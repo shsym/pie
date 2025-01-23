@@ -188,3 +188,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Prompt files
+*.prompt
