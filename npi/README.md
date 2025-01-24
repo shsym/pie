@@ -1,2 +1,0 @@
-Neural Programming Interface (NPI)
-
