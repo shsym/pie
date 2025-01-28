@@ -1,0 +1,9 @@
+// helloworld.wit
+package helloworld
+
+// Define a world. The `import` block states which interfaces
+// this component expects. The `export` block states what it offers.
+world helloworld {
+    import spi: spi.Spi
+    export main: function(message: string)
+}
