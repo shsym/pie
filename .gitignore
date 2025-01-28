@@ -191,3 +191,5 @@ cython_debug/
 
 # Prompt files
 *.prompt
+
+.DS_Store
