@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "helloworld"
+]
+
+[workspace.dependencies]
+wit-bindgen = "0.38.0"

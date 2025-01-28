@@ -1,9 +1,0 @@
-package spi
-
-interface Spi {
-  /// Sends a string message; no value is returned.
-  tell(message: string)
-
-  /// Sends a string message and receives a string response.
-  ask(question: string) -> string
-}
