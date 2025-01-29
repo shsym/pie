@@ -1,0 +1,4 @@
+interface system {
+  ask: func(question: string) -> string;
+  tell: func(message: string);
+}

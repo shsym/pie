@@ -1,9 +1,0 @@
-package spi:helloworld;
-
-// Define a world. The `import` block states which interfaces
-// this component expects. The `export` block states what it offers.
-world app {
-  import spi:core/inference;
-  import spi:core/system;
-  export spi:core/run;
-}

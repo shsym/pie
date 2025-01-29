@@ -1,7 +1,8 @@
 mod spi;
+use futures::executor::block_on;
 
-use crate::spi::{ComponentRunStates, Imports};
-use anyhow::Context;
+use crate::spi::{App, ComponentRunStates};
+use anyhow::{anyhow, Context};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Result, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiImpl, WasiView};
@@ -12,6 +13,16 @@ fn main() -> Result<()> {
 
     let engine = Engine::new(&config)?;
 
+    // run_async(
+    //     &engine,
+    //     "../example-apps/target/wasm32-wasip2/release/helloworld.wasm",
+    // )?;
+
+    run_async(
+        &engine,
+        "../example-apps-python/helloworld/helloworld.wasm",
+    )?;
+    
     println!("Run without errors!");
     Ok(())
 }
@@ -21,22 +32,32 @@ fn run_async(engine: &Engine, path: &'static str) -> Result<()> {
     let component = Component::from_file(engine, path)
         .with_context(|| format!("Cannot find component from path: {path}"))?;
 
-    let mut linker = Linker::new(&engine);
+    let mut linker: Linker<ComponentRunStates> = Linker::new(&engine);
     let state = ComponentRunStates::new();
     let mut store = Store::new(&engine, state);
 
-    Imports::add_to_linker(&mut linker, |s| s)?;
+    App::add_to_linker(&mut linker, |s| s)?;
     bind_interfaces_needed_by_guest_rust_std(&mut linker);
+    let async_future = async {
+        let instance = linker.instantiate_async(&mut store, &component).await?;
 
-    // let async_future = async {
-    //     let bindings = KvDatabase::instantiate_async(&mut store, &component, &linker).await?;
-    //     let result = bindings.call_replace_value(store, "hello", "world").await?;
-    //     assert_eq!(result, None);
-    //     Ok(())
-    // };
-    // block_on(async_future)
-    //
-    // unimplemented!("Run async code here")
+        let run_interface = instance
+            .get_export(&mut store, None, "spi:app/run")
+            .ok_or_else(|| anyhow!("spi:app/run missing?"))?;
+        let run_func_export = instance
+            .get_export(&mut store, Some(&run_interface), "run")
+            .ok_or_else(|| anyhow!("run export missing?"))?;
+        let run_func = instance
+            .get_typed_func::<(), (Result<(), ()>,)>(&mut store, &run_func_export)
+            .context("run as typed func")?;
+
+        println!("entering wasm...");
+        let (runtime_result,) = run_func.call_async(&mut store, ()).await?;
+        runtime_result.map_err(|()| anyhow!("run returned an error"))?;
+        println!("done");
+        Ok(())
+    };
+    block_on(async_future)
 }
 
 /// Copied from [wasmtime_wasi::type_annotate]

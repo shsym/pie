@@ -1,0 +1,7 @@
+package spi:app;
+
+world app {
+    include spi:lm/imports;
+    import system;
+    export run;
+}

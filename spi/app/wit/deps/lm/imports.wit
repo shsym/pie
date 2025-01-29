@@ -1,0 +1,6 @@
+package spi:lm;
+
+world imports {
+  import inference;
+  import kvcache;
+}

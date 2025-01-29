@@ -1,0 +1,1 @@
+componentize-py -d ../../spi/app/wit -w app componentize --stub-wasi helloworld -o helloworld.wasm
