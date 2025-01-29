@@ -4,6 +4,7 @@ use wasmtime::component::{bindgen, ResourceTable};
 use wasmtime::Result;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
+use crate::ClientId;
 use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 
