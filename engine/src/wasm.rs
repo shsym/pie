@@ -1,4 +1,3 @@
-mod spi;
 use futures::executor::block_on;
 
 use crate::spi::{App, ComponentRunStates};

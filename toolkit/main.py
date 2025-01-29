@@ -3,7 +3,7 @@ import websockets
 import msgpack
 import blake3
 
-PROGRAM_CACHE_DIR = "./"
+PROGRAM_CACHE_DIR = "../example-apps/target/wasm32-wasip2/release/"
 
 async def main():
     uri = "ws://127.0.0.1:9000"
@@ -13,7 +13,7 @@ async def main():
         # 1) Query existence of a sample hash
         query_msg = {
             "type": "query_existence",
-            "hash": "some_non_existent_hash"
+            "hash": "fd4cf7193c818fc5fc464d441406ca29182c9e86966ed5c54a25bce720d14a44"
         }
         await ws.send(msgpack.packb(query_msg, use_bin_type=True))
         response_data = await ws.recv()  # This is binary
@@ -21,7 +21,7 @@ async def main():
         print("query_existence response:", response)
 
         # 2) Upload a local .wasm (renamed as “program”) file in chunks
-        program_path = "test_program.wasm"
+        program_path = f"{PROGRAM_CACHE_DIR}helloworld.wasm"
         with open(program_path, "rb") as f:
             program_bytes = f.read()
 
@@ -48,7 +48,12 @@ async def main():
             resp = msgpack.unpackb(resp_data, raw=False)
             print("Upload chunk response:", resp)
 
+        # Read server ack
+        resp_data = await ws.recv()
+        resp = msgpack.unpackb(resp_data, raw=False)
+        print("Final upload response:", resp)
         # 3) Start the program
+
         start_msg = {
             "type": "start_program",
             "hash": file_hash,
@@ -57,6 +62,9 @@ async def main():
         await ws.send(msgpack.packb(start_msg, use_bin_type=True))
         start_resp_data = await ws.recv()
         start_resp = msgpack.unpackb(start_resp_data, raw=False)
+        print("Start response:", start_resp)
+        return;
+
         print("Start response:", start_resp)
 
         if start_resp.get("type") == "program_launched":

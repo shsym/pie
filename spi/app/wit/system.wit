@@ -1,4 +1,10 @@
 interface system {
-  ask: func(question: string) -> string;
-  tell: func(message: string);
+
+  resource channel {
+    constructor(channel-id: u32);
+    send: func(message: string);
+    receive: func() -> string;
+  }
+
+  get-version: func() -> string;
 }
