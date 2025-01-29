@@ -1,5 +1,3 @@
-use futures::executor::block_on;
-
 use std::future::Future;
 use wasmtime::component::Resource;
 use wasmtime::component::{bindgen, ResourceTable};
