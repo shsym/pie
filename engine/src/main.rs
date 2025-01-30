@@ -567,16 +567,11 @@ async fn handle_client_message_start_program(
                 return; // or handle more gracefully
             }
 
+            // Maybe we can do more fine-grained linking by submodules in the future
             if let Err(e) = wasmtime_wasi::add_to_linker_async(&mut linker) {
                 eprintln!("Failed to link WASI bindings: {}", e);
                 return;
             }
-
-            //
-            // if let Err(e) = link_wasi_bindings(&mut linker) {
-            //     eprintln!("Failed to link WASI bindings: {}", e);
-            //     return;
-            // }
 
             // Instantiate
             let instance = match linker.instantiate_async(&mut store, &component).await {
@@ -587,8 +582,6 @@ async fn handle_client_message_start_program(
                 }
             };
 
-            // Optionally store the Instance somewhere (Arc<Instance>, etc.)
-            // Then run the "run" entry point
             let run_interface = match instance.get_export(&mut store, None, "spi:app/run") {
                 Some(r) => r,
                 None => {
@@ -614,18 +607,18 @@ async fn handle_client_message_start_program(
                 }
             };
 
-            println!("entering wasm run for instance_id={}", instance_id);
+            println!("Running instance_id={}", instance_id);
 
             // Actually run
             match run_func.call_async(&mut store, ()).await {
                 Ok((Ok(()),)) => {
-                    println!("WASM finished normally for instance_id={}", instance_id);
+                    println!("Finished normally for instance_id={}", instance_id);
                 }
                 Ok((Err(()),)) => {
-                    eprintln!("WASM run returned an error for instance_id={}", instance_id);
+                    eprintln!("Returned an error for instance_id={}", instance_id);
                 }
                 Err(call_err) => {
-                    eprintln!("WASM call error: {}", call_err);
+                    eprintln!("Call error: {}", call_err);
                 }
             }
 
@@ -711,31 +704,4 @@ async fn handle_client_message_terminate_program(
     vec![ServerMessage::ProgramTerminated {
         instance_id: instance_id.to_string(),
     }]
-}
-
-/// Copied from [wasmtime_wasi::type_annotate]
-pub fn type_annotate<T: WasiView, F>(val: F) -> F
-where
-    F: Fn(&mut T) -> WasiImpl<&mut T>,
-{
-    val
-}
-pub fn link_wasi_bindings<T: WasiView>(l: &mut Linker<T>) -> Result<(), wasmtime::Error> {
-    let closure = type_annotate::<T, _>(|t| WasiImpl(t));
-    let options = wasmtime_wasi::bindings::sync::LinkOptions::default();
-
-    //wasmtime_wasi::add_to_linker_async(l, closure.clone())?;
-
-    wasmtime_wasi::bindings::sync::filesystem::types::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::bindings::filesystem::preopens::add_to_linker_get_host(l, closure)?;
-
-    wasmtime_wasi::bindings::io::error::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::bindings::sync::io::streams::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::bindings::cli::exit::add_to_linker_get_host(l, &options.into(), closure)?;
-    wasmtime_wasi::bindings::cli::environment::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::bindings::cli::stdin::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::bindings::cli::stdout::add_to_linker_get_host(l, closure)?;
-    wasmtime_wasi::bindings::cli::stderr::add_to_linker_get_host(l, closure)?;
-
-    Ok(())
 }
