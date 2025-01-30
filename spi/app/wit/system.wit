@@ -1,10 +1,5 @@
 interface system {
-
-  resource channel {
-    constructor(channel-id: u32);
-    send: func(message: string);
-    receive: func() -> string;
-  }
-
   get-version: func() -> string;
+  send: func(dest-id: u32, message: string);
+  receive: func() -> string;
 }

@@ -1,95 +1,74 @@
 import asyncio
-import websockets
-import msgpack
+import os
 import blake3
 
-PROGRAM_CACHE_DIR = "../example-apps/target/wasm32-wasip2/release/"
+from symphony import SymphonyClient
 
-async def main():
-    uri = "ws://127.0.0.1:9000"
-    async with websockets.connect(uri) as ws:
-        print("Connected to Symphony server.")
+PROGRAM_PATH = "../example-apps/target/wasm32-wasip2/release/helloworld.wasm"
 
-        # 1) Query existence of a sample hash
-        query_msg = {
-            "type": "query_existence",
-            "hash": "fd4cf7193c818fc5fc464d441406ca29182c9e86966ed5c54a25bce720d14a44"
-        }
-        await ws.send(msgpack.packb(query_msg, use_bin_type=True))
-        response_data = await ws.recv()  # This is binary
-        response = msgpack.unpackb(response_data, raw=False)
-        print("query_existence response:", response)
 
-        # 2) Upload a local .wasm (renamed as “program”) file in chunks
-        program_path = f"{PROGRAM_CACHE_DIR}helloworld.wasm"
-        with open(program_path, "rb") as f:
-            program_bytes = f.read()
+async def demo_sequence():
+    # 1) Create and connect the client
+    client = SymphonyClient("ws://127.0.0.1:9000")
+    await client.connect()
 
-        # Compute BLAKE3
-        file_hash = blake3.blake3(program_bytes).hexdigest()
-        print("Program BLAKE3:", file_hash)
+    # 2) Compute BLAKE3 for the local file
+    with open(PROGRAM_PATH, "rb") as f:
+        wasm_bytes = f.read()
+    file_hash = blake3.blake3(wasm_bytes).hexdigest()
+    print("[Demo] Program file hash:", file_hash)
 
-        chunk_size = 64 * 1024
-        total_chunks = (len(program_bytes) + chunk_size - 1) // chunk_size
+    # 3) Query existence
+    query_resp = await client.query_existence(file_hash)
+    print("[Demo] query_existence response:", query_resp)
 
-        for i in range(total_chunks):
-            chunk = program_bytes[i*chunk_size : (i+1)*chunk_size]
-            msg = {
-                "type": "upload_program",
-                "hash": file_hash,
-                "chunk_index": i,
-                "total_chunks": total_chunks,
-                "chunk_data": chunk,  # raw bytes
-            }
-            await ws.send(msgpack.packb(msg, use_bin_type=True))
+    # 4) If not present, upload
+    if not query_resp.get("exists", False):
+        print("[Demo] Program not found on server, uploading now...")
+        await client.upload_program(wasm_bytes, file_hash)
 
-            # Read server ack
-            resp_data = await ws.recv()
-            resp = msgpack.unpackb(resp_data, raw=False)
-            print("Upload chunk response:", resp)
+        # The last chunk upload typically yields a "upload_complete"
+        # But let's read any subsequent messages too if needed.
+        # For example, if the server sends "upload_complete" after the last chunk ack.
+        # The above library code receives *one* message after each chunk,
+        # which in many server flows includes the final "upload_complete" message.
 
-        # Read server ack
-        resp_data = await ws.recv()
-        resp = msgpack.unpackb(resp_data, raw=False)
-        print("Final upload response:", resp)
-        # 3) Start the program
+    else:
+        print("[Demo] Program already exists on server, skipping upload.")
 
-        start_msg = {
-            "type": "start_program",
-            "hash": file_hash,
-            "configuration": {},  # could contain CPU/memory limits
-        }
-        await ws.send(msgpack.packb(start_msg, use_bin_type=True))
-        start_resp_data = await ws.recv()
-        start_resp = msgpack.unpackb(start_resp_data, raw=False)
-        print("Start response:", start_resp)
-        return;
+    # 5) Start the program
+    start_resp = await client.start_program(file_hash)
+    print("[Demo] start_program response:", start_resp)
 
-        print("Start response:", start_resp)
+    if start_resp.get("type") == "program_launched":
+        instance_id = start_resp["instance_id"]
+        print(f"[Demo] Program launched with instance_id = {instance_id}")
 
-        if start_resp.get("type") == "program_launched":
-            instance_id = start_resp.get("instance_id")
-            # 4) Send an event
-            event_msg = {
-                "type": "send_event",
-                "hash": file_hash,
-                "instance_id": instance_id,
-                "event_data": {"my_event": "hello program!"}
-            }
-            await ws.send(msgpack.packb(event_msg, use_bin_type=True))
-            event_resp_data = await ws.recv()
-            event_resp = msgpack.unpackb(event_resp_data, raw=False)
-            print("Event response:", event_resp)
+        # 6) Send a couple of events
+        await client.send_event(instance_id, "Hello from Python client - event #1")
+        await client.send_event(instance_id, "Another event #2")
 
-            # 5) Terminate the program
-            term_msg = {
-                "type": "terminate_program",
-                "hash": file_hash,
-                "instance_id": instance_id
-            }
-            await ws.send(msgpack.packb(term_msg, use_bin_type=True))
-            term_resp_data = await ws.recv()
-            term_resp = msgpack.unpackb(term_resp_data, raw=False)
-            print("Termination response:", term_resp)
+        # We might want to see if the server sends back any "program_event" messages.
+        # Since the server can send them asynchronously, let's wait briefly:
+        await asyncio.sleep(2.0)
+        while not client.incoming_messages.empty():
+            msg = await client.wait_for_next_message()
+            print("[Demo] Received async event:", msg)
 
-asyncio.run(main())
+        # 7) Terminate the program
+        term_resp = await client.terminate_program(instance_id)
+        print("[Demo] terminate_program response:", term_resp)
+
+    else:
+        print("[Demo] Program launch failed or was not recognized.")
+
+    # 8) Close the connection
+    await client.close()
+
+
+def main():
+    asyncio.run(demo_sequence())
+
+
+if __name__ == "__main__":
+    main()
