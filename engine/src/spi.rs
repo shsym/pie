@@ -70,14 +70,19 @@ pub struct LanguageModel {
     model_id: String,
 }
 
-pub struct TokenDistribution {}
-
-#[derive(Clone, Copy)]
-pub struct CachedToken {
-    token: u32,
-    id: u32,
+pub struct TokenDistribution {
+    object_id: u32,
 }
 
+// handle...
+#[derive(Clone, Copy)]
+pub struct CachedToken {
+    object_id: u32,
+}
+
+// This is actually more like a set, because the order of cached tokens does not affect the semantics.
+// In most cases, position encodings are just baked into the token.
+// But who knows?
 pub struct CachedTokenList {
     tokens: Vec<CachedToken>,
 }
@@ -135,9 +140,10 @@ impl spi::lm::inference::HostLanguageModel for InstanceState {
     async fn predict(
         &mut self,
         resource: Resource<LanguageModel>,
+        cache: Resource<CachedTokenList>,
         tokens: Vec<u32>,
-    ) -> Result<u32, wasmtime::Error> {
-        Ok(7)
+    ) -> Result<Vec<Resource<TokenDistribution>>, wasmtime::Error> {
+        Ok(vec![])
     }
 
     async fn drop(&mut self, resource: Resource<LanguageModel>) -> Result<()> {
@@ -284,11 +290,6 @@ impl spi::lm::kvcache::HostTokenList for InstanceState {
         list_resource: Resource<CachedTokenList>,
         other_list_resource: Resource<CachedTokenList>,
     ) -> Result<()> {
-        let token_list = self.resource_table.get_mut(&list_resource)?;
-        let other_list = self.resource_table.get(&other_list_resource)?;
-
-        // Copy the tokens from other_list
-        token_list.tokens.extend(other_list.tokens.clone());
         Ok(())
     }
 
@@ -305,23 +306,6 @@ impl spi::lm::kvcache::HostTokenList for InstanceState {
         delete_count: u32,
         other_list_resource: Resource<CachedTokenList>,
     ) -> Result<()> {
-        let token_list = self.resource_table.get_mut(&list_resource)?;
-        let other_list = self.resource_table.get(&other_list_resource)?;
-
-        let start_usize = start as usize;
-        let delete_count_usize = delete_count as usize;
-
-        // Safety check or clamp if needed:
-        let len = token_list.tokens.len();
-        if start_usize > len {
-            return Err(anyhow::anyhow!("Start index out of bounds"));
-        }
-        let end_delete = (start_usize + delete_count_usize).min(len);
-
-        // Splice out delete_count items and replace with `other_list.tokens`
-        token_list
-            .tokens
-            .splice(start_usize..end_delete, other_list.tokens.clone());
         Ok(())
     }
 
@@ -344,19 +328,7 @@ impl spi::lm::kvcache::HostTokenList for InstanceState {
         start: u32,
         end: u32,
     ) -> Result<Resource<CachedTokenList>> {
-        let token_list = self.resource_table.get(&list_resource)?;
-        let len = token_list.tokens.len();
-
-        let start_usize = start as usize;
-        let end_usize = end as usize;
-        if start_usize > len || end_usize > len || start_usize > end_usize {
-            return Err(anyhow::anyhow!("Invalid slice range"));
-        }
-
-        let new_tokens = token_list.tokens[start_usize..end_usize].to_vec();
-        let new_list = CachedTokenList { tokens: new_tokens };
-        let handle = self.resource_table.push(new_list)?;
-        Ok(handle)
+        Ok(list_resource)
     }
 
     //
@@ -369,15 +341,8 @@ impl spi::lm::kvcache::HostTokenList for InstanceState {
         list_resource: Resource<CachedTokenList>,
         other_list_resource: Resource<CachedTokenList>,
     ) -> Result<Resource<CachedTokenList>> {
-        let token_list = self.resource_table.get(&list_resource)?;
-        let other_list = self.resource_table.get(&other_list_resource)?;
-
-        let mut new_vec = token_list.tokens.clone();
-        new_vec.extend(other_list.tokens.clone());
-
-        let new_list = CachedTokenList { tokens: new_vec };
-        let handle = self.resource_table.push(new_list)?;
-        Ok(handle)
+        //
+        Ok(other_list_resource)
     }
 
     //
