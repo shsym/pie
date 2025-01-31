@@ -16,7 +16,7 @@ interface kvcache {
      // keeps block_id internally.
      allocated: func() -> bool;
      drop: func(start: u32, end: u32);
-     copy: func(other:block, src-start:u32, src-end:u32, dest-start: u32, dest-end: u32) -> block;
+     copy: func(other:block, src-start:u32, src-end:u32, dest-start: u32, dest-end: u32);
   }
 
   // this is actually a set. The order is just for indexing purposes. So this is more like a ranged map.
@@ -34,7 +34,10 @@ interface kvcache {
   allocate-block: func() -> block;
   allocate-blocks: func(count:u32) -> block-list;
 
+  free-block: func(block: block);
+  free-blocks: func(blocks: block-list);
 
+  available-blocks: func() -> u32;
 
   //
   //
