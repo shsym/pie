@@ -1,6 +1,6 @@
 interface inference {
 
-  use kvcache.{token-list};
+  use kvcache.{block-list, mask, sink};
 
   resource token-distribution {
     sample-p: func() -> u32;
@@ -11,6 +11,9 @@ interface inference {
     constructor(model-id:string);
     tokenize: func(text: string) -> list<u32>;
     detokenize: func(tokens: list<u32>) -> string;
-    predict: func(cache: token-list, tokens: list<u32>) -> list<token-distribution>;
+
+    // for indices, we could use RLE-like encoding to compress the list.
+    // dist-n is the number of distributions to return.
+    predict-all: func(blocks: block-list, tokens: list<u32>, indices: list<u32>, mask:mask, sink:sink, dist-n:u32) -> list<token-distribution>;
   }
 }
