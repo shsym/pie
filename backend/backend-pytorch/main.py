@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import zmq
 import msgpack
 import uuid
@@ -6,27 +7,36 @@ import threading
 import queue
 from dataclasses import dataclass
 from typing import List, Optional, Union
+from enum import StrEnum, auto
 
 
 # =============================================================================
-# 1) Pythonic Data Classes to Mirror Your Commands & Responses
+# 1) Enums & Dataclasses for Commands/Responses
 # =============================================================================
+
+class CommandKind(StrEnum):
+    ALLOCATE_BLOCKS = "AllocateBlocks"
+    ALLOCATE_BLOCK = "AllocateBlock"
+    COPY = "Copy"
+    DROP = "Drop"
+    FREE_BLOCK = "FreeBlock"
+    FREE_BLOCKS = "FreeBlocks"
+    AVAILABLE_BLOCKS = "AvailableBlocks"
+    # Add more if needed
+
 
 @dataclass
 class AllocateBlocksCmd:
-    """Represents Command::AllocateBlocks(num_blocks)."""
     num_blocks: int
 
 
 @dataclass
 class AllocateBlockCmd:
-    """Represents Command::AllocateBlock (no parameters)."""
     pass
 
 
 @dataclass
 class CopyCmd:
-    """Represents Command::Copy { src_block_id, dst_block_id, src_start, dst_start, length }."""
     src_block_id: int
     dst_block_id: int
     src_start: int
@@ -36,7 +46,6 @@ class CopyCmd:
 
 @dataclass
 class DropCmd:
-    """Represents Command::Drop { block_id, start, end }."""
     block_id: int
     start: int
     end: int
@@ -44,25 +53,21 @@ class DropCmd:
 
 @dataclass
 class FreeBlockCmd:
-    """Represents Command::FreeBlock { block_id }."""
     block_id: int
 
 
 @dataclass
 class FreeBlocksCmd:
-    """Represents Command::FreeBlocks { block_id_offset, count }."""
     block_id_offset: int
     count: int
 
 
 @dataclass
 class AvailableBlocksCmd:
-    """Represents Command::AvailableBlocks (no parameters)."""
     pass
 
 
-# For convenience, define a Python "enum-like" union of all commands:
-Command = Union[
+CommandPayload = Union[
     AllocateBlocksCmd,
     AllocateBlockCmd,
     CopyCmd,
@@ -75,12 +80,19 @@ Command = Union[
 
 @dataclass
 class Request:
-    """Represents an incoming client request."""
-    instance_id: bytes  # The raw 16 bytes from the message
-    command: Command
+    instance_id: bytes
+    kind: CommandKind
+    payload: CommandPayload
 
 
-# --- For responses, define typed wrappers as well ---
+# For responses, likewise we define the kind:
+
+class ResponseKind(StrEnum):
+    ALLOCATED_BLOCKS = "AllocatedBlocks"
+    AVAILABLE_COUNT = "AvailableCount"
+    ERROR = "Error"
+    AWK = "Awk"
+
 
 @dataclass
 class AllocatedBlocksResp:
@@ -104,7 +116,7 @@ class AwkResp:
     message: str
 
 
-ResponseData = Union[
+ResponsePayload = Union[
     AllocatedBlocksResp,
     AvailableCountResp,
     ErrorResp,
@@ -115,12 +127,9 @@ ResponseData = Union[
 @dataclass
 class Response:
     instance_id: bytes
-    data: ResponseData
+    kind: ResponseKind
+    payload: ResponsePayload
 
-
-# =============================================================================
-# 2) Server State
-# =============================================================================
 
 class ServerState:
     """
@@ -140,7 +149,6 @@ class ServerState:
                 raise ValueError("Capacity exceeded")
             allocated_ids = []
             for _ in range(n):
-                # Find the next available block id.
                 while self.next_block_id in self.allocated:
                     self.next_block_id += 1
                 allocated_ids.append(self.next_block_id)
@@ -173,18 +181,14 @@ class ServerState:
                 raise ValueError(f"Source block {src} not allocated")
             if dst not in self.allocated:
                 raise ValueError(f"Destination block {dst} not allocated")
-            # Simulate copy (no state change)
+            # Simulate copy
 
     def drop_block(self, block_id: int):
         with self.lock:
             if block_id not in self.allocated:
                 raise ValueError(f"Block {block_id} not allocated")
-            # Simulate partial drop (no state change)
+            # Simulate partial drop
 
-
-# =============================================================================
-# 3) Parsing and Handling Commands
-# =============================================================================
 
 def parse_incoming_message(msg: list) -> Request:
     """
@@ -192,205 +196,146 @@ def parse_incoming_message(msg: list) -> Request:
       [ <16-byte UUID>, { "AllocateBlocks": [5] } ]
     or similar for other commands.
 
-    We'll parse:
-    - instance_id_bytes = msg[0]  (16-byte array)
-    - command_dict = msg[1]      (dict, e.g. {"AllocateBlocks": [5]})
+    We'll parse them using structural pattern matching.
     """
     if not isinstance(msg, list) or len(msg) != 2:
-        raise ValueError("Message must be a 2-element list: [uuid_bytes, command_dict]")
-    instance_id = msg[0]  # 16-byte UUID
+        raise ValueError("Message must be [uuid_bytes, command_dict]")
+
+    instance_id = msg[0]
     command_dict = msg[1]
 
-    print("instance_id", instance_id)
-    print("command_dict", command_dict)
+    if not isinstance(command_dict, dict):
+        (cmd_str, parameters) = (command_dict, [])
 
-    if isinstance(command_dict, dict):
-
-        (cmd_type, cmd_payload_list) = next(iter(command_dict.items()))
     else:
-        cmd_type = command_dict
-        cmd_payload_list = []
+        # There's only one key in command_dict, e.g. {"AllocateBlocks": [5]}
+        (cmd_str, parameters) = next(iter(command_dict.items()))
 
-    if not isinstance(cmd_payload_list, list):
-        raise ValueError("Command payload must be a list of parameters")
+    # Convert string -> CommandKind
+    try:
+        kind = CommandKind(cmd_str)
+    except ValueError:
+        raise ValueError(f"Unknown command type: {cmd_str}")
 
-    # Now parse each command type:
-    if cmd_type == "AllocateBlocks":
-        if len(cmd_payload_list) != 1:
-            raise ValueError("AllocateBlocks requires [num_blocks]")
-        return Request(
-            instance_id,
-            AllocateBlocksCmd(num_blocks=cmd_payload_list[0]),
-        )
-
-    elif cmd_type == "AllocateBlock":
-        # Typically "AllocateBlock": []
-        return Request(instance_id, AllocateBlockCmd())
-
-    elif cmd_type == "Copy":
-        # Expect 5 parameters
-        if len(cmd_payload_list) != 5:
-            raise ValueError("Copy requires 5 parameters [src_block_id, dst_block_id, src_start, dst_start, length]")
-        return Request(
-            instance_id,
-            CopyCmd(
-                src_block_id=cmd_payload_list[0],
-                dst_block_id=cmd_payload_list[1],
-                src_start=cmd_payload_list[2],
-                dst_start=cmd_payload_list[3],
-                length=cmd_payload_list[4],
-            ),
-        )
-
-    elif cmd_type == "Drop":
-        # Expect 3 parameters
-        if len(cmd_payload_list) != 3:
-            raise ValueError("Drop requires 3 parameters [block_id, start, end]")
-        return Request(
-            instance_id,
-            DropCmd(block_id=cmd_payload_list[0],
-                    start=cmd_payload_list[1],
-                    end=cmd_payload_list[2]),
-        )
-
-    elif cmd_type == "FreeBlock":
-        # Expect 1 parameter
-        if len(cmd_payload_list) != 1:
-            raise ValueError("FreeBlock requires [block_id]")
-        return Request(
-            instance_id,
-            FreeBlockCmd(block_id=cmd_payload_list[0]),
-        )
-
-    elif cmd_type == "FreeBlocks":
-        # Expect 2 parameters: [block_id_offset, count]
-        if len(cmd_payload_list) != 2:
-            raise ValueError("FreeBlocks requires [block_id_offset, count]")
-        return Request(
-            instance_id,
-            FreeBlocksCmd(
-                block_id_offset=cmd_payload_list[0],
-                count=cmd_payload_list[1],
+    # In a typical scenario, parameters is a list. We'll match on (kind, parameters).
+    match kind, parameters:
+        case (CommandKind.ALLOCATE_BLOCKS, [int(num_blocks)]):
+            payload = AllocateBlocksCmd(num_blocks=num_blocks)
+        case (CommandKind.ALLOCATE_BLOCK, []):
+            payload = AllocateBlockCmd()
+        case (CommandKind.COPY, [int(src), int(dst), int(src_start), int(dst_start), int(length)]):
+            payload = CopyCmd(
+                src_block_id=src, dst_block_id=dst,
+                src_start=src_start, dst_start=dst_start, length=length
             )
-        )
+        case (CommandKind.DROP, [int(block_id), int(start), int(end)]):
+            payload = DropCmd(block_id=block_id, start=start, end=end)
+        case (CommandKind.FREE_BLOCK, [int(block_id)]):
+            payload = FreeBlockCmd(block_id=block_id)
+        case (CommandKind.FREE_BLOCKS, [int(offset), int(count)]):
+            payload = FreeBlocksCmd(block_id_offset=offset, count=count)
+        case (CommandKind.AVAILABLE_BLOCKS, []):
+            payload = AvailableBlocksCmd()
+        case _:
+            raise ValueError(f"Invalid parameters for command: {cmd_str}")
 
-    elif cmd_type == "AvailableBlocks":
-        # Expect 0 parameters
-        return Request(instance_id, AvailableBlocksCmd())
-
-    else:
-        raise ValueError(f"Unknown command type: {cmd_type}")
+    return Request(
+        instance_id=instance_id,
+        kind=kind,
+        payload=payload,
+    )
 
 
 def handle_command(req: Request, state: ServerState) -> Optional[Response]:
     """
-    Process a typed request. Return a `Response` if the command needs one.
-    If the command does not produce a "success" response, return None
-    (but on error, we'll generate an error response).
+    Process a typed request, returning a Response if the command needs one.
     """
-    c = req.command
-    if isinstance(c, AllocateBlocksCmd):
-        allocated_ids = state.allocate_blocks(c.num_blocks)
-        if not allocated_ids:
-            raise ValueError("Allocation returned empty")
-        offset = allocated_ids[0]
-        count = len(allocated_ids)
-        return Response(
-            instance_id=req.instance_id,
-            data=AllocatedBlocksResp(offset, count),
-        )
+    match req.kind, req.payload:
+        case (CommandKind.ALLOCATE_BLOCKS, AllocateBlocksCmd(num_blocks)):
+            allocated_ids = state.allocate_blocks(num_blocks)
+            if not allocated_ids:
+                raise ValueError("Allocation returned empty")
+            offset = allocated_ids[0]
+            count = len(allocated_ids)
+            return Response(
+                instance_id=req.instance_id,
+                kind=ResponseKind.ALLOCATED_BLOCKS,
+                payload=AllocatedBlocksResp(block_id_offset=offset, count=count)
+            )
 
-    elif isinstance(c, AllocateBlockCmd):
-        allocated_ids = state.allocate_blocks(1)
-        if not allocated_ids:
-            raise ValueError("Allocation returned empty")
-        return Response(
-            instance_id=req.instance_id,
-            data=AllocatedBlocksResp(allocated_ids[0], 1)
-        )
+        case (CommandKind.ALLOCATE_BLOCK, AllocateBlockCmd()):
+            allocated_ids = state.allocate_blocks(1)
+            if not allocated_ids:
+                raise ValueError("Allocation returned empty")
+            return Response(
+                instance_id=req.instance_id,
+                kind=ResponseKind.ALLOCATED_BLOCKS,
+                payload=AllocatedBlocksResp(block_id_offset=allocated_ids[0], count=1)
+            )
 
-    elif isinstance(c, AvailableBlocksCmd):
-        available = state.available_blocks()
-        return Response(
-            instance_id=req.instance_id,
-            data=AvailableCountResp(count=available),
-        )
+        case (CommandKind.AVAILABLE_BLOCKS, AvailableBlocksCmd()):
+            available = state.available_blocks()
+            return Response(
+                instance_id=req.instance_id,
+                kind=ResponseKind.AVAILABLE_COUNT,
+                payload=AvailableCountResp(count=available)
+            )
 
-    elif isinstance(c, FreeBlockCmd):
-        state.free_block(c.block_id)
-        return None  # no success response
+        case (CommandKind.FREE_BLOCK, FreeBlockCmd(block_id)):
+            state.free_block(block_id)
+            return None
 
-    elif isinstance(c, FreeBlocksCmd):
-        state.free_blocks_range(c.block_id_offset, c.count)
-        return None
+        case (CommandKind.FREE_BLOCKS, FreeBlocksCmd(block_id_offset=offset, count=c)):
+            state.free_blocks_range(offset, c)
+            return None
 
-    elif isinstance(c, CopyCmd):
-        state.copy_blocks(c.src_block_id, c.dst_block_id)
-        return None
+        case (CommandKind.COPY, CopyCmd(src_block_id=src, dst_block_id=dst, src_start=_, dst_start=_, length=_)):
+            state.copy_blocks(src, dst)
+            return None
 
-    elif isinstance(c, DropCmd):
-        state.drop_block(c.block_id)
-        return None
+        case (CommandKind.DROP, DropCmd(block_id=b, start=_, end=_)):
+            state.drop_block(b)
+            return None
 
-    # Should never get here if all commands are covered
-    raise ValueError("Unhandled command variant")
+        case _:
+            # This should never happen if all commands are covered
+            raise ValueError("Unhandled command variant")
 
-
-# =============================================================================
-# 4) Convert Response to a Dict for msgpack
-# =============================================================================
 
 def response_to_dict(resp: Response) -> list:
     """
-    Convert a typed Response into a dictionary that can be msgpacked.
+    Convert a typed Response into a list/dict structure suitable for msgpack.
+    Returns something like:
+        [ <16-byte instance_id>,
+          { "AllocatedBlocks": [offset, count] }
+        ]
     """
-    if isinstance(resp.data, AllocatedBlocksResp):
-        return [
-            resp.instance_id,
-            {
-                "AllocatedBlocks": [
-                    resp.data.block_id_offset,
-                    resp.data.count
-                ]
-            }
-        ]
-    elif isinstance(resp.data, AvailableCountResp):
-        return [
-            resp.instance_id,
-            {"AvailableCount": [resp.data.count]},
-        ]
-    elif isinstance(resp.data, ErrorResp):
-        return [
-            resp.instance_id,
+    match resp.kind, resp.payload:
+        case (ResponseKind.ALLOCATED_BLOCKS, AllocatedBlocksResp(offset, count)):
+            return [
+                resp.instance_id,
+                {"AllocatedBlocks": [offset, count]}
+            ]
+        case (ResponseKind.AVAILABLE_COUNT, AvailableCountResp(count)):
+            return [
+                resp.instance_id,
+                {"AvailableCount": [count]}
+            ]
+        case (ResponseKind.ERROR, ErrorResp(error_code, msg)):
+            return [
+                resp.instance_id,
+                {"Error": [error_code, msg]}
+            ]
+        case (ResponseKind.AWK, AwkResp(message)):
+            return [
+                resp.instance_id,
+                {"Awk": [message]}
+            ]
+        case _:
+            raise ValueError("Unknown response type")
 
-            {"Error": [
-                resp.data.error_code,
-                resp.data.message
-            ]}
-        ]
-    elif isinstance(resp.data, AwkResp):
-        return [
-            resp.instance_id,
-            {"Awk": [resp.data.message]},
-        ]
-    else:
-        # If you add new response variants, handle them here
-        raise ValueError("Unknown response type")
-
-
-# =============================================================================
-# 5) Worker Thread
-# =============================================================================
 
 def worker_thread(worker_queue, state: ServerState, response_queue):
-    """
-    Each worker processes items of the form (client_id, message_list).
-    message_list is something like:
-       [ <16-byte UUID>, { "AllocateBlocks": [5] } ]
-    We parse it into a Request, handle the command, and if needed place
-    the response on response_queue. If there's an error, we place an error
-    response on the queue.
-    """
     while True:
         item = worker_queue.get()
         if item is None:
@@ -399,32 +344,21 @@ def worker_thread(worker_queue, state: ServerState, response_queue):
         client_id, req = item
 
         try:
-
-            print(req)
-
             resp = handle_command(req, state)
-
             if resp is not None:
-                # Convert typed Response to dict
                 response_queue.put((client_id, resp))
         except Exception as exc:
             print(f"[Worker] Error: {exc} for message {req}")
 
-            resp = Response(
+            err_resp = Response(
                 instance_id=req.instance_id,
-                data=ErrorResp(
-                    error_code=100,
-                    message=str(exc),
-                ),
+                kind=ResponseKind.ERROR,
+                payload=ErrorResp(error_code=100, message=str(exc)),
             )
-            response_queue.put((client_id, resp))
+            response_queue.put((client_id, err_resp))
 
         worker_queue.task_done()
 
-
-# =============================================================================
-# 6) Main Server Loop
-# =============================================================================
 
 def main():
     context = zmq.Context()
@@ -432,10 +366,8 @@ def main():
     router.bind("tcp://*:5555")
     print("Server listening on tcp://*:5555")
 
-    # Shared server state
     state = ServerState(capacity=10_000)
 
-    # Create worker threads
     num_workers = 4
     worker_queues = [queue.Queue() for _ in range(num_workers)]
     response_queue = queue.Queue()
@@ -449,7 +381,7 @@ def main():
         t.start()
 
     while True:
-        # 1) Receive a multi-part message: [client_id, payload]
+        # Receive a multipart message from the client: [client_id, payload]
         msg_parts = router.recv_multipart()
         if len(msg_parts) < 2:
             continue
@@ -457,28 +389,18 @@ def main():
         client_id = msg_parts[0]
         payload = msg_parts[1]
 
-        # 2) Unpack from MessagePack. The result should be a list of length 2:
-        #    [instance_id_bytes, command_obj]
+        # Unpack from MessagePack
         message_list = msgpack.unpackb(payload, raw=False)
         req = parse_incoming_message(message_list)
 
         worker_index = hash(req.instance_id) % num_workers
-
-        # 4) Enqueue the work
-
         worker_queues[worker_index].put((client_id, req))
 
-        # return awk
-        # router.send_multipart([client_id, msgpack.packb(response_to_dict(
-        #     Response(req.instance_id, AwkResp(message="Received"))
-        # ), use_bin_type=True)])
-
-        # 5) Check for any responses in the response_queue
+        # Drain any ready responses
         while not response_queue.empty():
             try:
                 resp_client_id, resp = response_queue.get_nowait()
                 resp_dict = response_to_dict(resp)
-
                 packed_resp = msgpack.packb(resp_dict, use_bin_type=True)
                 router.send_multipart([resp_client_id, packed_resp])
                 response_queue.task_done()

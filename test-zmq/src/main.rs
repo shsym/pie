@@ -164,7 +164,7 @@ async fn sender_task(tx: mpsc::Sender<Request>) {
             break;
         }
         // Wait 1 second before sending the next random command
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
