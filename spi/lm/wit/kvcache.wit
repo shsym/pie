@@ -30,36 +30,37 @@ interface kvcache {
     embed-image: func(url: string, position-offset: u32) -> input-embedding;
     embed-sound: func(url: string, position-offset: u32) -> input-embedding;
 
-    resource block {
+    resource context-block {
         // keeps block_id internally.
-        erase: func(range: tuple<u32, u32>);
+        fill: func(ctx:context, input: embedding, mask:mask, retain-output:bool);
+        empty: func(range: tuple<u32, u32>);
         copy: func(other:block, src-range:tuple<u32, u32>, dest-range:tuple<u32, u32>);
-        fill: func(context:block-list, input: embedding, mask:mask, retain-output:bool);
         output-embedding: func(range: tuple<u32, u32>) -> output-embedding;
+        drop-output-embedding: func();
     }
 
     // this is actually a set. The order is just for indexing purposes. So this is more like a ranged map.
     // RLE-like encoding could be used to compress the list.
     // This is only needed to avoid WASM-host boundary crosssing.
-    resource block-list {
-        constructor(blocks: list<block>);
+    resource context {
+        constructor(blocks: list<context-block>);
         length: func() -> u32;
-        append: func(block: block);
-        remove: func(block: block);
-        extend: func(blocks: block-list);
-        slice: func(range: tuple<u32, u32>) -> block-list;
-        index: func(position: u32) -> block;
+        append: func(block: context-block);
+        remove: func(block: context-block);
+        extend: func(ctx: context);
+        slice: func(range: tuple<u32, u32>) -> context;
+        index: func(position: u32) -> context-block;
+        clone: func() -> context;
     }
 
+    // return "initialized" block handles (block id reserved after 2^18)]
+    allocate-context: func(block-count:u32) -> context;
+    allocate-context-block: func() -> context-block;
 
-    // return "initialized" block handles (block id reserved after 2^18)
-    allocate-block: func() -> block;
-    allocate-blocks: func(count:u32) -> block-list;
+    free-context: func(ctx: context);
+    free-context-block: func(block: context-block);
 
-    free-block: func(block: block);
-    free-blocks: func(blocks: block-list);
-
-    available-blocks: func() -> u32;
+    available-context-blocks: func() -> u32;
 
     //
     //
