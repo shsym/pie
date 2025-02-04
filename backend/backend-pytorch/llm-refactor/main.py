@@ -70,7 +70,7 @@ def main(model):
 
     inputs = inputs.to(model.device)
 
-    max_new_tokens = 30
+    max_new_tokens = 32
     logits = None
     past_key_values = None
 
