@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoProcessor, QuantoConfig, GPTQConfig, TorchAoConfig, AutoTokenizer
+from transformers import AutoProcessor, TorchAoConfig, AutoTokenizer
 from qwen_utils import process_vision_info
 
 from qwen import Qwen2_5_VLForConditionalGeneration
@@ -15,7 +15,7 @@ def create_causal_mask(position_ids, ctx_len):
     # hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
     return attn_mask
-
+ 
 
 # @torch.inference_mode()
 def main(model):
@@ -91,35 +91,17 @@ def main(model):
                                               second_per_grid_ts=None
                                               )
 
-
     # print(position_ids)
     pos_offset += num_input_tokens - 1
     for i in range(max_new_tokens):
 
         # prefill
         if i == 0:
-            # input_ids: torch.LongTensor = None,
-            # attention_mask: Optional[torch.Tensor] = None,
-            # position_ids: Optional[torch.LongTensor] = None,
-            # past_key_values: Optional[List[torch.FloatTensor]] = None,
-            # inputs_embeds: Optional[torch.FloatTensor] = None,
-            # use_cache: Optional[bool] = None,
-            # output_attentions: Optional[bool] = None,
-            # output_hidden_states: Optional[bool] = None,
-            # return_dict: Optional[bool] = None,
-            # pixel_values: Optional[torch.Tensor] = None,
-            # pixel_values_videos: Optional[torch.FloatTensor] = None,
-            # image_grid_thw: Optional[torch.LongTensor] = None,
-            # video_grid_thw: Optional[torch.LongTensor] = None,
-            # rope_deltas: Optional[torch.LongTensor] = None,
-            # cache_position: Optional[torch.LongTensor] = None,
-            # second_per_grid_ts: Optional[torch.Tensor] = None,
 
             aaa = torch.arange(num_input_tokens, device=position_ids.device)
             attention_mask = create_causal_mask(aaa, num_input_tokens)
             buffer_sink_ids = buffer.allocate(num_input_tokens)
-            # print(attention_mask)
-            output = model(
+            logits = model(
                 input_ids=inputs.input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
@@ -128,8 +110,7 @@ def main(model):
                 buffer=buffer,
                 buffer_sink_ids=buffer_sink_ids
             )
-            logits = output.logits
-            #past_key_values = output.past_key_values
+
 
         else:
 
@@ -138,17 +119,13 @@ def main(model):
             attention_mask = create_causal_mask(aaa, num_input_tokens + i)
 
             buffer_sink_ids = buffer.allocate(1)
-            output = model(
+            logits = model(
                 input_ids=torch.as_tensor([[token]], device=device),
                 position_ids=position_ids.view(1, -1).expand(3, 1, 1),
                 attention_mask=attention_mask,
-                #past_key_values=past_key_values,
-                #cache_position=torch.as_tensor([[i + len(inputs.input_ids[0]) - 1]], device=device),
                 buffer=buffer,
                 buffer_sink_ids=buffer_sink_ids
             )
-            logits = output.logits
-            #past_key_values = output.past_key_values
 
         last_token_logits = logits[0, -1, :]
         token = int(torch.argmax(last_token_logits))
@@ -161,27 +138,12 @@ def main(model):
                                        spaces_between_special_tokens=False, )
         print(output_text)
 
-        ...
-    # print(model.config)
-
-    # Inference: Generation of the output
-    # generated_ids = model.generate(**inputs, max_new_tokens=128)
-    # generated_ids_trimmed = [
-    #     out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    # ]
-    # output_text = processor.batch_decode(
-    #     generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    # )
-    # print(output_text)
-
 
 if __name__ == "__main__":
     # default: Load the model on the available device(s)
     quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
 
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        "Qwen/Qwen2.5-VL-7B-Instruct", torch_dtype="bfloat16", device_map="cuda:0", quantization_config=quantization_config,
-        attn_implementation="eager"
-    )
+        "Qwen/Qwen2.5-VL-7B-Instruct", torch_dtype="bfloat16", device_map="cuda:0", quantization_config=quantization_config)
 
     main(model)

@@ -11,6 +11,10 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 
+class Config:
+
+    ...
+
 class L4maRmsNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -46,7 +50,7 @@ class L4maMlp(nn.Module):
 
 class L4maAttention(nn.Module):
 
-    def __init__(self, config, layer_idx: int, use_bias: bool = False):
+    def __init__(self, config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -57,10 +61,10 @@ class L4maAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=use_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=use_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=use_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=use_bias)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.use_qkv_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.use_qkv_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.use_qkv_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
     def forward(
             self,
@@ -126,6 +130,89 @@ class L4maAttention(nn.Module):
 
         attn_output = self.o_proj(attn_output)
         return attn_output
+
+
+class L4maDecoderLayer(nn.Module):
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = L4maAttention(config, layer_idx)
+
+        self.mlp = L4maMlp(config)
+        self.input_layernorm = L4maRmsNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = L4maRmsNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            position_embeddings: tuple[torch.Tensor, torch.Tensor],  # necessary, but kept here for BC
+            buffer: AttentionBuffer | None = None,
+            buffer_sink_ids: list[int] | None = None,
+            # **kwargs,
+    ) -> torch.Tensor:
+        residual = hidden_states
+
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # Self Attention
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            buffer=buffer,
+            buffer_sink_ids=buffer_sink_ids,
+        )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+class L4maModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        # super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [L4maDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = L4maRmsNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+            self,
+            inputs_embeds: torch.FloatTensor,
+            position_embeds: tuple[torch.FloatTensor, torch.FloatTensor],
+            attention_mask: torch.Tensor,
+            buffer: AttentionBuffer,
+            buffer_sink_ids: list[int],
+    ) -> torch.Tensor:
+        attention_mask = proc_mask(attention_mask, inputs_embeds.dtype)
+        hidden_states = inputs_embeds
+
+        for decoder_layer in self.layers:
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeds,
+                buffer=buffer,
+                buffer_sink_ids=buffer_sink_ids,
+            )
+
+            hidden_states = layer_outputs
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states
 
 
 def get_relocation_map(free_ids: SortedList, allocated_ids: SortedList) -> tuple[list[int], list[int]]:
