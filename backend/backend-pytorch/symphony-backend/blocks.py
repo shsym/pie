@@ -238,17 +238,19 @@ class Block:
     _location: BlockLocation
     _pointer: BlockPointer
 
-    _position_indices: list[int]
+    _position_ids: list[int]
     _occupancy: list[bool]
 
     _ref_count: int
     _last_used: int
+    _filled: bool
 
     def __init__(self, ptr: BlockPointer, location: BlockLocation, block_size: int):
         self._pointer = ptr
         self._location = location
-        self._position_indices = [0] * block_size
+        self._position_ids = [0] * block_size
         self._occupancy = [False] * block_size
+        self._filled = False
         self.increase_ref_count()
 
     def drop(self, start: int, end: int):
@@ -256,16 +258,28 @@ class Block:
             self._occupancy[i] = False
 
     @property
-    def pointer(self):
+    def size(self) -> int:
+        return len(self._position_ids)
+
+    @property
+    def pointer(self) -> BlockPointer:
         return self._pointer
 
     @property
-    def location(self):
+    def location(self) -> BlockLocation:
         return self._location
 
     @property
-    def ref_count(self):
+    def ref_count(self) -> int:
         return self._ref_count
+
+    @property
+    def position_ids(self) -> list[int]:
+        return self._position_ids
+
+    @property
+    def occupancy(self) -> list[bool]:
+        return self._occupancy
 
     def increase_ref_count(self):
         self._ref_count += 1
