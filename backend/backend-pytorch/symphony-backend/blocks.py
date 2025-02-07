@@ -5,8 +5,8 @@ import numpy as np
 import torch
 
 type InstanceId = bytes
-type BlockId = int
-type BlockPointer = int
+type KvBlockId = int
+type KvBlockPointer = int
 
 
 class BlockError(Exception):
@@ -14,17 +14,17 @@ class BlockError(Exception):
 
 
 class InstanceAddrSpace:
-    blocks: dict[BlockId, BlockPointer]
+    blocks: dict[KvBlockId, KvBlockPointer]
     id_counter: int
 
     def __init__(self):
         self.blocks = {}
         self.id_counter = 0
 
-    def translate(self, block_id: BlockId) -> BlockPointer:
+    def translate(self, block_id: KvBlockId) -> KvBlockPointer:
         return self.blocks[block_id]
 
-    def map(self, block_ptr: BlockPointer) -> BlockId:
+    def map(self, block_ptr: KvBlockPointer) -> KvBlockId:
         # create a new id
         block_id = self.id_counter
         self.id_counter += 1
@@ -32,23 +32,23 @@ class InstanceAddrSpace:
 
         return block_id
 
-    def unmap(self, block_id: BlockId):
+    def unmap(self, block_id: KvBlockId):
         del self.blocks[block_id]
 
-    def block_ids(self) -> list[BlockId]:
+    def block_ids(self) -> list[KvBlockId]:
         return list(self.blocks.keys())
 
 
-class BlockManager:
+class KvBlockManager:
     # block manager's job is to keep safe address space and storage per each user
 
-    global_addr_space: dict[BlockPointer, Block]
+    global_addr_space: dict[KvBlockPointer, KvBlock]
     virtual_addr_space: dict[InstanceId, InstanceAddrSpace]
 
     # in the future, we may want to have multiple block storages
-    storage: BlockStorage
+    storage: KvBlockStorage
 
-    def __init__(self, storage: BlockStorage):
+    def __init__(self, storage: KvBlockStorage):
         self.global_addr_space = {}
         self.virtual_addr_space = {}
         self.storage = storage
@@ -69,29 +69,29 @@ class BlockManager:
 
     ## --- Just helper functions to make the code more readable ----
 
-    def get_block(self, inst_id: InstanceId, block_id: BlockId) -> Block:
+    def get_block(self, inst_id: InstanceId, block_id: KvBlockId) -> KvBlock:
         return self.get_blocks(inst_id, [block_id])[0]
 
-    def create_block(self, inst_id: InstanceId) -> BlockId:
+    def create_block(self, inst_id: InstanceId) -> KvBlockId:
         return self.create_blocks(inst_id, 1)[0]
 
-    def delete_block(self, inst_id: InstanceId, block: BlockId):
+    def delete_block(self, inst_id: InstanceId, block: KvBlockId):
         self.delete_blocks(inst_id, [block])
 
     ## --------------------------------------------------------
 
-    def copy_tokens(self, inst_id: InstanceId, src: BlockId, dst: BlockId, src_offset: int, dst_offset: int, size: int):
+    def copy_tokens(self, inst_id: InstanceId, src: KvBlockId, dst: KvBlockId, src_offset: int, dst_offset: int, size: int):
         src_block = self.get_block(inst_id, src)
         dst_block = self.get_block(inst_id, dst)
         self.storage.copy(self.storage, src_block.pointer, dst_block.pointer, src_offset, dst_offset, size)
 
-    def drop_tokens(self, inst_id: InstanceId, block: BlockId, start: int, end: int):
+    def drop_tokens(self, inst_id: InstanceId, block: KvBlockId, start: int, end: int):
         block = self.get_block(inst_id, block)
         block.drop(start, end)
 
     ## --- Methods to manage blocks --------------------------------
 
-    def get_blocks(self, inst_id: InstanceId, block_ids: list[BlockId]) -> list[Block]:
+    def get_blocks(self, inst_id: InstanceId, block_ids: list[KvBlockId]) -> list[KvBlock]:
         addr_space = self.virtual_addr_space[inst_id]
 
         blocks = []
@@ -101,7 +101,7 @@ class BlockManager:
             blocks.append(self.global_addr_space[b_ptr])
         return blocks
 
-    def create_blocks(self, inst_id: InstanceId, num_blocks: int) -> list[BlockId]:
+    def create_blocks(self, inst_id: InstanceId, num_blocks: int) -> list[KvBlockId]:
 
         addr_space = self.virtual_addr_space[inst_id]
 
@@ -112,13 +112,13 @@ class BlockManager:
         # then, create the block objects
         blocks_ids = []
         for block_ptr in block_ptrs:
-            self.global_addr_space[block_ptr] = Block(block_ptr, BlockLocation.GPU, block_size)
+            self.global_addr_space[block_ptr] = KvBlock(block_ptr, StorageTier.GPU, block_size)
             block_id = addr_space.map(block_ptr)
             blocks_ids.append(block_id)
 
         return blocks_ids
 
-    def create_linked_blocks(self, inst_id: InstanceId, src_inst_id: InstanceId, src_block_ids: list[BlockId]) -> list[BlockId]:
+    def create_linked_blocks(self, inst_id: InstanceId, src_inst_id: InstanceId, src_block_ids: list[KvBlockId]) -> list[KvBlockId]:
 
         dst_addr_space = self.virtual_addr_space[inst_id]
         src_addr_space = self.virtual_addr_space[src_inst_id]
@@ -134,7 +134,7 @@ class BlockManager:
 
         return dst_block_ids
 
-    def delete_blocks(self, inst_id: InstanceId, block_ids: list[BlockId]):
+    def delete_blocks(self, inst_id: InstanceId, block_ids: list[KvBlockId]):
 
         addr_space = self.virtual_addr_space[inst_id]
 
@@ -153,12 +153,12 @@ class BlockManager:
     ## --------------------------------------------------------
 
 
-class BlockStorage:
+class KvBlockStorage:
     ptr: list[torch.Tensor]
     _num_blocks: int
     device: torch.device
 
-    addr_map: dict[BlockId, int]
+    addr_map: dict[KvBlockId, int]
     index: np.ndarray
 
     num_layers: int
@@ -181,7 +181,7 @@ class BlockStorage:
         self.base_ptr = torch.empty((num_layers, max_capacity, num_head, block_size * 2, block_dim), device=device, dtype=dtype)
         self.ptr = [self.base_ptr[i] for i in range(num_layers)]
 
-    def allocate(self, num_blocks: int) -> list[BlockPointer]:
+    def allocate(self, num_blocks: int) -> list[KvBlockPointer]:
 
         if self.num_free_blocks() == 0:
             raise BlockError("No free blocks available")
@@ -203,11 +203,11 @@ class BlockStorage:
 
         return allocated
 
-    def free(self, block_ptrs: list[BlockPointer]):
+    def free(self, block_ptrs: list[KvBlockPointer]):
         for block_ptr in block_ptrs:
             self.index[block_ptr] = True
 
-    def copy(self, src: BlockStorage, src_ptr: BlockPointer, dst_ptr: BlockPointer, src_offset: int, dst_offset: int, size: int):
+    def copy(self, src: KvBlockStorage, src_ptr: KvBlockPointer, dst_ptr: KvBlockPointer, src_offset: int, dst_offset: int, size: int):
 
         # fast path
         if size == self.block_size:
@@ -227,16 +227,16 @@ class BlockStorage:
         return sum([ptr.numel() * ptr.element_size() for ptr in self.ptr])
 
 
-class BlockLocation(Enum):
+class StorageTier(Enum):
     CPU = 0
     GPU = 1
     REMOVED = 2
     SCHEDULED = 3
 
 
-class Block:
-    _location: BlockLocation
-    _pointer: BlockPointer
+class KvBlock:
+    _location: StorageTier
+    _pointer: KvBlockPointer
 
     _position_ids: list[int]
     _occupancy: list[bool]
@@ -245,7 +245,7 @@ class Block:
     _last_used: int
     _filled: bool
 
-    def __init__(self, ptr: BlockPointer, location: BlockLocation, block_size: int):
+    def __init__(self, ptr: KvBlockPointer, location: StorageTier, block_size: int):
         self._pointer = ptr
         self._location = location
         self._position_ids = [0] * block_size
@@ -262,11 +262,11 @@ class Block:
         return len(self._position_ids)
 
     @property
-    def pointer(self) -> BlockPointer:
+    def pointer(self) -> KvBlockPointer:
         return self._pointer
 
     @property
-    def location(self) -> BlockLocation:
+    def location(self) -> StorageTier:
         return self._location
 
     @property
@@ -280,6 +280,23 @@ class Block:
     @property
     def occupancy(self) -> list[bool]:
         return self._occupancy
+
+    @property
+    def filled(self) -> bool:
+        return self._filled
+
+    def set_occupancy(self, occupancy: list[bool]):
+        if len(occupancy) != self.size:
+            raise BlockError("Invalid occupancy size")
+        self._occupancy = occupancy
+
+    def set_position_ids(self, position_ids: list[int]):
+        if len(position_ids) != self.size:
+            raise BlockError("Invalid position_ids size")
+        self._position_ids = position_ids
+
+    def set_filled(self, filled: bool):
+        self._filled = filled
 
     def increase_ref_count(self):
         self._ref_count += 1

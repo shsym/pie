@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Union
 
-from blocks import BlockManager
+from blocks import KvBlockManager
 
 
 # =============================================================================
@@ -74,7 +74,7 @@ CommandPayload = Union[
 
 
 class ServerState:
-    block_mgr: BlockManager
+    block_mgr: KvBlockManager
     ...
 
 

@@ -10,7 +10,7 @@ from sortedcontainers import SortedList
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from blocks import BlockStorage, BlockId
+from blocks import KvBlockStorage, KvBlockId
 
 
 @dataclasses.dataclass
@@ -31,7 +31,7 @@ class Input:
     position_embeds: torch.Tensor
     attention_mask: torch.Tensor
 
-    block_storage: BlockStorage
+    block_storage: KvBlockStorage
     target_blocks: torch.LongTensor  # (N)
     context_blocks: torch.LongTensor  # (N, #blocks-in-bundle)
     reduction_groups: torch.LongTensor  # (num-cmd, #max-num-bundles-in-cmd)
@@ -234,7 +234,7 @@ class Model(nn.Module):
             position_embeds: torch.Tensor,
             attention_mask: torch.Tensor,
 
-            block_storage: BlockStorage,
+            block_storage: KvBlockStorage,
             target_blocks: torch.LongTensor,  # (N)
             context_blocks: torch.LongTensor,  # (N, #blocks-in-bundle)
             reduction_groups: torch.LongTensor,  # (num-cmd, #max-num-bundles-in-cmd)

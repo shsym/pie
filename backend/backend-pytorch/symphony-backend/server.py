@@ -8,7 +8,7 @@ from typing import Union
 import numpy as np
 import torch
 
-from blocks import BlockManager, BlockStorage, Block, BlockId, BlockPointer
+from blocks import KvBlockManager, KvBlockStorage, KvBlock, KvBlockId, KvBlockPointer
 
 type InstanceId = bytes
 
@@ -198,19 +198,19 @@ class ServerState:
     and enforces a finite capacity.
     """
 
-    block_manager: BlockManager
+    block_manager: KvBlockManager
     fill_cmd_batcher: FillBlockCmdBatcher
     img_cmd_batcher: CreateImageTokensCmdBatcher
 
-    def __init__(self, block_storage: BlockStorage):
-        self.block_manager = BlockManager(block_storage)
+    def __init__(self, block_storage: KvBlockStorage):
+        self.block_manager = KvBlockManager(block_storage)
         self.fill_cmd_batcher = FillBlockCmdBatcher()
 
-    def allocate_blocks(self, inst_id: InstanceId, num_blocks: int) -> list[BlockId]:
+    def allocate_blocks(self, inst_id: InstanceId, num_blocks: int) -> list[KvBlockId]:
         new_block_ids = self.block_manager.create_blocks(inst_id, num_blocks)
         return new_block_ids
 
-    def fill_blocks(self, inst_id: InstanceId, block_id: BlockId, ctx_block_ids: list[BlockId], block_mask: list[list[bool]], embeddings: list[Token], retain_output_embed: bool):
+    def fill_blocks(self, inst_id: InstanceId, block_id: KvBlockId, ctx_block_ids: list[KvBlockId], block_mask: list[list[bool]], embeddings: list[Token], retain_output_embed: bool):
         # first validate if all the blocks are in the storage
 
         addr_space = self.block_manager.virtual_addr_space[inst_id]
@@ -227,16 +227,16 @@ class ServerState:
         self.fill_cmd_batcher.add
         ...
 
-    def free_blocks(self, inst_id: InstanceId, offset: BlockId, count: int):
+    def free_blocks(self, inst_id: InstanceId, offset: KvBlockId, count: int):
         self.block_manager.delete_blocks(inst_id, list(range(offset, offset + count)))
 
     def available_blocks(self) -> int:
         return self.block_manager.num_free_blocks()
 
-    def copy_tokens(self, inst_id: InstanceId, src_block_id: BlockId, dst_block_id: BlockId, src_offset: int, dst_offset: int, size: int):
+    def copy_tokens(self, inst_id: InstanceId, src_block_id: KvBlockId, dst_block_id: KvBlockId, src_offset: int, dst_offset: int, size: int):
         self.block_manager.copy_tokens(inst_id, src_block_id, dst_block_id, src_offset, dst_offset, size)
 
-    def drop_tokens(self, inst_id: InstanceId, block_id: BlockId, offset: int, size: int):
+    def drop_tokens(self, inst_id: InstanceId, block_id: KvBlockId, offset: int, size: int):
         self.block_manager.drop_tokens(inst_id, block_id, offset, size)
 
 
@@ -312,7 +312,14 @@ def parse_incoming_message(msg: list) -> Request:
     )
 
 
-def handle_command(req: Request, state: ServerState) -> tuple[Response | None, bool]:
+def pad_list(x, max_len, pad_value):
+    if len(x) > max_len:
+        raise ValueError("List is too long")
+    else:
+        return x + [pad_value] * (max_len - len(x))
+
+
+def handle_command(state: ServerState, req: Request) -> tuple[Response | None, bool]:
     """
     Process a typed request, returning a Response if the command needs one.
     """
@@ -334,12 +341,34 @@ def handle_command(req: Request, state: ServerState) -> tuple[Response | None, b
 
         case (CommandKind.FILL_BLOCK, FillBlockCmd(block_id=block_id, ctx_block_ids=ctx_block_ids, block_mask=block_mask, tokens=embeddings, retain_output_embed=retain_output_embed)):
 
+            # inspect the embedding to see if they are ready. if not, return None, False
+            for b in embeddings:
+                if isinstance(b, ImageToken):
+                    if not state.img_cmd_batcher.is_ready(b.image_url):
+                        return None, False
+
+
             # fill the block with the position id and occupancy mask
+            tgt_block = state.block_manager.get_block(req.instance_id, block_id)
+            tgt_block.set_occupancy(pad_list([True] * len(embeddings), tgt_block.size, False))
+            tgt_block.set_position_ids(pad_list([b.position_id for b in embeddings], tgt_block.size, 0))
+
+            tgt_block.set_filled(False)
+
+            cmd = _FillBlockCmd(
+                block=tgt_block,
+                ctx_blocks=[state.block_manager.get_block(req.instance_id, b_id) for b_id in ctx_block_ids],
+                block_mask=block_mask,
+                embeddings=embeddings,
+                retain_output_embed=retain_output_embed
+            )
+
+            state.fill_cmd_batcher.add(cmd)
 
             return None, True
 
         case (CommandKind.FREE_BLOCK, FreeBlockCmd(block_id_offset=offset, count=c)):
-            state.free_blocks(offset, c)
+            state.free_blocks(req.instance_id, offset, c)
             return None, True
 
         case (CommandKind.AVAILABLE_BLOCKS, AvailableBlocksCmd()):
@@ -351,11 +380,11 @@ def handle_command(req: Request, state: ServerState) -> tuple[Response | None, b
             ), True
 
         case (CommandKind.COPY_TOKENS, CopyTokensCmd(src_block_id=src, dst_block_id=dst, src_offset=src_offset, dst_offset=dst_offset, size=size)):
-            state.copy_tokens(src, dst, src_offset, dst_offset, size)
+            state.copy_tokens(req.instance_id, src, dst, src_offset, dst_offset, size)
             return None, True
 
         case (CommandKind.DROP_TOKENS, DropTokensCmd(block_id=b, offset=offset, size=size)):
-            state.drop_tokens(b, offset, size)
+            state.drop_tokens(req.instance_id, b, offset, size)
             return None, True
 
         case (CommandKind.CREATE_IMAGE_TOKENS, CreateImageTokensCmd(image_url=url)):
@@ -412,15 +441,15 @@ class BatchItem:
 
 
 class ChunkedContext:
-    block: Block
-    ctx_blocks: list[Block]
+    block: KvBlock
+    ctx_blocks: list[KvBlock]
     ctx_block_mask: list[bool]
 
 
 @dataclass
 class _FillBlockCmd:
-    block: Block
-    ctx_blocks: list[Block]
+    block: KvBlock
+    ctx_blocks: list[KvBlock]
     block_mask: list[bool]
     embeddings: list[Token]
     retain_output_embed: bool
@@ -428,7 +457,7 @@ class _FillBlockCmd:
 
 class FillBlockCmdBatcher:
     queue: list[_FillBlockCmd]
-    redundancy_check: dict[BlockPointer, _FillBlockCmd]
+    redundancy_check: dict[KvBlockPointer, _FillBlockCmd]
 
     def __init__(self):
         self.queue = []
