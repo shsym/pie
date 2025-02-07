@@ -465,12 +465,17 @@ class FillBlockCmdBatcher:
         chunk_size = self.get_chunk_size()
 
         cmd_groups = []  # 2d (NUM_CMDS, MAX_NUM_CHUNKS)
+
+        # N = sum(NUM_CHUNKS per command)
+
         batched_tgt_block_ptrs = []  # 1d (N, 1)
         batched_ctx_block_ptrs = []  # 2d (N, CHUNK_SIZE)
 
         batched_token_ids = []  # 2d (N, BLOCK_SIZE)
         batched_pos_ids = []  # 2d (N, BLOCK_SIZE)
         batched_mask = []  # 3d (N, BLOCK_SIZE * CHUNK_SIZE, BLOCK_SIZE)
+
+        token_id_map = []
 
         for cmd in self.queue:
 
@@ -510,13 +515,16 @@ class FillBlockCmdBatcher:
                     if isinstance(b, TextToken):
                         token_ids.append(b.token_id)
 
-                    elif isinstance(b, ImageToken):
-                        # get the image token
-                        pass
+                    else:
+                        # just fill in stubs. It will be filled in later
+                        token_ids.append(0)
 
-                    elif isinstance(b, VideoToken):
-                        # get the video token
-                        pass
+                        # get the image token
+                        token_id_map.append({
+                            "n": len(batched_token_ids),
+                            "i": len(token_ids) - 1,
+                            "token": b
+                        })
 
                 # this is better than computing masks for the entire command.
                 # most of the masks will be zeros anyway. so this kinda leverages the sparsity.
@@ -559,7 +567,8 @@ class FillBlockCmdBatcher:
             "token_ids": batched_token_ids,
             "pos_ids": batched_pos_ids,
             "mask": batched_mask,
-            "cmd_groups": cmd_groups
+            "cmd_groups": cmd_groups,
+            "token_id_map": token_id_map
         }
 
     def clear(self):
