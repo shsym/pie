@@ -8,7 +8,7 @@ from typing import Union
 import numpy as np
 import torch
 
-from blocks import KvBlockManager, KvBlockStorage, KvBlock, KvBlockId, KvBlockPointer
+from blocks import KvBlockManager, KvBlockStorage, KvBlock, KvBlockId, KvBlockPointer, EmbeddingManager, EmbeddingStorage
 
 type InstanceId = bytes
 
@@ -193,17 +193,21 @@ class Response:
 
 
 class ServerState:
-    """
-    Maintains a set of allocated block IDs, a global counter for new blocks,
-    and enforces a finite capacity.
-    """
-
+    # state management
     block_manager: KvBlockManager
+    input_manager: EmbeddingManager
+    output_manager: EmbeddingManager
+
+    # command batcher
     fill_cmd_batcher: FillBlockCmdBatcher
     img_cmd_batcher: CreateImageTokensCmdBatcher
 
-    def __init__(self, block_storage: KvBlockStorage):
+    def __init__(self, block_storage: KvBlockStorage, embedding_storage: EmbeddingStorage):
         self.block_manager = KvBlockManager(block_storage)
+
+        # input and output managers actually share the same physical storage
+        self.input_manager = EmbeddingManager(embedding_storage)
+        self.output_manager = EmbeddingManager(embedding_storage)
         self.fill_cmd_batcher = FillBlockCmdBatcher()
 
     def allocate_blocks(self, inst_id: InstanceId, num_blocks: int) -> list[KvBlockId]:
@@ -346,7 +350,6 @@ def handle_command(state: ServerState, req: Request) -> tuple[Response | None, b
                 if isinstance(b, ImageToken):
                     if not state.img_cmd_batcher.is_ready(b.image_url):
                         return None, False
-
 
             # fill the block with the position id and occupancy mask
             tgt_block = state.block_manager.get_block(req.instance_id, block_id)
