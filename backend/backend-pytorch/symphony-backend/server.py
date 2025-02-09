@@ -8,7 +8,7 @@ from typing import Union
 import numpy as np
 import torch
 
-from blocks import KvBlockManager, KvBlockStorage, KvBlock, KvBlockId, KvBlockPointer, EmbeddingManager, EmbeddingStorage
+from blocks import KvBlockManager, BlockStorage, KvBlock, Address, Address, EmbeddingManager, EmbeddingStorage
 
 type InstanceId = bytes
 
@@ -192,7 +192,27 @@ class Response:
     payload: ResponsePayload
 
 
+
+
+# Any reusable states, blocks and embeddings
+class Resource:
+    name:str
+
+    # ones that are not in the list are denied
+    access_control: list[str]
+
+    def __init__(self, name: str):
+        self.name = name
+        self.access_control = []
+
+
 class ServerState:
+
+    # resource name resolution.
+
+    # public resources should be visible to the users.
+    resources: dict[str, str]
+
     # state management
     block_manager: KvBlockManager
     input_manager: EmbeddingManager
@@ -202,7 +222,7 @@ class ServerState:
     fill_cmd_batcher: FillBlockCmdBatcher
     img_cmd_batcher: CreateImageTokensCmdBatcher
 
-    def __init__(self, block_storage: KvBlockStorage, embedding_storage: EmbeddingStorage):
+    def __init__(self, block_storage: BlockStorage, embedding_storage: EmbeddingStorage):
         self.block_manager = KvBlockManager(block_storage)
 
         # input and output managers actually share the same physical storage
@@ -210,37 +230,37 @@ class ServerState:
         self.output_manager = EmbeddingManager(embedding_storage)
         self.fill_cmd_batcher = FillBlockCmdBatcher()
 
-    def allocate_blocks(self, inst_id: InstanceId, num_blocks: int) -> list[KvBlockId]:
-        new_block_ids = self.block_manager.create_blocks(inst_id, num_blocks)
+    def allocate_blocks(self, inst_id: InstanceId, num_blocks: int) -> list[Address]:
+        new_block_ids = self.block_manager.allocate_blocks(inst_id, num_blocks)
         return new_block_ids
 
-    def fill_blocks(self, inst_id: InstanceId, block_id: KvBlockId, ctx_block_ids: list[KvBlockId], block_mask: list[list[bool]], embeddings: list[Token], retain_output_embed: bool):
+    def fill_blocks(self, inst_id: InstanceId, block_id: Address, ctx_block_ids: list[Address], block_mask: list[list[bool]], embeddings: list[Token], retain_output_embed: bool):
         # first validate if all the blocks are in the storage
 
-        addr_space = self.block_manager.virtual_addr_space[inst_id]
+        addr_space = self.block_manager.addr_space[inst_id]
 
         # translate all block ids into block ptr
         ctx_block_ptrs = []
         for b_id in ctx_block_ids:
-            b_ptr = addr_space.translate(b_id)
+            b_ptr = addr_space.resolve(b_id)
             ctx_block_ptrs.append(b_ptr)
 
-        block_ptr = addr_space.translate(block_id)
+        block_ptr = addr_space.resolve(block_id)
 
         # self.cmd_batcher << accepts block pointers.
         self.fill_cmd_batcher.add
         ...
 
-    def free_blocks(self, inst_id: InstanceId, offset: KvBlockId, count: int):
+    def free_blocks(self, inst_id: InstanceId, offset: Address, count: int):
         self.block_manager.delete_blocks(inst_id, list(range(offset, offset + count)))
 
     def available_blocks(self) -> int:
         return self.block_manager.num_free_blocks()
 
-    def copy_tokens(self, inst_id: InstanceId, src_block_id: KvBlockId, dst_block_id: KvBlockId, src_offset: int, dst_offset: int, size: int):
+    def copy_tokens(self, inst_id: InstanceId, src_block_id: Address, dst_block_id: Address, src_offset: int, dst_offset: int, size: int):
         self.block_manager.copy_tokens(inst_id, src_block_id, dst_block_id, src_offset, dst_offset, size)
 
-    def drop_tokens(self, inst_id: InstanceId, block_id: KvBlockId, offset: int, size: int):
+    def drop_tokens(self, inst_id: InstanceId, block_id: Address, offset: int, size: int):
         self.block_manager.drop_tokens(inst_id, block_id, offset, size)
 
 
@@ -460,7 +480,7 @@ class _FillBlockCmd:
 
 class FillBlockCmdBatcher:
     queue: list[_FillBlockCmd]
-    redundancy_check: dict[KvBlockPointer, _FillBlockCmd]
+    redundancy_check: dict[Address, _FillBlockCmd]
 
     def __init__(self):
         self.queue = []
