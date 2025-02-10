@@ -1,5 +1,7 @@
 mod spi;
 mod cmd_buffer;
+mod state;
+//mod state_old;
 
 use crate::spi::{App, InstanceMessage, InstanceState};
 use anyhow::Context;

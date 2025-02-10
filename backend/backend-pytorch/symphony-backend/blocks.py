@@ -19,23 +19,23 @@ class BlockError(Exception):
 
 class AddressMap:
     mapping: dict[Address, Address]
-    addr_assignment: count
+    _id_generator: count
 
     def __init__(self):
         self.mapping = {}
-        self.addr_assignment = count(start=0, step=1)
+        self._id_generator = count(start=0, step=1)
 
     def resolve(self, virtual_addr: Address) -> Address:
         return self.mapping[virtual_addr]
 
-    def allocate(self, addr: Address) -> Address:
+    def register(self, addr: Address) -> Address:
         # create a new id
-        virtual_addr = next(self.addr_assignment)
+        virtual_addr = next(self._id_generator)
         self.mapping[virtual_addr] = addr
 
         return virtual_addr
 
-    def release(self, virtual_addr: Address):
+    def unregister(self, virtual_addr: Address):
         del self.mapping[virtual_addr]
 
 
@@ -175,7 +175,7 @@ class BlockManager[BT:Block, ST:BlockStorage]:
             g_addr = next(self.addr_assignment)
 
             self.blocks[g_addr] = block
-            v_addr = addr_space.allocate(g_addr)
+            v_addr = addr_space.register(g_addr)
             v_addrs.append(v_addr)
 
         return v_addrs
@@ -191,7 +191,7 @@ class BlockManager[BT:Block, ST:BlockStorage]:
             block = self.blocks[g_addr]
             block.reference_count += 1
 
-            dst_v_addr = dst_addr_space.allocate(g_addr)
+            dst_v_addr = dst_addr_space.register(g_addr)
             dst_v_addrs.append(dst_v_addr)
 
         return dst_v_addrs
@@ -206,7 +206,7 @@ class BlockManager[BT:Block, ST:BlockStorage]:
             block = self.blocks[g_addr]
             block.reference_count -= 1
 
-            addr_space.release(v_addr)
+            addr_space.unregister(v_addr)
 
             if block.reference_count <= 0:
 
@@ -315,13 +315,13 @@ class KvBlockManager(BlockManager[KvBlock, KvBlockStorage]):
 
 # Token-level Embedding. This can be either input embedding out output embedding.
 
-class Embedding(Block):
+class TokenEmbed(Block):
 
     def __init__(self, ptr: Address):
         super().__init__(ptr)
 
 
-class EmbeddingStorage(BlockStorage):
+class TokenEmbedStorage(BlockStorage):
     ptr: torch.Tensor
 
     block_dim: int
@@ -347,11 +347,11 @@ class EmbeddingStorage(BlockStorage):
         return sum([ptr.numel() * ptr.element_size() for ptr in self.ptr])
 
 
-class EmbeddingManager(BlockManager[Embedding, EmbeddingStorage]):
+class TokenEmbedManager(BlockManager[TokenEmbed, TokenEmbedStorage]):
 
-    def __init__(self, storage: EmbeddingStorage):
+    def __init__(self, storage: TokenEmbedStorage):
         super().__init__(storage)
 
-    def create_block(self, ptr: BlockPointer) -> Embedding:
-        emb = Embedding(ptr)
+    def create_block(self, ptr: BlockPointer) -> TokenEmbed:
+        emb = TokenEmbed(ptr)
         return emb
