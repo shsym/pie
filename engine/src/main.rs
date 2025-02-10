@@ -1,6 +1,7 @@
 mod spi;
 mod cmd_buffer;
-mod state;
+mod remote_obj;
+mod handler;
 //mod state_old;
 
 use crate::spi::{App, InstanceMessage, InstanceState};
