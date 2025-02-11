@@ -1,6 +1,7 @@
 use crate::state::{
-    Addr, BlockError, InstanceId, KvBlock, KvBlockFiller, KvBlockManager, KvBlockManipulator,
-    ObjectManager, RemoteObjId, TokenEmbManager,
+    Addr, BlockError, ImageEmbedder, InstanceId, KvBlock, KvBlockFiller, KvBlockManager,
+    KvBlockManipulator, ObjectAllocator, ObjectManager, RemoteObjId, TokenEmb, TokenEmbManager,
+    VideoEmbedder,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -196,9 +197,53 @@ where
     ) -> Result<(), BlockError> {
         self.kv_blocks.mask_tokens(inst_id, addr, &mask)
     }
+
+    pub fn allocate_token_emb(&mut self, inst_id: &InstanceId) -> Result<Addr, BlockError> {
+        self.token_embs.alloc(inst_id, TokenEmb::new())
+    }
+
+    pub fn deallocate_token_emb(
+        &mut self,
+        inst_id: &InstanceId,
+        addr: Addr,
+    ) -> Result<(), BlockError> {
+        self.token_embs.dealloc(inst_id, addr)
+    }
+    
+    
 }
 
-// Only for multimodal LLMs
+// For multimodal LLMs
+impl<B> ServerState<B>
+where
+    B: ImageEmbedder + VideoEmbedder + ObjectAllocator<TokenEmb>,
+{
+    pub fn embed_image(
+        &mut self,
+        inst_id: &InstanceId,
+        token_addrs: Vec<Addr>,
+        image_url: String,
+    ) -> Result<(), BlockError> {
+        let ptrs = self.token_embs.resolve_many(inst_id, &token_addrs)?;
+
+        self.backend.embed_img(inst_id, ptrs, image_url)?;
+
+        Ok(())
+    }
+
+    pub fn embed_video(
+        &mut self,
+        inst_id: &InstanceId,
+        token_addrs: Vec<Addr>,
+        video_url: String,
+    ) -> Result<(), BlockError> {
+        let ptrs = self.token_embs.resolve_many(inst_id, &token_addrs)?;
+
+        self.backend.embed_vid(inst_id, ptrs, video_url)?;
+
+        Ok(())
+    }
+}
 
 //
 // pub struct FillBlockCmdBatcher {

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use num_traits::PrimInt;
-
 use crate::utils::{Counter, IdPool};
+use num_traits::PrimInt;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 pub type InstanceId = Uuid;
@@ -30,9 +30,20 @@ pub trait ReferenceCounted {
 }
 
 pub trait ObjectAllocator<T: ReferenceCounted> {
+    type RawRepr;
+
     fn alloc(&self, stream_id: &InstanceId) -> Result<RemoteObjId, BlockError>;
 
     fn dealloc(&self, stream_id: &InstanceId, obj_id: RemoteObjId) -> Result<(), BlockError>;
+
+    // retrieve the underlying data from the backend.
+    // this is unlikely to be used in practice, except for debugging, implementing some new sampling algos, and so on.
+    fn raw_repr(
+        &self,
+        stream_id: &InstanceId,
+        obj_id: RemoteObjId,
+        sender: oneshot::Sender<Self::RawRepr>,
+    ) -> Result<(), BlockError>;
 
     fn available(&self) -> usize;
 }
@@ -234,7 +245,7 @@ pub trait KvBlockFiller: ObjectAllocator<KvBlock> + ObjectAllocator<TokenEmb> {
 // ------------------------------------------------------------
 
 impl KvBlock {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         KvBlock {
             counter: Counter::new(0),
             position_ids: Vec::new(),
@@ -316,8 +327,8 @@ where
         dst_token_offset: usize,
         size: usize,
     ) -> Result<(), BlockError> {
-        let src_block_ptr = self.get(inst_id, src_addr)?.id;
-        let dst_block_ptr = self.get(inst_id, dst_addr)?.id;
+        let src_block_ptr = self.resolve(inst_id, src_addr)?;
+        let dst_block_ptr = self.resolve(inst_id, dst_addr)?;
 
         self.backend().copy_tokens(
             inst_id,
@@ -353,14 +364,13 @@ where
         virtual_addr: Addr,
         mask: &[bool],
     ) -> Result<(), BlockError> {
-        let block_id = {
-            let block = self.get_mut(inst_id, virtual_addr)?;
-            for i in 0..mask.len() {
-                block.occupied[i] = mask[i];
-            }
-            block.id
-        };
-        self.backend.mask_tokens(inst_id, block_id, mask)?;
+        let block_ptr = self.resolve(inst_id, virtual_addr)?;
+        self.backend.mask_tokens(inst_id, block_ptr, mask)?;
+
+        let block = self.get_mut(inst_id, virtual_addr)?;
+        for i in 0..mask.len() {
+            block.occupied[i] = mask[i];
+        }
 
         Ok(())
     }
@@ -373,7 +383,7 @@ pub struct TokenEmb {
 }
 
 impl TokenEmb {
-    fn new() -> Self {
+    pub fn new() -> Self {
         TokenEmb {
             counter: Counter::new(0),
         }
@@ -440,13 +450,23 @@ where
 // ------------------------------------------------------------
 
 // Trait for backends that can embed images.
-pub trait ImageEmbedder {
-    fn embed(&self, inst_id: &InstanceId, addr: Addr) -> Result<RemoteObjId, BlockError>;
+pub trait ImageEmbedder: ObjectAllocator<TokenEmb> {
+    fn embed_img(
+        &self,
+        inst_id: &InstanceId,
+        addrs: Vec<RemoteObjId>,
+        url: String,
+    ) -> Result<(), BlockError>;
 }
 
 // Trait for backends that can embed videos.
-pub trait VideoEmbedder {
-    fn embed(&self, inst_id: &InstanceId, addr: Addr) -> Result<RemoteObjId, BlockError>;
+pub trait VideoEmbedder: ObjectAllocator<TokenEmb> {
+    fn embed_vid(
+        &self,
+        inst_id: &InstanceId,
+        addrs: Vec<RemoteObjId>,
+        url: String,
+    ) -> Result<(), BlockError>;
 }
 
 // ------------------------------------------------------------

@@ -1,9 +1,11 @@
 use crate::state::{
-    Addr, BlockError, IdPool, KvBlock, KvBlockFiller, KvBlockManipulator, ObjectAllocator,
-    RemoteObjId, TokenEmb,
+    Addr, BlockError, ImageEmbedder, InstanceId, KvBlock, KvBlockFiller, KvBlockManipulator,
+    ObjectAllocator, RemoteObjId, TokenEmb,
 };
+use crate::utils::IdPool;
 use std::cell::RefCell;
 use std::rc::Rc;
+use tokio::sync::oneshot::Sender;
 use uuid::Uuid;
 
 type StreamId = Uuid;
@@ -64,6 +66,8 @@ impl Backend {
 }
 
 impl ObjectAllocator<TokenEmb> for Backend {
+    type RawRepr = Vec<f32>;
+
     fn alloc(&self, stream_id: &StreamId) -> Result<RemoteObjId, BlockError> {
         let new_obj_id = self
             .inner
@@ -88,12 +92,24 @@ impl ObjectAllocator<TokenEmb> for Backend {
         Ok(())
     }
 
+    fn raw_repr(
+        &self,
+        stream_id: &InstanceId,
+        obj_id: RemoteObjId,
+        sender: Sender<Self::RawRepr>,
+    ) -> Result<(), BlockError> {
+        todo!()
+    }
+
     fn available(&self) -> usize {
         self.inner.borrow().emb_id_pool.available()
     }
 }
 
 impl ObjectAllocator<KvBlock> for Backend {
+    // The raw representation of a kv block is not really useful in any way. So we just use usize.
+    type RawRepr = usize;
+
     fn alloc(&self, stream_id: &StreamId) -> Result<RemoteObjId, BlockError> {
         let new_obj_id = self
             .inner
@@ -115,6 +131,16 @@ impl ObjectAllocator<KvBlock> for Backend {
         let cmd = Command::DeallocateKvBlock(obj_id);
         self.enqueue_cmd(stream_id, cmd)?;
 
+        Ok(())
+    }
+
+    fn raw_repr(
+        &self,
+        stream_id: &InstanceId,
+        obj_id: RemoteObjId,
+        sender: Sender<Self::RawRepr>,
+    ) -> Result<(), BlockError> {
+        sender.send(obj_id).unwrap();
         Ok(())
     }
 
@@ -167,5 +193,18 @@ impl KvBlockFiller for Backend {
 
         self.enqueue_cmd(stream_id, cmd)?;
         Ok(())
+    }
+}
+
+/// for multimodal LLMs
+
+impl ImageEmbedder for Backend {
+    fn embed_img(
+        &self,
+        stream_id: &StreamId,
+        addrs: Vec<RemoteObjId>,
+        url: String,
+    ) -> Result<(), BlockError> {
+        todo!()
     }
 }
