@@ -1,7 +1,9 @@
 mod spi;
 mod cmd_buffer;
-mod remote_obj;
+mod state;
 mod handler;
+mod backend;
+mod utils;
 //mod state_old;
 
 use crate::spi::{App, InstanceMessage, InstanceState};
