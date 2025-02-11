@@ -1,5 +1,5 @@
 use crate::state::{
-    Addr, BlockError, ImageEmbedder, InstanceId, KvBlock, KvBlockFiller, KvBlockManager,
+    Addr, BlockError, ImageEmbedder, InstanceId, KvBlock, CausalTransformer, KvBlockManager,
     KvBlockManipulator, ObjectAllocator, ObjectManager, RemoteObjId, TokenEmb, TokenEmbManager,
     VideoEmbedder,
 };
@@ -56,7 +56,7 @@ pub struct ServerState<B> {
 
 impl<B> ServerState<B>
 where
-    B: KvBlockFiller + KvBlockManipulator + Clone,
+    B: CausalTransformer + KvBlockManipulator + Clone,
 {
     pub fn new(backend: B) -> Self {
         Self {

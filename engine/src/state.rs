@@ -209,8 +209,18 @@ pub struct KvBlock {
     pub filled: bool,
 }
 
-// Backend trait for manipulating key-value blocks.
-pub trait KvBlockManipulator: ObjectAllocator<KvBlock> {
+// Backend trait for filling key-value blocks. (GPT-like models)
+pub trait CausalTransformer: ObjectAllocator<KvBlock> + ObjectAllocator<TokenEmb> {
+    fn fill(
+        &self,
+        stream_id: &InstanceId,
+        addr: RemoteObjId,
+        ctx_addrs: Vec<RemoteObjId>,
+        mask: Vec<bool>,
+        input_embs: Vec<RemoteObjId>,
+        output_embs: Vec<RemoteObjId>,
+    ) -> Result<(), BlockError>;
+
     fn copy_tokens(
         &self,
         stream_id: &InstanceId,
@@ -229,15 +239,23 @@ pub trait KvBlockManipulator: ObjectAllocator<KvBlock> {
     ) -> Result<(), BlockError>;
 }
 
-// Backend trait for filling key-value blocks.
-pub trait KvBlockFiller: ObjectAllocator<KvBlock> + ObjectAllocator<TokenEmb> {
+// probably unused in the first version. For BERT-like models.
+pub trait FullTransformer: ObjectAllocator<TokenEmb> {
     fn fill(
         &self,
-        stream_id: &InstanceId,
-        addr: RemoteObjId,
-        ctx_addrs: Vec<RemoteObjId>,
+        inst_id: &InstanceId,
         mask: Vec<bool>,
         input_embs: Vec<RemoteObjId>,
+        output_embs: Vec<RemoteObjId>,
+    ) -> Result<(), BlockError>;
+}
+
+// could be used for other LLM architectures like SSMs
+pub trait Rnn: ObjectAllocator<TokenEmb> {
+    fn fill(
+        &self,
+        inst_id: &InstanceId,
+        state: RemoteObjId,
         output_embs: Vec<RemoteObjId>,
     ) -> Result<(), BlockError>;
 }
@@ -316,7 +334,7 @@ where
 
 impl<B> KvBlockManager<B>
 where
-    B: KvBlockManipulator,
+    B: CausalTransformer,
 {
     pub fn copy_tokens(
         &mut self,
@@ -445,6 +463,99 @@ where
     fn backend(&self) -> &B {
         &self.storage
     }
+}
+
+// ------------------------------------------------------------
+
+// distribution
+
+pub struct TokenDist {
+    counter: Counter,
+}
+
+impl TokenDist {
+    pub fn new() -> Self {
+        TokenDist {
+            counter: Counter::new(0),
+        }
+    }
+}
+
+impl ReferenceCounted for TokenDist {
+    fn add_ref(&self) {
+        self.counter.inc();
+    }
+
+    fn release(&self) -> bool {
+        self.counter.dec() <= 0
+    }
+
+    fn ref_count(&self) -> usize {
+        self.counter.get() as usize
+    }
+}
+
+pub struct TokenDistManager<B> {
+    token_dists: HashMap<RemoteObjId, TokenDist>,
+    virtual_addr_maps: HashMap<InstanceId, AddrMap<Addr, RemoteObjId>>,
+
+    // primary storage
+    storage: B,
+}
+
+impl<B> TokenDistManager<B> {
+    pub fn new(storage: B) -> Self {
+        Self {
+            token_dists: HashMap::new(),
+            virtual_addr_maps: HashMap::new(),
+            storage,
+        }
+    }
+}
+
+impl<B> ObjectManager<TokenDist, B> for TokenDistManager<B>
+where
+    B: ObjectAllocator<TokenDist>,
+{
+    fn objects(&self) -> &HashMap<Addr, TokenDist> {
+        &self.token_dists
+    }
+
+    fn objects_mut(&mut self) -> &mut HashMap<Addr, TokenDist> {
+        &mut self.token_dists
+    }
+
+    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, RemoteObjId>> {
+        &self.virtual_addr_maps
+    }
+
+    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, RemoteObjId>> {
+        &mut self.virtual_addr_maps
+    }
+
+    fn backend(&self) -> &B {
+        &self.storage
+    }
+}
+
+// ------------------------------------------------------------
+
+pub trait CausalLanguageModel: ObjectAllocator<TokenEmb> + ObjectAllocator<TokenDist> {
+    fn next_token_dist(
+        &self,
+        inst_id: &InstanceId,
+        emb_ptr: RemoteObjId,
+        dist_ptr: RemoteObjId,
+    ) -> Result<(), BlockError>;
+}
+
+pub trait MaskedLanguageModel: ObjectAllocator<TokenEmb> + ObjectAllocator<TokenDist> {
+    fn token_dist(
+        &self,
+        inst_id: &InstanceId,
+        emb_ptr: RemoteObjId,
+        dist_ptr: RemoteObjId,
+    ) -> Result<(), BlockError>;
 }
 
 // ------------------------------------------------------------
