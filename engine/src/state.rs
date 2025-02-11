@@ -547,6 +547,22 @@ pub trait CausalLanguageModel: ObjectAllocator<TokenEmb> + ObjectAllocator<Token
         emb_ptr: RemoteObjId,
         dist_ptr: RemoteObjId,
     ) -> Result<(), BlockError>;
+
+    fn sample_top_k(
+        &self,
+        inst_id: &InstanceId,
+        dist_ptr: RemoteObjId,
+        k: usize,
+        sender: oneshot::Sender<Vec<usize>>,
+    ) -> Result<(), BlockError>;
+
+    // todo: design a better struct to represent distributions
+    fn get_raw_dist(
+        &self,
+        inst_id: &InstanceId,
+        dist_ptr: RemoteObjId,
+        sender: oneshot::Sender<Vec<f32>>,
+    ) -> Result<(), BlockError>;
 }
 
 pub trait MaskedLanguageModel: ObjectAllocator<TokenEmb> + ObjectAllocator<TokenDist> {
@@ -592,7 +608,9 @@ pub enum BlockError {
     InstanceAlreadyExists,
     ResourceNotFound,
     ResourcePermissionDenied,
+    LockError,
 }
+
 
 // ------------------------------------------------------------
 // AddressMap

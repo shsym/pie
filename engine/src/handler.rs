@@ -1,9 +1,10 @@
 use crate::state::{
-    Addr, BlockError, ImageEmbedder, InstanceId, KvBlock, CausalTransformer, KvBlockManager,
-    KvBlockManipulator, ObjectAllocator, ObjectManager, RemoteObjId, TokenEmb, TokenEmbManager,
+    Addr, BlockError, CausalLanguageModel, CausalTransformer, ImageEmbedder, InstanceId, KvBlock,
+    KvBlockManager, ObjectAllocator, ObjectManager, RemoteObjId, TokenEmb, TokenEmbManager,
     VideoEmbedder,
 };
 use std::collections::{HashMap, HashSet};
+use tokio::sync::oneshot;
 
 #[derive(Debug)]
 pub struct Resource {
@@ -56,7 +57,7 @@ pub struct ServerState<B> {
 
 impl<B> ServerState<B>
 where
-    B: CausalTransformer + KvBlockManipulator + Clone,
+    B: CausalTransformer + Clone,
 {
     pub fn new(backend: B) -> Self {
         Self {
@@ -209,8 +210,40 @@ where
     ) -> Result<(), BlockError> {
         self.token_embs.dealloc(inst_id, addr)
     }
-    
-    
+}
+
+// For causal LMs
+
+impl<B> ServerState<B>
+where
+    B: CausalLanguageModel,
+{
+    pub fn next_token_dist(
+        &self,
+        inst_id: &InstanceId,
+        emb_ptr: Addr,
+        dist_ptr: Addr,
+    ) -> Result<(), BlockError> {
+        let emb_ptr = self.token_embs.resolve(inst_id, emb_ptr)?;
+        let dist_ptr = self.token_embs.resolve(inst_id, dist_ptr)?;
+
+        self.backend.next_token_dist(inst_id, emb_ptr, dist_ptr)?;
+
+        Ok(())
+    }
+
+    pub fn sample_top_k(
+        &self,
+        inst_id: &InstanceId,
+        dist_ptr: Addr,
+        k: usize,
+        sender: oneshot::Sender<Vec<usize>>,
+    ) -> Result<(), BlockError> {
+        let dist_ptr = self.token_embs.resolve(inst_id, dist_ptr)?;
+        self.backend.sample_top_k(inst_id, dist_ptr, k, sender)?;
+
+        Ok(())
+    }
 }
 
 // For multimodal LLMs
