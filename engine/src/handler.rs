@@ -1,7 +1,7 @@
 use crate::state::{
-    Addr, BlockError, CausalLanguageModel, CausalTransformer, ImageEmbedder, InstanceId, KvBlock,
-    KvBlockManager, ObjectAllocator, ObjectManager, RemoteObjId, TokenEmb, TokenEmbManager,
-    VideoEmbedder,
+    get_stream_id, Addr, BlockError, CausalLanguageModel, CausalTransformer, ImageEmbedder,
+    InstanceId, KvBlock, KvBlockManager, ObjectAllocator, ObjectManager, RemoteObjId, TokenEmb,
+    TokenEmbManager, VideoEmbedder,
 };
 use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
@@ -90,16 +90,22 @@ where
         Ok(())
     }
 
-    pub fn allocate_kv_block(&mut self, inst_id: &InstanceId) -> Result<Addr, BlockError> {
-        self.kv_blocks.alloc(inst_id, KvBlock::new())
+    pub fn allocate_kv_block(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+    ) -> Result<Addr, BlockError> {
+        self.kv_blocks
+            .alloc(inst_id, local_stream_id, KvBlock::new())
     }
 
     pub fn deallocate_kv_block(
         &mut self,
         inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
         addr: Addr,
     ) -> Result<(), BlockError> {
-        self.kv_blocks.dealloc(inst_id, addr)
+        self.kv_blocks.dealloc(inst_id, local_stream_id, addr)
     }
 
     pub fn export_kv_blocks(
@@ -142,6 +148,7 @@ where
     pub fn fill_kv_block(
         &mut self,
         inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
         addr: Addr,
         ctx_addrs: Vec<Addr>,
         mask: Vec<bool>,
@@ -160,7 +167,7 @@ where
         self.kv_blocks.get_mut(inst_id, addr)?.filled = false;
 
         self.backend.fill(
-            inst_id,
+            get_stream_id(inst_id, local_stream_id),
             block_ptr,
             ctx_block_ptrs,
             mask,
@@ -174,6 +181,7 @@ where
     pub fn copy_kv_block(
         &mut self,
         inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
         src_addr: Addr,
         dst_addr: Addr,
         src_token_offset: usize,
@@ -182,6 +190,7 @@ where
     ) -> Result<(), BlockError> {
         self.kv_blocks.copy_tokens(
             inst_id,
+            local_stream_id,
             src_addr,
             dst_addr,
             src_token_offset,
@@ -193,22 +202,30 @@ where
     pub fn mask_kv_block(
         &mut self,
         inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
         addr: Addr,
         mask: Vec<bool>,
     ) -> Result<(), BlockError> {
-        self.kv_blocks.mask_tokens(inst_id, addr, &mask)
+        self.kv_blocks
+            .mask_tokens(inst_id, local_stream_id, addr, &mask)
     }
 
-    pub fn allocate_token_emb(&mut self, inst_id: &InstanceId) -> Result<Addr, BlockError> {
-        self.token_embs.alloc(inst_id, TokenEmb::new())
+    pub fn allocate_token_emb(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+    ) -> Result<Addr, BlockError> {
+        self.token_embs
+            .alloc(inst_id, local_stream_id, TokenEmb::new())
     }
 
     pub fn deallocate_token_emb(
         &mut self,
         inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
         addr: Addr,
     ) -> Result<(), BlockError> {
-        self.token_embs.dealloc(inst_id, addr)
+        self.token_embs.dealloc(inst_id, local_stream_id, addr)
     }
 }
 
@@ -221,13 +238,16 @@ where
     pub fn next_token_dist(
         &self,
         inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+
         emb_ptr: Addr,
         dist_ptr: Addr,
     ) -> Result<(), BlockError> {
         let emb_ptr = self.token_embs.resolve(inst_id, emb_ptr)?;
         let dist_ptr = self.token_embs.resolve(inst_id, dist_ptr)?;
 
-        self.backend.next_token_dist(inst_id, emb_ptr, dist_ptr)?;
+        self.backend
+            .next_token_dist(get_stream_id(inst_id, local_stream_id), emb_ptr, dist_ptr)?;
 
         Ok(())
     }
@@ -235,12 +255,15 @@ where
     pub fn sample_top_k(
         &self,
         inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+
         dist_ptr: Addr,
         k: usize,
         sender: oneshot::Sender<Vec<usize>>,
     ) -> Result<(), BlockError> {
         let dist_ptr = self.token_embs.resolve(inst_id, dist_ptr)?;
-        self.backend.sample_top_k(inst_id, dist_ptr, k, sender)?;
+        self.backend
+            .sample_top_k(get_stream_id(inst_id, local_stream_id), dist_ptr, k, sender)?;
 
         Ok(())
     }
@@ -254,12 +277,15 @@ where
     pub fn embed_image(
         &mut self,
         inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+
         token_addrs: Vec<Addr>,
         image_url: String,
     ) -> Result<(), BlockError> {
         let ptrs = self.token_embs.resolve_many(inst_id, &token_addrs)?;
 
-        self.backend.embed_img(inst_id, ptrs, image_url)?;
+        self.backend
+            .embed_img(get_stream_id(inst_id, local_stream_id), ptrs, image_url)?;
 
         Ok(())
     }
@@ -267,12 +293,15 @@ where
     pub fn embed_video(
         &mut self,
         inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+
         token_addrs: Vec<Addr>,
         video_url: String,
     ) -> Result<(), BlockError> {
         let ptrs = self.token_embs.resolve_many(inst_id, &token_addrs)?;
 
-        self.backend.embed_vid(inst_id, ptrs, video_url)?;
+        self.backend
+            .embed_vid(get_stream_id(inst_id, local_stream_id), ptrs, video_url)?;
 
         Ok(())
     }

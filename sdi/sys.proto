@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package sdi;
+
+// -----------------------------------------------------------------------------
+// Enum for kinds of objects.
+// -----------------------------------------------------------------------------
+enum ObjectKind {
+  // Default or unspecified kind.
+  OBJECT_KIND_UNSPECIFIED = 0;
+
+  // Key-value block.
+  OBJECT_KIND_KV_BLOCK = 1;
+
+  // Embedding.
+  OBJECT_KIND_EMB = 2;
+
+  // Distribution.
+  OBJECT_KIND_DIST = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Allocate and Deallocate messages.
+// -----------------------------------------------------------------------------
+
+// A request to allocate objects of a certain kind with specified IDs.
+message Allocate {
+  ObjectKind kind = 1;
+  repeated uint32 object_ids = 2;
+}
+
+// A request to deallocate objects of a certain kind with specified IDs.
+message Deallocate {
+  ObjectKind kind = 1;
+  repeated uint32 object_ids = 2;
+}
+
+// -----------------------------------------------------------------------------
+// Embedding messages.
+// -----------------------------------------------------------------------------
+
+// A request to generate text embeddings.
+message EmbedText {
+  // Embedding IDs to produce/associate with this text.
+  repeated uint32 embedding_ids = 1;
+  // The token IDs for the text to be embedded.
+  repeated uint32 token_ids = 2;
+  // The position IDs corresponding to each token.
+  repeated uint32 position_ids = 3;
+}
+
+// A request to embed one or more images.
+message EmbedImage {
+  // Nested type representing a single image embedding specification.
+  message Spec {
+    // Embedding IDs to store or associate with the image.
+    repeated uint32 embedding_ids = 1;
+    // The URL of the image to embed.
+    string url = 2;
+  }
+  // A batch of image embedding specifications.
+  repeated Spec specs = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Block fill, mask, and copy messages.
+// -----------------------------------------------------------------------------
+
+// A request to fill one or more blocks.
+message FillBlock {
+  // Nested type representing the specification for a single block fill.
+  message Spec {
+    // The ID of the block to fill.
+    uint32 block_id = 1;
+    // IDs of blocks providing context for the fill operation.
+    repeated uint32 context_block_ids = 2;
+    // Input embeddings that seed the fill.
+    repeated uint32 input_embedding_ids = 3;
+    // Output embeddings produced by the fill.
+    repeated uint32 output_embedding_ids = 4;
+  }
+  // A batch of fill specifications.
+  repeated Spec specs = 1;
+}
+
+// A request to apply one or more boolean masks to blocks.
+message MaskBlock {
+  // Nested type representing a single mask specification.
+  message Spec {
+    // The ID of the block being masked.
+    uint32 block_id = 1;
+    // A flattened 2D mask (row-major order) represented as booleans.
+    repeated bool mask = 2;
+  }
+  // A batch of mask specifications.
+  repeated Spec specs = 1;
+}
+
+// A request to copy data between blocks.
+message CopyBlock {
+  // Nested type representing a single copy specification.
+  message Spec {
+    // The source block ID.
+    uint32 source_block_id = 1;
+    // The destination block ID.
+    uint32 destination_block_id = 2;
+    // The starting position in the source block.
+    uint32 source_start = 3;
+    // The starting position in the destination block.
+    uint32 destination_start = 4;
+    // The number of elements to copy.
+    uint32 length = 5;
+  }
+  // A batch of copy specifications.
+  repeated Spec specs = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Decode request/response messages.
+// -----------------------------------------------------------------------------
+
+// A request to decode a sequence of embeddings into tokens.
+message DecodeRequest {
+  // A unique identifier for this decode request.
+  uint32 request_id = 1;
+  // The embedding IDs to decode.
+  repeated uint32 embedding_ids = 2;
+}
+
+// The response containing decoded tokens.
+message DecodeResponse {
+  // The request identifier to which this response corresponds.
+  uint32 request_id = 1;
+  // The decoded token IDs.
+  repeated uint32 token_ids = 2;
+}
