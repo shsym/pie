@@ -7,7 +7,10 @@ use prost::Message;
 use std::collections::HashMap;
 use std::mem;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use tokio::sync::oneshot::Sender;
+use tokio::task::JoinHandle;
+use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
 mod sdi {
     include!(concat!(env!("OUT_DIR"), "/sdi.rs"));
@@ -46,6 +49,193 @@ pub struct Backend {
     staged: Arc<Mutex<Vec<sdi::Command>>>,
     submitted: Arc<Mutex<Vec<sdi::Command>>>,
     // queue, cmd_buffer, scheduled, submitted
+    socket_tx: Arc<Mutex<Option<mpsc::Sender<Vec<sdi::Command>>>>>,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    // zmq handles
+    //handle: Arc<JoinHandle<()>>,
+}
+
+impl Backend {
+    pub fn new(block_size: u32, max_kv_blocks: u32, max_embs: u32) -> Self {
+        Self {
+            block_size,
+            namespace: Arc::new(Mutex::new(ObjNamespace::new(max_kv_blocks, max_embs))),
+            cmd_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(Pending::new(10.0, 1, 1))),
+            staged: Arc::new(Mutex::new(Vec::new())),
+            submitted: Arc::new(Mutex::new(vec![])),
+            socket_tx: Arc::new(Mutex::new(None)),
+            handle: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn enqueue_cmd(&self, stream_id: StreamId, cmd: IrCommand) -> Result<(), BlockError> {
+        let mut inner = self.cmd_buffer.lock().map_err(|_| BlockError::LockError)?;
+        inner.push((stream_id, cmd));
+        Ok(())
+    }
+
+    fn acquire_id(&self, namespace: usize) -> Result<RemoteObjId, BlockError> {
+        let mut inner = self.namespace.lock().map_err(|_| BlockError::LockError)?;
+        inner.acquire_id(namespace)
+    }
+
+    fn release_id(&self, namespace: usize, id: RemoteObjId) -> Result<(), BlockError> {
+        let mut inner = self.namespace.lock().map_err(|_| BlockError::LockError)?;
+        inner.release_id(namespace, id)
+    }
+
+    fn remaining_ids(&self, namespace: usize) -> usize {
+        let inner = self.namespace.lock().unwrap();
+        inner.remaining_ids(namespace)
+    }
+
+    pub fn schedule(&self, curr_timestamp: f64) -> Result<(), BlockError> {
+        let mut pending = self.pending.lock().map_err(|_| BlockError::LockError)?;
+
+        // first move all the commands from cmd_buffer to pending (buffer items are removed)
+        let mut commands_by_stream = {
+            let mut cmd_buffer = self.cmd_buffer.lock().map_err(|_| BlockError::LockError)?;
+
+            let mut stream_commands = HashMap::new();
+
+            for (stream_id, command) in cmd_buffer.drain(..) {
+                stream_commands
+                    .entry(stream_id)
+                    .or_insert_with(Vec::new)
+                    .push(command);
+            }
+
+            stream_commands
+            // drop the lock on cmd_buffer
+        };
+
+        // Horizontal batching: group commands by stream and type.
+        for (_stream_id, cmd_list) in commands_by_stream.iter_mut() {
+            let mut prev_cmd = None;
+
+            loop {
+                if cmd_list.is_empty() {
+                    break;
+                }
+                let cmd = cmd_list.pop().unwrap();
+                let curr_cmd = mem::discriminant(&cmd);
+
+                // Vertical batching: Same kind of consecutive commands are batched together.
+                // if the current command is different from the previous one, stop batching.
+                if let Some(prev_cmd) = prev_cmd {
+                    if prev_cmd != curr_cmd {
+                        break;
+                    }
+                }
+
+                pending.push(cmd, curr_timestamp);
+                prev_cmd = Some(curr_cmd);
+            }
+        }
+
+        let batched_payloads = pending.batch_all(curr_timestamp);
+
+        // add the commands to the staged queue
+        let mut staged = self.staged.lock().map_err(|_| BlockError::LockError)?;
+
+        // Add the batched commands to the staged queue.
+        for payload in batched_payloads {
+            staged.push(sdi::Command {
+                correlation_id: 0,
+                payload: Some(payload),
+            });
+        }
+
+        // drop the lock on pending
+        Ok(())
+    }
+
+    pub async fn commit(&self) -> Result<(), BlockError> {
+        // Lock and take the staged commands.
+        let mut staged = self.staged.lock().map_err(|_| BlockError::LockError)?;
+
+        // Lock the sender.
+        let tx_guard = self.socket_tx.lock().map_err(|_| BlockError::LockError)?;
+        let tx = tx_guard.as_ref().ok_or(BlockError::LockError)?;
+
+        // Send the staged commands, replacing them with an empty Vec.
+        tx.send(mem::take(&mut *staged))
+            .await
+            .map_err(|_| BlockError::SendError)?;
+
+        Ok(())
+    }
+
+    pub async fn bind(&mut self, endpoint: &str) -> Result<(), ZmqError> {
+        // bind the zmq socket
+        let mut socket = DealerSocket::new();
+        socket.connect(endpoint).await?;
+        println!("Connected to server at {endpoint}");
+
+        let (tx, rx) = mpsc::channel::<Vec<sdi::Command>>(100);
+
+        self.socket_tx = Arc::new(Mutex::new(Some(tx)));
+
+        // 3) Spawn the single I/O driver task that handles all read/write from the socket
+        let handle = tokio::spawn(Self::socket_driver(socket, rx));
+
+        self.handle = Arc::new(Mutex::new(Some(handle)));
+
+        Ok(())
+    }
+
+    async fn socket_driver(
+        mut socket: DealerSocket,
+        mut rx: mpsc::Receiver<Vec<sdi::Command>>,
+    ) {
+        loop {
+            tokio::select! {
+                // A) Incoming requests from the channel => send to server
+                maybe_req = rx.recv() => {
+                    match maybe_req {
+                        Some(cmds) => {
+                            for cmd in cmds {
+                                let bytes = cmd.encode_to_vec();
+                                if let Err(e) = socket.send(ZmqMessage::from(bytes)).await {
+                                    eprintln!("Socket send failed: {:?}", e);
+                                    // You might choose to break or keep trying
+                                }
+                            }
+                        },
+                        None => {
+                            // channel closed => no more requests
+                            println!("Request channel closed, shutting down driver.");
+                            break;
+                        }
+                    }
+                },
+
+                // B) Incoming responses from the server
+                result = socket.recv() => {
+                    match result {
+                        Ok(msg) => {
+                            // Dealer/Router typically has 2 frames: [identity, payload]
+                            let payload = msg.get(0).unwrap();
+                            match sdi::Command::decode(payload.as_ref()) {
+                                Ok(resp) => {
+                                    println!("---> Received response: {:?}", resp);
+                                }
+                                Err(err) => {
+                                    eprintln!("Failed to parse Response from server: {:?}", err);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Socket receive error: {:?}", e);
+                            // Possibly break or keep going...
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // more sophisticated forms include: MultiNodeBackend, etc.
@@ -265,101 +455,6 @@ impl ObjNamespace {
             1 => self.emb_id_pool.available(),
             _ => 0,
         }
-    }
-}
-
-impl Backend {
-    pub fn new(block_size: u32, max_kv_blocks: u32, max_embs: u32) -> Self {
-        Self {
-            block_size,
-            namespace: Arc::new(Mutex::new(ObjNamespace::new(max_kv_blocks, max_embs))),
-            cmd_buffer: Arc::new(Mutex::new(Vec::new())),
-            pending: Arc::new(Mutex::new(Pending::new(10.0, 1, 1))),
-            staged: Arc::new(Mutex::new(Vec::new())),
-            submitted: Arc::new(Mutex::new(vec![])),
-        }
-    }
-
-    pub fn enqueue_cmd(&self, stream_id: StreamId, cmd: IrCommand) -> Result<(), BlockError> {
-        let mut inner = self.cmd_buffer.lock().map_err(|_| BlockError::LockError)?;
-        inner.push((stream_id, cmd));
-        Ok(())
-    }
-
-    fn acquire_id(&self, namespace: usize) -> Result<RemoteObjId, BlockError> {
-        let mut inner = self.namespace.lock().map_err(|_| BlockError::LockError)?;
-        inner.acquire_id(namespace)
-    }
-
-    fn release_id(&self, namespace: usize, id: RemoteObjId) -> Result<(), BlockError> {
-        let mut inner = self.namespace.lock().map_err(|_| BlockError::LockError)?;
-        inner.release_id(namespace, id)
-    }
-
-    fn remaining_ids(&self, namespace: usize) -> usize {
-        let inner = self.namespace.lock().unwrap();
-        inner.remaining_ids(namespace)
-    }
-
-    pub fn schedule(&self, curr_timestamp: f64) -> Result<(), BlockError> {
-        let mut pending = self.pending.lock().map_err(|_| BlockError::LockError)?;
-
-        // first move all the commands from cmd_buffer to pending (buffer items are removed)
-        let mut commands_by_stream = {
-            let mut cmd_buffer = self.cmd_buffer.lock().map_err(|_| BlockError::LockError)?;
-
-            let mut stream_commands = HashMap::new();
-
-            for (stream_id, command) in cmd_buffer.drain(..) {
-                stream_commands
-                    .entry(stream_id)
-                    .or_insert_with(Vec::new)
-                    .push(command);
-            }
-
-            stream_commands
-            // drop the lock on cmd_buffer
-        };
-
-        // Horizontal batching: group commands by stream and type.
-        for (_stream_id, cmd_list) in commands_by_stream.iter_mut() {
-            let mut prev_cmd = None;
-
-            loop {
-                if cmd_list.is_empty() {
-                    break;
-                }
-                let cmd = cmd_list.pop().unwrap();
-                let curr_cmd = mem::discriminant(&cmd);
-
-                // Vertical batching: Same kind of consecutive commands are batched together.
-                // if the current command is different from the previous one, stop batching.
-                if let Some(prev_cmd) = prev_cmd {
-                    if prev_cmd != curr_cmd {
-                        break;
-                    }
-                }
-
-                pending.push(cmd, curr_timestamp);
-                prev_cmd = Some(curr_cmd);
-            }
-        }
-
-        let batched_payloads = pending.batch_all(curr_timestamp);
-
-        // add the commands to the staged queue
-        let mut staged = self.staged.lock().map_err(|_| BlockError::LockError)?;
-
-        // Add the batched commands to the staged queue.
-        for payload in batched_payloads {
-            staged.push(sdi::Command {
-                correlation_id: 0,
-                payload: Some(payload),
-            });
-        }
-
-        // drop the lock on pending
-        Ok(())
     }
 }
 

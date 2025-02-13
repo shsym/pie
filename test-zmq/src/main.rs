@@ -1,8 +1,10 @@
+use std::sync::Arc;
 use rand::Rng;
 use rmp_serde::{from_slice, to_vec};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::{self, sync::mpsc};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
@@ -87,6 +89,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Press Ctrl-C to quit.");
     tokio::signal::ctrl_c().await?;
     println!("Client shutting down.");
+
+    let mut socket2 = DealerSocket::new();
+    // put it in arc
+    let socket233 = Arc::new(Mutex::new( DealerSocket::new()));
 
     Ok(())
 }

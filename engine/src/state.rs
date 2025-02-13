@@ -634,6 +634,7 @@ pub enum BlockError {
     ResourceNotFound,
     ResourcePermissionDenied,
     LockError,
+    SendError
 }
 
 // ------------------------------------------------------------
