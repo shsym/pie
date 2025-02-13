@@ -151,9 +151,8 @@ where
         local_stream_id: Option<u32>,
         addr: Addr,
         ctx_addrs: Vec<Addr>,
-        mask: Vec<bool>,
         input_embs: Vec<Addr>,
-        output_embs: Vec<Addr>,
+        output_embs: Option<Vec<Addr>>,
     ) -> Result<(), BlockError> {
         // create "resolved" cmd.
 
@@ -162,7 +161,15 @@ where
 
         let input_emb_ptrs = self.token_embs.resolve_many(inst_id, &input_embs)?;
 
-        let output_emb_ptrs = self.token_embs.resolve_many(inst_id, &output_embs)?;
+        // let output_emb_ptrs = if let Some(output_embs) = output_embs {
+        //     Some(self.token_embs.resolve_many(inst_id, &output_embs)?)
+        // } else {
+        //     None
+        // };
+
+        let output_emb_ptrs = output_embs
+            .map(|emb| self.token_embs.resolve_many(inst_id, &emb))
+            .transpose()?;
 
         self.kv_blocks.get_mut(inst_id, addr)?.filled = false;
 
@@ -170,7 +177,6 @@ where
             get_stream_id(inst_id, local_stream_id),
             block_ptr,
             ctx_block_ptrs,
-            mask,
             input_emb_ptrs,
             output_emb_ptrs,
         )?;
@@ -184,9 +190,9 @@ where
         local_stream_id: Option<u32>,
         src_addr: Addr,
         dst_addr: Addr,
-        src_token_offset: usize,
-        dst_token_offset: usize,
-        token_count: usize,
+        src_token_offset: u32,
+        dst_token_offset: u32,
+        token_count: u32,
     ) -> Result<(), BlockError> {
         self.kv_blocks.copy_tokens(
             inst_id,

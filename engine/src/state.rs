@@ -8,16 +8,15 @@ use uuid::Uuid;
 
 pub type InstanceId = Uuid;
 pub type StreamId = (u128, u32);
+pub type RemoteObjId = u32;
 
-pub type Addr = usize;
+pub type Addr = RemoteObjId;
 
 pub fn get_stream_id(inst_id: &InstanceId, local_stream_id: Option<u32>) -> StreamId {
     (inst_id.as_u128(), local_stream_id.unwrap_or(0))
 }
 
 // ------------------------------------------------------------
-
-pub type RemoteObjId = usize;
 
 // this helps the backend to make optimization decisions.
 
@@ -234,9 +233,8 @@ pub trait CausalTransformer: ObjectAllocator<KvBlock> + ObjectAllocator<TokenEmb
         stream_id: StreamId,
         addr: RemoteObjId,
         ctx_addrs: Vec<RemoteObjId>,
-        mask: Vec<bool>,
         input_embs: Vec<RemoteObjId>,
-        output_embs: Vec<RemoteObjId>,
+        output_embs: Option<Vec<RemoteObjId>>,
     ) -> Result<(), BlockError>;
 
     fn copy_tokens(
@@ -244,9 +242,9 @@ pub trait CausalTransformer: ObjectAllocator<KvBlock> + ObjectAllocator<TokenEmb
         stream_id: StreamId,
         src_ptr: RemoteObjId,
         dst_ptr: RemoteObjId,
-        src_offset: usize,
-        dst_offset: usize,
-        size: usize,
+        src_offset: u32,
+        dst_offset: u32,
+        size: u32,
     ) -> Result<(), BlockError>;
 
     fn mask_tokens(
@@ -360,9 +358,9 @@ where
         local_stream_id: Option<u32>,
         src_addr: Addr,
         dst_addr: Addr,
-        src_token_offset: usize,
-        dst_token_offset: usize,
-        size: usize,
+        src_token_offset: u32,
+        dst_token_offset: u32,
+        size: u32,
     ) -> Result<(), BlockError> {
         let stream_id = get_stream_id(inst_id, local_stream_id);
 
@@ -383,16 +381,19 @@ where
         let (src_position_ids, src_occupied) = {
             let src_block = self.get(inst_id, src_addr)?;
             (
-                src_block.position_ids[src_token_offset..src_token_offset + size].to_vec(),
-                src_block.occupied[src_token_offset..src_token_offset + size].to_vec(),
+                src_block.position_ids
+                    [src_token_offset as usize..(src_token_offset + size) as usize]
+                    .to_vec(),
+                src_block.occupied[src_token_offset as usize..(src_token_offset + size) as usize]
+                    .to_vec(),
             )
         };
 
         // Now get a mutable borrow of the destination block and update its data.
         let dst_block = self.get_mut(inst_id, dst_addr)?;
-        for i in 0..size {
-            dst_block.position_ids[dst_token_offset + i] = src_position_ids[i];
-            dst_block.occupied[dst_token_offset + i] = src_occupied[i];
+        for i in 0..size as usize {
+            dst_block.position_ids[dst_token_offset as usize + i] = src_position_ids[i];
+            dst_block.occupied[dst_token_offset as usize + i] = src_occupied[i];
         }
         Ok(())
     }
