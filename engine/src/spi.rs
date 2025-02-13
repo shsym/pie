@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 
 bindgen!({
-    path: "../spi/app/wit",
+    path: "../api/app/wit",
     world: "app",
     async: true,
     with: {
