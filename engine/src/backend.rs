@@ -18,15 +18,14 @@ mod sdi {
 #[derive(Debug)]
 enum IrCommand {
     // Embs
-    AllocateEmb(u32),
-    DeallocateEmb(u32),
-
-    // KvBlocks
-    AllocateKvBlock(u32),
-    DeallocateKvBlock(u32),
-    CopyKvBlock(u32, u32, u32, u32, u32),
-    MaskKvBlock(u32, Vec<bool>),
-    FillKvBlock(u32, Vec<u32>, Vec<u32>, Option<Vec<u32>>),
+    Allocate(sdi::AllocateItem),
+    Deallocate(sdi::AllocateItem),
+    CopyBlock(sdi::CopyBlockItem),
+    MaskBlock(sdi::MaskBlockItem),
+    FillBlock(sdi::FillBlockItem),
+    EmbedImage(sdi::EmbedImageItem),
+    EmbedText(sdi::EmbedTextItem),
+    DecodeRequest(sdi::DecodeRequestItem),
 }
 
 // Define actual cmd, interpretable by the backend.
@@ -57,19 +56,24 @@ struct ObjNamespace {
 }
 #[derive(Debug)]
 struct Pending {
+    allocate: BatchBuffer<sdi::AllocateItem>,
+    deallocate: BatchBuffer<sdi::AllocateItem>,
+    copy_block: BatchBuffer<sdi::CopyBlockItem>,
+    mask_block: BatchBuffer<sdi::MaskBlockItem>,
+    embed_text: BatchBuffer<sdi::EmbedTextItem>,
+    embed_image: BatchBuffer<sdi::EmbedImageItem>,
+
     // these cmds are only be fired when it contains "enough" commands to be batched.
-    fill_block: BatchStrategy<sdi::FillBlock>,
-    copy_block: BatchStrategy<sdi::CopyBlock>,
-    embed_image: BatchStrategy<sdi::EmbedImage>,
-    decode: BatchStrategy<sdi::DecodeRequest>,
+    fill_block: BatchBuffer<sdi::FillBlockItem>,
+    decode_req: BatchBuffer<sdi::DecodeRequestItem>,
 }
 
 /// "K-or-T" Strategy
 // 	For instance: If queue size reaches K, launch immediately; otherwise launch after T ms if K isn’t reached.
 // 	This ensures that the GPU does not stay idle for too long (bounded by T) and that short bursts of arrivals form a large enough batch to get good utilization (bounded by K).
 #[derive(Debug)]
-struct BatchStrategy<T> {
-    cmd: T,
+struct BatchBuffer<T> {
+    items: Vec<T>,
 
     max_wait_time: f64,
     max_size: u32,
@@ -78,10 +82,18 @@ struct BatchStrategy<T> {
     current_size: u32,
 }
 
-impl<T> BatchStrategy<T> {
-    fn new(cmd: T, max_wait_time: f64, max_size: u32) -> Self {
+impl<T> BatchBuffer<T> {
+    fn new(max_wait_time: Option<f64>, max_size: Option<u32>) -> Self {
+        // if only one of the two is provided, the other is set to extreme value.
+        let (max_wait_time, max_size) = match (max_wait_time, max_size) {
+            (Some(t), None) => (t, u32::MAX), // T only strategy
+            (None, Some(s)) => (f64::MAX, s), // K only strategy
+            (Some(t), Some(s)) => (t, s),     // K-T strategy
+            (None, None) => (0.0, 1),         // Eager execution
+        };
+
         Self {
-            cmd,
+            items: Vec::new(),
             max_wait_time,
             max_size,
             current_wait_time: 0.0,
@@ -89,14 +101,18 @@ impl<T> BatchStrategy<T> {
         }
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self) -> Vec<T> {
         self.current_wait_time = 0.0;
         self.current_size = 0;
+
+        mem::take(&mut self.items)
     }
 
-    fn inc(&mut self, time_elapsed: f64) {
+    fn push(&mut self, item: T, time_elapsed: f64) {
         self.current_size += 1;
         self.current_wait_time += time_elapsed;
+
+        self.items.push(item);
     }
 
     fn is_ready(&self) -> bool {
@@ -108,10 +124,14 @@ impl<T> BatchStrategy<T> {
 impl Pending {
     fn new(max_wait_time: f64, max_size: u32) -> Self {
         Self {
-            fill_block: BatchStrategy::new(sdi::FillBlock::default(), max_wait_time, max_size),
-            copy_block: BatchStrategy::new(sdi::CopyBlock::default(), max_wait_time, max_size),
-            embed_image: BatchStrategy::new(sdi::EmbedImage::default(), max_wait_time, max_size),
-            decode: BatchStrategy::new(sdi::DecodeRequest::default(), max_wait_time, max_size),
+            allocate: BatchBuffer::new(None, None),
+            deallocate: BatchBuffer::new(None, None),
+            copy_block: BatchBuffer::new(Some(max_wait_time), Some(max_size)),
+            mask_block: BatchBuffer::new(None, None),
+            embed_text: BatchBuffer::new(None, None),
+            embed_image: BatchBuffer::new(Some(max_wait_time), Some(max_size)),
+            fill_block: BatchBuffer::new(Some(max_wait_time), Some(max_size)),
+            decode_req: BatchBuffer::new(Some(max_wait_time), Some(max_size)),
         }
     }
 }
@@ -205,77 +225,57 @@ impl Backend {
 
         // do batching!!
         //
-        // cmd_set = HashMap<CmdType, Vec<Cmd>>
-        //
-        let mut alloc_cmd = sdi::Allocate {
-            kind: Vec::new(),
-            object_ids: Vec::new(),
-        };
-
-        let mut dealloc_cmd = sdi::Deallocate {
-            kind: Vec::new(),
-            object_ids: Vec::new(),
-        };
 
         let mut mask_cmd = sdi::MaskBlock { items: Vec::new() };
 
+        // Horizontal batching: group commands by stream and type.
         for (_stream_id, cmd_list) in commands_by_stream.iter_mut() {
-            let mut processed_count = 0;
+            let mut prev_cmd = None;
 
-            for cmd in cmd_list.iter() {
-                let mut should_stop = true;
-                match cmd {
-                    IrCommand::AllocateEmb(id) => {
-                        alloc_cmd.kind.push(sdi::ObjectKind::Emb.into());
-                        alloc_cmd.object_ids.push(*id);
-                        // Processed, so keep_on remains false (we can drop this command)
-                    }
-                    IrCommand::DeallocateEmb(id) => {
-                        dealloc_cmd.kind.push(sdi::ObjectKind::Emb.into());
-                        dealloc_cmd.object_ids.push(*id);
-                    }
-                    IrCommand::AllocateKvBlock(id) => {
-                        alloc_cmd.kind.push(sdi::ObjectKind::KvBlock.into());
-                        alloc_cmd.object_ids.push(*id);
-                    }
-                    IrCommand::DeallocateKvBlock(id) => {
-                        dealloc_cmd.kind.push(sdi::ObjectKind::KvBlock.into());
-                        dealloc_cmd.object_ids.push(*id);
-                    }
-                    IrCommand::CopyKvBlock(src, dst, src_offset, dst_offset, size) => {
-                        pending.copy_block.cmd.items.push(sdi::CopyBlockItem {
-                            source_block_id: *src,
-                            destination_block_id: *dst,
-                            source_start: *src_offset,
-                            destination_start: *dst_offset,
-                            length: *size,
-                        });
-                    }
-                    IrCommand::MaskKvBlock(id, mask) => {
-                        mask_cmd.items.push(sdi::MaskBlockItem {
-                            block_id: *id,
-                            mask: mask.to_vec(),
-                        });
-                    }
-                    IrCommand::FillKvBlock(ptr, ctx_ptrs, input_embs, output_embs) => {
-                        pending.fill_block.cmd.items.push(sdi::FillBlockItem {
-                            block_id: *ptr,
-                            context_block_ids: ctx_ptrs.to_vec(),
-                            input_embedding_ids: input_embs.to_vec(),
-                            output_embedding_ids: output_embs.clone().unwrap_or_default(),
-                        });
-
-                        should_stop = false;
-                    }
-                }
-                processed_count += 1;
-                if should_stop {
+            loop {
+                if cmd_list.is_empty() {
                     break;
                 }
-            }
+                let cmd = cmd_list.pop().unwrap();
+                let curr_cmd = mem::discriminant(&cmd);
 
-            // Only remove the commands that were processed.
-            cmd_list.drain(0..processed_count);
+                // Vertical batching: Same kind of consecutive commands are batched together.
+                // if the current command is different from the previous one, stop batching.
+                if let Some(prev_cmd) = prev_cmd {
+                    if prev_cmd != curr_cmd {
+                        break;
+                    }
+                }
+
+                match cmd {
+                    IrCommand::Allocate(item) => {
+                        pending.allocate.push(item, time_elapsed);
+                    }
+                    IrCommand::Deallocate(item) => {
+                        pending.deallocate.push(item, time_elapsed);
+                    }
+                    IrCommand::CopyBlock(item) => {
+                        pending.copy_block.push(item, time_elapsed);
+                    }
+                    IrCommand::MaskBlock(item) => {
+                        pending.mask_block.push(item, time_elapsed);
+                    }
+                    IrCommand::FillBlock(item) => {
+                        pending.fill_block.push(item, time_elapsed);
+                    }
+                    IrCommand::EmbedImage(item) => {
+                        pending.embed_image.push(item, time_elapsed);
+                    }
+                    IrCommand::EmbedText(item) => {
+                        pending.embed_text.push(item, time_elapsed);
+                    }
+                    IrCommand::DecodeRequest(item) => {
+                        pending.decode_req.push(item, time_elapsed);
+                    }
+                }
+
+                prev_cmd = Some(curr_cmd);
+            }
         }
 
         // add the commands to the staged queue
@@ -307,7 +307,7 @@ impl Backend {
             staged.push(sdi::Command {
                 correlation_id: 0,
                 payload: Some(sdi::command::Payload::FillBlock(mem::take(
-                    &mut pending.fill_block.cmd,
+                    &mut pending.fill_block.items,
                 ))),
             });
             pending.fill_block.clear();
@@ -324,7 +324,11 @@ impl ObjectAllocator<TokenEmb> for Backend {
     fn alloc(&self, stream_id: StreamId) -> Result<RemoteObjId, BlockError> {
         let new_obj_id = self.acquire_id(1)?;
 
-        let cmd = IrCommand::AllocateEmb(new_obj_id);
+        let cmd = IrCommand::Allocate(sdi::AllocateItem {
+            kind: sdi::ObjectKind::Emb.into(),
+            object_id_offset: new_obj_id,
+            count: 1,
+        });
         self.enqueue_cmd(stream_id, cmd)?;
 
         Ok(new_obj_id)
@@ -334,7 +338,11 @@ impl ObjectAllocator<TokenEmb> for Backend {
         // Release the object id back to the pool.
         self.release_id(1, obj_id)?;
 
-        let cmd = IrCommand::DeallocateEmb(obj_id);
+        let cmd = IrCommand::Deallocate(sdi::AllocateItem {
+            kind: sdi::ObjectKind::Emb.into(),
+            object_id_offset: obj_id,
+            count: 1,
+        });
         self.enqueue_cmd(stream_id, cmd)?;
 
         Ok(())
@@ -361,7 +369,11 @@ impl ObjectAllocator<KvBlock> for Backend {
     fn alloc(&self, stream_id: StreamId) -> Result<RemoteObjId, BlockError> {
         let new_obj_id = self.acquire_id(0)?;
 
-        let cmd = IrCommand::AllocateKvBlock(new_obj_id);
+        let cmd = IrCommand::Allocate(sdi::AllocateItem {
+            kind: sdi::ObjectKind::KvBlock.into(),
+            object_id_offset: new_obj_id,
+            count: 1,
+        });
         self.enqueue_cmd(stream_id, cmd)?;
 
         Ok(new_obj_id)
@@ -371,7 +383,11 @@ impl ObjectAllocator<KvBlock> for Backend {
         // Release the object id back to the pool.
         self.release_id(0, obj_id)?;
 
-        let cmd = IrCommand::DeallocateKvBlock(obj_id);
+        let cmd = IrCommand::Deallocate(sdi::AllocateItem {
+            kind: sdi::ObjectKind::KvBlock.into(),
+            object_id_offset: obj_id,
+            count: 1,
+        });
         self.enqueue_cmd(stream_id, cmd)?;
 
         Ok(())
@@ -428,7 +444,12 @@ impl CausalTransformer for Backend {
     ) -> Result<(), BlockError> {
         // create "resolved" cmd.
 
-        let cmd = IrCommand::FillKvBlock(ptr, ctx_ptrs, input_embs, output_embs);
+        let cmd = IrCommand::FillBlock(sdi::FillBlockItem {
+            block_id: ptr,
+            context_block_ids: ctx_ptrs,
+            input_embedding_ids: input_embs,
+            output_embedding_ids: output_embs.unwrap_or_default(),
+        });
 
         self.enqueue_cmd(stream_id, cmd)?;
         Ok(())
@@ -443,7 +464,13 @@ impl CausalTransformer for Backend {
         dst_offset: u32,
         size: u32,
     ) -> Result<(), BlockError> {
-        let cmd = IrCommand::CopyKvBlock(src_ptr, dst_ptr, src_offset, dst_offset, size);
+        let cmd = IrCommand::CopyBlock(sdi::CopyBlockItem {
+            source_block_id: src_ptr,
+            destination_block_id: dst_ptr,
+            source_start: src_offset,
+            destination_start: dst_offset,
+            length: size,
+        });
 
         self.enqueue_cmd(stream_id, cmd)?;
         Ok(())
@@ -455,7 +482,10 @@ impl CausalTransformer for Backend {
         ptr: RemoteObjId,
         mask: &[bool],
     ) -> Result<(), BlockError> {
-        let cmd = IrCommand::MaskKvBlock(ptr, mask.to_vec());
+        let cmd = IrCommand::MaskBlock(sdi::MaskBlockItem {
+            block_id: ptr,
+            mask: mask.to_vec(),
+        });
         self.enqueue_cmd(stream_id, cmd)?;
         Ok(())
     }

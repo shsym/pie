@@ -23,30 +23,41 @@ enum ObjectKind {
 // Allocate and Deallocate messages.
 // -----------------------------------------------------------------------------
 
+message AllocateItem {
+  // The kind of object to allocate.
+  ObjectKind kind = 1;
+  // The number of objects to allocate.
+  uint32 object_id_offset = 2;
+  uint32 count = 3;
+}
+
 // A request to allocate objects of a certain kind with specified IDs.
 message Allocate {
-  repeated ObjectKind kind = 1;
-  repeated uint32 object_ids = 2;
+  repeated AllocateItem items = 1;
 }
 
 // A request to deallocate objects of a certain kind with specified IDs.
 message Deallocate {
-  repeated ObjectKind kind = 1;
-  repeated uint32 object_ids = 2;
+  repeated AllocateItem items = 1;
 }
 
 // -----------------------------------------------------------------------------
 // Embedding messages.
 // -----------------------------------------------------------------------------
 
+message EmbedTextItem {
+  // Embedding IDs to produce/associate with this text.
+  uint32 embedding_id = 1;
+  // The token IDs for the text to be embedded.
+  uint32 token_id = 2;
+  // The position IDs corresponding to each token.
+  uint32 position_id = 3;
+}
+
 // A request to generate text embeddings.
 message EmbedText {
   // Embedding IDs to produce/associate with this text.
-  repeated uint32 embedding_ids = 1;
-  // The token IDs for the text to be embedded.
-  repeated uint32 token_ids = 2;
-  // The position IDs corresponding to each token.
-  repeated uint32 position_ids = 3;
+  repeated EmbedTextItem items = 1;
 }
 
 // A single image embedding specification.
@@ -123,11 +134,16 @@ message CopyBlock {
 // Decode request/response messages.
 // -----------------------------------------------------------------------------
 
+message DecodeRequestItem {
+  // The embedding ID to decode.
+  uint32 embedding_id = 1;
+}
+
 // A request to decode a sequence of embeddings into tokens.
 message DecodeRequest {
 
   // The embedding IDs to decode.
-  repeated uint32 embedding_ids = 2;
+  repeated DecodeRequestItem items = 1;
 }
 
 // The response containing decoded tokens.
