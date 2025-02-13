@@ -56,83 +56,181 @@ struct ObjNamespace {
 }
 #[derive(Debug)]
 struct Pending {
-    allocate: BatchBuffer<sdi::AllocateItem>,
-    deallocate: BatchBuffer<sdi::AllocateItem>,
-    copy_block: BatchBuffer<sdi::CopyBlockItem>,
-    mask_block: BatchBuffer<sdi::MaskBlockItem>,
-    embed_text: BatchBuffer<sdi::EmbedTextItem>,
-    embed_image: BatchBuffer<sdi::EmbedImageItem>,
+    allocate: BatchQueue<sdi::AllocateItem>,
+    deallocate: BatchQueue<sdi::AllocateItem>,
+    copy_block: BatchQueue<sdi::CopyBlockItem>,
+    mask_block: BatchQueue<sdi::MaskBlockItem>,
+    embed_text: BatchQueue<sdi::EmbedTextItem>,
+    embed_image: BatchQueue<sdi::EmbedImageItem>,
 
     // these cmds are only be fired when it contains "enough" commands to be batched.
-    fill_block: BatchBuffer<sdi::FillBlockItem>,
-    decode_req: BatchBuffer<sdi::DecodeRequestItem>,
+    fill_block: BatchQueue<sdi::FillBlockItem>,
+    decode_req: BatchQueue<sdi::DecodeRequestItem>,
 }
 
 /// "K-or-T" Strategy
 // 	For instance: If queue size reaches K, launch immediately; otherwise launch after T ms if K isn’t reached.
 // 	This ensures that the GPU does not stay idle for too long (bounded by T) and that short bursts of arrivals form a large enough batch to get good utilization (bounded by K).
 #[derive(Debug)]
-struct BatchBuffer<T> {
-    items: Vec<T>,
+struct BatchQueue<T> {
+    items: Vec<(T, f64)>,
 
     max_wait_time: f64,
-    max_size: u32,
-
-    current_wait_time: f64,
-    current_size: u32,
+    min_size: usize,
+    max_size: usize,
 }
 
-impl<T> BatchBuffer<T> {
-    fn new(max_wait_time: Option<f64>, max_size: Option<u32>) -> Self {
-        // if only one of the two is provided, the other is set to extreme value.
-        let (max_wait_time, max_size) = match (max_wait_time, max_size) {
-            (Some(t), None) => (t, u32::MAX), // T only strategy
-            (None, Some(s)) => (f64::MAX, s), // K only strategy
-            (Some(t), Some(s)) => (t, s),     // K-T strategy
-            (None, None) => (0.0, 1),         // Eager execution
-        };
-
+impl<T> BatchQueue<T> {
+    fn eager() -> Self {
         Self {
             items: Vec::new(),
-            max_wait_time,
-            max_size,
-            current_wait_time: 0.0,
-            current_size: 0,
+            max_wait_time: 0.0,
+            min_size: 1,
+            max_size: usize::MAX,
         }
     }
 
-    fn clear(&mut self) -> Vec<T> {
-        self.current_wait_time = 0.0;
-        self.current_size = 0;
-
-        mem::take(&mut self.items)
+    fn k_only(min_size: usize, max_size: Option<usize>) -> Self {
+        Self {
+            items: Vec::new(),
+            max_wait_time: f64::MAX,
+            min_size,
+            max_size: max_size.unwrap_or(min_size),
+        }
     }
 
-    fn push(&mut self, item: T, time_elapsed: f64) {
-        self.current_size += 1;
-        self.current_wait_time += time_elapsed;
-
-        self.items.push(item);
+    fn t_only(max_wait_time: f64) -> Self {
+        Self {
+            items: Vec::new(),
+            max_wait_time,
+            min_size: 1,
+            max_size: usize::MAX,
+        }
     }
 
-    fn is_ready(&self) -> bool {
-        self.current_size >= self.max_size
-            || (self.current_wait_time >= self.max_wait_time && self.current_size > 0)
+    fn k_or_t(max_wait_time: f64, min_size: usize, max_size: Option<usize>) -> Self {
+        Self {
+            items: Vec::new(),
+            max_wait_time,
+            min_size,
+            max_size: max_size.unwrap_or(min_size),
+        }
+    }
+
+    fn take(&mut self) -> Vec<T> {
+        let drain_count = self.items.len().min(self.max_size);
+        self.items
+            .drain(..drain_count)
+            .map(|(item, _)| item)
+            .collect()
+    }
+
+    fn push(&mut self, item: T, curr_timestamp: f64) {
+        self.items.push((item, curr_timestamp));
+    }
+
+    fn is_ready(&self, curr_timestamp: f64) -> bool {
+        let num_items = self.items.len();
+
+        if num_items > 0 {
+            let longest_wait_time = curr_timestamp - self.items[0].1;
+            if num_items >= self.min_size || longest_wait_time >= self.max_wait_time {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn batch(&mut self, curr_timestamp: f64) -> Option<Vec<T>> {
+        if self.is_ready(curr_timestamp) {
+            Some(self.take())
+        } else {
+            None
+        }
     }
 }
 
 impl Pending {
-    fn new(max_wait_time: f64, max_size: u32) -> Self {
+    fn new(max_wait_time: f64, min_size: usize, max_size: usize) -> Self {
         Self {
-            allocate: BatchBuffer::new(None, None),
-            deallocate: BatchBuffer::new(None, None),
-            copy_block: BatchBuffer::new(Some(max_wait_time), Some(max_size)),
-            mask_block: BatchBuffer::new(None, None),
-            embed_text: BatchBuffer::new(None, None),
-            embed_image: BatchBuffer::new(Some(max_wait_time), Some(max_size)),
-            fill_block: BatchBuffer::new(Some(max_wait_time), Some(max_size)),
-            decode_req: BatchBuffer::new(Some(max_wait_time), Some(max_size)),
+            allocate: BatchQueue::eager(),
+            deallocate: BatchQueue::eager(),
+            copy_block: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
+            mask_block: BatchQueue::eager(),
+            embed_text: BatchQueue::eager(),
+            embed_image: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
+            fill_block: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
+            decode_req: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
         }
+    }
+
+    fn push(&mut self, cmd: IrCommand, curr_timestamp: f64) {
+        match cmd {
+            IrCommand::Allocate(item) => {
+                self.allocate.push(item, curr_timestamp);
+            }
+            IrCommand::Deallocate(item) => {
+                self.deallocate.push(item, curr_timestamp);
+            }
+            IrCommand::CopyBlock(item) => {
+                self.copy_block.push(item, curr_timestamp);
+            }
+            IrCommand::MaskBlock(item) => {
+                self.mask_block.push(item, curr_timestamp);
+            }
+            IrCommand::FillBlock(item) => {
+                self.fill_block.push(item, curr_timestamp);
+            }
+            IrCommand::EmbedImage(item) => {
+                self.embed_image.push(item, curr_timestamp);
+            }
+            IrCommand::EmbedText(item) => {
+                self.embed_text.push(item, curr_timestamp);
+            }
+            IrCommand::DecodeRequest(item) => {
+                self.decode_req.push(item, curr_timestamp);
+            }
+        }
+    }
+
+    fn batch_all(&mut self, curr_timestamp: f64) -> Vec<sdi::command::Payload> {
+        let mut cmds = Vec::new();
+
+        if let Some(items) = self.allocate.batch(curr_timestamp) {
+            cmds.push(sdi::command::Payload::Allocate(sdi::Allocate { items }));
+        }
+
+        if let Some(items) = self.deallocate.batch(curr_timestamp) {
+            cmds.push(sdi::command::Payload::Deallocate(sdi::Deallocate { items }));
+        }
+
+        if let Some(items) = self.copy_block.batch(curr_timestamp) {
+            cmds.push(sdi::command::Payload::CopyBlock(sdi::CopyBlock { items }));
+        }
+
+        if let Some(items) = self.mask_block.batch(curr_timestamp) {
+            cmds.push(sdi::command::Payload::MaskBlock(sdi::MaskBlock { items }));
+        }
+
+        if let Some(items) = self.embed_text.batch(curr_timestamp) {
+            cmds.push(sdi::command::Payload::EmbedText(sdi::EmbedText { items }));
+        }
+
+        if let Some(items) = self.embed_image.batch(curr_timestamp) {
+            cmds.push(sdi::command::Payload::EmbedImage(sdi::EmbedImage { items }));
+        }
+
+        if let Some(items) = self.fill_block.batch(curr_timestamp) {
+            cmds.push(sdi::command::Payload::FillBlock(sdi::FillBlock { items }));
+        }
+
+        if let Some(items) = self.decode_req.batch(curr_timestamp) {
+            cmds.push(sdi::command::Payload::DecodeRequest(sdi::DecodeRequest {
+                items,
+            }));
+        }
+
+        cmds
     }
 }
 
@@ -176,7 +274,7 @@ impl Backend {
             block_size,
             namespace: Arc::new(Mutex::new(ObjNamespace::new(max_kv_blocks, max_embs))),
             cmd_buffer: Arc::new(Mutex::new(Vec::new())),
-            pending: Arc::new(Mutex::new(Pending::new(10.0, 0))),
+            pending: Arc::new(Mutex::new(Pending::new(10.0, 1, 1))),
             staged: Arc::new(Mutex::new(Vec::new())),
             submitted: Arc::new(Mutex::new(vec![])),
         }
@@ -203,7 +301,7 @@ impl Backend {
         inner.remaining_ids(namespace)
     }
 
-    pub fn schedule(&self, time_elapsed: f64) -> Result<(), BlockError> {
+    pub fn schedule(&self, curr_timestamp: f64) -> Result<(), BlockError> {
         let mut pending = self.pending.lock().map_err(|_| BlockError::LockError)?;
 
         // first move all the commands from cmd_buffer to pending (buffer items are removed)
@@ -222,11 +320,6 @@ impl Backend {
             stream_commands
             // drop the lock on cmd_buffer
         };
-
-        // do batching!!
-        //
-
-        let mut mask_cmd = sdi::MaskBlock { items: Vec::new() };
 
         // Horizontal batching: group commands by stream and type.
         for (_stream_id, cmd_list) in commands_by_stream.iter_mut() {
@@ -247,70 +340,22 @@ impl Backend {
                     }
                 }
 
-                match cmd {
-                    IrCommand::Allocate(item) => {
-                        pending.allocate.push(item, time_elapsed);
-                    }
-                    IrCommand::Deallocate(item) => {
-                        pending.deallocate.push(item, time_elapsed);
-                    }
-                    IrCommand::CopyBlock(item) => {
-                        pending.copy_block.push(item, time_elapsed);
-                    }
-                    IrCommand::MaskBlock(item) => {
-                        pending.mask_block.push(item, time_elapsed);
-                    }
-                    IrCommand::FillBlock(item) => {
-                        pending.fill_block.push(item, time_elapsed);
-                    }
-                    IrCommand::EmbedImage(item) => {
-                        pending.embed_image.push(item, time_elapsed);
-                    }
-                    IrCommand::EmbedText(item) => {
-                        pending.embed_text.push(item, time_elapsed);
-                    }
-                    IrCommand::DecodeRequest(item) => {
-                        pending.decode_req.push(item, time_elapsed);
-                    }
-                }
-
+                pending.push(cmd, curr_timestamp);
                 prev_cmd = Some(curr_cmd);
             }
         }
 
+        let batched_payloads = pending.batch_all(curr_timestamp);
+
         // add the commands to the staged queue
         let mut staged = self.staged.lock().map_err(|_| BlockError::LockError)?;
 
-        if alloc_cmd.object_ids.len() > 0 {
+        // Add the batched commands to the staged queue.
+        for payload in batched_payloads {
             staged.push(sdi::Command {
                 correlation_id: 0,
-                payload: Some(sdi::command::Payload::Allocate(alloc_cmd)),
+                payload: Some(payload),
             });
-        }
-
-        if dealloc_cmd.object_ids.len() > 0 {
-            staged.push(sdi::Command {
-                correlation_id: 0,
-                payload: Some(sdi::command::Payload::Deallocate(dealloc_cmd)),
-            });
-        }
-
-        if mask_cmd.items.len() > 0 {
-            staged.push(sdi::Command {
-                correlation_id: 0,
-                payload: Some(sdi::command::Payload::MaskBlock(mask_cmd)),
-            });
-        }
-
-        // fill decision.
-        if pending.fill_block.is_ready() {
-            staged.push(sdi::Command {
-                correlation_id: 0,
-                payload: Some(sdi::command::Payload::FillBlock(mem::take(
-                    &mut pending.fill_block.items,
-                ))),
-            });
-            pending.fill_block.clear();
         }
 
         // drop the lock on pending
