@@ -23,7 +23,7 @@ enum ObjectKind {
 // Allocate and Deallocate messages.
 // -----------------------------------------------------------------------------
 
-message AllocateItem {
+message Allocate {
   // The kind of object to allocate.
   ObjectKind kind = 1;
   // The number of objects to allocate.
@@ -32,20 +32,20 @@ message AllocateItem {
 }
 
 // A request to allocate objects of a certain kind with specified IDs.
-message Allocate {
-  repeated AllocateItem items = 1;
+message BatchAllocate {
+  repeated Allocate items = 1;
 }
 
 // A request to deallocate objects of a certain kind with specified IDs.
-message Deallocate {
-  repeated AllocateItem items = 1;
+message BatchDeallocate {
+  repeated Allocate items = 1;
 }
 
 // -----------------------------------------------------------------------------
 // Embedding messages.
 // -----------------------------------------------------------------------------
 
-message EmbedTextItem {
+message EmbedText {
   // Embedding IDs to produce/associate with this text.
   uint32 embedding_id = 1;
   // The token IDs for the text to be embedded.
@@ -55,13 +55,13 @@ message EmbedTextItem {
 }
 
 // A request to generate text embeddings.
-message EmbedText {
+message BatchEmbedText {
   // Embedding IDs to produce/associate with this text.
-  repeated EmbedTextItem items = 1;
+  repeated EmbedText items = 1;
 }
 
 // A single image embedding specification.
-message EmbedImageItem {
+message EmbedImage {
   // Embedding IDs to store or associate with the image.
   repeated uint32 embedding_ids = 1;
   // The URL of the image to embed.
@@ -69,9 +69,9 @@ message EmbedImageItem {
 }
 
 // A request to embed one or more images.
-message EmbedImage {
+message BatchEmbedImage {
   // A batch of image embedding items.
-  repeated EmbedImageItem items = 1;
+  repeated EmbedImage items = 1;
 }
 
 // -----------------------------------------------------------------------------
@@ -79,7 +79,7 @@ message EmbedImage {
 // -----------------------------------------------------------------------------
 
 // A single block fill specification.
-message FillBlockItem {
+message FillBlock {
   // The ID of the block to fill.
   uint32 block_id = 1;
   // IDs of blocks providing context for the fill operation.
@@ -91,13 +91,13 @@ message FillBlockItem {
 }
 
 // A request to fill one or more blocks.
-message FillBlock {
+message BatchFillBlock {
   // A batch of block fill items.
-  repeated FillBlockItem items = 1;
+  repeated FillBlock items = 1;
 }
 
 // A single mask specification for a block.
-message MaskBlockItem {
+message MaskBlock {
   // The ID of the block being masked.
   uint32 block_id = 1;
   // A flattened 2D mask (row-major order) represented as booleans.
@@ -105,13 +105,13 @@ message MaskBlockItem {
 }
 
 // A request to apply one or more boolean masks to blocks.
-message MaskBlock {
+message BatchMaskBlock {
   // A batch of block mask items.
-  repeated MaskBlockItem items = 1;
+  repeated MaskBlock items = 1;
 }
 
 // A single copy specification for data between blocks.
-message CopyBlockItem {
+message CopyBlock {
   // The source block ID.
   uint32 source_block_id = 1;
   // The destination block ID.
@@ -125,47 +125,89 @@ message CopyBlockItem {
 }
 
 // A request to copy data between blocks.
-message CopyBlock {
+message BatchCopyBlock {
   // A batch of block copy items.
-  repeated CopyBlockItem items = 1;
+  repeated CopyBlock items = 1;
 }
 
 // -----------------------------------------------------------------------------
 // Decode request/response messages.
 // -----------------------------------------------------------------------------
 
-message DecodeRequestItem {
+message DecodeTokenDistribution {
   // The embedding ID to decode.
   uint32 embedding_id = 1;
+  uint32 distribution_id = 2;
 }
 
 // A request to decode a sequence of embeddings into tokens.
-message DecodeRequest {
+message BatchDecodeTokenDistribution {
 
   // The embedding IDs to decode.
-  repeated DecodeRequestItem items = 1;
+  repeated DecodeTokenDistribution items = 1;
+}
+
+message SampleTopKRequest {
+  // The distribution to sample from.
+  uint32 distribution_id = 1;
+  // The number of samples to draw.
+  uint32 k = 2;
+}
+
+message BatchSampleTopKRequest {
+  // The sampling request items.
+  repeated SampleTopKRequest items = 1;
 }
 
 // The response containing decoded tokens.
-message DecodeResponse {
-  // The request identifier to which this response corresponds.
-  uint32 request_id = 1;
+message SampleTopKResponse {
   // The decoded token IDs.
-  repeated uint32 token_ids = 2;
+  repeated uint32 token_ids = 1;
 }
+
+message BatchSampleTopKResponse {
+  // The response items.
+  repeated SampleTopKResponse items = 1;
+}
+
+message GetTokenDistributionRequest {
+  // The distribution ID to retrieve.
+  uint32 distribution_id = 1;
+}
+
+
+message BatchGetTokenDistributionRequest {
+  // The distribution ID to retrieve.
+  repeated GetTokenDistributionRequest items = 1;
+}
+
+message GetTokenDistributionResponse {
+  // The distribution.
+  repeated float distribution = 1;
+}
+
+message BatchGetTokenDistributionResponse {
+  // The distribution.
+  repeated GetTokenDistributionResponse items = 1;
+}
+
+// -----------------------------------------------------------------------------
+
 
 message Command {
   uint32 correlation_id = 1;
 
   oneof payload {
-    Allocate allocate = 2;
-    Deallocate deallocate = 3;
-    EmbedText embed_text = 4;
-    EmbedImage embed_image = 5;
-    FillBlock fill_block = 6;
-    MaskBlock mask_block = 7;
-    CopyBlock copy_block = 8;
-    DecodeRequest decode_request = 9;
+    BatchAllocate allocate = 2;
+    BatchDeallocate deallocate = 3;
+    BatchEmbedText embed_text = 4;
+    BatchEmbedImage embed_image = 5;
+    BatchFillBlock fill_block = 6;
+    BatchMaskBlock mask_block = 7;
+    BatchCopyBlock copy_block = 8;
+    BatchDecodeTokenDistribution decode_token_distribution = 9;
+    BatchSampleTopKRequest sample_top_k_request = 10;
+    BatchGetTokenDistributionRequest get_token_distribution = 11;
   }
 }
 
@@ -174,6 +216,7 @@ message Event {
   uint32 correlation_id = 1;
 
   oneof payload {
-    DecodeResponse decode_response = 2;
+    BatchSampleTopKResponse sample_top_k = 2;
+    BatchGetTokenDistributionResponse get_token_distribution = 3;
   }
 }

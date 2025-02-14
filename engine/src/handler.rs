@@ -1,6 +1,6 @@
 use crate::state::{
     get_stream_id, Addr, BlockError, CausalLanguageModel, CausalTransformer, ImageEmbedder,
-    InstanceId, KvBlock, KvBlockManager, ObjectAllocator, ObjectManager, RemoteObjId, TokenEmb,
+    InstanceId, KvBlock, KvBlockManager, ObjectAllocator, ObjectId, ObjectManager, TokenEmb,
     TokenEmbManager, VideoEmbedder,
 };
 use std::collections::{HashMap, HashSet};
@@ -262,16 +262,12 @@ where
         &self,
         inst_id: &InstanceId,
         local_stream_id: Option<u32>,
-
         dist_ptr: Addr,
-        k: usize,
-        sender: oneshot::Sender<Vec<usize>>,
-    ) -> Result<(), BlockError> {
+        k: u32,
+    ) -> Result<oneshot::Receiver<Vec<u32>>, BlockError> {
         let dist_ptr = self.token_embs.resolve(inst_id, dist_ptr)?;
         self.backend
-            .sample_top_k(get_stream_id(inst_id, local_stream_id), dist_ptr, k, sender)?;
-
-        Ok(())
+            .sample_top_k(get_stream_id(inst_id, local_stream_id), dist_ptr, k)
     }
 }
 
@@ -357,11 +353,11 @@ where
 /// Internal struct that won't be exposed outside the module
 #[derive(Debug, Clone)]
 struct _FillBlockCmd {
-    block_ptr: RemoteObjId,
-    ctx_block_ptrs: Vec<RemoteObjId>,
+    block_ptr: ObjectId,
+    ctx_block_ptrs: Vec<ObjectId>,
     mask: Vec<bool>,
-    input_emb_ptrs: Vec<RemoteObjId>,
-    output_emb_ptrs: Vec<RemoteObjId>,
+    input_emb_ptrs: Vec<ObjectId>,
+    output_emb_ptrs: Vec<ObjectId>,
 }
 
 #[derive(Debug, Clone)]

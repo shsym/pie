@@ -8,9 +8,9 @@ use uuid::Uuid;
 
 pub type InstanceId = Uuid;
 pub type StreamId = (u128, u32);
-pub type RemoteObjId = u32;
+pub type ObjectId = u32;
 
-pub type Addr = RemoteObjId;
+pub type Addr = ObjectId;
 
 pub fn get_stream_id(inst_id: &InstanceId, local_stream_id: Option<u32>) -> StreamId {
     (inst_id.as_u128(), local_stream_id.unwrap_or(0))
@@ -37,31 +37,30 @@ pub trait ReferenceCounted {
 pub trait ObjectAllocator<T: ReferenceCounted> {
     type RawRepr;
 
-    fn alloc(&self, stream_id: StreamId) -> Result<RemoteObjId, BlockError>;
+    fn alloc(&self, stream_id: StreamId) -> Result<ObjectId, BlockError>;
 
-    fn dealloc(&self, stream_id: StreamId, obj_id: RemoteObjId) -> Result<(), BlockError>;
+    fn dealloc(&self, stream_id: StreamId, obj_id: ObjectId) -> Result<(), BlockError>;
 
     // retrieve the underlying data from the backend.
     // this is unlikely to be used in practice, except for debugging, implementing some new sampling algos, and so on.
     fn raw_repr(
         &self,
         stream_id: StreamId,
-        obj_id: RemoteObjId,
-        sender: oneshot::Sender<Self::RawRepr>,
-    ) -> Result<(), BlockError>;
+        obj_id: ObjectId,
+    ) -> Result<oneshot::Receiver<Self::RawRepr>, BlockError>;
 
     fn available(&self) -> usize;
 }
 
 // reference-counted object manager
 pub trait ObjectManager<T: ReferenceCounted, B: ObjectAllocator<T>> {
-    fn objects(&self) -> &HashMap<RemoteObjId, T>;
+    fn objects(&self) -> &HashMap<ObjectId, T>;
 
-    fn objects_mut(&mut self) -> &mut HashMap<RemoteObjId, T>;
+    fn objects_mut(&mut self) -> &mut HashMap<ObjectId, T>;
 
-    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, RemoteObjId>>;
+    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, ObjectId>>;
 
-    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, RemoteObjId>>;
+    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, ObjectId>>;
 
     fn backend(&self) -> &B;
 
@@ -173,7 +172,7 @@ pub trait ObjectManager<T: ReferenceCounted, B: ObjectAllocator<T>> {
         Ok(())
     }
 
-    fn resolve(&self, inst_id: &InstanceId, addr: Addr) -> Result<RemoteObjId, BlockError> {
+    fn resolve(&self, inst_id: &InstanceId, addr: Addr) -> Result<ObjectId, BlockError> {
         self.addr_maps()
             .get(&inst_id)
             .ok_or(BlockError::InstanceNotFound)?
@@ -184,7 +183,7 @@ pub trait ObjectManager<T: ReferenceCounted, B: ObjectAllocator<T>> {
         &self,
         inst_id: &InstanceId,
         addrs: &[Addr],
-    ) -> Result<Vec<RemoteObjId>, BlockError> {
+    ) -> Result<Vec<ObjectId>, BlockError> {
         self.addr_maps()
             .get(&inst_id)
             .ok_or(BlockError::InstanceNotFound)?
@@ -231,17 +230,17 @@ pub trait CausalTransformer: ObjectAllocator<KvBlock> + ObjectAllocator<TokenEmb
     fn fill(
         &self,
         stream_id: StreamId,
-        addr: RemoteObjId,
-        ctx_addrs: Vec<RemoteObjId>,
-        input_embs: Vec<RemoteObjId>,
-        output_embs: Option<Vec<RemoteObjId>>,
+        addr: ObjectId,
+        ctx_addrs: Vec<ObjectId>,
+        input_embs: Vec<ObjectId>,
+        output_embs: Option<Vec<ObjectId>>,
     ) -> Result<(), BlockError>;
 
     fn copy_tokens(
         &self,
         stream_id: StreamId,
-        src_ptr: RemoteObjId,
-        dst_ptr: RemoteObjId,
+        src_ptr: ObjectId,
+        dst_ptr: ObjectId,
         src_offset: u32,
         dst_offset: u32,
         size: u32,
@@ -250,7 +249,7 @@ pub trait CausalTransformer: ObjectAllocator<KvBlock> + ObjectAllocator<TokenEmb
     fn mask_tokens(
         &self,
         stream_id: StreamId,
-        ptr: RemoteObjId,
+        ptr: ObjectId,
         mask: &[bool],
     ) -> Result<(), BlockError>;
 }
@@ -261,8 +260,8 @@ pub trait FullTransformer: ObjectAllocator<TokenEmb> {
         &self,
         stream_id: StreamId,
         mask: Vec<bool>,
-        input_embs: Vec<RemoteObjId>,
-        output_embs: Vec<RemoteObjId>,
+        input_embs: Vec<ObjectId>,
+        output_embs: Vec<ObjectId>,
     ) -> Result<(), BlockError>;
 }
 
@@ -271,8 +270,8 @@ pub trait Rnn: ObjectAllocator<TokenEmb> {
     fn fill(
         &self,
         stream_id: StreamId,
-        state: RemoteObjId,
-        output_embs: Vec<RemoteObjId>,
+        state: ObjectId,
+        output_embs: Vec<ObjectId>,
     ) -> Result<(), BlockError>;
 }
 
@@ -304,9 +303,9 @@ impl ReferenceCounted for KvBlock {
 }
 
 pub struct KvBlockManager<B> {
-    kv_blocks: HashMap<RemoteObjId, KvBlock>,
-    token_embs: HashMap<RemoteObjId, TokenEmb>,
-    virtual_addr_maps: HashMap<InstanceId, AddrMap<Addr, RemoteObjId>>,
+    kv_blocks: HashMap<ObjectId, KvBlock>,
+    token_embs: HashMap<ObjectId, TokenEmb>,
+    virtual_addr_maps: HashMap<InstanceId, AddrMap<Addr, ObjectId>>,
 
     // primary storage
     backend: B,
@@ -335,11 +334,11 @@ where
         &mut self.kv_blocks
     }
 
-    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, RemoteObjId>> {
+    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, ObjectId>> {
         &self.virtual_addr_maps
     }
 
-    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, RemoteObjId>> {
+    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, ObjectId>> {
         &mut self.virtual_addr_maps
     }
 
@@ -448,8 +447,8 @@ impl ReferenceCounted for TokenEmb {
 }
 
 pub struct TokenEmbManager<B> {
-    token_embs: HashMap<RemoteObjId, TokenEmb>,
-    virtual_addr_maps: HashMap<InstanceId, AddrMap<Addr, RemoteObjId>>,
+    token_embs: HashMap<ObjectId, TokenEmb>,
+    virtual_addr_maps: HashMap<InstanceId, AddrMap<Addr, ObjectId>>,
 
     // primary storage
     storage: B,
@@ -477,11 +476,11 @@ where
         &mut self.token_embs
     }
 
-    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, RemoteObjId>> {
+    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, ObjectId>> {
         &self.virtual_addr_maps
     }
 
-    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, RemoteObjId>> {
+    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, ObjectId>> {
         &mut self.virtual_addr_maps
     }
 
@@ -521,8 +520,8 @@ impl ReferenceCounted for TokenDist {
 }
 
 pub struct TokenDistManager<B> {
-    token_dists: HashMap<RemoteObjId, TokenDist>,
-    virtual_addr_maps: HashMap<InstanceId, AddrMap<Addr, RemoteObjId>>,
+    token_dists: HashMap<ObjectId, TokenDist>,
+    virtual_addr_maps: HashMap<InstanceId, AddrMap<Addr, ObjectId>>,
 
     // primary storage
     storage: B,
@@ -550,11 +549,11 @@ where
         &mut self.token_dists
     }
 
-    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, RemoteObjId>> {
+    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, ObjectId>> {
         &self.virtual_addr_maps
     }
 
-    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, RemoteObjId>> {
+    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, ObjectId>> {
         &mut self.virtual_addr_maps
     }
 
@@ -569,33 +568,31 @@ pub trait CausalLanguageModel: ObjectAllocator<TokenEmb> + ObjectAllocator<Token
     fn next_token_dist(
         &self,
         stream_id: StreamId,
-        emb_ptr: RemoteObjId,
-        dist_ptr: RemoteObjId,
+        emb_ptr: ObjectId,
+        dist_ptr: ObjectId,
     ) -> Result<(), BlockError>;
 
     fn sample_top_k(
         &self,
         stream_id: StreamId,
-        dist_ptr: RemoteObjId,
-        k: usize,
-        sender: oneshot::Sender<Vec<usize>>,
-    ) -> Result<(), BlockError>;
+        dist_ptr: ObjectId,
+        k: u32,
+    ) -> Result<oneshot::Receiver<Vec<u32>>, BlockError>;
 
     // todo: design a better struct to represent distributions
     fn get_raw_dist(
         &self,
         stream_id: StreamId,
-        dist_ptr: RemoteObjId,
-        sender: oneshot::Sender<Vec<f32>>,
-    ) -> Result<(), BlockError>;
+        dist_ptr: ObjectId,
+    ) -> Result<oneshot::Receiver<Vec<f32>>, BlockError>;
 }
 
 pub trait MaskedLanguageModel: ObjectAllocator<TokenEmb> + ObjectAllocator<TokenDist> {
     fn token_dist(
         &self,
         stream_id: StreamId,
-        emb_ptr: RemoteObjId,
-        dist_ptr: RemoteObjId,
+        emb_ptr: ObjectId,
+        dist_ptr: ObjectId,
     ) -> Result<(), BlockError>;
 }
 
@@ -606,7 +603,7 @@ pub trait ImageEmbedder: ObjectAllocator<TokenEmb> {
     fn embed_img(
         &self,
         stream_id: StreamId,
-        addrs: Vec<RemoteObjId>,
+        addrs: Vec<ObjectId>,
         url: String,
     ) -> Result<(), BlockError>;
 }
@@ -616,7 +613,7 @@ pub trait VideoEmbedder: ObjectAllocator<TokenEmb> {
     fn embed_vid(
         &self,
         stream_id: StreamId,
-        addrs: Vec<RemoteObjId>,
+        addrs: Vec<ObjectId>,
         url: String,
     ) -> Result<(), BlockError>;
 }
@@ -634,7 +631,7 @@ pub enum BlockError {
     ResourceNotFound,
     ResourcePermissionDenied,
     LockError,
-    SendError
+    SendError,
 }
 
 // ------------------------------------------------------------
