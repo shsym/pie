@@ -1,12 +1,13 @@
-mod spi;
-mod cmd_buffer;
-mod state;
-mod handler;
 mod backend;
+mod cmd_buffer;
+mod handler;
+mod spi;
+mod state;
 mod utils;
+mod tokenizer;
 //mod state_old;
 
-use crate::spi::{App, InstanceMessage, InstanceState};
+use crate::spi::{App, InstanceMessageOld, InstanceState};
 use anyhow::Context;
 use blake3::Hasher;
 use dashmap::DashMap;
@@ -31,6 +32,7 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiImpl, WasiView};
 
 // For MessagePack serialization/deserialization.
+use crate::handler::InferenceManager;
 use rmp_serde::{decode::from_slice, encode::to_vec_named};
 use serde::{Deserialize, Serialize};
 
@@ -73,7 +75,7 @@ struct ServerState {
     engine: Engine,
 
     // The "global" sender (instances -> server)
-    inst2server: Sender<InstanceMessage>,
+    inst2server: Sender<InstanceMessageOld>,
 }
 
 /// In-progress upload info
@@ -91,7 +93,7 @@ struct ClientHandle {
 struct InstanceHandle {
     client_id: ClientId,
     hash: String,
-    server2inst: Sender<InstanceMessage>,
+    server2inst: Sender<InstanceMessageOld>,
     join_handle: JoinHandle<()>,
 }
 
@@ -203,10 +205,13 @@ async fn main() -> anyhow::Result<()> {
     //
     let state_ = state.clone();
 
+    let backend = backend::Backend::new(32, 1000, 1000);
+    let infer_mgr = InferenceManager::new(backend);
+
     tokio::spawn(async move {
         // Global loop reading from the global MPSC receiver
         while let Some(instance_msg) = inst2server_rx.recv().await {
-            let InstanceMessage {
+            let InstanceMessageOld {
                 instance_id,
                 dest_id,
                 message,
@@ -670,7 +675,7 @@ async fn handle_client_message_send_message(
 
     if let Err(e) = instance_handle
         .server2inst
-        .send(InstanceMessage {
+        .send(InstanceMessageOld {
             instance_id,
             dest_id: 0,
             message: event_data,

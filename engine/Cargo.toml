@@ -21,6 +21,10 @@ dashmap = "6.1.0"
 num-traits = "0.2.19"
 prost = "0.13"
 prost-types = "0.13"
+fancy-regex = "0.14.0"
+pyo3 = "0.23.4"
+rustc-hash = "2.1.0"
+bstr = "1.11.3"
 
 [build-dependencies]
 prost-build = "0.13.5"

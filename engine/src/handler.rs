@@ -33,7 +33,7 @@ impl Instance {
     }
 }
 
-pub struct ServerState<B> {
+pub struct InferenceManager<B> {
     backend: B,
     // resource name -> Resource handle
     resources: HashMap<String, Resource>,
@@ -55,7 +55,7 @@ pub struct ServerState<B> {
 //     -- dealloc(addr)
 //     -- compute( input_addrs, output_addrs, op, etc. )
 
-impl<B> ServerState<B>
+impl<B> InferenceManager<B>
 where
     B: CausalTransformer + Clone,
 {
@@ -237,7 +237,7 @@ where
 
 // For causal LMs
 
-impl<B> ServerState<B>
+impl<B> InferenceManager<B>
 where
     B: CausalLanguageModel,
 {
@@ -245,7 +245,6 @@ where
         &self,
         inst_id: &InstanceId,
         local_stream_id: Option<u32>,
-
         emb_ptr: Addr,
         dist_ptr: Addr,
     ) -> Result<(), BlockError> {
@@ -272,7 +271,7 @@ where
 }
 
 // For multimodal LLMs
-impl<B> ServerState<B>
+impl<B> InferenceManager<B>
 where
     B: ImageEmbedder + VideoEmbedder + ObjectAllocator<TokenEmb>,
 {
@@ -307,174 +306,4 @@ where
 
         Ok(())
     }
-}
-
-//
-// pub struct FillBlockCmdBatcher {
-//     queue: Vec<_FillBlockCmd>,
-//     redundancy_check: HashSet<RemoteObjId>,
-// }
-//
-// impl FillBlockCmdBatcher {
-//     pub fn new() -> Self {
-//         Self {
-//             queue: vec![],
-//             redundancy_check: HashSet::new(),
-//         }
-//     }
-//
-//     pub fn add(&mut self, cmd: _FillBlockCmd) {
-//         let ptr = cmd.block_ptr;
-//         // If there's already a command for this block, replace it
-//         if self.redundancy_check.remove(&ptr) {
-//             // remove from the queue
-//             let idx = self.queue.iter().position(|c| c.block_ptr == ptr);
-//             if let Some(i) = idx {
-//                 self.queue.remove(i);
-//             }
-//         }
-//         self.redundancy_check.insert(ptr);
-//         self.queue.push(cmd);
-//     }
-//
-//     pub fn batch(&self) {
-//
-//
-//
-//         ///
-//     }
-//
-//     pub fn clear(&mut self) {
-//         self.queue.clear();
-//         self.redundancy_check.clear();
-//     }
-// }
-
-/// Internal struct that won't be exposed outside the module
-#[derive(Debug, Clone)]
-struct _FillBlockCmd {
-    block_ptr: ObjectId,
-    ctx_block_ptrs: Vec<ObjectId>,
-    mask: Vec<bool>,
-    input_emb_ptrs: Vec<ObjectId>,
-    output_emb_ptrs: Vec<ObjectId>,
-}
-
-#[derive(Debug, Clone)]
-pub enum Command {
-    AllocateKvBlocks(AllocateKvBlocksCmd),
-    DeallocateKvBlocks(DeallocateKvBlocksCmd),
-    AvailableKvBlocks(AvailableKvBlocksCmd),
-    ExportKvBlocks(ExportKvBlocksCmd),
-    ImportKvBlocks(ImportKvBlocksCmd),
-    FillKvBlock(FillKvBlockCmd),
-    CopyKvBlock(CopyKvBlockCmd),
-    MaskKvBlock(MaskKvBlockCmd),
-    AllocateTokenEmbeds(AllocateTokenEmbedsCmd),
-    DeallocateTokenEmbeds(DeallocateTokenEmbedsCmd),
-    AvailableTokenEmbeds(AvailableTokenEmbedsCmd),
-    EmbedImage(EmbedImageCmd),
-    EmbedVideo(EmbedVideoCmd),
-    Decode(DecodeCmd),
-    GetNextTokenDist(GetNextTokenDistCmd),
-    GetFeatureVector(GetFeatureVectorCmd),
-}
-
-// =============================================================================
-// Individual command payloads
-// =============================================================================
-
-#[derive(Debug, Clone)]
-pub struct AllocateKvBlocksCmd {
-    pub num_blocks: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct DeallocateKvBlocksCmd {
-    pub addr_offset: Addr,
-    pub count: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct AvailableKvBlocksCmd;
-
-#[derive(Debug, Clone)]
-pub struct ExportKvBlocksCmd {
-    pub resource_name: String,
-    pub addr_offset: Addr,
-    pub count: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct ImportKvBlocksCmd {
-    pub resource_name: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct FillKvBlockCmd {
-    pub addr: Addr,
-    pub ctx_addrs: Vec<Addr>,
-    pub mask: Vec<bool>,
-    /// For simplicity, unify “input_embeds” or “tokens” into one name
-    pub input_embs: Vec<Addr>,
-    pub output_embs: Vec<Addr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CopyKvBlockCmd {
-    pub src_addr: Addr,
-    pub dst_addr: Addr,
-    pub src_token_offset: usize,
-    pub dst_token_offset: usize,
-    pub token_count: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct MaskKvBlockCmd {
-    pub addr: Addr,
-    pub token_offset: usize,
-    pub token_count: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct AllocateTokenEmbedsCmd {
-    pub num_tokens: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct DeallocateTokenEmbedsCmd {
-    pub addr_offset: Addr,
-    pub count: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct AvailableTokenEmbedsCmd;
-
-#[derive(Debug, Clone)]
-pub struct EmbedImageCmd {
-    pub image_url: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct EmbedVideoCmd {
-    pub video_url: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct DecodeCmd;
-
-#[derive(Debug, Clone)]
-pub struct GetNextTokenDistCmd {
-    pub addr: Addr,
-    pub offset: usize,
-    pub size: usize,
-    pub drop_output_embed: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct GetFeatureVectorCmd {
-    pub addr: Addr,
-    pub offset: usize,
-    pub size: usize,
-    pub drop_output_embed: bool,
 }

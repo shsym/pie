@@ -3,7 +3,6 @@ use crate::state::{
     ObjectId, StreamId, TokenDist, TokenEmb,
 };
 use crate::utils::IdPool;
-use futures::TryFutureExt;
 use prost::Message;
 use std::collections::HashMap;
 use std::mem;

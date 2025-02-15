@@ -1,5 +1,7 @@
 interface system {
-  get-version: func() -> string;
-  send: func(dest-id: u32, message: string);
-  receive: func() -> string;
+    get-version: func() -> string;
+
+
+    send: func(dest-id: u32, message: string);
+    receive: func() -> string;
 }
