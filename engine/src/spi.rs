@@ -1,10 +1,11 @@
-use std::future::Future;
+use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime::component::{bindgen, ResourceTable};
 use wasmtime::Result;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
-use crate::state::{ObjectId, StreamId};
+use crate::state::ObjectId;
+use crate::tokenizer::BytePairEncoder;
 use crate::utils::IdPool;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
@@ -38,6 +39,11 @@ pub struct InstanceState {
     pub cmd_buffer: Sender<Msg>,
 
     allocator: IdPool<ObjectId>,
+    utils: InstanceUtils,
+}
+
+pub struct InstanceUtils {
+    tokenizer: Arc<BytePairEncoder>,
 }
 
 pub struct InstanceMessageOld {
@@ -48,7 +54,7 @@ pub struct InstanceMessageOld {
 
 pub struct Msg {
     pub instance_id: Uuid,
-    pub command: Command,
+    pub cmd: Command,
 }
 
 pub enum Command {
@@ -132,6 +138,7 @@ pub enum Command {
 
     DecodeTokenDist {
         stream: u32,
+        embs: Vec<ObjectId>,
         dists: Vec<ObjectId>,
     },
 
@@ -164,6 +171,7 @@ impl InstanceState {
         inst2server: Sender<InstanceMessageOld>,
         server2inst: Receiver<InstanceMessageOld>,
         cmd_buffer: Sender<Msg>,
+        utils: InstanceUtils,
     ) -> Self {
         let mut builder = WasiCtx::builder();
         builder.inherit_stderr().inherit_network().inherit_stdout();
@@ -176,6 +184,7 @@ impl InstanceState {
             server2inst,
             cmd_buffer,
             allocator: IdPool::new(1_000_000),
+            utils,
         }
     }
 
@@ -183,7 +192,7 @@ impl InstanceState {
         self.cmd_buffer
             .send(Msg {
                 instance_id: self.instance_id,
-                command,
+                cmd: command,
             })
             .await?;
 
@@ -231,11 +240,17 @@ impl spi::lm::inference::Host for InstanceState {
         }
 
         // also let the server know
-        self.submit(Command::AllocateBlocks {
+        let cmd = Command::AllocateBlocks {
             stream,
             blocks: ids.clone(),
-        })
-        .await?;
+        };
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
 
         Ok(ids)
     }
@@ -247,11 +262,17 @@ impl spi::lm::inference::Host for InstanceState {
                 .or(Err(wasmtime::Error::msg("Invalid ID")))?;
         }
 
-        self.submit(Command::DeallocateBlocks {
+        let cmd = Command::DeallocateBlocks {
             stream,
             blocks: ids,
-        })
-        .await?;
+        };
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
 
         Ok(())
     }
@@ -264,15 +285,22 @@ impl spi::lm::inference::Host for InstanceState {
         inputs: Vec<u32>,
         outputs: Vec<u32>,
     ) -> Result<(), wasmtime::Error> {
-        self.submit(Command::FillBlocks {
+        let cmd = Command::FillBlocks {
             stream,
             blocks,
             context,
             inputs,
             outputs: outputs.into_iter().map(|x| Some(x)).collect(),
-        })
-        .await
-        .or(Err(wasmtime::Error::msg("FillBlocks failed")))
+        };
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn copy_block(
@@ -284,16 +312,23 @@ impl spi::lm::inference::Host for InstanceState {
         dst_offset: u32,
         size: u32,
     ) -> Result<(), wasmtime::Error> {
-        self.submit(Command::CopyBlock {
+        let cmd = Command::CopyBlock {
             stream,
             src_block: src,
             dst_block: dst,
             src_token_offset: src_offset,
             dst_token_offset: dst_offset,
             size,
-        })
-        .await
-        .or(Err(wasmtime::Error::msg("CopyBlock failed")))
+        };
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn mask_block(
@@ -302,31 +337,52 @@ impl spi::lm::inference::Host for InstanceState {
         block: u32,
         mask: Vec<u32>,
     ) -> Result<(), wasmtime::Error> {
-        self.submit(Command::MaskBlock {
+        let cmd = Command::MaskBlock {
             stream,
             block,
             mask: mask.into_iter().map(|x| x != 0).collect(),
-        })
-        .await
-        .or(Err(wasmtime::Error::msg("MaskBlock failed")))
+        };
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn export_blocks(&mut self, src: Vec<u32>, name: String) -> Result<(), wasmtime::Error> {
-        self.submit(Command::ExportBlocks {
+        let cmd = Command::ExportBlocks {
             blocks: src,
             resource_name: name,
-        })
-        .await
-        .or(Err(wasmtime::Error::msg("ExportBlocks failed")))
+        };
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn import_blocks(&mut self, dst: Vec<u32>, name: String) -> Result<(), wasmtime::Error> {
-        self.submit(Command::ImportBlocks {
+        let cmd = Command::ImportBlocks {
             blocks: dst,
             resource_name: name,
-        })
-        .await
-        .or(Err(wasmtime::Error::msg("ImportBlocks failed")))
+        };
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn embed_text(
@@ -335,13 +391,20 @@ impl spi::lm::inference::Host for InstanceState {
         embs: Vec<u32>,
         tokens: Vec<u32>,
     ) -> Result<(), wasmtime::Error> {
-        self.submit(Command::EmbedText {
+        let cmd = Command::EmbedText {
             stream,
             embs,
             text: tokens,
-        })
-        .await
-        .or(Err(wasmtime::Error::msg("EmbedText failed")))
+        };
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn embed_image(
@@ -350,13 +413,20 @@ impl spi::lm::inference::Host for InstanceState {
         embs: Vec<u32>,
         url: String,
     ) -> Result<(), wasmtime::Error> {
-        self.submit(Command::EmbedImage {
+        let cmd = Command::EmbedImage {
             stream,
             embs,
             image: url,
-        })
-        .await
-        .or(Err(wasmtime::Error::msg("EmbedImage failed")))
+        };
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn embed_video(
@@ -372,14 +442,22 @@ impl spi::lm::inference::Host for InstanceState {
         &mut self,
         stream: u32,
         embs: Vec<u32>,
-        dist: Vec<u32>,
+        dists: Vec<u32>,
     ) -> Result<(), wasmtime::Error> {
-        self.submit(Command::DecodeTokenDist {
+        let cmd = Command::DecodeTokenDist {
             stream,
-            dists: dist,
-        })
-        .await
-        .or(Err(wasmtime::Error::msg("DecodeTokenDist failed")))
+            embs,
+            dists,
+        };
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn sample_top_k(
@@ -388,16 +466,21 @@ impl spi::lm::inference::Host for InstanceState {
         embs: Vec<u32>,
         k: u32,
     ) -> Result<Vec<u32>, wasmtime::Error> {
-        let (tx, rx) = oneshot::channel();
-
-        self.submit(Command::SampleTopK {
+        let cmd = Command::SampleTopK {
             stream,
             emb: embs[0],
             k,
-            handle: tx,
-        })
-        .await
-        .or(Err(wasmtime::Error::msg("SampleTopK failed")))?;
+            handle: oneshot::channel().0,
+        };
+
+        let (tx, rx) = oneshot::channel();
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
 
         let result = rx
             .await
@@ -411,15 +494,20 @@ impl spi::lm::inference::Host for InstanceState {
         stream: u32,
         dist: u32,
     ) -> Result<Vec<f32>, wasmtime::Error> {
-        let (tx, rx) = oneshot::channel();
-
-        self.submit(Command::GetTokenDist {
+        let cmd = Command::GetTokenDist {
             stream,
             dist,
-            handle: tx,
-        })
-        .await
-        .or(Err(wasmtime::Error::msg("GetTokenDist failed")))?;
+            handle: oneshot::channel().0,
+        };
+
+        let (tx, rx) = oneshot::channel();
+
+        self.cmd_buffer
+            .send(Msg {
+                instance_id: self.instance_id,
+                cmd,
+            })
+            .await?;
 
         let result = rx
             .await
@@ -429,11 +517,18 @@ impl spi::lm::inference::Host for InstanceState {
     }
 
     async fn tokenize(&mut self, text: String) -> Result<Vec<u32>, wasmtime::Error> {
-        todo!()
+        let tokens = self
+            .utils
+            .tokenizer
+            .encode_with_special_tokens(text.as_str());
+
+        Ok(tokens)
     }
 
     async fn detokenize(&mut self, tokens: Vec<u32>) -> Result<String, wasmtime::Error> {
-        todo!()
+        let text = self.utils.tokenizer.decode(tokens.as_slice())?;
+
+        Ok(text)
     }
 }
 // impl spi::lm::inference::HostLanguageModel for InstanceState {

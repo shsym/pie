@@ -241,7 +241,7 @@ impl BytePairEncoder {
     }
 }
 
-fn load_merge_rules(path: &str) -> Result<HashMap<Vec<u8>, Rank>, Box<dyn std::error::Error>> {
+fn load_tiktoken_bpe(path: &str) -> Result<HashMap<Vec<u8>, Rank>, Box<dyn std::error::Error>> {
     // Read the entire file as a UTF-8 string
     let contents = fs::read_to_string(path)?;
 
@@ -286,10 +286,9 @@ fn load_merge_rules(path: &str) -> Result<HashMap<Vec<u8>, Rank>, Box<dyn std::e
     Ok(ret)
 }
 
-// https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py
-fn llama3_tokenizer(path: &str) -> Result<BytePairEncoder, Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example usage
-    let mergeable_ranks = load_merge_rules(path)?;
+    let mergeable_ranks = load_tiktoken_bpe("tokenizer.model")?;
     let special_tokens = vec![
         "<|begin_of_text|>",
         "<|end_of_text|>",
@@ -312,12 +311,20 @@ fn llama3_tokenizer(path: &str) -> Result<BytePairEncoder, Box<dyn std::error::E
         .map(|(i, s)| (s.to_string(), num_base_tokens + i as Rank))
         .collect();
 
-    let encoder = BytePairEncoder::new(mergeable_ranks, special_tokens_encoder, pattern);
+    let bpe_map = BytePairEncoder::new(mergeable_ranks, special_tokens_encoder, pattern);
     // [9906, 11, 856, 5679, 374, 19369]
     // encode text
-    //let text = "Hello, my dog is cute";
-    //let tokens = encoder.encode_with_special_tokens(text);
-    //println!("Encoded tokens: {:?}", tokens);
+    let text = "Hello, my dog is cute";
+    let tokens = bpe_map.encode_with_special_tokens(text);
+    println!("Encoded tokens: {:?}", tokens);
 
-    Ok(encoder)
+    let decoded_text = bpe_map.decode(&tokens)?;
+    
+    println!("Decoded text: {:?}", decoded_text);
+    
+    // Now `bpe_map` is a HashMap<Vec<u8>, i32>
+    // Do something with it...
+    println!("Loaded {} entries", num_base_tokens);
+
+    Ok(())
 }
