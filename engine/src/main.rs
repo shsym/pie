@@ -1,13 +1,14 @@
-mod backend;
+mod controller;
 mod cmd_buffer;
 mod handler;
 mod spi;
-mod state;
-mod utils;
+mod backend;
 mod tokenizer;
+mod utils;
+mod object;
 //mod state_old;
 
-use crate::spi::{App, InstanceMessageOld, InstanceState};
+use crate::spi::{App, InstanceMessageOld, InstanceState, InstanceUtils};
 use anyhow::Context;
 use blake3::Hasher;
 use dashmap::DashMap;
@@ -32,7 +33,8 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiImpl, WasiView};
 
 // For MessagePack serialization/deserialization.
-use crate::handler::InferenceManager;
+use crate::handler::Controller;
+use crate::tokenizer::{llama3_tokenizer, BytePairEncoder};
 use rmp_serde::{decode::from_slice, encode::to_vec_named};
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +78,8 @@ struct ServerState {
 
     // The "global" sender (instances -> server)
     inst2server: Sender<InstanceMessageOld>,
+
+    utils: Arc<BytePairEncoder>,
 }
 
 /// In-progress upload info
@@ -178,6 +182,9 @@ async fn main() -> anyhow::Result<()> {
     let mut config = Config::default();
     config.async_support(true);
 
+    // Load tokenizer
+    let tokenizer = llama3_tokenizer("../tokenizer.model").unwrap();
+
     // create channel
     let (inst2server_tx, mut inst2server_rx) = channel(1024);
 
@@ -189,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
         running_instances: DashMap::new(),
         engine: Engine::new(&config)?,
         inst2server: inst2server_tx,
+        utils: Arc::new(tokenizer),
     };
 
     // Scan the existing cache_dir and load the programs
@@ -205,8 +213,8 @@ async fn main() -> anyhow::Result<()> {
     //
     let state_ = state.clone();
 
-    let backend = backend::Backend::new(32, 1000, 1000);
-    let infer_mgr = InferenceManager::new(backend);
+    let backend = controller::Controller::new(32, 1000, 1000);
+    let infer_mgr = Controller::new(backend);
 
     tokio::spawn(async move {
         // Global loop reading from the global MPSC receiver
@@ -558,7 +566,14 @@ async fn handle_client_message_start_program(
     // create a channel
     let (server2inst_tx, server2inst_rx) = channel(32);
 
-    let inst_state = InstanceState::new(instance_id, state.inst2server.clone(), server2inst_rx);
+    let inst_state = InstanceState::new(
+        instance_id,
+        state.inst2server.clone(),
+        server2inst_rx,
+        InstanceUtils {
+            tokenizer: state.utils.clone(),
+        },
+    );
 
     // linker and store
 

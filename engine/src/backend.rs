@@ -1,857 +1,653 @@
-use crate::state::{
-    BlockError, CausalLanguageModel, CausalTransformer, ImageEmbedder, KvBlock, ObjectAllocator,
-    ObjectId, StreamId, TokenDist, TokenEmb,
-};
-use crate::utils::IdPool;
-use prost::Message;
 use std::collections::HashMap;
-use std::mem;
-use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
+use std::hash::Hash;
 
-mod sdi {
-    include!(concat!(env!("OUT_DIR"), "/sdi.rs"));
-}
+use crate::object;
 
-/// Intermediate representation of a command to be executed by the backend.
-/// This must not be exposed to other modules.
-#[derive(Debug)]
-enum IrCommand {
-    // Embs
-    Allocate(sdi::Allocate),
-    Deallocate(sdi::Allocate),
-    CopyBlock(sdi::CopyBlock),
-    MaskBlock(sdi::MaskBlock),
-    FillBlock(sdi::FillBlock),
-    EmbedImage(sdi::EmbedImage),
-    EmbedText(sdi::EmbedText),
-    DecodeTokenDistribution(sdi::DecodeTokenDistribution),
-    SampleTopKRequest(sdi::SampleTopKRequest),
-    GetTokenDistributionRequest(sdi::GetTokenDistributionRequest),
-}
+use crate::object::{KvBlock, TokenDist, TokenEmb};
+use tokio::sync::oneshot;
+use uuid::Uuid;
+use crate::utils::Stream;
 
-// Hidden
-#[derive(Debug)]
-enum IrEvent {
-    SampleTopK(sdi::SampleTopKResponse),
-    GetTokenDistribution(sdi::GetTokenDistributionResponse),
-}
+pub type InstanceId = Uuid;
+//pub type StreamId = (u128, u32);
+
+pub type Addr = object::Id;
 
 #[derive(Debug)]
-struct EventDispatcher {
-    // maps correlation_id to a list of senders.
-    table: HashMap<u32, Vec<EventHandle>>,
-}
-#[derive(Debug)]
-pub enum EventHandle {
-    None,
-    SampleTopK(oneshot::Sender<Vec<u32>>),
-    GetTokenDistribution(oneshot::Sender<Vec<f32>>),
+pub struct Resource {
+    owner_id: InstanceId,
+    addrs: Vec<Addr>,
 }
 
-impl EventHandle {
-    fn is_some(&self) -> bool {
-        match self {
-            EventHandle::None => false,
-            _ => true,
-        }
+impl Resource {
+    pub fn new(owner_id: InstanceId, addrs: Vec<Addr>) -> Self {
+        Self { owner_id, addrs }
     }
 }
 
-impl EventDispatcher {
-    fn new() -> Self {
+#[derive(Debug)]
+pub struct Instance {
+    owned_resources: Vec<String>,
+    //usage_stats: HashMap<String, usize>,
+}
+
+impl Instance {
+    pub fn new() -> Self {
         Self {
-            table: HashMap::new(),
-        }
-    }
-
-    fn register(&mut self, correlation_id: u32, sender: Vec<EventHandle>) {
-        self.table.insert(correlation_id, sender);
-    }
-
-    fn dispatch(&mut self, correlation_id: u32, event: Vec<IrEvent>) {
-        // zip senders and evnt
-        let senders = self.table.get_mut(&correlation_id).unwrap();
-        assert_eq!(senders.len(), event.len());
-
-        for (sender, evt) in senders.drain(..).zip(event.into_iter()) {
-            match sender {
-                EventHandle::None => {}
-                EventHandle::SampleTopK(s) => {
-                    if let IrEvent::SampleTopK(mut resp) = evt {
-                        let _ = s.send(mem::take(&mut resp.token_ids));
-                    } else {
-                        eprintln!("Unexpected event type");
-                    }
-                }
-                EventHandle::GetTokenDistribution(s) => {
-                    if let IrEvent::GetTokenDistribution(mut resp) = evt {
-                        let _ = s.send(mem::take(&mut resp.distribution));
-                    } else {
-                        eprintln!("Unexpected event type");
-                    }
-                }
-            }
+            owned_resources: vec![],
+            //usage_stats: HashMap::new(),
         }
     }
 }
-// Define actual cmd, interpretable by the backend.
 
-// Allocate(Type, entities:[id])
-// Deallocate(Type, entities:[id])
-// Fill (List[id,
-// LongFill using bitsets.. implement this later.
+pub struct ControllerManager<B> {
+    backend: B,
+    // resource name -> Resource handle
+    resources: HashMap<String, Resource>,
+    // instance_id -> Instance
+    instances: HashMap<InstanceId, Instance>,
 
-#[derive(Debug, Clone)]
-pub struct Backend {
-    block_size: u32,
-    id_pool: Arc<Mutex<ObjectIdPool>>,
-
-    cmd_buffer: Arc<Mutex<Vec<(StreamId, IrCommand, EventHandle)>>>,
-
-    pending: Arc<Mutex<Pending>>,
-    staged: Arc<Mutex<Vec<sdi::Command>>>,
-    submitted: Arc<Mutex<Vec<sdi::Command>>>,
-    // queue, cmd_buffer, scheduled, submitted
-    socket_tx: Arc<Mutex<Option<mpsc::Sender<Vec<sdi::Command>>>>>,
-    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    // zmq handles
-    //handle: Arc<JoinHandle<()>>,
-
-    // event dispatcher
-    event_dispatcher: Arc<Mutex<EventDispatcher>>,
+    // managers
+    kv_blocks: KvBlockManager<B>,
+    token_embs: TokenEmbManager<B>,
 }
+//
+//
+//
+// impl object::Allocator<KvBlock> for Controller<B> {
+//     fn alloc(&mut self, _local_stream_id: Option<u32>) -> Result<Addr, BlockError> {
+//         unimplemented!()
+//     }
+//
+//     fn dealloc(&mut self, _local_stream_id: Option<u32>, _addr: Addr) -> Result<(), BlockError> {
+//         unimplemented!()
+//     }
+// }
 
-impl Backend {
-    pub fn new(block_size: u32, max_kv_blocks: u32, max_embs: u32) -> Self {
+impl<B> ControllerManager<B>
+where
+    B: CausalTransformer + Clone,
+{
+    pub fn new(backend: B) -> Self {
         Self {
-            block_size,
-            id_pool: Arc::new(Mutex::new(ObjectIdPool::new(max_kv_blocks, max_embs))),
-            cmd_buffer: Arc::new(Mutex::new(Vec::new())),
-            pending: Arc::new(Mutex::new(Pending::new(10.0, 1, 1))),
-            staged: Arc::new(Mutex::new(Vec::new())),
-            submitted: Arc::new(Mutex::new(vec![])),
-            socket_tx: Arc::new(Mutex::new(None)),
-            handle: Arc::new(Mutex::new(None)),
-            event_dispatcher: Arc::new(Mutex::new(EventDispatcher {
-                table: HashMap::new(),
-            })),
+            backend: backend.clone(),
+            resources: HashMap::new(),
+            instances: HashMap::new(),
+            kv_blocks: KvBlockManager::new(backend.clone()),
+            token_embs: TokenEmbManager::new(backend),
+            //fill_cmd_batcher: FillBlockCmdBatcher::new(),
         }
     }
 
-    pub fn enqueue_cmd(&self, stream_id: StreamId, cmd: IrCommand) -> Result<(), BlockError> {
-        let mut inner = self.cmd_buffer.lock().map_err(|_| BlockError::LockError)?;
-        inner.push((stream_id, cmd, EventHandle::None));
+    pub fn init_instance(&mut self, inst_id: InstanceId) -> Result<(), BlockError> {
+        self.instances.insert(inst_id, Instance::new());
+        self.kv_blocks.init_instance(inst_id)?;
+        self.token_embs.init_instance(inst_id)?;
         Ok(())
     }
 
-    pub fn enqueue_cmd_with_event(
-        &self,
-        stream_id: StreamId,
-        cmd: IrCommand,
-        evt: EventHandle,
+    pub fn destroy_instance(&mut self, inst_id: &InstanceId) -> Result<(), BlockError> {
+        if let Some(inst) = self.instances.get(inst_id) {
+            for r in &inst.owned_resources {
+                self.resources.remove(r);
+            }
+        }
+        self.instances.remove(inst_id);
+        self.kv_blocks.destroy_instance(inst_id)?;
+        self.token_embs.destroy_instance(inst_id)?;
+
+        Ok(())
+    }
+
+    pub fn allocate_kv_block(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+    ) -> Result<Addr, BlockError> {
+        self.kv_blocks
+            .alloc(inst_id, local_stream_id, KvBlock::new())
+    }
+
+    pub fn deallocate_kv_block(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+        addr: Addr,
     ) -> Result<(), BlockError> {
-        let mut inner = self.cmd_buffer.lock().map_err(|_| BlockError::LockError)?;
+        self.kv_blocks.dealloc(inst_id, local_stream_id, addr)
+    }
 
-        inner.push((stream_id, cmd, evt));
+    pub fn export_kv_blocks(
+        &mut self,
+        inst_id: &InstanceId,
+        resource_name: String,
+        addrs: Vec<Addr>,
+    ) -> Result<(), BlockError> {
+        self.resources
+            .insert(resource_name.clone(), Resource::new(*inst_id, addrs));
+        self.instances
+            .get_mut(inst_id)
+            .ok_or(BlockError::InstanceNotFound)?
+            .owned_resources
+            .push(resource_name);
         Ok(())
     }
 
-    fn acquire_id(&self, ns: ObjectNamespace) -> Result<ObjectId, BlockError> {
-        let mut inner = self.id_pool.lock().map_err(|_| BlockError::LockError)?;
-        inner.acquire_id(ns)
-    }
+    pub fn import_kv_blocks(
+        &mut self,
+        inst_id: &InstanceId,
+        resource_name: String,
+    ) -> Result<Vec<Addr>, BlockError> {
+        let res = self
+            .resources
+            .get(&resource_name)
+            .ok_or(BlockError::ResourceNotFound)?;
 
-    fn release_id(&self, ns: ObjectNamespace, id: ObjectId) -> Result<(), BlockError> {
-        let mut inner = self.id_pool.lock().map_err(|_| BlockError::LockError)?;
-        inner.release_id(ns, id)
-    }
-
-    fn remaining_ids(&self, ns: ObjectNamespace) -> usize {
-        let inner = self.id_pool.lock().unwrap();
-        inner.remaining_ids(ns)
-    }
-
-    pub fn schedule(&self, curr_timestamp: f64) -> Result<(), BlockError> {
-        let mut pending = self.pending.lock().map_err(|_| BlockError::LockError)?;
-
-        // first move all the commands from cmd_buffer to pending (buffer items are removed)
-        let mut commands_by_stream = {
-            let mut cmd_buffer = self.cmd_buffer.lock().map_err(|_| BlockError::LockError)?;
-
-            let mut stream_commands = HashMap::new();
-
-            for (stream_id, command, sender) in cmd_buffer.drain(..) {
-                stream_commands
-                    .entry(stream_id)
-                    .or_insert_with(Vec::new)
-                    .push((command, sender));
-            }
-
-            stream_commands
-            // drop the lock on cmd_buffer
-        };
-
-        // Horizontal batching: group commands by stream and type.
-        for (_stream_id, cmd_list) in commands_by_stream.iter_mut() {
-            let mut prev_cmd = None;
-
-            loop {
-                if cmd_list.is_empty() {
-                    break;
-                }
-                let (cmd, sender) = cmd_list.pop().unwrap();
-                let curr_cmd = mem::discriminant(&cmd);
-
-                // Vertical batching: Same kind of consecutive commands are batched together.
-                // if the current command is different from the previous one, stop batching.
-                if let Some(prev_cmd) = prev_cmd {
-                    if prev_cmd != curr_cmd {
-                        break;
-                    }
-                }
-
-                pending.push(cmd, curr_timestamp, sender);
-                prev_cmd = Some(curr_cmd);
-            }
+        let mut addrs = Vec::with_capacity(res.addrs.len());
+        for src_addr in &res.addrs {
+            addrs.push(
+                self.kv_blocks
+                    .create_ref(inst_id, &res.owner_id, *src_addr)?,
+            );
         }
 
-        let batched_payloads = pending.batch_all(curr_timestamp);
-
-        // add the commands to the staged queue
-        let mut staged = self.staged.lock().map_err(|_| BlockError::LockError)?;
-
-        // Add the batched commands to the staged queue.
-        for (payload, evt_handles) in batched_payloads {
-            let correlation_id = self.acquire_id(ObjectNamespace::Cmd)?;
-
-            staged.push(sdi::Command {
-                correlation_id,
-                payload: Some(payload),
-            });
-
-            // if at least one sender is present, add it to the event dispatcher.
-            let has_event = evt_handles.iter().any(|s| s.is_some());
-            if has_event {
-                let mut dispatcher = self
-                    .event_dispatcher
-                    .lock()
-                    .map_err(|_| BlockError::LockError)?;
-                dispatcher.table.insert(correlation_id, evt_handles);
-            }
-        }
-
-        // drop the lock on pending
-        Ok(())
+        Ok(addrs)
     }
 
-    pub async fn commit(&self) -> Result<(), BlockError> {
-        // Lock and take the staged commands.
-        let mut staged = self.staged.lock().map_err(|_| BlockError::LockError)?;
+    pub fn fill_kv_block(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+        addr: Addr,
+        ctx_addrs: Vec<Addr>,
+        input_embs: Vec<Addr>,
+        output_embs: Option<Vec<Addr>>,
+    ) -> Result<(), BlockError> {
+        // create "resolved" cmd.
 
-        // Lock the sender.
-        let tx_guard = self.socket_tx.lock().map_err(|_| BlockError::LockError)?;
-        let tx = tx_guard.as_ref().ok_or(BlockError::LockError)?;
+        let block_ptr = self.kv_blocks.resolve(inst_id, addr)?;
+        let ctx_block_ptrs = self.kv_blocks.resolve_many(inst_id, &ctx_addrs)?;
 
-        // Send the staged commands, replacing them with an empty Vec.
-        tx.send(mem::take(&mut *staged))
-            .await
-            .map_err(|_| BlockError::SendError)?;
+        let input_emb_ptrs = self.token_embs.resolve_many(inst_id, &input_embs)?;
+
+        // let output_emb_ptrs = if let Some(output_embs) = output_embs {
+        //     Some(self.token_embs.resolve_many(inst_id, &output_embs)?)
+        // } else {
+        //     None
+        // };
+
+        let output_emb_ptrs = output_embs
+            .map(|emb| self.token_embs.resolve_many(inst_id, &emb))
+            .transpose()?;
+
+        self.kv_blocks.get_mut(inst_id, addr)?.filled = false;
+
+        self.backend.fill(
+            get_stream_id(inst_id, local_stream_id),
+            block_ptr,
+            ctx_block_ptrs,
+            input_emb_ptrs,
+            output_emb_ptrs,
+        )?;
 
         Ok(())
     }
 
-    pub async fn bind(&mut self, endpoint: &str) -> Result<(), ZmqError> {
-        // bind the zmq socket
-        let mut socket = DealerSocket::new();
-        socket.connect(endpoint).await?;
-        println!("Connected to server at {endpoint}");
-
-        let (tx, rx) = mpsc::channel::<Vec<sdi::Command>>(100);
-
-        self.socket_tx = Arc::new(Mutex::new(Some(tx)));
-
-        // 3) Spawn the single I/O driver task that handles all read/write from the socket
-        let handle = tokio::spawn(Self::socket_driver(
-            socket,
-            rx,
-            self.event_dispatcher.clone(),
-        ));
-
-        self.handle = Arc::new(Mutex::new(Some(handle)));
-
-        Ok(())
+    pub fn copy_kv_block(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+        src_addr: Addr,
+        dst_addr: Addr,
+        src_token_offset: u32,
+        dst_token_offset: u32,
+        token_count: u32,
+    ) -> Result<(), BlockError> {
+        self.kv_blocks.copy_tokens(
+            inst_id,
+            local_stream_id,
+            src_addr,
+            dst_addr,
+            src_token_offset,
+            dst_token_offset,
+            token_count,
+        )
     }
 
-    async fn socket_driver(
-        mut socket: DealerSocket,
-        mut rx: mpsc::Receiver<Vec<sdi::Command>>,
-        evt_dispatch: Arc<Mutex<EventDispatcher>>,
-    ) {
-        loop {
-            tokio::select! {
-                // A) Incoming requests from the channel => send to server
-                maybe_req = rx.recv() => {
-                    match maybe_req {
-                        Some(cmds) => {
-                            for cmd in cmds {
-                                let bytes = cmd.encode_to_vec();
-                                if let Err(e) = socket.send(ZmqMessage::from(bytes)).await {
-                                    eprintln!("Socket send failed: {:?}", e);
-                                    // You might choose to break or keep trying
-                                }
-                            }
-                        },
-                        None => {
-                            // channel closed => no more requests
-                            println!("Request channel closed, shutting down driver.");
-                            break;
-                        }
-                    }
-                },
+    pub fn mask_kv_block(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+        addr: Addr,
+        mask: Vec<bool>,
+    ) -> Result<(), BlockError> {
+        self.kv_blocks
+            .mask_tokens(inst_id, local_stream_id, addr, &mask)
+    }
 
-                // B) Incoming responses from the server
-                result = socket.recv() => {
-                    match result {
-                        Ok(msg) => {
-                            // Dealer/Router typically has 2 frames: [identity, payload]
-                            let payload = msg.get(0).unwrap();
-                            match sdi::Event::decode(payload.as_ref()) {
-                                Ok(evt) => {
+    pub fn allocate_token_emb(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+    ) -> Result<Addr, BlockError> {
+        self.token_embs
+            .alloc(inst_id, local_stream_id, TokenEmb::new())
+    }
 
-                                    // send this evt somewhere elese.
-
-                                    let correlation_id = evt.correlation_id;
-
-                                    let ir_events = match evt.payload.unwrap() {
-                                        sdi::event::Payload::SampleTopK(batch) => {
-                                            batch.items.into_iter().map(|item| IrEvent::SampleTopK(item)
-                                            ).collect()
-                                        },
-                                        sdi::event::Payload::GetTokenDistribution(batch) => {
-                                             batch.items.into_iter().map(|item| IrEvent::GetTokenDistribution(item)
-                                            ).collect()
-                                        }
-                                    };
-
-                                    let mut dispatcher = evt_dispatch.lock().unwrap();
-                                    dispatcher.dispatch(correlation_id, ir_events);
-
-                                }
-                                Err(err) => {
-                                    eprintln!("Failed to parse Response from server: {:?}", err);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("Socket receive error: {:?}", e);
-                            // Possibly break or keep going...
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+    pub fn deallocate_token_emb(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+        addr: Addr,
+    ) -> Result<(), BlockError> {
+        self.token_embs.dealloc(inst_id, local_stream_id, addr)
     }
 }
 
-// more sophisticated forms include: MultiNodeBackend, etc.
-#[derive(Debug)]
-struct ObjectIdPool {
-    kv_block_id_pool: IdPool<ObjectId>,
-    emb_id_pool: IdPool<ObjectId>,
-    dist_id_pool: IdPool<ObjectId>,
-    cmd_id_pool: IdPool<ObjectId>,
-}
-#[derive(Debug)]
-struct Pending {
-    allocate: BatchQueue<sdi::Allocate>,
-    deallocate: BatchQueue<sdi::Allocate>,
-    copy_block: BatchQueue<sdi::CopyBlock>,
-    mask_block: BatchQueue<sdi::MaskBlock>,
-    embed_text: BatchQueue<sdi::EmbedText>,
-    embed_image: BatchQueue<sdi::EmbedImage>,
+// For causal LMs
 
-    // these cmds are only be fired when it contains "enough" commands to be batched.
-    fill_block: BatchQueue<sdi::FillBlock>,
-    decode_token_distribution: BatchQueue<sdi::DecodeTokenDistribution>,
-    sample_top_k: BatchQueue<sdi::SampleTopKRequest>,
-}
-
-/// "K-or-T" Strategy
-// 	For instance: If queue size reaches K, launch immediately; otherwise launch after T ms if K isn’t reached.
-// 	This ensures that the GPU does not stay idle for too long (bounded by T) and that short bursts of arrivals form a large enough batch to get good utilization (bounded by K).
-#[derive(Debug)]
-struct BatchQueue<T> {
-    // cmd, timestamp, response_sender
-    items: Vec<(T, f64, EventHandle)>,
-
-    max_wait_time: f64,
-    min_size: usize,
-    max_size: usize,
-}
-
-impl<T> BatchQueue<T> {
-    fn eager() -> Self {
-        Self {
-            items: Vec::new(),
-            max_wait_time: 0.0,
-            min_size: 1,
-            max_size: usize::MAX,
-        }
-    }
-
-    fn k_only(min_size: usize, max_size: Option<usize>) -> Self {
-        Self {
-            items: Vec::new(),
-            max_wait_time: f64::MAX,
-            min_size,
-            max_size: max_size.unwrap_or(min_size),
-        }
-    }
-
-    fn t_only(max_wait_time: f64) -> Self {
-        Self {
-            items: Vec::new(),
-            max_wait_time,
-            min_size: 1,
-            max_size: usize::MAX,
-        }
-    }
-
-    fn k_or_t(max_wait_time: f64, min_size: usize, max_size: Option<usize>) -> Self {
-        Self {
-            items: Vec::new(),
-            max_wait_time,
-            min_size,
-            max_size: max_size.unwrap_or(min_size),
-        }
-    }
-
-    fn take(&mut self) -> (Vec<T>, Vec<EventHandle>) {
-        let drain_count = self.items.len().min(self.max_size);
-        self.items
-            .drain(..drain_count)
-            .map(|(item, _, sender)| (item, sender))
-            .unzip()
-    }
-
-    fn push(&mut self, item: T, curr_timestamp: f64, evt: EventHandle) {
-        self.items.push((item, curr_timestamp, evt));
-    }
-
-    fn is_ready(&self, curr_timestamp: f64) -> bool {
-        let num_items = self.items.len();
-
-        if num_items > 0 {
-            let longest_wait_time = curr_timestamp - self.items[0].1;
-            if num_items >= self.min_size || longest_wait_time >= self.max_wait_time {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn batch(&mut self, curr_timestamp: f64) -> Option<(Vec<T>, Vec<EventHandle>)> {
-        if self.is_ready(curr_timestamp) {
-            Some(self.take())
-        } else {
-            None
-        }
-    }
-}
-
-impl Pending {
-    fn new(max_wait_time: f64, min_size: usize, max_size: usize) -> Self {
-        Self {
-            allocate: BatchQueue::eager(),
-            deallocate: BatchQueue::eager(),
-            copy_block: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
-            mask_block: BatchQueue::eager(),
-            embed_text: BatchQueue::eager(),
-            embed_image: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
-            fill_block: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
-            sample_top_k: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
-            decode_token_distribution: BatchQueue::eager(),
-        }
-    }
-
-    fn push(&mut self, cmd: IrCommand, curr_timestamp: f64, evt: EventHandle) {
-        match cmd {
-            IrCommand::Allocate(item) => {
-                self.allocate.push(item, curr_timestamp, evt);
-            }
-            IrCommand::Deallocate(item) => {
-                self.deallocate.push(item, curr_timestamp, evt);
-            }
-            IrCommand::CopyBlock(item) => {
-                self.copy_block.push(item, curr_timestamp, evt);
-            }
-            IrCommand::MaskBlock(item) => {
-                self.mask_block.push(item, curr_timestamp, evt);
-            }
-            IrCommand::FillBlock(item) => {
-                self.fill_block.push(item, curr_timestamp, evt);
-            }
-            IrCommand::EmbedImage(item) => {
-                self.embed_image.push(item, curr_timestamp, evt);
-            }
-            IrCommand::EmbedText(item) => {
-                self.embed_text.push(item, curr_timestamp, evt);
-            }
-            IrCommand::SampleTopKRequest(item) => {
-                self.sample_top_k.push(item, curr_timestamp, evt);
-            }
-            IrCommand::DecodeTokenDistribution(item) => {
-                self.decode_token_distribution
-                    .push(item, curr_timestamp, evt);
-            },
-            IrCommand::GetTokenDistributionRequest(_) => todo!()
-        }
-    }
-
-    fn batch_all(&mut self, curr_timestamp: f64) -> Vec<(sdi::command::Payload, Vec<EventHandle>)> {
-        let mut cmds = Vec::new();
-
-        if let Some((items, senders)) = self.allocate.batch(curr_timestamp) {
-            cmds.push((
-                sdi::command::Payload::Allocate(sdi::BatchAllocate { items }),
-                senders,
-            ));
-        }
-
-        if let Some((items, senders)) = self.deallocate.batch(curr_timestamp) {
-            cmds.push((
-                sdi::command::Payload::Deallocate(sdi::BatchDeallocate { items }),
-                senders,
-            ));
-        }
-
-        if let Some((items, senders)) = self.copy_block.batch(curr_timestamp) {
-            cmds.push((
-                sdi::command::Payload::CopyBlock(sdi::BatchCopyBlock { items }),
-                senders,
-            ));
-        }
-
-        if let Some((items, senders)) = self.mask_block.batch(curr_timestamp) {
-            cmds.push((
-                sdi::command::Payload::MaskBlock(sdi::BatchMaskBlock { items }),
-                senders,
-            ));
-        }
-
-        if let Some((items, senders)) = self.embed_text.batch(curr_timestamp) {
-            cmds.push((
-                sdi::command::Payload::EmbedText(sdi::BatchEmbedText { items }),
-                senders,
-            ));
-        }
-
-        if let Some((items, senders)) = self.embed_image.batch(curr_timestamp) {
-            cmds.push((
-                sdi::command::Payload::EmbedImage(sdi::BatchEmbedImage { items }),
-                senders,
-            ));
-        }
-
-        if let Some((items, senders)) = self.fill_block.batch(curr_timestamp) {
-            cmds.push((
-                sdi::command::Payload::FillBlock(sdi::BatchFillBlock { items }),
-                senders,
-            ));
-        }
-
-        if let Some((items, senders)) = self.sample_top_k.batch(curr_timestamp) {
-            cmds.push((
-                sdi::command::Payload::SampleTopKRequest(sdi::BatchSampleTopKRequest { items }),
-                senders,
-            ));
-        }
-
-        cmds
-    }
-}
-
-enum ObjectNamespace {
-    KvBlock = 0,
-    Emb = 1,
-    Dist = 2,
-    Cmd = 3,
-}
-
-impl ObjectIdPool {
-    fn new(max_kv_blocks: u32, max_embs: u32) -> Self {
-        Self {
-            kv_block_id_pool: IdPool::new(max_kv_blocks),
-            emb_id_pool: IdPool::new(max_embs),
-            dist_id_pool: IdPool::new(max_embs),
-            cmd_id_pool: IdPool::new(max_embs),
-        }
-    }
-
-    fn acquire_id(&mut self, ns: ObjectNamespace) -> Result<ObjectId, BlockError> {
-        match ns {
-            ObjectNamespace::KvBlock => self.kv_block_id_pool.acquire(),
-            ObjectNamespace::Emb => self.emb_id_pool.acquire(),
-            ObjectNamespace::Dist => self.dist_id_pool.acquire(),
-            ObjectNamespace::Cmd => self.cmd_id_pool.acquire(),
-        }
-        .ok_or(BlockError::NoFreeBlocks)
-    }
-
-    fn release_id(&mut self, ns: ObjectNamespace, id: ObjectId) -> Result<(), BlockError> {
-        match ns {
-            ObjectNamespace::KvBlock => self.kv_block_id_pool.release(id),
-            ObjectNamespace::Emb => self.emb_id_pool.release(id),
-            ObjectNamespace::Dist => self.dist_id_pool.release(id),
-            ObjectNamespace::Cmd => self.cmd_id_pool.release(id),
-        }
-    }
-
-    fn remaining_ids(&self, ns: ObjectNamespace) -> usize {
-        match ns {
-            ObjectNamespace::KvBlock => self.kv_block_id_pool.available(),
-            ObjectNamespace::Emb => self.emb_id_pool.available(),
-            ObjectNamespace::Dist => self.dist_id_pool.available(),
-            ObjectNamespace::Cmd => self.cmd_id_pool.available(),
-        }
-    }
-}
-
-impl ObjectAllocator<TokenEmb> for Backend {
-    type RawRepr = Vec<f32>;
-
-    fn alloc(&self, stream_id: StreamId) -> Result<ObjectId, BlockError> {
-        let new_obj_id = self.acquire_id(ObjectNamespace::Emb)?;
-
-        let cmd = IrCommand::Allocate(sdi::Allocate {
-            kind: sdi::ObjectKind::Emb.into(),
-            object_id_offset: new_obj_id,
-            count: 1,
-        });
-        self.enqueue_cmd(stream_id, cmd)?;
-
-        Ok(new_obj_id)
-    }
-
-    fn dealloc(&self, stream_id: StreamId, obj_id: ObjectId) -> Result<(), BlockError> {
-        // Release the object id back to the pool.
-        self.release_id(ObjectNamespace::Emb, obj_id)?;
-
-        let cmd = IrCommand::Deallocate(sdi::Allocate {
-            kind: sdi::ObjectKind::Emb.into(),
-            object_id_offset: obj_id,
-            count: 1,
-        });
-        self.enqueue_cmd(stream_id, cmd)?;
-
-        Ok(())
-    }
-
-    fn raw_repr(
+impl<B> ControllerManager<B>
+where
+    B: CausalLanguageModel,
+{
+    pub fn next_token_dist(
         &self,
-        stream_id: StreamId,
-        obj_id: ObjectId,
-    ) -> Result<oneshot::Receiver<Self::RawRepr>, BlockError> {
-        todo!()
-    }
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+        emb_ptr: Addr,
+        dist_ptr: Addr,
+    ) -> Result<(), BlockError> {
+        let emb_ptr = self.token_embs.resolve(inst_id, emb_ptr)?;
+        let dist_ptr = self.token_embs.resolve(inst_id, dist_ptr)?;
 
-    fn available(&self) -> usize {
-        self.remaining_ids(ObjectNamespace::Emb)
-    }
-}
-
-impl ObjectAllocator<KvBlock> for Backend {
-    // The raw representation of a kv block is not really useful in any way. So we just use usize.
-    type RawRepr = ObjectId;
-
-    fn alloc(&self, stream_id: StreamId) -> Result<ObjectId, BlockError> {
-        let new_obj_id = self.acquire_id(ObjectNamespace::KvBlock)?;
-
-        let cmd = IrCommand::Allocate(sdi::Allocate {
-            kind: sdi::ObjectKind::KvBlock.into(),
-            object_id_offset: new_obj_id,
-            count: 1,
-        });
-        self.enqueue_cmd(stream_id, cmd)?;
-
-        Ok(new_obj_id)
-    }
-
-    fn dealloc(&self, stream_id: StreamId, obj_id: ObjectId) -> Result<(), BlockError> {
-        // Release the object id back to the pool.
-        self.release_id(ObjectNamespace::KvBlock, obj_id)?;
-
-        let cmd = IrCommand::Deallocate(sdi::Allocate {
-            kind: sdi::ObjectKind::KvBlock.into(),
-            object_id_offset: obj_id,
-            count: 1,
-        });
-        self.enqueue_cmd(stream_id, cmd)?;
+        self.backend
+            .next_token_dist(get_stream_id(inst_id, local_stream_id), emb_ptr, dist_ptr)?;
 
         Ok(())
     }
 
-    fn raw_repr(
+    pub fn sample_top_k(
         &self,
-        stream_id: StreamId,
-        obj_id: ObjectId,
-    ) -> Result<oneshot::Receiver<Self::RawRepr>, BlockError> {
-        //sender.send(obj_id).unwrap();
-        todo!()
-    }
-
-    fn available(&self) -> usize {
-        self.remaining_ids(ObjectNamespace::KvBlock)
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+        dist_ptr: Addr,
+        k: u32,
+    ) -> Result<oneshot::Receiver<Vec<u32>>, BlockError> {
+        let dist_ptr = self.token_embs.resolve(inst_id, dist_ptr)?;
+        self.backend
+            .sample_top_k(get_stream_id(inst_id, local_stream_id), dist_ptr, k)
     }
 }
 
-impl ObjectAllocator<TokenDist> for Backend {
-    type RawRepr = Vec<f32>;
+// For multimodal LLMs
+impl<B> ControllerManager<B>
+where
+    B: ImageEmbedder + VideoEmbedder + ObjectAllocator<TokenEmb>,
+{
+    pub fn embed_image(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
 
-    fn alloc(&self, stream_id: StreamId) -> Result<ObjectId, BlockError> {
-        todo!()
+        token_addrs: Vec<Addr>,
+        image_url: String,
+    ) -> Result<(), BlockError> {
+        let ptrs = self.token_embs.resolve_many(inst_id, &token_addrs)?;
+
+        self.backend
+            .embed_img(get_stream_id(inst_id, local_stream_id), ptrs, image_url)?;
+
+        Ok(())
     }
 
-    fn dealloc(&self, stream_id: StreamId, obj_id: ObjectId) -> Result<(), BlockError> {
-        todo!()
-    }
+    pub fn embed_video(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
 
-    fn raw_repr(
-        &self,
-        stream_id: StreamId,
-        obj_id: ObjectId,
-    ) -> Result<oneshot::Receiver<Self::RawRepr>, BlockError> {
-        todo!()
-    }
+        token_addrs: Vec<Addr>,
+        video_url: String,
+    ) -> Result<(), BlockError> {
+        let ptrs = self.token_embs.resolve_many(inst_id, &token_addrs)?;
 
-    fn available(&self) -> usize {
-        todo!()
+        self.backend
+            .embed_vid(get_stream_id(inst_id, local_stream_id), ptrs, video_url)?;
+
+        Ok(())
     }
 }
 
-impl CausalTransformer for Backend {
+// Backend trait for filling key-value blocks. (GPT-like models)
+pub trait CausalTransformer: object::Allocator<KvBlock> + object::Allocator<TokenEmb> {
     fn fill(
         &self,
-        stream_id: StreamId,
-        ptr: ObjectId,
-        ctx_ptrs: Vec<ObjectId>,
-        input_embs: Vec<ObjectId>,
-        output_embs: Option<Vec<ObjectId>>,
-    ) -> Result<(), BlockError> {
-        let cmd = IrCommand::FillBlock(sdi::FillBlock {
-            block_id: ptr,
-            context_block_ids: ctx_ptrs,
-            input_embedding_ids: input_embs,
-            output_embedding_ids: output_embs.unwrap_or_default(),
-        });
-
-        self.enqueue_cmd(stream_id, cmd)
-    }
+        stream_id: Stream,
+        addr: object::Id,
+        ctx_addrs: Vec<object::Id>,
+        input_embs: Vec<object::Id>,
+        output_embs: Option<Vec<object::Id>>,
+    ) -> Result<(), BlockError>;
 
     fn copy_tokens(
         &self,
         stream_id: StreamId,
-        src_ptr: ObjectId,
-        dst_ptr: ObjectId,
+        src_ptr: object::Id,
+        dst_ptr: object::Id,
         src_offset: u32,
         dst_offset: u32,
         size: u32,
-    ) -> Result<(), BlockError> {
-        let cmd = IrCommand::CopyBlock(sdi::CopyBlock {
-            source_block_id: src_ptr,
-            destination_block_id: dst_ptr,
-            source_start: src_offset,
-            destination_start: dst_offset,
-            length: size,
-        });
-
-        self.enqueue_cmd(stream_id, cmd)
-    }
+    ) -> Result<(), BlockError>;
 
     fn mask_tokens(
         &self,
         stream_id: StreamId,
-        ptr: ObjectId,
+        ptr: object::Id,
         mask: &[bool],
-    ) -> Result<(), BlockError> {
-        let cmd = IrCommand::MaskBlock(sdi::MaskBlock {
-            block_id: ptr,
-            mask: mask.to_vec(),
-        });
-        self.enqueue_cmd(stream_id, cmd)
+    ) -> Result<(), BlockError>;
+}
+
+// probably unused in the first version. For BERT-like models.
+pub trait FullTransformer: object::Allocator<TokenEmb> {
+    fn fill(
+        &self,
+        stream_id: StreamId,
+        mask: Vec<bool>,
+        input_embs: Vec<object::Id>,
+        output_embs: Vec<object::Id>,
+    ) -> Result<(), BlockError>;
+}
+
+// could be used for other LLM architectures like SSMs
+pub trait Rnn: object::Allocator<TokenEmb> {
+    fn fill(
+        &self,
+        stream_id: StreamId,
+        state: object::Id,
+        output_embs: Vec<object::Id>,
+    ) -> Result<(), BlockError>;
+}
+
+// ------------------------------------------------------------
+
+pub struct KvBlockManager<B> {
+    kv_blocks: HashMap<object::Id, KvBlock>,
+    token_embs: HashMap<object::Id, TokenEmb>,
+    virtual_addr_maps: HashMap<InstanceId, AddrMap<Addr, object::Id>>,
+
+    // primary storage
+    backend: B,
+}
+
+impl<B> KvBlockManager<B> {
+    pub fn new(backend: B) -> Self {
+        Self {
+            kv_blocks: HashMap::new(),
+            token_embs: HashMap::new(),
+            virtual_addr_maps: HashMap::new(),
+            backend,
+        }
     }
 }
 
-impl CausalLanguageModel for Backend {
+impl<B> ObjectManager<KvBlock, B> for KvBlockManager<B>
+where
+    B: object::Allocator<KvBlock>,
+{
+    fn objects(&self) -> &HashMap<Addr, KvBlock> {
+        &self.kv_blocks
+    }
+
+    fn objects_mut(&mut self) -> &mut HashMap<Addr, KvBlock> {
+        &mut self.kv_blocks
+    }
+
+    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, object::Id>> {
+        &self.virtual_addr_maps
+    }
+
+    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, object::Id>> {
+        &mut self.virtual_addr_maps
+    }
+
+    fn backend(&self) -> &B {
+        &self.backend
+    }
+}
+
+impl<B> KvBlockManager<B>
+where
+    B: CausalTransformer,
+{
+    pub fn copy_tokens(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+        src_addr: Addr,
+        dst_addr: Addr,
+        src_token_offset: u32,
+        dst_token_offset: u32,
+        size: u32,
+    ) -> Result<(), BlockError> {
+        let stream_id = get_stream_id(inst_id, local_stream_id);
+
+        let src_block_ptr = self.resolve(inst_id, src_addr)?;
+        let dst_block_ptr = self.resolve(inst_id, dst_addr)?;
+
+        self.backend().copy_tokens(
+            stream_id,
+            src_block_ptr,
+            dst_block_ptr,
+            src_token_offset,
+            dst_token_offset,
+            size,
+        )?;
+
+        // First, get a temporary copy of the data from the source block.
+        // Here we use an immutable borrow so that we can later borrow the destination mutably.
+        let (src_position_ids, src_occupied) = {
+            let src_block = self.get(inst_id, src_addr)?;
+            (
+                src_block.position_ids
+                    [src_token_offset as usize..(src_token_offset + size) as usize]
+                    .to_vec(),
+                src_block.occupied[src_token_offset as usize..(src_token_offset + size) as usize]
+                    .to_vec(),
+            )
+        };
+
+        // Now get a mutable borrow of the destination block and update its data.
+        let dst_block = self.get_mut(inst_id, dst_addr)?;
+        for i in 0..size as usize {
+            dst_block.position_ids[dst_token_offset as usize + i] = src_position_ids[i];
+            dst_block.occupied[dst_token_offset as usize + i] = src_occupied[i];
+        }
+        Ok(())
+    }
+
+    pub fn mask_tokens(
+        &mut self,
+        inst_id: &InstanceId,
+        local_stream_id: Option<u32>,
+        virtual_addr: Addr,
+        mask: &[bool],
+    ) -> Result<(), BlockError> {
+        let stream_id = get_stream_id(inst_id, local_stream_id);
+
+        let block_ptr = self.resolve(inst_id, virtual_addr)?;
+        self.backend.mask_tokens(stream_id, block_ptr, mask)?;
+
+        let block = self.get_mut(inst_id, virtual_addr)?;
+        for i in 0..mask.len() {
+            block.occupied[i] = mask[i];
+        }
+
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------------
+
+pub struct TokenEmbManager<B> {
+    token_embs: HashMap<object::Id, TokenEmb>,
+    virtual_addr_maps: HashMap<InstanceId, AddrMap<Addr, object::Id>>,
+
+    // primary storage
+    storage: B,
+}
+
+impl<B> TokenEmbManager<B> {
+    pub fn new(storage: B) -> Self {
+        Self {
+            token_embs: HashMap::new(),
+            virtual_addr_maps: HashMap::new(),
+            storage,
+        }
+    }
+}
+
+impl<B> ObjectManager<TokenEmb, B> for TokenEmbManager<B>
+where
+    B: object::Allocator<TokenEmb>,
+{
+    fn objects(&self) -> &HashMap<Addr, TokenEmb> {
+        &self.token_embs
+    }
+
+    fn objects_mut(&mut self) -> &mut HashMap<Addr, TokenEmb> {
+        &mut self.token_embs
+    }
+
+    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, object::Id>> {
+        &self.virtual_addr_maps
+    }
+
+    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, object::Id>> {
+        &mut self.virtual_addr_maps
+    }
+
+    fn backend(&self) -> &B {
+        &self.storage
+    }
+}
+
+// ------------------------------------------------------------
+
+pub struct TokenDistManager<B> {
+    token_dists: HashMap<object::Id, TokenDist>,
+    virtual_addr_maps: HashMap<InstanceId, AddrMap<Addr, object::Id>>,
+
+    // primary storage
+    storage: B,
+}
+
+impl<B> TokenDistManager<B> {
+    pub fn new(storage: B) -> Self {
+        Self {
+            token_dists: HashMap::new(),
+            virtual_addr_maps: HashMap::new(),
+            storage,
+        }
+    }
+}
+
+impl<B> ObjectManager<TokenDist, B> for TokenDistManager<B>
+where
+    B: object::Allocator<TokenDist>,
+{
+    fn objects(&self) -> &HashMap<Addr, TokenDist> {
+        &self.token_dists
+    }
+
+    fn objects_mut(&mut self) -> &mut HashMap<Addr, TokenDist> {
+        &mut self.token_dists
+    }
+
+    fn addr_maps(&self) -> &HashMap<InstanceId, AddrMap<Addr, object::Id>> {
+        &self.virtual_addr_maps
+    }
+
+    fn addr_maps_mut(&mut self) -> &mut HashMap<InstanceId, AddrMap<Addr, object::Id>> {
+        &mut self.virtual_addr_maps
+    }
+
+    fn backend(&self) -> &B {
+        &self.storage
+    }
+}
+
+// ------------------------------------------------------------
+
+pub trait CausalLanguageModel<K>:
+    object::MappedAllocator<TokenEmb, K> + object::MappedAllocator<TokenDist, K>
+where
+    K: Hash + Copy,
+{
     fn next_token_dist(
         &self,
-        stream_id: StreamId,
-        emb_ptr: ObjectId,
-        dist_ptr: ObjectId,
-    ) -> Result<(), BlockError> {
-        let cmd = IrCommand::DecodeTokenDistribution(sdi::DecodeTokenDistribution {
-            embedding_id: emb_ptr,
-            distribution_id: dist_ptr,
-        });
-
-        self.enqueue_cmd(stream_id, cmd)
-    }
+        stream: Stream,
+        vspace_id: &K,
+        emb_ptr: object::Id,
+        dist_ptr: object::Id,
+    ) -> Result<(), BlockError>;
 
     fn sample_top_k(
         &self,
         stream_id: StreamId,
-        dist_ptr: ObjectId,
+        dist_ptr: object::Id,
         k: u32,
-    ) -> Result<oneshot::Receiver<Vec<u32>>, BlockError> {
-        // create a new event handle
+    ) -> Result<oneshot::Receiver<Vec<u32>>, BlockError>;
 
-        let cmd = IrCommand::SampleTopKRequest(sdi::SampleTopKRequest {
-            distribution_id: dist_ptr,
-            k,
-        });
-
-        let (tx, rx) = oneshot::channel::<Vec<u32>>();
-        let handle = EventHandle::SampleTopK(tx);
-
-        self.enqueue_cmd_with_event(stream_id, cmd, handle)?;
-        Ok(rx)
-    }
-
+    // todo: design a better struct to represent distributions
     fn get_raw_dist(
         &self,
         stream_id: StreamId,
-        dist_ptr: ObjectId,
-    ) -> Result<oneshot::Receiver<Vec<f32>>, BlockError> {
-        let cmd = IrCommand::GetTokenDistributionRequest(sdi::GetTokenDistributionRequest {
-            distribution_id: dist_ptr,
-        });
-
-        let (tx, rx) = oneshot::channel::<Vec<f32>>();
-        let handle = EventHandle::GetTokenDistribution(tx);
-
-        self.enqueue_cmd_with_event(stream_id, cmd, handle)?;
-        Ok(rx)
-    }
+        dist_ptr: object::Id,
+    ) -> Result<oneshot::Receiver<Vec<f32>>, BlockError>;
 }
 
-/// for multimodal LLMs
+pub trait MaskedLanguageModel: object::Allocator<TokenEmb> + object::Allocator<TokenDist> {
+    fn token_dist(
+        &self,
+        stream_id: StreamId,
+        emb_ptr: object::Id,
+        dist_ptr: object::Id,
+    ) -> Result<(), BlockError>;
+}
 
-impl ImageEmbedder for Backend {
+// ------------------------------------------------------------
+
+// Trait for backends that can embed images.
+pub trait ImageEmbedder: object::Allocator<TokenEmb> {
     fn embed_img(
         &self,
         stream_id: StreamId,
-        addrs: Vec<ObjectId>,
+        addrs: Vec<object::Id>,
         url: String,
-    ) -> Result<(), BlockError> {
-        let cmd = IrCommand::EmbedImage(sdi::EmbedImage {
-            embedding_ids: addrs,
-            url,
-        });
+    ) -> Result<(), BlockError>;
+}
 
-        self.enqueue_cmd(stream_id, cmd)
-    }
+// Trait for backends that can embed videos.
+pub trait VideoEmbedder: object::Allocator<TokenEmb> {
+    fn embed_vid(
+        &self,
+        stream_id: StreamId,
+        addrs: Vec<object::Id>,
+        url: String,
+    ) -> Result<(), BlockError>;
+}
+
+// ------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum BlockError {
+    NoFreeBlocks,
+    NotEnoughFreeBlocks { requested: usize, available: usize },
+    VirtualAddressTranslationFailed,
+    BlockNotFound,
+    InstanceNotFound,
+    InstanceAlreadyExists,
+    ResourceNotFound,
+    ResourcePermissionDenied,
+    LockError,
+    SendError,
 }

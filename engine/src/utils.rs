@@ -1,7 +1,23 @@
+use crate::backend::{BlockError, InstanceId, StreamId};
+use num_traits::PrimInt;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicIsize, Ordering};
-use num_traits::PrimInt;
-use crate::state::BlockError;
+use uuid::Uuid;
+
+#[derive(Debug, Copy, Clone, Default)]
+pub struct Stream {
+    pub inst_id: u128,
+    pub local_stream_id: u32,
+}
+
+impl Stream {
+    pub fn new(inst_id: &Uuid, local_stream_id: Option<u32>) -> Self {
+        Self {
+            inst_id: inst_id.as_u128(),
+            local_stream_id: local_stream_id.unwrap_or(0),
+        }
+    }
+}
 
 /// A fast, thread-safe counter.
 #[derive(Debug)]

@@ -287,7 +287,7 @@ fn load_merge_rules(path: &str) -> Result<HashMap<Vec<u8>, Rank>, Box<dyn std::e
 }
 
 // https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py
-fn llama3_tokenizer(path: &str) -> Result<BytePairEncoder, Box<dyn std::error::Error>> {
+pub fn llama3_tokenizer(path: &str) -> Result<BytePairEncoder, Box<dyn std::error::Error>> {
     // Example usage
     let mergeable_ranks = load_merge_rules(path)?;
     let special_tokens = vec![

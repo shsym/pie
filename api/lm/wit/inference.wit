@@ -1,7 +1,13 @@
 interface inference {
 
-  allocate: func(stream-id:u32, count:u32) -> list<u32>;
-  deallocate: func(stream-id:u32, ids: list<u32>);
+  enum object {
+    kv-block,
+    emb,
+    dist,
+  }
+
+  allocate: func(stream-id:u32, kind:object, count:u32) -> list<u32>;
+  deallocate: func(stream-id:u32, kind:object, ids: list<u32>);
 
   fill-blocks: func(stream-id:u32, blocks:list<u32>, context: list<u32>, inputs: list<u32>, outputs: list<u32>);
   copy-block: func(stream-id:u32, src:u32, dst:u32, src-offset:u32, dst-offset:u32, size:u32);

@@ -6,9 +6,8 @@ interface system {
     send-to-origin: func(message: string);
     receive-from-origin: func() -> string;
 
-    send-to-peer: func(instance-id: string, message: string);
-    receive-from-peer: func(instance-id: string) -> string;
+    broadcast-to-peers: func(topic:string, message: string);
+    receive-from-peers: func() -> tuple<string, string>;
 
-    broadcast: func(topic:string, message: string);
-    subscribe: func(topic:string) -> string;
+    subscribe: func(topic:string);
 }

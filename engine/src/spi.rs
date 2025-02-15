@@ -1,12 +1,11 @@
 use std::sync::Arc;
-use wasmtime::component::Resource;
 use wasmtime::component::{bindgen, ResourceTable};
 use wasmtime::Result;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
-use crate::state::ObjectId;
+use crate::object;
+use crate::backend::InstanceId;
 use crate::tokenizer::BytePairEncoder;
-use crate::utils::IdPool;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -27,70 +26,74 @@ bindgen!({
 });
 
 pub struct InstanceState {
-    pub instance_id: Uuid,
+    id: InstanceId,
 
-    pub wasi_ctx: WasiCtx,
-    pub resource_table: ResourceTable,
+    wasi_ctx: WasiCtx,
+    resource_table: ResourceTable,
 
-    // For communication between the instance and the host
-    pub inst2server: Sender<InstanceMessageOld>,
-    pub server2inst: Receiver<InstanceMessageOld>,
+    cmd_buffer: Sender<(InstanceId, Command)>,
 
-    pub cmd_buffer: Sender<Msg>,
+    evt_from_origin: Receiver<String>,
+    evt_from_peers: Receiver<(String, String)>,
 
-    allocator: IdPool<ObjectId>,
+    allocator: object::IdPool,
+
     utils: InstanceUtils,
 }
 
 pub struct InstanceUtils {
-    tokenizer: Arc<BytePairEncoder>,
+    pub tokenizer: Arc<BytePairEncoder>,
 }
 
-pub struct InstanceMessageOld {
-    pub instance_id: Uuid,
-    pub dest_id: u32,
-    pub message: String,
-}
-
-pub struct Msg {
-    pub instance_id: Uuid,
-    pub cmd: Command,
-}
-
+// implements send
 pub enum Command {
+    // Communication
+    SendToOrigin {
+        message: String,
+    },
+
+    BroadcastToPeers {
+        topic: String,
+        message: String,
+    },
+
+    Subscribe {
+        topic: String,
+    },
+
     // Block commands
     AllocateBlocks {
         stream: u32,
-        blocks: Vec<ObjectId>,
+        blocks: Vec<object::Id>,
     },
 
     DeallocateBlocks {
         stream: u32,
-        blocks: Vec<ObjectId>,
+        blocks: Vec<object::Id>,
     },
 
     FillBlocks {
         stream: u32,
-        blocks: Vec<ObjectId>,
-        context: Vec<ObjectId>,
-        inputs: Vec<ObjectId>,
-        outputs: Vec<Option<ObjectId>>,
+        blocks: Vec<object::Id>,
+        context: Vec<object::Id>,
+        inputs: Vec<object::Id>,
+        outputs: Vec<Option<object::Id>>,
     },
 
     ExportBlocks {
-        blocks: Vec<ObjectId>,
+        blocks: Vec<object::Id>,
         resource_name: String,
     },
 
     ImportBlocks {
-        blocks: Vec<ObjectId>,
+        blocks: Vec<object::Id>,
         resource_name: String,
     },
 
     CopyBlock {
         stream: u32,
-        src_block: ObjectId,
-        dst_block: ObjectId,
+        src_block: object::Id,
+        dst_block: object::Id,
         src_token_offset: u32,
         dst_token_offset: u32,
         size: u32,
@@ -98,60 +101,60 @@ pub enum Command {
 
     MaskBlock {
         stream: u32,
-        block: ObjectId,
+        block: object::Id,
         mask: Vec<bool>,
     },
 
     // Embed ctrl
     AllocateEmb {
         stream: u32,
-        embs: Vec<ObjectId>,
+        embs: Vec<object::Id>,
     },
 
     DeallocateEmb {
         stream: u32,
-        embs: Vec<ObjectId>,
+        embs: Vec<object::Id>,
     },
 
     EmbedText {
         stream: u32,
-        embs: Vec<ObjectId>,
+        embs: Vec<object::Id>,
         text: Vec<u32>,
     },
 
     EmbedImage {
         stream: u32,
-        embs: Vec<ObjectId>,
+        embs: Vec<object::Id>,
         image: String,
     },
 
     // Output emb ctrl
     AllocateDist {
         stream: u32,
-        dists: Vec<ObjectId>,
+        dists: Vec<object::Id>,
     },
 
     DeallocateDist {
         stream: u32,
-        dists: Vec<ObjectId>,
+        dists: Vec<object::Id>,
     },
 
     DecodeTokenDist {
         stream: u32,
-        embs: Vec<ObjectId>,
-        dists: Vec<ObjectId>,
+        embs: Vec<object::Id>,
+        dists: Vec<object::Id>,
     },
 
     SampleTopK {
         stream: u32,
-        emb: ObjectId,
+        emb: object::Id,
         k: u32,
         handle: oneshot::Sender<Vec<u32>>,
     },
 
     GetTokenDist {
         stream: u32,
-        dist: ObjectId,
+        dist: object::Id,
         handle: oneshot::Sender<Vec<f32>>,
     },
 }
@@ -167,36 +170,25 @@ impl WasiView for InstanceState {
 
 impl InstanceState {
     pub fn new(
-        instance_id: Uuid,
-        inst2server: Sender<InstanceMessageOld>,
-        server2inst: Receiver<InstanceMessageOld>,
-        cmd_buffer: Sender<Msg>,
+        id: Uuid,
+        cmd_buffer: Sender<(InstanceId, Command)>,
+        evt_from_origin: Receiver<String>,
+        evt_from_peers: Receiver<(String, String)>,
         utils: InstanceUtils,
     ) -> Self {
         let mut builder = WasiCtx::builder();
         builder.inherit_stderr().inherit_network().inherit_stdout();
 
         InstanceState {
-            instance_id,
+            id,
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
-            inst2server,
-            server2inst,
             cmd_buffer,
-            allocator: IdPool::new(1_000_000),
+            evt_from_origin,
+            evt_from_peers,
+            allocator: object::IdPool::new(1000, 1000),
             utils,
         }
-    }
-
-    async fn submit(&self, command: Command) -> Result<()> {
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd: command,
-            })
-            .await?;
-
-        Ok(())
     }
 }
 
@@ -207,47 +199,66 @@ impl spi::app::system::Host for InstanceState {
     }
 
     async fn get_instance_id(&mut self) -> Result<String, wasmtime::Error> {
-        Ok(self.instance_id.to_string())
+        Ok(self.id.to_string())
     }
 
     async fn send_to_origin(&mut self, message: String) -> Result<(), wasmtime::Error> {
+        self.cmd_buffer
+            .send((self.id, Command::SendToOrigin { message }))
+            .await?;
         Ok(())
     }
 
     async fn receive_from_origin(&mut self) -> Result<String, wasmtime::Error> {
-        Ok("".to_string())
+        self.evt_from_origin
+            .recv()
+            .await
+            .ok_or(wasmtime::Error::msg("No more events"))
     }
 
-    async fn send_to_peer(
+    async fn broadcast_to_peers(
         &mut self,
-        inst_id: String,
+        topic: String,
         message: String,
     ) -> Result<(), wasmtime::Error> {
+        self.cmd_buffer
+            .send((self.id, Command::BroadcastToPeers { topic, message }))
+            .await?;
         Ok(())
     }
 
-    async fn receive_from_peer(&mut self, inst_id: String) -> Result<String, wasmtime::Error> {
-        Ok("".to_string())
+    async fn receive_from_peers(&mut self) -> Result<(String, String), wasmtime::Error> {
+        self.evt_from_peers
+            .recv()
+            .await
+            .ok_or(wasmtime::Error::msg("No more events"))
     }
 
-    async fn broadcast(&mut self, topic: String, message: String) -> Result<(), wasmtime::Error> {
+    async fn subscribe(&mut self, topic: String) -> Result<(), wasmtime::Error> {
+        self.cmd_buffer
+            .send((self.id, Command::Subscribe { topic }))
+            .await?;
         Ok(())
-    }
-
-    async fn subscribe(&mut self, topic: String) -> Result<String, wasmtime::Error> {
-        Ok("".to_string())
     }
 }
 
 impl spi::lm::inference::Host for InstanceState {
-    async fn allocate(&mut self, stream: u32, count: u32) -> Result<Vec<u32>, wasmtime::Error> {
+    async fn allocate(
+        &mut self,
+        stream: u32,
+        obj: spi::lm::inference::Object,
+        count: u32,
+    ) -> Result<Vec<u32>, wasmtime::Error> {
         let mut ids = Vec::with_capacity(count as usize);
+
+        let ns = obj.to_namespace();
 
         for _ in 0..count {
             let id = self
                 .allocator
-                .acquire()
-                .ok_or(wasmtime::Error::msg("Out of capacity"))?;
+                .acquire(ns)
+                .or(Err(wasmtime::Error::msg("No more free blocks")))?;
+
             ids.push(id);
         }
 
@@ -257,20 +268,22 @@ impl spi::lm::inference::Host for InstanceState {
             blocks: ids.clone(),
         };
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         Ok(ids)
     }
 
-    async fn deallocate(&mut self, stream: u32, ids: Vec<u32>) -> Result<(), wasmtime::Error> {
+    async fn deallocate(
+        &mut self,
+        stream: u32,
+        obj: spi::lm::inference::Object,
+        ids: Vec<u32>,
+    ) -> Result<(), wasmtime::Error> {
+        let ns = obj.to_namespace();
+
         for id in ids.iter().copied() {
             self.allocator
-                .release(id)
+                .release(ns, id)
                 .or(Err(wasmtime::Error::msg("Invalid ID")))?;
         }
 
@@ -279,12 +292,14 @@ impl spi::lm::inference::Host for InstanceState {
             blocks: ids,
         };
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
+
+        // self.cmd_buffer
+        //     .send(Msg {
+        //         instance_id: self.instance_id,
+        //         cmd,
+        //     })
+        //     .await?;
 
         Ok(())
     }
@@ -305,12 +320,7 @@ impl spi::lm::inference::Host for InstanceState {
             outputs: outputs.into_iter().map(|x| Some(x)).collect(),
         };
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         Ok(())
     }
@@ -333,12 +343,7 @@ impl spi::lm::inference::Host for InstanceState {
             size,
         };
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         Ok(())
     }
@@ -355,12 +360,7 @@ impl spi::lm::inference::Host for InstanceState {
             mask: mask.into_iter().map(|x| x != 0).collect(),
         };
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         Ok(())
     }
@@ -371,12 +371,7 @@ impl spi::lm::inference::Host for InstanceState {
             resource_name: name,
         };
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         Ok(())
     }
@@ -387,12 +382,7 @@ impl spi::lm::inference::Host for InstanceState {
             resource_name: name,
         };
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         Ok(())
     }
@@ -409,12 +399,7 @@ impl spi::lm::inference::Host for InstanceState {
             text: tokens,
         };
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         Ok(())
     }
@@ -431,12 +416,7 @@ impl spi::lm::inference::Host for InstanceState {
             image: url,
         };
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         Ok(())
     }
@@ -462,12 +442,7 @@ impl spi::lm::inference::Host for InstanceState {
             dists,
         };
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         Ok(())
     }
@@ -487,12 +462,7 @@ impl spi::lm::inference::Host for InstanceState {
 
         let (tx, rx) = oneshot::channel();
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         let result = rx
             .await
@@ -514,12 +484,7 @@ impl spi::lm::inference::Host for InstanceState {
 
         let (tx, rx) = oneshot::channel();
 
-        self.cmd_buffer
-            .send(Msg {
-                instance_id: self.instance_id,
-                cmd,
-            })
-            .await?;
+        self.cmd_buffer.send((self.id, cmd)).await?;
 
         let result = rx
             .await
@@ -543,6 +508,17 @@ impl spi::lm::inference::Host for InstanceState {
         Ok(text)
     }
 }
+
+impl spi::lm::inference::Object {
+    fn to_namespace(&self) -> object::Namespace {
+        match self {
+            spi::lm::inference::Object::KvBlock => object::Namespace::KvBlock,
+            spi::lm::inference::Object::Emb => object::Namespace::Emb,
+            spi::lm::inference::Object::Dist => object::Namespace::Dist,
+        }
+    }
+}
+
 // impl spi::lm::inference::HostLanguageModel for InstanceState {
 //     async fn new(&mut self, model_id: String) -> Result<Resource<LanguageModel>, wasmtime::Error> {
 //         let handle = LanguageModel { model_id };

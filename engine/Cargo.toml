@@ -22,6 +22,7 @@ num-traits = "0.2.19"
 prost = "0.13"
 fancy-regex = "0.14.0"
 base64 = "0.22.1"
+thiserror = "1.0.69"
 
 [build-dependencies]
 prost-build = "0.13.5"
