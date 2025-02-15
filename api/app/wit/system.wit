@@ -1,7 +1,14 @@
 interface system {
     get-version: func() -> string;
+    get-instance-id: func() -> string;
 
+    // to the user that started the instance
+    send-to-origin: func(message: string);
+    receive-from-origin: func() -> string;
 
-    send: func(dest-id: u32, message: string);
-    receive: func() -> string;
+    send-to-peer: func(instance-id: string, message: string);
+    receive-from-peer: func(instance-id: string) -> string;
+
+    broadcast: func(topic:string, message: string);
+    subscribe: func(topic:string) -> string;
 }

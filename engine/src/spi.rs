@@ -206,23 +206,35 @@ impl spi::app::system::Host for InstanceState {
         Ok("0.1.0".to_string())
     }
 
-    async fn send(&mut self, dest_id: u32, message: String) -> Result<()> {
-        self.inst2server
-            .send(InstanceMessageOld {
-                instance_id: self.instance_id,
-                dest_id,
-                message,
-            })
-            .await?;
+    async fn get_instance_id(&mut self) -> Result<String, wasmtime::Error> {
+        Ok(self.instance_id.to_string())
+    }
 
+    async fn send_to_origin(&mut self, message: String) -> Result<(), wasmtime::Error> {
         Ok(())
     }
 
-    async fn receive(&mut self) -> Result<String, wasmtime::Error> {
-        if let Some(message) = self.server2inst.recv().await {
-            return Ok(message.message);
-        }
+    async fn receive_from_origin(&mut self) -> Result<String, wasmtime::Error> {
+        Ok("".to_string())
+    }
 
+    async fn send_to_peer(
+        &mut self,
+        inst_id: String,
+        message: String,
+    ) -> Result<(), wasmtime::Error> {
+        Ok(())
+    }
+
+    async fn receive_from_peer(&mut self, inst_id: String) -> Result<String, wasmtime::Error> {
+        Ok("".to_string())
+    }
+
+    async fn broadcast(&mut self, topic: String, message: String) -> Result<(), wasmtime::Error> {
+        Ok(())
+    }
+
+    async fn subscribe(&mut self, topic: String) -> Result<String, wasmtime::Error> {
         Ok("".to_string())
     }
 }
