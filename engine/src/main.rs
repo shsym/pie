@@ -1,14 +1,14 @@
 mod controller;
 mod cmd_buffer;
 mod handler;
-mod spi;
+mod instance;
 mod backend;
 mod tokenizer;
 mod utils;
 mod object;
 //mod state_old;
 
-use crate::spi::{App, InstanceMessageOld, InstanceState, InstanceUtils};
+use crate::instance::{App, InstanceMessageOld, InstanceState, InstanceUtils};
 use anyhow::Context;
 use blake3::Hasher;
 use dashmap::DashMap;

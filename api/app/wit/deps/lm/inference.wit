@@ -1,48 +1,48 @@
 interface inference {
 
-  enum object {
-    kv-block,
-    emb,
-    dist,
-  }
+    allocate-blocks: func(stream-id:u32, count:u32) -> list<u32>;
+    deallocate-blocks: func(stream-id:u32, ids: list<u32>);
 
-  allocate: func(stream-id:u32, kind:object, count:u32) -> list<u32>;
-  deallocate: func(stream-id:u32, kind:object, ids: list<u32>);
+    fill-blocks: func(stream-id:u32, blocks:list<u32>, context: list<u32>, inputs: list<u32>, outputs: list<u32>);
+    copy-block: func(stream-id:u32, src:u32, dst:u32, src-offset:u32, dst-offset:u32, size:u32);
+    mask-block: func(stream-id:u32, block:u32, mask:list<u32>);
 
-  fill-blocks: func(stream-id:u32, blocks:list<u32>, context: list<u32>, inputs: list<u32>, outputs: list<u32>);
-  copy-block: func(stream-id:u32, src:u32, dst:u32, src-offset:u32, dst-offset:u32, size:u32);
-  mask-block: func(stream-id:u32, block:u32, mask:list<u32>);
+    export-blocks: func(src:list<u32>, name:string);
+    import-blocks: func(dst:list<u32>, name:string);
 
-  export-blocks: func(src:list<u32>, name:string);
-  import-blocks: func(dst:list<u32>, name:string);
+    allocate-embeds: func(stream-id:u32, count:u32) -> list<u32>;
+    deallocate-embeds: func(stream-id:u32, ids: list<u32>);
 
-  embed-text: func(stream-id:u32, embs:list<u32>, tokens:list<u32>);
-  embed-image: func(stream-id:u32, embs:list<u32>, url:string);
-  embed-video: func(stream-id:u32, embs:list<u32>, url:string);
+    embed-text: func(stream-id:u32, embs:list<u32>, tokens:list<u32>);
+    embed-image: func(stream-id:u32, embs:list<u32>, url:string);
+    embed-video: func(stream-id:u32, embs:list<u32>, url:string);
 
-  decode-token-dist: func(stream-id:u32, embs:list<u32>, dist:list<u32>);
-  sample-top-k: func(stream-id:u32, embs:list<u32>, k:u32) -> list<u32>;
-  get-token-dist: func(stream-id:u32, dist:u32) -> list<f32>;
+    allocate-dists: func(stream-id:u32, count:u32) -> list<u32>;
+    deallocate-dists: func(stream-id:u32, ids: list<u32>);
 
-  tokenize: func(text:string) -> list<u32>;
-  detokenize: func(tokens:list<u32>) -> string;
+    decode-token-dist: func(stream-id:u32, embs:list<u32>, dist:list<u32>);
+    sample-top-k: func(stream-id:u32, embs:list<u32>, k:u32) -> list<u32>;
+    get-token-dist: func(stream-id:u32, dist:u32) -> list<f32>;
 
-  // use kvcache.{block-list, mask, sink};
-  //
-  // resource token-distribution {
-  //   sample-p: func() -> u32;
-  //   top-k: func(k: u32) -> list<u32>;
-  // }
-  //
-  // resource language-model {
-  //   constructor(model-id:string);
-  //   tokenize: func(text: string) -> list<u32>;
-  //   detokenize: func(tokens: list<u32>) -> string;
-  //
-  //   // for indices, we could use RLE-like encoding to compress the list.
-  //   // dist-n is the number of distributions to return.
-  //   predict-all: func(blocks: block-list, tokens: list<u32>, indices: list<u32>, mask:mask, sink:sink, dist-n:u32) -> list<token-distribution>;
-  // }
+    tokenize: func(text:string) -> list<u32>;
+    detokenize: func(tokens:list<u32>) -> string;
+
+    // use kvcache.{block-list, mask, sink};
+    //
+    // resource token-distribution {
+    //   sample-p: func() -> u32;
+    //   top-k: func(k: u32) -> list<u32>;
+    // }
+    //
+    // resource language-model {
+    //   constructor(model-id:string);
+    //   tokenize: func(text: string) -> list<u32>;
+    //   detokenize: func(tokens: list<u32>) -> string;
+    //
+    //   // for indices, we could use RLE-like encoding to compress the list.
+    //   // dist-n is the number of distributions to return.
+    //   predict-all: func(blocks: block-list, tokens: list<u32>, indices: list<u32>, mask:mask, sink:sink, dist-n:u32) -> list<token-distribution>;
+    // }
 }
 
 //

@@ -1,10 +1,9 @@
-use crate::backend::{BlockError, InstanceId, StreamId};
+use anyhow::{Error, Result};
 use num_traits::PrimInt;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use uuid::Uuid;
-
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash)]
 pub struct Stream {
     pub inst_id: u128,
     pub local_stream_id: u32,
@@ -78,33 +77,75 @@ where
     /// Allocate and return the smallest available ID.
     ///
     /// Returns `Some(id)` if an ID is available, or `None` if the pool is exhausted.
-    pub fn acquire(&mut self) -> Option<T> {
+    pub fn acquire(&mut self) -> Result<T> {
         if let Some(&id) = self.free.iter().next() {
             // There is a freed ID available. Remove and return it.
             self.free.remove(&id);
-            Some(id)
+            Ok(id)
         } else if self.next < self.max_capacity {
             // No freed IDs available; allocate a fresh one.
             let addr = self.next;
             self.next = self.next + T::one();
-            Some(addr)
+            Ok(addr)
         } else {
             // Pool is exhausted.
-            None
+            Err(Error::msg("ID pool exhausted"))
         }
+    }
+
+    pub fn acquire_many(&mut self, count: usize) -> Result<Vec<T>> {
+        // check if we have enough available ids
+        if self.available() < count {
+            return Err(Error::msg("ID pool exhausted"));
+        }
+
+        let mut result = Vec::with_capacity(count);
+        for _ in 0..count {
+            result.push(self.acquire()?);
+        }
+        Ok(result)
     }
 
     /// Release an ID back into the pool so it can be re-used.
 
-    pub fn release(&mut self, addr: T) -> Result<(), BlockError> {
+    pub fn release(&mut self, addr: T) -> Result<()> {
         // Only allow releasing IDs that were allocated.
         if addr >= self.next {
-            return Err(BlockError::VirtualAddressTranslationFailed);
+            return Err(Error::msg("ID was never allocated"));
         }
 
         // Insert the id into the free set.
         self.free.insert(addr);
 
+        if T::from(self.free.len()).unwrap() > T::from(1000).unwrap() {
+            self.tail_optimization();
+        }
+
+        Ok(())
+    }
+
+    pub fn release_many(&mut self, addrs: &[T]) -> Result<()> {
+        for &addr in addrs {
+            if addr >= self.next {
+                return Err(Error::msg("ID was never allocated"));
+            }
+            self.free.insert(addr);
+        }
+        if T::from(self.free.len()).unwrap() > T::from(1000).unwrap() {
+            self.tail_optimization();
+        }
+        Ok(())
+    }
+
+    /// Returns the number of IDs that are available for allocation.
+    ///
+    /// This equals the number of IDs that have been freed plus the difference
+    /// between the maximum capacity and the next never‑allocated ID.
+    pub fn available(&self) -> usize {
+        self.free.len() + (self.max_capacity - self.next).to_usize().unwrap()
+    }
+
+    fn tail_optimization(&mut self) {
         // Tail optimization: if the largest freed id is exactly next-1,
         // collapse the free block by decrementing `next`.
         while let Some(&last) = self.free.iter().next_back() {
@@ -115,15 +156,5 @@ where
                 break;
             }
         }
-
-        Ok(())
-    }
-
-    /// Returns the number of IDs that are available for allocation.
-    ///
-    /// This equals the number of IDs that have been freed plus the difference
-    /// between the maximum capacity and the next never‑allocated ID.
-    pub fn available(&self) -> usize {
-        self.free.len() + (self.max_capacity - self.next).to_usize().unwrap()
     }
 }

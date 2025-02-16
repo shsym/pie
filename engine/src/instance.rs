@@ -3,8 +3,9 @@ use wasmtime::component::{bindgen, ResourceTable};
 use wasmtime::Result;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
-use crate::object;
 use crate::backend::InstanceId;
+use crate::object;
+use crate::object::{KvBlock, TokenDist, TokenEmb};
 use crate::tokenizer::BytePairEncoder;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
@@ -64,36 +65,36 @@ pub enum Command {
     // Block commands
     AllocateBlocks {
         stream: u32,
-        blocks: Vec<object::Id>,
+        blocks: Vec<object::Id<KvBlock>>,
     },
 
     DeallocateBlocks {
         stream: u32,
-        blocks: Vec<object::Id>,
+        blocks: Vec<object::Id<KvBlock>>,
     },
 
     FillBlocks {
         stream: u32,
-        blocks: Vec<object::Id>,
-        context: Vec<object::Id>,
-        inputs: Vec<object::Id>,
-        outputs: Vec<Option<object::Id>>,
+        blocks: Vec<object::Id<KvBlock>>,
+        context: Vec<object::Id<KvBlock>>,
+        inputs: Vec<object::Id<TokenEmb>>,
+        outputs: Vec<Option<object::Id<TokenEmb>>>,
     },
 
     ExportBlocks {
-        blocks: Vec<object::Id>,
+        blocks: Vec<object::Id<KvBlock>>,
         resource_name: String,
     },
 
     ImportBlocks {
-        blocks: Vec<object::Id>,
+        blocks: Vec<object::Id<KvBlock>>,
         resource_name: String,
     },
 
     CopyBlock {
         stream: u32,
-        src_block: object::Id,
-        dst_block: object::Id,
+        src_block: object::Id<KvBlock>,
+        dst_block: object::Id<KvBlock>,
         src_token_offset: u32,
         dst_token_offset: u32,
         size: u32,
@@ -101,60 +102,60 @@ pub enum Command {
 
     MaskBlock {
         stream: u32,
-        block: object::Id,
+        block: object::Id<KvBlock>,
         mask: Vec<bool>,
     },
 
     // Embed ctrl
     AllocateEmb {
         stream: u32,
-        embs: Vec<object::Id>,
+        embs: Vec<object::Id<TokenEmb>>,
     },
 
     DeallocateEmb {
         stream: u32,
-        embs: Vec<object::Id>,
+        embs: Vec<object::Id<TokenEmb>>,
     },
 
     EmbedText {
         stream: u32,
-        embs: Vec<object::Id>,
+        embs: Vec<object::Id<TokenEmb>>,
         text: Vec<u32>,
     },
 
     EmbedImage {
         stream: u32,
-        embs: Vec<object::Id>,
+        embs: Vec<object::Id<TokenEmb>>,
         image: String,
     },
 
     // Output emb ctrl
     AllocateDist {
         stream: u32,
-        dists: Vec<object::Id>,
+        dists: Vec<object::Id<TokenDist>>,
     },
 
     DeallocateDist {
         stream: u32,
-        dists: Vec<object::Id>,
+        dists: Vec<object::Id<TokenDist>>,
     },
 
     DecodeTokenDist {
         stream: u32,
-        embs: Vec<object::Id>,
-        dists: Vec<object::Id>,
+        embs: Vec<object::Id<TokenEmb>>,
+        dists: Vec<object::Id<TokenDist>>,
     },
 
     SampleTopK {
         stream: u32,
-        emb: object::Id,
+        emb: object::Id<TokenEmb>,
         k: u32,
         handle: oneshot::Sender<Vec<u32>>,
     },
 
     GetTokenDist {
         stream: u32,
-        dist: object::Id,
+        dist: object::Id<TokenDist>,
         handle: oneshot::Sender<Vec<f32>>,
     },
 }
@@ -243,20 +244,17 @@ impl spi::app::system::Host for InstanceState {
 }
 
 impl spi::lm::inference::Host for InstanceState {
-    async fn allocate(
+    async fn allocate_blocks(
         &mut self,
         stream: u32,
-        obj: spi::lm::inference::Object,
         count: u32,
     ) -> Result<Vec<u32>, wasmtime::Error> {
         let mut ids = Vec::with_capacity(count as usize);
 
-        let ns = obj.to_namespace();
-
         for _ in 0..count {
             let id = self
                 .allocator
-                .acquire(ns)
+                .acquire()
                 .or(Err(wasmtime::Error::msg("No more free blocks")))?;
 
             ids.push(id);
@@ -279,11 +277,9 @@ impl spi::lm::inference::Host for InstanceState {
         obj: spi::lm::inference::Object,
         ids: Vec<u32>,
     ) -> Result<(), wasmtime::Error> {
-        let ns = obj.to_namespace();
-
         for id in ids.iter().copied() {
             self.allocator
-                .release(ns, id)
+                .release(id)
                 .or(Err(wasmtime::Error::msg("Invalid ID")))?;
         }
 
@@ -506,16 +502,6 @@ impl spi::lm::inference::Host for InstanceState {
         let text = self.utils.tokenizer.decode(tokens.as_slice())?;
 
         Ok(text)
-    }
-}
-
-impl spi::lm::inference::Object {
-    fn to_namespace(&self) -> object::Namespace {
-        match self {
-            spi::lm::inference::Object::KvBlock => object::Namespace::KvBlock,
-            spi::lm::inference::Object::Emb => object::Namespace::Emb,
-            spi::lm::inference::Object::Dist => object::Namespace::Dist,
-        }
     }
 }
 

@@ -13,7 +13,7 @@ mod sdi {
     include!(concat!(env!("OUT_DIR"), "/sdi.rs"));
 }
 
-use crate::object::{KvBlock, ObjectError, TokenDist, TokenEmb};
+use crate::object::{KvBlock, Object, ObjectError, TokenDist, TokenEmb};
 use thiserror::Error;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinError;
@@ -144,23 +144,23 @@ pub struct Controller {
     socket_tx: Arc<Mutex<Option<mpsc::Sender<Vec<sdi::Command>>>>>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     // zmq handles
-    //handle: Arc<JoinHandle<()>>,
 
     // event dispatcher
     event_dispatcher: Arc<Mutex<EventDispatcher>>,
 
+    // object allocations
     id_pool: object::IdPool,
 
-    kv_blocks: HashMap<object::Id, KvBlock>,
-    token_embs: HashMap<object::Id, TokenEmb>,
-    virtual_addr_maps: HashMap<InstanceId, HashMap<object::Id, object::Id>>,
+    kv_blocks: HashMap<object::Id<KvBlock>, KvBlock>,
+    token_embs: HashMap<object::Id<TokenEmb>, TokenEmb>,
+    virtual_addr_maps: HashMap<InstanceId, object::IdMap>,
 }
 
 impl Controller {
     pub fn new(block_size: u32, max_kv_blocks: u32, max_embs: u32) -> Self {
         Self {
             block_size,
-            id_pool: Arc::new(Mutex::new(object::IdPool::new(max_kv_blocks, max_embs))),
+            id_pool: object::IdPool::new(max_kv_blocks, max_embs),
             cmd_buffer: Arc::new(Mutex::new(Vec::new())),
             pending: Arc::new(Mutex::new(Pending::new(10.0, 1, 1))),
             staged: Arc::new(Mutex::new(Vec::new())),
@@ -195,22 +195,6 @@ impl Controller {
 
         inner.push((stream, cmd, evt));
         Ok(())
-    }
-
-    fn acquire_id(&mut self, ns: object::Namespace) -> Result<object::Id, ControllerError> {
-        self.id_pool
-            .acquire(ns)
-            .map_err(|e| ControllerError::ObjectError(e))
-    }
-
-    fn release_id(&mut self, ns: object::Namespace, id: object::Id) -> Result<(), ControllerError> {
-        self.id_pool
-            .release(ns, id)
-            .map_err(|e| ControllerError::ObjectError(e))
-    }
-
-    fn remaining_ids(&self, ns: object::Namespace) -> usize {
-        self.id_pool.available(ns)
     }
 
     pub fn schedule(&self, curr_timestamp: f64) -> Result<(), ControllerError> {
@@ -617,25 +601,26 @@ impl Pending {
     }
 }
 
-impl object::Allocator<TokenEmb> for Controller {
+impl object::Allocator<TokenEmb> for Controller
+{
     type RawRepr = Vec<f32>;
 
-    fn objects(&self) -> &HashMap<object::Id, TokenEmb> {
+    fn objects(&self) -> &HashMap<object::Id<TokenEmb>, TokenEmb> {
         &self.token_embs
     }
 
-    fn objects_mut(&mut self) -> &mut HashMap<object::Id, TokenEmb> {
+    fn objects_mut(&mut self) -> &mut HashMap<object::Id<TokenEmb>, TokenEmb> {
         &mut self.token_embs
     }
 
-    fn alloc(&mut self, stream: Stream, object: TokenEmb) -> Result<object::Id, ObjectError> {
-        let id = self.id_pool.acquire(object::Namespace::Emb)?;
+    fn alloc(&mut self, stream: Stream, object: TokenEmb) -> Result<object::Id<TokenEmb>, ObjectError> {
+        let id = self.id_pool.acquire()?;
 
         self.token_embs.insert(id, object);
 
         let cmd = IrCommand::Allocate(sdi::Allocate {
             kind: sdi::ObjectKind::Emb.into(),
-            object_id_offset: id,
+            object_id_offset: id.into(),
             count: 1,
         });
         self.enqueue_cmd(stream, cmd)
@@ -644,13 +629,13 @@ impl object::Allocator<TokenEmb> for Controller {
         Ok(id)
     }
 
-    fn dealloc(&mut self, stream: Stream, id: object::Id) -> Result<(), ObjectError> {
+    fn dealloc(&mut self, stream: Stream, id: object::Id<TokenEmb>) -> Result<(), ObjectError> {
         // Release the object id back to the pool.
-        self.id_pool.release(object::Namespace::Emb, id)?;
+        self.id_pool.release(id)?;
 
         let cmd = IrCommand::Deallocate(sdi::Allocate {
             kind: sdi::ObjectKind::Emb.into(),
-            object_id_offset: id,
+            object_id_offset: id.into(),
             count: 1,
         });
         self.enqueue_cmd(stream, cmd)
@@ -662,37 +647,37 @@ impl object::Allocator<TokenEmb> for Controller {
     fn raw_repr(
         &self,
         stream: Stream,
-        id: object::Id,
+        id: object::Id<TokenEmb>,
         sender: Sender<Self::RawRepr>,
     ) -> Result<(), ObjectError> {
         todo!()
     }
 
     fn available(&self) -> usize {
-        self.remaining_ids(object::Namespace::Emb)
+        self.id_pool.available::<TokenEmb>()
     }
 }
 
 impl object::Allocator<KvBlock> for Controller {
     // The raw representation of a kv block is not really useful in any way. So we just use usize.
-    type RawRepr = object::Id;
+    type RawRepr = object::Id<KvBlock>;
 
-    fn objects(&self) -> &HashMap<object::Id, KvBlock> {
+    fn objects(&self) -> &HashMap<object::Id<KvBlock>, KvBlock> {
         &self.kv_blocks
     }
 
-    fn objects_mut(&mut self) -> &mut HashMap<object::Id, KvBlock> {
+    fn objects_mut(&mut self) -> &mut HashMap<object::Id<KvBlock>, KvBlock> {
         &mut self.kv_blocks
     }
 
-    fn alloc(&mut self, stream: Stream, object: KvBlock) -> Result<object::Id, ObjectError> {
-        let id = self.id_pool.acquire(object::Namespace::KvBlock)?;
+    fn alloc(&mut self, stream: Stream, object: KvBlock) -> Result<object::Id<KvBlock>, ObjectError> {
+        let id = self.id_pool.acquire()?;
 
         self.kv_blocks.insert(id, object);
 
         let cmd = IrCommand::Allocate(sdi::Allocate {
             kind: sdi::ObjectKind::KvBlock.into(),
-            object_id_offset: id,
+            object_id_offset: id.into(),
             count: 1,
         });
         self.enqueue_cmd(stream, cmd)
@@ -701,13 +686,13 @@ impl object::Allocator<KvBlock> for Controller {
         Ok(id)
     }
 
-    fn dealloc(&mut self, stream: Stream, id: object::Id) -> Result<(), ObjectError> {
+    fn dealloc(&mut self, stream: Stream, id: object::Id<KvBlock>) -> Result<(), ObjectError> {
         // Release the object id back to the pool.
-        self.id_pool.release(object::Namespace::KvBlock, id)?;
+        self.id_pool.release(id)?;
 
         let cmd = IrCommand::Deallocate(sdi::Allocate {
             kind: sdi::ObjectKind::KvBlock.into(),
-            object_id_offset: id,
+            object_id_offset: id.into(),
             count: 1,
         });
         self.enqueue_cmd(stream, cmd)
@@ -719,40 +704,40 @@ impl object::Allocator<KvBlock> for Controller {
     fn raw_repr(
         &self,
         stream: Stream,
-        id: object::Id,
+        id: object::Id<KvBlock>,
         sender: Sender<Self::RawRepr>,
     ) -> Result<(), ObjectError> {
         todo!()
     }
 
     fn available(&self) -> usize {
-        self.remaining_ids(object::Namespace::KvBlock)
+        self.id_pool.available::<KvBlock>()
     }
 }
 
 impl object::Allocator<TokenDist> for Controller {
     type RawRepr = Vec<f32>;
 
-    fn objects(&self) -> &HashMap<object::Id, TokenDist> {
+    fn objects(&self) -> &HashMap<object::Id<TokenDist>, TokenDist> {
         todo!()
     }
 
-    fn objects_mut(&mut self) -> &mut HashMap<object::Id, TokenDist> {
+    fn objects_mut(&mut self) -> &mut HashMap<object::Id<TokenDist>, TokenDist> {
         todo!()
     }
 
-    fn alloc(&mut self, stream: Stream, object: TokenDist) -> Result<object::Id, ObjectError> {
+    fn alloc(&mut self, stream: Stream, object: TokenDist) -> Result<object::Id<TokenDist>, ObjectError> {
         todo!()
     }
 
-    fn dealloc(&mut self, stream: Stream, id: object::Id) -> Result<(), ObjectError> {
+    fn dealloc(&mut self, stream: Stream, id: object::Id<TokenDist>) -> Result<(), ObjectError> {
         todo!()
     }
 
     fn raw_repr(
         &self,
         stream: Stream,
-        id: object::Id,
+        id: object::Id<TokenDist>,
         sender: Sender<Self::RawRepr>,
     ) -> Result<(), ObjectError> {
         todo!()
@@ -767,16 +752,16 @@ impl CausalTransformer for Controller {
     fn fill(
         &self,
         stream: Stream,
-        ptr: object::Id,
-        ctx_ptrs: Vec<object::Id>,
-        input_embs: Vec<object::Id>,
-        output_embs: Option<Vec<object::Id>>,
+        ptr: object::Id<KvBlock>,
+        ctx_ptrs: Vec<object::Id<KvBlock>>,
+        input_embs: Vec<object::Id<TokenEmb>>,
+        output_embs: Vec<Option<object::Id<TokenEmb>>>,
     ) -> Result<(), ControllerError> {
         let cmd = IrCommand::FillBlock(sdi::FillBlock {
-            block_id: ptr,
-            context_block_ids: ctx_ptrs,
-            input_embedding_ids: input_embs,
-            output_embedding_ids: output_embs.unwrap_or_default(),
+            block_id: ptr.into(),
+            context_block_ids: ctx_ptrs.into_iter().map(|id| id.into()).collect(),
+            input_embedding_ids: input_embs.into_iter().map(|id| id.into()).collect(),
+            output_embedding_ids: output_embs.into_iter().map(|id| id.map(|id| id.into())).collect(),
         });
 
         self.enqueue_cmd(stream, cmd)
@@ -785,15 +770,15 @@ impl CausalTransformer for Controller {
     fn copy_tokens(
         &self,
         stream_id: Stream,
-        src_ptr: object::Id,
-        dst_ptr: object::Id,
+        src_ptr: object::Id<KvBlock>,
+        dst_ptr: object::Id<KvBlock>,
         src_offset: u32,
         dst_offset: u32,
         size: u32,
     ) -> Result<(), ControllerError> {
         let cmd = IrCommand::CopyBlock(sdi::CopyBlock {
-            source_block_id: src_ptr,
-            destination_block_id: dst_ptr,
+            source_block_id: src_ptr.into(),
+            destination_block_id: dst_ptr.into(),
             source_start: src_offset,
             destination_start: dst_offset,
             length: size,
@@ -805,11 +790,11 @@ impl CausalTransformer for Controller {
     fn mask_tokens(
         &self,
         stream_id: Stream,
-        ptr: object::Id,
+        ptr: object::Id<KvBlock>,
         mask: &[bool],
     ) -> Result<(), ControllerError> {
         let cmd = IrCommand::MaskBlock(sdi::MaskBlock {
-            block_id: ptr,
+            block_id: ptr.into(),
             mask: mask.to_vec(),
         });
         self.enqueue_cmd(stream_id, cmd)
@@ -820,8 +805,8 @@ impl CausalLanguageModel for Controller {
     fn next_token_dist(
         &self,
         stream_id: Stream,
-        emb_ptr: object::Id,
-        dist_ptr: object::Id,
+        emb_ptr: object::Id<TokenEmb>,
+        dist_ptr: object::Id<TokenDist>,
     ) -> Result<(), ControllerError> {
         let cmd = IrCommand::DecodeTokenDistribution(sdi::DecodeTokenDistribution {
             embedding_id: emb_ptr,
