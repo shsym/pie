@@ -1,21 +1,18 @@
-use crate::backend::{Addr, CausalLanguageModel, CausalTransformer, ImageEmbedder, InstanceId};
-use crate::object;
-use crate::utils::Stream;
-use prost::Message;
+use crate::lm::{
+    CausalLanguageModel, CausalTransformer, ImageEmbedder, InstanceId, KvBlock, TokenDist, TokenEmb,
+};
+use crate::utils::{Counter, Stream};
+use crate::{backend, object, utils};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::mem;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
-mod sdi {
-    include!(concat!(env!("OUT_DIR"), "/sdi.rs"));
-}
-
-use crate::object::{KvBlock, Object, ObjectError, TokenDist, TokenEmb};
+use crate::object::{Id, ObjectError, VspaceId};
 use thiserror::Error;
-use tokio::sync::oneshot::Sender;
 use tokio::task::JoinError;
 
 #[derive(Error, Debug)]
@@ -47,30 +44,52 @@ pub enum ControllerError {
 #[derive(Debug)]
 enum IrCommand {
     // Embs
-    Allocate(sdi::Allocate),
-    Deallocate(sdi::Allocate),
-    CopyBlock(sdi::CopyBlock),
-    MaskBlock(sdi::MaskBlock),
-    FillBlock(sdi::FillBlock),
-    EmbedImage(sdi::EmbedImage),
-    EmbedText(sdi::EmbedText),
-    DecodeTokenDistribution(sdi::DecodeTokenDistribution),
-    SampleTopKRequest(sdi::SampleTopKRequest),
-    GetTokenDistributionRequest(sdi::GetTokenDistributionRequest),
+    Allocate(backend::sdi::Allocate),
+    Deallocate(backend::sdi::Allocate),
+    CopyBlock(backend::sdi::CopyBlock),
+    MaskBlock(backend::sdi::MaskBlock),
+    FillBlock(backend::sdi::FillBlock),
+    EmbedImage(backend::sdi::EmbedImage),
+    EmbedText(backend::sdi::EmbedText),
+    DecodeTokenDistribution(backend::sdi::DecodeTokenDistribution),
+    SampleTopKRequest(backend::sdi::SampleTopKRequest),
+    GetTokenDistributionRequest(backend::sdi::GetTokenDistributionRequest),
 }
 
 // Hidden
 #[derive(Debug)]
 enum IrEvent {
-    SampleTopK(sdi::SampleTopKResponse),
-    GetTokenDistribution(sdi::GetTokenDistributionResponse),
+    SampleTopK(backend::sdi::SampleTopKResponse),
+    GetTokenDistribution(backend::sdi::GetTokenDistributionResponse),
 }
 
 #[derive(Debug)]
-struct EventDispatcher {
-    // maps correlation_id to a list of senders.
-    table: HashMap<u32, Vec<EventHandle>>,
+pub struct Resource {
+    owner_id: InstanceId,
+    addrs: Vec<object::Id<KvBlock>>,
 }
+
+impl Resource {
+    pub fn new(owner_id: InstanceId, addrs: Vec<object::Id<KvBlock>>) -> Self {
+        Self { owner_id, addrs }
+    }
+}
+
+#[derive(Debug)]
+pub struct Instance {
+    owned_resources: Vec<String>,
+    //usage_stats: HashMap<String, usize>,
+}
+
+impl Instance {
+    pub fn new() -> Self {
+        Self {
+            owned_resources: vec![],
+            //usage_stats: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum EventHandle {
     None,
@@ -87,126 +106,58 @@ impl EventHandle {
     }
 }
 
-impl EventDispatcher {
-    fn new() -> Self {
-        Self {
-            table: HashMap::new(),
-        }
-    }
-
-    fn register(&mut self, correlation_id: u32, sender: Vec<EventHandle>) {
-        self.table.insert(correlation_id, sender);
-    }
-
-    fn dispatch(&mut self, correlation_id: u32, event: Vec<IrEvent>) {
-        // zip senders and evnt
-        let senders = self.table.get_mut(&correlation_id).unwrap();
-        assert_eq!(senders.len(), event.len());
-
-        for (sender, evt) in senders.drain(..).zip(event.into_iter()) {
-            match sender {
-                EventHandle::None => {}
-                EventHandle::SampleTopK(s) => {
-                    if let IrEvent::SampleTopK(mut resp) = evt {
-                        let _ = s.send(mem::take(&mut resp.token_ids));
-                    } else {
-                        eprintln!("Unexpected event type");
-                    }
-                }
-                EventHandle::GetTokenDistribution(s) => {
-                    if let IrEvent::GetTokenDistribution(mut resp) = evt {
-                        let _ = s.send(mem::take(&mut resp.distribution));
-                    } else {
-                        eprintln!("Unexpected event type");
-                    }
-                }
-            }
-        }
-    }
-}
-// Define actual cmd, interpretable by the backend.
-
-// Allocate(Type, entities:[id])
-// Deallocate(Type, entities:[id])
-// Fill (List[id,
-// LongFill using bitsets.. implement this later.
-
 #[derive(Debug)]
-pub struct Controller {
+pub struct Controller<B> {
     block_size: u32,
 
-    cmd_buffer: Arc<Mutex<Vec<(Stream, IrCommand, EventHandle)>>>,
-
-    pending: Arc<Mutex<Pending>>,
-    staged: Arc<Mutex<Vec<sdi::Command>>>,
-    submitted: Arc<Mutex<Vec<sdi::Command>>>,
-    // queue, cmd_buffer, scheduled, submitted
-    socket_tx: Arc<Mutex<Option<mpsc::Sender<Vec<sdi::Command>>>>>,
-    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    // zmq handles
-
-    // event dispatcher
-    event_dispatcher: Arc<Mutex<EventDispatcher>>,
+    cmd_buffer: Vec<(Stream, IrCommand, EventHandle)>,
+    cmd_batcher: CommandBatcher,
+    backend: B,
 
     // object allocations
-    id_pool: object::IdPool,
-
-    kv_blocks: HashMap<object::Id<KvBlock>, KvBlock>,
-    token_embs: HashMap<object::Id<TokenEmb>, TokenEmb>,
-    virtual_addr_maps: HashMap<InstanceId, object::IdMap>,
+    id_pool: IdPool,
+    ref_counter: RefCounter,
+    vspaces: HashMap<object::VspaceId, IdMap>,
 }
 
-impl Controller {
-    pub fn new(block_size: u32, max_kv_blocks: u32, max_embs: u32) -> Self {
+impl<B> Controller<B> {
+    pub fn new(backend: B) -> Self {
         Self {
             block_size,
-            id_pool: object::IdPool::new(max_kv_blocks, max_embs),
-            cmd_buffer: Arc::new(Mutex::new(Vec::new())),
-            pending: Arc::new(Mutex::new(Pending::new(10.0, 1, 1))),
-            staged: Arc::new(Mutex::new(Vec::new())),
-            submitted: Arc::new(Mutex::new(vec![])),
-            socket_tx: Arc::new(Mutex::new(None)),
-            handle: Arc::new(Mutex::new(None)),
-            event_dispatcher: Arc::new(Mutex::new(EventDispatcher {
-                table: HashMap::new(),
-            })),
+            cmd_buffer: Vec::new(),
+            cmd_batcher: CommandBatcher::new(0.0, 1, 1),
+            backend,
+            id_pool: IdPool::new(max_kv_blocks, max_embs),
+            ref_counter: RefCounter::new(),
+            vspaces: HashMap::new(),
         }
     }
 
-    pub fn enqueue_cmd(&self, stream: Stream, cmd: IrCommand) -> Result<(), ControllerError> {
-        let mut inner = self
-            .cmd_buffer
-            .lock()
-            .map_err(|_| ControllerError::LockError)?;
-        inner.push((stream, cmd, EventHandle::None));
+    pub fn enqueue_cmd(&mut self, stream: Stream, cmd: IrCommand) -> Result<(), ControllerError> {
+        self.cmd_buffer.push((stream, cmd, EventHandle::None));
         Ok(())
     }
 
     pub fn enqueue_cmd_with_event(
-        &self,
+        &mut self,
         stream: Stream,
         cmd: IrCommand,
         evt: EventHandle,
     ) -> Result<(), ControllerError> {
-        let mut inner = self
-            .cmd_buffer
-            .lock()
-            .map_err(|_| ControllerError::LockError)?;
-
-        inner.push((stream, cmd, evt));
+        self.cmd_buffer.push((stream, cmd, evt));
         Ok(())
     }
 
     pub fn schedule(&self, curr_timestamp: f64) -> Result<(), ControllerError> {
         let mut pending = self
-            .pending
+            .cmd_batcher
             .lock()
             .map_err(|_| ControllerError::LockError)?;
 
         // first move all the commands from cmd_buffer to pending (buffer items are removed)
         let mut commands_by_stream = {
             let mut cmd_buffer = self
-                .cmd_buffer
+                .cmd_batcher
                 .lock()
                 .map_err(|_| ControllerError::LockError)?;
 
@@ -275,124 +226,12 @@ impl Controller {
         // drop the lock on pending
         Ok(())
     }
-
-    pub async fn commit(&self) -> Result<(), ControllerError> {
-        // Lock and take the staged commands.
-        let mut staged = self.staged.lock().map_err(|_| ControllerError::LockError)?;
-
-        // Lock the sender.
-        let tx_guard = self
-            .socket_tx
-            .lock()
-            .map_err(|_| ControllerError::LockError)?;
-        let tx = tx_guard.as_ref().ok_or(ControllerError::LockError)?;
-
-        // Send the staged commands, replacing them with an empty Vec.
-        tx.send(mem::take(&mut *staged))
-            .await
-            .map_err(|_| ControllerError::SendError)?;
-
-        Ok(())
-    }
-
-    pub async fn bind(&mut self, endpoint: &str) -> Result<(), ZmqError> {
-        // bind the zmq socket
-        let mut socket = DealerSocket::new();
-        socket.connect(endpoint).await?;
-        println!("Connected to server at {endpoint}");
-
-        let (tx, rx) = mpsc::channel::<Vec<sdi::Command>>(100);
-
-        self.socket_tx = Arc::new(Mutex::new(Some(tx)));
-
-        // 3) Spawn the single I/O driver task that handles all read/write from the socket
-        let handle = tokio::spawn(Self::socket_driver(
-            socket,
-            rx,
-            self.event_dispatcher.clone(),
-        ));
-
-        self.handle = Arc::new(Mutex::new(Some(handle)));
-
-        Ok(())
-    }
-
-    async fn socket_driver(
-        mut socket: DealerSocket,
-        mut rx: mpsc::Receiver<Vec<sdi::Command>>,
-        evt_dispatch: Arc<Mutex<EventDispatcher>>,
-    ) {
-        loop {
-            tokio::select! {
-                // A) Incoming requests from the channel => send to server
-                maybe_req = rx.recv() => {
-                    match maybe_req {
-                        Some(cmds) => {
-                            for cmd in cmds {
-                                let bytes = cmd.encode_to_vec();
-                                if let Err(e) = socket.send(ZmqMessage::from(bytes)).await {
-                                    eprintln!("Socket send failed: {:?}", e);
-                                    // You might choose to break or keep trying
-                                }
-                            }
-                        },
-                        None => {
-                            // channel closed => no more requests
-                            println!("Request channel closed, shutting down driver.");
-                            break;
-                        }
-                    }
-                },
-
-                // B) Incoming responses from the server
-                result = socket.recv() => {
-                    match result {
-                        Ok(msg) => {
-                            // Dealer/Router typically has 2 frames: [identity, payload]
-                            let payload = msg.get(0).unwrap();
-                            match sdi::Event::decode(payload.as_ref()) {
-                                Ok(evt) => {
-
-                                    // send this evt somewhere elese.
-
-                                    let correlation_id = evt.correlation_id;
-
-                                    let ir_events = match evt.payload.unwrap() {
-                                        sdi::event::Payload::SampleTopK(batch) => {
-                                            batch.items.into_iter().map(|item| IrEvent::SampleTopK(item)
-                                            ).collect()
-                                        },
-                                        sdi::event::Payload::GetTokenDistribution(batch) => {
-                                             batch.items.into_iter().map(|item| IrEvent::GetTokenDistribution(item)
-                                            ).collect()
-                                        }
-                                    };
-
-                                    let mut dispatcher = evt_dispatch.lock().unwrap();
-                                    dispatcher.dispatch(correlation_id, ir_events);
-
-                                }
-                                Err(err) => {
-                                    eprintln!("Failed to parse Response from server: {:?}", err);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("Socket receive error: {:?}", e);
-                            // Possibly break or keep going...
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 // more sophisticated forms include: MultiNodeBackend, etc.
 
 #[derive(Debug)]
-struct Pending {
+struct CommandBatcher {
     allocate: BatchQueue<sdi::Allocate>,
     deallocate: BatchQueue<sdi::Allocate>,
     copy_block: BatchQueue<sdi::CopyBlock>,
@@ -489,7 +328,7 @@ impl<T> BatchQueue<T> {
     }
 }
 
-impl Pending {
+impl CommandBatcher {
     fn new(max_wait_time: f64, min_size: usize, max_size: usize) -> Self {
         Self {
             allocate: BatchQueue::eager(),
@@ -601,149 +440,119 @@ impl Pending {
     }
 }
 
-impl object::Allocator<TokenEmb> for Controller
+pub trait ControllerManaged: Debug + Sized + Send + Sync {
+    const NAMESPACE: Namespace;
+    //fn get_namespace() -> Namespace;
+
+    pub fn sdi_object_kind() -> i32 {
+        match Self::NAMESPACE {
+            Namespace::KvBlock => backend::sdi::ObjectKind::KvBlock.into(),
+            Namespace::Emb => backend::sdi::ObjectKind::Emb.into(),
+            Namespace::Dist => backend::sdi::ObjectKind::Dist.into(),
+        }
+    }
+}
+
+impl ControllerManaged for KvBlock {
+    const NAMESPACE: Namespace = Namespace::KvBlock;
+}
+
+impl ControllerManaged for TokenEmb {
+    const NAMESPACE: Namespace = Namespace::Emb;
+}
+
+impl ControllerManaged for TokenDist {
+    const NAMESPACE: Namespace = Namespace::Dist;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Namespace {
+    KvBlock = 0,
+    Emb = 1,
+    Dist = 2,
+}
+
+impl<B, T> object::Allocator<T> for Controller<B>
+where
+    T: ControllerManaged,
 {
-    type RawRepr = Vec<f32>;
+    fn alloc_many(
+        &mut self,
+        stream: Stream,
+        count: usize,
+    ) -> Result<Vec<object::Id<T>>, ObjectError> {
+        let ids = self.id_pool.acquire_many::<T>(count)?;
 
-    fn objects(&self) -> &HashMap<object::Id<TokenEmb>, TokenEmb> {
-        &self.token_embs
+        // init the ref counter
+        for id in &ids {
+            self.ref_counter.init(*id);
+        }
+
+        // Request the backend to allocate the objects.
+        let kind = T::sdi_object_kind();
+        let cons_id = object::Id::group_consecutive_ids(&ids);
+
+        for (id_offset, size) in cons_id {
+            let cmd = IrCommand::Allocate(backend::sdi::Allocate {
+                kind,
+                object_id_offset: id_offset.into(),
+                count: size,
+            });
+            self.cmd_buffer.push((stream, cmd, EventHandle::None));
+        }
+        Ok(ids)
     }
 
-    fn objects_mut(&mut self) -> &mut HashMap<object::Id<TokenEmb>, TokenEmb> {
-        &mut self.token_embs
-    }
+    fn dealloc_many(&mut self, stream: Stream, ids: &[object::Id<T>]) -> Result<(), ObjectError> {
+        let cons_id = object::Id::group_consecutive_ids(ids);
 
-    fn alloc(&mut self, stream: Stream, object: TokenEmb) -> Result<object::Id<TokenEmb>, ObjectError> {
-        let id = self.id_pool.acquire()?;
+        // destroy the ref counter
+        for id in ids {
+            self.ref_counter.destroy(id);
+        }
 
-        self.token_embs.insert(id, object);
+        let kind = T::sdi_object_kind();
 
-        let cmd = IrCommand::Allocate(sdi::Allocate {
-            kind: sdi::ObjectKind::Emb.into(),
-            object_id_offset: id.into(),
-            count: 1,
-        });
-        self.enqueue_cmd(stream, cmd)
-            .map_err(|_| ObjectError::BackendError("Failed to enqueue command".into()))?;
-
-        Ok(id)
-    }
-
-    fn dealloc(&mut self, stream: Stream, id: object::Id<TokenEmb>) -> Result<(), ObjectError> {
-        // Release the object id back to the pool.
-        self.id_pool.release(id)?;
-
-        let cmd = IrCommand::Deallocate(sdi::Allocate {
-            kind: sdi::ObjectKind::Emb.into(),
-            object_id_offset: id.into(),
-            count: 1,
-        });
-        self.enqueue_cmd(stream, cmd)
-            .map_err(|_| ObjectError::BackendError("Failed to enqueue command".into()))?;
+        for (id_offset, size) in cons_id {
+            let cmd = IrCommand::Deallocate(backend::sdi::Allocate {
+                kind,
+                object_id_offset: id_offset.into(),
+                count: size,
+            });
+            self.cmd_buffer.push((stream, cmd, EventHandle::None));
+        }
 
         Ok(())
     }
 
-    fn raw_repr(
-        &self,
-        stream: Stream,
-        id: object::Id<TokenEmb>,
-        sender: Sender<Self::RawRepr>,
-    ) -> Result<(), ObjectError> {
-        todo!()
-    }
-
     fn available(&self) -> usize {
-        self.id_pool.available::<TokenEmb>()
+        self.id_pool.available::<T>()
     }
 }
 
-impl object::Allocator<KvBlock> for Controller {
-    // The raw representation of a kv block is not really useful in any way. So we just use usize.
-    type RawRepr = object::Id<KvBlock>;
 
-    fn objects(&self) -> &HashMap<object::Id<KvBlock>, KvBlock> {
-        &self.kv_blocks
+
+impl<B, T> object::MappedAllocator<T> for Controller<B>
+where
+    T: ControllerManaged,
+{
+    fn vspaces(&self) -> &HashMap<VspaceId, HashMap<Id<T>, Id<T>>> {
+        &self.vspaces
     }
 
-    fn objects_mut(&mut self) -> &mut HashMap<object::Id<KvBlock>, KvBlock> {
-        &mut self.kv_blocks
+    fn vspaces_mut(&mut self) -> &mut HashMap<VspaceId, HashMap<Id<T>, Id<T>>> {
+        &mut self.vspaces
     }
 
-    fn alloc(&mut self, stream: Stream, object: KvBlock) -> Result<object::Id<KvBlock>, ObjectError> {
-        let id = self.id_pool.acquire()?;
-
-        self.kv_blocks.insert(id, object);
-
-        let cmd = IrCommand::Allocate(sdi::Allocate {
-            kind: sdi::ObjectKind::KvBlock.into(),
-            object_id_offset: id.into(),
-            count: 1,
-        });
-        self.enqueue_cmd(stream, cmd)
-            .map_err(|_| ObjectError::BackendError("Failed to enqueue command".into()))?;
-
-        Ok(id)
-    }
-
-    fn dealloc(&mut self, stream: Stream, id: object::Id<KvBlock>) -> Result<(), ObjectError> {
-        // Release the object id back to the pool.
-        self.id_pool.release(id)?;
-
-        let cmd = IrCommand::Deallocate(sdi::Allocate {
-            kind: sdi::ObjectKind::KvBlock.into(),
-            object_id_offset: id.into(),
-            count: 1,
-        });
-        self.enqueue_cmd(stream, cmd)
-            .map_err(|_| ObjectError::BackendError("Failed to enqueue command".into()))?;
-
-        Ok(())
-    }
-
-    fn raw_repr(
-        &self,
-        stream: Stream,
-        id: object::Id<KvBlock>,
-        sender: Sender<Self::RawRepr>,
-    ) -> Result<(), ObjectError> {
+    fn ref_inc(&mut self, id: &Id<T>) -> Result<(), ObjectError> {
         todo!()
     }
 
-    fn available(&self) -> usize {
-        self.id_pool.available::<KvBlock>()
-    }
-}
-
-impl object::Allocator<TokenDist> for Controller {
-    type RawRepr = Vec<f32>;
-
-    fn objects(&self) -> &HashMap<object::Id<TokenDist>, TokenDist> {
+    fn ref_dec(&mut self, id: &Id<T>) -> Result<bool, ObjectError> {
         todo!()
     }
 
-    fn objects_mut(&mut self) -> &mut HashMap<object::Id<TokenDist>, TokenDist> {
-        todo!()
-    }
-
-    fn alloc(&mut self, stream: Stream, object: TokenDist) -> Result<object::Id<TokenDist>, ObjectError> {
-        todo!()
-    }
-
-    fn dealloc(&mut self, stream: Stream, id: object::Id<TokenDist>) -> Result<(), ObjectError> {
-        todo!()
-    }
-
-    fn raw_repr(
-        &self,
-        stream: Stream,
-        id: object::Id<TokenDist>,
-        sender: Sender<Self::RawRepr>,
-    ) -> Result<(), ObjectError> {
-        todo!()
-    }
-
-    fn available(&self) -> usize {
+    fn ref_count(&self, id: &Id<T>) -> Result<usize, ObjectError> {
         todo!()
     }
 }
@@ -761,7 +570,10 @@ impl CausalTransformer for Controller {
             block_id: ptr.into(),
             context_block_ids: ctx_ptrs.into_iter().map(|id| id.into()).collect(),
             input_embedding_ids: input_embs.into_iter().map(|id| id.into()).collect(),
-            output_embedding_ids: output_embs.into_iter().map(|id| id.map(|id| id.into())).collect(),
+            output_embedding_ids: output_embs
+                .into_iter()
+                .map(|id| id.map(|id| id.into()))
+                .collect(),
         });
 
         self.enqueue_cmd(stream, cmd)
@@ -868,5 +680,194 @@ impl ImageEmbedder for Controller {
         });
 
         self.enqueue_cmd(stream_id, cmd)
+    }
+}
+
+#[derive(Debug)]
+pub struct IdPool {
+    kv_block_id_pool: utils::IdPool<object::IdRepr>,
+    emb_id_pool: utils::IdPool<object::IdRepr>,
+    dist_id_pool: utils::IdPool<object::IdRepr>,
+}
+impl IdPool {
+    pub fn new(max_kv_blocks: u32, max_embs: u32) -> Self {
+        Self {
+            kv_block_id_pool: utils::IdPool::new(max_kv_blocks),
+            emb_id_pool: utils::IdPool::new(max_embs),
+            dist_id_pool: utils::IdPool::new(max_embs),
+        }
+    }
+
+    // Helper that returns a mutable reference to the appropriate pool.
+    fn pool_mut<T: ControllerManaged>(&mut self) -> &mut utils::IdPool<object::IdRepr> {
+        match T::NAMESPACE {
+            Namespace::KvBlock => &mut self.kv_block_id_pool,
+            Namespace::Emb => &mut self.emb_id_pool,
+            Namespace::Dist => &mut self.dist_id_pool,
+        }
+    }
+
+    // Helper that returns an immutable reference.
+    fn pool<T: ControllerManaged>(&self) -> &utils::IdPool<object::IdRepr> {
+        match T::NAMESPACE {
+            Namespace::KvBlock => &self.kv_block_id_pool,
+            Namespace::Emb => &self.emb_id_pool,
+            Namespace::Dist => &self.dist_id_pool,
+        }
+    }
+
+    pub fn acquire<T: ControllerManaged>(&mut self) -> Result<object::Id<T>, ObjectError> {
+        let id = self
+            .pool_mut::<T>()
+            .acquire()
+            .map_err(|_| ObjectError::NoAvailableSpace)?;
+        Ok(object::Id::new(id))
+    }
+
+    pub fn acquire_many<T: ControllerManaged>(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<object::Id<T>>, ObjectError> {
+        let ids = self
+            .pool_mut::<T>()
+            .acquire_many(count)
+            .map_err(|_| ObjectError::NoAvailableSpace)?;
+        Ok(object::Id::map_from_repr(ids))
+    }
+
+    pub fn release<T: ControllerManaged>(&mut self, id: &object::Id<T>) -> Result<(), ObjectError> {
+        self.pool_mut::<T>()
+            .release(id.into())
+            .map_err(|e| ObjectError::AddressPoolError(e.to_string()))
+    }
+
+    pub fn release_many<T: ControllerManaged>(
+        &mut self,
+        ids: &[object::Id<T>],
+    ) -> Result<(), ObjectError> {
+        let raw_ids = object::Id::ref_as_repr(ids);
+        self.pool_mut::<T>()
+            .release_many(raw_ids)
+            .map_err(|e| ObjectError::AddressPoolError(e.to_string()))
+    }
+
+    pub fn available<T: ControllerManaged>(&self) -> usize {
+        self.pool::<T>().available()
+    }
+}
+
+#[derive(Debug)]
+pub struct IdMap {
+    kv_block_id_map: HashMap<object::VspaceId, HashMap<object::IdRepr, object::IdRepr>>,
+    emb_id_map: HashMap<object::VspaceId, HashMap<object::IdRepr, object::IdRepr>>,
+    dist_id_map: HashMap<object::VspaceId, HashMap<object::IdRepr, object::IdRepr>>,
+}
+impl IdMap {
+    pub fn new() -> Self {
+        Self {
+            kv_block_id_map: HashMap::new(),
+            emb_id_map: HashMap::new(),
+            dist_id_map: HashMap::new(),
+        }
+    }
+
+    // Helper method to get a mutable reference to the appropriate map.
+    fn map_mut<T: ControllerManaged>(&mut self) -> &mut HashMap<object::IdRepr, object::IdRepr> {
+        match T::NAMESPACE {
+            Namespace::KvBlock => &mut self.kv_block_id_map,
+            Namespace::Emb => &mut self.emb_id_map,
+            Namespace::Dist => &mut self.dist_id_map,
+        }
+    }
+
+    // Helper method to get an immutable reference to the appropriate map.
+    fn map<T: ControllerManaged>(&self) -> &HashMap<object::IdRepr, object::IdRepr> {
+        match T::NAMESPACE {
+            Namespace::KvBlock => &self.kv_block_id_map,
+            Namespace::Emb => &self.emb_id_map,
+            Namespace::Dist => &self.dist_id_map,
+        }
+    }
+
+    pub fn insert<T: ControllerManaged>(&mut self, vid: object::Id<T>, id: object::Id<T>) {
+        let (src, dst) = (vid.into(), id.into());
+        self.map_mut::<T>().insert(src, dst);
+    }
+
+    pub fn remove<T: ControllerManaged>(
+        &mut self,
+        vid: object::Id<T>,
+    ) -> Result<object::Id<T>, ObjectError> {
+        let vid = vid.into();
+        let id = self
+            .map_mut::<T>()
+            .remove(&vid)
+            .ok_or(ObjectError::ObjectNotFound)?;
+        Ok(object::Id::<T>::new(id))
+    }
+
+    pub fn get<T: ControllerManaged>(
+        &self,
+        vid: object::Id<T>,
+    ) -> Result<object::Id<T>, ObjectError> {
+        let vid = vid.into();
+        let id = self
+            .map::<T>()
+            .get(&vid)
+            .ok_or(ObjectError::ObjectNotFound)?;
+        Ok(object::Id::<T>::new(*id))
+    }
+}
+
+#[derive(Debug)]
+struct RefCounter {
+    kv_block_counter: HashMap<object::Id<KvBlock>, Counter>,
+    emb_counter: HashMap<object::Id<TokenEmb>, Counter>,
+    dist_counter: HashMap<object::Id<TokenDist>, Counter>,
+}
+
+impl RefCounter {
+    pub fn new() -> Self {
+        Self {
+            kv_block_counter: HashMap::new(),
+            emb_counter: HashMap::new(),
+            dist_counter: HashMap::new(),
+        }
+    }
+
+    fn counter<T: ControllerManaged>(&self) -> &HashMap<object::Id<T>, Counter> {
+        match T::NAMESPACE {
+            Namespace::KvBlock => &self.kv_block_counter,
+            Namespace::Emb => &self.emb_counter,
+            Namespace::Dist => &self.dist_counter,
+        }
+    }
+
+    fn counter_mut<T: ControllerManaged>(&mut self) -> &mut HashMap<object::Id<T>, Counter> {
+        match T::NAMESPACE {
+            Namespace::KvBlock => &mut self.kv_block_counter,
+            Namespace::Emb => &mut self.emb_counter,
+            Namespace::Dist => &mut self.dist_counter,
+        }
+    }
+
+    pub fn init<T: ControllerManaged>(&mut self, id: object::Id<T>) {
+        self.counter_mut::<T>().insert(id, Counter::new(0));
+    }
+
+    pub fn destroy<T: ControllerManaged>(&mut self, id: &object::Id<T>) {
+        self.counter_mut::<T>().remove(&id);
+    }
+
+    pub fn inc<T: ControllerManaged>(&mut self, id: &object::Id<T>) {
+        self.counter_mut::<T>().get_mut(&id).unwrap().inc();
+    }
+
+    pub fn dec<T: ControllerManaged>(&mut self, id: &object::Id<T>) -> bool {
+        self.counter_mut::<T>().get_mut(&id).unwrap().dec() <= 0
+    }
+
+    pub fn get<T: ControllerManaged>(&self, id: &object::Id<T>) -> usize {
+        self.counter::<T>().get(&id).unwrap().get() as usize
     }
 }

@@ -1,11 +1,11 @@
 mod controller;
 mod cmd_buffer;
-mod handler;
 mod instance;
-mod backend;
+mod lm;
 mod tokenizer;
 mod utils;
 mod object;
+mod backend;
 //mod state_old;
 
 use crate::instance::{App, InstanceMessageOld, InstanceState, InstanceUtils};

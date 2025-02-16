@@ -1,5 +1,4 @@
-use crate::utils;
-use crate::utils::{Counter, Stream};
+use crate::utils::Stream;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -43,56 +42,116 @@ pub enum ObjectError {
 
 // ------------------------------------------------------------
 
-// Id definition ------------------------------------------------
-pub trait Object: Debug + Sized + Send + Sync {
-    const NAMESPACE: Namespace;
-    //fn get_namespace() -> Namespace;
-}
-
 pub type IdRepr = u32;
 
+#[repr(transparent)]
 #[derive(Debug)]
-pub struct Id<T: Object>(IdRepr, PhantomData<T>);
+pub struct Id<T>(IdRepr, PhantomData<T>);
 
-impl<T: Object> Clone for Id<T> {
+impl<T> Id<T> {
+    pub fn new(id: IdRepr) -> Self {
+        Self(id, PhantomData)
+    }
+    pub fn into_repr(self) -> IdRepr {
+        self.0
+    }
+
+    pub fn map_from_repr(reprs: Vec<IdRepr>) -> Vec<Id<T>> {
+        // The safe way to do this is to use Vec::map...
+        // reprs
+        //     .into_iter()
+        //     .map(|repr| Id(repr, PhantomData))
+        //     .collect()
+        // But we can do it in a more efficient way since the Id is repr(transparent).
+        let capacity = reprs.capacity();
+        let len = reprs.len();
+        let ptr = reprs.as_ptr() as *mut Id<T>;
+        std::mem::forget(reprs); // Prevent the original Vec<u32> from dropping
+        unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+    }
+
+    pub fn map_to_repr(ids: Vec<Id<T>>) -> Vec<IdRepr> {
+        // Safe way:
+        // ids.into_iter().map(Id::into_repr).collect()
+
+        let capacity = ids.capacity();
+        let len = ids.len();
+        let ptr = ids.as_ptr() as *mut u32;
+        std::mem::forget(ids);
+        unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+    }
+
+    pub fn ref_as_repr(ids: &[Id<T>]) -> &[u32] {
+        unsafe { slice::from_raw_parts(ids.as_ptr() as *const u32, ids.len()) }
+    }
+
+    pub fn group_consecutive_ids(ids: &[Id<T>]) -> Vec<(Id<T>, IdRepr)> {
+        let mut ranges = Vec::new();
+        let ids = Id::ref_as_repr(ids);
+        if ids.is_empty() {
+            return ranges;
+        }
+
+        // Initialize the first range with the first id.
+        let mut offset = ids[0];
+        let mut size = 1;
+
+        // Use windows to look at each consecutive pair.
+        for pair in ids.windows(2) {
+            let (current, next) = (pair[0], pair[1]);
+            if next == current + 1 {
+                // They are consecutive, so increase the current range.
+                size += 1;
+            } else {
+                // A gap is found, so push the current range.
+                ranges.push((Id::new(offset), size));
+                // Start a new range with the next id.
+                offset = next;
+                size = 1;
+            }
+        }
+
+        // Don't forget to push the last range.
+        ranges.push((Id::new(offset), size));
+        ranges
+    }
+}
+
+impl<T> Clone for Id<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T: Object> Copy for Id<T> {}
+impl<T> Copy for Id<T> {}
 
-impl<T: Object> PartialEq for Id<T> {
+impl<T> PartialEq for Id<T> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
-impl<T: Object> Eq for Id<T> {}
+impl<T> Eq for Id<T> {}
 
-impl<T: Object> Hash for Id<T> {
+impl<T> Hash for Id<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
 }
 
-impl<T: Object> Id<T> {
-    pub fn new(id: IdRepr) -> Self {
-        Self(id, PhantomData)
-    }
-
-    pub fn namespace(&self) -> Namespace {
-        T::NAMESPACE
-    }
-}
-
-impl<T: Object> From<IdRepr> for Id<T> {
+impl<T> From<IdRepr> for Id<T> {
     fn from(id: IdRepr) -> Self {
         Self::new(id)
     }
 }
 
-impl<T: Object> Into<IdRepr> for Id<T> {
+impl<T> Into<IdRepr> for Id<T> {
+    fn into(self) -> IdRepr {
+        self.0
+    }
+}
+
+impl<T> Into<IdRepr> for &Id<T> {
     fn into(self) -> IdRepr {
         self.0
     }
@@ -100,38 +159,13 @@ impl<T: Object> Into<IdRepr> for Id<T> {
 
 // Id definition ------------------------------------------------
 
-// this helps the backend to make optimization decisions.
-
-pub trait ReferenceCounted {
-    /// Increments the reference count.
-    fn add_ref(&self);
-
-    /// Decrements the reference count.
-    ///
-    /// Returns `true` if the count has reached zero, indicating that the object
-    /// can be safely cleaned up.
-    fn release(&self) -> bool;
-
-    /// Returns the current reference count.
-    fn ref_count(&self) -> usize;
-}
-
-pub trait Allocator<T>
-where
-    T: Object,
-{
-    type RawRepr;
-
-    fn objects(&self) -> &HashMap<Id<T>, T>;
-
-    fn objects_mut(&mut self) -> &mut HashMap<Id<T>, T>;
-
-    fn alloc(&mut self, stream: Stream, object: T) -> Result<Id<T>, ObjectError> {
-        self.alloc_many(stream, vec![object])
+pub trait Allocator<T> {
+    fn alloc(&mut self, stream: Stream) -> Result<Id<T>, ObjectError> {
+        self.alloc_many(stream, 1)
             .map(|mut ids| ids.pop().unwrap())
     }
 
-    fn alloc_many(&mut self, stream: Stream, objects: Vec<T>) -> Result<Vec<Id<T>>, ObjectError>;
+    fn alloc_many(&mut self, stream: Stream, count:usize) -> Result<Vec<Id<T>>, ObjectError>;
 
     fn dealloc(&mut self, stream: Stream, id: Id<T>) -> Result<(), ObjectError> {
         self.dealloc_many(stream, &[id])
@@ -139,39 +173,19 @@ where
 
     fn dealloc_many(&mut self, stream: Stream, ids: &[Id<T>]) -> Result<(), ObjectError>;
 
-    fn get(&self, id: Id<T>) -> Result<&T, ObjectError> {
-        self.objects().get(&id).ok_or(ObjectError::ObjectNotFound)
-    }
-
-    fn get_mut(&mut self, id: Id<T>) -> Result<&mut T, ObjectError> {
-        self.objects_mut()
-            .get_mut(&id)
-            .ok_or(ObjectError::ObjectNotFound)
-    }
-
-    fn get_many(&self, ids: &[Id<T>]) -> Result<Vec<&T>, ObjectError> {
-        ids.iter().map(|&id| self.get(id)).collect()
-    }
-
-    // retrieve the underlying data from the backend.
-    // this is unlikely to be used in practice, except for debugging, implementing some new sampling algos, and so on.
-    fn raw_repr(
-        &self,
-        stream: Stream,
-        id: Id<T>,
-        sender: oneshot::Sender<Self::RawRepr>,
-    ) -> Result<(), ObjectError>;
-
     fn available(&self) -> usize;
 }
 
-type VspaceId = u32;
+pub trait Fetcher<T>: Allocator<T> {
+    type RawRepr;
+
+    fn fetch(&self, id: &Id<T>, sender: oneshot::Sender<Self::RawRepr>) -> Result<(), ObjectError>;
+}
+
+pub type VspaceId = u32;
 
 // reference-counted object manager
-pub trait MappedAllocator<T>: Allocator<T>
-where
-    T: ReferenceCounted + Object,
-{
+pub trait MappedAllocator<T>: Allocator<T> {
     fn vspaces(&self) -> &HashMap<VspaceId, HashMap<Id<T>, Id<T>>>;
 
     fn vspaces_mut(&mut self) -> &mut HashMap<VspaceId, HashMap<Id<T>, Id<T>>>;
@@ -197,6 +211,18 @@ where
 
         Ok(())
     }
+
+    /// Increments the reference count.
+    fn ref_inc(&mut self, id: &Id<T>) -> Result<(), ObjectError>;
+
+    /// Decrements the reference count.
+    ///
+    /// Returns `true` if the count has reached zero, indicating that the object
+    /// can be safely cleaned up.
+    fn ref_dec(&mut self, id: &Id<T>) -> Result<bool, ObjectError>;
+
+    /// Returns the current reference count.
+    fn ref_count(&self, id: &Id<T>) -> Result<usize, ObjectError>;
 
     fn alloc(
         &mut self,
@@ -271,11 +297,7 @@ where
 
         // Now iterate over the collected ids to release and possibly deallocate.
         for id in ids {
-            let remove_entirely = self
-                .objects()
-                .get(&id)
-                .ok_or(ObjectError::ObjectNotFound)?
-                .release();
+            let remove_entirely = self.ref_dec(&id)?;
 
             if remove_entirely {
                 Allocator::dealloc(self, stream, id).map_err(|e| {
@@ -296,19 +318,10 @@ where
         dst_vspace_id: &VspaceId,
         dst_vid: &Id<T>,
     ) -> Result<(), ObjectError> {
-        let src_id = self
-            .vspaces()
-            .get(&src_vspace_id)
-            .ok_or(ObjectError::VSpaceNotFound)?
-            .get(src_vid)
-            .ok_or(ObjectError::VSpaceTranslationFailed(src_vid.0))?
-            .clone();
+        let src_id = self.resolve(src_vspace_id, src_vid)?;
 
         // increase ref count
-        self.objects()
-            .get(&src_id)
-            .ok_or(ObjectError::ObjectNotFound)?
-            .add_ref();
+        self.ref_inc(&src_id)?;
 
         let dst_vspace = self
             .vspaces_mut()
@@ -351,245 +364,5 @@ where
                     .ok_or(ObjectError::VSpaceTranslationFailed(vid.into()))
             })
             .collect()
-    }
-
-    fn get(&self, vspace_id: &VspaceId, vid: &Id<T>) -> Result<&T, ObjectError> {
-        let id = self.resolve(vspace_id, vid)?;
-
-        Allocator::get(self, id)
-    }
-
-    fn get_mut(&mut self, vspace_id: &VspaceId, vid: &Id<T>) -> Result<&mut T, ObjectError> {
-        let id = self.resolve(vspace_id, vid)?;
-
-        Allocator::get_mut(self, id)
-    }
-
-    fn get_many(&self, vspace_id: &VspaceId, vids: &[Id<T>]) -> Result<Vec<&T>, ObjectError> {
-        let ids = self.resolve_many(vspace_id, vids)?;
-
-        Allocator::get_many(self, &ids)
-    }
-}
-
-// ------------------------------------------------------------
-
-#[derive(Debug)]
-pub struct KvBlock {
-    counter: Counter,
-}
-
-impl Object for KvBlock {
-    const NAMESPACE: Namespace = Namespace::KvBlock;
-}
-
-impl KvBlock {
-    pub fn new() -> Self {
-        KvBlock {
-            counter: Counter::new(0),
-        }
-    }
-}
-
-impl ReferenceCounted for KvBlock {
-    fn add_ref(&self) {
-        self.counter.inc();
-    }
-
-    fn release(&self) -> bool {
-        self.counter.dec() <= 0
-    }
-
-    fn ref_count(&self) -> usize {
-        self.counter.get() as usize
-    }
-}
-#[derive(Debug)]
-pub struct TokenEmb {
-    counter: Counter,
-}
-
-impl Object for TokenEmb {
-    const NAMESPACE: Namespace = Namespace::Emb;
-}
-
-impl TokenEmb {
-    pub fn new() -> Self {
-        TokenEmb {
-            counter: Counter::new(0),
-        }
-    }
-}
-
-impl ReferenceCounted for TokenEmb {
-    fn add_ref(&self) {
-        self.counter.inc();
-    }
-
-    fn release(&self) -> bool {
-        self.counter.dec() <= 0
-    }
-
-    fn ref_count(&self) -> usize {
-        self.counter.get() as usize
-    }
-}
-
-// distribution
-#[derive(Debug)]
-pub struct TokenDist {
-    counter: Counter,
-}
-
-impl Object for TokenDist {
-    const NAMESPACE: Namespace = Namespace::Dist;
-}
-
-impl TokenDist {
-    pub fn new() -> Self {
-        TokenDist {
-            counter: Counter::new(0),
-        }
-    }
-}
-
-impl ReferenceCounted for TokenDist {
-    fn add_ref(&self) {
-        self.counter.inc();
-    }
-
-    fn release(&self) -> bool {
-        self.counter.dec() <= 0
-    }
-
-    fn ref_count(&self) -> usize {
-        self.counter.get() as usize
-    }
-}
-
-// ------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-pub enum Namespace {
-    KvBlock = 0,
-    Emb = 1,
-    Dist = 2,
-}
-
-#[derive(Debug)]
-pub struct IdPool {
-    kv_block_id_pool: utils::IdPool<IdRepr>,
-    emb_id_pool: utils::IdPool<IdRepr>,
-    dist_id_pool: utils::IdPool<IdRepr>,
-}
-
-impl IdPool {
-    pub fn new(max_kv_blocks: u32, max_embs: u32) -> Self {
-        Self {
-            kv_block_id_pool: utils::IdPool::new(max_kv_blocks),
-            emb_id_pool: utils::IdPool::new(max_embs),
-            dist_id_pool: utils::IdPool::new(max_embs),
-        }
-    }
-
-    pub fn acquire<T: Object>(&mut self) -> Result<Id<T>, ObjectError> {
-        if let Ok(id) = match T::NAMESPACE {
-            Namespace::KvBlock => self.kv_block_id_pool.acquire(),
-            Namespace::Emb => self.emb_id_pool.acquire(),
-            Namespace::Dist => self.dist_id_pool.acquire(),
-        } {
-            Ok(Id::new(id))
-        } else {
-            Err(ObjectError::NoAvailableSpace)
-        }
-    }
-
-    pub fn acquire_many<T: Object>(&mut self, count: usize) -> Result<Vec<Id<T>>, ObjectError> {
-        if let Ok(ids) = match T::NAMESPACE {
-            Namespace::KvBlock => self.kv_block_id_pool.acquire_many(count),
-            Namespace::Emb => self.emb_id_pool.acquire_many(count),
-            Namespace::Dist => self.dist_id_pool.acquire_many(count),
-        } {
-            Ok(ids.into_iter().map(Id::new).collect())
-        } else {
-            Err(ObjectError::NoAvailableSpace)
-        }
-    }
-
-    pub fn release<T: Object>(&mut self, id: Id<T>) -> Result<(), ObjectError> {
-        let id = id.into();
-        match T::NAMESPACE {
-            Namespace::KvBlock => self.kv_block_id_pool.release(id),
-            Namespace::Emb => self.emb_id_pool.release(id),
-            Namespace::Dist => self.dist_id_pool.release(id),
-        }
-        .map_err(|e| ObjectError::AddressPoolError(e.to_string()))
-    }
-
-    pub fn release_many<T: Object>(&mut self, ids: &[Id<T>]) -> Result<(), ObjectError> {
-        let ids = ids.iter().map(|id| id.0).collect::<Vec<_>>();
-        match T::NAMESPACE {
-            Namespace::KvBlock => self.kv_block_id_pool.release_many(&ids),
-            Namespace::Emb => self.emb_id_pool.release_many(&ids),
-            Namespace::Dist => self.dist_id_pool.release_many(&ids),
-        }
-        .map_err(|e| ObjectError::AddressPoolError(e.to_string()))
-    }
-
-    pub fn available<T: Object>(&self) -> usize {
-        match T::NAMESPACE {
-            Namespace::KvBlock => self.kv_block_id_pool.available(),
-            Namespace::Emb => self.emb_id_pool.available(),
-            Namespace::Dist => self.dist_id_pool.available(),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct IdMap {
-    kv_block_id_map: HashMap<IdRepr, IdRepr>,
-    emb_id_map: HashMap<IdRepr, IdRepr>,
-    dist_id_map: HashMap<IdRepr, IdRepr>,
-}
-
-impl IdMap {
-    pub fn new() -> Self {
-        Self {
-            kv_block_id_map: HashMap::new(),
-            emb_id_map: HashMap::new(),
-            dist_id_map: HashMap::new(),
-        }
-    }
-
-    pub fn insert<T: Object>(&mut self, vid: Id<T>, id: Id<T>) {
-        let (src, dst) = (vid.into(), id.into());
-        match T::NAMESPACE {
-            Namespace::KvBlock => self.kv_block_id_map.insert(src, dst),
-            Namespace::Emb => self.emb_id_map.insert(src, dst),
-            Namespace::Dist => self.dist_id_map.insert(src, dst),
-        };
-    }
-
-    pub fn remove<T: Object>(&mut self, vid: Id<T>) -> Result<Id<T>, ObjectError> {
-        let vid = vid.into();
-        let id = match T::NAMESPACE {
-            Namespace::KvBlock => self.kv_block_id_map.remove(&vid),
-            Namespace::Emb => self.emb_id_map.remove(&vid),
-            Namespace::Dist => self.dist_id_map.remove(&vid),
-        }
-        .ok_or(ObjectError::ObjectNotFound)?;
-        Ok(Id::<T>::new(id))
-    }
-
-    pub fn get<T: Object>(&self, vid: Id<T>) -> Result<Id<T>, ObjectError> {
-        let vid = vid.into();
-        let id = match T::NAMESPACE {
-            Namespace::KvBlock => self.kv_block_id_map.get(&vid),
-            Namespace::Emb => self.emb_id_map.get(&vid),
-            Namespace::Dist => self.dist_id_map.get(&vid),
-        }
-        .ok_or(ObjectError::ObjectNotFound)?;
-
-        Ok(Id::<T>::new(*id))
     }
 }
