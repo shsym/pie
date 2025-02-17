@@ -1,0 +1,28 @@
+name: Test Build Example-apps/helloworld
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Add WASI Preview 2 Target
+        run: rustup target add wasm32-wasip2
+
+      - name: Build Example LIP App
+        working-directory: ./example-apps/helloworld
+        run: cargo build --target wasm32-wasip2 --release

@@ -3,11 +3,14 @@ use crate::lm::{
 };
 use crate::utils::{Counter, Stream};
 use crate::{backend, instance, object, utils};
+use anyhow::{anyhow, bail, ensure, Context};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::mem;
-use tokio::sync::oneshot;
+use std::sync::Arc;
+use tokio::sync::{oneshot, Mutex};
 
+use crate::backend::ExecuteCommand;
 use crate::instance::Id as InstanceId;
 use crate::object::{Allocator, Fetcher, Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
 use thiserror::Error;
@@ -25,6 +28,9 @@ pub enum ControllerError {
 
     #[error("Object error: {0}")]
     ObjectError(#[from] ObjectError),
+
+    #[error("Event dispatcher error: {0}")]
+    EventDispatcherError(#[from] anyhow::Error),
 }
 
 /// Intermediate representation of a command to be executed by the backend.
@@ -98,23 +104,40 @@ impl EventHandle {
 pub struct Controller<B> {
     cmd_buffer: Vec<(Stream, IrCommand, EventHandle)>,
     cmd_batcher: CommandBatcher,
+    cmd_id_pool: utils::IdPool<u32>,
     backend: B,
 
     // object allocations
-    id_pool: IdPool,
-    ref_counter: RefCounter,
-    vspaces: HashMap<VspaceId, IdMap>,
+    obj_id_pool: IdPool,
+    obj_ref_counter: RefCounter,
+    obj_id_spaces: HashMap<VspaceId, IdMap>,
+
+    event_dispatcher: Arc<Mutex<EventDispatcher>>,
+    resp_handler: tokio::task::JoinHandle<()>,
 }
 
-impl<B> Controller<B> {
-    pub fn new(backend: B) -> Self {
+impl<B> Controller<B>
+where
+    B: ExecuteCommand,
+{
+    pub async fn new(backend: B) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(1000);
+
+        let dispatcher = Arc::new(Mutex::new(EventDispatcher::new()));
+
+        let resp_handler = tokio::spawn(Self::handle_responses(rx, dispatcher.clone()));
+        backend.report_to(tx);
+
         Self {
             cmd_buffer: Vec::new(),
             cmd_batcher: CommandBatcher::new(0.0, 1, 1),
+            cmd_id_pool: utils::IdPool::new(u32::MAX),
             backend,
-            id_pool: IdPool::new(10000, 10000),
-            ref_counter: RefCounter::new(),
-            vspaces: HashMap::new(),
+            obj_id_pool: IdPool::new(10000, 10000),
+            obj_ref_counter: RefCounter::new(),
+            obj_id_spaces: HashMap::new(),
+            event_dispatcher: dispatcher,
+            resp_handler,
         }
     }
 
@@ -133,7 +156,7 @@ impl<B> Controller<B> {
         Ok(())
     }
 
-    pub fn schedule(&mut self, curr_timestamp: f64) -> Result<(), ControllerError> {
+    pub async fn submit(&mut self, curr_timestamp: f64) -> Result<(), ControllerError> {
         // first move all the commands from cmd_buffer to pending (buffer items are removed)
         let mut commands_by_stream = HashMap::new();
 
@@ -170,7 +193,130 @@ impl<B> Controller<B> {
 
         let batched_payloads = self.cmd_batcher.batch_all(curr_timestamp);
 
+        for (cmd, senders) in batched_payloads {
+            // TODO: fix error type
+            let correlation_id = self
+                .cmd_id_pool
+                .acquire()
+                .map_err(|e| ControllerError::LockError)?;
+
+            // register events if there are any
+            if senders.iter().any(|s| s.is_some()) {
+                self.event_dispatcher
+                    .lock()
+                    .await
+                    .register(correlation_id, senders);
+            }
+
+            let req = backend::sdi::Request {
+                correlation_id,
+                command: Some(cmd),
+            };
+
+            self.backend
+                .exec(req)
+                .await
+                .map_err(|_| ControllerError::SendError)?;
+        }
+
         // drop the lock on pending
+        Ok(())
+    }
+
+    async fn handle_responses(
+        mut rx: tokio::sync::mpsc::Receiver<backend::sdi::Response>,
+        dispatcher: Arc<Mutex<EventDispatcher>>,
+    ) {
+        loop {
+            let resp = rx.recv().await.unwrap();
+
+            let correlation_id = resp.correlation_id;
+            let payload = resp.payload.unwrap();
+
+            let mut dispatcher = dispatcher.lock().await;
+
+            let ir_events = match payload {
+                backend::sdi::response::Payload::SampleTopK(batch) => batch
+                    .items
+                    .into_iter()
+                    .map(|item| IrEvent::SampleTopK(item))
+                    .collect(),
+                backend::sdi::response::Payload::GetTokenDistribution(batch) => batch
+                    .items
+                    .into_iter()
+                    .map(|item| IrEvent::GetTokenDistribution(item))
+                    .collect(),
+            };
+
+            dispatcher.dispatch(correlation_id, ir_events).unwrap();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EventDispatcher {
+    // maps correlation_id to a list of senders.
+    table: HashMap<u32, Vec<EventHandle>>,
+}
+
+impl EventDispatcher {
+    fn new() -> Self {
+        Self {
+            table: HashMap::new(),
+        }
+    }
+
+    fn register(&mut self, correlation_id: u32, sender: Vec<EventHandle>) {
+        self.table.insert(correlation_id, sender);
+    }
+
+    fn dispatch(&mut self, correlation_id: u32, events: Vec<IrEvent>) -> anyhow::Result<()> {
+        // Remove the handlers associated with the given correlation ID.
+        let senders = self.table.remove(&correlation_id).ok_or_else(|| {
+            anyhow!(
+                "No event handlers found for correlation_id: {}",
+                correlation_id
+            )
+        })?;
+
+        // Ensure the number of senders matches the number of events.
+        ensure!(
+            senders.len() == events.len(),
+            "Length mismatch: {} senders vs {} events",
+            senders.len(),
+            events.len()
+        );
+
+        // Iterate over each (sender, event) pair.
+        for (sender, event) in senders.into_iter().zip(events.into_iter()) {
+            match sender {
+                EventHandle::None => { /* No action needed */ }
+                EventHandle::SampleTopK(s) => {
+                    if let IrEvent::SampleTopK(mut resp) = event {
+                        s.send(mem::take(&mut resp.token_ids))
+                            .map_err(|e| anyhow!("Failed to send SampleTopK event: {:?}", e))?;
+                    } else {
+                        bail!(
+                            "Mismatched event type: expected SampleTopK for correlation_id: {}",
+                            correlation_id
+                        );
+                    }
+                }
+                EventHandle::GetTokenDistribution(s) => {
+                    if let IrEvent::GetTokenDistribution(mut resp) = event {
+                        s.send(mem::take(&mut resp.distribution)).map_err(|e| {
+                            anyhow!("Failed to send GetTokenDistribution event: {:?}", e)
+                        })?;
+                    } else {
+                        bail!(
+                        "Mismatched event type: expected GetTokenDistribution for correlation_id: {}",
+                        correlation_id
+                    );
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -427,13 +573,14 @@ pub enum Namespace {
 impl<B, T> Allocator<T> for Controller<B>
 where
     T: ControllerManaged,
+    B: ExecuteCommand,
 {
     fn alloc_all(&mut self, stream: Stream, count: usize) -> Result<Vec<ObjectId<T>>, ObjectError> {
-        let ids = self.id_pool.acquire_many::<T>(count)?;
+        let ids = self.obj_id_pool.acquire_many::<T>(count)?;
 
         // init the ref counter
         for id in &ids {
-            self.ref_counter.init(*id); // set the ref count to 0
+            self.obj_ref_counter.init(*id); // set the ref count to 0
         }
 
         // Request the backend to allocate the objects.
@@ -455,11 +602,11 @@ where
         let mut rm_ids = Vec::new();
         for id in ids {
             // safety check
-            let free = self.ref_counter.get(id) <= 0;
+            let free = self.obj_ref_counter.get(id) <= 0;
             if free {
                 rm_ids.push(*id);
-                self.id_pool.release(id)?;
-                self.ref_counter.destroy(id);
+                self.obj_id_pool.release(id)?;
+                self.obj_ref_counter.destroy(id);
             }
         }
 
@@ -485,34 +632,35 @@ where
     }
 
     fn available(&self) -> usize {
-        self.id_pool.available::<T>()
+        self.obj_id_pool.available::<T>()
     }
 
     fn increment_ref_count(&mut self, id: &ObjectId<T>) -> Result<(), ObjectError> {
-        Ok(self.ref_counter.inc(id))
+        Ok(self.obj_ref_counter.inc(id))
     }
 
     fn decrement_ref_count(&mut self, id: &ObjectId<T>) -> Result<bool, ObjectError> {
-        Ok(self.ref_counter.dec(id))
+        Ok(self.obj_ref_counter.dec(id))
     }
 
     fn ref_count(&self, id: &ObjectId<T>) -> Result<usize, ObjectError> {
-        Ok(self.ref_counter.get(id))
+        Ok(self.obj_ref_counter.get(id))
     }
 }
 
 impl<B, T> object::IdMapper<T> for Controller<B>
 where
     T: ControllerManaged,
+    B: ExecuteCommand,
 {
     fn exists(&self, space: &VspaceId, src: &ObjectId<T>) -> bool {
-        self.vspaces
+        self.obj_id_spaces
             .get(space)
             .map_or(false, |vspace| vspace.exists(src))
     }
 
     fn list(&self, space: &VspaceId) -> Result<Vec<ObjectId<T>>, ObjectError> {
-        self.vspaces
+        self.obj_id_spaces
             .get(space)
             .ok_or(ObjectError::VSpaceNotFound)?
             .list()
@@ -523,7 +671,7 @@ where
         space: &VspaceId,
         srcs: &[ObjectId<T>],
     ) -> Result<Vec<ObjectId<T>>, ObjectError> {
-        self.vspaces
+        self.obj_id_spaces
             .get(space)
             .ok_or(ObjectError::VSpaceNotFound)?
             .lookup_all(srcs)
@@ -541,7 +689,7 @@ where
         }
 
         let vspace = self
-            .vspaces
+            .obj_id_spaces
             .get_mut(space)
             .ok_or(ObjectError::VSpaceNotFound)?;
 
@@ -554,7 +702,7 @@ where
 
     fn unassign_all(&mut self, space: &VspaceId, srcs: &[ObjectId<T>]) -> Result<(), ObjectError> {
         let vspace = self
-            .vspaces
+            .obj_id_spaces
             .get_mut(space)
             .ok_or(ObjectError::VSpaceNotFound)?;
 
@@ -575,11 +723,11 @@ where
     }
 
     fn open(&mut self, space: VspaceId) -> Result<(), ObjectError> {
-        if self.vspaces.contains_key(&space) {
+        if self.obj_id_spaces.contains_key(&space) {
             return Err(ObjectError::VSpaceAlreadyExists(space));
         }
 
-        self.vspaces.insert(space, IdMap::new());
+        self.obj_id_spaces.insert(space, IdMap::new());
         Ok(())
     }
 
@@ -588,12 +736,15 @@ where
         let srcs: Vec<ObjectId<T>> = self.list(space)?;
         self.unassign_all(space, &srcs)?;
 
-        self.vspaces.remove(space).unwrap();
+        self.obj_id_spaces.remove(space).unwrap();
         Ok(())
     }
 }
 
-impl<B> CausalTransformer for Controller<B> {
+impl<B> CausalTransformer for Controller<B>
+where
+    B: ExecuteCommand,
+{
     fn fill(
         &mut self,
         stream: Stream,
@@ -660,7 +811,10 @@ impl<B> CausalTransformer for Controller<B> {
     }
 }
 
-impl<B> CausalLanguageModel for Controller<B> {
+impl<B> CausalLanguageModel for Controller<B>
+where
+    B: ExecuteCommand,
+{
     fn next_token_dist(
         &mut self,
         stream: Stream,
@@ -720,7 +874,10 @@ impl<B> CausalLanguageModel for Controller<B> {
     // }
 }
 
-impl<B> Fetcher<TokenDist> for Controller<B> {
+impl<B> Fetcher<TokenDist> for Controller<B>
+where
+    B: ExecuteCommand,
+{
     type RawRepr = Vec<f32>;
 
     fn fetch(
@@ -748,7 +905,10 @@ impl<B> Fetcher<TokenDist> for Controller<B> {
 
 /// for multimodal LLMs
 
-impl<B> ImageEmbedder for Controller<B> {
+impl<B> ImageEmbedder for Controller<B>
+where
+    B: ExecuteCommand,
+{
     fn embed_img(
         &mut self,
         stream: Stream,

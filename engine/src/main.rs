@@ -7,7 +7,7 @@ mod tokenizer;
 mod utils;
 //mod state_old;
 
-use crate::instance::{App, InstanceState, InstanceUtils};
+use crate::instance::{App, Command, Id as InstanceId, InstanceState, InstanceUtils};
 use anyhow::Context;
 use blake3::Hasher;
 use dashmap::DashMap;
@@ -32,6 +32,8 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiImpl, WasiView};
 
 // For MessagePack serialization/deserialization.
+use crate::backend::Backend;
+use crate::controller::Controller;
 use crate::tokenizer::{llama3_tokenizer, BytePairEncoder};
 use rmp_serde::{decode::from_slice, encode::to_vec_named};
 use serde::{Deserialize, Serialize};
@@ -48,7 +50,6 @@ const CHUNK_SIZE_BYTES: usize = 64 * 1024; // 64 KiB
 // ---------------------------
 
 pub type ClientId = Uuid;
-pub type InstanceId = Uuid;
 pub type ProgramHash = String;
 
 /// Global server state:
@@ -75,7 +76,7 @@ struct ServerState {
     engine: Engine,
 
     // The "global" sender (instances -> server)
-    inst2server: Sender<InstanceMessageOld>,
+    inst2server: Sender<(InstanceId, Command)>,
 
     utils: Arc<BytePairEncoder>,
 }
@@ -211,12 +212,46 @@ async fn main() -> anyhow::Result<()> {
     //
     let state_ = state.clone();
 
-    let backend = controller::Controller::new(32, 1000, 1000);
-    let infer_mgr = Controller::new(backend);
+    let backend = Backend::bind("tcp://127.0.0.1:5555")
+        .await
+        .context("Failed to bind backend")?;
 
     tokio::spawn(async move {
-        // Global loop reading from the global MPSC receiver
-        while let Some(instance_msg) = inst2server_rx.recv().await {
+        // Global controller loop
+        let mut controller = Controller::new(backend).await;
+
+        while let Some((inst_id, cmd)) = inst2server_rx.recv().await {
+
+
+            match cmd {
+                Command::CreateInstance { id } => {
+
+                    controller.create_instance(inst_id).await;
+
+                }
+                Command::DestroyInstance { .. } => {}
+                Command::SendToOrigin { .. } => {}
+                Command::BroadcastToPeers { .. } => {}
+                Command::Subscribe { .. } => {}
+                Command::AllocateBlocks { .. } => {}
+                Command::DeallocateBlocks { .. } => {}
+                Command::FillBlocks { .. } => {}
+                Command::ExportBlocks { .. } => {}
+                Command::ImportBlocks { .. } => {}
+                Command::CopyBlock { .. } => {}
+                Command::MaskBlock { .. } => {}
+                Command::AllocateEmb { .. } => {}
+                Command::DeallocateEmb { .. } => {}
+                Command::EmbedText { .. } => {}
+                Command::EmbedImage { .. } => {}
+                Command::AllocateDist { .. } => {}
+                Command::DeallocateDist { .. } => {}
+                Command::DecodeTokenDist { .. } => {}
+                Command::SampleTopK { .. } => {}
+                Command::GetTokenDist { .. } => {}
+            }
+
+
             let InstanceMessageOld {
                 instance_id,
                 dest_id,

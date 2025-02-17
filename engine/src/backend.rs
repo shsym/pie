@@ -1,11 +1,10 @@
-use crate::backend;
 use crate::controller::{ControllerError, EventHandle, IrEvent, Namespace};
 use crate::utils::IdPool;
 use prost::Message;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::mem;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
@@ -15,6 +14,8 @@ pub mod sdi {
 
 use prost::DecodeError;
 use thiserror::Error;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug, Error)]
 pub enum BackendError {
@@ -31,76 +32,17 @@ pub enum BackendError {
     CorrelationIdNotFound(u32),
 }
 
-pub trait ExecuteCommand {
-    async fn exec(
-        &self,
-        cmd: sdi::request::Command,
-        resp: Option<oneshot::Sender<sdi::response::Payload>>,
-    ) -> Result<(), BackendError>;
+pub trait ExecuteCommand: Debug + Send + Sync +'static {
+    async fn exec(&self, cmd: sdi::Request) -> Result<(), BackendError>;
+
+    fn report_to(&self, tx: mpsc::Sender<sdi::Response>);
 }
 
-struct BackendDriver {
-    event_dispatcher: EventDispatcher,
-    cmd_id_pool: IdPool<u32>,
-    //submitted: Vec<sdi::request::Command>,
-}
-
-impl BackendDriver {
-    fn new() -> Self {
-        Self {
-            event_dispatcher: EventDispatcher::new(),
-            cmd_id_pool: IdPool::new(u32::MAX),
-        }
-    }
-
-    fn outbound(
-        &mut self,
-        cmd: sdi::request::Command,
-        evt_handles: Vec<EventHandle>,
-    ) -> sdi::Request {
-        let correlation_id = self.cmd_id_pool.acquire().unwrap();
-
-        let request = sdi::Request {
-            correlation_id,
-            command: Some(cmd),
-        };
-
-        // if at least one sender is present, add it to the event dispatcher.
-        let has_event = evt_handles.iter().any(|s| s.is_some());
-        if has_event {
-            self.event_dispatcher
-                .table
-                .insert(correlation_id, evt_handles);
-        }
-
-        request
-    }
-
-    fn inbound(&mut self, resp: sdi::Response) {
-        // send this evt somewhere elese.
-
-        let correlation_id = resp.correlation_id;
-
-        let ir_events = match resp.payload.unwrap() {
-            sdi::response::Payload::SampleTopK(batch) => batch
-                .items
-                .into_iter()
-                .map(|item| IrEvent::SampleTopK(item))
-                .collect(),
-            sdi::response::Payload::GetTokenDistribution(batch) => batch
-                .items
-                .into_iter()
-                .map(|item| IrEvent::GetTokenDistribution(item))
-                .collect(),
-        };
-
-        self.event_dispatcher.dispatch(correlation_id, ir_events);
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Backend {
-    cmd_tx: mpsc::Sender<Vec<(sdi::request::Command, Vec<EventHandle>)>>,
+    cmd_tx: mpsc::Sender<sdi::Request>,
+    evt_tx: Arc<Mutex<Option<mpsc::Sender<sdi::Response>>>>, // no tokio mutex. Because it will be only mutated once.
     handle: Arc<JoinHandle<()>>,
 }
 
@@ -113,13 +55,15 @@ impl Backend {
 
         // create event dispatcher
 
-        let (tx, rx) = mpsc::channel::<Vec<(sdi::request::Command, Vec<EventHandle>)>>(1000);
+        let (tx, rx) = mpsc::channel::<sdi::Request>(1000);
+        let event_tx = Arc::new(Mutex::new(None));
 
         // 3) Spawn the single I/O driver task that handles all read/write from the socket
-        let handle = tokio::spawn(Self::backend_routine(socket, rx));
+        let handle = tokio::spawn(Self::backend_routine(socket, rx, event_tx.clone()));
 
         let backend = Backend {
             cmd_tx: tx,
+            evt_tx: event_tx,
             handle: Arc::new(handle),
         };
 
@@ -128,23 +72,20 @@ impl Backend {
 
     async fn backend_routine(
         mut socket: DealerSocket,
-        mut rx: mpsc::Receiver<Vec<(sdi::request::Command, Vec<EventHandle>)>>,
+        mut rx: mpsc::Receiver<sdi::Request>,
+        evt_tx: Arc<Mutex<Option<mpsc::Sender<sdi::Response>>>>,
     ) {
-        let mut driver = BackendDriver::new();
-
         loop {
             tokio::select! {
                 // A) Incoming requests from the channel => send to server
                 maybe_req = rx.recv() => {
                     match maybe_req {
-                        Some(cmds) => {
-                            for (cmd, evt) in cmds {
-                                let req = driver.outbound(cmd, evt);
-                                let bytes = req.encode_to_vec();
-                                if let Err(e) = socket.send(ZmqMessage::from(bytes)).await {
-                                    eprintln!("Socket send failed: {:?}", e);
-                                }
+                        Some(cmd) => {
+                            let bytes = cmd.encode_to_vec();
+                            if let Err(e) = socket.send(ZmqMessage::from(bytes)).await {
+                                eprintln!("Socket send failed: {:?}", e);
                             }
+
                         },
                         None => {
                             // channel closed => no more requests
@@ -161,7 +102,12 @@ impl Backend {
                             let payload = msg.get(0).unwrap();
                             match sdi::Response::decode(payload.as_ref()) {
                                 Ok(resp) => {
-                                    driver.inbound(resp);
+                                    let a = evt_tx.lock().unwrap();
+                                    if let Some(tx) = &*a {
+                                        let _ = tx.send(resp);
+                                    } else {
+                                        eprintln!("No event dispatcher found for response: {:?}", resp);
+                                    }
                                 }
                                 Err(err) => {
                                     eprintln!("Failed to parse Response from server: {:?}", err);
@@ -181,65 +127,16 @@ impl Backend {
 }
 
 impl ExecuteCommand for Backend {
-    async fn exec(
-        &self,
-        cmd: sdi::request::Command,
-        resp: Option<oneshot::Sender<sdi::response::Payload>>,
-    ) -> Result<(), BackendError> {
-        let evt = match resp {
-            Some(s) => vec![EventHandle::GetTokenDistribution(s)],
-            None => vec![EventHandle::None],
-        };
-
+    async fn exec(&self, cmd: sdi::Request) -> Result<(), BackendError> {
         self.cmd_tx
-            .send(vec![(cmd, evt)])
+            .send(cmd)
             .await
             .map_err(|_| BackendError::ChannelClosed)?;
 
         Ok(())
     }
-}
 
-#[derive(Debug)]
-struct EventDispatcher {
-    // maps correlation_id to a list of senders.
-    table: HashMap<u32, Vec<EventHandle>>,
-}
-
-impl EventDispatcher {
-    fn new() -> Self {
-        Self {
-            table: HashMap::new(),
-        }
-    }
-
-    fn register(&mut self, correlation_id: u32, sender: Vec<EventHandle>) {
-        self.table.insert(correlation_id, sender);
-    }
-
-    fn dispatch(&mut self, correlation_id: u32, event: Vec<IrEvent>) {
-        // zip senders and evnt
-        let senders = self.table.get_mut(&correlation_id).unwrap();
-        assert_eq!(senders.len(), event.len());
-
-        for (sender, evt) in senders.drain(..).zip(event.into_iter()) {
-            match sender {
-                EventHandle::None => {}
-                EventHandle::SampleTopK(s) => {
-                    if let IrEvent::SampleTopK(mut resp) = evt {
-                        let _ = s.send(mem::take(&mut resp.token_ids));
-                    } else {
-                        eprintln!("Unexpected event type");
-                    }
-                }
-                EventHandle::GetTokenDistribution(s) => {
-                    if let IrEvent::GetTokenDistribution(mut resp) = evt {
-                        let _ = s.send(mem::take(&mut resp.distribution));
-                    } else {
-                        eprintln!("Unexpected event type");
-                    }
-                }
-            }
-        }
+    fn report_to(&self, tx: Sender<sdi::Response>) {
+        self.evt_tx.lock().unwrap().replace(tx);
     }
 }

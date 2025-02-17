@@ -3,8 +3,8 @@ use wasmtime::component::{bindgen, ResourceTable};
 use wasmtime::Result;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
-use crate::{controller, lm, object};
 use crate::tokenizer::BytePairEncoder;
+use crate::{controller, lm, object};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -48,7 +48,16 @@ pub struct InstanceUtils {
 
 // implements send
 pub enum Command {
-    // Communication
+    // Init -------------------------------------
+    CreateInstance {
+        id: Id,
+    },
+
+    DestroyInstance {
+        id: Id,
+    },
+
+    // Communication -------------------------------------
     SendToOrigin {
         message: String,
     },
@@ -62,7 +71,7 @@ pub enum Command {
         topic: String,
     },
 
-    // Block commands
+    // Block commands -------------------------------------
     AllocateBlocks {
         stream: u32,
         blocks: Vec<object::Id<lm::KvBlock>>,
@@ -279,7 +288,9 @@ impl spi::lm::inference::Host for InstanceState {
         stream: u32,
         count: u32,
     ) -> Result<Vec<object::IdRepr>, wasmtime::Error> {
-        let embs = self.allocator.acquire_many::<lm::TokenEmb>(count as usize)?;
+        let embs = self
+            .allocator
+            .acquire_many::<lm::TokenEmb>(count as usize)?;
 
         let cmd = Command::AllocateEmb {
             stream,
@@ -308,7 +319,9 @@ impl spi::lm::inference::Host for InstanceState {
         stream: u32,
         count: u32,
     ) -> Result<Vec<object::IdRepr>, wasmtime::Error> {
-        let dists = self.allocator.acquire_many::<lm::TokenDist>(count as usize)?;
+        let dists = self
+            .allocator
+            .acquire_many::<lm::TokenDist>(count as usize)?;
 
         let cmd = Command::AllocateDist {
             stream,
