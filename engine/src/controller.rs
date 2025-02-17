@@ -52,36 +52,9 @@ enum IrCommand {
 
 // Hidden
 #[derive(Debug)]
-pub enum IrEvent {
+enum IrEvent {
     SampleTopK(backend::sdi::SampleTopKResponse),
     GetTokenDistribution(backend::sdi::GetTokenDistributionResponse),
-}
-
-#[derive(Debug)]
-pub struct Resource {
-    owner_id: InstanceId,
-    addrs: Vec<ObjectId<KvBlock>>,
-}
-
-impl Resource {
-    pub fn new(owner_id: InstanceId, addrs: Vec<ObjectId<KvBlock>>) -> Self {
-        Self { owner_id, addrs }
-    }
-}
-
-#[derive(Debug)]
-pub struct Instance {
-    owned_resources: Vec<String>,
-    //usage_stats: HashMap<String, usize>,
-}
-
-impl Instance {
-    pub fn new() -> Self {
-        Self {
-            owned_resources: vec![],
-            //usage_stats: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -139,6 +112,29 @@ where
             event_dispatcher: dispatcher,
             resp_handler,
         }
+    }
+
+    pub fn init_space(&mut self, space: VspaceId) -> Result<(), ObjectError> {
+        if self.obj_id_spaces.contains_key(&space) {
+            return Err(ObjectError::VSpaceAlreadyExists(space));
+        }
+
+        self.obj_id_spaces.insert(space, IdMap::new());
+        Ok(())
+    }
+
+    pub fn destroy_space(&mut self, space: &VspaceId) -> Result<(), ObjectError> {
+        // first, un-assign all the objects in the space
+        let kv_blocks: Vec<ObjectId<KvBlock>> = self.list(space)?;
+        let embs: Vec<ObjectId<TokenEmb>> = self.list(space)?;
+        let dists: Vec<ObjectId<TokenDist>> = self.list(space)?;
+
+        self.unassign_all(space, &kv_blocks)?;
+        self.unassign_all(space, &embs)?;
+        self.unassign_all(space, &dists)?;
+
+        self.obj_id_spaces.remove(space).unwrap();
+        Ok(())
     }
 
     pub fn enqueue_cmd(&mut self, stream: Stream, cmd: IrCommand) -> Result<(), ControllerError> {
@@ -719,24 +715,6 @@ where
             }
         }
 
-        Ok(())
-    }
-
-    fn open(&mut self, space: VspaceId) -> Result<(), ObjectError> {
-        if self.obj_id_spaces.contains_key(&space) {
-            return Err(ObjectError::VSpaceAlreadyExists(space));
-        }
-
-        self.obj_id_spaces.insert(space, IdMap::new());
-        Ok(())
-    }
-
-    fn close(&mut self, space: &VspaceId) -> Result<(), ObjectError> {
-        // first, un-assign all the objects in the space
-        let srcs: Vec<ObjectId<T>> = self.list(space)?;
-        self.unassign_all(space, &srcs)?;
-
-        self.obj_id_spaces.remove(space).unwrap();
         Ok(())
     }
 }

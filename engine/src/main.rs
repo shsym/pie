@@ -12,6 +12,7 @@ use anyhow::Context;
 use blake3::Hasher;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -34,7 +35,10 @@ use wasmtime_wasi::{WasiImpl, WasiView};
 // For MessagePack serialization/deserialization.
 use crate::backend::Backend;
 use crate::controller::Controller;
+use crate::lm::{CausalTransformer, KvBlock};
+use crate::object::{Allocator, IdMapper, VspaceId};
 use crate::tokenizer::{llama3_tokenizer, BytePairEncoder};
+use crate::utils::Stream;
 use rmp_serde::{decode::from_slice, encode::to_vec_named};
 use serde::{Deserialize, Serialize};
 
@@ -96,7 +100,8 @@ struct ClientHandle {
 struct InstanceHandle {
     client_id: ClientId,
     hash: String,
-    server2inst: Sender<InstanceMessageOld>,
+    evt_from_origin: Sender<String>,
+    evt_from_peers: Sender<(String, String)>,
     join_handle: JoinHandle<()>,
 }
 
@@ -167,9 +172,166 @@ enum ServerMessage {
     Error { error: String },
 }
 
+#[derive(Debug)]
+pub struct ExportedBlocks {
+    owner_id: InstanceId,
+    addrs: Vec<crate::object::Id<KvBlock>>,
+}
+
+impl ExportedBlocks {
+    pub fn new(owner_id: InstanceId, addrs: Vec<crate::object::Id<KvBlock>>) -> Self {
+        Self { owner_id, addrs }
+    }
+}
+
 // ---------------------------
 // Main
 // ---------------------------
+// Global, synchronous controller loop
+async fn control_loop(
+    backend: Backend,
+    mut inst2server_rx: Receiver<(InstanceId, Command)>,
+    state: Arc<ServerState>,
+) {
+    let mut controller = Controller::new(backend).await;
+
+    // Object virtual address space
+    let mut vspaces = HashMap::<InstanceId, VspaceId>::new();
+    let mut vspace_id_pool = utils::IdPool::new(VspaceId::MAX);
+
+    // Event subscriptions
+    let mut subscriptions = HashMap::<String, Vec<InstanceId>>::new();
+
+    // inter-instance shared resources
+    let mut exported_blocks = HashMap::<String, ExportedBlocks>::new();
+
+    // ANY CPU-HEAVY WORKS SHOULD BE AVOIDED HERE!!! NO BLOCKING NO ASYNC AWAITS.
+    while let Some((inst_id, cmd)) = inst2server_rx.recv().await {
+        match cmd {
+            Command::CreateInstance => {
+                let vspace_id = vspace_id_pool.acquire().unwrap();
+                vspaces.insert(inst_id, vspace_id);
+                controller.init_space(vspace_id).unwrap();
+            }
+            Command::DestroyInstance => {
+                let vspace_id = vspaces.remove(&inst_id).unwrap();
+                vspace_id_pool.release(vspace_id).unwrap();
+                controller.destroy_space(&vspace_id).unwrap();
+
+                // remove all subscriptions
+                for (_, subs) in subscriptions.iter_mut() {
+                    subs.retain(|&x| x != inst_id);
+                }
+            }
+            Command::SendToOrigin { message } => {
+                let inst = state.running_instances.get(&inst_id).unwrap();
+                let client = state.clients.get(&inst.client_id).unwrap();
+
+                let server_msg = ServerMessage::ProgramEvent {
+                    instance_id: inst_id.to_string(),
+                    event_data: message,
+                };
+
+                client.server2client.send(server_msg).await.unwrap();
+            }
+            Command::BroadcastToPeers { topic, message } => {
+                if let Some(subscribers) = subscriptions.get(&topic) {
+                    for sub in subscribers {
+                        let inst = state.running_instances.get(&sub).unwrap();
+                        inst.evt_from_peers
+                            .send((topic.clone(), message.clone()))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            Command::Subscribe { topic } => {
+                let subs = subscriptions.entry(topic).or_insert_with(Vec::new);
+                subs.push(inst_id);
+            }
+            Command::Unsubscribe { topic } => {
+                if let Some(subs) = subscriptions.get_mut(&topic) {
+                    subs.retain(|&x| x != inst_id);
+                }
+            }
+            Command::AllocateBlocks { stream, blocks } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+                let space = vspaces.get(&inst_id).unwrap();
+
+                let ids = controller
+                    .alloc_all(stream, blocks.len())
+                    .expect("Failed to allocate blocks");
+                controller
+                    .assign_all(space, &blocks, &ids)
+                    .expect("Failed to assign blocks");
+            }
+            Command::DeallocateBlocks { stream, blocks } => {
+                let space = vspaces.get(&inst_id).unwrap();
+                controller
+                    .unassign_all(space, &blocks)
+                    .expect("Failed to unassign blocks");
+            }
+            Command::FillBlock {
+                stream,
+                block,
+                context,
+                inputs,
+                outputs,
+            } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+                let space = *vspaces.get(&inst_id).unwrap();
+
+                controller
+                    .fill(stream, &space, block, context, inputs, outputs)
+                    .expect("Failed to fill blocks");
+            }
+            Command::ExportBlocks { .. } => {}
+            Command::ImportBlocks { .. } => {}
+            Command::CopyBlock { .. } => {}
+            Command::MaskBlock { .. } => {}
+            Command::AllocateEmb { .. } => {}
+            Command::DeallocateEmb { .. } => {}
+            Command::EmbedText { .. } => {}
+            Command::EmbedImage { .. } => {}
+            Command::AllocateDist { .. } => {}
+            Command::DeallocateDist { .. } => {}
+            Command::DecodeTokenDist { .. } => {}
+            Command::SampleTopK { .. } => {}
+            Command::GetTokenDist { .. } => {}
+        }
+
+        let InstanceMessageOld {
+            instance_id,
+            dest_id,
+            message,
+        } = instance_msg;
+
+        // get handle
+        let instance_handle = state_.running_instances.get(&instance_id).unwrap();
+        let client_id = instance_handle.client_id;
+
+        // dest_id = 0: to symphony server.
+        // dest_id = 1: to client.
+        // dest_id = 2: to LLM server.
+        // dest_id > 4: to other instances.
+
+        // Construct a ProgramEvent message for the client
+        if dest_id == 1 {
+            // (Just parse or wrap the `message` into JSON)
+
+            let server_msg = ServerMessage::ProgramEvent {
+                instance_id: instance_id.to_string(),
+                event_data: message,
+            };
+
+            // get client handle
+            let client_handle = state_.clients.get(&client_id).unwrap();
+            client_handle.server2client.send(server_msg).await.unwrap();
+        } else {
+            // Currently do nothing for other channels,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -216,76 +378,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to bind backend")?;
 
-    tokio::spawn(async move {
-        // Global controller loop
-        let mut controller = Controller::new(backend).await;
-
-        while let Some((inst_id, cmd)) = inst2server_rx.recv().await {
-
-
-            match cmd {
-                Command::CreateInstance { id } => {
-
-                    controller.create_instance(inst_id).await;
-
-                }
-                Command::DestroyInstance { .. } => {}
-                Command::SendToOrigin { .. } => {}
-                Command::BroadcastToPeers { .. } => {}
-                Command::Subscribe { .. } => {}
-                Command::AllocateBlocks { .. } => {}
-                Command::DeallocateBlocks { .. } => {}
-                Command::FillBlocks { .. } => {}
-                Command::ExportBlocks { .. } => {}
-                Command::ImportBlocks { .. } => {}
-                Command::CopyBlock { .. } => {}
-                Command::MaskBlock { .. } => {}
-                Command::AllocateEmb { .. } => {}
-                Command::DeallocateEmb { .. } => {}
-                Command::EmbedText { .. } => {}
-                Command::EmbedImage { .. } => {}
-                Command::AllocateDist { .. } => {}
-                Command::DeallocateDist { .. } => {}
-                Command::DecodeTokenDist { .. } => {}
-                Command::SampleTopK { .. } => {}
-                Command::GetTokenDist { .. } => {}
-            }
-
-
-            let InstanceMessageOld {
-                instance_id,
-                dest_id,
-                message,
-            } = instance_msg;
-
-            // get handle
-            let instance_handle = state_.running_instances.get(&instance_id).unwrap();
-            let client_id = instance_handle.client_id;
-
-            // dest_id = 0: to symphony server.
-            // dest_id = 1: to client.
-            // dest_id = 2: to LLM server.
-            // dest_id > 4: to other instances.
-
-            // Construct a ProgramEvent message for the client
-            if dest_id == 1 {
-                // (Just parse or wrap the `message` into JSON)
-
-                let server_msg = ServerMessage::ProgramEvent {
-                    instance_id: instance_id.to_string(),
-                    event_data: message,
-                };
-
-                // get client handle
-                let client_handle = state_.clients.get(&client_id).unwrap();
-                client_handle.server2client.send(server_msg).await.unwrap();
-            } else {
-                // Currently do nothing for other channels,
-            }
-        }
-
-        // This is the end of the global loop
-    });
+    let controller_handle = tokio::spawn(control_loop(backend, inst2server_rx));
 
     // Accept incoming connections
     loop {

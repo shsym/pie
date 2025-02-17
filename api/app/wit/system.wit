@@ -10,4 +10,5 @@ interface system {
     receive-from-peers: func() -> tuple<string, string>;
 
     subscribe: func(topic:string);
+    unsubscribe: func(topic:string);
 }

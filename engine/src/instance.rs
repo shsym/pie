@@ -49,13 +49,9 @@ pub struct InstanceUtils {
 // implements send
 pub enum Command {
     // Init -------------------------------------
-    CreateInstance {
-        id: Id,
-    },
+    CreateInstance,
 
-    DestroyInstance {
-        id: Id,
-    },
+    DestroyInstance,
 
     // Communication -------------------------------------
     SendToOrigin {
@@ -71,6 +67,10 @@ pub enum Command {
         topic: String,
     },
 
+    Unsubscribe {
+        topic: String,
+    },
+
     // Block commands -------------------------------------
     AllocateBlocks {
         stream: u32,
@@ -82,9 +82,9 @@ pub enum Command {
         blocks: Vec<object::Id<lm::KvBlock>>,
     },
 
-    FillBlocks {
+    FillBlock {
         stream: u32,
-        blocks: Vec<object::Id<lm::KvBlock>>,
+        block: object::Id<lm::KvBlock>,
         context: Vec<object::Id<lm::KvBlock>>,
         inputs: Vec<object::Id<lm::TokenEmb>>,
         outputs: Vec<object::Id<lm::TokenEmb>>,
@@ -355,7 +355,7 @@ impl spi::lm::inference::Host for InstanceState {
         inputs: Vec<object::IdRepr>,
         outputs: Vec<object::IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        let cmd = Command::FillBlocks {
+        let cmd = Command::FillBlock {
             stream,
             blocks: object::Id::map_from_repr(blocks),
             context: object::Id::map_from_repr(context),

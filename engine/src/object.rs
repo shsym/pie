@@ -229,10 +229,10 @@ pub trait IdMapper<T>: Allocator<T> {
     }
 
     fn unassign_all(&mut self, vspace_id: &VspaceId, srcs: &[Id<T>]) -> Result<(), ObjectError>;
-
-    fn open(&mut self, space: VspaceId) -> Result<(), ObjectError>;
-
-    fn close(&mut self, space: &VspaceId) -> Result<(), ObjectError>;
+    // 
+    // fn open(&mut self, space: VspaceId) -> Result<(), ObjectError>;
+    // 
+    // fn close(&mut self, space: &VspaceId) -> Result<(), ObjectError>;
 
     // fn alloc(
     //     &mut self,
