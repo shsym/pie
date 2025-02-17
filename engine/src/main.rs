@@ -1,14 +1,13 @@
+mod backend;
 mod controller;
-mod cmd_buffer;
 mod instance;
 mod lm;
+mod object;
 mod tokenizer;
 mod utils;
-mod object;
-mod backend;
 //mod state_old;
 
-use crate::instance::{App, InstanceMessageOld, InstanceState, InstanceUtils};
+use crate::instance::{App, InstanceState, InstanceUtils};
 use anyhow::Context;
 use blake3::Hasher;
 use dashmap::DashMap;
@@ -33,7 +32,6 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiImpl, WasiView};
 
 // For MessagePack serialization/deserialization.
-use crate::handler::Controller;
 use crate::tokenizer::{llama3_tokenizer, BytePairEncoder};
 use rmp_serde::{decode::from_slice, encode::to_vec_named};
 use serde::{Deserialize, Serialize};

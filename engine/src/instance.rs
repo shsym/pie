@@ -3,9 +3,7 @@ use wasmtime::component::{bindgen, ResourceTable};
 use wasmtime::Result;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
-use crate::lm::InstanceId;
-use crate::object;
-use crate::object::{KvBlock, TokenDist, TokenEmb};
+use crate::{controller, lm, object};
 use crate::tokenizer::BytePairEncoder;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
@@ -26,18 +24,20 @@ bindgen!({
     trappable_imports: true,
 });
 
+pub type Id = Uuid;
+
 pub struct InstanceState {
-    id: InstanceId,
+    id: Id,
 
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
 
-    cmd_buffer: Sender<(InstanceId, Command)>,
+    cmd_buffer: Sender<(Id, Command)>,
 
     evt_from_origin: Receiver<String>,
     evt_from_peers: Receiver<(String, String)>,
 
-    allocator: object::IdPool,
+    allocator: controller::IdPool,
 
     utils: InstanceUtils,
 }
@@ -65,36 +65,36 @@ pub enum Command {
     // Block commands
     AllocateBlocks {
         stream: u32,
-        blocks: Vec<object::Id<KvBlock>>,
+        blocks: Vec<object::Id<lm::KvBlock>>,
     },
 
     DeallocateBlocks {
         stream: u32,
-        blocks: Vec<object::Id<KvBlock>>,
+        blocks: Vec<object::Id<lm::KvBlock>>,
     },
 
     FillBlocks {
         stream: u32,
-        blocks: Vec<object::Id<KvBlock>>,
-        context: Vec<object::Id<KvBlock>>,
-        inputs: Vec<object::Id<TokenEmb>>,
-        outputs: Vec<object::Id<TokenEmb>>,
+        blocks: Vec<object::Id<lm::KvBlock>>,
+        context: Vec<object::Id<lm::KvBlock>>,
+        inputs: Vec<object::Id<lm::TokenEmb>>,
+        outputs: Vec<object::Id<lm::TokenEmb>>,
     },
 
     ExportBlocks {
-        blocks: Vec<object::Id<KvBlock>>,
+        blocks: Vec<object::Id<lm::KvBlock>>,
         resource_name: String,
     },
 
     ImportBlocks {
-        blocks: Vec<object::Id<KvBlock>>,
+        blocks: Vec<object::Id<lm::KvBlock>>,
         resource_name: String,
     },
 
     CopyBlock {
         stream: u32,
-        src_block: object::Id<KvBlock>,
-        dst_block: object::Id<KvBlock>,
+        src_block: object::Id<lm::KvBlock>,
+        dst_block: object::Id<lm::KvBlock>,
         src_token_offset: u32,
         dst_token_offset: u32,
         size: u32,
@@ -102,60 +102,60 @@ pub enum Command {
 
     MaskBlock {
         stream: u32,
-        block: object::Id<KvBlock>,
+        block: object::Id<lm::KvBlock>,
         mask: Vec<bool>,
     },
 
     // Embed ctrl
     AllocateEmb {
         stream: u32,
-        embs: Vec<object::Id<TokenEmb>>,
+        embs: Vec<object::Id<lm::TokenEmb>>,
     },
 
     DeallocateEmb {
         stream: u32,
-        embs: Vec<object::Id<TokenEmb>>,
+        embs: Vec<object::Id<lm::TokenEmb>>,
     },
 
     EmbedText {
         stream: u32,
-        embs: Vec<object::Id<TokenEmb>>,
+        embs: Vec<object::Id<lm::TokenEmb>>,
         text: Vec<u32>,
     },
 
     EmbedImage {
         stream: u32,
-        embs: Vec<object::Id<TokenEmb>>,
+        embs: Vec<object::Id<lm::TokenEmb>>,
         image: String,
     },
 
     // Output emb ctrl
     AllocateDist {
         stream: u32,
-        dists: Vec<object::Id<TokenDist>>,
+        dists: Vec<object::Id<lm::TokenDist>>,
     },
 
     DeallocateDist {
         stream: u32,
-        dists: Vec<object::Id<TokenDist>>,
+        dists: Vec<object::Id<lm::TokenDist>>,
     },
 
     DecodeTokenDist {
         stream: u32,
-        embs: Vec<object::Id<TokenEmb>>,
-        dists: Vec<object::Id<TokenDist>>,
+        embs: Vec<object::Id<lm::TokenEmb>>,
+        dists: Vec<object::Id<lm::TokenDist>>,
     },
 
     SampleTopK {
         stream: u32,
-        emb: object::Id<TokenEmb>,
+        emb: object::Id<lm::TokenEmb>,
         k: u32,
         handle: oneshot::Sender<Vec<u32>>,
     },
 
     GetTokenDist {
         stream: u32,
-        dist: object::Id<TokenDist>,
+        dist: object::Id<lm::TokenDist>,
         handle: oneshot::Sender<Vec<f32>>,
     },
 }
@@ -172,7 +172,7 @@ impl WasiView for InstanceState {
 impl InstanceState {
     pub fn new(
         id: Uuid,
-        cmd_buffer: Sender<(InstanceId, Command)>,
+        cmd_buffer: Sender<(Id, Command)>,
         evt_from_origin: Receiver<String>,
         evt_from_peers: Receiver<(String, String)>,
         utils: InstanceUtils,
@@ -187,7 +187,7 @@ impl InstanceState {
             cmd_buffer,
             evt_from_origin,
             evt_from_peers,
-            allocator: object::IdPool::new(1000, 1000),
+            allocator: controller::IdPool::new(1000, 1000),
             utils,
         }
     }
@@ -279,7 +279,7 @@ impl spi::lm::inference::Host for InstanceState {
         stream: u32,
         count: u32,
     ) -> Result<Vec<object::IdRepr>, wasmtime::Error> {
-        let embs = self.allocator.acquire_many::<TokenEmb>(count as usize)?;
+        let embs = self.allocator.acquire_many::<lm::TokenEmb>(count as usize)?;
 
         let cmd = Command::AllocateEmb {
             stream,
@@ -295,7 +295,7 @@ impl spi::lm::inference::Host for InstanceState {
         stream: u32,
         ids: Vec<object::IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        let embs = object::Id::<TokenEmb>::map_from_repr(ids);
+        let embs = object::Id::<lm::TokenEmb>::map_from_repr(ids);
         self.allocator.release_many(&embs)?;
 
         let cmd = Command::DeallocateEmb { stream, embs };
@@ -308,7 +308,7 @@ impl spi::lm::inference::Host for InstanceState {
         stream: u32,
         count: u32,
     ) -> Result<Vec<object::IdRepr>, wasmtime::Error> {
-        let dists = self.allocator.acquire_many::<TokenDist>(count as usize)?;
+        let dists = self.allocator.acquire_many::<lm::TokenDist>(count as usize)?;
 
         let cmd = Command::AllocateDist {
             stream,
@@ -324,7 +324,7 @@ impl spi::lm::inference::Host for InstanceState {
         stream: u32,
         ids: Vec<object::IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        let dists = object::Id::<TokenDist>::map_from_repr(ids);
+        let dists = object::Id::<lm::TokenDist>::map_from_repr(ids);
         self.allocator.release_many(&dists)?;
 
         let cmd = Command::DeallocateDist { stream, dists };

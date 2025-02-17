@@ -194,10 +194,10 @@ message BatchGetTokenDistributionResponse {
 // -----------------------------------------------------------------------------
 
 
-message Command {
+message Request {
   uint32 correlation_id = 1;
 
-  oneof payload {
+  oneof command {
     BatchAllocate allocate = 2;
     BatchDeallocate deallocate = 3;
     BatchEmbedText embed_text = 4;
@@ -212,7 +212,7 @@ message Command {
 }
 
 
-message Event {
+message Response {
   uint32 correlation_id = 1;
 
   oneof payload {

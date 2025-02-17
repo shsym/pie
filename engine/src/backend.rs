@@ -3,10 +3,10 @@ use std::mem;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use zeromq::{DealerSocket, ZmqError};
-use crate::controller::ControllerError;
+use zeromq::{DealerSocket, Socket, ZmqError, ZmqMessage};
+use crate::controller::{ControllerError, EventHandle, Namespace};
 use prost::Message;
-
+use crate::backend;
 
 pub mod sdi {
     include!(concat!(env!("OUT_DIR"), "/sdi.rs"));
@@ -14,10 +14,12 @@ pub mod sdi {
 
 
 pub struct Backend {
-    staged: Arc<Mutex<Vec<sdi::Command>>>,
-    submitted: Arc<Mutex<Vec<sdi::Command>>>,
+    
+    cmd_tx: mpsc::Sender<Vec<(sdi::request::Command, Vec<EventHandle>)>>,
+    
+    staged: Arc<Mutex<Vec<sdi::Request>>>,
+    submitted: Arc<Mutex<Vec<sdi::Request>>>,
     // queue, cmd_buffer, scheduled, submitted
-    socket_tx: Arc<Mutex<Option<mpsc::Sender<Vec<sdi::Command>>>>>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     // zmq handles
 
@@ -36,9 +38,45 @@ impl Backend {
         
         
         
-        ///
     }
 
+    pub fn submit(&self, cmd: sdi::Request) -> Result<(), ControllerError> {
+        // Lock and take the staged commands.
+        let mut staged = self.staged.lock().map_err(|_| ControllerError::LockError)?;
+
+        // Push the command into the staged commands.
+        staged.push(cmd);
+
+        // add the commands to the staged queue
+        let mut staged = Vec::new();
+
+        // Add the batched commands to the staged queue.
+        for (payload, evt_handles) in batched_payloads {
+            let correlation_id = self.acquire_id(Namespace::Cmd)?;
+
+            staged.push(backend::sdi::Command {
+                correlation_id,
+                payload: Some(payload),
+            });
+
+            // if at least one sender is present, add it to the event dispatcher.
+            let has_event = evt_handles.iter().any(|s| s.is_some());
+            if has_event {
+                let mut dispatcher = self
+                    .event_dispatcher
+                    .lock()
+                    .map_err(|_| ControllerError::LockError)?;
+                dispatcher.table.insert(correlation_id, evt_handles);
+            }
+        }
+        
+        
+        Ok(())
+        
+        
+    }
+    
+    
     pub async fn commit(&self) -> Result<(), ControllerError> {
         // Lock and take the staged commands.
         let mut staged = self.staged.lock().map_err(|_| ControllerError::LockError)?;
@@ -64,7 +102,7 @@ impl Backend {
         socket.connect(endpoint).await?;
         println!("Connected to server at {endpoint}");
 
-        let (tx, rx) = mpsc::channel::<Vec<crate::controller::sdi::Command>>(100);
+        let (tx, rx) = mpsc::channel::<Vec<(sdi::request::Command, Vec<EventHandle>)>>(1000);
 
         self.socket_tx = Arc::new(Mutex::new(Some(tx)));
 
@@ -82,7 +120,7 @@ impl Backend {
 
     async fn socket_driver(
         mut socket: DealerSocket,
-        mut rx: mpsc::Receiver<Vec<crate::controller::sdi::Command>>,
+        mut rx: mpsc::Receiver<Vec<sdi::Command>>,
         evt_dispatch: Arc<Mutex<EventDispatcher>>,
     ) {
         loop {

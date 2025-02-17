@@ -1,6 +1,5 @@
+use crate::object;
 use crate::utils::Stream;
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -161,19 +160,30 @@ impl<T> Into<IdRepr> for &Id<T> {
 
 pub trait Allocator<T> {
     fn alloc(&mut self, stream: Stream) -> Result<Id<T>, ObjectError> {
-        self.alloc_many(stream, 1)
-            .map(|mut ids| ids.pop().unwrap())
+        self.alloc_all(stream, 1).map(|mut ids| ids.pop().unwrap())
     }
 
-    fn alloc_many(&mut self, stream: Stream, count:usize) -> Result<Vec<Id<T>>, ObjectError>;
+    fn alloc_all(&mut self, stream: Stream, count: usize) -> Result<Vec<Id<T>>, ObjectError>;
 
-    fn dealloc(&mut self, stream: Stream, id: Id<T>) -> Result<(), ObjectError> {
-        self.dealloc_many(stream, &[id])
+    fn dealloc(&mut self, stream: Stream, id: &Id<T>) -> Result<(), ObjectError> {
+        self.dealloc_all(stream, slice::from_ref(id))
     }
 
-    fn dealloc_many(&mut self, stream: Stream, ids: &[Id<T>]) -> Result<(), ObjectError>;
+    fn dealloc_all(&mut self, stream: Stream, ids: &[Id<T>]) -> Result<(), ObjectError>;
 
     fn available(&self) -> usize;
+
+    // /// Increments the reference count.
+    fn increment_ref_count(&mut self, id: &Id<T>) -> Result<(), ObjectError>;
+
+    // Decrements the reference count.
+    //
+    // Returns `true` if the count has reached zero, indicating that the object
+    // can be safely cleaned up.
+    fn decrement_ref_count(&mut self, id: &Id<T>) -> Result<bool, ObjectError>;
+
+    //Returns the current reference count.
+    fn ref_count(&self, id: &Id<T>) -> Result<usize, ObjectError>;
 }
 
 pub trait Fetcher<T>: Allocator<T> {
@@ -184,185 +194,147 @@ pub trait Fetcher<T>: Allocator<T> {
 
 pub type VspaceId = u32;
 
+// pub trait Vspace<T> {
+//     fn contains(&self, vid: &Id<T>) -> bool;
+//
+//     fn get(&self, vid: &Id<T>) -> Result<Id<T>, ObjectError>;
+//
+//     fn get_many(&self, vids: &[Id<T>]) -> Result<Vec<Id<T>>, ObjectError>;
+//
+//     fn insert(&mut self, vid: Id<T>, id: Id<T>);
+//
+//     fn remove(&mut self, vid: &Id<T>) -> Result<object::Id<T>, ObjectError>;
+//
+//     fn all_vids(&self) -> Vec<Id<T>>;
+// }
+
 // reference-counted object manager
-pub trait MappedAllocator<T>: Allocator<T> {
-    fn vspaces(&self) -> &HashMap<VspaceId, HashMap<Id<T>, Id<T>>>;
+pub trait IdMapper<T>: Allocator<T> {
+    fn exists(&self, space: &VspaceId, src: &Id<T>) -> bool;
+    fn list(&self, space: &VspaceId) -> Result<Vec<Id<T>>, ObjectError>;
 
-    fn vspaces_mut(&mut self) -> &mut HashMap<VspaceId, HashMap<Id<T>, Id<T>>>;
-
-    fn init_vspace(&mut self, vspace_id: VspaceId) -> Result<(), ObjectError> {
-        if self.vspaces().contains_key(&vspace_id) {
-            return Err(ObjectError::VSpaceAlreadyExists(vspace_id));
-        }
-
-        self.vspaces_mut().insert(vspace_id, HashMap::new());
-        Ok(())
+    fn lookup(&self, space: &VspaceId, src: &Id<T>) -> Result<Id<T>, ObjectError> {
+        self.lookup_all(space, slice::from_ref(src))
+            .map(|mut ids| ids.pop().unwrap())
     }
 
-    fn destroy_vspace(&mut self, vspace_id: &VspaceId) -> Result<(), ObjectError> {
-        let removed = self
-            .vspaces_mut()
-            .remove(vspace_id)
-            .ok_or(ObjectError::VSpaceNotFound)?;
+    fn lookup_all(&self, space: &VspaceId, srcs: &[Id<T>]) -> Result<Vec<Id<T>>, ObjectError>;
 
-        for addr in removed.keys() {
-            MappedAllocator::<T>::dealloc(self, Stream::default(), vspace_id, &addr)?;
-        }
-
-        Ok(())
+    fn assign(&mut self, space: &VspaceId, src: &Id<T>, tgt: &Id<T>) -> Result<(), ObjectError> {
+        self.assign_all(space, slice::from_ref(src), slice::from_ref(tgt))
     }
 
-    /// Increments the reference count.
-    fn ref_inc(&mut self, id: &Id<T>) -> Result<(), ObjectError>;
-
-    /// Decrements the reference count.
-    ///
-    /// Returns `true` if the count has reached zero, indicating that the object
-    /// can be safely cleaned up.
-    fn ref_dec(&mut self, id: &Id<T>) -> Result<bool, ObjectError>;
-
-    /// Returns the current reference count.
-    fn ref_count(&self, id: &Id<T>) -> Result<usize, ObjectError>;
-
-    fn alloc(
+    fn assign_all(
         &mut self,
-        stream: Stream,
-        obj: T,
-        vspace_id: &VspaceId,
-        vid: Id<T>,
-    ) -> Result<(), ObjectError> {
-        MappedAllocator::alloc_many(self, stream, vec![obj], vspace_id, vec![vid])
+        space: &VspaceId,
+        srcs: &[Id<T>],
+        tgts: &[Id<T>],
+    ) -> Result<(), ObjectError>;
+
+    fn unassign(&mut self, vspace_id: &VspaceId, src: &Id<T>) -> Result<(), ObjectError> {
+        self.unassign_all(vspace_id, slice::from_ref(src))
     }
 
-    fn alloc_many(
-        &mut self,
-        stream: Stream,
-        objs: Vec<T>,
-        vspace_id: &VspaceId,
-        vids: Vec<Id<T>>,
-    ) -> Result<(), ObjectError> {
-        objs.iter().for_each(|obj| obj.add_ref());
+    fn unassign_all(&mut self, vspace_id: &VspaceId, srcs: &[Id<T>]) -> Result<(), ObjectError>;
 
-        let ids = Allocator::alloc_many(self, stream, objs)?;
+    fn open(&mut self, space: VspaceId) -> Result<(), ObjectError>;
 
-        // Retrieve a mutable reference to the vspace, converting a missing vspace into an InstanceNotFound error.
-        let vspace = self
-            .vspaces_mut()
-            .get_mut(vspace_id)
-            .ok_or(ObjectError::VSpaceNotFound)?;
+    fn close(&mut self, space: &VspaceId) -> Result<(), ObjectError>;
 
-        for (vid, id) in vids.into_iter().zip(ids.into_iter()) {
-            match vspace.entry(vid) {
-                Entry::Vacant(entry) => {
-                    entry.insert(id);
-                }
-                Entry::Occupied(_) => {
-                    return Err(ObjectError::VSpaceAlreadyExists(vid.into()));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn dealloc(
-        &mut self,
-        stream: Stream,
-        vspace_id: &VspaceId,
-        vid: &Id<T>,
-    ) -> Result<(), ObjectError> {
-        MappedAllocator::dealloc_many(self, stream, vspace_id, slice::from_ref(vid))
-    }
-
-    fn dealloc_many(
-        &mut self,
-        stream: Stream,
-        vspace_id: &VspaceId,
-        vids: &[Id<T>],
-    ) -> Result<(), ObjectError> {
-        // Borrow the vspace mutably and remove all vids,
-        // collecting their corresponding global addresses.
-        let vspace = self
-            .vspaces_mut()
-            .get_mut(vspace_id)
-            .ok_or(ObjectError::VSpaceNotFound)?;
-
-        let mut ids = Vec::with_capacity(vids.len());
-        for vid in vids {
-            let id = vspace
-                .remove(vid)
-                .ok_or(ObjectError::VSpaceTranslationFailed(vid.0))?;
-            ids.push(id);
-        }
-        // The mutable borrow on vspace is dropped here.
-
-        // Now iterate over the collected ids to release and possibly deallocate.
-        for id in ids {
-            let remove_entirely = self.ref_dec(&id)?;
-
-            if remove_entirely {
-                Allocator::dealloc(self, stream, id).map_err(|e| {
-                    ObjectError::BackendError(format!(
-                        "Failed to deallocate object in Allocator: {}",
-                        e
-                    ))
-                })?;
-            }
-        }
-
-        Ok(())
-    }
-    fn create_ref(
-        &mut self,
-        src_vspace_id: &VspaceId,
-        src_vid: &Id<T>,
-        dst_vspace_id: &VspaceId,
-        dst_vid: &Id<T>,
-    ) -> Result<(), ObjectError> {
-        let src_id = self.resolve(src_vspace_id, src_vid)?;
-
-        // increase ref count
-        self.ref_inc(&src_id)?;
-
-        let dst_vspace = self
-            .vspaces_mut()
-            .get_mut(dst_vspace_id)
-            .ok_or(ObjectError::VSpaceNotFound)?;
-
-        match dst_vspace.entry(*dst_vid) {
-            Entry::Vacant(entry) => {
-                entry.insert(src_id);
-                Ok(())
-            }
-            Entry::Occupied(_) => Err(ObjectError::VSpaceAlreadyExists(dst_vid.0)),
-        }
-    }
-
-    fn resolve(&self, vspace_id: &VspaceId, vid: &Id<T>) -> Result<Id<T>, ObjectError> {
-        self.vspaces()
-            .get(&vspace_id)
-            .ok_or(ObjectError::VSpaceNotFound)?
-            .get(vid)
-            .copied()
-            .ok_or(ObjectError::VSpaceTranslationFailed(vid.0))
-    }
-
-    fn resolve_many(
-        &self,
-        vspace_id: &VspaceId,
-        vids: &[Id<T>],
-    ) -> Result<Vec<Id<T>>, ObjectError> {
-        let vspace = self
-            .vspaces()
-            .get(vspace_id)
-            .ok_or(ObjectError::VSpaceNotFound)?;
-
-        vids.iter()
-            .map(|&vid| {
-                vspace
-                    .get(&vid)
-                    .copied()
-                    .ok_or(ObjectError::VSpaceTranslationFailed(vid.into()))
-            })
-            .collect()
-    }
+    // fn alloc(
+    //     &mut self,
+    //     stream: Stream,
+    //     vspace_id: &VspaceId,
+    //     vid: Id<T>,
+    // ) -> Result<(), ObjectError> {
+    //     MappedAllocator::alloc_many(self, stream, vspace_id, vec![vid])
+    // }
+    //
+    // fn alloc_many(
+    //     &mut self,
+    //     stream: Stream,
+    //     vspace_id: &VspaceId,
+    //     vids: Vec<Id<T>>,
+    // ) -> Result<(), ObjectError> {
+    //     //objs.iter().for_each(|obj| obj.add_ref());
+    //
+    //     let ids = Allocator::alloc_many(self, stream, vids.len())?;
+    //
+    //     // Retrieve a mutable reference to the vspace, converting a missing vspace into an InstanceNotFound error.
+    //     let vspace = self.vspaces_mut(vspace_id)?;
+    //
+    //     for (vid, id) in vids.into_iter().zip(ids.into_iter()) {
+    //         if vspace.contains(&vid) {
+    //             return Err(ObjectError::VSpaceAlreadyExists(vid.into()));
+    //         }
+    //
+    //         vspace.insert(vid, id);
+    //     }
+    //     Ok(())
+    // }
+    //
+    // fn dealloc(
+    //     &mut self,
+    //     stream: Stream,
+    //     vspace_id: &VspaceId,
+    //     vid: &Id<T>,
+    // ) -> Result<(), ObjectError> {
+    //     MappedAllocator::dealloc_many(self, stream, vspace_id, slice::from_ref(vid))
+    // }
+    //
+    // fn dealloc_many(
+    //     &mut self,
+    //     stream: Stream,
+    //     vspace_id: &VspaceId,
+    //     vids: &[Id<T>],
+    // ) -> Result<(), ObjectError> {
+    //     // Borrow the vspace mutably and remove all vids,
+    //     // collecting their corresponding global addresses.
+    //     let vspace = self.vspaces_mut(vspace_id)?;
+    //
+    //     let mut ids = Vec::with_capacity(vids.len());
+    //     for vid in vids {
+    //         let id = vspace.remove(vid)?;
+    //         ids.push(id);
+    //     }
+    //     // The mutable borrow on vspace is dropped here.
+    //
+    //     // Now iterate over the collected ids to release and possibly deallocate.
+    //     for id in ids {
+    //         let remove_entirely = self.ref_dec(&id)?;
+    //
+    //         if remove_entirely {
+    //             Allocator::dealloc(self, stream, id).map_err(|e| {
+    //                 ObjectError::BackendError(format!(
+    //                     "Failed to deallocate object in Allocator: {}",
+    //                     e
+    //                 ))
+    //             })?;
+    //         }
+    //     }
+    //
+    //     Ok(())
+    // }
+    // fn create_ref(
+    //     &mut self,
+    //     src_vspace_id: &VspaceId,
+    //     src_vid: &Id<T>,
+    //     dst_vspace_id: &VspaceId,
+    //     dst_vid: &Id<T>,
+    // ) -> Result<(), ObjectError> {
+    //     let src_id = self.vspaces(src_vspace_id)?.get(src_vid)?;
+    //
+    //     // increase ref count
+    //     self.ref_inc(&src_id)?;
+    //
+    //     let dst_vspace = self.vspaces_mut(dst_vspace_id)?;
+    //
+    //     if dst_vspace.contains(dst_vid) {
+    //         return Err(ObjectError::VSpaceAlreadyExists(dst_vid.0));
+    //     }
+    //
+    //     dst_vspace.insert(*dst_vid, src_id);
+    //
+    //     Ok(())
+    // }
 }

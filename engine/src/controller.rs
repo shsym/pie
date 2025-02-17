@@ -1,17 +1,16 @@
 use crate::lm::{
-    CausalLanguageModel, CausalTransformer, ImageEmbedder, InstanceId, KvBlock, TokenDist, TokenEmb,
+    CausalLanguageModel, CausalTransformer, ImageEmbedder, KvBlock, TokenDist, TokenEmb,
 };
 use crate::utils::{Counter, Stream};
-use crate::{backend, object, utils};
+use crate::{backend, instance, object, utils};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::mem;
-use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
-use crate::object::{Id, ObjectError, VspaceId};
+use crate::instance::Id as InstanceId;
+use crate::object::{Allocator, Id as ObjectId, IdMapper, IdRepr, ObjectError, Vspace, VspaceId};
 use thiserror::Error;
 use tokio::task::JoinError;
 
@@ -66,11 +65,11 @@ enum IrEvent {
 #[derive(Debug)]
 pub struct Resource {
     owner_id: InstanceId,
-    addrs: Vec<object::Id<KvBlock>>,
+    addrs: Vec<ObjectId<KvBlock>>,
 }
 
 impl Resource {
-    pub fn new(owner_id: InstanceId, addrs: Vec<object::Id<KvBlock>>) -> Self {
+    pub fn new(owner_id: InstanceId, addrs: Vec<ObjectId<KvBlock>>) -> Self {
         Self { owner_id, addrs }
     }
 }
@@ -108,8 +107,6 @@ impl EventHandle {
 
 #[derive(Debug)]
 pub struct Controller<B> {
-    block_size: u32,
-
     cmd_buffer: Vec<(Stream, IrCommand, EventHandle)>,
     cmd_batcher: CommandBatcher,
     backend: B,
@@ -117,17 +114,16 @@ pub struct Controller<B> {
     // object allocations
     id_pool: IdPool,
     ref_counter: RefCounter,
-    vspaces: HashMap<object::VspaceId, IdMap>,
+    vspaces: HashMap<VspaceId, IdMap>,
 }
 
 impl<B> Controller<B> {
     pub fn new(backend: B) -> Self {
         Self {
-            block_size,
             cmd_buffer: Vec::new(),
             cmd_batcher: CommandBatcher::new(0.0, 1, 1),
             backend,
-            id_pool: IdPool::new(max_kv_blocks, max_embs),
+            id_pool: IdPool::new(10000, 10000),
             ref_counter: RefCounter::new(),
             vspaces: HashMap::new(),
         }
@@ -148,31 +144,16 @@ impl<B> Controller<B> {
         Ok(())
     }
 
-    pub fn schedule(&self, curr_timestamp: f64) -> Result<(), ControllerError> {
-        let mut pending = self
-            .cmd_batcher
-            .lock()
-            .map_err(|_| ControllerError::LockError)?;
-
+    pub fn schedule(&mut self, curr_timestamp: f64) -> Result<(), ControllerError> {
         // first move all the commands from cmd_buffer to pending (buffer items are removed)
-        let mut commands_by_stream = {
-            let mut cmd_buffer = self
-                .cmd_batcher
-                .lock()
-                .map_err(|_| ControllerError::LockError)?;
+        let mut commands_by_stream = HashMap::new();
 
-            let mut stream_commands = HashMap::new();
-
-            for (stream_id, command, sender) in cmd_buffer.drain(..) {
-                stream_commands
-                    .entry(stream_id)
-                    .or_insert_with(Vec::new)
-                    .push((command, sender));
-            }
-
-            stream_commands
-            // drop the lock on cmd_buffer
-        };
+        for (stream_id, command, sender) in self.cmd_buffer.drain(..) {
+            commands_by_stream
+                .entry(stream_id)
+                .or_insert_with(Vec::new)
+                .push((command, sender));
+        }
 
         // Horizontal batching: group commands by stream and type.
         for (_stream_id, cmd_list) in commands_by_stream.iter_mut() {
@@ -193,35 +174,12 @@ impl<B> Controller<B> {
                     }
                 }
 
-                pending.push(cmd, curr_timestamp, sender);
+                self.cmd_batcher.push(cmd, curr_timestamp, sender);
                 prev_cmd = Some(curr_cmd);
             }
         }
 
-        let batched_payloads = pending.batch_all(curr_timestamp);
-
-        // add the commands to the staged queue
-        let mut staged = self.staged.lock().map_err(|_| ControllerError::LockError)?;
-
-        // Add the batched commands to the staged queue.
-        for (payload, evt_handles) in batched_payloads {
-            let correlation_id = self.acquire_id(object::Namespace::Cmd)?;
-
-            staged.push(sdi::Command {
-                correlation_id,
-                payload: Some(payload),
-            });
-
-            // if at least one sender is present, add it to the event dispatcher.
-            let has_event = evt_handles.iter().any(|s| s.is_some());
-            if has_event {
-                let mut dispatcher = self
-                    .event_dispatcher
-                    .lock()
-                    .map_err(|_| ControllerError::LockError)?;
-                dispatcher.table.insert(correlation_id, evt_handles);
-            }
-        }
+        let batched_payloads = self.cmd_batcher.batch_all(curr_timestamp);
 
         // drop the lock on pending
         Ok(())
@@ -232,17 +190,17 @@ impl<B> Controller<B> {
 
 #[derive(Debug)]
 struct CommandBatcher {
-    allocate: BatchQueue<sdi::Allocate>,
-    deallocate: BatchQueue<sdi::Allocate>,
-    copy_block: BatchQueue<sdi::CopyBlock>,
-    mask_block: BatchQueue<sdi::MaskBlock>,
-    embed_text: BatchQueue<sdi::EmbedText>,
-    embed_image: BatchQueue<sdi::EmbedImage>,
+    allocate: BatchQueue<backend::sdi::Allocate>,
+    deallocate: BatchQueue<backend::sdi::Allocate>,
+    copy_block: BatchQueue<backend::sdi::CopyBlock>,
+    mask_block: BatchQueue<backend::sdi::MaskBlock>,
+    embed_text: BatchQueue<backend::sdi::EmbedText>,
+    embed_image: BatchQueue<backend::sdi::EmbedImage>,
 
     // these cmds are only be fired when it contains "enough" commands to be batched.
-    fill_block: BatchQueue<sdi::FillBlock>,
-    decode_token_distribution: BatchQueue<sdi::DecodeTokenDistribution>,
-    sample_top_k: BatchQueue<sdi::SampleTopKRequest>,
+    fill_block: BatchQueue<backend::sdi::FillBlock>,
+    decode_token_distribution: BatchQueue<backend::sdi::DecodeTokenDistribution>,
+    sample_top_k: BatchQueue<backend::sdi::SampleTopKRequest>,
 }
 
 /// "K-or-T" Strategy
@@ -377,61 +335,66 @@ impl CommandBatcher {
         }
     }
 
-    fn batch_all(&mut self, curr_timestamp: f64) -> Vec<(sdi::command::Payload, Vec<EventHandle>)> {
+    fn batch_all(
+        &mut self,
+        curr_timestamp: f64,
+    ) -> Vec<(backend::sdi::request::Command, Vec<EventHandle>)> {
         let mut cmds = Vec::new();
 
         if let Some((items, senders)) = self.allocate.batch(curr_timestamp) {
             cmds.push((
-                sdi::command::Payload::Allocate(sdi::BatchAllocate { items }),
+                backend::sdi::request::Command::Allocate(backend::sdi::BatchAllocate { items }),
                 senders,
             ));
         }
 
         if let Some((items, senders)) = self.deallocate.batch(curr_timestamp) {
             cmds.push((
-                sdi::command::Payload::Deallocate(sdi::BatchDeallocate { items }),
+                backend::sdi::request::Command::Deallocate(backend::sdi::BatchDeallocate { items }),
                 senders,
             ));
         }
 
         if let Some((items, senders)) = self.copy_block.batch(curr_timestamp) {
             cmds.push((
-                sdi::command::Payload::CopyBlock(sdi::BatchCopyBlock { items }),
+                backend::sdi::request::Command::CopyBlock(backend::sdi::BatchCopyBlock { items }),
                 senders,
             ));
         }
 
         if let Some((items, senders)) = self.mask_block.batch(curr_timestamp) {
             cmds.push((
-                sdi::command::Payload::MaskBlock(sdi::BatchMaskBlock { items }),
+                backend::sdi::request::Command::MaskBlock(backend::sdi::BatchMaskBlock { items }),
                 senders,
             ));
         }
 
         if let Some((items, senders)) = self.embed_text.batch(curr_timestamp) {
             cmds.push((
-                sdi::command::Payload::EmbedText(sdi::BatchEmbedText { items }),
+                backend::sdi::request::Command::EmbedText(backend::sdi::BatchEmbedText { items }),
                 senders,
             ));
         }
 
         if let Some((items, senders)) = self.embed_image.batch(curr_timestamp) {
             cmds.push((
-                sdi::command::Payload::EmbedImage(sdi::BatchEmbedImage { items }),
+                backend::sdi::request::Command::EmbedImage(backend::sdi::BatchEmbedImage { items }),
                 senders,
             ));
         }
 
         if let Some((items, senders)) = self.fill_block.batch(curr_timestamp) {
             cmds.push((
-                sdi::command::Payload::FillBlock(sdi::BatchFillBlock { items }),
+                backend::sdi::request::Command::FillBlock(backend::sdi::BatchFillBlock { items }),
                 senders,
             ));
         }
 
         if let Some((items, senders)) = self.sample_top_k.batch(curr_timestamp) {
             cmds.push((
-                sdi::command::Payload::SampleTopKRequest(sdi::BatchSampleTopKRequest { items }),
+                backend::sdi::request::Command::SampleTopKRequest(
+                    backend::sdi::BatchSampleTopKRequest { items },
+                ),
                 senders,
             ));
         }
@@ -444,7 +407,7 @@ pub trait ControllerManaged: Debug + Sized + Send + Sync {
     const NAMESPACE: Namespace;
     //fn get_namespace() -> Namespace;
 
-    pub fn sdi_object_kind() -> i32 {
+    fn sdi_object_kind() -> i32 {
         match Self::NAMESPACE {
             Namespace::KvBlock => backend::sdi::ObjectKind::KvBlock.into(),
             Namespace::Emb => backend::sdi::ObjectKind::Emb.into(),
@@ -472,25 +435,21 @@ pub enum Namespace {
     Dist = 2,
 }
 
-impl<B, T> object::Allocator<T> for Controller<B>
+impl<B, T> Allocator<T> for Controller<B>
 where
     T: ControllerManaged,
 {
-    fn alloc_many(
-        &mut self,
-        stream: Stream,
-        count: usize,
-    ) -> Result<Vec<object::Id<T>>, ObjectError> {
+    fn alloc_all(&mut self, stream: Stream, count: usize) -> Result<Vec<ObjectId<T>>, ObjectError> {
         let ids = self.id_pool.acquire_many::<T>(count)?;
 
         // init the ref counter
         for id in &ids {
-            self.ref_counter.init(*id);
+            self.ref_counter.init(*id); // set the ref count to 0
         }
 
         // Request the backend to allocate the objects.
         let kind = T::sdi_object_kind();
-        let cons_id = object::Id::group_consecutive_ids(&ids);
+        let cons_id = ObjectId::group_consecutive_ids(&ids);
 
         for (id_offset, size) in cons_id {
             let cmd = IrCommand::Allocate(backend::sdi::Allocate {
@@ -503,13 +462,25 @@ where
         Ok(ids)
     }
 
-    fn dealloc_many(&mut self, stream: Stream, ids: &[object::Id<T>]) -> Result<(), ObjectError> {
-        let cons_id = object::Id::group_consecutive_ids(ids);
+    fn dealloc_all(&mut self, stream: Stream, ids: &[ObjectId<T>]) -> Result<(), ObjectError> {
+        let mut rm_ids = Vec::new();
+        for id in ids {
+
+            // safety check
+            let free = self.ref_counter.get(id) <= 0;
+            if free {
+                rm_ids.push(*id);
+                self.id_pool.release(id)?;
+                self.ref_counter.destroy(id);
+            }
+        }
+
+        let cons_id = ObjectId::group_consecutive_ids(&rm_ids);
 
         // destroy the ref counter
-        for id in ids {
-            self.ref_counter.destroy(id);
-        }
+        // for id in rm_ids.iter() {
+        //     self.ref_counter.destroy(id);
+        // }
 
         let kind = T::sdi_object_kind();
 
@@ -528,67 +499,173 @@ where
     fn available(&self) -> usize {
         self.id_pool.available::<T>()
     }
+
+    fn increment_ref_count(&mut self, id: &ObjectId<T>) -> Result<(), ObjectError> {
+        Ok(self.ref_counter.inc(id))
+    }
+
+    fn decrement_ref_count(&mut self, id: &ObjectId<T>) -> Result<bool, ObjectError> {
+        Ok(self.ref_counter.dec(id))
+    }
+
+    fn ref_count(&self, id: &ObjectId<T>) -> Result<usize, ObjectError> {
+        Ok(self.ref_counter.get(id))
+    }
 }
 
-
-
-impl<B, T> object::MappedAllocator<T> for Controller<B>
+impl<B, T> object::IdMapper<T> for Controller<B>
 where
     T: ControllerManaged,
 {
-    fn vspaces(&self) -> &HashMap<VspaceId, HashMap<Id<T>, Id<T>>> {
-        &self.vspaces
+    fn exists(&self, space: &VspaceId, src: &ObjectId<T>) -> bool {
+        self.vspaces
+            .get(space)
+            .map_or(false, |vspace| vspace.exists(src))
     }
 
-    fn vspaces_mut(&mut self) -> &mut HashMap<VspaceId, HashMap<Id<T>, Id<T>>> {
-        &mut self.vspaces
+    fn list(&self, space: &VspaceId) -> Result<Vec<ObjectId<T>>, ObjectError> {
+        self.vspaces
+            .get(space)
+            .ok_or(ObjectError::VSpaceNotFound)?
+            .list()
     }
 
-    fn ref_inc(&mut self, id: &Id<T>) -> Result<(), ObjectError> {
+    fn lookup_all(
+        &self,
+        space: &VspaceId,
+        srcs: &[ObjectId<T>],
+    ) -> Result<Vec<ObjectId<T>>, ObjectError> {
+        self.vspaces
+            .get(space)
+            .ok_or(ObjectError::VSpaceNotFound)?
+            .lookup_all(srcs)
+    }
+
+    fn assign_all(
+        &mut self,
+        space: &VspaceId,
+        srcs: &[ObjectId<T>],
+        tgts: &[ObjectId<T>],
+    ) -> Result<(), ObjectError> {
+        // increase the ref count for the target objects
+        for tgt in tgts.iter() {
+            self.increment_ref_count(tgt)?;
+        }
+
+        let vspace = self
+            .vspaces
+            .get_mut(space)
+            .ok_or(ObjectError::VSpaceNotFound)?;
+
+        for (src, tgt) in srcs.iter().zip(tgts.into_iter()) {
+            vspace.assign(*src, *tgt);
+        }
+
+        Ok(())
+    }
+
+    fn unassign_all(
+        &mut self,
+        vspace_id: &VspaceId,
+        srcs: &[ObjectId<T>],
+    ) -> Result<(), ObjectError> {
+        let vspace = self
+            .vspaces
+            .get_mut(vspace_id)
+            .ok_or(ObjectError::VSpaceNotFound)?;
+
+        let mut tgts = Vec::with_capacity(srcs.len());
+        for src in srcs.iter() {
+            let tgt = vspace.unassign(src)?;
+            tgts.push(tgt);
+        }
+
+        for tgt in tgts.iter() {
+            let free = self.decrement_ref_count(tgt)?;
+            if free {
+                self.dealloc(Stream::default(), tgt)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn open(&mut self, space: VspaceId) -> Result<(), ObjectError> {
         todo!()
     }
 
-    fn ref_dec(&mut self, id: &Id<T>) -> Result<bool, ObjectError> {
+    fn close(&mut self, space: &VspaceId) -> Result<(), ObjectError> {
         todo!()
     }
-
-    fn ref_count(&self, id: &Id<T>) -> Result<usize, ObjectError> {
-        todo!()
-    }
+    //
+    // fn vspaces(&self, vspace_id: &object::VspaceId) -> Result<&Self::View, ObjectError> {
+    //     self.vspaces
+    //         .get(vspace_id)
+    //         .ok_or(ObjectError::VSpaceNotFound)
+    // }
+    //
+    // fn vspaces_mut(
+    //     &mut self,
+    //     vspace_id: &object::VspaceId,
+    // ) -> Result<&mut Self::View, ObjectError> {
+    //     self.vspaces
+    //         .get_mut(vspace_id)
+    //         .ok_or(ObjectError::VSpaceNotFound)
+    // }
+    //
+    // fn open(&mut self, vspace_id: object::VspaceId) -> Result<(), ObjectError> {
+    //     if self.vspaces.contains_key(&vspace_id) {
+    //         return Err(ObjectError::VSpaceAlreadyExists(vspace_id));
+    //     }
+    //
+    //     self.vspaces.insert(vspace_id, IdMap::new());
+    //
+    //     Ok(())
+    // }
+    //
+    // fn close(&mut self, vspace_id: &object::VspaceId) -> Result<(), ObjectError> {
+    //     let to_removed: Vec<ObjectId<T>> =
+    //         <Controller<B> as object::IdMapper<T>>::vspaces(self, vspace_id)?.all_vids();
+    //
+    //     object::IdMapper::dealloc_all(self, Stream::default(), vspace_id, &to_removed)?;
+    //
+    //     self.vspaces.remove(vspace_id).unwrap();
+    //
+    //     Ok(())
+    // }
 }
 
-impl CausalTransformer for Controller {
+impl<B> CausalTransformer for Controller<B> {
     fn fill(
-        &self,
+        &mut self,
         stream: Stream,
-        ptr: object::Id<KvBlock>,
-        ctx_ptrs: Vec<object::Id<KvBlock>>,
-        input_embs: Vec<object::Id<TokenEmb>>,
-        output_embs: Vec<Option<object::Id<TokenEmb>>>,
+        vspace_id: &VspaceId,
+        ptr: ObjectId<KvBlock>,
+        ctx_ptrs: Vec<ObjectId<KvBlock>>,
+        input_embs: Vec<ObjectId<TokenEmb>>,
+        output_embs: Option<Vec<ObjectId<TokenEmb>>>,
     ) -> Result<(), ControllerError> {
-        let cmd = IrCommand::FillBlock(sdi::FillBlock {
+        let cmd = IrCommand::FillBlock(backend::sdi::FillBlock {
             block_id: ptr.into(),
-            context_block_ids: ctx_ptrs.into_iter().map(|id| id.into()).collect(),
-            input_embedding_ids: input_embs.into_iter().map(|id| id.into()).collect(),
-            output_embedding_ids: output_embs
-                .into_iter()
-                .map(|id| id.map(|id| id.into()))
-                .collect(),
+            context_block_ids: ObjectId::map_to_repr(self.vspaces(vspace_id)?.get_many(&ctx_ptrs)?),
+            input_embedding_ids: ObjectId::map_to_repr(input_embs),
+            output_embedding_ids: output_embs.map_or_else(Vec::new, ObjectId::map_to_repr),
         });
 
         self.enqueue_cmd(stream, cmd)
     }
 
     fn copy_tokens(
-        &self,
+        &mut self,
         stream_id: Stream,
-        src_ptr: object::Id<KvBlock>,
-        dst_ptr: object::Id<KvBlock>,
+        vspace_id: &VspaceId,
+        src_ptr: ObjectId<KvBlock>,
+        dst_ptr: ObjectId<KvBlock>,
         src_offset: u32,
         dst_offset: u32,
         size: u32,
     ) -> Result<(), ControllerError> {
-        let cmd = IrCommand::CopyBlock(sdi::CopyBlock {
+        let cmd = IrCommand::CopyBlock(backend::sdi::CopyBlock {
             source_block_id: src_ptr.into(),
             destination_block_id: dst_ptr.into(),
             source_start: src_offset,
@@ -600,12 +677,13 @@ impl CausalTransformer for Controller {
     }
 
     fn mask_tokens(
-        &self,
+        &mut self,
         stream_id: Stream,
-        ptr: object::Id<KvBlock>,
+        vspace_id: &VspaceId,
+        ptr: ObjectId<KvBlock>,
         mask: &[bool],
     ) -> Result<(), ControllerError> {
-        let cmd = IrCommand::MaskBlock(sdi::MaskBlock {
+        let cmd = IrCommand::MaskBlock(backend::sdi::MaskBlock {
             block_id: ptr.into(),
             mask: mask.to_vec(),
         });
@@ -613,31 +691,33 @@ impl CausalTransformer for Controller {
     }
 }
 
-impl CausalLanguageModel for Controller {
+impl<B> CausalLanguageModel for Controller<B> {
     fn next_token_dist(
-        &self,
+        &mut self,
         stream_id: Stream,
-        emb_ptr: object::Id<TokenEmb>,
-        dist_ptr: object::Id<TokenDist>,
+        vspace_id: &VspaceId,
+        emb_ptr: ObjectId<TokenEmb>,
+        dist_ptr: ObjectId<TokenDist>,
     ) -> Result<(), ControllerError> {
-        let cmd = IrCommand::DecodeTokenDistribution(sdi::DecodeTokenDistribution {
-            embedding_id: emb_ptr,
-            distribution_id: dist_ptr,
+        let cmd = IrCommand::DecodeTokenDistribution(backend::sdi::DecodeTokenDistribution {
+            embedding_id: emb_ptr.into(),
+            distribution_id: dist_ptr.into(),
         });
 
         self.enqueue_cmd(stream_id, cmd)
     }
 
     fn sample_top_k(
-        &self,
+        &mut self,
         stream_id: Stream,
-        dist_ptr: object::Id,
+        vspace_id: &VspaceId,
+        dist_ptr: ObjectId<TokenDist>,
         k: u32,
     ) -> Result<oneshot::Receiver<Vec<u32>>, ControllerError> {
         // create a new event handle
 
-        let cmd = IrCommand::SampleTopKRequest(sdi::SampleTopKRequest {
-            distribution_id: dist_ptr,
+        let cmd = IrCommand::SampleTopKRequest(backend::sdi::SampleTopKRequest {
+            distribution_id: dist_ptr.into(),
             k,
         });
 
@@ -648,34 +728,37 @@ impl CausalLanguageModel for Controller {
         Ok(rx)
     }
 
-    fn get_raw_dist(
-        &self,
-        stream_id: Stream,
-        dist_ptr: object::Id,
-    ) -> Result<oneshot::Receiver<Vec<f32>>, ControllerError> {
-        let cmd = IrCommand::GetTokenDistributionRequest(sdi::GetTokenDistributionRequest {
-            distribution_id: dist_ptr,
-        });
-
-        let (tx, rx) = oneshot::channel::<Vec<f32>>();
-        let handle = EventHandle::GetTokenDistribution(tx);
-
-        self.enqueue_cmd_with_event(stream_id, cmd, handle)?;
-        Ok(rx)
-    }
+    // fn get_raw_dist(
+    //     &self,
+    //     stream_id: Stream,
+    //     vspace_id: &VspaceId,
+    //     dist_ptr: ObjectId<TokenDist>,
+    // ) -> Result<oneshot::Receiver<Vec<f32>>, ControllerError> {
+    //     let cmd =
+    //         IrCommand::GetTokenDistributionRequest(backend::sdi::GetTokenDistributionRequest {
+    //             distribution_id: dist_ptr,
+    //         });
+    //
+    //     let (tx, rx) = oneshot::channel::<Vec<f32>>();
+    //     let handle = EventHandle::GetTokenDistribution(tx);
+    //
+    //     self.enqueue_cmd_with_event(stream_id, cmd, handle)?;
+    //     Ok(rx)
+    // }
 }
 
 /// for multimodal LLMs
 
-impl ImageEmbedder for Controller {
+impl<B> ImageEmbedder for Controller<B> {
     fn embed_img(
-        &self,
+        &mut self,
         stream_id: Stream,
-        addrs: Vec<object::Id>,
+        vspace_id: &VspaceId,
+        addrs: Vec<ObjectId<TokenEmb>>,
         url: String,
     ) -> Result<(), ControllerError> {
-        let cmd = IrCommand::EmbedImage(sdi::EmbedImage {
-            embedding_ids: addrs,
+        let cmd = IrCommand::EmbedImage(backend::sdi::EmbedImage {
+            embedding_ids: ObjectId::map_to_repr(addrs),
             url,
         });
 
@@ -716,26 +799,26 @@ impl IdPool {
         }
     }
 
-    pub fn acquire<T: ControllerManaged>(&mut self) -> Result<object::Id<T>, ObjectError> {
+    pub fn acquire<T: ControllerManaged>(&mut self) -> Result<ObjectId<T>, ObjectError> {
         let id = self
             .pool_mut::<T>()
             .acquire()
             .map_err(|_| ObjectError::NoAvailableSpace)?;
-        Ok(object::Id::new(id))
+        Ok(ObjectId::new(id))
     }
 
     pub fn acquire_many<T: ControllerManaged>(
         &mut self,
         count: usize,
-    ) -> Result<Vec<object::Id<T>>, ObjectError> {
+    ) -> Result<Vec<ObjectId<T>>, ObjectError> {
         let ids = self
             .pool_mut::<T>()
             .acquire_many(count)
             .map_err(|_| ObjectError::NoAvailableSpace)?;
-        Ok(object::Id::map_from_repr(ids))
+        Ok(ObjectId::map_from_repr(ids))
     }
 
-    pub fn release<T: ControllerManaged>(&mut self, id: &object::Id<T>) -> Result<(), ObjectError> {
+    pub fn release<T: ControllerManaged>(&mut self, id: &ObjectId<T>) -> Result<(), ObjectError> {
         self.pool_mut::<T>()
             .release(id.into())
             .map_err(|e| ObjectError::AddressPoolError(e.to_string()))
@@ -743,9 +826,9 @@ impl IdPool {
 
     pub fn release_many<T: ControllerManaged>(
         &mut self,
-        ids: &[object::Id<T>],
+        ids: &[ObjectId<T>],
     ) -> Result<(), ObjectError> {
-        let raw_ids = object::Id::ref_as_repr(ids);
+        let raw_ids = ObjectId::ref_as_repr(ids);
         self.pool_mut::<T>()
             .release_many(raw_ids)
             .map_err(|e| ObjectError::AddressPoolError(e.to_string()))
@@ -758,9 +841,9 @@ impl IdPool {
 
 #[derive(Debug)]
 pub struct IdMap {
-    kv_block_id_map: HashMap<object::VspaceId, HashMap<object::IdRepr, object::IdRepr>>,
-    emb_id_map: HashMap<object::VspaceId, HashMap<object::IdRepr, object::IdRepr>>,
-    dist_id_map: HashMap<object::VspaceId, HashMap<object::IdRepr, object::IdRepr>>,
+    kv_block_id_map: HashMap<object::IdRepr, object::IdRepr>,
+    emb_id_map: HashMap<object::IdRepr, object::IdRepr>,
+    dist_id_map: HashMap<object::IdRepr, object::IdRepr>,
 }
 impl IdMap {
     pub fn new() -> Self {
@@ -772,7 +855,9 @@ impl IdMap {
     }
 
     // Helper method to get a mutable reference to the appropriate map.
-    fn map_mut<T: ControllerManaged>(&mut self) -> &mut HashMap<object::IdRepr, object::IdRepr> {
+    fn mapping_mut<T: ControllerManaged>(
+        &mut self,
+    ) -> &mut HashMap<object::IdRepr, object::IdRepr> {
         match T::NAMESPACE {
             Namespace::KvBlock => &mut self.kv_block_id_map,
             Namespace::Emb => &mut self.emb_id_map,
@@ -781,7 +866,7 @@ impl IdMap {
     }
 
     // Helper method to get an immutable reference to the appropriate map.
-    fn map<T: ControllerManaged>(&self) -> &HashMap<object::IdRepr, object::IdRepr> {
+    fn mapping<T: ControllerManaged>(&self) -> &HashMap<object::IdRepr, object::IdRepr> {
         match T::NAMESPACE {
             Namespace::KvBlock => &self.kv_block_id_map,
             Namespace::Emb => &self.emb_id_map,
@@ -789,41 +874,62 @@ impl IdMap {
         }
     }
 
-    pub fn insert<T: ControllerManaged>(&mut self, vid: object::Id<T>, id: object::Id<T>) {
-        let (src, dst) = (vid.into(), id.into());
-        self.map_mut::<T>().insert(src, dst);
+    fn exists<T: ControllerManaged>(&self, vid: &ObjectId<T>) -> bool {
+        self.mapping::<T>().contains_key(&vid.into())
     }
 
-    pub fn remove<T: ControllerManaged>(
+    fn lookup<T: ControllerManaged>(&self, vid: &ObjectId<T>) -> Result<ObjectId<T>, ObjectError> {
+        self.mapping::<T>()
+            .get(&vid.into())
+            .map(|id| ObjectId::<T>::new(*id))
+            .ok_or(ObjectError::ObjectNotFound)
+    }
+
+    fn lookup_all<T: ControllerManaged>(
+        &self,
+        vids: &[ObjectId<T>],
+    ) -> Result<Vec<ObjectId<T>>, ObjectError> {
+        let map = self.mapping::<T>();
+        let mut ids = Vec::with_capacity(vids.len());
+
+        for vid in vids {
+            let id = map.get(&vid.into()).ok_or(ObjectError::ObjectNotFound)?;
+            ids.push(ObjectId::new(*id));
+        }
+        Ok(ids)
+    }
+
+    fn assign<T: ControllerManaged>(&mut self, vid: ObjectId<T>, id: ObjectId<T>) {
+        let (src, dst) = (vid.into(), id.into());
+        self.mapping_mut::<T>().insert(src, dst);
+    }
+
+    fn unassign<T: ControllerManaged>(
         &mut self,
-        vid: object::Id<T>,
-    ) -> Result<object::Id<T>, ObjectError> {
+        vid: &ObjectId<T>,
+    ) -> Result<ObjectId<T>, ObjectError> {
         let vid = vid.into();
         let id = self
-            .map_mut::<T>()
+            .mapping_mut::<T>()
             .remove(&vid)
             .ok_or(ObjectError::ObjectNotFound)?;
-        Ok(object::Id::<T>::new(id))
+        Ok(ObjectId::<T>::new(id))
     }
 
-    pub fn get<T: ControllerManaged>(
-        &self,
-        vid: object::Id<T>,
-    ) -> Result<object::Id<T>, ObjectError> {
-        let vid = vid.into();
-        let id = self
-            .map::<T>()
-            .get(&vid)
-            .ok_or(ObjectError::ObjectNotFound)?;
-        Ok(object::Id::<T>::new(*id))
+    fn list<T: ControllerManaged>(&self) -> Result<Vec<ObjectId<T>>, ObjectError> {
+        Ok(self
+            .mapping::<T>()
+            .keys()
+            .map(|id| ObjectId::<T>::new(*id))
+            .collect())
     }
 }
 
 #[derive(Debug)]
 struct RefCounter {
-    kv_block_counter: HashMap<object::Id<KvBlock>, Counter>,
-    emb_counter: HashMap<object::Id<TokenEmb>, Counter>,
-    dist_counter: HashMap<object::Id<TokenDist>, Counter>,
+    kv_block_counter: HashMap<IdRepr, Counter>,
+    emb_counter: HashMap<IdRepr, Counter>,
+    dist_counter: HashMap<IdRepr, Counter>,
 }
 
 impl RefCounter {
@@ -835,7 +941,7 @@ impl RefCounter {
         }
     }
 
-    fn counter<T: ControllerManaged>(&self) -> &HashMap<object::Id<T>, Counter> {
+    fn counter<T: ControllerManaged>(&self) -> &HashMap<IdRepr, Counter> {
         match T::NAMESPACE {
             Namespace::KvBlock => &self.kv_block_counter,
             Namespace::Emb => &self.emb_counter,
@@ -843,7 +949,7 @@ impl RefCounter {
         }
     }
 
-    fn counter_mut<T: ControllerManaged>(&mut self) -> &mut HashMap<object::Id<T>, Counter> {
+    fn counter_mut<T: ControllerManaged>(&mut self) -> &mut HashMap<IdRepr, Counter> {
         match T::NAMESPACE {
             Namespace::KvBlock => &mut self.kv_block_counter,
             Namespace::Emb => &mut self.emb_counter,
@@ -851,23 +957,23 @@ impl RefCounter {
         }
     }
 
-    pub fn init<T: ControllerManaged>(&mut self, id: object::Id<T>) {
-        self.counter_mut::<T>().insert(id, Counter::new(0));
+    pub fn init<T: ControllerManaged>(&mut self, id: ObjectId<T>) {
+        self.counter_mut::<T>().insert(id.into(), Counter::new(0));
     }
 
-    pub fn destroy<T: ControllerManaged>(&mut self, id: &object::Id<T>) {
-        self.counter_mut::<T>().remove(&id);
+    pub fn destroy<T: ControllerManaged>(&mut self, id: &ObjectId<T>) {
+        self.counter_mut::<T>().remove(&id.into());
     }
 
-    pub fn inc<T: ControllerManaged>(&mut self, id: &object::Id<T>) {
-        self.counter_mut::<T>().get_mut(&id).unwrap().inc();
+    pub fn inc<T: ControllerManaged>(&mut self, id: &ObjectId<T>) {
+        self.counter_mut::<T>().get_mut(&id.into()).unwrap().inc();
     }
 
-    pub fn dec<T: ControllerManaged>(&mut self, id: &object::Id<T>) -> bool {
-        self.counter_mut::<T>().get_mut(&id).unwrap().dec() <= 0
+    pub fn dec<T: ControllerManaged>(&mut self, id: &ObjectId<T>) -> bool {
+        self.counter_mut::<T>().get_mut(&id.into()).unwrap().dec() <= 0
     }
 
-    pub fn get<T: ControllerManaged>(&self, id: &object::Id<T>) -> usize {
-        self.counter::<T>().get(&id).unwrap().get() as usize
+    pub fn get<T: ControllerManaged>(&self, id: &ObjectId<T>) -> usize {
+        self.counter::<T>().get(&id.into()).unwrap().get() as usize
     }
 }
