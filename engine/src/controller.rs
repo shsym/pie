@@ -7,12 +7,10 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::mem;
 use tokio::sync::oneshot;
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
 use crate::instance::Id as InstanceId;
-use crate::object::{Allocator, Id as ObjectId, IdMapper, IdRepr, ObjectError, Vspace, VspaceId};
+use crate::object::{Allocator, Fetcher, Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
 use thiserror::Error;
-use tokio::task::JoinError;
 
 #[derive(Error, Debug)]
 pub enum ControllerError {
@@ -24,15 +22,6 @@ pub enum ControllerError {
 
     #[error("Channel send error")]
     SendError,
-
-    #[error("ZeroMQ error: {0}")]
-    ZmqError(#[from] ZmqError),
-
-    #[error("Task join error: {0}")]
-    JoinError(#[from] JoinError),
-
-    #[error("Decode error: {0}")]
-    DecodeError(#[from] prost::DecodeError),
 
     #[error("Object error: {0}")]
     ObjectError(#[from] ObjectError),
@@ -57,7 +46,7 @@ enum IrCommand {
 
 // Hidden
 #[derive(Debug)]
-enum IrEvent {
+pub enum IrEvent {
     SampleTopK(backend::sdi::SampleTopKResponse),
     GetTokenDistribution(backend::sdi::GetTokenDistributionResponse),
 }
@@ -97,7 +86,7 @@ pub enum EventHandle {
 }
 
 impl EventHandle {
-    fn is_some(&self) -> bool {
+    pub fn is_some(&self) -> bool {
         match self {
             EventHandle::None => false,
             _ => true,
@@ -465,7 +454,6 @@ where
     fn dealloc_all(&mut self, stream: Stream, ids: &[ObjectId<T>]) -> Result<(), ObjectError> {
         let mut rm_ids = Vec::new();
         for id in ids {
-
             // safety check
             let free = self.ref_counter.get(id) <= 0;
             if free {
@@ -564,14 +552,10 @@ where
         Ok(())
     }
 
-    fn unassign_all(
-        &mut self,
-        vspace_id: &VspaceId,
-        srcs: &[ObjectId<T>],
-    ) -> Result<(), ObjectError> {
+    fn unassign_all(&mut self, space: &VspaceId, srcs: &[ObjectId<T>]) -> Result<(), ObjectError> {
         let vspace = self
             .vspaces
-            .get_mut(vspace_id)
+            .get_mut(space)
             .ok_or(ObjectError::VSpaceNotFound)?;
 
         let mut tgts = Vec::with_capacity(srcs.len());
@@ -591,65 +575,45 @@ where
     }
 
     fn open(&mut self, space: VspaceId) -> Result<(), ObjectError> {
-        todo!()
+        if self.vspaces.contains_key(&space) {
+            return Err(ObjectError::VSpaceAlreadyExists(space));
+        }
+
+        self.vspaces.insert(space, IdMap::new());
+        Ok(())
     }
 
     fn close(&mut self, space: &VspaceId) -> Result<(), ObjectError> {
-        todo!()
+        // first, un-assign all the objects in the space
+        let srcs: Vec<ObjectId<T>> = self.list(space)?;
+        self.unassign_all(space, &srcs)?;
+
+        self.vspaces.remove(space).unwrap();
+        Ok(())
     }
-    //
-    // fn vspaces(&self, vspace_id: &object::VspaceId) -> Result<&Self::View, ObjectError> {
-    //     self.vspaces
-    //         .get(vspace_id)
-    //         .ok_or(ObjectError::VSpaceNotFound)
-    // }
-    //
-    // fn vspaces_mut(
-    //     &mut self,
-    //     vspace_id: &object::VspaceId,
-    // ) -> Result<&mut Self::View, ObjectError> {
-    //     self.vspaces
-    //         .get_mut(vspace_id)
-    //         .ok_or(ObjectError::VSpaceNotFound)
-    // }
-    //
-    // fn open(&mut self, vspace_id: object::VspaceId) -> Result<(), ObjectError> {
-    //     if self.vspaces.contains_key(&vspace_id) {
-    //         return Err(ObjectError::VSpaceAlreadyExists(vspace_id));
-    //     }
-    //
-    //     self.vspaces.insert(vspace_id, IdMap::new());
-    //
-    //     Ok(())
-    // }
-    //
-    // fn close(&mut self, vspace_id: &object::VspaceId) -> Result<(), ObjectError> {
-    //     let to_removed: Vec<ObjectId<T>> =
-    //         <Controller<B> as object::IdMapper<T>>::vspaces(self, vspace_id)?.all_vids();
-    //
-    //     object::IdMapper::dealloc_all(self, Stream::default(), vspace_id, &to_removed)?;
-    //
-    //     self.vspaces.remove(vspace_id).unwrap();
-    //
-    //     Ok(())
-    // }
 }
 
 impl<B> CausalTransformer for Controller<B> {
     fn fill(
         &mut self,
         stream: Stream,
-        vspace_id: &VspaceId,
+        space: &VspaceId,
         ptr: ObjectId<KvBlock>,
         ctx_ptrs: Vec<ObjectId<KvBlock>>,
         input_embs: Vec<ObjectId<TokenEmb>>,
-        output_embs: Option<Vec<ObjectId<TokenEmb>>>,
+        output_embs: Vec<ObjectId<TokenEmb>>,
     ) -> Result<(), ControllerError> {
+        // lookup the objects from the space
+        let ptr = self.lookup(space, &ptr)?;
+        let ctx_ptrs = self.lookup_all(space, &ctx_ptrs)?;
+        let input_embs = self.lookup_all(space, &input_embs)?;
+        let output_embs = self.lookup_all(space, &output_embs)?;
+
         let cmd = IrCommand::FillBlock(backend::sdi::FillBlock {
             block_id: ptr.into(),
-            context_block_ids: ObjectId::map_to_repr(self.vspaces(vspace_id)?.get_many(&ctx_ptrs)?),
+            context_block_ids: ObjectId::map_to_repr(ctx_ptrs),
             input_embedding_ids: ObjectId::map_to_repr(input_embs),
-            output_embedding_ids: output_embs.map_or_else(Vec::new, ObjectId::map_to_repr),
+            output_embedding_ids: ObjectId::map_to_repr(output_embs),
         });
 
         self.enqueue_cmd(stream, cmd)
@@ -657,14 +621,17 @@ impl<B> CausalTransformer for Controller<B> {
 
     fn copy_tokens(
         &mut self,
-        stream_id: Stream,
-        vspace_id: &VspaceId,
+        stream: Stream,
+        space: &VspaceId,
         src_ptr: ObjectId<KvBlock>,
         dst_ptr: ObjectId<KvBlock>,
         src_offset: u32,
         dst_offset: u32,
         size: u32,
     ) -> Result<(), ControllerError> {
+        let src_ptr = self.lookup(space, &src_ptr)?;
+        let dst_ptr = self.lookup(space, &dst_ptr)?;
+
         let cmd = IrCommand::CopyBlock(backend::sdi::CopyBlock {
             source_block_id: src_ptr.into(),
             destination_block_id: dst_ptr.into(),
@@ -673,58 +640,64 @@ impl<B> CausalTransformer for Controller<B> {
             length: size,
         });
 
-        self.enqueue_cmd(stream_id, cmd)
+        self.enqueue_cmd(stream, cmd)
     }
 
     fn mask_tokens(
         &mut self,
-        stream_id: Stream,
-        vspace_id: &VspaceId,
+        stream: Stream,
+        space: &VspaceId,
         ptr: ObjectId<KvBlock>,
         mask: &[bool],
     ) -> Result<(), ControllerError> {
+        let ptr = self.lookup(space, &ptr)?;
+
         let cmd = IrCommand::MaskBlock(backend::sdi::MaskBlock {
             block_id: ptr.into(),
             mask: mask.to_vec(),
         });
-        self.enqueue_cmd(stream_id, cmd)
+        self.enqueue_cmd(stream, cmd)
     }
 }
 
 impl<B> CausalLanguageModel for Controller<B> {
     fn next_token_dist(
         &mut self,
-        stream_id: Stream,
-        vspace_id: &VspaceId,
+        stream: Stream,
+        space: &VspaceId,
         emb_ptr: ObjectId<TokenEmb>,
         dist_ptr: ObjectId<TokenDist>,
     ) -> Result<(), ControllerError> {
+        let emb_ptr = self.lookup(space, &emb_ptr)?;
+        let dist_ptr = self.lookup(space, &dist_ptr)?;
+
         let cmd = IrCommand::DecodeTokenDistribution(backend::sdi::DecodeTokenDistribution {
             embedding_id: emb_ptr.into(),
             distribution_id: dist_ptr.into(),
         });
 
-        self.enqueue_cmd(stream_id, cmd)
+        self.enqueue_cmd(stream, cmd)
     }
 
     fn sample_top_k(
         &mut self,
-        stream_id: Stream,
-        vspace_id: &VspaceId,
+        stream: Stream,
+        space: &VspaceId,
         dist_ptr: ObjectId<TokenDist>,
         k: u32,
     ) -> Result<oneshot::Receiver<Vec<u32>>, ControllerError> {
-        // create a new event handle
+        let dist_ptr = self.lookup(space, &dist_ptr)?;
 
         let cmd = IrCommand::SampleTopKRequest(backend::sdi::SampleTopKRequest {
             distribution_id: dist_ptr.into(),
             k,
         });
+        // create a new event handle
 
         let (tx, rx) = oneshot::channel::<Vec<u32>>();
         let handle = EventHandle::SampleTopK(tx);
 
-        self.enqueue_cmd_with_event(stream_id, cmd, handle)?;
+        self.enqueue_cmd_with_event(stream, cmd, handle)?;
         Ok(rx)
     }
 
@@ -747,22 +720,50 @@ impl<B> CausalLanguageModel for Controller<B> {
     // }
 }
 
+impl<B> Fetcher<TokenDist> for Controller<B> {
+    type RawRepr = Vec<f32>;
+
+    fn fetch(
+        &mut self,
+        stream: Stream,
+        space: &VspaceId,
+        ptr: &ObjectId<TokenDist>,
+        sender: oneshot::Sender<Self::RawRepr>,
+    ) -> Result<(), ObjectError> {
+        let ptr = self.lookup(space, &ptr)?;
+
+        let cmd =
+            IrCommand::GetTokenDistributionRequest(backend::sdi::GetTokenDistributionRequest {
+                distribution_id: ptr.into(),
+            });
+
+        let handle = EventHandle::GetTokenDistribution(sender);
+
+        self.enqueue_cmd_with_event(stream, cmd, handle)
+            .map_err(|e| {
+                ObjectError::BackendError("Failed to fetch token distribution".to_string())
+            })
+    }
+}
+
 /// for multimodal LLMs
 
 impl<B> ImageEmbedder for Controller<B> {
     fn embed_img(
         &mut self,
-        stream_id: Stream,
-        vspace_id: &VspaceId,
+        stream: Stream,
+        space: &VspaceId,
         addrs: Vec<ObjectId<TokenEmb>>,
         url: String,
     ) -> Result<(), ControllerError> {
+        let addrs = self.lookup_all(space, &addrs)?;
+
         let cmd = IrCommand::EmbedImage(backend::sdi::EmbedImage {
             embedding_ids: ObjectId::map_to_repr(addrs),
             url,
         });
 
-        self.enqueue_cmd(stream_id, cmd)
+        self.enqueue_cmd(stream, cmd)
     }
 }
 

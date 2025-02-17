@@ -1,4 +1,3 @@
-use crate::object;
 use crate::utils::Stream;
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -186,12 +185,6 @@ pub trait Allocator<T> {
     fn ref_count(&self, id: &Id<T>) -> Result<usize, ObjectError>;
 }
 
-pub trait Fetcher<T>: Allocator<T> {
-    type RawRepr;
-
-    fn fetch(&self, id: &Id<T>, sender: oneshot::Sender<Self::RawRepr>) -> Result<(), ObjectError>;
-}
-
 pub type VspaceId = u32;
 
 // pub trait Vspace<T> {
@@ -337,4 +330,16 @@ pub trait IdMapper<T>: Allocator<T> {
     //
     //     Ok(())
     // }
+}
+
+pub trait Fetcher<T>: IdMapper<T> {
+    type RawRepr;
+
+    fn fetch(
+        &mut self,
+        stream: Stream,
+        space: &VspaceId,
+        id: &Id<T>,
+        sender: oneshot::Sender<Self::RawRepr>,
+    ) -> Result<(), ObjectError>;
 }

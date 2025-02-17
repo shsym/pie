@@ -26,17 +26,17 @@ pub trait CausalTransformer: object::IdMapper<KvBlock> + object::IdMapper<TokenE
     fn fill(
         &mut self,
         stream: Stream,
-        vspace_id: &object::VspaceId,
+        space: &object::VspaceId,
         addr: object::Id<KvBlock>,
         ctx_addrs: Vec<object::Id<KvBlock>>,
         input_embs: Vec<object::Id<TokenEmb>>,
-        output_embs: Option<Vec<object::Id<TokenEmb>>>,
+        output_embs: Vec<object::Id<TokenEmb>>,
     ) -> Result<(), ControllerError>;
 
     fn copy_tokens(
         &mut self,
         stream: Stream,
-        vspace_id: &object::VspaceId,
+        space: &object::VspaceId,
         src_ptr: object::Id<KvBlock>,
         dst_ptr: object::Id<KvBlock>,
         src_offset: u32,
@@ -47,7 +47,7 @@ pub trait CausalTransformer: object::IdMapper<KvBlock> + object::IdMapper<TokenE
     fn mask_tokens(
         &mut self,
         stream: Stream,
-        vspace_id: &object::VspaceId,
+        space: &object::VspaceId,
         ptr: object::Id<KvBlock>,
         mask: &[bool],
     ) -> Result<(), ControllerError>;
@@ -58,7 +58,7 @@ pub trait FullTransformer: object::IdMapper<TokenEmb> {
     fn fill(
         &mut self,
         stream: Stream,
-        vspace_id: &object::VspaceId,
+        space: &object::VspaceId,
         mask: Vec<bool>,
         input_embs: Vec<object::Id<TokenEmb>>,
         output_embs: Vec<object::Id<TokenEmb>>,
@@ -70,7 +70,7 @@ pub trait Rnn: object::IdMapper<TokenEmb> {
     fn fill(
         &mut self,
         stream: Stream,
-        vspace_id: &object::VspaceId,
+        space: &object::VspaceId,
         state: object::Id<KvBlock>,
         output_embs: Vec<object::Id<TokenEmb>>,
     ) -> Result<(), ControllerError>;
@@ -80,13 +80,11 @@ pub trait Rnn: object::IdMapper<TokenEmb> {
 
 // ------------------------------------------------------------
 
-pub trait CausalLanguageModel:
-    object::IdMapper<TokenEmb> + object::IdMapper<TokenDist>
-{
+pub trait CausalLanguageModel: object::IdMapper<TokenEmb> + object::IdMapper<TokenDist> {
     fn next_token_dist(
         &mut self,
         stream: Stream,
-        vspace_id: &object::VspaceId,
+        space: &object::VspaceId,
         emb_ptr: object::Id<TokenEmb>,
         dist_ptr: object::Id<TokenDist>,
     ) -> Result<(), ControllerError>;
@@ -94,7 +92,7 @@ pub trait CausalLanguageModel:
     fn sample_top_k(
         &mut self,
         stream: Stream,
-        vspace_id: &object::VspaceId,
+        space: &object::VspaceId,
         dist_ptr: object::Id<TokenDist>,
         k: u32,
     ) -> Result<oneshot::Receiver<Vec<u32>>, ControllerError>;
@@ -106,7 +104,7 @@ pub trait MaskedLanguageModel: object::IdMapper<TokenEmb> + object::IdMapper<Tok
     fn token_dist(
         &mut self,
         stream: Stream,
-        vspace_id: &object::VspaceId,
+        space: &object::VspaceId,
         emb_ptr: object::Id<TokenEmb>,
         dist_ptr: object::Id<TokenDist>,
     ) -> Result<(), ControllerError>;
@@ -118,8 +116,8 @@ pub trait MaskedLanguageModel: object::IdMapper<TokenEmb> + object::IdMapper<Tok
 pub trait ImageEmbedder: object::IdMapper<TokenEmb> {
     fn embed_img(
         &mut self,
-        stream_id: Stream,
-        vspace_id: &object::VspaceId,
+        stream: Stream,
+        space: &object::VspaceId,
         addrs: Vec<object::Id<TokenEmb>>,
         url: String,
     ) -> Result<(), ControllerError>;
@@ -129,8 +127,8 @@ pub trait ImageEmbedder: object::IdMapper<TokenEmb> {
 pub trait VideoEmbedder: object::IdMapper<TokenEmb> {
     fn embed_vid(
         &mut self,
-        stream_id: Stream,
-        vspace_id: &object::VspaceId,
+        stream: Stream,
+        space: &object::VspaceId,
         addrs: Vec<object::Id<TokenEmb>>,
         url: String,
     ) -> Result<(), ControllerError>;

@@ -1,139 +1,148 @@
+use crate::backend;
+use crate::controller::{ControllerError, EventHandle, IrEvent, Namespace};
+use crate::utils::IdPool;
+use prost::Message;
 use std::collections::HashMap;
 use std::mem;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use zeromq::{DealerSocket, Socket, ZmqError, ZmqMessage};
-use crate::controller::{ControllerError, EventHandle, Namespace};
-use prost::Message;
-use crate::backend;
+use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
 pub mod sdi {
     include!(concat!(env!("OUT_DIR"), "/sdi.rs"));
 }
 
+use prost::DecodeError;
+use thiserror::Error;
 
-pub struct Backend {
-    
-    cmd_tx: mpsc::Sender<Vec<(sdi::request::Command, Vec<EventHandle>)>>,
-    
-    staged: Arc<Mutex<Vec<sdi::Request>>>,
-    submitted: Arc<Mutex<Vec<sdi::Request>>>,
-    // queue, cmd_buffer, scheduled, submitted
-    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    // zmq handles
+#[derive(Debug, Error)]
+pub enum BackendError {
+    #[error("ZeroMQ error: {0}")]
+    Zmq(#[from] ZmqError),
 
-    // event dispatcher
-    event_dispatcher: Arc<Mutex<EventDispatcher>>,
+    #[error("Failed to decode message: {0}")]
+    Decode(#[from] DecodeError),
 
+    #[error("Backend channel closed unexpectedly")]
+    ChannelClosed,
 
-
+    #[error("Correlation id not found in event dispatcher: {0}")]
+    CorrelationIdNotFound(u32),
 }
 
+pub trait ExecuteCommand {
+    async fn exec(
+        &self,
+        cmd: sdi::request::Command,
+        resp: Option<oneshot::Sender<sdi::response::Payload>>,
+    ) -> Result<(), BackendError>;
+}
+
+struct BackendDriver {
+    event_dispatcher: EventDispatcher,
+    cmd_id_pool: IdPool<u32>,
+    //submitted: Vec<sdi::request::Command>,
+}
+
+impl BackendDriver {
+    fn new() -> Self {
+        Self {
+            event_dispatcher: EventDispatcher::new(),
+            cmd_id_pool: IdPool::new(u32::MAX),
+        }
+    }
+
+    fn outbound(
+        &mut self,
+        cmd: sdi::request::Command,
+        evt_handles: Vec<EventHandle>,
+    ) -> sdi::Request {
+        let correlation_id = self.cmd_id_pool.acquire().unwrap();
+
+        let request = sdi::Request {
+            correlation_id,
+            command: Some(cmd),
+        };
+
+        // if at least one sender is present, add it to the event dispatcher.
+        let has_event = evt_handles.iter().any(|s| s.is_some());
+        if has_event {
+            self.event_dispatcher
+                .table
+                .insert(correlation_id, evt_handles);
+        }
+
+        request
+    }
+
+    fn inbound(&mut self, resp: sdi::Response) {
+        // send this evt somewhere elese.
+
+        let correlation_id = resp.correlation_id;
+
+        let ir_events = match resp.payload.unwrap() {
+            sdi::response::Payload::SampleTopK(batch) => batch
+                .items
+                .into_iter()
+                .map(|item| IrEvent::SampleTopK(item))
+                .collect(),
+            sdi::response::Payload::GetTokenDistribution(batch) => batch
+                .items
+                .into_iter()
+                .map(|item| IrEvent::GetTokenDistribution(item))
+                .collect(),
+        };
+
+        self.event_dispatcher.dispatch(correlation_id, ir_events);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Backend {
+    cmd_tx: mpsc::Sender<Vec<(sdi::request::Command, Vec<EventHandle>)>>,
+    handle: Arc<JoinHandle<()>>,
+}
 
 impl Backend {
-    
-    
-    pub fn new() {
-        
-        
-        
-    }
-
-    pub fn submit(&self, cmd: sdi::Request) -> Result<(), ControllerError> {
-        // Lock and take the staged commands.
-        let mut staged = self.staged.lock().map_err(|_| ControllerError::LockError)?;
-
-        // Push the command into the staged commands.
-        staged.push(cmd);
-
-        // add the commands to the staged queue
-        let mut staged = Vec::new();
-
-        // Add the batched commands to the staged queue.
-        for (payload, evt_handles) in batched_payloads {
-            let correlation_id = self.acquire_id(Namespace::Cmd)?;
-
-            staged.push(backend::sdi::Command {
-                correlation_id,
-                payload: Some(payload),
-            });
-
-            // if at least one sender is present, add it to the event dispatcher.
-            let has_event = evt_handles.iter().any(|s| s.is_some());
-            if has_event {
-                let mut dispatcher = self
-                    .event_dispatcher
-                    .lock()
-                    .map_err(|_| ControllerError::LockError)?;
-                dispatcher.table.insert(correlation_id, evt_handles);
-            }
-        }
-        
-        
-        Ok(())
-        
-        
-    }
-    
-    
-    pub async fn commit(&self) -> Result<(), ControllerError> {
-        // Lock and take the staged commands.
-        let mut staged = self.staged.lock().map_err(|_| ControllerError::LockError)?;
-
-        // Lock the sender.
-        let tx_guard = self
-            .socket_tx
-            .lock()
-            .map_err(|_| ControllerError::LockError)?;
-        let tx = tx_guard.as_ref().ok_or(ControllerError::LockError)?;
-
-        // Send the staged commands, replacing them with an empty Vec.
-        tx.send(mem::take(&mut *staged))
-            .await
-            .map_err(|_| ControllerError::SendError)?;
-
-        Ok(())
-    }
-
-    pub async fn bind(&mut self, endpoint: &str) -> Result<(), ZmqError> {
+    pub async fn bind(endpoint: &str) -> Result<Self, ZmqError> {
         // bind the zmq socket
         let mut socket = DealerSocket::new();
         socket.connect(endpoint).await?;
         println!("Connected to server at {endpoint}");
 
+        // create event dispatcher
+
         let (tx, rx) = mpsc::channel::<Vec<(sdi::request::Command, Vec<EventHandle>)>>(1000);
 
-        self.socket_tx = Arc::new(Mutex::new(Some(tx)));
-
         // 3) Spawn the single I/O driver task that handles all read/write from the socket
-        let handle = tokio::spawn(Self::socket_driver(
-            socket,
-            rx,
-            self.event_dispatcher.clone(),
-        ));
+        let handle = tokio::spawn(Self::backend_routine(socket, rx));
 
-        self.handle = Arc::new(Mutex::new(Some(handle)));
+        let backend = Backend {
+            cmd_tx: tx,
+            handle: Arc::new(handle),
+        };
 
-        Ok(())
+        Ok(backend)
     }
 
-    async fn socket_driver(
+    async fn backend_routine(
         mut socket: DealerSocket,
-        mut rx: mpsc::Receiver<Vec<sdi::Command>>,
-        evt_dispatch: Arc<Mutex<EventDispatcher>>,
+        mut rx: mpsc::Receiver<Vec<(sdi::request::Command, Vec<EventHandle>)>>,
     ) {
+        let mut driver = BackendDriver::new();
+
         loop {
             tokio::select! {
                 // A) Incoming requests from the channel => send to server
                 maybe_req = rx.recv() => {
                     match maybe_req {
                         Some(cmds) => {
-                            for cmd in cmds {
-                                let bytes = cmd.encode_to_vec();
+                            for (cmd, evt) in cmds {
+                                let req = driver.outbound(cmd, evt);
+                                let bytes = req.encode_to_vec();
                                 if let Err(e) = socket.send(ZmqMessage::from(bytes)).await {
                                     eprintln!("Socket send failed: {:?}", e);
-                                    // You might choose to break or keep trying
                                 }
                             }
                         },
@@ -149,29 +158,10 @@ impl Backend {
                 result = socket.recv() => {
                     match result {
                         Ok(msg) => {
-                            // Dealer/Router typically has 2 frames: [identity, payload]
                             let payload = msg.get(0).unwrap();
-                            match sdi::Event::decode(payload.as_ref()) {
-                                Ok(evt) => {
-
-                                    // send this evt somewhere elese.
-
-                                    let correlation_id = evt.correlation_id;
-
-                                    let ir_events = match evt.payload.unwrap() {
-                                        sdi::event::Payload::SampleTopK(batch) => {
-                                            batch.items.into_iter().map(|item| IrEvent::SampleTopK(item)
-                                            ).collect()
-                                        },
-                                        sdi::event::Payload::GetTokenDistribution(batch) => {
-                                             batch.items.into_iter().map(|item| IrEvent::GetTokenDistribution(item)
-                                            ).collect()
-                                        }
-                                    };
-
-                                    let mut dispatcher = evt_dispatch.lock().unwrap();
-                                    dispatcher.dispatch(correlation_id, ir_events);
-
+                            match sdi::Response::decode(payload.as_ref()) {
+                                Ok(resp) => {
+                                    driver.inbound(resp);
                                 }
                                 Err(err) => {
                                     eprintln!("Failed to parse Response from server: {:?}", err);
@@ -190,7 +180,25 @@ impl Backend {
     }
 }
 
+impl ExecuteCommand for Backend {
+    async fn exec(
+        &self,
+        cmd: sdi::request::Command,
+        resp: Option<oneshot::Sender<sdi::response::Payload>>,
+    ) -> Result<(), BackendError> {
+        let evt = match resp {
+            Some(s) => vec![EventHandle::GetTokenDistribution(s)],
+            None => vec![EventHandle::None],
+        };
 
+        self.cmd_tx
+            .send(vec![(cmd, evt)])
+            .await
+            .map_err(|_| BackendError::ChannelClosed)?;
+
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 struct EventDispatcher {
@@ -209,7 +217,7 @@ impl EventDispatcher {
         self.table.insert(correlation_id, sender);
     }
 
-    fn dispatch(&mut self, correlation_id: u32, event: Vec<crate::controller::IrEvent>) {
+    fn dispatch(&mut self, correlation_id: u32, event: Vec<IrEvent>) {
         // zip senders and evnt
         let senders = self.table.get_mut(&correlation_id).unwrap();
         assert_eq!(senders.len(), event.len());
@@ -218,14 +226,14 @@ impl EventDispatcher {
             match sender {
                 EventHandle::None => {}
                 EventHandle::SampleTopK(s) => {
-                    if let crate::controller::IrEvent::SampleTopK(mut resp) = evt {
+                    if let IrEvent::SampleTopK(mut resp) = evt {
                         let _ = s.send(mem::take(&mut resp.token_ids));
                     } else {
                         eprintln!("Unexpected event type");
                     }
                 }
                 EventHandle::GetTokenDistribution(s) => {
-                    if let crate::controller::IrEvent::GetTokenDistribution(mut resp) = evt {
+                    if let IrEvent::GetTokenDistribution(mut resp) = evt {
                         let _ = s.send(mem::take(&mut resp.distribution));
                     } else {
                         eprintln!("Unexpected event type");
