@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package sdi;
+package sdi.l4m;
 
 // -----------------------------------------------------------------------------
 // Enum for kinds of objects.

@@ -4,7 +4,7 @@ use wasmtime::Result;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
 use crate::tokenizer::BytePairEncoder;
-use crate::{controller, lm, object};
+use crate::{driver_l4m, lm, object};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -37,7 +37,7 @@ pub struct InstanceState {
     evt_from_origin: Receiver<String>,
     evt_from_peers: Receiver<(String, String)>,
 
-    allocator: controller::IdPool,
+    allocator: driver_l4m::IdPool,
 
     utils: InstanceUtils,
 }
@@ -201,7 +201,7 @@ impl InstanceState {
             cmd_buffer,
             evt_from_origin,
             evt_from_peers,
-            allocator: controller::IdPool::new(1000, 1000),
+            allocator: driver_l4m::IdPool::new(1000, 1000),
             utils,
         }
     }

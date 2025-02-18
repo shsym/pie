@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use crate::object;
 
-use crate::controller::ControllerError;
+use crate::driver_l4m::DriverError;
 use crate::object::VspaceId;
 use crate::utils::Stream;
 use tokio::sync::oneshot;
@@ -31,7 +31,7 @@ pub trait CausalTransformer: object::IdMapper<KvBlock> + object::IdMapper<TokenE
         ctx_addrs: Vec<object::Id<KvBlock>>,
         input_embs: Vec<object::Id<TokenEmb>>,
         output_embs: Vec<object::Id<TokenEmb>>,
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 
     fn copy_tokens(
         &mut self,
@@ -42,7 +42,7 @@ pub trait CausalTransformer: object::IdMapper<KvBlock> + object::IdMapper<TokenE
         src_offset: u32,
         dst_offset: u32,
         size: u32,
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 
     fn mask_tokens(
         &mut self,
@@ -50,7 +50,7 @@ pub trait CausalTransformer: object::IdMapper<KvBlock> + object::IdMapper<TokenE
         space: &object::VspaceId,
         ptr: object::Id<KvBlock>,
         mask: &[bool],
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 }
 
 // probably unused in the first version. For BERT-like models.
@@ -62,7 +62,7 @@ pub trait FullTransformer: object::IdMapper<TokenEmb> {
         mask: Vec<bool>,
         input_embs: Vec<object::Id<TokenEmb>>,
         output_embs: Vec<object::Id<TokenEmb>>,
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 }
 
 // could be used for other LLM architectures like SSMs
@@ -73,7 +73,7 @@ pub trait Rnn: object::IdMapper<TokenEmb> {
         space: &object::VspaceId,
         state: object::Id<KvBlock>,
         output_embs: Vec<object::Id<TokenEmb>>,
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 }
 
 // ------------------------------------------------------------
@@ -88,7 +88,7 @@ pub trait CausalLanguageModel: object::IdMapper<TokenEmb> + object::IdMapper<Tok
         addrs: Vec<object::Id<TokenEmb>>,
         text_tokens: Vec<u32>,
         positions: Vec<u32>,
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 
     fn next_token_dist(
         &mut self,
@@ -96,7 +96,7 @@ pub trait CausalLanguageModel: object::IdMapper<TokenEmb> + object::IdMapper<Tok
         space: &object::VspaceId,
         emb_ptr: Vec<object::Id<TokenEmb>>,
         dist_ptr: Vec<object::Id<TokenDist>>,
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 
     fn sample_top_k(
         &mut self,
@@ -105,7 +105,7 @@ pub trait CausalLanguageModel: object::IdMapper<TokenEmb> + object::IdMapper<Tok
         dist_ptr: &object::Id<TokenDist>,
         k: u32,
         handle: oneshot::Sender<Vec<u32>>,
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 
     // todo: design a better struct to represent distributions
 }
@@ -117,7 +117,7 @@ pub trait MaskedLanguageModel: object::IdMapper<TokenEmb> + object::IdMapper<Tok
         space: &object::VspaceId,
         emb_ptr: &object::Id<TokenEmb>,
         dist_ptr: &object::Id<TokenDist>,
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 }
 
 // ------------------------------------------------------------
@@ -130,7 +130,7 @@ pub trait ImageEmbedder: object::IdMapper<TokenEmb> {
         space: &object::VspaceId,
         addrs: Vec<object::Id<TokenEmb>>,
         url: String,
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 }
 
 // Trait for backends that can embed videos.
@@ -141,7 +141,7 @@ pub trait VideoEmbedder: object::IdMapper<TokenEmb> {
         space: &object::VspaceId,
         addrs: Vec<object::Id<TokenEmb>>,
         url: String,
-    ) -> Result<(), ControllerError>;
+    ) -> Result<(), DriverError>;
 }
 
 /////

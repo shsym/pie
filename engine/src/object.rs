@@ -224,14 +224,45 @@ pub trait IdMapper<T>: Allocator<T> {
         tgts: &[Id<T>],
     ) -> Result<(), ObjectError>;
 
-    fn unassign(&mut self, vspace_id: &VspaceId, src: &Id<T>) -> Result<(), ObjectError> {
-        self.unassign_all(vspace_id, slice::from_ref(src))
+    fn alloc_and_assign(
+        &mut self,
+        stream: Stream,
+        space: &VspaceId,
+        src: &Id<T>,
+    ) -> Result<Id<T>, ObjectError> {
+        self.alloc_and_assign_all(stream, space, slice::from_ref(src))
+            .map(|mut ids| ids.pop().unwrap())
     }
 
-    fn unassign_all(&mut self, vspace_id: &VspaceId, srcs: &[Id<T>]) -> Result<(), ObjectError>;
-    // 
+    fn alloc_and_assign_all(
+        &mut self,
+        stream: Stream,
+        space: &VspaceId,
+        srcs: &[Id<T>],
+    ) -> Result<Vec<Id<T>>, ObjectError> {
+        let ids = self.alloc_all(stream, srcs.len())?;
+        self.assign_all(space, srcs, &ids)?;
+        Ok(ids)
+    }
+
+    fn unassign(
+        &mut self,
+        stream: Stream,
+        space: &VspaceId,
+        src: &Id<T>,
+    ) -> Result<(), ObjectError> {
+        self.unassign_all(stream, space, slice::from_ref(src))
+    }
+
+    fn unassign_all(
+        &mut self,
+        stream: Stream,
+        space: &VspaceId,
+        srcs: &[Id<T>],
+    ) -> Result<(), ObjectError>;
+    //
     // fn open(&mut self, space: VspaceId) -> Result<(), ObjectError>;
-    // 
+    //
     // fn close(&mut self, space: &VspaceId) -> Result<(), ObjectError>;
 
     // fn alloc(

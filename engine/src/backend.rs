@@ -1,16 +1,11 @@
-use crate::controller::{ControllerError, EventHandle, Namespace};
+use crate::driver_l4m::{DriverError, EventHandle, Namespace};
 use crate::utils::IdPool;
-use prost::Message;
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter};
 use std::mem;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
-
-pub mod sdi {
-    include!(concat!(env!("OUT_DIR"), "/sdi.rs"));
-}
 
 use prost::DecodeError;
 use thiserror::Error;
@@ -32,20 +27,24 @@ pub enum BackendError {
     CorrelationIdNotFound(u32),
 }
 
-pub trait ExecuteCommand: Debug + Send + Sync + 'static {
-    async fn exec(&self, cmd: sdi::Request) -> Result<(), BackendError>;
+pub trait ExecuteCommand<A, B>: Send + Sync + 'static {
+    async fn exec(&self, cmd: A) -> Result<(), BackendError>;
 
-    fn report_to(&self, tx: mpsc::Sender<sdi::Response>);
+    fn report_to(&self, tx: mpsc::Sender<B>);
 }
 
 #[derive(Debug, Clone)]
-pub struct Backend {
-    cmd_tx: mpsc::Sender<sdi::Request>,
-    evt_tx: Arc<Mutex<Option<mpsc::Sender<sdi::Response>>>>, // no tokio mutex. Because it will be only mutated once.
+pub struct ZmqBackend<A, B> {
+    cmd_tx: mpsc::Sender<A>,
+    evt_tx: Arc<Mutex<Option<mpsc::Sender<B>>>>, // no tokio mutex. Because it will be only mutated once.
     handle: Arc<JoinHandle<()>>,
 }
 
-impl Backend {
+impl<A, B> ZmqBackend<A, B>
+where
+    A: prost::Message + 'static,
+    B: prost::Message + Default + 'static,
+{
     pub async fn bind(endpoint: &str) -> Result<Self, ZmqError> {
         // bind the zmq socket
         let mut socket = DealerSocket::new();
@@ -54,13 +53,13 @@ impl Backend {
 
         // create event dispatcher
 
-        let (tx, rx) = mpsc::channel::<sdi::Request>(1000);
+        let (tx, rx) = mpsc::channel::<A>(1000);
         let event_tx = Arc::new(Mutex::new(None));
 
         // 3) Spawn the single I/O driver task that handles all read/write from the socket
         let handle = tokio::spawn(Self::backend_routine(socket, rx, event_tx.clone()));
 
-        let backend = Backend {
+        let backend = ZmqBackend {
             cmd_tx: tx,
             evt_tx: event_tx,
             handle: Arc::new(handle),
@@ -71,8 +70,8 @@ impl Backend {
 
     async fn backend_routine(
         mut socket: DealerSocket,
-        mut rx: mpsc::Receiver<sdi::Request>,
-        evt_tx: Arc<Mutex<Option<mpsc::Sender<sdi::Response>>>>,
+        mut rx: mpsc::Receiver<A>,
+        evt_tx: Arc<Mutex<Option<mpsc::Sender<B>>>>,
     ) {
         loop {
             tokio::select! {
@@ -99,7 +98,7 @@ impl Backend {
                     match result {
                         Ok(msg) => {
                             let payload = msg.get(0).unwrap();
-                            match sdi::Response::decode(payload.as_ref()) {
+                            match B::decode(payload.as_ref()) {
                                 Ok(resp) => {
                                     let a = evt_tx.lock().unwrap();
                                     if let Some(tx) = &*a {
@@ -125,8 +124,12 @@ impl Backend {
     }
 }
 
-impl ExecuteCommand for Backend {
-    async fn exec(&self, cmd: sdi::Request) -> Result<(), BackendError> {
+impl<A, B> ExecuteCommand<A, B> for ZmqBackend<A, B>
+where
+    A: prost::Message + 'static,
+    B: prost::Message + Default + 'static,
+{
+    async fn exec(&self, cmd: A) -> Result<(), BackendError> {
         self.cmd_tx
             .send(cmd)
             .await
@@ -135,7 +138,7 @@ impl ExecuteCommand for Backend {
         Ok(())
     }
 
-    fn report_to(&self, tx: Sender<sdi::Response>) {
+    fn report_to(&self, tx: Sender<B>) {
         self.evt_tx.lock().unwrap().replace(tx);
     }
 }
