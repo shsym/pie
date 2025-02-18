@@ -100,6 +100,10 @@ pub enum Command {
         resource_name: String,
     },
 
+    GetAllExportedBlocks {
+        handle: oneshot::Sender<Vec<(String, u32)>>,
+    },
+
     CopyBlock {
         stream: u32,
         src_block: object::Id<lm::KvBlock>,
@@ -130,6 +134,7 @@ pub enum Command {
         stream: u32,
         embs: Vec<object::Id<lm::TokenEmb>>,
         text: Vec<u32>,
+        positions: Vec<u32>,
     },
 
     EmbedImage {
@@ -157,7 +162,7 @@ pub enum Command {
 
     SampleTopK {
         stream: u32,
-        emb: object::Id<lm::TokenEmb>,
+        emb: object::Id<lm::TokenDist>,
         k: u32,
         handle: oneshot::Sender<Vec<u32>>,
     },
@@ -247,6 +252,13 @@ impl spi::app::system::Host for InstanceState {
     async fn subscribe(&mut self, topic: String) -> Result<(), wasmtime::Error> {
         self.cmd_buffer
             .send((self.id, Command::Subscribe { topic }))
+            .await?;
+        Ok(())
+    }
+
+    async fn unsubscribe(&mut self, topic: String) -> Result<(), wasmtime::Error> {
+        self.cmd_buffer
+            .send((self.id, Command::Unsubscribe { topic }))
             .await?;
         Ok(())
     }
@@ -347,17 +359,17 @@ impl spi::lm::inference::Host for InstanceState {
         Ok(())
     }
 
-    async fn fill_blocks(
+    async fn fill_block(
         &mut self,
         stream: u32,
-        blocks: Vec<object::IdRepr>,
+        block: object::IdRepr,
         context: Vec<object::IdRepr>,
         inputs: Vec<object::IdRepr>,
         outputs: Vec<object::IdRepr>,
     ) -> Result<(), wasmtime::Error> {
         let cmd = Command::FillBlock {
             stream,
-            blocks: object::Id::map_from_repr(blocks),
+            block:block.into(),
             context: object::Id::map_from_repr(context),
             inputs: object::Id::map_from_repr(inputs),
             outputs: object::Id::map_from_repr(outputs),
@@ -438,16 +450,31 @@ impl spi::lm::inference::Host for InstanceState {
         Ok(())
     }
 
+    async fn get_all_exported_blocks(&mut self) -> Result<Vec<(String, u32)>, wasmtime::Error> {
+        let (tx, rx) = oneshot::channel();
+
+        let cmd = Command::GetAllExportedBlocks { handle: tx };
+        self.cmd_buffer.send((self.id, cmd)).await?;
+
+        let result = rx
+            .await
+            .or(Err(wasmtime::Error::msg("GetAllExportedBlocks failed")))?;
+
+        Ok(result)
+    }
+
     async fn embed_text(
         &mut self,
         stream: u32,
         embs: Vec<object::IdRepr>,
         tokens: Vec<u32>,
+        positions: Vec<u32>,
     ) -> Result<(), wasmtime::Error> {
         let cmd = Command::EmbedText {
             stream,
             embs: object::Id::map_from_repr(embs),
             text: tokens,
+            positions,
         };
 
         self.cmd_buffer.send((self.id, cmd)).await?;

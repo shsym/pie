@@ -13,6 +13,7 @@ use blake3::Hasher;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
+use std::time::Instant;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -35,8 +36,8 @@ use wasmtime_wasi::{WasiImpl, WasiView};
 // For MessagePack serialization/deserialization.
 use crate::backend::Backend;
 use crate::controller::Controller;
-use crate::lm::{CausalTransformer, KvBlock};
-use crate::object::{Allocator, IdMapper, VspaceId};
+use crate::lm::{CausalLanguageModel, CausalTransformer, ImageEmbedder, KvBlock};
+use crate::object::{Allocator, Fetcher, IdMapper, VspaceId};
 use crate::tokenizer::{llama3_tokenizer, BytePairEncoder};
 use crate::utils::Stream;
 use rmp_serde::{decode::from_slice, encode::to_vec_named};
@@ -173,13 +174,13 @@ enum ServerMessage {
 }
 
 #[derive(Debug)]
-pub struct ExportedBlocks {
+struct ExportedBlocks {
     owner_id: InstanceId,
-    addrs: Vec<crate::object::Id<KvBlock>>,
+    addrs: Vec<object::Id<KvBlock>>,
 }
 
 impl ExportedBlocks {
-    pub fn new(owner_id: InstanceId, addrs: Vec<crate::object::Id<KvBlock>>) -> Self {
+    pub fn new(owner_id: InstanceId, addrs: Vec<object::Id<KvBlock>>) -> Self {
         Self { owner_id, addrs }
     }
 }
@@ -222,6 +223,9 @@ async fn control_loop(
                 for (_, subs) in subscriptions.iter_mut() {
                     subs.retain(|&x| x != inst_id);
                 }
+
+                // remove all exported blocks
+                exported_blocks.retain(|_, v| v.owner_id != inst_id);
             }
             Command::SendToOrigin { message } => {
                 let inst = state.running_instances.get(&inst_id).unwrap();
@@ -285,51 +289,165 @@ async fn control_loop(
                     .fill(stream, &space, block, context, inputs, outputs)
                     .expect("Failed to fill blocks");
             }
-            Command::ExportBlocks { .. } => {}
-            Command::ImportBlocks { .. } => {}
-            Command::CopyBlock { .. } => {}
-            Command::MaskBlock { .. } => {}
-            Command::AllocateEmb { .. } => {}
-            Command::DeallocateEmb { .. } => {}
-            Command::EmbedText { .. } => {}
-            Command::EmbedImage { .. } => {}
-            Command::AllocateDist { .. } => {}
-            Command::DeallocateDist { .. } => {}
-            Command::DecodeTokenDist { .. } => {}
-            Command::SampleTopK { .. } => {}
-            Command::GetTokenDist { .. } => {}
+            Command::ExportBlocks {
+                blocks,
+                resource_name,
+            } => {
+                let space = vspaces.get(&inst_id).unwrap();
+                let gids = controller
+                    .lookup_all(space, &blocks)
+                    .expect("Failed to lookup blocks");
+
+                exported_blocks.insert(resource_name, ExportedBlocks::new(inst_id, gids));
+            }
+            Command::ImportBlocks {
+                blocks,
+                resource_name,
+            } => {
+                let space = *vspaces.get(&inst_id).unwrap();
+                let exported = exported_blocks
+                    .get(&resource_name)
+                    .expect("Resource not found");
+
+                controller
+                    .assign_all(&space, &blocks, &exported.addrs)
+                    .expect("Failed to assign blocks");
+            }
+            Command::GetAllExportedBlocks { handle } => {
+                // share a "catalogue" of exported blocks
+                let catalogue = exported_blocks
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.addrs.len() as u32))
+                    .collect();
+
+                handle.send(catalogue).unwrap();
+            }
+            Command::CopyBlock {
+                stream,
+                src_block,
+                dst_block,
+                src_token_offset,
+                dst_token_offset,
+                size,
+            } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+                let space = *vspaces.get(&inst_id).unwrap();
+                controller
+                    .copy_tokens(
+                        stream,
+                        &space,
+                        src_block,
+                        dst_block,
+                        src_token_offset,
+                        dst_token_offset,
+                        size,
+                    )
+                    .expect("Failed to copy tokens");
+            }
+            Command::MaskBlock {
+                stream,
+                block,
+                mask,
+            } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+                let space = *vspaces.get(&inst_id).unwrap();
+                controller
+                    .mask_tokens(stream, &space, block, &mask)
+                    .expect("Failed to mask tokens");
+            }
+            Command::AllocateEmb { stream, embs } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+                let space = *vspaces.get(&inst_id).unwrap();
+                let ids = controller
+                    .alloc_all(stream, embs.len())
+                    .expect("Failed to allocate embeddings");
+
+                controller
+                    .assign_all(&space, &embs, &ids)
+                    .expect("Failed to assign embeddings");
+            }
+            Command::DeallocateEmb { stream, embs } => {
+                let space = *vspaces.get(&inst_id).unwrap();
+                controller
+                    .unassign_all(&space, &embs)
+                    .expect("Failed to unassign embeddings");
+            }
+            Command::EmbedText {
+                stream,
+                embs,
+                text,
+                positions,
+            } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+
+                let space = *vspaces.get(&inst_id).unwrap();
+
+                controller
+                    .embed_text(stream, &space, embs, text, positions)
+                    .unwrap();
+            }
+            Command::EmbedImage {
+                stream,
+                embs,
+                image,
+            } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+                let space = *vspaces.get(&inst_id).unwrap();
+                controller.embed_img(stream, &space, embs, image).unwrap();
+            }
+            Command::AllocateDist { stream, dists } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+                let space = *vspaces.get(&inst_id).unwrap();
+                let ids = controller
+                    .alloc_all(stream, dists.len())
+                    .expect("Failed to allocate distributions");
+
+                controller
+                    .assign_all(&space, &dists, &ids)
+                    .expect("Failed to assign distributions");
+            }
+            Command::DeallocateDist { stream, dists } => {
+                let space = *vspaces.get(&inst_id).unwrap();
+                controller
+                    .unassign_all(&space, &dists)
+                    .expect("Failed to unassign distributions");
+            }
+            Command::DecodeTokenDist {
+                stream,
+                embs,
+                dists,
+            } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+                let space = *vspaces.get(&inst_id).unwrap();
+                controller
+                    .next_token_dist(stream, &space, embs, dists)
+                    .unwrap();
+            }
+            Command::SampleTopK {
+                stream,
+                emb,
+                k,
+                handle,
+            } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+                let space = *vspaces.get(&inst_id).unwrap();
+                controller
+                    .sample_top_k(stream, &space, &emb, k, handle)
+                    .unwrap();
+            }
+            Command::GetTokenDist {
+                stream,
+                dist,
+                handle,
+            } => {
+                let stream = Stream::new(&inst_id, Some(stream));
+                let space = *vspaces.get(&inst_id).unwrap();
+                controller.fetch(stream, &space, &dist, handle).unwrap();
+            }
         }
 
-        let InstanceMessageOld {
-            instance_id,
-            dest_id,
-            message,
-        } = instance_msg;
-
-        // get handle
-        let instance_handle = state_.running_instances.get(&instance_id).unwrap();
-        let client_id = instance_handle.client_id;
-
-        // dest_id = 0: to symphony server.
-        // dest_id = 1: to client.
-        // dest_id = 2: to LLM server.
-        // dest_id > 4: to other instances.
-
-        // Construct a ProgramEvent message for the client
-        if dest_id == 1 {
-            // (Just parse or wrap the `message` into JSON)
-
-            let server_msg = ServerMessage::ProgramEvent {
-                instance_id: instance_id.to_string(),
-                event_data: message,
-            };
-
-            // get client handle
-            let client_handle = state_.clients.get(&client_id).unwrap();
-            client_handle.server2client.send(server_msg).await.unwrap();
-        } else {
-            // Currently do nothing for other channels,
-        }
+        // let the backend do its work
+        controller.submit(Instant::now()).await.unwrap();
     }
 }
 
@@ -344,10 +462,10 @@ async fn main() -> anyhow::Result<()> {
     config.async_support(true);
 
     // Load tokenizer
-    let tokenizer = llama3_tokenizer("../tokenizer.model").unwrap();
+    let tokenizer = llama3_tokenizer("../tokenizer.model").expect("Tokenizer load failed");
 
     // create channel
-    let (inst2server_tx, mut inst2server_rx) = channel(1024);
+    let (inst2server_tx, inst2server_rx) = channel(1024);
 
     let mut server_state = ServerState {
         programs_in_disk: DashMap::new(),
@@ -378,7 +496,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to bind backend")?;
 
-    let controller_handle = tokio::spawn(control_loop(backend, inst2server_rx));
+    let controller_handle = tokio::spawn(control_loop(backend, inst2server_rx, state.clone()));
 
     // Accept incoming connections
     loop {
@@ -691,11 +809,13 @@ async fn handle_client_message_start_program(
 
     // create a channel
     let (server2inst_tx, server2inst_rx) = channel(32);
+    let (peer_tx, peer_rx) = channel(32);
 
     let inst_state = InstanceState::new(
         instance_id,
         state.inst2server.clone(),
         server2inst_rx,
+        peer_rx,
         InstanceUtils {
             tokenizer: state.utils.clone(),
         },
@@ -785,7 +905,8 @@ async fn handle_client_message_start_program(
     let handle = InstanceHandle {
         client_id,
         hash: hash.clone(),
-        server2inst: server2inst_tx,
+        evt_from_origin: server2inst_tx,
+        evt_from_peers: peer_tx,
         join_handle,
     };
 
@@ -814,15 +935,7 @@ async fn handle_client_message_send_message(
         }
     };
 
-    if let Err(e) = instance_handle
-        .server2inst
-        .send(InstanceMessageOld {
-            instance_id,
-            dest_id: 0,
-            message: event_data,
-        })
-        .await
-    {
+    if let Err(e) = instance_handle.evt_from_origin.send(event_data).await {
         return vec![ServerMessage::Error {
             error: format!("Failed to send event to instance: {}", e),
         }];

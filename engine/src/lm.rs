@@ -3,9 +3,9 @@ use std::fmt::Debug;
 use crate::object;
 
 use crate::controller::ControllerError;
+use crate::object::VspaceId;
 use crate::utils::Stream;
 use tokio::sync::oneshot;
-
 // object::Id definition ------------------------------------------------
 
 // ------------------------------------------------------------
@@ -81,21 +81,31 @@ pub trait Rnn: object::IdMapper<TokenEmb> {
 // ------------------------------------------------------------
 
 pub trait CausalLanguageModel: object::IdMapper<TokenEmb> + object::IdMapper<TokenDist> {
+    fn embed_text(
+        &mut self,
+        stream: Stream,
+        space: &VspaceId,
+        addrs: Vec<object::Id<TokenEmb>>,
+        text_tokens: Vec<u32>,
+        positions: Vec<u32>,
+    ) -> Result<(), ControllerError>;
+
     fn next_token_dist(
         &mut self,
         stream: Stream,
         space: &object::VspaceId,
-        emb_ptr: object::Id<TokenEmb>,
-        dist_ptr: object::Id<TokenDist>,
+        emb_ptr: Vec<object::Id<TokenEmb>>,
+        dist_ptr: Vec<object::Id<TokenDist>>,
     ) -> Result<(), ControllerError>;
 
     fn sample_top_k(
         &mut self,
         stream: Stream,
         space: &object::VspaceId,
-        dist_ptr: object::Id<TokenDist>,
+        dist_ptr: &object::Id<TokenDist>,
         k: u32,
-    ) -> Result<oneshot::Receiver<Vec<u32>>, ControllerError>;
+        handle: oneshot::Sender<Vec<u32>>,
+    ) -> Result<(), ControllerError>;
 
     // todo: design a better struct to represent distributions
 }
@@ -105,8 +115,8 @@ pub trait MaskedLanguageModel: object::IdMapper<TokenEmb> + object::IdMapper<Tok
         &mut self,
         stream: Stream,
         space: &object::VspaceId,
-        emb_ptr: object::Id<TokenEmb>,
-        dist_ptr: object::Id<TokenDist>,
+        emb_ptr: &object::Id<TokenEmb>,
+        dist_ptr: &object::Id<TokenDist>,
     ) -> Result<(), ControllerError>;
 }
 

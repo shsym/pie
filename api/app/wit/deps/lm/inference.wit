@@ -3,17 +3,18 @@ interface inference {
     allocate-blocks: func(stream-id:u32, count:u32) -> list<u32>;
     deallocate-blocks: func(stream-id:u32, ids: list<u32>);
 
-    fill-blocks: func(stream-id:u32, blocks:list<u32>, context: list<u32>, inputs: list<u32>, outputs: list<u32>);
+    fill-block: func(stream-id:u32, blocks:u32, context: list<u32>, inputs: list<u32>, outputs: list<u32>);
     copy-block: func(stream-id:u32, src:u32, dst:u32, src-offset:u32, dst-offset:u32, size:u32);
     mask-block: func(stream-id:u32, block:u32, mask:list<u32>);
 
     export-blocks: func(src:list<u32>, name:string);
     import-blocks: func(dst:list<u32>, name:string);
+    get-all-exported-blocks: func() -> list<tuple<string, u32>>;
 
     allocate-embeds: func(stream-id:u32, count:u32) -> list<u32>;
     deallocate-embeds: func(stream-id:u32, ids: list<u32>);
 
-    embed-text: func(stream-id:u32, embs:list<u32>, tokens:list<u32>);
+    embed-text: func(stream-id:u32, embs:list<u32>, tokens:list<u32>, positions:list<u32>);
     embed-image: func(stream-id:u32, embs:list<u32>, url:string);
     embed-video: func(stream-id:u32, embs:list<u32>, url:string);
 

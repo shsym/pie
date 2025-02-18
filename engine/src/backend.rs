@@ -1,4 +1,4 @@
-use crate::controller::{ControllerError, EventHandle, IrEvent, Namespace};
+use crate::controller::{ControllerError, EventHandle, Namespace};
 use crate::utils::IdPool;
 use prost::Message;
 use std::collections::HashMap;
@@ -32,12 +32,11 @@ pub enum BackendError {
     CorrelationIdNotFound(u32),
 }
 
-pub trait ExecuteCommand: Debug + Send + Sync +'static {
+pub trait ExecuteCommand: Debug + Send + Sync + 'static {
     async fn exec(&self, cmd: sdi::Request) -> Result<(), BackendError>;
 
     fn report_to(&self, tx: mpsc::Sender<sdi::Response>);
 }
-
 
 #[derive(Debug, Clone)]
 pub struct Backend {
