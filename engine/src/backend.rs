@@ -3,13 +3,13 @@ use crate::utils::IdPool;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::mem;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 use tokio::task::JoinHandle;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
 use prost::DecodeError;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::sync::mpsc::Sender;
 
 #[derive(Debug, Error)]
@@ -30,13 +30,13 @@ pub enum BackendError {
 pub trait ExecuteCommand<A, B>: Send + Sync + 'static {
     async fn exec(&self, cmd: A) -> Result<(), BackendError>;
 
-    fn report_to(&self, tx: mpsc::Sender<B>);
+    async fn report_to(&self, tx: mpsc::Sender<B>);
 }
 
 #[derive(Debug, Clone)]
 pub struct ZmqBackend<A, B> {
-    cmd_tx: mpsc::Sender<A>,
-    evt_tx: Arc<Mutex<Option<mpsc::Sender<B>>>>, // no tokio mutex. Because it will be only mutated once.
+    cmd_tx: Sender<A>,
+    evt_tx: Arc<Mutex<Option<Sender<B>>>>, // no tokio mutex. Because it will be only mutated once.
     handle: Arc<JoinHandle<()>>,
 }
 
@@ -71,7 +71,7 @@ where
     async fn backend_routine(
         mut socket: DealerSocket,
         mut rx: mpsc::Receiver<A>,
-        evt_tx: Arc<Mutex<Option<mpsc::Sender<B>>>>,
+        evt_tx: Arc<Mutex<Option<Sender<B>>>>,
     ) {
         loop {
             tokio::select! {
@@ -100,7 +100,7 @@ where
                             let payload = msg.get(0).unwrap();
                             match B::decode(payload.as_ref()) {
                                 Ok(resp) => {
-                                    let a = evt_tx.lock().unwrap();
+                                    let a = evt_tx.lock().await;
                                     if let Some(tx) = &*a {
                                         let _ = tx.send(resp);
                                     } else {
@@ -138,7 +138,7 @@ where
         Ok(())
     }
 
-    fn report_to(&self, tx: Sender<B>) {
-        self.evt_tx.lock().unwrap().replace(tx);
+    async fn report_to(&self, tx: Sender<B>) {
+        self.evt_tx.lock().await.replace(tx);
     }
 }

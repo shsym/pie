@@ -4,15 +4,20 @@ use crate::lm::{
 use crate::utils::{Counter, Stream};
 use crate::{backend, object, utils};
 use anyhow::{anyhow, bail, ensure};
+use rand::Rng;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
+use crate::backend::BackendError;
+//use crate::driver_l4m::l4m::{Request, Response};
 use crate::object::{Allocator, Fetcher, Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
 use thiserror::Error;
+use tokio::sync::mpsc::Sender;
+use tokio::task::JoinHandle;
 
 mod l4m {
     include!(concat!(env!("OUT_DIR"), "/sdi.l4m.rs"));
@@ -227,9 +232,7 @@ where
         mut rx: tokio::sync::mpsc::Receiver<l4m::Response>,
         dispatcher: Arc<Mutex<EventDispatcher>>,
     ) {
-        loop {
-            let resp = rx.recv().await.unwrap();
-
+        while let Some(resp) = rx.recv().await {
             let correlation_id = resp.correlation_id;
             let payload = resp.payload.unwrap();
 
@@ -1001,10 +1004,7 @@ impl IdPool {
             .map_err(|e| ObjectError::AddressPoolError(e.to_string()))
     }
 
-    pub fn release_many<T: Managed>(
-        &mut self,
-        ids: &[ObjectId<T>],
-    ) -> Result<(), ObjectError> {
+    pub fn release_many<T: Managed>(&mut self, ids: &[ObjectId<T>]) -> Result<(), ObjectError> {
         let raw_ids = ObjectId::ref_as_repr(ids);
         self.pool_mut::<T>()
             .release_many(raw_ids)
@@ -1032,9 +1032,7 @@ impl IdMap {
     }
 
     // Helper method to get a mutable reference to the appropriate map.
-    fn mapping_mut<T: Managed>(
-        &mut self,
-    ) -> &mut HashMap<object::IdRepr, object::IdRepr> {
+    fn mapping_mut<T: Managed>(&mut self) -> &mut HashMap<object::IdRepr, object::IdRepr> {
         match T::NAMESPACE {
             Namespace::KvBlock => &mut self.kv_block_id_map,
             Namespace::Emb => &mut self.emb_id_map,
@@ -1081,10 +1079,7 @@ impl IdMap {
         self.mapping_mut::<T>().insert(src, dst);
     }
 
-    fn unassign<T: Managed>(
-        &mut self,
-        vid: &ObjectId<T>,
-    ) -> Result<ObjectId<T>, ObjectError> {
+    fn unassign<T: Managed>(&mut self, vid: &ObjectId<T>) -> Result<ObjectId<T>, ObjectError> {
         let vid = vid.into();
         let id = self
             .mapping_mut::<T>()
@@ -1152,5 +1147,105 @@ impl RefCounter {
 
     pub fn get<T: Managed>(&self, id: &ObjectId<T>) -> usize {
         self.counter::<T>().get(&id.into()).unwrap().get() as usize
+    }
+}
+
+// Assuming these are defined somewhere
+// use l4m::{Request, Response, request, response};
+// use backend::{ExecuteCommand, BackendError};
+
+pub struct DummyBackend {
+    exec_overhead: Duration,
+    cmd_tx: mpsc::Sender<l4m::Request>,
+    evt_tx: Arc<Mutex<Option<mpsc::Sender<l4m::Response>>>>,
+    handle: Arc<JoinHandle<()>>,
+}
+
+impl DummyBackend {
+    pub async fn new(exec_overhead: Duration) -> DummyBackend {
+        let (cmd_tx, rx) = mpsc::channel::<l4m::Request>(1000);
+        let evt_tx = Arc::new(Mutex::new(None));
+
+        // Spawn the background routine and pass the exec_overhead to simulate delay.
+        let handle = tokio::spawn(Self::backend_routine(
+            rx,
+            Arc::clone(&evt_tx),
+            exec_overhead,
+        ));
+
+        DummyBackend {
+            exec_overhead,
+            cmd_tx,
+            evt_tx,
+            handle: Arc::new(handle),
+        }
+    }
+
+    async fn backend_routine(
+        mut rx: mpsc::Receiver<l4m::Request>,
+        evt_tx: Arc<Mutex<Option<mpsc::Sender<l4m::Response>>>>,
+        exec_overhead: Duration,
+    ) {
+        while let Some(req) = rx.recv().await {
+            // Simulate execution overhead for each request.
+            tokio::time::sleep(exec_overhead).await;
+
+            let resp_payload = match req.command.unwrap() {
+                l4m::request::Command::SampleTopKRequest(batch) => {
+                    let items = batch.items.into_iter().map(|item| {
+                        let mut rng = rand::thread_rng();
+                        let token_ids: Vec<_> =
+                            (0..item.k).map(|_| rng.gen_range(0..1000)).collect();
+                        l4m::SampleTopKResponse { token_ids }
+                    });
+                    Some(l4m::response::Payload::SampleTopK(
+                        l4m::BatchSampleTopKResponse {
+                            items: items.collect(),
+                        },
+                    ))
+                }
+                l4m::request::Command::GetTokenDistribution(batch) => {
+                    let items = batch.items.into_iter().map(|item| {
+                        let mut rng = rand::thread_rng();
+                        let distribution: Vec<_> =
+                            (0..1000).map(|_| rng.gen_range(0.0..1.0)).collect();
+                        l4m::GetTokenDistributionResponse { distribution }
+                    });
+                    Some(l4m::response::Payload::GetTokenDistribution(
+                        l4m::BatchGetTokenDistributionResponse {
+                            items: items.collect(),
+                        },
+                    ))
+                }
+                _ => None,
+            };
+
+            if let Some(payload) = resp_payload {
+                let resp = l4m::Response {
+                    correlation_id: req.correlation_id,
+                    payload: Some(payload),
+                };
+                let mut evt_tx_guard = evt_tx.lock().await;
+                if let Some(tx) = evt_tx_guard.as_mut() {
+                    // Here, unwrap is used for brevity.
+                    tx.send(resp).await.unwrap();
+                }
+            }
+        }
+    }
+}
+
+impl backend::ExecuteCommand<l4m::Request, l4m::Response> for DummyBackend {
+    async fn exec(&self, cmd: l4m::Request) -> Result<(), BackendError> {
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| BackendError::ChannelClosed)?;
+
+        Ok(())
+    }
+
+    async fn report_to(&self, tx: mpsc::Sender<l4m::Response>) {
+        self.evt_tx.lock().await.replace(tx);
     }
 }

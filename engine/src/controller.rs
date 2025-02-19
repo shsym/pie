@@ -1,8 +1,10 @@
-use crate::instance::Command;
-use crate::lm::{CausalLanguageModel, CausalTransformer, ImageEmbedder};
+use crate::instance::{Command, Id as InstanceId};
+use crate::lm::{CausalLanguageModel, CausalTransformer, ImageEmbedder, KvBlock};
 use crate::object::{Fetcher, IdMapper, VspaceId};
+use crate::runtime::Runtime;
+use crate::server::ServerMessage;
 use crate::utils::Stream;
-use crate::{driver_l4m, instance, utils, ExportedBlocks, ServerMessage, ServerState};
+use crate::{driver_l4m, instance, object, utils};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,7 +38,7 @@ pub enum ControllerError {
 }
 
 pub struct Controller<BL4M> {
-    state: Arc<ServerState>,
+    state: Arc<Runtime>,
 
     vspaces: HashMap<instance::Id, VspaceId>,
     vspace_id_pool: utils::IdPool<VspaceId>,
@@ -51,7 +53,7 @@ impl<BL4M> Controller<BL4M>
 where
     BL4M: driver_l4m::ExecuteCommand,
 {
-    pub async fn new(state: Arc<ServerState>, backend_l4m: BL4M) -> Self {
+    pub async fn new(state: Arc<Runtime>, backend_l4m: BL4M) -> Self {
         Controller {
             state,
             vspaces: HashMap::new(),
@@ -106,18 +108,13 @@ where
                     .running_instances
                     .get(&inst_id)
                     .ok_or(ControllerError::InstanceNotFound(inst_id))?;
-                let client = self
-                    .state
-                    .clients
-                    .get(&inst.client_id)
-                    .ok_or(ControllerError::ClientNotFound(inst_id))?;
 
                 let server_msg = ServerMessage::ProgramEvent {
                     instance_id: inst_id.to_string(),
                     event_data: message,
                 };
 
-                client.server2client.send(server_msg).await.map_err(|e| {
+                inst.to_origin.send(server_msg).await.map_err(|e| {
                     ControllerError::SendError(format!("SendToOrigin failed: {}", e))
                 })?;
             }
@@ -414,5 +411,17 @@ where
             .map_err(|e| ControllerError::DriverError(format!("Submit failed: {}", e)))?;
 
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ExportedBlocks {
+    owner_id: InstanceId,
+    addrs: Vec<object::Id<KvBlock>>,
+}
+
+impl ExportedBlocks {
+    pub fn new(owner_id: InstanceId, addrs: Vec<object::Id<KvBlock>>) -> Self {
+        Self { owner_id, addrs }
     }
 }

@@ -369,7 +369,7 @@ impl spi::lm::inference::Host for InstanceState {
     ) -> Result<(), wasmtime::Error> {
         let cmd = Command::FillBlock {
             stream,
-            block:block.into(),
+            block: block.into(),
             context: object::Id::map_from_repr(context),
             inputs: object::Id::map_from_repr(inputs),
             outputs: object::Id::map_from_repr(outputs),
