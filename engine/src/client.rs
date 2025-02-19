@@ -324,9 +324,13 @@ impl Client {
             match incoming {
                 ServerMessage::ProgramTerminated {
                     instance_id: term_id,
+                    reason,
                 } => {
                     if term_id == instance_id {
-                        println!("[Client] ProgramTerminated for instance_id={}", instance_id);
+                        println!(
+                            "[Client] ProgramTerminated for instance_id={}, because {}",
+                            instance_id, reason
+                        );
                         return Ok(());
                     } else {
                         eprintln!(

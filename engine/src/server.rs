@@ -138,7 +138,7 @@ pub enum ServerMessage {
     },
 
     #[serde(rename = "program_terminated")]
-    ProgramTerminated { instance_id: String },
+    ProgramTerminated { instance_id: String, reason: String },
 
     #[serde(rename = "error")]
     Error { error: String },
@@ -463,7 +463,10 @@ async fn handle_terminate_program(
 
     let was_terminated = state.runtime.terminate_program(inst_id);
     if was_terminated {
-        Ok(vec![ServerMessage::ProgramTerminated { instance_id }])
+        Ok(vec![ServerMessage::ProgramTerminated {
+            instance_id,
+            reason: "User requested".to_string(),
+        }])
     } else {
         Err(ServerError::NoSuchRunningInstance(inst_id.to_string()))
     }

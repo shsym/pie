@@ -155,6 +155,7 @@ impl Runtime {
 
         // 5) Instantiate and run in a task
         let engine_clone = self.engine.clone();
+        let to_origin_clone = to_origin.clone();
         let join_handle = tokio::spawn(async move {
             // Wrap everything in a closure returning a Result,
             // so we can capture errors more systematically if desired:
@@ -184,7 +185,7 @@ impl Runtime {
                     .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
 
                 let run_func = instance
-                    .get_typed_func::<(), (Result<(), ()>,)>(&mut store, &run_func_export)
+                    .get_typed_func::<(), (Result<(), String>,)>(&mut store, &run_func_export)
                     .map_err(|e| {
                         RuntimeError::Other(format!("Failed to get 'run' function: {e}"))
                     })?;
@@ -192,20 +193,37 @@ impl Runtime {
                 match run_func.call_async(&mut store, ()).await {
                     Ok((Ok(()),)) => {
                         println!("Instance {instance_id} finished normally");
+                        Ok(())
                     }
-                    Ok((Err(()),)) => {
+                    Ok((Err(runtime_err),)) => {
                         eprintln!("Instance {instance_id} returned an error");
+                        Err(RuntimeError::Other(runtime_err))
                     }
                     Err(call_err) => {
                         eprintln!("Instance {instance_id} call error: {call_err}");
+                        Err(RuntimeError::Other(format!("Call error: {call_err}")))
                     }
                 }
-                Ok::<(), RuntimeError>(())
             }
             .await;
 
             if let Err(err) = result {
                 eprintln!("Instance {instance_id} error: {err}");
+                to_origin_clone
+                    .send(ServerMessage::ProgramTerminated {
+                        instance_id: String::from(instance_id),
+                        reason: format!("{err}"),
+                    })
+                    .await
+                    .ok();
+            } else {
+                to_origin_clone
+                    .send(ServerMessage::ProgramTerminated {
+                        instance_id: String::from(instance_id),
+                        reason: "the instance normally finished".to_string(),
+                    })
+                    .await
+                    .ok();
             }
         });
 

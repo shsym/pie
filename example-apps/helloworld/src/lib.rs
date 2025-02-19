@@ -1,22 +1,21 @@
-wit_bindgen::generate!({
-    path: "../../api/app/wit",
-    world: "app",
-    generate_all,
-});
+use symphony::Run;
 
-use crate::exports::spi::app::run::Guest;
-use crate::spi::app::system;
+struct App;
 
-struct HelloWorld;
+impl Run for App {
+    async fn run() -> Result<(), String> {
+        let inst_id = symphony::system::get_instance_id();
 
-impl Guest for HelloWorld {
-    fn run() -> Result<(), ()> {
-        println!("I am a WASM module running in the Symphony runtime!");
+        println!(
+            "[{}] I am a WASM module running in the Symphony runtime!",
+            { inst_id }
+        );
 
-        system::send_to_origin("What is your name?");
-        system::send_to_origin("Have a great day!");
+        symphony::system::send_to_origin("What is your name?");
+        symphony::system::send_to_origin("Have a great day!");
+
         Ok(())
     }
 }
 
-export!(HelloWorld);
+symphony::main!(App);

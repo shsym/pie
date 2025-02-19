@@ -153,7 +153,7 @@ async fn dummy_client() -> anyhow::Result<()> {
         }
 
         // 7) Terminate the program
-        client.terminate_program(&instance_id).await?;
+        //client.terminate_program(&instance_id).await?;
     } else {
         println!("[User] Program launch failed or was not recognized.");
     }
