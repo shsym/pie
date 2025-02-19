@@ -1,21 +1,22 @@
 use symphony::Run;
 
-struct App;
+struct HelloWorld;
 
-impl Run for App {
+impl Run for HelloWorld {
     async fn run() -> Result<(), String> {
         let inst_id = symphony::system::get_instance_id();
-
+        let version = symphony::system::get_version();
         println!(
-            "[{}] I am a WASM module running in the Symphony runtime!",
-            { inst_id }
+            "[{inst_id}] I am a WASM module running in the Symphony ({version}) runtime!",
+            inst_id = inst_id,
+            version = version
         );
 
-        symphony::system::send_to_origin("What is your name?");
+        symphony::system::send_to_origin("Hello world!!");
         symphony::system::send_to_origin("Have a great day!");
 
         Ok(())
     }
 }
 
-symphony::main!(App);
+symphony::main!(HelloWorld);
