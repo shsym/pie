@@ -87,9 +87,9 @@ impl WebSocketServer {
 }
 
 /// Messages from client -> server
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-enum ClientMessage {
+pub enum ClientMessage {
     #[serde(rename = "query_existence")]
     QueryExistence { hash: String },
 
@@ -116,7 +116,7 @@ enum ClientMessage {
 }
 
 /// Messages from server -> client
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
     #[serde(rename = "query_response")]

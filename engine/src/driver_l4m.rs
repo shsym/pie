@@ -108,7 +108,7 @@ where
         let dispatcher = Arc::new(Mutex::new(EventDispatcher::new()));
 
         let resp_handler = tokio::spawn(Self::handle_responses(rx, dispatcher.clone()));
-        backend.report_to(tx);
+        backend.report_to(tx).await;
 
         Self {
             cmd_buffer: Vec::new(),

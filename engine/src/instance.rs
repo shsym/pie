@@ -5,7 +5,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
 use crate::tokenizer::BytePairEncoder;
 use crate::{driver_l4m, lm, object};
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -32,7 +32,7 @@ pub struct InstanceState {
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
 
-    cmd_buffer: Sender<(Id, Command)>,
+    cmd_buffer: UnboundedSender<(Id, Command)>,
 
     evt_from_origin: Receiver<String>,
     evt_from_peers: Receiver<(String, String)>,
@@ -186,7 +186,7 @@ impl WasiView for InstanceState {
 impl InstanceState {
     pub fn new(
         id: Uuid,
-        cmd_buffer: Sender<(Id, Command)>,
+        cmd_buffer: UnboundedSender<(Id, Command)>,
         evt_from_origin: Receiver<String>,
         evt_from_peers: Receiver<(String, String)>,
         utils: InstanceUtils,
@@ -219,8 +219,7 @@ impl spi::app::system::Host for InstanceState {
 
     async fn send_to_origin(&mut self, message: String) -> Result<(), wasmtime::Error> {
         self.cmd_buffer
-            .send((self.id, Command::SendToOrigin { message }))
-            .await?;
+            .send((self.id, Command::SendToOrigin { message }));
         Ok(())
     }
 
@@ -237,8 +236,7 @@ impl spi::app::system::Host for InstanceState {
         message: String,
     ) -> Result<(), wasmtime::Error> {
         self.cmd_buffer
-            .send((self.id, Command::BroadcastToPeers { topic, message }))
-            .await?;
+            .send((self.id, Command::BroadcastToPeers { topic, message }));
         Ok(())
     }
 
@@ -251,15 +249,13 @@ impl spi::app::system::Host for InstanceState {
 
     async fn subscribe(&mut self, topic: String) -> Result<(), wasmtime::Error> {
         self.cmd_buffer
-            .send((self.id, Command::Subscribe { topic }))
-            .await?;
+            .send((self.id, Command::Subscribe { topic }));
         Ok(())
     }
 
     async fn unsubscribe(&mut self, topic: String) -> Result<(), wasmtime::Error> {
         self.cmd_buffer
-            .send((self.id, Command::Unsubscribe { topic }))
-            .await?;
+            .send((self.id, Command::Unsubscribe { topic }));
         Ok(())
     }
 }
@@ -278,7 +274,7 @@ impl spi::lm::inference::Host for InstanceState {
             blocks: blocks.clone(),
         };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
         Ok(object::Id::map_to_repr(blocks))
     }
 
@@ -291,7 +287,7 @@ impl spi::lm::inference::Host for InstanceState {
         self.allocator.release_many(&blocks)?;
         let cmd = Command::DeallocateBlocks { stream, blocks };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
         Ok(())
     }
 
@@ -309,7 +305,7 @@ impl spi::lm::inference::Host for InstanceState {
             embs: embs.clone(),
         };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
         Ok(object::Id::map_to_repr(embs))
     }
 
@@ -322,7 +318,7 @@ impl spi::lm::inference::Host for InstanceState {
         self.allocator.release_many(&embs)?;
 
         let cmd = Command::DeallocateEmb { stream, embs };
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
         Ok(())
     }
 
@@ -339,7 +335,7 @@ impl spi::lm::inference::Host for InstanceState {
             stream,
             dists: dists.clone(),
         };
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         Ok(object::Id::map_to_repr(dists))
     }
@@ -354,7 +350,7 @@ impl spi::lm::inference::Host for InstanceState {
 
         let cmd = Command::DeallocateDist { stream, dists };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         Ok(())
     }
@@ -375,7 +371,7 @@ impl spi::lm::inference::Host for InstanceState {
             outputs: object::Id::map_from_repr(outputs),
         };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         Ok(())
     }
@@ -398,7 +394,7 @@ impl spi::lm::inference::Host for InstanceState {
             size,
         };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         Ok(())
     }
@@ -415,7 +411,7 @@ impl spi::lm::inference::Host for InstanceState {
             mask: mask.into_iter().map(|x| x != 0).collect(),
         };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         Ok(())
     }
@@ -430,7 +426,7 @@ impl spi::lm::inference::Host for InstanceState {
             resource_name: name,
         };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         Ok(())
     }
@@ -445,7 +441,7 @@ impl spi::lm::inference::Host for InstanceState {
             resource_name: name,
         };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         Ok(())
     }
@@ -454,7 +450,7 @@ impl spi::lm::inference::Host for InstanceState {
         let (tx, rx) = oneshot::channel();
 
         let cmd = Command::GetAllExportedBlocks { handle: tx };
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         let result = rx
             .await
@@ -477,7 +473,7 @@ impl spi::lm::inference::Host for InstanceState {
             positions,
         };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         Ok(())
     }
@@ -494,7 +490,7 @@ impl spi::lm::inference::Host for InstanceState {
             image: url,
         };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         Ok(())
     }
@@ -520,7 +516,7 @@ impl spi::lm::inference::Host for InstanceState {
             dists: object::Id::map_from_repr(dists),
         };
 
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         Ok(())
     }
@@ -545,7 +541,7 @@ impl spi::lm::inference::Host for InstanceState {
                 handle: tx,
             };
 
-            self.cmd_buffer.send((self.id, cmd)).await?;
+            self.cmd_buffer.send((self.id, cmd));
         }
 
         let mut results = Vec::with_capacity(embs.len());
@@ -571,7 +567,7 @@ impl spi::lm::inference::Host for InstanceState {
             dist: object::Id::new(dist),
             handle: tx,
         };
-        self.cmd_buffer.send((self.id, cmd)).await?;
+        self.cmd_buffer.send((self.id, cmd));
 
         let result = rx
             .await

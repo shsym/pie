@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 use uuid::Uuid;
 use wasmtime::{component::Component, component::Linker, Engine, Store};
 use wasmtime_wasi;
@@ -54,7 +54,7 @@ pub struct Runtime {
     pub running_instances: DashMap<InstanceId, InstanceHandle>,
 
     /// The channel for (Instance -> controller) messages
-    pub inst2server: Sender<(InstanceId, Command)>,
+    pub inst2server: UnboundedSender<(InstanceId, Command)>,
 
     /// For demonstration: a tokenizer or other utility
     pub tokenizer: Arc<tokenizer::BytePairEncoder>,
@@ -70,7 +70,7 @@ pub struct InstanceHandle {
 
 impl Runtime {
     /// Create a new `Runtime`
-    pub fn new(engine: Engine, inst2server: Sender<(InstanceId, Command)>) -> Self {
+    pub fn new(engine: Engine, inst2server: UnboundedSender<(InstanceId, Command)>) -> Self {
         // Here you might also load your tokenizer file or do other initialization.
         let tokenizer = Arc::new(
             tokenizer::llama3_tokenizer(super::TOKENIZER_MODEL).expect("Tokenizer load failed"),

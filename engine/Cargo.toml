@@ -22,8 +22,9 @@ num-traits = "0.2.19"
 prost = "0.13"
 fancy-regex = "0.14.0"
 base64 = "0.22.1"
-thiserror = "1.0.69"
-rand = "0.8.5"
+thiserror = "2.0.11"
+rand = "0.9.0"
+colored = "3.0"
 
 [build-dependencies]
 prost-build = "0.13.5"
