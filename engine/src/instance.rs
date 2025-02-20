@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use wasmtime::component::{bindgen, ResourceTable};
 use wasmtime::Result;
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
 
 use crate::tokenizer::BytePairEncoder;
 use crate::{driver_l4m, lm, object};
@@ -174,10 +174,13 @@ pub enum Command {
     },
 }
 
-impl WasiView for InstanceState {
+impl IoView for InstanceState {
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.resource_table
     }
+}
+
+impl WasiView for InstanceState {
     fn ctx(&mut self) -> &mut WasiCtx {
         &mut self.wasi_ctx
     }

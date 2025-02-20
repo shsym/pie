@@ -4,7 +4,6 @@ mod backend;
 mod client;
 mod controller;
 mod driver_l4m;
-mod dummy;
 mod instance;
 mod lm;
 mod object;

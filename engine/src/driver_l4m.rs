@@ -1193,9 +1193,9 @@ impl DummyBackend {
             let resp_payload = match req.command.unwrap() {
                 l4m::request::Command::SampleTopKRequest(batch) => {
                     let items = batch.items.into_iter().map(|item| {
-                        let mut rng = rand::thread_rng();
+                        let mut rng = rand::rng();
                         let token_ids: Vec<_> =
-                            (0..item.k).map(|_| rng.gen_range(0..1000)).collect();
+                            (0..item.k).map(|_| rng.random_range(0..1000)).collect();
                         l4m::SampleTopKResponse { token_ids }
                     });
                     Some(l4m::response::Payload::SampleTopK(
@@ -1206,9 +1206,9 @@ impl DummyBackend {
                 }
                 l4m::request::Command::GetTokenDistribution(batch) => {
                     let items = batch.items.into_iter().map(|item| {
-                        let mut rng = rand::thread_rng();
+                        let mut rng = rand::rng();
                         let distribution: Vec<_> =
-                            (0..1000).map(|_| rng.gen_range(0.0..1.0)).collect();
+                            (0..1000).map(|_| rng.random_range(0.0..1.0)).collect();
                         l4m::GetTokenDistributionResponse { distribution }
                     });
                     Some(l4m::response::Payload::GetTokenDistribution(
