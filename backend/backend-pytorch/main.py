@@ -95,5 +95,5 @@ def main():
         # Include the client identity and an empty frame to maintain the envelope.
         router.send_multipart([client_identity, reply_payload])
 
-    if __name__ == "__main__":
-        main()
+if __name__ == "__main__":
+    main()

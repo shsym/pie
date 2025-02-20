@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::backend::BackendError;
-//use crate::driver_l4m::l4m::{Request, Response};
 use crate::object::{Allocator, Fetcher, Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
