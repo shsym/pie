@@ -5,6 +5,9 @@ from typing import Union
 import numpy as np
 import torch
 
+from l4ma import AttentionStorage, VectorStorage
+from llama import LlamaForCausalLM
+
 BLOCK_SIZE = 64
 
 
@@ -117,16 +120,66 @@ EMPTY_BLOCK = Block(
 Embed = Union[TextEmbed, ImageEmbed]
 
 
+@dataclass
+class Batch:
+
+    num_requests: int
+
+    # underlying storage
+    block_storage_ptr: torch.Tensor
+    embed_storage_ptr: torch.Tensor
+
+    # batched data
+    tgt_block_ptrs: torch.Tensor
+    ctx_block_ptrs: torch.Tensor
+    pos_ids: torch.Tensor
+    mask: torch.Tensor
+    cmd_groups: torch.Tensor
+
+    rope_cache: tuple[torch.Tensor, torch.Tensor]
+    input_embeds: torch.Tensor
+
+    def dtype(self):
+        return self.block_storage_ptr.dtype
+
+    def device(self):
+        return self.block_storage_ptr.device
+
+    def batch_size(self):
+        return self.ctx_block_ptrs.size(0)
+
+    def chunk_size(self):
+        return self.ctx_block_ptrs.size(1)
+
+    def block_size(self):
+        return self.pos_ids.size(1)
+
+    def max_chunk_count(self):
+        return self.cmd_groups.size(1)
+
 class Engine:
     embeds: dict[int, Embed]
     blocks: dict[int, Block]
+    lm: LlamaForCausalLM
 
-    def __init__(self, model):
+    block_storage: AttentionStorage
+    embed_storage: VectorStorage
+    dist_storage: VectorStorage
+
+    def __init__(self, model, storage: AttentionStorage, embed_storage: VectorStorage, dist_storage: VectorStorage):
         self.embeds = {}
         self.blocks = {}
 
-        # llm
-        # tokens
+        self.lm = model
+        self.block_storage = storage
+        self.embed_storage = embed_storage
+        self.dist_storage = dist_storage
+
+    def device(self):
+        return self.block_storage.ptr.device
+
+    def dtype(self):
+        return self.block_storage.ptr.dtype
 
     def allocate(self, cmds: list[AllocateCommand]):
         # in current implementation, all allocations are already done in the constructor.
@@ -163,6 +216,11 @@ class Engine:
                 block.occupancy[i] = m
 
     def copy_block(self, cmds: list[CopyBlockCommand]):
+
+        for cmd in cmds:
+            # needs to write a new kernel
+            ...
+            # self.storage.
         ...
 
     def decode_token_distribution(self, cmds: list[DecodeTokenDistributionCommand]):
@@ -271,25 +329,43 @@ class Engine:
             cmd_groups.append(cmd_grp)
 
         # create a torch tensor
-        batched_tgt_block_ptrs = torch.as_tensor(batched_tgt_block_ptrs)
-        batched_ctx_block_ptrs = torch.as_tensor(batched_ctx_block_ptrs)
-        batched_token_ids = torch.as_tensor(batched_token_ids)
-        batched_pos_ids = torch.as_tensor(batched_pos_ids)
-        batched_mask = torch.as_tensor(batched_mask)
+        batched_tgt_block_ptrs = torch.as_tensor(batched_tgt_block_ptrs, device=self.device(), dtype=torch.long)
+        batched_ctx_block_ptrs = torch.as_tensor(batched_ctx_block_ptrs, device=self.device(), dtype=torch.long)
+        batched_token_ids = torch.as_tensor(batched_token_ids, device=self.device(), dtype=torch.long)
+        batched_pos_ids = torch.as_tensor(batched_pos_ids, device=self.device(), dtype=torch.long)
+        batched_mask = torch.as_tensor(batched_mask, device=self.device(), dtype=torch.bool)
 
         cmd_grp_max_size = max(len(g) for g in cmd_groups)
         cmd_groups = [g + [-1] * (cmd_grp_max_size - len(g)) for g in cmd_groups]
-        cmd_groups = torch.as_tensor(cmd_groups)
+        cmd_groups = torch.as_tensor(cmd_groups, device=self.device(), dtype=torch.long)
 
+        # compute the embeddings...
+        input_embeds = self.lm.model.embed_tokens(batched_token_ids)
 
-        # invoke the model
+        # inject the image embeddings
+        for token_map in token_id_map:
+            vec_id = token_map["vec_id"]
+            input_embeds[token_map["n"], token_map["i"]].copy_(self.embed_storage.ptr[vec_id], non_blocking=True)
 
-        return {
-            "tgt_block_ptrs": batched_tgt_block_ptrs,
-            "ctx_block_ptrs": batched_ctx_block_ptrs,
-            "token_ids": batched_token_ids,
-            "pos_ids": batched_pos_ids,
-            "mask": batched_mask,
-            "cmd_groups": cmd_groups,
-            "token_id_map": token_id_map
-        }
+        # compute the position embeddings
+        cos, sin = self.lm.rotary_emb(input_embeds, batched_pos_ids.max().item() + 1)
+
+        position_embeds = (cos[batched_pos_ids].unsqueeze(1), sin[batched_pos_ids].unsqueeze(1))
+
+        # process masks (bool) -> (float)
+        batched_mask = self.lm.proc_mask(batched_mask, self.dtype())
+
+        batch = Batch(
+            num_requests=len(cmds),
+            block_storage_ptr=self.block_storage.ptr,
+            embed_storage_ptr=self.embed_storage.ptr,
+            tgt_block_ptrs=batched_tgt_block_ptrs,
+            ctx_block_ptrs=batched_ctx_block_ptrs,
+            rope_cache=position_embeds,
+            input_embeds=input_embeds,
+            pos_ids=batched_pos_ids,
+            mask=batched_mask,
+            cmd_groups=cmd_groups,
+        )
+
+        self.lm.forward(batch)

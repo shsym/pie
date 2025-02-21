@@ -1,5 +1,12 @@
+import torch
 import zmq
+from flatbuffers.flexbuffers import Vector
+from transformers import TorchAoConfig
+
 import sdi_pb2
+from engine import Engine, BLOCK_SIZE
+from l4ma import L4maModel, AttentionBuffer, AttentionStorage, VectorStorage
+from llama import LlamaForCausalLM
 
 
 def handle_request(request: sdi_pb2.Request):
@@ -68,7 +75,44 @@ def handle_request(request: sdi_pb2.Request):
     else:
         print("No valid command found in request.")
 
+
 def main():
+    device = "cuda:0"
+
+    quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
+
+    model = LlamaForCausalLM.from_pretrained(
+        "meta-llama/Llama-3.2-1B-Instruct", torch_dtype="bfloat16", device_map=device, quantization_config=quantization_config)
+
+    block_storage = AttentionStorage(
+        num_layers=model.config.num_hidden_layers,
+        num_blocks=1000,
+        num_heads=model.config.num_attention_heads,
+        block_size=BLOCK_SIZE,
+        head_dim=model.config.hidden_size // model.config.num_attention_heads,
+        dtype=torch.bfloat16,
+        device=device
+    )
+
+    embed_storage = VectorStorage(
+        num_embeds=100,
+        embed_dim=model.config.hidden_size,
+        dtype=torch.bfloat16,
+        device=device
+    )
+
+    dist_storage = VectorStorage(
+        num_embeds=100,
+        embed_dim=model.config.hidden_size,
+        dtype=torch.bfloat16,
+        device=device
+    )
+
+    engine = Engine(model, block_storage, embed_storage, dist_storage)
+
+
+
+
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
     router.bind("tcp://*:5555")
@@ -90,10 +134,10 @@ def main():
         print(f"Received message from {client_identity.decode('utf-8')}:")
         print(person)
 
-
         # Send reply back to the client.
         # Include the client identity and an empty frame to maintain the envelope.
         router.send_multipart([client_identity, reply_payload])
+
 
 if __name__ == "__main__":
     main()
