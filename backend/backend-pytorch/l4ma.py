@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 import ops
-from engine import Batch
+from driver import Batch
 
 
 class Config:
@@ -68,13 +68,12 @@ class L4maAttention(nn.Module):
     def forward(
             self,
             hidden_states: torch.Tensor,
-            batch:Batch
+            batch: Batch
             # position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
             # attention_mask: torch.Tensor | None = None,
             # buffer: AttentionBuffer | None = None,
             # buffer_sink_ids: list[int] | None = None,
     ) -> torch.Tensor:
-
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -89,7 +88,7 @@ class L4maAttention(nn.Module):
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        ops.copy_kv_block(batch.block_storage_ptr, key_states, value_states, batch.ctx_block_ptrs)
+        ops.copy_kv_block(batch.block_storage_ptr, key_states, value_states, batch.tgt_block_ptrs)
 
         attn_output = ops.qkv_attention(
             query_states,
@@ -99,9 +98,9 @@ class L4maAttention(nn.Module):
             max_grp_size=batch.max_chunk_count(),
             num_blocks_per_batch=batch.chunk_size(),
             q_lut=batch.q_lut,
-            kv_lut=batch.kv_lut,
-            mask_lut=batch.mask_lut,
-            reduce_grp_lut=batch.reduce_grp_lut,
+            kv_lut=batch.ctx_block_ptrs,
+            mask_lut=batch.mask,
+            reduce_grp_lut=batch.cmd_groups,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -125,7 +124,7 @@ class L4maDecoderLayer(nn.Module):
     def forward(
             self,
             hidden_states: torch.Tensor,
-            batch:Batch
+            batch: Batch
             # attention_mask: torch.Tensor,
             # position_embeddings: tuple[torch.Tensor, torch.Tensor],  # necessary, but kept here for BC
             # buffer: AttentionBuffer | None = None,
@@ -172,9 +171,9 @@ class L4maModel(nn.Module):
 
     def forward(
             self,
-            batch:Batch,
+            batch: Batch,
     ) -> torch.Tensor:
-        #attention_mask = proc_mask(attention_mask, batch.dtype())
+        # attention_mask = proc_mask(attention_mask, batch.dtype())
         hidden_states = batch.input_embeds
 
         for decoder_layer in self.layers:
@@ -192,20 +191,6 @@ class L4maModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states
-
-
-
-
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 def get_image_position_ids(offset: int, patch_h: int, patch_w: int) -> list[tuple[int, int, int]]:

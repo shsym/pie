@@ -11,9 +11,6 @@ from llama import LlamaForCausalLM
 BLOCK_SIZE = 64
 
 
-def ceil_div(a, b):
-    return -(-a // b)
-
 
 class ObjectKind(Enum):
     BLOCK = "Block"
@@ -122,7 +119,6 @@ Embed = Union[TextEmbed, ImageEmbed]
 
 @dataclass
 class Batch:
-
     num_requests: int
 
     # underlying storage
@@ -135,6 +131,7 @@ class Batch:
     pos_ids: torch.Tensor
     mask: torch.Tensor
     cmd_groups: torch.Tensor
+    q_lut: torch.Tensor
 
     rope_cache: tuple[torch.Tensor, torch.Tensor]
     input_embeds: torch.Tensor
@@ -157,7 +154,8 @@ class Batch:
     def max_chunk_count(self):
         return self.cmd_groups.size(1)
 
-class Engine:
+
+class Driver:
     embeds: dict[int, Embed]
     blocks: dict[int, Block]
     lm: LlamaForCausalLM
@@ -258,8 +256,9 @@ class Engine:
         batched_mask = []  # 3d (N, BLOCK_SIZE * CHUNK_SIZE, BLOCK_SIZE)
 
         token_id_map = []
+        q_lut = []  # 2d (N, 1)
 
-        for cmd in cmds:
+        for q_idx, cmd in enumerate(cmds):
 
             if len(cmd.input_embed_ids) > BLOCK_SIZE:
                 raise ValueError("Too many tokens in the block")
@@ -325,6 +324,7 @@ class Engine:
                 batched_pos_ids.append(tgt_pos_ids)
                 batched_mask.append(attn_mask)
                 cmd_grp.append(len(batched_token_ids) - 1)
+                q_lut.append(q_idx)
 
             cmd_groups.append(cmd_grp)
 
@@ -338,6 +338,8 @@ class Engine:
         cmd_grp_max_size = max(len(g) for g in cmd_groups)
         cmd_groups = [g + [-1] * (cmd_grp_max_size - len(g)) for g in cmd_groups]
         cmd_groups = torch.as_tensor(cmd_groups, device=self.device(), dtype=torch.long)
+
+        q_lut = torch.as_tensor(q_lut, device=self.device(), dtype=torch.long)
 
         # compute the embeddings...
         input_embeds = self.lm.model.embed_tokens(batched_token_ids)
@@ -366,6 +368,7 @@ class Engine:
             pos_ids=batched_pos_ids,
             mask=batched_mask,
             cmd_groups=cmd_groups,
+            q_lut=q_lut,
         )
 
         self.lm.forward(batch)

@@ -110,9 +110,6 @@ def main():
 
     engine = Engine(model, block_storage, embed_storage, dist_storage)
 
-
-
-
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
     router.bind("tcp://*:5555")
