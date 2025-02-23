@@ -7,28 +7,6 @@ import torch
 from torch import nn
 
 import ops
-from driver import Batch
-
-
-class Config:
-    ...
-
-
-class L4maRmsNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        L4maRmsNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
 
 
 class L4maMlp(nn.Module):
@@ -68,11 +46,14 @@ class L4maAttention(nn.Module):
     def forward(
             self,
             hidden_states: torch.Tensor,
-            batch: Batch
-            # position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
-            # attention_mask: torch.Tensor | None = None,
-            # buffer: AttentionBuffer | None = None,
-            # buffer_sink_ids: list[int] | None = None,
+            kv_ptr: torch.Tensor,  # KV storage pointer
+            new_q_lut: torch.Tensor,  # Query LUT
+            new_kv_lut: torch.Tensor,  # New KV LUT
+            all_kv_lut: torch.Tensor,  # All KV LUT
+            mask: torch.Tensor,  # Attention mask
+            cmd_groups: torch.Tensor,  # Command groups
+            rope_cache: tuple[torch.Tensor, torch.Tensor],  # Cos and Sin cache
+
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -84,23 +65,19 @@ class L4maAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = batch.rope_cache
+        cos, sin = rope_cache
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        ops.copy_kv_block(batch.block_storage_ptr, key_states, value_states, batch.tgt_block_ptrs)
+        ops.fill_kv_block_storage(kv_ptr, key_states, value_states, new_kv_lut)
 
         attn_output = ops.qkv_attention(
-            query_states,
-            batch.block_storage_ptr,
-            batch_size=batch.input_embeds.shape[0],
-            num_grps=batch.num_requests,
-            max_grp_size=batch.max_chunk_count(),
-            num_blocks_per_batch=batch.chunk_size(),
-            q_lut=batch.q_lut,
-            kv_lut=batch.ctx_block_ptrs,
-            mask_lut=batch.mask,
-            reduce_grp_lut=batch.cmd_groups,
+            q=query_states,
+            kv=kv_ptr,
+            q_lut=new_q_lut,
+            kv_lut=all_kv_lut,
+            mask=mask,
+            reduce_grp=cmd_groups,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -118,18 +95,19 @@ class L4maDecoderLayer(nn.Module):
         self.self_attn = L4maAttention(config, layer_idx)
 
         self.mlp = L4maMlp(config)
-        self.input_layernorm = L4maRmsNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = L4maRmsNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
             self,
             hidden_states: torch.Tensor,
-            batch: Batch
-            # attention_mask: torch.Tensor,
-            # position_embeddings: tuple[torch.Tensor, torch.Tensor],  # necessary, but kept here for BC
-            # buffer: AttentionBuffer | None = None,
-            # buffer_sink_ids: list[int] | None = None,
-            # **kwargs,
+            kv_ptr: torch.Tensor,  # KV storage pointer
+            new_q_lut: torch.Tensor,  # Query LUT
+            new_kv_lut: torch.Tensor,  # New KV LUT
+            all_kv_lut: torch.Tensor,  # All KV LUT
+            mask: torch.Tensor,  # Attention mask
+            cmd_groups: torch.Tensor,  # Command groups
+            rope_cache: tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -138,12 +116,15 @@ class L4maDecoderLayer(nn.Module):
         # Self Attention
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            batch=batch
-            # attention_mask=attention_mask,
-            # position_embeddings=position_embeddings,
-            # buffer=buffer,
-            # buffer_sink_ids=buffer_sink_ids,
+            kv_ptr=kv_ptr,
+            new_q_lut=new_q_lut,
+            new_kv_lut=new_kv_lut,
+            all_kv_lut=all_kv_lut,
+            mask=mask,
+            cmd_groups=cmd_groups,
+            rope_cache=rope_cache,
         )
+
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -167,23 +148,32 @@ class L4maModel(nn.Module):
         self.layers = nn.ModuleList(
             [L4maDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = L4maRmsNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
             self,
-            batch: Batch,
+            input_embeds: torch.Tensor,
+            kv_ptr: torch.Tensor,  # KV storage pointer
+            new_q_lut: torch.Tensor,  # Query LUT
+            new_kv_lut: torch.Tensor,  # New KV LUT
+            all_kv_lut: torch.Tensor,  # All KV LUT
+            mask: torch.Tensor,  # Attention mask
+            cmd_groups: torch.Tensor,  # Command groups
+            rope_cache: tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
         # attention_mask = proc_mask(attention_mask, batch.dtype())
-        hidden_states = batch.input_embeds
+        hidden_states = input_embeds
 
         for decoder_layer in self.layers:
             layer_outputs = decoder_layer(
                 hidden_states,
-                batch
-                # attention_mask=attention_mask,
-                # position_embeddings=position_embeds,
-                # buffer=buffer,
-                # buffer_sink_ids=buffer_sink_ids,
+                kv_ptr=kv_ptr,
+                new_q_lut=new_q_lut,
+                new_kv_lut=new_kv_lut,
+                all_kv_lut=all_kv_lut,
+                mask=mask,
+                cmd_groups=cmd_groups,
+                rope_cache=rope_cache
             )
 
             hidden_states = layer_outputs
@@ -218,14 +208,6 @@ def get_video_position_ids(offset, patch_t, patch_h, patch_w, time_scale) -> lis
         ))
 
     return output_ids
-
-
-# mask = 1 (true) for tokens that are masked
-# mask = 0 (false) for tokens that are not masked
-def proc_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    float_mask = mask.to(dtype)
-
-    return float_mask.masked_fill(mask.to(torch.bool), torch.finfo(dtype).min)
 
 
 def _compute_default_rope_parameters(

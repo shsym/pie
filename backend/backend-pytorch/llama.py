@@ -30,28 +30,28 @@ class LlamaForCausalLM(PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def forward(
-            self,
-            batch:Batch
-    ) -> torch.Tensor:
-        # print("input_ids", input_ids.shape)
-        # print("position_ids", position_ids.shape)
-        # print("attention_mask", attention_mask.shape)
-        # print("buffer_sink_ids", buffer_sink_ids)
-        #
-        # input_embeds = self.model.embed_tokens(input_ids)
-        # cos, sin = self.rotary_emb(input_embeds, position_ids.max().item() + 1)
-        # position_embeds = (cos[position_ids].unsqueeze(1), sin[position_ids].unsqueeze(1))
-
-        final_hidden_states = self.model(
-            batch
-            # inputs_embeds=input_embeds,
-            # position_embeds=position_embeds,
-            # attention_mask=attention_mask,
-            # buffer=buffer,
-            # buffer_sink_ids=buffer_sink_ids,
-        )
-
-        logits = self.lm_head(final_hidden_states)
-
-        return logits
+    # def forward(
+    #         self,
+    #         batch:Batch
+    # ) -> torch.Tensor:
+    #     # print("input_ids", input_ids.shape)
+    #     # print("position_ids", position_ids.shape)
+    #     # print("attention_mask", attention_mask.shape)
+    #     # print("buffer_sink_ids", buffer_sink_ids)
+    #     #
+    #     # input_embeds = self.model.embed_tokens(input_ids)
+    #     # cos, sin = self.rotary_emb(input_embeds, position_ids.max().item() + 1)
+    #     # position_embeds = (cos[position_ids].unsqueeze(1), sin[position_ids].unsqueeze(1))
+    #
+    #     final_hidden_states = self.model(
+    #         batch
+    #         # inputs_embeds=input_embeds,
+    #         # position_embeds=position_embeds,
+    #         # attention_mask=attention_mask,
+    #         # buffer=buffer,
+    #         # buffer_sink_ids=buffer_sink_ids,
+    #     )
+    #
+    #     logits = self.lm_head(final_hidden_states)
+    #
+    #     return logits
