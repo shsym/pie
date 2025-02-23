@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from enum import Enum
 from typing import Union
 
 import numpy as np
@@ -8,86 +7,10 @@ import torch
 from common import ceil_div
 from l4ma import AttentionStorage, VectorStorage
 from llama import LlamaForCausalLM
+from sdi_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchEmbedImage, BatchMaskBlock, BatchCopyBlock, BatchDecodeTokenDistribution, BatchSampleTopKRequest, BatchSampleTopKResponse, \
+    ObjectKind, SampleTopKResponse, BatchGetTokenDistributionRequest, BatchGetTokenDistributionResponse, BatchFillBlock
 
 NUM_TOKENS_IN_BLOCK = 64
-
-
-class ObjectKind(Enum):
-    BLOCK = "Block"
-    EMBED = "Embed"
-    DIST = "Dist"
-
-
-@dataclass
-class AllocateCommand:
-    kind: ObjectKind
-    id_offset: int
-    count: int
-
-
-@dataclass
-class EmbedTextCommand:
-    embed_id: int
-    token_id: int
-    position_id: int
-
-
-@dataclass
-class EmbedImageCommand:
-    embed_id: int
-    url: str
-
-
-@dataclass
-class FillBlockCommand:
-    block_id: int
-    context_block_ids: list[int]
-    input_embed_ids: list[int]
-    output_embed_ids: list[int]
-
-
-@dataclass
-class MaskBlockCommand:
-    block_id: int
-    mask: list[bool]
-
-
-@dataclass
-class CopyBlockCommand:
-    src_block_id: int
-    dst_block_id: int
-    src_start: int
-    dst_start: int
-    length: int
-
-
-@dataclass
-class DecodeTokenDistributionCommand:
-    dist_id: int
-    token_id: int
-
-
-@dataclass
-class SampleTopKCommand:
-    dist_id: int
-    k: int
-
-
-@dataclass
-class SampleTopKResponse:
-    token_id: int
-    prob: float
-
-
-@dataclass
-class GetTokenDistributionCommand:
-    dist_id: int
-
-
-@dataclass
-class GetTokenDistributionResponse:
-    token_id: int
-    prob: float
 
 
 @dataclass
@@ -141,15 +64,15 @@ class Driver:
     def dtype(self):
         return self.block_storage.ptr.dtype
 
-    def allocate(self, cmds: list[AllocateCommand]):
+    def allocate(self, cmds: BatchAllocate):
         # in current implementation, all allocations are already done in the constructor.
         # but in the future, we may want to allocate more blocks than the GPU capacity, by offloading some of the blocks to the CPU memory.
         # This logic should handle that case.
 
-        for cmd in cmds:
+        for cmd in cmds.items:
             if cmd.kind == ObjectKind.BLOCK:
                 for i in range(cmd.count):
-                    self.blocks[cmd.id_offset + i] = EMPTY_BLOCK
+                    self.blocks[cmd.object_id_offset + i] = EMPTY_BLOCK
 
             elif cmd.kind == ObjectKind.EMBED:
                 # do nothing. Embeds are allocated on the fly.
@@ -158,41 +81,55 @@ class Driver:
                 # do nothing. Dists are allocated on the fly.
                 ...
 
-    def deallocate(self, cmds: list[AllocateCommand]):
+    def deallocate(self, cmds: BatchDeallocate):
+        # in current implementation, all allocations are already done in the constructor.
+        # so we don't need to deallocate anything.
         ...
 
-    def embed_text(self, cmds: list[EmbedTextCommand]):
-        for cmd in cmds:
-            self.embeds[cmd.embed_id] = TextEmbed(token_id=cmd.token_id, position_id=cmd.position_id)
+    def embed_text(self, cmds: BatchEmbedText):
+        for cmd in cmds.items:
+            self.embeds[cmd.embedding_id] = TextEmbed(token_id=cmd.token_id, position_id=cmd.position_id)
 
-    def embed_image(self, cmds: list[EmbedImageCommand]):
+    def embed_image(self, cmds: BatchEmbedImage):
         # unimplemented
         ...
 
-    def mask_block(self, cmds: list[MaskBlockCommand]):
-        for cmd in cmds:
+    def mask_block(self, cmds: BatchMaskBlock):
+        for cmd in cmds.items:
             block = self.blocks[cmd.block_id]
             for i, m in enumerate(cmd.mask):
                 block.occupancy[i] = m
 
-    def copy_block(self, cmds: list[CopyBlockCommand]):
+    def copy_block(self, cmds: BatchCopyBlock):
 
-        for cmd in cmds:
-            # needs to write a new kernel
-            ...
-            # self.storage.
+        # TODO.
         ...
 
-    def decode_token_distribution(self, cmds: list[DecodeTokenDistributionCommand]):
+    def decode_token_distribution(self, cmds: BatchDecodeTokenDistribution):
+
+        # TODO -> make this more efficient by batching.
+        for i, cmd in enumerate(cmds.items):
+            dist = torch.softmax(self.lm.lm_head(self.embed_storage.ptr[cmd.embedding_id]), dim=-1)
+            self.dist_storage.ptr[cmd.distribution_id] = dist
+
+    def sample_top_k_request(self, cmds: BatchSampleTopKRequest) -> BatchSampleTopKResponse:
+        res = []
+        for i, cmd in enumerate(cmds.items):
+            dist = self.dist_storage.ptr[cmd.distribution_id]
+            topk_res = torch.topk(dist, k=cmd.k)
+            topk_tokens = topk_res.indices.tolist()
+            topk_probs = topk_res.values.tolist()
+
+            res.append(SampleTopKResponse(token_ids=topk_tokens))
+
+        return BatchSampleTopKResponse(items=res)
+
+    def get_token_distribution(self, cmds: BatchGetTokenDistributionRequest) -> BatchGetTokenDistributionResponse:
+
+        # get the truncated token distribution. TODO
         ...
 
-    def sample_top_k_request(self, cmds: list[SampleTopKCommand]) -> list[SampleTopKResponse]:
-        ...
-
-    def get_token_distribution(self, cmds: list[GetTokenDistributionCommand]) -> list[GetTokenDistributionResponse]:
-        ...
-
-    def fill_block(self, cmds: list[FillBlockCommand]):
+    def fill_block(self, cmds: BatchFillBlock):
 
         ### Step 1.Decide the `chunk size`
         # first estimate the `chunk_size` for the batch (chunk = number of blocks in one batch row)
@@ -200,25 +137,25 @@ class Driver:
         # if chunk size is too small -> there will be only few empty blocks, but the performance could be bad for fill requests with very large contexts.
         # so we need to find a balance between the two, which I use the median of the number of context blocks in the commands.
 
-        num_blocks_per_req = [len(cmd.context_block_ids) for cmd in cmds]
+        num_blocks_per_req = [len(cmd.context_block_ids) for cmd in cmds.items]
         NUM_BLOCKS_IN_CHUNK = int(np.median(num_blocks_per_req))
         NUM_TOKENS_IN_CHUNK = NUM_BLOCKS_IN_CHUNK * NUM_TOKENS_IN_BLOCK
 
         num_chunks_per_req = [ceil_div(n, NUM_BLOCKS_IN_CHUNK) for n in num_blocks_per_req]
 
-        reduce_grps = np.zeros((len(cmds), max(num_chunks_per_req)), dtype=np.int32)  # 2d (NUM_CMDS, MAX_NUM_CHUNKS)
+        reduce_grps = np.zeros((len(cmds.items), max(num_chunks_per_req)), dtype=np.int32)  # 2d (NUM_CMDS, MAX_NUM_CHUNKS)
         new_q_lut = np.zeros((sum(num_chunks_per_req), 1), dtype=np.int32)
-        new_kv_lut = np.zeros((len(cmds), 1), dtype=np.int32)
+        new_kv_lut = np.zeros((len(cmds.items), 1), dtype=np.int32)
         all_kv_lut = np.zeros((sum(num_chunks_per_req), NUM_BLOCKS_IN_CHUNK), dtype=np.int32)
         masks = np.zeros((sum(num_chunks_per_req), NUM_TOKENS_IN_BLOCK, NUM_TOKENS_IN_CHUNK), dtype=np.bool_)
 
-        new_token_ids = np.zeros((len(cmds), NUM_TOKENS_IN_BLOCK), dtype=np.int32)
+        new_token_ids = np.zeros((len(cmds.items), NUM_TOKENS_IN_BLOCK), dtype=np.int32)
         POS_DIM = 1
-        new_position_ids = np.zeros((len(cmds), NUM_TOKENS_IN_BLOCK * POS_DIM), dtype=np.int32)
+        new_position_ids = np.zeros((len(cmds.items), NUM_TOKENS_IN_BLOCK * POS_DIM), dtype=np.int32)
         input_embed_postproc = []
         output_embed_postproc = []
         k = 0
-        for i, cmd in enumerate(cmds):
+        for i, cmd in enumerate(cmds.items):
 
             # update the block metadata
 
@@ -226,8 +163,8 @@ class Driver:
             for j in range(NUM_TOKENS_IN_BLOCK):
 
                 # process input embeds
-                if j < len(cmd.input_embed_ids) and cmd.input_embed_ids[j] in self.embeds:
-                    embed = self.embeds[cmd.input_embed_ids[j]]
+                if j < len(cmd.input_embedding_ids) and cmd.input_embedding_ids[j] in self.embeds:
+                    embed = self.embeds[cmd.input_embedding_ids[j]]
 
                     tgt_block.occupancy[j] = True
                     tgt_block.position_ids[j] = embed.position_id
@@ -252,11 +189,11 @@ class Driver:
                     tgt_block.position_ids[j] = 0
 
                 # process output embeds
-                if j < len(cmd.output_embed_ids) and cmd.output_embed_ids[j] >= 0:
+                if j < len(cmd.output_embedding_ids) and cmd.output_embedding_ids[j] >= 0:
                     output_embed_postproc.append({
                         "row": i,
                         "col": j,
-                        "vec_id": cmd.output_embed_ids[j],
+                        "vec_id": cmd.output_embedding_ids[j],
                     })
 
             # mask: (len(ctx_ids) * block_size, block_size)
@@ -297,16 +234,6 @@ class Driver:
                 reduce_grps[i, j] = k
 
                 k += 1
-
-        # create a torch tensor
-        #
-        # reduce_grps = np.zeros((len(cmds), max(num_chunks_per_req)), dtype=np.int32)  # 2d (NUM_CMDS, MAX_NUM_CHUNKS)
-        # new_q_lut = np.zeros((sum(num_chunks_per_req), 1), dtype=np.int32)
-        # new_kv_lut = np.zeros((len(cmds), 1), dtype=np.int32)
-        # all_kv_lut = np.zeros((sum(num_chunks_per_req), NUM_BLOCKS_IN_CHUNK), dtype=np.int32)
-        # masks = np.zeros((sum(num_chunks_per_req), NUM_TOKENS_IN_BLOCK, NUM_TOKENS_IN_CHUNK), dtype=np.bool_)
-        # new_token_ids = np.zeros((len(cmds), NUM_TOKENS_IN_BLOCK), dtype=np.int32)
-        # new_position_ids = np.zeros((len(cmds), NUM_TOKENS_IN_BLOCK * POS_DIM), dtype=np.int32)
 
         pt_reduce_grps = torch.as_tensor(reduce_grps, device=self.device(), dtype=torch.int32)
         pt_new_q_lut = torch.as_tensor(new_q_lut, device=self.device(), dtype=torch.int32)

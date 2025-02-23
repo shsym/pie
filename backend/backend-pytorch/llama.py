@@ -2,7 +2,6 @@ import torch
 from torch import nn
 from transformers import PreTrainedModel, LlamaConfig
 
-from engine import Batch
 from l4ma import L4maRotaryEmbedding, L4maModel
 
 

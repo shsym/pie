@@ -1,15 +1,14 @@
 import torch
 import zmq
-from flatbuffers.flexbuffers import Vector
 from transformers import TorchAoConfig
 
 import sdi_pb2
-from engine import Engine, BLOCK_SIZE
-from l4ma import L4maModel, AttentionBuffer, AttentionStorage, VectorStorage
+from driver import Driver, NUM_TOKENS_IN_BLOCK
+from l4ma import AttentionStorage, VectorStorage
 from llama import LlamaForCausalLM
 
 
-def handle_request(request: sdi_pb2.Request):
+def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | None:
     # Determine which command was set in the oneof field "command"
     command = request.WhichOneof("command")
 
@@ -19,61 +18,41 @@ def handle_request(request: sdi_pb2.Request):
     # ...
 
     if command == "allocate":
-        batch_allocate = request.allocate  # This is a BatchAllocate message
-        print("Handling BatchAllocate command")
-        # Process each Allocate item...
-        for allocate in batch_allocate.items:
-            print(f"Allocate object: kind={allocate.kind}, offset={allocate.object_id_offset}, count={allocate.count}")
+        d.allocate(request.allocate)
 
     elif command == "deallocate":
-        batch_deallocate = request.deallocate  # This is a BatchDeallocate message
-        print("Handling BatchDeallocate command")
-        # Process each Allocate item (or deallocate items if they differ)...
+        d.deallocate(request.deallocate)
 
     elif command == "embed_text":
-        batch_embed_text = request.embed_text  # This is a BatchEmbedText message
-        print("Handling BatchEmbedText command")
-        for embed in batch_embed_text.items:
-            print(f"EmbedText: embedding_id={embed.embedding_id}, token_id={embed.token_id}, position_id={embed.position_id}")
+        d.embed_text(request.embed_text)
 
     elif command == "embed_image":
-        batch_embed_image = request.embed_image  # This is a BatchEmbedImage message
-        print("Handling BatchEmbedImage command")
-        for embed in batch_embed_image.items:
-            print(f"EmbedImage: embedding_ids={embed.embedding_ids}, url={embed.url}")
+        d.embed_image(request.embed_image)
 
     elif command == "fill_block":
-        batch_fill_block = request.fill_block  # This is a BatchFillBlock message
-        print("Handling BatchFillBlock command")
-        # Process each FillBlock item...
+        d.fill_block(request.fill_block)
 
     elif command == "mask_block":
-        batch_mask_block = request.mask_block  # This is a BatchMaskBlock message
-        print("Handling BatchMaskBlock command")
-        # Process each MaskBlock item...
+        d.mask_block(request.mask_block)
 
     elif command == "copy_block":
-        batch_copy_block = request.copy_block  # This is a BatchCopyBlock message
-        print("Handling BatchCopyBlock command")
-        # Process each CopyBlock item...
+        d.copy_block(request.copy_block)
 
     elif command == "decode_token_distribution":
-        batch_decode = request.decode_token_distribution  # This is a BatchDecodeTokenDistribution message
-        print("Handling BatchDecodeTokenDistribution command")
-        # Process each DecodeTokenDistribution item...
+        d.decode_token_distribution(request.decode_token_distribution)
 
     elif command == "sample_top_k_request":
-        batch_sample_topk = request.sample_top_k_request  # This is a BatchSampleTopKRequest message
-        print("Handling BatchSampleTopKRequest command")
-        # Process each SampleTopKRequest item...
+        res = d.sample_top_k_request(request.sample_top_k_request)
+        return sdi_pb2.Response(correlation_id=request.correlation_id, sample_top_k=res)
 
     elif command == "get_token_distribution":
-        batch_get_distribution = request.get_token_distribution  # This is a BatchGetTokenDistributionRequest message
-        print("Handling BatchGetTokenDistribution command")
-        # Process each GetTokenDistributionRequest item...
+        res = d.get_token_distribution(request.get_token_distribution)
+        return sdi_pb2.Response(correlation_id=request.correlation_id, get_token_distribution=res)
 
     else:
         print("No valid command found in request.")
+
+    return None
 
 
 def main():
@@ -88,7 +67,7 @@ def main():
         num_layers=model.config.num_hidden_layers,
         num_blocks=1000,
         num_heads=model.config.num_attention_heads,
-        block_size=BLOCK_SIZE,
+        block_size=NUM_TOKENS_IN_BLOCK,
         head_dim=model.config.hidden_size // model.config.num_attention_heads,
         dtype=torch.bfloat16,
         device=device
@@ -108,7 +87,7 @@ def main():
         device=device
     )
 
-    engine = Engine(model, block_storage, embed_storage, dist_storage)
+    engine = Driver(model, block_storage, embed_storage, dist_storage)
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
@@ -125,15 +104,18 @@ def main():
         payload = frames[1]
 
         # Deserialize the protobuf message
-        person = sdi_pb2.Request()
-        person.ParseFromString(payload)
+        request = sdi_pb2.Request()
+        request.ParseFromString(payload)
 
-        print(f"Received message from {client_identity.decode('utf-8')}:")
-        print(person)
+        # handle the request
+        response = handle_request(engine, request)
 
-        # Send reply back to the client.
-        # Include the client identity and an empty frame to maintain the envelope.
-        router.send_multipart([client_identity, reply_payload])
+        if response is not None:
+            reply_payload = response.SerializeToString()
+
+            # Send reply back to the client.
+            # Include the client identity and an empty frame to maintain the envelope.
+            router.send_multipart([client_identity, reply_payload])
 
 
 if __name__ == "__main__":
