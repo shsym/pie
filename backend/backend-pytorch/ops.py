@@ -350,6 +350,8 @@ def fill_kv_block_storage(
         src_v: torch.Tensor,
         dst_lut: torch.Tensor,
 ):
+    #print(src_k.shape)
+    #print(dst_kv.shape)
     _, num_head, block_size, block_dim = src_k.shape
     _, num_head_, block_size2, block_dim_ = dst_kv.shape
 
@@ -609,7 +611,7 @@ def qkv_attention(
 
     # reduce y if necessary
     if need_reduce:
-        print('reducing y')
+        #print('reducing y')
         y_reduced = q  # torch.empty_like(q)
 
         grid = (num_reqs, num_head)

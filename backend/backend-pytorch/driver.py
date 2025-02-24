@@ -10,7 +10,7 @@ from llama import LlamaForCausalLM
 from sdi_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchEmbedImage, BatchMaskBlock, BatchCopyBlock, BatchDecodeTokenDistribution, BatchSampleTopKRequest, BatchSampleTopKResponse, \
     ObjectKind, SampleTopKResponse, BatchGetTokenDistributionRequest, BatchGetTokenDistributionResponse, BatchFillBlock
 
-NUM_TOKENS_IN_BLOCK = 64
+NUM_TOKENS_IN_BLOCK = 16
 
 
 @dataclass
@@ -70,14 +70,14 @@ class Driver:
         # This logic should handle that case.
 
         for cmd in cmds.items:
-            if cmd.kind == ObjectKind.BLOCK:
+            if cmd.kind == ObjectKind.OBJECT_KIND_KV_BLOCK:
                 for i in range(cmd.count):
                     self.blocks[cmd.object_id_offset + i] = EMPTY_BLOCK
 
-            elif cmd.kind == ObjectKind.EMBED:
+            elif cmd.kind == ObjectKind.OBJECT_KIND_EMB:
                 # do nothing. Embeds are allocated on the fly.
                 ...
-            elif cmd.kind == ObjectKind.DIST:
+            elif cmd.kind == ObjectKind.OBJECT_KIND_DIST:
                 # do nothing. Dists are allocated on the fly.
                 ...
 
@@ -136,6 +136,11 @@ class Driver:
         # if chunk size is too large -> performance will be nice, but most blocks will be "empty" ones, leading to wasted computation.
         # if chunk size is too small -> there will be only few empty blocks, but the performance could be bad for fill requests with very large contexts.
         # so we need to find a balance between the two, which I use the median of the number of context blocks in the commands.
+        # for cmd in cmds.items:
+        #     print(cmd.block_id)
+        #     print(cmd.context_block_ids)
+        #     print(cmd.input_embedding_ids)
+        #     print(cmd.output_embedding_ids)
 
         num_blocks_per_req = [len(cmd.context_block_ids) for cmd in cmds.items]
         NUM_BLOCKS_IN_CHUNK = int(np.median(num_blocks_per_req))
@@ -208,22 +213,39 @@ class Driver:
             tgt_pos_ids = np.array(self.blocks[tgt_block_id].position_ids)  # int
             tgt_occupancy = np.array(self.blocks[tgt_block_id].occupancy)  # bool
 
+            # pad them to the NUM_TOKENS_IN_CHUNK
+            # print("NUM_TOKENS_IN_CHUNK", NUM_TOKENS_IN_CHUNK, NUM_TOKENS_IN_CHUNK - len(ctx_pos_ids))
+
             new_kv_lut[i] = tgt_block_id
             new_position_ids[i] = tgt_pos_ids
 
             for j in range(num_chunks):
-                start = j * NUM_BLOCKS_IN_CHUNK
-                end = min(start + NUM_BLOCKS_IN_CHUNK, len(ctx_block_ids))
+                start_b = j * NUM_BLOCKS_IN_CHUNK
+                end_b = min(start_b + NUM_BLOCKS_IN_CHUNK, len(ctx_block_ids))
 
                 new_q_lut[k] = i
                 new_kv_lut[i] = tgt_block_id
-                all_kv_lut[k, :end - start] = ctx_block_ids[start:end]
+                all_kv_lut[k, :end_b - start_b] = ctx_block_ids[start_b:end_b]
 
-                ctx_pos_ids[k, :end - start] = ctx_pos_ids[start:end]
-                ctx_occupancy[k, :end - start] = ctx_occupancy[start:end]
+                # ctx_pos_ids[k, :end - start] = ctx_pos_ids[start:end]
+                # ctx_occupancy[k, :end - start] = ctx_occupancy[start:end]
 
-                casual_mask = ctx_pos_ids[None, j * NUM_TOKENS_IN_CHUNK:(j + 1) * NUM_TOKENS_IN_CHUNK] <= tgt_pos_ids[:, None]
-                valid_mask = np.logical_and(ctx_occupancy[None, j * NUM_TOKENS_IN_CHUNK:(j + 1) * NUM_TOKENS_IN_CHUNK], tgt_occupancy[:, None])
+                start_t = j * NUM_TOKENS_IN_CHUNK
+                end_t = min(start_t + NUM_TOKENS_IN_CHUNK, len(ctx_pos_ids))
+
+                chunk_ctx_pos_ids = ctx_pos_ids[start_t:end_t]
+                chunk_ctx_occupancy = ctx_occupancy[start_t:end_t]
+
+                if len(chunk_ctx_pos_ids) < NUM_TOKENS_IN_CHUNK:
+                    chunk_ctx_pos_ids = np.pad(chunk_ctx_pos_ids, (0, NUM_TOKENS_IN_CHUNK - len(chunk_ctx_pos_ids)), mode='constant', constant_values=0)
+                    chunk_ctx_occupancy = np.pad(chunk_ctx_occupancy, (0, NUM_TOKENS_IN_CHUNK - len(chunk_ctx_occupancy)), mode='constant', constant_values=False)
+
+                casual_mask = chunk_ctx_pos_ids[None, :] <= tgt_pos_ids[:, None]
+                valid_mask = np.logical_and(chunk_ctx_occupancy[None, :], tgt_occupancy[:, None])
+
+                # print(ctx_pos_ids.shape)
+                # print(casual_mask.shape)
+                # print(valid_mask.shape)
 
                 masks[k] = np.logical_and(casual_mask, valid_mask)
 

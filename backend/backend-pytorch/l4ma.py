@@ -69,11 +69,11 @@ class L4maAttention(nn.Module):
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        ops.fill_kv_block_storage(kv_ptr, key_states, value_states, new_kv_lut)
+        ops.fill_kv_block_storage(kv_ptr[self.layer_idx], key_states, value_states, new_kv_lut)
 
         attn_output = ops.qkv_attention(
             q=query_states,
-            kv=kv_ptr,
+            kv=kv_ptr[self.layer_idx],
             q_lut=new_q_lut,
             kv_lut=all_kv_lut,
             mask=mask,

@@ -1,8 +1,9 @@
 import torch
 import zmq
-from transformers import TorchAoConfig
+from transformers import TorchAoConfig, AutoTokenizer
 
 import sdi_pb2
+from common import ceil_div
 from driver import Driver, NUM_TOKENS_IN_BLOCK
 from l4ma import AttentionStorage, VectorStorage
 from llama import LlamaForCausalLM
@@ -55,7 +56,7 @@ def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | No
     return None
 
 
-def main():
+def main_run():
     device = "cuda:0"
 
     quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
@@ -66,7 +67,7 @@ def main():
     block_storage = AttentionStorage(
         num_layers=model.config.num_hidden_layers,
         num_blocks=1000,
-        num_heads=model.config.num_attention_heads,
+        num_heads=model.config.num_key_value_heads,
         block_size=NUM_TOKENS_IN_BLOCK,
         head_dim=model.config.hidden_size // model.config.num_attention_heads,
         dtype=torch.bfloat16,
@@ -74,14 +75,14 @@ def main():
     )
 
     embed_storage = VectorStorage(
-        num_embeds=100,
+        num_embeds=1000,
         embed_dim=model.config.hidden_size,
         dtype=torch.bfloat16,
         device=device
     )
 
     dist_storage = VectorStorage(
-        num_embeds=100,
+        num_embeds=1000,
         embed_dim=model.config.hidden_size,
         dtype=torch.bfloat16,
         device=device
@@ -118,5 +119,83 @@ def main():
             router.send_multipart([client_identity, reply_payload])
 
 
+###====================Test====================###
+
+def llama3_format(prompt: str, hint: str | None, system: str = "You are a helpful, respectful and honest assistant."):
+    temp = "<|begin_of_text|>"
+    temp += f"<|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>"
+    temp += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
+    temp += f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    if hint:
+        temp += hint
+
+    return temp
+
+
+def main_test():
+    device = "cuda:0"
+
+    quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
+
+    model = LlamaForCausalLM.from_pretrained(
+        "meta-llama/Llama-3.2-1B-Instruct", torch_dtype="bfloat16", device_map=device, quantization_config=quantization_config)
+
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+
+    block_storage = AttentionStorage(
+        num_layers=model.config.num_hidden_layers,
+        num_blocks=1000,
+        num_heads=model.config.num_key_value_heads,
+        block_size=NUM_TOKENS_IN_BLOCK,
+        head_dim=model.config.hidden_size // model.config.num_attention_heads,
+        dtype=torch.bfloat16,
+        device=device
+    )
+
+    embed_storage = VectorStorage(
+        num_embeds=1000,
+        embed_dim=model.config.hidden_size,
+        dtype=torch.bfloat16,
+        device=device
+    )
+
+    dist_storage = VectorStorage(
+        num_embeds=1000,
+        embed_dim=model.config.hidden_size,
+        dtype=torch.bfloat16,
+        device=device
+    )
+
+    engine = Driver(model, block_storage, embed_storage, dist_storage)
+
+    test_prompt = llama3_format("Explain what Poodle is.", None)
+
+    token_ids = tokenizer.encode(test_prompt)
+    print("token_ids:", token_ids)
+
+    num_blocks_needed = ceil_div(len(token_ids), NUM_TOKENS_IN_BLOCK)
+    print("num blocks needed:", num_blocks_needed)
+
+    embeddings = []
+    for i in range(len(token_ids)):
+        embeddings.append(sdi_pb2.EmbedText(embedding_id=i, token_id=token_ids[i], position_id=i))
+
+    engine.embed_text(sdi_pb2.BatchEmbedText(items=embeddings))
+
+    allocs = [sdi_pb2.Allocate(kind=sdi_pb2.ObjectKind.OBJECT_KIND_KV_BLOCK, object_id_offset=0, count=5)]
+    fills = [
+        sdi_pb2.FillBlock(block_id=0, context_block_ids=[0], input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * 0, NUM_TOKENS_IN_BLOCK * 1)), output_embedding_ids=[]),
+        sdi_pb2.FillBlock(block_id=1, context_block_ids=[0, 1], input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * 1, NUM_TOKENS_IN_BLOCK * 2)), output_embedding_ids=[]),
+        sdi_pb2.FillBlock(block_id=2, context_block_ids=[0, 1, 2], input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * 2, NUM_TOKENS_IN_BLOCK * 3)), output_embedding_ids=[]),
+    ]
+
+    engine.allocate(sdi_pb2.BatchAllocate(items=allocs))
+    engine.fill_block(sdi_pb2.BatchFillBlock(items=fills))
+
+    print("done!")
+
+
 if __name__ == "__main__":
-    main()
+    # main_run()
+    main_test()
