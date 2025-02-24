@@ -72,7 +72,10 @@ class Driver:
         for cmd in cmds.items:
             if cmd.kind == ObjectKind.OBJECT_KIND_KV_BLOCK:
                 for i in range(cmd.count):
-                    self.blocks[cmd.object_id_offset + i] = EMPTY_BLOCK
+                    self.blocks[cmd.object_id_offset + i] = Block(
+                        position_ids=np.array([0] * NUM_TOKENS_IN_BLOCK),
+                        occupancy=np.array([False] * NUM_TOKENS_IN_BLOCK)
+                    )
 
             elif cmd.kind == ObjectKind.OBJECT_KIND_EMB:
                 # do nothing. Embeds are allocated on the fly.
@@ -143,7 +146,7 @@ class Driver:
         #     print(cmd.output_embedding_ids)
 
         num_blocks_per_req = [len(cmd.context_block_ids) for cmd in cmds.items]
-        NUM_BLOCKS_IN_CHUNK = int(np.median(num_blocks_per_req))
+        NUM_BLOCKS_IN_CHUNK = int(np.max(num_blocks_per_req))
         NUM_TOKENS_IN_CHUNK = NUM_BLOCKS_IN_CHUNK * NUM_TOKENS_IN_BLOCK
 
         num_chunks_per_req = [ceil_div(n, NUM_BLOCKS_IN_CHUNK) for n in num_blocks_per_req]
@@ -249,6 +252,8 @@ class Driver:
 
                 masks[k] = np.logical_and(casual_mask, valid_mask)
 
+                # print("masks[k]", masks[k].astype(int))
+
                 # if all items in the chunk are False, then it will cause NaN in softmax. Check:
                 if not masks[k].any():
                     print('Warning: All items in the chunk are False. This may cause NaN in softmax.')
@@ -265,12 +270,21 @@ class Driver:
         pt_new_token_ids = torch.as_tensor(new_token_ids, device=self.device(), dtype=torch.int32)
         pt_new_position_ids = torch.as_tensor(new_position_ids, device=self.device(), dtype=torch.int32)
 
+        # token ids
+        # print("pt_new_q_lut", pt_new_q_lut)
+        # print("pt_new_kv_lut", pt_new_kv_lut)
+        # print("pt_all_kv_lut", pt_all_kv_lut)
+        # print("pt_reduce_grps", pt_reduce_grps)
+        # print("new_token_ids", pt_new_token_ids)
+        # print("new_position_ids", pt_new_position_ids)
+        # print("pt_masks", pt_masks)
         # compute the embeddings...
         input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
 
         # inject the image embeddings -> replace with torch.scatter later
         for token_map in input_embed_postproc:
             vec_id = token_map["vec_id"]
+            print("img emb")
             input_embeds[token_map["row"], token_map["col"]].copy_(self.embed_storage.ptr[vec_id], non_blocking=True)
 
         # compute the position embeddings
@@ -288,8 +302,12 @@ class Driver:
             cmd_groups=pt_reduce_grps,
             rope_cache=position_embeds
         )
-
+        # print(logits.shape)
         # store the logits in the output embeds  -> replace with torch.scatter later
         for token_map in output_embed_postproc:
             vec_id = token_map["vec_id"]
+
+            # print("vec_id", vec_id)
+            # print(token_map)
+
             self.embed_storage.ptr[vec_id].copy_(logits[token_map["row"], token_map["col"]], non_blocking=True)

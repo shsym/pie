@@ -255,6 +255,7 @@ class L4maRotaryEmbedding(nn.Module):
         self.base = config.rope_theta
         # print( config.rope_scaling)
         if config.rope_scaling is not None and config.rope_scaling["rope_type"] == "llama3":
+            print("Using LLAMA3 parameters")
             inv_freq = _compute_llama3_parameters(
                 base=self.base,
                 dim=self.dim,

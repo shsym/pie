@@ -350,8 +350,8 @@ def fill_kv_block_storage(
         src_v: torch.Tensor,
         dst_lut: torch.Tensor,
 ):
-    #print(src_k.shape)
-    #print(dst_kv.shape)
+    # print(src_k.shape)
+    # print(dst_kv.shape)
     _, num_head, block_size, block_dim = src_k.shape
     _, num_head_, block_size2, block_dim_ = dst_kv.shape
 
@@ -567,8 +567,8 @@ def qkv_attention(
     max_grp_size = reduce_grp.shape[1]
     num_blocks_per_row = kv_lut.shape[1]
 
-    #print(q.shape)
-    #print(kv.shape)
+    # print(q.shape)
+    # print(kv.shape)
 
     # print(mask)
 
@@ -611,7 +611,7 @@ def qkv_attention(
 
     # reduce y if necessary
     if need_reduce:
-        #print('reducing y')
+        # print('reducing y')
         y_reduced = q  # torch.empty_like(q)
 
         grid = (num_reqs, num_head)
@@ -776,7 +776,7 @@ def test_qkv_attention():
 
     for _ in range(NUM_REQS):
         # pick random number between 1 and 10
-        num_blocks = 10 #random.randint(1, 8)
+        num_blocks = 10  # random.randint(1, 8)
 
         # select `num_total_blocks` amount of random block ids (does not need to be unique)
         ctx_ids = random.choices(range(NUM_TOTAL_BLOCKS), k=num_blocks)
