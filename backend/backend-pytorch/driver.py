@@ -146,12 +146,12 @@ class Driver:
         #     print(cmd.output_embedding_ids)
 
         num_blocks_per_req = [len(cmd.context_block_ids) for cmd in cmds.items]
-        NUM_BLOCKS_IN_CHUNK = int(np.max(num_blocks_per_req))
+        NUM_BLOCKS_IN_CHUNK = int(np.median(num_blocks_per_req))
         NUM_TOKENS_IN_CHUNK = NUM_BLOCKS_IN_CHUNK * NUM_TOKENS_IN_BLOCK
 
         num_chunks_per_req = [ceil_div(n, NUM_BLOCKS_IN_CHUNK) for n in num_blocks_per_req]
 
-        reduce_grps = np.zeros((len(cmds.items), max(num_chunks_per_req)), dtype=np.int32)  # 2d (NUM_CMDS, MAX_NUM_CHUNKS)
+        reduce_grps = np.full((len(cmds.items), max(num_chunks_per_req)), fill_value=-1, dtype=np.int32)  # 2d (NUM_CMDS, MAX_NUM_CHUNKS)
         new_q_lut = np.zeros((sum(num_chunks_per_req), 1), dtype=np.int32)
         new_kv_lut = np.zeros((len(cmds.items), 1), dtype=np.int32)
         all_kv_lut = np.zeros((sum(num_chunks_per_req), NUM_BLOCKS_IN_CHUNK), dtype=np.int32)
@@ -271,13 +271,13 @@ class Driver:
         pt_new_position_ids = torch.as_tensor(new_position_ids, device=self.device(), dtype=torch.int32)
 
         # token ids
-        # print("pt_new_q_lut", pt_new_q_lut)
-        # print("pt_new_kv_lut", pt_new_kv_lut)
-        # print("pt_all_kv_lut", pt_all_kv_lut)
-        # print("pt_reduce_grps", pt_reduce_grps)
-        # print("new_token_ids", pt_new_token_ids)
-        # print("new_position_ids", pt_new_position_ids)
-        # print("pt_masks", pt_masks)
+        print("pt_new_q_lut", pt_new_q_lut)
+        print("pt_new_kv_lut", pt_new_kv_lut)
+        print("pt_all_kv_lut", pt_all_kv_lut)
+        print("pt_reduce_grps", pt_reduce_grps)
+        print("new_token_ids", pt_new_token_ids)
+        print("new_position_ids", pt_new_position_ids)
+        print("pt_masks", pt_masks)
         # compute the embeddings...
         input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
 

@@ -190,10 +190,6 @@ def main_test():
     OUT_EMB_OFFSET = 100
 
     engine.fill_block(sdi_pb2.BatchFillBlock(items=[
-        # sdi_pb2.FillBlock(block_id=0, context_block_ids=[0], input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * 0, NUM_TOKENS_IN_BLOCK * 1)), output_embedding_ids=[]),
-        # sdi_pb2.FillBlock(block_id=1, context_block_ids=[0, 1], input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * 1, NUM_TOKENS_IN_BLOCK * 2)), output_embedding_ids=[]),
-        # sdi_pb2.FillBlock(block_id=2, context_block_ids=[0, 1, 2], input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * 2, NUM_TOKENS_IN_BLOCK * 3)),
-        #                   output_embedding_ids=list(range(100, 100 + next_token_pointer_idx + 1)))
         sdi_pb2.FillBlock(block_id=i,
                           context_block_ids=list(range(i + 1)),
                           input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * i, NUM_TOKENS_IN_BLOCK * (i + 1))),
