@@ -12,60 +12,56 @@ from common import ceil_div
 
 
 @triton.jit
-def rope_kernel(rope_ptr,  # (N, D)
-                x_ptr,  # (I, H, S, D)
-                pos_ptr,  # (I, ) stores the position of each block
-                rope_stride_i, rope_stride_d,
-                x_stride_i, x_stride_h, x_stride_s, x_stride_d,
-                BLOCK_SIZE: tl.constexpr,
-                BLOCK_DIM: tl.constexpr,
-                MAX_SEQ_LEN: tl.constexpr,
-                ):
+def rope_kernel(
+    # Shape: (max_pos, head_dim)
+    rope_cache_ptr,
+    # Shape: (batch_size, num_head, block_size, head_dim)
+    x_ptr,
+    # Shape: (batch_size, )
+    start_pos_ptr,
+    rope_stride_pos, rope_stride_dim,
+    x_stride_bch, x_stride_hd, x_stride_blk, x_stride_dim,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    MAX_POS: tl.constexpr,
+):
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
 
-    rope_idx = tl.load(pos_ptr + batch_idx)
+    pos = tl.load(start_pos_ptr + batch_idx)
 
-    # print("rope_idx", rope_idx)
-    rope_block_ptr = tl.make_block_ptr(
-        base=rope_ptr,
-        shape=(MAX_SEQ_LEN, BLOCK_DIM),
-        strides=(rope_stride_i, rope_stride_d),
-        offsets=(rope_idx, 0),
-        block_shape=(BLOCK_SIZE, BLOCK_DIM // 2),
+    # Shape: (block_size, head_dim/2)
+    cache_block_ptr = tl.make_block_ptr(
+        base=rope_cache_ptr,
+        shape=(MAX_POS, HEAD_DIM),
+        strides=(rope_stride_pos, rope_stride_dim),
+        offsets=(pos, 0),
+        block_shape=(BLOCK_SIZE, HEAD_DIM // 2),
         order=(0, 1)
     )
 
-    cos_block = tl.load(rope_block_ptr)
-    sin_block = tl.load(tl.advance(rope_block_ptr, (0, BLOCK_DIM // 2)))
+    cos = tl.load(cache_block_ptr)
+    sin = tl.load(tl.advance(cache_block_ptr, (0, HEAD_DIM // 2)))
 
-    # load halves
-    x_half_block_ptr = tl.make_block_ptr(
-        base=x_ptr + batch_idx * x_stride_i + head_idx * x_stride_h,
-        shape=(BLOCK_SIZE, BLOCK_DIM),
-        strides=(x_stride_s, x_stride_d),
+    # Shape: (block_size, head_dim/2)
+    x1_ptr = tl.make_block_ptr(
+        base=x_ptr + batch_idx * x_stride_bch + head_idx * x_stride_hd,
+        shape=(BLOCK_SIZE, HEAD_DIM),
+        strides=(x_stride_blk, x_stride_dim),
         offsets=(0, 0),
-        block_shape=(BLOCK_SIZE, BLOCK_DIM // 2),
+        block_shape=(BLOCK_SIZE, HEAD_DIM // 2),
         order=(0, 1)
     )
+    x2_ptr = tl.advance(x1_ptr, (0, HEAD_DIM // 2))
 
-    y_half_block_ptr = tl.make_block_ptr(
-        base=x_ptr + batch_idx * x_stride_i + head_idx * x_stride_h,
-        shape=(BLOCK_SIZE, BLOCK_DIM),
-        strides=(x_stride_s, x_stride_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE, BLOCK_DIM // 2),
-        order=(0, 1)
-    )
+    x1 = tl.load(x1_ptr)
+    x2 = tl.load(x2_ptr)
 
-    x_block_a = tl.load(x_half_block_ptr)
-    x_block_b = tl.load(tl.advance(x_half_block_ptr, (0, BLOCK_DIM // 2)))
+    x1_rotated = x1 * cos - x2 * sin
+    x2_rotated = x2 * cos + x1 * sin
 
-    new_x_block_a = x_block_a * cos_block - x_block_b * sin_block
-    new_x_block_b = x_block_b * cos_block + x_block_a * sin_block
-
-    tl.store(y_half_block_ptr, new_x_block_a)
-    tl.store(tl.advance(y_half_block_ptr, (0, BLOCK_DIM // 2)), new_x_block_b)
+    tl.store(x1_ptr, x1_rotated)
+    tl.store(x2_ptr, x2_rotated)
 
 
 @triton.jit
@@ -245,18 +241,21 @@ def flip_baseline(x: torch.Tensor):
 
 
 def rope(
+        # Shape: (max_pos, head_dim)
         rope_cache: torch.Tensor,
+        # Shape: (batch_size, num_head, block_size, head_dim)
         x: torch.Tensor,
-        pos: torch.Tensor | list[int],
+        # Shape: (batch_size, )
+        start_pos: torch.Tensor | list[int],
 ):
-    if isinstance(pos, list):
-        pos = torch.tensor(pos, dtype=torch.int32, device=x.device)
+    if isinstance(start_pos, list):
+        start_pos = torch.tensor(start_pos, dtype=torch.int32, device=x.device)
 
-    max_seq_len, block_dim = rope_cache.shape
-    batch_size, num_head, block_size, block_dim_ = x.shape
-    batch_size_, = pos.shape
+    max_pos, head_dim = rope_cache.shape
+    batch_size, num_head, block_size, head_dim_ = x.shape
+    batch_size_, = start_pos.shape
 
-    assert block_dim == block_dim_
+    assert head_dim == head_dim_
     assert batch_size == batch_size_
 
     grid = (batch_size, num_head)
@@ -264,10 +263,10 @@ def rope(
     rope_kernel[grid](
         rope_cache,
         x,
-        pos,
+        start_pos,
         rope_cache.stride(0), rope_cache.stride(1),
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-        block_size, block_dim, max_seq_len
+        block_size, head_dim, max_pos
     )
 
     return x
@@ -275,72 +274,103 @@ def rope(
 
 # pytorch-only inefficient implementation of rope for testing purposes
 def rope_baseline(
+        # Shape: (max_pos, head_dim)
         rope_cache: torch.Tensor,
+        # Shape: (batch_size, num_head, block_size, head_dim)
         x: torch.Tensor,
-        pos: torch.Tensor | list[int],
+        # Shape: (batch_size, )
+        start_pos: torch.Tensor,
 ):
-    rope_cache = rope_cache.view(-1, 2, rope_cache.size(-1) // 2)
-    cos_cache, sin_cache = rope_cache[:, 0, :], rope_cache[:, 1, :]
-    cos_cache = cos_cache.squeeze(1)
-    sin_cache = sin_cache.squeeze(1)
+    # Split out the cos and sin part in the cache
+    _, head_dim = rope_cache.shape
+    cos_cache = rope_cache[..., : head_dim // 2]
+    sin_cache = rope_cache[..., head_dim // 2 :]
+
+    # Shape: (max_pos, head_dim)
     cos_cache = torch.cat([cos_cache, cos_cache], dim=-1)
     sin_cache = torch.cat([sin_cache, sin_cache], dim=-1)
 
-    pp = pos.unsqueeze(1) + torch.arange(0, x.size(-2), device=x.device).unsqueeze(0)
-    cos_cache = cos_cache[pp].unsqueeze(1)
-    sin_cache = sin_cache[pp].unsqueeze(1)
+    _, _, block_size, _ = x.shape
+
+    # Shape: (batch_size, block_size)
+    x_pos = start_pos.unsqueeze(1) + torch.arange(0, block_size, device=x.device).unsqueeze(0)
+
+    # Shape: (max_pos, head_dim)
+    cos = cos_cache[x_pos].unsqueeze(1)
+    sin = sin_cache[x_pos].unsqueeze(1)
 
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
-    rotated_x = torch.cat((-x2, x1), dim=-1)
 
-    y = (x * cos_cache) + (rotated_x * sin_cache)
+    # Shape: (batch_size, num_head, block_size, head_dim)
+    x_inverted = torch.cat((-x2, x1), dim=-1)
+    x_rotated = (x * cos) + (x_inverted * sin)
 
-    return y
+    return x_rotated
 
 
 def rope_baseline_no_cache(
+        # Shape: (batch_size, num_head, block_size, head_dim)
         x: torch.Tensor,
-        pos: torch.Tensor | list[int],
+        # Shape: (batch_size, )
+        start_pos: torch.Tensor,
         base: int = 50000,
-):
-    bsz, num_head, block_size, head_dim = x.shape
+) -> torch.Tensor:
+    _batch_size, _num_head, block_size, head_dim = x.shape
 
-    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=x.device).float() / head_dim))
+    # Shape: (head_dim/2, )
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=x.device) / head_dim))
 
-    t = torch.arange(8000, device=x.device, dtype=inv_freq.dtype)
+    max_pos = torch.max(start_pos).item() + block_size
 
-    freqs = torch.outer(t, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
+    # Shape: (max_pos, )
+    all_pos = torch.arange(max_pos, device=x.device, dtype=inv_freq.dtype)
 
-    cos_cache = emb.cos()
-    sin_cache = emb.sin()
+    # Shape: (max_pos, head_dim)
+    theta = torch.outer(all_pos, inv_freq)
+    theta = torch.cat((theta, theta), dim=-1)
 
-    pp = pos.unsqueeze(1) + torch.arange(0, block_size, device=x.device).unsqueeze(0)
+    # Shape: (max_pos, head_dim)
+    cos = torch.cos(theta)
+    sin = torch.sin(theta)
+
+    # Shape: (batch_size, block_size)
+    x_pos = start_pos.unsqueeze(1) + torch.arange(0, block_size, device=x.device).unsqueeze(0)
 
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
-    x_rotated = torch.cat((-x2, x1), dim=-1)
 
-    cos_cache = cos_cache[pp].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin_cache = sin_cache[pp].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    y = (x * cos_cache) + (x_rotated * sin_cache)
+    # Shape: (batch_size, 1, block_size, head_dim)
+    cos = cos[x_pos].unsqueeze(1)
+    sin = sin[x_pos].unsqueeze(1)
 
-    return y
+    # Shape: (batch_size, num_head, block_size, head_dim)
+    x_inverted = torch.cat((-x2, x1), dim=-1)
+    x_rotated = (x * cos) + (x_inverted * sin)
+
+    return x_rotated
 
 
-def create_rope_cache(max_seq_len: int, block_dim: int, dtype: torch.dtype, device: torch.device, base: int = 50000) -> torch.Tensor:
-    theta = 1.0 / (base ** (torch.arange(0, block_dim, 2, device=device) / block_dim))
+def create_rope_cache(
+        max_pos: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        base: int = 50000
+) -> torch.Tensor:
+    # Shape: (head_dim/2, )
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device) / head_dim))
 
-    # (seq_len, )
-    seq_idx = torch.arange(max_seq_len, device=device)
+    # Shape: (max_pos, )
+    all_pos = torch.arange(max_pos, device=device)
 
-    # (seq_len, block_dim/2)
-    idx_theta = torch.outer(seq_idx, theta)
+    # Shape: (max_pos, head_dim/2)
+    theta = torch.outer(all_pos, inv_freq)
 
-    # (seq_len, block_dim/2)
-    cos, sin = torch.cos(idx_theta), torch.sin(idx_theta)
+    # Shape: (max_pos, head_dim/2)
+    cos, sin = torch.cos(theta), torch.sin(theta)
 
+    # Shape: (max_pos, head_dim)
     return torch.cat((cos, sin), dim=-1).to(dtype)
 
 

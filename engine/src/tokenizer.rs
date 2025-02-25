@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use fancy_regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -116,10 +116,8 @@ impl BytePairEncoder {
 
         // Then, convert the bytes to a UTF-8 string.
         // Using `from_utf8_lossy` would silently replace invalid sequences with
-        // the Unicode replacement character; here we fail on invalid UTF-8 instead.
-        let decoded_string = String::from_utf8(decoded_bytes).map_err(|err| DecodeError {
-            message: err.to_string(),
-        })?;
+        // the Unicode replacement character;
+        let decoded_string = String::from_utf8_lossy(&*decoded_bytes).to_string();
 
         Ok(decoded_string)
     }
@@ -206,7 +204,11 @@ impl BytePairEncoder {
         let decoder: HashMap<Rank, Vec<u8>> =
             encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
 
-        assert_eq!(encoder.len(), decoder.len(), "Encoder and decoder must be of equal length; maybe you had duplicate token indices in your encoder?");
+        assert_eq!(
+            encoder.len(),
+            decoder.len(),
+            "Encoder and decoder must be of equal length; maybe you had duplicate token indices in your encoder?"
+        );
 
         let special_tokens_decoder: HashMap<Rank, Vec<u8>> = special_tokens_encoder
             .iter()

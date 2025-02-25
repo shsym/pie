@@ -1,5 +1,5 @@
 use std::time::Instant;
-use symphony::Run;
+use symphony::RunSync;
 
 struct SimpleDecoding;
 
@@ -18,10 +18,10 @@ fn llama3_format(prompt: &str, hint: Option<&str>, system: Option<&str>) -> Stri
 
 // create a default stream constant
 const MAIN: u32 = 0;
-const MAX_NUM_OUTPUTS: usize = 1024;
+const MAX_NUM_OUTPUTS: usize = 32;
 
-impl Run for SimpleDecoding {
-    async fn run() -> Result<(), String> {
+impl RunSync for SimpleDecoding {
+    fn run() -> Result<(), String> {
         let start = Instant::now();
 
         let prompt = llama3_format("Explain the LLM decoding process ELI5.", None, None);
@@ -50,7 +50,7 @@ impl Run for SimpleDecoding {
             );
 
             // allocate blocks
-            let mut prefilled_blocks =
+            let prefilled_blocks =
                 symphony::inference::allocate_blocks(MAIN, num_context_blocks as u32);
 
             // fill blocks (=prefilling in the classic LLM inference settings)
@@ -103,18 +103,20 @@ impl Run for SimpleDecoding {
         context_blocks.push(symphony::inference::allocate_blocks(MAIN, 1)[0]);
 
         for i in 0..MAX_NUM_OUTPUTS {
+            let offset = (i + valid_len - 1) % block_size;
+
             symphony::inference::fill_block(
                 MAIN,
                 context_blocks[working_block_idx],
                 &context_blocks[..working_block_idx + 1], // the context should be inclusive of the current block
-                &input_block_embeds[..valid_len],
-                &output_block_embeds[..valid_len],
+                &input_block_embeds[..offset + 1],
+                &output_block_embeds[..offset + 1],
             );
 
             // let's sample the next token
             symphony::inference::decode_token_dist(
                 MAIN,
-                &output_block_embeds[(valid_len - 1)..valid_len],
+                &output_block_embeds[offset..offset + 1],
                 &next_dist,
             );
 
@@ -122,8 +124,6 @@ impl Run for SimpleDecoding {
             let sampled = symphony::inference::sample_top_k(MAIN, &next_dist, 1);
 
             let next_token = sampled[0][0];
-
-            println!("Next token: {:?}", next_token);
 
             // Check the EOS token (TODO)
             if next_token == eos_token {
@@ -134,17 +134,14 @@ impl Run for SimpleDecoding {
 
             symphony::inference::embed_text(
                 MAIN,
-                &input_block_embeds[valid_len..valid_len + 1],
+                &input_block_embeds[offset..offset + 1],
                 &[next_token],
                 &[(working_block_idx * block_size + valid_len) as u32],
             );
 
-            valid_len += 1;
-
-            if valid_len == block_size {
+            if offset == block_size - 1 {
                 // move to the next block
                 working_block_idx += 1;
-                valid_len = 0;
                 context_blocks.push(symphony::inference::allocate_blocks(MAIN, 1)[0]);
             }
         }
@@ -155,10 +152,10 @@ impl Run for SimpleDecoding {
         println!("Output text: {:?}", output_text);
 
         // Print elapsed time in milliseconds
-        println!("Time elapsed: {} microsec", duration.as_micros());
+        println!("Time elapsed: {:?} ms", duration);
 
         Ok(())
     }
 }
 
-symphony::main!(SimpleDecoding);
+symphony::main_sync!(SimpleDecoding);

@@ -117,9 +117,7 @@ impl BytePairEncoder {
         // Then, convert the bytes to a UTF-8 string.
         // Using `from_utf8_lossy` would silently replace invalid sequences with
         // the Unicode replacement character; here we fail on invalid UTF-8 instead.
-        let decoded_string = String::from_utf8(decoded_bytes).map_err(|err| DecodeError {
-            message: err.to_string(),
-        })?;
+        let decoded_string = String::from_utf8_lossy(&*decoded_bytes).to_string();
 
         Ok(decoded_string)
     }
@@ -318,7 +316,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokens = bpe_map.encode_with_special_tokens(text);
     println!("Encoded tokens: {:?}", tokens);
 
-    let decoded_text = bpe_map.decode(&tokens)?;
+    let new_tokens = vec![139, 915, 176, 660, 280, 175, 495, 229, 475, 923, 84, 383, 577, 295, 258, 529, 385, 765, 817, 250, 36, 141, 289, 570, 591, 841, 706, 607, 316, 831, 392, 868];
+    
+    let decoded_text = bpe_map.decode(&new_tokens)?;
     
     println!("Decoded text: {:?}", decoded_text);
     

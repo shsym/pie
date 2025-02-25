@@ -64,7 +64,11 @@ async fn main() -> anyhow::Result<()> {
 
     let controller_handle = tokio::spawn(async move {
         while let Some((inst_id, cmd)) = inst2server_rx.recv().await {
+            // print the cmd
+            //println!("Controller received command: {:?}", cmd);
             if let Err(e) = controller.exec(inst_id, cmd).await {
+                // print the cmd
+                //panic!("Controller exec error: {}", e);
                 eprintln!("Controller exec error: {}", e);
             }
         }
@@ -94,7 +98,8 @@ async fn main() -> anyhow::Result<()> {
 
 async fn dummy_client() -> anyhow::Result<()> {
     // Adjust path as needed:
-    let wasm_path = PathBuf::from("../example-apps/target/wasm32-wasip2/release/simple_decoding.wasm");
+    let wasm_path =
+        PathBuf::from("../example-apps/target/wasm32-wasip2/release/simple_decoding.wasm");
     let server_uri = "ws://127.0.0.1:9000";
 
     // 1) Create and connect the client

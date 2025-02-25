@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::backend::BackendError;
 use crate::object::{Allocator, Fetcher, Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
@@ -318,9 +318,9 @@ impl EventDispatcher {
                         })?;
                     } else {
                         bail!(
-                        "Mismatched event type: expected GetTokenDistribution for correlation_id: {}",
-                        correlation_id
-                    );
+                            "Mismatched event type: expected GetTokenDistribution for correlation_id: {}",
+                            correlation_id
+                        );
                     }
                 }
             }
@@ -439,8 +439,8 @@ impl CommandBatcher {
             mask_block: BatchQueue::eager(),
             embed_text: BatchQueue::eager(),
             embed_image: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
-            fill_block: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
-            sample_top_k: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
+            fill_block: BatchQueue::eager(),
+            sample_top_k: BatchQueue::eager(),
             decode_token_distribution: BatchQueue::eager(),
         }
     }
@@ -1187,7 +1187,13 @@ impl DummyBackend {
     ) {
         while let Some(req) = rx.recv().await {
             // Simulate execution overhead for each request.
-            tokio::time::sleep(exec_overhead).await;
+
+            // let start = Instant::now();
+            //
+            //
+            // //tokio::time::sleep(exec_overhead).await;
+            // let duration = start.elapsed();
+            //                     println!("Duration: {:?}", duration);
 
             let resp_payload = match req.command.unwrap() {
                 l4m::request::Command::SampleTopKRequest(batch) => {
@@ -1195,8 +1201,10 @@ impl DummyBackend {
                         let mut rng = rand::rng();
                         let token_ids: Vec<_> =
                             (0..item.k).map(|_| rng.random_range(0..1000)).collect();
+
                         l4m::SampleTopKResponse { token_ids }
                     });
+
                     Some(l4m::response::Payload::SampleTopK(
                         l4m::BatchSampleTopKResponse {
                             items: items.collect(),
