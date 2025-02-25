@@ -200,3 +200,5 @@ cython_debug/
 program_cache/
 
 *.model
+
+.run/

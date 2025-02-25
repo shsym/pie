@@ -13,6 +13,7 @@ pub use crate::bindings::{
     export, exports::spi::app::run::Guest as RunSync, spi::app::system, spi::lm::inference,
 };
 
+#[trait_variant::make(LocalRun: Send)]
 pub trait Run {
     async fn run() -> Result<(), String>;
 }

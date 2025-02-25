@@ -302,10 +302,11 @@ def rope_baseline(
 def rope_baseline_no_cache(
         x: torch.Tensor,
         pos: torch.Tensor | list[int],
+        base: int = 50000,
 ):
     bsz, num_head, block_size, head_dim = x.shape
 
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2, device=x.device).float() / head_dim))
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=x.device).float() / head_dim))
 
     t = torch.arange(8000, device=x.device, dtype=inv_freq.dtype)
 
@@ -784,7 +785,7 @@ def test_qkv_attention():
         # create a random mask (num_total_blocks * block_size, block_size) using numpy
         mask = np.random.choice([0, 1], size=(BLOCK_SIZE, num_blocks * BLOCK_SIZE), p=[0.1, 0.9])
 
-        # ensure the first block is always True
+        # ensure the first block is always True (This is to ensure that the softmax is not NaN)
         mask[:, 0] = 1
 
         # create a full true mask
@@ -844,29 +845,6 @@ def test_qkv_attention():
     print('done')
 
     ...
-
-
-def test_rope():
-    head_dim = 64
-    batch_size = 100
-    device = 'cuda'
-
-    k = torch.randn((batch_size, 32, 8, head_dim), device=device)
-    position_offsets = torch.tensor(list(range(batch_size)), dtype=torch.int32, device=device)
-    rope_cache = create_rope_cache(8192, head_dim, torch.float32, device)
-
-    k_pos1 = rope_baseline(rope_cache, k, position_offsets)
-    k_pos2 = rope_baseline_no_cache(k, position_offsets)
-
-    k_pos_triton = rope(rope_cache, k, position_offsets)
-
-    # print the difference
-    print('kpos1, kpos2', torch.abs(k_pos1 - k_pos2).sum())
-    assert torch.allclose(k_pos2, k_pos1, atol=1e-3)
-
-    print('kpos1, kpostriton', torch.abs(k_pos1 - k_pos_triton).sum())
-    assert torch.allclose(k_pos1, k_pos_triton, atol=1e-3)
-    # assert torch.allclose(v_pos1, v)
 
 
 if __name__ == '__main__':

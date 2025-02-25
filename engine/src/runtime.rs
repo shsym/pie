@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use uuid::Uuid;
-use wasmtime::{component::Component, component::Linker, Engine, Store};
+use wasmtime::{Engine, Store, component::Component, component::Linker};
 use wasmtime_wasi;
 
 use crate::instance::{App, Command, Id as InstanceId, InstanceState};
@@ -132,7 +132,7 @@ impl Runtime {
             None => {
                 return Err(RuntimeError::Other(
                     "Failed to get component from memory".into(),
-                ))
+                ));
             }
         };
 
@@ -150,6 +150,7 @@ impl Runtime {
             peer_rx,
             crate::instance::InstanceUtils {
                 tokenizer: self.tokenizer.clone(),
+                block_size: 32, // TODO: make this configurable
             },
         );
 

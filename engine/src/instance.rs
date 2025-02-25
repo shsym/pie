@@ -44,6 +44,7 @@ pub struct InstanceState {
 
 pub struct InstanceUtils {
     pub tokenizer: Arc<BytePairEncoder>,
+    pub block_size: u32,
 }
 
 // implements send
@@ -264,6 +265,12 @@ impl spi::app::system::Host for InstanceState {
 }
 
 impl spi::lm::inference::Host for InstanceState {
+
+
+    async fn get_block_size(&mut self) -> Result<u32, wasmtime::Error> {
+        Ok(self.utils.block_size)
+    }
+
     async fn allocate_blocks(
         &mut self,
         stream: u32,

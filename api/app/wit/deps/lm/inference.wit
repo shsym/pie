@@ -1,5 +1,7 @@
 interface inference {
 
+    get-block-size: func() -> u32;
+
     allocate-blocks: func(stream-id:u32, count:u32) -> list<u32>;
     deallocate-blocks: func(stream-id:u32, ids: list<u32>);
 

@@ -1,9 +1,11 @@
 interface inference {
 
+    get-block-size: func() -> u32;
+
     allocate-blocks: func(stream-id:u32, count:u32) -> list<u32>;
     deallocate-blocks: func(stream-id:u32, ids: list<u32>);
 
-    fill-block: func(stream-id:u32, blocks:u32, context: list<u32>, inputs: list<u32>, outputs: list<u32>);
+    fill-block: func(stream-id:u32, block:u32, context: list<u32>, inputs: list<u32>, outputs: list<u32>);
     copy-block: func(stream-id:u32, src:u32, dst:u32, src-offset:u32, dst-offset:u32, size:u32);
     mask-block: func(stream-id:u32, block:u32, mask:list<u32>);
 
