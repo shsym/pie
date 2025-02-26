@@ -27,6 +27,7 @@ use crate::driver_l4m::DummyBackend;
 use crate::runtime::Runtime;
 use std::fs;
 use std::time::Duration;
+use crate::backend::ZmqBackend;
 
 /// Directory for cached programs
 const PROGRAM_CACHE_DIR: &str = "./program_cache";
@@ -54,11 +55,10 @@ async fn main() -> anyhow::Result<()> {
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
 
     // 6) Spawn the controller loop (which manages commands coming from instances)
-    let backend = DummyBackend::new(Duration::ZERO).await;
-    // let backend = ZmqBackend::bind("tcp://127.0.0.1:5555")
-    //     .await
-    //     .context("Failed to bind backend")
-    //     .unwrap();
+    //let backend = DummyBackend::new(Duration::ZERO).await;
+    let backend = ZmqBackend::bind("tcp://gimlab.org:8888")
+        .await
+        .context("Failed to bind backend")?;
 
     let mut controller = Controller::new(runtime.clone(), backend).await;
 

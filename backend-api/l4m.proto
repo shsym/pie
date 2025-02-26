@@ -191,6 +191,14 @@ message BatchGetTokenDistributionResponse {
   repeated GetTokenDistributionResponse items = 1;
 }
 
+message PingRequest {
+  string message = 1;
+}
+
+message PingResponse {
+  string message = 1;
+}
+
 // -----------------------------------------------------------------------------
 
 
@@ -208,6 +216,7 @@ message Request {
     BatchDecodeTokenDistribution decode_token_distribution = 9;
     BatchSampleTopKRequest sample_top_k_request = 10;
     BatchGetTokenDistributionRequest get_token_distribution = 11;
+    PingRequest ping = 12;
   }
 }
 
@@ -218,5 +227,6 @@ message Response {
   oneof payload {
     BatchSampleTopKResponse sample_top_k = 2;
     BatchGetTokenDistributionResponse get_token_distribution = 3;
+    PingResponse ping = 4;
   }
 }

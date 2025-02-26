@@ -3,14 +3,14 @@ use crate::utils::IdPool;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::mem;
-use std::sync::{Arc};
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
 use prost::DecodeError;
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::{Mutex, mpsc};
 
 #[derive(Debug, Error)]
 pub enum BackendError {
@@ -83,7 +83,6 @@ where
                             if let Err(e) = socket.send(ZmqMessage::from(bytes)).await {
                                 eprintln!("Socket send failed: {:?}", e);
                             }
-
                         },
                         None => {
                             // channel closed => no more requests
@@ -97,12 +96,16 @@ where
                 result = socket.recv() => {
                     match result {
                         Ok(msg) => {
+                            // if msg.len() != 2 {
+                            //     eprintln!("Invalid message received from server: {:?}", msg);
+                            //     continue;
+                            // }
                             let payload = msg.get(0).unwrap();
                             match B::decode(payload.as_ref()) {
                                 Ok(resp) => {
                                     let a = evt_tx.lock().await;
                                     if let Some(tx) = &*a {
-                                        let _ = tx.send(resp);
+                                        let _ = tx.send(resp).await;
                                     } else {
                                         eprintln!("No event dispatcher found for response: {:?}", resp);
                                     }

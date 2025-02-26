@@ -10,7 +10,7 @@ from llama import LlamaForCausalLM
 from sdi_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchEmbedImage, BatchMaskBlock, BatchCopyBlock, BatchDecodeTokenDistribution, BatchSampleTopKRequest, BatchSampleTopKResponse, \
     ObjectKind, SampleTopKResponse, BatchGetTokenDistributionRequest, BatchGetTokenDistributionResponse, BatchFillBlock
 
-NUM_TOKENS_IN_BLOCK = 16
+NUM_TOKENS_IN_BLOCK = 32
 
 
 @dataclass
@@ -271,13 +271,13 @@ class Driver:
         pt_new_position_ids = torch.as_tensor(new_position_ids, device=self.device(), dtype=torch.int32)
 
         # token ids
-        print("pt_new_q_lut", pt_new_q_lut)
-        print("pt_new_kv_lut", pt_new_kv_lut)
-        print("pt_all_kv_lut", pt_all_kv_lut)
-        print("pt_reduce_grps", pt_reduce_grps)
-        print("new_token_ids", pt_new_token_ids)
-        print("new_position_ids", pt_new_position_ids)
-        print("pt_masks", pt_masks)
+        # print("pt_new_q_lut", pt_new_q_lut)
+        # print("pt_new_kv_lut", pt_new_kv_lut)
+        # print("pt_all_kv_lut", pt_all_kv_lut)
+        # print("pt_reduce_grps", pt_reduce_grps)
+        # print("new_token_ids", pt_new_token_ids)
+        # print("new_position_ids", pt_new_position_ids)
+        # print("pt_masks", pt_masks)
         # compute the embeddings...
         input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
 

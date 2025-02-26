@@ -56,6 +56,7 @@ enum Command {
     DecodeTokenDistribution(l4m::DecodeTokenDistribution),
     SampleTopKRequest(l4m::SampleTopKRequest),
     GetTokenDistributionRequest(l4m::GetTokenDistributionRequest),
+    Ping(l4m::PingRequest),
 }
 
 // Hidden
@@ -63,6 +64,7 @@ enum Command {
 enum Event {
     SampleTopK(l4m::SampleTopKResponse),
     GetTokenDistribution(l4m::GetTokenDistributionResponse),
+    Ping(l4m::PingResponse),
 }
 
 #[derive(Debug)]
@@ -70,6 +72,7 @@ pub enum EventHandle {
     None,
     SampleTopK(oneshot::Sender<Vec<u32>>),
     GetTokenDistribution(oneshot::Sender<Vec<f32>>),
+    Ping(oneshot::Sender<String>),
 }
 
 impl EventHandle {
@@ -198,32 +201,42 @@ where
         let batched_payloads = self.cmd_batcher.batch_all(curr_timestamp);
 
         for (cmd, senders) in batched_payloads {
-            // TODO: fix error type
-            let correlation_id = self
-                .cmd_id_pool
-                .acquire()
-                .map_err(|e| DriverError::LockError)?;
-
-            // register events if there are any
-            if senders.iter().any(|s| s.is_some()) {
-                self.event_dispatcher
-                    .lock()
-                    .await
-                    .register(correlation_id, senders);
-            }
-
-            let req = l4m::Request {
-                correlation_id,
-                command: Some(cmd),
-            };
-
-            self.backend
-                .exec(req)
-                .await
-                .map_err(|_| DriverError::SendError)?;
+            self.exec_in_backend(cmd, senders).await?;
         }
 
         // drop the lock on pending
+        Ok(())
+    }
+
+    async fn exec_in_backend(
+        &mut self,
+        cmd: l4m::request::Command,
+        senders: Vec<EventHandle>,
+    ) -> Result<(), DriverError> {
+        // TODO: fix error type
+        let correlation_id = self
+            .cmd_id_pool
+            .acquire()
+            .map_err(|e| DriverError::LockError)?;
+
+        // register events if there are any
+        if senders.iter().any(|s| s.is_some()) {
+            self.event_dispatcher
+                .lock()
+                .await
+                .register(correlation_id, senders);
+        }
+
+        let req = l4m::Request {
+            correlation_id,
+            command: Some(cmd),
+        };
+
+        self.backend
+            .exec(req)
+            .await
+            .map_err(|_| DriverError::SendError)?;
+
         Ok(())
     }
 
@@ -248,10 +261,26 @@ where
                     .into_iter()
                     .map(|item| Event::GetTokenDistribution(item))
                     .collect(),
+                l4m::response::Payload::Ping(item) => {
+                    vec![Event::Ping(item)]
+                }
             };
 
             dispatcher.dispatch(correlation_id, ir_events).unwrap();
         }
+    }
+
+    pub async fn ping(
+        &mut self,
+        message: String,
+        handler: oneshot::Sender<String>,
+    ) -> Result<(), DriverError> {
+        let cmd = l4m::request::Command::Ping(l4m::PingRequest { message });
+
+        self.exec_in_backend(cmd, vec![EventHandle::Ping(handler)])
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -319,6 +348,17 @@ impl EventDispatcher {
                     } else {
                         bail!(
                             "Mismatched event type: expected GetTokenDistribution for correlation_id: {}",
+                            correlation_id
+                        );
+                    }
+                }
+                EventHandle::Ping(s) => {
+                    if let Event::Ping(mut resp) = event {
+                        s.send(mem::take(&mut resp.message))
+                            .map_err(|e| anyhow!("Failed to send Ping event: {:?}", e))?;
+                    } else {
+                        bail!(
+                            "Mismatched event type: expected Ping for correlation_id: {}",
                             correlation_id
                         );
                     }
@@ -476,6 +516,9 @@ impl CommandBatcher {
                     .push(item, curr_timestamp, evt);
             }
             Command::GetTokenDistributionRequest(_) => todo!(),
+            _ => {
+                eprintln!("Unsupported command type: {:?}", cmd);
+            }
         }
     }
 

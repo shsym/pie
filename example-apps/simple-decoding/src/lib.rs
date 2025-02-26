@@ -22,8 +22,17 @@ const MAX_NUM_OUTPUTS: usize = 32;
 
 impl RunSync for SimpleDecoding {
     fn run() -> Result<(), String> {
-        let start = Instant::now();
+        // Test the system ping latency
 
+        for _ in 0..10 {
+            let start = Instant::now();
+            let resp = symphony::system::ping("hello");
+            let duration = start.elapsed();
+            println!("Ping response: {:?}, Time elapsed: {:?}", resp, duration);
+        }
+
+        let start = Instant::now();
+        println!("Running the simple decoding example...");
         let prompt = llama3_format("Explain the LLM decoding process ELI5.", None, None);
 
         let prompt_tokens = symphony::inference::tokenize(&prompt);
@@ -94,7 +103,7 @@ impl RunSync for SimpleDecoding {
             &range[idx_offset..idx_offset + remaining_tokens.len()],
         );
 
-        let mut valid_len = remaining_tokens.len();
+        let valid_len = remaining_tokens.len();
         let mut working_block_idx = context_blocks.len();
 
         let mut output_tokens = Vec::new();
@@ -103,6 +112,8 @@ impl RunSync for SimpleDecoding {
         context_blocks.push(symphony::inference::allocate_blocks(MAIN, 1)[0]);
 
         for i in 0..MAX_NUM_OUTPUTS {
+            let start_time = Instant::now();
+
             let offset = (i + valid_len - 1) % block_size;
 
             symphony::inference::fill_block(
@@ -144,6 +155,9 @@ impl RunSync for SimpleDecoding {
                 working_block_idx += 1;
                 context_blocks.push(symphony::inference::allocate_blocks(MAIN, 1)[0]);
             }
+
+            let duration = start_time.elapsed();
+            println!("Time elapsed for iteration {}: {:?}", i, duration);
         }
 
         let duration = start.elapsed();
@@ -152,7 +166,7 @@ impl RunSync for SimpleDecoding {
         println!("Output text: {:?}", output_text);
 
         // Print elapsed time in milliseconds
-        println!("Time elapsed: {:?} ms", duration);
+        println!("Time elapsed: {:?}", duration);
 
         Ok(())
     }

@@ -1,3 +1,5 @@
+import time
+
 import torch
 import zmq
 from transformers import TorchAoConfig, AutoTokenizer
@@ -17,7 +19,7 @@ def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | No
 
     # no pending computations on input -> do it RN (except for Fills - cannot do them in parallel) & register "pending" status on inputs & outputs.
     # ...
-
+    print("Handling request:", command)
     if command == "allocate":
         d.allocate(request.allocate)
 
@@ -49,6 +51,11 @@ def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | No
     elif command == "get_token_distribution":
         res = d.get_token_distribution(request.get_token_distribution)
         return sdi_pb2.Response(correlation_id=request.correlation_id, get_token_distribution=res)
+
+    elif command == "ping":
+        reply = "awk:" + request.ping.message
+        return sdi_pb2.Response(correlation_id=request.correlation_id, ping=sdi_pb2.PingResponse(message=reply))
+
 
     else:
         print("No valid command found in request.")
@@ -92,8 +99,8 @@ def main_run():
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
-    router.bind("tcp://*:5555")
-    print("Server listening on tcp://*:5555")
+    router.bind("tcp://*:8888")
+    print("Server listening on tcp://*:8888")
 
     while True:
         # ROUTER sockets receive multipart messages.
@@ -114,6 +121,7 @@ def main_run():
         if response is not None:
             reply_payload = response.SerializeToString()
 
+            # print("Sending reply back to the client.")
             # Send reply back to the client.
             # Include the client identity and an empty frame to maintain the envelope.
             router.send_multipart([client_identity, reply_payload])
@@ -203,6 +211,10 @@ def main_test():
     last_token_idx = (len(token_ids) % NUM_TOKENS_IN_BLOCK) - 1
 
     for i in range(10):
+        torch.cuda.synchronize()
+
+        time_start = time.time()
+
         engine.decode_token_distribution(sdi_pb2.BatchDecodeTokenDistribution(items=[
             sdi_pb2.DecodeTokenDistribution(embedding_id=OUT_EMB_OFFSET + last_token_idx + i, distribution_id=0)
         ]))
@@ -225,10 +237,15 @@ def main_test():
                               input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * last_block_id, NUM_TOKENS_IN_BLOCK * (last_block_id + 1))),
                               output_embedding_ids=list(range(OUT_EMB_OFFSET, OUT_EMB_OFFSET + NUM_TOKENS_IN_BLOCK))),
         ]))
+        torch.cuda.synchronize()
+        time_end = time.time()
+
+        # print the elapsed time in milliseconds
+        print(f"Elapsed time: {(time_end - time_start) * 1000:.2f}ms")
 
     print("done!")
 
 
 if __name__ == "__main__":
-    # main_run()
-    main_test()
+    main_run()
+    # main_test()

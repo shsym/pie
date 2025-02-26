@@ -147,6 +147,12 @@ where
                     subs.retain(|&x| x != inst_id);
                 }
             }
+            
+            Command::Ping { message, handle } => {
+                self.driver_l4m.ping(message, handle).await.map_err(|e| {
+                    ControllerError::DriverError(format!("Ping failed: {}", e))
+                })?;
+            }
             Command::AllocateBlocks { stream, blocks } => {
                 let stream = Stream::new(&inst_id, Some(stream));
                 let space = self
