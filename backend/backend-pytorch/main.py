@@ -90,7 +90,7 @@ def main_run():
 
     dist_storage = VectorStorage(
         num_embeds=1000,
-        embed_dim=model.config.hidden_size,
+        embed_dim=model.config.vocab_size,
         dtype=torch.bfloat16,
         device=device
     )

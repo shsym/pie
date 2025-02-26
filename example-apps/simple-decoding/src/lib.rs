@@ -142,15 +142,17 @@ impl RunSync for SimpleDecoding {
             }
 
             output_tokens.push(next_token);
-
+        
+            let next_offset = (offset + 1) % block_size;
+            
             symphony::inference::embed_text(
                 MAIN,
-                &input_block_embeds[offset..offset + 1],
+                &input_block_embeds[next_offset..next_offset + 1],
                 &[next_token],
-                &[(working_block_idx * block_size + valid_len) as u32],
+                &[(working_block_idx * block_size + valid_len + i) as u32],
             );
 
-            if offset == block_size - 1 {
+            if next_offset == 0 {
                 // move to the next block
                 working_block_idx += 1;
                 context_blocks.push(symphony::inference::allocate_blocks(MAIN, 1)[0]);

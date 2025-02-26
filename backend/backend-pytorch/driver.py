@@ -3,6 +3,7 @@ from typing import Union
 
 import numpy as np
 import torch
+from transformers import AutoTokenizer
 
 from common import ceil_div
 from l4ma import AttentionStorage, VectorStorage
@@ -12,6 +13,7 @@ from sdi_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchEmbedIm
 
 NUM_TOKENS_IN_BLOCK = 32
 
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
 
 @dataclass
 class TextEmbed:
@@ -271,13 +273,14 @@ class Driver:
         pt_new_position_ids = torch.as_tensor(new_position_ids, device=self.device(), dtype=torch.int32)
 
         # token ids
-        # print("pt_new_q_lut", pt_new_q_lut)
-        # print("pt_new_kv_lut", pt_new_kv_lut)
-        # print("pt_all_kv_lut", pt_all_kv_lut)
-        # print("pt_reduce_grps", pt_reduce_grps)
-        # print("new_token_ids", pt_new_token_ids)
-        # print("new_position_ids", pt_new_position_ids)
-        # print("pt_masks", pt_masks)
+        print("pt_new_q_lut", pt_new_q_lut)
+        print("pt_new_kv_lut", pt_new_kv_lut)
+        print("pt_all_kv_lut", pt_all_kv_lut)
+        print("pt_reduce_grps", pt_reduce_grps)
+        print("new_token_ids", pt_new_token_ids)
+        print("detokenized ids", tokenizer.decode(pt_new_token_ids[0]))
+        print("new_position_ids", pt_new_position_ids)
+        print("pt_masks", pt_masks)
         # compute the embeddings...
         input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
 

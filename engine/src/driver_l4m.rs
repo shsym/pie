@@ -577,6 +577,15 @@ impl CommandBatcher {
             ));
         }
 
+        if let Some((items, senders)) = self.decode_token_distribution.batch(curr_timestamp) {
+            cmds.push((
+                l4m::request::Command::DecodeTokenDistribution(l4m::BatchDecodeTokenDistribution {
+                    items,
+                }),
+                senders,
+            ));
+        }
+
         if let Some((items, senders)) = self.sample_top_k.batch(curr_timestamp) {
             cmds.push((
                 l4m::request::Command::SampleTopKRequest(l4m::BatchSampleTopKRequest { items }),
