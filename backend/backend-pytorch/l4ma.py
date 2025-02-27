@@ -72,10 +72,10 @@ class L4maAttention(nn.Module):
         ops.fill_kv_block_storage(kv_ptr[self.layer_idx], key_states, value_states, new_kv_lut)
 
         attn_output = ops.qkv_attention(
-            q=query_states,
-            kv=kv_ptr[self.layer_idx],
-            q_lut=new_q_lut,
-            kv_lut=all_kv_lut,
+            q_table=query_states,
+            kv_table=kv_ptr[self.layer_idx],
+            q_idxs=new_q_lut,
+            kv_idxs=all_kv_lut,
             mask=mask,
             reduce_grp=cmd_groups,
         )

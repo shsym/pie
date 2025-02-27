@@ -65,41 +65,6 @@ def rope_kernel(
 
 
 @triton.jit
-def flip_kernel(x_ptr,  # (I, H, S, D)
-                k_stride_i, k_stride_h, k_stride_s, k_stride_d,
-                BLOCK_SIZE: tl.constexpr,
-                BLOCK_DIM: tl.constexpr,
-                ):
-    batch_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-
-    # load halves
-    x_half_block_ptr = tl.make_block_ptr(
-        base=x_ptr + batch_idx * k_stride_i + head_idx * k_stride_h,
-        shape=(BLOCK_SIZE, BLOCK_DIM),
-        strides=(k_stride_s, k_stride_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE, BLOCK_DIM // 2),
-        order=(0, 1)
-    )
-
-    y_half_block_ptr = tl.make_block_ptr(
-        base=x_ptr + batch_idx * k_stride_i + head_idx * k_stride_h,
-        shape=(BLOCK_SIZE, BLOCK_DIM),
-        strides=(k_stride_s, k_stride_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE, BLOCK_DIM // 2),
-        order=(0, 1)
-    )
-
-    x_block_a = tl.load(x_half_block_ptr)
-    x_block_b = tl.load(tl.advance(x_half_block_ptr, (0, BLOCK_DIM // 2)))
-
-    tl.store(y_half_block_ptr, x_block_b)
-    tl.store(tl.advance(y_half_block_ptr, (0, (BLOCK_DIM // 2))), x_block_a)
-
-
-@triton.jit
 def fill_kv_block_storage_kernel(dst_kv_ptr,  # destination block table float(I1, H, 2S, D)
                                  src_k_ptr,  # source block table float(I2, H, S, D)
                                  src_v_ptr,  # source block table float(I2, H, S, D)
@@ -147,53 +112,64 @@ def fill_kv_block_storage_kernel(dst_kv_ptr,  # destination block table float(I1
 
 @triton.jit
 def reduce_y_slices_kernel(
+        # Unreduced attention results
+        # Shape: (num_chunk_in_batch, num_head, num_tok_per_blk, head_dim)
         y_ptr,  # unreduced y float(I1, H, S, D)
-        attn_ptr,  # attn stats float(I1, H, 2S)
-        grp_lut_ptr,  # reduce group lookup table. all ys in the same group are reduced. int(I2, NUM_BLOCKS_IN_GROUP)
-        y_reduced_ptr,  # reduced y float(I2, H, S, D)
+        # Attention stats tensor (required for reducing y)
+        # Shape: (num_chunk_in_batch, num_head, 2 * num_tok_per_blk)
+        attn_stats_ptr,
+        # Shape: (batch_size, num_chunk_per_req)
+        reduce_grp_ptr,
+        # Output reduced attention results
+        # Shape: (batch_size, num_head, num_tok_per_blk, head_dim)
+        y_reduced_ptr,
+        # Strides to access the data in the tensors
         stride_y_i, stride_y_h, stride_y_s, stride_y_d,
         stride_attn_i, stride_attn_h, stride_attn_2s,
         stride_y_reduced_i, stride_y_reduced_h, stride_y_reduced_s, stride_y_reduced_d,
-        BLOCK_SIZE: tl.constexpr,
-        BLOCK_DIM: tl.constexpr,
-        NUM_BLOCKS_IN_GROUP: tl.constexpr,
+        # Number of tokens contained by a block
+        NUM_TOK_PER_BLK: tl.constexpr,
+        # The hidden dimension of the model (head_dim)
+        HEAD_DIM: tl.constexpr,
+        # Number of chunks in a request
+        NUM_CHUNK_PER_REQ: tl.constexpr,
 ):
-    grp_idx = tl.program_id(0)
+    req_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
 
-    y_reduced = tl.zeros([BLOCK_SIZE, BLOCK_DIM], dtype=tl.float32)
-    attn_max_reduced = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    attn_sum_reduced = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    y_reduced = tl.zeros([NUM_TOK_PER_BLK, HEAD_DIM], dtype=tl.float32)
+    attn_max_reduced = tl.zeros([NUM_TOK_PER_BLK], dtype=tl.float32)
+    attn_sum_reduced = tl.zeros([NUM_TOK_PER_BLK], dtype=tl.float32)
 
-    for i in range(NUM_BLOCKS_IN_GROUP):
-        # get block index
-        block_idx = tl.load(grp_lut_ptr + grp_idx * NUM_BLOCKS_IN_GROUP + i)
+    # Reduce attention results across chunks (flash decoding)
+    for i in range(NUM_CHUNK_PER_REQ):
+        block_idx = tl.load(reduce_grp_ptr + req_idx * NUM_CHUNK_PER_REQ + i)
 
-        # skip if block_idx is -1
+        # When requests in the batch have unequal length, shorter requests
+        # will be padded and set the padding block index to -1. We should
+        # skip the padding blocks.
         if block_idx >= 0:
 
-            # get block ptr
             y_block_ptr = tl.make_block_ptr(
                 base=y_ptr + block_idx * stride_y_i + head_idx * stride_y_h,
-                shape=(BLOCK_SIZE, BLOCK_DIM),
+                shape=(NUM_TOK_PER_BLK, HEAD_DIM),
                 strides=(stride_y_s, stride_y_d),
                 offsets=(0, 0),
-                block_shape=(BLOCK_SIZE, BLOCK_DIM),
+                block_shape=(NUM_TOK_PER_BLK, HEAD_DIM),
                 order=(0, 1)
             )
 
-            attn_block_ptr = attn_ptr + block_idx * stride_attn_i + head_idx * stride_attn_h
+            attn_block_ptr = attn_stats_ptr + block_idx * stride_attn_i + head_idx * stride_attn_h
 
             if i == 0:
                 y_reduced = tl.load(y_block_ptr).to(tl.float32)
-                attn_max_reduced = tl.load(attn_block_ptr + tl.arange(0, BLOCK_SIZE))
-                attn_sum_reduced = tl.load(attn_block_ptr + tl.arange(BLOCK_SIZE, BLOCK_SIZE * 2))
+                attn_max_reduced = tl.load(attn_block_ptr + tl.arange(0, NUM_TOK_PER_BLK))
+                attn_sum_reduced = tl.load(attn_block_ptr + tl.arange(NUM_TOK_PER_BLK, NUM_TOK_PER_BLK * 2))
 
             else:
-
                 y = tl.load(y_block_ptr)
-                attn_max = tl.load(attn_block_ptr + tl.arange(0, BLOCK_SIZE))
-                attn_sum = tl.load(attn_block_ptr + tl.arange(BLOCK_SIZE, BLOCK_SIZE * 2))
+                attn_max = tl.load(attn_block_ptr + tl.arange(0, NUM_TOK_PER_BLK))
+                attn_sum = tl.load(attn_block_ptr + tl.arange(NUM_TOK_PER_BLK, NUM_TOK_PER_BLK * 2))
 
                 # re-normalize the softmax
                 attn_max_diff = tl.maximum(attn_max_reduced, attn_max)
@@ -207,37 +183,15 @@ def reduce_y_slices_kernel(
     y_reduced = y_reduced / attn_sum_reduced[:, None]
 
     y_reduced_block_ptr = tl.make_block_ptr(
-        base=y_reduced_ptr + grp_idx * stride_y_reduced_i + head_idx * stride_y_reduced_h,
-        shape=(BLOCK_SIZE, BLOCK_DIM),
+        base=y_reduced_ptr + req_idx * stride_y_reduced_i + head_idx * stride_y_reduced_h,
+        shape=(NUM_TOK_PER_BLK, HEAD_DIM),
         strides=(stride_y_reduced_s, stride_y_reduced_d),
         offsets=(0, 0),
-        block_shape=(BLOCK_SIZE, BLOCK_DIM),
+        block_shape=(NUM_TOK_PER_BLK, HEAD_DIM),
         order=(0, 1)
     )
 
     tl.store(y_reduced_block_ptr, y_reduced.to(y_ptr.dtype.element_ty))
-
-
-def flip(x: torch.Tensor):
-    batch_size, num_head, block_size, block_dim = x.shape
-
-    grid = (batch_size, num_head)
-
-    flip_kernel[grid](
-        x,
-        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-        block_size, block_dim
-    )
-
-    return x
-
-
-def flip_baseline(x: torch.Tensor):
-    _, num_head, block_size, block_dim = x.shape
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    x = torch.cat((x2, x1), dim=-1)
-    return x
 
 
 def rope(
@@ -426,37 +380,30 @@ def fill_kv_block_storage_baseline(
 
 @triton.jit
 def qkv_attention_kernel(
-
-        # <LEGEND>
-        # NUM_REQS: Number of requests (fill cmd) in the batch.
-        # NUM_ROWS (N): Number of rows in the batch. Why NUM_REQ != NUM_ROWS? Because each request can have multiple rows.
-        # NUM_HEAD (H): Number of heads in the model. (config.num_attention_heads)
-        # BLOCK_SIZE: Number of tokens in a block. (config.block_size)
-        # BLOCK_DIM (D): The hidden dimension of the model (head_dim)
-        # NUM_BLOCKS_PER_ROW: CHUNK_SIZE * BLOCK_SIZE => Number of blocks in a row. (config.chunk_size)
-        # NUM_TOTAL_BLOCKS_IN_STORAGE (CAP): Total number of blocks in the storage.
-
-        # Q tensor (a single block)
-        q_ptr,  # q float(NUM_REQS, H, BLOCK_SIZE, D)
-
-        # KV storage
-        kv_ptr,  # kv float(CAP, H, 2 * BLOCK_SIZE, D)
-
+        # Input query tensors
+        # Shape: (batch_size, num_head, num_tok_per_blk, head_dim)
+        q_table_ptr,
+        # Input KV cache table tensors
+        # Shape: (num_kv_block, num_kv_head, 2*num_tok_per_blk, head_dim)
+        kv_table_ptr,
         # Output tensor
-        y_ptr,  # y float(N, H, BLOCK_SIZE, D)
-
+        # Shape: (batch_size, num_head, num_tok_per_blk, head_dim)
+        y_ptr,
         # Attention stats tensor (required for reducing y)
-        attn_ptr,  # attn stats float(N, H, 2*BLOCK_SIZE)
-
-        # Lookup tables to map N -> NUM_REQS (i.e., all entries are < NUM_REQS)
-        q_lut_ptr,  # q lookup int(N, 1)
-
-        # Lookup tables to map N -> list of block ids in a  (i.e., all entries are < NUM_TOTAL_BLOCKS_IN_STORAGE)
-        kv_lut_ptr,  # kv lookup int(N, NUM_BLOCKS_PER_ROW)
-
-        # Attention mask.
-        mask_ptr,  # mask lookup bool(N, BLOCK_SIZE, NUM_BLOCKS_PER_ROW * BLOCK_SIZE)
-
+        # Shape: (num_chunk_in_batch, num_head, 2 * num_tok_per_blk)
+        attn_stats_ptr,
+        # Indicies into `q_table`
+        # For each chunk give the index of the query tensor in `q_table`
+        # Shape: (num_chunk_in_batch, 1)
+        q_idxs_ptr,
+        # Indicies into `kv_table`
+        # For each chunk and for each block in the chunk, give the index of the key and
+        # value tensor in `kv_table`
+        # Shape: (num_chunk_in_batch, num_blk_per_chunk)
+        kv_idxs_ptr,
+        # Attention mask
+        # Shape: (num_chunk_in_batch, num_tok_per_blk, num_blk_per_chunk * num_tok_per_blk)
+        mask_ptr,
         # Strides to access the data in the tensors
         stride_q_i, stride_q_h, stride_q_s, stride_q_d,
         stride_kv_i, stride_kv_h, stride_kv_2s, stride_kv_d,
@@ -464,188 +411,185 @@ def qkv_attention_kernel(
         stride_y_i, stride_y_h, stride_y_s, stride_y_d,
         stride_attn_i, stride_attn_h, stride_attn_2s,
         normalize_at_the_end,
-
         # Scaling factor for the softmax
         sm_scale: tl.constexpr,
-
-        # Number of tokens in a block
-        BLOCK_SIZE: tl.constexpr,
-
+        # Number of tokens contained by a block
+        NUM_TOK_PER_BLK: tl.constexpr,
         # The hidden dimension of the model (head_dim)
-        BLOCK_DIM: tl.constexpr,
-
-        # This value is referred to as "chunk_size" in the driver code
-        NUM_BLOCKS_PER_ROW: tl.constexpr,
-
+        HEAD_DIM: tl.constexpr,
+        # Number of blocks contained by a chunk
+        NUM_BLOCK_PER_CHUNK: tl.constexpr,
         # Needed for Grouped-Query Attention (https://arxiv.org/pdf/2305.13245)
         # If NUM_HEAD_GROUPS is 1, then this is a standard multi-head attention.
         NUM_HEAD_GROUPS: tl.constexpr = 1  # 1 means no GQA.
 ):
-    batch_idx = tl.program_id(0)
+    glb_chunk_idx = tl.program_id(0)
     head_q_idx = tl.program_id(1)
     head_kv_idx = head_q_idx // NUM_HEAD_GROUPS
 
-    # read q_idx from q_lut
-    q_idx = tl.load(q_lut_ptr + batch_idx)
+    q_idx = tl.load(q_idxs_ptr + glb_chunk_idx)
 
-    # shape (BLOCK_SIZE, D)
     q_block_ptr = tl.make_block_ptr(
-        base=q_ptr + q_idx * stride_q_i + head_q_idx * stride_q_h,
-        shape=(BLOCK_SIZE, BLOCK_DIM),
+        base=q_table_ptr + q_idx * stride_q_i + head_q_idx * stride_q_h,
+        shape=(NUM_TOK_PER_BLK, HEAD_DIM),
         strides=(stride_q_s, stride_q_d),
         offsets=(0, 0),
-        block_shape=(BLOCK_SIZE, BLOCK_DIM),
+        block_shape=(NUM_TOK_PER_BLK, HEAD_DIM),
         order=(0, 1)
     )
 
-    # shape (BLOCK_SIZE, BLOCK_SIZE)
     mask_block_ptr = tl.make_block_ptr(
-        base=mask_ptr + batch_idx * stride_mask_i,
-        shape=(BLOCK_SIZE, BLOCK_SIZE),
+        base=mask_ptr + glb_chunk_idx * stride_mask_i,
+        shape=(NUM_TOK_PER_BLK, NUM_TOK_PER_BLK), # TODO: Check this
         strides=(stride_mask_j, stride_mask_k),
         offsets=(0, 0),
-        block_shape=(BLOCK_SIZE, BLOCK_SIZE),
+        block_shape=(NUM_TOK_PER_BLK, NUM_TOK_PER_BLK),
         order=(0, 1)
     )
 
     y_block_ptr = tl.make_block_ptr(
-        base=y_ptr + batch_idx * stride_y_i + head_q_idx * stride_y_h,
-        shape=(BLOCK_SIZE, BLOCK_DIM),
+        base=y_ptr + glb_chunk_idx * stride_y_i + head_q_idx * stride_y_h,
+        shape=(NUM_TOK_PER_BLK, HEAD_DIM),
         strides=(stride_y_s, stride_y_d),
         offsets=(0, 0),
-        block_shape=(BLOCK_SIZE, BLOCK_DIM),
+        block_shape=(NUM_TOK_PER_BLK, HEAD_DIM),
         order=(0, 1)
     )
 
-    attn_block_ptr = attn_ptr + batch_idx * stride_attn_i + head_q_idx * stride_attn_h
+    attn_block_ptr = attn_stats_ptr + glb_chunk_idx * stride_attn_i + head_q_idx * stride_attn_h
 
     qk_scale = sm_scale * 1.44269504
+
+    # Shape: (block_size, head_dim)
     q_block = tl.load(q_block_ptr)
-    q_block = (q_block * qk_scale).to(kv_ptr.dtype.element_ty)
+    q_block = (q_block * qk_scale).to(kv_table_ptr.dtype.element_ty)
 
-    attn_max_reduced = tl.zeros([BLOCK_SIZE], dtype=tl.float32) - 1000000.0  # float("inf")
-    attn_sum_reduced = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    y_block = tl.zeros([BLOCK_SIZE, BLOCK_DIM], dtype=tl.float32)
+    attn_max_reduced = tl.zeros([NUM_TOK_PER_BLK], dtype=tl.float32) - 1000000.0  # float("inf")
+    attn_sum_reduced = tl.zeros([NUM_TOK_PER_BLK], dtype=tl.float32)
+    y_block = tl.zeros([NUM_TOK_PER_BLK, HEAD_DIM], dtype=tl.float32)
 
-    for block_idx in range(NUM_BLOCKS_PER_ROW):
-        kv_idx = tl.load(kv_lut_ptr + batch_idx * NUM_BLOCKS_PER_ROW + block_idx)
+    for block_idx in range(NUM_BLOCK_PER_CHUNK):
+        kv_idx = tl.load(kv_idxs_ptr + glb_chunk_idx * NUM_BLOCK_PER_CHUNK + block_idx)
 
         k_block_ptr = tl.make_block_ptr(
-            base=kv_ptr + kv_idx * stride_kv_i + head_kv_idx * stride_kv_h,
-            shape=(BLOCK_DIM, BLOCK_SIZE),
+            base=kv_table_ptr + kv_idx * stride_kv_i + head_kv_idx * stride_kv_h,
+            shape=(HEAD_DIM, NUM_TOK_PER_BLK),
             strides=(stride_kv_d, stride_kv_2s),
             offsets=(0, 0),
-            block_shape=(BLOCK_DIM, BLOCK_SIZE),
+            block_shape=(HEAD_DIM, NUM_TOK_PER_BLK),
             order=(1, 0)
         )
 
         v_block_ptr = tl.make_block_ptr(
-            base=kv_ptr + kv_idx * stride_kv_i + head_kv_idx * stride_kv_h,
-            shape=(BLOCK_SIZE, BLOCK_DIM),
+            base=kv_table_ptr + kv_idx * stride_kv_i + head_kv_idx * stride_kv_h,
+            shape=(NUM_TOK_PER_BLK, HEAD_DIM),
             strides=(stride_kv_2s, stride_kv_d),
-            offsets=(BLOCK_SIZE, 0),
-            block_shape=(BLOCK_SIZE, BLOCK_DIM),
+            offsets=(NUM_TOK_PER_BLK, 0),
+            block_shape=(NUM_TOK_PER_BLK, HEAD_DIM),
             order=(0, 1)
         )
 
+        # Shape: (head_dim, block_size)
         k_block = tl.load(k_block_ptr)
+        # Shape: (block_size, head_dim)
         v_block = tl.load(v_block_ptr)
+        # Shape: (block_size, block_size)
         mask = tl.load(mask_block_ptr)
 
-        attn = tl.zeros([BLOCK_SIZE, BLOCK_SIZE], dtype=tl.float32)
-        attn += tl.dot(q_block, k_block, allow_tf32=True)
+        # Shape: (block_size, block_size)
+        attn = tl.dot(q_block, k_block, allow_tf32=True)
 
         # Looks like Triton uses int8 for torch bool types. I added cast to satisfy triton compiler.
         # Check if this cast is causing any performance issues.
         attn += tl.where(mask.cast(tl.int1), 0.0, -1000000.0)
 
+        # Flash attention
         attn_max = tl.maximum(attn_max_reduced, tl.max(attn, axis=1))
         alpha = tl.math.exp2(attn_max_reduced - attn_max)
         attn = tl.math.exp2(attn - attn_max[:, None])
 
-        y_block = alpha[:, None] * y_block + tl.dot(attn.to(kv_ptr.dtype.element_ty), v_block, allow_tf32=True)
+        # Shape: (block_size, head_dim)
+        y_block = alpha[:, None] * y_block + tl.dot(attn.to(kv_table_ptr.dtype.element_ty), v_block, allow_tf32=True)
 
         attn_sum_reduced = attn_sum_reduced * alpha + tl.sum(attn, 1)
         attn_max_reduced = attn_max
 
-        # advance the mask ptr
-        mask_block_ptr = tl.advance(mask_block_ptr, (0, BLOCK_SIZE))
+        # Advance the mask ptr
+        mask_block_ptr = tl.advance(mask_block_ptr, (0, NUM_TOK_PER_BLK))
 
     if normalize_at_the_end:
         y_block = y_block / attn_sum_reduced[:, None]
     tl.store(y_block_ptr, y_block.to(y_ptr.dtype.element_ty))
 
-    tl.store(attn_block_ptr + tl.arange(0, BLOCK_SIZE), attn_max_reduced)
-    tl.store(attn_block_ptr + tl.arange(BLOCK_SIZE, BLOCK_SIZE * 2), attn_sum_reduced)
+    tl.store(attn_block_ptr + tl.arange(0, NUM_TOK_PER_BLK), attn_max_reduced)
+    tl.store(attn_block_ptr + tl.arange(NUM_TOK_PER_BLK, NUM_TOK_PER_BLK * 2), attn_sum_reduced)
 
 
 def qkv_attention(
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        q_lut: torch.Tensor,
-        kv_lut: torch.Tensor,
+        # Shape: (batch_size, num_head, num_tok_per_blk, head_dim)
+        q_table: torch.Tensor,
+        # Shape: (num_kv_block, num_kv_head, 2*num_tok_per_blk, head_dim)
+        kv_table: torch.Tensor,
+        # Shape: (num_chunk_in_batch, 1)
+        q_idxs: torch.Tensor,
+        # Shape: (num_chunk_in_batch, num_blk_per_chunk)
+        kv_idxs: torch.Tensor,
+        # Shape: (num_chunk_in_batch, num_tok_per_blk, num_blk_per_chunk * num_tok_per_blk)
         mask: torch.Tensor,
+        # Shape: (batch_size, num_chunk_per_req)
         reduce_grp: torch.Tensor,
-
 ) -> torch.Tensor:
-    num_reqs, num_head, block_size, block_dim = q.shape
-    _, num_head_kv, block_size2, block_dim_ = kv.shape
+    batch_size, num_head, num_tok_per_blk, head_dim = q_table.shape
+    _, num_kv_head, num_tok_per_blk2, head_dim_ = kv_table.shape
 
-    assert block_size * 2 == block_size2
-    assert block_dim == block_dim_
+    assert num_tok_per_blk * 2 == num_tok_per_blk2
+    assert head_dim == head_dim_
+    assert num_head % num_kv_head == 0
 
-    num_rows = q_lut.shape[0]
-    max_grp_size = reduce_grp.shape[1]
-    num_blocks_per_row = kv_lut.shape[1]
+    num_chunk_in_batch = q_idxs.shape[0]
+    num_chunk_per_req = reduce_grp.shape[1]
+    num_blk_per_chunk = kv_idxs.shape[1]
 
-    # print(q.shape)
-    # print(kv.shape)
+    # Check if it is a GQA
+    num_gqa_groups = num_head // num_kv_head
 
-    # print(mask)
+    grid = (num_chunk_in_batch, num_head)
 
-    # print('num_reqs', num_reqs)
-    # print('num_head', num_head)
-    # print('block_size', block_size)
-    # print('block_dim', block_dim)
-    # print('num_rows', num_rows)
-    # print('max_grp_size', max_grp_size)
-    # print('num_blocks_per_row', num_blocks_per_row)
+    y = torch.empty(
+        (num_chunk_in_batch, num_head, num_tok_per_blk, head_dim),
+        device=q_table.device, dtype=q_table.dtype
+    )
+    attn_stats = torch.empty(
+        (num_chunk_in_batch, num_head, 2 * num_tok_per_blk),
+        device=q_table.device, dtype=torch.float32
+    )
 
-    # check if it is a GQA
-    num_gqa_groups = num_head // num_head_kv
-
-    grid = (num_rows, num_head)
-
-    y = torch.empty((num_rows, num_head, block_size, block_dim), device=q.device, dtype=q.dtype)
-    attn_stats = torch.zeros((num_rows, num_head, 2 * block_size), device=q.device, dtype=torch.float32)
-
-    # check if we need to reduce y. If not, we do a normalization in this kernel.
-    need_reduce = max_grp_size > 1
+    # Check if we need to reduce y. If not, we do a normalization in this kernel.
+    need_reduce = num_chunk_per_req > 1
 
     qkv_attention_kernel[grid](
-        q,
-        kv,
+        q_table,
+        kv_table,
         y,
         attn_stats,
-        q_lut,
-        kv_lut,
+        q_idxs,
+        kv_idxs,
         mask,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        kv.stride(0), kv.stride(1), kv.stride(2), kv.stride(3),
+        q_table.stride(0), q_table.stride(1), q_table.stride(2), q_table.stride(3),
+        kv_table.stride(0), kv_table.stride(1), kv_table.stride(2), kv_table.stride(3),
         mask.stride(0), mask.stride(1), mask.stride(2),
         y.stride(0), y.stride(1), y.stride(2), y.stride(3),
         attn_stats.stride(0), attn_stats.stride(1), attn_stats.stride(2),
         not need_reduce,
-        1.0 / (block_dim ** 0.5),
-        block_size, block_dim, num_blocks_per_row, num_gqa_groups
+        1.0 / (head_dim ** 0.5),
+        num_tok_per_blk, head_dim, num_blk_per_chunk, num_gqa_groups
     )
 
     # reduce y if necessary
     if need_reduce:
-        # print('reducing y')
-        y_reduced = q  # torch.empty_like(q)
+        y_reduced = torch.empty_like(q_table)
 
-        grid = (num_reqs, num_head)
+        grid = (batch_size, num_head)
 
         reduce_y_slices_kernel[grid](
             y,
@@ -655,7 +599,7 @@ def qkv_attention(
             y.stride(0), y.stride(1), y.stride(2), y.stride(3),
             attn_stats.stride(0), attn_stats.stride(1), attn_stats.stride(2),
             y_reduced.stride(0), y_reduced.stride(1), y_reduced.stride(2), y_reduced.stride(3),
-            block_size, block_dim, max_grp_size
+            num_tok_per_blk, head_dim, num_chunk_per_req
         )
 
         y = y_reduced
@@ -664,220 +608,125 @@ def qkv_attention(
 
 
 def qkv_attention_baseline(
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        q_lut: torch.Tensor,
-        kv_lut: torch.Tensor,
+        # Shape: (batch_size, num_head, block_size, head_dim)
+        q_table: torch.Tensor,
+        # Shape: (num_kv_block, num_kv_head, 2*block_size, head_dim)
+        kv_table: torch.Tensor,
+        # Shape: (batch_size, 1)
+        q_idxs: torch.Tensor,
+        # Shape: (batch_size, num_blk_per_bch)
+        kv_idxs: torch.Tensor,
+        # Shape: (batch_size, block_size, num_blk_per_bch * block_size)
         mask: torch.Tensor,
-
 ) -> torch.Tensor:
-    num_rows, num_head, block_size, block_dim = q.shape
-    _, num_head_kv, block_size2, block_dim_ = kv.shape
+    batch_size, num_head, block_size, head_dim = q_table.shape
+    _, num_kv_head, block_size2, head_dim_ = kv_table.shape
+    num_blk_per_bch = kv_idxs.shape[1]
 
     assert block_size * 2 == block_size2
-    assert block_dim == block_dim_
+    assert head_dim == head_dim_
+    assert num_head % num_kv_head == 0
 
-    q = q[q_lut].squeeze(1)
-    kv = kv[kv_lut]  # (batch_size, num_blocks_per_batch, num_head_kv, 2*block_size,  block_dim)
+    # Shape: (batch_size, num_head, block_size, head_dim)
+    q = q_table[q_idxs].squeeze(1)
 
+    # Shape: (batch_size, num_blk_per_bch, num_kv_head, 2*block_size, head_dim)
+    kv = kv_table[kv_idxs]
+
+    # Shape: (batch_size, num_blk_per_bch, num_kv_head, block_size, head_dim)
     k = kv[:, :, :, :block_size, :]
     v = kv[:, :, :, block_size:, :]
 
-    num_blocks_per_row = kv_lut.shape[1]
+    # Shape: (batch_size, num_kv_head, seq_len, head_dim)
+    k = k.transpose(1, 2).reshape(batch_size, num_kv_head, num_blk_per_bch * block_size, head_dim)
+    v = v.transpose(1, 2).reshape(batch_size, num_kv_head, num_blk_per_bch * block_size, head_dim)
 
-    # mask = mask[mask_lut].view(num_rows, 1, num_blocks_per_batch * block_size, block_size).transpose(-1, -2)
+    # Repeat KV heads for GQA
+    # Shape: (batch_size, num_head, seq_len, head_dim)
+    k = torch.repeat_interleave(k, dim=1, repeats=num_head // num_kv_head)
+    v = torch.repeat_interleave(v, dim=1, repeats=num_head // num_kv_head)
 
-    k = k.transpose(1, 2).reshape(num_rows, num_head_kv, num_blocks_per_row * block_size, block_dim)
-    v = v.transpose(1, 2).reshape(num_rows, num_head_kv, num_blocks_per_row * block_size, block_dim)
-
-    # GQA
-    k = torch.repeat_interleave(k, dim=1, repeats=num_head // num_head_kv)
-    v = torch.repeat_interleave(v, dim=1, repeats=num_head // num_head_kv)
-
-    attn = torch.einsum('nhqd,nhkd->nhqk', q, k) / (block_dim ** 0.5)
+    # Shape: (batch_size, num_head, block_size, seq_len)
+    attn = torch.einsum('nhqd,nhkd->nhqk', q, k) / (head_dim ** 0.5)
 
     m = torch.where(mask, 0.0, torch.finfo(attn.dtype).min).to(attn.dtype).unsqueeze(1)
-
     attn = attn + m
-
     attn = torch.nn.functional.softmax(attn, dim=-1, dtype=torch.float32).to(attn.dtype)
 
-    y = torch.einsum('nhqk,nhkd->nhqd', attn, v)
+    # Shape: (batch_size, num_head, block_size, head_dim)
+    return torch.einsum('nhqk,nhkd->nhqd', attn, v)
 
-    return y
+def construct_input(
+    reqs: list[tuple[list[int], np.ndarray]],
+    num_blk_per_chunk: int,
+    num_tok_per_blk: int,
+    device: torch.device
+) -> dict:
+    num_chunk_of_reqs = [ceil_div(len(block_idxs), num_blk_per_chunk) for block_idxs, _ in reqs]
+    num_chunk_in_batch = sum(num_chunk_of_reqs)
+    batch_size = len(reqs)
 
+    q_idxs = np.zeros((num_chunk_in_batch, 1), dtype=np.int32)
+    kv_idxs = np.zeros((num_chunk_in_batch, num_blk_per_chunk), dtype=np.int32)
+    reduce_grps = np.zeros((batch_size, max(num_chunk_of_reqs)), dtype=np.int32)
+    masks = np.zeros((num_chunk_in_batch, num_tok_per_blk, num_blk_per_chunk * num_tok_per_blk), dtype=np.bool_)
 
-def construct_input(reqs: list[tuple[list[int], np.ndarray]], chunk_size: int, block_size: int, device: torch.device) -> dict:
-    # mask (num_reqs, num_blocks_per_row, block_size)
-    num_chunks_per_req = [ceil_div(len(req[0]), chunk_size) for req in reqs]
+    # Unique index for each chunk in the batch
+    glb_chunk_idx = 0
 
-    q_lut = np.zeros((sum(num_chunks_per_req), 1), dtype=np.int32)
-    kv_lut = np.zeros((sum(num_chunks_per_req), chunk_size), dtype=np.int32)
-    reduce_grps = np.zeros((len(reqs), max(num_chunks_per_req)), dtype=np.int32)  # (num_reqs, max num_blocks_per_row)
-    masks = np.zeros((sum(num_chunks_per_req), block_size, chunk_size * block_size), dtype=np.bool_)
-    # print(reduce_grps)
-    k = 0
-    for i, req in enumerate(reqs):
+    for req_idx, req in enumerate(reqs):
 
-        ctx_ids, mask = req
-        # mask: (len(ctx_ids) * block_size, block_size)
+        block_idxs, mask = req
 
-        num_chunks = ceil_div(len(ctx_ids), chunk_size)
+        num_chunk_in_req = ceil_div(len(block_idxs), num_blk_per_chunk)
 
-        for j in range(num_chunks):
-            start = j * chunk_size
-            end = min(start + chunk_size, len(ctx_ids))
+        for req_chunk_idx in range(num_chunk_in_req):
+            start = req_chunk_idx * num_blk_per_chunk
+            end = min(start + num_blk_per_chunk, len(block_idxs))
 
-            q_lut[k] = i
-            kv_lut[k, :end - start] = ctx_ids[start:end]
-            masks[k, :, :(end - start) * block_size] = mask[:, start * block_size: end * block_size]
+            q_idxs[glb_chunk_idx] = req_idx
+            kv_idxs[glb_chunk_idx, :end - start] = block_idxs[start:end]
+            masks[glb_chunk_idx, :, : (end - start) * num_tok_per_blk] = mask[
+                :, start * num_tok_per_blk : end * num_tok_per_blk
+            ]
 
             # if all items in the chunk are False, then it will cause NaN in softmax. Check:
-            if not masks[k].any():
+            if not masks[glb_chunk_idx].any():
                 raise ValueError('All items in the chunk are False. This will cause NaN in softmax.')
 
-            reduce_grps[i, j] = k
+            reduce_grps[req_idx, req_chunk_idx] = glb_chunk_idx
 
-            k += 1
+            glb_chunk_idx += 1
 
     return {
-        'q_lut': torch.as_tensor(q_lut, dtype=torch.long, device=device),
-        'kv_lut': torch.as_tensor(kv_lut, dtype=torch.long, device=device),
+        'q_lut': torch.as_tensor(q_idxs, dtype=torch.long, device=device),
+        'kv_lut': torch.as_tensor(kv_idxs, dtype=torch.long, device=device),
         'reduce_grps': torch.as_tensor(reduce_grps, dtype=torch.long, device=device),
         'masks': torch.as_tensor(masks, dtype=torch.bool, device=device)
     }
 
+def construct_input_baseline(
+    reqs: list[tuple[list[int], np.ndarray]],
+    num_tok_per_blk: int,
+    device: torch.device
+) -> dict:
+    batch_size = len(reqs)
 
-def construct_input_baseline(reqs: list[tuple[list[int], np.ndarray]], block_size: int, device: torch.device) -> dict:
-    # just pad them to the same size
+    # Pad all requests to the same maximum length
+    num_blk_per_req = max(len(block_idxs) for block_idxs, _ in reqs)
 
-    max_num_blocks = max(len(req[0]) for req in reqs)
-
-    kv_lut = np.zeros((len(reqs), max_num_blocks), dtype=np.int32)
-    q_lut = np.zeros((len(reqs), 1), dtype=np.int32)
-    masks = np.zeros((len(reqs), block_size, max_num_blocks * block_size), dtype=np.bool_)
+    kv_idxs = np.zeros((batch_size, num_blk_per_req), dtype=np.int32)
+    q_idxs = np.zeros((batch_size, 1), dtype=np.int32)
+    masks = np.zeros((batch_size, num_tok_per_blk, num_blk_per_req * num_tok_per_blk), dtype=np.bool_)
 
     for i, req in enumerate(reqs):
-        ctx_ids, mask = req
-        q_lut[i] = i
-        kv_lut[i, :len(ctx_ids)] = ctx_ids
-        masks[i, :, :len(ctx_ids) * block_size] = mask
+        block_idxs, mask = req
+        q_idxs[i] = i
+        kv_idxs[i, : len(block_idxs)] = block_idxs
+        masks[i, :, : len(block_idxs) * num_tok_per_blk] = mask
 
     return {
-        'q_lut': torch.as_tensor(q_lut, device=device),
-        'kv_lut': torch.as_tensor(kv_lut, device=device),
+        'q_lut': torch.as_tensor(q_idxs, device=device),
+        'kv_lut': torch.as_tensor(kv_idxs, device=device),
         'mask': torch.as_tensor(masks, device=device)
     }
-
-
-@torch.inference_mode()
-def test_qkv_attention():
-    device = torch.device('cuda')
-
-    #### CREATE A DUMMY MODEL ####
-
-    # create a dummy model
-    num_heads = 9
-    head_dim = 32
-    hidden_size = head_dim * num_heads
-    num_key_value_heads = num_heads // 1
-
-    # create a rope cache
-    # rope_cache = create_rope_cache(8192, head_dim, torch.float32, device)
-
-    q_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False, device=device)
-    # k_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=False, device=device)
-    # v_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=False, device=device)
-
-    ###############################
-
-    #### CREATE A DUMMY KV CACHE ####
-    NUM_TOTAL_BLOCKS = 128
-    BLOCK_SIZE = 32
-
-    # create a dummy kv cache
-    kv_cache_table = torch.randn(NUM_TOTAL_BLOCKS, num_key_value_heads, BLOCK_SIZE * 2, head_dim, device=device)
-
-    ###############################
-
-    #### CREATE A DUMMY TASK BATCH ####
-    CHUNK_SIZE = 3
-    NUM_REQS = 5
-    tasks = []
-
-    for _ in range(NUM_REQS):
-        # pick random number between 1 and 10
-        num_blocks = 10  # random.randint(1, 8)
-
-        # select `num_total_blocks` amount of random block ids (does not need to be unique)
-        ctx_ids = random.choices(range(NUM_TOTAL_BLOCKS), k=num_blocks)
-
-        # create a random mask (num_total_blocks * block_size, block_size) using numpy
-        mask = np.random.choice([0, 1], size=(BLOCK_SIZE, num_blocks * BLOCK_SIZE), p=[0.1, 0.9])
-
-        # ensure the first block is always True (This is to ensure that the softmax is not NaN)
-        mask[:, 0] = 1
-
-        # create a full true mask
-        # mask = np.ones((BLOCK_SIZE, num_blocks * BLOCK_SIZE), dtype=np.bool_)
-
-        tasks.append((ctx_ids, mask))
-
-    inp_baseline = construct_input_baseline(tasks, block_size=BLOCK_SIZE, device=device)
-    inp = construct_input(tasks, chunk_size=CHUNK_SIZE, block_size=BLOCK_SIZE, device=device)
-
-    # simulate the previous state
-    hidden_states = torch.randn(NUM_REQS, BLOCK_SIZE, hidden_size, device=device)
-
-    q = q_proj(hidden_states)
-    # k = k_proj(hidden_states)
-    # v = v_proj(hidden_states)
-
-    q = q.view(NUM_REQS, BLOCK_SIZE, num_heads, head_dim).transpose(1, 2)
-    # k = k.view(NUM_REQS, BLOCK_SIZE, num_key_value_heads, head_dim).transpose(1, 2)
-    # v = v.view(NUM_REQS, BLOCK_SIZE, num_key_value_heads, head_dim).transpose(1, 2)
-
-    # rope(rope_cache, q, batch.position_offsets)
-    # rope(rope_cache, k, batch.position_offsets)
-
-    # attention
-    y1 = qkv_attention_baseline(
-        q,
-        kv_cache_table,
-        inp_baseline['q_lut'],
-        inp_baseline['kv_lut'],
-        inp_baseline['mask']
-    )
-
-    # print(y1[0])
-
-    y2 = qkv_attention(
-        q,
-        kv_cache_table,
-        inp['q_lut'],
-        inp['kv_lut'],
-        inp['masks'],
-        inp['reduce_grps']
-    )
-
-    # print(y2[0])
-    # print('baseline:')
-    # print(y1.unsqueeze(0).unsqueeze(0))
-    #
-    # print('triton:')
-    # print(y2.unsqueeze(0).unsqueeze(0))
-
-    # shape
-    print('y1, y2', y1.shape, y2.shape)
-
-    print('y1, y2', torch.abs(y1 - y2).sum())
-
-    print('done')
-
-    ...
-
-
-if __name__ == '__main__':
-    # test_sliced_attention()
-    # test_rope()
-    test_qkv_attention()
