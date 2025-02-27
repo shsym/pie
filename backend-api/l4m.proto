@@ -199,6 +199,19 @@ message PingResponse {
   string message = 1;
 }
 
+message GetInfoRequest {
+
+}
+
+message GetInfoResponse {
+  string version = 1;
+  string model_name = 2;
+  uint32 block_size = 3;
+  uint32 num_available_blocks = 4;
+  uint32 num_available_embeddings = 5;
+  uint32 num_available_distributions = 6;
+}
+
 // -----------------------------------------------------------------------------
 
 
@@ -217,6 +230,7 @@ message Request {
     BatchSampleTopKRequest sample_top_k_request = 10;
     BatchGetTokenDistributionRequest get_token_distribution = 11;
     PingRequest ping = 12;
+    GetInfoRequest get_info = 13;
   }
 }
 
@@ -228,5 +242,6 @@ message Response {
     BatchSampleTopKResponse sample_top_k = 2;
     BatchGetTokenDistributionResponse get_token_distribution = 3;
     PingResponse ping = 4;
+    GetInfoResponse get_info = 5;
   }
 }

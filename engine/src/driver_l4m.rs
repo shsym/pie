@@ -65,6 +65,7 @@ enum Event {
     SampleTopK(l4m::SampleTopKResponse),
     GetTokenDistribution(l4m::GetTokenDistributionResponse),
     Ping(l4m::PingResponse),
+    GetInfo(l4m::GetInfoResponse),
 }
 
 #[derive(Debug)]
@@ -73,6 +74,7 @@ pub enum EventHandle {
     SampleTopK(oneshot::Sender<Vec<u32>>),
     GetTokenDistribution(oneshot::Sender<Vec<f32>>),
     Ping(oneshot::Sender<String>),
+    GetInfo(oneshot::Sender<Info>),
 }
 
 impl EventHandle {
@@ -82,6 +84,16 @@ impl EventHandle {
             _ => true,
         }
     }
+}
+
+#[derive(Debug)]
+pub struct Info {
+    pub version: String,
+    pub model_name: String,
+    pub block_size: u32,
+    pub num_blocks: u32,
+    pub num_embeddings: u32,
+    pub num_distributions: u32,
 }
 
 #[derive(Debug)]
@@ -98,6 +110,8 @@ pub struct Driver<B> {
 
     event_dispatcher: Arc<Mutex<EventDispatcher>>,
     resp_handler: tokio::task::JoinHandle<()>,
+
+    info: Info,
 }
 
 impl<B> Driver<B>
@@ -112,17 +126,48 @@ where
         let resp_handler = tokio::spawn(Self::handle_responses(rx, dispatcher.clone()));
         backend.report_to(tx).await;
 
-        Self {
+        // retrieve the backend info
+        let info = {
+            let (info_tx, info_rx) = oneshot::channel();
+
+            let req = l4m::Request {
+                correlation_id: 0,
+                command: Some(l4m::request::Command::GetInfo(l4m::GetInfoRequest {})),
+            };
+
+            dispatcher
+                .lock()
+                .await
+                .register(req.correlation_id, vec![EventHandle::GetInfo(info_tx)]);
+            backend.exec(req).await.unwrap();
+
+            info_rx.await.unwrap()
+        };
+
+        println!(
+            "The backend info: version={}, model_name={}, block_size={}, num_blocks={}, num_embeddings={}, num_distributions={}",
+            info.version,
+            info.model_name,
+            info.block_size,
+            info.num_blocks,
+            info.num_embeddings,
+            info.num_distributions
+        );
+
+        let driver = Self {
             cmd_buffer: Vec::new(),
             cmd_batcher: CommandBatcher::new(Duration::from_secs_f32(0.0), 1, 1),
             cmd_id_pool: utils::IdPool::new(u32::MAX),
             backend,
-            obj_id_pool: IdPool::new(10000, 10000),
+            obj_id_pool: IdPool::new(info.block_size, info.num_embeddings, info.num_distributions),
             obj_ref_counter: RefCounter::new(),
             obj_id_spaces: HashMap::new(),
             event_dispatcher: dispatcher,
             resp_handler,
-        }
+            info,
+        };
+
+        driver
     }
 
     pub fn init_space(&mut self, space: VspaceId) -> Result<(), ObjectError> {
@@ -264,6 +309,9 @@ where
                 l4m::response::Payload::Ping(item) => {
                     vec![Event::Ping(item)]
                 }
+                l4m::response::Payload::GetInfo(item) => {
+                    vec![Event::GetInfo(item)]
+                }
             };
 
             dispatcher.dispatch(correlation_id, ir_events).unwrap();
@@ -281,6 +329,19 @@ where
             .await?;
 
         Ok(())
+    }
+
+    pub async fn get_info(&mut self) -> Result<Info, DriverError> {
+        let cmd = l4m::request::Command::GetInfo(l4m::GetInfoRequest {});
+
+        let (tx, rx) = oneshot::channel();
+
+        self.exec_in_backend(cmd, vec![EventHandle::GetInfo(tx)])
+            .await?;
+
+        let resp = rx.await.map_err(|_| DriverError::SendError)?;
+
+        Ok(resp)
     }
 }
 
@@ -359,6 +420,26 @@ impl EventDispatcher {
                     } else {
                         bail!(
                             "Mismatched event type: expected Ping for correlation_id: {}",
+                            correlation_id
+                        );
+                    }
+                }
+                EventHandle::GetInfo(s) => {
+                    if let Event::GetInfo(mut resp) = event {
+                        let info = Info {
+                            version: resp.version,
+                            model_name: resp.model_name,
+                            block_size: resp.block_size,
+                            num_blocks: resp.num_available_blocks,
+                            num_embeddings: resp.num_available_embeddings,
+                            num_distributions: resp.num_available_distributions,
+                        };
+
+                        s.send(info)
+                            .map_err(|e| anyhow!("Failed to send GetInfo event: {:?}", e))?;
+                    } else {
+                        bail!(
+                            "Mismatched event type: expected GetInfo for correlation_id: {}",
                             correlation_id
                         );
                     }
@@ -1004,11 +1085,11 @@ pub struct IdPool {
     dist_id_pool: utils::IdPool<object::IdRepr>,
 }
 impl IdPool {
-    pub fn new(max_kv_blocks: u32, max_embs: u32) -> Self {
+    pub fn new(max_kv_blocks: u32, max_embs: u32, max_dists: u32) -> Self {
         Self {
             kv_block_id_pool: utils::IdPool::new(max_kv_blocks),
             emb_id_pool: utils::IdPool::new(max_embs),
-            dist_id_pool: utils::IdPool::new(max_embs),
+            dist_id_pool: utils::IdPool::new(max_dists),
         }
     }
 
@@ -1275,6 +1356,21 @@ impl DummyBackend {
                             items: items.collect(),
                         },
                     ))
+                }
+                l4m::request::Command::Ping(ping) => {
+                    Some(l4m::response::Payload::Ping(l4m::PingResponse {
+                        message: ping.message + " Pong",
+                    }))
+                }
+                l4m::request::Command::GetInfo(_) => {
+                    Some(l4m::response::Payload::GetInfo(l4m::GetInfoResponse {
+                        version: "0.1.0".to_string(),
+                        model_name: "DummyModel".to_string(),
+                        block_size: 128,
+                        num_available_blocks: 1000000,
+                        num_available_embeddings: 1000000,
+                        num_available_distributions: 100000,
+                    }))
                 }
                 _ => None,
             };

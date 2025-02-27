@@ -10,6 +10,8 @@ from driver import Driver, NUM_TOKENS_IN_BLOCK
 from l4ma import AttentionStorage, VectorStorage
 from llama import LlamaForCausalLM
 
+VERSION = "0.1.0"
+
 
 def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | None:
     # Determine which command was set in the oneof field "command"
@@ -56,6 +58,15 @@ def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | No
         reply = "awk:" + request.ping.message
         return sdi_pb2.Response(correlation_id=request.correlation_id, ping=sdi_pb2.PingResponse(message=reply))
 
+    elif command == "get_info":
+        return sdi_pb2.Response(correlation_id=request.correlation_id, get_info=sdi_pb2.GetInfoResponse(
+            version=VERSION,
+            model_name="Llama-3.2-1B-Instruct",
+            block_size=NUM_TOKENS_IN_BLOCK,
+            num_available_blocks=d.block_storage.num_blocks,
+            num_available_embeddings=d.embed_storage.num_vectors,
+            num_available_distributions=d.dist_storage.num_vectors
+        ))
 
     else:
         print("No valid command found in request.")
@@ -82,14 +93,14 @@ def main_run():
     )
 
     embed_storage = VectorStorage(
-        num_embeds=1000,
+        num_vectors=1000,
         embed_dim=model.config.hidden_size,
         dtype=torch.bfloat16,
         device=device
     )
 
     dist_storage = VectorStorage(
-        num_embeds=1000,
+        num_vectors=1000,
         embed_dim=model.config.vocab_size,
         dtype=torch.bfloat16,
         device=device
@@ -162,14 +173,14 @@ def main_test():
     )
 
     embed_storage = VectorStorage(
-        num_embeds=1000,
+        num_vectors=1000,
         embed_dim=model.config.hidden_size,
         dtype=torch.bfloat16,
         device=device
     )
 
     dist_storage = VectorStorage(
-        num_embeds=1000,
+        num_vectors=1000,
         embed_dim=model.config.vocab_size,
         dtype=torch.bfloat16,
         device=device

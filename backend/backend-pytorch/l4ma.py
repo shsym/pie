@@ -324,6 +324,7 @@ class AttentionStorage:
         self.dtype = dtype
         self.device = device
 
+        self.num_blocks = num_blocks
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -331,11 +332,11 @@ class AttentionStorage:
 
 class VectorStorage:
 
-    def __init__(self, num_embeds: int, embed_dim: int, device: str, dtype=torch.bfloat16):
-        self.ptr = torch.empty((num_embeds, embed_dim), device=device, dtype=dtype)
+    def __init__(self, num_vectors: int, embed_dim: int, device: str, dtype=torch.bfloat16):
+        self.ptr = torch.empty((num_vectors, embed_dim), device=device, dtype=dtype)
 
         self.dtype = dtype
         self.device = device
 
-        self.num_embeds = num_embeds
+        self.num_vectors = num_vectors
         self.embed_dim = embed_dim

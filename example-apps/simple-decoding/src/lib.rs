@@ -18,7 +18,7 @@ fn llama3_format(prompt: &str, hint: Option<&str>, system: Option<&str>) -> Stri
 
 // create a default stream constant
 const MAIN: u32 = 0;
-const MAX_NUM_OUTPUTS: usize = 32;
+const MAX_NUM_OUTPUTS: usize = 128;
 
 impl RunSync for SimpleDecoding {
     fn run() -> Result<(), String> {
@@ -142,9 +142,9 @@ impl RunSync for SimpleDecoding {
             }
 
             output_tokens.push(next_token);
-        
+
             let next_offset = (offset + 1) % block_size;
-            
+
             symphony::inference::embed_text(
                 MAIN,
                 &input_block_embeds[next_offset..next_offset + 1],
@@ -156,6 +156,7 @@ impl RunSync for SimpleDecoding {
                 // move to the next block
                 working_block_idx += 1;
                 context_blocks.push(symphony::inference::allocate_blocks(MAIN, 1)[0]);
+                println!("Allocated a new block at index {}", working_block_idx);
             }
 
             let duration = start_time.elapsed();
