@@ -22,26 +22,20 @@ use crate::instance::{Command, Id as InstanceId};
 use crate::server::{ServerMessage, ServerState, WebSocketServer};
 use wasmtime::{Config, Engine};
 
+use crate::backend::ZmqBackend;
 use crate::client::Client;
 use crate::driver_l4m::DummyBackend;
 use crate::runtime::Runtime;
 use std::fs;
 use std::time::Duration;
-use crate::backend::ZmqBackend;
 
 /// Directory for cached programs
 const PROGRAM_CACHE_DIR: &str = "./program_cache";
-const TOKENIZER_MODEL: &str = "../test-tokenizer/tokenizer.model";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 1) Ensure the cache directory exists
     fs::create_dir_all(PROGRAM_CACHE_DIR).context("Failed to create program cache directory")?;
-
-    // 2) Configure Wasmtime engine
-    let mut config = Config::default();
-    config.async_support(true);
-    let engine = Engine::new(&config)?;
 
     // 3) Build a channel for (instance -> controller) commands
     let (inst2server_tx, mut inst2server_rx) = unbounded_channel::<(InstanceId, Command)>();
@@ -49,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     // 4) Create our “runtime” state.
     //    (This holds everything the controller and server might share: engine,
     //     references to compiled programs, running instances, etc.)
-    let runtime = Arc::new(Runtime::new(engine, inst2server_tx));
+    let runtime = Arc::new(Runtime::new(inst2server_tx));
 
     // 5) Scan the existing cache_dir and load (or just record) programs on disk
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;

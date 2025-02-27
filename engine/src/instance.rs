@@ -39,19 +39,16 @@ pub struct InstanceState {
 
     allocator: driver_l4m::IdPool,
 
-    utils: InstanceUtils,
-}
-
-pub struct InstanceUtils {
-    pub tokenizer: Arc<BytePairEncoder>,
-    pub block_size: u32,
+    l4m_driver_utils: Arc<driver_l4m::Utils>,
 }
 
 // implements send
 #[derive(Debug)]
 pub enum Command {
     // Init -------------------------------------
-    CreateInstance,
+    CreateInstance {
+        handle: oneshot::Sender<Arc<driver_l4m::Utils>>,
+    },
 
     DestroyInstance,
 
@@ -194,18 +191,20 @@ impl WasiView for InstanceState {
 }
 
 impl InstanceState {
-    pub fn new(
+    pub async fn new(
         id: Uuid,
         cmd_buffer: UnboundedSender<(Id, Command)>,
         evt_from_origin: Receiver<String>,
         evt_from_peers: Receiver<(String, String)>,
-        utils: InstanceUtils,
+        //l4m_driver_utils: Arc<driver_l4m::Utils>,
     ) -> Self {
         let mut builder = WasiCtx::builder();
         builder.inherit_stderr().inherit_network().inherit_stdout();
 
         // send construct cmd
-        cmd_buffer.send((id, Command::CreateInstance));
+        let (tx, rx) = oneshot::channel();
+        cmd_buffer.send((id, Command::CreateInstance { handle: tx }));
+        let l4m_driver_utils = rx.await.unwrap();
 
         InstanceState {
             id,
@@ -215,7 +214,7 @@ impl InstanceState {
             evt_from_origin,
             evt_from_peers,
             allocator: driver_l4m::IdPool::new(1000, 1000, 1000),
-            utils,
+            l4m_driver_utils,
         }
     }
 }
@@ -296,7 +295,7 @@ impl spi::app::system::Host for InstanceState {
 
 impl spi::lm::inference::Host for InstanceState {
     async fn get_block_size(&mut self) -> Result<u32, wasmtime::Error> {
-        Ok(self.utils.block_size)
+        Ok(self.l4m_driver_utils.block_size)
     }
 
     async fn allocate_blocks(
@@ -621,15 +620,14 @@ impl spi::lm::inference::Host for InstanceState {
 
     async fn tokenize(&mut self, text: String) -> Result<Vec<u32>, wasmtime::Error> {
         let tokens = self
-            .utils
+            .l4m_driver_utils
             .tokenizer
             .encode_with_special_tokens(text.as_str());
-
         Ok(tokens)
     }
 
     async fn detokenize(&mut self, tokens: Vec<u32>) -> Result<String, wasmtime::Error> {
-        let text = self.utils.tokenizer.decode(tokens.as_slice())?;
+        let text = self.l4m_driver_utils.tokenizer.decode(tokens.as_slice())?;
         Ok(text)
     }
 }

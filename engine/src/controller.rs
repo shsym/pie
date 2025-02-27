@@ -70,7 +70,7 @@ where
         cmd: Command,
     ) -> Result<(), ControllerError> {
         match cmd {
-            Command::CreateInstance => {
+            Command::CreateInstance { handle } => {
                 let space = self
                     .vspace_id_pool
                     .acquire()
@@ -80,6 +80,8 @@ where
                 self.driver_l4m.init_space(space).map_err(|e| {
                     ControllerError::DriverError(format!("init_space failed: {}", e))
                 })?;
+
+                handle.send(self.driver_l4m.utils.clone());
             }
             Command::DestroyInstance => {
                 let stream = Stream::new(&inst_id, None);
@@ -147,11 +149,12 @@ where
                     subs.retain(|&x| x != inst_id);
                 }
             }
-            
+
             Command::Ping { message, handle } => {
-                self.driver_l4m.ping(message, handle).await.map_err(|e| {
-                    ControllerError::DriverError(format!("Ping failed: {}", e))
-                })?;
+                self.driver_l4m
+                    .ping(message, handle)
+                    .await
+                    .map_err(|e| ControllerError::DriverError(format!("Ping failed: {}", e)))?;
             }
             Command::AllocateBlocks { stream, blocks } => {
                 let stream = Stream::new(&inst_id, Some(stream));

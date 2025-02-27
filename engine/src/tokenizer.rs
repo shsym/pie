@@ -96,7 +96,7 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BytePairEncoder {
     encoder: HashMap<Vec<u8>, Rank>,
     special_tokens_encoder: HashMap<String, Rank>,

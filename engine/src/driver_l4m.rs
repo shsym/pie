@@ -2,7 +2,7 @@ use crate::lm::{
     CausalLanguageModel, CausalTransformer, ImageEmbedder, KvBlock, TokenDist, TokenEmb,
 };
 use crate::utils::{Counter, Stream};
-use crate::{backend, object, utils};
+use crate::{backend, object, tokenizer, utils};
 use anyhow::{anyhow, bail, ensure};
 use rand::Rng;
 use std::collections::HashMap;
@@ -14,9 +14,12 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::backend::BackendError;
 use crate::object::{Allocator, Fetcher, Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
+use crate::tokenizer::BytePairEncoder;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
+
+const TOKENIZER_MODEL: &str = "../test-tokenizer/tokenizer.model";
 
 mod l4m {
     include!(concat!(env!("OUT_DIR"), "/sdi.l4m.rs"));
@@ -96,6 +99,13 @@ pub struct Info {
     pub num_distributions: u32,
 }
 
+// User-facing API
+#[derive(Debug)]
+pub struct Utils {
+    pub(crate) tokenizer: BytePairEncoder,
+    pub(crate) block_size: u32,
+}
+
 #[derive(Debug)]
 pub struct Driver<B> {
     cmd_buffer: Vec<(Stream, Command, EventHandle)>,
@@ -111,7 +121,8 @@ pub struct Driver<B> {
     event_dispatcher: Arc<Mutex<EventDispatcher>>,
     resp_handler: tokio::task::JoinHandle<()>,
 
-    info: Info,
+    pub info: Info,
+    pub utils: Arc<Utils>,
 }
 
 impl<B> Driver<B>
@@ -144,6 +155,12 @@ where
             info_rx.await.unwrap()
         };
 
+        let utils = Utils {
+            // TODO: load the tokenizer model based on the info.model_name
+            tokenizer: tokenizer::llama3_tokenizer(TOKENIZER_MODEL).expect("Tokenizer load failed"),
+            block_size: info.block_size,
+        };
+
         println!(
             "The backend info: version={}, model_name={}, block_size={}, num_blocks={}, num_embeddings={}, num_distributions={}",
             info.version,
@@ -165,6 +182,7 @@ where
             event_dispatcher: dispatcher,
             resp_handler,
             info,
+            utils: Arc::new(utils),
         };
 
         driver

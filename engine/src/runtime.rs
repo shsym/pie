@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use uuid::Uuid;
-use wasmtime::{Engine, Store, component::Component, component::Linker};
+use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
 use wasmtime_wasi;
 
 use crate::instance::{App, Command, Id as InstanceId, InstanceState};
@@ -55,9 +55,6 @@ pub struct Runtime {
 
     /// The channel for (Instance -> controller) messages
     pub inst2server: UnboundedSender<(InstanceId, Command)>,
-
-    /// For demonstration: a tokenizer or other utility
-    pub tokenizer: Arc<tokenizer::BytePairEncoder>,
 }
 
 pub struct InstanceHandle {
@@ -70,11 +67,11 @@ pub struct InstanceHandle {
 
 impl Runtime {
     /// Create a new `Runtime`
-    pub fn new(engine: Engine, inst2server: UnboundedSender<(InstanceId, Command)>) -> Self {
-        // Here you might also load your tokenizer file or do other initialization.
-        let tokenizer = Arc::new(
-            tokenizer::llama3_tokenizer(super::TOKENIZER_MODEL).expect("Tokenizer load failed"),
-        );
+    pub fn new(inst2server: UnboundedSender<(InstanceId, Command)>) -> Self {
+        // Configure Wasmtime engine
+        let mut config = Config::default();
+        config.async_support(true);
+        let engine = Engine::new(&config).unwrap();
 
         Self {
             engine,
@@ -82,7 +79,6 @@ impl Runtime {
             programs_in_disk: DashMap::new(),
             running_instances: DashMap::new(),
             inst2server,
-            tokenizer,
         }
     }
 
@@ -148,11 +144,8 @@ impl Runtime {
             self.inst2server.clone(),
             server2inst_rx,
             peer_rx,
-            crate::instance::InstanceUtils {
-                tokenizer: self.tokenizer.clone(),
-                block_size: 32, // TODO: make this configurable
-            },
-        );
+        )
+        .await;
 
         // 5) Instantiate and run in a task
         let engine_clone = self.engine.clone();
