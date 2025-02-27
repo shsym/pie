@@ -418,10 +418,12 @@ def qkv_attention_kernel(
         # The hidden dimension of the model (head_dim)
         HEAD_DIM: tl.constexpr,
         # Number of blocks contained by a chunk
-        NUM_BLOCK_PER_CHUNK: tl.constexpr,
+        NUM_BLK_PER_CHUNK: tl.constexpr,
         # Needed for Grouped-Query Attention (https://arxiv.org/pdf/2305.13245)
         # If NUM_HEAD_GROUPS is 1, then this is a standard multi-head attention.
-        NUM_HEAD_GROUPS: tl.constexpr = 1  # 1 means no GQA.
+        NUM_HEAD_GROUPS: tl.constexpr = 1,  # 1 means no GQA.
+        # Whether to use tf32 in computing
+        ALLOW_TF32: tl.constexpr = True,
 ):
     glb_chunk_idx = tl.program_id(0)
     head_q_idx = tl.program_id(1)
@@ -440,7 +442,7 @@ def qkv_attention_kernel(
 
     mask_block_ptr = tl.make_block_ptr(
         base=mask_ptr + glb_chunk_idx * stride_mask_i,
-        shape=(NUM_TOK_PER_BLK, NUM_TOK_PER_BLK), # TODO: Check this
+        shape=(NUM_TOK_PER_BLK, NUM_TOK_PER_BLK * NUM_BLK_PER_CHUNK),
         strides=(stride_mask_j, stride_mask_k),
         offsets=(0, 0),
         block_shape=(NUM_TOK_PER_BLK, NUM_TOK_PER_BLK),
@@ -458,7 +460,7 @@ def qkv_attention_kernel(
 
     attn_block_ptr = attn_stats_ptr + glb_chunk_idx * stride_attn_i + head_q_idx * stride_attn_h
 
-    qk_scale = sm_scale * 1.44269504
+    qk_scale = sm_scale * 1.4426950408889634
 
     # Shape: (block_size, head_dim)
     q_block = tl.load(q_block_ptr)
@@ -468,8 +470,8 @@ def qkv_attention_kernel(
     attn_sum_reduced = tl.zeros([NUM_TOK_PER_BLK], dtype=tl.float32)
     y_block = tl.zeros([NUM_TOK_PER_BLK, HEAD_DIM], dtype=tl.float32)
 
-    for block_idx in range(NUM_BLOCK_PER_CHUNK):
-        kv_idx = tl.load(kv_idxs_ptr + glb_chunk_idx * NUM_BLOCK_PER_CHUNK + block_idx)
+    for block_idx in range(NUM_BLK_PER_CHUNK):
+        kv_idx = tl.load(kv_idxs_ptr + glb_chunk_idx * NUM_BLK_PER_CHUNK + block_idx)
 
         k_block_ptr = tl.make_block_ptr(
             base=kv_table_ptr + kv_idx * stride_kv_i + head_kv_idx * stride_kv_h,
@@ -497,7 +499,7 @@ def qkv_attention_kernel(
         mask = tl.load(mask_block_ptr)
 
         # Shape: (block_size, block_size)
-        attn = tl.dot(q_block, k_block, allow_tf32=True)
+        attn = tl.dot(q_block, k_block, allow_tf32=ALLOW_TF32)
 
         # Looks like Triton uses int8 for torch bool types. I added cast to satisfy triton compiler.
         # Check if this cast is causing any performance issues.
@@ -509,7 +511,7 @@ def qkv_attention_kernel(
         attn = tl.math.exp2(attn - attn_max[:, None])
 
         # Shape: (block_size, head_dim)
-        y_block = alpha[:, None] * y_block + tl.dot(attn.to(kv_table_ptr.dtype.element_ty), v_block, allow_tf32=True)
+        y_block = alpha[:, None] * y_block + tl.dot(attn.to(kv_table_ptr.dtype.element_ty), v_block, allow_tf32=ALLOW_TF32)
 
         attn_sum_reduced = attn_sum_reduced * alpha + tl.sum(attn, 1)
         attn_max_reduced = attn_max
@@ -538,6 +540,8 @@ def qkv_attention(
         mask: torch.Tensor,
         # Shape: (batch_size, num_chunk_per_req)
         reduce_grp: torch.Tensor,
+        # Whether to use tf32 in computing
+        allow_tf32: bool = True,
 ) -> torch.Tensor:
     batch_size, num_head, num_tok_per_blk, head_dim = q_table.shape
     _, num_kv_head, num_tok_per_blk2, head_dim_ = kv_table.shape
@@ -582,7 +586,8 @@ def qkv_attention(
         attn_stats.stride(0), attn_stats.stride(1), attn_stats.stride(2),
         not need_reduce,
         1.0 / (head_dim ** 0.5),
-        num_tok_per_blk, head_dim, num_blk_per_chunk, num_gqa_groups
+        num_tok_per_blk, head_dim, num_blk_per_chunk, num_gqa_groups,
+        allow_tf32
     )
 
     # reduce y if necessary
@@ -655,78 +660,3 @@ def qkv_attention_baseline(
 
     # Shape: (batch_size, num_head, block_size, head_dim)
     return torch.einsum('nhqk,nhkd->nhqd', attn, v)
-
-def construct_input(
-    reqs: list[tuple[list[int], np.ndarray]],
-    num_blk_per_chunk: int,
-    num_tok_per_blk: int,
-    device: torch.device
-) -> dict:
-    num_chunk_of_reqs = [ceil_div(len(block_idxs), num_blk_per_chunk) for block_idxs, _ in reqs]
-    num_chunk_in_batch = sum(num_chunk_of_reqs)
-    batch_size = len(reqs)
-
-    q_idxs = np.zeros((num_chunk_in_batch, 1), dtype=np.int32)
-    kv_idxs = np.zeros((num_chunk_in_batch, num_blk_per_chunk), dtype=np.int32)
-    reduce_grps = np.zeros((batch_size, max(num_chunk_of_reqs)), dtype=np.int32)
-    masks = np.zeros((num_chunk_in_batch, num_tok_per_blk, num_blk_per_chunk * num_tok_per_blk), dtype=np.bool_)
-
-    # Unique index for each chunk in the batch
-    glb_chunk_idx = 0
-
-    for req_idx, req in enumerate(reqs):
-
-        block_idxs, mask = req
-
-        num_chunk_in_req = ceil_div(len(block_idxs), num_blk_per_chunk)
-
-        for req_chunk_idx in range(num_chunk_in_req):
-            start = req_chunk_idx * num_blk_per_chunk
-            end = min(start + num_blk_per_chunk, len(block_idxs))
-
-            q_idxs[glb_chunk_idx] = req_idx
-            kv_idxs[glb_chunk_idx, :end - start] = block_idxs[start:end]
-            masks[glb_chunk_idx, :, : (end - start) * num_tok_per_blk] = mask[
-                :, start * num_tok_per_blk : end * num_tok_per_blk
-            ]
-
-            # if all items in the chunk are False, then it will cause NaN in softmax. Check:
-            if not masks[glb_chunk_idx].any():
-                raise ValueError('All items in the chunk are False. This will cause NaN in softmax.')
-
-            reduce_grps[req_idx, req_chunk_idx] = glb_chunk_idx
-
-            glb_chunk_idx += 1
-
-    return {
-        'q_lut': torch.as_tensor(q_idxs, dtype=torch.long, device=device),
-        'kv_lut': torch.as_tensor(kv_idxs, dtype=torch.long, device=device),
-        'reduce_grps': torch.as_tensor(reduce_grps, dtype=torch.long, device=device),
-        'masks': torch.as_tensor(masks, dtype=torch.bool, device=device)
-    }
-
-def construct_input_baseline(
-    reqs: list[tuple[list[int], np.ndarray]],
-    num_tok_per_blk: int,
-    device: torch.device
-) -> dict:
-    batch_size = len(reqs)
-
-    # Pad all requests to the same maximum length
-    num_blk_per_req = max(len(block_idxs) for block_idxs, _ in reqs)
-
-    kv_idxs = np.zeros((batch_size, num_blk_per_req), dtype=np.int32)
-    q_idxs = np.zeros((batch_size, 1), dtype=np.int32)
-    masks = np.zeros((batch_size, num_tok_per_blk, num_blk_per_req * num_tok_per_blk), dtype=np.bool_)
-
-    for i, req in enumerate(reqs):
-        block_idxs, mask = req
-        q_idxs[i] = i
-        kv_idxs[i, : len(block_idxs)] = block_idxs
-        masks[i, :, : len(block_idxs) * num_tok_per_blk] = mask
-
-    return {
-        'q_lut': torch.as_tensor(q_idxs, device=device),
-        'kv_lut': torch.as_tensor(kv_idxs, device=device),
-        'mask': torch.as_tensor(masks, device=device)
-    }

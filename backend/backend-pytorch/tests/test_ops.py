@@ -70,108 +70,149 @@ def test_rope_performance():
     print('Speed up: %.1f%%' % (speedup * 100))
 
 
-
-
 @torch.inference_mode()
 def test_qkv_attention():
     device = torch.device('cuda')
 
     #### CREATE A DUMMY MODEL ####
 
-    # create a dummy model
-    num_heads = 9
+    num_head = 9
     head_dim = 32
-    hidden_size = head_dim * num_heads
-    num_key_value_heads = num_heads // 1
+    hidden_size = head_dim * num_head
+    num_kv_head = num_head // 1
 
-    # create a rope cache
-    # rope_cache = create_rope_cache(8192, head_dim, torch.float32, device)
-
-    q_proj = nn.Linear(hidden_size, num_heads * head_dim, bias=False, device=device)
-    # k_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=False, device=device)
-    # v_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=False, device=device)
-
-    ###############################
+    q_proj = nn.Linear(hidden_size, num_head * head_dim, bias=False, device=device)
 
     #### CREATE A DUMMY KV CACHE ####
     NUM_TOTAL_BLOCKS = 128
-    BLOCK_SIZE = 32
+    NUM_TOK_PER_BLK = 32
 
-    # create a dummy kv cache
-    kv_cache_table = torch.randn(NUM_TOTAL_BLOCKS, num_key_value_heads, BLOCK_SIZE * 2, head_dim, device=device)
-
-    ###############################
+    kv_cache_table = torch.randn(NUM_TOTAL_BLOCKS, num_kv_head, NUM_TOK_PER_BLK * 2, head_dim, device=device)
 
     #### CREATE A DUMMY TASK BATCH ####
-    CHUNK_SIZE = 3
-    NUM_REQS = 5
+    NUM_BLK_PER_CHUNK = 3
+    BATCH_SIZE = 5
     tasks = []
 
-    for _ in range(NUM_REQS):
+    for _ in range(BATCH_SIZE):
         # pick random number between 1 and 10
-        num_blocks = 10  # random.randint(1, 8)
+        num_blk_in_req = random.randint(1, 10)
 
         # select `num_total_blocks` amount of random block ids (does not need to be unique)
-        ctx_ids = random.choices(range(NUM_TOTAL_BLOCKS), k=num_blocks)
+        ctx_ids = random.choices(range(NUM_TOTAL_BLOCKS), k=num_blk_in_req)
 
         # create a random mask (num_total_blocks * block_size, block_size) using numpy
-        mask = np.random.choice([0, 1], size=(BLOCK_SIZE, num_blocks * BLOCK_SIZE), p=[0.1, 0.9])
+        mask = np.random.choice([0, 1], size=(NUM_TOK_PER_BLK, num_blk_in_req * NUM_TOK_PER_BLK), p=[0.1, 0.9])
 
         # ensure the first block is always True (This is to ensure that the softmax is not NaN)
         mask[:, 0] = 1
 
-        # create a full true mask
-        # mask = np.ones((BLOCK_SIZE, num_blocks * BLOCK_SIZE), dtype=np.bool_)
-
         tasks.append((ctx_ids, mask))
 
-    inp_baseline = construct_input_baseline(tasks, num_tok_per_blk=BLOCK_SIZE, device=device)
-    inp = construct_input(tasks, num_blk_per_chunk=CHUNK_SIZE, num_tok_per_blk=BLOCK_SIZE, device=device)
+    inp_baseline = construct_input_baseline(tasks, num_tok_per_blk=NUM_TOK_PER_BLK, device=device)
+    inp = construct_input(tasks, num_blk_per_chunk=NUM_BLK_PER_CHUNK, num_tok_per_blk=NUM_TOK_PER_BLK, device=device)
 
     # simulate the previous state
-    hidden_states = torch.randn(NUM_REQS, BLOCK_SIZE, hidden_size, device=device)
+    hidden_states = torch.randn(BATCH_SIZE, NUM_TOK_PER_BLK, hidden_size, device=device)
 
     q = q_proj(hidden_states)
-    # k = k_proj(hidden_states)
-    # v = v_proj(hidden_states)
-
-    q = q.view(NUM_REQS, BLOCK_SIZE, num_heads, head_dim).transpose(1, 2)
-    # k = k.view(NUM_REQS, BLOCK_SIZE, num_key_value_heads, head_dim).transpose(1, 2)
-    # v = v.view(NUM_REQS, BLOCK_SIZE, num_key_value_heads, head_dim).transpose(1, 2)
-
-    # rope(rope_cache, q, batch.position_offsets)
-    # rope(rope_cache, k, batch.position_offsets)
+    q = q.view(BATCH_SIZE, NUM_TOK_PER_BLK, num_head, head_dim).transpose(1, 2)
 
     # attention
     y1 = qkv_attention_baseline(
         q,
         kv_cache_table,
-        inp_baseline['q_lut'],
-        inp_baseline['kv_lut'],
+        inp_baseline['q_idxs'],
+        inp_baseline['kv_idxs'],
         inp_baseline['mask']
     )
-
-    # print(y1[0])
 
     y2 = qkv_attention(
         q,
         kv_cache_table,
-        inp['q_lut'],
-        inp['kv_lut'],
+        inp['q_idxs'],
+        inp['kv_idxs'],
         inp['masks'],
-        inp['reduce_grps']
+        inp['reduce_grps'],
+        False
     )
 
-    # print(y2[0])
-    # print('baseline:')
-    # print(y1.unsqueeze(0).unsqueeze(0))
-    #
-    # print('triton:')
-    # print(y2.unsqueeze(0).unsqueeze(0))
-
-    # shape
-    print('y1, y2', y1.shape, y2.shape)
-
     print('y1, y2', torch.abs(y1 - y2).sum())
+    assert torch.allclose(y1, y2, atol=1e-6)
 
-    print('done')
+
+def construct_input(
+    reqs: list[tuple[list[int], np.ndarray]],
+    num_blk_per_chunk: int,
+    num_tok_per_blk: int,
+    device: torch.device
+) -> dict:
+    num_chunk_of_reqs = [ceil_div(len(block_idxs), num_blk_per_chunk) for block_idxs, _ in reqs]
+    num_chunk_in_batch = sum(num_chunk_of_reqs)
+    batch_size = len(reqs)
+
+    q_idxs = np.zeros((num_chunk_in_batch, 1), dtype=np.int32)
+    kv_idxs = np.zeros((num_chunk_in_batch, num_blk_per_chunk), dtype=np.int32)
+    reduce_grps = np.zeros((batch_size, max(num_chunk_of_reqs)), dtype=np.int32) - 1
+    masks = np.zeros((num_chunk_in_batch, num_tok_per_blk, num_blk_per_chunk * num_tok_per_blk), dtype=np.bool_)
+
+    # Unique index for each chunk in the batch
+    glb_chunk_idx = 0
+
+    for req_idx, req in enumerate(reqs):
+
+        block_idxs, mask = req
+
+        num_chunk_in_req = ceil_div(len(block_idxs), num_blk_per_chunk)
+
+        for req_chunk_idx in range(num_chunk_in_req):
+            start = req_chunk_idx * num_blk_per_chunk
+            end = min(start + num_blk_per_chunk, len(block_idxs))
+
+            q_idxs[glb_chunk_idx] = req_idx
+            kv_idxs[glb_chunk_idx, :end - start] = block_idxs[start:end]
+            masks[glb_chunk_idx, :, : (end - start) * num_tok_per_blk] = mask[
+                :, start * num_tok_per_blk : end * num_tok_per_blk
+            ]
+
+            # if all items in the chunk are False, then it will cause NaN in softmax. Check:
+            if not masks[glb_chunk_idx].any():
+                raise ValueError('All items in the chunk are False. This will cause NaN in softmax.')
+
+            reduce_grps[req_idx, req_chunk_idx] = glb_chunk_idx
+
+            glb_chunk_idx += 1
+
+    return {
+        'q_idxs': torch.as_tensor(q_idxs, dtype=torch.long, device=device),
+        'kv_idxs': torch.as_tensor(kv_idxs, dtype=torch.long, device=device),
+        'reduce_grps': torch.as_tensor(reduce_grps, dtype=torch.long, device=device),
+        'masks': torch.as_tensor(masks, dtype=torch.bool, device=device)
+    }
+
+
+def construct_input_baseline(
+    reqs: list[tuple[list[int], np.ndarray]],
+    num_tok_per_blk: int,
+    device: torch.device
+) -> dict:
+    batch_size = len(reqs)
+
+    # Pad all requests to the same maximum length
+    num_blk_per_req = max(len(block_idxs) for block_idxs, _ in reqs)
+
+    kv_idxs = np.zeros((batch_size, num_blk_per_req), dtype=np.int32)
+    q_idxs = np.zeros((batch_size, 1), dtype=np.int32)
+    masks = np.zeros((batch_size, num_tok_per_blk, num_blk_per_req * num_tok_per_blk), dtype=np.bool_)
+
+    for i, req in enumerate(reqs):
+        block_idxs, mask = req
+        q_idxs[i] = i
+        kv_idxs[i, : len(block_idxs)] = block_idxs
+        masks[i, :, : len(block_idxs) * num_tok_per_blk] = mask
+
+    return {
+        'q_idxs': torch.as_tensor(q_idxs, device=device),
+        'kv_idxs': torch.as_tensor(kv_idxs, device=device),
+        'mask': torch.as_tensor(masks, device=device)
+    }
