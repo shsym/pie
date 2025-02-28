@@ -33,14 +33,14 @@ def test_rope_correctness():
 
     k_pos1 = rope_baseline(rope_cache, k, start_pos)
     k_pos2 = rope_baseline_no_cache(k, start_pos)
-    k_pos_triton = rope(rope_cache, k, start_pos)
-    k_pos_new = rope_pre_indexed(pre_indexed_cache, k2)
-    k_pos_sg = rope_scatter_gather(rope_cache, k3, cache_idxs)
+    rope_(rope_cache, k, start_pos)
+    rope_pre_indexed_(pre_indexed_cache, k2)
+    rope_scatter_gather_(rope_cache, k3, cache_idxs)
 
     assert torch.allclose(k_pos2, k_pos1, atol=1e-6)
-    assert torch.allclose(k_pos1, k_pos_triton, atol=1e-6)
-    assert torch.allclose(k_pos_new, k_pos_triton, atol=1e-6)
-    assert torch.allclose(k_pos_sg, k_pos_triton, atol=1e-6)
+    assert torch.allclose(k_pos1, k, atol=1e-6)
+    assert torch.allclose(k, k2, atol=1e-6)
+    assert torch.allclose(k2, k3, atol=1e-6)
 
 
 @torch.inference_mode()
@@ -62,7 +62,7 @@ def test_rope_performance():
 
     torch.cuda.synchronize()
     for _ in range(warmup_round):
-        rope_baseline(rope_cache, k, start_pos)
+        compiled_baseline(rope_cache, k, start_pos)
 
     torch.cuda.synchronize()
     pytorch_start = time.time()
@@ -73,12 +73,12 @@ def test_rope_performance():
 
     torch.cuda.synchronize()
     for _ in range(warmup_round):
-        rope(rope_cache, k, start_pos)
+        rope_(rope_cache, k, start_pos)
 
     torch.cuda.synchronize()
     triton_start = time.time()
     for _ in range(test_round):
-        rope(rope_cache, k, start_pos)
+        rope_(rope_cache, k, start_pos)
     torch.cuda.synchronize()
     triton_elapsed = time.time() - triton_start
 
@@ -87,24 +87,24 @@ def test_rope_performance():
     torch.cuda.synchronize()
     for _ in range(warmup_round):
         pre_indexed_cache = rope_cache[cache_idxs]
-        rope_pre_indexed(pre_indexed_cache, k)
+        rope_pre_indexed_(pre_indexed_cache, k)
 
     torch.cuda.synchronize()
     pre_indexed_start = time.time()
     for _ in range(test_round):
         pre_indexed_cache = rope_cache[cache_idxs]
-        rope_pre_indexed(pre_indexed_cache, k)
+        rope_pre_indexed_(pre_indexed_cache, k)
     torch.cuda.synchronize()
     pre_indexed_elapsed = time.time() - pre_indexed_start
 
     torch.cuda.synchronize()
     for _ in range(warmup_round):
-        rope_scatter_gather(rope_cache, k, cache_idxs)
+        rope_scatter_gather_(rope_cache, k, cache_idxs)
 
     torch.cuda.synchronize()
     sg_start = time.time()
     for _ in range(test_round):
-        rope_scatter_gather(rope_cache, k, cache_idxs)
+        rope_scatter_gather_(rope_cache, k, cache_idxs)
     torch.cuda.synchronize()
     sg_elapsed = time.time() - sg_start
 

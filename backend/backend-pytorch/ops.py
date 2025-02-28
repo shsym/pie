@@ -283,7 +283,7 @@ def reduce_y_slices_kernel(
     tl.store(y_reduced_block_ptr, y_reduced.to(y_ptr.dtype.element_ty))
 
 
-def rope(
+def rope_(
         # Shape: (max_pos, head_dim)
         rope_cache: torch.Tensor,
         # Shape: (batch_size, num_head, block_size, head_dim)
@@ -312,10 +312,8 @@ def rope(
         block_size, head_dim, max_pos
     )
 
-    return x
 
-
-def rope_scatter_gather(
+def rope_scatter_gather_(
         # Shape: (max_pos, head_dim)
         rope_table: torch.Tensor,
         # Shape: (batch_size, num_head, block_size, head_dim)
@@ -341,10 +339,8 @@ def rope_scatter_gather(
         block_size, head_dim,
     )
 
-    return x
 
-
-def rope_pre_indexed(
+def rope_pre_indexed_(
         # Shape: (batch_size, block_size, head_dim)
         rope_cache: torch.Tensor,
         # Shape: (batch_size, num_head, block_size, head_dim)
@@ -366,8 +362,6 @@ def rope_pre_indexed(
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
         block_size, head_dim
     )
-
-    return x
 
 
 # pytorch-only inefficient implementation of rope for testing purposes
