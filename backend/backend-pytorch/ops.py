@@ -65,6 +65,95 @@ def rope_kernel(
 
 
 @triton.jit
+def rope_kernel_scatter_gather(
+    # Shape: (max_pos, head_dim)
+    rope_table_ptr,
+    # Shape: (batch_size, num_head, block_size, head_dim)
+    x_ptr,
+    # Shape: (batch_size, block_size)
+    rope_idxs_ptr,
+    x_stride_bch, x_stride_hd,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    rope_idx_ptr = rope_idxs_ptr + batch_idx * BLOCK_SIZE
+    x_ptr = x_ptr + batch_idx * x_stride_bch + head_idx * x_stride_hd
+
+    # Triton will likely unroll and pipeline the operations in the loop body
+    for _ in tl.static_range(BLOCK_SIZE):
+        rope_idx = tl.load(rope_idx_ptr)
+        cache_block_ptr = rope_table_ptr + rope_idx * HEAD_DIM
+        cos = tl.load(cache_block_ptr + tl.arange(0, HEAD_DIM // 2))
+        sin = tl.load(cache_block_ptr + HEAD_DIM // 2 + tl.arange(0, HEAD_DIM // 2))
+
+        x1_ptr = x_ptr + tl.arange(0, HEAD_DIM // 2)
+        x2_ptr = x1_ptr + HEAD_DIM // 2
+
+        x1 = tl.load(x1_ptr)
+        x2 = tl.load(x2_ptr)
+
+        x1_rotated = x1 * cos - x2 * sin
+        x2_rotated = x2 * cos + x1 * sin
+        
+        tl.store(x1_ptr, x1_rotated)
+        tl.store(x2_ptr, x2_rotated)
+
+        rope_idx_ptr += 1
+        x_ptr += HEAD_DIM
+
+
+@triton.jit
+def rope_kernel_pre_indexed(
+    # Shape: (batch_size, block_size, head_dim)
+    rope_cache_ptr,
+    # Shape: (batch_size, num_head, block_size, head_dim)
+    x_ptr,
+    rope_stride_bch, rope_stride_blk, rope_stride_dim,
+    x_stride_bch, x_stride_hd, x_stride_blk, x_stride_dim,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    # Shape: (block_size, head_dim/2)
+    cache_block_ptr = tl.make_block_ptr(
+        base=rope_cache_ptr + batch_idx * rope_stride_bch,
+        shape=(BLOCK_SIZE, HEAD_DIM),
+        strides=(rope_stride_blk, rope_stride_dim),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE, HEAD_DIM // 2),
+        order=(0, 1)
+    )
+
+    cos = tl.load(cache_block_ptr)
+    sin = tl.load(tl.advance(cache_block_ptr, (0, HEAD_DIM // 2)))
+
+    # Shape: (block_size, head_dim/2)
+    x1_ptr = tl.make_block_ptr(
+        base=x_ptr + batch_idx * x_stride_bch + head_idx * x_stride_hd,
+        shape=(BLOCK_SIZE, HEAD_DIM),
+        strides=(x_stride_blk, x_stride_dim),
+        offsets=(0, 0),
+        block_shape=(BLOCK_SIZE, HEAD_DIM // 2),
+        order=(0, 1)
+    )
+    x2_ptr = tl.advance(x1_ptr, (0, HEAD_DIM // 2))
+
+    x1 = tl.load(x1_ptr)
+    x2 = tl.load(x2_ptr)
+
+    x1_rotated = x1 * cos - x2 * sin
+    x2_rotated = x2 * cos + x1 * sin
+
+    tl.store(x1_ptr, x1_rotated)
+    tl.store(x2_ptr, x2_rotated)
+
+
+@triton.jit
 def fill_kv_block_storage_kernel(dst_kv_ptr,  # destination block table float(I1, H, 2S, D)
                                  src_k_ptr,  # source block table float(I2, H, S, D)
                                  src_v_ptr,  # source block table float(I2, H, S, D)
@@ -221,6 +310,61 @@ def rope(
         rope_cache.stride(0), rope_cache.stride(1),
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
         block_size, head_dim, max_pos
+    )
+
+    return x
+
+
+def rope_scatter_gather(
+        # Shape: (max_pos, head_dim)
+        rope_table: torch.Tensor,
+        # Shape: (batch_size, num_head, block_size, head_dim)
+        x: torch.Tensor,
+        # Shape: (batch_size, block_size)
+        rope_idxs: torch.Tensor,
+):
+    max_pos, head_dim = rope_table.shape
+    batch_size, num_head, block_size, head_dim_ = x.shape
+    batch_size_, block_size_ = rope_idxs.shape
+
+    assert head_dim == head_dim_
+    assert batch_size == batch_size_
+    assert block_size == block_size_
+
+    grid = (batch_size, num_head)
+
+    rope_kernel_scatter_gather[grid](
+        rope_table,
+        x,
+        rope_idxs,
+        x.stride(0), x.stride(1),
+        block_size, head_dim,
+    )
+
+    return x
+
+
+def rope_pre_indexed(
+        # Shape: (batch_size, block_size, head_dim)
+        rope_cache: torch.Tensor,
+        # Shape: (batch_size, num_head, block_size, head_dim)
+        x: torch.Tensor,
+):
+    batch_size, block_size, head_dim = rope_cache.shape
+    batch_size_, num_head, block_size_, head_dim_ = x.shape
+
+    assert block_size == block_size_
+    assert head_dim == head_dim_
+    assert batch_size == batch_size_
+
+    grid = (batch_size, num_head)
+
+    rope_kernel_pre_indexed[grid](
+        rope_cache,
+        x,
+        rope_cache.stride(0), rope_cache.stride(1), rope_cache.stride(2),
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        block_size, head_dim
     )
 
     return x

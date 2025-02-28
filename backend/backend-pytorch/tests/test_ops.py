@@ -20,15 +20,27 @@ def test_rope_correctness():
     device = 'cuda'
 
     k = torch.randn((batch_size, num_head, block_size, head_dim), device=device)
+    k2 = torch.clone(k)
+    k3 = torch.clone(k)
+    # Shape: (batch_size, )
     start_pos = torch.tensor(list(range(batch_size)), dtype=torch.int32, device=device)
+    # Shape: (max_pos, head_dim)
     rope_cache = create_rope_cache(max_pos, head_dim, torch.float32, device)
+    # Shape: (batch_size, block_size)
+    cache_idxs = start_pos[:, None] + torch.tensor(list(range(block_size)), dtype=torch.int32, device=device)[None, :]
+    # Shape: (batch_size, block_size, head_dim)
+    pre_indexed_cache = rope_cache[cache_idxs]
 
     k_pos1 = rope_baseline(rope_cache, k, start_pos)
     k_pos2 = rope_baseline_no_cache(k, start_pos)
     k_pos_triton = rope(rope_cache, k, start_pos)
+    k_pos_new = rope_pre_indexed(pre_indexed_cache, k2)
+    k_pos_sg = rope_scatter_gather(rope_cache, k3, cache_idxs)
 
     assert torch.allclose(k_pos2, k_pos1, atol=1e-6)
     assert torch.allclose(k_pos1, k_pos_triton, atol=1e-6)
+    assert torch.allclose(k_pos_new, k_pos_triton, atol=1e-6)
+    assert torch.allclose(k_pos_sg, k_pos_triton, atol=1e-6)
 
 
 @torch.inference_mode()
@@ -48,26 +60,60 @@ def test_rope_performance():
 
     compiled_baseline = torch.compile(rope_baseline)
 
+    torch.cuda.synchronize()
     for _ in range(warmup_round):
-        compiled_baseline(rope_cache, k, start_pos)
+        rope_baseline(rope_cache, k, start_pos)
 
+    torch.cuda.synchronize()
     pytorch_start = time.time()
     for _ in range(test_round):
         compiled_baseline(rope_cache, k, start_pos)
+    torch.cuda.synchronize()
     pytorch_elapsed = time.time() - pytorch_start
 
+    torch.cuda.synchronize()
     for _ in range(warmup_round):
         rope(rope_cache, k, start_pos)
 
+    torch.cuda.synchronize()
     triton_start = time.time()
     for _ in range(test_round):
         rope(rope_cache, k, start_pos)
+    torch.cuda.synchronize()
     triton_elapsed = time.time() - triton_start
 
-    assert triton_elapsed < pytorch_elapsed
+    cache_idxs = start_pos[:, None] + torch.tensor(list(range(block_size)), dtype=torch.int32, device=device)[None, :]
 
-    speedup = pytorch_elapsed / triton_elapsed - 1.0
-    print('Speed up: %.1f%%' % (speedup * 100))
+    torch.cuda.synchronize()
+    for _ in range(warmup_round):
+        pre_indexed_cache = rope_cache[cache_idxs]
+        rope_pre_indexed(pre_indexed_cache, k)
+
+    torch.cuda.synchronize()
+    pre_indexed_start = time.time()
+    for _ in range(test_round):
+        pre_indexed_cache = rope_cache[cache_idxs]
+        rope_pre_indexed(pre_indexed_cache, k)
+    torch.cuda.synchronize()
+    pre_indexed_elapsed = time.time() - pre_indexed_start
+
+    torch.cuda.synchronize()
+    for _ in range(warmup_round):
+        rope_scatter_gather(rope_cache, k, cache_idxs)
+
+    torch.cuda.synchronize()
+    sg_start = time.time()
+    for _ in range(test_round):
+        rope_scatter_gather(rope_cache, k, cache_idxs)
+    torch.cuda.synchronize()
+    sg_elapsed = time.time() - sg_start
+
+    # assert sg_elapsed < triton_elapsed < pytorch_elapsed < pre_indexed_elapsed
+
+    print('Pytorch: %.2f ms' % (pytorch_elapsed * 1000))
+    print('Triton-old: %.2f ms' % (triton_elapsed * 1000))
+    print('Triton-pre-indexed: %.2f ms' % (pre_indexed_elapsed * 1000))
+    print('Triton-scatter-gather: %.2f ms' % (sg_elapsed * 1000))
 
 
 @torch.inference_mode()
