@@ -1,4 +1,3 @@
-use crate::driver_l4m::{DriverError, EventHandle, Namespace};
 use crate::utils::IdPool;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -27,13 +26,13 @@ pub enum BackendError {
     CorrelationIdNotFound(u32),
 }
 
-pub trait ExecuteCommand<A, B>: Send + Sync + 'static {
+pub trait ExecuteCommand<A, B>: Clone + Send + Sync + 'static {
     async fn exec(&self, cmd: A) -> Result<(), BackendError>;
 
     async fn report_to(&self, tx: mpsc::Sender<B>);
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ZmqBackend<A, B> {
     cmd_tx: Sender<A>,
     evt_tx: Arc<Mutex<Option<Sender<B>>>>, // no tokio mutex. Because it will be only mutated once.
@@ -127,10 +126,117 @@ where
     }
 }
 
+impl<A, B> Clone for ZmqBackend<A, B>
+where
+    A: 'static + prost::Message,
+    B: 'static + Default + prost::Message,
+{
+    fn clone(&self) -> Self {
+        Self {
+            cmd_tx: self.cmd_tx.clone(),
+            evt_tx: self.evt_tx.clone(),
+            handle: self.handle.clone(),
+        }
+    }
+}
+
 impl<A, B> ExecuteCommand<A, B> for ZmqBackend<A, B>
 where
     A: prost::Message + 'static,
     B: prost::Message + Default + 'static,
+{
+    async fn exec(&self, cmd: A) -> Result<(), BackendError> {
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| BackendError::ChannelClosed)?;
+
+        Ok(())
+    }
+
+    async fn report_to(&self, tx: Sender<B>) {
+        self.evt_tx.lock().await.replace(tx);
+    }
+}
+
+pub trait Simulate<A, B>: Clone + Send + Sync + 'static {
+    fn simulate(&mut self, cmd: A) -> Option<B>;
+}
+
+pub struct SimulatedBackend<A, B, F> {
+    cmd_tx: mpsc::Sender<A>,
+    evt_tx: Arc<Mutex<Option<mpsc::Sender<B>>>>,
+    handle: Arc<JoinHandle<()>>,
+    simulator: F,
+}
+
+impl<A, B, F> SimulatedBackend<A, B, F>
+where
+    A: prost::Message + 'static,
+    B: Default + prost::Message + 'static,
+    F: Simulate<A, B>,
+{
+    pub async fn new(simulator: F) -> Self {
+        let (cmd_tx, rx) = mpsc::channel::<A>(1000);
+        let evt_tx = Arc::new(Mutex::new(None));
+
+        // Clone simulate so one copy is passed to the backend routine.
+        let handle = tokio::spawn(Self::backend_routine(
+            rx,
+            Arc::clone(&evt_tx),
+            simulator.clone(),
+        ));
+
+        Self {
+            cmd_tx,
+            evt_tx,
+            handle: Arc::new(handle),
+            simulator,
+        }
+    }
+
+    async fn backend_routine(
+        mut rx: mpsc::Receiver<A>,
+        evt_tx: Arc<Mutex<Option<mpsc::Sender<B>>>>,
+        mut simulator: F,
+    ) {
+        while let Some(cmd) = rx.recv().await {
+            let resp = simulator.simulate(cmd);
+
+            if let Some(resp) = resp {
+                let guard = evt_tx.lock().await;
+                if let Some(tx) = &*guard {
+                    // Send the response; ignore errors if the receiver has been dropped.
+                    let _ = tx.send(resp).await;
+                } else {
+                    eprintln!("No event dispatcher found for response: {:?}", resp);
+                }
+            }
+        }
+    }
+}
+
+impl<A, B, F> Clone for SimulatedBackend<A, B, F>
+where
+    A: 'static + prost::Message,
+    B: 'static + Default + prost::Message,
+    F: Simulate<A, B>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            cmd_tx: self.cmd_tx.clone(),
+            evt_tx: Arc::clone(&self.evt_tx),
+            handle: Arc::clone(&self.handle),
+            simulator: self.simulator.clone(),
+        }
+    }
+}
+
+impl<A, B, F> ExecuteCommand<A, B> for SimulatedBackend<A, B, F>
+where
+    A: prost::Message + 'static,
+    B: prost::Message + Default + 'static,
+    F: Simulate<A, B>,
 {
     async fn exec(&self, cmd: A) -> Result<(), BackendError> {
         self.cmd_tx

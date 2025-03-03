@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::backend::BackendError;
+use crate::driver::DriverError;
 use crate::object::{Allocator, Fetcher, Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
 use crate::tokenizer::BytePairEncoder;
 use thiserror::Error;
@@ -22,27 +23,12 @@ use tokio::task::JoinHandle;
 const TOKENIZER_MODEL: &str = "../test-tokenizer/tokenizer.model";
 
 mod l4m {
-    include!(concat!(env!("OUT_DIR"), "/sdi.l4m.rs"));
+    include!(concat!(env!("OUT_DIR"), "/l4m.rs"));
 }
 
 // blanket implementation for all compatible backends
 pub trait ExecuteCommand: backend::ExecuteCommand<l4m::Request, l4m::Response> {}
 impl<T> ExecuteCommand for T where T: backend::ExecuteCommand<l4m::Request, l4m::Response> {}
-
-#[derive(Error, Debug)]
-pub enum DriverError {
-    #[error("Mutex lock failed")]
-    LockError,
-
-    #[error("Channel send error")]
-    SendError,
-
-    #[error("Object error: {0}")]
-    ObjectError(#[from] ObjectError),
-
-    #[error("Event dispatcher error: {0}")]
-    EventDispatcherError(#[from] anyhow::Error),
-}
 
 /// Intermediate representation of a command to be executed by the backend.
 /// This must not be exposed to other modules.
@@ -54,12 +40,12 @@ enum Command {
     CopyBlock(l4m::CopyBlock),
     MaskBlock(l4m::MaskBlock),
     FillBlock(l4m::FillBlock),
-    EmbedImage(l4m::EmbedImage),
+    //EmbedImage(l4m::EmbedImage),
     EmbedText(l4m::EmbedText),
     DecodeTokenDistribution(l4m::DecodeTokenDistribution),
     SampleTopKRequest(l4m::SampleTopKRequest),
     GetTokenDistributionRequest(l4m::GetTokenDistributionRequest),
-    Ping(l4m::PingRequest),
+    //Ping(l4m::PingRequest),
 }
 
 // Hidden
@@ -67,7 +53,7 @@ enum Command {
 enum Event {
     SampleTopK(l4m::SampleTopKResponse),
     GetTokenDistribution(l4m::GetTokenDistributionResponse),
-    Ping(l4m::PingResponse),
+    //Ping(l4m::PingResponse),
     GetInfo(l4m::GetInfoResponse),
 }
 
@@ -76,7 +62,7 @@ pub enum EventHandle {
     None,
     SampleTopK(oneshot::Sender<Vec<u32>>),
     GetTokenDistribution(oneshot::Sender<Vec<f32>>),
-    Ping(oneshot::Sender<String>),
+    //Ping(oneshot::Sender<String>),
     GetInfo(oneshot::Sender<Info>),
 }
 
@@ -102,8 +88,8 @@ pub struct Info {
 // User-facing API
 #[derive(Debug)]
 pub struct Utils {
-    pub(crate) tokenizer: BytePairEncoder,
-    pub(crate) block_size: u32,
+    pub tokenizer: BytePairEncoder,
+    pub block_size: u32,
 }
 
 #[derive(Debug)]
@@ -129,13 +115,13 @@ impl<B> Driver<B>
 where
     B: ExecuteCommand,
 {
-    pub async fn new(backend: B) -> Self {
+    pub async fn new(b: B) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(1000);
 
         let dispatcher = Arc::new(Mutex::new(EventDispatcher::new()));
 
         let resp_handler = tokio::spawn(Self::handle_responses(rx, dispatcher.clone()));
-        backend.report_to(tx).await;
+        b.report_to(tx).await;
 
         // retrieve the backend info
         let info = {
@@ -150,7 +136,7 @@ where
                 .lock()
                 .await
                 .register(req.correlation_id, vec![EventHandle::GetInfo(info_tx)]);
-            backend.exec(req).await.unwrap();
+            b.exec(req).await.unwrap();
 
             info_rx.await.unwrap()
         };
@@ -175,7 +161,7 @@ where
             cmd_buffer: Vec::new(),
             cmd_batcher: CommandBatcher::new(Duration::from_secs_f32(0.0), 1, 1),
             cmd_id_pool: utils::IdPool::new(u32::MAX),
-            backend,
+            backend: b,
             obj_id_pool: IdPool::new(info.block_size, info.num_embeddings, info.num_distributions),
             obj_ref_counter: RefCounter::new(),
             obj_id_spaces: HashMap::new(),
@@ -309,25 +295,25 @@ where
     ) {
         while let Some(resp) = rx.recv().await {
             let correlation_id = resp.correlation_id;
-            let payload = resp.payload.unwrap();
+            let payload = resp.command.unwrap();
 
             let mut dispatcher = dispatcher.lock().await;
 
             let ir_events = match payload {
-                l4m::response::Payload::SampleTopK(batch) => batch
+                l4m::response::Command::SampleTopK(batch) => batch
                     .items
                     .into_iter()
                     .map(|item| Event::SampleTopK(item))
                     .collect(),
-                l4m::response::Payload::GetTokenDistribution(batch) => batch
+                l4m::response::Command::GetTokenDistribution(batch) => batch
                     .items
                     .into_iter()
                     .map(|item| Event::GetTokenDistribution(item))
                     .collect(),
-                l4m::response::Payload::Ping(item) => {
-                    vec![Event::Ping(item)]
-                }
-                l4m::response::Payload::GetInfo(item) => {
+                // l4m::response::Command::Ping(item) => {
+                //     vec![Event::Ping(item)]
+                // }
+                l4m::response::Command::GetInfo(item) => {
                     vec![Event::GetInfo(item)]
                 }
             };
@@ -336,18 +322,18 @@ where
         }
     }
 
-    pub async fn ping(
-        &mut self,
-        message: String,
-        handler: oneshot::Sender<String>,
-    ) -> Result<(), DriverError> {
-        let cmd = l4m::request::Command::Ping(l4m::PingRequest { message });
-
-        self.exec_in_backend(cmd, vec![EventHandle::Ping(handler)])
-            .await?;
-
-        Ok(())
-    }
+    // pub async fn ping(
+    //     &mut self,
+    //     message: String,
+    //     handler: oneshot::Sender<String>,
+    // ) -> Result<(), DriverError> {
+    //     let cmd = l4m::request::Command::Ping(l4m::PingRequest { message });
+    //
+    //     self.exec_in_backend(cmd, vec![EventHandle::Ping(handler)])
+    //         .await?;
+    //
+    //     Ok(())
+    // }
 
     pub async fn get_info(&mut self) -> Result<Info, DriverError> {
         let cmd = l4m::request::Command::GetInfo(l4m::GetInfoRequest {});
@@ -431,17 +417,17 @@ impl EventDispatcher {
                         );
                     }
                 }
-                EventHandle::Ping(s) => {
-                    if let Event::Ping(mut resp) = event {
-                        s.send(mem::take(&mut resp.message))
-                            .map_err(|e| anyhow!("Failed to send Ping event: {:?}", e))?;
-                    } else {
-                        bail!(
-                            "Mismatched event type: expected Ping for correlation_id: {}",
-                            correlation_id
-                        );
-                    }
-                }
+                // EventHandle::Ping(s) => {
+                //     if let Event::Ping(mut resp) = event {
+                //         s.send(mem::take(&mut resp.message))
+                //             .map_err(|e| anyhow!("Failed to send Ping event: {:?}", e))?;
+                //     } else {
+                //         bail!(
+                //             "Mismatched event type: expected Ping for correlation_id: {}",
+                //             correlation_id
+                //         );
+                //     }
+                // }
                 EventHandle::GetInfo(s) => {
                     if let Event::GetInfo(mut resp) = event {
                         let info = Info {
@@ -478,7 +464,7 @@ struct CommandBatcher {
     copy_block: BatchQueue<l4m::CopyBlock>,
     mask_block: BatchQueue<l4m::MaskBlock>,
     embed_text: BatchQueue<l4m::EmbedText>,
-    embed_image: BatchQueue<l4m::EmbedImage>,
+    //embed_image: BatchQueue<l4m::EmbedImage>,
 
     // these cmds are only be fired when it contains "enough" commands to be batched.
     fill_block: BatchQueue<l4m::FillBlock>,
@@ -577,7 +563,7 @@ impl CommandBatcher {
             copy_block: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
             mask_block: BatchQueue::eager(),
             embed_text: BatchQueue::eager(),
-            embed_image: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
+            //embed_image: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
             fill_block: BatchQueue::eager(),
             sample_top_k: BatchQueue::eager(),
             decode_token_distribution: BatchQueue::eager(),
@@ -601,9 +587,9 @@ impl CommandBatcher {
             Command::FillBlock(item) => {
                 self.fill_block.push(item, curr_timestamp, evt);
             }
-            Command::EmbedImage(item) => {
-                self.embed_image.push(item, curr_timestamp, evt);
-            }
+            // Command::EmbedImage(item) => {
+            //     self.embed_image.push(item, curr_timestamp, evt);
+            // }
             Command::EmbedText(item) => {
                 self.embed_text.push(item, curr_timestamp, evt);
             }
@@ -662,12 +648,12 @@ impl CommandBatcher {
             ));
         }
 
-        if let Some((items, senders)) = self.embed_image.batch(curr_timestamp) {
-            cmds.push((
-                l4m::request::Command::EmbedImage(l4m::BatchEmbedImage { items }),
-                senders,
-            ));
-        }
+        // if let Some((items, senders)) = self.embed_image.batch(curr_timestamp) {
+        //     cmds.push((
+        //         l4m::request::Command::EmbedImage(l4m::BatchEmbedImage { items }),
+        //         senders,
+        //     ));
+        // }
 
         if let Some((items, senders)) = self.fill_block.batch(curr_timestamp) {
             cmds.push((
@@ -1074,28 +1060,6 @@ where
 
 /// for multimodal LLMs
 
-impl<B> ImageEmbedder for Driver<B>
-where
-    B: backend::ExecuteCommand<l4m::Request, l4m::Response>,
-{
-    fn embed_img(
-        &mut self,
-        stream: Stream,
-        space: &VspaceId,
-        addrs: Vec<ObjectId<TokenEmb>>,
-        url: String,
-    ) -> Result<(), DriverError> {
-        let addrs = self.lookup_all(space, &addrs)?;
-
-        let cmd = Command::EmbedImage(l4m::EmbedImage {
-            embedding_ids: ObjectId::map_to_repr(addrs),
-            url,
-        });
-
-        self.enqueue_cmd(stream, cmd)
-    }
-}
-
 #[derive(Debug)]
 pub struct IdPool {
     kv_block_id_pool: utils::IdPool<object::IdRepr>,
@@ -1300,125 +1264,61 @@ impl RefCounter {
     }
 }
 
-// Assuming these are defined somewhere
-// use l4m::{Request, Response, request, response};
-// use backend::{ExecuteCommand, BackendError};
+#[derive(Clone)]
+pub struct Simulator {}
 
-pub struct DummyBackend {
-    exec_overhead: Duration,
-    cmd_tx: mpsc::Sender<l4m::Request>,
-    evt_tx: Arc<Mutex<Option<mpsc::Sender<l4m::Response>>>>,
-    handle: Arc<JoinHandle<()>>,
-}
+impl backend::Simulate<l4m::Request, l4m::Response> for Simulator {
+    fn simulate(&mut self, req: l4m::Request) -> Option<l4m::Response> {
+        let resp_payload = match req.command.unwrap() {
+            l4m::request::Command::SampleTopKRequest(batch) => {
+                let items = batch.items.into_iter().map(|item| {
+                    let mut rng = rand::rng();
+                    let token_ids: Vec<_> =
+                        (0..item.k).map(|_| rng.random_range(0..1000)).collect();
 
-impl DummyBackend {
-    pub async fn new(exec_overhead: Duration) -> DummyBackend {
-        let (cmd_tx, rx) = mpsc::channel::<l4m::Request>(1000);
-        let evt_tx = Arc::new(Mutex::new(None));
+                    l4m::SampleTopKResponse { token_ids }
+                });
 
-        // Spawn the background routine and pass the exec_overhead to simulate delay.
-        let handle = tokio::spawn(Self::backend_routine(
-            rx,
-            Arc::clone(&evt_tx),
-            exec_overhead,
-        ));
-
-        DummyBackend {
-            exec_overhead,
-            cmd_tx,
-            evt_tx,
-            handle: Arc::new(handle),
-        }
-    }
-
-    async fn backend_routine(
-        mut rx: mpsc::Receiver<l4m::Request>,
-        evt_tx: Arc<Mutex<Option<mpsc::Sender<l4m::Response>>>>,
-        exec_overhead: Duration,
-    ) {
-        while let Some(req) = rx.recv().await {
-            // Simulate execution overhead for each request.
-
-            // let start = Instant::now();
-            //
-            //
-            // //tokio::time::sleep(exec_overhead).await;
-            // let duration = start.elapsed();
-            //                     println!("Duration: {:?}", duration);
-
-            let resp_payload = match req.command.unwrap() {
-                l4m::request::Command::SampleTopKRequest(batch) => {
-                    let items = batch.items.into_iter().map(|item| {
-                        let mut rng = rand::rng();
-                        let token_ids: Vec<_> =
-                            (0..item.k).map(|_| rng.random_range(0..1000)).collect();
-
-                        l4m::SampleTopKResponse { token_ids }
-                    });
-
-                    Some(l4m::response::Payload::SampleTopK(
-                        l4m::BatchSampleTopKResponse {
-                            items: items.collect(),
-                        },
-                    ))
-                }
-                l4m::request::Command::GetTokenDistribution(batch) => {
-                    let items = batch.items.into_iter().map(|item| {
-                        let mut rng = rand::rng();
-                        let distribution: Vec<_> =
-                            (0..1000).map(|_| rng.random_range(0.0..1.0)).collect();
-                        l4m::GetTokenDistributionResponse { distribution }
-                    });
-                    Some(l4m::response::Payload::GetTokenDistribution(
-                        l4m::BatchGetTokenDistributionResponse {
-                            items: items.collect(),
-                        },
-                    ))
-                }
-                l4m::request::Command::Ping(ping) => {
-                    Some(l4m::response::Payload::Ping(l4m::PingResponse {
-                        message: ping.message + " Pong",
-                    }))
-                }
-                l4m::request::Command::GetInfo(_) => {
-                    Some(l4m::response::Payload::GetInfo(l4m::GetInfoResponse {
-                        version: "0.1.0".to_string(),
-                        model_name: "DummyModel".to_string(),
-                        block_size: 128,
-                        num_available_blocks: 1000000,
-                        num_available_embeddings: 1000000,
-                        num_available_distributions: 100000,
-                    }))
-                }
-                _ => None,
-            };
-
-            if let Some(payload) = resp_payload {
-                let resp = l4m::Response {
-                    correlation_id: req.correlation_id,
-                    payload: Some(payload),
-                };
-                let mut evt_tx_guard = evt_tx.lock().await;
-                if let Some(tx) = evt_tx_guard.as_mut() {
-                    // Here, unwrap is used for brevity.
-                    tx.send(resp).await.unwrap();
-                }
+                Some(l4m::response::Command::SampleTopK(
+                    l4m::BatchSampleTopKResponse {
+                        items: items.collect(),
+                    },
+                ))
             }
+            l4m::request::Command::GetTokenDistribution(batch) => {
+                let items = batch.items.into_iter().map(|item| {
+                    let mut rng = rand::rng();
+                    let distribution: Vec<_> =
+                        (0..1000).map(|_| rng.random_range(0.0..1.0)).collect();
+                    l4m::GetTokenDistributionResponse { distribution }
+                });
+                Some(l4m::response::Command::GetTokenDistribution(
+                    l4m::BatchGetTokenDistributionResponse {
+                        items: items.collect(),
+                    },
+                ))
+            }
+
+            l4m::request::Command::GetInfo(_) => {
+                Some(l4m::response::Command::GetInfo(l4m::GetInfoResponse {
+                    version: "0.1.0".to_string(),
+                    model_name: "DummyModel".to_string(),
+                    block_size: 128,
+                    num_available_blocks: 1000000,
+                    num_available_embeddings: 1000000,
+                    num_available_distributions: 100000,
+                }))
+            }
+            _ => None,
+        };
+
+        if let Some(payload) = resp_payload {
+            Some(l4m::Response {
+                correlation_id: req.correlation_id,
+                command: Some(payload),
+            })
+        } else {
+            None
         }
-    }
-}
-
-impl backend::ExecuteCommand<l4m::Request, l4m::Response> for DummyBackend {
-    async fn exec(&self, cmd: l4m::Request) -> Result<(), BackendError> {
-        self.cmd_tx
-            .send(cmd)
-            .await
-            .map_err(|_| BackendError::ChannelClosed)?;
-
-        Ok(())
-    }
-
-    async fn report_to(&self, tx: mpsc::Sender<l4m::Response>) {
-        self.evt_tx.lock().await.replace(tx);
     }
 }

@@ -2,10 +2,10 @@ use std::fmt::Debug;
 
 use crate::object;
 
-use crate::driver_l4m::DriverError;
 use crate::object::VspaceId;
 use crate::utils::Stream;
 use tokio::sync::oneshot;
+use crate::driver::DriverError;
 // object::Id definition ------------------------------------------------
 
 // ------------------------------------------------------------

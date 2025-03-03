@@ -134,6 +134,7 @@ class Driver:
         # get the truncated token distribution. TODO
         ...
 
+    @torch.inference_mode()
     def fill_block(self, cmds: BatchFillBlock):
 
         ### Step 1.Decide the `chunk size`

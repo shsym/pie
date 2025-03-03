@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package sdi.l4m;
+package l4m;
 
 // -----------------------------------------------------------------------------
 // Enum for kinds of objects.
@@ -58,20 +58,6 @@ message EmbedText {
 message BatchEmbedText {
   // Embedding IDs to produce/associate with this text.
   repeated EmbedText items = 1;
-}
-
-// A single image embedding specification.
-message EmbedImage {
-  // Embedding IDs to store or associate with the image.
-  repeated uint32 embedding_ids = 1;
-  // The URL of the image to embed.
-  string url = 2;
-}
-
-// A request to embed one or more images.
-message BatchEmbedImage {
-  // A batch of image embedding items.
-  repeated EmbedImage items = 1;
 }
 
 // -----------------------------------------------------------------------------
@@ -191,13 +177,7 @@ message BatchGetTokenDistributionResponse {
   repeated GetTokenDistributionResponse items = 1;
 }
 
-message PingRequest {
-  string message = 1;
-}
 
-message PingResponse {
-  string message = 1;
-}
 
 message GetInfoRequest {
 
@@ -222,15 +202,13 @@ message Request {
     BatchAllocate allocate = 2;
     BatchDeallocate deallocate = 3;
     BatchEmbedText embed_text = 4;
-    BatchEmbedImage embed_image = 5;
-    BatchFillBlock fill_block = 6;
-    BatchMaskBlock mask_block = 7;
-    BatchCopyBlock copy_block = 8;
-    BatchDecodeTokenDistribution decode_token_distribution = 9;
-    BatchSampleTopKRequest sample_top_k_request = 10;
-    BatchGetTokenDistributionRequest get_token_distribution = 11;
-    PingRequest ping = 12;
-    GetInfoRequest get_info = 13;
+    BatchFillBlock fill_block = 5;
+    BatchMaskBlock mask_block = 6;
+    BatchCopyBlock copy_block = 7;
+    BatchDecodeTokenDistribution decode_token_distribution = 8;
+    BatchSampleTopKRequest sample_top_k_request = 9;
+    BatchGetTokenDistributionRequest get_token_distribution = 10;
+    GetInfoRequest get_info = 11;
   }
 }
 
@@ -238,10 +216,9 @@ message Request {
 message Response {
   uint32 correlation_id = 1;
 
-  oneof payload {
+  oneof command {
     BatchSampleTopKResponse sample_top_k = 2;
     BatchGetTokenDistributionResponse get_token_distribution = 3;
-    PingResponse ping = 4;
-    GetInfoResponse get_info = 5;
+    GetInfoResponse get_info = 4;
   }
 }

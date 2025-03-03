@@ -73,7 +73,6 @@ def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | No
 
     return None
 
-
 def main_run():
     device = "cuda:0"
 
@@ -150,7 +149,6 @@ def llama3_format(prompt: str, hint: str | None, system: str = "You are a helpfu
         temp += hint
 
     return temp
-
 
 def main_test():
     device = "cuda:0"

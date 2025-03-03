@@ -4,7 +4,7 @@ use crate::object::{Fetcher, IdMapper, VspaceId};
 use crate::runtime::Runtime;
 use crate::server::ServerMessage;
 use crate::utils::Stream;
-use crate::{driver_l4m, instance, object, utils};
+use crate::{driver_l4m, driver_ping, instance, object, utils};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,7 +37,7 @@ pub enum ControllerError {
     SendError(String),
 }
 
-pub struct Controller<BL4M> {
+pub struct Controller<B1, B2> {
     state: Arc<Runtime>,
 
     vspaces: HashMap<instance::Id, VspaceId>,
@@ -46,21 +46,24 @@ pub struct Controller<BL4M> {
     subscriptions: HashMap<String, Vec<instance::Id>>,
     exported_blocks: HashMap<String, ExportedBlocks>,
 
-    driver_l4m: driver_l4m::Driver<BL4M>,
+    driver_l4m: driver_l4m::Driver<B1>,
+    driver_ping: driver_ping::Driver<B2>,
 }
 
-impl<BL4M> Controller<BL4M>
+impl<B1, B2> Controller<B1, B2>
 where
-    BL4M: driver_l4m::ExecuteCommand,
+    B1: driver_l4m::ExecuteCommand,
+    B2: driver_ping::ExecuteCommand,
 {
-    pub async fn new(state: Arc<Runtime>, backend_l4m: BL4M) -> Self {
+    pub async fn new(state: Arc<Runtime>, backend_l4m: B1, backend_ping: B2) -> Self {
         Controller {
             state,
             vspaces: HashMap::new(),
             vspace_id_pool: utils::IdPool::new(VspaceId::MAX),
             subscriptions: HashMap::new(),
             exported_blocks: HashMap::new(),
-            driver_l4m: driver_l4m::Driver::new(backend_l4m).await,
+            driver_l4m: driver_l4m::Driver::new(backend_l4m.clone()).await,
+            driver_ping: driver_ping::Driver::new(backend_ping).await,
         }
     }
 
@@ -151,7 +154,7 @@ where
             }
 
             Command::Ping { message, handle } => {
-                self.driver_l4m
+                self.driver_ping
                     .ping(message, handle)
                     .await
                     .map_err(|e| ControllerError::DriverError(format!("Ping failed: {}", e)))?;
@@ -328,16 +331,16 @@ where
                 embs,
                 image,
             } => {
-                let stream = Stream::new(&inst_id, Some(stream));
-                let space = *self
-                    .vspaces
-                    .get(&inst_id)
-                    .ok_or(ControllerError::VspaceNotFound(inst_id))?;
-                self.driver_l4m
-                    .embed_img(stream, &space, embs, image)
-                    .map_err(|e| {
-                        ControllerError::DriverError(format!("EmbedImage failed: {}", e))
-                    })?;
+                // let stream = Stream::new(&inst_id, Some(stream));
+                // let space = *self
+                //     .vspaces
+                //     .get(&inst_id)
+                //     .ok_or(ControllerError::VspaceNotFound(inst_id))?;
+                // self.driver_l4m
+                //     .embed_img(stream, &space, embs, image)
+                //     .map_err(|e| {
+                //         ControllerError::DriverError(format!("EmbedImage failed: {}", e))
+                //     })?;
             }
             Command::AllocateDist { stream, dists } => {
                 let stream = Stream::new(&inst_id, Some(stream));

@@ -3,7 +3,10 @@
 mod backend;
 mod client;
 mod controller;
+mod driver;
 mod driver_l4m;
+mod driver_l4m_vision;
+mod driver_ping;
 mod instance;
 mod lm;
 mod object;
@@ -22,9 +25,8 @@ use crate::instance::{Command, Id as InstanceId};
 use crate::server::{ServerMessage, ServerState, WebSocketServer};
 use wasmtime::{Config, Engine};
 
-use crate::backend::ZmqBackend;
+use crate::backend::{SimulatedBackend, ZmqBackend};
 use crate::client::Client;
-use crate::driver_l4m::DummyBackend;
 use crate::runtime::Runtime;
 use std::fs;
 use std::time::Duration;
@@ -49,12 +51,14 @@ async fn main() -> anyhow::Result<()> {
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
 
     // 6) Spawn the controller loop (which manages commands coming from instances)
-    //let backend = DummyBackend::new(Duration::ZERO).await;
-    let backend = ZmqBackend::bind("tcp://gimlab.org:8888")
-        .await
-        .context("Failed to bind backend")?;
+    let backend_l4m = SimulatedBackend::new(driver_l4m::Simulator {}).await;
+    let backend_ping = SimulatedBackend::new(driver_ping::Simulator {}).await;
 
-    let mut controller = Controller::new(runtime.clone(), backend).await;
+    // let backend = ZmqBackend::bind("tcp://gimlab.org:8888")
+    //     .await
+    //     .context("Failed to bind backend")?;
+
+    let mut controller = Controller::new(runtime.clone(), backend_l4m, backend_ping).await;
 
     let controller_handle = tokio::spawn(async move {
         while let Some((inst_id, cmd)) = inst2server_rx.recv().await {
