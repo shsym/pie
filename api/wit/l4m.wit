@@ -22,8 +22,7 @@ interface l4m {
     deallocate-dists: func(stream-id:u32, ids: list<u32>);
 
     decode-token-dist: func(stream-id:u32, embs:list<u32>, dist:list<u32>);
-    sample-top-k: func(stream-id:u32, embs:list<u32>, k:u32) -> list<list<u32>>;
-    get-token-dist: func(stream-id:u32, dist:u32) -> list<f32>;
+    sample-top-k: func(stream-id:u32, embs:list<u32>, k:u32) -> list<tuple<list<u32>, list<f32>>>;
 
     tokenize: func(text:string) -> list<u32>;
     detokenize: func(tokens:list<u32>) -> string;

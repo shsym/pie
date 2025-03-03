@@ -46,7 +46,6 @@ enum Command {
     EmbedText(l4m::EmbedText),
     DecodeTokenDistribution(l4m::DecodeTokenDistribution),
     SampleTopKRequest(l4m::SampleTopKRequest),
-    GetTokenDistributionRequest(l4m::GetTokenDistributionRequest),
     //Ping(l4m::PingRequest),
 }
 
@@ -54,7 +53,6 @@ enum Command {
 #[derive(Debug)]
 enum Event {
     SampleTopK(l4m::SampleTopKResponse),
-    GetTokenDistribution(l4m::GetTokenDistributionResponse),
     //Ping(l4m::PingResponse),
     GetInfo(l4m::GetInfoResponse),
 }
@@ -62,9 +60,7 @@ enum Event {
 #[derive(Debug)]
 pub enum EventHandle {
     None,
-    SampleTopK(oneshot::Sender<Vec<u32>>),
-    GetTokenDistribution(oneshot::Sender<Vec<f32>>),
-    //Ping(oneshot::Sender<String>),
+    SampleTopK(oneshot::Sender<(Vec<u32>, Vec<f32>)>),
     GetInfo(oneshot::Sender<Info>),
 }
 
@@ -307,14 +303,7 @@ where
                     .into_iter()
                     .map(|item| Event::SampleTopK(item))
                     .collect(),
-                l4m::response::Command::GetTokenDistribution(batch) => batch
-                    .items
-                    .into_iter()
-                    .map(|item| Event::GetTokenDistribution(item))
-                    .collect(),
-                // l4m::response::Command::Ping(item) => {
-                //     vec![Event::Ping(item)]
-                // }
+
                 l4m::response::Command::GetInfo(item) => {
                     vec![Event::GetInfo(item)]
                 }
@@ -398,8 +387,11 @@ impl EventDispatcher {
                 EventHandle::None => { /* No action needed */ }
                 EventHandle::SampleTopK(s) => {
                     if let Event::SampleTopK(mut resp) = event {
-                        s.send(mem::take(&mut resp.token_ids))
-                            .map_err(|e| anyhow!("Failed to send SampleTopK event: {:?}", e))?;
+                        s.send((
+                            mem::take(&mut resp.token_ids),
+                            mem::take(&mut resp.probabilities),
+                        ))
+                        .map_err(|e| anyhow!("Failed to send SampleTopK event: {:?}", e))?;
                     } else {
                         bail!(
                             "Mismatched event type: expected SampleTopK for correlation_id: {}",
@@ -407,18 +399,18 @@ impl EventDispatcher {
                         );
                     }
                 }
-                EventHandle::GetTokenDistribution(s) => {
-                    if let Event::GetTokenDistribution(mut resp) = event {
-                        s.send(mem::take(&mut resp.distribution)).map_err(|e| {
-                            anyhow!("Failed to send GetTokenDistribution event: {:?}", e)
-                        })?;
-                    } else {
-                        bail!(
-                            "Mismatched event type: expected GetTokenDistribution for correlation_id: {}",
-                            correlation_id
-                        );
-                    }
-                }
+                // EventHandle::GetTokenDistribution(s) => {
+                //     if let Event::GetTokenDistribution(mut resp) = event {
+                //         s.send(mem::take(&mut resp.distribution)).map_err(|e| {
+                //             anyhow!("Failed to send GetTokenDistribution event: {:?}", e)
+                //         })?;
+                //     } else {
+                //         bail!(
+                //             "Mismatched event type: expected GetTokenDistribution for correlation_id: {}",
+                //             correlation_id
+                //         );
+                //     }
+                // }
                 // EventHandle::Ping(s) => {
                 //     if let Event::Ping(mut resp) = event {
                 //         s.send(mem::take(&mut resp.message))
@@ -602,7 +594,7 @@ impl CommandBatcher {
                 self.decode_token_distribution
                     .push(item, curr_timestamp, evt);
             }
-            Command::GetTokenDistributionRequest(_) => todo!(),
+
             _ => {
                 eprintln!("Unsupported command type: {:?}", cmd);
             }
@@ -998,7 +990,7 @@ where
         space: &VspaceId,
         dist_ptr: &ObjectId<TokenDist>,
         k: u32,
-        handle: oneshot::Sender<Vec<u32>>,
+        handle: oneshot::Sender<(Vec<u32>, Vec<f32>)>,
     ) -> Result<(), DriverError> {
         let dist_ptr = self.lookup(space, &dist_ptr)?;
 
@@ -1036,7 +1028,7 @@ impl<B> Fetcher<TokenDist> for Driver<B>
 where
     B: ExecuteCommand,
 {
-    type RawRepr = Vec<f32>;
+    type RawRepr = (Vec<u32>, Vec<f32>);
 
     fn fetch(
         &mut self,
@@ -1047,11 +1039,12 @@ where
     ) -> Result<(), ObjectError> {
         let ptr = self.lookup(space, &ptr)?;
 
-        let cmd = Command::GetTokenDistributionRequest(l4m::GetTokenDistributionRequest {
+        let cmd = Command::SampleTopKRequest(l4m::SampleTopKRequest {
             distribution_id: ptr.into(),
+            k: 256,
         });
 
-        let handle = EventHandle::GetTokenDistribution(sender);
+        let handle = EventHandle::SampleTopK(sender);
 
         self.enqueue_cmd_with_event(stream, cmd, handle)
             .map_err(|e| {
@@ -1278,24 +1271,16 @@ impl backend::Simulate<l4m::Request, l4m::Response> for Simulator {
                     let token_ids: Vec<_> =
                         (0..item.k).map(|_| rng.random_range(0..1000)).collect();
 
-                    l4m::SampleTopKResponse { token_ids }
+                    let probs: Vec<_> = (0..item.k).map(|_| rng.random()).collect();
+
+                    l4m::SampleTopKResponse {
+                        token_ids,
+                        probabilities: probs,
+                    }
                 });
 
                 Some(l4m::response::Command::SampleTopK(
                     l4m::BatchSampleTopKResponse {
-                        items: items.collect(),
-                    },
-                ))
-            }
-            l4m::request::Command::GetTokenDistribution(batch) => {
-                let items = batch.items.into_iter().map(|item| {
-                    let mut rng = rand::rng();
-                    let distribution: Vec<_> =
-                        (0..1000).map(|_| rng.random_range(0.0..1.0)).collect();
-                    l4m::GetTokenDistributionResponse { distribution }
-                });
-                Some(l4m::response::Command::GetTokenDistribution(
-                    l4m::BatchGetTokenDistributionResponse {
                         items: items.collect(),
                     },
                 ))

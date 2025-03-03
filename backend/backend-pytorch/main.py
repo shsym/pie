@@ -50,11 +50,6 @@ def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | No
         res = d.sample_top_k_request(request.sample_top_k_request)
         return l4m_pb2.Response(correlation_id=request.correlation_id, sample_top_k=res)
 
-    elif command == "get_token_distribution":
-        res = d.get_token_distribution(request.get_token_distribution)
-        return l4m_pb2.Response(correlation_id=request.correlation_id, get_token_distribution=res)
-
-
     elif command == "get_info":
         return l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
             version=VERSION,

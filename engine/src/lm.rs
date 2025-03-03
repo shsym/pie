@@ -2,10 +2,10 @@ use std::fmt::Debug;
 
 use crate::object;
 
+use crate::driver::DriverError;
 use crate::object::VspaceId;
 use crate::utils::Stream;
 use tokio::sync::oneshot;
-use crate::driver::DriverError;
 // object::Id definition ------------------------------------------------
 
 // ------------------------------------------------------------
@@ -104,7 +104,7 @@ pub trait CausalLanguageModel: object::IdMapper<TokenEmb> + object::IdMapper<Tok
         space: &object::VspaceId,
         dist_ptr: &object::Id<TokenDist>,
         k: u32,
-        handle: oneshot::Sender<Vec<u32>>,
+        handle: oneshot::Sender<(Vec<u32>, Vec<f32>)>,
     ) -> Result<(), DriverError>;
 
     // todo: design a better struct to represent distributions

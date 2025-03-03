@@ -1,7 +1,7 @@
 use std::time::Instant;
 use symphony::RunSync;
 
-struct SimpleDecoding;
+struct ConstrainedDecoding;
 
 fn llama3_format(prompt: &str, hint: Option<&str>, system: Option<&str>) -> String {
     let system_msg = system.unwrap_or("You are a helpful, respectful and honest assistant.");
@@ -20,7 +20,7 @@ fn llama3_format(prompt: &str, hint: Option<&str>, system: Option<&str>) -> Stri
 const MAIN: u32 = 0;
 const MAX_NUM_OUTPUTS: usize = 128;
 
-impl RunSync for SimpleDecoding {
+impl RunSync for ConstrainedDecoding {
     fn run() -> Result<(), String> {
         // Test the system ping latency
 
@@ -174,4 +174,4 @@ impl RunSync for SimpleDecoding {
     }
 }
 
-symphony::main_sync!(SimpleDecoding);
+symphony::main_sync!(ConstrainedDecoding);

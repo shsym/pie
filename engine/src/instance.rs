@@ -166,15 +166,9 @@ pub enum Command {
 
     SampleTopK {
         stream: u32,
-        emb: object::Id<lm::TokenDist>,
-        k: u32,
-        handle: oneshot::Sender<Vec<u32>>,
-    },
-
-    GetTokenDist {
-        stream: u32,
         dist: object::Id<lm::TokenDist>,
-        handle: oneshot::Sender<Vec<f32>>,
+        k: u32,
+        handle: oneshot::Sender<(Vec<u32>, Vec<f32>)>,
     },
 }
 
@@ -539,7 +533,7 @@ impl spi::app::l4m::Host for InstanceState {
         stream: u32,
         embs: Vec<object::IdRepr>,
         k: u32,
-    ) -> Result<Vec<Vec<u32>>, wasmtime::Error> {
+    ) -> Result<Vec<(Vec<u32>, Vec<f32>)>, wasmtime::Error> {
         // create a vector of oneshot channels
         //let start = std::time::Instant::now();
 
@@ -551,7 +545,7 @@ impl spi::app::l4m::Host for InstanceState {
 
             let cmd = Command::SampleTopK {
                 stream,
-                emb: object::Id::new(embs[i]),
+                dist: object::Id::new(embs[i]),
                 k,
                 handle: tx,
             };
@@ -571,27 +565,6 @@ impl spi::app::l4m::Host for InstanceState {
         // println!("SampleTopK took: {:?}", duration);
 
         Ok(results)
-    }
-
-    async fn get_token_dist(
-        &mut self,
-        stream: u32,
-        dist: object::IdRepr,
-    ) -> Result<Vec<f32>, wasmtime::Error> {
-        let (tx, rx) = oneshot::channel();
-
-        let cmd = Command::GetTokenDist {
-            stream,
-            dist: object::Id::new(dist),
-            handle: tx,
-        };
-        self.cmd_buffer.send((self.id, cmd));
-
-        let result = rx
-            .await
-            .or(Err(wasmtime::Error::msg("GetTokenDist failed")))?;
-
-        Ok(result)
     }
 
     async fn tokenize(&mut self, text: String) -> Result<Vec<u32>, wasmtime::Error> {

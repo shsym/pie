@@ -384,7 +384,7 @@ where
             }
             Command::SampleTopK {
                 stream,
-                emb,
+                dist: emb,
                 k,
                 handle,
             } => {
@@ -397,22 +397,6 @@ where
                     .sample_top_k(stream, space, &emb, k, handle)
                     .map_err(|e| {
                         ControllerError::DriverError(format!("SampleTopK failed: {}", e))
-                    })?;
-            }
-            Command::GetTokenDist {
-                stream,
-                dist,
-                handle,
-            } => {
-                let stream = Stream::new(&inst_id, Some(stream));
-                let space = self
-                    .vspaces
-                    .get(&inst_id)
-                    .ok_or(ControllerError::VspaceNotFound(inst_id))?;
-                self.driver_l4m
-                    .fetch(stream, space, &dist, handle)
-                    .map_err(|e| {
-                        ControllerError::DriverError(format!("GetTokenDist failed: {}", e))
                     })?;
             }
         }

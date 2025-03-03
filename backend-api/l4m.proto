@@ -149,34 +149,13 @@ message BatchSampleTopKRequest {
 message SampleTopKResponse {
   // The decoded token IDs.
   repeated uint32 token_ids = 1;
+  repeated float probabilities = 2;
 }
 
 message BatchSampleTopKResponse {
   // The response items.
   repeated SampleTopKResponse items = 1;
 }
-
-message GetTokenDistributionRequest {
-  // The distribution ID to retrieve.
-  uint32 distribution_id = 1;
-}
-
-
-message BatchGetTokenDistributionRequest {
-  // The distribution ID to retrieve.
-  repeated GetTokenDistributionRequest items = 1;
-}
-
-message GetTokenDistributionResponse {
-  // The distribution.
-  repeated float distribution = 1;
-}
-
-message BatchGetTokenDistributionResponse {
-  // The distribution.
-  repeated GetTokenDistributionResponse items = 1;
-}
-
 
 
 message GetInfoRequest {
@@ -207,8 +186,7 @@ message Request {
     BatchCopyBlock copy_block = 7;
     BatchDecodeTokenDistribution decode_token_distribution = 8;
     BatchSampleTopKRequest sample_top_k_request = 9;
-    BatchGetTokenDistributionRequest get_token_distribution = 10;
-    GetInfoRequest get_info = 11;
+    GetInfoRequest get_info = 10;
   }
 }
 
@@ -218,7 +196,6 @@ message Response {
 
   oneof command {
     BatchSampleTopKResponse sample_top_k = 2;
-    BatchGetTokenDistributionResponse get_token_distribution = 3;
-    GetInfoResponse get_info = 4;
+    GetInfoResponse get_info = 3;
   }
 }

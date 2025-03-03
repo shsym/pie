@@ -9,7 +9,7 @@ from common import ceil_div
 from l4ma import AttentionStorage, VectorStorage
 from llama import LlamaForCausalLM
 from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlock, BatchCopyBlock, BatchDecodeTokenDistribution, BatchSampleTopKRequest, BatchSampleTopKResponse, \
-    ObjectKind, SampleTopKResponse, BatchGetTokenDistributionRequest, BatchGetTokenDistributionResponse, BatchFillBlock
+    ObjectKind, SampleTopKResponse, BatchFillBlock
 
 from l4m_vision_pb2 import BatchEmbedImage
 from ping_pb2 import Ping, Pong
@@ -129,14 +129,9 @@ class Driver:
             topk_tokens = topk_res.indices.tolist()
             topk_probs = topk_res.values.tolist()
 
-            res.append(SampleTopKResponse(token_ids=topk_tokens))
+            res.append(SampleTopKResponse(token_ids=topk_tokens, probabilities=topk_probs))
 
         return BatchSampleTopKResponse(items=res)
-
-    def get_token_distribution(self, cmds: BatchGetTokenDistributionRequest) -> BatchGetTokenDistributionResponse:
-
-        # get the truncated token distribution. TODO
-        ...
 
     @torch.inference_mode()
     def fill_block(self, cmds: BatchFillBlock):
