@@ -11,6 +11,4 @@ interface system {
 
     subscribe: func(topic:string);
     unsubscribe: func(topic:string);
-
-    ping: func(message:string) -> string;
 }

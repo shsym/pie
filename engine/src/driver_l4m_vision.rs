@@ -3,6 +3,8 @@ use crate::object::VspaceId;
 use crate::utils::Stream;
 use crate::{backend, driver_l4m};
 
+pub const PROTOCOL: &str = "l4m-vision"; // for future backward compatibility
+
 mod l4m {
     pub mod vision {
         include!(concat!(env!("OUT_DIR"), "/l4m.vision.rs"));
@@ -24,9 +26,7 @@ impl<T> ExecuteCommand for T where
 {
 }
 
-
-
-// 
+//
 // impl<B> ImageEmbedder for Driver<B>
 // where
 //     B: ExecuteCommand,
@@ -39,12 +39,12 @@ impl<T> ExecuteCommand for T where
 //         url: String,
 //     ) -> Result<(), DriverError> {
 //         let addrs = self.lookup_all(space, &addrs)?;
-// 
+//
 //         let cmd = crate::driver_l4m::Command::EmbedImage(crate::driver_l4m::l4m::EmbedImage {
 //             embedding_ids: crate::object::Id::map_to_repr(addrs),
 //             url,
 //         });
-// 
+//
 //         self.enqueue_cmd(stream, cmd)
 //     }
 // }

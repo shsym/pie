@@ -22,6 +22,8 @@ use tokio::task::JoinHandle;
 
 const TOKENIZER_MODEL: &str = "../test-tokenizer/tokenizer.model";
 
+pub const PROTOCOL: &str = "l4m"; // for future backward compatibility
+
 mod l4m {
     include!(concat!(env!("OUT_DIR"), "/l4m.rs"));
 }

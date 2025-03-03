@@ -1,7 +1,9 @@
 package spi:app;
 
 world app {
-    include spi:lm/imports;
     import system;
+    import l4m;
+    import l4m-vision;
+    import ping;
     export run;
 }

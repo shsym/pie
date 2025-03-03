@@ -4,7 +4,10 @@ import torch
 import zmq
 from transformers import TorchAoConfig, AutoTokenizer
 
-import sdi_pb2
+import l4m_pb2
+import l4m_vision_pb2
+import ping_pb2
+
 from common import ceil_div
 from driver import Driver, NUM_TOKENS_IN_BLOCK
 from l4ma import AttentionStorage, VectorStorage
@@ -13,7 +16,7 @@ from llama import LlamaForCausalLM
 VERSION = "0.1.0"
 
 
-def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | None:
+def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | None:
     # Determine which command was set in the oneof field "command"
     command = request.WhichOneof("command")
 
@@ -31,9 +34,6 @@ def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | No
     elif command == "embed_text":
         d.embed_text(request.embed_text)
 
-    elif command == "embed_image":
-        d.embed_image(request.embed_image)
-
     elif command == "fill_block":
         d.fill_block(request.fill_block)
 
@@ -48,18 +48,15 @@ def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | No
 
     elif command == "sample_top_k_request":
         res = d.sample_top_k_request(request.sample_top_k_request)
-        return sdi_pb2.Response(correlation_id=request.correlation_id, sample_top_k=res)
+        return l4m_pb2.Response(correlation_id=request.correlation_id, sample_top_k=res)
 
     elif command == "get_token_distribution":
         res = d.get_token_distribution(request.get_token_distribution)
-        return sdi_pb2.Response(correlation_id=request.correlation_id, get_token_distribution=res)
+        return l4m_pb2.Response(correlation_id=request.correlation_id, get_token_distribution=res)
 
-    elif command == "ping":
-        reply = "awk:" + request.ping.message
-        return sdi_pb2.Response(correlation_id=request.correlation_id, ping=sdi_pb2.PingResponse(message=reply))
 
     elif command == "get_info":
-        return sdi_pb2.Response(correlation_id=request.correlation_id, get_info=sdi_pb2.GetInfoResponse(
+        return l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
             version=VERSION,
             model_name="Llama-3.2-1B-Instruct",
             block_size=NUM_TOKENS_IN_BLOCK,
@@ -72,6 +69,7 @@ def handle_request(d: Driver, request: sdi_pb2.Request) -> sdi_pb2.Response | No
         print("No valid command found in request.")
 
     return None
+
 
 def main_run():
     device = "cuda:0"
@@ -112,6 +110,8 @@ def main_run():
     router.bind("tcp://*:8888")
     print("Server listening on tcp://*:8888")
 
+    protocols = {}
+
     while True:
         # ROUTER sockets receive multipart messages.
         # Expected format: [client_identity, empty_frame, payload]
@@ -121,20 +121,67 @@ def main_run():
         # Check if an empty frame is present. If so, payload is at index 2.
         payload = frames[1]
 
-        # Deserialize the protobuf message
-        request = sdi_pb2.Request()
-        request.ParseFromString(payload)
+        # check if the client has already a protocol
+        if client_identity in protocols:
+            protocol = protocols[client_identity]
 
-        # handle the request
-        response = handle_request(engine, request)
+            if protocol == "l4m":
+                # Deserialize the protobuf message
+                request = l4m_pb2.Request()
+                request.ParseFromString(payload)
 
-        if response is not None:
-            reply_payload = response.SerializeToString()
+                # handle the request
+                response = handle_request(engine, request)
 
-            # print("Sending reply back to the client.")
-            # Send reply back to the client.
-            # Include the client identity and an empty frame to maintain the envelope.
-            router.send_multipart([client_identity, reply_payload])
+                if response is not None:
+                    reply_payload = response.SerializeToString()
+
+                    # print("Sending reply back to the client.")
+                    # Send reply back to the client.
+                    # Include the client identity and an empty frame to maintain the envelope.
+                    router.send_multipart([client_identity, reply_payload])
+
+
+
+            elif protocol == "l4m_vision":
+
+                request = l4m_vision_pb2.Request()
+                request.ParseFromString(payload)
+
+            elif protocol == "ping":
+                ping = ping_pb2.Ping()
+                ping.ParseFromString(payload)
+
+                pong = ping_pb2.Pong(
+                    correlation_id=ping.correlation_id,
+                    message="Pong:" + ping.message
+                ).SerializeToString()
+
+                router.send_multipart([client_identity, pong])
+
+            else:
+                print("Invalid protocol.", protocol)
+                # send an error message back to the client
+
+
+
+        else:
+
+            # protocol = payload
+            # parse the payload
+            protocol = payload.decode("utf-8")
+
+            # check if the protocol is supported
+            if protocol not in ["l4m", "l4m_vision", "ping"]:
+                print("Invalid protocol.")
+                # send an error message back to the client
+                router.send_multipart([client_identity, b"\x00"])
+
+            else:
+
+                protocols[client_identity] = protocol
+                # send a message back to the client
+                router.send_multipart([client_identity, b"\x01"])
 
 
 ###====================Test====================###
@@ -149,6 +196,7 @@ def llama3_format(prompt: str, hint: str | None, system: str = "You are a helpfu
         temp += hint
 
     return temp
+
 
 def main_test():
     device = "cuda:0"
@@ -197,17 +245,17 @@ def main_test():
     next_token_pointer_idx = (len(token_ids) % NUM_TOKENS_IN_BLOCK) - 1
     print("next token pointer idx:", next_token_pointer_idx)
 
-    engine.embed_text(sdi_pb2.BatchEmbedText(items=[
-        sdi_pb2.EmbedText(embedding_id=i, token_id=token_ids[i], position_id=i)
+    engine.embed_text(l4m_pb2.BatchEmbedText(items=[
+        l4m_pb2.EmbedText(embedding_id=i, token_id=token_ids[i], position_id=i)
         for i in range(len(token_ids))
     ]))
 
-    engine.allocate(sdi_pb2.BatchAllocate(items=[sdi_pb2.Allocate(kind=sdi_pb2.ObjectKind.OBJECT_KIND_KV_BLOCK, object_id_offset=0, count=5)]))
+    engine.allocate(l4m_pb2.BatchAllocate(items=[l4m_pb2.Allocate(kind=l4m_pb2.ObjectKind.OBJECT_KIND_KV_BLOCK, object_id_offset=0, count=5)]))
 
     OUT_EMB_OFFSET = 100
 
-    engine.fill_block(sdi_pb2.BatchFillBlock(items=[
-        sdi_pb2.FillBlock(block_id=i,
+    engine.fill_block(l4m_pb2.BatchFillBlock(items=[
+        l4m_pb2.FillBlock(block_id=i,
                           context_block_ids=list(range(i + 1)),
                           input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * i, NUM_TOKENS_IN_BLOCK * (i + 1))),
                           output_embedding_ids=list(range(OUT_EMB_OFFSET, OUT_EMB_OFFSET + NUM_TOKENS_IN_BLOCK)) if i == num_blocks_needed - 1 else [])
@@ -224,11 +272,11 @@ def main_test():
 
         time_start = time.time()
 
-        engine.decode_token_distribution(sdi_pb2.BatchDecodeTokenDistribution(items=[
-            sdi_pb2.DecodeTokenDistribution(embedding_id=OUT_EMB_OFFSET + last_token_idx + i, distribution_id=0)
+        engine.decode_token_distribution(l4m_pb2.BatchDecodeTokenDistribution(items=[
+            l4m_pb2.DecodeTokenDistribution(embedding_id=OUT_EMB_OFFSET + last_token_idx + i, distribution_id=0)
         ]))
-        res = engine.sample_top_k_request(sdi_pb2.BatchSampleTopKRequest(items=[
-            sdi_pb2.SampleTopKRequest(distribution_id=0, k=5)
+        res = engine.sample_top_k_request(l4m_pb2.BatchSampleTopKRequest(items=[
+            l4m_pb2.SampleTopKRequest(distribution_id=0, k=5)
         ]))
 
         new_token = res.items[0].token_ids[0]
@@ -237,11 +285,11 @@ def main_test():
         decoded_tokens.append(new_token)
         print(tokenizer.decode(decoded_tokens), f"({new_token})")
 
-        engine.embed_text(sdi_pb2.BatchEmbedText(items=[
-            sdi_pb2.EmbedText(embedding_id=len(token_ids) + i, token_id=new_token, position_id=len(token_ids) + i)
+        engine.embed_text(l4m_pb2.BatchEmbedText(items=[
+            l4m_pb2.EmbedText(embedding_id=len(token_ids) + i, token_id=new_token, position_id=len(token_ids) + i)
         ]))
-        engine.fill_block(sdi_pb2.BatchFillBlock(items=[
-            sdi_pb2.FillBlock(block_id=last_block_id,
+        engine.fill_block(l4m_pb2.BatchFillBlock(items=[
+            l4m_pb2.FillBlock(block_id=last_block_id,
                               context_block_ids=list(range(last_block_id + 1)),
                               input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * last_block_id, NUM_TOKENS_IN_BLOCK * (last_block_id + 1))),
                               output_embedding_ids=list(range(OUT_EMB_OFFSET, OUT_EMB_OFFSET + NUM_TOKENS_IN_BLOCK))),

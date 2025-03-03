@@ -51,12 +51,16 @@ async fn main() -> anyhow::Result<()> {
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
 
     // 6) Spawn the controller loop (which manages commands coming from instances)
-    let backend_l4m = SimulatedBackend::new(driver_l4m::Simulator {}).await;
-    let backend_ping = SimulatedBackend::new(driver_ping::Simulator {}).await;
+    // let backend_l4m = SimulatedBackend::new(driver_l4m::Simulator {}).await;
+    // let backend_ping = SimulatedBackend::new(driver_ping::Simulator {}).await;
 
-    // let backend = ZmqBackend::bind("tcp://gimlab.org:8888")
-    //     .await
-    //     .context("Failed to bind backend")?;
+    let backend_l4m = ZmqBackend::bind("tcp://gimlab.org:8888", driver_l4m::PROTOCOL)
+        .await
+        .context("Failed to bind backend")?;
+
+    let backend_ping = ZmqBackend::bind("tcp://gimlab.org:8888", driver_ping::PROTOCOL)
+        .await
+        .context("Failed to bind backend")?;
 
     let mut controller = Controller::new(runtime.clone(), backend_l4m, backend_ping).await;
 

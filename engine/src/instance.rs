@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 bindgen!({
-    path: "../api/app/wit",
+    path: "../api/wit",
     world: "app",
     async: true,
     // with: {
@@ -276,7 +276,9 @@ impl spi::app::system::Host for InstanceState {
             .send((self.id, Command::Unsubscribe { topic }));
         Ok(())
     }
+}
 
+impl spi::app::ping::Host for InstanceState {
     async fn ping(&mut self, message: String) -> Result<String, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
 
@@ -293,7 +295,7 @@ impl spi::app::system::Host for InstanceState {
     }
 }
 
-impl spi::lm::inference::Host for InstanceState {
+impl spi::app::l4m::Host for InstanceState {
     async fn get_block_size(&mut self) -> Result<u32, wasmtime::Error> {
         Ok(self.l4m_driver_utils.block_size)
     }
@@ -515,32 +517,6 @@ impl spi::lm::inference::Host for InstanceState {
         Ok(())
     }
 
-    async fn embed_image(
-        &mut self,
-        stream: u32,
-        embs: Vec<object::IdRepr>,
-        url: String,
-    ) -> Result<(), wasmtime::Error> {
-        let cmd = Command::EmbedImage {
-            stream,
-            embs: object::Id::map_from_repr(embs),
-            image: url,
-        };
-
-        self.cmd_buffer.send((self.id, cmd));
-
-        Ok(())
-    }
-
-    async fn embed_video(
-        &mut self,
-        stream: u32,
-        embs: Vec<object::IdRepr>,
-        url: String,
-    ) -> Result<(), wasmtime::Error> {
-        todo!()
-    }
-
     async fn decode_token_dist(
         &mut self,
         stream: u32,
@@ -629,5 +605,33 @@ impl spi::lm::inference::Host for InstanceState {
     async fn detokenize(&mut self, tokens: Vec<u32>) -> Result<String, wasmtime::Error> {
         let text = self.l4m_driver_utils.tokenizer.decode(tokens.as_slice())?;
         Ok(text)
+    }
+}
+
+impl spi::app::l4m_vision::Host for InstanceState {
+    async fn embed_image(
+        &mut self,
+        stream: u32,
+        embs: Vec<object::IdRepr>,
+        url: String,
+    ) -> Result<(), wasmtime::Error> {
+        let cmd = Command::EmbedImage {
+            stream,
+            embs: object::Id::map_from_repr(embs),
+            image: url,
+        };
+
+        self.cmd_buffer.send((self.id, cmd));
+
+        Ok(())
+    }
+
+    async fn embed_video(
+        &mut self,
+        stream: u32,
+        embs: Vec<object::IdRepr>,
+        url: String,
+    ) -> Result<(), wasmtime::Error> {
+        todo!()
     }
 }

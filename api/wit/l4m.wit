@@ -1,4 +1,4 @@
-interface inference {
+interface l4m {
 
     get-block-size: func() -> u32;
 
@@ -17,8 +17,6 @@ interface inference {
     deallocate-embeds: func(stream-id:u32, ids: list<u32>);
 
     embed-text: func(stream-id:u32, embs:list<u32>, tokens:list<u32>, positions:list<u32>);
-    embed-image: func(stream-id:u32, embs:list<u32>, url:string);
-    embed-video: func(stream-id:u32, embs:list<u32>, url:string);
 
     allocate-dists: func(stream-id:u32, count:u32) -> list<u32>;
     deallocate-dists: func(stream-id:u32, ids: list<u32>);

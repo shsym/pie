@@ -44,11 +44,36 @@ where
     A: prost::Message + 'static,
     B: prost::Message + Default + 'static,
 {
-    pub async fn bind(endpoint: &str) -> Result<Self, ZmqError> {
+    pub async fn bind(endpoint: &str, protocol: &str) -> Result<Self, ZmqError> {
         // bind the zmq socket
         let mut socket = DealerSocket::new();
         socket.connect(endpoint).await?;
         println!("Connected to server at {endpoint}");
+
+        // do a handshake with the server
+        socket.send(ZmqMessage::from(protocol)).await?;
+
+        // if let Some(response) = socket.recv().await?.get(0) {
+        //     match response.as_ref() {
+        //         b"\x01" => println!("Handshake successful (True)"),
+        //         b"\x00" => println!("Handshake failed (False)"),
+        //         _ => println!("Unexpected response: {:?}", response),
+        //     }
+        // } else {
+        //     println!("No response received");
+        // }
+
+        let resp = socket.recv().await?;
+
+        //println!("Handshake response: {:?}", resp);
+
+        match resp.get(0).unwrap().as_ref() {
+            b"\x01" => println!("Handshake successful"),
+            _ => {
+                println!("Handshake failed (False)");
+                return Err(ZmqError::Other("Handshake failed"));
+            }
+        }
 
         // create event dispatcher
 

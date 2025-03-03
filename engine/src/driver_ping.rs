@@ -11,6 +11,8 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+pub const PROTOCOL: &str = "ping";
+
 mod ping {
     include!(concat!(env!("OUT_DIR"), "/ping.rs"));
 }

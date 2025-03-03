@@ -1,7 +1,7 @@
 pub mod bindings {
 
     wit_bindgen::generate!({
-        path: "../../api/app/wit",
+        path: "../../api/wit",
         world: "app",
         pub_export_macro: true,
         export_macro_name: "export",
@@ -10,7 +10,8 @@ pub mod bindings {
 }
 
 pub use crate::bindings::{
-    export, exports::spi::app::run::Guest as RunSync, spi::app::system, spi::lm::inference,
+    export, exports::spi::app::run::Guest as RunSync, spi::app::l4m, spi::app::l4m_vision,
+    spi::app::ping, spi::app::system,
 };
 
 #[trait_variant::make(LocalRun: Send)]

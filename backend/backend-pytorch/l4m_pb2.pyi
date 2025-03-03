@@ -55,20 +55,6 @@ class BatchEmbedText(_message.Message):
     items: _containers.RepeatedCompositeFieldContainer[EmbedText]
     def __init__(self, items: _Optional[_Iterable[_Union[EmbedText, _Mapping]]] = ...) -> None: ...
 
-class EmbedImage(_message.Message):
-    __slots__ = ("embedding_ids", "url")
-    EMBEDDING_IDS_FIELD_NUMBER: _ClassVar[int]
-    URL_FIELD_NUMBER: _ClassVar[int]
-    embedding_ids: _containers.RepeatedScalarFieldContainer[int]
-    url: str
-    def __init__(self, embedding_ids: _Optional[_Iterable[int]] = ..., url: _Optional[str] = ...) -> None: ...
-
-class BatchEmbedImage(_message.Message):
-    __slots__ = ("items",)
-    ITEMS_FIELD_NUMBER: _ClassVar[int]
-    items: _containers.RepeatedCompositeFieldContainer[EmbedImage]
-    def __init__(self, items: _Optional[_Iterable[_Union[EmbedImage, _Mapping]]] = ...) -> None: ...
-
 class FillBlock(_message.Message):
     __slots__ = ("block_id", "context_block_ids", "input_embedding_ids", "output_embedding_ids")
     BLOCK_ID_FIELD_NUMBER: _ClassVar[int]
@@ -185,18 +171,6 @@ class BatchGetTokenDistributionResponse(_message.Message):
     items: _containers.RepeatedCompositeFieldContainer[GetTokenDistributionResponse]
     def __init__(self, items: _Optional[_Iterable[_Union[GetTokenDistributionResponse, _Mapping]]] = ...) -> None: ...
 
-class PingRequest(_message.Message):
-    __slots__ = ("message",)
-    MESSAGE_FIELD_NUMBER: _ClassVar[int]
-    message: str
-    def __init__(self, message: _Optional[str] = ...) -> None: ...
-
-class PingResponse(_message.Message):
-    __slots__ = ("message",)
-    MESSAGE_FIELD_NUMBER: _ClassVar[int]
-    message: str
-    def __init__(self, message: _Optional[str] = ...) -> None: ...
-
 class GetInfoRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
@@ -218,45 +192,39 @@ class GetInfoResponse(_message.Message):
     def __init__(self, version: _Optional[str] = ..., model_name: _Optional[str] = ..., block_size: _Optional[int] = ..., num_available_blocks: _Optional[int] = ..., num_available_embeddings: _Optional[int] = ..., num_available_distributions: _Optional[int] = ...) -> None: ...
 
 class Request(_message.Message):
-    __slots__ = ("correlation_id", "allocate", "deallocate", "embed_text", "embed_image", "fill_block", "mask_block", "copy_block", "decode_token_distribution", "sample_top_k_request", "get_token_distribution", "ping", "get_info")
+    __slots__ = ("correlation_id", "allocate", "deallocate", "embed_text", "fill_block", "mask_block", "copy_block", "decode_token_distribution", "sample_top_k_request", "get_token_distribution", "get_info")
     CORRELATION_ID_FIELD_NUMBER: _ClassVar[int]
     ALLOCATE_FIELD_NUMBER: _ClassVar[int]
     DEALLOCATE_FIELD_NUMBER: _ClassVar[int]
     EMBED_TEXT_FIELD_NUMBER: _ClassVar[int]
-    EMBED_IMAGE_FIELD_NUMBER: _ClassVar[int]
     FILL_BLOCK_FIELD_NUMBER: _ClassVar[int]
     MASK_BLOCK_FIELD_NUMBER: _ClassVar[int]
     COPY_BLOCK_FIELD_NUMBER: _ClassVar[int]
     DECODE_TOKEN_DISTRIBUTION_FIELD_NUMBER: _ClassVar[int]
     SAMPLE_TOP_K_REQUEST_FIELD_NUMBER: _ClassVar[int]
     GET_TOKEN_DISTRIBUTION_FIELD_NUMBER: _ClassVar[int]
-    PING_FIELD_NUMBER: _ClassVar[int]
     GET_INFO_FIELD_NUMBER: _ClassVar[int]
     correlation_id: int
     allocate: BatchAllocate
     deallocate: BatchDeallocate
     embed_text: BatchEmbedText
-    embed_image: BatchEmbedImage
     fill_block: BatchFillBlock
     mask_block: BatchMaskBlock
     copy_block: BatchCopyBlock
     decode_token_distribution: BatchDecodeTokenDistribution
     sample_top_k_request: BatchSampleTopKRequest
     get_token_distribution: BatchGetTokenDistributionRequest
-    ping: PingRequest
     get_info: GetInfoRequest
-    def __init__(self, correlation_id: _Optional[int] = ..., allocate: _Optional[_Union[BatchAllocate, _Mapping]] = ..., deallocate: _Optional[_Union[BatchDeallocate, _Mapping]] = ..., embed_text: _Optional[_Union[BatchEmbedText, _Mapping]] = ..., embed_image: _Optional[_Union[BatchEmbedImage, _Mapping]] = ..., fill_block: _Optional[_Union[BatchFillBlock, _Mapping]] = ..., mask_block: _Optional[_Union[BatchMaskBlock, _Mapping]] = ..., copy_block: _Optional[_Union[BatchCopyBlock, _Mapping]] = ..., decode_token_distribution: _Optional[_Union[BatchDecodeTokenDistribution, _Mapping]] = ..., sample_top_k_request: _Optional[_Union[BatchSampleTopKRequest, _Mapping]] = ..., get_token_distribution: _Optional[_Union[BatchGetTokenDistributionRequest, _Mapping]] = ..., ping: _Optional[_Union[PingRequest, _Mapping]] = ..., get_info: _Optional[_Union[GetInfoRequest, _Mapping]] = ...) -> None: ...
+    def __init__(self, correlation_id: _Optional[int] = ..., allocate: _Optional[_Union[BatchAllocate, _Mapping]] = ..., deallocate: _Optional[_Union[BatchDeallocate, _Mapping]] = ..., embed_text: _Optional[_Union[BatchEmbedText, _Mapping]] = ..., fill_block: _Optional[_Union[BatchFillBlock, _Mapping]] = ..., mask_block: _Optional[_Union[BatchMaskBlock, _Mapping]] = ..., copy_block: _Optional[_Union[BatchCopyBlock, _Mapping]] = ..., decode_token_distribution: _Optional[_Union[BatchDecodeTokenDistribution, _Mapping]] = ..., sample_top_k_request: _Optional[_Union[BatchSampleTopKRequest, _Mapping]] = ..., get_token_distribution: _Optional[_Union[BatchGetTokenDistributionRequest, _Mapping]] = ..., get_info: _Optional[_Union[GetInfoRequest, _Mapping]] = ...) -> None: ...
 
 class Response(_message.Message):
-    __slots__ = ("correlation_id", "sample_top_k", "get_token_distribution", "ping", "get_info")
+    __slots__ = ("correlation_id", "sample_top_k", "get_token_distribution", "get_info")
     CORRELATION_ID_FIELD_NUMBER: _ClassVar[int]
     SAMPLE_TOP_K_FIELD_NUMBER: _ClassVar[int]
     GET_TOKEN_DISTRIBUTION_FIELD_NUMBER: _ClassVar[int]
-    PING_FIELD_NUMBER: _ClassVar[int]
     GET_INFO_FIELD_NUMBER: _ClassVar[int]
     correlation_id: int
     sample_top_k: BatchSampleTopKResponse
     get_token_distribution: BatchGetTokenDistributionResponse
-    ping: PingResponse
     get_info: GetInfoResponse
-    def __init__(self, correlation_id: _Optional[int] = ..., sample_top_k: _Optional[_Union[BatchSampleTopKResponse, _Mapping]] = ..., get_token_distribution: _Optional[_Union[BatchGetTokenDistributionResponse, _Mapping]] = ..., ping: _Optional[_Union[PingResponse, _Mapping]] = ..., get_info: _Optional[_Union[GetInfoResponse, _Mapping]] = ...) -> None: ...
+    def __init__(self, correlation_id: _Optional[int] = ..., sample_top_k: _Optional[_Union[BatchSampleTopKResponse, _Mapping]] = ..., get_token_distribution: _Optional[_Union[BatchGetTokenDistributionResponse, _Mapping]] = ..., get_info: _Optional[_Union[GetInfoResponse, _Mapping]] = ...) -> None: ...

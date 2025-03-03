@@ -8,12 +8,16 @@ from transformers import AutoTokenizer
 from common import ceil_div
 from l4ma import AttentionStorage, VectorStorage
 from llama import LlamaForCausalLM
-from sdi_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchEmbedImage, BatchMaskBlock, BatchCopyBlock, BatchDecodeTokenDistribution, BatchSampleTopKRequest, BatchSampleTopKResponse, \
+from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlock, BatchCopyBlock, BatchDecodeTokenDistribution, BatchSampleTopKRequest, BatchSampleTopKResponse, \
     ObjectKind, SampleTopKResponse, BatchGetTokenDistributionRequest, BatchGetTokenDistributionResponse, BatchFillBlock
+
+from l4m_vision_pb2 import BatchEmbedImage
+from ping_pb2 import Ping, Pong
 
 NUM_TOKENS_IN_BLOCK = 32
 
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
+
 
 @dataclass
 class TextEmbed:

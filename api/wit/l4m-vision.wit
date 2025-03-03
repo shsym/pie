@@ -1,0 +1,4 @@
+interface l4m-vision {
+    embed-image: func(stream-id:u32, embs:list<u32>, url:string);
+    embed-video: func(stream-id:u32, embs:list<u32>, url:string);
+}
