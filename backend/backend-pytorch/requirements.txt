@@ -8,4 +8,5 @@ websockets~=11.0.3
 sortedcontainers~=2.4.0
 safetensors~=0.4.2
 protobuf~=3.20.3
-torchaoa~=0.1.0
+torchao~=0.9.0
+accelerate>=0.26.0
