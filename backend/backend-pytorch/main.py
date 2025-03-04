@@ -9,11 +9,10 @@ import l4m_vision_pb2
 import ping_pb2
 
 from common import ceil_div
-from driver import Driver, NUM_TOKENS_IN_BLOCK
+from driver import Driver
 from l4ma import AttentionStorage, VectorStorage
 from llama import LlamaForCausalLM
-
-VERSION = "0.1.0"
+from config import VERSION, MODEL_NAME, FULL_MODEL_NAME, NUM_TOKENS_IN_BLOCK
 
 
 def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | None:
@@ -53,7 +52,7 @@ def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | No
     elif command == "get_info":
         return l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
             version=VERSION,
-            model_name="Llama-3.2-1B-Instruct",
+            model_name=MODEL_NAME,
             block_size=NUM_TOKENS_IN_BLOCK,
             num_available_blocks=d.block_storage.num_blocks,
             num_available_embeddings=d.embed_storage.num_vectors,
@@ -72,7 +71,7 @@ def main_run():
     quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
 
     model = LlamaForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.2-1B-Instruct", torch_dtype="bfloat16", device_map=device, quantization_config=quantization_config)
+        FULL_MODEL_NAME, torch_dtype="bfloat16", device_map=device, quantization_config=quantization_config)
 
     block_storage = AttentionStorage(
         num_layers=model.config.num_hidden_layers,
@@ -199,9 +198,9 @@ def main_test():
     quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
 
     model = LlamaForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.2-1B-Instruct", torch_dtype="bfloat16", device_map=device, quantization_config=quantization_config)
+        FULL_MODEL_NAME, torch_dtype="bfloat16", device_map=device, quantization_config=quantization_config)
 
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+    tokenizer = AutoTokenizer.from_pretrained(FULL_MODEL_NAME)
 
     block_storage = AttentionStorage(
         num_layers=model.config.num_hidden_layers,

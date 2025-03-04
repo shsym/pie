@@ -13,10 +13,9 @@ from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlo
 
 from l4m_vision_pb2 import BatchEmbedImage
 from ping_pb2 import Ping, Pong
+from config import FULL_MODEL_NAME, NUM_TOKENS_IN_BLOCK
 
-NUM_TOKENS_IN_BLOCK = 32
-
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained(FULL_MODEL_NAME)
 
 
 @dataclass
