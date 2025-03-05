@@ -290,6 +290,7 @@ where
                         ControllerError::DriverError(format!("CopyBlock failed: {}", e))
                     })?;
             }
+           
             Command::MaskBlock {
                 stream,
                 block,
