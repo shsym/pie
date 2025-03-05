@@ -67,11 +67,32 @@ where
         }
     }
 
-    pub async fn exec(
+    pub async fn submit(
         &mut self,
         inst_id: instance::Id,
         cmd: Command,
     ) -> Result<(), ControllerError> {
+        if let Err(e) = self.update(inst_id, cmd).await {
+            //eprintln!("Controller error: {:?}", e);
+
+            let inst = self
+                .state
+                .running_instances
+                .get(&inst_id)
+                .ok_or(ControllerError::InstanceNotFound(inst_id))?;
+
+            inst.evt_from_system.send(e.to_string()).await;
+        } else {
+            self.driver_l4m
+                .submit(Instant::now())
+                .await
+                .map_err(|e| ControllerError::DriverError(format!("Submit failed: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    async fn update(&mut self, inst_id: instance::Id, cmd: Command) -> Result<(), ControllerError> {
         match cmd {
             Command::CreateInstance { handle } => {
                 let space = self
@@ -400,11 +421,6 @@ where
                     })?;
             }
         }
-
-        self.driver_l4m
-            .submit(Instant::now())
-            .await
-            .map_err(|e| ControllerError::DriverError(format!("Submit failed: {}", e)))?;
 
         Ok(())
     }

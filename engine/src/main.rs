@@ -66,13 +66,7 @@ async fn main() -> anyhow::Result<()> {
 
     let controller_handle = tokio::spawn(async move {
         while let Some((inst_id, cmd)) = inst2server_rx.recv().await {
-            // print the cmd
-            //println!("Controller received command: {:?}", cmd);
-            if let Err(e) = controller.exec(inst_id, cmd).await {
-                // print the cmd
-                //panic!("Controller exec error: {}", e);
-                eprintln!("Controller exec error: {}", e);
-            }
+            controller.submit(inst_id, cmd).await;
         }
     });
 

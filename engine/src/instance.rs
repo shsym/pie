@@ -34,6 +34,7 @@ pub struct InstanceState {
 
     cmd_buffer: UnboundedSender<(Id, Command)>,
 
+    evt_from_system: Receiver<String>,
     evt_from_origin: Receiver<String>,
     evt_from_peers: Receiver<(String, String)>,
 
@@ -188,6 +189,7 @@ impl InstanceState {
     pub async fn new(
         id: Uuid,
         cmd_buffer: UnboundedSender<(Id, Command)>,
+        evt_from_system: Receiver<String>,
         evt_from_origin: Receiver<String>,
         evt_from_peers: Receiver<(String, String)>,
         //l4m_driver_utils: Arc<driver_l4m::Utils>,
@@ -205,6 +207,7 @@ impl InstanceState {
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             cmd_buffer,
+            evt_from_system,
             evt_from_origin,
             evt_from_peers,
             allocator: driver_l4m::IdPool::new(1000, 1000, 1000),

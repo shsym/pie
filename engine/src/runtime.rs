@@ -60,6 +60,7 @@ pub struct Runtime {
 pub struct InstanceHandle {
     pub hash: String,
     pub to_origin: Sender<ServerMessage>,
+    pub evt_from_system: Sender<String>,
     pub evt_from_origin: Sender<String>,
     pub evt_from_peers: Sender<(String, String)>,
     pub join_handle: tokio::task::JoinHandle<()>,
@@ -135,14 +136,16 @@ impl Runtime {
         let instance_id = Uuid::new_v4();
 
         // 3) Create channels for event-sending
-        let (server2inst_tx, server2inst_rx) = tokio::sync::mpsc::channel::<String>(32);
-        let (peer_tx, peer_rx) = tokio::sync::mpsc::channel::<(String, String)>(32);
+        let (origin_tx, origin_rx) = tokio::sync::mpsc::channel::<String>(32);
+        let (peer_tx, peer_rx) = tokio::sync::mpsc::channel::<(String, String)>(128);
+        let (error_tx, error_rx) = tokio::sync::mpsc::channel::<String>(128);
 
         // 4) Build the InstanceState
         let inst_state = InstanceState::new(
             instance_id,
             self.inst2server.clone(),
-            server2inst_rx,
+            error_rx,
+            origin_rx,
             peer_rx,
         )
         .await;
@@ -225,7 +228,8 @@ impl Runtime {
         let instance_handle = InstanceHandle {
             hash: hash.to_string(),
             to_origin,
-            evt_from_origin: server2inst_tx,
+            evt_from_system: error_tx,
+            evt_from_origin: origin_tx,
             evt_from_peers: peer_tx,
             join_handle,
         };

@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use fancy_regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -204,7 +204,11 @@ impl BytePairEncoder {
         let decoder: HashMap<Rank, Vec<u8>> =
             encoder.iter().map(|(k, v)| (*v, k.clone())).collect();
 
-        assert_eq!(encoder.len(), decoder.len(), "Encoder and decoder must be of equal length; maybe you had duplicate token indices in your encoder?");
+        assert_eq!(
+            encoder.len(),
+            decoder.len(),
+            "Encoder and decoder must be of equal length; maybe you had duplicate token indices in your encoder?"
+        );
 
         let special_tokens_decoder: HashMap<Rank, Vec<u8>> = special_tokens_encoder
             .iter()
@@ -284,7 +288,7 @@ fn load_tiktoken_bpe(path: &str) -> Result<HashMap<Vec<u8>, Rank>, Box<dyn std::
     Ok(ret)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main_test() -> Result<(), Box<dyn std::error::Error>> {
     // Example usage
     let mergeable_ranks = load_tiktoken_bpe("tokenizer.model")?;
     let special_tokens = vec![
@@ -316,15 +320,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokens = bpe_map.encode_with_special_tokens(text);
     println!("Encoded tokens: {:?}", tokens);
 
-    let new_tokens = vec![139, 915, 176, 660, 280, 175, 495, 229, 475, 923, 84, 383, 577, 295, 258, 529, 385, 765, 817, 250, 36, 141, 289, 570, 591, 841, 706, 607, 316, 831, 392, 868];
-    
+    let new_tokens = vec![
+        139, 915, 176, 660, 280, 175, 495, 229, 475, 923, 84, 383, 577, 295, 258, 529, 385, 765,
+        817, 250, 36, 141, 289, 570, 591, 841, 706, 607, 316, 831, 392, 868,
+    ];
+
     let decoded_text = bpe_map.decode(&new_tokens)?;
-    
+
     println!("Decoded text: {:?}", decoded_text);
-    
+
     // Now `bpe_map` is a HashMap<Vec<u8>, i32>
     // Do something with it...
     println!("Loaded {} entries", num_base_tokens);
+
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use ahash::AHashMap;
+    use kbnf::{Engine, EngineLike, Grammar, Token, Vocabulary};
+    let grammar_str = r##"
+start ::= #e"(.|\n)*\n\n";
+"##;
+    let mut token_strings: AHashMap<u32, String> = AHashMap::default();
+    token_strings.extend([
+        (1, "a".to_string()),
+        (2, "hello".to_string()),
+        (4, "\n".to_string()),
+        (5, "\n\n".to_string()),
+    ]);
+    let tokens = token_strings
+        .iter()
+        .map(|(k, v)| (*k, Token(v.as_bytes().to_vec().into_boxed_slice())))
+        .collect::<AHashMap<u32, _>>();
+    let vocab = Vocabulary::new(tokens, token_strings).unwrap();
+    let mut engine = Engine::new(grammar_str, vocab).unwrap();
+    let mut logits = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; // The logits of the language model
+    engine.compute_allowed_token_ids();
+    assert_eq!(
+        engine
+            .allowed_token_ids_from_last_computation()
+            .ones()
+            .collect::<Vec<_>>(),
+        vec![1, 2, 4, 5]
+    );
+    engine.mask_logits(&mut logits).unwrap(); // mask the logits
+    assert_eq!(&format!("{:?}", logits), "[-inf, 0.0, 0.0, -inf, 0.0, 0.0]");
 
     Ok(())
 }
