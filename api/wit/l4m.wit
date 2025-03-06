@@ -26,5 +26,6 @@ interface l4m {
 
     tokenize: func(text:string) -> list<u32>;
     detokenize: func(tokens:list<u32>) -> string;
+    get-vocabs: func() -> list<list<u8>>;
 
 }

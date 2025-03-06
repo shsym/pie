@@ -241,6 +241,10 @@ impl BytePairEncoder {
         let allowed_special = self.special_tokens();
         self.encode(text, &allowed_special)
     }
+
+    pub fn get_vocabs(&self) -> Vec<Vec<u8>> {
+        self.sorted_token_bytes.clone()
+    }
 }
 
 fn load_merge_rules(path: &str) -> Result<HashMap<Vec<u8>, Rank>, Box<dyn std::error::Error>> {

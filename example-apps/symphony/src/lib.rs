@@ -1,4 +1,7 @@
 mod context;
+pub mod sampler;
+pub mod stop_condition;
+
 pub use context::Context;
 
 pub mod bindings {

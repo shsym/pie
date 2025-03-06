@@ -582,6 +582,11 @@ impl spi::app::l4m::Host for InstanceState {
         let text = self.l4m_driver_utils.tokenizer.decode(tokens.as_slice())?;
         Ok(text)
     }
+
+    async fn get_vocabs(&mut self) -> Result<Vec<Vec<u8>>, wasmtime::Error> {
+        let vocabs = self.l4m_driver_utils.tokenizer.get_vocabs();
+        Ok(vocabs)
+    }
 }
 
 impl spi::app::l4m_vision::Host for InstanceState {
