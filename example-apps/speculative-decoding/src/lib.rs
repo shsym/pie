@@ -1,54 +1,84 @@
 use std::time::Instant;
-use symphony::{RunSync, l4m};
+use symphony::{RunSync, l4m, sampler, stop_condition};
 
 use std::collections::HashMap;
-use std::{mem, slice};
+use std::{mem};
 use symphony::sampler::Sampler;
 use symphony::stop_condition::StopCondition;
 
-use std::collections::VecDeque;
-
-pub struct FixedSizeQueue<T> {
-    queue: VecDeque<T>,
-    max_size: usize,
+pub struct FixedSizeQueue<T, const N: usize> {
+    buf: [T; N],
+    head: usize, // index of the oldest element
+    len: usize,  // number of valid elements in the queue
 }
 
-impl<T> FixedSizeQueue<T> {
-    pub fn new(max_size: usize) -> Self {
+impl<T: Default, const N: usize> FixedSizeQueue<T, N> {
+    /// Creates an empty queue.
+    pub fn new() -> Self {
         Self {
-            queue: VecDeque::with_capacity(max_size),
-            max_size,
+            // Initialize the buffer with T::default()
+            buf: std::array::from_fn(|_| T::default()),
+            head: 0,
+            len: 0,
         }
     }
 
+    /// Pushes an item onto the queue.
+    /// If the queue is full, it overwrites the oldest item.
+    pub fn push(&mut self, item: T) {
+        if self.len == N {
+            // Overwrite the oldest element at head and move head forward.
+            self.buf[self.head] = item;
+            self.head = (self.head + 1) % N;
+        } else {
+            // Place the new item at the tail.
+            let tail = (self.head + self.len) % N;
+            self.buf[tail] = item;
+            self.len += 1;
+        }
+    }
+
+    /// Removes and returns the oldest item in the queue.
+    pub fn pop_front(&mut self) -> Option<T> {
+        if self.len == 0 {
+            None
+        } else {
+            // Replace the element at head with the default value.
+            let item = std::mem::take(&mut self.buf[self.head]);
+            self.head = (self.head + 1) % N;
+            self.len -= 1;
+            Some(item)
+        }
+    }
+
+    /// Extends the queue with items from an iterator.
+    ///
+    /// - If the iterator yields at least N items, only the last N items are kept.
+    /// - Otherwise, enough items are removed from the front so that after pushing the new items,
+    ///   the total number of elements does not exceed N.
     pub fn extend(&mut self, items: impl ExactSizeIterator<Item = T>) {
         let count = items.len();
-        if count >= self.max_size {
-            // When there are at least `max_size` items,
-            // skip the first ones and collect only the last `max_size` items.
-            self.queue = items.skip(count - self.max_size).collect();
+        if count >= N {
+            // There are at least N new items.
+            // Skip the first count - N items so that only the last N are used.
+            let mut iter = items.skip(count - N);
+            for i in 0..N {
+                // It is safe to unwrap since we expect exactly N items.
+                self.buf[i] = iter.next().unwrap();
+            }
+            self.head = 0;
+            self.len = N;
         } else {
-            // Calculate how many items to remove so that the new total doesn't exceed max_size.
-            let to_remove = (self.queue.len() + count).saturating_sub(self.max_size);
-            // Remove them in bulk.
-            self.queue.drain(0..to_remove);
-            self.queue.extend(items);
+            // Remove as many items as needed so that len + count does not exceed N.
+            let to_remove = (self.len + count).saturating_sub(N);
+            for _ in 0..to_remove {
+                self.pop_front();
+            }
+            // Now push the new items.
+            for item in items {
+                self.push(item);
+            }
         }
-    }
-
-    pub fn push(&mut self, item: T) {
-        if self.queue.len() == self.max_size {
-            self.queue.pop_front();
-        }
-        self.queue.push_back(item);
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.queue.iter()
-    }
-
-    pub fn as_slice(&self) -> &[T] {
-        self.queue.as_slices().0
     }
 }
 
@@ -109,9 +139,6 @@ impl<T: Copy + PartialEq, const CAP: usize> LruCache<T, CAP> {
 /// A cable table (cache) that maps a fixed-size array of previous tokens to an LRU cache
 /// of next token sequences. The sizes of the token arrays and the LRU capacity are known at compile time.
 pub struct CacheTable<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> {
-    n_prev: usize,
-    n_next: usize,
-    cache_size: usize,
     table: HashMap<[u32; N_PREV], LruCache<[u32; N_NEXT], CACHE_SIZE>>,
 }
 
@@ -121,9 +148,6 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize>
     /// Creates a new cache table.
     pub fn new() -> Self {
         Self {
-            n_prev: N_PREV,
-            n_next: N_NEXT,
-            cache_size: CACHE_SIZE,
             table: HashMap::new(),
         }
     }
@@ -135,9 +159,25 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize>
             .map_or(false, |lru| lru.is_hit(next_tokens))
     }
 
+    pub fn update(&mut self, tokens: &[u32]) {
+        // Take a window of (N_PREV + N_NEXT) tokens from the start of the sequence, shifting by 1 token each time.
+        // Then update the cache with the previous N_PREV tokens and the next N_NEXT tokens.
+        let window_size = N_PREV + N_NEXT;
+        if tokens.len() < window_size {
+            return;
+        }
+        // Slide over the tokens one at a time
+        for window in tokens.windows(window_size) {
+            // Convert slices into fixed-size arrays
+            let prev_tokens: [u32; N_PREV] = window[..N_PREV].try_into().unwrap();
+            let next_tokens: [u32; N_NEXT] = window[N_PREV..].try_into().unwrap();
+            self.update_entry(prev_tokens, next_tokens);
+        }
+    }
+
     /// Updates the cache for the given `prev_tokens` key with the `next_tokens` sequence.
     /// This moves the entry to the front (most-recent) and enforces the cache size limit.
-    pub fn update(&mut self, prev_tokens: [u32; N_PREV], next_tokens: [u32; N_NEXT]) {
+    pub fn update_entry(&mut self, prev_tokens: [u32; N_PREV], next_tokens: [u32; N_NEXT]) {
         self.table
             .entry(prev_tokens)
             .or_insert_with(LruCache::new)
@@ -150,12 +190,14 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize>
     }
 }
 
-struct SpeculativeContext<'a, const N_PREV: usize> {
-    cache_table: CacheTable<2, 1, 16>,
+struct SpeculativeContext<'a, const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> {
+    cache_table: CacheTable<N_PREV, N_NEXT, CACHE_SIZE>,
     context: symphony::Context<'a>,
 }
 
-impl<'a, const N_PREV: usize> SpeculativeContext<'a, N_PREV> {
+impl<'a, const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize>
+    SpeculativeContext<'a, N_PREV, N_NEXT, CACHE_SIZE>
+{
     pub fn new() -> Self {
         Self {
             cache_table: CacheTable::new(),
@@ -164,7 +206,9 @@ impl<'a, const N_PREV: usize> SpeculativeContext<'a, N_PREV> {
     }
 
     pub fn fill(&mut self, text: &str) {
-        self.context.fill(text);
+        let token_ids = l4m::tokenize(text);
+        self.cache_table.update(&token_ids);
+        self.context.fill_tokens(token_ids);
     }
 
     pub fn speculate(&mut self, ctx: &[u32; N_PREV], max_trie_size: usize) -> (Vec<u32>, Vec<u32>) {
@@ -173,7 +217,7 @@ impl<'a, const N_PREV: usize> SpeculativeContext<'a, N_PREV> {
         let mut spec_token_ids = Vec::new();
         let mut spec_pos_ids = Vec::new();
 
-        if let Some(cache) = self.cache_table.table.get(&ctx) {
+        if let Some(cache) = self.cache_table.table.get(ctx) {
             for item in cache.items {
                 if let Some(item) = item {
                     spec_token_ids.extend(item);
@@ -188,6 +232,17 @@ impl<'a, const N_PREV: usize> SpeculativeContext<'a, N_PREV> {
         }
 
         (spec_token_ids, spec_pos_ids)
+    }
+
+    pub fn generate_until(&mut self, stop_str: &str, max_tokens: usize) -> String {
+        let mut sampler = sampler::GreedySampler::new();
+
+        let mut stop_condition = stop_condition::any(
+            stop_condition::Until::new(stop_str),
+            stop_condition::Length::new(max_tokens),
+        );
+
+        self.generate(&mut sampler, &mut stop_condition)
     }
 
     // This overrides the generate method in the symphony::Context struct
@@ -224,18 +279,17 @@ impl<'a, const N_PREV: usize> SpeculativeContext<'a, N_PREV> {
         let mut processing_position_ids: Vec<u32> =
             (pos_offset as u32..(pos_offset + processed_token_ids.len()) as u32).collect();
 
-        let mut spec_ctx = FixedSizeQueue::new(self.cache_table.n_prev);
-
-        spec_ctx.extend(&self.context.processed_token_ids);
+        let mut spec_ctx = FixedSizeQueue::<u32, N_PREV>::new();
+        spec_ctx.extend(self.context.processed_token_ids.iter().copied());
 
         loop {
             // come up with the speculations
             let max_trie_size =
                 block_size - (processed_token_ids.len() + processing_token_ids.len());
 
-            spec_ctx.extend(&processing_token_ids);
+            spec_ctx.extend(processing_token_ids.iter().copied());
 
-            let (spec_token_ids, spec_pos_ids) = self.speculate(spec_ctx.as_slice(), max_trie_size);
+            let (spec_token_ids, spec_pos_ids) = self.speculate(&spec_ctx.buf, max_trie_size);
 
             let combined_token_ids =
                 [processing_token_ids.as_slice(), spec_token_ids.as_slice()].concat();
@@ -353,6 +407,13 @@ impl<'a, const N_PREV: usize> SpeculativeContext<'a, N_PREV> {
 
             generated_token_ids.extend(&sampled_next_token_ids);
 
+            // update the cache
+            self.cache_table.update(
+                &generated_token_ids[generated_token_ids
+                    .len()
+                    .saturating_sub(N_PREV + N_NEXT + 1)..],
+            );
+
             // if this was the last block,
             if processed_token_ids.len() + processing_token_ids.len() == block_size {
                 // get the new working block
@@ -413,8 +474,9 @@ impl RunSync for SpeculativeDecoding {
         let start = Instant::now();
 
         // TODO: Prepopulate the cache table with some entries
+        let max_num_outputs = 128;
 
-        let mut ctx = SpeculativeContext::new();
+        let mut ctx = SpeculativeContext::<1, 1, 16>::new();
         ctx.fill("<|begin_of_text|>");
         ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
         ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>");
