@@ -1,5 +1,5 @@
 [package]
-name = "simple-decoding"
+name = "speculative-decoding"
 version = "0.1.0"
 edition = "2024"
 
