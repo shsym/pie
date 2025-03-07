@@ -4,6 +4,8 @@ pub mod stop_condition;
 
 pub use context::Context;
 
+pub use tokio;
+
 pub mod bindings {
 
     wit_bindgen::generate!({

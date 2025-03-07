@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
 async fn dummy_client() -> anyhow::Result<()> {
     // Adjust path as needed:
     let wasm_path =
-        PathBuf::from("../example-apps/target/wasm32-wasip2/release/constrained_decoding.wasm");
+        PathBuf::from("../example-apps/target/wasm32-wasip2/release/parallel_generation.wasm");
     let server_uri = "ws://127.0.0.1:9000";
 
     // 1) Create and connect the client

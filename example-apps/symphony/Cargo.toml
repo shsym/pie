@@ -7,4 +7,3 @@ edition = "2021"
 wit-bindgen.workspace = true
 tokio = { version = "1", features = ["rt"] }
 trait-variant = "0.1.2"
-thiserror = "2.0.12"
