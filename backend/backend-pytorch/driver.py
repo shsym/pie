@@ -27,7 +27,7 @@ class TextEmbed:
 @dataclass
 class ImageEmbed:
     vec_id: int
-    position_id: (int, int)
+    position_id: tuple[int, int]
 
 
 @dataclass
@@ -290,20 +290,20 @@ class Driver:
             input_embeds[token_map["row"], token_map["col"]].copy_(self.embed_storage.ptr[vec_id], non_blocking=True)
 
         # compute the position embeddings
-        cos, sin = self.lm.rotary_emb(input_embeds, pt_new_position_ids.max().item() + 1)
+        rope_cache = self.lm.rotary_emb(input_embeds, pt_new_position_ids.max().item() + 1)
 
-        position_embeds = (cos[pt_new_position_ids].unsqueeze(1), sin[pt_new_position_ids].unsqueeze(1))
-
-        logits = self.lm.model.forward(
-            input_embeds=input_embeds,
-            kv_ptr=self.block_storage.ptr,
-            new_q_lut=pt_new_q_lut,
-            new_kv_lut=pt_new_kv_lut,
-            all_kv_lut=pt_all_kv_lut,
-            mask=pt_masks,
-            cmd_groups=pt_reduce_grps,
-            rope_cache=position_embeds
-        )
+        with torch.cuda.device(self.device()):
+            logits = self.lm.model.forward(
+                input_embeds=input_embeds,
+                kv_ptr=self.block_storage.ptr,
+                new_q_lut=pt_new_q_lut,
+                new_kv_lut=pt_new_kv_lut,
+                all_kv_lut=pt_all_kv_lut,
+                mask=pt_masks,
+                cmd_groups=pt_reduce_grps,
+                rope_cache=rope_cache,
+                pos_ids=pt_new_position_ids,
+            )
         # print(logits.shape)
         # store the logits in the output embeds  -> replace with torch.scatter later
         for token_map in output_embed_postproc:

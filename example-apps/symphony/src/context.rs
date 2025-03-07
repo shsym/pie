@@ -15,8 +15,7 @@ pub struct Context<'a> {
     pub stream: u32,
     pub occupied_block_ids: Vec<u32>,
     pub free_block_ids: Vec<u32>,
-    pub pending_token_ids: Vec<u32>,
-    pub processed_token_ids: Vec<u32>,
+    pub leftover_token_ids: Vec<u32>,
 }
 
 impl<'a> Context<'a> {
@@ -28,8 +27,7 @@ impl<'a> Context<'a> {
             stream,
             occupied_block_ids: Vec::new(),
             free_block_ids: Vec::new(),
-            pending_token_ids: Vec::new(),
-            processed_token_ids: Vec::new(),
+            leftover_token_ids: Vec::new(),
         }
     }
 
@@ -45,8 +43,7 @@ impl<'a> Context<'a> {
             stream,
             occupied_block_ids: Vec::new(),
             free_block_ids,
-            pending_token_ids: Vec::new(),
-            processed_token_ids: Vec::new(),
+            leftover_token_ids: Vec::new(),
         }
     }
 
@@ -66,30 +63,25 @@ impl<'a> Context<'a> {
 
         self.occupied_block_ids.clear();
         self.free_block_ids.clear();
-        self.pending_token_ids.clear();
+        self.leftover_token_ids.clear();
     }
 
     pub fn fill(&mut self, text: &str) {
-        let new_token_ids = l4m::tokenize(&text);
-
-        self.fill_tokens(new_token_ids);
-    }
-
-    pub fn fill_tokens(&mut self, new_token_ids: Vec<u32>) {
         let block_size = l4m::get_block_size() as usize;
 
         // tokenize the text
 
         let token_ids = {
-            self.pending_token_ids.extend(new_token_ids);
+            let new_token_ids = l4m::tokenize(&text);
+            self.leftover_token_ids.extend(new_token_ids);
 
             // there should be at least one leftover token for generation.
-            if self.pending_token_ids.len() < block_size + 1 {
+            if self.leftover_token_ids.len() < block_size + 1 {
                 return;
             }
 
-            let drain_amount = (self.pending_token_ids.len() / block_size) * block_size;
-            self.pending_token_ids
+            let drain_amount = (self.leftover_token_ids.len() / block_size) * block_size;
+            self.leftover_token_ids
                 .drain(..drain_amount)
                 .collect::<Vec<u32>>()
         };
@@ -136,8 +128,6 @@ impl<'a> Context<'a> {
 
         // Free embeds
         l4m::deallocate_embeds(self.stream, &embed_ids);
-
-        self.processed_token_ids.extend(token_ids);
     }
 
     pub fn generate_until(&mut self, stop_str: &str, max_tokens: usize) -> String {
@@ -160,7 +150,7 @@ impl<'a> Context<'a> {
 
         let block_size = l4m::get_block_size() as usize;
         // the seed must not be empty
-        assert!(!self.pending_token_ids.is_empty());
+        assert!(!self.leftover_token_ids.is_empty());
 
         // initialize the working block
         // ensure we have enough blocks
@@ -171,7 +161,7 @@ impl<'a> Context<'a> {
         let mut working_block_id = self.free_block_ids.pop().unwrap();
         self.occupied_block_ids.push(working_block_id);
 
-        let mut working_token_ids = mem::take(&mut self.pending_token_ids);
+        let mut working_token_ids = mem::take(&mut self.leftover_token_ids);
         let mut working_position_ids: Vec<u32> =
             (pos_offset as u32..(pos_offset + working_token_ids.len()) as u32).collect();
 
@@ -232,7 +222,6 @@ impl<'a> Context<'a> {
 
                 working_block_id = self.free_block_ids.pop().unwrap();
                 self.occupied_block_ids.push(working_block_id);
-                self.processed_token_ids.extend(&working_token_ids);
 
                 working_position_ids.clear();
                 working_token_ids.clear();
@@ -264,8 +253,8 @@ impl<'a> Context<'a> {
         self.free_block_ids
             .push(self.occupied_block_ids.pop().unwrap());
 
-        self.pending_token_ids.clear();
-        self.pending_token_ids.append(&mut working_token_ids);
+        self.leftover_token_ids.clear();
+        self.leftover_token_ids.append(&mut working_token_ids);
 
         // decode the generated tokens
         let result = l4m::detokenize(&generated_token_ids);
@@ -279,8 +268,7 @@ impl<'a> Context<'a> {
             stream: get_unique_stream(),
             occupied_block_ids: Vec::new(),
             free_block_ids: Vec::new(),
-            pending_token_ids: self.pending_token_ids.clone(),
-            processed_token_ids: self.processed_token_ids.clone(),
+            leftover_token_ids: self.leftover_token_ids.clone(),
         }
     }
 

@@ -52,8 +52,8 @@ class L4maAttention(nn.Module):
             all_kv_lut: torch.Tensor,  # All KV LUT
             mask: torch.Tensor,  # Attention mask
             cmd_groups: torch.Tensor,  # Command groups
-            rope_cache: tuple[torch.Tensor, torch.Tensor],  # Cos and Sin cache
-
+            rope_cache: torch.Tensor, # Cos and Sin cache
+            pos_ids: torch.Tensor, # Position IDs
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -65,9 +65,8 @@ class L4maAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = rope_cache
-
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        ops.rope_scatter_gather_(rope_cache, query_states, pos_ids)
+        ops.rope_scatter_gather_(rope_cache, key_states, pos_ids)
 
         ops.fill_kv_block_storage(kv_ptr[self.layer_idx], key_states, value_states, new_kv_lut)
 
@@ -107,7 +106,8 @@ class L4maDecoderLayer(nn.Module):
             all_kv_lut: torch.Tensor,  # All KV LUT
             mask: torch.Tensor,  # Attention mask
             cmd_groups: torch.Tensor,  # Command groups
-            rope_cache: tuple[torch.Tensor, torch.Tensor]
+            rope_cache: torch.Tensor,
+            pos_ids: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -123,6 +123,7 @@ class L4maDecoderLayer(nn.Module):
             mask=mask,
             cmd_groups=cmd_groups,
             rope_cache=rope_cache,
+            pos_ids=pos_ids,
         )
 
         hidden_states = residual + hidden_states
@@ -159,7 +160,8 @@ class L4maModel(nn.Module):
             all_kv_lut: torch.Tensor,  # All KV LUT
             mask: torch.Tensor,  # Attention mask
             cmd_groups: torch.Tensor,  # Command groups
-            rope_cache: tuple[torch.Tensor, torch.Tensor]
+            rope_cache: torch.Tensor,
+            pos_ids: torch.Tensor,
     ) -> torch.Tensor:
         # attention_mask = proc_mask(attention_mask, batch.dtype())
         hidden_states = input_embeds
@@ -173,7 +175,8 @@ class L4maModel(nn.Module):
                 all_kv_lut=all_kv_lut,
                 mask=mask,
                 cmd_groups=cmd_groups,
-                rope_cache=rope_cache
+                rope_cache=rope_cache,
+                pos_ids=pos_ids,
             )
 
             hidden_states = layer_outputs
@@ -284,20 +287,19 @@ class L4maRotaryEmbedding(nn.Module):
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=torch.float)
 
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().float(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().float(), persistent=False)
+        cos = freqs.cos().float()
+        sin = freqs.sin().float()
+        cache = torch.cat((cos, sin), dim=-1)
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device)
 
-        return (
-            self.cos_cached[:seq_len, ...].to(x.dtype),
-            self.sin_cached[:seq_len, ...].to(x.dtype),
-        )
+        return self.cos_sin_cache.to(x.dtype)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
