@@ -30,6 +30,7 @@ use crate::client::Client;
 use crate::runtime::Runtime;
 use std::fs;
 use std::time::Duration;
+use tokio::time::timeout;
 
 /// Directory for cached programs
 const PROGRAM_CACHE_DIR: &str = "./program_cache";
@@ -51,22 +52,34 @@ async fn main() -> anyhow::Result<()> {
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
 
     // 6) Spawn the controller loop (which manages commands coming from instances)
-    let backend_l4m = SimulatedBackend::new(driver_l4m::Simulator {}).await;
-    let backend_ping = SimulatedBackend::new(driver_ping::Simulator {}).await;
+    //let backend_l4m = SimulatedBackend::new(driver_l4m::Simulator {}).await;
+    //let backend_ping = SimulatedBackend::new(driver_ping::Simulator {}).await;
 
-    // let backend_l4m = ZmqBackend::bind("tcp://gimlab.org:8888", driver_l4m::PROTOCOL)
-    //     .await
-    //     .context("Failed to bind backend")?;
-    // 
-    // let backend_ping = ZmqBackend::bind("tcp://gimlab.org:8888", driver_ping::PROTOCOL)
-    //     .await
-    //     .context("Failed to bind backend")?;
+    let backend_l4m = ZmqBackend::bind("tcp://gimlab.org:8888", driver_l4m::PROTOCOL)
+        .await
+        .context("Failed to bind backend")?;
+
+    let backend_ping = ZmqBackend::bind("tcp://gimlab.org:8888", driver_ping::PROTOCOL)
+        .await
+        .context("Failed to bind backend")?;
 
     let mut controller = Controller::new(runtime.clone(), backend_l4m, backend_ping).await;
 
     let controller_handle = tokio::spawn(async move {
-        while let Some((inst_id, cmd)) = inst2server_rx.recv().await {
-            controller.submit(inst_id, cmd).await;
+        loop {
+            match timeout(Duration::from_micros(50), inst2server_rx.recv()).await {
+                // A command arrived within 20ms:
+                Ok(Some((inst_id, cmd))) => {
+                    controller.handle_command(inst_id, cmd).await;
+                    controller.submit().await;
+                }
+                // The channel closed:
+                Ok(None) => break,
+                // No command received within 20ms; time to call submit:
+                Err(_) => {
+                    controller.submit().await;
+                }
+            }
         }
     });
 
@@ -95,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
 async fn dummy_client() -> anyhow::Result<()> {
     // Adjust path as needed:
     let wasm_path =
-        PathBuf::from("../example-apps/target/wasm32-wasip2/release/parallel_generation.wasm");
+        PathBuf::from("../example-apps/target/wasm32-wasip2/release/simple_decoding.wasm");
     let server_uri = "ws://127.0.0.1:9000";
 
     // 1) Create and connect the client

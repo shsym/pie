@@ -67,12 +67,19 @@ where
         }
     }
 
-    pub async fn submit(
+    pub async fn submit(&mut self) -> Result<(), ControllerError> {
+        self.driver_l4m
+            .submit(Instant::now())
+            .await
+            .map_err(|e| ControllerError::DriverError(format!("Submit failed: {}", e)))
+    }
+
+    pub async fn handle_command(
         &mut self,
         inst_id: instance::Id,
         cmd: Command,
     ) -> Result<(), ControllerError> {
-        if let Err(e) = self.update(inst_id, cmd).await {
+        if let Err(e) = self.try_handle_command(inst_id, cmd).await {
             //eprintln!("Controller error: {:?}", e);
 
             let inst = self
@@ -82,17 +89,15 @@ where
                 .ok_or(ControllerError::InstanceNotFound(inst_id))?;
 
             inst.evt_from_system.send(e.to_string()).await;
-        } else {
-            self.driver_l4m
-                .submit(Instant::now())
-                .await
-                .map_err(|e| ControllerError::DriverError(format!("Submit failed: {}", e)))?;
         }
-
         Ok(())
     }
 
-    async fn update(&mut self, inst_id: instance::Id, cmd: Command) -> Result<(), ControllerError> {
+    async fn try_handle_command(
+        &mut self,
+        inst_id: instance::Id,
+        cmd: Command,
+    ) -> Result<(), ControllerError> {
         match cmd {
             Command::CreateInstance { handle } => {
                 let space = self
@@ -290,7 +295,7 @@ where
                         ControllerError::DriverError(format!("CopyBlock failed: {}", e))
                     })?;
             }
-           
+
             Command::MaskBlock {
                 stream,
                 block,

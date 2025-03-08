@@ -8,8 +8,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::Stream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 static STREAM: AtomicU32 = AtomicU32::new(0);
 
@@ -292,6 +292,8 @@ impl Inner {
         let mut working_block_id = self.free_block_ids.pop().unwrap();
         self.occupied_block_ids.push(working_block_id);
 
+        //println!("block_size: {}", block_size);
+
         // L4M objects
         let input_block_embeds = l4m::allocate_embeds(self.stream, block_size as u32);
         let output_block_embeds = l4m::allocate_embeds(self.stream, block_size as u32);
@@ -328,6 +330,7 @@ impl Inner {
 
             let combined_token_ids =
                 [processing_token_ids.as_slice(), spec_token_ids.as_slice()].concat();
+
             let combined_position_ids = {
                 let mut res = processing_position_ids.clone();
                 let offset = processing_position_ids.last().unwrap();
@@ -336,13 +339,13 @@ impl Inner {
                 res
             };
 
-            let offset_prev = processed_token_ids.len() - 1;
+            let offset_prev = processed_token_ids.len();
             let offset_last_token = processing_token_ids.len() - 1;
             let valid_len = combined_token_ids.len();
 
             l4m::embed_text(
                 self.stream,
-                &input_block_embeds[offset_prev..=offset_prev + valid_len],
+                &input_block_embeds[offset_prev..offset_prev + valid_len],
                 &combined_token_ids,
                 &combined_position_ids,
             );
@@ -358,20 +361,26 @@ impl Inner {
                 self.stream,
                 working_block_id,
                 &ctx_block_ids,
-                &input_block_embeds[..=offset_prev + valid_len],
-                &output_block_embeds[..=offset_prev + valid_len],
+                &input_block_embeds[..offset_prev + valid_len],
+                &output_block_embeds[..offset_prev + valid_len],
             );
+            // println!(
+            //     "input_block_embeds: {:?}",
+            //     &input_block_embeds[..offset_prev + valid_len]
+            // );
+            // println!("processed_token_ids: {:?}", &processed_token_ids);
+            // println!("processing_token_ids: {:?}", &processing_token_ids);
 
             // let's sample the next token
             l4m::decode_token_dist(
                 self.stream,
-                &output_block_embeds[offset_prev + offset_last_token..=offset_prev + valid_len],
-                &next_dists[offset_prev + offset_last_token..=offset_prev + valid_len],
+                &output_block_embeds[offset_prev + offset_last_token..offset_prev + valid_len],
+                &next_dists[offset_prev + offset_last_token..offset_prev + valid_len],
             );
 
             let sampled = l4m_async::sample_top_k(
                 self.stream,
-                next_dists[offset_prev + offset_last_token..=offset_prev + valid_len].to_vec(),
+                next_dists[offset_prev + offset_last_token..offset_prev + valid_len].to_vec(),
                 32,
             )
             .await;
@@ -434,11 +443,7 @@ impl Inner {
                 }
             }
 
-            let next_position_id = if processed_token_ids.is_empty() {
-                processing_position_ids.last().unwrap()
-            } else {
-                processed_position_ids.last().unwrap()
-            } + 1;
+            let next_position_id = processing_position_ids.last().unwrap() + 1;
 
             generated_token_ids.extend(&sampled_next_token_ids);
 
@@ -448,7 +453,7 @@ impl Inner {
                     stream.send(*next_token_id).unwrap();
                 }
             }
-
+            //println!("all len: {}, {}", processed_token_ids.len(), processing_token_ids.len());
             // if this was the last block,
             if processed_token_ids.len() + processing_token_ids.len() == block_size {
                 // get the new working block
@@ -461,14 +466,18 @@ impl Inner {
                 self.processed_token_ids.extend(&processed_token_ids);
                 processed_position_ids.clear();
                 processed_token_ids.clear();
+            } else {
+                processed_token_ids.append(&mut processing_token_ids);
+                processed_position_ids.append(&mut processing_position_ids);
             }
 
-            processed_token_ids.append(&mut processing_token_ids);
-            processed_position_ids.append(&mut processing_position_ids);
+            processing_token_ids.clear();
+            processing_position_ids.clear();
 
             processing_token_ids.append(&mut sampled_next_token_ids);
-            processing_position_ids
-                .extend(next_position_id..(next_position_id + sampled_next_token_ids.len() as u32));
+            processing_position_ids.extend(
+                next_position_id..=(next_position_id + sampled_next_token_ids.len() as u32),
+            );
 
             // check if
             if stop_condition.should_stop(&generated_token_ids) {

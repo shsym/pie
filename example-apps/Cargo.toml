@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["constrained-decoding",
-    "helloworld", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "symphony", "parallel-generation"]
+members = ["helloworld", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "symphony", "parallel-generation"]
+
+
 
 [workspace.dependencies]
-wit-bindgen = "0.39.0"
+wit-bindgen = "0.40.0"
 
 [profile.release]
 lto = true

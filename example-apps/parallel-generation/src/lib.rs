@@ -9,7 +9,7 @@ impl Run for ParallelGeneration {
     async fn run() -> Result<(), String> {
         let start = Instant::now();
 
-        let max_num_outputs = 128;
+        let max_num_outputs = 32;
 
         let mut common = symphony::Context::new();
         common.fill("<|begin_of_text|>").await;
@@ -18,7 +18,10 @@ impl Run for ParallelGeneration {
         // tokio spawn
         let mut ctx1 = common.fork().await;
         let handle1 = async move {
-            ctx1.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>").await;
+            ctx1.fill(
+                "<|start_header_id|>user<|end_header_id|>\n\nExplain Pulmonary Embolism<|eot_id|>",
+            )
+            .await;
             ctx1.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
                 .await;
 

@@ -5,6 +5,6 @@ edition = "2024"
 
 [dependencies]
 wit-bindgen.workspace = true
-tokio = { version = "1.44.0", features = ["rt", "sync", "macros"] }
+tokio = { version = "1.44.0", features = ["rt", "sync", "macros", "io-util", "time"] }
 trait-variant = "0.1.2"
 tokio-stream = "0.1.17"
