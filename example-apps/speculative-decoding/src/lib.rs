@@ -1,10 +1,84 @@
 use std::time::Instant;
-use symphony::{RunSync, l4m};
+use symphony::{Context, Run, sampler, stop_condition};
 
 use std::collections::HashMap;
-use std::{mem, slice};
-use symphony::sampler::Sampler;
-use symphony::stop_condition::StopCondition;
+use symphony::drafter::Drafter;
+
+pub struct FixedSizeQueue<T, const N: usize> {
+    buf: [T; N],
+    head: usize, // index of the oldest element
+    len: usize,  // number of valid elements in the queue
+}
+
+impl<T: Default, const N: usize> FixedSizeQueue<T, N> {
+    /// Creates an empty queue.
+    pub fn new() -> Self {
+        Self {
+            // Initialize the buffer with T::default()
+            buf: std::array::from_fn(|_| T::default()),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    /// Pushes an item onto the queue.
+    /// If the queue is full, it overwrites the oldest item.
+    pub fn push(&mut self, item: T) {
+        if self.len == N {
+            // Overwrite the oldest element at head and move head forward.
+            self.buf[self.head] = item;
+            self.head = (self.head + 1) % N;
+        } else {
+            // Place the new item at the tail.
+            let tail = (self.head + self.len) % N;
+            self.buf[tail] = item;
+            self.len += 1;
+        }
+    }
+
+    /// Removes and returns the oldest item in the queue.
+    pub fn pop_front(&mut self) -> Option<T> {
+        if self.len == 0 {
+            None
+        } else {
+            // Replace the element at head with the default value.
+            let item = std::mem::take(&mut self.buf[self.head]);
+            self.head = (self.head + 1) % N;
+            self.len -= 1;
+            Some(item)
+        }
+    }
+
+    /// Extends the queue with items from an iterator.
+    ///
+    /// - If the iterator yields at least N items, only the last N items are kept.
+    /// - Otherwise, enough items are removed from the front so that after pushing the new items,
+    ///   the total number of elements does not exceed N.
+    pub fn extend(&mut self, items: impl ExactSizeIterator<Item = T>) {
+        let count = items.len();
+        if count >= N {
+            // There are at least N new items.
+            // Skip the first count - N items so that only the last N are used.
+            let mut iter = items.skip(count - N);
+            for i in 0..N {
+                // It is safe to unwrap since we expect exactly N items.
+                self.buf[i] = iter.next().unwrap();
+            }
+            self.head = 0;
+            self.len = N;
+        } else {
+            // Remove as many items as needed so that len + count does not exceed N.
+            let to_remove = (self.len + count).saturating_sub(N);
+            for _ in 0..to_remove {
+                self.pop_front();
+            }
+            // Now push the new items.
+            for item in items {
+                self.push(item);
+            }
+        }
+    }
+}
 
 /// A simple fixed-size LRU cache implemented using a fixed-size array.
 /// It stores items of type `T` (which must be Copy and comparable) and
@@ -62,17 +136,19 @@ impl<T: Copy + PartialEq, const CAP: usize> LruCache<T, CAP> {
 
 /// A cable table (cache) that maps a fixed-size array of previous tokens to an LRU cache
 /// of next token sequences. The sizes of the token arrays and the LRU capacity are known at compile time.
-pub struct CacheTable<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> {
+pub struct CacheDrafter<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> {
     table: HashMap<[u32; N_PREV], LruCache<[u32; N_NEXT], CACHE_SIZE>>,
+    curr: [u32; N_PREV],
 }
 
 impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize>
-    CacheTable<N_PREV, N_NEXT, CACHE_SIZE>
+    CacheDrafter<N_PREV, N_NEXT, CACHE_SIZE>
 {
     /// Creates a new cache table.
     pub fn new() -> Self {
         Self {
             table: HashMap::new(),
+            curr: [0; N_PREV],
         }
     }
 
@@ -85,7 +161,7 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize>
 
     /// Updates the cache for the given `prev_tokens` key with the `next_tokens` sequence.
     /// This moves the entry to the front (most-recent) and enforces the cache size limit.
-    pub fn update(&mut self, prev_tokens: [u32; N_PREV], next_tokens: [u32; N_NEXT]) {
+    pub fn update_cache(&mut self, prev_tokens: [u32; N_PREV], next_tokens: [u32; N_NEXT]) {
         self.table
             .entry(prev_tokens)
             .or_insert_with(LruCache::new)
@@ -98,146 +174,54 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize>
     }
 }
 
-struct SpeculativeContext<'a> {
-    cache_table: CacheTable<2, 1, 2>,
-    context: symphony::Context<'a>,
-}
+impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> Drafter
+    for CacheDrafter<N_PREV, N_NEXT, CACHE_SIZE>
+{
+    fn update(&mut self, context: &[u32]) {
+        // Update the pointer to the last N_PREV tokens of the context.
 
-impl<'a> SpeculativeContext<'a> {
-    pub fn new() -> Self {
-        Self {
-            cache_table: CacheTable::new(),
-            context: symphony::Context::new(),
+        if context.len() >= N_PREV {
+            let start = context.len().saturating_sub(N_PREV);
+            for i in 0..N_PREV {
+                self.curr[i] = context[start + i];
+            }
+        }
+
+        // Take a window of (N_PREV + N_NEXT) tokens from the start of the sequence, shifting by 1 token each time.
+        // Then update the cache with the previous N_PREV tokens and the next N_NEXT tokens.
+        let window_size = N_PREV + N_NEXT;
+        if context.len() >= window_size {
+            // Slide over the tokens one at a time
+            for window in context.windows(window_size) {
+                // Convert slices into fixed-size arrays
+                let prev_tokens: [u32; N_PREV] = window[..N_PREV].try_into().unwrap();
+                let next_tokens: [u32; N_NEXT] = window[N_PREV..].try_into().unwrap();
+                self.update_cache(prev_tokens, next_tokens);
+            }
         }
     }
 
-    pub fn fill(&mut self, text: &str) {
-        self.context.fill(text);
-    }
+    fn draft(&mut self, max_tokens: usize) -> (Vec<u32>, Vec<u32>) {
+        // build a speculation Trie. (https://en.wikipedia.org/wiki/Trie)
+        // Rn, its just a single level Trie.
+        let mut spec_token_ids = Vec::new();
+        let mut spec_pos_ids = Vec::new();
 
-    // This overrides the generate method in the symphony::Context struct
-    pub fn generate<S: Sampler, C: StopCondition>(
-        &mut self,
-        sampler: &mut S,
-        stop_condition: &mut C,
-    ) -> String {
-        //let until_token_ids = l4m::tokenize(until);
-
-        let block_size = l4m::get_block_size() as usize;
-        // the seed must not be empty
-        assert!(!self.context.leftover_token_ids.is_empty());
-
-        // initialize the working block
-        // ensure we have enough blocks
-        if self.context.free_block_ids.is_empty() {
-            self.context.grow(block_size);
-        }
-        let pos_offset = self.context.occupied_block_ids.len() * block_size;
-        let mut working_block_id = self.context.free_block_ids.pop().unwrap();
-        self.context.occupied_block_ids.push(working_block_id);
-
-        let mut working_token_ids = mem::take(&mut self.context.leftover_token_ids);
-        let mut working_position_ids: Vec<u32> =
-            (pos_offset as u32..(pos_offset + working_token_ids.len()) as u32).collect();
-
-        let input_block_embeds = l4m::allocate_embeds(self.context.stream, block_size as u32);
-        let output_block_embeds = l4m::allocate_embeds(self.context.stream, block_size as u32);
-        let next_dist = l4m::allocate_dists(self.context.stream, 1)[0];
-
-        // put the remaining tokens into the last block
-        l4m::embed_text(
-            self.context.stream,
-            &input_block_embeds[..working_token_ids.len()],
-            &working_token_ids,
-            &working_position_ids,
-        );
-
-        let mut generated_token_ids = Vec::new();
-        let parent_occupied_block_ids = self.context.get_parent_occupied_block_ids();
-
-        loop {
-            let ctx_block_ids = [
-                parent_occupied_block_ids.as_slice(),
-                self.context.occupied_block_ids.as_slice(),
-            ]
-            .concat();
-
-            l4m::fill_block(
-                self.context.stream,
-                working_block_id,
-                &ctx_block_ids,
-                &input_block_embeds[..working_token_ids.len()],
-                &output_block_embeds[..working_token_ids.len()],
-            );
-
-            // let's sample the next token
-            l4m::decode_token_dist(
-                self.context.stream,
-                slice::from_ref(&output_block_embeds[working_token_ids.len() - 1]),
-                slice::from_ref(&next_dist),
-            );
-
-            let sampled = l4m::sample_top_k(self.context.stream, slice::from_ref(&next_dist), 32);
-
-            let (next_token_ids, next_token_logits) = &sampled[0];
-
-            let next_token_id = sampler.sample(next_token_ids, &next_token_logits);
-
-            //let next_token_id = next_token_ids[0];
-            let next_position_id = working_position_ids.last().unwrap() + 1;
-
-            generated_token_ids.push(next_token_id);
-
-            // if this was the last block,
-            if working_token_ids.len() == block_size {
-                // get the new working block
-                if self.context.free_block_ids.is_empty() {
-                    self.context.grow(block_size);
+        if let Some(cache) = self.table.get(&self.curr) {
+            for item in cache.items {
+                if let Some(item) = item {
+                    spec_token_ids.extend(item);
+                    spec_pos_ids.extend(1..=item.len() as u32);
                 }
-
-                working_block_id = self.context.free_block_ids.pop().unwrap();
-                self.context.occupied_block_ids.push(working_block_id);
-
-                working_position_ids.clear();
-                working_token_ids.clear();
             }
-
-            working_token_ids.push(next_token_id);
-            working_position_ids.push(next_position_id);
-
-            // check if
-            if stop_condition.should_stop(&generated_token_ids) {
-                break;
-            }
-
-            // embed the next token
-            l4m::embed_text(
-                self.context.stream,
-                slice::from_ref(&input_block_embeds[working_token_ids.len() - 1]),
-                &[next_token_id],
-                slice::from_ref(&working_position_ids[working_token_ids.len() - 1]),
-            );
         }
 
-        // free the resources
-        l4m::deallocate_embeds(self.context.stream, &input_block_embeds);
-        l4m::deallocate_embeds(self.context.stream, &output_block_embeds);
-        l4m::deallocate_dists(self.context.stream, &[next_dist]);
+        if spec_token_ids.len() >= max_tokens {
+            spec_token_ids.truncate(max_tokens);
+            spec_pos_ids.truncate(max_tokens);
+        }
 
-        // pop the last block
-        self.context
-            .free_block_ids
-            .push(self.context.occupied_block_ids.pop().unwrap());
-
-        self.context.leftover_token_ids.clear();
-        self.context
-            .leftover_token_ids
-            .append(&mut working_token_ids);
-
-        // decode the generated tokens
-        let result = l4m::detokenize(&generated_token_ids);
-
-        result
+        (spec_token_ids, spec_pos_ids)
     }
 }
 
@@ -245,24 +229,36 @@ struct SpeculativeDecoding;
 
 // create a default stream constant
 
-impl RunSync for SpeculativeDecoding {
-    fn run() -> Result<(), String> {
+impl Run for SpeculativeDecoding {
+    async fn run() -> Result<(), String> {
         let start = Instant::now();
 
         // TODO: Prepopulate the cache table with some entries
+        let max_num_outputs = 128;
 
-        let mut ctx = SpeculativeContext::new();
-        ctx.fill("<|begin_of_text|>");
-        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
-        ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>");
-        ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        let mut ctx = Context::new();
+        ctx.fill("<|begin_of_text|>").await;
+        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
+        ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>").await;
+        ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
+            .await;
 
-        let output_text = ctx.generate_until("<|eot_id|>", max_num_outputs);
+        let mut drafter = CacheDrafter::<1, 1, 16>::new();
+        let mut sampler = sampler::GreedySampler::new();
 
-        println!("Output: {:?} (elapsed: {:?})", output_text, start.elapsed());
+        let mut stop_condition = stop_condition::any(
+            stop_condition::Until::new("<|eot_id|>"),
+            stop_condition::Length::new(max_num_outputs),
+        );
+
+        let output = ctx
+            .generate(&mut drafter, &mut sampler, &mut stop_condition, None)
+            .await;
+
+        println!("elapsed: {:?}", start.elapsed());
 
         Ok(())
     }
 }
 
-symphony::main_sync!(SpeculativeDecoding);
+symphony::main!(SpeculativeDecoding);

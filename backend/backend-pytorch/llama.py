@@ -9,8 +9,6 @@ class LlamaForCausalLM(PreTrainedModel):
     config_class = LlamaConfig
 
     def __init__(self, config):
-        print(config)
-        
         config.use_qkv_bias = False
 
         super().__init__(config)

@@ -72,24 +72,27 @@ def rope_kernel_scatter_gather(
     x_ptr,
     # Shape: (batch_size, block_size)
     rope_idxs_ptr,
-    x_stride_bch, x_stride_hd,
+    rope_table_stride_pos,
+    x_stride_bch, x_stride_hd, x_stride_blk,
+    rope_idx_stride_bch,
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
 
-    rope_idx_ptr = rope_idxs_ptr + batch_idx * BLOCK_SIZE
-    x_ptr = x_ptr + batch_idx * x_stride_bch + head_idx * x_stride_hd
-
+    
     # Triton will likely unroll and pipeline the operations in the loop body
-    for _ in tl.static_range(BLOCK_SIZE):
+    for idx_in_blk in tl.static_range(BLOCK_SIZE):
+        cur_x_ptr = x_ptr + batch_idx * x_stride_bch + head_idx * x_stride_hd + idx_in_blk * x_stride_blk
+        rope_idx_ptr = rope_idxs_ptr + batch_idx * rope_idx_stride_bch + idx_in_blk
+
         rope_idx = tl.load(rope_idx_ptr)
-        cache_block_ptr = rope_table_ptr + rope_idx * HEAD_DIM
+        cache_block_ptr = rope_table_ptr + rope_idx * rope_table_stride_pos
         cos = tl.load(cache_block_ptr + tl.arange(0, HEAD_DIM // 2))
         sin = tl.load(cache_block_ptr + HEAD_DIM // 2 + tl.arange(0, HEAD_DIM // 2))
 
-        x1_ptr = x_ptr + tl.arange(0, HEAD_DIM // 2)
+        x1_ptr = cur_x_ptr + tl.arange(0, HEAD_DIM // 2)
         x2_ptr = x1_ptr + HEAD_DIM // 2
 
         x1 = tl.load(x1_ptr)
@@ -100,9 +103,6 @@ def rope_kernel_scatter_gather(
         
         tl.store(x1_ptr, x1_rotated)
         tl.store(x2_ptr, x2_rotated)
-
-        rope_idx_ptr += 1
-        x_ptr += HEAD_DIM
 
 
 @triton.jit
@@ -329,13 +329,19 @@ def rope_scatter_gather_(
     assert batch_size == batch_size_
     assert block_size == block_size_
 
+    # The last dimension must have stride 1 to satisfy the assumptions of
+    # the kernel.
+    assert rope_table.stride(-1) == x.stride(-1) == rope_idxs.stride(-1) == 1
+
     grid = (batch_size, num_head)
 
     rope_kernel_scatter_gather[grid](
         rope_table,
         x,
         rope_idxs,
-        x.stride(0), x.stride(1),
+        rope_table.stride(0),
+        x.stride(0), x.stride(1), x.stride(2),
+        rope_idxs.stride(0),
         block_size, head_dim,
     )
 

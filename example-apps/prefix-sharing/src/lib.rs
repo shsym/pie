@@ -1,30 +1,34 @@
 use std::time::Instant;
-use symphony::RunSync;
+use symphony::Run;
 
 struct PrefixSharing;
 
 // create a default stream constant
 
-impl RunSync for PrefixSharing {
-    fn run() -> Result<(), String> {
+impl Run for PrefixSharing {
+    async fn run() -> Result<(), String> {
         let start = Instant::now();
 
         let max_num_outputs = 128;
 
         let mut ctx = symphony::Context::new();
-        ctx.fill("<|begin_of_text|>");
-        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
+        ctx.fill("<|begin_of_text|>").await;
+        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
 
-        let mut ctx_sub1 = ctx.fork();
-        let mut ctx_sub2 = ctx.fork();
+        let mut ctx_sub1 = ctx.fork().await;
+        let mut ctx_sub2 = ctx.fork().await;
 
-        ctx_sub1.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>");
-        ctx_sub1.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        ctx_sub1.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>").await;
+        ctx_sub1
+            .fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
+            .await;
 
-        ctx_sub2.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the Espresso making process ELI5.<|eot_id|>");
-        ctx_sub2.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        ctx_sub2.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the Espresso making process ELI5.<|eot_id|>").await;
+        ctx_sub2
+            .fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
+            .await;
 
-        let output_text1 = ctx_sub1.generate_until("<|eot_id|>", max_num_outputs);
+        let output_text1 = ctx_sub1.generate_until("<|eot_id|>", max_num_outputs).await;
 
         println!(
             "Output: {:?} (elapsed: {:?})",
@@ -32,7 +36,7 @@ impl RunSync for PrefixSharing {
             start.elapsed()
         );
 
-        let output_text2 = ctx_sub2.generate_until("<|eot_id|>", max_num_outputs);
+        let output_text2 = ctx_sub2.generate_until("<|eot_id|>", max_num_outputs).await;
 
         println!(
             "Output: {:?} (elapsed: {:?})",
@@ -44,4 +48,4 @@ impl RunSync for PrefixSharing {
     }
 }
 
-symphony::main_sync!(PrefixSharing);
+symphony::main!(PrefixSharing);

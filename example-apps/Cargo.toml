@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["constrained-decoding",
-    "helloworld", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "symphony"]
+    "helloworld", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "symphony", "parallel-generation"]
 
 [workspace.dependencies]
 wit-bindgen = "0.39.0"

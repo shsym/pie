@@ -6,8 +6,9 @@ use llguidance::{
 };
 use std::sync::Arc;
 use std::time::Instant;
-use symphony::RunSync;
+use symphony::drafter::Empty;
 use symphony::sampler::Sampler;
+use symphony::{Run, l4m};
 
 struct ConstrainedDecoding;
 
@@ -107,13 +108,13 @@ impl ConstrainedSampler {
         unk_token: Option<&str>,
         end_of_turn_token: Option<&str>,
     ) -> Self {
-        let words = symphony::l4m::get_vocabs();
+        let words = l4m::get_vocabs();
 
-        let eos_token = symphony::l4m::tokenize(eos_token)[0];
-        let bos_token = bos_token.map(|s| symphony::l4m::tokenize(s)[0]);
-        let pad_token = pad_token.map(|s| symphony::l4m::tokenize(s)[0]);
-        let unk_token = unk_token.map(|s| symphony::l4m::tokenize(s)[0]);
-        let end_of_turn_token = end_of_turn_token.map(|s| symphony::l4m::tokenize(s)[0]);
+        let eos_token = l4m::tokenize(eos_token)[0];
+        let bos_token = bos_token.map(|s| l4m::tokenize(s)[0]);
+        let pad_token = pad_token.map(|s| l4m::tokenize(s)[0]);
+        let unk_token = unk_token.map(|s| l4m::tokenize(s)[0]);
+        let end_of_turn_token = end_of_turn_token.map(|s| l4m::tokenize(s)[0]);
 
         let tokenizer = TrieTokenizer::new(
             &words,
@@ -181,10 +182,11 @@ impl Sampler for ConstrainedSampler {
     }
 }
 
-impl RunSync for ConstrainedDecoding {
-    fn run() -> Result<(), String> {
+impl Run for ConstrainedDecoding {
+    async fn run() -> Result<(), String> {
         let start = Instant::now();
 
+        let mut drafter = Empty {};
         let mut sampler = ConstrainedSampler::new(
             JSON_GRAMMAR,
             "<|end_of_text|>",
@@ -200,14 +202,18 @@ impl RunSync for ConstrainedDecoding {
         );
 
         let mut ctx = symphony::Context::new();
-        ctx.fill("<|begin_of_text|>");
-        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
+        ctx.fill("<|begin_of_text|>").await;
+        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
         ctx.fill(
             "<|start_header_id|>user<|end_header_id|>\n\n Generate some random json data<|eot_id|>",
-        );
-        ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        )
+        .await;
+        ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
+            .await;
 
-        let output_text = ctx.generate(&mut sampler, &mut stop_condition);
+        let output_text = ctx
+            .generate(&mut drafter, &mut sampler, &mut stop_condition, None)
+            .await;
 
         println!("Output: {:?} (elapsed: {:?})", output_text, start.elapsed());
 
@@ -215,4 +221,4 @@ impl RunSync for ConstrainedDecoding {
     }
 }
 
-symphony::main_sync!(ConstrainedDecoding);
+symphony::main!(ConstrainedDecoding);
