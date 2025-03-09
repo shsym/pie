@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     let backend_l4m = ZmqBackend::bind("tcp://gimlab.org:8888", driver_l4m::PROTOCOL)
         .await
         .context("Failed to bind backend")?;
-
+    
     let backend_ping = ZmqBackend::bind("tcp://gimlab.org:8888", driver_ping::PROTOCOL)
         .await
         .context("Failed to bind backend")?;
@@ -70,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
             match timeout(Duration::from_micros(50), inst2server_rx.recv()).await {
                 // A command arrived within 20ms:
                 Ok(Some((inst_id, cmd))) => {
+                    //println!("Received command: {:?}", cmd);
+
                     controller.handle_command(inst_id, cmd).await;
                     controller.submit().await;
                 }

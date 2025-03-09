@@ -157,7 +157,7 @@ where
 
         let driver = Self {
             cmd_buffer: Vec::new(),
-            cmd_batcher: CommandBatcher::new(Duration::from_millis(5), 8, 100), // CommandBatcher::eager(), //
+            cmd_batcher: CommandBatcher::eager(), // CommandBatcher::new(Duration::from_millis(5), 8, 100), //
             cmd_id_pool: utils::IdPool::new(u32::MAX),
             backend: b,
             obj_id_pool: IdPool::new(info.block_size, info.num_embeddings, info.num_distributions),

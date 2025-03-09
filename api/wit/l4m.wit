@@ -1,5 +1,7 @@
 interface l4m {
 
+    use wasi:io/poll@0.2.4.{pollable};
+
     get-block-size: func() -> u32;
 
     allocate-blocks: func(stream-id:u32, count:u32) -> list<u32>;
@@ -22,10 +24,18 @@ interface l4m {
     deallocate-dists: func(stream-id:u32, ids: list<u32>);
 
     decode-token-dist: func(stream-id:u32, embs:list<u32>, dist:list<u32>);
-    sample-top-k: func(stream-id:u32, embs:list<u32>, k:u32) -> list<tuple<list<u32>, list<f32>>>;
+
+    sample-top-k: func(stream-id:u32, embs:list<u32>, k:u32) -> sample-top-k-result;
+    resource sample-top-k-result {
+        subscribe: func() -> pollable;
+        get: func() -> option<list<tuple<list<u32>, list<f32>>>>; // None if not ready
+    }
 
     tokenize: func(text:string) -> list<u32>;
     detokenize: func(tokens:list<u32>) -> string;
     get-vocabs: func() -> list<list<u8>>;
+
+
+    echo: func(text:string) -> pollable;
 
 }

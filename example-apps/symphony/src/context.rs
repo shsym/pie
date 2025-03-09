@@ -6,10 +6,6 @@ use std::cell::RefCell;
 use std::mem;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio_stream::Stream;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 static STREAM: AtomicU32 = AtomicU32::new(0);
 
@@ -87,57 +83,57 @@ impl Context {
             stop_condition::Length::new(max_tokens),
         );
 
-        self.generate(&mut drafter, &mut sampler, &mut stop_condition, None)
+        self.generate(&mut drafter, &mut sampler, &mut stop_condition)
             .await
     }
-
-    pub async fn generate_stream_until(
-        &mut self,
-        stop_str: &str,
-        max_tokens: usize,
-    ) -> impl Stream<Item = u32> {
-        let drafter = drafter::Empty {};
-        let sampler = sampler::GreedySampler::new();
-
-        let stop_condition = stop_condition::any(
-            stop_condition::Until::new(&stop_str),
-            stop_condition::Length::new(max_tokens),
-        );
-
-        self.generate_stream(drafter, sampler, stop_condition).await
-    }
-
-    async fn generate_stream<D, S, C>(
-        &mut self,
-        mut drafter: D,
-        mut sampler: S,
-        mut stop_condition: C,
-    ) -> impl Stream<Item = u32>
-    where
-        D: Drafter + 'static,
-        S: Sampler + 'static,
-        C: StopCondition + 'static,
-    {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut self_cloned = self.clone();
-        tokio::task::spawn_local(async move {
-            self_cloned
-                .generate(&mut drafter, &mut sampler, &mut stop_condition, Some(tx))
-                .await;
-        });
-        UnboundedReceiverStream::new(rx)
-    }
+    //
+    // pub async fn generate_stream_until(
+    //     &mut self,
+    //     stop_str: &str,
+    //     max_tokens: usize,
+    // ) -> impl Stream<Item = u32> {
+    //     let drafter = drafter::Empty {};
+    //     let sampler = sampler::GreedySampler::new();
+    //
+    //     let stop_condition = stop_condition::any(
+    //         stop_condition::Until::new(&stop_str),
+    //         stop_condition::Length::new(max_tokens),
+    //     );
+    //
+    //     self.generate_stream(drafter, sampler, stop_condition).await
+    // }
+    //
+    // async fn generate_stream<D, S, C>(
+    //     &mut self,
+    //     mut drafter: D,
+    //     mut sampler: S,
+    //     mut stop_condition: C,
+    // ) -> impl Stream<Item = u32>
+    // where
+    //     D: Drafter + 'static,
+    //     S: Sampler + 'static,
+    //     C: StopCondition + 'static,
+    // {
+    //     let (tx, rx) = mpsc::unbounded_channel();
+    //     let mut self_cloned = self.clone();
+    //     tokio::task::spawn_local(async move {
+    //         self_cloned
+    //             .generate(&mut drafter, &mut sampler, &mut stop_condition, Some(tx))
+    //             .await;
+    //     });
+    //     UnboundedReceiverStream::new(rx)
+    // }
 
     pub async fn generate<D: Drafter, S: Sampler, C: StopCondition>(
         &mut self,
         drafter: &mut D,
         sampler: &mut S,
         stop_condition: &mut C,
-        stream: Option<UnboundedSender<u32>>,
+        //stream: Option<UnboundedSender<u32>>,
     ) -> String {
         self.inner
             .borrow_mut()
-            .generate(drafter, sampler, stop_condition, stream)
+            .generate(drafter, sampler, stop_condition)
             .await
     }
 }
@@ -199,8 +195,7 @@ impl Inner {
 
     pub async fn fill(&mut self, text: &str) {
         // to satisfy the borrow checker
-        let text_str = text.to_string();
-        let new_token_ids = l4m_async::tokenize(text_str).await;
+        let new_token_ids = l4m::tokenize(text);
 
         self.fill_tokens(new_token_ids).await;
     }
@@ -274,7 +269,7 @@ impl Inner {
         drafter: &mut D,
         sampler: &mut S,
         stop_condition: &mut C,
-        stream: Option<UnboundedSender<u32>>,
+        //stream: Option<UnboundedSender<u32>>,
     ) -> String {
         //let until_token_ids = l4m::tokenize(until);
 
@@ -448,11 +443,11 @@ impl Inner {
             generated_token_ids.extend(&sampled_next_token_ids);
 
             // if the stream is not None, send the token id to the stream
-            if let Some(stream) = stream.as_ref() {
-                for next_token_id in &sampled_next_token_ids {
-                    stream.send(*next_token_id).unwrap();
-                }
-            }
+            // if let Some(stream) = stream.as_ref() {
+            //     for next_token_id in &sampled_next_token_ids {
+            //         stream.send(*next_token_id).unwrap();
+            //     }
+            // }
             //println!("all len: {}, {}", processed_token_ids.len(), processing_token_ids.len());
             // if this was the last block,
             if processed_token_ids.len() + processing_token_ids.len() == block_size {
@@ -567,7 +562,7 @@ impl Inner {
         self.pending_token_ids.append(&mut processing_token_ids);
 
         // decode the generated tokens
-        let result = l4m_async::detokenize(generated_token_ids).await;
+        let result = l4m::detokenize(&generated_token_ids);
 
         result
     }

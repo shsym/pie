@@ -1,24 +1,36 @@
-use std::sync::Arc;
-use wasmtime::Result;
-use wasmtime::component::{ResourceTable, bindgen};
-use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
-
+use crate::instance::spi::app::l4m::HostSampleTopKResult;
 use crate::tokenizer::BytePairEncoder;
+use crate::utils::IdPool;
 use crate::{driver_l4m, lm, object};
+use dashmap::DashMap;
+use std::fmt::Debug;
+use std::mem;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use tokio::sync::oneshot;
 use uuid::Uuid;
+use wasmtime::Result;
+use wasmtime::component::{Resource, ResourceTable, bindgen};
+use wasmtime_wasi::{
+    DynPollable, IoView, Pollable, WasiCtx, WasiCtxBuilder, WasiView, async_trait, bindings,
+    subscribe,
+};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+//use wasmtime_wasi_io::poll::{};
 
 bindgen!({
     path: "../api/wit",
     world: "app",
     async: true,
-    // with: {
-    //     "spi:lm/inference/language-model": LanguageModel,
-    //     "spi:lm/inference/token-distribution": TokenDistribution,
-    //     "spi:lm/kvcache/token": CachedToken,
-    //     "spi:lm/kvcache/token-list": CachedTokenList,
-    // },
+    with: {
+        "wasi:io/poll": wasmtime_wasi::bindings::io::poll,
+        "spi:app/l4m/sample-top-k-result": SampleTopKResult,
+        //"spi:app/l4m/echo-result": EchoResult,
+        // "spi:lm/inference/token-distribution": TokenDistribution,
+        // "spi:lm/kvcache/token": CachedToken,
+        // "spi:lm/kvcache/token-list": CachedTokenList,
+    },
     // Interactions with `ResourceTable` can possibly trap so enable the ability
     // to return traps from generated functions.
     trappable_imports: true,
@@ -31,6 +43,7 @@ pub struct InstanceState {
 
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
+    http_ctx: WasiHttpCtx,
 
     cmd_buffer: UnboundedSender<(Id, Command)>,
 
@@ -41,6 +54,14 @@ pub struct InstanceState {
     allocator: driver_l4m::IdPool,
 
     l4m_driver_utils: Arc<driver_l4m::Utils>,
+
+    resource_ids: IdPool<ResourceId>,
+    ready_resources: Arc<ReadyResources>,
+}
+
+type ResourceId = u32;
+pub struct ReadyResources {
+    sample_top_k: DashMap<ResourceId, Vec<(Vec<u32>, Vec<f32>)>>,
 }
 
 // implements send
@@ -185,6 +206,12 @@ impl WasiView for InstanceState {
     }
 }
 
+impl WasiHttpView for InstanceState {
+    fn ctx(&mut self) -> &mut WasiHttpCtx {
+        &mut self.http_ctx
+    }
+}
+
 impl InstanceState {
     pub async fn new(
         id: Uuid,
@@ -206,12 +233,17 @@ impl InstanceState {
             id,
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
+            http_ctx: WasiHttpCtx::new(),
             cmd_buffer,
             evt_from_system,
             evt_from_origin,
             evt_from_peers,
             allocator: driver_l4m::IdPool::new(1000, 1000, 1000),
             l4m_driver_utils,
+            resource_ids: IdPool::new(u32::MAX),
+            ready_resources: Arc::new(ReadyResources {
+                sample_top_k: DashMap::new(),
+            }),
         }
     }
 }
@@ -291,6 +323,50 @@ impl spi::app::ping::Host for InstanceState {
         Ok(result)
     }
 }
+
+impl HostSampleTopKResult for InstanceState {
+    async fn subscribe(
+        &mut self,
+        this: Resource<SampleTopKResult>,
+    ) -> Result<Resource<DynPollable>> {
+        subscribe(self.table(), this)
+    }
+
+    async fn get(
+        &mut self,
+        this: Resource<SampleTopKResult>,
+    ) -> Result<Option<Vec<(Vec<u32>, Vec<f32>)>>> {
+        let r = self.table().get_mut(&this)?;
+
+        if r.done {
+            Ok(Some(r.results.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn drop(&mut self, this: Resource<SampleTopKResult>) -> Result<()> {
+        //println!("dropped");
+        let _ = self.table().delete(this)?;
+        Ok(())
+    }
+}
+
+// impl HostEchoResult for InstanceState {
+//     async fn subscribe(&mut self, this: Resource<Deadline>) -> Result<Resource<DynPollable>> {
+//         subscribe(self.table(), this)
+//     }
+//
+//     async fn get(&mut self, this: Resource<Deadline>) -> Result<String> {
+//         let r = self.table().get_mut(&this)?;
+//         Ok(r.value.clone())
+//     }
+//
+//     async fn drop(&mut self, this: Resource<Deadline>) -> Result<()> {
+//         let _ = self.table().delete(this)?;
+//         Ok(())
+//     }
+// }
 
 impl spi::app::l4m::Host for InstanceState {
     async fn get_block_size(&mut self) -> Result<u32, wasmtime::Error> {
@@ -536,7 +612,7 @@ impl spi::app::l4m::Host for InstanceState {
         stream: u32,
         embs: Vec<object::IdRepr>,
         k: u32,
-    ) -> Result<Vec<(Vec<u32>, Vec<f32>)>, wasmtime::Error> {
+    ) -> Result<Resource<SampleTopKResult>, wasmtime::Error> {
         // create a vector of oneshot channels
         //let start = std::time::Instant::now();
 
@@ -545,7 +621,6 @@ impl spi::app::l4m::Host for InstanceState {
             let (tx, rx) = oneshot::channel();
 
             receivers.push(rx);
-
             let cmd = Command::SampleTopK {
                 stream,
                 dist: object::Id::new(embs[i]),
@@ -556,19 +631,27 @@ impl spi::app::l4m::Host for InstanceState {
             self.cmd_buffer.send((self.id, cmd));
         }
 
-        let mut results = Vec::with_capacity(embs.len());
-        for rx in receivers {
-            let result = rx
-                .await
-                .or(Err(wasmtime::Error::msg("SampleTopK failed")))?;
-            results.push(result);
-        }
+        let top_k_result = SampleTopKResult {
+            receivers,
+            results: Vec::new(),
+            done: false,
+        };
 
-        // let duration = start.elapsed();
-        // println!("SampleTopK took: {:?}", duration);
-
-        Ok(results)
+        let res = self.table().push(top_k_result)?;
+        Ok(res)
     }
+
+    // async fn sample_top_k_value(
+    //     &mut self,
+    //     handle: u32,
+    // ) -> Result<Option<Vec<(Vec<u32>, Vec<f32>)>>, wasmtime::Error> {
+    //     if let Some((handle, res)) = self.ready_resources.sample_top_k.remove(&handle) {
+    //         self.resource_ids.release(handle);
+    //         Ok(Some(res))
+    //     } else {
+    //         Ok(None)
+    //     }
+    // }
 
     async fn tokenize(&mut self, text: String) -> Result<Vec<u32>, wasmtime::Error> {
         let tokens = self
@@ -586,6 +669,15 @@ impl spi::app::l4m::Host for InstanceState {
     async fn get_vocabs(&mut self) -> Result<Vec<Vec<u8>>, wasmtime::Error> {
         let vocabs = self.l4m_driver_utils.tokenizer.get_vocabs();
         Ok(vocabs)
+    }
+    async fn echo(&mut self, value: String) -> Result<Resource<DynPollable>> {
+        let ddl = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(3))
+            .unwrap();
+
+        let deadline = Deadline { done: false };
+        let sleep = self.table().push(deadline)?;
+        subscribe(self.table(), sleep)
     }
 }
 
@@ -616,3 +708,144 @@ impl spi::app::l4m_vision::Host for InstanceState {
         todo!()
     }
 }
+
+pub struct SampleTopKResult {
+    receivers: Vec<oneshot::Receiver<(Vec<u32>, Vec<f32>)>>,
+    results: Vec<(Vec<u32>, Vec<f32>)>,
+    done: bool,
+}
+
+#[async_trait]
+impl Pollable for SampleTopKResult {
+    async fn ready(&mut self) {
+        // if results are already computed, return
+        if self.done {
+            return;
+        }
+
+        //println!("SampleTopKResult Polling");
+        for rx in &mut self.receivers {
+            let result = rx.await.unwrap();
+            self.results.push(result);
+        }
+        self.done = true;
+    }
+}
+
+struct Deadline {
+    done: bool,
+}
+
+#[async_trait::async_trait]
+impl Pollable for Deadline {
+    async fn ready(&mut self) {
+        if self.done {
+            return;
+        }
+
+        let start = std::time::Instant::now();
+
+        // sleep for 1 sec
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // match self {
+        //     Deadline::Past => {}
+        //     Deadline::Instant(instant) => tokio::time::sleep_until(*instant).await,
+        //     Deadline::Never => std::future::pending().await,
+        // }
+
+        let duration = start.elapsed();
+        self.done = true;
+        println!("Deadline took: {:?}", duration);
+    }
+}
+
+//
+// impl HostPollable for InstanceState {
+//     async fn ready(&mut self, self_: Resource<DynPollable>) -> Result<bool> {
+//         todo!()
+//     }
+//
+//     async fn block(&mut self, self_: Resource<DynPollable>) -> Result<()> {
+//         todo!()
+//     }
+//
+//     fn drop(&mut self, rep: Resource<DynPollable>) -> Result<()> {
+//         todo!()
+//     }
+// }
+//
+// impl poll::Host for InstanceState {
+//     async fn poll(&mut self, in_: Vec<Resource<DynPollable>>) -> Result<Vec<u32>> {
+//         todo!()
+//     }
+// }
+
+/////
+//
+// struct Listener<T, F> {
+//     receiver: oneshot::Receiver<T>,
+//     on_data: F,
+// }
+// impl<T, F> Listener<T, F>
+// where
+//     T: Debug + Clone + Send + Sync + 'static,
+//     F: Fn(T) + Send + Sync + 'static,
+// {
+//     fn new(receiver: oneshot::Receiver<T>, on_data: F) -> Self {
+//         Listener { receiver, on_data }
+//     }
+// }
+//
+// #[async_trait]
+// impl<T, F> Pollable for Listener<T, F>
+// where
+//     T: Debug + Clone + Send + Sync + 'static,
+//     F: Fn(T) + Send + Sync + 'static,
+// {
+//     async fn ready(&mut self) {
+//         let result = (&mut self.receiver).await.unwrap();
+//
+//         (self.on_data)(result);
+//     }
+// }
+//
+// struct MultiListener<T, F> {
+//     receivers: Vec<oneshot::Receiver<T>>,
+//     on_data: F,
+//     ss: u32,
+// }
+// impl<T, F> MultiListener<T, F>
+// where
+//     T: Debug + Clone + Send + Sync + 'static,
+//     F: Fn(Vec<T>) + Send + Sync + 'static,
+// {
+//     fn new(receivers: Vec<oneshot::Receiver<T>>, on_data: F) -> Self {
+//         MultiListener {
+//             receivers,
+//             on_data,
+//             ss: 0,
+//         }
+//     }
+// }
+//
+// #[async_trait]
+// impl<T, F> Pollable for MultiListener<T, F>
+// where
+//     T: Debug + Clone + Send + Sync + 'static,
+//     F: Fn(Vec<T>) + Send + Sync + 'static,
+// {
+//     async fn ready(&mut self) {
+//         self.ss += 1;
+//         println!("Pollin!!!!!!!! {:?}", self.ss);
+//
+//         let results = futures::future::join_all(&mut self.receivers)
+//             .await
+//             .into_iter()
+//             .map(|result| result.unwrap())
+//             .collect::<Vec<_>>();
+//
+//         println!("Done {:?}", results);
+//         (self.on_data)(results);
+//     }
+// }

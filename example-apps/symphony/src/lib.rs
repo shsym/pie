@@ -1,20 +1,20 @@
 mod context;
 pub mod drafter;
-mod l4m_async;
+pub mod l4m_async;
 pub mod sampler;
 pub mod stop_condition;
 
 pub use context::Context;
-
-pub use tokio;
-
+pub use wstd;
 pub mod bindings {
-
     wit_bindgen::generate!({
         path: "../../api/wit",
         world: "app",
         pub_export_macro: true,
         export_macro_name: "export",
+        with: {
+             "wasi:io/poll@0.2.4": wasi::io::poll,
+        },
         generate_all,
     });
 }
@@ -38,13 +38,15 @@ where
     T: Run,
 {
     fn run() -> Result<(), String> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let result = wstd::runtime::block_on(async { T::run().await });
 
-        let local = tokio::task::LocalSet::new();
-        let result = local.block_on(&runtime, T::run());
+        // let runtime = tokio::runtime::Builder::new_current_thread()
+        //     .enable_all()
+        //     .build()
+        //     .unwrap();
+        //
+        // let local = tokio::task::LocalSet::new();
+        // let result = local.block_on(&runtime, T::run());
         // Run the async main function inside the runtime
         //let result = runtime.block_on(T::run());
 

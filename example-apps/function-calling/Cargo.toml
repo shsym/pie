@@ -1,5 +1,5 @@
 [package]
-name = "helloworld"
+name = "function-calling"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,4 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 symphony = { path = "../symphony" }
-wasi = "0.14.2+wasi-0.2.4"
+anyhow = "1.0.95"

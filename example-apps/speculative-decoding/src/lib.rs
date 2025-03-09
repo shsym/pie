@@ -252,10 +252,10 @@ impl Run for SpeculativeDecoding {
         );
 
         let output = ctx
-            .generate(&mut drafter, &mut sampler, &mut stop_condition, None)
+            .generate(&mut drafter, &mut sampler, &mut stop_condition)
             .await;
 
-        println!("elapsed: {:?}", start.elapsed());
+        println!("Out {:?}, elapsed: {:?}", output, start.elapsed());
 
         Ok(())
     }

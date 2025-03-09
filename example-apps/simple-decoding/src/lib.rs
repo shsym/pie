@@ -1,4 +1,3 @@
-use futures::stream::StreamExt;
 use std::time::Instant;
 use symphony::Run;
 
@@ -18,23 +17,15 @@ impl Run for SimpleDecoding {
         ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
             .await;
 
-        let mut output_stream = ctx
-            .generate_stream_until("<|eot_id|>", max_num_outputs)
-            .await;
-
-        let mut token_ids = Vec::new();
-        while let Some(token_id) = output_stream.next().await {
-            //let now = Instant::now();
-            //let token_latency = now.duration_since(prev);
-            //println!("Token: {} (latency: {:?})", token_id, token_latency);
-            //prev = now;
-            token_ids.push(token_id);
-        }
-        let text = symphony::l4m::detokenize(&token_ids);
+        let text = ctx.generate_until("<|eot_id|>", max_num_outputs).await;
+        let token_ids = symphony::l4m::tokenize(&text);
         println!("Output: {:?} (total elapsed: {:?})", text, start.elapsed());
-        
+
         // compute per token latency
-        println!("Per token latency: {:?}", start.elapsed() / token_ids.len() as u32);
+        println!(
+            "Per token latency: {:?}",
+            start.elapsed() / token_ids.len() as u32
+        );
 
         Ok(())
     }
