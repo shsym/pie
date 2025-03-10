@@ -4,7 +4,7 @@ pub mod l4m_async;
 pub mod sampler;
 pub mod stop_condition;
 
-pub use context::Context;
+pub use context::{Context, Model};
 pub use wstd;
 pub mod bindings {
     wit_bindgen::generate!({
@@ -23,6 +23,10 @@ pub use crate::bindings::{
     export, exports::spi::app::run::Guest as RunSync, spi::app::l4m, spi::app::l4m_vision,
     spi::app::ping, spi::app::system,
 };
+
+pub fn available_models() -> Vec<String> {
+    Model::available_models()
+}
 
 #[trait_variant::make(LocalRun: Send)]
 pub trait Run {

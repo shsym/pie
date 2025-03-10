@@ -43,6 +43,22 @@ impl Model {
             inner: Rc::new(RefCell::new(Inner::new(self.model.clone()))),
         }
     }
+
+    pub fn tokenize(&self, text: &str) -> Vec<u32> {
+        self.model.tokenize(text)
+    }
+
+    pub fn detokenize(&self, token_ids: &[u32]) -> String {
+        self.model.detokenize(token_ids)
+    }
+
+    pub fn get_vocabs(&self) -> Vec<Vec<u8>> {
+        self.model.get_vocabs()
+    }
+
+    pub fn get_block_size(&self) -> usize {
+        self.model.get_block_size() as usize
+    }
 }
 
 impl Context {

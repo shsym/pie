@@ -196,12 +196,16 @@ impl Run for ConstrainedDecoding {
             Some("<|eot_id|>"),
         );
 
+        let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
+
+
         let mut stop_condition = symphony::stop_condition::any(
-            symphony::stop_condition::Until::new("<|eot_id|>"),
+            symphony::stop_condition::Until::new(model.tokenize("<|eot_id|>")),
             symphony::stop_condition::Length::new(128),
         );
 
-        let mut ctx = symphony::Context::new();
+
+        let mut ctx = model.create_context();
         ctx.fill("<|begin_of_text|>").await;
         ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
         ctx.fill(
