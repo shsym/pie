@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["helloworld", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "symphony", "parallel-generation", "function-calling"]
+members = ["helloworld", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "symphony", "parallel-generation", "function-calling", "multimodal"]
 
 
 

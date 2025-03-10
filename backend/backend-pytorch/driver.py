@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass
 from typing import Union
 
@@ -12,7 +13,6 @@ from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlo
     ObjectKind, SampleTopKResponse, BatchFillBlock
 
 from l4m_vision_pb2 import BatchEmbedImage
-from ping_pb2 import Ping, Pong
 from config import FULL_MODEL_NAME, NUM_TOKENS_IN_BLOCK
 
 tokenizer = AutoTokenizer.from_pretrained(FULL_MODEL_NAME)
@@ -145,6 +145,8 @@ class Driver:
         #     print(cmd.context_block_ids)
         #     print(cmd.input_embedding_ids)
         #     print(cmd.output_embedding_ids)
+
+        start_time = time.time()
 
         num_blocks_per_req = [len(cmd.context_block_ids) for cmd in cmds.items]
         NUM_BLOCKS_IN_CHUNK = int(np.median(num_blocks_per_req))
@@ -292,6 +294,13 @@ class Driver:
         # compute the position embeddings
         rope_cache = self.lm.rotary_emb(input_embeds, pt_new_position_ids.max().item() + 1)
 
+        torch.cuda.synchronize()
+        elapsed_time = (time.time() - start_time) * 1000
+
+        print("preproc elapsed time", elapsed_time)
+
+        start_time = time.time()
+
         with torch.cuda.device(self.device()):
             logits = self.lm.model.forward(
                 input_embeds=input_embeds,
@@ -304,6 +313,11 @@ class Driver:
                 rope_cache=rope_cache,
                 pos_ids=pt_new_position_ids,
             )
+
+        torch.cuda.synchronize()
+        elapsed_time = (time.time() - start_time) * 1000
+        print("fill_block elapsed time", elapsed_time)
+
         # print(logits.shape)
         # store the logits in the output embeds  -> replace with torch.scatter later
         for token_map in output_embed_postproc:

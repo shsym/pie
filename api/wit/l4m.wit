@@ -2,40 +2,44 @@ interface l4m {
 
     use wasi:io/poll@0.2.4.{pollable};
 
-    get-block-size: func() -> u32;
+    get-model: func(name:string) -> option<model>;
+    get-all-models: func() -> list<string>;
 
-    allocate-blocks: func(stream-id:u32, count:u32) -> list<u32>;
-    deallocate-blocks: func(stream-id:u32, ids: list<u32>);
+    resource model {
+        get-block-size: func() -> u32;
+        get-all-adapters: func() -> list<string>;
+        get-all-exported-blocks: func() -> list<tuple<string, u32>>;
 
-    fill-block: func(stream-id:u32, block:u32, context: list<u32>, inputs: list<u32>, outputs: list<u32>);
-    copy-block: func(stream-id:u32, src:u32, dst:u32, src-offset:u32, dst-offset:u32, size:u32);
-    mask-block: func(stream-id:u32, block:u32, mask:list<u32>);
+        allocate-blocks: func(stream-id:u32, count:u32) -> list<u32>;
+        allocate-embeds: func(stream-id:u32, count:u32) -> list<u32>;
+        allocate-dists: func(stream-id:u32, count:u32) -> list<u32>;
 
-    export-blocks: func(src:list<u32>, name:string);
-    import-blocks: func(dst:list<u32>, name:string);
-    get-all-exported-blocks: func() -> list<tuple<string, u32>>;
+        deallocate-blocks: func(stream-id:u32, ids: list<u32>);
+        deallocate-embeds: func(stream-id:u32, ids: list<u32>);
+        deallocate-dists: func(stream-id:u32, ids: list<u32>);
 
-    allocate-embeds: func(stream-id:u32, count:u32) -> list<u32>;
-    deallocate-embeds: func(stream-id:u32, ids: list<u32>);
+        fill-block: func(stream-id:u32, block:u32, context: list<u32>, inputs: list<u32>, outputs: list<u32>);
+        fill-block-with-adapter: func(stream-id:u32, adapter:string, block:u32, context: list<u32>, inputs: list<u32>, outputs: list<u32>);
 
-    embed-text: func(stream-id:u32, embs:list<u32>, tokens:list<u32>, positions:list<u32>);
+        copy-block: func(stream-id:u32, src:u32, dst:u32, src-offset:u32, dst-offset:u32, size:u32);
+        mask-block: func(stream-id:u32, block:u32, mask:list<u32>);
 
-    allocate-dists: func(stream-id:u32, count:u32) -> list<u32>;
-    deallocate-dists: func(stream-id:u32, ids: list<u32>);
+        export-blocks: func(src:list<u32>, name:string);
+        import-blocks: func(dst:list<u32>, name:string);
 
-    decode-token-dist: func(stream-id:u32, embs:list<u32>, dist:list<u32>);
+        embed-text: func(stream-id:u32, embs:list<u32>, tokens:list<u32>, positions:list<u32>);
+        decode-token-dist: func(stream-id:u32, embs:list<u32>, dist:list<u32>);
 
-    sample-top-k: func(stream-id:u32, embs:list<u32>, k:u32) -> sample-top-k-result;
+        sample-top-k: func(stream-id:u32, dist:list<u32>, k:u32) -> sample-top-k-result;
+
+        tokenize: func(text:string) -> list<u32>;
+        detokenize: func(tokens:list<u32>) -> string;
+        get-vocabs: func() -> list<list<u8>>;
+    }
+
     resource sample-top-k-result {
         subscribe: func() -> pollable;
         get: func() -> option<list<tuple<list<u32>, list<f32>>>>; // None if not ready
     }
-
-    tokenize: func(text:string) -> list<u32>;
-    detokenize: func(tokens:list<u32>) -> string;
-    get-vocabs: func() -> list<list<u8>>;
-
-
-    echo: func(text:string) -> pollable;
 
 }

@@ -26,6 +26,7 @@ bindgen!({
     with: {
         "wasi:io/poll": wasmtime_wasi::bindings::io::poll,
         "spi:app/l4m/sample-top-k-result": SampleTopKResult,
+        "spi:app/l4m/model": Model,
         //"spi:app/l4m/echo-result": EchoResult,
         // "spi:lm/inference/token-distribution": TokenDistribution,
         // "spi:lm/kvcache/token": CachedToken,
@@ -254,6 +255,10 @@ impl Drop for InstanceState {
     }
 }
 
+pub struct Model {
+    name: String,
+}
+
 //
 impl spi::app::system::Host for InstanceState {
     async fn get_version(&mut self) -> Result<String, wasmtime::Error> {
@@ -352,29 +357,21 @@ impl HostSampleTopKResult for InstanceState {
     }
 }
 
-// impl HostEchoResult for InstanceState {
-//     async fn subscribe(&mut self, this: Resource<Deadline>) -> Result<Resource<DynPollable>> {
-//         subscribe(self.table(), this)
-//     }
-//
-//     async fn get(&mut self, this: Resource<Deadline>) -> Result<String> {
-//         let r = self.table().get_mut(&this)?;
-//         Ok(r.value.clone())
-//     }
-//
-//     async fn drop(&mut self, this: Resource<Deadline>) -> Result<()> {
-//         let _ = self.table().delete(this)?;
-//         Ok(())
-//     }
-// }
-
-impl spi::app::l4m::Host for InstanceState {
-    async fn get_block_size(&mut self) -> Result<u32, wasmtime::Error> {
+impl spi::app::l4m::HostModel for InstanceState {
+    async fn get_block_size(&mut self, model: Resource<Model>) -> Result<u32, wasmtime::Error> {
         Ok(self.l4m_driver_utils.block_size)
+    }
+
+    async fn get_all_adapters(
+        &mut self,
+        model: Resource<Model>,
+    ) -> Result<Vec<String>, wasmtime::Error> {
+        todo!()
     }
 
     async fn allocate_blocks(
         &mut self,
+        model: Resource<Model>,
         stream: u32,
         count: u32,
     ) -> Result<Vec<object::IdRepr>, wasmtime::Error> {
@@ -390,21 +387,10 @@ impl spi::app::l4m::Host for InstanceState {
         Ok(object::Id::map_to_repr(blocks))
     }
 
-    async fn deallocate_blocks(
-        &mut self,
-        stream: u32,
-        ids: Vec<object::IdRepr>,
-    ) -> Result<(), wasmtime::Error> {
-        let blocks = object::Id::map_from_repr(ids);
-        self.allocator.release_many(&blocks)?;
-        let cmd = Command::DeallocateBlocks { stream, blocks };
-
-        self.cmd_buffer.send((self.id, cmd));
-        Ok(())
-    }
-
     async fn allocate_embeds(
         &mut self,
+        model: Resource<Model>,
+
         stream: u32,
         count: u32,
     ) -> Result<Vec<object::IdRepr>, wasmtime::Error> {
@@ -421,21 +407,10 @@ impl spi::app::l4m::Host for InstanceState {
         Ok(object::Id::map_to_repr(embs))
     }
 
-    async fn deallocate_embeds(
-        &mut self,
-        stream: u32,
-        ids: Vec<object::IdRepr>,
-    ) -> Result<(), wasmtime::Error> {
-        let embs = object::Id::<lm::TokenEmb>::map_from_repr(ids);
-        self.allocator.release_many(&embs)?;
-
-        let cmd = Command::DeallocateEmb { stream, embs };
-        self.cmd_buffer.send((self.id, cmd));
-        Ok(())
-    }
-
     async fn allocate_dists(
         &mut self,
+        model: Resource<Model>,
+
         stream: u32,
         count: u32,
     ) -> Result<Vec<object::IdRepr>, wasmtime::Error> {
@@ -452,8 +427,39 @@ impl spi::app::l4m::Host for InstanceState {
         Ok(object::Id::map_to_repr(dists))
     }
 
+    async fn deallocate_blocks(
+        &mut self,
+        model: Resource<Model>,
+
+        stream: u32,
+        ids: Vec<object::IdRepr>,
+    ) -> Result<(), wasmtime::Error> {
+        let blocks = object::Id::map_from_repr(ids);
+        self.allocator.release_many(&blocks)?;
+        let cmd = Command::DeallocateBlocks { stream, blocks };
+
+        self.cmd_buffer.send((self.id, cmd));
+        Ok(())
+    }
+    async fn deallocate_embeds(
+        &mut self,
+        model: Resource<Model>,
+
+        stream: u32,
+        ids: Vec<object::IdRepr>,
+    ) -> Result<(), wasmtime::Error> {
+        let embs = object::Id::<lm::TokenEmb>::map_from_repr(ids);
+        self.allocator.release_many(&embs)?;
+
+        let cmd = Command::DeallocateEmb { stream, embs };
+        self.cmd_buffer.send((self.id, cmd));
+        Ok(())
+    }
+
     async fn deallocate_dists(
         &mut self,
+        model: Resource<Model>,
+
         stream: u32,
         ids: Vec<object::IdRepr>,
     ) -> Result<(), wasmtime::Error> {
@@ -469,7 +475,32 @@ impl spi::app::l4m::Host for InstanceState {
 
     async fn fill_block(
         &mut self,
+        model: Resource<Model>,
+
         stream: u32,
+        block: object::IdRepr,
+        context: Vec<object::IdRepr>,
+        inputs: Vec<object::IdRepr>,
+        outputs: Vec<object::IdRepr>,
+    ) -> Result<(), wasmtime::Error> {
+        let cmd = Command::FillBlock {
+            stream,
+            block: block.into(),
+            context: object::Id::map_from_repr(context),
+            inputs: object::Id::map_from_repr(inputs),
+            outputs: object::Id::map_from_repr(outputs),
+        };
+
+        self.cmd_buffer.send((self.id, cmd));
+
+        Ok(())
+    }
+
+    async fn fill_block_with_adapter(
+        &mut self,
+        model: Resource<Model>,
+        stream: u32,
+        adapter: String,
         block: object::IdRepr,
         context: Vec<object::IdRepr>,
         inputs: Vec<object::IdRepr>,
@@ -490,6 +521,8 @@ impl spi::app::l4m::Host for InstanceState {
 
     async fn copy_block(
         &mut self,
+        model: Resource<Model>,
+
         stream: u32,
         src: object::IdRepr,
         dst: object::IdRepr,
@@ -513,6 +546,8 @@ impl spi::app::l4m::Host for InstanceState {
 
     async fn mask_block(
         &mut self,
+        model: Resource<Model>,
+
         stream: u32,
         block: object::IdRepr,
         mask: Vec<u32>,
@@ -530,6 +565,8 @@ impl spi::app::l4m::Host for InstanceState {
 
     async fn export_blocks(
         &mut self,
+        model: Resource<Model>,
+
         src: Vec<object::IdRepr>,
         name: String,
     ) -> Result<(), wasmtime::Error> {
@@ -545,6 +582,8 @@ impl spi::app::l4m::Host for InstanceState {
 
     async fn import_blocks(
         &mut self,
+        model: Resource<Model>,
+
         dst: Vec<object::IdRepr>,
         name: String,
     ) -> Result<(), wasmtime::Error> {
@@ -558,7 +597,10 @@ impl spi::app::l4m::Host for InstanceState {
         Ok(())
     }
 
-    async fn get_all_exported_blocks(&mut self) -> Result<Vec<(String, u32)>, wasmtime::Error> {
+    async fn get_all_exported_blocks(
+        &mut self,
+        model: Resource<Model>,
+    ) -> Result<Vec<(String, u32)>, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
 
         let cmd = Command::GetAllExportedBlocks { handle: tx };
@@ -573,6 +615,8 @@ impl spi::app::l4m::Host for InstanceState {
 
     async fn embed_text(
         &mut self,
+        model: Resource<Model>,
+
         stream: u32,
         embs: Vec<object::IdRepr>,
         tokens: Vec<u32>,
@@ -592,6 +636,8 @@ impl spi::app::l4m::Host for InstanceState {
 
     async fn decode_token_dist(
         &mut self,
+        model: Resource<Model>,
+
         stream: u32,
         embs: Vec<object::IdRepr>,
         dists: Vec<object::IdRepr>,
@@ -609,6 +655,8 @@ impl spi::app::l4m::Host for InstanceState {
 
     async fn sample_top_k(
         &mut self,
+        model: Resource<Model>,
+
         stream: u32,
         embs: Vec<object::IdRepr>,
         k: u32,
@@ -653,7 +701,11 @@ impl spi::app::l4m::Host for InstanceState {
     //     }
     // }
 
-    async fn tokenize(&mut self, text: String) -> Result<Vec<u32>, wasmtime::Error> {
+    async fn tokenize(
+        &mut self,
+        model: Resource<Model>,
+        text: String,
+    ) -> Result<Vec<u32>, wasmtime::Error> {
         let tokens = self
             .l4m_driver_utils
             .tokenizer
@@ -661,23 +713,34 @@ impl spi::app::l4m::Host for InstanceState {
         Ok(tokens)
     }
 
-    async fn detokenize(&mut self, tokens: Vec<u32>) -> Result<String, wasmtime::Error> {
+    async fn detokenize(
+        &mut self,
+        model: Resource<Model>,
+        tokens: Vec<u32>,
+    ) -> Result<String, wasmtime::Error> {
         let text = self.l4m_driver_utils.tokenizer.decode(tokens.as_slice())?;
         Ok(text)
     }
 
-    async fn get_vocabs(&mut self) -> Result<Vec<Vec<u8>>, wasmtime::Error> {
+    async fn get_vocabs(
+        &mut self,
+        model: Resource<Model>,
+    ) -> Result<Vec<Vec<u8>>, wasmtime::Error> {
         let vocabs = self.l4m_driver_utils.tokenizer.get_vocabs();
         Ok(vocabs)
     }
-    async fn echo(&mut self, value: String) -> Result<Resource<DynPollable>> {
-        let ddl = tokio::time::Instant::now()
-            .checked_add(Duration::from_secs(3))
-            .unwrap();
+    async fn drop(&mut self, model: Resource<Model>) -> Result<(), wasmtime::Error> {
+        Ok(())
+    }
+}
 
-        let deadline = Deadline { done: false };
-        let sleep = self.table().push(deadline)?;
-        subscribe(self.table(), sleep)
+impl spi::app::l4m::Host for InstanceState {
+    async fn get_model(&mut self, value: String) -> Result<Option<Resource<Model>>> {
+        todo!()
+    }
+
+    async fn get_all_models(&mut self) -> Result<Vec<String>> {
+        todo!()
     }
 }
 
