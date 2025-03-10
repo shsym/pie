@@ -11,7 +11,7 @@ impl Run for ParallelGeneration {
 
         let max_num_outputs = 32;
 
-        let mut common = symphony::Context::new();
+        let mut common = symphony::Context::create();
         common.fill("<|begin_of_text|>").await;
         common.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
 

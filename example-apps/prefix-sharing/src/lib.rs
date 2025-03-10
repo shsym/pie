@@ -11,7 +11,7 @@ impl Run for PrefixSharing {
 
         let max_num_outputs = 128;
 
-        let mut ctx = symphony::Context::new();
+        let mut ctx = symphony::Context::create();
         ctx.fill("<|begin_of_text|>").await;
         ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
 

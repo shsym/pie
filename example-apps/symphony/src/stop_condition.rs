@@ -1,5 +1,3 @@
-use crate::l4m;
-
 pub fn any<SC1, SC2>(sc1: SC1, sc2: SC2) -> impl StopCondition
 where
     SC1: StopCondition + 'static,
@@ -17,8 +15,7 @@ pub struct Until {
 }
 
 impl Until {
-    pub fn new(text: &str) -> Self {
-        let token_ids = l4m::tokenize(text);
+    pub fn new(token_ids: Vec<u32>) -> Self {
         Self { token_ids }
     }
 }

@@ -10,7 +10,7 @@ impl Run for SimpleDecoding {
 
         let max_num_outputs = 256;
 
-        let mut ctx = symphony::Context::new();
+        let mut ctx = symphony::Context::create();
         ctx.fill("<|begin_of_text|>").await;
         ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
         ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>").await;
