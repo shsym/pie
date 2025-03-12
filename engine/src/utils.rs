@@ -1,8 +1,13 @@
+use crate::object;
+use crate::object::ObjectError;
 use anyhow::{Error, Result};
 use num_traits::PrimInt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use uuid::Uuid;
+use wasmtime::Ref;
+
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash)]
 pub struct Stream {
     pub inst_id: u128,
@@ -156,5 +161,132 @@ where
                 break;
             }
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct TranslationTable<T> {
+    table: HashMap<T, T>,
+}
+
+impl<T> TranslationTable<T>
+where
+    T: Eq + Hash + PrimInt,
+{
+    pub fn new() -> Self {
+        Self {
+            table: HashMap::new(),
+        }
+    }
+
+    pub fn exists(&self, src: &T) -> bool {
+        self.table.contains_key(src)
+    }
+
+    pub fn lookup(&self, src: &T) -> Result<T, ObjectError> {
+        self.table
+            .get(src)
+            .cloned()
+            .ok_or(ObjectError::ObjectNotFound)
+    }
+
+    pub fn lookup_all(&self, srcs: &[T]) -> Result<Vec<T>, ObjectError> {
+        srcs.iter().map(|k| self.lookup(k)).collect()
+    }
+
+    pub fn translate(&self, src: &mut T) -> Result<(), ObjectError> {
+        *src = self.lookup(src)?;
+        Ok(())
+    }
+
+    pub fn translate_all(&self, srcs: &mut [T]) -> Result<(), ObjectError> {
+        for k in srcs.iter_mut() {
+            self.translate(k)?;
+        }
+        Ok(())
+    }
+
+    pub fn assign(&mut self, src: T, dst: T) {
+        self.table.insert(src, dst);
+    }
+
+    pub fn assign_all(&mut self, srcs: &[T], dsts: &[T]) {
+        for (key, value) in srcs.iter().zip(dsts.iter()) {
+            self.assign(*key, *value);
+        }
+    }
+
+    pub fn unassign(&mut self, src: &T) -> Result<(), ObjectError> {
+        self.table.remove(src).ok_or(ObjectError::ObjectNotFound)?;
+        Ok(())
+    }
+
+    pub fn unassign_all(&mut self, srcs: &[T]) -> Result<(), ObjectError> {
+        srcs.iter().map(|k| self.unassign(k));
+        Ok(())
+    }
+
+    pub fn to_list(&self) -> Vec<T> {
+        self.table.keys().cloned().collect()
+    }
+}
+
+pub struct RefCounter<T>
+where
+    T: Eq + Hash + PrimInt,
+{
+    counters: HashMap<T, Counter>,
+}
+
+impl<T> RefCounter<T>
+where
+    T: Eq + Hash + PrimInt,
+{
+    pub fn new() -> Self {
+        Self {
+            counters: HashMap::new(),
+        }
+    }
+
+    pub fn init(&mut self, id: T) {
+        self.counters.insert(id, Counter::new(1));
+    }
+
+    pub fn destroy(&mut self, id: T) {
+        self.counters.remove(&id);
+    }
+
+    pub fn inc(&self, id: T) {
+        self.counters.get(&id).unwrap().inc();
+    }
+
+    pub fn dec(&self, id: T) -> bool {
+        self.counters.get(&id).unwrap().dec() <= 0
+    }
+
+    pub fn get(&self, id: T) -> usize {
+        self.counters.get(&id).unwrap().get() as usize
+    }
+
+    pub fn init_all(&mut self, ids: &[T]) {
+        for id in ids {
+            self.init(id.clone());
+        }
+    }
+
+    pub fn destroy_all(&mut self, ids: &[T]) {
+        for id in ids {
+            self.destroy(id.clone());
+        }
+    }
+
+    pub fn inc_all(&self, ids: &[T]) {
+        for id in ids {
+            self.inc(id.clone());
+        }
+    }
+
+    pub fn get_all(&self, ids: &[T]) -> Vec<usize> {
+        ids.iter().map(|id| self.get(id.clone())).collect()
     }
 }

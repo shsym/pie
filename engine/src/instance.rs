@@ -17,7 +17,6 @@ use wasmtime_wasi::{
     subscribe,
 };
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
-//use wasmtime_wasi_io::poll::{};
 
 bindgen!({
     path: "../api/wit",
@@ -27,13 +26,7 @@ bindgen!({
         "wasi:io/poll": wasmtime_wasi::bindings::io::poll,
         "spi:app/l4m/sample-top-k-result": SampleTopKResult,
         "spi:app/l4m/model": Model,
-        //"spi:app/l4m/echo-result": EchoResult,
-        // "spi:lm/inference/token-distribution": TokenDistribution,
-        // "spi:lm/kvcache/token": CachedToken,
-        // "spi:lm/kvcache/token-list": CachedTokenList,
     },
-    // Interactions with `ResourceTable` can possibly trap so enable the ability
-    // to return traps from generated functions.
     trappable_imports: true,
 });
 
@@ -366,7 +359,7 @@ impl spi::app::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
     ) -> Result<Vec<String>, wasmtime::Error> {
-        todo!()
+        Ok(vec![])
     }
 
     async fn allocate_blocks(
@@ -736,25 +729,28 @@ impl spi::app::l4m::HostModel for InstanceState {
 
 impl spi::app::l4m::Host for InstanceState {
     async fn get_model(&mut self, value: String) -> Result<Option<Resource<Model>>> {
-        todo!()
+        let model = Model { name: value };
+        let res = self.table().push(model)?;
+        Ok(Some(res))
     }
 
     async fn get_all_models(&mut self) -> Result<Vec<String>> {
-        todo!()
+        Ok(vec!["default".to_string()])
     }
 }
 
 impl spi::app::l4m_vision::Host for InstanceState {
     async fn embed_image(
         &mut self,
+        model: Resource<Model>,
         stream: u32,
         embs: Vec<object::IdRepr>,
-        url: String,
+        image_blob: Vec<u8>,
     ) -> Result<(), wasmtime::Error> {
         let cmd = Command::EmbedImage {
             stream,
             embs: object::Id::map_from_repr(embs),
-            image: url,
+            image: "url".to_string(),
         };
 
         self.cmd_buffer.send((self.id, cmd));
@@ -762,14 +758,14 @@ impl spi::app::l4m_vision::Host for InstanceState {
         Ok(())
     }
 
-    async fn embed_video(
-        &mut self,
-        stream: u32,
-        embs: Vec<object::IdRepr>,
-        url: String,
-    ) -> Result<(), wasmtime::Error> {
-        todo!()
-    }
+    // async fn embed_video(
+    //     &mut self,
+    //     stream: u32,
+    //     embs: Vec<object::IdRepr>,
+    //     url: String,
+    // ) -> Result<(), wasmtime::Error> {
+    //     todo!()
+    // }
 }
 
 pub struct SampleTopKResult {

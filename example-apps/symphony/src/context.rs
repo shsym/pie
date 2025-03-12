@@ -1,7 +1,7 @@
 use crate::drafter::Drafter;
 use crate::sampler::Sampler;
 use crate::stop_condition::StopCondition;
-use crate::{drafter, l4m, l4m_async, sampler, stop_condition};
+use crate::{drafter, l4m, l4m_async, l4m_vision, sampler, stop_condition};
 use std::cell::RefCell;
 use std::mem;
 use std::rc::Rc;
@@ -299,6 +299,10 @@ impl Inner {
         self.model.deallocate_embeds(self.stream, &embed_ids);
 
         self.processed_token_ids.extend(token_ids);
+    }
+
+    pub async fn fill_image(&mut self, image_blob: &[u8]) {
+        l4m_vision::embed_image(&self.model, self.stream, &[], image_blob);
     }
 
     pub async fn generate<D: Drafter, S: Sampler, C: StopCondition>(

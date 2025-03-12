@@ -10,7 +10,7 @@ impl Run for SimpleDecoding {
 
         let max_num_outputs = 256;
 
-        let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
+        let model = symphony::Model::new(symphony::available_models().first().unwrap()).unwrap();
 
         let mut ctx = model.create_context();
 

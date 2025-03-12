@@ -4,7 +4,7 @@ use crate::object::{Fetcher, IdMapper, VspaceId};
 use crate::runtime::Runtime;
 use crate::server::ServerMessage;
 use crate::utils::Stream;
-use crate::{driver_l4m, driver_ping, instance, object, utils};
+use crate::{driver_l4m, driver_l4m_vision, driver_ping, instance, object, utils};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,7 +37,7 @@ pub enum ControllerError {
     SendError(String),
 }
 
-pub struct Controller<B1, B2> {
+pub struct Controller<B1, B2, B3> {
     state: Arc<Runtime>,
 
     vspaces: HashMap<instance::Id, VspaceId>,
@@ -47,22 +47,25 @@ pub struct Controller<B1, B2> {
     exported_blocks: HashMap<String, ExportedBlocks>,
 
     driver_l4m: driver_l4m::Driver<B1>,
-    driver_ping: driver_ping::Driver<B2>,
+    driver_l4m_vision: driver_l4m_vision::Driver<B2>,
+    driver_ping: driver_ping::Driver<B3>,
 }
 
-impl<B1, B2> Controller<B1, B2>
+impl<B1,B2, B3> Controller<B1, B2, B3>
 where
     B1: driver_l4m::ExecuteCommand,
-    B2: driver_ping::ExecuteCommand,
+    B2: driver_l4m_vision::ExecuteCommand,
+    B3: driver_ping::ExecuteCommand,
 {
-    pub async fn new(state: Arc<Runtime>, backend_l4m: B1, backend_ping: B2) -> Self {
+    pub async fn new(state: Arc<Runtime>, backend_l4m: B1, backend_l4m_vision:B2, backend_ping: B3) -> Self {
         Controller {
             state,
             vspaces: HashMap::new(),
             vspace_id_pool: utils::IdPool::new(VspaceId::MAX),
             subscriptions: HashMap::new(),
             exported_blocks: HashMap::new(),
-            driver_l4m: driver_l4m::Driver::new(backend_l4m.clone()).await,
+            driver_l4m: driver_l4m::Driver::new(backend_l4m).await,
+            driver_l4m_vision: driver_l4m_vision::Driver::new(backend_l4m_vision).await,
             driver_ping: driver_ping::Driver::new(backend_ping).await,
         }
     }
@@ -411,7 +414,7 @@ where
             }
             Command::SampleTopK {
                 stream,
-                dist: emb,
+                dist,
                 k,
                 handle,
             } => {
@@ -421,7 +424,7 @@ where
                     .get(&inst_id)
                     .ok_or(ControllerError::VspaceNotFound(inst_id))?;
                 self.driver_l4m
-                    .sample_top_k(stream, space, &emb, k, handle)
+                    .sample_top_k(stream, space, &dist, k, handle)
                     .map_err(|e| {
                         ControllerError::DriverError(format!("SampleTopK failed: {}", e))
                     })?;

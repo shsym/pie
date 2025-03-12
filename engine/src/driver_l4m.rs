@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::backend::BackendError;
-use crate::driver::DriverError;
+use crate::driver::{BatchQueue, DriverError};
 use crate::object::{Allocator, Fetcher, Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
 use crate::tokenizer::BytePairEncoder;
 use thiserror::Error;
@@ -42,11 +42,9 @@ enum Command {
     CopyBlock(l4m::CopyBlock),
     MaskBlock(l4m::MaskBlock),
     FillBlock(l4m::FillBlock),
-    //EmbedImage(l4m::EmbedImage),
     EmbedText(l4m::EmbedText),
     DecodeTokenDistribution(l4m::DecodeTokenDistribution),
     SampleTopKRequest(l4m::SampleTopKRequest),
-    //Ping(l4m::PingRequest),
 }
 
 // Hidden
@@ -442,90 +440,7 @@ struct CommandBatcher {
     // these cmds are only be fired when it contains "enough" commands to be batched.
     fill_block: BatchQueue<l4m::FillBlock>,
     decode_token_distribution: BatchQueue<l4m::DecodeTokenDistribution>,
-    sample_top_k: BatchQueue<l4m::SampleTopKRequest>,
-}
-
-/// "K-or-T" Strategy
-// 	For instance: If queue size reaches K, launch immediately; otherwise launch after T ms if K isn’t reached.
-// 	This ensures that the GPU does not stay idle for too long (bounded by T) and that short bursts of arrivals form a large enough batch to get good utilization (bounded by K).
-#[derive(Debug)]
-struct BatchQueue<T> {
-    // cmd, timestamp, response_sender
-    items: Vec<(T, Instant, EventHandle)>,
-
-    max_wait_time: Duration,
-    min_size: usize,
-    max_size: usize,
-}
-
-impl<T> BatchQueue<T> {
-    fn eager() -> Self {
-        Self {
-            items: Vec::new(),
-            max_wait_time: Duration::from_secs_f32(0.0),
-            min_size: 1,
-            max_size: usize::MAX,
-        }
-    }
-
-    fn k_only(min_size: usize, max_size: Option<usize>) -> Self {
-        Self {
-            items: Vec::new(),
-            max_wait_time: Duration::MAX,
-            min_size,
-            max_size: max_size.unwrap_or(min_size),
-        }
-    }
-
-    fn t_only(max_wait_time: Duration) -> Self {
-        Self {
-            items: Vec::new(),
-            max_wait_time,
-            min_size: 1,
-            max_size: usize::MAX,
-        }
-    }
-
-    fn k_or_t(max_wait_time: Duration, min_size: usize, max_size: Option<usize>) -> Self {
-        Self {
-            items: Vec::new(),
-            max_wait_time,
-            min_size,
-            max_size: max_size.unwrap_or(min_size),
-        }
-    }
-
-    fn take(&mut self) -> (Vec<T>, Vec<EventHandle>) {
-        let drain_count = self.items.len().min(self.max_size);
-        self.items
-            .drain(..drain_count)
-            .map(|(item, _, sender)| (item, sender))
-            .unzip()
-    }
-
-    fn push(&mut self, item: T, curr_timestamp: Instant, evt: EventHandle) {
-        self.items.push((item, curr_timestamp, evt));
-    }
-
-    fn is_ready(&self, curr_timestamp: Instant) -> bool {
-        let num_items = self.items.len();
-
-        if num_items > 0 {
-            let longest_wait_time = curr_timestamp - self.items[0].1;
-            if num_items >= self.min_size || longest_wait_time >= self.max_wait_time {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn batch(&mut self, curr_timestamp: Instant) -> Option<(Vec<T>, Vec<EventHandle>)> {
-        if self.is_ready(curr_timestamp) {
-            Some(self.take())
-        } else {
-            None
-        }
-    }
+    sample_top_k: BatchQueue<(l4m::SampleTopKRequest, EventHandle)>,
 }
 
 impl CommandBatcher {
@@ -558,30 +473,29 @@ impl CommandBatcher {
     fn push(&mut self, cmd: Command, curr_timestamp: Instant, evt: EventHandle) {
         match cmd {
             Command::Allocate(item) => {
-                self.allocate.push(item, curr_timestamp, evt);
+                self.allocate.push(item, curr_timestamp);
             }
             Command::Deallocate(item) => {
-                self.deallocate.push(item, curr_timestamp, evt);
+                self.deallocate.push(item, curr_timestamp);
             }
             Command::CopyBlock(item) => {
-                self.copy_block.push(item, curr_timestamp, evt);
+                self.copy_block.push(item, curr_timestamp);
             }
             Command::MaskBlock(item) => {
-                self.mask_block.push(item, curr_timestamp, evt);
+                self.mask_block.push(item, curr_timestamp);
             }
             Command::FillBlock(item) => {
-                self.fill_block.push(item, curr_timestamp, evt);
+                self.fill_block.push(item, curr_timestamp);
             }
 
             Command::EmbedText(item) => {
-                self.embed_text.push(item, curr_timestamp, evt);
+                self.embed_text.push(item, curr_timestamp);
             }
             Command::SampleTopKRequest(item) => {
-                self.sample_top_k.push(item, curr_timestamp, evt);
+                self.sample_top_k.push((item, evt), curr_timestamp);
             }
             Command::DecodeTokenDistribution(item) => {
-                self.decode_token_distribution
-                    .push(item, curr_timestamp, evt);
+                self.decode_token_distribution.push(item, curr_timestamp);
             }
 
             _ => {
@@ -596,58 +510,61 @@ impl CommandBatcher {
     ) -> Vec<(l4m::request::Command, Vec<EventHandle>)> {
         let mut cmds = Vec::new();
 
-        if let Some((items, senders)) = self.allocate.batch(curr_timestamp) {
+        if let Some(items) = self.allocate.batch(curr_timestamp) {
             cmds.push((
                 l4m::request::Command::Allocate(l4m::BatchAllocate { items }),
-                senders,
+                vec![],
             ));
         }
 
-        if let Some((items, senders)) = self.deallocate.batch(curr_timestamp) {
+        if let Some(items)= self.deallocate.batch(curr_timestamp) {
             cmds.push((
                 l4m::request::Command::Deallocate(l4m::BatchDeallocate { items }),
-                senders,
+                vec![],
             ));
         }
 
-        if let Some((items, senders)) = self.copy_block.batch(curr_timestamp) {
+        if let Some(items) = self.copy_block.batch(curr_timestamp) {
             cmds.push((
                 l4m::request::Command::CopyBlock(l4m::BatchCopyBlock { items }),
-                senders,
+                vec![],
             ));
         }
 
-        if let Some((items, senders)) = self.mask_block.batch(curr_timestamp) {
+        if let Some(items) = self.mask_block.batch(curr_timestamp) {
             cmds.push((
                 l4m::request::Command::MaskBlock(l4m::BatchMaskBlock { items }),
-                senders,
+                vec![],
             ));
         }
 
-        if let Some((items, senders)) = self.embed_text.batch(curr_timestamp) {
+        if let Some(items) = self.embed_text.batch(curr_timestamp) {
             cmds.push((
                 l4m::request::Command::EmbedText(l4m::BatchEmbedText { items }),
-                senders,
+                vec![],
             ));
         }
 
-        if let Some((items, senders)) = self.fill_block.batch(curr_timestamp) {
+        if let Some(items) = self.fill_block.batch(curr_timestamp) {
             cmds.push((
                 l4m::request::Command::FillBlock(l4m::BatchFillBlock { items }),
-                senders,
+                vec![],
             ));
         }
 
-        if let Some((items, senders)) = self.decode_token_distribution.batch(curr_timestamp) {
+        if let Some(items) = self.decode_token_distribution.batch(curr_timestamp) {
             cmds.push((
                 l4m::request::Command::DecodeTokenDistribution(l4m::BatchDecodeTokenDistribution {
                     items,
                 }),
-                senders,
+                vec![],
             ));
         }
 
-        if let Some((items, senders)) = self.sample_top_k.batch(curr_timestamp) {
+        if let Some(items) = self.sample_top_k.batch(curr_timestamp) {
+            
+            let (items, senders) = items.into_iter().unzip();
+            
             cmds.push((
                 l4m::request::Command::SampleTopKRequest(l4m::BatchSampleTopKRequest { items }),
                 senders,
@@ -1006,34 +923,6 @@ where
     // }
 }
 
-impl<B> Fetcher<TokenDist> for Driver<B>
-where
-    B: ExecuteCommand,
-{
-    type RawRepr = (Vec<u32>, Vec<f32>);
-
-    fn fetch(
-        &mut self,
-        stream: Stream,
-        space: &VspaceId,
-        ptr: &ObjectId<TokenDist>,
-        sender: oneshot::Sender<Self::RawRepr>,
-    ) -> Result<(), ObjectError> {
-        let ptr = self.lookup(space, &ptr)?;
-
-        let cmd = Command::SampleTopKRequest(l4m::SampleTopKRequest {
-            distribution_id: ptr.into(),
-            k: 256,
-        });
-
-        let handle = EventHandle::SampleTopK(sender);
-
-        self.enqueue_cmd_with_event(stream, cmd, handle)
-            .map_err(|e| {
-                ObjectError::BackendError("Failed to fetch token distribution".to_string())
-            })
-    }
-}
 
 /// for multimodal LLMs
 

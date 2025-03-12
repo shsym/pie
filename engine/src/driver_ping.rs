@@ -42,7 +42,7 @@ where
         Self {
             backend: b,
             event_table,
-            cmd_id_pool: utils::IdPool::new(100000),
+            cmd_id_pool: utils::IdPool::new(u32::MAX),
         }
     }
 

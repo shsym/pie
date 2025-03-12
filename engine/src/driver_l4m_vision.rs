@@ -1,7 +1,11 @@
+use crate::driver::DriverError;
 use crate::lm::{ImageEmbedder, TokenEmb};
 use crate::object::VspaceId;
 use crate::utils::Stream;
-use crate::{backend, driver_l4m};
+use crate::{backend, driver_l4m, utils};
+use dashmap::DashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
 
 pub const PROTOCOL: &str = "l4m-vision"; // for future backward compatibility
 
@@ -16,35 +20,65 @@ mod l4m {
 // impl<T> crate::driver_l4m::ExecuteCommand for T where T: backend::ExecuteCommand<l4m::Request, l4m::Response> {}
 
 pub trait ExecuteCommand:
-    driver_l4m::ExecuteCommand + backend::ExecuteCommand<l4m::vision::Request, l4m::vision::Response>
+    backend::ExecuteCommand<l4m::vision::Request, l4m::vision::Response>
 {
 }
 
 impl<T> ExecuteCommand for T where
-    T: driver_l4m::ExecuteCommand
-        + backend::ExecuteCommand<l4m::vision::Request, l4m::vision::Response>
+    T: backend::ExecuteCommand<l4m::vision::Request, l4m::vision::Response>
 {
 }
 
-//
-// impl<B> ImageEmbedder for Driver<B>
-// where
-//     B: ExecuteCommand,
-// {
-//     fn embed_img(
-//         &mut self,
-//         stream: Stream,
-//         space: &VspaceId,
-//         addrs: Vec<crate::object::Id<TokenEmb>>,
-//         url: String,
-//     ) -> Result<(), DriverError> {
-//         let addrs = self.lookup_all(space, &addrs)?;
-//
-//         let cmd = crate::driver_l4m::Command::EmbedImage(crate::driver_l4m::l4m::EmbedImage {
-//             embedding_ids: crate::object::Id::map_to_repr(addrs),
-//             url,
-//         });
-//
-//         self.enqueue_cmd(stream, cmd)
-//     }
-// }
+#[derive(Debug)]
+pub struct Driver<B> {
+    backend: B,
+    cmd_id_pool: utils::IdPool<u32>,
+}
+
+impl<B> Driver<B>
+where
+    B: ExecuteCommand,
+{
+    pub async fn new(b: B) -> Self {
+        Self {
+            backend: b,
+            cmd_id_pool: utils::IdPool::new(u32::MAX),
+        }
+    }
+
+    pub async fn embed_image(
+        &mut self,
+        message: String,
+    ) -> Result<(), DriverError> {
+        let correlation_id = self
+            .cmd_id_pool
+            .acquire()
+            .map_err(|e| DriverError::LockError)?;
+
+        // let msg = l4m::vision::Request {
+        //     correlation_id,
+        //     command: Some(l4m::vision::request::Command::EmbedImage(
+        //         
+        //     )),
+        // };
+        // 
+        // self.event_table.insert(correlation_id, handler);
+        // 
+        // self.backend
+        //     .exec(msg)
+        //     .await
+        //     .map_err(|_| DriverError::SendError)?;
+
+        Ok(())
+    }
+
+}
+
+#[derive(Clone)]
+pub struct Simulator {}
+
+impl backend::Simulate<l4m::vision::Request, l4m::vision::Response> for Simulator {
+    fn simulate(&mut self, cmd: l4m::vision::Request) -> Option<l4m::vision::Response> {
+        None
+    }
+}

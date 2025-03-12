@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
     // 6) Spawn the controller loop (which manages commands coming from instances)
     let backend_l4m = SimulatedBackend::new(driver_l4m::Simulator {}).await;
     let backend_ping = SimulatedBackend::new(driver_ping::Simulator {}).await;
+    let backend_l4m_vision = SimulatedBackend::new(driver_l4m_vision::Simulator {}).await;
 
     // let backend_l4m = ZmqBackend::bind("tcp://gimlab.org:8888", driver_l4m::PROTOCOL)
     //     .await
@@ -63,7 +64,12 @@ async fn main() -> anyhow::Result<()> {
     //     .await
     //     .context("Failed to bind backend")?;
 
-    let mut controller = Controller::new(runtime.clone(), backend_l4m, backend_ping).await;
+    let mut controller = Controller::new(
+        runtime.clone(), 
+        backend_l4m,
+        backend_l4m_vision,
+        backend_ping
+    ).await;
 
     let controller_handle = tokio::spawn(async move {
         loop {

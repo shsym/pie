@@ -260,117 +260,34 @@ pub trait IdMapper<T>: Allocator<T> {
         space: &VspaceId,
         srcs: &[Id<T>],
     ) -> Result<(), ObjectError>;
-    //
-    // fn open(&mut self, space: VspaceId) -> Result<(), ObjectError>;
-    //
-    // fn close(&mut self, space: &VspaceId) -> Result<(), ObjectError>;
-
-    // fn alloc(
-    //     &mut self,
-    //     stream: Stream,
-    //     vspace_id: &VspaceId,
-    //     vid: Id<T>,
-    // ) -> Result<(), ObjectError> {
-    //     MappedAllocator::alloc_many(self, stream, vspace_id, vec![vid])
-    // }
-    //
-    // fn alloc_many(
-    //     &mut self,
-    //     stream: Stream,
-    //     vspace_id: &VspaceId,
-    //     vids: Vec<Id<T>>,
-    // ) -> Result<(), ObjectError> {
-    //     //objs.iter().for_each(|obj| obj.add_ref());
-    //
-    //     let ids = Allocator::alloc_many(self, stream, vids.len())?;
-    //
-    //     // Retrieve a mutable reference to the vspace, converting a missing vspace into an InstanceNotFound error.
-    //     let vspace = self.vspaces_mut(vspace_id)?;
-    //
-    //     for (vid, id) in vids.into_iter().zip(ids.into_iter()) {
-    //         if vspace.contains(&vid) {
-    //             return Err(ObjectError::VSpaceAlreadyExists(vid.into()));
-    //         }
-    //
-    //         vspace.insert(vid, id);
-    //     }
-    //     Ok(())
-    // }
-    //
-    // fn dealloc(
-    //     &mut self,
-    //     stream: Stream,
-    //     vspace_id: &VspaceId,
-    //     vid: &Id<T>,
-    // ) -> Result<(), ObjectError> {
-    //     MappedAllocator::dealloc_many(self, stream, vspace_id, slice::from_ref(vid))
-    // }
-    //
-    // fn dealloc_many(
-    //     &mut self,
-    //     stream: Stream,
-    //     vspace_id: &VspaceId,
-    //     vids: &[Id<T>],
-    // ) -> Result<(), ObjectError> {
-    //     // Borrow the vspace mutably and remove all vids,
-    //     // collecting their corresponding global addresses.
-    //     let vspace = self.vspaces_mut(vspace_id)?;
-    //
-    //     let mut ids = Vec::with_capacity(vids.len());
-    //     for vid in vids {
-    //         let id = vspace.remove(vid)?;
-    //         ids.push(id);
-    //     }
-    //     // The mutable borrow on vspace is dropped here.
-    //
-    //     // Now iterate over the collected ids to release and possibly deallocate.
-    //     for id in ids {
-    //         let remove_entirely = self.ref_dec(&id)?;
-    //
-    //         if remove_entirely {
-    //             Allocator::dealloc(self, stream, id).map_err(|e| {
-    //                 ObjectError::BackendError(format!(
-    //                     "Failed to deallocate object in Allocator: {}",
-    //                     e
-    //                 ))
-    //             })?;
-    //         }
-    //     }
-    //
-    //     Ok(())
-    // }
-    // fn create_ref(
-    //     &mut self,
-    //     src_vspace_id: &VspaceId,
-    //     src_vid: &Id<T>,
-    //     dst_vspace_id: &VspaceId,
-    //     dst_vid: &Id<T>,
-    // ) -> Result<(), ObjectError> {
-    //     let src_id = self.vspaces(src_vspace_id)?.get(src_vid)?;
-    //
-    //     // increase ref count
-    //     self.ref_inc(&src_id)?;
-    //
-    //     let dst_vspace = self.vspaces_mut(dst_vspace_id)?;
-    //
-    //     if dst_vspace.contains(dst_vid) {
-    //         return Err(ObjectError::VSpaceAlreadyExists(dst_vid.0));
-    //     }
-    //
-    //     dst_vspace.insert(*dst_vid, src_id);
-    //
-    //     Ok(())
-    // }
 }
 
-pub trait Fetcher<T>: IdMapper<T> {
-    type RawRepr;
+pub fn group_consecutive_ids(ids: &[IdRepr]) -> Vec<(IdRepr, IdRepr)> {
+    let mut ranges = Vec::new();
+    if ids.is_empty() {
+        return ranges;
+    }
 
-    fn fetch(
-        &mut self,
-        stream: Stream,
-        space: &VspaceId,
-        id: &Id<T>,
-        sender: oneshot::Sender<Self::RawRepr>,
-    ) -> Result<(), ObjectError>;
+    // Initialize the first range with the first id.
+    let mut offset = ids[0];
+    let mut size = 1;
+
+    // Use windows to look at each consecutive pair.
+    for pair in ids.windows(2) {
+        let (current, next) = (pair[0], pair[1]);
+        if next == current + 1 {
+            // They are consecutive, so increase the current range.
+            size += 1;
+        } else {
+            // A gap is found, so push the current range.
+            ranges.push((offset, size));
+            // Start a new range with the next id.
+            offset = next;
+            size = 1;
+        }
+    }
+
+    // Don't forget to push the last range.
+    ranges.push((offset, size));
+    ranges
 }
