@@ -1,6 +1,10 @@
 interface l4m-vision {
-    use l4m.{model};
+    use l4m.{model as base-model};
 
-    embed-image: func(model:borrow<model>, stream-id:u32, embs:list<u32>, image-blob:list<u8>);
-    //embed-video: func(stream-id:u32, embs:list<u32>, url:string);
+    extend-model: func(model:borrow<base-model>) -> option<model>;
+
+    resource model {
+        get-base-model: func() -> base-model;
+        embed-image: func(stream-id:u32, embs:list<u32>, image-blob:list<u8>);
+    }
 }

@@ -183,23 +183,16 @@ where
         self.table.contains_key(src)
     }
 
-    pub fn lookup(&self, src: &T) -> Result<T, ObjectError> {
-        self.table
+    pub fn translate(&self, src: &mut T) -> Result<(), ObjectError> {
+        *src = self
+            .table
             .get(src)
             .cloned()
-            .ok_or(ObjectError::ObjectNotFound)
-    }
-
-    pub fn lookup_all(&self, srcs: &[T]) -> Result<Vec<T>, ObjectError> {
-        srcs.iter().map(|k| self.lookup(k)).collect()
-    }
-
-    pub fn translate(&self, src: &mut T) -> Result<(), ObjectError> {
-        *src = self.lookup(src)?;
+            .ok_or(ObjectError::ObjectNotFound)?;
         Ok(())
     }
 
-    pub fn translate_all(&self, srcs: &mut [T]) -> Result<(), ObjectError> {
+    pub fn translate_many(&self, srcs: &mut [T]) -> Result<(), ObjectError> {
         for k in srcs.iter_mut() {
             self.translate(k)?;
         }
@@ -210,7 +203,7 @@ where
         self.table.insert(src, dst);
     }
 
-    pub fn assign_all(&mut self, srcs: &[T], dsts: &[T]) {
+    pub fn assign_many(&mut self, srcs: &[T], dsts: &[T]) {
         for (key, value) in srcs.iter().zip(dsts.iter()) {
             self.assign(*key, *value);
         }
@@ -221,7 +214,7 @@ where
         Ok(())
     }
 
-    pub fn unassign_all(&mut self, srcs: &[T]) -> Result<(), ObjectError> {
+    pub fn unassign_many(&mut self, srcs: &[T]) -> Result<(), ObjectError> {
         srcs.iter().map(|k| self.unassign(k));
         Ok(())
     }
@@ -231,6 +224,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct RefCounter<T>
 where
     T: Eq + Hash + PrimInt,
@@ -268,19 +262,19 @@ where
         self.counters.get(&id).unwrap().get() as usize
     }
 
-    pub fn init_all(&mut self, ids: &[T]) {
+    pub fn init_many(&mut self, ids: &[T]) {
         for id in ids {
             self.init(id.clone());
         }
     }
 
-    pub fn destroy_all(&mut self, ids: &[T]) {
+    pub fn destroy_many(&mut self, ids: &[T]) {
         for id in ids {
             self.destroy(id.clone());
         }
     }
 
-    pub fn inc_all(&self, ids: &[T]) {
+    pub fn inc_many(&self, ids: &[T]) {
         for id in ids {
             self.inc(id.clone());
         }

@@ -1,6 +1,6 @@
 use crate::instance::{Command, Id as InstanceId};
 use crate::lm::{CausalLanguageModel, CausalTransformer, ImageEmbedder, KvBlock};
-use crate::object::{Fetcher, IdMapper, VspaceId};
+use crate::object::{IdMapper, VspaceId};
 use crate::runtime::Runtime;
 use crate::server::ServerMessage;
 use crate::utils::Stream;

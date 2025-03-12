@@ -1,4 +1,5 @@
 use crate::instance::spi::app::l4m::HostSampleTopKResult;
+use crate::instance::spi::app::l4m_vision::BaseModel;
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::IdPool;
 use crate::{driver_l4m, lm, object};
@@ -26,6 +27,8 @@ bindgen!({
         "wasi:io/poll": wasmtime_wasi::bindings::io::poll,
         "spi:app/l4m/sample-top-k-result": SampleTopKResult,
         "spi:app/l4m/model": Model,
+        "spi:app/l4m-vision/model": VisionModel,
+
     },
     trappable_imports: true,
 });
@@ -249,6 +252,10 @@ impl Drop for InstanceState {
 }
 
 pub struct Model {
+    name: String,
+}
+
+pub struct VisionModel {
     name: String,
 }
 
@@ -740,32 +747,56 @@ impl spi::app::l4m::Host for InstanceState {
 }
 
 impl spi::app::l4m_vision::Host for InstanceState {
-    async fn embed_image(
+    async fn extend_model(
         &mut self,
         model: Resource<Model>,
-        stream: u32,
-        embs: Vec<object::IdRepr>,
-        image_blob: Vec<u8>,
-    ) -> Result<(), wasmtime::Error> {
-        let cmd = Command::EmbedImage {
-            stream,
-            embs: object::Id::map_from_repr(embs),
-            image: "url".to_string(),
+    ) -> Result<Option<Resource<VisionModel>>, wasmtime::Error> {
+        let vision_model = VisionModel {
+            name: "".to_string(),
         };
 
-        self.cmd_buffer.send((self.id, cmd));
+        let res = self.table().push(vision_model)?;
 
-        Ok(())
+        Ok(Some(res))
     }
-
-    // async fn embed_video(
+    //
+    // async fn embed_image(
     //     &mut self,
+    //     model: Resource<Model>,
     //     stream: u32,
     //     embs: Vec<object::IdRepr>,
-    //     url: String,
+    //     image_blob: Vec<u8>,
     // ) -> Result<(), wasmtime::Error> {
-    //     todo!()
+    //     let cmd = Command::EmbedImage {
+    //         stream,
+    //         embs: object::Id::map_from_repr(embs),
+    //         image: "url".to_string(),
+    //     };
+    //
+    //     self.cmd_buffer.send((self.id, cmd));
+    //
+    //     Ok(())
     // }
+}
+
+impl spi::app::l4m_vision::HostModel for InstanceState {
+    async fn get_base_model(&mut self, self_: Resource<VisionModel>) -> Result<Resource<Model>> {
+        todo!()
+    }
+
+    async fn embed_image(
+        &mut self,
+        self_: Resource<VisionModel>,
+        stream_id: u32,
+        embs: Vec<u32>,
+        image_blob: Vec<u8>,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    async fn drop(&mut self, rep: Resource<VisionModel>) -> Result<()> {
+        todo!()
+    }
 }
 
 pub struct SampleTopKResult {

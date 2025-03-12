@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::backend::BackendError;
-use crate::driver::{BatchQueue, DriverError};
-use crate::object::{Allocator, Fetcher, Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
+use crate::driver::{BatchQueue, DriverError, KorTStrategy};
+use crate::object::{Allocator,  Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
 use crate::tokenizer::BytePairEncoder;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
@@ -281,7 +281,7 @@ where
         self.backend
             .exec(req)
             .await
-            .map_err(|_| DriverError::SendError)?;
+            .map_err(|_| DriverError::SendError);
 
         Ok(())
     }
@@ -333,7 +333,7 @@ where
         self.exec_in_backend(cmd, vec![EventHandle::GetInfo(tx)])
             .await?;
 
-        let resp = rx.await.map_err(|_| DriverError::SendError)?;
+        let resp = rx.await.map_err(|_| DriverError::SendError("".to_string()))?;
 
         Ok(resp)
     }
@@ -446,27 +446,27 @@ struct CommandBatcher {
 impl CommandBatcher {
     fn new(max_wait_time: Duration, min_size: usize, max_size: usize) -> Self {
         Self {
-            allocate: BatchQueue::eager(),
-            deallocate: BatchQueue::eager(),
-            copy_block: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
-            mask_block: BatchQueue::eager(),
-            embed_text: BatchQueue::eager(),
-            fill_block: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
-            sample_top_k: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
-            decode_token_distribution: BatchQueue::k_or_t(max_wait_time, min_size, Some(max_size)),
+            allocate: BatchQueue::new(KorTStrategy::eager().into_box()),
+            deallocate:BatchQueue::new(KorTStrategy::eager().into_box()),
+            copy_block: BatchQueue::new(KorTStrategy::eager().into_box()),
+            mask_block: BatchQueue::new(KorTStrategy::eager().into_box()),
+            embed_text: BatchQueue::new(KorTStrategy::eager().into_box()),
+            fill_block: BatchQueue::new(KorTStrategy::eager().into_box()),
+            sample_top_k: BatchQueue::new(KorTStrategy::eager().into_box()),
+            decode_token_distribution:BatchQueue::new(KorTStrategy::eager().into_box()),
         }
     }
 
     fn eager() -> Self {
         Self {
-            allocate: BatchQueue::eager(),
-            deallocate: BatchQueue::eager(),
-            copy_block: BatchQueue::eager(),
-            mask_block: BatchQueue::eager(),
-            embed_text: BatchQueue::eager(),
-            fill_block: BatchQueue::eager(),
-            sample_top_k: BatchQueue::eager(),
-            decode_token_distribution: BatchQueue::eager(),
+            allocate:BatchQueue::new(KorTStrategy::eager().into_box()),
+            deallocate:BatchQueue::new(KorTStrategy::eager().into_box()),
+            copy_block: BatchQueue::new(KorTStrategy::eager().into_box()),
+            mask_block:BatchQueue::new(KorTStrategy::eager().into_box()),
+            embed_text:BatchQueue::new(KorTStrategy::eager().into_box()),
+            fill_block:BatchQueue::new(KorTStrategy::eager().into_box()),
+            sample_top_k: BatchQueue::new(KorTStrategy::eager().into_box()),
+            decode_token_distribution: BatchQueue::new(KorTStrategy::eager().into_box()),
         }
     }
 
@@ -562,9 +562,9 @@ impl CommandBatcher {
         }
 
         if let Some(items) = self.sample_top_k.batch(curr_timestamp) {
-            
+
             let (items, senders) = items.into_iter().unzip();
-            
+
             cmds.push((
                 l4m::request::Command::SampleTopKRequest(l4m::BatchSampleTopKRequest { items }),
                 senders,

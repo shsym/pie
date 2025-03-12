@@ -1,16 +1,7 @@
-// Command -> Enum that defines the commands that can be sent to the backend
-
-// Driver
-
-// Executor -> the Trait that defines compatible backends
-
-// Simulator
-
 use crate::backend::ExecuteCommand;
 use crate::controller::ControllerError;
 use crate::driver::{BatchQueue, BatchingStrategy, DriverError, KorTStrategy, StreamId};
 use crate::instance::Id as InstanceId;
-use crate::lm::KvBlock;
 use crate::object::{IdRepr, ObjectError, VspaceId, group_consecutive_ids};
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::{Counter, IdPool, RefCounter, TranslationTable};
@@ -18,16 +9,20 @@ use crate::{backend, instance, lm, object, tokenizer, utils};
 use anyhow::anyhow;
 use dashmap::DashMap;
 use rand::Rng;
+use std::cell::RefCell;
 use std::cmp::PartialEq;
 use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::mem::Discriminant;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot};
 
-mod protobuf {
+pub const PROTOCOL: &str = "l4m"; // for future backward compatibility
+
+mod pb_bindings {
     include!(concat!(env!("OUT_DIR"), "/l4m.rs"));
 }
 
@@ -163,24 +158,87 @@ pub struct Driver<B> {
     subscriptions: HashMap<String, Vec<InstanceId>>,
     exported_blocks: HashMap<String, ExportedBlocks>,
 
-    obj_id_pools: HashMap<Namespace, IdPool<IdRepr>>,
-    obj_ref_counters: HashMap<Namespace, RefCounter<IdRepr>>,
-    obj_id_spaces: HashMap<(InstanceId, Namespace), TranslationTable<IdRepr>>,
+    // Rc for shared ownership across multiple "extension drivers"
+    objects: Rc<RefCell<ObjectRegistry>>,
 
     info: Info,
     utils: Arc<Utils>,
 }
 
+#[derive(Debug)]
+struct ObjectRegistry {
+    // Object Physical ID pools
+    id: HashMap<Namespace, IdPool<IdRepr>>,
+
+    // Reference counter for physical objects
+    rc: HashMap<Namespace, RefCounter<IdRepr>>,
+
+    // Translation table for virtual to physical ID mapping
+    vid: HashMap<(InstanceId, Namespace), TranslationTable<IdRepr>>,
+}
+
+// Read-only view of the object registry
+#[derive(Debug)]
+pub struct ObjectRegistryView {
+    objects: Rc<RefCell<ObjectRegistry>>,
+}
+
+impl ObjectRegistryView {
+    fn new(objects: Rc<RefCell<ObjectRegistry>>) -> Self {
+        Self { objects }
+    }
+
+    pub fn translate(
+        &self,
+        inst: InstanceId,
+        namespace: Namespace,
+        id: &mut IdRepr,
+    ) -> Result<(), DriverError> {
+        let object = self.objects.borrow();
+        object
+            .vid
+            .get(&(inst, namespace))
+            .ok_or(DriverError::InstanceNotFound(inst))?
+            .translate(id)
+            .map_err(|e| DriverError::ObjectError(e))
+    }
+
+    pub fn translate_many(
+        &self,
+        inst: InstanceId,
+        namespace: Namespace,
+        ids: &mut [IdRepr],
+    ) -> Result<(), DriverError> {
+        let object = self.objects.borrow();
+        object
+            .vid
+            .get(&(inst, namespace))
+            .ok_or(DriverError::InstanceNotFound(inst))?
+            .translate_many(ids)
+            .map_err(|e| DriverError::ObjectError(e))
+    }
+}
+
+impl ObjectRegistry {
+    fn new() -> Self {
+        Self {
+            id: HashMap::new(),
+            rc: HashMap::new(),
+            vid: HashMap::new(),
+        }
+    }
+}
+
 impl<B> Driver<B>
 where
-    B: ExecuteCommand<protobuf::Request, protobuf::Response>,
+    B: ExecuteCommand<pb_bindings::Request, pb_bindings::Response>,
 {
     pub async fn new(backend: B) {
         let (tx, rx) = mpsc::channel(1000);
         backend.report_to(tx).await;
 
         let event_table = Arc::new(DashMap::new());
-        let event_loop_handle = tokio::spawn(Self::handle_response(rx, event_table.clone()));
+        let event_loop_handle = tokio::spawn(Self::event_loop(rx, event_table.clone()));
 
         let info = {
             let (info_tx, info_rx) = oneshot::channel();
@@ -188,10 +246,10 @@ where
             event_table.insert(0, vec![Event::GetInfo(info_tx)]);
 
             backend
-                .exec(protobuf::Request {
+                .exec(pb_bindings::Request {
                     correlation_id: 0,
-                    command: Some(protobuf::request::Command::GetInfo(
-                        protobuf::GetInfoRequest {},
+                    command: Some(pb_bindings::request::Command::GetInfo(
+                        pb_bindings::GetInfoRequest {},
                     )),
                 })
                 .await;
@@ -229,6 +287,12 @@ where
             (CommandType::SampleTopK, KorTStrategy::eager().into_box()),
         ];
 
+        let mut objects = ObjectRegistry::new();
+        for namespace in Namespace::iter_all() {
+            objects.id.insert(namespace, IdPool::new(IdRepr::MAX));
+            objects.rc.insert(namespace, RefCounter::new());
+        }
+
         let driver = Self {
             backend,
             cmd_id_pool: IdPool::new(u32::MAX),
@@ -238,25 +302,26 @@ where
             event_loop_handle,
             subscriptions: HashMap::new(),
             exported_blocks: HashMap::new(),
-            obj_id_pools: HashMap::new(),
-            obj_ref_counters: HashMap::new(),
-            obj_id_spaces: HashMap::new(),
+            objects: Rc::new(RefCell::new(objects)),
             info,
             utils: Arc::new(utils),
         };
     }
 
+    pub fn get_object_registry_view(&self) -> ObjectRegistryView {
+        ObjectRegistryView::new(self.objects.clone())
+    }
+
     pub fn init_instance(&mut self, inst: InstanceId) -> Result<(), DriverError> {
+        let mut objects = RefCell::borrow_mut(&self.objects);
+
         for namespace in Namespace::iter_all() {
-            if self.obj_id_spaces.contains_key(&(inst, namespace)) {
+            if objects.vid.contains_key(&(inst, namespace)) {
                 return Err(DriverError::InstanceAlreadyExists(inst));
             }
 
-            self.obj_id_pools
-                .insert(namespace, IdPool::new(IdRepr::MAX));
-
-            self.obj_ref_counters.insert(namespace, RefCounter::new());
-            self.obj_id_spaces
+            objects
+                .vid
                 .insert((inst, namespace), TranslationTable::new());
         }
 
@@ -265,14 +330,20 @@ where
 
     pub fn destroy_instance(&mut self, inst: InstanceId) -> Result<(), DriverError> {
         for namespace in Namespace::iter_all() {
-            let ids = self
-                .obj_id_spaces
-                .get(&(inst, namespace))
-                .ok_or(DriverError::InstanceNotFound(inst))?
-                .to_list();
+            let ids = {
+                let mut objects = RefCell::borrow_mut(&self.objects);
+
+                objects
+                    .vid
+                    .get(&(inst, namespace))
+                    .ok_or(DriverError::InstanceNotFound(inst))?
+                    .to_list()
+            };
 
             self.submit(inst, 0, Command::Deallocate { namespace, ids })?;
-            self.obj_id_spaces.remove(&(inst, namespace));
+
+            let mut objects = RefCell::borrow_mut(&self.objects);
+            objects.vid.remove(&(inst, namespace));
         }
 
         // Remove all exported blocks
@@ -303,40 +374,45 @@ where
     ) -> Result<Option<Command>, DriverError> {
         // Convert virtual id -> real id
 
+        let mut objects = RefCell::borrow_mut(&self.objects);
+
         let resolved_cmd = match cmd {
             Command::Allocate { namespace, ids } => {
                 // first check the validity of virtual ID.
                 // To ensure that the user is not mapping the VID to the same PID multiple times.
                 // If the ID is already mapped, return an error.
                 if !namespace.allow_remapping() {
-                    let space = self
-                        .obj_id_spaces
+                    let space = objects
+                        .vid
                         .get(&(inst, namespace))
                         .ok_or(DriverError::InstanceNotFound(inst))?;
+
+                    // let space = self
+                    //     .obj_id_spaces
+                    //     .get(&(inst, namespace))
+                    //     .ok_or(DriverError::InstanceNotFound(inst))?;
 
                     if let Some(id) = ids.iter().find(|id| space.exists(id)) {
                         return Err(DriverError::Other(format!("ID already exists: {}", id)));
                     }
                 }
 
-                let phys_ids = self
-                    .obj_id_pools
+                let phys_ids = objects
+                    .id
                     .get_mut(&namespace)
                     .unwrap()
                     .acquire_many(ids.len())
                     .map_err(|e| DriverError::ObjectError(ObjectError::NoAvailableSpace))?;
 
-                self.obj_id_spaces
+                objects
+                    .vid
                     .get_mut(&(inst, namespace))
                     .ok_or(DriverError::InstanceNotFound(inst))?
-                    .assign_all(&ids, &phys_ids);
+                    .assign_many(&ids, &phys_ids);
 
                 // If the object is sharable, manage ref counters
                 if namespace.is_sharable() {
-                    self.obj_ref_counters
-                        .get_mut(&namespace)
-                        .unwrap()
-                        .init_all(&phys_ids);
+                    objects.rc.get_mut(&namespace).unwrap().init_many(&phys_ids);
                 }
 
                 Some(Command::Allocate {
@@ -345,10 +421,11 @@ where
                 })
             }
             Command::Deallocate { namespace, mut ids } => {
-                self.obj_id_spaces
+                objects
+                    .vid
                     .get(&(inst, namespace))
                     .ok_or(DriverError::InstanceNotFound(inst))?
-                    .translate_all(&mut ids)
+                    .translate_many(&mut ids)
                     .map_err(|e| DriverError::ObjectError(e));
 
                 let phys_ids = ids;
@@ -358,24 +435,18 @@ where
 
                     // Decrement ref count
                     for phys_id in phys_ids {
-                        let free = self
-                            .obj_ref_counters
-                            .get_mut(&namespace)
-                            .unwrap()
-                            .dec(phys_id);
+                        let free = objects.rc.get_mut(&namespace).unwrap().dec(phys_id);
 
                         if free {
-                            self.obj_id_pools
-                                .get_mut(&namespace)
-                                .unwrap()
-                                .release(phys_id);
+                            objects.id.get_mut(&namespace).unwrap().release(phys_id);
 
                             phys_ids_freed.push(phys_id);
                         }
                     }
                     phys_ids_freed
                 } else {
-                    self.obj_id_pools
+                    objects
+                        .id
                         .get_mut(&namespace)
                         .unwrap()
                         .release_many(&phys_ids);
@@ -394,8 +465,8 @@ where
                 mut outputs,
             } => {
                 let (phys_block, phys_context) = {
-                    let space = self
-                        .obj_id_spaces
+                    let space = objects
+                        .vid
                         .get_mut(&(inst, Namespace::KV_BLOCK))
                         .ok_or(DriverError::InstanceNotFound(inst))?;
 
@@ -404,24 +475,21 @@ where
                         .map_err(|e| DriverError::ObjectError(e))?;
 
                     space
-                        .translate_all(&mut context)
+                        .translate_many(&mut context)
                         .map_err(|e| DriverError::ObjectError(e))?;
 
                     (block, context)
                 };
 
                 let (phys_inputs, phys_outputs) = {
-                    let space = self
-                        .obj_id_spaces
-                        .get_mut(&(inst, Namespace::TOKEN_EMB))
-                        .unwrap();
+                    let space = objects.vid.get_mut(&(inst, Namespace::TOKEN_EMB)).unwrap();
 
                     space
-                        .translate_all(&mut inputs)
+                        .translate_many(&mut inputs)
                         .map_err(|e| DriverError::ObjectError(e))?;
 
                     space
-                        .translate_all(&mut outputs)
+                        .translate_many(&mut outputs)
                         .map_err(|e| DriverError::ObjectError(e))?;
 
                     (inputs, outputs)
@@ -439,20 +507,22 @@ where
                 resource_name,
                 sticky,
             } => {
-                self.obj_id_spaces
+                objects
+                    .vid
                     .get(&(inst, Namespace::KV_BLOCK))
                     .unwrap()
-                    .translate_all(&mut blocks)
+                    .translate_many(&mut blocks)
                     .map_err(|e| DriverError::ObjectError(e))?;
 
                 let phys_block_ids = blocks;
 
                 // If sticky, increment ref count so that the blocks are not deallocated even if the owner program terminates.
                 if sticky {
-                    self.obj_ref_counters
+                    objects
+                        .rc
                         .get_mut(&Namespace::KV_BLOCK)
                         .unwrap()
-                        .inc_all(&phys_block_ids);
+                        .inc_many(&phys_block_ids);
                 }
 
                 let exported_blocks = ExportedBlocks::new(inst, phys_block_ids);
@@ -472,19 +542,17 @@ where
                             resource_name
                         )))?;
 
-                let space = self
-                    .obj_id_spaces
-                    .get_mut(&(inst, Namespace::KV_BLOCK))
-                    .unwrap();
+                let space = objects.vid.get_mut(&(inst, Namespace::KV_BLOCK)).unwrap();
 
                 if let Some(id) = blocks.iter().find(|id| space.exists(id)) {
                     return Err(DriverError::Other(format!("ID already exists: {}", id)));
                 } else {
-                    space.assign_all(&blocks, &exported.addrs);
-                    self.obj_ref_counters
+                    space.assign_many(&blocks, &exported.addrs);
+                    objects
+                        .rc
                         .get_mut(&Namespace::KV_BLOCK)
                         .unwrap()
-                        .inc_all(&exported.addrs);
+                        .inc_many(&exported.addrs);
                 }
                 None
             }
@@ -500,27 +568,31 @@ where
                 None
             }
             Command::CopyBlock {
-                src_block,
-                dst_block,
+                mut src_block,
+                mut dst_block,
                 src_token_offset,
                 dst_token_offset,
                 size,
             } => {
-                let space = self
-                    .obj_id_spaces
+                let space = objects
+                    .vid
                     .get_mut(&(inst, Namespace::KV_BLOCK))
                     .ok_or(DriverError::InstanceNotFound(inst))?;
 
+                space.translate(&mut src_block);
+                space.translate(&mut dst_block);
+
                 Some(Command::CopyBlock {
-                    src_block: space.lookup(&src_block)?,
-                    dst_block: space.lookup(&dst_block)?,
+                    src_block,
+                    dst_block,
                     src_token_offset,
                     dst_token_offset,
                     size,
                 })
             }
             Command::MaskBlock { mut block, mask } => {
-                self.obj_id_spaces
+                objects
+                    .vid
                     .get_mut(&(inst, Namespace::KV_BLOCK))
                     .ok_or(DriverError::InstanceNotFound(inst))?
                     .translate(&mut block);
@@ -532,10 +604,11 @@ where
                 text,
                 positions,
             } => {
-                self.obj_id_spaces
+                objects
+                    .vid
                     .get_mut(&(inst, Namespace::TOKEN_EMB))
                     .ok_or(DriverError::InstanceNotFound(inst))?
-                    .translate_all(&mut embs)
+                    .translate_many(&mut embs)
                     .map_err(|e| DriverError::ObjectError(e))?;
 
                 Some(Command::EmbedText {
@@ -548,16 +621,18 @@ where
                 mut embs,
                 mut dists,
             } => {
-                self.obj_id_spaces
+                objects
+                    .vid
                     .get(&(inst, Namespace::TOKEN_EMB))
                     .ok_or(DriverError::InstanceNotFound(inst))?
-                    .translate_all(&mut embs)
+                    .translate_many(&mut embs)
                     .map_err(|e| DriverError::ObjectError(e))?;
 
-                self.obj_id_spaces
+                objects
+                    .vid
                     .get(&(inst, Namespace::TOKEN_DIST))
                     .ok_or(DriverError::InstanceNotFound(inst))?
-                    .translate_all(&mut dists)
+                    .translate_many(&mut dists)
                     .map_err(|e| DriverError::ObjectError(e))?;
 
                 Some(Command::DecodeTokenDist { embs, dists })
@@ -567,7 +642,8 @@ where
                 k,
                 handle,
             } => {
-                self.obj_id_spaces
+                objects
+                    .vid
                     .get_mut(&(inst, Namespace::TOKEN_DIST))
                     .ok_or(DriverError::InstanceNotFound(inst))?
                     .translate(&mut dist)
@@ -634,15 +710,15 @@ where
                         Command::Allocate { namespace, ids }
                         | Command::Deallocate { namespace, ids } => {
                             let kind = match namespace {
-                                Namespace::KV_BLOCK => protobuf::ObjectKind::KvBlock,
-                                Namespace::TOKEN_EMB => protobuf::ObjectKind::Emb,
-                                Namespace::TOKEN_DIST => protobuf::ObjectKind::Dist,
+                                Namespace::KV_BLOCK => pb_bindings::ObjectKind::KvBlock,
+                                Namespace::TOKEN_EMB => pb_bindings::ObjectKind::Emb,
+                                Namespace::TOKEN_DIST => pb_bindings::ObjectKind::Dist,
                                 _ => unreachable!(),
                             }
                             .into();
 
                             for (offset, size) in group_consecutive_ids(&ids) {
-                                let pb = protobuf::Allocate {
+                                let pb = pb_bindings::Allocate {
                                     kind,
                                     object_id_offset: offset,
                                     count: size as u32,
@@ -654,7 +730,7 @@ where
                     }
                 }
                 (
-                    protobuf::request::Command::Allocate(protobuf::BatchAllocate { items }),
+                    pb_bindings::request::Command::Allocate(pb_bindings::BatchAllocate { items }),
                     None,
                 )
             }
@@ -669,7 +745,7 @@ where
                             inputs,
                             outputs,
                         } => {
-                            let pb = protobuf::FillBlock {
+                            let pb = pb_bindings::FillBlock {
                                 block_id: block,
                                 context_block_ids: context,
                                 input_embedding_ids: inputs,
@@ -681,7 +757,7 @@ where
                     }
                 }
                 (
-                    protobuf::request::Command::FillBlock(protobuf::BatchFillBlock { items }),
+                    pb_bindings::request::Command::FillBlock(pb_bindings::BatchFillBlock { items }),
                     None,
                 )
             }
@@ -697,7 +773,7 @@ where
                             dst_token_offset,
                             size,
                         } => {
-                            let pb = protobuf::CopyBlock {
+                            let pb = pb_bindings::CopyBlock {
                                 source_block_id: src_block,
                                 destination_block_id: dst_block,
                                 source_start: src_token_offset,
@@ -711,7 +787,7 @@ where
                 }
 
                 (
-                    protobuf::request::Command::CopyBlock(protobuf::BatchCopyBlock { items }),
+                    pb_bindings::request::Command::CopyBlock(pb_bindings::BatchCopyBlock { items }),
                     None,
                 )
             }
@@ -721,7 +797,7 @@ where
                 for cmd in cmd_batch {
                     match cmd {
                         Command::MaskBlock { block, mask } => {
-                            let pb = protobuf::MaskBlock {
+                            let pb = pb_bindings::MaskBlock {
                                 block_id: block,
                                 mask,
                             };
@@ -732,7 +808,7 @@ where
                 }
 
                 (
-                    protobuf::request::Command::MaskBlock(protobuf::BatchMaskBlock { items }),
+                    pb_bindings::request::Command::MaskBlock(pb_bindings::BatchMaskBlock { items }),
                     None,
                 )
             }
@@ -747,7 +823,7 @@ where
                             positions,
                         } => {
                             for i in 0..embs.len() {
-                                let pb = protobuf::EmbedText {
+                                let pb = pb_bindings::EmbedText {
                                     embedding_id: embs[i],
                                     token_id: text[i],
                                     position_id: positions[i],
@@ -760,7 +836,7 @@ where
                 }
 
                 (
-                    protobuf::request::Command::EmbedText(protobuf::BatchEmbedText { items }),
+                    pb_bindings::request::Command::EmbedText(pb_bindings::BatchEmbedText { items }),
                     None,
                 )
             }
@@ -771,7 +847,7 @@ where
                     match cmd {
                         Command::DecodeTokenDist { embs, dists } => {
                             for i in 0..embs.len() {
-                                let pb = protobuf::DecodeTokenDistribution {
+                                let pb = pb_bindings::DecodeTokenDistribution {
                                     embedding_id: embs[i],
                                     distribution_id: dists[i],
                                 };
@@ -783,8 +859,8 @@ where
                 }
 
                 (
-                    protobuf::request::Command::DecodeTokenDistribution(
-                        protobuf::BatchDecodeTokenDistribution { items },
+                    pb_bindings::request::Command::DecodeTokenDistribution(
+                        pb_bindings::BatchDecodeTokenDistribution { items },
                     ),
                     None,
                 )
@@ -796,7 +872,7 @@ where
                 for cmd in cmd_batch {
                     match cmd {
                         Command::SampleTopK { dist, k, handle } => {
-                            let pb = protobuf::SampleTopKRequest {
+                            let pb = pb_bindings::SampleTopKRequest {
                                 distribution_id: dist,
                                 k,
                             };
@@ -809,8 +885,8 @@ where
                     }
                 }
                 (
-                    protobuf::request::Command::SampleTopKRequest(
-                        protobuf::BatchSampleTopKRequest { items },
+                    pb_bindings::request::Command::SampleTopKRequest(
+                        pb_bindings::BatchSampleTopKRequest { items },
                     ),
                     Some(events),
                 )
@@ -823,7 +899,7 @@ where
             .acquire()
             .map_err(|e| DriverError::LockError)?;
 
-        let req = protobuf::Request {
+        let req = pb_bindings::Request {
             correlation_id,
             command: Some(cmd),
         };
@@ -840,8 +916,8 @@ where
         Ok(())
     }
 
-    async fn handle_response(
-        mut rx: Receiver<protobuf::Response>,
+    async fn event_loop(
+        mut rx: Receiver<pb_bindings::Response>,
         event_table: Arc<DashMap<u32, Vec<Event>>>,
     ) {
         while let Some(resp) = rx.recv().await {
@@ -850,7 +926,7 @@ where
 
             if let Some((_, senders)) = event_table.remove(&correlation_id) {
                 match payload {
-                    protobuf::response::Command::SampleTopK(batch) => {
+                    pb_bindings::response::Command::SampleTopK(batch) => {
                         for (item, event) in batch.items.into_iter().zip(senders) {
                             match event {
                                 Event::SampleTopK(handle) => {
@@ -861,7 +937,7 @@ where
                         }
                     }
 
-                    protobuf::response::Command::GetInfo(info) => {
+                    pb_bindings::response::Command::GetInfo(info) => {
                         let sender = senders.into_iter().next().unwrap();
                         match sender {
                             Event::GetInfo(handle) => {
@@ -1000,10 +1076,10 @@ impl Namespace {
 #[derive(Clone)]
 pub struct Simulator {}
 
-impl backend::Simulate<protobuf::Request, protobuf::Response> for Simulator {
-    fn simulate(&mut self, req: protobuf::Request) -> Option<protobuf::Response> {
+impl backend::Simulate<pb_bindings::Request, pb_bindings::Response> for Simulator {
+    fn simulate(&mut self, req: pb_bindings::Request) -> Option<pb_bindings::Response> {
         let resp_payload = match req.command.unwrap() {
-            protobuf::request::Command::SampleTopKRequest(batch) => {
+            pb_bindings::request::Command::SampleTopKRequest(batch) => {
                 let items = batch.items.into_iter().map(|item| {
                     let mut rng = rand::rng();
                     let token_ids: Vec<_> =
@@ -1011,34 +1087,34 @@ impl backend::Simulate<protobuf::Request, protobuf::Response> for Simulator {
 
                     let probs: Vec<_> = (0..item.k).map(|_| rng.random()).collect();
 
-                    protobuf::SampleTopKResponse {
+                    pb_bindings::SampleTopKResponse {
                         token_ids,
                         probabilities: probs,
                     }
                 });
 
-                Some(protobuf::response::Command::SampleTopK(
-                    protobuf::BatchSampleTopKResponse {
+                Some(pb_bindings::response::Command::SampleTopK(
+                    pb_bindings::BatchSampleTopKResponse {
                         items: items.collect(),
                     },
                 ))
             }
 
-            protobuf::request::Command::GetInfo(_) => Some(protobuf::response::Command::GetInfo(
-                protobuf::GetInfoResponse {
+            pb_bindings::request::Command::GetInfo(_) => Some(
+                pb_bindings::response::Command::GetInfo(pb_bindings::GetInfoResponse {
                     version: "0.1.0".to_string(),
                     model_name: "DummyModel".to_string(),
                     block_size: 128,
                     num_available_blocks: 1000000,
                     num_available_embeddings: 1000000,
                     num_available_distributions: 100000,
-                },
-            )),
+                }),
+            ),
             _ => None,
         };
 
         if let Some(payload) = resp_payload {
-            Some(protobuf::Response {
+            Some(pb_bindings::Response {
                 correlation_id: req.correlation_id,
                 command: Some(payload),
             })

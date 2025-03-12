@@ -27,7 +27,7 @@ pub struct Driver<B> {
     cmd_id_pool: utils::IdPool<u32>,
 }
 
-impl<B> Driver<B>
+impl<B> Driver<B>   
 where
     B: ExecuteCommand,
 {
@@ -66,7 +66,7 @@ where
         self.backend
             .exec(msg)
             .await
-            .map_err(|_| DriverError::SendError)?;
+            .map_err(|_| DriverError::SendError("".to_string()))?;
 
         Ok(())
     }
