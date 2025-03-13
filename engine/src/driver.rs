@@ -179,6 +179,7 @@ pub trait Batchable<G> {
     fn group(&self) -> G;
 }
 
+#[derive(Debug)]
 pub struct Batcher<T, S, G> {
     current_group_by_stream: HashMap<S, G>,
     streams_by_current_group: HashMap<G, Vec<S>>,

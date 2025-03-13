@@ -1,10 +1,14 @@
 use crate::backend::ExecuteCommand;
 use crate::controller::ControllerError;
-use crate::driver::{BatchQueue, BatchingStrategy, DriverError, KorTStrategy, StreamId};
+use crate::driver::{
+    BatchQueue, Batchable, Batcher, BatchingStrategy, DriverError, KorTStrategy, StreamId,
+};
 use crate::instance::Id as InstanceId;
-use crate::object::{IdRepr, ObjectError, VspaceId, group_consecutive_ids};
+use crate::object::{
+    IdRepr, ObjectError, ObjectManager, ObjectType, VspaceId, group_consecutive_ids,
+};
 use crate::tokenizer::BytePairEncoder;
-use crate::utils::{Counter, IdPool, RefCounter, TranslationTable};
+use crate::utils::{Counter, IdPool};
 use crate::{backend, instance, lm, object, tokenizer, utils};
 use anyhow::anyhow;
 use dashmap::DashMap;
@@ -45,12 +49,12 @@ pub struct Utils {
 #[derive(Debug)]
 pub enum Command {
     Allocate {
-        namespace: Namespace,
+        ty: ManagedTypes,
         ids: Vec<IdRepr>,
     },
 
     Deallocate {
-        namespace: Namespace,
+        ty: ManagedTypes,
         ids: Vec<IdRepr>,
     },
 
@@ -64,7 +68,6 @@ pub enum Command {
     ExportBlocks {
         blocks: Vec<IdRepr>,
         resource_name: String,
-        sticky: bool,
     },
 
     ImportBlocks {
@@ -108,13 +111,10 @@ pub enum Command {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-enum CommandType {
+enum CommandGroup {
     Allocate,
     Deallocate,
     FillBlock,
-    ExportBlocks,
-    ImportBlocks,
-    GetAllExportedBlocks,
     CopyBlock,
     MaskBlock,
     EmbedText,
@@ -122,35 +122,69 @@ enum CommandType {
     SampleTopK,
 }
 
-impl Command {
-    fn to_type(&self) -> CommandType {
+impl Batchable<CommandGroup> for Command {
+    fn strategy(&self) -> Box<dyn BatchingStrategy> {
         match self {
-            Command::Allocate { .. } => CommandType::Allocate,
-            Command::Deallocate { .. } => CommandType::Deallocate,
-            Command::FillBlock { .. } => CommandType::FillBlock,
-            Command::ExportBlocks { .. } => CommandType::ExportBlocks,
-            Command::ImportBlocks { .. } => CommandType::ImportBlocks,
-            Command::GetAllExportedBlocks { .. } => CommandType::GetAllExportedBlocks,
-            Command::CopyBlock { .. } => CommandType::CopyBlock,
-            Command::MaskBlock { .. } => CommandType::MaskBlock,
-            Command::EmbedText { .. } => CommandType::EmbedText,
-            Command::DecodeTokenDist { .. } => CommandType::DecodeTokenDist,
-            Command::SampleTopK { .. } => CommandType::SampleTopK,
+            Command::Allocate { .. } => KorTStrategy::eager().into_box(),
+            Command::Deallocate { .. } => KorTStrategy::eager().into_box(),
+            Command::FillBlock { .. } => KorTStrategy::eager().into_box(),
+            Command::CopyBlock { .. } => KorTStrategy::eager().into_box(),
+            Command::MaskBlock { .. } => KorTStrategy::eager().into_box(),
+            Command::EmbedText { .. } => KorTStrategy::eager().into_box(),
+            Command::DecodeTokenDist { .. } => KorTStrategy::eager().into_box(),
+            Command::SampleTopK { .. } => KorTStrategy::eager().into_box(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn group(&self) -> CommandGroup {
+        match self {
+            Command::Allocate { .. } => CommandGroup::Allocate,
+            Command::Deallocate { .. } => CommandGroup::Deallocate,
+            Command::FillBlock { .. } => CommandGroup::FillBlock,
+            Command::CopyBlock { .. } => CommandGroup::CopyBlock,
+            Command::MaskBlock { .. } => CommandGroup::MaskBlock,
+            Command::EmbedText { .. } => CommandGroup::EmbedText,
+            Command::DecodeTokenDist { .. } => CommandGroup::DecodeTokenDist,
+            Command::SampleTopK { .. } => CommandGroup::SampleTopK,
+            _ => unreachable!(),
         }
     }
 }
 
+#[derive(Debug)]
 pub enum Event {
     SampleTopK(oneshot::Sender<(Vec<u32>, Vec<f32>)>),
 
     GetInfo(oneshot::Sender<Info>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ManagedTypes {
+    KvBlock,
+    TokenEmb,
+    TokenDist,
+}
+
+impl ObjectType for ManagedTypes {
+    fn is_sharable(&self) -> bool {
+        todo!()
+    }
+
+    fn allow_remapping(&self) -> bool {
+        todo!()
+    }
+
+    fn max_capacity(&self) -> IdRepr {
+        todo!()
+    }
+}
+
+#[derive(Debug)]
 pub struct Driver<B> {
     backend: B,
     cmd_id_pool: IdPool<u32>,
-    cmd_queue_by_stream: HashMap<(InstanceId, StreamId), VecDeque<Command>>,
-    cmd_batcher: CommandBatcher,
+    cmd_batcher: Batcher<Command, (InstanceId, StreamId), CommandGroup>,
 
     event_table: Arc<DashMap<u32, Vec<Event>>>,
     event_loop_handle: tokio::task::JoinHandle<()>,
@@ -159,73 +193,41 @@ pub struct Driver<B> {
     exported_blocks: HashMap<String, ExportedBlocks>,
 
     // Rc for shared ownership across multiple "extension drivers"
-    objects: Rc<RefCell<ObjectRegistry>>,
+    objects: Rc<RefCell<ObjectManager<InstanceId, ManagedTypes>>>,
 
     info: Info,
     utils: Arc<Utils>,
 }
 
-#[derive(Debug)]
-struct ObjectRegistry {
-    // Object Physical ID pools
-    id: HashMap<Namespace, IdPool<IdRepr>>,
-
-    // Reference counter for physical objects
-    rc: HashMap<Namespace, RefCounter<IdRepr>>,
-
-    // Translation table for virtual to physical ID mapping
-    vid: HashMap<(InstanceId, Namespace), TranslationTable<IdRepr>>,
-}
-
 // Read-only view of the object registry
 #[derive(Debug)]
 pub struct ObjectRegistryView {
-    objects: Rc<RefCell<ObjectRegistry>>,
+    objects: Rc<RefCell<ObjectManager<InstanceId, ManagedTypes>>>,
 }
 
 impl ObjectRegistryView {
-    fn new(objects: Rc<RefCell<ObjectRegistry>>) -> Self {
+    fn new(objects: Rc<RefCell<ObjectManager<InstanceId, ManagedTypes>>>) -> Self {
         Self { objects }
     }
 
     pub fn translate(
         &self,
+        ty: ManagedTypes,
         inst: InstanceId,
-        namespace: Namespace,
         id: &mut IdRepr,
-    ) -> Result<(), DriverError> {
+    ) -> Result<(), ObjectError> {
         let object = self.objects.borrow();
-        object
-            .vid
-            .get(&(inst, namespace))
-            .ok_or(DriverError::InstanceNotFound(inst))?
-            .translate(id)
-            .map_err(|e| DriverError::ObjectError(e))
+        object.translate(ty, inst, id)
     }
 
     pub fn translate_many(
         &self,
+        ty: ManagedTypes,
         inst: InstanceId,
-        namespace: Namespace,
         ids: &mut [IdRepr],
-    ) -> Result<(), DriverError> {
+    ) -> Result<(), ObjectError> {
         let object = self.objects.borrow();
-        object
-            .vid
-            .get(&(inst, namespace))
-            .ok_or(DriverError::InstanceNotFound(inst))?
-            .translate_many(ids)
-            .map_err(|e| DriverError::ObjectError(e))
-    }
-}
-
-impl ObjectRegistry {
-    fn new() -> Self {
-        Self {
-            id: HashMap::new(),
-            rc: HashMap::new(),
-            vid: HashMap::new(),
-        }
+        object.translate_many(ty, inst, ids)
     }
 }
 
@@ -273,36 +275,15 @@ where
             block_size: info.block_size,
         };
 
-        let batch_policy = vec![
-            (CommandType::Allocate, KorTStrategy::eager().into_box()),
-            (CommandType::Deallocate, KorTStrategy::eager().into_box()),
-            (CommandType::FillBlock, KorTStrategy::eager().into_box()),
-            (CommandType::CopyBlock, KorTStrategy::eager().into_box()),
-            (CommandType::MaskBlock, KorTStrategy::eager().into_box()),
-            (CommandType::EmbedText, KorTStrategy::eager().into_box()),
-            (
-                CommandType::DecodeTokenDist,
-                KorTStrategy::eager().into_box(),
-            ),
-            (CommandType::SampleTopK, KorTStrategy::eager().into_box()),
-        ];
-
-        let mut objects = ObjectRegistry::new();
-        for namespace in Namespace::iter_all() {
-            objects.id.insert(namespace, IdPool::new(IdRepr::MAX));
-            objects.rc.insert(namespace, RefCounter::new());
-        }
-
         let driver = Self {
             backend,
             cmd_id_pool: IdPool::new(u32::MAX),
-            cmd_queue_by_stream: HashMap::new(),
-            cmd_batcher: CommandBatcher::new(batch_policy),
+            cmd_batcher: Batcher::new(),
             event_table,
             event_loop_handle,
             subscriptions: HashMap::new(),
             exported_blocks: HashMap::new(),
-            objects: Rc::new(RefCell::new(objects)),
+            objects: Rc::new(RefCell::new(ObjectManager::new())),
             info,
             utils: Arc::new(utils),
         };
@@ -313,37 +294,39 @@ where
     }
 
     pub fn init_instance(&mut self, inst: InstanceId) -> Result<(), DriverError> {
-        let mut objects = RefCell::borrow_mut(&self.objects);
-
-        for namespace in Namespace::iter_all() {
-            if objects.vid.contains_key(&(inst, namespace)) {
-                return Err(DriverError::InstanceAlreadyExists(inst));
-            }
-
-            objects
-                .vid
-                .insert((inst, namespace), TranslationTable::new());
-        }
+        // let mut objects = RefCell::borrow_mut(&self.objects);
+        //
+        // for namespace in Namespace::iter_all() {
+        //     if objects.vid.contains_key(&(inst, namespace)) {
+        //         return Err(DriverError::InstanceAlreadyExists(inst));
+        //     }
+        //
+        //     objects
+        //         .vid
+        //         .insert((inst, namespace), TranslationTable::new());
+        // }
 
         Ok(())
     }
 
     pub fn destroy_instance(&mut self, inst: InstanceId) -> Result<(), DriverError> {
-        for namespace in Namespace::iter_all() {
-            let ids = {
-                let mut objects = RefCell::borrow_mut(&self.objects);
+        let mut cmds = Vec::new();
 
-                objects
-                    .vid
-                    .get(&(inst, namespace))
-                    .ok_or(DriverError::InstanceNotFound(inst))?
-                    .to_list()
-            };
+        for ty in [
+            ManagedTypes::KvBlock,
+            ManagedTypes::TokenEmb,
+            ManagedTypes::TokenDist,
+        ] {
+            let mut obj_mgr = RefCell::borrow_mut(&self.objects);
 
-            self.submit(inst, 0, Command::Deallocate { namespace, ids })?;
+            cmds.push(Command::Deallocate {
+                ty,
+                ids: obj_mgr.all_names(ty, inst)?,
+            })
+        }
 
-            let mut objects = RefCell::borrow_mut(&self.objects);
-            objects.vid.remove(&(inst, namespace));
+        for cmd in cmds {
+            self.submit(inst, 0, cmd, Instant::now())?;
         }
 
         // Remove all exported blocks
@@ -357,106 +340,38 @@ where
         inst: InstanceId,
         stream: StreamId,
         cmd: Command,
+        now: Instant,
     ) -> Result<(), DriverError> {
-        if let Some(cmd) = self.process_command(inst, cmd)? {
-            self.cmd_queue_by_stream
-                .entry((inst, stream))
-                .or_insert_with(VecDeque::new)
-                .push_back(cmd);
+        if let Some(cmd) = self.translate_cmd(inst, cmd)? {
+            self.cmd_batcher.push((inst, stream), cmd, now);
         }
         Ok(())
     }
 
-    fn process_command(
+    fn translate_cmd(
         &mut self,
         inst: InstanceId,
         cmd: Command,
     ) -> Result<Option<Command>, DriverError> {
         // Convert virtual id -> real id
 
+        //let mut objects = RefCell::borrow_mut(&self.objects);
         let mut objects = RefCell::borrow_mut(&self.objects);
 
         let resolved_cmd = match cmd {
-            Command::Allocate { namespace, ids } => {
-                // first check the validity of virtual ID.
-                // To ensure that the user is not mapping the VID to the same PID multiple times.
-                // If the ID is already mapped, return an error.
-                if !namespace.allow_remapping() {
-                    let space = objects
-                        .vid
-                        .get(&(inst, namespace))
-                        .ok_or(DriverError::InstanceNotFound(inst))?;
+            Command::Allocate { ty, ids } => {
+                let ids = objects.create_many(ty, inst, ids)?;
 
-                    // let space = self
-                    //     .obj_id_spaces
-                    //     .get(&(inst, namespace))
-                    //     .ok_or(DriverError::InstanceNotFound(inst))?;
-
-                    if let Some(id) = ids.iter().find(|id| space.exists(id)) {
-                        return Err(DriverError::Other(format!("ID already exists: {}", id)));
-                    }
-                }
-
-                let phys_ids = objects
-                    .id
-                    .get_mut(&namespace)
-                    .unwrap()
-                    .acquire_many(ids.len())
-                    .map_err(|e| DriverError::ObjectError(ObjectError::NoAvailableSpace))?;
-
-                objects
-                    .vid
-                    .get_mut(&(inst, namespace))
-                    .ok_or(DriverError::InstanceNotFound(inst))?
-                    .assign_many(&ids, &phys_ids);
-
-                // If the object is sharable, manage ref counters
-                if namespace.is_sharable() {
-                    objects.rc.get_mut(&namespace).unwrap().init_many(&phys_ids);
-                }
-
-                Some(Command::Allocate {
-                    namespace,
-                    ids: phys_ids,
-                })
+                Some(Command::Allocate { ty, ids })
             }
-            Command::Deallocate { namespace, mut ids } => {
-                objects
-                    .vid
-                    .get(&(inst, namespace))
-                    .ok_or(DriverError::InstanceNotFound(inst))?
-                    .translate_many(&mut ids)
-                    .map_err(|e| DriverError::ObjectError(e));
+            Command::Deallocate { ty, ids } => {
+                let ids = objects.destroy_many(ty, inst, &ids)?;
 
-                let phys_ids = ids;
+                if ids.is_empty() {
+                    return Ok(None);
+                }
 
-                let phys_ids_freed = if namespace.is_sharable() {
-                    let mut phys_ids_freed = Vec::new();
-
-                    // Decrement ref count
-                    for phys_id in phys_ids {
-                        let free = objects.rc.get_mut(&namespace).unwrap().dec(phys_id);
-
-                        if free {
-                            objects.id.get_mut(&namespace).unwrap().release(phys_id);
-
-                            phys_ids_freed.push(phys_id);
-                        }
-                    }
-                    phys_ids_freed
-                } else {
-                    objects
-                        .id
-                        .get_mut(&namespace)
-                        .unwrap()
-                        .release_many(&phys_ids);
-                    phys_ids
-                };
-
-                Some(Command::Deallocate {
-                    namespace,
-                    ids: phys_ids_freed,
-                })
+                Some(Command::Deallocate { ty, ids })
             }
             Command::FillBlock {
                 mut block,
@@ -464,69 +379,26 @@ where
                 mut inputs,
                 mut outputs,
             } => {
-                let (phys_block, phys_context) = {
-                    let space = objects
-                        .vid
-                        .get_mut(&(inst, Namespace::KV_BLOCK))
-                        .ok_or(DriverError::InstanceNotFound(inst))?;
-
-                    space
-                        .translate(&mut block)
-                        .map_err(|e| DriverError::ObjectError(e))?;
-
-                    space
-                        .translate_many(&mut context)
-                        .map_err(|e| DriverError::ObjectError(e))?;
-
-                    (block, context)
-                };
-
-                let (phys_inputs, phys_outputs) = {
-                    let space = objects.vid.get_mut(&(inst, Namespace::TOKEN_EMB)).unwrap();
-
-                    space
-                        .translate_many(&mut inputs)
-                        .map_err(|e| DriverError::ObjectError(e))?;
-
-                    space
-                        .translate_many(&mut outputs)
-                        .map_err(|e| DriverError::ObjectError(e))?;
-
-                    (inputs, outputs)
-                };
+                objects.translate(ManagedTypes::KvBlock, inst, &mut block)?;
+                objects.translate_many(ManagedTypes::KvBlock, inst, &mut context)?;
+                objects.translate_many(ManagedTypes::TokenEmb, inst, &mut inputs)?;
+                objects.translate_many(ManagedTypes::TokenEmb, inst, &mut outputs)?;
 
                 Some(Command::FillBlock {
-                    block: phys_block,
-                    context: phys_context,
-                    inputs: phys_inputs,
-                    outputs: phys_outputs,
+                    block,
+                    context,
+                    inputs,
+                    outputs,
                 })
             }
             Command::ExportBlocks {
                 mut blocks,
                 resource_name,
-                sticky,
             } => {
-                objects
-                    .vid
-                    .get(&(inst, Namespace::KV_BLOCK))
-                    .unwrap()
-                    .translate_many(&mut blocks)
-                    .map_err(|e| DriverError::ObjectError(e))?;
+                objects.translate_many(ManagedTypes::KvBlock, inst, &mut blocks)?;
 
-                let phys_block_ids = blocks;
-
-                // If sticky, increment ref count so that the blocks are not deallocated even if the owner program terminates.
-                if sticky {
-                    objects
-                        .rc
-                        .get_mut(&Namespace::KV_BLOCK)
-                        .unwrap()
-                        .inc_many(&phys_block_ids);
-                }
-
-                let exported_blocks = ExportedBlocks::new(inst, phys_block_ids);
-                self.exported_blocks.insert(resource_name, exported_blocks);
+                self.exported_blocks
+                    .insert(resource_name, ExportedBlocks::new(inst, blocks));
 
                 None
             }
@@ -542,18 +414,8 @@ where
                             resource_name
                         )))?;
 
-                let space = objects.vid.get_mut(&(inst, Namespace::KV_BLOCK)).unwrap();
+                objects.create_ref_many(ManagedTypes::KvBlock, inst, blocks, &exported.addrs)?;
 
-                if let Some(id) = blocks.iter().find(|id| space.exists(id)) {
-                    return Err(DriverError::Other(format!("ID already exists: {}", id)));
-                } else {
-                    space.assign_many(&blocks, &exported.addrs);
-                    objects
-                        .rc
-                        .get_mut(&Namespace::KV_BLOCK)
-                        .unwrap()
-                        .inc_many(&exported.addrs);
-                }
                 None
             }
             Command::GetAllExportedBlocks { handle } => {
@@ -574,13 +436,8 @@ where
                 dst_token_offset,
                 size,
             } => {
-                let space = objects
-                    .vid
-                    .get_mut(&(inst, Namespace::KV_BLOCK))
-                    .ok_or(DriverError::InstanceNotFound(inst))?;
-
-                space.translate(&mut src_block);
-                space.translate(&mut dst_block);
+                objects.translate(ManagedTypes::KvBlock, inst, &mut src_block)?;
+                objects.translate(ManagedTypes::KvBlock, inst, &mut dst_block)?;
 
                 Some(Command::CopyBlock {
                     src_block,
@@ -591,11 +448,7 @@ where
                 })
             }
             Command::MaskBlock { mut block, mask } => {
-                objects
-                    .vid
-                    .get_mut(&(inst, Namespace::KV_BLOCK))
-                    .ok_or(DriverError::InstanceNotFound(inst))?
-                    .translate(&mut block);
+                objects.translate(ManagedTypes::KvBlock, inst, &mut block)?;
 
                 Some(Command::MaskBlock { block, mask })
             }
@@ -604,12 +457,7 @@ where
                 text,
                 positions,
             } => {
-                objects
-                    .vid
-                    .get_mut(&(inst, Namespace::TOKEN_EMB))
-                    .ok_or(DriverError::InstanceNotFound(inst))?
-                    .translate_many(&mut embs)
-                    .map_err(|e| DriverError::ObjectError(e))?;
+                objects.translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
 
                 Some(Command::EmbedText {
                     embs,
@@ -621,19 +469,8 @@ where
                 mut embs,
                 mut dists,
             } => {
-                objects
-                    .vid
-                    .get(&(inst, Namespace::TOKEN_EMB))
-                    .ok_or(DriverError::InstanceNotFound(inst))?
-                    .translate_many(&mut embs)
-                    .map_err(|e| DriverError::ObjectError(e))?;
-
-                objects
-                    .vid
-                    .get(&(inst, Namespace::TOKEN_DIST))
-                    .ok_or(DriverError::InstanceNotFound(inst))?
-                    .translate_many(&mut dists)
-                    .map_err(|e| DriverError::ObjectError(e))?;
+                objects.translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
+                objects.translate_many(ManagedTypes::TokenDist, inst, &mut dists)?;
 
                 Some(Command::DecodeTokenDist { embs, dists })
             }
@@ -642,12 +479,7 @@ where
                 k,
                 handle,
             } => {
-                objects
-                    .vid
-                    .get_mut(&(inst, Namespace::TOKEN_DIST))
-                    .ok_or(DriverError::InstanceNotFound(inst))?
-                    .translate(&mut dist)
-                    .map_err(|e| DriverError::ObjectError(e))?;
+                objects.translate(ManagedTypes::TokenDist, inst, &mut dist)?;
 
                 Some(Command::SampleTopK { dist, k, handle })
             }
@@ -657,42 +489,7 @@ where
     }
 
     pub async fn flush(&mut self, now: Instant) -> Result<(), DriverError> {
-        let mut keys_to_remove = Vec::new();
-
-        // Horizontal batching: group commands by stream and type.
-        for (key, cmd_queue) in self.cmd_queue_by_stream.iter_mut() {
-            // non-flushed commands sharing the same stream in the cmd_batcher
-            // None -> no commands in the batch queue with the same stream
-            let mut prev_cmd_type = self.cmd_batcher.cmd_type(key);
-
-            while !cmd_queue.is_empty() {
-                let curr_cmd_type = cmd_queue.front().unwrap().to_type();
-
-                // Vertical batching: Same kind of consecutive commands are batched together.
-                // if the current command is different from the previous one, stop batching.
-                if let Some(prev_cmd_type) = prev_cmd_type {
-                    if curr_cmd_type != prev_cmd_type {
-                        break;
-                    }
-                }
-                prev_cmd_type = Some(curr_cmd_type);
-
-                let cmd = cmd_queue.pop_front().unwrap();
-                self.cmd_batcher.push(*key, cmd, now);
-            }
-
-            // remove the vecdeque if it is empty
-            if cmd_queue.is_empty() {
-                keys_to_remove.push(*key);
-            }
-        }
-
-        // Remove empty queues outside the loop.
-        for key in keys_to_remove {
-            self.cmd_queue_by_stream.remove(&key);
-        }
-
-        for cmd_batch in self.cmd_batcher.batch_all(now) {
+        for (_, cmd_batch) in self.cmd_batcher.batch(now) {
             self.commit_backend(cmd_batch).await?;
         }
 
@@ -700,19 +497,18 @@ where
     }
 
     async fn commit_backend(&mut self, cmd_batch: Vec<Command>) -> Result<(), DriverError> {
-        let cmd_type = cmd_batch.first().unwrap().to_type();
+        let cmd_type = cmd_batch.first().unwrap().group();
 
-        let (cmd, event) = match cmd_type {
-            CommandType::Allocate | CommandType::Deallocate => {
+        let (cmd, event) = match cmd_type.clone() {
+            CommandGroup::Allocate | CommandGroup::Deallocate => {
                 let mut items = Vec::new();
                 for cmd in cmd_batch {
                     match cmd {
-                        Command::Allocate { namespace, ids }
-                        | Command::Deallocate { namespace, ids } => {
-                            let kind = match namespace {
-                                Namespace::KV_BLOCK => pb_bindings::ObjectKind::KvBlock,
-                                Namespace::TOKEN_EMB => pb_bindings::ObjectKind::Emb,
-                                Namespace::TOKEN_DIST => pb_bindings::ObjectKind::Dist,
+                        Command::Allocate { ty, ids } | Command::Deallocate { ty, ids } => {
+                            let kind = match ty {
+                                ManagedTypes::KvBlock => pb_bindings::ObjectKind::KvBlock,
+                                ManagedTypes::TokenEmb => pb_bindings::ObjectKind::Emb,
+                                ManagedTypes::TokenDist => pb_bindings::ObjectKind::Dist,
                                 _ => unreachable!(),
                             }
                             .into();
@@ -729,13 +525,19 @@ where
                         _ => unreachable!(),
                     }
                 }
-                (
-                    pb_bindings::request::Command::Allocate(pb_bindings::BatchAllocate { items }),
-                    None,
-                )
+
+                let pb = if cmd_type == CommandGroup::Allocate {
+                    pb_bindings::request::Command::Allocate(pb_bindings::BatchAllocate { items })
+                } else {
+                    pb_bindings::request::Command::Deallocate(pb_bindings::BatchDeallocate {
+                        items,
+                    })
+                };
+
+                (pb, None)
             }
 
-            CommandType::FillBlock => {
+            CommandGroup::FillBlock => {
                 let mut items = Vec::new();
                 for cmd in cmd_batch {
                     match cmd {
@@ -762,7 +564,7 @@ where
                 )
             }
 
-            CommandType::CopyBlock => {
+            CommandGroup::CopyBlock => {
                 let mut items = Vec::new();
                 for cmd in cmd_batch {
                     match cmd {
@@ -791,7 +593,7 @@ where
                     None,
                 )
             }
-            CommandType::MaskBlock => {
+            CommandGroup::MaskBlock => {
                 let mut items = Vec::new();
 
                 for cmd in cmd_batch {
@@ -812,7 +614,7 @@ where
                     None,
                 )
             }
-            CommandType::EmbedText => {
+            CommandGroup::EmbedText => {
                 let mut items = Vec::new();
 
                 for cmd in cmd_batch {
@@ -840,7 +642,7 @@ where
                     None,
                 )
             }
-            CommandType::DecodeTokenDist => {
+            CommandGroup::DecodeTokenDist => {
                 let mut items = Vec::new();
 
                 for cmd in cmd_batch {
@@ -865,7 +667,7 @@ where
                     None,
                 )
             }
-            CommandType::SampleTopK => {
+            CommandGroup::SampleTopK => {
                 let mut items = Vec::new();
                 let mut events = Vec::new();
 
@@ -960,74 +762,6 @@ where
 }
 
 #[derive(Debug)]
-struct CommandBatcher {
-    type_tracker: HashMap<(InstanceId, StreamId), CommandType>,
-    type_tracker_inv: HashMap<CommandType, Vec<(InstanceId, StreamId)>>,
-    queue: HashMap<CommandType, BatchQueue<Command>>,
-}
-
-impl CommandBatcher {
-    fn new(policies: Vec<(CommandType, Box<dyn BatchingStrategy>)>) -> Self {
-        let mut queue = HashMap::new();
-        let mut type_tracker_inv = HashMap::new();
-        for (cmd_type, strategy) in policies {
-            queue.insert(cmd_type, BatchQueue::new(strategy));
-            type_tracker_inv.insert(cmd_type, Vec::new());
-        }
-
-        Self {
-            type_tracker: HashMap::new(),
-            type_tracker_inv,
-            queue,
-        }
-    }
-
-    fn cmd_type(&self, key: &(InstanceId, StreamId)) -> Option<CommandType> {
-        self.type_tracker.get(key).cloned()
-    }
-
-    fn push(&mut self, key: (InstanceId, StreamId), cmd: Command, now: Instant) {
-        let cmd_type = cmd.to_type();
-
-        // Ensure the key's command type is consistent.
-        if let Some(&existing_type) = self.type_tracker.get(&key) {
-            assert_eq!(
-                existing_type, cmd_type,
-                "Mismatched command type for key {:?}",
-                key
-            );
-        } else {
-            self.type_tracker.insert(key, cmd_type);
-            self.type_tracker_inv.get_mut(&cmd_type).unwrap().push(key);
-        }
-
-        self.queue.get_mut(&cmd_type).unwrap().push(cmd, now);
-    }
-
-    fn batch_all(&mut self, now: Instant) -> Vec<Vec<Command>> {
-        //
-        let mut all_batched_cmds = Vec::new();
-
-        for (cmd_type, queue) in self.queue.iter_mut() {
-            if let Some(cmds) = queue.batch(now) {
-                for key in self
-                    .type_tracker_inv
-                    .get_mut(cmd_type)
-                    .unwrap()
-                    .drain(..cmds.len())
-                {
-                    self.type_tracker.remove(&key);
-                }
-
-                all_batched_cmds.push(cmds);
-            }
-        }
-
-        all_batched_cmds
-    }
-}
-
-#[derive(Debug)]
 struct ExportedBlocks {
     owner: instance::Id,
     addrs: Vec<IdRepr>,
@@ -1036,40 +770,6 @@ struct ExportedBlocks {
 impl ExportedBlocks {
     pub fn new(owner: instance::Id, addrs: Vec<IdRepr>) -> Self {
         Self { owner, addrs }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct Namespace(usize);
-
-impl Namespace {
-    pub const KV_BLOCK: Namespace = Namespace(0);
-    pub const TOKEN_EMB: Namespace = Namespace(1);
-    pub const TOKEN_DIST: Namespace = Namespace(2);
-    pub fn size() -> usize {
-        3
-    }
-
-    pub fn is_sharable(&self) -> bool {
-        match self.0 {
-            0 => true,
-            1 => false,
-            2 => false,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn allow_remapping(&self) -> bool {
-        match self.0 {
-            0 => false,
-            1 => true,
-            2 => true,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn iter_all() -> impl Iterator<Item = Namespace> {
-        (0..Self::size()).map(Namespace)
     }
 }
 
