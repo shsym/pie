@@ -3,13 +3,13 @@ use crate::controller::ControllerError;
 use crate::driver::{
     BatchQueue, Batchable, Batcher, BatchingStrategy, DriverError, KorTStrategy, StreamId,
 };
-use crate::instance::Id as InstanceId;
+use crate::instance_old::Id as InstanceId;
 use crate::object::{
     IdRepr, ObjectError, ObjectManager, ObjectType, VspaceId, group_consecutive_ids,
 };
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::{Counter, IdPool};
-use crate::{backend, instance, lm, object, tokenizer, utils};
+use crate::{backend, instance_old, lm, object, tokenizer, utils};
 use anyhow::anyhow;
 use dashmap::DashMap;
 use rand::Rng;
@@ -41,13 +41,19 @@ pub struct Info {
 }
 
 #[derive(Debug)]
-pub struct Utils {
-    pub tokenizer: BytePairEncoder,
-    pub block_size: u32,
-}
-
-#[derive(Debug)]
 pub enum Command {
+    GetBlockSize {
+        handle: oneshot::Sender<u32>,
+    },
+
+    GetTokenizer {
+        handle: oneshot::Sender<Arc<BytePairEncoder>>,
+    },
+
+    GetAllExportedBlocks {
+        handle: oneshot::Sender<Vec<(String, IdRepr)>>,
+    },
+
     Allocate {
         ty: ManagedTypes,
         ids: Vec<IdRepr>,
@@ -73,10 +79,6 @@ pub enum Command {
     ImportBlocks {
         blocks: Vec<IdRepr>,
         resource_name: String,
-    },
-
-    GetAllExportedBlocks {
-        handle: oneshot::Sender<Vec<(String, IdRepr)>>,
     },
 
     CopyBlock {
@@ -111,7 +113,7 @@ pub enum Command {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-enum CommandGroup {
+enum BatchGroup {
     Allocate,
     Deallocate,
     FillBlock,
@@ -122,7 +124,7 @@ enum CommandGroup {
     SampleTopK,
 }
 
-impl Batchable<CommandGroup> for Command {
+impl Batchable<BatchGroup> for Command {
     fn strategy(&self) -> Box<dyn BatchingStrategy> {
         match self {
             Command::Allocate { .. } => KorTStrategy::eager().into_box(),
@@ -137,16 +139,16 @@ impl Batchable<CommandGroup> for Command {
         }
     }
 
-    fn group(&self) -> CommandGroup {
+    fn group(&self) -> BatchGroup {
         match self {
-            Command::Allocate { .. } => CommandGroup::Allocate,
-            Command::Deallocate { .. } => CommandGroup::Deallocate,
-            Command::FillBlock { .. } => CommandGroup::FillBlock,
-            Command::CopyBlock { .. } => CommandGroup::CopyBlock,
-            Command::MaskBlock { .. } => CommandGroup::MaskBlock,
-            Command::EmbedText { .. } => CommandGroup::EmbedText,
-            Command::DecodeTokenDist { .. } => CommandGroup::DecodeTokenDist,
-            Command::SampleTopK { .. } => CommandGroup::SampleTopK,
+            Command::Allocate { .. } => BatchGroup::Allocate,
+            Command::Deallocate { .. } => BatchGroup::Deallocate,
+            Command::FillBlock { .. } => BatchGroup::FillBlock,
+            Command::CopyBlock { .. } => BatchGroup::CopyBlock,
+            Command::MaskBlock { .. } => BatchGroup::MaskBlock,
+            Command::EmbedText { .. } => BatchGroup::EmbedText,
+            Command::DecodeTokenDist { .. } => BatchGroup::DecodeTokenDist,
+            Command::SampleTopK { .. } => BatchGroup::SampleTopK,
             _ => unreachable!(),
         }
     }
@@ -184,7 +186,7 @@ impl ObjectType for ManagedTypes {
 pub struct Driver<B> {
     backend: B,
     cmd_id_pool: IdPool<u32>,
-    cmd_batcher: Batcher<Command, (InstanceId, StreamId), CommandGroup>,
+    cmd_batcher: Batcher<Command, (InstanceId, StreamId), BatchGroup>,
 
     event_table: Arc<DashMap<u32, Vec<Event>>>,
     event_loop_handle: tokio::task::JoinHandle<()>,
@@ -196,16 +198,16 @@ pub struct Driver<B> {
     objects: Rc<RefCell<ObjectManager<InstanceId, ManagedTypes>>>,
 
     info: Info,
-    utils: Arc<Utils>,
+    tokenizer: Arc<BytePairEncoder>,
 }
 
 // Read-only view of the object registry
 #[derive(Debug)]
-pub struct ObjectRegistryView {
+pub struct ObjectView {
     objects: Rc<RefCell<ObjectManager<InstanceId, ManagedTypes>>>,
 }
 
-impl ObjectRegistryView {
+impl ObjectView {
     fn new(objects: Rc<RefCell<ObjectManager<InstanceId, ManagedTypes>>>) -> Self {
         Self { objects }
     }
@@ -268,12 +270,9 @@ where
             info.num_distributions
         );
 
-        let utils = Utils {
-            // TODO: load the tokenizer model based on the info.model_name
-            tokenizer: tokenizer::llama3_tokenizer("../test-tokenizer/tokenizer.model")
-                .expect("Tokenizer load failed"),
-            block_size: info.block_size,
-        };
+        // TODO: load the tokenizer model based on the info.model_name
+        let tokenizer = tokenizer::llama3_tokenizer("../test-tokenizer/tokenizer.model")
+            .expect("Tokenizer load failed");
 
         let driver = Self {
             backend,
@@ -285,12 +284,12 @@ where
             exported_blocks: HashMap::new(),
             objects: Rc::new(RefCell::new(ObjectManager::new())),
             info,
-            utils: Arc::new(utils),
+            tokenizer: Arc::new(tokenizer),
         };
     }
 
-    pub fn get_object_registry_view(&self) -> ObjectRegistryView {
-        ObjectRegistryView::new(self.objects.clone())
+    pub fn get_object_registry_view(&self) -> ObjectView {
+        ObjectView::new(self.objects.clone())
     }
 
     pub fn init_instance(&mut self, inst: InstanceId) -> Result<(), DriverError> {
@@ -353,12 +352,36 @@ where
         inst: InstanceId,
         cmd: Command,
     ) -> Result<Option<Command>, DriverError> {
-        // Convert virtual id -> real id
 
-        //let mut objects = RefCell::borrow_mut(&self.objects);
         let mut objects = RefCell::borrow_mut(&self.objects);
 
         let resolved_cmd = match cmd {
+            Command::GetBlockSize { handle } => {
+                handle
+                    .send(self.info.block_size)
+                    .map_err(|_| DriverError::SendError("GetBlockSize failed.".to_string()))?;
+                None
+            }
+
+            Command::GetTokenizer { handle } => {
+                handle
+                    .send(self.tokenizer.clone())
+                    .map_err(|_| DriverError::SendError("GetTokenizer failed.".to_string()))?;
+                None
+            }
+
+            Command::GetAllExportedBlocks { handle } => {
+                let catalogue = self
+                    .exported_blocks
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.addrs.len() as u32))
+                    .collect();
+                handle.send(catalogue).map_err(|_| {
+                    DriverError::SendError("GetAllExportedBlocks failed.".to_string())
+                })?;
+                None
+            }
+
             Command::Allocate { ty, ids } => {
                 let ids = objects.create_many(ty, inst, ids)?;
 
@@ -418,17 +441,7 @@ where
 
                 None
             }
-            Command::GetAllExportedBlocks { handle } => {
-                let catalogue = self
-                    .exported_blocks
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.addrs.len() as u32))
-                    .collect();
-                handle.send(catalogue).map_err(|_| {
-                    DriverError::SendError("GetAllExportedBlocks failed.".to_string())
-                })?;
-                None
-            }
+
             Command::CopyBlock {
                 mut src_block,
                 mut dst_block,
@@ -500,7 +513,7 @@ where
         let cmd_type = cmd_batch.first().unwrap().group();
 
         let (cmd, event) = match cmd_type.clone() {
-            CommandGroup::Allocate | CommandGroup::Deallocate => {
+            BatchGroup::Allocate | BatchGroup::Deallocate => {
                 let mut items = Vec::new();
                 for cmd in cmd_batch {
                     match cmd {
@@ -526,7 +539,7 @@ where
                     }
                 }
 
-                let pb = if cmd_type == CommandGroup::Allocate {
+                let pb = if cmd_type == BatchGroup::Allocate {
                     pb_bindings::request::Command::Allocate(pb_bindings::BatchAllocate { items })
                 } else {
                     pb_bindings::request::Command::Deallocate(pb_bindings::BatchDeallocate {
@@ -537,7 +550,7 @@ where
                 (pb, None)
             }
 
-            CommandGroup::FillBlock => {
+            BatchGroup::FillBlock => {
                 let mut items = Vec::new();
                 for cmd in cmd_batch {
                     match cmd {
@@ -564,7 +577,7 @@ where
                 )
             }
 
-            CommandGroup::CopyBlock => {
+            BatchGroup::CopyBlock => {
                 let mut items = Vec::new();
                 for cmd in cmd_batch {
                     match cmd {
@@ -593,7 +606,7 @@ where
                     None,
                 )
             }
-            CommandGroup::MaskBlock => {
+            BatchGroup::MaskBlock => {
                 let mut items = Vec::new();
 
                 for cmd in cmd_batch {
@@ -614,7 +627,7 @@ where
                     None,
                 )
             }
-            CommandGroup::EmbedText => {
+            BatchGroup::EmbedText => {
                 let mut items = Vec::new();
 
                 for cmd in cmd_batch {
@@ -642,7 +655,7 @@ where
                     None,
                 )
             }
-            CommandGroup::DecodeTokenDist => {
+            BatchGroup::DecodeTokenDist => {
                 let mut items = Vec::new();
 
                 for cmd in cmd_batch {
@@ -667,7 +680,7 @@ where
                     None,
                 )
             }
-            CommandGroup::SampleTopK => {
+            BatchGroup::SampleTopK => {
                 let mut items = Vec::new();
                 let mut events = Vec::new();
 
@@ -763,12 +776,12 @@ where
 
 #[derive(Debug)]
 struct ExportedBlocks {
-    owner: instance::Id,
+    owner: instance_old::Id,
     addrs: Vec<IdRepr>,
 }
 
 impl ExportedBlocks {
-    pub fn new(owner: instance::Id, addrs: Vec<IdRepr>) -> Self {
+    pub fn new(owner: instance_old::Id, addrs: Vec<IdRepr>) -> Self {
         Self { owner, addrs }
     }
 }

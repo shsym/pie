@@ -1,9 +1,9 @@
-mod l4m;
-mod l4m_vision;
-mod ping;
+pub mod l4m;
+pub mod l4m_vision;
+pub mod ping;
 
 use crate::object::ObjectError;
-use crate::{instance, object};
+use crate::{instance_old, object};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -29,13 +29,13 @@ pub enum DriverError {
     VspacePoolReleaseFailed,
 
     #[error("Vspace not found for instance {0}")]
-    VspaceNotFound(instance::Id),
+    VspaceNotFound(instance_old::Id),
 
     #[error("Instance already exists: {0}")]
-    InstanceAlreadyExists(instance::Id),
+    InstanceAlreadyExists(instance_old::Id),
 
     #[error("Instance not found: {0}")]
-    InstanceNotFound(instance::Id),
+    InstanceNotFound(instance_old::Id),
 
     #[error("Namespace not found: {0}")]
     NamespaceNotFound(usize),

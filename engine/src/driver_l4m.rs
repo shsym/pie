@@ -35,7 +35,7 @@ impl<T> ExecuteCommand for T where T: backend::ExecuteCommand<l4m::Request, l4m:
 /// Intermediate representation of a command to be executed by the backend.
 /// This must not be exposed to other modules.
 #[derive(Debug)]
-enum Command {
+pub(crate) enum Command {
     // Embs
     Allocate(l4m::Allocate),
     Deallocate(l4m::Allocate),

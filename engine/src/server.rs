@@ -1,4 +1,4 @@
-use crate::instance::Id as InstanceId;
+use crate::instance_old::Id as InstanceId;
 use crate::runtime::{Runtime, RuntimeError};
 use anyhow::Result;
 use dashmap::DashMap;

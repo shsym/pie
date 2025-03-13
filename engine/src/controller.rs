@@ -1,10 +1,10 @@
-use crate::instance::{Command, Id as InstanceId};
+use crate::instance_old::{Command, Id as InstanceId};
 use crate::lm::{CausalLanguageModel, CausalTransformer, ImageEmbedder, KvBlock};
 use crate::object::{IdMapper, VspaceId};
 use crate::runtime::Runtime;
 use crate::server::ServerMessage;
 use crate::utils::Stream;
-use crate::{driver_l4m, driver_l4m_vision, driver_ping, instance, object, utils};
+use crate::{driver_l4m, driver_l4m_vision, driver_ping, instance_old, object, utils};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,13 +19,13 @@ pub enum ControllerError {
     VspacePoolReleaseFailed,
 
     #[error("Vspace not found for instance {0}")]
-    VspaceNotFound(instance::Id),
+    VspaceNotFound(instance_old::Id),
 
     #[error("Instance not found: {0}")]
-    InstanceNotFound(instance::Id),
+    InstanceNotFound(instance_old::Id),
 
     #[error("Client not found for instance {0}")]
-    ClientNotFound(instance::Id),
+    ClientNotFound(instance_old::Id),
 
     #[error("Driver error: {0}")]
     DriverError(String),
@@ -40,10 +40,10 @@ pub enum ControllerError {
 pub struct Controller<B1, B2, B3> {
     state: Arc<Runtime>,
 
-    vspaces: HashMap<instance::Id, VspaceId>,
+    vspaces: HashMap<instance_old::Id, VspaceId>,
     vspace_id_pool: utils::IdPool<VspaceId>,
 
-    subscriptions: HashMap<String, Vec<instance::Id>>,
+    subscriptions: HashMap<String, Vec<instance_old::Id>>,
     exported_blocks: HashMap<String, ExportedBlocks>,
 
     driver_l4m: driver_l4m::Driver<B1>,
@@ -79,7 +79,7 @@ where
 
     pub async fn handle_command(
         &mut self,
-        inst_id: instance::Id,
+        inst_id: instance_old::Id,
         cmd: Command,
     ) -> Result<(), ControllerError> {
         if let Err(e) = self.try_handle_command(inst_id, cmd).await {
@@ -98,7 +98,7 @@ where
 
     async fn try_handle_command(
         &mut self,
-        inst_id: instance::Id,
+        inst_id: instance_old::Id,
         cmd: Command,
     ) -> Result<(), ControllerError> {
         match cmd {

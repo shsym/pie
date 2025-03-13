@@ -7,13 +7,14 @@ mod driver;
 mod driver_l4m;
 mod driver_l4m_vision;
 mod driver_ping;
-mod instance;
+mod instance_old;
 mod lm;
 mod object;
 mod runtime;
 mod server;
 mod tokenizer;
 mod utils;
+mod instance;
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{channel, unbounded_channel};
 
 use crate::controller::Controller;
-use crate::instance::{Command, Id as InstanceId};
+use crate::instance_old::{Command, Id as InstanceId};
 use crate::server::{ServerMessage, ServerState, WebSocketServer};
 use wasmtime::{Config, Engine};
 
@@ -165,7 +166,7 @@ async fn dummy_client() -> anyhow::Result<()> {
 
         // Drain the queue of messages
         while let Ok(Some(msg)) = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+            Duration::from_millis(100),
             client.wait_for_next_message(),
         )
         .await

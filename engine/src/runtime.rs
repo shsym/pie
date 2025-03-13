@@ -5,9 +5,9 @@ use uuid::Uuid;
 use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
 use wasmtime_wasi;
 
-use crate::instance::{App, Command, Id as InstanceId, InstanceState};
+use crate::instance_old::{App, Command, Id as InstanceId, InstanceState};
 use crate::server::ServerMessage;
-use crate::{instance, tokenizer};
+use crate::{instance_old, tokenizer};
 
 use thiserror::Error;
 
@@ -168,10 +168,10 @@ impl Runtime {
                 wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
                     .map_err(|e| RuntimeError::Other(format!("Failed to link WASI: {e}")))?;
 
-                instance::spi::app::l4m::add_to_linker(&mut linker, |s| s)?;
-                instance::spi::app::l4m_vision::add_to_linker(&mut linker, |s| s)?;
-                instance::spi::app::system::add_to_linker(&mut linker, |s| s)?;
-                instance::spi::app::ping::add_to_linker(&mut linker, |s| s)?;
+                instance_old::spi::app::l4m::add_to_linker(&mut linker, |s| s)?;
+                instance_old::spi::app::l4m_vision::add_to_linker(&mut linker, |s| s)?;
+                instance_old::spi::app::system::add_to_linker(&mut linker, |s| s)?;
+                instance_old::spi::app::ping::add_to_linker(&mut linker, |s| s)?;
 
                 // App::add_to_linker(&mut linker, |s| s)
                 //     .map_err(|e| RuntimeError::Other(format!("Error adding to linker: {e}")))?;
