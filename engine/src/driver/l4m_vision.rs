@@ -1,5 +1,5 @@
 use crate::driver::{
-    Batchable, Batcher, BatchingStrategy, DriverError, KorTStrategy, StreamId, l4m,
+    Batchable, Batcher, BatchingStrategy, DriverError, KorTStrategy, LocalStreamId, l4m,
 };
 use crate::instance_old::Id as InstanceId;
 use crate::{backend, utils};
@@ -56,7 +56,7 @@ pub struct Driver<B> {
     backend: B,
     cmd_id_pool: utils::IdPool<u32>,
     objects: l4m::ObjectView,
-    cmd_batcher: Batcher<Command, (InstanceId, StreamId), BatchGroup>,
+    cmd_batcher: Batcher<Command, (InstanceId, LocalStreamId), BatchGroup>,
 }
 
 impl<B> Driver<B>
@@ -75,7 +75,7 @@ where
     pub fn submit(
         &mut self,
         inst: InstanceId,
-        stream: StreamId,
+        stream: LocalStreamId,
         cmd: Command,
     ) -> Result<(), DriverError> {
         match cmd {

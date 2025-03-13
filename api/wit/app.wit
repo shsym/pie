@@ -1,7 +1,8 @@
-package spi:app;
+package symphony:app;
 
 world app {
     import system;
+    import messaging;
     import l4m;
     import l4m-vision;
     import ping;

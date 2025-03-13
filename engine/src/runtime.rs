@@ -7,7 +7,7 @@ use wasmtime_wasi;
 
 use crate::instance_old::{App, Command, Id as InstanceId, InstanceState};
 use crate::server::ServerMessage;
-use crate::{instance_old, tokenizer};
+use crate::{bindings, instance_old, tokenizer};
 
 use thiserror::Error;
 
@@ -160,18 +160,18 @@ impl Runtime {
                 let mut store = Store::new(&engine_clone, inst_state);
                 let mut linker = Linker::new(&engine_clone);
 
-                //wasmtime_wasi_io::add_to_linker_async(&mut linker)?;
-
                 // Add to linker
                 wasmtime_wasi::add_to_linker_async(&mut linker)
                     .map_err(|e| RuntimeError::Other(format!("Failed to link WASI: {e}")))?;
                 wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
                     .map_err(|e| RuntimeError::Other(format!("Failed to link WASI: {e}")))?;
 
-                instance_old::spi::app::l4m::add_to_linker(&mut linker, |s| s)?;
-                instance_old::spi::app::l4m_vision::add_to_linker(&mut linker, |s| s)?;
-                instance_old::spi::app::system::add_to_linker(&mut linker, |s| s)?;
-                instance_old::spi::app::ping::add_to_linker(&mut linker, |s| s)?;
+                bindings::add_to_linker(&mut linker)?;
+
+                // instance_old::spi::app::l4m::add_to_linker(&mut linker, |s| s)?;
+                // instance_old::spi::app::l4m_vision::add_to_linker(&mut linker, |s| s)?;
+                // instance_old::spi::app::system::add_to_linker(&mut linker, |s| s)?;
+                // instance_old::spi::app::ping::add_to_linker(&mut linker, |s| s)?;
 
                 // App::add_to_linker(&mut linker, |s| s)
                 //     .map_err(|e| RuntimeError::Other(format!("Error adding to linker: {e}")))?;

@@ -1,6 +1,8 @@
 pub mod l4m;
 pub mod l4m_vision;
 pub mod ping;
+pub mod messaging;
+mod system;
 
 use crate::object::ObjectError;
 use crate::{instance_old, object};
@@ -47,7 +49,6 @@ pub enum DriverError {
     Other(String),
 }
 
-pub type StreamId = u32;
 
 pub trait BatchingStrategy: Debug + Send {
     fn update(&mut self, now: Instant);

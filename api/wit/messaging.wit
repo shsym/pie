@@ -1,0 +1,15 @@
+interface messaging {
+
+    // Import pollable functionality from the WASI IO poll package
+    use wasi:io/poll@0.2.4.{pollable};
+
+    broadcast: func(topic:string, message: string);
+    subscribe: func(topic:string) -> subscription;
+
+    resource subscription {
+        poll: func() -> pollable;
+        receive: func() -> option<string>;
+        unsubscribe: func();
+    }
+
+}

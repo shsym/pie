@@ -15,6 +15,7 @@ mod server;
 mod tokenizer;
 mod utils;
 mod instance;
+mod bindings;
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};

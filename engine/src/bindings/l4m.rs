@@ -1,12 +1,11 @@
-use crate::instance::wit_bindings::spi::app::l4m::HostTokenizer;
-use crate::instance::{Command, InstanceState, wit_bindings};
+use crate::driver::LocalStreamId;
+use crate::instance::{Command, InstanceState};
 use crate::object::IdRepr;
 use crate::tokenizer::BytePairEncoder;
-use crate::{driver, object};
+use crate::{bindings, driver, object};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use wasmtime::component::__internal::wasmtime_environ::component::Adapter;
 use wasmtime::component::Resource;
 use wasmtime_wasi::{DynPollable, IoView, Pollable, subscribe};
 
@@ -25,6 +24,16 @@ pub struct SampleTopKResult {
     receivers: Vec<oneshot::Receiver<(Vec<u32>, Vec<f32>)>>,
     results: Vec<(Vec<u32>, Vec<f32>)>,
     done: bool,
+}
+
+impl InstanceState {
+    fn send_l4m_cmd(
+        &self,
+        stream: LocalStreamId,
+        cmd: driver::l4m::Command,
+    ) -> anyhow::Result<(), wasmtime::Error> {
+        self.send_cmd(Command::L4m { stream, cmd })
+    }
 }
 
 #[async_trait]
@@ -49,15 +58,17 @@ pub struct Cache {
     tokenizer: Option<Tokenizer>,
 }
 
-fn map_object_types(ty: wit_bindings::spi::app::l4m::ObjectType) -> driver::l4m::ManagedTypes {
+fn map_object_types(
+    ty: bindings::wit::symphony::app::l4m::ObjectType,
+) -> driver::l4m::ManagedTypes {
     match ty {
-        wit_bindings::spi::app::l4m::ObjectType::Block => driver::l4m::ManagedTypes::KvBlock,
-        wit_bindings::spi::app::l4m::ObjectType::Dist => driver::l4m::ManagedTypes::TokenDist,
-        wit_bindings::spi::app::l4m::ObjectType::Embed => driver::l4m::ManagedTypes::TokenEmb,
+        bindings::wit::symphony::app::l4m::ObjectType::Block => driver::l4m::ManagedTypes::KvBlock,
+        bindings::wit::symphony::app::l4m::ObjectType::Dist => driver::l4m::ManagedTypes::TokenDist,
+        bindings::wit::symphony::app::l4m::ObjectType::Embed => driver::l4m::ManagedTypes::TokenEmb,
     }
 }
 
-impl wit_bindings::spi::app::l4m::Host for InstanceState {
+impl bindings::wit::symphony::app::l4m::Host for InstanceState {
     async fn get_model(&mut self, value: String) -> anyhow::Result<Option<Resource<Model>>> {
         let model = Model { name: value };
         let res = self.table().push(model)?;
@@ -69,36 +80,22 @@ impl wit_bindings::spi::app::l4m::Host for InstanceState {
     }
 }
 
-impl wit_bindings::spi::app::l4m::HostModel for InstanceState {
+impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
     async fn get_block_size(&mut self, model: Resource<Model>) -> Result<u32, wasmtime::Error> {
-        // If block size is not cached, get it from the driver
-        if self.l4m_cache.block_size.is_none() {
-            let (tx, rx) = oneshot::channel();
-            self.send_l4m_cmd(0, driver::l4m::Command::GetBlockSize { handle: tx })?;
-            let block_size = rx
-                .await
-                .or(Err(wasmtime::Error::msg("GetBlockSize failed")))?;
-            self.l4m_cache.block_size = Some(block_size)
-        }
-
-        Ok(self.l4m_cache.block_size.unwrap())
+        let (tx, rx) = oneshot::channel();
+        self.send_l4m_cmd(0, driver::l4m::Command::GetBlockSize { handle: tx })?;
+        let block_size = rx.await?;
+        Ok(block_size)
     }
 
     async fn get_tokenizer(
         &mut self,
         model: Resource<Model>,
     ) -> Result<Resource<Tokenizer>, wasmtime::Error> {
-        if self.l4m_cache.tokenizer.is_none() {
-            let (tx, rx) = oneshot::channel();
-            self.send_l4m_cmd(0, driver::l4m::Command::GetTokenizer { handle: tx })?;
-            let inner = rx
-                .await
-                .or(Err(wasmtime::Error::msg("GetTokenizer failed")))?;
-            self.l4m_cache.tokenizer = Some(Tokenizer { inner });
-        }
-        let tokenizer = self.l4m_cache.tokenizer.clone().unwrap();
-
-        let res = self.table().push(tokenizer)?;
+        let (tx, rx) = oneshot::channel();
+        self.send_l4m_cmd(0, driver::l4m::Command::GetTokenizer { handle: tx })?;
+        let inner = rx.await?;
+        let res = self.table().push(Tokenizer { inner })?;
         Ok(res)
     }
 
@@ -128,7 +125,7 @@ impl wit_bindings::spi::app::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
         stream_id: u32,
-        ty: wit_bindings::spi::app::l4m::ObjectType,
+        ty: bindings::wit::symphony::app::l4m::ObjectType,
         object_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
         self.send_l4m_cmd(
@@ -144,7 +141,7 @@ impl wit_bindings::spi::app::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
         stream_id: u32,
-        ty: wit_bindings::spi::app::l4m::ObjectType,
+        ty: bindings::wit::symphony::app::l4m::ObjectType,
         object_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
         self.send_l4m_cmd(
@@ -331,11 +328,12 @@ impl wit_bindings::spi::app::l4m::HostModel for InstanceState {
     }
 
     async fn drop(&mut self, model: Resource<Model>) -> anyhow::Result<(), wasmtime::Error> {
+        let _ = self.table().delete(model)?;
         Ok(())
     }
 }
 
-impl HostTokenizer for InstanceState {
+impl bindings::wit::symphony::app::l4m::HostTokenizer for InstanceState {
     async fn tokenize(
         &mut self,
         this: Resource<Tokenizer>,
@@ -372,7 +370,7 @@ impl HostTokenizer for InstanceState {
     }
 }
 
-impl wit_bindings::spi::app::l4m::HostSampleTopKResult for InstanceState {
+impl bindings::wit::symphony::app::l4m::HostSampleTopKResult for InstanceState {
     async fn subscribe(
         &mut self,
         this: Resource<SampleTopKResult>,

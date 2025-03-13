@@ -6,13 +6,19 @@ interface l4m {
 
     // Define basic types
     type object-id = u32;   // Object identifier type (unsigned 32-bit integer)
-    type stream-id = u32;      // stream-id identifier type (unsigned 32-bit integer)
+    type stream-id = u32;   // stream-id identifier type (unsigned 32-bit integer)
 
     // Enumeration for different object types
     enum object-type {
         block,  // Block object
         embed,  // Embed object
         dist,   // Distribution object
+    }
+
+    enum stream-priority {
+        low,
+        normal, // Default
+        high,
     }
 
     // Function to retrieve a model by its name; returns an optional model
@@ -64,6 +70,12 @@ interface l4m {
         // Samples the top k elements from a token distribution; returns a sample-top-k-result resource
         sample-top-k: func(stream-id: stream-id, dist-ids: list<object-id>, k: u32) -> sample-top-k-result;
 
+        // Wait for the stream
+        synchronize: func(stream-id: stream-id) -> synchronization-result;
+
+        // Set stream priority
+        set-stream-priority: func(stream-id: stream-id, priority: stream-priority);
+
     }
 
     resource tokenizer {
@@ -84,5 +96,10 @@ interface l4m {
 
         // Retrieves the sample result as an optional list of tuples; returns None if not ready
         get: func() -> option<list<tuple<list<u32>, list<f32>>>>; // None if not ready
+    }
+
+    resource synchronization-result {
+        subscribe: func() -> pollable;
+        get: func() -> option<()>; // None if not ready
     }
 }

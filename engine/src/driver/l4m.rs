@@ -1,8 +1,6 @@
 use crate::backend::ExecuteCommand;
 use crate::controller::ControllerError;
-use crate::driver::{
-    BatchQueue, Batchable, Batcher, BatchingStrategy, DriverError, KorTStrategy, StreamId,
-};
+use crate::driver::{BatchQueue, Batchable, Batcher, BatchingStrategy, DriverError, KorTStrategy};
 use crate::instance_old::Id as InstanceId;
 use crate::object::{
     IdRepr, ObjectError, ObjectManager, ObjectType, VspaceId, group_consecutive_ids,
@@ -14,8 +12,9 @@ use anyhow::anyhow;
 use dashmap::DashMap;
 use rand::Rng;
 use std::cell::RefCell;
-use std::cmp::PartialEq;
+use std::cmp::{Ordering, PartialEq};
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::mem;
 use std::mem::Discriminant;
 use std::rc::Rc;
@@ -40,6 +39,59 @@ pub struct Info {
     pub num_distributions: u32,
 }
 
+pub type LocalStreamId = u32;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Stream(InstanceId, LocalStreamId, StreamPriority);
+
+impl Stream {
+    pub fn new(inst: InstanceId, stream_id: LocalStreamId) -> Self {
+        Self(inst, stream_id, StreamPriority::Normal)
+    }
+
+    pub fn set_priority(&mut self, priority: StreamPriority) {
+        self.2 = priority;
+    }
+}
+
+// Equality and hashing ignore the priority field.
+impl PartialEq for Stream {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.1 == other.1
+    }
+}
+
+impl Eq for Stream {}
+
+impl Hash for Stream {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+        self.1.hash(state);
+    }
+}
+
+// Ordering only compares the StreamPriority.
+impl PartialOrd for Stream {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.2.cmp(&other.2))
+    }
+}
+
+impl Ord for Stream {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.2.cmp(&other.2)
+    }
+}
+
+// Depending on your needs you may want High to be considered either greater or less than Low.
+// Here we simply derive the order in the declared order (High < Normal < Low).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StreamPriority {
+    High,
+    Normal,
+    Low,
+}
+
 #[derive(Debug)]
 pub enum Command {
     GetBlockSize {
@@ -55,16 +107,19 @@ pub enum Command {
     },
 
     Allocate {
+        stream_id: LocalStreamId,
         ty: ManagedTypes,
         ids: Vec<IdRepr>,
     },
 
     Deallocate {
+        stream_id: LocalStreamId,
         ty: ManagedTypes,
         ids: Vec<IdRepr>,
     },
 
     FillBlock {
+        stream_id: LocalStreamId,
         block: IdRepr,
         context: Vec<IdRepr>,
         inputs: Vec<IdRepr>,
@@ -82,6 +137,7 @@ pub enum Command {
     },
 
     CopyBlock {
+        stream_id: LocalStreamId,
         src_block: IdRepr,
         dst_block: IdRepr,
         src_token_offset: u32,
@@ -90,25 +146,39 @@ pub enum Command {
     },
 
     MaskBlock {
+        stream_id: LocalStreamId,
         block: IdRepr,
         mask: Vec<bool>,
     },
 
     EmbedText {
+        stream_id: LocalStreamId,
         embs: Vec<IdRepr>,
         text: Vec<u32>,
         positions: Vec<u32>,
     },
 
     DecodeTokenDist {
+        stream_id: LocalStreamId,
         embs: Vec<IdRepr>,
         dists: Vec<IdRepr>,
     },
 
     SampleTopK {
+        stream_id: LocalStreamId,
         dist: IdRepr,
         k: u32,
         handle: oneshot::Sender<(Vec<u32>, Vec<f32>)>,
+    },
+
+    Synchronize {
+        stream_id: LocalStreamId,
+        handle: oneshot::Sender<()>,
+    },
+
+    SetStreamPriority {
+        stream_id: LocalStreamId,
+        priority: StreamPriority,
     },
 }
 
@@ -186,7 +256,7 @@ impl ObjectType for ManagedTypes {
 pub struct Driver<B> {
     backend: B,
     cmd_id_pool: IdPool<u32>,
-    cmd_batcher: Batcher<Command, (InstanceId, StreamId), BatchGroup>,
+    cmd_batcher: Batcher<Command, Stream, BatchGroup>,
 
     event_table: Arc<DashMap<u32, Vec<Event>>>,
     event_loop_handle: tokio::task::JoinHandle<()>,
@@ -196,6 +266,8 @@ pub struct Driver<B> {
 
     // Rc for shared ownership across multiple "extension drivers"
     objects: Rc<RefCell<ObjectManager<InstanceId, ManagedTypes>>>,
+
+    stream_priorities: HashMap<Stream, StreamPriority>,
 
     info: Info,
     tokenizer: Arc<BytePairEncoder>,
@@ -283,6 +355,7 @@ where
             subscriptions: HashMap::new(),
             exported_blocks: HashMap::new(),
             objects: Rc::new(RefCell::new(ObjectManager::new())),
+            stream_priorities: HashMap::new(),
             info,
             tokenizer: Arc::new(tokenizer),
         };
@@ -319,13 +392,14 @@ where
             let mut obj_mgr = RefCell::borrow_mut(&self.objects);
 
             cmds.push(Command::Deallocate {
+                stream_id: 0,
                 ty,
                 ids: obj_mgr.all_names(ty, inst)?,
             })
         }
 
         for cmd in cmds {
-            self.submit(inst, 0, cmd, Instant::now())?;
+            self.submit(inst, cmd, Instant::now())?;
         }
 
         // Remove all exported blocks
@@ -337,12 +411,16 @@ where
     pub fn submit(
         &mut self,
         inst: InstanceId,
-        stream: StreamId,
         cmd: Command,
         now: Instant,
     ) -> Result<(), DriverError> {
-        if let Some(cmd) = self.translate_cmd(inst, cmd)? {
-            self.cmd_batcher.push((inst, stream), cmd, now);
+        if let Some((cmd, mut stream)) = self.translate_cmd(inst, cmd)? {
+            // adjust stream priority
+            if let Some(priority) = self.stream_priorities.get(&stream) {
+                stream.set_priority(*priority)
+            }
+
+            self.cmd_batcher.push(stream, cmd, now);
         }
         Ok(())
     }
@@ -351,8 +429,7 @@ where
         &mut self,
         inst: InstanceId,
         cmd: Command,
-    ) -> Result<Option<Command>, DriverError> {
-
+    ) -> Result<Option<(Command, Stream)>, DriverError> {
         let mut objects = RefCell::borrow_mut(&self.objects);
 
         let resolved_cmd = match cmd {
@@ -382,21 +459,28 @@ where
                 None
             }
 
-            Command::Allocate { ty, ids } => {
+            Command::Allocate { stream_id, ty, ids } => {
                 let ids = objects.create_many(ty, inst, ids)?;
 
-                Some(Command::Allocate { ty, ids })
+                Some((
+                    Command::Allocate { stream_id, ty, ids },
+                    Stream::new(inst, stream_id),
+                ))
             }
-            Command::Deallocate { ty, ids } => {
+            Command::Deallocate { stream_id, ty, ids } => {
                 let ids = objects.destroy_many(ty, inst, &ids)?;
 
                 if ids.is_empty() {
                     return Ok(None);
                 }
 
-                Some(Command::Deallocate { ty, ids })
+                Some((
+                    Command::Deallocate { stream_id, ty, ids },
+                    Stream::new(inst, stream_id),
+                ))
             }
             Command::FillBlock {
+                stream_id,
                 mut block,
                 mut context,
                 mut inputs,
@@ -407,12 +491,16 @@ where
                 objects.translate_many(ManagedTypes::TokenEmb, inst, &mut inputs)?;
                 objects.translate_many(ManagedTypes::TokenEmb, inst, &mut outputs)?;
 
-                Some(Command::FillBlock {
-                    block,
-                    context,
-                    inputs,
-                    outputs,
-                })
+                Some((
+                    Command::FillBlock {
+                        stream_id,
+                        block,
+                        context,
+                        inputs,
+                        outputs,
+                    },
+                    Stream::new(inst, stream_id),
+                ))
             }
             Command::ExportBlocks {
                 mut blocks,
@@ -443,6 +531,7 @@ where
             }
 
             Command::CopyBlock {
+                stream_id,
                 mut src_block,
                 mut dst_block,
                 src_token_offset,
@@ -452,49 +541,98 @@ where
                 objects.translate(ManagedTypes::KvBlock, inst, &mut src_block)?;
                 objects.translate(ManagedTypes::KvBlock, inst, &mut dst_block)?;
 
-                Some(Command::CopyBlock {
-                    src_block,
-                    dst_block,
-                    src_token_offset,
-                    dst_token_offset,
-                    size,
-                })
+                Some((
+                    Command::CopyBlock {
+                        stream_id,
+                        src_block,
+                        dst_block,
+                        src_token_offset,
+                        dst_token_offset,
+                        size,
+                    },
+                    Stream::new(inst, stream_id),
+                ))
             }
-            Command::MaskBlock { mut block, mask } => {
+            Command::MaskBlock {
+                stream_id,
+                mut block,
+                mask,
+            } => {
                 objects.translate(ManagedTypes::KvBlock, inst, &mut block)?;
 
-                Some(Command::MaskBlock { block, mask })
+                Some((
+                    Command::MaskBlock {
+                        stream_id,
+                        block,
+                        mask,
+                    },
+                    Stream::new(inst, stream_id),
+                ))
             }
             Command::EmbedText {
+                stream_id,
                 mut embs,
                 text,
                 positions,
             } => {
                 objects.translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
 
-                Some(Command::EmbedText {
-                    embs,
-                    text,
-                    positions,
-                })
+                Some((
+                    Command::EmbedText {
+                        stream_id,
+                        embs,
+                        text,
+                        positions,
+                    },
+                    Stream::new(inst, stream_id),
+                ))
             }
             Command::DecodeTokenDist {
+                stream_id,
                 mut embs,
                 mut dists,
             } => {
                 objects.translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
                 objects.translate_many(ManagedTypes::TokenDist, inst, &mut dists)?;
 
-                Some(Command::DecodeTokenDist { embs, dists })
+                Some((
+                    Command::DecodeTokenDist {
+                        stream_id,
+                        embs,
+                        dists,
+                    },
+                    Stream::new(inst, stream_id),
+                ))
             }
             Command::SampleTopK {
+                stream_id,
                 mut dist,
                 k,
                 handle,
             } => {
                 objects.translate(ManagedTypes::TokenDist, inst, &mut dist)?;
 
-                Some(Command::SampleTopK { dist, k, handle })
+                Some((
+                    Command::SampleTopK {
+                        stream_id,
+                        dist,
+                        k,
+                        handle,
+                    },
+                    Stream::new(inst, stream_id),
+                ))
+            }
+            Command::Synchronize { stream_id, handle } => Some((
+                Command::Synchronize { stream_id, handle },
+                Stream::new(inst, stream_id),
+            )),
+            Command::SetStreamPriority {
+                stream_id,
+                priority,
+            } => {
+                self.stream_priorities
+                    .insert(Stream::new(inst, stream_id), priority);
+                None
             }
         };
 
@@ -517,7 +655,8 @@ where
                 let mut items = Vec::new();
                 for cmd in cmd_batch {
                     match cmd {
-                        Command::Allocate { ty, ids } | Command::Deallocate { ty, ids } => {
+                        Command::Allocate { stream_id, ty, ids }
+                        | Command::Deallocate { stream_id, ty, ids } => {
                             let kind = match ty {
                                 ManagedTypes::KvBlock => pb_bindings::ObjectKind::KvBlock,
                                 ManagedTypes::TokenEmb => pb_bindings::ObjectKind::Emb,
@@ -555,6 +694,7 @@ where
                 for cmd in cmd_batch {
                     match cmd {
                         Command::FillBlock {
+                            stream_id,
                             block,
                             context,
                             inputs,
@@ -582,6 +722,7 @@ where
                 for cmd in cmd_batch {
                     match cmd {
                         Command::CopyBlock {
+                            stream_id,
                             src_block,
                             dst_block,
                             src_token_offset,
@@ -611,7 +752,11 @@ where
 
                 for cmd in cmd_batch {
                     match cmd {
-                        Command::MaskBlock { block, mask } => {
+                        Command::MaskBlock {
+                            stream_id,
+                            block,
+                            mask,
+                        } => {
                             let pb = pb_bindings::MaskBlock {
                                 block_id: block,
                                 mask,
@@ -633,6 +778,7 @@ where
                 for cmd in cmd_batch {
                     match cmd {
                         Command::EmbedText {
+                            stream_id,
                             embs,
                             text,
                             positions,
@@ -660,7 +806,11 @@ where
 
                 for cmd in cmd_batch {
                     match cmd {
-                        Command::DecodeTokenDist { embs, dists } => {
+                        Command::DecodeTokenDist {
+                            stream_id,
+                            embs,
+                            dists,
+                        } => {
                             for i in 0..embs.len() {
                                 let pb = pb_bindings::DecodeTokenDistribution {
                                     embedding_id: embs[i],
@@ -686,7 +836,12 @@ where
 
                 for cmd in cmd_batch {
                     match cmd {
-                        Command::SampleTopK { dist, k, handle } => {
+                        Command::SampleTopK {
+                            stream_id,
+                            dist,
+                            k,
+                            handle,
+                        } => {
                             let pb = pb_bindings::SampleTopKRequest {
                                 distribution_id: dist,
                                 k,

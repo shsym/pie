@@ -1,14 +1,10 @@
 interface system {
-    get-version: func() -> string;
+
+    get-runtime-version: func() -> string;
     get-instance-id: func() -> string;
 
-    // to the user that started the instance
-    send-to-origin: func(message: string);
-    receive-from-origin: func() -> string;
+    // TODO: telemetry
 
-    broadcast-to-peers: func(topic:string, message: string);
-    receive-from-peers: func() -> tuple<string, string>;
+    // TODO: spawning instances
 
-    subscribe: func(topic:string);
-    unsubscribe: func(topic:string);
 }
