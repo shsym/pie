@@ -1,17 +1,13 @@
-use crate::utils::IdPool;
-use dashmap::DashMap;
-use prost::bytes::Bytes;
-use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
-use std::mem;
-use std::sync::Arc;
+use futures::SinkExt;
+use prost::bytes::{Buf, Bytes};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
 use prost::{DecodeError, Message};
 use thiserror::Error;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 mod pb_bindings {
     include!(concat!(env!("OUT_DIR"), "/handshake.rs"));
@@ -33,124 +29,130 @@ pub enum BackendError {
 
     #[error("Correlation id not found in event dispatcher: {0}")]
     CorrelationIdNotFound(u32),
+
+    #[error("Unsupported protocol: {0}")]
+    UnsupportedProtocol(String),
 }
 
-pub trait Protocol<A, B>: Clone + Send + Sync + 'static {
-    async fn exec(&self, cmd: A) -> Result<(), BackendError>;
+/// The backend trait used for both real and simulated backends.
+pub trait Backend: Clone + Send + Sync + 'static {
+    fn protocols(&self) -> &[String];
 
-    async fn report_to(&self, tx: mpsc::Sender<B>);
+    async fn send(&self, protocol_idx: u8, payload: Vec<u8>) -> Result<(), BackendError>;
+
+    /// Registers a listener (an event dispatcher) for a given protocol index.
+    fn listen(&self, protocol_idx: u8, tx: mpsc::Sender<Vec<u8>>);
 }
 
-#[derive(Debug)]
+/// Implementation using ZeroMQ as transport.
+#[derive(Debug, Clone)]
 pub struct ZmqBackend {
-    supported_protocols: Vec<String>,
-    cmd_tx: Sender<(String, Bytes)>,
-    evt_tx: Arc<Mutex<HashMap<String, Sender<Bytes>>>>,
+    protocols: Vec<String>,
+    command_tx: mpsc::Sender<(u8, Vec<u8>)>,
+    event_dispatchers: Arc<Mutex<Vec<Option<mpsc::Sender<Vec<u8>>>>>>,
     event_loop_handle: Arc<JoinHandle<()>>,
 }
 
 impl ZmqBackend {
-    pub fn supported_protocols(&self) -> &[String] {
-        &self.supported_protocols
-    }
-
     pub async fn bind(endpoint: &str) -> Result<Self, BackendError> {
-        // bind the zmq socket
         let mut socket = DealerSocket::new();
         socket.connect(endpoint).await?;
-        println!("Connected to server at {endpoint}");
+        println!("Connected to server at {}", endpoint);
 
-        let pb_req = pb_bindings::Request {};
-        let zmq_req = ZmqMessage::from(pb_req.encode_to_vec());
+        // Perform handshake
+        let pb_request = pb_bindings::Request {};
+        let zmq_request = ZmqMessage::from(pb_request.encode_to_vec());
 
-        // do a handshake with the server
-        socket
-            .send(zmq_req)
-            .await
-            .map_err(|e| BackendError::Zmq(e.into()))?;
+        socket.send(zmq_request).await.map_err(BackendError::Zmq)?;
 
-        let zmq_resp = socket
-            .recv()
-            .await
-            .map_err(|e| BackendError::Zmq(e.into()))?;
-
-        let pb_resp = pb_bindings::Response::decode(zmq_resp.get(0).unwrap().as_ref());
-
-        let protocols = if let Ok(pb_resp) = pb_resp {
-            println!("Handshake successful");
-            pb_resp.protocols
-        } else {
-            println!("Handshake failed (False)");
-            return Err(BackendError::HandshakeFailed);
+        let zmq_response = socket.recv().await.map_err(BackendError::Zmq)?;
+        let response_frame = zmq_response.get(0).ok_or(BackendError::HandshakeFailed)?;
+        let pb_response = pb_bindings::Response::decode(response_frame.as_ref());
+        let protocols = match pb_response {
+            Ok(resp) => {
+                println!("Handshake successful");
+                resp.protocols
+            }
+            Err(_) => {
+                println!("Handshake failed");
+                return Err(BackendError::HandshakeFailed);
+            }
         };
 
-        //println!("Handshake response: {:?}", resp);
+        let (command_tx, rx) = mpsc::channel(1000);
+        let event_dispatchers = Arc::new(Mutex::new(vec![None; protocols.len()]));
 
-        let (tx, rx) = mpsc::channel(1000);
-        let event_tx = Arc::new(Mutex::new(HashMap::new()));
+        // Spawn the event loop task.
+        let event_loop_handle =
+            tokio::spawn(Self::event_loop(socket, rx, event_dispatchers.clone()));
 
-        // 3) Spawn the single I/O driver task that handles all read/write from the socket
-        let handle = tokio::spawn(Self::event_loop(socket, rx, event_tx.clone()));
-
-        let backend = ZmqBackend {
-            cmd_tx: tx,
-            evt_tx: event_tx,
-            event_loop_handle: Arc::new(handle),
-        };
-
-        Ok(backend)
+        Ok(ZmqBackend {
+            protocols,
+            command_tx,
+            event_dispatchers,
+            event_loop_handle: Arc::new(event_loop_handle),
+        })
     }
 
     async fn event_loop(
         mut socket: DealerSocket,
-        mut rx: mpsc::Receiver<(String, Bytes)>,
-        evt_tx: Arc<Mutex<HashMap<String, Sender<Bytes>>>>,
+        mut rx: mpsc::Receiver<(u8, Vec<u8>)>,
+        event_dispatchers: Arc<Mutex<Vec<Option<mpsc::Sender<Vec<u8>>>>>>,
     ) {
         loop {
             tokio::select! {
-                // A) Incoming requests from the channel => send to server
-                maybe_req = rx.recv() => {
-                    match maybe_req {
-                        Some((protocol, cmd)) => {
-                            let bytes = cmd.encode_to_vec();
-                            if let Err(e) = socket.send(ZmqMessage::from(bytes)).await {
-                                eprintln!("Socket send failed: {:?}", e);
+                // Handle outgoing commands.
+                maybe_command = rx.recv() => {
+                    if let Some((protocol, command)) = maybe_command {
+                        let mut zmq_frames = VecDeque::new();
+                        // Create a frame for the protocol identifier.
+                        zmq_frames.push_back(Bytes::copy_from_slice(&[protocol]));
+                        // Create a frame for the command payload.
+                        zmq_frames.push_back(Bytes::from(command));
+
+                        let zmq_message = match ZmqMessage::try_from(zmq_frames) {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                eprintln!("Failed to construct ZMQ message: {:?}", e);
+                                continue;
                             }
-                        },
-                        None => {
-                            // channel closed => no more requests
-                            println!("Request channel closed, shutting down driver.");
-                            break;
+                        };
+
+                        if let Err(e) = socket.send(zmq_message).await {
+                            eprintln!("Socket send failed: {:?}", e);
                         }
+                    } else {
+                        println!("Command channel closed, shutting down event loop.");
+                        break;
                     }
                 },
 
-                // B) Incoming responses from the server
+                // Handle incoming messages from the server.
                 result = socket.recv() => {
                     match result {
                         Ok(msg) => {
-                            // if msg.len() != 2 {
-                            //     eprintln!("Invalid message received from server: {:?}", msg);
-                            //     continue;
-                            // }
-                            let payload = msg.get(0).unwrap();
-                            match B::decode(payload.as_ref()) {
-                                Ok(resp) => {
-                                    let a = evt_tx.lock().await;
-                                    if let Some(tx) = &*a {
-                                        let _ = tx.send(resp).await;
-                                    } else {
-                                        eprintln!("No event dispatcher found for response: {:?}", resp);
-                                    }
-                                }
-                                Err(err) => {
-                                    eprintln!("Failed to parse Response from server: {:?}", err);
-                                }
+                            if msg.len() != 2 {
+                                eprintln!("Invalid message received from server: {:?}", msg);
+                                continue;
+                            }
+                            // Safely extract the protocol identifier.
+                            let protocol_byte = msg.get(0)
+                                .and_then(|frame| frame.first())
+                                .copied().unwrap_or(0);
+                            let protocol_idx = protocol_byte as usize;
+                            let payload = msg.get(1).unwrap().to_vec();
+
+                            let dispatchers = event_dispatchers.lock().unwrap();
+                            if protocol_idx >= dispatchers.len() || dispatchers[protocol_idx].is_none() {
+                                eprintln!("No event dispatcher found for protocol index: {}", protocol_idx);
+                                continue;
+                            }
+                            if let Err(e) = dispatchers[protocol_idx].as_ref().unwrap().send(payload).await {
+                                eprintln!("Failed to dispatch event for protocol {}: {:?}", protocol_idx, e);
                             }
                         },
                         Err(e) => {
                             eprintln!("Socket receive error: {:?}", e);
-                            // Possibly break or keep going...
                             break;
                         }
                     }
@@ -160,128 +162,120 @@ impl ZmqBackend {
     }
 }
 
-impl<A, B> Clone for ZmqBackend<A, B>
-where
-    A: 'static + prost::Message,
-    B: 'static + Default + prost::Message,
-{
-    fn clone(&self) -> Self {
-        Self {
-            cmd_tx: self.cmd_tx.clone(),
-            evt_tx: self.evt_tx.clone(),
-            event_loop_handle: self.event_loop_handle.clone(),
+impl Backend for ZmqBackend {
+    fn protocols(&self) -> &[String] {
+        &self.protocols
+    }
+
+    async fn send(&self, protocol_idx: u8, payload: Vec<u8>) -> Result<(), BackendError> {
+        self.command_tx
+            .send((protocol_idx, payload))
+            .await
+            .map_err(|_| BackendError::ChannelClosed)
+    }
+
+    fn listen(&self, protocol_idx: u8, tx: mpsc::Sender<Vec<u8>>) {
+        let mut dispatchers = self.event_dispatchers.lock().unwrap();
+        if (protocol_idx as usize) < dispatchers.len() {
+            dispatchers[protocol_idx as usize] = Some(tx);
+        } else {
+            eprintln!("Protocol index {} out of range", protocol_idx);
         }
     }
 }
 
-impl<A, B> Protocol<A, B> for ZmqBackend<A, B>
-where
-    A: prost::Message + 'static,
-    B: prost::Message + Default + 'static,
-{
-    async fn exec(&self, cmd: A) -> Result<(), BackendError> {
-        self.cmd_tx
-            .send(cmd)
-            .await
-            .map_err(|_| BackendError::ChannelClosed)?;
-
-        Ok(())
-    }
-
-    async fn report_to(&self, tx: Sender<B>) {
-        self.evt_tx.lock().await.replace(tx);
-    }
+/// The simulation trait – note it works on raw bytes.
+pub trait Simulate: Clone + Send + Sync + 'static {
+    fn protocols(&self) -> &[String];
+    fn simulate(&mut self, command: Vec<u8>) -> Option<Vec<u8>>;
 }
 
-pub trait Simulate<A, B>: Clone + Send + Sync + 'static {
-    fn simulate(&mut self, cmd: A) -> Option<B>;
-}
-
-pub struct SimulatedBackend<A, B, F> {
-    cmd_tx: mpsc::Sender<A>,
-    evt_tx: Arc<Mutex<Option<mpsc::Sender<B>>>>,
-    handle: Arc<JoinHandle<()>>,
+/// A simulated backend implementation.
+#[derive(Debug, Clone)]
+pub struct SimulatedBackend<F> {
+    protocols: Vec<String>,
+    command_tx: mpsc::Sender<(u8, Vec<u8>)>,
+    event_dispatchers: Arc<Mutex<Vec<Option<mpsc::Sender<Vec<u8>>>>>>,
+    event_loop_handle: Arc<JoinHandle<()>>,
     simulator: F,
 }
 
-impl<A, B, F> SimulatedBackend<A, B, F>
+impl<F> SimulatedBackend<F>
 where
-    A: prost::Message + 'static,
-    B: Default + prost::Message + 'static,
-    F: Simulate<A, B>,
+    F: Simulate + 'static,
 {
     pub async fn new(simulator: F) -> Self {
-        let (cmd_tx, rx) = mpsc::channel::<A>(1000);
-        let evt_tx = Arc::new(Mutex::new(None));
+        let protocols = simulator.protocols().to_vec();
+        let (command_tx, rx) = mpsc::channel(1000);
+        let event_dispatchers = Arc::new(Mutex::new(vec![None; protocols.len()]));
 
-        // Clone simulate so one copy is passed to the backend routine.
-        let handle = tokio::spawn(Self::backend_routine(
+        let simulator_clone = simulator.clone();
+
+        let event_loop_handle = tokio::spawn(Self::event_loop(
             rx,
-            Arc::clone(&evt_tx),
-            simulator.clone(),
+            event_dispatchers.clone(),
+            simulator_clone,
         ));
 
         Self {
-            cmd_tx,
-            evt_tx,
-            handle: Arc::new(handle),
+            protocols,
+            command_tx,
+            event_dispatchers,
+            event_loop_handle: Arc::new(event_loop_handle),
             simulator,
         }
     }
 
-    async fn backend_routine(
-        mut rx: mpsc::Receiver<A>,
-        evt_tx: Arc<Mutex<Option<mpsc::Sender<B>>>>,
+    async fn event_loop(
+        mut rx: mpsc::Receiver<(u8, Vec<u8>)>,
+        event_dispatchers: Arc<Mutex<Vec<Option<mpsc::Sender<Vec<u8>>>>>>,
         mut simulator: F,
     ) {
-        while let Some(cmd) = rx.recv().await {
-            let resp = simulator.simulate(cmd);
+        while let Some((protocol, command)) = rx.recv().await {
+            if let Some(response) = simulator.simulate(command) {
+                let maybe_dispatcher = {
+                    let dispatchers = event_dispatchers.lock().unwrap();
+                    dispatchers
+                        .get(protocol as usize)
+                        .and_then(|opt| opt.clone())
+                };
 
-            if let Some(resp) = resp {
-                let guard = evt_tx.lock().await;
-                if let Some(tx) = &*guard {
-                    // Send the response; ignore errors if the receiver has been dropped.
-                    let _ = tx.send(resp).await;
+                if let Some(tx) = maybe_dispatcher {
+                    if let Err(e) = tx.send(response).await {
+                        eprintln!(
+                            "Failed to send simulated response for protocol {}: {:?}",
+                            protocol, e
+                        );
+                    }
                 } else {
-                    eprintln!("No event dispatcher found for response: {:?}", resp);
+                    eprintln!("No event dispatcher found for protocol index: {}", protocol);
                 }
             }
         }
     }
 }
 
-impl<A, B, F> Clone for SimulatedBackend<A, B, F>
+impl<F> Backend for SimulatedBackend<F>
 where
-    A: 'static + prost::Message,
-    B: 'static + Default + prost::Message,
-    F: Simulate<A, B>,
+    F: Simulate + 'static,
 {
-    fn clone(&self) -> Self {
-        Self {
-            cmd_tx: self.cmd_tx.clone(),
-            evt_tx: Arc::clone(&self.evt_tx),
-            handle: Arc::clone(&self.handle),
-            simulator: self.simulator.clone(),
-        }
+    fn protocols(&self) -> &[String] {
+        &self.protocols
     }
-}
 
-impl<A, B, F> Protocol<A, B> for SimulatedBackend<A, B, F>
-where
-    A: prost::Message + 'static,
-    B: prost::Message + Default + 'static,
-    F: Simulate<A, B>,
-{
-    async fn exec(&self, cmd: A) -> Result<(), BackendError> {
-        self.cmd_tx
-            .send(cmd)
+    async fn send(&self, protocol_idx: u8, payload: Vec<u8>) -> Result<(), BackendError> {
+        self.command_tx
+            .send((protocol_idx, payload))
             .await
-            .map_err(|_| BackendError::ChannelClosed)?;
-
-        Ok(())
+            .map_err(|_| BackendError::ChannelClosed)
     }
 
-    async fn report_to(&self, tx: Sender<B>) {
-        self.evt_tx.lock().await.replace(tx);
+    fn listen(&self, protocol_idx: u8, tx: mpsc::Sender<Vec<u8>>) {
+        let mut dispatchers = self.event_dispatchers.lock().unwrap();
+        if (protocol_idx as usize) < dispatchers.len() {
+            dispatchers[protocol_idx as usize] = Some(tx);
+        } else {
+            eprintln!("Protocol index {} out of range", protocol_idx);
+        }
     }
 }
