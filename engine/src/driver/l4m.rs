@@ -1,16 +1,17 @@
-use crate::backend::ExecuteCommand;
-use crate::controller::ControllerError;
-use crate::driver::{BatchQueue, Batchable, Batcher, BatchingStrategy, DriverError, KorTStrategy};
-use crate::instance_old::Id as InstanceId;
+use crate::batching::{Batchable, Batcher, BatchingStrategy, KorTStrategy};
+use crate::controller_old::ControllerError;
+use crate::driver::{Driver, DriverError, DynCommand};
+use crate::instance::Id as InstanceId;
 use crate::object::{
     IdRepr, ObjectError, ObjectManager, ObjectType, VspaceId, group_consecutive_ids,
 };
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::{Counter, IdPool};
-use crate::{backend, instance_old, lm, object, tokenizer, utils};
+use crate::{backend_old, lm, object, tokenizer, utils};
 use anyhow::anyhow;
 use dashmap::DashMap;
 use rand::Rng;
+use std::any::TypeId;
 use std::cell::RefCell;
 use std::cmp::{Ordering, PartialEq};
 use std::collections::{HashMap, VecDeque};
@@ -22,11 +23,21 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task;
 
 pub const PROTOCOL: &str = "l4m"; // for future backward compatibility
 
 mod pb_bindings {
     include!(concat!(env!("OUT_DIR"), "/l4m.rs"));
+}
+
+pub trait CompatibleBackend:
+    backend_old::Protocol<pb_bindings::Request, pb_bindings::Response>
+{
+}
+impl<T> CompatibleBackend for T where
+    T: backend_old::Protocol<pb_bindings::Request, pb_bindings::Response>
+{
 }
 
 #[derive(Debug)]
@@ -180,6 +191,8 @@ pub enum Command {
         stream_id: LocalStreamId,
         priority: StreamPriority,
     },
+
+    Cleanup,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -192,6 +205,7 @@ enum BatchGroup {
     EmbedText,
     DecodeTokenDist,
     SampleTopK,
+    Synchronize,
 }
 
 impl Batchable<BatchGroup> for Command {
@@ -205,6 +219,7 @@ impl Batchable<BatchGroup> for Command {
             Command::EmbedText { .. } => KorTStrategy::eager().into_box(),
             Command::DecodeTokenDist { .. } => KorTStrategy::eager().into_box(),
             Command::SampleTopK { .. } => KorTStrategy::eager().into_box(),
+            Command::Synchronize { .. } => KorTStrategy::immediate().into_box(),
             _ => unreachable!(),
         }
     }
@@ -219,6 +234,7 @@ impl Batchable<BatchGroup> for Command {
             Command::EmbedText { .. } => BatchGroup::EmbedText,
             Command::DecodeTokenDist { .. } => BatchGroup::DecodeTokenDist,
             Command::SampleTopK { .. } => BatchGroup::SampleTopK,
+            Command::Synchronize { .. } => BatchGroup::Synchronize,
             _ => unreachable!(),
         }
     }
@@ -253,13 +269,13 @@ impl ObjectType for ManagedTypes {
 }
 
 #[derive(Debug)]
-pub struct Driver<B> {
+pub struct L4m<B> {
     backend: B,
     cmd_id_pool: IdPool<u32>,
     cmd_batcher: Batcher<Command, Stream, BatchGroup>,
 
     event_table: Arc<DashMap<u32, Vec<Event>>>,
-    event_loop_handle: tokio::task::JoinHandle<()>,
+    event_loop_handle: task::JoinHandle<()>,
 
     subscriptions: HashMap<String, Vec<InstanceId>>,
     exported_blocks: HashMap<String, ExportedBlocks>,
@@ -305,9 +321,52 @@ impl ObjectView {
     }
 }
 
-impl<B> Driver<B>
+impl<B> Driver for L4m<B>
 where
-    B: ExecuteCommand<pb_bindings::Request, pb_bindings::Response>,
+    B: CompatibleBackend,
+{
+    fn accepts(&self) -> &[TypeId] {
+        vec![TypeId::of::<Command>()]
+    }
+
+    fn create_inst(&mut self, inst: InstanceId) -> Result<(), DriverError> {
+        todo!()
+    }
+
+    fn destroy_inst(&mut self, inst: InstanceId) -> Result<(), DriverError> {
+        todo!()
+    }
+
+    fn submit(&mut self, inst: InstanceId, cmd: DynCommand) -> Result<(), DriverError> {
+        if let Some(cmd) = cmd.as_any().downcast_ref::<Command>() {
+            if let Some((cmd, mut stream)) = self.translate_cmd(inst, cmd)? {
+                // adjust stream priority
+                if let Some(priority) = self.stream_priorities.get(&stream) {
+                    stream.set_priority(*priority)
+                }
+
+                self.cmd_batcher.push(stream, cmd, Instant::now());
+            }
+            Ok(())
+        } else {
+            return Err(DriverError::Other("Command type mismatch.".to_string()));
+        }
+
+        todo!()
+    }
+
+    async fn flush(&mut self) -> Result<(), DriverError> {
+        for (_, cmd_batch) in self.cmd_batcher.batch(Instant::now()) {
+            self.commit_backend(cmd_batch).await?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<B> L4m<B>
+where
+    B: CompatibleBackend,
 {
     pub async fn new(backend: B) {
         let (tx, rx) = mpsc::channel(1000);
@@ -365,23 +424,7 @@ where
         ObjectView::new(self.objects.clone())
     }
 
-    pub fn init_instance(&mut self, inst: InstanceId) -> Result<(), DriverError> {
-        // let mut objects = RefCell::borrow_mut(&self.objects);
-        //
-        // for namespace in Namespace::iter_all() {
-        //     if objects.vid.contains_key(&(inst, namespace)) {
-        //         return Err(DriverError::InstanceAlreadyExists(inst));
-        //     }
-        //
-        //     objects
-        //         .vid
-        //         .insert((inst, namespace), TranslationTable::new());
-        // }
-
-        Ok(())
-    }
-
-    pub fn destroy_instance(&mut self, inst: InstanceId) -> Result<(), DriverError> {
+    fn cleanup(&mut self, inst: InstanceId) -> Result<(), DriverError> {
         let mut cmds = Vec::new();
 
         for ty in [
@@ -399,29 +442,12 @@ where
         }
 
         for cmd in cmds {
-            self.submit(inst, cmd, Instant::now())?;
+            self.submit(inst, DynCommand::new(cmd))?;
         }
 
         // Remove all exported blocks
         self.exported_blocks.retain(|_, v| v.owner != inst);
 
-        Ok(())
-    }
-
-    pub fn submit(
-        &mut self,
-        inst: InstanceId,
-        cmd: Command,
-        now: Instant,
-    ) -> Result<(), DriverError> {
-        if let Some((cmd, mut stream)) = self.translate_cmd(inst, cmd)? {
-            // adjust stream priority
-            if let Some(priority) = self.stream_priorities.get(&stream) {
-                stream.set_priority(*priority)
-            }
-
-            self.cmd_batcher.push(stream, cmd, now);
-        }
         Ok(())
     }
 
@@ -634,17 +660,14 @@ where
                     .insert(Stream::new(inst, stream_id), priority);
                 None
             }
+
+            Command::Cleanup => {
+                self.cleanup(inst)?;
+                None
+            }
         };
 
         Ok(resolved_cmd)
-    }
-
-    pub async fn flush(&mut self, now: Instant) -> Result<(), DriverError> {
-        for (_, cmd_batch) in self.cmd_batcher.batch(now) {
-            self.commit_backend(cmd_batch).await?;
-        }
-
-        Ok(())
     }
 
     async fn commit_backend(&mut self, cmd_batch: Vec<Command>) -> Result<(), DriverError> {
@@ -861,6 +884,19 @@ where
                     Some(events),
                 )
             }
+
+            BatchGroup::Synchronize => {
+                let cmd = cmd_batch.into_iter().next().unwrap();
+
+                match cmd {
+                    Command::Synchronize { stream_id, handle } => {
+                        handle.send(()).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+
+                return Ok(());
+            }
             _ => unreachable!(),
         };
 
@@ -931,12 +967,12 @@ where
 
 #[derive(Debug)]
 struct ExportedBlocks {
-    owner: instance_old::Id,
+    owner: InstanceId,
     addrs: Vec<IdRepr>,
 }
 
 impl ExportedBlocks {
-    pub fn new(owner: instance_old::Id, addrs: Vec<IdRepr>) -> Self {
+    pub fn new(owner: InstanceId, addrs: Vec<IdRepr>) -> Self {
         Self { owner, addrs }
     }
 }
@@ -944,7 +980,7 @@ impl ExportedBlocks {
 #[derive(Clone)]
 pub struct Simulator {}
 
-impl backend::Simulate<pb_bindings::Request, pb_bindings::Response> for Simulator {
+impl backend_old::Simulate<pb_bindings::Request, pb_bindings::Response> for Simulator {
     fn simulate(&mut self, req: pb_bindings::Request) -> Option<pb_bindings::Response> {
         let resp_payload = match req.command.unwrap() {
             pb_bindings::request::Command::SampleTopKRequest(batch) => {

@@ -1,9 +1,9 @@
-use crate::backend::BackendError;
+use crate::backend_old::BackendError;
 use crate::driver::DriverError;
 use crate::driver_l4m::EventHandle;
 use crate::object::VspaceId;
 use crate::utils::Stream;
-use crate::{backend, utils};
+use crate::{backend_old, utils};
 use dashmap::DashMap;
 use rand::Rng;
 use std::collections::HashMap;
@@ -17,8 +17,8 @@ mod ping {
     include!(concat!(env!("OUT_DIR"), "/ping.rs"));
 }
 
-pub trait ExecuteCommand: backend::ExecuteCommand<ping::Ping, ping::Pong> {}
-impl<T> ExecuteCommand for T where T: backend::ExecuteCommand<ping::Ping, ping::Pong> {}
+pub trait ExecuteCommand: backend_old::Protocol<ping::Ping, ping::Pong> {}
+impl<T> ExecuteCommand for T where T: backend_old::Protocol<ping::Ping, ping::Pong> {}
 
 #[derive(Debug)]
 pub struct Driver<B> {
@@ -87,7 +87,7 @@ where
 #[derive(Clone)]
 pub struct Simulator {}
 
-impl backend::Simulate<ping::Ping, ping::Pong> for Simulator {
+impl backend_old::Simulate<ping::Ping, ping::Pong> for Simulator {
     fn simulate(&mut self, cmd: ping::Ping) -> Option<ping::Pong> {
         Some(ping::Pong {
             correlation_id: cmd.correlation_id,

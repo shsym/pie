@@ -1,6 +1,4 @@
 use crate::utils::IdPool;
-use dashmap::DashMap;
-use prost::bytes::Bytes;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::mem;
@@ -8,20 +6,13 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
-use prost::{DecodeError, Message};
+use prost::DecodeError;
 use thiserror::Error;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{Mutex, mpsc};
 
-mod pb_bindings {
-    include!(concat!(env!("OUT_DIR"), "/handshake.rs"));
-}
-
 #[derive(Debug, Error)]
 pub enum BackendError {
-    #[error("Handshake failed")]
-    HandshakeFailed,
-
     #[error("ZeroMQ error: {0}")]
     Zmq(#[from] ZmqError),
 
@@ -42,76 +33,76 @@ pub trait Protocol<A, B>: Clone + Send + Sync + 'static {
 }
 
 #[derive(Debug)]
-pub struct ZmqBackend {
-    supported_protocols: Vec<String>,
-    cmd_tx: Sender<(String, Bytes)>,
-    evt_tx: Arc<Mutex<HashMap<String, Sender<Bytes>>>>,
-    event_loop_handle: Arc<JoinHandle<()>>,
+pub struct ZmqBackend<A, B> {
+    cmd_tx: Sender<A>,
+    evt_tx: Arc<Mutex<Option<Sender<B>>>>, // no tokio mutex. Because it will be only mutated once.
+    handle: Arc<JoinHandle<()>>,
 }
 
-impl ZmqBackend {
-    pub fn supported_protocols(&self) -> &[String] {
-        &self.supported_protocols
-    }
-
-    pub async fn bind(endpoint: &str) -> Result<Self, BackendError> {
+impl<A, B> ZmqBackend<A, B>
+where
+    A: prost::Message + 'static,
+    B: prost::Message + Default + 'static,
+{
+    pub async fn bind(endpoint: &str, protocol: &str) -> Result<Self, ZmqError> {
         // bind the zmq socket
         let mut socket = DealerSocket::new();
         socket.connect(endpoint).await?;
         println!("Connected to server at {endpoint}");
 
-        let pb_req = pb_bindings::Request {};
-        let zmq_req = ZmqMessage::from(pb_req.encode_to_vec());
-
         // do a handshake with the server
-        socket
-            .send(zmq_req)
-            .await
-            .map_err(|e| BackendError::Zmq(e.into()))?;
+        socket.send(ZmqMessage::from(protocol)).await?;
+        
+        // if let Some(response) = socket.recv().await?.get(0) {
+        //     match response.as_ref() {
+        //         b"\x01" => println!("Handshake successful (True)"),
+        //         b"\x00" => println!("Handshake failed (False)"),
+        //         _ => println!("Unexpected response: {:?}", response),
+        //     }
+        // } else {
+        //     println!("No response received");
+        // }
 
-        let zmq_resp = socket
-            .recv()
-            .await
-            .map_err(|e| BackendError::Zmq(e.into()))?;
-
-        let pb_resp = pb_bindings::Response::decode(zmq_resp.get(0).unwrap().as_ref());
-
-        let protocols = if let Ok(pb_resp) = pb_resp {
-            println!("Handshake successful");
-            pb_resp.protocols
-        } else {
-            println!("Handshake failed (False)");
-            return Err(BackendError::HandshakeFailed);
-        };
+        let resp = socket.recv().await?;
 
         //println!("Handshake response: {:?}", resp);
 
-        let (tx, rx) = mpsc::channel(1000);
-        let event_tx = Arc::new(Mutex::new(HashMap::new()));
+        match resp.get(0).unwrap().as_ref() {
+            b"\x01" => println!("Handshake successful"),
+            _ => {
+                println!("Handshake failed (False)");
+                return Err(ZmqError::Other("Handshake failed"));
+            }
+        }
+
+        // create event dispatcher
+
+        let (tx, rx) = mpsc::channel::<A>(1000);
+        let event_tx = Arc::new(Mutex::new(None));
 
         // 3) Spawn the single I/O driver task that handles all read/write from the socket
-        let handle = tokio::spawn(Self::event_loop(socket, rx, event_tx.clone()));
+        let handle = tokio::spawn(Self::backend_routine(socket, rx, event_tx.clone()));
 
         let backend = ZmqBackend {
             cmd_tx: tx,
             evt_tx: event_tx,
-            event_loop_handle: Arc::new(handle),
+            handle: Arc::new(handle),
         };
 
         Ok(backend)
     }
 
-    async fn event_loop(
+    async fn backend_routine(
         mut socket: DealerSocket,
-        mut rx: mpsc::Receiver<(String, Bytes)>,
-        evt_tx: Arc<Mutex<HashMap<String, Sender<Bytes>>>>,
+        mut rx: mpsc::Receiver<A>,
+        evt_tx: Arc<Mutex<Option<Sender<B>>>>,
     ) {
         loop {
             tokio::select! {
                 // A) Incoming requests from the channel => send to server
                 maybe_req = rx.recv() => {
                     match maybe_req {
-                        Some((protocol, cmd)) => {
+                        Some(cmd) => {
                             let bytes = cmd.encode_to_vec();
                             if let Err(e) = socket.send(ZmqMessage::from(bytes)).await {
                                 eprintln!("Socket send failed: {:?}", e);
@@ -169,7 +160,7 @@ where
         Self {
             cmd_tx: self.cmd_tx.clone(),
             evt_tx: self.evt_tx.clone(),
-            event_loop_handle: self.event_loop_handle.clone(),
+            handle: self.handle.clone(),
         }
     }
 }

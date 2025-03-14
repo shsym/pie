@@ -5,7 +5,7 @@ use uuid::Uuid;
 use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
 use wasmtime_wasi;
 
-use crate::instance_old::{App, Command, Id as InstanceId, InstanceState};
+use crate::instance::{Id as InstanceId, InstanceState};
 use crate::server::ServerMessage;
 use crate::{bindings, instance_old, tokenizer};
 
@@ -60,9 +60,9 @@ pub struct Runtime {
 pub struct InstanceHandle {
     pub hash: String,
     pub to_origin: Sender<ServerMessage>,
-    pub evt_from_system: Sender<String>,
-    pub evt_from_origin: Sender<String>,
-    pub evt_from_peers: Sender<(String, String)>,
+    // pub evt_from_system: Sender<String>,
+    // pub evt_from_origin: Sender<String>,
+    // pub evt_from_peers: Sender<(String, String)>,
     pub join_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -135,18 +135,10 @@ impl Runtime {
 
         let instance_id = Uuid::new_v4();
 
-        // 3) Create channels for event-sending
-        let (origin_tx, origin_rx) = tokio::sync::mpsc::channel::<String>(32);
-        let (peer_tx, peer_rx) = tokio::sync::mpsc::channel::<(String, String)>(128);
-        let (error_tx, error_rx) = tokio::sync::mpsc::channel::<String>(128);
-
         // 4) Build the InstanceState
         let inst_state = InstanceState::new(
             instance_id,
-            self.inst2server.clone(),
-            error_rx,
-            origin_rx,
-            peer_rx,
+            self.inst2server.clone()
         )
         .await;
 
@@ -237,9 +229,6 @@ impl Runtime {
         let instance_handle = InstanceHandle {
             hash: hash.to_string(),
             to_origin,
-            evt_from_system: error_tx,
-            evt_from_origin: origin_tx,
-            evt_from_peers: peer_tx,
             join_handle,
         };
         self.running_instances.insert(instance_id, instance_handle);
@@ -248,8 +237,9 @@ impl Runtime {
     }
 
     /// Terminate (abort) a running instance
-    pub fn terminate_program(&self, instance_id: InstanceId) -> bool {
+    pub fn terminate_program(&self, instance_id: InstanceId, reason:String) -> bool {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
+            // TODO
             handle.join_handle.abort();
             true
         } else {

@@ -1,29 +1,38 @@
-use crate::driver::{
-    Batchable, Batcher, BatchingStrategy, DriverError, KorTStrategy, LocalStreamId, l4m,
-};
-use crate::instance_old::Id as InstanceId;
-use crate::{backend, utils};
+use crate::batching::{Batchable, Batcher, BatchingStrategy, KorTStrategy};
+use crate::driver::l4m::LocalStreamId;
+use crate::driver::{DriverError, l4m};
+use crate::instance::Id as InstanceId;
+use crate::{backend_old, utils};
 
 pub const PROTOCOL: &str = "l4m-vision"; // for future backward compatibility
 mod pb_bindings {
     include!(concat!(env!("OUT_DIR"), "/l4m.vision.rs"));
 }
 
-pub trait ExecuteCommand:
-    backend::ExecuteCommand<pb_bindings::Request, pb_bindings::Response>
+pub trait CompatibleBackend:
+    backend_old::Protocol<pb_bindings::Request, pb_bindings::Response>
 {
 }
 
-impl<T> ExecuteCommand for T where
-    T: backend::ExecuteCommand<pb_bindings::Request, pb_bindings::Response>
+impl<T> CompatibleBackend for T where
+    T: backend_old::Protocol<pb_bindings::Request, pb_bindings::Response>
 {
 }
 
 #[derive(Debug)]
 pub enum Command {
-    EmbedAudio { message: String },
-    EmbedImage { message: String },
-    EmbedVideo { message: String },
+    EmbedAudio {
+        stream_id: LocalStreamId,
+        message: String,
+    },
+    EmbedImage {
+        stream_id: LocalStreamId,
+        message: String,
+    },
+    EmbedVideo {
+        stream_id: LocalStreamId,
+        message: String,
+    },
 }
 
 impl Batchable<BatchGroup> for Command {
@@ -52,16 +61,16 @@ pub enum BatchGroup {
 }
 
 #[derive(Debug)]
-pub struct Driver<B> {
+pub struct L4mVision<B> {
     backend: B,
     cmd_id_pool: utils::IdPool<u32>,
     objects: l4m::ObjectView,
     cmd_batcher: Batcher<Command, (InstanceId, LocalStreamId), BatchGroup>,
 }
 
-impl<B> Driver<B>
+impl<B> L4mVision<B>
 where
-    B: ExecuteCommand,
+    B: CompatibleBackend,
 {
     pub async fn new(backend: B, objects: l4m::ObjectView) -> Self {
         Self {
@@ -72,14 +81,9 @@ where
         }
     }
 
-    pub fn submit(
-        &mut self,
-        inst: InstanceId,
-        stream: LocalStreamId,
-        cmd: Command,
-    ) -> Result<(), DriverError> {
+    pub fn submit(&mut self, inst: InstanceId, cmd: Command) -> Result<(), DriverError> {
         match cmd {
-            Command::EmbedImage { message } => {
+            Command::EmbedImage { stream_id, message } => {
                 let correlation_id = self
                     .cmd_id_pool
                     .acquire()
@@ -99,6 +103,7 @@ where
 
                 Ok(())
             }
+            _ => unimplemented!(),
         }
     }
 }
@@ -106,7 +111,7 @@ where
 #[derive(Clone)]
 pub struct Simulator {}
 
-impl backend::Simulate<pb_bindings::Request, pb_bindings::Response> for Simulator {
+impl backend_old::Simulate<pb_bindings::Request, pb_bindings::Response> for Simulator {
     fn simulate(&mut self, cmd: pb_bindings::Request) -> Option<pb_bindings::Response> {
         todo!()
     }

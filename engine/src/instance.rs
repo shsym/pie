@@ -1,4 +1,4 @@
-use crate::driver::LocalStreamId;
+use crate::driver::DynCommand;
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::IdPool;
 use crate::{driver, object};
@@ -28,39 +28,12 @@ pub struct InstanceState {
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
 
-    cmd_buffer: UnboundedSender<(Id, Command)>,
+    cmd_buffer: UnboundedSender<(Id, DynCommand)>,
 }
 
 type ResourceId = u32;
 pub struct ReadyResources {
     sample_top_k: DashMap<ResourceId, Vec<(Vec<u32>, Vec<f32>)>>,
-}
-
-// implements send
-#[derive(Debug)]
-pub enum Command {
-    // Init -------------------------------------
-    CreateInstance,
-
-    DestroyInstance,
-
-    System {
-        cmd: driver::messaging::Command,
-    },
-
-    Messaging {
-        cmd: driver::messaging::Command,
-    },
-
-    L4m {
-        stream: LocalStreamId,
-        cmd: driver::l4m::Command,
-    },
-    L4mVision {
-        stream: LocalStreamId,
-        cmd: driver::l4m_vision::Command,
-    },
-    Ping(driver::ping::Command),
 }
 
 impl IoView for InstanceState {
@@ -82,12 +55,12 @@ impl WasiHttpView for InstanceState {
 }
 
 impl InstanceState {
-    pub async fn new(id: Uuid, cmd_buffer: UnboundedSender<(Id, Command)>) -> Self {
+    pub async fn new(id: Uuid, cmd_buffer: UnboundedSender<(Id, DynCommand)>) -> Self {
         let mut builder = WasiCtx::builder();
         builder.inherit_stderr().inherit_network().inherit_stdout();
 
         // send construct cmd
-        cmd_buffer.send((id, Command::CreateInstance));
+        //cmd_buffer.send((id, Command::CreateInstance));
 
         InstanceState {
             id,
@@ -98,15 +71,19 @@ impl InstanceState {
         }
     }
 
-    pub fn send_cmd(&self, cmd: Command) -> Result<(), wasmtime::Error> {
+    pub fn send_cmd<T>(&self, cmd: T) -> Result<(), wasmtime::Error>
+    where
+        T: Send,
+    {
+        let dyn_cmd = DynCommand::new(cmd);
         self.cmd_buffer
-            .send((self.id, cmd))
+            .send((self.id, dyn_cmd))
             .map_err(|e| wasmtime::Error::msg(format!("Send error: {}", e)))
     }
 }
-
-impl Drop for InstanceState {
-    fn drop(&mut self) {
-        self.cmd_buffer.send((self.id, Command::DestroyInstance));
-    }
-}
+//
+// impl Drop for InstanceState {
+//     fn drop(&mut self) {
+//         self.cmd_buffer.send((self.id, Command::DestroyInstance));
+//     }
+// }

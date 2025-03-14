@@ -1,10 +1,13 @@
 interface l4m-vision {
-    use l4m.{model as base-model, object-id, stream-id};
+    use l4m.{model as base-model, object-id, stream-id, synchronization-result};
 
     extend-model: func(model: borrow<base-model>) -> option<model>;
 
     resource model {
         get-base-model: func() -> base-model;
         embed-image: func(stream-id: stream-id, embs: list<object-id>, image-blob: list<u8>);
+
+        // Wait for the stream
+        synchronize: func(stream-id: stream-id) -> synchronization-result;
     }
 }

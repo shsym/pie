@@ -1,4 +1,4 @@
-interface system {
+interface runtime {
 
     get-runtime-version: func() -> string;
     get-instance-id: func() -> string;

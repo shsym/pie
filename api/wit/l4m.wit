@@ -100,6 +100,6 @@ interface l4m {
 
     resource synchronization-result {
         subscribe: func() -> pollable;
-        get: func() -> option<()>; // None if not ready
+        get: func() -> option<bool>; // None if not ready
     }
 }

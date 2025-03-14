@@ -1,3 +1,5 @@
+use crate::driver::DriverError;
+use crate::instance::Id as InstanceId;
 use crate::utils::IdPool;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -24,20 +26,20 @@ pub enum Command {
 }
 
 #[derive(Debug)]
-pub struct Driver {
+pub struct Messaging {
     tx: UnboundedSender<(String, String)>,
     event_loop_handle: tokio::task::JoinHandle<()>,
     subscriptions: Arc<DashMap<String, Vec<(SubscriptionId, mpsc::Sender<String>)>>>,
     subscription_id_pool: IdPool<SubscriptionId>,
 }
 
-impl Driver {
+impl Messaging {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let subscriptions = Arc::new(DashMap::new());
         let event_loop_handle = tokio::spawn(Self::event_loop(rx, Arc::clone(&subscriptions)));
 
-        Driver {
+        Messaging {
             tx,
             event_loop_handle,
             subscriptions,
@@ -51,11 +53,13 @@ impl Driver {
 
     /// Submit a command to the driver.
     ///
-    pub fn submit(&mut self, cmd: Command) {
+    pub fn submit(&mut self, inst: InstanceId, cmd: Command) -> Result<(), DriverError> {
         match cmd {
             Command::Broadcast { topic, message } => {
                 // Broadcast the message. Replace unwrap with proper error handling if needed.
-                self.tx.send((topic, message)).unwrap();
+                self.tx
+                    .send((topic, message))
+                    .map_err(|e| DriverError::SendError(e.to_string()))
             }
             Command::Subscribe {
                 topic,
@@ -66,7 +70,7 @@ impl Driver {
                 let id = self
                     .subscription_id_pool
                     .acquire()
-                    .expect("Failed to acquire a subscription id");
+                    .map_err(|e| DriverError::LockError)?;
 
                 // Insert the new subscriber into the map.
                 self.subscriptions
@@ -75,7 +79,9 @@ impl Driver {
                     .push((id, sender));
 
                 // Send back the subscription id.
-                sub_id.send(id).unwrap();
+                sub_id
+                    .send(id)
+                    .map_err(|e| DriverError::SendError(e.to_string()))
             }
             Command::Unsubscribe { topic, sub_id } => {
                 if let Some(mut subscribers) = self.subscriptions.get_mut(&topic) {
@@ -88,7 +94,9 @@ impl Driver {
                     }
                 }
                 // Release the subscription id back to the pool.
-                self.subscription_id_pool.release(sub_id);
+                self.subscription_id_pool
+                    .release(sub_id)
+                    .map_err(|e| DriverError::Other(e.to_string()))
             }
         }
     }

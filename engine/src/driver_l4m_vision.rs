@@ -2,7 +2,7 @@ use crate::driver::DriverError;
 use crate::lm::{ImageEmbedder, TokenEmb};
 use crate::object::VspaceId;
 use crate::utils::Stream;
-use crate::{backend, driver_l4m, utils};
+use crate::{backend_old, driver_l4m, utils};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -20,12 +20,12 @@ mod l4m {
 // impl<T> crate::driver_l4m::ExecuteCommand for T where T: backend::ExecuteCommand<l4m::Request, l4m::Response> {}
 
 pub trait ExecuteCommand:
-    backend::ExecuteCommand<l4m::vision::Request, l4m::vision::Response>
+    backend_old::Protocol<l4m::vision::Request, l4m::vision::Response>
 {
 }
 
 impl<T> ExecuteCommand for T where
-    T: backend::ExecuteCommand<l4m::vision::Request, l4m::vision::Response>
+    T: backend_old::Protocol<l4m::vision::Request, l4m::vision::Response>
 {
 }
 
@@ -77,7 +77,7 @@ where
 #[derive(Clone)]
 pub struct Simulator {}
 
-impl backend::Simulate<l4m::vision::Request, l4m::vision::Response> for Simulator {
+impl backend_old::Simulate<l4m::vision::Request, l4m::vision::Response> for Simulator {
     fn simulate(&mut self, cmd: l4m::vision::Request) -> Option<l4m::vision::Response> {
         None
     }

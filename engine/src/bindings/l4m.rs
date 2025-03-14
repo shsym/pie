@@ -1,5 +1,5 @@
-use crate::driver::LocalStreamId;
-use crate::instance::{Command, InstanceState};
+use crate::driver::l4m::{LocalStreamId, StreamPriority};
+use crate::instance::InstanceState;
 use crate::object::IdRepr;
 use crate::tokenizer::BytePairEncoder;
 use crate::{bindings, driver, object};
@@ -25,15 +25,10 @@ pub struct SampleTopKResult {
     results: Vec<(Vec<u32>, Vec<f32>)>,
     done: bool,
 }
-
-impl InstanceState {
-    fn send_l4m_cmd(
-        &self,
-        stream: LocalStreamId,
-        cmd: driver::l4m::Command,
-    ) -> anyhow::Result<(), wasmtime::Error> {
-        self.send_cmd(Command::L4m { stream, cmd })
-    }
+#[derive(Debug)]
+pub struct SynchronizationResult {
+    receiver: oneshot::Receiver<()>,
+    done: bool,
 }
 
 #[async_trait]
@@ -52,6 +47,20 @@ impl Pollable for SampleTopKResult {
         self.done = true;
     }
 }
+
+#[async_trait]
+impl Pollable for SynchronizationResult {
+    async fn ready(&mut self) {
+        // if results are already computed, return
+        if self.done {
+            return;
+        }
+
+        let _ = (&self.receiver).await.unwrap();
+        self.done = true;
+    }
+}
+
 #[derive(Debug)]
 pub struct Cache {
     block_size: Option<u32>,
@@ -83,7 +92,7 @@ impl bindings::wit::symphony::app::l4m::Host for InstanceState {
 impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
     async fn get_block_size(&mut self, model: Resource<Model>) -> Result<u32, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
-        self.send_l4m_cmd(0, driver::l4m::Command::GetBlockSize { handle: tx })?;
+        self.send_cmd(driver::l4m::Command::GetBlockSize { handle: tx })?;
         let block_size = rx.await?;
         Ok(block_size)
     }
@@ -93,7 +102,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         model: Resource<Model>,
     ) -> Result<Resource<Tokenizer>, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
-        self.send_l4m_cmd(0, driver::l4m::Command::GetTokenizer { handle: tx })?;
+        self.send_cmd(driver::l4m::Command::GetTokenizer { handle: tx })?;
         let inner = rx.await?;
         let res = self.table().push(Tokenizer { inner })?;
         Ok(res)
@@ -112,7 +121,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
     ) -> Result<Vec<(String, u32)>, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
 
-        self.send_l4m_cmd(0, driver::l4m::Command::GetAllExportedBlocks { handle: tx })?;
+        self.send_cmd(driver::l4m::Command::GetAllExportedBlocks { handle: tx })?;
 
         let result = rx
             .await
@@ -128,13 +137,11 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         ty: bindings::wit::symphony::app::l4m::ObjectType,
         object_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_l4m_cmd(
+        self.send_cmd(driver::l4m::Command::Allocate {
             stream_id,
-            driver::l4m::Command::Allocate {
-                ty: map_object_types(ty),
-                ids: object_ids,
-            },
-        )
+            ty: map_object_types(ty),
+            ids: object_ids,
+        })
     }
 
     async fn deallocate(
@@ -144,13 +151,11 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         ty: bindings::wit::symphony::app::l4m::ObjectType,
         object_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_l4m_cmd(
+        self.send_cmd(driver::l4m::Command::Deallocate {
             stream_id,
-            driver::l4m::Command::Deallocate {
-                ty: map_object_types(ty),
-                ids: object_ids,
-            },
-        )
+            ty: map_object_types(ty),
+            ids: object_ids,
+        })
     }
 
     async fn fill_block(
@@ -162,15 +167,13 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         input_emb_ids: Vec<IdRepr>,
         output_emb_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_l4m_cmd(
+        self.send_cmd(driver::l4m::Command::FillBlock {
             stream_id,
-            driver::l4m::Command::FillBlock {
-                block: block_id,
-                context: context_block_ids,
-                inputs: input_emb_ids,
-                outputs: output_emb_ids,
-            },
-        )
+            block: block_id,
+            context: context_block_ids,
+            inputs: input_emb_ids,
+            outputs: output_emb_ids,
+        })
     }
 
     async fn fill_block_with_adapter(
@@ -183,15 +186,13 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         input_emb_ids: Vec<IdRepr>,
         output_emb_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_l4m_cmd(
+        self.send_cmd(driver::l4m::Command::FillBlock {
             stream_id,
-            driver::l4m::Command::FillBlock {
-                block: block_id,
-                context: context_block_ids,
-                inputs: input_emb_ids,
-                outputs: output_emb_ids,
-            },
-        )
+            block: block_id,
+            context: context_block_ids,
+            inputs: input_emb_ids,
+            outputs: output_emb_ids,
+        })
     }
 
     async fn copy_block(
@@ -204,16 +205,14 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         dst_offset: u32,
         size: u32,
     ) -> Result<(), wasmtime::Error> {
-        self.send_l4m_cmd(
+        self.send_cmd(driver::l4m::Command::CopyBlock {
             stream_id,
-            driver::l4m::Command::CopyBlock {
-                src_block: src_block_id,
-                dst_block: dst_block_id,
-                src_token_offset: src_offset,
-                dst_token_offset: dst_offset,
-                size,
-            },
-        )
+            src_block: src_block_id,
+            dst_block: dst_block_id,
+            src_token_offset: src_offset,
+            dst_token_offset: dst_offset,
+            size,
+        })
     }
 
     async fn mask_block(
@@ -223,13 +222,12 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         block_id: IdRepr,
         mask: Vec<bool>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_l4m_cmd(
+        self.send_cmd(driver::l4m::Command::MaskBlock {
             stream_id,
-            driver::l4m::Command::MaskBlock {
-                block: block_id,
-                mask,
-            },
-        )
+
+            block: block_id,
+            mask,
+        })
     }
 
     async fn export_blocks(
@@ -238,13 +236,10 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         src_block_ids: Vec<IdRepr>,
         name: String,
     ) -> Result<(), wasmtime::Error> {
-        self.send_l4m_cmd(
-            0,
-            driver::l4m::Command::ExportBlocks {
-                blocks: src_block_ids,
-                resource_name: name,
-            },
-        )
+        self.send_cmd(driver::l4m::Command::ExportBlocks {
+            blocks: src_block_ids,
+            resource_name: name,
+        })
     }
 
     async fn import_blocks(
@@ -253,13 +248,10 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         dst_block_ids: Vec<IdRepr>,
         name: String,
     ) -> Result<(), wasmtime::Error> {
-        self.send_l4m_cmd(
-            0,
-            driver::l4m::Command::ImportBlocks {
-                blocks: dst_block_ids,
-                resource_name: name,
-            },
-        )
+        self.send_cmd(driver::l4m::Command::ImportBlocks {
+            blocks: dst_block_ids,
+            resource_name: name,
+        })
     }
 
     async fn embed_text(
@@ -270,14 +262,12 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         tokens: Vec<u32>,
         positions: Vec<u32>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_l4m_cmd(
+        self.send_cmd(driver::l4m::Command::EmbedText {
             stream_id,
-            driver::l4m::Command::EmbedText {
-                embs: emb_ids,
-                text: tokens,
-                positions,
-            },
-        )
+            embs: emb_ids,
+            text: tokens,
+            positions,
+        })
     }
 
     async fn decode_token_dist(
@@ -287,13 +277,11 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         emb_ids: Vec<IdRepr>,
         dist_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_l4m_cmd(
+        self.send_cmd(driver::l4m::Command::DecodeTokenDist {
             stream_id,
-            driver::l4m::Command::DecodeTokenDist {
-                embs: emb_ids,
-                dists: dist_ids,
-            },
-        )
+            embs: emb_ids,
+            dists: dist_ids,
+        })
     }
 
     async fn sample_top_k(
@@ -307,14 +295,12 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         for i in 0..dist_ids.len() {
             let (tx, rx) = oneshot::channel();
             receivers.push(rx);
-            self.send_l4m_cmd(
+            self.send_cmd(driver::l4m::Command::SampleTopK {
                 stream_id,
-                driver::l4m::Command::SampleTopK {
-                    dist: dist_ids[i],
-                    k,
-                    handle: tx,
-                },
-            )?;
+                dist: dist_ids[i],
+                k,
+                handle: tx,
+            })?;
         }
 
         let top_k_result = SampleTopKResult {
@@ -325,6 +311,42 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
 
         let res = self.table().push(top_k_result)?;
         Ok(res)
+    }
+
+    async fn synchronize(
+        &mut self,
+        model: Resource<Model>,
+        stream_id: u32,
+    ) -> Result<Resource<SynchronizationResult>, wasmtime::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.send_cmd(driver::l4m::Command::Synchronize {
+            stream_id,
+            handle: tx,
+        });
+
+        let result = SynchronizationResult {
+            receiver: rx,
+            done: false,
+        };
+
+        let res = self.table().push(result)?;
+        Ok(res)
+    }
+
+    async fn set_stream_priority(
+        &mut self,
+        model: Resource<Model>,
+        stream_id: u32,
+        priority: bindings::wit::symphony::app::l4m::StreamPriority,
+    ) -> Result<(), wasmtime::Error> {
+        self.send_cmd(driver::l4m::Command::SetStreamPriority {
+            stream_id,
+            priority: match priority {
+                bindings::wit::symphony::app::l4m::StreamPriority::High => StreamPriority::High,
+                bindings::wit::symphony::app::l4m::StreamPriority::Normal => StreamPriority::Normal,
+                bindings::wit::symphony::app::l4m::StreamPriority::Low => StreamPriority::Low,
+            },
+        })
     }
 
     async fn drop(&mut self, model: Resource<Model>) -> anyhow::Result<(), wasmtime::Error> {
@@ -374,7 +396,7 @@ impl bindings::wit::symphony::app::l4m::HostSampleTopKResult for InstanceState {
     async fn subscribe(
         &mut self,
         this: Resource<SampleTopKResult>,
-    ) -> anyhow::Result<Resource<DynPollable>> {
+    ) -> Result<Resource<DynPollable>, wasmtime::Error> {
         subscribe(self.table(), this)
     }
 
@@ -390,7 +412,33 @@ impl bindings::wit::symphony::app::l4m::HostSampleTopKResult for InstanceState {
         }
     }
 
-    async fn drop(&mut self, this: Resource<SampleTopKResult>) -> anyhow::Result<()> {
+    async fn drop(&mut self, this: Resource<SampleTopKResult>) -> Result<(), wasmtime::Error> {
+        let _ = self.table().delete(this)?;
+        Ok(())
+    }
+}
+
+impl bindings::wit::symphony::app::l4m::HostSynchronizationResult for InstanceState {
+    async fn subscribe(
+        &mut self,
+        this: Resource<SynchronizationResult>,
+    ) -> Result<Resource<DynPollable>, wasmtime::Error> {
+        subscribe(self.table(), this)
+    }
+
+    async fn get(
+        &mut self,
+        this: Resource<SynchronizationResult>,
+    ) -> Result<Option<bool>, wasmtime::Error> {
+        let result = self.table().get_mut(&this)?;
+        if result.done {
+            Ok(Some(true))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn drop(&mut self, this: Resource<SynchronizationResult>) -> Result<(), wasmtime::Error> {
         let _ = self.table().delete(this)?;
         Ok(())
     }

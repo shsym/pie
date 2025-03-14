@@ -1,8 +1,8 @@
 #![allow(unused)]
 
-mod backend;
+mod backend_old;
 mod client;
-mod controller;
+mod controller_old;
 mod driver;
 mod driver_l4m;
 mod driver_l4m_vision;
@@ -16,18 +16,21 @@ mod tokenizer;
 mod utils;
 mod instance;
 mod bindings;
+mod controller;
+mod batching;
+mod backend;
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc::{channel, unbounded_channel};
 
-use crate::controller::Controller;
+use crate::controller_old::Controller;
 use crate::instance_old::{Command, Id as InstanceId};
 use crate::server::{ServerMessage, ServerState, WebSocketServer};
 use wasmtime::{Config, Engine};
 
-use crate::backend::{SimulatedBackend, ZmqBackend};
+use crate::backend_old::{SimulatedBackend, ZmqBackend};
 use crate::client::Client;
 use crate::runtime::Runtime;
 use std::fs;

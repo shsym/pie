@@ -2,7 +2,7 @@ use crate::lm::{
     CausalLanguageModel, CausalTransformer, ImageEmbedder, KvBlock, TokenDist, TokenEmb,
 };
 use crate::utils::{Counter, Stream};
-use crate::{backend, object, tokenizer, utils};
+use crate::{backend_old, object, tokenizer, utils};
 use anyhow::{anyhow, bail, ensure};
 use rand::Rng;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::backend::BackendError;
+use crate::backend_old::BackendError;
 use crate::driver::{BatchQueue, DriverError, KorTStrategy};
 use crate::object::{Allocator,  Id as ObjectId, IdMapper, IdRepr, ObjectError, VspaceId};
 use crate::tokenizer::BytePairEncoder;
@@ -29,8 +29,8 @@ mod l4m {
 }
 
 // blanket implementation for all compatible backends
-pub trait ExecuteCommand: backend::ExecuteCommand<l4m::Request, l4m::Response> {}
-impl<T> ExecuteCommand for T where T: backend::ExecuteCommand<l4m::Request, l4m::Response> {}
+pub trait ExecuteCommand: backend_old::Protocol<l4m::Request, l4m::Response> {}
+impl<T> ExecuteCommand for T where T: backend_old::Protocol<l4m::Request, l4m::Response> {}
 
 /// Intermediate representation of a command to be executed by the backend.
 /// This must not be exposed to other modules.
@@ -767,7 +767,7 @@ where
 
 impl<B> CausalTransformer for Driver<B>
 where
-    B: backend::ExecuteCommand<l4m::Request, l4m::Response>,
+    B: backend_old::Protocol<l4m::Request, l4m::Response>,
 {
     fn fill(
         &mut self,
@@ -1133,7 +1133,7 @@ impl RefCounter {
 #[derive(Clone)]
 pub struct Simulator {}
 
-impl backend::Simulate<l4m::Request, l4m::Response> for Simulator {
+impl backend_old::Simulate<l4m::Request, l4m::Response> for Simulator {
     fn simulate(&mut self, req: l4m::Request) -> Option<l4m::Response> {
         let resp_payload = match req.command.unwrap() {
             l4m::request::Command::SampleTopKRequest(batch) => {
