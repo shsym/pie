@@ -1,11 +1,13 @@
 // Minimalistic driver implementation
 
-use crate::backend_old;
+use crate::backend;
+use crate::backend::Backend;
 use crate::driver::DriverError;
 use crate::instance::Id as InstanceId;
 use crate::utils::IdPool;
 use dashmap::DashMap;
 use futures::SinkExt;
+use prost::Message;
 use std::collections::VecDeque;
 use std::mem;
 use std::sync::{Arc, Mutex};
@@ -16,9 +18,6 @@ pub const PROTOCOL: &str = "ping";
 mod pb_bindings {
     include!(concat!(env!("OUT_DIR"), "/ping.rs"));
 }
-
-pub trait CompatibleBackend: backend_old::Protocol<pb_bindings::Ping, pb_bindings::Pong> {}
-impl<T> CompatibleBackend for T where T: backend_old::Protocol<pb_bindings::Ping, pb_bindings::Pong> {}
 
 #[derive(Debug)]
 pub enum Command {
@@ -40,26 +39,35 @@ pub struct Ping<B> {
     cmd_queue: Arc<Mutex<Vec<Command>>>,
     event_table: Arc<DashMap<u32, Event>>,
     event_loop_handle: tokio::task::JoinHandle<()>,
+
+    protocol_idx: u8,
 }
 
 impl<B> Ping<B>
 where
-    B: CompatibleBackend,
+    B: Backend,
 {
-    pub async fn new(backend: B) -> Self {
+    pub async fn new(backend: B) -> Result<Self, DriverError> {
+        let protocol_idx = backend
+            .get_protocol_idx(crate::driver::l4m::PROTOCOL)
+            .map_err(|e| {
+                DriverError::Other(format!("Failed to get protocol index: {}", e.to_string()))
+            })?;
+
         let (tx, rx) = mpsc::channel(1000);
-        backend.report_to(tx).await;
+        backend.listen(protocol_idx, tx);
 
         let event_table = Arc::new(DashMap::new());
         let event_loop_handle = tokio::spawn(Self::event_loop(rx, event_table.clone()));
 
-        Self {
+        Ok(Self {
             backend,
             cmd_id_pool: IdPool::new(u32::MAX),
             cmd_queue: Arc::new(Mutex::new(Vec::new())),
             event_table,
             event_loop_handle,
-        }
+            protocol_idx,
+        })
     }
 
     pub fn submit(&mut self, _: InstanceId, cmd: Command) -> Result<(), DriverError> {
@@ -89,7 +97,7 @@ where
                     self.event_table
                         .insert(correlation_id, Event::Pong(handler));
                     self.backend
-                        .exec(ping)
+                        .send(self.protocol_idx, ping.encode_to_vec())
                         .await
                         .map_err(|e| DriverError::Other(e.to_string()))?;
                 }
@@ -100,10 +108,12 @@ where
     }
 
     async fn event_loop(
-        mut rx: mpsc::Receiver<pb_bindings::Pong>,
+        mut rx: mpsc::Receiver<Vec<u8>>,
         mut event_table: Arc<DashMap<u32, Event>>,
     ) {
         while let Some(pong) = rx.recv().await {
+            let pong = pb_bindings::Pong::decode(pong.as_slice()).unwrap();
+
             let correlation_id = pong.correlation_id;
             if let Some((_, event)) = event_table.remove(&correlation_id) {
                 match event {
@@ -117,13 +127,31 @@ where
 }
 
 #[derive(Clone)]
-pub struct Simulator {}
+pub struct Simulator {
+    pub protocols: Vec<String>,
+}
 
-impl backend_old::Simulate<pb_bindings::Ping, pb_bindings::Pong> for Simulator {
-    fn simulate(&mut self, cmd: pb_bindings::Ping) -> Option<pb_bindings::Pong> {
-        Some(pb_bindings::Pong {
-            correlation_id: cmd.correlation_id,
-            message: format!("Pong: {}", cmd.message),
-        })
+impl Simulator {
+    pub fn new() -> Self {
+        Self {
+            protocols: vec![PROTOCOL.to_string()],
+        }
+    }
+}
+
+impl backend::Simulate for Simulator {
+    fn protocols(&self) -> &[String] {
+        self.protocols.as_slice()
+    }
+
+    fn simulate(&mut self, command: Vec<u8>) -> Option<Vec<u8>> {
+        let cmd = pb_bindings::Ping::decode(command.as_slice()).unwrap();
+        Some(
+            pb_bindings::Pong {
+                correlation_id: cmd.correlation_id,
+                message: format!("Pong: {}", cmd.message),
+            }
+            .encode_to_vec(),
+        )
     }
 }

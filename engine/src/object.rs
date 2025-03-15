@@ -303,9 +303,9 @@ pub trait ObjectType: Eq + Hash + Debug + Copy {
     fn is_sharable(&self) -> bool;
     fn allow_remapping(&self) -> bool;
 
-    fn max_capacity(&self) -> IdRepr {
-        IdRepr::MAX
-    }
+    // //fn max_capacity(&self) -> IdRepr {
+    //     IdRepr::MAX
+    // }
 }
 
 #[derive(Debug)]
@@ -334,6 +334,14 @@ where
             ref_counter,
             namespaces: HashMap::new(),
         }
+    }
+
+    pub fn set_capacity(&mut self, ty: TY, capacity: usize) -> Result<(), ObjectError> {
+        self.id_pool
+            .entry(ty)
+            .or_insert_with(|| IdPool::new(capacity.into()))
+            .set_capacity(capacity.into())
+            .map_err(|e| ObjectError::NoAvailableSpace)
     }
 
     pub fn create(&mut self, ty: TY, ns: NS, name: IdRepr) -> Result<IdRepr, ObjectError> {
@@ -596,12 +604,7 @@ where
         Ok(())
     }
 
-    pub fn translate_many(
-        &self,
-        ty: TY,
-        ns: NS,
-        names: &mut [IdRepr],
-    ) -> Result<(), ObjectError> {
+    pub fn translate_many(&self, ty: TY, ns: NS, names: &mut [IdRepr]) -> Result<(), ObjectError> {
         let ty_ns = (ty.clone(), ns);
         let table = self
             .namespaces

@@ -79,6 +79,14 @@ where
         }
     }
 
+    pub fn set_capacity(&mut self, capacity: T) -> Result<()> {
+        if capacity < self.next {
+            return Err(Error::msg("Cannot set capacity lower than the next ID"));
+        }
+        self.max_capacity = capacity;
+        Ok(())
+    }
+
     /// Allocate and return the smallest available ID.
     ///
     /// Returns `Some(id)` if an ID is available, or `None` if the pool is exhausted.

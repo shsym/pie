@@ -1,18 +1,19 @@
+use crate::backend::Backend;
 use crate::batching::{Batchable, Batcher, BatchingStrategy, KorTStrategy};
-use crate::controller_old::ControllerError;
 use crate::driver::{Driver, DriverError, DynCommand};
 use crate::instance::Id as InstanceId;
 use crate::object::{
     IdRepr, ObjectError, ObjectManager, ObjectType, VspaceId, group_consecutive_ids,
 };
+use crate::runtime::Reporter;
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::{Counter, IdPool};
-use crate::{backend_old, lm, object, tokenizer, utils};
+use crate::{backend, lm, object, tokenizer, utils};
 use anyhow::anyhow;
 use dashmap::DashMap;
+use prost::Message;
 use rand::Rng;
 use std::any::TypeId;
-use std::cell::RefCell;
 use std::cmp::{Ordering, PartialEq};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -25,19 +26,12 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
-pub const PROTOCOL: &str = "l4m"; // for future backward compatibility
+pub const PROTOCOLS: [&str; 2] = ["l4m", "l4m-vision"]; // for future backward compatibility
+const PROTOCOL_BASE: usize = 0;
+const PROTOCOL_VISION: usize = 1;
 
 mod pb_bindings {
     include!(concat!(env!("OUT_DIR"), "/l4m.rs"));
-}
-
-pub trait CompatibleBackend:
-    backend_old::Protocol<pb_bindings::Request, pb_bindings::Response>
-{
-}
-impl<T> CompatibleBackend for T where
-    T: backend_old::Protocol<pb_bindings::Request, pb_bindings::Response>
-{
 }
 
 #[derive(Debug)]
@@ -192,7 +186,12 @@ pub enum Command {
         priority: StreamPriority,
     },
 
-    Cleanup,
+    //// ------ Vision specific commands ------ ////
+    EmbedImage {
+        stream_id: LocalStreamId,
+        embs: Vec<IdRepr>,
+        image_blob: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -206,6 +205,7 @@ enum BatchGroup {
     DecodeTokenDist,
     SampleTopK,
     Synchronize,
+    EmbedImage,
 }
 
 impl Batchable<BatchGroup> for Command {
@@ -220,6 +220,7 @@ impl Batchable<BatchGroup> for Command {
             Command::DecodeTokenDist { .. } => KorTStrategy::eager().into_box(),
             Command::SampleTopK { .. } => KorTStrategy::eager().into_box(),
             Command::Synchronize { .. } => KorTStrategy::immediate().into_box(),
+            Command::EmbedImage { .. } => KorTStrategy::eager().into_box(),
             _ => unreachable!(),
         }
     }
@@ -235,6 +236,7 @@ impl Batchable<BatchGroup> for Command {
             Command::DecodeTokenDist { .. } => BatchGroup::DecodeTokenDist,
             Command::SampleTopK { .. } => BatchGroup::SampleTopK,
             Command::Synchronize { .. } => BatchGroup::Synchronize,
+            Command::EmbedImage { .. } => BatchGroup::EmbedImage,
             _ => unreachable!(),
         }
     }
@@ -256,21 +258,28 @@ pub enum ManagedTypes {
 
 impl ObjectType for ManagedTypes {
     fn is_sharable(&self) -> bool {
-        todo!()
+        match self {
+            ManagedTypes::KvBlock => true,
+            ManagedTypes::TokenEmb => false,
+            ManagedTypes::TokenDist => false,
+        }
     }
 
     fn allow_remapping(&self) -> bool {
-        todo!()
-    }
-
-    fn max_capacity(&self) -> IdRepr {
-        todo!()
+        match self {
+            ManagedTypes::KvBlock => false,
+            ManagedTypes::TokenEmb => true,
+            ManagedTypes::TokenDist => true,
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct L4m<B> {
     backend: B,
+    reporter: Reporter,
+    protocol_ids: Vec<u8>,
+
     cmd_id_pool: IdPool<u32>,
     cmd_batcher: Batcher<Command, Stream, BatchGroup>,
 
@@ -281,7 +290,7 @@ pub struct L4m<B> {
     exported_blocks: HashMap<String, ExportedBlocks>,
 
     // Rc for shared ownership across multiple "extension drivers"
-    objects: Rc<RefCell<ObjectManager<InstanceId, ManagedTypes>>>,
+    objects: ObjectManager<InstanceId, ManagedTypes>,
 
     stream_priorities: HashMap<Stream, StreamPriority>,
 
@@ -289,88 +298,82 @@ pub struct L4m<B> {
     tokenizer: Arc<BytePairEncoder>,
 }
 
-// Read-only view of the object registry
-#[derive(Debug)]
-pub struct ObjectView {
-    objects: Rc<RefCell<ObjectManager<InstanceId, ManagedTypes>>>,
-}
-
-impl ObjectView {
-    fn new(objects: Rc<RefCell<ObjectManager<InstanceId, ManagedTypes>>>) -> Self {
-        Self { objects }
-    }
-
-    pub fn translate(
-        &self,
-        ty: ManagedTypes,
-        inst: InstanceId,
-        id: &mut IdRepr,
-    ) -> Result<(), ObjectError> {
-        let object = self.objects.borrow();
-        object.translate(ty, inst, id)
-    }
-
-    pub fn translate_many(
-        &self,
-        ty: ManagedTypes,
-        inst: InstanceId,
-        ids: &mut [IdRepr],
-    ) -> Result<(), ObjectError> {
-        let object = self.objects.borrow();
-        object.translate_many(ty, inst, ids)
-    }
-}
-
 impl<B> Driver for L4m<B>
 where
-    B: CompatibleBackend,
+    B: Backend,
 {
-    fn accepts(&self) -> &[TypeId] {
-        vec![TypeId::of::<Command>()]
+    type Command = Command;
+
+    fn create(&mut self, inst: InstanceId) {}
+
+    fn destroy(&mut self, inst: InstanceId) {
+        let mut cmds = Vec::new();
+
+        for ty in [
+            ManagedTypes::KvBlock,
+            ManagedTypes::TokenEmb,
+            ManagedTypes::TokenDist,
+        ] {
+            cmds.push(Command::Deallocate {
+                stream_id: 0,
+                ty,
+                ids: self.objects.all_names(ty, inst).unwrap(),
+            })
+        }
+
+        for cmd in cmds {
+            self.dispatch(inst, cmd);
+        }
+
+        // Remove all exported blocks
+        self.exported_blocks.retain(|_, v| v.owner != inst);
     }
 
-    fn create_inst(&mut self, inst: InstanceId) -> Result<(), DriverError> {
-        todo!()
-    }
+    async fn dispatch(&mut self, inst: InstanceId, cmd: Self::Command) {
+        match self.translate_cmd(inst, cmd) {
+            Ok(cmd) => match cmd {
+                // Should be sent to backend
+                Some((cmd, mut stream)) => {
+                    // adjust stream priority
+                    if let Some(priority) = self.stream_priorities.get(&stream) {
+                        stream.set_priority(*priority)
+                    }
 
-    fn destroy_inst(&mut self, inst: InstanceId) -> Result<(), DriverError> {
-        todo!()
-    }
+                    self.cmd_batcher.push(stream, cmd, Instant::now());
 
-    fn submit(&mut self, inst: InstanceId, cmd: DynCommand) -> Result<(), DriverError> {
-        if let Some(cmd) = cmd.as_any().downcast_ref::<Command>() {
-            if let Some((cmd, mut stream)) = self.translate_cmd(inst, cmd)? {
-                // adjust stream priority
-                if let Some(priority) = self.stream_priorities.get(&stream) {
-                    stream.set_priority(*priority)
+                    for (_, cmd_batch) in self.cmd_batcher.batch(Instant::now()) {
+                        self.commit_backend(cmd_batch).await;
+                    }
                 }
 
-                self.cmd_batcher.push(stream, cmd, Instant::now());
-            }
-            Ok(())
-        } else {
-            return Err(DriverError::Other("Command type mismatch.".to_string()));
+                // No need to send to backend
+                None => {}
+            },
+            Err(e) => self.reporter.error(inst, e.to_string()),
         }
-
-        todo!()
     }
 
-    async fn flush(&mut self) -> Result<(), DriverError> {
-        for (_, cmd_batch) in self.cmd_batcher.batch(Instant::now()) {
-            self.commit_backend(cmd_batch).await?;
-        }
-
-        Ok(())
+    fn reporter(&self) -> Option<&Reporter> {
+        Some(&self.reporter)
     }
 }
 
 impl<B> L4m<B>
 where
-    B: CompatibleBackend,
+    B: Backend,
 {
-    pub async fn new(backend: B) {
+    pub async fn new(backend: B, reporter: Reporter) -> Result<Self, DriverError> {
+        let protocol_ids = PROTOCOLS
+            .iter()
+            .map(|protoc| {
+                backend.get_protocol_idx(protoc).map_err(|e| {
+                    DriverError::Other(format!("Failed to get protocol index: {}", e.to_string()))
+                })
+            })
+            .collect::<Result<Vec<u8>, DriverError>>()?;
+
         let (tx, rx) = mpsc::channel(1000);
-        backend.report_to(tx).await;
+        backend.listen(0, tx);
 
         let event_table = Arc::new(DashMap::new());
         let event_loop_handle = tokio::spawn(Self::event_loop(rx, event_table.clone()));
@@ -381,12 +384,16 @@ where
             event_table.insert(0, vec![Event::GetInfo(info_tx)]);
 
             backend
-                .exec(pb_bindings::Request {
-                    correlation_id: 0,
-                    command: Some(pb_bindings::request::Command::GetInfo(
-                        pb_bindings::GetInfoRequest {},
-                    )),
-                })
+                .send(
+                    protocol_ids[PROTOCOL_BASE],
+                    pb_bindings::Request {
+                        correlation_id: 0,
+                        command: Some(pb_bindings::request::Command::GetInfo(
+                            pb_bindings::GetInfoRequest {},
+                        )),
+                    }
+                    .encode_to_vec(),
+                )
                 .await;
             info_rx.await.unwrap()
         };
@@ -405,50 +412,28 @@ where
         let tokenizer = tokenizer::llama3_tokenizer("../test-tokenizer/tokenizer.model")
             .expect("Tokenizer load failed");
 
+        let mut objects = ObjectManager::new();
+        objects.set_capacity(ManagedTypes::KvBlock, info.num_blocks as usize)?;
+        objects.set_capacity(ManagedTypes::TokenEmb, info.num_embeddings as usize)?;
+        objects.set_capacity(ManagedTypes::TokenDist, info.num_distributions as usize)?;
+
         let driver = Self {
             backend,
+            reporter,
+            protocol_ids,
             cmd_id_pool: IdPool::new(u32::MAX),
             cmd_batcher: Batcher::new(),
             event_table,
             event_loop_handle,
             subscriptions: HashMap::new(),
             exported_blocks: HashMap::new(),
-            objects: Rc::new(RefCell::new(ObjectManager::new())),
+            objects,
             stream_priorities: HashMap::new(),
             info,
             tokenizer: Arc::new(tokenizer),
         };
-    }
 
-    pub fn get_object_registry_view(&self) -> ObjectView {
-        ObjectView::new(self.objects.clone())
-    }
-
-    fn cleanup(&mut self, inst: InstanceId) -> Result<(), DriverError> {
-        let mut cmds = Vec::new();
-
-        for ty in [
-            ManagedTypes::KvBlock,
-            ManagedTypes::TokenEmb,
-            ManagedTypes::TokenDist,
-        ] {
-            let mut obj_mgr = RefCell::borrow_mut(&self.objects);
-
-            cmds.push(Command::Deallocate {
-                stream_id: 0,
-                ty,
-                ids: obj_mgr.all_names(ty, inst)?,
-            })
-        }
-
-        for cmd in cmds {
-            self.submit(inst, DynCommand::new(cmd))?;
-        }
-
-        // Remove all exported blocks
-        self.exported_blocks.retain(|_, v| v.owner != inst);
-
-        Ok(())
+        Ok(driver)
     }
 
     fn translate_cmd(
@@ -456,7 +441,7 @@ where
         inst: InstanceId,
         cmd: Command,
     ) -> Result<Option<(Command, Stream)>, DriverError> {
-        let mut objects = RefCell::borrow_mut(&self.objects);
+        //let mut objects = &self.objects;
 
         let resolved_cmd = match cmd {
             Command::GetBlockSize { handle } => {
@@ -486,7 +471,7 @@ where
             }
 
             Command::Allocate { stream_id, ty, ids } => {
-                let ids = objects.create_many(ty, inst, ids)?;
+                let ids = self.objects.create_many(ty, inst, ids)?;
 
                 Some((
                     Command::Allocate { stream_id, ty, ids },
@@ -494,7 +479,7 @@ where
                 ))
             }
             Command::Deallocate { stream_id, ty, ids } => {
-                let ids = objects.destroy_many(ty, inst, &ids)?;
+                let ids = self.objects.destroy_many(ty, inst, &ids)?;
 
                 if ids.is_empty() {
                     return Ok(None);
@@ -512,10 +497,14 @@ where
                 mut inputs,
                 mut outputs,
             } => {
-                objects.translate(ManagedTypes::KvBlock, inst, &mut block)?;
-                objects.translate_many(ManagedTypes::KvBlock, inst, &mut context)?;
-                objects.translate_many(ManagedTypes::TokenEmb, inst, &mut inputs)?;
-                objects.translate_many(ManagedTypes::TokenEmb, inst, &mut outputs)?;
+                self.objects
+                    .translate(ManagedTypes::KvBlock, inst, &mut block)?;
+                self.objects
+                    .translate_many(ManagedTypes::KvBlock, inst, &mut context)?;
+                self.objects
+                    .translate_many(ManagedTypes::TokenEmb, inst, &mut inputs)?;
+                self.objects
+                    .translate_many(ManagedTypes::TokenEmb, inst, &mut outputs)?;
 
                 Some((
                     Command::FillBlock {
@@ -532,7 +521,8 @@ where
                 mut blocks,
                 resource_name,
             } => {
-                objects.translate_many(ManagedTypes::KvBlock, inst, &mut blocks)?;
+                self.objects
+                    .translate_many(ManagedTypes::KvBlock, inst, &mut blocks)?;
 
                 self.exported_blocks
                     .insert(resource_name, ExportedBlocks::new(inst, blocks));
@@ -551,7 +541,12 @@ where
                             resource_name
                         )))?;
 
-                objects.create_ref_many(ManagedTypes::KvBlock, inst, blocks, &exported.addrs)?;
+                self.objects.create_ref_many(
+                    ManagedTypes::KvBlock,
+                    inst,
+                    blocks,
+                    &exported.addrs,
+                )?;
 
                 None
             }
@@ -564,8 +559,10 @@ where
                 dst_token_offset,
                 size,
             } => {
-                objects.translate(ManagedTypes::KvBlock, inst, &mut src_block)?;
-                objects.translate(ManagedTypes::KvBlock, inst, &mut dst_block)?;
+                self.objects
+                    .translate(ManagedTypes::KvBlock, inst, &mut src_block)?;
+                self.objects
+                    .translate(ManagedTypes::KvBlock, inst, &mut dst_block)?;
 
                 Some((
                     Command::CopyBlock {
@@ -584,7 +581,8 @@ where
                 mut block,
                 mask,
             } => {
-                objects.translate(ManagedTypes::KvBlock, inst, &mut block)?;
+                self.objects
+                    .translate(ManagedTypes::KvBlock, inst, &mut block)?;
 
                 Some((
                     Command::MaskBlock {
@@ -601,7 +599,8 @@ where
                 text,
                 positions,
             } => {
-                objects.translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
+                self.objects
+                    .translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
 
                 Some((
                     Command::EmbedText {
@@ -618,8 +617,10 @@ where
                 mut embs,
                 mut dists,
             } => {
-                objects.translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
-                objects.translate_many(ManagedTypes::TokenDist, inst, &mut dists)?;
+                self.objects
+                    .translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
+                self.objects
+                    .translate_many(ManagedTypes::TokenDist, inst, &mut dists)?;
 
                 Some((
                     Command::DecodeTokenDist {
@@ -636,7 +637,8 @@ where
                 k,
                 handle,
             } => {
-                objects.translate(ManagedTypes::TokenDist, inst, &mut dist)?;
+                self.objects
+                    .translate(ManagedTypes::TokenDist, inst, &mut dist)?;
 
                 Some((
                     Command::SampleTopK {
@@ -661,253 +663,52 @@ where
                 None
             }
 
-            Command::Cleanup => {
-                self.cleanup(inst)?;
-                None
+            Command::EmbedImage {
+                stream_id,
+                mut embs,
+                image_blob,
+            } => {
+                self.objects
+                    .translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
+
+                Some((
+                    Command::EmbedImage {
+                        stream_id,
+                        embs,
+                        image_blob,
+                    },
+                    Stream::new(inst, stream_id),
+                ))
             }
         };
 
         Ok(resolved_cmd)
     }
 
-    async fn commit_backend(&mut self, cmd_batch: Vec<Command>) -> Result<(), DriverError> {
-        let cmd_type = cmd_batch.first().unwrap().group();
+    async fn commit_backend(&mut self, batch: Vec<Command>) {
+        let batch_type = batch.first().unwrap().group();
+        let correlation_id = self.cmd_id_pool.acquire().unwrap();
 
-        let (cmd, event) = match cmd_type.clone() {
-            BatchGroup::Allocate | BatchGroup::Deallocate => {
-                let mut items = Vec::new();
-                for cmd in cmd_batch {
-                    match cmd {
-                        Command::Allocate { stream_id, ty, ids }
-                        | Command::Deallocate { stream_id, ty, ids } => {
-                            let kind = match ty {
-                                ManagedTypes::KvBlock => pb_bindings::ObjectKind::KvBlock,
-                                ManagedTypes::TokenEmb => pb_bindings::ObjectKind::Emb,
-                                ManagedTypes::TokenDist => pb_bindings::ObjectKind::Dist,
-                                _ => unreachable!(),
-                            }
-                            .into();
-
-                            for (offset, size) in group_consecutive_ids(&ids) {
-                                let pb = pb_bindings::Allocate {
-                                    kind,
-                                    object_id_offset: offset,
-                                    count: size as u32,
-                                };
-                                items.push(pb);
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-
-                let pb = if cmd_type == BatchGroup::Allocate {
-                    pb_bindings::request::Command::Allocate(pb_bindings::BatchAllocate { items })
-                } else {
-                    pb_bindings::request::Command::Deallocate(pb_bindings::BatchDeallocate {
-                        items,
-                    })
-                };
-
-                (pb, None)
-            }
-
-            BatchGroup::FillBlock => {
-                let mut items = Vec::new();
-                for cmd in cmd_batch {
-                    match cmd {
-                        Command::FillBlock {
-                            stream_id,
-                            block,
-                            context,
-                            inputs,
-                            outputs,
-                        } => {
-                            let pb = pb_bindings::FillBlock {
-                                block_id: block,
-                                context_block_ids: context,
-                                input_embedding_ids: inputs,
-                                output_embedding_ids: outputs,
-                            };
-                            items.push(pb);
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                (
-                    pb_bindings::request::Command::FillBlock(pb_bindings::BatchFillBlock { items }),
-                    None,
-                )
-            }
-
-            BatchGroup::CopyBlock => {
-                let mut items = Vec::new();
-                for cmd in cmd_batch {
-                    match cmd {
-                        Command::CopyBlock {
-                            stream_id,
-                            src_block,
-                            dst_block,
-                            src_token_offset,
-                            dst_token_offset,
-                            size,
-                        } => {
-                            let pb = pb_bindings::CopyBlock {
-                                source_block_id: src_block,
-                                destination_block_id: dst_block,
-                                source_start: src_token_offset,
-                                destination_start: dst_token_offset,
-                                length: size,
-                            };
-                            items.push(pb);
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-
-                (
-                    pb_bindings::request::Command::CopyBlock(pb_bindings::BatchCopyBlock { items }),
-                    None,
-                )
-            }
-            BatchGroup::MaskBlock => {
-                let mut items = Vec::new();
-
-                for cmd in cmd_batch {
-                    match cmd {
-                        Command::MaskBlock {
-                            stream_id,
-                            block,
-                            mask,
-                        } => {
-                            let pb = pb_bindings::MaskBlock {
-                                block_id: block,
-                                mask,
-                            };
-                            items.push(pb);
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-
-                (
-                    pb_bindings::request::Command::MaskBlock(pb_bindings::BatchMaskBlock { items }),
-                    None,
-                )
-            }
-            BatchGroup::EmbedText => {
-                let mut items = Vec::new();
-
-                for cmd in cmd_batch {
-                    match cmd {
-                        Command::EmbedText {
-                            stream_id,
-                            embs,
-                            text,
-                            positions,
-                        } => {
-                            for i in 0..embs.len() {
-                                let pb = pb_bindings::EmbedText {
-                                    embedding_id: embs[i],
-                                    token_id: text[i],
-                                    position_id: positions[i],
-                                };
-                                items.push(pb);
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-
-                (
-                    pb_bindings::request::Command::EmbedText(pb_bindings::BatchEmbedText { items }),
-                    None,
-                )
-            }
-            BatchGroup::DecodeTokenDist => {
-                let mut items = Vec::new();
-
-                for cmd in cmd_batch {
-                    match cmd {
-                        Command::DecodeTokenDist {
-                            stream_id,
-                            embs,
-                            dists,
-                        } => {
-                            for i in 0..embs.len() {
-                                let pb = pb_bindings::DecodeTokenDistribution {
-                                    embedding_id: embs[i],
-                                    distribution_id: dists[i],
-                                };
-                                items.push(pb);
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-
-                (
-                    pb_bindings::request::Command::DecodeTokenDistribution(
-                        pb_bindings::BatchDecodeTokenDistribution { items },
-                    ),
-                    None,
-                )
-            }
-            BatchGroup::SampleTopK => {
-                let mut items = Vec::new();
-                let mut events = Vec::new();
-
-                for cmd in cmd_batch {
-                    match cmd {
-                        Command::SampleTopK {
-                            stream_id,
-                            dist,
-                            k,
-                            handle,
-                        } => {
-                            let pb = pb_bindings::SampleTopKRequest {
-                                distribution_id: dist,
-                                k,
-                            };
-                            items.push(pb);
-
-                            // register event handle
-                            events.push(Event::SampleTopK(handle));
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-                (
-                    pb_bindings::request::Command::SampleTopKRequest(
-                        pb_bindings::BatchSampleTopKRequest { items },
-                    ),
-                    Some(events),
-                )
-            }
-
+        let ((protocol, payload), event) = match batch_type.clone() {
+            BatchGroup::Allocate => encode_pb_batch_allocate(correlation_id, batch),
+            BatchGroup::Deallocate => encode_pb_batch_deallocate(correlation_id, batch),
+            BatchGroup::FillBlock => encode_pb_batch_fill_block(correlation_id, batch),
+            BatchGroup::CopyBlock => encode_pb_batch_copy_block(correlation_id, batch),
+            BatchGroup::MaskBlock => encode_pb_batch_mask_block(correlation_id, batch),
+            BatchGroup::EmbedText => encode_pb_batch_embed_text(correlation_id, batch),
+            BatchGroup::DecodeTokenDist => encode_pb_batch_decode_token_dist(correlation_id, batch),
+            BatchGroup::SampleTopK => encode_pb_batch_sample_topk(correlation_id, batch),
             BatchGroup::Synchronize => {
-                let cmd = cmd_batch.into_iter().next().unwrap();
-
+                let cmd = batch.into_iter().next().unwrap();
                 match cmd {
                     Command::Synchronize { stream_id, handle } => {
                         handle.send(()).unwrap();
                     }
                     _ => unreachable!(),
                 }
-
-                return Ok(());
+                return;
             }
             _ => unreachable!(),
-        };
-
-        let correlation_id = self
-            .cmd_id_pool
-            .acquire()
-            .map_err(|e| DriverError::LockError)?;
-
-        let req = pb_bindings::Request {
-            correlation_id,
-            command: Some(cmd),
         };
 
         if let Some(events) = event {
@@ -915,18 +716,15 @@ where
         }
 
         self.backend
-            .exec(req)
+            .send(self.protocol_ids[protocol], payload)
             .await
-            .map_err(|e| DriverError::Other(e.to_string()))?;
-
-        Ok(())
+            .unwrap();
     }
 
-    async fn event_loop(
-        mut rx: Receiver<pb_bindings::Response>,
-        event_table: Arc<DashMap<u32, Vec<Event>>>,
-    ) {
+    async fn event_loop(mut rx: Receiver<Vec<u8>>, event_table: Arc<DashMap<u32, Vec<Event>>>) {
         while let Some(resp) = rx.recv().await {
+            let resp = pb_bindings::Response::decode(resp.as_ref()).unwrap();
+
             let correlation_id = resp.correlation_id;
             let payload = resp.command.unwrap();
 
@@ -978,10 +776,26 @@ impl ExportedBlocks {
 }
 
 #[derive(Clone)]
-pub struct Simulator {}
+pub struct Simulator {
+    protocols: Vec<String>,
+}
 
-impl backend_old::Simulate<pb_bindings::Request, pb_bindings::Response> for Simulator {
-    fn simulate(&mut self, req: pb_bindings::Request) -> Option<pb_bindings::Response> {
+impl Simulator {
+    pub fn new() -> Self {
+        Self {
+            protocols: PROTOCOLS.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+}
+
+impl backend::Simulate for Simulator {
+    fn protocols(&self) -> &[String] {
+        self.protocols.as_slice()
+    }
+
+    fn simulate(&mut self, command: Vec<u8>) -> Option<Vec<u8>> {
+        let req = pb_bindings::Request::decode(command.as_ref()).unwrap();
+
         let resp_payload = match req.command.unwrap() {
             pb_bindings::request::Command::SampleTopKRequest(batch) => {
                 let items = batch.items.into_iter().map(|item| {
@@ -1018,12 +832,281 @@ impl backend_old::Simulate<pb_bindings::Request, pb_bindings::Response> for Simu
         };
 
         if let Some(payload) = resp_payload {
-            Some(pb_bindings::Response {
-                correlation_id: req.correlation_id,
-                command: Some(payload),
-            })
+            Some(
+                pb_bindings::Response {
+                    correlation_id: req.correlation_id,
+                    command: Some(payload),
+                }
+                .encode_to_vec(),
+            )
         } else {
             None
         }
     }
+}
+
+// ----
+
+fn encode_pb_batch_allocate_inner(batch: Vec<Command>) -> Vec<pb_bindings::Allocate> {
+    let mut items = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::Allocate { stream_id, ty, ids }
+            | Command::Deallocate { stream_id, ty, ids } => {
+                let kind = match ty {
+                    ManagedTypes::KvBlock => pb_bindings::ObjectKind::KvBlock,
+                    ManagedTypes::TokenEmb => pb_bindings::ObjectKind::Emb,
+                    ManagedTypes::TokenDist => pb_bindings::ObjectKind::Dist,
+                    _ => unreachable!(),
+                }
+                .into();
+
+                for (offset, size) in group_consecutive_ids(&ids) {
+                    let pb = pb_bindings::Allocate {
+                        kind,
+                        object_id_offset: offset,
+                        count: size as u32,
+                    };
+                    items.push(pb);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    items
+}
+
+fn encode_pb_batch_allocate(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(pb_bindings::request::Command::Allocate(
+            pb_bindings::BatchAllocate {
+                items: encode_pb_batch_allocate_inner(batch),
+            },
+        )),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+fn encode_pb_batch_deallocate(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(pb_bindings::request::Command::Deallocate(
+            pb_bindings::BatchDeallocate {
+                items: encode_pb_batch_allocate_inner(batch),
+            },
+        )),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+fn encode_pb_batch_fill_block(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let mut items = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::FillBlock {
+                stream_id,
+                block,
+                context,
+                inputs,
+                outputs,
+            } => {
+                let pb = pb_bindings::FillBlock {
+                    block_id: block,
+                    context_block_ids: context,
+                    input_embedding_ids: inputs,
+                    output_embedding_ids: outputs,
+                };
+                items.push(pb);
+            }
+            _ => unreachable!(),
+        }
+    }
+    let cmd = pb_bindings::request::Command::FillBlock(pb_bindings::BatchFillBlock { items });
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+fn encode_pb_batch_copy_block(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let mut items = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::CopyBlock {
+                stream_id,
+                src_block,
+                dst_block,
+                src_token_offset,
+                dst_token_offset,
+                size,
+            } => {
+                let pb = pb_bindings::CopyBlock {
+                    source_block_id: src_block,
+                    destination_block_id: dst_block,
+                    source_start: src_token_offset,
+                    destination_start: dst_token_offset,
+                    length: size,
+                };
+                items.push(pb);
+            }
+            _ => unreachable!(),
+        }
+    }
+    let cmd = pb_bindings::request::Command::CopyBlock(pb_bindings::BatchCopyBlock { items });
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+fn encode_pb_batch_mask_block(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let mut items = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::MaskBlock {
+                stream_id,
+                block,
+                mask,
+            } => {
+                let pb = pb_bindings::MaskBlock {
+                    block_id: block,
+                    mask,
+                };
+                items.push(pb);
+            }
+            _ => unreachable!(),
+        }
+    }
+    let cmd = pb_bindings::request::Command::MaskBlock(pb_bindings::BatchMaskBlock { items });
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+fn encode_pb_batch_embed_text(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let mut items = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::EmbedText {
+                stream_id,
+                embs,
+                text,
+                positions,
+            } => {
+                for i in 0..embs.len() {
+                    let pb = pb_bindings::EmbedText {
+                        embedding_id: embs[i],
+                        token_id: text[i],
+                        position_id: positions[i],
+                    };
+                    items.push(pb);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    let cmd = pb_bindings::request::Command::EmbedText(pb_bindings::BatchEmbedText { items });
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+fn encode_pb_batch_decode_token_dist(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let mut items = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::DecodeTokenDist {
+                stream_id,
+                embs,
+                dists,
+            } => {
+                for i in 0..embs.len() {
+                    let pb = pb_bindings::DecodeTokenDistribution {
+                        embedding_id: embs[i],
+                        distribution_id: dists[i],
+                    };
+                    items.push(pb);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    let cmd = pb_bindings::request::Command::DecodeTokenDistribution(
+        pb_bindings::BatchDecodeTokenDistribution { items },
+    );
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+fn encode_pb_batch_sample_topk(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let mut items = Vec::new();
+    let mut events = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::SampleTopK {
+                stream_id,
+                dist,
+                k,
+                handle,
+            } => {
+                let pb = pb_bindings::SampleTopKRequest {
+                    distribution_id: dist,
+                    k,
+                };
+                items.push(pb);
+                events.push(Event::SampleTopK(handle));
+            }
+            _ => unreachable!(),
+        }
+    }
+    let cmd =
+        pb_bindings::request::Command::SampleTopKRequest(pb_bindings::BatchSampleTopKRequest {
+            items,
+        });
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), Some(events))
 }

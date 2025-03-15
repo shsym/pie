@@ -38,6 +38,14 @@ pub enum BackendError {
 pub trait Backend: Clone + Send + Sync + 'static {
     fn protocols(&self) -> &[String];
 
+    fn get_protocol_idx(&self, protocol: &str) -> Result<u8, BackendError> {
+        self.protocols()
+            .iter()
+            .position(|p| p == protocol)
+            .map(|idx| idx as u8)
+            .ok_or_else(|| BackendError::UnsupportedProtocol(protocol.to_string()))
+    }
+    
     async fn send(&self, protocol_idx: u8, payload: Vec<u8>) -> Result<(), BackendError>;
 
     /// Registers a listener (an event dispatcher) for a given protocol index.

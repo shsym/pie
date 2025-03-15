@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use uuid::Uuid;
 use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
@@ -136,11 +137,7 @@ impl Runtime {
         let instance_id = Uuid::new_v4();
 
         // 4) Build the InstanceState
-        let inst_state = InstanceState::new(
-            instance_id,
-            self.inst2server.clone()
-        )
-        .await;
+        let inst_state = InstanceState::new(instance_id, self.inst2server.clone()).await;
 
         // 5) Instantiate and run in a task
         let engine_clone = self.engine.clone();
@@ -237,7 +234,7 @@ impl Runtime {
     }
 
     /// Terminate (abort) a running instance
-    pub fn terminate_program(&self, instance_id: InstanceId, reason:String) -> bool {
+    pub fn terminate_program(&self, instance_id: InstanceId, reason: String) -> bool {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             // TODO
             handle.join_handle.abort();
@@ -245,5 +242,38 @@ impl Runtime {
         } else {
             false
         }
+    }
+}
+
+// Error reporter
+
+enum Report {
+    Error(InstanceId, String),
+    Warning(InstanceId, String),
+    LogTrace(InstanceId, String, String, Instant),
+}
+
+#[derive(Clone, Debug)]
+pub struct Reporter {
+    tx: UnboundedSender<Report>,
+}
+
+impl Reporter {
+    pub fn new(tx: UnboundedSender<Report>) -> Self {
+        Self { tx }
+    }
+
+    pub fn error(&self, inst: InstanceId, msg: String) {
+        self.tx.send(Report::Error(inst, msg)).unwrap()
+    }
+
+    pub fn warning(&self, inst: InstanceId, msg: String) {
+        self.tx.send(Report::Warning(inst, msg)).unwrap()
+    }
+
+    pub fn log_trace(&self, inst: InstanceId, subject: String, tag: String) {
+        self.tx
+            .send(Report::LogTrace(inst, subject, tag, Instant::now()))
+            .unwrap()
     }
 }
