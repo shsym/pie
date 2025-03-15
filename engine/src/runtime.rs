@@ -11,6 +11,7 @@ use crate::server::ServerMessage;
 use crate::{bindings, instance_old, tokenizer};
 
 use thiserror::Error;
+use crate::driver::AnyCommand;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -55,7 +56,7 @@ pub struct Runtime {
     pub running_instances: DashMap<InstanceId, InstanceHandle>,
 
     /// The channel for (Instance -> controller) messages
-    pub inst2server: UnboundedSender<(InstanceId, Command)>,
+    pub inst2server: UnboundedSender<(InstanceId, AnyCommand)>,
 }
 
 pub struct InstanceHandle {
@@ -69,7 +70,7 @@ pub struct InstanceHandle {
 
 impl Runtime {
     /// Create a new `Runtime`
-    pub fn new(inst2server: UnboundedSender<(InstanceId, Command)>) -> Self {
+    pub fn new(inst2server: UnboundedSender<(InstanceId, AnyCommand)>) -> Self {
         // Configure Wasmtime engine
         let mut config = Config::default();
         config.async_support(true);

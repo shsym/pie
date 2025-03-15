@@ -1,4 +1,4 @@
-use crate::driver::DriverError;
+use crate::driver::{Driver, DriverError};
 use crate::instance::Id as InstanceId;
 use crate::utils::IdPool;
 use dashmap::DashMap;
@@ -51,56 +51,6 @@ impl Messaging {
         self.tx.clone()
     }
 
-    /// Submit a command to the driver.
-    ///
-    pub fn submit(&mut self, inst: InstanceId, cmd: Command) -> Result<(), DriverError> {
-        match cmd {
-            Command::Broadcast { topic, message } => {
-                // Broadcast the message. Replace unwrap with proper error handling if needed.
-                self.tx
-                    .send((topic, message))
-                    .map_err(|e| DriverError::SendError(e.to_string()))
-            }
-            Command::Subscribe {
-                topic,
-                sender,
-                sub_id,
-            } => {
-                // Acquire a new subscription id.
-                let id = self
-                    .subscription_id_pool
-                    .acquire()
-                    .map_err(|e| DriverError::LockError)?;
-
-                // Insert the new subscriber into the map.
-                self.subscriptions
-                    .entry(topic)
-                    .or_insert_with(Vec::new)
-                    .push((id, sender));
-
-                // Send back the subscription id.
-                sub_id
-                    .send(id)
-                    .map_err(|e| DriverError::SendError(e.to_string()))
-            }
-            Command::Unsubscribe { topic, sub_id } => {
-                if let Some(mut subscribers) = self.subscriptions.get_mut(&topic) {
-                    // Remove the subscriber with the matching id.
-                    subscribers.retain(|(s, _)| *s != sub_id);
-
-                    // Remove the topic entirely if there are no more subscribers.
-                    if subscribers.is_empty() {
-                        self.subscriptions.remove(&topic);
-                    }
-                }
-                // Release the subscription id back to the pool.
-                self.subscription_id_pool
-                    .release(sub_id)
-                    .map_err(|e| DriverError::Other(e.to_string()))
-            }
-        }
-    }
-
     /// The event loop that listens for broadcast messages and dispatches them to subscribers.
     async fn event_loop(
         mut rx: UnboundedReceiver<(String, String)>,
@@ -127,6 +77,52 @@ impl Messaging {
                 if subscribers.is_empty() {
                     subscriptions.remove(&topic);
                 }
+            }
+        }
+    }
+}
+
+impl Driver for Messaging {
+    type Command = Command;
+
+    async fn dispatch(&mut self, inst: InstanceId, cmd: Self::Command) {
+        match cmd {
+            Command::Broadcast { topic, message } => {
+                // Broadcast the message.
+                self.tx.send((topic, message)).unwrap();
+            }
+            Command::Subscribe {
+                topic,
+                sender,
+                sub_id,
+            } => {
+                // Acquire a new subscription id.
+                let id = self
+                    .subscription_id_pool
+                    .acquire()
+                    .map_err(|e| DriverError::LockError)?;
+
+                // Insert the new subscriber into the map.
+                self.subscriptions
+                    .entry(topic)
+                    .or_insert_with(Vec::new)
+                    .push((id, sender));
+
+                // Send back the subscription id.
+                let _ = sub_id.send(id).ok();
+            }
+            Command::Unsubscribe { topic, sub_id } => {
+                if let Some(mut subscribers) = self.subscriptions.get_mut(&topic) {
+                    // Remove the subscriber with the matching id.
+                    subscribers.retain(|(s, _)| *s != sub_id);
+
+                    // Remove the topic entirely if there are no more subscribers.
+                    if subscribers.is_empty() {
+                        self.subscriptions.remove(&topic);
+                    }
+                }
+                // Release the subscription id back to the pool.
+                self.subscription_id_pool.release(sub_id).unwrap();
             }
         }
     }

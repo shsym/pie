@@ -2,7 +2,7 @@
 
 use crate::backend;
 use crate::backend::Backend;
-use crate::driver::DriverError;
+use crate::driver::{Driver, DriverError};
 use crate::instance::Id as InstanceId;
 use crate::utils::IdPool;
 use dashmap::DashMap;
@@ -35,12 +35,11 @@ pub enum Event {
 #[derive(Debug)]
 pub struct Ping<B> {
     backend: B,
+    protocol_id: u8,
     cmd_id_pool: IdPool<u32>,
     cmd_queue: Arc<Mutex<Vec<Command>>>,
     event_table: Arc<DashMap<u32, Event>>,
     event_loop_handle: tokio::task::JoinHandle<()>,
-
-    protocol_idx: u8,
 }
 
 impl<B> Ping<B>
@@ -48,63 +47,25 @@ where
     B: Backend,
 {
     pub async fn new(backend: B) -> Result<Self, DriverError> {
-        let protocol_idx = backend
-            .get_protocol_idx(crate::driver::l4m::PROTOCOL)
-            .map_err(|e| {
-                DriverError::Other(format!("Failed to get protocol index: {}", e.to_string()))
-            })?;
+        let protocol_id = backend.get_protocol_idx(PROTOCOL).map_err(|e| {
+            DriverError::Other(format!("Failed to get protocol index: {}", e.to_string()))
+        })?;
 
         let (tx, rx) = mpsc::channel(1000);
-        backend.listen(protocol_idx, tx);
+        backend.listen(protocol_id, tx);
 
         let event_table = Arc::new(DashMap::new());
         let event_loop_handle = tokio::spawn(Self::event_loop(rx, event_table.clone()));
 
         Ok(Self {
             backend,
+            protocol_id,
+
             cmd_id_pool: IdPool::new(u32::MAX),
             cmd_queue: Arc::new(Mutex::new(Vec::new())),
             event_table,
             event_loop_handle,
-            protocol_idx,
         })
-    }
-
-    pub fn submit(&mut self, _: InstanceId, cmd: Command) -> Result<(), DriverError> {
-        let mut cmd_queue = self.cmd_queue.lock().map_err(|e| DriverError::LockError)?;
-        cmd_queue.push(cmd);
-        Ok(())
-    }
-
-    pub async fn flush(&mut self) -> Result<(), DriverError> {
-        let cmd_queue = {
-            let mut cmd_queue = self.cmd_queue.lock().map_err(|e| DriverError::LockError)?;
-            cmd_queue.drain(..).collect::<Vec<_>>()
-        };
-
-        for cmd in cmd_queue {
-            match cmd {
-                Command::Ping { message, handler } => {
-                    let correlation_id = self
-                        .cmd_id_pool
-                        .acquire()
-                        .map_err(|e| DriverError::LockError)?;
-
-                    let ping = pb_bindings::Ping {
-                        correlation_id,
-                        message,
-                    };
-                    self.event_table
-                        .insert(correlation_id, Event::Pong(handler));
-                    self.backend
-                        .send(self.protocol_idx, ping.encode_to_vec())
-                        .await
-                        .map_err(|e| DriverError::Other(e.to_string()))?;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     async fn event_loop(
@@ -121,6 +82,32 @@ where
                         sender.send(pong.message).unwrap();
                     }
                 }
+            }
+        }
+    }
+}
+
+impl<B> Driver for Ping<B>
+where
+    B: Backend,
+{
+    type Command = Command;
+
+    async fn dispatch(&mut self, inst: InstanceId, cmd: Self::Command) {
+        match cmd {
+            Command::Ping { message, handler } => {
+                let correlation_id = self.cmd_id_pool.acquire().unwrap();
+
+                let ping = pb_bindings::Ping {
+                    correlation_id,
+                    message,
+                };
+                self.event_table
+                    .insert(correlation_id, Event::Pong(handler));
+                self.backend
+                    .send(self.protocol_id, ping.encode_to_vec())
+                    .await
+                    .unwrap();
             }
         }
     }

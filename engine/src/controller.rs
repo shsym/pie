@@ -1,7 +1,7 @@
-use crate::driver::{Driver, DriverError, DynCommand};
+use crate::driver::{AnyCommand, Driver, DriverError, DynCommand, NameSelector, Router};
 use crate::instance::Id as InstanceId;
 use crate::object::{IdMapper, VspaceId};
-use crate::runtime::Runtime;
+use crate::runtime::{Reporter, Runtime};
 use crate::server::ServerMessage;
 use crate::utils::Stream;
 use crate::{driver, object, utils};
@@ -41,102 +41,44 @@ pub enum ControllerError {
     SendError(String),
 }
 
-enum Cmd {
-    CreateInst(InstanceId),
-    DestroyInst(InstanceId),
-    Submit(InstanceId, DynCommand),
-}
-
 pub struct Controller {
-    runtime: Arc<Runtime>,
-    drivers: HashMap<TypeId, UnboundedSender<Cmd>>,
-    accepted_types: Vec<TypeId>,
+    router: Router,
+    reporter: Reporter, //drivers: HashMap<TypeId, UnboundedSender<Cmd>>,
 }
 
 impl Controller {
-    pub fn new(runtime: Arc<Runtime>) -> Self {
-        Controller {
-            runtime,
-            drivers: HashMap::new(),
-            accepted_types: Vec::new(),
-        }
-    }
+    pub fn new(reporter: Reporter) -> Self {
+        let mut router = Router::new();
 
-    pub fn install<T>(&mut self, mut driver: T)
-    where
-        T: Driver + 'static,
-    {
-        let (tx, mut rx) = unbounded_channel();
+        router.install(driver::runtime::RuntimeHelper::new("0.1.0"));
+        router.install(driver::messaging::Messaging::new());
+        router.install(driver::ping::Ping::new());
 
-        for type_id in driver.cmd_accepted() {
-            self.drivers.insert(*type_id, tx.clone());
+        router.install(NameSelector::with(vec![
+            ("llama3-1b".to_string(), driver::l4m::L4m::new()),
+            ("llama3-7b".to_string(), driver::l4m::L4m::new()),
+        ]));
 
-            if !self.accepted_types.contains(&type_id) {
-                self.accepted_types.push(*type_id);
-            } else {
-                eprintln!("Warning: Driver already exists for type {:?}", type_id);
-            }
-        }
-
-        let mut runtime = self.runtime.clone();
-
-        task::spawn(async move {
-            while let Some(cmd) = rx.recv().await {
-                match cmd {
-                    Cmd::CreateInst(inst) => {
-                        driver.create(inst).unwrap();
-                    }
-                    Cmd::DestroyInst(inst) => {
-                        driver.destroy(inst).unwrap();
-                    }
-                    Cmd::Submit(inst, cmd) => {
-                        if let Err(reason) = driver.dispatch(inst, cmd).await {
-                            runtime.terminate_program(inst, reason.to_string()).await;
-                        } else {
-                            driver.flush().await.unwrap();
-                        }
-                    }
-                }
-            }
-        });
+        Controller { router, reporter }
     }
 }
 
 impl Driver for Controller {
-    fn cmd_accepted(&self) -> Vec<TypeId> {
-        self.accepted_types.clone()
+    type Command = AnyCommand;
+
+    fn create(&mut self, inst: InstanceId) {
+        self.router.create(inst)
     }
 
-    fn create(&mut self, inst: InstanceId) -> Result<(), DriverError> {
-        for driver in self.drivers.values() {
-            driver.send(Cmd::CreateInst(inst)).unwrap();
-        }
-        Ok(())
+    fn destroy(&mut self, inst: InstanceId) {
+        self.router.destroy(inst)
     }
 
-    fn destroy(&mut self, inst: InstanceId) -> Result<(), DriverError> {
-        for driver in self.drivers.values() {
-            driver.send(Cmd::DestroyInst(inst)).unwrap();
-        }
-        Ok(())
+    async fn dispatch(&mut self, inst: InstanceId, cmd: Self::Command) {
+        self.router.dispatch(inst, cmd).await
     }
 
-    fn dispatch(&mut self, inst: InstanceId, cmd: DynCommand) -> Result<(), DriverError> {
-        let type_id = cmd.as_any().type_id();
-
-        let driver = self
-            .drivers
-            .get(&type_id)
-            .ok_or(ControllerError::DriverError(format!(
-                "Driver not found for command {:?}",
-                type_id
-            )))?;
-        driver.send(Cmd::Submit(inst, cmd)).unwrap();
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> Result<(), DriverError> {
-        // Flushing is done in the driver tasks
-        Ok(())
+    fn reporter(&self) -> Option<&Reporter> {
+        Some(&self.reporter)
     }
 }

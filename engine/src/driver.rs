@@ -62,13 +62,15 @@ pub trait Driver {
 
     //fn cmd_accepted(&self) -> Vec<TypeId>;
 
-    fn create(&mut self, inst: InstanceId);
+    fn create(&mut self, inst: InstanceId) {}
 
-    fn destroy(&mut self, inst: InstanceId);
+    fn destroy(&mut self, inst: InstanceId) {}
 
     async fn dispatch(&mut self, inst: InstanceId, cmd: Self::Command);
 
-    fn reporter(&self) -> Option<&Reporter>;
+    fn reporter(&self) -> Option<&Reporter> {
+        None
+    }
 }
 
 // Some common driver utilities
@@ -169,24 +171,41 @@ impl Driver for Router {
 }
 
 //// ----------------- NameSelector ----------------- ////
-pub struct NamedCommand<C> {
-    name: String,
+pub struct NamedCommand<N, C>
+where
+    N: Copy + Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    C: Send + Sync + 'static,
+{
+    name: N,
     cmd: C,
 }
 
-pub struct NameSelector<T, C>
+impl<N, C> NamedCommand<N, C>
+where
+    N: Copy + Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    C: Send + Sync + 'static,
+{
+    pub fn new(name: N, cmd: C) -> Self {
+        Self { name, cmd }
+    }
+}
+
+pub struct NameSelector<T, N, C>
 where
     T: Driver<Command = C>,
+    N: Copy + Clone + Eq + Hash + Debug + Send + Sync + 'static,
+    C: Send + Sync + 'static,
 {
     phantom: PhantomData<T>,
-    channels: HashMap<String, Sender<Operation<C>>>,
-    handles: HashMap<String, task::JoinHandle<()>>,
+    channels: HashMap<N, Sender<Operation<C>>>,
+    handles: HashMap<N, task::JoinHandle<()>>,
     reporter: Option<Reporter>,
 }
 
-impl<T, C> NameSelector<T, C>
+impl<T, N, C> NameSelector<T, N, C>
 where
     T: Driver<Command = C>,
+    N: Copy + Clone + Eq + Hash + Debug + Send + Sync + 'static,
     C: Send + Sync + 'static,
 {
     pub fn new() -> Self {
@@ -207,7 +226,7 @@ where
         this
     }
 
-    pub fn add_driver(&mut self, name: &str, mut driver: T) {
+    pub fn add_driver(&mut self, name: N, mut driver: T) {
         if self.reporter.is_none() {
             if let Some(reporter) = driver.reporter() {
                 self.reporter = Some(reporter.clone());
@@ -237,12 +256,13 @@ where
     }
 }
 
-impl<T, C> Driver for NameSelector<T, C>
+impl<T, N, C> Driver for NameSelector<T, N, C>
 where
     T: Driver<Command = C>,
+    N: Copy + Clone + Eq + Hash + Debug + Send + Sync + 'static,
     C: Send + Sync + 'static,
 {
-    type Command = NamedCommand<C>;
+    type Command = NamedCommand<N, C>;
 
     fn create(&mut self, inst: InstanceId) {
         for (_, sender) in self.channels.iter() {

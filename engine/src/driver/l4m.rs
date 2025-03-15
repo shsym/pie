@@ -34,6 +34,10 @@ mod pb_bindings {
     include!(concat!(env!("OUT_DIR"), "/l4m.rs"));
 }
 
+mod pb_bindings_vision {
+    include!(concat!(env!("OUT_DIR"), "/l4m.vision.rs"));
+}
+
 #[derive(Debug)]
 pub struct Info {
     pub version: String,
@@ -708,6 +712,7 @@ where
                 }
                 return;
             }
+            BatchGroup::EmbedImage => encode_pb_batch_embed_image(correlation_id, batch),
             _ => unreachable!(),
         };
 
@@ -1109,4 +1114,37 @@ fn encode_pb_batch_sample_topk(
     }
     .encode_to_vec();
     ((PROTOCOL_BASE, payload), Some(events))
+}
+
+fn encode_pb_batch_embed_image(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let mut items = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::EmbedImage {
+                stream_id,
+                embs,
+                image_blob,
+            } => {
+                let pb = pb_bindings_vision::EmbedImage {
+                    embedding_ids: embs,
+                    image_blob,
+                };
+                items.push(pb);
+            }
+            _ => unreachable!(),
+        }
+    }
+    let cmd =
+        pb_bindings_vision::request::Command::EmbedImage(pb_bindings_vision::BatchEmbedImage {
+            items,
+        });
+    let payload = pb_bindings_vision::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_VISION, payload), None)
 }

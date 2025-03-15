@@ -1,4 +1,4 @@
-use crate::driver::DynCommand;
+use crate::driver::{AnyCommand, DynCommand};
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::IdPool;
 use crate::{driver, object};
@@ -28,7 +28,7 @@ pub struct InstanceState {
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
 
-    cmd_buffer: UnboundedSender<(Id, DynCommand)>,
+    cmd_buffer: UnboundedSender<(Id, AnyCommand)>,
 }
 
 type ResourceId = u32;
@@ -55,7 +55,7 @@ impl WasiHttpView for InstanceState {
 }
 
 impl InstanceState {
-    pub async fn new(id: Uuid, cmd_buffer: UnboundedSender<(Id, DynCommand)>) -> Self {
+    pub async fn new(id: Uuid, cmd_buffer: UnboundedSender<(Id, AnyCommand)>) -> Self {
         let mut builder = WasiCtx::builder();
         builder.inherit_stderr().inherit_network().inherit_stdout();
 
@@ -75,7 +75,7 @@ impl InstanceState {
     where
         T: Send,
     {
-        let dyn_cmd = DynCommand::new(cmd);
+        let dyn_cmd = AnyCommand::new(cmd);
         self.cmd_buffer
             .send((self.id, dyn_cmd))
             .map_err(|e| wasmtime::Error::msg(format!("Send error: {}", e)))

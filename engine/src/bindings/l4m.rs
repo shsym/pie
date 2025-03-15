@@ -91,6 +91,12 @@ impl bindings::wit::symphony::app::l4m::Host for InstanceState {
 
 impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
     async fn get_block_size(&mut self, model: Resource<Model>) -> Result<u32, wasmtime::Error> {
+        
+        let model = self.table().get(&model)?;
+        
+        driver::NamedCommand::new(model.name, driver::l4m::Command::GetBlockSize);
+        
+        
         let (tx, rx) = oneshot::channel();
         self.send_cmd(driver::l4m::Command::GetBlockSize { handle: tx })?;
         let block_size = rx.await?;

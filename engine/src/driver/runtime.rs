@@ -1,5 +1,6 @@
-use crate::driver::DriverError;
+use crate::driver::{Driver, DriverError};
 use crate::instance::Id as InstanceId;
+use crate::runtime::Reporter;
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
@@ -14,11 +15,17 @@ pub struct RuntimeHelper {
 }
 
 impl RuntimeHelper {
-    pub fn new(runtime_version: String) -> Self {
-        RuntimeHelper { runtime_version }
+    pub fn new(runtime_version: &str) -> Self {
+        RuntimeHelper {
+            runtime_version: runtime_version.to_string(),
+        }
     }
+}
 
-    pub fn submit(&mut self, inst: InstanceId, cmd: Command) -> Result<(), DriverError> {
+impl Driver for RuntimeHelper {
+    type Command = Command;
+
+    async fn dispatch(&mut self, inst: InstanceId, cmd: Self::Command) {
         match cmd {
             Command::GetRuntimeVersion { handle } => {
                 handle.send(self.runtime_version.clone()).unwrap();
@@ -27,7 +34,5 @@ impl RuntimeHelper {
                 handle.send(inst.to_string()).unwrap();
             }
         }
-
-        Ok(())
     }
 }
