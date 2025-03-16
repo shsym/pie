@@ -1,6 +1,6 @@
 use crate::backend::Backend;
 use crate::batching::{Batchable, Batcher, BatchingStrategy, KorTStrategy};
-use crate::driver::{Driver, DriverError, DynCommand};
+use crate::driver::{Driver, DriverError};
 use crate::instance::Id as InstanceId;
 use crate::object::{
     IdRepr, ObjectError, ObjectManager, ObjectType, VspaceId, group_consecutive_ids,
@@ -8,7 +8,7 @@ use crate::object::{
 use crate::runtime::Reporter;
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::{Counter, IdPool};
-use crate::{backend, lm, object, tokenizer, utils};
+use crate::{backend, object, tokenizer, utils};
 use anyhow::anyhow;
 use dashmap::DashMap;
 use prost::Message;
@@ -21,10 +21,11 @@ use std::mem;
 use std::mem::Discriminant;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
+use tokio::time::timeout;
 
 pub const PROTOCOLS: [&str; 2] = ["l4m", "l4m-vision"]; // for future backward compatibility
 const PROTOCOL_BASE: usize = 0;
@@ -50,7 +51,7 @@ pub struct Info {
 
 pub type LocalStreamId = u32;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Stream(InstanceId, LocalStreamId, StreamPriority);
 
 impl Stream {
@@ -101,8 +102,18 @@ pub enum StreamPriority {
     Low,
 }
 
+impl Default for StreamPriority {
+    fn default() -> Self {
+        StreamPriority::Normal
+    }
+}
+
 #[derive(Debug)]
 pub enum Command {
+    GetInfo {
+        handle: oneshot::Sender<Info>,
+    },
+
     GetBlockSize {
         handle: oneshot::Sender<u32>,
     },
@@ -200,6 +211,7 @@ pub enum Command {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 enum BatchGroup {
+    GetInfo,
     Allocate,
     Deallocate,
     FillBlock,
@@ -215,6 +227,7 @@ enum BatchGroup {
 impl Batchable<BatchGroup> for Command {
     fn strategy(&self) -> Box<dyn BatchingStrategy> {
         match self {
+            Command::GetInfo { .. } => KorTStrategy::immediate().into_box(),
             Command::Allocate { .. } => KorTStrategy::eager().into_box(),
             Command::Deallocate { .. } => KorTStrategy::eager().into_box(),
             Command::FillBlock { .. } => KorTStrategy::eager().into_box(),
@@ -231,6 +244,7 @@ impl Batchable<BatchGroup> for Command {
 
     fn group(&self) -> BatchGroup {
         match self {
+            Command::GetInfo { .. } => BatchGroup::GetInfo,
             Command::Allocate { .. } => BatchGroup::Allocate,
             Command::Deallocate { .. } => BatchGroup::Deallocate,
             Command::FillBlock { .. } => BatchGroup::FillBlock,
@@ -248,9 +262,8 @@ impl Batchable<BatchGroup> for Command {
 
 #[derive(Debug)]
 pub enum Event {
-    SampleTopK(oneshot::Sender<(Vec<u32>, Vec<f32>)>),
-
     GetInfo(oneshot::Sender<Info>),
+    SampleTopK(oneshot::Sender<(Vec<u32>, Vec<f32>)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -279,33 +292,19 @@ impl ObjectType for ManagedTypes {
 }
 
 #[derive(Debug)]
-pub struct L4m<B> {
-    backend: B,
+pub struct L4m {
     reporter: Reporter,
-    protocol_ids: Vec<u8>,
-
-    cmd_id_pool: IdPool<u32>,
-    cmd_batcher: Batcher<Command, Stream, BatchGroup>,
-
-    event_table: Arc<DashMap<u32, Vec<Event>>>,
+    scheduler: Sender<(Stream, Command)>,
+    scheduler_loop_handle: task::JoinHandle<()>,
     event_loop_handle: task::JoinHandle<()>,
-
-    subscriptions: HashMap<String, Vec<InstanceId>>,
     exported_blocks: HashMap<String, ExportedBlocks>,
-
-    // Rc for shared ownership across multiple "extension drivers"
     objects: ObjectManager<InstanceId, ManagedTypes>,
-
     stream_priorities: HashMap<Stream, StreamPriority>,
-
     info: Info,
     tokenizer: Arc<BytePairEncoder>,
 }
 
-impl<B> Driver for L4m<B>
-where
-    B: Backend,
-{
+impl Driver for L4m {
     type Command = Command;
 
     fn create(&mut self, inst: InstanceId) {}
@@ -343,11 +342,7 @@ where
                         stream.set_priority(*priority)
                     }
 
-                    self.cmd_batcher.push(stream, cmd, Instant::now());
-
-                    for (_, cmd_batch) in self.cmd_batcher.batch(Instant::now()) {
-                        self.commit_backend(cmd_batch).await;
-                    }
+                    self.scheduler.send((stream, cmd));
                 }
 
                 // No need to send to backend
@@ -362,45 +357,28 @@ where
     }
 }
 
-impl<B> L4m<B>
-where
-    B: Backend,
-{
-    pub async fn new(backend: B, reporter: Reporter) -> Result<Self, DriverError> {
-        let protocol_ids = PROTOCOLS
-            .iter()
-            .map(|protoc| {
-                backend.get_protocol_idx(protoc).map_err(|e| {
-                    DriverError::Other(format!("Failed to get protocol index: {}", e.to_string()))
-                })
-            })
-            .collect::<Result<Vec<u8>, DriverError>>()?;
+impl L4m {
+    pub async fn new<B>(backend: B, reporter: Reporter) -> Result<Self, DriverError>
+    where
+        B: Backend + 'static,
+    {
+        let (event_tx, event_rx) = mpsc::channel(1000);
+        let (scheduler_tx, scheduler_rx) = mpsc::channel(1000);
 
-        let (tx, rx) = mpsc::channel(1000);
-        backend.listen(0, tx);
-
+        backend.listen(0, event_tx);
         let event_table = Arc::new(DashMap::new());
-        let event_loop_handle = tokio::spawn(Self::event_loop(rx, event_table.clone()));
+        let event_loop_handle = tokio::spawn(Self::event_loop(event_rx, event_table.clone()));
 
-        let info = {
-            let (info_tx, info_rx) = oneshot::channel();
+        let scheduler = CommandScheduler::new(backend, event_table)?;
+        let scheduler_loop_handle = tokio::spawn(Self::scheduler_loop(scheduler, scheduler_rx));
 
-            event_table.insert(0, vec![Event::GetInfo(info_tx)]);
+        let (info_tx, info_rx) = oneshot::channel();
 
-            backend
-                .send(
-                    protocol_ids[PROTOCOL_BASE],
-                    pb_bindings::Request {
-                        correlation_id: 0,
-                        command: Some(pb_bindings::request::Command::GetInfo(
-                            pb_bindings::GetInfoRequest {},
-                        )),
-                    }
-                    .encode_to_vec(),
-                )
-                .await;
-            info_rx.await.unwrap()
-        };
+        scheduler_tx
+            .send((Stream::default(), Command::GetInfo { handle: info_tx }))
+            .await;
+
+        let info = info_rx.await.unwrap();
 
         println!(
             "The backend info: version={}, model_name={}, block_size={}, num_blocks={}, num_embeddings={}, num_distributions={}",
@@ -422,14 +400,10 @@ where
         objects.set_capacity(ManagedTypes::TokenDist, info.num_distributions as usize)?;
 
         let driver = Self {
-            backend,
             reporter,
-            protocol_ids,
-            cmd_id_pool: IdPool::new(u32::MAX),
-            cmd_batcher: Batcher::new(),
-            event_table,
+            scheduler: scheduler_tx,
+            scheduler_loop_handle,
             event_loop_handle,
-            subscriptions: HashMap::new(),
             exported_blocks: HashMap::new(),
             objects,
             stream_priorities: HashMap::new(),
@@ -448,6 +422,10 @@ where
         //let mut objects = &self.objects;
 
         let resolved_cmd = match cmd {
+            Command::GetInfo { handle } => {
+                Some((Command::GetInfo { handle }, Stream::new(inst, 0)))
+            }
+
             Command::GetBlockSize { handle } => {
                 handle
                     .send(self.info.block_size)
@@ -689,41 +667,22 @@ where
         Ok(resolved_cmd)
     }
 
-    async fn commit_backend(&mut self, batch: Vec<Command>) {
-        let batch_type = batch.first().unwrap().group();
-        let correlation_id = self.cmd_id_pool.acquire().unwrap();
-
-        let ((protocol, payload), event) = match batch_type.clone() {
-            BatchGroup::Allocate => encode_pb_batch_allocate(correlation_id, batch),
-            BatchGroup::Deallocate => encode_pb_batch_deallocate(correlation_id, batch),
-            BatchGroup::FillBlock => encode_pb_batch_fill_block(correlation_id, batch),
-            BatchGroup::CopyBlock => encode_pb_batch_copy_block(correlation_id, batch),
-            BatchGroup::MaskBlock => encode_pb_batch_mask_block(correlation_id, batch),
-            BatchGroup::EmbedText => encode_pb_batch_embed_text(correlation_id, batch),
-            BatchGroup::DecodeTokenDist => encode_pb_batch_decode_token_dist(correlation_id, batch),
-            BatchGroup::SampleTopK => encode_pb_batch_sample_topk(correlation_id, batch),
-            BatchGroup::Synchronize => {
-                let cmd = batch.into_iter().next().unwrap();
-                match cmd {
-                    Command::Synchronize { stream_id, handle } => {
-                        handle.send(()).unwrap();
-                    }
-                    _ => unreachable!(),
+    async fn scheduler_loop(mut sch: CommandScheduler<B>, mut rx: Receiver<(Stream, Command)>) {
+        loop {
+            match timeout(Duration::from_micros(50), rx.recv()).await {
+                // A command arrived within 20ms:
+                Ok(Some((stream, cmd))) => {
+                    sch.submit(stream, cmd, Instant::now());
+                    sch.update(Instant::now()).await;
                 }
-                return;
+                // The channel closed:
+                Ok(None) => break,
+                // No command received within 20ms; time to call submit:
+                Err(_) => {
+                    sch.update(Instant::now()).await;
+                }
             }
-            BatchGroup::EmbedImage => encode_pb_batch_embed_image(correlation_id, batch),
-            _ => unreachable!(),
-        };
-
-        if let Some(events) = event {
-            self.event_table.insert(correlation_id, events);
         }
-
-        self.backend
-            .send(self.protocol_ids[protocol], payload)
-            .await
-            .unwrap();
     }
 
     async fn event_loop(mut rx: Receiver<Vec<u8>>, event_table: Arc<DashMap<u32, Vec<Event>>>) {
@@ -765,6 +724,89 @@ where
                 }
             }
         }
+    }
+}
+
+struct CommandScheduler<B> {
+    backend: B,
+
+    protocol_ids: Vec<u8>,
+
+    cmd_id_pool: IdPool<u32>,
+    cmd_batcher: Batcher<Command, Stream, BatchGroup>,
+
+    event_table: Arc<DashMap<u32, Vec<Event>>>,
+}
+
+impl<B> CommandScheduler<B>
+where
+    B: Backend + 'static,
+{
+    fn new(backend: B, event_table: Arc<DashMap<u32, Vec<Event>>>) -> Result<Self, DriverError> {
+        let protocol_ids = PROTOCOLS
+            .iter()
+            .map(|protoc| {
+                backend.get_protocol_idx(protoc).map_err(|e| {
+                    DriverError::Other(format!("Failed to get protocol index: {}", e.to_string()))
+                })
+            })
+            .collect::<Result<Vec<u8>, DriverError>>()?;
+
+        Ok(Self {
+            backend,
+            protocol_ids,
+            cmd_id_pool: IdPool::new(u32::MAX),
+            cmd_batcher: Batcher::new(),
+            event_table,
+        })
+    }
+
+    fn submit(&mut self, mut stream: Stream, cmd: Command, now: Instant) {
+        self.cmd_batcher.push(stream, cmd, now);
+    }
+
+    async fn update(&mut self, now: Instant) {
+        for (_, cmd_batch) in self.cmd_batcher.batch(now) {
+            self.flush(cmd_batch).await;
+        }
+    }
+
+    async fn flush(&mut self, batch: Vec<Command>) {
+        let batch_type = batch.first().unwrap().group();
+        let correlation_id = self.cmd_id_pool.acquire().unwrap();
+
+        let ((protocol, payload), event) = match batch_type.clone() {
+            BatchGroup::GetInfo => encode_pb_get_info(correlation_id, batch),
+            BatchGroup::Allocate => encode_pb_batch_allocate(correlation_id, batch),
+            BatchGroup::Deallocate => encode_pb_batch_deallocate(correlation_id, batch),
+            BatchGroup::FillBlock => encode_pb_batch_fill_block(correlation_id, batch),
+            BatchGroup::CopyBlock => encode_pb_batch_copy_block(correlation_id, batch),
+            BatchGroup::MaskBlock => encode_pb_batch_mask_block(correlation_id, batch),
+            BatchGroup::EmbedText => encode_pb_batch_embed_text(correlation_id, batch),
+            BatchGroup::DecodeTokenDist => encode_pb_batch_decode_token_dist(correlation_id, batch),
+            BatchGroup::SampleTopK => encode_pb_batch_sample_topk(correlation_id, batch),
+            BatchGroup::Synchronize => {
+                let cmd = batch.into_iter().next().unwrap();
+                match cmd {
+                    Command::Synchronize { stream_id, handle } => {
+                        handle.send(()).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                return;
+            }
+            BatchGroup::EmbedImage => encode_pb_batch_embed_image(correlation_id, batch),
+            _ => unreachable!(),
+        };
+
+        if let Some(events) = event {
+            self.event_table.insert(correlation_id, events);
+        }
+
+        self.backend
+            .send(self.protocol_ids[protocol], payload)
+            .await
+            .unwrap();
     }
 }
 
@@ -1147,4 +1189,25 @@ fn encode_pb_batch_embed_image(
     }
     .encode_to_vec();
     ((PROTOCOL_VISION, payload), None)
+}
+
+fn encode_pb_get_info(
+    correlation_id: u32,
+    cmd: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let cmd = cmd.into_iter().next().unwrap();
+
+    match cmd {
+        Command::GetInfo { handle } => {
+            let cmd = pb_bindings::Request {
+                correlation_id,
+                command: Some(pb_bindings::request::Command::GetInfo(
+                    pb_bindings::GetInfoRequest {},
+                )),
+            }
+            .encode_to_vec();
+            ((PROTOCOL_BASE, cmd), Some(vec![Event::GetInfo(handle)]))
+        }
+        _ => unreachable!(),
+    }
 }

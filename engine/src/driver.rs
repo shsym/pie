@@ -1,5 +1,4 @@
 pub mod l4m;
-pub mod l4m_vision;
 pub mod messaging;
 pub mod ping;
 pub mod runtime;
@@ -18,7 +17,6 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel, unbounded_channel};
 use tokio::task;
-use wasmtime::component::__internal::wasmtime_environ::object::read::elf::Dyn;
 // Common driver routines
 
 #[derive(Error, Debug)]
@@ -60,8 +58,6 @@ pub enum DriverError {
 pub trait Driver {
     type Command: Send + Sync + 'static;
 
-    //fn cmd_accepted(&self) -> Vec<TypeId>;
-
     fn create(&mut self, inst: InstanceId) {}
 
     fn destroy(&mut self, inst: InstanceId) {}
@@ -82,7 +78,6 @@ pub enum Operation<C> {
 }
 
 // Router -- routes commands to the appropriate driver based on the command type
-pub type DynCommand = Box<dyn Any + Send + Sync>;
 
 pub struct AnyCommand {
     orig_type_id: TypeId,
