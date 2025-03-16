@@ -17,6 +17,12 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel, unbounded_channel};
 use tokio::task;
+
+pub use l4m::L4m;
+pub use messaging::Messaging;
+pub use ping::Ping;
+pub use runtime::RuntimeHelper;
+
 // Common driver routines
 
 #[derive(Error, Debug)]
@@ -84,11 +90,21 @@ pub struct AnyCommand {
     bx: Box<dyn Any + Send + Sync>,
 }
 
+/// -----------
+
 impl AnyCommand {
     pub fn new<T: Any + Send + Sync>(cmd: T) -> Self {
         Self {
             orig_type_id: TypeId::of::<T>(),
             bx: Box::new(cmd),
+        }
+    }
+
+    pub fn into_inner<T: Any + Send + Sync + Debug>(self) -> Result<T, AnyCommand> {
+        if self.orig_type_id == TypeId::of::<T>() {
+            Ok(*self.bx.downcast().unwrap())
+        } else {
+            Err(self)
         }
     }
 }

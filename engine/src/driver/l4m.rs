@@ -342,7 +342,7 @@ impl Driver for L4m {
                         stream.set_priority(*priority)
                     }
 
-                    self.scheduler.send((stream, cmd));
+                    self.scheduler.send((stream, cmd)).await.unwrap();
                 }
 
                 // No need to send to backend

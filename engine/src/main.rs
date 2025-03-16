@@ -1,36 +1,27 @@
 #![allow(unused)]
 
-mod backend_old;
 mod client;
-mod controller_old;
 mod driver;
-mod driver_l4m;
-mod driver_l4m_vision;
-mod driver_ping;
-mod instance_old;
-mod lm;
+
+mod backend;
+mod batching;
+mod bindings;
+mod controller;
+mod instance;
 mod object;
 mod runtime;
 mod server;
 mod tokenizer;
 mod utils;
-mod instance;
-mod bindings;
-mod controller;
-mod batching;
-mod backend;
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc::{channel, unbounded_channel};
 
-use crate::controller_old::Controller;
-use crate::instance_old::{Command, Id as InstanceId};
 use crate::server::{ServerMessage, ServerState, WebSocketServer};
 use wasmtime::{Config, Engine};
 
-use crate::backend_old::{SimulatedBackend, ZmqBackend};
 use crate::client::Client;
 use crate::runtime::Runtime;
 use std::fs;
@@ -64,17 +55,18 @@ async fn main() -> anyhow::Result<()> {
     // let backend_l4m = ZmqBackend::bind("tcp://gimlab.org:8888", driver_l4m::PROTOCOL)
     //     .await
     //     .context("Failed to bind backend")?;
-    // 
+    //
     // let backend_ping = ZmqBackend::bind("tcp://gimlab.org:8888", driver_ping::PROTOCOL)
     //     .await
     //     .context("Failed to bind backend")?;
 
     let mut controller = Controller::new(
-        runtime.clone(), 
+        runtime.clone(),
         backend_l4m,
         backend_l4m_vision,
-        backend_ping
-    ).await;
+        backend_ping,
+    )
+    .await;
 
     let controller_handle = tokio::spawn(async move {
         loop {
@@ -120,8 +112,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn dummy_client() -> anyhow::Result<()> {
     // Adjust path as needed:
-    let wasm_path =
-        PathBuf::from("../example-apps/target/wasm32-wasip2/release/multimodal.wasm");
+    let wasm_path = PathBuf::from("../example-apps/target/wasm32-wasip2/release/multimodal.wasm");
     let server_uri = "ws://127.0.0.1:9000";
 
     // 1) Create and connect the client
@@ -169,11 +160,8 @@ async fn dummy_client() -> anyhow::Result<()> {
         //tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         // Drain the queue of messages
-        while let Ok(Some(msg)) = tokio::time::timeout(
-            Duration::from_millis(100),
-            client.wait_for_next_message(),
-        )
-        .await
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(Duration::from_millis(100), client.wait_for_next_message()).await
         {
             println!("[User] Received async event: {:?}", msg);
         }

@@ -1,4 +1,4 @@
-use crate::driver::{AnyCommand, Driver, DriverError, DynCommand, NameSelector, Router};
+use crate::driver::{AnyCommand, Driver, DriverError, NameSelector, Operation, Router};
 use crate::instance::Id as InstanceId;
 use crate::object::{IdMapper, VspaceId};
 use crate::runtime::{Reporter, Runtime};
@@ -7,78 +7,147 @@ use crate::utils::Stream;
 use crate::{driver, object, utils};
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Sender, UnboundedSender, channel, unbounded_channel};
+use tokio::sync::{RwLock, mpsc};
 use tokio::task;
 
 #[derive(Debug, Error)]
 pub enum ControllerError {
-    #[error("Failed to acquire a vspace id")]
-    VspacePoolAcquireFailed,
+    #[error("Driver '{0}' not found")]
+    DriverNotFound(String),
+    
+    #[error("Invalid driver index: {0}")]
+    InvalidDriverIndex(usize),
+}
 
-    #[error("Failed to release the vspace id")]
-    VspacePoolReleaseFailed,
+type DynCommand = Box<dyn Any + Send + Sync>;
 
-    #[error("Vspace not found for instance {0}")]
-    VspaceNotFound(InstanceId),
+struct ControllerBuilder {
+    maps: HashMap<String, usize>,
+    channels: Vec<UnboundedSender<Operation<DynCommand>>>,
+}
 
-    #[error("Instance not found: {0}")]
-    InstanceNotFound(InstanceId),
+impl ControllerBuilder {
+    pub fn new() -> Self {
+        let mut builder = Self {
+            maps: HashMap::new(),
+            channels: Vec::new(),
+        };
+        builder.install_basics();
+        builder
+    }
 
-    #[error("Client not found for instance {0}")]
-    ClientNotFound(InstanceId),
+    fn install_basics(&mut self) {
+        self.install("runtime", driver::RuntimeHelper::new("0.1.0"));
+        self.install("messaging", driver::Messaging::new());
+    }
 
-    #[error("Driver error: {0}")]
-    DriverError(String),
+    pub fn install<T>(&mut self, name: &str, mut driver: T) -> &mut Self
+    where
+        T: Driver + 'static,
+    {
+        let (tx, mut rx) = unbounded_channel();
 
-    #[error("Exported block resource not found: {0}")]
-    ExportedBlockNotFound(String),
+        self.channels.push(tx);
+        self.maps.insert(name.to_string(), self.channels.len() - 1);
 
-    #[error("Send error: {0}")]
-    SendError(String),
+        task::spawn(async move {
+            while let Some(op) = rx.recv().await {
+                match op {
+                    Operation::Create(inst) => driver.create(inst),
+                    Operation::Destroy(inst) => driver.destroy(inst),
+                    Operation::Dispatch(inst, cmd) => {
+                        driver.dispatch(inst, cmd.downcast().unwrap()).await
+                    }
+                }
+            }
+        });
+
+        self
+    }
+
+    pub fn build(self) -> Controller {
+        let dispatcher = CommandDispatcher {
+            maps: Arc::new(self.maps),
+            channels: Arc::new(self.channels),
+        };
+
+        Controller { dispatcher }
+    }
 }
 
 pub struct Controller {
-    router: Router,
-    reporter: Reporter, //drivers: HashMap<TypeId, UnboundedSender<Cmd>>,
+    dispatcher: CommandDispatcher,
 }
 
 impl Controller {
-    pub fn new(reporter: Reporter) -> Self {
-        let mut router = Router::new();
+    fn create(&self, inst: InstanceId) {
+        for (chan) in self.dispatcher.channels.iter() {
+            chan.send(Operation::Create(inst)).unwrap();
+        }
+    }
 
-        router.install(driver::runtime::RuntimeHelper::new("0.1.0"));
-        router.install(driver::messaging::Messaging::new());
-        router.install(driver::ping::Ping::new());
+    fn destroy(&self, inst: InstanceId) {
+        for (chan) in self.dispatcher.channels.iter() {
+            chan.send(Operation::Destroy(inst)).unwrap();
+        }
+    }
 
-        router.install(NameSelector::with(vec![
-            ("llama3-1b".to_string(), driver::l4m::L4m::new()),
-            ("llama3-7b".to_string(), driver::l4m::L4m::new()),
-        ]));
-
-        Controller { router, reporter }
+    fn dispatcher(&self) -> &CommandDispatcher {
+        &self.dispatcher
     }
 }
 
-impl Driver for Controller {
-    type Command = AnyCommand;
+pub struct CommandDispatcher {
+    maps: Arc<HashMap<String, usize>>,
+    channels: Arc<Vec<UnboundedSender<Operation<DynCommand>>>>,
+}
 
-    fn create(&mut self, inst: InstanceId) {
-        self.router.create(inst)
+impl CommandDispatcher {
+    pub fn get_driver_idx(&self, driver_name: &str) -> Option<usize> {
+        self.maps.get(driver_name).map(|idx| *idx)
     }
 
-    fn destroy(&mut self, inst: InstanceId) {
-        self.router.destroy(inst)
+    pub fn dispatch<C>(
+        &self,
+        driver_idx: usize,
+        inst: InstanceId,
+        cmd: C,
+    ) -> Result<(), ControllerError>
+    where
+        C: Any + Send + Sync + Debug + 'static,
+    {
+        let cmd = Box::new(cmd);
+
+        self.channels
+            .get(driver_idx)
+            .ok_or(ControllerError::InvalidDriverIndex(driver_idx))?
+            .send(Operation::Dispatch(inst, cmd))
+            .unwrap();
+
+        Ok(())
     }
 
-    async fn dispatch(&mut self, inst: InstanceId, cmd: Self::Command) {
-        self.router.dispatch(inst, cmd).await
-    }
+    pub fn dispatch_with<C>(
+        &self,
+        driver_name: &str,
+        inst: InstanceId,
+        cmd: C,
+    ) -> Result<(), ControllerError>
+    where
+        C: Any + Send + Sync + Debug + 'static,
+    {
+        let driver_idx = self
+            .maps
+            .get(driver_name)
+            .ok_or(ControllerError::DriverNotFound(driver_name.to_string()))?;
 
-    fn reporter(&self) -> Option<&Reporter> {
-        Some(&self.reporter)
+        self.dispatch(*driver_idx, inst, cmd)?;
+
+        Ok(())
     }
 }
