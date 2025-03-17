@@ -1,89 +1,67 @@
-use crate::instance_old::Id as InstanceId;
-use crate::runtime::{Runtime, RuntimeError};
-use anyhow::Result;
+use crate::instance::Id as InstanceId;
+use crate::runtime::RuntimeError;
+use crate::service::{Service, ServiceError};
+use crate::utils::IdPool;
+use crate::{messaging, runtime, service};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{
-    mpsc::{channel, Sender},
-    Mutex,
-};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task;
 use tokio_tungstenite::accept_async;
 use tungstenite::protocol::Message as WsMessage;
 use uuid::Uuid;
 
-/// The maximum chunk size we allow in an upload.
+// mod pb_bindings {
+//     include!(concat!(env!("OUT_DIR"), "/client.rs"));
+// }
 const CHUNK_SIZE_BYTES: usize = 64 * 1024; // 64 KiB
 
-/// Per-client ID
-pub type Id = Uuid;
+/// Define the various errors that can happen while handling messages.
+#[derive(Debug, Error)]
+pub enum ServerError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 
-/// In-progress upload
-struct InFlightUpload {
-    total_chunks: usize,
-    collected_data: Vec<u8>,
-    received_chunks: usize,
-}
+    #[error("WebSocket accept error: {0}")]
+    WsAccept(#[from] tungstenite::Error),
 
-struct ClientHandle {
-    to_origin: Sender<ServerMessage>,
-    instances: Vec<InstanceId>,
-}
+    #[error("MessagePack decode error: {0}")]
+    MsgPackDecode(#[from] rmp_serde::decode::Error),
 
-/// Our WebSocket server's global state:
-///  - each connection can look up the controller’s `RuntimeState`
-///  - track file uploads in progress
-///  - track connected clients, etc.
-pub struct ServerState {
-    /// The “controller” or “runtime” data we share with the controlling logic
-    runtime: Arc<Runtime>,
+    #[error("Text frames not supported")]
+    TextFrameNotSupported,
 
-    /// Tracks partial uploads in progress (hash -> InFlightUpload)
-    uploads_in_flight: DashMap<String, Arc<Mutex<InFlightUpload>>>,
+    #[error("Chunk size {actual} exceeds {limit} bytes limit")]
+    ChunkTooLarge { actual: usize, limit: usize },
 
-    /// Map of clients
-    clients: DashMap<Id, ClientHandle>,
-}
+    #[error("Mismatch in total_chunks: was {was}, now {now}")]
+    ChunkCountMismatch { was: usize, now: usize },
 
-impl ServerState {
-    pub fn new(runtime: Arc<Runtime>) -> Self {
-        Self {
-            runtime,
-            uploads_in_flight: DashMap::new(),
-            clients: DashMap::new(),
-        }
-    }
-}
+    #[error("Out-of-order chunk: expected {expected}, got {got}")]
+    OutOfOrderChunk { expected: usize, got: usize },
 
-/// The actual server.
-/// This struct is fairly minimal here—just holds an `Arc<ServerState>`.
-pub struct WebSocketServer {
-    state: Arc<ServerState>,
-}
+    #[error("Hash mismatch: expected {expected}, got {found})")]
+    HashMismatch { expected: String, found: String },
 
-impl WebSocketServer {
-    pub fn new(state: Arc<ServerState>) -> Self {
-        Self { state }
-    }
+    #[error("Invalid instance_id: {0}")]
+    InvalidInstanceId(String),
 
-    /// Start listening on a TCP address, accept new websockets, etc.
-    pub async fn run(self, addr: &str) -> Result<()> {
-        let listener = TcpListener::bind(addr).await?;
+    #[error("Instance {instance} not owned by client")]
+    NotOwnedInstance { instance: String },
 
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let state_clone = self.state.clone();
-            task::spawn(async move {
-                if let Err(e) = handle_connection(stream, state_clone).await {
-                    eprintln!("Connection error: {:?}", e);
-                }
-            });
-        }
-    }
+    #[error("No such running instance: {0}")]
+    NoSuchRunningInstance(String),
+
+    #[error("Failed to write program: {0}")]
+    FileWriteError(#[source] std::io::Error),
+
+    #[error("Failed to start program: {0}")]
+    StartProgramFailed(#[from] RuntimeError),
 }
 
 /// Messages from client -> server
@@ -144,330 +122,300 @@ pub enum ServerMessage {
     Error { error: String },
 }
 
-/// Define the various errors that can happen while handling messages.
-#[derive(Debug, Error)]
-pub enum ServerError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+type ConnectionId = u32;
 
-    #[error("WebSocket accept error: {0}")]
-    WsAccept(#[from] tungstenite::Error),
+#[derive(Debug)]
+pub enum Command {
+    Send { inst: InstanceId, message: String },
 
-    #[error("MessagePack decode error: {0}")]
-    MsgPackDecode(#[from] rmp_serde::decode::Error),
-
-    #[error("Text frames not supported")]
-    TextFrameNotSupported,
-
-    #[error("Chunk size {actual} exceeds {limit} bytes limit")]
-    ChunkTooLarge { actual: usize, limit: usize },
-
-    #[error("Mismatch in total_chunks: was {was}, now {now}")]
-    ChunkCountMismatch { was: usize, now: usize },
-
-    #[error("Out-of-order chunk: expected {expected}, got {got}")]
-    OutOfOrderChunk { expected: usize, got: usize },
-
-    #[error("Hash mismatch: expected {expected}, got {found} (chunks={chunks})")]
-    HashMismatch {
-        expected: String,
-        found: String,
-        chunks: usize,
-    },
-
-    #[error("Invalid instance_id: {0}")]
-    InvalidInstanceId(String),
-
-    #[error("Instance {instance} not owned by client")]
-    NotOwnedInstance { instance: String },
-
-    #[error("No such running instance: {0}")]
-    NoSuchRunningInstance(String),
-
-    #[error("Failed to write program: {0}")]
-    FileWriteError(#[source] std::io::Error),
-
-    #[error("Failed to start program: {0}")]
-    StartProgramFailed(#[from] RuntimeError),
+    Terminate { inst: InstanceId, reason: String },
 }
 
-/// Convert a `ServerError` into a single `ServerMessage::Error`.
-impl From<ServerError> for ServerMessage {
-    fn from(err: ServerError) -> Self {
-        ServerMessage::Error {
-            error: err.to_string(),
+impl Command {
+    pub fn dispatch(self) -> Result<(), ServiceError> {
+        service::dispatch(service::SERVICE_SERVER, self)
+    }
+}
+
+struct ServerState {
+    connection_id_pool: Mutex<IdPool<ConnectionId>>,
+    connections: DashMap<ConnectionId, Connection>,
+    instance_chans: DashMap<InstanceId, mpsc::Sender<ConnectionCommand>>,
+}
+
+pub struct Server {
+    state: Arc<ServerState>,
+    listener_loop: task::JoinHandle<()>,
+}
+
+impl Server {
+    pub fn new(addr: &str) -> Self {
+        let state = Arc::new(ServerState {
+            connection_id_pool: Mutex::new(IdPool::new(ConnectionId::MAX)),
+            connections: DashMap::new(),
+            instance_chans: DashMap::new(),
+        });
+
+        let listener_loop = task::spawn(Self::listener_loop(addr, state.clone()));
+        Server {
+            state,
+            listener_loop,
+        }
+    }
+
+    async fn listener_loop(addr: &str, state: Arc<ServerState>) {
+        let listener = TcpListener::bind(addr).await.unwrap();
+
+        while let Ok((stream, addr)) = listener.accept().await {
+            let id = {
+                let mut id_pool = state.connection_id_pool.lock().await;
+                id_pool.acquire().unwrap()
+            };
+            let connection = Connection::new(id, stream, state.clone());
+
+            state.connections.insert(id, connection);
         }
     }
 }
 
-/// A handy alias: we return a list of `ServerMessage` on success, or a single `ServerError` on error.
-type ServerResult = std::result::Result<Vec<ServerMessage>, ServerError>;
+impl Service for Server {
+    type Command = Command;
 
-async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
-    let ws_stream = accept_async(stream).await?;
-    let (mut ws_writer, mut ws_reader) = ws_stream.split();
+    async fn handle(&mut self, cmd: Self::Command) {
+        match cmd {
+            Command::Send { inst, message } => {
+                if let Some(sender) = self.state.instance_chans.get(&inst) {
+                    sender
+                        .send(ConnectionCommand::Send(ServerMessage::ProgramEvent {
+                            instance_id: inst.to_string(),
+                            event_data: message,
+                        }))
+                        .await
+                        .ok();
+                }
+            }
 
-    let (server2client_tx, mut server2client_rx) = channel::<ServerMessage>(128);
+            Command::Terminate { inst, reason } => {
+                if let Some(sender) = self.state.instance_chans.get(&inst) {
+                    sender
+                        .send(ConnectionCommand::DetachInstance {
+                            instance_id: inst,
+                            reason,
+                        })
+                        .await
+                        .ok();
+                }
+            }
+        }
+    }
+}
 
-    let client_id = Uuid::new_v4();
-    let client_handle = ClientHandle {
-        to_origin: server2client_tx.clone(),
-        instances: Vec::new(),
-    };
-    state.clients.insert(client_id, client_handle);
+enum ConnectionCommand {
+    Send(ServerMessage),
+    DetachInstance {
+        instance_id: InstanceId,
+        reason: String,
+    },
+}
 
-    // Writer task (Server -> Client)
-    let writer_task = task::spawn(async move {
-        while let Some(msg) = server2client_rx.recv().await {
-            match rmp_serde::to_vec_named(&msg) {
-                Ok(encoded) => {
-                    if let Err(e) = ws_writer.send(WsMessage::Binary(encoded.into())).await {
-                        eprintln!("WS write error: {:?}", e);
+struct Connection {
+    id: ConnectionId,
+
+    //sender: mpsc::Sender<ConnectionCommand>,
+    handler_loop: task::JoinHandle<()>,
+}
+
+impl Connection {
+    fn new(id: ConnectionId, stream: TcpStream, state: Arc<ServerState>) -> Self {
+        let handler_loop = task::spawn(Self::handler_loop(stream, id, state));
+        Connection {
+            id,
+            //sender: tx,
+            handler_loop,
+        }
+    }
+
+    async fn temp() {}
+
+    async fn handler_loop(stream: TcpStream, id: ConnectionId, state: Arc<ServerState>) {
+        let (writer_tx, mut writer_rx) = mpsc::channel(1000);
+
+        let ws_stream = accept_async(stream).await?;
+        let (mut ws_writer, mut ws_reader) = ws_stream.split();
+        let mut upload_buffer = Vec::new();
+
+        let mut owned_instance_ids = Vec::new();
+
+        loop {
+            tokio::select! {
+                // Process outgoing messages from the server to the client.
+                Some(cmd) = writer_rx.recv() => {
+
+                    match cmd {
+                        ConnectionCommand::Send(msg) => {
+                            match rmp_serde::to_vec_named(&msg) {
+                                Ok(encoded) => {
+                                    if let Err(e) = ws_writer.send(WsMessage::Binary(encoded.into())).await {
+                                        eprintln!("WS write error: {:?}", e);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("MessagePack encode error: {:?}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        ConnectionCommand::DetachInstance { instance_id, reason } => {
+                            // remove from owned_instances_ids
+                            if let Some(_) = state.instance_chans.remove(&instance_id) {
+                                owned_instance_ids.retain(|id| id != &instance_id);
+
+                                let cmd = ConnectionCommand::Send(ServerMessage::ProgramTerminated { instance_id:instance_id.to_string(), reason: "User request".to_string() })
+
+                                writer_tx.send(cmd).await?;
+                            }
+                        }
+                    }
+
+                },
+
+                // Process incoming messages from the client.
+                Some(result) = ws_reader.next() => {
+
+                    let msg = result?;
+                    if msg.is_binary() {
+                        // Try to decode the client message
+                        let client_msg = rmp_serde::from_slice::<ClientMessage>(&msg.into_data())?;
+
+                        match client_msg {
+                            ClientMessage::QueryExistence { hash } => {
+                                let (evt_tx, evt_rx) = oneshot::channel();
+
+                                runtime::Command::ProgramExists {
+                                    hash: hash.clone(),
+                                    event: evt_tx,
+                                }
+                                .dispatch()?;
+
+                                let exists = evt_rx.await?;
+
+                                writer_tx.send(ConnectionCommand::Send(ServerMessage::QueryResponse { hash, exists })).await?;
+                            }
+                            ClientMessage::UploadProgram {
+                                hash,
+                                chunk_index,
+                                total_chunks,
+                                mut chunk_data,
+                            } => {
+                                if chunk_data.len() > CHUNK_SIZE_BYTES {
+                                    writer_tx.send(ConnectionCommand::Send(ServerMessage::Error {
+                                        error: ServerError::ChunkTooLarge {
+                                            actual: chunk_data.len(),
+                                            limit: CHUNK_SIZE_BYTES,
+                                        }
+                                        .to_string(),
+                                    }))?;
+                                } else {
+                                    // First chunk
+                                    if chunk_index == 0 {
+                                        upload_buffer.clear();
+                                    }
+
+                                    upload_buffer.append(&mut chunk_data);
+
+                                    // The last chunk
+                                    if chunk_index == total_chunks - 1 {
+                                        let file_hash = blake3::hash(&upload_buffer).to_hex().to_string();
+
+                                        if file_hash != hash {
+                                            writer_tx.send(ConnectionCommand::Send(ServerMessage::Error {
+                                                error: ServerError::HashMismatch {
+                                                    expected: hash,
+                                                    found: file_hash,
+                                                }
+                                                .to_string(),
+                                            }))?;
+                                        } else {
+                                            let (evt_tx, evt_rx) = oneshot::channel();
+                                            runtime::Command::UploadProgram {
+                                                hash: file_hash.clone(),
+                                                raw: upload_buffer.clone(),
+                                                event: evt_tx,
+                                            }
+                                            .dispatch()?;
+                                            let _ = evt_rx.await?;
+
+                                            writer_tx.send(ConnectionCommand::Send(ServerMessage::UploadComplete { hash: file_hash })).await?;
+                                        }
+                                    }
+                                }
+
+
+                            }
+                            ClientMessage::StartProgram { hash } => {
+                                let (evt_tx, evt_rx) = oneshot::channel();
+                                runtime::Command::LaunchInstance {
+                                    hash: hash.clone(),
+                                    event: evt_tx,
+                                }
+                                .dispatch()?;
+
+                                if let Ok(instance_id) = evt_rx.await? {
+
+                                    //register
+                                    state.instance_chans.insert(instance_id.clone(), writer_tx.clone());
+                                    owned_instance_ids.push(instance_id.clone());
+                                    writer_tx.send(ConnectionCommand::Send(ServerMessage::ProgramLaunched { hash, instance_id:instance_id.to_string() })).await?;
+                                } else {
+                                    writer_tx.send(ConnectionCommand::Send(ServerMessage::Error {
+                                        error: "Failed to launch program".to_string(),
+                                    })).await?;
+                                }
+
+                            }
+                            ClientMessage::SendEvent {
+                                instance_id,
+                                event_data,
+                            } => messaging::Command::Broadcast {
+                                topic: instance_id.clone(),
+                                message: event_data.clone(),
+                            }
+                            .dispatch()?,
+                            ClientMessage::TerminateProgram { instance_id } => {
+
+                                let inst_id = Uuid::parse_str(&instance_id)
+                                    .map_err(|_| ServerError::InvalidInstanceId(instance_id.clone()))?;
+
+                                runtime::trap(
+                                    inst_id,
+                                    "user terminated the program"
+                                );
+
+                            }
+                        }
+                    } else if msg.is_text() {
+                        // Return an error message for text frames
+                        writer_tx.send(ServerError::TextFrameNotSupported.into()).await.unwrap();
+                    } else if msg.is_close() {
                         break;
                     }
-                }
-                Err(e) => {
-                    eprintln!("MessagePack encode error: {:?}", e);
-                    break;
-                }
+
+                },
+
+                // If both streams are exhausted, exit the loop.
+                else => break,
             }
         }
-    });
 
-    // Reader loop
-    while let Some(msg) = ws_reader.next().await {
-        // If we got an error from the WS stream itself, bail out
-        let msg = msg?;
-
-        if msg.is_binary() {
-            // Try to decode the client message
-            let client_msg = rmp_serde::from_slice::<ClientMessage>(&msg.into_data())?;
-
-            // Dispatch & handle
-            let responses = handle_client_message(state.clone(), client_id, client_msg).await;
-            match responses {
-                Ok(msgs) => {
-                    for m in msgs {
-                        let _ = server2client_tx.send(m).await;
-                    }
-                }
-                Err(err) => {
-                    // Convert the error to a single error message
-                    let _ = server2client_tx.send(err.into()).await;
-                }
+        // remove all instances owned by this connection
+        for instance_id in owned_instance_ids {
+            if let Some(_) = state.instance_chans.remove(&instance_id) {
+                runtime::trap(instance_id, "socket terminated");
             }
-        } else if msg.is_text() {
-            // Return an error message for text frames
-            let _ = server2client_tx
-                .send(ServerError::TextFrameNotSupported.into())
-                .await;
-        } else if msg.is_close() {
-            break;
-        }
-    }
-
-    // Cleanup
-    writer_task.abort();
-    state.clients.remove(&client_id);
-    Ok(())
-}
-
-/// Dispatch a `ClientMessage` to the correct handler
-async fn handle_client_message(
-    state: Arc<ServerState>,
-    client_id: Id,
-    msg: ClientMessage,
-) -> ServerResult {
-    match msg {
-        ClientMessage::QueryExistence { hash } => handle_query_existence(state, hash).await,
-        ClientMessage::UploadProgram {
-            hash,
-            chunk_index,
-            total_chunks,
-            chunk_data,
-        } => handle_upload_program(state, hash, chunk_index, total_chunks, chunk_data).await,
-        ClientMessage::StartProgram { hash } => handle_start_program(state, client_id, hash).await,
-        ClientMessage::SendEvent {
-            instance_id,
-            event_data,
-        } => handle_send_event(state, client_id, instance_id, event_data).await,
-        ClientMessage::TerminateProgram { instance_id } => {
-            handle_terminate_program(state, client_id, instance_id).await
-        }
-    }
-}
-
-async fn handle_query_existence(state: Arc<ServerState>, hash: String) -> ServerResult {
-    let exists = state.runtime.programs_in_disk.contains_key(&hash);
-    Ok(vec![ServerMessage::QueryResponse { hash, exists }])
-}
-
-async fn handle_upload_program(
-    state: Arc<ServerState>,
-    hash: String,
-    chunk_index: usize,
-    total_chunks: usize,
-    chunk_data: Vec<u8>,
-) -> ServerResult {
-    if chunk_data.len() > CHUNK_SIZE_BYTES {
-        return Err(ServerError::ChunkTooLarge {
-            actual: chunk_data.len(),
-            limit: CHUNK_SIZE_BYTES,
-        });
-    }
-
-    let upload_entry = state
-        .uploads_in_flight
-        .entry(hash.clone())
-        .or_insert_with(|| {
-            Arc::new(Mutex::new(InFlightUpload {
-                total_chunks,
-                collected_data: Vec::with_capacity(total_chunks * CHUNK_SIZE_BYTES),
-                received_chunks: 0,
-            }))
-        })
-        .clone();
-
-    let mut inflight = upload_entry.lock().await;
-
-    if inflight.total_chunks != total_chunks {
-        return Err(ServerError::ChunkCountMismatch {
-            was: inflight.total_chunks,
-            now: total_chunks,
-        });
-    }
-
-    if inflight.received_chunks != chunk_index {
-        return Err(ServerError::OutOfOrderChunk {
-            expected: inflight.received_chunks,
-            got: chunk_index,
-        });
-    }
-
-    inflight.collected_data.extend_from_slice(&chunk_data);
-    inflight.received_chunks += 1;
-
-    let mut replies = vec![ServerMessage::UploadAck {
-        hash: hash.clone(),
-        chunk_index,
-    }];
-
-    // If last chunk:
-    if inflight.received_chunks == inflight.total_chunks {
-        let final_data = std::mem::take(&mut inflight.collected_data);
-        let total_chunks_stored = inflight.total_chunks;
-        drop(inflight);
-        state.uploads_in_flight.remove(&hash);
-
-        let actual_hash = blake3::hash(&final_data).to_hex().to_string();
-        if actual_hash != hash {
-            return Err(ServerError::HashMismatch {
-                expected: hash,
-                found: actual_hash,
-                chunks: total_chunks_stored,
-            });
         }
 
-        // Write to disk if not yet present
-        if state.runtime.programs_in_disk.get(&hash).is_none() {
-            let file_path = std::path::Path::new(super::PROGRAM_CACHE_DIR).join(&hash);
-            // If writing fails, return an error
-            std::fs::write(&file_path, &final_data).map_err(ServerError::FileWriteError)?;
-            state
-                .runtime
-                .programs_in_disk
-                .insert(hash.clone(), file_path);
-        }
-        replies.push(ServerMessage::UploadComplete { hash });
-    }
-
-    Ok(replies)
-}
-
-async fn handle_start_program(
-    state: Arc<ServerState>,
-    client_id: Id,
-    hash: String,
-) -> ServerResult {
-    let tx = state
-        .clients
-        .get(&client_id)
-        .expect("Client must exist.")
-        .to_origin
-        .clone();
-
-    let instance_id = state
-        .runtime
-        .start_program(&hash, tx)
-        .await
-        // Convert anyhow::Error to our custom error variant
-        .map_err(|e| ServerError::StartProgramFailed(e))?;
-
-    // Track the instance in the client handle
-    if let Some(mut client) = state.clients.get_mut(&client_id) {
-        client.instances.push(instance_id);
-    }
-
-    Ok(vec![ServerMessage::ProgramLaunched {
-        hash,
-        instance_id: instance_id.to_string(),
-    }])
-}
-
-async fn handle_send_event(
-    state: Arc<ServerState>,
-    client_id: Id,
-    instance_id: String,
-    event_data: String,
-) -> ServerResult {
-    let inst_id = Uuid::parse_str(&instance_id)
-        .map_err(|_| ServerError::InvalidInstanceId(instance_id.clone()))?;
-
-    // Check if the instance is owned by the client
-    let handle = state.clients.get(&client_id).unwrap(); // or expect
-
-    if !handle.instances.contains(&inst_id) {
-        return Err(ServerError::NotOwnedInstance {
-            instance: instance_id,
-        });
-    }
-
-    if let Some(runtime_handle) = state.runtime.running_instances.get(&inst_id) {
-        // Send event to the instance
-        runtime_handle
-            .evt_from_origin
-            .send(event_data)
-            .await
-            .unwrap();
-        // If no immediate server messages are needed, return an empty list
-        Ok(vec![])
-    } else {
-        Err(ServerError::NoSuchRunningInstance(inst_id.to_string()))
-    }
-}
-
-async fn handle_terminate_program(
-    state: Arc<ServerState>,
-    client_id: Id,
-    instance_id: String,
-) -> ServerResult {
-    let inst_id = Uuid::parse_str(&instance_id)
-        .map_err(|_| ServerError::InvalidInstanceId(instance_id.clone()))?;
-
-    let handle = state.clients.get(&client_id).unwrap();
-    if !handle.instances.contains(&inst_id) {
-        return Err(ServerError::NotOwnedInstance {
-            instance: instance_id,
-        });
-    }
-
-    let was_terminated = state.runtime.terminate_program(inst_id);
-    if was_terminated {
-        Ok(vec![ServerMessage::ProgramTerminated {
-            instance_id,
-            reason: "User requested".to_string(),
-        }])
-    } else {
-        Err(ServerError::NoSuchRunningInstance(inst_id.to_string()))
+        // remove the connection from the state
+        state.connections.remove(&id);
     }
 }

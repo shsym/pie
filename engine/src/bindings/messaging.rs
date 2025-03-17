@@ -1,5 +1,5 @@
 use crate::instance::{InstanceState};
-use crate::{bindings, driver};
+use crate::{bindings, service};
 use async_trait::async_trait;
 use std::mem;
 use tokio::sync::{mpsc, oneshot};
@@ -41,7 +41,7 @@ impl bindings::wit::symphony::app::messaging::Host for InstanceState {
         topic: String,
         message: String,
     ) -> anyhow::Result<(), wasmtime::Error> {
-        self.send_cmd(driver::messaging::Command::Broadcast { topic, message })
+        self.send_cmd(service::messaging::Command::Broadcast { topic, message })
     }
 
     async fn subscribe(
@@ -51,7 +51,7 @@ impl bindings::wit::symphony::app::messaging::Host for InstanceState {
         let (tx, rx) = mpsc::channel(64);
         let (sub_tx, sub_rx) = oneshot::channel();
 
-        self.send_cmd(driver::messaging::Command::Subscribe {
+        self.send_cmd(service::messaging::Command::Subscribe {
             topic: topic.clone(),
             sender: tx,
             sub_id: sub_tx,
@@ -95,7 +95,7 @@ impl bindings::wit::symphony::app::messaging::HostSubscription for InstanceState
         sub.done = true;
         let topic = sub.topic.clone();
         let sub_id = sub.id;
-        self.send_cmd(driver::messaging::Command::Unsubscribe { topic, sub_id })
+        self.send_cmd(service::messaging::Command::Unsubscribe { topic, sub_id })
     }
 
     async fn drop(&mut self, this: Resource<Subscription>) -> anyhow::Result<(), wasmtime::Error> {

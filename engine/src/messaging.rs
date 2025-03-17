@@ -1,5 +1,5 @@
-use crate::driver::{Driver, DriverError};
-use crate::instance::Id as InstanceId;
+use crate::service;
+use crate::service::{Service, ServiceError};
 use crate::utils::IdPool;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -25,6 +25,12 @@ pub enum Command {
     },
 }
 
+impl Command {
+    pub fn dispatch(self) -> Result<(), ServiceError> {
+        service::dispatch(service::SERVICE_MESSAGING, self)
+    }
+}
+
 #[derive(Debug)]
 pub struct Messaging {
     tx: UnboundedSender<(String, String)>,
@@ -45,10 +51,6 @@ impl Messaging {
             subscriptions,
             subscription_id_pool: IdPool::new(SubscriptionId::MAX),
         }
-    }
-
-    pub fn channel(&self) -> UnboundedSender<(String, String)> {
-        self.tx.clone()
     }
 
     /// The event loop that listens for broadcast messages and dispatches them to subscribers.
@@ -82,10 +84,10 @@ impl Messaging {
     }
 }
 
-impl Driver for Messaging {
+impl Service for Messaging {
     type Command = Command;
 
-    async fn dispatch(&mut self, inst: InstanceId, cmd: Self::Command) {
+    async fn handle(&mut self, cmd: Self::Command) {
         match cmd {
             Command::Broadcast { topic, message } => {
                 // Broadcast the message.
@@ -97,10 +99,7 @@ impl Driver for Messaging {
                 sub_id,
             } => {
                 // Acquire a new subscription id.
-                let id = self
-                    .subscription_id_pool
-                    .acquire()
-                    .map_err(|e| DriverError::LockError)?;
+                let id = self.subscription_id_pool.acquire().unwrap();
 
                 // Insert the new subscriber into the map.
                 self.subscriptions

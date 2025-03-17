@@ -1,8 +1,8 @@
-use crate::driver::l4m::{LocalStreamId, StreamPriority};
+use crate::service::l4m::{LocalStreamId, StreamPriority};
 use crate::instance::InstanceState;
 use crate::object::IdRepr;
 use crate::tokenizer::BytePairEncoder;
-use crate::{bindings, driver, object};
+use crate::{bindings, service, object};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -69,11 +69,11 @@ pub struct Cache {
 
 fn map_object_types(
     ty: bindings::wit::symphony::app::l4m::ObjectType,
-) -> driver::l4m::ManagedTypes {
+) -> service::l4m::ManagedTypes {
     match ty {
-        bindings::wit::symphony::app::l4m::ObjectType::Block => driver::l4m::ManagedTypes::KvBlock,
-        bindings::wit::symphony::app::l4m::ObjectType::Dist => driver::l4m::ManagedTypes::TokenDist,
-        bindings::wit::symphony::app::l4m::ObjectType::Embed => driver::l4m::ManagedTypes::TokenEmb,
+        bindings::wit::symphony::app::l4m::ObjectType::Block => service::l4m::ManagedTypes::KvBlock,
+        bindings::wit::symphony::app::l4m::ObjectType::Dist => service::l4m::ManagedTypes::TokenDist,
+        bindings::wit::symphony::app::l4m::ObjectType::Embed => service::l4m::ManagedTypes::TokenEmb,
     }
 }
 
@@ -94,11 +94,11 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         
         let model = self.table().get(&model)?;
         
-        driver::NamedCommand::new(model.name, driver::l4m::Command::GetBlockSize);
+        service::NamedCommand::new(model.name, service::l4m::Command::GetBlockSize);
         
         
         let (tx, rx) = oneshot::channel();
-        self.send_cmd(driver::l4m::Command::GetBlockSize { handle: tx })?;
+        self.send_cmd(service::l4m::Command::GetBlockSize { handle: tx })?;
         let block_size = rx.await?;
         Ok(block_size)
     }
@@ -108,7 +108,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         model: Resource<Model>,
     ) -> Result<Resource<Tokenizer>, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
-        self.send_cmd(driver::l4m::Command::GetTokenizer { handle: tx })?;
+        self.send_cmd(service::l4m::Command::GetTokenizer { handle: tx })?;
         let inner = rx.await?;
         let res = self.table().push(Tokenizer { inner })?;
         Ok(res)
@@ -127,7 +127,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
     ) -> Result<Vec<(String, u32)>, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
 
-        self.send_cmd(driver::l4m::Command::GetAllExportedBlocks { handle: tx })?;
+        self.send_cmd(service::l4m::Command::GetAllExportedBlocks { handle: tx })?;
 
         let result = rx
             .await
@@ -143,7 +143,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         ty: bindings::wit::symphony::app::l4m::ObjectType,
         object_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::Allocate {
+        self.send_cmd(service::l4m::Command::Allocate {
             stream_id,
             ty: map_object_types(ty),
             ids: object_ids,
@@ -157,7 +157,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         ty: bindings::wit::symphony::app::l4m::ObjectType,
         object_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::Deallocate {
+        self.send_cmd(service::l4m::Command::Deallocate {
             stream_id,
             ty: map_object_types(ty),
             ids: object_ids,
@@ -173,7 +173,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         input_emb_ids: Vec<IdRepr>,
         output_emb_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::FillBlock {
+        self.send_cmd(service::l4m::Command::FillBlock {
             stream_id,
             block: block_id,
             context: context_block_ids,
@@ -192,7 +192,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         input_emb_ids: Vec<IdRepr>,
         output_emb_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::FillBlock {
+        self.send_cmd(service::l4m::Command::FillBlock {
             stream_id,
             block: block_id,
             context: context_block_ids,
@@ -211,7 +211,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         dst_offset: u32,
         size: u32,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::CopyBlock {
+        self.send_cmd(service::l4m::Command::CopyBlock {
             stream_id,
             src_block: src_block_id,
             dst_block: dst_block_id,
@@ -228,7 +228,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         block_id: IdRepr,
         mask: Vec<bool>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::MaskBlock {
+        self.send_cmd(service::l4m::Command::MaskBlock {
             stream_id,
 
             block: block_id,
@@ -242,7 +242,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         src_block_ids: Vec<IdRepr>,
         name: String,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::ExportBlocks {
+        self.send_cmd(service::l4m::Command::ExportBlocks {
             blocks: src_block_ids,
             resource_name: name,
         })
@@ -254,7 +254,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         dst_block_ids: Vec<IdRepr>,
         name: String,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::ImportBlocks {
+        self.send_cmd(service::l4m::Command::ImportBlocks {
             blocks: dst_block_ids,
             resource_name: name,
         })
@@ -268,7 +268,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         tokens: Vec<u32>,
         positions: Vec<u32>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::EmbedText {
+        self.send_cmd(service::l4m::Command::EmbedText {
             stream_id,
             embs: emb_ids,
             text: tokens,
@@ -283,7 +283,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         emb_ids: Vec<IdRepr>,
         dist_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::DecodeTokenDist {
+        self.send_cmd(service::l4m::Command::DecodeTokenDist {
             stream_id,
             embs: emb_ids,
             dists: dist_ids,
@@ -301,7 +301,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         for i in 0..dist_ids.len() {
             let (tx, rx) = oneshot::channel();
             receivers.push(rx);
-            self.send_cmd(driver::l4m::Command::SampleTopK {
+            self.send_cmd(service::l4m::Command::SampleTopK {
                 stream_id,
                 dist: dist_ids[i],
                 k,
@@ -325,7 +325,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         stream_id: u32,
     ) -> Result<Resource<SynchronizationResult>, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
-        self.send_cmd(driver::l4m::Command::Synchronize {
+        self.send_cmd(service::l4m::Command::Synchronize {
             stream_id,
             handle: tx,
         });
@@ -345,7 +345,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         stream_id: u32,
         priority: bindings::wit::symphony::app::l4m::StreamPriority,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(driver::l4m::Command::SetStreamPriority {
+        self.send_cmd(service::l4m::Command::SetStreamPriority {
             stream_id,
             priority: match priority {
                 bindings::wit::symphony::app::l4m::StreamPriority::High => StreamPriority::High,

@@ -1,5 +1,5 @@
 use crate::instance::{InstanceState};
-use crate::{bindings, driver};
+use crate::{bindings, service};
 use tokio::sync::oneshot;
 use crate::controller::Command;
 
@@ -8,7 +8,7 @@ impl bindings::wit::symphony::app::system::Host for InstanceState {
         let (tx, rx) = oneshot::channel();
 
         self.send_cmd(Command::System(
-            driver::runtime::Command::GetRuntimeVersion { handle: tx },
+            service::runtime::Command::GetRuntimeVersion { handle: tx },
         ));
 
         let result = rx.await?;
@@ -18,7 +18,7 @@ impl bindings::wit::symphony::app::system::Host for InstanceState {
     async fn get_instance_id(&mut self) -> anyhow::Result<String, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
 
-        self.send_cmd(Command::System(driver::runtime::Command::GetInstanceId {
+        self.send_cmd(Command::System(service::runtime::Command::GetInstanceId {
             handle: tx,
         }));
 

@@ -1,12 +1,9 @@
-use crate::object;
-use crate::object::ObjectError;
 use anyhow::{Error, Result};
 use num_traits::PrimInt;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use uuid::Uuid;
-use wasmtime::Ref;
 
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash)]
 pub struct Stream {

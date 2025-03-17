@@ -1,32 +1,35 @@
 use crate::backend::Backend;
 use crate::batching::{Batchable, Batcher, BatchingStrategy, KorTStrategy};
-use crate::driver::{Driver, DriverError};
 use crate::instance::Id as InstanceId;
-use crate::object::{
-    IdRepr, ObjectError, ObjectManager, ObjectType, VspaceId, group_consecutive_ids,
-};
-use crate::runtime::Reporter;
+use crate::object::{IdRepr, ObjectManager, ObjectType, group_consecutive_ids};
+use crate::service::Service;
 use crate::tokenizer::BytePairEncoder;
-use crate::utils::{Counter, IdPool};
-use crate::{backend, object, tokenizer, utils};
-use anyhow::anyhow;
+use crate::utils::IdPool;
+use crate::{backend, runtime, tokenizer};
 use dashmap::DashMap;
 use prost::Message;
 use rand::Rng;
-use std::any::TypeId;
 use std::cmp::{Ordering, PartialEq};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::mem;
-use std::mem::Discriminant;
-use std::rc::Rc;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 use tokio::time::timeout;
-
+macro_rules! try_trap {
+    ($result:expr, $inst_id:expr, $msg:expr) => {
+        match $result {
+            Ok(val) => val,
+            Err(e) => {
+                runtime::trap($inst_id, format!("{}: {}", $msg, e));
+                return None;
+            }
+        }
+    };
+}
 pub const PROTOCOLS: [&str; 2] = ["l4m", "l4m-vision"]; // for future backward compatibility
 const PROTOCOL_BASE: usize = 0;
 const PROTOCOL_VISION: usize = 1;
@@ -127,18 +130,21 @@ pub enum Command {
     },
 
     Allocate {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         ty: ManagedTypes,
         ids: Vec<IdRepr>,
     },
 
     Deallocate {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         ty: ManagedTypes,
         ids: Vec<IdRepr>,
     },
 
     FillBlock {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         block: IdRepr,
         context: Vec<IdRepr>,
@@ -147,16 +153,19 @@ pub enum Command {
     },
 
     ExportBlocks {
+        inst_id: InstanceId,
         blocks: Vec<IdRepr>,
         resource_name: String,
     },
 
     ImportBlocks {
+        inst_id: InstanceId,
         blocks: Vec<IdRepr>,
         resource_name: String,
     },
 
     CopyBlock {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         src_block: IdRepr,
         dst_block: IdRepr,
@@ -166,12 +175,14 @@ pub enum Command {
     },
 
     MaskBlock {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         block: IdRepr,
         mask: Vec<bool>,
     },
 
     EmbedText {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         embs: Vec<IdRepr>,
         text: Vec<u32>,
@@ -179,12 +190,14 @@ pub enum Command {
     },
 
     DecodeTokenDist {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         embs: Vec<IdRepr>,
         dists: Vec<IdRepr>,
     },
 
     SampleTopK {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         dist: IdRepr,
         k: u32,
@@ -192,17 +205,20 @@ pub enum Command {
     },
 
     Synchronize {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         handle: oneshot::Sender<()>,
     },
 
     SetStreamPriority {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         priority: StreamPriority,
     },
 
     //// ------ Vision specific commands ------ ////
     EmbedImage {
+        inst_id: InstanceId,
         stream_id: LocalStreamId,
         embs: Vec<IdRepr>,
         image_blob: Vec<u8>,
@@ -293,7 +309,6 @@ impl ObjectType for ManagedTypes {
 
 #[derive(Debug)]
 pub struct L4m {
-    reporter: Reporter,
     scheduler: Sender<(Stream, Command)>,
     scheduler_loop_handle: task::JoinHandle<()>,
     event_loop_handle: task::JoinHandle<()>,
@@ -304,61 +319,29 @@ pub struct L4m {
     tokenizer: Arc<BytePairEncoder>,
 }
 
-impl Driver for L4m {
+impl Service for L4m {
     type Command = Command;
 
-    fn create(&mut self, inst: InstanceId) {}
-
-    fn destroy(&mut self, inst: InstanceId) {
-        let mut cmds = Vec::new();
-
-        for ty in [
-            ManagedTypes::KvBlock,
-            ManagedTypes::TokenEmb,
-            ManagedTypes::TokenDist,
-        ] {
-            cmds.push(Command::Deallocate {
-                stream_id: 0,
-                ty,
-                ids: self.objects.all_names(ty, inst).unwrap(),
-            })
-        }
-
-        for cmd in cmds {
-            self.dispatch(inst, cmd);
-        }
-
-        // Remove all exported blocks
-        self.exported_blocks.retain(|_, v| v.owner != inst);
-    }
-
-    async fn dispatch(&mut self, inst: InstanceId, cmd: Self::Command) {
-        match self.translate_cmd(inst, cmd) {
-            Ok(cmd) => match cmd {
-                // Should be sent to backend
-                Some((cmd, mut stream)) => {
-                    // adjust stream priority
-                    if let Some(priority) = self.stream_priorities.get(&stream) {
-                        stream.set_priority(*priority)
-                    }
-
-                    self.scheduler.send((stream, cmd)).await.unwrap();
+    async fn handle(&mut self, cmd: Self::Command) {
+        match self.translate_cmd(cmd) {
+            // Should be sent to backend
+            Some((cmd, mut stream)) => {
+                // adjust stream priority
+                if let Some(priority) = self.stream_priorities.get(&stream) {
+                    stream.set_priority(*priority)
                 }
 
-                // No need to send to backend
-                None => {}
-            },
-            Err(e) => self.reporter.error(inst, e.to_string()),
-        }
-    }
+                self.scheduler.send((stream, cmd)).await.unwrap();
+            }
 
-    fn reporter(&self) -> Option<&Reporter> {
-        Some(&self.reporter)
+            // No need to send to backend
+            None => {}
+        }
     }
 }
 
 impl L4m {
-    pub async fn new<B>(backend: B, reporter: Reporter) -> Result<Self, DriverError>
+    pub async fn new<B>(backend: B) -> Self
     where
         B: Backend + 'static,
     {
@@ -369,14 +352,16 @@ impl L4m {
         let event_table = Arc::new(DashMap::new());
         let event_loop_handle = tokio::spawn(Self::event_loop(event_rx, event_table.clone()));
 
-        let scheduler = CommandScheduler::new(backend, event_table)?;
+        let scheduler =
+            CommandScheduler::new(backend, event_table).expect("Failed to create scheduler");
         let scheduler_loop_handle = tokio::spawn(Self::scheduler_loop(scheduler, scheduler_rx));
 
         let (info_tx, info_rx) = oneshot::channel();
 
         scheduler_tx
             .send((Stream::default(), Command::GetInfo { handle: info_tx }))
-            .await;
+            .await
+            .unwrap();
 
         let info = info_rx.await.unwrap();
 
@@ -395,12 +380,17 @@ impl L4m {
             .expect("Tokenizer load failed");
 
         let mut objects = ObjectManager::new();
-        objects.set_capacity(ManagedTypes::KvBlock, info.num_blocks as usize)?;
-        objects.set_capacity(ManagedTypes::TokenEmb, info.num_embeddings as usize)?;
-        objects.set_capacity(ManagedTypes::TokenDist, info.num_distributions as usize)?;
+        objects
+            .set_capacity(ManagedTypes::KvBlock, info.num_blocks as usize)
+            .unwrap();
+        objects
+            .set_capacity(ManagedTypes::TokenEmb, info.num_embeddings as usize)
+            .unwrap();
+        objects
+            .set_capacity(ManagedTypes::TokenDist, info.num_distributions as usize)
+            .unwrap();
 
         let driver = Self {
-            reporter,
             scheduler: scheduler_tx,
             scheduler_loop_handle,
             event_loop_handle,
@@ -411,32 +401,42 @@ impl L4m {
             tokenizer: Arc::new(tokenizer),
         };
 
-        Ok(driver)
+        driver
     }
+    async fn destroy(&mut self, inst_id: InstanceId) {
+        let mut cmds = Vec::new();
 
-    fn translate_cmd(
-        &mut self,
-        inst: InstanceId,
-        cmd: Command,
-    ) -> Result<Option<(Command, Stream)>, DriverError> {
-        //let mut objects = &self.objects;
+        for ty in [
+            ManagedTypes::KvBlock,
+            ManagedTypes::TokenEmb,
+            ManagedTypes::TokenDist,
+        ] {
+            cmds.push(Command::Deallocate {
+                inst_id,
+                stream_id: 0,
+                ty,
+                ids: self.objects.all_names(ty, inst_id).unwrap(),
+            })
+        }
 
-        let resolved_cmd = match cmd {
-            Command::GetInfo { handle } => {
-                Some((Command::GetInfo { handle }, Stream::new(inst, 0)))
-            }
+        for cmd in cmds {
+            self.handle(cmd).await;
+        }
+
+        // Remove all exported blocks
+        self.exported_blocks.retain(|_, v| v.owner != inst_id);
+    }
+    fn translate_cmd(&mut self, cmd: Command) -> Option<(Command, Stream)> {
+        match cmd {
+            Command::GetInfo { handle } => Some((Command::GetInfo { handle }, Stream::default())),
 
             Command::GetBlockSize { handle } => {
-                handle
-                    .send(self.info.block_size)
-                    .map_err(|_| DriverError::SendError("GetBlockSize failed.".to_string()))?;
+                handle.send(self.info.block_size).ok();
                 None
             }
 
             Command::GetTokenizer { handle } => {
-                handle
-                    .send(self.tokenizer.clone())
-                    .map_err(|_| DriverError::SendError("GetTokenizer failed.".to_string()))?;
+                handle.send(self.tokenizer.clone()).ok();
                 None
             }
 
@@ -446,94 +446,157 @@ impl L4m {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.addrs.len() as u32))
                     .collect();
-                handle.send(catalogue).map_err(|_| {
-                    DriverError::SendError("GetAllExportedBlocks failed.".to_string())
-                })?;
+                handle.send(catalogue).ok();
                 None
             }
 
-            Command::Allocate { stream_id, ty, ids } => {
-                let ids = self.objects.create_many(ty, inst, ids)?;
+            Command::Allocate {
+                inst_id,
+                stream_id,
+                ty,
+                ids,
+            } => {
+                let ids = try_trap!(
+                    self.objects.create_many(ty, inst_id, ids),
+                    inst_id,
+                    "l4m::allocation failed"
+                );
 
                 Some((
-                    Command::Allocate { stream_id, ty, ids },
-                    Stream::new(inst, stream_id),
+                    Command::Allocate {
+                        inst_id,
+                        stream_id,
+                        ty,
+                        ids,
+                    },
+                    Stream::new(inst_id, stream_id),
                 ))
             }
-            Command::Deallocate { stream_id, ty, ids } => {
-                let ids = self.objects.destroy_many(ty, inst, &ids)?;
+
+            Command::Deallocate {
+                inst_id,
+                stream_id,
+                ty,
+                ids,
+            } => {
+                let ids = try_trap!(
+                    self.objects.destroy_many(ty, inst_id, &ids),
+                    inst_id,
+                    "l4m::deallocation failed"
+                );
 
                 if ids.is_empty() {
-                    return Ok(None);
+                    return None;
                 }
 
                 Some((
-                    Command::Deallocate { stream_id, ty, ids },
-                    Stream::new(inst, stream_id),
+                    Command::Deallocate {
+                        inst_id,
+                        stream_id,
+                        ty,
+                        ids,
+                    },
+                    Stream::new(inst_id, stream_id),
                 ))
             }
+
             Command::FillBlock {
+                inst_id,
                 stream_id,
                 mut block,
                 mut context,
                 mut inputs,
                 mut outputs,
             } => {
-                self.objects
-                    .translate(ManagedTypes::KvBlock, inst, &mut block)?;
-                self.objects
-                    .translate_many(ManagedTypes::KvBlock, inst, &mut context)?;
-                self.objects
-                    .translate_many(ManagedTypes::TokenEmb, inst, &mut inputs)?;
-                self.objects
-                    .translate_many(ManagedTypes::TokenEmb, inst, &mut outputs)?;
+                try_trap!(
+                    self.objects
+                        .translate(ManagedTypes::KvBlock, inst_id, &mut block),
+                    inst_id,
+                    format!("l4m::fill_block failed. cannot find {}", block)
+                );
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::KvBlock, inst_id, &mut context),
+                    inst_id,
+                    "l4m::fill_block failed. some context blocks are invalid"
+                );
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::TokenEmb, inst_id, &mut inputs),
+                    inst_id,
+                    "l4m::fill_block failed. some input embeddings are invalid"
+                );
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::TokenEmb, inst_id, &mut outputs),
+                    inst_id,
+                    "l4m::fill_block failed. some output embeddings are invalid"
+                );
 
                 Some((
                     Command::FillBlock {
+                        inst_id,
                         stream_id,
                         block,
                         context,
                         inputs,
                         outputs,
                     },
-                    Stream::new(inst, stream_id),
+                    Stream::new(inst_id, stream_id),
                 ))
             }
+
             Command::ExportBlocks {
+                inst_id,
                 mut blocks,
                 resource_name,
             } => {
-                self.objects
-                    .translate_many(ManagedTypes::KvBlock, inst, &mut blocks)?;
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::KvBlock, inst_id, &mut blocks),
+                    inst_id,
+                    "l4m::export_blocks failed. some blocks are invalid"
+                );
 
                 self.exported_blocks
-                    .insert(resource_name, ExportedBlocks::new(inst, blocks));
-
+                    .insert(resource_name, ExportedBlocks::new(inst_id, blocks));
                 None
             }
+
             Command::ImportBlocks {
+                inst_id,
                 blocks,
                 resource_name,
             } => {
-                let exported =
-                    self.exported_blocks
-                        .get(&resource_name)
-                        .ok_or(DriverError::Other(format!(
-                            "Resource not found {}",
-                            resource_name
-                        )))?;
+                let exported = match self.exported_blocks.get(&resource_name) {
+                    Some(exp) => exp,
+                    None => {
+                        runtime::trap(
+                            inst_id,
+                            format!(
+                                "l4m::import_blocks failed. resource {} not found",
+                                resource_name
+                            ),
+                        );
+                        return None;
+                    }
+                };
 
-                self.objects.create_ref_many(
-                    ManagedTypes::KvBlock,
-                    inst,
-                    blocks,
-                    &exported.addrs,
-                )?;
-
+                try_trap!(
+                    self.objects.create_ref_many(
+                        ManagedTypes::KvBlock,
+                        inst_id,
+                        blocks,
+                        &exported.addrs
+                    ),
+                    inst_id,
+                    "l4m::import_blocks failed"
+                );
                 None
             }
 
             Command::CopyBlock {
+                inst_id,
                 stream_id,
                 mut src_block,
                 mut dst_block,
@@ -541,13 +604,22 @@ impl L4m {
                 dst_token_offset,
                 size,
             } => {
-                self.objects
-                    .translate(ManagedTypes::KvBlock, inst, &mut src_block)?;
-                self.objects
-                    .translate(ManagedTypes::KvBlock, inst, &mut dst_block)?;
+                try_trap!(
+                    self.objects
+                        .translate(ManagedTypes::KvBlock, inst_id, &mut src_block),
+                    inst_id,
+                    "l4m::copy_block failed. invalid source block"
+                );
+                try_trap!(
+                    self.objects
+                        .translate(ManagedTypes::KvBlock, inst_id, &mut dst_block),
+                    inst_id,
+                    "l4m::copy_block failed. invalid destination block"
+                );
 
                 Some((
                     Command::CopyBlock {
+                        inst_id,
                         stream_id,
                         src_block,
                         dst_block,
@@ -555,119 +627,169 @@ impl L4m {
                         dst_token_offset,
                         size,
                     },
-                    Stream::new(inst, stream_id),
+                    Stream::new(inst_id, stream_id),
                 ))
             }
+
             Command::MaskBlock {
+                inst_id,
                 stream_id,
                 mut block,
                 mask,
             } => {
-                self.objects
-                    .translate(ManagedTypes::KvBlock, inst, &mut block)?;
+                try_trap!(
+                    self.objects
+                        .translate(ManagedTypes::KvBlock, inst_id, &mut block),
+                    inst_id,
+                    "l4m::mask_block failed. invalid block"
+                );
 
                 Some((
                     Command::MaskBlock {
+                        inst_id,
                         stream_id,
                         block,
                         mask,
                     },
-                    Stream::new(inst, stream_id),
+                    Stream::new(inst_id, stream_id),
                 ))
             }
+
             Command::EmbedText {
+                inst_id,
                 stream_id,
                 mut embs,
                 text,
                 positions,
             } => {
-                self.objects
-                    .translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::TokenEmb, inst_id, &mut embs),
+                    inst_id,
+                    "l4m::embed_text failed. invalid embeddings"
+                );
 
                 Some((
                     Command::EmbedText {
+                        inst_id,
                         stream_id,
                         embs,
                         text,
                         positions,
                     },
-                    Stream::new(inst, stream_id),
+                    Stream::new(inst_id, stream_id),
                 ))
             }
+
             Command::DecodeTokenDist {
+                inst_id,
                 stream_id,
                 mut embs,
                 mut dists,
             } => {
-                self.objects
-                    .translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
-                self.objects
-                    .translate_many(ManagedTypes::TokenDist, inst, &mut dists)?;
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::TokenEmb, inst_id, &mut embs),
+                    inst_id,
+                    "l4m::decode_token_dist failed. invalid embeddings"
+                );
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::TokenDist, inst_id, &mut dists),
+                    inst_id,
+                    "l4m::decode_token_dist failed. invalid distributions"
+                );
 
                 Some((
                     Command::DecodeTokenDist {
+                        inst_id,
                         stream_id,
                         embs,
                         dists,
                     },
-                    Stream::new(inst, stream_id),
+                    Stream::new(inst_id, stream_id),
                 ))
             }
+
             Command::SampleTopK {
+                inst_id,
                 stream_id,
                 mut dist,
                 k,
                 handle,
             } => {
-                self.objects
-                    .translate(ManagedTypes::TokenDist, inst, &mut dist)?;
+                try_trap!(
+                    self.objects
+                        .translate(ManagedTypes::TokenDist, inst_id, &mut dist),
+                    inst_id,
+                    "l4m::sample_topk failed. invalid distribution"
+                );
 
                 Some((
                     Command::SampleTopK {
+                        inst_id,
                         stream_id,
                         dist,
                         k,
                         handle,
                     },
-                    Stream::new(inst, stream_id),
+                    Stream::new(inst_id, stream_id),
                 ))
             }
-            Command::Synchronize { stream_id, handle } => Some((
-                Command::Synchronize { stream_id, handle },
-                Stream::new(inst, stream_id),
+
+            Command::Synchronize {
+                inst_id,
+                stream_id,
+                handle,
+            } => Some((
+                Command::Synchronize {
+                    inst_id,
+                    stream_id,
+                    handle,
+                },
+                Stream::new(inst_id, stream_id),
             )),
+
             Command::SetStreamPriority {
+                inst_id,
                 stream_id,
                 priority,
             } => {
                 self.stream_priorities
-                    .insert(Stream::new(inst, stream_id), priority);
+                    .insert(Stream::new(inst_id, stream_id), priority);
                 None
             }
 
             Command::EmbedImage {
+                inst_id,
                 stream_id,
                 mut embs,
                 image_blob,
             } => {
-                self.objects
-                    .translate_many(ManagedTypes::TokenEmb, inst, &mut embs)?;
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::TokenEmb, inst_id, &mut embs),
+                    inst_id,
+                    "l4m::embed_image failed. invalid embeddings"
+                );
 
                 Some((
                     Command::EmbedImage {
+                        inst_id,
                         stream_id,
                         embs,
                         image_blob,
                     },
-                    Stream::new(inst, stream_id),
+                    Stream::new(inst_id, stream_id),
                 ))
             }
-        };
-
-        Ok(resolved_cmd)
+        }
     }
 
-    async fn scheduler_loop(mut sch: CommandScheduler<B>, mut rx: Receiver<(Stream, Command)>) {
+    async fn scheduler_loop<B>(mut sch: CommandScheduler<B>, mut rx: Receiver<(Stream, Command)>)
+    where
+        B: Backend,
+    {
         loop {
             match timeout(Duration::from_micros(50), rx.recv()).await {
                 // A command arrived within 20ms:
@@ -698,7 +820,7 @@ impl L4m {
                         for (item, event) in batch.items.into_iter().zip(senders) {
                             match event {
                                 Event::SampleTopK(handle) => {
-                                    handle.send((item.token_ids, item.probabilities));
+                                    handle.send((item.token_ids, item.probabilities)).ok();
                                 }
                                 _ => unreachable!(),
                             }
@@ -709,14 +831,16 @@ impl L4m {
                         let sender = senders.into_iter().next().unwrap();
                         match sender {
                             Event::GetInfo(handle) => {
-                                handle.send(Info {
-                                    version: info.version,
-                                    model_name: info.model_name,
-                                    block_size: info.block_size,
-                                    num_blocks: info.num_available_blocks,
-                                    num_embeddings: info.num_available_embeddings,
-                                    num_distributions: info.num_available_distributions,
-                                });
+                                handle
+                                    .send(Info {
+                                        version: info.version,
+                                        model_name: info.model_name,
+                                        block_size: info.block_size,
+                                        num_blocks: info.num_available_blocks,
+                                        num_embeddings: info.num_available_embeddings,
+                                        num_distributions: info.num_available_distributions,
+                                    })
+                                    .ok();
                             }
                             _ => unreachable!(),
                         }
@@ -788,7 +912,11 @@ where
             BatchGroup::Synchronize => {
                 let cmd = batch.into_iter().next().unwrap();
                 match cmd {
-                    Command::Synchronize { stream_id, handle } => {
+                    Command::Synchronize {
+                        inst_id,
+                        stream_id,
+                        handle,
+                    } => {
                         handle.send(()).unwrap();
                     }
                     _ => unreachable!(),
@@ -898,8 +1026,18 @@ fn encode_pb_batch_allocate_inner(batch: Vec<Command>) -> Vec<pb_bindings::Alloc
     let mut items = Vec::new();
     for cmd in batch {
         match cmd {
-            Command::Allocate { stream_id, ty, ids }
-            | Command::Deallocate { stream_id, ty, ids } => {
+            Command::Allocate {
+                inst_id,
+                stream_id,
+                ty,
+                ids,
+            }
+            | Command::Deallocate {
+                inst_id,
+                stream_id,
+                ty,
+                ids,
+            } => {
                 let kind = match ty {
                     ManagedTypes::KvBlock => pb_bindings::ObjectKind::KvBlock,
                     ManagedTypes::TokenEmb => pb_bindings::ObjectKind::Emb,
@@ -962,6 +1100,7 @@ fn encode_pb_batch_fill_block(
     for cmd in batch {
         match cmd {
             Command::FillBlock {
+                inst_id,
                 stream_id,
                 block,
                 context,
@@ -996,6 +1135,7 @@ fn encode_pb_batch_copy_block(
     for cmd in batch {
         match cmd {
             Command::CopyBlock {
+                inst_id,
                 stream_id,
                 src_block,
                 dst_block,
@@ -1032,6 +1172,7 @@ fn encode_pb_batch_mask_block(
     for cmd in batch {
         match cmd {
             Command::MaskBlock {
+                inst_id,
                 stream_id,
                 block,
                 mask,
@@ -1062,6 +1203,7 @@ fn encode_pb_batch_embed_text(
     for cmd in batch {
         match cmd {
             Command::EmbedText {
+                inst_id,
                 stream_id,
                 embs,
                 text,
@@ -1096,6 +1238,7 @@ fn encode_pb_batch_decode_token_dist(
     for cmd in batch {
         match cmd {
             Command::DecodeTokenDist {
+                inst_id,
                 stream_id,
                 embs,
                 dists,
@@ -1131,6 +1274,7 @@ fn encode_pb_batch_sample_topk(
     for cmd in batch {
         match cmd {
             Command::SampleTopK {
+                inst_id,
                 stream_id,
                 dist,
                 k,
@@ -1166,6 +1310,7 @@ fn encode_pb_batch_embed_image(
     for cmd in batch {
         match cmd {
             Command::EmbedImage {
+                inst_id,
                 stream_id,
                 embs,
                 image_blob,

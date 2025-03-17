@@ -45,7 +45,7 @@ pub trait Backend: Clone + Send + Sync + 'static {
             .map(|idx| idx as u8)
             .ok_or_else(|| BackendError::UnsupportedProtocol(protocol.to_string()))
     }
-    
+
     async fn send(&self, protocol_idx: u8, payload: Vec<u8>) -> Result<(), BackendError>;
 
     /// Registers a listener (an event dispatcher) for a given protocol index.
@@ -167,6 +167,8 @@ impl ZmqBackend {
                 }
             }
         }
+
+        ()
     }
 }
 

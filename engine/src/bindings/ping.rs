@@ -1,5 +1,5 @@
 use crate::instance::{InstanceState};
-use crate::{bindings, driver};
+use crate::{bindings, service};
 use tokio::sync::oneshot;
 use crate::controller::Command;
 
@@ -7,7 +7,7 @@ impl bindings::wit::symphony::app::ping::Host for InstanceState {
     async fn ping(&mut self, message: String) -> anyhow::Result<String, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
 
-        self.send_cmd(Command::Ping(driver::ping::Command::Ping {
+        self.send_cmd(Command::Ping(service::ping::Command::Ping {
             message,
             handler: tx,
         }));

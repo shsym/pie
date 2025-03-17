@@ -1,15 +1,11 @@
-use crate::server::{ClientMessage, ServerMessage};
 use anyhow::Result;
 use blake3;
-use colored::*;
 use futures::{SinkExt, StreamExt};
 use rmp_serde::{decode, encode};
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
+
+use crate::server::{ClientMessage, ServerMessage};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 const CHUNK_SIZE: usize = 64 * 1024;
@@ -196,8 +192,10 @@ impl Client {
                                 );
                                 break; // proceed to next chunk
                             } else {
-                                eprintln!("UploadAck mismatch: got hash={}, idx={} but expected {} and {}",
-                                          hash, ack_idx, program_hash, chunk_index);
+                                eprintln!(
+                                    "UploadAck mismatch: got hash={}, idx={} but expected {} and {}",
+                                    hash, ack_idx, program_hash, chunk_index
+                                );
                                 // keep waiting or handle as error
                             }
                         }

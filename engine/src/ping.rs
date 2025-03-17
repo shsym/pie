@@ -2,14 +2,11 @@
 
 use crate::backend;
 use crate::backend::Backend;
-use crate::driver::{Driver, DriverError};
-use crate::instance::Id as InstanceId;
+use crate::service::Service;
 use crate::utils::IdPool;
 use dashmap::DashMap;
-use futures::SinkExt;
 use prost::Message;
-use std::collections::VecDeque;
-use std::mem;
+
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
@@ -28,7 +25,6 @@ pub enum Command {
 }
 
 #[derive(Debug)]
-
 pub enum Event {
     Pong(oneshot::Sender<String>),
 }
@@ -46,10 +42,10 @@ impl<B> Ping<B>
 where
     B: Backend,
 {
-    pub async fn new(backend: B) -> Result<Self, DriverError> {
-        let protocol_id = backend.get_protocol_idx(PROTOCOL).map_err(|e| {
-            DriverError::Other(format!("Failed to get protocol index: {}", e.to_string()))
-        })?;
+    pub fn new(backend: B) -> Self {
+        let protocol_id = backend
+            .get_protocol_idx(PROTOCOL)
+            .expect("Failed to get protocol index");
 
         let (tx, rx) = mpsc::channel(1000);
         backend.listen(protocol_id, tx);
@@ -57,7 +53,7 @@ where
         let event_table = Arc::new(DashMap::new());
         let event_loop_handle = tokio::spawn(Self::event_loop(rx, event_table.clone()));
 
-        Ok(Self {
+        Self {
             backend,
             protocol_id,
 
@@ -65,7 +61,7 @@ where
             cmd_queue: Arc::new(Mutex::new(Vec::new())),
             event_table,
             event_loop_handle,
-        })
+        }
     }
 
     async fn event_loop(
@@ -87,13 +83,13 @@ where
     }
 }
 
-impl<B> Driver for Ping<B>
+impl<B> Service for Ping<B>
 where
     B: Backend,
 {
     type Command = Command;
 
-    async fn dispatch(&mut self, inst: InstanceId, cmd: Self::Command) {
+    async fn handle(&mut self, cmd: Self::Command) {
         match cmd {
             Command::Ping { message, handler } => {
                 let correlation_id = self.cmd_id_pool.acquire().unwrap();
