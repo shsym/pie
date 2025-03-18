@@ -1,17 +1,18 @@
 use dashmap::DashMap;
-use std::sync::Arc;
-use async_trait::async_trait;
+use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
 use wasmtime_wasi;
 
 use crate::instance::{Id as InstanceId, InstanceState};
-use crate::{bindings, server, service, tokenizer};
+use crate::{bindings, server, service};
 
 use crate::service::{Service, ServiceError};
 use thiserror::Error;
 use tokio::sync::oneshot;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+static SERVICE_ID_RUNTIME: OnceLock<usize> = OnceLock::new();
 
 pub fn trap<T>(instance_id: InstanceId, message: T)
 where
@@ -87,7 +88,10 @@ pub enum Command {
 
 impl Command {
     pub fn dispatch(self) -> Result<(), ServiceError> {
-        service::dispatch(service::SERVICE_RUNTIME, self)
+        let service_id =
+            *SERVICE_ID_RUNTIME.get_or_init(move || service::get_service_id("runtime").unwrap());
+
+        service::dispatch(service_id, self)
     }
 }
 
@@ -132,10 +136,19 @@ impl Service for Runtime {
                 if self.programs_in_memory.contains_key(&hash) {
                     event.send(Ok(hash)).unwrap();
                 } else {
-                    let path = std::path::Path::new("cache").join(&hash);
-                    std::fs::write(&path, &raw).unwrap();
-                    self.programs_in_disk.insert(hash.clone(), path);
-                    event.send(Ok(hash)).unwrap();
+                    if let Ok(component) = Component::from_binary(&self.engine, raw.as_slice()) {
+                        self.programs_in_memory.insert(hash.to_string(), component);
+
+                        // Write to disk
+                        let file_path = std::path::Path::new(super::PROGRAM_CACHE_DIR).join(&hash);
+                        std::fs::write(&file_path, &raw).unwrap();
+                        self.programs_in_disk.insert(hash.clone(), file_path);
+                        event.send(Ok(hash)).unwrap();
+                    } else {
+                        event
+                            .send(Err(RuntimeError::Other("Failed to compile".into())))
+                            .unwrap();
+                    }
                 }
             }
 
@@ -216,6 +229,7 @@ impl Runtime {
             // load from disk if possible
             if let Some(path_entry) = self.programs_in_disk.get(hash) {
                 // Use a custom error variant for compile errors
+
                 let component =
                     Component::from_file(&self.engine, path_entry.value()).map_err(|err| {
                         RuntimeError::CompileWasm {
@@ -294,9 +308,9 @@ impl Runtime {
                 .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
 
             // Attempt to call “run”
-            let run_export = instance.get_export(&mut store, None, "spi:app/run");
+            let run_export = instance.get_export(&mut store, None, "symphony:app/run");
             let run_iface = run_export
-                .ok_or_else(|| RuntimeError::Other("No spi:app/run in the module".into()))?;
+                .ok_or_else(|| RuntimeError::Other("No symphony:app/run in the module".into()))?;
 
             let run_func_export = instance.get_export(&mut store, Some(&run_iface), "run");
             let run_func_export = run_func_export
@@ -324,6 +338,7 @@ impl Runtime {
         .await;
 
         if let Err(err) = result {
+            //println!("Instance {instance_id} failed: {err}");
             server::Command::Detach {
                 inst: instance_id.clone(),
                 reason: format!("{err}"),
@@ -331,6 +346,7 @@ impl Runtime {
             .dispatch()
             .ok();
         } else {
+            //println!("Instance {instance_id} finished normally");
             server::Command::Detach {
                 inst: instance_id.clone(),
                 reason: format!("instance norally finished"),

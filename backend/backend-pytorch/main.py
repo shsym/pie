@@ -7,6 +7,7 @@ from transformers import TorchAoConfig, AutoTokenizer
 import l4m_pb2
 import l4m_vision_pb2
 import ping_pb2
+import handshake_pb2
 
 from common import ceil_div
 from driver import Driver
@@ -104,7 +105,8 @@ def main_run():
     router.bind("tcp://*:8888")
     print("Server listening on tcp://*:8888")
 
-    protocols = {}
+    connected_clients = {}
+    protocols = ["l4m", "l4m_vision", "ping"]
 
     while True:
         # ROUTER sockets receive multipart messages.
@@ -113,11 +115,25 @@ def main_run():
         client_identity = frames[0]
 
         # Check if an empty frame is present. If so, payload is at index 2.
-        payload = frames[1]
 
         # check if the client has already a protocol
-        if client_identity in protocols:
-            protocol = protocols[client_identity]
+        if client_identity in connected_clients:
+
+            if len(frames) != 3:
+                print("Invalid message format.")
+                # send an error message back to the client
+                continue
+
+            protocol_idx_raw = frames[1]  # should be a single byte
+            protocol_idx = int.from_bytes(protocol_idx_raw, byteorder="little")
+
+            if protocol_idx >= len(protocols):
+                print("Invalid protocol:", protocol_idx)
+                # send an error message back to the client
+                continue
+
+            protocol = protocols[protocol_idx]
+            payload = frames[2]
 
             if protocol == "l4m":
                 # Deserialize the protobuf message
@@ -153,29 +169,30 @@ def main_run():
 
                 router.send_multipart([client_identity, pong])
 
-            else:
-                print("Invalid protocol.", protocol)
-                # send an error message back to the client
-
-
 
         else:
+            # do a handshake
+            payload = frames[1]
 
-            # protocol = payload
-            # parse the payload
-            protocol = payload.decode("utf-8")
+            try:
+                # Deserialize the protobuf message
+                hs = handshake_pb2.Request()
+                hs.ParseFromString(payload)
 
-            # check if the protocol is supported
-            if protocol not in ["l4m", "l4m_vision", "ping"]:
-                print("Invalid protocol.")
+            except:
+                print("Invalid handshake message.")
                 # send an error message back to the client
                 router.send_multipart([client_identity, b"\x00"])
+                continue
 
-            else:
+            # send available protocols to the client
+            response = handshake_pb2.Response(protocols=protocols)
 
-                protocols[client_identity] = protocol
-                # send a message back to the client
-                router.send_multipart([client_identity, b"\x01"])
+            # Serialize the response
+            payload = response.SerializeToString()
+
+            # send the response back to the client
+            router.send_multipart([client_identity, payload])
 
 
 ###====================Test====================###

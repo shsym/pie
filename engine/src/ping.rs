@@ -8,7 +8,6 @@ use dashmap::DashMap;
 use prost::Message;
 
 use std::sync::{Arc, Mutex};
-use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
 pub const PROTOCOL: &str = "ping";

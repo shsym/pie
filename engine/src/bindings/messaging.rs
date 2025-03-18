@@ -1,11 +1,10 @@
 use crate::bindings;
 use crate::instance::InstanceState;
 use crate::messaging::Command;
-use async_trait::async_trait;
 use std::mem;
 use tokio::sync::{mpsc, oneshot};
 use wasmtime::component::Resource;
-use wasmtime_wasi::{DynPollable, IoView, Pollable, subscribe};
+use wasmtime_wasi::{DynPollable, IoView, Pollable, subscribe, async_trait};
 //
 
 #[derive(Debug)]

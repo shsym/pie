@@ -185,10 +185,10 @@ impl Client {
                             chunk_index: ack_idx,
                         } => {
                             if hash == program_hash && ack_idx == chunk_index {
-                                println!(
-                                    "[Client] Received ack for chunk {}/{}",
-                                    ack_idx, total_chunks
-                                );
+                                // println!(
+                                //     "[Client] Received ack for chunk {}/{}",
+                                //     ack_idx, total_chunks
+                                // );
                                 break; // proceed to next chunk
                             } else {
                                 eprintln!(

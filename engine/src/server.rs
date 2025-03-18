@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -20,6 +20,7 @@ use uuid::Uuid;
 //     include!(concat!(env!("OUT_DIR"), "/client.rs"));
 // }
 const CHUNK_SIZE_BYTES: usize = 64 * 1024; // 64 KiB
+static SERVICE_ID_SERVER: OnceLock<usize> = OnceLock::new();
 
 /// Define the various errors that can happen while handling messages.
 #[derive(Debug, Error)]
@@ -142,7 +143,9 @@ pub enum Command {
 
 impl Command {
     pub fn dispatch(self) -> Result<(), ServiceError> {
-        service::dispatch(service::SERVICE_SERVER, self)
+        let service_id =
+            *SERVICE_ID_SERVER.get_or_init(move || service::get_service_id("server").unwrap());
+        service::dispatch(service_id, self)
     }
 }
 
@@ -352,6 +355,9 @@ impl Connection {
                                 total_chunks,
                                 mut chunk_data,
                             } => {
+
+                                //println!("Received chunk {} of {} for program with hash {}", chunk_index, total_chunks, hash);
+
                                 if chunk_data.len() > CHUNK_SIZE_BYTES {
                                     writer_tx.send(ConnectionCommand::Send(ServerMessage::Error {
                                         error: ServerError::ChunkTooLarge {
@@ -367,6 +373,12 @@ impl Connection {
                                     }
 
                                     upload_buffer.append(&mut chunk_data);
+
+                                    writer_tx.send(ConnectionCommand::Send(ServerMessage::UploadAck {
+                                        hash: hash.clone(),
+                                        chunk_index,
+                                    })).await?;
+
 
                                     // The last chunk
                                     if chunk_index == total_chunks - 1 {
@@ -389,6 +401,8 @@ impl Connection {
                                             }
                                             .dispatch()?;
                                             let _ = evt_rx.await?;
+
+                                            println!("Uploaded program with hash {}", file_hash);
 
                                             writer_tx.send(ConnectionCommand::Send(ServerMessage::UploadComplete { hash: file_hash })).await?;
                                         }

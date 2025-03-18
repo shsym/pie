@@ -1,22 +1,14 @@
-use once_cell::sync::OnceCell;
-
-use crate::messaging::Messaging;
-use crate::runtime::Runtime;
-use crate::server::Server;
-use async_trait::async_trait;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::OnceLock;
 use thiserror::Error;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task;
 
 // Common driver routines
-pub static SERVICE_RUNTIME: usize = 0;
-pub static SERVICE_SERVER: usize = 1;
-pub static SERVICE_MESSAGING: usize = 2;
 
-static SERVICE_DISPATCHER: OnceCell<ServiceDispatcher> = OnceCell::new();
+static SERVICE_DISPATCHER: OnceLock<ServiceDispatcher> = OnceLock::new();
 
 pub fn dispatch<C>(service_id: usize, cmd: C) -> Result<(), ServiceError>
 where
@@ -93,7 +85,7 @@ impl ServiceInstaller {
         self
     }
 
-    pub fn install(self) {
+    pub fn setup(self) {
         let dispatcher = ServiceDispatcher {
             maps: self.maps,
             channels: self.channels,

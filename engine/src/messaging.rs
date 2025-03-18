@@ -2,11 +2,12 @@ use crate::service;
 use crate::service::{Service, ServiceError};
 use crate::utils::IdPool;
 use dashmap::DashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 type SubscriptionId = usize;
+static SERVICE_ID_MESSAGING: OnceLock<usize> = OnceLock::new();
 
 #[derive(Debug)]
 pub enum Command {
@@ -27,7 +28,10 @@ pub enum Command {
 
 impl Command {
     pub fn dispatch(self) -> Result<(), ServiceError> {
-        service::dispatch(service::SERVICE_MESSAGING, self)
+        let service_id = *SERVICE_ID_MESSAGING
+            .get_or_init(move || service::get_service_id("messaging").unwrap());
+
+        service::dispatch(service_id, self)
     }
 }
 

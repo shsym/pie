@@ -1,13 +1,12 @@
 use crate::instance::InstanceState;
-use crate::l4m::{Command, ManagedTypes, StreamPriority};
+use crate::l4m::{Command, ManagedTypes, StreamPriority, available_models};
 use crate::object::IdRepr;
 use crate::tokenizer::BytePairEncoder;
 use crate::{bindings, service};
-use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
-use wasmtime_wasi::{DynPollable, IoView, Pollable, subscribe};
+use wasmtime_wasi::{DynPollable, IoView, Pollable, async_trait, subscribe};
 
 #[derive(Debug, Clone)]
 pub struct Model {
@@ -93,7 +92,7 @@ impl bindings::wit::symphony::app::l4m::Host for InstanceState {
     }
 
     async fn get_all_models(&mut self) -> anyhow::Result<Vec<String>> {
-        Ok(vec!["default".to_string()])
+        Ok(available_models().to_vec())
     }
 }
 

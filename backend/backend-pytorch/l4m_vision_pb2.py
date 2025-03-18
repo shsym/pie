@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10l4m_vision.proto\x12\nl4m.vision\"0\n\nEmbedImage\x12\x15\n\rembedding_ids\x18\x01 \x03(\r\x12\x0b\n\x03url\x18\x02 \x01(\t\"8\n\x0f\x42\x61tchEmbedImage\x12%\n\x05items\x18\x01 \x03(\x0b\x32\x16.l4m.vision.EmbedImage\"0\n\nEmbedVideo\x12\x15\n\rembedding_ids\x18\x01 \x03(\r\x12\x0b\n\x03url\x18\x02 \x01(\t\"8\n\x0f\x42\x61tchEmbedVideo\x12%\n\x05items\x18\x01 \x03(\x0b\x32\x16.l4m.vision.EmbedVideo\"\x94\x01\n\x07Request\x12\x16\n\x0e\x63orrelation_id\x18\x01 \x01(\r\x12\x32\n\x0b\x65mbed_image\x18\x02 \x01(\x0b\x32\x1b.l4m.vision.BatchEmbedImageH\x00\x12\x32\n\x0b\x65mbed_video\x18\x03 \x01(\x0b\x32\x1b.l4m.vision.BatchEmbedVideoH\x00\x42\t\n\x07\x63ommand\"\"\n\x08Response\x12\x16\n\x0e\x63orrelation_id\x18\x01 \x01(\rb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10l4m_vision.proto\x12\nl4m.vision\"7\n\nEmbedImage\x12\x15\n\rembedding_ids\x18\x01 \x03(\r\x12\x12\n\nimage_blob\x18\x02 \x01(\x0c\"8\n\x0f\x42\x61tchEmbedImage\x12%\n\x05items\x18\x01 \x03(\x0b\x32\x16.l4m.vision.EmbedImage\"`\n\x07Request\x12\x16\n\x0e\x63orrelation_id\x18\x01 \x01(\r\x12\x32\n\x0b\x65mbed_image\x18\x02 \x01(\x0b\x32\x1b.l4m.vision.BatchEmbedImageH\x00\x42\t\n\x07\x63ommand\"\"\n\x08Response\x12\x16\n\x0e\x63orrelation_id\x18\x01 \x01(\rb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,15 +32,11 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'l4m_vision_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_EMBEDIMAGE']._serialized_start=32
-  _globals['_EMBEDIMAGE']._serialized_end=80
-  _globals['_BATCHEMBEDIMAGE']._serialized_start=82
-  _globals['_BATCHEMBEDIMAGE']._serialized_end=138
-  _globals['_EMBEDVIDEO']._serialized_start=140
-  _globals['_EMBEDVIDEO']._serialized_end=188
-  _globals['_BATCHEMBEDVIDEO']._serialized_start=190
-  _globals['_BATCHEMBEDVIDEO']._serialized_end=246
-  _globals['_REQUEST']._serialized_start=249
-  _globals['_REQUEST']._serialized_end=397
-  _globals['_RESPONSE']._serialized_start=399
-  _globals['_RESPONSE']._serialized_end=433
+  _globals['_EMBEDIMAGE']._serialized_end=87
+  _globals['_BATCHEMBEDIMAGE']._serialized_start=89
+  _globals['_BATCHEMBEDIMAGE']._serialized_end=145
+  _globals['_REQUEST']._serialized_start=147
+  _globals['_REQUEST']._serialized_end=243
+  _globals['_RESPONSE']._serialized_start=245
+  _globals['_RESPONSE']._serialized_end=279
 # @@protoc_insertion_point(module_scope)

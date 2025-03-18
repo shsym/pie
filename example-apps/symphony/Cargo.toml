@@ -8,6 +8,4 @@ wit-bindgen.workspace = true
 wstd = "0.5.3"
 trait-variant = "0.1.2"
 wasi = "0.14.2+wasi-0.2.4"
-slab = "0.4.9"
-futures-lite = "2.6.0"
 num-traits = "0.2.19"

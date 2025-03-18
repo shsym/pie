@@ -18,15 +18,7 @@ mod utils;
 //
 use anyhow::Context;
 use std::path::{Path, PathBuf};
-// use std::sync::Arc;
-// use tokio::sync::mpsc::{channel, unbounded_channel};
-//
-// use crate::server_old::{ServerMessage, ServerState, WebSocketServer};
-// use wasmtime::{Config, Engine};
-//
-// use crate::backend::SimulatedBackend;
-// use crate::client::Client;
-// use crate::runtime::{ExceptionDispatcher, Runtime};
+
 use crate::client::Client;
 use crate::l4m::L4m;
 use crate::messaging::Messaging;
@@ -37,10 +29,6 @@ use crate::service::ServiceInstaller;
 use std::fs;
 use std::time::Duration;
 
-// use std::time::Duration;
-// use tokio::time::timeout;
-//
-// /// Directory for cached programs
 const PROGRAM_CACHE_DIR: &str = "./program_cache";
 //
 #[tokio::main]
@@ -48,16 +36,8 @@ async fn main() -> anyhow::Result<()> {
     // 1) Ensure the cache directory exists
     fs::create_dir_all(PROGRAM_CACHE_DIR).context("Failed to create program cache directory")?;
 
-    // fn add_builtin_services(mut self, listen_addr: &str) -> Self {
-    //     self.add("runtime", Runtime::new())
-    //         .add("server", Server::new(listen_addr))
-    //         .add("messaging", Messaging::new())
-    // }
-
     let l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
     let ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
-
-    let installer = ServiceInstaller::new();
 
     let runtime = Runtime::new();
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
@@ -67,13 +47,16 @@ async fn main() -> anyhow::Result<()> {
     let l4m = L4m::new(l4m_backend).await;
     let ping = Ping::new(ping_backend);
 
-    installer
+    l4m::set_available_models(["llama3"]);
+
+    // Install all services
+    ServiceInstaller::new()
         .add("runtime", runtime)
         .add("server", server)
         .add("messaging", messaging)
-        .add("l4m", l4m)
+        .add("llama3", l4m)
         .add("ping", ping)
-        .install();
+        .setup();
 
     // TEST: spawn a dummy client
     tokio::spawn(dummy_client());
@@ -86,7 +69,8 @@ async fn main() -> anyhow::Result<()> {
 
 async fn dummy_client() -> anyhow::Result<()> {
     // Adjust path as needed:
-    let wasm_path = PathBuf::from("../example-apps/target/wasm32-wasip2/release/multimodal.wasm");
+    let wasm_path =
+        PathBuf::from("../example-apps/target/wasm32-wasip2/release/parallel_generation.wasm");
     let server_uri = "ws://127.0.0.1:9000";
 
     // 1) Create and connect the client

@@ -13,9 +13,8 @@ use std::cmp::{Ordering, PartialEq};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use async_trait::async_trait;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -34,6 +33,24 @@ macro_rules! try_trap {
 pub const PROTOCOLS: [&str; 2] = ["l4m", "l4m-vision"]; // for future backward compatibility
 const PROTOCOL_BASE: usize = 0;
 const PROTOCOL_VISION: usize = 1;
+
+static AVAILABLE_MODELS: OnceLock<Vec<String>> = OnceLock::new();
+
+pub fn set_available_models<T>(models: T)
+where
+    T: IntoIterator,
+    T::Item: ToString,
+{
+    let models = models
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<String>>();
+    AVAILABLE_MODELS.get_or_init(|| models);
+}
+
+pub fn available_models() -> &'static [String] {
+    AVAILABLE_MODELS.get().unwrap()
+}
 
 mod pb_bindings {
     include!(concat!(env!("OUT_DIR"), "/l4m.rs"));

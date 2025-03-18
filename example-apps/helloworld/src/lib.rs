@@ -4,6 +4,8 @@ struct HelloWorld;
 
 impl Run for HelloWorld {
     async fn run() -> Result<(), String> {
+        println!("Hello World!!");
+
         let inst_id = symphony::runtime::get_instance_id();
         let version = symphony::runtime::get_version();
         println!(
