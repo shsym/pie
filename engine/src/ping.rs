@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use prost::Message;
 
 use std::sync::{Arc, Mutex};
+use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
 pub const PROTOCOL: &str = "ping";
@@ -83,6 +84,7 @@ where
     }
 }
 
+//#[async_trait]
 impl<B> Service for Ping<B>
 where
     B: Backend,
@@ -102,7 +104,6 @@ where
                     .insert(correlation_id, Event::Pong(handler));
                 self.backend
                     .send(self.protocol_id, ping.encode_to_vec())
-                    .await
                     .unwrap();
             }
         }

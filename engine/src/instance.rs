@@ -52,6 +52,10 @@ impl InstanceState {
             http_ctx: WasiHttpCtx::new(),
         }
     }
+    
+    pub fn id(&self) -> Id {
+        self.id
+    }
 }
 //
 // impl Drop for InstanceState {

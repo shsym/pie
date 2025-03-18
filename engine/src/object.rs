@@ -114,11 +114,11 @@ where
         }
     }
 
-    pub fn set_capacity(&mut self, ty: TY, capacity: usize) -> Result<(), ObjectError> {
+    pub fn set_capacity(&mut self, ty: TY, capacity: IdRepr) -> Result<(), ObjectError> {
         self.id_pool
             .entry(ty)
-            .or_insert_with(|| IdPool::new(capacity.into()))
-            .set_capacity(capacity.into())
+            .or_insert_with(|| IdPool::new(capacity))
+            .set_capacity(capacity)
             .map_err(|e| ObjectError::NoAvailableSpace)
     }
 
@@ -127,7 +127,7 @@ where
         let id = self
             .id_pool
             .entry(ty)
-            .or_insert_with(|| IdPool::new(ty.max_capacity()))
+            .or_insert_with(|| IdPool::new(1))
             .acquire()
             .map_err(|_| ObjectError::NoAvailableSpace)?;
 
@@ -164,7 +164,7 @@ where
         let ids = self
             .id_pool
             .entry(ty.clone())
-            .or_insert_with(|| IdPool::new(ty.max_capacity()))
+            .or_insert_with(|| IdPool::new(1))
             .acquire_many(names.len())
             .map_err(|_| ObjectError::NoAvailableSpace)?;
 

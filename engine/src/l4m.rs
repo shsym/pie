@@ -2,10 +2,10 @@ use crate::backend::Backend;
 use crate::batching::{Batchable, Batcher, BatchingStrategy, KorTStrategy};
 use crate::instance::Id as InstanceId;
 use crate::object::{IdRepr, ObjectManager, ObjectType, group_consecutive_ids};
-use crate::service::Service;
+use crate::service::{Service, ServiceError};
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::IdPool;
-use crate::{backend, runtime, tokenizer};
+use crate::{backend, runtime, service, tokenizer};
 use dashmap::DashMap;
 use prost::Message;
 use rand::Rng;
@@ -15,6 +15,7 @@ use std::hash::{Hash, Hasher};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use async_trait::async_trait;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -225,6 +226,12 @@ pub enum Command {
     },
 }
 
+impl Command {
+    pub fn dispatch(self, service_id: usize) -> Result<(), ServiceError> {
+        service::dispatch(service_id, self)
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 enum BatchGroup {
     GetInfo,
@@ -319,6 +326,7 @@ pub struct L4m {
     tokenizer: Arc<BytePairEncoder>,
 }
 
+//#[async_trait]
 impl Service for L4m {
     type Command = Command;
 
@@ -352,9 +360,8 @@ impl L4m {
         let event_table = Arc::new(DashMap::new());
         let event_loop_handle = tokio::spawn(Self::event_loop(event_rx, event_table.clone()));
 
-        let scheduler =
-            CommandScheduler::new(backend, event_table).expect("Failed to create scheduler");
-        let scheduler_loop_handle = tokio::spawn(Self::scheduler_loop(scheduler, scheduler_rx));
+        let scheduler_loop_handle =
+            tokio::spawn(Self::scheduler_loop(backend, event_table, scheduler_rx));
 
         let (info_tx, info_rx) = oneshot::channel();
 
@@ -381,13 +388,13 @@ impl L4m {
 
         let mut objects = ObjectManager::new();
         objects
-            .set_capacity(ManagedTypes::KvBlock, info.num_blocks as usize)
+            .set_capacity(ManagedTypes::KvBlock, info.num_blocks as IdRepr)
             .unwrap();
         objects
-            .set_capacity(ManagedTypes::TokenEmb, info.num_embeddings as usize)
+            .set_capacity(ManagedTypes::TokenEmb, info.num_embeddings as IdRepr)
             .unwrap();
         objects
-            .set_capacity(ManagedTypes::TokenDist, info.num_distributions as usize)
+            .set_capacity(ManagedTypes::TokenDist, info.num_distributions as IdRepr)
             .unwrap();
 
         let driver = Self {
@@ -786,10 +793,15 @@ impl L4m {
         }
     }
 
-    async fn scheduler_loop<B>(mut sch: CommandScheduler<B>, mut rx: Receiver<(Stream, Command)>)
-    where
+    async fn scheduler_loop<B>(
+        backend: B,
+        event_table: Arc<DashMap<u32, Vec<Event>>>,
+        mut rx: Receiver<(Stream, Command)>,
+    ) where
         B: Backend,
     {
+        let mut sch = CommandScheduler::new(backend, event_table);
+
         loop {
             match timeout(Duration::from_micros(50), rx.recv()).await {
                 // A command arrived within 20ms:
@@ -866,26 +878,26 @@ impl<B> CommandScheduler<B>
 where
     B: Backend + 'static,
 {
-    fn new(backend: B, event_table: Arc<DashMap<u32, Vec<Event>>>) -> Result<Self, DriverError> {
+    fn new(backend: B, event_table: Arc<DashMap<u32, Vec<Event>>>) -> Self {
         let protocol_ids = PROTOCOLS
             .iter()
             .map(|protoc| {
-                backend.get_protocol_idx(protoc).map_err(|e| {
-                    DriverError::Other(format!("Failed to get protocol index: {}", e.to_string()))
-                })
+                backend
+                    .get_protocol_idx(protoc)
+                    .expect("Failed to get protocol index")
             })
-            .collect::<Result<Vec<u8>, DriverError>>()?;
+            .collect::<Vec<u8>>();
 
-        Ok(Self {
+        Self {
             backend,
             protocol_ids,
             cmd_id_pool: IdPool::new(u32::MAX),
             cmd_batcher: Batcher::new(),
             event_table,
-        })
+        }
     }
 
-    fn submit(&mut self, mut stream: Stream, cmd: Command, now: Instant) {
+    fn submit(&mut self, stream: Stream, cmd: Command, now: Instant) {
         self.cmd_batcher.push(stream, cmd, now);
     }
 
@@ -933,7 +945,6 @@ where
 
         self.backend
             .send(self.protocol_ids[protocol], payload)
-            .await
             .unwrap();
     }
 }

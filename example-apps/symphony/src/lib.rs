@@ -3,8 +3,8 @@ pub mod drafter;
 pub mod l4m_async;
 pub mod sampler;
 pub mod stop_condition;
+mod utils;
 
-pub use context::{Context, Model};
 pub use wstd;
 pub mod bindings {
     wit_bindgen::generate!({
@@ -20,9 +20,10 @@ pub mod bindings {
 }
 
 pub use crate::bindings::{
-    export, exports::spi::app::run::Guest as RunSync, spi::app::l4m, spi::app::l4m_vision,
-    spi::app::ping, spi::app::system,
+    export, exports::symphony::app::run::Guest as RunSync, symphony::app::l4m,
+    symphony::app::l4m_vision, symphony::app::ping, symphony::app::runtime, symphony::app::messaging
 };
+pub use crate::context::Model;
 
 pub fn available_models() -> Vec<String> {
     Model::available_models()

@@ -1,5 +1,4 @@
 use anyhow::Result;
-use blake3;
 use futures::{SinkExt, StreamExt};
 use rmp_serde::{decode, encode};
 
@@ -98,7 +97,7 @@ impl Client {
 
     /// Close the connection. This signals the writer channel to terminate
     /// and also awaits the read task finishing.
-    pub async fn close(mut self) -> Result<()> {
+    pub async fn close(self) -> Result<()> {
         // Attempt to send a Close message
         let _ = self.tx.send(Message::Close(None));
         // The writer side might flush out. Let's drop our sender so the writer can exit:

@@ -1,6 +1,6 @@
 interface runtime {
 
-    get-runtime-version: func() -> string;
+    get-version: func() -> string;
     get-instance-id: func() -> string;
 
     // TODO: telemetry

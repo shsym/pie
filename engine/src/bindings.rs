@@ -1,5 +1,3 @@
-use crate::instance_old;
-
 mod l4m;
 mod l4m_vision;
 mod messaging;
@@ -24,9 +22,14 @@ mod wit {
     });
 }
 
-pub fn add_to_linker<T>(
-    linker: &mut wasmtime::component::Linker<T>,
-) -> Result<(), wasmtime::Error> {
+pub fn add_to_linker<T>(linker: &mut wasmtime::component::Linker<T>) -> Result<(), wasmtime::Error>
+where
+    T: wit::symphony::app::l4m::Host
+        + wit::symphony::app::l4m_vision::Host
+        + wit::symphony::app::runtime::Host
+        + wit::symphony::app::ping::Host
+        + wit::symphony::app::messaging::Host,
+{
     wit::symphony::app::l4m::add_to_linker(linker, |s| s)?;
     wit::symphony::app::l4m_vision::add_to_linker(linker, |s| s)?;
     wit::symphony::app::runtime::add_to_linker(linker, |s| s)?;

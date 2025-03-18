@@ -11,6 +11,7 @@ impl Run for SimpleDecoding {
         let max_num_outputs = 256;
 
         let model = symphony::Model::new(symphony::available_models().first().unwrap()).unwrap();
+        let tokenizer = model.get_tokenizer();
 
         let mut ctx = model.create_context();
 
@@ -21,7 +22,7 @@ impl Run for SimpleDecoding {
             .await;
 
         let text = ctx.generate_until("<|eot_id|>", max_num_outputs).await;
-        let token_ids = model.tokenize(&text);
+        let token_ids = tokenizer.encode(&text);
         println!("Output: {:?} (total elapsed: {:?})", text, start.elapsed());
 
         // compute per token latency

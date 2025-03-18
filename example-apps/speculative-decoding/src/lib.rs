@@ -237,7 +237,9 @@ impl Run for SpeculativeDecoding {
         let max_num_outputs = 128;
 
         let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
-
+        let tokenizer = model.get_tokenizer();
+        
+        
         let mut ctx = model.create_context();
         ctx.fill("<|begin_of_text|>").await;
         ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
@@ -249,7 +251,7 @@ impl Run for SpeculativeDecoding {
         let mut sampler = sampler::GreedySampler::new();
 
         let mut stop_condition = stop_condition::any(
-            stop_condition::Until::new(model.tokenize("<|eot_id|>")),
+            stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
             stop_condition::Length::new(max_num_outputs),
         );
 

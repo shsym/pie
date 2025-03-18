@@ -180,7 +180,7 @@ where
 
             // non-flushed commands sharing the same stream in the cmd_batcher
             // None -> no commands in the batch queue with the same stream
-            let mut prev_group = self.current_group_by_stream.get(stream).cloned();
+            let mut prev_group = self.current_group_by_stream.get(&stream).cloned();
 
             while !queue.is_empty() {
                 let curr_group = queue.front().unwrap().0.group();
@@ -201,17 +201,17 @@ where
                     .push(item, timestamp);
 
                 self.current_group_by_stream
-                    .entry(*stream)
+                    .entry(stream.clone())
                     .or_insert(curr_group);
 
                 self.streams_by_current_group
                     .entry(curr_group)
                     .or_insert_with(Vec::new)
-                    .push(*stream);
+                    .push(stream.clone());
             }
 
             if queue.is_empty() {
-                empty_streams.push(*stream);
+                empty_streams.push(stream);
             }
         }
 

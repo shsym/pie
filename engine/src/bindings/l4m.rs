@@ -1,8 +1,8 @@
-use crate::service::l4m::{LocalStreamId, StreamPriority};
 use crate::instance::InstanceState;
+use crate::l4m::{Command, ManagedTypes, StreamPriority};
 use crate::object::IdRepr;
 use crate::tokenizer::BytePairEncoder;
-use crate::{bindings, service, object};
+use crate::{bindings, service};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -11,7 +11,8 @@ use wasmtime_wasi::{DynPollable, IoView, Pollable, subscribe};
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    name: String,
+    pub name: String,
+    pub service_id: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -27,7 +28,7 @@ pub struct SampleTopKResult {
 }
 #[derive(Debug)]
 pub struct SynchronizationResult {
-    receiver: oneshot::Receiver<()>,
+    receiver: Option<oneshot::Receiver<()>>,
     done: bool,
 }
 
@@ -56,7 +57,9 @@ impl Pollable for SynchronizationResult {
             return;
         }
 
-        let _ = (&self.receiver).await.unwrap();
+        if let Some(receiver) = self.receiver.take() {
+            let _ = receiver.await.unwrap();
+        }
         self.done = true;
     }
 }
@@ -67,21 +70,26 @@ pub struct Cache {
     tokenizer: Option<Tokenizer>,
 }
 
-fn map_object_types(
-    ty: bindings::wit::symphony::app::l4m::ObjectType,
-) -> service::l4m::ManagedTypes {
+fn map_object_types(ty: bindings::wit::symphony::app::l4m::ObjectType) -> ManagedTypes {
     match ty {
-        bindings::wit::symphony::app::l4m::ObjectType::Block => service::l4m::ManagedTypes::KvBlock,
-        bindings::wit::symphony::app::l4m::ObjectType::Dist => service::l4m::ManagedTypes::TokenDist,
-        bindings::wit::symphony::app::l4m::ObjectType::Embed => service::l4m::ManagedTypes::TokenEmb,
+        bindings::wit::symphony::app::l4m::ObjectType::Block => ManagedTypes::KvBlock,
+        bindings::wit::symphony::app::l4m::ObjectType::Dist => ManagedTypes::TokenDist,
+        bindings::wit::symphony::app::l4m::ObjectType::Embed => ManagedTypes::TokenEmb,
     }
 }
 
 impl bindings::wit::symphony::app::l4m::Host for InstanceState {
     async fn get_model(&mut self, value: String) -> anyhow::Result<Option<Resource<Model>>> {
-        let model = Model { name: value };
-        let res = self.table().push(model)?;
-        Ok(Some(res))
+        if let Some(service_id) = service::get_service_id(&value) {
+            let model = Model {
+                name: value,
+                service_id,
+            };
+            let res = self.table().push(model)?;
+            Ok(Some(res))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn get_all_models(&mut self) -> anyhow::Result<Vec<String>> {
@@ -91,14 +99,10 @@ impl bindings::wit::symphony::app::l4m::Host for InstanceState {
 
 impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
     async fn get_block_size(&mut self, model: Resource<Model>) -> Result<u32, wasmtime::Error> {
-        
-        let model = self.table().get(&model)?;
-        
-        service::NamedCommand::new(model.name, service::l4m::Command::GetBlockSize);
-        
-        
+        let service_id = self.table().get(&model)?.service_id;
+
         let (tx, rx) = oneshot::channel();
-        self.send_cmd(service::l4m::Command::GetBlockSize { handle: tx })?;
+        Command::GetBlockSize { handle: tx }.dispatch(service_id)?;
         let block_size = rx.await?;
         Ok(block_size)
     }
@@ -107,8 +111,10 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
     ) -> Result<Resource<Tokenizer>, wasmtime::Error> {
+        let service_id = self.table().get(&model)?.service_id;
+
         let (tx, rx) = oneshot::channel();
-        self.send_cmd(service::l4m::Command::GetTokenizer { handle: tx })?;
+        Command::GetTokenizer { handle: tx }.dispatch(service_id)?;
         let inner = rx.await?;
         let res = self.table().push(Tokenizer { inner })?;
         Ok(res)
@@ -118,6 +124,8 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
     ) -> Result<Vec<String>, wasmtime::Error> {
+        let service_id = self.table().get(&model)?.service_id;
+
         Ok(vec![])
     }
 
@@ -125,9 +133,11 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
     ) -> Result<Vec<(String, u32)>, wasmtime::Error> {
+        let service_id = self.table().get(&model)?.service_id;
+
         let (tx, rx) = oneshot::channel();
 
-        self.send_cmd(service::l4m::Command::GetAllExportedBlocks { handle: tx })?;
+        Command::GetAllExportedBlocks { handle: tx }.dispatch(service_id)?;
 
         let result = rx
             .await
@@ -143,11 +153,17 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         ty: bindings::wit::symphony::app::l4m::ObjectType,
         object_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::Allocate {
+        let service_id = self.table().get(&model)?.service_id;
+
+        Command::Allocate {
+            inst_id: self.id(),
             stream_id,
             ty: map_object_types(ty),
             ids: object_ids,
-        })
+        }
+        .dispatch(service_id)?;
+
+        Ok(())
     }
 
     async fn deallocate(
@@ -157,11 +173,16 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         ty: bindings::wit::symphony::app::l4m::ObjectType,
         object_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::Deallocate {
+        let service_id = self.table().get(&model)?.service_id;
+
+        Command::Deallocate {
+            inst_id: self.id(),
             stream_id,
             ty: map_object_types(ty),
             ids: object_ids,
-        })
+        }
+        .dispatch(service_id)?;
+        Ok(())
     }
 
     async fn fill_block(
@@ -173,13 +194,18 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         input_emb_ids: Vec<IdRepr>,
         output_emb_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::FillBlock {
+        let service_id = self.table().get(&model)?.service_id;
+
+        Command::FillBlock {
+            inst_id: self.id(),
             stream_id,
             block: block_id,
             context: context_block_ids,
             inputs: input_emb_ids,
             outputs: output_emb_ids,
-        })
+        }
+        .dispatch(service_id)?;
+        Ok(())
     }
 
     async fn fill_block_with_adapter(
@@ -192,13 +218,18 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         input_emb_ids: Vec<IdRepr>,
         output_emb_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::FillBlock {
+        let service_id = self.table().get(&model)?.service_id;
+
+        Command::FillBlock {
+            inst_id: self.id(),
             stream_id,
             block: block_id,
             context: context_block_ids,
             inputs: input_emb_ids,
             outputs: output_emb_ids,
-        })
+        }
+        .dispatch(service_id)?;
+        Ok(())
     }
 
     async fn copy_block(
@@ -211,14 +242,19 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         dst_offset: u32,
         size: u32,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::CopyBlock {
+        let service_id = self.table().get(&model)?.service_id;
+
+        Command::CopyBlock {
+            inst_id: self.id(),
             stream_id,
             src_block: src_block_id,
             dst_block: dst_block_id,
             src_token_offset: src_offset,
             dst_token_offset: dst_offset,
             size,
-        })
+        }
+        .dispatch(service_id)?;
+        Ok(())
     }
 
     async fn mask_block(
@@ -228,12 +264,16 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         block_id: IdRepr,
         mask: Vec<bool>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::MaskBlock {
-            stream_id,
+        let service_id = self.table().get(&model)?.service_id;
 
+        Command::MaskBlock {
+            inst_id: self.id(),
+            stream_id,
             block: block_id,
             mask,
-        })
+        }
+        .dispatch(service_id)?;
+        Ok(())
     }
 
     async fn export_blocks(
@@ -242,10 +282,15 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         src_block_ids: Vec<IdRepr>,
         name: String,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::ExportBlocks {
+        let service_id = self.table().get(&model)?.service_id;
+
+        Command::ExportBlocks {
+            inst_id: self.id(),
             blocks: src_block_ids,
             resource_name: name,
-        })
+        }
+        .dispatch(service_id)?;
+        Ok(())
     }
 
     async fn import_blocks(
@@ -254,10 +299,15 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         dst_block_ids: Vec<IdRepr>,
         name: String,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::ImportBlocks {
+        let service_id = self.table().get(&model)?.service_id;
+
+        Command::ImportBlocks {
+            inst_id: self.id(),
             blocks: dst_block_ids,
             resource_name: name,
-        })
+        }
+        .dispatch(service_id)?;
+        Ok(())
     }
 
     async fn embed_text(
@@ -268,12 +318,17 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         tokens: Vec<u32>,
         positions: Vec<u32>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::EmbedText {
+        let service_id = self.table().get(&model)?.service_id;
+
+        Command::EmbedText {
+            inst_id: self.id(),
             stream_id,
             embs: emb_ids,
             text: tokens,
             positions,
-        })
+        }
+        .dispatch(service_id)?;
+        Ok(())
     }
 
     async fn decode_token_dist(
@@ -283,11 +338,17 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         emb_ids: Vec<IdRepr>,
         dist_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::DecodeTokenDist {
+        let service_id = self.table().get(&model)?.service_id;
+
+        Command::DecodeTokenDist {
+            inst_id: self.id(),
             stream_id,
             embs: emb_ids,
             dists: dist_ids,
-        })
+        }
+        .dispatch(service_id)?;
+
+        Ok(())
     }
 
     async fn sample_top_k(
@@ -297,16 +358,20 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         dist_ids: Vec<IdRepr>,
         k: u32,
     ) -> Result<Resource<SampleTopKResult>, wasmtime::Error> {
+        let service_id = self.table().get(&model)?.service_id;
+
         let mut receivers = Vec::with_capacity(dist_ids.len());
         for i in 0..dist_ids.len() {
             let (tx, rx) = oneshot::channel();
             receivers.push(rx);
-            self.send_cmd(service::l4m::Command::SampleTopK {
+            Command::SampleTopK {
+                inst_id: self.id(),
                 stream_id,
                 dist: dist_ids[i],
                 k,
                 handle: tx,
-            })?;
+            }
+            .dispatch(service_id)?;
         }
 
         let top_k_result = SampleTopKResult {
@@ -324,14 +389,18 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         model: Resource<Model>,
         stream_id: u32,
     ) -> Result<Resource<SynchronizationResult>, wasmtime::Error> {
+        let service_id = self.table().get(&model)?.service_id;
+
         let (tx, rx) = oneshot::channel();
-        self.send_cmd(service::l4m::Command::Synchronize {
+        Command::Synchronize {
+            inst_id: self.id(),
             stream_id,
             handle: tx,
-        });
+        }
+        .dispatch(service_id)?;
 
         let result = SynchronizationResult {
-            receiver: rx,
+            receiver: Some(rx),
             done: false,
         };
 
@@ -345,14 +414,20 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         stream_id: u32,
         priority: bindings::wit::symphony::app::l4m::StreamPriority,
     ) -> Result<(), wasmtime::Error> {
-        self.send_cmd(service::l4m::Command::SetStreamPriority {
+        let service_id = self.table().get(&model)?.service_id;
+
+        Command::SetStreamPriority {
+            inst_id: self.id(),
             stream_id,
             priority: match priority {
                 bindings::wit::symphony::app::l4m::StreamPriority::High => StreamPriority::High,
                 bindings::wit::symphony::app::l4m::StreamPriority::Normal => StreamPriority::Normal,
                 bindings::wit::symphony::app::l4m::StreamPriority::Low => StreamPriority::Low,
             },
-        })
+        }
+        .dispatch(service_id)?;
+
+        Ok(())
     }
 
     async fn drop(&mut self, model: Resource<Model>) -> anyhow::Result<(), wasmtime::Error> {

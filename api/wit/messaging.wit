@@ -3,6 +3,9 @@ interface messaging {
     // Import pollable functionality from the WASI IO poll package
     use wasi:io/poll@0.2.4.{pollable};
 
+    send: func(message: string);
+    receive: func() -> subscription;
+
     broadcast: func(topic:string, message: string);
     subscribe: func(topic:string) -> subscription;
 

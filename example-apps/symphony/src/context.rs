@@ -1,7 +1,9 @@
 use crate::drafter::Drafter;
+use crate::l4m::ObjectType;
 use crate::sampler::Sampler;
 use crate::stop_condition::StopCondition;
-use crate::{drafter, l4m, l4m_async, l4m_vision, sampler, stop_condition};
+use crate::utils::{IdPool, RcIdPool};
+use crate::{drafter, l4m, l4m_async, sampler, stop_condition};
 use std::cell::RefCell;
 use std::mem;
 use std::rc::Rc;
@@ -13,14 +15,34 @@ fn get_unique_stream() -> u32 {
     STREAM.fetch_add(1, Ordering::SeqCst)
 }
 
-#[derive(Clone, Debug)]
-pub struct Context {
-    //pub parent: Option<&'a Context<'a>>,
-    inner: Rc<RefCell<Inner>>, // WASM is single-threaded, so we can use Rc<RefCell<Inner>> instead of Arc<Mutex<Inner>>
+#[derive(Debug)]
+struct ResourcePool {
+    block_ids: RcIdPool<u32>,
+    embed_ids: IdPool<u32>,
+    dist_ids: IdPool<u32>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Model {
     model: Rc<l4m::Model>,
+    block_size: usize,
+    tokenizer: Rc<l4m::Tokenizer>,
+    resources: Rc<RefCell<ResourcePool>>,
+}
+
+#[derive(Debug)]
+pub struct Context {
+    inner: Model,
+    stream: u32,
+    occupied_block_ids: Vec<u32>,
+    free_block_ids: Vec<u32>,
+    pending_token_ids: Vec<u32>,
+    processed_token_ids: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Tokenizer {
+    tokenizer: Rc<l4m::Tokenizer>,
 }
 
 impl Model {
@@ -30,8 +52,19 @@ impl Model {
 
     pub fn new(model_name: &str) -> Option<Self> {
         if let Some(model) = l4m::get_model(model_name) {
+            // Prefetch the tokenizer
+            let tokenizer = model.get_tokenizer();
+            let resources = ResourcePool {
+                block_ids: RcIdPool::new(u32::MAX),
+                embed_ids: IdPool::new(u32::MAX),
+                dist_ids: IdPool::new(u32::MAX),
+            };
+            let block_size = model.get_block_size() as usize;
             Some(Self {
                 model: Rc::new(model),
+                block_size,
+                tokenizer: Rc::new(tokenizer),
+                resources: Rc::new(RefCell::new(resources)),
             })
         } else {
             None
@@ -40,20 +73,19 @@ impl Model {
 
     pub fn create_context(&self) -> Context {
         Context {
-            inner: Rc::new(RefCell::new(Inner::new(self.model.clone()))),
+            inner: self.clone(),
+            stream: get_unique_stream(),
+            occupied_block_ids: Vec::new(),
+            free_block_ids: Vec::new(),
+            pending_token_ids: Vec::new(),
+            processed_token_ids: Vec::new(),
         }
     }
 
-    pub fn tokenize(&self, text: &str) -> Vec<u32> {
-        self.model.tokenize(text)
-    }
-
-    pub fn detokenize(&self, token_ids: &[u32]) -> String {
-        self.model.detokenize(token_ids)
-    }
-
-    pub fn get_vocabs(&self) -> Vec<Vec<u8>> {
-        self.model.get_vocabs()
+    pub fn get_tokenizer(&self) -> Tokenizer {
+        Tokenizer {
+            tokenizer: self.tokenizer.clone(),
+        }
     }
 
     pub fn get_block_size(&self) -> usize {
@@ -61,55 +93,107 @@ impl Model {
     }
 }
 
-impl Context {
-    pub fn stream(&self) -> u32 {
-        self.inner.borrow().stream
+impl Tokenizer {
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        self.tokenizer.tokenize(text)
     }
 
-    pub async fn fork(&self) -> Self {
-        let inner = self.inner.borrow();
+    pub fn decode(&self, token_ids: &[u32]) -> String {
+        self.tokenizer.detokenize(token_ids)
+    }
 
-        let (parents, inherited_block_ids) = {
-            let mut parents = inner.parents.clone();
-            parents.push(self.clone());
+    pub fn get_vocabs(&self) -> Vec<Vec<u8>> {
+        self.tokenizer.get_vocabs()
+    }
+}
 
-            let inherited_block_ids = [
-                inner.inherited_block_ids.as_slice(),
-                inner.occupied_block_ids.as_slice(),
-            ]
-            .concat();
-            (parents, inherited_block_ids)
+impl Drop for Context {
+    fn drop(&mut self) {
+        let taken = mem::take(&mut self.occupied_block_ids);
+        self.release(l4m::ObjectType::Block, &taken);
+    }
+}
+
+impl Context {
+    pub fn stream(&self) -> u32 {
+        self.stream
+    }
+
+    fn alloc(&mut self, ty: ObjectType, count: usize) -> Vec<u32> {
+        let ids = match ty {
+            ObjectType::Block => RefCell::borrow_mut(&self.inner.resources)
+                .block_ids
+                .acquire_many(count)
+                .unwrap(),
+            ObjectType::Embed => RefCell::borrow_mut(&self.inner.resources)
+                .embed_ids
+                .acquire_many(count)
+                .unwrap(),
+            ObjectType::Dist => RefCell::borrow_mut(&self.inner.resources)
+                .dist_ids
+                .acquire_many(count)
+                .unwrap(),
         };
 
-        let child_inner = Inner {
-            stream: get_unique_stream(),
-            model: inner.model.clone(),
-            parents,
-            inherited_block_ids,
-            occupied_block_ids: Vec::new(),
-            free_block_ids: Vec::new(),
-            pending_token_ids: inner.pending_token_ids.clone(),
-            processed_token_ids: inner.processed_token_ids.clone(),
-        };
+        self.inner.model.allocate(self.stream, ty, &ids);
+        ids
+    }
 
-        Self {
-            inner: Rc::new(RefCell::new(child_inner)),
+    fn release(&mut self, ty: ObjectType, ids: &[u32]) {
+        match ty {
+            ObjectType::Block => {
+                let should_be_freed = RefCell::borrow_mut(&self.inner.resources)
+                    .block_ids
+                    .release_many(ids)
+                    .unwrap();
+                self.inner
+                    .model
+                    .deallocate(self.stream, ty, &should_be_freed);
+            }
+            ObjectType::Embed => RefCell::borrow_mut(&self.inner.resources)
+                .embed_ids
+                .release_many(ids)
+                .unwrap(),
+            ObjectType::Dist => RefCell::borrow_mut(&self.inner.resources)
+                .dist_ids
+                .release_many(ids)
+                .unwrap(),
         }
     }
 
-    pub async fn fill(&mut self, text: &str) {
-        self.inner.borrow_mut().fill(text).await;
-    }
+    pub async fn fork(&self) -> Self {
+        // increase the refcount
+        self.inner
+            .resources
+            .borrow_mut()
+            .block_ids
+            .increment_rc_many(&self.occupied_block_ids);
 
-    pub async fn fill_tokens(&mut self, new_token_ids: Vec<u32>) {
-        self.inner.borrow_mut().fill_tokens(new_token_ids).await;
+        let forked = Context {
+            inner: self.inner.clone(),
+            stream: get_unique_stream(),
+            occupied_block_ids: self.occupied_block_ids.clone(),
+            free_block_ids: Vec::new(),
+            pending_token_ids: self.pending_token_ids.clone(),
+            processed_token_ids: self.processed_token_ids.clone(),
+        };
+
+        forked
+    }
+    fn grow(&mut self, num_tokens: usize) {
+        // allocate block ids
+        let num_needed_blocks = (num_tokens).div_ceil(self.inner.block_size);
+        let new_block_ids = self.alloc(ObjectType::Block, num_needed_blocks);
+
+        // append new block ids
+        self.free_block_ids.extend(new_block_ids);
     }
 
     pub async fn generate_until(&mut self, stop_str: &str, max_tokens: usize) -> String {
         let mut drafter = drafter::Empty {};
         let mut sampler = sampler::GreedySampler::new();
 
-        let stop_str_token_ids = self.inner.borrow().model.tokenize(stop_str);
+        let stop_str_token_ids = self.inner.tokenizer.tokenize(stop_str);
 
         let mut stop_condition = stop_condition::any(
             stop_condition::Until::new(stop_str_token_ids),
@@ -119,123 +203,15 @@ impl Context {
         self.generate(&mut drafter, &mut sampler, &mut stop_condition)
             .await
     }
-    //
-    // pub async fn generate_stream_until(
-    //     &mut self,
-    //     stop_str: &str,
-    //     max_tokens: usize,
-    // ) -> impl Stream<Item = u32> {
-    //     let drafter = drafter::Empty {};
-    //     let sampler = sampler::GreedySampler::new();
-    //
-    //     let stop_condition = stop_condition::any(
-    //         stop_condition::Until::new(&stop_str),
-    //         stop_condition::Length::new(max_tokens),
-    //     );
-    //
-    //     self.generate_stream(drafter, sampler, stop_condition).await
-    // }
-    //
-    // async fn generate_stream<D, S, C>(
-    //     &mut self,
-    //     mut drafter: D,
-    //     mut sampler: S,
-    //     mut stop_condition: C,
-    // ) -> impl Stream<Item = u32>
-    // where
-    //     D: Drafter + 'static,
-    //     S: Sampler + 'static,
-    //     C: StopCondition + 'static,
-    // {
-    //     let (tx, rx) = mpsc::unbounded_channel();
-    //     let mut self_cloned = self.clone();
-    //     tokio::task::spawn_local(async move {
-    //         self_cloned
-    //             .generate(&mut drafter, &mut sampler, &mut stop_condition, Some(tx))
-    //             .await;
-    //     });
-    //     UnboundedReceiverStream::new(rx)
-    // }
-
-    pub async fn generate<D: Drafter, S: Sampler, C: StopCondition>(
-        &mut self,
-        drafter: &mut D,
-        sampler: &mut S,
-        stop_condition: &mut C,
-        //stream: Option<UnboundedSender<u32>>,
-    ) -> String {
-        self.inner
-            .borrow_mut()
-            .generate(drafter, sampler, stop_condition)
-            .await
-    }
-}
-
-#[derive(Debug)]
-struct Inner {
-    pub stream: u32,
-    pub model: Rc<l4m::Model>,
-    pub parents: Vec<Context>, // just for memory management for inherited blocks. So that they are not deallocated until all children are done.
-    pub inherited_block_ids: Vec<u32>,
-    pub occupied_block_ids: Vec<u32>,
-    pub free_block_ids: Vec<u32>,
-    pub pending_token_ids: Vec<u32>,
-    pub processed_token_ids: Vec<u32>,
-}
-
-impl Drop for Inner {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
-impl Inner {
-    pub fn new(model: Rc<l4m::Model>) -> Self {
-        // allocate block ids
-        let stream = get_unique_stream();
-
-        Self {
-            stream,
-            model,
-            parents: Vec::new(),
-            inherited_block_ids: Vec::new(),
-            occupied_block_ids: Vec::new(),
-            free_block_ids: Vec::new(),
-            pending_token_ids: Vec::new(),
-            processed_token_ids: Vec::new(),
-        }
-    }
-
-    pub fn grow(&mut self, num_tokens: usize) {
-        // allocate block ids
-        let num_needed_blocks = (num_tokens as u32).div_ceil(self.model.get_block_size());
-        let new_block_ids = self.model.allocate_blocks(self.stream, num_needed_blocks);
-
-        // append new block ids
-        self.free_block_ids.extend(new_block_ids);
-    }
-
-    pub fn clear(&mut self) {
-        // deallocate all blocks
-        self.model
-            .deallocate_blocks(self.stream, &self.occupied_block_ids);
-        self.model
-            .deallocate_blocks(self.stream, &self.free_block_ids);
-
-        self.occupied_block_ids.clear();
-        self.free_block_ids.clear();
-        self.pending_token_ids.clear();
-    }
 
     pub async fn fill(&mut self, text: &str) {
-        // to satisfy the borrow checker
-        let new_token_ids = self.model.tokenize(text);
+        let new_token_ids = self.inner.tokenizer.tokenize(text);
 
         self.fill_tokens(new_token_ids).await;
     }
 
     pub async fn fill_tokens(&mut self, new_token_ids: Vec<u32>) {
-        let block_size = self.model.get_block_size() as usize;
+        let block_size = self.inner.block_size;
 
         // tokenize the text
 
@@ -256,15 +232,14 @@ impl Inner {
         assert_eq!(token_ids.len() % block_size, 0);
         ////////
 
-        let pos_offset =
-            (self.inherited_block_ids.len() + self.occupied_block_ids.len()) * block_size;
+        let pos_offset = self.occupied_block_ids.len() * block_size;
         let position_ids =
             (pos_offset as u32..(pos_offset + token_ids.len()) as u32).collect::<Vec<u32>>();
 
-        let embed_ids = self
+        let embed_ids = self.alloc(ObjectType::Embed, token_ids.len());
+
+        self.inner
             .model
-            .allocate_embeds(self.stream, token_ids.len() as u32);
-        self.model
             .embed_text(self.stream, &embed_ids, &token_ids, &position_ids);
 
         // ensure we have enough blocks
@@ -280,29 +255,23 @@ impl Inner {
             self.occupied_block_ids
                 .push(self.free_block_ids.pop().unwrap());
 
-            let ctx_block_ids = [
-                self.inherited_block_ids.as_slice(),
-                self.occupied_block_ids.as_slice(),
-            ]
-            .concat();
-
-            self.model.fill_block(
+            self.inner.model.fill_block(
                 self.stream,
                 *self.occupied_block_ids.last().unwrap(),
-                &ctx_block_ids,
+                &self.occupied_block_ids,
                 &embed_ids[offset..offset + block_size],
                 &[],
             );
         }
 
         // Free embeds
-        self.model.deallocate_embeds(self.stream, &embed_ids);
+        self.release(ObjectType::Embed, &embed_ids);
 
         self.processed_token_ids.extend(token_ids);
     }
 
     pub async fn fill_image(&mut self, image_blob: &[u8]) {
-        l4m_vision::embed_image(&self.model, self.stream, &[], image_blob);
+        //l4m_vision::embed_image(&self.model, self.stream, &[], image_blob);
     }
 
     pub async fn generate<D: Drafter, S: Sampler, C: StopCondition>(
@@ -314,7 +283,7 @@ impl Inner {
     ) -> String {
         //let until_token_ids = l4m::tokenize(until);
 
-        let block_size = self.model.get_block_size() as usize;
+        let block_size = self.inner.block_size;
         // the seed must not be empty
         assert!(!self.pending_token_ids.is_empty());
 
@@ -323,17 +292,16 @@ impl Inner {
         if self.free_block_ids.is_empty() {
             self.grow(block_size);
         }
-        let pos_offset =
-            (self.inherited_block_ids.len() + self.occupied_block_ids.len()) * block_size;
+        let pos_offset = self.occupied_block_ids.len() * block_size;
         let mut working_block_id = self.free_block_ids.pop().unwrap();
         self.occupied_block_ids.push(working_block_id);
 
         //println!("block_size: {}", block_size);
 
         // L4M objects
-        let input_block_embeds = self.model.allocate_embeds(self.stream, block_size as u32);
-        let output_block_embeds = self.model.allocate_embeds(self.stream, block_size as u32);
-        let next_dists = self.model.allocate_dists(self.stream, block_size as u32);
+        let input_block_embeds = self.alloc(ObjectType::Embed, block_size);
+        let output_block_embeds = self.alloc(ObjectType::Embed, block_size);
+        let next_dists = self.alloc(ObjectType::Dist, block_size);
 
         // Tokens that have been generated in the working block
         let mut processed_token_ids = Vec::new();
@@ -379,24 +347,18 @@ impl Inner {
             let offset_last_token = processing_token_ids.len() - 1;
             let valid_len = combined_token_ids.len();
 
-            self.model.embed_text(
+            self.inner.model.embed_text(
                 self.stream,
                 &input_block_embeds[offset_prev..offset_prev + valid_len],
                 &combined_token_ids,
                 &combined_position_ids,
             );
 
-            let ctx_block_ids = [
-                self.inherited_block_ids.as_slice(),
-                self.occupied_block_ids.as_slice(),
-            ]
-            .concat();
-
             // "Full" fill_block
-            self.model.fill_block(
+            self.inner.model.fill_block(
                 self.stream,
                 working_block_id,
-                &ctx_block_ids,
+                &self.occupied_block_ids,
                 &input_block_embeds[..offset_prev + valid_len],
                 &output_block_embeds[..offset_prev + valid_len],
             );
@@ -408,14 +370,14 @@ impl Inner {
             // println!("processing_token_ids: {:?}", &processing_token_ids);
 
             // let's sample the next token
-            self.model.decode_token_dist(
+            self.inner.model.decode_token_dist(
                 self.stream,
                 &output_block_embeds[offset_prev + offset_last_token..offset_prev + valid_len],
                 &next_dists[offset_prev + offset_last_token..offset_prev + valid_len],
             );
 
             let sampled = l4m_async::sample_top_k(
-                self.model.clone(),
+                self.inner.model.clone(),
                 self.stream,
                 next_dists[offset_prev + offset_last_token..offset_prev + valid_len].to_vec(),
                 32,
@@ -520,83 +482,12 @@ impl Inner {
             if stop_condition.should_stop(&generated_token_ids) {
                 break;
             }
-
-            //
-            // let ctx_block_ids = [
-            //     self.inherited_block_ids.as_slice(),
-            //     self.occupied_block_ids.as_slice(),
-            // ]
-            // .concat();
-            //
-            // l4m::fill_block(
-            //     self.stream,
-            //     working_block_id,
-            //     &ctx_block_ids,
-            //     &input_block_embeds[..processing_token_ids.len()],
-            //     &output_block_embeds[..processing_token_ids.len()],
-            // );
-            //
-            // // let's sample the next token
-            // l4m::decode_token_dist(
-            //     self.stream,
-            //     slice::from_ref(&output_block_embeds[processing_token_ids.len() - 1]),
-            //     slice::from_ref(&next_dist),
-            // );
-            //
-            // let sampled = l4m_async::sample_top_k(self.stream, vec![next_dist], 32).await;
-            //
-            // let (next_token_ids, next_token_logits) = &sampled[0];
-            //
-            // let next_token_id = sampler.sample(next_token_ids, &next_token_logits);
-            //
-            // //let next_token_id = next_token_ids[0];
-            // let next_position_id = processing_position_ids.last().unwrap() + 1;
-            //
-            // generated_token_ids.push(next_token_id);
-            //
-            // // send the token id to the parent stream
-            // if let Some(stream) = stream.as_ref() {
-            //     stream.send(next_token_id).await.unwrap();
-            // }
-            //
-            // // if this was the last block,
-            // if processing_token_ids.len() == block_size {
-            //     // get the new working block
-            //     if self.free_block_ids.is_empty() {
-            //         self.grow(block_size);
-            //     }
-            //
-            //     working_block_id = self.free_block_ids.pop().unwrap();
-            //     self.occupied_block_ids.push(working_block_id);
-            //     self.processed_token_ids.extend(&processing_token_ids);
-            //
-            //     processing_position_ids.clear();
-            //     processing_token_ids.clear();
-            // }
-            //
-            // processing_token_ids.push(next_token_id);
-            // processing_position_ids.push(next_position_id);
-            //
-            // // check if
-            // if stop_condition.should_stop(&generated_token_ids) {
-            //     break;
-            // }
-            //
-            // // embed the next token
-            // l4m::embed_text(
-            //     self.stream,
-            //     slice::from_ref(&input_block_embeds[processing_token_ids.len() - 1]),
-            //     &[next_token_id],
-            //     slice::from_ref(&processing_position_ids[processing_token_ids.len() - 1]),
-            // );
         }
 
         // free the resources
-        self.model
-            .deallocate_embeds(self.stream, &input_block_embeds);
-        self.model
-            .deallocate_embeds(self.stream, &output_block_embeds);
-        self.model.deallocate_dists(self.stream, &next_dists);
+        self.release(ObjectType::Embed, &input_block_embeds);
+        self.release(ObjectType::Embed, &output_block_embeds);
+        self.release(ObjectType::Dist, &next_dists);
 
         // pop the last block
         self.free_block_ids
@@ -606,7 +497,7 @@ impl Inner {
         self.pending_token_ids.append(&mut processing_token_ids);
 
         // decode the generated tokens
-        let result = self.model.detokenize(&generated_token_ids);
+        let result = self.inner.tokenizer.detokenize(&generated_token_ids);
 
         result
     }

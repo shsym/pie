@@ -35,8 +35,8 @@ impl Command {
 pub struct Messaging {
     tx: UnboundedSender<(String, String)>,
     event_loop_handle: tokio::task::JoinHandle<()>,
-    subscriptions: Arc<DashMap<String, Vec<(SubscriptionId, mpsc::Sender<String>)>>>,
-    subscription_id_pool: IdPool<SubscriptionId>,
+    subs: Arc<DashMap<String, Vec<(SubscriptionId, mpsc::Sender<String>)>>>,
+    sub_id_pool: IdPool<SubscriptionId>,
 }
 
 impl Messaging {
@@ -48,8 +48,8 @@ impl Messaging {
         Messaging {
             tx,
             event_loop_handle,
-            subscriptions,
-            subscription_id_pool: IdPool::new(SubscriptionId::MAX),
+            subs: subscriptions,
+            sub_id_pool: IdPool::new(SubscriptionId::MAX),
         }
     }
 
@@ -83,7 +83,7 @@ impl Messaging {
         }
     }
 }
-
+//#[async_trait]
 impl Service for Messaging {
     type Command = Command;
 
@@ -99,10 +99,10 @@ impl Service for Messaging {
                 sub_id,
             } => {
                 // Acquire a new subscription id.
-                let id = self.subscription_id_pool.acquire().unwrap();
+                let id = self.sub_id_pool.acquire().unwrap();
 
                 // Insert the new subscriber into the map.
-                self.subscriptions
+                self.subs
                     .entry(topic)
                     .or_insert_with(Vec::new)
                     .push((id, sender));
@@ -111,17 +111,17 @@ impl Service for Messaging {
                 let _ = sub_id.send(id).ok();
             }
             Command::Unsubscribe { topic, sub_id } => {
-                if let Some(mut subscribers) = self.subscriptions.get_mut(&topic) {
+                if let Some(mut subscribers) = self.subs.get_mut(&topic) {
                     // Remove the subscriber with the matching id.
                     subscribers.retain(|(s, _)| *s != sub_id);
 
                     // Remove the topic entirely if there are no more subscribers.
                     if subscribers.is_empty() {
-                        self.subscriptions.remove(&topic);
+                        self.subs.remove(&topic);
                     }
                 }
                 // Release the subscription id back to the pool.
-                self.subscription_id_pool.release(sub_id).unwrap();
+                self.sub_id_pool.release(sub_id).unwrap();
             }
         }
     }
