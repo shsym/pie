@@ -315,7 +315,7 @@ impl Connection {
                             if let Some(_) = state.instance_chans.remove(&instance_id) {
                                 owned_instance_ids.retain(|id| id != &instance_id);
 
-                                let cmd = ConnectionCommand::Send(ServerMessage::ProgramTerminated { instance_id:instance_id.to_string(), reason: "User request".to_string() });
+                                let cmd = ConnectionCommand::Send(ServerMessage::ProgramTerminated { instance_id:instance_id.to_string(), reason });
 
                                 writer_tx.send(cmd).await?;
                             }

@@ -1,5 +1,5 @@
 use std::time::Instant;
-use symphony::{Context, Run, sampler, stop_condition};
+use symphony::{Run, sampler, stop_condition};
 
 use std::collections::HashMap;
 use symphony::drafter::Drafter;

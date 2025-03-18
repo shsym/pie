@@ -66,18 +66,13 @@ pub struct ServiceInstaller {
 }
 
 impl ServiceInstaller {
-    pub fn new(listen_addr: &str) -> Self {
+    pub fn new() -> Self {
         let builder = Self {
             maps: HashMap::new(),
             channels: Vec::new(),
         };
-        builder.add_builtin_services(listen_addr)
-    }
-
-    fn add_builtin_services(mut self, listen_addr: &str) -> Self {
-        self.add("runtime", Runtime::new())
-            .add("server", Server::new(listen_addr))
-            .add("messaging", Messaging::new())
+        //builder.add_builtin_services(listen_addr)
+        builder
     }
 
     pub fn add<T>(mut self, name: &str, mut driver: T) -> Self

@@ -288,7 +288,7 @@ where
     }
 
     fn listen(&self, protocol_idx: u8, tx: mpsc::Sender<Vec<u8>>) {
-        let mut dispatchers = self.event_dispatchers.blocking_lock();
+        let mut dispatchers = self.event_dispatchers.try_lock().unwrap();
         if (protocol_idx as usize) < dispatchers.len() {
             dispatchers[protocol_idx as usize] = Some(tx);
         } else {
