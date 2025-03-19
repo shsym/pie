@@ -71,7 +71,7 @@ pub enum Command {
     },
 
     LaunchInstance {
-        hash: String,
+        program_hash: String,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
     },
 
@@ -152,7 +152,10 @@ impl Service for Runtime {
                 }
             }
 
-            Command::LaunchInstance { hash, event } => {
+            Command::LaunchInstance {
+                program_hash: hash,
+                event,
+            } => {
                 let instance_id = self.start_program(&hash).await.unwrap();
                 event.send(Ok(instance_id)).unwrap();
             }
@@ -168,7 +171,7 @@ impl Service for Runtime {
                 instance_id,
                 message,
             } => server::Command::Send {
-                inst: instance_id.clone(),
+                inst_id: instance_id.clone(),
                 message: message.clone(),
             }
             .dispatch()
@@ -278,8 +281,8 @@ impl Runtime {
     pub async fn terminate_program(&self, instance_id: InstanceId, reason: String) {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
-            server::Command::Detach {
-                inst: instance_id.clone(),
+            server::Command::DetachInstance {
+                inst_id: instance_id.clone(),
                 reason,
             }
             .dispatch()
@@ -322,15 +325,15 @@ impl Runtime {
 
             match run_func.call_async(&mut store, ()).await {
                 Ok((Ok(()),)) => {
-                    println!("Instance {instance_id} finished normally");
+                    //println!("Instance {instance_id} finished normally");
                     Ok(())
                 }
                 Ok((Err(runtime_err),)) => {
-                    eprintln!("Instance {instance_id} returned an error");
+                    //eprintln!("Instance {instance_id} returned an error");
                     Err(RuntimeError::Other(runtime_err))
                 }
                 Err(call_err) => {
-                    eprintln!("Instance {instance_id} call error: {call_err}");
+                    //eprintln!("Instance {instance_id} call error: {call_err}");
                     Err(RuntimeError::Other(format!("Call error: {call_err}")))
                 }
             }
@@ -338,18 +341,17 @@ impl Runtime {
         .await;
 
         if let Err(err) = result {
-            //println!("Instance {instance_id} failed: {err}");
-            server::Command::Detach {
-                inst: instance_id.clone(),
+            println!("Instance {instance_id} failed: {err}");
+            server::Command::DetachInstance {
+                inst_id: instance_id.clone(),
                 reason: format!("{err}"),
             }
             .dispatch()
             .ok();
         } else {
-            //println!("Instance {instance_id} finished normally");
-            server::Command::Detach {
-                inst: instance_id.clone(),
-                reason: format!("instance norally finished"),
+            server::Command::DetachInstance {
+                inst_id: instance_id.clone(),
+                reason: format!("instance normally finished"),
             }
             .dispatch()
             .ok();

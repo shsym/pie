@@ -36,10 +36,10 @@ pub enum BackendError {
 
 /// The backend trait used for both real and simulated backends.
 pub trait Backend: Clone + Send + Sync + 'static {
-    fn protocols(&self) -> &[String];
+    fn supported_protocols(&self) -> &[String];
 
-    fn get_protocol_idx(&self, protocol: &str) -> Result<u8, BackendError> {
-        self.protocols()
+    fn protocol_index(&self, protocol: &str) -> Result<u8, BackendError> {
+        self.supported_protocols()
             .iter()
             .position(|p| p == protocol)
             .map(|idx| idx as u8)
@@ -49,7 +49,7 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn send(&self, protocol_idx: u8, payload: Vec<u8>) -> Result<(), BackendError>;
 
     /// Registers a listener (an event dispatcher) for a given protocol index.
-    fn listen(&self, protocol_idx: u8, tx: mpsc::Sender<Vec<u8>>);
+    async fn register_listener(&self, protocol_idx: u8, tx: mpsc::Sender<Vec<u8>>);
 }
 
 /// Implementation using ZeroMQ as transport.
@@ -57,7 +57,7 @@ pub trait Backend: Clone + Send + Sync + 'static {
 pub struct ZmqBackend {
     protocols: Vec<String>,
     command_tx: UnboundedSender<(u8, Vec<u8>)>,
-    event_dispatchers: Arc<Mutex<Vec<Option<mpsc::Sender<Vec<u8>>>>>>,
+    event_listeners: Arc<Mutex<Vec<Option<mpsc::Sender<Vec<u8>>>>>>,
     event_loop_handle: Arc<JoinHandle<()>>,
 }
 
@@ -87,7 +87,10 @@ impl ZmqBackend {
         let pb_response = pb_bindings::Response::decode(response_frame.as_ref());
         let protocols = match pb_response {
             Ok(resp) => {
-                println!("Handshake successful");
+                println!(
+                    "ZMQ backend handshake successful, supported protocols: {:?}",
+                    resp.protocols
+                );
                 resp.protocols
             }
             Err(_) => {
@@ -106,7 +109,7 @@ impl ZmqBackend {
         Ok(ZmqBackend {
             protocols,
             command_tx,
-            event_dispatchers,
+            event_listeners: event_dispatchers,
             event_loop_handle: Arc::new(event_loop_handle),
         })
     }
@@ -182,7 +185,7 @@ impl ZmqBackend {
 }
 
 impl Backend for ZmqBackend {
-    fn protocols(&self) -> &[String] {
+    fn supported_protocols(&self) -> &[String] {
         &self.protocols
     }
 
@@ -192,8 +195,8 @@ impl Backend for ZmqBackend {
             .map_err(|_| BackendError::ChannelClosed)
     }
 
-    fn listen(&self, protocol_idx: u8, tx: mpsc::Sender<Vec<u8>>) {
-        let mut dispatchers = self.event_dispatchers.blocking_lock();
+    async fn register_listener(&self, protocol_idx: u8, tx: mpsc::Sender<Vec<u8>>) {
+        let mut dispatchers = self.event_listeners.lock().await;
         if (protocol_idx as usize) < dispatchers.len() {
             dispatchers[protocol_idx as usize] = Some(tx);
         } else {
@@ -236,7 +239,7 @@ where
         ));
 
         Self {
-            protocols,
+            protocols: protocols,
             command_tx,
             event_dispatchers,
             event_loop_handle: Arc::new(event_loop_handle),
@@ -277,7 +280,7 @@ impl<F> Backend for SimulatedBackend<F>
 where
     F: Simulate + 'static,
 {
-    fn protocols(&self) -> &[String] {
+    fn supported_protocols(&self) -> &[String] {
         &self.protocols
     }
 
@@ -287,8 +290,8 @@ where
             .map_err(|_| BackendError::ChannelClosed)
     }
 
-    fn listen(&self, protocol_idx: u8, tx: mpsc::Sender<Vec<u8>>) {
-        let mut dispatchers = self.event_dispatchers.try_lock().unwrap();
+    async fn register_listener(&self, protocol_idx: u8, tx: mpsc::Sender<Vec<u8>>) {
+        let mut dispatchers = self.event_dispatchers.lock().await;
         if (protocol_idx as usize) < dispatchers.len() {
             dispatchers[protocol_idx as usize] = Some(tx);
         } else {

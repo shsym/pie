@@ -42,13 +42,13 @@ impl<B> Ping<B>
 where
     B: Backend,
 {
-    pub fn new(backend: B) -> Self {
+    pub async fn new(backend: B) -> Self {
         let protocol_id = backend
-            .get_protocol_idx(PROTOCOL)
+            .protocol_index(PROTOCOL)
             .expect("Failed to get protocol index");
 
         let (tx, rx) = mpsc::channel(1000);
-        backend.listen(protocol_id, tx);
+        backend.register_listener(protocol_id, tx).await;
 
         let event_table = Arc::new(DashMap::new());
         let event_loop_handle = tokio::spawn(Self::event_loop(rx, event_table.clone()));
@@ -75,7 +75,9 @@ where
             if let Some((_, event)) = event_table.remove(&correlation_id) {
                 match event {
                     Event::Pong(sender) => {
-                        sender.send(pong.message).unwrap();
+                        // should be ok, not unwrap.
+                        // the inst may have dropped even before the pong is received
+                        sender.send(pong.message).ok();
                     }
                 }
             }

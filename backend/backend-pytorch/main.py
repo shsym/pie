@@ -106,13 +106,15 @@ def main_run():
     print("Server listening on tcp://*:8888")
 
     connected_clients = {}
-    protocols = ["l4m", "l4m_vision", "ping"]
+    protocols = ["l4m", "l4m-vision", "ping"]
 
     while True:
         # ROUTER sockets receive multipart messages.
         # Expected format: [client_identity, empty_frame, payload]
         frames = router.recv_multipart()
         client_identity = frames[0]
+
+        # print("received", frames)
 
         # Check if an empty frame is present. If so, payload is at index 2.
 
@@ -124,8 +126,8 @@ def main_run():
                 # send an error message back to the client
                 continue
 
-            protocol_idx_raw = frames[1]  # should be a single byte
-            protocol_idx = int.from_bytes(protocol_idx_raw, byteorder="little")
+            protocol_raw = frames[1]  # should be a single byte
+            protocol_idx = int.from_bytes(protocol_raw, byteorder="little")
 
             if protocol_idx >= len(protocols):
                 print("Invalid protocol:", protocol_idx)
@@ -149,11 +151,11 @@ def main_run():
                     # print("Sending reply back to the client.")
                     # Send reply back to the client.
                     # Include the client identity and an empty frame to maintain the envelope.
-                    router.send_multipart([client_identity, reply_payload])
+                    router.send_multipart([client_identity, protocol_raw, reply_payload])
 
 
 
-            elif protocol == "l4m_vision":
+            elif protocol == "l4m-vision":
 
                 request = l4m_vision_pb2.Request()
                 request.ParseFromString(payload)
@@ -167,7 +169,7 @@ def main_run():
                     message="Pong:" + ping.message
                 ).SerializeToString()
 
-                router.send_multipart([client_identity, pong])
+                router.send_multipart([client_identity, protocol_raw, pong])
 
 
         else:
@@ -190,6 +192,8 @@ def main_run():
 
             # Serialize the response
             payload = response.SerializeToString()
+
+            connected_clients.update({client_identity: True})
 
             # send the response back to the client
             router.send_multipart([client_identity, payload])

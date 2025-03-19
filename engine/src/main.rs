@@ -15,37 +15,49 @@ mod runtime;
 mod server;
 mod tokenizer;
 mod utils;
+
 //
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 
-use crate::client::Client;
+use crate::client::{Client, hash_program};
 use crate::l4m::L4m;
 use crate::messaging::Messaging;
 use crate::ping::Ping;
 use crate::runtime::Runtime;
 use crate::server::{Server, ServerMessage};
 use crate::service::ServiceInstaller;
+use colored::Colorize;
 use std::fs;
-use std::time::Duration;
 
 const PROGRAM_CACHE_DIR: &str = "./program_cache";
 //
+// Define a simple macro for client-side logging.
+macro_rules! log_user {
+    ($($arg:tt)*) => {
+        println!("{}", format!("[User] {}", format_args!($($arg)*)).bright_blue());
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 1) Ensure the cache directory exists
     fs::create_dir_all(PROGRAM_CACHE_DIR).context("Failed to create program cache directory")?;
 
-    let l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
-    let ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
+    //let l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
+    //let ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
+
+    let backend = backend::ZmqBackend::bind("tcp://gimlab.org:8888").await?;
+
+    //return Ok(());
 
     let runtime = Runtime::new();
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
 
     let server = Server::new("127.0.0.1:9000");
     let messaging = Messaging::new();
-    let l4m = L4m::new(l4m_backend).await;
-    let ping = Ping::new(ping_backend);
+    let l4m = L4m::new(backend.clone()).await;
+    let ping = Ping::new(backend).await;
 
     l4m::set_available_models(["llama3"]);
 
@@ -68,70 +80,45 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn dummy_client() -> anyhow::Result<()> {
-    // Adjust path as needed:
-    let wasm_path =
-        PathBuf::from("../example-apps/target/wasm32-wasip2/release/parallel_generation.wasm");
+    let program_path =
+        PathBuf::from("../example-apps/target/wasm32-wasip2/release/simple_decoding.wasm");
     let server_uri = "ws://127.0.0.1:9000";
 
-    // 1) Create and connect the client
     let mut client = Client::connect(server_uri).await?;
 
-    // 2) Read local file and compute BLAKE3
-    let wasm_bytes = fs::read(&wasm_path)?;
-    let file_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
-    println!("[User] Program file hash: {}", file_hash);
+    let program_blob = fs::read(&program_path)?;
+    let program_hash = hash_program(&program_blob);
 
-    // 3) Query existence
-    match client.query_existence(&file_hash).await? {
-        ServerMessage::QueryResponse { hash, exists } => {
-            println!(
-                "[User] query_existence response: hash={}, exists={}",
-                hash, exists
-            );
+    log_user!("Program file hash: {}", program_hash);
 
-            // 4) If not present, upload
-            if !exists {
-                println!("[User] Program not found on server, uploading now...");
-                client.upload_program(&wasm_bytes, &file_hash).await?;
-            } else {
-                println!("[User] Program already exists on server, skipping upload.");
+    // If program is not present, upload it
+    if !client.program_exists(&program_hash).await? {
+        log_user!("Program not found on server, uploading now...");
+
+        client.upload_program(&program_blob).await?;
+
+        log_user!("Program uploaded successfully!");
+    }
+
+    let mut instance = client.launch_instance(&program_hash).await?;
+    log_user!("Instance {} launched.", instance.id());
+
+    instance.send("Hello from Rust client - event #1").await?;
+    instance.send("Another event - event #2").await?;
+
+    while let Ok((event, message)) = instance.recv().await {
+        match event.as_str() {
+            "terminated" => {
+                log_user!("Instance terminated. Reason: {}", message);
+                break;
+            }
+            _ => {
+                log_user!("Received message: {}", message);
             }
         }
-        ServerMessage::Error { error } => {
-            eprintln!("[User] query_existence got error: {}", error);
-        }
-        _ => {}
     }
 
-    // 5) Start the program
-    if let Some(instance_id) = client.start_program(&file_hash).await? {
-        println!("[User] Program launched with instance_id = {}", instance_id);
-
-        // 6) Send a couple of events
-        client.send_event(
-            &instance_id,
-            "Hello from Rust client - event #1".to_string(),
-        )?;
-        client.send_event(&instance_id, "Another event #2".to_string())?;
-
-        // Wait a bit to let any "program_event" messages come back
-        //tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        // Drain the queue of messages
-        while let Ok(Some(msg)) =
-            tokio::time::timeout(Duration::from_millis(100), client.wait_for_next_message()).await
-        {
-            println!("[User] Received async event: {:?}", msg);
-        }
-
-        // 7) Terminate the program
-        //client.terminate_program(&instance_id).await?;
-    } else {
-        println!("[User] Program launch failed or was not recognized.");
-    }
-
-    // 8) Close the connection
     client.close().await?;
-    println!("[User] Client connection closed.");
+    log_user!("Client connection closed.");
     Ok(())
 }

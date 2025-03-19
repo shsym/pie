@@ -373,7 +373,7 @@ impl L4m {
         let (event_tx, event_rx) = mpsc::channel(1000);
         let (scheduler_tx, scheduler_rx) = mpsc::channel(1000);
 
-        backend.listen(0, event_tx);
+        backend.register_listener(0, event_tx).await;
         let event_table = Arc::new(DashMap::new());
         let event_loop_handle = tokio::spawn(Self::event_loop(event_rx, event_table.clone()));
 
@@ -900,7 +900,7 @@ where
             .iter()
             .map(|protoc| {
                 backend
-                    .get_protocol_idx(protoc)
+                    .protocol_index(protoc)
                     .expect("Failed to get protocol index")
             })
             .collect::<Vec<u8>>();
