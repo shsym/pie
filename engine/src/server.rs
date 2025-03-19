@@ -1,4 +1,5 @@
 use crate::instance::Id as InstanceId;
+use crate::messaging::dispatch_u2i;
 use crate::runtime::RuntimeError;
 use crate::service::{Service, ServiceError};
 use crate::utils::IdPool;
@@ -378,7 +379,6 @@ impl Client {
         self.inst_owned.retain(|&id| id != inst_id);
 
         if let Some(_) = self.state.instance_chans.remove(&inst_id) {
-
             self.send_inst_event(inst_id, "terminated".to_string(), reason)
                 .await;
         }
@@ -502,12 +502,10 @@ impl Client {
     async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.inst_owned.contains(&inst_id) {
-                messaging::Command::Broadcast {
+                dispatch_u2i(messaging::PushPullCommand::Push {
                     topic: inst_id.to_string(),
                     message,
-                }
-                .dispatch()
-                .unwrap();
+                });
             }
         }
     }

@@ -473,7 +473,7 @@ impl bindings::wit::symphony::app::l4m::HostTokenizer for InstanceState {
 }
 
 impl bindings::wit::symphony::app::l4m::HostSampleTopKResult for InstanceState {
-    async fn subscribe(
+    async fn pollable(
         &mut self,
         this: Resource<SampleTopKResult>,
     ) -> Result<Resource<DynPollable>, wasmtime::Error> {
@@ -499,7 +499,7 @@ impl bindings::wit::symphony::app::l4m::HostSampleTopKResult for InstanceState {
 }
 
 impl bindings::wit::symphony::app::l4m::HostSynchronizationResult for InstanceState {
-    async fn subscribe(
+    async fn pollable(
         &mut self,
         this: Resource<SynchronizationResult>,
     ) -> Result<Resource<DynPollable>, wasmtime::Error> {

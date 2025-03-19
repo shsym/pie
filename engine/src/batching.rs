@@ -159,6 +159,10 @@ where
             batch_queues_by_group: HashMap::new(),
         }
     }
+    
+    pub fn has_pending_items(&self) -> bool {
+        !self.pending_items_by_stream.is_empty()
+    }
 
     pub fn push(&mut self, stream: S, item: T, now: Instant) {
         self.pending_items_by_stream

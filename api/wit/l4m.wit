@@ -92,14 +92,14 @@ interface l4m {
     // Resource representing the result of the sample-top-k function
     resource sample-top-k-result {
         // Subscribes to the sample result, returning a pollable object
-        subscribe: func() -> pollable;
+        pollable: func() -> pollable;
 
         // Retrieves the sample result as an optional list of tuples; returns None if not ready
         get: func() -> option<list<tuple<list<u32>, list<f32>>>>; // None if not ready
     }
 
     resource synchronization-result {
-        subscribe: func() -> pollable;
+        pollable: func() -> pollable;
         get: func() -> option<bool>; // None if not ready
     }
 }

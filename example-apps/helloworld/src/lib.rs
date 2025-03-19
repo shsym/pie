@@ -5,13 +5,8 @@ async fn main() -> Result<(), String> {
     let inst_id = symphony::runtime::get_instance_id();
     let version = symphony::runtime::get_version();
     println!(
-        "[{inst_id}] I am a WASM module running in the Symphony ({version}) runtime!",
-        inst_id = inst_id,
-        version = version
+        "I am an instance (id: {}) running in the Symphony runtime (version: {}) !",
+        inst_id, version
     );
-
-    symphony::messaging::send("Hello world!!");
-    symphony::messaging::send("Have a great day!");
-
     Ok(())
 }

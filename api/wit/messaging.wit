@@ -4,15 +4,19 @@ interface messaging {
     use wasi:io/poll@0.2.4.{pollable};
 
     send: func(message: string);
-    receive: func() -> subscription;
+    receive: func() -> receive-result;
 
     broadcast: func(topic:string, message: string);
     subscribe: func(topic:string) -> subscription;
 
-    resource subscription {
-        poll: func() -> pollable;
-        receive: func() -> option<string>;
-        unsubscribe: func();
+    resource receive-result {
+        pollable: func() -> pollable;
+        get: func() -> option<string>; // None if not ready
     }
 
+    resource subscription {
+        pollable: func() -> pollable;
+        get: func() -> option<string>;
+        unsubscribe: func();
+    }
 }

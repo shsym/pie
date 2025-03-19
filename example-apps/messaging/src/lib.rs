@@ -1,17 +1,25 @@
+use symphony::Result;
+
 #[symphony::main]
-async fn main() -> Result<(), String> {
-    println!("Hello World!!");
+async fn main() -> Result<()> {
+    println!("Let's chat!");
 
-    let inst_id = symphony::runtime::get_instance_id();
-    let version = symphony::runtime::get_version();
-    println!(
-        "[{inst_id}] I am a WASM module running in the Symphony ({version}) runtime!",
-        inst_id = inst_id,
-        version = version
-    );
+    for _ in 0..3 {
+        let s = symphony::messaging_async::receive().await;
+        println!("{}", s);
+    }
 
-    symphony::messaging::send("Hello world!!");
-    symphony::messaging::send("Have a great day!");
+    let responses = [
+        "I'm doing well, thank you!",
+        "I'm feeling great today!",
+        "I'm doing fantastic!",
+    ];
+
+    for i in 0..3 {
+        symphony::messaging::send(responses[i]);
+    }
+
+    println!("It was nice chatting with you. Bye!");
 
     Ok(())
 }

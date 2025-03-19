@@ -820,16 +820,22 @@ impl L4m {
         let mut sch = CommandScheduler::new(backend, event_table);
 
         loop {
-            match timeout(Duration::from_micros(50), rx.recv()).await {
-                // A command arrived within 20ms:
+            let res = if sch.has_pending_command() {
+                // With pending tasks, wait up to 50µs for a new command.
+                timeout(Duration::from_micros(50), rx.recv()).await
+            } else {
+                // Without pending tasks, wait indefinitely.
+                Ok(rx.recv().await)
+            };
+
+            match res {
                 Ok(Some((stream, cmd))) => {
                     sch.submit(stream, cmd, Instant::now());
                     sch.update(Instant::now()).await;
                 }
-                // The channel closed:
-                Ok(None) => break,
-                // No command received within 20ms; time to call submit:
+                Ok(None) => break, // The channel closed.
                 Err(_) => {
+                    // Timeout. Still need to flush pending commands.
                     sch.update(Instant::now()).await;
                 }
             }
@@ -916,6 +922,10 @@ where
 
     fn submit(&mut self, stream: Stream, cmd: Command, now: Instant) {
         self.cmd_batcher.push(stream, cmd, now);
+    }
+
+    fn has_pending_command(&self) -> bool {
+        self.cmd_batcher.has_pending_items()
     }
 
     async fn update(&mut self, now: Instant) {

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use crate::client::{Client, hash_program};
 use crate::l4m::L4m;
-use crate::messaging::Messaging;
+use crate::messaging::{PubSub, PushPull};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
 use crate::server::Server;
@@ -39,8 +39,12 @@ macro_rules! log_user {
     }
 }
 
+//use console_subscriber;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    //console_subscriber::init();
+
     // 1) Ensure the cache directory exists
     fs::create_dir_all(PROGRAM_CACHE_DIR).context("Failed to create program cache directory")?;
 
@@ -55,7 +59,8 @@ async fn main() -> anyhow::Result<()> {
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
 
     let server = Server::new("127.0.0.1:9000");
-    let messaging = Messaging::new();
+    let messaging_inst2inst = PubSub::new();
+    let messaging_user2inst = PushPull::new();
     let l4m = L4m::new(backend.clone()).await;
     let ping = Ping::new(backend).await;
 
@@ -65,7 +70,8 @@ async fn main() -> anyhow::Result<()> {
     let _ = Controller::new()
         .add("runtime", runtime)
         .add("server", server)
-        .add("messaging", messaging)
+        .add("messaging-inst2inst", messaging_inst2inst)
+        .add("messaging-user2inst", messaging_user2inst)
         .add("llama3", l4m)
         .add("ping", ping)
         .install();
@@ -81,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn dummy_client() -> anyhow::Result<()> {
     let program_path =
-        PathBuf::from("../example-apps/target/wasm32-wasip2/release/helloworld.wasm");
+        PathBuf::from("../example-apps/target/wasm32-wasip2/release/simple_decoding.wasm");
     let server_uri = "ws://127.0.0.1:9000";
 
     let mut client = Client::connect(server_uri).await?;
@@ -103,8 +109,12 @@ async fn dummy_client() -> anyhow::Result<()> {
     let mut instance = client.launch_instance(&program_hash).await?;
     log_user!("Instance {} launched.", instance.id());
 
-    instance.send("Hello from Rust client - event #1").await?;
-    instance.send("Another event - event #2").await?;
+    instance.send("event #1: Hello from Rust client").await?;
+    instance.send("event #2: Another event").await?;
+    instance.send("event #3: Another event").await?;
+    //instance.send("event #4: Another event").await?;
+
+    //instance.send("event #3: Last message").await?;
 
     while let Ok((event, message)) = instance.recv().await {
         match event.as_str() {

@@ -1,6 +1,7 @@
 mod context;
 pub mod drafter;
 pub mod l4m_async;
+pub mod messaging_async;
 pub mod sampler;
 pub mod stop_condition;
 mod utils;
@@ -26,6 +27,7 @@ pub use crate::bindings::{
     symphony::app::runtime,
 };
 pub use crate::context::Model;
+pub use anyhow::Result;
 
 pub fn available_models() -> Vec<String> {
     Model::available_models()

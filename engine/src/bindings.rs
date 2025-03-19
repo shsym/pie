@@ -13,6 +13,7 @@ mod wit {
         with: {
             "wasi:io/poll": wasmtime_wasi::bindings::io::poll,
             "symphony:app/messaging/subscription": messaging::Subscription,
+            "symphony:app/messaging/receive-result": messaging::ReceiveResult,
             "symphony:app/l4m/model": l4m::Model,
             "symphony:app/l4m/tokenizer": l4m::Tokenizer,
             "symphony:app/l4m/sample-top-k-result": l4m::SampleTopKResult,
