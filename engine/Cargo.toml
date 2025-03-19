@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.95"
 blake3 = "1.5.5"
-tokio = { version = "1.44.1", features = ["full"] }
+tokio = { version = "1.44.1", features = ["full"] } # ["full", "tracing"]
 tokio-tungstenite = "0.26.2"
 wasmtime = "30.0.2" #{ path = "../../wasmtime/crates/wasmtime" }
 wasmtime-wasi = "30.0.2"# { path = "../../wasmtime/crates/wasi" }

@@ -2,8 +2,7 @@ import app
 import app.exports
 import app.imports
 
-import app.imports.system as system
-import app.imports.inference as inference
+import app.imports.messaging as messaging
 
 class Run(app.exports.Run):
 
@@ -11,5 +10,4 @@ class Run(app.exports.Run):
 
         #print("Hello, World!! from python")
 
-        system.ask("Python asks!!!")
-        system.tell("Py tells how it is!!")
+        messaging.send("hi!")

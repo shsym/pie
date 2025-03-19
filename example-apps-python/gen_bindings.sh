@@ -1,1 +1,1 @@
-componentize-py -d ../spi/app/wit -w app bindings new_app
+componentize-py --wit-path ../api/wit --world app bindings new_app

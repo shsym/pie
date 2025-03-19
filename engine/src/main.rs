@@ -87,7 +87,9 @@ async fn main() -> anyhow::Result<()> {
 
 async fn dummy_client() -> anyhow::Result<()> {
     let program_path =
-        PathBuf::from("../example-apps/target/wasm32-wasip2/release/simple_decoding.wasm");
+        PathBuf::from("../example-apps/target/wasm32-wasip2/release/helloworld.wasm");
+    //let program_path = PathBuf::from("../example-apps-python/helloworld/helloworld.wasm");
+
     let server_uri = "ws://127.0.0.1:9000";
 
     let mut client = Client::connect(server_uri).await?;
