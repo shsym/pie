@@ -25,8 +25,8 @@ use crate::l4m::L4m;
 use crate::messaging::Messaging;
 use crate::ping::Ping;
 use crate::runtime::Runtime;
-use crate::server::{Server, ServerMessage};
-use crate::service::ServiceInstaller;
+use crate::server::Server;
+use crate::service::Controller;
 use colored::Colorize;
 use std::fs;
 
@@ -62,13 +62,13 @@ async fn main() -> anyhow::Result<()> {
     l4m::set_available_models(["llama3"]);
 
     // Install all services
-    ServiceInstaller::new()
+    let _ = Controller::new()
         .add("runtime", runtime)
         .add("server", server)
         .add("messaging", messaging)
         .add("llama3", l4m)
         .add("ping", ping)
-        .setup();
+        .install();
 
     // TEST: spawn a dummy client
     tokio::spawn(dummy_client());
@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn dummy_client() -> anyhow::Result<()> {
     let program_path =
-        PathBuf::from("../example-apps/target/wasm32-wasip2/release/simple_decoding.wasm");
+        PathBuf::from("../example-apps/target/wasm32-wasip2/release/helloworld.wasm");
     let server_uri = "ws://127.0.0.1:9000";
 
     let mut client = Client::connect(server_uri).await?;

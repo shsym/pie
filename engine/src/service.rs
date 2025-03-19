@@ -52,12 +52,12 @@ pub trait Service: Send {
 
 pub type AnyCommand = Box<dyn Any + Send + Sync>;
 
-pub struct ServiceInstaller {
+pub struct Controller {
     maps: HashMap<String, usize>,
     channels: Vec<UnboundedSender<AnyCommand>>,
 }
 
-impl ServiceInstaller {
+impl Controller {
     pub fn new() -> Self {
         let builder = Self {
             maps: HashMap::new(),
@@ -85,7 +85,7 @@ impl ServiceInstaller {
         self
     }
 
-    pub fn setup(self) {
+    pub fn install(self) {
         let dispatcher = ServiceDispatcher {
             maps: self.maps,
             channels: self.channels,

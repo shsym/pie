@@ -1,8 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["helloworld", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "symphony", "parallel-generation", "function-calling", "multimodal"]
-
-
+members = ["symphony", "symphony-macros", "helloworld", "messaging", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "parallel-generation", "function-calling", "multimodal", ]
 
 [workspace.dependencies]
 wit-bindgen = "0.40.0"

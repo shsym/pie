@@ -9,3 +9,4 @@ wstd = "0.5.3"
 trait-variant = "0.1.2"
 wasi = "0.14.2+wasi-0.2.4"
 num-traits = "0.2.19"
+symphony-macros = { path = "../symphony-macros" }

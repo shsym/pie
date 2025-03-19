@@ -10,7 +10,7 @@ use wasmtime_wasi::{
     IoView, OutputStream, Pollable, StdoutStream, StreamError, StreamResult, WasiCtx, WasiView,
     async_trait,
 };
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView}; // add this at the top of your file
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 pub type Id = Uuid;
 
@@ -19,11 +19,6 @@ pub struct InstanceState {
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
-}
-
-type ResourceId = u32;
-pub struct ReadyResources {
-    sample_top_k: DashMap<ResourceId, Vec<(Vec<u32>, Vec<f32>)>>,
 }
 
 impl IoView for InstanceState {
@@ -49,11 +44,9 @@ impl WasiHttpView for InstanceState {
 impl InstanceState {
     pub async fn new(id: Uuid) -> Self {
         let mut builder = WasiCtx::builder();
-        builder.inherit_network();
+        builder.inherit_network(); // TODO: Replace with socket_addr_check later.
         builder.stdout(Stdout(shorten_uuid(&id)));
         builder.stderr(Stderr(shorten_uuid(&id)));
-        // send construct cmd
-        //cmd_buffer.send((id, Command::CreateInstance));
 
         InstanceState {
             id,
@@ -67,12 +60,10 @@ impl InstanceState {
         self.id
     }
 }
-//
-// impl Drop for InstanceState {
-//     fn drop(&mut self) {
-//         self.cmd_buffer.send((self.id, Command::DestroyInstance));
-//     }
-// }
+
+////////////////////////
+// Helper functions for making stdout and stderr more readable.
+
 fn shorten_uuid(uuid: &Uuid) -> String {
     // Convert the UUID to a string and split it by '-' to take the first segment.
     uuid.to_string().split('-').next().unwrap().to_string()

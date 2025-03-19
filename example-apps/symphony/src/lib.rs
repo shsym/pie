@@ -5,6 +5,7 @@ pub mod sampler;
 pub mod stop_condition;
 mod utils;
 
+pub use symphony_macros::main;
 pub use wstd;
 pub mod bindings {
     wit_bindgen::generate!({
@@ -21,7 +22,8 @@ pub mod bindings {
 
 pub use crate::bindings::{
     export, exports::symphony::app::run::Guest as RunSync, symphony::app::l4m,
-    symphony::app::l4m_vision, symphony::app::ping, symphony::app::runtime, symphony::app::messaging
+    symphony::app::l4m_vision, symphony::app::messaging, symphony::app::ping,
+    symphony::app::runtime,
 };
 pub use crate::context::Model;
 
@@ -44,17 +46,6 @@ where
 {
     fn run() -> Result<(), String> {
         let result = wstd::runtime::block_on(async { T::run().await });
-
-        // let runtime = tokio::runtime::Builder::new_current_thread()
-        //     .enable_all()
-        //     .build()
-        //     .unwrap();
-        //
-        // let local = tokio::task::LocalSet::new();
-        // let result = local.block_on(&runtime, T::run());
-        // Run the async main function inside the runtime
-        //let result = runtime.block_on(T::run());
-
         if let Err(e) = result {
             return Err(format!("{:?}", e));
         }
@@ -71,7 +62,7 @@ macro_rules! main_sync {
 }
 
 #[macro_export]
-macro_rules! main {
+macro_rules! main_async {
     ($app:ident) => {
         type _App = symphony::App<$app>;
         symphony::export!(_App with_types_in symphony::bindings);

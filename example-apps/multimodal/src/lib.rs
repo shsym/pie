@@ -1,6 +1,5 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use image::{DynamicImage, load_from_memory};
-use symphony::Run;
 use symphony::wstd::http::{Client, Method, Request};
 use symphony::wstd::io::{AsyncRead, copy, empty};
 
@@ -28,19 +27,12 @@ pub async fn fetch_image(url: &str) -> Result<DynamicImage> {
     // Convert the buffer into a UTF-8 string.
     Ok(img)
 }
-struct Multimodal;
+#[symphony::main]
+async fn main() -> Result<()> {
+    // read example.com
 
-impl Run for Multimodal {
-    async fn run() -> Result<(), String> {
-        // read example.com
+    let url = "https://www.ilankelman.org/stopsigns/australia.jpg";
+    let image = fetch_image(url).await?;
 
-        let url = "https://www.ilankelman.org/stopsigns/australia.jpg";
-        let image = fetch_image(url)
-            .await
-            .map_err(|e| format!("Failed to fetch {}: {}", url, e))?;
-
-        Ok(())
-    }
+    Ok(())
 }
-
-symphony::main!(Multimodal);

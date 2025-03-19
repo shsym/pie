@@ -1,14 +1,14 @@
 use llguidance::earley::SlicedBiasComputer;
 use llguidance::{
-    Constraint, ParserFactory,
     api::TopLevelGrammar,
     toktrie::{InferenceCapabilities, TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv},
+    Constraint, ParserFactory,
 };
 use std::sync::Arc;
 use std::time::Instant;
 use symphony::drafter::Empty;
 use symphony::sampler::Sampler;
-use symphony::{Run, l4m};
+use symphony::{l4m, Run};
 
 struct ConstrainedDecoding;
 
@@ -182,47 +182,42 @@ impl Sampler for ConstrainedSampler {
     }
 }
 
-impl Run for ConstrainedDecoding {
-    async fn run() -> Result<(), String> {
-        let start = Instant::now();
+#[symphony::main]
+async fn main() -> Result<(), String> {
+    let start = Instant::now();
 
-        let mut drafter = Empty {};
-        let mut sampler = ConstrainedSampler::new(
-            JSON_GRAMMAR,
-            "<|end_of_text|>",
-            Some("<|begin_of_text|>"),
-            None,
-            None,
-            Some("<|eot_id|>"),
-        );
+    let mut drafter = Empty {};
+    let mut sampler = ConstrainedSampler::new(
+        JSON_GRAMMAR,
+        "<|end_of_text|>",
+        Some("<|begin_of_text|>"),
+        None,
+        None,
+        Some("<|eot_id|>"),
+    );
 
-        let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
+    let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
 
+    let mut stop_condition = symphony::stop_condition::any(
+        symphony::stop_condition::Until::new(model.tokenize("<|eot_id|>")),
+        symphony::stop_condition::Length::new(128),
+    );
 
-        let mut stop_condition = symphony::stop_condition::any(
-            symphony::stop_condition::Until::new(model.tokenize("<|eot_id|>")),
-            symphony::stop_condition::Length::new(128),
-        );
-
-
-        let mut ctx = model.create_context();
-        ctx.fill("<|begin_of_text|>").await;
-        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
-        ctx.fill(
-            "<|start_header_id|>user<|end_header_id|>\n\n Generate some random json data<|eot_id|>",
-        )
+    let mut ctx = model.create_context();
+    ctx.fill("<|begin_of_text|>").await;
+    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
+    ctx.fill(
+        "<|start_header_id|>user<|end_header_id|>\n\n Generate some random json data<|eot_id|>",
+    )
+    .await;
+    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
         .await;
-        ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
-            .await;
 
-        let output_text = ctx
-            .generate(&mut drafter, &mut sampler, &mut stop_condition, None)
-            .await;
+    let output_text = ctx
+        .generate(&mut drafter, &mut sampler, &mut stop_condition, None)
+        .await;
 
-        println!("Output: {:?} (elapsed: {:?})", output_text, start.elapsed());
+    println!("Output: {:?} (elapsed: {:?})", output_text, start.elapsed());
 
-        Ok(())
-    }
+    Ok(())
 }
-
-symphony::main!(ConstrainedDecoding);

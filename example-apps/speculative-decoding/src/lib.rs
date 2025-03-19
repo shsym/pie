@@ -1,5 +1,5 @@
 use std::time::Instant;
-use symphony::{Run, sampler, stop_condition};
+use symphony::{sampler, stop_condition};
 
 use std::collections::HashMap;
 use symphony::drafter::Drafter;
@@ -225,44 +225,36 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> Drafter
     }
 }
 
-struct SpeculativeDecoding;
+#[symphony::main]
+async fn main() -> Result<(), String> {
+    let start = Instant::now();
 
-// create a default stream constant
+    // TODO: Prepopulate the cache table with some entries
+    let max_num_outputs = 128;
 
-impl Run for SpeculativeDecoding {
-    async fn run() -> Result<(), String> {
-        let start = Instant::now();
+    let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
+    let tokenizer = model.get_tokenizer();
 
-        // TODO: Prepopulate the cache table with some entries
-        let max_num_outputs = 128;
+    let mut ctx = model.create_context();
+    ctx.fill("<|begin_of_text|>").await;
+    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
+    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>").await;
+    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
+        .await;
 
-        let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
-        let tokenizer = model.get_tokenizer();
-        
-        
-        let mut ctx = model.create_context();
-        ctx.fill("<|begin_of_text|>").await;
-        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
-        ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>").await;
-        ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
-            .await;
+    let mut drafter = CacheDrafter::<1, 1, 16>::new();
+    let mut sampler = sampler::GreedySampler::new();
 
-        let mut drafter = CacheDrafter::<1, 1, 16>::new();
-        let mut sampler = sampler::GreedySampler::new();
+    let mut stop_condition = stop_condition::any(
+        stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
+        stop_condition::Length::new(max_num_outputs),
+    );
 
-        let mut stop_condition = stop_condition::any(
-            stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
-            stop_condition::Length::new(max_num_outputs),
-        );
+    let output = ctx
+        .generate(&mut drafter, &mut sampler, &mut stop_condition)
+        .await;
 
-        let output = ctx
-            .generate(&mut drafter, &mut sampler, &mut stop_condition)
-            .await;
+    println!("Out {:?}, elapsed: {:?}", output, start.elapsed());
 
-        println!("Out {:?}, elapsed: {:?}", output, start.elapsed());
-
-        Ok(())
-    }
+    Ok(())
 }
-
-symphony::main!(SpeculativeDecoding);
