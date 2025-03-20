@@ -12,7 +12,6 @@ interface l4m {
     enum object-type {
         block,  // Block object
         embed,  // Embed object
-        dist,   // Distribution object
     }
 
     enum stream-priority {
@@ -64,11 +63,9 @@ interface l4m {
         // Embeds text into the model using embed IDs, tokens, and their positions
         embed-text: func(stream-id: stream-id, emb-ids: list<object-id>, tokens: list<u32>, positions: list<u32>);
 
-        // Decodes the token distribution using embed IDs and distribution IDs
-        decode-token-dist: func(stream-id: stream-id, emb-ids: list<object-id>, dist-ids: list<object-id>);
-
+        // Decodes the token distribution using embed IDs
         // Samples the top k elements from a token distribution; returns a sample-top-k-result resource
-        sample-top-k: func(stream-id: stream-id, dist-ids: list<object-id>, k: u32) -> sample-top-k-result;
+        sample-top-k: func(stream-id: stream-id, emb-ids: list<object-id>, k: u32) -> sample-top-k-result;
 
         // Wait for the stream
         synchronize: func(stream-id: stream-id) -> synchronization-result;

@@ -2,16 +2,14 @@ use std::time::Instant;
 
 #[symphony::main]
 async fn main() -> Result<(), String> {
-    let start = Instant::now();
     //let mut prev = start; // track the time of the previous token
+    let start = Instant::now();
 
-    let max_num_outputs = 256;
+    let max_num_outputs = 32;
 
     let available_models = symphony::available_models();
 
-    println!("Available models: {:?}", available_models);
-
-    let model = symphony::Model::new(symphony::available_models().first().unwrap()).unwrap();
+    let model = symphony::Model::new(available_models.first().unwrap()).unwrap();
     let tokenizer = model.get_tokenizer();
 
     let mut ctx = model.create_context();

@@ -129,10 +129,6 @@ impl Context {
                 .embed_ids
                 .acquire_many(count)
                 .unwrap(),
-            ObjectType::Dist => RefCell::borrow_mut(&self.inner.resources)
-                .dist_ids
-                .acquire_many(count)
-                .unwrap(),
         };
 
         self.inner.model.allocate(self.stream, ty, &ids);
@@ -154,10 +150,7 @@ impl Context {
                 .embed_ids
                 .release_many(ids)
                 .unwrap(),
-            ObjectType::Dist => RefCell::borrow_mut(&self.inner.resources)
-                .dist_ids
-                .release_many(ids)
-                .unwrap(),
+
         }
     }
 
@@ -301,7 +294,6 @@ impl Context {
         // L4M objects
         let input_block_embeds = self.alloc(ObjectType::Embed, block_size);
         let output_block_embeds = self.alloc(ObjectType::Embed, block_size);
-        let next_dists = self.alloc(ObjectType::Dist, block_size);
 
         // Tokens that have been generated in the working block
         let mut processed_token_ids = Vec::new();
@@ -370,16 +362,16 @@ impl Context {
             // println!("processing_token_ids: {:?}", &processing_token_ids);
 
             // let's sample the next token
-            self.inner.model.decode_token_dist(
-                self.stream,
-                &output_block_embeds[offset_prev + offset_last_token..offset_prev + valid_len],
-                &next_dists[offset_prev + offset_last_token..offset_prev + valid_len],
-            );
+            // self.inner.model.decode_token_dist(
+            //     self.stream,
+            //     &output_block_embeds[offset_prev + offset_last_token..offset_prev + valid_len],
+            //     &next_dists[offset_prev + offset_last_token..offset_prev + valid_len],
+            // );
 
             let sampled = l4m_async::sample_top_k(
                 self.inner.model.clone(),
                 self.stream,
-                next_dists[offset_prev + offset_last_token..offset_prev + valid_len].to_vec(),
+                output_block_embeds[offset_prev + offset_last_token..offset_prev + valid_len].to_vec(),
                 32,
             )
             .await;
@@ -487,7 +479,6 @@ impl Context {
         // free the resources
         self.release(ObjectType::Embed, &input_block_embeds);
         self.release(ObjectType::Embed, &output_block_embeds);
-        self.release(ObjectType::Dist, &next_dists);
 
         // pop the last block
         self.free_block_ids

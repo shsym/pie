@@ -5,7 +5,7 @@ use crate::object::{IdRepr, ObjectManager, ObjectType, group_consecutive_ids};
 use crate::service::{Service, ServiceError};
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::IdPool;
-use crate::{backend, runtime, service, tokenizer};
+use crate::{backend, batching, runtime, service, tokenizer};
 use dashmap::DashMap;
 use prost::Message;
 use rand::Rng;
@@ -207,17 +207,10 @@ pub enum Command {
         positions: Vec<u32>,
     },
 
-    DecodeTokenDist {
-        inst_id: InstanceId,
-        stream_id: LocalStreamId,
-        embs: Vec<IdRepr>,
-        dists: Vec<IdRepr>,
-    },
-
     SampleTopK {
         inst_id: InstanceId,
         stream_id: LocalStreamId,
-        dist: IdRepr,
+        emb_id: IdRepr,
         k: u32,
         handle: oneshot::Sender<(Vec<u32>, Vec<f32>)>,
     },
@@ -258,7 +251,6 @@ enum BatchGroup {
     CopyBlock,
     MaskBlock,
     EmbedText,
-    DecodeTokenDist,
     SampleTopK,
     Synchronize,
     EmbedImage,
@@ -267,17 +259,26 @@ enum BatchGroup {
 impl Batchable<BatchGroup> for Command {
     fn strategy(&self) -> Box<dyn BatchingStrategy> {
         match self {
-            Command::GetInfo { .. } => KorTStrategy::immediate().into_box(),
-            Command::Allocate { .. } => KorTStrategy::eager().into_box(),
-            Command::Deallocate { .. } => KorTStrategy::eager().into_box(),
-            Command::FillBlock { .. } => KorTStrategy::eager().into_box(),
-            Command::CopyBlock { .. } => KorTStrategy::eager().into_box(),
-            Command::MaskBlock { .. } => KorTStrategy::eager().into_box(),
-            Command::EmbedText { .. } => KorTStrategy::eager().into_box(),
-            Command::DecodeTokenDist { .. } => KorTStrategy::eager().into_box(),
-            Command::SampleTopK { .. } => KorTStrategy::eager().into_box(),
-            Command::Synchronize { .. } => KorTStrategy::immediate().into_box(),
-            Command::EmbedImage { .. } => KorTStrategy::eager().into_box(),
+            Command::GetInfo { .. } => batching::immediate(),
+            Command::Allocate { .. } => batching::eager(),
+            Command::Deallocate { .. } => batching::eager(),
+            Command::FillBlock { .. } => {
+                //
+                //batching::eager()
+                batching::k_or_t(Duration::from_millis(12), 24, None)
+            }
+            Command::CopyBlock { .. } => batching::eager(),
+            Command::MaskBlock { .. } => batching::eager(),
+            Command::EmbedText { .. } => batching::eager(),
+
+            Command::SampleTopK { .. } => {
+                //
+                //
+                batching::eager()
+                //batching::k_or_t(Duration::from_millis(8), 24, None)
+            }
+            Command::Synchronize { .. } => batching::eager(),
+            Command::EmbedImage { .. } => batching::eager(),
             _ => unreachable!(),
         }
     }
@@ -291,7 +292,6 @@ impl Batchable<BatchGroup> for Command {
             Command::CopyBlock { .. } => BatchGroup::CopyBlock,
             Command::MaskBlock { .. } => BatchGroup::MaskBlock,
             Command::EmbedText { .. } => BatchGroup::EmbedText,
-            Command::DecodeTokenDist { .. } => BatchGroup::DecodeTokenDist,
             Command::SampleTopK { .. } => BatchGroup::SampleTopK,
             Command::Synchronize { .. } => BatchGroup::Synchronize,
             Command::EmbedImage { .. } => BatchGroup::EmbedImage,
@@ -310,7 +310,6 @@ pub enum Event {
 pub enum ManagedTypes {
     KvBlock,
     TokenEmb,
-    TokenDist,
 }
 
 impl ObjectType for ManagedTypes {
@@ -318,7 +317,6 @@ impl ObjectType for ManagedTypes {
         match self {
             ManagedTypes::KvBlock => true,
             ManagedTypes::TokenEmb => false,
-            ManagedTypes::TokenDist => false,
         }
     }
 
@@ -326,7 +324,6 @@ impl ObjectType for ManagedTypes {
         match self {
             ManagedTypes::KvBlock => false,
             ManagedTypes::TokenEmb => true,
-            ManagedTypes::TokenDist => true,
         }
     }
 }
@@ -410,9 +407,6 @@ impl L4m {
         objects
             .set_capacity(ManagedTypes::TokenEmb, info.num_embeddings as IdRepr)
             .unwrap();
-        objects
-            .set_capacity(ManagedTypes::TokenDist, info.num_distributions as IdRepr)
-            .unwrap();
 
         let driver = Self {
             scheduler: scheduler_tx,
@@ -430,11 +424,7 @@ impl L4m {
     async fn destroy(&mut self, inst_id: InstanceId) {
         let mut cmds = Vec::new();
 
-        for ty in [
-            ManagedTypes::KvBlock,
-            ManagedTypes::TokenEmb,
-            ManagedTypes::TokenDist,
-        ] {
+        for ty in [ManagedTypes::KvBlock, ManagedTypes::TokenEmb] {
             cmds.push(Command::Deallocate {
                 inst_id,
                 stream_id: 0,
@@ -705,46 +695,16 @@ impl L4m {
                 ))
             }
 
-            Command::DecodeTokenDist {
-                inst_id,
-                stream_id,
-                mut embs,
-                mut dists,
-            } => {
-                try_trap!(
-                    self.objects
-                        .translate_many(ManagedTypes::TokenEmb, inst_id, &mut embs),
-                    inst_id,
-                    "l4m::decode_token_dist failed. invalid embeddings"
-                );
-                try_trap!(
-                    self.objects
-                        .translate_many(ManagedTypes::TokenDist, inst_id, &mut dists),
-                    inst_id,
-                    "l4m::decode_token_dist failed. invalid distributions"
-                );
-
-                Some((
-                    Command::DecodeTokenDist {
-                        inst_id,
-                        stream_id,
-                        embs,
-                        dists,
-                    },
-                    Stream::new(inst_id, stream_id),
-                ))
-            }
-
             Command::SampleTopK {
                 inst_id,
                 stream_id,
-                mut dist,
+                mut emb_id,
                 k,
                 handle,
             } => {
                 try_trap!(
                     self.objects
-                        .translate(ManagedTypes::TokenDist, inst_id, &mut dist),
+                        .translate(ManagedTypes::TokenEmb, inst_id, &mut emb_id),
                     inst_id,
                     "l4m::sample_topk failed. invalid distribution"
                 );
@@ -753,7 +713,7 @@ impl L4m {
                     Command::SampleTopK {
                         inst_id,
                         stream_id,
-                        dist,
+                        emb_id,
                         k,
                         handle,
                     },
@@ -822,7 +782,7 @@ impl L4m {
         loop {
             let res = if sch.has_pending_command() {
                 // With pending tasks, wait up to 50µs for a new command.
-                timeout(Duration::from_micros(50), rx.recv()).await
+                timeout(Duration::from_micros(10), rx.recv()).await
             } else {
                 // Without pending tasks, wait indefinitely.
                 Ok(rx.recv().await)
@@ -946,7 +906,6 @@ where
             BatchGroup::CopyBlock => encode_pb_batch_copy_block(correlation_id, batch),
             BatchGroup::MaskBlock => encode_pb_batch_mask_block(correlation_id, batch),
             BatchGroup::EmbedText => encode_pb_batch_embed_text(correlation_id, batch),
-            BatchGroup::DecodeTokenDist => encode_pb_batch_decode_token_dist(correlation_id, batch),
             BatchGroup::SampleTopK => encode_pb_batch_sample_topk(correlation_id, batch),
             BatchGroup::Synchronize => {
                 let cmd = batch.into_iter().next().unwrap();
@@ -1079,7 +1038,6 @@ fn encode_pb_batch_allocate_inner(batch: Vec<Command>) -> Vec<pb_bindings::Alloc
                 let kind = match ty {
                     ManagedTypes::KvBlock => pb_bindings::ObjectKind::KvBlock,
                     ManagedTypes::TokenEmb => pb_bindings::ObjectKind::Emb,
-                    ManagedTypes::TokenDist => pb_bindings::ObjectKind::Dist,
                     _ => unreachable!(),
                 }
                 .into();
@@ -1268,41 +1226,6 @@ fn encode_pb_batch_embed_text(
     ((PROTOCOL_BASE, payload), None)
 }
 
-fn encode_pb_batch_decode_token_dist(
-    correlation_id: u32,
-    batch: Vec<Command>,
-) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
-    let mut items = Vec::new();
-    for cmd in batch {
-        match cmd {
-            Command::DecodeTokenDist {
-                inst_id,
-                stream_id,
-                embs,
-                dists,
-            } => {
-                for i in 0..embs.len() {
-                    let pb = pb_bindings::DecodeTokenDistribution {
-                        embedding_id: embs[i],
-                        distribution_id: dists[i],
-                    };
-                    items.push(pb);
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-    let cmd = pb_bindings::request::Command::DecodeTokenDistribution(
-        pb_bindings::BatchDecodeTokenDistribution { items },
-    );
-    let payload = pb_bindings::Request {
-        correlation_id,
-        command: Some(cmd),
-    }
-    .encode_to_vec();
-    ((PROTOCOL_BASE, payload), None)
-}
-
 fn encode_pb_batch_sample_topk(
     correlation_id: u32,
     batch: Vec<Command>,
@@ -1314,7 +1237,7 @@ fn encode_pb_batch_sample_topk(
             Command::SampleTopK {
                 inst_id,
                 stream_id,
-                dist,
+                emb_id: dist,
                 k,
                 handle,
             } => {

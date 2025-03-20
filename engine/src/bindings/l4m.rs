@@ -72,7 +72,6 @@ pub struct Cache {
 fn map_object_types(ty: bindings::wit::symphony::app::l4m::ObjectType) -> ManagedTypes {
     match ty {
         bindings::wit::symphony::app::l4m::ObjectType::Block => ManagedTypes::KvBlock,
-        bindings::wit::symphony::app::l4m::ObjectType::Dist => ManagedTypes::TokenDist,
         bindings::wit::symphony::app::l4m::ObjectType::Embed => ManagedTypes::TokenEmb,
     }
 }
@@ -329,44 +328,44 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         .dispatch(service_id)?;
         Ok(())
     }
-
-    async fn decode_token_dist(
-        &mut self,
-        model: Resource<Model>,
-        stream_id: u32,
-        emb_ids: Vec<IdRepr>,
-        dist_ids: Vec<IdRepr>,
-    ) -> Result<(), wasmtime::Error> {
-        let service_id = self.table().get(&model)?.service_id;
-
-        Command::DecodeTokenDist {
-            inst_id: self.id(),
-            stream_id,
-            embs: emb_ids,
-            dists: dist_ids,
-        }
-        .dispatch(service_id)?;
-
-        Ok(())
-    }
+    //
+    // async fn decode_token_dist(
+    //     &mut self,
+    //     model: Resource<Model>,
+    //     stream_id: u32,
+    //     emb_ids: Vec<IdRepr>,
+    //     dist_ids: Vec<IdRepr>,
+    // ) -> Result<(), wasmtime::Error> {
+    //     let service_id = self.table().get(&model)?.service_id;
+    //
+    //     Command::DecodeTokenDist {
+    //         inst_id: self.id(),
+    //         stream_id,
+    //         embs: emb_ids,
+    //         dists: dist_ids,
+    //     }
+    //     .dispatch(service_id)?;
+    //
+    //     Ok(())
+    // }
 
     async fn sample_top_k(
         &mut self,
         model: Resource<Model>,
         stream_id: u32,
-        dist_ids: Vec<IdRepr>,
+        emb_ids: Vec<IdRepr>,
         k: u32,
     ) -> Result<Resource<SampleTopKResult>, wasmtime::Error> {
         let service_id = self.table().get(&model)?.service_id;
 
-        let mut receivers = Vec::with_capacity(dist_ids.len());
-        for i in 0..dist_ids.len() {
+        let mut receivers = Vec::with_capacity(emb_ids.len());
+        for i in 0..emb_ids.len() {
             let (tx, rx) = oneshot::channel();
             receivers.push(rx);
             Command::SampleTopK {
                 inst_id: self.id(),
                 stream_id,
-                dist: dist_ids[i],
+                emb_id: emb_ids[i],
                 k,
                 handle: tx,
             }

@@ -9,6 +9,30 @@ pub trait BatchingStrategy: Debug + Send {
     fn batch(&mut self, now: Instant) -> usize;
 }
 
+pub fn eager() -> Box<dyn BatchingStrategy> {
+    KorTStrategy::eager().into_box()
+}
+
+pub fn immediate() -> Box<dyn BatchingStrategy> {
+    KorTStrategy::immediate().into_box()
+}
+
+pub fn k_only(min_size: usize, max_size: Option<usize>) -> Box<dyn BatchingStrategy> {
+    KorTStrategy::k_only(min_size, max_size).into_box()
+}
+
+pub fn t_only(max_wait_time: Duration) -> Box<dyn BatchingStrategy> {
+    KorTStrategy::t_only(max_wait_time).into_box()
+}
+
+pub fn k_or_t(
+    max_wait_time: Duration,
+    min_size: usize,
+    max_size: Option<usize>,
+) -> Box<dyn BatchingStrategy> {
+    KorTStrategy::k_or_t(max_wait_time, min_size, max_size).into_box()
+}
+
 /// "K-or-T" Strategy
 // 	For instance: If queue size reaches K, launch immediately; otherwise launch after T ms if K isn’t reached.
 // 	This ensures that the GPU does not stay idle for too long (bounded by T) and that short bursts of arrivals form a large enough batch to get good utilization (bounded by K).
@@ -159,7 +183,7 @@ where
             batch_queues_by_group: HashMap::new(),
         }
     }
-    
+
     pub fn has_pending_items(&self) -> bool {
         !self.pending_items_by_stream.is_empty()
     }

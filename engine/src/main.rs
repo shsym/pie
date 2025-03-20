@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     let runtime = Runtime::new();
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
 
-    let server = Server::new("127.0.0.1:9000");
+    let server = Server::new("127.0.0.1:9123");
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
     let l4m = L4m::new(backend.clone()).await;
@@ -87,13 +87,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn dummy_client() -> anyhow::Result<()> {
     let program_path =
-        PathBuf::from("../example-apps/target/wasm32-wasip2/release/helloworld.wasm");
-    //let program_path = PathBuf::from("../example-apps-python/helloworld/helloworld.wasm");
-
-    let server_uri = "ws://127.0.0.1:9000";
+        PathBuf::from("../example-apps/target/wasm32-wasip2/release/simple_decoding.wasm");
+    let server_uri = "ws://127.0.0.1:9123";
 
     let mut client = Client::connect(server_uri).await?;
-
     let program_blob = fs::read(&program_path)?;
     let program_hash = hash_program(&program_blob);
 
@@ -102,32 +99,47 @@ async fn dummy_client() -> anyhow::Result<()> {
     // If program is not present, upload it
     if !client.program_exists(&program_hash).await? {
         log_user!("Program not found on server, uploading now...");
-
         client.upload_program(&program_blob).await?;
-
         log_user!("Program uploaded successfully!");
     }
 
-    let mut instance = client.launch_instance(&program_hash).await?;
-    log_user!("Instance {} launched.", instance.id());
+    const num_instances: usize = 48;
 
-    instance.send("event #1: Hello from Rust client").await?;
-    instance.send("event #2: Another event").await?;
-    instance.send("event #3: Another event").await?;
-    //instance.send("event #4: Another event").await?;
+    // Launch 32 instances sequentially
+    let mut instances = Vec::new();
+    for i in 0..num_instances {
+        let instance = client.launch_instance(&program_hash).await?;
+        log_user!("Instance {} launched.", instance.id());
+        instances.push(instance);
+    }
 
-    //instance.send("event #3: Last message").await?;
+    // Spawn a task for each instance to handle sending and receiving concurrently.
+    let mut handles = Vec::new();
+    for mut instance in instances {
+        let handle = tokio::spawn(async move {
+            instance.send("event #1: Hello from Rust client").await?;
+            instance.send("event #2: Another event").await?;
+            instance.send("event #3: Another event").await?;
 
-    while let Ok((event, message)) = instance.recv().await {
-        match event.as_str() {
-            "terminated" => {
-                log_user!("Instance terminated. Reason: {}", message);
-                break;
+            while let Ok((event, message)) = instance.recv().await {
+                match event.as_str() {
+                    "terminated" => {
+                        log_user!("Instance {} terminated. Reason: {}", instance.id(), message);
+                        break;
+                    }
+                    _ => {
+                        log_user!("Instance {} received message: {}", instance.id(), message);
+                    }
+                }
             }
-            _ => {
-                log_user!("Received message: {}", message);
-            }
-        }
+            anyhow::Result::<()>::Ok(())
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all instance tasks to complete.
+    for handle in handles {
+        handle.await??;
     }
 
     client.close().await?;

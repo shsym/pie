@@ -52,16 +52,18 @@ class Driver:
 
     block_storage: AttentionStorage
     embed_storage: VectorStorage
-    dist_storage: VectorStorage
+    #dist_storage: VectorStorage
 
-    def __init__(self, model, storage: AttentionStorage, embed_storage: VectorStorage, dist_storage: VectorStorage):
+    def __init__(self, model, storage: AttentionStorage, embed_storage: VectorStorage):
         self.embeds = {}
         self.blocks = {}
 
         self.lm = model
         self.block_storage = storage
         self.embed_storage = embed_storage
-        self.dist_storage = dist_storage
+        #self.dist_storage = dist_storage
+
+        self.inter_fill_time = time.time()
 
     def device(self):
         return self.block_storage.ptr.device
@@ -113,22 +115,35 @@ class Driver:
         # TODO.
         ...
 
+    @torch.inference_mode()
     def decode_token_distribution(self, cmds: BatchDecodeTokenDistribution):
+        # start_time = time.time()
 
         # TODO -> make this more efficient by batching.
-        for i, cmd in enumerate(cmds.items):
-            dist = torch.softmax(self.lm.lm_head(self.embed_storage.ptr[cmd.embedding_id]), dim=-1)
-            self.dist_storage.ptr[cmd.distribution_id] = dist
+        # for i, cmd in enumerate(cmds.items):
+        #     dist = torch.softmax(self.lm.lm_head(self.embed_storage.ptr[cmd.embedding_id]), dim=-1)
+        #     self.dist_storage.ptr[cmd.distribution_id] = dist
 
+        # torch.cuda.synchronize()
+        # print(f"decode_token_distribution elapsed time {(time.time() - start_time) * 1000}ms")
+        ...
+
+    @torch.inference_mode()
     def sample_top_k_request(self, cmds: BatchSampleTopKRequest) -> BatchSampleTopKResponse:
+
+        start_time = time.time()
+
         res = []
         for i, cmd in enumerate(cmds.items):
-            dist = self.dist_storage.ptr[cmd.distribution_id]
+            dist = self.embed_storage.ptr[cmd.distribution_id]
             topk_res = torch.topk(dist, k=cmd.k)
             topk_tokens = topk_res.indices.tolist()
             topk_probs = topk_res.values.tolist()
 
             res.append(SampleTopKResponse(token_ids=topk_tokens, probabilities=topk_probs))
+
+        torch.cuda.synchronize()
+        print(f"sample_top_k_request elapsed time {(time.time() - start_time) * 1000}ms")
 
         return BatchSampleTopKResponse(items=res)
 
@@ -147,6 +162,7 @@ class Driver:
         #     print(cmd.output_embedding_ids)
 
         start_time = time.time()
+        inter_fill_elapsed_time = (start_time - self.inter_fill_time) * 1000
 
         num_blocks_per_req = [len(cmd.context_block_ids) for cmd in cmds.items]
         NUM_BLOCKS_IN_CHUNK = int(np.median(num_blocks_per_req))
@@ -274,35 +290,29 @@ class Driver:
         pt_new_position_ids = torch.as_tensor(new_position_ids, device=self.device(), dtype=torch.int32)
 
         # token ids
-        print("pt_new_q_lut", pt_new_q_lut)
-        print("pt_new_kv_lut", pt_new_kv_lut)
-        print("pt_all_kv_lut", pt_all_kv_lut)
-        print("pt_reduce_grps", pt_reduce_grps)
-        print("new_token_ids", pt_new_token_ids)
-        print("detokenized ids", tokenizer.decode(pt_new_token_ids[0]))
-        print("new_position_ids", pt_new_position_ids)
-        print("pt_masks", pt_masks)
+        # print("pt_new_q_lut", pt_new_q_lut)
+        # print("pt_new_kv_lut", pt_new_kv_lut)
+        # print("pt_all_kv_lut", pt_all_kv_lut)
+        # print("pt_reduce_grps", pt_reduce_grps)
+        # print("new_token_ids", pt_new_token_ids)
+        # print("detokenized ids", tokenizer.decode(pt_new_token_ids[0]))
+        # print("new_position_ids", pt_new_position_ids)
+        # print("pt_masks", pt_masks)
         # compute the embeddings...
         input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
 
         # inject the image embeddings -> replace with torch.scatter later
         for token_map in input_embed_postproc:
             vec_id = token_map["vec_id"]
-            print("img emb")
             input_embeds[token_map["row"], token_map["col"]].copy_(self.embed_storage.ptr[vec_id], non_blocking=True)
 
         # compute the position embeddings
         rope_cache = self.lm.rotary_emb(input_embeds, pt_new_position_ids.max().item() + 1)
 
-        torch.cuda.synchronize()
-        elapsed_time = (time.time() - start_time) * 1000
-
-        print("preproc elapsed time", elapsed_time)
-
-        start_time = time.time()
+        # torch.cuda.synchronize()
 
         with torch.cuda.device(self.device()):
-            logits = self.lm.model.forward(
+            output_embeds = self.lm.model.forward(
                 input_embeds=input_embeds,
                 kv_ptr=self.block_storage.ptr,
                 new_q_lut=pt_new_q_lut,
@@ -314,9 +324,11 @@ class Driver:
                 pos_ids=pt_new_position_ids,
             )
 
-        torch.cuda.synchronize()
-        elapsed_time = (time.time() - start_time) * 1000
-        print("fill_block elapsed time", elapsed_time)
+            # precompute the dists
+            logits = self.lm.lm_head(output_embeds)
+
+            # topk
+            # top_k = torch.topk(dists, k=50)
 
         # print(logits.shape)
         # store the logits in the output embeds  -> replace with torch.scatter later
@@ -327,3 +339,10 @@ class Driver:
             # print(token_map)
 
             self.embed_storage.ptr[vec_id].copy_(logits[token_map["row"], token_map["col"]], non_blocking=True)
+
+        torch.cuda.synchronize()
+        elapsed_time = (time.time() - start_time) * 1000
+        print(f"fill_block elapsed time {elapsed_time}ms size {output_embeds.shape}")
+        print(f"inter-fill time {inter_fill_elapsed_time}ms")
+
+        self.inter_fill_time = time.time()

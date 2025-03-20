@@ -24,7 +24,7 @@ def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | No
 
     # no pending computations on input -> do it RN (except for Fills - cannot do them in parallel) & register "pending" status on inputs & outputs.
     # ...
-    print("Handling request:", command)
+    # print("Handling request:", command)
     if command == "allocate":
         d.allocate(request.allocate)
 
@@ -57,7 +57,7 @@ def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | No
             block_size=NUM_TOKENS_IN_BLOCK,
             num_available_blocks=d.block_storage.num_blocks,
             num_available_embeddings=d.embed_storage.num_vectors,
-            num_available_distributions=d.dist_storage.num_vectors
+            num_available_distributions=0
         ))
 
     else:
@@ -69,14 +69,14 @@ def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | No
 def main_run():
     device = "cuda:0"
 
-    quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
-
+    # quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
+    # , quantization_config=quantization_config
     model = LlamaForCausalLM.from_pretrained(
-        FULL_MODEL_NAME, torch_dtype="bfloat16", device_map=device, quantization_config=quantization_config)
+        FULL_MODEL_NAME, torch_dtype="bfloat16", device_map=device)
 
     block_storage = AttentionStorage(
         num_layers=model.config.num_hidden_layers,
-        num_blocks=1000,
+        num_blocks=6000,
         num_heads=model.config.num_key_value_heads,
         block_size=NUM_TOKENS_IN_BLOCK,
         head_dim=model.config.hidden_size // model.config.num_attention_heads,
@@ -85,20 +85,20 @@ def main_run():
     )
 
     embed_storage = VectorStorage(
-        num_vectors=1000,
-        embed_dim=model.config.hidden_size,
-        dtype=torch.bfloat16,
-        device=device
-    )
-
-    dist_storage = VectorStorage(
-        num_vectors=1000,
+        num_vectors=6000,
         embed_dim=model.config.vocab_size,
         dtype=torch.bfloat16,
         device=device
     )
 
-    engine = Driver(model, block_storage, embed_storage, dist_storage)
+    # dist_storage = VectorStorage(
+    #     num_vectors=6000,
+    #     embed_dim=model.config.vocab_size,
+    #     dtype=torch.bfloat16,
+    #     device=device
+    # )
+
+    engine = Driver(model, block_storage, embed_storage)
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
@@ -216,10 +216,10 @@ def llama3_format(prompt: str, hint: str | None, system: str = "You are a helpfu
 def main_test():
     device = "cuda:0"
 
-    quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
-
+    # quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
+    # , quantization_config=quantization_config
     model = LlamaForCausalLM.from_pretrained(
-        FULL_MODEL_NAME, torch_dtype="bfloat16", device_map=device, quantization_config=quantization_config)
+        FULL_MODEL_NAME, torch_dtype="bfloat16", device_map=device)
 
     tokenizer = AutoTokenizer.from_pretrained(FULL_MODEL_NAME)
 
@@ -235,19 +235,19 @@ def main_test():
 
     embed_storage = VectorStorage(
         num_vectors=1000,
-        embed_dim=model.config.hidden_size,
-        dtype=torch.bfloat16,
-        device=device
-    )
-
-    dist_storage = VectorStorage(
-        num_vectors=1000,
         embed_dim=model.config.vocab_size,
         dtype=torch.bfloat16,
         device=device
     )
 
-    engine = Driver(model, block_storage, embed_storage, dist_storage)
+    # dist_storage = VectorStorage(
+    #     num_vectors=1000,
+    #     embed_dim=model.config.vocab_size,
+    #     dtype=torch.bfloat16,
+    #     device=device
+    # )
+
+    engine = Driver(model, block_storage, embed_storage)
 
     test_prompt = llama3_format("What is Pinon coffee? ELI 5", None)
 
