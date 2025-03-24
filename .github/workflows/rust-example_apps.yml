@@ -1,8 +1,7 @@
-name: Test Build Example-apps/helloworld
-
+name: Test Build Example-apps
 on:
-  push:
-    branches: [ main ]
+  # push:
+  #   branches: [ main ]
   pull_request:
     branches: [ main ]
 
@@ -24,5 +23,5 @@ jobs:
         run: rustup target add wasm32-wasip2
 
       - name: Build Example LIP App
-        working-directory: ./example-apps/helloworld
+        working-directory: ./example-apps
         run: cargo build --target wasm32-wasip2 --release
