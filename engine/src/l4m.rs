@@ -396,9 +396,25 @@ impl L4m {
             info.num_distributions
         );
 
-        // TODO: load the tokenizer model based on the info.model_name
-        let tokenizer = tokenizer::llama3_tokenizer("../test-tokenizer/tokenizer.model")
-            .expect("Tokenizer load failed");
+        // Try to load the tokenizer model from different paths
+        let tokenizer_paths = [
+            format!("program_cache/{}/original/tokenizer.model", info.model_name),
+            "../test-tokenizer/tokenizer.model".to_string(),
+        ];
+
+        let mut tokenizer = None;
+        for path in &tokenizer_paths {
+            match tokenizer::llama3_tokenizer(path) {
+                Ok(tok) => {
+                    tokenizer = Some(tok);
+                    println!("Successfully loaded tokenizer from {}", path);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        let tokenizer = tokenizer.expect("Failed to load tokenizer from any available path");
 
         let mut objects = ObjectManager::new();
         objects

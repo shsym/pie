@@ -1,1 +1,16 @@
-Serving system - a standalone software written in Rust
+# Serving System Engine
+
+This is a standalone software written in Rust
+
+Download the model (Llama 3.2 1B) with the following command. You should have Hugging Face CLI set up and have access to the model with git/ssh.
+```bash
+./download_tokenizer.sh
+```
+
+This will download model files into `program_cache`.
+
+Before running the engine, make sure that you have run the backend with the corresponding model compatible with the tokenizer. You can then run the engine with:
+
+```bash
+cargo run --release
+```

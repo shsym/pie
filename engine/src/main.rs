@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
     //let l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
     //let ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
 
-    let backend = backend::ZmqBackend::bind("tcp://gimlab.org:8888").await?;
+    let backend = backend::ZmqBackend::bind("tcp://127.0.0.1:8888").await?;
 
     //return Ok(());
 
