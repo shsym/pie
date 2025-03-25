@@ -27,6 +27,7 @@ use crate::ping::Ping;
 use crate::runtime::Runtime;
 use crate::server::Server;
 use crate::service::Controller;
+use clap::{Arg, Command};
 use colored::Colorize;
 use std::fs;
 
@@ -44,6 +45,20 @@ macro_rules! log_user {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     //console_subscriber::init();
+
+    // Parse command line arguments
+    let matches = Command::new("Symphony Engine")
+        .version("1.0")
+        .author("Symphony Team")
+        .about("Symphony Engine for WebAssembly programs")
+        .arg(
+            Arg::new("program")
+                .help("Name of the program to run (without extension)")
+                .default_value("simple_decoding"),
+        )
+        .get_matches();
+
+    let program_name = matches.get_one::<String>("program").unwrap();
 
     // 1) Ensure the cache directory exists
     fs::create_dir_all(PROGRAM_CACHE_DIR).context("Failed to create program cache directory")?;
@@ -76,8 +91,8 @@ async fn main() -> anyhow::Result<()> {
         .add("ping", ping)
         .install();
 
-    // TEST: spawn a dummy client
-    tokio::spawn(dummy_client());
+    // TEST: spawn a dummy client with the program name
+    tokio::spawn(dummy_client(program_name.to_string()));
 
     // wait forever
     tokio::signal::ctrl_c().await?;
@@ -85,10 +100,21 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn dummy_client() -> anyhow::Result<()> {
-    let program_path =
-        PathBuf::from("../example-apps/target/wasm32-wasip2/release/simple_decoding.wasm");
+async fn dummy_client(program_name: String) -> anyhow::Result<()> {
+    let program_path = PathBuf::from(format!(
+        "../example-apps/target/wasm32-wasip2/release/{}.wasm",
+        program_name
+    ));
+
+    // Check if the file exists
+    if !program_path.exists() {
+        log_user!("Error: Program file not found at path: {:?}", program_path);
+        return Ok(());
+    }
+
     let server_uri = "ws://127.0.0.1:9123";
+
+    log_user!("Using program: {}", program_name);
 
     let mut client = Client::connect(server_uri).await?;
     let program_blob = fs::read(&program_path)?;
