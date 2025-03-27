@@ -8,3 +8,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 symphony = { path = "../symphony" }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.9"
+rand_distr = "0.5"
