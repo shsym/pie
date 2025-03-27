@@ -265,7 +265,8 @@ impl Batchable<BatchGroup> for Command {
             Command::FillBlock { .. } => {
                 //
                 //batching::eager()
-                batching::k_or_t(Duration::from_millis(12), 24, None)
+                //batching::k_or_t(Duration::from_millis(10), 30, None)
+                batching::t_only(Duration::from_millis(5))
             }
             Command::CopyBlock { .. } => batching::eager(),
             Command::MaskBlock { .. } => batching::eager(),
@@ -275,7 +276,7 @@ impl Batchable<BatchGroup> for Command {
                 //
                 //
                 batching::eager()
-                //batching::k_or_t(Duration::from_millis(8), 24, None)
+                //batching::t_only(Duration::from_millis(1))
             }
             Command::Synchronize { .. } => batching::eager(),
             Command::EmbedImage { .. } => batching::eager(),
@@ -797,8 +798,8 @@ impl L4m {
 
         loop {
             let res = if sch.has_pending_command() {
-                // With pending tasks, wait up to 50µs for a new command.
-                timeout(Duration::from_micros(10), rx.recv()).await
+                // With pending tasks, wait up to 100µs for a new command.
+                timeout(Duration::from_micros(100), rx.recv()).await
             } else {
                 // Without pending tasks, wait indefinitely.
                 Ok(rx.recv().await)

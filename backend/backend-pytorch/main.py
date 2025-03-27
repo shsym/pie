@@ -4,6 +4,7 @@ import torch
 import zmq
 from transformers import TorchAoConfig, AutoTokenizer
 
+import config
 import l4m_pb2
 import l4m_vision_pb2
 import ping_pb2
@@ -56,7 +57,7 @@ def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | No
             model_name=MODEL_NAME,
             block_size=NUM_TOKENS_IN_BLOCK,
             num_available_blocks=d.block_storage.num_blocks,
-            num_available_embeddings=d.embed_storage.num_vectors,
+            num_available_embeddings=1000000,
             num_available_distributions=0
         ))
 
@@ -84,35 +85,51 @@ def main_run():
         device=device
     )
 
-    embed_storage = VectorStorage(
-        num_vectors=6000,
-        embed_dim=model.config.vocab_size,
+    embed_storage_p1 = VectorStorage(
+        num_vectors=7000,
+        embed_dim=config.DIST_RESOLUTION,
         dtype=torch.bfloat16,
         device=device
     )
 
+    embed_storage_p2 = VectorStorage(
+        num_vectors=7000,
+        embed_dim=config.DIST_RESOLUTION,
+        dtype=torch.long,
+        device=device
+    )
+
     # dist_storage = VectorStorage(
-    #     num_vectors=6000,
+    #     num_vectors=1000,
     #     embed_dim=model.config.vocab_size,
     #     dtype=torch.bfloat16,
     #     device=device
     # )
 
-    engine = Driver(model, block_storage, embed_storage)
+    endpoint = "tcp://*:8888"
+    #endpoint = "ipc:///tmp/zmq-ipc-example"
+
+    engine = Driver(model, block_storage, embed_storage_p1, embed_storage_p2)
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
-    router.bind("tcp://*:8888")
-    print("Server listening on tcp://*:8888")
+    # router.bind("tcp://*:8888")
+    router.bind(endpoint)
+
+    print(f"Server listening on {endpoint}")
 
     connected_clients = {}
     protocols = ["l4m", "l4m-vision", "ping"]
-
+    idle_start = time.time()
     while True:
         # ROUTER sockets receive multipart messages.
         # Expected format: [client_identity, empty_frame, payload]
+
         frames = router.recv_multipart()
+        print(f"Idle time: {(time.time() - idle_start) * 1000}ms")
+
         client_identity = frames[0]
+        start = time.time()
 
         # print("received", frames)
 
@@ -139,6 +156,7 @@ def main_run():
 
             if protocol == "l4m":
                 # Deserialize the protobuf message
+
                 request = l4m_pb2.Request()
                 request.ParseFromString(payload)
 
@@ -153,6 +171,7 @@ def main_run():
                     # Include the client identity and an empty frame to maintain the envelope.
                     router.send_multipart([client_identity, protocol_raw, reply_payload])
 
+                # print(f"elapsed time: {(time.time() - start) * 1000}ms")
 
 
             elif protocol == "l4m-vision":
@@ -161,6 +180,7 @@ def main_run():
                 request.ParseFromString(payload)
 
             elif protocol == "ping":
+
                 ping = ping_pb2.Ping()
                 ping.ParseFromString(payload)
 
@@ -170,6 +190,7 @@ def main_run():
                 ).SerializeToString()
 
                 router.send_multipart([client_identity, protocol_raw, pong])
+
 
 
         else:
@@ -197,6 +218,8 @@ def main_run():
 
             # send the response back to the client
             router.send_multipart([client_identity, payload])
+
+        idle_start = time.time()
 
 
 ###====================Test====================###
@@ -233,10 +256,17 @@ def main_test():
         device=device
     )
 
-    embed_storage = VectorStorage(
+    embed_storage_p1 = VectorStorage(
         num_vectors=1000,
-        embed_dim=model.config.vocab_size,
+        embed_dim=config.DIST_RESOLUTION,
         dtype=torch.bfloat16,
+        device=device
+    )
+
+    embed_storage_p2 = VectorStorage(
+        num_vectors=1000,
+        embed_dim=config.DIST_RESOLUTION,
+        dtype=torch.long,
         device=device
     )
 
@@ -247,7 +277,7 @@ def main_test():
     #     device=device
     # )
 
-    engine = Driver(model, block_storage, embed_storage)
+    engine = Driver(model, block_storage, embed_storage_p1, embed_storage_p2)
 
     test_prompt = llama3_format("What is Pinon coffee? ELI 5", None)
 
@@ -313,7 +343,7 @@ def main_test():
         time_end = time.time()
 
         # print the elapsed time in milliseconds
-        print(f"Elapsed time: {(time_end - time_start) * 1000:.2f}ms")
+        # print(f"Elapsed time: {(time_end - time_start) * 1000:.2f}ms")
 
     print("done!")
 

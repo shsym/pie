@@ -6,3 +6,4 @@ FULL_MODEL_NAME = "meta-llama/" + MODEL_NAME
 
 # Constants
 NUM_TOKENS_IN_BLOCK = 16
+DIST_RESOLUTION = 32

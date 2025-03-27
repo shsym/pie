@@ -75,7 +75,7 @@ impl KorTStrategy {
 
     /// Creates a queue that only uses the time threshold.
     pub fn t_only(max_wait_time: Duration) -> Self {
-        KorTStrategy::new(max_wait_time, 1, Some(usize::MAX))
+        KorTStrategy::new(max_wait_time, usize::MAX, Some(usize::MAX))
     }
 
     /// Creates a queue that batches when either the time or count threshold is met.

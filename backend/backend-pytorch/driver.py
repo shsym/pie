@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 
+import config
 from common import ceil_div
 from l4ma import AttentionStorage, VectorStorage
 from llama import LlamaForCausalLM
@@ -51,17 +52,21 @@ class Driver:
     lm: LlamaForCausalLM
 
     block_storage: AttentionStorage
-    embed_storage: VectorStorage
-    #dist_storage: VectorStorage
+    embed_storage_p1: VectorStorage
+    embed_storage_p2: VectorStorage
 
-    def __init__(self, model, storage: AttentionStorage, embed_storage: VectorStorage):
+    # dist_storage: VectorStorage
+
+    def __init__(self, model, storage: AttentionStorage, embed_storage_p1: VectorStorage, embed_storage_p2: VectorStorage):
         self.embeds = {}
         self.blocks = {}
 
         self.lm = model
         self.block_storage = storage
-        self.embed_storage = embed_storage
-        #self.dist_storage = dist_storage
+        self.embed_storage_p1 = embed_storage_p1
+        self.embed_storage_p2 = embed_storage_p2
+
+        # self.dist_storage = dist_storage
 
         self.inter_fill_time = time.time()
 
@@ -135,15 +140,17 @@ class Driver:
 
         res = []
         for i, cmd in enumerate(cmds.items):
-            dist = self.embed_storage.ptr[cmd.distribution_id]
-            topk_res = torch.topk(dist, k=cmd.k)
-            topk_tokens = topk_res.indices.tolist()
-            topk_probs = topk_res.values.tolist()
+            topk_probs = self.embed_storage_p1.ptr[cmd.distribution_id].tolist()
+            topk_tokens = self.embed_storage_p2.ptr[cmd.distribution_id].tolist()
+
+            # topk_res = torch.topk(dist, k=cmd.k)
+            # topk_tokens = topk_res.indices.tolist()
+            # topk_probs = topk_res.values.tolist()
 
             res.append(SampleTopKResponse(token_ids=topk_tokens, probabilities=topk_probs))
 
         torch.cuda.synchronize()
-        print(f"sample_top_k_request elapsed time {(time.time() - start_time) * 1000}ms")
+        #print(f"sample_top_k_request elapsed time {(time.time() - start_time) * 1000}ms")
 
         return BatchSampleTopKResponse(items=res)
 
@@ -328,7 +335,7 @@ class Driver:
             logits = self.lm.lm_head(output_embeds)
 
             # topk
-            # top_k = torch.topk(dists, k=50)
+            condensed = torch.topk(logits, k=config.DIST_RESOLUTION, sorted=True)
 
         # print(logits.shape)
         # store the logits in the output embeds  -> replace with torch.scatter later
@@ -338,11 +345,13 @@ class Driver:
             # print("vec_id", vec_id)
             # print(token_map)
 
-            self.embed_storage.ptr[vec_id].copy_(logits[token_map["row"], token_map["col"]], non_blocking=True)
+            self.embed_storage_p1.ptr[vec_id].copy_(condensed.values[token_map["row"], token_map["col"]], non_blocking=True)
+            self.embed_storage_p2.ptr[vec_id].copy_(condensed.indices[token_map["row"], token_map["col"]], non_blocking=True)
+
 
         torch.cuda.synchronize()
         elapsed_time = (time.time() - start_time) * 1000
-        print(f"fill_block elapsed time {elapsed_time}ms size {output_embeds.shape}")
-        print(f"inter-fill time {inter_fill_elapsed_time}ms")
+        #print(f"fill_block elapsed time {elapsed_time}ms size {output_embeds.shape}")
+        #print(f"inter-fill time {inter_fill_elapsed_time}ms")
 
         self.inter_fill_time = time.time()
