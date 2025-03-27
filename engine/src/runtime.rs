@@ -1,4 +1,7 @@
 use dashmap::DashMap;
+use hyper::Request;
+use hyper::server::conn::http1;
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
@@ -10,6 +13,15 @@ use crate::{bindings, server, service};
 use crate::service::{Service, ServiceError};
 use thiserror::Error;
 use tokio::sync::oneshot;
+use wasmtime::component::Resource;
+use wasmtime_wasi_http::WasiHttpView;
+use wasmtime_wasi_http::bindings::exports::wasi::http::incoming_handler::{
+    IncomingRequest, ResponseOutparam,
+};
+use wasmtime_wasi_http::bindings::http::types::Scheme;
+use wasmtime_wasi_http::body::HyperOutgoingBody;
+use wasmtime_wasi_http::io::TokioIo;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static SERVICE_ID_RUNTIME: OnceLock<usize> = OnceLock::new();
@@ -75,6 +87,12 @@ pub enum Command {
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
     },
 
+    LaunchServerInstance {
+        program_hash: String,
+        port: u32,
+        event: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+
     Trap {
         instance_id: InstanceId,
         message: String,
@@ -110,6 +128,9 @@ pub struct Runtime {
 
     /// Running instances
     running_instances: DashMap<InstanceId, InstanceHandle>,
+
+    /// Running server instances
+    running_server_instances: DashMap<InstanceId, InstanceHandle>,
 }
 
 pub struct InstanceHandle {
@@ -156,15 +177,24 @@ impl Service for Runtime {
                 program_hash: hash,
                 event,
             } => {
-                let instance_id = self.start_program(&hash).await.unwrap();
+                let instance_id = self.launch_instance(&hash).await.unwrap();
                 event.send(Ok(instance_id)).unwrap();
+            }
+
+            Command::LaunchServerInstance {
+                program_hash: hash,
+                port,
+                event,
+            } => {
+                self.launch_server_instance(&hash, port).await;
+                event.send(Ok(())).unwrap();
             }
 
             Command::Trap {
                 instance_id,
                 message,
             } => {
-                self.terminate_program(instance_id, message).await;
+                self.terminate_instance(instance_id, message).await;
             }
 
             Command::Warn {
@@ -208,6 +238,7 @@ impl Runtime {
             programs_in_memory: DashMap::new(),
             programs_in_disk: DashMap::new(),
             running_instances: DashMap::new(),
+            running_server_instances: DashMap::new(),
         }
     }
 
@@ -225,8 +256,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Actually start a program instance
-    pub async fn start_program(&self, hash: &str) -> Result<InstanceId, RuntimeError> {
+    fn get_component(&self, hash: &str) -> Result<Component, RuntimeError> {
         // 1) Make sure the `Component` is loaded in memory
         if self.programs_in_memory.get(hash).is_none() {
             // load from disk if possible
@@ -257,6 +287,13 @@ impl Runtime {
             }
         };
 
+        Ok(component)
+    }
+
+    /// Actually start a program instance
+    pub async fn launch_instance(&self, hash: &str) -> Result<InstanceId, RuntimeError> {
+        let component = self.get_component(hash)?;
+
         let instance_id = Uuid::new_v4();
 
         // 4) Build the InstanceState
@@ -277,8 +314,37 @@ impl Runtime {
         Ok(instance_id)
     }
 
+    /// Actually start a program instance
+    pub async fn launch_server_instance(
+        &self,
+        hash: &str,
+        port: u32,
+    ) -> Result<InstanceId, RuntimeError> {
+        let instance_id = Uuid::new_v4();
+        let component = self.get_component(hash)?;
+
+        // 4) Build the InstanceState
+
+        // 5) Instantiate and run in a task
+        let engine = self.engine.clone();
+        let linker = self.linker.clone();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
+
+        let join_handle = tokio::spawn(Self::launch_server(addr, component, engine, linker));
+
+        // 6) Record in the “running_instances” so we can manage it later
+        let instance_handle = InstanceHandle {
+            hash: hash.to_string(),
+            join_handle,
+        };
+        self.running_server_instances
+            .insert(instance_id, instance_handle);
+
+        Ok(instance_id)
+    }
+
     /// Terminate (abort) a running instance
-    pub async fn terminate_program(&self, instance_id: InstanceId, reason: String) {
+    pub async fn terminate_instance(&self, instance_id: InstanceId, reason: String) {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
             server::Command::DetachInstance {
@@ -289,6 +355,121 @@ impl Runtime {
             .ok();
 
             // TODO: cleanup other resources (l4m, etc.)
+        }
+    }
+
+    async fn handle_server_request(
+        engine: Engine,
+        linker: Arc<Linker<InstanceState>>,
+        component: Component,
+        req: hyper::Request<hyper::body::Incoming>,
+    ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
+        let inst_id = Uuid::new_v4();
+        let inst_state = InstanceState::new(inst_id).await;
+
+        let mut store = Store::new(&engine, inst_state);
+        let (sender, receiver) = oneshot::channel();
+
+        let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
+        let out = store.data_mut().new_response_outparam(sender)?;
+
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
+
+        let serve_export = instance
+            .get_export(&mut store, None, "wasi:http/incoming-handler")
+            .ok_or_else(|| RuntimeError::Other("No 'serve' function found".into()))?;
+
+        let handle_func_export = instance
+            .get_export(&mut store, Some(&serve_export), "handle")
+            .ok_or_else(|| RuntimeError::Other("No 'handle' function found".into()))?;
+
+        let handle_func =
+            instance
+                .get_typed_func::<(
+                    Resource<IncomingRequest>,
+                    Resource<ResponseOutparam>,
+                ), (Result<(), String>,)>(
+                    &mut store,
+                    &handle_func_export,
+                )
+                .map_err(|e| {
+                    RuntimeError::Other(format!(
+                        "Failed to get 'handle' function: {e}"
+                    ))
+                })?;
+
+        let task = tokio::task::spawn(async move {
+            if let Err(e) = handle_func.call_async(&mut store, (req, out)).await {
+                eprintln!("error: {e:?}");
+                return Err(e);
+            }
+            Ok(())
+        });
+
+        match receiver.await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => {
+                let e = match task.await {
+                    Ok(r) => {
+                        r.expect_err("if the receiver has an error, the task must have failed")
+                    }
+                    Err(e) => e.into(),
+                };
+                Err(e.context("guest never invoked `response-outparam::set` method"))
+            }
+        }
+    }
+
+    async fn launch_server(
+        addr: SocketAddr,
+        component: Component,
+        engine: Engine,
+        linker: Arc<Linker<InstanceState>>,
+    ) {
+        let result = async {
+            let socket = tokio::net::TcpSocket::new_v4()?;
+            socket.set_reuseaddr(!cfg!(windows))?;
+            socket.bind(addr)?;
+            let listener = socket.listen(100)?;
+            eprintln!("Serving HTTP on http://{}/", listener.local_addr()?);
+            //store.data_mut().w
+            tokio::task::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let stream = TokioIo::new(stream);
+                    let engine_ = engine.clone();
+                    let linker_ = linker.clone();
+                    let component_ = component.clone();
+
+                    tokio::task::spawn(async {
+                        if let Err(e) = http1::Builder::new()
+                            .keep_alive(true)
+                            .serve_connection(
+                                stream,
+                                hyper::service::service_fn(move |req| {
+                                    Self::handle_server_request(
+                                        engine_.clone(),
+                                        linker_.clone(),
+                                        component_.clone(),
+                                        req,
+                                    )
+                                }),
+                            )
+                            .await
+                        {
+                            eprintln!("error: {e:?}");
+                        }
+                    });
+                }
+            });
+            anyhow::Ok(())
+        };
+        if let Err(e) = result.await {
+            eprintln!("error: {e}");
         }
     }
 
@@ -311,19 +492,19 @@ impl Runtime {
                 .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
 
             // Attempt to call “run”
-            let run_export = instance.get_export(&mut store, None, "symphony:nbi/run");
-            let run_iface = run_export
-                .ok_or_else(|| RuntimeError::Other("No symphony:nbi/run in the module".into()))?;
+            let run_export = instance
+                .get_export(&mut store, None, "symphony:nbi/run")
+                .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
 
-            let run_func_export = instance.get_export(&mut store, Some(&run_iface), "run");
-            let run_func_export = run_func_export
+            let run_func_export = instance
+                .get_export(&mut store, Some(&run_export), "run")
                 .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
 
             let run_func = instance
                 .get_typed_func::<(), (Result<(), String>,)>(&mut store, &run_func_export)
                 .map_err(|e| RuntimeError::Other(format!("Failed to get 'run' function: {e}")))?;
 
-            match run_func.call_async(&mut store, ()).await {
+            return match run_func.call_async(&mut store, ()).await {
                 Ok((Ok(()),)) => {
                     //println!("Instance {instance_id} finished normally");
                     Ok(())
@@ -336,7 +517,7 @@ impl Runtime {
                     //eprintln!("Instance {instance_id} call error: {call_err}");
                     Err(RuntimeError::Other(format!("Call error: {call_err}")))
                 }
-            }
+            };
         }
         .await;
 

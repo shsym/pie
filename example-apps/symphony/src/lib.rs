@@ -32,22 +32,26 @@ pub mod bindings_app {
     });
 }
 
-// pub mod bindings_server {
-//     wit_bindgen::generate!({
-//         path: "../../api/wit",
-//         world: "server",
-//         pub_export_macro: true,
-//         default_bindings_module: "symphony::bindings",
-//         with: {
-//             "wasi:io/poll@0.2.4": wasi::io::poll,
-//             "wasi:clocks/monotonic-clock@0.2.4": wasi::clocks::monotonic_clock,
-//             "wasi:io/error@0.2.4": wasi::io::error,
-//             "wasi:io/streams@0.2.4": wasi::io::streams,
-//             "wasi:http/types@0.2.4": wasi::http::types,
-//         },
-//         generate_all,
-//     });
-// }
+pub mod bindings_server {
+    wit_bindgen::generate!({
+        path: "../../api/wit",
+        world: "server",
+        pub_export_macro: true,
+        default_bindings_module: "symphony::bindings",
+        with: {
+            "wasi:io/poll@0.2.4": wasi::io::poll,
+            "wasi:clocks/monotonic-clock@0.2.4": wasi::clocks::monotonic_clock,
+            //"wasi:clocks/wall-clock@0.2.4": wasi::clocks::wall_clock,
+            //"wasi:random/random@0.2.4": wasi::random::random,
+            //"wasi:cli/stdout@0.2.4": wasi::cli::stdout,
+            "wasi:io/error@0.2.4": wasi::io::error,
+            "wasi:io/streams@0.2.4": wasi::io::streams,
+            "wasi:http/types@0.2.4": wasi::http::types,
+            //"wasi:http/incoming_handler@0.2.4": wasi::exports::http::incoming_handler,
+        },
+        generate_all,
+    });
+}
 
 pub use crate::bindings::{
     symphony::nbi::l4m, symphony::nbi::l4m_vision, symphony::nbi::messaging, symphony::nbi::ping,
@@ -55,9 +59,9 @@ pub use crate::bindings::{
 };
 
 pub use crate::bindings_app::{export, exports::symphony::nbi::run::Guest as RunSync};
-
 pub use crate::context::Model;
 pub use anyhow::Result;
+pub use wasi;
 use wasi::exports::http::incoming_handler::{IncomingRequest, ResponseOutparam};
 
 pub fn available_models() -> Vec<String> {
@@ -98,7 +102,7 @@ pub struct Server<T> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T> wasi::exports::http::incoming_handler::Guest for Server<T>
+impl<T> bindings_server::exports::wasi::http::incoming_handler::Guest for Server<T>
 where
     T: Serve,
 {
@@ -117,7 +121,7 @@ where
 #[macro_export]
 macro_rules! main_sync {
     ($app:ident) => {
-        symphony::export!($app with_types_in symphony::bindings);
+        symphony::export!($app with_types_in symphony::bindings_app);
     };
 }
 
@@ -125,6 +129,14 @@ macro_rules! main_sync {
 macro_rules! main_async {
     ($app:ident) => {
         type _App = symphony::App<$app>;
-        symphony::export!(_App with_types_in symphony::bindings);
+        symphony::export!(_App with_types_in symphony::bindings_app);
+    };
+}
+
+#[macro_export]
+macro_rules! server {
+    ($app:ident) => {
+        type _Server = symphony::Server<$app>;
+        symphony::wasi::http::proxy::export!(_Server with_types_in symphony::bindings_server);
     };
 }

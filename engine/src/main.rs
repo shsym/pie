@@ -92,10 +92,37 @@ async fn main() -> anyhow::Result<()> {
         .install();
 
     // TEST: spawn a dummy client with the program name
-    tokio::spawn(dummy_client(program_name.to_string()));
-
+    //tokio::spawn(dummy_client(program_name.to_string()));
+    tokio::spawn(dummy_client2());
     // wait forever
     tokio::signal::ctrl_c().await?;
+
+    Ok(())
+}
+
+async fn dummy_client2() -> anyhow::Result<()> {
+    let program_path =
+        PathBuf::from("../example-apps/target/wasm32-wasip2/release/http_server.wasm");
+
+    let server_uri = "ws://127.0.0.1:9123";
+    let my_port = 9125;
+
+    let mut client = Client::connect(server_uri).await?;
+    let program_blob = fs::read(&program_path)?;
+    let program_hash = hash_program(&program_blob);
+
+    log_user!("Program file hash: {}", program_hash);
+
+    // If program is not present, upload it
+    if !client.program_exists(&program_hash).await? {
+        log_user!("Program not found on server, uploading now...");
+        client.upload_program(&program_blob).await?;
+        log_user!("Program uploaded successfully!");
+    }
+
+    client
+        .launch_server_instance(&program_hash, my_port)
+        .await?;
 
     Ok(())
 }
@@ -129,11 +156,11 @@ async fn dummy_client(program_name: String) -> anyhow::Result<()> {
         log_user!("Program uploaded successfully!");
     }
 
-    const num_instances: usize = 48;
+    const NUM_INSTANCES: usize = 48;
 
     // Launch 32 instances sequentially
     let mut instances = Vec::new();
-    for i in 0..num_instances {
+    for i in 0..NUM_INSTANCES {
         let instance = client.launch_instance(&program_hash).await?;
         log_user!("Instance {} launched.", instance.id());
         instances.push(instance);

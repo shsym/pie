@@ -27,6 +27,7 @@ thiserror = "2.0.11"
 rand = "0.9.0"
 colored = "3.0"
 clap = "4.5"
+hyper = "1.6.0"
 #console-subscriber = "0.4.1"
 
 [build-dependencies]

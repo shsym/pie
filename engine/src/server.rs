@@ -91,6 +91,13 @@ pub enum ClientMessage {
     #[serde(rename = "launch_instance")]
     LaunchInstance { corr_id: u32, program_hash: String },
 
+    #[serde(rename = "launch_server_instance")]
+    LaunchServerInstance {
+        corr_id: u32,
+        port: u32,
+        program_hash: String,
+    },
+
     #[serde(rename = "signal_instance")]
     SignalInstance {
         instance_id: String,
@@ -323,6 +330,14 @@ impl Client {
                         corr_id,
                         program_hash,
                     } => self.handle_launch_instance(corr_id, program_hash).await,
+                    ClientMessage::LaunchServerInstance {
+                        corr_id,
+                        port,
+                        program_hash,
+                    } => {
+                        self.handle_launch_server_instance(corr_id, port, program_hash)
+                            .await
+                    }
                     ClientMessage::SignalInstance {
                         instance_id,
                         message,
@@ -491,6 +506,32 @@ impl Client {
 
                 self.inst_owned.push(instance_id.clone());
                 self.send_response(corr_id, true, instance_id.to_string())
+                    .await;
+            }
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+            }
+        }
+    }
+
+    async fn handle_launch_server_instance(
+        &mut self,
+        corr_id: u32,
+        port: u32,
+        program_hash: String,
+    ) {
+        let (evt_tx, evt_rx) = oneshot::channel();
+        runtime::Command::LaunchServerInstance {
+            program_hash: program_hash.clone(),
+            port,
+            event: evt_tx,
+        }
+        .dispatch()
+        .unwrap();
+
+        match evt_rx.await.unwrap() {
+            Ok(_) => {
+                self.send_response(corr_id, true, "server launched".to_string())
                     .await;
             }
             Err(e) => {

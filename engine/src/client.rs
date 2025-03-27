@@ -301,4 +301,27 @@ impl Client {
             anyhow::bail!("Query failed: {}", result);
         }
     }
+
+    pub async fn launch_server_instance(&mut self, program_hash: &str, port: u32) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let corr_id = self.corr_id_pool.acquire()?;
+        self.pending_requests.insert(corr_id, tx);
+
+        let msg = ClientMessage::LaunchServerInstance {
+            corr_id,
+            port,
+            program_hash: program_hash.to_string(),
+        };
+        self.send_msg(&msg)?;
+
+        let (successful, result) = rx.await?;
+
+        // release the corr_id
+        self.corr_id_pool.release(corr_id)?;
+        if successful {
+            Ok(())
+        } else {
+            anyhow::bail!("Query failed: {}", result);
+        }
+    }
 }
