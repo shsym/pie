@@ -7,6 +7,8 @@ pub mod stop_condition;
 mod utils;
 
 pub use symphony_macros::main;
+pub use symphony_macros::server_main;
+
 pub use wstd;
 pub mod bindings {
     wit_bindgen::generate!({

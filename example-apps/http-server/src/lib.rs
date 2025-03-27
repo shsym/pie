@@ -3,20 +3,16 @@ use symphony::wstd::http::server::{Finished, Responder};
 use symphony::wstd::http::{IntoBody, Request, Response, StatusCode};
 use symphony::wstd::io::{AsyncWrite, copy, empty};
 use symphony::wstd::time::{Duration, Instant};
-struct HttpServer {
-    port: u16,
-}
 
-impl symphony::Serve for HttpServer {
-    async fn serve(req: Request<IncomingBody>, res: Responder) -> Finished {
-        match req.uri().path_and_query().unwrap().as_str() {
-            "/wait" => wait(req, res).await,
-            "/echo" => echo(req, res).await,
-            "/echo-headers" => echo_headers(req, res).await,
-            "/echo-trailers" => echo_trailers(req, res).await,
-            "/" => home(req, res).await,
-            _ => not_found(req, res).await,
-        }
+#[symphony::server_main]
+async fn main(req: Request<IncomingBody>, res: Responder) -> Finished {
+    match req.uri().path_and_query().unwrap().as_str() {
+        "/wait" => wait(req, res).await,
+        "/echo" => echo(req, res).await,
+        "/echo-headers" => echo_headers(req, res).await,
+        "/echo-trailers" => echo_trailers(req, res).await,
+        "/" => home(req, res).await,
+        _ => not_found(req, res).await,
     }
 }
 
@@ -74,5 +70,3 @@ async fn not_found(_req: Request<IncomingBody>, responder: Responder) -> Finishe
         .unwrap();
     responder.respond(res).await
 }
-
-symphony::server!(HttpServer);

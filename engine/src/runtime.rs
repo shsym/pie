@@ -379,27 +379,19 @@ impl Runtime {
             .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
 
         let serve_export = instance
-            .get_export(&mut store, None, "wasi:http/incoming-handler")
+            .get_export(&mut store, None, "wasi:http/incoming-handler@0.2.4")
             .ok_or_else(|| RuntimeError::Other("No 'serve' function found".into()))?;
 
         let handle_func_export = instance
             .get_export(&mut store, Some(&serve_export), "handle")
             .ok_or_else(|| RuntimeError::Other("No 'handle' function found".into()))?;
 
-        let handle_func =
-            instance
-                .get_typed_func::<(
-                    Resource<IncomingRequest>,
-                    Resource<ResponseOutparam>,
-                ), (Result<(), String>,)>(
-                    &mut store,
-                    &handle_func_export,
-                )
-                .map_err(|e| {
-                    RuntimeError::Other(format!(
-                        "Failed to get 'handle' function: {e}"
-                    ))
-                })?;
+        let handle_func = instance
+            .get_typed_func::<(Resource<IncomingRequest>, Resource<ResponseOutparam>), ()>(
+                &mut store,
+                &handle_func_export,
+            )
+            .map_err(|e| RuntimeError::Other(format!("Failed to get 'handle' function: {e}")))?;
 
         let task = tokio::task::spawn(async move {
             if let Err(e) = handle_func.call_async(&mut store, (req, out)).await {

@@ -44,3 +44,51 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     expanded.into()
 }
+
+
+
+#[proc_macro_attribute]
+pub fn server_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Parse the input tokens into a syntax tree
+    let mut input_fn = parse_macro_input!(item as ItemFn);
+    let original_fn_name = input_fn.sig.ident.clone();
+    let inner_fn_name = syn::Ident::new("__symphony_main_inner", original_fn_name.span());
+
+    // Ensure the function is async
+    if input_fn.sig.asyncness.is_none() {
+        return syn::Error::new_spanned(
+            input_fn.sig.ident,
+            "The #[symphony::server_main] attribute can only be used on async functions",
+        )
+            .to_compile_error()
+            .into();
+    }
+
+    // Rename the user's function so that we can call it from our generated code.
+    input_fn.sig.ident = inner_fn_name.clone();
+
+    // Generate a wrapper type that implements `symphony::Run`.
+    // It calls the inner async function and maps the error to String.
+    let expanded = quote! {
+        #input_fn
+
+        struct __SymphonyMain;
+
+        impl symphony::bindings_server::exports::wasi::http::incoming_handler::Guest for __SymphonyMain {
+            fn handle(request: symphony::wasi::exports::http::incoming_handler::IncomingRequest, response_out: symphony::wasi::exports::http::incoming_handler::ResponseOutparam) -> () {
+                let responder = symphony::wstd::http::server::Responder::new(response_out);
+                let _finished: symphony::wstd::http::server::Finished =
+                    match symphony::wstd::http::request::try_from_incoming(request) {
+                        Ok(request) => {
+                            symphony::wstd::runtime::block_on(async { #inner_fn_name(request, responder).await })
+                        }
+                        Err(err) => responder.fail(err),
+                    };
+            }
+        }
+
+        symphony::wasi::http::proxy::export!(__SymphonyMain with_types_in symphony::bindings_server);
+    };
+
+    expanded.into()
+}
