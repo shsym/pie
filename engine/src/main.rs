@@ -63,10 +63,10 @@ async fn main() -> anyhow::Result<()> {
     // 1) Ensure the cache directory exists
     fs::create_dir_all(PROGRAM_CACHE_DIR).context("Failed to create program cache directory")?;
 
-    //let l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
-    //let ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
+    let l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
+    let ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
 
-    let backend = backend::ZmqBackend::bind("tcp://127.0.0.1:8888").await?;
+    //let backend = backend::ZmqBackend::bind("tcp://127.0.0.1:8888").await?;
 
     //return Ok(());
 
@@ -76,8 +76,8 @@ async fn main() -> anyhow::Result<()> {
     let server = Server::new("127.0.0.1:9123");
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
-    let l4m = L4m::new(backend.clone()).await;
-    let ping = Ping::new(backend).await;
+    let l4m = L4m::new(l4m_backend.clone()).await;
+    let ping = Ping::new(ping_backend).await;
 
     l4m::set_available_models(["llama3"]);
 

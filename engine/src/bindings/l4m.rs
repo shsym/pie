@@ -69,14 +69,14 @@ pub struct Cache {
     tokenizer: Option<Tokenizer>,
 }
 
-fn map_object_types(ty: bindings::wit::symphony::app::l4m::ObjectType) -> ManagedTypes {
+fn map_object_types(ty: bindings::wit::symphony::nbi::l4m::ObjectType) -> ManagedTypes {
     match ty {
-        bindings::wit::symphony::app::l4m::ObjectType::Block => ManagedTypes::KvBlock,
-        bindings::wit::symphony::app::l4m::ObjectType::Embed => ManagedTypes::TokenEmb,
+        bindings::wit::symphony::nbi::l4m::ObjectType::Block => ManagedTypes::KvBlock,
+        bindings::wit::symphony::nbi::l4m::ObjectType::Embed => ManagedTypes::TokenEmb,
     }
 }
 
-impl bindings::wit::symphony::app::l4m::Host for InstanceState {
+impl bindings::wit::symphony::nbi::l4m::Host for InstanceState {
     async fn get_model(&mut self, value: String) -> anyhow::Result<Option<Resource<Model>>> {
         if let Some(service_id) = service::get_service_id(&value) {
             let model = Model {
@@ -95,7 +95,7 @@ impl bindings::wit::symphony::app::l4m::Host for InstanceState {
     }
 }
 
-impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
+impl bindings::wit::symphony::nbi::l4m::HostModel for InstanceState {
     async fn get_block_size(&mut self, model: Resource<Model>) -> Result<u32, wasmtime::Error> {
         let service_id = self.table().get(&model)?.service_id;
 
@@ -148,7 +148,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
         stream_id: u32,
-        ty: bindings::wit::symphony::app::l4m::ObjectType,
+        ty: bindings::wit::symphony::nbi::l4m::ObjectType,
         object_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
         let service_id = self.table().get(&model)?.service_id;
@@ -168,7 +168,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
         stream_id: u32,
-        ty: bindings::wit::symphony::app::l4m::ObjectType,
+        ty: bindings::wit::symphony::nbi::l4m::ObjectType,
         object_ids: Vec<IdRepr>,
     ) -> Result<(), wasmtime::Error> {
         let service_id = self.table().get(&model)?.service_id;
@@ -410,7 +410,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
         stream_id: u32,
-        priority: bindings::wit::symphony::app::l4m::StreamPriority,
+        priority: bindings::wit::symphony::nbi::l4m::StreamPriority,
     ) -> Result<(), wasmtime::Error> {
         let service_id = self.table().get(&model)?.service_id;
 
@@ -418,9 +418,9 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
             inst_id: self.id(),
             stream_id,
             priority: match priority {
-                bindings::wit::symphony::app::l4m::StreamPriority::High => StreamPriority::High,
-                bindings::wit::symphony::app::l4m::StreamPriority::Normal => StreamPriority::Normal,
-                bindings::wit::symphony::app::l4m::StreamPriority::Low => StreamPriority::Low,
+                bindings::wit::symphony::nbi::l4m::StreamPriority::High => StreamPriority::High,
+                bindings::wit::symphony::nbi::l4m::StreamPriority::Normal => StreamPriority::Normal,
+                bindings::wit::symphony::nbi::l4m::StreamPriority::Low => StreamPriority::Low,
             },
         }
         .dispatch(service_id)?;
@@ -434,7 +434,7 @@ impl bindings::wit::symphony::app::l4m::HostModel for InstanceState {
     }
 }
 
-impl bindings::wit::symphony::app::l4m::HostTokenizer for InstanceState {
+impl bindings::wit::symphony::nbi::l4m::HostTokenizer for InstanceState {
     async fn tokenize(
         &mut self,
         this: Resource<Tokenizer>,
@@ -471,7 +471,7 @@ impl bindings::wit::symphony::app::l4m::HostTokenizer for InstanceState {
     }
 }
 
-impl bindings::wit::symphony::app::l4m::HostSampleTopKResult for InstanceState {
+impl bindings::wit::symphony::nbi::l4m::HostSampleTopKResult for InstanceState {
     async fn pollable(
         &mut self,
         this: Resource<SampleTopKResult>,
@@ -497,7 +497,7 @@ impl bindings::wit::symphony::app::l4m::HostSampleTopKResult for InstanceState {
     }
 }
 
-impl bindings::wit::symphony::app::l4m::HostSynchronizationResult for InstanceState {
+impl bindings::wit::symphony::nbi::l4m::HostSynchronizationResult for InstanceState {
     async fn pollable(
         &mut self,
         this: Resource<SynchronizationResult>,

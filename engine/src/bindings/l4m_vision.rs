@@ -9,7 +9,7 @@ pub struct VisionModel {
     name: String,
 }
 
-impl bindings::wit::symphony::app::l4m_vision::Host for InstanceState {
+impl bindings::wit::symphony::nbi::l4m_vision::Host for InstanceState {
     async fn embed_image(
         &mut self,
         model: Resource<Model>,

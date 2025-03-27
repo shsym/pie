@@ -11,12 +11,12 @@ wit_bindgen::generate!({
 
 struct HelloWorld;
 
-impl exports::symphony::app::run::Guest for HelloWorld {
+impl exports::symphony::nbi::run::Guest for HelloWorld {
     fn run() -> Result<(), String> {
         println!("Hello World!!");
 
-        let inst_id = symphony::app::runtime::get_instance_id();
-        let version = symphony::app::runtime::get_version();
+        let inst_id = symphony::nbi::runtime::get_instance_id();
+        let version = symphony::nbi::runtime::get_version();
         println!(
             "I am an instance (id: {}) running in the Symphony runtime (version: {}) !",
             inst_id, version

@@ -311,9 +311,9 @@ impl Runtime {
                 .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
 
             // Attempt to call “run”
-            let run_export = instance.get_export(&mut store, None, "symphony:app/run");
+            let run_export = instance.get_export(&mut store, None, "symphony:nbi/run");
             let run_iface = run_export
-                .ok_or_else(|| RuntimeError::Other("No symphony:app/run in the module".into()))?;
+                .ok_or_else(|| RuntimeError::Other("No symphony:nbi/run in the module".into()))?;
 
             let run_func_export = instance.get_export(&mut store, Some(&run_iface), "run");
             let run_func_export = run_func_export

@@ -39,7 +39,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        symphony::export!(__SymphonyMain with_types_in symphony::bindings);
+        symphony::export!(__SymphonyMain with_types_in symphony::bindings_app);
     };
 
     expanded.into()
