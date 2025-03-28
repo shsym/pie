@@ -12,7 +12,7 @@ python benchmark_requests.py
 
 ### With custom parameters
 ```
-python benchmark_requests.py --concurrent 50 --duration 30 --api-key "YOUR_ACTUAL_API_KEY"
+python benchmark_requests.py --concurrent 50 --duration 30 --api-key "YOUR_ACTUAL_API_KEY" --processes 4
 ```
 
 If you want to send empty GET requests, use `-e` flag:
