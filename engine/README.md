@@ -14,3 +14,10 @@ Before running the engine, make sure that you have run the backend with the corr
 ```bash
 cargo run --release
 ```
+
+## Example usage
+- OpenAI API compatible server
+Note that you first need to run the backend that is compatible with this server. After that, you can run the engine and the server with:
+```bash
+cargo run --release -- openai_compat -H -p 8080 --dummy false
+```

@@ -1,8 +1,7 @@
-use symphony::Result;
-// Use Symphony's own traits if they work, as established
-use symphony::wstd::io::{AsyncRead, AsyncWrite};
-use symphony::wstd::iter::AsyncIterator;
-use symphony::wstd::net::TcpListener;
+// Replace TCP socket handling with HTTP server imports
+use symphony::wstd::http::body::IncomingBody;
+use symphony::wstd::http::server::{Finished, Responder};
+use symphony::wstd::http::{IntoBody, Request, Response, StatusCode};
 
 // Added imports
 use serde::Serialize; // For serializing the response structure
@@ -52,105 +51,82 @@ fn get_unix_timestamp() -> u64 {
         .as_secs()
 }
 
+#[symphony::server_main]
+async fn main(req: Request<IncomingBody>, res: Responder) -> Finished {
+    // Log connection info
+    println!("Received request from {} to {}", 
+        req.headers().get("host").map_or("unknown", |h| h.to_str().unwrap_or("unknown")),
+        req.uri().path_and_query().map_or("", |p| p.as_str()));
 
-#[symphony::main]
-async fn main() -> Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    println!(
-        "OpenAI-like API Server listening on http://{}",
-        listener.local_addr()?
-    );
-    println!("Send a POST request with JSON body (content ignored for now):");
-    println!("  curl -X POST -H \"Content-Type: application/json\" -d '{{\"messages\": [{{\"role\": \"user\", \"content\": \"Hello\"}}]}}' http://localhost:8080/");
-
-    let mut incoming = listener.incoming();
-
-    while let Some(stream_result) = incoming.next().await {
-        match stream_result {
-            Ok(mut stream) => {
-                let peer_addr = stream.peer_addr()
-                    .unwrap_or_else(|_| "unknown:0".to_string());
-                println!("Accepted connection from: {}", peer_addr);
-
-                // --- Simplified Request Reading ---
-                // We read a chunk just to consume *something* from the client.
-                // A real server MUST parse headers (Content-Length) and read the exact body.
-                let mut buffer = [0; 1024]; // Read up to 1KB
-                match stream.read(&mut buffer).await {
-                    Ok(0) => {
-                        println!("Client {} disconnected before sending data.", peer_addr);
-                        continue; // Skip to next connection
-                    }
-                    Ok(bytes_read) => {
-                        println!("Read {} bytes from client {} (request body ignored).", bytes_read, peer_addr);
-                        // In a real app, parse `&buffer[..bytes_read]` as JSON here
-                    }
-                    Err(e) => {
-                        eprintln!("Error reading from stream for {}: {}", peer_addr, e);
-                        continue; // Skip to next connection
-                    }
-                };
-
-                // --- Generate Response Content ---
-                let random_content = generate_random_string(30); // Generate a 30-char random string
-                let response_id = format!("chatcmpl-{}", generate_random_string(20)); // Generate a plausible ID
-                let timestamp = get_unix_timestamp();
-
-                // --- Construct the OpenAI-like Response Body ---
-                let response_data = OpenAiResponse {
-                    id: response_id,
-                    object: "chat.completion".to_string(),
-                    created: timestamp,
-                    model: "symphony-mock-v1".to_string(),
-                    choices: vec![
-                        ResponseChoice {
-                            index: 0,
-                            message: ResponseChoiceMessage {
-                                role: "assistant".to_string(),
-                                content: random_content, // Embed the random string
-                            },
-                            finish_reason: "stop".to_string(),
-                        }
-                    ],
-                };
-
-                // --- Serialize Response to JSON ---
-                let response_body_json = match serde_json::to_string(&response_data) {
-                    Ok(json) => json,
-                    Err(e) => {
-                        eprintln!("Error serializing response JSON: {}", e);
-                        // Consider sending an HTTP 500 error here
-                        continue; // Skip to next connection
-                    }
-                };
-
-                // --- Construct the Full HTTP Response ---
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                     Content-Type: application/json\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {}", // End of headers (blank line)
-                    response_body_json.len(),
-                    response_body_json // The JSON payload
-                );
-
-                // --- Send the Response ---
-                if let Err(e) = stream.write_all(response.as_bytes()).await {
-                    eprintln!("Error writing response to {}: {}", peer_addr, e);
-                } else {
-                    println!("Sent JSON response to {}", peer_addr);
-                }
-
-                if let Err(e) = stream.flush().await {
-                     eprintln!("Error flushing stream for {}: {}", peer_addr, e);
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to accept connection: {}", e);
-            }
-        }
+    match req.uri().path() {
+        "/" | "/v1/chat/completions" => handle_chat_completion(req, res).await,
+        _ => handle_not_found(req, res).await,
     }
-    Ok(())
+}
+
+async fn handle_chat_completion(_req: Request<IncomingBody>, res: Responder) -> Finished {
+    // --- Generate Response Content ---
+    let random_content = generate_random_string(30); // Generate a 30-char random string
+    let response_id = format!("chatcmpl-{}", generate_random_string(20)); // Generate a plausible ID
+    let timestamp = get_unix_timestamp();
+
+    // --- Construct the OpenAI-like Response Body ---
+    let response_data = OpenAiResponse {
+        id: response_id,
+        object: "chat.completion".to_string(),
+        created: timestamp,
+        model: "symphony-mock-v1".to_string(),
+        choices: vec![
+            ResponseChoice {
+                index: 0,
+                message: ResponseChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: random_content, // Embed the random string
+                },
+                finish_reason: "stop".to_string(),
+            }
+        ],
+    };
+
+    // --- Serialize Response to JSON ---
+    let response_body_json = match serde_json::to_string(&response_data) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("Error serializing response JSON: {}", e);
+            return handle_error(res).await;
+        }
+    };
+
+    println!("Sending JSON response: {} bytes", response_body_json.len());
+
+    // Create a response with proper headers
+    let response = Response::builder()
+        .header("Content-Type", "application/json")
+        .body(response_body_json.into_body())
+        .unwrap();
+
+    // Send the response
+    res.respond(response).await
+}
+
+async fn handle_not_found(_req: Request<IncomingBody>, res: Responder) -> Finished {
+    let body = "Not Found: The requested endpoint does not exist.";
+    let response = Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("Content-Type", "text/plain")
+        .body(body.into_body())
+        .unwrap();
+
+    res.respond(response).await
+}
+
+async fn handle_error(res: Responder) -> Finished {
+    let body = r#"{"error": {"message": "An error occurred while processing the request", "type": "internal_error"}}"#;
+    let response = Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header("Content-Type", "application/json")
+        .body(body.into_body())
+        .unwrap();
+
+    res.respond(response).await
 }

@@ -56,17 +56,46 @@ async fn main() -> anyhow::Result<()> {
                 .help("Name of the program to run (without extension)")
                 .default_value("simple_decoding"),
         )
+        .arg(
+            Arg::new("http")
+                .short('H')
+                .long("http")
+                .action(clap::ArgAction::SetTrue)
+                .help("Run the HTTP server")
+                .default_value("false"),
+        )
+        .arg(
+            Arg::new("port")
+                .short('p')
+                .long("port")
+                .value_name("PORT")
+                .help("Port to run the HTTP server on")
+                .default_value("9123"),
+        )
+        .arg(
+            Arg::new("dummy")
+                .short('d')
+                .long("dummy")
+                .action(clap::ArgAction::SetTrue)
+                .help("Run the dummy client")
+                .default_value("false"),
+        )
         .get_matches();
 
     let program_name = matches.get_one::<String>("program").unwrap();
+    let is_http = matches.get_one::<bool>("http").unwrap();
+    let port = matches.get_one::<String>("port").unwrap();
+    let port: u16 = port.parse().unwrap_or(9123);
+    let use_dummy = matches.get_one::<bool>("dummy").unwrap();
+    let use_dummy = *use_dummy;
 
     // 1) Ensure the cache directory exists
     fs::create_dir_all(PROGRAM_CACHE_DIR).context("Failed to create program cache directory")?;
 
-    let l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
-    let ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
+    let dummy_l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
+    let dummy_ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
 
-    //let backend = backend::ZmqBackend::bind("tcp://127.0.0.1:8888").await?;
+    let l4m_backend = backend::ZmqBackend::bind("tcp://127.0.0.1:8888").await?;
 
     //return Ok(());
 
@@ -76,36 +105,61 @@ async fn main() -> anyhow::Result<()> {
     let server = Server::new("127.0.0.1:9123");
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
-    let l4m = L4m::new(l4m_backend.clone()).await;
-    let ping = Ping::new(ping_backend).await;
 
-    l4m::set_available_models(["llama3"]);
+    // Setup with dummy
+    if use_dummy {
+        log_user!("Running in dummy mode");
+        let l4m = L4m::new(dummy_l4m_backend.clone()).await;
+        let ping = Ping::new(dummy_ping_backend.clone()).await;
 
-    // Install all services
-    let _ = Controller::new()
-        .add("runtime", runtime)
-        .add("server", server)
-        .add("messaging-inst2inst", messaging_inst2inst)
-        .add("messaging-user2inst", messaging_user2inst)
-        .add("llama3", l4m)
-        .add("ping", ping)
-        .install();
+        l4m::set_available_models(["llama3"]);
+
+        // Install all services
+        let _ = Controller::new()
+            .add("runtime", runtime)
+            .add("server", server)
+            .add("messaging-inst2inst", messaging_inst2inst)
+            .add("messaging-user2inst", messaging_user2inst)
+            .add("llama3", l4m)
+            .add("ping", ping)
+            .install();
+    } else {
+        // Setup with real backend
+        let l4m = L4m::new(l4m_backend.clone()).await;
+        let ping = Ping::new(dummy_ping_backend.clone()).await;
+
+        l4m::set_available_models(["llama3"]);
+
+        // Install all services
+        let _ = Controller::new()
+            .add("runtime", runtime)
+            .add("server", server)
+            .add("messaging-inst2inst", messaging_inst2inst)
+            .add("messaging-user2inst", messaging_user2inst)
+            .add("llama3", l4m)
+            .add("ping", ping)
+            .install();
+    }
 
     // TEST: spawn a dummy client with the program name
-    //tokio::spawn(dummy_client(program_name.to_string()));
-    tokio::spawn(dummy_client2());
+    if *is_http {
+        tokio::spawn(dummy_client2(program_name.to_string(), port));
+    } else {
+        tokio::spawn(dummy_client(program_name.to_string()));
+    }
     // wait forever
     tokio::signal::ctrl_c().await?;
 
     Ok(())
 }
 
-async fn dummy_client2() -> anyhow::Result<()> {
-    let program_path =
-        PathBuf::from("../example-apps/target/wasm32-wasip2/release/http_server.wasm");
+async fn dummy_client2(program_name: String, port: u16) -> anyhow::Result<()> {
+    let program_path = PathBuf::from(format!(
+        "../example-apps/target/wasm32-wasip2/release/{}.wasm",
+        program_name
+    ));
 
     let server_uri = "ws://127.0.0.1:9123";
-    let my_port = 9125;
 
     let mut client = Client::connect(server_uri).await?;
     let program_blob = fs::read(&program_path)?;
@@ -121,7 +175,7 @@ async fn dummy_client2() -> anyhow::Result<()> {
     }
 
     client
-        .launch_server_instance(&program_hash, my_port)
+        .launch_server_instance(&program_hash, port as u32)
         .await?;
 
     Ok(())
