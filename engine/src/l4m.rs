@@ -397,6 +397,9 @@ impl L4m {
             info.num_distributions
         );
 
+        // Add the model name to the available models
+        set_available_models([info.model_name.clone()]);
+
         // Try to load the tokenizer model from different paths
         let tokenizer_paths = [
             format!("program_cache/{}/original/tokenizer.model", info.model_name),

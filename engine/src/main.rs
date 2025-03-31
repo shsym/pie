@@ -127,8 +127,7 @@ async fn main() -> anyhow::Result<()> {
         // Setup with real backend
         let l4m = L4m::new(l4m_backend.clone()).await;
         let ping = Ping::new(dummy_ping_backend.clone()).await;
-
-        l4m::set_available_models(["llama3"]);
+        let avail_models = l4m::available_models();
 
         // Install all services
         let _ = Controller::new()
@@ -136,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
             .add("server", server)
             .add("messaging-inst2inst", messaging_inst2inst)
             .add("messaging-user2inst", messaging_user2inst)
-            .add("llama3", l4m)
+            .add(avail_models.first().unwrap(), l4m)
             .add("ping", ping)
             .install();
     }
