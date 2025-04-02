@@ -216,7 +216,6 @@ impl Context {
     }
 
     pub async fn generate_until(&mut self, stop_str: &str, max_tokens: usize) -> String {
-        let mut drafter = drafter::Empty {};
         let mut sampler = sampler::GreedySampler::new();
 
         let stop_str_token_ids = self.inner.tokenizer.tokenize(stop_str);
@@ -226,7 +225,7 @@ impl Context {
             stop_condition::Length::new(max_tokens),
         );
 
-        self.generate_with_drafter(&mut drafter, &mut sampler, &mut stop_condition)
+        self.generate(&mut sampler, &mut stop_condition)
             .await
     }
 
@@ -262,7 +261,11 @@ impl Context {
 
         // ensure we have enough blocks
 
-        let available_space = self.block_size() - self.last_block_len;
+        let available_space = if self.block_ids.len() > 0 {
+            self.block_size() - self.last_block_len
+        } else {
+            0
+        };
 
         if pending_token_ids.len() > available_space {
             let needed_block_count =

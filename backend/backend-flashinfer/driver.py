@@ -173,7 +173,7 @@ class Driver:
     @torch.inference_mode()
     def fill_block(self, cmds: BatchFillBlock):
 
-
+        print("fill_block", cmds)
         start_time = time.time()
         
         kv_page_indices = []
@@ -189,7 +189,7 @@ class Driver:
         single_token_inference_mode = True
         
         for i, cmd in enumerate(cmds.items):
-            last_block_len = cmd.block_id # change this name to "offset" later.
+            last_block_len = cmd.last_block_len # change this name to "offset" later.
             
             ctx_block_ids = cmd.context_block_ids # block == page. make names consistent later.
             input_embeds = cmd.input_embedding_ids
@@ -222,8 +222,13 @@ class Driver:
             for i in range(len(input_embeds)):
                 
                 token_offset = total_ctx_tokens - len(input_embeds) + i
-                tgt_block_id = token_offset // NUM_TOKENS_IN_BLOCK
+                tgt_block_idx = token_offset // NUM_TOKENS_IN_BLOCK
                 tgt_block_offset = token_offset % NUM_TOKENS_IN_BLOCK
+                
+                #print("token_offset", token_offset, "tgt_block_idx", tgt_block_idx, "tgt_block_offset", tgt_block_offset)
+                #print(self.blocks)
+                tgt_block_id = ctx_block_ids[tgt_block_idx]
+                
                 tgt_block = self.blocks[tgt_block_id]
                 
                 if input_embeds[i] in self.embeds:

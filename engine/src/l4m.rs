@@ -1,5 +1,5 @@
 use crate::backend::Backend;
-use crate::batching::{Batchable, Batcher, BatchingStrategy, KorTStrategy};
+use crate::batching::{Batchable, Batcher, BatchingStrategy};
 use crate::instance::Id as InstanceId;
 use crate::object::{IdRepr, ObjectManager, ObjectType, group_consecutive_ids};
 use crate::service::{Service, ServiceError};
@@ -542,6 +542,26 @@ impl L4m {
                 mut inputs,
                 mut outputs,
             } => {
+
+                if last_block_len == 0 || last_block_len > self.info.block_size {
+                    // error
+                    runtime::trap(
+                        inst_id,
+                        format!("l4m::fill_block failed. last_block_len ({}) is 0 or greater than the block size ({})", last_block_len, self.info.block_size  )
+                    );
+                    return None;
+                }
+
+                let max_tokens = self.info.block_size * (context.len() as u32 - 1) + last_block_len;
+
+                if inputs.len() > max_tokens as usize {
+                    // error
+                    runtime::trap(
+                        inst_id,
+                        format!("l4m::fill_block failed. inputs length is greater than the max tokens: {} > {}", inputs.len(), max_tokens)
+                    );
+                    return None;
+                }
 
                 try_trap!(
                     self.objects

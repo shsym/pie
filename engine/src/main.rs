@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     let dummy_l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
     let dummy_ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
 
-    let l4m_backend = backend::ZmqBackend::bind("tcp://127.0.0.1:8888").await?;
+    let l4m_backend = backend::ZmqBackend::bind("ipc:///tmp/symphony-ipc").await?;
 
     //return Ok(());
 
@@ -209,7 +209,7 @@ async fn dummy_client(program_name: String) -> anyhow::Result<()> {
         log_user!("Program uploaded successfully!");
     }
 
-    const NUM_INSTANCES: usize = 48;
+    const NUM_INSTANCES: usize = 200;
 
     // Launch 32 instances sequentially
     let mut instances = Vec::new();

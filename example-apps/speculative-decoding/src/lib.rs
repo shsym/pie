@@ -201,7 +201,7 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> Drafter
         }
     }
 
-    fn draft(&mut self, max_tokens: usize) -> (Vec<u32>, Vec<u32>) {
+    fn draft(&mut self) -> (Vec<u32>, Vec<u32>) {
         // build a speculation Trie. (https://en.wikipedia.org/wiki/Trie)
         // Rn, its just a single level Trie.
         let mut spec_token_ids = Vec::new();
@@ -214,11 +214,6 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> Drafter
                     spec_pos_ids.extend(1..=item.len() as u32);
                 }
             }
-        }
-
-        if spec_token_ids.len() >= max_tokens {
-            spec_token_ids.truncate(max_tokens);
-            spec_pos_ids.truncate(max_tokens);
         }
 
         (spec_token_ids, spec_pos_ids)
