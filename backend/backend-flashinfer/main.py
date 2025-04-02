@@ -12,7 +12,6 @@ import handshake_pb2
 
 from common import ceil_div
 from driver import Driver
-from l4ma import AttentionStorage, VectorStorage
 from llama import LlamaForCausalLM
 from config import VERSION, MODEL_NAME, FULL_MODEL_NAME, NUM_TOKENS_IN_BLOCK
 
@@ -75,41 +74,10 @@ def main_run():
     model = LlamaForCausalLM.from_pretrained(
         FULL_MODEL_NAME, torch_dtype="bfloat16", device_map=device)
 
-    block_storage = AttentionStorage(
-        num_layers=model.config.num_hidden_layers,
-        num_blocks=1000,
-        num_heads=model.config.num_key_value_heads,
-        block_size=NUM_TOKENS_IN_BLOCK,
-        head_dim=model.config.hidden_size // model.config.num_attention_heads,
-        dtype=torch.bfloat16,
-        device=device
-    )
-
-    embed_storage_p1 = VectorStorage(
-        num_vectors=57000,
-        embed_dim=config.DIST_RESOLUTION,
-        dtype=torch.bfloat16,
-        device=device
-    )
-
-    embed_storage_p2 = VectorStorage(
-        num_vectors=57000,
-        embed_dim=config.DIST_RESOLUTION,
-        dtype=torch.long,
-        device=device
-    )
-
-    # dist_storage = VectorStorage(
-    #     num_vectors=1000,
-    #     embed_dim=model.config.vocab_size,
-    #     dtype=torch.bfloat16,
-    #     device=device
-    # )
-
     #endpoint = "tcp://*:8888"
     endpoint = "ipc:///tmp/symphony-ipc"
 
-    engine = Driver(model, block_storage, embed_storage_p1, embed_storage_p2)
+    engine = Driver(model, 5000, torch.bfloat16, device)
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
@@ -236,6 +204,9 @@ def llama3_format(prompt: str, hint: str | None, system: str = "You are a helpfu
     return temp
 
 
+
+
+
 def main_test():
     device = "cuda:0"
 
@@ -246,38 +217,8 @@ def main_test():
 
     tokenizer = AutoTokenizer.from_pretrained(FULL_MODEL_NAME)
 
-    block_storage = AttentionStorage(
-        num_layers=model.config.num_hidden_layers,
-        num_blocks=1000,
-        num_heads=model.config.num_key_value_heads,
-        block_size=NUM_TOKENS_IN_BLOCK,
-        head_dim=model.config.hidden_size // model.config.num_attention_heads,
-        dtype=torch.bfloat16,
-        device=device
-    )
 
-    embed_storage_p1 = VectorStorage(
-        num_vectors=1000,
-        embed_dim=config.DIST_RESOLUTION,
-        dtype=torch.bfloat16,
-        device=device
-    )
-
-    embed_storage_p2 = VectorStorage(
-        num_vectors=1000,
-        embed_dim=config.DIST_RESOLUTION,
-        dtype=torch.long,
-        device=device
-    )
-
-    # dist_storage = VectorStorage(
-    #     num_vectors=1000,
-    #     embed_dim=model.config.vocab_size,
-    #     dtype=torch.bfloat16,
-    #     device=device
-    # )
-
-    engine = Driver(model, block_storage, embed_storage_p1, embed_storage_p2)
+    engine = Driver(model, 5000, torch.bfloat16, device)
 
     test_prompt = llama3_format("What is Pinon coffee? ELI 5", None)
 
@@ -300,10 +241,10 @@ def main_test():
     OUT_EMB_OFFSET = 100
 
     engine.fill_block(l4m_pb2.BatchFillBlock(items=[
-        l4m_pb2.FillBlock(block_id=i,
+        l4m_pb2.FillBlock(block_id=0,
                           context_block_ids=list(range(i + 1)),
-                          input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * i, NUM_TOKENS_IN_BLOCK * (i + 1))),
-                          output_embedding_ids=list(range(OUT_EMB_OFFSET, OUT_EMB_OFFSET + NUM_TOKENS_IN_BLOCK)) if i == num_blocks_needed - 1 else [])
+                          input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * i, min(NUM_TOKENS_IN_BLOCK * (i + 1), len(token_ids)))),
+                          output_embedding_ids=[0] if i == num_blocks_needed - 1 else [])
         for i in range(num_blocks_needed)
     ]))
 
@@ -317,9 +258,7 @@ def main_test():
 
         time_start = time.time()
 
-        engine.decode_token_distribution(l4m_pb2.BatchDecodeTokenDistribution(items=[
-            l4m_pb2.DecodeTokenDistribution(embedding_id=OUT_EMB_OFFSET + last_token_idx + i, distribution_id=0)
-        ]))
+
         res = engine.sample_top_k_request(l4m_pb2.BatchSampleTopKRequest(items=[
             l4m_pb2.SampleTopKRequest(distribution_id=0, k=5)
         ]))
@@ -334,7 +273,7 @@ def main_test():
             l4m_pb2.EmbedText(embedding_id=len(token_ids) + i, token_id=new_token, position_id=len(token_ids) + i)
         ]))
         engine.fill_block(l4m_pb2.BatchFillBlock(items=[
-            l4m_pb2.FillBlock(block_id=last_block_id,
+            l4m_pb2.FillBlock(block_id=0,
                               context_block_ids=list(range(last_block_id + 1)),
                               input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * last_block_id, NUM_TOKENS_IN_BLOCK * (last_block_id + 1))),
                               output_embedding_ids=list(range(OUT_EMB_OFFSET, OUT_EMB_OFFSET + NUM_TOKENS_IN_BLOCK))),
@@ -346,8 +285,8 @@ def main_test():
         # print(f"Elapsed time: {(time_end - time_start) * 1000:.2f}ms")
 
     print("done!")
-
-
+    
+    
 if __name__ == "__main__":
-    main_run()
-    # main_test()
+    #main_run()
+    main_test()

@@ -139,6 +139,7 @@ class Driver:
         start_time = time.time()
 
         res = []
+                
         for i, cmd in enumerate(cmds.items):
             topk_probs = self.embed_storage_p1.ptr[cmd.distribution_id].tolist()
             topk_tokens = self.embed_storage_p2.ptr[cmd.distribution_id].tolist()
@@ -149,7 +150,7 @@ class Driver:
 
             res.append(SampleTopKResponse(token_ids=topk_tokens, probabilities=topk_probs))
 
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
         #print(f"sample_top_k_request elapsed time {(time.time() - start_time) * 1000}ms")
 
         return BatchSampleTopKResponse(items=res)
@@ -316,8 +317,8 @@ class Driver:
         # compute the position embeddings
         rope_cache = self.lm.rotary_emb(input_embeds, pt_new_position_ids.max().item() + 1)
 
-        # torch.cuda.synchronize()
-
+        torch.cuda.synchronize()
+        print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
         with torch.cuda.device(self.device()):
             output_embeds = self.lm.model.forward(
                 input_embeds=input_embeds,
@@ -351,7 +352,7 @@ class Driver:
 
         torch.cuda.synchronize()
         elapsed_time = (time.time() - start_time) * 1000
-        #print(f"fill_block elapsed time {elapsed_time}ms size {output_embeds.shape}")
-        #print(f"inter-fill time {inter_fill_elapsed_time}ms")
+        print(f"fill_block elapsed time {elapsed_time}ms size {output_embeds.shape}")
+        print(f"inter-fill time {inter_fill_elapsed_time}ms")
 
         self.inter_fill_time = time.time()
