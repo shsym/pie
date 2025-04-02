@@ -10,3 +10,4 @@ safetensors~=0.4.2
 protobuf~=3.20.3
 torchao~=0.9.0
 accelerate>=0.26.0
+flashinfer>=0.2.4

@@ -56,16 +56,16 @@ class BatchEmbedText(_message.Message):
     def __init__(self, items: _Optional[_Iterable[_Union[EmbedText, _Mapping]]] = ...) -> None: ...
 
 class FillBlock(_message.Message):
-    __slots__ = ("block_id", "context_block_ids", "input_embedding_ids", "output_embedding_ids")
-    BLOCK_ID_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("last_block_len", "context_block_ids", "input_embedding_ids", "output_embedding_ids")
+    LAST_BLOCK_LEN_FIELD_NUMBER: _ClassVar[int]
     CONTEXT_BLOCK_IDS_FIELD_NUMBER: _ClassVar[int]
     INPUT_EMBEDDING_IDS_FIELD_NUMBER: _ClassVar[int]
     OUTPUT_EMBEDDING_IDS_FIELD_NUMBER: _ClassVar[int]
-    block_id: int
+    last_block_len: int
     context_block_ids: _containers.RepeatedScalarFieldContainer[int]
     input_embedding_ids: _containers.RepeatedScalarFieldContainer[int]
     output_embedding_ids: _containers.RepeatedScalarFieldContainer[int]
-    def __init__(self, block_id: _Optional[int] = ..., context_block_ids: _Optional[_Iterable[int]] = ..., input_embedding_ids: _Optional[_Iterable[int]] = ..., output_embedding_ids: _Optional[_Iterable[int]] = ...) -> None: ...
+    def __init__(self, last_block_len: _Optional[int] = ..., context_block_ids: _Optional[_Iterable[int]] = ..., input_embedding_ids: _Optional[_Iterable[int]] = ..., output_embedding_ids: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class BatchFillBlock(_message.Message):
     __slots__ = ("items",)

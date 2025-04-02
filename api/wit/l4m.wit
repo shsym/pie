@@ -46,8 +46,8 @@ interface l4m {
 
         // Fills a block with data based on context block IDs, input embed IDs, and output embed IDs
         // Fills a block using a specific adapter along with context block IDs and embed IDs for input/output
-        fill-block: func(stream-id: stream-id, block-id: object-id, context-block-ids: list<object-id>, input-emb-ids: list<object-id>, output-emb-ids: list<object-id>);
-        fill-block-with-adapter: func(stream-id: stream-id, adapter: string, block-id: object-id, context-block-ids: list<object-id>, input-emb-ids: list<object-id>, output-emb-ids: list<object-id>);
+        fill-block: func(stream-id: stream-id, last-block-len: u32, context-block-ids: list<object-id>, input-emb-ids: list<object-id>, output-emb-ids: list<object-id>);
+        fill-block-with-adapter: func(stream-id: stream-id, adapter: string, last-block-len: u32, context-block-ids: list<object-id>, input-emb-ids: list<object-id>, output-emb-ids: list<object-id>);
 
         // Copies data from a source block to a destination block with specified offsets and size
         copy-block: func(stream-id: stream-id, src-block-id: object-id, dst-block-id: object-id, src-offset: u32, dst-offset: u32, size: u32);

@@ -192,7 +192,7 @@ def main_run():
 
 ###====================Test====================###
 
-def llama3_format(prompt: str, hint: str | None, system: str = "You are a helpful, respectful and honest assistant."):
+def llama3_format(prompt: str, hint: str | None, system: str = "you are a helpful assistant."):
     temp = "<|begin_of_text|>"
     temp += f"<|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>"
     temp += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
@@ -205,87 +205,69 @@ def llama3_format(prompt: str, hint: str | None, system: str = "You are a helpfu
 
 
 
-
-
 def main_test():
     device = "cuda:0"
-
-    # quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
-    # , quantization_config=quantization_config
+    FULL_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct" #"meta-llama/Llama-3.1-8B-Instruct" #  #
     model = LlamaForCausalLM.from_pretrained(
         FULL_MODEL_NAME, torch_dtype="bfloat16", device_map=device)
 
     tokenizer = AutoTokenizer.from_pretrained(FULL_MODEL_NAME)
+    
+    
+    engine = Driver(model, 1000, torch.bfloat16, device)
+    
+    test_prompt = llama3_format("What is a pinon coffee? eli 5", None)
+    
+    next_token_ids = tokenizer.encode(test_prompt)
+    output_token_ids = []
+    ctx_blocks = [0]
+    engine.allocate(l4m_pb2.BatchAllocate(items=[l4m_pb2.Allocate(kind=l4m_pb2.ObjectKind.OBJECT_KIND_KV_BLOCK, object_id_offset=0, count=1)]))
 
+    last_block_len = 0
+    token_pos_offset = 0
+    while True:
+        cur_avail = NUM_TOKENS_IN_BLOCK - last_block_len
+        new_blocks_needed = len(next_token_ids) > cur_avail
+        
+        if new_blocks_needed:
+            num_new_blocks_needed = ceil_div(len(next_token_ids) - cur_avail, NUM_TOKENS_IN_BLOCK)
+            engine.allocate(l4m_pb2.BatchAllocate(items=[l4m_pb2.Allocate(kind=l4m_pb2.ObjectKind.OBJECT_KIND_KV_BLOCK, object_id_offset=len(ctx_blocks), count=num_new_blocks_needed)]))
+            ctx_blocks.extend(list(range(len(ctx_blocks), len(ctx_blocks) + num_new_blocks_needed)))
+            last_block_len = (last_block_len + len(next_token_ids)) % NUM_TOKENS_IN_BLOCK
 
-    engine = Driver(model, 5000, torch.bfloat16, device)
+        else:    
+            last_block_len = (last_block_len + len(next_token_ids))
+            
+            
+        engine.embed_text(l4m_pb2.BatchEmbedText(items=[
+            l4m_pb2.EmbedText(embedding_id=i, token_id=next_token_ids[i], position_id=i+token_pos_offset)
+            for i in range(len(next_token_ids))
+        ]))
+        token_pos_offset += len(next_token_ids)
 
-    test_prompt = llama3_format("What is Pinon coffee? ELI 5", None)
-
-    token_ids = tokenizer.encode(test_prompt)
-    print("token_ids:", token_ids)
-
-    num_blocks_needed = ceil_div(len(token_ids), NUM_TOKENS_IN_BLOCK)
-    print("num blocks needed:", num_blocks_needed)
-
-    next_token_pointer_idx = (len(token_ids) % NUM_TOKENS_IN_BLOCK) - 1
-    print("next token pointer idx:", next_token_pointer_idx)
-
-    engine.embed_text(l4m_pb2.BatchEmbedText(items=[
-        l4m_pb2.EmbedText(embedding_id=i, token_id=token_ids[i], position_id=i)
-        for i in range(len(token_ids))
-    ]))
-
-    engine.allocate(l4m_pb2.BatchAllocate(items=[l4m_pb2.Allocate(kind=l4m_pb2.ObjectKind.OBJECT_KIND_KV_BLOCK, object_id_offset=0, count=5)]))
-
-    OUT_EMB_OFFSET = 100
-
-    engine.fill_block(l4m_pb2.BatchFillBlock(items=[
-        l4m_pb2.FillBlock(block_id=0,
-                          context_block_ids=list(range(i + 1)),
-                          input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * i, min(NUM_TOKENS_IN_BLOCK * (i + 1), len(token_ids)))),
-                          output_embedding_ids=[0] if i == num_blocks_needed - 1 else [])
-        for i in range(num_blocks_needed)
-    ]))
-
-    decoded_tokens = []
-
-    last_block_id = num_blocks_needed - 1
-    last_token_idx = (len(token_ids) % NUM_TOKENS_IN_BLOCK) - 1
-
-    for i in range(10):
-        torch.cuda.synchronize()
-
-        time_start = time.time()
-
-
+        
+        engine.fill_block(l4m_pb2.BatchFillBlock(items=[
+            l4m_pb2.FillBlock(block_id=last_block_len,
+                              context_block_ids=ctx_blocks,
+                              input_embedding_ids=list(range(0, len(next_token_ids))),
+                              output_embedding_ids=[0])
+        ]))
+        
         res = engine.sample_top_k_request(l4m_pb2.BatchSampleTopKRequest(items=[
             l4m_pb2.SampleTopKRequest(distribution_id=0, k=5)
         ]))
 
         new_token = res.items[0].token_ids[0]
+        output_token_ids.append(new_token)
+        print(tokenizer.decode(output_token_ids), f"({new_token})")
+        
+        
+        next_token_ids = [new_token]
+        
+        if len(output_token_ids) > 50:
+            break
 
-        # print("new token:", new_token)
-        decoded_tokens.append(new_token)
-        print(tokenizer.decode(decoded_tokens), f"({new_token})")
 
-        engine.embed_text(l4m_pb2.BatchEmbedText(items=[
-            l4m_pb2.EmbedText(embedding_id=len(token_ids) + i, token_id=new_token, position_id=len(token_ids) + i)
-        ]))
-        engine.fill_block(l4m_pb2.BatchFillBlock(items=[
-            l4m_pb2.FillBlock(block_id=0,
-                              context_block_ids=list(range(last_block_id + 1)),
-                              input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * last_block_id, NUM_TOKENS_IN_BLOCK * (last_block_id + 1))),
-                              output_embedding_ids=list(range(OUT_EMB_OFFSET, OUT_EMB_OFFSET + NUM_TOKENS_IN_BLOCK))),
-        ]))
-        torch.cuda.synchronize()
-        time_end = time.time()
-
-        # print the elapsed time in milliseconds
-        # print(f"Elapsed time: {(time_end - time_start) * 1000:.2f}ms")
-
-    print("done!")
-    
     
 if __name__ == "__main__":
     #main_run()

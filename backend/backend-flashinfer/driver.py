@@ -189,20 +189,19 @@ class Driver:
         single_token_inference_mode = True
         
         for i, cmd in enumerate(cmds.items):
-            offset = cmd.block_id # change this name to "offset" later.
+            last_block_len = cmd.block_id # change this name to "offset" later.
             
             ctx_block_ids = cmd.context_block_ids # block == page. make names consistent later.
-            tgt_block_id = ctx_block_ids[-1]
             input_embeds = cmd.input_embedding_ids
             output_embeds = cmd.output_embedding_ids
             
             kv_page_indices.extend(ctx_block_ids)
             kv_page_indptr.append(len(kv_page_indices))
-            kv_last_page_lens.append(offset + len(input_embeds))
+            kv_last_page_lens.append(last_block_len)
             
-            if offset + len(input_embeds) > NUM_TOKENS_IN_BLOCK:
-                # should never happen.
-                raise ValueError("Page size exceeded")
+            # if offset + len(input_embeds) > NUM_TOKENS_IN_BLOCK:
+            #     # should never happen.
+            #     raise ValueError("Page size exceeded")
             
             qo_indices.extend(input_embeds)
             qo_indptr.append(len(qo_indices))
@@ -217,8 +216,16 @@ class Driver:
                 single_token_inference_mode = False
             
             
-            tgt_block = self.blocks[tgt_block_id]
+            
+            total_ctx_tokens = NUM_TOKENS_IN_BLOCK * (len(ctx_block_ids) - 1) + last_block_len
+
             for i in range(len(input_embeds)):
+                
+                token_offset = total_ctx_tokens - len(input_embeds) + i
+                tgt_block_id = token_offset // NUM_TOKENS_IN_BLOCK
+                tgt_block_offset = token_offset % NUM_TOKENS_IN_BLOCK
+                tgt_block = self.blocks[tgt_block_id]
+                
                 if input_embeds[i] in self.embeds:
                     embed = self.embeds[input_embeds[i]]
                     if isinstance(embed, TextEmbed):
@@ -226,8 +233,8 @@ class Driver:
                         new_position_ids.append(embed.position_id)
                         inp_occupancy[i] = True
                         inp_pos_ids[i] = embed.position_id
-                        tgt_block.occupancy[i] = True
-                        tgt_block.position_ids[i] = embed.position_id
+                        tgt_block.occupancy[tgt_block_offset] = True
+                        tgt_block.position_ids[tgt_block_offset] = embed.position_id
                 else:
                     # should never happen, since the controller should have already checked that the input embeds are valid.
                     raise ValueError("Input embedding not found")
@@ -238,33 +245,40 @@ class Driver:
                     "vec_id": output_embeds[i]
                 })
                 
-            ctx_pos_ids = np.hstack([self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids])  # int
-            ctx_occupancy = np.hstack([self.blocks[ctx_id].occupancy for ctx_id in ctx_block_ids])  # bool
+            ctx_pos_ids = np.hstack([self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids])[:total_ctx_tokens]  # int
+            ctx_occupancy = np.hstack([self.blocks[ctx_id].occupancy for ctx_id in ctx_block_ids])[:total_ctx_tokens]  # bool
             casual_mask = ctx_pos_ids[None, :] <= inp_pos_ids[:, None]
             valid_mask = np.logical_and(ctx_occupancy[None, :], inp_occupancy[:, None])
             mask = np.logical_and(casual_mask, valid_mask)
             
             mask_flat = mask.flatten()
             custom_masks.append(mask_flat)
+            #print(mask)
+
 
         # concat all masks
         custom_mask = np.concatenate(custom_masks)
 
-        pt_new_token_ids = torch.as_tensor(new_token_ids, device=self.device(), dtype=torch.int32)
-        pt_new_position_ids = torch.as_tensor(new_position_ids, device=self.device(), dtype=torch.int32)
+        pt_new_token_ids = torch.as_tensor(new_token_ids, device=self.device, dtype=torch.int32)
+        pt_new_position_ids = torch.as_tensor(new_position_ids, device=self.device, dtype=torch.int32)
 
-        pt_kv_page_indices = torch.as_tensor(kv_page_indices, device=self.device(), dtype=torch.int32)
-        pt_kv_page_indptr = torch.as_tensor(kv_page_indptr, device=self.device(), dtype=torch.int32)
-        pt_kv_last_page_lens = torch.as_tensor(kv_last_page_lens, device=self.device(), dtype=torch.int32)
-        pt_qo_indptr = torch.as_tensor(qo_indptr, device=self.device(), dtype=torch.int32)
-        pt_custom_mask = torch.as_tensor(custom_mask, device=self.device(), dtype=torch.bool_)
+        pt_kv_page_indices = torch.as_tensor(kv_page_indices, device=self.device, dtype=torch.int32)
+        pt_kv_page_indptr = torch.as_tensor(kv_page_indptr, device=self.device, dtype=torch.int32)
+        pt_kv_last_page_lens = torch.as_tensor(kv_last_page_lens, device=self.device, dtype=torch.int32)
+        pt_qo_indptr = torch.as_tensor(qo_indptr, device=self.device, dtype=torch.int32)
+        pt_custom_mask = torch.as_tensor(custom_mask, device=self.device, dtype=torch.bool)
 
         input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
 
         torch.cuda.synchronize()
-        print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
+        #print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
+        # print('kv_page_indices', kv_page_indices)
+        # print('kv_page_indptr', kv_page_indptr)
+        # print('kv_last_page_lens', kv_last_page_lens)
+        # print('qo_indptr', qo_indptr)
+        #print('custom_mask', custom_masks)
         
-        with torch.cuda.device(self.device()):
+        with torch.cuda.device(self.device):
             output_embeds = self.lm.model.forward(
                 input_embeds=input_embeds,
                 position_ids=pt_new_position_ids,
@@ -288,7 +302,7 @@ class Driver:
         for token_map in output_embed_postproc:
             vec_id = token_map["vec_id"]
             idx = token_map["idx"]
-
+            #print(f"sampled {idx}-th token among {output_embeds.shape[0]} tokens")
             self.embed_storage_p1.ptr[vec_id].copy_(condensed.values[idx], non_blocking=True)
             self.embed_storage_p2.ptr[vec_id].copy_(condensed.indices[idx], non_blocking=True)
 

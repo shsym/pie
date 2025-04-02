@@ -63,7 +63,8 @@ class L4maAttention(nn.Module):
         key_states = key_states.view(nnz, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(nnz, self.num_key_value_heads, self.head_dim)
 
-        ops.apply_llama31_rope_pos_ids_inplace(query_states, key_states, position_ids)
+        #print(position_ids)
+        ops.apply_llama31_rope_pos_ids_inplace(q=query_states, k=key_states, pos_ids=position_ids)
 
         
         batch_indices, positions = ops.get_batch_indices_positions(
@@ -71,7 +72,7 @@ class L4maAttention(nn.Module):
             ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, NUM_TOKENS_IN_BLOCK),
             nnz
         )
-
+        
         ops.append_paged_kv_cache(
             key_states,
             value_states,
@@ -84,6 +85,7 @@ class L4maAttention(nn.Module):
         )
 
         attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
+        attn_output = attn_output.reshape(nnz, -1)
 
         attn_output = self.o_proj(attn_output)
         return attn_output
@@ -144,7 +146,7 @@ class L4maModel(nn.Module):
         # super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
+        self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [L4maDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -177,28 +179,49 @@ class L4maModel(nn.Module):
         # check if its decoding (qo_indptr is )
         if single_token_inference_mode:
             self.wrapper_decode.plan(
-                kv_page_indptr,
-                kv_page_indices,
-                kv_last_page_lens,
-                self.num_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-                NUM_TOKENS_IN_BLOCK,
+                indptr=kv_page_indptr,
+                indices=kv_page_indices,
+                last_page_len=kv_last_page_lens,
+                num_qo_heads=self.config.num_attention_heads,
+                num_kv_heads=self.config.num_key_value_heads,
+                head_dim=self.config.hidden_size // self.config.num_attention_heads,
+                page_size=NUM_TOKENS_IN_BLOCK,
                 pos_encoding_mode="NONE",
-                q_data_type=torch.float16
+                q_data_type=torch.bfloat16
             )
             wrapper = self.wrapper_decode
         else:
+            
+            # mask_arr = []
+            # qo_len = (qo_indptr[1:] - qo_indptr[:-1]).cpu().tolist()
+            # kv_len = (NUM_TOKENS_IN_BLOCK * (kv_page_indptr[1:] - kv_page_indptr[:-1] - 1) + kv_last_page_lens).cpu().tolist()
+            # for i in range(1):
+            #     mask_i = torch.tril(
+            #         torch.full((qo_len[i], kv_len[i]), True, device="cuda:0"),
+            #         diagonal=(kv_len[i] - qo_len[i]),
+            #     )
+            #     print(mask_i.shape)
+            #     mask_arr.append(mask_i.flatten())
+            #     print(mask_i.tolist())
+
+
+            # mask = torch.cat(mask_arr, dim=0)
+            
+            
+            
+            
+            
             self.wrapper_append.plan(
-                qo_indptr,
-                kv_page_indptr,
-                kv_page_indices,
-                kv_last_page_lens,
-                self.num_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-                NUM_TOKENS_IN_BLOCK,
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=kv_page_indptr,
+                paged_kv_indices=kv_page_indices,
+                paged_kv_last_page_len=kv_last_page_lens,
+                num_qo_heads=self.config.num_attention_heads,
+                num_kv_heads=self.config.num_key_value_heads,
+                head_dim_qk=self.config.hidden_size // self.config.num_attention_heads,
+                page_size=NUM_TOKENS_IN_BLOCK,
                 custom_mask=custom_mask,
+                q_data_type=torch.bfloat16
             )
             wrapper = self.wrapper_append
   

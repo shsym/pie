@@ -164,7 +164,7 @@ pub enum Command {
     FillBlock {
         inst_id: InstanceId,
         stream_id: LocalStreamId,
-        block: IdRepr,
+        last_block_len: u32,
         context: Vec<IdRepr>,
         inputs: Vec<IdRepr>,
         outputs: Vec<IdRepr>,
@@ -537,17 +537,12 @@ impl L4m {
             Command::FillBlock {
                 inst_id,
                 stream_id,
-                mut block,
+                last_block_len,
                 mut context,
                 mut inputs,
                 mut outputs,
             } => {
-                try_trap!(
-                    self.objects
-                        .translate(ManagedTypes::KvBlock, inst_id, &mut block),
-                    inst_id,
-                    format!("l4m::fill_block failed. cannot find {}", block)
-                );
+
                 try_trap!(
                     self.objects
                         .translate_many(ManagedTypes::KvBlock, inst_id, &mut context),
@@ -571,7 +566,7 @@ impl L4m {
                     Command::FillBlock {
                         inst_id,
                         stream_id,
-                        block,
+                        last_block_len,
                         context,
                         inputs,
                         outputs,
@@ -1118,13 +1113,13 @@ fn encode_pb_batch_fill_block(
             Command::FillBlock {
                 inst_id,
                 stream_id,
-                block,
+                last_block_len,
                 context,
                 inputs,
                 outputs,
             } => {
                 let pb = pb_bindings::FillBlock {
-                    block_id: block,
+                    last_block_len: last_block_len,
                     context_block_ids: context,
                     input_embedding_ids: inputs,
                     output_embedding_ids: outputs,

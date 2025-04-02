@@ -251,7 +251,7 @@ async fn main() -> Result<(), String> {
     );
 
     let output = ctx
-        .generate(&mut drafter, &mut sampler, &mut stop_condition)
+        .generate_with_drafter(&mut drafter, &mut sampler, &mut stop_condition)
         .await;
 
     println!("Out {:?}, elapsed: {:?}", output, start.elapsed());

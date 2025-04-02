@@ -24,15 +24,15 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tl4m.proto\x12\x03l4m\"R\n\x08\x41llocate\x12\x1d\n\x04kind\x18\x01 \x01(\x0e\x32\x0f.l4m.ObjectKind\x12\x18\n\x10object_id_offset\x18\x02 \x01(\r\x12\r\n\x05\x63ount\x18\x03 \x01(\r\"-\n\rBatchAllocate\x12\x1c\n\x05items\x18\x01 \x03(\x0b\x32\r.l4m.Allocate\"/\n\x0f\x42\x61tchDeallocate\x12\x1c\n\x05items\x18\x01 \x03(\x0b\x32\r.l4m.Allocate\"H\n\tEmbedText\x12\x14\n\x0c\x65mbedding_id\x18\x01 \x01(\r\x12\x10\n\x08token_id\x18\x02 \x01(\r\x12\x13\n\x0bposition_id\x18\x03 \x01(\r\"/\n\x0e\x42\x61tchEmbedText\x12\x1d\n\x05items\x18\x01 \x03(\x0b\x32\x0e.l4m.EmbedText\"s\n\tFillBlock\x12\x10\n\x08\x62lock_id\x18\x01 \x01(\r\x12\x19\n\x11\x63ontext_block_ids\x18\x02 \x03(\r\x12\x1b\n\x13input_embedding_ids\x18\x03 \x03(\r\x12\x1c\n\x14output_embedding_ids\x18\x04 \x03(\r\"/\n\x0e\x42\x61tchFillBlock\x12\x1d\n\x05items\x18\x01 \x03(\x0b\x32\x0e.l4m.FillBlock\"+\n\tMaskBlock\x12\x10\n\x08\x62lock_id\x18\x01 \x01(\r\x12\x0c\n\x04mask\x18\x02 \x03(\x08\"/\n\x0e\x42\x61tchMaskBlock\x12\x1d\n\x05items\x18\x01 \x03(\x0b\x32\x0e.l4m.MaskBlock\"\x83\x01\n\tCopyBlock\x12\x17\n\x0fsource_block_id\x18\x01 \x01(\r\x12\x1c\n\x14\x64\x65stination_block_id\x18\x02 \x01(\r\x12\x14\n\x0csource_start\x18\x03 \x01(\r\x12\x19\n\x11\x64\x65stination_start\x18\x04 \x01(\r\x12\x0e\n\x06length\x18\x05 \x01(\r\"/\n\x0e\x42\x61tchCopyBlock\x12\x1d\n\x05items\x18\x01 \x03(\x0b\x32\x0e.l4m.CopyBlock\"H\n\x17\x44\x65\x63odeTokenDistribution\x12\x14\n\x0c\x65mbedding_id\x18\x01 \x01(\r\x12\x17\n\x0f\x64istribution_id\x18\x02 \x01(\r\"K\n\x1c\x42\x61tchDecodeTokenDistribution\x12+\n\x05items\x18\x01 \x03(\x0b\x32\x1c.l4m.DecodeTokenDistribution\"7\n\x11SampleTopKRequest\x12\x17\n\x0f\x64istribution_id\x18\x01 \x01(\r\x12\t\n\x01k\x18\x02 \x01(\r\"?\n\x16\x42\x61tchSampleTopKRequest\x12%\n\x05items\x18\x01 \x03(\x0b\x32\x16.l4m.SampleTopKRequest\">\n\x12SampleTopKResponse\x12\x11\n\ttoken_ids\x18\x01 \x03(\r\x12\x15\n\rprobabilities\x18\x02 \x03(\x02\"A\n\x17\x42\x61tchSampleTopKResponse\x12&\n\x05items\x18\x01 \x03(\x0b\x32\x17.l4m.SampleTopKResponse\"\x10\n\x0eGetInfoRequest\"\xaf\x01\n\x0fGetInfoResponse\x12\x0f\n\x07version\x18\x01 \x01(\t\x12\x12\n\nmodel_name\x18\x02 \x01(\t\x12\x12\n\nblock_size\x18\x03 \x01(\r\x12\x1c\n\x14num_available_blocks\x18\x04 \x01(\r\x12 \n\x18num_available_embeddings\x18\x05 \x01(\r\x12#\n\x1bnum_available_distributions\x18\x06 \x01(\r\"\xda\x03\n\x07Request\x12\x16\n\x0e\x63orrelation_id\x18\x01 \x01(\r\x12&\n\x08\x61llocate\x18\x02 \x01(\x0b\x32\x12.l4m.BatchAllocateH\x00\x12*\n\ndeallocate\x18\x03 \x01(\x0b\x32\x14.l4m.BatchDeallocateH\x00\x12)\n\nembed_text\x18\x04 \x01(\x0b\x32\x13.l4m.BatchEmbedTextH\x00\x12)\n\nfill_block\x18\x05 \x01(\x0b\x32\x13.l4m.BatchFillBlockH\x00\x12)\n\nmask_block\x18\x06 \x01(\x0b\x32\x13.l4m.BatchMaskBlockH\x00\x12)\n\ncopy_block\x18\x07 \x01(\x0b\x32\x13.l4m.BatchCopyBlockH\x00\x12\x46\n\x19\x64\x65\x63ode_token_distribution\x18\x08 \x01(\x0b\x32!.l4m.BatchDecodeTokenDistributionH\x00\x12;\n\x14sample_top_k_request\x18\t \x01(\x0b\x32\x1b.l4m.BatchSampleTopKRequestH\x00\x12\'\n\x08get_info\x18\n \x01(\x0b\x32\x13.l4m.GetInfoRequestH\x00\x42\t\n\x07\x63ommand\"\x8d\x01\n\x08Response\x12\x16\n\x0e\x63orrelation_id\x18\x01 \x01(\r\x12\x34\n\x0csample_top_k\x18\x02 \x01(\x0b\x32\x1c.l4m.BatchSampleTopKResponseH\x00\x12(\n\x08get_info\x18\x03 \x01(\x0b\x32\x14.l4m.GetInfoResponseH\x00\x42\t\n\x07\x63ommand*n\n\nObjectKind\x12\x1b\n\x17OBJECT_KIND_UNSPECIFIED\x10\x00\x12\x18\n\x14OBJECT_KIND_KV_BLOCK\x10\x01\x12\x13\n\x0fOBJECT_KIND_EMB\x10\x02\x12\x14\n\x10OBJECT_KIND_DIST\x10\x03\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tl4m.proto\x12\x03l4m\"R\n\x08\x41llocate\x12\x1d\n\x04kind\x18\x01 \x01(\x0e\x32\x0f.l4m.ObjectKind\x12\x18\n\x10object_id_offset\x18\x02 \x01(\r\x12\r\n\x05\x63ount\x18\x03 \x01(\r\"-\n\rBatchAllocate\x12\x1c\n\x05items\x18\x01 \x03(\x0b\x32\r.l4m.Allocate\"/\n\x0f\x42\x61tchDeallocate\x12\x1c\n\x05items\x18\x01 \x03(\x0b\x32\r.l4m.Allocate\"H\n\tEmbedText\x12\x14\n\x0c\x65mbedding_id\x18\x01 \x01(\r\x12\x10\n\x08token_id\x18\x02 \x01(\r\x12\x13\n\x0bposition_id\x18\x03 \x01(\r\"/\n\x0e\x42\x61tchEmbedText\x12\x1d\n\x05items\x18\x01 \x03(\x0b\x32\x0e.l4m.EmbedText\"y\n\tFillBlock\x12\x16\n\x0elast_block_len\x18\x01 \x01(\r\x12\x19\n\x11\x63ontext_block_ids\x18\x02 \x03(\r\x12\x1b\n\x13input_embedding_ids\x18\x03 \x03(\r\x12\x1c\n\x14output_embedding_ids\x18\x04 \x03(\r\"/\n\x0e\x42\x61tchFillBlock\x12\x1d\n\x05items\x18\x01 \x03(\x0b\x32\x0e.l4m.FillBlock\"+\n\tMaskBlock\x12\x10\n\x08\x62lock_id\x18\x01 \x01(\r\x12\x0c\n\x04mask\x18\x02 \x03(\x08\"/\n\x0e\x42\x61tchMaskBlock\x12\x1d\n\x05items\x18\x01 \x03(\x0b\x32\x0e.l4m.MaskBlock\"\x83\x01\n\tCopyBlock\x12\x17\n\x0fsource_block_id\x18\x01 \x01(\r\x12\x1c\n\x14\x64\x65stination_block_id\x18\x02 \x01(\r\x12\x14\n\x0csource_start\x18\x03 \x01(\r\x12\x19\n\x11\x64\x65stination_start\x18\x04 \x01(\r\x12\x0e\n\x06length\x18\x05 \x01(\r\"/\n\x0e\x42\x61tchCopyBlock\x12\x1d\n\x05items\x18\x01 \x03(\x0b\x32\x0e.l4m.CopyBlock\"H\n\x17\x44\x65\x63odeTokenDistribution\x12\x14\n\x0c\x65mbedding_id\x18\x01 \x01(\r\x12\x17\n\x0f\x64istribution_id\x18\x02 \x01(\r\"K\n\x1c\x42\x61tchDecodeTokenDistribution\x12+\n\x05items\x18\x01 \x03(\x0b\x32\x1c.l4m.DecodeTokenDistribution\"7\n\x11SampleTopKRequest\x12\x17\n\x0f\x64istribution_id\x18\x01 \x01(\r\x12\t\n\x01k\x18\x02 \x01(\r\"?\n\x16\x42\x61tchSampleTopKRequest\x12%\n\x05items\x18\x01 \x03(\x0b\x32\x16.l4m.SampleTopKRequest\">\n\x12SampleTopKResponse\x12\x11\n\ttoken_ids\x18\x01 \x03(\r\x12\x15\n\rprobabilities\x18\x02 \x03(\x02\"A\n\x17\x42\x61tchSampleTopKResponse\x12&\n\x05items\x18\x01 \x03(\x0b\x32\x17.l4m.SampleTopKResponse\"\x10\n\x0eGetInfoRequest\"\xaf\x01\n\x0fGetInfoResponse\x12\x0f\n\x07version\x18\x01 \x01(\t\x12\x12\n\nmodel_name\x18\x02 \x01(\t\x12\x12\n\nblock_size\x18\x03 \x01(\r\x12\x1c\n\x14num_available_blocks\x18\x04 \x01(\r\x12 \n\x18num_available_embeddings\x18\x05 \x01(\r\x12#\n\x1bnum_available_distributions\x18\x06 \x01(\r\"\xda\x03\n\x07Request\x12\x16\n\x0e\x63orrelation_id\x18\x01 \x01(\r\x12&\n\x08\x61llocate\x18\x02 \x01(\x0b\x32\x12.l4m.BatchAllocateH\x00\x12*\n\ndeallocate\x18\x03 \x01(\x0b\x32\x14.l4m.BatchDeallocateH\x00\x12)\n\nembed_text\x18\x04 \x01(\x0b\x32\x13.l4m.BatchEmbedTextH\x00\x12)\n\nfill_block\x18\x05 \x01(\x0b\x32\x13.l4m.BatchFillBlockH\x00\x12)\n\nmask_block\x18\x06 \x01(\x0b\x32\x13.l4m.BatchMaskBlockH\x00\x12)\n\ncopy_block\x18\x07 \x01(\x0b\x32\x13.l4m.BatchCopyBlockH\x00\x12\x46\n\x19\x64\x65\x63ode_token_distribution\x18\x08 \x01(\x0b\x32!.l4m.BatchDecodeTokenDistributionH\x00\x12;\n\x14sample_top_k_request\x18\t \x01(\x0b\x32\x1b.l4m.BatchSampleTopKRequestH\x00\x12\'\n\x08get_info\x18\n \x01(\x0b\x32\x13.l4m.GetInfoRequestH\x00\x42\t\n\x07\x63ommand\"\x8d\x01\n\x08Response\x12\x16\n\x0e\x63orrelation_id\x18\x01 \x01(\r\x12\x34\n\x0csample_top_k\x18\x02 \x01(\x0b\x32\x1c.l4m.BatchSampleTopKResponseH\x00\x12(\n\x08get_info\x18\x03 \x01(\x0b\x32\x14.l4m.GetInfoResponseH\x00\x42\t\n\x07\x63ommand*n\n\nObjectKind\x12\x1b\n\x17OBJECT_KIND_UNSPECIFIED\x10\x00\x12\x18\n\x14OBJECT_KIND_KV_BLOCK\x10\x01\x12\x13\n\x0fOBJECT_KIND_EMB\x10\x02\x12\x14\n\x10OBJECT_KIND_DIST\x10\x03\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'l4m_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_OBJECTKIND']._serialized_start=1985
-  _globals['_OBJECTKIND']._serialized_end=2095
+  _globals['_OBJECTKIND']._serialized_start=1991
+  _globals['_OBJECTKIND']._serialized_end=2101
   _globals['_ALLOCATE']._serialized_start=18
   _globals['_ALLOCATE']._serialized_end=100
   _globals['_BATCHALLOCATE']._serialized_start=102
@@ -44,35 +44,35 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_BATCHEMBEDTEXT']._serialized_start=272
   _globals['_BATCHEMBEDTEXT']._serialized_end=319
   _globals['_FILLBLOCK']._serialized_start=321
-  _globals['_FILLBLOCK']._serialized_end=436
-  _globals['_BATCHFILLBLOCK']._serialized_start=438
-  _globals['_BATCHFILLBLOCK']._serialized_end=485
-  _globals['_MASKBLOCK']._serialized_start=487
-  _globals['_MASKBLOCK']._serialized_end=530
-  _globals['_BATCHMASKBLOCK']._serialized_start=532
-  _globals['_BATCHMASKBLOCK']._serialized_end=579
-  _globals['_COPYBLOCK']._serialized_start=582
-  _globals['_COPYBLOCK']._serialized_end=713
-  _globals['_BATCHCOPYBLOCK']._serialized_start=715
-  _globals['_BATCHCOPYBLOCK']._serialized_end=762
-  _globals['_DECODETOKENDISTRIBUTION']._serialized_start=764
-  _globals['_DECODETOKENDISTRIBUTION']._serialized_end=836
-  _globals['_BATCHDECODETOKENDISTRIBUTION']._serialized_start=838
-  _globals['_BATCHDECODETOKENDISTRIBUTION']._serialized_end=913
-  _globals['_SAMPLETOPKREQUEST']._serialized_start=915
-  _globals['_SAMPLETOPKREQUEST']._serialized_end=970
-  _globals['_BATCHSAMPLETOPKREQUEST']._serialized_start=972
-  _globals['_BATCHSAMPLETOPKREQUEST']._serialized_end=1035
-  _globals['_SAMPLETOPKRESPONSE']._serialized_start=1037
-  _globals['_SAMPLETOPKRESPONSE']._serialized_end=1099
-  _globals['_BATCHSAMPLETOPKRESPONSE']._serialized_start=1101
-  _globals['_BATCHSAMPLETOPKRESPONSE']._serialized_end=1166
-  _globals['_GETINFOREQUEST']._serialized_start=1168
-  _globals['_GETINFOREQUEST']._serialized_end=1184
-  _globals['_GETINFORESPONSE']._serialized_start=1187
-  _globals['_GETINFORESPONSE']._serialized_end=1362
-  _globals['_REQUEST']._serialized_start=1365
-  _globals['_REQUEST']._serialized_end=1839
-  _globals['_RESPONSE']._serialized_start=1842
-  _globals['_RESPONSE']._serialized_end=1983
+  _globals['_FILLBLOCK']._serialized_end=442
+  _globals['_BATCHFILLBLOCK']._serialized_start=444
+  _globals['_BATCHFILLBLOCK']._serialized_end=491
+  _globals['_MASKBLOCK']._serialized_start=493
+  _globals['_MASKBLOCK']._serialized_end=536
+  _globals['_BATCHMASKBLOCK']._serialized_start=538
+  _globals['_BATCHMASKBLOCK']._serialized_end=585
+  _globals['_COPYBLOCK']._serialized_start=588
+  _globals['_COPYBLOCK']._serialized_end=719
+  _globals['_BATCHCOPYBLOCK']._serialized_start=721
+  _globals['_BATCHCOPYBLOCK']._serialized_end=768
+  _globals['_DECODETOKENDISTRIBUTION']._serialized_start=770
+  _globals['_DECODETOKENDISTRIBUTION']._serialized_end=842
+  _globals['_BATCHDECODETOKENDISTRIBUTION']._serialized_start=844
+  _globals['_BATCHDECODETOKENDISTRIBUTION']._serialized_end=919
+  _globals['_SAMPLETOPKREQUEST']._serialized_start=921
+  _globals['_SAMPLETOPKREQUEST']._serialized_end=976
+  _globals['_BATCHSAMPLETOPKREQUEST']._serialized_start=978
+  _globals['_BATCHSAMPLETOPKREQUEST']._serialized_end=1041
+  _globals['_SAMPLETOPKRESPONSE']._serialized_start=1043
+  _globals['_SAMPLETOPKRESPONSE']._serialized_end=1105
+  _globals['_BATCHSAMPLETOPKRESPONSE']._serialized_start=1107
+  _globals['_BATCHSAMPLETOPKRESPONSE']._serialized_end=1172
+  _globals['_GETINFOREQUEST']._serialized_start=1174
+  _globals['_GETINFOREQUEST']._serialized_end=1190
+  _globals['_GETINFORESPONSE']._serialized_start=1193
+  _globals['_GETINFORESPONSE']._serialized_end=1368
+  _globals['_REQUEST']._serialized_start=1371
+  _globals['_REQUEST']._serialized_end=1845
+  _globals['_RESPONSE']._serialized_start=1848
+  _globals['_RESPONSE']._serialized_end=1989
 # @@protoc_insertion_point(module_scope)

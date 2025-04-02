@@ -67,7 +67,7 @@ message BatchEmbedText {
 // A single block fill specification.
 message FillBlock {
   // The ID of the block to fill.
-  uint32 block_id = 1;
+  uint32 last_block_len = 1;
   // IDs of blocks providing context for the fill operation.
   repeated uint32 context_block_ids = 2;
   // Input embeddings that seed the fill.
