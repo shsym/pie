@@ -140,6 +140,17 @@ async fn main() -> anyhow::Result<()> {
             .install();
     }
 
+    
+    // periodically print stats
+    tokio::spawn(async {
+        loop {
+            let service_id = service::get_service_id(l4m::available_models().first().unwrap()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            l4m::Command::PrintStats.dispatch(service_id).unwrap();
+        }
+    });
+
+
     // TEST: spawn a dummy client with the program name
     // if *is_http {
     //     tokio::spawn(dummy_client2(program_name.to_string(), port));

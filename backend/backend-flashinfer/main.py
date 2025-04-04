@@ -77,7 +77,7 @@ def main_run():
     #endpoint = "tcp://*:8888"
     endpoint = "ipc:///tmp/symphony-ipc"
 
-    engine = Driver(model, 1000, torch.bfloat16, device)
+    engine = Driver(model, 2000, torch.bfloat16, device)
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)

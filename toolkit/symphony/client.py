@@ -85,14 +85,16 @@ class SymphonyClient:
 
     async def close(self):
         """Close the WebSocket connection and clean up."""
-        if self.ws and not self.ws.closed:
-            await self.ws.close()
+        
         if self.listener_task:
             self.listener_task.cancel()
             try:
                 await self.listener_task
             except asyncio.CancelledError:
                 pass
+            
+        if self.ws and not self.ws.closed:
+            await self.ws.close()
         print("[SymphonyClient] Connection closed/cancelled.")
 
     def _get_next_corr_id(self):

@@ -84,6 +84,10 @@ where
         Ok(())
     }
 
+    pub fn capacity(&self) -> T {
+        self.max_capacity
+    }
+
     /// Allocate and return the smallest available ID.
     ///
     /// Returns `Some(id)` if an ID is available, or `None` if the pool is exhausted.

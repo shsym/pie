@@ -131,6 +131,12 @@ impl Default for StreamPriority {
 
 #[derive(Debug)]
 pub enum Command {
+    PrintStats,
+
+    Destroy {
+        inst_id: InstanceId,
+    },
+
     GetInfo {
         handle: oneshot::Sender<Info>,
     },
@@ -346,19 +352,12 @@ impl Service for L4m {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
-        match self.translate_cmd(cmd) {
-            // Should be sent to backend
-            Some((cmd, mut stream)) => {
-                // adjust stream priority
-                if let Some(priority) = self.stream_priorities.get(&stream) {
-                    stream.set_priority(*priority)
-                }
-
-                self.scheduler.send((stream, cmd)).await.unwrap();
+        if let Command::Destroy { inst_id } = cmd {
+            for cmd in self.get_cleanup_cmds(inst_id) {
+                self.handle_cmd(cmd).await;
             }
-
-            // No need to send to backend
-            None => {}
+        } else {
+            self.handle_cmd(cmd).await;
         }
     }
 }
@@ -368,8 +367,8 @@ impl L4m {
     where
         B: Backend + 'static,
     {
-        let (event_tx, event_rx) = mpsc::channel(1000);
-        let (scheduler_tx, scheduler_rx) = mpsc::channel(1000);
+        let (event_tx, event_rx) = mpsc::channel(1024 * 8);
+        let (scheduler_tx, scheduler_rx) = mpsc::channel(1024 * 8);
 
         backend.register_listener(0, event_tx).await;
         let event_table = Arc::new(DashMap::new());
@@ -441,27 +440,81 @@ impl L4m {
 
         driver
     }
-    async fn destroy(&mut self, inst_id: InstanceId) {
+
+    pub fn print_stats(&self) {
+        // INSERT_YOUR_REWRITE_HERE
+        let mut stats = Vec::new();
+        for &managed_type in &[ManagedTypes::KvBlock, ManagedTypes::TokenEmb] {
+            let current = self.objects.available(managed_type).unwrap();
+            let capacity: usize = self.objects.capacity(managed_type).unwrap() as usize;
+            let used = capacity - current;
+            let percentage = (used as f32 / capacity as f32) * 100.0;
+
+            let type_name = match managed_type {
+                ManagedTypes::KvBlock => "kvpage",
+                ManagedTypes::TokenEmb => "tokenemb",
+                _ => "unknown",
+            };
+
+            stats.push(format!(
+                "{}: {} / {} ({:.2}% used)",
+                type_name, used, capacity, percentage
+            ));
+        }
+
+        println!("{}", stats.join(" | "));
+    }
+
+    fn get_cleanup_cmds(&mut self, inst_id: InstanceId) -> Vec<Command> {
         let mut cmds = Vec::new();
 
         for ty in [ManagedTypes::KvBlock, ManagedTypes::TokenEmb] {
-            cmds.push(Command::Deallocate {
-                inst_id,
-                stream_id: 0,
-                ty,
-                ids: self.objects.all_names(ty, inst_id).unwrap(),
-            })
+            if let Ok(ids) = self.objects.all_names(ty, inst_id) {
+                cmds.push(Command::Deallocate {
+                    inst_id,
+                    stream_id: 0,
+                    ty,
+                    ids,
+                });
+            }
         }
 
-        for cmd in cmds {
-            self.handle(cmd).await;
-        }
+        //println!("deallocating all objects for instance: {:?}", cmds);
 
         // Remove all exported blocks
         self.exported_blocks.retain(|_, v| v.owner != inst_id);
+
+        cmds
     }
-    fn translate_cmd(&mut self, cmd: Command) -> Option<(Command, Stream)> {
+
+    async fn handle_cmd(&mut self, cmd: Command) {
+        match self.resolve_cmd(cmd) {
+            // Should be sent to backend
+            Some((cmd, mut stream)) => {
+                // adjust stream priority
+                if let Some(priority) = self.stream_priorities.get(&stream) {
+                    stream.set_priority(*priority)
+                }
+
+                self.scheduler.send((stream, cmd)).await.unwrap();
+            }
+
+            // No need to send to backend
+            None => {}
+        }
+    }
+
+    fn resolve_cmd(&mut self, cmd: Command) -> Option<(Command, Stream)> {
         match cmd {
+            Command::PrintStats => {
+                self.print_stats();
+                None
+            }
+
+            Command::Destroy { .. } => {
+                unreachable!()
+            }
+
             Command::GetInfo { handle } => Some((Command::GetInfo { handle }, Stream::default())),
 
             Command::GetBlockSize { handle } => {
@@ -490,6 +543,15 @@ impl L4m {
                 ty,
                 ids,
             } => {
+
+                // check available space
+                if self.objects.available(ty).unwrap() < ids.len() {
+                    runtime::trap(
+                        inst_id,
+                        "l4m::allocation failed. not enough available space",
+                    );
+                }
+
                 let ids = try_trap!(
                     self.objects.create_many(ty, inst_id, ids),
                     inst_id,
@@ -513,11 +575,21 @@ impl L4m {
                 ty,
                 ids,
             } => {
+
+                // if ty == ManagedTypes::TokenEmb {
+                //     println!("deallocating tokenemb, ids: {:?}", ids);
+                //     println!("available tokenemb: {:?}", self.objects.available(ty));
+                // }
+               
                 let ids = try_trap!(
                     self.objects.destroy_many(ty, inst_id, &ids),
                     inst_id,
                     "l4m::deallocation failed"
                 );
+
+                // if ty == ManagedTypes::TokenEmb {
+                //     println!("available tokenemb after deallocation: {:?}", self.objects.available(ty));
+                // }
 
                 if ids.is_empty() {
                     return None;
@@ -542,12 +614,14 @@ impl L4m {
                 mut inputs,
                 mut outputs,
             } => {
-
                 if last_block_len == 0 || last_block_len > self.info.block_size {
                     // error
                     runtime::trap(
                         inst_id,
-                        format!("l4m::fill_block failed. last_block_len ({}) is 0 or greater than the block size ({})", last_block_len, self.info.block_size  )
+                        format!(
+                            "l4m::fill_block failed. last_block_len ({}) is 0 or greater than the block size ({})",
+                            last_block_len, self.info.block_size
+                        ),
                     );
                     return None;
                 }
@@ -558,7 +632,11 @@ impl L4m {
                     // error
                     runtime::trap(
                         inst_id,
-                        format!("l4m::fill_block failed. inputs length is greater than the max tokens: {} > {}", inputs.len(), max_tokens)
+                        format!(
+                            "l4m::fill_block failed. inputs length is greater than the max tokens: {} > {}",
+                            inputs.len(),
+                            max_tokens
+                        ),
                     );
                     return None;
                 }
@@ -815,13 +893,14 @@ impl L4m {
         let mut sch = CommandScheduler::new(backend, event_table);
 
         loop {
-            let res = if sch.has_pending_command() {
-                // With pending tasks, wait up to 100µs for a new command.
-                timeout(Duration::from_micros(100), rx.recv()).await
-            } else {
-                // Without pending tasks, wait indefinitely.
-                Ok(rx.recv().await)
-            };
+            let res: Result<Option<(Stream, Command)>, tokio::time::error::Elapsed> =
+                if sch.has_pending_command() {
+                    // With pending tasks, wait up to 100µs for a new command.
+                    timeout(Duration::from_micros(100), rx.recv()).await
+                } else {
+                    // Without pending tasks, wait indefinitely.
+                    Ok(rx.recv().await)
+                };
 
             match res {
                 Ok(Some((stream, cmd))) => {

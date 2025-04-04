@@ -6,7 +6,7 @@ from symphony import SymphonyClient, Instance  # Assuming these are defined else
 import random
 async def main():
     # Define the program name and construct the file path
-    program_name = "text_completion"
+    program_name = "tree_of_thought" #"text_completion"
     program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
 
     # Check if the program file exists
@@ -35,7 +35,7 @@ async def main():
         print("Program uploaded successfully!")
 
     # Launch 200 instances
-    NUM_INSTANCES = 200
+    NUM_INSTANCES = 1
     instances = []
     for _ in range(NUM_INSTANCES):
         instance = await client.launch_instance(program_hash)
@@ -88,8 +88,11 @@ async def main():
     print(f"Overall throughput: {throughput:.2f} instances per second")
 
     # Close the client connection
-    await client.close()
+    #await client.close()
     print("Client connection closed.")
+    
+    # exit the program
+    exit(0)
 
 if __name__ == "__main__":
     asyncio.run(main())

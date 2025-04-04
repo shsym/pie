@@ -122,6 +122,16 @@ where
             .map_err(|e| ObjectError::NoAvailableSpace)
     }
 
+    pub fn capacity(&self, ty: TY) -> Result<IdRepr, ObjectError> {
+        let id_pool = self.id_pool.get(&ty).ok_or(ObjectError::ObjectNotFound)?;
+        Ok(id_pool.capacity())
+    }
+
+    pub fn available(&self, ty: TY) -> Result<usize, ObjectError> {
+        let id_pool = self.id_pool.get(&ty).ok_or(ObjectError::ObjectNotFound)?;
+        Ok(id_pool.available())
+    }
+
     pub fn create(&mut self, ty: TY, ns: NS, name: IdRepr) -> Result<IdRepr, ObjectError> {
         // acquire an ID from the pool
         let id = self
@@ -311,6 +321,8 @@ where
         ns: NS,
         names: &[IdRepr],
     ) -> Result<Vec<IdRepr>, ObjectError> {
+
+
         // Get the namespace table for the given type and namespace.
         let ty_ns = (ty.clone(), ns);
         let table = self
@@ -320,29 +332,43 @@ where
 
         let mut freed_ids = Vec::new();
 
+        // print hashmap
+        //println!("hashmap: {:?}", table);
+
         for name in names {
             // Remove the (name, id) pair from the namespace.
-            let id = table.remove(name).ok_or(ObjectError::ObjectNotFound)?;
+            if let Some(id) = table.remove(name) {
+                
+                //println!("attempting to free, type: {:?}, id: {:?}", ty, id);
+                // Determine if the object should be freed.
+                let should_free = if ty.is_sharable() {
 
-            // Determine if the object should be freed.
-            let should_free = if ty.is_sharable() {
-                self.ref_counter
-                    .get_mut(&ty)
-                    .unwrap()
-                    .get_mut(&id)
-                    .unwrap()
-                    .dec()
-                    <= 0
-            }
-            // Non-sharable objects are always freed.
-            else {
-                true
-            };
+                    // let rc =self.ref_counter
+                    // .get_mut(&ty)
+                    // .unwrap()
+                    // .get_mut(&id).unwrap().get();
 
-            if should_free {
-                self.id_pool.get_mut(&ty).unwrap().release(id);
-                freed_ids.push(id);
-            }
+                    //println!("ref count: {:?}", rc);
+
+                    self.ref_counter
+                        .get_mut(&ty)
+                        .unwrap()
+                        .get_mut(&id)
+                        .unwrap()
+                        .dec()
+                        <= 0
+                }
+                // Non-sharable objects are always freed.
+                else {
+                    true
+                };
+
+                if should_free {
+                    //println!("freed, type: {:?}, id: {:?}", ty, id);
+                    self.id_pool.get_mut(&ty).unwrap().release(id);
+                        freed_ids.push(id);
+                }
+            } 
         }
 
         // cleanup the namespace table if it is empty
@@ -360,8 +386,8 @@ where
             .namespaces
             .get_mut(&ty_ns)
             .ok_or(ObjectError::VSpaceNotFound)?
-            .drain()
-            .map(|(n, _)| n)
+            .iter()
+            .map(|(n, _)| *n)
             .collect();
 
         Ok(names)

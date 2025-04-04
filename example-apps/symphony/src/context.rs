@@ -2,7 +2,7 @@ use crate::drafter::Drafter;
 use crate::l4m::ObjectType;
 use crate::sampler::Sampler;
 use crate::stop_condition::StopCondition;
-use crate::utils::{IdPool, RcIdPool};
+use crate::utils::{ResourcePool, ResourceRcPool};
 use crate::{drafter, l4m, l4m_async, sampler, stop_condition};
 use std::cell::RefCell;
 use std::mem;
@@ -16,10 +16,9 @@ fn get_unique_stream() -> u32 {
 }
 
 #[derive(Debug)]
-struct ResourcePool {
-    block_ids: RcIdPool<u32>,
-    embed_ids: IdPool<u32>,
-    dist_ids: IdPool<u32>,
+struct Resources {
+    block_ids: ResourceRcPool,
+    embed_ids: ResourcePool,
 }
 
 #[derive(Clone, Debug)]
@@ -27,7 +26,7 @@ pub struct Model {
     model: Rc<l4m::Model>,
     block_size: usize,
     tokenizer: Rc<l4m::Tokenizer>,
-    resources: Rc<RefCell<ResourcePool>>,
+    resources: Rc<RefCell<Resources>>,
 }
 
 #[derive(Debug)]
@@ -59,14 +58,15 @@ impl Model {
         if let Some(model) = l4m::get_model(model_name) {
             // Prefetch the tokenizer
             let tokenizer = model.get_tokenizer();
-            let resources = ResourcePool {
-                block_ids: RcIdPool::new(u32::MAX),
-                embed_ids: IdPool::new(u32::MAX),
-                dist_ids: IdPool::new(u32::MAX),
+            let model = Rc::new(model);
+
+            let resources = Resources {
+                block_ids: ResourceRcPool::new(model.clone(), ObjectType::Block, u32::MAX, true),
+                embed_ids: ResourcePool::new(model.clone(), ObjectType::Embed, u32::MAX, false),
             };
             let block_size = model.get_block_size() as usize;
             Some(Self {
-                model: Rc::new(model),
+                model: model.clone(),
                 block_size,
                 tokenizer: Rc::new(tokenizer),
                 resources: Rc::new(RefCell::new(resources)),
@@ -127,42 +127,46 @@ impl Context {
     pub fn get_token_ids(&self) -> &[u32] {
         &self.token_ids
     }
-    
+
     pub fn get_text(&self) -> String {
         self.inner.tokenizer.detokenize(&self.token_ids)
     }
-    
+
     fn alloc(&mut self, ty: ObjectType, count: usize) -> Vec<u32> {
         let ids = match ty {
-            ObjectType::Block => RefCell::borrow_mut(&self.inner.resources)
-                .block_ids
-                .acquire_many(count)
-                .unwrap(),
-            ObjectType::Embed => RefCell::borrow_mut(&self.inner.resources)
-                .embed_ids
-                .acquire_many(count)
-                .unwrap(),
+            ObjectType::Block => {
+                let ids = RefCell::borrow_mut(&self.inner.resources)
+                    .block_ids
+                    .acquire_many(count)
+                    .unwrap();
+                ids
+            }
+            ObjectType::Embed => {
+                let ids = RefCell::borrow_mut(&self.inner.resources)
+                    .embed_ids
+                    .acquire_many(count)
+                    .unwrap();
+                ids
+            }
         };
 
-        self.inner.model.allocate(self.stream, ty, &ids);
         ids
     }
 
     fn release(&mut self, ty: ObjectType, ids: &[u32]) {
         match ty {
             ObjectType::Block => {
-                let should_be_freed = RefCell::borrow_mut(&self.inner.resources)
+                RefCell::borrow_mut(&self.inner.resources)
                     .block_ids
                     .release_many(ids)
                     .unwrap();
-                self.inner
-                    .model
-                    .deallocate(self.stream, ty, &should_be_freed);
             }
-            ObjectType::Embed => RefCell::borrow_mut(&self.inner.resources)
-                .embed_ids
-                .release_many(ids)
-                .unwrap(),
+            ObjectType::Embed => {
+                RefCell::borrow_mut(&self.inner.resources)
+                    .embed_ids
+                    .release_many(ids)
+                    .unwrap();
+            }
         }
     }
 
