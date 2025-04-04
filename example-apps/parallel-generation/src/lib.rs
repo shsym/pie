@@ -9,29 +9,26 @@ async fn main() -> Result<(), String> {
     let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
 
     let mut common = model.create_context();
-    common.fill("<|begin_of_text|>").await;
-    common.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
+    common.fill("<|begin_of_text|>");
+    common.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
 
     // tokio spawn
-    let mut ctx1 = common.fork().await;
+    let mut ctx1 = common.fork();
     let handle1 = async move {
         ctx1.fill(
             "<|start_header_id|>user<|end_header_id|>\n\nExplain Pulmonary Embolism<|eot_id|>",
-        )
-        .await;
-        ctx1.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
-            .await;
+        );
+        ctx1.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
         let output = ctx1.generate_until("<|eot_id|>", max_num_outputs).await;
 
         println!("Output: {:?} (elapsed: {:?})", output, start.elapsed());
     };
 
-    let mut ctx2 = common.fork().await;
+    let mut ctx2 = common.fork();
     let handle2 = async move {
-        ctx2.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the Espresso making process ELI5.<|eot_id|>").await;
-        ctx2.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
-            .await;
+        ctx2.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the Espresso making process ELI5.<|eot_id|>");
+        ctx2.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
         let output = ctx2.generate_until("<|eot_id|>", max_num_outputs).await;
 

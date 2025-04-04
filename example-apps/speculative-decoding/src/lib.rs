@@ -231,11 +231,10 @@ async fn main() -> Result<(), String> {
     let tokenizer = model.get_tokenizer();
 
     let mut ctx = model.create_context();
-    ctx.fill("<|begin_of_text|>").await;
-    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
-    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>").await;
-    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
-        .await;
+    ctx.fill("<|begin_of_text|>");
+    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
+    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>");
+    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
     let mut drafter = CacheDrafter::<1, 1, 16>::new();
     let mut sampler = sampler::GreedySampler::new();

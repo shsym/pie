@@ -64,13 +64,13 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
     let mut ctx = model.create_context();
 
     // Begin formatting the prompt
-    ctx.fill("<|begin_of_text|>").await;
+    ctx.fill("<|begin_of_text|>");
 
     // Add system message if present, otherwise use a default
     let mut has_system = false;
     for message in &chat_request.messages {
         if message.role == "system" {
-            ctx.fill(&format!("<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>", message.content)).await;
+            ctx.fill(&format!("<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>", message.content));
             has_system = true;
             break;
         }
@@ -78,7 +78,7 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
 
     // Add default system message if none was provided
     if !has_system {
-        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
+        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
     }
 
     // Add user and assistant messages in order
@@ -88,11 +88,11 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
         }
 
         ctx.fill(&format!("<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
-                         message.role, message.content)).await;
+                         message.role, message.content));
     }
 
     // Add the assistant prefix for generating the response
-    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n").await;
+    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
     // Determine max tokens to generate
     let max_tokens = chat_request.max_tokens.unwrap_or(256);

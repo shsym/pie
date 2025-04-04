@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 from blake3 import blake3
 from symphony import SymphonyClient, Instance  # Assuming these are defined elsewhere
-
+import random
 async def main():
     # Define the program name and construct the file path
     program_name = "text_completion"
@@ -47,8 +47,8 @@ async def main():
         instance_start = time.monotonic()
         try:
             # Send two messages to the instance
-            await instance.send("hello!! how are you doing today??")
-            await instance.send("32")
+            await instance.send("please tell me about this natural number:" + str(random.randint(1, 1000000)))
+            await instance.send("32") # max_num_outputs
 
             # Listen for events until termination
             while True:

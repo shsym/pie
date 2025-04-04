@@ -124,6 +124,14 @@ impl Context {
         self.stream
     }
 
+    pub fn get_token_ids(&self) -> &[u32] {
+        &self.token_ids
+    }
+    
+    pub fn get_text(&self) -> String {
+        self.inner.tokenizer.detokenize(&self.token_ids)
+    }
+    
     fn alloc(&mut self, ty: ObjectType, count: usize) -> Vec<u32> {
         let ids = match ty {
             ObjectType::Block => RefCell::borrow_mut(&self.inner.resources)
@@ -162,10 +170,10 @@ impl Context {
         self.inner.block_size
     }
 
-    pub async fn fork(&mut self) -> Self {
+    pub fn fork(&mut self) -> Self {
         // flush the pending tokens
         if self.pending_token_ids.len() > 0 {
-            self.flush().await;
+            self.flush();
         }
 
         let forked = if self.last_block_len == self.block_size() {
@@ -225,20 +233,19 @@ impl Context {
             stop_condition::Length::new(max_tokens),
         );
 
-        self.generate(&mut sampler, &mut stop_condition)
-            .await
+        self.generate(&mut sampler, &mut stop_condition).await
     }
 
-    pub async fn fill(&mut self, text: &str) {
+    pub fn fill(&mut self, text: &str) {
         let new_token_ids = self.inner.tokenizer.tokenize(text);
-        self.fill_tokens(new_token_ids).await;
+        self.fill_tokens(new_token_ids);
     }
 
-    pub async fn fill_tokens(&mut self, new_token_ids: Vec<u32>) {
+    pub fn fill_tokens(&mut self, new_token_ids: Vec<u32>) {
         self.pending_token_ids.extend(new_token_ids);
     }
 
-    pub async fn flush(&mut self) {
+    pub fn flush(&mut self) {
         if self.pending_token_ids.len() < 2 {
             return;
         }
@@ -291,7 +298,7 @@ impl Context {
         self.release(ObjectType::Embed, &embed_ids);
     }
 
-    pub async fn fill_image(&mut self, image_blob: &[u8]) {
+    pub fn fill_image(&mut self, image_blob: &[u8]) {
         //l4m_vision::embed_image(&self.model, self.stream, &[], image_blob);
     }
 
@@ -302,7 +309,7 @@ impl Context {
         stop_condition: &mut C,
     ) -> String {
         if self.pending_token_ids.len() > 1 {
-            self.flush().await;
+            self.flush();
         }
 
         // the seed must not be empty
@@ -388,7 +395,7 @@ impl Context {
         //stream: Option<UnboundedSender<u32>>,
     ) -> String {
         if self.pending_token_ids.len() > 1 {
-            self.flush().await;
+            self.flush();
         }
 
         // the seed must not be empty

@@ -61,7 +61,7 @@ pub use crate::bindings::{
 };
 
 pub use crate::bindings_app::{export, exports::symphony::nbi::run::Guest as RunSync};
-pub use crate::context::Model;
+pub use crate::context::{Model, Context};
 pub use anyhow::Result;
 pub use wasi;
 use wasi::exports::http::incoming_handler::{IncomingRequest, ResponseOutparam};
