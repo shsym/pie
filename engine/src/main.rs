@@ -141,11 +141,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // TEST: spawn a dummy client with the program name
-    if *is_http {
-        tokio::spawn(dummy_client2(program_name.to_string(), port));
-    } else {
-        tokio::spawn(dummy_client(program_name.to_string()));
-    }
+    // if *is_http {
+    //     tokio::spawn(dummy_client2(program_name.to_string(), port));
+    // } else {
+    //     tokio::spawn(dummy_client(program_name.to_string()));
+    // }
     // wait forever
     tokio::signal::ctrl_c().await?;
 

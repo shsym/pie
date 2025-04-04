@@ -1,74 +1,95 @@
 import asyncio
-import os
-import blake3
+import time
+from pathlib import Path
+from blake3 import blake3
+from symphony import SymphonyClient, Instance  # Assuming these are defined elsewhere
 
-from symphony import SymphonyClient
+async def main():
+    # Define the program name and construct the file path
+    program_name = "text_completion"
+    program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
 
-PROGRAM_PATH = "../example-apps/target/wasm32-wasip2/release/helloworld.wasm"
+    # Check if the program file exists
+    if not program_path.exists():
+        print(f"Error: Program file not found at path: {program_path}")
+        return
 
+    # Server URI (matching the Rust code)
+    server_uri = "ws://127.0.0.1:9123"
+    print(f"Using program: {program_name}")
 
-async def demo_sequence():
-    # 1) Create and connect the client
-    client = SymphonyClient("ws://127.0.0.1:9000")
+    # Initialize and connect the client
+    client = SymphonyClient(server_uri)
     await client.connect()
 
-    # 2) Compute BLAKE3 for the local file
-    with open(PROGRAM_PATH, "rb") as f:
-        wasm_bytes = f.read()
-    file_hash = blake3.blake3(wasm_bytes).hexdigest()
-    print("[Demo] Program file hash:", file_hash)
+    # Read the program file and compute its hash
+    with open(program_path, "rb") as f:
+        program_bytes = f.read()
+    program_hash = blake3(program_bytes).hexdigest()
+    print(f"Program file hash: {program_hash}")
 
-    # 3) Query existence
-    query_resp = await client.query_existence(file_hash)
-    print("[Demo] query_existence response:", query_resp)
+    # Check if the program exists on the server; upload if not
+    if not await client.program_exists(program_hash):
+        print("Program not found on server, uploading now...")
+        await client.upload_program(program_bytes)
+        print("Program uploaded successfully!")
 
-    # 4) If not present, upload
-    if not query_resp.get("exists", False):
-        print("[Demo] Program not found on server, uploading now...")
-        await client.upload_program(wasm_bytes, file_hash)
+    # Launch 200 instances
+    NUM_INSTANCES = 200
+    instances = []
+    for _ in range(NUM_INSTANCES):
+        instance = await client.launch_instance(program_hash)
+        print(f"Instance {instance.instance_id} launched.")
+        instances.append(instance)
 
-        # The last chunk upload typically yields a "upload_complete"
-        # But let's read any subsequent messages too if needed.
-        # For example, if the server sends "upload_complete" after the last chunk ack.
-        # The above library code receives *one* message after each chunk,
-        # which in many server flows includes the final "upload_complete" message.
+    # Define a function to handle each instance's send/receive operations and measure latency
+    async def handle_instance(instance: Instance):
+        instance_start = time.monotonic()
+        try:
+            # Send two messages to the instance
+            await instance.send("hello!! how are you doing today??")
+            await instance.send("32")
 
+            # Listen for events until termination
+            while True:
+                event, message = await instance.recv()
+                if event == "terminated":
+                    instance_end = time.monotonic()
+                    latency = instance_end - instance_start
+                    print(f"Instance {instance.instance_id} terminated. Reason: {message}. Latency: {latency:.4f} seconds")
+                    return latency
+                else:
+                    print(f"Instance {instance.instance_id} received message: {message}")
+        except Exception as e:
+            print(f"Error handling instance {instance.instance_id}: {e}")
+            return None
+
+    # Record overall start time before launching tasks
+    overall_start = time.monotonic()
+
+    # Create concurrent tasks for each instance and collect latencies
+    tasks = [asyncio.create_task(handle_instance(instance)) for instance in instances]
+    latencies = await asyncio.gather(*tasks)
+
+    # Record overall end time after tasks complete
+    overall_end = time.monotonic()
+
+    # Filter out any None values from failed instances
+    valid_latencies = [lat for lat in latencies if lat is not None]
+    if valid_latencies:
+        average_latency = sum(valid_latencies) / len(valid_latencies)
+        print(f"Average latency per instance: {average_latency:.4f} seconds")
     else:
-        print("[Demo] Program already exists on server, skipping upload.")
+        print("No valid latency measurements collected.")
 
-    # 5) Start the program
-    start_resp = await client.start_program(file_hash)
-    print("[Demo] start_program response:", start_resp)
+    # Calculate throughput (instances completed per second)
+    total_time = overall_end - overall_start
+    throughput = len(valid_latencies) / total_time if total_time > 0 else 0
+    print(f"Overall throughput: {throughput:.2f} instances per second")
 
-    if start_resp.get("type") == "program_launched":
-        instance_id = start_resp["instance_id"]
-        print(f"[Demo] Program launched with instance_id = {instance_id}")
-
-        # 6) Send a couple of events
-        await client.send_event(instance_id, "Hello from Python client - event #1")
-        await client.send_event(instance_id, "Another event #2")
-
-        # We might want to see if the server sends back any "program_event" messages.
-        # Since the server can send them asynchronously, let's wait briefly:
-        await asyncio.sleep(2.0)
-        while not client.incoming_messages.empty():
-            msg = await client.wait_for_next_message()
-            print("[Demo] Received async event:", msg)
-
-        # 7) Terminate the program
-        term_resp = await client.terminate_program(instance_id)
-        print("[Demo] terminate_program response:", term_resp)
-
-    else:
-        print("[Demo] Program launch failed or was not recognized.")
-
-    # 8) Close the connection
+    # Close the client connection
     await client.close()
-
-
-def main():
-    asyncio.run(demo_sequence())
-
+    print("Client connection closed.")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

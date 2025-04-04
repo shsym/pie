@@ -173,7 +173,6 @@ class Driver:
     @torch.inference_mode()
     def fill_block(self, cmds: BatchFillBlock):
 
-        print("fill_block", cmds)
         start_time = time.time()
         
         kv_page_indices = []
