@@ -74,19 +74,19 @@ impl ResourcePool {
     /// Allocate and return the smallest available ID.
     ///
     /// Returns `Ok(id)` if an ID is available, or an error if the pool is exhausted.
-    pub fn acquire(&mut self) -> Result<u32> {
+    pub fn acquire(&mut self, stream: u32) -> Result<u32> {
         if let Some(&id) = self.free.iter().next() {
             // A freed ID is available. Remove and return it.
             self.free.remove(&id);
             if self.tight {
-                self.model.allocate(0, self.ty, &[id]);
+                self.model.allocate(stream, self.ty, &[id]);
             }
             Ok(id)
         } else if self.next < self.max_capacity {
             // Allocate a fresh ID.
             let addr = self.next;
             self.next = self.next + 1;
-            self.model.allocate(0, self.ty, &[addr]);
+            self.model.allocate(stream, self.ty, &[addr]);
             Ok(addr)
         } else {
             Err(IdPoolError::PoolExhausted)
@@ -96,7 +96,7 @@ impl ResourcePool {
     /// Acquire many IDs at once.
     ///
     /// Returns a vector of IDs or an error if not enough IDs are available.
-    pub fn acquire_many(&mut self, count: usize) -> Result<Vec<u32>> {
+    pub fn acquire_many(&mut self, stream: u32, count: usize) -> Result<Vec<u32>> {
         if self.available() < count {
             return Err(IdPoolError::PoolExhausted);
         }
@@ -121,7 +121,7 @@ impl ResourcePool {
             }
         }
         if need_alloc.len() > 0 {
-            self.model.allocate(0, self.ty, &need_alloc);
+            self.model.allocate(stream, self.ty, &need_alloc);
         }
         Ok(result)
     }
@@ -129,14 +129,14 @@ impl ResourcePool {
     /// Release an ID back into the pool so it can be re-used.
     ///
     /// Returns an error if the given ID was never allocated.
-    pub fn release(&mut self, addr: u32) -> Result<()> {
+    pub fn release(&mut self, stream: u32, addr: u32) -> Result<()> {
         if addr >= self.next {
             return Err(IdPoolError::IdNotAllocated);
         }
         self.free.insert(addr);
 
         if self.tight {
-            self.model.deallocate(0, self.ty, &[addr]);
+            self.model.deallocate(stream, self.ty, &[addr]);
         }
         if self.free.len() > 1000 {
             self.tail_optimization();
@@ -147,7 +147,7 @@ impl ResourcePool {
     /// Release multiple IDs back into the pool.
     ///
     /// Returns an error if any of the given IDs were never allocated.
-    pub fn release_many(&mut self, addrs: &[u32]) -> Result<()> {
+    pub fn release_many(&mut self, stream: u32, addrs: &[u32]) -> Result<()> {
         let mut to_deallocate = Vec::new();
 
         for &addr in addrs {
@@ -161,7 +161,7 @@ impl ResourcePool {
         }
 
         if self.tight {
-            self.model.deallocate(0, self.ty, &to_deallocate);
+            self.model.deallocate(stream, self.ty, &to_deallocate);
         }
 
         if self.free.len() > 1000 {
@@ -248,8 +248,8 @@ impl ResourceRcPool {
     /// Acquire an ID and increment its reference count.
     ///
     /// Returns the allocated ID or an error if the pool is exhausted.
-    pub fn acquire(&mut self) -> Result<u32> {
-        let id = self.pool.acquire()?;
+    pub fn acquire(&mut self, stream: u32) -> Result<u32> {
+        let id = self.pool.acquire(stream)?;
         self.increment_rc(id);
         Ok(id)
     }
@@ -257,8 +257,8 @@ impl ResourceRcPool {
     /// Acquire many IDs at once.
     ///
     /// Returns a vector of allocated IDs or an error if not enough IDs are available.
-    pub fn acquire_many(&mut self, count: usize) -> Result<Vec<u32>> {
-        let ids = self.pool.acquire_many(count)?;
+    pub fn acquire_many(&mut self, stream: u32, count: usize) -> Result<Vec<u32>> {
+        let ids = self.pool.acquire_many(stream, count)?;
         for &id in &ids {
             self.increment_rc(id);
         }
@@ -268,14 +268,14 @@ impl ResourceRcPool {
     /// Release an ID. The underlying ID is only returned to the pool when its reference count drops to zero.
     ///
     /// Returns the released ID or an error if the ID was never allocated.
-    pub fn release(&mut self, id: u32) -> Result<u32> {
+    pub fn release(&mut self, stream: u32, id: u32) -> Result<u32> {
         let idx = id as usize;
         if idx >= self.rc.len() || self.rc[idx] == 0 {
             return Err(IdPoolError::IdNotAllocated);
         }
         self.rc[idx] -= 1;
         if self.rc[idx] == 0 {
-            self.pool.release(id)?;
+            self.pool.release(stream, id)?;
         }
         Ok(id)
     }
@@ -283,10 +283,10 @@ impl ResourceRcPool {
     /// Release many IDs. Only those whose reference count drops to zero are returned to the pool.
     ///
     /// Returns a vector of IDs that were actually deallocated or an error if any ID was never allocated.
-    pub fn release_many(&mut self, ids: &[u32]) -> Result<Vec<u32>> {
+    pub fn release_many(&mut self, stream: u32, ids: &[u32]) -> Result<Vec<u32>> {
         let mut deallocated = Vec::new();
         for &id in ids {
-            let idx = (id as usize);
+            let idx = id as usize;
             if idx >= self.rc.len() || self.rc[idx] == 0 {
                 return Err(IdPoolError::IdNotAllocated);
             }
@@ -296,7 +296,7 @@ impl ResourceRcPool {
             }
         }
         if !deallocated.is_empty() {
-            self.pool.release_many(&deallocated)?;
+            self.pool.release_many(stream, &deallocated)?;
         }
         Ok(deallocated)
     }

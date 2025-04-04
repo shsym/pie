@@ -137,14 +137,14 @@ impl Context {
             ObjectType::Block => {
                 let ids = RefCell::borrow_mut(&self.inner.resources)
                     .block_ids
-                    .acquire_many(count)
+                    .acquire_many(self.stream, count)
                     .unwrap();
                 ids
             }
             ObjectType::Embed => {
                 let ids = RefCell::borrow_mut(&self.inner.resources)
                     .embed_ids
-                    .acquire_many(count)
+                    .acquire_many(self.stream, count)
                     .unwrap();
                 ids
             }
@@ -158,13 +158,13 @@ impl Context {
             ObjectType::Block => {
                 RefCell::borrow_mut(&self.inner.resources)
                     .block_ids
-                    .release_many(ids)
+                    .release_many(self.stream, ids)
                     .unwrap();
             }
             ObjectType::Embed => {
                 RefCell::borrow_mut(&self.inner.resources)
                     .embed_ids
-                    .release_many(ids)
+                    .release_many(self.stream, ids)
                     .unwrap();
             }
         }
@@ -283,11 +283,21 @@ impl Context {
                 (pending_token_ids.len() - available_space).div_ceil(self.block_size());
             let new_block_ids = self.alloc(ObjectType::Block, needed_block_count);
             self.block_ids.extend(new_block_ids);
-            self.last_block_len = (self.token_ids.len() + pending_token_ids.len())
-                - (self.block_ids.len() - 1) * self.block_size();
+
+            let remaining_tokens = (pending_token_ids.len() - available_space) % self.block_size();
+
+            self.last_block_len = if remaining_tokens == 0 {
+                self.block_size()
+            } else {
+                remaining_tokens
+            };
         } else {
             self.last_block_len += pending_token_ids.len();
         }
+
+        // println!("context block_ids: {:?}", self.block_ids);
+        // println!("context last_block_len: {:?}", self.last_block_len);
+        // println!("context embed ids: {:?}", embed_ids);
 
         self.inner.model.fill_block(
             self.stream,
@@ -318,6 +328,7 @@ impl Context {
 
         // the seed must not be empty
         assert!(self.pending_token_ids.len() == 1);
+        assert!(self.last_block_len != 0);
 
         let mut generated_token_ids = Vec::new();
 

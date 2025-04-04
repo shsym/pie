@@ -54,12 +54,13 @@ class Driver:
 
     # dist_storage: VectorStorage
 
-    def __init__(self, model, max_num_pages: int, dtype: torch.dtype, device: str):
+    def __init__(self, model, max_num_pages: int, max_num_embeds: int, dtype: torch.dtype, device: str):
         self.embeds = {}
         self.blocks = {}
 
         self.lm = model
         self.max_num_pages = max_num_pages
+        self.max_num_embeds = max_num_embeds
         self.dtype = dtype
         self.device = device
 
@@ -73,14 +74,14 @@ class Driver:
         ]
 
         self.embed_storage_p1 = VectorStorage(
-            num_vectors=50000,
+            num_vectors=max_num_embeds,
             embed_dim=config.DIST_RESOLUTION,
             dtype=dtype,
             device=device
         )
 
         self.embed_storage_p2 = VectorStorage(
-            num_vectors=50000,
+            num_vectors=max_num_embeds,
             embed_dim=config.DIST_RESOLUTION,
             dtype=torch.long,
             device=device
@@ -99,6 +100,8 @@ class Driver:
         for cmd in cmds.items:
             if cmd.kind == ObjectKind.OBJECT_KIND_KV_BLOCK:
                 for i in range(cmd.count):
+                    #print(f"allocate {cmd.count} blocks", cmd.object_id_offset + i)
+
                     self.blocks[cmd.object_id_offset + i] = Block(
                         position_ids=np.array([0] * NUM_TOKENS_IN_BLOCK),
                         occupancy=np.array([False] * NUM_TOKENS_IN_BLOCK)

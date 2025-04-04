@@ -56,7 +56,7 @@ def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | No
             model_name=MODEL_NAME,
             block_size=NUM_TOKENS_IN_BLOCK,
             num_available_blocks=d.max_num_pages,
-            num_available_embeddings=1000000,
+            num_available_embeddings=d.max_num_embeds,
             num_available_distributions=0
         ))
 
@@ -77,7 +77,7 @@ def main_run():
     #endpoint = "tcp://*:8888"
     endpoint = "ipc:///tmp/symphony-ipc"
 
-    engine = Driver(model, 2000, torch.bfloat16, device)
+    engine = Driver(model, 2000, 50000, torch.bfloat16, device)
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)

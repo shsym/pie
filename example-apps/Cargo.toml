@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["symphony", "symphony-macros", "helloworld", "messaging", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "parallel-generation", "function-calling", "multimodal", "helloworld-plain", "openai-compat", "http-server", "text-completion",  "tree-of-thought"]
+members = ["symphony", "symphony-macros", "helloworld", "messaging", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "parallel-generation", "function-calling", "helloworld-plain", "openai-compat", "http-server", "text-completion",  "tree-of-thought"]
 
 [workspace.dependencies]
 wit-bindgen = "0.40.0"
