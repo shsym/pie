@@ -124,12 +124,12 @@ async fn tree_search_naive(
     let propose_prompt = format!("{} {}", PROPOSE_PROMPT_TEMPLATE, question);
 
     init_ctx.fill(&propose_prompt);
+    init_ctx.fill(ASSISTANT_PREFIX);
 
     let leaf_futures = (0..num_branches.pow(3))
         .map(|_| {
             let mut ctx = init_ctx.fork();
             async move {
-                ctx.fill(ASSISTANT_PREFIX);
                 ctx.generate_until(STOP_TOKEN, MAX_TOKENS).await;
 
                 ctx.fill(EXECUTE_PROMPT);
