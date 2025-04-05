@@ -1,0 +1,13 @@
+[package]
+name = "skeleton-of-thought"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+symphony = { path = "../symphony" }
+futures = "0.3.31"
+regex = "1.11.1"
+once_cell = "1.20.2"

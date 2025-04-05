@@ -402,6 +402,103 @@ impl Context {
         result
     }
 
+    async fn next(&mut self) -> (Vec<u32>, Vec<f32>) {
+        if self.pending_token_ids.len() > 1 {
+            self.flush();
+        }
+
+        // the seed must not be empty
+        assert!(self.pending_token_ids.len() == 1);
+        assert!(self.last_block_len != 0);
+
+        let input_embed_id = self.alloc(ObjectType::Embed, 1);
+        let output_embed_id = self.alloc(ObjectType::Embed, 1);
+
+        let next_token_id = self.pending_token_ids[0];
+        let next_pos_id = self.token_ids.len() as u32;
+        // embed the next token
+        self.inner.model.embed_text(
+            self.stream,
+            &input_embed_id,
+            &[next_token_id],
+            &[next_pos_id],
+        );
+
+        // extend the block as needed
+        if self.last_block_len == self.block_size() || self.block_ids.len() == 0 {
+            let new_block_ids = self.alloc(ObjectType::Block, 1);
+            self.block_ids.extend(new_block_ids);
+            self.last_block_len = 1;
+        } else {
+            self.last_block_len += 1;
+        }
+
+        // fill the block
+        self.inner.model.fill_block(
+            self.stream,
+            self.last_block_len as u32,
+            &self.block_ids,
+            &input_embed_id,
+            &output_embed_id,
+        );
+
+        // sample the next token
+        let sampled = l4m_async::sample_top_k(
+            self.inner.model.clone(),
+            self.stream,
+            output_embed_id.clone(),
+            32,
+        )
+        .await;
+
+        self.token_ids.push(next_token_id);
+        // free the resources
+        self.release(ObjectType::Embed, &input_embed_id);
+        self.release(ObjectType::Embed, &output_embed_id);
+
+        sampled.into_iter().next().unwrap()
+    }
+
+    // Simple autoregressive generation
+    pub async fn generate_with_beam<C: StopCondition>(
+        &mut self,
+        stop_condition: &mut C,
+        beam_size: usize,
+    ) -> String {
+        let mut beams = Vec::new();
+        beams.push((self.fork(), vec![], 0.0));
+
+        loop {
+            // check if we meets the stop condition
+            for (_, generated, _) in beams.iter() {
+                if stop_condition.should_stop(&generated) {
+                    return self.inner.tokenizer.detokenize(generated);
+                }
+            }
+
+            let mut next_beams = Vec::new();
+            for (mut beam, generated, score) in beams.into_iter() {
+                let (next_token_ids, next_score) = beam.next().await;
+
+                for i in 0..beam_size {
+                    let mut next_beam = beam.fork();
+                    next_beam.pending_token_ids.push(next_token_ids[i]);
+                    let next_generated = [generated.as_slice(), &[next_token_ids[i]]].concat();
+                    let next_score = score + next_score[i];
+                    next_beams.push((next_beam, next_generated, next_score));
+                }
+            }
+
+            // get the top k beams by score in next_beam_cands
+            // sort the next_beam_cands by score
+            // and only keep the first beam_size beams
+            next_beams.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+            next_beams.truncate(beam_size);
+
+            beams = next_beams;
+        }
+    }
+
     pub async fn generate_with_drafter<D: Drafter, S: Sampler, C: StopCondition>(
         &mut self,
         drafter: &mut D,
