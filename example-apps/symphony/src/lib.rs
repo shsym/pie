@@ -1,4 +1,4 @@
-mod context;
+pub mod context;
 pub mod drafter;
 pub mod l4m_async;
 pub mod messaging_async;

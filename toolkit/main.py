@@ -6,7 +6,7 @@ from symphony import SymphonyClient, Instance  # Assuming these are defined else
 import random
 async def main():
     # Define the program name and construct the file path
-    program_name = "tree_of_thought"#"text_completion"# # # 
+    program_name = "skeleton_of_thought"#"text_completion"# # # 
     program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
 
     # Check if the program file exists
@@ -35,7 +35,7 @@ async def main():
         print("Program uploaded successfully!")
 
     # Launch 200 instances
-    NUM_INSTANCES = 1
+    NUM_INSTANCES = 5
     instances = []
     for _ in range(NUM_INSTANCES):
         instance = await client.launch_instance(program_hash)

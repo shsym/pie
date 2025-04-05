@@ -1,14 +1,15 @@
 use llguidance::earley::SlicedBiasComputer;
 use llguidance::{
+    Constraint, ParserFactory,
     api::TopLevelGrammar,
     toktrie::{InferenceCapabilities, TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv},
-    Constraint, ParserFactory,
 };
 use std::sync::Arc;
 use std::time::Instant;
+use symphony::context::Tokenizer;
 use symphony::drafter::Empty;
 use symphony::sampler::Sampler;
-use symphony::{l4m, Run};
+use symphony::{Run, l4m};
 
 struct ConstrainedDecoding;
 
@@ -101,6 +102,7 @@ struct ConstrainedSampler {
 
 impl ConstrainedSampler {
     pub fn new(
+        tokenizer: Tokenizer,
         lark: &str,
         eos_token: &str,
         bos_token: Option<&str>,
@@ -108,13 +110,13 @@ impl ConstrainedSampler {
         unk_token: Option<&str>,
         end_of_turn_token: Option<&str>,
     ) -> Self {
-        let words = l4m::get_vocabs();
-
-        let eos_token = l4m::tokenize(eos_token)[0];
-        let bos_token = bos_token.map(|s| l4m::tokenize(s)[0]);
-        let pad_token = pad_token.map(|s| l4m::tokenize(s)[0]);
-        let unk_token = unk_token.map(|s| l4m::tokenize(s)[0]);
-        let end_of_turn_token = end_of_turn_token.map(|s| l4m::tokenize(s)[0]);
+        //let words = l4m::get_vocabs();
+        let words = tokenizer.get_vocabs();
+        let eos_token = tokenizer.encode(eos_token)[0];
+        let bos_token = bos_token.map(|s| tokenizer.encode(s)[0]);
+        let pad_token = pad_token.map(|s| tokenizer.encode(s)[0]);
+        let unk_token = unk_token.map(|s| tokenizer.encode(s)[0]);
+        let end_of_turn_token = end_of_turn_token.map(|s| tokenizer.encode(s)[0]);
 
         let tokenizer = TrieTokenizer::new(
             &words,
@@ -186,8 +188,12 @@ impl Sampler for ConstrainedSampler {
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
-    let mut drafter = Empty {};
+    let available_models = symphony::available_models();
+    let model = symphony::Model::new(available_models.first().unwrap()).unwrap();
+    let tokenizer = model.get_tokenizer();
+
     let mut sampler = ConstrainedSampler::new(
+        tokenizer.clone(),
         JSON_GRAMMAR,
         "<|end_of_text|>",
         Some("<|begin_of_text|>"),
@@ -196,25 +202,21 @@ async fn main() -> Result<(), String> {
         Some("<|eot_id|>"),
     );
 
-    let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
-
     let mut stop_condition = symphony::stop_condition::any(
-        symphony::stop_condition::Until::new(model.tokenize("<|eot_id|>")),
+        symphony::stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
         symphony::stop_condition::Length::new(128),
     );
 
     let mut ctx = model.create_context();
-    ctx.fill("<|begin_of_text|>").await;
-    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>").await;
+    ctx.fill("<|begin_of_text|>");
+    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
     ctx.fill(
         "<|start_header_id|>user<|end_header_id|>\n\n Generate some random json data<|eot_id|>",
-    )
-    .await;
-    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n")
-        .await;
+    );
+    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
     let output_text = ctx
-        .generate(&mut drafter, &mut sampler, &mut stop_condition, None)
+        .generate(&mut sampler, &mut stop_condition)
         .await;
 
     println!("Output: {:?} (elapsed: {:?})", output_text, start.elapsed());
