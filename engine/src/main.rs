@@ -92,11 +92,6 @@ async fn main() -> anyhow::Result<()> {
     // 1) Ensure the cache directory exists
     fs::create_dir_all(PROGRAM_CACHE_DIR).context("Failed to create program cache directory")?;
 
-    let dummy_l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
-    let dummy_ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
-
-    let l4m_backend = backend::ZmqBackend::bind("ipc:///tmp/symphony-ipc").await?;
-
     //return Ok(());
 
     let runtime = Runtime::new();
@@ -106,41 +101,44 @@ async fn main() -> anyhow::Result<()> {
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
 
+
+    let ctrl = Controller::new()
+            .add("runtime", runtime)
+            .add("server", server)
+            .add("messaging-inst2inst", messaging_inst2inst)
+            .add("messaging-user2inst", messaging_user2inst);
+            
+
     // Setup with dummy
-    if use_dummy {
+    let ctrl = if use_dummy {
         log_user!("Running in dummy mode");
+
+        let dummy_l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
+        let dummy_ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
+
         let l4m = L4m::new(dummy_l4m_backend.clone()).await;
         let ping = Ping::new(dummy_ping_backend.clone()).await;
 
-        l4m::set_available_models(["llama3"]);
-
-        // Install all services
-        let _ = Controller::new()
-            .add("runtime", runtime)
-            .add("server", server)
-            .add("messaging-inst2inst", messaging_inst2inst)
-            .add("messaging-user2inst", messaging_user2inst)
-            .add("llama3", l4m)
+        ctrl
+            .add(l4m::available_models().first().unwrap(), l4m)
             .add("ping", ping)
-            .install();
+
     } else {
+        let l4m_backend = backend::ZmqBackend::bind("ipc:///tmp/symphony-ipc").await?;
+
         // Setup with real backend
         let l4m = L4m::new(l4m_backend.clone()).await;
-        let ping = Ping::new(dummy_ping_backend.clone()).await;
-        let avail_models = l4m::available_models();
+        let ping = Ping::new(l4m_backend.clone()).await;
 
         // Install all services
-        let _ = Controller::new()
-            .add("runtime", runtime)
-            .add("server", server)
-            .add("messaging-inst2inst", messaging_inst2inst)
-            .add("messaging-user2inst", messaging_user2inst)
-            .add(avail_models.first().unwrap(), l4m)
+        ctrl
+            .add(l4m::available_models().first().unwrap(), l4m)
             .add("ping", ping)
-            .install();
-    }
-
+    };
     
+    // Install all services
+    ctrl.install();
+
     // periodically print stats
     tokio::spawn(async {
         loop {

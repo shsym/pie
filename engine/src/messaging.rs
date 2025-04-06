@@ -103,7 +103,7 @@ impl PubSub {
             //println!("subscriptions: {:?}", subscriptions.len());
 
             let remove_topic = if let Some(mut subscribers) = subscribers_by_topic.get_mut(&topic) {
-                println!("Received message: {:?}, {:?}", topic, message);
+                //println!("Received message: {:?}, {:?}", topic, message);
 
                 // Retain only the subscribers that can receive the message.
                 subscribers.retain(|(_, sender)| {

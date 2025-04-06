@@ -48,7 +48,9 @@ impl Pollable for Subscription {
         }
 
         if let Some(result) = self.receiver.recv().await {
+            //println!("Sub Received message: {:?}", result);
             self.result = Some(result);
+            self.done = true;
         } else {
             self.done = true;
         }
