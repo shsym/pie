@@ -434,7 +434,7 @@ impl Context {
         result
     }
 
-    async fn next(&mut self) -> (Vec<u32>, Vec<f32>) {
+    pub async fn next(&mut self) -> (Vec<u32>, Vec<f32>) {
         if self.pending_token_ids.len() > 1 {
             self.flush();
         }
@@ -443,10 +443,10 @@ impl Context {
         assert!(self.pending_token_ids.len() == 1);
         assert!(self.last_block_len != 0);
 
-        let input_embed_id = self.alloc(ObjectType::Embed, 1);
+        let input_embed_id: Vec<u32> = self.alloc(ObjectType::Embed, 1);
         let output_embed_id = self.alloc(ObjectType::Embed, 1);
 
-        let next_token_id = self.pending_token_ids[0];
+        let next_token_id = self.pending_token_ids.pop().unwrap();
         let next_pos_id = self.token_ids.len() as u32;
         // embed the next token
         self.inner.model.embed_text(
