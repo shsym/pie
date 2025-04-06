@@ -316,6 +316,38 @@ impl Context {
         //l4m_vision::embed_image(&self.model, self.stream, &[], image_blob);
     }
 
+    pub async fn apply_sink(&mut self, sink_size: usize, window_size: usize) {
+        // flush the pending tokens
+
+        if self.pending_token_ids.len() > 1 {
+            self.flush();
+        }
+
+        let num_pages_to_retain_begin = sink_size.div_ceil(self.block_size());
+        let num_pages_to_retain_end = window_size.div_ceil(self.block_size());
+
+        if self.block_ids.len() > num_pages_to_retain_begin + num_pages_to_retain_end {
+            let sink_start = num_pages_to_retain_begin;
+            let sink_end = self.block_ids.len() - num_pages_to_retain_end;
+
+            self.block_ids = self.block_ids[sink_start..sink_end].to_vec();
+        }
+    }
+
+    pub async fn apply_window(&mut self, window_size: usize) {
+        if self.pending_token_ids.len() > 1 {
+            self.flush();
+        }
+
+        let num_pages_to_retain = window_size.div_ceil(self.block_size());
+
+        if self.block_ids.len() > num_pages_to_retain {
+            let sink_start = self.block_ids.len() - num_pages_to_retain;
+
+            self.block_ids = self.block_ids[sink_start..].to_vec();
+        }
+    }
+
     // Simple autoregressive generation
     pub async fn generate<S: Sampler, C: StopCondition>(
         &mut self,

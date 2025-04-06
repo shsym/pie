@@ -277,7 +277,7 @@ class Driver:
 
         input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
 
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize()
         #print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
         # print('kv_page_indices', kv_page_indices)
         # print('kv_page_indptr', kv_page_indptr)

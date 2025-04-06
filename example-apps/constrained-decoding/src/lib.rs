@@ -204,7 +204,7 @@ async fn main() -> Result<(), String> {
 
     let mut stop_condition = symphony::stop_condition::any(
         symphony::stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
-        symphony::stop_condition::Length::new(128),
+        symphony::stop_condition::Length::new(32),
     );
 
     let mut ctx = model.create_context();

@@ -6,7 +6,7 @@ from symphony import SymphonyClient, Instance  # Assuming these are defined else
 import random
 async def main():
     # Define the program name and construct the file path
-    program_name = "skeleton_of_thought"#"text_completion"# # # 
+    program_name = "agent_react"#"text_completion"# # # 
     program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
 
     # Check if the program file exists
@@ -35,11 +35,12 @@ async def main():
         print("Program uploaded successfully!")
 
     # Launch 200 instances
-    NUM_INSTANCES = 5
+    NUM_INSTANCES = 200
+    NUM_PROMPTS = 1#200
     instances = []
     for _ in range(NUM_INSTANCES):
         instance = await client.launch_instance(program_hash)
-        print(f"Instance {instance.instance_id} launched.")
+        #print(f"Instance {instance.instance_id} launched.")
         instances.append(instance)
 
     # Define a function to handle each instance's send/receive operations and measure latency
@@ -49,17 +50,20 @@ async def main():
             # Send two messages to the instance
             await instance.send("please tell me about this natural number:" + str(random.randint(1, 1000000)))
             await instance.send("32") # max_num_outputs
+            await instance.send(str(NUM_PROMPTS)) # num_prompts
 
             # Listen for events until termination
             while True:
                 event, message = await instance.recv()
-                if event == "terminated":
-                    instance_end = time.monotonic()
-                    latency = instance_end - instance_start
-                    print(f"Instance {instance.instance_id} terminated. Reason: {message}. Latency: {latency:.4f} seconds")
-                    return latency
-                else:
-                    print(f"Instance {instance.instance_id} received message: {message}")
+                # if event == "terminated":
+                    
+                #     print(f"Instance {instance.instance_id} terminated. Reason: {message}. Latency: {latency:.4f} seconds")
+                # else:
+                instance_end = time.monotonic()
+                latency = instance_end - instance_start
+                #print(f"Instance {instance.instance_id} received message: {message}")
+                return latency
+
         except Exception as e:
             print(f"Error handling instance {instance.instance_id}: {e}")
             return None
@@ -74,17 +78,20 @@ async def main():
     # Record overall end time after tasks complete
     overall_end = time.monotonic()
 
+    num_prompts = NUM_PROMPTS * NUM_INSTANCES
+
     # Filter out any None values from failed instances
     valid_latencies = [lat for lat in latencies if lat is not None]
     if valid_latencies:
-        average_latency = sum(valid_latencies) / len(valid_latencies)
+        average_latency = sum(valid_latencies) / num_prompts
         print(f"Average latency per instance: {average_latency:.4f} seconds")
     else:
         print("No valid latency measurements collected.")
 
+    print(f"Total time: {overall_end - overall_start:.4f} seconds")
     # Calculate throughput (instances completed per second)
     total_time = overall_end - overall_start
-    throughput = len(valid_latencies) / total_time if total_time > 0 else 0
+    throughput = num_prompts / total_time if total_time > 0 else 0
     print(f"Overall throughput: {throughput:.2f} instances per second")
 
     # Close the client connection

@@ -13,7 +13,7 @@ import handshake_pb2
 from common import ceil_div
 from driver import Driver
 from llama import LlamaForCausalLM
-from config import VERSION, MODEL_NAME, FULL_MODEL_NAME, NUM_TOKENS_IN_BLOCK
+from config import VERSION, MODEL_NAME, FULL_MODEL_NAME, NUM_TOKENS_IN_BLOCK, MAX_NUM_PAGES, MAX_NUM_EMBEDS
 
 
 def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | None:
@@ -77,7 +77,7 @@ def main_run():
     #endpoint = "tcp://*:8888"
     endpoint = "ipc:///tmp/symphony-ipc"
 
-    engine = Driver(model, 2000, 50000, torch.bfloat16, device)
+    engine = Driver(model, MAX_NUM_PAGES, MAX_NUM_EMBEDS, torch.bfloat16, device)
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
