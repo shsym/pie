@@ -6,7 +6,7 @@ from symphony import SymphonyClient, Instance  # Assuming these are defined else
 import random
 async def main():
     # Define the program name and construct the file path
-    program_name = "attention_sink"#"text_completion"# # # 
+    program_name = "agent_codeact"#"text_completion"# # # 
     program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
 
     # Check if the program file exists
@@ -36,7 +36,7 @@ async def main():
 
     # Launch 200 instances
     NUM_INSTANCES = 1
-    NUM_PROMPTS = 150#200
+    NUM_PROMPTS = 1#200
     instances = []
     for _ in range(NUM_INSTANCES):
         instance = await client.launch_instance(program_hash)
@@ -48,15 +48,16 @@ async def main():
         instance_start = time.monotonic()
         try:
             # Send two messages to the instance
-            await instance.send("please tell me about this natural number:" + str(random.randint(1, 1000000)))
-            await instance.send("128") # max_num_outputs
-            await instance.send(str(NUM_PROMPTS)) # num_prompts
+            #await instance.send("please tell me about this natural number:" + str(random.randint(1, 1000000)))
+            #await instance.send("32") # max_num_outputs
+            #await instance.send(str(NUM_PROMPTS)) # num_prompts
 
             # Listen for events until termination
             while True:
                 event, message = await instance.recv()
                 if event == "terminated":
-                    print(f"Instance {instance.instance_id} terminated. Reason: {message}. Latency: {latency:.4f} seconds")
+                    print(f"Instance {instance.instance_id} terminated. Reason: {message}")
+                    ...
                 else:
                     ...
                     
@@ -134,8 +135,8 @@ async def main_swarm():
         print("Program uploaded successfully!")
 
     # Launch 200 instances
-    NUM_SWARMS = 1
-    SWARM_SIZE = 2#200
+    NUM_SWARMS = 60
+    SWARM_SIZE = 4#200
     instances = []
     for _ in range(NUM_SWARMS * SWARM_SIZE):
         instance = await client.launch_instance(program_hash)
@@ -151,25 +152,31 @@ async def main_swarm():
         if role_idx == 0:
             role = "idea_generator"
         elif role_idx == 1:
+            role = "plot_developer"
+        elif role_idx == 2:
+            role = "character_creator"
+        elif role_idx == 3:
             role = "dialogue_writer"
         else:
             raise ValueError(f"Invalid role index: {role_idx}")
         
-        instance_start = time.monotonic()
         try:
+            instance_start = time.monotonic()
+
             # Send two messages to the instance
             await instance.send(role)
             await instance.send(str(group)) # max_num_outputs
 
             if role == "idea_generator":
                 await instance.send("please tell me about this natural number:" + str(random.randint(1, 1000000)))
-            
+
 
             # Listen for events until termination
             while True:
                 event, message = await instance.recv()
                 if event == "terminated":
-                    print(f"Instance {instance.instance_id} terminated. Reason: {message}.")
+                    #print(f"Instance {instance.instance_id} terminated. Reason: {message}.")
+                    ...
                 else:
                     print(f"Instance {instance.instance_id} received message: {message}")
                     
@@ -192,7 +199,7 @@ async def main_swarm():
     # Record overall end time after tasks complete
     overall_end = time.monotonic()
 
-    num_prompts =NUM_SWARMS * SWARM_SIZE
+    num_prompts = NUM_SWARMS * SWARM_SIZE
 
     # Filter out any None values from failed instances
     valid_latencies = [lat for lat in latencies if lat is not None]
@@ -215,4 +222,4 @@ async def main_swarm():
 
 
 if __name__ == "__main__":
-    asyncio.run(main_swarm())
+    asyncio.run(main())

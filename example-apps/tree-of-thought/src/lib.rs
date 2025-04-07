@@ -7,7 +7,7 @@ const EXECUTE_PROMPT: &str = "The plan looks good! Now, use real numbers and do 
 const REFLECT_PROMPT: &str = "Okay. Now you evaluate your own solution and give it a score on a scale of 1 to 5. Please do rigorous check of the correctness.";
 const ASSISTANT_PREFIX: &str = "<|start_header_id|>assistant<|end_header_id|>\n\n";
 const STOP_TOKEN: &str = "<|eot_id|>";
-const MAX_TOKENS: usize = 256;
+const MAX_TOKENS: usize = 32;
 
 /// Asynchronously generates branches concurrently for proposing a plan.
 async fn propose_plan(mut ctx: Context, question: &str, num_branches: usize) -> Vec<Context> {

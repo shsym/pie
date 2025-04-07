@@ -8,4 +8,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 symphony = { path = "../symphony" }
+futures = "0.3.31"
 llguidance = { version = "0.6.31", default-features = false, features = ["lark"] }

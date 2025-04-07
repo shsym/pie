@@ -31,13 +31,13 @@ pub struct Model {
 
 #[derive(Debug)]
 pub struct Context {
-    inner: Model,
-    stream: u32,
-    block_ids: Vec<u32>,
-    last_block_len: usize,
+    pub inner: Model,
+    pub stream: u32,
+    pub block_ids: Vec<u32>,
+    pub last_block_len: usize,
 
-    token_ids: Vec<u32>,
-    pending_token_ids: Vec<u32>,
+    pub token_ids: Vec<u32>,
+    pub pending_token_ids: Vec<u32>,
     // occupied_block_ids: Vec<u32>,
     // free_block_ids: Vec<u32>,
     // pending_token_ids: Vec<u32>,
@@ -172,6 +172,23 @@ impl Context {
 
     fn block_size(&self) -> usize {
         self.inner.block_size
+    }
+
+    pub fn fork_unsafe(&mut self) -> Self {
+
+        self.inner
+            .resources
+            .borrow_mut()
+            .block_ids
+            .increment_rc_many(&self.block_ids);
+        Context {
+            inner: self.inner.clone(),
+            stream: get_unique_stream(),
+            block_ids: self.block_ids.clone(),
+            last_block_len: self.block_size(),
+            token_ids: self.token_ids.clone(),
+            pending_token_ids: self.pending_token_ids.clone(),
+        }
     }
 
     pub fn fork(&mut self) -> Self {

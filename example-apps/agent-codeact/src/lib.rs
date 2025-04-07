@@ -2,7 +2,7 @@ use boa_engine::{Context, Source};
 
 #[symphony::main]
 async fn main() -> Result<(), String> {
-    let max_num_outputs = 128;
+    let max_num_outputs = 32;
 
     // Initialize the model and context
     let available_models = symphony::available_models();

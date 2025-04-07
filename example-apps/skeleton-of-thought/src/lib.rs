@@ -6,7 +6,7 @@ const PLAN_PROMPT_TEMPLATE: &str = "Generate up to {} key points that outline th
 const COMPLETE_PROMPT_TEMPLATE: &str = "Elaborate on the following point: {}. Your response should be complete and only concerned with this point. Keep it concise and within 80 words.";
 const ASSISTANT_PREFIX: &str = "<|start_header_id|>assistant<|end_header_id|>\n\n";
 const STOP_TOKEN: &str = "<|eot_id|>";
-const MAX_TOKENS: usize = 256;
+const MAX_TOKENS: usize = 32;
 
 /// Generates a high-level plan and elaborates on each point in parallel.
 ///

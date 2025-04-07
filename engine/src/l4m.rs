@@ -267,30 +267,30 @@ impl Batchable<BatchGroup> for Command {
         match self {
             Command::GetInfo { .. } => batching::immediate(),
             Command::Allocate { .. } => {
-                batching::t_only(Duration::from_micros(100))
-                //batching::eager()
+                //batching::t_only(Duration::from_micros(100))
+                batching::eager()
             },
             Command::Deallocate { .. } => {
-                batching::t_only(Duration::from_micros(100))
-                //batching::eager()
+                //batching::t_only(Duration::from_micros(100))
+                batching::eager()
             },
             Command::FillBlock { .. } => {
                 //
-                //batching::eager()
+                batching::eager()
                 //batching::k_or_t(Duration::from_millis(10), 30, None)
                 // 7ms, 14ms
-                batching::t_only(Duration::from_millis(16))
+                //batching::t_only(Duration::from_millis(7))
             }
             Command::CopyBlock { .. } => batching::eager(),
             Command::MaskBlock { .. } => batching::eager(),
             Command::EmbedText { .. } => {
-                batching::t_only(Duration::from_micros(100))
-                //batching::eager()
+                //batching::t_only(Duration::from_micros(100))
+                batching::eager()
             },
 
             Command::SampleTopK { .. } => {
-                batching::t_only(Duration::from_micros(100))
-                //batching::eager()
+                //batching::t_only(Duration::from_micros(100))
+                batching::eager()
             },
             Command::Synchronize { .. } => batching::eager(),
             Command::EmbedImage { .. } => batching::eager(),

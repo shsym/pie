@@ -191,35 +191,48 @@ async fn main() -> Result<(), String> {
     let available_models = symphony::available_models();
     let model = symphony::Model::new(available_models.first().unwrap()).unwrap();
     let tokenizer = model.get_tokenizer();
+    let prompt = symphony::messaging_async::receive().await;
 
-    let mut sampler = ConstrainedSampler::new(
-        tokenizer.clone(),
-        JSON_GRAMMAR,
-        "<|end_of_text|>",
-        Some("<|begin_of_text|>"),
-        None,
-        None,
-        Some("<|eot_id|>"),
-    );
+    let num_prompts = symphony::messaging_async::receive()
+        .await
+        .parse()
+        .unwrap_or(1);
 
-    let mut stop_condition = symphony::stop_condition::any(
-        symphony::stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
-        symphony::stop_condition::Length::new(32),
-    );
+    let mut futures = Vec::new();
+    for _ in 0..num_prompts {
+        let mut ctx = model.create_context();
+        let prompt = prompt.clone();
+        let mut sampler = ConstrainedSampler::new(
+            tokenizer.clone(),
+            JSON_GRAMMAR,
+            "<|end_of_text|>",
+            Some("<|begin_of_text|>"),
+            None,
+            None,
+            Some("<|eot_id|>"),
+        );
+        let mut stop_condition = symphony::stop_condition::any(
+            symphony::stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
+            symphony::stop_condition::Length::new(32),
+        );
+        let future= async move {
 
-    let mut ctx = model.create_context();
-    ctx.fill("<|begin_of_text|>");
-    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
-    ctx.fill(
-        "<|start_header_id|>user<|end_header_id|>\n\n Generate some random json data<|eot_id|>",
-    );
-    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            ctx.fill("<|begin_of_text|>");
+            ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
+            ctx.fill("<|start_header_id|>user<|end_header_id|>\n\n");
+            ctx.fill(&prompt);
+            ctx.fill("<|eot_id|>");
+            ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
-    let output_text = ctx
-        .generate(&mut sampler, &mut stop_condition)
-        .await;
+            ctx
+            .generate(&mut sampler, &mut stop_condition).await
+        };
+        futures.push(future);
 
-    println!("Output: {:?} (elapsed: {:?})", output_text, start.elapsed());
-
+    }
+    let results = futures::future::join_all(futures).await;
+    let text = results.join("\n\n");
+    symphony::messaging::send(&text);
+    
     Ok(())
 }
