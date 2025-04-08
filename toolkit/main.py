@@ -4,9 +4,10 @@ from pathlib import Path
 from blake3 import blake3
 from symphony import SymphonyClient, Instance  # Assuming these are defined elsewhere
 import random
+
 async def main():
     # Define the program name and construct the file path
-    program_name = "skeleton_of_thought"#"text_completion"# # # 
+    program_name = "graph_of_thought"#"text_completion"# # # 
     program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
 
     # Check if the program file exists
@@ -35,7 +36,7 @@ async def main():
         print("Program uploaded successfully!")
 
     # Launch 200 instances
-    NUM_INSTANCES = 40
+    NUM_INSTANCES = 60
     NUM_PROMPTS = 1#200
     instances = []
     for _ in range(NUM_INSTANCES):
@@ -48,9 +49,9 @@ async def main():
         instance_start = time.monotonic()
         try:
             # Send two messages to the instance
-            #await instance.send("please tell me about this natural number:" + str(random.randint(1, 1000000)))
-            #await instance.send("32") # max_num_outputs
-            #await instance.send(str(NUM_PROMPTS)) # num_prompts
+            await instance.send("please tell me about this natural number:" + str(random.randint(1, 1000000)))
+            await instance.send("32") # max_num_outputs
+            await instance.send(str(NUM_PROMPTS)) # num_prompts
 
             # Listen for events until termination
             while True:
@@ -359,7 +360,7 @@ async def main_rt_bench():
         print("Program not found on server, uploading now...")
         await client.upload_program(program_bytes)
         print("Program uploaded successfully!")
-    for num_instances in [897]:
+    for num_instances in [10]:
         print(f"Running experiment with {num_instances} instances")
 
         # Repeat the experiment 10 times and collect all latencies
@@ -414,5 +415,108 @@ async def main_rt_bench():
 
 
 
+
+async def main_count_calls():
+    program_name = "beam_search"
+    program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
+    server_uri = "ws://127.0.0.1:9123"
+
+    client = SymphonyClient(server_uri)
+    await client.connect()
+
+    # Read the program file and compute its hash
+    with open(program_path, "rb") as f:
+        program_bytes = f.read()
+    program_hash = blake3(program_bytes).hexdigest()
+    print(f"Program file hash: {program_hash}")
+
+    # Check if the program exists on the server; upload if not
+    if not await client.program_exists(program_hash):
+        print("Program not found on server, uploading now...")
+        await client.upload_program(program_bytes)
+        print("Program uploaded successfully!")
+
+        # Repeat the experiment 10 times and collect all latencies
+
+    instance = await client.launch_instance(program_hash)
+    await instance.send("please tell me about this natural number:" + str(random.randint(1, 1000000)))
+    await instance.send("64") # max_num_outputs
+    await instance.send("1") # num_prompts
+
+    event, message = await instance.recv()
+    print(message)
+    
+    
+
+
+
+async def main_startup_time():
+    
+     # Define the program name and construct the file path
+    program_name = "rt_bench"#"text_completion"# # # 
+    program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
+
+    # Check if the program file exists
+    if not program_path.exists():
+        print(f"Error: Program file not found at path: {program_path}")
+        return
+
+    # Server URI (matching the Rust code)
+    server_uri = "ws://127.0.0.1:9123"
+    print(f"Using program: {program_name}")
+
+    # Initialize and connect the client
+    client = SymphonyClient(server_uri)
+    await client.connect()
+
+    # Read the program file and compute its hash
+    with open(program_path, "rb") as f:
+        program_bytes = f.read()
+    program_hash = blake3(program_bytes).hexdigest()
+    print(f"Program file hash: {program_hash}")
+
+    # Check if the program exists on the server; upload if not
+    if not await client.program_exists(program_hash):
+        print("Program not found on server, uploading now...")
+        await client.upload_program(program_bytes)
+        print("Program uploaded successfully!")
+    
+    for num_instances in [641]:
+        print(f"Running experiment with {num_instances} instances")
+
+        # Repeat the experiment 10 times and collect all latencies
+        all_latencies = []
+        for _ in range(5):
+            instances = []
+            for _ in range(num_instances):
+                instance = await client.launch_instance(program_hash)
+                
+                instances.append(instance)
+
+            # Define a function to handle each instance's send/receive operations and measure latency
+            async def handle_instance(instance: Instance):
+                instance_start = time.monotonic()
+                await instance.send("ping")
+                await instance.recv()
+                return time.monotonic() - instance_start
+                
+
+            # Create concurrent tasks for each instance and collect latencies
+            tasks = [asyncio.create_task(handle_instance(instance)) for instance in instances]
+            latencies = await asyncio.gather(*tasks)
+
+            # Filter out any None values from failed instances
+            valid_latencies = [lat for lat in latencies if lat > 0]
+            all_latencies.extend(valid_latencies)
+
+        # Calculate the average latency over all experiments
+        if all_latencies:
+            # 24 is pings per instance
+            average_latency = sum(all_latencies) / len(all_latencies)
+            print(f"Average latency per instance over 10 runs: {average_latency * 1000} milliseconds")
+        else:
+            print("No valid latency measurements collected.")
+
+
 if __name__ == "__main__":
-    asyncio.run(main_rt_bench())
+    asyncio.run(main())

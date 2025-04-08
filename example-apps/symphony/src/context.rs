@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::mem;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 static STREAM: AtomicU32 = AtomicU32::new(0);
 
@@ -396,7 +397,9 @@ impl Context {
 
         let mut next_token_id = self.pending_token_ids[0];
         let mut next_pos_id = self.token_ids.len() as u32;
+
         loop {
+            //let mut start = Instant::now();
             // embed the next token
             self.inner.model.embed_text(
                 self.stream,
@@ -446,6 +449,7 @@ impl Context {
             } else {
                 self.token_ids.push(next_token_id);
             }
+            //println!("TPOT: {:?}", elapsed);
         }
 
         self.pending_token_ids.clear();

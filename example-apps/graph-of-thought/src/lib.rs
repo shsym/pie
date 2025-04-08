@@ -13,12 +13,12 @@ async fn aggregate_proposals_async(mut base_context: Context, question: &str) ->
     let propose_prompt = format!("{} {}", PROPOSAL_PROMPT, question);
     base_context.fill(&propose_prompt);
     base_context.fill(ASSISTANT_PREFIX);
-
+    base_context.flush();
     // Generate proposals in parallel with varying max_tokens
-    let mut proposal_tasks = [16, 128, 32, 256, 128, 128, 16, 32]
+    let mut proposal_tasks = [4, 32, 16, 8, 4, 16, 3, 32]
         .into_iter()
         .map(|max_tokens| {
-            let mut ctx = base_context.fork();
+            let mut ctx = base_context.fork_unsafe();
             async move {
                 let proposal_text = ctx.generate_until(STOP_TOKEN, max_tokens).await;
                 (proposal_text, ctx)
@@ -73,7 +73,6 @@ async fn main() -> Result<(), String> {
     let model = Model::new(available_models.first().unwrap()).unwrap();
     let mut ctx = model.create_context();
     ctx.fill("<|begin_of_text|>");
-    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
 
     // Example usage
     let question = "What is the sum of 123456789 and 987654321?";

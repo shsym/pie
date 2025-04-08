@@ -276,10 +276,10 @@ impl Batchable<BatchGroup> for Command {
             },
             Command::FillBlock { .. } => {
                 //
-                //batching::eager()
                 //batching::k_or_t(Duration::from_millis(10), 30, None)
                 // 7ms, 14ms
-                batching::t_only(Duration::from_millis(6))
+                batching::t_only(Duration::from_millis(14))
+                //batching::eager()
             }
             Command::CopyBlock { .. } => batching::eager(),
             Command::MaskBlock { .. } => batching::eager(),
@@ -342,6 +342,10 @@ impl ObjectType for ManagedTypes {
         }
     }
 }
+#[derive(Debug)]
+pub struct L4mStat {
+    total_calls: u32,
+}
 
 #[derive(Debug)]
 pub struct L4m {
@@ -353,6 +357,7 @@ pub struct L4m {
     stream_priorities: HashMap<Stream, StreamPriority>,
     info: Info,
     tokenizer: Arc<BytePairEncoder>,
+    stats: L4mStat,
 }
 
 //#[async_trait]
@@ -360,6 +365,9 @@ impl Service for L4m {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
+
+
+        self.stats.total_calls += 1;
         if let Command::Destroy { inst_id } = cmd {
             for cmd in self.get_cleanup_cmds(inst_id) {
                 self.handle_cmd(cmd).await;
@@ -444,13 +452,13 @@ impl L4m {
             stream_priorities: HashMap::new(),
             info,
             tokenizer: Arc::new(tokenizer),
+            stats: L4mStat { total_calls: 0 },
         };
 
         driver
     }
 
     pub fn print_stats(&self) {
-        // INSERT_YOUR_REWRITE_HERE
         let mut stats = Vec::new();
         for &managed_type in &[ManagedTypes::KvBlock, ManagedTypes::TokenEmb] {
             let current = self.objects.available(managed_type).unwrap();
@@ -460,7 +468,7 @@ impl L4m {
 
             let type_name = match managed_type {
                 ManagedTypes::KvBlock => "kvpage",
-                ManagedTypes::TokenEmb => "tokenemb",
+                ManagedTypes::TokenEmb => "emb",
                 _ => "unknown",
             };
 
@@ -469,6 +477,8 @@ impl L4m {
                 type_name, used, capacity, percentage
             ));
         }
+
+        stats.push(format!("Total calls: {}", self.stats.total_calls));
 
         println!("{}", stats.join(" | "));
     }
@@ -515,6 +525,8 @@ impl L4m {
     fn resolve_cmd(&mut self, cmd: Command) -> Option<(Command, Stream)> {
         match cmd {
             Command::PrintStats => {
+                self.stats.total_calls -=1; // compensate for the print stats call
+
                 self.print_stats();
                 None
             }
