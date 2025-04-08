@@ -174,7 +174,7 @@ impl Context {
         self.inner.block_size
     }
 
-    pub fn fork_unsafe(&mut self) -> Self {
+    pub fn fork_unsafe(&self) -> Self {
 
         self.inner
             .resources
@@ -266,6 +266,10 @@ impl Context {
         self.pending_token_ids.extend(new_token_ids);
     }
 
+    pub fn fill_token(&mut self, new_token_id: u32) {
+        self.pending_token_ids.push(new_token_id);
+    }
+
     pub fn flush(&mut self) {
         if self.pending_token_ids.len() < 2 {
             return;
@@ -342,12 +346,18 @@ impl Context {
 
         let num_pages_to_retain_begin = sink_size.div_ceil(self.block_size());
         let num_pages_to_retain_end = window_size.div_ceil(self.block_size());
+        //println!("num blocks before sink: {}", self.block_ids.len());
 
         if self.block_ids.len() > num_pages_to_retain_begin + num_pages_to_retain_end {
             let sink_start = num_pages_to_retain_begin;
             let sink_end = self.block_ids.len() - num_pages_to_retain_end;
 
-            self.block_ids = self.block_ids[sink_start..sink_end].to_vec();
+            self.block_ids = self.block_ids[..=sink_start]
+                .iter()
+                .chain(self.block_ids[sink_end..].iter())
+                .cloned()
+                .collect();
+            //println!("num blocks after sink: {}", self.block_ids.len());
         }
     }
 

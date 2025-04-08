@@ -20,7 +20,7 @@ async fn main() -> Result<(), String> {
     let text = ctx.generate_until("<|eot_id|>", max_num_outputs).await;
 
     // simulate function calling
-    //symphony::wstd::task::sleep(Duration::from_millis(100)).await;
+    symphony::wstd::task::sleep(Duration::from_millis(100)).await;
 
     ctx.fill("result from the function call");
 

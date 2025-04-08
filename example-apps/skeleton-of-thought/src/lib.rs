@@ -30,7 +30,7 @@ async fn plan_and_generate_parallel(
     let output = plan_ctx.generate_until(STOP_TOKEN, MAX_TOKENS).await;
 
     // Robustly parse points from the output
-    let points = output
+    let mut points = output
         .split("<point>")
         .skip(1) // Skip any text before the first "<point>"
         .filter_map(|s| {
@@ -42,6 +42,11 @@ async fn plan_and_generate_parallel(
             }
         })
         .collect::<Vec<_>>();
+
+    // check if points is empty
+    if points.is_empty() {
+        points = vec!["Dummy Point 1".to_string(), "Dummy Point 2".to_string(), "Dummy Point 3".to_string()];
+    }
 
     // Generate elaborations in parallel using fresh contexts
     let leaf_futures = points
