@@ -433,7 +433,13 @@ impl L4m {
             }
         }
 
-        let tokenizer = tokenizer.expect("Failed to load tokenizer from any available path");
+        let tokenizer = tokenizer.expect(
+            format!(
+                "Failed to load tokenizer from paths: {:?}\nModel name: {}\n
+                 Download the tokenizer model with: ./download_tokenizer.sh MODEL_NAME",
+                tokenizer_paths, info.model_name
+            ).as_str()
+        );
 
         let mut objects = ObjectManager::new();
         objects
