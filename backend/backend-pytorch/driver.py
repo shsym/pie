@@ -193,8 +193,7 @@ class Driver:
         for i, cmd in enumerate(cmds.items):
 
             # update the block metadata
-
-            tgt_block = self.blocks[cmd.block_id]
+            tgt_block = self.blocks[cmd.last_block_len]
             for j in range(NUM_TOKENS_IN_BLOCK):
 
                 # process input embeds
@@ -233,7 +232,7 @@ class Driver:
 
             # mask: (len(ctx_ids) * block_size, block_size)
             ctx_block_ids = cmd.context_block_ids
-            tgt_block_id = cmd.block_id
+            tgt_block_id = cmd.last_block_len
 
             num_chunks = ceil_div(len(ctx_block_ids), NUM_BLOCKS_IN_CHUNK)
 

@@ -193,6 +193,12 @@ async fn main() -> Result<(), String> {
 
     //tree_search(ctx, question, num_branches).await;
     //tree_search_branch_parallel(ctx, question, num_branches).await;\
-    tree_search_naive(ctx, question, num_branches).await;
+    let res = tree_search_naive(ctx, question, num_branches).await;
+    // Print the last result
+    if let Some(last_result) = res.last() {
+        println!("Final result: {}", last_result);
+    } else {
+        println!("No results generated.");
+    }
     Ok(())
 }

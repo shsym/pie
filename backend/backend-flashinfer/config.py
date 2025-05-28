@@ -1,7 +1,7 @@
 VERSION = "0.1.0"
 
 # Model configuration
-MODEL_NAME = "Llama-3.2-1B-Instruct"
+MODEL_NAME = "Llama-3.1-8B-Instruct"
 FULL_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 
 # Constants

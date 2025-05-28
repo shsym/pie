@@ -1,9 +1,9 @@
 VERSION = "0.1.0"
 
 # Model configuration
-MODEL_NAME = "Meta-Llama-3-8B"
-FULL_MODEL_NAME = "NousResearch/Meta-Llama-3-8B-Instruct"
+MODEL_NAME = "Llama-3.1-8B-Instruct"
+FULL_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 
 # Constants
-NUM_TOKENS_IN_BLOCK = 8
+NUM_TOKENS_IN_BLOCK = 16
 DIST_RESOLUTION = 32

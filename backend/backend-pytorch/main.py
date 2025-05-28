@@ -300,7 +300,7 @@ def main_test():
     OUT_EMB_OFFSET = 100
 
     engine.fill_block(l4m_pb2.BatchFillBlock(items=[
-        l4m_pb2.FillBlock(block_id=i,
+        l4m_pb2.FillBlock(last_block_len=i,
                           context_block_ids=list(range(i + 1)),
                           input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * i, NUM_TOKENS_IN_BLOCK * (i + 1))),
                           output_embedding_ids=list(range(OUT_EMB_OFFSET, OUT_EMB_OFFSET + NUM_TOKENS_IN_BLOCK)) if i == num_blocks_needed - 1 else [])
@@ -334,7 +334,7 @@ def main_test():
             l4m_pb2.EmbedText(embedding_id=len(token_ids) + i, token_id=new_token, position_id=len(token_ids) + i)
         ]))
         engine.fill_block(l4m_pb2.BatchFillBlock(items=[
-            l4m_pb2.FillBlock(block_id=last_block_id,
+            l4m_pb2.FillBlock(last_block_len=last_block_id,
                               context_block_ids=list(range(last_block_id + 1)),
                               input_embedding_ids=list(range(NUM_TOKENS_IN_BLOCK * last_block_id, NUM_TOKENS_IN_BLOCK * (last_block_id + 1))),
                               output_embedding_ids=list(range(OUT_EMB_OFFSET, OUT_EMB_OFFSET + NUM_TOKENS_IN_BLOCK))),
