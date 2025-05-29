@@ -1,24 +1,4 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://pie-project.org/images/pie-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="https://pie-project.org/images/pie-light.svg">
-    <img alt="Pie: Programmable serving system for emerging LLM applications"
-         src="https://pie-project.org/images/pie-light.svg"
-         width="30%">
-  </picture>
-
-[Getting started] | [Learn] | [Documentation] | [Contributing]
-</div>
-
-[Pie] is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
-
----
-
-[pie]: https://pie-project.org/
-[Getting Started]: https://pie-project.org/learn/get-started
-[Learn]: https://pie-project.org/learn
-[Documentation]: https://pie-project.org/learn#learn-use
-[Contributing]: CONTRIBUTING.md
+# Symphony
 
 ## Getting Started
 
