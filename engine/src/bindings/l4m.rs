@@ -6,8 +6,8 @@ use crate::{bindings, service};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
-use wasmtime_wasi::{DynPollable, IoView, Pollable, async_trait, subscribe};
-
+use wasmtime_wasi::async_trait;
+use wasmtime_wasi::p2::{DynPollable, IoView, Pollable, subscribe};
 #[derive(Debug, Clone)]
 pub struct Model {
     pub name: String,

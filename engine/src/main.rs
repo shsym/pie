@@ -79,17 +79,17 @@ macro_rules! log_user {
 /// Load engine configuration from JSON file
 fn load_config(config_path: Option<&str>) -> anyhow::Result<EngineConfig> {
     let config_path = config_path.unwrap_or("./config.json");
-    
+
     let config_content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path))?;
-    
+
     let config: EngineConfig = serde_json::from_str(&config_content)
         .with_context(|| format!("Failed to parse config file: {}", config_path))?;
-    
+
     log_user!("Loaded engine config from: {}", config_path);
     log_user!("Available models: {:?}", config.models);
     log_user!("Default model: {}", config.default_model);
-    
+
     Ok(config)
 }
 
@@ -103,7 +103,7 @@ async fn get_model_endpoint(model_name: &str, config: &EngineConfig) -> anyhow::
     let correlation_id = uuid::Uuid::new_v4().to_string();
     let mut params = HashMap::new();
     params.insert("model_name".to_string(), serde_json::Value::String(model_name.to_string()));
-    
+
     let command = ManagementCommand {
         command: "load-model".to_string(),
         params,
@@ -114,7 +114,7 @@ async fn get_model_endpoint(model_name: &str, config: &EngineConfig) -> anyhow::
     let command_json = serde_json::to_string(&command)
         .context("Failed to serialize management command")?;
     let message = ZmqMessage::from(command_json.as_bytes().to_vec());
-    
+
     socket.send(message).await
         .context("Failed to send command to management service")?;
 
@@ -123,13 +123,13 @@ async fn get_model_endpoint(model_name: &str, config: &EngineConfig) -> anyhow::
         .context("Failed to receive response from management service")?;
     let response_bytes = response_msg.get(0)
         .context("Empty response from management service")?;
-    
+
     let response: ManagementResponse = serde_json::from_slice(response_bytes)
         .context("Failed to parse management service response")?;
 
     if !response.success {
         return Err(anyhow::anyhow!(
-            "Management service error: {}", 
+            "Management service error: {}",
             response.error.unwrap_or_else(|| "Unknown error".to_string())
         ));
     }
@@ -154,11 +154,11 @@ async fn find_first_available_model(config: &EngineConfig) -> anyhow::Result<Str
 
     for model_name in &config.models {
         log_user!("Checking availability of model: {}", model_name);
-        
+
         let correlation_id = uuid::Uuid::new_v4().to_string();
         let mut params = HashMap::new();
         params.insert("model_name".to_string(), serde_json::Value::String(model_name.clone()));
-        
+
         let command = ManagementCommand {
             command: "load-model".to_string(),
             params,
@@ -169,7 +169,7 @@ async fn find_first_available_model(config: &EngineConfig) -> anyhow::Result<Str
         let command_json = serde_json::to_string(&command)
             .context("Failed to serialize management command")?;
         let message = ZmqMessage::from(command_json.as_bytes().to_vec());
-        
+
         if let Err(e) = socket.send(message).await {
             log_user!("Failed to send command for model {}: {}", model_name, e);
             continue;
@@ -183,7 +183,7 @@ async fn find_first_available_model(config: &EngineConfig) -> anyhow::Result<Str
                 continue;
             }
         };
-        
+
         let response_bytes = match response_msg.get(0) {
             Some(bytes) => bytes,
             None => {
@@ -191,7 +191,7 @@ async fn find_first_available_model(config: &EngineConfig) -> anyhow::Result<Str
                 continue;
             }
         };
-        
+
         let response: ManagementResponse = match serde_json::from_slice(response_bytes) {
             Ok(resp) => resp,
             Err(e) => {
@@ -204,7 +204,7 @@ async fn find_first_available_model(config: &EngineConfig) -> anyhow::Result<Str
             log_user!("Model {} is available", model_name);
             return Ok(model_name.clone());
         } else {
-            log_user!("Model {} is not available: {}", model_name, 
+            log_user!("Model {} is not available: {}", model_name,
                 response.error.unwrap_or_else(|| "Unknown error".to_string()));
         }
     }
@@ -228,7 +228,7 @@ async fn check_management_service_status(config: &EngineConfig) -> anyhow::Resul
     let command_json = serde_json::to_string(&command)
         .context("Failed to serialize status command")?;
     let message = ZmqMessage::from(command_json.as_bytes().to_vec());
-    
+
     socket.send(message).await
         .context("Failed to send status command")?;
 
@@ -236,13 +236,13 @@ async fn check_management_service_status(config: &EngineConfig) -> anyhow::Resul
         .context("Failed to receive status response")?;
     let response_bytes = response_msg.get(0)
         .context("Empty status response")?;
-    
+
     let response: ManagementResponse = serde_json::from_slice(response_bytes)
         .context("Failed to parse status response")?;
 
     if !response.success {
         return Err(anyhow::anyhow!(
-            "Management service status check failed: {}", 
+            "Management service status check failed: {}",
             response.error.unwrap_or_else(|| "Unknown error".to_string())
         ));
     }
@@ -309,15 +309,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Load engine configuration
     let config = load_config(Some(config_path))?;
-    
+
     // Check if management service is running first
     check_management_service_status(&config).await
         .context("Management service is not available")?;
-    
+
     // Find the first available model from the config
     let model_name = find_first_available_model(&config).await
         .context("Failed to find any available models")?;
-    
+
     log_user!("Using model: {}", model_name);
 
     // 1) Ensure the cache directory exists
@@ -338,7 +338,6 @@ async fn main() -> anyhow::Result<()> {
             .add("server", server)
             .add("messaging-inst2inst", messaging_inst2inst)
             .add("messaging-user2inst", messaging_user2inst);
-            
 
     // Setup with dummy
     let ctrl = if use_dummy {
@@ -358,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
         // Get the model endpoint from management service
         let model_endpoint = get_model_endpoint(&model_name, &config).await
             .context("Failed to get model endpoint from management service")?;
-        
+
         // Connect to the model backend endpoint
         let l4m_backend = backend::ZmqBackend::bind(&model_endpoint).await?;
 
@@ -371,7 +370,7 @@ async fn main() -> anyhow::Result<()> {
             .add(l4m::available_models().first().unwrap(), l4m)
             .add("ping", ping)
     };
-    
+
     // Install all services
     ctrl.install();
 
@@ -383,7 +382,6 @@ async fn main() -> anyhow::Result<()> {
             l4m::Command::PrintStats.dispatch(service_id).unwrap();
         }
     });
-
 
     // TEST: spawn a dummy client with the program name
     if *is_http {

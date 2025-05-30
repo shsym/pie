@@ -4,7 +4,8 @@ use crate::{bindings, server};
 use std::mem;
 use tokio::sync::{mpsc, oneshot};
 use wasmtime::component::Resource;
-use wasmtime_wasi::{DynPollable, IoView, Pollable, async_trait, subscribe};
+use wasmtime_wasi::async_trait;
+use wasmtime_wasi::p2::{DynPollable, IoView, Pollable , subscribe};
 //
 
 #[derive(Debug)]

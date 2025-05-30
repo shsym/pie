@@ -223,7 +223,7 @@ impl Runtime {
         let mut linker = Linker::<InstanceState>::new(&engine);
 
         // Add to linker
-        wasmtime_wasi::add_to_linker_async(&mut linker)
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|e| RuntimeError::Other(format!("Failed to link WASI: {e}")))
             .unwrap();
         wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
@@ -387,11 +387,11 @@ impl Runtime {
             .await
             .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
 
-        let serve_export = instance
+        let (_, serve_export) = instance
             .get_export(&mut store, None, "wasi:http/incoming-handler@0.2.4")
             .ok_or_else(|| RuntimeError::Other("No 'serve' function found".into()))?;
 
-        let handle_func_export = instance
+        let (_, handle_func_export) = instance
             .get_export(&mut store, Some(&serve_export), "handle")
             .ok_or_else(|| RuntimeError::Other("No 'handle' function found".into()))?;
 
@@ -493,11 +493,11 @@ impl Runtime {
                 .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
 
             // Attempt to call “run”
-            let run_export = instance
+            let (_, run_export) = instance
                 .get_export(&mut store, None, "symphony:nbi/run")
                 .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
 
-            let run_func_export = instance
+            let (_, run_func_export) = instance
                 .get_export(&mut store, Some(&run_export), "run")
                 .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
 

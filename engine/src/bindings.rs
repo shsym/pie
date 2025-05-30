@@ -11,7 +11,7 @@ mod wit {
         world: "imports",
         async: true,
         with: {
-            "wasi:io/poll": wasmtime_wasi::bindings::io::poll,
+            "wasi:io/poll": wasmtime_wasi::p2::bindings::io::poll,
             "symphony:nbi/messaging/subscription": messaging::Subscription,
             "symphony:nbi/messaging/receive-result": messaging::ReceiveResult,
             "symphony:nbi/l4m/model": l4m::Model,

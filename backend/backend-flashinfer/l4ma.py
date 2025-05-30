@@ -243,15 +243,3 @@ class L4maModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states
-
-
-class VectorStorage:
-
-    def __init__(self, num_vectors: int, embed_dim: int, device: str, dtype=torch.bfloat16):
-        self.ptr = torch.empty((num_vectors, embed_dim), device=device, dtype=dtype)
-
-        self.dtype = dtype
-        self.device = device
-
-        self.num_vectors = num_vectors
-        self.embed_dim = embed_dim

@@ -1,16 +1,16 @@
 [package]
-name = "symphony-engine"
+name = "pie"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.95"
-blake3 = "1.5.5"
-tokio = { version = "1.44.1", features = ["full"] } # ["full", "tracing"]
+blake3 = "1.8.2"
+tokio = { version = "1.45.1", features = ["full"] } # ["full", "tracing"]
 tokio-tungstenite = "0.26.2"
-wasmtime = "30.0.2" #{ path = "../../wasmtime/crates/wasmtime" }
-wasmtime-wasi = "30.0.2"# { path = "../../wasmtime/crates/wasi" }
-wasmtime-wasi-http = "30.0.2" #{ path = "../../wasmtime/crates/wasi-http" }
+wasmtime = "33.0.0" #{ path = "../../wasmtime/crates/wasmtime" }
+wasmtime-wasi = "33.0.0"# { path = "../../wasmtime/crates/wasi" }
+wasmtime-wasi-http = "33.0.0" #{ path = "../../wasmtime/crates/wasi-http" }
 zeromq = "0.4.1"
 futures = "0.3.31"
 tungstenite = "0.26.2"

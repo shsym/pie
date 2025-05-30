@@ -8,7 +8,6 @@ from transformers import AutoTokenizer
 
 import config
 from common import ceil_div
-from l4ma import VectorStorage
 from llama import LlamaForCausalLM
 from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlock, BatchCopyBlock, BatchDecodeTokenDistribution, BatchSampleTopKRequest, BatchSampleTopKResponse, \
     ObjectKind, SampleTopKResponse, BatchFillBlock
@@ -16,8 +15,15 @@ from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlo
 from l4m_vision_pb2 import BatchEmbedImage
 from config import FULL_MODEL_NAME, NUM_TOKENS_IN_BLOCK
 
-tokenizer = AutoTokenizer.from_pretrained(FULL_MODEL_NAME)
+class VectorStorage:
+    def __init__(self, num_vectors: int, embed_dim: int, device: str, dtype=torch.bfloat16):
+        self.ptr = torch.empty((num_vectors, embed_dim), device=device, dtype=dtype)
 
+        self.dtype = dtype
+        self.device = device
+
+        self.num_vectors = num_vectors
+        self.embed_dim = embed_dim
 
 @dataclass
 class TextEmbed:
@@ -49,8 +55,6 @@ Embed = Union[TextEmbed, ImageEmbed]
 class Driver:
     embeds: dict[int, Embed]
     blocks: dict[int, Block]
-    lm: LlamaForCausalLM
-
 
     # dist_storage: VectorStorage
 

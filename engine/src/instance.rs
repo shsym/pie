@@ -6,9 +6,9 @@ use std::io;
 use std::io::{IsTerminal, Write};
 use uuid::Uuid;
 use wasmtime::component::ResourceTable;
-use wasmtime_wasi::{
+use wasmtime_wasi::async_trait;
+use wasmtime_wasi::p2::{
     IoView, OutputStream, Pollable, StdoutStream, StreamError, StreamResult, WasiCtx, WasiView,
-    async_trait,
 };
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
