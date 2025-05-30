@@ -36,9 +36,17 @@ message BatchAllocate {
   repeated Allocate items = 1;
 }
 
+message Deallocate {
+  // The kind of object to deallocate.
+  ObjectKind kind = 1;
+  // The number of objects to deallocate.
+  uint32 object_id_offset = 2;
+  uint32 count = 3;
+}
+
 // A request to deallocate objects of a certain kind with specified IDs.
 message BatchDeallocate {
-  repeated Allocate items = 1;
+  repeated Deallocate items = 1;
 }
 
 // -----------------------------------------------------------------------------

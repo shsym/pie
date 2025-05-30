@@ -55,8 +55,15 @@ class ManagementCLI:
     def cleanup(self):
         """Clean up ZMQ context."""
         if hasattr(self, 'context') and self.context:
-            self.context.term()
-            self.context = None
+            try:
+                # Use a short linger to avoid hanging
+                self.context.setsockopt(zmq.LINGER, 100)  # 100ms linger
+                self.context.term()
+            except Exception as e:
+                # Log the error but don't raise it to avoid breaking cleanup
+                print(f"Warning: Error terminating ZMQ context: {e}")
+            finally:
+                self.context = None
         
     def _send_command(self, command: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Send a command to the management service and get response."""

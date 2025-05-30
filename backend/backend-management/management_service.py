@@ -15,6 +15,7 @@ import signal
 import logging
 import argparse
 import subprocess
+import threading
 from typing import Dict, Optional, Any
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -103,8 +104,10 @@ class ManagementService:
         self.client_router = None  # For client handshakes
         self.cli_router = None     # For CLI commands
         
-        # Shutdown flag
+        # Shutdown flag and lock for thread safety
         self.shutdown_requested = False
+        self._cleanup_lock = threading.Lock()
+        self._cleaned_up = False
         
         # Setup logging
         self._setup_logging()
@@ -660,21 +663,48 @@ class ManagementService:
     
     def _cleanup(self):
         """Cleanup resources before shutdown."""
-        self.logger.info("Cleaning up management service...")
-        
-        # Terminate all model instances
-        for model_name, instance in self.model_instances.items():
-            self.logger.info(f"Terminating model instance: {model_name}")
-            instance.terminate()
-        
-        # Close ZMQ sockets
-        if self.client_router:
-            self.client_router.close()
-        if self.cli_router:
-            self.cli_router.close()
-        
-        self.context.term()
-        self.logger.info("Management service cleanup complete")
+        with self._cleanup_lock:
+            if self._cleaned_up:
+                return  # Already cleaned up
+                
+            self.logger.info("Cleaning up management service...")
+            
+            # Terminate all model instances
+            for model_name, instance in self.model_instances.items():
+                self.logger.info(f"Terminating model instance: {model_name}")
+                try:
+                    instance.terminate()
+                except Exception as e:
+                    self.logger.warning(f"Error terminating model instance {model_name}: {e}")
+            
+            # Close ZMQ sockets with proper error handling
+            if self.client_router:
+                try:
+                    self.client_router.close()
+                except Exception as e:
+                    self.logger.warning(f"Error closing client router: {e}")
+                self.client_router = None
+                
+            if self.cli_router:
+                try:
+                    self.cli_router.close()
+                except Exception as e:
+                    self.logger.warning(f"Error closing CLI router: {e}")
+                self.cli_router = None
+
+            # Terminate ZMQ context with proper error handling and thread safety
+            if hasattr(self, 'context') and self.context:
+                try:
+                    # Use a short linger to avoid hanging
+                    self.context.setsockopt(zmq.LINGER, 100)  # 100ms linger
+                    self.context.term()
+                except Exception as e:
+                    self.logger.warning(f"Error terminating ZMQ context: {e}")
+                finally:
+                    self.context = None
+                    
+            self._cleaned_up = True
+            self.logger.info("Management service cleanup complete")
     
     def initialize_sockets(self):
         """Initialize ZMQ sockets without starting the main loop (for testing)."""

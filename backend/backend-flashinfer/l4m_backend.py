@@ -1,4 +1,5 @@
 import time
+import argparse
 
 import torch
 import zmq
@@ -67,6 +68,12 @@ def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | No
 
 
 def main_run():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='L4M Backend Server')
+    parser.add_argument('--ipc-endpoint', type=str, default='ipc:///tmp/symphony-ipc', 
+                       help='IPC endpoint to bind to')
+    args = parser.parse_args()
+    
     device = "cuda:0"
 
     # quantization_config = TorchAoConfig("int4_weight_only", group_size=128)
@@ -74,14 +81,12 @@ def main_run():
     model = LlamaForCausalLM.from_pretrained(
         FULL_MODEL_NAME, torch_dtype="bfloat16", device_map=device)
 
-    #endpoint = "tcp://*:8888"
-    endpoint = "ipc:///tmp/symphony-ipc"
+    endpoint = args.ipc_endpoint
 
     engine = Driver(model, MAX_NUM_PAGES, MAX_NUM_EMBEDS, torch.bfloat16, device)
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
-    # router.bind("tcp://*:8888")
     router.bind(endpoint)
 
     print(f"Server listening on {endpoint}")
@@ -190,85 +195,6 @@ def main_run():
         idle_start = time.time()
 
 
-###====================Test====================###
 
-def llama3_format(prompt: str, hint: str | None, system: str = "you are a helpful assistant."):
-    temp = "<|begin_of_text|>"
-    temp += f"<|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>"
-    temp += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
-    temp += f"<|start_header_id|>assistant<|end_header_id|>\n\n"
-
-    if hint:
-        temp += hint
-
-    return temp
-
-
-
-def main_test():
-    device = "cuda:0"
-    FULL_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct" #"meta-llama/Llama-3.1-8B-Instruct" #  #
-    model = LlamaForCausalLM.from_pretrained(
-        FULL_MODEL_NAME, torch_dtype="bfloat16", device_map=device)
-
-    tokenizer = AutoTokenizer.from_pretrained(FULL_MODEL_NAME)
-    
-    
-    engine = Driver(model, 1000, torch.bfloat16, device)
-    
-    test_prompt = llama3_format("What is a pinon coffee? eli 5", None)
-    
-    next_token_ids = tokenizer.encode(test_prompt)
-    output_token_ids = []
-    ctx_blocks = [0]
-    engine.allocate(l4m_pb2.BatchAllocate(items=[l4m_pb2.Allocate(kind=l4m_pb2.ObjectKind.OBJECT_KIND_KV_BLOCK, object_id_offset=0, count=1)]))
-
-    last_block_len = 0
-    token_pos_offset = 0
-    while True:
-        cur_avail = NUM_TOKENS_IN_BLOCK - last_block_len
-        new_blocks_needed = len(next_token_ids) > cur_avail
-        
-        if new_blocks_needed:
-            num_new_blocks_needed = ceil_div(len(next_token_ids) - cur_avail, NUM_TOKENS_IN_BLOCK)
-            engine.allocate(l4m_pb2.BatchAllocate(items=[l4m_pb2.Allocate(kind=l4m_pb2.ObjectKind.OBJECT_KIND_KV_BLOCK, object_id_offset=len(ctx_blocks), count=num_new_blocks_needed)]))
-            ctx_blocks.extend(list(range(len(ctx_blocks), len(ctx_blocks) + num_new_blocks_needed)))
-            last_block_len = (last_block_len + len(next_token_ids)) % NUM_TOKENS_IN_BLOCK
-
-        else:    
-            last_block_len = (last_block_len + len(next_token_ids))
-            
-            
-        engine.embed_text(l4m_pb2.BatchEmbedText(items=[
-            l4m_pb2.EmbedText(embedding_id=i, token_id=next_token_ids[i], position_id=i+token_pos_offset)
-            for i in range(len(next_token_ids))
-        ]))
-        token_pos_offset += len(next_token_ids)
-
-        
-        engine.fill_block(l4m_pb2.BatchFillBlock(items=[
-            l4m_pb2.FillBlock(block_id=last_block_len,
-                              context_block_ids=ctx_blocks,
-                              input_embedding_ids=list(range(0, len(next_token_ids))),
-                              output_embedding_ids=[0])
-        ]))
-        
-        res = engine.sample_top_k_request(l4m_pb2.BatchSampleTopKRequest(items=[
-            l4m_pb2.SampleTopKRequest(distribution_id=0, k=5)
-        ]))
-
-        new_token = res.items[0].token_ids[0]
-        output_token_ids.append(new_token)
-        print(tokenizer.decode(output_token_ids), f"({new_token})")
-        
-        
-        next_token_ids = [new_token]
-        
-        if len(output_token_ids) > 50:
-            break
-
-
-    
 if __name__ == "__main__":
     main_run()
-    #main_test()

@@ -3,7 +3,7 @@ use crate::bindings::l4m::Model;
 use crate::instance::InstanceState;
 use crate::l4m::Command;
 use wasmtime::component::Resource;
-use wasmtime_wasi::IoView;
+use wasmtime_wasi::p2::IoView;
 
 pub struct VisionModel {
     name: String,

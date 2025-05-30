@@ -75,6 +75,8 @@ The management layer will consist of two main parts: a long-running **Management
     *   **Steps:**
         *   Revise `backend/backend-flashinfer/main.py` to `backend/backend-flashinfer/l4m_backend.py` (or similar, e.g., `llama_backend.py`).
         *   This script will now be executed as a separate process by the new management layer.
+        *   Unit tests for the L4M backend should be updated to reflect this change.
+        *   Integration test from backend-management with this backend should be created.
 
 2.  **Parameterize IPC Endpoint:**
     *   **Objective:** Allow the IPC endpoint to be dynamically assigned by the management layer.

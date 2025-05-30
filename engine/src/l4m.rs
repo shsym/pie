@@ -1197,6 +1197,44 @@ fn encode_pb_batch_allocate_inner(batch: Vec<Command>) -> Vec<pb_bindings::Alloc
     items
 }
 
+fn encode_pb_batch_deallocate_inner(batch: Vec<Command>) -> Vec<pb_bindings::Deallocate> {
+    let mut items = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::Allocate {
+                inst_id,
+                stream_id,
+                ty,
+                ids,
+            }
+            | Command::Deallocate {
+                inst_id,
+                stream_id,
+                ty,
+                ids,
+            } => {
+                let kind = match ty {
+                    ManagedTypes::KvBlock => pb_bindings::ObjectKind::KvBlock,
+                    ManagedTypes::TokenEmb => pb_bindings::ObjectKind::Emb,
+                    _ => unreachable!(),
+                }
+                .into();
+
+                for (offset, size) in group_consecutive_ids(&ids) {
+                    let pb = pb_bindings::Deallocate {
+                        kind,
+                        object_id_offset: offset,
+                        count: size as u32,
+                    };
+                    items.push(pb);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    items
+}
+
 fn encode_pb_batch_allocate(
     correlation_id: u32,
     batch: Vec<Command>,
@@ -1221,7 +1259,7 @@ fn encode_pb_batch_deallocate(
         correlation_id,
         command: Some(pb_bindings::request::Command::Deallocate(
             pb_bindings::BatchDeallocate {
-                items: encode_pb_batch_allocate_inner(batch),
+                items: encode_pb_batch_deallocate_inner(batch),
             },
         )),
     }
