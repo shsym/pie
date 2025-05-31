@@ -7,6 +7,5 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-symphony = { path = "../symphony" }
-tokio = "1.43.0"
+pie = { path = "../pie" }
 futures = "0.3.31"

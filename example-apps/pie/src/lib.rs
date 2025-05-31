@@ -6,8 +6,8 @@ pub mod sampler;
 pub mod stop_condition;
 mod utils;
 
-pub use symphony_macros::main;
-pub use symphony_macros::server_main;
+pub use pie_macros::main;
+pub use pie_macros::server_main;
 
 pub use wstd;
 pub mod bindings {
@@ -27,7 +27,7 @@ pub mod bindings_app {
         path: "../../api/wit",
         world: "app",
         pub_export_macro: true,
-        default_bindings_module: "symphony::bindings",
+        default_bindings_module: "pie::bindings",
         with: {
              "wasi:io/poll@0.2.4": wasi::io::poll,
         },
@@ -39,7 +39,7 @@ pub mod bindings_server {
         path: "../../api/wit",
         world: "server",
         pub_export_macro: true,
-        default_bindings_module: "symphony::bindings",
+        default_bindings_module: "pie::bindings",
         with: {
             "wasi:io/poll@0.2.4": wasi::io::poll,
             "wasi:clocks/monotonic-clock@0.2.4": wasi::clocks::monotonic_clock,
@@ -56,11 +56,11 @@ pub mod bindings_server {
 }
 
 pub use crate::bindings::{
-    symphony::nbi::l4m, symphony::nbi::l4m_vision, symphony::nbi::messaging, symphony::nbi::ping,
-    symphony::nbi::runtime,
+    pie::nbi::l4m, pie::nbi::l4m_vision, pie::nbi::messaging, pie::nbi::ping,
+    pie::nbi::runtime,
 };
 
-pub use crate::bindings_app::{export, exports::symphony::nbi::run::Guest as RunSync};
+pub use crate::bindings_app::{export, exports::pie::nbi::run::Guest as RunSync};
 pub use crate::context::{Model, Context};
 pub use anyhow::Result;
 pub use wasi;
@@ -123,22 +123,22 @@ where
 #[macro_export]
 macro_rules! main_sync {
     ($app:ident) => {
-        symphony::export!($app with_types_in symphony::bindings_app);
+        pie::export!($app with_types_in pie::bindings_app);
     };
 }
 
 #[macro_export]
 macro_rules! main_async {
     ($app:ident) => {
-        type _App = symphony::App<$app>;
-        symphony::export!(_App with_types_in symphony::bindings_app);
+        type _App = pie::App<$app>;
+        pie::export!(_App with_types_in pie::bindings_app);
     };
 }
 
 #[macro_export]
 macro_rules! server {
     ($app:ident) => {
-        type _Server = symphony::Server<$app>;
-        symphony::wasi::http::proxy::export!(_Server with_types_in symphony::bindings_server);
+        type _Server = pie::Server<$app>;
+        pie::wasi::http::proxy::export!(_Server with_types_in pie::bindings_server);
     };
 }

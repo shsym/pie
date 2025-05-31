@@ -3,6 +3,14 @@ name = "backend-management-rs"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "symphony-management-service"
+path = "src/main.rs"
+
+[[bin]]
+name = "symphony-cli"
+path = "src/cli/management_cli.rs"
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -18,6 +26,7 @@ signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 async-trait = "0.1"
 bytes = "1.0"
+clap = { version = "4.0", features = ["derive"] }
 
 [build-dependencies]
 prost-build = "0.12"

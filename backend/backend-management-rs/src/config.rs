@@ -2,7 +2,7 @@ use crate::error::{ConfigError, ConfigResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn, debug};
+use tracing::{info, debug};
 
 /// Main configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
-use symphony::wstd::http::{Client, Method, Request};
-use symphony::wstd::io::AsyncRead;
+use pie::wstd::http::{Client, Method, Request};
+use pie::wstd::io::AsyncRead;
 
 /// Asynchronously fetches the contents of the given URL as a String.
 pub async fn fetch(url: &str) -> Result<String> {
@@ -11,7 +11,7 @@ pub async fn fetch(url: &str) -> Result<String> {
     let request = Request::builder()
         .uri(url)
         .method(Method::GET)
-        .body(symphony::wstd::io::empty())?;
+        .body(pie::wstd::io::empty())?;
 
     // Send the request and get the response.
     let response = client.send(request).await?;
@@ -24,7 +24,7 @@ pub async fn fetch(url: &str) -> Result<String> {
     // Convert the buffer into a UTF-8 string.
     String::from_utf8(buf).map_err(|e| anyhow!("Failed to convert response to UTF-8: {}", e))
 }
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
     // read example.com
 

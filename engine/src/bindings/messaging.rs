@@ -58,7 +58,7 @@ impl Pollable for Subscription {
     }
 }
 
-impl bindings::wit::symphony::nbi::messaging::Host for InstanceState {
+impl bindings::wit::pie::nbi::messaging::Host for InstanceState {
     async fn send(&mut self, message: String) -> Result<(), wasmtime::Error> {
         server::Command::Send {
             inst_id: self.id(),
@@ -119,7 +119,7 @@ impl bindings::wit::symphony::nbi::messaging::Host for InstanceState {
     }
 }
 
-impl bindings::wit::symphony::nbi::messaging::HostReceiveResult for InstanceState {
+impl bindings::wit::pie::nbi::messaging::HostReceiveResult for InstanceState {
     async fn pollable(
         &mut self,
         this: Resource<ReceiveResult>,
@@ -142,7 +142,7 @@ impl bindings::wit::symphony::nbi::messaging::HostReceiveResult for InstanceStat
     }
 }
 
-impl bindings::wit::symphony::nbi::messaging::HostSubscription for InstanceState {
+impl bindings::wit::pie::nbi::messaging::HostSubscription for InstanceState {
     async fn pollable(
         &mut self,
         this: Resource<Subscription>,

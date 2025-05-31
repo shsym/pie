@@ -3,7 +3,7 @@ use crate::instance::InstanceState;
 use crate::runtime::Command;
 use tokio::sync::oneshot;
 
-impl bindings::wit::symphony::nbi::runtime::Host for InstanceState {
+impl bindings::wit::pie::nbi::runtime::Host for InstanceState {
     async fn get_version(&mut self) -> anyhow::Result<String, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
 

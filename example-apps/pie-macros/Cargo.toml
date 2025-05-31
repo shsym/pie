@@ -1,5 +1,5 @@
 [package]
-name = "symphony-macros"
+name = "pie-macros"
 version = "0.1.0"
 edition = "2024"
 

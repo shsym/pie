@@ -3,8 +3,8 @@ use backend_management_rs::types::*;
 use backend_management_rs::error::{ManagementError, ConfigError, ProcessError};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
-use tempfile::{tempdir, TempDir};
+use std::time::SystemTime;
+use tempfile::tempdir;
 
 mod common;
 use common::TestUtils;

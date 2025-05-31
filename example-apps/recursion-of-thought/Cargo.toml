@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-symphony = { path = "../symphony" }
+pie = { path = "../pie" }
 futures = "0.3.31"
 regex = "1.11.1"
 once_cell = "1.20.2"

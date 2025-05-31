@@ -1,8 +1,8 @@
 use std::time::Instant;
-use symphony::{sampler, stop_condition};
+use pie::{sampler, stop_condition};
 
 use std::collections::HashMap;
-use symphony::drafter::Drafter;
+use pie::drafter::Drafter;
 
 pub struct FixedSizeQueue<T, const N: usize> {
     buf: [T; N],
@@ -220,14 +220,14 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> Drafter
     }
 }
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
     // TODO: Prepopulate the cache table with some entries
     let max_num_outputs = 128;
 
-    let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
+    let model = pie::Model::new(&pie::available_models()[0]).unwrap();
     let tokenizer = model.get_tokenizer();
 
     let mut ctx = model.create_context();

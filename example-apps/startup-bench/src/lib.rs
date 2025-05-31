@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
 
-    let flag = symphony::messaging_async::receive().await;
+    let flag = pie::messaging_async::receive().await;
 
     let mut total_duration = Duration::ZERO;
 
@@ -11,7 +11,7 @@ async fn main() -> Result<(), String> {
 
     for i in 1..=PING_COUNT {
         let start = Instant::now();
-        let resp = symphony::ping::ping("hello");
+        let resp = pie::ping::ping("hello");
         let elapsed = start.elapsed();
         total_duration += elapsed;
     }
@@ -22,7 +22,7 @@ async fn main() -> Result<(), String> {
     //     
     // }
 
-    symphony::messaging::send(&avg_latency.as_micros().to_string());
+    pie::messaging::send(&avg_latency.as_micros().to_string());
     //println!("Average Latency: {:?}", avg_latency);
 
     Ok(())

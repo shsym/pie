@@ -1,48 +1,48 @@
-use symphony::wstd::time::Duration;
+use pie::wstd::time::Duration;
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
 
-    let input_prompt = symphony::messaging_async::receive()
+    let input_prompt = pie::messaging_async::receive()
         .await
         .parse()
         .unwrap_or("".to_string());
 
-    let max_num_outputs = symphony::messaging_async::receive()
+    let max_num_outputs = pie::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(32);
-    let num_fc = symphony::messaging_async::receive()
+    let num_fc = pie::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(1);
 
-    let num_insts = symphony::messaging_async::receive()
+    let num_insts = pie::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(1);
 
 
-    let use_cache = symphony::messaging_async::receive()
+    let use_cache = pie::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(false);
 
-    let use_asyncfc = symphony::messaging_async::receive()
+    let use_asyncfc = pie::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(false);
 
-    let use_ctx_mask = symphony::messaging_async::receive()
+    let use_ctx_mask = pie::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(false);
 
-    let available_models = symphony::available_models();
+    let available_models = pie::available_models();
 
     // Simulate agentic behavior
 
-    let model = symphony::Model::new(available_models.first().unwrap()).unwrap();
+    let model = pie::Model::new(available_models.first().unwrap()).unwrap();
 
 
     let mut cache_ctx = if use_cache {
@@ -101,7 +101,7 @@ async fn main() -> Result<(), String> {
                     }
 
                     // simulate function calling
-                    symphony::wstd::task::sleep(Duration::from_millis(100)).await;
+                    pie::wstd::task::sleep(Duration::from_millis(100)).await;
                 }
                 return ctx.get_text();
             }

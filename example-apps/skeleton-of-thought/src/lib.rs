@@ -1,5 +1,5 @@
 use futures::future::join_all;
-use symphony::{Context, Model};
+use pie::{Context, Model};
 
 // Constants with improved prompt templates
 const PLAN_PROMPT_TEMPLATE: &str = "Generate up to {} key points that outline the answer to the following question: {}. Each point should be a concise statement of a main idea, enclosed in <point> tags. Do not elaborate on the points yet. Keep your entire response within 30 words.";
@@ -63,10 +63,10 @@ async fn plan_and_generate_parallel(
     join_all(leaf_futures).await
 }
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
     // Initialize the model and context
-    let available_models = symphony::available_models();
+    let available_models = pie::available_models();
     let model = Model::new(available_models.first().unwrap()).unwrap();
     let mut ctx = model.create_context();
     ctx.fill("<|begin_of_text|>");

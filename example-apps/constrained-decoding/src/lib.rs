@@ -6,10 +6,10 @@ use llguidance::{
 };
 use std::sync::Arc;
 use std::time::Instant;
-use symphony::context::Tokenizer;
-use symphony::drafter::Empty;
-use symphony::sampler::Sampler;
-use symphony::{Run, l4m};
+use pie::context::Tokenizer;
+use pie::drafter::Empty;
+use pie::sampler::Sampler;
+use pie::{Run, l4m};
 
 struct ConstrainedDecoding;
 
@@ -184,16 +184,16 @@ impl Sampler for ConstrainedSampler {
     }
 }
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
-    let available_models = symphony::available_models();
-    let model = symphony::Model::new(available_models.first().unwrap()).unwrap();
+    let available_models = pie::available_models();
+    let model = pie::Model::new(available_models.first().unwrap()).unwrap();
     let tokenizer = model.get_tokenizer();
-    let prompt = symphony::messaging_async::receive().await;
+    let prompt = pie::messaging_async::receive().await;
 
-    let num_prompts = symphony::messaging_async::receive()
+    let num_prompts = pie::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(1);
@@ -211,9 +211,9 @@ async fn main() -> Result<(), String> {
             None,
             Some("<|eot_id|>"),
         );
-        let mut stop_condition = symphony::stop_condition::any(
-            symphony::stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
-            symphony::stop_condition::Length::new(32),
+        let mut stop_condition = pie::stop_condition::any(
+            pie::stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
+            pie::stop_condition::Length::new(32),
         );
         let future= async move {
 
@@ -232,7 +232,7 @@ async fn main() -> Result<(), String> {
     }
     let results = futures::future::join_all(futures).await;
     let text = results.join("\n\n");
-    symphony::messaging::send(&text);
+    pie::messaging::send(&text);
     
     Ok(())
 }

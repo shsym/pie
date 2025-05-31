@@ -1,5 +1,5 @@
 [package]
-name = "pie"
+name = "pie-rt"
 version = "0.1.0"
 edition = "2024"
 
@@ -29,6 +29,7 @@ rand = "0.9.0"
 colored = "3.0"
 clap = "4.5"
 hyper = "1.6.0"
+backend-management-rs = { path = "../backend/backend-management-rs" }
 #console-subscriber = "0.4.1"
 
 [build-dependencies]

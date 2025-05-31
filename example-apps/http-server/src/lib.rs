@@ -1,10 +1,10 @@
-use symphony::wstd::http::body::{BodyForthcoming, IncomingBody};
-use symphony::wstd::http::server::{Finished, Responder};
-use symphony::wstd::http::{IntoBody, Request, Response, StatusCode};
-use symphony::wstd::io::{AsyncWrite, copy, empty};
-use symphony::wstd::time::{Duration, Instant};
+use pie::wstd::http::body::{BodyForthcoming, IncomingBody};
+use pie::wstd::http::server::{Finished, Responder};
+use pie::wstd::http::{IntoBody, Request, Response, StatusCode};
+use pie::wstd::io::{AsyncWrite, copy, empty};
+use pie::wstd::time::{Duration, Instant};
 
-#[symphony::server_main]
+#[pie::server_main]
 async fn main(req: Request<IncomingBody>, res: Responder) -> Finished {
     match req.uri().path_and_query().unwrap().as_str() {
         "/wait" => wait(req, res).await,
@@ -27,7 +27,7 @@ async fn wait(_req: Request<IncomingBody>, res: Responder) -> Finished {
     let now = Instant::now();
 
     // Sleep for one second.
-    symphony::wstd::task::sleep(Duration::from_secs(1)).await;
+    pie::wstd::task::sleep(Duration::from_secs(1)).await;
 
     // Compute how long we slept for.
     let elapsed = Instant::now().duration_since(now).as_millis();

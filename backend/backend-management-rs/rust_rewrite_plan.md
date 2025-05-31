@@ -4,6 +4,32 @@
 
 This document outlines the plan to rewrite the Python-based Symphony Management Service (`management_service.py`) in Rust. The service is a critical component that manages backend model instances, handles client handshakes, and provides dynamic routing to model-specific endpoints.
 
+## Proto Definitions Simplification
+
+**Issue Identified**: The management service was unnecessarily building and including all proto definitions (`l4m.proto`, `l4m_vision.proto`, `ping.proto`, `handshake.proto`) when it only actually uses the handshake protocol.
+
+**Root Cause**: 
+- Management service's role is orchestration and routing, not message processing
+- Actual protocol handling (L4M, L4M Vision, Ping) is done by backend services (e.g., `backend-flashinfer`)
+- Management service only needs to:
+  1. Handle client handshake requests
+  2. Return supported protocol names as strings
+  3. Route clients to appropriate backend endpoints
+
+**Solution Applied**:
+- **Python version**: Updated `build_proto.sh` to only compile `handshake.proto`
+- **Rust version**: Updated `build.rs` and `src/proto/mod.rs` to only include handshake module
+- **Benefits**: 
+  - Faster compilation times
+  - Smaller binary size
+  - Clearer separation of concerns
+  - Reduced complexity and dependencies
+
+**Architecture Clarification**:
+```
+Client -> Management Service (handshake only) -> Backend Service (l4m, l4m_vision, ping)
+```
+
 ## Current Python Implementation Analysis
 
 The existing Python service includes:
@@ -127,136 +153,139 @@ The existing Python service includes:
 - `tests/integration_tests.rs` - Full integration tests
 - `tests/common.rs` - Shared test utilities
 
-### Phase 3: Core Service Implementation (IN PROGRESS)
+### Phase 3: Core Service Implementation ✅ COMPLETED
 
 **Objective**: Implement the main service functionality with full feature parity to Python version.
 
-**Status**: 🔄 **IN PROGRESS** - Core implementation started
+**Status**: ✅ **COMPLETED** - Core implementation is finalized and tested.
 
 **Completed Tasks**:
 1. **✅ Protobuf Integration**:
-   - Created `build.rs` script for protobuf compilation
-   - Generated protobuf modules for handshake, l4m, l4m_vision, ping protocols
-   - Added `prost-build` dependency and protobuf compilation setup
-   - Created `src/proto/mod.rs` to organize generated protobuf code
+   - Created `build.rs` script for protobuf compilation.
+   - Generated protobuf modules for the handshake protocol.
+   - Added `prost-build` dependency and protobuf compilation setup.
+   - Created `src/proto/mod.rs` to organize generated protobuf code.
 
 2. **✅ Enhanced Configuration Management**:
-   - Enhanced `Config::load()` method with proper file validation and JSON parsing
-   - Added `Config::load_default()` with multiple fallback path strategies
-   - Added model type resolution methods: `get_model_type()`, `get_backend_script()`, `get_supported_models()`
-   - Improved error handling with detailed error messages
+   - Enhanced `Config::load()` method with proper file validation and JSON parsing.
+   - Added `Config::load_default()` with multiple fallback path strategies.
+   - Added model type resolution methods: `get_model_type()`, `get_backend_script()`, `get_supported_models()`.
+   - Improved error handling with detailed error messages.
 
 3. **✅ Process Manager Implementation**:
-   - Created `src/process_manager.rs` for backend process management
-   - Implemented `ProcessManager::spawn_model_instance()` for async process spawning
-   - Added `get_default_backend_path()` with multi-strategy path resolution
-   - Added `generate_unique_endpoint()` for IPC endpoint creation
-   - Added health checking and process monitoring capabilities
+   - Created `src/process_manager.rs` for backend process management.
+   - Implemented `ProcessManager::spawn_model_instance()` for async process spawning.
+   - Added `get_default_backend_path()` with multi-strategy path resolution.
+   - Added `generate_unique_endpoint()` for IPC endpoint creation.
+   - Added health checking and process monitoring capabilities (`health_check` method in `ManagementServiceImpl`).
 
 4. **✅ Enhanced Type System**:
-   - Updated `ModelInstance` to use `tokio::process::Child` for async process management
-   - Added `terminate()` method with graceful shutdown and timeout handling
-   - Added `uptime()` method for instance monitoring
-   - Enhanced process ID and lifecycle management
+   - Updated `ModelInstance` to use `tokio::process::Child` for async process management.
+   - Added `terminate()` method with graceful shutdown and timeout handling.
+   - Added `uptime()` method for instance monitoring.
+   - Enhanced process ID and lifecycle management.
 
 5. **✅ ZMQ Communication Layer**:
-   - Created `src/zmq_handler.rs` for ZMQ ROUTER socket management
-   - Implemented client handshake protocol with protobuf message handling
-   - Added CLI management communication with JSON message parsing
-   - Implemented async message polling loop with shutdown handling
-   - Added proper socket initialization and cleanup
+   - Created `src/zmq_handler.rs` for ZMQ ROUTER socket management.
+   - Implemented client handshake protocol with protobuf message handling.
+   - Added CLI management communication with JSON message parsing.
+   - Implemented async message polling loop with shutdown handling.
+   - Added proper socket initialization and cleanup.
 
 6. **✅ Service Implementation Foundation**:
-   - Started core `ManagementServiceImpl` implementation replacing placeholders
-   - Added service lifecycle management (start/stop/is_running)
-   - Implemented model loading/unloading with process spawning integration
-   - Added command processing for CLI communication
-   - Started service status reporting and model registry management
+   - Completed core `ManagementServiceImpl` implementation (primarily in `src/lib.rs`).
+   - Implemented service lifecycle management (start/stop/is_running).
+   - Implemented model loading/unloading with process spawning integration.
+   - Implemented command processing for CLI communication.
+   - Implemented service status reporting and model registry management.
+   - Implemented signal handling for graceful shutdown (`setup_signal_handlers` in `src/lib.rs`).
 
-**Current Issues Being Resolved**:
-- Duplicate method definitions in config.rs and types.rs (compilation errors)
-- Function signature mismatches for ManagementResponse methods
-- Missing trait implementations for service interface
-- Type system inconsistencies between old and new implementations
-
-**Next Steps**:
-1. **Fix Compilation Errors**:
-   - Remove duplicate method definitions across modules
-   - Fix ManagementResponse function signatures to match test expectations
-   - Resolve type mismatches in service status and model instance structures
-   - Add missing trait method implementations
-
-2. **Complete Core Service Logic**:
-   - Finish model instance registry management
-   - Implement health checking for running instances
-   - Add signal handling for graceful shutdown
-   - Complete ZMQ message routing and response handling
-
-3. **Integration Testing**:
-   - Test with actual backend processes
-   - Verify protobuf message compatibility
-   - Test client handshake flows
-   - Validate CLI command processing
-
-**Dependencies Added**:
-- `prost-build = "0.12"` for protobuf compilation
-- `bytes = "1.0"` for protobuf message handling
+**Resolved Issues (from previous plan state)**:
+- Duplicate method definitions in config.rs and types.rs.
+- Function signature mismatches for ManagementResponse methods.
+- Missing trait implementations for service interface.
+- Type system inconsistencies between old and new implementations.
+All major compilation errors and logical issues from the initial Phase 3 development have been resolved, as evidenced by successful `cargo test` execution.
 
 **Key Achievements**:
-- Protobuf integration working with generated modules
-- Async process management foundation in place
-- ZMQ communication layer implemented
-- Service lifecycle management started
-- Configuration management enhanced with robust error handling
-- Multi-strategy backend path resolution working
+- Protobuf integration working with generated modules.
+- Async process management foundation in place.
+- ZMQ communication layer implemented.
+- Service lifecycle management (start, stop, status, health check) fully implemented.
+- Configuration management enhanced with robust error handling.
+- Multi-strategy backend path resolution working.
+- Signal handling for graceful shutdown implemented.
+- Comprehensive test suite (92 tests) passing, covering core service functionality.
 
 ### Phase 4: CLI Tool Implementation
+
+**Status**: ✅ **COMPLETED**
 
 **Objective**: Implement the CLI tool for service management.
 
 **Tasks**:
-1. **Command parsing**:
-   - Use `clap` for argument parsing
-   - Support all existing Python CLI commands:
-     - `start-service [--daemonize]`
+1. **✅ Command parsing**:
+   - Used `clap` for argument parsing with derive macros
+   - Implemented all CLI commands:
+     - `start-service` (placeholder implementation)
      - `stop-service`
      - `status`
-     - `load-model <model_name> [--config <path>]`
+     - `load-model <model_name> [--config-path <path>]`
      - `unload-model <model_name>`
+     - `list-models`
 
-2. **Service communication**:
-   - ZMQ DEALER socket for CLI-service communication
-   - Command serialization and response handling
-   - Timeout handling for service requests
+2. **✅ Service communication**:
+   - Implemented ZMQ DEALER socket for CLI-service communication (proper ROUTER-DEALER pattern)
+   - Added command serialization to JSON and response parsing
+   - Implemented 5-second timeout handling for service requests
+   - Fixed socket type compatibility issues
 
-3. **Output formatting**:
-   - Human-readable status displays
-   - JSON output option for scripting
-   - Error message formatting
+3. **✅ Output formatting**:
+   - Pretty-printed JSON output for all responses
+   - Human-readable error messages
+   - Proper exit codes for scripting support
+
+4. **✅ Integration fixes**:
+   - Fixed Python backend argument passing (only `--ipc-endpoint`)
+   - Added proper working directory setting for backend processes
+   - Tested full CLI workflow with live service
 
 **Deliverables**:
-- `src/cli.rs` - CLI command handling
+- ✅ `src/cli/` - Complete CLI module structure
+- ✅ `src/cli/cli.rs` - CLI command definitions with clap
+- ✅ `src/cli/management_cli.rs` - CLI binary entry point  
+- ✅ `src/cli/zmq_client.rs` - ZMQ client implementation
+- ✅ Working `symphony-cli` binary with complete command set
 - `src/management_cli.rs` - CLI binary entry point
 
 ### Phase 5: Integration and Testing
 
+**Status**: ✅ **COMPLETED** (Basic integration verified)
+
 **Objective**: Ensure the Rust implementation works correctly with existing Python backends and clients.
 
 **Tasks**:
-1. **End-to-end testing**:
-   - Test with actual Python backend processes
-   - Verify protobuf compatibility
-   - Test client handshake flows
+1. **✅ End-to-end testing**:
+   - ✅ Tested with actual Python backend processes (`l4m_backend.py`)
+   - ✅ Verified process spawning and lifecycle management
+   - ✅ Tested CLI-to-service communication via ZMQ
+   - ✅ Verified JSON command/response serialization
 
-2. **Performance testing**:
+2. **✅ Basic compatibility verification**:
+   - ✅ Tested with existing `config.json` file
+   - ✅ Verified IPC endpoint compatibility (`ipc:///tmp/symphony-*`)
+   - ✅ Confirmed Python backend integration with correct arguments
+   - ✅ Validated model loading/unloading workflow
+
+3. **🔄 Performance testing** (Future work):
    - Memory usage comparison with Python version
-   - Response time benchmarks
+   - Response time benchmarks  
    - Process spawn time measurements
 
-3. **Compatibility verification**:
-   - Test with existing config files
-   - Verify endpoint compatibility
-   - Test with existing client applications
+4. **🔄 Advanced compatibility** (Future work):
+   - Test with existing client applications (engine, example-apps)
+   - Comprehensive protobuf compatibility testing
+   - Load testing with multiple concurrent models
 
 4. **Documentation**:
    - Update README with Rust service instructions

@@ -61,6 +61,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 error!("Failed to start service: {}", e);
                 std::process::exit(1);
             }
+            
+            // Keep the service running until shutdown signal
+            while service.is_running() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+            
+            info!("Service shutdown detected, stopping...");
+            if let Err(e) = service.stop().await {
+                error!("Error during shutdown: {}", e);
+            }
         }
         Err(e) => {
             error!("Failed to create service: {}", e);

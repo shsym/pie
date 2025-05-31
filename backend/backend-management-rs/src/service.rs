@@ -94,18 +94,6 @@ pub trait ManagementServiceFactory {
 
 /// Utility functions for the management service
 pub mod utils {
-    use uuid::Uuid;
-
-    /// Generate a unique IPC endpoint for a model instance
-    pub fn generate_unique_endpoint() -> String {
-        let instance_id = Uuid::new_v4()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect::<String>();
-        format!("ipc:///tmp/symphony-model-{}", instance_id)
-    }
-
     /// Check if an endpoint is valid IPC format
     pub fn is_valid_ipc_endpoint(endpoint: &str) -> bool {
         endpoint.starts_with("ipc://")
@@ -124,16 +112,6 @@ pub mod utils {
 #[cfg(test)]
 mod tests {
     use super::utils::*;
-
-    #[test]
-    fn test_generate_unique_endpoint() {
-        let endpoint1 = generate_unique_endpoint();
-        let endpoint2 = generate_unique_endpoint();
-        
-        assert_ne!(endpoint1, endpoint2);
-        assert!(endpoint1.starts_with("ipc:///tmp/symphony-model-"));
-        assert!(endpoint2.starts_with("ipc:///tmp/symphony-model-"));
-    }
 
     #[test]
     fn test_is_valid_ipc_endpoint() {

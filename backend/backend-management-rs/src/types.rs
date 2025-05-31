@@ -1,10 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Child;
 use std::time::{SystemTime, Duration};
 use uuid::Uuid;
 use tokio::process::Child as TokioChild;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error};
 
 /// Represents a running model backend instance
 #[derive(Debug)]

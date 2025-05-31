@@ -1,14 +1,12 @@
-use backend_management_rs::config::Config;
 use backend_management_rs::types::*;
 use backend_management_rs::{ManagementServiceImpl};
-use backend_management_rs::service::{ManagementServiceFactory, ManagementServiceTrait};
+use backend_management_rs::service::ManagementServiceFactory;
 use backend_management_rs::error::ManagementError;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
-use tempfile::tempdir;
-use tokio::time::{sleep, timeout};
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::time::sleep;
+use serde_json::json;
 
 mod common;
 use common::TestUtils;
@@ -27,7 +25,7 @@ mod integration_tests {
         let service: Result<ManagementServiceImpl, _> = ManagementServiceImpl::create_service(&config_path).await;
         assert!(service.is_ok());
         
-        let service = service.unwrap();
+        let _service = service.unwrap();
         
         // TODO: Test socket initialization once implemented
         // assert!(service.initialize_sockets().await.is_ok());
@@ -61,7 +59,7 @@ mod process_management_integration_tests {
     
     #[tokio::test]
     async fn test_model_instance_lifecycle() {
-        let mut process = TestUtils::create_mock_process();
+        let process = TestUtils::create_mock_process();
         let pid = process.id();
         
         let mut instance = ModelInstance::new(
@@ -465,15 +463,25 @@ mod lifecycle_integration_tests {
         let cmd = TestUtils::create_test_command("status");
         let correlation_id = cmd.correlation_id.clone();
         
+        // Get expected endpoint values from a test config instance
+        let test_config = TestUtils::create_test_config();
+
         let data = test_params! {
             "status" => "running",
-            "uptime_seconds" => 0,
-            "model_count" => 0
+            "client_endpoint" => test_config.endpoints.client_handshake.clone(),
+            "cli_endpoint" => test_config.endpoints.cli_management.clone(),
+            "models_loaded_count" => 0,
+            "active_model_details" => json!([])
         };
         let response = ManagementResponse::success(correlation_id, TestUtils::hashmap_to_value(data.clone()));
         
         assert!(response.success);
-        assert_eq!(response.data.as_ref().unwrap()["status"], serde_json::json!("running"));
-        assert_eq!(response.data.as_ref().unwrap()["model_count"], serde_json::json!(0));
+        let response_data = response.data.as_ref().unwrap();
+        assert_eq!(response_data["status"], serde_json::json!("running"));
+        assert_eq!(response_data["client_endpoint"], serde_json::json!(test_config.endpoints.client_handshake));
+        assert_eq!(response_data["cli_endpoint"], serde_json::json!(test_config.endpoints.cli_management));
+        assert_eq!(response_data["models_loaded_count"], serde_json::json!(0));
+        assert!(response_data["active_model_details"].is_array());
+        assert_eq!(response_data["active_model_details"].as_array().unwrap().len(), 0);
     }
 }

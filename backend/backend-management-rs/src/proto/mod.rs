@@ -1,17 +1,6 @@
-// Generated protobuf modules
+// Generated protobuf modules for management service
+// Only handshake protocol is needed - other protocols are handled by backend services
 
 pub mod handshake {
     include!("handshake.rs");
-}
-
-pub mod l4m {
-    include!("l4m.rs");
-}
-
-pub mod l4m_vision {
-    include!("l4m.vision.rs");
-}
-
-pub mod ping {
-    include!("ping.rs");
 }

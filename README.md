@@ -5,6 +5,7 @@
     <img alt="Pie: Programmable serving system for emerging LLM applications"
          src="https://pie-project.org/images/pie-light.svg"
          width="30%">
+    <p></p>
   </picture>
 
 [Getting started] | [Learn] | [Documentation] | [Contributing]

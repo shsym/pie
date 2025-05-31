@@ -3,7 +3,7 @@ use crate::error::{ProcessError, ProcessResult};
 use crate::config::Config;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, debug};
 use uuid::Uuid;
 
 /// Process manager for backend model instances
@@ -105,15 +105,13 @@ impl ProcessManager {
         let mut command = Command::new("python3");
         command
             .arg(&script_path)
-            .arg("--model")
-            .arg(model_name)
-            .arg("--endpoint")
-            .arg(&endpoint);
+            .arg("--ipc-endpoint")
+            .arg(&endpoint)
+            .current_dir(&self.backend_base_path);
 
-        // Add config path if provided
-        if let Some(config) = config_path {
-            command.arg("--config").arg(config);
-        }
+        // Note: The Python backend doesn't support --model or --config arguments yet
+        // It uses hardcoded model from config.py
+        // TODO: Enhance Python backend to support dynamic model loading
 
         // Set environment variables
         command

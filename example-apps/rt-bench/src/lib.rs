@@ -1,10 +1,10 @@
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
 
-    let msg = symphony::messaging_async::receive().await;
+    let msg = pie::messaging_async::receive().await;
 
-    symphony::messaging::send(&msg);
+    pie::messaging::send(&msg);
 
     Ok(())
 }

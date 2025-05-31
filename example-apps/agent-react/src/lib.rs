@@ -1,14 +1,14 @@
-use symphony::wstd::time::Duration;
+use pie::wstd::time::Duration;
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
     let max_num_outputs = 32;
 
-    let available_models = symphony::available_models();
+    let available_models = pie::available_models();
 
     // Simulate agentic behavior
 
-    let model = symphony::Model::new(available_models.first().unwrap()).unwrap();
+    let model = pie::Model::new(available_models.first().unwrap()).unwrap();
 
     let mut ctx = model.create_context();
 
@@ -20,12 +20,12 @@ async fn main() -> Result<(), String> {
     let text = ctx.generate_until("<|eot_id|>", max_num_outputs).await;
 
     // simulate function calling
-    symphony::wstd::task::sleep(Duration::from_millis(100)).await;
+    pie::wstd::task::sleep(Duration::from_millis(100)).await;
 
     ctx.fill("result from the function call");
 
-    
-    symphony::wstd::task::sleep(Duration::from_millis(100)).await;
+
+    pie::wstd::task::sleep(Duration::from_millis(100)).await;
 
     ctx.fill("result from the function call");
 

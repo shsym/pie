@@ -7,6 +7,6 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-symphony = { path = "../symphony" }
+pie = { path = "../pie" }
 futures = "0.3.31"
 llguidance = { version = "0.6.31", default-features = false, features = ["lark"] }

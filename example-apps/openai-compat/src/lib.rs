@@ -2,11 +2,11 @@ mod models;
 mod handlers;
 mod utils;
 
-use symphony::wstd::http::body::IncomingBody;
-use symphony::wstd::http::server::{Finished, Responder};
-use symphony::wstd::http::Request;
+use pie::wstd::http::body::IncomingBody;
+use pie::wstd::http::server::{Finished, Responder};
+use pie::wstd::http::Request;
 
-#[symphony::server_main]
+#[pie::server_main]
 async fn main(req: Request<IncomingBody>, res: Responder) -> Finished {
     // Log connection info
     println!("Received request from {} to {}",

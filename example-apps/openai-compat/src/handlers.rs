@@ -1,6 +1,6 @@
-use symphony::wstd::http::body::IncomingBody;
-use symphony::wstd::http::server::{Finished, Responder};
-use symphony::wstd::http::{IntoBody, Request, Response, StatusCode};
+use pie::wstd::http::body::IncomingBody;
+use pie::wstd::http::server::{Finished, Responder};
+use pie::wstd::http::{IntoBody, Request, Response, StatusCode};
 use serde_json;
 use std::time::Instant;
 
@@ -35,7 +35,7 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
     let start = Instant::now();
 
     // Get available models and initialize
-    let available_models = symphony::available_models();
+    let available_models = pie::available_models();
     if available_models.is_empty() {
         eprintln!("No Symphony models available");
         return handle_error(res).await;
@@ -52,7 +52,7 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
         return handle_error(res).await;
     }
 
-    let model = match symphony::Model::new(model_name) {
+    let model = match pie::Model::new(model_name) {
         Some(model) => model,
         None => {
             eprintln!("Failed to create model");

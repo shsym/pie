@@ -1,11 +1,11 @@
-use symphony::Result;
+use pie::Result;
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<()> {
     println!("Let's chat!");
 
     for _ in 0..3 {
-        let s = symphony::messaging_async::receive().await;
+        let s = pie::messaging_async::receive().await;
         println!("{}", s);
     }
 
@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     ];
 
     for i in 0..3 {
-        symphony::messaging::send(responses[i]);
+        pie::messaging::send(responses[i]);
     }
 
     println!("It was nice chatting with you. Bye!");

@@ -2,6 +2,7 @@
 //
 mod client;
 mod service;
+mod zmq_handler;
 
 mod backend;
 mod batching;
@@ -20,14 +21,13 @@ mod utils;
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
-use std::collections::HashMap;
 
 use crate::client::{Client, hash_program};
 use crate::l4m::L4m;
 use crate::messaging::{PubSub, PushPull};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
+use crate::zmq_handler::{ManagementConfig, check_management_service_status, get_model_endpoint};
 use crate::server::Server;
 use crate::service::Controller;
 use clap::{Arg, Command};
@@ -50,24 +50,9 @@ struct ManagementServiceConfig {
     endpoint: String,
 }
 
-// Data structures for management service communication
-#[derive(Serialize, Deserialize, Debug)]
-struct ManagementCommand {
-    command: String,
-    params: HashMap<String, serde_json::Value>,
-    correlation_id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ManagementResponse {
-    correlation_id: String,
-    success: bool,
-    data: Option<serde_json::Value>,
-    error: Option<String>,
-}
-
 //
 // Define a simple macro for client-side logging.
+#[macro_export]
 macro_rules! log_user {
     ($($arg:tt)*) => {
         println!("{}", format!("[User] {}", format_args!($($arg)*)).bright_blue());
@@ -87,168 +72,30 @@ fn load_config(config_path: Option<&str>) -> anyhow::Result<EngineConfig> {
         .with_context(|| format!("Failed to parse config file: {}", config_path))?;
 
     log_user!("Loaded engine config from: {}", config_path);
-    log_user!("Available models: {:?}", config.models);
-    log_user!("Default model: {}", config.default_model);
 
     Ok(config)
 }
 
-/// Query the management service to get the IPC endpoint for a specific model
-async fn get_model_endpoint(model_name: &str, config: &EngineConfig) -> anyhow::Result<String> {
-    let mut socket = DealerSocket::new();
-    socket.connect(&config.management_service.endpoint).await
-        .context("Failed to connect to management service")?;
-
-    // Create load-model command
-    let correlation_id = uuid::Uuid::new_v4().to_string();
-    let mut params = HashMap::new();
-    params.insert("model_name".to_string(), serde_json::Value::String(model_name.to_string()));
-
-    let command = ManagementCommand {
-        command: "load-model".to_string(),
-        params,
-        correlation_id: correlation_id.clone(),
-    };
-
-    // Send command to management service
-    let command_json = serde_json::to_string(&command)
-        .context("Failed to serialize management command")?;
-    let message = ZmqMessage::from(command_json.as_bytes().to_vec());
-
-    socket.send(message).await
-        .context("Failed to send command to management service")?;
-
-    // Receive response
-    let response_msg = socket.recv().await
-        .context("Failed to receive response from management service")?;
-    let response_bytes = response_msg.get(0)
-        .context("Empty response from management service")?;
-
-    let response: ManagementResponse = serde_json::from_slice(response_bytes)
-        .context("Failed to parse management service response")?;
-
-    if !response.success {
-        return Err(anyhow::anyhow!(
-            "Management service error: {}",
-            response.error.unwrap_or_else(|| "Unknown error".to_string())
-        ));
-    }
-
-    // Extract endpoint from response data
-    let endpoint = response.data
-        .as_ref()
-        .and_then(|data| data.get("endpoint"))
-        .and_then(|ep| ep.as_str())
-        .context("No endpoint in management service response")?
-        .to_string();
-
-    log_user!("Got model endpoint from management service: {}", endpoint);
-    Ok(endpoint)
-}
-
 /// Check all models in config and return the first available one
 async fn find_first_available_model(config: &EngineConfig) -> anyhow::Result<String> {
-    let mut socket = DealerSocket::new();
-    socket.connect(&config.management_service.endpoint).await
-        .context("Failed to connect to management service")?;
+    let mgmt_config = ManagementConfig {
+        endpoint: config.management_service.endpoint.clone(),
+    };
 
     for model_name in &config.models {
-        log_user!("Checking availability of model: {}", model_name);
-
-        let correlation_id = uuid::Uuid::new_v4().to_string();
-        let mut params = HashMap::new();
-        params.insert("model_name".to_string(), serde_json::Value::String(model_name.clone()));
-
-        let command = ManagementCommand {
-            command: "load-model".to_string(),
-            params,
-            correlation_id: correlation_id.clone(),
-        };
-
-        // Send command to management service
-        let command_json = serde_json::to_string(&command)
-            .context("Failed to serialize management command")?;
-        let message = ZmqMessage::from(command_json.as_bytes().to_vec());
-
-        if let Err(e) = socket.send(message).await {
-            log_user!("Failed to send command for model {}: {}", model_name, e);
-            continue;
-        }
-
-        // Receive response
-        let response_msg = match socket.recv().await {
-            Ok(msg) => msg,
+        // Try to get the model endpoint, which will load the model if it's not already loaded
+        match get_model_endpoint(model_name, &mgmt_config).await {
+            Ok(_endpoint) => {
+                return Ok(model_name.clone());
+            }
             Err(e) => {
-                log_user!("Failed to receive response for model {}: {}", model_name, e);
+                log_user!("Failed to load model {}: {}", model_name, e);
                 continue;
             }
-        };
-
-        let response_bytes = match response_msg.get(0) {
-            Some(bytes) => bytes,
-            None => {
-                log_user!("Empty response for model {}", model_name);
-                continue;
-            }
-        };
-
-        let response: ManagementResponse = match serde_json::from_slice(response_bytes) {
-            Ok(resp) => resp,
-            Err(e) => {
-                log_user!("Failed to parse response for model {}: {}", model_name, e);
-                continue;
-            }
-        };
-
-        if response.success {
-            log_user!("Model {} is available", model_name);
-            return Ok(model_name.clone());
-        } else {
-            log_user!("Model {} is not available: {}", model_name,
-                response.error.unwrap_or_else(|| "Unknown error".to_string()));
         }
     }
 
     Err(anyhow::anyhow!("No available models found from the configured list: {:?}", config.models))
-}
-
-/// Check if the management service is running and responsive
-async fn check_management_service_status(config: &EngineConfig) -> anyhow::Result<()> {
-    let mut socket = DealerSocket::new();
-    socket.connect(&config.management_service.endpoint).await
-        .context("Failed to connect to management service - is it running?")?;
-
-    let correlation_id = uuid::Uuid::new_v4().to_string();
-    let command = ManagementCommand {
-        command: "status".to_string(),
-        params: HashMap::new(),
-        correlation_id: correlation_id.clone(),
-    };
-
-    let command_json = serde_json::to_string(&command)
-        .context("Failed to serialize status command")?;
-    let message = ZmqMessage::from(command_json.as_bytes().to_vec());
-
-    socket.send(message).await
-        .context("Failed to send status command")?;
-
-    let response_msg = socket.recv().await
-        .context("Failed to receive status response")?;
-    let response_bytes = response_msg.get(0)
-        .context("Empty status response")?;
-
-    let response: ManagementResponse = serde_json::from_slice(response_bytes)
-        .context("Failed to parse status response")?;
-
-    if !response.success {
-        return Err(anyhow::anyhow!(
-            "Management service status check failed: {}",
-            response.error.unwrap_or_else(|| "Unknown error".to_string())
-        ));
-    }
-
-    log_user!("Management service is running");
-    Ok(())
 }
 
 #[tokio::main]
@@ -311,7 +158,10 @@ async fn main() -> anyhow::Result<()> {
     let config = load_config(Some(config_path))?;
 
     // Check if management service is running first
-    check_management_service_status(&config).await
+    let mgmt_config = ManagementConfig {
+        endpoint: config.management_service.endpoint.clone(),
+    };
+    check_management_service_status(&mgmt_config).await
         .context("Management service is not available")?;
 
     // Find the first available model from the config
@@ -355,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
 
     } else {
         // Get the model endpoint from management service
-        let model_endpoint = get_model_endpoint(&model_name, &config).await
+        let model_endpoint = get_model_endpoint(&model_name, &mgmt_config).await
             .context("Failed to get model endpoint from management service")?;
 
         // Connect to the model backend endpoint

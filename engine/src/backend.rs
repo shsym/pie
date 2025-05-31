@@ -63,12 +63,9 @@ pub struct ZmqBackend {
 
 impl ZmqBackend {
     pub async fn bind(endpoint: &str) -> Result<Self, BackendError> {
-        let mut socket = DealerSocket::new();
-        socket
-            .connect(endpoint)
-            .await
+        // Use the connection helper with spinner from zmq_handler
+        let mut socket = crate::zmq_handler::connect_to_backend_with_retry(endpoint).await
             .map_err(|e| BackendError::Zmq(e.to_string()))?;
-        println!("Connected to server at {}", endpoint);
 
         // Perform handshake
         let pb_request = pb_bindings::Request {};

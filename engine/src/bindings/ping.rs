@@ -3,7 +3,7 @@ use crate::ping::Command;
 use crate::{bindings, service};
 use tokio::sync::oneshot;
 
-impl bindings::wit::symphony::nbi::ping::Host for InstanceState {
+impl bindings::wit::pie::nbi::ping::Host for InstanceState {
     async fn ping(&mut self, message: String) -> anyhow::Result<String, wasmtime::Error> {
         let (tx, rx) = oneshot::channel();
 

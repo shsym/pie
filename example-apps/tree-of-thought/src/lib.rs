@@ -1,6 +1,6 @@
 use futures::future::join_all;
 
-use symphony::{Context, Model};
+use pie::{Context, Model};
 
 const PROPOSE_PROMPT_TEMPLATE: &str = "Please generate a high-level plan for solving the following question. As the first step, just say what method and idea you will use to solve the question. You can reorganize the information in the question. Do not do the actual calculation. Keep your response concise and within 80 words. Question: {}";
 const EXECUTE_PROMPT: &str = "The plan looks good! Now, use real numbers and do the calculation. Please solve the question step-by-step according to the high-level plan. Give me the final answer. Make your response short.";
@@ -178,10 +178,10 @@ async fn tree_search(init_ctx: Context, question: &str, num_branches: usize) -> 
     outputs
 }
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
     // Initialize the Symphony model and a common context.
-    let available_models = symphony::available_models();
+    let available_models = pie::available_models();
 
     let model = Model::new(available_models.first().unwrap()).unwrap();
     let mut ctx = model.create_context();

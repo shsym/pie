@@ -1,12 +1,12 @@
 use std::time::Instant;
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
     let max_num_outputs = 128;
 
-    let model = symphony::Model::new(&symphony::available_models()[0]).unwrap();
+    let model = pie::Model::new(&pie::available_models()[0]).unwrap();
 
     let mut ctx = model.create_context();
     ctx.fill("<|begin_of_text|>");

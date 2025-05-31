@@ -1,11 +1,9 @@
 use crate::error::{ManagementError, Result};
-use crate::proto::{handshake, ping};
+use crate::proto::handshake;
 use crate::types::{ManagementCommand, ManagementResponse};
 use tokio::sync::mpsc;
 use tracing::{info, warn, error, debug};
 use prost::Message;
-use bytes::Bytes;
-use std::collections::HashMap;
 
 /// ZMQ message handler for client handshakes and CLI management
 pub struct ZmqHandler {
@@ -20,7 +18,7 @@ pub struct ZmqHandler {
     /// CLI management endpoint
     cli_endpoint: String,
     /// Shutdown signal receiver
-    shutdown_rx: Option<mpsc::Receiver<()>>,
+    _shutdown_rx: Option<mpsc::Receiver<()>>,
 }
 
 impl ZmqHandler {
@@ -32,7 +30,7 @@ impl ZmqHandler {
             cli_router: None,
             client_endpoint,
             cli_endpoint,
-            shutdown_rx: None,
+            _shutdown_rx: None,
         }
     }
 

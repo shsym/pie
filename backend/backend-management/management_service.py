@@ -600,7 +600,7 @@ class ManagementService:
             log_thread.start()
             
             # Give it a moment to start
-            time.sleep(2)
+            time.sleep(5)
             
             if process.poll() is not None:
                 # Process died immediately

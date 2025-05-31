@@ -97,17 +97,17 @@
 //     Ok(())
 // }
 
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
     let max_num_outputs = 32;
 
     // Initialize the model
-    let available_models = symphony::available_models();
-    let model = symphony::Model::new(available_models.first().unwrap()).unwrap();
+    let available_models = pie::available_models();
+    let model = pie::Model::new(available_models.first().unwrap()).unwrap();
 
     // Receive role and group from the master
-    let my_role = symphony::messaging_async::receive().await;
-    let group = symphony::messaging_async::receive().await;
+    let my_role = pie::messaging_async::receive().await;
+    let group = pie::messaging_async::receive().await;
 
     // Define role-specific configuration
     let (system_message, section, prev_topic, next_topic) = match my_role.as_str() {
@@ -141,12 +141,12 @@ async fn main() -> Result<(), String> {
     // Construct the prompt and fetch accumulated story (if applicable)
     let (prompt, accumulated_so_far) = if my_role == "idea_generator" {
         // Initial prompt from master, e.g., "Generate a story idea about adventure."
-        let initial_prompt = symphony::messaging_async::receive().await;
+        let initial_prompt = pie::messaging_async::receive().await;
         (initial_prompt, None)
     } else {
         let prev_topic = prev_topic.ok_or("No previous topic defined")?;
         let accumulated =
-            symphony::messaging_async::subscribe(format!("{}-{group}", prev_topic)).await;
+            pie::messaging_async::subscribe(format!("{}-{group}", prev_topic)).await;
         let instructions = match my_role.as_str() {
             "plot_developer" => "Develop a plot outline based on the idea.",
             "character_creator" => "Create characters based on the idea and plot.",
@@ -184,9 +184,9 @@ async fn main() -> Result<(), String> {
 
     // Send to the next agent or master
     if let Some(next) = next_topic {
-        symphony::messaging::broadcast(&format!("{}-{group}", next), &accumulated_story);
+        pie::messaging::broadcast(&format!("{}-{group}", next), &accumulated_story);
     } else {
-        symphony::messaging::send(&accumulated_story);
+        pie::messaging::send(&accumulated_story);
     }
 
     Ok(())

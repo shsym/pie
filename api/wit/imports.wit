@@ -1,4 +1,4 @@
-package symphony:nbi;
+package pie:nbi;
 
 world imports {
     import runtime;

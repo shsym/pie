@@ -2,11 +2,8 @@ use backend_management_rs::config::Config;
 use backend_management_rs::types::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
 use tempfile::{tempdir, TempDir};
-use tokio::time::timeout;
 use tokio::process::{Child, Command};
-use serde_json::Value;
 
 /// Test utilities for creating mock objects and test scenarios
 pub struct TestUtils;
@@ -68,20 +65,10 @@ impl TestUtils {
         (temp_dir, config_path)
     }
 
-    /// Create a test model instance with a mock process
-    pub fn create_test_model_instance(
-        model_name: &str,
-        model_type: &str,
-        endpoint: &str,
-    ) -> ModelInstance {
-        let process = Self::create_mock_process();
-        ModelInstance::new(
-            model_name.to_string(),
-            model_type.to_string(),
-            endpoint.to_string(),
-            process,
-            None,
-        )
+    /// Load the real Python config file if it exists
+    pub fn try_load_python_config() -> Option<Config> {
+        let python_config_path = PathBuf::from("../backend-management/config.json");
+        Config::load(&python_config_path).ok()
     }
 
     /// Create a test management command
@@ -97,44 +84,8 @@ impl TestUtils {
         ManagementCommand::new(command.to_string(), params)
     }
 
-    /// Load the real Python config file if it exists
-    pub fn try_load_python_config() -> Option<Config> {
-        let python_config_path = PathBuf::from("../backend-management/config.json");
-        Config::load(&python_config_path).ok()
-    }
-
-    /// Wait for a condition with timeout
-    pub async fn wait_for_condition<F>(
-        mut condition: F,
-        timeout_duration: Duration,
-        check_interval: Duration,
-    ) -> bool
-    where
-        F: FnMut() -> bool,
-    {
-        let start = SystemTime::now();
-        
-        while start.elapsed().unwrap_or(Duration::ZERO) < timeout_duration {
-            if condition() {
-                return true;
-            }
-            tokio::time::sleep(check_interval).await;
-        }
-        
-        false
-    }
-
-    /// Clean up any test processes
-    pub fn cleanup_test_processes(processes: &mut Vec<Child>) {
-        for process in processes.iter_mut() {
-            let _ = process.kill();
-            let _ = process.wait();
-        }
-        processes.clear();
-    }
-
     /// Convert HashMap to serde_json::Value for test responses
-    pub fn hashmap_to_value(map: HashMap<String, Value>) -> Option<Value> {
+    pub fn hashmap_to_value(map: HashMap<String, serde_json::Value>) -> Option<serde_json::Value> {
         Some(serde_json::Value::Object(
             map.into_iter()
                 .map(|(k, v)| (k, v))
@@ -153,14 +104,4 @@ macro_rules! test_params {
         )*
         params
     }};
-}
-
-/// Async test wrapper for convenience
-pub async fn run_async_test<F, Fut>(test_fn: F)
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    timeout(Duration::from_secs(30), test_fn()).await
-        .expect("Test timed out after 30 seconds");
 }

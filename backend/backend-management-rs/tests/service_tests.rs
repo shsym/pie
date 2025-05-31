@@ -1,13 +1,11 @@
-use backend_management_rs::config::Config;
 use backend_management_rs::types::*;
-use backend_management_rs::service::{ManagementServiceTrait, ManagementServiceFactory};
+use backend_management_rs::service::ManagementServiceFactory;
 use backend_management_rs::{ManagementServiceImpl};
 use backend_management_rs::error::{ManagementError, ConfigError, ProcessError};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
-use tempfile::{tempdir, TempDir};
-use tokio::time::timeout;
+use std::time::SystemTime;
+use tempfile::tempdir;
 
 mod common;
 use common::TestUtils;
@@ -36,7 +34,7 @@ mod model_instance_tests {
     
     #[tokio::test]
     async fn test_model_instance_is_alive() {
-        let mut process = TestUtils::create_mock_process();
+        let process = TestUtils::create_mock_process();
         let mut instance = ModelInstance::new(
             "test-model".to_string(),
             "test-type".to_string(),

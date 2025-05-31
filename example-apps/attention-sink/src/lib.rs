@@ -1,19 +1,19 @@
-#[symphony::main]
+#[pie::main]
 async fn main() -> Result<(), String> {
-    let prompt = symphony::messaging_async::receive().await;
-    let max_num_outputs: usize = symphony::messaging_async::receive()
+    let prompt = pie::messaging_async::receive().await;
+    let max_num_outputs: usize = pie::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(32);
 
-    let num_prompts = symphony::messaging_async::receive()
+    let num_prompts = pie::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(1);
 
-    let available_models = symphony::available_models();
+    let available_models = pie::available_models();
 
-    let model = symphony::Model::new(available_models.first().unwrap()).unwrap();
+    let model = pie::Model::new(available_models.first().unwrap()).unwrap();
     let tokenizer = model.get_tokenizer();
     let eot_id = tokenizer.encode("<|eot_id|>")[0];
     let mut futures = Vec::new();
@@ -50,7 +50,7 @@ async fn main() -> Result<(), String> {
 
     let results = futures::future::join_all(futures).await;
     let text = results.join("\n\n");
-    symphony::messaging::send(&text);
+    pie::messaging::send(&text);
 
     Ok(())
 }
