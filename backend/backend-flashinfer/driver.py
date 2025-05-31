@@ -4,11 +4,8 @@ from typing import Union
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer
 
 import config
-from common import ceil_div
-from llama import LlamaForCausalLM
 from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlock, BatchCopyBlock, BatchDecodeTokenDistribution, BatchSampleTopKRequest, BatchSampleTopKResponse, \
     ObjectKind, SampleTopKResponse, BatchFillBlock
 

@@ -494,7 +494,7 @@ impl Runtime {
 
             // Attempt to call “run”
             let (_, run_export) = instance
-                .get_export(&mut store, None, "symphony:nbi/run")
+                .get_export(&mut store, None, "pie:nbi/run")
                 .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
 
             let (_, run_func_export) = instance

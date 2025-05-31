@@ -141,11 +141,29 @@ pub fn send_command_to_service(command_enum: Commands, json: bool) -> Result<Str
 fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Result<String, String> {
     match command {
         Commands::Status => {
-            if let Some(status) = data.get("status") {
-                Ok(format!("Service Status: {}", status.as_str().unwrap_or("unknown")))
-            } else {
-                Ok("✓ Service is running".to_string())
+            let mut result = String::from("✓ Service is running");
+            
+            // Add model information if available
+            if let Some(models) = data.get("models").and_then(|m| m.as_array()) {
+                let model_count = models.len();
+                result.push_str(&format!("\n  Models loaded: {}", model_count));
+                
+                if model_count > 0 && model_count <= 3 {
+                    // Show details for up to 3 models
+                    for model in models {
+                        if let Some(model_name) = model.get("model_name").and_then(|n| n.as_str()) {
+                            result.push_str(&format!("\n  • {}", model_name));
+                            if let Some(uptime) = model.get("uptime").and_then(|u| u.as_u64()) {
+                                result.push_str(&format!(" (uptime: {}s)", uptime));
+                            }
+                        }
+                    }
+                } else if model_count > 3 {
+                    result.push_str("\n  (use 'list-models' to see details)");
+                }
             }
+            
+            Ok(result)
         }
         Commands::ListModels => {
             if let Some(models) = data.get("models").and_then(|m| m.as_array()) {
@@ -154,7 +172,30 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
                 } else {
                     let mut result = String::from("Loaded Models:\n");
                     for model in models {
-                        if let Some(name) = model.as_str() {
+                        if let Some(model_obj) = model.as_object() {
+                            let model_name = model_obj.get("model_name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unknown");
+                            let model_type = model_obj.get("model_type")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("unknown");
+                            let uptime = model_obj.get("uptime")
+                                .and_then(|u| u.as_u64())
+                                .unwrap_or(0);
+                            let is_alive = model_obj.get("is_alive")
+                                .and_then(|a| a.as_bool())
+                                .unwrap_or(false);
+                            let status_icon = if is_alive { "✓" } else { "✗" };
+                            
+                            result.push_str(&format!("  {} {} ({})\n", status_icon, model_name, model_type));
+                            result.push_str(&format!("    Uptime: {}s", uptime));
+                            
+                            if let Some(endpoint) = model_obj.get("endpoint").and_then(|e| e.as_str()) {
+                                result.push_str(&format!(" | Endpoint: {}", endpoint));
+                            }
+                            result.push('\n');
+                        } else if let Some(name) = model.as_str() {
+                            // Fallback for simple string models
                             result.push_str(&format!("  • {}\n", name));
                         }
                     }
