@@ -30,6 +30,7 @@ colored = "3.0"
 clap = "4.5"
 hyper = "1.6.0"
 backend-management-rs = { path = "../backend/backend-management-rs" }
+tokenizers = { version = "0.19.1", features = ["onig"] }
 #console-subscriber = "0.4.1"
 
 [build-dependencies]

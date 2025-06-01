@@ -560,7 +560,7 @@ class TestEndToEndIntegration:
             status_result = cli.status()
             assert status_result is True
             
-            # 3. Load a model (this should start backend-flashinfer)
+            # 3. Load a model (this should start backend-python)
             model_name = "Llama-3.2-1B-Instruct"
             load_result = cli.load_model(model_name)
             assert load_result is True
@@ -606,7 +606,7 @@ class TestEndToEndIntegration:
             # 7. Verify backend process is stopped
             result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
             backend_processes = [line for line in result.stdout.split('\n') 
-                               if 'backend-flashinfer' in line and 'main.py' in line]
+                               if 'backend-python' in line and 'main.py' in line]
             assert len(backend_processes) == 0, "Backend process should be stopped"
             
         finally:
@@ -867,14 +867,14 @@ class TestEndToEndIntegration:
             self._cleanup_existing_processes()
 
     def _test_backend_communication(self, config_path):
-        """Test direct communication with backend-flashinfer"""
+        """Test direct communication with backend-python"""
         try:
             import zmq
             import sys
             import os
             
-            # Add backend-flashinfer to Python path for protobuf imports
-            backend_path = os.path.join(os.path.dirname(__file__), '..', '..', 'backend-flashinfer')
+            # Add backend-python to Python path for protobuf imports
+            backend_path = os.path.join(os.path.dirname(__file__), '..', '..', 'backend-python')
             if os.path.exists(backend_path) and backend_path not in sys.path:
                 sys.path.insert(0, backend_path)
             
@@ -955,7 +955,7 @@ class TestEndToEndIntegration:
                       capture_output=True, text=True)
         
         # Kill backend processes  
-        subprocess.run(['pkill', '-f', 'backend-flashinfer.*l4m_backend.py'], 
+        subprocess.run(['pkill', '-f', 'backend-python.*l4m_backend.py'], 
                       capture_output=True, text=True)
         
         # Clean up IPC sockets

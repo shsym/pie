@@ -60,6 +60,7 @@ class Driver:
         self.blocks = {}
 
         self.lm = model
+        self.model_name_or_path = model.config._name_or_path
         self.max_num_pages = max_num_pages
         self.max_num_embeds = max_num_embeds
         self.dtype = dtype

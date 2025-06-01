@@ -131,21 +131,21 @@ class ManagementService:
     def _get_default_backend_path(self) -> str:
         """Get the default path to backend scripts.
         
-        This method tries to locate the backend-flashinfer directory using
+        This method tries to locate the backend-python directory using
         multiple strategies to ensure it works regardless of how the service
         is invoked (from CLI, tests, or different working directories).
         """
         # Strategy 1: Use the file's location to find backend directory
         # This works when the file structure is intact
         current_file_dir = Path(__file__).parent.resolve()
-        backend_dir = current_file_dir.parent / "backend-flashinfer"
+        backend_dir = current_file_dir.parent / "backend-python"
         
         if backend_dir.exists():
             return str(backend_dir)
         
         # Strategy 2: Look for backend directory relative to current working directory
         # This handles cases where the service is run from the project root
-        cwd_backend = Path.cwd() / "backend" / "backend-flashinfer"
+        cwd_backend = Path.cwd() / "backend" / "backend-python"
         if cwd_backend.exists():
             return str(cwd_backend)
         
@@ -158,7 +158,7 @@ class ManagementService:
                 (current_path / "engine").exists() and
                 (current_path / "example-apps").exists()):
                 
-                potential_backend = current_path / "backend" / "backend-flashinfer"
+                potential_backend = current_path / "backend" / "backend-python"
                 if potential_backend.exists():
                     return str(potential_backend)
             
@@ -170,7 +170,7 @@ class ManagementService:
         
         # Strategy 4: Return the original calculated path as fallback
         # Even if it doesn't exist, let the calling code handle the error
-        print(f"Warning: Could not find backend-flashinfer directory, using fallback path: {backend_dir}")
+        print(f"Warning: Could not find backend-python directory, using fallback path: {backend_dir}")
         return str(backend_dir)
     
     def _setup_logging(self):

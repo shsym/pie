@@ -68,12 +68,12 @@ The management layer will consist of two main parts: a long-running **Management
         *   After a successful handshake (for a client) and (if necessary) backend instance creation, the `management_service.py` returns the unique IPC endpoint of the model backend to the client via the updated `handshake.Response`.
         *   The client then disconnects from the management service and connects directly to the provided model backend endpoint.
 
-### B. Refactor Existing L4M Backend (Currently `backend/backend-flashinfer/main.py`)
+### B. Refactor Existing L4M Backend (Currently `backend/backend-python/main.py`)
 
 1.  **Rename and Isolate:**
     *   **Objective:** Make the L4M backend a standalone, manageable component.
     *   **Steps:**
-        *   Revise `backend/backend-flashinfer/main.py` to `backend/backend-flashinfer/l4m_backend.py` (or similar, e.g., `llama_backend.py`).
+        *   Revise `backend/backend-python/main.py` to `backend/backend-python/l4m_backend.py` (or similar, e.g., `llama_backend.py`).
         *   This script will now be executed as a separate process by the new management layer.
         *   Unit tests for the L4M backend should be updated to reflect this change.
         *   Integration test from backend-management with this backend should be created.
@@ -95,7 +95,7 @@ The management layer will consist of two main parts: a long-running **Management
 1.  **Create New Backend Script:**
     *   **Objective:** Provide a template/structure for adding support for new models.
     *   **Steps:**
-        *   Create a new Python script (e.g., `backend/backend-flashinfer/deepseek_backend.py`).
+        *   Create a new Python script (e.g., `backend/backend-python/deepseek_backend.py`).
         *   This script will be similar in structure to the refactored `l4m_backend.py`.
 
 2.  **Model-Specific Logic:**

@@ -1,7 +1,8 @@
 {
   "model_backends": {
     "llama3": "l4m_backend.py",
-    "deepseek": "deepseek_backend.py"
+    "deepseek": "deepseek_backend.py",
+    "qwen3": "qwen3_backend.py"
   },
   "endpoints": {
     "client_handshake": "ipc:///tmp/symphony-ipc",
@@ -15,6 +16,6 @@
   "supported_models": [
     {"name": "Llama-3.1-8B-Instruct", "fullname": "meta-llama/Llama-3.1-8B-Instruct", "type": "llama3"},
     {"name": "Llama-3.2-1B-Instruct", "fullname": "meta-llama/Llama-3.2-1B-Instruct", "type": "llama3"},
-    {"name": "DeepSeek-V3-0324", "fullname": "deepseek-ai/DeepSeek-V3-0324", "type": "deepseek"}
+    {"name": "DeepSeek-R1-0528-Qwen3-8B", "fullname": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", "type": "qwen3"}
   ]
 }

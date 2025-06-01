@@ -10,7 +10,7 @@ This document outlines the plan to rewrite the Python-based Symphony Management 
 
 **Root Cause**: 
 - Management service's role is orchestration and routing, not message processing
-- Actual protocol handling (L4M, L4M Vision, Ping) is done by backend services (e.g., `backend-flashinfer`)
+- Actual protocol handling (L4M, L4M Vision, Ping) is done by backend services (e.g., `backend-python`)
 - Management service only needs to:
   1. Handle client handshake requests
   2. Return supported protocol names as strings

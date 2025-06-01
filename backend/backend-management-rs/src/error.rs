@@ -12,7 +12,7 @@ pub enum ManagementError {
     Process(#[from] ProcessError),
 
     #[error("ZMQ communication error: {0}")]
-    Zmq(#[from] zmq::Error),
+    Zmq(String),
 
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
@@ -88,6 +88,12 @@ pub enum ProcessError {
 
     #[error("Backend script not found: {0}")]
     ScriptNotFound(PathBuf),
+
+    #[error("ZMQ error: {0}")]
+    ZmqError(String),
+
+    #[error("Protocol error: {0}")]
+    ProtocolError(String),
 }
 
 impl From<prost::EncodeError> for ManagementError {

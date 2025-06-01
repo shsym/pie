@@ -15,6 +15,7 @@ from config import NUM_TOKENS_IN_BLOCK
 class DsmaMlp(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
@@ -32,7 +33,7 @@ class DsmaMlp(nn.Module):
 # --------------------------------------------------------------------------- #
 class DsmaAttention(nn.Module):
     r"""
-    Implements DeepSeek-V3 MLA using FlashInfer’s paged-KV kernels.
+    Implements DeepSeek-V3 MLA using FlashInfer's paged-KV kernels.
 
     Notation  (per DeepSeek paper):
         H_q   - # query/output heads                    (config.num_attention_heads)
@@ -47,6 +48,7 @@ class DsmaAttention(nn.Module):
     """
     def __init__(self, config, layer_idx: int):
         super().__init__()
+        self.config = config
         self.layer_idx = layer_idx
         self.num_heads        = config.num_attention_heads          # H_q
         self.num_latent_heads = config.num_latent_heads             # H_l
@@ -132,11 +134,12 @@ class DsmaAttention(nn.Module):
 class DsmaDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx: int):
         super().__init__()
+        self.hidden_size = config.hidden_size
         self.self_attn = DsmaAttention(config, layer_idx)
 
         self.mlp   = DsmaMlp(config)
-        self.norm1 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm2 = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm1 = nn.RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.norm2 = nn.RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,

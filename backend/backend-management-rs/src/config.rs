@@ -78,6 +78,14 @@ impl Config {
             .map(|model| model.model_type.as_str())
     }
     
+    /// Get full model name by short name or full name
+    pub fn get_full_model_name(&self, model_name: &str) -> Option<&str> {
+        self.supported_models
+            .iter()
+            .find(|model| model.name == model_name || model.fullname == model_name)
+            .map(|model| model.fullname.as_str())
+    }
+    
     /// Get all supported model names
     pub fn get_supported_models(&self) -> Vec<&str> {
         self.supported_models

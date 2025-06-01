@@ -53,6 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("Starting Symphony Management Service");
+    
+    // Clean up any leftover IPC sockets from previous runs
+    backend_management_rs::cleanup_all_symphony_sockets();
 
     // Create and start the service
     match ManagementServiceImpl::create(config_path, backend_path) {

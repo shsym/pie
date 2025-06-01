@@ -30,7 +30,7 @@ macro_rules! try_trap {
         }
     };
 }
-pub const PROTOCOLS: [&str; 2] = ["l4m", "l4m-vision"]; // for future backward compatibility
+// Protocol definitions - backends dynamically report their supported protocols
 const PROTOCOL_BASE: usize = 0;
 const PROTOCOL_VISION: usize = 1;
 
@@ -415,31 +415,105 @@ impl L4m {
         // Add the model name to the available models
         set_available_models([info.model_name.clone()]);
 
-        // Try to load the tokenizer model from different paths
-        let tokenizer_paths = [
-            format!("program_cache/{}/original/tokenizer.model", info.model_name),
-            "../test-tokenizer/tokenizer.model".to_string(),
-        ];
+        // Attempt to load tokenizer
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use serde_json::Value;
 
+        let home = std::env::var("HOME").unwrap_or_default();
+        let cache_base = PathBuf::from(&home)
+            .join(".cache").join("symphony").join("models");
         let mut tokenizer = None;
-        for path in &tokenizer_paths {
-            match tokenizer::llama3_tokenizer(path) {
-                Ok(tok) => {
-                    tokenizer = Some(tok);
-                    println!("Successfully loaded tokenizer from {}", path);
-                    break;
+
+        let model_path = PathBuf::from(&info.model_name);
+
+        if model_path.is_absolute() && model_path.is_dir() {
+            println!("Model name is an absolute path: {:?}", model_path);
+            // Attempt 1: Load from symphony_model_info.json in the model_path
+            let model_info_json_path = model_path.join("symphony_model_info.json");
+            if model_info_json_path.exists() {
+                println!("Attempting to load tokenizer from symphony_model_info.json: {:?}", model_info_json_path);
+                if let Ok(content) = fs::read_to_string(&model_info_json_path) {
+                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
+                        if let Some(tok_str) = json.get("tokenizer_path").and_then(Value::as_str) {
+                            // tok_str could be relative to the symphony_model_info.json or absolute
+                            let mut absolute_tokenizer_path = PathBuf::from(tok_str);
+                            if !absolute_tokenizer_path.is_absolute() {
+                                absolute_tokenizer_path = model_path.join(tok_str);
+                            }
+                            println!("Loading tokenizer from metadata path: {:?}", absolute_tokenizer_path);
+                            if let Ok(tok) = tokenizer::load_symphony_tokenizer(absolute_tokenizer_path.to_str().unwrap()) {
+                                tokenizer = Some(tok);
+                                println!("Loaded tokenizer from {:?}", absolute_tokenizer_path);
+                            }
+                        }
+                    }
                 }
-                Err(_) => continue,
+            }
+
+            // Attempt 2: If not found, try tokenizer.json directly in model_path
+            if tokenizer.is_none() {
+                let direct_tokenizer_json_path = model_path.join("tokenizer.json");
+                if direct_tokenizer_json_path.exists() {
+                    println!("Attempting to load tokenizer.json directly from {:?}", direct_tokenizer_json_path);
+                    if let Ok(tok) = tokenizer::load_hf_tokenizer(direct_tokenizer_json_path.to_str().unwrap()) {
+                        tokenizer = Some(tok);
+                        println!("Loaded tokenizer from {:?}", direct_tokenizer_json_path);
+                    }
+                }
+            }
+        } else {
+            println!("Model name is not an absolute path, searching in cache: {} for {}", cache_base.display(), info.model_name);
+            // Existing logic: Iterate through cache_base or construct path
+            // Attempt 1: Find via symphony_model_info.json in subdirectories of cache_base
+            if let Ok(dir_iter) = fs::read_dir(&cache_base) {
+                for entry in dir_iter.flatten() {
+                    let model_dir_path = entry.path();
+                    if model_dir_path.is_dir() {
+                        let symphony_info_path = model_dir_path.join("symphony_model_info.json");
+                        if symphony_info_path.exists() {
+                            if let Ok(content) = fs::read_to_string(&symphony_info_path) {
+                                if let Ok(json) = serde_json::from_str::<Value>(&content) {
+                                    if json.get("local_name").and_then(Value::as_str) == Some(info.model_name.as_str()) ||
+                                       json.get("model_name").and_then(Value::as_str) == Some(info.model_name.as_str()) {
+                                        if let Some(tok_str) = json.get("tokenizer_path").and_then(Value::as_str) {
+                                            let mut absolute_tokenizer_path = PathBuf::from(tok_str);
+                                            if !absolute_tokenizer_path.is_absolute() {
+                                                absolute_tokenizer_path = model_dir_path.join(tok_str);
+                                            }
+                                            println!("Loading tokenizer from metadata path: {:?}", absolute_tokenizer_path);
+                                            if let Ok(tok) = tokenizer::load_symphony_tokenizer(absolute_tokenizer_path.to_str().unwrap()) {
+                                                tokenizer = Some(tok);
+                                                println!("Loaded tokenizer from {:?}", absolute_tokenizer_path);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Attempt 2: If not found, try tokenizer.json in a conventionally named cache directory
+            if tokenizer.is_none() {
+                let model_specific_cache_dir = cache_base.join(info.model_name.replace("/", "--"));
+                let tokenizer_json_path = model_specific_cache_dir.join("tokenizer.json");
+                if tokenizer_json_path.exists() {
+                    println!("Attempting to load tokenizer.json from conventional cache path: {:?}", tokenizer_json_path);
+                    if let Ok(tok) = tokenizer::load_hf_tokenizer(tokenizer_json_path.to_str().unwrap()) {
+                        tokenizer = Some(tok);
+                        println!("Loaded tokenizer from {:?}", tokenizer_json_path);
+                    }
+                }
             }
         }
 
-        let tokenizer = tokenizer.expect(
-            format!(
-                "Failed to load tokenizer from paths: {:?}\nModel name: {}\n
-                 Download the tokenizer model with: ./download_tokenizer.sh MODEL_NAME",
-                tokenizer_paths, info.model_name
-            ).as_str()
-        );
+        let tokenizer = tokenizer.expect(&format!(
+            "Failed to load tokenizer for model \'{}\'.\\nInstall with: symphony-cli install-model {}",
+            info.model_name, info.model_name
+        ));
 
         let mut objects = ObjectManager::new();
         objects
@@ -606,7 +680,7 @@ impl L4m {
                 //     println!("deallocating tokenemb, ids: {:?}", ids);
                 //     println!("available tokenemb: {:?}", self.objects.available(ty));
                 // }
-               
+
                 let ids = try_trap!(
                     self.objects.destroy_many(ty, inst_id, &ids),
                     inst_id,
@@ -1002,12 +1076,13 @@ where
     B: Backend + 'static,
 {
     fn new(backend: B, event_table: Arc<DashMap<u32, Vec<Event>>>) -> Self {
-        let protocol_ids = PROTOCOLS
+        let protocol_ids = backend
+            .supported_protocols()
             .iter()
             .map(|protoc| {
                 backend
                     .protocol_index(protoc)
-                    .expect("Failed to get protocol index")
+                    .expect(&format!("Failed to get protocol index: UnsupportedProtocol(\"{}\")", protoc))
             })
             .collect::<Vec<u8>>();
 
@@ -1095,8 +1170,12 @@ pub struct Simulator {
 impl Simulator {
     pub fn new() -> Self {
         Self {
-            protocols: PROTOCOLS.iter().map(|e| e.to_string()).collect(),
+            protocols: vec!["l4m".to_string()],
         }
+    }
+
+    pub fn new_with_protocols(protocols: Vec<String>) -> Self {
+        Self { protocols }
     }
 }
 

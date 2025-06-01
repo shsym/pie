@@ -37,6 +37,25 @@ pub enum Commands {
     },
     /// List loaded models
     ListModels,
+    /// Install a model from HuggingFace Hub
+    InstallModel {
+        /// Model name or path on HuggingFace Hub (e.g., meta-llama/Llama-3.1-8B-Instruct)
+        model_name: String,
+        /// Local name to use for the model (optional, defaults to last part of model_name)
+        #[clap(long)]
+        local_name: Option<String>,
+        /// Force reinstall even if model already exists
+        #[clap(long, action)]
+        force: bool,
+    },
+    /// Uninstall a model from local storage
+    UninstallModel {
+        /// Model name to uninstall
+        model_name: String,
+        /// Force uninstall even if model is currently loaded
+        #[clap(long, action)]
+        force: bool,
+    },
     // TODO: Add other commands as needed, e.g., health, logs
 }
 
@@ -47,7 +66,7 @@ pub async fn process_cli_command(args: CliArgs) {
         }
         other_command => {
             // Use ZMQ client for all other commands
-            match zmq_client::send_command_to_service(other_command, args.json) {
+            match zmq_client::send_command_to_service(other_command, args.json).await {
                 Ok(response) => println!("{}", response),
                 Err(e) => {
                     if args.json {
@@ -63,7 +82,7 @@ pub async fn process_cli_command(args: CliArgs) {
 
 async fn handle_start_service(daemonize: bool, json: bool) {
     // First check if service is already running
-    match zmq_client::send_command_to_service(Commands::Status, json) {
+    match zmq_client::send_command_to_service(Commands::Status, json).await {
         Ok(_) => {
             if json {
                 println!("{}", serde_json::json!({"status": "already_running", "message": "Service is already running"}));

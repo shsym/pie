@@ -3,7 +3,8 @@
     "endpoint": "ipc:///tmp/symphony-cli"
   },
   "models": [
-    "Llama-3.1-8B-Instruct"
+    "Llama-3.1-8B-Instruct",
+    "DeepSeek-R1-0528-Qwen3-8B"
   ],
   "default_model": "Llama-3.1-8B-Instruct"
 }

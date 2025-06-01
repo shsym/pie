@@ -4,25 +4,28 @@ use crate::types::{ManagementCommand, ManagementResponse};
 use crate::config::Config;
 use std::collections::HashMap;
 use super::cli::Commands;
+use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use tokio::time::{timeout, Duration};
 
 pub struct ZmqClient {
-    socket: zmq::Socket,
+    socket: DealerSocket,
     endpoint: String,
 }
 
 impl ZmqClient {
-    pub fn new(service_endpoint: &str) -> Result<Self, String> {
-        let context = zmq::Context::new();
-        let socket = context.socket(zmq::DEALER).map_err(|e| e.to_string())?;
+    pub async fn new(service_endpoint: &str) -> Result<Self, String> {
+        let mut socket = DealerSocket::new();
         
-        // Set timeouts for send/recv (3 seconds for faster feedback)
-        socket.set_rcvtimeo(3000).map_err(|e| e.to_string())?;
-        socket.set_sndtimeo(3000).map_err(|e| e.to_string())?;
-        
-        // Set linger to 0 so socket closes immediately
-        socket.set_linger(0).map_err(|e| e.to_string())?;
-        
-        socket.connect(service_endpoint).map_err(|e| e.to_string())?;
+        // Connect to the service with timeout
+        match timeout(Duration::from_secs(3), socket.connect(service_endpoint)).await {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => {
+                return Err(format!("Failed to connect to {}: {}", service_endpoint, e));
+            },
+            Err(_) => {
+                return Err(format!("Timeout: Could not connect to service at {} (is the service running?)", service_endpoint));
+            }
+        }
         
         Ok(Self { 
             socket, 
@@ -30,34 +33,58 @@ impl ZmqClient {
         })
     }
 
-    pub fn send_command(&self, command: ManagementCommand) -> Result<ManagementResponse, String> {
+    pub async fn send_command(&mut self, command: ManagementCommand) -> Result<ManagementResponse, String> {
         let serialized_cmd = serde_json::to_string(&command)
             .map_err(|e| format!("Failed to serialize command: {}", e))?;
 
-        // Try to send the command
-        match self.socket.send(&serialized_cmd, 0) {
-            Ok(_) => {},
-            Err(zmq::Error::EAGAIN) => {
-                return Err(format!("Timeout: Could not send command to service at {} (is the service running?)", self.endpoint));
-            },
-            Err(e) => {
+        let msg = ZmqMessage::from(serialized_cmd.into_bytes());
+
+        // Try to send the command with timeout
+        match timeout(Duration::from_secs(3), self.socket.send(msg)).await {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => {
                 return Err(format!("Failed to send command to {}: {}", self.endpoint, e));
+            },
+            Err(_) => {
+                return Err(format!("Timeout: Could not send command to service at {} (is the service running?)", self.endpoint));
             }
         }
 
-        // Try to receive the response
-        let mut msg = zmq::Message::new();
-        match self.socket.recv(&mut msg, 0) {
-            Ok(_) => {
-                let response_str = msg.as_str().ok_or_else(|| "Received non-UTF8 response".to_string())?;
+        // Determine timeout based on command type - model loading and installation need much longer
+        let receive_timeout = if command.command == "load-model" {
+            Duration::from_secs(60) // 60 seconds for model loading
+        } else if command.command == "install-model" {
+            Duration::from_secs(600) // 10 minutes for model installation
+        } else if command.command == "uninstall-model" {
+            Duration::from_secs(60) // 60 seconds for model uninstallation
+        } else {
+            Duration::from_secs(10) // 10 seconds for other operations
+        };
+
+        // Try to receive the response with appropriate timeout
+        match timeout(receive_timeout, self.socket.recv()).await {
+            Ok(Ok(response_msg)) => {
+                let response_bytes = response_msg.get(0)
+                    .ok_or_else(|| "Received empty response".to_string())?;
+                let response_str = std::str::from_utf8(response_bytes)
+                    .map_err(|_| "Received non-UTF8 response".to_string())?;
                 serde_json::from_str(response_str)
                     .map_err(|e| format!("Failed to deserialize response: {}", e))
             },
-            Err(zmq::Error::EAGAIN) => {
-                Err(format!("Timeout: No response from service at {} (is the service running?)", self.endpoint))
-            },
-            Err(e) => {
+            Ok(Err(e)) => {
                 Err(format!("Failed to receive response from {}: {}", self.endpoint, e))
+            },
+            Err(_) => {
+                let timeout_msg = if command.command == "load-model" {
+                    "Timeout: Model loading took longer than 60 seconds"
+                } else if command.command == "install-model" {
+                    "Timeout: Model installation took longer than 10 minutes"
+                } else if command.command == "uninstall-model" {
+                    "Timeout: Model uninstallation took longer than 60 seconds"
+                } else {
+                    "Timeout: No response from service within 10 seconds"
+                };
+                Err(format!("{} (endpoint: {})", timeout_msg, self.endpoint))
             }
         }
     }
@@ -73,12 +100,12 @@ fn get_service_endpoint() -> String {
     "ipc:///tmp/symphony-cli".to_string()
 }
 
-pub fn send_command_to_service(command_enum: Commands, json: bool) -> Result<String, String> {
+pub async fn send_command_to_service(command_enum: Commands, json: bool) -> Result<String, String> {
     // 1. Determine the service endpoint
     let endpoint = get_service_endpoint();
 
     // 2. Create a ZmqClient instance
-    let client = ZmqClient::new(&endpoint)?;
+    let mut client = ZmqClient::new(&endpoint).await?;
 
     // 3. Convert cli::Commands enum to a types::ManagementCommand
     let core_command = match &command_enum {
@@ -97,6 +124,21 @@ pub fn send_command_to_service(command_enum: Commands, json: bool) -> Result<Str
             ManagementCommand::new("unload-model".to_string(), params)
         }
         Commands::ListModels => ManagementCommand::new("list-models".to_string(), HashMap::new()),
+        Commands::InstallModel { model_name, local_name, force } => {
+            let mut params = HashMap::new();
+            params.insert("model_name".to_string(), serde_json::Value::String(model_name.clone()));
+            if let Some(name) = local_name {
+                params.insert("local_name".to_string(), serde_json::Value::String(name.clone()));
+            }
+            params.insert("force".to_string(), serde_json::Value::Bool(*force));
+            ManagementCommand::new("install-model".to_string(), params)
+        }
+        Commands::UninstallModel { model_name, force } => {
+            let mut params = HashMap::new();
+            params.insert("model_name".to_string(), serde_json::Value::String(model_name.clone()));
+            params.insert("force".to_string(), serde_json::Value::Bool(*force));
+            ManagementCommand::new("uninstall-model".to_string(), params)
+        }
         Commands::StopService => ManagementCommand::new("stop-service".to_string(), HashMap::new()),
         Commands::StartService { .. } => {
             return Err("StartService command should be handled locally, not sent to service".to_string());
@@ -104,7 +146,7 @@ pub fn send_command_to_service(command_enum: Commands, json: bool) -> Result<Str
     };
 
     // 4. Send the command and get a response
-    match client.send_command(core_command) {
+    match client.send_command(core_command).await {
         Ok(response) => {
             if json {
                 // Return raw JSON response
@@ -166,12 +208,15 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
             Ok(result)
         }
         Commands::ListModels => {
-            if let Some(models) = data.get("models").and_then(|m| m.as_array()) {
-                if models.is_empty() {
-                    Ok("No models currently loaded".to_string())
+            let mut result = String::new();
+            
+            // Show loaded models
+            if let Some(loaded_models) = data.get("loaded_models").and_then(|m| m.as_array()) {
+                if loaded_models.is_empty() {
+                    result.push_str("Loaded Models: None\n");
                 } else {
-                    let mut result = String::from("Loaded Models:\n");
-                    for model in models {
+                    result.push_str("Loaded Models:\n");
+                    for model in loaded_models {
                         if let Some(model_obj) = model.as_object() {
                             let model_name = model_obj.get("model_name")
                                 .and_then(|n| n.as_str())
@@ -194,16 +239,46 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
                                 result.push_str(&format!(" | Endpoint: {}", endpoint));
                             }
                             result.push('\n');
-                        } else if let Some(name) = model.as_str() {
-                            // Fallback for simple string models
-                            result.push_str(&format!("  • {}\n", name));
                         }
                     }
-                    Ok(result.trim_end().to_string())
                 }
             } else {
-                Ok("No models currently loaded".to_string())
+                result.push_str("Loaded Models: None\n");
             }
+            
+            result.push('\n');
+            
+            // Show installed models
+            if let Some(installed_models) = data.get("installed_models").and_then(|m| m.as_array()) {
+                if installed_models.is_empty() {
+                    result.push_str("Installed Models: None");
+                } else {
+                    result.push_str("Installed Models:\n");
+                    for model in installed_models {
+                        if let Some(model_obj) = model.as_object() {
+                            let model_name = model_obj.get("model_name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unknown");
+                            let local_name = model_obj.get("local_name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or(model_name);
+                            let model_type = model_obj.get("model_type")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("unknown");
+                            let path = model_obj.get("path")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("unknown");
+                            
+                            result.push_str(&format!("  • {} ({})\n", local_name, model_type));
+                            result.push_str(&format!("    Original: {} | Path: {}\n", model_name, path));
+                        }
+                    }
+                }
+            } else {
+                result.push_str("Installed Models: None");
+            }
+            
+            Ok(result.trim_end().to_string())
         }
         Commands::LoadModel { model_name, .. } => {
             if let Some(message) = data.get("message") {
@@ -228,6 +303,61 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
         }
         Commands::StartService { .. } => {
             Ok("✓ Service started".to_string())
+        }
+        Commands::InstallModel { model_name, local_name, .. } => {
+            if let Some(status) = data.get("status").and_then(|s| s.as_str()) {
+                match status {
+                    "installed" => {
+                        let path = data.get("path")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("unknown path");
+                        let model_type = data.get("model_type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("unknown");
+                        Ok(format!("✅ Model '{}' installed successfully as '{}'\n  Type: {}\n  Path: {}", 
+                                 model_name, local_name.as_deref().unwrap_or(model_name), model_type, path))
+                    }
+                    "already_installed" => {
+                        let path = data.get("path")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("unknown path");
+                        Ok(format!("ℹ️  Model '{}' is already installed\n  Path: {}", model_name, path))
+                    }
+                    _ => {
+                        if let Some(message) = data.get("message") {
+                            Ok(format!("✅ {}", message.as_str().unwrap_or("Model installation completed")))
+                        } else {
+                            Ok(format!("✅ Model '{}' installation completed", model_name))
+                        }
+                    }
+                }
+            } else {
+                Ok(format!("✅ Model '{}' installation completed\n\n📝 Note: Installation progress is shown in the management service logs.\n   Run 'journalctl -f -u symphony-management' to follow progress in real-time.", model_name))
+            }
+        }
+        Commands::UninstallModel { model_name, .. } => {
+            if let Some(status) = data.get("status").and_then(|s| s.as_str()) {
+                match status {
+                    "uninstalled" => {
+                        let path = data.get("path")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("unknown path");
+                        Ok(format!("✓ Model '{}' uninstalled successfully\n  Removed: {}", model_name, path))
+                    }
+                    "not_found" => {
+                        Ok(format!("ℹ Model '{}' was not installed", model_name))
+                    }
+                    _ => {
+                        if let Some(message) = data.get("message") {
+                            Ok(format!("✓ {}", message.as_str().unwrap_or("Model uninstallation completed")))
+                        } else {
+                            Ok(format!("✓ Model '{}' uninstallation completed", model_name))
+                        }
+                    }
+                }
+            } else {
+                Ok(format!("✓ Model '{}' uninstallation completed", model_name))
+            }
         }
     }
 }

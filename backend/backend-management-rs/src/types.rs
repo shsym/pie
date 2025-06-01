@@ -4,6 +4,7 @@ use std::time::{SystemTime, Duration};
 use uuid::Uuid;
 use tokio::process::Child as TokioChild;
 use tracing::{info, warn, error};
+use crate::utils::cleanup_ipc_socket;
 
 /// Represents a running model backend instance
 #[derive(Debug)]
@@ -20,6 +21,8 @@ pub struct ModelInstance {
     pub config_path: Option<std::path::PathBuf>,
     /// Timestamp when the instance was started
     pub started_at: SystemTime,
+    /// Protocols supported by this specific backend instance
+    pub supported_protocols: Vec<String>,
 }
 
 impl ModelInstance {
@@ -30,6 +33,7 @@ impl ModelInstance {
         endpoint: String,
         process: TokioChild,
         config_path: Option<std::path::PathBuf>,
+        supported_protocols: Vec<String>,
     ) -> Self {
         Self {
             model_name,
@@ -38,6 +42,7 @@ impl ModelInstance {
             process,
             config_path,
             started_at: SystemTime::now(),
+            supported_protocols,
         }
     }
 
@@ -67,7 +72,7 @@ impl ModelInstance {
 
         // Wait up to 10 seconds for graceful shutdown
         let timeout = Duration::from_secs(10);
-        match tokio::time::timeout(timeout, self.process.wait()).await {
+        let result = match tokio::time::timeout(timeout, self.process.wait()).await {
             Ok(Ok(status)) => {
                 info!("Process {} exited with status: {}", self.model_name, status);
                 Ok(())
@@ -81,7 +86,12 @@ impl ModelInstance {
                 // Force kill if timeout
                 self.process.kill().await
             }
-        }
+        };
+
+        // Clean up IPC socket file after process termination
+        cleanup_ipc_socket(&self.endpoint);
+        
+        result
     }
 
     /// Get uptime duration
@@ -89,9 +99,22 @@ impl ModelInstance {
         self.started_at.elapsed().unwrap_or(Duration::ZERO)
     }
 
+    /// Clean up resources associated with this model instance
+    pub fn cleanup(&self) {
+        info!("Cleaning up resources for model instance: {}", self.model_name);
+        cleanup_ipc_socket(&self.endpoint);
+    }
+
     /// Get the process ID if available (alias for pid)
     pub fn get_process_id(&self) -> Option<u32> {
         self.pid()
+    }
+}
+
+impl Drop for ModelInstance {
+    fn drop(&mut self) {
+        // Clean up IPC socket when instance is dropped
+        cleanup_ipc_socket(&self.endpoint);
     }
 }
 
@@ -176,6 +199,7 @@ pub struct ModelInstanceStatus {
     pub started_at: SystemTime,
     pub uptime: Duration,
     pub config_path: Option<std::path::PathBuf>,
+    pub supported_protocols: Vec<String>,
 }
 
 impl From<&mut ModelInstance> for ModelInstanceStatus {
@@ -189,6 +213,7 @@ impl From<&mut ModelInstance> for ModelInstanceStatus {
             started_at: instance.started_at,
             uptime: instance.uptime(),
             config_path: instance.config_path.clone(),
+            supported_protocols: instance.supported_protocols.clone(),
         }
     }
 }
