@@ -1,0 +1,59 @@
+# build.ninja for CUDA C++ Project with FlashInfer
+
+# Variables
+nvcc = nvcc
+cxxflags = -std=c++20 -Xcompiler -Wall -Xcompiler -Wextra -gencode arch=compute_70,code=sm_70
+# Add -g -G for debug symbols and device-side debugging
+# cxxflags += -g -G
+
+src_dir = src
+include_dir = include
+lib_dir = lib
+build_dir = build
+bin_dir = bin
+
+flashinfer_include_dir = $lib_dir/flashinfer/include
+
+inc_path = -I$include_dir -I$flashinfer_include_dir
+
+# Rules
+
+# Rule to compile CUDA .cu files into object files
+rule cu_compile
+  command = $nvcc $cxxflags $inc_path -c $in -o $out
+  description = Compiling $in
+
+# Rule to link object files into the final executable
+rule link
+  command = $nvcc $cxxflags $in -o $out
+  description = Linking $out
+
+# Build edges
+
+# Object files
+# Ninja will create the $build_dir if it doesn't exist when building these
+build $build_dir/main.o: cu_compile $src_dir/main.cu
+
+# Executable
+# Ninja will create the $bin_dir if it doesn't exist when building this
+build $bin_dir/cuda_app: link $build_dir/main.o
+
+# Default target: builds the executable
+default $bin_dir/cuda_app
+build all: phony $bin_dir/cuda_app
+
+# Clean up build artifacts
+rule clean
+  command = rm -rf $build_dir $bin_dir
+  description = Cleaning build artifacts
+build clean: clean
+
+# Phony target for running the application
+# Note: Ninja doesn't have a direct equivalent of Make's "run" target that
+# first ensures the target is up-to-date and then runs it.
+# You typically run the executable directly after building.
+# However, you can define a phony target that depends on the executable
+# and then use a separate script or command to run it.
+# For a simple case, you can create a helper script or just run manually.
+# This "run" target here mainly serves as a placeholder to show dependency.
+build run: phony $bin_dir/cuda_app
