@@ -192,25 +192,6 @@ class L4maModel(nn.Module):
             wrapper = self.wrapper_decode
         else:
             
-            # mask_arr = []
-            # qo_len = (qo_indptr[1:] - qo_indptr[:-1]).cpu().tolist()
-            # kv_len = (NUM_TOKENS_IN_BLOCK * (kv_page_indptr[1:] - kv_page_indptr[:-1] - 1) + kv_last_page_lens).cpu().tolist()
-            # for i in range(1):
-            #     mask_i = torch.tril(
-            #         torch.full((qo_len[i], kv_len[i]), True, device="cuda:0"),
-            #         diagonal=(kv_len[i] - qo_len[i]),
-            #     )
-            #     print(mask_i.shape)
-            #     mask_arr.append(mask_i.flatten())
-            #     print(mask_i.tolist())
-
-
-            # mask = torch.cat(mask_arr, dim=0)
-            
-            
-            
-            
-            
             self.wrapper_append.plan(
                 qo_indptr=qo_indptr,
                 paged_kv_indptr=kv_page_indptr,

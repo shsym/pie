@@ -177,8 +177,6 @@ def install_model(model_name: str, target_path: str):
             snapshot_download(
                 repo_id=model_name,
                 local_dir=target_path,
-                local_dir_use_symlinks=False,
-                resume_download=True,
                 tqdm_class=tqdm.tqdm
             )
             print("✅ Model download completed!")
@@ -266,7 +264,7 @@ if __name__ == "__main__":
 
     /// Remove a model and its associated files
     pub async fn uninstall_model(&self, model_name: &str) -> Result<PathBuf> {
-        let model_dir = self.get_model_dir(model_name);
+        let model_dir = self.get_model_path(model_name);
         
         if !model_dir.exists() {
             return Err(crate::ManagementError::Model {
@@ -305,9 +303,13 @@ if __name__ == "__main__":
             })? {
             
             if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
-                let dir_name = entry.file_name().to_string_lossy().to_string();
-                // Convert directory name back to original model name (reverse the "/" -> "--" replacement)
-                let model_name = dir_name.replace("--", "/");
+                let model_name = entry.file_name().to_string_lossy().to_string();
+                
+                // Skip directories that start with '.' (like .locks, .git, etc.)
+                if model_name.starts_with('.') {
+                    continue;
+                }
+                
                 if let Ok(model_info) = self.get_model_info(&model_name).await {
                     models.push(model_info);
                 }
@@ -339,7 +341,7 @@ if __name__ == "__main__":
 
     /// Get the path where a model would be installed
     pub fn get_model_path(&self, model_name: &str) -> PathBuf {
-        self.get_model_dir(model_name)
+        self.models_dir.join(model_name.replace("/", "--"))
     }
 
     /// Check if a model is installed
@@ -406,10 +408,35 @@ if __name__ == "__main__":
         })
     }
 
-    /// Get the directory path for a specific model
-    fn get_model_dir(&self, model_name: &str) -> PathBuf {
-        self.models_dir.join(model_name.replace("/", "--"))
+    /// Resolve a local model name to the original HuggingFace model name
+    /// This allows users to uninstall models using either the original name or local name
+    pub async fn resolve_model_name(&self, name_or_local_name: &str) -> Result<String> {
+        // First, check if it's already an original model name (contains "/")
+        if name_or_local_name.contains("/") && self.is_model_installed(name_or_local_name).await {
+            return Ok(name_or_local_name.to_string());
+        }
+        
+        // If not, search through all installed models to find a match by local_name
+        let installed_models = self.list_installed_models().await?;
+        
+        for model_info in installed_models {
+            // Check if the input matches the local name
+            if model_info.local_name == name_or_local_name {
+                return Ok(model_info.model_name);
+            }
+            // Also check if it matches the last part of the original model name
+            // (for cases where local_name wasn't explicitly set)
+            if let Some(last_part) = model_info.model_name.split('/').last() {
+                if last_part == name_or_local_name {
+                    return Ok(model_info.model_name);
+                }
+            }
+        }
+        
+        // If no match found, return the original name (let the caller handle the error)
+        Ok(name_or_local_name.to_string())
     }
+
 }
 
 /// Information about an installed model

@@ -415,105 +415,77 @@ impl L4m {
         // Add the model name to the available models
         set_available_models([info.model_name.clone()]);
 
-        // Attempt to load tokenizer
-        use std::fs;
-        use std::path::{Path, PathBuf};
-        use serde_json::Value;
-
-        let home = std::env::var("HOME").unwrap_or_default();
-        let cache_base = PathBuf::from(&home)
-            .join(".cache").join("symphony").join("models");
-        let mut tokenizer = None;
-
-        let model_path = PathBuf::from(&info.model_name);
-
-        if model_path.is_absolute() && model_path.is_dir() {
-            println!("Model name is an absolute path: {:?}", model_path);
-            // Attempt 1: Load from symphony_model_info.json in the model_path
-            let model_info_json_path = model_path.join("symphony_model_info.json");
-            if model_info_json_path.exists() {
-                println!("Attempting to load tokenizer from symphony_model_info.json: {:?}", model_info_json_path);
-                if let Ok(content) = fs::read_to_string(&model_info_json_path) {
-                    if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                        if let Some(tok_str) = json.get("tokenizer_path").and_then(Value::as_str) {
-                            // tok_str could be relative to the symphony_model_info.json or absolute
-                            let mut absolute_tokenizer_path = PathBuf::from(tok_str);
-                            if !absolute_tokenizer_path.is_absolute() {
-                                absolute_tokenizer_path = model_path.join(tok_str);
-                            }
-                            println!("Loading tokenizer from metadata path: {:?}", absolute_tokenizer_path);
-                            if let Ok(tok) = tokenizer::load_symphony_tokenizer(absolute_tokenizer_path.to_str().unwrap()) {
-                                tokenizer = Some(tok);
-                                println!("Loaded tokenizer from {:?}", absolute_tokenizer_path);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Attempt 2: If not found, try tokenizer.json directly in model_path
-            if tokenizer.is_none() {
-                let direct_tokenizer_json_path = model_path.join("tokenizer.json");
-                if direct_tokenizer_json_path.exists() {
-                    println!("Attempting to load tokenizer.json directly from {:?}", direct_tokenizer_json_path);
-                    if let Ok(tok) = tokenizer::load_hf_tokenizer(direct_tokenizer_json_path.to_str().unwrap()) {
-                        tokenizer = Some(tok);
-                        println!("Loaded tokenizer from {:?}", direct_tokenizer_json_path);
-                    }
-                }
-            }
+        // Extract the actual model name from the path if it's a full path
+        let model_name = if info.model_name.contains('/') {
+            // If it's a path, extract the last component
+            std::path::Path::new(&info.model_name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&info.model_name)
+                .to_string()
         } else {
-            println!("Model name is not an absolute path, searching in cache: {} for {}", cache_base.display(), info.model_name);
-            // Existing logic: Iterate through cache_base or construct path
-            // Attempt 1: Find via symphony_model_info.json in subdirectories of cache_base
-            if let Ok(dir_iter) = fs::read_dir(&cache_base) {
-                for entry in dir_iter.flatten() {
-                    let model_dir_path = entry.path();
-                    if model_dir_path.is_dir() {
-                        let symphony_info_path = model_dir_path.join("symphony_model_info.json");
-                        if symphony_info_path.exists() {
-                            if let Ok(content) = fs::read_to_string(&symphony_info_path) {
-                                if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                                    if json.get("local_name").and_then(Value::as_str) == Some(info.model_name.as_str()) ||
-                                       json.get("model_name").and_then(Value::as_str) == Some(info.model_name.as_str()) {
-                                        if let Some(tok_str) = json.get("tokenizer_path").and_then(Value::as_str) {
-                                            let mut absolute_tokenizer_path = PathBuf::from(tok_str);
-                                            if !absolute_tokenizer_path.is_absolute() {
-                                                absolute_tokenizer_path = model_dir_path.join(tok_str);
-                                            }
-                                            println!("Loading tokenizer from metadata path: {:?}", absolute_tokenizer_path);
-                                            if let Ok(tok) = tokenizer::load_symphony_tokenizer(absolute_tokenizer_path.to_str().unwrap()) {
-                                                tokenizer = Some(tok);
-                                                println!("Loaded tokenizer from {:?}", absolute_tokenizer_path);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            info.model_name.clone()
+        };
 
-            // Attempt 2: If not found, try tokenizer.json in a conventionally named cache directory
-            if tokenizer.is_none() {
-                let model_specific_cache_dir = cache_base.join(info.model_name.replace("/", "--"));
-                let tokenizer_json_path = model_specific_cache_dir.join("tokenizer.json");
-                if tokenizer_json_path.exists() {
-                    println!("Attempting to load tokenizer.json from conventional cache path: {:?}", tokenizer_json_path);
-                    if let Ok(tok) = tokenizer::load_hf_tokenizer(tokenizer_json_path.to_str().unwrap()) {
+        // Try to load the tokenizer model from different paths
+        // First try to load from Symphony managed models if available
+        let symphony_model_paths = [
+            format!("~/.cache/symphony/models/{}", model_name),
+            format!("{}/.cache/symphony/models/{}", std::env::var("HOME").unwrap_or_default(), model_name),
+        ];
+        
+        let tokenizer_paths = [
+            format!("program_cache/{}/original/tokenizer.model", model_name),
+            "../test-tokenizer/tokenizer.model".to_string(),
+        ];
+
+        let mut tokenizer = None;
+        
+        // First try Symphony managed models with metadata
+        for path in &symphony_model_paths {
+            let expanded_path = if path.starts_with("~/") {
+                format!("{}{}", std::env::var("HOME").unwrap_or_default(), &path[1..])
+            } else {
+                path.clone()
+            };
+            
+            if std::path::Path::new(&expanded_path).exists() {
+                println!("Trying to load tokenizer from Symphony managed model: {}", expanded_path);
+                match tokenizer::load_symphony_tokenizer(&expanded_path) {
+                    Ok(tok) => {
                         tokenizer = Some(tok);
-                        println!("Loaded tokenizer from {:?}", tokenizer_json_path);
+                        println!("Successfully loaded tokenizer from Symphony managed model: {}", expanded_path);
+                        break;
+                    }
+                    Err(e) => {
+                        println!("Failed to load tokenizer from Symphony managed model {}: {}", expanded_path, e);
+                        continue;
                     }
                 }
             }
         }
+        
+        // Fallback to original hardcoded paths if Symphony models not found
+        if tokenizer.is_none() {
+            for path in &tokenizer_paths {
+                match tokenizer::llama3_tokenizer(path) {
+                    Ok(tok) => {
+                        tokenizer = Some(tok);
+                        println!("Successfully loaded tokenizer from {}", path);
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
 
-        let tokenizer = tokenizer.expect(&format!(
-            "Failed to load tokenizer for model \'{}\'.\\nInstall with: symphony-cli install-model {}",
-            info.model_name, info.model_name
-        ));
+        let tokenizer = tokenizer.expect(
+            format!(
+                "Failed to load tokenizer from paths: {:?}\nModel name: {}\n
+                 Download a model with: symphony-cli install-model MODEL_NAME",
+                [symphony_model_paths.to_vec(), tokenizer_paths.to_vec()].concat(), info.model_name
+            ).as_str()
+        );
 
         let mut objects = ObjectManager::new();
         objects
@@ -680,7 +652,7 @@ impl L4m {
                 //     println!("deallocating tokenemb, ids: {:?}", ids);
                 //     println!("available tokenemb: {:?}", self.objects.available(ty));
                 // }
-
+               
                 let ids = try_trap!(
                     self.objects.destroy_many(ty, inst_id, &ids),
                     inst_id,

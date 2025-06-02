@@ -817,8 +817,11 @@ impl ManagementServiceImpl {
     ) -> Result<serde_json::Value> {
         info!("Uninstalling model '{}' from local storage", model_name);
         
+        // Resolve the model name (in case user provided local name instead of original name)
+        let resolved_name = model_installer.resolve_model_name(model_name).await?;
+        
         // Check if model is installed
-        if !model_installer.is_model_installed(model_name).await {
+        if !model_installer.is_model_installed(&resolved_name).await {
             return Ok(serde_json::json!({
                 "status": "not_found",
                 "model_name": model_name,
@@ -829,14 +832,15 @@ impl ManagementServiceImpl {
         // TODO: Check if model is currently loaded and handle force flag
         // For now, we'll proceed with uninstallation
         
-        // Uninstall the model
-        let removed_path = model_installer.uninstall_model(model_name).await?;
+        // Uninstall the model using the resolved name
+        let removed_path = model_installer.uninstall_model(&resolved_name).await?;
         
-        info!("Successfully uninstalled model '{}' from {:?}", model_name, removed_path);
+        info!("Successfully uninstalled model '{}' (resolved as '{}') from {:?}", model_name, resolved_name, removed_path);
         
         Ok(serde_json::json!({
             "status": "uninstalled",
             "model_name": model_name,
+            "resolved_name": resolved_name,
             "path": removed_path,
             "message": format!("Model '{}' uninstalled successfully", model_name)
         }))

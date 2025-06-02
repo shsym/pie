@@ -4,6 +4,7 @@ use crate::types::{ManagementCommand, ManagementResponse};
 use crate::config::Config;
 use std::collections::HashMap;
 use super::cli::Commands;
+use super::spinner;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 use tokio::time::{timeout, Duration};
 
@@ -145,8 +146,20 @@ pub async fn send_command_to_service(command_enum: Commands, json: bool) -> Resu
         }
     };
 
-    // 4. Send the command and get a response
-    match client.send_command(core_command).await {
+    // 4. Send the command and get a response with spinner for long operations
+    let result = if should_show_spinner(&command_enum, json) {
+        let (message, _) = get_spinner_messages(&command_enum);
+        spinner::with_spinner_custom(
+            client.send_command(core_command),
+            &message,
+            |_| "".to_string(), // Don't show success message from spinner
+            |e| format!("Failed: {}", e),
+        ).await
+    } else {
+        client.send_command(core_command).await
+    };
+
+    match result {
         Ok(response) => {
             if json {
                 // Return raw JSON response
@@ -176,6 +189,50 @@ pub async fn send_command_to_service(command_enum: Commands, json: bool) -> Resu
             }
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Determine if a spinner should be shown for a command (skip for JSON output or quick commands)
+fn should_show_spinner(command: &Commands, json: bool) -> bool {
+    if json {
+        return false; // Don't show spinner for JSON output
+    }
+    
+    match command {
+        Commands::LoadModel { .. } => true,
+        Commands::InstallModel { .. } => true,
+        Commands::UnloadModel { .. } => true,
+        Commands::UninstallModel { .. } => true,
+        Commands::Status => true,
+        Commands::ListModels => false,   // Quick operation
+        Commands::StopService => true,
+        Commands::StartService { .. } => false,
+    }
+}
+
+/// Get appropriate spinner messages for each command type
+fn get_spinner_messages(command: &Commands) -> (String, String) {
+    match command {
+        Commands::LoadModel { model_name, .. } => (
+            format!("Loading model '{}'...", model_name),
+            format!("Model '{}' loaded", model_name),
+        ),
+        Commands::InstallModel { model_name, .. } => (
+            format!("Installing model '{}'...", model_name),
+            format!("Model '{}' installed", model_name),
+        ),
+        Commands::UnloadModel { model_name } => (
+            format!("Unloading model '{}'...", model_name),
+            format!("Model '{}' unloaded", model_name),
+        ),
+        Commands::UninstallModel { model_name, .. } => (
+            format!("Uninstalling model '{}'...", model_name),
+            format!("Model '{}' uninstalled", model_name),
+        ),
+        _ => (
+            "Processing...".to_string(),
+            "Operation completed".to_string(),
+        ),
     }
 }
 
@@ -345,7 +402,7 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
                         Ok(format!("✓ Model '{}' uninstalled successfully\n  Removed: {}", model_name, path))
                     }
                     "not_found" => {
-                        Ok(format!("ℹ Model '{}' was not installed", model_name))
+                        Ok(format!("Err: Model '{}' was not installed", model_name))
                     }
                     _ => {
                         if let Some(message) = data.get("message") {
