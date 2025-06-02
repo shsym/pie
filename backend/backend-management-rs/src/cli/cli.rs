@@ -17,10 +17,7 @@ pub struct CliArgs {
 #[derive(Parser, Debug)]
 pub enum Commands {
     /// Start the management service (daemon)
-    StartService {
-        #[clap(long, action)]
-        daemonize: bool,
-    },
+    StartService,
     /// Stop the management service
     StopService,
     /// Get the status of the management service
@@ -61,8 +58,8 @@ pub enum Commands {
 
 pub async fn process_cli_command(args: CliArgs) {
     match args.command {
-        Commands::StartService { daemonize } => {
-            handle_start_service(daemonize, args.json).await;
+        Commands::StartService => {
+            handle_start_service(args.json).await;
         }
         other_command => {
             // Use ZMQ client for all other commands
@@ -80,7 +77,7 @@ pub async fn process_cli_command(args: CliArgs) {
     }
 }
 
-async fn handle_start_service(daemonize: bool, json: bool) {
+async fn handle_start_service(json: bool) {
     // First check if service is already running
     match zmq_client::send_command_to_service(Commands::Status, json).await {
         Ok(_) => {
@@ -113,62 +110,26 @@ async fn handle_start_service(daemonize: bool, json: bool) {
         return;
     }
     
-    // Start the service
+    // Start the service (always daemonized)
     let mut command = std::process::Command::new(&binary_path);
     
-    if daemonize {
-        // For daemonization, we could use nohup or implement proper daemonization
-        // For now, we'll start it in the background
-        command.stdout(std::process::Stdio::null())
-               .stderr(std::process::Stdio::null())
-               .stdin(std::process::Stdio::null());
-    }
+    // Always run as daemon - redirect output to null
+    command.stdout(std::process::Stdio::null())
+           .stderr(std::process::Stdio::null())
+           .stdin(std::process::Stdio::null());
     
     match command.spawn() {
-        Ok(mut child) => {
-            if daemonize {
-                // For daemonized mode, we don't wait for the child
-                if json {
-                    println!("{}", serde_json::json!({
-                        "status": "started", 
-                        "message": "Service started in background",
-                        "pid": child.id()
-                    }));
-                } else {
-                    println!("✓ Service started in background (PID: {})", child.id());
-                }
+        Ok(child) => {
+            // For daemonized mode, we don't wait for the child
+            if json {
+                println!("{}", serde_json::json!({
+                    "status": "started", 
+                    "message": "Service started as daemon",
+                    "pid": child.id()
+                }));
             } else {
-                if json {
-                    println!("{}", serde_json::json!({
-                        "status": "starting", 
-                        "message": "Service starting...",
-                        "pid": child.id()
-                    }));
-                } else {
-                    println!("✓ Service starting... (PID: {})", child.id());
-                    println!("Press Ctrl+C to stop the service");
-                }
-                
-                // Wait for the child process
-                match child.wait() {
-                    Ok(status) => {
-                        if json {
-                            println!("{}", serde_json::json!({
-                                "status": "exited", 
-                                "exit_code": status.code()
-                            }));
-                        } else {
-                            println!("Service exited with code: {:?}", status.code());
-                        }
-                    }
-                    Err(e) => {
-                        if json {
-                            println!("{}", serde_json::json!({"status": "error", "message": format!("Failed to wait for service: {}", e)}));
-                        } else {
-                            eprintln!("Error waiting for service: {}", e);
-                        }
-                    }
-                }
+                println!("✓ Service started as daemon (PID: {})", child.id());
+                println!("Logs are written to symphony-service.log");
             }
         }
         Err(e) => {

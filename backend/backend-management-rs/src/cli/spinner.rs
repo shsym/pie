@@ -1,7 +1,7 @@
 //! Pretty spinning wheel/loading indicator for CLI operations.
 
 use std::io::{self, Write};
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 
 /// A simple spinner utility for showing progress during long-running operations
 pub struct Spinner {

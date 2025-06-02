@@ -53,13 +53,13 @@ impl ZmqClient {
 
         // Determine timeout based on command type - model loading and installation need much longer
         let receive_timeout = if command.command == "load-model" {
-            Duration::from_secs(60) // 60 seconds for model loading
+            Duration::from_secs(300) // 300 seconds for model loading
         } else if command.command == "install-model" {
-            Duration::from_secs(600) // 10 minutes for model installation
+            Duration::from_secs(3600) // 60 minutes for model installation
         } else if command.command == "uninstall-model" {
-            Duration::from_secs(60) // 60 seconds for model uninstallation
+            Duration::from_secs(300) // 300 seconds for model uninstallation
         } else {
-            Duration::from_secs(10) // 10 seconds for other operations
+            Duration::from_secs(30) // 30 seconds for other operations
         };
 
         // Try to receive the response with appropriate timeout

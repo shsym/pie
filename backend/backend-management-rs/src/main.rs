@@ -10,8 +10,19 @@ use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing with file output to avoid terminal interference
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("symphony-service.log")
+        .expect("Failed to create log file");
+    
+    tracing_subscriber::fmt()
+        .with_writer(log_file)
+        .with_ansi(false)
+        .init();
+    
+    println!("Symphony Management Service starting... Logs will be written to symphony-management.log");
 
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
@@ -57,6 +68,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clean up any leftover IPC sockets from previous runs
     backend_management_rs::cleanup_all_symphony_sockets();
 
+    // Set up signal handling for the main process
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    
+    // Spawn signal handler task
+    let shutdown_tx_signal = shutdown_tx.clone();
+    tokio::spawn(async move {
+        setup_main_signal_handlers(shutdown_tx_signal).await;
+    });
+
     // Create and start the service
     match ManagementServiceImpl::create(config_path, backend_path) {
         Ok(mut service) => {
@@ -65,12 +85,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
             
-            // Keep the service running until shutdown signal
-            while service.is_running() {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Wait for either the service to stop naturally or a shutdown signal
+            tokio::select! {
+                _ = async {
+                    while service.is_running() {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                } => {
+                    // Service stopped naturally
+                }
+                _ = shutdown_rx.recv() => {
+                    // Received shutdown signal
+                    println!("Shutting down... (check symphony-management.log for details)");
+                    info!("Service shutdown detected, stopping...");
+                }
             }
             
-            info!("Service shutdown detected, stopping...");
+            // Ensure clean shutdown
             if let Err(e) = service.stop().await {
                 error!("Error during shutdown: {}", e);
             }
@@ -80,8 +111,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
-
+    
     Ok(())
+}
+
+async fn setup_main_signal_handlers(shutdown_tx: tokio::sync::mpsc::Sender<()>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
+    
+    tokio::select! {
+        _ = sigterm.recv() => {
+            println!("Received SIGTERM, shutting down...");
+            info!("Received SIGTERM, initiating graceful shutdown");
+            let _ = shutdown_tx.send(()).await;
+        }
+        _ = sigint.recv() => {
+            println!("Received SIGINT (Ctrl+C), shutting down...");
+            info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
+            let _ = shutdown_tx.send(()).await;
+        }
+    }
 }
 
 fn print_help() {
