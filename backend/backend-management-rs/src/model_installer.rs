@@ -4,11 +4,13 @@
 //! from HuggingFace Hub using the huggingface-cli download command.
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::collections::HashMap;
 use tokio::process::Command;
 use tracing::{info, warn, error};
 use serde::{Serialize, Deserialize};
+use regex::Regex;
 use crate::error::{ManagementError, Result};
-use crate::config::ModelInfo;
+use crate::config::{ModelInfo, ModelArchInfo};
 
 /// Information about an installed model with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +29,92 @@ pub struct InstalledModelInfo {
     pub architectures: Vec<String>,
     /// When the model was installed (ISO timestamp or UNIX timestamp)
     pub installed_at: Option<String>,
+}
+
+/// SafeTensors index file structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafeTensorsIndex {
+    /// Mapping from tensor name to SafeTensors file name
+    pub weight_map: HashMap<String, String>,
+    /// Metadata about the model (optional)
+    pub metadata: Option<SafeTensorsMetadata>,
+}
+
+/// SafeTensors metadata structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafeTensorsMetadata {
+    /// Total size of all tensors in bytes
+    pub total_size: u64,
+    /// Additional metadata fields
+    #[serde(flatten)]
+    pub additional: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Weight renaming rules configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeightRenamingRules {
+    /// Root name for the model (e.g., "model")
+    pub root: String,
+    /// List of renaming rules to apply
+    pub rules: Vec<RenamingRule>,
+    /// Optional metadata about the rules
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Individual renaming rule
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenamingRule {
+    /// Name/description of this rule
+    pub name: String,
+    /// Type of renaming rule
+    #[serde(flatten)]
+    pub rule_type: RenamingRuleType,
+    /// Whether this rule is enabled (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Types of renaming rules supported
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum RenamingRuleType {
+    /// Regular expression replacement
+    #[serde(rename = "regex")]
+    Regex {
+        /// Regex pattern to match
+        pattern: String,
+        /// Replacement string (can use capture groups like $1, $2)
+        replacement: String,
+    },
+    /// Direct string replacement
+    #[serde(rename = "direct")]
+    Direct {
+        /// Exact string to match
+        from: String,
+        /// String to replace with
+        to: String,
+    },
+    /// Prefix replacement
+    #[serde(rename = "prefix")]
+    Prefix {
+        /// Old prefix to remove
+        old_prefix: String,
+        /// New prefix to add
+        new_prefix: String,
+    },
+    /// Suffix replacement
+    #[serde(rename = "suffix")]
+    Suffix {
+        /// Old suffix to remove
+        old_suffix: String,
+        /// New suffix to add
+        new_suffix: String,
+    },
+}
+
+/// Default value for enabled field
+fn default_true() -> bool {
+    true
 }
 
 impl InstalledModelInfo {
@@ -366,45 +454,58 @@ impl ModelInstaller {
     async fn create_model_info_file(&self, model_name: &str, model_path: &Path) -> Result<()> {
         // Try to read config.json to get model details
         let config_path = model_path.join("config.json");
-        let (model_type, _architectures, _vocab_size) = if config_path.exists() {
+        // Read and encapsulate model architecture info
+        let (model_type, arch_info) = if config_path.exists() {
             match tokio::fs::read_to_string(&config_path).await {
-                Ok(config_content) => {
-                    match serde_json::from_str::<serde_json::Value>(&config_content) {
-                        Ok(config) => {
-                            let model_type = config.get("model_type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let architectures = config.get("architectures")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect::<Vec<_>>())
-                                .unwrap_or_default();
-                            let vocab_size = config.get("vocab_size")
-                                .and_then(|v| v.as_u64());
-                            (model_type, architectures, vocab_size)
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse config.json: {}", e);
-                            ("unknown".to_string(), Vec::new(), None)
-                        }
+                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(cfg) => {
+                        let model_type = cfg.get("model_type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                        let arch_info = ModelArchInfo {
+                            architectures: cfg.get("architectures").and_then(|v| v.as_array())
+                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default(),
+                            vocab_size: cfg.get("vocab_size").and_then(|v| v.as_u64()),
+                            hidden_size: cfg.get("hidden_size").and_then(|v| v.as_u64()),
+                            num_attention_heads: cfg.get("num_attention_heads").and_then(|v| v.as_u64()),
+                            num_hidden_layers: cfg.get("num_hidden_layers").and_then(|v| v.as_u64()),
+                            intermediate_size: cfg.get("intermediate_size").and_then(|v| v.as_u64()),
+                            hidden_act: cfg.get("hidden_act").and_then(|v| v.as_str().map(String::from)),
+                            hidden_dropout_prob: cfg.get("hidden_dropout_prob").and_then(|v| v.as_f64().map(|f| f as f32)),
+                            attention_probs_dropout_prob: cfg.get("attention_probs_dropout_prob").and_then(|v| v.as_f64().map(|f| f as f32)),
+                            max_position_embeddings: cfg.get("max_position_embeddings").and_then(|v| v.as_u64()),
+                            type_vocab_size: cfg.get("type_vocab_size").and_then(|v| v.as_u64()),
+                            layer_norm_eps: cfg.get("layer_norm_eps").and_then(|v| v.as_f64().map(|f| f as f32)),
+                            tie_word_embeddings: cfg.get("tie_word_embeddings").and_then(|v| v.as_bool()),
+                            bos_token_id: cfg.get("bos_token_id").and_then(|v| v.as_u64()),
+                            eos_token_id: cfg.get("eos_token_id").and_then(|v| if let Some(arr) = v.as_array() {
+                                    Some(arr.iter().filter_map(|e| e.as_u64()).collect())
+                                } else if let Some(id) = v.as_u64() {
+                                    Some(vec![id])
+                                } else { None }),
+                            pad_token_id: cfg.get("pad_token_id").and_then(|v| v.as_u64()),
+                            torch_dtype: cfg.get("torch_dtype").and_then(|v| v.as_str().map(String::from)),
+                        };
+                        (model_type, arch_info)
                     }
-                }
+                    Err(e) => {
+                        warn!("Failed to parse config.json: {}", e);
+                        ("unknown".to_string(), ModelArchInfo::default())
+                    }
+                },
                 Err(e) => {
                     warn!("Failed to read config.json: {}", e);
-                    ("unknown".to_string(), Vec::new(), None)
+                    ("unknown".to_string(), ModelArchInfo::default())
                 }
             }
         } else {
-            ("unknown".to_string(), Vec::new(), None)
+            ("unknown".to_string(), ModelArchInfo::default())
         };
 
         let model_info = ModelInfo {
-            name: model_name.split('/').last().unwrap_or(model_name).to_string(),
-            fullname: model_name.to_string(),
-            model_type,
-        };
+             name: model_name.split('/').last().unwrap_or(model_name).to_string(),
+             fullname: model_name.to_string(),
+             model_type,
+             arch_info,
+         };
 
         let info_file = model_path.join("symphony_model_info.json");
         let info_content = serde_json::to_string_pretty(&model_info)
@@ -694,5 +795,342 @@ impl ModelInstaller {
         }
 
         vec![]
+    }
+
+    /// Rename model layers according to weight_renaming.json rules
+    pub async fn rename_model_layers(&self, model_path: &Path) -> Result<()> {
+        info!("Starting layer renaming for model at: {}", model_path.display());
+
+        // Check if model.safetensors.index.json exists
+        let index_path = model_path.join("model.safetensors.index.json");
+        if !index_path.exists() {
+            return Err(ManagementError::Service {
+                message: "model.safetensors.index.json not found. This is required for layer renaming.".to_string()
+            });
+        }
+
+        // Check if weight_renaming.json exists
+        let renaming_rules_path = model_path.join("weight_renaming.json");
+        if !renaming_rules_path.exists() {
+            return Err(ManagementError::Service {
+                message: "weight_renaming.json not found. This file contains the layer renaming rules.".to_string()
+            });
+        }
+
+        // Load the renaming rules
+        let renaming_rules = self.load_renaming_rules(&renaming_rules_path).await?;
+        info!("Loaded {} renaming rules", renaming_rules.rules.len());
+
+        // Load the SafeTensors index
+        let safetensors_index = self.load_safetensors_index(&index_path).await?;
+        info!("Found {} SafeTensors files to process", safetensors_index.weight_map.len());
+
+        // Extract current layer names from all SafeTensors files
+        let current_layers = self.extract_all_layer_names(model_path, &safetensors_index).await?;
+        info!("Extracted {} layer names", current_layers.len());
+
+        // Apply renaming rules to generate new layer names
+        let layer_mapping = self.apply_renaming_rules(&current_layers, &renaming_rules)?;
+        info!("Generated {} layer name mappings", layer_mapping.len());
+
+        // Update SafeTensors files with new layer names
+        self.update_safetensors_files(model_path, &safetensors_index, &layer_mapping).await?;
+
+        // Update the index file with new layer names
+        self.update_safetensors_index(model_path, &safetensors_index, &layer_mapping).await?;
+
+        info!("Successfully completed layer renaming for model at: {}", model_path.display());
+        Ok(())
+    }
+
+    /// Load renaming rules from weight_renaming.json
+    async fn load_renaming_rules(&self, rules_path: &Path) -> Result<WeightRenamingRules> {
+        let content = tokio::fs::read_to_string(rules_path).await
+            .map_err(|e| ManagementError::Service {
+                message: format!("Failed to read weight_renaming.json: {}", e)
+            })?;
+
+        let rules: WeightRenamingRules = serde_json::from_str(&content)
+            .map_err(|e| ManagementError::Service {
+                message: format!("Failed to parse weight_renaming.json: {}", e)
+            })?;
+
+        Ok(rules)
+    }
+
+    /// Load SafeTensors index file
+    async fn load_safetensors_index(&self, index_path: &Path) -> Result<SafeTensorsIndex> {
+        let content = tokio::fs::read_to_string(index_path).await
+            .map_err(|e| ManagementError::Service {
+                message: format!("Failed to read model.safetensors.index.json: {}", e)
+            })?;
+
+        let index: SafeTensorsIndex = serde_json::from_str(&content)
+            .map_err(|e| ManagementError::Service {
+                message: format!("Failed to parse model.safetensors.index.json: {}", e)
+            })?;
+
+        Ok(index)
+    }
+
+    /// Extract all layer names from SafeTensors files
+    async fn extract_all_layer_names(&self, model_path: &Path, index: &SafeTensorsIndex) -> Result<Vec<String>> {
+        let mut all_layers = Vec::new();
+        let mut processed_files = std::collections::HashSet::new();
+
+        // Get unique SafeTensors file names
+        for file_name in index.weight_map.values() {
+            if processed_files.insert(file_name.clone()) {
+                let file_path = model_path.join(file_name);
+                let layers = self.extract_layer_names_from_file(&file_path).await?;
+                all_layers.extend(layers);
+            }
+        }
+
+        Ok(all_layers)
+    }
+
+    /// Extract layer names from a single SafeTensors file by reading only the header
+    async fn extract_layer_names_from_file(&self, file_path: &Path) -> Result<Vec<String>> {
+        let mut file = tokio::fs::File::open(file_path).await
+            .map_err(|e| ManagementError::Service {
+                message: format!("Failed to open SafeTensors file {}: {}", file_path.display(), e)
+            })?;
+
+        // Read the first 8 bytes to get header size
+        let mut size_bytes = [0u8; 8];
+        use tokio::io::AsyncReadExt;
+        file.read_exact(&mut size_bytes).await
+            .map_err(|e| ManagementError::Service {
+                message: format!("Failed to read header size from {}: {}", file_path.display(), e)
+            })?;
+
+        let header_size = u64::from_le_bytes(size_bytes);
+
+        // Read the header
+        let mut header_bytes = vec![0u8; header_size as usize];
+        file.read_exact(&mut header_bytes).await
+            .map_err(|e| ManagementError::Service {
+                message: format!("Failed to read header from {}: {}", file_path.display(), e)
+            })?;
+
+        // Parse header as JSON to extract tensor names
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+            .map_err(|e| ManagementError::Service {
+                message: format!("Failed to parse header JSON from {}: {}", file_path.display(), e)
+            })?;
+
+        let mut layer_names = Vec::new();
+        if let Some(obj) = header.as_object() {
+            for key in obj.keys() {
+                if key != "__metadata__" {
+                    layer_names.push(key.clone());
+                }
+            }
+        }
+
+        Ok(layer_names)
+    }
+
+    /// Apply renaming rules to current layer names
+    fn apply_renaming_rules(&self, current_layers: &[String], rules: &WeightRenamingRules) -> Result<HashMap<String, String>> {
+        let mut mapping = HashMap::new();
+
+        for layer_name in current_layers {
+            let new_name = self.apply_single_renaming_rule(layer_name, rules)?;
+            if new_name != *layer_name {
+                mapping.insert(layer_name.clone(), new_name);
+                info!("Mapping: {} -> {}", layer_name, mapping[layer_name]);
+            }
+        }
+
+        Ok(mapping)
+    }
+
+    /// Apply renaming rules to a single layer name
+    fn apply_single_renaming_rule(&self, layer_name: &str, rules: &WeightRenamingRules) -> Result<String> {
+        let mut result = layer_name.to_string();
+
+        for rule in &rules.rules {
+            if !rule.enabled {
+                continue;
+            }
+
+            match &rule.rule_type {
+                RenamingRuleType::Regex { pattern, replacement } => {
+                    let regex = Regex::new(pattern)
+                        .map_err(|e| ManagementError::Service {
+                            message: format!("Invalid regex pattern '{}': {}", pattern, e)
+                        })?;
+                    
+                    // Replace {root} placeholder in the replacement string
+                    let replacement_with_root = replacement.replace("{root}", &rules.root);
+                    result = regex.replace_all(&result, replacement_with_root.as_str()).to_string();
+                },
+                RenamingRuleType::Direct { from, to } => {
+                    if result == *from {
+                        // Replace {root} placeholder in the to string
+                        result = to.replace("{root}", &rules.root);
+                    }
+                },
+                RenamingRuleType::Prefix { old_prefix, new_prefix } => {
+                    if result.starts_with(old_prefix) {
+                        // Replace {root} placeholder in the new prefix
+                        let new_prefix_with_root = new_prefix.replace("{root}", &rules.root);
+                        result = format!("{}{}", new_prefix_with_root, &result[old_prefix.len()..]);
+                    }
+                },
+                RenamingRuleType::Suffix { old_suffix, new_suffix } => {
+                    if result.ends_with(old_suffix) {
+                        // Replace {root} placeholder in the new suffix
+                        let new_suffix_with_root = new_suffix.replace("{root}", &rules.root);
+                        result = format!("{}{}", &result[..result.len() - old_suffix.len()], new_suffix_with_root);
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Update SafeTensors files with new layer names
+    async fn update_safetensors_files(&self, model_path: &Path, index: &SafeTensorsIndex, mapping: &HashMap<String, String>) -> Result<()> {
+        let mut processed_files = std::collections::HashSet::new();
+
+        for file_name in index.weight_map.values() {
+            if processed_files.insert(file_name.clone()) {
+                let file_path = model_path.join(file_name);
+                self.update_single_safetensors_file(&file_path, mapping).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update a single SafeTensors file with new layer names
+    async fn update_single_safetensors_file(&self, file_path: &Path, mapping: &HashMap<String, String>) -> Result<()> {
+        info!("Updating SafeTensors file: {}", file_path.display());
+
+        // Read the file
+        let file_content = tokio::fs::read(file_path).await
+            .map_err(|e| ManagementError::Service {
+                message: format!("Failed to read SafeTensors file {}: {}", file_path.display(), e)
+            })?;
+
+        // Parse header size
+        if file_content.len() < 8 {
+            return Err(ManagementError::Service {
+                message: format!("SafeTensors file {} is too small", file_path.display())
+            });
+        }
+
+        let header_size = u64::from_le_bytes([
+            file_content[0], file_content[1], file_content[2], file_content[3],
+            file_content[4], file_content[5], file_content[6], file_content[7]
+        ]);
+
+        if file_content.len() < (8 + header_size as usize) {
+            return Err(ManagementError::Service {
+                message: format!("SafeTensors file {} has invalid header size", file_path.display())
+            });
+        }
+
+        // Extract and parse header
+        let header_bytes = &file_content[8..8 + header_size as usize];
+        let mut header: serde_json::Value = serde_json::from_slice(header_bytes)
+            .map_err(|e| ManagementError::Service {
+                message: format!("Failed to parse header from {}: {}", file_path.display(), e)
+            })?;
+
+        // Update layer names in header
+        let mut updated = false;
+        if let Some(obj) = header.as_object_mut() {
+            let keys_to_update: Vec<_> = obj.keys()
+                .filter(|k| *k != "__metadata__" && mapping.contains_key(*k))
+                .cloned()
+                .collect();
+
+            for old_key in keys_to_update {
+                if let Some(new_key) = mapping.get(&old_key) {
+                    if let Some(value) = obj.remove(&old_key) {
+                        obj.insert(new_key.clone(), value);
+                        updated = true;
+                        info!("Updated tensor name: {} -> {}", old_key, new_key);
+                    }
+                }
+            }
+        }
+
+        if updated {
+            // Serialize updated header
+            let new_header_bytes = serde_json::to_vec(&header)
+                .map_err(|e| ManagementError::Service {
+                    message: format!("Failed to serialize updated header: {}", e)
+                })?;
+
+            // Create new file content
+            let new_header_size = new_header_bytes.len() as u64;
+            let mut new_content = Vec::new();
+            
+            // Write new header size
+            new_content.extend_from_slice(&new_header_size.to_le_bytes());
+            
+            // Write new header
+            new_content.extend_from_slice(&new_header_bytes);
+            
+            // Write original tensor data
+            new_content.extend_from_slice(&file_content[8 + header_size as usize..]);
+
+            // Write updated file
+            tokio::fs::write(file_path, new_content).await
+                .map_err(|e| ManagementError::Service {
+                    message: format!("Failed to write updated SafeTensors file {}: {}", file_path.display(), e)
+                })?;
+
+            info!("Successfully updated SafeTensors file: {}", file_path.display());
+        } else {
+            info!("No updates needed for SafeTensors file: {}", file_path.display());
+        }
+
+        Ok(())
+    }
+
+    /// Update the SafeTensors index file with new layer names
+    async fn update_safetensors_index(&self, model_path: &Path, index: &SafeTensorsIndex, mapping: &HashMap<String, String>) -> Result<()> {
+        let mut updated_index = index.clone();
+        let mut updated = false;
+
+        // Update weight_map with new layer names
+        let weight_map_updates: Vec<_> = updated_index.weight_map.iter()
+            .filter_map(|(layer_name, file_name)| {
+                mapping.get(layer_name).map(|new_name| (layer_name.clone(), new_name.clone(), file_name.clone()))
+            })
+            .collect();
+
+        for (old_name, new_name, file_name) in weight_map_updates {
+            updated_index.weight_map.remove(&old_name);
+            updated_index.weight_map.insert(new_name.clone(), file_name);
+            updated = true;
+            info!("Updated index mapping: {} -> {}", old_name, new_name);
+        }
+
+        if updated {
+            let index_path = model_path.join("model.safetensors.index.json");
+            let updated_content = serde_json::to_string_pretty(&updated_index)
+                .map_err(|e| ManagementError::Service {
+                    message: format!("Failed to serialize updated index: {}", e)
+                })?;
+
+            tokio::fs::write(&index_path, updated_content).await
+                .map_err(|e| ManagementError::Service {
+                    message: format!("Failed to write updated index file: {}", e)
+                })?;
+
+            info!("Successfully updated SafeTensors index file");
+        } else {
+            info!("No updates needed for SafeTensors index file");
+        }
+
+        Ok(())
     }
 }

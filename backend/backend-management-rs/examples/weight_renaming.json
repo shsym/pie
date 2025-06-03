@@ -1,0 +1,115 @@
+{
+  "root": "model",
+  "metadata": {
+    "description": "Weight renaming rules for converting HuggingFace model layer names to Symphony format",
+    "version": "1.0",
+    "target_format": "Symphony standardized layer names"
+  },
+  "rules": [
+    {
+      "name": "Convert embedding layers",
+      "type": "regex",
+      "pattern": "^(model\\.)?embed_tokens\\.weight$",
+      "replacement": "{root}.embed_tokens.weight",
+      "enabled": true
+    },
+    {
+      "name": "Convert layer normalization",
+      "type": "regex", 
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.input_layernorm\\.weight$",
+      "replacement": "{root}.layers.$2.input_norm.weight",
+      "enabled": true
+    },
+    {
+      "name": "Convert attention projection layers",
+      "type": "regex",
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)\\.weight$",
+      "replacement": "{root}.layers.$2.self_attn.$3.weight",
+      "enabled": true
+    },
+    {
+      "name": "Convert fused QKV projection",
+      "type": "regex",
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.self_attn\\.qkv_proj\\.weight$", 
+      "replacement": "{root}.layers.$2.self_attn.qkv_proj.weight",
+      "enabled": true
+    },
+    {
+      "name": "Convert post attention norm",
+      "type": "regex",
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.post_attention_layernorm\\.weight$",
+      "replacement": "{root}.layers.$2.post_attention_norm.weight", 
+      "enabled": true
+    },
+    {
+      "name": "Convert MLP layers - down projection",
+      "type": "regex",
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.mlp\\.down_proj\\.weight$",
+      "replacement": "{root}.layers.$2.mlp.down_proj.weight",
+      "enabled": true
+    },
+    {
+      "name": "Convert MLP layers - gate projection", 
+      "type": "regex",
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.mlp\\.gate_proj\\.weight$",
+      "replacement": "{root}.layers.$2.mlp.gate_proj.weight",
+      "enabled": true
+    },
+    {
+      "name": "Convert MLP layers - up projection",
+      "type": "regex", 
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.mlp\\.up_proj\\.weight$",
+      "replacement": "{root}.layers.$2.mlp.up_proj.weight",
+      "enabled": true
+    },
+    {
+      "name": "Convert fused gate-up projection",
+      "type": "regex",
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.mlp\\.gate_up_proj\\.weight$",
+      "replacement": "{root}.layers.$2.mlp.gate_up_proj.weight", 
+      "enabled": true
+    },
+    {
+      "name": "Convert MoE expert layers - w1",
+      "type": "regex",
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.mlp\\.experts\\.(\\d+)\\.w1\\.weight$",
+      "replacement": "{root}.layers.$2.mlp.experts.$3.w1.weight",
+      "enabled": true
+    },
+    {
+      "name": "Convert MoE expert layers - w2", 
+      "type": "regex",
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.mlp\\.experts\\.(\\d+)\\.w2\\.weight$",
+      "replacement": "{root}.layers.$2.mlp.experts.$3.w2.weight",
+      "enabled": true
+    },
+    {
+      "name": "Convert final layer norm",
+      "type": "regex",
+      "pattern": "^(model\\.)?norm\\.weight$",
+      "replacement": "{root}.norm.weight",
+      "enabled": true
+    },
+    {
+      "name": "Convert language model head",
+      "type": "regex", 
+      "pattern": "^lm_head\\.weight$",
+      "replacement": "{root}.lm_head.weight",
+      "enabled": true
+    },
+    {
+      "name": "Handle alternative layer norm names",
+      "type": "regex",
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.ln_1\\.weight$",
+      "replacement": "{root}.layers.$2.input_norm.weight",
+      "enabled": true
+    },
+    {
+      "name": "Handle alternative post-attention norm names", 
+      "type": "regex",
+      "pattern": "^(model\\.)?layers\\.(\\d+)\\.ln_2\\.weight$", 
+      "replacement": "{root}.layers.$2.post_attention_norm.weight",
+      "enabled": true
+    }
+  ]
+}
