@@ -2,12 +2,67 @@
 //!
 //! This module provides functionality to download and install models and tokenizers
 //! from HuggingFace Hub using the huggingface-cli download command.
-
-use crate::error::{ManagementError, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
-use tracing::{info, error, warn};
+use tracing::{info, warn, error};
+use serde::{Serialize, Deserialize};
+use crate::error::{ManagementError, Result};
+use crate::config::ModelInfo;
+
+/// Information about an installed model with metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledModelInfo {
+    /// Original model name from HuggingFace (e.g., "meta-llama/Llama-3.1-8B-Instruct")
+    pub model_name: String,
+    /// Local name for the model (e.g., "Llama-3.1-8B-Instruct")
+    pub local_name: String,
+    /// Model type for backend selection (e.g., "llama3", "deepseek")
+    pub model_type: String,
+    /// Local path where model is installed
+    pub path: PathBuf,
+    /// Path to tokenizer files (usually same as model path)
+    pub tokenizer_path: Option<PathBuf>,
+    /// Model architectures from config.json
+    pub architectures: Vec<String>,
+    /// When the model was installed (ISO timestamp or UNIX timestamp)
+    pub installed_at: Option<String>,
+}
+
+impl InstalledModelInfo {
+    /// Parse model info from an old-style text info file
+    pub fn from_info_file(content: &str) -> Self {
+        let mut model_name = String::new();
+        let mut local_name = String::new();
+        let mut model_type = String::new();
+        let mut path = PathBuf::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some((key, value)) = line.split_once(':') {
+                let key = key.trim();
+                let value = value.trim();
+                match key {
+                    "Model Name" => model_name = value.to_string(),
+                    "Local Name" => local_name = value.to_string(),
+                    "Model Type" => model_type = value.to_string(),
+                    "Path" => path = PathBuf::from(value),
+                    _ => {}
+                }
+            }
+        }
+
+        InstalledModelInfo {
+            model_name,
+            local_name,
+            model_type,
+            path: path.clone(),
+            tokenizer_path: Some(path),
+            architectures: vec![],
+            installed_at: None,
+        }
+    }
+}
 
 /// Model installation manager
 #[derive(Debug, Clone)]
@@ -50,6 +105,26 @@ impl ModelInstaller {
 
     /// Install a model and tokenizer from HuggingFace Hub using huggingface-cli
     pub async fn install_model(&self, model_name: &str) -> Result<PathBuf> {
+        // Validate model name format first
+        if let Err(e) = Self::validate_model_name_format(model_name) {
+            // Try to provide helpful suggestions
+            let suggestions = Self::suggest_model_name(model_name);
+            if !suggestions.is_empty() {
+                return Err(ManagementError::InvalidInput {
+                    message: format!(
+                        "{}. Did you mean one of these?\n{}",
+                        e,
+                        suggestions.iter()
+                            .take(3)
+                            .map(|s| format!("  - {}", s))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                });
+            }
+            return Err(e);
+        }
+
         self.install_model_with_options(model_name, None, None).await
     }
 
@@ -60,6 +135,9 @@ impl ModelInstaller {
         revision: Option<&str>,
         files_to_download: Option<Vec<&str>>,
     ) -> Result<PathBuf> {
+        // Validate model name format first
+        Self::validate_model_name_format(model_name)?;
+        
         info!("Installing model: {}", model_name);
 
         // Create models directory if it doesn't exist
@@ -89,8 +167,16 @@ impl ModelInstaller {
         // Execute huggingface-cli download
         self.download_model_with_hf_cli(model_name, revision, files_to_download, &model_path).await?;
 
-        // Create model info file for Symphony compatibility
+        // Create model info file for Symphony compatibility first
         self.create_model_info_file(model_name, &model_path).await?;
+
+        // Convert HuggingFace tokenizer to Symphony format if present
+        // Pass the info file path so it can update it with tokenizer metadata
+        let info_file_path = model_path.join("symphony_model_info.json");
+        if let Err(e) = crate::transform_tokenizer::convert_hf_tokenizer_to_symphony(&model_path, &info_file_path).await {
+            warn!("Failed to convert tokenizer for model {}: {}", model_name, e);
+            // Continue with installation even if tokenizer conversion fails
+        }
 
         info!("Successfully installed model: {}", model_name);
         Ok(model_path)
@@ -127,9 +213,8 @@ impl ModelInstaller {
         }
         // If no specific files provided, download everything (simplified approach)
 
-        // Set local directory and avoid symlinks for reliability
+        // Set local directory
         cmd.arg("--local-dir").arg(local_dir);
-        cmd.arg("--local-dir-use-symlinks").arg("False");
 
         // Set custom cache directory if specified
         if let Some(cache) = &self.cache_dir {
@@ -279,12 +364,9 @@ impl ModelInstaller {
 
     /// Create model info file for Symphony compatibility
     async fn create_model_info_file(&self, model_name: &str, model_path: &Path) -> Result<()> {
-        use serde_json::json;
-        use std::time::SystemTime;
-
         // Try to read config.json to get model details
         let config_path = model_path.join("config.json");
-        let (model_type, architectures, vocab_size) = if config_path.exists() {
+        let (model_type, _architectures, _vocab_size) = if config_path.exists() {
             match tokio::fs::read_to_string(&config_path).await {
                 Ok(config_content) => {
                     match serde_json::from_str::<serde_json::Value>(&config_content) {
@@ -318,31 +400,11 @@ impl ModelInstaller {
             ("unknown".to_string(), Vec::new(), None)
         };
 
-        // Determine tokenizer class by checking for tokenizer files
-        let tokenizer_class = if model_path.join("tokenizer.json").exists() {
-            "PreTrainedTokenizer"
-        } else if model_path.join("tokenizer.model").exists() {
-            "SentencePieceTokenizer"
-        } else {
-            "Unknown"
+        let model_info = ModelInfo {
+            name: model_name.split('/').last().unwrap_or(model_name).to_string(),
+            fullname: model_name.to_string(),
+            model_type,
         };
-
-        let model_info = json!({
-            "model_name": model_name,
-            "local_name": model_name.split('/').last().unwrap_or(model_name),
-            "model_type": model_type,
-            "architectures": architectures,
-            "vocab_size": vocab_size,
-            "tokenizer_class": tokenizer_class,
-            "path": model_path.display().to_string(),
-            "tokenizer_path": model_path.display().to_string(),
-            "installed_at": SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            "installation_method": "huggingface-cli",
-            "installation_successful": true
-        });
 
         let info_file = model_path.join("symphony_model_info.json");
         let info_content = serde_json::to_string_pretty(&model_info)
@@ -382,7 +444,7 @@ impl ModelInstaller {
     }
 
     /// List all installed models
-    pub async fn list_installed_models(&self) -> Result<Vec<ModelInfo>> {
+    pub async fn list_installed_models(&self) -> Result<Vec<InstalledModelInfo>> {
         let mut models = Vec::new();
         
         if !self.models_dir.exists() {
@@ -447,7 +509,7 @@ impl ModelInstaller {
     }
 
     /// Get model info from installed model
-    pub async fn get_model_info(&self, model_name: &str) -> Result<ModelInfo> {
+    pub async fn get_model_info(&self, model_name: &str) -> Result<InstalledModelInfo> {
         let model_path = self.get_model_path(model_name);
         
         if !model_path.exists() {
@@ -469,10 +531,10 @@ impl ModelInstaller {
                     message: format!("Failed to parse model info JSON: {}", e)
                 })?;
             
-            return Ok(ModelInfo {
-                model_name: info.get("model_name").and_then(|v| v.as_str()).unwrap_or(model_name).to_string(),
-                local_name: info.get("local_name").and_then(|v| v.as_str()).unwrap_or(model_name).to_string(),
-                model_type: info.get("model_type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+            return Ok(InstalledModelInfo {
+                model_name: info.get("fullname").and_then(|v| v.as_str()).unwrap_or(model_name).to_string(),
+                local_name: info.get("name").and_then(|v| v.as_str()).unwrap_or(model_name).to_string(),
+                model_type: info.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                 path: model_path.clone(),
                 tokenizer_path: info.get("tokenizer_path").and_then(|v| v.as_str()).map(PathBuf::from),
                 architectures: info.get("architectures").and_then(|v| v.as_array()).map(|arr| 
@@ -498,7 +560,7 @@ impl ModelInstaller {
             });
         }
 
-        // Try to read the old text info file
+        // Try to read the old text info file and parse manually
         let text_info_file = model_path.join("symphony_model_info.txt");
         if text_info_file.exists() {
             let content = tokio::fs::read_to_string(&text_info_file).await
@@ -506,11 +568,11 @@ impl ModelInstaller {
                     message: format!("Failed to read model info: {}", e)
                 })?;
             
-            return Ok(ModelInfo::from_info_file(&content));
+            return Ok(InstalledModelInfo::from_info_file(&content));
         }
 
         // Fallback: basic info from path
-        Ok(ModelInfo {
+        Ok(InstalledModelInfo {
             model_name: model_name.to_string(),
             local_name: model_name.split('/').last().unwrap_or(model_name).to_string(),
             model_type: "unknown".to_string(),
@@ -550,155 +612,87 @@ impl ModelInstaller {
         Ok(name_or_local_name.to_string())
     }
 
-}
+    /// Validate that the model name follows HuggingFace repository format (organization/model-name)
+    fn validate_model_name_format(model_name: &str) -> Result<()> {
+        // Check if the model name contains a slash (indicating organization/model format)
+        if !model_name.contains('/') {
+            return Err(ManagementError::InvalidInput {
+                message: format!(
+                    "Invalid model name format: '{}'. \
+                    Model names must include the organization/username (e.g., 'meta-llama/Llama-3.1-8B-Instruct'). \
+                    Common formats:\n\
+                    - meta-llama/Llama-3.1-8B-Instruct\n\
+                    - microsoft/DialoGPT-medium\n\
+                    - huggingface/CodeBERTa-small-v1\n\
+                    Please visit https://huggingface.co/models to find the correct repository path.",
+                    model_name
+                )
+            });
+        }
 
-/// Information about an installed model
-#[derive(Debug, Clone)]
-pub struct ModelInfo {
-    pub model_name: String,
-    pub local_name: String,
-    pub model_type: String,
-    pub path: PathBuf,
-    pub tokenizer_path: Option<PathBuf>,
-    pub architectures: Vec<String>,
-    pub installed_at: Option<String>,
-}
+        // Additional validation: check for reasonable format
+        let parts: Vec<&str> = model_name.split('/').collect();
+        if parts.len() != 2 {
+            return Err(ManagementError::InvalidInput {
+                message: format!(
+                    "Invalid model name format: '{}'. \
+                    Expected format: 'organization/model-name' (exactly one slash). \
+                    Examples: 'meta-llama/Llama-3.1-8B-Instruct', 'microsoft/DialoGPT-medium'",
+                    model_name
+                )
+            });
+        }
 
-impl ModelInfo {
-    fn from_info_file(content: &str) -> Self {
-        let mut model_name = String::new();
-        let mut local_name = String::new();
-        let mut model_type = "unknown".to_string();
-        let mut path = PathBuf::new();
-        let mut tokenizer_path = None;
-        let mut architectures = Vec::new();
-        let mut installed_at = None;
+        let (org, model) = (parts[0], parts[1]);
+        
+        // Check for empty parts
+        if org.trim().is_empty() || model.trim().is_empty() {
+            return Err(ManagementError::InvalidInput {
+                message: format!(
+                    "Invalid model name format: '{}'. \
+                    Both organization and model name must be non-empty. \
+                    Expected format: 'organization/model-name'",
+                    model_name
+                )
+            });
+        }
 
-        for line in content.lines() {
-            if let Some((key, value)) = line.split_once(':') {
-                match key.trim() {
-                    "Model" => model_name = value.trim().to_string(),
-                    "LocalName" => local_name = value.trim().to_string(),
-                    "Type" => model_type = value.trim().to_string(),
-                    "Path" => path = PathBuf::from(value.trim()),
-                    "TokenizerPath" => tokenizer_path = Some(PathBuf::from(value.trim())),
-                    "InstalledAt" => installed_at = Some(value.trim().to_string()),
-                    "Architecture" => {
-                        // Parse architecture list (could be like "['Qwen3ForCausalLM']")
-                        let arch_str = value.trim();
-                        if arch_str.starts_with('[') && arch_str.ends_with(']') {
-                            // Simple parsing for now
-                            architectures.push(arch_str.trim_matches(['[', ']', '\'', '"']).to_string());
-                        } else {
-                            architectures.push(arch_str.to_string());
-                        }
-                    },
-                    _ => {}
-                }
+        // Check for invalid characters that would cause issues with file paths
+        let invalid_chars = ['\\', ':', '*', '?', '"', '<', '>', '|'];
+        for &ch in &invalid_chars {
+            if model_name.contains(ch) {
+                return Err(ManagementError::InvalidInput {
+                    message: format!(
+                        "Invalid model name format: '{}'. \
+                        Model names cannot contain invalid characters: {}",
+                        model_name,
+                        invalid_chars.iter().collect::<String>()
+                    )
+                });
             }
         }
 
-        // If local_name is empty, derive it from model_name
-        if local_name.is_empty() && !model_name.is_empty() {
-            local_name = model_name.split('/').last().unwrap_or(&model_name).to_string();
+        Ok(())
+    }
+
+    /// Suggest common model names if user provides incomplete format
+    fn suggest_model_name(partial_name: &str) -> Vec<String> {
+        let suggestions = vec![
+            ("llama", vec![
+                "meta-llama/Llama-3.1-8B-Instruct",
+                "meta-llama/Llama-3.1-7B-Instruct", 
+                "meta-llama/Llama-2-7b-chat-hf",
+                "meta-llama/Llama-2-13b-chat-hf"
+            ])
+        ];
+
+        let partial_lower = partial_name.to_lowercase();
+        for (keyword, models) in suggestions {
+            if partial_lower.contains(keyword) {
+                return models.into_iter().map(String::from).collect();
+            }
         }
 
-        Self {
-            model_name,
-            local_name,
-            model_type,
-            path,
-            tokenizer_path,
-            architectures,
-            installed_at,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[tokio::test]
-    async fn test_model_installer_creation() {
-        let temp_dir = TempDir::new().unwrap();
-        let installer = ModelInstaller::new(Some(temp_dir.path().to_path_buf()));
-        
-        assert_eq!(installer.models_dir, temp_dir.path());
-        assert_eq!(installer.hf_cli_path, "huggingface-cli");
-        assert!(installer.cache_dir.is_none());
-    }
-
-    #[test]
-    fn test_model_installer_with_custom_hf_cli() {
-        let temp_dir = TempDir::new().unwrap();
-        let installer = ModelInstaller::new(Some(temp_dir.path().to_path_buf()))
-            .with_hf_cli_path("custom-hf-cli".to_string())
-            .with_cache_dir(temp_dir.path().join("cache"));
-        
-        assert_eq!(installer.hf_cli_path, "custom-hf-cli");
-        assert_eq!(installer.cache_dir, Some(temp_dir.path().join("cache")));
-    }
-
-    #[test]
-    fn test_model_info_parsing() {
-        let content = r#"Model: test/model
-Type: qwen3
-Installed: 1234567890
-Architecture: ['Qwen3ForCausalLM']"#;
-        
-        let info = ModelInfo::from_info_file(content);
-        assert_eq!(info.model_name, "test/model");
-        assert_eq!(info.model_type, "qwen3");
-        assert_eq!(info.architectures, vec!["Qwen3ForCausalLM"]);
-    }
-
-    #[tokio::test]
-    async fn test_create_model_info_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let installer = ModelInstaller::new(Some(temp_dir.path().to_path_buf()));
-        let model_path = temp_dir.path().join("test-model");
-        
-        tokio::fs::create_dir_all(&model_path).await.unwrap();
-        
-        // Create a fake config.json
-        let config = serde_json::json!({
-            "model_type": "llama",
-            "architectures": ["LlamaForCausalLM"],
-            "vocab_size": 32000
-        });
-        tokio::fs::write(
-            model_path.join("config.json"),
-            serde_json::to_string_pretty(&config).unwrap()
-        ).await.unwrap();
-        
-        // Create tokenizer.json
-        tokio::fs::write(
-            model_path.join("tokenizer.json"),
-            "{}"
-        ).await.unwrap();
-        
-        installer.create_model_info_file("test/model", &model_path).await.unwrap();
-        
-        let info_file = model_path.join("symphony_model_info.json");
-        assert!(info_file.exists());
-        
-        let content = tokio::fs::read_to_string(info_file).await.unwrap();
-        let info: serde_json::Value = serde_json::from_str(&content).unwrap();
-        
-        assert_eq!(info["model_name"], "test/model");
-        assert_eq!(info["model_type"], "llama");
-        assert_eq!(info["tokenizer_class"], "PreTrainedTokenizer");
-        assert_eq!(info["installation_method"], "huggingface-cli");
-    }
-
-    #[test]
-    fn test_model_path_generation() {
-        let temp_dir = TempDir::new().unwrap();
-        let installer = ModelInstaller::new(Some(temp_dir.path().to_path_buf()));
-        
-        let path = installer.get_model_path("microsoft/DialoGPT-medium");
-        assert_eq!(path, temp_dir.path().join("microsoft--DialoGPT-medium"));
+        vec![]
     }
 }

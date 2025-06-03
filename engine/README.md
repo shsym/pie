@@ -21,3 +21,14 @@ Note that you first need to run the backend that is compatible with this server.
 ```bash
 cargo run --release -- openai_compat -H -p 8080 --dummy false
 ```
+
+## Testing
+- Tokenizer test (metadata and tokenizer loading)
+```bash
+cargo test --test tokenizer_integration_tests
+```
+
+- Demo version of the tokenizer with hand-coded metadata
+```bash
+cargo run --example tokenizer_demo
+```

@@ -34,6 +34,9 @@ pub enum ManagementError {
 
     #[error("Unknown model: {0}")]
     UnknownModel(String),
+
+    #[error("Invalid input: {message}")]
+    InvalidInput { message: String },
 }
 
 #[derive(Error, Debug)]

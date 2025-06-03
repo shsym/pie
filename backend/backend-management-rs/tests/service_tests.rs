@@ -24,6 +24,7 @@ mod model_instance_tests {
             "ipc:///tmp/test".to_string(),
             process,
             None,
+            vec!["l4m".to_string()],
         );
         
         assert_eq!(instance.model_name, "Llama-3.1-8B-Instruct");
@@ -41,6 +42,7 @@ mod model_instance_tests {
             "ipc:///tmp/test".to_string(),
             process,
             None,
+            vec!["l4m".to_string()],
         );
         
         // Process should be alive initially
@@ -63,6 +65,7 @@ mod model_instance_tests {
             "ipc:///tmp/test".to_string(),
             process,
             None,
+            vec!["l4m".to_string()],
         );
         
         // Process should be alive
@@ -86,6 +89,7 @@ mod model_instance_tests {
             "ipc:///tmp/test".to_string(),
             process,
             None,
+            vec!["l4m".to_string()],
         );
         
         assert_eq!(instance.get_process_id(), pid);
@@ -101,6 +105,7 @@ mod model_instance_tests {
             "ipc:///tmp/test".to_string(),
             process,
             Some(config_path.clone()),
+            vec!["l4m".to_string()],
         );
         
         assert_eq!(instance.config_path, Some(config_path));

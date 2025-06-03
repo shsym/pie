@@ -1,9 +1,38 @@
 use base64::{Engine as _, engine::general_purpose};
 use fancy_regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 pub type Rank = u32;
+
+// Structures for deserializing tokenizer metadata from symphony_model_info.json
+#[derive(Debug, Deserialize, Serialize)]
+struct AddedTokenInfo {
+    content: String,
+    #[serde(default)]
+    id: Option<u32>,
+    #[serde(default)]
+    special: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TokenizerMetadata {
+    model_type: String,
+    vocab_size: usize,
+    pre_tokenizer_pattern: Option<String>,
+    special_tokens: HashMap<String, u32>,
+    added_tokens: Vec<AddedTokenInfo>,
+    post_processor_type: Option<String>,
+    decoder_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SymphonyModelInfo {
+    tokenizer_path: Option<String>,
+    tokenizer_metadata: Option<TokenizerMetadata>,
+    // ... other fields can be added as needed
+}
 
 // The code below is copied from the tiktoken.
 // https://github.com/openai/tiktoken/blob/main/src/lib.rs
@@ -191,15 +220,17 @@ impl BytePairEncoder {
         encoder: HashMap<Vec<u8>, Rank>,
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
-    ) -> Self {
-        let regex = Regex::new(pattern).unwrap();
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let regex = Regex::new(pattern)
+            .map_err(|e| format!("Failed to compile regex pattern '{}': {}", pattern, e))?;
 
         let special_regex = {
             let parts = special_tokens_encoder
                 .keys()
                 .map(|s| fancy_regex::escape(s))
                 .collect::<Vec<_>>();
-            Regex::new(&parts.join("|")).unwrap()
+            Regex::new(&parts.join("|"))
+                .map_err(|e| format!("Failed to compile special tokens regex: {}", e))?
         };
 
         let decoder: HashMap<Rank, Vec<u8>> =
@@ -220,7 +251,7 @@ impl BytePairEncoder {
         let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
         sorted_token_bytes.sort();
 
-        Self {
+        Ok(Self {
             encoder,
             special_tokens_encoder,
             decoder,
@@ -228,7 +259,7 @@ impl BytePairEncoder {
             regex,
             special_regex,
             sorted_token_bytes,
-        }
+        })
     }
 
     pub fn special_tokens(&self) -> HashSet<&str> {
@@ -294,52 +325,115 @@ fn load_merge_rules(path: &str) -> Result<HashMap<Vec<u8>, Rank>, Box<dyn std::e
 }
 
 // https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py
-pub fn llama3_tokenizer(path: &str) -> Result<BytePairEncoder, Box<dyn std::error::Error>> {
-    // Example usage
-    let mergeable_ranks = load_merge_rules(path)?;
-    let special_tokens = vec![
-        "<|begin_of_text|>",
-        "<|end_of_text|>",
-        "<|reserved_special_token_0|>",
-        "<|reserved_special_token_1|>",
-        "<|reserved_special_token_2|>",
-        "<|reserved_special_token_3|>",
-        "<|start_header_id|>",
-        "<|end_header_id|>",
-        "<|reserved_special_token_4|>",
-        "<|eot_id|>",
-    ];
-    let pattern = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// Create a configurable tokenizer using metadata from symphony_model_info.json
+pub fn configurable_tokenizer(
+    tokenizer_model_path: &str,
+    metadata: &TokenizerMetadata,
+) -> Result<BytePairEncoder, Box<dyn std::error::Error>> {
+    let mergeable_ranks = load_merge_rules(tokenizer_model_path)?;
 
-    let num_base_tokens = mergeable_ranks.len() as Rank;
+    // Require a valid pre-tokenizer pattern from metadata
+    let pattern = metadata.pre_tokenizer_pattern
+        .as_deref()
+        .ok_or("No pre_tokenizer_pattern found in model metadata file")?;
 
-    let special_tokens_encoder: HashMap<String, Rank> = special_tokens
-        .into_iter()
-        .enumerate()
-        .map(|(i, s)| (s.to_string(), num_base_tokens + i as Rank))
-        .collect();
+    // Validate the regex pattern from metadata
+    fancy_regex::Regex::new(pattern)
+        .map_err(|e| format!("Invalid regex pattern in model metadata file: '{}' - {}", pattern, e))?;
 
-    let encoder = BytePairEncoder::new(mergeable_ranks, special_tokens_encoder, pattern);
-    // [9906, 11, 856, 5679, 374, 19369]
-    // encode text
-    //let text = "Hello, my dog is cute";
-    //let tokens = encoder.encode_with_special_tokens(text);
-    //println!("Encoded tokens: {:?}", tokens);
 
+    println!("Using tokenizer pattern: {}", pattern);
+
+    // Create special tokens encoder from metadata
+    let mut special_tokens_encoder = HashMap::new();
+
+    // Add special tokens from the special_tokens map
+    for (token, id) in &metadata.special_tokens {
+        special_tokens_encoder.insert(token.clone(), *id);
+    }
+
+    // Add special tokens from added_tokens list (if they have IDs)
+    for added_token in &metadata.added_tokens {
+        if added_token.special {
+            if let Some(id) = added_token.id {
+                special_tokens_encoder.insert(added_token.content.clone(), id);
+            } else {
+                // For added tokens without explicit IDs, assign them after the base vocabulary
+                let next_id = mergeable_ranks.len() as Rank + special_tokens_encoder.len() as Rank;
+                special_tokens_encoder.insert(added_token.content.clone(), next_id);
+            }
+        }
+    }
+
+    // If no special tokens were found in metadata, fall back to hardcoded Llama3 tokens
+    if special_tokens_encoder.is_empty() {
+        println!("No special tokens found in metadata, falling back to default Llama3 tokens");
+        let default_special_tokens = vec![
+            "<|begin_of_text|>",
+            "<|end_of_text|>",
+            "<|reserved_special_token_0|>",
+            "<|reserved_special_token_1|>",
+            "<|reserved_special_token_2|>",
+            "<|reserved_special_token_3|>",
+            "<|start_header_id|>",
+            "<|end_header_id|>",
+            "<|reserved_special_token_4|>",
+            "<|eot_id|>",
+        ];
+
+        let num_base_tokens = mergeable_ranks.len() as Rank;
+        special_tokens_encoder = default_special_tokens
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| (s.to_string(), num_base_tokens + i as Rank))
+            .collect();
+    }
+
+    println!("Created tokenizer with {} base tokens and {} special tokens",
+             mergeable_ranks.len(), special_tokens_encoder.len());
+
+    let encoder = BytePairEncoder::new(mergeable_ranks, special_tokens_encoder, pattern)?;
     Ok(encoder)
+}
+
+/// Legacy tokenizer function for backward compatibility
+pub fn llama3_tokenizer(path: &str) -> Result<BytePairEncoder, Box<dyn std::error::Error>> {
+    // Create default metadata for legacy calls
+    let default_metadata = TokenizerMetadata {
+        model_type: "BPE".to_string(),
+        vocab_size: 0, // Will be determined from merge rules
+        pre_tokenizer_pattern: Some(r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+".to_string()),
+        special_tokens: HashMap::new(),
+        added_tokens: vec![
+            AddedTokenInfo { content: "<|begin_of_text|>".to_string(), id: None, special: true },
+            AddedTokenInfo { content: "<|end_of_text|>".to_string(), id: None, special: true },
+            AddedTokenInfo { content: "<|reserved_special_token_0|>".to_string(), id: None, special: true },
+            AddedTokenInfo { content: "<|reserved_special_token_1|>".to_string(), id: None, special: true },
+            AddedTokenInfo { content: "<|reserved_special_token_2|>".to_string(), id: None, special: true },
+            AddedTokenInfo { content: "<|reserved_special_token_3|>".to_string(), id: None, special: true },
+            AddedTokenInfo { content: "<|start_header_id|>".to_string(), id: None, special: true },
+            AddedTokenInfo { content: "<|end_header_id|>".to_string(), id: None, special: true },
+            AddedTokenInfo { content: "<|reserved_special_token_4|>".to_string(), id: None, special: true },
+            AddedTokenInfo { content: "<|eot_id|>".to_string(), id: None, special: true },
+        ],
+        post_processor_type: None,
+        decoder_type: None,
+    };
+
+    configurable_tokenizer(path, &default_metadata)
 }
 
 /// Recursively search for tokenizer.model in a directory and its subdirectories
 fn find_tokenizer_model_recursive(dir_path: &str) -> Result<String, Box<dyn std::error::Error>> {
     use std::fs;
-    
+
     fn search_dir(dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
         // Check if tokenizer.model exists in current directory
         let tokenizer_model = dir.join("tokenizer.model");
         if tokenizer_model.exists() {
             return Ok(tokenizer_model.to_string_lossy().to_string());
         }
-        
+
         // Recursively search subdirectories
         if dir.is_dir() {
             for entry in fs::read_dir(dir)? {
@@ -352,10 +446,10 @@ fn find_tokenizer_model_recursive(dir_path: &str) -> Result<String, Box<dyn std:
                 }
             }
         }
-        
+
         Err("tokenizer.model not found".into())
     }
-    
+
     search_dir(Path::new(dir_path))
 }
 
@@ -364,23 +458,61 @@ fn find_tokenizer_model_recursive(dir_path: &str) -> Result<String, Box<dyn std:
 pub fn load_symphony_tokenizer(model_path: &str) -> Result<BytePairEncoder, Box<dyn std::error::Error>> {
     let model_dir = Path::new(model_path);
 
-    // First, try to read Symphony model metadata for precise tokenizer path
+    // First, try to read Symphony model metadata for precise tokenizer path and configuration
     let json_info = model_dir.join("symphony_model_info.json");
     if json_info.exists() {
         let content = std::fs::read_to_string(&json_info)?;
-        let info: serde_json::Value = serde_json::from_str(&content)?;
+        let info: SymphonyModelInfo = serde_json::from_str(&content)?;
 
-        if let Some(tokenizer_path) = info.get("tokenizer_path").and_then(|p| p.as_str()) {
-            println!("Loading tokenizer from Symphony metadata: {}", tokenizer_path);
+        // If we have tokenizer metadata, use the configurable tokenizer
+        if let Some(metadata) = &info.tokenizer_metadata {
+            println!("Found tokenizer metadata in Symphony model info");
+
+            // Try to find the tokenizer.model file
+            let mut tokenizer_model_path = None;
+
+            // First check if explicit tokenizer_path is provided
+            if let Some(tokenizer_path) = &info.tokenizer_path {
+                let tokenizer_dir = Path::new(tokenizer_path);
+                let tokenizer_model = tokenizer_dir.join("tokenizer.model");
+                if tokenizer_model.exists() {
+                    tokenizer_model_path = Some(tokenizer_model.to_string_lossy().to_string());
+                } else if let Ok(found_tokenizer) = find_tokenizer_model_recursive(tokenizer_path) {
+                    tokenizer_model_path = Some(found_tokenizer);
+                }
+            }
+
+            // If not found via explicit path, search in model directory
+            if tokenizer_model_path.is_none() {
+                let tokenizer_model = model_dir.join("tokenizer.model");
+                if tokenizer_model.exists() {
+                    tokenizer_model_path = Some(tokenizer_model.to_string_lossy().to_string());
+                } else if let Ok(found_tokenizer) = find_tokenizer_model_recursive(model_path) {
+                    tokenizer_model_path = Some(found_tokenizer);
+                }
+            }
+
+            if let Some(path) = tokenizer_model_path {
+                println!("Loading configurable tokenizer from: {}", path);
+                println!("Model type: {}, Vocab size: {}", metadata.model_type, metadata.vocab_size);
+                return configurable_tokenizer(&path, metadata);
+            } else {
+                println!("Warning: tokenizer metadata found but tokenizer.model file not found");
+            }
+        }
+
+        // Fallback to legacy loading if tokenizer_path exists but no metadata
+        if let Some(tokenizer_path) = &info.tokenizer_path {
+            println!("Loading tokenizer from Symphony metadata (legacy mode): {}", tokenizer_path);
             let tokenizer_dir = Path::new(tokenizer_path);
-            
+
             // Check for tokenizer.model in the specified path
             let tokenizer_model = tokenizer_dir.join("tokenizer.model");
             if tokenizer_model.exists() {
                 println!("Found tokenizer.model at specified path, attempting to load as SentencePiece/Llama tokenizer");
                 return llama3_tokenizer(tokenizer_model.to_str().unwrap());
             }
-            
+
             // If not found directly, search recursively in the tokenizer path
             if let Ok(found_tokenizer) = find_tokenizer_model_recursive(tokenizer_path) {
                 println!("Found tokenizer.model in subdirectory: {}", found_tokenizer);

@@ -68,6 +68,7 @@ mod process_management_integration_tests {
             "ipc:///tmp/test-lifecycle".to_string(),
             process,
             None,
+            vec!["l4m".to_string()],
         );
         
         // Process should be alive initially
@@ -95,6 +96,7 @@ mod process_management_integration_tests {
                 format!("ipc:///tmp/test-{}", i),
                 process,
                 None,
+                vec!["l4m".to_string()],
             );
             instances.push(instance);
         }
@@ -128,6 +130,7 @@ mod process_management_integration_tests {
                 "ipc:///tmp/test-cleanup".to_string(),
                 process,
                 None,
+                vec!["l4m".to_string()],
             );
             
             assert!(instance.is_alive());
@@ -436,6 +439,7 @@ mod lifecycle_integration_tests {
                 format!("ipc:///tmp/test-shutdown-{}", i),
                 process,
                 None,
+                vec!["l4m".to_string()],
             );
             instances.push(instance);
         }

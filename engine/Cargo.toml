@@ -35,3 +35,7 @@ backend-management-rs = { path = "../backend/backend-management-rs" }
 [build-dependencies]
 prost-build = "0.13.5"
 
+[[test]]
+name = "tokenizer_integration_tests"
+path = "tests/tokenizer_integration_tests.rs"
+
