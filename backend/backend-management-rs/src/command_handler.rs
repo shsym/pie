@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use tracing::{info, warn, error, debug};
 
 use crate::{ManagementServiceImpl, Result};
+use crate::error::ManagementError;
 use crate::types::{ManagementCommand, ManagementResponse, ModelInstance};
 use crate::{process_manager, model_installer};
 
@@ -29,6 +30,7 @@ impl ManagementServiceImpl {
             "list-models" => Self::handle_list_models_command(command, model_instances, model_installer).await,
             "install-model" => Self::handle_install_model_command(command, model_installer).await,
             "uninstall-model" => Self::handle_uninstall_model_command(command, model_installer).await,
+            "transform-model" => Self::handle_transform_model_command(command, model_installer).await,
             _ => {
                 warn!("Unknown command: {}", command.command);
                 ManagementResponse::error(
@@ -300,12 +302,12 @@ impl ManagementServiceImpl {
     /// Install a model from HuggingFace Hub using transformers
     async fn install_model_from_hf(
         model_installer: &model_installer::ModelInstaller,
-        model_name: &str, 
-        local_name: &str, 
+        model_name: &str,
+        local_name: &str,
         force: bool
     ) -> Result<serde_json::Value> {
         info!("Installing model '{}' from HuggingFace Hub as '{}'", model_name, local_name);
-        
+
         // Check if model is already installed (unless force is true)
         if !force && model_installer.is_model_installed(model_name).await {
             let model_info = model_installer.get_model_info(model_name).await?;
@@ -317,13 +319,13 @@ impl ManagementServiceImpl {
                 "model_type": model_info.model_type
             }));
         }
-        
+
         // Install the model
         let model_path = model_installer.install_model(model_name).await?;
         let model_info = model_installer.get_model_info(model_name).await?;
-        
+
         info!("Successfully installed model '{}' to {:?}", model_name, model_path);
-        
+
         Ok(serde_json::json!({
             "status": "installed",
             "model_name": model_name,
@@ -341,10 +343,10 @@ impl ManagementServiceImpl {
         _force: bool
     ) -> Result<serde_json::Value> {
         info!("Uninstalling model '{}' from local storage", model_name);
-        
+
         // Resolve the model name (in case user provided local name instead of original name)
         let resolved_name = model_installer.resolve_model_name(model_name).await?;
-        
+
         // Check if model is installed
         if !model_installer.is_model_installed(&resolved_name).await {
             return Ok(serde_json::json!({
@@ -353,21 +355,196 @@ impl ManagementServiceImpl {
                 "message": format!("Model '{}' is not installed", model_name)
             }));
         }
-        
+
         // TODO: Check if model is currently loaded and handle force flag
         // For now, we'll proceed with uninstallation
-        
+
         // Uninstall the model using the resolved name
         let removed_path = model_installer.uninstall_model(&resolved_name).await?;
-        
+
         info!("Successfully uninstalled model '{}' (resolved as '{}') from {:?}", model_name, resolved_name, removed_path);
-        
+
         Ok(serde_json::json!({
             "status": "uninstalled",
             "model_name": model_name,
             "resolved_name": resolved_name,
             "path": removed_path,
             "message": format!("Model '{}' uninstalled successfully", model_name)
+        }))
+    }
+
+    /// Handle transform-model command
+    async fn handle_transform_model_command(
+        command: ManagementCommand,
+        model_installer: &model_installer::ModelInstaller,
+    ) -> ManagementResponse {
+        let model_name = command.params.get("model_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        if model_name.is_empty() {
+            return ManagementResponse::error(
+                command.correlation_id.clone(),
+                "Missing model_name parameter".to_string()
+            );
+        }
+
+        let force = command.params.get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Transform the model (index and model transformations)
+        match Self::transform_installed_model(model_installer, model_name, force).await {
+            Ok(transformation_info) => {
+                ManagementResponse::success(
+                    command.correlation_id.clone(),
+                    Some(transformation_info)
+                )
+            }
+            Err(e) => {
+                ManagementResponse::error(
+                    command.correlation_id.clone(),
+                    format!("Failed to transform model: {}", e)
+                )
+            }
+        }
+    }
+
+    /// Transform an installed model by running index and model transformations
+    async fn transform_installed_model(
+        model_installer: &model_installer::ModelInstaller,
+        model_name: &str,
+        force: bool
+    ) -> Result<serde_json::Value> {
+        use crate::transform_models::ModelTransformer;
+        use crate::transform_tokenizer;
+
+        info!("Starting transformation for model: {}", model_name);
+
+        // First, check if the model is installed
+        let installed_models = model_installer.list_installed_models().await?;
+        let model_info = installed_models.iter()
+            .find(|m| m.model_name == model_name || m.local_name == model_name)
+            .ok_or_else(|| ManagementError::Service {
+                message: format!("Model '{}' is not installed", model_name)
+            })?;
+
+        let model_path = std::path::Path::new(&model_info.path);
+        info!("Transforming model at path: {}", model_path.display());
+
+        let mut transformation_results = Vec::new();
+
+        // 1. Transform tokenizer if needed (convert HF tokenizer to Symphony format)
+        let tokenizer_json_path = model_path.join("tokenizer.json");
+        let tokenizer_model_path = model_path.join("tokenizer.model");
+        let info_file_path = model_path.join("symphony_model_info.json");
+
+        if tokenizer_json_path.exists() && (!tokenizer_model_path.exists() || force) {
+            info!("Converting HuggingFace tokenizer to Symphony format");
+            match transform_tokenizer::convert_hf_tokenizer_to_symphony(&model_path, &info_file_path).await {
+                Ok(()) => {
+                    transformation_results.push(serde_json::json!({
+                        "type": "tokenizer_conversion",
+                        "status": "success",
+                        "message": "Successfully converted HuggingFace tokenizer to Symphony format"
+                    }));
+                    info!("Tokenizer conversion completed successfully");
+                }
+                Err(e) => {
+                    warn!("Failed to convert tokenizer: {}", e);
+                    transformation_results.push(serde_json::json!({
+                        "type": "tokenizer_conversion",
+                        "status": "failed",
+                        "error": format!("Failed to convert tokenizer: {}", e)
+                    }));
+                }
+            }
+        } else if tokenizer_model_path.exists() && !force {
+            transformation_results.push(serde_json::json!({
+                "type": "tokenizer_conversion",
+                "status": "skipped",
+                "message": "Tokenizer already converted (use --force to reconvert)"
+            }));
+        } else {
+            transformation_results.push(serde_json::json!({
+                "type": "tokenizer_conversion",
+                "status": "skipped",
+                "message": "No HuggingFace tokenizer.json found"
+            }));
+        }
+
+        // 2. Transform model layers if weight renaming rules exist
+        let weight_renaming_path = model_path.join("weight_renaming.json");
+        let safetensors_index_path = model_path.join("model.safetensors.index.json");
+
+        if weight_renaming_path.exists() && safetensors_index_path.exists() {
+            info!("Applying weight renaming transformations");
+            match ModelTransformer::rename_model_layers(&model_path).await {
+                Ok(()) => {
+                    transformation_results.push(serde_json::json!({
+                        "type": "layer_renaming",
+                        "status": "success",
+                        "message": "Successfully renamed model layers according to weight_renaming.json"
+                    }));
+                    info!("Layer renaming completed successfully");
+                }
+                Err(e) => {
+                    warn!("Failed to rename model layers: {}", e);
+                    transformation_results.push(serde_json::json!({
+                        "type": "layer_renaming",
+                        "status": "failed",
+                        "error": format!("Failed to rename model layers: {}", e)
+                    }));
+                }
+            }
+        } else {
+            let missing_files = vec![
+                (!weight_renaming_path.exists()).then(|| "weight_renaming.json"),
+                (!safetensors_index_path.exists()).then(|| "model.safetensors.index.json"),
+            ].into_iter().flatten().collect::<Vec<_>>();
+
+            if !missing_files.is_empty() {
+                transformation_results.push(serde_json::json!({
+                    "type": "layer_renaming",
+                    "status": "skipped",
+                    "message": format!("Layer renaming skipped: missing files: {}", missing_files.join(", "))
+                }));
+            }
+        }
+
+        // 3. Update model metadata if info file doesn't exist
+        if !info_file_path.exists() {
+            info!("Creating model metadata file");
+            if let Err(e) = model_installer.create_model_info_file(&model_info.model_name, &model_path).await {
+                warn!("Failed to create model info file: {}", e);
+                transformation_results.push(serde_json::json!({
+                    "type": "metadata_creation",
+                    "status": "failed",
+                    "error": format!("Failed to create model metadata: {}", e)
+                }));
+            } else {
+                transformation_results.push(serde_json::json!({
+                    "type": "metadata_creation",
+                    "status": "success",
+                    "message": "Created Symphony model metadata file"
+                }));
+            }
+        } else {
+            transformation_results.push(serde_json::json!({
+                "type": "metadata_creation",
+                "status": "skipped",
+                "message": "Model metadata file already exists"
+            }));
+        }
+
+        info!("Model transformation completed for: {}", model_name);
+
+        Ok(serde_json::json!({
+            "status": "transformed",
+            "model_name": model_name,
+            "path": model_path,
+            "transformations": transformation_results,
+            "message": format!("Model '{}' transformation completed", model_name)
         }))
     }
 }

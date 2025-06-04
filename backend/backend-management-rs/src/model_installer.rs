@@ -363,7 +363,7 @@ impl ModelInstaller {
     }
 
     /// Create model info file for Symphony compatibility
-    async fn create_model_info_file(&self, model_name: &str, model_path: &Path) -> Result<()> {
+    pub async fn create_model_info_file(&self, model_name: &str, model_path: &Path) -> Result<()> {
         // Try to read config.json to get model details
         let config_path = model_path.join("config.json");
         // Read and encapsulate model architecture info
