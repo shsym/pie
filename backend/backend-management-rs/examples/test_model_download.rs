@@ -1,5 +1,5 @@
 use backend_management_rs::model_installer::ModelInstaller;
-use std::path::PathBuf;
+use backend_management_rs::path_utils::expand_home_dir_str;
 use tempfile::TempDir;
 
 #[tokio::main]
@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create model installer with custom huggingface-cli path
     let installer = ModelInstaller::new(Some(temp_dir.path().to_path_buf()))
-        .with_hf_cli_path("/home/sslee/Workspace/symphony/.venv/bin/huggingface-cli".to_string());
+        .with_hf_cli_path(expand_home_dir_str("~/Workspace/symphony/.venv/bin/huggingface-cli"));
 
     // Test downloading a very small model
     let model_name = "gpt2"; // This is a small model that should download quickly

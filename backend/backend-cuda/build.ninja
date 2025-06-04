@@ -28,16 +28,17 @@ rule cu_compile
 
 # Rule to link object files into the final executable
 rule link
-  command = $nvcc $cxxflags $in -o $out
+  command = $nvcc $cxxflags $in -o $out -lcublas -lcublasLt
   description = Linking $out
 
 # Build edges
 
 # Object files
+build $build_dir/l4ma.o: cu_compile $src_dir/l4ma.cu
 build $build_dir/main.o: cu_compile $src_dir/main.cu
 
 # Executable
-build $bin_dir/cuda_app: link $build_dir/main.o
+build $bin_dir/cuda_app: link $build_dir/main.o $build_dir/l4ma.o
 
 # Default target: builds the executable
 default $bin_dir/cuda_app

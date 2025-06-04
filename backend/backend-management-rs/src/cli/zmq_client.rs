@@ -16,7 +16,7 @@ pub struct ZmqClient {
 impl ZmqClient {
     pub async fn new(service_endpoint: &str) -> Result<Self, String> {
         let mut socket = DealerSocket::new();
-        
+
         // Connect to the service with timeout
         match timeout(Duration::from_secs(3), socket.connect(service_endpoint)).await {
             Ok(Ok(())) => {},
@@ -27,10 +27,10 @@ impl ZmqClient {
                 return Err(format!("Timeout: Could not connect to service at {} (is the service running?)", service_endpoint));
             }
         }
-        
-        Ok(Self { 
-            socket, 
-            endpoint: service_endpoint.to_string() 
+
+        Ok(Self {
+            socket,
+            endpoint: service_endpoint.to_string()
         })
     }
 
@@ -58,6 +58,8 @@ impl ZmqClient {
             Duration::from_secs(3600) // 60 minutes for model installation
         } else if command.command == "uninstall-model" {
             Duration::from_secs(300) // 300 seconds for model uninstallation
+        } else if command.command == "transform-model" {
+            Duration::from_secs(1800) // 30 minutes for model transformation
         } else {
             Duration::from_secs(30) // 30 seconds for other operations
         };
@@ -77,13 +79,15 @@ impl ZmqClient {
             },
             Err(_) => {
                 let timeout_msg = if command.command == "load-model" {
-                    "Timeout: Model loading took longer than 60 seconds"
+                    "Timeout: Model loading took longer than 5 minutes"
                 } else if command.command == "install-model" {
-                    "Timeout: Model installation took longer than 10 minutes"
+                    "Timeout: Model installation took longer than 60 minutes"
                 } else if command.command == "uninstall-model" {
-                    "Timeout: Model uninstallation took longer than 60 seconds"
+                    "Timeout: Model uninstallation took longer than 5 minutes"
+                } else if command.command == "transform-model" {
+                    "Timeout: Model transformation took longer than 30 minutes"
                 } else {
-                    "Timeout: No response from service within 10 seconds"
+                    "Timeout: No response from service within 30 seconds"
                 };
                 Err(format!("{} (endpoint: {})", timeout_msg, self.endpoint))
             }
@@ -96,7 +100,7 @@ fn get_service_endpoint() -> String {
     if let Ok(config) = Config::load_default() {
         return config.endpoints.cli_management.clone();
     }
-    
+
     // Fall back to default IPC endpoint (not TCP)
     "ipc:///tmp/symphony-cli".to_string()
 }
@@ -139,6 +143,12 @@ pub async fn send_command_to_service(command_enum: Commands, json: bool) -> Resu
             params.insert("model_name".to_string(), serde_json::Value::String(model_name.clone()));
             params.insert("force".to_string(), serde_json::Value::Bool(*force));
             ManagementCommand::new("uninstall-model".to_string(), params)
+        }
+        Commands::TransformModel { model_name, force } => {
+            let mut params = HashMap::new();
+            params.insert("model_name".to_string(), serde_json::Value::String(model_name.clone()));
+            params.insert("force".to_string(), serde_json::Value::Bool(*force));
+            ManagementCommand::new("transform-model".to_string(), params)
         }
         Commands::StopService => ManagementCommand::new("stop-service".to_string(), HashMap::new()),
         Commands::StartService { .. } => {
@@ -197,12 +207,13 @@ fn should_show_spinner(command: &Commands, json: bool) -> bool {
     if json {
         return false; // Don't show spinner for JSON output
     }
-    
+
     match command {
         Commands::LoadModel { .. } => true,
         Commands::InstallModel { .. } => true,
         Commands::UnloadModel { .. } => true,
         Commands::UninstallModel { .. } => true,
+        Commands::TransformModel { .. } => true,
         Commands::Status => true,
         Commands::ListModels => false,   // Quick operation
         Commands::StopService => true,
@@ -229,6 +240,10 @@ fn get_spinner_messages(command: &Commands) -> (String, String) {
             format!("Uninstalling model '{}'...", model_name),
             format!("Model '{}' uninstalled", model_name),
         ),
+        Commands::TransformModel { model_name, .. } => (
+            format!("Transforming model '{}'...", model_name),
+            format!("Model '{}' transformed", model_name),
+        ),
         _ => (
             "Processing...".to_string(),
             "Operation completed".to_string(),
@@ -241,12 +256,12 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
     match command {
         Commands::Status => {
             let mut result = String::from("✓ Service is running");
-            
+
             // Add model information if available
             if let Some(models) = data.get("models").and_then(|m| m.as_array()) {
                 let model_count = models.len();
                 result.push_str(&format!("\n  Models loaded: {}", model_count));
-                
+
                 if model_count > 0 && model_count <= 3 {
                     // Show details for up to 3 models
                     for model in models {
@@ -261,12 +276,12 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
                     result.push_str("\n  (use 'list-models' to see details)");
                 }
             }
-            
+
             Ok(result)
         }
         Commands::ListModels => {
             let mut result = String::new();
-            
+
             // Show loaded models
             if let Some(loaded_models) = data.get("loaded_models").and_then(|m| m.as_array()) {
                 if loaded_models.is_empty() {
@@ -288,10 +303,10 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
                                 .and_then(|a| a.as_bool())
                                 .unwrap_or(false);
                             let status_icon = if is_alive { "✓" } else { "✗" };
-                            
+
                             result.push_str(&format!("  {} {} ({})\n", status_icon, model_name, model_type));
                             result.push_str(&format!("    Uptime: {}s", uptime));
-                            
+
                             if let Some(endpoint) = model_obj.get("endpoint").and_then(|e| e.as_str()) {
                                 result.push_str(&format!(" | Endpoint: {}", endpoint));
                             }
@@ -302,9 +317,9 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
             } else {
                 result.push_str("Loaded Models: None\n");
             }
-            
+
             result.push('\n');
-            
+
             // Show installed models
             if let Some(installed_models) = data.get("installed_models").and_then(|m| m.as_array()) {
                 if installed_models.is_empty() {
@@ -325,7 +340,7 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
                             let path = model_obj.get("path")
                                 .and_then(|p| p.as_str())
                                 .unwrap_or("unknown");
-                            
+
                             result.push_str(&format!("  • {} ({})\n", local_name, model_type));
                             result.push_str(&format!("    Original: {} | Path: {}\n", model_name, path));
                         }
@@ -334,7 +349,7 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
             } else {
                 result.push_str("Installed Models: None");
             }
-            
+
             Ok(result.trim_end().to_string())
         }
         Commands::LoadModel { model_name, .. } => {
@@ -371,7 +386,7 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
                         let model_type = data.get("model_type")
                             .and_then(|t| t.as_str())
                             .unwrap_or("unknown");
-                        Ok(format!("✅ Model '{}' installed successfully as '{}'\n  Type: {}\n  Path: {}", 
+                        Ok(format!("✅ Model '{}' installed successfully as '{}'\n  Type: {}\n  Path: {}",
                                  model_name, local_name.as_deref().unwrap_or(model_name), model_type, path))
                     }
                     "already_installed" => {
@@ -414,6 +429,62 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
                 }
             } else {
                 Ok(format!("✓ Model '{}' uninstallation completed", model_name))
+            }
+        }
+        Commands::TransformModel { model_name, .. } => {
+            if let Some(status) = data.get("status").and_then(|s| s.as_str()) {
+                match status {
+                    "transformed" => {
+                        let mut result = format!("✅ Model '{}' transformation completed", model_name);
+
+                        if let Some(path) = data.get("path").and_then(|p| p.as_str()) {
+                            result.push_str(&format!("\n  Path: {}", path));
+                        }
+
+                        // Show transformation details
+                        if let Some(transformations) = data.get("transformations").and_then(|t| t.as_array()) {
+                            result.push_str("\n\nTransformation Results:");
+                            for transform in transformations {
+                                if let Some(transform_obj) = transform.as_object() {
+                                    let transform_type = transform_obj.get("type")
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("unknown");
+                                    let transform_status = transform_obj.get("status")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("unknown");
+
+                                    let status_icon = match transform_status {
+                                        "success" => "✅",
+                                        "failed" => "❌",
+                                        "skipped" => "⏭️",
+                                        _ => "•"
+                                    };
+
+                                    result.push_str(&format!("\n  {} {}: {}", status_icon, transform_type, transform_status));
+
+                                    if let Some(message) = transform_obj.get("message").and_then(|m| m.as_str()) {
+                                        result.push_str(&format!(" - {}", message));
+                                    }
+
+                                    if let Some(error) = transform_obj.get("error").and_then(|e| e.as_str()) {
+                                        result.push_str(&format!(" - {}", error));
+                                    }
+                                }
+                            }
+                        }
+
+                        Ok(result)
+                    }
+                    _ => {
+                        if let Some(message) = data.get("message") {
+                            Ok(format!("✅ {}", message.as_str().unwrap_or("Model transformation completed")))
+                        } else {
+                            Ok(format!("✅ Model '{}' transformation completed", model_name))
+                        }
+                    }
+                }
+            } else {
+                Ok(format!("✅ Model '{}' transformation completed", model_name))
             }
         }
     }

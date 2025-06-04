@@ -41,11 +41,13 @@ impl TestUtils {
                     name: "Llama-3.1-8B-Instruct".to_string(),
                     fullname: "meta-llama/Llama-3.1-8B-Instruct".to_string(),
                     model_type: "llama3".to_string(),
+                    arch_info: backend_management_rs::config::ModelArchInfo::default(),
                 },
                 backend_management_rs::config::ModelInfo {
                     name: "DeepSeek-V3-0324".to_string(),
                     fullname: "deepseek-ai/DeepSeek-V3-0324".to_string(),
                     model_type: "deepseek".to_string(),
+                    arch_info: backend_management_rs::config::ModelArchInfo::default(),
                 },
             ],
         }

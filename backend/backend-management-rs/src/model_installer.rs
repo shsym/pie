@@ -8,7 +8,7 @@ use tokio::process::Command;
 use tracing::{info, warn, error};
 use serde::{Serialize, Deserialize};
 use crate::error::{ManagementError, Result};
-use crate::config::ModelInfo;
+use crate::config::{ModelInfo, ModelArchInfo};
 
 /// Information about an installed model with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,7 +137,7 @@ impl ModelInstaller {
     ) -> Result<PathBuf> {
         // Validate model name format first
         Self::validate_model_name_format(model_name)?;
-        
+
         info!("Installing model: {}", model_name);
 
         // Create models directory if it doesn't exist
@@ -163,7 +163,7 @@ impl ModelInstaller {
         }
 
         info!("Downloading model {} using huggingface-cli", model_name);
-        
+
         // Execute huggingface-cli download
         self.download_model_with_hf_cli(model_name, revision, files_to_download, &model_path).await?;
 
@@ -234,12 +234,12 @@ impl ModelInstaller {
 
         // Stream output in real-time
         use tokio::io::{AsyncBufReadExt, BufReader};
-        
+
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let stdout_reader = BufReader::new(stdout);
         let stderr_reader = BufReader::new(stderr);
-        
+
         // Stream stdout
         let stdout_task = tokio::spawn(async move {
             let mut lines = stdout_reader.lines();
@@ -247,14 +247,14 @@ impl ModelInstaller {
                 info!("HF_CLI: {}", line);
             }
         });
-        
+
         // Stream stderr
         let stderr_task = tokio::spawn(async move {
             let mut lines = stderr_reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.contains("warning") || line.contains("Warning") || line.contains("FutureWarning") {
                     warn!("HF_CLI_WARN: {}", line);
-                } else if line.contains("Downloading") || line.contains("Download complete") || 
+                } else if line.contains("Downloading") || line.contains("Download complete") ||
                          line.contains("Fetching") || line.contains("Moving file") ||
                          line.contains("Xet Storage") || line.starts_with("Fetching ") {
                     // These are normal progress messages that huggingface-cli sends to stderr
@@ -317,7 +317,7 @@ impl ModelInstaller {
             "tokenizer.model",
             "tokenizer_config.json"
         ];
-        
+
         let has_tokenizer = tokenizer_files.iter().any(|file| {
             model_path.join(file).exists()
         });
@@ -363,48 +363,61 @@ impl ModelInstaller {
     }
 
     /// Create model info file for Symphony compatibility
-    async fn create_model_info_file(&self, model_name: &str, model_path: &Path) -> Result<()> {
+    pub async fn create_model_info_file(&self, model_name: &str, model_path: &Path) -> Result<()> {
         // Try to read config.json to get model details
         let config_path = model_path.join("config.json");
-        let (model_type, _architectures, _vocab_size) = if config_path.exists() {
+        // Read and encapsulate model architecture info
+        let (model_type, arch_info) = if config_path.exists() {
             match tokio::fs::read_to_string(&config_path).await {
-                Ok(config_content) => {
-                    match serde_json::from_str::<serde_json::Value>(&config_content) {
-                        Ok(config) => {
-                            let model_type = config.get("model_type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let architectures = config.get("architectures")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect::<Vec<_>>())
-                                .unwrap_or_default();
-                            let vocab_size = config.get("vocab_size")
-                                .and_then(|v| v.as_u64());
-                            (model_type, architectures, vocab_size)
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse config.json: {}", e);
-                            ("unknown".to_string(), Vec::new(), None)
-                        }
+                Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(cfg) => {
+                        let model_type = cfg.get("model_type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                        let arch_info = ModelArchInfo {
+                            architectures: cfg.get("architectures").and_then(|v| v.as_array())
+                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default(),
+                            vocab_size: cfg.get("vocab_size").and_then(|v| v.as_u64()),
+                            hidden_size: cfg.get("hidden_size").and_then(|v| v.as_u64()),
+                            num_attention_heads: cfg.get("num_attention_heads").and_then(|v| v.as_u64()),
+                            num_hidden_layers: cfg.get("num_hidden_layers").and_then(|v| v.as_u64()),
+                            intermediate_size: cfg.get("intermediate_size").and_then(|v| v.as_u64()),
+                            hidden_act: cfg.get("hidden_act").and_then(|v| v.as_str().map(String::from)),
+                            hidden_dropout_prob: cfg.get("hidden_dropout_prob").and_then(|v| v.as_f64().map(|f| f as f32)),
+                            attention_probs_dropout_prob: cfg.get("attention_probs_dropout_prob").and_then(|v| v.as_f64().map(|f| f as f32)),
+                            max_position_embeddings: cfg.get("max_position_embeddings").and_then(|v| v.as_u64()),
+                            type_vocab_size: cfg.get("type_vocab_size").and_then(|v| v.as_u64()),
+                            layer_norm_eps: cfg.get("layer_norm_eps").and_then(|v| v.as_f64().map(|f| f as f32)),
+                            tie_word_embeddings: cfg.get("tie_word_embeddings").and_then(|v| v.as_bool()),
+                            bos_token_id: cfg.get("bos_token_id").and_then(|v| v.as_u64()),
+                            eos_token_id: cfg.get("eos_token_id").and_then(|v| if let Some(arr) = v.as_array() {
+                                    Some(arr.iter().filter_map(|e| e.as_u64()).collect())
+                                } else if let Some(id) = v.as_u64() {
+                                    Some(vec![id])
+                                } else { None }),
+                            pad_token_id: cfg.get("pad_token_id").and_then(|v| v.as_u64()),
+                            torch_dtype: cfg.get("torch_dtype").and_then(|v| v.as_str().map(String::from)),
+                        };
+                        (model_type, arch_info)
                     }
-                }
+                    Err(e) => {
+                        warn!("Failed to parse config.json: {}", e);
+                        ("unknown".to_string(), ModelArchInfo::default())
+                    }
+                },
                 Err(e) => {
                     warn!("Failed to read config.json: {}", e);
-                    ("unknown".to_string(), Vec::new(), None)
+                    ("unknown".to_string(), ModelArchInfo::default())
                 }
             }
         } else {
-            ("unknown".to_string(), Vec::new(), None)
+            ("unknown".to_string(), ModelArchInfo::default())
         };
 
         let model_info = ModelInfo {
-            name: model_name.split('/').last().unwrap_or(model_name).to_string(),
-            fullname: model_name.to_string(),
-            model_type,
-        };
+             name: model_name.split('/').last().unwrap_or(model_name).to_string(),
+             fullname: model_name.to_string(),
+             model_type,
+             arch_info,
+         };
 
         let info_file = model_path.join("symphony_model_info.json");
         let info_content = serde_json::to_string_pretty(&model_info)
@@ -424,7 +437,7 @@ impl ModelInstaller {
     /// Remove a model and its associated files
     pub async fn uninstall_model(&self, model_name: &str) -> Result<PathBuf> {
         let model_dir = self.get_model_path(model_name);
-        
+
         if !model_dir.exists() {
             return Err(crate::ManagementError::Model {
                 message: format!("Model '{}' is not installed", model_name),
@@ -432,7 +445,7 @@ impl ModelInstaller {
         }
 
         info!("Uninstalling model '{}' from {:?}", model_name, model_dir);
-        
+
         // Remove the entire model directory
         tokio::fs::remove_dir_all(&model_dir).await
             .map_err(|e| crate::ManagementError::Service {
@@ -446,7 +459,7 @@ impl ModelInstaller {
     /// List all installed models
     pub async fn list_installed_models(&self) -> Result<Vec<InstalledModelInfo>> {
         let mut models = Vec::new();
-        
+
         if !self.models_dir.exists() {
             return Ok(models);
         }
@@ -460,15 +473,15 @@ impl ModelInstaller {
             .map_err(|e| crate::ManagementError::Service {
                 message: format!("Failed to read directory entry: {}", e),
             })? {
-            
+
             if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
                 let model_name = entry.file_name().to_string_lossy().to_string();
-                
+
                 // Skip directories that start with '.' (like .locks, .git, etc.)
                 if model_name.starts_with('.') {
                     continue;
                 }
-                
+
                 if let Ok(model_info) = self.get_model_info(&model_name).await {
                     models.push(model_info);
                 }
@@ -481,7 +494,7 @@ impl ModelInstaller {
     /// Remove an installed model
     pub async fn remove_model(&self, model_name: &str) -> Result<()> {
         let model_path = self.models_dir.join(model_name.replace("/", "--"));
-        
+
         if !model_path.exists() {
             return Err(ManagementError::Service {
                 message: format!("Model {} is not installed", model_name)
@@ -511,7 +524,7 @@ impl ModelInstaller {
     /// Get model info from installed model
     pub async fn get_model_info(&self, model_name: &str) -> Result<InstalledModelInfo> {
         let model_path = self.get_model_path(model_name);
-        
+
         if !model_path.exists() {
             return Err(ManagementError::Service {
                 message: format!("Model {} is not installed", model_name)
@@ -525,19 +538,19 @@ impl ModelInstaller {
                 .map_err(|e| ManagementError::Service {
                     message: format!("Failed to read model info: {}", e)
                 })?;
-            
+
             let info: serde_json::Value = serde_json::from_str(&content)
                 .map_err(|e| ManagementError::Service {
                     message: format!("Failed to parse model info JSON: {}", e)
                 })?;
-            
+
             return Ok(InstalledModelInfo {
                 model_name: info.get("fullname").and_then(|v| v.as_str()).unwrap_or(model_name).to_string(),
                 local_name: info.get("name").and_then(|v| v.as_str()).unwrap_or(model_name).to_string(),
                 model_type: info.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                 path: model_path.clone(),
                 tokenizer_path: info.get("tokenizer_path").and_then(|v| v.as_str()).map(PathBuf::from),
-                architectures: info.get("architectures").and_then(|v| v.as_array()).map(|arr| 
+                architectures: info.get("architectures").and_then(|v| v.as_array()).map(|arr|
                     arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
                 ).unwrap_or_default(),
                 installed_at: info.get("installed_at").and_then(|v| {
@@ -567,7 +580,7 @@ impl ModelInstaller {
                 .map_err(|e| ManagementError::Service {
                     message: format!("Failed to read model info: {}", e)
                 })?;
-            
+
             return Ok(InstalledModelInfo::from_info_file(&content));
         }
 
@@ -590,10 +603,10 @@ impl ModelInstaller {
         if name_or_local_name.contains("/") && self.is_model_installed(name_or_local_name).await {
             return Ok(name_or_local_name.to_string());
         }
-        
+
         // If not, search through all installed models to find a match by local_name
         let installed_models = self.list_installed_models().await?;
-        
+
         for model_info in installed_models {
             // Check if the input matches the local name
             if model_info.local_name == name_or_local_name {
@@ -607,7 +620,7 @@ impl ModelInstaller {
                 }
             }
         }
-        
+
         // If no match found, return the original name (let the caller handle the error)
         Ok(name_or_local_name.to_string())
     }
@@ -644,7 +657,7 @@ impl ModelInstaller {
         }
 
         let (org, model) = (parts[0], parts[1]);
-        
+
         // Check for empty parts
         if org.trim().is_empty() || model.trim().is_empty() {
             return Err(ManagementError::InvalidInput {
@@ -680,7 +693,7 @@ impl ModelInstaller {
         let suggestions = vec![
             ("llama", vec![
                 "meta-llama/Llama-3.1-8B-Instruct",
-                "meta-llama/Llama-3.1-7B-Instruct", 
+                "meta-llama/Llama-3.1-7B-Instruct",
                 "meta-llama/Llama-2-7b-chat-hf",
                 "meta-llama/Llama-2-13b-chat-hf"
             ])
@@ -695,4 +708,10 @@ impl ModelInstaller {
 
         vec![]
     }
+
+    /// Rename model layers according to weight_renaming.json rules
+    pub async fn rename_model_layers(&self, model_path: &Path) -> Result<()> {
+        crate::transform_models::ModelTransformer::rename_model_layers(model_path).await
+    }
+
 }

@@ -1,5 +1,5 @@
 //! Tests for tokenizer conversion functionality
-//! 
+//!
 //! This module tests the conversion of HuggingFace tokenizer.json files
 //! to Symphony's tokenizer.model format, specifically handling:
 //! - Unicode to bytes transformation for byte-level BPE tokenizers
@@ -10,14 +10,15 @@
 use std::fs;
 use std::path::Path;
 use backend_management_rs::transform_tokenizer::convert_hf_tokenizer_to_symphony;
+use backend_management_rs::path_utils::expand_home_dir_str;
 use serde_json::Value;
 
 #[tokio::test]
 async fn test_tokenizer_conversion_with_llama_model() {
-    let model_dir = "/home/sslee/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct";
+    let model_dir = expand_home_dir_str("~/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct");
     let json_path = format!("{}/tokenizer.json", model_dir);
     let original_model_path = format!("{}/original/tokenizer.model", model_dir);
-    
+
     if !Path::new(&json_path).exists() || !Path::new(&original_model_path).exists() {
         println!("Skipping test - model files not found at {}", model_dir);
         return;
@@ -25,7 +26,8 @@ async fn test_tokenizer_conversion_with_llama_model() {
 
     // Convert the tokenizer
     let generated_model_path = format!("{}/tokenizer.model", model_dir);
-    convert_hf_tokenizer_to_symphony(Path::new(model_dir))
+    let info_file_path = format!("{}/model_info.json", model_dir);
+    convert_hf_tokenizer_to_symphony(Path::new(&model_dir), Path::new(&info_file_path))
         .await
         .expect("Failed to convert tokenizer");
 
@@ -35,20 +37,20 @@ async fn test_tokenizer_conversion_with_llama_model() {
     // Compare file sizes
     let original_size = fs::metadata(&original_model_path).unwrap().len();
     let generated_size = fs::metadata(&generated_model_path).unwrap().len();
-    
+
     println!("Original tokenizer.model size: {} bytes", original_size);
     println!("Generated tokenizer.model size: {} bytes", generated_size);
-    
+
     // For text format, sizes should match exactly
     assert_eq!(original_size, generated_size, "File sizes should match exactly");
 }
 
 #[tokio::test]
 async fn test_tokenizer_conversion_detailed_comparison() {
-    let model_dir = "/home/sslee/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct";
+    let model_dir = expand_home_dir_str("~/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct");
     let json_path = format!("{}/tokenizer.json", model_dir);
     let original_model_path = format!("{}/original/tokenizer.model", model_dir);
-    
+
     if !Path::new(&json_path).exists() || !Path::new(&original_model_path).exists() {
         println!("Skipping test - model files not found at {}", model_dir);
         return;
@@ -57,7 +59,7 @@ async fn test_tokenizer_conversion_detailed_comparison() {
     // Read and parse the original tokenizer.json to get expected vocab size
     let json_content = fs::read_to_string(&json_path).expect("Failed to read tokenizer.json");
     let tokenizer_json: Value = serde_json::from_str(&json_content).expect("Failed to parse JSON");
-    
+
     let expected_vocab_size = if let Some(vocab) = tokenizer_json["model"]["vocab"].as_object() {
         vocab.len()
     } else {
@@ -68,30 +70,31 @@ async fn test_tokenizer_conversion_detailed_comparison() {
 
     // Convert the tokenizer
     let generated_model_path = format!("{}/tokenizer.model", model_dir);
-    convert_hf_tokenizer_to_symphony(Path::new(model_dir))
+    let info_file_path = format!("{}/model_info.json", model_dir);
+    convert_hf_tokenizer_to_symphony(Path::new(&model_dir), Path::new(&info_file_path))
         .await
         .expect("Failed to convert tokenizer");
 
     // Read the generated model and count non-empty lines
     let generated_content = fs::read_to_string(&generated_model_path)
         .expect("Failed to read generated tokenizer.model");
-    
+
     let actual_vocab_size = generated_content.lines()
         .filter(|line| !line.trim().is_empty())
         .count();
-    
+
     println!("Generated vocabulary size: {}", actual_vocab_size);
-    
-    assert_eq!(expected_vocab_size, actual_vocab_size, 
-        "Vocabulary size mismatch: expected {} but got {}", 
+
+    assert_eq!(expected_vocab_size, actual_vocab_size,
+        "Vocabulary size mismatch: expected {} but got {}",
         expected_vocab_size, actual_vocab_size);
 }
 
 #[tokio::test]
 async fn test_tokenizer_byte_conversion_sample() {
-    let model_dir = "/home/sslee/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct";
+    let model_dir = expand_home_dir_str("~/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct");
     let json_path = format!("{}/tokenizer.json", model_dir);
-    
+
     if !Path::new(&json_path).exists() {
         println!("Skipping test - tokenizer.json not found at {}", json_path);
         return;
@@ -99,7 +102,8 @@ async fn test_tokenizer_byte_conversion_sample() {
 
     // Convert the tokenizer
     let generated_model_path = format!("{}/tokenizer.model", model_dir);
-    convert_hf_tokenizer_to_symphony(Path::new(model_dir))
+    let info_file_path = format!("{}/model_info.json", model_dir);
+    convert_hf_tokenizer_to_symphony(Path::new(&model_dir), Path::new(&info_file_path))
         .await
         .expect("Failed to convert tokenizer");
 
@@ -116,17 +120,17 @@ async fn test_tokenizer_byte_conversion_sample() {
             }
         }
     }
-    
+
     assert!(valid_lines > 0, "Should have valid token lines");
     println!("Validated {} sample lines", valid_lines);
 }
 
 #[tokio::test]
 async fn test_content_analysis() {
-    let model_dir = "/home/sslee/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct";
+    let model_dir = expand_home_dir_str("~/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct");
     let original_model_path = format!("{}/original/tokenizer.model", model_dir);
     let json_path = format!("{}/tokenizer.json", model_dir);
-    
+
     if !Path::new(&original_model_path).exists() || !Path::new(&json_path).exists() {
         println!("Skipping test - model files not found at {}", model_dir);
         return;
@@ -134,7 +138,8 @@ async fn test_content_analysis() {
 
     // Convert the tokenizer
     let generated_model_path = format!("{}/tokenizer.model", model_dir);
-    convert_hf_tokenizer_to_symphony(Path::new(model_dir))
+    let info_file_path = format!("{}/model_info.json", model_dir);
+    convert_hf_tokenizer_to_symphony(Path::new(&model_dir), Path::new(&info_file_path))
         .await
         .expect("Failed to convert tokenizer");
 
@@ -143,30 +148,30 @@ async fn test_content_analysis() {
         .expect("Failed to read original tokenizer.model");
     let generated_content = fs::read_to_string(&generated_model_path)
         .expect("Failed to read generated tokenizer.model");
-    
+
     let original_lines: Vec<&str> = original_content.lines().collect();
     let generated_lines: Vec<&str> = generated_content.lines().collect();
-    
+
     println!("Original file has {} lines", original_lines.len());
     println!("Generated file has {} lines", generated_lines.len());
-    
+
     assert_eq!(original_lines.len(), generated_lines.len(), "Line counts should match");
-    
+
     // Check file sizes
     let original_size = original_content.len();
     let generated_size = generated_content.len();
-    
+
     println!("Original file size: {} bytes", original_size);
     println!("Generated file size: {} bytes", generated_size);
-    
+
     assert_eq!(original_size, generated_size, "File sizes should match exactly");
 }
 
-#[tokio::test] 
+#[tokio::test]
 async fn test_vocabulary_verification() {
-    let model_dir = "/home/sslee/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct";
+    let model_dir = expand_home_dir_str("~/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct");
     let json_path = format!("{}/tokenizer.json", model_dir);
-    
+
     if !Path::new(&json_path).exists() {
         println!("Skipping test - tokenizer.json not found at {}", json_path);
         return;
@@ -174,13 +179,14 @@ async fn test_vocabulary_verification() {
 
     // Convert the tokenizer
     let generated_model_path = format!("{}/tokenizer.model", model_dir);
-    
+
     // Clean up any existing file first
     if Path::new(&generated_model_path).exists() {
         fs::remove_file(&generated_model_path).ok();
     }
-    
-    convert_hf_tokenizer_to_symphony(Path::new(model_dir))
+
+    let info_file_path = format!("{}/model_info.json", model_dir);
+    convert_hf_tokenizer_to_symphony(Path::new(&model_dir), Path::new(&info_file_path))
         .await
         .expect("Failed to convert tokenizer");
 
@@ -191,7 +197,7 @@ async fn test_vocabulary_verification() {
     // Parse JSON to get original vocabulary
     let json_content = fs::read_to_string(&json_path).expect("Failed to read tokenizer.json");
     let tokenizer_json: Value = serde_json::from_str(&json_content).expect("Failed to parse JSON");
-    
+
     let vocab = tokenizer_json["model"]["vocab"].as_object()
         .expect("Could not find vocab in tokenizer.json");
 
@@ -211,26 +217,26 @@ async fn test_vocabulary_verification() {
                         false
                     }
                 });
-                
+
                 if found {
                     verified_count += 1;
                 }
-                
+
                 println!("Token {}: {} -> ID {}", verified_count, token_b64, id);
             }
         }
     }
-    
+
     println!("Successfully verified {} tokens", verified_count);
     assert!(verified_count > 0, "Should find at least some matching tokens");
 }
 
 #[tokio::test]
 async fn test_complete_file_comparison() {
-    let model_dir = "/home/sslee/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct";
+    let model_dir = expand_home_dir_str("~/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct");
     let json_path = format!("{}/tokenizer.json", model_dir);
     let original_model_path = format!("{}/original/tokenizer.model", model_dir);
-    
+
     if !Path::new(&json_path).exists() || !Path::new(&original_model_path).exists() {
         println!("Skipping test - model files not found at {}", model_dir);
         return;
@@ -238,7 +244,8 @@ async fn test_complete_file_comparison() {
 
     // Convert the tokenizer
     let generated_model_path = format!("{}/tokenizer.model", model_dir);
-    convert_hf_tokenizer_to_symphony(Path::new(model_dir))
+    let info_file_path = format!("{}/model_info.json", model_dir);
+    convert_hf_tokenizer_to_symphony(Path::new(&model_dir), Path::new(&info_file_path))
         .await
         .expect("Failed to convert tokenizer");
 
@@ -252,12 +259,12 @@ async fn test_complete_file_comparison() {
     let original_lines: Vec<&str> = original_content.lines().collect();
     let generated_lines: Vec<&str> = generated_content.lines().collect();
 
-    println!("Comparing {} lines from original with {} lines from generated", 
+    println!("Comparing {} lines from original with {} lines from generated",
              original_lines.len(), generated_lines.len());
 
     // First check: line counts must match
-    assert_eq!(original_lines.len(), generated_lines.len(), 
-               "Line count mismatch: original has {} lines, generated has {}", 
+    assert_eq!(original_lines.len(), generated_lines.len(),
+               "Line count mismatch: original has {} lines, generated has {}",
                original_lines.len(), generated_lines.len());
 
     // Second check: content must be identical
@@ -268,10 +275,10 @@ async fn test_complete_file_comparison() {
             println!("  Original:  '{}'", orig_line);
             println!("  Generated: '{}'", gen_line);
             differences += 1;
-            
+
             // Only show first 5 differences to avoid spam
             if differences >= 5 {
-                println!("... and {} more differences", 
+                println!("... and {} more differences",
                          original_lines.len() - i - 1);
                 break;
             }
@@ -285,9 +292,9 @@ async fn test_complete_file_comparison() {
     }
 
     assert_eq!(differences, 0, "Files should be identical but found {} differences", differences);
-    
+
     // Final verification: byte-level comparison
     assert_eq!(original_content, generated_content, "Files should be byte-for-byte identical");
-    
+
     println!("Final verification passed: Files are completely identical at byte level");
 }

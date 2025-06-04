@@ -177,16 +177,19 @@ impl Default for Config {
                     name: "Llama-3.1-8B-Instruct".to_string(),
                     fullname: "meta-llama/Llama-3.1-8B-Instruct".to_string(),
                     model_type: "llama3".to_string(),
+                    arch_info: ModelArchInfo::default(),
                 },
                 ModelInfo {
                     name: "Llama-3.2-1B-Instruct".to_string(),
                     fullname: "meta-llama/Llama-3.2-1B-Instruct".to_string(),
                     model_type: "llama3".to_string(),
+                    arch_info: ModelArchInfo::default(),
                 },
                 ModelInfo {
                     name: "DeepSeek-V3-0324".to_string(),
                     fullname: "deepseek-ai/DeepSeek-V3-0324".to_string(),
                     model_type: "deepseek".to_string(),
+                    arch_info: ModelArchInfo::default(),
                 },
             ],
         }
@@ -213,6 +216,29 @@ pub struct LoggingConfig {
     pub date_format: String,
 }
 
+/// Model architecture and hyperparameter info required for loading
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelArchInfo {
+    /// Model architectures from config.json
+    #[serde(default)]
+    pub architectures: Vec<String>,
+    #[serde(default)] pub vocab_size: Option<u64>,
+    #[serde(default)] pub hidden_size: Option<u64>,
+    #[serde(default)] pub num_attention_heads: Option<u64>,
+    #[serde(default)] pub num_hidden_layers: Option<u64>,
+    #[serde(default)] pub intermediate_size: Option<u64>,
+    #[serde(default)] pub hidden_act: Option<String>,
+    #[serde(default)] pub hidden_dropout_prob: Option<f32>,
+    #[serde(default)] pub attention_probs_dropout_prob: Option<f32>,
+    #[serde(default)] pub max_position_embeddings: Option<u64>,
+    #[serde(default)] pub type_vocab_size: Option<u64>,
+    #[serde(default)] pub layer_norm_eps: Option<f32>,
+    #[serde(default)] pub tie_word_embeddings: Option<bool>,
+    #[serde(default)] pub bos_token_id: Option<u64>,
+    #[serde(default)] pub eos_token_id: Option<Vec<u64>>,
+    #[serde(default)] pub pad_token_id: Option<u64>,
+    #[serde(default)] pub torch_dtype: Option<String>,
+}
 /// Information about a supported model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -223,4 +249,7 @@ pub struct ModelInfo {
     /// Model type for backend selection (e.g., "llama3", "deepseek")
     #[serde(rename = "type")]
     pub model_type: String,
+    /// Nested architecture and hyperparameter info
+    #[serde(default)]
+    pub arch_info: ModelArchInfo,
 }

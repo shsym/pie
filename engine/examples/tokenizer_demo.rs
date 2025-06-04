@@ -1,6 +1,7 @@
 // Symphony Tokenizer Integration Demo
 // This example demonstrates the configurable tokenizer functionality
 
+use backend_management_rs::path_utils::expand_home_dir_str;
 use std::env;
 use std::path::Path;
 use pie_rt::{load_symphony_tokenizer, llama3_tokenizer};
@@ -8,20 +9,20 @@ use pie_rt::{load_symphony_tokenizer, llama3_tokenizer};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get model path from command line or use default
     let args: Vec<String> = env::args().collect();
-    let model_path = if args.len() > 1 {
-        &args[1]
+    let model_path_str = if args.len() > 1 {
+        args[1].clone()
     } else {
         // Default path - user can override with command line argument
-        "/home/sslee/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct"
+        expand_home_dir_str("~/.cache/symphony/models/meta-llama--Llama-3.1-8B-Instruct")
     };
 
     println!("🎵 Symphony Tokenizer Integration Demo");
     println!("=====================================");
-    println!("Model path: {}", model_path);
+    println!("Model path: {}", model_path_str);
 
     // Check if the path exists
-    if !Path::new(model_path).exists() {
-        println!("❌ Model path does not exist: {}", model_path);
+    if !Path::new(&model_path_str).exists() {
+        println!("❌ Model path does not exist: {}", model_path_str);
         println!("Please provide a valid model path as a command line argument:");
         println!("  cargo run --example tokenizer_demo -- /path/to/your/model");
         return Ok(());
@@ -29,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load the Symphony tokenizer with metadata
     println!("\n🔧 Loading Symphony tokenizer with metadata integration...");
-    match load_symphony_tokenizer(model_path) {
+    match load_symphony_tokenizer(&model_path_str) {
         Ok(tokenizer) => {
             println!("✅ Successfully loaded tokenizer!");
 

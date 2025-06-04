@@ -6,6 +6,7 @@ use crate::service::{Service, ServiceError};
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::IdPool;
 use crate::{backend, batching, runtime, service, tokenizer};
+use backend_management_rs::path_utils::expand_home_dir_str;
 use dashmap::DashMap;
 use prost::Message;
 use rand::Rng;
@@ -430,41 +431,34 @@ impl L4m {
         // Try to load the tokenizer model from different paths
         // First try to load from Symphony managed models if available
         let symphony_model_paths = [
-            format!("~/.cache/symphony/models/{}", model_name),
-            format!("{}/.cache/symphony/models/{}", std::env::var("HOME").unwrap_or_default(), model_name),
+            expand_home_dir_str(&format!("~/.cache/symphony/models/{}", model_name)),
         ];
-        
+
         let tokenizer_paths = [
             format!("program_cache/{}/original/tokenizer.model", model_name),
             "../test-tokenizer/tokenizer.model".to_string(),
         ];
 
         let mut tokenizer = None;
-        
+
         // First try Symphony managed models with metadata
         for path in &symphony_model_paths {
-            let expanded_path = if path.starts_with("~/") {
-                format!("{}{}", std::env::var("HOME").unwrap_or_default(), &path[1..])
-            } else {
-                path.clone()
-            };
-            
-            if std::path::Path::new(&expanded_path).exists() {
-                println!("Trying to load tokenizer from Symphony managed model: {}", expanded_path);
-                match tokenizer::load_symphony_tokenizer(&expanded_path) {
+            if std::path::Path::new(path).exists() {
+                println!("Trying to load tokenizer from Symphony managed model: {}", path);
+                match tokenizer::load_symphony_tokenizer(path) {
                     Ok(tok) => {
                         tokenizer = Some(tok);
-                        println!("Successfully loaded tokenizer from Symphony managed model: {}", expanded_path);
+                        println!("Successfully loaded tokenizer from Symphony managed model: {}", path);
                         break;
                     }
                     Err(e) => {
-                        println!("Failed to load tokenizer from Symphony managed model {}: {}", expanded_path, e);
+                        println!("Failed to load tokenizer from Symphony managed model {}: {}", path, e);
                         continue;
                     }
                 }
             }
         }
-        
+
         // Fallback to original hardcoded paths if Symphony models not found
         if tokenizer.is_none() {
             for path in &tokenizer_paths {
@@ -652,7 +646,7 @@ impl L4m {
                 //     println!("deallocating tokenemb, ids: {:?}", ids);
                 //     println!("available tokenemb: {:?}", self.objects.available(ty));
                 // }
-               
+
                 let ids = try_trap!(
                     self.objects.destroy_many(ty, inst_id, &ids),
                     inst_id,
