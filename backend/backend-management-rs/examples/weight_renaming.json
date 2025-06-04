@@ -1,9 +1,9 @@
 {
   "root": "model",
   "metadata": {
-    "description": "Weight renaming rules for converting HuggingFace model layer names to Pie format",
+    "description": "Weight renaming rules for converting HuggingFace model layer names to Symphony format",
     "version": "1.0",
-    "target_format": "Pie standardized layer names"
+    "target_format": "Symphony standardized layer names"
   },
   "rules": [
     {

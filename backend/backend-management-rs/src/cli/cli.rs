@@ -53,14 +53,6 @@ pub enum Commands {
         #[clap(long, action)]
         force: bool,
     },
-    /// Transform an installed model (run index and model transformations)
-    TransformModel {
-        /// Model name to transform (must be already installed)
-        model_name: String,
-        /// Force transformation even if already processed
-        #[clap(long, action)]
-        force: bool,
-    },
     // TODO: Add other commands as needed, e.g., health, logs
 }
 
