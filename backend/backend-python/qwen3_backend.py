@@ -30,7 +30,7 @@ def main_run():
     
     device = "cuda:0"
 
-    # Load model using QwenForCausalLM wrapper
+    # Load model using QwenForCausalLM wrapper with FlashInfer
     # This works for Qwen3 models including DeepSeek-R1-0528-Qwen3-8B
     # Determine if model is in local Symphony cache
     models_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "symphony", "models")

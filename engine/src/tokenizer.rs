@@ -170,7 +170,7 @@ impl BytePairEncoder {
         let mut ret = vec![];
 
         let mut start = 0;
-        let mut last_piece_token_len = 0;
+        let mut _last_piece_token_len = 0;
         loop {
             let mut next_special;
             let mut start_find = start;
@@ -191,12 +191,12 @@ impl BytePairEncoder {
             for mat in self.regex.find_iter(&text[start..end]) {
                 let piece = mat.unwrap().as_str().as_bytes();
                 if let Some(token) = self.encoder.get(piece) {
-                    last_piece_token_len = 1;
+                    _last_piece_token_len = 1;
                     ret.push(*token);
                     continue;
                 }
                 let tokens = byte_pair_encode(piece, &self.encoder);
-                last_piece_token_len = tokens.len();
+                _last_piece_token_len = tokens.len();
                 ret.extend(&tokens);
             }
 
@@ -207,7 +207,7 @@ impl BytePairEncoder {
                     let token = self.special_tokens_encoder[piece];
                     ret.push(token);
                     start = m.end();
-                    last_piece_token_len = 0;
+                    _last_piece_token_len = 0;
                 }
                 None => break,
             }
@@ -352,16 +352,17 @@ pub fn configurable_tokenizer(
         special_tokens_encoder.insert(token.clone(), *id);
     }
 
-    // Add special tokens from added_tokens list (if they have IDs)
+    // Add ALL added tokens from added_tokens list (both special and non-special)
+    // These tokens need to be treated as special tokens in the encoder regardless of their "special" flag
+    // because they are not part of the base vocabulary and need special handling
     for added_token in &metadata.added_tokens {
-        if added_token.special {
-            if let Some(id) = added_token.id {
-                special_tokens_encoder.insert(added_token.content.clone(), id);
-            } else {
-                // For added tokens without explicit IDs, assign them after the base vocabulary
-                let next_id = mergeable_ranks.len() as Rank + special_tokens_encoder.len() as Rank;
-                special_tokens_encoder.insert(added_token.content.clone(), next_id);
-            }
+        if let Some(id) = added_token.id {
+            special_tokens_encoder.insert(added_token.content.clone(), id);
+        } else {
+            // For added tokens without explicit IDs, assign them after the base vocabulary
+            let next_id = mergeable_ranks.len() as Rank + special_tokens_encoder.len() as Rank;
+            special_tokens_encoder.insert(added_token.content.clone(), next_id);
+            println!("WARN: Added token without ID: '{}' -> {} (assigned)", added_token.content, next_id);
         }
     }
 
@@ -539,8 +540,7 @@ pub fn load_symphony_tokenizer(model_path: &str) -> Result<BytePairEncoder, Box<
         return llama3_tokenizer(&found_tokenizer);
     }
 
-    // For now, fall back to the hardcoded test tokenizer
-    // TODO: Implement support for other tokenizer formats (tokenizer.json, vocab.txt)
+    // Try HuggingFace tokenizer.json if available
     if tokenizer_json.exists() {
         println!("Found tokenizer.json, but HuggingFace tokenizer.json support is not yet implemented");
         println!("Falling back to default tokenizer");

@@ -1,6 +1,6 @@
 import l4m_pb2 # Added import
 from driver import Driver # Added import
-from config import VERSION, MODEL_NAME, NUM_TOKENS_IN_BLOCK
+from config import VERSION, NUM_TOKENS_IN_BLOCK
 
 
 def ceil_div(a, b):

@@ -17,7 +17,7 @@
       "name": "Convert layer normalization",
       "type": "regex", 
       "pattern": "^(model\\.)?layers\\.(\\d+)\\.input_layernorm\\.weight$",
-      "replacement": "{root}.layers.$2.input_norm.weight",
+      "replacement": "{root}.layers.$2.input_layernorm.weight",
       "enabled": true
     },
     {
@@ -38,7 +38,7 @@
       "name": "Convert post attention norm",
       "type": "regex",
       "pattern": "^(model\\.)?layers\\.(\\d+)\\.post_attention_layernorm\\.weight$",
-      "replacement": "{root}.layers.$2.post_attention_norm.weight", 
+      "replacement": "{root}.layers.$2.post_attention_layernorm.weight", 
       "enabled": true
     },
     {
@@ -94,21 +94,7 @@
       "name": "Convert language model head",
       "type": "regex", 
       "pattern": "^lm_head\\.weight$",
-      "replacement": "{root}.lm_head.weight",
-      "enabled": true
-    },
-    {
-      "name": "Handle alternative layer norm names",
-      "type": "regex",
-      "pattern": "^(model\\.)?layers\\.(\\d+)\\.ln_1\\.weight$",
-      "replacement": "{root}.layers.$2.input_norm.weight",
-      "enabled": true
-    },
-    {
-      "name": "Handle alternative post-attention norm names", 
-      "type": "regex",
-      "pattern": "^(model\\.)?layers\\.(\\d+)\\.ln_2\\.weight$", 
-      "replacement": "{root}.layers.$2.post_attention_norm.weight",
+      "replacement": "lm_head.weight",
       "enabled": true
     }
   ]

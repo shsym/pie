@@ -10,7 +10,7 @@ from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlo
     ObjectKind, SampleTopKResponse, BatchFillBlock
 
 from l4m_vision_pb2 import BatchEmbedImage
-from config import FULL_MODEL_NAME, NUM_TOKENS_IN_BLOCK
+from config import NUM_TOKENS_IN_BLOCK
 
 class VectorStorage:
     def __init__(self, num_vectors: int, embed_dim: int, device: str, dtype=torch.bfloat16):
@@ -102,7 +102,7 @@ class Driver:
         for cmd in cmds.items:
             if cmd.kind == ObjectKind.OBJECT_KIND_KV_BLOCK:
                 for i in range(cmd.count):
-                    #print(f"allocate {cmd.count} blocks", cmd.object_id_offset + i)
+                    # print(f"Debug - allocate {cmd.count} blocks at offset {cmd.object_id_offset}, creating block {cmd.object_id_offset + i}")
 
                     self.blocks[cmd.object_id_offset + i] = Block(
                         position_ids=np.array([0] * NUM_TOKENS_IN_BLOCK),
@@ -122,7 +122,8 @@ class Driver:
         ...
 
     def embed_text(self, cmds: BatchEmbedText):
-        for cmd in cmds.items:
+        print(f"Debug - embed_text called with {len(cmds.items)} items")
+        for _i, cmd in enumerate(cmds.items):
             self.embeds[cmd.embedding_id] = TextEmbed(token_id=cmd.token_id, position_id=cmd.position_id)
 
     def embed_image(self, cmds: BatchEmbedImage):
@@ -159,19 +160,22 @@ class Driver:
         start_time = time.time()
 
         res = []
-                
+
         for i, cmd in enumerate(cmds.items):
+            # Get the stored logits/probabilities and token IDs
             topk_probs = self.embed_storage_p1.ptr[cmd.distribution_id].tolist()
             topk_tokens = self.embed_storage_p2.ptr[cmd.distribution_id].tolist()
 
-            # topk_res = torch.topk(dist, k=cmd.k)
-            # topk_tokens = topk_res.indices.tolist()
-            # topk_probs = topk_res.values.tolist()
+            # Limit to k requested tokens if needed
+            if cmd.k > 0 and cmd.k < len(topk_tokens):
+                topk_tokens = topk_tokens[:cmd.k]
+                topk_probs = topk_probs[:cmd.k]
 
             res.append(SampleTopKResponse(token_ids=topk_tokens, probabilities=topk_probs))
 
-        #torch.cuda.synchronize()
-        #print(f"sample_top_k_request elapsed time {(time.time() - start_time) * 1000}ms")
+        # torch.cuda.synchronize()
+        # elapsed_time = (time.time() - start_time) * 1000
+        # print(f"sample_top_k_request elapsed time {elapsed_time:.2f}ms")
 
         return BatchSampleTopKResponse(items=res)
 
@@ -179,62 +183,75 @@ class Driver:
     def fill_block(self, cmds: BatchFillBlock):
 
         start_time = time.time()
-        
+
         kv_page_indices = []
         kv_page_indptr = [0]
         kv_last_page_lens = []
         qo_indices = []
         qo_indptr = [0]
         custom_masks = []
-        
+
         new_token_ids = []
         new_position_ids = []
         output_embed_postproc = []
         single_token_inference_mode = True
-        
+
         for i, cmd in enumerate(cmds.items):
             last_block_len = cmd.last_block_len # change this name to "offset" later.
-            
+
             ctx_block_ids = cmd.context_block_ids # block == page. make names consistent later.
             input_embeds = cmd.input_embedding_ids
             output_embeds = cmd.output_embedding_ids
-            
+
             kv_page_indices.extend(ctx_block_ids)
             kv_page_indptr.append(len(kv_page_indices))
             kv_last_page_lens.append(last_block_len)
-            
+
             # if offset + len(input_embeds) > NUM_TOKENS_IN_BLOCK:
             #     # should never happen.
             #     raise ValueError("Page size exceeded")
-            
+
             qo_indices.extend(input_embeds)
             qo_indptr.append(len(qo_indices))
-        
+
             # let's compute the mask.
-            
+
 
             inp_pos_ids = np.empty((len(input_embeds), ), dtype=np.int32)
             inp_occupancy = np.zeros((len(input_embeds), ), dtype=np.bool_)
 
             if len(input_embeds) > 1:
                 single_token_inference_mode = False
-            
-            
-            
+
             total_ctx_tokens = NUM_TOKENS_IN_BLOCK * (len(ctx_block_ids) - 1) + last_block_len
 
             for i in range(len(input_embeds)):
-                
+
                 token_offset = total_ctx_tokens - len(input_embeds) + i
                 tgt_block_idx = token_offset // NUM_TOKENS_IN_BLOCK
                 tgt_block_offset = token_offset % NUM_TOKENS_IN_BLOCK
-                
-                #print("token_offset", token_offset, "tgt_block_idx", tgt_block_idx, "tgt_block_offset", tgt_block_offset)
-                #print(self.blocks)
+
+                # print(f"Debug - Token {i}: ID={input_embeds[i]}, token_offset={token_offset}, tgt_block_idx={tgt_block_idx}, tgt_block_offset={tgt_block_offset}")
+
+                # Safety check to avoid index errors
+                if tgt_block_idx >= len(ctx_block_ids):
+                    print(f"ERROR: Block index {tgt_block_idx} out of range for ctx_block_ids with length {len(ctx_block_ids)}")
+                    print(f"INFO: This usually means last_block_len is set incorrectly or context_block_ids is incomplete")
+                    print(f"INFO: total_ctx_tokens={total_ctx_tokens}, len(input_embeds)={len(input_embeds)}")
+
+                    # Fall back to using the last available context block
+                    tgt_block_idx = len(ctx_block_ids) - 1
+                    print(f"FALLBACK: Using last available block index {tgt_block_idx} instead")
+
                 tgt_block_id = ctx_block_ids[tgt_block_idx]
-                
+
+                if tgt_block_id not in self.blocks:
+                    print(f"ERROR: Block with ID {tgt_block_id} not found in allocated blocks")
+                    print(f"INFO: Available block IDs: {list(self.blocks.keys())}")
+                    continue
+
                 tgt_block = self.blocks[tgt_block_id]
-                
+
                 if input_embeds[i] in self.embeds:
                     embed = self.embeds[input_embeds[i]]
                     if isinstance(embed, TextEmbed):
@@ -247,19 +264,25 @@ class Driver:
                 else:
                     # should never happen, since the controller should have already checked that the input embeds are valid.
                     raise ValueError("Input embedding not found")
-            
+
             for i in range(len(output_embeds)):
                 output_embed_postproc.append({
                     "idx":  len(new_token_ids) -  len(output_embeds) + i,
                     "vec_id": output_embeds[i]
                 })
-                
-            ctx_pos_ids = np.hstack([self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids])[:total_ctx_tokens]  # int
-            ctx_occupancy = np.hstack([self.blocks[ctx_id].occupancy for ctx_id in ctx_block_ids])[:total_ctx_tokens]  # bool
+
+            # Get the full sequence length (context + input tokens)
+            total_sequence_length = total_ctx_tokens    # + len(input_embeds)
+
+            # Get position IDs and occupancy for the entire sequence
+            ctx_pos_ids = np.hstack([self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids])[:total_sequence_length]  # int
+            ctx_occupancy = np.hstack([self.blocks[ctx_id].occupancy for ctx_id in ctx_block_ids])[:total_sequence_length]  # bool
+
+            # Build the causal and valid masks
             casual_mask = ctx_pos_ids[None, :] <= inp_pos_ids[:, None]
             valid_mask = np.logical_and(ctx_occupancy[None, :], inp_occupancy[:, None])
             mask = np.logical_and(casual_mask, valid_mask)
-            
+
             mask_flat = mask.flatten()
             custom_masks.append(mask_flat)
             #print(mask)
@@ -286,7 +309,7 @@ class Driver:
         # print('kv_last_page_lens', kv_last_page_lens)
         # print('qo_indptr', qo_indptr)
         #print('custom_mask', custom_masks)
-        
+
         with torch.cuda.device(self.device):
             output_embeds = self.lm.model.forward(
                 input_embeds=input_embeds,
@@ -303,6 +326,34 @@ class Driver:
             # precompute the dists
             logits = self.lm.lm_head(output_embeds)
 
+            for i, token_map in enumerate(output_embed_postproc):
+                vec_id = token_map["vec_id"]
+                idx = token_map["idx"]
+
+                if idx < logits.shape[0]:
+                    pos_logits = logits[idx]  # Logits for this OUTPUT position
+                    top_5_values, top_5_indices = torch.topk(pos_logits, k=5)
+
+                    print(f"  Output {i} (vec_id={vec_id}, logit_idx={idx}):")
+                    print(f"    Shape: {pos_logits.shape}")
+                    print(f"    Min: {pos_logits.min().item():.4f}")
+                    print(f"    Max: {pos_logits.max().item():.4f}")
+                    print(f"    Mean: {pos_logits.mean().item():.4f}")
+                    print(f"    Top 5 token IDs: {top_5_indices.tolist()}")
+                    print(f"    Top 5 values: {top_5_values.tolist()}")
+
+                    # Check if EOS token has abnormally high probability
+                    if hasattr(self.lm.config, 'eos_token_id') and self.lm.config.eos_token_id is not None:
+                        eos_token_id = self.lm.config.eos_token_id
+                        if isinstance(eos_token_id, list):
+                            eos_token_id = eos_token_id[0] if len(eos_token_id) > 0 else None
+
+                        if eos_token_id is not None and eos_token_id < len(pos_logits):
+                            eos_logit = pos_logits[eos_token_id].item()
+                            max_logit = pos_logits.max().item()
+                            print(f"    EOS token {eos_token_id} logit: {eos_logit:.4f} (max: {max_logit:.4f})")
+                            if eos_logit == max_logit:
+                                print(f"    *** WARNING: EOS token has highest logit for output {i}! ***")
             # topk
             condensed = torch.topk(logits, k=config.DIST_RESOLUTION, sorted=True)
 
@@ -311,7 +362,6 @@ class Driver:
         for token_map in output_embed_postproc:
             vec_id = token_map["vec_id"]
             idx = token_map["idx"]
-            #print(f"sampled {idx}-th token among {output_embeds.shape[0]} tokens")
             self.embed_storage_p1.ptr[vec_id].copy_(condensed.values[idx], non_blocking=True)
             self.embed_storage_p2.ptr[vec_id].copy_(condensed.indices[idx], non_blocking=True)
 

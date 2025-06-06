@@ -1,145 +1,32 @@
-# qwen.py
 import torch
-import warnings
 from torch import nn
-from transformers import AutoModelForCausalLM, AutoConfig
+from transformers import PreTrainedModel
+from transformers.generation.utils import GenerationMixin
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+
+from q4wen import Q4wenModel
 
 
-class QwenModelWrapper(nn.Module):
+class QwenForCausalLM(PreTrainedModel, GenerationMixin):
     """
-    Wrapper for the Qwen3 model.model to provide the same forward interface
-    as expected by the symphony driver.py
+    Qwen model for causal language modeling using FlashInfer for efficient attention.
+    This class follows the same pattern as LlamaForCausalLM.
     """
-    
-    def __init__(self, qwen_model):
-        super().__init__()
-        self.qwen_model = qwen_model
-        self.embed_tokens = qwen_model.embed_tokens
-        
-    def forward(
-        self,
-        input_embeds: torch.Tensor,
-        position_ids: torch.Tensor,
-        kv_cache_at_layer,  # This will be ignored for standard Qwen3 models
-        kv_page_indices: torch.Tensor,
-        kv_page_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        qo_indptr: torch.Tensor,
-        custom_mask: torch.Tensor = None,
-        single_token_inference_mode: bool = False,
-        **kwargs
-    ):
-        """
-        Forward pass that adapts the symphony driver interface to work with
-        standard Qwen3 models. 
-        
-        Note: This is a simplified implementation that doesn't use the custom
-        KV cache parameters. For full compatibility with symphony's paged attention,
-        you would need to implement the custom KV cache handling.
-        """
-        # For now, we'll use the standard Qwen3 forward pass
-        # In a full implementation, you'd need to handle the custom KV cache
-        
-        # Convert position_ids to the right shape if needed
-        batch_size = 1  # Assuming single batch for now
-        seq_len = input_embeds.shape[0]
-        
-        # Create attention mask if custom_mask is provided
-        attention_mask = None
-        if custom_mask is not None:
-            # Convert custom_mask to attention_mask format expected by Qwen3
-            attention_mask = custom_mask.unsqueeze(0)  # Add batch dimension
-        
-        # Reshape inputs for standard model
-        input_embeds_reshaped = input_embeds.unsqueeze(0)  # Add batch dimension
-        position_ids_reshaped = position_ids.unsqueeze(0)  # Add batch dimension
-        
-        # Call the standard Qwen3 model
-        outputs = self.qwen_model(
-            inputs_embeds=input_embeds_reshaped,
-            position_ids=position_ids_reshaped,
-            attention_mask=attention_mask,
-            use_cache=False,  # Disable built-in caching since symphony handles it
-            return_dict=True
-        )
-        
-        # Return last hidden states, removing batch dimension
-        return outputs.last_hidden_state.squeeze(0)
+    config_class = Qwen3Config
 
-
-class QwenForCausalLM:
-    """
-    Wrapper for Qwen3 models that provides the same interface as DeepSeekForCausalLM
-    but uses the standard transformers implementation under the hood.
-    
-    This is designed to work with models like:
-    - deepseek-ai/DeepSeek-R1-0528-Qwen3-8B (which is actually a Qwen3 model)
-    - Qwen/Qwen3-8B-Instruct
-    - Any other Qwen3-based models
-    """
-
-    def __init__(self, transformers_model):
-        """
-        Initialize with a pre-loaded transformers model
-        """
-        self.transformers_model = transformers_model
-        self.model = QwenModelWrapper(transformers_model.model)
-        self.lm_head = transformers_model.lm_head
-        self.config = transformers_model.config
-        self.vocab_size = transformers_model.config.vocab_size
-        
-        # Ensure config has all required attributes for driver.py
-        self._ensure_config_compatibility()
-
-    def _ensure_config_compatibility(self):
-        """
-        Ensure the config has all attributes expected by driver.py
-        """
-        # Map Qwen3 config attributes to expected names if needed
-        if not hasattr(self.config, 'num_key_value_heads'):
-            # Qwen3 might use different attribute names
-            if hasattr(self.config, 'num_key_value_heads'):
-                pass  # Already has the right name
-            elif hasattr(self.config, 'num_kv_heads'):
-                self.config.num_key_value_heads = self.config.num_kv_heads
+    def __init__(self, config):
+        # Ensure config compatibility for FlashInfer
+        if not hasattr(config, 'num_key_value_heads'):
+            if hasattr(config, 'num_kv_heads'):
+                config.num_key_value_heads = config.num_kv_heads
             else:
-                # Default to num_attention_heads if not specified
-                self.config.num_key_value_heads = getattr(self.config, 'num_attention_heads', 32)
-        
-        # Ensure other required attributes exist
-        if not hasattr(self.config, 'hidden_size'):
-            self.config.hidden_size = getattr(self.config, 'd_model', 4096)
-            
-        if not hasattr(self.config, 'num_attention_heads'):
-            self.config.num_attention_heads = getattr(self.config, 'n_head', 32)
-            
-        if not hasattr(self.config, 'num_hidden_layers'):
-            self.config.num_hidden_layers = getattr(self.config, 'n_layer', 24)
+                config.num_key_value_heads = getattr(config, 'num_attention_heads', 32)
 
-    @classmethod
-    def from_pretrained(cls, model_name_or_path, **kwargs):
-        """
-        Load a Qwen3 model using standard transformers AutoModelForCausalLM
-        """
-        print(f"Loading Qwen3 model: {model_name_or_path}")
-        
-        # Ensure trust_remote_code is set
-        kwargs['trust_remote_code'] = True
-        
-        # Suppress the rope_scaling warning about unrecognized keys
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="Unrecognized keys in `rope_scaling`")
-            
-            # Load model using standard transformers
-            transformers_model = AutoModelForCausalLM.from_pretrained(
-                model_name_or_path,
-                **kwargs
-            )
-        
-        print(f"Model loaded successfully: {type(transformers_model)}")
-        return cls(transformers_model)
+        super().__init__(config)
+        self.model = Q4wenModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    # ----- embedding helpers (HF API) ------------------------------------ #
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
@@ -151,3 +38,94 @@ class QwenForCausalLM:
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    # == Test only ==
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None, **kwargs):
+        """
+        Forward pass for QwenForCausalLM.
+        
+        NOTE: This method is only used by test scripts and standalone usage.
+        In production, the Symphony driver calls self.model.forward() directly,
+        bypassing this wrapper method entirely.
+        """
+        # Convert input_ids to embeddings if needed
+        if input_ids is not None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+        else:
+            inputs_embeds = kwargs.get('inputs_embeds')
+
+        if inputs_embeds is None:
+            raise ValueError("Either input_ids or inputs_embeds must be provided")
+
+        batch_size, seq_len = inputs_embeds.shape[:2]
+        device = inputs_embeds.device
+
+        # Create simple position_ids if not provided
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+        # Check if we have proper FlashInfer parameters from the driver
+        has_flashinfer_params = all(param is not None for param in [
+            kwargs.get('kv_cache_at_layer'),
+            kwargs.get('kv_page_indices'),
+            kwargs.get('kv_page_indptr'),
+            kwargs.get('kv_last_page_lens'),
+            kwargs.get('qo_indptr')
+        ])
+
+        if has_flashinfer_params:
+            # Production path: use driver-provided FlashInfer parameters
+            outputs = self.model(
+                input_embeds=inputs_embeds,
+                position_ids=position_ids,
+                **kwargs
+            )
+        else:
+            # Testing/fallback path: create minimal dummy FlashInfer parameters
+            
+            from config import NUM_TOKENS_IN_BLOCK
+            
+            # Calculate number of pages needed
+            total_tokens = batch_size * seq_len
+            num_pages = (total_tokens + NUM_TOKENS_IN_BLOCK - 1) // NUM_TOKENS_IN_BLOCK
+            
+            # Create dummy KV cache (simplified single-page setup)
+            head_dim = getattr(self.config, 'head_dim', self.config.hidden_size // self.config.num_attention_heads)
+            kv_cache_at_layer = [
+                torch.zeros(
+                    (num_pages, 2, NUM_TOKENS_IN_BLOCK, self.config.num_key_value_heads, head_dim),
+                    dtype=inputs_embeds.dtype,
+                    device=device
+                ) for _ in range(self.config.num_hidden_layers)
+            ]
+            
+            # Create dummy page indices and pointers for simple sequential layout
+            kv_page_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+            kv_page_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device) * (num_pages // batch_size)
+            kv_last_page_lens = torch.full((batch_size,), seq_len % NUM_TOKENS_IN_BLOCK or NUM_TOKENS_IN_BLOCK, dtype=torch.int32, device=device)
+            qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device) * seq_len
+            
+            # Create causal mask (lower triangular)
+            custom_mask = torch.tril(torch.ones(total_tokens, total_tokens, dtype=torch.bool, device=device))
+            
+            outputs = self.model(
+                input_embeds=inputs_embeds,
+                position_ids=position_ids,
+                kv_cache_at_layer=kv_cache_at_layer,
+                kv_page_indices=kv_page_indices,
+                kv_page_indptr=kv_page_indptr,
+                kv_last_page_lens=kv_last_page_lens,
+                qo_indptr=qo_indptr,
+                custom_mask=custom_mask,
+                single_token_inference_mode=False,
+            )
+
+        hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+        logits = self.lm_head(hidden_states)
+
+        return type('ModelOutput', (), {
+            'logits': logits,
+            'past_key_values': getattr(outputs, 'past_key_values', None),
+            'hidden_states': getattr(outputs, 'hidden_states', None),
+            'attentions': getattr(outputs, 'attentions', None),
+        })()
