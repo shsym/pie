@@ -171,7 +171,7 @@ class L4maModel(nn.Module):
             kv_last_page_lens: torch.Tensor,
             qo_indptr: torch.Tensor,
             custom_mask: torch.Tensor,
-            single_token_inference_mode:bool=False,
+            single_token_inference_mode: bool=False,
     ) -> torch.Tensor:
         # attention_mask = proc_mask(attention_mask, batch.dtype())
         hidden_states = input_embeds

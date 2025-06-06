@@ -5,10 +5,15 @@ use crate::proto::handshake;
 use prost::Message;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
+use std::process::Stdio;
 use tokio::time::Duration;
 use tracing::{info, warn, debug};
 use uuid::Uuid;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use std::io::Write;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Process manager for backend model instances
 #[derive(Clone, Debug)]
@@ -127,14 +132,82 @@ impl ProcessManager {
             .env("PIE_MODEL_NAME", full_model_name)
             .env("PIE_ENDPOINT", &endpoint);
 
-        info!("Spawning backend process for model '{}' (full name: '{}') with endpoint '{}'", model_name, full_model_name, endpoint);
+        // Create log file for this backend instance
+        let log_file_name = format!("symphony-backend-{}.log", model_name);
+        let log_file_path = std::path::Path::new(&log_file_name);
+        
+        // Configure command to pipe stdout and stderr
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        info!("Spawning backend process for model '{}' (full name: '{}') with endpoint '{}', logs: {}", 
+              model_name, full_model_name, endpoint, log_file_path.display());
         debug!("Command: {:?}", command);
 
         // Spawn the process
-        let process = command.spawn()
+        let mut process = command.spawn()
             .map_err(|e| ProcessError::SpawnFailed(format!("Failed to spawn {}: {}", script_path.display(), e)))?;
 
         info!("Successfully spawned model instance: {} (PID: {:?})", model_name, process.id());
+
+        // Set up logging with periodic flushing
+        let stdout = process.stdout.take().ok_or_else(|| ProcessError::SpawnFailed("Failed to capture stdout".to_string()))?;
+        let stderr = process.stderr.take().ok_or_else(|| ProcessError::SpawnFailed("Failed to capture stderr".to_string()))?;
+        
+        // Create log file with buffered writer
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_file_path)
+            .map_err(|e| ProcessError::SpawnFailed(format!("Failed to create log file {}: {}", log_file_path.display(), e)))?;
+        
+        let log_writer = Arc::new(Mutex::new(std::io::BufWriter::new(log_file)));
+        
+        // Spawn background task for stdout logging
+        let stdout_log_writer = log_writer.clone();
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut writer = stdout_log_writer.lock().await;
+                if let Err(e) = writeln!(writer, "{}", line) {
+                    warn!("Failed to write stdout to log: {}", e);
+                    break;
+                }
+            }
+        });
+        
+        // Spawn background task for stderr logging
+        let stderr_log_writer = log_writer.clone();
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut writer = stderr_log_writer.lock().await;
+                if let Err(e) = writeln!(writer, "{}", line) {
+                    warn!("Failed to write stderr to log: {}", e);
+                    break;
+                }
+            }
+        });
+        
+        // Spawn background task for periodic flushing
+        let flush_log_writer = log_writer.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let mut writer = flush_log_writer.lock().await;
+                if let Err(e) = writer.flush() {
+                    warn!("Failed to flush log file: {}", e);
+                    break;
+                }
+            }
+        });
 
         // Give the backend a moment to start up
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;

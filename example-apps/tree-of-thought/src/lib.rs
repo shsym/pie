@@ -5,8 +5,8 @@ use pie::{Context, Model};
 const PROPOSE_PROMPT_TEMPLATE: &str = "Please generate a high-level plan for solving the following question. As the first step, just say what method and idea you will use to solve the question. You can reorganize the information in the question. Do not do the actual calculation. Keep your response concise and within 80 words. Question: ";
 const EXECUTE_PROMPT: &str = "The plan looks good! Now, use real numbers and do the calculation. Please solve the question step-by-step according to the high-level plan. Give me the final answer. Make your response short.";
 const REFLECT_PROMPT: &str = "Okay. Now you evaluate your own solution and give it a score on a scale of 1 to 5. Please do rigorous check of the correctness.";
-const ASSISTANT_PREFIX: &str = "<|start_header_id|>assistant<|end_header_id|>\n\n";
-const STOP_TOKEN: &str = "<|eot_id|>";
+const ASSISTANT_PREFIX: &str = "<｜Assistant｜>";
+const STOP_TOKEN: &str = "<｜end▁of▁sentence｜>";
 const MAX_TOKENS: usize = 32;
 
 /// Asynchronously generates branches concurrently for proposing a plan.
@@ -185,8 +185,8 @@ async fn main() -> Result<(), String> {
 
     let model = Model::new(available_models.first().unwrap()).unwrap();
     let mut ctx = model.create_context();
-    ctx.fill("<|begin_of_text|>");
-    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
+    ctx.fill("<｜begin▁of▁sentence｜>");
+    ctx.fill("You are a helpful, respectful and honest assistant.<｜User｜>");
 
     let question = "What is the sum of 123456789 and 987654321?";
     let num_branches = 3;

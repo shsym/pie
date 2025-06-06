@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["pie", "pie-macros", "helloworld", "messaging", "ping", "prefix-sharing", "speculative-decoding", "constrained-decoding", "simple-decoding", "parallel-generation", "function-calling", "helloworld-plain", "openai-compat", "http-server", "text-completion",  "tree-of-thought", "graph-of-thought", "recursion-of-thought", "skeleton-of-thought", "beam-search", "agent-react", "agent-react-bench", "agent-codeact", "agent-swarm", "attention-sink", "rt-bench", "startup-bench"]
+members = ["pie", "pie-macros", "helloworld", "messaging", "ping", "prefix-sharing", "speculative-decoding", "constrained-decoding", "simple-decoding", "simple-decoding-qwen", "parallel-generation", "function-calling", "helloworld-plain", "openai-compat", "http-server", "text-completion",  "tree-of-thought", "graph-of-thought", "recursion-of-thought", "skeleton-of-thought", "beam-search", "agent-react", "agent-react-bench", "agent-codeact", "agent-swarm", "attention-sink", "rt-bench", "startup-bench"]
 
 [workspace.dependencies]
 wit-bindgen = "0.42.1"

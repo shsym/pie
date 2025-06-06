@@ -16,7 +16,7 @@ import handshake_pb2
 from common import ceil_div, handle_request # Updated import
 from driver import Driver
 from llama import LlamaForCausalLM
-from config import VERSION, MODEL_NAME, FULL_MODEL_NAME, NUM_TOKENS_IN_BLOCK, MAX_NUM_PAGES, MAX_NUM_EMBEDS
+from config import MAX_NUM_PAGES, MAX_NUM_EMBEDS
 
 
 def main_run():
