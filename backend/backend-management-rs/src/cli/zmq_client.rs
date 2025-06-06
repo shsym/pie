@@ -154,9 +154,6 @@ pub async fn send_command_to_service(command_enum: Commands, json: bool) -> Resu
         Commands::StartService { .. } => {
             return Err("StartService command should be handled locally, not sent to service".to_string());
         }
-        Commands::Log { .. } => {
-            return Err("Log command should be handled locally, not sent to service".to_string());
-        }
     };
 
     // 4. Send the command and get a response with spinner for long operations
@@ -221,7 +218,6 @@ fn should_show_spinner(command: &Commands, json: bool) -> bool {
         Commands::ListModels => false,   // Quick operation
         Commands::StopService => true,
         Commands::StartService { .. } => false,
-        Commands::Log { .. } => false,    // Handled locally
     }
 }
 
@@ -490,10 +486,6 @@ fn format_response_pretty(command: &Commands, data: &serde_json::Value) -> Resul
             } else {
                 Ok(format!("✅ Model '{}' transformation completed", model_name))
             }
-        }
-        Commands::Log { .. } => {
-            // This should never be called since Log is handled locally
-            Ok("Log command handled locally".to_string())
         }
     }
 }

@@ -10,6 +10,7 @@
 #include "l4ma.cuh"
 #include <zmq.hpp>
 #include <random>
+#include "ztensor.hpp"
 
 // Helper to fill thrust::device_vector with random floats
 void fill_random(thrust::device_vector<float> &vec, float min = -1.0f, float max = 1.0f)

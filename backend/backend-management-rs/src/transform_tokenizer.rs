@@ -102,10 +102,8 @@ pub struct TokenizerMetadata {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AddedTokenInfo {
+    pub id: u32,
     pub content: String,
-    #[serde(default)]
-    pub id: Option<u32>,
-    #[serde(default)]
     pub special: bool,
 }
 
@@ -183,8 +181,8 @@ pub fn extract_tokenizer_metadata(hf_tokenizer: &HfTokenizerJson) -> Result<Toke
     let added_tokens: Vec<AddedTokenInfo> = hf_tokenizer.added_tokens
         .iter()
         .map(|token| AddedTokenInfo {
+            id: token.id,
             content: token.content.clone(),
-            id: Some(token.id),
             special: token.special.unwrap_or(false),
         })
         .collect();
@@ -192,9 +190,7 @@ pub fn extract_tokenizer_metadata(hf_tokenizer: &HfTokenizerJson) -> Result<Toke
     // Also add special tokens to the special_tokens map
     for token in &added_tokens {
         if token.special {
-            if let Some(id) = token.id {
-                special_tokens.insert(token.content.clone(), id);
-            }
+            special_tokens.insert(token.content.clone(), token.id);
         }
     }
 
