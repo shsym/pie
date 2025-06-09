@@ -24,6 +24,12 @@
 #include <vector>
 #include <memory>
 
+#include <string>
+#include <iostream>
+
+// Loads L4maConfig from a YAML file using yaml-cpp
+
+
 constexpr int PAGE_SIZE = 16; // Or get from config
 
 struct L4maConfig
@@ -41,7 +47,25 @@ struct L4maConfig
 
     // Helper for head_dim
     int head_dim() const { return hidden_size / num_attention_heads; }
+
+    // Print all config data
+    void print() const {
+        std::cout << "L4maConfig {\n"
+                  << "  hidden_size: " << hidden_size << "\n"
+                  << "  intermediate_size: " << intermediate_size << "\n"
+                  << "  num_attention_heads: " << num_attention_heads << "\n"
+                  << "  num_key_value_heads: " << num_key_value_heads << "\n"
+                  << "  use_qkv_bias: " << (use_qkv_bias ? "true" : "false") << "\n"
+                  << "  rms_norm_eps: " << rms_norm_eps << "\n"
+                  << "  vocab_size: " << vocab_size << "\n"
+                  << "  pad_token_id: " << pad_token_id << "\n"
+                  << "  num_hidden_layers: " << num_hidden_layers << "\n"
+                  << "}"
+                  << std::endl;
+    }
 };
+
+L4maConfig load_l4ma_config_from_yaml(const std::string& yaml_path);
 
 template <typename T = float>
 class L4maMlp
@@ -156,6 +180,10 @@ template <typename T = float>
 class L4maModel
 {
 public:
+    // New static factory method
+    static L4maModel<T> from_files(const std::string& yaml_path, const std::string& ztensor_path);
+
+    // Old constructor for backward compatibility
     L4maModel(const L4maConfig &config /* paths to weights or pre-loaded weight pointers */);
     ~L4maModel();
 

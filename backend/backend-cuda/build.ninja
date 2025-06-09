@@ -2,7 +2,7 @@
 
 # Variables
 nvcc = nvcc
-cxxflags = -std=c++20 -Xcompiler -Wall -Xcompiler -Wextra -gencode arch=compute_89,code=sm_89
+cxxflags = -std=c++20 -Xcompiler -Wall -Xcompiler -Wextra -gencode arch=compute_89,code=sm_89 --extended-lambda
 # Add -g -G for debug symbols and device-side debugging
 # cxxflags += -g -G
 
@@ -28,7 +28,7 @@ rule cu_compile
 
 # Rule to link object files into the final executable
 rule link
-  command = $nvcc $cxxflags $in -o $out -lcublas -lcublasLt
+  command = $nvcc $cxxflags $in -o $out -lcublas -lcublasLt -lyaml-cpp
   description = Linking $out
 
 # Build edges
