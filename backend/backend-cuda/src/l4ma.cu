@@ -7,28 +7,29 @@
 #include <cassert>
 #include <iostream>
 #include "flashinfer/norm.cuh"
+#include "flashinfer/activation.cuh"
 
 // Macro for error checking
-#define CUDA_CHECK(call)                                                                                               \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        cudaError_t err = call;                                                                                        \
-        if (err != cudaSuccess)                                                                                        \
-        {                                                                                                              \
-            fprintf(stderr, "CUDA Error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err));         \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
+#define CUDA_CHECK(call)                                                                                       \
+    do                                                                                                         \
+    {                                                                                                          \
+        cudaError_t err = call;                                                                                \
+        if (err != cudaSuccess)                                                                                \
+        {                                                                                                      \
+            fprintf(stderr, "CUDA Error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE);                                                                                \
+        }                                                                                                      \
     } while (0)
 
-#define CUBLAS_CHECK(status)                                                                                           \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        cublasStatus_t _status = (status);                                                                             \
-        if (_status != CUBLAS_STATUS_SUCCESS)                                                                          \
-        {                                                                                                              \
-            fprintf(stderr, "cuBLAS Error in %s at line %d: Status %d\n", __FILE__, __LINE__, _status);                \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
+#define CUBLAS_CHECK(status)                                                                            \
+    do                                                                                                  \
+    {                                                                                                   \
+        cublasStatus_t _status = (status);                                                              \
+        if (_status != CUBLAS_STATUS_SUCCESS)                                                           \
+        {                                                                                               \
+            fprintf(stderr, "cuBLAS Error in %s at line %d: Status %d\n", __FILE__, __LINE__, _status); \
+            exit(EXIT_FAILURE);                                                                         \
+        }                                                                                               \
     } while (0)
 
 /***************************************************************************************************
@@ -157,6 +158,50 @@ __global__ void paged_attention_kernel(
     // ... (rest of simplified kernel logic)
 }
 
+__device__ __forceinline__ float silu(const float &val) { return val / (1.0f + __expf(-val)); }
+
+__device__ __forceinline__ float gelu(const float &val)
+{
+    constexpr float kAlpha = M_SQRT1_2;
+    return val * 0.5f * (1.0f + ::erf(val * kAlpha));
+}
+
+__device__ __forceinline__ float gelu_tanh(const float &val)
+{
+    const float cdf =
+        0.5f * (1.0f + tanhf(0.7978845608028654f * (val + 0.044715f * val * val * val)));
+    return val * cdf;
+}
+
+template <typename T>
+void silu_and_mul(
+    T *out_ptr,
+    const T *in_ptr,
+    int num_tokens,
+    int d_half,
+    cudaStream_t stream,
+    bool enable_pdl)
+{
+    // This function wraps the flashinfer fused kernel for SwiGLU: out = silu(gate) * up
+    // The kernel expects a single concatenated input tensor and internally splits it.
+    // The 'd_half' parameter is the dimension of the gate/up projection (intermediate_size).
+    uint32_t vec_size = 16 / sizeof(T);
+    cudaLaunchConfig_t config;
+    config.gridDim = num_tokens;
+    config.blockDim = std::min(d_half / vec_size, 1024U);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    auto kernel = flashinfer::activation::act_and_mul_kernel<T, silu>;
+    // Pass a single input pointer to the underlying flashinfer kernel
+    cudaLaunchKernelEx(&config, kernel, out_ptr, in_ptr, d_half);
+}
+
 // *** ADDED KERNEL ***
 // Kernel for the MLP's activation function: SwiGLU
 template <typename T>
@@ -257,9 +302,9 @@ L4maConfig load_l4ma_config_from_yaml(const std::string &yaml_path)
 // *** ADDED IMPLEMENTATION ***
 template <typename T>
 L4maMlp<T>::L4maMlp(const L4maConfig &config,
-                   const thrust::device_vector<T> &gate_proj_weights,
-                   const thrust::device_vector<T> &up_proj_weights,
-                   const thrust::device_vector<T> &down_proj_weights)
+                    const thrust::device_vector<T> &gate_proj_weights,
+                    const thrust::device_vector<T> &up_proj_weights,
+                    const thrust::device_vector<T> &down_proj_weights)
     : config_(config),
       gate_proj_weights_(gate_proj_weights),
       up_proj_weights_(up_proj_weights),
@@ -279,25 +324,26 @@ void L4maMlp<T>::forward(thrust::device_vector<T> &output,
     const int hs = config_.hidden_size;
     const int is = config_.intermediate_size;
 
-    // Use the provided temp_buffer for intermediate results
-    T *gate_out_ptr = thrust::raw_pointer_cast(temp_buffer.data());
-    T *up_out_ptr = gate_out_ptr + num_tokens * is;
+    // The temp_buffer holds the concatenated gate and up projections.
+    T *gate_and_up_ptr = thrust::raw_pointer_cast(temp_buffer.data());
+    T *gate_out_ptr = gate_and_up_ptr;
+    T *up_out_ptr = gate_and_up_ptr + num_tokens * is;
 
     const T *x_ptr = thrust::raw_pointer_cast(x.data());
     T *output_ptr = thrust::raw_pointer_cast(output.data());
 
-    // 1. Gate projection: gate_out = x * W_g^T
+    // 1. Gate projection: result stored in the first half of the temp buffer
     gemm_cublasLt<T>(ltHandle, stream, x_ptr, thrust::raw_pointer_cast(gate_proj_weights_.data()), gate_out_ptr, num_tokens, is, hs, false, true);
 
-    // 2. Up projection: up_out = x * W_u^T
+    // 2. Up projection: result stored in the second half of the temp buffer
     gemm_cublasLt<T>(ltHandle, stream, x_ptr, thrust::raw_pointer_cast(up_proj_weights_.data()), up_out_ptr, num_tokens, is, hs, false, true);
 
     // 3. SiLU activation and element-wise multiply
-    // This kernel computes silu(gate_out) * up_out and stores the result in gate_out buffer to reuse memory
-    const int grid_size = (num_tokens * is + 255) / 256;
-    silu_and_mul_kernel<T><<<grid_size, 256, 0, stream>>>(gate_out_ptr, gate_out_ptr, up_out_ptr, num_tokens * is);
+    // The kernel takes the entire gate_and_up_ptr as input and writes the result
+    // into the first half of the buffer (gate_out_ptr), which is then used for the down projection.
+    silu_and_mul<T>(gate_out_ptr, gate_and_up_ptr, num_tokens, is, stream, false);
 
-    // 4. Down projection: output = gate_out * W_d^T
+    // 4. Down projection: output = result * W_d^T
     gemm_cublasLt<T>(ltHandle, stream, gate_out_ptr, thrust::raw_pointer_cast(down_proj_weights_.data()), output_ptr, num_tokens, hs, is, false, true);
 }
 
@@ -397,8 +443,7 @@ void L4maDecoderLayer<T>::forward(
         thrust::raw_pointer_cast(normed_hidden_states_.data()),
         nnz, config_.hidden_size,
         config_.hidden_size, config_.hidden_size,
-        config_.rms_norm_eps, false, stream
-    ));
+        config_.rms_norm_eps, false, stream));
 
     // 2. Attention
     thrust::device_vector<T> attn_output(hidden_states.size());
@@ -419,8 +464,7 @@ void L4maDecoderLayer<T>::forward(
         thrust::raw_pointer_cast(normed_hidden_states_.data()),
         nnz, config_.hidden_size,
         config_.hidden_size, config_.hidden_size,
-        config_.rms_norm_eps, false, stream
-    ));
+        config_.rms_norm_eps, false, stream));
 
     // 5. MLP
     mlp_.forward(hidden_states, normed_hidden_states_, nnz, temp_buffer, ltHandle, stream);
@@ -525,8 +569,7 @@ void L4maModel<T>::forward(
         thrust::raw_pointer_cast(hidden_states_.data()),
         nnz, config_.hidden_size,
         config_.hidden_size, config_.hidden_size,
-        config_.rms_norm_eps, false, stream
-    ));
+        config_.rms_norm_eps, false, stream));
 
     // 4. LM Head (GEMM to get logits)
     // *** FIXED WARNING ***
