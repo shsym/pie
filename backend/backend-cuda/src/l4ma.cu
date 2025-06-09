@@ -6,8 +6,8 @@
 #include <thrust/host_vector.h>
 #include <cassert>
 #include <iostream>
-#include "flashinfer/norm.cuh"
-#include "flashinfer/activation.cuh"
+#include <flashinfer/norm.cuh>
+#include <flashinfer/activation.cuh>
 
 // Macro for error checking
 #define CUDA_CHECK(call)                                                                                       \
@@ -202,19 +202,6 @@ void silu_and_mul(
     cudaLaunchKernelEx(&config, kernel, out_ptr, in_ptr, d_half);
 }
 
-// *** ADDED KERNEL ***
-// Kernel for the MLP's activation function: SwiGLU
-template <typename T>
-__global__ void silu_and_mul_kernel(T *out, const T *gate_in, const T *up_in, int n_elements)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_elements; i += gridDim.x * blockDim.x)
-    {
-        float g = static_cast<float>(gate_in[i]);
-        float u = static_cast<float>(up_in[i]);
-        // out = silu(g) * u
-        out[i] = static_cast<T>((g / (1.0f + expf(-g))) * u);
-    }
-}
 
 /***************************************************************************************************
  * HELPER FUNCTIONS
