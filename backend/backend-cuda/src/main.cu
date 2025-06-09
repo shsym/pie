@@ -1,101 +1,140 @@
+#include "l4ma.cuh"
 #include <iostream>
 #include <vector>
-#include <cuda_runtime.h>
-#include <algorithm>
-#include <cmath>
-
-#include <thrust/execution_policy.h>
+#include <numeric>
+#include <stdexcept>
 #include <thrust/device_vector.h>
-#include "flashinfer_ops.cuh"
-#include "l4ma.cuh"
-#include <zmq.hpp>
-#include <random>
-#include "ztensor.hpp"
-#include <cuda_bf16.h>
-#include <unordered_map>
-#include <cstring>
+#include <thrust/host_vector.h>
+#include <thrust/sequence.h>
+#include <thrust/extrema.h>
+
+/**
+ * @brief Finds the index of the maximum element in a portion of a device vector.
+ * @param logits The device vector of logits.
+ * @param offset The starting offset for the search.
+ * @param size The number of elements to search.
+ * @return The index of the maximum logit relative to the offset.
+ */
+int get_next_token(const thrust::device_vector<float>& logits, size_t offset, size_t size) {
+    // Find the iterator to the maximum element in the specified range
+    auto max_it = thrust::max_element(logits.begin() + offset, logits.begin() + offset + size);
+    // Return the index of that element by calculating the distance from the beginning of the range
+    return thrust::distance(logits.begin() + offset, max_it);
+}
 
 
 int main()
 {
     std::cout << "hello world!" << std::endl;
 
-
     // --- Print ztensor metadata for llama1b.zt ---
     std::string pie_home;
-    const char* env_pie_home = std::getenv("PIE_HOME");
-    if (env_pie_home && env_pie_home[0] != '\0') {
+    const char *env_pie_home = std::getenv("PIE_HOME");
+    if (env_pie_home && env_pie_home[0] != '\0')
+    {
         pie_home = env_pie_home;
-    } else {
-        const char* home = std::getenv("HOME");
-        if (!home) {
+    }
+    else
+    {
+        const char *home = std::getenv("HOME");
+        if (!home)
+        {
             std::cerr << "Could not determine $HOME for PIE_HOME fallback." << std::endl;
             return 1;
         }
         pie_home = std::string(home) + "/.cache/pie";
     }
     std::string zt_path = pie_home + "/llama1b.zt";
-    std::cout << "Reading ztensor file: " << zt_path << std::endl;
-    std::unordered_map<std::string, thrust::device_vector<__nv_bfloat16>> device_tensors;
-    try {
-        ztensor::zTensorReader reader(zt_path);
-        auto tensor_names = reader.list_tensors();
-        std::cout << "Tensors in file (" << tensor_names.size() << "):\n";
-        for (const auto& name : tensor_names) {
-            const auto& info = reader.get_tensor_info(name);
-            std::cout << "- name: " << info.name << "\n"
-                      << "  dtype: " << info.dtype << "\n"
-                      << "  shape: [";
-            for (size_t i = 0; i < info.shape.size(); ++i) {
-                std::cout << info.shape[i];
-                if (i + 1 < info.shape.size()) std::cout << ", ";
-            }
-            std::cout << "]\n" << std::endl;
 
-            // --- Efficiently load and upload as bfloat16 ---
-            const void* raw_ptr = reader.get_raw_tensor_pointer(name);
-            size_t numel = info.num_elements();
-            thrust::device_vector<__nv_bfloat16> dev_bf16(numel);
-            cudaMemcpy(thrust::raw_pointer_cast(dev_bf16.data()), raw_ptr, numel * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
-            device_tensors[name] = std::move(dev_bf16);
-        }
-        // --- Print first 10 elements for each tensor ---
-        std::cout << "\nTensor first 10 elements (on GPU):\n";
-        for (const auto& kv : device_tensors) {
-            const std::string& name = kv.first;
-            if (name.find("model.layers.1.mlp") != 0) continue;
-            const thrust::device_vector<__nv_bfloat16>& dev_bf16 = kv.second;
-            size_t numel = dev_bf16.size();
-            size_t print_count = std::min<size_t>(10, numel);
-            std::vector<__nv_bfloat16> host_bf16(print_count);
-            cudaMemcpy(host_bf16.data(), thrust::raw_pointer_cast(dev_bf16.data()), print_count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-            std::cout << "- " << name << ": ";
-            for (size_t i = 0; i < print_count; ++i) {
-                float val = __bfloat162float(host_bf16[i]);
-                std::cout << val << " ";
-            }
-            std::cout << std::endl;
-        }
+    // set config_path to "./l4ma.yaml"
+    std::string config_path = "./l4ma.yaml";
+    const int MAX_TOTAL_TOKENS = 2048;
 
-        // --- L4MA model config and weights from files ---
-        auto model = L4maModel<__nv_bfloat16>::from_files("./l4ma.yaml", zt_path);
-        // --- Dummy input for forward pass ---
-        int num_tokens = 4;
-        thrust::device_vector<__nv_bfloat16> x(num_tokens * model.config_.hidden_size, __float2bfloat16(1.0f));
-        thrust::device_vector<__nv_bfloat16> output(num_tokens * model.config_.hidden_size);
-        // Forward pass (stub)
-        model.forward(output, x, nullptr, /*kv_cache_k*/ x, /*kv_cache_v*/ x, nullptr, nullptr, nullptr, nullptr, nullptr, false, num_tokens, 1, 0, 0, 0);
-        // Print a few output values
-        std::vector<__nv_bfloat16> output_host(output.size());
-        cudaMemcpy(output_host.data(), thrust::raw_pointer_cast(output.data()), output.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-        std::cout << "L4maModel output (first 8 values): ";
-        for (int i = 0; i < std::min(8, (int)output_host.size()); ++i) {
-            std::cout << __bfloat162float(output_host[i]) << " ";
-        }
-        std::cout << std::endl;
+    try
+    {
+        // --- 2. Load Model ---
+        std::cout << "Loading model from files..." << std::endl;
+        // Use the static factory method to load config, weights, and construct the model
+        auto model = L4maModel<__nv_bfloat16>::from_files(config_path, zt_path);
+        std::cout << "Model loaded successfully." << std::endl;
 
-    } catch (const std::exception& e) {
-        std::cerr << "Error reading ztensor file: " << e.what() << std::endl;
+        // Extract config details needed for setup
+        // IMPORTANT: The model class should expose its config. For this example, we re-load it.
+        // In a better design, model.config() would be a public method.
+        L4maConfig config = load_l4ma_config_from_yaml(config_path);
+
+        // --- 3. Prepare Inputs (Simulate a Tokenized Prompt) ---
+        // In a real application, this would come from a tokenizer.
+        // Let's create a sample prompt with 5 tokens.
+        thrust::host_vector<int32_t> h_input_ids = {101, 2054, 2003, 2026, 102};
+        thrust::device_vector<int32_t> d_input_ids = h_input_ids;
+        int num_input_tokens = d_input_ids.size();
+
+        // Create position IDs: [0, 1, 2, 3, 4]
+        thrust::device_vector<int32_t> d_position_ids(num_input_tokens);
+        thrust::sequence(d_position_ids.begin(), d_position_ids.end());
+        std::cout << "Prepared input with " << num_input_tokens << " tokens." << std::endl;
+
+        // --- 4. Prepare Paged KV Cache ---
+        // This simulates what an inference server's memory manager would do.
+        const int batch_size = 1; // We are processing one prompt
+        const int num_kv_heads = config.num_key_value_heads;
+        const int head_dim = config.head_dim();
+        const int num_layers = config.num_hidden_layers;
+
+        // Allocate the main KV cache buffers
+        const int num_cache_pages = (MAX_TOTAL_TOKENS / PAGE_SIZE) * num_layers;
+        size_t cache_buffer_size = num_cache_pages * PAGE_SIZE * num_kv_heads * head_dim;
+        thrust::device_vector<__nv_bfloat16> kv_cache_k(cache_buffer_size);
+        thrust::device_vector<__nv_bfloat16> kv_cache_v(cache_buffer_size);
+
+        // Metadata to describe the cache layout for this request
+        // For a single prompt prefill, the layout is simple.
+        int pages_for_request = (num_input_tokens + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        // kv_page_indices: The list of physical page numbers assigned to this request
+        thrust::device_vector<int32_t> d_kv_page_indices(pages_for_request);
+        thrust::sequence(d_kv_page_indices.begin(), d_kv_page_indices.end()); // Assign pages [0, 1, 2, ...]
+
+        // kv_page_indptr: Start and end pointers into the kv_page_indices list for each sequence in the batch
+        thrust::device_vector<int32_t> d_kv_page_indptr = {0, pages_for_request};
+
+        // kv_last_page_lens: The number of tokens in the last page of each sequence. For prefill, it's 0.
+        thrust::device_vector<int32_t> d_kv_last_page_lens = {0};
+
+        // qo_indptr: Start and end indices for tokens in the flat input_ids tensor.
+        thrust::device_vector<int32_t> d_qo_indptr = {0, num_input_tokens};
+
+        std::cout << "KV Cache allocated and configured for prefill." << std::endl;
+
+        // --- 5. Run Inference ---
+        thrust::device_vector<float> d_logits;
+        cudaStream_t stream = 0; // Use default stream
+
+        std::cout << "\nRunning forward pass..." << std::endl;
+        model.forward(d_logits, d_input_ids, d_position_ids,
+                      kv_cache_k, kv_cache_v,
+                      thrust::raw_pointer_cast(d_kv_page_indices.data()),
+                      thrust::raw_pointer_cast(d_kv_page_indptr.data()),
+                      thrust::raw_pointer_cast(d_kv_last_page_lens.data()),
+                      thrust::raw_pointer_cast(d_qo_indptr.data()),
+                      batch_size, stream);
+
+        // Wait for all CUDA kernels to finish
+        cudaDeviceSynchronize();
+        std::cout << "Forward pass complete." << std::endl;
+
+        // --- 6. Get Result ---
+        // We want the logits for the *last* token to predict the next one.
+        size_t last_token_offset = (num_input_tokens - 1) * config.vocab_size;
+        int next_token_id = get_next_token(d_logits, last_token_offset, config.vocab_size);
+
+        std::cout << "\n--- Inference Result ---" << std::endl;
+        std::cout << "Predicted Next Token ID: " << next_token_id << std::endl;
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "\nAn error occurred: " << e.what() << std::endl;
         return 1;
     }
 
