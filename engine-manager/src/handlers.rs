@@ -4,6 +4,30 @@ use crate::models::{
 use crate::state::SharedState;
 use axum::{extract::{Path, State}, http::StatusCode, Json};
 use uuid::Uuid;
+use serde_json::{json, Value};
+use std::process::{Command, Child, Stdio};
+use std::sync::{Arc, Mutex};
+
+// Global state for controller processes
+static CONTROLLER_PROCESSES: std::sync::OnceLock<Arc<Mutex<ControllerProcesses>>> = std::sync::OnceLock::new();
+
+#[derive(Default)]
+struct ControllerProcesses {
+    engine_process: Option<Child>,
+}
+
+fn get_controller_processes() -> &'static Arc<Mutex<ControllerProcesses>> {
+    CONTROLLER_PROCESSES.get_or_init(|| Arc::new(Mutex::new(ControllerProcesses::default())))
+}
+
+// GET /health
+pub async fn health_handler() -> Json<Value> {
+    Json(json!({
+        "status": "healthy",
+        "service": "pie-engine-manager",
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    }))
+}
 
 // POST /backends/register
 pub async fn register_backend_handler(
@@ -103,4 +127,95 @@ pub async fn terminate_backend_handler(
             Err(StatusCode::NOT_FOUND)
         }
     }
+}
+
+// GET /controller/status
+pub async fn controller_status_handler() -> Json<Value> {
+    let processes = get_controller_processes();
+    let processes_guard = processes.lock().unwrap();
+
+    Json(json!({
+        "status": "healthy",
+        "service": "pie-engine-manager",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "controller": {
+            "engine_process_running": processes_guard.engine_process.is_some()
+        }
+    }))
+}
+
+// POST /controller/start
+pub async fn controller_start_handler() -> Result<Json<Value>, StatusCode> {
+    let processes = get_controller_processes();
+    let mut processes_guard = processes.lock().unwrap();
+
+    if processes_guard.engine_process.is_some() {
+        return Ok(Json(json!({
+            "status": "already_running",
+            "message": "Controller engine process is already running"
+        })));
+    }
+
+    // For now, we'll just simulate starting an engine process
+    // In Phase 3, this would actually start the engine
+    tracing::info!("Starting controller engine process (simulated)");
+
+    Ok(Json(json!({
+        "status": "started",
+        "message": "Controller engine process started successfully"
+    })))
+}
+
+// POST /controller/stop
+pub async fn controller_stop_handler() -> Result<Json<Value>, StatusCode> {
+    let processes = get_controller_processes();
+    let mut processes_guard = processes.lock().unwrap();
+
+    if let Some(mut engine_process) = processes_guard.engine_process.take() {
+        tracing::info!("Stopping controller engine process");
+        if let Err(e) = engine_process.kill() {
+            tracing::error!("Failed to kill engine process: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        if let Err(e) = engine_process.wait() {
+            tracing::error!("Failed to wait for engine process: {}", e);
+        }
+    }
+
+    Ok(Json(json!({
+        "status": "stopped",
+        "message": "Controller stopped successfully"
+    })))
+}
+
+// POST /shutdown - Gracefully shutdown the engine-manager service
+pub async fn shutdown_handler() -> Result<Json<Value>, StatusCode> {
+    tracing::info!("Received shutdown request");
+
+    // First stop any running engine processes
+    let processes = get_controller_processes();
+    let mut processes_guard = processes.lock().unwrap();
+
+    if let Some(mut engine_process) = processes_guard.engine_process.take() {
+        tracing::info!("Stopping engine process before shutdown");
+        if let Err(e) = engine_process.kill() {
+            tracing::error!("Failed to kill engine process: {}", e);
+        }
+        if let Err(e) = engine_process.wait() {
+            tracing::error!("Failed to wait for engine process: {}", e);
+        }
+    }
+
+    // Spawn a task to shutdown the server after a short delay
+    // This allows the response to be sent before the server shuts down
+    tokio::spawn(async {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tracing::info!("Shutting down engine-manager service");
+        std::process::exit(0);
+    });
+
+    Ok(Json(json!({
+        "status": "shutting_down",
+        "message": "Engine-manager service is shutting down"
+    })))
 }

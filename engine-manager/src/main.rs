@@ -4,7 +4,9 @@ use axum::{
 };
 use clap::Parser;
 use engine_manager::{
-    handlers::{heartbeat_handler, list_backends_handler, register_backend_handler},
+    handlers::{health_handler, heartbeat_handler, list_backends_handler, register_backend_handler,
+               controller_status_handler, controller_start_handler, controller_stop_handler,
+               shutdown_handler},
     state::AppState,
 };
 use std::net::SocketAddr;
@@ -27,16 +29,23 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Initialize tracing with info level by default
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
     let shared_state = Arc::new(RwLock::new(AppState::new()));
 
     // Build our application with routes
     let app = Router::new()
+        .route("/health", get(health_handler))
         .route("/backends", get(list_backends_handler))
         .route("/backends/register", post(register_backend_handler))
         .route("/backends/:backend_id/heartbeat", post(heartbeat_handler))
+        .route("/controller/status", get(controller_status_handler))
+        .route("/controller/start", post(controller_start_handler))
+        .route("/controller/stop", post(controller_stop_handler))
+        .route("/shutdown", post(shutdown_handler))
         .with_state(shared_state);
 
     // Select address based on command line argument
@@ -47,6 +56,7 @@ async fn main() {
     };
 
     let addr = SocketAddr::from((ip, args.port));
+    println!("Starting engine-management-service on {}", addr);
     tracing::info!("engine-management-service listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
