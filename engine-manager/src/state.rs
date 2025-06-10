@@ -28,18 +28,27 @@ impl AppState {
         backend_id
     }
 
-    pub fn record_heartbeat(&mut self, backend_id: &Uuid) -> Result<BackendStatus, &'static str> {
+    pub fn record_heartbeat(&mut self, backend_id: &Uuid) -> Result<Option<BackendStatus>, &'static str> {
         if let Some(backend) = self.backends.get_mut(backend_id) {
             backend.last_heartbeat = Some(std::time::SystemTime::now());
             let old_status = backend.status.clone();
-            if old_status == BackendStatus::Initializing {
+            let status_changed = if old_status == BackendStatus::Initializing {
                 backend.status = BackendStatus::Running;
+                true
             } else if old_status == BackendStatus::Unresponsive {
                  backend.status = BackendStatus::Running; // Recovered
+                 true
+            } else {
+                // If already Running, just update heartbeat time.
+                // If Terminated, a heartbeat should ideally not occur or be ignored.
+                false
+            };
+            
+            if status_changed {
+                Ok(Some(backend.status.clone()))
+            } else {
+                Ok(None)
             }
-            // If already Running, just update heartbeat time.
-            // If Terminated, a heartbeat should ideally not occur or be ignored.
-            Ok(backend.status.clone())
         } else {
             Err("Backend not found")
         }
@@ -55,5 +64,14 @@ impl AppState {
                 capabilities: info.capabilities.clone(),
             })
             .collect()
+    }
+
+    pub fn terminate_backend(&mut self, backend_id: &Uuid) -> Result<(), &'static str> {
+        if let Some(backend) = self.backends.get_mut(backend_id) {
+            backend.status = BackendStatus::Terminated;
+            Ok(())
+        } else {
+            Err("Backend not found")
+        }
     }
 }
