@@ -12,6 +12,7 @@ mod model;
 mod application;
 mod spinner;
 mod constants;
+mod config;
 
 use controller::ControllerCommands;
 use backend::BackendCommands;

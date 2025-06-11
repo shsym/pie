@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, Context};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::path::{Path, PathBuf};
@@ -9,6 +9,19 @@ use tracing::{info, warn, debug};
 use serde_json::Value;
 use crate::spinner::{with_spinner, with_dynamic_spinner};
 use crate::constants::{network, spinner as spinner_constants};
+use crate::config::Config;
+
+/// Resolve a path to an absolute path
+fn resolve_absolute_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
+    let path = path.as_ref();
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        let current_dir = std::env::current_dir()
+            .context("Failed to get current directory")?;
+        Ok(current_dir.join(path))
+    }
+}
 
 #[derive(Subcommand)]
 pub enum ControllerCommands {
@@ -51,9 +64,13 @@ pub enum ControllerCommands {
 }
 
 pub async fn handle_command(cmd: ControllerCommands) -> Result<()> {
+    // Load the unified configuration
+    let config = Config::load_default()
+        .context("Failed to load configuration file. Please ensure config.json exists in the project root.")?;
+
     match cmd {
         ControllerCommands::Start { host, port, engine_port } => {
-            start_controller(&host, port, engine_port).await
+            start_controller(&config, &host, port, engine_port).await
         }
         ControllerCommands::Status { host, port } => {
             check_status(&host, port).await
@@ -64,7 +81,35 @@ pub async fn handle_command(cmd: ControllerCommands) -> Result<()> {
     }
 }
 
-async fn start_controller(host: &str, port: u16, _engine_port: u16) -> Result<()> {
+async fn start_engine_via_manager(management_url: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let start_url = format!("{}/controller/start", management_url);
+
+    let response = client.post(&start_url)
+        .send()
+        .await
+        .context("Failed to send start engine request")?;
+
+    if response.status().is_success() {
+        let response_json: Value = response.json().await
+            .context("Failed to parse start engine response")?;
+
+        if let Some(status) = response_json.get("status").and_then(|s| s.as_str()) {
+            if status == "started" || status == "already_running" {
+                debug!("Engine start response: {:?}", response_json);
+                return Ok(());
+            }
+        }
+
+        bail!("Engine start returned unexpected status: {:?}", response_json);
+    } else {
+        let status_code = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        bail!("Failed to start engine: HTTP {} - {}", status_code, error_text);
+    }
+}
+
+async fn start_controller(config: &Config, host: &str, port: u16, _engine_port: u16) -> Result<()> {
     // Check if engine-manager is already running
     if check_engine_manager_health(&format!("http://{}:{}", host, port)).await {
         println!("✓ Engine-manager is already running at http://{}:{}", host, port);
@@ -75,7 +120,7 @@ async fn start_controller(host: &str, port: u16, _engine_port: u16) -> Result<()
     // Start the spinner immediately and run the entire startup process
     let startup_future = async {
         // Start engine-manager process in detached mode
-        start_engine_manager_detached(host, port).await?;
+        start_engine_manager_detached(config, host, port).await?;
 
         // Wait for engine-manager to start with a spinning indicator
         // Instead of a single 2-second sleep, we'll do smaller sleeps
@@ -124,64 +169,88 @@ async fn start_controller(host: &str, port: u16, _engine_port: u16) -> Result<()
     ).await?;
 
     info!("Engine-manager started successfully");
+
+    // Now start the engine process through the engine-manager
+    let start_engine_future = async {
+        let management_url = format!("http://{}:{}", host, port);
+        start_engine_via_manager(&management_url).await
+    };
+
+    with_spinner(
+        start_engine_future,
+        "Starting engine process...",
+        "Engine started successfully!"
+    ).await?;
+
     info!("Pie controller started successfully!");
 
     println!("🚀 Engine management service available at: http://{}:{}", host, port);
+    println!("🚀 Engine process started and available via WebSocket");
     println!("   Use 'pie-cli controller status' to check status");
     println!("   Use 'pie-cli controller stop' to stop all services");
 
     Ok(())
 }
 
-fn find_engine_manager_binary() -> Result<PathBuf> {
+fn find_binary_from_config(binary_name: &str, search_paths: &[String]) -> Result<PathBuf> {
     // First, try to find it in PATH (works when installed/bundled)
-    if let Ok(output) = Command::new("which").arg("pie_engine_manager").output() {
+    if let Ok(output) = Command::new("which").arg(binary_name).output() {
         if output.status.success() {
             let path_output = String::from_utf8_lossy(&output.stdout);
             let path_str = path_output.trim();
             if !path_str.is_empty() {
-                debug!("Found pie_engine_manager in PATH: {}", path_str);
-                return Ok(PathBuf::from(path_str));
+                let absolute_path = resolve_absolute_path(path_str)?;
+                info!("Found {} in PATH: {}", binary_name, absolute_path.display());
+                return Ok(absolute_path);
             }
         }
     }
 
-    // Fallback: try relative paths for development
-    let relative_paths = [
-        "../engine-manager/target/release/pie_engine_manager",
-        "../engine-manager/target/debug/pie_engine_manager",
-        "../../engine-manager/target/release/pie_engine_manager", // if running from cli/target/
-        "../../engine-manager/target/debug/pie_engine_manager",
-    ];
-
-    for path_str in &relative_paths {
+    // Try the configured search paths
+    for path_str in search_paths {
         let path = Path::new(path_str);
         if path.exists() {
-            debug!("Found pie_engine_manager at relative path: {}", path_str);
-            return Ok(path.to_path_buf());
+            let absolute_path = resolve_absolute_path(path)?;
+            info!("Found {} at configured path: {}", binary_name, absolute_path.display());
+            return Ok(absolute_path);
         }
     }
 
-    bail!("Could not find pie_engine_manager binary. Please ensure it's compiled or in PATH.")
+    bail!("Could not find {} binary. Please ensure it's compiled or in PATH.", binary_name)
 }
 
-async fn start_engine_manager_detached(host: &str, port: u16) -> Result<()> {
-    let binary_path = find_engine_manager_binary()?;
+fn find_engine_manager_binary(config: &Config) -> Result<PathBuf> {
+    find_binary_from_config(
+        &config.services.engine_manager.binary_name,
+        &config.paths.engine_manager_binary_search
+    )
+}
+
+
+async fn start_engine_manager_detached(config: &Config, host: &str, port: u16) -> Result<()> {
+    let binary_path = find_engine_manager_binary(config)?;
+
+    // Log the exact binary we're about to start
+    info!("Starting engine-manager from: {}", binary_path.display());
 
     // Create logs directory if it doesn't exist
-    create_dir_all("logs").unwrap_or_default();
+    create_dir_all(&config.logging.directory).unwrap_or_default();
 
     // Create log file for engine-manager
     let timestamp = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let log_file_name = format!("logs/engine-manager-{}-{}.log", port, timestamp);
+    let log_file_name = format!("{}/engine-manager-{}-{}.log", config.logging.directory, port, timestamp);
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_file_name)?;
 
+    // Resolve absolute config path to pass to engine-manager
+    let config_path = resolve_absolute_path("config.json")?;
+
     let mut cmd = Command::new(&binary_path);
     cmd.args(&[
         "--port", &port.to_string(),
+        "--config", &config_path.to_string_lossy(),
         "--no-color",  // Disable ANSI colors for clean log files
     ]);
 
@@ -248,11 +317,19 @@ async fn check_status(host: &str, port: u16) -> Result<()> {
                     }
 
                     if let Some(controller) = status.get("controller") {
-                        if let Some(engine_running) = controller.get("engine_process_running") {
-                            if engine_running.as_bool().unwrap_or(false) {
-                                println!("  - Engine process: Running");
-                            } else {
-                                println!("  - Engine process: Not running");
+                        if let Some(engine_info) = controller.get("engine_process") {
+                            if let Some(running) = engine_info.get("running") {
+                                if running.as_bool().unwrap_or(false) {
+                                    println!("  - Engine process: Running");
+                                    if let Some(port) = engine_info.get("port") {
+                                        println!("    Port: {}", port);
+                                    }
+                                    if let Some(url) = engine_info.get("url") {
+                                        println!("    WebSocket URL: {}", url.as_str().unwrap_or("Unknown"));
+                                    }
+                                } else {
+                                    println!("  - Engine process: Not running");
+                                }
                             }
                         }
                     }

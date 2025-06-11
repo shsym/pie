@@ -8,11 +8,19 @@ pub type SharedState = Arc<RwLock<AppState>>;
 #[derive(Default)]
 pub struct AppState {
     pub backends: HashMap<Uuid, BackendInfo>,
+    pub config_path: Option<String>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Default::default()
+    }
+
+    pub fn new_with_config(config_path: String) -> Self {
+        Self {
+            backends: HashMap::new(),
+            config_path: Some(config_path),
+        }
     }
 
     pub fn register_backend(&mut self, capabilities: Vec<String>, management_api_address: String) -> Uuid {

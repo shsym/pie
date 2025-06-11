@@ -2,11 +2,27 @@ use crate::models::{
     BackendRegistrationRequest, BackendRegistrationResponse, HeartbeatResponse, ListBackendsResponse,
 };
 use crate::state::SharedState;
+use crate::config::Config;
 use axum::{extract::{Path, State}, http::StatusCode, Json};
 use uuid::Uuid;
 use serde_json::{json, Value};
 use std::process::{Command, Child, Stdio};
 use std::sync::{Arc, Mutex};
+use std::path::{Path as StdPath, PathBuf};
+use std::fs::{OpenOptions, create_dir_all};
+use anyhow::{Result, Context};
+
+/// Resolve a path to an absolute path
+fn resolve_absolute_path<P: AsRef<StdPath>>(path: P) -> Result<PathBuf> {
+    let path = path.as_ref();
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        let current_dir = std::env::current_dir()
+            .context("Failed to get current directory")?;
+        Ok(current_dir.join(path))
+    }
+}
 
 // Global state for controller processes
 static CONTROLLER_PROCESSES: std::sync::OnceLock<Arc<Mutex<ControllerProcesses>>> = std::sync::OnceLock::new();
@@ -14,10 +30,85 @@ static CONTROLLER_PROCESSES: std::sync::OnceLock<Arc<Mutex<ControllerProcesses>>
 #[derive(Default)]
 struct ControllerProcesses {
     engine_process: Option<Child>,
+    engine_port: Option<u16>,
 }
 
 fn get_controller_processes() -> &'static Arc<Mutex<ControllerProcesses>> {
     CONTROLLER_PROCESSES.get_or_init(|| Arc::new(Mutex::new(ControllerProcesses::default())))
+}
+
+fn find_engine_binary(config: &Config) -> Result<PathBuf> {
+    let binary_name = &config.services.engine.binary_name;
+
+    // Try to find it in PATH first
+    if let Ok(output) = Command::new("which").arg(binary_name).output() {
+        if output.status.success() {
+            let path_output = String::from_utf8_lossy(&output.stdout);
+            let path_str = path_output.trim();
+            if !path_str.is_empty() {
+                tracing::info!("Found {} in PATH: {}", binary_name, path_str);
+                return Ok(PathBuf::from(path_str));
+            }
+        }
+    }
+
+    // Try the configured search paths
+    for path_str in &config.paths.engine_binary_search {
+        let path = StdPath::new(path_str);
+        if path.exists() {
+            tracing::info!("Found {} at configured path: {}", binary_name, path_str);
+            return Ok(path.to_path_buf());
+        }
+    }
+
+    Err(anyhow::anyhow!("Could not find {} binary. Please ensure it's compiled or in PATH.", binary_name))
+}
+
+fn start_engine_process(config: &Config, config_path: &str, port: u16) -> Result<Child> {
+    let binary_path = find_engine_binary(config)?;
+
+    // Create logs directory if it doesn't exist
+    create_dir_all(&config.logging.directory).map_err(|e| anyhow::anyhow!("Failed to create logs directory: {}", e))?;
+
+    // Create log file for engine
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let log_file_name = format!("{}/engine-{}-{}.log", config.logging.directory, port, timestamp);
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_name)
+        .map_err(|e| anyhow::anyhow!("Failed to create log file: {}", e))?;
+
+    // Resolve absolute config path
+    let absolute_config_path = resolve_absolute_path(config_path)?;
+
+    let mut cmd = Command::new(&binary_path);
+
+    // Start with base args from config
+    let mut args = config.services.engine.base_args.clone();
+
+    // Add port
+    args.push("--port".to_string());
+    args.push(port.to_string());
+
+    // Add config file with absolute path (engine now supports unified config)
+    args.push("--config".to_string());
+    args.push(absolute_config_path.to_string_lossy().to_string());
+
+    cmd.args(&args);
+
+    // Redirect output to log file
+    cmd.stdout(Stdio::from(log_file.try_clone().map_err(|e| anyhow::anyhow!("Failed to clone log file: {}", e))?))
+       .stderr(Stdio::from(log_file))
+       .stdin(Stdio::null());
+
+    tracing::info!("Starting engine from: {}", binary_path.display());
+    tracing::info!("Engine logs will be written to: {}", log_file_name);
+
+    let child = cmd.spawn().map_err(|e| anyhow::anyhow!("Failed to start engine process: {}", e))?;
+
+    tracing::info!("Engine process started with PID: {}", child.id());
+    Ok(child)
 }
 
 // GET /health
@@ -134,36 +225,80 @@ pub async fn controller_status_handler() -> Json<Value> {
     let processes = get_controller_processes();
     let processes_guard = processes.lock().unwrap();
 
+    let engine_status = if let Some(ref _engine_process) = processes_guard.engine_process {
+        json!({
+            "running": true,
+            "port": processes_guard.engine_port,
+            "url": processes_guard.engine_port.map(|p| format!("ws://127.0.0.1:{}", p))
+        })
+    } else {
+        json!({
+            "running": false,
+            "port": null,
+            "url": null
+        })
+    };
+
     Json(json!({
         "status": "healthy",
         "service": "pie-engine-manager",
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "controller": {
-            "engine_process_running": processes_guard.engine_process.is_some()
+            "engine_process": engine_status
         }
     }))
 }
 
 // POST /controller/start
-pub async fn controller_start_handler() -> Result<Json<Value>, StatusCode> {
+pub async fn controller_start_handler(State(state): State<SharedState>) -> Result<Json<Value>, StatusCode> {
+    // Get the config path from shared state
+    let config_path = {
+        let state_guard = state.read().unwrap();
+        state_guard.config_path.clone().unwrap_or_else(|| "config.json".to_string())
+    };
+
+    // Load the unified configuration from the absolute path
+    let config = match Config::load_from_file(&config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!("Failed to load configuration from {}: {}", config_path, e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
     let processes = get_controller_processes();
     let mut processes_guard = processes.lock().unwrap();
 
     if processes_guard.engine_process.is_some() {
         return Ok(Json(json!({
             "status": "already_running",
-            "message": "Controller engine process is already running"
+            "message": "Controller engine process is already running",
+            "engine_port": processes_guard.engine_port
         })));
     }
 
-    // For now, we'll just simulate starting an engine process
-    // In Phase 3, this would actually start the engine
-    tracing::info!("Starting controller engine process (simulated)");
+    // Use the configured default engine port
+    let engine_port = config.services.engine.default_port;
 
-    Ok(Json(json!({
-        "status": "started",
-        "message": "Controller engine process started successfully"
-    })))
+    // Start the actual engine process
+    match start_engine_process(&config, &config_path, engine_port) {
+        Ok(engine_process) => {
+            tracing::info!("Engine process started successfully on port {}", engine_port);
+            processes_guard.engine_process = Some(engine_process);
+            processes_guard.engine_port = Some(engine_port);
+
+            Ok(Json(json!({
+                "status": "started",
+                "message": "Controller engine process started successfully",
+                "engine_port": engine_port,
+                "engine_url": format!("ws://127.0.0.1:{}", engine_port)
+            })))
+        }
+        Err(e) => {
+            tracing::error!("Failed to start engine process: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 // POST /controller/stop
@@ -180,6 +315,8 @@ pub async fn controller_stop_handler() -> Result<Json<Value>, StatusCode> {
         if let Err(e) = engine_process.wait() {
             tracing::error!("Failed to wait for engine process: {}", e);
         }
+        processes_guard.engine_port = None;
+        tracing::info!("Engine process stopped successfully");
     }
 
     Ok(Json(json!({

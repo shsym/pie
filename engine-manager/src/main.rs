@@ -6,7 +6,7 @@ use clap::Parser;
 use engine_manager::{
     handlers::{health_handler, heartbeat_handler, list_backends_handler, register_backend_handler,
                controller_status_handler, controller_start_handler, controller_stop_handler,
-               shutdown_handler},
+               shutdown_handler, terminate_backend_handler},
     state::AppState,
 };
 use std::net::SocketAddr;
@@ -23,6 +23,10 @@ struct Args {
     /// Port to listen on
     #[arg(short = 'p', long = "port", default_value = "3000")]
     port: u16,
+
+    /// Path to configuration file
+    #[arg(short = 'c', long = "config", default_value = "config.json")]
+    config: String,
 
     /// Disable colored output (useful when redirecting to files)
     #[arg(long = "no-color", help = "Disable colored output")]
@@ -45,7 +49,7 @@ async fn main() {
             .init();
     }
 
-    let shared_state = Arc::new(RwLock::new(AppState::new()));
+    let shared_state = Arc::new(RwLock::new(AppState::new_with_config(args.config.clone())));
 
     // Start timeout monitoring task
     let timeout_state = shared_state.clone();
@@ -75,6 +79,7 @@ async fn main() {
         .route("/backends", get(list_backends_handler))
         .route("/backends/register", post(register_backend_handler))
         .route("/backends/:backend_id/heartbeat", post(heartbeat_handler))
+        .route("/backends/:backend_id/terminate", post(terminate_backend_handler))
         .route("/controller/status", get(controller_status_handler))
         .route("/controller/start", post(controller_start_handler))
         .route("/controller/stop", post(controller_stop_handler))

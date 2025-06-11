@@ -20,7 +20,6 @@ mod utils;
 //
 use anyhow::Context;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, hash_program};
 use crate::l4m::L4m;
@@ -33,24 +32,10 @@ use crate::service::Controller;
 use clap::{Arg, Command};
 use colored::Colorize;
 use std::fs;
+use pie_cli::config::Config;
 
 const PROGRAM_CACHE_DIR: &str = "./program_cache";
 
-//
-// Engine configuration structures
-#[derive(Serialize, Deserialize, Debug)]
-struct EngineConfig {
-    management_service: ManagementServiceConfig,
-    models: Vec<String>,
-    default_model: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ManagementServiceConfig {
-    endpoint: String,
-}
-
-//
 // Define a simple macro for client-side logging.
 #[macro_export]
 macro_rules! log_user {
@@ -59,30 +44,49 @@ macro_rules! log_user {
     }
 }
 
-//use console_subscriber;
-
 /// Load engine configuration from JSON file
-fn load_config(config_path: Option<&str>) -> anyhow::Result<EngineConfig> {
-    let config_path = config_path.unwrap_or("./config.json");
+/// Returns (available_models, default_model, management_endpoint)
+fn load_config(config_path: Option<&str>) -> anyhow::Result<(Vec<String>, String, String)> {
+    let config_file = config_path.unwrap_or("config.json");
+    
+    // Load the unified configuration
+    let config_content = fs::read_to_string(config_file)
+        .with_context(|| format!("Failed to read config file: {}", config_file))?;
 
-    let config_content = std::fs::read_to_string(config_path)
-        .with_context(|| format!("Failed to read config file: {}", config_path))?;
+    let config: Config = serde_json::from_str(&config_content)
+        .with_context(|| format!("Failed to parse config file: {}", config_file))?;
 
-    let config: EngineConfig = serde_json::from_str(&config_content)
-        .with_context(|| format!("Failed to parse config file: {}", config_path))?;
+    log_user!("Loaded unified configuration from {}", config_file);
 
-    log_user!("Loaded engine config from: {}", config_path);
+    // Extract the models list from the config
+    let models: Vec<String> = config.models.supported_models.iter()
+        .map(|model| model.name.clone())
+        .collect();
 
-    Ok(config)
+    // Use the default model from config, or fall back to the first one
+    let default_model = if !config.models.default.is_empty() {
+        config.models.default
+    } else {
+        models.first()
+            .ok_or_else(|| anyhow::anyhow!("No models found in configuration"))?
+            .clone()
+    };
+
+    // Build management endpoint from config
+    let management_endpoint = format!("http://{}:{}", 
+        config.services.engine_manager.host, 
+        config.services.engine_manager.port);
+
+    Ok((models, default_model, management_endpoint))
 }
 
 /// Check all models in config and return the first available one
-async fn find_first_available_model(config: &EngineConfig) -> anyhow::Result<String> {
+async fn find_first_available_model(models: &[String], management_endpoint: &str) -> anyhow::Result<String> {
     let mgmt_config = ManagementConfig {
-        endpoint: config.management_service.endpoint.clone(),
+        endpoint: management_endpoint.to_string(),
     };
 
-    for model_name in &config.models {
+    for model_name in models {
         // Try to get the model endpoint, which will load the model if it's not already loaded
         match get_model_endpoint(model_name, &mgmt_config).await {
             Ok(_endpoint) => {
@@ -95,7 +99,7 @@ async fn find_first_available_model(config: &EngineConfig) -> anyhow::Result<Str
         }
     }
 
-    Err(anyhow::anyhow!("No available models found from the configured list: {:?}", config.models))
+    Err(anyhow::anyhow!("No available models found from the configured list: {:?}", models))
 }
 
 #[tokio::main]
@@ -155,17 +159,17 @@ async fn main() -> anyhow::Result<()> {
     let use_dummy = *use_dummy;
 
     // Load engine configuration
-    let config = load_config(Some(config_path))?;
+    let (models, _default_model, management_endpoint) = load_config(Some(config_path))?;
 
     // Check if management service is running first
     let mgmt_config = ManagementConfig {
-        endpoint: config.management_service.endpoint.clone(),
+        endpoint: management_endpoint.clone(),
     };
     check_management_service_status(&mgmt_config).await
         .context("Management service is not available")?;
 
     // Find the first available model from the config
-    let model_name = find_first_available_model(&config).await
+    let model_name = find_first_available_model(&models, &management_endpoint).await
         .context("Failed to find any available models")?;
 
     log_user!("Using model: {}", model_name);

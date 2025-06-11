@@ -26,3 +26,4 @@ http-body-util = "0.1.0" # For Full in tests
 mime = "0.3" # For APPLICATION_JSON in tests
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = "0.12"
+anyhow = "1.0"

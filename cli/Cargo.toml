@@ -3,6 +3,14 @@ name = "pie-cli"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "pie-cli"
+path = "src/main.rs"
+
+[lib]
+name = "pie_cli"
+path = "src/lib.rs"
+
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

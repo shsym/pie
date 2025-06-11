@@ -81,7 +81,6 @@ cover/
 *.pot
 
 # Django stuff:
-*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -204,3 +203,10 @@ program_cache/
 backend/backend-pytorch
 
 bin/
+
+# logs and temporary files
+logs
+*.log
+
+# No MCP files
+.memory-bank

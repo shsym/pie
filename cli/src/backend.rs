@@ -2,12 +2,11 @@ use clap::Subcommand;
 use anyhow::{Result, anyhow, bail};
 use std::process::Command;
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use tracing::{info, error, warn, debug};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::constants::network;
+use crate::config::Config;
 
 #[derive(Subcommand)]
 pub enum BackendCommands {
@@ -67,35 +66,6 @@ pub enum BackendCommands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         management_service_url: String,
     },
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-struct ModelInfo {
-    name: String,
-    fullname: String,
-    #[serde(rename = "type")]
-    model_type: String,
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-struct BackendConfig {
-    model_backends: HashMap<String, String>,
-    endpoints: HashMap<String, String>,
-    logging: HashMap<String, String>,
-    supported_models: Vec<ModelInfo>,
-}
-
-impl Default for BackendConfig {
-    fn default() -> Self {
-        // Return minimal empty configuration
-        // The actual configuration should be loaded from config files
-        BackendConfig {
-            model_backends: HashMap::new(),
-            endpoints: HashMap::new(),
-            logging: HashMap::new(),
-            supported_models: Vec::new(),
-        }
-    }
 }
 
 pub async fn handle_command(cmd: BackendCommands) -> Result<()> {
@@ -447,39 +417,24 @@ async fn terminate_backend(backend_id: &str, management_service_url: &str) -> Re
     Ok(())
 }
 
-fn load_backend_config() -> Result<BackendConfig> {
-    // Try to load from the backend-management-rs config file first
-    let config_paths = [
-        "../backend/backend-management-rs/config.json",
-        "../../backend/backend-management-rs/config.json", // if running from target/
-        "./config.json", // local override
-    ];
-
-    for config_path in &config_paths {
-        if let Ok(config_content) = std::fs::read_to_string(config_path) {
-            match serde_json::from_str::<BackendConfig>(&config_content) {
-                Ok(config) => {
-                    debug!("Loaded backend config from: {}", config_path);
-                    return Ok(config);
-                }
-                Err(e) => {
-                    warn!("Failed to parse config file '{}': {}", config_path, e);
-                }
-            }
-        }
-    }
-
-    bail!("No valid backend configuration file found. Please ensure config.json exists in one of the expected locations: {:?}", config_paths);
+fn load_backend_config() -> Result<Config> {
+    // Use the CLI's unified configuration
+    Config::load_default()
+        .or_else(|_| {
+            // If no config file is found, provide a helpful error message
+            warn!("No configuration file found");
+            bail!("Configuration file 'config.json' not found. Please ensure it exists in the current directory.");
+        })
 }
 
-fn resolve_model_to_backend(model_or_backend: &str, config: &BackendConfig) -> Result<(String, String)> {
+fn resolve_model_to_backend(model_or_backend: &str, config: &Config) -> Result<(String, String)> {
     // First check if it's a direct backend type in config
-    if config.model_backends.contains_key(model_or_backend) {
+    if config.backends.model_backends.contains_key(model_or_backend) {
         return Ok((model_or_backend.to_string(), model_or_backend.to_string()));
     }
 
     // Then check if it's a model name (short or full) in config
-    for model_info in &config.supported_models {
+    for model_info in &config.models.supported_models {
         if model_info.name == model_or_backend || model_info.fullname == model_or_backend {
             return Ok((model_info.fullname.clone(), model_info.model_type.clone()));
         }
@@ -489,8 +444,8 @@ fn resolve_model_to_backend(model_or_backend: &str, config: &BackendConfig) -> R
     bail!("Unknown model or backend type: '{}'. Please check the configuration file or use a supported model name.", model_or_backend);
 }
 
-fn find_backend_script(backend_type: &str, config: &BackendConfig) -> Result<PathBuf> {
-    let script_name = config.model_backends.get(backend_type)
+fn find_backend_script(backend_type: &str, config: &Config) -> Result<PathBuf> {
+    let script_name = config.backends.model_backends.get(backend_type)
         .ok_or_else(|| anyhow!("Unknown backend type: {}", backend_type))?;
 
     let backend_paths = [
