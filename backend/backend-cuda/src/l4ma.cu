@@ -1,29 +1,36 @@
 #include "l4ma.cuh"
-#include "common.cuh"
+
 #include "ztensor.hpp"
 #include <yaml-cpp/yaml.h>
 #include <thrust/copy.h>
 #include <thrust/host_vector.h>
 #include <cassert>
-#include <cstdint>
 #include <iostream>
 #include <flashinfer/norm.cuh>
 #include <flashinfer/activation.cuh>
 
-// Helper to get pointer alignment (inspired by the provided example)
-uint32_t _getAlignment(const void *ptr)
-{
-    uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
-    if (address % 16 == 0)
-        return 16;
-    if (address % 8 == 0)
-        return 8;
-    if (address % 4 == 0)
-        return 4;
-    if (address % 2 == 0)
-        return 2;
-    return 1;
-}
+// Macro for error checking
+#define CUDA_CHECK(call)                                                                                       \
+    do                                                                                                         \
+    {                                                                                                          \
+        cudaError_t err = call;                                                                                \
+        if (err != cudaSuccess)                                                                                \
+        {                                                                                                      \
+            fprintf(stderr, "CUDA Error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE);                                                                                \
+        }                                                                                                      \
+    } while (0)
+
+#define CUBLAS_CHECK(status)                                                                            \
+    do                                                                                                  \
+    {                                                                                                   \
+        cublasStatus_t _status = (status);                                                              \
+        if (_status != CUBLAS_STATUS_SUCCESS)                                                           \
+        {                                                                                               \
+            fprintf(stderr, "cuBLAS Error in %s at line %d: Status %d\n", __FILE__, __LINE__, _status); \
+            exit(EXIT_FAILURE);                                                                         \
+        }                                                                                               \
+    } while (0)
 
 /***************************************************************************************************
  * CUDA KERNELS
@@ -195,20 +202,58 @@ void silu_and_mul(
     cudaLaunchKernelEx(&config, kernel, out_ptr, in_ptr, d_half);
 }
 
-void L4maConfig::print() const
+
+/***************************************************************************************************
+ * HELPER FUNCTIONS
+ ***************************************************************************************************/
+
+template <typename T>
+struct CudaDataType;
+template <>
+struct CudaDataType<float>
 {
-    printf("L4maConfig:\n");
-    printf("  hidden_size: %d\n", hidden_size);
-    printf("  intermediate_size: %d\n", intermediate_size);
-    printf("  num_attention_heads: %d\n", num_attention_heads);
-    printf("  num_key_value_heads: %d\n", num_key_value_heads);
-    printf("  num_hidden_layers: %d\n", num_hidden_layers);
-    printf("  use_qkv_bias: %s\n", use_qkv_bias ? "true" : "false");
-    printf("  rms_norm_eps: %g\n", rms_norm_eps);
-    printf("  vocab_size: %d\n", vocab_size);
-    printf("  pad_token_id: %d\n", pad_token_id);
-    printf("  rope_base: %g\n", rope_base);
+    static constexpr cudaDataType_t value = CUDA_R_32F;
+};
+template <>
+struct CudaDataType<__nv_half>
+{
+    static constexpr cudaDataType_t value = CUDA_R_16F;
+};
+template <>
+struct CudaDataType<__nv_bfloat16>
+{
+    static constexpr cudaDataType_t value = CUDA_R_16BF;
+};
+
+template <typename T>
+void gemm_cublasLt(cublasLtHandle_t ltHandle, cudaStream_t stream, const T *A, const T *B, T *C,
+                   int m, int n, int k, bool transa = false, bool transb = false)
+{
+    float alpha = 1.0f, beta = 0.0f;
+    cublasLtMatmulDesc_t matmulDesc;
+    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
+
+    CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    cublasOperation_t opA = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+
+    cudaDataType_t dtype = CudaDataType<T>::value;
+    // Note: Leading dimension (last arg) for row-major matrix is the number of columns (the 'n' in k-by-n)
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, dtype, transa ? k : m, transa ? m : k, transa ? m : k));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, dtype, transb ? n : k, transb ? k : n, transb ? k : n));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, dtype, m, n, n));
+
+    CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha, A, Adesc, B, Bdesc, &beta, C, Cdesc, C, Cdesc, nullptr, nullptr, 0, stream));
+
+    cublasLtMatmulDescDestroy(matmulDesc);
+    cublasLtMatrixLayoutDestroy(Adesc);
+    cublasLtMatrixLayoutDestroy(Bdesc);
+    cublasLtMatrixLayoutDestroy(Cdesc);
 }
+
+void L4maConfig::print() const { /* Omitted for brevity */ }
 
 // *** FIXED IMPLEMENTATION ***
 L4maConfig load_l4ma_config_from_yaml(const std::string &yaml_path)
@@ -274,19 +319,19 @@ void L4maMlp<T>::forward(thrust::device_vector<T> &output,
     const T *x_ptr = thrust::raw_pointer_cast(x.data());
     T *output_ptr = thrust::raw_pointer_cast(output.data());
 
-    // // 1. Gate projection: result stored in the first half of the temp buffer
-    // gemm_cublasLt<T>(ltHandle, stream, x_ptr, thrust::raw_pointer_cast(gate_proj_weights_.data()), gate_out_ptr, num_tokens, is, hs, false, true);
+    // 1. Gate projection: result stored in the first half of the temp buffer
+    gemm_cublasLt<T>(ltHandle, stream, x_ptr, thrust::raw_pointer_cast(gate_proj_weights_.data()), gate_out_ptr, num_tokens, is, hs, false, true);
 
-    // // 2. Up projection: result stored in the second half of the temp buffer
-    // gemm_cublasLt<T>(ltHandle, stream, x_ptr, thrust::raw_pointer_cast(up_proj_weights_.data()), up_out_ptr, num_tokens, is, hs, false, true);
+    // 2. Up projection: result stored in the second half of the temp buffer
+    gemm_cublasLt<T>(ltHandle, stream, x_ptr, thrust::raw_pointer_cast(up_proj_weights_.data()), up_out_ptr, num_tokens, is, hs, false, true);
 
-    // // 3. SiLU activation and element-wise multiply
-    // // The kernel takes the entire gate_and_up_ptr as input and writes the result
-    // // into the first half of the buffer (gate_out_ptr), which is then used for the down projection.
-    // silu_and_mul<T>(gate_out_ptr, gate_and_up_ptr, num_tokens, is, stream, false);
+    // 3. SiLU activation and element-wise multiply
+    // The kernel takes the entire gate_and_up_ptr as input and writes the result
+    // into the first half of the buffer (gate_out_ptr), which is then used for the down projection.
+    silu_and_mul<T>(gate_out_ptr, gate_and_up_ptr, num_tokens, is, stream, false);
 
-    // // 4. Down projection: output = result * W_d^T
-    // gemm_cublasLt<T>(ltHandle, stream, gate_out_ptr, thrust::raw_pointer_cast(down_proj_weights_.data()), output_ptr, num_tokens, hs, is, false, true);
+    // 4. Down projection: output = result * W_d^T
+    gemm_cublasLt<T>(ltHandle, stream, gate_out_ptr, thrust::raw_pointer_cast(down_proj_weights_.data()), output_ptr, num_tokens, hs, is, false, true);
 }
 
 // --- L4maAttention ---
@@ -308,45 +353,45 @@ void L4maAttention<T>::forward(
     const int32_t *qo_indptr, int nnz, int batch_size,
     thrust::device_vector<T> &temp_buffer, cublasLtHandle_t ltHandle, cudaStream_t stream)
 {
-    // int hs = config_.hidden_size;
-    // int nq = config_.num_attention_heads;
-    // int nkv = config_.num_key_value_heads;
-    // int hd = config_.head_dim();
+    int hs = config_.hidden_size;
+    int nq = config_.num_attention_heads;
+    int nkv = config_.num_key_value_heads;
+    int hd = config_.head_dim();
 
-    // // temp_buffer layout: [Q_proj | K_proj | V_proj]
-    // T *q_proj_ptr = thrust::raw_pointer_cast(temp_buffer.data());
-    // T *k_proj_ptr = q_proj_ptr + nnz * nq * hd;
-    // T *v_proj_ptr = k_proj_ptr + nnz * nkv * hd;
+    // temp_buffer layout: [Q_proj | K_proj | V_proj]
+    T *q_proj_ptr = thrust::raw_pointer_cast(temp_buffer.data());
+    T *k_proj_ptr = q_proj_ptr + nnz * nq * hd;
+    T *v_proj_ptr = k_proj_ptr + nnz * nkv * hd;
 
-    // // 1. Q, K, V projections (Weights are [out_dim, in_dim], so we need to transpose B)
-    // gemm_cublasLt<T>(ltHandle, stream, thrust::raw_pointer_cast(hidden_states.data()), thrust::raw_pointer_cast(q_proj_weights_.data()), q_proj_ptr, nnz, nq * hd, hs, false, true);
-    // gemm_cublasLt<T>(ltHandle, stream, thrust::raw_pointer_cast(hidden_states.data()), thrust::raw_pointer_cast(k_proj_weights_.data()), k_proj_ptr, nnz, nkv * hd, hs, false, true);
-    // gemm_cublasLt<T>(ltHandle, stream, thrust::raw_pointer_cast(hidden_states.data()), thrust::raw_pointer_cast(v_proj_weights_.data()), v_proj_ptr, nnz, nkv * hd, hs, false, true);
+    // 1. Q, K, V projections (Weights are [out_dim, in_dim], so we need to transpose B)
+    gemm_cublasLt<T>(ltHandle, stream, thrust::raw_pointer_cast(hidden_states.data()), thrust::raw_pointer_cast(q_proj_weights_.data()), q_proj_ptr, nnz, nq * hd, hs, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, thrust::raw_pointer_cast(hidden_states.data()), thrust::raw_pointer_cast(k_proj_weights_.data()), k_proj_ptr, nnz, nkv * hd, hs, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, thrust::raw_pointer_cast(hidden_states.data()), thrust::raw_pointer_cast(v_proj_weights_.data()), v_proj_ptr, nnz, nkv * hd, hs, false, true);
 
-    // // 2. Apply RoPE
-    // dim3 rope_grid(nnz, nq);
-    // dim3 rope_block(hd / 2);
-    // apply_rope_kernel<T><<<rope_grid, rope_block, 0, stream>>>(q_proj_ptr, k_proj_ptr, position_ids, nq, nkv, hd, config_.rope_base);
+    // 2. Apply RoPE
+    dim3 rope_grid(nnz, nq);
+    dim3 rope_block(hd / 2);
+    apply_rope_kernel<T><<<rope_grid, rope_block, 0, stream>>>(q_proj_ptr, k_proj_ptr, position_ids, nq, nkv, hd, config_.rope_base);
 
-    // // 3. Update KV Cache
-    // dim3 kv_cache_grid(batch_size);
-    // dim3 kv_cache_block(nkv * hd);
-    // update_kv_cache_kernel<T><<<kv_cache_grid, kv_cache_block, 0, stream>>>(
-    //     k_proj_ptr, v_proj_ptr, thrust::raw_pointer_cast(kv_cache_k.data()), thrust::raw_pointer_cast(kv_cache_v.data()),
-    //     qo_indptr, kv_page_indptr, kv_page_indices, kv_last_page_lens, batch_size, nkv, hd);
+    // 3. Update KV Cache
+    dim3 kv_cache_grid(batch_size);
+    dim3 kv_cache_block(nkv * hd);
+    update_kv_cache_kernel<T><<<kv_cache_grid, kv_cache_block, 0, stream>>>(
+        k_proj_ptr, v_proj_ptr, thrust::raw_pointer_cast(kv_cache_k.data()), thrust::raw_pointer_cast(kv_cache_v.data()),
+        qo_indptr, kv_page_indptr, kv_page_indices, kv_last_page_lens, batch_size, nkv, hd);
 
-    // // 4. Paged Attention (Simplified kernel, see above)
-    // dim3 attn_grid(nnz, nq);
-    // dim3 attn_block(128);
-    // paged_attention_kernel<T><<<attn_grid, attn_block, 0, stream>>>( // Note: shmem disabled for this simple version
-    //     thrust::raw_pointer_cast(attn_output.data()), q_proj_ptr, thrust::raw_pointer_cast(kv_cache_k.data()), thrust::raw_pointer_cast(kv_cache_v.data()),
-    //     kv_page_indptr, kv_page_indices, kv_last_page_lens, qo_indptr, batch_size, nq, nkv, hd);
+    // 4. Paged Attention (Simplified kernel, see above)
+    dim3 attn_grid(nnz, nq);
+    dim3 attn_block(128);
+    paged_attention_kernel<T><<<attn_grid, attn_block, 0, stream>>>( // Note: shmem disabled for this simple version
+        thrust::raw_pointer_cast(attn_output.data()), q_proj_ptr, thrust::raw_pointer_cast(kv_cache_k.data()), thrust::raw_pointer_cast(kv_cache_v.data()),
+        kv_page_indptr, kv_page_indices, kv_last_page_lens, qo_indptr, batch_size, nq, nkv, hd);
 
-    // // 5. Output projection
-    // T *attn_out_gemm_in = thrust::raw_pointer_cast(attn_output.data());
-    // thrust::device_vector<T> o_proj_out(nnz * hs);
-    // gemm_cublasLt<T>(ltHandle, stream, attn_out_gemm_in, thrust::raw_pointer_cast(o_proj_weights_.data()), thrust::raw_pointer_cast(o_proj_out.data()), nnz, hs, hs, false, true);
-    // attn_output = o_proj_out;
+    // 5. Output projection
+    T *attn_out_gemm_in = thrust::raw_pointer_cast(attn_output.data());
+    thrust::device_vector<T> o_proj_out(nnz * hs);
+    gemm_cublasLt<T>(ltHandle, stream, attn_out_gemm_in, thrust::raw_pointer_cast(o_proj_weights_.data()), thrust::raw_pointer_cast(o_proj_out.data()), nnz, hs, hs, false, true);
+    attn_output = o_proj_out;
 }
 
 // --- L4maDecoderLayer ---
@@ -436,45 +481,29 @@ L4maModel<__nv_bfloat16> L4maModel<__nv_bfloat16>::from_files(const std::string 
         device_tensors[name] = std::move(dev_vec);
     }
 
-    // Split weights for each decoder layer
-    std::vector<std::unordered_map<std::string, thrust::device_vector<__nv_bfloat16>>> layer_weights_vec;
-    for (int i = 0; i < config.num_hidden_layers; ++i) {
-        std::string prefix = "model.layers." + std::to_string(i) + ".";
-        std::unordered_map<std::string, thrust::device_vector<__nv_bfloat16>> layer_weights;
-        for (const auto &kv : device_tensors) {
-            if (kv.first.rfind(prefix, 0) == 0) {
-                std::string key = kv.first.substr(prefix.length());
-                layer_weights[key] = kv.second;
-            }
-        }
-        layer_weights_vec.push_back(std::move(layer_weights));
-    }
-
-    // Collect global weights
-    std::unordered_map<std::string, thrust::device_vector<__nv_bfloat16>> global_weights;
-    for (const auto &kv : device_tensors) {
-        if (kv.first.rfind("model.layers.", 0) != 0) {
-            global_weights[kv.first] = kv.second;
-        }
-    }
-
-    return L4maModel<__nv_bfloat16>(config, global_weights, layer_weights_vec);
+    return L4maModel<__nv_bfloat16>(config, device_tensors);
 }
 
 template <typename T>
-L4maModel<T>::L4maModel(const L4maConfig &config,
-                       const std::unordered_map<std::string, thrust::device_vector<T>> &global_weights,
-                       const std::vector<std::unordered_map<std::string, thrust::device_vector<T>>> &layer_weights_vec)
+L4maModel<T>::L4maModel(const L4maConfig &config, const std::unordered_map<std::string, thrust::device_vector<T>> &all_weights)
     : config_(config),
-      embedding_weights_(global_weights.at("model.embed_tokens.weight")),
-      lm_head_weights_(global_weights.at("model.embed_tokens.weight")),
-      final_norm_weight_(global_weights.at("model.norm.weight"))
+      embedding_weights_(all_weights.at("model.embed_tokens.weight")),
+      lm_head_weights_(all_weights.at("model.embed_tokens.weight")),
+      final_norm_weight_(all_weights.at("model.norm.weight"))
 {
     CUBLAS_CHECK(cublasLtCreate(&cublaslt_handle_));
-    for (const auto &layer_weights : layer_weights_vec)
+    for (int i = 0; i < config.num_hidden_layers; ++i)
     {
+        std::unordered_map<std::string, thrust::device_vector<T>> layer_weights;
+        std::string prefix = "model.layers." + std::to_string(i) + ".";
+        for (auto const &[key, val] : all_weights)
+        {
+            if (key.rfind(prefix, 0) == 0)
+            {
+                layer_weights[key.substr(prefix.length())] = val;
+            }
+        }
         layers_.emplace_back(config, layer_weights);
-
     }
 }
 
@@ -488,63 +517,63 @@ void L4maModel<T>::forward(
     const int32_t *kv_page_indices, const int32_t *kv_page_indptr, const int32_t *kv_last_page_lens,
     const int32_t *qo_indptr, int batch_size, cudaStream_t stream)
 {
-    // int nnz = input_ids.size();
-    // // *** FIXED WARNING ***
-    // if (hidden_states_.size() != static_cast<size_t>(nnz * config_.hidden_size))
-    // {
-    //     hidden_states_.resize(nnz * config_.hidden_size);
-    // }
+    int nnz = input_ids.size();
+    // *** FIXED WARNING ***
+    if (hidden_states_.size() != static_cast<size_t>(nnz * config_.hidden_size))
+    {
+        hidden_states_.resize(nnz * config_.hidden_size);
+    }
 
-    // // 1. Embedding Lookup
-    // thrust::device_vector<T> embeddings_table = embedding_weights_;
-    // thrust::host_vector<int32_t> host_ids = input_ids;
-    // for (int i = 0; i < nnz; ++i)
-    // {
-    //     int token_id = host_ids[i];
-    //     cudaMemcpyAsync(thrust::raw_pointer_cast(hidden_states_.data()) + i * config_.hidden_size,
-    //                     thrust::raw_pointer_cast(embeddings_table.data()) + token_id * config_.hidden_size,
-    //                     config_.hidden_size * sizeof(T), cudaMemcpyDeviceToDevice, stream);
-    // }
+    // 1. Embedding Lookup
+    thrust::device_vector<T> embeddings_table = embedding_weights_;
+    thrust::host_vector<int32_t> host_ids = input_ids;
+    for (int i = 0; i < nnz; ++i)
+    {
+        int token_id = host_ids[i];
+        cudaMemcpyAsync(thrust::raw_pointer_cast(hidden_states_.data()) + i * config_.hidden_size,
+                        thrust::raw_pointer_cast(embeddings_table.data()) + token_id * config_.hidden_size,
+                        config_.hidden_size * sizeof(T), cudaMemcpyDeviceToDevice, stream);
+    }
 
-    // // Allocate a single large temp buffer for all layers
-    // size_t temp_buffer_size = static_cast<size_t>(nnz) * config_.intermediate_size * 2;
-    // if (temp_bwd_buffer_.size() < temp_buffer_size)
-    //     temp_bwd_buffer_.resize(temp_buffer_size);
+    // Allocate a single large temp buffer for all layers
+    size_t temp_buffer_size = static_cast<size_t>(nnz) * config_.intermediate_size * 2;
+    if (temp_bwd_buffer_.size() < temp_buffer_size)
+        temp_bwd_buffer_.resize(temp_buffer_size);
 
-    // // 2. Decoder Layers
-    // for (auto &layer : layers_)
-    // {
-    //     layer.forward(hidden_states_, thrust::raw_pointer_cast(position_ids.data()), kv_cache_k, kv_cache_v,
-    //                   kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr,
-    //                   nnz, batch_size, temp_bwd_buffer_, cublaslt_handle_, stream);
-    // }
+    // 2. Decoder Layers
+    for (auto &layer : layers_)
+    {
+        layer.forward(hidden_states_, thrust::raw_pointer_cast(position_ids.data()), kv_cache_k, kv_cache_v,
+                      kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr,
+                      nnz, batch_size, temp_bwd_buffer_, cublaslt_handle_, stream);
+    }
 
-    // // 3. Final RMSNorm (in-place)
-    // // FIXED: Removed flashinfer:: namespace qualifier
-    // CUDA_CHECK(flashinfer::norm::RMSNorm<T>(
-    //     thrust::raw_pointer_cast(hidden_states_.data()),
-    //     thrust::raw_pointer_cast(final_norm_weight_.data()),
-    //     thrust::raw_pointer_cast(hidden_states_.data()),
-    //     nnz, config_.hidden_size,
-    //     config_.hidden_size, config_.hidden_size,
-    //     config_.rms_norm_eps, false, stream));
+    // 3. Final RMSNorm (in-place)
+    // FIXED: Removed flashinfer:: namespace qualifier
+    CUDA_CHECK(flashinfer::norm::RMSNorm<T>(
+        thrust::raw_pointer_cast(hidden_states_.data()),
+        thrust::raw_pointer_cast(final_norm_weight_.data()),
+        thrust::raw_pointer_cast(hidden_states_.data()),
+        nnz, config_.hidden_size,
+        config_.hidden_size, config_.hidden_size,
+        config_.rms_norm_eps, false, stream));
 
-    // // 4. LM Head (GEMM to get logits)
-    // // *** FIXED WARNING ***
-    // if (logits.size() != static_cast<size_t>(nnz * config_.vocab_size))
-    // {
-    //     logits.resize(nnz * config_.vocab_size);
-    // }
+    // 4. LM Head (GEMM to get logits)
+    // *** FIXED WARNING ***
+    if (logits.size() != static_cast<size_t>(nnz * config_.vocab_size))
+    {
+        logits.resize(nnz * config_.vocab_size);
+    }
 
-    // thrust::device_vector<T> temp_logits(logits.size());
-    // // FIXED: Changed hidden_states to hidden_states_
-    // gemm_cublasLt<T>(cublaslt_handle_, stream, thrust::raw_pointer_cast(hidden_states_.data()),
-    //                  thrust::raw_pointer_cast(lm_head_weights_.data()),
-    //                  thrust::raw_pointer_cast(temp_logits.data()),
-    //                  nnz, config_.vocab_size, config_.hidden_size, false, true);
+    thrust::device_vector<T> temp_logits(logits.size());
+    // FIXED: Changed hidden_states to hidden_states_
+    gemm_cublasLt<T>(cublaslt_handle_, stream, thrust::raw_pointer_cast(hidden_states_.data()),
+                     thrust::raw_pointer_cast(lm_head_weights_.data()),
+                     thrust::raw_pointer_cast(temp_logits.data()),
+                     nnz, config_.vocab_size, config_.hidden_size, false, true);
 
-    // // For now, simple copy. A kernel is needed for bf16 -> float32 conversion.
-    // thrust::copy(temp_logits.begin(), temp_logits.end(), logits.begin());
+    // For now, simple copy. A kernel is needed for bf16 -> float32 conversion.
+    thrust::copy(temp_logits.begin(), temp_logits.end(), logits.begin());
 }
 
 // Explicit Instantiations

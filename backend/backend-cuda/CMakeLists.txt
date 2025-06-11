@@ -55,8 +55,6 @@ CPMAddPackage(
 add_executable(cuda_app
     src/main.cu
     src/l4ma.cu
-    src/bpe.cpp
-    src/common.cu
 )
 
 # 6. Set compiler flags and options for the target
@@ -78,15 +76,13 @@ target_compile_options(cuda_app PRIVATE
 # We just need to add our own 'include' directory and link the required libraries.
 target_include_directories(cuda_app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${flashinfer_SOURCE_DIR}/include 
-    ${cuembed_SOURCE_DIR}
+    ${flashinfer_SOURCE_DIR}/include # <-- Add this line
 )
 
 target_link_libraries(cuda_app PRIVATE
     # Link against targets provided by CPM packages
     cppzmq
     yaml-cpp
-    
     nlohmann_json::nlohmann_json
 
     # Link against CUDA libraries provided by CMake's FindCUDA module
