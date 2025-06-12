@@ -1,4 +1,5 @@
 use crate::backend::Backend;
+use crate::backend_discovery::EngineManagerClient;
 use crate::batching::{Batchable, Batcher, BatchingStrategy};
 use crate::instance::Id as InstanceId;
 use crate::object::{IdRepr, ObjectManager, ObjectType, group_consecutive_ids};
@@ -6,6 +7,7 @@ use crate::service::{Service, ServiceError};
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::IdPool;
 use crate::{backend, batching, runtime, service, tokenizer};
+use anyhow;
 use backend_management_rs::path_utils::expand_home_dir_str;
 use dashmap::DashMap;
 use prost::Message;
@@ -14,7 +16,7 @@ use std::cmp::{Ordering, PartialEq};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot};
@@ -35,22 +37,130 @@ macro_rules! try_trap {
 const PROTOCOL_BASE: usize = 0;
 const PROTOCOL_VISION: usize = 1;
 
-static AVAILABLE_MODELS: OnceLock<Vec<String>> = OnceLock::new();
+static AVAILABLE_MODELS: std::sync::LazyLock<RwLock<Vec<String>>> = std::sync::LazyLock::new(|| {
+    RwLock::new(Vec::new())
+});
+
+// Engine manager endpoint for dynamic model discovery
+static ENGINE_MANAGER_ENDPOINT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("ENGINE_MANAGER_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+});
 
 pub fn set_available_models<T>(models: T)
 where
     T: IntoIterator,
     T::Item: ToString,
 {
-    let models = models
+    let new_models = models
         .into_iter()
         .map(|s| s.to_string())
         .collect::<Vec<String>>();
-    AVAILABLE_MODELS.get_or_init(|| models);
+
+    // Update the static cache with new models
+    if let Ok(mut cached_models) = AVAILABLE_MODELS.write() {
+        *cached_models = new_models;
+        tracing::info!("Updated available models cache with {} models", cached_models.len());
+    } else {
+        tracing::warn!("Failed to update available models cache");
+    }
 }
 
-pub fn available_models() -> &'static [String] {
-    AVAILABLE_MODELS.get().unwrap()
+pub fn available_models() -> Vec<String> {
+    // Read from the cached models
+    if let Ok(cached_models) = AVAILABLE_MODELS.read() {
+        cached_models.clone()
+    } else {
+        tracing::warn!("Failed to read available models cache");
+        vec![]
+    }
+}
+
+/// Async function to discover models from all registered backends
+pub async fn discover_available_models() -> anyhow::Result<Vec<String>> {
+    tracing::info!("[L4M] discover_available_models() - starting backend discovery");
+    let client = EngineManagerClient::new(&ENGINE_MANAGER_ENDPOINT);
+    tracing::info!("[L4M] Created engine manager client for endpoint: {}", *ENGINE_MANAGER_ENDPOINT);
+
+    let backends = match client.list_backends().await {
+        Ok(backends) => {
+            tracing::info!("[L4M] Successfully retrieved {} backends from engine manager", backends.len());
+            tracing::debug!("[L4M] Raw backends data: {:#?}", backends);
+            backends
+        }
+        Err(e) => {
+            tracing::error!("[L4M] Failed to list backends from engine manager: {}", e);
+            return Err(e);
+        }
+    };
+
+    let mut models = Vec::new();
+
+    for (backend_id, backend_info) in &backends {
+        tracing::info!("[L4M] Processing backend '{}' with status '{}'", backend_id, backend_info.status);
+        tracing::debug!("[L4M] Backend '{}' capabilities: {:?}", backend_id, backend_info.capabilities);
+
+        if backend_info.status != "Running" {
+            tracing::warn!("[L4M] Skipping backend '{}' because status is not 'Running': {}", backend_id, backend_info.status);
+            continue;
+        }
+
+        // Extract models from backend capabilities
+        println!("[DEBUG] Extracting models from {} capabilities", backend_info.capabilities.len());
+        for capability in &backend_info.capabilities {
+            println!("[DEBUG] Processing capability: '{}'", capability);
+            tracing::debug!("Processing capability: '{}'", capability);
+            if capability.starts_with("model:") {
+                let model_name = &capability[6..]; // Remove "model:" prefix
+                println!("[DEBUG] Found model capability: '{}' -> extracted model: '{}'", capability, model_name);
+                if !models.contains(&model_name.to_string()) {
+                    models.push(model_name.to_string());
+                    println!("[DEBUG] Added model '{}' to models list", model_name);
+                    tracing::info!("Discovered model '{}' from backend '{}'", model_name, backend_id);
+                } else {
+                    println!("[DEBUG] Model '{}' already discovered", model_name);
+                    tracing::debug!("Model '{}' already discovered", model_name);
+                }
+            } else {
+                println!("[DEBUG] Capability '{}' is not a model capability (doesn't start with 'model:')", capability);
+            }
+        }
+    }
+
+    if models.is_empty() {
+        println!("[DEBUG] No models discovered from registered backends (total backends: {})", backends.len());
+        tracing::warn!("No models discovered from registered backends (total backends: {})", backends.len());
+        if backends.len() > 0 {
+            println!("[DEBUG] Backends were found but no models extracted. Check backend capabilities format.");
+        } else {
+            println!("[DEBUG] No backends found at all. Check if backend is registered with engine-manager.");
+        }
+    } else {
+        println!("[DEBUG] Discovered {} models from backends: {:?}", models.len(), models);
+        tracing::info!("Discovered {} models from backends: {:?}", models.len(), models);
+    }
+
+    Ok(models)
+}
+
+/// Runtime version of model discovery that can be called from within the engine
+/// This spawns a background task to discover models and update the cache
+pub fn discover_models_from_backends() {
+    tokio::spawn(async {
+        match discover_available_models().await {
+            Ok(models) => {
+                if !models.is_empty() {
+                    set_available_models(models);
+                    tracing::info!("Runtime model discovery: Updated available models cache");
+                } else {
+                    tracing::warn!("Runtime model discovery: No models found");
+                }
+            }
+            Err(e) => {
+                tracing::error!("Runtime model discovery failed: {}", e);
+            }
+        }
+    });
 }
 
 mod pb_bindings {
@@ -412,9 +522,6 @@ impl L4m {
             info.num_embeddings,
             info.num_distributions
         );
-
-        // Add the model name to the available models
-        set_available_models([info.model_name.clone()]);
 
         // Extract the actual model name from the path if it's a full path
         let model_name = if info.model_name.contains('/') {

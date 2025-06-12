@@ -128,7 +128,7 @@ async fn test_controller_status_when_not_running() {
         .current_dir(ctx.temp_dir.path()); // Run from temp dir with config
 
     let result = cmd.assert();
-    
+
     // Accept either "Not running" or "Running" depending on test environment
     // Both are valid since we can't control if a controller is already running
     result.success()
@@ -194,7 +194,7 @@ async fn test_backend_list_without_service() {
     // This could either succeed (showing no backends) or fail (if management service isn't running)
     // Both are valid outcomes depending on the test environment
     let result = cmd.assert();
-    
+
     // Accept either success with "No backends" message or failure with connection error
     result.code(predicate::in_iter([0, 1]));
 }

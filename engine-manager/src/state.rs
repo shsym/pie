@@ -9,6 +9,7 @@ pub type SharedState = Arc<RwLock<AppState>>;
 pub struct AppState {
     pub backends: HashMap<Uuid, BackendInfo>,
     pub config_path: Option<String>,
+    pub manager_port: Option<u16>,
 }
 
 impl AppState {
@@ -20,6 +21,7 @@ impl AppState {
         Self {
             backends: HashMap::new(),
             config_path: Some(config_path),
+            manager_port: None,
         }
     }
 

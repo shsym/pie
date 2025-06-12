@@ -451,7 +451,7 @@ fn find_backend_script(backend_type: &str, config: &Config) -> Result<PathBuf> {
     let backend_paths = [
         format!("../backend/backend-python/{}", script_name),
         format!("../../backend/backend-python/{}", script_name), // if running from target/
-        format!("./backend-python/{}", script_name), // local development
+        format!("./backend/backend-python/{}", script_name), // local development
     ];
 
     for path_str in &backend_paths {

@@ -3,6 +3,7 @@
 mod client;
 mod service;
 mod zmq_handler;
+mod backend_discovery;
 
 mod backend;
 mod batching;
@@ -26,13 +27,12 @@ use crate::l4m::L4m;
 use crate::messaging::{PubSub, PushPull};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
-use crate::zmq_handler::{ManagementConfig, check_management_service_status, get_model_endpoint};
+use crate::backend_discovery::discover_backend_for_model;
 use crate::server::Server;
 use crate::service::Controller;
 use clap::{Arg, Command};
 use colored::Colorize;
 use std::fs;
-use pie_cli::config::Config;
 
 const PROGRAM_CACHE_DIR: &str = "./program_cache";
 
@@ -44,66 +44,47 @@ macro_rules! log_user {
     }
 }
 
-/// Load engine configuration from JSON file
-/// Returns (available_models, default_model, management_endpoint)
-fn load_config(config_path: Option<&str>) -> anyhow::Result<(Vec<String>, String, String)> {
-    let config_file = config_path.unwrap_or("config.json");
-    
-    // Load the unified configuration
-    let config_content = fs::read_to_string(config_file)
-        .with_context(|| format!("Failed to read config file: {}", config_file))?;
-
-    let config: Config = serde_json::from_str(&config_content)
-        .with_context(|| format!("Failed to parse config file: {}", config_file))?;
-
-    log_user!("Loaded unified configuration from {}", config_file);
-
-    // Extract the models list from the config
-    let models: Vec<String> = config.models.supported_models.iter()
-        .map(|model| model.name.clone())
-        .collect();
-
-    // Use the default model from config, or fall back to the first one
-    let default_model = if !config.models.default.is_empty() {
-        config.models.default
-    } else {
-        models.first()
-            .ok_or_else(|| anyhow::anyhow!("No models found in configuration"))?
-            .clone()
-    };
-
-    // Build management endpoint from config
-    let management_endpoint = format!("http://{}:{}", 
-        config.services.engine_manager.host, 
-        config.services.engine_manager.port);
-
-    Ok((models, default_model, management_endpoint))
-}
-
-/// Check all models in config and return the first available one
-async fn find_first_available_model(models: &[String], management_endpoint: &str) -> anyhow::Result<String> {
-    let mgmt_config = ManagementConfig {
-        endpoint: management_endpoint.to_string(),
-    };
-
-    for model_name in models {
-        // Try to get the model endpoint, which will load the model if it's not already loaded
-        match get_model_endpoint(model_name, &mgmt_config).await {
-            Ok(_endpoint) => {
-                return Ok(model_name.clone());
-            }
-            Err(e) => {
-                log_user!("Failed to load model {}: {}", model_name, e);
-                continue;
-            }
+/// Check if a model is available by attempting to load it via management service
+/// This function is used for on-demand backend discovery
+async fn check_model_available(model_name: &str, engine_manager_endpoint: &str) -> anyhow::Result<String> {
+    // Use the new HTTP-based backend discovery
+    match discover_backend_for_model(engine_manager_endpoint, model_name).await {
+        Ok(endpoint) => {
+            log_user!("Model {} is available at endpoint: {}", model_name, endpoint);
+            Ok(endpoint)
+        }
+        Err(e) => {
+            log_user!("Model {} is not available: {}", model_name, e);
+            Err(anyhow::anyhow!("Model {} is not available: {}", model_name, e))
         }
     }
-
-    Err(anyhow::anyhow!("No available models found from the configured list: {:?}", models))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Create log directory if it doesn't exist
+    std::fs::create_dir_all("logs").unwrap_or(());
+
+    // Create log file with current date
+    let current_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let log_filename = format!("engine-9123-{}.log", current_date);
+
+    // Initialize tracing subscriber to write to file
+    let file_appender = tracing_appender::rolling::never("logs", &log_filename);
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("pie_rt=debug".parse().unwrap()))
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_ansi(false)  // Disable ANSI color codes for clean log files
+        .with_writer(non_blocking)
+        .init();
+
+    tracing::info!("Symphony Engine starting up");
+
     //console_subscriber::init();
 
     // Parse command line arguments
@@ -117,12 +98,12 @@ async fn main() -> anyhow::Result<()> {
                 .default_value("simple_decoding"),
         )
         .arg(
-            Arg::new("config")
-                .short('c')
-                .long("config")
-                .value_name("CONFIG_PATH")
-                .help("Path to engine config file")
-                .default_value("./config.json"),
+            Arg::new("engine_manager")
+                .short('e')
+                .long("engine-manager")
+                .value_name("ENDPOINT")
+                .help("Engine-manager endpoint URL")
+                .default_value("http://127.0.0.1:8080"),
         )
         .arg(
             Arg::new("http")
@@ -150,34 +131,26 @@ async fn main() -> anyhow::Result<()> {
         )
         .get_matches();
 
-    let program_name = matches.get_one::<String>("program").unwrap();
-    let config_path = matches.get_one::<String>("config").unwrap();
-    let is_http = matches.get_one::<bool>("http").unwrap();
+    let _program_name = matches.get_one::<String>("program").unwrap();
+    let _is_http = matches.get_one::<bool>("http").unwrap();
     let port = matches.get_one::<String>("port").unwrap();
-    let port: u16 = port.parse().unwrap_or(9123);
+    let _port: u16 = port.parse().unwrap_or(9123);
     let use_dummy = matches.get_one::<bool>("dummy").unwrap();
     let use_dummy = *use_dummy;
 
-    // Load engine configuration
-    let (models, _default_model, management_endpoint) = load_config(Some(config_path))?;
+    // Get engine-manager endpoint from command line or environment variable
+    let management_endpoint = matches.get_one::<String>("engine_manager")
+        .map(|s| s.clone())
+        .or_else(|| std::env::var("SYMPHONY_ENGINE_MANAGER_ENDPOINT").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
 
-    // Check if management service is running first
-    let mgmt_config = ManagementConfig {
-        endpoint: management_endpoint.clone(),
-    };
-    check_management_service_status(&mgmt_config).await
-        .context("Management service is not available")?;
-
-    // Find the first available model from the config
-    let model_name = find_first_available_model(&models, &management_endpoint).await
-        .context("Failed to find any available models")?;
-
-    log_user!("Using model: {}", model_name);
+    // Store management endpoint for runtime backend discovery
+    // We don't check for backends on startup - they will be discovered when needed
+    log_user!("Engine starting - backend discovery will happen on-demand");
+    log_user!("Engine-manager endpoint: {}", management_endpoint);
 
     // 1) Ensure the cache directory exists
     fs::create_dir_all(PROGRAM_CACHE_DIR).context("Failed to create program cache directory")?;
-
-    //return Ok(());
 
     let runtime = Runtime::new();
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
@@ -186,14 +159,13 @@ async fn main() -> anyhow::Result<()> {
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
 
-
     let ctrl = Controller::new()
             .add("runtime", runtime)
             .add("server", server)
             .add("messaging-inst2inst", messaging_inst2inst)
             .add("messaging-user2inst", messaging_user2inst);
 
-    // Setup with dummy
+    // Setup services based on mode
     let ctrl = if use_dummy {
         log_user!("Running in dummy mode");
 
@@ -203,47 +175,28 @@ async fn main() -> anyhow::Result<()> {
         let l4m = L4m::new(dummy_l4m_backend.clone()).await;
         let ping = Ping::new(dummy_ping_backend.clone()).await;
 
-        ctrl
-            .add(l4m::available_models().first().unwrap(), l4m)
-            .add("ping", ping)
+        let models = l4m::available_models();
+        let default_model = "dummy_model".to_string();
+        let model_name = models.first().unwrap_or(&default_model);
 
+        ctrl
+            .add(model_name, l4m)
+            .add("ping", ping)
     } else {
-        // Get the model endpoint from management service
-        let model_endpoint = get_model_endpoint(&model_name, &mgmt_config).await
-            .context("Failed to get model endpoint from management service")?;
+        // On-demand mode: ping uses real L4M backend when available, L4M services added dynamically
+        log_user!("Starting engine in on-demand backend mode");
 
-        // Connect to the model backend endpoint
-        let l4m_backend = backend::ZmqBackend::bind(&model_endpoint).await?;
-
-        // Setup with real backend
-        let l4m = L4m::new(l4m_backend.clone()).await;
-        let ping = Ping::new(l4m_backend.clone()).await;
-
-        // Install all services
+        // Return controller without any pre-registered services - they'll all be added dynamically
         ctrl
-            .add(l4m::available_models().first().unwrap(), l4m)
-            .add("ping", ping)
     };
 
     // Install all services
     ctrl.install();
 
-    // periodically print stats
-    tokio::spawn(async {
-        loop {
-            let service_id = service::get_service_id(l4m::available_models().first().unwrap()).unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            l4m::Command::PrintStats.dispatch(service_id).unwrap();
-        }
-    });
+    // TODO: Add periodic stats printing for connected backends when they are connected
+    // This should be done dynamically based on which backends are actually connected
 
-    // TEST: spawn a dummy client with the program name
-    if *is_http {
-        tokio::spawn(dummy_client2(program_name.to_string(), port));
-    } else {
-        tokio::spawn(dummy_client(program_name.to_string()));
-    }
-    // wait forever
+    // Wait forever - applications will be loaded via WebSocket API when requested
     tokio::signal::ctrl_c().await?;
 
     Ok(())

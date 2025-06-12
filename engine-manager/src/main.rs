@@ -51,6 +51,12 @@ async fn main() {
 
     let shared_state = Arc::new(RwLock::new(AppState::new_with_config(args.config.clone())));
 
+    // Set the manager port in the state
+    {
+        let mut state = shared_state.write().unwrap();
+        state.manager_port = Some(args.port);
+    }
+
     // Start timeout monitoring task
     let timeout_state = shared_state.clone();
     tokio::spawn(async move {

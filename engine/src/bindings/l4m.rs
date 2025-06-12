@@ -1,8 +1,8 @@
 use crate::instance::InstanceState;
-use crate::l4m::{Command, ManagedTypes, StreamPriority, available_models};
+use crate::l4m::{Command, ManagedTypes, StreamPriority, available_models, L4m};
 use crate::object::IdRepr;
 use crate::tokenizer::BytePairEncoder;
-use crate::{bindings, service};
+use crate::{bindings, service, backend};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
@@ -78,20 +78,86 @@ fn map_object_types(ty: bindings::wit::pie::nbi::l4m::ObjectType) -> ManagedType
 
 impl bindings::wit::pie::nbi::l4m::Host for InstanceState {
     async fn get_model(&mut self, value: String) -> anyhow::Result<Option<Resource<Model>>> {
+        // First check if service already exists for this model
         if let Some(service_id) = service::get_service_id(&value) {
             let model = Model {
                 name: value,
                 service_id,
             };
             let res = self.table().push(model)?;
-            Ok(Some(res))
-        } else {
-            Ok(None)
+            return Ok(Some(res));
+        }
+
+        // If no service exists, try to discover and connect to a backend for this model
+        tracing::info!("No service found for model '{}', attempting backend discovery", value);
+
+        // TODO: Get the engine-manager endpoint from configuration
+        // For now, use the default endpoint
+        let engine_manager_endpoint = std::env::var("SYMPHONY_ENGINE_MANAGER_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+
+        match crate::backend_discovery::discover_backend_for_model(&engine_manager_endpoint, &value).await {
+            Ok(endpoint) => {
+                tracing::info!("Found backend for model '{}' at endpoint: {}", value, endpoint);
+
+                // Create a new L4M service connected to this backend
+                match self.create_l4m_service_for_backend(&value, &endpoint).await {
+                    Ok(service_id) => {
+                        let model = Model {
+                            name: value,
+                            service_id,
+                        };
+                        let res = self.table().push(model)?;
+                        Ok(Some(res))
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to create L4M service for backend: {}", e);
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Backend discovery failed for model '{}': {}", value, e);
+                Ok(None)
+            }
         }
     }
 
     async fn get_all_models(&mut self) -> anyhow::Result<Vec<String>> {
-        Ok(available_models().to_vec())
+        tracing::info!("[L4M] get_all_models() called - checking available models");
+        let current_models = available_models();
+        tracing::info!("[L4M] Current cached models: {:?} (count: {})", current_models, current_models.len());
+
+        // If no models are cached, try to discover them from backends
+        if current_models.is_empty() {
+            tracing::info!("[L4M] Models cache is empty, starting backend discovery");
+
+            tracing::info!("[L4M] About to call discover_available_models()");
+            match crate::l4m::discover_available_models().await {
+                Ok(discovered_models) => {
+                    tracing::info!("Backend discovery returned {} models: {:?}", discovered_models.len(), discovered_models);
+                    if !discovered_models.is_empty() {
+                        tracing::info!("Setting available models to discovered models");
+                        crate::l4m::set_available_models(&discovered_models);
+                        let updated_models = available_models();
+                        tracing::info!("After update, cached models: {:?}", updated_models);
+                        return Ok(discovered_models);
+                    } else {
+                        tracing::warn!("Backend discovery returned empty model list");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to discover models from backends: {}", e);
+                }
+            }
+        } else {
+            tracing::info!("Returning cached models: {:?}", current_models);
+        }
+
+        // Return the current models (which may have been updated by discovery)
+        let final_models = available_models();
+        tracing::info!("Returning final models: {:?}", final_models);
+        Ok(final_models)
     }
 }
 
@@ -520,5 +586,33 @@ impl bindings::wit::pie::nbi::l4m::HostSynchronizationResult for InstanceState {
     async fn drop(&mut self, this: Resource<SynchronizationResult>) -> Result<(), wasmtime::Error> {
         let _ = self.table().delete(this)?;
         Ok(())
+    }
+}
+
+impl InstanceState {
+    /// Create a new L4M service connected to the specified backend endpoint
+    async fn create_l4m_service_for_backend(&mut self, model_name: &str, endpoint: &str) -> anyhow::Result<usize> {
+        tracing::info!("Creating L4M service for model '{}' with backend at '{}'", model_name, endpoint);
+
+        // Create a ZMQ backend connection to the endpoint
+        let backend = backend::ZmqBackend::bind(endpoint).await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to backend at {}: {}", endpoint, e))?;
+
+        // Create a new L4M service with this backend
+        let l4m_service = L4m::new(backend).await;
+
+        // Add the service dynamically to the controller
+        match service::add_service_runtime(model_name, l4m_service) {
+            Ok(_) => {
+                tracing::info!("Successfully added L4M service for model '{}'", model_name);
+
+                // Get the service ID for the newly added service
+                service::get_service_id(model_name)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to get service ID for newly added model '{}'", model_name))
+            }
+            Err(e) => {
+                Err(anyhow::anyhow!("Failed to add L4M service to controller: {:?}", e))
+            }
+        }
     }
 }

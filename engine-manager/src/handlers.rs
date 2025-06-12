@@ -64,7 +64,7 @@ fn find_engine_binary(config: &Config) -> Result<PathBuf> {
     Err(anyhow::anyhow!("Could not find {} binary. Please ensure it's compiled or in PATH.", binary_name))
 }
 
-fn start_engine_process(config: &Config, config_path: &str, port: u16) -> Result<Child> {
+fn start_engine_process(config: &Config, config_path: &str, port: u16, manager_port: u16) -> Result<Child> {
     let binary_path = find_engine_binary(config)?;
 
     // Create logs directory if it doesn't exist
@@ -91,9 +91,9 @@ fn start_engine_process(config: &Config, config_path: &str, port: u16) -> Result
     args.push("--port".to_string());
     args.push(port.to_string());
 
-    // Add config file with absolute path (engine now supports unified config)
-    args.push("--config".to_string());
-    args.push(absolute_config_path.to_string_lossy().to_string());
+    // Add engine-manager endpoint (engine now gets config via engine-manager endpoint)
+    args.push("--engine-manager".to_string());
+    args.push(format!("http://127.0.0.1:{}", manager_port));
 
     cmd.args(&args);
 
@@ -251,10 +251,13 @@ pub async fn controller_status_handler() -> Json<Value> {
 
 // POST /controller/start
 pub async fn controller_start_handler(State(state): State<SharedState>) -> Result<Json<Value>, StatusCode> {
-    // Get the config path from shared state
-    let config_path = {
+    // Get the config path and manager port from shared state
+    let (config_path, manager_port) = {
         let state_guard = state.read().unwrap();
-        state_guard.config_path.clone().unwrap_or_else(|| "config.json".to_string())
+        (
+            state_guard.config_path.clone().unwrap_or_else(|| "config.json".to_string()),
+            state_guard.manager_port.unwrap_or(8080)
+        )
     };
 
     // Load the unified configuration from the absolute path
@@ -281,7 +284,7 @@ pub async fn controller_start_handler(State(state): State<SharedState>) -> Resul
     let engine_port = config.services.engine.default_port;
 
     // Start the actual engine process
-    match start_engine_process(&config, &config_path, engine_port) {
+    match start_engine_process(&config, &config_path, engine_port, manager_port) {
         Ok(engine_process) => {
             tracing::info!("Engine process started successfully on port {}", engine_port);
             processes_guard.engine_process = Some(engine_process);

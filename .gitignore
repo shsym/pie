@@ -207,6 +207,7 @@ bin/
 # logs and temporary files
 logs
 *.log
+.plan
 
 # No MCP files
 .memory-bank

@@ -1,14 +1,14 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task;
 
 // Common driver routines
 
-static SERVICE_DISPATCHER: OnceLock<ServiceDispatcher> = OnceLock::new();
+static SERVICE_DISPATCHER: OnceLock<Arc<Mutex<ServiceDispatcher>>> = OnceLock::new();
 
 pub fn dispatch<C>(service_id: usize, cmd: C) -> Result<(), ServiceError>
 where
@@ -17,6 +17,8 @@ where
     SERVICE_DISPATCHER
         .get()
         .expect("Service not initialized")
+        .lock()
+        .unwrap()
         .dispatch(service_id, cmd)
 }
 
@@ -24,7 +26,42 @@ pub fn get_service_id(name: &str) -> Option<usize> {
     SERVICE_DISPATCHER
         .get()
         .expect("Service not found")
+        .lock()
+        .unwrap()
         .get_service_id(name)
+}
+
+pub fn add_service_runtime<T>(name: &str, driver: T) -> Result<(), ServiceError>
+where
+    T: Service + 'static + Send,
+{
+    SERVICE_DISPATCHER
+        .get()
+        .expect("Service not initialized")
+        .lock()
+        .unwrap()
+        .add_service(name, driver)
+}
+
+pub fn remove_service(name: &str) -> Result<(), ServiceError> {
+    SERVICE_DISPATCHER
+        .get()
+        .expect("Service not initialized")
+        .lock()
+        .unwrap()
+        .remove_service(name)
+}
+
+pub fn has_service(name: &str) -> bool {
+    SERVICE_DISPATCHER
+        .get()
+        .map(|dispatcher| {
+            dispatcher
+                .lock()
+                .unwrap()
+                .has_service(name)
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Error)]
@@ -86,10 +123,10 @@ impl Controller {
     }
 
     pub fn install(self) {
-        let dispatcher = ServiceDispatcher {
+        let dispatcher = Arc::new(Mutex::new(ServiceDispatcher {
             maps: self.maps,
             channels: self.channels,
-        };
+        }));
         SERVICE_DISPATCHER
             .set(dispatcher)
             .expect("Dispatcher already initialized");
@@ -131,6 +168,46 @@ impl ServiceDispatcher {
             .ok_or(ServiceError::DriverNotFound(name.to_string()))?;
 
         self.dispatch(service_id, cmd)?;
+
+        Ok(())
+    }
+
+    pub fn has_service(&self, name: &str) -> bool {
+        self.maps.contains_key(name)
+    }
+
+    pub fn add_service<T>(&mut self, name: &str, mut driver: T) -> Result<(), ServiceError>
+    where
+        T: Service + 'static + Send,
+    {
+        if self.maps.contains_key(name) {
+            return Err(ServiceError::DriverNotFound(format!("Service '{}' already exists", name)));
+        }
+
+        let (tx, mut rx) = unbounded_channel();
+        self.channels.push(tx);
+        self.maps.insert(name.to_string(), self.channels.len() - 1);
+
+        task::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                driver.handle(*cmd.downcast().unwrap()).await
+            }
+        });
+
+        Ok(())
+    }
+
+    pub fn remove_service(&mut self, name: &str) -> Result<(), ServiceError> {
+        let service_id = self.maps.remove(name)
+            .ok_or(ServiceError::DriverNotFound(name.to_string()))?;
+
+        // Note: We can't actually remove from the Vec without affecting other indices
+        // Instead, we'll close the channel and let the task finish naturally
+        if let Some(channel) = self.channels.get(service_id) {
+            // Dropping the sender will close the channel and terminate the task
+            // For now, we'll just mark it as removed from the map
+            // TODO: Consider using a more sophisticated approach like Option<UnboundedSender>
+        }
 
         Ok(())
     }
