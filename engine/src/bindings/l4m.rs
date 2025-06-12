@@ -147,7 +147,7 @@ impl bindings::wit::pie::nbi::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
     ) -> Result<Vec<String>, wasmtime::Error> {
-        let service_id = self.table().get(&model)?.service_id;
+        let _service_id = self.table().get(&model)?.service_id;
 
         Ok(vec![])
     }
@@ -235,7 +235,7 @@ impl bindings::wit::pie::nbi::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
         stream_id: u32,
-        adapter: String,
+        _adapter: String,
         last_block_len: u32,
         context_block_ids: Vec<IdRepr>,
         input_emb_ids: Vec<IdRepr>,

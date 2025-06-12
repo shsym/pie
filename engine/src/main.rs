@@ -17,7 +17,7 @@ mod utils;
 
 //
 use anyhow::Context;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // use crate::client::{Client, hash_program};
 use crate::l4m::L4m;
@@ -57,8 +57,26 @@ async fn check_model_available(model_name: &str, engine_manager_endpoint: &str) 
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+// Add manual Tokio runtime for main
+fn main() -> anyhow::Result<()> {
+    // Build the main Tokio runtime
+    let rt_main = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to build main Tokio runtime")?;
+    // Build a separate Tokio runtime for management
+    let rt_mgmt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to build management Tokio runtime")?;
+    // Run management_main on its own runtime
+    rt_mgmt.block_on(management_main())?;
+    // Run the async_main on the main runtime
+    rt_main.block_on(async_main())
+}
+
+// Remove the Tokio macro and rename main
+async fn async_main() -> anyhow::Result<()> {
     // Create log directory if it doesn't exist
     std::fs::create_dir_all("logs").unwrap_or(());
 
@@ -103,19 +121,11 @@ async fn main() -> anyhow::Result<()> {
                 .default_value("http://127.0.0.1:8080"),
         )
         .arg(
-            Arg::new("http")
-                .short('H')
-                .long("http")
-                .action(clap::ArgAction::SetTrue)
-                .help("Run the HTTP server")
-                .default_value("false"),
-        )
-        .arg(
             Arg::new("port")
                 .short('p')
                 .long("port")
                 .value_name("PORT")
-                .help("Port to run the HTTP server on")
+                .help("Port to run the client entry point")
                 .default_value("9123"),
         )
         .arg(
@@ -129,9 +139,8 @@ async fn main() -> anyhow::Result<()> {
         .get_matches();
 
     let _program_name = matches.get_one::<String>("program").unwrap();
-    let _is_http = matches.get_one::<bool>("http").unwrap();
     let port = matches.get_one::<String>("port").unwrap();
-    let _port: u16 = port.parse().unwrap_or(9123);
+    let port: u16 = port.parse().unwrap_or(9123);
     let use_dummy = matches.get_one::<bool>("dummy").unwrap();
     let use_dummy = *use_dummy;
 
@@ -152,7 +161,10 @@ async fn main() -> anyhow::Result<()> {
     let runtime = Runtime::new();
     runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
 
-    let server = Server::new("127.0.0.1:9123");
+    // Get port from args
+    let server_url = format!("127.0.0.1:{}", port);
+    log_user!("Server URL: {}", server_url);
+    let server = Server::new(&server_url);
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
 
@@ -199,5 +211,12 @@ async fn main() -> anyhow::Result<()> {
     // Wait forever - applications will be loaded via WebSocket API when requested
     tokio::signal::ctrl_c().await?;
 
+    Ok(())
+}
+
+// New management entrypoint
+async fn management_main() -> anyhow::Result<()> {
+    // TODO: add management logic here
+    tracing::info!("Management runtime started");
     Ok(())
 }

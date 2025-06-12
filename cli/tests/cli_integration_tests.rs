@@ -41,7 +41,7 @@ impl TestContext {
         "engine": {
             "binary_name": "pie-rt",
             "default_port": 9123,
-            "base_args": ["--http"]
+            "base_args": []
         }
     },
     "endpoints": {

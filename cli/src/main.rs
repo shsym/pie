@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
 
             // Instead of finishing, just leave the spinner on the screen
             // The controller command will take over with its own spinner
-            print!("\r"); // Just move to beginning of line, don't clear
+            // print!("\r"); // Just move to beginning of line, don't clear
             io::stdout().flush().unwrap();
         },
         Commands::Controller(ControllerCommands::Stop { .. }) => {
@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
             }
 
             // Don't clear the line, let the stop command take over
-            print!("\r");
+            // print!("\r");
             io::stdout().flush().unwrap();
         },
         Commands::Backend(BackendCommands::Start { .. }) => {

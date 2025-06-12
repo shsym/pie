@@ -1,5 +1,4 @@
 use dashmap::DashMap;
-use hyper::Request;
 use hyper::server::conn::http1;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -186,7 +185,7 @@ impl Service for Runtime {
                 port,
                 event,
             } => {
-                self.launch_server_instance(&hash, port).await;
+                let _ = self.launch_server_instance(&hash, port).await;
                 event.send(Ok(())).unwrap();
             }
 

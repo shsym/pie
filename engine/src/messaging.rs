@@ -1,9 +1,8 @@
 use crate::service;
-use crate::service::{Service, ServiceError};
+use crate::service::Service;
 use crate::utils::IdPool;
 use dashmap::DashMap;
 use std::collections::VecDeque;
-use std::mem;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;

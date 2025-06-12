@@ -203,7 +203,7 @@ impl ServiceDispatcher {
 
         // Note: We can't actually remove from the Vec without affecting other indices
         // Instead, we'll close the channel and let the task finish naturally
-        if let Some(channel) = self.channels.get(service_id) {
+        if let Some(_channel) = self.channels.get(service_id) {
             // Dropping the sender will close the channel and terminate the task
             // For now, we'll just mark it as removed from the map
             // TODO: Consider using a more sophisticated approach like Option<UnboundedSender>

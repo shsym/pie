@@ -1,5 +1,4 @@
 use crate::backend::Backend;
-use crate::backend_discovery::EngineManagerClient;
 use crate::batching::{Batchable, Batcher, BatchingStrategy};
 use crate::instance::Id as InstanceId;
 use crate::object::{IdRepr, ObjectManager, ObjectType, group_consecutive_ids};
@@ -7,7 +6,6 @@ use crate::service::{Service, ServiceError};
 use crate::tokenizer::BytePairEncoder;
 use crate::utils::IdPool;
 use crate::{backend, batching, runtime, service, tokenizer};
-use anyhow;
 use backend_management_rs::path_utils::expand_home_dir_str;
 use dashmap::DashMap;
 use prost::Message;
@@ -20,7 +18,6 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task;
 use tokio::time::timeout;
 macro_rules! try_trap {
     ($result:expr, $inst_id:expr, $msg:expr) => {
@@ -42,10 +39,7 @@ static AVAILABLE_MODELS: std::sync::LazyLock<RwLock<Vec<String>>> = std::sync::L
 });
 
 // Engine manager endpoint for dynamic model discovery
-static ENGINE_MANAGER_ENDPOINT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    std::env::var("ENGINE_MANAGER_ENDPOINT")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
-});
+
 
 pub fn set_available_models<T>(models: T)
 where
@@ -156,7 +150,7 @@ impl Default for StreamPriority {
 
 #[derive(Debug)]
 pub enum Command {
-    PrintStats,
+
 
     Destroy {
         inst_id: InstanceId,
@@ -375,8 +369,8 @@ pub struct L4mStat {
 #[derive(Debug)]
 pub struct L4m {
     scheduler: Sender<(Stream, Command)>,
-    scheduler_loop_handle: task::JoinHandle<()>,
-    event_loop_handle: task::JoinHandle<()>,
+    scheduler_loop_handle: tokio::task::JoinHandle<()>,
+    event_loop_handle: tokio::task::JoinHandle<()>,
     exported_blocks: HashMap<String, ExportedBlocks>,
     objects: ObjectManager<InstanceId, ManagedTypes>,
     stream_priorities: HashMap<Stream, StreamPriority>,
@@ -539,7 +533,7 @@ impl L4m {
             let type_name = match managed_type {
                 ManagedTypes::KvBlock => "kvpage",
                 ManagedTypes::TokenEmb => "emb",
-                _ => "unknown",
+                // _ => "unknown",
             };
 
             stats.push(format!(
@@ -592,12 +586,6 @@ impl L4m {
 
     fn resolve_cmd(&mut self, cmd: Command) -> Option<(Command, Stream)> {
         match cmd {
-            Command::PrintStats => {
-                self.stats.total_calls -=1; // compensate for the print stats call
-
-                self.print_stats();
-                None
-            }
 
             Command::Destroy { .. } => {
                 unreachable!()
@@ -1114,8 +1102,8 @@ where
                 let cmd = batch.into_iter().next().unwrap();
                 match cmd {
                     Command::Synchronize {
-                        inst_id,
-                        stream_id,
+                        inst_id: _,
+                        stream_id: _,
                         handle,
                     } => {
                         handle.send(()).unwrap();
@@ -1125,7 +1113,7 @@ where
                 return;
             }
             BatchGroup::EmbedImage => encode_pb_batch_embed_image(correlation_id, batch),
-            _ => unreachable!(),
+            // _ => unreachable!(),
         };
 
         if let Some(events) = event {
@@ -1162,9 +1150,7 @@ impl Simulator {
         }
     }
 
-    pub fn new_with_protocols(protocols: Vec<String>) -> Self {
-        Self { protocols }
-    }
+
 }
 
 impl backend::Simulate for Simulator {
@@ -1231,14 +1217,14 @@ fn encode_pb_batch_allocate_inner(batch: Vec<Command>) -> Vec<pb_bindings::Alloc
     for cmd in batch {
         match cmd {
             Command::Allocate {
-                inst_id,
-                stream_id,
+                inst_id: _,
+                stream_id: _,
                 ty,
                 ids,
             }
             | Command::Deallocate {
-                inst_id,
-                stream_id,
+                inst_id: _,
+                stream_id: _,
                 ty,
                 ids,
             } => {
@@ -1269,14 +1255,14 @@ fn encode_pb_batch_deallocate_inner(batch: Vec<Command>) -> Vec<pb_bindings::Dea
     for cmd in batch {
         match cmd {
             Command::Allocate {
-                inst_id,
-                stream_id,
+                inst_id: _,
+                stream_id: _,
                 ty,
                 ids,
             }
             | Command::Deallocate {
-                inst_id,
-                stream_id,
+                inst_id: _,
+                stream_id: _,
                 ty,
                 ids,
             } => {
@@ -1341,8 +1327,8 @@ fn encode_pb_batch_fill_block(
     for cmd in batch {
         match cmd {
             Command::FillBlock {
-                inst_id,
-                stream_id,
+                inst_id: _,
+                stream_id: _,
                 last_block_len,
                 context,
                 inputs,
@@ -1376,8 +1362,8 @@ fn encode_pb_batch_copy_block(
     for cmd in batch {
         match cmd {
             Command::CopyBlock {
-                inst_id,
-                stream_id,
+                inst_id: _,
+                stream_id: _,
                 src_block,
                 dst_block,
                 src_token_offset,
@@ -1413,8 +1399,8 @@ fn encode_pb_batch_mask_block(
     for cmd in batch {
         match cmd {
             Command::MaskBlock {
-                inst_id,
-                stream_id,
+                inst_id: _,
+                stream_id: _,
                 block,
                 mask,
             } => {
@@ -1444,8 +1430,8 @@ fn encode_pb_batch_embed_text(
     for cmd in batch {
         match cmd {
             Command::EmbedText {
-                inst_id,
-                stream_id,
+                inst_id: _,
+                stream_id: _,
                 embs,
                 text,
                 positions,
@@ -1480,8 +1466,8 @@ fn encode_pb_batch_sample_topk(
     for cmd in batch {
         match cmd {
             Command::SampleTopK {
-                inst_id,
-                stream_id,
+                inst_id: _,
+                stream_id: _,
                 emb_id: dist,
                 k,
                 handle,
@@ -1516,8 +1502,8 @@ fn encode_pb_batch_embed_image(
     for cmd in batch {
         match cmd {
             Command::EmbedImage {
-                inst_id,
-                stream_id,
+                inst_id: _,
+                stream_id: _,
                 embs,
                 image_blob,
             } => {
