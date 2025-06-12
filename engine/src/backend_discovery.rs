@@ -1,6 +1,27 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::RwLock;
+
+/// Model-to-backend cache: maps model names to backend endpoints and service IDs
+#[derive(Debug, Clone)]
+pub struct ModelBackendInfo {
+    pub backend_endpoint: String,
+    pub service_id: Option<usize>, // Set when service is created
+    pub backend_id: String,
+    pub last_verified: std::time::Instant,
+}
+
+static MODEL_BACKEND_CACHE: std::sync::LazyLock<RwLock<HashMap<String, ModelBackendInfo>>> =
+    std::sync::LazyLock::new(|| {
+        RwLock::new(HashMap::new())
+    });
+
+/// Engine manager endpoint for dynamic model discovery
+static ENGINE_MANAGER_ENDPOINT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("ENGINE_MANAGER_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+});
 
 /// Backend information returned from engine-manager
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +67,6 @@ impl EngineManagerClient {
 
     /// Query engine-manager for all registered backends
     pub async fn list_backends(&self) -> Result<HashMap<String, BackendInfo>> {
-        tracing::info!("Listing backends from engine-manager at: {}", self.base_url);
         let url = format!("{}/backends", self.base_url);
         tracing::debug!("Making GET request to: {}", url);
 
@@ -76,7 +96,7 @@ impl EngineManagerClient {
         let list_response: ListBackendsResponse = serde_json::from_str(&response_text)
             .context("Failed to parse backends list response")?;
 
-        tracing::info!("Successfully parsed {} backends from engine-manager", list_response.backends.len());
+        tracing::debug!("Successfully parsed {} backends from engine-manager", list_response.backends.len());
 
         // Convert Vec<BackendInfoSummary> to HashMap<String, BackendInfo>
         let mut backends_map = HashMap::new();
@@ -90,7 +110,7 @@ impl EngineManagerClient {
                 last_heartbeat: None,
             };
 
-            tracing::info!("Backend '{}': status={}, management_api_address={}, capabilities={:?}",
+            tracing::debug!("Backend '{}': status={}, management_api_address={}, capabilities={:?}",
                 backend_info.backend_id, backend_info.status, backend_info.management_api_address, backend_info.capabilities);
 
             backends_map.insert(summary.backend_id, backend_info);
@@ -275,4 +295,271 @@ pub async fn discover_backend_for_model(
 
     // Get the model endpoint from the backend
     get_model_endpoint_from_backend(&backend_info, model_name).await
+}
+
+/// Get a model backend info from the cache ONLY (no discovery)
+pub fn get_cached_model_backend_info(model_name: &str) -> Option<ModelBackendInfo> {
+    if let Ok(cache) = MODEL_BACKEND_CACHE.read() {
+        if let Some(info) = cache.get(model_name) {
+            tracing::info!("Found cached backend info for model '{}': {}", model_name, info.backend_endpoint);
+            return Some(info.clone());
+        }
+    }
+    tracing::debug!("No cached backend info found for model '{}'", model_name);
+    None
+}
+
+/// Get a model backend info from the cache, or discover it if not cached
+/// This function is for internal engine use only, not for bindings
+pub async fn get_model_backend_info(model_name: &str) -> anyhow::Result<Option<ModelBackendInfo>> {
+    // First check cache
+    if let Ok(cache) = MODEL_BACKEND_CACHE.read() {
+        if let Some(info) = cache.get(model_name) {
+            // Check if cache entry is still fresh (within 5 minutes)
+            if info.last_verified.elapsed() < std::time::Duration::from_secs(300) {
+                tracing::info!("Found cached backend info for model '{}': {}", model_name, info.backend_endpoint);
+                return Ok(Some(info.clone()));
+            } else {
+                tracing::info!("Cache entry for model '{}' is stale, will refresh", model_name);
+            }
+        }
+    }
+
+    // Not in cache or stale, discover backend for this model
+    tracing::info!("Discovering backend for model '{}'", model_name);
+    match discover_backend_for_model(&ENGINE_MANAGER_ENDPOINT, model_name).await {
+        Ok(backend_endpoint) => {
+            let backend_info = ModelBackendInfo {
+                backend_endpoint: backend_endpoint.clone(),
+                service_id: None, // Will be set when service is created
+                backend_id: "unknown".to_string(), // TODO: Get from discovery
+                last_verified: std::time::Instant::now(),
+            };
+
+            // Update cache
+            if let Ok(mut cache) = MODEL_BACKEND_CACHE.write() {
+                cache.insert(model_name.to_string(), backend_info.clone());
+                tracing::info!("Cached backend info for model '{}': {}", model_name, backend_endpoint);
+            }
+
+            Ok(Some(backend_info))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to discover backend for model '{}': {}", model_name, e);
+            Ok(None)
+        }
+    }
+}
+
+/// Update the service ID for a model in the cache
+pub fn set_model_service_id(model_name: &str, service_id: usize) {
+    if let Ok(mut cache) = MODEL_BACKEND_CACHE.write() {
+        if let Some(info) = cache.get_mut(model_name) {
+            info.service_id = Some(service_id);
+            tracing::info!("Updated service ID for model '{}' to {}", model_name, service_id);
+        }
+    }
+}
+
+/// Get the service ID for a model from the cache
+pub fn get_model_service_id(model_name: &str) -> Option<usize> {
+    if let Ok(cache) = MODEL_BACKEND_CACHE.read() {
+        if let Some(info) = cache.get(model_name) {
+            return info.service_id;
+        }
+    }
+    None
+}
+
+/// Update the model-backend cache when backends are discovered
+pub fn update_model_backend_cache_from_discovery(backends: &HashMap<String, BackendInfo>) {
+    let mut cache_updates = HashMap::new();
+
+    for (backend_id, backend_info) in backends {
+        if backend_info.status != "Running" {
+            continue;
+        }
+
+        // Extract IPC endpoint from capabilities
+        let ipc_endpoint = backend_info.capabilities.iter()
+            .find(|cap| cap.starts_with("ipc_endpoint:"))
+            .map(|cap| &cap[13..]) // Remove "ipc_endpoint:" prefix
+            .unwrap_or("unknown");
+
+        // Extract models from capabilities
+        for capability in &backend_info.capabilities {
+            if capability.starts_with("model:") {
+                let model_name = &capability[6..]; // Remove "model:" prefix
+
+                let backend_info = ModelBackendInfo {
+                    backend_endpoint: ipc_endpoint.to_string(),
+                    service_id: None, // Services created on demand
+                    backend_id: backend_id.clone(),
+                    last_verified: std::time::Instant::now(),
+                };
+
+                cache_updates.insert(model_name.to_string(), backend_info);
+            }
+        }
+    }
+
+    // Update the cache with discovered models
+    if let Ok(mut cache) = MODEL_BACKEND_CACHE.write() {
+        for (model_name, backend_info) in cache_updates {
+            // Only update if not already cached or if we have a service ID to preserve
+            if let Some(existing) = cache.get(&model_name) {
+                let mut updated_info = backend_info;
+                updated_info.service_id = existing.service_id; // Preserve existing service ID
+                cache.insert(model_name.clone(), updated_info);
+            } else {
+                tracing::info!("Added new model '{}' to cache with backend '{}'", model_name, backend_info.backend_endpoint);
+                cache.insert(model_name.clone(), backend_info);
+            }
+        }
+    }
+}
+
+/// Start a background task to periodically update the model-backend cache
+pub fn start_periodic_cache_updates() {
+    let update_interval = std::time::Duration::from_secs(1); // Update every second for low latency
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(update_interval);
+
+        loop {
+            interval.tick().await;
+
+            // Update the cache from engine-manager
+            match discover_available_models().await {
+                Ok(discovered_models) => {
+                    if !discovered_models.is_empty() {
+                        crate::l4m::set_available_models(&discovered_models);
+
+                        // Create L4M services for newly discovered models
+                        // Note: This will only create services for models that don't already have one
+                        create_l4m_services_for_discovered_models(&discovered_models).await;
+
+                        tracing::debug!("Periodic cache update: found {} models", discovered_models.len());
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Periodic cache update failed: {}", e);
+                }
+            }
+        }
+    });
+
+    tracing::info!("Started periodic model-backend cache updates (interval: {:?})", update_interval);
+}
+
+/// Async function to discover models from all registered backends
+/// Note) this function is called periodically to refresh the model list
+pub async fn discover_available_models() -> anyhow::Result<Vec<String>> {
+    let client = EngineManagerClient::new(&ENGINE_MANAGER_ENDPOINT);
+    tracing::debug!("[BackendDiscovery] Created engine manager client for endpoint: {}", *ENGINE_MANAGER_ENDPOINT);
+
+    let backends = match client.list_backends().await {
+        Ok(backends) => {
+            tracing::debug!("[BackendDiscovery] Raw backends data: {:#?}", backends);
+            backends
+        }
+        Err(e) => {
+            tracing::error!("[BackendDiscovery] Failed to list backends from engine manager: {}", e);
+            return Err(e);
+        }
+    };
+
+    // Update the model-backend cache from discovered backends
+    update_model_backend_cache_from_discovery(&backends);
+
+    // Start with empty list of models; discover fresh set from registered backends
+    // We cannot simply start from the cached models because the backend capabilities may have changed
+    let mut models = Vec::new();
+
+    for (backend_id, backend_info) in &backends {
+        tracing::debug!("[BackendDiscovery] Backend '{}' capabilities: {:?}", backend_id, backend_info.capabilities);
+
+        if backend_info.status != "Running" {
+            tracing::warn!("[BackendDiscovery] Skipping backend '{}' because status is not 'Running': {}", backend_id, backend_info.status);
+            continue;
+        }
+
+        // Extract models from backend capabilities
+        for capability in &backend_info.capabilities {
+            tracing::debug!("[BackendDiscovery] Processing capability: '{}'", capability);
+            // Check and extract model capability prefix
+            if let Some(model_name) = capability.strip_prefix("model:") {
+                tracing::debug!("[BackendDiscovery] Found model: '{}'", model_name);
+                let model_str = model_name.to_string();
+                if !models.contains(&model_str) {
+                    models.push(model_str.clone());
+                    tracing::debug!("Discovered a new model '{}' from backend '{}'", model_str, backend_id);
+                } else {
+                    tracing::debug!("Model '{}' already discovered", model_str);
+                }
+            } else {
+                tracing::debug!("[BackendDiscovery] Ignoring non-model capability: '{}'", capability);
+            }
+        }
+    }
+
+    if models.is_empty() {
+        tracing::warn!("No models discovered from registered backends (total backends: {})", backends.len());
+        if backends.len() > 0 {
+            tracing::debug!("Backends were found but no models extracted. Check backend capabilities format.");
+        } else {
+            tracing::debug!("No backends found at all. Check if backend is registered with engine-manager.");
+        }
+    } else {
+        tracing::debug!("Discovered {} models from backends: {:?}", models.len(), models);
+    }
+
+    Ok(models)
+}
+
+/// Create L4M services for newly discovered models that don't already have services
+async fn create_l4m_services_for_discovered_models(discovered_models: &[String]) {
+    use crate::{backend, l4m::L4m, service};
+
+    for model_name in discovered_models {
+        // Check if this model already has a service
+        if service::get_service_id(model_name).is_some() {
+            tracing::debug!("Model '{}' already has a service, skipping creation", model_name);
+            continue;
+        }
+
+        // Check if we have backend info for this model
+        if let Some(backend_info) = get_cached_model_backend_info(model_name) {
+            tracing::info!("Creating L4M service for model '{}' with backend at '{}'", model_name, backend_info.backend_endpoint);
+
+            // Create a ZMQ backend connection to the endpoint
+            match backend::ZmqBackend::bind(&backend_info.backend_endpoint).await {
+                Ok(backend) => {
+                    // Create a new L4M service with this backend
+                    let l4m_service = L4m::new(backend).await;
+
+                    // Add the service dynamically to the controller
+                    match service::add_service_runtime(model_name, l4m_service) {
+                        Ok(_) => {
+                            tracing::info!("Successfully added L4M service for model '{}'", model_name);
+
+                            // Get the service ID for the newly added service and update cache
+                            if let Some(service_id) = service::get_service_id(model_name) {
+                                set_model_service_id(model_name, service_id);
+                                tracing::info!("Updated cache with service ID {} for model '{}'", service_id, model_name);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to add L4M service to controller for model '{}': {:?}", model_name, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to connect to backend at '{}' for model '{}': {}", backend_info.backend_endpoint, model_name, e);
+                }
+            }
+        } else {
+            tracing::warn!("No backend info found in cache for model '{}' - this should not happen", model_name);
+        }
+    }
 }

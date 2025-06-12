@@ -296,15 +296,13 @@ impl Runtime {
 
         let instance_id = Uuid::new_v4();
 
-        // 4) Build the InstanceState
-
-        // 5) Instantiate and run in a task
+        // Instantiate and run in a task
         let engine = self.engine.clone();
         let linker = self.linker.clone();
 
         let join_handle = tokio::spawn(Self::launch(instance_id, component, engine, linker));
 
-        // 6) Record in the “running_instances” so we can manage it later
+        // Record in the “running_instances” so we can manage it later
         let instance_handle = InstanceHandle {
             hash: hash.to_string(),
             join_handle,
@@ -323,16 +321,14 @@ impl Runtime {
         let instance_id = Uuid::new_v4();
         let component = self.get_component(hash)?;
 
-        // 4) Build the InstanceState
-
-        // 5) Instantiate and run in a task
+        // Instantiate and run in a task
         let engine = self.engine.clone();
         let linker = self.linker.clone();
         let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
 
         let join_handle = tokio::spawn(Self::launch_server(addr, component, engine, linker));
 
-        // 6) Record in the “running_instances” so we can manage it later
+        // Record in the “running_instances” so we can manage it later
         let instance_handle = InstanceHandle {
             hash: hash.to_string(),
             join_handle,

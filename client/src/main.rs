@@ -82,10 +82,6 @@ async fn run_interactive_instance(
     let mut handles = Vec::new();
     for (i, mut instance) in instances.into_iter().enumerate() {
         let handle = tokio::spawn(async move {
-            // Send some example events
-            instance.send("event #1: Hello from Symphony client").await?;
-            instance.send("event #2: Another event").await?;
-            instance.send("event #3: Final event").await?;
 
             // Handle incoming events
             while let Ok((event, message)) = instance.recv().await {

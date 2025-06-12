@@ -60,7 +60,7 @@ where
     // Update the static cache with new models
     if let Ok(mut cached_models) = AVAILABLE_MODELS.write() {
         *cached_models = new_models;
-        tracing::info!("Updated available models cache with {} models", cached_models.len());
+        tracing::debug!("Updated available models cache with {} models", cached_models.len());
     } else {
         tracing::warn!("Failed to update available models cache");
     }
@@ -76,92 +76,6 @@ pub fn available_models() -> Vec<String> {
     }
 }
 
-/// Async function to discover models from all registered backends
-pub async fn discover_available_models() -> anyhow::Result<Vec<String>> {
-    tracing::info!("[L4M] discover_available_models() - starting backend discovery");
-    let client = EngineManagerClient::new(&ENGINE_MANAGER_ENDPOINT);
-    tracing::info!("[L4M] Created engine manager client for endpoint: {}", *ENGINE_MANAGER_ENDPOINT);
-
-    let backends = match client.list_backends().await {
-        Ok(backends) => {
-            tracing::info!("[L4M] Successfully retrieved {} backends from engine manager", backends.len());
-            tracing::debug!("[L4M] Raw backends data: {:#?}", backends);
-            backends
-        }
-        Err(e) => {
-            tracing::error!("[L4M] Failed to list backends from engine manager: {}", e);
-            return Err(e);
-        }
-    };
-
-    let mut models = Vec::new();
-
-    for (backend_id, backend_info) in &backends {
-        tracing::info!("[L4M] Processing backend '{}' with status '{}'", backend_id, backend_info.status);
-        tracing::debug!("[L4M] Backend '{}' capabilities: {:?}", backend_id, backend_info.capabilities);
-
-        if backend_info.status != "Running" {
-            tracing::warn!("[L4M] Skipping backend '{}' because status is not 'Running': {}", backend_id, backend_info.status);
-            continue;
-        }
-
-        // Extract models from backend capabilities
-        println!("[DEBUG] Extracting models from {} capabilities", backend_info.capabilities.len());
-        for capability in &backend_info.capabilities {
-            println!("[DEBUG] Processing capability: '{}'", capability);
-            tracing::debug!("Processing capability: '{}'", capability);
-            if capability.starts_with("model:") {
-                let model_name = &capability[6..]; // Remove "model:" prefix
-                println!("[DEBUG] Found model capability: '{}' -> extracted model: '{}'", capability, model_name);
-                if !models.contains(&model_name.to_string()) {
-                    models.push(model_name.to_string());
-                    println!("[DEBUG] Added model '{}' to models list", model_name);
-                    tracing::info!("Discovered model '{}' from backend '{}'", model_name, backend_id);
-                } else {
-                    println!("[DEBUG] Model '{}' already discovered", model_name);
-                    tracing::debug!("Model '{}' already discovered", model_name);
-                }
-            } else {
-                println!("[DEBUG] Capability '{}' is not a model capability (doesn't start with 'model:')", capability);
-            }
-        }
-    }
-
-    if models.is_empty() {
-        println!("[DEBUG] No models discovered from registered backends (total backends: {})", backends.len());
-        tracing::warn!("No models discovered from registered backends (total backends: {})", backends.len());
-        if backends.len() > 0 {
-            println!("[DEBUG] Backends were found but no models extracted. Check backend capabilities format.");
-        } else {
-            println!("[DEBUG] No backends found at all. Check if backend is registered with engine-manager.");
-        }
-    } else {
-        println!("[DEBUG] Discovered {} models from backends: {:?}", models.len(), models);
-        tracing::info!("Discovered {} models from backends: {:?}", models.len(), models);
-    }
-
-    Ok(models)
-}
-
-/// Runtime version of model discovery that can be called from within the engine
-/// This spawns a background task to discover models and update the cache
-pub fn discover_models_from_backends() {
-    tokio::spawn(async {
-        match discover_available_models().await {
-            Ok(models) => {
-                if !models.is_empty() {
-                    set_available_models(models);
-                    tracing::info!("Runtime model discovery: Updated available models cache");
-                } else {
-                    tracing::warn!("Runtime model discovery: No models found");
-                }
-            }
-            Err(e) => {
-                tracing::error!("Runtime model discovery failed: {}", e);
-            }
-        }
-    });
-}
 
 mod pb_bindings {
     include!(concat!(env!("OUT_DIR"), "/l4m.rs"));
@@ -513,8 +427,8 @@ impl L4m {
 
         let info = info_rx.await.unwrap();
 
-        println!(
-            "The backend info: version={}, model_name={}, block_size={}, num_blocks={}, num_embeddings={}, num_distributions={}",
+        tracing::info!(
+            "Backend initialized: version={}, model_name={}, block_size={}, num_blocks={}, num_embeddings={}, num_distributions={}",
             info.version,
             info.model_name,
             info.block_size,
@@ -522,6 +436,9 @@ impl L4m {
             info.num_embeddings,
             info.num_distributions
         );
+
+        // Add the model name to the available models
+        set_available_models([info.model_name.clone()]);
 
         // Extract the actual model name from the path if it's a full path
         let model_name = if info.model_name.contains('/') {
@@ -551,15 +468,15 @@ impl L4m {
         // First try Symphony managed models with metadata
         for path in &symphony_model_paths {
             if std::path::Path::new(path).exists() {
-                println!("Trying to load tokenizer from Symphony managed model: {}", path);
+                tracing::debug!("Trying to load tokenizer from Symphony managed model: {}", path);
                 match tokenizer::load_symphony_tokenizer(path) {
                     Ok(tok) => {
                         tokenizer = Some(tok);
-                        println!("Successfully loaded tokenizer from Symphony managed model: {}", path);
+                        tracing::info!("Successfully loaded tokenizer from Symphony managed model: {}", path);
                         break;
                     }
                     Err(e) => {
-                        println!("Failed to load tokenizer from Symphony managed model {}: {}", path, e);
+                        tracing::debug!("Failed to load tokenizer from Symphony managed model {}: {}", path, e);
                         continue;
                     }
                 }
@@ -572,7 +489,7 @@ impl L4m {
                 match tokenizer::llama3_tokenizer(path) {
                     Ok(tok) => {
                         tokenizer = Some(tok);
-                        println!("Successfully loaded tokenizer from {}", path);
+                        tracing::info!("Successfully loaded tokenizer from {}", path);
                         break;
                     }
                     Err(_) => continue,
@@ -633,7 +550,7 @@ impl L4m {
 
         stats.push(format!("Total calls: {}", self.stats.total_calls));
 
-        println!("{}", stats.join(" | "));
+        tracing::info!("{}", stats.join(" | "));
     }
 
     fn get_cleanup_cmds(&mut self, inst_id: InstanceId) -> Vec<Command> {
@@ -649,8 +566,6 @@ impl L4m {
                 });
             }
         }
-
-        //println!("deallocating all objects for instance: {:?}", cmds);
 
         // Remove all exported blocks
         self.exported_blocks.retain(|_, v| v.owner != inst_id);

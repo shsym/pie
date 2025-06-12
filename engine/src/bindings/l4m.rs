@@ -1,8 +1,9 @@
 use crate::instance::InstanceState;
-use crate::l4m::{Command, ManagedTypes, StreamPriority, available_models, L4m};
+use crate::l4m::{Command, ManagedTypes, StreamPriority, available_models};
+use crate::backend_discovery::{get_model_service_id};
 use crate::object::IdRepr;
 use crate::tokenizer::BytePairEncoder;
-use crate::{bindings, service, backend};
+use crate::{bindings, service};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
@@ -88,76 +89,34 @@ impl bindings::wit::pie::nbi::l4m::Host for InstanceState {
             return Ok(Some(res));
         }
 
-        // If no service exists, try to discover and connect to a backend for this model
-        tracing::info!("No service found for model '{}', attempting backend discovery", value);
-
-        // TODO: Get the engine-manager endpoint from configuration
-        // For now, use the default endpoint
-        let engine_manager_endpoint = std::env::var("SYMPHONY_ENGINE_MANAGER_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-
-        match crate::backend_discovery::discover_backend_for_model(&engine_manager_endpoint, &value).await {
-            Ok(endpoint) => {
-                tracing::info!("Found backend for model '{}' at endpoint: {}", value, endpoint);
-
-                // Create a new L4M service connected to this backend
-                match self.create_l4m_service_for_backend(&value, &endpoint).await {
-                    Ok(service_id) => {
-                        let model = Model {
-                            name: value,
-                            service_id,
-                        };
-                        let res = self.table().push(model)?;
-                        Ok(Some(res))
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to create L4M service for backend: {}", e);
-                        Ok(None)
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Backend discovery failed for model '{}': {}", value, e);
-                Ok(None)
-            }
+        // Check if the model has a cached service ID
+        if let Some(service_id) = get_model_service_id(&value) {
+            tracing::info!("Found existing service for model '{}' with service_id: {}", value, service_id);
+            let model = Model {
+                name: value,
+                service_id,
+            };
+            let res = self.table().push(model)?;
+            return Ok(Some(res));
         }
+
+        // Model not found in already initialized services
+        tracing::warn!("Model '{}' service not found. The model may not be available or the backend may not be started yet. Available models are discovered and services created automatically by the engine.", value);
+        Ok(None)
     }
 
     async fn get_all_models(&mut self) -> anyhow::Result<Vec<String>> {
-        tracing::info!("[L4M] get_all_models() called - checking available models");
+        tracing::info!("[L4M] get_all_models() called - returning cached models");
         let current_models = available_models();
         tracing::info!("[L4M] Current cached models: {:?} (count: {})", current_models, current_models.len());
 
-        // If no models are cached, try to discover them from backends
+        // Return cached models only - periodic updates will keep cache fresh
+        // If no models are cached, it means no backends are currently registered
         if current_models.is_empty() {
-            tracing::info!("[L4M] Models cache is empty, starting backend discovery");
-
-            tracing::info!("[L4M] About to call discover_available_models()");
-            match crate::l4m::discover_available_models().await {
-                Ok(discovered_models) => {
-                    tracing::info!("Backend discovery returned {} models: {:?}", discovered_models.len(), discovered_models);
-                    if !discovered_models.is_empty() {
-                        tracing::info!("Setting available models to discovered models");
-                        crate::l4m::set_available_models(&discovered_models);
-                        let updated_models = available_models();
-                        tracing::info!("After update, cached models: {:?}", updated_models);
-                        return Ok(discovered_models);
-                    } else {
-                        tracing::warn!("Backend discovery returned empty model list");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to discover models from backends: {}", e);
-                }
-            }
-        } else {
-            tracing::info!("Returning cached models: {:?}", current_models);
+            tracing::warn!("[L4M] No models available - no backends currently registered with engine-manager");
         }
 
-        // Return the current models (which may have been updated by discovery)
-        let final_models = available_models();
-        tracing::info!("Returning final models: {:?}", final_models);
-        Ok(final_models)
+        Ok(current_models)
     }
 }
 
@@ -589,30 +548,4 @@ impl bindings::wit::pie::nbi::l4m::HostSynchronizationResult for InstanceState {
     }
 }
 
-impl InstanceState {
-    /// Create a new L4M service connected to the specified backend endpoint
-    async fn create_l4m_service_for_backend(&mut self, model_name: &str, endpoint: &str) -> anyhow::Result<usize> {
-        tracing::info!("Creating L4M service for model '{}' with backend at '{}'", model_name, endpoint);
 
-        // Create a ZMQ backend connection to the endpoint
-        let backend = backend::ZmqBackend::bind(endpoint).await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to backend at {}: {}", endpoint, e))?;
-
-        // Create a new L4M service with this backend
-        let l4m_service = L4m::new(backend).await;
-
-        // Add the service dynamically to the controller
-        match service::add_service_runtime(model_name, l4m_service) {
-            Ok(_) => {
-                tracing::info!("Successfully added L4M service for model '{}'", model_name);
-
-                // Get the service ID for the newly added service
-                service::get_service_id(model_name)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to get service ID for newly added model '{}'", model_name))
-            }
-            Err(e) => {
-                Err(anyhow::anyhow!("Failed to add L4M service to controller: {:?}", e))
-            }
-        }
-    }
-}

@@ -1,6 +1,3 @@
-// #![allow(unused)]
-//
-mod client;
 mod service;
 mod zmq_handler;
 mod backend_discovery;
@@ -22,12 +19,12 @@ mod utils;
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 
-use crate::client::{Client, hash_program};
+// use crate::client::{Client, hash_program};
 use crate::l4m::L4m;
 use crate::messaging::{PubSub, PushPull};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
-use crate::backend_discovery::discover_backend_for_model;
+use crate::backend_discovery::{discover_backend_for_model, start_periodic_cache_updates};
 use crate::server::Server;
 use crate::service::Controller;
 use clap::{Arg, Command};
@@ -67,14 +64,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Create log file with current date
     let current_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let log_filename = format!("engine-9123-{}.log", current_date);
+    let log_filename = format!("engine-{}.log", current_date);
 
     // Initialize tracing subscriber to write to file
     let file_appender = tracing_appender::rolling::never("logs", &log_filename);
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("pie_rt=debug".parse().unwrap()))
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("pie_rt=info".parse().unwrap()))
         .with_target(true)
         .with_thread_ids(true)
         .with_file(true)
@@ -193,112 +190,14 @@ async fn main() -> anyhow::Result<()> {
     // Install all services
     ctrl.install();
 
+    // Start periodic cache updates for detecting new backend registrations
+    start_periodic_cache_updates();
+
     // TODO: Add periodic stats printing for connected backends when they are connected
     // This should be done dynamically based on which backends are actually connected
 
     // Wait forever - applications will be loaded via WebSocket API when requested
     tokio::signal::ctrl_c().await?;
 
-    Ok(())
-}
-
-async fn dummy_client2(program_name: String, port: u16) -> anyhow::Result<()> {
-    let program_path = PathBuf::from(format!(
-        "../example-apps/target/wasm32-wasip2/release/{}.wasm",
-        program_name
-    ));
-
-    let server_uri = "ws://127.0.0.1:9123";
-
-    let mut client = Client::connect(server_uri).await?;
-    let program_blob = fs::read(&program_path)?;
-    let program_hash = hash_program(&program_blob);
-
-    log_user!("Program file hash: {}", program_hash);
-
-    // If program is not present, upload it
-    if !client.program_exists(&program_hash).await? {
-        log_user!("Program not found on server, uploading now...");
-        client.upload_program(&program_blob).await?;
-        log_user!("Program uploaded successfully!");
-    }
-
-    client
-        .launch_server_instance(&program_hash, port as u32)
-        .await?;
-
-    Ok(())
-}
-
-async fn dummy_client(program_name: String) -> anyhow::Result<()> {
-    let program_path = PathBuf::from(format!(
-        "../example-apps/target/wasm32-wasip2/release/{}.wasm",
-        program_name
-    ));
-
-    // Check if the file exists
-    if !program_path.exists() {
-        log_user!("Error: Program file not found at path: {:?}", program_path);
-        return Ok(());
-    }
-
-    let server_uri = "ws://127.0.0.1:9123";
-
-    log_user!("Using program: {}", program_name);
-
-    let mut client = Client::connect(server_uri).await?;
-    let program_blob = fs::read(&program_path)?;
-    let program_hash = hash_program(&program_blob);
-
-    log_user!("Program file hash: {}", program_hash);
-
-    // If program is not present, upload it
-    if !client.program_exists(&program_hash).await? {
-        log_user!("Program not found on server, uploading now...");
-        client.upload_program(&program_blob).await?;
-        log_user!("Program uploaded successfully!");
-    }
-
-    const NUM_INSTANCES: usize = 1;
-
-    // Launch 1 instances sequentially
-    let mut instances = Vec::new();
-    for i in 0..NUM_INSTANCES {
-        let instance = client.launch_instance(&program_hash).await?;
-        log_user!("Instance {} launched.", instance.id());
-        instances.push(instance);
-    }
-
-    // Spawn a task for each instance to handle sending and receiving concurrently.
-    let mut handles = Vec::new();
-    for mut instance in instances {
-        let handle = tokio::spawn(async move {
-            instance.send("event #1: Hello from Rust client").await?;
-            instance.send("event #2: Another event").await?;
-            instance.send("event #3: Another event").await?;
-
-            while let Ok((event, message)) = instance.recv().await {
-                match event.as_str() {
-                    "terminated" => {
-                        log_user!("Instance {} terminated. Reason: {}", instance.id(), message);
-                        break;
-                    }
-                    _ => {
-                        log_user!("Instance {} received message: {}", instance.id(), message);
-                    }
-                }
-            }
-            anyhow::Result::<()>::Ok(())
-        });
-        handles.push(handle);
-    }
-
-    // Wait for all instance tasks to complete.
-    for handle in handles {
-        handle.await??;
-    }
-
-    client.close().await?;
-    log_user!("Client connection closed.");
     Ok(())
 }

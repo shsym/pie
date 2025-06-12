@@ -7,6 +7,8 @@ use tracing::{info, error, warn, debug};
 use serde_json::Value;
 use crate::constants::network;
 use crate::config::Config;
+use crate::spinner::with_spinner;
+use std::time::Duration;
 
 #[derive(Subcommand)]
 pub enum BackendCommands {
@@ -564,7 +566,16 @@ async fn start_backend(
             println!("  Process ID: {}", child.id());
             println!("  Logs: {}", log_file_name);
 
-            println!("\nBackend is starting up...");
+            // Wait for backend to register with a spinner
+            with_spinner(
+                async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok::<(), anyhow::Error>(())
+                },
+                "Wait for the backend to be discovered by the engine...",
+                "Backend registration completed!"
+            ).await?;
+            // Instructions after backend registration
             println!("Use 'pie-cli backend list' to check registration status");
             println!("Use 'curl http://{}:{}/manage/health' to check backend health", backend_host, port);
             println!("Use 'tail -f {}' to monitor backend logs", log_file_name);

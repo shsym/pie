@@ -72,7 +72,7 @@ fn start_engine_process(config: &Config, config_path: &str, port: u16, manager_p
 
     // Create log file for engine
     let timestamp = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let log_file_name = format!("{}/engine-{}-{}.log", config.logging.directory, port, timestamp);
+    let log_file_name = format!("{}/engine-stdout-{}.log", config.logging.directory, timestamp);
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -182,7 +182,7 @@ pub async fn heartbeat_handler(
 pub async fn list_backends_handler(
     State(state): State<SharedState>,
 ) -> Result<Json<ListBackendsResponse>, StatusCode> {
-    tracing::info!("Listing all backends");
+    tracing::debug!("Listing all backends");
 
     // Explicitly scope the lock to ensure it's released
     let summaries = {

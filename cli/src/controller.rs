@@ -238,7 +238,7 @@ async fn start_engine_manager_detached(config: &Config, host: &str, port: u16) -
 
     // Create log file for engine-manager
     let timestamp = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let log_file_name = format!("{}/engine-manager-{}-{}.log", config.logging.directory, port, timestamp);
+    let log_file_name = format!("{}/engine-manager-{}.log", config.logging.directory, timestamp);
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
