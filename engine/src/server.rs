@@ -180,7 +180,7 @@ impl Server {
 
     async fn listener_loop(addr: String, state: Arc<ServerState>) {
         let listener = TcpListener::bind(addr).await.unwrap();
-        while let Ok((stream, addr)) = listener.accept().await {
+        while let Ok((stream, _addr)) = listener.accept().await {
             let id = {
                 let mut id_pool = state.client_id_pool.lock().await;
                 id_pool.acquire().unwrap()

@@ -1,5 +1,6 @@
 use crate::instance::InstanceState;
 use crate::l4m::{Command, ManagedTypes, StreamPriority, available_models};
+use crate::backend_discovery::{get_model_service_id};
 use crate::object::IdRepr;
 use crate::tokenizer::BytePairEncoder;
 use crate::{bindings, service};
@@ -78,20 +79,44 @@ fn map_object_types(ty: bindings::wit::pie::nbi::l4m::ObjectType) -> ManagedType
 
 impl bindings::wit::pie::nbi::l4m::Host for InstanceState {
     async fn get_model(&mut self, value: String) -> anyhow::Result<Option<Resource<Model>>> {
+        // First check if service already exists for this model
         if let Some(service_id) = service::get_service_id(&value) {
             let model = Model {
                 name: value,
                 service_id,
             };
             let res = self.table().push(model)?;
-            Ok(Some(res))
-        } else {
-            Ok(None)
+            return Ok(Some(res));
         }
+
+        // Check if the model has a cached service ID
+        if let Some(service_id) = get_model_service_id(&value) {
+            tracing::info!("Found existing service for model '{}' with service_id: {}", value, service_id);
+            let model = Model {
+                name: value,
+                service_id,
+            };
+            let res = self.table().push(model)?;
+            return Ok(Some(res));
+        }
+
+        // Model not found in already initialized services
+        tracing::warn!("Model '{}' service not found. The model may not be available or the backend may not be started yet. Available models are discovered and services created automatically by the engine.", value);
+        Ok(None)
     }
 
     async fn get_all_models(&mut self) -> anyhow::Result<Vec<String>> {
-        Ok(available_models().to_vec())
+        tracing::info!("[L4M] get_all_models() called - returning cached models");
+        let current_models = available_models();
+        tracing::info!("[L4M] Current cached models: {:?} (count: {})", current_models, current_models.len());
+
+        // Return cached models only - periodic updates will keep cache fresh
+        // If no models are cached, it means no backends are currently registered
+        if current_models.is_empty() {
+            tracing::warn!("[L4M] No models available - no backends currently registered with engine-manager");
+        }
+
+        Ok(current_models)
     }
 }
 
@@ -122,7 +147,7 @@ impl bindings::wit::pie::nbi::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
     ) -> Result<Vec<String>, wasmtime::Error> {
-        let service_id = self.table().get(&model)?.service_id;
+        let _service_id = self.table().get(&model)?.service_id;
 
         Ok(vec![])
     }
@@ -210,7 +235,7 @@ impl bindings::wit::pie::nbi::l4m::HostModel for InstanceState {
         &mut self,
         model: Resource<Model>,
         stream_id: u32,
-        adapter: String,
+        _adapter: String,
         last_block_len: u32,
         context_block_ids: Vec<IdRepr>,
         input_emb_ids: Vec<IdRepr>,
@@ -522,3 +547,5 @@ impl bindings::wit::pie::nbi::l4m::HostSynchronizationResult for InstanceState {
         Ok(())
     }
 }
+
+

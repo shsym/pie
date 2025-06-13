@@ -1,5 +1,4 @@
 use dashmap::DashMap;
-use hyper::Request;
 use hyper::server::conn::http1;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -186,7 +185,7 @@ impl Service for Runtime {
                 port,
                 event,
             } => {
-                self.launch_server_instance(&hash, port).await;
+                let _ = self.launch_server_instance(&hash, port).await;
                 event.send(Ok(())).unwrap();
             }
 
@@ -296,15 +295,13 @@ impl Runtime {
 
         let instance_id = Uuid::new_v4();
 
-        // 4) Build the InstanceState
-
-        // 5) Instantiate and run in a task
+        // Instantiate and run in a task
         let engine = self.engine.clone();
         let linker = self.linker.clone();
 
         let join_handle = tokio::spawn(Self::launch(instance_id, component, engine, linker));
 
-        // 6) Record in the “running_instances” so we can manage it later
+        // Record in the “running_instances” so we can manage it later
         let instance_handle = InstanceHandle {
             hash: hash.to_string(),
             join_handle,
@@ -323,16 +320,14 @@ impl Runtime {
         let instance_id = Uuid::new_v4();
         let component = self.get_component(hash)?;
 
-        // 4) Build the InstanceState
-
-        // 5) Instantiate and run in a task
+        // Instantiate and run in a task
         let engine = self.engine.clone();
         let linker = self.linker.clone();
         let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
 
         let join_handle = tokio::spawn(Self::launch_server(addr, component, engine, linker));
 
-        // 6) Record in the “running_instances” so we can manage it later
+        // Record in the “running_instances” so we can manage it later
         let instance_handle = InstanceHandle {
             hash: hash.to_string(),
             join_handle,
@@ -347,10 +342,10 @@ impl Runtime {
     pub async fn terminate_instance(&self, instance_id: InstanceId, reason: String) {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
-            
+
 
             for model in l4m::available_models() {
-                let service_id = service::get_service_id(model).unwrap();
+                let service_id = service::get_service_id(&model).unwrap();
                 l4m::Command::Destroy {
                     inst_id: instance_id.clone(),
                 }
@@ -541,7 +536,7 @@ impl Runtime {
 
         // force cleanup of the remaining resources
         for model in l4m::available_models() {
-            let service_id = service::get_service_id(model).unwrap();
+            let service_id = service::get_service_id(&model).unwrap();
             l4m::Command::Destroy {
                 inst_id: instance_id.clone(),
             }

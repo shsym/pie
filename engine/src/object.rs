@@ -119,7 +119,7 @@ where
             .entry(ty)
             .or_insert_with(|| IdPool::new(capacity))
             .set_capacity(capacity)
-            .map_err(|e| ObjectError::NoAvailableSpace)
+            .map_err(|_e| ObjectError::NoAvailableSpace)
     }
 
     pub fn capacity(&self, ty: TY) -> Result<IdRepr, ObjectError> {
@@ -153,7 +153,7 @@ where
         if let Err(e) = self.create_ref(ty, ns, name, &id) {
             if ty.is_sharable() {
                 self.ref_counter.get_mut(&ty).unwrap().remove(&id);
-                self.id_pool.get_mut(&ty).unwrap().release(id);
+                let _ = self.id_pool.get_mut(&ty).unwrap().release(id);
             }
             return Err(e);
         }
@@ -194,7 +194,7 @@ where
                     self.ref_counter.get_mut(&ty).unwrap().remove(id);
                 }
             }
-            self.id_pool.get_mut(&ty).unwrap().release_many(&ids);
+            let _ = self.id_pool.get_mut(&ty).unwrap().release_many(&ids);
             return Err(e);
         }
 
@@ -303,7 +303,7 @@ where
         };
 
         if should_free {
-            self.id_pool.get_mut(&ty).unwrap().release(id);
+            let _ = self.id_pool.get_mut(&ty).unwrap().release(id);
 
             if self.namespaces.get(&ty_ns).unwrap().is_empty() {
                 self.namespaces.remove(&ty_ns);
@@ -338,7 +338,7 @@ where
         for name in names {
             // Remove the (name, id) pair from the namespace.
             if let Some(id) = table.remove(name) {
-                
+
                 //println!("attempting to free, type: {:?}, id: {:?}", ty, id);
                 // Determine if the object should be freed.
                 let should_free = if ty.is_sharable() {
@@ -365,10 +365,10 @@ where
 
                 if should_free {
                     //println!("freed, type: {:?}, id: {:?}", ty, id);
-                    self.id_pool.get_mut(&ty).unwrap().release(id);
+                    let _ = self.id_pool.get_mut(&ty).unwrap().release(id);
                         freed_ids.push(id);
                 }
-            } 
+            }
         }
 
         // cleanup the namespace table if it is empty

@@ -29,8 +29,14 @@ rand = "0.9.0"
 colored = "3.0"
 clap = "4.5"
 hyper = "1.6.0"
-backend-management-rs = { path = "../backend/backend-management-rs" }
-#console-subscriber = "0.4.1"
+reqwest = { version = "0.12", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+
+pie-cli = { path = "../cli" }
 
 [build-dependencies]
 prost-build = "0.13.5"

@@ -20,7 +20,7 @@ from config import MAX_NUM_PAGES, MAX_NUM_EMBEDS
 def main_run():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='DeepSeek Backend Server') # Changed description
-    parser.add_argument('--ipc-endpoint', type=str, default='ipc:///tmp/symphony-ipc', 
+    parser.add_argument('--ipc-endpoint', type=str, default='ipc:///tmp/pie-ipc', 
                        help='IPC endpoint to bind to')
     parser.add_argument('--model-name', type=str, required=True,
                        help='Model name to load (e.g., deepseek-ai/DeepSeek-R1-0528-Qwen3-8B, meta-llama/Llama-3.1-8B-Instruct)')

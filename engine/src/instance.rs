@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use colored::*;
-use dashmap::DashMap;
 use prost::bytes;
 use std::io;
 use std::io::{IsTerminal, Write};

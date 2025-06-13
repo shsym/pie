@@ -1,9 +1,108 @@
+//! Utility functions for the Management Service
+
 use anyhow::{Error, Result};
 use num_traits::PrimInt;
 use std::collections::BTreeSet;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use uuid::Uuid;
+use std::path::{Path, PathBuf};
+use tracing::{info, warn};
+
+
+/// Expands a path that may contain a tilde prefix (~/) to the user's home directory.
+///
+/// # Arguments
+/// * `path` - A path string that may start with ~/
+///
+/// # Returns
+/// A PathBuf with the tilde expanded to the actual home directory path
+///
+/// # Examples
+/// ```
+/// use backend_management_rs::path_utils::expand_home_dir;
+///
+/// let expanded = expand_home_dir("~/.cache/symphony/models");
+/// // On Unix: "/home/username/.cache/symphony/models"
+///
+/// let unchanged = expand_home_dir("/absolute/path");
+/// // Returns: "/absolute/path"
+/// ```
+pub fn expand_home_dir<P: AsRef<Path>>(path: P) -> PathBuf {
+    let path_str = path.as_ref().to_string_lossy();
+
+    if path_str.starts_with("~/") {
+        if let Some(home_dir) = dirs::home_dir() {
+            home_dir.join(&path_str[2..])
+        } else {
+            // Fallback to environment variable if dirs crate fails
+            if let Ok(home) = std::env::var("HOME") {
+                PathBuf::from(home).join(&path_str[2..])
+            } else {
+                // Last resort: return the path as-is
+                path.as_ref().to_path_buf()
+            }
+        }
+    } else {
+        path.as_ref().to_path_buf()
+    }
+}
+
+/// Convenience function to expand a string path and return it as a String
+pub fn expand_home_dir_str<P: AsRef<Path>>(path: P) -> String {
+    expand_home_dir(path).to_string_lossy().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_expand_home_dir_with_tilde() {
+        let test_path = "~/.cache/symphony/models";
+        let expanded = expand_home_dir(test_path);
+
+        // Should not start with ~ anymore
+        assert!(!expanded.to_string_lossy().starts_with("~"));
+
+        // Should contain the home directory
+        if let Some(home) = dirs::home_dir() {
+            assert!(expanded.starts_with(&home));
+            assert!(expanded.to_string_lossy().contains(".cache/symphony/models"));
+        }
+    }
+
+    #[test]
+    fn test_expand_home_dir_without_tilde() {
+        let test_path = "/absolute/path/to/file";
+        let expanded = expand_home_dir(test_path);
+
+        // Should remain unchanged
+        assert_eq!(expanded.to_string_lossy(), test_path);
+    }
+
+    #[test]
+    fn test_expand_home_dir_str() {
+        let test_path = "~/.bashrc";
+        let expanded = expand_home_dir_str(test_path);
+
+        // Should not start with ~ anymore
+        assert!(!expanded.starts_with("~"));
+    }
+
+    #[test]
+    fn test_expand_home_dir_just_tilde() {
+        let test_path = "~/";
+        let expanded = expand_home_dir(test_path);
+
+        // Should be the home directory
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expanded, home);
+        }
+    }
+}
+
 
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash)]
 pub struct Stream {
@@ -168,6 +267,65 @@ where
                 self.next = self.next - T::one();
             } else {
                 break;
+            }
+        }
+    }
+}
+
+/// Extract IPC socket path from endpoint URL
+pub fn extract_ipc_path(endpoint: &str) -> Option<&str> {
+    if endpoint.starts_with("ipc://") {
+        Some(&endpoint[6..]) // Remove "ipc://" prefix
+    } else {
+        None
+    }
+}
+
+/// Clean up IPC socket file if it exists
+pub fn cleanup_ipc_socket(endpoint: &str) {
+    if let Some(socket_path) = extract_ipc_path(endpoint) {
+        if Path::new(socket_path).exists() {
+            match std::fs::remove_file(socket_path) {
+                Ok(()) => info!("Cleaned up IPC socket: {}", socket_path),
+                Err(e) => warn!("Failed to remove IPC socket {}: {}", socket_path, e),
+            }
+        }
+    }
+}
+
+/// Clean up all Symphony-related IPC sockets
+pub fn cleanup_all_symphony_sockets() {
+    info!("Cleaning up all Symphony IPC sockets");
+
+    // Common patterns for Symphony IPC sockets
+    let socket_patterns = [
+        "/tmp/pie-ipc",
+        "/tmp/pie-cli",
+        "/tmp/symphony-test-client",
+        "/tmp/symphony-test-cli",
+    ];
+
+    // Clean up known socket files
+    for pattern in &socket_patterns {
+        if Path::new(pattern).exists() {
+            match std::fs::remove_file(pattern) {
+                Ok(()) => info!("Cleaned up IPC socket: {}", pattern),
+                Err(e) => warn!("Failed to remove IPC socket {}: {}", pattern, e),
+            }
+        }
+    }
+
+    // Clean up model instance sockets (symphony-model-*)
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("symphony-model-") {
+                    let path = entry.path();
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => info!("Cleaned up model IPC socket: {:?}", path),
+                        Err(e) => warn!("Failed to remove model IPC socket {:?}: {}", path, e),
+                    }
+                }
             }
         }
     }
