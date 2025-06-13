@@ -2,9 +2,9 @@ use prost::bytes::Bytes;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use zeromq::{DealerSocket, SocketRecv, SocketSend, ZmqMessage};
+use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
-use prost::Message;
+use prost::{DecodeError, Message};
 use thiserror::Error;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Mutex, mpsc};

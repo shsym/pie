@@ -17,7 +17,7 @@ struct AddedTokenInfo {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct TokenizerMetadata {
+struct TokenizerMetadata {
     model_type: String,
     vocab_size: usize,
     pre_tokenizer_pattern: Option<String>,

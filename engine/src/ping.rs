@@ -66,7 +66,7 @@ where
 
     async fn event_loop(
         mut rx: mpsc::Receiver<Vec<u8>>,
-        event_table: Arc<DashMap<u32, Event>>,
+        mut event_table: Arc<DashMap<u32, Event>>,
     ) {
         while let Some(pong) = rx.recv().await {
             let pong = pb_bindings::Pong::decode(pong.as_slice()).unwrap();
