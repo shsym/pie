@@ -344,7 +344,7 @@ def main_run():
         return 1
 
     logger.info(f"Qwen3 backend agent started successfully")
-    logger.info(f"Management API: http://{args.backend_host}:{args.backend_api_port}")
+    logger.info(f"Engine Management API: http://{args.backend_host}:{args.backend_api_port}")
     logger.info(f"ZMQ endpoint: {args.ipc_endpoint}")
 
     # Auto-load model if requested

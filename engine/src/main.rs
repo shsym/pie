@@ -47,9 +47,10 @@ macro_rules! log_user {
 async fn check_model_available(model_name: &str, engine_manager_endpoint: &str) -> anyhow::Result<String> {
     // Use the new HTTP-based backend discovery
     match discover_backend_for_model(engine_manager_endpoint, model_name).await {
-        Ok(endpoint) => {
-            log_user!("Model {} is available at endpoint: {}", model_name, endpoint);
-            Ok(endpoint)
+        Ok(discovery_result) => {
+            log_user!("Model {} is available at endpoint: {})",
+                model_name, discovery_result.backend_endpoint);
+            Ok(discovery_result.backend_endpoint)
         }
         Err(e) => {
             log_user!("Model {} is not available: {}", model_name, e);

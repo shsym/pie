@@ -2,7 +2,7 @@ use crate::models::{
     BackendRegistrationRequest, BackendRegistrationResponse, HeartbeatResponse, ListBackendsResponse,
 };
 use crate::state::SharedState;
-use crate::config::Config;
+use pie_cli::config::Config;
 use axum::{extract::{Path, State}, http::StatusCode, Json};
 use uuid::Uuid;
 use serde_json::{json, Value};
@@ -10,19 +10,7 @@ use std::process::{Command, Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::path::{Path as StdPath, PathBuf};
 use std::fs::{OpenOptions, create_dir_all};
-use anyhow::{Result, Context};
-
-/// Resolve a path to an absolute path
-fn resolve_absolute_path<P: AsRef<StdPath>>(path: P) -> Result<PathBuf> {
-    let path = path.as_ref();
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        let current_dir = std::env::current_dir()
-            .context("Failed to get current directory")?;
-        Ok(current_dir.join(path))
-    }
-}
+use anyhow::Result;
 
 // Global state for controller processes
 static CONTROLLER_PROCESSES: std::sync::OnceLock<Arc<Mutex<ControllerProcesses>>> = std::sync::OnceLock::new();
@@ -64,7 +52,7 @@ fn find_engine_binary(config: &Config) -> Result<PathBuf> {
     Err(anyhow::anyhow!("Could not find {} binary. Please ensure it's compiled or in PATH.", binary_name))
 }
 
-fn start_engine_process(config: &Config, config_path: &str, port: u16, manager_port: u16) -> Result<Child> {
+fn start_engine_process(config: &Config, port: u16, manager_port: u16) -> Result<Child> {
     let binary_path = find_engine_binary(config)?;
 
     // Create logs directory if it doesn't exist
@@ -78,9 +66,6 @@ fn start_engine_process(config: &Config, config_path: &str, port: u16, manager_p
         .append(true)
         .open(&log_file_name)
         .map_err(|e| anyhow::anyhow!("Failed to create log file: {}", e))?;
-
-    // Resolve absolute config path
-    let absolute_config_path = resolve_absolute_path(config_path)?;
 
     let mut cmd = Command::new(&binary_path);
 
@@ -284,7 +269,7 @@ pub async fn controller_start_handler(State(state): State<SharedState>) -> Resul
     let engine_port = config.services.engine.default_port;
 
     // Start the actual engine process
-    match start_engine_process(&config, &config_path, engine_port, manager_port) {
+    match start_engine_process(&config, engine_port, manager_port) {
         Ok(engine_process) => {
             tracing::info!("Engine process started successfully on port {}", engine_port);
             processes_guard.engine_process = Some(engine_process);

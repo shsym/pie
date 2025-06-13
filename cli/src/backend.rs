@@ -117,7 +117,7 @@ fn print_backend_info(backend_obj: &serde_json::Map<String, Value>) {
 
     // Show management API address if available
     if let Some(mgmt_api) = backend_obj.get("management_api_address") {
-        println!("  Management API: {}", mgmt_api.as_str().unwrap_or("unknown"));
+        println!("  Engine Management API: {}", mgmt_api.as_str().unwrap_or("unknown"));
     }
 
     if !models.is_empty() {
@@ -289,7 +289,7 @@ async fn get_backend_status(backend_id: &str, management_service_url: &str) -> R
                         println!("Health Status: {}", status.as_str().unwrap_or("unknown"));
                     }
 
-                    println!("Management API: {}", mgmt_api_address);
+                    println!("Engine Management API: {}", mgmt_api_address);
 
                     if let Some(ipc_endpoint) = health_data.get("ipc_endpoint") {
                         println!("IPC Endpoint: {}", ipc_endpoint.as_str().unwrap_or("unknown"));
@@ -561,7 +561,7 @@ async fn start_backend(
             println!("✓ Backend started successfully!");
             println!("  Model: {}", model_name);
             println!("  Backend Type: {}", backend_type);
-            println!("  Management API: http://{}:{}", backend_host, port);
+            println!("  Engine Management API: http://{}:{}", backend_host, port);
             println!("  IPC Endpoint: {}", ipc_endpoint);
             println!("  Process ID: {}", child.id());
             println!("  Logs: {}", log_file_name);

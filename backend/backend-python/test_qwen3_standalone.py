@@ -27,7 +27,7 @@ def test_qwen3_backend_standalone():
     
     print(f"Model: {model_name}")
     print(f"IPC Endpoint: {ipc_endpoint}")
-    print(f"Management API: http://{backend_host}:{backend_api_port}")
+    print(f"Engine Management API: http://{backend_host}:{backend_api_port}")
     print(f"Management Service URL: {management_service_url}")
     
     # Start the backend process

@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+/// Result of backend discovery for a model
+#[derive(Debug, Clone)]
+pub struct BackendDiscoveryResult {
+    pub backend_endpoint: String,
+    pub backend_id: String,
+}
+
 /// Model-to-backend cache: maps model names to backend endpoints and service IDs
 #[derive(Debug, Clone)]
 pub struct ModelBackendInfo {
@@ -279,7 +286,7 @@ pub async fn get_model_endpoint_from_backend(
 pub async fn discover_backend_for_model(
     engine_manager_endpoint: &str,
     model_name: &str,
-) -> Result<String> {
+) -> Result<BackendDiscoveryResult> {
     let client = EngineManagerClient::new(engine_manager_endpoint);
 
     // Find a compatible backend
@@ -294,7 +301,12 @@ pub async fn discover_backend_for_model(
         })?;
 
     // Get the model endpoint from the backend
-    get_model_endpoint_from_backend(&backend_info, model_name).await
+    let backend_endpoint = get_model_endpoint_from_backend(&backend_info, model_name).await?;
+
+    Ok(BackendDiscoveryResult {
+        backend_endpoint,
+        backend_id: backend_info.backend_id,
+    })
 }
 
 /// Get a model backend info from the cache ONLY (no discovery)
@@ -328,18 +340,19 @@ pub async fn get_model_backend_info(model_name: &str) -> anyhow::Result<Option<M
     // Not in cache or stale, discover backend for this model
     tracing::info!("Discovering backend for model '{}'", model_name);
     match discover_backend_for_model(&ENGINE_MANAGER_ENDPOINT, model_name).await {
-        Ok(backend_endpoint) => {
+        Ok(discovery_result) => {
             let backend_info = ModelBackendInfo {
-                backend_endpoint: backend_endpoint.clone(),
+                backend_endpoint: discovery_result.backend_endpoint.clone(),
                 service_id: None, // Will be set when service is created
-                backend_id: "unknown".to_string(), // TODO: Get from discovery
+                backend_id: discovery_result.backend_id,
                 last_verified: std::time::Instant::now(),
             };
 
             // Update cache
             if let Ok(mut cache) = MODEL_BACKEND_CACHE.write() {
                 cache.insert(model_name.to_string(), backend_info.clone());
-                tracing::info!("Cached backend info for model '{}': {}", model_name, backend_endpoint);
+                tracing::info!("Cached backend info for model '{}': endpoint={}, backend_id={}",
+                    model_name, discovery_result.backend_endpoint, backend_info.backend_id);
             }
 
             Ok(Some(backend_info))
