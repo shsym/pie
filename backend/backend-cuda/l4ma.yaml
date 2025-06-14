@@ -14,14 +14,16 @@ architecture:
     low_freq_factor: 1
     theta: 500000
 
+parameters: 
+  - llama-3.2-1b-instruct.zt
+  
 tokenizer:
   type: bpe
   vocab_size: 32000
-  vocab: tokenizer.model
+  vocab: llama-3.2-1b-instruct.vocab
   special_tokens:
     - 32: <|begin_of_text|>
     - 313: <|end_of_text|>"
-
 
 source:
   - repo: huggingface

@@ -28,13 +28,13 @@ include(cmake/CPM.cmake)
 # This replaces manual submodule management.
 CPMAddPackage(
     URI "gh:flashinfer-ai/flashinfer@0.2.6"
-    OPTIONS "FLASHINFER_ENABLE_FP8 OFF" "FLASHINFER_ENABLE_FP8_E4M3 OFF" "FLASHINFER_ENABLE_FP8_E5M2 OFF"
-)
+    OPTIONS "FLASHINFER_ENABLE_FP8 OFF" "FLASHINFER_ENABLE_FP8_E4M3 OFF" "FLASHINFER_ENABLE_FP8_E5M2 OFF" "FLASHINFER_GEN_HEAD_DIMS 64" "FLASHINFER_GEN_POS_ENCODING_MODES 0" "FLASHINFER_GEN_MASK_MODES 0" 
+) 
 
-CPMAddPackage(
-    URI "gh:NVIDIA/cuembed#main@0.1.0"
-    OPTIONS "BUILD_TESTS OFF" "BUILD_BENCHMARKS OFF"
-)
+# CPMAddPackage(
+#     URI "gh:NVIDIA/cuembed#main@0.1.0"
+#     OPTIONS "BUILD_TESTS OFF" "BUILD_BENCHMARKS OFF"
+# )
 
 CPMAddPackage(
     URI "gh:zeromq/cppzmq@4.10.0"
@@ -50,41 +50,61 @@ CPMAddPackage(
     OPTIONS "YAML_CPP_BUILD_TESTS OFF"
 )
 
+CPMAddPackage(
+    URI "gh:CLIUtils/CLI11@2.5.0"
+)
+
+
+file(GLOB_RECURSE FLASHINFER_GENERATED_SOURCES
+     "${flashinfer_SOURCE_DIR}/src/generated/*.cu"
+)
+
 # 5. Define the main executable target
 # Add all your source files here.
-add_executable(cuda_app
+add_executable(pie_cuda_be
     src/main.cu
     src/l4ma.cu
+    src/bpe.cpp
+    src/common.cu
+    #${FLASHINFER_GENERATED_SOURCES}
 )
 
 # 6. Set compiler flags and options for the target
 # These flags are applied specifically to 'cuda_app'.
 # This mirrors the 'cxxflags' from your ninja file.
-target_compile_options(cuda_app PRIVATE
+target_compile_options(pie_cuda_be PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
         -Xcompiler=-Wall
         -Xcompiler=-Wextra
         --extended-lambda
         -g # Enable host debug symbols
         -G # Enable device-side debug symbols
-        -gencode=arch=compute_89,code=sm_89
+        #-gencode=arch=compute_89,code=sm_89
     >
 )
+
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-relax")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcmodel=large")
 
 # 7. Link libraries and include directories
 # CPM automatically handles include directories for its packages when you link them.
 # We just need to add our own 'include' directory and link the required libraries.
-target_include_directories(cuda_app PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${flashinfer_SOURCE_DIR}/include # <-- Add this line
+target_include_directories(pie_cuda_be PRIVATE
+   ${CMAKE_CURRENT_SOURCE_DIR}/include
+   ${flashinfer_SOURCE_DIR}/include 
+   ${flashinfer_SOURCE_DIR}/src/generated 
 )
 
-target_link_libraries(cuda_app PRIVATE
+target_link_libraries(pie_cuda_be PRIVATE
     # Link against targets provided by CPM packages
     cppzmq
     yaml-cpp
+    
     nlohmann_json::nlohmann_json
-
+    decode_kernels
+    prefill_kernels
+    CLI11::CLI11
+    #flashinfer
     # Link against CUDA libraries provided by CMake's FindCUDA module
     CUDA::cublas
     CUDA::cublasLt
@@ -94,10 +114,10 @@ target_link_libraries(cuda_app PRIVATE
 # This allows you to build and run the application with a single command.
 # e.g., 'ninja run' or 'make run'
 add_custom_target(run
-    COMMAND $<TARGET_FILE:cuda_app>
-    DEPENDS cuda_app
+    COMMAND $<TARGET_FILE:pie_cuda_be>
+    DEPENDS pie_cuda_be
     WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-    COMMENT "Running cuda_app..."
+    COMMENT "Running pie_cuda_be..."
 )
 
 # --- End of CMakeLists.txt ---

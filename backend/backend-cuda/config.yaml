@@ -1,0 +1,5 @@
+controller: "localhost:9090"
+model: "llama-3.2-1b-instruct"
+kv_page_size: 32
+max_num_kv_page: 256
+max_num_embed: 512
