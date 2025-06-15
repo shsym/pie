@@ -173,8 +173,8 @@ message GetInfoRequest {
 message GetInfoResponse {
   string version = 1;
   string model_name = 2;
-  uint32 block_size = 3;
-  uint32 num_available_blocks = 4;
+  uint32 kv_page_size = 3;
+  uint32 num_available_kv_pages = 4;
   uint32 num_available_embeddings = 5;
   uint32 num_available_distributions = 6;
   Tokenizer tokenizer = 7;

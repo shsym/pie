@@ -82,8 +82,8 @@ mod pb_bindings_vision {
 pub struct Info {
     pub version: String,
     pub model_name: String,
-    pub block_size: u32,
-    pub num_blocks: u32,
+    pub kv_page_size: u32,
+    pub num_kv_pages: u32,
     pub num_embeddings: u32,
     pub num_distributions: u32,
 }
@@ -420,8 +420,8 @@ impl L4m {
             "Backend initialized: version={}, model_name={}, block_size={}, num_blocks={}, num_embeddings={}, num_distributions={}",
             info.version,
             info.model_name,
-            info.block_size,
-            info.num_blocks,
+            info.kv_page_size,
+            info.num_kv_pages,
             info.num_embeddings,
             info.num_distributions
         );
@@ -433,7 +433,7 @@ impl L4m {
 
         let mut objects = ObjectManager::new();
         objects
-            .set_capacity(ManagedTypes::KvBlock, info.num_blocks as IdRepr)
+            .set_capacity(ManagedTypes::KvBlock, info.num_kv_pages as IdRepr)
             .unwrap();
         objects
             .set_capacity(ManagedTypes::TokenEmb, info.num_embeddings as IdRepr)
@@ -525,7 +525,7 @@ impl L4m {
             Command::GetInfo { handle } => Some((Command::GetInfo { handle }, Stream::default())),
 
             Command::GetBlockSize { handle } => {
-                handle.send(self.info.block_size).ok();
+                handle.send(self.info.kv_page_size).ok();
                 None
             }
 
@@ -619,19 +619,19 @@ impl L4m {
                 mut inputs,
                 mut outputs,
             } => {
-                if last_block_len == 0 || last_block_len > self.info.block_size {
+                if last_block_len == 0 || last_block_len > self.info.kv_page_size {
                     // error
                     runtime::trap(
                         inst_id,
                         format!(
                             "l4m::fill_block failed. last_block_len ({}) is 0 or greater than the block size ({})",
-                            last_block_len, self.info.block_size
+                            last_block_len, self.info.kv_page_size
                         ),
                     );
                     return None;
                 }
 
-                let max_tokens = self.info.block_size * (context.len() as u32 - 1) + last_block_len;
+                let max_tokens = self.info.kv_page_size * (context.len() as u32 - 1) + last_block_len;
 
                 if inputs.len() > max_tokens as usize {
                     // error
@@ -949,8 +949,8 @@ impl L4m {
                                     .send(Info {
                                         version: info.version,
                                         model_name: info.model_name,
-                                        block_size: info.block_size,
-                                        num_blocks: info.num_available_blocks,
+                                        kv_page_size: info.kv_page_size,
+                                        num_kv_pages: info.num_available_kv_pages,
                                         num_embeddings: info.num_available_embeddings,
                                         num_distributions: info.num_available_distributions,
                                     })
@@ -1071,7 +1071,7 @@ impl ExportedBlocks {
 #[derive(Clone)]
 pub struct Simulator {
     protocols: Vec<String>,
-    tokenizer_merge_table: HashMap<u32, Vec<u8>>
+    tokenizer_merge_table: HashMap<u32, Vec<u8>>,
 }
 
 impl Simulator {
@@ -1081,7 +1081,7 @@ impl Simulator {
 
         Self {
             protocols: vec!["l4m".to_string()],
-            tokenizer_merge_table
+            tokenizer_merge_table,
         }
     }
 }
@@ -1119,15 +1119,21 @@ impl backend::Simulate for Simulator {
             pb_bindings::request::Command::GetInfo(_) => Some(
                 pb_bindings::response::Command::GetInfo(pb_bindings::GetInfoResponse {
                     version: "0.1.0".to_string(),
-                    model_name: "DummyModel".to_string(),
-                    block_size: 128,
-                    num_available_blocks: 1000000,
+                    model_name: "test-model".to_string(),
+                    kv_page_size: 128,
+                    num_available_kv_pages: 1000000,
                     num_available_embeddings: 1000000,
                     num_available_distributions: 100000,
                     tokenizer: Some(pb_bindings::Tokenizer {
                         merge_table: self.tokenizer_merge_table.clone(),
-                        special_tokens: HashMap::new(),
-                        split_regex: "".to_string(),
+                        special_tokens: HashMap::from([
+                            (128000, "<|begin_of_text|>".to_string()),
+                            (128001, "<|end_of_text|>".to_string()),
+                            (128006, "<|start_header_id|>".to_string()),
+                            (128007, "<|end_header_id|>".to_string()),
+                            (128009, "<|eot_id|>".to_string())
+                        ]),
+                        split_regex: r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+".to_string(),
                     }),
                 }),
             ),
