@@ -2,7 +2,7 @@ use crate::backend::Backend;
 use crate::batching::{Batchable, Batcher, BatchingStrategy};
 use crate::instance::Id as InstanceId;
 use crate::object::{IdRepr, ObjectManager, ObjectType, group_consecutive_ids};
-use crate::service::{Service, ServiceError};
+use crate::service::{Service, ServiceError, install_service};
 use crate::tokenizer::{BytePairEncoder, load_merge_rules};
 use crate::utils::IdPool;
 use crate::{backend, batching, runtime, service};
@@ -35,6 +35,16 @@ const PROTOCOL_VISION: usize = 1;
 
 static AVAILABLE_MODELS: std::sync::LazyLock<RwLock<Vec<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(Vec::new()));
+
+pub async fn try_attach_new_backend(name: String, endpoint: String) -> Option<usize> {
+    let backend = match backend::ZmqBackend::bind(&endpoint).await {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+
+    let l4m = L4m::new(backend).await;
+    install_service(&name, l4m)
+}
 
 // Engine manager endpoint for dynamic model discovery
 
@@ -417,7 +427,7 @@ impl L4m {
         let info = info_rx.await.unwrap();
 
         tracing::info!(
-            "Backend initialized: version={}, model_name={}, block_size={}, num_blocks={}, num_embeddings={}, num_distributions={}",
+            "New L4m service started: version={}, model_name={}, kv_page_size={}, num_kv_pages={}, num_embeddings={}, num_distributions={}",
             info.version,
             info.model_name,
             info.kv_page_size,

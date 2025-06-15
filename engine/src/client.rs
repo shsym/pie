@@ -3,6 +3,10 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use rmp_serde::{decode, encode};
 use std::sync::Arc;
+
+use crate::instance::Id as InstanceId;
+use crate::server::{CHUNK_SIZE_BYTES, ClientMessage, QUERY_PROGRAM_EXISTS, ServerMessage};
+use crate::utils::IdPool;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -10,117 +14,23 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use uuid::Uuid;
 
 type CorrId = u32;
-type InstanceId = Uuid;
 
-/// Message chunks size for program uploads
-const CHUNK_SIZE_BYTES: usize = 256 * 1024; // 256 KB
-
-/// Query subject for checking if a program exists
-const QUERY_PROGRAM_EXISTS: &str = "program_exists";
-
-/// A simple ID pool for correlation IDs
-#[derive(Debug)]
-pub struct IdPool<T> {
-    pool: Vec<T>,
-    next_id: T,
-}
-
-impl<T> IdPool<T>
-where
-    T: Copy + Clone + PartialOrd + std::ops::Add<Output = T> + From<u8>,
-{
-    pub fn new(max_id: T) -> Self {
-        Self {
-            pool: Vec::new(),
-            next_id: T::from(1),
-        }
-    }
-
-    pub fn acquire(&mut self) -> Result<T> {
-        if let Some(id) = self.pool.pop() {
-            Ok(id)
-        } else {
-            let id = self.next_id;
-            self.next_id = self.next_id + T::from(1);
-            Ok(id)
-        }
-    }
-
-    pub fn release(&mut self, id: T) -> Result<()> {
-        self.pool.push(id);
-        Ok(())
-    }
-}
-
-/// Client message types for communication with the Symphony engine
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMessage {
-    Query {
-        corr_id: CorrId,
-        subject: String,
-        record: String,
-    },
-    UploadProgram {
-        corr_id: CorrId,
-        program_hash: String,
-        chunk_index: usize,
-        total_chunks: usize,
-        chunk_data: Vec<u8>,
-    },
-    LaunchInstance {
-        corr_id: CorrId,
-        program_hash: String,
-    },
-    LaunchServerInstance {
-        corr_id: CorrId,
-        port: u32,
-        program_hash: String,
-    },
-    SignalInstance {
-        instance_id: String,
-        message: String,
-    },
-    TerminateInstance {
-        instance_id: String,
-    },
-}
-
-/// Server message types for responses from the Symphony engine
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMessage {
-    Response {
-        corr_id: CorrId,
-        successful: bool,
-        result: String,
-    },
-    InstanceEvent {
-        instance_id: String,
-        event: String,
-        message: String,
-    },
-    ServerEvent {
-        message: String,
-    },
-}
-
-/// A client that interacts with the Symphony engine server
+/// A client that interacts with the "Symphony" server.
 pub struct Client {
     /// Outgoing sender for Message frames
     ws_writer_tx: UnboundedSender<Message>,
     corr_id_pool: IdPool<CorrId>,
     /// A queue of incoming `ServerMessage`s (decoded from msgpack)
+    // event table
     pending_requests: Arc<DashMap<CorrId, oneshot::Sender<(bool, String)>>>,
     inst_event_tx: Arc<DashMap<InstanceId, mpsc::Sender<(String, String)>>>,
     server_event_rx: mpsc::Receiver<String>,
 
-    /// Task handles for the background reading and writing loops
+    /// A task handle for the background reading loop
     reader_handle: task::JoinHandle<()>,
     writer_handle: task::JoinHandle<()>,
 }
 
-/// Represents a running instance of a WebAssembly program
 #[derive(Debug)]
 pub struct Instance {
     id: InstanceId,
@@ -128,7 +38,6 @@ pub struct Instance {
     event_rx: mpsc::Receiver<(String, String)>,
 }
 
-/// Hash a program blob using Blake3
 pub fn hash_program(blob: &[u8]) -> String {
     blake3::hash(blob).to_hex().to_string()
 }
@@ -138,7 +47,6 @@ impl Instance {
         self.id
     }
 
-    /// Send a message to this instance
     pub async fn send<T>(&self, message: T) -> Result<()>
     where
         T: ToString,
@@ -152,7 +60,6 @@ impl Instance {
         Ok(())
     }
 
-    /// Receive the next event from this instance
     pub async fn recv(&mut self) -> Result<(String, String)> {
         self.event_rx
             .recv()
@@ -160,7 +67,6 @@ impl Instance {
             .ok_or_else(|| anyhow::anyhow!("Event channel closed"))
     }
 
-    /// Terminate this instance
     pub async fn terminate(&self) -> Result<()> {
         let msg = ClientMessage::TerminateInstance {
             instance_id: self.id.to_string(),
@@ -172,7 +78,6 @@ impl Instance {
 }
 
 impl Client {
-    /// Connect to a Symphony engine server
     pub async fn connect(ws_host: &str) -> Result<Client> {
         let (ws_stream, _response) = connect_async(ws_host).await?;
         println!("[Client] Connected to {ws_host}");
@@ -253,6 +158,9 @@ impl Client {
             }
         });
 
+        // We'll join the writer_task on drop or when close() is called, but let's keep only the
+        // reader task handle. We can embed the writer handle in the client or not.
+
         Ok(Client {
             ws_writer_tx,
             corr_id_pool: IdPool::new(CorrId::MAX),
@@ -264,7 +172,8 @@ impl Client {
         })
     }
 
-    /// Close the connection
+    /// Close the connection. This signals the writer channel to terminate
+    /// and also awaits the read task finishing.
     pub async fn close(self) -> Result<()> {
         // Attempt to send a Close message
         let _ = self.ws_writer_tx.send(Message::Close(None));
@@ -278,14 +187,13 @@ impl Client {
         Ok(())
     }
 
-    /// Helper: sends a serialized msgpack message to the server
+    /// Helper: sends a serialized msgpack message to the server.
     fn send_msg(&self, msg: &ClientMessage) -> Result<()> {
         let encoded = encode::to_vec_named(msg)?; // rmp-serde encoding
         self.ws_writer_tx.send(Message::Binary(encoded.into()))?;
         Ok(())
     }
 
-    /// Send a query to the server and wait for a response
     pub async fn query<T>(&mut self, subject: T, record: String) -> Result<String>
     where
         T: ToString,
@@ -313,14 +221,14 @@ impl Client {
         }
     }
 
-    /// Check if a program exists on the server
     pub async fn program_exists(&mut self, program_hash: &str) -> Result<bool> {
         self.query(QUERY_PROGRAM_EXISTS, program_hash.to_string())
             .await
             .map(|r| r == "true")
     }
 
-    /// Upload a WASM file in chunked form
+    /// Upload a WASM file in chunked form.
+    /// Prints out the server ack messages as they arrive.
     pub async fn upload_program(&mut self, blob: &[u8]) -> Result<()> {
         let program_hash = hash_program(blob);
 
@@ -357,11 +265,10 @@ impl Client {
         if successful {
             Ok(())
         } else {
-            anyhow::bail!("Upload failed: {}", result);
+            anyhow::bail!("Query failed: {}", result);
         }
     }
 
-    /// Launch a new instance of a program
     pub async fn launch_instance(&mut self, program_hash: &str) -> Result<Instance> {
         let (tx, rx) = oneshot::channel();
         let corr_id = self.corr_id_pool.acquire()?;
@@ -391,11 +298,10 @@ impl Client {
 
             Ok(instance)
         } else {
-            anyhow::bail!("Launch failed: {}", result);
+            anyhow::bail!("Query failed: {}", result);
         }
     }
 
-    /// Launch a server instance on a specific port
     pub async fn launch_server_instance(&mut self, program_hash: &str, port: u32) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let corr_id = self.corr_id_pool.acquire()?;
@@ -415,7 +321,7 @@ impl Client {
         if successful {
             Ok(())
         } else {
-            anyhow::bail!("Launch server failed: {}", result);
+            anyhow::bail!("Query failed: {}", result);
         }
     }
 }

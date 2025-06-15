@@ -1,4 +1,5 @@
 use crate::instance::Id as InstanceId;
+use crate::l4m::try_attach_new_backend;
 use crate::messaging::dispatch_u2i;
 use crate::runtime::RuntimeError;
 use crate::service::{Service, ServiceError};
@@ -108,7 +109,12 @@ pub enum ClientMessage {
     TerminateInstance { instance_id: String },
 
     #[serde(rename = "attach_backend")]
-    AttachBackend { endpoint: String, service: String },
+    AttachRemoteService {
+        corr_id: u32,
+        endpoint: String,
+        service_type: String,
+        service_name: String,
+    },
 }
 
 /// Messages from server -> client
@@ -348,32 +354,19 @@ impl Client {
                     ClientMessage::TerminateInstance { instance_id } => {
                         self.handle_terminate_instance(instance_id).await
                     }
-                    ClientMessage::AttachBackend { endpoint, service } => {
-
-
-
-                        // let service_id = SERVICE_ID_SERVER
-                        //     .get_or_init(|| service::get_service_id(&service).unwrap());
-                        // let (evt_tx, evt_rx) = oneshot::channel();
-                        // runtime::Command::AttachBackend {
-                        //     endpoint,
-                        //     service_id: *service_id,
-                        //     event: evt_tx,
-                        // }
-                        // .dispatch()
-                        // .unwrap();
-                        //
-                        // match evt_rx.await {
-                        //     Ok(_) => {
-                        //         self.send(ServerMessage::ServerEvent {
-                        //             message: format!("Attached to backend service {}", service),
-                        //         })
-                        //         .await;
-                        //     }
-                        //     Err(e) => {
-                        //         eprintln!("Failed to attach backend: {:?}", e);
-                        //     }
-                        // }
+                    ClientMessage::AttachRemoteService {
+                        corr_id,
+                        endpoint,
+                        service_type,
+                        service_name,
+                    } => {
+                        self.handle_attach_remote_service(
+                            corr_id,
+                            endpoint,
+                            service_type,
+                            service_name,
+                        )
+                        .await;
                     }
                 },
                 ClientCommand::Internal(cmd) => match cmd {
@@ -585,6 +578,41 @@ impl Client {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.inst_owned.contains(&inst_id) {
                 runtime::trap(inst_id, "user terminated the program");
+            }
+        }
+    }
+
+    async fn handle_attach_remote_service(
+        &mut self,
+        corr_id: u32,
+        endpoint: String,
+        service_type: String,
+        service_name: String,
+    ) {
+        match service_type.as_str() {
+            "l4m" => {
+                if try_attach_new_backend(service_name, endpoint)
+                    .await
+                    .is_some()
+                {
+                    self.send_response(corr_id, true, "Attached to L4M backend".to_string())
+                        .await;
+                } else {
+                    self.send_response(
+                        corr_id,
+                        false,
+                        "Failed to attach to L4M backend".to_string(),
+                    )
+                    .await;
+                }
+            }
+            _ => {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!("Unknown service type: {}", service_type),
+                )
+                .await;
             }
         }
     }

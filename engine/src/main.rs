@@ -14,6 +14,7 @@ mod server;
 mod tokenizer;
 mod types;
 mod utils;
+mod client;
 
 //
 use anyhow::Context;
@@ -25,10 +26,10 @@ use crate::messaging::{PubSub, PushPull};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
 use crate::server::Server;
-use crate::service::{Controller, install_service};
-use clap::{Command, Parser};
+use crate::service::install_service;
 use serde::Deserialize;
 use std::{env, fs};
+use clap::Parser;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};

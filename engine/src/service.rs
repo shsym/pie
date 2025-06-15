@@ -10,7 +10,7 @@ use tokio::task;
 
 static SERVICE_DISPATCHER: OnceLock<ServiceDispatcher> = OnceLock::new();
 
-pub fn install_service<T>(name: &str, driver: T) -> usize
+pub fn install_service<T>(name: &str, driver: T) -> Option<usize>
 where
     T: Service + 'static + Send,
 {
@@ -57,14 +57,13 @@ pub trait Service: Send {
 
 pub type AnyCommand = Box<dyn Any + Send + Sync>;
 
-pub struct Controller {
-    maps: RwLock<HashMap<String, usize>>,
-    channels: Vec<UnboundedSender<AnyCommand>>,
-}
-
 #[derive(Debug)]
 pub struct ServiceDispatcher {
     maps: RwLock<HashMap<String, usize>>,
+
+    // Note: Using `boxcar::Vec` for performance
+    // boxcar::Vec<> took:  14.79875ms
+    // RwLock<Vec<>> took: 54.038458ms
     channels: boxcar::Vec<UnboundedSender<AnyCommand>>,
 }
 
@@ -73,12 +72,17 @@ impl ServiceDispatcher {
         self.maps.read().unwrap().get(name).copied()
     }
 
-    pub fn install<T>(&self, name: &str, mut driver: T) -> usize
+    pub fn install<T>(&self, name: &str, mut driver: T) -> Option<usize>
     where
         T: Service + 'static + Send,
     {
         let (tx, mut rx) = unbounded_channel();
 
+        // first, make sure the name is not already registered
+        if self.get_service_id(name).is_some() {
+            return None;
+        }
+        
         self.channels.push(tx);
         let service_id = self.channels.count() - 1;
 
@@ -93,7 +97,7 @@ impl ServiceDispatcher {
             }
         });
 
-        service_id
+        Some(service_id)
     }
 
     pub fn dispatch<C>(&self, service_id: usize, cmd: C) -> Result<(), ServiceError>
