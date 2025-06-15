@@ -186,7 +186,7 @@ impl BytePairEncoder {
         ret
     }
 
-    fn new(
+    pub(crate) fn new(
         decoder: HashMap<Rank, Vec<u8>>,
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,

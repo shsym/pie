@@ -86,6 +86,7 @@ pub struct Info {
     pub num_kv_pages: u32,
     pub num_embeddings: u32,
     pub num_distributions: u32,
+    pub tokenizer: Arc<BytePairEncoder>,
 }
 
 pub type LocalStreamId = u32;
@@ -372,7 +373,6 @@ pub struct L4m {
     objects: ObjectManager<InstanceId, ManagedTypes>,
     stream_priorities: HashMap<Stream, StreamPriority>,
     info: Info,
-    tokenizer: Arc<BytePairEncoder>,
     stats: L4mStat,
 }
 
@@ -429,8 +429,6 @@ impl L4m {
         // Add the model name to the available models
         set_available_models([info.model_name.clone()]);
 
-        let tokenizer = empty_tokenizer();
-
         let mut objects = ObjectManager::new();
         objects
             .set_capacity(ManagedTypes::KvBlock, info.num_kv_pages as IdRepr)
@@ -447,7 +445,6 @@ impl L4m {
             objects,
             stream_priorities: HashMap::new(),
             info,
-            tokenizer: Arc::new(tokenizer),
             stats: L4mStat { total_calls: 0 },
         };
 
@@ -530,7 +527,7 @@ impl L4m {
             }
 
             Command::GetTokenizer { handle } => {
-                handle.send(self.tokenizer.clone()).ok();
+                handle.send(self.info.tokenizer.clone()).ok();
                 None
             }
 
@@ -631,7 +628,8 @@ impl L4m {
                     return None;
                 }
 
-                let max_tokens = self.info.kv_page_size * (context.len() as u32 - 1) + last_block_len;
+                let max_tokens =
+                    self.info.kv_page_size * (context.len() as u32 - 1) + last_block_len;
 
                 if inputs.len() > max_tokens as usize {
                     // error
@@ -945,6 +943,17 @@ impl L4m {
                         let sender = senders.into_iter().next().unwrap();
                         match sender {
                             Event::GetInfo(handle) => {
+                                let tokenizer = info.tokenizer.unwrap();
+                                let merge_table = tokenizer.merge_table;
+                                let special_tokens = tokenizer.special_tokens;
+                                let pattern = tokenizer.split_regex;
+
+                                let tokenizer = Arc::new(BytePairEncoder::new(
+                                    merge_table,
+                                    special_tokens,
+                                    &pattern,
+                                ));
+
                                 handle
                                     .send(Info {
                                         version: info.version,
@@ -953,6 +962,7 @@ impl L4m {
                                         num_kv_pages: info.num_available_kv_pages,
                                         num_embeddings: info.num_available_embeddings,
                                         num_distributions: info.num_available_distributions,
+                                        tokenizer,
                                     })
                                     .ok();
                             }
@@ -1127,11 +1137,11 @@ impl backend::Simulate for Simulator {
                     tokenizer: Some(pb_bindings::Tokenizer {
                         merge_table: self.tokenizer_merge_table.clone(),
                         special_tokens: HashMap::from([
-                            (128000, "<|begin_of_text|>".to_string()),
-                            (128001, "<|end_of_text|>".to_string()),
-                            (128006, "<|start_header_id|>".to_string()),
-                            (128007, "<|end_header_id|>".to_string()),
-                            (128009, "<|eot_id|>".to_string())
+                            ("<|begin_of_text|>".to_string(), 128000),
+                            ("<|end_of_text|>".to_string(), 128001),
+                            ("<|start_header_id|>".to_string(), 128006),
+                            ("<|end_header_id|>".to_string(), 128007),
+                            ("<|eot_id|>".to_string(), 128009)
                         ]),
                         split_regex: r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+".to_string(),
                     }),
