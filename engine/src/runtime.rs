@@ -119,6 +119,8 @@ pub struct Runtime {
     engine: Engine,
     linker: Arc<Linker<InstanceState>>,
 
+    cache_dir: std::path::PathBuf,
+
     /// Pre-compiled WASM components, keyed by BLAKE3 hex string
     programs_in_memory: DashMap<String, Component>,
 
@@ -155,20 +157,18 @@ impl Service for Runtime {
             Command::UploadProgram { hash, raw, event } => {
                 if self.programs_in_memory.contains_key(&hash) {
                     event.send(Ok(hash)).unwrap();
-                } else {
-                    if let Ok(component) = Component::from_binary(&self.engine, raw.as_slice()) {
-                        self.programs_in_memory.insert(hash.to_string(), component);
+                } else if let Ok(component) = Component::from_binary(&self.engine, raw.as_slice()) {
+                    self.programs_in_memory.insert(hash.to_string(), component);
 
-                        // Write to disk
-                        let file_path = std::path::Path::new(super::PROGRAM_CACHE_DIR).join(&hash);
-                        std::fs::write(&file_path, &raw).unwrap();
-                        self.programs_in_disk.insert(hash.clone(), file_path);
-                        event.send(Ok(hash)).unwrap();
-                    } else {
-                        event
-                            .send(Err(RuntimeError::Other("Failed to compile".into())))
-                            .unwrap();
-                    }
+                    // Write to disk
+                    let file_path = std::path::Path::new(&self.cache_dir).join(&hash);
+                    std::fs::write(&file_path, &raw).unwrap();
+                    self.programs_in_disk.insert(hash.clone(), file_path);
+                    event.send(Ok(hash)).unwrap();
+                } else {
+                    event
+                        .send(Err(RuntimeError::Other("Failed to compile".into())))
+                        .unwrap();
                 }
             }
 
@@ -213,7 +213,7 @@ impl Service for Runtime {
 }
 
 impl Runtime {
-    pub fn new() -> Self {
+    pub fn new<P: AsRef<std::path::Path>>(cache_dir: P) -> Self {
         // Configure Wasmtime engine
         let mut config = Config::default();
         config.async_support(true);
@@ -231,9 +231,14 @@ impl Runtime {
 
         bindings::add_to_linker(&mut linker).unwrap();
 
+        let cache_dir = cache_dir.as_ref().join("programs");
+        // Ensure the cache directory exists
+        std::fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
+
         Self {
             engine,
             linker: Arc::new(linker),
+            cache_dir,
             programs_in_memory: DashMap::new(),
             programs_in_disk: DashMap::new(),
             running_instances: DashMap::new(),
@@ -241,8 +246,8 @@ impl Runtime {
         }
     }
 
-    pub fn load_existing_programs(&self, cache_dir: &std::path::Path) -> Result<(), RuntimeError> {
-        let entries = std::fs::read_dir(cache_dir)?; // Will map to RuntimeError::Io automatically
+    pub fn load_existing_programs(&self) -> Result<(), RuntimeError> {
+        let entries = std::fs::read_dir(&self.cache_dir)?; // Will map to RuntimeError::Io automatically
         for entry in entries {
             let entry = entry?; // same here, auto-converted to RuntimeError::Io
             if entry.file_type()?.is_file() {
@@ -342,7 +347,6 @@ impl Runtime {
     pub async fn terminate_instance(&self, instance_id: InstanceId, reason: String) {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
-
 
             for model in l4m::available_models() {
                 let service_id = service::get_service_id(&model).unwrap();

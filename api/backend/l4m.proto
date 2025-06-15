@@ -177,10 +177,16 @@ message GetInfoResponse {
   uint32 num_available_blocks = 4;
   uint32 num_available_embeddings = 5;
   uint32 num_available_distributions = 6;
+  Tokenizer tokenizer = 7;
+}
+
+message Tokenizer {
+  map<uint32, bytes> merge_table = 1;
+  map<uint32, string> special_tokens = 2;
+  string split_regex = 3;
 }
 
 // -----------------------------------------------------------------------------
-
 
 message Request {
   uint32 correlation_id = 1;

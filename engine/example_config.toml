@@ -1,0 +1,5 @@
+# Sample config.toml
+host = "127.0.0.1"
+port = 8080
+verbose = true
+log = "/var/log/pie_app.log"

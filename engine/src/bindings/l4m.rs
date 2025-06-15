@@ -1,6 +1,5 @@
 use crate::instance::InstanceState;
 use crate::l4m::{Command, ManagedTypes, StreamPriority, available_models};
-use crate::backend_discovery::{get_model_service_id};
 use crate::object::IdRepr;
 use crate::tokenizer::BytePairEncoder;
 use crate::{bindings, service};
@@ -90,15 +89,15 @@ impl bindings::wit::pie::nbi::l4m::Host for InstanceState {
         }
 
         // Check if the model has a cached service ID
-        if let Some(service_id) = get_model_service_id(&value) {
-            tracing::info!("Found existing service for model '{}' with service_id: {}", value, service_id);
-            let model = Model {
-                name: value,
-                service_id,
-            };
-            let res = self.table().push(model)?;
-            return Ok(Some(res));
-        }
+        // if let Some(service_id) = get_model_service_id(&value) {
+        //     tracing::info!("Found existing service for model '{}' with service_id: {}", value, service_id);
+        //     let model = Model {
+        //         name: value,
+        //         service_id,
+        //     };
+        //     let res = self.table().push(model)?;
+        //     return Ok(Some(res));
+        // }
 
         // Model not found in already initialized services
         tracing::warn!("Model '{}' service not found. The model may not be available or the backend may not be started yet. Available models are discovered and services created automatically by the engine.", value);

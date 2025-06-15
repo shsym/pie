@@ -3,10 +3,9 @@ use crate::batching::{Batchable, Batcher, BatchingStrategy};
 use crate::instance::Id as InstanceId;
 use crate::object::{IdRepr, ObjectManager, ObjectType, group_consecutive_ids};
 use crate::service::{Service, ServiceError};
-use crate::tokenizer::BytePairEncoder;
+use crate::tokenizer::{BytePairEncoder, empty_tokenizer, llama3_tokenizer, load_merge_rules};
 use crate::utils::IdPool;
 use crate::{backend, batching, runtime, service, tokenizer};
-use crate::utils::expand_home_dir_str;
 use dashmap::DashMap;
 use prost::Message;
 use rand::Rng;
@@ -34,12 +33,10 @@ macro_rules! try_trap {
 const PROTOCOL_BASE: usize = 0;
 const PROTOCOL_VISION: usize = 1;
 
-static AVAILABLE_MODELS: std::sync::LazyLock<RwLock<Vec<String>>> = std::sync::LazyLock::new(|| {
-    RwLock::new(Vec::new())
-});
+static AVAILABLE_MODELS: std::sync::LazyLock<RwLock<Vec<String>>> =
+    std::sync::LazyLock::new(|| RwLock::new(Vec::new()));
 
 // Engine manager endpoint for dynamic model discovery
-
 
 pub fn set_available_models<T>(models: T)
 where
@@ -54,7 +51,10 @@ where
     // Update the static cache with new models
     if let Ok(mut cached_models) = AVAILABLE_MODELS.write() {
         *cached_models = new_models;
-        tracing::debug!("Updated available models cache with {} models", cached_models.len());
+        tracing::debug!(
+            "Updated available models cache with {} models",
+            cached_models.len()
+        );
     } else {
         tracing::warn!("Failed to update available models cache");
     }
@@ -69,7 +69,6 @@ pub fn available_models() -> Vec<String> {
         vec![]
     }
 }
-
 
 mod pb_bindings {
     include!(concat!(env!("OUT_DIR"), "/l4m.rs"));
@@ -150,8 +149,6 @@ impl Default for StreamPriority {
 
 #[derive(Debug)]
 pub enum Command {
-
-
     Destroy {
         inst_id: InstanceId,
     },
@@ -288,11 +285,11 @@ impl Batchable<BatchGroup> for Command {
             Command::Allocate { .. } => {
                 //batching::t_only(Duration::from_micros(100))
                 batching::eager()
-            },
+            }
             Command::Deallocate { .. } => {
                 //batching::t_only(Duration::from_micros(100))
                 batching::eager()
-            },
+            }
             Command::FillBlock { .. } => {
                 //
                 //batching::k_or_t(Duration::from_millis(10), 30, None)
@@ -305,12 +302,12 @@ impl Batchable<BatchGroup> for Command {
             Command::EmbedText { .. } => {
                 //batching::t_only(Duration::from_micros(100))
                 batching::eager()
-            },
+            }
 
             Command::SampleTopK { .. } => {
                 //batching::t_only(Duration::from_micros(100))
                 batching::eager()
-            },
+            }
             Command::Synchronize { .. } => batching::eager(),
             Command::EmbedImage { .. } => batching::eager(),
             _ => unreachable!(),
@@ -384,8 +381,6 @@ impl Service for L4m {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
-
-
         self.stats.total_calls += 1;
         if let Command::Destroy { inst_id } = cmd {
             for cmd in self.get_cleanup_cmds(inst_id) {
@@ -434,70 +429,7 @@ impl L4m {
         // Add the model name to the available models
         set_available_models([info.model_name.clone()]);
 
-        // Extract the actual model name from the path if it's a full path
-        let model_name = if info.model_name.contains('/') {
-            // If it's a path, extract the last component
-            std::path::Path::new(&info.model_name)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(&info.model_name)
-                .to_string()
-        } else {
-            info.model_name.clone()
-        };
-
-        // Try to load the tokenizer model from different paths
-        // First try to load from Symphony managed models if available
-        let symphony_model_paths = [
-            expand_home_dir_str(&format!("~/.cache/symphony/models/{}", model_name)),
-        ];
-
-        let tokenizer_paths = [
-            format!("program_cache/{}/original/tokenizer.model", model_name),
-            "../test-tokenizer/tokenizer.model".to_string(),
-        ];
-
-        let mut tokenizer = None;
-
-        // First try Symphony managed models with metadata
-        for path in &symphony_model_paths {
-            if std::path::Path::new(path).exists() {
-                tracing::debug!("Trying to load tokenizer from Symphony managed model: {}", path);
-                match tokenizer::load_symphony_tokenizer(path) {
-                    Ok(tok) => {
-                        tokenizer = Some(tok);
-                        tracing::info!("Successfully loaded tokenizer from Symphony managed model: {}", path);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::debug!("Failed to load tokenizer from Symphony managed model {}: {}", path, e);
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // Fallback to original hardcoded paths if Symphony models not found
-        if tokenizer.is_none() {
-            for path in &tokenizer_paths {
-                match tokenizer::llama3_tokenizer(path) {
-                    Ok(tok) => {
-                        tokenizer = Some(tok);
-                        tracing::info!("Successfully loaded tokenizer from {}", path);
-                        break;
-                    }
-                    Err(_) => continue,
-                }
-            }
-        }
-
-        let tokenizer = tokenizer.expect(
-            format!(
-                "Failed to load tokenizer from paths: {:?}\nModel name: {}\n
-                 Download a model with: pie-cli model install MODEL_NAME",
-                [symphony_model_paths.to_vec(), tokenizer_paths.to_vec()].concat(), info.model_name
-            ).as_str()
-        );
+        let tokenizer = empty_tokenizer();
 
         let mut objects = ObjectManager::new();
         objects
@@ -586,7 +518,6 @@ impl L4m {
 
     fn resolve_cmd(&mut self, cmd: Command) -> Option<(Command, Stream)> {
         match cmd {
-
             Command::Destroy { .. } => {
                 unreachable!()
             }
@@ -619,7 +550,6 @@ impl L4m {
                 ty,
                 ids,
             } => {
-
                 // check available space
                 if self.objects.available(ty).unwrap() < ids.len() {
                     runtime::trap(
@@ -651,7 +581,6 @@ impl L4m {
                 ty,
                 ids,
             } => {
-
                 // if ty == ManagedTypes::TokenEmb {
                 //     println!("deallocating tokenemb, ids: {:?}", ids);
                 //     println!("available tokenemb: {:?}", self.objects.available(ty));
@@ -1056,9 +985,10 @@ where
             .supported_protocols()
             .iter()
             .map(|protoc| {
-                backend
-                    .protocol_index(protoc)
-                    .expect(&format!("Failed to get protocol index: UnsupportedProtocol(\"{}\")", protoc))
+                backend.protocol_index(protoc).expect(&format!(
+                    "Failed to get protocol index: UnsupportedProtocol(\"{}\")",
+                    protoc
+                ))
             })
             .collect::<Vec<u8>>();
 
@@ -1141,16 +1071,19 @@ impl ExportedBlocks {
 #[derive(Clone)]
 pub struct Simulator {
     protocols: Vec<String>,
+    tokenizer_merge_table: HashMap<u32, Vec<u8>>
 }
 
 impl Simulator {
     pub fn new() -> Self {
+        let tokenizer_merge_table =
+            load_merge_rules("asset/model-test.vocab").expect("Failed to load tokenizer vocab");
+
         Self {
             protocols: vec!["l4m".to_string()],
+            tokenizer_merge_table
         }
     }
-
-
 }
 
 impl backend::Simulate for Simulator {
@@ -1191,6 +1124,11 @@ impl backend::Simulate for Simulator {
                     num_available_blocks: 1000000,
                     num_available_embeddings: 1000000,
                     num_available_distributions: 100000,
+                    tokenizer: Some(pb_bindings::Tokenizer {
+                        merge_table: self.tokenizer_merge_table.clone(),
+                        special_tokens: HashMap::new(),
+                        split_regex: "".to_string(),
+                    }),
                 }),
             ),
             _ => None,

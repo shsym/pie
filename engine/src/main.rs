@@ -1,6 +1,5 @@
 mod service;
 mod zmq_handler;
-mod backend_discovery;
 
 mod backend;
 mod batching;
@@ -13,212 +12,227 @@ mod ping;
 mod runtime;
 mod server;
 mod tokenizer;
-mod utils;
 mod types;
+mod utils;
 
 //
 use anyhow::Context;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // use crate::client::{Client, hash_program};
 use crate::l4m::L4m;
 use crate::messaging::{PubSub, PushPull};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
-use crate::backend_discovery::{discover_backend_for_model, start_periodic_cache_updates};
 use crate::server::Server;
 use crate::service::Controller;
-use clap::{Arg, Command};
-use colored::Colorize;
-use std::fs;
+use clap::{Command, Parser};
+use serde::Deserialize;
+use std::{env, fs};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
-const PROGRAM_CACHE_DIR: &str = "./program_cache";
+const DEFAULT_PORT: u16 = 9123; // Default port for the server
+const DEFAULT_HOST: &str = "127.0.0.1"; // Default host for the server
 
-// Define a simple macro for client-side logging.
-#[macro_export]
-macro_rules! log_user {
-    ($($arg:tt)*) => {
-        println!("{}", format!("[User] {}", format_args!($($arg)*)).bright_blue());
-    }
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Cli {
+    /// The network host to connect to.
+    #[arg(long, help = "Network host")]
+    host: Option<String>,
+
+    /// The network port to use.
+    #[arg(short, long, help = "Network port")]
+    port: Option<u16>,
+
+    /// The directory for caching data.
+    /// Defaults to $PIE_HOME, or $HOME/.cache/pie if not set.
+    #[arg(long, help = "Cache directory")]
+    cache_dir: Option<PathBuf>,
+
+    /// Path to the TOML configuration file.
+    #[arg(long, help = "Path to a TOML configuration file")]
+    config: Option<PathBuf>,
+
+    /// Enable verbose output.
+    #[arg(long, action = clap::ArgAction::SetTrue, help = "Enable verbose logging")]
+    verbose: bool,
+
+    /// A log file to write to.
+    #[arg(long, help = "Log file path")]
+    log: Option<PathBuf>,
 }
 
-/// Check if a model is available by attempting to load it via management service
-/// This function is used for on-demand backend discovery
-async fn check_model_available(model_name: &str, engine_manager_endpoint: &str) -> anyhow::Result<String> {
-    // Use the new HTTP-based backend discovery
-    match discover_backend_for_model(engine_manager_endpoint, model_name).await {
-        Ok(discovery_result) => {
-            log_user!("Model {} is available at endpoint: {})",
-                model_name, discovery_result.backend_endpoint);
-            Ok(discovery_result.backend_endpoint)
-        }
-        Err(e) => {
-            log_user!("Model {} is not available: {}", model_name, e);
-            Err(anyhow::anyhow!("Model {} is not available: {}", model_name, e))
-        }
-    }
+/// A struct that represents the structure of your TOML configuration file.
+/// The field names here use snake_case to match TOML conventions.
+#[derive(Deserialize, Debug, Default)]
+struct ConfigFile {
+    host: Option<String>,
+    port: Option<u16>,
+    cache_dir: Option<PathBuf>,
+    verbose: Option<bool>,
+    log: Option<PathBuf>,
 }
 
-// Add manual Tokio runtime for main
+/// The final, merged configuration struct that the application will use.
+#[derive(Debug)]
+struct Config {
+    host: String,
+    port: u16,
+    cache_dir: PathBuf,
+    verbose: bool,
+    log: Option<PathBuf>,
+}
+
+/// Determines the default cache directory path.
+///
+/// It follows this logic:
+/// 1. Check for the `PIE_HOME` environment variable.
+/// 2. If not found, fall back to the user's cache directory (`$HOME/.cache` on Linux).
+/// 3. Appends a "pie" subdirectory to the chosen path.
+fn get_default_cache_dir() -> PathBuf {
+    // Try to get PIE_HOME from environment variables.
+    if let Ok(pie_home) = env::var("PIE_HOME") {
+        return PathBuf::from(pie_home);
+    }
+
+    // Fallback to the system's cache directory if PIE_HOME is not set.
+    // `dirs::cache_dir()` provides the conventional location for cache files.
+    // e.g., ~/.cache on Linux, ~/Library/Caches on macOS, %LOCALAPPDATA% on Windows.
+    if let Some(mut cache_path) = dirs::cache_dir() {
+        cache_path.push("pie");
+        return cache_path;
+    }
+
+    // A final fallback if even the home directory can't be found.
+    // On most systems, this part of the code is unlikely to be reached.
+    let mut fallback = PathBuf::from(".cache");
+    fallback.push("pie");
+    fallback
+}
+
 fn main() -> anyhow::Result<()> {
-    // Build the main Tokio runtime
-    let rt_main = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("Failed to build main Tokio runtime")?;
-    // Build a separate Tokio runtime for management
-    let rt_mgmt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("Failed to build management Tokio runtime")?;
-    // Run management_main on its own runtime
-    rt_mgmt.block_on(management_main())?;
-    // Run the async_main on the main runtime
-    rt_main.block_on(async_main())
-}
+    // 1. Parse CLI and TOML config
+    let cli = Cli::parse();
+    let file_config = if let Some(config_path) = &cli.config {
+        let file_contents = fs::read_to_string(config_path)
+            .with_context(|| format!("Could not read config file at {:?}", config_path))?;
+        toml::from_str(&file_contents)
+            .with_context(|| format!("Could not parse TOML from {:?}", config_path))?
+    } else {
+        ConfigFile::default()
+    };
 
-// Remove the Tokio macro and rename main
-async fn async_main() -> anyhow::Result<()> {
-    // Create log directory if it doesn't exist
-    std::fs::create_dir_all("logs").unwrap_or(());
+    // 2. Merge configurations
+    let config = Config {
+        host: cli
+            .host
+            .or(file_config.host)
+            .unwrap_or_else(|| DEFAULT_HOST.to_string()),
+        port: cli.port.or(file_config.port).unwrap_or(DEFAULT_PORT),
+        cache_dir: cli
+            .cache_dir
+            .or(file_config.cache_dir)
+            .unwrap_or_else(get_default_cache_dir),
+        verbose: cli.verbose || file_config.verbose.unwrap_or(true),
+        log: cli.log.or(file_config.log),
+    };
 
-    // Create log file with current date
-    let current_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let log_filename = format!("engine-{}.log", current_date);
+    // 3. Setup logging
+    // This guard must be kept alive for the duration of the program.
+    // If it's dropped, the background logging thread will shut down.
+    let _guard;
 
-    // Initialize tracing subscriber to write to file
-    let file_appender = tracing_appender::rolling::never("logs", &log_filename);
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let stdout_filter = if config.verbose {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
+    };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("pie_rt=info".parse().unwrap()))
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_ansi(false)  // Disable ANSI color codes for clean log files
-        .with_writer(non_blocking)
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_filter(stdout_filter);
+
+    let file_layer = if let Some(log_path) = &config.log {
+        // Ensure the parent directory exists.
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create log directory at {:?}", parent))?;
+        }
+
+        // Use tracing_appender to create a non-blocking file writer.
+        // We use `rolling::never` to create a single, non-rotating log file.
+        let file_appender = tracing_appender::rolling::never(
+            log_path.parent().unwrap_or_else(|| Path::new(".")),
+            log_path.file_name().unwrap_or_else(|| "pie.log".as_ref()),
+        );
+
+        // The 'non_blocking' function spawns a dedicated thread for writing.
+        let (non_blocking_writer, guard) = tracing_appender::non_blocking(file_appender);
+        _guard = guard; // Store the guard to keep the thread alive.
+
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(non_blocking_writer) // Use the non-blocking writer
+            .with_ansi(false)
+            .with_filter(EnvFilter::new("trace")); // Log everything to the file
+        Some(layer)
+    } else {
+        None
+    };
+
+    tracing_subscriber::registry()
+        .with(stdout_layer)
+        .with(file_layer)
         .init();
 
-    tracing::info!("Symphony Engine starting up");
+    tracing::debug!("{:#?}", config);
 
-    //console_subscriber::init();
+    // 4. Build the Tokio runtime and start the runtime.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
 
-    // Parse command line arguments
-    let matches = Command::new("Symphony Engine")
-        .version("1.0")
-        .author("Symphony Team")
-        .about("Symphony Engine for WebAssembly programs")
-        .arg(
-            Arg::new("program")
-                .help("Name of the program to run (without extension)")
-                .default_value("simple_decoding"),
-        )
-        .arg(
-            Arg::new("engine_manager")
-                .short('e')
-                .long("engine-manager")
-                .value_name("ENDPOINT")
-                .help("Engine-manager endpoint URL")
-                .default_value("http://127.0.0.1:8080"),
-        )
-        .arg(
-            Arg::new("port")
-                .short('p')
-                .long("port")
-                .value_name("PORT")
-                .help("Port to run the client entry point")
-                .default_value("9123"),
-        )
-        .arg(
-            Arg::new("dummy")
-                .short('d')
-                .long("dummy")
-                .action(clap::ArgAction::SetTrue)
-                .help("Run the dummy client")
-                .default_value("false"),
-        )
-        .get_matches();
+    rt.block_on(start(config))
+}
 
-    let _program_name = matches.get_one::<String>("program").unwrap();
-    let port = matches.get_one::<String>("port").unwrap();
-    let port: u16 = port.parse().unwrap_or(9123);
-    let use_dummy = matches.get_one::<bool>("dummy").unwrap();
-    let use_dummy = *use_dummy;
+async fn start(config: Config) -> anyhow::Result<()> {
+    // Ensure the cache directory exists
+    fs::create_dir_all(&config.cache_dir).map_err(|e| {
+        tracing::error!(error = %e,"Setup failure: could not create cache dir");
+        e
+    })?;
 
-    // Get engine-manager endpoint from command line or environment variable
-    let management_endpoint = matches.get_one::<String>("engine_manager")
-        .map(|s| s.clone())
-        .or_else(|| std::env::var("SYMPHONY_ENGINE_MANAGER_ENDPOINT").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+    // Set up core services
+    let runtime = Runtime::new(&config.cache_dir);
+    runtime.load_existing_programs()?;
 
-    // Store management endpoint for runtime backend discovery
-    // We don't check for backends on startup - they will be discovered when needed
-    log_user!("Engine starting - backend discovery will happen on-demand");
-    log_user!("Engine-manager endpoint: {}", management_endpoint);
-
-    // 1) Ensure the cache directory exists
-    fs::create_dir_all(PROGRAM_CACHE_DIR).context("Failed to create program cache directory")?;
-
-    let runtime = Runtime::new();
-    runtime.load_existing_programs(Path::new(PROGRAM_CACHE_DIR))?;
-
-    // Get port from args
-    let server_url = format!("127.0.0.1:{}", port);
-    log_user!("Server URL: {}", server_url);
+    let server_url = format!("{}:{}", config.host, config.port);
     let server = Server::new(&server_url);
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
 
+    // Set up test services
+    let dummy_l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
+    let dummy_ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
+    let l4m = L4m::new(dummy_l4m_backend.clone()).await;
+    let ping = Ping::new(dummy_ping_backend.clone()).await;
+
     let ctrl = Controller::new()
-            .add("runtime", runtime)
-            .add("server", server)
-            .add("messaging-inst2inst", messaging_inst2inst)
-            .add("messaging-user2inst", messaging_user2inst);
-
-    // Setup services based on mode
-    let ctrl = if use_dummy {
-        log_user!("Running in dummy mode");
-
-        let dummy_l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
-        let dummy_ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
-
-        let l4m = L4m::new(dummy_l4m_backend.clone()).await;
-        let ping = Ping::new(dummy_ping_backend.clone()).await;
-
-        let models = l4m::available_models();
-        let default_model = "dummy_model".to_string();
-        let model_name = models.first().unwrap_or(&default_model);
-
-        ctrl
-            .add(model_name, l4m)
-            .add("ping", ping)
-    } else {
-        // On-demand mode: ping uses real L4M backend when available, L4M services added dynamically
-        log_user!("Starting engine in on-demand backend mode");
-
-        // Return controller without any pre-registered services - they'll all be added dynamically
-        ctrl
-    };
+        .add("runtime", runtime)
+        .add("server", server)
+        .add("messaging-inst2inst", messaging_inst2inst)
+        .add("messaging-user2inst", messaging_user2inst)
+        .add("model-test", l4m)
+        .add("ping", ping);
 
     // Install all services
     ctrl.install();
+    tracing::info!("Runtime started successfully.");
 
-    // Start periodic cache updates for detecting new backend registrations
-    start_periodic_cache_updates();
-
-    // TODO: Add periodic stats printing for connected backends when they are connected
-    // This should be done dynamically based on which backends are actually connected
-
-    // Wait forever - applications will be loaded via WebSocket API when requested
     tokio::signal::ctrl_c().await?;
+    tracing::info!("Ctrl+C received, shutting down.");
 
-    Ok(())
-}
-
-// New management entrypoint
-async fn management_main() -> anyhow::Result<()> {
-    // TODO: add management logic here
-    tracing::info!("Management runtime started");
     Ok(())
 }
