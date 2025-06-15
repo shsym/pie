@@ -291,48 +291,48 @@ pub fn load_merge_rules(path: &str) -> Result<HashMap<Rank, Vec<u8>>, Box<dyn st
 
     Ok(ret)
 }
-
-pub fn empty_tokenizer() -> BytePairEncoder {
-    // Create an empty encoder with no merge rules and no special tokens
-    BytePairEncoder::new(
-        HashMap::new(),
-        HashMap::new(),
-        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-    )
-}
-
-// https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py
-pub fn llama3_tokenizer(path: &str) -> Result<BytePairEncoder, Box<dyn std::error::Error>> {
-    // Example usage
-    let mergeable_ranks = load_merge_rules(path)?;
-    let special_tokens = vec![
-        "<|begin_of_text|>",
-        "<|end_of_text|>",
-        "<|reserved_special_token_0|>",
-        "<|reserved_special_token_1|>",
-        "<|reserved_special_token_2|>",
-        "<|reserved_special_token_3|>",
-        "<|start_header_id|>",
-        "<|end_header_id|>",
-        "<|reserved_special_token_4|>",
-        "<|eot_id|>",
-    ];
-    let pattern = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-
-    let num_base_tokens = mergeable_ranks.len() as Rank;
-
-    let special_tokens_encoder: HashMap<String, Rank> = special_tokens
-        .into_iter()
-        .enumerate()
-        .map(|(i, s)| (s.to_string(), num_base_tokens + i as Rank))
-        .collect();
-
-    let encoder = BytePairEncoder::new(mergeable_ranks, special_tokens_encoder, pattern);
-    // [9906, 11, 856, 5679, 374, 19369]
-    // encode text
-    //let text = "Hello, my dog is cute";
-    //let tokens = encoder.encode_with_special_tokens(text);
-    //println!("Encoded tokens: {:?}", tokens);
-
-    Ok(encoder)
-}
+//
+// pub fn empty_tokenizer() -> BytePairEncoder {
+//     // Create an empty encoder with no merge rules and no special tokens
+//     BytePairEncoder::new(
+//         HashMap::new(),
+//         HashMap::new(),
+//         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+//     )
+// }
+//
+// // https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py
+// pub fn llama3_tokenizer(path: &str) -> Result<BytePairEncoder, Box<dyn std::error::Error>> {
+//     // Example usage
+//     let mergeable_ranks = load_merge_rules(path)?;
+//     let special_tokens = vec![
+//         "<|begin_of_text|>",
+//         "<|end_of_text|>",
+//         "<|reserved_special_token_0|>",
+//         "<|reserved_special_token_1|>",
+//         "<|reserved_special_token_2|>",
+//         "<|reserved_special_token_3|>",
+//         "<|start_header_id|>",
+//         "<|end_header_id|>",
+//         "<|reserved_special_token_4|>",
+//         "<|eot_id|>",
+//     ];
+//     let pattern = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+//
+//     let num_base_tokens = mergeable_ranks.len() as Rank;
+//
+//     let special_tokens_encoder: HashMap<String, Rank> = special_tokens
+//         .into_iter()
+//         .enumerate()
+//         .map(|(i, s)| (s.to_string(), num_base_tokens + i as Rank))
+//         .collect();
+//
+//     let encoder = BytePairEncoder::new(mergeable_ranks, special_tokens_encoder, pattern);
+//     // [9906, 11, 856, 5679, 374, 19369]
+//     // encode text
+//     //let text = "Hello, my dog is cute";
+//     //let tokens = encoder.encode_with_special_tokens(text);
+//     //println!("Encoded tokens: {:?}", tokens);
+//
+//     Ok(encoder)
+// }

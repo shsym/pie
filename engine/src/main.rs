@@ -25,7 +25,7 @@ use crate::messaging::{PubSub, PushPull};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
 use crate::server::Server;
-use crate::service::Controller;
+use crate::service::{Controller, install_service};
 use clap::{Command, Parser};
 use serde::Deserialize;
 use std::{env, fs};
@@ -219,16 +219,13 @@ async fn start(config: Config) -> anyhow::Result<()> {
     let l4m = L4m::new(dummy_l4m_backend.clone()).await;
     let ping = Ping::new(dummy_ping_backend.clone()).await;
 
-    let ctrl = Controller::new()
-        .add("runtime", runtime)
-        .add("server", server)
-        .add("messaging-inst2inst", messaging_inst2inst)
-        .add("messaging-user2inst", messaging_user2inst)
-        .add("model-test", l4m)
-        .add("ping", ping);
+    install_service("runtime", runtime);
+    install_service("server", server);
+    install_service("messaging-inst2inst", messaging_inst2inst);
+    install_service("messaging-user2inst", messaging_user2inst);
+    install_service("model-test", l4m);
+    install_service("ping", ping);
 
-    // Install all services
-    ctrl.install();
     tracing::info!("Runtime started successfully.");
 
     tokio::signal::ctrl_c().await?;

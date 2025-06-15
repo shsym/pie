@@ -106,6 +106,9 @@ pub enum ClientMessage {
 
     #[serde(rename = "terminate_instance")]
     TerminateInstance { instance_id: String },
+
+    #[serde(rename = "attach_backend")]
+    AttachBackend { endpoint: String, service: String },
 }
 
 /// Messages from server -> client
@@ -344,6 +347,33 @@ impl Client {
                     } => self.handle_signal_instance(instance_id, message).await,
                     ClientMessage::TerminateInstance { instance_id } => {
                         self.handle_terminate_instance(instance_id).await
+                    }
+                    ClientMessage::AttachBackend { endpoint, service } => {
+
+
+
+                        // let service_id = SERVICE_ID_SERVER
+                        //     .get_or_init(|| service::get_service_id(&service).unwrap());
+                        // let (evt_tx, evt_rx) = oneshot::channel();
+                        // runtime::Command::AttachBackend {
+                        //     endpoint,
+                        //     service_id: *service_id,
+                        //     event: evt_tx,
+                        // }
+                        // .dispatch()
+                        // .unwrap();
+                        //
+                        // match evt_rx.await {
+                        //     Ok(_) => {
+                        //         self.send(ServerMessage::ServerEvent {
+                        //             message: format!("Attached to backend service {}", service),
+                        //         })
+                        //         .await;
+                        //     }
+                        //     Err(e) => {
+                        //         eprintln!("Failed to attach backend: {:?}", e);
+                        //     }
+                        // }
                     }
                 },
                 ClientCommand::Internal(cmd) => match cmd {
