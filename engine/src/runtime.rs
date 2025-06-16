@@ -9,6 +9,7 @@ use wasmtime_wasi;
 use crate::instance::{Id as InstanceId, InstanceState};
 use crate::{bindings, l4m, server, service};
 
+use crate::l4m::cleanup_instance;
 use crate::service::{Service, ServiceError};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -348,14 +349,7 @@ impl Runtime {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
 
-            for model in l4m::available_models() {
-                let service_id = service::get_service_id(&model).unwrap();
-                l4m::Command::Destroy {
-                    inst_id: instance_id.clone(),
-                }
-                .dispatch(service_id)
-                .ok();
-            }
+            l4m::cleanup_instance(instance_id.clone());
 
             server::Command::DetachInstance {
                 inst_id: instance_id.clone(),
@@ -539,13 +533,6 @@ impl Runtime {
         }
 
         // force cleanup of the remaining resources
-        for model in l4m::available_models() {
-            let service_id = service::get_service_id(&model).unwrap();
-            l4m::Command::Destroy {
-                inst_id: instance_id.clone(),
-            }
-            .dispatch(service_id)
-            .ok();
-        }
+        cleanup_instance(instance_id);
     }
 }

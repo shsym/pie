@@ -82,7 +82,7 @@ impl ServiceDispatcher {
         if self.get_service_id(name).is_some() {
             return None;
         }
-        
+
         self.channels.push(tx);
         let service_id = self.channels.count() - 1;
 

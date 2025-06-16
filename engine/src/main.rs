@@ -1,9 +1,10 @@
 mod service;
-mod zmq_handler;
 
+mod auth;
 mod backend;
 mod batching;
 mod bindings;
+mod client;
 mod instance;
 mod l4m;
 mod messaging;
@@ -12,24 +13,21 @@ mod ping;
 mod runtime;
 mod server;
 mod tokenizer;
-mod types;
 mod utils;
-mod client;
 
 //
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 
-// use crate::client::{Client, hash_program};
-use crate::l4m::L4m;
+use crate::auth::{create_jwt, init_secret};
 use crate::messaging::{PubSub, PushPull};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
 use crate::server::Server;
 use crate::service::install_service;
+use clap::Parser;
 use serde::Deserialize;
 use std::{env, fs};
-use clap::Parser;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -40,6 +38,10 @@ const DEFAULT_HOST: &str = "127.0.0.1"; // Default host for the server
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
+    /// Path to the TOML configuration file.
+    #[arg(long, help = "Path to a TOML configuration file")]
+    config: Option<PathBuf>,
+
     /// The network host to connect to.
     #[arg(long, help = "Network host")]
     host: Option<String>,
@@ -48,14 +50,16 @@ struct Cli {
     #[arg(short, long, help = "Network port")]
     port: Option<u16>,
 
+    #[arg(long, help = "Whether to use authentication")]
+    enable_auth: bool,
+
+    #[arg(long, help = "Secret for signing JWTs")]
+    auth_secret: Option<String>,
+
     /// The directory for caching data.
     /// Defaults to $PIE_HOME, or $HOME/.cache/pie if not set.
     #[arg(long, help = "Cache directory")]
     cache_dir: Option<PathBuf>,
-
-    /// Path to the TOML configuration file.
-    #[arg(long, help = "Path to a TOML configuration file")]
-    config: Option<PathBuf>,
 
     /// Enable verbose output.
     #[arg(long, action = clap::ArgAction::SetTrue, help = "Enable verbose logging")]
@@ -72,6 +76,8 @@ struct Cli {
 struct ConfigFile {
     host: Option<String>,
     port: Option<u16>,
+    enable_auth: Option<bool>,
+    auth_secret: Option<String>,
     cache_dir: Option<PathBuf>,
     verbose: Option<bool>,
     log: Option<PathBuf>,
@@ -82,6 +88,8 @@ struct ConfigFile {
 struct Config {
     host: String,
     port: u16,
+    enable_auth: bool,
+    auth_secret: String,
     cache_dir: PathBuf,
     verbose: bool,
     log: Option<PathBuf>,
@@ -133,6 +141,11 @@ fn main() -> anyhow::Result<()> {
             .or(file_config.host)
             .unwrap_or_else(|| DEFAULT_HOST.to_string()),
         port: cli.port.or(file_config.port).unwrap_or(DEFAULT_PORT),
+        enable_auth: cli.enable_auth || file_config.enable_auth.unwrap_or(false),
+        auth_secret: cli
+            .auth_secret
+            .or(file_config.auth_secret)
+            .unwrap_or("dummy".to_string()),
         cache_dir: cli
             .cache_dir
             .or(file_config.cache_dir)
@@ -205,27 +218,37 @@ async fn start(config: Config) -> anyhow::Result<()> {
         e
     })?;
 
+    if config.enable_auth {
+        tracing::info!("Authentication is enabled.");
+        init_secret(&config.auth_secret);
+        let token = create_jwt("default", auth::Role::User)?;
+        tracing::info!("Use this token to authenticate: {}", token);
+    } else {
+        tracing::info!("Authentication is disabled.");
+    }
+
     // Set up core services
     let runtime = Runtime::new(&config.cache_dir);
     runtime.load_existing_programs()?;
 
     let server_url = format!("{}:{}", config.host, config.port);
-    let server = Server::new(&server_url);
+
+    let server = Server::new(&server_url, config.enable_auth);
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
 
     // Set up test services
     let dummy_l4m_backend = backend::SimulatedBackend::new(l4m::Simulator::new()).await;
     let dummy_ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
-    let l4m = L4m::new(dummy_l4m_backend.clone()).await;
     let ping = Ping::new(dummy_ping_backend.clone()).await;
 
     install_service("runtime", runtime);
     install_service("server", server);
     install_service("messaging-inst2inst", messaging_inst2inst);
     install_service("messaging-user2inst", messaging_user2inst);
-    install_service("model-test", l4m);
     install_service("ping", ping);
+
+    l4m::attach_new_backend("model-test", dummy_l4m_backend).await;
 
     tracing::info!("Runtime started successfully.");
 

@@ -13,7 +13,8 @@ use std::cmp::{Ordering, PartialEq};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use std::sync::{Arc, RwLock};
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot};
@@ -33,51 +34,73 @@ macro_rules! try_trap {
 const PROTOCOL_BASE: usize = 0;
 const PROTOCOL_VISION: usize = 1;
 
-static AVAILABLE_MODELS: std::sync::LazyLock<RwLock<Vec<String>>> =
-    std::sync::LazyLock::new(|| RwLock::new(Vec::new()));
+static AVAILABLE_MODELS: std::sync::LazyLock<boxcar::Vec<(String, usize)>> =
+    std::sync::LazyLock::new(boxcar::Vec::new);
 
-pub async fn try_attach_new_backend(name: String, endpoint: String) -> Option<usize> {
+pub async fn attach_new_remote_backend(name: &str, endpoint: String) -> Option<()> {
     let backend = match backend::ZmqBackend::bind(&endpoint).await {
         Ok(b) => b,
         Err(_) => return None,
     };
 
     let l4m = L4m::new(backend).await;
-    install_service(&name, l4m)
+    let model_name = l4m.info.model_name.clone();
+
+    if let Some(service_id) = install_service(name, l4m) {
+        AVAILABLE_MODELS.push((model_name, service_id));
+        Some(())
+    } else {
+        None
+    }
 }
 
-// Engine manager endpoint for dynamic model discovery
-
-pub fn set_available_models<T>(models: T)
+pub async fn attach_new_backend<B>(name: &str, backend: B) -> Option<()>
 where
-    T: IntoIterator,
-    T::Item: ToString,
+    B: Backend + 'static,
 {
-    let new_models = models
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<String>>();
+    let l4m = L4m::new(backend).await;
+    let model_name = l4m.info.model_name.clone();
 
-    // Update the static cache with new models
-    if let Ok(mut cached_models) = AVAILABLE_MODELS.write() {
-        *cached_models = new_models;
-        tracing::debug!(
-            "Updated available models cache with {} models",
-            cached_models.len()
-        );
+    if let Some(service_id) = install_service(name, l4m) {
+        AVAILABLE_MODELS.push((model_name, service_id));
+        Some(())
     } else {
-        tracing::warn!("Failed to update available models cache");
+        None
     }
+}
+
+pub async fn gather_stats() -> String {
+    let mut stats = Vec::<Info>::new();
+    for (_, (_, service_id)) in AVAILABLE_MODELS.iter() {
+        let (tx, rx) = oneshot::channel();
+
+        Command::GetInfo { handle: tx }.dispatch(*service_id).ok();
+
+        if let Ok(info) = rx.await {
+            stats.push(info);
+        }
+    }
+    serde_json::to_string(&stats).unwrap_or_else(|_| "Serialization error".to_string())
 }
 
 pub fn available_models() -> Vec<String> {
-    // Read from the cached models
-    if let Ok(cached_models) = AVAILABLE_MODELS.read() {
-        cached_models.clone()
-    } else {
-        tracing::warn!("Failed to read available models cache");
-        vec![]
-    }
+    AVAILABLE_MODELS
+        .iter()
+        .map(|(_, (model_name, _))| model_name.clone())
+        .collect()
+}
+
+pub fn model_service_id(model_name: &str) -> Option<usize> {
+    AVAILABLE_MODELS
+        .iter()
+        .find(|(_, (name, _))| name == model_name)
+        .map(|(_, (_, service_id))| *service_id)
+}
+
+pub fn cleanup_instance(inst_id: InstanceId) {
+    AVAILABLE_MODELS.iter().for_each(|(_, (_, service_id))| {
+        Command::Destroy { inst_id }.dispatch(*service_id).ok();
+    })
 }
 
 mod pb_bindings {
@@ -88,7 +111,7 @@ mod pb_bindings_vision {
     include!(concat!(env!("OUT_DIR"), "/l4m.vision.rs"));
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Info {
     pub version: String,
     pub model_name: String,
@@ -96,6 +119,8 @@ pub struct Info {
     pub num_kv_pages: u32,
     pub num_embeddings: u32,
     pub num_distributions: u32,
+
+    #[serde(skip)]
     pub tokenizer: Arc<BytePairEncoder>,
 }
 
@@ -435,9 +460,6 @@ impl L4m {
             info.num_embeddings,
             info.num_distributions
         );
-
-        // Add the model name to the available models
-        set_available_models([info.model_name.clone()]);
 
         let mut objects = ObjectManager::new();
         objects

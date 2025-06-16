@@ -1,10 +1,10 @@
 use crate::instance::Id as InstanceId;
-use crate::l4m::try_attach_new_backend;
+use crate::l4m::attach_new_remote_backend;
 use crate::messaging::dispatch_u2i;
 use crate::runtime::RuntimeError;
 use crate::service::{Service, ServiceError};
 use crate::utils::IdPool;
-use crate::{messaging, runtime, service};
+use crate::{auth, l4m, messaging, runtime, service};
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -72,6 +72,9 @@ pub enum ServerError {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
+    #[serde(rename = "authenticate")]
+    Authenticate { corr_id: u32, token: String },
+
     #[serde(rename = "query")]
     Query {
         corr_id: u32,
@@ -162,6 +165,7 @@ impl Command {
 }
 
 struct ServerState {
+    enable_auth: bool,
     client_id_pool: Mutex<IdPool<ClientId>>,
     clients: DashMap<ClientId, JoinHandle<()>>,
     instance_chans: DashMap<InstanceId, mpsc::Sender<ClientCommand>>,
@@ -173,8 +177,9 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(addr: &str) -> Self {
+    pub fn new(addr: &str, enable_auth: bool) -> Self {
         let state = Arc::new(ServerState {
+            enable_auth,
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
             instance_chans: DashMap::new(),
@@ -229,6 +234,8 @@ struct InFlightUpload {
 
 struct Client {
     id: ClientId,
+    authenticated: bool,
+
     state: Arc<ServerState>,
 
     inflight_upload: Option<InFlightUpload>,
@@ -248,6 +255,7 @@ enum ClientCommand {
 }
 
 pub const QUERY_PROGRAM_EXISTS: &str = "program_exists";
+pub const QUERY_MODEL_STATUS: &str = "model_status";
 
 impl Client {
     async fn new(id: ClientId, stream: TcpStream, state: Arc<ServerState>) -> Result<Self> {
@@ -299,6 +307,7 @@ impl Client {
 
         Ok(Self {
             id,
+            authenticated: !state.enable_auth,
             state,
             inflight_upload: None,
             inst_owned: Vec::new(),
@@ -314,6 +323,9 @@ impl Client {
         while let Some(cmd) = self.incoming_rx.recv().await {
             match cmd {
                 ClientCommand::FromClient(message) => match message {
+                    ClientMessage::Authenticate { corr_id, token } => {
+                        self.handle_authenticate(corr_id, token).await
+                    }
                     ClientMessage::Query {
                         corr_id,
                         subject,
@@ -414,6 +426,9 @@ impl Client {
     }
 
     async fn handle_detach_instance(&mut self, inst_id: InstanceId, reason: String) {
+        if !self.authenticated {
+            return;
+        }
         self.inst_owned.retain(|&id| id != inst_id);
 
         if let Some(_) = self.state.instance_chans.remove(&inst_id) {
@@ -421,7 +436,23 @@ impl Client {
                 .await;
         }
     }
+
+    async fn handle_authenticate(&mut self, corr_id: u32, token: String) {
+        if let Ok(claims) = auth::validate_jwt(&token) {
+            self.authenticated = true;
+            self.send_response(corr_id, true, claims.sub).await;
+        } else {
+            self.send_response(corr_id, false, "Invalid token".to_string())
+                .await;
+        }
+    }
+
     async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
+        if !self.authenticated {
+            self.send_response(corr_id, false, "Not authenticated".to_string())
+                .await;
+        }
+
         match subject.as_str() {
             QUERY_PROGRAM_EXISTS => {
                 let (evt_tx, evt_rx) = oneshot::channel();
@@ -435,6 +466,12 @@ impl Client {
 
                 let exists = evt_rx.await.unwrap();
                 self.send_response(corr_id, true, exists.to_string()).await;
+            }
+            QUERY_MODEL_STATUS => {
+                // gather model status from all attached backends
+                let l4m_stats = l4m::gather_stats().await;
+
+                self.send_response(corr_id, true, l4m_stats).await;
             }
             _ => {
                 println!("Unknown query subject: {}", subject);
@@ -450,6 +487,11 @@ impl Client {
         total_chunks: usize,
         mut chunk_data: Vec<u8>,
     ) {
+        if !self.authenticated {
+            self.send_response(corr_id, false, "Not authenticated".to_string())
+                .await;
+        }
+
         if self.inflight_upload.is_none() {
             self.inflight_upload = Some(InFlightUpload {
                 program_hash: program_hash.clone(),
@@ -512,6 +554,11 @@ impl Client {
     }
 
     async fn handle_launch_instance(&mut self, corr_id: u32, program_hash: String) {
+        if !self.authenticated {
+            self.send_response(corr_id, false, "Not authenticated".to_string())
+                .await;
+        }
+
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchInstance {
             program_hash: program_hash.clone(),
@@ -543,6 +590,11 @@ impl Client {
         port: u32,
         program_hash: String,
     ) {
+        if !self.authenticated {
+            self.send_response(corr_id, false, "Not authenticated".to_string())
+                .await;
+        }
+
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchServerInstance {
             program_hash: program_hash.clone(),
@@ -564,6 +616,9 @@ impl Client {
     }
 
     async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
+        if !self.authenticated {
+            return;
+        }
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.inst_owned.contains(&inst_id) {
                 dispatch_u2i(messaging::PushPullCommand::Push {
@@ -575,6 +630,9 @@ impl Client {
     }
 
     async fn handle_terminate_instance(&mut self, instance_id: String) {
+        if !self.authenticated {
+            return;
+        }
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.inst_owned.contains(&inst_id) {
                 runtime::trap(inst_id, "user terminated the program");
@@ -589,9 +647,13 @@ impl Client {
         service_type: String,
         service_name: String,
     ) {
+        if !self.authenticated {
+            self.send_response(corr_id, false, "Not authenticated".to_string())
+                .await;
+        }
         match service_type.as_str() {
             "l4m" => {
-                if try_attach_new_backend(service_name, endpoint)
+                if attach_new_remote_backend(&service_name, endpoint)
                     .await
                     .is_some()
                 {

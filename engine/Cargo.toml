@@ -39,6 +39,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 dirs = "6.0"
 boxcar = "0.2.13"
+jsonwebtoken = "9.3.1"
+chrono = { version = "0.4", features = ["serde"] }
+
 
 [build-dependencies]
 prost-build = "0.14.0"
