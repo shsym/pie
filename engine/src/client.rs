@@ -188,31 +188,64 @@ impl Client {
     }
 
     /// Helper: sends a serialized msgpack message to the server.
-    fn send_msg(&self, msg: &ClientMessage) -> Result<()> {
-        let encoded = encode::to_vec_named(msg)?; // rmp-serde encoding
+    fn send_msg(&self, msg: ClientMessage) -> Result<()> {
+        let encoded = encode::to_vec_named(&msg)?; // rmp-serde encoding
         self.ws_writer_tx.send(Message::Binary(encoded.into()))?;
         Ok(())
+    }
+
+    async fn send_msg_and_wait(&mut self, mut msg: ClientMessage) -> Result<(bool, String)> {
+        let corr_id_new = self.corr_id_pool.acquire()?;
+
+        match &mut msg {
+            ClientMessage::Authenticate { corr_id, .. }
+            | ClientMessage::Query { corr_id, .. }
+            | ClientMessage::UploadProgram { corr_id, .. }
+            | ClientMessage::LaunchInstance { corr_id, .. }
+            | ClientMessage::LaunchServerInstance { corr_id, .. } => *corr_id = corr_id_new,
+            _ => {
+                anyhow::bail!("Invalid message type for sending and waiting");
+            }
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_requests.insert(corr_id_new, tx);
+
+        self.send_msg(msg)?;
+
+        let (successful, result) = rx.await?;
+
+        // release the corr_id
+        self.corr_id_pool.release(corr_id_new)?;
+
+        Ok((successful, result))
+    }
+
+    pub async fn authenticate(&mut self, token: &str) -> Result<()> {
+        let msg = ClientMessage::Authenticate {
+            corr_id: 0,
+            token: token.to_string(),
+        };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+
+        if successful {
+            Ok(())
+        } else {
+            anyhow::bail!("Authentication failed: {}", result);
+        }
     }
 
     pub async fn query<T>(&mut self, subject: T, record: String) -> Result<String>
     where
         T: ToString,
     {
-        let (tx, rx) = oneshot::channel();
-        let corr_id = self.corr_id_pool.acquire()?;
-        self.pending_requests.insert(corr_id, tx);
-
         let msg = ClientMessage::Query {
-            corr_id,
+            corr_id: 0,
             subject: subject.to_string(),
             record,
         };
-        self.send_msg(&msg)?;
 
-        let (successful, result) = rx.await?;
-
-        // release the corr_id
-        self.corr_id_pool.release(corr_id)?;
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
 
         if successful {
             Ok(result)
@@ -253,7 +286,7 @@ impl Client {
                 total_chunks,
                 chunk_data: Vec::from(chunk_data),
             };
-            self.send_msg(&msg)?;
+            self.send_msg(msg)?;
 
             chunk_index += 1;
         }
@@ -270,20 +303,13 @@ impl Client {
     }
 
     pub async fn launch_instance(&mut self, program_hash: &str) -> Result<Instance> {
-        let (tx, rx) = oneshot::channel();
-        let corr_id = self.corr_id_pool.acquire()?;
-        self.pending_requests.insert(corr_id, tx);
-
         let msg = ClientMessage::LaunchInstance {
-            corr_id,
+            corr_id: 0,
             program_hash: program_hash.to_string(),
         };
-        self.send_msg(&msg)?;
 
-        let (successful, result) = rx.await?;
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
 
-        // release the corr_id
-        self.corr_id_pool.release(corr_id)?;
         if successful {
             let inst_id = Uuid::parse_str(&result)?;
 
@@ -303,21 +329,14 @@ impl Client {
     }
 
     pub async fn launch_server_instance(&mut self, program_hash: &str, port: u32) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        let corr_id = self.corr_id_pool.acquire()?;
-        self.pending_requests.insert(corr_id, tx);
-
         let msg = ClientMessage::LaunchServerInstance {
-            corr_id,
+            corr_id: 0,
             port,
             program_hash: program_hash.to_string(),
         };
-        self.send_msg(&msg)?;
 
-        let (successful, result) = rx.await?;
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
 
-        // release the corr_id
-        self.corr_id_pool.release(corr_id)?;
         if successful {
             Ok(())
         } else {

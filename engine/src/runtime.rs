@@ -3,7 +3,10 @@ use hyper::server::conn::http1;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
-use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
+use wasmtime::{
+    Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store,
+    component::Component, component::Linker,
+};
 use wasmtime_wasi;
 
 use crate::instance::{Id as InstanceId, InstanceState};
@@ -218,6 +221,13 @@ impl Runtime {
         // Configure Wasmtime engine
         let mut config = Config::default();
         config.async_support(true);
+
+        let mut pooling_config = PoolingAllocationConfig::default();
+
+        // TODO: Adjust settings later: https://docs.wasmtime.dev/api/wasmtime/struct.PoolingAllocationConfig.html
+
+        config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
+
         let engine = Engine::new(&config).unwrap();
 
         let mut linker = Linker::<InstanceState>::new(&engine);

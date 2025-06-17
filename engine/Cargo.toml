@@ -12,7 +12,7 @@ anyhow = "1.0.95"
 blake3 = "1.8.2"
 tokio = { version = "1.45.1", features = ["full"] } # ["full", "tracing"]
 tokio-tungstenite = "0.27.0"
-wasmtime = "33.0.0" #{ path = "../../wasmtime/crates/wasmtime" }
+wasmtime = { version = "33.0.0", features = ["pooling-allocator"] } #{ path = "../../wasmtime/crates/wasmtime" }
 wasmtime-wasi = "33.0.0"# { path = "../../wasmtime/crates/wasi" }
 wasmtime-wasi-http = "33.0.0" #{ path = "../../wasmtime/crates/wasi-http" }
 zeromq = "0.4.1"
