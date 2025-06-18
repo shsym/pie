@@ -49,8 +49,6 @@ EMPTY_BLOCK = Block(
 Embed = Union[TextEmbed, ImageEmbed]
 
 
-
-
 class Driver:
     embeds: dict[int, Embed]
     blocks: dict[int, Block]

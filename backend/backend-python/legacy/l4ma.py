@@ -1,17 +1,13 @@
 # Llama-Like Large Language Model Architecture (L4MA)
 from __future__ import annotations
 
+import math
 
 import torch
 from torch import nn
 
 import flashinfer as ops
 from config import NUM_TOKENS_IN_BLOCK
-
-from transformers import LlamaConfig
-from transformers.modeling_utils import PreTrainedModel
-
-
 class L4maMlp(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -67,15 +63,16 @@ class L4maAttention(nn.Module):
         key_states = key_states.view(nnz, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(nnz, self.num_key_value_heads, self.head_dim)
 
-        # print(position_ids)
+        #print(position_ids)
         ops.apply_llama31_rope_pos_ids_inplace(q=query_states, k=key_states, pos_ids=position_ids)
 
+        
         batch_indices, positions = ops.get_batch_indices_positions(
             qo_indptr,
             ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, NUM_TOKENS_IN_BLOCK),
             nnz
         )
-
+        
         ops.append_paged_kv_cache(
             key_states,
             value_states,
@@ -174,11 +171,11 @@ class L4maModel(nn.Module):
             kv_last_page_lens: torch.Tensor,
             qo_indptr: torch.Tensor,
             custom_mask: torch.Tensor,
-            single_token_inference_mode: bool = False,
+            single_token_inference_mode: bool=False,
     ) -> torch.Tensor:
         # attention_mask = proc_mask(attention_mask, batch.dtype())
         hidden_states = input_embeds
-
+        
         # check if its decoding (qo_indptr is )
         if single_token_inference_mode:
             self.wrapper_decode.plan(
@@ -194,7 +191,7 @@ class L4maModel(nn.Module):
             )
             wrapper = self.wrapper_decode
         else:
-
+            
             self.wrapper_append.plan(
                 qo_indptr=qo_indptr,
                 paged_kv_indptr=kv_page_indptr,
@@ -208,6 +205,7 @@ class L4maModel(nn.Module):
                 q_data_type=torch.bfloat16
             )
             wrapper = self.wrapper_append
+  
 
         for decoder_layer in self.layers:
             layer_outputs = decoder_layer(
@@ -226,27 +224,3 @@ class L4maModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states
-
-
-class LlamaForCausalLM(PreTrainedModel):
-    config_class = LlamaConfig
-
-    def __init__(self, config):
-        config.use_qkv_bias = False
-
-        super().__init__(config)
-        self.model = L4maModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings

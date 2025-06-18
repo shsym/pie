@@ -7,7 +7,6 @@ use wasmtime::{
     Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store,
     component::Component, component::Linker,
 };
-use wasmtime_wasi;
 
 use crate::instance::{Id as InstanceId, InstanceState};
 use crate::{bindings, l4m, server, service};
