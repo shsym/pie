@@ -15,23 +15,26 @@ import handshake_pb2
 import l4m_pb2
 import l4m_vision_pb2
 import ping_pb2
-from config import MAX_NUM_PAGES, MAX_NUM_EMBEDS, VERSION, NUM_TOKENS_IN_BLOCK
+from config import parse_model_metadata
 from driver import Driver
-from l4ma import LlamaForCausalLM
+from l4ma import L4maForCausalLM
+import ztensor
+from tqdm import tqdm
 
 
-def run(config: str = None,
-        host: str = 'localhost',
-        port: int = 9123,
-        auth_token: str = None,
-        model: str = None,
-        cache_dir: str = None,
-        kv_page_size: int = 32,
-        dist_size: int = 32,
-        max_num_kv_pages: int = 1000,
-        max_num_embeds: int = 50000,
-        device: str = 'cuda:0',
-        dtype: str = 'bfloat16'):
+def main(config: str = None,
+         host: str = 'localhost',
+         port: int = 9123,
+         auth_token: str = None,
+         model: str = None,
+         version: str = None,
+         cache_dir: str = None,
+         kv_page_size: int = 32,
+         dist_size: int = 32,
+         max_num_kv_pages: int = 1000,
+         max_num_embeds: int = 50000,
+         device: str = 'cuda:0',
+         dtype: str = 'bfloat16'):
     """
     Runs the application with the specified configuration.
 
@@ -41,6 +44,7 @@ def run(config: str = None,
         port (int, optional): The port number. Defaults to 9123.
         auth_token (str, optional): The authentication token. Defaults to None.
         model (str, optional): The model to use. Defaults to None.
+        version (str, optional): The version of the model. Defaults to None.
         cache_dir (str, optional): The directory for caching. Defaults to a system-appropriate cache directory.
         kv_page_size (int, optional): The KV page size. Defaults to 32.
         dist_size (int, optional): The distribution size. Defaults to 32.
@@ -65,6 +69,7 @@ def run(config: str = None,
         'port': port if port != 9123 else config_from_file.get('port', 9123),
         'auth_token': auth_token if auth_token is not None else config_from_file.get('auth_token'),
         'model': model if model is not None else config_from_file.get('model'),
+        'version': version if version is not None else config_from_file.get('version', ""),
         'kv_page_size': kv_page_size if kv_page_size != 32 else config_from_file.get('kv_page_size', 32),
         'dist_size': dist_size if dist_size != 32 else config_from_file.get('dist_size', 32),
         'max_num_kv_pages': max_num_kv_pages if max_num_kv_pages != 1000 else config_from_file.get('max_num_kv_pages', 1000),
@@ -88,6 +93,111 @@ def run(config: str = None,
         print(f"{key}: {value}")
     print("---------------------------")
 
+    start_server(final_config)
+
+
+def start_server(config: dict):
+    model_name = config.get('model')
+    if not model_name:
+        raise ValueError("Model name must be specified in config or arguments.")
+
+    cache_dir = config.get('cache_dir')
+
+    # Define the path to the model directory and metadata file
+    model_path = os.path.join(cache_dir, model_name)
+    metadata_path = os.path.join(model_path, f"{model_name}-{config.get('version', '')}.toml")
+
+    # Read the metadata file
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"Metadata file not found at: {metadata_path}")
+
+    metadata = parse_model_metadata(metadata_path)
+
+    print(f"Loading model structure for '{model_name}'...")
+    # Load the model with the specified dtype, but without weights initially.
+    # This avoids allocating memory for random weights.
+
+    metadata.architecture.device = config.get('device', 'cuda:0')
+    metadata.architecture.dtype = getattr(torch, config.get('dtype', 'bfloat16'))
+
+    model = L4maForCausalLM(metadata.architecture)
+
+    # Get all tensor names that the model expects
+    model_state_keys = set(model.state_dict().keys())
+    loaded_keys = set()
+
+    print(f"Found {len(metadata.parameters)} parameter file(s) to load.")
+
+    try:
+        # Iterate over all parameter files listed in the metadata
+        for param_file in metadata.parameters:
+            weights_path = os.path.join(model_path, param_file)
+            if not os.path.exists(weights_path):
+                print(f"Warning: A specified weights file was not found: {weights_path}. Skipping.")
+                continue
+
+            print(f"Loading weights from ztensor file: {param_file}")
+
+            with ztensor.Reader(weights_path) as reader:
+                # Get tensor names available in the current file
+                tensors_in_file = reader.get_tensor_names()
+
+                # Use tqdm for a progress bar
+                for name in tqdm(tensors_in_file, desc=f"Loading {param_file}", unit="tensors"):
+                    # Check if the tensor is needed by the model and not already loaded
+                    if name in model_state_keys and name not in loaded_keys:
+                        try:
+                            # Read tensor data into a PyTorch tensor
+                            tensor_data_torch = reader.read_tensor(name, to="torch")
+
+                            # Get the target parameter/buffer from the model's state dict
+                            param = model.state_dict()[name]
+
+                            # Check if shapes match before copying
+                            if tensor_data_torch.shape != param.shape:
+                                print(f"    Warning: Shape mismatch for tensor '{name}'. ZT: {tensor_data_torch.shape}, Model: {param.shape}. Skipping.")
+                                continue
+
+                            # Load the data into the model parameter
+                            with torch.no_grad():
+                                param.copy_(tensor_data_torch, non_blocking=True)
+
+                            # Mark this tensor as loaded
+                            loaded_keys.add(name)
+
+                        except ztensor.ZTensorError as e:
+                            print(f"    Warning: Could not read tensor '{name}' from {param_file}. Error: {e}")
+                        except Exception as e:
+                            print(f"    An unexpected error occurred while loading tensor '{name}': {e}")
+
+        # L4ma models often reuse the embed_tokens for the lm_head, so we need to copy it explicitly
+        if "lm_head.weight" in model_state_keys:
+            model.state_dict()["lm_head.weight"].copy_(model.model.embed_tokens.weight, non_blocking=True)
+            loaded_keys.add("lm_head.weight")
+
+        # After trying all files, check if any keys are missing
+        missing_keys = model_state_keys - loaded_keys
+        if missing_keys:
+            print("\nWarning: Some model weights were not found in any parameter file:")
+            for key in sorted(list(missing_keys)):
+                print(f"  - {key}")
+        else:
+            print("\nSuccessfully loaded all expected model weights.")
+
+        # Move the entire model to the specified device
+        model.eval()  # Set the model to evaluation mode
+
+        print("Model loaded and ready")
+        # ---
+        # The rest of the server startup logic (e.g., driver, websocket) would go here.
+        # For this example, we'll just confirm the model is loaded.
+        # driver = Driver(...)
+        # ---
+
+    except ztensor.ZTensorError as e:
+        print(f"Fatal Error: Failed to read a ztensor file. Error: {e}")
+    except Exception as e:
+        print(f"An unexpected fatal error occurred: {e}")
 
 
 def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | None:
@@ -146,7 +256,7 @@ def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | No
 
 
 def start_service(endpoint, model_name, device="cuda:0"):
-    model = LlamaForCausalLM.from_pretrained(
+    model = L4maForCausalLM.from_pretrained(
         model_name,
         torch_dtype="bfloat16",
         device_map=device,
@@ -265,50 +375,51 @@ def start_service(endpoint, model_name, device="cuda:0"):
         idle_start = time.time()
 
 
-# Example usage
-async def main():
-    controller_host = "127.0.0.1"
-    controller_port = 8080
-
-    endpoint = ""
-
-    if controller_host == "127.0.1" or controller_host == "localhost":
-        endpoint = "ipc:///tmp/pie-ipc-test"
-
-    else:
-        endpoint = "tcp://*:8080"
-
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    start_service(endpoint, model_name)
-
-    return
-    # Notify the controller.
-    auth_token = "<PASSWORD>"
-    async with connect(f"ws://{controller_host}:{controller_port}") as websocket:
-
-        # do authentication
-        await websocket.send(msgpack.packb({
-            "type": "authenticate",
-            "corr_id": 0,
-            "token": auth_token,
-        }, use_bin_type=True))
-
-        message = msgpack.unpackb(await websocket.recv(), raw=False)
-        print(message)
-
-        await websocket.send(msgpack.packb({
-            "type": "attach_remote_service",
-            "corr_id": 0,
-            "endpoint": endpoint,
-            "service_name": "example_service",
-            "service_type": "l4m",
-        }, use_bin_type=True))
-
-        # register a remote backend
-
-        await websocket.close()
+#
+# # Example usage
+# async def main():
+#     controller_host = "127.0.0.1"
+#     controller_port = 8080
+#
+#     endpoint = ""
+#
+#     if controller_host == "127.0.1" or controller_host == "localhost":
+#         endpoint = "ipc:///tmp/pie-ipc-test"
+#
+#     else:
+#         endpoint = "tcp://*:8080"
+#
+#     model_name = "meta-llama/Llama-3.2-1B-Instruct"
+#     start_service(endpoint, model_name)
+#
+#     return
+#     # Notify the controller.
+#     auth_token = "<PASSWORD>"
+#     async with connect(f"ws://{controller_host}:{controller_port}") as websocket:
+#
+#         # do authentication
+#         await websocket.send(msgpack.packb({
+#             "type": "authenticate",
+#             "corr_id": 0,
+#             "token": auth_token,
+#         }, use_bin_type=True))
+#
+#         message = msgpack.unpackb(await websocket.recv(), raw=False)
+#         print(message)
+#
+#         await websocket.send(msgpack.packb({
+#             "type": "attach_remote_service",
+#             "corr_id": 0,
+#             "endpoint": endpoint,
+#             "service_name": "example_service",
+#             "service_type": "l4m",
+#         }, use_bin_type=True))
+#
+#         # register a remote backend
+#
+#         await websocket.close()
 
 
 if __name__ == "__main__":
-    fire.Fire(run)
-    #asyncio.run(main())
+    fire.Fire(main)
+    # asyncio.run(main())

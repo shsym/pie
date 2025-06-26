@@ -253,7 +253,7 @@ async fn start(config: Config) -> anyhow::Result<()> {
 
     tracing::info!("Runtime started successfully.");
 
-    spawn_client("helloworld".to_string()).await?;
+    spawn_client("simple_decoding".to_string()).await?;
 
     tokio::signal::ctrl_c().await?;
     tracing::info!("Ctrl+C received, shutting down.");

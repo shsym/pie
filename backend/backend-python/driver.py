@@ -10,7 +10,12 @@ from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlo
     ObjectKind, SampleTopKResponse, BatchFillBlock
 
 from l4m_vision_pb2 import BatchEmbedImage
-from config import NUM_TOKENS_IN_BLOCK
+# Constants
+NUM_TOKENS_IN_BLOCK = 16
+DIST_RESOLUTION = 32
+
+MAX_NUM_PAGES = 1800
+MAX_NUM_EMBEDS = 50000
 
 class VectorStorage:
     def __init__(self, num_vectors: int, embed_dim: int, device: str, dtype=torch.bfloat16):
