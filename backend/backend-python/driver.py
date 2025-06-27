@@ -11,8 +11,6 @@ from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlo
 from l4m_vision_pb2 import BatchEmbedImage
 
 
-
-
 @dataclass
 class TextEmbed:
     token_id: int
@@ -64,7 +62,7 @@ class Driver:
 
         self.embed_storage_p1 = torch.empty((max_num_embeds, dist_size), device=device, dtype=dtype)
 
-        self.embed_storage_p2 = torch.empty((max_num_embeds, dist_size), device=device, dtype=dtype)
+        self.embed_storage_p2 = torch.empty((max_num_embeds, dist_size), device=device, dtype=torch.int32)
 
         # self.dist_storage = dist_storage
 
@@ -141,11 +139,11 @@ class Driver:
             # Get the stored logits/probabilities and token IDs
             topk_probs = self.embed_storage_p1[cmd.distribution_id].tolist()
             topk_tokens = self.embed_storage_p2[cmd.distribution_id].tolist()
-
-            # Limit to k requested tokens if needed
-            if cmd.k > 0 and cmd.k < len(topk_tokens):
-                topk_tokens = topk_tokens[:cmd.k]
-                topk_probs = topk_probs[:cmd.k]
+            #
+            # # Limit to k requested tokens if needed
+            # if cmd.k > 0 and cmd.k < len(topk_tokens):
+            #     topk_tokens = topk_tokens[:cmd.k]
+            #     topk_probs = topk_probs[:cmd.k]
 
             res.append(SampleTopKResponse(token_ids=topk_tokens, probabilities=topk_probs))
 
@@ -206,24 +204,7 @@ class Driver:
                 tgt_block_idx = token_offset // self.kv_page_size
                 tgt_block_offset = token_offset % self.kv_page_size
 
-                # print(f"Debug - Token {i}: ID={input_embeds[i]}, token_offset={token_offset}, tgt_block_idx={tgt_block_idx}, tgt_block_offset={tgt_block_offset}")
-
-                # Safety check to avoid index errors
-                if tgt_block_idx >= len(ctx_block_ids):
-                    print(f"ERROR: Block index {tgt_block_idx} out of range for ctx_block_ids with length {len(ctx_block_ids)}")
-                    print(f"INFO: This usually means last_block_len is set incorrectly or context_block_ids is incomplete")
-                    print(f"INFO: total_ctx_tokens={total_ctx_tokens}, len(input_embeds)={len(input_embeds)}")
-
-                    # Fall back to using the last available context block
-                    tgt_block_idx = len(ctx_block_ids) - 1
-                    print(f"FALLBACK: Using last available block index {tgt_block_idx} instead")
-
                 tgt_block_id = ctx_block_ids[tgt_block_idx]
-
-                if tgt_block_id not in self.blocks:
-                    print(f"ERROR: Block with ID {tgt_block_id} not found in allocated blocks")
-                    print(f"INFO: Available block IDs: {list(self.blocks.keys())}")
-                    continue
 
                 tgt_block = self.blocks[tgt_block_id]
 
@@ -299,23 +280,6 @@ class Driver:
 
             # precompute the dists
             logits = self.lm.lm_head(output_embeds)
-
-            for i, token_map in enumerate(output_embed_postproc):
-                vec_id = token_map["vec_id"]
-                idx = token_map["idx"]
-
-                if idx < logits.shape[0]:
-                    pos_logits = logits[idx]  # Logits for this OUTPUT position
-                    top_5_values, top_5_indices = torch.topk(pos_logits, k=5)
-
-                    print(f"  Output {i} (vec_id={vec_id}, logit_idx={idx}):")
-                    print(f"    Shape: {pos_logits.shape}")
-                    print(f"    Min: {pos_logits.min().item():.4f}")
-                    print(f"    Max: {pos_logits.max().item():.4f}")
-                    print(f"    Mean: {pos_logits.mean().item():.4f}")
-                    print(f"    Top 5 token IDs: {top_5_indices.tolist()}")
-                    print(f"    Top 5 values: {top_5_values.tolist()}")
-
             # topk
             condensed = torch.topk(logits, k=self.dist_size, sorted=True)
 

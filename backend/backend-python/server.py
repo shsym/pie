@@ -342,8 +342,6 @@ def run_zmq_server(router, engine, config, model_metadata):
                     command = request.WhichOneof("command")
                     response = None
 
-                    print(command)
-
                     if command == "allocate":
                         engine.allocate(request.allocate)
                     elif command == "deallocate":
