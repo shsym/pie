@@ -452,7 +452,7 @@ impl L4m {
         let info = info_rx.await.unwrap();
 
         tracing::info!(
-            "New L4m service started: version={}, model_name={}, kv_page_size={}, num_kv_pages={}, num_embeddings={}, num_distributions={}",
+            "L4m service started: version={}, model_name={}, kv_page_size={}, num_kv_pages={}, num_embeddings={}, num_distributions={}",
             info.version,
             info.model_name,
             info.kv_page_size,

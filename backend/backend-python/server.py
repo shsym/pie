@@ -1,5 +1,4 @@
 import random
-
 import msgpack
 import torch
 from websockets.sync.client import connect
@@ -19,6 +18,7 @@ from driver import Driver
 from l4ma import L4maForCausalLM
 import ztensor
 from tqdm import tqdm
+import threading  # Import the threading module
 
 
 def main(config: str = None,
@@ -199,14 +199,18 @@ def load_model(config: dict):
         print(f"An unexpected fatal error occurred: {e}")
 
 
+
 def start_service(config, model, model_metadata):
-    if config.get("controller_host") == "127.0.0.1" or config.get("controller_host") == "localhost":
+    """
+    Initializes and starts the service, including the ZMQ server and registration threads.
+    """
+    if config.get("controller_host") in ["127.0.0.1", "localhost"]:
         unique_id = random.randint(1000, 9999)
         endpoint = f"ipc:///tmp/pie-service-{unique_id}"
         real_endpoint = endpoint
     else:
-        endpoint = f"tcp://{config.get("host")}:{config.get("port")}"
-        real_endpoint = f"tcp://*:{config.get("port")}"
+        endpoint = f"tcp://{config.get('host')}:{config.get('port')}"
+        real_endpoint = f"tcp://*:{config.get('port')}"
 
     engine = Driver(model=model,
                     kv_page_size=config.get("kv_page_size"),
@@ -222,166 +226,44 @@ def start_service(config, model, model_metadata):
 
     print(f"Server listening on {endpoint}")
 
-    connected_clients = {}
-    protocols = ["l4m", "l4m-vision", "ping"]
+    # Create and start the ZMQ server thread
+    zmq_thread = threading.Thread(
+        target=run_zmq_server,
+        args=(router, engine, config, model_metadata),
+        daemon=True  # Daemonize thread to exit when the main thread exits
+    )
+    zmq_thread.start()
 
-    register(config, endpoint)
+    # Create and start the registration thread
+    register_thread = threading.Thread(
+        target=register,
+        args=(config, endpoint),
+        daemon=True
+    )
+    register_thread.start()
 
-    while True:
-        # ROUTER sockets receive multipart messages.
-        # Expected format: [client_identity, empty_frame, payload]
-
-        frames = router.recv_multipart()
-        # print(f"Idle time: {(time.time() - idle_start) * 1000}ms")
-
-        client_identity = frames[0]
-        start = time.time()
-
-        # print("received", frames)
-
-        # Check if an empty frame is present. If so, payload is at index 2.
-
-        # check if the client has already a protocol
-        if client_identity in connected_clients:
-
-            if len(frames) != 3:
-                print("Invalid message format.")
-                # send an error message back to the client
-                continue
-
-            protocol_raw = frames[1]  # should be a single byte
-            protocol_idx = int.from_bytes(protocol_raw, byteorder="little")
-
-            if protocol_idx >= len(protocols):
-                print("Invalid protocol:", protocol_idx)
-                # send an error message back to the client
-                continue
-
-            protocol = protocols[protocol_idx]
-            payload = frames[2]
-
-            if protocol == "l4m":
-                # Deserialize the protobuf message
-
-                request = l4m_pb2.Request()
-                request.ParseFromString(payload)
-
-                # handle the request
-                # response = handle_request(engine, request)
-
-                command = request.WhichOneof("command")
-                response = None
-
-                if command == "allocate":
-                    engine.allocate(request.allocate)
-
-                elif command == "deallocate":
-                    engine.deallocate(request.deallocate)
-
-                elif command == "embed_text":
-                    engine.embed_text(request.embed_text)
-
-                elif command == "fill_block":
-                    engine.fill_block(request.fill_block)
-
-                elif command == "mask_block":
-                    engine.mask_block(request.mask_block)
-
-                elif command == "copy_block":
-                    engine.copy_block(request.copy_block)
-
-                elif command == "decode_token_distribution":
-                    engine.decode_token_distribution(request.decode_token_distribution)
-
-                elif command == "sample_top_k_request":
-                    res = engine.sample_top_k_request(request.sample_top_k_request)
-                    response = l4m_pb2.Response(correlation_id=request.correlation_id, sample_top_k=res)
-
-                elif command == "get_info":
-
-                    print("Getting info from the engine.")
-                    response = l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
-                        version="0.1",
-                        model_name=f"{config.get("model")}-{config.get("version", "")}",
-                        kv_page_size=config.get("kv_page_size"),
-                        num_available_kv_pages=config.get("max_num_kv_pages"),
-                        num_available_embeddings=config.get("max_num_embeds"),
-                        num_available_distributions=0,
-                        tokenizer=l4m_pb2.Tokenizer(
-                            merge_table=model_metadata.tokenizer.merge_table,
-                            special_tokens=model_metadata.tokenizer.special_tokens,
-                            split_regex=model_metadata.tokenizer.split_regex,
-                        )
-                    ))
-
-                else:
-                    print("No valid command found in request.")
-
-                if response is not None:
-                    reply_payload = response.SerializeToString()
-
-                    # print("Sending reply back to the client.")
-                    # Send reply back to the client.
-                    # Include the client identity and an empty frame to maintain the envelope.
-                    router.send_multipart([client_identity, protocol_raw, reply_payload])
-
-                # print(f"elapsed time: {(time.time() - start) * 1000}ms")
+    # Keep the main thread alive to allow daemon threads to run, and handle shutdown
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down server...")
+    finally:
+        # Cleanly close ZMQ resources
+        router.close()
+        context.term()
+        print("Server shutdown complete.")
 
 
-            elif protocol == "l4m-vision":
-
-                request = l4m_vision_pb2.Request()
-                request.ParseFromString(payload)
-
-            elif protocol == "ping":
-
-                ping = ping_pb2.Ping()
-                ping.ParseFromString(payload)
-
-                pong = ping_pb2.Pong(
-                    correlation_id=ping.correlation_id,
-                    message="Pong:" + ping.message
-                ).SerializeToString()
-
-                router.send_multipart([client_identity, protocol_raw, pong])
-
-        else:
-            # do a handshake
-            payload = frames[1]
-
-            try:
-                # Deserialize the protobuf message
-                hs = handshake_pb2.Request()
-                hs.ParseFromString(payload)
-
-            except:
-                print("Invalid handshake message.")
-                # send an error message back to the client
-                router.send_multipart([client_identity, b"\x00"])
-                continue
-
-            # send available protocols to the client
-            response = handshake_pb2.Response(protocols=protocols)
-
-            # Serialize the response
-            payload = response.SerializeToString()
-
-            connected_clients.update({client_identity: True})
-
-            # send the response back to the client
-            router.send_multipart([client_identity, payload])
-
-        idle_start = time.time()
-
-
-# Example usage
 def register(config, endpoint):
+    """
+    Registers the service with the controller. Runs in a separate thread.
+    """
     # Notify the controller.
-
     try:
         auth_token = config.get("auth_token")
-        with connect(f"ws://{config.get("controller_host")}:{config.get("controller_port")}") as websocket:
-            # do authentication
+        with connect(f"ws://{config.get('controller_host')}:{config.get('controller_port')}") as websocket:
+            # Do authentication
             websocket.send(msgpack.packb({
                 "type": "authenticate",
                 "corr_id": 0,
@@ -390,10 +272,11 @@ def register(config, endpoint):
 
             message = msgpack.unpackb(websocket.recv(), raw=False)
 
-            if message.get("successful") is not True:
-                print(f"Authentication failed: {message.get("result", "Unknown error")}")
+            if not message.get("successful"):
+                print(f"Authentication failed: {message.get('result', 'Unknown error')}")
                 exit(1)
 
+            # Register the service
             websocket.send(msgpack.packb({
                 "type": "attach_remote_service",
                 "corr_id": 0,
@@ -402,13 +285,137 @@ def register(config, endpoint):
                 "service_type": "l4m",
             }, use_bin_type=True))
 
-            # websocket.close()
-            print(f"Registered with the controller at {config.get("controller_host")}:{config.get("controller_port")}")
+            message = msgpack.unpackb(websocket.recv(), raw=False)
+            if not message.get("successful"):
+                print(f"Controller could not attack the backend: {message.get('result', 'Unknown error')}")
+                exit(1)
 
+            print(f"Registered with the controller at {config.get('controller_host')}:{config.get('controller_port')}")
+
+    except ConnectionRefusedError:
+        print(f"Failed to connect to the controller at {config.get('controller_host')}:{config.get('controller_port')}.")
+        print("Please ensure the controller is running and accessible.")
     except Exception as e:
-        print(f"Failed to register with the controller at {config.get("controller_host")}:{config.get("controller_port")}: {e}")
-        print("Make sure the controller is running and reachable.")
-        exit(1)
+        print(f"An error occurred during registration: {e}")
+
+
+def run_zmq_server(router, engine, config, model_metadata):
+    """
+    This function runs the ZMQ server loop in a dedicated thread.
+    It listens for incoming client requests and processes them.
+    """
+    connected_clients = {}
+    protocols = ["l4m", "l4m-vision", "ping"]
+    idle_start = time.time()
+
+    while True:
+        try:
+            # ROUTER sockets receive multipart messages.
+            # Expected format: [client_identity, empty_frame, payload]
+            frames = router.recv_multipart()
+            # print(f"Idle time: {(time.time() - idle_start) * 1000}ms")
+
+            client_identity = frames[0]
+            start = time.time()
+
+            # print("received", frames)
+
+            # Check if the client has already established a protocol
+            if client_identity in connected_clients:
+                if len(frames) != 3:
+                    print("Invalid message format.")
+                    continue
+
+                protocol_raw = frames[1]  # Should be a single byte
+                protocol_idx = int.from_bytes(protocol_raw, byteorder="little")
+
+                if protocol_idx >= len(protocols):
+                    print("Invalid protocol:", protocol_idx)
+                    continue
+
+                protocol = protocols[protocol_idx]
+                payload = frames[2]
+
+                if protocol == "l4m":
+                    request = l4m_pb2.Request()
+                    request.ParseFromString(payload)
+                    command = request.WhichOneof("command")
+                    response = None
+
+                    if command == "allocate":
+                        engine.allocate(request.allocate)
+                    elif command == "deallocate":
+                        engine.deallocate(request.deallocate)
+                    elif command == "embed_text":
+                        engine.embed_text(request.embed_text)
+                    elif command == "fill_block":
+                        engine.fill_block(request.fill_block)
+                    elif command == "mask_block":
+                        engine.mask_block(request.mask_block)
+                    elif command == "copy_block":
+                        engine.copy_block(request.copy_block)
+                    elif command == "decode_token_distribution":
+                        engine.decode_token_distribution(request.decode_token_distribution)
+                    elif command == "sample_top_k_request":
+                        res = engine.sample_top_k_request(request.sample_top_k_request)
+                        response = l4m_pb2.Response(correlation_id=request.correlation_id, sample_top_k=res)
+                    elif command == "get_info":
+                        print("Getting info from the engine.")
+                        response = l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
+                            version="0.1",
+                            model_name=f"{config.get('model')}-{config.get('version', '')}",
+                            kv_page_size=config.get("kv_page_size"),
+                            num_available_kv_pages=config.get("max_num_kv_pages"),
+                            num_available_embeddings=config.get("max_num_embeds"),
+                            num_available_distributions=0,
+                            tokenizer=l4m_pb2.Tokenizer(
+                                merge_table=model_metadata.tokenizer.merge_table,
+                                special_tokens=model_metadata.tokenizer.special_tokens,
+                                split_regex=model_metadata.tokenizer.split_regex,
+                            )
+                        ))
+                    else:
+                        print("No valid command found in request.")
+
+                    if response is not None:
+                        reply_payload = response.SerializeToString()
+                        router.send_multipart([client_identity, protocol_raw, reply_payload])
+
+                elif protocol == "l4m-vision":
+                    request = l4m_vision_pb2.Request()
+                    request.ParseFromString(payload)
+                elif protocol == "ping":
+                    ping = ping_pb2.Ping()
+                    ping.ParseFromString(payload)
+                    pong = ping_pb2.Pong(
+                        correlation_id=ping.correlation_id,
+                        message="Pong:" + ping.message
+                    ).SerializeToString()
+                    router.send_multipart([client_identity, protocol_raw, pong])
+            else:
+                # Handle handshake for new clients
+                payload = frames[1]
+                try:
+                    hs = handshake_pb2.Request()
+                    hs.ParseFromString(payload)
+                except:
+                    print("Invalid handshake message.")
+                    router.send_multipart([client_identity, b"\x00"])
+                    continue
+
+                response = handshake_pb2.Response(protocols=protocols)
+                payload = response.SerializeToString()
+                connected_clients.update({client_identity: True})
+                router.send_multipart([client_identity, payload])
+
+            idle_start = time.time()
+        except zmq.ZMQError as e:
+            # This can happen if the context is terminated, which is expected on shutdown
+            if e.errno == zmq.ETERM:
+                print("ZMQ server thread exiting.")
+                break
+            else:
+                raise
 
 
 if __name__ == "__main__":

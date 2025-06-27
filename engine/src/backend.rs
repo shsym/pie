@@ -69,7 +69,6 @@ impl ZmqBackend {
             .connect(endpoint)
             .await
             .map_err(|e| BackendError::Zmq(e.to_string()))?;
-        println!("Connected to server at {}", endpoint);
 
         // Perform handshake
         let pb_request = pb_bindings::Request {};
@@ -87,15 +86,8 @@ impl ZmqBackend {
         let response_frame = zmq_response.get(0).ok_or(BackendError::HandshakeFailed)?;
         let pb_response = pb_bindings::Response::decode(response_frame.as_ref());
         let protocols = match pb_response {
-            Ok(resp) => {
-                println!(
-                    "ZMQ backend handshake successful, supported protocols: {:?}",
-                    resp.protocols
-                );
-                resp.protocols
-            }
+            Ok(resp) => resp.protocols,
             Err(_) => {
-                println!("Handshake failed");
                 return Err(BackendError::HandshakeFailed);
             }
         };
