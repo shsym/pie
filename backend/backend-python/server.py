@@ -1,8 +1,8 @@
-import asyncio
+import random
+
 import msgpack
 import torch
-from transformers import AutoTokenizer, LlamaTokenizer
-from websockets.asyncio.client import connect
+from websockets.sync.client import connect
 import zmq
 import time
 import fire
@@ -10,7 +10,6 @@ import os
 import tomli
 from pathlib import Path
 from platformdirs import user_cache_dir
-import math
 import handshake_pb2
 import l4m_pb2
 import l4m_vision_pb2
@@ -24,7 +23,9 @@ from tqdm import tqdm
 
 def main(config: str = None,
          host: str = 'localhost',
-         port: int = 9123,
+         port: int = 10123,
+         controller_host: str = 'localhost',
+         controller_port: int = 9123,
          auth_token: str = None,
          model: str = None,
          version: str = None,
@@ -41,7 +42,9 @@ def main(config: str = None,
     Args:
         config (str, optional): Path to a TOML configuration file.
         host (str, optional): The hostname. Defaults to 'localhost'.
-        port (int, optional): The port number. Defaults to 9123.
+        port (int, optional): The port number. Defaults to 10123.
+        controller_host (str, optional): The controller hostname. Defaults to 'localhost'.
+        controller_port (int, optional): The controller port number. Defaults to 9123.
         auth_token (str, optional): The authentication token. Defaults to None.
         model (str, optional): The model to use. Defaults to None.
         version (str, optional): The version of the model. Defaults to None.
@@ -66,7 +69,9 @@ def main(config: str = None,
     # Prioritize CLI arguments over config file values
     final_config = {
         'host': host if host != 'localhost' else config_from_file.get('host', 'localhost'),
-        'port': port if port != 9123 else config_from_file.get('port', 9123),
+        'port': port if port != 10123 else config_from_file.get('port', 10123),
+        'controller_host': controller_host if controller_host != 'localhost' else config_from_file.get('host', 'localhost'),
+        'controller_port': controller_port if controller_port != 9123 else config_from_file.get('port', 9123),
         'auth_token': auth_token if auth_token is not None else config_from_file.get('auth_token'),
         'model': model if model is not None else config_from_file.get('model'),
         'version': version if version is not None else config_from_file.get('version', ""),
@@ -88,15 +93,17 @@ def main(config: str = None,
     else:
         final_config['cache_dir'] = str(Path(user_cache_dir('pie')))
 
-    print("--- Final Configuration ---")
+    print("--- Configuration ---")
     for key, value in final_config.items():
         print(f"{key}: {value}")
-    print("---------------------------")
+    print("----------------------")
 
-    start_server(final_config)
+    model, model_metadata = load_model(final_config)
+
+    start_service(final_config, model, model_metadata)
 
 
-def start_server(config: dict):
+def load_model(config: dict):
     model_name = config.get('model')
     if not model_name:
         raise ValueError("Model name must be specified in config or arguments.")
@@ -112,10 +119,6 @@ def start_server(config: dict):
         raise FileNotFoundError(f"Metadata file not found at: {metadata_path}")
 
     metadata = parse_model_metadata(metadata_path)
-
-    print(f"Loading model structure for '{model_name}'...")
-    # Load the model with the specified dtype, but without weights initially.
-    # This avoids allocating memory for random weights.
 
     metadata.architecture.device = config.get('device', 'cuda:0')
     metadata.architecture.dtype = getattr(torch, config.get('dtype', 'bfloat16'))
@@ -187,12 +190,8 @@ def start_server(config: dict):
         # Move the entire model to the specified device
         model.eval()  # Set the model to evaluation mode
 
-        print("Model loaded and ready")
-        # ---
-        # The rest of the server startup logic (e.g., driver, websocket) would go here.
-        # For this example, we'll just confirm the model is loaded.
-        # driver = Driver(...)
-        # ---
+        return model, metadata
+
 
     except ztensor.ZTensorError as e:
         print(f"Fatal Error: Failed to read a ztensor file. Error: {e}")
@@ -200,80 +199,32 @@ def start_server(config: dict):
         print(f"An unexpected fatal error occurred: {e}")
 
 
-def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | None:
-    # Determine which command was set in the oneof field "command"
-    command = request.WhichOneof("command")
-
-    # check locks on inputs & outputs
-
-    # no pending computations on input -> do it RN (except for Fills - cannot do them in parallel) & register "pending" status on inputs & outputs.
-    # ...
-    # print("Handling request:", command)
-    if command == "allocate":
-        d.allocate(request.allocate)
-
-    elif command == "deallocate":
-        d.deallocate(request.deallocate)
-
-    elif command == "embed_text":
-        d.embed_text(request.embed_text)
-
-    elif command == "fill_block":
-        d.fill_block(request.fill_block)
-
-    elif command == "mask_block":
-        d.mask_block(request.mask_block)
-
-    elif command == "copy_block":
-        d.copy_block(request.copy_block)
-
-    elif command == "decode_token_distribution":
-        d.decode_token_distribution(request.decode_token_distribution)
-
-    elif command == "sample_top_k_request":
-        res = d.sample_top_k_request(request.sample_top_k_request)
-        return l4m_pb2.Response(correlation_id=request.correlation_id, sample_top_k=res)
-
-    elif command == "get_info":
-        return l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
-            version=VERSION,  # This needs to be defined or passed in
-            model_name=d.model_name_or_path,  # Use the stored model name
-            kv_page_size=NUM_TOKENS_IN_BLOCK,  # This needs to be defined or passed in
-            num_available_kv_pages=d.max_num_pages,
-            num_available_embeddings=d.max_num_embeds,
-            num_available_distributions=0,
-            tokenizer=l4m_pb2.Tokenizer(
-                merge_table=None,
-                special_tokens=None,
-                split_regex=None,
-            )
-        ))
-
+def start_service(config, model, model_metadata):
+    if config.get("controller_host") == "127.0.0.1" or config.get("controller_host") == "localhost":
+        unique_id = random.randint(1000, 9999)
+        endpoint = f"ipc:///tmp/pie-service-{unique_id}"
     else:
-        print("No valid command found in request.")
+        endpoint = f"tcp://{config.get("host")}:{config.get("port")}"
 
-    return None
-
-
-def start_service(endpoint, model_name, device="cuda:0"):
-    model = L4maForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype="bfloat16",
-        device_map=device,
-    )
-
-    engine = Driver(model, MAX_NUM_PAGES, MAX_NUM_EMBEDS, torch.bfloat16, device)
+    engine = Driver(model=model,
+                    kv_page_size=config.get("kv_page_size"),
+                    dist_size=config.get("dist_size"),
+                    max_num_kv_pages=config.get("max_num_kv_pages"),
+                    max_num_embeds=config.get("max_num_embeds"),
+                    dtype=getattr(torch, config.get('dtype', 'bfloat16')),
+                    device=config.get("device"))
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
     router.bind(endpoint)
 
     print(f"Server listening on {endpoint}")
-    tokenizer = AutoTokenizer.from_pretrained(engine.model_name_or_path)
 
     connected_clients = {}
     protocols = ["l4m", "l4m-vision", "ping"]
-    idle_start = time.time()
+
+    register(config, endpoint)
+
     while True:
         # ROUTER sockets receive multipart messages.
         # Expected format: [client_identity, empty_frame, payload]
@@ -314,7 +265,53 @@ def start_service(endpoint, model_name, device="cuda:0"):
                 request.ParseFromString(payload)
 
                 # handle the request
-                response = handle_request(engine, request)
+                # response = handle_request(engine, request)
+
+                command = request.WhichOneof("command")
+                response = None
+
+                if command == "allocate":
+                    engine.allocate(request.allocate)
+
+                elif command == "deallocate":
+                    engine.deallocate(request.deallocate)
+
+                elif command == "embed_text":
+                    engine.embed_text(request.embed_text)
+
+                elif command == "fill_block":
+                    engine.fill_block(request.fill_block)
+
+                elif command == "mask_block":
+                    engine.mask_block(request.mask_block)
+
+                elif command == "copy_block":
+                    engine.copy_block(request.copy_block)
+
+                elif command == "decode_token_distribution":
+                    engine.decode_token_distribution(request.decode_token_distribution)
+
+                elif command == "sample_top_k_request":
+                    res = engine.sample_top_k_request(request.sample_top_k_request)
+                    response = l4m_pb2.Response(correlation_id=request.correlation_id, sample_top_k=res)
+
+                elif command == "get_info":
+                    response = l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
+                        version="0.1",
+                        model_name=f"{config.get("model")}-{config.get("version", "")}",
+                        kv_page_size=config.get("kv_page_size"),
+                        num_available_kv_pages=config.get("max_num_kv_pages"),
+                        num_available_embeddings=config.get("max_num_embeds"),
+                        num_available_distributions=0,
+                        tokenizer=l4m_pb2.Tokenizer(
+                            merge_table=model_metadata.tokenizer.merge_table,
+                            special_tokens=model_metadata.tokenizer.special_tokens,
+                            split_regex=model_metadata.tokenizer.split_regex,
+                        )
+                    ))
+
+                else:
+                    print("No valid command found in request.")
 
                 if response is not None:
                     reply_payload = response.SerializeToString()
@@ -375,51 +372,31 @@ def start_service(endpoint, model_name, device="cuda:0"):
         idle_start = time.time()
 
 
-#
-# # Example usage
-# async def main():
-#     controller_host = "127.0.0.1"
-#     controller_port = 8080
-#
-#     endpoint = ""
-#
-#     if controller_host == "127.0.1" or controller_host == "localhost":
-#         endpoint = "ipc:///tmp/pie-ipc-test"
-#
-#     else:
-#         endpoint = "tcp://*:8080"
-#
-#     model_name = "meta-llama/Llama-3.2-1B-Instruct"
-#     start_service(endpoint, model_name)
-#
-#     return
-#     # Notify the controller.
-#     auth_token = "<PASSWORD>"
-#     async with connect(f"ws://{controller_host}:{controller_port}") as websocket:
-#
-#         # do authentication
-#         await websocket.send(msgpack.packb({
-#             "type": "authenticate",
-#             "corr_id": 0,
-#             "token": auth_token,
-#         }, use_bin_type=True))
-#
-#         message = msgpack.unpackb(await websocket.recv(), raw=False)
-#         print(message)
-#
-#         await websocket.send(msgpack.packb({
-#             "type": "attach_remote_service",
-#             "corr_id": 0,
-#             "endpoint": endpoint,
-#             "service_name": "example_service",
-#             "service_type": "l4m",
-#         }, use_bin_type=True))
-#
-#         # register a remote backend
-#
-#         await websocket.close()
+# Example usage
+def register(config, endpoint):
+    # Notify the controller.
+    auth_token = config.get("auth_token")
+    with connect(f"ws://{config.get("controller_host")}:{config.get("controller_port")}") as websocket:
+        # do authentication
+        websocket.send(msgpack.packb({
+            "type": "authenticate",
+            "corr_id": 0,
+            "token": auth_token,
+        }, use_bin_type=True))
+
+        message = msgpack.unpackb(websocket.recv(), raw=False)
+        print(message)
+
+        websocket.send(msgpack.packb({
+            "type": "attach_remote_service",
+            "corr_id": 0,
+            "endpoint": endpoint,
+            "service_name": "example_service",
+            "service_type": "l4m",
+        }, use_bin_type=True))
+
+        websocket.close()
 
 
 if __name__ == "__main__":
     fire.Fire(main)
-    # asyncio.run(main())

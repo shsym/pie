@@ -5,27 +5,13 @@ from typing import Union
 import numpy as np
 import torch
 
-import config
 from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlock, BatchCopyBlock, BatchDecodeTokenDistribution, BatchSampleTopKRequest, BatchSampleTopKResponse, \
     ObjectKind, SampleTopKResponse, BatchFillBlock
 
 from l4m_vision_pb2 import BatchEmbedImage
-# Constants
-NUM_TOKENS_IN_BLOCK = 16
-DIST_RESOLUTION = 32
 
-MAX_NUM_PAGES = 1800
-MAX_NUM_EMBEDS = 50000
 
-class VectorStorage:
-    def __init__(self, num_vectors: int, embed_dim: int, device: str, dtype=torch.bfloat16):
-        self.ptr = torch.empty((num_vectors, embed_dim), device=device, dtype=dtype)
 
-        self.dtype = dtype
-        self.device = device
-
-        self.num_vectors = num_vectors
-        self.embed_dim = embed_dim
 
 @dataclass
 class TextEmbed:
@@ -45,15 +31,8 @@ class Block:
     occupancy: np.ndarray
 
 
-EMPTY_BLOCK = Block(
-    position_ids=np.array([0] * NUM_TOKENS_IN_BLOCK),
-    occupancy=np.array([False] * NUM_TOKENS_IN_BLOCK)
-)
-
 # union type
 Embed = Union[TextEmbed, ImageEmbed]
-
-
 
 
 class Driver:
@@ -62,44 +41,34 @@ class Driver:
 
     # dist_storage: VectorStorage
 
-    def __init__(self, model, max_num_pages: int, max_num_embeds: int, dtype: torch.dtype, device: str):
+    def __init__(self, model, kv_page_size: int, dist_size: int, max_num_kv_pages: int, max_num_embeds: int, dtype: torch.dtype, device: str):
         self.embeds = {}
         self.blocks = {}
 
         self.lm = model
-        self.model_name_or_path = model.config._name_or_path
-        self.max_num_pages = max_num_pages
+        self.kv_page_size = kv_page_size
+        self.dist_size = dist_size
+        self.max_num_kv_pages = max_num_kv_pages
         self.max_num_embeds = max_num_embeds
         self.dtype = dtype
         self.device = device
 
         self.kv_cache_at_layer = [
             torch.randn(
-                (max_num_pages, 2, NUM_TOKENS_IN_BLOCK,
-                self.lm.config.num_key_value_heads,
-                self.lm.config.hidden_size // self.lm.config.num_attention_heads),
+                (max_num_kv_pages, 2, kv_page_size,
+                 self.lm.config.num_key_value_heads,
+                 self.lm.config.hidden_size // self.lm.config.num_attention_heads),
                 dtype=dtype, device=device
             ) for _ in range(self.lm.config.num_hidden_layers)
         ]
 
-        self.embed_storage_p1 = VectorStorage(
-            num_vectors=max_num_embeds,
-            embed_dim=config.DIST_RESOLUTION,
-            dtype=dtype,
-            device=device
-        )
+        self.embed_storage_p1 = torch.empty((max_num_embeds, dist_size), device=device, dtype=dtype)
 
-        self.embed_storage_p2 = VectorStorage(
-            num_vectors=max_num_embeds,
-            embed_dim=config.DIST_RESOLUTION,
-            dtype=torch.long,
-            device=device
-        )
+        self.embed_storage_p2 = torch.empty((max_num_embeds, dist_size), device=device, dtype=dtype)
 
         # self.dist_storage = dist_storage
 
         self.inter_fill_time = time.time()
-
 
     def allocate(self, cmds: BatchAllocate):
         # in current implementation, all allocations are already done in the constructor.
@@ -112,8 +81,8 @@ class Driver:
                     # print(f"Debug - allocate {cmd.count} blocks at offset {cmd.object_id_offset}, creating block {cmd.object_id_offset + i}")
 
                     self.blocks[cmd.object_id_offset + i] = Block(
-                        position_ids=np.array([0] * NUM_TOKENS_IN_BLOCK),
-                        occupancy=np.array([False] * NUM_TOKENS_IN_BLOCK)
+                        position_ids=np.array([0] * self.kv_page_size),
+                        occupancy=np.array([False] * self.kv_page_size)
                     )
 
             elif cmd.kind == ObjectKind.OBJECT_KIND_EMB:
@@ -170,8 +139,8 @@ class Driver:
 
         for i, cmd in enumerate(cmds.items):
             # Get the stored logits/probabilities and token IDs
-            topk_probs = self.embed_storage_p1.ptr[cmd.distribution_id].tolist()
-            topk_tokens = self.embed_storage_p2.ptr[cmd.distribution_id].tolist()
+            topk_probs = self.embed_storage_p1[cmd.distribution_id].tolist()
+            topk_tokens = self.embed_storage_p2[cmd.distribution_id].tolist()
 
             # Limit to k requested tokens if needed
             if cmd.k > 0 and cmd.k < len(topk_tokens):
@@ -204,9 +173,9 @@ class Driver:
         single_token_inference_mode = True
 
         for i, cmd in enumerate(cmds.items):
-            last_block_len = cmd.last_block_len # change this name to "offset" later.
+            last_block_len = cmd.last_block_len  # change this name to "offset" later.
 
-            ctx_block_ids = cmd.context_block_ids # block == page. make names consistent later.
+            ctx_block_ids = cmd.context_block_ids  # block == page. make names consistent later.
             input_embeds = cmd.input_embedding_ids
             output_embeds = cmd.output_embedding_ids
 
@@ -223,20 +192,19 @@ class Driver:
 
             # let's compute the mask.
 
-
-            inp_pos_ids = np.empty((len(input_embeds), ), dtype=np.int32)
-            inp_occupancy = np.zeros((len(input_embeds), ), dtype=np.bool_)
+            inp_pos_ids = np.empty((len(input_embeds),), dtype=np.int32)
+            inp_occupancy = np.zeros((len(input_embeds),), dtype=np.bool_)
 
             if len(input_embeds) > 1:
                 single_token_inference_mode = False
 
-            total_ctx_tokens = NUM_TOKENS_IN_BLOCK * (len(ctx_block_ids) - 1) + last_block_len
+            total_ctx_tokens = self.kv_page_size * (len(ctx_block_ids) - 1) + last_block_len
 
             for i in range(len(input_embeds)):
 
                 token_offset = total_ctx_tokens - len(input_embeds) + i
-                tgt_block_idx = token_offset // NUM_TOKENS_IN_BLOCK
-                tgt_block_offset = token_offset % NUM_TOKENS_IN_BLOCK
+                tgt_block_idx = token_offset // self.kv_page_size
+                tgt_block_offset = token_offset % self.kv_page_size
 
                 # print(f"Debug - Token {i}: ID={input_embeds[i]}, token_offset={token_offset}, tgt_block_idx={tgt_block_idx}, tgt_block_offset={tgt_block_offset}")
 
@@ -274,12 +242,12 @@ class Driver:
 
             for i in range(len(output_embeds)):
                 output_embed_postproc.append({
-                    "idx":  len(new_token_ids) -  len(output_embeds) + i,
+                    "idx": len(new_token_ids) - len(output_embeds) + i,
                     "vec_id": output_embeds[i]
                 })
 
             # Get the full sequence length (context + input tokens)
-            total_sequence_length = total_ctx_tokens    # + len(input_embeds)
+            total_sequence_length = total_ctx_tokens  # + len(input_embeds)
 
             # Get position IDs and occupancy for the entire sequence
             ctx_pos_ids = np.hstack([self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids])[:total_sequence_length]  # int
@@ -292,8 +260,7 @@ class Driver:
 
             mask_flat = mask.flatten()
             custom_masks.append(mask_flat)
-            #print(mask)
-
+            # print(mask)
 
         # concat all masks
         custom_mask = np.concatenate(custom_masks)
@@ -309,13 +276,13 @@ class Driver:
 
         input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
 
-        #torch.cuda.synchronize()
-        #print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
+        # torch.cuda.synchronize()
+        # print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
         # print('kv_page_indices', kv_page_indices)
         # print('kv_page_indptr', kv_page_indptr)
         # print('kv_last_page_lens', kv_last_page_lens)
         # print('qo_indptr', qo_indptr)
-        #print('custom_mask', custom_masks)
+        # print('custom_mask', custom_masks)
 
         with torch.cuda.device(self.device):
             output_embeds = self.lm.model.forward(
@@ -362,16 +329,15 @@ class Driver:
                             if eos_logit == max_logit:
                                 print(f"    *** WARNING: EOS token has highest logit for output {i}! ***")
             # topk
-            condensed = torch.topk(logits, k=config.DIST_RESOLUTION, sorted=True)
+            condensed = torch.topk(logits, k=self.dist_size, sorted=True)
 
         # print(logits.shape)
         # store the logits in the output embeds  -> replace with torch.scatter later
         for token_map in output_embed_postproc:
             vec_id = token_map["vec_id"]
             idx = token_map["idx"]
-            self.embed_storage_p1.ptr[vec_id].copy_(condensed.values[idx], non_blocking=True)
-            self.embed_storage_p2.ptr[vec_id].copy_(condensed.indices[idx], non_blocking=True)
-
+            self.embed_storage_p1[vec_id].copy_(condensed.values[idx], non_blocking=True)
+            self.embed_storage_p2[vec_id].copy_(condensed.indices[idx], non_blocking=True)
 
         torch.cuda.synchronize()
         elapsed_time = (time.time() - start_time) * 1000

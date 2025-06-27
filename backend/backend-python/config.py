@@ -1,13 +1,12 @@
+import os
 import tomllib
 from dataclasses import dataclass
 
 from typing import Any
 
 import torch
+import base64
 
-
-# Assuming L4maConfig is defined elsewhere, as in the original code.
-# For this example to be self-contained, we'll create a placeholder.
 @dataclass
 class L4maConfig:
     type: str
@@ -32,9 +31,9 @@ class L4maConfig:
 class Tokenizer:
     """Struct for tokenizer configuration."""
     type: str
-    vocabulary_file: str
+    merge_table: dict[int, bytes]
     split_regex: str
-    special_tokens: dict[str, str]
+    special_tokens: dict[int, str]
 
 
 @dataclass
@@ -55,6 +54,8 @@ def parse_model_metadata(path: str) -> ModelMetadata:
     Parses a dictionary (from loaded TOML data) into the ModelMetadata struct,
     with improved and informative error handling.
     """
+    metadata_dir = os.path.dirname(os.path.abspath(path))
+
 
     # Helper function to safely get required keys from a dictionary
     def get_required_key(data_dict: dict, key: str, section_name: str) -> Any:
@@ -100,11 +101,27 @@ def parse_model_metadata(path: str) -> ModelMetadata:
 
     # --- Parse Tokenizer ---
     tokenizer_data = get_required_key(data, 'tokenizer', 'top-level')
+    vocabulary_file = get_required_key(tokenizer_data, 'vocabulary_file', 'tokenizer')
+
+    vocabulary_full_path = os.path.join(metadata_dir, vocabulary_file)
+
+    try:
+        merge_rules = load_merge_rules(vocabulary_full_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load vocabulary file '{vocabulary_file}' at path '{vocabulary_full_path}': {e}"
+        ) from e
+
+    raw_special_tokens = get_required_key(tokenizer_data, 'special_tokens', 'tokenizer')
+    processed_special_tokens: dict[int, str] = {}
+    for key, value in raw_special_tokens.items():
+        processed_special_tokens[int(key)] = str(value)
+
     tokenizer = Tokenizer(
         type=get_required_key(tokenizer_data, 'type', 'tokenizer'),
-        vocabulary_file=get_required_key(tokenizer_data, 'vocabulary_file', 'tokenizer'),
+        merge_table=merge_rules,
         split_regex=get_required_key(tokenizer_data, 'split_regex', 'tokenizer'),
-        special_tokens=get_required_key(tokenizer_data, 'special_tokens', 'tokenizer')
+        special_tokens=processed_special_tokens
     )
 
     # --- Parse Template ---
@@ -121,3 +138,68 @@ def parse_model_metadata(path: str) -> ModelMetadata:
         template_type=get_required_key(template_data, 'type', 'template'),
         template_content=get_required_key(template_data, 'content', 'template'),
     )
+
+
+def load_merge_rules(path: str) -> dict[int, bytes]:
+    """
+    Loads merge rules from a file.
+
+    The file is expected to contain lines where each line has a
+    base64-encoded token and an integer rank, separated by whitespace.
+    Empty lines are skipped.
+
+    Args:
+        path: The path to the file to read.
+
+    Returns:
+        A dictionary mapping each rank (int) to its corresponding
+        decoded token (bytes).
+
+    Raises:
+        FileNotFoundError: If the file at the specified path does not exist.
+        ValueError: If a line in the file is malformed (e.g., incorrect
+                    number of parts, invalid base64, or non-integer rank).
+    """
+    merge_rules: dict[int, bytes] = {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line_number, line in enumerate(f, 1):
+                line = line.strip()
+                # Skip empty or blank lines
+                if not line:
+                    continue
+
+                # Expect two parts: base64-encoded token and rank
+                parts = line.split()
+                if len(parts) != 2:
+                    raise ValueError(
+                        f"Error on line {line_number}: expected 2 parts, "
+                        f"but found {len(parts)} (line: '{line}')"
+                    )
+
+                b64_token, rank_str = parts
+
+                # 1. Decode base64 token
+                try:
+                    decoded_token = base64.b64decode(b64_token)
+                except (ValueError, TypeError) as e:
+                    raise ValueError(
+                        f"Error on line {line_number}: failed to decode base64 token. {e}"
+                    ) from e
+
+                # 2. Parse rank into an integer
+                try:
+                    rank = int(rank_str)
+                except ValueError as e:
+                    raise ValueError(
+                        f"Error on line {line_number}: failed to parse rank '{rank_str}' as an integer."
+                    ) from e
+
+                # Insert into the dictionary
+                merge_rules[rank] = decoded_token
+
+    except FileNotFoundError:
+        # Re-raise the exception to be handled by the caller
+        raise
+
+    return merge_rules

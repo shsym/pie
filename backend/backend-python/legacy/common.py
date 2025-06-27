@@ -46,7 +46,7 @@ def handle_request(d: Driver, request: l4m_pb2.Request) -> l4m_pb2.Response | No
             version=VERSION, # This needs to be defined or passed in
             model_name=d.model_name_or_path, # Use the stored model name
             block_size=NUM_TOKENS_IN_BLOCK, # This needs to be defined or passed in
-            num_available_blocks=d.max_num_pages,
+            num_available_blocks=d.max_num_kv_pages,
             num_available_embeddings=d.max_num_embeds,
             num_available_distributions=0
         ))
