@@ -230,5 +230,6 @@ class L4maForCausalLM(nn.Module):
 
     def __init__(self, config: L4maConfig):
         super().__init__()
+        self.config = config
         self.model = L4maModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, device=config.device, dtype=config.dtype)

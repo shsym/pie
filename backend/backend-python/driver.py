@@ -57,9 +57,9 @@ class Driver:
             torch.randn(
                 (max_num_kv_pages, 2, kv_page_size,
                  self.lm.config.num_key_value_heads,
-                 self.lm.config.hidden_size // self.lm.config.num_attention_heads),
+                 self.lm.config.head_size),
                 dtype=dtype, device=device
-            ) for _ in range(self.lm.config.num_hidden_layers)
+            ) for _ in range(self.lm.config.num_layers)
         ]
 
         self.embed_storage_p1 = torch.empty((max_num_embeds, dist_size), device=device, dtype=dtype)
@@ -316,18 +316,6 @@ class Driver:
                     print(f"    Top 5 token IDs: {top_5_indices.tolist()}")
                     print(f"    Top 5 values: {top_5_values.tolist()}")
 
-                    # Check if EOS token has abnormally high probability
-                    if hasattr(self.lm.config, 'eos_token_id') and self.lm.config.eos_token_id is not None:
-                        eos_token_id = self.lm.config.eos_token_id
-                        if isinstance(eos_token_id, list):
-                            eos_token_id = eos_token_id[0] if len(eos_token_id) > 0 else None
-
-                        if eos_token_id is not None and eos_token_id < len(pos_logits):
-                            eos_logit = pos_logits[eos_token_id].item()
-                            max_logit = pos_logits.max().item()
-                            print(f"    EOS token {eos_token_id} logit: {eos_logit:.4f} (max: {max_logit:.4f})")
-                            if eos_logit == max_logit:
-                                print(f"    *** WARNING: EOS token has highest logit for output {i}! ***")
             # topk
             condensed = torch.topk(logits, k=self.dist_size, sorted=True)
 

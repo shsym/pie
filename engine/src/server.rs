@@ -438,11 +438,16 @@ impl Client {
     }
 
     async fn handle_authenticate(&mut self, corr_id: u32, token: String) {
-        if let Ok(claims) = auth::validate_jwt(&token) {
-            self.authenticated = true;
-            self.send_response(corr_id, true, claims.sub).await;
+        if !self.authenticated {
+            if let Ok(claims) = auth::validate_jwt(&token) {
+                self.authenticated = true;
+                self.send_response(corr_id, true, claims.sub).await;
+            } else {
+                self.send_response(corr_id, false, "Invalid token".to_string())
+                    .await;
+            }
         } else {
-            self.send_response(corr_id, false, "Invalid token".to_string())
+            self.send_response(corr_id, true, "Already authenticated".to_string())
                 .await;
         }
     }

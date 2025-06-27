@@ -34,7 +34,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
 const DEFAULT_PORT: u16 = 9123; // Default port for the server
-const DEFAULT_HOST: &str = "127.0.0.1"; // Default host for the server
+const DEFAULT_HOST: &str = "0.0.0.0"; // Default host for the server
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]

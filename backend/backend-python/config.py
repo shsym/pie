@@ -112,16 +112,11 @@ def parse_model_metadata(path: str) -> ModelMetadata:
             f"Failed to load vocabulary file '{vocabulary_file}' at path '{vocabulary_full_path}': {e}"
         ) from e
 
-    raw_special_tokens = get_required_key(tokenizer_data, 'special_tokens', 'tokenizer')
-    processed_special_tokens: dict[int, str] = {}
-    for key, value in raw_special_tokens.items():
-        processed_special_tokens[int(key)] = str(value)
-
     tokenizer = Tokenizer(
         type=get_required_key(tokenizer_data, 'type', 'tokenizer'),
         merge_table=merge_rules,
         split_regex=get_required_key(tokenizer_data, 'split_regex', 'tokenizer'),
-        special_tokens=processed_special_tokens
+        special_tokens=get_required_key(tokenizer_data, 'special_tokens', 'tokenizer')
     )
 
     # --- Parse Template ---

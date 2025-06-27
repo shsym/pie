@@ -70,8 +70,8 @@ def main(config: str = None,
     final_config = {
         'host': host if host != 'localhost' else config_from_file.get('host', 'localhost'),
         'port': port if port != 10123 else config_from_file.get('port', 10123),
-        'controller_host': controller_host if controller_host != 'localhost' else config_from_file.get('host', 'localhost'),
-        'controller_port': controller_port if controller_port != 9123 else config_from_file.get('port', 9123),
+        'controller_host': controller_host if controller_host != 'localhost' else config_from_file.get('controller_host', 'localhost'),
+        'controller_port': controller_port if controller_port != 9123 else config_from_file.get('controller_port', 9123),
         'auth_token': auth_token if auth_token is not None else config_from_file.get('auth_token'),
         'model': model if model is not None else config_from_file.get('model'),
         'version': version if version is not None else config_from_file.get('version', ""),
@@ -203,8 +203,10 @@ def start_service(config, model, model_metadata):
     if config.get("controller_host") == "127.0.0.1" or config.get("controller_host") == "localhost":
         unique_id = random.randint(1000, 9999)
         endpoint = f"ipc:///tmp/pie-service-{unique_id}"
+        real_endpoint = endpoint
     else:
         endpoint = f"tcp://{config.get("host")}:{config.get("port")}"
+        real_endpoint = f"tcp://*:{config.get("port")}"
 
     engine = Driver(model=model,
                     kv_page_size=config.get("kv_page_size"),
@@ -216,7 +218,7 @@ def start_service(config, model, model_metadata):
 
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
-    router.bind(endpoint)
+    router.bind(real_endpoint)
 
     print(f"Server listening on {endpoint}")
 
@@ -296,6 +298,8 @@ def start_service(config, model, model_metadata):
                     response = l4m_pb2.Response(correlation_id=request.correlation_id, sample_top_k=res)
 
                 elif command == "get_info":
+
+                    print("Getting info from the engine.")
                     response = l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
                         version="0.1",
                         model_name=f"{config.get("model")}-{config.get("version", "")}",
@@ -341,8 +345,6 @@ def start_service(config, model, model_metadata):
 
                 router.send_multipart([client_identity, protocol_raw, pong])
 
-
-
         else:
             # do a handshake
             payload = frames[1]
@@ -375,27 +377,38 @@ def start_service(config, model, model_metadata):
 # Example usage
 def register(config, endpoint):
     # Notify the controller.
-    auth_token = config.get("auth_token")
-    with connect(f"ws://{config.get("controller_host")}:{config.get("controller_port")}") as websocket:
-        # do authentication
-        websocket.send(msgpack.packb({
-            "type": "authenticate",
-            "corr_id": 0,
-            "token": auth_token,
-        }, use_bin_type=True))
 
-        message = msgpack.unpackb(websocket.recv(), raw=False)
-        print(message)
+    try:
+        auth_token = config.get("auth_token")
+        with connect(f"ws://{config.get("controller_host")}:{config.get("controller_port")}") as websocket:
+            # do authentication
+            websocket.send(msgpack.packb({
+                "type": "authenticate",
+                "corr_id": 0,
+                "token": auth_token,
+            }, use_bin_type=True))
 
-        websocket.send(msgpack.packb({
-            "type": "attach_remote_service",
-            "corr_id": 0,
-            "endpoint": endpoint,
-            "service_name": "example_service",
-            "service_type": "l4m",
-        }, use_bin_type=True))
+            message = msgpack.unpackb(websocket.recv(), raw=False)
 
-        websocket.close()
+            if message.get("successful") is not True:
+                print(f"Authentication failed: {message.get("result", "Unknown error")}")
+                exit(1)
+
+            websocket.send(msgpack.packb({
+                "type": "attach_remote_service",
+                "corr_id": 0,
+                "endpoint": endpoint,
+                "service_name": "example_service",
+                "service_type": "l4m",
+            }, use_bin_type=True))
+
+            # websocket.close()
+            print(f"Registered with the controller at {config.get("controller_host")}:{config.get("controller_port")}")
+
+    except Exception as e:
+        print(f"Failed to register with the controller at {config.get("controller_host")}:{config.get("controller_port")}: {e}")
+        print("Make sure the controller is running and reachable.")
+        exit(1)
 
 
 if __name__ == "__main__":
