@@ -13,13 +13,6 @@ from config import L4maConfig
 
 VERSION = "0.1.0"
 
-# Constants
-NUM_TOKENS_IN_BLOCK = 16
-DIST_RESOLUTION = 32
-
-MAX_NUM_PAGES = 1800
-MAX_NUM_EMBEDS = 50000
-
 
 class L4maMlp(nn.Module):
     def __init__(self, config: L4maConfig):
@@ -59,6 +52,7 @@ class L4maAttention(nn.Module):
             qo_indptr: torch.Tensor,
     ) -> torch.Tensor:
         n, _ = hidden_states.size()
+        page_size = kv_cache_at_layer[0].shape[2]
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
@@ -72,20 +66,21 @@ class L4maAttention(nn.Module):
         ops.apply_llama31_rope_pos_ids_inplace(q=query_states, k=key_states, pos_ids=position_ids)
 
         batch_indices, positions = ops.get_batch_indices_positions(
-            qo_indptr,
-            ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, NUM_TOKENS_IN_BLOCK),
-            n
+            append_indptr=qo_indptr,
+            seq_lens=ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size),
+            nnz=n
         )
 
         ops.append_paged_kv_cache(
-            key_states,
-            value_states,
-            batch_indices,
-            positions,
-            kv_cache_at_layer[self.layer_idx],
-            kv_page_indices,
-            kv_page_indptr,
-            kv_last_page_lens
+            append_key=key_states,
+            append_value=value_states,
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=kv_cache_at_layer[self.layer_idx],
+            kv_indices=kv_page_indices,
+            kv_indptr=kv_page_indptr,
+            kv_last_page_len=kv_last_page_lens,
+            kv_layout='NHD'
         )
 
         attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
@@ -176,6 +171,7 @@ class L4maModel(nn.Module):
     ) -> torch.Tensor:
         # attention_mask = proc_mask(attention_mask, batch.dtype())
         hidden_states = input_embeds
+        page_size = kv_cache_at_layer[0].shape[2]
 
         # check if its decoding (qo_indptr is )
         if single_token_inference_mode:
@@ -186,7 +182,7 @@ class L4maModel(nn.Module):
                 num_qo_heads=self.config.num_query_heads,
                 num_kv_heads=self.config.num_key_value_heads,
                 head_dim=self.config.hidden_size // self.config.num_query_heads,
-                page_size=NUM_TOKENS_IN_BLOCK,
+                page_size=page_size,
                 pos_encoding_mode="NONE",
                 q_data_type=torch.bfloat16
             )
@@ -201,7 +197,7 @@ class L4maModel(nn.Module):
                 num_qo_heads=self.config.num_query_heads,
                 num_kv_heads=self.config.num_key_value_heads,
                 head_dim_qk=self.config.hidden_size // self.config.num_query_heads,
-                page_size=NUM_TOKENS_IN_BLOCK,
+                page_size=page_size,
                 custom_mask=custom_mask,
                 q_data_type=torch.bfloat16
             )

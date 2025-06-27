@@ -249,7 +249,7 @@ async fn start(config: Config) -> anyhow::Result<()> {
     install_service("messaging-user2inst", messaging_user2inst);
     install_service("ping", ping);
 
-    l4m::attach_new_backend("model-test", dummy_l4m_backend).await;
+    //l4m::attach_new_backend("model-test", dummy_l4m_backend).await;
 
     tracing::info!("Runtime started successfully.");
 
@@ -262,6 +262,21 @@ async fn start(config: Config) -> anyhow::Result<()> {
 }
 
 async fn spawn_client(program_name: String) -> anyhow::Result<()> {
+    // Wait until more than one model is available, checking every second.
+    loop {
+        // NOTE: Assuming `l4m::available_models()` is an async function
+        // that returns a collection (e.g., Vec) that has a .len() method.
+        let models = l4m::available_models();
+        if models.len() > 0 {
+            tracing::info!("Found {} models. Proceeding to spawn client.", models.len());
+            break;
+        }
+        tracing::info!(
+            "Waiting for more than one model to become available... Checking again in 1s."
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
     let program_path = PathBuf::from(format!(
         "../example-apps/target/wasm32-wasip2/release/{}.wasm",
         program_name
