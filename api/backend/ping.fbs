@@ -1,0 +1,11 @@
+namespace Ping;
+
+table Ping {
+  correlation_id: uint;
+  message: string;
+}
+
+table Pong {
+  correlation_id: uint;
+  message: string;
+}

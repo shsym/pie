@@ -1,0 +1,145 @@
+// l4m.fbs
+namespace Model.Gpt;
+
+enum ObjectKind : byte {
+  KvBlock = 0,
+  Emb = 1,
+  Dist = 2
+}
+
+table Allocate {
+  kind:ObjectKind;
+  object_id_offset:uint;
+  count:uint;
+}
+
+table BatchAllocate {
+  items:[Allocate];
+}
+
+table Deallocate {
+  kind:ObjectKind;
+  object_id_offset:uint;
+  count:uint;
+}
+
+table BatchDeallocate {
+  items:[Deallocate];
+}
+
+table EmbedText {
+  embedding_id:uint;
+  token_id:uint;
+  position_id:uint;
+}
+
+table BatchEmbedText {
+  items:[EmbedText];
+}
+
+table FillBlock {
+  last_block_len:uint;
+  context_block_ids:[uint];
+  input_embedding_ids:[uint];
+  output_embedding_ids:[uint];
+}
+
+table BatchFillBlock {
+  items:[FillBlock];
+}
+
+table MaskBlock {
+  block_id:uint;
+  mask:[bool];
+}
+
+table BatchMaskBlock {
+  items:[MaskBlock];
+}
+
+table CopyBlock {
+  source_block_id:uint;
+  destination_block_id:uint;
+  source_start:uint;
+  destination_start:uint;
+  length:uint;
+}
+
+table BatchCopyBlock {
+  items:[CopyBlock];
+}
+
+table SampleTopKRequest {
+  distribution_id:uint;
+  k:uint;
+}
+
+table BatchSampleTopKRequest {
+  items:[SampleTopKRequest];
+}
+
+table SampleTopKResponse {
+  token_ids:[uint];
+  probabilities:[float];
+}
+
+table BatchSampleTopKResponse {
+  items:[SampleTopKResponse];
+}
+
+table GetInfoRequest {
+}
+
+table TokenizerEntry {
+  key:uint;
+  value:[ubyte];
+}
+
+table SpecialToken {
+    key:string;
+    value:uint;
+}
+
+table Tokenizer {
+  merge_table:[TokenizerEntry];
+  special_tokens:[SpecialToken];
+  split_regex:string;
+}
+
+table GetInfoResponse {
+  version:string;
+  model_name:string;
+  kv_page_size:uint;
+  num_available_kv_pages:uint;
+  num_available_embeddings:uint;
+  num_available_distributions:uint;
+  tokenizer:Tokenizer;
+}
+
+union Command {
+  BatchAllocate,
+  BatchDeallocate,
+  BatchEmbedText,
+  BatchFillBlock,
+  BatchMaskBlock,
+  BatchCopyBlock,
+  BatchSampleTopKRequest,
+  GetInfoRequest
+}
+
+table Request {
+  correlation_id:uint;
+  command:Command;
+}
+
+union ResponsePayload {
+    BatchSampleTopKResponse,
+    GetInfoResponse
+}
+
+table Response {
+  correlation_id:uint;
+  command:ResponsePayload;
+}
+
+root_type Request;

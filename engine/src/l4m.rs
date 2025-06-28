@@ -19,6 +19,20 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
+
+mod pb_bindings {
+    include!(concat!(env!("OUT_DIR"), "/l4m.rs"));
+}
+
+mod pb_bindings_vision {
+    include!(concat!(env!("OUT_DIR"), "/l4m.vision.rs"));
+}
+
+#[allow(warnings)]
+mod fb_bindings {
+    include!(concat!(env!("OUT_DIR"), "/flatbuffers/mod.rs"));
+}
+
 macro_rules! try_trap {
     ($result:expr, $inst_id:expr, $msg:expr) => {
         match $result {
@@ -101,14 +115,6 @@ pub fn cleanup_instance(inst_id: InstanceId) {
     AVAILABLE_MODELS.iter().for_each(|(_, (_, service_id))| {
         Command::Destroy { inst_id }.dispatch(*service_id).ok();
     })
-}
-
-mod pb_bindings {
-    include!(concat!(env!("OUT_DIR"), "/l4m.rs"));
-}
-
-mod pb_bindings_vision {
-    include!(concat!(env!("OUT_DIR"), "/l4m.vision.rs"));
 }
 
 #[derive(Debug, Serialize)]
