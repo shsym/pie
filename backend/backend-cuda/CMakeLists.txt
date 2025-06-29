@@ -42,7 +42,8 @@ CPMAddPackage(
 )
 
 CPMAddPackage(
-    URI "gh:PJK/libcbor@0.12.0"
+    URI "gh:nlohmann/json@3.12.0"
+    OPTIONS "JSON_BuildTests OFF"
 )
 
 CPMAddPackage(
@@ -98,7 +99,7 @@ protobuf_generate(
 
 add_executable(pie_cuda_be
     src/main.cpp
-    src/ztensor.cpp
+    #src/ztensor.cpp
     src/gpt.cu
     src/server.cu
     #src/l4ma.cu
@@ -136,7 +137,8 @@ target_link_libraries(pie_cuda_be PRIVATE
     CLI11::CLI11
     tomlplusplus::tomlplusplus
     zstd
-    libcbor::libcbor
+    nlohmann_json::nlohmann_json
+
     # protobuf bindings
     pie_protobuf
 

@@ -118,10 +118,11 @@ inline ModelMetadata parse_model_metadata(const std::filesystem::path& metadata_
 
     if (auto special_tokens_node = get_required(*tokenizer_data, "special_tokens", "tokenizer").as_table()) {
         for (const auto& [k, v] : *special_tokens_node) {
-
-            std::cout << "Special token: " << k << " -> " << v.value_or("") << std::endl;
-
-            metadata.tokenizer.special_tokens[std::stoi(v.value_or("0"))] = std::string(k);
+            if (auto id = v.value<int>()) {
+                metadata.tokenizer.special_tokens[*id] = std::string(k);
+            } else {
+                std::cerr << "Failed to parse special token ID for key: " << k << std::endl;
+            }
         }
     }
 
