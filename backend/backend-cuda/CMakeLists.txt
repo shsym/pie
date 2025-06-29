@@ -15,6 +15,8 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+# should be set to 89 for 4090. We will have to write some auto-detection logic later.
+# For now, we set it to 86 for 3090.
 set(CMAKE_CUDA_ARCHITECTURES "86")
 
 find_package(CUDAToolkit REQUIRED)
@@ -75,6 +77,7 @@ file(GLOB_RECURSE FLASHINFER_GENERATED_SOURCES
 )
 
 # ------- self-contained protobuf generation -------
+# i prefer this way than find_package(Protobuf REQUIRED) since we have a complete control over the protobuf generation & version selection
 
 include(${protobuf_SOURCE_DIR}/cmake/protobuf-generate.cmake)
 
@@ -126,6 +129,7 @@ target_compile_options(pie_cuda_be PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
         -Xcompiler=-Wall
         -Xcompiler=-Wextra
+        -Wno-unused-parameter
         --extended-lambda
         -g # Enable host debug symbols
         -G # Enable device-side debug symbols
@@ -151,7 +155,7 @@ target_link_libraries(pie_cuda_be PRIVATE
     nlohmann_json::nlohmann_json
     ixwebsocket
     msgpack-cxx
-    
+
     # protobuf bindings
     pie_protobuf
 

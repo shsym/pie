@@ -35,9 +35,16 @@ template <typename T>
 class RMSNorm : public Module<T> {
 public:
     explicit RMSNorm(const L4maConfig& config);
+    
+    void forward(thrust::device_vector<T>& output,
+                 const thrust::device_vector<T>& input,
+                 int num_tokens,
+                 cudaStream_t stream);
+
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
 
 private:
+    L4maConfig config_;
     thrust::device_vector<T> weight_;
 };
 
@@ -72,6 +79,22 @@ template <typename T>
 class L4maAttention : public Module<T> {
 public:
     explicit L4maAttention(const L4maConfig& config);
+
+    void forward(thrust::device_vector<T>& attn_output,
+                 const thrust::device_vector<T>& hidden_states,
+                 const int32_t* position_ids,
+                 thrust::device_vector<T>& kv_cache_k,
+                 thrust::device_vector<T>& kv_cache_v,
+                 const int32_t* kv_page_indices,
+                 const int32_t* kv_page_indptr,
+                 const int32_t* kv_last_page_lens,
+                 const int32_t* qo_indptr,
+                 int nnz,
+                 int batch_size,
+                 thrust::device_vector<T>& temp_buffer,
+                 cublasLtHandle_t ltHandle,
+                 cudaStream_t stream);
+
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
 
 private:
@@ -92,6 +115,21 @@ template <typename T>
 class L4maDecoderLayer : public Module<T> {
 public:
     explicit L4maDecoderLayer(const L4maConfig& config);
+
+    void forward(thrust::device_vector<T>& hidden_states, // In-place
+                 const int32_t* position_ids,
+                 thrust::device_vector<T>& kv_cache_k,
+                 thrust::device_vector<T>& kv_cache_v,
+                 const int32_t* kv_page_indices,
+                 const int32_t* kv_page_indptr,
+                 const int32_t* kv_last_page_lens,
+                 const int32_t* qo_indptr,
+                 int nnz,
+                 int batch_size,
+                 thrust::device_vector<T>& temp_buffer,
+                 cublasLtHandle_t ltHandle,
+                 cudaStream_t stream);
+
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
 
 private:
@@ -99,6 +137,8 @@ private:
     L4maMlp<T> mlp_;
     RMSNorm<T> input_layernorm_;
     RMSNorm<T> post_attention_layernorm_;
+    thrust::device_vector<T> residual_;
+    thrust::device_vector<T> normed_hidden_states_;
 };
 
 /**
@@ -108,6 +148,19 @@ template <typename T>
 class L4maModel : public Module<T> {
 public:
     explicit L4maModel(const L4maConfig& config);
+
+    void forward(thrust::device_vector<T>& hidden_states,
+                 const thrust::device_vector<int32_t>& input_ids,
+                 const thrust::device_vector<int32_t>& position_ids,
+                 thrust::device_vector<T>& kv_cache_k,
+                 thrust::device_vector<T>& kv_cache_v,
+                 const int32_t* kv_page_indices,
+                 const int32_t* kv_page_indptr,
+                 const int32_t* kv_last_page_lens,
+                 const int32_t* qo_indptr,
+                 int batch_size,
+                 cudaStream_t stream);
+
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
     
     // Getter to allow weight tying for lm_head
@@ -115,9 +168,11 @@ public:
 
 private:
     L4maConfig config_;
+    cublasLtHandle_t cublaslt_handle_;
     thrust::device_vector<T> embed_tokens_weight_;
     std::vector<L4maDecoderLayer<T>> layers_;
     RMSNorm<T> norm_;
+    thrust::device_vector<T> temp_bwd_buffer_;
 };
 
 /**
@@ -127,6 +182,19 @@ template <typename T>
 class L4maForCausalLM : public Module<T> {
 public:
     explicit L4maForCausalLM(const L4maConfig& config);
+
+    void forward(thrust::device_vector<float>& logits,
+                 const thrust::device_vector<int32_t>& input_ids,
+                 const thrust::device_vector<int32_t>& position_ids,
+                 thrust::device_vector<T>& kv_cache_k,
+                 thrust::device_vector<T>& kv_cache_v,
+                 const int32_t* kv_page_indices,
+                 const int32_t* kv_page_indptr,
+                 const int32_t* kv_last_page_lens,
+                 const int32_t* qo_indptr,
+                 int batch_size,
+                 cudaStream_t stream);
+
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
 
 private:

@@ -125,9 +125,36 @@ const thrust::device_vector<T>& L4maModel<T>::get_embed_tokens_weight() const {
 }
 
 // --- Forward Pass Stub ---
+
+
 template <typename T>
-void L4maMlp<T>::forward(thrust::device_vector<T>&, const thrust::device_vector<T>&, int, thrust::device_vector<T>&, cublasLtHandle_t, cudaStream_t) {
-    std::cerr << "Warning: L4maMlp::forward is not implemented." << std::endl;
+void RMSNorm<T>::forward(thrust::device_vector<T>& output, const thrust::device_vector<T>& input, int num_tokens, cudaStream_t stream) {
+    std::cerr << "Warning: RMSNorm<T>::forward is not implemented." << std::endl;
+}
+
+template <typename T>
+void L4maMlp<T>::forward(thrust::device_vector<T>& output, const thrust::device_vector<T>& x, int num_tokens, thrust::device_vector<T>& temp_buffer, cublasLtHandle_t ltHandle, cudaStream_t stream) {
+    std::cerr << "Warning: L4maMlp<T>::forward is not implemented." << std::endl;
+}
+
+template <typename T>
+void L4maAttention<T>::forward(thrust::device_vector<T>& attn_output, const thrust::device_vector<T>& hidden_states, const int32_t* position_ids, thrust::device_vector<T>& kv_cache_k, thrust::device_vector<T>& kv_cache_v, const int32_t* kv_page_indices, const int32_t* kv_page_indptr, const int32_t* kv_last_page_lens, const int32_t* qo_indptr, int nnz, int batch_size, thrust::device_vector<T>& temp_buffer, cublasLtHandle_t ltHandle, cudaStream_t stream) {
+    std::cerr << "Warning: L4maAttention<T>::forward is not implemented." << std::endl;
+}
+
+template <typename T>
+void L4maDecoderLayer<T>::forward(thrust::device_vector<T>& hidden_states, const int32_t* position_ids, thrust::device_vector<T>& kv_cache_k, thrust::device_vector<T>& kv_cache_v, const int32_t* kv_page_indices, const int32_t* kv_page_indptr, const int32_t* kv_last_page_lens, const int32_t* qo_indptr, int nnz, int batch_size, thrust::device_vector<T>& temp_buffer, cublasLtHandle_t ltHandle, cudaStream_t stream) {
+    std::cerr << "Warning: L4maDecoderLayer<T>::forward is not implemented." << std::endl;
+}
+
+template <typename T>
+void L4maModel<T>::forward(thrust::device_vector<T>& hidden_states, const thrust::device_vector<int32_t>& input_ids, const thrust::device_vector<int32_t>& position_ids, thrust::device_vector<T>& kv_cache_k, thrust::device_vector<T>& kv_cache_v, const int32_t* kv_page_indices, const int32_t* kv_page_indptr, const int32_t* kv_last_page_lens, const int32_t* qo_indptr, int batch_size, cudaStream_t stream) {
+    std::cerr << "Warning: L4maModel<T>::forward is not implemented." << std::endl;
+}
+
+template <typename T>
+void L4maForCausalLM<T>::forward(thrust::device_vector<float>& logits, const thrust::device_vector<int32_t>& input_ids, const thrust::device_vector<int32_t>& position_ids, thrust::device_vector<T>& kv_cache_k, thrust::device_vector<T>& kv_cache_v, const int32_t* kv_page_indices, const int32_t* kv_page_indptr, const int32_t* kv_last_page_lens, const int32_t* qo_indptr, int batch_size, cudaStream_t stream) {
+    std::cerr << "Warning: L4maForCausalLM<T>::forward is not implemented." << std::endl;
 }
 
 // --- Explicit Template Instantiations ---

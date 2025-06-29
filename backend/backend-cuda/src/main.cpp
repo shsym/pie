@@ -301,6 +301,13 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
     std::vector<std::string> protocols = {"l4m", "l4m-vision", "ping"};
     std::unordered_map<std::string, bool> connected_clients;
 
+
+    // Initializing the models
+    Model model(config, metadata);
+    
+    // The run() method contains the main application loop.
+    model.run();
+
     while (true) {
         try {
             std::vector<zmq::message_t> multipart_msg;
@@ -355,6 +362,10 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                 l4m::Request request;
                 request.ParseFromString(payload_str);
                 
+                bool needs_response = false;
+                l4m::Response response;
+                response.set_correlation_id(request.correlation_id());
+
                 if (request.has_get_info()) {
                     l4m::Response response;
                     response.set_correlation_id(request.correlation_id());
@@ -371,15 +382,12 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
 
                     tokenizer_info->set_split_regex(metadata.tokenizer.split_regex);
 
-                    // Populate the merge table from metadata.
                     // The protobuf `bytes` type corresponds to `std::string` in C++.
                     for (const auto& [rank, token_bytes] : metadata.tokenizer.merge_table) {
                         (*merge_table_proto)[static_cast<uint32_t>(rank)] = 
                             std::string(token_bytes.begin(), token_bytes.end());
                     }
 
-                    // Populate the special tokens, inverting the key-value pairs
-                    // from the C++ map (id -> name) to the protobuf map (name -> id).
                     for (const auto& [id, name] : metadata.tokenizer.special_tokens) {
                         (*special_tokens_proto)[name] = static_cast<uint32_t>(id);
                     }
@@ -387,7 +395,126 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     router.send(zmq::const_buffer(client_identity.data(), client_identity.size()), zmq::send_flags::sndmore);
                     router.send(multipart_msg[1], zmq::send_flags::sndmore);
                     router.send(zmq::buffer(response.SerializeAsString()), zmq::send_flags::none);
-                } 
+                }  else if (request.has_allocate()) {
+                    std::cout << "[ZMQ Server Thread] Handling BatchAllocate request." << std::endl;
+                    std::vector<Model::AllocateCommand> commands;
+                    commands.reserve(request.allocate().items_size());
+                    for (const auto& item : request.allocate().items()) {
+                        commands.push_back({
+                            static_cast<Model::ObjectKind>(item.kind()),
+                            item.object_id_offset(),
+                            item.count()
+                        });
+                    }
+                    model.handle_allocate(commands);
+
+                } else if (request.has_deallocate()) {
+                    std::cout << "[ZMQ Server Thread] Handling BatchDeallocate request." << std::endl;
+                    std::vector<Model::DeallocateCommand> commands;
+                    commands.reserve(request.deallocate().items_size());
+                    for (const auto& item : request.deallocate().items()) {
+                        commands.push_back({
+                            static_cast<Model::ObjectKind>(item.kind()),
+                            item.object_id_offset(),
+                            item.count()
+                        });
+                    }
+                    model.handle_deallocate(commands);
+
+                } else if (request.has_embed_text()) {
+                    std::cout << "[ZMQ Server Thread] Handling BatchEmbedText request." << std::endl;
+                    std::vector<Model::EmbedTextCommand> commands;
+                    commands.reserve(request.embed_text().items_size());
+                    for (const auto& item : request.embed_text().items()) {
+                        commands.push_back({
+                            item.embedding_id(),
+                            item.token_id(),
+                            item.position_id()
+                        });
+                    }
+                    model.handle_embed_text(commands);
+
+                } else if (request.has_fill_block()) {
+                    std::cout << "[ZMQ Server Thread] Handling BatchFillBlock request." << std::endl;
+                    std::vector<Model::FillBlockCommand> commands;
+                    commands.reserve(request.fill_block().items_size());
+                    for (const auto& item : request.fill_block().items()) {
+                        commands.push_back({
+                            item.last_block_len(),
+                            {item.context_block_ids().begin(), item.context_block_ids().end()},
+                            {item.input_embedding_ids().begin(), item.input_embedding_ids().end()},
+                            {item.output_embedding_ids().begin(), item.output_embedding_ids().end()}
+                        });
+                    }
+                    model.handle_fill_block(commands);
+
+                } else if (request.has_mask_block()) {
+                    std::cout << "[ZMQ Server Thread] Handling BatchMaskBlock request." << std::endl;
+                    std::vector<Model::MaskBlockCommand> commands;
+                    commands.reserve(request.mask_block().items_size());
+                    for (const auto& item : request.mask_block().items()) {
+                        commands.push_back({
+                            item.block_id(),
+                            {item.mask().begin(), item.mask().end()}
+                        });
+                    }
+                    model.handle_mask_block(commands);
+
+                } else if (request.has_copy_block()) {
+                    std::cout << "[ZMQ Server Thread] Handling BatchCopyBlock request." << std::endl;
+                    std::vector<Model::CopyBlockCommand> commands;
+                    commands.reserve(request.copy_block().items_size());
+                    for (const auto& item : request.copy_block().items()) {
+                        commands.push_back({
+                            item.source_block_id(),
+                            item.destination_block_id(),
+                            item.source_start(),
+                            item.destination_start(),
+                            item.length()
+                        });
+                    }
+                    model.handle_copy_block(commands);
+
+                } else if (request.has_decode_token_distribution()) {
+                    std::cout << "[ZMQ Server Thread] Handling BatchDecodeTokenDistribution request." << std::endl;
+                    std::vector<Model::DecodeTokenDistributionCommand> commands;
+                    commands.reserve(request.decode_token_distribution().items_size());
+                    for (const auto& item : request.decode_token_distribution().items()) {
+                        commands.push_back({
+                            item.embedding_id(),
+                            item.distribution_id()
+                        });
+                    }
+                    model.handle_decode_token_distribution(commands);
+
+                } else if (request.has_sample_top_k_request()) {
+                    std::cout << "[ZMQ Server Thread] Handling BatchSampleTopKRequest request." << std::endl;
+                    needs_response = true;
+                    
+                    std::vector<Model::SampleTopKCommand> commands;
+                    commands.reserve(request.sample_top_k_request().items_size());
+                    for (const auto& item : request.sample_top_k_request().items()) {
+                        commands.push_back({item.distribution_id(), item.k()});
+                    }
+
+                    std::vector<Model::SampleTopKResult> results = model.handle_sample_top_k(commands);
+
+                    auto* proto_response = response.mutable_sample_top_k();
+                    for (const auto& result_item : results) {
+                        auto* proto_item = proto_response->add_items();
+                        proto_item->mutable_token_ids()->Add(result_item.token_ids.begin(), result_item.token_ids.end());
+                        proto_item->mutable_probabilities()->Add(result_item.probabilities.begin(), result_item.probabilities.end());
+                    }
+
+                } else {
+                    std::cerr << "[ZMQ Server Thread] Unknown or empty L4M command." << std::endl;
+                }
+
+                if (needs_response) {
+                    router.send(zmq::const_buffer(client_identity.data(), client_identity.size()), zmq::send_flags::sndmore);
+                    router.send(multipart_msg[1], zmq::send_flags::sndmore);
+                    router.send(zmq::buffer(response.SerializeAsString()), zmq::send_flags::none);
+                }
                 // TODO: Implement other l4m commands.
 
             } else if (protocol == "ping") {
@@ -487,15 +614,6 @@ int main(int argc, char* argv[]) {
         }
         ModelMetadata model_metadata = parse_model_metadata(metadata_path);
         std::cout << model_metadata << std::endl;
-
-
-        // --- 3. Create and Run the Server ---
-        
-        // The Server constructor handles all the loading.
-        Model model(final_config, model_metadata);
-        
-        // The run() method contains the main application loop.
-        model.run();
 
 
         // --- 4. Start Services ---
