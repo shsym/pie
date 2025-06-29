@@ -118,6 +118,47 @@ namespace utils {
         }
         return out;
     }
+
+    // Implements a cross-platform method for finding the user's cache directory.
+    inline std::filesystem::path get_user_cache_dir()
+    {
+#if defined(_WIN32)
+        // Windows: Prefer %LOCALAPPDATA%, fallback to %APPDATA%
+        const char *local_appdata = std::getenv("LOCALAPPDATA");
+        if (local_appdata)
+        {
+            return std::filesystem::path(local_appdata);
+        }
+        const char *appdata = std::getenv("APPDATA");
+        if (appdata)
+        {
+            return std::filesystem::path(appdata) / "Local";
+        }
+#else
+        // Linux, macOS, and other UNIX-like systems
+        const char *home = std::getenv("HOME");
+        if (!home)
+        {
+            throw std::runtime_error("Could not determine home directory. Please set the $HOME environment variable.");
+        }
+        std::filesystem::path home_path(home);
+
+#if defined(__APPLE__)
+        // macOS: ~/Library/Caches
+        return home_path / "Library" / "Caches";
+#else
+        // Linux: Follow XDG Base Directory Specification
+        const char *xdg_cache_home = std::getenv("XDG_CACHE_HOME");
+        if (xdg_cache_home && std::strlen(xdg_cache_home) > 0)
+        {
+            return std::filesystem::path(xdg_cache_home);
+        }
+        // Default to ~/.cache
+        return home_path / ".cache";
+#endif
+#endif
+        throw std::runtime_error("Unsupported platform or unable to determine cache directory.");
+    }
 }
 
 

@@ -15,10 +15,9 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-set(CMAKE_CUDA_ARCHITECTURES "89")
+set(CMAKE_CUDA_ARCHITECTURES "86")
 
 find_package(CUDAToolkit REQUIRED)
- 
 
 # 3. Include CPM.cmake for package management
 # This downloads the CPM script if it's not already present.
@@ -42,9 +41,12 @@ CPMAddPackage(
     URI "gh:zeromq/cppzmq@4.10.0"
 )
 
-CPMAddPackage( 
-    URI "gh:nlohmann/json@3.12.0"
-    OPTIONS "JSON_BuildTests OFF"
+CPMAddPackage(
+    URI "gh:PJK/libcbor@0.12.0"
+)
+
+CPMAddPackage(
+    URI "gh:facebook/zstd@1.5.7"
 )
 
 CPMAddPackage(
@@ -96,11 +98,12 @@ protobuf_generate(
 
 add_executable(pie_cuda_be
     src/main.cpp
+    src/ztensor.cpp
+    src/gpt.cu
+    src/server.cu
     #src/l4ma.cu
     #src/bpe.cpp
     #src/common.cu
-    ${PROTO_SRCS}
-    ${PROTO_HDRS}
 )
 
 
@@ -125,20 +128,23 @@ target_include_directories(pie_cuda_be PRIVATE
    ${CMAKE_CURRENT_SOURCE_DIR}/include
    ${flashinfer_SOURCE_DIR}/include 
    ${flashinfer_SOURCE_DIR}/src/generated    
-   ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 target_link_libraries(pie_cuda_be PRIVATE
-    # Link against targets provided by CPM packages
+    # 3rd-party libraries
     cppzmq
-    pie_protobuf
+    CLI11::CLI11
     tomlplusplus::tomlplusplus
-    nlohmann_json::nlohmann_json
+    zstd
+    libcbor::libcbor
+    # protobuf bindings
+    pie_protobuf
+
+    # from flashinfer
     decode_kernels
     prefill_kernels
-    CLI11::CLI11
-    #flashinfer
-    # Link against CUDA libraries provided by CMake's FindCUDA module
+
+    # aux cuda libraries
     CUDA::cublas
     CUDA::cublasLt
 )
