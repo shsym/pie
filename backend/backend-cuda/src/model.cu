@@ -1,4 +1,4 @@
-#include "server.hpp"
+#include "model.hpp"
 
 // All implementation-specific headers are safely included here
 #include "gpt.cuh"
@@ -12,12 +12,12 @@
 
 
 // The actual implementation of the Server is hidden in this struct.
-struct Server::ServerImpl {
+struct Model::ModelImpl {
     std::unique_ptr<L4maForCausalLM<__nv_bfloat16>> model;
     // You can add any other server state here (e.g., ZMQ context).
 };
 
-namespace { // Anonymous namespace for internal helper functions
+namespace { 
 
 template<typename T>
 std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config, const ModelMetadata& metadata) {
@@ -26,9 +26,6 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
     std::cout << "Instantiating model structure on device..." << std::endl;
 
     auto model_ptr = std::make_unique<L4maForCausalLM<T>>(metadata.architecture);
-
-
-
 
     auto params_map = model_ptr->get_parameters();
     std::cout << "Found " << params_map.size() << " parameter tensors in the model structure." << std::endl;
@@ -69,8 +66,18 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
         loaded_keys.insert("lm_head.weight");
     }
     
-    // (Verification logic would go here)
+    if (loaded_keys.size() != params_map.size()) {
+        std::cout << "\nWarning: Mismatch between loaded and expected parameter counts." << std::endl;
+        std::cout << "Missing parameters:" << std::endl;
+        for (const auto& pair : params_map) {
+            if (loaded_keys.find(pair.first) == loaded_keys.end()) {
+                std::cout << "  - " << pair.first << std::endl;
+            }
+        }
+    }
+    
     std::cout << "\nSuccessfully loaded " << loaded_keys.size() << " expected weights." << std::endl;
+
 
     return model_ptr;
 }
@@ -80,9 +87,9 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
 
 // --- Public Interface Implementation ---
 
-Server::Server(const AppConfig& config, ModelMetadata& out_metadata)
+Model::Model(const AppConfig& config, ModelMetadata& out_metadata)
     // Create the PIMPL object
-    : pimpl(std::make_unique<ServerImpl>()) {
+    : pimpl(std::make_unique<ModelImpl>()) {
     
     std::cout << "Starting service..." << std::endl;
 
@@ -94,9 +101,8 @@ Server::Server(const AppConfig& config, ModelMetadata& out_metadata)
 
 // By defining the destructor here, the compiler knows the full definition of ServerImpl
 // and can correctly destroy the unique_ptr it contains.
-Server::~Server() = default;
+Model::~Model() = default;
 
-void Server::run() {
-    std::cout << "Starting ZMQ server loop (placeholder)..." << std::endl;
+void Model::run() {
     
 }

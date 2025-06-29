@@ -4,27 +4,34 @@
 #include <map>
 #include <optional>
 #include <filesystem>
+#include <thread>
 #include <fstream>
 #include <stdexcept>
 #include <cstdlib>
 #include <cstring>
-
-#include "utils.hpp" // For base64_decode and get_user_cache_dir
-#include <toml++/toml.hpp>
-
-
-#include "config.hpp"
-#include "server.hpp"
+#include <mutex>
+#include <condition_variable>
 
 #include <CLI/CLI.hpp>
-#include <iostream>
+#include <toml++/toml.hpp>
+#include <zmq.hpp>
+#include <zmq_addon.hpp>
+#include <ixwebsocket/IXWebSocket.h>
+#include <ixwebsocket/IXConnectionState.h>
+#include <msgpack.hpp>
+
+#include "utils.hpp" // For base64_decode and get_user_cache_dir
+#include "config.hpp"
+#include "model.hpp"
+
+// protobuf includes
+#include "handshake.pb.h"
+#include "ping.pb.h"
+#include "l4m.pb.h"
+#include "l4m_vision.pb.h"
 
 
-// ======================================================================================
-// MARK: - Parsing and Helper Functions
-// ======================================================================================
-
-inline std::map<int, std::vector<uint8_t>> load_merge_rules(const std::filesystem::path& path) {
+std::map<int, std::vector<uint8_t>> load_merge_rules(const std::filesystem::path& path) {
     std::map<int, std::vector<uint8_t>> merge_rules;
     std::ifstream file(path);
     if (!file.is_open()) throw std::runtime_error("Failed to load vocabulary file: " + path.string());
@@ -50,7 +57,7 @@ inline std::map<int, std::vector<uint8_t>> load_merge_rules(const std::filesyste
     return merge_rules;
 }
 
-inline ModelMetadata parse_model_metadata(const std::filesystem::path& metadata_path) {
+ModelMetadata parse_model_metadata(const std::filesystem::path& metadata_path) {
     if (!std::filesystem::exists(metadata_path)) {
         throw std::runtime_error("Metadata file not found at: " + metadata_path.string());
     }
@@ -134,7 +141,7 @@ inline ModelMetadata parse_model_metadata(const std::filesystem::path& metadata_
     return metadata;
 }
 
-inline std::filesystem::path get_cache_dir(const std::optional<std::string>& cli_path, const toml::table& config_table) {
+std::filesystem::path get_cache_dir(const std::optional<std::string>& cli_path, const toml::table& config_table) {
     if (cli_path && !cli_path->empty()) return *cli_path;
     if (auto node = config_table["cache_dir"]; node.is_string()) return node.as_string()->get();
     if (const char* env_pie_home = std::getenv("PIE_HOME")) {
@@ -142,6 +149,274 @@ inline std::filesystem::path get_cache_dir(const std::optional<std::string>& cli
     }
     return utils::get_user_cache_dir() / "pie";
 }
+
+/**
+ * @brief Registers this service with the central controller using ixwebsocket.
+ *
+ * This corrected version uses the asynchronous, callback-based API provided by the library.
+ * It uses a state machine within the callback and a condition_variable to wait
+ * for the registration process to complete.
+ */
+void register_with_controller(const AppConfig& config, const std::string& service_endpoint) {
+    std::cout << "[Registration Thread] Attempting registration with the controller..." << std::endl;
+
+    // --- State machine and synchronization setup ---
+    enum class RegistrationState {
+        Connecting,
+        AwaitingAuthResponse,
+        AwaitingRegisterResponse,
+        Succeeded,
+        Failed
+    };
+
+    RegistrationState state = RegistrationState::Connecting;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool process_finished = false;
+    std::string error_reason;
+
+    // 1. Setup the WebSocket client
+    ix::WebSocket webSocket;
+    const std::string url = "ws://" + config.controller_host + ":" + std::to_string(config.controller_port);
+    webSocket.setUrl(url);
+
+    // 2. Define the callback for handling all WebSocket events
+    webSocket.setOnMessageCallback(
+        [&](const ix::WebSocketMessagePtr& msg) {
+            std::unique_lock<std::mutex> lock(mtx);
+
+            switch (msg->type) {
+                case ix::WebSocketMessageType::Open:
+                    std::cout << "[Registration Thread] Connection established. Sending authentication request..." << std::endl;
+                    {
+                        // Now that we are open, send the authentication request
+                        msgpack::sbuffer sbuf;
+                        msgpack::packer<msgpack::sbuffer> packer(sbuf);
+                        packer.pack_map(3);
+                        packer.pack("type"); packer.pack("authenticate");
+                        packer.pack("corr_id"); packer.pack(0);
+                        packer.pack("token"); packer.pack(config.auth_token);
+                        webSocket.sendBinary(std::string(sbuf.data(), sbuf.size()));
+                        state = RegistrationState::AwaitingAuthResponse;
+                    }
+                    break;
+
+                case ix::WebSocketMessageType::Message:
+                    if (state == RegistrationState::AwaitingAuthResponse) {
+                        std::cout << "[Registration Thread] Received authentication response." << std::endl;
+                        try {
+                            msgpack::object_handle oh = msgpack::unpack(msg->str.data(), msg->str.size());
+                            std::map<std::string, msgpack::object> response;
+                            oh.get().convert(response);
+
+                            if (response["successful"].as<bool>()) {
+                                std::cout << "[Registration Thread] Authentication successful. Sending registration request..." << std::endl;
+                                // Auth succeeded, now send registration request
+                                msgpack::sbuffer sbuf;
+                                msgpack::packer<msgpack::sbuffer> packer(sbuf);
+                                packer.pack_map(5);
+                                packer.pack("type"); packer.pack("attach_remote_service");
+                                packer.pack("corr_id"); packer.pack(0);
+                                packer.pack("endpoint"); packer.pack(service_endpoint);
+                                packer.pack("service_name"); packer.pack(config.model_name);
+                                packer.pack("service_type"); packer.pack("l4m");
+                                webSocket.sendBinary(std::string(sbuf.data(), sbuf.size()));
+                                state = RegistrationState::AwaitingRegisterResponse;
+                            } else {
+                                error_reason = "Authentication failed by controller: " + (response.count("result") ? response["result"].as<std::string>() : "reason unknown");
+                                state = RegistrationState::Failed;
+                                process_finished = true;
+                            }
+                        } catch (const std::exception& e) {
+                            error_reason = "Failed to parse auth response: " + std::string(e.what());
+                            state = RegistrationState::Failed;
+                            process_finished = true;
+                        }
+                    } else if (state == RegistrationState::AwaitingRegisterResponse) {
+                        std::cout << "[Registration Thread] Received registration response." << std::endl;
+                         try {
+                            msgpack::object_handle oh = msgpack::unpack(msg->str.data(), msg->str.size());
+                            std::map<std::string, msgpack::object> response;
+                            oh.get().convert(response);
+
+                            if (response["successful"].as<bool>()) {
+                                std::cout << "[Registration Thread] Successfully registered with the controller." << std::endl;
+                                state = RegistrationState::Succeeded;
+                            } else {
+                                error_reason = "Controller could not attach backend: " + (response.count("result") ? response["result"].as<std::string>() : "reason unknown");
+                                state = RegistrationState::Failed;
+                            }
+                        } catch (const std::exception& e) {
+                            error_reason = "Failed to parse registration response: " + std::string(e.what());
+                            state = RegistrationState::Failed;
+                        }
+                        process_finished = true;
+                    }
+                    break;
+
+                case ix::WebSocketMessageType::Error:
+                    error_reason = "Connection error: " + msg->errorInfo.reason;
+                    state = RegistrationState::Failed;
+                    process_finished = true;
+                    break;
+
+                case ix::WebSocketMessageType::Close:
+                    if (state != RegistrationState::Succeeded) {
+                         error_reason = "Connection closed unexpectedly. Code: " + std::to_string(msg->closeInfo.code);
+                         state = RegistrationState::Failed;
+                    }
+                    process_finished = true;
+                    break;
+
+                default:
+                    break;
+            }
+
+            if (process_finished) {
+                cv.notify_one();
+            }
+        });
+
+    // 3. Start the WebSocket client's background thread
+    webSocket.start();
+
+    // 4. Wait until the registration process is finished (or fails)
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&] { return process_finished; });
+    }
+    webSocket.stop();
+
+    // 5. Check the final state and log any errors
+    if (state == RegistrationState::Failed) {
+        std::cerr << "[Registration Thread] Registration process failed: " << error_reason << std::endl;
+    }
+}
+
+
+// Runs the main ZMQ server loop, listening for and handling requests.
+void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelMetadata& metadata)
+{
+    std::cout << "[ZMQ Server Thread] ZMQ server thread started." << std::endl;
+    std::vector<std::string> protocols = {"l4m", "l4m-vision", "ping"};
+    std::unordered_map<std::string, bool> connected_clients;
+
+    while (true) {
+        try {
+            std::vector<zmq::message_t> multipart_msg;
+            auto result = zmq::recv_multipart(router, std::back_inserter(multipart_msg));
+
+            if (!result) {
+                std::cerr << "[ZMQ Server Thread] Failed to receive message." << std::endl;
+                continue;
+            }
+
+            const std::string client_identity = multipart_msg[0].to_string();
+
+            // Handle handshake for new clients
+            if (connected_clients.find(client_identity) == connected_clients.end()) {
+                std::cout << "[ZMQ Server Thread] New client connection, performing handshake." << std::endl;
+                handshake::Request hs_req;
+                if (!hs_req.ParseFromString(multipart_msg[1].to_string())) {
+                    std::cerr << "[ZMQ Server Thread] Invalid handshake message." << std::endl;
+                    continue;
+                }
+                
+                handshake::Response hs_res;
+                for(const auto& p : protocols) {
+                    hs_res.add_protocols(p);
+                }
+                
+                zmq::message_t response_payload(hs_res.ByteSizeLong());
+                hs_res.SerializeToArray(response_payload.data(), response_payload.size());
+
+                router.send(zmq::const_buffer(client_identity.data(), client_identity.size()), zmq::send_flags::sndmore);
+                router.send(response_payload, zmq::send_flags::none);
+
+                connected_clients[client_identity] = true;
+                continue;
+            }
+            
+            // Handle requests from existing clients
+            if (multipart_msg.size() != 3) {
+                std::cerr << "[ZMQ Server Thread] Invalid message format from known client." << std::endl;
+                continue;
+            }
+            
+            const int protocol_idx = *static_cast<const uint8_t*>(multipart_msg[1].data());
+            if (protocol_idx < 0 || protocol_idx >= protocols.size()) {
+                std::cerr << "[ZMQ Server Thread] Invalid protocol index: " << protocol_idx << std::endl;
+                continue;
+            }
+            const std::string& protocol = protocols[protocol_idx];
+            const std::string& payload_str = multipart_msg[2].to_string();
+
+            if (protocol == "l4m") {
+                l4m::Request request;
+                request.ParseFromString(payload_str);
+                
+                if (request.has_get_info()) {
+                    l4m::Response response;
+                    response.set_correlation_id(request.correlation_id());
+                    auto* info = response.mutable_get_info();
+                    info->set_version(metadata.version);
+                    info->set_model_name(metadata.name);
+                    info->set_kv_page_size(config.kv_page_size);
+                    info->set_num_available_kv_pages(config.max_num_kv_pages);
+                    info->set_num_available_embeddings(config.max_num_embeds);
+                    
+                    auto* tokenizer_info = info->mutable_tokenizer();
+                    auto* merge_table_proto = tokenizer_info->mutable_merge_table();
+                    auto* special_tokens_proto = tokenizer_info->mutable_special_tokens();
+
+                    tokenizer_info->set_split_regex(metadata.tokenizer.split_regex);
+
+                    // Populate the merge table from metadata.
+                    // The protobuf `bytes` type corresponds to `std::string` in C++.
+                    for (const auto& [rank, token_bytes] : metadata.tokenizer.merge_table) {
+                        (*merge_table_proto)[static_cast<uint32_t>(rank)] = 
+                            std::string(token_bytes.begin(), token_bytes.end());
+                    }
+
+                    // Populate the special tokens, inverting the key-value pairs
+                    // from the C++ map (id -> name) to the protobuf map (name -> id).
+                    for (const auto& [id, name] : metadata.tokenizer.special_tokens) {
+                        (*special_tokens_proto)[name] = static_cast<uint32_t>(id);
+                    }
+
+                    router.send(zmq::const_buffer(client_identity.data(), client_identity.size()), zmq::send_flags::sndmore);
+                    router.send(multipart_msg[1], zmq::send_flags::sndmore);
+                    router.send(zmq::buffer(response.SerializeAsString()), zmq::send_flags::none);
+                } 
+                // TODO: Implement other l4m commands.
+
+            } else if (protocol == "ping") {
+                ping::Ping ping_req;
+                ping_req.ParseFromString(payload_str);
+
+                ping::Pong pong_res;
+                pong_res.set_correlation_id(ping_req.correlation_id());
+                pong_res.set_message("Pong:" + ping_req.message());
+
+                router.send(zmq::const_buffer(client_identity.data(), client_identity.size()), zmq::send_flags::sndmore);
+                router.send(multipart_msg[1], zmq::send_flags::sndmore);
+                router.send(zmq::buffer(pong_res.SerializeAsString()), zmq::send_flags::none);
+            }
+            
+        } catch (const zmq::error_t& e) {
+            if (e.num() == ETERM) {
+                std::cout << "[ZMQ Server Thread] Context terminated, shutting down." << std::endl;
+                break;
+            }
+            std::cerr << "[ZMQ Server Thread] ZMQ Error: " << e.what() << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[ZMQ Server Thread] An unexpected error occurred: " << e.what() << std::endl;
+        }
+    }
+}
+
+
+
 
 
 
@@ -217,10 +492,41 @@ int main(int argc, char* argv[]) {
         // --- 3. Create and Run the Server ---
         
         // The Server constructor handles all the loading.
-        Server server(final_config, model_metadata);
+        Model model(final_config, model_metadata);
         
         // The run() method contains the main application loop.
-        server.run();
+        model.run();
+
+
+        // --- 4. Start Services ---
+        zmq::context_t context(1);
+        zmq::socket_t router(context, zmq::socket_type::router);
+        
+        std::string service_endpoint;
+        std::string service_endpoint_public;
+
+        if (final_config.host == "localhost" || final_config.host == "127.0.0.1") {
+            int unique_id = std::rand() % 9000 + 1000;
+            service_endpoint = "ipc:///tmp/pie-service-" + std::to_string(unique_id);
+            service_endpoint_public = service_endpoint;
+        } else {
+            service_endpoint = "tcp://*:" + std::to_string(final_config.port);
+            service_endpoint_public = "tcp://" + final_config.host + ":" + std::to_string(final_config.port);
+        }
+        router.bind(service_endpoint);
+        std::cout << "Server listening on " << service_endpoint << std::endl;
+
+
+        std::thread zmq_thread(run_zmq_server, std::ref(router), std::cref(final_config), std::cref(model_metadata));
+        std::thread register_thread(register_with_controller, std::cref(final_config), service_endpoint_public);
+
+        std::cout << "Service is running. Press Ctrl+C to shut down." << std::endl;
+        zmq_thread.join();
+        register_thread.join();
+
+        router.close();
+        context.close();
+
         
     } catch (const std::exception& e) {
         std::cerr << "An error occurred: " << e.what() << std::endl;

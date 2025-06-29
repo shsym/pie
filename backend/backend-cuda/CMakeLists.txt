@@ -42,10 +42,21 @@ CPMAddPackage(
 )
 
 CPMAddPackage(
+    URI "gh:machinezone/IXWebSocket@11.4.6"
+)
+
+CPMAddPackage(
+    URI "gh:msgpack/msgpack-c#cpp-7.0.0"
+    OPTIONS "MSGPACK_CXX20 ON" "MSGPACK_USE_BOOST OFF" "MSGPACK_BUILD_DOCS OFF"
+)
+
+# for cbor parsing in zTensor maybe i can switch to libcbor later
+CPMAddPackage(
     URI "gh:nlohmann/json@3.12.0"
     OPTIONS "JSON_BuildTests OFF"
 )
 
+# for zTensor zstd decompression support
 CPMAddPackage(
     URI "gh:facebook/zstd@1.5.7"
 )
@@ -101,7 +112,7 @@ add_executable(pie_cuda_be
     src/main.cpp
     #src/ztensor.cpp
     src/gpt.cu
-    src/server.cu
+    src/model.cu
     #src/l4ma.cu
     #src/bpe.cpp
     #src/common.cu
@@ -138,7 +149,9 @@ target_link_libraries(pie_cuda_be PRIVATE
     tomlplusplus::tomlplusplus
     zstd
     nlohmann_json::nlohmann_json
-
+    ixwebsocket
+    msgpack-cxx
+    
     # protobuf bindings
     pie_protobuf
 
