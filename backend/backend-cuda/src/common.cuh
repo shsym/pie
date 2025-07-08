@@ -4,7 +4,6 @@
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include "flashinfer_ops.cuh"
 #include <stdexcept>
 #include <cstdint>
 #include <cstdio>

@@ -8,6 +8,7 @@
 #include <thrust/device_vector.h>
 
 #include "config.hpp"
+#include "flashinfer_ops.cuh"
 
 // Forward declarations for CUDA types
 typedef struct cublasLtContext* cublasLtHandle_t;
@@ -61,7 +62,8 @@ public:
                  int num_tokens,
                  thrust::device_vector<T>& temp_buffer,
                  cublasLtHandle_t ltHandle,
-                 cudaStream_t stream);
+                 cudaStream_t stream,
+                 thrust::device_vector<char>& workspace);
 
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
 
@@ -82,18 +84,19 @@ public:
 
     void forward(thrust::device_vector<T>& attn_output,
                  const thrust::device_vector<T>& hidden_states,
-                 const int32_t* position_ids,
+                 const thrust::device_vector<uint32_t>& position_ids,
                  thrust::device_vector<T>& kv_cache_k,
                  thrust::device_vector<T>& kv_cache_v,
                  const int32_t* kv_page_indices,
                  const int32_t* kv_page_indptr,
                  const int32_t* kv_last_page_lens,
                  const int32_t* qo_indptr,
-                 int nnz,
-                 int batch_size,
                  thrust::device_vector<T>& temp_buffer,
                  cublasLtHandle_t ltHandle,
-                 cudaStream_t stream);
+                 cudaStream_t stream,
+                 thrust::device_vector<char>& workspace,
+                 flashinfer::BatchPrefillHandler& prefill_handler
+                );
 
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
 
@@ -117,18 +120,19 @@ public:
     explicit L4maDecoderLayer(const L4maConfig& config);
 
     void forward(thrust::device_vector<T>& hidden_states, // In-place
-                 const int32_t* position_ids,
+                 const thrust::device_vector<uint32_t>& position_ids,
                  thrust::device_vector<T>& kv_cache_k,
                  thrust::device_vector<T>& kv_cache_v,
                  const int32_t* kv_page_indices,
                  const int32_t* kv_page_indptr,
                  const int32_t* kv_last_page_lens,
                  const int32_t* qo_indptr,
-                 int nnz,
-                 int batch_size,
                  thrust::device_vector<T>& temp_buffer,
                  cublasLtHandle_t ltHandle,
-                 cudaStream_t stream);
+                 cudaStream_t stream,
+                 thrust::device_vector<char>& workspace,
+                 flashinfer::BatchPrefillHandler& prefill_handler
+                );
 
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
 
@@ -150,8 +154,8 @@ public:
     explicit L4maModel(const L4maConfig& config);
 
     void forward(thrust::device_vector<T>& hidden_states,
-                 const thrust::device_vector<int32_t>& input_ids,
-                 const thrust::device_vector<int32_t>& position_ids,
+                 const thrust::device_vector<uint32_t>& input_ids,
+                 const thrust::device_vector<uint32_t>& position_ids,
                  thrust::device_vector<T>& kv_cache_k,
                  thrust::device_vector<T>& kv_cache_v,
                  const int32_t* kv_page_indices,
@@ -159,7 +163,10 @@ public:
                  const int32_t* kv_last_page_lens,
                  const int32_t* qo_indptr,
                  int batch_size,
-                 cudaStream_t stream);
+                 cudaStream_t stream,
+                 thrust::device_vector<char>& workspace,
+                 flashinfer::BatchPrefillHandler& prefill_handler
+                );
 
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
     
@@ -184,8 +191,8 @@ public:
     explicit L4maForCausalLM(const L4maConfig& config);
 
     void forward(thrust::device_vector<float>& logits,
-                 const thrust::device_vector<int32_t>& input_ids,
-                 const thrust::device_vector<int32_t>& position_ids,
+                 const thrust::device_vector<uint32_t>& input_ids,
+                 const thrust::device_vector<uint32_t>& position_ids,
                  thrust::device_vector<T>& kv_cache_k,
                  thrust::device_vector<T>& kv_cache_v,
                  const int32_t* kv_page_indices,
@@ -193,7 +200,9 @@ public:
                  const int32_t* kv_last_page_lens,
                  const int32_t* qo_indptr,
                  int batch_size,
-                 cudaStream_t stream);
+                 cudaStream_t stream,
+                 thrust::device_vector<char>& workspace
+                );
 
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
 
