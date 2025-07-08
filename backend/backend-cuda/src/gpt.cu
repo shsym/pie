@@ -1,10 +1,39 @@
 #include "gpt.cuh"
 #include "config.hpp"
+#include "common.cuh"   // Your helper functions header
 
 #include <stdexcept>
 #include <iostream>
 #include <utility>
+#include <algorithm> // for std::max
 
+#include "flashinfer/norm.cuh"
+#include "flashinfer/pos_enc.cuh"
+#include "flashinfer/page.cuh"
+
+// --- Helper CUDA Kernels ---
+// These are still needed for operations not covered by your common.cuh or FlashInfer.
+
+template <typename T>
+__global__ void add_residual_kernel(T* x, const T* residual, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        // Perform addition in float32 for precision, then cast back.
+        x[idx] = static_cast<T>(static_cast<float>(x[idx]) + static_cast<float>(residual[idx]));
+    }
+}
+
+template <typename T>
+__global__ void swiglu_kernel(T* gate_proj, const T* up_proj, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float gate_val = static_cast<float>(gate_proj[idx]);
+        float up_val = static_cast<float>(up_proj[idx]);
+        // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+        float silu_val = gate_val * (1.0f / (1.0f + expf(-gate_val)));
+        gate_proj[idx] = static_cast<T>(silu_val * up_val);
+    }
+}
 // --- Constructor Implementations ---
 
 template <typename T>
@@ -49,6 +78,7 @@ L4maModel<T>::L4maModel(const L4maConfig& config)
     for (int i = 0; i < config.num_layers; ++i) {
         layers_.emplace_back(config);
     }
+    CUBLAS_CHECK(cublasLtCreate(&cublaslt_handle_));
 }
 
 template <typename T>
@@ -129,7 +159,17 @@ const thrust::device_vector<T>& L4maModel<T>::get_embed_tokens_weight() const {
 
 template <typename T>
 void RMSNorm<T>::forward(thrust::device_vector<T>& output, const thrust::device_vector<T>& input, int num_tokens, cudaStream_t stream) {
-    std::cerr << "Warning: RMSNorm<T>::forward is not implemented." << std::endl;
+    
+    uint32_t batch_size = input.size() / config_.hidden_size;
+    uint32_t stride = config_.hidden_size;
+    uint32_t d = config_.hidden_size;
+
+    flashinfer::norm::RMSNorm(
+        const_cast<T *>(thrust::raw_pointer_cast(input.data())),
+        const_cast<T *>(thrust::raw_pointer_cast(weight_.data())),
+        thrust::raw_pointer_cast(output.data()),
+        batch_size, d, stride, stride, config_.rms_norm_eps
+    );
 }
 
 template <typename T>

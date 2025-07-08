@@ -116,6 +116,7 @@ add_executable(pie_cuda_be
     #src/ztensor.cpp
     src/gpt.cu
     src/model.cu
+    src/common.cu
     #src/l4ma.cu
     #src/bpe.cpp
     #src/common.cu
