@@ -143,6 +143,7 @@ public:
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
 
 private:
+    L4maConfig config_;
     L4maAttention<T> self_attn_;
     L4maMlp<T> mlp_;
     RMSNorm<T> input_layernorm_;

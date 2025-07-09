@@ -10,6 +10,7 @@
 #include "flashinfer/norm.cuh"
 #include "flashinfer/pos_enc.cuh"
 #include "flashinfer/page.cuh"
+#include "flashinfer/activation.cuh"
 #include "flashinfer_ops.cuh"
 
 // --- Helper CUDA Kernels ---
@@ -19,23 +20,39 @@ template <typename T>
 __global__ void add_residual_kernel(T* x, const T* residual, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        // Perform addition in float32 for precision, then cast back.
-        x[idx] = static_cast<T>(static_cast<float>(x[idx]) + static_cast<float>(residual[idx]));
+        x[idx] = x[idx] + residual[idx];
     }
 }
 
+__device__ __forceinline__ float silu(const float &val) { return val / (1.0f + __expf(-val)); }
+
 template <typename T>
-__global__ void swiglu_kernel(T* gate_proj, const T* up_proj, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        float gate_val = static_cast<float>(gate_proj[idx]);
-        float up_val = static_cast<float>(up_proj[idx]);
-        // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-        float silu_val = gate_val * (1.0f / (1.0f + expf(-gate_val)));
-        gate_proj[idx] = static_cast<T>(silu_val * up_val);
-    }
+void silu_and_mul(
+    T *out_ptr,
+    const T *in_ptr,
+    int num_tokens,
+    int d_half,
+    cudaStream_t stream)
+{
+    // This function wraps the flashinfer fused kernel for SwiGLU: out = silu(gate) * up
+    // The kernel expects a single concatenated input tensor and internally splits it.
+    // The 'd_half' parameter is the dimension of the gate/up projection (intermediate_size).
+    uint32_t vec_size = 16 / sizeof(T);
+    cudaLaunchConfig_t config;
+    config.gridDim = num_tokens;
+    config.blockDim = std::min(d_half / vec_size, 1024U);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    //attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    auto kernel = flashinfer::activation::act_and_mul_kernel<T, silu>;
+    // Pass a single input pointer to the underlying flashinfer kernel
+    cudaLaunchKernelEx(&config, kernel, out_ptr, in_ptr, d_half);
 }
-// --- Constructor Implementations ---
 
 template <typename T>
 RMSNorm<T>::RMSNorm(const L4maConfig& config)
@@ -64,7 +81,8 @@ L4maAttention<T>::L4maAttention(const L4maConfig& config)
 
 template <typename T>
 L4maDecoderLayer<T>::L4maDecoderLayer(const L4maConfig& config)
-    : self_attn_(config),
+    : config_(config),
+      self_attn_(config),
       mlp_(config),
       input_layernorm_(config),
       post_attention_layernorm_(config) {}
@@ -177,7 +195,7 @@ template <typename T>
 void L4maMlp<T>::forward(thrust::device_vector<T>& output, const thrust::device_vector<T>& x, int num_tokens, thrust::device_vector<T>& temp_buffer, cublasLtHandle_t ltHandle, cudaStream_t stream, thrust::device_vector<char>& workspace) {
     const int hidden_size = config_.hidden_size;
     const int intermediate_size = config_.intermediate_size;
-    
+
     // Partition the temp buffer
     thrust::device_vector<T> gate_proj_out(thrust::device_pointer_cast(temp_buffer.data()), thrust::device_pointer_cast(temp_buffer.data() + (size_t)num_tokens * intermediate_size));
     thrust::device_vector<T> up_proj_out(thrust::device_pointer_cast(gate_proj_out.data().get() + (size_t)num_tokens * intermediate_size), thrust::device_pointer_cast(gate_proj_out.data().get() + 2 * (size_t)num_tokens * intermediate_size));
@@ -189,8 +207,13 @@ void L4maMlp<T>::forward(thrust::device_vector<T>& output, const thrust::device_
     gemm_cublasLt<T>(ltHandle, stream, x, up_proj_weights_, nullptr, up_proj_out, num_tokens, intermediate_size, hidden_size, workspace, false, true);
 
     // 3. SwiGLU activation: silu(gate_proj) * up_proj (in-place into gate_proj_out)
-    int swiglu_elements = num_tokens * intermediate_size;
-    swiglu_kernel<<<(swiglu_elements + 255) / 256, 256, 0, stream>>>(thrust::raw_pointer_cast(gate_proj_out.data()), thrust::raw_pointer_cast(up_proj_out.data()), swiglu_elements);
+    silu_and_mul<T>(
+        thrust::raw_pointer_cast(temp_buffer.data()),
+        const_cast<T *>(thrust::raw_pointer_cast(temp_buffer.data())),
+        num_tokens,
+        intermediate_size,
+        stream
+    );
 
     // 4. Down projection: output = (activated_output) @ W_down^T
     gemm_cublasLt<T>(ltHandle, stream, gate_proj_out, down_proj_weights_, nullptr, output, num_tokens, hidden_size, intermediate_size, workspace, false, true);
@@ -333,7 +356,47 @@ void L4maDecoderLayer<T>::forward(
     thrust::device_vector<int32_t>& kv_batch_indices,
     thrust::device_vector<int32_t>& kv_positions
 ) {
-    std::cerr << "Warning: L4maDecoderLayer<T>::forward is not implemented." << std::endl;
+    const int num_tokens = hidden_states.size() / config_.hidden_size;
+
+    // --- 1. Self-Attention Block ---
+    
+    // Store residual for the first connection
+    thrust::device_vector<T> residual = hidden_states;
+
+    // Apply input layer normalization
+    thrust::device_vector<T> normed_input(hidden_states.size());
+    input_layernorm_.forward(normed_input, hidden_states, num_tokens, stream);
+
+    // Perform attention
+    thrust::device_vector<T> attn_output(hidden_states.size());
+    self_attn_.forward(attn_output, normed_input, position_ids, kv_cache_k, kv_cache_v, 
+                       kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr, temp_buffer, 
+                       ltHandle, stream, workspace, prefill_handler, page_size,
+                       kv_batch_indices, kv_positions);
+    
+    // First residual connection: hidden_states = residual + attn_output
+    add_residual_kernel<<<(hidden_states.size() + 255) / 256, 256, 0, stream>>>(
+        thrust::raw_pointer_cast(hidden_states.data()), 
+        thrust::raw_pointer_cast(attn_output.data()), 
+        hidden_states.size());
+
+    // --- 2. MLP Block ---
+
+    // Store residual for the second connection
+    residual = hidden_states;
+
+    // Apply post-attention layer normalization
+    post_attention_layernorm_.forward(normed_input, hidden_states, num_tokens, stream); // Re-use normed_input buffer
+
+    // Perform MLP
+    thrust::device_vector<T> mlp_output(hidden_states.size());
+    mlp_.forward(mlp_output, normed_input, num_tokens, temp_buffer, ltHandle, stream, workspace);
+
+    // Second residual connection: hidden_states = residual + mlp_output
+    add_residual_kernel<<<(hidden_states.size() + 255) / 256, 256, 0, stream>>>(
+        thrust::raw_pointer_cast(hidden_states.data()), 
+        thrust::raw_pointer_cast(mlp_output.data()), 
+        hidden_states.size());
 }
 
 template <typename T>
@@ -355,7 +418,23 @@ void L4maModel<T>::forward(
     thrust::device_vector<int32_t>& kv_batch_indices,
     thrust::device_vector<int32_t>& kv_positions
 ) {
-    std::cerr << "Warning: L4maModel<T>::forward is not implemented." << std::endl;
+    const int num_tokens = input_ids.size();
+    
+    // 1. Token Embeddings
+    embed<T>(embed_tokens_weight_, input_ids, &hidden_states, config_.hidden_size, stream);
+
+    size_t temp_buffer_size = 2 * (size_t)num_tokens * config_.intermediate_size;
+    thrust::device_vector<T> temp_buffer(temp_buffer_size);
+
+    for (auto& layer : layers_) {
+        layer.forward(hidden_states, position_ids, kv_cache_k, kv_cache_v,
+                      kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                      qo_indptr, temp_buffer, cublaslt_handle_, stream, workspace,
+                      prefill_handler, page_size, kv_batch_indices, kv_positions);
+    }
+
+    thrust::device_vector<T> final_norm_input = hidden_states;
+    norm_.forward(hidden_states, final_norm_input, num_tokens, stream);
 }
 
 template <typename T>
@@ -373,7 +452,33 @@ void L4maForCausalLM<T>::forward(
     cudaStream_t stream,
     thrust::device_vector<char>& workspace
     ) {
-    std::cerr << "Warning: L4maForCausalLM<T>::forward is not implemented." << std::endl;
+    
+    const int head_size = config_.head_size;
+    const int num_query_heads = config_.num_query_heads;
+    const int num_key_value_heads = config_.num_key_value_heads;
+    const int page_size = 64;
+
+    flashinfer::BatchPrefillHandler handler;
+    size_t float_workspace_size_in_bytes = 128 * 1024 * 1024;
+    thrust::device_vector<char> float_buffer(float_workspace_size_in_bytes);
+    size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
+    thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
+
+    std::vector<int32_t> qo_indptr_h{0, 32};
+    std::vector<int32_t> kv_indptr_host({0, 1});
+
+    handler.Plan<T, int32_t>(
+        (void *)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
+        (void *)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
+        qo_indptr_h.data(), 
+        kv_indptr_host.data(),
+         /*total_num_rows=*/32, 
+         /*batch=*/1,
+        num_query_heads,
+        num_key_value_heads,
+        head_size,
+        page_size);
+
 }
 
 // --- Explicit Template Instantiations ---
