@@ -1,170 +1,30 @@
 #include "l4ma.cuh"
-#include "common.cuh"
-#include "ztensor.hpp"
-#include <yaml-cpp/yaml.h>
-#include <thrust/copy.h>
-#include <thrust/host_vector.h>
-#include <cassert>
-#include <cstdint>
+#include "config.hpp"
+#include "common.cuh"   // Your helper functions header
+
+#include <stdexcept>
 #include <iostream>
-#include <flashinfer/norm.cuh>
-#include <flashinfer/activation.cuh>
+#include <utility>
+#include <algorithm> // for std::max
 
-// Helper to get pointer alignment (inspired by the provided example)
-uint32_t _getAlignment(const void *ptr)
-{
-    uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
-    if (address % 16 == 0)
-        return 16;
-    if (address % 8 == 0)
-        return 8;
-    if (address % 4 == 0)
-        return 4;
-    if (address % 2 == 0)
-        return 2;
-    return 1;
-}
+#include "flashinfer/norm.cuh"
+#include "flashinfer/pos_enc.cuh"
+#include "flashinfer/page.cuh"
+#include "flashinfer/activation.cuh"
+#include "flashinfer_ops.cuh"
 
-/***************************************************************************************************
- * CUDA KERNELS
- ***************************************************************************************************/
+// --- Helper CUDA Kernels ---
+// These are still needed for operations not covered by your common.cuh or FlashInfer.
 
-// The custom rms_norm_kernel has been removed and will be replaced by flashinfer's RMSNorm
-
-// In-place residual addition. Grid-strided loop for arbitrary sizes.
 template <typename T>
-__global__ void add_residual_inplace_kernel(T *x, const T *residual, int n_elements)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_elements; i += gridDim.x * blockDim.x)
-    {
-        x[i] = static_cast<T>(static_cast<float>(x[i]) + static_cast<float>(residual[i]));
+__global__ void add_residual_kernel(T* x, const T* residual, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        x[idx] = x[idx] + residual[idx];
     }
-}
-
-// Applies Rotary Position Embeddings to Q and K tensors.
-template <typename T>
-__global__ void apply_rope_kernel(
-    T *q_tensor, T *k_tensor, const int *position_ids, int num_q_heads, int num_kv_heads, int head_dim, float rope_base)
-{
-    int token_idx = blockIdx.x;
-    int head_idx = blockIdx.y;
-    int dim_idx = threadIdx.x;
-
-    if (dim_idx >= head_dim / 2)
-        return;
-
-    float pos = static_cast<float>(position_ids[token_idx]);
-    float inv_freq = pos / powf(rope_base, (2.0f * dim_idx) / head_dim);
-    float cos_val = cosf(inv_freq);
-    float sin_val = sinf(inv_freq);
-
-    int q_head_offset = (token_idx * num_q_heads + head_idx) * head_dim;
-    float q_val1 = static_cast<float>(q_tensor[q_head_offset + dim_idx]);
-    float q_val2 = static_cast<float>(q_tensor[q_head_offset + dim_idx + head_dim / 2]);
-    q_tensor[q_head_offset + dim_idx] = static_cast<T>(q_val1 * cos_val - q_val2 * sin_val);
-    q_tensor[q_head_offset + dim_idx + head_dim / 2] = static_cast<T>(q_val2 * cos_val + q_val1 * sin_val);
-
-    // Apply to K if the head index is within the KV head count
-    if (head_idx < num_kv_heads)
-    {
-        int k_head_offset = (token_idx * num_kv_heads + head_idx) * head_dim;
-        float k_val1 = static_cast<float>(k_tensor[k_head_offset + dim_idx]);
-        float k_val2 = static_cast<float>(k_tensor[k_head_offset + dim_idx + head_dim / 2]);
-        k_tensor[k_head_offset + dim_idx] = static_cast<T>(k_val1 * cos_val - k_val2 * sin_val);
-        k_tensor[k_head_offset + dim_idx + head_dim / 2] = static_cast<T>(k_val2 * cos_val + k_val1 * sin_val);
-    }
-}
-
-// Writes the new K/V projections into the paged KV cache.
-template <typename T>
-__global__ void update_kv_cache_kernel(
-    const T *k_new, const T *v_new,
-    T *kv_cache_k, T *kv_cache_v,
-    const int *qo_indptr, const int *kv_page_indptr, const int *kv_page_indices, const int *kv_last_page_lens,
-    int batch_size, int num_kv_heads, int head_dim)
-{
-
-    int batch_idx = blockIdx.x;
-    if (batch_idx >= batch_size)
-        return;
-
-    int head_and_dim_idx = threadIdx.x;
-    int head_idx = head_and_dim_idx / head_dim;
-    int dim_idx = head_and_dim_idx % head_dim;
-
-    if (head_idx >= num_kv_heads)
-        return;
-
-    int seq_len = kv_last_page_lens[batch_idx];
-    int page_idx = kv_page_indptr[batch_idx] + (seq_len / PAGE_SIZE);
-    int page_offset = seq_len % PAGE_SIZE;
-    int physical_page_idx = kv_page_indices[page_idx];
-
-    int cache_offset = physical_page_idx * PAGE_SIZE * num_kv_heads * head_dim +
-                       head_idx * PAGE_SIZE * head_dim +
-                       page_offset * head_dim +
-                       dim_idx;
-
-    int new_kv_offset = qo_indptr[batch_idx] * num_kv_heads * head_dim +
-                        head_idx * head_dim +
-                        dim_idx;
-
-    kv_cache_k[cache_offset] = k_new[new_kv_offset];
-    kv_cache_v[cache_offset] = v_new[new_kv_offset];
-}
-
-// Fused Paged Attention Kernel (QKT, Softmax, SV)
-template <typename T>
-__global__ void paged_attention_kernel(
-    T *__restrict__ out, const T *__restrict__ q,
-    const T *__restrict__ k_cache, const T *__restrict__ v_cache,
-    const int *__restrict__ kv_page_indptr, const int *__restrict__ kv_page_indices, const int *__restrict__ kv_last_page_lens,
-    const int *__restrict__ qo_indptr,
-    int batch_size, int num_q_heads, int num_kv_heads, int head_dim)
-{
-
-    // Simplified kernel: This is a complex operation. A production-grade version
-    // would use shared memory more extensively for reductions and data reuse.
-    // This version is functional but not highly optimized.
-
-    int token_idx = blockIdx.x;
-    int head_idx = blockIdx.y;
-    int thread_idx = threadIdx.x;
-
-    int batch_idx = -1;
-    for (int b = 0; b < batch_size; ++b)
-    {
-        if (token_idx >= qo_indptr[b] && token_idx < qo_indptr[b + 1])
-        {
-            batch_idx = b;
-            break;
-        }
-    }
-    if (batch_idx == -1)
-        return;
-
-    int seq_len = kv_last_page_lens[batch_idx] + 1;
-    int kv_head_idx = head_idx * num_kv_heads / num_q_heads;
-
-    // This kernel would need significant work to be efficient.
-    // For now, we'll keep the simplified logic.
-    // ... (rest of simplified kernel logic)
 }
 
 __device__ __forceinline__ float silu(const float &val) { return val / (1.0f + __expf(-val)); }
-
-__device__ __forceinline__ float gelu(const float &val)
-{
-    constexpr float kAlpha = M_SQRT1_2;
-    return val * 0.5f * (1.0f + ::erf(val * kAlpha));
-}
-
-__device__ __forceinline__ float gelu_tanh(const float &val)
-{
-    const float cdf =
-        0.5f * (1.0f + tanhf(0.7978845608028654f * (val + 0.044715f * val * val * val)));
-    return val * cdf;
-}
 
 template <typename T>
 void silu_and_mul(
@@ -172,8 +32,7 @@ void silu_and_mul(
     const T *in_ptr,
     int num_tokens,
     int d_half,
-    cudaStream_t stream,
-    bool enable_pdl)
+    cudaStream_t stream)
 {
     // This function wraps the flashinfer fused kernel for SwiGLU: out = silu(gate) * up
     // The kernel expects a single concatenated input tensor and internally splits it.
@@ -186,7 +45,7 @@ void silu_and_mul(
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    //attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
     config.numAttrs = 1;
     config.attrs = attrs;
 
@@ -195,360 +54,457 @@ void silu_and_mul(
     cudaLaunchKernelEx(&config, kernel, out_ptr, in_ptr, d_half);
 }
 
-void L4maConfig::print() const
-{
-    printf("L4maConfig:\n");
-    printf("  hidden_size: %d\n", hidden_size);
-    printf("  intermediate_size: %d\n", intermediate_size);
-    printf("  num_attention_heads: %d\n", num_attention_heads);
-    printf("  num_key_value_heads: %d\n", num_key_value_heads);
-    printf("  num_hidden_layers: %d\n", num_hidden_layers);
-    printf("  use_qkv_bias: %s\n", use_qkv_bias ? "true" : "false");
-    printf("  rms_norm_eps: %g\n", rms_norm_eps);
-    printf("  vocab_size: %d\n", vocab_size);
-    printf("  pad_token_id: %d\n", pad_token_id);
-    printf("  rope_base: %g\n", rope_base);
-}
-
-// *** FIXED IMPLEMENTATION ***
-L4maConfig load_l4ma_config_from_yaml(const std::string &yaml_path)
-{
-    L4maConfig config;
-    YAML::Node root = YAML::LoadFile(yaml_path);
-
-    auto arch = root["architecture"];
-    if (!arch)
-        throw std::runtime_error("Missing architecture section in YAML");
-    config.hidden_size = arch["hidden_size"].as<int>();
-    config.intermediate_size = arch["intermediate_size"].as<int>();
-    config.num_attention_heads = arch["num_heads"].as<int>();
-    config.num_key_value_heads = arch["num_heads_kv"].as<int>();
-    config.num_hidden_layers = arch["num_layers"].as<int>();
-    config.use_qkv_bias = arch["use_qkv_bias"] ? arch["use_qkv_bias"].as<bool>() : false;
-    config.rms_norm_eps = arch["rms_norm_eps"] ? arch["rms_norm_eps"].as<float>() : 1e-5f;
-
-    auto tokenizer = root["tokenizer"];
-    if (!tokenizer)
-        throw std::runtime_error("Missing tokenizer section in YAML");
-    config.vocab_size = tokenizer["vocab_size"].as<int>();
-    config.pad_token_id = root["pad_token_id"] ? root["pad_token_id"].as<int>() : 0;
-
-    return config;
-}
-
-/***************************************************************************************************
- * CLASS IMPLEMENTATIONS
- ***************************************************************************************************/
-
-// --- L4maMlp ---
-// *** ADDED IMPLEMENTATION ***
 template <typename T>
-L4maMlp<T>::L4maMlp(const L4maConfig &config,
-                    const thrust::device_vector<T> &gate_proj_weights,
-                    const thrust::device_vector<T> &up_proj_weights,
-                    const thrust::device_vector<T> &down_proj_weights)
+RMSNorm<T>::RMSNorm(const L4maConfig& config)
+    : weight_(config.hidden_size) {}
+
+template <typename T>
+L4maMlp<T>::L4maMlp(const L4maConfig& config)
     : config_(config),
-      gate_proj_weights_(gate_proj_weights),
-      up_proj_weights_(up_proj_weights),
-      down_proj_weights_(down_proj_weights) {}
+      gate_proj_weights_(config.hidden_size * config.intermediate_size),
+      up_proj_weights_(config.hidden_size * config.intermediate_size),
+      down_proj_weights_(config.intermediate_size * config.hidden_size) {}
 
 template <typename T>
-L4maMlp<T>::~L4maMlp() {}
-
-template <typename T>
-void L4maMlp<T>::forward(thrust::device_vector<T> &output,
-                         const thrust::device_vector<T> &x,
-                         int num_tokens,
-                         thrust::device_vector<T> &temp_buffer,
-                         cublasLtHandle_t ltHandle,
-                         cudaStream_t stream)
-{
-    const int hs = config_.hidden_size;
-    const int is = config_.intermediate_size;
-
-    // The temp_buffer holds the concatenated gate and up projections.
-    T *gate_and_up_ptr = thrust::raw_pointer_cast(temp_buffer.data());
-    T *gate_out_ptr = gate_and_up_ptr;
-    T *up_out_ptr = gate_and_up_ptr + num_tokens * is;
-
-    const T *x_ptr = thrust::raw_pointer_cast(x.data());
-    T *output_ptr = thrust::raw_pointer_cast(output.data());
-
-    // // 1. Gate projection: result stored in the first half of the temp buffer
-    // gemm_cublasLt<T>(ltHandle, stream, x_ptr, thrust::raw_pointer_cast(gate_proj_weights_.data()), gate_out_ptr, num_tokens, is, hs, false, true);
-
-    // // 2. Up projection: result stored in the second half of the temp buffer
-    // gemm_cublasLt<T>(ltHandle, stream, x_ptr, thrust::raw_pointer_cast(up_proj_weights_.data()), up_out_ptr, num_tokens, is, hs, false, true);
-
-    // // 3. SiLU activation and element-wise multiply
-    // // The kernel takes the entire gate_and_up_ptr as input and writes the result
-    // // into the first half of the buffer (gate_out_ptr), which is then used for the down projection.
-    // silu_and_mul<T>(gate_out_ptr, gate_and_up_ptr, num_tokens, is, stream, false);
-
-    // // 4. Down projection: output = result * W_d^T
-    // gemm_cublasLt<T>(ltHandle, stream, gate_out_ptr, thrust::raw_pointer_cast(down_proj_weights_.data()), output_ptr, num_tokens, hs, is, false, true);
+L4maAttention<T>::L4maAttention(const L4maConfig& config)
+    : config_(config),
+      q_proj_weights_(config.hidden_size * (config.num_query_heads * config.head_size)),
+      k_proj_weights_(config.hidden_size * (config.num_key_value_heads * config.head_size)),
+      v_proj_weights_(config.hidden_size * (config.num_key_value_heads * config.head_size)),
+      o_proj_weights_((config.num_query_heads * config.head_size) * config.hidden_size) {
+    if (config_.use_qkv_bias) {
+        q_proj_bias_.resize(config.num_query_heads * config.head_size);
+        k_proj_bias_.resize(config.num_key_value_heads * config.head_size);
+        v_proj_bias_.resize(config.num_key_value_heads * config.head_size);
+    }
 }
 
-// --- L4maAttention ---
 template <typename T>
-L4maAttention<T>::L4maAttention(const L4maConfig &config,
-                                const thrust::device_vector<T> &q_proj_weights, const thrust::device_vector<T> &k_proj_weights,
-                                const thrust::device_vector<T> &v_proj_weights, const thrust::device_vector<T> &o_proj_weights)
-    : config_(config), q_proj_weights_(q_proj_weights), k_proj_weights_(k_proj_weights),
-      v_proj_weights_(v_proj_weights), o_proj_weights_(o_proj_weights) {}
+L4maDecoderLayer<T>::L4maDecoderLayer(const L4maConfig& config)
+    : config_(config),
+      self_attn_(config),
+      mlp_(config),
+      input_layernorm_(config),
+      post_attention_layernorm_(config) {}
 
 template <typename T>
-L4maAttention<T>::~L4maAttention() {}
+L4maModel<T>::L4maModel(const L4maConfig& config)
+    : config_(config),
+      embed_tokens_weight_(config.vocab_size * config.hidden_size),
+      norm_(config) {
+
+    layers_.reserve(config.num_layers);
+    for (int i = 0; i < config.num_layers; ++i) {
+        layers_.emplace_back(config);
+    }
+    CUBLAS_CHECK(cublasLtCreate(&cublaslt_handle_));
+}
+
+template <typename T>
+L4maForCausalLM<T>::L4maForCausalLM(const L4maConfig& config)
+    : config_(config), model_(config) {
+    lm_head_weight_ = model_.get_embed_tokens_weight(); // Weight tying
+}
+
+
+template <typename T>
+void L4maForCausalLM<T>::create_kv_device_vectors(int max_kv_num) {
+    // Preallocate KV-cache device vectors with the correct size
+    size_t kv_cache_size = static_cast<size_t>(max_kv_num) * config_.num_key_value_heads * config_.head_size;
+
+    // Only resize if needed to avoid unnecessary allocations
+    if (kv_cache_k_.size() != kv_cache_size) {
+        kv_cache_k_.resize(kv_cache_size);
+    }
+    if (kv_cache_v_.size() != kv_cache_size) {
+        kv_cache_v_.resize(kv_cache_size);
+    }
+}
+
+// --- get_parameters() Implementations ---
+
+template <typename T>
+std::map<std::string, thrust::device_vector<T>*> RMSNorm<T>::get_parameters() {
+    return {{"weight", &weight_}};
+}
+
+template <typename T>
+std::map<std::string, thrust::device_vector<T>*> L4maMlp<T>::get_parameters() {
+    return {{"gate_proj.weight", &gate_proj_weights_},
+            {"up_proj.weight", &up_proj_weights_},
+            {"down_proj.weight", &down_proj_weights_}};
+}
+
+template <typename T>
+std::map<std::string, thrust::device_vector<T>*> L4maAttention<T>::get_parameters() {
+    auto params = std::map<std::string, thrust::device_vector<T>*>{
+        {"q_proj.weight", &q_proj_weights_},
+        {"k_proj.weight", &k_proj_weights_},
+        {"v_proj.weight", &v_proj_weights_},
+        {"o_proj.weight", &o_proj_weights_}};
+    if (config_.use_qkv_bias) {
+        params["q_proj.bias"] = &q_proj_bias_;
+        params["k_proj.bias"] = &k_proj_bias_;
+        params["v_proj.bias"] = &v_proj_bias_;
+    }
+    return params;
+}
+
+template <typename T>
+std::map<std::string, thrust::device_vector<T>*> L4maDecoderLayer<T>::get_parameters() {
+    std::map<std::string, thrust::device_vector<T>*> params;
+    for (auto const& [key, val] : self_attn_.get_parameters()) { params["self_attn." + key] = val; }
+    for (auto const& [key, val] : mlp_.get_parameters()) { params["mlp." + key] = val; }
+    for (auto const& [key, val] : input_layernorm_.get_parameters()) { params["input_layernorm." + key] = val; }
+    for (auto const& [key, val] : post_attention_layernorm_.get_parameters()) { params["post_attention_layernorm." + key] = val; }
+    return params;
+}
+
+template <typename T>
+std::map<std::string, thrust::device_vector<T>*> L4maModel<T>::get_parameters() {
+    std::map<std::string, thrust::device_vector<T>*> params;
+    params["embed_tokens.weight"] = &embed_tokens_weight_;
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        for (auto const& [key, val] : layers_[i].get_parameters()) {
+            params["layers." + std::to_string(i) + "." + key] = val;
+        }
+    }
+    for (auto const& [key, val] : norm_.get_parameters()) { params["norm." + key] = val; }
+    return params;
+}
+
+template <typename T>
+std::map<std::string, thrust::device_vector<T>*> L4maForCausalLM<T>::get_parameters() {
+    std::map<std::string, thrust::device_vector<T>*> params;
+    for (auto const& [key, val] : model_.get_parameters()) {
+        params["model." + key] = val;
+    }
+    params["lm_head.weight"] = &lm_head_weight_;
+    return params;
+}
+
+template <typename T>
+const thrust::device_vector<T>& L4maModel<T>::get_embed_tokens_weight() const {
+    return embed_tokens_weight_;
+}
+
+// --- Forward Pass Stub ---
+
+
+template <typename T>
+void RMSNorm<T>::forward(thrust::device_vector<T>& output, const thrust::device_vector<T>& input, int num_tokens, cudaStream_t stream) {
+    
+    uint32_t batch_size = input.size() / config_.hidden_size;
+    uint32_t stride = config_.hidden_size;
+    uint32_t d = config_.hidden_size;
+
+    flashinfer::norm::RMSNorm(
+        const_cast<T *>(thrust::raw_pointer_cast(input.data())),
+        const_cast<T *>(thrust::raw_pointer_cast(weight_.data())),
+        thrust::raw_pointer_cast(output.data()),
+        batch_size, d, stride, stride, config_.rms_norm_eps
+    );
+}
+
+template <typename T>
+void L4maMlp<T>::forward(thrust::device_vector<T>& output, const thrust::device_vector<T>& x, int num_tokens, thrust::device_vector<T>& temp_buffer, cublasLtHandle_t ltHandle, cudaStream_t stream, thrust::device_vector<char>& workspace) {
+    const int hidden_size = config_.hidden_size;
+    const int intermediate_size = config_.intermediate_size;
+
+    // Partition the temp buffer
+    thrust::device_vector<T> gate_proj_out(thrust::device_pointer_cast(temp_buffer.data()), thrust::device_pointer_cast(temp_buffer.data() + (size_t)num_tokens * intermediate_size));
+    thrust::device_vector<T> up_proj_out(thrust::device_pointer_cast(gate_proj_out.data().get() + (size_t)num_tokens * intermediate_size), thrust::device_pointer_cast(gate_proj_out.data().get() + 2 * (size_t)num_tokens * intermediate_size));
+
+    // 1. Gate projection: gate_proj_out = x @ W_gate^T
+    gemm_cublasLt<T>(ltHandle, stream, x, gate_proj_weights_, nullptr, gate_proj_out, num_tokens, intermediate_size, hidden_size, workspace, false, true);
+    
+    // 2. Up projection: up_proj_out = x @ W_up^T
+    gemm_cublasLt<T>(ltHandle, stream, x, up_proj_weights_, nullptr, up_proj_out, num_tokens, intermediate_size, hidden_size, workspace, false, true);
+
+    // 3. SwiGLU activation: silu(gate_proj) * up_proj (in-place into gate_proj_out)
+    silu_and_mul<T>(
+        thrust::raw_pointer_cast(temp_buffer.data()),
+        const_cast<T *>(thrust::raw_pointer_cast(temp_buffer.data())),
+        num_tokens,
+        intermediate_size,
+        stream
+    );
+
+    // 4. Down projection: output = (activated_output) @ W_down^T
+    gemm_cublasLt<T>(ltHandle, stream, gate_proj_out, down_proj_weights_, nullptr, output, num_tokens, hidden_size, intermediate_size, workspace, false, true);
+}
 
 template <typename T>
 void L4maAttention<T>::forward(
-    thrust::device_vector<T> &attn_output, const thrust::device_vector<T> &hidden_states,
-    const int32_t *position_ids, thrust::device_vector<T> &kv_cache_k, thrust::device_vector<T> &kv_cache_v,
-    const int32_t *kv_page_indices, const int32_t *kv_page_indptr, const int32_t *kv_last_page_lens,
-    const int32_t *qo_indptr, int nnz, int batch_size,
-    thrust::device_vector<T> &temp_buffer, cublasLtHandle_t ltHandle, cudaStream_t stream)
-{
-    // int hs = config_.hidden_size;
-    // int nq = config_.num_attention_heads;
-    // int nkv = config_.num_key_value_heads;
-    // int hd = config_.head_dim();
+    thrust::device_vector<T>& attn_output,
+    const thrust::device_vector<T>& hidden_states,
+    const thrust::device_vector<int32_t>& position_ids,
+    thrust::device_vector<T>& kv_cache_k,
+    thrust::device_vector<T>& kv_cache_v,
+    thrust::device_vector<int32_t>& kv_page_indices,
+    thrust::device_vector<int32_t>& kv_page_indptr,
+    thrust::device_vector<int32_t>& kv_last_page_lens,
+    thrust::device_vector<int32_t>& qo_indptr,
+    thrust::device_vector<T>& temp_buffer,
+    cublasLtHandle_t ltHandle,
+    cudaStream_t stream,
+    thrust::device_vector<char>& workspace,
+    flashinfer::BatchPrefillHandler& prefill_handler,
+    const int32_t page_size,
+    thrust::device_vector<int32_t>& kv_batch_indices,
+    thrust::device_vector<int32_t>& kv_positions
+) {
 
-    // // temp_buffer layout: [Q_proj | K_proj | V_proj]
-    // T *q_proj_ptr = thrust::raw_pointer_cast(temp_buffer.data());
-    // T *k_proj_ptr = q_proj_ptr + nnz * nq * hd;
-    // T *v_proj_ptr = k_proj_ptr + nnz * nkv * hd;
+    const int batch_size = hidden_states.size() / config_.hidden_size;
+    const int hidden_size = config_.hidden_size;
+    const int head_size = config_.head_size;
+    const int num_query_heads = config_.num_query_heads;
+    const int num_key_value_heads = config_.num_key_value_heads;
+    
+    size_t q_size = (size_t)batch_size * num_query_heads * head_size;
+    size_t k_size = (size_t)batch_size * num_key_value_heads * head_size;
+    size_t v_size = (size_t)batch_size * num_key_value_heads * head_size;
 
-    // // 1. Q, K, V projections (Weights are [out_dim, in_dim], so we need to transpose B)
-    // gemm_cublasLt<T>(ltHandle, stream, thrust::raw_pointer_cast(hidden_states.data()), thrust::raw_pointer_cast(q_proj_weights_.data()), q_proj_ptr, nnz, nq * hd, hs, false, true);
-    // gemm_cublasLt<T>(ltHandle, stream, thrust::raw_pointer_cast(hidden_states.data()), thrust::raw_pointer_cast(k_proj_weights_.data()), k_proj_ptr, nnz, nkv * hd, hs, false, true);
-    // gemm_cublasLt<T>(ltHandle, stream, thrust::raw_pointer_cast(hidden_states.data()), thrust::raw_pointer_cast(v_proj_weights_.data()), v_proj_ptr, nnz, nkv * hd, hs, false, true);
+    if(temp_buffer.size() < q_size + k_size + v_size) {
+        throw std::runtime_error("Temporary buffer size is too small for Q, K, V projections.");
+    }
 
-    // // 2. Apply RoPE
-    // dim3 rope_grid(nnz, nq);
-    // dim3 rope_block(hd / 2);
-    // apply_rope_kernel<T><<<rope_grid, rope_block, 0, stream>>>(q_proj_ptr, k_proj_ptr, position_ids, nq, nkv, hd, config_.rope_base);
+    // Partition buffer
+    thrust::device_vector<T> q_proj(thrust::device_pointer_cast(temp_buffer.data()), thrust::device_pointer_cast(temp_buffer.data() + q_size));
+    thrust::device_vector<T> k_proj(thrust::device_pointer_cast(q_proj.data().get() + q_size), thrust::device_pointer_cast(q_proj.data().get() + q_size + k_size));
+    thrust::device_vector<T> v_proj(thrust::device_pointer_cast(k_proj.data().get() + k_size), thrust::device_pointer_cast(k_proj.data().get() + k_size + v_size));
+    
+    // 1. Q, K, V projections
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, q_proj_weights_, config_.use_qkv_bias ? &q_proj_bias_ : nullptr, q_proj, batch_size, num_query_heads * head_size, hidden_size, workspace, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, k_proj_weights_, config_.use_qkv_bias ? &k_proj_bias_ : nullptr, k_proj, batch_size, num_key_value_heads * head_size, hidden_size, workspace, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, v_proj_weights_, config_.use_qkv_bias ? &v_proj_bias_ : nullptr, v_proj, batch_size, num_key_value_heads * head_size, hidden_size, workspace, false, true);
 
-    // // 3. Update KV Cache
-    // dim3 kv_cache_grid(batch_size);
-    // dim3 kv_cache_block(nkv * hd);
-    // update_kv_cache_kernel<T><<<kv_cache_grid, kv_cache_block, 0, stream>>>(
-    //     k_proj_ptr, v_proj_ptr, thrust::raw_pointer_cast(kv_cache_k.data()), thrust::raw_pointer_cast(kv_cache_v.data()),
-    //     qo_indptr, kv_page_indptr, kv_page_indices, kv_last_page_lens, batch_size, nkv, hd);
+    // 2. Apply RoPE (in-place)
+    flashinfer::BatchQKApplyLlama31RotaryPosIds(
+        const_cast<T *>(thrust::raw_pointer_cast(q_proj.data())), // q
+        const_cast<T *>(thrust::raw_pointer_cast(k_proj.data())), // k
+        thrust::raw_pointer_cast(q_proj.data()),                  // q_rope (not available)
+        thrust::raw_pointer_cast(k_proj.data()),                  // k_rope (not available)
+        thrust::raw_pointer_cast(position_ids.data()),                 // pos_ids (uint32_t*)
+        batch_size,                                                    // nnz (assuming batch size for now)
+        num_query_heads,                                                       // num_qo_heads
+        num_key_value_heads,                                                      // num_kv_heads
+        head_size,                                       // rotary_dim
+        head_size,                                       // head_dim
+        num_query_heads * head_size,                                                  // q_stride_n
+        head_size,                                       // q_stride_h
+        num_key_value_heads * head_size,                                                 // k_stride_n
+        head_size,
+        ///----                                                      // k_stride_h
+        // q_rope_stride_n, q_rope_stride_h, k_rope_stride_n, k_rope_stride_h (not available)
+        num_query_heads * head_size,
+        head_size,
+        num_key_value_heads * head_size,
+        head_size,
+        ///----                                                      
+        false, // interleave
+        8.0f,  // rope_scale
+        5e5f,  // rope_theta
+        1.0f,  // low_freq_factor
+        4.0f,  // high_freq_factor
+        8192,  // old_context_length
+        stream // cudaStream_t
+    );
 
-    // // 4. Paged Attention (Simplified kernel, see above)
-    // dim3 attn_grid(nnz, nq);
-    // dim3 attn_block(128);
-    // paged_attention_kernel<T><<<attn_grid, attn_block, 0, stream>>>( // Note: shmem disabled for this simple version
-    //     thrust::raw_pointer_cast(attn_output.data()), q_proj_ptr, thrust::raw_pointer_cast(kv_cache_k.data()), thrust::raw_pointer_cast(kv_cache_v.data()),
-    //     kv_page_indptr, kv_page_indices, kv_last_page_lens, qo_indptr, batch_size, nq, nkv, hd);
 
-    // // 5. Output projection
-    // T *attn_out_gemm_in = thrust::raw_pointer_cast(attn_output.data());
-    // thrust::device_vector<T> o_proj_out(nnz * hs);
-    // gemm_cublasLt<T>(ltHandle, stream, attn_out_gemm_in, thrust::raw_pointer_cast(o_proj_weights_.data()), thrust::raw_pointer_cast(o_proj_out.data()), nnz, hs, hs, false, true);
-    // attn_output = o_proj_out;
+    // 3. Create paged KV-cache object
+    flashinfer::paged_kv_t<T, int32_t> paged_kv(
+        num_key_value_heads, page_size, head_size, batch_size,
+        flashinfer::QKVLayout::kNHD,
+        thrust::raw_pointer_cast(kv_cache_k.data()),
+        thrust::raw_pointer_cast(kv_cache_v.data()),
+        thrust::raw_pointer_cast(kv_page_indices.data()), 
+        thrust::raw_pointer_cast(kv_page_indptr.data()), 
+        thrust::raw_pointer_cast(kv_last_page_lens.data())
+    );
+
+
+    flashinfer::AppendPagedKVCache<T, int32_t>(
+        paged_kv,
+        thrust::raw_pointer_cast(k_proj.data()), // append_key
+        thrust::raw_pointer_cast(v_proj.data()), // append_value
+        thrust::raw_pointer_cast(kv_batch_indices.data()),
+        thrust::raw_pointer_cast(kv_positions.data()),
+        kv_batch_indices.size(),
+        num_key_value_heads * head_size, head_size,
+        num_key_value_heads * head_size, head_size);
+
+
+    thrust::device_vector<T> o_proj = q_proj; // Reuse buffer
+    cudaError_t status = flashinfer::BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(
+        &prefill_handler,
+        thrust::raw_pointer_cast(q_proj.data()),
+        thrust::raw_pointer_cast(qo_indptr.data()),
+        /*q_rope_offset=*/nullptr,
+        paged_kv,
+        thrust::raw_pointer_cast(o_proj.data()),
+        /*lse=*/nullptr, 
+        num_query_heads,
+        /*causal=*/false,
+        flashinfer::PosEncodingMode::kNone);
+
+    gemm_cublasLt<T>(ltHandle, stream, o_proj, o_proj_weights_, nullptr, attn_output, batch_size, hidden_size, num_query_heads * head_size, workspace, false, true);
+
 }
-
-// --- L4maDecoderLayer ---
-template <typename T>
-L4maDecoderLayer<T>::L4maDecoderLayer(const L4maConfig &config, const std::unordered_map<std::string, thrust::device_vector<T>> &weights)
-    : config_(config),
-      self_attn_(config, weights.at("self_attn.q_proj.weight"), weights.at("self_attn.k_proj.weight"),
-                 weights.at("self_attn.v_proj.weight"), weights.at("self_attn.o_proj.weight")),
-      mlp_(config, weights.at("mlp.gate_proj.weight"), weights.at("mlp.up_proj.weight"), weights.at("mlp.down_proj.weight")),
-      input_layernorm_weight_(weights.at("input_layernorm.weight")),
-      post_attention_layernorm_weight_(weights.at("post_attention_layernorm.weight")) {}
-
-template <typename T>
-L4maDecoderLayer<T>::~L4maDecoderLayer() {}
 
 template <typename T>
 void L4maDecoderLayer<T>::forward(
-    thrust::device_vector<T> &hidden_states, const int32_t *position_ids,
-    thrust::device_vector<T> &kv_cache_k, thrust::device_vector<T> &kv_cache_v,
-    const int32_t *kv_page_indices, const int32_t *kv_page_indptr, const int32_t *kv_last_page_lens,
-    const int32_t *qo_indptr, int nnz, int batch_size,
-    thrust::device_vector<T> &temp_buffer, cublasLtHandle_t ltHandle, cudaStream_t stream)
-{
-    // Ensure buffers are sized correctly
-    if (residual_.size() != hidden_states.size())
-        residual_.resize(hidden_states.size());
-    if (normed_hidden_states_.size() != hidden_states.size())
-        normed_hidden_states_.resize(hidden_states.size());
+    thrust::device_vector<T>& hidden_states,
+    const thrust::device_vector<uint32_t>& position_ids,
+    thrust::device_vector<T>& kv_cache_k,
+    thrust::device_vector<T>& kv_cache_v,
+    thrust::device_vector<int32_t>& kv_page_indices,
+    thrust::device_vector<int32_t>& kv_page_indptr,
+    thrust::device_vector<int32_t>& kv_last_page_lens,
+    thrust::device_vector<int32_t>& qo_indptr,
+    thrust::device_vector<T>& temp_buffer,
+    cublasLtHandle_t ltHandle,
+    cudaStream_t stream,
+    thrust::device_vector<char>& workspace,
+    flashinfer::BatchPrefillHandler& prefill_handler,
+    const int32_t page_size,
+    thrust::device_vector<int32_t>& kv_batch_indices,
+    thrust::device_vector<int32_t>& kv_positions
+) {
+    const int num_tokens = hidden_states.size() / config_.hidden_size;
 
-    // 1. First residual connection and RMSNorm
-    thrust::copy(hidden_states.begin(), hidden_states.end(), residual_.begin());
-    // FIXED: Removed flashinfer:: namespace qualifier
-    CUDA_CHECK(flashinfer::norm::RMSNorm<T>(
-        thrust::raw_pointer_cast(hidden_states.data()),
-        thrust::raw_pointer_cast(input_layernorm_weight_.data()),
-        thrust::raw_pointer_cast(normed_hidden_states_.data()),
-        nnz, config_.hidden_size,
-        config_.hidden_size, config_.hidden_size,
-        config_.rms_norm_eps, false, stream));
+    // --- 1. Self-Attention Block ---
+    
+    // Store residual for the first connection
+    thrust::device_vector<T> residual = hidden_states;
 
-    // 2. Attention
+    // Apply input layer normalization
+    thrust::device_vector<T> normed_input(hidden_states.size());
+    input_layernorm_.forward(normed_input, hidden_states, num_tokens, stream);
+
+    // Perform attention
     thrust::device_vector<T> attn_output(hidden_states.size());
-    self_attn_.forward(attn_output, normed_hidden_states_, position_ids, kv_cache_k, kv_cache_v,
-                       kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr,
-                       nnz, batch_size, temp_buffer, ltHandle, stream);
+    self_attn_.forward(attn_output, normed_input, position_ids, kv_cache_k, kv_cache_v, 
+                       kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr, temp_buffer, 
+                       ltHandle, stream, workspace, prefill_handler, page_size,
+                       kv_batch_indices, kv_positions);
+    
+    // First residual connection: hidden_states = residual + attn_output
+    add_residual_kernel<<<(hidden_states.size() + 255) / 256, 256, 0, stream>>>(
+        thrust::raw_pointer_cast(hidden_states.data()), 
+        thrust::raw_pointer_cast(attn_output.data()), 
+        hidden_states.size());
 
-    // 3. Add attention output to residual
-    add_residual_inplace_kernel<T><<<(hidden_states.size() + 255) / 256, 256, 0, stream>>>(
-        thrust::raw_pointer_cast(attn_output.data()), thrust::raw_pointer_cast(residual_.data()), hidden_states.size());
+    // --- 2. MLP Block ---
 
-    // 4. Second residual and RMSNorm
-    thrust::copy(attn_output.begin(), attn_output.end(), residual_.begin());
-    // FIXED: Removed flashinfer:: namespace qualifier
-    CUDA_CHECK(flashinfer::norm::RMSNorm<T>(
-        thrust::raw_pointer_cast(attn_output.data()),
-        thrust::raw_pointer_cast(post_attention_layernorm_weight_.data()),
-        thrust::raw_pointer_cast(normed_hidden_states_.data()),
-        nnz, config_.hidden_size,
-        config_.hidden_size, config_.hidden_size,
-        config_.rms_norm_eps, false, stream));
+    // Store residual for the second connection
+    residual = hidden_states;
 
-    // 5. MLP
-    mlp_.forward(hidden_states, normed_hidden_states_, nnz, temp_buffer, ltHandle, stream);
+    // Apply post-attention layer normalization
+    post_attention_layernorm_.forward(normed_input, hidden_states, num_tokens, stream); // Re-use normed_input buffer
 
-    // 6. Final residual
-    add_residual_inplace_kernel<T><<<(hidden_states.size() + 255) / 256, 256, 0, stream>>>(
-        thrust::raw_pointer_cast(hidden_states.data()), thrust::raw_pointer_cast(residual_.data()), hidden_states.size());
+    // Perform MLP
+    thrust::device_vector<T> mlp_output(hidden_states.size());
+    mlp_.forward(mlp_output, normed_input, num_tokens, temp_buffer, ltHandle, stream, workspace);
+
+    // Second residual connection: hidden_states = residual + mlp_output
+    add_residual_kernel<<<(hidden_states.size() + 255) / 256, 256, 0, stream>>>(
+        thrust::raw_pointer_cast(hidden_states.data()), 
+        thrust::raw_pointer_cast(mlp_output.data()), 
+        hidden_states.size());
 }
-
-// --- L4maModel ---
-// This is a factory method and needs to be defined
-template <>
-L4maModel<__nv_bfloat16> L4maModel<__nv_bfloat16>::from_files(const std::string &yaml_path, const std::string &ztensor_path)
-{
-    L4maConfig config = load_l4ma_config_from_yaml(yaml_path);
-    ztensor::zTensorReader reader(ztensor_path);
-    std::unordered_map<std::string, thrust::device_vector<__nv_bfloat16>> device_tensors;
-
-    auto tensor_names = reader.list_tensors();
-    for (const auto &name : tensor_names)
-    {
-        const auto &info = reader.get_tensor_info(name);
-        size_t numel = info.num_elements();
-        const void *raw_ptr = reader.get_raw_tensor_pointer(name);
-        thrust::device_vector<__nv_bfloat16> dev_vec(numel);
-        CUDA_CHECK(cudaMemcpy(thrust::raw_pointer_cast(dev_vec.data()), raw_ptr, numel * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-        device_tensors[name] = std::move(dev_vec);
-    }
-
-    // Split weights for each decoder layer
-    std::vector<std::unordered_map<std::string, thrust::device_vector<__nv_bfloat16>>> layer_weights_vec;
-    for (int i = 0; i < config.num_hidden_layers; ++i) {
-        std::string prefix = "model.layers." + std::to_string(i) + ".";
-        std::unordered_map<std::string, thrust::device_vector<__nv_bfloat16>> layer_weights;
-        for (const auto &kv : device_tensors) {
-            if (kv.first.rfind(prefix, 0) == 0) {
-                std::string key = kv.first.substr(prefix.length());
-                layer_weights[key] = kv.second;
-            }
-        }
-        layer_weights_vec.push_back(std::move(layer_weights));
-    }
-
-    // Collect global weights
-    std::unordered_map<std::string, thrust::device_vector<__nv_bfloat16>> global_weights;
-    for (const auto &kv : device_tensors) {
-        if (kv.first.rfind("model.layers.", 0) != 0) {
-            global_weights[kv.first] = kv.second;
-        }
-    }
-
-    return L4maModel<__nv_bfloat16>(config, global_weights, layer_weights_vec);
-}
-
-template <typename T>
-L4maModel<T>::L4maModel(const L4maConfig &config,
-                       const std::unordered_map<std::string, thrust::device_vector<T>> &global_weights,
-                       const std::vector<std::unordered_map<std::string, thrust::device_vector<T>>> &layer_weights_vec)
-    : config_(config),
-      embedding_weights_(global_weights.at("model.embed_tokens.weight")),
-      lm_head_weights_(global_weights.at("model.embed_tokens.weight")),
-      final_norm_weight_(global_weights.at("model.norm.weight"))
-{
-    CUBLAS_CHECK(cublasLtCreate(&cublaslt_handle_));
-    for (const auto &layer_weights : layer_weights_vec)
-    {
-        layers_.emplace_back(config, layer_weights);
-
-    }
-}
-
-template <typename T>
-L4maModel<T>::~L4maModel() { CUBLAS_CHECK(cublasLtDestroy(cublaslt_handle_)); }
 
 template <typename T>
 void L4maModel<T>::forward(
-    thrust::device_vector<float> &logits, const thrust::device_vector<int32_t> &input_ids,
-    const thrust::device_vector<int32_t> &position_ids, thrust::device_vector<T> &kv_cache_k, thrust::device_vector<T> &kv_cache_v,
-    const int32_t *kv_page_indices, const int32_t *kv_page_indptr, const int32_t *kv_last_page_lens,
-    const int32_t *qo_indptr, int batch_size, cudaStream_t stream)
-{
-    // int nnz = input_ids.size();
-    // // *** FIXED WARNING ***
-    // if (hidden_states_.size() != static_cast<size_t>(nnz * config_.hidden_size))
-    // {
-    //     hidden_states_.resize(nnz * config_.hidden_size);
-    // }
+    thrust::device_vector<T>& hidden_states,
+    const thrust::device_vector<uint32_t>& input_ids,
+    const thrust::device_vector<uint32_t>& position_ids,
+    thrust::device_vector<T>& kv_cache_k,
+    thrust::device_vector<T>& kv_cache_v,
+    thrust::device_vector<int32_t>& kv_page_indices,
+    thrust::device_vector<int32_t>& kv_page_indptr,
+    thrust::device_vector<int32_t>& kv_last_page_lens,
+    thrust::device_vector<int32_t>& qo_indptr,
+    int batch_size,
+    cudaStream_t stream,
+    thrust::device_vector<char>& workspace,
+    flashinfer::BatchPrefillHandler& prefill_handler,
+    const int32_t page_size,
+    thrust::device_vector<int32_t>& kv_batch_indices,
+    thrust::device_vector<int32_t>& kv_positions
+) {
+    const int num_tokens = input_ids.size();
+    
+    // 1. Token Embeddings
+    embed<T>(embed_tokens_weight_, input_ids, &hidden_states, config_.hidden_size, stream);
 
-    // // 1. Embedding Lookup
-    // thrust::device_vector<T> embeddings_table = embedding_weights_;
-    // thrust::host_vector<int32_t> host_ids = input_ids;
-    // for (int i = 0; i < nnz; ++i)
-    // {
-    //     int token_id = host_ids[i];
-    //     cudaMemcpyAsync(thrust::raw_pointer_cast(hidden_states_.data()) + i * config_.hidden_size,
-    //                     thrust::raw_pointer_cast(embeddings_table.data()) + token_id * config_.hidden_size,
-    //                     config_.hidden_size * sizeof(T), cudaMemcpyDeviceToDevice, stream);
-    // }
+    size_t temp_buffer_size = 2 * (size_t)num_tokens * config_.intermediate_size;
+    thrust::device_vector<T> temp_buffer(temp_buffer_size);
 
-    // // Allocate a single large temp buffer for all layers
-    // size_t temp_buffer_size = static_cast<size_t>(nnz) * config_.intermediate_size * 2;
-    // if (temp_bwd_buffer_.size() < temp_buffer_size)
-    //     temp_bwd_buffer_.resize(temp_buffer_size);
+    for (auto& layer : layers_) {
+        layer.forward(hidden_states, position_ids, kv_cache_k, kv_cache_v,
+                      kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                      qo_indptr, temp_buffer, cublaslt_handle_, stream, workspace,
+                      prefill_handler, page_size, kv_batch_indices, kv_positions);
+    }
 
-    // // 2. Decoder Layers
-    // for (auto &layer : layers_)
-    // {
-    //     layer.forward(hidden_states_, thrust::raw_pointer_cast(position_ids.data()), kv_cache_k, kv_cache_v,
-    //                   kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr,
-    //                   nnz, batch_size, temp_bwd_buffer_, cublaslt_handle_, stream);
-    // }
-
-    // // 3. Final RMSNorm (in-place)
-    // // FIXED: Removed flashinfer:: namespace qualifier
-    // CUDA_CHECK(flashinfer::norm::RMSNorm<T>(
-    //     thrust::raw_pointer_cast(hidden_states_.data()),
-    //     thrust::raw_pointer_cast(final_norm_weight_.data()),
-    //     thrust::raw_pointer_cast(hidden_states_.data()),
-    //     nnz, config_.hidden_size,
-    //     config_.hidden_size, config_.hidden_size,
-    //     config_.rms_norm_eps, false, stream));
-
-    // // 4. LM Head (GEMM to get logits)
-    // // *** FIXED WARNING ***
-    // if (logits.size() != static_cast<size_t>(nnz * config_.vocab_size))
-    // {
-    //     logits.resize(nnz * config_.vocab_size);
-    // }
-
-    // thrust::device_vector<T> temp_logits(logits.size());
-    // // FIXED: Changed hidden_states to hidden_states_
-    // gemm_cublasLt<T>(cublaslt_handle_, stream, thrust::raw_pointer_cast(hidden_states_.data()),
-    //                  thrust::raw_pointer_cast(lm_head_weights_.data()),
-    //                  thrust::raw_pointer_cast(temp_logits.data()),
-    //                  nnz, config_.vocab_size, config_.hidden_size, false, true);
-
-    // // For now, simple copy. A kernel is needed for bf16 -> float32 conversion.
-    // thrust::copy(temp_logits.begin(), temp_logits.end(), logits.begin());
+    thrust::device_vector<T> final_norm_input = hidden_states;
+    norm_.forward(hidden_states, final_norm_input, num_tokens, stream);
 }
 
-// Explicit Instantiations
+template <typename T>
+void L4maForCausalLM<T>::forward(
+    thrust::device_vector<T>& logits, 
+    const thrust::device_vector<uint32_t>& input_ids,
+    const thrust::device_vector<uint32_t>& position_ids,
+    thrust::device_vector<int32_t>& kv_page_indices,
+    thrust::device_vector<int32_t>& kv_page_indptr,
+    thrust::device_vector<int32_t>& kv_last_page_lens,
+    thrust::device_vector<int32_t>& qo_indptr,
+    int batch_size,
+    cudaStream_t stream,
+    thrust::device_vector<char>& workspace
+    ) {
+    
+    const int head_size = config_.head_size;
+    const int num_query_heads = config_.num_query_heads;
+    const int num_key_value_heads = config_.num_key_value_heads;
+    const int page_size = 64;
+
+    flashinfer::BatchPrefillHandler handler;
+    size_t float_workspace_size_in_bytes = 128 * 1024 * 1024;
+    thrust::device_vector<char> float_buffer(float_workspace_size_in_bytes);
+    size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
+    thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
+
+    std::vector<int32_t> qo_indptr_h{0, 32};
+    std::vector<int32_t> kv_indptr_host({0, 1});
+
+    handler.Plan<T, int32_t>(
+        (void *)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
+        (void *)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
+        qo_indptr_h.data(), 
+        kv_indptr_host.data(),
+         /*total_num_rows=*/32, 
+         /*batch=*/1,
+        num_query_heads,
+        num_key_value_heads,
+        head_size,
+        page_size);
+
+}
+
+// --- Explicit Template Instantiations ---
+// template class RMSNorm<float>;
+// template class L4maMlp<float>;
+// template class L4maAttention<float>;
+// template class L4maDecoderLayer<float>;
+// template class L4maModel<float>;
+// template class L4maForCausalLM<float>;
+
+template class RMSNorm<__nv_bfloat16>;
 template class L4maMlp<__nv_bfloat16>;
 template class L4maAttention<__nv_bfloat16>;
 template class L4maDecoderLayer<__nv_bfloat16>;
 template class L4maModel<__nv_bfloat16>;
+template class L4maForCausalLM<__nv_bfloat16>;

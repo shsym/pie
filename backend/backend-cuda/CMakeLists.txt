@@ -114,7 +114,7 @@ protobuf_generate(
 add_executable(pie_cuda_be
     src/main.cpp
     #src/ztensor.cpp
-    src/gpt.cu
+    src/l4ma.cu
     src/model.cu
     src/common.cu
     #src/l4ma.cu
