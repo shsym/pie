@@ -355,9 +355,14 @@ public:
             nq, nkv, config_.head_dim(), page_size);
 
         cudaError_t status = flashinfer::BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(
-            &handler, thrust::raw_pointer_cast(q_proj.data()), thrust::raw_pointer_cast(qo_indptr_d.data()),
-            /*q_rope_offset=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_proj.data()),
-            /*lse=*/nullptr, nq,
+            &handler, 
+            thrust::raw_pointer_cast(q_proj.data()),
+             thrust::raw_pointer_cast(qo_indptr_d.data()),
+            /*q_rope_offset=*/nullptr, 
+            paged_kv,
+             thrust::raw_pointer_cast(o_proj.data()),
+            /*lse=*/nullptr,
+             nq,
             /*causal=*/false, flashinfer::PosEncodingMode::kNone);
 
         // flashinfer::BatchDecodeHandler handler;

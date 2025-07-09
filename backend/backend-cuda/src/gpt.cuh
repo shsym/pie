@@ -84,18 +84,21 @@ public:
 
     void forward(thrust::device_vector<T>& attn_output,
                  const thrust::device_vector<T>& hidden_states,
-                 const thrust::device_vector<uint32_t>& position_ids,
+                 const thrust::device_vector<int32_t>& position_ids,
                  thrust::device_vector<T>& kv_cache_k,
                  thrust::device_vector<T>& kv_cache_v,
-                 const int32_t* kv_page_indices,
-                 const int32_t* kv_page_indptr,
-                 const int32_t* kv_last_page_lens,
-                 const int32_t* qo_indptr,
+                 thrust::device_vector<int32_t>& kv_page_indices,
+                 thrust::device_vector<int32_t>& kv_page_indptr,
+                 thrust::device_vector<int32_t>& kv_last_page_lens,
+                 thrust::device_vector<int32_t>& qo_indptr,
                  thrust::device_vector<T>& temp_buffer,
                  cublasLtHandle_t ltHandle,
                  cudaStream_t stream,
                  thrust::device_vector<char>& workspace,
-                 flashinfer::BatchPrefillHandler& prefill_handler
+                 flashinfer::BatchPrefillHandler& prefill_handler,
+                 const int32_t page_size,
+                 thrust::device_vector<int32_t>& kv_batch_indices,
+                 thrust::device_vector<int32_t>& kv_positions
                 );
 
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
@@ -123,15 +126,18 @@ public:
                  const thrust::device_vector<uint32_t>& position_ids,
                  thrust::device_vector<T>& kv_cache_k,
                  thrust::device_vector<T>& kv_cache_v,
-                 const int32_t* kv_page_indices,
-                 const int32_t* kv_page_indptr,
-                 const int32_t* kv_last_page_lens,
-                 const int32_t* qo_indptr,
+                 thrust::device_vector<int32_t>& kv_page_indices,
+                 thrust::device_vector<int32_t>& kv_page_indptr,
+                 thrust::device_vector<int32_t>& kv_last_page_lens,
+                 thrust::device_vector<int32_t>& qo_indptr,
                  thrust::device_vector<T>& temp_buffer,
                  cublasLtHandle_t ltHandle,
                  cudaStream_t stream,
                  thrust::device_vector<char>& workspace,
-                 flashinfer::BatchPrefillHandler& prefill_handler
+                 flashinfer::BatchPrefillHandler& prefill_handler,
+                 const int32_t page_size,
+                 thrust::device_vector<int32_t>& kv_batch_indices,
+                 thrust::device_vector<int32_t>& kv_positions
                 );
 
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
@@ -158,14 +164,17 @@ public:
                  const thrust::device_vector<uint32_t>& position_ids,
                  thrust::device_vector<T>& kv_cache_k,
                  thrust::device_vector<T>& kv_cache_v,
-                 const int32_t* kv_page_indices,
-                 const int32_t* kv_page_indptr,
-                 const int32_t* kv_last_page_lens,
-                 const int32_t* qo_indptr,
+                 thrust::device_vector<int32_t>& kv_page_indices,
+                 thrust::device_vector<int32_t>& kv_page_indptr,
+                 thrust::device_vector<int32_t>& kv_last_page_lens,
+                 thrust::device_vector<int32_t>& qo_indptr,
                  int batch_size,
                  cudaStream_t stream,
                  thrust::device_vector<char>& workspace,
-                 flashinfer::BatchPrefillHandler& prefill_handler
+                 flashinfer::BatchPrefillHandler& prefill_handler,
+                 const int32_t page_size,
+                 thrust::device_vector<int32_t>& kv_batch_indices,
+                 thrust::device_vector<int32_t>& kv_positions
                 );
 
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
@@ -195,10 +204,10 @@ public:
                  const thrust::device_vector<uint32_t>& position_ids,
                  thrust::device_vector<T>& kv_cache_k,
                  thrust::device_vector<T>& kv_cache_v,
-                 const int32_t* kv_page_indices,
-                 const int32_t* kv_page_indptr,
-                 const int32_t* kv_last_page_lens,
-                 const int32_t* qo_indptr,
+                 thrust::device_vector<int32_t>& kv_page_indices,
+                 thrust::device_vector<int32_t>& kv_page_indptr,
+                 thrust::device_vector<int32_t>& kv_last_page_lens,
+                 thrust::device_vector<int32_t>& qo_indptr,
                  int batch_size,
                  cudaStream_t stream,
                  thrust::device_vector<char>& workspace

@@ -200,32 +200,34 @@ template <typename T>
 void L4maAttention<T>::forward(
     thrust::device_vector<T>& attn_output,
     const thrust::device_vector<T>& hidden_states,
-    const thrust::device_vector<uint32_t>& position_ids,
+    const thrust::device_vector<int32_t>& position_ids,
     thrust::device_vector<T>& kv_cache_k,
     thrust::device_vector<T>& kv_cache_v,
-    const int32_t* kv_page_indices,
-    const int32_t* kv_page_indptr,
-    const int32_t* kv_last_page_lens,
-    const int32_t* qo_indptr,
+    thrust::device_vector<int32_t>& kv_page_indices,
+    thrust::device_vector<int32_t>& kv_page_indptr,
+    thrust::device_vector<int32_t>& kv_last_page_lens,
+    thrust::device_vector<int32_t>& qo_indptr,
     thrust::device_vector<T>& temp_buffer,
     cublasLtHandle_t ltHandle,
     cudaStream_t stream,
     thrust::device_vector<char>& workspace,
-    flashinfer::BatchPrefillHandler& prefill_handler
+    flashinfer::BatchPrefillHandler& prefill_handler,
+    const int32_t page_size,
+    thrust::device_vector<int32_t>& kv_batch_indices,
+    thrust::device_vector<int32_t>& kv_positions
 ) {
 
-    const int batch = hidden_states.size() / config_.hidden_size;
+    const int batch_size = hidden_states.size() / config_.hidden_size;
     const int hidden_size = config_.hidden_size;
-    const int head_dim = config_.head_size;
-    const int num_q_heads = config_.num_query_heads;
-    const int num_kv_heads = config_.num_key_value_heads;
+    const int head_size = config_.head_size;
+    const int num_query_heads = config_.num_query_heads;
+    const int num_key_value_heads = config_.num_key_value_heads;
     
-    size_t q_size = (size_t)batch * num_q_heads * head_dim;
-    size_t k_size = (size_t)batch * num_kv_heads * head_dim;
-    size_t v_size = (size_t)batch * num_kv_heads * head_dim;
+    size_t q_size = (size_t)batch_size * num_query_heads * head_size;
+    size_t k_size = (size_t)batch_size * num_key_value_heads * head_size;
+    size_t v_size = (size_t)batch_size * num_key_value_heads * head_size;
 
     if(temp_buffer.size() < q_size + k_size + v_size) {
-        // panic if the temp buffer is too small
         throw std::runtime_error("Temporary buffer size is too small for Q, K, V projections.");
     }
 
@@ -235,9 +237,9 @@ void L4maAttention<T>::forward(
     thrust::device_vector<T> v_proj(thrust::device_pointer_cast(k_proj.data().get() + k_size), thrust::device_pointer_cast(k_proj.data().get() + k_size + v_size));
     
     // 1. Q, K, V projections
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, q_proj_weights_, config_.use_qkv_bias ? &q_proj_bias_ : nullptr, q_proj, batch, num_q_heads * head_dim, hidden_size, workspace, false, true);
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, k_proj_weights_, config_.use_qkv_bias ? &k_proj_bias_ : nullptr, k_proj, batch, num_kv_heads * head_dim, hidden_size, workspace, false, true);
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, v_proj_weights_, config_.use_qkv_bias ? &v_proj_bias_ : nullptr, v_proj, batch, num_kv_heads * head_dim, hidden_size, workspace, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, q_proj_weights_, config_.use_qkv_bias ? &q_proj_bias_ : nullptr, q_proj, batch_size, num_query_heads * head_size, hidden_size, workspace, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, k_proj_weights_, config_.use_qkv_bias ? &k_proj_bias_ : nullptr, k_proj, batch_size, num_key_value_heads * head_size, hidden_size, workspace, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, v_proj_weights_, config_.use_qkv_bias ? &v_proj_bias_ : nullptr, v_proj, batch_size, num_key_value_heads * head_size, hidden_size, workspace, false, true);
 
     // 2. Apply RoPE (in-place)
     flashinfer::BatchQKApplyLlama31RotaryPosIds(
@@ -246,21 +248,21 @@ void L4maAttention<T>::forward(
         thrust::raw_pointer_cast(q_proj.data()),                  // q_rope (not available)
         thrust::raw_pointer_cast(k_proj.data()),                  // k_rope (not available)
         thrust::raw_pointer_cast(position_ids.data()),                 // pos_ids (uint32_t*)
-        batch,                                                    // nnz (assuming batch size for now)
-        num_q_heads,                                                       // num_qo_heads
-        num_kv_heads,                                                      // num_kv_heads
-        head_dim,                                       // rotary_dim
-        head_dim,                                       // head_dim
-        num_q_heads * head_dim,                                                  // q_stride_n
-        head_dim,                                       // q_stride_h
-        num_kv_heads * head_dim,                                                 // k_stride_n
-        head_dim,
+        batch_size,                                                    // nnz (assuming batch size for now)
+        num_query_heads,                                                       // num_qo_heads
+        num_key_value_heads,                                                      // num_kv_heads
+        head_size,                                       // rotary_dim
+        head_size,                                       // head_dim
+        num_query_heads * head_size,                                                  // q_stride_n
+        head_size,                                       // q_stride_h
+        num_key_value_heads * head_size,                                                 // k_stride_n
+        head_size,
         ///----                                                      // k_stride_h
         // q_rope_stride_n, q_rope_stride_h, k_rope_stride_n, k_rope_stride_h (not available)
-        num_q_heads * head_dim,
-        head_dim,
-        num_kv_heads * head_dim,
-        head_dim,
+        num_query_heads * head_size,
+        head_size,
+        num_key_value_heads * head_size,
+        head_size,
         ///----                                                      
         false, // interleave
         8.0f,  // rope_scale
@@ -271,51 +273,45 @@ void L4maAttention<T>::forward(
         stream // cudaStream_t
     );
 
-//     const int page_size = 32;
+
+    // 3. Create paged KV-cache object
+    flashinfer::paged_kv_t<T, int32_t> paged_kv(
+        num_key_value_heads, page_size, head_size, batch_size,
+        flashinfer::QKVLayout::kNHD,
+        thrust::raw_pointer_cast(kv_cache_k.data()),
+        thrust::raw_pointer_cast(kv_cache_v.data()),
+        thrust::raw_pointer_cast(kv_page_indices.data()), 
+        thrust::raw_pointer_cast(kv_page_indptr.data()), 
+        thrust::raw_pointer_cast(kv_last_page_lens.data())
+    );
 
 
-//     // 3. Create paged KV-cache object
-//     flashinfer::paged_kv_t<T, int32_t> paged_kv(
-//         num_kv_heads, page_size, head_dim, batch,
-//         flashinfer::QKVLayout::kNHD,
-//         thrust::raw_pointer_cast(kv_cache_k.data()),
-//         thrust::raw_pointer_cast(kv_cache_v.data()),
-//         thrust::raw_pointer_cast(kv_page_indices.data()), 
-//         thrust::raw_pointer_cast(kv_page_indptr.data()), 
-//         thrust::raw_pointer_cast(kv_last_page_lens.data()));
+    flashinfer::AppendPagedKVCache<T, int32_t>(
+        paged_kv,
+        thrust::raw_pointer_cast(k_proj.data()), // append_key
+        thrust::raw_pointer_cast(v_proj.data()), // append_value
+        thrust::raw_pointer_cast(kv_batch_indices.data()),
+        thrust::raw_pointer_cast(kv_positions.data()),
+        kv_batch_indices.size(),
+        num_key_value_heads * head_size, head_size,
+        num_key_value_heads * head_size, head_size);
 
 
-//     std::vector<int32_t> batch_indices_host{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-//     std::vector<int32_t> positions_host{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-//                                         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
-//     thrust::device_vector<int32_t> batch_indices(batch_indices_host);
-//     thrust::device_vector<int32_t> positions(positions_host);
+    thrust::device_vector<T> o_proj = q_proj; // Reuse buffer
+    cudaError_t status = flashinfer::BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(
+        &prefill_handler,
+        thrust::raw_pointer_cast(q_proj.data()),
+        thrust::raw_pointer_cast(qo_indptr.data()),
+        /*q_rope_offset=*/nullptr,
+        paged_kv,
+        thrust::raw_pointer_cast(o_proj.data()),
+        /*lse=*/nullptr, 
+        num_query_heads,
+        /*causal=*/false,
+        flashinfer::PosEncodingMode::kNone);
 
-//     // populate the kv cache.
-//     flashinfer::AppendPagedKVCache<T, int32_t>(
-//         paged_kv,
-//         thrust::raw_pointer_cast(k_proj.data()), // append_key
-//         thrust::raw_pointer_cast(v_proj.data()), // append_value
-//         thrust::raw_pointer_cast(batch_indices.data()),
-//         thrust::raw_pointer_cast(positions.data()),
-//         32,
-//         num_kv_heads * head_dim, head_dim,
-//         num_kv_heads * head_dim, head_dim);
+    gemm_cublasLt<T>(ltHandle, stream, o_proj, o_proj_weights_, nullptr, attn_output, batch_size, hidden_size, num_query_heads * head_size, workspace, false, true);
 
-
-//     // 4. Compute attention using FlashInfer
-//     thrust::device_vector<T> attn_context = q_proj; // Reuse buffer
-//     flashinfer::BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(
-//         thrust::raw_pointer_cast(q_proj.data()),
-//         thrust::raw_pointer_cast(qo_indptr.data()),
-//         paged_kv,
-//         thrust::raw_pointer_cast(attn_context.data()),
-//         (uint32_t)num_q_heads, /*causal=*/true, stream);
-
-//     // 5. Output projection
-//     attn_output.resize((size_t)batch * hidden_size);
-//     gemm_cublasLt<T>(ltHandle, stream, attn_context, o_proj_weights_, nullptr, attn_output, nnz, hidden_size, num_q_heads * head_dim, workspace, false, true);
-// }
 }
 
 template <typename T>
@@ -324,15 +320,18 @@ void L4maDecoderLayer<T>::forward(
     const thrust::device_vector<uint32_t>& position_ids,
     thrust::device_vector<T>& kv_cache_k,
     thrust::device_vector<T>& kv_cache_v,
-    const int32_t* kv_page_indices,
-    const int32_t* kv_page_indptr,
-    const int32_t* kv_last_page_lens,
-    const int32_t* qo_indptr,
+    thrust::device_vector<int32_t>& kv_page_indices,
+    thrust::device_vector<int32_t>& kv_page_indptr,
+    thrust::device_vector<int32_t>& kv_last_page_lens,
+    thrust::device_vector<int32_t>& qo_indptr,
     thrust::device_vector<T>& temp_buffer,
     cublasLtHandle_t ltHandle,
     cudaStream_t stream,
     thrust::device_vector<char>& workspace,
-    flashinfer::BatchPrefillHandler& prefill_handler
+    flashinfer::BatchPrefillHandler& prefill_handler,
+    const int32_t page_size,
+    thrust::device_vector<int32_t>& kv_batch_indices,
+    thrust::device_vector<int32_t>& kv_positions
 ) {
     std::cerr << "Warning: L4maDecoderLayer<T>::forward is not implemented." << std::endl;
 }
@@ -344,30 +343,46 @@ void L4maModel<T>::forward(
     const thrust::device_vector<uint32_t>& position_ids,
     thrust::device_vector<T>& kv_cache_k,
     thrust::device_vector<T>& kv_cache_v,
-    const int32_t* kv_page_indices,
-    const int32_t* kv_page_indptr,
-    const int32_t* kv_last_page_lens,
-    const int32_t* qo_indptr,
+    thrust::device_vector<int32_t>& kv_page_indices,
+    thrust::device_vector<int32_t>& kv_page_indptr,
+    thrust::device_vector<int32_t>& kv_last_page_lens,
+    thrust::device_vector<int32_t>& qo_indptr,
     int batch_size,
     cudaStream_t stream,
     thrust::device_vector<char>& workspace,
-    flashinfer::BatchPrefillHandler& prefill_handler
+    flashinfer::BatchPrefillHandler& prefill_handler,
+    const int32_t page_size,
+    thrust::device_vector<int32_t>& kv_batch_indices,
+    thrust::device_vector<int32_t>& kv_positions
 ) {
     std::cerr << "Warning: L4maModel<T>::forward is not implemented." << std::endl;
 }
 
 template <typename T>
-void L4maForCausalLM<T>::forward(thrust::device_vector<float>& logits, const thrust::device_vector<uint32_t>& input_ids, const thrust::device_vector<uint32_t>& position_ids, thrust::device_vector<T>& kv_cache_k, thrust::device_vector<T>& kv_cache_v, const int32_t* kv_page_indices, const int32_t* kv_page_indptr, const int32_t* kv_last_page_lens, const int32_t* qo_indptr, int batch_size, cudaStream_t stream, thrust::device_vector<char>& workspace) {
+void L4maForCausalLM<T>::forward(
+    thrust::device_vector<float>& logits, 
+    const thrust::device_vector<uint32_t>& input_ids,
+    const thrust::device_vector<uint32_t>& position_ids,
+    thrust::device_vector<T>& kv_cache_k,
+    thrust::device_vector<T>& kv_cache_v,
+    thrust::device_vector<int32_t>& kv_page_indices,
+    thrust::device_vector<int32_t>& kv_page_indptr,
+    thrust::device_vector<int32_t>& kv_last_page_lens,
+    thrust::device_vector<int32_t>& qo_indptr,
+    int batch_size,
+    cudaStream_t stream,
+    thrust::device_vector<char>& workspace
+    ) {
     std::cerr << "Warning: L4maForCausalLM<T>::forward is not implemented." << std::endl;
 }
 
 // --- Explicit Template Instantiations ---
-template class RMSNorm<float>;
-template class L4maMlp<float>;
-template class L4maAttention<float>;
-template class L4maDecoderLayer<float>;
-template class L4maModel<float>;
-template class L4maForCausalLM<float>;
+// template class RMSNorm<float>;
+// template class L4maMlp<float>;
+// template class L4maAttention<float>;
+// template class L4maDecoderLayer<float>;
+// template class L4maModel<float>;
+// template class L4maForCausalLM<float>;
 
 template class RMSNorm<__nv_bfloat16>;
 template class L4maMlp<__nv_bfloat16>;
