@@ -156,108 +156,169 @@ void Model::ModelImpl::handle_embed_text(const std::vector<Model::EmbedTextComma
 }
 
 void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockCommand>& commands) {
-    std::cout << "  [ModelImpl] handle_fill_block called with " << commands.size() << " items." << std::endl;
+    std::vector<int32_t> kv_page_indices_host;
+    std::vector<int32_t> kv_page_indptr_host = {0};
+    std::vector<int32_t> kv_last_page_lens_host;
+    std::vector<int32_t> qo_indptr_host = {0};
+    std::vector<uint8_t> custom_masks_host; // Use uint8_t for flashinfer
+    std::vector<int32_t> mask_indptr_host = {0};
 
-    // --- Data Preparation ---
-    // std::vector<int32_t> kv_page_indices_host;
-    // std::vector<int32_t> kv_page_indptr_host = {0};
-    // std::vector<int32_t> kv_last_page_lens_host;
-    // std::vector<int32_t> qo_indptr_host = {0};
-    // std::vector<bool> custom_masks_host;
+    std::vector<int32_t> kv_batch_indices_host;
+    std::vector<int32_t> kv_positions_host;
 
-    // std::vector<int32_t> new_token_ids_host;
-    // std::vector<int32_t> new_position_ids_host;
+    std::vector<uint32_t> new_token_ids_host;    // Use uint32_t for model input
+    std::vector<uint32_t> new_position_ids_host; // Use uint32_t for model input
 
-    // struct OutputEmbedPostproc {
-    //     size_t idx;
-    //     uint32_t vec_id;
-    // };
-    // std::vector<OutputEmbedPostproc> output_embed_postproc;
+    struct OutputEmbedPostproc {
+        size_t logit_row_idx;
+        uint32_t dest_embed_id;
+    };
+    std::vector<OutputEmbedPostproc> output_embed_postproc;
 
-    // for (const auto& cmd : commands) {
-    //     kv_page_indices_host.insert(kv_page_indices_host.end(), cmd.context_block_ids.begin(), cmd.context_block_ids.end());
-    //     kv_page_indptr_host.push_back(kv_page_indices_host.size());
-    //     kv_last_page_lens_host.push_back(cmd.last_block_len);
-        
-    //     qo_indptr_host.push_back(qo_indptr_host.back() + cmd.input_embedding_ids.size());
+    int batch_idx = 0;
+    for (const auto& cmd : commands) {
+        kv_page_indices_host.insert(kv_page_indices_host.end(), cmd.context_block_ids.begin(), cmd.context_block_ids.end());
+        kv_page_indptr_host.push_back(kv_page_indices_host.size());
+        kv_last_page_lens_host.push_back(cmd.last_block_len);
 
-    //     size_t total_ctx_tokens = kv_page_size * (cmd.context_block_ids.size() - 1) + cmd.last_block_len;
+        int32_t num_new_tokens = cmd.input_embedding_ids.size();
+        qo_indptr_host.push_back(qo_indptr_host.back() + num_new_tokens);
 
-    //     std::vector<int32_t> inp_pos_ids;
-    //     std::vector<bool> inp_occupancy;
+        size_t total_ctx_tokens = (cmd.context_block_ids.empty()) ? 0 :
+                                  kv_page_size * (cmd.context_block_ids.size() - 1) + cmd.last_block_len;
 
-    //     for (uint32_t embed_id : cmd.input_embedding_ids) {
-    //         auto it = embeds.find(embed_id);
-    //         if (it != embeds.end()) {
-    //             const auto& embed = it->second;
-    //             new_token_ids_host.push_back(embed.token_id);
-    //             new_position_ids_host.push_back(embed.position_id);
-    //             inp_pos_ids.push_back(embed.position_id);
-    //             inp_occupancy.push_back(true);
+        mask_indptr_host.push_back(mask_indptr_host.back() + (num_new_tokens * total_ctx_tokens));
 
-    //             size_t token_offset = total_ctx_tokens - cmd.input_embedding_ids.size() + (inp_pos_ids.size() - 1);
-    //             uint32_t tgt_block_idx = token_offset / kv_page_size;
-    //             uint32_t tgt_block_offset = token_offset % kv_page_size;
-    //             uint32_t tgt_block_id = cmd.context_block_ids[tgt_block_idx];
-                
-    //             blocks[tgt_block_id].occupancy[tgt_block_offset] = true;
-    //             blocks[tgt_block_id].position_ids[tgt_block_offset] = embed.position_id;
-    //         }
-    //     }
+        // --- kv_batch_indices and kv_positions for KV cache update ---
+        for (int32_t i = 0; i < num_new_tokens; ++i) {
+            kv_batch_indices_host.push_back(batch_idx);
+            kv_positions_host.push_back(total_ctx_tokens + i);
+        }
 
-    //     for (size_t i = 0; i < cmd.output_embedding_ids.size(); ++i) {
-    //         output_embed_postproc.push_back({new_token_ids_host.size() - cmd.output_embedding_ids.size() + i, cmd.output_embedding_ids[i]});
-    //     }
+        std::vector<uint32_t> inp_pos_ids_for_mask;
+        size_t tokens_in_batch_before_cmd = new_token_ids_host.size();
 
-    //     std::vector<int32_t> ctx_pos_ids;
-    //     std::vector<bool> ctx_occupancy;
-    //     for(uint32_t block_id : cmd.context_block_ids) {
-    //         const auto& block = blocks[block_id];
-    //         ctx_pos_ids.insert(ctx_pos_ids.end(), block.position_ids.begin(), block.position_ids.end());
-    //         ctx_occupancy.insert(ctx_occupancy.end(), block.occupancy.begin(), block.occupancy.end());
-    //     }
-    //     ctx_pos_ids.resize(total_ctx_tokens);
-    //     ctx_occupancy.resize(total_ctx_tokens);
+        for (uint32_t embed_id : cmd.input_embedding_ids) {
+            auto it = embeds.find(embed_id);
+            if (it != embeds.end()) {
+                const auto& embed = it->second;
+                new_token_ids_host.push_back(embed.token_id);
+                new_position_ids_host.push_back(embed.position_id);
+                inp_pos_ids_for_mask.push_back(embed.position_id);
 
-    //     for (size_t i = 0; i < inp_pos_ids.size(); ++i) {
-    //         for (size_t j = 0; j < total_ctx_tokens; ++j) {
-    //             bool casual_mask = ctx_pos_ids[j] <= inp_pos_ids[i];
-    //             bool valid_mask = ctx_occupancy[j] && inp_occupancy[i];
-    //             custom_masks_host.push_back(casual_mask && valid_mask);
-    //         }
-    //     }
-    // }
+                size_t token_abs_pos = total_ctx_tokens + (new_token_ids_host.size() - tokens_in_batch_before_cmd) - 1;
+                uint32_t tgt_block_idx = token_abs_pos / kv_page_size;
+                uint32_t tgt_block_offset = token_abs_pos % kv_page_size;
 
-    // // --- Copy data to device ---
-    // thrust::device_vector<int32_t> kv_page_indices = kv_page_indices_host;
-    // thrust::device_vector<int32_t> kv_page_indptr = kv_page_indptr_host;
-    // thrust::device_vector<int32_t> kv_last_page_lens = kv_last_page_lens_host;
-    // thrust::device_vector<int32_t> qo_indptr = qo_indptr_host;
-    // thrust::device_vector<bool> custom_mask = custom_masks_host;
-    // thrust::device_vector<int32_t> new_token_ids = new_token_ids_host;
-    // thrust::device_vector<int32_t> new_position_ids = new_position_ids_host;
+                if (tgt_block_idx < cmd.context_block_ids.size()) {
+                    uint32_t tgt_block_id = cmd.context_block_ids[tgt_block_idx];
+                    auto block_it = blocks.find(tgt_block_id);
+                    if (block_it != blocks.end()) {
+                        block_it->second.occupancy[tgt_block_offset] = true;
+                        block_it->second.position_ids[tgt_block_offset] = embed.position_id;
+                    }
+                }
+            }
+        }
 
-    // // --- Model Forward Pass ---
-    // thrust::device_vector<__nv_bfloat16> hidden_states = model->forward(
-    //     new_token_ids,
-    //     new_position_ids,
-    //     kv_page_indices,
-    //     kv_page_indptr,
-    //     kv_last_page_lens,
-    //     qo_indptr,
-    //     custom_mask,
-    //     nullptr // Use internal stream
-    // );
+        for (size_t i = 0; i < cmd.output_embedding_ids.size(); ++i) {
+            size_t logit_row = new_token_ids_host.size() - cmd.output_embedding_ids.size() + i;
+            output_embed_postproc.push_back({logit_row, cmd.output_embedding_ids[i]});
+        }
 
-    // // --- Post-processing ---
-    // thrust::device_vector<__nv_bfloat16> logits(hidden_states.size() / model->get_config().hidden_size * model->get_config().vocab_size);
-    // model->lm_head(logits, hidden_states);
+        if (total_ctx_tokens > 0) {
+            std::vector<uint32_t> ctx_pos_ids;
+            std::vector<bool> ctx_occupancy;
+            ctx_pos_ids.reserve(total_ctx_tokens);
+            ctx_occupancy.reserve(total_ctx_tokens);
 
-    // // TODO: Top-k selection and storing results in embed_storage
-    // // This part is complex and requires a custom kernel or sophisticated use of Thrust.
-    // // For now, we just acknowledge the logits are computed.
-    
-    // cudaDeviceSynchronize(); // Wait for all computations to finish
+            for (size_t i = 0; i < cmd.context_block_ids.size(); ++i) {
+                uint32_t block_id = cmd.context_block_ids[i];
+                const auto& block = blocks.at(block_id);
+                size_t len_to_copy = (i == cmd.context_block_ids.size() - 1) ? cmd.last_block_len : kv_page_size;
+                ctx_pos_ids.insert(ctx_pos_ids.end(), block.position_ids.begin(), block.position_ids.begin() + len_to_copy);
+                ctx_occupancy.insert(ctx_occupancy.end(), block.occupancy.begin(), block.occupancy.begin() + len_to_copy);
+            }
+
+            for (uint32_t inp_pos_id : inp_pos_ids_for_mask) {
+                for (size_t j = 0; j < total_ctx_tokens; ++j) {
+                    bool causal_mask = ctx_pos_ids[j] <= inp_pos_id;
+                    bool valid_mask = ctx_occupancy[j];
+                    custom_masks_host.push_back((causal_mask && valid_mask) ? 1 : 0);
+                }
+            }
+        }
+        batch_idx++;
+    }
+
+    // --- Copy data to device ---
+    thrust::device_vector<int32_t> kv_page_indices = kv_page_indices_host;
+    thrust::device_vector<int32_t> kv_page_indptr = kv_page_indptr_host;
+    thrust::device_vector<int32_t> kv_last_page_lens = kv_last_page_lens_host;
+    thrust::device_vector<int32_t> qo_indptr = qo_indptr_host;
+    thrust::device_vector<uint8_t> custom_mask = custom_masks_host;
+    thrust::device_vector<int32_t> mask_indptr = mask_indptr_host;
+    thrust::device_vector<uint32_t> new_token_ids = new_token_ids_host;
+    thrust::device_vector<uint32_t> new_position_ids = new_position_ids_host;
+    thrust::device_vector<int32_t> kv_batch_indices = kv_batch_indices_host;
+    thrust::device_vector<int32_t> kv_positions = kv_positions_host;
+
+    // --- Allocate buffers ---
+    size_t num_total_new_tokens = new_token_ids.size();
+    if (num_total_new_tokens == 0) return; // Nothing to do
+
+    thrust::device_vector<__nv_bfloat16> logits(num_total_new_tokens * model->get_config().vocab_size);
+    thrust::device_vector<char> workspace(128 * 1024 * 1024); // Placeholder size
+    cudaStream_t stream = 0; // Use default stream
+
+    // --- Model Forward Pass ---
+    model->forward(
+        logits,
+        new_token_ids,
+        new_position_ids,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
+        qo_indptr,
+        custom_mask,
+        mask_indptr,
+        stream,
+        workspace,
+        kv_batch_indices,
+        kv_positions
+    );
+
+    // --- Post-processing: Softmax, Top-K, and Scatter to storage ---
+    if (!output_embed_postproc.empty()) {
+        std::vector<size_t> logit_indices_host;
+        std::vector<uint32_t> dest_embed_ids_host;
+        logit_indices_host.reserve(output_embed_postproc.size());
+        dest_embed_ids_host.reserve(output_embed_postproc.size());
+        for (const auto& p : output_embed_postproc) {
+            logit_indices_host.push_back(p.logit_row_idx);
+            dest_embed_ids_host.push_back(p.dest_embed_id);
+        }
+        thrust::device_vector<size_t> logit_indices_dev = logit_indices_host;
+        thrust::device_vector<uint32_t> dest_embed_ids_dev = dest_embed_ids_host;
+
+        // In a complete implementation, the following function would be a custom CUDA kernel
+        // or a series of library calls (e.g., from CUB or cuDNN) that performs a gather
+        // of the specified logit rows, applies softmax, finds the top-k values/indices,
+        // and scatters the results into the final embed_storage buffers.
+        /*
+        softmax_topk_scatter(
+            logits,
+            logit_indices_dev,
+            dest_embed_ids_dev,
+            model->get_config().vocab_size,
+            dist_size,
+            embed_storage_p1,
+            embed_storage_p2,
+            stream
+        );
+        */
+    }
+
 }
 
 void Model::ModelImpl::handle_mask_block(const std::vector<Model::MaskBlockCommand>& commands) {
@@ -334,7 +395,7 @@ Model::Model(const AppConfig& config,const ModelMetadata& out_metadata)
     pimpl->model->create_kv_device_vectors(config.max_num_kv_pages);
 
     // Initialize state
-    //pimpl->kv_page_size = pimpl->model->get_kv_page_size();
+    pimpl->kv_page_size = config.kv_page_size;
     pimpl->dist_size = config.dist_size;
     pimpl->embed_storage_p1.resize(config.max_num_embeds * config.dist_size);
     pimpl->embed_storage_p2.resize(config.max_num_embeds * config.dist_size);

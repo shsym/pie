@@ -508,7 +508,12 @@ namespace flashinfer
   cudaError_t BatchPrefillWithPagedKVCacheWrapper(
       BatchPrefillHandler *handler, DTypeQ *q, IdType *qo_indptr, IdType *q_rope_offset,
       paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO *o, float *lse, uint32_t num_qo_heads,
-      bool causal = true, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
+      // mask
+      MaskMode mask_mode = MaskMode::kNone, 
+      uint8_t* custom_mask = nullptr,
+      IdType *mask_indptr = nullptr,
+      // positional encoding
+      PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
       bool use_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
       float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr,
       uint32_t *maybe_prefix_len_ptr = nullptr, uint16_t *maybe_token_pos_in_items_ptr = nullptr,
@@ -517,7 +522,6 @@ namespace flashinfer
     const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(paged_kv.head_dim)));
     const uint32_t num_kv_heads = paged_kv.num_heads;
     const uint32_t head_dim = paged_kv.head_dim;
-    MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
     if (maybe_prefix_len_ptr != nullptr)
       mask_mode = MaskMode::kMultiItemScoring;
     auto plan_info = handler->GetPlanInfo();
@@ -534,8 +538,8 @@ namespace flashinfer
                       /*use_sliding_window=*/false,
                       /*use_logits_soft_cap=*/false,
                       /*use_alibi=*/false>;
-                  Params params(q, paged_kv, /*custom_mask=*/nullptr, qo_indptr,
-                                /*mask_indptr=*/nullptr, q_rope_offset, o, lse,
+                  Params params(q, paged_kv, /*custom_mask=*/custom_mask, qo_indptr,
+                                /*mask_indptr=*/mask_indptr, q_rope_offset, o, lse,
                                 /*alibi_slopes=*/nullptr, num_qo_heads,
                                 /*q_stride_n*/ num_qo_heads * HEAD_DIM, /*q_stride_h*/ HEAD_DIM,
                                 /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,

@@ -245,6 +245,8 @@ void L4maAttention<T>::forward(
     thrust::device_vector<int32_t>& kv_page_indptr,
     thrust::device_vector<int32_t>& kv_last_page_lens,
     thrust::device_vector<int32_t>& qo_indptr,
+    thrust::device_vector<uint8_t>& custom_mask,
+    thrust::device_vector<int32_t>& mask_indptr,
     thrust::device_vector<T>& temp_buffer,
     cublasLtHandle_t ltHandle,
     cudaStream_t stream,
@@ -345,7 +347,9 @@ void L4maAttention<T>::forward(
         thrust::raw_pointer_cast(o_proj.data()),
         /*lse=*/nullptr, 
         num_query_heads,
-        /*causal=*/false,
+        flashinfer::MaskMode::kCustom,
+        thrust::raw_pointer_cast(custom_mask.data()),
+        thrust::raw_pointer_cast(mask_indptr.data()),
         flashinfer::PosEncodingMode::kNone);
 
     gemm_cublasLt<T>(ltHandle, stream, o_proj, o_proj_weights_, nullptr, attn_output, batch_size, hidden_size, num_query_heads * head_size, workspace, false, true);
@@ -362,6 +366,8 @@ void L4maDecoderLayer<T>::forward(
     thrust::device_vector<int32_t>& kv_page_indptr,
     thrust::device_vector<int32_t>& kv_last_page_lens,
     thrust::device_vector<int32_t>& qo_indptr,
+    thrust::device_vector<uint8_t>& custom_mask,
+    thrust::device_vector<int32_t>& mask_indptr,
     thrust::device_vector<T>& temp_buffer,
     cublasLtHandle_t ltHandle,
     cudaStream_t stream,
@@ -385,7 +391,7 @@ void L4maDecoderLayer<T>::forward(
     // Perform attention
     thrust::device_vector<T> attn_output(hidden_states.size());
     self_attn_.forward(attn_output, normed_input, position_ids, kv_cache_k, kv_cache_v, 
-                       kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr, temp_buffer, 
+                       kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr, custom_mask, mask_indptr, temp_buffer, 
                        ltHandle, stream, workspace, prefill_handler, page_size,
                        kv_batch_indices, kv_positions);
     
@@ -425,7 +431,8 @@ void L4maModel<T>::forward(
     thrust::device_vector<int32_t>& kv_page_indptr,
     thrust::device_vector<int32_t>& kv_last_page_lens,
     thrust::device_vector<int32_t>& qo_indptr,
-    int batch_size,
+    thrust::device_vector<uint8_t>& custom_mask,
+    thrust::device_vector<int32_t>& mask_indptr,
     cudaStream_t stream,
     thrust::device_vector<char>& workspace,
     flashinfer::BatchPrefillHandler& prefill_handler,
@@ -444,7 +451,7 @@ void L4maModel<T>::forward(
     for (auto& layer : layers_) {
         layer.forward(hidden_states, position_ids, kv_cache_k, kv_cache_v,
                       kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                      qo_indptr, temp_buffer, cublaslt_handle_, stream, workspace,
+                      qo_indptr, custom_mask, mask_indptr, temp_buffer, cublaslt_handle_, stream, workspace,
                       prefill_handler, page_size, kv_batch_indices, kv_positions);
     }
 
@@ -461,9 +468,12 @@ void L4maForCausalLM<T>::forward(
     thrust::device_vector<int32_t>& kv_page_indptr,
     thrust::device_vector<int32_t>& kv_last_page_lens,
     thrust::device_vector<int32_t>& qo_indptr,
-    int batch_size,
+    thrust::device_vector<uint8_t>& custom_mask,
+    thrust::device_vector<int32_t>& mask_indptr,
     cudaStream_t stream,
-    thrust::device_vector<char>& workspace
+    thrust::device_vector<char>& workspace,
+    thrust::device_vector<int32_t>& kv_batch_indices,
+    thrust::device_vector<int32_t>& kv_positions
     ) {
     
     const int head_size = config_.head_size;

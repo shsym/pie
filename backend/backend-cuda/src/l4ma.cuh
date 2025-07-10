@@ -91,6 +91,8 @@ public:
                  thrust::device_vector<int32_t>& kv_page_indptr,
                  thrust::device_vector<int32_t>& kv_last_page_lens,
                  thrust::device_vector<int32_t>& qo_indptr,
+                 thrust::device_vector<uint8_t>& custom_mask,
+                 thrust::device_vector<int32_t>& mask_indptr,
                  thrust::device_vector<T>& temp_buffer,
                  cublasLtHandle_t ltHandle,
                  cudaStream_t stream,
@@ -130,6 +132,8 @@ public:
                  thrust::device_vector<int32_t>& kv_page_indptr,
                  thrust::device_vector<int32_t>& kv_last_page_lens,
                  thrust::device_vector<int32_t>& qo_indptr,
+                 thrust::device_vector<uint8_t>& custom_mask,
+                 thrust::device_vector<int32_t>& mask_indptr,
                  thrust::device_vector<T>& temp_buffer,
                  cublasLtHandle_t ltHandle,
                  cudaStream_t stream,
@@ -169,7 +173,8 @@ public:
                  thrust::device_vector<int32_t>& kv_page_indptr,
                  thrust::device_vector<int32_t>& kv_last_page_lens,
                  thrust::device_vector<int32_t>& qo_indptr,
-                 int batch_size,
+                 thrust::device_vector<uint8_t>& custom_mask,
+                 thrust::device_vector<int32_t>& mask_indptr,
                  cudaStream_t stream,
                  thrust::device_vector<char>& workspace,
                  flashinfer::BatchPrefillHandler& prefill_handler,
@@ -208,9 +213,12 @@ public:
                 thrust::device_vector<int32_t>& kv_page_indptr,
                 thrust::device_vector<int32_t>& kv_last_page_lens,
                 thrust::device_vector<int32_t>& qo_indptr,
-                int batch_size,
+                thrust::device_vector<uint8_t>& custom_mask,
+                thrust::device_vector<int32_t>& mask_indptr,
                 cudaStream_t stream,
-                thrust::device_vector<char>& workspace
+                thrust::device_vector<char>& workspace,
+                thrust::device_vector<int32_t>& kv_batch_indices,
+                thrust::device_vector<int32_t>& kv_positions
                 );
 
     std::map<std::string, thrust::device_vector<T>*> get_parameters() override;
@@ -222,6 +230,9 @@ public:
     // LM Head
     void lm_head(thrust::device_vector<__nv_bfloat16>& logits, const thrust::device_vector<__nv_bfloat16>& hidden_states);
 
+    L4maConfig& get_config() {
+        return config_;
+    }
 
 private:
     L4maConfig config_;
