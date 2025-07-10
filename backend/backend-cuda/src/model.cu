@@ -3,7 +3,7 @@
 // All implementation-specific headers are safely included here
 #include "l4ma.cuh"
 #include "ztensor.hpp"
-
+#include "common.cuh"
 #include <iostream>
 #include <set>
 #include <memory>
@@ -23,7 +23,7 @@ struct Block {
     std::vector<bool> occupancy;
 
     Block() = default; // Default constructor
-    Block(size_t kv_page_size)
+    Block(int32_t kv_page_size)
         : position_ids(kv_page_size, 0), occupancy(kv_page_size, false) {}
 };
 
@@ -47,8 +47,8 @@ struct Model::ModelImpl {
     thrust::device_vector<int32_t> embed_storage_p2;
 
     // Configuration
-    size_t kv_page_size;
-    int dist_size;
+    int32_t kv_page_size;
+    int32_t dist_size;
 
 
     // --- Handler method declarations added to ModelImpl ---
@@ -86,16 +86,16 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
             for (const auto& name : reader.list_tensors()) {
                 if (params_map.count(name) && !loaded_keys.count(name)) {
                     const auto& info = reader.get_tensor_info(name);
-                    thrust::device_vector<T>* target_tensor = params_map[name];
+                    auto& target_tensor_ptr = params_map[name];
 
-                    if (target_tensor->size() != info.num_elements()) {
-                        std::cerr << "    Warning: Shape mismatch for tensor '" << name << "'. ZT: " << info.num_elements() << ", Model: " << target_tensor->size() << ". Skipping." << std::endl;
+                    if (target_tensor_ptr->size() != info.num_elements()) {
+                        std::cerr << "    Warning: Shape mismatch for tensor '" << name << "'. ZT: " << info.num_elements() << ", Model: " << target_tensor_ptr->size() << ". Skipping." << std::endl;
                         continue;
                     }
 
                     const T* host_ptr = static_cast<const T*>(reader.get_raw_tensor_pointer(name));
                     if (host_ptr) {
-                        cudaMemcpy(thrust::raw_pointer_cast(target_tensor->data()), host_ptr, info.size, cudaMemcpyHostToDevice);
+                        cudaMemcpy(thrust::raw_pointer_cast(target_tensor_ptr->data()), host_ptr, info.size, cudaMemcpyHostToDevice);
                         loaded_keys.insert(name);
                     }
                 }
@@ -106,7 +106,7 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
     }
 
     if (params_map.count("lm_head.weight") && params_map.count("model.embed_tokens.weight")) {
-        *params_map["lm_head.weight"] = *params_map["model.embed_tokens.weight"];
+        params_map["lm_head.weight"] = params_map["model.embed_tokens.weight"];
         loaded_keys.insert("lm_head.weight");
     }
     
@@ -156,6 +156,9 @@ void Model::ModelImpl::handle_embed_text(const std::vector<Model::EmbedTextComma
 }
 
 void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockCommand>& commands) {
+
+    std::cout << "  [ModelImpl] handle_fill_block called with " << commands.size() << " items." << std::endl;
+
     std::vector<int32_t> kv_page_indices_host;
     std::vector<int32_t> kv_page_indptr_host = {0};
     std::vector<int32_t> kv_last_page_lens_host;
@@ -167,7 +170,7 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     std::vector<int32_t> kv_positions_host;
 
     std::vector<uint32_t> new_token_ids_host;    // Use uint32_t for model input
-    std::vector<uint32_t> new_position_ids_host; // Use uint32_t for model input
+    std::vector<int32_t> new_position_ids_host; // Use uint32_t for model input
 
     struct OutputEmbedPostproc {
         size_t logit_row_idx;
@@ -259,7 +262,7 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     thrust::device_vector<uint8_t> custom_mask = custom_masks_host;
     thrust::device_vector<int32_t> mask_indptr = mask_indptr_host;
     thrust::device_vector<uint32_t> new_token_ids = new_token_ids_host;
-    thrust::device_vector<uint32_t> new_position_ids = new_position_ids_host;
+    thrust::device_vector<int32_t> new_position_ids = new_position_ids_host;
     thrust::device_vector<int32_t> kv_batch_indices = kv_batch_indices_host;
     thrust::device_vector<int32_t> kv_positions = kv_positions_host;
 
@@ -268,8 +271,15 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     if (num_total_new_tokens == 0) return; // Nothing to do
 
     thrust::device_vector<__nv_bfloat16> logits(num_total_new_tokens * model->get_config().vocab_size);
-    thrust::device_vector<char> workspace(128 * 1024 * 1024); // Placeholder size
+    
+
+    // using the numbers from flashinfer repo
+    thrust::device_vector<char> workspace_buffer_float(128 * 1024 * 1024);
+    thrust::device_vector<char> workspace_buffer_int(8 * 1024 * 1024);
+
     cudaStream_t stream = 0; // Use default stream
+
+    
 
     // --- Model Forward Pass ---
     model->forward(
@@ -278,17 +288,20 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         new_position_ids,
         kv_page_indices,
         kv_page_indptr,
+        kv_page_indptr_host,
         kv_last_page_lens,
         qo_indptr,
+        qo_indptr_host,
         custom_mask,
         mask_indptr,
         stream,
-        workspace,
+        workspace_buffer_float,
+        workspace_buffer_int,
+        kv_page_size,
         kv_batch_indices,
         kv_positions
     );
 
-    // --- Post-processing: Softmax, Top-K, and Scatter to storage ---
     if (!output_embed_postproc.empty()) {
         std::vector<size_t> logit_indices_host;
         std::vector<uint32_t> dest_embed_ids_host;
@@ -301,12 +314,7 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         thrust::device_vector<size_t> logit_indices_dev = logit_indices_host;
         thrust::device_vector<uint32_t> dest_embed_ids_dev = dest_embed_ids_host;
 
-        // In a complete implementation, the following function would be a custom CUDA kernel
-        // or a series of library calls (e.g., from CUB or cuDNN) that performs a gather
-        // of the specified logit rows, applies softmax, finds the top-k values/indices,
-        // and scatters the results into the final embed_storage buffers.
-        /*
-        softmax_topk_scatter(
+        topk_scatter(
             logits,
             logit_indices_dev,
             dest_embed_ids_dev,
@@ -316,7 +324,7 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
             embed_storage_p2,
             stream
         );
-        */
+       
     }
 
 }

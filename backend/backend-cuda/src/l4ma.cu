@@ -56,26 +56,26 @@ void silu_and_mul(
 
 template <typename T>
 RMSNorm<T>::RMSNorm(const L4maConfig& config)
-    : weight_(config.hidden_size) {}
+    :  weight_(std::make_shared<thrust::device_vector<T>>(config.hidden_size)) {}
 
 template <typename T>
 L4maMlp<T>::L4maMlp(const L4maConfig& config)
     : config_(config),
-      gate_proj_weights_(config.hidden_size * config.intermediate_size),
-      up_proj_weights_(config.hidden_size * config.intermediate_size),
-      down_proj_weights_(config.intermediate_size * config.hidden_size) {}
+      gate_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.hidden_size * config.intermediate_size)),
+      up_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.hidden_size * config.intermediate_size)),
+      down_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.intermediate_size * config.hidden_size)) {}
 
 template <typename T>
 L4maAttention<T>::L4maAttention(const L4maConfig& config)
     : config_(config),
-      q_proj_weights_(config.hidden_size * (config.num_query_heads * config.head_size)),
-      k_proj_weights_(config.hidden_size * (config.num_key_value_heads * config.head_size)),
-      v_proj_weights_(config.hidden_size * (config.num_key_value_heads * config.head_size)),
-      o_proj_weights_((config.num_query_heads * config.head_size) * config.hidden_size) {
+      q_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.hidden_size * (config.num_query_heads * config.head_size))),
+      k_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.hidden_size * (config.num_key_value_heads * config.head_size))),
+      v_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.hidden_size * (config.num_key_value_heads * config.head_size))),
+      o_proj_weights_(std::make_shared<thrust::device_vector<T>>((config.num_query_heads * config.head_size) * config.hidden_size)) {
     if (config_.use_qkv_bias) {
-        q_proj_bias_.resize(config.num_query_heads * config.head_size);
-        k_proj_bias_.resize(config.num_key_value_heads * config.head_size);
-        v_proj_bias_.resize(config.num_key_value_heads * config.head_size);
+        q_proj_bias_ = std::make_shared<thrust::device_vector<T>>(config.num_query_heads * config.head_size);
+        k_proj_bias_ = std::make_shared<thrust::device_vector<T>>(config.num_key_value_heads * config.head_size);
+        v_proj_bias_ = std::make_shared<thrust::device_vector<T>>(config.num_key_value_heads * config.head_size);
     }
 }
 
@@ -90,20 +90,19 @@ L4maDecoderLayer<T>::L4maDecoderLayer(const L4maConfig& config)
 template <typename T>
 L4maModel<T>::L4maModel(const L4maConfig& config)
     : config_(config),
-      embed_tokens_weight_(config.vocab_size * config.hidden_size),
+      embed_tokens_weight_(std::make_shared<thrust::device_vector<T>>(config.vocab_size * config.hidden_size)),
       norm_(config) {
 
     layers_.reserve(config.num_layers);
     for (int i = 0; i < config.num_layers; ++i) {
         layers_.emplace_back(config);
     }
-    CUBLAS_CHECK(cublasLtCreate(&cublaslt_handle_));
 }
 
 template <typename T>
 L4maForCausalLM<T>::L4maForCausalLM(const L4maConfig& config)
     : config_(config), model_(config) {
-    lm_head_weight_ = model_.get_embed_tokens_weight(); // Weight tying
+    CUBLAS_CHECK(cublasLtCreate(&cublaslt_handle_));
 }
 
 
@@ -119,40 +118,41 @@ void L4maForCausalLM<T>::create_kv_device_vectors(int max_kv_num) {
     if (kv_cache_v_.size() != kv_cache_size) {
         kv_cache_v_.resize(kv_cache_size);
     }
+    
 }
 
 // --- get_parameters() Implementations ---
 
 template <typename T>
-std::map<std::string, thrust::device_vector<T>*> RMSNorm<T>::get_parameters() {
-    return {{"weight", &weight_}};
+std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> RMSNorm<T>::get_parameters() {
+    return {{"weight", weight_}};
 }
 
 template <typename T>
-std::map<std::string, thrust::device_vector<T>*> L4maMlp<T>::get_parameters() {
-    return {{"gate_proj.weight", &gate_proj_weights_},
-            {"up_proj.weight", &up_proj_weights_},
-            {"down_proj.weight", &down_proj_weights_}};
+std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> L4maMlp<T>::get_parameters() {
+    return {{"gate_proj.weight", gate_proj_weights_},
+            {"up_proj.weight", up_proj_weights_},
+            {"down_proj.weight", down_proj_weights_}};
 }
 
 template <typename T>
-std::map<std::string, thrust::device_vector<T>*> L4maAttention<T>::get_parameters() {
-    auto params = std::map<std::string, thrust::device_vector<T>*>{
-        {"q_proj.weight", &q_proj_weights_},
-        {"k_proj.weight", &k_proj_weights_},
-        {"v_proj.weight", &v_proj_weights_},
-        {"o_proj.weight", &o_proj_weights_}};
+std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> L4maAttention<T>::get_parameters() {
+    auto params = std::map<std::string, std::shared_ptr<thrust::device_vector<T>>>{
+        {"q_proj.weight", q_proj_weights_},
+        {"k_proj.weight", k_proj_weights_},
+        {"v_proj.weight", v_proj_weights_},
+        {"o_proj.weight", o_proj_weights_}};
     if (config_.use_qkv_bias) {
-        params["q_proj.bias"] = &q_proj_bias_;
-        params["k_proj.bias"] = &k_proj_bias_;
-        params["v_proj.bias"] = &v_proj_bias_;
+        params["q_proj.bias"] = q_proj_bias_;
+        params["k_proj.bias"] = k_proj_bias_;
+        params["v_proj.bias"] = v_proj_bias_;
     }
     return params;
 }
 
 template <typename T>
-std::map<std::string, thrust::device_vector<T>*> L4maDecoderLayer<T>::get_parameters() {
-    std::map<std::string, thrust::device_vector<T>*> params;
+std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> L4maDecoderLayer<T>::get_parameters() {
+    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> params;
     for (auto const& [key, val] : self_attn_.get_parameters()) { params["self_attn." + key] = val; }
     for (auto const& [key, val] : mlp_.get_parameters()) { params["mlp." + key] = val; }
     for (auto const& [key, val] : input_layernorm_.get_parameters()) { params["input_layernorm." + key] = val; }
@@ -161,9 +161,9 @@ std::map<std::string, thrust::device_vector<T>*> L4maDecoderLayer<T>::get_parame
 }
 
 template <typename T>
-std::map<std::string, thrust::device_vector<T>*> L4maModel<T>::get_parameters() {
-    std::map<std::string, thrust::device_vector<T>*> params;
-    params["embed_tokens.weight"] = &embed_tokens_weight_;
+std::map<std::string, std::shared_ptr<thrust::device_vector<T>>>  L4maModel<T>::get_parameters() {
+    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> params;
+    params["embed_tokens.weight"] = embed_tokens_weight_;
     for (size_t i = 0; i < layers_.size(); ++i) {
         for (auto const& [key, val] : layers_[i].get_parameters()) {
             params["layers." + std::to_string(i) + "." + key] = val;
@@ -174,25 +174,24 @@ std::map<std::string, thrust::device_vector<T>*> L4maModel<T>::get_parameters() 
 }
 
 template <typename T>
-std::map<std::string, thrust::device_vector<T>*> L4maForCausalLM<T>::get_parameters() {
-    std::map<std::string, thrust::device_vector<T>*> params;
+std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> L4maForCausalLM<T>::get_parameters() {
+    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> params;
     for (auto const& [key, val] : model_.get_parameters()) {
         params["model." + key] = val;
     }
-    params["lm_head.weight"] = &lm_head_weight_;
+    params["lm_head.weight"] = lm_head_weight_;
     return params;
-}
-
-template <typename T>
-const thrust::device_vector<T>& L4maModel<T>::get_embed_tokens_weight() const {
-    return embed_tokens_weight_;
 }
 
 // --- Forward Pass Stub ---
 
 
 template <typename T>
-void RMSNorm<T>::forward(thrust::device_vector<T>& output, const thrust::device_vector<T>& input, int num_tokens, cudaStream_t stream) {
+void RMSNorm<T>::forward(
+    thrust::device_vector<T>& output,
+    const thrust::device_vector<T>& input,
+    int num_tokens,
+    cudaStream_t stream) {
     
     uint32_t batch_size = input.size() / config_.hidden_size;
     uint32_t stride = config_.hidden_size;
@@ -200,14 +199,22 @@ void RMSNorm<T>::forward(thrust::device_vector<T>& output, const thrust::device_
 
     flashinfer::norm::RMSNorm(
         const_cast<T *>(thrust::raw_pointer_cast(input.data())),
-        const_cast<T *>(thrust::raw_pointer_cast(weight_.data())),
+        const_cast<T *>(thrust::raw_pointer_cast(weight_->data())),
         thrust::raw_pointer_cast(output.data()),
-        batch_size, d, stride, stride, config_.rms_norm_eps
+        batch_size, d, stride, stride, config_.rms_norm_eps, false, stream
     );
 }
 
 template <typename T>
-void L4maMlp<T>::forward(thrust::device_vector<T>& output, const thrust::device_vector<T>& x, int num_tokens, thrust::device_vector<T>& temp_buffer, cublasLtHandle_t ltHandle, cudaStream_t stream, thrust::device_vector<char>& workspace) {
+void L4maMlp<T>::forward(
+    thrust::device_vector<T>& output, 
+    const thrust::device_vector<T>& x, 
+    int num_tokens, 
+    thrust::device_vector<T>& temp_buffer, 
+    cublasLtHandle_t ltHandle, 
+    cudaStream_t stream, 
+    thrust::device_vector<char>& workspace_buffer_float
+) {
     const int hidden_size = config_.hidden_size;
     const int intermediate_size = config_.intermediate_size;
 
@@ -216,10 +223,10 @@ void L4maMlp<T>::forward(thrust::device_vector<T>& output, const thrust::device_
     thrust::device_vector<T> up_proj_out(thrust::device_pointer_cast(gate_proj_out.data().get() + (size_t)num_tokens * intermediate_size), thrust::device_pointer_cast(gate_proj_out.data().get() + 2 * (size_t)num_tokens * intermediate_size));
 
     // 1. Gate projection: gate_proj_out = x @ W_gate^T
-    gemm_cublasLt<T>(ltHandle, stream, x, gate_proj_weights_, nullptr, gate_proj_out, num_tokens, intermediate_size, hidden_size, workspace, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, x, *gate_proj_weights_, nullptr, gate_proj_out, num_tokens, intermediate_size, hidden_size, workspace_buffer_float, false, true);
     
     // 2. Up projection: up_proj_out = x @ W_up^T
-    gemm_cublasLt<T>(ltHandle, stream, x, up_proj_weights_, nullptr, up_proj_out, num_tokens, intermediate_size, hidden_size, workspace, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, x, *up_proj_weights_, nullptr, up_proj_out, num_tokens, intermediate_size, hidden_size, workspace_buffer_float, false, true);
 
     // 3. SwiGLU activation: silu(gate_proj) * up_proj (in-place into gate_proj_out)
     silu_and_mul<T>(
@@ -231,7 +238,7 @@ void L4maMlp<T>::forward(thrust::device_vector<T>& output, const thrust::device_
     );
 
     // 4. Down projection: output = (activated_output) @ W_down^T
-    gemm_cublasLt<T>(ltHandle, stream, gate_proj_out, down_proj_weights_, nullptr, output, num_tokens, hidden_size, intermediate_size, workspace, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, gate_proj_out, *down_proj_weights_, nullptr, output, num_tokens, hidden_size, intermediate_size, workspace_buffer_float, false, true);
 }
 
 template <typename T>
@@ -250,7 +257,7 @@ void L4maAttention<T>::forward(
     thrust::device_vector<T>& temp_buffer,
     cublasLtHandle_t ltHandle,
     cudaStream_t stream,
-    thrust::device_vector<char>& workspace,
+    thrust::device_vector<char>& workspace_buffer_float,
     flashinfer::BatchPrefillHandler& prefill_handler,
     const int32_t page_size,
     thrust::device_vector<int32_t>& kv_batch_indices,
@@ -277,9 +284,9 @@ void L4maAttention<T>::forward(
     thrust::device_vector<T> v_proj(thrust::device_pointer_cast(k_proj.data().get() + k_size), thrust::device_pointer_cast(k_proj.data().get() + k_size + v_size));
     
     // 1. Q, K, V projections
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, q_proj_weights_, config_.use_qkv_bias ? &q_proj_bias_ : nullptr, q_proj, batch_size, num_query_heads * head_size, hidden_size, workspace, false, true);
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, k_proj_weights_, config_.use_qkv_bias ? &k_proj_bias_ : nullptr, k_proj, batch_size, num_key_value_heads * head_size, hidden_size, workspace, false, true);
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, v_proj_weights_, config_.use_qkv_bias ? &v_proj_bias_ : nullptr, v_proj, batch_size, num_key_value_heads * head_size, hidden_size, workspace, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, *q_proj_weights_, config_.use_qkv_bias ? q_proj_bias_.get() : nullptr, q_proj, batch_size, num_query_heads * head_size, hidden_size, workspace_buffer_float, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, *k_proj_weights_, config_.use_qkv_bias ? k_proj_bias_.get() : nullptr, k_proj, batch_size, num_key_value_heads * head_size, hidden_size, workspace_buffer_float, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, *v_proj_weights_, config_.use_qkv_bias ? v_proj_bias_.get() : nullptr, v_proj, batch_size, num_key_value_heads * head_size, hidden_size, workspace_buffer_float, false, true);
 
     // 2. Apply RoPE (in-place)
     flashinfer::BatchQKApplyLlama31RotaryPosIds(
@@ -305,10 +312,10 @@ void L4maAttention<T>::forward(
         head_size,
         ///----                                                      
         false, // interleave
-        8.0f,  // rope_scale
-        5e5f,  // rope_theta
-        1.0f,  // low_freq_factor
-        4.0f,  // high_freq_factor
+        config_.rope_factor,  // rope_scale
+        config_.rope_theta,  // rope_theta
+        config_.rope_low_frequency_factor,  // low_freq_factor
+        config_.rope_high_frequency_factor,  // high_freq_factor
         8192,  // old_context_length
         stream // cudaStream_t
     );
@@ -352,14 +359,14 @@ void L4maAttention<T>::forward(
         thrust::raw_pointer_cast(mask_indptr.data()),
         flashinfer::PosEncodingMode::kNone);
 
-    gemm_cublasLt<T>(ltHandle, stream, o_proj, o_proj_weights_, nullptr, attn_output, batch_size, hidden_size, num_query_heads * head_size, workspace, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, o_proj, *o_proj_weights_, nullptr, attn_output, batch_size, hidden_size, num_query_heads * head_size, workspace_buffer_float, false, true);
 
 }
 
 template <typename T>
 void L4maDecoderLayer<T>::forward(
     thrust::device_vector<T>& hidden_states,
-    const thrust::device_vector<uint32_t>& position_ids,
+    const thrust::device_vector<int32_t>& position_ids,
     thrust::device_vector<T>& kv_cache_k,
     thrust::device_vector<T>& kv_cache_v,
     thrust::device_vector<int32_t>& kv_page_indices,
@@ -371,7 +378,7 @@ void L4maDecoderLayer<T>::forward(
     thrust::device_vector<T>& temp_buffer,
     cublasLtHandle_t ltHandle,
     cudaStream_t stream,
-    thrust::device_vector<char>& workspace,
+    thrust::device_vector<char>& workspace_buffer_float,
     flashinfer::BatchPrefillHandler& prefill_handler,
     const int32_t page_size,
     thrust::device_vector<int32_t>& kv_batch_indices,
@@ -392,7 +399,7 @@ void L4maDecoderLayer<T>::forward(
     thrust::device_vector<T> attn_output(hidden_states.size());
     self_attn_.forward(attn_output, normed_input, position_ids, kv_cache_k, kv_cache_v, 
                        kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr, custom_mask, mask_indptr, temp_buffer, 
-                       ltHandle, stream, workspace, prefill_handler, page_size,
+                       ltHandle, stream, workspace_buffer_float, prefill_handler, page_size,
                        kv_batch_indices, kv_positions);
     
     // First residual connection: hidden_states = residual + attn_output
@@ -411,7 +418,7 @@ void L4maDecoderLayer<T>::forward(
 
     // Perform MLP
     thrust::device_vector<T> mlp_output(hidden_states.size());
-    mlp_.forward(mlp_output, normed_input, num_tokens, temp_buffer, ltHandle, stream, workspace);
+    mlp_.forward(mlp_output, normed_input, num_tokens, temp_buffer, ltHandle, stream, workspace_buffer_float);
 
     // Second residual connection: hidden_states = residual + mlp_output
     add_residual_kernel<<<(hidden_states.size() + 255) / 256, 256, 0, stream>>>(
@@ -424,7 +431,7 @@ template <typename T>
 void L4maModel<T>::forward(
     thrust::device_vector<T>& hidden_states,
     const thrust::device_vector<uint32_t>& input_ids,
-    const thrust::device_vector<uint32_t>& position_ids,
+    const thrust::device_vector<int32_t>& position_ids,
     thrust::device_vector<T>& kv_cache_k,
     thrust::device_vector<T>& kv_cache_v,
     thrust::device_vector<int32_t>& kv_page_indices,
@@ -433,8 +440,9 @@ void L4maModel<T>::forward(
     thrust::device_vector<int32_t>& qo_indptr,
     thrust::device_vector<uint8_t>& custom_mask,
     thrust::device_vector<int32_t>& mask_indptr,
+    cublasLtHandle_t ltHandle,
     cudaStream_t stream,
-    thrust::device_vector<char>& workspace,
+    thrust::device_vector<char>& workspace_buffer_float,
     flashinfer::BatchPrefillHandler& prefill_handler,
     const int32_t page_size,
     thrust::device_vector<int32_t>& kv_batch_indices,
@@ -443,7 +451,7 @@ void L4maModel<T>::forward(
     const int num_tokens = input_ids.size();
     
     // 1. Token Embeddings
-    embed<T>(embed_tokens_weight_, input_ids, &hidden_states, config_.hidden_size, stream);
+    embed<T>(*embed_tokens_weight_, input_ids, &hidden_states, config_.hidden_size, stream);
 
     size_t temp_buffer_size = 2 * (size_t)num_tokens * config_.intermediate_size;
     thrust::device_vector<T> temp_buffer(temp_buffer_size);
@@ -451,7 +459,7 @@ void L4maModel<T>::forward(
     for (auto& layer : layers_) {
         layer.forward(hidden_states, position_ids, kv_cache_k, kv_cache_v,
                       kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                      qo_indptr, custom_mask, mask_indptr, temp_buffer, cublaslt_handle_, stream, workspace,
+                      qo_indptr, custom_mask, mask_indptr, temp_buffer, ltHandle, stream, workspace_buffer_float,
                       prefill_handler, page_size, kv_batch_indices, kv_positions);
     }
 
@@ -463,15 +471,19 @@ template <typename T>
 void L4maForCausalLM<T>::forward(
     thrust::device_vector<T>& logits, 
     const thrust::device_vector<uint32_t>& input_ids,
-    const thrust::device_vector<uint32_t>& position_ids,
+    const thrust::device_vector<int32_t>& position_ids,
     thrust::device_vector<int32_t>& kv_page_indices,
     thrust::device_vector<int32_t>& kv_page_indptr,
+    std::vector<int32_t>& kv_page_indptr_host,
     thrust::device_vector<int32_t>& kv_last_page_lens,
     thrust::device_vector<int32_t>& qo_indptr,
+    std::vector<int32_t>& qo_indptr_host,
     thrust::device_vector<uint8_t>& custom_mask,
     thrust::device_vector<int32_t>& mask_indptr,
     cudaStream_t stream,
-    thrust::device_vector<char>& workspace,
+    thrust::device_vector<char>& workspace_buffer_float,
+    thrust::device_vector<char>& workspace_buffer_int,
+    const int32_t page_size,
     thrust::device_vector<int32_t>& kv_batch_indices,
     thrust::device_vector<int32_t>& kv_positions
     ) {
@@ -479,28 +491,69 @@ void L4maForCausalLM<T>::forward(
     const int head_size = config_.head_size;
     const int num_query_heads = config_.num_query_heads;
     const int num_key_value_heads = config_.num_key_value_heads;
-    const int page_size = 64;
-
+    const int num_tokens = input_ids.size();
     flashinfer::BatchPrefillHandler handler;
-    size_t float_workspace_size_in_bytes = 128 * 1024 * 1024;
-    thrust::device_vector<char> float_buffer(float_workspace_size_in_bytes);
-    size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
-    thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
-
-    std::vector<int32_t> qo_indptr_h{0, 32};
-    std::vector<int32_t> kv_indptr_host({0, 1});
 
     handler.Plan<T, int32_t>(
-        (void *)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
-        (void *)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
-        qo_indptr_h.data(), 
-        kv_indptr_host.data(),
-         /*total_num_rows=*/32, 
-         /*batch=*/1,
+        (void *)thrust::raw_pointer_cast(workspace_buffer_float.data()), workspace_buffer_float.size(),
+        (void *)thrust::raw_pointer_cast(workspace_buffer_int.data()), workspace_buffer_int.size(),
+        qo_indptr_host.data(), 
+        kv_page_indptr_host.data(),
+         /*total_num_rows=*/num_tokens,
+         /*batch=*/qo_indptr_host.size() - 1,
         num_query_heads,
         num_key_value_heads,
         head_size,
         page_size);
+
+
+   // --- Start of Forward Pass Implementation ---
+
+    // 1. Run the core model forward pass
+    // This vector will hold the final hidden states from the last decoder layer.
+    thrust::device_vector<T> hidden_states(num_tokens * config_.hidden_size);
+
+    // Execute the forward pass of the base L4maModel
+    model_.forward(
+        hidden_states,
+        input_ids,
+        position_ids,
+        kv_cache_k_, // Pass the pre-allocated KV cache
+        kv_cache_v_, // Pass the pre-allocated KV cache
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
+        qo_indptr,
+        custom_mask,
+        mask_indptr,
+        cublaslt_handle_,
+        stream,
+        workspace_buffer_float,
+        handler, // The planned prefill handler
+        page_size,
+        kv_batch_indices,
+        kv_positions
+    );
+
+    // 2. Compute logits using the LM head
+    // The output logits are computed by multiplying the final hidden states
+    // with the language modeling head weights (which are tied to the token embeddings).
+    // logits = hidden_states @ lm_head_weight^T
+    gemm_cublasLt<T>(
+        cublaslt_handle_, // Use the cuBLAS handle from the model
+        stream,
+        hidden_states,           // Input matrix A (m x k)
+        *lm_head_weight_,         // Input matrix B (n x k)
+        nullptr,                 // Bias (not used)
+        logits,                  // Output matrix C (m x n)
+        num_tokens,              // m: number of tokens
+        config_.vocab_size,      // n: vocabulary size
+        config_.hidden_size,     // k: hidden dimension
+        workspace_buffer_float,  // Workspace for cuBLAS
+        false,                   // transa: Don't transpose hidden_states
+        true                     // transb: Transpose the lm_head_weight matrix
+    );
+
 
 }
 

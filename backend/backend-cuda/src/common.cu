@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <stdexcept>
 #include <type_traits>
+#include <limits> // Required for std::numeric_limits
 
 /**
  * @brief High-performance CUDA kernel for embedding lookup.
@@ -96,6 +97,150 @@ void embed(
         hidden_dim_div_16);
 }
 
+
+
+// Define a reasonable maximum K that can be handled by the shared memory implementation.
+// If you need k > 256, this value should be increased, and you may need more shared memory.
+#define MAX_K 256
+
+/**
+ * @brief CUDA kernel to find top-k values/indices and scatter them.
+ *
+ * Each thread block processes one row from the input `all_logits` tensor. It finds the top 'k'
+ * values and their original indices. It then writes these results to a potentially non-contiguous
+ * location in the destination storage buffers, as specified by `dest_embed_ids`.
+ *
+ * This implementation uses a spin-lock to manage a critical section for updating
+ * the list of top-k candidates held in shared memory, ensuring correctness when multiple
+ * threads find a candidate simultaneously.
+ */
+template <typename T>
+__global__ void topk_scatter_kernel(
+    const T* __restrict__ all_logits,
+    const size_t* __restrict__ logit_indices,
+    const uint32_t* __restrict__ dest_embed_ids,
+    size_t vocab_size,
+    size_t k,
+    T* __restrict__ topk_probs_storage,
+    int32_t* __restrict__ topk_tokens_storage)
+{
+    // --- Shared Memory Allocation (volatile removed) ---
+    __shared__ T sm_top_vals[MAX_K];
+    __shared__ int32_t sm_top_idxs[MAX_K];
+    __shared__ int lock;
+
+    // --- Block-level variable setup ---
+    const int block_row_idx = blockIdx.x;
+    const size_t source_row_idx = logit_indices[block_row_idx];
+    const uint32_t dest_embed_id = dest_embed_ids[block_row_idx];
+    const T* logit_row_ptr = all_logits + source_row_idx * vocab_size;
+
+    // --- Phase 1: Initialize shared memory ---
+    if (threadIdx.x == 0) {
+        lock = 0;
+    }
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        // FIX: Explicitly cast the initial value to the correct type T
+        sm_top_vals[i] = static_cast<T>(-1000000.0);
+        sm_top_idxs[i] = -1;
+    }
+    __syncthreads();
+
+
+    // --- Phase 2: Iterate over the input row and find top candidates ---
+    for (size_t i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        T val = __ldg(logit_row_ptr + i);
+        int32_t idx = static_cast<int32_t>(i);
+
+        // FIX: Comparisons now work because sm_top_vals is no longer volatile
+        if (val > sm_top_vals[k-1]) {
+            while(atomicCAS(&lock, 0, 1) != 0); // Acquire lock
+
+            if (val > sm_top_vals[k-1]) {
+                sm_top_vals[k-1] = val;
+                sm_top_idxs[k-1] = idx;
+
+                for (int j = k - 2; j >= 0; --j) {
+                    // FIX: This comparison also works now
+                    if (sm_top_vals[j+1] > sm_top_vals[j]) {
+                        // Swap
+                        T temp_val = sm_top_vals[j];
+                        int32_t temp_idx = sm_top_idxs[j];
+                        sm_top_vals[j] = sm_top_vals[j+1];
+                        sm_top_idxs[j] = sm_top_idxs[j+1];
+                        sm_top_vals[j+1] = temp_val;
+                        sm_top_idxs[j+1] = temp_idx;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            atomicExch(&lock, 0); // Release lock
+        }
+    }
+
+    __syncthreads();
+
+    // --- Phase 3: Write results from shared memory to global memory ---
+    T* dest_probs_ptr = topk_probs_storage + dest_embed_id * k;
+    int32_t* dest_tokens_ptr = topk_tokens_storage + dest_embed_id * k;
+
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        dest_probs_ptr[i] = sm_top_vals[i];
+        dest_tokens_ptr[i] = sm_top_idxs[i];
+    }
+}
+
+/**
+ * @brief Performs top-k selection on specified rows of a logit tensor and scatters the results.
+ * @tparam T The data type of the logits (e.g., __nv_bfloat16 or float).
+ * @param logits The flattened device vector containing all batched logits.
+ * @param logit_indices_dev A device vector of indices specifying which rows of `logits` to process.
+ * @param dest_embed_ids_dev A device vector specifying the destination slot in storage for each row's result.
+ * @param vocab_size The number of columns in the logit tensor (the vocabulary size).
+ * @param k The number of top elements to select. Must be <= MAX_K.
+ * @param topk_probs_storage Output device vector for storing top-k probabilities/scores.
+ * @param topk_tokens_storage Output device vector for storing top-k token IDs.
+ * @param stream The CUDA stream for the operation.
+ */
+template<typename T>
+void topk_scatter(
+    const thrust::device_vector<T>& logits,
+    const thrust::device_vector<size_t>& logit_indices_dev,
+    const thrust::device_vector<uint32_t>& dest_embed_ids_dev,
+    size_t vocab_size,
+    size_t k,
+    thrust::device_vector<T>& topk_probs_storage,
+    thrust::device_vector<int32_t>& topk_tokens_storage,
+    cudaStream_t stream)
+{
+    if (k > MAX_K) {
+        // In a real application, you should throw an exception or handle this error.
+        printf("Error: k=%zu is greater than MAX_K=%d\n", k, MAX_K);
+        return;
+    }
+    if (logit_indices_dev.empty()) {
+        return; // Nothing to do
+    }
+
+    // --- Kernel Launch Configuration ---
+    dim3 blockDim(256); // Threads per block (a common choice)
+    dim3 gridDim(logit_indices_dev.size()); // One block per row to process
+
+    // --- Launch Kernel ---
+    topk_scatter_kernel<T><<<gridDim, blockDim, 0, stream>>>(
+        thrust::raw_pointer_cast(logits.data()),
+        thrust::raw_pointer_cast(logit_indices_dev.data()),
+        thrust::raw_pointer_cast(dest_embed_ids_dev.data()),
+        vocab_size,
+        k,
+        thrust::raw_pointer_cast(topk_probs_storage.data()),
+        thrust::raw_pointer_cast(topk_tokens_storage.data())
+    );
+}
+
+
+
 // --- Explicit Template Instantiations ---
 // We explicitly instantiate the templates for the supported types. This forces
 // the compiler to generate the code for each of these types, which will then
@@ -118,6 +263,38 @@ template void embed<__nv_bfloat16>(
     const thrust::device_vector<uint32_t> &,
     thrust::device_vector<__nv_bfloat16> *,
     int, cudaStream_t);
+
+
+template void topk_scatter<float>(
+    const thrust::device_vector<float>& ,
+    const thrust::device_vector<size_t>& ,
+    const thrust::device_vector<uint32_t>& ,
+    size_t ,
+    size_t ,
+    thrust::device_vector<float>& ,
+    thrust::device_vector<int32_t>& ,
+    cudaStream_t );
+
+template void topk_scatter<__half>(
+    const thrust::device_vector<__half>& ,
+    const thrust::device_vector<size_t>& ,
+    const thrust::device_vector<uint32_t>& ,
+    size_t ,
+    size_t ,
+    thrust::device_vector<__half>& ,
+    thrust::device_vector<int32_t>& ,
+    cudaStream_t );
+
+template void topk_scatter<__nv_bfloat16>(
+    const thrust::device_vector<__nv_bfloat16>& ,
+    const thrust::device_vector<size_t>& ,
+    const thrust::device_vector<uint32_t>& ,
+    size_t ,
+    size_t ,
+    thrust::device_vector<__nv_bfloat16>& ,
+    thrust::device_vector<int32_t>& ,
+    cudaStream_t );
+
 
 template <typename T>
 constexpr cudaDataType_t get_cuda_data_type()
@@ -152,78 +329,6 @@ constexpr cudaDataType_t get_cuda_data_type()
         return CUDA_R_32F; // Dummy return to satisfy compiler
     }
 }
-
-// Helper to calculate memory alignment in bytes from a raw pointer
-static uint32_t getAlignment(const void *ptr)
-{
-    uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
-    if (address == 0)
-        return 256;
-    if (address % 256 == 0)
-        return 256;
-    if (address % 128 == 0)
-        return 128;
-    if (address % 64 == 0)
-        return 64;
-    if (address % 32 == 0)
-        return 32;
-    if (address % 16 == 0)
-        return 16;
-    if (address % 8 == 0)
-        return 8;
-    if (address % 4 == 0)
-        return 4;
-    if (address % 2 == 0)
-        return 2;
-    return 1;
-}
-
-template <typename T>
-void gemm_cublasLt2(cublasLtHandle_t ltHandle, cudaStream_t stream, const T *A, const T *B, T *C,
-                    int m, int n, int k, bool transa, bool transb)
-{
-    float alpha = 1.0f, beta = 0.0f;
-    cublasLtMatmulDesc_t matmulDesc;
-    cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
-
-    cudaDataType_t cuda_dtype = get_cuda_data_type<T>();
-    cublasComputeType_t compute_type;
-
-    // Determine compute type based on data type T
-    if (cuda_dtype == CUDA_R_16F || cuda_dtype == CUDA_R_16BF)
-    {
-        compute_type = CUBLAS_COMPUTE_32F; // A common and safe choice for FP16/BF16
-    }
-    else if (cuda_dtype == CUDA_R_32F)
-    {
-        compute_type = CUBLAS_COMPUTE_32F;
-    }
-    else
-    {
-        compute_type = CUBLAS_COMPUTE_32F;
-    }
-
-    CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, compute_type, CUDA_R_32F));
-
-    cublasOperation_t opA = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
-    cublasOperation_t opB = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opB, sizeof(opB)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opA, sizeof(opA)));
-
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, cuda_dtype, n, k, n));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, cuda_dtype, k, m, k));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, cuda_dtype, n, m, n));
-
-    CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha, B, Adesc, A, Bdesc, &beta, C, Cdesc, C, Cdesc, nullptr, nullptr, 0, stream));
-
-    cublasLtMatmulDescDestroy(matmulDesc);
-    cublasLtMatrixLayoutDestroy(Adesc);
-    cublasLtMatrixLayoutDestroy(Bdesc);
-    cublasLtMatrixLayoutDestroy(Cdesc);
-}
-
-template void gemm_cublasLt2(cublasLtHandle_t, cudaStream_t, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *,
-                             int, int, int, bool, bool);
 
 template <typename T>
 void gemm_cublasLt(cublasLtHandle_t ltHandle,
