@@ -4,6 +4,7 @@
 #include "l4ma.cuh"
 #include "ztensor.hpp"
 #include "common.cuh"
+#include "stack_allocator.cuh"
 #include <iostream>
 #include <set>
 #include <memory>
@@ -272,14 +273,16 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     thrust::device_vector<__nv_bfloat16> logits(num_total_new_tokens * model->get_config().vocab_size);
     
     size_t workspace_size_bytes = model->get_workspace_size(num_total_new_tokens);
-    thrust::device_vector<char> workspace_buffer_float(workspace_size_bytes);
-    thrust::device_vector<char> workspace_buffer_int(8 * 1024 * 1024);
+    thrust::device_vector<char> workspace_buffer(workspace_size_bytes);
+
+    StackAllocator allocator(thrust::raw_pointer_cast(workspace_buffer.data()), workspace_size_bytes);
 
     cudaStream_t stream = 0;
 
     // --- Model Forward Pass ---
     model->forward(
-        logits,
+        allocator,
+        thrust::raw_pointer_cast(logits.data()),
         new_token_ids,
         new_position_ids,
         kv_page_indices,
@@ -291,8 +294,6 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         custom_mask,
         mask_indptr,
         stream,
-        thrust::raw_pointer_cast(workspace_buffer_float.data()),
-        thrust::raw_pointer_cast(workspace_buffer_int.data()),
         kv_page_size,
         kv_batch_indices,
         kv_positions
