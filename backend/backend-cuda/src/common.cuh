@@ -52,9 +52,11 @@ struct __nv_bfloat16;
  */
 template <typename T>
 void embed(
-    const thrust::device_vector<T> &embedding,
-    const thrust::device_vector<uint32_t> &indices,
-    thrust::device_vector<T> *result,
+    const T* embedding,
+    size_t embedding_num_rows,
+    const uint32_t* indices,
+    size_t num_indices,
+    T* result,
     int embed_width,
     cudaStream_t stream);
 
@@ -86,15 +88,28 @@ void topk_scatter(
 // void gemm_cublasLt2(cublasLtHandle_t ltHandle, cudaStream_t stream, const T *A, const T *B, T *C,
 //                     int m, int n, int k, bool transa, bool transb);
 
+// template <typename T>
+// void gemm_cublasLt(cublasLtHandle_t ltHandle,
+//                    cudaStream_t stream,
+//                    const thrust::device_vector<T> &A,
+//                    const thrust::device_vector<T> &B,
+//                    const thrust::device_vector<T> *bias,
+//                    thrust::device_vector<T> &C,
+//                    int m, int n, int k,
+//                    thrust::device_vector<char> &workspace,
+//                    bool transa,
+//                    bool transb);
+
 template <typename T>
 void gemm_cublasLt(cublasLtHandle_t ltHandle,
                    cudaStream_t stream,
-                   const thrust::device_vector<T> &A,
-                   const thrust::device_vector<T> &B,
-                   const thrust::device_vector<T> *bias,
-                   thrust::device_vector<T> &C,
+                   const T *d_A,
+                   const T *d_B,
+                   const T *d_bias,
+                   T *d_C,
                    int m, int n, int k,
-                   thrust::device_vector<char> &workspace,
+                   void *d_workspace,
+                   size_t workspaceSize,
                    bool transa,
                    bool transb);
 

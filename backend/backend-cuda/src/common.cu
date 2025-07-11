@@ -58,30 +58,31 @@ __global__ void embedding_lookup_kernel_128bit(T *output,
  *
  * @tparam T The base data type (float, __half, etc.).
  */
+/**
+ * @brief Host-side launch function for embedding lookup with a raw pointer API.
+ */
 template <typename T>
 void embed(
-    const thrust::device_vector<T> &embedding,
-    const thrust::device_vector<uint32_t> &indices,
-    thrust::device_vector<T> *result,
+    const T* embedding,
+    size_t embedding_num_rows,
+    const uint32_t* indices,
+    size_t num_indices,
+    T* result,
     int embed_width,
     cudaStream_t stream)
 {
     // --- Input Validation ---
-    if (embedding.size() == 0 || indices.size() == 0)
-        return;
-    if (embedding.size() % embed_width != 0)
-    {
+    if (embedding_num_rows == 0 || num_indices == 0) return;
+    if ((embedding_num_rows * embed_width) == 0) return;
+    if ((embedding_num_rows * embed_width) % embed_width != 0) {
         throw std::invalid_argument("Embedding vector size is not divisible by the embed_width.");
     }
-    if ((embed_width * sizeof(T)) % 16 != 0)
-    {
+    if ((embed_width * sizeof(T)) % 16 != 0) {
         throw std::invalid_argument("Total byte size of a slice (embed_width * sizeof(T)) must be a multiple of 16.");
     }
 
     // --- Prepare Parameters ---
-    const int num_indices = indices.size();
-    result->resize((long long)num_indices * embed_width);
-
+    // The result buffer is assumed to be pre-allocated by the caller.
     const int threads_per_block = 256;
     const int hidden_dim_div_16 = (embed_width * sizeof(T)) / 16;
 
@@ -90,12 +91,52 @@ void embed(
 
     // --- Kernel Launch ---
     embedding_lookup_kernel_128bit<T><<<blocks, threads, 0, stream>>>(
-        thrust::raw_pointer_cast(result->data()),
-        thrust::raw_pointer_cast(embedding.data()),
-        thrust::raw_pointer_cast(indices.data()),
+        result,
+        embedding,
+        indices,
         num_indices,
         hidden_dim_div_16);
 }
+
+
+// template <typename T>
+// void embed(
+//     const thrust::device_vector<T> &embedding,
+//     const thrust::device_vector<uint32_t> &indices,
+//     thrust::device_vector<T> *result,
+//     int embed_width,
+//     cudaStream_t stream)
+// {
+//     // --- Input Validation ---
+//     if (embedding.size() == 0 || indices.size() == 0)
+//         return;
+//     if (embedding.size() % embed_width != 0)
+//     {
+//         throw std::invalid_argument("Embedding vector size is not divisible by the embed_width.");
+//     }
+//     if ((embed_width * sizeof(T)) % 16 != 0)
+//     {
+//         throw std::invalid_argument("Total byte size of a slice (embed_width * sizeof(T)) must be a multiple of 16.");
+//     }
+
+//     // --- Prepare Parameters ---
+//     const int num_indices = indices.size();
+//     result->resize((long long)num_indices * embed_width);
+
+//     const int threads_per_block = 256;
+//     const int hidden_dim_div_16 = (embed_width * sizeof(T)) / 16;
+
+//     dim3 blocks(num_indices);
+//     dim3 threads(threads_per_block);
+
+//     // --- Kernel Launch ---
+//     embedding_lookup_kernel_128bit<T><<<blocks, threads, 0, stream>>>(
+//         thrust::raw_pointer_cast(result->data()),
+//         thrust::raw_pointer_cast(embedding.data()),
+//         thrust::raw_pointer_cast(indices.data()),
+//         num_indices,
+//         hidden_dim_div_16);
+// }
 
 
 
@@ -246,23 +287,41 @@ void topk_scatter(
 // the compiler to generate the code for each of these types, which will then
 // be linked against when another file includes embedding.h.
 
-template void embed<float>(
-    const thrust::device_vector<float> &,
-    const thrust::device_vector<uint32_t> &,
-    thrust::device_vector<float> *,
-    int, cudaStream_t);
+// template void embed<float>(
+//     const thrust::device_vector<float> &,
+//     const thrust::device_vector<uint32_t> &,
+//     thrust::device_vector<float> *,
+//     int, cudaStream_t);
 
-template void embed<__half>(
-    const thrust::device_vector<__half> &,
-    const thrust::device_vector<uint32_t> &,
-    thrust::device_vector<__half> *,
-    int, cudaStream_t);
+// template void embed<__half>(
+//     const thrust::device_vector<__half> &,
+//     const thrust::device_vector<uint32_t> &,
+//     thrust::device_vector<__half> *,
+//     int, cudaStream_t);
+
+// template void embed<__nv_bfloat16>(
+//     const thrust::device_vector<__nv_bfloat16> &,
+//     const thrust::device_vector<uint32_t> &,
+//     thrust::device_vector<__nv_bfloat16> *,
+//     int, cudaStream_t);
+
+template void embed<float>(
+    const float*,
+    size_t,
+    const uint32_t*,
+    size_t,
+    float* result,
+    int,
+    cudaStream_t);
 
 template void embed<__nv_bfloat16>(
-    const thrust::device_vector<__nv_bfloat16> &,
-    const thrust::device_vector<uint32_t> &,
-    thrust::device_vector<__nv_bfloat16> *,
-    int, cudaStream_t);
+    const __nv_bfloat16*,
+    size_t,
+    const uint32_t*,
+    size_t,
+    __nv_bfloat16* result,
+    int,
+    cudaStream_t);
 
 
 template void topk_scatter<float>(
@@ -273,7 +332,7 @@ template void topk_scatter<float>(
     size_t ,
     thrust::device_vector<float>& ,
     thrust::device_vector<int32_t>& ,
-    cudaStream_t );
+    cudaStream_t);
 
 template void topk_scatter<__half>(
     const thrust::device_vector<__half>& ,
@@ -283,7 +342,7 @@ template void topk_scatter<__half>(
     size_t ,
     thrust::device_vector<__half>& ,
     thrust::device_vector<int32_t>& ,
-    cudaStream_t );
+    cudaStream_t);
 
 template void topk_scatter<__nv_bfloat16>(
     const thrust::device_vector<__nv_bfloat16>& ,
@@ -293,7 +352,7 @@ template void topk_scatter<__nv_bfloat16>(
     size_t ,
     thrust::device_vector<__nv_bfloat16>& ,
     thrust::device_vector<int32_t>& ,
-    cudaStream_t );
+    cudaStream_t);
 
 
 template <typename T>
@@ -330,15 +389,36 @@ constexpr cudaDataType_t get_cuda_data_type()
     }
 }
 
+/**
+ * @brief Performs General Matrix Multiplication (GEMM) using cuBLASLt with raw device pointers.
+ * * This function computes C = alpha * op(A) * op(B) + beta * C.
+ * It uses a strategy of swapping A and B to handle column-major layout requirements of cuBLAS
+ * while allowing the caller to think in terms of row-major layouts.
+ * * @tparam T The data type of the matrices (e.g., float, __nv_bfloat16).
+ * @param ltHandle The cuBLASLt library handle.
+ * @param stream The CUDA stream for the operation.
+ * @param d_A Pointer to matrix A on the device.
+ * @param d_B Pointer to matrix B on the device.
+ * @param d_bias Pointer to the bias vector on the device (can be nullptr).
+ * @param d_C Pointer to the output matrix C on the device.
+ * @param m The number of rows of matrix op(A) and C.
+ * @param n The number of columns of matrix op(B) and C.
+ * @param k The number of columns of op(A) and rows of op(B).
+ * @param d_workspace Pointer to the workspace buffer on the device.
+ * @param workspaceSize The size of the workspace buffer in bytes.
+ * @param transa Specifies if matrix A should be transposed.
+ * @param transb Specifies if matrix B should be transposed.
+ */
 template <typename T>
 void gemm_cublasLt(cublasLtHandle_t ltHandle,
                    cudaStream_t stream,
-                   const thrust::device_vector<T> &A,
-                   const thrust::device_vector<T> &B,
-                   const thrust::device_vector<T> *bias,
-                   thrust::device_vector<T> &C,
+                   const T *d_A,
+                   const T *d_B,
+                   const T *d_bias,
+                   T *d_C,
                    int m, int n, int k,
-                   thrust::device_vector<char> &workspace,
+                   void *d_workspace,
+                   size_t workspaceSize,
                    bool transa,
                    bool transb)
 {
@@ -346,14 +426,6 @@ void gemm_cublasLt(cublasLtHandle_t ltHandle,
     {
         return;
     }
-
-    // --- Pointers and Workspace Setup ---
-    const T *d_A = thrust::raw_pointer_cast(A.data());
-    const T *d_B = thrust::raw_pointer_cast(B.data());
-    T *d_C = thrust::raw_pointer_cast(C.data());
-    const T *d_bias = (bias != nullptr && !bias->empty()) ? thrust::raw_pointer_cast(bias->data()) : nullptr;
-    void *d_workspace = thrust::raw_pointer_cast(workspace.data());
-    size_t workspaceSize = workspace.size();
 
     // --- Scaling Factors ---
     float alpha = 1.0f;
@@ -380,19 +452,16 @@ void gemm_cublasLt(cublasLtHandle_t ltHandle,
 
     // --- Core Correction using (A*B)^T = op(B)^T * op(A)^T strategy ---
     // We ask cuBLAS to compute C_col(n,m) = op(B)^T_col(n,k) * op(A)^T_col(k,m).
-    // This is achieved by swapping the inputs (B becomes the first matrix, A the second)
-    // and providing the correctly transformed operations and layouts.
-
-    // 1. Determine the operations for the swapped multiplication.
-    // To get op(M)^T: if the original op was N, the new op is T. If the original was T, the new op is N.
     cublasOperation_t opA_swapped = transa ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t opB_swapped = transb ? CUBLAS_OP_T : CUBLAS_OP_N;
 
-    // 2. Create the Matmul Descriptor with the swapped & transformed operations.
+    // Create the Matmul Descriptor with the swapped & transformed operations.
     CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmulDesc, compute_type, scale_type));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opB_swapped, sizeof(opB_swapped)));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmulDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opA_swapped, sizeof(opA_swapped)));
 
+    // Create matrix layouts. Note that the dimensions are for the *swapped* matrices.
+    // A (now B) has dimensions (n, k)
     if (transb)
     {
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, cuda_dtype, k, n, k));
@@ -402,6 +471,7 @@ void gemm_cublasLt(cublasLtHandle_t ltHandle,
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, cuda_dtype, n, k, n));
     }
 
+    // B (now A) has dimensions (k, m)
     if (transa)
     {
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, cuda_dtype, m, k, m));
@@ -410,9 +480,11 @@ void gemm_cublasLt(cublasLtHandle_t ltHandle,
     {
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, cuda_dtype, k, m, k));
     }
+    
+    // C has dimensions (n, m)
     CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, cuda_dtype, n, m, n));
 
-    // 4. Configure Epilogue (Bias Addition)
+    // Configure Epilogue (Bias Addition)
     cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
     if (d_bias != nullptr)
     {
@@ -429,7 +501,7 @@ void gemm_cublasLt(cublasLtHandle_t ltHandle,
     int returnedResults = 0;
     cublasLtMatmulHeuristicResult_t heuristicResult = {};
 
-    // Note the order of descriptors: Bdesc, Adesc, Cdesc
+    // Note the order of descriptors: Adesc (for B), Bdesc (for A), Cdesc
     CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(ltHandle, matmulDesc, Adesc, Bdesc, Cdesc, Cdesc, preference, 1, &heuristicResult, &returnedResults));
 
     if (returnedResults == 0)
@@ -438,8 +510,7 @@ void gemm_cublasLt(cublasLtHandle_t ltHandle,
     }
     else
     {
-        // 5. Execute the Matmul
-        // Note the order of pointers: d_B, d_A, d_C
+        // Execute the Matmul. Note the order of pointers: d_B, d_A, d_C
         CUBLAS_CHECK(cublasLtMatmul(ltHandle, matmulDesc, &alpha,
                                     d_B, Adesc, // First matrix is B
                                     d_A, Bdesc, // Second matrix is A
@@ -450,39 +521,26 @@ void gemm_cublasLt(cublasLtHandle_t ltHandle,
     }
 
     // --- Cleanup ---
-    if (preference)
-        CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
-    if (Cdesc)
-        CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Cdesc));
-    if (Bdesc)
-        CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Bdesc));
-    if (Adesc)
-        CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Adesc));
-    if (matmulDesc)
-        CUBLAS_CHECK(cublasLtMatmulDescDestroy(matmulDesc));
+    if (preference) CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
+    if (Cdesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Cdesc));
+    if (Bdesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Bdesc));
+    if (Adesc) CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Adesc));
+    if (matmulDesc) CUBLAS_CHECK(cublasLtMatmulDescDestroy(matmulDesc));
 }
 
-template void gemm_cublasLt(cublasLtHandle_t,
-                            cudaStream_t,
-                            const thrust::device_vector<__nv_bfloat16> &,
-                            const thrust::device_vector<__nv_bfloat16> &,
-                            const thrust::device_vector<__nv_bfloat16> *,
-                            thrust::device_vector<__nv_bfloat16> &,
-                            int, int, int,
-                            thrust::device_vector<char> &,
-                            bool,
-                            bool);
+// --- Explicit Template Instantiations for raw pointer version ---
 
-template void gemm_cublasLt(cublasLtHandle_t,
-                            cudaStream_t,
-                            const thrust::device_vector<float> &,
-                            const thrust::device_vector<float> &,
-                            const thrust::device_vector<float> *,
-                            thrust::device_vector<float> &,
-                            int, int, int,
-                            thrust::device_vector<char> &,
-                            bool,
-                            bool);
+template void gemm_cublasLt<__nv_bfloat16>(cublasLtHandle_t, cudaStream_t,
+                                           const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *,
+                                           int, int, int,
+                                           void *, size_t,
+                                           bool, bool);
+
+template void gemm_cublasLt<float>(cublasLtHandle_t, cudaStream_t,
+                                   const float *, const float *, const float *, float *,
+                                   int, int, int,
+                                   void *, size_t,
+                                   bool, bool);
 
 void multiply_bf16_cublas(cublasHandle_t handle,
                           const __nv_bfloat16 *A, const __nv_bfloat16 *B, __nv_bfloat16 *C,

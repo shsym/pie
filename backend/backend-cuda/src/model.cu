@@ -154,23 +154,23 @@ void Model::ModelImpl::handle_embed_text(const std::vector<Model::EmbedTextComma
         embeds[cmd.embedding_id] = {cmd.token_id, cmd.position_id};
     }
 }
+// Assuming other necessary includes and the Model::ModelImpl class definition exist above
 
 void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockCommand>& commands) {
 
     std::cout << "  [ModelImpl] handle_fill_block called with " << commands.size() << " items." << std::endl;
 
+    // --- Host-side vector preparations ---
     std::vector<int32_t> kv_page_indices_host;
     std::vector<int32_t> kv_page_indptr_host = {0};
     std::vector<int32_t> kv_last_page_lens_host;
     std::vector<int32_t> qo_indptr_host = {0};
-    std::vector<uint8_t> custom_masks_host; // Use uint8_t for flashinfer
+    std::vector<uint8_t> custom_masks_host;
     std::vector<int32_t> mask_indptr_host = {0};
-
     std::vector<int32_t> kv_batch_indices_host;
     std::vector<int32_t> kv_positions_host;
-
-    std::vector<uint32_t> new_token_ids_host;    // Use uint32_t for model input
-    std::vector<int32_t> new_position_ids_host; // Use uint32_t for model input
+    std::vector<uint32_t> new_token_ids_host;
+    std::vector<int32_t> new_position_ids_host;
 
     struct OutputEmbedPostproc {
         size_t logit_row_idx;
@@ -192,7 +192,6 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
 
         mask_indptr_host.push_back(mask_indptr_host.back() + (num_new_tokens * total_ctx_tokens));
 
-        // --- kv_batch_indices and kv_positions for KV cache update ---
         for (int32_t i = 0; i < num_new_tokens; ++i) {
             kv_batch_indices_host.push_back(batch_idx);
             kv_positions_host.push_back(total_ctx_tokens + i);
@@ -268,18 +267,15 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
 
     // --- Allocate buffers ---
     size_t num_total_new_tokens = new_token_ids.size();
-    if (num_total_new_tokens == 0) return; // Nothing to do
+    if (num_total_new_tokens == 0) return;
 
     thrust::device_vector<__nv_bfloat16> logits(num_total_new_tokens * model->get_config().vocab_size);
     
-
-    // using the numbers from flashinfer repo
-    thrust::device_vector<char> workspace_buffer_float(128 * 1024 * 1024);
+    size_t workspace_size_bytes = model->get_workspace_size(num_total_new_tokens);
+    thrust::device_vector<char> workspace_buffer_float(workspace_size_bytes);
     thrust::device_vector<char> workspace_buffer_int(8 * 1024 * 1024);
 
-    cudaStream_t stream = 0; // Use default stream
-
-    
+    cudaStream_t stream = 0;
 
     // --- Model Forward Pass ---
     model->forward(
@@ -295,13 +291,14 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         custom_mask,
         mask_indptr,
         stream,
-        workspace_buffer_float,
-        workspace_buffer_int,
+        thrust::raw_pointer_cast(workspace_buffer_float.data()),
+        thrust::raw_pointer_cast(workspace_buffer_int.data()),
         kv_page_size,
         kv_batch_indices,
         kv_positions
     );
 
+    // --- Post-processing ---
     if (!output_embed_postproc.empty()) {
         std::vector<size_t> logit_indices_host;
         std::vector<uint32_t> dest_embed_ids_host;
@@ -324,9 +321,7 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
             embed_storage_p2,
             stream
         );
-       
     }
-
 }
 
 void Model::ModelImpl::handle_mask_block(const std::vector<Model::MaskBlockCommand>& commands) {
