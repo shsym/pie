@@ -28,6 +28,7 @@ class L4maMlp(nn.Module):
         gate_proj = self.gate_proj(x)
         up_proj = self.up_proj(x)
         
+        print(f"gate mean: {gate_proj.mean().item()}, up_proj mean: {up_proj.mean().item()}")
         
         interim = self.act_fn(gate_proj) * up_proj
         

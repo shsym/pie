@@ -336,9 +336,8 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     thrust::device_vector<__nv_bfloat16> logits(num_total_new_tokens * model->get_config().vocab_size);
     
     size_t workspace_size_bytes = model->get_workspace_size(num_total_new_tokens);
-    thrust::device_vector<char> workspace_buffer(workspace_size_bytes);
 
-    StackAllocator allocator(thrust::raw_pointer_cast(workspace_buffer.data()), workspace_size_bytes);
+    StackAllocator allocator(workspace_size_bytes);
 
     cudaStream_t stream = 0;
 

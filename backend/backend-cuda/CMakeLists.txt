@@ -117,6 +117,7 @@ add_executable(pie_cuda_be
     src/l4ma.cu
     src/model.cu
     src/common.cu
+    src/tensor.cu
     #src/l4ma.cu
     #src/bpe.cpp
     #src/common.cu

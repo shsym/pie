@@ -371,37 +371,33 @@ void L4maMlp<T>::forward(
     const int intermediate_size = config_.intermediate_size;
     const size_t proj_count = (size_t)num_tokens * intermediate_size;
 
-    // 1. Allocate buffers from the stack allocator
-    T* up_proj_out_ptr = allocator.template allocate<T>(proj_count);
-    T* gate_proj_out_ptr = allocator.template allocate<T>(proj_count);
+    Tensor<T> up_proj_out = allocator.allocate<T>(proj_count);
+    Tensor<T> gate_proj_out = allocator.allocate<T>(proj_count);
 
-    // Use allocate_rest for the cublas workspace as requested
-    size_t cublas_workspace_size = 32 * 1024 * 1024; // 32MB workspace size for cublasLt
-    void* cublas_workspace_ptr = allocator.allocate_bytes(cublas_workspace_size); // Allocate aligned workspace
+    // Use a Tensor<uint8_t> for the raw byte buffer
+    size_t cublas_workspace_size = 32 * 1024 * 1024;
+    Tensor<uint8_t> cublas_workspace = allocator.allocate<uint8_t>(cublas_workspace_size);
 
     // 2. Gate and Up projections. TODO: Fuse them into a single GEMM if possible
-    gemm_cublasLt<T>(ltHandle, stream, x, thrust::raw_pointer_cast(up_proj_weights_->data()), nullptr, up_proj_out_ptr, num_tokens, intermediate_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
-    gemm_cublasLt<T>(ltHandle, stream, x, thrust::raw_pointer_cast(gate_proj_weights_->data()), nullptr, gate_proj_out_ptr, num_tokens, intermediate_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, x, thrust::raw_pointer_cast(up_proj_weights_->data()), nullptr, up_proj_out.data(), num_tokens, intermediate_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, x, thrust::raw_pointer_cast(gate_proj_weights_->data()), nullptr, gate_proj_out.data(), num_tokens, intermediate_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
 
     // print the mean of gate_proj_out_ptr and up_proj_out_ptr for debugging
-    // float gate_mean = compute_mean(gate_proj_out_ptr, proj_count);
-    // float up_mean = compute_mean(up_proj_out_ptr, proj_count);
-    // std::cout << "Gate mean: " << gate_mean << ", Up mean: " << up_mean << std::endl;
+    std::cout << "Gate mean: " << gate_proj_out.mean() << ", Up mean: " << up_proj_out.mean() << std::endl;
 
     // 3. SwiGLU activation (gate * silu(up))
     // We can reuse the gate_proj_out_ptr buffer for the output of SwiGLU
-    silu_and_mul<T>(up_proj_out_ptr, up_proj_out_ptr, num_tokens, intermediate_size, stream);
+    silu_and_mul<T>(up_proj_out.data(), up_proj_out.data(), num_tokens, intermediate_size, stream);
 
-    float out_mean = compute_mean(up_proj_out_ptr, proj_count);
-    std::cout << "SwiGLU output mean: " << out_mean << std::endl;
+    std::cout << "SwiGLU output mean: " << up_proj_out.mean() << std::endl;
 
     // 4. Down projection
-    gemm_cublasLt<T>(ltHandle, stream, up_proj_out_ptr, thrust::raw_pointer_cast(down_proj_weights_->data()), nullptr, output, num_tokens, hidden_size, intermediate_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, up_proj_out.data(), thrust::raw_pointer_cast(down_proj_weights_->data()), nullptr, output, num_tokens, hidden_size, intermediate_size, cublas_workspace.data(), cublas_workspace_size, false, true);
 
     // 5. Deallocate buffers in reverse order of allocation (LIFO)
-    allocator.deallocate_bytes(cublas_workspace_ptr, cublas_workspace_size);
-    allocator.template deallocate<T>(gate_proj_out_ptr, proj_count);
-    allocator.template deallocate<T>(up_proj_out_ptr, proj_count);
+    allocator.deallocate(cublas_workspace);
+    allocator.deallocate(gate_proj_out);
+    allocator.deallocate(up_proj_out);
 
 }
 
@@ -445,16 +441,16 @@ void L4maAttention<T>::forward(
     const size_t kv_proj_count = (size_t)num_tokens * num_key_value_heads * head_size;
     
     // 1. Allocate buffers from the stack allocator
-    T* q_proj_ptr = allocator.template allocate<T>(q_proj_count);
-    T* k_proj_ptr = allocator.template allocate<T>(kv_proj_count);
-    T* v_proj_ptr = allocator.template allocate<T>(kv_proj_count);
-    size_t cublas_workspace_size = 32 * 1024 * 1024; // 32MB workspace size for cublasLt
-    void* cublas_workspace_ptr = allocator.allocate_bytes(cublas_workspace_size); // Allocate aligned workspace
+    Tensor<T> q_proj = allocator.allocate<T>(q_proj_count);
+    Tensor<T> k_proj = allocator.allocate<T>(kv_proj_count);
+    Tensor<T> v_proj = allocator.allocate<T>(kv_proj_count);
+    size_t cublas_workspace_size = 32 * 1024 * 1024;
+    Tensor<uint8_t> cublas_workspace = allocator.allocate<uint8_t>(cublas_workspace_size);
 
     // 2. Q, K, V projections. TODO: Fuse them into a single GEMM if possible
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(q_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(q_proj_bias_->data()) : nullptr, q_proj_ptr, num_tokens, num_query_heads * head_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(k_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(k_proj_bias_->data()) : nullptr, k_proj_ptr, num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(v_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(v_proj_bias_->data()) : nullptr, v_proj_ptr, num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(q_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(q_proj_bias_->data()) : nullptr, q_proj.data(), num_tokens, num_query_heads * head_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(k_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(k_proj_bias_->data()) : nullptr, k_proj.data(), num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(v_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(v_proj_bias_->data()) : nullptr, v_proj.data(), num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
 
     // compute the mean of qkv outputs for debugging
     // float q_mean = compute_mean(q_proj_ptr, q_proj_count);
@@ -465,7 +461,7 @@ void L4maAttention<T>::forward(
 
     // 3. Apply RoPE (in-place)
     flashinfer::BatchQKApplyLlama31RotaryPosIds(
-        q_proj_ptr, k_proj_ptr, q_proj_ptr, k_proj_ptr,
+        q_proj.data(), k_proj.data(), q_proj.data(),  k_proj.data(),
         thrust::raw_pointer_cast(position_ids.data()),
         num_tokens, num_query_heads, num_key_value_heads, head_size, head_size,
         num_query_heads * head_size, head_size, num_key_value_heads * head_size, head_size,
@@ -496,7 +492,7 @@ void L4maAttention<T>::forward(
 
 
     flashinfer::AppendPagedKVCache<T, int32_t>(
-        paged_kv, k_proj_ptr, v_proj_ptr,
+        paged_kv, k_proj.data(), v_proj.data(),
         thrust::raw_pointer_cast(kv_batch_indices.data()),
         thrust::raw_pointer_cast(kv_positions.data()),
         num_tokens,
@@ -506,9 +502,9 @@ void L4maAttention<T>::forward(
     );
 
     // Reuse a buffer for the attention output before the final projection
-    T* o_proj_input_ptr = q_proj_ptr; 
+    T* o_proj_input_ptr = q_proj.data(); 
     flashinfer::BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(
-        &prefill_handler, q_proj_ptr, thrust::raw_pointer_cast(qo_indptr.data()),
+        &prefill_handler, q_proj.data(), thrust::raw_pointer_cast(qo_indptr.data()),
         nullptr, paged_kv, o_proj_input_ptr, nullptr, num_query_heads,
         flashinfer::MaskMode::kCustom,
         thrust::raw_pointer_cast(custom_mask.data()),
@@ -548,18 +544,17 @@ void L4maAttention<T>::forward(
     
 
     // 5. Final output projection
-    gemm_cublasLt<T>(ltHandle, stream, o_proj_input_ptr, thrust::raw_pointer_cast(o_proj_weights_->data()), nullptr, attn_output, num_tokens, hidden_size, num_query_heads * head_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, o_proj_input_ptr, thrust::raw_pointer_cast(o_proj_weights_->data()), nullptr, attn_output, num_tokens, hidden_size, num_query_heads * head_size, cublas_workspace.data(), cublas_workspace_size, false, true);
 
     // float o_proj_output_mean = compute_mean(attn_output, num_tokens * hidden_size);
     // std::cout << "O projection output mean: " << o_proj_output_mean << std::endl;
     // print_first_10_bfloat16_elements(attn_output, num_tokens * hidden_size);
     
-
     // 6. Deallocate buffers in reverse order
-    allocator.deallocate_bytes(cublas_workspace_ptr, cublas_workspace_size);
-    allocator.template deallocate<T>(v_proj_ptr, kv_proj_count);
-    allocator.template deallocate<T>(k_proj_ptr, kv_proj_count);
-    allocator.template deallocate<T>(q_proj_ptr, q_proj_count);
+    allocator.deallocate(cublas_workspace);
+    allocator.deallocate(v_proj);
+    allocator.deallocate(k_proj);
+    allocator.deallocate(q_proj);
 }
 
 template <typename T>
@@ -587,12 +582,12 @@ void L4maDecoderLayer<T>::forward(
 
     // --- 1. Self-Attention Block ---
     // The input `hidden_states` serves as the first residual.
-    T* normed_input_ptr = allocator.template allocate<T>(hidden_size_elements);
-    input_layernorm_.forward(normed_input_ptr, hidden_states, num_tokens, stream);
+    Tensor<T> normed_input = allocator.allocate<T>(hidden_size_elements);
+    input_layernorm_.forward(normed_input.data(), hidden_states, num_tokens, stream);
 
-    T* attn_output_ptr = allocator.template allocate<T>(hidden_size_elements);
-    self_attn_.forward(allocator, attn_output_ptr, 
-                       normed_input_ptr, position_ids, kv_cache_k, kv_cache_v, 
+    Tensor<T> attn_output = allocator.allocate<T>(hidden_size_elements);
+    self_attn_.forward(allocator, attn_output.data(), 
+                       normed_input.data(), position_ids, kv_cache_k, kv_cache_v, 
                        kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr, custom_mask, mask_indptr, 
                        ltHandle, stream, prefill_handler, page_size,
                        kv_batch_indices, kv_positions);
@@ -600,40 +595,33 @@ void L4maDecoderLayer<T>::forward(
 
 
     add_residual_kernel<<<(hidden_size_elements + 255) / 256, 256, 0, stream>>>(
-        hidden_states, attn_output_ptr, hidden_size_elements);
+        hidden_states, attn_output.data(), hidden_size_elements);
     
 
-
-
-
     // Deallocate attn_output and then normed_input to free up space for the MLP block
-    allocator.template deallocate<T>(attn_output_ptr, hidden_size_elements);
-    allocator.template deallocate<T>(normed_input_ptr, hidden_size_elements);
+    allocator.deallocate(attn_output);
+    allocator.deallocate(normed_input);
 
 
     // --- 2. MLP Block ---
     // The result of the attention block, `hidden_states`, is the residual for the MLP block.
-    T* normed_mlp_input_ptr = allocator.template allocate<T>(hidden_size_elements);
-    post_attention_layernorm_.forward(normed_mlp_input_ptr, hidden_states, num_tokens, stream);
+    Tensor<T> normed_mlp_input = allocator.allocate<T>(hidden_size_elements);
+    post_attention_layernorm_.forward(normed_mlp_input.data(), hidden_states, num_tokens, stream);
 
 
- 
-
-    T* mlp_output_ptr = allocator.template allocate<T>(hidden_size_elements);
-    mlp_.forward(allocator, mlp_output_ptr, normed_mlp_input_ptr, num_tokens, ltHandle, stream);
+    Tensor<T> mlp_output = allocator.allocate<T>(hidden_size_elements);
+    mlp_.forward(allocator, mlp_output.data(), normed_mlp_input.data(), num_tokens, ltHandle, stream);
     
     // print the attn_output_ptr mean for debugging
     // float attn_output_mean = compute_mean(mlp_output_ptr, hidden_size_elements);
     // std::cout << "mlp_output_ptr mean: " << attn_output_mean << std::endl;
 
-
-
     add_residual_kernel<<<(hidden_size_elements + 255) / 256, 256, 0, stream>>>(
-        hidden_states, mlp_output_ptr, hidden_size_elements);
+        hidden_states, mlp_output.data(), hidden_size_elements);
         
     // Deallocate MLP buffers
-    allocator.template deallocate<T>(mlp_output_ptr, hidden_size_elements);
-    allocator.template deallocate<T>(normed_mlp_input_ptr, hidden_size_elements);
+    allocator.deallocate(mlp_output);
+    allocator.deallocate(normed_mlp_input);
 }
 
 template <typename T>
@@ -661,14 +649,14 @@ void L4maModel<T>::forward(
     const size_t hidden_size_elements = (size_t)num_tokens * config_.hidden_size;
     
     // Allocate a working buffer for the layers. The layers will operate in-place on this buffer.
-    T* working_hidden_buffer = allocator.template allocate<T>(hidden_size_elements);
+    Tensor<T> working_hidden_buffer = allocator.allocate<T>(hidden_size_elements);
 
     embed<T>(
         thrust::raw_pointer_cast(embed_tokens_weight_->data()),
         embed_tokens_weight_->size() / config_.hidden_size,
         thrust::raw_pointer_cast(input_ids.data()),
         input_ids.size(),
-        working_hidden_buffer, // Embeddings are written to the allocated working buffer
+        working_hidden_buffer.data(), // Embeddings are written to the allocated working buffer
         config_.hidden_size, 
         stream
     );
@@ -692,7 +680,7 @@ void L4maModel<T>::forward(
         T* layer_v_cache_ptr = v_cache_ptr + i * kv_cache_size;
 
         // Pass the allocator down to the layer. The layer will use it for its own scratch space.
-        layer.forward(allocator, working_hidden_buffer,
+        layer.forward(allocator, working_hidden_buffer.data(),
                       position_ids, layer_k_cache_ptr, layer_v_cache_ptr,
                       kv_page_indices, kv_page_indptr, kv_last_page_lens,
                       qo_indptr, custom_mask, mask_indptr, ltHandle, stream,
@@ -700,10 +688,10 @@ void L4maModel<T>::forward(
     }
 
     // Final norm reads from the working buffer and writes to the final output buffer.
-    norm_.forward(final_norm_output, working_hidden_buffer, num_tokens, stream);
+    norm_.forward(final_norm_output, working_hidden_buffer.data(), num_tokens, stream);
     
     // Deallocate the working buffer.
-    allocator.template deallocate<T>(working_hidden_buffer, hidden_size_elements);
+    allocator.deallocate(working_hidden_buffer);
 }
 
 template <typename T>
@@ -728,18 +716,19 @@ void L4maForCausalLM<T>::forward(
     
     const int num_tokens = input_ids.size();
     
-    // Allocate the buffer for the final hidden states (output of the model, input to lm_head)
-    T* hidden_states_ptr = allocator.template allocate<T>((size_t)num_tokens * config_.hidden_size);
-    
-    // Allocate fixed-size buffers for FlashInfer
-    // Check the appendix D2 of https://arxiv.org/pdf/2501.01005
-    void* flashinfer_float_buffer = allocator.allocate_bytes(256 * 1024 * 1024);
-    void* flashinfer_int_buffer = allocator.allocate_bytes(8 * 1024 * 1024);
+    const size_t hidden_elements = (size_t)num_tokens * config_.hidden_size;
+    const size_t flash_float_bytes = 256 * 1024 * 1024;
+    const size_t flash_int_bytes = 8 * 1024 * 1024;
+    const size_t lm_head_workspace_bytes = 32 * 1024 * 1024;
+
+    Tensor<T> hidden_states = allocator.allocate<T>(hidden_elements);
+    Tensor<uint8_t> flashinfer_float_buffer = allocator.allocate<uint8_t>(flash_float_bytes);
+    Tensor<uint8_t> flashinfer_int_buffer = allocator.allocate<uint8_t>(flash_int_bytes);
 
     flashinfer::BatchPrefillHandler handler;
     handler.Plan<T, int32_t>(
-        flashinfer_float_buffer, 256 * 1024 * 1024,
-        flashinfer_int_buffer, 8 * 1024 * 1024,
+        flashinfer_float_buffer.data(), flash_float_bytes,
+        flashinfer_int_buffer.data(), flash_int_bytes,
         qo_indptr_host.data(), 
         kv_page_indptr_host.data(),
         num_tokens,
@@ -751,7 +740,7 @@ void L4maForCausalLM<T>::forward(
 
     model_.forward(
         allocator, // Pass the allocator down to the model.
-        hidden_states_ptr,
+        hidden_states.data(),
         input_ids, position_ids,
         kv_cache_k_, kv_cache_v_,
         kv_page_indices, kv_page_indptr, kv_last_page_lens,
@@ -760,25 +749,24 @@ void L4maForCausalLM<T>::forward(
         kv_batch_indices, kv_positions
     );
 
-    size_t lm_head_workspace_size = 32 * 1024 * 1024; // 32MB workspace size for cublasLt
-    void* lm_head_workspace_ptr = allocator.allocate_bytes(lm_head_workspace_size); // Allocate aligned workspace
+    Tensor<uint8_t> lm_head_workspace = allocator.allocate<uint8_t>(lm_head_workspace_bytes);
     
     gemm_cublasLt<T>(
         cublaslt_handle_, stream,
-        hidden_states_ptr,
+        hidden_states.data(),
         thrust::raw_pointer_cast(lm_head_weight_->data()),
         nullptr,
         output,
         num_tokens, config_.vocab_size, config_.hidden_size,
-        lm_head_workspace_ptr, lm_head_workspace_size, false, true
+        lm_head_workspace.data(), lm_head_workspace_bytes, false, true
     );
     
     // Deallocations will happen automatically as the allocator goes out of scope.
     // However, to be explicit and use the implemented checks:
-    allocator.deallocate_bytes(lm_head_workspace_ptr, lm_head_workspace_size);
-    allocator.deallocate_bytes(flashinfer_int_buffer, 8 * 1024 * 1024);
-    allocator.deallocate_bytes(flashinfer_float_buffer, 256 * 1024 * 1024);
-    allocator.template deallocate<T>(hidden_states_ptr, (size_t)num_tokens * config_.hidden_size);
+    allocator.deallocate(lm_head_workspace);
+    allocator.deallocate(flashinfer_int_buffer);
+    allocator.deallocate(flashinfer_float_buffer);
+    allocator.deallocate(hidden_states);
 }
 
 // --- Explicit Template Instantiations (Unchanged) ---
