@@ -8,6 +8,7 @@
 #include <thrust/device_vector.h>
 
 #include "config.hpp"
+#include "tensor.hpp"
 #include "flashinfer_ops.cuh"
 
 // Forward declarations
@@ -23,7 +24,7 @@ template <typename T>
 class Module {
 public:
     virtual ~Module() = default;
-    virtual std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> get_parameters() = 0;
+    virtual std::map<std::string, Tensor<T>*> get_parameters() = 0;
 };
 
 // ---
@@ -42,11 +43,11 @@ public:
                  int num_tokens,
                  cudaStream_t stream);
 
-    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> get_parameters() override;
+    std::map<std::string, Tensor<T>*> get_parameters() override;
 
 private:
     L4maConfig config_;
-    std::shared_ptr<thrust::device_vector<T>> weight_;
+    Tensor<T> weight_;
 };
 
 // ---
@@ -67,13 +68,13 @@ public:
                  cublasLtHandle_t ltHandle,
                  cudaStream_t stream);
 
-    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> get_parameters() override;
+    std::map<std::string, Tensor<T>*> get_parameters() override;
 
 private:
     L4maConfig config_;
-    std::shared_ptr<thrust::device_vector<T>> gate_proj_weights_;
-    std::shared_ptr<thrust::device_vector<T>> up_proj_weights_;
-    std::shared_ptr<thrust::device_vector<T>> down_proj_weights_;
+    Tensor<T> gate_proj_weights_;
+    Tensor<T> up_proj_weights_;
+    Tensor<T> down_proj_weights_;
 };
 
 // ---
@@ -107,17 +108,17 @@ public:
                  thrust::device_vector<int32_t>& kv_positions
                 );
 
-    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> get_parameters() override;
+    std::map<std::string, Tensor<T>*> get_parameters() override;
 
 private:
     L4maConfig config_;
-    std::shared_ptr<thrust::device_vector<T>> q_proj_weights_;
-    std::shared_ptr<thrust::device_vector<T>> k_proj_weights_;
-    std::shared_ptr<thrust::device_vector<T>> v_proj_weights_;
-    std::shared_ptr<thrust::device_vector<T>> o_proj_weights_;
-    std::shared_ptr<thrust::device_vector<T>> q_proj_bias_;
-    std::shared_ptr<thrust::device_vector<T>> k_proj_bias_;
-    std::shared_ptr<thrust::device_vector<T>> v_proj_bias_;
+    Tensor<T> q_proj_weights_;
+    Tensor<T> k_proj_weights_;
+    Tensor<T> v_proj_weights_;
+    Tensor<T> o_proj_weights_;
+    // Tensor<T> q_proj_bias_;
+    // Tensor<T> k_proj_bias_;
+    // Tensor<T> v_proj_bias_;
 };
 
 // ---
@@ -150,7 +151,7 @@ public:
                  thrust::device_vector<int32_t>& kv_positions
                 );
 
-    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> get_parameters() override;
+    std::map<std::string, Tensor<T>*> get_parameters() override;
 
 private:
     L4maConfig config_;
@@ -191,11 +192,13 @@ public:
                  thrust::device_vector<int32_t>& kv_positions
                 );
 
-    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> get_parameters() override;
+    std::map<std::string, Tensor<T>*> get_parameters() override;
+
+    Tensor<T>& get_embed_tokens_weight() { return embed_tokens_weight_; }
 
 private:
     L4maConfig config_;
-    std::shared_ptr<thrust::device_vector<T>> embed_tokens_weight_;
+    Tensor<T> embed_tokens_weight_;
     std::vector<L4maDecoderLayer<T>> layers_;
     RMSNorm<T> norm_;
 };
@@ -210,8 +213,7 @@ class L4maForCausalLM : public Module<T> {
 public:
     explicit L4maForCausalLM(const L4maConfig& config);
 
-    // REFACTORED: The StackAllocator is created inside this function, so it
-    // takes the raw workspace pointer. Changed to void* for generality.
+
     void forward(StackAllocator& allocator,
                  T* output,
                  const thrust::device_vector<uint32_t>& input_ids,
@@ -230,12 +232,10 @@ public:
                  thrust::device_vector<int32_t>& kv_positions
                 );
 
-    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> get_parameters() override;
+    std::map<std::string, Tensor<T>*> get_parameters() override;
     void create_kv_device_vectors(int max_kv_num);
     size_t get_workspace_size(int max_num_tokens) const;
 
-    // Unchanged methods
-    std::pair<thrust::device_vector<T>*, thrust::device_vector<T>*> get_kv_cache_device_vectors();
     L4maConfig& get_config() { return config_; }
 
 private:
@@ -243,7 +243,6 @@ private:
     cublasLtHandle_t cublaslt_handle_;
 
     L4maModel<T> model_;
-    std::shared_ptr<thrust::device_vector<T>> lm_head_weight_;
 
     thrust::device_vector<T> kv_cache_k_;
     thrust::device_vector<T> kv_cache_v_;

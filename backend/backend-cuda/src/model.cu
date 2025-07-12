@@ -95,7 +95,9 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
 
                     const T* host_ptr = static_cast<const T*>(reader.get_raw_tensor_pointer(name));
                     if (host_ptr) {
-                        cudaMemcpy(thrust::raw_pointer_cast(target_tensor_ptr->data()), host_ptr, info.size, cudaMemcpyHostToDevice);
+                        target_tensor_ptr->from_pointer(host_ptr, info.num_elements());
+
+                        //cudaMemcpy(thrust::raw_pointer_cast(target_tensor_ptr->data()), host_ptr, info.size, cudaMemcpyHostToDevice);
                         loaded_keys.insert(name);
                     }
                 }
@@ -105,11 +107,6 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
         }
     }
 
-    if (params_map.count("lm_head.weight") && params_map.count("model.embed_tokens.weight")) {
-        params_map["lm_head.weight"] = params_map["model.embed_tokens.weight"];
-        loaded_keys.insert("lm_head.weight");
-    }
-    
     if (loaded_keys.size() != params_map.size()) {
         std::cout << "\nWarning: Mismatch between loaded and expected parameter counts." << std::endl;
         std::cout << "Missing parameters:" << std::endl;

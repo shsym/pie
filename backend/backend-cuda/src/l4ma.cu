@@ -12,116 +12,11 @@
 #include "flashinfer/pos_enc.cuh"
 #include "flashinfer/page.cuh"
 #include "flashinfer/activation.cuh"
+#include "flashinfer/vec_dtypes.cuh"
+#include "flashinfer/utils.cuh"
+#include "flashinfer/math.cuh"
+
 #include "flashinfer_ops.cuh"
-
-
-
-/**
- * @brief CUDA kernel to compute partial sums of a __nv_bfloat16 array.
- *
- * Each block computes the sum of a portion of the input array and writes a single
- * partial sum to the output array. The summation is done in float32 for precision.
- *
- * @param input Device pointer to the input __nv_bfloat16 array.
- * @param output Device pointer to the output float array for partial sums.
- * @param size The total number of elements in the input array.
- */
-__global__ void sum_reduction_kernel(const __nv_bfloat16* input, float* output, int size) {
-    // Use dynamic shared memory for the reduction
-    extern __shared__ float sdata[];
-
-    unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    // Each thread loads one element from global memory to shared memory
-    if (i < size) {
-        // Convert bfloat16 to float for summation
-        sdata[tid] = __bfloat162float(input[i]);
-    } else {
-        sdata[tid] = 0.0f;
-    }
-    __syncthreads();
-
-    // Perform the reduction in shared memory
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    // The first thread in the block writes the partial sum to global memory
-    if (tid == 0) {
-        output[blockIdx.x] = sdata[0];
-    }
-}
-
-
-/**
- * @brief Computes the mean of a __nv_bfloat16 array on the GPU.
- *
- * This function is intended for debugging purposes. It launches a reduction
- * kernel, copies the partial sums back to the host, and computes the final mean.
- *
- * @param d_input Device pointer to the __nv_bfloat16 array.
- * @param num_elements The total number of elements in the array.
- * @return The mean of the array as a float.
- */
-float compute_mean(const __nv_bfloat16* d_input, size_t num_elements) {
-    if (num_elements == 0) {
-        return 0.0f;
-    }
-
-    // --- Kernel Launch Configuration ---
-    const int threads_per_block = 256;
-    const int num_blocks = (num_elements + threads_per_block - 1) / threads_per_block;
-
-    // --- Allocate Memory ---
-    // Allocate device memory for partial sums from each block
-    float* d_partial_sums;
-    CUDA_CHECK(cudaMalloc(&d_partial_sums, num_blocks * sizeof(float)));
-
-    // --- Launch Kernel ---
-    // The size of shared memory is threads_per_block * sizeof(float)
-    size_t shared_mem_size = threads_per_block * sizeof(float);
-    sum_reduction_kernel<<<num_blocks, threads_per_block, shared_mem_size>>>(d_input, d_partial_sums, num_elements);
-    CUDA_CHECK(cudaGetLastError()); // Check for any launch errors
-
-    // --- Copy Results and Final Computation ---
-    // Allocate host memory for partial sums
-    std::vector<float> h_partial_sums(num_blocks);
-
-    // Copy partial sums from device to host
-    CUDA_CHECK(cudaMemcpy(h_partial_sums.data(), d_partial_sums, num_blocks * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // Free the device memory for partial sums
-    CUDA_CHECK(cudaFree(d_partial_sums));
-
-    // Compute the final sum on the CPU
-    float total_sum = std::accumulate(h_partial_sums.begin(), h_partial_sums.end(), 0.0f);
-
-    // Calculate the mean
-    return total_sum / num_elements;
-}
-
-void print_first_10_bfloat16_elements(const __nv_bfloat16* device_ptr, size_t size) {
-
-    // Allocate host vector
-    std::vector<__nv_bfloat16> host_data(size);
-    
-    // Copy from device to host
-    CUDA_CHECK(cudaMemcpy(host_data.data(), device_ptr, size * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
-    
-    // Print first 10 elements as float
-    for (size_t i = 0; i < 10 && i < size; ++i) {
-        float val = __bfloat162float(host_data[i]);
-        std::cout << val << " ";
-    }
-
-    std::cout << std::endl;
-}
-
-/// END of debugging functions
 
 
 
@@ -135,55 +30,118 @@ __global__ void add_residual_kernel(T* x, const T* residual, int n) {
     }
 }
 
-__device__ __forceinline__ float silu(const float &val) { return val / (1.0f + __expf(-val)); }
 
+__device__ __forceinline__ float silu(const float &val) {
+    return val / (1.0f + __expf(-val));
+}
+
+template <typename T, float (*Activation)(const float&)>
+__global__ void act_and_mul_kernel(
+    T* __restrict__ out,
+    const T* __restrict__ input1,
+    const T* __restrict__ input2,
+    const int d
+) {
+    // Each thread processes one element at a time, with vectorization
+    constexpr uint32_t vec_size = 16 / sizeof(T);
+
+    // The block index corresponds to the token index in the batch
+    const int64_t token_idx = blockIdx.x;
+    // The thread index within the block
+    const int64_t thread_idx = threadIdx.x;
+    // The total number of threads in the block
+    const int64_t stride = blockDim.x;
+
+    // Calculate the base offset for the current token for each input
+    const int64_t token_offset = token_idx * d;
+
+    // Main loop for vectorized processing
+    // Each thread processes multiple elements in a strided pattern
+    #pragma unroll 1
+    for (uint32_t idx = thread_idx; idx < d / vec_size; idx += stride) {
+        flashinfer::vec_t<float, vec_size> x_vec, y_vec, out_vec;
+
+        // Load data from the two separate input tensors
+        x_vec.cast_load(input1 + token_offset + idx * vec_size);
+        y_vec.cast_load(input2 + token_offset + idx * vec_size);
+
+        // Apply activation to the first vector and multiply element-wise
+        #pragma unroll
+        for (uint32_t i = 0; i < vec_size; ++i) {
+            out_vec[i] = Activation(x_vec[i]) * y_vec[i];
+        }
+
+        // Store the result back to the output tensor
+        out_vec.cast_store(out + token_offset + idx * vec_size);
+    }
+
+    // Handle remaining elements that don't fit into a full vector
+    const int64_t remaining_offset = (d / vec_size) * vec_size;
+    #pragma unroll 1
+    for (int64_t idx = thread_idx + remaining_offset; idx < d; idx += stride) {
+        // Load single elements from each input tensor
+        float x = static_cast<float>(__ldg(input1 + token_offset + idx));
+        float y = static_cast<float>(__ldg(input2 + token_offset + idx));
+        // Compute and store the result
+        out[token_offset + idx] = static_cast<T>(Activation(x) * y);
+    }
+}
+
+
+
+// Host-side function to launch the silu_and_mul kernel
 template <typename T>
 void silu_and_mul(
-    T *out_ptr,
-    const T *in_ptr,
-    int num_tokens,
-    int d_half,
-    cudaStream_t stream)
-{
-    uint32_t vec_size = 16 / sizeof(T);
-    cudaLaunchConfig_t config;
-    config.gridDim = num_tokens;
-    config.blockDim = std::min(d_half / vec_size, 256U);
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    config.numAttrs = 1;
-    config.attrs = attrs;
+    T* out_ptr,
+    const T* in1_ptr, // Pointer to the first input tensor
+    const T* in2_ptr, // Pointer to the second input tensor
+    int num_tokens,   // Batch size or number of tokens
+    int d,            // The hidden dimension size
+    cudaStream_t stream
+) {
+    // Vector size depends on the data type (e.g., 8 for half, 4 for float)
+    constexpr uint32_t vec_size = 16 / sizeof(T);
+    
+    // Each block processes one token
+    dim3 grid_dim(num_tokens);
+    // Number of threads per block, capped at 256 for efficiency
+    // We choose a block size that is a power of two and related to the problem size
+    uint32_t block_dim = std::min(static_cast<uint32_t>(d / vec_size), 256U);
+    if (block_dim == 0) { // Ensure at least one thread block if d is small
+        block_dim = std::min(static_cast<uint32_t>(d), 256U);
+    }
 
-    auto kernel = flashinfer::activation::act_and_mul_kernel<T, silu>;
-    cudaLaunchKernelEx(&config, kernel, out_ptr, in_ptr, d_half);
+    // Launch the kernel with a standard execution configuration
+    act_and_mul_kernel<T, silu><<<grid_dim, block_dim, 0, stream>>>(
+        out_ptr, in1_ptr, in2_ptr, d
+    );
 }
+
 
 // --- Constructor Implementations (Unchanged) ---
 template <typename T>
 RMSNorm<T>::RMSNorm(const L4maConfig& config)
-    : config_(config), weight_(std::make_shared<thrust::device_vector<T>>(config.hidden_size)) {}
+    : config_(config), weight_(Tensor<T>(config.hidden_size)) {}
 
 template <typename T>
 L4maMlp<T>::L4maMlp(const L4maConfig& config)
     : config_(config),
-      gate_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.hidden_size * config.intermediate_size)),
-      up_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.hidden_size * config.intermediate_size)),
-      down_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.intermediate_size * config.hidden_size)) {}
+      gate_proj_weights_(Tensor<T>(config.hidden_size * config.intermediate_size)),
+      up_proj_weights_(Tensor<T>(config.hidden_size * config.intermediate_size)),
+      down_proj_weights_(Tensor<T>(config.intermediate_size * config.hidden_size)) {}
 
 template <typename T>
 L4maAttention<T>::L4maAttention(const L4maConfig& config)
     : config_(config),
-      q_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.hidden_size * (config.num_query_heads * config.head_size))),
-      k_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.hidden_size * (config.num_key_value_heads * config.head_size))),
-      v_proj_weights_(std::make_shared<thrust::device_vector<T>>(config.hidden_size * (config.num_key_value_heads * config.head_size))),
-      o_proj_weights_(std::make_shared<thrust::device_vector<T>>((config.num_query_heads * config.head_size) * config.hidden_size)) {
-    if (config_.use_qkv_bias) {
-        q_proj_bias_ = std::make_shared<thrust::device_vector<T>>(config.num_query_heads * config.head_size);
-        k_proj_bias_ = std::make_shared<thrust::device_vector<T>>(config.num_key_value_heads * config.head_size);
-        v_proj_bias_ = std::make_shared<thrust::device_vector<T>>(config.num_key_value_heads * config.head_size);
-    }
+      q_proj_weights_(Tensor<T>(config.hidden_size * (config.num_query_heads * config.head_size))),
+      k_proj_weights_(Tensor<T>(config.hidden_size * (config.num_key_value_heads * config.head_size))),
+      v_proj_weights_(Tensor<T>(config.hidden_size * (config.num_key_value_heads * config.head_size))),
+      o_proj_weights_(Tensor<T>((config.num_query_heads * config.head_size) * config.hidden_size)) {
+    // if (config_.use_qkv_bias) {
+    //     q_proj_bias_ = Tensor<T>(config.num_query_heads * config.head_size);
+    //     k_proj_bias_ = Tensor<T>(config.num_key_value_heads * config.head_size);
+    //     v_proj_bias_ = Tensor<T>(config.num_key_value_heads * config.head_size);
+    // }
 }
 
 template <typename T>
@@ -197,7 +155,7 @@ L4maDecoderLayer<T>::L4maDecoderLayer(const L4maConfig& config)
 template <typename T>
 L4maModel<T>::L4maModel(const L4maConfig& config)
     : config_(config),
-      embed_tokens_weight_(std::make_shared<thrust::device_vector<T>>(config.vocab_size * config.hidden_size)),
+      embed_tokens_weight_(Tensor<T>(config.vocab_size * config.hidden_size)),
       norm_(config) {
 
     layers_.reserve(config.num_layers);
@@ -209,8 +167,7 @@ L4maModel<T>::L4maModel(const L4maConfig& config)
 template <typename T>
 L4maForCausalLM<T>::L4maForCausalLM(const L4maConfig& config)
     : config_(config), 
-      model_(config),
-      lm_head_weight_(std::make_shared<thrust::device_vector<T>>(config.vocab_size * config.hidden_size)) {
+      model_(config) {
     CUBLAS_CHECK(cublasLtCreate(&cublaslt_handle_));
 }
 
@@ -279,37 +236,43 @@ size_t L4maForCausalLM<T>::get_workspace_size(int max_num_tokens) const {
 }
 
 
-// --- get_parameters() Implementations (Unchanged) ---
+// --- get_parameters() Implementations (Corrected) ---
 template <typename T>
-std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> RMSNorm<T>::get_parameters() {
-    return {{"weight", weight_}};
+std::map<std::string, Tensor<T>*> RMSNorm<T>::get_parameters() {
+    // Return a pointer to the weight tensor
+    return {{"weight", &weight_}};
 }
 
 template <typename T>
-std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> L4maMlp<T>::get_parameters() {
-    return {{"gate_proj.weight", gate_proj_weights_},
-            {"up_proj.weight", up_proj_weights_},
-            {"down_proj.weight", down_proj_weights_}};
+std::map<std::string, Tensor<T>*> L4maMlp<T>::get_parameters() {
+    // Return pointers to the weight tensors
+    return {{"gate_proj.weight", &gate_proj_weights_},
+            {"up_proj.weight", &up_proj_weights_},
+            {"down_proj.weight", &down_proj_weights_}};
 }
 
 template <typename T>
-std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> L4maAttention<T>::get_parameters() {
-    auto params = std::map<std::string, std::shared_ptr<thrust::device_vector<T>>>{
-        {"q_proj.weight", q_proj_weights_},
-        {"k_proj.weight", k_proj_weights_},
-        {"v_proj.weight", v_proj_weights_},
-        {"o_proj.weight", o_proj_weights_}};
-    if (config_.use_qkv_bias) {
-        params["q_proj.bias"] = q_proj_bias_;
-        params["k_proj.bias"] = k_proj_bias_;
-        params["v_proj.bias"] = v_proj_bias_;
-    }
+std::map<std::string, Tensor<T>*> L4maAttention<T>::get_parameters() {
+    // Initialize the map with pointers
+    auto params = std::map<std::string, Tensor<T>*>{
+        {"q_proj.weight", &q_proj_weights_},
+        {"k_proj.weight", &k_proj_weights_},
+        {"v_proj.weight", &v_proj_weights_},
+        {"o_proj.weight", &o_proj_weights_}};
+    // Bias handling (if you re-enable it)
+    // if (config_.use_qkv_bias) {
+    //     params["q_proj.bias"] = &q_proj_bias_;
+    //     params["k_proj.bias"] = &k_proj_bias_;
+    //     params["v_proj.bias"] = &v_proj_bias_;
+    // }
     return params;
 }
 
 template <typename T>
-std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> L4maDecoderLayer<T>::get_parameters() {
-    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> params;
+std::map<std::string, Tensor<T>*> L4maDecoderLayer<T>::get_parameters() {
+    // The map now correctly stores pointers
+    std::map<std::string, Tensor<T>*> params;
+    // The 'val' from the sub-calls is now a Tensor<T>*, which can be assigned directly.
     for (auto const& [key, val] : self_attn_.get_parameters()) { params["self_attn." + key] = val; }
     for (auto const& [key, val] : mlp_.get_parameters()) { params["mlp." + key] = val; }
     for (auto const& [key, val] : input_layernorm_.get_parameters()) { params["input_layernorm." + key] = val; }
@@ -318,9 +281,9 @@ std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> L4maDecoderLaye
 }
 
 template <typename T>
-std::map<std::string, std::shared_ptr<thrust::device_vector<T>>>  L4maModel<T>::get_parameters() {
-    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> params;
-    params["embed_tokens.weight"] = embed_tokens_weight_;
+std::map<std::string, Tensor<T>*> L4maModel<T>::get_parameters() {
+    std::map<std::string, Tensor<T>*> params;
+    params["embed_tokens.weight"] = &embed_tokens_weight_;
     for (size_t i = 0; i < layers_.size(); ++i) {
         for (auto const& [key, val] : layers_[i].get_parameters()) {
             params["layers." + std::to_string(i) + "." + key] = val;
@@ -331,15 +294,14 @@ std::map<std::string, std::shared_ptr<thrust::device_vector<T>>>  L4maModel<T>::
 }
 
 template <typename T>
-std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> L4maForCausalLM<T>::get_parameters() {
-    std::map<std::string, std::shared_ptr<thrust::device_vector<T>>> params;
+std::map<std::string, Tensor<T>*> L4maForCausalLM<T>::get_parameters() {
+    std::map<std::string, Tensor<T>*> params;
     for (auto const& [key, val] : model_.get_parameters()) {
         params["model." + key] = val;
     }
-    params["lm_head.weight"] = lm_head_weight_;
+    
     return params;
 }
-
 
 template <typename T>
 void RMSNorm<T>::forward(
@@ -350,9 +312,9 @@ void RMSNorm<T>::forward(
     
     uint32_t d = config_.hidden_size;
 
-    flashinfer::norm::RMSNorm(
+    flashinfer::norm::RMSNorm<T>(
         const_cast<T *>(input),
-        const_cast<T *>(thrust::raw_pointer_cast(weight_->data())),
+        weight_.data(),
         output,
         num_tokens, d, d, d, config_.rms_norm_eps, false, stream
     );
@@ -379,20 +341,29 @@ void L4maMlp<T>::forward(
     Tensor<uint8_t> cublas_workspace = allocator.allocate<uint8_t>(cublas_workspace_size);
 
     // 2. Gate and Up projections. TODO: Fuse them into a single GEMM if possible
-    gemm_cublasLt<T>(ltHandle, stream, x, thrust::raw_pointer_cast(up_proj_weights_->data()), nullptr, up_proj_out.data(), num_tokens, intermediate_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
-    gemm_cublasLt<T>(ltHandle, stream, x, thrust::raw_pointer_cast(gate_proj_weights_->data()), nullptr, gate_proj_out.data(), num_tokens, intermediate_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, x, up_proj_weights_.data(), nullptr, up_proj_out.data(), num_tokens, intermediate_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, x, gate_proj_weights_.data(), nullptr, gate_proj_out.data(), num_tokens, intermediate_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
 
     // print the mean of gate_proj_out_ptr and up_proj_out_ptr for debugging
-    std::cout << "Gate mean: " << gate_proj_out.mean() << ", Up mean: " << up_proj_out.mean() << std::endl;
+    //std::cout << "Gate mean: " << gate_proj_out.mean() << ", Up mean: " << up_proj_out.mean() << std::endl;
 
     // 3. SwiGLU activation (gate * silu(up))
     // We can reuse the gate_proj_out_ptr buffer for the output of SwiGLU
-    silu_and_mul<T>(up_proj_out.data(), up_proj_out.data(), num_tokens, intermediate_size, stream);
+    //silu_and_mul<T>(up_proj_out.data(), up_proj_out.data(), num_tokens, intermediate_size, stream);
 
-    std::cout << "SwiGLU output mean: " << up_proj_out.mean() << std::endl;
+    silu_and_mul<T>(
+        up_proj_out.data(), 
+        gate_proj_out.data(), 
+        up_proj_out.data(), 
+        num_tokens, 
+        intermediate_size, 
+        stream
+    );
+
+    //std::cout << "SwiGLU output mean: " << up_proj_out.mean() << std::endl;
 
     // 4. Down projection
-    gemm_cublasLt<T>(ltHandle, stream, up_proj_out.data(), thrust::raw_pointer_cast(down_proj_weights_->data()), nullptr, output, num_tokens, hidden_size, intermediate_size, cublas_workspace.data(), cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, up_proj_out.data(), down_proj_weights_.data(), nullptr, output, num_tokens, hidden_size, intermediate_size, cublas_workspace.data(), cublas_workspace_size, false, true);
 
     // 5. Deallocate buffers in reverse order of allocation (LIFO)
     allocator.deallocate(cublas_workspace);
@@ -448,9 +419,9 @@ void L4maAttention<T>::forward(
     Tensor<uint8_t> cublas_workspace = allocator.allocate<uint8_t>(cublas_workspace_size);
 
     // 2. Q, K, V projections. TODO: Fuse them into a single GEMM if possible
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(q_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(q_proj_bias_->data()) : nullptr, q_proj.data(), num_tokens, num_query_heads * head_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(k_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(k_proj_bias_->data()) : nullptr, k_proj.data(), num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
-    gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(v_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(v_proj_bias_->data()) : nullptr, v_proj.data(), num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, q_proj_weights_.data(), nullptr, q_proj.data(), num_tokens, num_query_heads * head_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, k_proj_weights_.data(), nullptr, k_proj.data(), num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, hidden_states, v_proj_weights_.data(), nullptr, v_proj.data(), num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
 
     // compute the mean of qkv outputs for debugging
     // float q_mean = compute_mean(q_proj_ptr, q_proj_count);
@@ -544,7 +515,7 @@ void L4maAttention<T>::forward(
     
 
     // 5. Final output projection
-    gemm_cublasLt<T>(ltHandle, stream, o_proj_input_ptr, thrust::raw_pointer_cast(o_proj_weights_->data()), nullptr, attn_output, num_tokens, hidden_size, num_query_heads * head_size, cublas_workspace.data(), cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, o_proj_input_ptr, o_proj_weights_.data(), nullptr, attn_output, num_tokens, hidden_size, num_query_heads * head_size, cublas_workspace.data(), cublas_workspace_size, false, true);
 
     // float o_proj_output_mean = compute_mean(attn_output, num_tokens * hidden_size);
     // std::cout << "O projection output mean: " << o_proj_output_mean << std::endl;
@@ -652,8 +623,8 @@ void L4maModel<T>::forward(
     Tensor<T> working_hidden_buffer = allocator.allocate<T>(hidden_size_elements);
 
     embed<T>(
-        thrust::raw_pointer_cast(embed_tokens_weight_->data()),
-        embed_tokens_weight_->size() / config_.hidden_size,
+        embed_tokens_weight_.data(),
+        embed_tokens_weight_.size() / config_.hidden_size,
         thrust::raw_pointer_cast(input_ids.data()),
         input_ids.size(),
         working_hidden_buffer.data(), // Embeddings are written to the allocated working buffer
@@ -754,7 +725,7 @@ void L4maForCausalLM<T>::forward(
     gemm_cublasLt<T>(
         cublaslt_handle_, stream,
         hidden_states.data(),
-        thrust::raw_pointer_cast(lm_head_weight_->data()),
+        model_.get_embed_tokens_weight().data(),
         nullptr,
         output,
         num_tokens, config_.vocab_size, config_.hidden_size,
