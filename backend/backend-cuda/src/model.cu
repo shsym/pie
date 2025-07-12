@@ -51,7 +51,6 @@ struct Model::ModelImpl {
     int32_t kv_page_size;
     int32_t dist_size;
 
-
     // --- Handler method declarations added to ModelImpl ---
     // These methods contain the core logic and have access to the model pointer.
     void handle_allocate(const std::vector<Model::AllocateCommand>& commands);
@@ -166,7 +165,7 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     std::vector<int32_t> kv_page_indptr_host = {0};
     std::vector<int32_t> kv_last_page_lens_host;
     std::vector<int32_t> qo_indptr_host = {0};
-    std::vector<uint8_t> custom_masks_host;
+    std::vector<bool> custom_masks_host;
     std::vector<int32_t> mask_indptr_host = {0};
     std::vector<int32_t> kv_batch_indices_host;
     std::vector<int32_t> kv_positions_host;
@@ -195,13 +194,13 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
 
         for (int32_t i = 0; i < num_new_tokens; ++i) {
             kv_batch_indices_host.push_back(batch_idx);
-            kv_positions_host.push_back(total_ctx_tokens + i);
+            kv_positions_host.push_back(total_ctx_tokens - cmd.last_block_len + i);
         }
 
         std::vector<uint32_t> inp_pos_ids_for_mask;
-        size_t tokens_in_batch_before_cmd = new_token_ids_host.size();
 
-        for (uint32_t embed_id : cmd.input_embedding_ids) {
+        for (size_t i = 0; i < cmd.input_embedding_ids.size(); ++i) {
+            uint32_t embed_id = cmd.input_embedding_ids[i];
             auto it = embeds.find(embed_id);
             if (it != embeds.end()) {
                 const auto& embed = it->second;
@@ -209,9 +208,16 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
                 new_position_ids_host.push_back(embed.position_id);
                 inp_pos_ids_for_mask.push_back(embed.position_id);
 
-                size_t token_abs_pos = total_ctx_tokens + (new_token_ids_host.size() - tokens_in_batch_before_cmd) - 1;
+                size_t token_abs_pos = total_ctx_tokens - num_new_tokens + i;
                 uint32_t tgt_block_idx = token_abs_pos / kv_page_size;
                 uint32_t tgt_block_offset = token_abs_pos % kv_page_size;
+
+                // print tgt_block_idx and tgt_block_offset for debugging
+                std::cout << "Processing token: " << embed.token_id 
+                          << ", position: " << embed.position_id 
+                          << ", token_abs_pos: " << token_abs_pos
+                          << ", target block index: " << tgt_block_idx 
+                          << ", target block offset: " << tgt_block_offset << std::endl;
 
                 if (tgt_block_idx < cmd.context_block_ids.size()) {
                     uint32_t tgt_block_id = cmd.context_block_ids[tgt_block_idx];
@@ -243,23 +249,80 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
                 ctx_occupancy.insert(ctx_occupancy.end(), block.occupancy.begin(), block.occupancy.begin() + len_to_copy);
             }
 
+            // print all ctx_pos_ids and ctx_occupancy for debugging
+            std::cout << "ctx_pos_ids: ";
+            for (const auto& pos_id : ctx_pos_ids) {
+                std::cout << pos_id << " ";
+            }
+            std::cout << "\nctx_occupancy: ";
+            for (const auto& occ : ctx_occupancy) {
+                std::cout << (occ ? 1 : 0) << " ";
+            }
+            std::cout << std::endl;
+
+
             for (uint32_t inp_pos_id : inp_pos_ids_for_mask) {
                 for (size_t j = 0; j < total_ctx_tokens; ++j) {
                     bool causal_mask = ctx_pos_ids[j] <= inp_pos_id;
                     bool valid_mask = ctx_occupancy[j];
-                    custom_masks_host.push_back((causal_mask && valid_mask) ? 1 : 0);
+                    custom_masks_host.push_back(causal_mask && valid_mask);
                 }
             }
         }
         batch_idx++;
     }
 
+    // print all host vectors for debugging
+    std::cout << "kv_page_indices_host: ";
+    for (const auto& idx : kv_page_indices_host) {
+        std::cout << idx << " ";
+    }
+    std::cout << "\nkv_page_indptr_host: ";
+    for (const auto& idx : kv_page_indptr_host) {
+        std::cout << idx << " ";
+    }
+    std::cout << "\nkv_last_page_lens_host: ";
+    for (const auto& len : kv_last_page_lens_host) {
+        std::cout << len << " ";
+    }
+    std::cout << "\nqo_indptr_host: ";
+    for (const auto& idx : qo_indptr_host) {
+        std::cout << idx << " ";
+    }
+    std::cout << "\ncustom_masks_host: ";
+    for (const auto& mask : custom_masks_host) {
+        std::cout << static_cast<int>(mask) << " ";
+    }
+    std::cout << "\nmask_indptr_host: ";
+    for (const auto& idx : mask_indptr_host) {
+        std::cout << idx << " ";
+    }
+    std::cout << "\nnew_token_ids_host: ";
+    for (const auto& token_id : new_token_ids_host) {
+        std::cout << token_id << " ";
+    }
+    std::cout << "\nnew_position_ids_host: ";
+    for (const auto& pos_id : new_position_ids_host) {
+        std::cout << pos_id << " ";
+    }
+    std::cout << "\nkv_batch_indices_host: ";
+    for (const auto& batch_idx : kv_batch_indices_host) {
+        std::cout << batch_idx << " ";
+    }
+    std::cout << "\nkv_positions_host: ";
+    for (const auto& pos : kv_positions_host) {
+        std::cout << pos << " ";
+    }
+    std::cout << std::endl;
+
+    std::vector<uint8_t> packed_mask_host = packbits_little(custom_masks_host);
+
     // --- Copy data to device ---
     thrust::device_vector<int32_t> kv_page_indices = kv_page_indices_host;
     thrust::device_vector<int32_t> kv_page_indptr = kv_page_indptr_host;
     thrust::device_vector<int32_t> kv_last_page_lens = kv_last_page_lens_host;
     thrust::device_vector<int32_t> qo_indptr = qo_indptr_host;
-    thrust::device_vector<uint8_t> custom_mask = custom_masks_host;
+    thrust::device_vector<uint8_t> custom_mask = packed_mask_host;
     thrust::device_vector<int32_t> mask_indptr = mask_indptr_host;
     thrust::device_vector<uint32_t> new_token_ids = new_token_ids_host;
     thrust::device_vector<int32_t> new_position_ids = new_position_ids_host;
@@ -408,8 +471,77 @@ Model::Model(const AppConfig& config,const ModelMetadata& out_metadata)
 Model::~Model() = default;
 
 void Model::run() {
-    // This would contain the primary execution loop if the model ran continuously.
-    // For a request/response server, it can remain empty.
+    // This function is now used as a test routine for handle_fill_block.
+
+    std::cout << "\n--- [START] Running Test Routine for handle_fill_block ---" << std::endl;
+
+    // 1. Define test parameters: a random sequence of tokens and IDs.
+    const std::vector<uint32_t> token_ids = {3513, 5331, 533, 11};
+    const uint32_t block_id = 101; // A unique ID for our KV block
+    const uint32_t embed_id_offset = 201; // Starting ID for our input embeddings
+    const uint32_t dist_id = 301;         // ID for the output distribution object
+
+    // Ensure the tokens fit within a single page.
+    if (token_ids.size() > static_cast<size_t>(pimpl->kv_page_size)) {
+        std::cerr << "Test Error: Number of tokens exceeds kv_page_size." << std::endl;
+        return;
+    }
+
+    // 2. Call handle_allocate to allocate a page for the KV cache.
+    std::cout << "\n[Step 1] Allocating KV Block..." << std::endl;
+    Model::AllocateCommand alloc_cmd;
+    alloc_cmd.kind = Model::ObjectKind::KV_BLOCK;
+    alloc_cmd.object_id_offset = block_id;
+    alloc_cmd.count = 1;
+    handle_allocate({alloc_cmd});
+    std::cout << "Allocated block with ID: " << block_id << std::endl;
+
+    // 3. Call handle_embed_texts to create mappings for token and position IDs.
+    std::cout << "\n[Step 2] Creating Text Embeddings..." << std::endl;
+    std::vector<Model::EmbedTextCommand> embed_cmds;
+    std::vector<uint32_t> input_embed_ids;
+    for (size_t i = 0; i < token_ids.size(); ++i) {
+        uint32_t current_embed_id = embed_id_offset + i;
+        input_embed_ids.push_back(current_embed_id);
+
+        Model::EmbedTextCommand embed_cmd;
+        embed_cmd.embedding_id = current_embed_id;
+        embed_cmd.token_id = token_ids[i];
+        embed_cmd.position_id = i; // Simple sequential positions 0, 1, 2, ...
+        embed_cmds.push_back(embed_cmd);
+    }
+    handle_embed_text(embed_cmds);
+    std::cout << "Created " << embed_cmds.size() << " embeddings." << std::endl;
+
+    // 4. Call handle_fill_block to do a single forward pass.
+    std::cout << "\n[Step 3] Calling handle_fill_block for a forward pass..." << std::endl;
+    Model::FillBlockCommand fill_cmd;
+    fill_cmd.last_block_len = token_ids.size(); // No previous context in the block
+    fill_cmd.context_block_ids = {block_id}; // The block to fill with new KV data
+    fill_cmd.input_embedding_ids = input_embed_ids;
+    fill_cmd.output_embedding_ids = {dist_id}; // Store logits for the last token in this distribution
+    handle_fill_block({fill_cmd});
+    std::cout << "handle_fill_block completed." << std::endl;
+
+    // 5. Verify the output by sampling the resulting distribution.
+    std::cout << "\n[Step 4] Verifying output with handle_sample_top_k..." << std::endl;
+    Model::SampleTopKCommand sample_cmd;
+    sample_cmd.distribution_id = dist_id;
+    sample_cmd.k = 5; // Get top 5 predictions
+    auto results = handle_sample_top_k({sample_cmd});
+
+    if (!results.empty()) {
+        const auto& result = results[0];
+        std::cout << "Successfully retrieved Top-" << result.token_ids.size() << " predicted next tokens:" << std::endl;
+        for (size_t i = 0; i < result.token_ids.size(); ++i) {
+            std::cout << "  - Token ID: " << result.token_ids[i]
+                      << ", Probability: " << result.probabilities[i] << std::endl;
+        }
+    } else {
+        std::cerr << "Test Error: Failed to get sampling results." << std::endl;
+    }
+
+    std::cout << "\n--- [END] Test Routine Finished ---\n" << std::endl;
 }
 
 // --- New: Public handler methods delegating to PIMPL ---

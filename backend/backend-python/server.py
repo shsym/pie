@@ -220,6 +220,11 @@ def start_service(config, model, model_metadata):
                     dtype=getattr(torch, config.get('dtype', 'bfloat16')),
                     device=config.get("device"))
 
+    # ===================================================================
+    # RUN THE TEST ROUTINE AT STARTUP
+    run_test_routine(engine)
+    # ===================================================================
+
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
     router.bind(real_endpoint)
@@ -417,6 +422,85 @@ def run_zmq_server(router, engine, config, model_metadata):
             else:
                 raise
 
+def run_test_routine(engine: Driver):
+    """
+    Runs a simple test routine to verify the fill_block functionality,
+    adhering to the correct protobuf message signatures.
+    """
+    print("\n--- [START] Corrected Python Test Routine for fill_block ---")
+
+    # 1. Define test parameters
+    token_ids = [3513, 5331, 533, 11]
+    block_id = 101
+    embed_id_offset = 201
+    dist_id = 301
+    k_top = 5
+
+    # 2. Allocate a KV block
+    # The engine.allocate method expects a single BatchAllocate object.
+    print("\n[Step 1] Allocating KV Block...")
+    alloc_command = l4m_pb2.Allocate(
+        kind=l4m_pb2.ObjectKind.OBJECT_KIND_KV_BLOCK,
+        object_id_offset=block_id,
+        count=1
+    )
+    batch_allocate_request = l4m_pb2.BatchAllocate(items=[alloc_command])
+    engine.allocate(batch_allocate_request)
+    print(f"Allocated block with ID: {block_id}")
+
+
+    # 3. Create text embeddings
+    # The engine.embed_text method expects a single BatchEmbedText object.
+    print("\n[Step 2] Creating Text Embeddings...")
+    list_of_embed_commands = []
+    input_embed_ids = []
+    for i, token in enumerate(token_ids):
+        embedding_id = embed_id_offset + i
+        input_embed_ids.append(embedding_id)
+        list_of_embed_commands.append(l4m_pb2.EmbedText(
+            embedding_id=embedding_id,
+            token_id=token,
+            position_id=i
+        ))
+    batch_embed_request = l4m_pb2.BatchEmbedText(items=list_of_embed_commands)
+    engine.embed_text(batch_embed_request)
+    print(f"Created {len(list_of_embed_commands)} embeddings.")
+
+
+    # 4. Call fill_block for a single forward pass
+    # The engine.fill_block method expects a single BatchFillBlock object.
+    print("\n[Step 3] Calling fill_block for a forward pass...")
+    fill_command = l4m_pb2.FillBlock(
+        last_block_len=len(token_ids),
+        context_block_ids=[block_id],
+        input_embedding_ids=input_embed_ids,
+        output_embedding_ids=[dist_id]
+    )
+    batch_fill_request = l4m_pb2.BatchFillBlock(items=[fill_command])
+    engine.fill_block(batch_fill_request)
+    print("fill_block completed.")
+
+
+    # 5. Verify the output by sampling
+    # The engine.sample_top_k_request method expects a BatchSampleTopKRequest.
+    print(f"\n[Step 4] Verifying output with sample_top_k (k={k_top})...")
+    sample_command = l4m_pb2.SampleTopKRequest(
+        distribution_id=dist_id,
+        k=k_top
+    )
+    batch_sample_request = l4m_pb2.BatchSampleTopKRequest(items=[sample_command])
+    response = engine.sample_top_k_request(batch_sample_request)
+
+    # The 'response' is a BatchSampleTopKResponse object which contains a list of results.
+    if response and response.items:
+        result = response.items[0]
+        print(f"Successfully retrieved Top-{len(result.token_ids)} predicted next tokens:")
+        for i in range(len(result.token_ids)):
+            print(f"  - Token ID: {result.token_ids[i]:<6} Probability: {result.probabilities[i]:.4f}")
+    else:
+        print("Test Error: Failed to get sampling results.")
+
+    print("\n--- [END] Corrected Python Test Routine Finished ---\n")
 
 if __name__ == "__main__":
     fire.Fire(main)

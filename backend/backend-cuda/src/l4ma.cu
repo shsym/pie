@@ -14,6 +14,118 @@
 #include "flashinfer/activation.cuh"
 #include "flashinfer_ops.cuh"
 
+
+
+/**
+ * @brief CUDA kernel to compute partial sums of a __nv_bfloat16 array.
+ *
+ * Each block computes the sum of a portion of the input array and writes a single
+ * partial sum to the output array. The summation is done in float32 for precision.
+ *
+ * @param input Device pointer to the input __nv_bfloat16 array.
+ * @param output Device pointer to the output float array for partial sums.
+ * @param size The total number of elements in the input array.
+ */
+__global__ void sum_reduction_kernel(const __nv_bfloat16* input, float* output, int size) {
+    // Use dynamic shared memory for the reduction
+    extern __shared__ float sdata[];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Each thread loads one element from global memory to shared memory
+    if (i < size) {
+        // Convert bfloat16 to float for summation
+        sdata[tid] = __bfloat162float(input[i]);
+    } else {
+        sdata[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    // Perform the reduction in shared memory
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // The first thread in the block writes the partial sum to global memory
+    if (tid == 0) {
+        output[blockIdx.x] = sdata[0];
+    }
+}
+
+
+/**
+ * @brief Computes the mean of a __nv_bfloat16 array on the GPU.
+ *
+ * This function is intended for debugging purposes. It launches a reduction
+ * kernel, copies the partial sums back to the host, and computes the final mean.
+ *
+ * @param d_input Device pointer to the __nv_bfloat16 array.
+ * @param num_elements The total number of elements in the array.
+ * @return The mean of the array as a float.
+ */
+float compute_mean(const __nv_bfloat16* d_input, size_t num_elements) {
+    if (num_elements == 0) {
+        return 0.0f;
+    }
+
+    // --- Kernel Launch Configuration ---
+    const int threads_per_block = 256;
+    const int num_blocks = (num_elements + threads_per_block - 1) / threads_per_block;
+
+    // --- Allocate Memory ---
+    // Allocate device memory for partial sums from each block
+    float* d_partial_sums;
+    CUDA_CHECK(cudaMalloc(&d_partial_sums, num_blocks * sizeof(float)));
+
+    // --- Launch Kernel ---
+    // The size of shared memory is threads_per_block * sizeof(float)
+    size_t shared_mem_size = threads_per_block * sizeof(float);
+    sum_reduction_kernel<<<num_blocks, threads_per_block, shared_mem_size>>>(d_input, d_partial_sums, num_elements);
+    CUDA_CHECK(cudaGetLastError()); // Check for any launch errors
+
+    // --- Copy Results and Final Computation ---
+    // Allocate host memory for partial sums
+    std::vector<float> h_partial_sums(num_blocks);
+
+    // Copy partial sums from device to host
+    CUDA_CHECK(cudaMemcpy(h_partial_sums.data(), d_partial_sums, num_blocks * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Free the device memory for partial sums
+    CUDA_CHECK(cudaFree(d_partial_sums));
+
+    // Compute the final sum on the CPU
+    float total_sum = std::accumulate(h_partial_sums.begin(), h_partial_sums.end(), 0.0f);
+
+    // Calculate the mean
+    return total_sum / num_elements;
+}
+
+void print_first_10_bfloat16_elements(const __nv_bfloat16* device_ptr, size_t size) {
+
+    // Allocate host vector
+    std::vector<__nv_bfloat16> host_data(size);
+    
+    // Copy from device to host
+    CUDA_CHECK(cudaMemcpy(host_data.data(), device_ptr, size * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    
+    // Print first 10 elements as float
+    for (size_t i = 0; i < 10 && i < size; ++i) {
+        float val = __bfloat162float(host_data[i]);
+        std::cout << val << " ";
+    }
+
+    std::cout << std::endl;
+}
+
+/// END of debugging functions
+
+
+
+
 // --- Helper CUDA Kernels (Unchanged) ---
 template <typename T>
 __global__ void add_residual_kernel(T* x, const T* residual, int n) {
@@ -36,7 +148,7 @@ void silu_and_mul(
     uint32_t vec_size = 16 / sizeof(T);
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
-    config.blockDim = std::min(d_half / vec_size, 1024U);
+    config.blockDim = std::min(d_half / vec_size, 256U);
     config.dynamicSmemBytes = 0;
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
@@ -96,7 +208,9 @@ L4maModel<T>::L4maModel(const L4maConfig& config)
 
 template <typename T>
 L4maForCausalLM<T>::L4maForCausalLM(const L4maConfig& config)
-    : config_(config), model_(config) {
+    : config_(config), 
+      model_(config),
+      lm_head_weight_(std::make_shared<thrust::device_vector<T>>(config.vocab_size * config.hidden_size)) {
     CUBLAS_CHECK(cublasLtCreate(&cublaslt_handle_));
 }
 
@@ -104,7 +218,7 @@ L4maForCausalLM<T>::L4maForCausalLM(const L4maConfig& config)
 
 template <typename T>
 void L4maForCausalLM<T>::create_kv_device_vectors(int max_kv_num) {
-    size_t kv_cache_size = static_cast<size_t>(max_kv_num) * config_.num_key_value_heads * config_.head_size;
+    size_t kv_cache_size = static_cast<size_t>(max_kv_num) * config_.num_key_value_heads * config_.head_size * config_.num_layers;
     if (kv_cache_k_.size() != kv_cache_size) {
         kv_cache_k_.resize(kv_cache_size);
     }
@@ -258,28 +372,37 @@ void L4maMlp<T>::forward(
     const size_t proj_count = (size_t)num_tokens * intermediate_size;
 
     // 1. Allocate buffers from the stack allocator
-    T* gate_proj_out_ptr = allocator.template allocate<T>(proj_count);
     T* up_proj_out_ptr = allocator.template allocate<T>(proj_count);
-    
+    T* gate_proj_out_ptr = allocator.template allocate<T>(proj_count);
+
     // Use allocate_rest for the cublas workspace as requested
     size_t cublas_workspace_size = 32 * 1024 * 1024; // 32MB workspace size for cublasLt
     void* cublas_workspace_ptr = allocator.allocate_bytes(cublas_workspace_size); // Allocate aligned workspace
 
-    // 2. Gate and Up projections
-    gemm_cublasLt<T>(ltHandle, stream, x, thrust::raw_pointer_cast(gate_proj_weights_->data()), nullptr, gate_proj_out_ptr, num_tokens, intermediate_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
+    // 2. Gate and Up projections. TODO: Fuse them into a single GEMM if possible
     gemm_cublasLt<T>(ltHandle, stream, x, thrust::raw_pointer_cast(up_proj_weights_->data()), nullptr, up_proj_out_ptr, num_tokens, intermediate_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, x, thrust::raw_pointer_cast(gate_proj_weights_->data()), nullptr, gate_proj_out_ptr, num_tokens, intermediate_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
+
+    // print the mean of gate_proj_out_ptr and up_proj_out_ptr for debugging
+    // float gate_mean = compute_mean(gate_proj_out_ptr, proj_count);
+    // float up_mean = compute_mean(up_proj_out_ptr, proj_count);
+    // std::cout << "Gate mean: " << gate_mean << ", Up mean: " << up_mean << std::endl;
 
     // 3. SwiGLU activation (gate * silu(up))
     // We can reuse the gate_proj_out_ptr buffer for the output of SwiGLU
-    silu_and_mul<T>(gate_proj_out_ptr, up_proj_out_ptr, num_tokens, intermediate_size, stream);
+    silu_and_mul<T>(up_proj_out_ptr, up_proj_out_ptr, num_tokens, intermediate_size, stream);
+
+    float out_mean = compute_mean(up_proj_out_ptr, proj_count);
+    std::cout << "SwiGLU output mean: " << out_mean << std::endl;
 
     // 4. Down projection
-    gemm_cublasLt<T>(ltHandle, stream, gate_proj_out_ptr, thrust::raw_pointer_cast(down_proj_weights_->data()), nullptr, output, num_tokens, hidden_size, intermediate_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
+    gemm_cublasLt<T>(ltHandle, stream, up_proj_out_ptr, thrust::raw_pointer_cast(down_proj_weights_->data()), nullptr, output, num_tokens, hidden_size, intermediate_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
 
     // 5. Deallocate buffers in reverse order of allocation (LIFO)
     allocator.deallocate_bytes(cublas_workspace_ptr, cublas_workspace_size);
-    allocator.template deallocate<T>(up_proj_out_ptr, proj_count);
     allocator.template deallocate<T>(gate_proj_out_ptr, proj_count);
+    allocator.template deallocate<T>(up_proj_out_ptr, proj_count);
+
 }
 
 template <typename T>
@@ -288,8 +411,8 @@ void L4maAttention<T>::forward(
     T* attn_output,
     const T* hidden_states,
     const thrust::device_vector<int32_t>& position_ids,
-    thrust::device_vector<T>& kv_cache_k,
-    thrust::device_vector<T>& kv_cache_v,
+    T* kv_cache_k,
+    T* kv_cache_v,
     thrust::device_vector<int32_t>& kv_page_indices,
     thrust::device_vector<int32_t>& kv_page_indptr,
     thrust::device_vector<int32_t>& kv_last_page_lens,
@@ -303,6 +426,15 @@ void L4maAttention<T>::forward(
     thrust::device_vector<int32_t>& kv_batch_indices,
     thrust::device_vector<int32_t>& kv_positions
 ) {
+
+
+
+    // sanity check. Compute the mean of qkv weights - no problem
+    // float q_mean = compute_mean(thrust::raw_pointer_cast(q_proj_weights_->data()), q_proj_weights_->size());
+    // float k_mean = compute_mean(thrust::raw_pointer_cast(k_proj_weights_->data()), k_proj_weights_->size());
+    // float v_mean = compute_mean(thrust::raw_pointer_cast(v_proj_weights_->data()), v_proj_weights_->size());
+    // std::cout << "Q mean: " << q_mean << ", K mean: " << k_mean << ", V mean: " << v_mean << std::endl;
+
     const int num_tokens = position_ids.size();
     const int hidden_size = config_.hidden_size;
     const int head_size = config_.head_size;
@@ -319,10 +451,17 @@ void L4maAttention<T>::forward(
     size_t cublas_workspace_size = 32 * 1024 * 1024; // 32MB workspace size for cublasLt
     void* cublas_workspace_ptr = allocator.allocate_bytes(cublas_workspace_size); // Allocate aligned workspace
 
-    // 2. Q, K, V projections
+    // 2. Q, K, V projections. TODO: Fuse them into a single GEMM if possible
     gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(q_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(q_proj_bias_->data()) : nullptr, q_proj_ptr, num_tokens, num_query_heads * head_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
     gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(k_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(k_proj_bias_->data()) : nullptr, k_proj_ptr, num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
     gemm_cublasLt<T>(ltHandle, stream, hidden_states, thrust::raw_pointer_cast(v_proj_weights_->data()), config_.use_qkv_bias ? thrust::raw_pointer_cast(v_proj_bias_->data()) : nullptr, v_proj_ptr, num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
+
+    // compute the mean of qkv outputs for debugging
+    // float q_mean = compute_mean(q_proj_ptr, q_proj_count);
+    // float k_mean = compute_mean(k_proj_ptr, kv_proj_count);
+    // float v_mean = compute_mean(v_proj_ptr, kv_proj_count);
+    // std::cout << "Q mean: " << q_mean << ", K mean: " << k_mean << ", V mean: " << v_mean << std::endl;
+
 
     // 3. Apply RoPE (in-place)
     flashinfer::BatchQKApplyLlama31RotaryPosIds(
@@ -335,38 +474,86 @@ void L4maAttention<T>::forward(
         config_.rope_high_frequency_factor, 8192, stream
     );
 
+    // compute the mean after RoPE for debugging
+    //float q_rope_mean = compute_mean(q_proj_ptr, q_proj_count);
+    //float k_rope_mean = compute_mean(k_proj_ptr, kv_proj_count);
+    // std::cout << "Q after RoPE mean: " << q_rope_mean << ", K after RoPE mean: " << k_rope_mean << std::endl;
+
     // 4. Paged KV-cache operations
     const int batch_size = (position_ids.size() > 0) ? (qo_indptr.size() - 1) : 0;
     flashinfer::paged_kv_t<T, int32_t> paged_kv(
         num_key_value_heads, page_size, head_size, batch_size,
         flashinfer::QKVLayout::kNHD,
-        thrust::raw_pointer_cast(kv_cache_k.data()),
-        thrust::raw_pointer_cast(kv_cache_v.data()),
+        kv_cache_k, kv_cache_v,
         thrust::raw_pointer_cast(kv_page_indices.data()), 
         thrust::raw_pointer_cast(kv_page_indptr.data()), 
         thrust::raw_pointer_cast(kv_last_page_lens.data())
     );
 
+    // print kv_batch_indices and kv_positions for debugging. copy to host first
+    // std::vector<int32_t> kv_batch_indices_host(kv_batch_indices.size());
+    // std::vector<int32_t> kv_positions_host(kv_positions.size());
+
+
     flashinfer::AppendPagedKVCache<T, int32_t>(
         paged_kv, k_proj_ptr, v_proj_ptr,
         thrust::raw_pointer_cast(kv_batch_indices.data()),
         thrust::raw_pointer_cast(kv_positions.data()),
-        kv_batch_indices.size(),
+        num_tokens,
         num_key_value_heads * head_size, head_size,
-        num_key_value_heads * head_size, head_size);
+        num_key_value_heads * head_size, head_size,
+        stream
+    );
 
     // Reuse a buffer for the attention output before the final projection
-    T* o_proj_input_ptr = k_proj_ptr; 
+    T* o_proj_input_ptr = q_proj_ptr; 
     flashinfer::BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(
         &prefill_handler, q_proj_ptr, thrust::raw_pointer_cast(qo_indptr.data()),
         nullptr, paged_kv, o_proj_input_ptr, nullptr, num_query_heads,
         flashinfer::MaskMode::kCustom,
         thrust::raw_pointer_cast(custom_mask.data()),
         thrust::raw_pointer_cast(mask_indptr.data()),
-        flashinfer::PosEncodingMode::kNone);
+        flashinfer::PosEncodingMode::kNone,
+        false, // use_fp16_qk_reduction
+        std::nullopt, // maybe_sm_scale
+        1.f, // rope_scale
+        1e4, // rope_theta
+        stream
+    );
+
+   
+
+    // // cuda synchroinize 
+    // CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // for (int i = 0; i < 4; i++) {
+    //     size_t last_q_size = num_query_heads * head_size;
+    //     T* last_q = o_proj_input_ptr + i * last_q_size;
+
+    //     // // compute the mean of o_proj_input_ptr for debugging
+    //     // float o_proj_input_mean = compute_mean(last_q, last_q_size);
+    //     // std::cout << "\nO projection input mean: " << o_proj_input_mean << std::endl;
+
+    //     // // // print out the first 10 elements of o_proj_input_ptr for debugging. (copy to host first)
+    //     // std::cout << "O projection input first 10 elements: ";
+    //     // print_first_10_bfloat16_elements(last_q, last_q_size);
+
+    //     // compute the mean of the last_q for debugging
+    //     float last_q_mean = compute_mean(last_q, last_q_size);
+    //     std::cout << "O projection input mean for iteration " << i << ": " << last_q_mean << std::endl;
+    //     print_first_10_bfloat16_elements(last_q, last_q_size);
+    //     std::cout << std::endl;
+
+    // }
     
+
     // 5. Final output projection
     gemm_cublasLt<T>(ltHandle, stream, o_proj_input_ptr, thrust::raw_pointer_cast(o_proj_weights_->data()), nullptr, attn_output, num_tokens, hidden_size, num_query_heads * head_size, cublas_workspace_ptr, cublas_workspace_size, false, true);
+
+    // float o_proj_output_mean = compute_mean(attn_output, num_tokens * hidden_size);
+    // std::cout << "O projection output mean: " << o_proj_output_mean << std::endl;
+    // print_first_10_bfloat16_elements(attn_output, num_tokens * hidden_size);
+    
 
     // 6. Deallocate buffers in reverse order
     allocator.deallocate_bytes(cublas_workspace_ptr, cublas_workspace_size);
@@ -380,8 +567,8 @@ void L4maDecoderLayer<T>::forward(
     StackAllocator& allocator,
     T* hidden_states,
     const thrust::device_vector<int32_t>& position_ids,
-    thrust::device_vector<T>& kv_cache_k,
-    thrust::device_vector<T>& kv_cache_v,
+    T* kv_cache_k,
+    T* kv_cache_v,
     thrust::device_vector<int32_t>& kv_page_indices,
     thrust::device_vector<int32_t>& kv_page_indptr,
     thrust::device_vector<int32_t>& kv_last_page_lens,
@@ -410,9 +597,15 @@ void L4maDecoderLayer<T>::forward(
                        ltHandle, stream, prefill_handler, page_size,
                        kv_batch_indices, kv_positions);
 
+
+
     add_residual_kernel<<<(hidden_size_elements + 255) / 256, 256, 0, stream>>>(
         hidden_states, attn_output_ptr, hidden_size_elements);
     
+
+
+
+
     // Deallocate attn_output and then normed_input to free up space for the MLP block
     allocator.template deallocate<T>(attn_output_ptr, hidden_size_elements);
     allocator.template deallocate<T>(normed_input_ptr, hidden_size_elements);
@@ -423,9 +616,18 @@ void L4maDecoderLayer<T>::forward(
     T* normed_mlp_input_ptr = allocator.template allocate<T>(hidden_size_elements);
     post_attention_layernorm_.forward(normed_mlp_input_ptr, hidden_states, num_tokens, stream);
 
+
+ 
+
     T* mlp_output_ptr = allocator.template allocate<T>(hidden_size_elements);
     mlp_.forward(allocator, mlp_output_ptr, normed_mlp_input_ptr, num_tokens, ltHandle, stream);
     
+    // print the attn_output_ptr mean for debugging
+    // float attn_output_mean = compute_mean(mlp_output_ptr, hidden_size_elements);
+    // std::cout << "mlp_output_ptr mean: " << attn_output_mean << std::endl;
+
+
+
     add_residual_kernel<<<(hidden_size_elements + 255) / 256, 256, 0, stream>>>(
         hidden_states, mlp_output_ptr, hidden_size_elements);
         
@@ -471,10 +673,27 @@ void L4maModel<T>::forward(
         stream
     );
 
-    for (auto& layer : layers_) {
+    // print out the mean of the embeddings
+    // float embed_mean = compute_mean(working_hidden_buffer, hidden_size_elements);
+    // std::cout << "Embed mean: " << embed_mean << std::endl;
+
+    size_t kv_cache_size = kv_cache_k.size() / config_.num_layers;
+
+    T* k_cache_ptr = thrust::raw_pointer_cast(kv_cache_k.data());
+    T* v_cache_ptr = thrust::raw_pointer_cast(kv_cache_v.data());
+
+    const size_t max_num_pages = kv_cache_k.size() / (config_.num_key_value_heads * config_.head_size);
+    for (size_t i = 0; i < layers_.size(); ++i) {
+
+        auto& layer = layers_[i];
+
+        // compute offset
+        T* layer_k_cache_ptr = k_cache_ptr + i * kv_cache_size;
+        T* layer_v_cache_ptr = v_cache_ptr + i * kv_cache_size;
+
         // Pass the allocator down to the layer. The layer will use it for its own scratch space.
         layer.forward(allocator, working_hidden_buffer,
-                      position_ids, kv_cache_k, kv_cache_v,
+                      position_ids, layer_k_cache_ptr, layer_v_cache_ptr,
                       kv_page_indices, kv_page_indptr, kv_last_page_lens,
                       qo_indptr, custom_mask, mask_indptr, ltHandle, stream,
                       prefill_handler, page_size, kv_batch_indices, kv_positions);

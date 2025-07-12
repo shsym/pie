@@ -14,7 +14,7 @@ device = "cuda:0"
 dtype = "bfloat16"
 
 kv_page_size = 32
-dist_size = 64
+dist_size = 8
 
 max_num_kv_pages = 1000
 max_num_embeds = 50000
