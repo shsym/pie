@@ -9,6 +9,7 @@
 
 #include "config.hpp"
 #include "tensor.hpp"
+#include "profiler.hpp"
 #include "flashinfer_ops.cuh"
 
 // Forward declarations
@@ -38,7 +39,8 @@ public:
     explicit RMSNorm(const L4maConfig& config);
     
     // Unchanged: This layer does not use a workspace buffer.
-    void forward(T* output,
+    void forward(PerformanceLogger& logger,
+                 T* output,
                  const T* input,
                  int num_tokens,
                  cudaStream_t stream);
@@ -61,7 +63,8 @@ public:
     explicit L4maMlp(const L4maConfig& config);
 
     // REFACTORED: Now accepts a StackAllocator.
-    void forward(StackAllocator& allocator,
+    void forward(PerformanceLogger& logger,
+                 StackAllocator& allocator,
                  T* output,
                  const T* x,
                  int num_tokens,
@@ -88,10 +91,11 @@ public:
     explicit L4maAttention(const L4maConfig& config);
 
     // REFACTORED: Now accepts a StackAllocator.
-    void forward(StackAllocator& allocator,
+    void forward(PerformanceLogger& logger,
+                 StackAllocator& allocator,
                  T* attn_output,
                  const T* hidden_states,
-                 const thrust::device_vector<int32_t>& position_ids,
+                 thrust::device_vector<int32_t>& position_ids,
                  T* kv_cache_k,
                  T* kv_cache_v,
                  thrust::device_vector<int32_t>& kv_page_indices,
@@ -132,9 +136,10 @@ public:
     explicit L4maDecoderLayer(const L4maConfig& config);
 
     // REFACTORED: Now accepts a StackAllocator.
-    void forward(StackAllocator& allocator,
+    void forward(PerformanceLogger& logger,
+                 StackAllocator& allocator,
                  T* hidden_states, // In-place
-                 const thrust::device_vector<int32_t>& position_ids,
+                 thrust::device_vector<int32_t>& position_ids,
                  T* kv_cache_k,
                  T* kv_cache_v,
                  thrust::device_vector<int32_t>& kv_page_indices,
@@ -172,10 +177,11 @@ public:
     explicit L4maModel(const L4maConfig& config);
 
     // REFACTORED: Now accepts a StackAllocator.
-    void forward(StackAllocator& allocator,
+    void forward(PerformanceLogger& logger,
+                 StackAllocator& allocator,
                  T* final_norm_output,
                  const thrust::device_vector<uint32_t>& input_ids,
-                 const thrust::device_vector<int32_t>& position_ids,
+                 thrust::device_vector<int32_t>& position_ids,
                  thrust::device_vector<T>& kv_cache_k,
                  thrust::device_vector<T>& kv_cache_v,
                  thrust::device_vector<int32_t>& kv_page_indices,
@@ -214,10 +220,11 @@ public:
     explicit L4maForCausalLM(const L4maConfig& config);
 
 
-    void forward(StackAllocator& allocator,
-                 T* output,
+    void forward(PerformanceLogger& logger,
+                 StackAllocator& allocator,
+                 Tensor<T>& output,
                  const thrust::device_vector<uint32_t>& input_ids,
-                 const thrust::device_vector<int32_t>& position_ids,
+                 thrust::device_vector<int32_t>& position_ids,
                  thrust::device_vector<int32_t>& kv_page_indices,
                  thrust::device_vector<int32_t>& kv_page_indptr,
                  std::vector<int32_t>& kv_page_indptr_host,

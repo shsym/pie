@@ -3,6 +3,7 @@
 cmake_minimum_required(VERSION 3.23)
 project(PIE_BACKEND CUDA CXX)
 
+set(CMAKE_BUILD_TYPE Release)
 
 # 2. Set C++ Standard and output directories
 # Ensures C++20 is used, matching the ninja file's flag.
@@ -29,7 +30,7 @@ include(cmake/CPM.cmake)
 # CPM downloads, configures, and makes targets available for all dependencies.
 # This replaces manual submodule management.
 CPMAddPackage(
-    URI "gh:flashinfer-ai/flashinfer@0.2.6"
+    URI "gh:flashinfer-ai/flashinfer@0.2.7"
     OPTIONS "FLASHINFER_ENABLE_FP8 OFF" "FLASHINFER_ENABLE_FP8_E4M3 OFF" "FLASHINFER_ENABLE_FP8_E5M2 OFF" "FLASHINFER_GEN_HEAD_DIMS 64" "FLASHINFER_GEN_POS_ENCODING_MODES 0"
 ) 
 
@@ -133,8 +134,8 @@ target_compile_options(pie_cuda_be PRIVATE
         -Xcompiler=-Wextra
         -Wno-unused-parameter
         --extended-lambda
-        -g # Enable host debug symbols
-        -G # Enable device-side debug symbols
+        #-g # Enable host debug symbols
+        #-G # Enable device-side debug symbols
         #-gencode=arch=compute_89,code=sm_89
     >
 )

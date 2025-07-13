@@ -246,7 +246,7 @@ __global__ void topk_scatter_kernel(
  */
 template<typename T>
 void topk_scatter(
-    const thrust::device_vector<T>& logits,
+    T* logits,
     const thrust::device_vector<size_t>& logit_indices_dev,
     const thrust::device_vector<uint32_t>& dest_embed_ids_dev,
     size_t vocab_size,
@@ -270,7 +270,7 @@ void topk_scatter(
 
     // --- Launch Kernel ---
     topk_scatter_kernel<T><<<gridDim, blockDim, 0, stream>>>(
-        thrust::raw_pointer_cast(logits.data()),
+        logits,
         thrust::raw_pointer_cast(logit_indices_dev.data()),
         thrust::raw_pointer_cast(dest_embed_ids_dev.data()),
         vocab_size,
@@ -325,7 +325,7 @@ template void embed<__nv_bfloat16>(
 
 
 template void topk_scatter<float>(
-    const thrust::device_vector<float>& ,
+    float* ,
     const thrust::device_vector<size_t>& ,
     const thrust::device_vector<uint32_t>& ,
     size_t ,
@@ -334,18 +334,10 @@ template void topk_scatter<float>(
     thrust::device_vector<int32_t>& ,
     cudaStream_t);
 
-template void topk_scatter<__half>(
-    const thrust::device_vector<__half>& ,
-    const thrust::device_vector<size_t>& ,
-    const thrust::device_vector<uint32_t>& ,
-    size_t ,
-    size_t ,
-    thrust::device_vector<__half>& ,
-    thrust::device_vector<int32_t>& ,
-    cudaStream_t);
+
 
 template void topk_scatter<__nv_bfloat16>(
-    const thrust::device_vector<__nv_bfloat16>& ,
+    __nv_bfloat16* ,
     const thrust::device_vector<size_t>& ,
     const thrust::device_vector<uint32_t>& ,
     size_t ,

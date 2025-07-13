@@ -77,7 +77,7 @@ void embed(
  */
 template<typename T>
 void topk_scatter(
-    const thrust::device_vector<T>& logits,
+    T* logits,
     const thrust::device_vector<size_t>& logit_indices_dev,
     const thrust::device_vector<uint32_t>& dest_embed_ids_dev,
     size_t vocab_size,

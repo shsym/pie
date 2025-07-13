@@ -66,14 +66,19 @@
 namespace flashinfer
 {
 
-  template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
-            typename Params>
-  cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO *tmp_v,
-                                                    float *tmp_s, cudaStream_t stream);
+  template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+            PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+            typename AttentionVariant, typename Params>
+  cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
+                                                    float* tmp_s, bool enable_pdl,
+                                                    cudaStream_t stream);
 
-  template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant, typename Params>
-  cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Params::DTypeO *tmp_v,
-                                                       float *tmp_s, cudaStream_t stream);
+  template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+            PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+            typename AttentionVariant, typename Params>
+  cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
+                                                      float* tmp_s, bool enable_pdl,
+                                                      cudaStream_t stream); 
 
   class BatchDecodeHandler
   {
@@ -562,7 +567,7 @@ namespace flashinfer
                     return BatchPrefillWithPagedKVCacheDispatched<
                         CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
                         MASK_MODE, AttentionVariant>(params, handler->GetTmpV<DTypeO>(),
-                                                     handler->GetTmpS(), stream);
+                                                     handler->GetTmpS(), false, stream);
                   })
                 })})})});
     return cudaSuccess;
