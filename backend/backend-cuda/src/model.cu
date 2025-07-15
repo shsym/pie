@@ -38,6 +38,7 @@ struct TextEmbed {
 // The actual implementation of the Server is hidden in this struct.
 struct Model::ModelImpl {
     std::unique_ptr<L4maForCausalLM<__nv_bfloat16>> model;
+    std::unique_ptr<L4maBuffer<__nv_bfloat16>> buffer;
 
     // --- State Management ---
     std::map<uint32_t, Block> blocks;
@@ -50,6 +51,9 @@ struct Model::ModelImpl {
     // Configuration
     int32_t kv_page_size;
     int32_t dist_size;
+    
+    // stream
+    cudaStream_t stream;
 
     // --- Handler method declarations added to ModelImpl ---
     // These methods contain the core logic and have access to the model pointer.
@@ -128,7 +132,7 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
 // These are the actual implementations within the ModelImpl struct.
 
 void Model::ModelImpl::handle_allocate(const std::vector<Model::AllocateCommand>& commands) {
-    std::cout << "  [ModelImpl] handle_allocate called with " << commands.size() << " items." << std::endl;
+    //std::cout << "  [ModelImpl] handle_allocate called with " << commands.size() << " items." << std::endl;
     for (const auto& cmd : commands) {
         if (cmd.kind == Model::ObjectKind::KV_BLOCK) {
             for (uint32_t i = 0; i < cmd.count; ++i) {
@@ -140,13 +144,13 @@ void Model::ModelImpl::handle_allocate(const std::vector<Model::AllocateCommand>
 }
 
 void Model::ModelImpl::handle_deallocate(const std::vector<Model::DeallocateCommand>& commands) {
-    std::cout << "  [ModelImpl] handle_deallocate called with " << commands.size() << " items." << std::endl;
+    //std::cout << "  [ModelImpl] handle_deallocate called with " << commands.size() << " items." << std::endl;
     // Currently a no-op, as in the Python implementation.
     // Blocks are cleared implicitly when the model is destroyed.
 }
 
 void Model::ModelImpl::handle_embed_text(const std::vector<Model::EmbedTextCommand>& commands) {
-    std::cout << "  [ModelImpl] handle_embed_text called with " << commands.size() << " items." << std::endl;
+    //std::cout << "  [ModelImpl] handle_embed_text called with " << commands.size() << " items." << std::endl;
     for (const auto& cmd : commands) {
         embeds[cmd.embedding_id] = {cmd.token_id, cmd.position_id};
     }
@@ -156,6 +160,9 @@ void Model::ModelImpl::handle_embed_text(const std::vector<Model::EmbedTextComma
 void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockCommand>& commands) {
 
     std::cout << "  [ModelImpl] handle_fill_block called with " << commands.size() << " items." << std::endl;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
 
     // --- Host-side vector preparations ---
     std::vector<int32_t> kv_page_indices_host;
@@ -174,6 +181,8 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         uint32_t dest_embed_id;
     };
     std::vector<OutputEmbedPostproc> output_embed_postproc;
+
+
 
     int batch_idx = 0;
     for (const auto& cmd : commands) {
@@ -269,6 +278,12 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         batch_idx++;
     }
 
+    // print time taken for processing commands
+    end_time = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    std::cout << "  [ModelImpl] index calculation took " << duration << " microseconds." << std::endl;
+    start_time = std::chrono::high_resolution_clock::now();
+
     // // print all host vectors for debugging
     // std::cout << "kv_page_indices_host: ";
     // for (const auto& idx : kv_page_indices_host) {
@@ -312,68 +327,44 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     // }
     // std::cout << std::endl;
 
-    std::vector<uint8_t> packed_mask_host = packbits_little(custom_masks_host);
+    // --- 2. Allocate and Plan L4maBuffer ---
+    size_t num_total_new_tokens = new_token_ids_host.size();
 
-    // --- Copy data to device ---
-    thrust::device_vector<int32_t> kv_page_indices = kv_page_indices_host;
-    thrust::device_vector<int32_t> kv_page_indptr = kv_page_indptr_host;
-    thrust::device_vector<int32_t> kv_last_page_lens = kv_last_page_lens_host;
-    thrust::device_vector<int32_t> qo_indptr = qo_indptr_host;
-    thrust::device_vector<uint8_t> custom_mask = packed_mask_host;
-    thrust::device_vector<int32_t> mask_indptr = mask_indptr_host;
-    thrust::device_vector<uint32_t> new_token_ids = new_token_ids_host;
-    thrust::device_vector<int32_t> new_position_ids = new_position_ids_host;
-    thrust::device_vector<int32_t> kv_batch_indices = kv_batch_indices_host;
-    thrust::device_vector<int32_t> kv_positions = kv_positions_host;
 
-    // --- Allocate buffers ---
-    size_t num_total_new_tokens = new_token_ids.size();
-    if (num_total_new_tokens == 0) return;
+    buffer->plan(
+        stream, new_token_ids_host, new_position_ids_host,
+        kv_page_indices_host, kv_page_indptr_host, kv_last_page_lens_host,
+        qo_indptr_host, custom_masks_host, mask_indptr_host,
+        kv_batch_indices_host, kv_positions_host
+    );
 
-    Tensor<__nv_bfloat16> logits(num_total_new_tokens * model->get_config().vocab_size);
-    
-    size_t workspace_size_bytes = model->get_workspace_size(num_total_new_tokens);
 
-    StackAllocator allocator(workspace_size_bytes);
     LoggingManager manager(false);
-
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-    
-    // create a stream
     auto model_logger = manager.scope("model_run", stream);
 
-    // measure the start time
-    auto start_time = std::chrono::high_resolution_clock::now();
+    Tensor<__nv_bfloat16> logits(num_total_new_tokens * model->get_config().vocab_size);
+
+
+    end_time = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    std::cout << "  [ModelImpl] indices gpu upload completed in " << duration << " microseconds." << std::endl;   
+    start_time = std::chrono::high_resolution_clock::now();
 
     model->forward(
         model_logger,
-        allocator,
-        logits,
-        new_token_ids,
-        new_position_ids,
-        kv_page_indices,
-        kv_page_indptr,
-        kv_page_indptr_host,
-        kv_last_page_lens,
-        qo_indptr,
-        qo_indptr_host,
-        custom_mask,
-        mask_indptr,
-        stream,
-        kv_page_size,
-        kv_batch_indices,
-        kv_positions
+        *buffer,
+        logits
     );
 
     //manager.print_report();
     // measure the end time
     cudaStreamSynchronize(stream);
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed = end_time - start_time;
-    std::cout << "Model forward pass took " << (elapsed.count()) << " ms." << std::endl;
-
-
+    
+    // print the time taken for the entire operation
+    end_time = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    std::cout << "  [ModelImpl] forward pass completed in " << duration << " microseconds." << std::endl;    
+    start_time = std::chrono::high_resolution_clock::now();
 
     // --- Post-processing ---
     if (!output_embed_postproc.empty()) {
@@ -388,7 +379,7 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         thrust::device_vector<size_t> logit_indices_dev = logit_indices_host;
         thrust::device_vector<uint32_t> dest_embed_ids_dev = dest_embed_ids_host;
         
-        std::cout << "logit mean: " << logits.mean() << std::endl;
+        //std::cout << "logit mean: " << logits.mean() << std::endl;
 
         topk_scatter(
             logits.data(),
@@ -401,10 +392,17 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
             stream
         );
     }
+    cudaStreamSynchronize(stream);
+    
+    // print the time taken for the entire operation
+    end_time = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    std::cout << "  [ModelImpl] sampling completed in " << duration << " microseconds." << std::endl;    
+
 }
 
 void Model::ModelImpl::handle_mask_block(const std::vector<Model::MaskBlockCommand>& commands) {
-    std::cout << "  [ModelImpl] handle_mask_block called with " << commands.size() << " items." << std::endl;
+    //std::cout << "  [ModelImpl] handle_mask_block called with " << commands.size() << " items." << std::endl;
     for (const auto& cmd : commands) {
         auto it = blocks.find(cmd.block_id);
         if (it != blocks.end()) {
@@ -421,19 +419,19 @@ void Model::ModelImpl::handle_mask_block(const std::vector<Model::MaskBlockComma
 }
 
 void Model::ModelImpl::handle_copy_block(const std::vector<Model::CopyBlockCommand>& commands) {
-    std::cout << "  [ModelImpl] handle_copy_block called with " << commands.size() << " items." << std::endl;
+    //std::cout << "  [ModelImpl] handle_copy_block called with " << commands.size() << " items." << std::endl;
     // TODO: Implement cudaMemcpy between different KV cache pages on the device.
     // This requires getting raw pointers to the device vectors for each layer in the KV cache.
 }
 
 void Model::ModelImpl::handle_decode_token_distribution(const std::vector<Model::DecodeTokenDistributionCommand>& commands) {
-    std::cout << "  [ModelImpl] handle_decode_token_distribution called with " << commands.size() << " items." << std::endl;
+    //std::cout << "  [ModelImpl] handle_decode_token_distribution called with " << commands.size() << " items." << std::endl;
     // This is a no-op in the provided python implementation.
     // The logic is integrated into fill_block where top-k results are computed and stored directly.
 }
 
 std::vector<Model::SampleTopKResult> Model::ModelImpl::handle_sample_top_k(const std::vector<Model::SampleTopKCommand>& commands) {
-    std::cout << "  [ModelImpl] handle_sample_top_k called with " << commands.size() << " items." << std::endl;
+    //std::cout << "  [ModelImpl] handle_sample_top_k called with " << commands.size() << " items." << std::endl;
     std::vector<Model::SampleTopKResult> results;
     results.reserve(commands.size());
 
@@ -473,6 +471,19 @@ Model::Model(const AppConfig& config,const ModelMetadata& out_metadata)
     pimpl->model = load_model_internal<__nv_bfloat16>(config, out_metadata);
     std::cout << "Model loaded successfully and is resident on the GPU." << std::endl;
 
+    // Initialize the L4maBuffer with the model's configuration
+    size_t workspace_size = L4maBuffer<__nv_bfloat16>::get_workspace_size(
+        pimpl->model->get_config(), 
+        4096, // number of new tokens
+        4096, // batch size
+        4096 // number of old tokens
+    );
+    pimpl->buffer = std::make_unique<L4maBuffer<__nv_bfloat16>>(pimpl->model->get_config(), config.kv_page_size, workspace_size);
+
+    // Initialize the CUDA stream
+    cudaStreamCreate(&pimpl->stream);
+
+
     // initialize kv cache
     pimpl->model->create_kv_device_vectors(config.max_num_kv_pages * config.kv_page_size);
 
@@ -481,6 +492,8 @@ Model::Model(const AppConfig& config,const ModelMetadata& out_metadata)
     pimpl->dist_size = config.dist_size;
     pimpl->embed_storage_p1.resize(config.max_num_embeds * config.dist_size);
     pimpl->embed_storage_p2.resize(config.max_num_embeds * config.dist_size);
+
+
 }
 
 Model::~Model() = default;

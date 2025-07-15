@@ -396,7 +396,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     router.send(multipart_msg[1], zmq::send_flags::sndmore);
                     router.send(zmq::buffer(response.SerializeAsString()), zmq::send_flags::none);
                 }  else if (request.has_allocate()) {
-                    std::cout << "[ZMQ Server Thread] Handling BatchAllocate request." << std::endl;
+                    //std::cout << "[ZMQ Server Thread] Handling BatchAllocate request." << std::endl;
                     std::vector<Model::AllocateCommand> commands;
                     commands.reserve(request.allocate().items_size());
                     for (const auto& item : request.allocate().items()) {
@@ -409,7 +409,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     model.handle_allocate(commands);
 
                 } else if (request.has_deallocate()) {
-                    std::cout << "[ZMQ Server Thread] Handling BatchDeallocate request." << std::endl;
+                    //std::cout << "[ZMQ Server Thread] Handling BatchDeallocate request." << std::endl;
                     std::vector<Model::DeallocateCommand> commands;
                     commands.reserve(request.deallocate().items_size());
                     for (const auto& item : request.deallocate().items()) {
@@ -422,7 +422,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     model.handle_deallocate(commands);
 
                 } else if (request.has_embed_text()) {
-                    std::cout << "[ZMQ Server Thread] Handling BatchEmbedText request." << std::endl;
+                    //std::cout << "[ZMQ Server Thread] Handling BatchEmbedText request." << std::endl;
                     std::vector<Model::EmbedTextCommand> commands;
                     commands.reserve(request.embed_text().items_size());
                     for (const auto& item : request.embed_text().items()) {
@@ -435,7 +435,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     model.handle_embed_text(commands);
 
                 } else if (request.has_fill_block()) {
-                    std::cout << "[ZMQ Server Thread] Handling BatchFillBlock request." << std::endl;
+                    //std::cout << "[ZMQ Server Thread] Handling BatchFillBlock request." << std::endl;
                     std::vector<Model::FillBlockCommand> commands;
                     commands.reserve(request.fill_block().items_size());
                     for (const auto& item : request.fill_block().items()) {
@@ -449,7 +449,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     model.handle_fill_block(commands);
 
                 } else if (request.has_mask_block()) {
-                    std::cout << "[ZMQ Server Thread] Handling BatchMaskBlock request." << std::endl;
+                    //std::cout << "[ZMQ Server Thread] Handling BatchMaskBlock request." << std::endl;
                     std::vector<Model::MaskBlockCommand> commands;
                     commands.reserve(request.mask_block().items_size());
                     for (const auto& item : request.mask_block().items()) {
@@ -461,7 +461,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     model.handle_mask_block(commands);
 
                 } else if (request.has_copy_block()) {
-                    std::cout << "[ZMQ Server Thread] Handling BatchCopyBlock request." << std::endl;
+                    //std::cout << "[ZMQ Server Thread] Handling BatchCopyBlock request." << std::endl;
                     std::vector<Model::CopyBlockCommand> commands;
                     commands.reserve(request.copy_block().items_size());
                     for (const auto& item : request.copy_block().items()) {
@@ -476,7 +476,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     model.handle_copy_block(commands);
 
                 } else if (request.has_decode_token_distribution()) {
-                    std::cout << "[ZMQ Server Thread] Handling BatchDecodeTokenDistribution request." << std::endl;
+                    //std::cout << "[ZMQ Server Thread] Handling BatchDecodeTokenDistribution request." << std::endl;
                     std::vector<Model::DecodeTokenDistributionCommand> commands;
                     commands.reserve(request.decode_token_distribution().items_size());
                     for (const auto& item : request.decode_token_distribution().items()) {
@@ -488,7 +488,7 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     model.handle_decode_token_distribution(commands);
 
                 } else if (request.has_sample_top_k_request()) {
-                    std::cout << "[ZMQ Server Thread] Handling BatchSampleTopKRequest request." << std::endl;
+                    //std::cout << "[ZMQ Server Thread] Handling BatchSampleTopKRequest request." << std::endl;
                     needs_response = true;
                     
                     std::vector<Model::SampleTopKCommand> commands;
@@ -627,9 +627,12 @@ int main(int argc, char* argv[]) {
             int unique_id = std::rand() % 9000 + 1000;
             service_endpoint = "ipc:///tmp/pie-service-" + std::to_string(unique_id);
             service_endpoint_public = service_endpoint;
+
+            std::cout << "Using IPC endpoint: " << service_endpoint << std::endl;
         } else {
             service_endpoint = "tcp://*:" + std::to_string(final_config.port);
             service_endpoint_public = "tcp://" + final_config.host + ":" + std::to_string(final_config.port);
+            std::cout << "Using TCP endpoint: " << service_endpoint << std::endl;
         }
         router.bind(service_endpoint);
         std::cout << "Server listening on " << service_endpoint << std::endl;

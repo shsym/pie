@@ -24,7 +24,7 @@ async fn main() -> Result<(), String> {
     //let mut prev = start; // track the time of the previous token
     let start = Instant::now();
 
-    let max_num_outputs = 32;
+    let max_num_outputs = 128;
 
     let available_models = pie::available_models();
 

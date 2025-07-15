@@ -566,18 +566,3 @@ void multiply_bf16_cublas(cublasHandle_t handle,
 }
 
 
-std::vector<uint8_t> packbits_little(const std::vector<bool>& data) {
-    // Calculate the number of bytes needed, padding with zeros for the last byte if necessary.
-    const size_t num_bytes = (data.size() + 7) / 8;
-    std::vector<uint8_t> packed(num_bytes, 0);
-
-    for (size_t i = 0; i < data.size(); ++i) {
-        // The first element in each chunk of 8 corresponds to the LSB.
-        // The '& 7' is equivalent to 'i % 8' but can be faster.
-        if (data[i]) {
-            packed[i / 8] |= (1 << (i & 7));
-        }
-    }
-
-    return packed;
-}

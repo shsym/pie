@@ -20,6 +20,7 @@ public:
     // --- Constructors and Lifetime ---
     explicit Tensor(size_t size);
     Tensor(const Tensor& other, size_t offset); // Same-type view constructor
+    Tensor() : data_(nullptr), size_(0), offset_(0) {}
 
     /**
      * @brief Reinterpreting View Constructor.

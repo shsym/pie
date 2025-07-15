@@ -1,6 +1,0 @@
-[submodule "backend/backend-cuda/lib/flashinfer"]
-	path = backend/backend-cuda/lib/flashinfer
-	url = https://github.com/flashinfer-ai/flashinfer.git
-[submodule "backend/backend-cuda/lib/cppzmq"]
-	path = backend/backend-cuda/lib/cppzmq
-	url = https://github.com/zeromq/cppzmq.git

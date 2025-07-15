@@ -119,4 +119,3 @@ void multiply_bf16_cublas(cublasHandle_t handle,
                           const __nv_bfloat16 *A, const __nv_bfloat16 *B, __nv_bfloat16 *C,
                           int m, int n, int k, bool transa, bool transb);
 
-std::vector<uint8_t> packbits_little(const std::vector<bool>& data);

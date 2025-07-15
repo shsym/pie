@@ -332,8 +332,8 @@ impl Batchable<BatchGroup> for Command {
                 //
                 //batching::k_or_t(Duration::from_millis(10), 30, None)
                 // 7ms, 14ms
-                batching::t_only(Duration::from_millis(14))
-                //batching::eager()
+                //batching::t_only(Duration::from_millis(14))
+                batching::eager()
             }
             Command::CopyBlock { .. } => batching::eager(),
             Command::MaskBlock { .. } => batching::eager(),
