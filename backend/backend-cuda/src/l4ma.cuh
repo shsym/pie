@@ -39,7 +39,7 @@ template <typename T>
 class L4maBuffer {
 public:
     // --- Device-side pointers, valid after `plan()` is called ---
-    Tensor<uint32_t> input_ids;
+    Tensor<int32_t> input_ids;
     Tensor<int32_t> position_ids;
     Tensor<int32_t> kv_page_indices;
     Tensor<int32_t> kv_page_indptr;
@@ -49,10 +49,12 @@ public:
     Tensor<int32_t> mask_indptr;
     Tensor<int32_t> kv_batch_indices;
     Tensor<int32_t> kv_positions;
+    Tensor<int32_t> output_indices_src;
 
     // --- Shape, Config, and Execution Context ---
     const L4maConfig& config;
     const int32_t page_size;
+    const int32_t dist_size;
     size_t num_tokens;
     size_t batch_size;
     cudaStream_t stream;
@@ -62,7 +64,7 @@ public:
     flashinfer::BatchPrefillHandler prefill_handler;
 
     // --- Constructor / Destructor ---
-    L4maBuffer(const L4maConfig& cfg, int32_t p_size, size_t workspace_size);
+    L4maBuffer(const L4maConfig& cfg, int32_t page_size, int32_t dist_size, size_t workspace_size);
     ~L4maBuffer();
 
     // --- Deleted Functions ---
@@ -76,13 +78,14 @@ public:
         const L4maConfig& config,
         size_t max_num_tokens,
         size_t max_batch_size,
-        size_t max_kv_seqlens
+        size_t max_kv_seqlens,
+        size_t dist_size
     );
 
     // --- Public Methods ---
     void plan(
         cudaStream_t strm,
-         std::vector<uint32_t>& input_ids_host,
+         std::vector<int32_t>& input_ids_host,
          std::vector<int32_t>& position_ids_host,
          std::vector<int32_t>& kv_page_indices_host,
          std::vector<int32_t>& kv_page_indptr_host,
@@ -91,7 +94,8 @@ public:
          std::vector<bool>& packed_custom_mask_host,
          std::vector<int32_t>& mask_indptr_host,
          std::vector<int32_t>& kv_batch_indices_host,
-         std::vector<int32_t>& kv_positions_host
+         std::vector<int32_t>& kv_positions_host,
+         std::vector<int32_t>& output_indices_src_host
     );
 
     // --- Allocator Wrappers ---
@@ -247,9 +251,8 @@ public:
     explicit L4maForCausalLM(const L4maConfig& config);
 
 
-    void forward(PerformanceLogger& logger,
-                 L4maBuffer<T>& buffer,
-                 Tensor<T>& output);
+    std::pair<std::vector<float>, std::vector<int32_t>> forward(PerformanceLogger& logger,
+                 L4maBuffer<T>& buffer);
 
     std::map<std::string, Tensor<T>*> get_parameters() override;
     void create_kv_device_vectors(int max_kv_num);

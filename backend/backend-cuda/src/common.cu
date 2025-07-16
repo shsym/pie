@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <limits> // Required for std::numeric_limits
+#include <cooperative_groups.h> // For warp-level operations
 
 /**
  * @brief High-performance CUDA kernel for embedding lookup.
@@ -15,10 +16,10 @@
  *
  * @tparam T The base data type (float, __half, etc.).
  */
-template <typename T>
+template <typename T, typename I>
 __global__ void embedding_lookup_kernel_128bit(T *output,
                                                const T *embedding_matrix,
-                                               const uint32_t *indices,
+                                               const I *indices,
                                                int n,
                                                int hidden_dim_div_16)
 {
@@ -30,7 +31,7 @@ __global__ void embedding_lookup_kernel_128bit(T *output,
     }
 
     // Use shared memory to broadcast the source row index for the block.
-    __shared__ uint32_t source_row_idx;
+    __shared__ I source_row_idx;
     if (threadIdx.x == 0)
     {
         source_row_idx = indices[idx_n];
@@ -61,11 +62,11 @@ __global__ void embedding_lookup_kernel_128bit(T *output,
 /**
  * @brief Host-side launch function for embedding lookup with a raw pointer API.
  */
-template <typename T>
+template <typename T, typename I>
 void embed(
     const T* embedding,
     size_t embedding_num_rows,
-    const uint32_t* indices,
+    const I* indices,
     size_t num_indices,
     T* result,
     int embed_width,
@@ -90,7 +91,7 @@ void embed(
     dim3 threads(threads_per_block);
 
     // --- Kernel Launch ---
-    embedding_lookup_kernel_128bit<T><<<blocks, threads, 0, stream>>>(
+    embedding_lookup_kernel_128bit<T, I><<<blocks, threads, 0, stream>>>(
         result,
         embedding,
         indices,
@@ -99,187 +100,186 @@ void embed(
 }
 
 
-// template <typename T>
-// void embed(
-//     const thrust::device_vector<T> &embedding,
-//     const thrust::device_vector<uint32_t> &indices,
-//     thrust::device_vector<T> *result,
-//     int embed_width,
-//     cudaStream_t stream)
-// {
-//     // --- Input Validation ---
-//     if (embedding.size() == 0 || indices.size() == 0)
-//         return;
-//     if (embedding.size() % embed_width != 0)
-//     {
-//         throw std::invalid_argument("Embedding vector size is not divisible by the embed_width.");
-//     }
-//     if ((embed_width * sizeof(T)) % 16 != 0)
-//     {
-//         throw std::invalid_argument("Total byte size of a slice (embed_width * sizeof(T)) must be a multiple of 16.");
-//     }
-
-//     // --- Prepare Parameters ---
-//     const int num_indices = indices.size();
-//     result->resize((long long)num_indices * embed_width);
-
-//     const int threads_per_block = 256;
-//     const int hidden_dim_div_16 = (embed_width * sizeof(T)) / 16;
-
-//     dim3 blocks(num_indices);
-//     dim3 threads(threads_per_block);
-
-//     // --- Kernel Launch ---
-//     embedding_lookup_kernel_128bit<T><<<blocks, threads, 0, stream>>>(
-//         thrust::raw_pointer_cast(result->data()),
-//         thrust::raw_pointer_cast(embedding.data()),
-//         thrust::raw_pointer_cast(indices.data()),
-//         num_indices,
-//         hidden_dim_div_16);
-// }
-
-
-
-// Define a reasonable maximum K that can be handled by the shared memory implementation.
-// If you need k > 256, this value should be increased, and you may need more shared memory.
-#define MAX_K 256
-
 /**
- * @brief CUDA kernel to find top-k values/indices and scatter them.
+ * @brief CUDA Kernel: Extracts k non-negative-infinity values and their indices from each row.
  *
- * Each thread block processes one row from the input `all_logits` tensor. It finds the top 'k'
- * values and their original indices. It then writes these results to a potentially non-contiguous
- * location in the destination storage buffers, as specified by `dest_embed_ids`.
+ * This kernel assigns one thread per row. Each thread scans its assigned row of the input
+ * matrix, finds the first k valid (not -inf) elements, and writes their values and
+ * column indices to the corresponding output matrices.
  *
- * This implementation uses a spin-lock to manage a critical section for updating
- * the list of top-k candidates held in shared memory, ensuring correctness when multiple
- * threads find a candidate simultaneously.
+ * @tparam T The data type of the matrix (e.g., float, __nv_bfloat16).
+ * @param A Input dense matrix of size M x N on the device.
+ * @param V Output value matrix of size M x k on the device.
+ * @param I Output index matrix of size M x k on the device.
+ * @param M Number of rows in the input matrix.
+ * @param N Number of columns in the input matrix.
+ * @param k The exact number of non-negative-infinity elements to extract from each row.
  */
 template <typename T>
-__global__ void topk_scatter_kernel(
-    const T* __restrict__ all_logits,
-    const size_t* __restrict__ logit_indices,
-    const uint32_t* __restrict__ dest_embed_ids,
-    size_t vocab_size,
-    size_t k,
-    T* __restrict__ topk_probs_storage,
-    int32_t* __restrict__ topk_tokens_storage)
+__global__ void extract_k_values_kernel(const T* __restrict__ A,
+                                        T* __restrict__ V,
+                                        int32_t* __restrict__ I,
+                                        int M,
+                                        int N,
+                                        int k)
 {
-    // --- Shared Memory Allocation (volatile removed) ---
-    __shared__ T sm_top_vals[MAX_K];
-    __shared__ int32_t sm_top_idxs[MAX_K];
-    __shared__ int lock;
+    // --- Threading Model: One Block per Row ---
+    // The block index corresponds to the row index.
+    const int row_idx = blockIdx.x;
+    const int tid = threadIdx.x;
 
-    // --- Block-level variable setup ---
-    const int block_row_idx = blockIdx.x;
-    const size_t source_row_idx = logit_indices[block_row_idx];
-    const uint32_t dest_embed_id = dest_embed_ids[block_row_idx];
-    const T* logit_row_ptr = all_logits + source_row_idx * vocab_size;
+    // Each block uses a shared memory counter to coordinate writes.
+    __shared__ int output_count;
 
-    // --- Phase 1: Initialize shared memory ---
-    if (threadIdx.x == 0) {
-        lock = 0;
-    }
-    for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        // FIX: Explicitly cast the initial value to the correct type T
-        sm_top_vals[i] = static_cast<T>(-1000000.0);
-        sm_top_idxs[i] = -1;
+    // Thread 0 of each block initializes its counter.
+    if (tid == 0)
+    {
+        output_count = 0;
     }
     __syncthreads();
 
+    // Pointers for the current row, calculated once per block.
+    const T* input_row = A + (long long)row_idx * N;
+    T* value_output_row = V + (long long)row_idx * k;
+    int32_t* index_output_row = I + (long long)row_idx * k;
 
-    // --- Phase 2: Iterate over the input row and find top candidates ---
-    for (size_t i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-        T val = __ldg(logit_row_ptr + i);
-        int32_t idx = static_cast<int32_t>(i);
+    const T neg_inf = static_cast<T>(-INFINITY);
 
-        // FIX: Comparisons now work because sm_top_vals is no longer volatile
-        if (val > sm_top_vals[k-1]) {
-            while(atomicCAS(&lock, 0, 1) != 0); // Acquire lock
+    // --- Parallel Scan through the Row ---
+    // Threads in the block scan the row in parallel chunks.
+    for (int col_base = 0; col_base < N; col_base += blockDim.x)
+    {
+        // Early exit for the entire block if k elements have been found.
+        // Reading a shared variable is much faster than continuing the loop.
+        if (output_count >= k)
+        {
+            break;
+        }
 
-            if (val > sm_top_vals[k-1]) {
-                sm_top_vals[k-1] = val;
-                sm_top_idxs[k-1] = idx;
+        const int col_idx = col_base + tid;
 
-                for (int j = k - 2; j >= 0; --j) {
-                    // FIX: This comparison also works now
-                    if (sm_top_vals[j+1] > sm_top_vals[j]) {
-                        // Swap
-                        T temp_val = sm_top_vals[j];
-                        int32_t temp_idx = sm_top_idxs[j];
-                        sm_top_vals[j] = sm_top_vals[j+1];
-                        sm_top_idxs[j] = sm_top_idxs[j+1];
-                        sm_top_vals[j+1] = temp_val;
-                        sm_top_idxs[j+1] = temp_idx;
-                    } else {
-                        break;
-                    }
+        // Boundary check for the last chunk of the row.
+        if (col_idx < N)
+        {
+            // This read is coalesced: adjacent threads read adjacent memory addresses.
+            T val = input_row[col_idx];
+
+            if (val != neg_inf)
+            {
+                // Atomically increment the shared counter to get a unique, sequential
+                // index for this thread to write its result to.
+                int write_idx = atomicAdd(&output_count, 1);
+
+                // If this thread's result is within the top k, write it out.
+                if (write_idx < k)
+                {
+                    value_output_row[write_idx] = val;
+                    index_output_row[write_idx] = col_idx;
                 }
             }
-            atomicExch(&lock, 0); // Release lock
         }
-    }
-
-    __syncthreads();
-
-    // --- Phase 3: Write results from shared memory to global memory ---
-    T* dest_probs_ptr = topk_probs_storage + dest_embed_id * k;
-    int32_t* dest_tokens_ptr = topk_tokens_storage + dest_embed_id * k;
-
-    for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        dest_probs_ptr[i] = sm_top_vals[i];
-        dest_tokens_ptr[i] = sm_top_idxs[i];
     }
 }
 
 /**
- * @brief Performs top-k selection on specified rows of a logit tensor and scatters the results.
- * @tparam T The data type of the logits (e.g., __nv_bfloat16 or float).
- * @param logits The flattened device vector containing all batched logits.
- * @param logit_indices_dev A device vector of indices specifying which rows of `logits` to process.
- * @param dest_embed_ids_dev A device vector specifying the destination slot in storage for each row's result.
- * @param vocab_size The number of columns in the logit tensor (the vocabulary size).
- * @param k The number of top elements to select. Must be <= MAX_K.
- * @param topk_probs_storage Output device vector for storing top-k probabilities/scores.
- * @param topk_tokens_storage Output device vector for storing top-k token IDs.
- * @param stream The CUDA stream for the operation.
+ * @brief Extracts the first k valid (non -inf) values/indices per row from a sparse matrix.
+ *
+ * This utility function launches a kernel to convert a sparse matrix, where "empty"
+ * values are represented by -infinity, into two dense matrices: one for the k values
+ * and one for their corresponding column indices. It operates entirely on device memory.
+ *
+ * @tparam T The data type of the matrix (e.g., float, __nv_bfloat16).
+ * @param A Device pointer to the input dense matrix (size M*N).
+ * @param V Device pointer to the output value matrix (size M*k).
+ * @param I Device pointer to the output index matrix (size M*k).
+ * @param M The number of rows.
+ * @param N The number of columns.
+ * @param k The number of non-negative-infinity elements to find in each row.
+ * @param stream The CUDA stream for asynchronous execution.
  */
-template<typename T>
-void topk_scatter(
-    T* logits,
-    const thrust::device_vector<size_t>& logit_indices_dev,
-    const thrust::device_vector<uint32_t>& dest_embed_ids_dev,
-    size_t vocab_size,
-    size_t k,
-    thrust::device_vector<T>& topk_probs_storage,
-    thrust::device_vector<int32_t>& topk_tokens_storage,
-    cudaStream_t stream)
+template <typename T>
+void extract_k_values(const T* A,
+                      T* V,
+                      int32_t* I,
+                      int M,
+                      int N,
+                      int k,
+                      cudaStream_t stream)
 {
-    if (k > MAX_K) {
-        // In a real application, you should throw an exception or handle this error.
-        printf("Error: k=%zu is greater than MAX_K=%d\n", k, MAX_K);
-        return;
-    }
-    if (logit_indices_dev.empty()) {
+    // --- Input Validation ---
+    if (M <= 0 || N <= 0 || k <= 0)
+    {
         return; // Nothing to do
     }
 
     // --- Kernel Launch Configuration ---
-    dim3 blockDim(256); // Threads per block (a common choice)
-    dim3 gridDim(logit_indices_dev.size()); // One block per row to process
+    // A block size of 256 is a good, general-purpose choice.
+    // It should be a multiple of the warp size (32).
+    const int threads_per_block = 256;
+
+    // Launch one block for each row.
+    const int blocks_per_grid = M;
+
+    dim3 grid(blocks_per_grid);
+    dim3 threads(threads_per_block);
 
     // --- Launch Kernel ---
-    topk_scatter_kernel<T><<<gridDim, blockDim, 0, stream>>>(
-        logits,
-        thrust::raw_pointer_cast(logit_indices_dev.data()),
-        thrust::raw_pointer_cast(dest_embed_ids_dev.data()),
-        vocab_size,
-        k,
-        thrust::raw_pointer_cast(topk_probs_storage.data()),
-        thrust::raw_pointer_cast(topk_tokens_storage.data())
-    );
+    extract_k_values_kernel<T><<<grid, threads, 0, stream>>>(A, V, I, M, N, k);
 }
 
+
+/**
+ * @brief CUDA kernel to perform element-wise type conversion.
+ *
+ * This kernel is a template that can handle various input and output types.
+ * Each thread processes one element of the input array and stores the
+ * converted value in the output array.
+ *
+ * @tparam InType The data type of the input array.
+ * @tparam OutType The data type of the output array.
+ * @param input Pointer to the input array on the device.
+ * @param output Pointer to the output array on the device.
+ * @param n The total number of elements in the arrays.
+ */
+template <typename InType, typename OutType>
+__global__ void cast_type_kernel(const InType* input, OutType* output, size_t n) {
+    // Calculate the global thread ID
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Boundary check to ensure we don't access out of bounds
+    if (idx < n) {
+        // Perform the type conversion using a static_cast
+        output[idx] = static_cast<OutType>(input[idx]);
+    }
+}
+
+/**
+ * @brief Host-side launch function for generic type conversion on the GPU.
+ *
+ * This function handles the kernel launch for converting a device array
+ * from one data type to another. It assumes input and output buffers are
+ * already allocated on the device.
+ *
+ * @tparam InType The data type of the input device array.
+ * @tparam OutType The data type for the output device array.
+ * @param d_input Pointer to the input array on the device.
+ * @param d_output Pointer to the output array on the device.
+ * @param n The number of elements to convert.
+ * @param stream The CUDA stream for asynchronous execution.
+ */
+template <typename InType, typename OutType>
+void cast_type(const InType* d_input, OutType* d_output, size_t n, cudaStream_t stream) {
+    if (n == 0) {
+        return;
+    }
+
+    // Define kernel launch parameters
+    int threads_per_block = 256;
+    int blocks_per_grid = (n + threads_per_block - 1) / threads_per_block;
+
+    // Launch the conversion kernel
+    cast_type_kernel<InType, OutType><<<blocks_per_grid, threads_per_block, 0, stream>>>(d_input, d_output, n);
+}
 
 
 // --- Explicit Template Instantiations ---
@@ -305,46 +305,48 @@ void topk_scatter(
 //     thrust::device_vector<__nv_bfloat16> *,
 //     int, cudaStream_t);
 
-template void embed<float>(
+template void embed<float, int32_t>(
     const float*,
     size_t,
-    const uint32_t*,
+    const int32_t*,
     size_t,
     float* result,
     int,
     cudaStream_t);
 
-template void embed<__nv_bfloat16>(
+template void embed<__nv_bfloat16, int32_t>(
     const __nv_bfloat16*,
     size_t,
-    const uint32_t*,
+    const int32_t*,
     size_t,
     __nv_bfloat16* result,
     int,
     cudaStream_t);
 
 
-template void topk_scatter<float>(
-    float* ,
-    const thrust::device_vector<size_t>& ,
-    const thrust::device_vector<uint32_t>& ,
-    size_t ,
-    size_t ,
-    thrust::device_vector<float>& ,
-    thrust::device_vector<int32_t>& ,
+template void extract_k_values<float>(
+    const float*,
+    float*,
+    int32_t*,
+    int, int, int,
+    cudaStream_t);
+
+template void extract_k_values<__nv_bfloat16>(
+    const __nv_bfloat16*,
+    __nv_bfloat16*,
+    int32_t*,
+    int, int, int,
     cudaStream_t);
 
 
+// Explicit template instantiations for convert_type_on_device
+template void cast_type<__nv_bfloat16, float>(const __nv_bfloat16*, float*, size_t, cudaStream_t);
+template void cast_type<float, __nv_bfloat16>(const float*, __nv_bfloat16*, size_t, cudaStream_t);
+template void cast_type<__half, float>(const __half*, float*, size_t, cudaStream_t);
+template void cast_type<float, __half>(const float*, __half*, size_t, cudaStream_t);
+template void cast_type<__nv_bfloat16, __half>(const __nv_bfloat16*, __half*, size_t, cudaStream_t);
+template void cast_type<__half, __nv_bfloat16>(const __half*, __nv_bfloat16*, size_t, cudaStream_t);
 
-template void topk_scatter<__nv_bfloat16>(
-    __nv_bfloat16* ,
-    const thrust::device_vector<size_t>& ,
-    const thrust::device_vector<uint32_t>& ,
-    size_t ,
-    size_t ,
-    thrust::device_vector<__nv_bfloat16>& ,
-    thrust::device_vector<int32_t>& ,
-    cudaStream_t);
 
 
 template <typename T>

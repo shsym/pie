@@ -134,6 +134,7 @@ target_compile_options(pie_cuda_be PRIVATE
         -Xcompiler=-Wextra
         -Wno-unused-parameter
         --extended-lambda
+        --expt-relaxed-constexpr
         #-g # Enable host debug symbols
         #-G # Enable device-side debug symbols
         #-gencode=arch=compute_89,code=sm_89

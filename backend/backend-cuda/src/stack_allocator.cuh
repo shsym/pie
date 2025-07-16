@@ -6,6 +6,7 @@
 #include <string>
 #include <algorithm>
 #include <cstdint>
+#include <vector> 
 
 inline size_t align_up(size_t size, size_t alignment) {
     return (size + alignment - 1) & ~(alignment - 1);
@@ -15,7 +16,10 @@ class StackAllocator {
 public:
     explicit StackAllocator(size_t total_size_bytes)
         : buffer_(total_size_bytes), 
-          offset_(0) {}
+          offset_(0) {
+        // Pre-allocate capacity to avoid frequent std::vector reallocations
+        offset_stack_.reserve(256); 
+    }
 
     StackAllocator(const StackAllocator&) = delete;
     StackAllocator& operator=(const StackAllocator&) = delete;
@@ -23,75 +27,77 @@ public:
     StackAllocator& operator=(StackAllocator&&) = delete;
 
     /**
-     * @brief Resets the allocator's offset, effectively "freeing" all memory.
+     * @brief Resets the allocator, clearing the offset and the history.
      */
     void reset() {
         offset_ = 0;
+        offset_stack_.clear();
     }
 
     /**
-     * @brief Allocates a Tensor view for one or more elements.
-     * @tparam T The type of the elements to allocate.
-     * @param count The number of elements of type T to allocate.
-     * @return A Tensor<T> view into the workspace buffer.
+     * @brief Allocates a Tensor view, saving the previous state for deallocation.
      */
     template<typename T>
     Tensor<T> allocate(size_t count = 1) {
         constexpr size_t alignment = std::max(alignof(T), (size_t)256);
+        
+        // **FIX**: Store the current offset before this allocation.
+        offset_stack_.push_back(offset_);
+
         size_t aligned_offset = align_up(offset_, alignment);
         size_t bytes_to_alloc = count * sizeof(T);
 
         if (aligned_offset + bytes_to_alloc > buffer_.size()) {
+            offset_stack_.pop_back(); // Revert state before throwing
             throw std::runtime_error("StackAllocator out of memory.");
         }
 
         offset_ = aligned_offset + bytes_to_alloc;
         
-        // Use the new reinterpreting constructor to create a typed view
         return Tensor<T>(buffer_, aligned_offset, count);
     }
 
-
     /**
-     * @brief Allocates and copies data from a host vector to the device asynchronously.
-     * @tparam U The data type of the vector elements.
-     * @param host_vector The host-side std::vector to copy from.
-     * @param stream The CUDA stream to use for the asynchronous copy.
-     * @return A device pointer of type U* to the newly allocated and populated memory.
+     * @brief Allocates and copies data, saving the previous state.
      */
     template<typename T>
     Tensor<T> allocate_and_copy_async(const std::vector<T>& host_vector, cudaStream_t stream) {
         if (host_vector.empty()) {
             throw std::runtime_error("empty vector provided to StackAllocator::allocate_and_copy_async.");
+
+            // exit program
+            //std::exit(EXIT_FAILURE);
         }
 
         size_t count = host_vector.size();
         constexpr size_t alignment = std::max(alignof(T), (size_t)256);
+        
+        // **FIX**: Store the current offset before this allocation.
+        offset_stack_.push_back(offset_);
+
         size_t aligned_offset = align_up(offset_, alignment);
         size_t bytes_to_alloc = count * sizeof(T);
 
         if (aligned_offset + bytes_to_alloc > buffer_.size()) {
+            offset_stack_.pop_back(); // Revert state before throwing
             throw std::runtime_error("StackAllocator::allocate_and_copy_async out of memory.");
         }
 
-        // Get the typed device pointer at the calculated offset
         T* device_ptr = reinterpret_cast<T*>(buffer_.data() + aligned_offset);
-
-        // Update the stack offset to reserve the space
         offset_ = aligned_offset + bytes_to_alloc;
 
-        // Perform the asynchronous copy from host to device
         CUDA_CHECK(cudaMemcpyAsync(device_ptr, host_vector.data(), bytes_to_alloc, cudaMemcpyHostToDevice, stream));
 
         return Tensor<T>(buffer_, aligned_offset, count);
     }
 
     /**
-     * @brief Allocates the rest of the available memory in the buffer.
-     * Useful for operations like cuBLAS that can use a variable amount of workspace.
-     * @return A Tensor<uint8_t> view representing all remaining memory.
+     * @brief Allocates the rest of the buffer, saving the previous state.
      */
     Tensor<uint8_t> allocate_rest() {
+        // **FIX**: Store the current offset before this allocation.
+        offset_stack_.push_back(offset_);
+
         constexpr size_t alignment = 256;
         size_t aligned_offset = align_up(offset_, alignment);
         size_t remaining_bytes = buffer_.size() - aligned_offset;
@@ -105,32 +111,36 @@ public:
     }
 
     /**
-     * @brief Deallocates the Tensor view, which must be the most recent allocation.
-     * @tparam T The type of the elements in the Tensor.
-     * @param tensor The Tensor view returned by the last corresponding allocate call.
+     * @brief Deallocates by restoring the allocator's state from before the allocation.
      */
     template<typename T>
     void deallocate(const Tensor<T>& tensor) {
-        if (tensor.size() == 0) {
-            return;
+        if (offset_stack_.empty()) {
+            // This can happen for a default-constructed tensor that was never allocated.
+            if (tensor.size() == 0) return;
+            throw std::runtime_error("StackAllocator deallocation error: Unbalanced deallocation call.");
         }
         
-        uint8_t* ptr = reinterpret_cast<uint8_t*>(tensor.data());
+        // The offset to restore to is the one we saved before this block was allocated.
+        size_t previous_offset = offset_stack_.back();
+        
+        // Sanity Check: Ensure the tensor being freed was indeed at the top of the stack.
+        // This check is now robust because it uses the true current offset.
+        uint8_t* start_ptr = reinterpret_cast<uint8_t*>(tensor.data());
         size_t bytes = tensor.size() * sizeof(T);
-        
-        // This is the core check for LIFO order, restored from your original code.
-        // It confirms that the block being freed is exactly at the top of the stack.
-        size_t allocation_offset = ptr - buffer_.data();
-        if (align_up(allocation_offset, 256) + bytes != offset_ && allocation_offset + bytes != offset_) {
-            // This fallback check is what your original code simplified to.
-            // It's a good sanity check if the alignment logic gets complex.
-            if (ptr + bytes != buffer_.data() + offset_) {
-                 throw std::runtime_error("StackAllocator deallocation error: The provided tensor does not match the most recent allocation (LIFO violation).");
-            }
+        uint8_t* end_ptr = start_ptr + bytes;
+        uint8_t* expected_end_ptr = buffer_.data() + offset_;
+
+        if (end_ptr != expected_end_ptr && tensor.size() != 0) {
+             throw std::runtime_error(
+                "StackAllocator deallocation error: The provided tensor does not match "
+                "the most recent allocation (LIFO violation)."
+            );
         }
-        
-        // Rewind the stack pointer to the start of the deallocated block.
-        offset_ = allocation_offset;
+
+        // **FIX**: Rewind the offset to its actual previous state and pop from the stack.
+        offset_ = previous_offset;
+        offset_stack_.pop_back();
     }
 
     size_t get_used_size() const { return offset_; }
@@ -139,4 +149,6 @@ public:
 private:
     ByteTensor buffer_;
     size_t offset_;
+    // **FIX**: This stack stores the `offset_` value from *before* each allocation.
+    std::vector<size_t> offset_stack_;
 };

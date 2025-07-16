@@ -41,6 +41,10 @@ public:
     size_t size() const;
     T* data() const;
 
+    bool is_empty() const {
+        return size_ == 0;
+    };
+
     // --- Host/Device Data Transfer ---
     std::vector<T> to_vector() const;
     void from_vector(const std::vector<T>& data);

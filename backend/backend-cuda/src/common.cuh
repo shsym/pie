@@ -52,11 +52,11 @@ struct __nv_bfloat16;
  * @param embed_width The dimensionality of a single embedding vector.
  * @param stream The CUDA stream for asynchronous execution.
  */
-template <typename T>
+template <typename T, typename I>
 void embed(
     const T* embedding,
     size_t embedding_num_rows,
-    const uint32_t* indices,
+    const I* indices,
     size_t num_indices,
     T* result,
     int embed_width,
@@ -119,3 +119,17 @@ void multiply_bf16_cublas(cublasHandle_t handle,
                           const __nv_bfloat16 *A, const __nv_bfloat16 *B, __nv_bfloat16 *C,
                           int m, int n, int k, bool transa, bool transb);
 
+
+template <typename T>
+void extract_k_values(const T* A,
+                      T* V,
+                      int* I,
+                      int M,
+                      int N,
+                      int k,
+                      cudaStream_t stream);
+
+
+
+template <typename InType, typename OutType>
+void cast_type(const InType* d_input, OutType* d_output, size_t n, cudaStream_t stream);

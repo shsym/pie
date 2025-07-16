@@ -12,6 +12,7 @@
 #include "flashinfer/pos_enc.cuh"
 #include "flashinfer/page.cuh"
 #include "flashinfer/activation.cuh"
+#include "flashinfer/sampling.cuh"
 #include "flashinfer/vec_dtypes.cuh"
 
 #include "flashinfer_ops.cuh"
@@ -133,9 +134,10 @@ std::vector<uint8_t> packbits_little(const std::vector<bool>& data) {
 
 
 template <typename T>
-L4maBuffer<T>::L4maBuffer(const L4maConfig& cfg, int32_t p_size, size_t workspace_size)
+L4maBuffer<T>::L4maBuffer(const L4maConfig& cfg, int32_t page_size, int32_t dist_size, size_t workspace_size)
     : config(cfg),
-      page_size(p_size),
+      page_size(page_size),
+      dist_size(dist_size),
       num_tokens(0),
       batch_size(0),
       stream(nullptr),
@@ -152,45 +154,66 @@ L4maBuffer<T>::~L4maBuffer() {
     // The StackAllocator will automatically free its buffer when it goes out of scope
 }
 
-
 template <typename T>
 size_t L4maBuffer<T>::get_workspace_size(
     const L4maConfig& config,
     size_t max_num_tokens,
     size_t max_batch_size,
-    size_t max_kv_seqlens
+    size_t max_kv_seqlens, // TODO: max_dist_size is needed for sampling buffers
+    size_t dist_size
 ) {
     const size_t alignment = 256;
-    size_t total_bytes = 0;
-
-    // Part 1: Intermediate Tensors (peak usage analysis)
     const size_t hidden_size = config.hidden_size;
     const size_t intermediate_size = config.intermediate_size;
     const size_t num_q_heads = config.num_query_heads;
     const size_t num_kv_heads = config.num_key_value_heads;
     const size_t head_size = config.head_size;
 
-    size_t attn_path_peak = 0;
-    attn_path_peak += align_up((size_t)max_num_tokens * hidden_size * sizeof(T), alignment);
-    attn_path_peak += align_up((size_t)max_num_tokens * hidden_size * sizeof(T), alignment);
-    attn_path_peak += align_up((size_t)max_num_tokens * num_q_heads * head_size * sizeof(T), alignment);
-    attn_path_peak += align_up((size_t)max_num_tokens * num_kv_heads * head_size * sizeof(T), alignment);
-    attn_path_peak += align_up((size_t)max_num_tokens * num_kv_heads * head_size * sizeof(T), alignment);
+    // --- Peak memory within a decoder layer ---
+    size_t decoder_layer_peak = 0;
+    {
+        // Buffers allocated in L4maDecoderLayer::forward
+        size_t decoder_wrapper_bytes = 2 * align_up((size_t)max_num_tokens * hidden_size * sizeof(T), alignment);
 
-    size_t mlp_path_peak = 0;
-    mlp_path_peak += align_up((size_t)max_num_tokens * hidden_size * sizeof(T), alignment);
-    mlp_path_peak += align_up((size_t)max_num_tokens * hidden_size * sizeof(T), alignment);
-    mlp_path_peak += align_up((size_t)max_num_tokens * intermediate_size * sizeof(T), alignment);
-    mlp_path_peak += align_up((size_t)max_num_tokens * intermediate_size * sizeof(T), alignment);
+        // Path 1: Attention block peak
+        size_t attn_path_peak = 0;
+        attn_path_peak += align_up((size_t)max_num_tokens * num_q_heads * head_size * sizeof(T), alignment); // q_proj
+        attn_path_peak += align_up((size_t)max_num_tokens * num_kv_heads * head_size * sizeof(T), alignment); // k_proj
+        attn_path_peak += align_up((size_t)max_num_tokens * num_kv_heads * head_size * sizeof(T), alignment); // v_proj
+        attn_path_peak += align_up(32 * 1024 * 1024, alignment); // cublas_workspace
 
-    size_t other_buffers = 0;
-    other_buffers += align_up((size_t)max_num_tokens * hidden_size * sizeof(T), alignment);
-    other_buffers += align_up((size_t)max_num_tokens * hidden_size * sizeof(T), alignment);
-    other_buffers += align_up(256 * 1024 * 1024, alignment);
-    other_buffers += align_up(8 * 1024 * 1024, alignment);
-    other_buffers += align_up(32 * 1024 * 1024, alignment);
+        // Path 2: MLP block peak
+        size_t mlp_path_peak = 0;
+        mlp_path_peak += align_up((size_t)max_num_tokens * intermediate_size * sizeof(T), alignment); // up_proj
+        mlp_path_peak += align_up((size_t)max_num_tokens * intermediate_size * sizeof(T), alignment); // gate_proj
+        mlp_path_peak += align_up(32 * 1024 * 1024, alignment); // cublas_workspace
 
-    total_bytes = other_buffers + std::max(attn_path_peak, mlp_path_peak);
+        decoder_layer_peak = decoder_wrapper_bytes + std::max(attn_path_peak, mlp_path_peak);
+    }
+
+    // --- Peak memory for the final LM head and sampling ---
+    size_t final_stage_peak = 0;
+    {
+        final_stage_peak += align_up((size_t)max_num_tokens * hidden_size * sizeof(T), alignment);                      // hidden_states
+        final_stage_peak += align_up((size_t)max_num_tokens * config.vocab_size * sizeof(T), alignment);                // output_logits
+        final_stage_peak += align_up((size_t)max_num_tokens * config.vocab_size * sizeof(float), alignment);             // output_logits_fp32
+        final_stage_peak += align_up((size_t)max_num_tokens * config.vocab_size * sizeof(float), alignment);             // output_logits_masked
+        final_stage_peak += align_up((size_t)max_num_tokens * dist_size * sizeof(float), alignment);                     // final_logits_val
+        final_stage_peak += align_up((size_t)max_num_tokens * dist_size * sizeof(int32_t), alignment);                   // final_logits_indices
+        final_stage_peak += align_up(32 * 1024 * 1024, alignment);                                                      // lm_head_workspace
+        final_stage_peak += align_up((size_t)max_num_tokens * hidden_size * sizeof(T), alignment);                      // gathered_states (worst case)
+    }
+
+    // --- Other persistent buffers ---
+    size_t persistent_buffers = 0;
+    // Memory for FlashInfer handlers
+    persistent_buffers += align_up(256 * 1024 * 1024, alignment);
+    persistent_buffers += align_up(8 * 1024 * 1024, alignment);
+    // Working buffer in L4maModel::forward
+    persistent_buffers += align_up((size_t)max_num_tokens * hidden_size * sizeof(T), alignment);
+
+    // Total size is the max of the two main stages, plus persistent metadata/handler buffers.
+    size_t total_bytes = persistent_buffers + std::max(decoder_layer_peak, final_stage_peak);
 
     // Part 2: Index and Metadata Vectors
     total_bytes += align_up(max_num_tokens * sizeof(uint32_t), alignment);
@@ -211,7 +234,7 @@ size_t L4maBuffer<T>::get_workspace_size(
 template <typename T>
 void L4maBuffer<T>::plan(
     cudaStream_t strm,
-     std::vector<uint32_t>& input_ids_host,
+     std::vector<int32_t>& input_ids_host,
      std::vector<int32_t>& position_ids_host,
      std::vector<int32_t>& kv_page_indices_host,
      std::vector<int32_t>& kv_page_indptr_host,
@@ -220,7 +243,8 @@ void L4maBuffer<T>::plan(
      std::vector<bool>& custom_masks_host,
      std::vector<int32_t>& mask_indptr_host,
      std::vector<int32_t>& kv_batch_indices_host,
-     std::vector<int32_t>& kv_positions_host
+     std::vector<int32_t>& kv_positions_host,
+     std::vector<int32_t>& output_indices_src_host
 ) {
     this->stream = strm;
     this->num_tokens = input_ids_host.size();
@@ -230,47 +254,23 @@ void L4maBuffer<T>::plan(
 
     allocator_->reset();
 
-    input_ids         = allocator_->allocate_and_copy_async<uint32_t>(input_ids_host, stream);
-    position_ids      = allocator_->allocate_and_copy_async<int32_t>(position_ids_host, stream);
-    kv_page_indices   = allocator_->allocate_and_copy_async<int32_t>(kv_page_indices_host, stream);
-    kv_page_indptr    = allocator_->allocate_and_copy_async<int32_t>(kv_page_indptr_host, stream);
-    kv_last_page_lens = allocator_->allocate_and_copy_async<int32_t>(kv_last_page_lens_host, stream);
-    qo_indptr         = allocator_->allocate_and_copy_async<int32_t>(qo_indptr_host, stream);
-    custom_mask       = allocator_->allocate_and_copy_async<uint8_t>(packed_custom_mask_host, stream);
-    mask_indptr       = allocator_->allocate_and_copy_async<int32_t>(mask_indptr_host, stream);
-    kv_batch_indices  = allocator_->allocate_and_copy_async<int32_t>(kv_batch_indices_host, stream);
-    kv_positions      = allocator_->allocate_and_copy_async<int32_t>(kv_positions_host, stream);
+    input_ids          = allocator_->allocate_and_copy_async<int32_t>(input_ids_host, stream);
+    position_ids       = allocator_->allocate_and_copy_async<int32_t>(position_ids_host, stream);
+    kv_page_indices    = allocator_->allocate_and_copy_async<int32_t>(kv_page_indices_host, stream);
+    kv_page_indptr     = allocator_->allocate_and_copy_async<int32_t>(kv_page_indptr_host, stream);
+    kv_last_page_lens  = allocator_->allocate_and_copy_async<int32_t>(kv_last_page_lens_host, stream);
+    qo_indptr          = allocator_->allocate_and_copy_async<int32_t>(qo_indptr_host, stream);
+    custom_mask        = allocator_->allocate_and_copy_async<uint8_t>(packed_custom_mask_host, stream);
+    mask_indptr        = allocator_->allocate_and_copy_async<int32_t>(mask_indptr_host, stream);
+    kv_batch_indices   = allocator_->allocate_and_copy_async<int32_t>(kv_batch_indices_host, stream);
+    kv_positions       = allocator_->allocate_and_copy_async<int32_t>(kv_positions_host, stream);
+
+    if (!output_indices_src_host.empty()) {
+        output_indices_src = allocator_->allocate_and_copy_async<int32_t>(output_indices_src_host, stream);
+    }
 
     Tensor<uint8_t> flashinfer_float_buffer = this->allocate<uint8_t>(256 * 1024 * 1024);
     Tensor<uint8_t> flashinfer_int_buffer = this->allocate<uint8_t>(8 * 1024 * 1024);
-
-    // //prefill_handler = flashinfer::BatchPrefillHandler();
-
-
-    // // print out qo_indptr_host
-    // std::cout << "qo_indptr_host: ";
-    // for (const auto& val : qo_indptr_host) {
-    //     std::cout << val << " ";
-    // }
-    // std::cout << std::endl;
-
-    // // print out kv_page_indptr_host
-    // std::cout << "kv_page_indptr_host: ";
-    // for (const auto& val : kv_page_indptr_host) {
-    //     std::cout << val << " ";
-    // }
-    // std::cout << std::endl;
-
-    // // print config num_query_heads
-    // std::cout << "num_tokens: " << num_tokens << std::endl;
-    // std::cout << "batch_size: " << batch_size << std::endl;
-    // std::cout << "config.num_query_heads: " << config.num_query_heads << std::endl;
-    // std::cout << "config.num_key_value_heads: " << config.num_key_value_heads << std::endl;
-    // std::cout << "config.head_size: " << config.head_size << std::endl;
-
-    // std::cout << "kv_page_size: " << page_size << std::endl;
-    // // Plan the prefill operation
-
 
     prefill_handler.Plan<T, int32_t>(
         flashinfer_float_buffer.data(), flashinfer_float_buffer.size(),
@@ -370,57 +370,6 @@ void L4maForCausalLM<T>::create_kv_device_vectors(int max_kv_num) {
         kv_cache_v_.resize(kv_cache_size);
     }
 }
-
-// template <typename T>
-// size_t L4maForCausalLM<T>::get_workspace_size(int max_num_tokens) const {
-//     const size_t alignment = 256;
-//     const size_t hidden_size = config_.hidden_size;
-//     const size_t intermediate_size = config_.intermediate_size;
-//     const size_t num_q_heads = config_.num_query_heads;
-//     const size_t num_kv_heads = config_.num_key_value_heads;
-//     const size_t head_size = config_.head_size;
-
-//     size_t peak_bytes = 0;
-
-//     // --- Trace allocations in L4maForCausalLM::forward ---
-//     size_t offset0 = 0;
-//     size_t hidden_states_offset = align_up(offset0, alignment) + (size_t)max_num_tokens * hidden_size * sizeof(T);
-//     size_t flash_float_offset = align_up(hidden_states_offset, alignment) + 256 * 1024 * 1024;
-//     size_t flash_int_offset = align_up(flash_float_offset, alignment) + 8 * 1024 * 1024;
-
-//     // --- Trace into L4maModel::forward ---
-//     size_t model_working_hidden_offset = align_up(flash_int_offset, alignment) + (size_t)max_num_tokens * hidden_size * sizeof(T);
-
-//     // --- Trace into L4maDecoderLayer::forward ---
-//     // The decoder layer reuses space, so we find the peak within one layer invocation.
-    
-//     // Path 1: Attention block
-//     size_t attn_norm_offset = align_up(model_working_hidden_offset, alignment) + (size_t)max_num_tokens * hidden_size * sizeof(T);
-//     size_t attn_out_offset = align_up(attn_norm_offset, alignment) + (size_t)max_num_tokens * hidden_size * sizeof(T);
-//     // After attention, these two buffers are deallocated, rewinding the offset to model_working_hidden_offset.
-//     // Now trace the allocations *inside* the attention block forward call.
-//     size_t q_proj_offset = align_up(attn_out_offset, alignment) + (size_t)max_num_tokens * num_q_heads * head_size * sizeof(T);
-//     size_t k_proj_offset = align_up(q_proj_offset, alignment) + (size_t)max_num_tokens * num_kv_heads * head_size * sizeof(T);
-//     size_t v_proj_offset = align_up(k_proj_offset, alignment) + (size_t)max_num_tokens * num_kv_heads * head_size * sizeof(T);
-//     size_t attn_peak = v_proj_offset; // Does not include cublas workspace, as allocate_rest() is used.
-
-//     // Path 2: MLP block (starts from the same point)
-//     size_t mlp_norm_offset = align_up(model_working_hidden_offset, alignment) + (size_t)max_num_tokens * hidden_size * sizeof(T);
-//     size_t mlp_out_offset = align_up(mlp_norm_offset, alignment) + (size_t)max_num_tokens * hidden_size * sizeof(T);
-//     // Trace inside MLP forward call
-//     size_t gate_proj_offset = align_up(mlp_out_offset, alignment) + (size_t)max_num_tokens * intermediate_size * sizeof(T);
-//     size_t up_proj_offset = align_up(gate_proj_offset, alignment) + (size_t)max_num_tokens * intermediate_size * sizeof(T);
-//     size_t mlp_peak = up_proj_offset;
-
-//     // The peak usage is the highest offset reached during the entire forward pass.
-//     peak_bytes = std::max(attn_peak, mlp_peak);
-
-//     // Finally, account for the lm_head GEMM, which uses allocate_rest(). To be safe,
-//     // we add a fixed large buffer for any `allocate_rest` calls.
-//     const size_t rest_buffer = 32 * 1024 * 1024; // 32MB buffer for all cublas workspaces (https://docs.nvidia.com/cuda/cublas/#cublassetworkspace)
-    
-//     return peak_bytes + rest_buffer;
-// }
 
 
 // --- get_parameters() Implementations (Corrected) ---
@@ -679,21 +628,8 @@ void L4maDecoderLayer<T>::forward(
     PerformanceLogger& logger,
     L4maBuffer<T>& buffer,
     T* hidden_states,
-    //thrust::device_vector<int32_t>& position_ids,
     T* kv_cache_k,
     T* kv_cache_v
-    // thrust::device_vector<int32_t>& kv_page_indices,
-    // thrust::device_vector<int32_t>& kv_page_indptr,
-    // thrust::device_vector<int32_t>& kv_last_page_lens,
-    // thrust::device_vector<int32_t>& qo_indptr,
-    // thrust::device_vector<uint8_t>& custom_mask,
-    // thrust::device_vector<int32_t>& mask_indptr,
-    // cublasLtHandle_t ltHandle,
-    // cudaStream_t stream,
-    // flashinfer::BatchPrefillHandler& prefill_handler,
-    // const int32_t page_size,
-    // thrust::device_vector<int32_t>& kv_batch_indices,
-    // thrust::device_vector<int32_t>& kv_positions
 ) {
     const int num_tokens = buffer.num_tokens;
     const size_t hidden_size_elements = (size_t)num_tokens * config_.hidden_size;
@@ -759,7 +695,7 @@ void L4maModel<T>::forward(
     // Allocate a working buffer for the layers. The layers will operate in-place on this buffer.
     Tensor<T> working_hidden_buffer = buffer.template allocate<T>(hidden_size_elements);
 
-    embed<T>(
+    embed<T, int32_t>(
         embed_tokens_weight_.data(),
         embed_tokens_weight_.size() / config_.hidden_size,
         buffer.input_ids.data(),
@@ -815,42 +751,133 @@ void L4maModel<T>::forward(
 }
 
 template <typename T>
-void L4maForCausalLM<T>::forward(
+std::pair<std::vector<float>, std::vector<int32_t>> L4maForCausalLM<T>::forward(
     PerformanceLogger& logger,
-    L4maBuffer<T>& buffer,
-    Tensor<T>& output) {
-    
+    L4maBuffer<T>& buffer) {
+
     const int num_tokens = buffer.num_tokens;
+    const int num_output_tokens = buffer.output_indices_src.size();
+    const int dist_size = buffer.dist_size;
     const size_t hidden_elements = (size_t)num_tokens * config_.hidden_size;
+    const size_t output_elements = (size_t)num_output_tokens * config_.hidden_size;
     const size_t lm_head_workspace_bytes = 32 * 1024 * 1024;
 
+    // 1. Allocate all necessary temporary buffers from the stack allocator.
     Tensor<T> hidden_states = buffer.template allocate<T>(hidden_elements);
 
+    // 2. Run the main model layers to produce hidden states.
     model_.forward(
         logger,
-        buffer, // Pass the allocator down to the model.
+        buffer,
         hidden_states.data(),
         kv_cache_k_,
         kv_cache_v_
     );
+    logger.record("model.forward", buffer.stream);
 
+
+    if (num_output_tokens == 0) {
+        // If there are no output tokens, we can return empty vectors.
+        return std::make_pair(std::vector<float>(), std::vector<int32_t>());
+    }
+
+
+    Tensor<T> output_logits = buffer.template allocate<T>(num_output_tokens * config_.vocab_size);
+    Tensor<float> output_logits_fp32 = buffer.template allocate<float>(num_output_tokens * config_.vocab_size);
+    Tensor<float> output_logits_masked = buffer.template allocate<float>(num_output_tokens * config_.vocab_size);
+    Tensor<float> final_logits_val = buffer.template allocate<float>(num_output_tokens * dist_size);
+    Tensor<int32_t> final_logits_indices = buffer.template allocate<int32_t>(num_output_tokens * dist_size);
     Tensor<uint8_t> lm_head_workspace = buffer.template allocate<uint8_t>(lm_head_workspace_bytes);
-    
+
+
+
+    // 3. Handle the hidden states for the final projection.
+    Tensor<T>* final_hidden_states_ptr = &hidden_states;
+    Tensor<T> gathered_states;
+    bool needs_gather = (hidden_elements != output_elements);
+
+    if (needs_gather) {
+        // NOTE: gathered_states is allocated last, so it must be deallocated first.
+        gathered_states = buffer.template allocate<T>(output_elements);
+        embed<T, int32_t>(
+            hidden_states.data(),
+            num_tokens,
+            buffer.output_indices_src.data(),
+            num_output_tokens,
+            gathered_states.data(),
+            config_.hidden_size,
+            buffer.stream
+        );
+        final_hidden_states_ptr = &gathered_states;
+        logger.record("model.gather_hidden_states", buffer.stream);
+
+    }
+
+    // 4. Compute logits
     gemm_cublasLt<T>(
         buffer.ltHandle, buffer.stream,
-        hidden_states.data(),
+        final_hidden_states_ptr->data(),
         model_.get_embed_tokens_weight().data(),
         nullptr,
-        output.data(),
-        num_tokens, config_.vocab_size, config_.hidden_size,
+        output_logits.data(),
+        num_output_tokens,
+        config_.vocab_size, config_.hidden_size,
         lm_head_workspace.data(), lm_head_workspace_bytes, false, true
     );
     logger.record("model.lm_head", buffer.stream);
+
+    cast_type<T, float>(
+        output_logits.data(),
+        output_logits_fp32.data(),
+        num_output_tokens * config_.vocab_size,
+        buffer.stream
+    );
+    logger.record("model.casting", buffer.stream);
+
+    // 5. Perform sampling
+    flashinfer::sampling::TopKMaskLogits<float, int32_t>(
+        output_logits_fp32.data(),
+        output_logits_masked.data(),
+        nullptr,
+        num_output_tokens,
+        dist_size,
+        config_.vocab_size,
+        buffer.stream
+    );
+    logger.record("model.topkmask", buffer.stream);
+
+    extract_k_values<float>(
+        output_logits_masked.data(),
+        final_logits_val.data(),
+        final_logits_indices.data(),
+        num_output_tokens,
+        config_.vocab_size,
+        dist_size,
+        buffer.stream
+    );
+    logger.record("model.extract", buffer.stream);
+
+    // 6. Copy final results back to the host.
+    std::vector<float> final_logits_val_host = final_logits_val.to_vector();
+    std::vector<int32_t> final_logits_indices_host = final_logits_indices.to_vector();
     
-    // Deallocations will happen automatically as the allocator goes out of scope.
-    // However, to be explicit and use the implemented checks:
+    // 7. DEALLOCATE ALL BUFFERS IN REVERSE ORDER (LIFO)
+
+
+    if (needs_gather) {
+        buffer.deallocate(gathered_states);
+    }
+
     buffer.deallocate(lm_head_workspace);
+    buffer.deallocate(final_logits_indices);
+    buffer.deallocate(final_logits_val);
+    buffer.deallocate(output_logits_masked);
+    buffer.deallocate(output_logits_fp32); // Deallocate the fp32 version
+    buffer.deallocate(output_logits);
     buffer.deallocate(hidden_states);
+
+    // 8. Return the results.
+    return std::make_pair(final_logits_val_host, final_logits_indices_host);
 }
 
 // --- Explicit Template Instantiations (Unchanged) ---
