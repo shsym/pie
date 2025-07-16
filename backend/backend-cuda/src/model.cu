@@ -43,8 +43,11 @@ struct Dist {
 
 // The actual implementation of the Server is hidden in this struct.
 struct Model::ModelImpl {
+
     std::unique_ptr<L4maForCausalLM<__nv_bfloat16>> model;
     std::unique_ptr<L4maBuffer<__nv_bfloat16>> buffer;
+    std::unique_ptr<L4maKVCache<__nv_bfloat16>> kv_cache;
+    
 
     // --- State Management ---
     std::map<uint32_t, Block> blocks;
@@ -162,10 +165,8 @@ void Model::ModelImpl::handle_embed_text(const std::vector<Model::EmbedTextComma
 
 void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockCommand>& commands) {
 
-    std::cout << "  [ModelImpl] handle_fill_block called with " << commands.size() << " items." << std::endl;
-    auto start_time = std::chrono::high_resolution_clock::now();
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    Profiler profiler(false);
+    ProfileScope scope = profiler.scope("fill", stream);
 
     // --- Host-side vector preparations ---
     std::vector<int32_t> kv_page_indices_host;
@@ -188,7 +189,6 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     std::vector<OutputEmbedPostproc> output_embed_postproc;
 
 
-
     int batch_idx = 0;
     for (const auto& cmd : commands) {
         kv_page_indices_host.insert(kv_page_indices_host.end(), cmd.context_block_ids.begin(), cmd.context_block_ids.end());
@@ -199,7 +199,7 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         qo_indptr_host.push_back(qo_indptr_host.back() + num_new_tokens);
 
         size_t total_ctx_tokens = (cmd.context_block_ids.empty()) ? 0 :
-                                  kv_page_size * (cmd.context_block_ids.size() - 1) + cmd.last_block_len;
+                                kv_page_size * (cmd.context_block_ids.size() - 1) + cmd.last_block_len;
 
         mask_indptr_host.push_back(mask_indptr_host.back() + (num_new_tokens * total_ctx_tokens));
 
@@ -285,11 +285,8 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         batch_idx++;
     }
 
-    // print time taken for processing commands
-    end_time = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-    std::cout << "  [ModelImpl] index calculation took " << duration << " microseconds." << std::endl;
-    start_time = std::chrono::high_resolution_clock::now();
+    scope.record("preproc");
+    
 
     // // print all host vectors for debugging
     // std::cout << "kv_page_indices_host: ";
@@ -344,30 +341,11 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         qo_indptr_host, custom_masks_host, mask_indptr_host,
         kv_batch_indices_host, kv_positions_host, output_indices_src_host
     );
-
-
-    LoggingManager manager(true);
-    auto model_logger = manager.scope("model_run", stream);
-
-
-    end_time = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-    std::cout << "  [ModelImpl] indices gpu upload completed in " << duration << " microseconds." << std::endl;   
-    start_time = std::chrono::high_resolution_clock::now();
+    scope.record("plan_buffer");
 
     auto [logits_vals, logits_indices] = model->forward(
-        model_logger,
-        *buffer);
-
-    manager.print_report();
-    // measure the end time
-    cudaStreamSynchronize(stream);
-    
-    // print the time taken for the entire operation
-    end_time = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-    std::cout << "  [ModelImpl] forward pass completed in " << duration << " microseconds." << std::endl;    
-    start_time = std::chrono::high_resolution_clock::now();
+        scope.scope("forward_pass"),
+        *buffer, *kv_cache);
 
     // Store the top-k distributions in the map
     for (size_t i = 0; i < output_embed_postproc.size(); ++i) {
@@ -378,12 +356,6 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
         // We must use an index `i` from 0 to N-1, where N is the number of requested distributions.
         size_t src_output_row_idx = i;
         size_t src_offset = src_output_row_idx * dist_size;
-
-        // Safety check to prevent reading out of bounds
-        if (src_offset + dist_size > logits_vals.size()) {
-             std::cerr << "Error: Logits vector is smaller than expected for distribution ID " << dest_embed_id << std::endl;
-             continue;
-        }
 
         // Create a new distribution object or get the existing one
         Dist& dist = dists[dest_embed_id];
@@ -403,6 +375,10 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
             dist.token_ids.begin()
         );
     }
+    scope.record("postproc");
+
+    cudaStreamSynchronize(stream);
+    profiler.print_report();
 
 }
 
@@ -494,21 +470,32 @@ Model::Model(const AppConfig& config,const ModelMetadata& out_metadata)
     std::cout << "Model loaded successfully and is resident on the GPU." << std::endl;
 
     // Initialize the L4maBuffer with the model's configuration
-    size_t workspace_size = L4maBuffer<__nv_bfloat16>::get_workspace_size(
+    size_t buffer_workspace_size = L4maBuffer<__nv_bfloat16>::get_workspace_size(
         pimpl->model->get_config(), 
         4096, // number of new tokens
         4096, // batch size
         4096, // number of old tokens
         config.dist_size
     );
-    pimpl->buffer = std::make_unique<L4maBuffer<__nv_bfloat16>>(pimpl->model->get_config(), config.kv_page_size, config.dist_size, workspace_size);
 
+    size_t kv_cache_workspace_size = L4maKVCache<__nv_bfloat16>::get_workspace_size(
+        pimpl->model->get_config(), 
+        config.max_num_kv_pages, 
+        config.kv_page_size
+    );
+
+    // print out the workspace sizes (in MB) 
+    std::cout << "Buffer workspace size: " << (buffer_workspace_size / (1024 * 1024)) << " MB" << std::endl;
+    std::cout << "KV Cache workspace size: " << (kv_cache_workspace_size / (1024 * 1024)) << " MB" << std::endl;
+
+    pimpl->buffer = std::make_unique<L4maBuffer<__nv_bfloat16>>(pimpl->model->get_config(), config.kv_page_size, config.dist_size, buffer_workspace_size);
+    pimpl->kv_cache = std::make_unique<L4maKVCache<__nv_bfloat16>>(pimpl->model->get_config(), config.max_num_kv_pages, config.kv_page_size);
     // Initialize the CUDA stream
     cudaStreamCreate(&pimpl->stream);
 
 
     // initialize kv cache
-    pimpl->model->create_kv_device_vectors(config.max_num_kv_pages * config.kv_page_size);
+    //pimpl->model->create_kv_device_vectors(config.max_num_kv_pages * config.kv_page_size);
 
     // Initialize state
     pimpl->kv_page_size = config.kv_page_size;
