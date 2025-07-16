@@ -5,8 +5,6 @@
 #include <string>
 #include <vector>
 
-#include <thrust/device_vector.h>
-
 #include "config.hpp"
 #include "tensor.hpp"
 #include "profiler.hpp"

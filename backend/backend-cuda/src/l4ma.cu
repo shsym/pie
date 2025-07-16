@@ -18,8 +18,6 @@
 #include "flashinfer_ops.cuh"
 
 
-
-
 // --- Helper CUDA Kernels (Unchanged) ---
 template <typename T>
 __global__ void add_residual_kernel(T* x, const T* residual, int n) {
@@ -28,7 +26,6 @@ __global__ void add_residual_kernel(T* x, const T* residual, int n) {
         x[idx] = x[idx] + residual[idx];
     }
 }
-
 
 __device__ __forceinline__ float silu(const float &val) {
     return val / (1.0f + __expf(-val));
