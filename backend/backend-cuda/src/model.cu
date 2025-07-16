@@ -12,8 +12,7 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <map>
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
+
 
 
 // --- Internal data structures ---
