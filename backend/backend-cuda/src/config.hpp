@@ -56,7 +56,6 @@ struct AppConfig {
 
     // Model & Cache
     std::string model_name;
-    std::string version = "";
     std::filesystem::path cache_dir;
 
     // Engine Parameters
@@ -76,7 +75,6 @@ struct AppConfig {
 struct ModelMetadata {
     std::string name;
     std::string description;
-    std::string version;
     std::vector<std::string> parameters;
     L4maConfig architecture;
     TokenizerInfo tokenizer;
@@ -203,7 +201,6 @@ inline std::ostream& operator<<(std::ostream& os, const AppConfig& config) {
 
     os << indent << "  Model & Cache:\n"
        << indent << "    Model Name: " << config.model_name << "\n"
-       << indent << "    Version: " << config.version << "\n"
        << indent << "    Cache Dir: " << config.cache_dir.string() << "\n"
 
        << indent << "  Engine Parameters:\n"
@@ -228,7 +225,6 @@ inline std::ostream& operator<<(std::ostream& os, const ModelMetadata& metadata)
        << "=================================================\n"
        << "Name: " << metadata.name << "\n"
        << "Description: " << metadata.description << "\n"
-       << "Version: " << metadata.version << "\n"
        << "Template Type: " << metadata.template_type << "\n"
        << "Template Content: \"" << metadata.template_content << "\"\n\n";
 

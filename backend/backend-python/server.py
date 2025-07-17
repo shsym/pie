@@ -74,7 +74,6 @@ def main(config: str = None,
         'controller_port': controller_port if controller_port != 9123 else config_from_file.get('controller_port', 9123),
         'auth_token': auth_token if auth_token is not None else config_from_file.get('auth_token'),
         'model': model if model is not None else config_from_file.get('model'),
-        'version': version if version is not None else config_from_file.get('version', ""),
         'kv_page_size': kv_page_size if kv_page_size != 32 else config_from_file.get('kv_page_size', 32),
         'dist_size': dist_size if dist_size != 32 else config_from_file.get('dist_size', 32),
         'max_num_kv_pages': max_num_kv_pages if max_num_kv_pages != 1000 else config_from_file.get('max_num_kv_pages', 1000),
@@ -111,8 +110,8 @@ def load_model(config: dict):
     cache_dir = config.get('cache_dir')
 
     # Define the path to the model directory and metadata file
-    model_path = os.path.join(cache_dir, model_name)
-    metadata_path = os.path.join(model_path, f"{model_name}-{config.get('version', '')}.toml")
+    model_path = os.path.join(cache_dir, "models")
+    metadata_path = os.path.join(model_path, f"{model_name}.toml")
 
     # Read the metadata file
     if not os.path.exists(metadata_path):
@@ -134,7 +133,7 @@ def load_model(config: dict):
     try:
         # Iterate over all parameter files listed in the metadata
         for param_file in metadata.parameters:
-            weights_path = os.path.join(model_path, param_file)
+            weights_path = os.path.join(model_path, model_name, param_file)
             if not os.path.exists(weights_path):
                 print(f"Warning: A specified weights file was not found: {weights_path}. Skipping.")
                 continue

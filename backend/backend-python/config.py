@@ -102,8 +102,9 @@ def parse_model_metadata(path: str) -> ModelMetadata:
     # --- Parse Tokenizer ---
     tokenizer_data = get_required_key(data, 'tokenizer', 'top-level')
     vocabulary_file = get_required_key(tokenizer_data, 'vocabulary_file', 'tokenizer')
-
-    vocabulary_full_path = os.path.join(metadata_dir, vocabulary_file)
+    model_name = get_required_key(data, 'name', 'top-level')
+    
+    vocabulary_full_path = os.path.join(metadata_dir, model_name, vocabulary_file)
 
     try:
         merge_rules = load_merge_rules(vocabulary_full_path)

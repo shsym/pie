@@ -85,7 +85,6 @@ ModelMetadata parse_model_metadata(const std::filesystem::path& metadata_path) {
     // --- Parse top-level keys ---
     metadata.name = get_required(tbl, "name", "top-level").value_or("");
     metadata.description = get_required(tbl, "description", "top-level").value_or("");
-    metadata.version = get_required(tbl, "version", "top-level").value_or("");
 
     if (auto params_node = get_required(tbl, "parameters", "top-level").as_array()) {
         for (const auto& elem : *params_node) {
@@ -117,7 +116,7 @@ ModelMetadata parse_model_metadata(const std::filesystem::path& metadata_path) {
     // --- Parse Tokenizer ---
     auto tokenizer_data = get_required(tbl, "tokenizer", "top-level").as_table();
     std::string vocab_file = get_required(*tokenizer_data, "vocabulary_file", "tokenizer").value_or("");
-    auto vocab_full_path = metadata_dir / vocab_file;
+    auto vocab_full_path = metadata_dir / metadata.name / vocab_file;
     
     metadata.tokenizer.type = get_required(*tokenizer_data, "type", "tokenizer").value_or("");
     metadata.tokenizer.split_regex = get_required(*tokenizer_data, "split_regex", "tokenizer").value_or("");
@@ -370,7 +369,6 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     l4m::Response response;
                     response.set_correlation_id(request.correlation_id());
                     auto* info = response.mutable_get_info();
-                    info->set_version(metadata.version);
                     info->set_model_name(metadata.name);
                     info->set_kv_page_size(config.kv_page_size);
                     info->set_num_available_kv_pages(config.max_num_kv_pages);
@@ -563,7 +561,6 @@ int main(int argc, char* argv[]) {
     app.add_option("--controller-port", cli_config.controller_port, "The controller port number.");
     app.add_option("--auth-token", cli_config.auth_token, "The authentication token for the controller.");
     app.add_option("--model", cli_config.model_name, "The model name (e.g., 'llama-3.2-1b-instruct').");
-    app.add_option("--version", cli_config.version, "The version of the model.");
     app.add_option("--cache-dir", cache_dir_opt, "The directory for caching models.");
     app.add_option("--kv-page-size", cli_config.kv_page_size, "The KV page size.");
     app.add_option("--dist-size", cli_config.dist_size, "The distribution size.");
@@ -599,7 +596,6 @@ int main(int argc, char* argv[]) {
         if (app.count("--auth-token") > 0) final_config.auth_token = cli_config.auth_token;
         else if (auto node = config_from_file["auth_token"]; node.is_string()) final_config.auth_token = node.as_string()->get();
 
-        final_config.version = app.count("--version") > 0 ? cli_config.version : config_from_file["version"].value_or(final_config.version);
         final_config.cache_dir = get_cache_dir(cache_dir_opt, config_from_file);
         // (Other config assignments remain the same)
 
@@ -607,7 +603,7 @@ int main(int argc, char* argv[]) {
 
         // Parse the model metadata
         // path = final_config.cache_dir / f{final_config.model_name}-{final_config.version}.toml
-        std::filesystem::path metadata_path = final_config.cache_dir / final_config.model_name / (final_config.model_name + "-" + final_config.version + ".toml");
+        std::filesystem::path metadata_path = final_config.cache_dir / "models" / (final_config.model_name + ".toml");
         if (!std::filesystem::exists(metadata_path)) {
             std::cerr << "Metadata file not found at: " << metadata_path.string() << std::endl;
             return 1;

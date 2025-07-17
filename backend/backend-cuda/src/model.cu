@@ -83,7 +83,7 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
     auto params_map = model_ptr->get_parameters();
     std::cout << "Found " << params_map.size() << " parameter tensors in the model structure." << std::endl;
 
-    const auto model_dir = config.cache_dir / config.model_name;
+    const auto model_dir = config.cache_dir / "models" / config.model_name;
     std::set<std::string> loaded_keys;
 
     for (const auto& param_file : metadata.parameters) {

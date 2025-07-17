@@ -6,8 +6,7 @@ controller_host = "localhost"          # The hostname or IP address of the contr
 controller_port = 9123                 # The port of the controller's WebSocket server.
 auth_token = "your-secret-auth-token-here" # The authentication token required by the controller.
 
-model = "llama-3.2"
-version = "1b-instruct"
+model = "llama-3.2-1b-instruct"
 
 device = "cuda:0"
 
