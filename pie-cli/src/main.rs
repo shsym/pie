@@ -3,69 +3,271 @@ use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand};
 use comfy_table::{presets::UTF8_FULL, Table};
 use daemonize::Daemonize;
-use futures_util::{stream::StreamExt, SinkExt};
+use dashmap::DashMap;
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
 use hex::ToHex;
 use indicatif::{ProgressBar, ProgressStyle};
 use jsonwebtoken::{encode, EncodingKey, Header};
 use rand::{distributions::Alphanumeric, Rng};
 use reqwest::Client;
+use rmp_serde as rmps;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     env,
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
     process::Command as StdCommand,
+    sync::{Arc, Mutex},
 };
 use sysinfo::{Pid, System};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tungstenite::protocol::Message as WsMessage;
 use url::Url;
+use uuid::Uuid;
 
 //================================================================================//
 // SECTION: WebSocket Client & Messaging
 //================================================================================//
 
-/// Messages sent from the CLI client to the engine server.
-#[derive(Debug, Serialize)]
+type CorrId = u32;
+type InstanceId = Uuid;
+
+/// Messages from client -> server
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-enum ClientMessage<'a> {
+pub enum ClientMessage {
     #[serde(rename = "authenticate")]
     Authenticate { corr_id: u32, token: String },
+
     #[serde(rename = "query")]
     Query {
         corr_id: u32,
-        subject: &'a str,
+        subject: String,
+        record: String,
     },
+
     #[serde(rename = "upload_program")]
     UploadProgram {
         corr_id: u32,
+        program_hash: String,
+        chunk_index: usize,
+        total_chunks: usize,
         #[serde(with = "serde_bytes")]
-        program_blob: &'a [u8],
+        chunk_data: Vec<u8>,
     },
-    #[serde(rename = "program_exists")]
-    ProgramExists { corr_id: u32, hash: String },
+
     #[serde(rename = "launch_instance")]
-    LaunchInstance { corr_id: u32, hash: String },
+    LaunchInstance { corr_id: u32, program_hash: String },
+
+    #[serde(rename = "launch_server_instance")]
+    LaunchServerInstance {
+        corr_id: u32,
+        port: u32,
+        program_hash: String,
+    },
+
+    #[serde(rename = "signal_instance")]
+    SignalInstance {
+        instance_id: String,
+        message: String,
+    },
+
+    #[serde(rename = "terminate_instance")]
+    TerminateInstance { instance_id: String },
+
+    #[serde(rename = "attach_remote_service")]
+    AttachRemoteService {
+        corr_id: u32,
+        endpoint: String,
+        service_type: String,
+        service_name: String,
+    },
 }
 
-/// Messages received from the engine server.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-enum ServerMessage {
+pub enum ServerMessage {
     #[serde(rename = "response")]
     Response {
         corr_id: u32,
         successful: bool,
-        result: serde_json::Value,
+        result: String,
     },
+
     #[serde(rename = "instance_event")]
     InstanceEvent {
         instance_id: String,
         event: String,
         message: String,
     },
+
+    #[serde(rename = "server_event")]
+    ServerEvent { message: String },
 }
+
+struct IdPool<T>(Mutex<VecDeque<T>>);
+impl IdPool<CorrId> {
+    fn new() -> Self {
+        Self(Mutex::new((1..=CorrId::MAX).collect()))
+    }
+    fn acquire(&self) -> Result<CorrId> {
+        self.0.lock().unwrap().pop_front().ok_or(anyhow!("Correlation ID pool exhausted"))
+    }
+    fn release(&self, id: CorrId) {
+        self.0.lock().unwrap().push_back(id);
+    }
+}
+
+/// A client for interacting with the PIE engine.
+struct EngineClient {
+    writer_tx: mpsc::UnboundedSender<WsMessage>,
+    corr_id_pool: Arc<IdPool<CorrId>>,
+    pending_requests: Arc<DashMap<CorrId, oneshot::Sender<(bool, String)>>>,
+    inst_event_listeners: Arc<DashMap<InstanceId, mpsc::UnboundedSender<(String, String)>>>,
+    _reader_handle: JoinHandle<()>,
+    _writer_handle: JoinHandle<()>,
+}
+
+impl EngineClient {
+    /// Connects to the engine and spawns background tasks for communication.
+    async fn connect(url: &str) -> Result<Self> {
+        let (ws_stream, _) = connect_async(url).await.context("Failed to connect to engine WebSocket")?;
+        let (ws_writer, ws_reader) = ws_stream.split();
+
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel();
+        let pending_requests = Arc::new(DashMap::new());
+        let inst_event_listeners = Arc::new(DashMap::new());
+        let corr_id_pool = Arc::new(IdPool::new());
+
+        let writer_handle = tokio::spawn(client_writer_task(ws_writer, writer_rx));
+        let reader_handle = tokio::spawn(client_reader_task(ws_reader, pending_requests.clone(), inst_event_listeners.clone()));
+
+        Ok(Self {
+            writer_tx,
+            corr_id_pool,
+            pending_requests,
+            inst_event_listeners,
+            _reader_handle: reader_handle,
+            _writer_handle: writer_handle,
+        })
+    }
+
+    /// Sends a message and waits for a corresponding response from the server.
+    async fn send_and_wait(&self, msg_builder: Box<dyn Fn(CorrId) -> ClientMessage + Send + 'static>) -> Result<(bool, String)> {
+        let corr_id = self.corr_id_pool.acquire()?;
+        let (tx, rx) = oneshot::channel();
+        self.pending_requests.insert(corr_id, tx);
+
+        let msg = msg_builder(corr_id);
+        let encoded = rmps::to_vec_named(&msg)?;
+        self.writer_tx.send(WsMessage::Binary(encoded))?;
+
+        let result = rx.await.context("Server did not respond to request");
+        self.corr_id_pool.release(corr_id);
+        result
+    }
+
+    async fn authenticate(&self, token: String) -> Result<()> {
+        let builder = Box::new(move |corr_id| ClientMessage::Authenticate { corr_id, token: token.clone() });
+        let (success, result) = self.send_and_wait(builder).await?;
+        if success { Ok(()) } else { Err(anyhow!("Authentication failed: {}", result)) }
+    }
+
+    async fn program_exists(&self, hash: &str) -> Result<bool> {
+        let hash_clone = hash.to_string();
+        let builder = Box::new(move |corr_id| ClientMessage::Query { corr_id, subject: "program_exists".to_string(), record: hash_clone.clone() });
+        let (success, result) = self.send_and_wait(builder).await?;
+        if success { Ok(result == "true") } else { Err(anyhow!("program_exists query failed: {}", result)) }
+    }
+
+    async fn upload_program(&self, blob: &[u8]) -> Result<()> {
+        const CHUNK_SIZE: usize = 256 * 1024;
+        let program_hash = blake3::hash(blob).to_hex().to_string();
+
+        let (tx, rx) = oneshot::channel();
+        let corr_id = self.corr_id_pool.acquire()?;
+        self.pending_requests.insert(corr_id, tx);
+
+        let total_chunks = (blob.len() as f64 / CHUNK_SIZE as f64).ceil() as usize;
+
+        for i in 0..total_chunks {
+            let start = i * CHUNK_SIZE;
+            let end = (start + CHUNK_SIZE).min(blob.len());
+            let chunk_data = blob[start..end].to_vec();
+
+            let msg = ClientMessage::UploadProgram { corr_id, program_hash: program_hash.clone(), chunk_index: i, total_chunks, chunk_data };
+            let encoded = rmps::to_vec_named(&msg)?;
+            self.writer_tx.send(WsMessage::Binary(encoded))?;
+        }
+
+        let result = rx.await.context("Server did not respond to upload completion");
+        self.corr_id_pool.release(corr_id);
+        let (success, result_str) = result?;
+        if success { Ok(()) } else { Err(anyhow!("Program upload failed: {}", result_str)) }
+    }
+
+    async fn launch_instance(&self, hash: &str) -> Result<(InstanceId, mpsc::UnboundedReceiver<(String, String)>)> {
+        let hash_clone = hash.to_string();
+        let builder = Box::new(move |corr_id| ClientMessage::LaunchInstance { corr_id, program_hash: hash_clone.clone() });
+        let (success, result) = self.send_and_wait(builder).await?;
+
+        if success {
+            let instance_id = Uuid::parse_str(&result).context("Failed to parse instance_id from server response")?;
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.inst_event_listeners.insert(instance_id, tx);
+            Ok((instance_id, rx))
+        } else {
+            Err(anyhow!("Launch instance failed: {}", result))
+        }
+    }
+}
+
+/// Background task to read messages from the server and dispatch them.
+async fn client_reader_task(mut ws_reader: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>, pending_requests: Arc<DashMap<CorrId, oneshot::Sender<(bool, String)>>>, inst_event_listeners: Arc<DashMap<InstanceId, mpsc::UnboundedSender<(String, String)>>>) {
+    while let Some(Ok(msg)) = ws_reader.next().await {
+        if let WsMessage::Binary(bin) = msg {
+            if let Ok(server_msg) = rmps::from_slice::<ServerMessage>(&bin) {
+                match server_msg {
+                    ServerMessage::Response { corr_id, successful, result } => {
+                        if let Some((_, sender)) = pending_requests.remove(&corr_id) {
+                            let _ = sender.send((successful, result));
+                        }
+                    },
+                    ServerMessage::InstanceEvent { instance_id, event, message } => {
+                        if let Ok(id) = Uuid::parse_str(&instance_id) {
+                            if let Some(sender) = inst_event_listeners.get(&id) {
+                                let _ = sender.send((event, message));
+                            }
+                        }
+                    }
+                    _ => {
+
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Background task to write messages to the server.
+async fn client_writer_task(mut ws_writer: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>, mut writer_rx: mpsc::UnboundedReceiver<WsMessage>) {
+    while let Some(msg) = writer_rx.recv().await {
+        if ws_writer.send(msg).await.is_err() {
+            break; // Connection closed
+        }
+    }
+}
+
 
 //================================================================================//
 // SECTION: Core Structs (Config & State)
@@ -317,35 +519,59 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
         }
         ModelCommands::Add(args) => {
             println!("➕ Adding model: {}", args.model_name);
-            let model_parts: Vec<&str> = args.model_name.splitn(2, '-').collect();
-            let model_group = model_parts[0];
 
-            let model_index_base = "https://raw.githubusercontent.com/pie-project/model-index/main";
-            let metadata_url = format!("{}/{}/{}.toml", model_index_base, model_group, args.model_name);
-            let vocab_url_base = format!("{}/{}/", model_index_base, model_group);
+            let models_root = get_pie_home()?.join("models");
+            let model_files_dir = models_root.join(&args.model_name);
+            let metadata_path = models_root.join(format!("{}.toml", args.model_name));
 
-            let metadata_raw = download_file_with_progress(&metadata_url, "Downloading metadata...").await?;
+            // Check if the model already exists and ask for confirmation to overwrite.
+            if metadata_path.exists() || model_files_dir.exists() {
+                print!("⚠️ Model '{}' already exists. Overwrite? [y/N] ", args.model_name);
+                std::io::stdout().flush().context("Failed to flush stdout")?;
+
+                let mut confirmation = String::new();
+                std::io::stdin().read_line(&mut confirmation).context("Failed to read user input")?;
+
+                if confirmation.trim().to_lowercase() != "y" {
+                    println!("Aborted by user.");
+                    return Ok(());
+                }
+            }
+
+            // --- Set up directories and save files with the new structure ---
+            fs::create_dir_all(&model_files_dir)?;
+
+            println!("Parameters will be stored at {:?}", model_files_dir);
+
+            let model_index_base = "https://raw.githubusercontent.com/pie-project/model-index/refs/heads/main";
+            let metadata_url = format!("{}/{}.toml", model_index_base, args.model_name);
+
+            // --- Download metadata with specific 404 error handling ---
+            let metadata_raw = match download_file_with_progress(&metadata_url, "Downloading metadata...").await {
+                Ok(data) => data,
+                Err(e) => {
+                    if let Some(req_err) = e.downcast_ref::<reqwest::Error>() {
+                        if req_err.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                            anyhow::bail!("Model '{}' not found in the official index.", args.model_name);
+                        }
+                    }
+                    return Err(e.context("Failed to download model metadata"));
+                }
+            };
+
             let metadata_str = String::from_utf8(metadata_raw)
                 .context("Failed to parse model metadata as UTF-8")?;
             let metadata: toml::Value = toml::from_str(&metadata_str)?;
 
-            let model_dir = get_pie_home()?.join("models").join(&args.model_name);
-            fs::create_dir_all(&model_dir)?;
-            fs::write(model_dir.join(format!("{}.toml", args.model_name)), &metadata_str)?;
+            // Store the .toml metadata file
+            fs::write(&metadata_path, &metadata_str)?;
 
-            if let Some(tokenizer) = metadata.get("tokenizer").and_then(|t| t.as_table()) {
-                if let Some(vocab_file) = tokenizer.get("vocabulary_file").and_then(|v| v.as_str()) {
-                    let vocab_url = format!("{}{}", vocab_url_base, vocab_file);
-                    let vocab_data = download_file_with_progress(&vocab_url, &format!("Downloading {}...", vocab_file)).await?;
-                    fs::write(model_dir.join(vocab_file), vocab_data)?;
-                }
-            }
-
+            // Download all source files listed in the metadata
             if let Some(source) = metadata.get("source").and_then(|s| s.as_table()) {
                 for (name, url_val) in source {
                     if let Some(url) = url_val.as_str() {
                         let file_data = download_file_with_progress(url, &format!("Downloading {}...", name)).await?;
-                        fs::write(model_dir.join(name), file_data)?;
+                        fs::write(model_files_dir.join(name), file_data)?;
                     }
                 }
             }
@@ -353,87 +579,68 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
         }
         ModelCommands::Remove(args) => {
             println!("🗑️ Removing model: {}", args.model_name);
-            let model_dir = get_pie_home()?.join("models").join(&args.model_name);
-            if model_dir.exists() {
-                fs::remove_dir_all(model_dir)?;
+
+            // Define the base path for all models
+            let models_root = get_pie_home()?.join("models");
+            // Path to the subdirectory containing the model's files
+            let model_files_dir = models_root.join(&args.model_name);
+            // Path to the model's metadata .toml file
+            let metadata_path = models_root.join(format!("{}.toml", args.model_name));
+
+            let mut was_removed = false;
+
+            // Attempt to remove the model's file directory if it exists
+            if model_files_dir.exists() {
+                fs::remove_dir_all(&model_files_dir)?;
+                was_removed = true;
+            }
+
+            // Attempt to remove the model's metadata file if it exists
+            if metadata_path.exists() {
+                fs::remove_file(&metadata_path)?;
+                was_removed = true;
+            }
+
+            if was_removed {
                 println!("✅ Model '{}' removed.", args.model_name);
             } else {
-                return Err(anyhow!("Model '{}' not found locally.", args.model_name));
+                // If neither the directory nor the file was found, return an error
+                anyhow::bail!("Model '{}' not found locally.", args.model_name);
             }
         }
         ModelCommands::Serve(args) => return Err(anyhow!("`model serve` is not yet implemented.")),
     }
     Ok(())
 }
-
 async fn handle_run(args: RunArgs) -> Result<()> {
     let engine_config = load_engine_config()?;
     let url = format!("ws://{}:{}", engine_config.host, engine_config.port);
-    let (ws_stream, _) = connect_async(url).await.context("Failed to connect to engine WebSocket")?;
-    let (mut write, mut read) = ws_stream.split();
+    let mut client = EngineClient::connect(&url).await?;
 
     // Authenticate
     let token = generate_jwt(&engine_config.auth_secret)?;
-    let auth_msg = ClientMessage::Authenticate { corr_id: 1, token };
-    write.send(Message::Text(serde_json::to_string(&auth_msg)?)).await?;
-
-    let auth_response = read.next().await.ok_or(anyhow!("Did not receive auth response"))??;
-    if let Message::Text(text) = auth_response {
-        let server_msg: ServerMessage = serde_json::from_str(&text)?;
-        if let ServerMessage::Response { successful, .. } = server_msg {
-            if !successful {
-                return Err(anyhow!("Authentication failed"));
-            }
-            println!("🔐 Authenticated successfully.");
-        }
-    }
+    client.authenticate(token).await?;
+    println!("🔐 Authenticated successfully.");
 
     // Check/Upload Wasm
     let wasm_blob = fs::read(&args.wasm_path_or_hash).context("Failed to read Wasm file")?;
-    let hash: String = Sha256::digest(&wasm_blob).encode_hex();
+    let hash: String = blake3::hash(&wasm_blob).to_hex().to_string();
     println!("Program hash: {}", hash);
 
-    let exists_msg = ClientMessage::ProgramExists { corr_id: 2, hash: hash.clone() };
-    write.send(Message::Text(serde_json::to_string(&exists_msg)?)).await?;
-
-    let exists_response = read.next().await.ok_or(anyhow!("No response for program_exists"))??;
-    let exists = if let Message::Text(text) = exists_response {
-        let server_msg: ServerMessage = serde_json::from_str(&text)?;
-        if let ServerMessage::Response { successful, result, .. } = server_msg {
-            successful && result.as_bool().unwrap_or(false)
-        } else { false }
-    } else { false };
-
-    if !exists {
+    if !client.program_exists(&hash).await? {
         println!("Program not found on server, uploading...");
-        let upload_msg = ClientMessage::UploadProgram { corr_id: 3, program_blob: &wasm_blob };
-        write.send(Message::Text(serde_json::to_string(&upload_msg)?)).await?;
-        let upload_response = read.next().await.ok_or(anyhow!("No response for upload"))??;
-        if let Message::Text(text) = upload_response {
-            let server_msg: ServerMessage = serde_json::from_str(&text)?;
-            if let ServerMessage::Response { successful, .. } = server_msg {
-                if !successful { return Err(anyhow!("Upload failed")); }
-                println!("✅ Upload successful.");
-            }
-        }
+        let pb = ProgressBar::new_spinner();
+        pb.set_message("Uploading program...");
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+        client.upload_program(&wasm_blob).await?;
+        pb.finish_with_message("✅ Upload successful.");
     } else {
         println!("Program already exists on server.");
     }
 
     // Launch instance
     println!("🚀 Launching instance...");
-    let launch_msg = ClientMessage::LaunchInstance { corr_id: 4, hash: hash.clone() };
-    write.send(Message::Text(serde_json::to_string(&launch_msg)?)).await?;
-
-    let launch_response = read.next().await.ok_or(anyhow!("No response for launch"))??;
-    let instance_id = if let Message::Text(text) = launch_response {
-        let server_msg: ServerMessage = serde_json::from_str(&text)?;
-        if let ServerMessage::Response { successful, result, .. } = server_msg {
-            if !successful { return Err(anyhow!("Launch failed: {}", result)); }
-            result.get("instance_id").and_then(|v| v.as_str()).map(String::from).ok_or(anyhow!("Missing instance_id"))?
-        } else { return Err(anyhow!("Unexpected launch response")); }
-    } else { return Err(anyhow!("Unexpected launch response format")); };
-
+    let (instance_id, mut event_rx) = client.launch_instance(&hash).await?;
     println!("✅ Instance launched with ID: {}", instance_id);
 
     if args.detach {
@@ -441,24 +648,12 @@ async fn handle_run(args: RunArgs) -> Result<()> {
     }
 
     println!("Attaching to instance output... (Ctrl+C to exit)");
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                let event: ServerMessage = serde_json::from_str(&text)?;
-                if let ServerMessage::InstanceEvent { event, message, .. } = event {
-                    if event == "terminated" {
-                        println!("Instance terminated. Reason: {}", message);
-                        break;
-                    } else {
-                        println!("[{}] {}", event, message);
-                    }
-                }
-            },
-            Err(e) => {
-                eprintln!("WebSocket error: {}", e);
-                break;
-            }
-            _ => {}
+    while let Some((event, message)) = event_rx.recv().await {
+        if event == "terminated" {
+            println!("Instance terminated. Reason: {}", message);
+            break;
+        } else {
+            println!("[{}] {}", event, message);
         }
     }
     Ok(())
@@ -535,9 +730,11 @@ async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>
     let total_size = res.content_length().unwrap_or(0);
 
     let pb = ProgressBar::new(total_size);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{msg} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")?
-        .progress_chars("##-"));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")?
+            .progress_chars("##-"),
+    );
     pb.set_message(message.to_string());
 
     let mut downloaded = 0;
@@ -550,7 +747,17 @@ async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>
         content.extend_from_slice(&chunk);
         pb.set_position(downloaded as u64);
     }
-    pb.finish_with_message("Downloaded.");
+
+    // Extract the filename from the URL for a more informative message
+    let file_name = url
+        .rsplit('/')
+        .next()
+        .unwrap_or("file") // Fallback for unusual URLs
+        .split('?')
+        .next()
+        .unwrap_or("file"); // Remove query parameters
+
+    pb.finish_with_message(format!("Downloaded {}", file_name));
     Ok(content)
 }
 
