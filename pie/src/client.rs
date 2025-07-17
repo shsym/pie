@@ -147,7 +147,7 @@ impl Client {
                         message,
                     } => {
                         let inst_id = Uuid::parse_str(&instance_id).unwrap();
-                        if let Some(mut sender) = inst_event_tx_.get(&inst_id) {
+                        if let Some(sender) = inst_event_tx_.get(&inst_id) {
                             let _ = sender.send((event, message)).await.ok();
                         }
                     }
@@ -271,7 +271,7 @@ impl Client {
         self.pending_requests.insert(corr_id, tx);
 
         let total_size = blob.len();
-        let total_chunks = (total_size + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES;
+        let total_chunks = total_size.div_ceil(CHUNK_SIZE_BYTES);
 
         let mut chunk_index = 0;
         while chunk_index < total_chunks {

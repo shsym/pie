@@ -2,33 +2,42 @@
 name = "pie-cli"
 version = "0.1.0"
 edition = "2024"
-
-[[bin]]
-name = "pie-cli"
-path = "src/main.rs"
-
-[lib]
-name = "pie_cli"
-path = "src/lib.rs"
+description = "Command-line interface for the PIE"
 
 [dependencies]
-clap = { version = "4.0", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
+# Core & Async
+tokio = { version = "1.38", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+futures-util = { version = "0.3", features = ["sink"] }
+
+# CLI Parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Serialization & Config
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.12", features = ["json"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1.0"
-indicatif = "0.17"
+toml = "0.8"
 
-[dev-dependencies]
-tokio-test = "0.4"
-tempfile = "3.0"
-assert_cmd = "2.0"
-predicates = "3.0"
-wiremock = "0.6"
-serial_test = "3.0"
-libc = "0.2"
+# Networking & Web
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+url = "2.5"
+
+# Utilities
+sha2 = "0.10"
+hex = "0.4"
+indicatif = "0.17"
+daemonize = "0.5"
+dirs = "5.0"
+rand = { version = "0.8", features = ["std_rng"] }
+comfy-table = "7.1"
+sysinfo = "0.30"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Authentication (JWT)
+jsonwebtoken = "9.3"
+chrono = "0.4"
