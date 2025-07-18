@@ -80,7 +80,7 @@ impl Instance {
 impl Client {
     pub async fn connect(ws_host: &str) -> Result<Client> {
         let (ws_stream, _response) = connect_async(ws_host).await?;
-        println!("[Client] Connected to {ws_host}");
+        //println!("[Client] Connected to {ws_host}");
 
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
@@ -117,7 +117,7 @@ impl Client {
                         }
                     }
                     Message::Close(_) => {
-                        println!("[Client] Server closed the connection");
+                        //println!("[Client] Server closed the connection");
                         break;
                     }
                     _ => {

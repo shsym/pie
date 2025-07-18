@@ -5,45 +5,18 @@ edition = "2024"
 description = "Command-line interface for the PIE"
 
 [dependencies]
-# Core & Async
+pie = { path = "../pie" }
 tokio = { version = "1.38", features = ["full"] }
 anyhow = "1.0"
-thiserror = "1.0"
 futures-util = { version = "0.3", features = ["sink"] }
-
-# CLI Parsing
 clap = { version = "4.5", features = ["derive"] }
-
-# Serialization & Config
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-rmp-serde = "1.3.0"
-serde_bytes = "0.11.15"
-toml = "0.8"
-
-# Networking & Web
+toml = "0.9"
 reqwest = { version = "0.12", features = ["json", "stream"] }
-tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
-url = "2.5"
-
-# Utilities
-sha2 = "0.10"
-hex = "0.4"
-indicatif = "0.17"
-daemonize = "0.5"
-dirs = "5.0"
+indicatif = "0.18"
+dirs = "6.0"
 rand = { version = "0.8", features = ["std_rng"] }
 comfy-table = "7.1"
-sysinfo = "0.30"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = "0.3"
-
-# Authentication (JWT)
-jsonwebtoken = "9.3"
-chrono = "0.4"
-blake3 = "1.8.2"
-uuid = { version = "1.17.0", features = ["v4"] }
-dashmap = "7.0.0-rc2"
-tungstenite = "0.23.0"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = "0.1.41"
+tracing-appender = "0.2"
