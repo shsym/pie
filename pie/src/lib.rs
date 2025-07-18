@@ -18,7 +18,7 @@ mod messaging;
 mod object;
 mod ping;
 mod runtime;
-mod server;
+pub mod server;
 mod tokenizer;
 mod utils;
 

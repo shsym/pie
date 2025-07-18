@@ -1,28 +1,31 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use comfy_table::{Table, presets::UTF8_FULL};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use pie::{
-    Config as EngineConfig,
     auth::{create_jwt, init_secret},
     client::{self, Client},
+    Config as EngineConfig,
 };
-use rand::{Rng, distributions::Alphanumeric};
+use rand::{distributions::Alphanumeric, Rng};
 use reqwest::Client as HttpClient;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
     env,
     fs::{self},
     io::{self, Write},
     path::PathBuf,
+    process::Stdio, // MODIFIED: Added for process spawning
 };
+// MODIFIED: Added necessary imports
 use tokio::io::{AsyncBufReadExt, BufReader, stdin as tokio_stdin};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::oneshot;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{EnvFilter, FmtSubscriber, Layer};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, FmtSubscriber, Layer};
+
 //================================================================================//
 // SECTION: CLI Command & Config Structs
 //================================================================================//
@@ -110,6 +113,9 @@ struct ConfigFile {
     cache_dir: Option<PathBuf>,
     verbose: Option<bool>,
     log: Option<PathBuf>,
+    // MODIFIED: Added field to capture backend configurations.
+    #[serde(default)]
+    backend: Vec<toml::Value>,
 }
 
 // Helper struct for what client commands need to know
@@ -129,18 +135,20 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Start(args) => {
-            // 1. Build the config first
-            let engine_config = build_engine_config(&args)?;
+            // MODIFIED: Build both engine and backend configs.
+            let (engine_config, backend_configs) = build_configs(&args)?;
 
             // 2. Initialize logging based on the config and get the file-writer guard
             let _guard = init_logging(&engine_config)?;
 
-            // 3. Start the interactive session, passing the already-built config
-            start_interactive_session(engine_config).await?;
+            // 3. Start the interactive session, passing both configs
+            start_interactive_session(engine_config, backend_configs).await?;
         }
         Commands::Model(cmd) => {
             // Model commands don't start the engine, so they can use a simple logger
-            let subscriber = FmtSubscriber::builder().with_max_level(tracing::Level::INFO).finish();
+            let subscriber = FmtSubscriber::builder()
+                .with_max_level(tracing::Level::INFO)
+                .finish();
             tracing::subscriber::set_global_default(subscriber)?;
             handle_model_command(cmd).await?;
         }
@@ -152,14 +160,17 @@ async fn main() -> Result<()> {
 //================================================================================//
 
 /// Starts the engine and drops into a client command-prompt session.
-async fn start_interactive_session(engine_config: EngineConfig) -> Result<()> {
+// MODIFIED: Accepts backend_configs and launches them.
+async fn start_interactive_session(
+    engine_config: EngineConfig,
+    backend_configs: Vec<toml::Value>,
+) -> Result<()> {
     // Config is already built and logging is already initialized.
     let client_config = ClientConfig {
         host: engine_config.host.clone(),
         port: engine_config.port,
         auth_secret: engine_config.auth_secret.clone(),
     };
-
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     println!("🚀 Starting PIE engine in background...");
@@ -168,9 +179,75 @@ async fn start_interactive_session(engine_config: EngineConfig) -> Result<()> {
             eprintln!("\n[Engine Error] Engine failed: {}", e);
         }
     });
-
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    println!("✅ Engine started. Entering interactive session. Type 'help' for commands.");
+    println!("✅ Engine started.");
+
+    // MODIFIED: Launch backend processes
+    let mut backend_processes = Vec::new();
+    if !backend_configs.is_empty() {
+        println!("🚀 Launching backend services...");
+        init_secret(&client_config.auth_secret);
+        let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
+
+        for backend_config in &backend_configs {
+            let backend_table = backend_config
+                .as_table()
+                .context("Each [[backend]] entry in config.toml must be a table.")?;
+
+            let backend_type = backend_table
+                .get("backend_type")
+                .and_then(|v| v.as_str())
+                .context("`backend_type` is missing or not a string.")?;
+
+            let exec_path = backend_table
+                .get("exec_path")
+                .and_then(|v| v.as_str())
+                .context("`exec_path` is missing or not a string.")?;
+
+            let mut cmd = if backend_type == "python" {
+                let mut cmd = TokioCommand::new("python");
+                cmd.arg(exec_path);
+                cmd
+            } else {
+                TokioCommand::new(exec_path)
+            };
+
+            // Inject required arguments
+            let random_port: u16 = rand::thread_rng().gen_range(49152..=65535);
+            cmd.arg("--host").arg("localhost");
+            cmd.arg("--port").arg(random_port.to_string());
+            cmd.arg("--controller_host").arg(&client_config.host);
+            cmd.arg("--controller_port")
+                .arg(client_config.port.to_string());
+            cmd.arg("--auth_token").arg(&auth_token);
+
+            // Add all other arguments from the config
+            for (key, value) in backend_table {
+                // Skip keys that are part of the launch command itself
+                if key == "backend_type" || key == "exec_path" {
+                    continue;
+                }
+                let arg_key = format!("--{}", key);
+                // `value.to_string()` wraps strings in quotes, so we remove them.
+                let arg_value = value.to_string().trim_matches('"').to_string();
+                cmd.arg(arg_key).arg(arg_value);
+            }
+
+            println!("- Spawning backend: {}", exec_path);
+
+            // Spawn the child process, ignoring its output
+            let child = cmd
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("Failed to spawn backend process: {}", exec_path))?;
+
+            backend_processes.push(child);
+        }
+        println!("✅ All backend services launched.");
+    }
+
+    println!("Entering interactive session. Type 'help' for commands.");
 
     let mut reader = BufReader::new(tokio_stdin());
     let mut line = String::new();
@@ -190,7 +267,6 @@ async fn start_interactive_session(engine_config: EngineConfig) -> Result<()> {
         if parts.is_empty() {
             continue;
         }
-
         // Updated loop logic to handle exit correctly
         match handle_interactive_command(parts[0], &parts[1..], &client_config).await {
             Ok(exit_signal) => {
@@ -201,10 +277,20 @@ async fn start_interactive_session(engine_config: EngineConfig) -> Result<()> {
             }
         }
     }
-
     // --- GRACEFUL SHUTDOWN ---
-    println!("Shutting down PIE engine...");
-    // Send the shutdown signal. We don't care if the receiver has already been dropped.
+    println!("Shutting down services...");
+
+    // MODIFIED: Terminate all spawned backend processes.
+    for mut child in backend_processes {
+        if let Some(pid) = child.id() {
+            println!("- Terminating backend process with PID: {}", pid);
+            if let Err(e) = child.kill().await {
+                eprintln!("  Failed to terminate process {}: {}", pid, e);
+            }
+        }
+    }
+
+    // Send the shutdown signal to the main engine.
     let _ = shutdown_tx.send(());
     // Wait for the server task to finish its cleanup.
     server_handle.await?;
@@ -230,7 +316,6 @@ async fn handle_interactive_command(
                     wasm_path = Some(PathBuf::from(arg));
                 }
             }
-
             if let Some(path) = wasm_path {
                 let run_args = RunArgs {
                     wasm_path: path,
@@ -280,7 +365,6 @@ async fn handle_run(args: RunArgs, client_config: &ClientConfig) -> Result<()> {
         }
     };
 
-    init_secret(&client_config.auth_secret);
     let token = create_jwt("default", pie::auth::Role::User)?;
     client.authenticate(&token).await?;
 
@@ -293,7 +377,6 @@ async fn handle_run(args: RunArgs, client_config: &ClientConfig) -> Result<()> {
         client.upload_program(&wasm_blob).await?;
         println!("✅ Program upload successful.");
     }
-
     println!("🚀 Launching instance...");
     let mut instance = client.launch_instance(&hash).await?;
     println!("✅ Instance launched with ID: {}", instance.id());
@@ -324,7 +407,6 @@ async fn handle_run(args: RunArgs, client_config: &ClientConfig) -> Result<()> {
             let _ = io::stdout().flush();
         });
     }
-
     Ok(())
 }
 
@@ -368,7 +450,6 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
                     return Ok(());
                 }
             }
-
             fs::create_dir_all(&model_files_dir)?;
             println!("Parameters will be stored at {:?}", model_files_dir);
 
@@ -391,7 +472,6 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
                         return Err(e.context("Failed to download model metadata"));
                     }
                 };
-
             let metadata_str = String::from_utf8(metadata_raw)
                 .context("Failed to parse model metadata as UTF-8")?;
             let metadata: toml::Value = toml::from_str(&metadata_str)?;
@@ -442,9 +522,11 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
 //================================================================================//
 
 /// Merges config from file and CLI args to create the final EngineConfig.
-fn build_engine_config(args: &StartArgs) -> Result<EngineConfig> {
-    let file_config = if let Some(path) = &args.config {
-        let content = fs::read_to_string(path)?;
+// MODIFIED: Renamed to build_configs and now returns backend configs as well.
+fn build_configs(args: &StartArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
+    let file_config: ConfigFile = if let Some(path) = &args.config {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file at {:?}", path))?;
         toml::from_str(&content)?
     } else {
         ConfigFile::default()
@@ -463,7 +545,7 @@ fn build_engine_config(args: &StartArgs) -> Result<EngineConfig> {
             .collect()
     });
 
-    Ok(EngineConfig {
+    let engine_config = EngineConfig {
         host: args
             .host
             .clone()
@@ -474,10 +556,13 @@ fn build_engine_config(args: &StartArgs) -> Result<EngineConfig> {
         auth_secret,
         cache_dir: file_config
             .cache_dir
-            .unwrap_or_else(|| get_pie_home().unwrap()),
+            .unwrap_or_else(|| get_pie_home().unwrap().join("programs")),
         verbose: args.verbose || file_config.verbose.unwrap_or(false),
         log: args.log.clone().or(file_config.log),
-    })
+    };
+
+    // Return both the engine config and the backend configs
+    Ok((engine_config, file_config.backend))
 }
 
 fn get_pie_home() -> Result<PathBuf> {
@@ -513,7 +598,6 @@ async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>
         content.extend_from_slice(&chunk);
         pb.set_position(downloaded as u64);
     }
-
     let file_name = url
         .rsplit('/')
         .next()
@@ -525,7 +609,6 @@ async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>
     pb.finish_with_message(format!("✅ Downloaded {}", file_name));
     Ok(content)
 }
-
 
 fn init_logging(config: &EngineConfig) -> Result<Option<WorkerGuard>> {
     let mut guard = None;
@@ -539,12 +622,14 @@ fn init_logging(config: &EngineConfig) -> Result<Option<WorkerGuard>> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
     };
     let console_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stdout)
+        .with_writer(io::stdout)
         .with_filter(console_filter);
 
     // File logger setup
     let file_layer = if let Some(log_path) = &config.log {
-        let parent = log_path.parent().context("Log path has no parent directory")?;
+        let parent = log_path
+            .parent()
+            .context("Log path has no parent directory")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create log directory at {:?}", parent))?;
 
@@ -557,7 +642,8 @@ fn init_logging(config: &EngineConfig) -> Result<Option<WorkerGuard>> {
         let layer = tracing_subscriber::fmt::layer()
             .with_writer(non_blocking_writer)
             .with_ansi(false) // No colors in files
-            .with_filter(EnvFilter::new("trace")); // Log everything to the file
+            .with_filter(EnvFilter::new("info")); // Log `INFO` and above to the file
+
         Some(layer)
     } else {
         None

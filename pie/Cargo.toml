@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Programmable Inference Engine (PIE)"
 license = "MIT"
-repository = "https://github.com/pie-project/pie"
+repository = "https://github.com/pie-project/pie/pie"
 
 [lib]
 
@@ -35,12 +35,9 @@ rand = "0.9.0"
 colored = "3.0"
 hyper = "1.6.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tracing-appender = "0.2"
 boxcar = "0.2.13"
 jsonwebtoken = "9.3.1"
 chrono = { version = "0.4", features = ["serde"] }
-
 
 [build-dependencies]
 prost-build = "0.14.0"
