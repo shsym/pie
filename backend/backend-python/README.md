@@ -5,6 +5,12 @@
 
 ## Installation
 
+First, build proto files:
+```bash
+./build_proto.sh
+```
+This script generates the necessary Python files from the protobuf definitions.
+
 We recommend using `uv` for installing and managing dependencies.
 Follow the [official instructions](https://docs.astral.sh/uv/getting-started/installation/) to install uv.
 
