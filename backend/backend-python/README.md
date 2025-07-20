@@ -1,3 +1,23 @@
-# Symphony PyTorch Backend
 
-This is only a proof-of-concept backend for the Symphony engine. It is not intended for production use.
+# PIE Torch Backend
+
+
+
+## Installation
+
+We recommend using `uv` for installing and managing dependencies.
+Follow the [official instructions](https://docs.astral.sh/uv/getting-started/installation/) to install uv.
+
+
+Once uv is installed, run:
+```bash
+uv sync
+```
+This will install all required and nested dependencies based on the project’s configuration.
+
+To start the backend server, run:
+
+```
+uv run server.py --config dev.toml
+```
+This command uses the specified development configuration (dev.toml).
