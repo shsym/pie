@@ -19,6 +19,8 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 indicatif = "0.18"
 dirs = "6.0"
 rand = { version = "0.8", features = ["std_rng"] }
+rustyline = "14.0"
+shellexpand = "3.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing = "0.1.41"
 tracing-appender = "0.2"

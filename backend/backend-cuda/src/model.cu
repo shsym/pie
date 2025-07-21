@@ -399,9 +399,84 @@ void Model::ModelImpl::handle_mask_block(const std::vector<Model::MaskBlockComma
 }
 
 void Model::ModelImpl::handle_copy_block(const std::vector<Model::CopyBlockCommand>& commands) {
-    //std::cout << "  [ModelImpl] handle_copy_block called with " << commands.size() << " items." << std::endl;
-    // TODO: Implement cudaMemcpy between different KV cache pages on the device.
-    // This requires getting raw pointers to the device vectors for each layer in the KV cache.
+    for (const auto& cmd : commands) {
+        // Find source and destination blocks
+        auto src_it = blocks.find(cmd.source_block_id);
+        auto dst_it = blocks.find(cmd.destination_block_id);
+        
+        if (src_it == blocks.end()) {
+            std::cerr << "Warning: Source block not found: " << cmd.source_block_id << std::endl;
+            continue;
+        }
+        
+        if (dst_it == blocks.end()) {
+            std::cerr << "Warning: Destination block not found: " << cmd.destination_block_id << std::endl;
+            continue;
+        }
+        
+        Block& src_block = src_it->second;
+        Block& dst_block = dst_it->second;
+        
+        // Validate bounds
+        if (cmd.source_start + cmd.length > src_block.occupancy.size() ||
+            cmd.destination_start + cmd.length > dst_block.occupancy.size()) {
+            std::cerr << "Warning: Copy operation out of bounds for blocks " 
+                      << cmd.source_block_id << " -> " << cmd.destination_block_id << std::endl;
+            continue;
+        }
+        
+        // Copy occupancy and position_ids (CPU-side arrays)
+        std::copy(
+            src_block.occupancy.begin() + cmd.source_start,
+            src_block.occupancy.begin() + cmd.source_start + cmd.length,
+            dst_block.occupancy.begin() + cmd.destination_start
+        );
+        
+        std::copy(
+            src_block.position_ids.begin() + cmd.source_start,
+            src_block.position_ids.begin() + cmd.source_start + cmd.length,
+            dst_block.position_ids.begin() + cmd.destination_start
+        );
+        
+        // Copy KV cache data (GPU-side) for each layer
+        size_t num_layers = model->get_config().num_layers;
+        size_t num_kv_heads = model->get_config().num_key_value_heads;
+        size_t head_size = model->get_config().head_size;
+        
+        // Calculate the number of elements per token position in the KV cache
+        size_t elements_per_token = num_kv_heads * head_size;
+        size_t bytes_per_token = elements_per_token * sizeof(__nv_bfloat16);
+        
+        for (size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+            auto [k_cache_ptr, v_cache_ptr] = kv_cache->get_layer_pointers(layer_idx);
+            
+            // Calculate source and destination offsets within the layer
+            // Each block contains kv_page_size tokens, and we need to copy a range within blocks
+            size_t src_token_offset = cmd.source_block_id * kv_page_size + cmd.source_start;
+            size_t dst_token_offset = cmd.destination_block_id * kv_page_size + cmd.destination_start;
+            
+            size_t src_element_offset = src_token_offset * elements_per_token;
+            size_t dst_element_offset = dst_token_offset * elements_per_token;
+            
+            size_t copy_size_bytes = cmd.length * bytes_per_token;
+            
+            // Copy K cache
+            cudaMemcpy(
+                k_cache_ptr + dst_element_offset,
+                k_cache_ptr + src_element_offset,
+                copy_size_bytes,
+                cudaMemcpyDeviceToDevice
+            );
+            
+            // Copy V cache
+            cudaMemcpy(
+                v_cache_ptr + dst_element_offset,
+                v_cache_ptr + src_element_offset,
+                copy_size_bytes,
+                cudaMemcpyDeviceToDevice
+            );
+        }
+    }
 }
 
 void Model::ModelImpl::handle_decode_token_distribution(const std::vector<Model::DecodeTokenDistributionCommand>& commands) {

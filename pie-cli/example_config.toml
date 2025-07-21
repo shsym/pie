@@ -7,25 +7,8 @@ verbose = true
 log = "pie.log"
 
 [[backend]]
-backend_type = "cuda"
-exec_path = "../bin/pie-backend-cuda"
-model = "llama-3.2-1b-instruct"
-device = "cuda:0"
-dtype = "bfloat16"
-kv_page_size = 32
-dist_size = 8
-max_num_kv_pages = 1000
-max_num_embeds = 50000
-#host = "localhost"
-#port = 9223        # The port to listen on -> unique random.
-#controller_host = "192.168.86.20"          # The hostname or IP address of the controller.
-#controller_port = 9123                 # The port of the controller's WebSocket server.
-#auth_token = "your-secret-auth-token-here" # The authentication token required by the controller.
-
-
-[[backend]]
 backend_type = "python"
-exec_path = "../python/main.py"
+exec_path = "../backend/backend-python/server.py"
 model = "llama-3.2-1b-instruct"
 device = "cuda:0"
 dtype = "bfloat16"
@@ -33,8 +16,3 @@ kv_page_size = 32
 dist_size = 8
 max_num_kv_pages = 1000
 max_num_embeds = 50000
-#host = "localhost"
-#port = 9223        # The port to listen on.
-#controller_host = "192.168.86.20"          # The hostname or IP address of the controller.
-#controller_port = 9123                 # The port of the controller's WebSocket server.
-#auth_token = "your-secret-auth-token-here" # The authentication token required by the controller.

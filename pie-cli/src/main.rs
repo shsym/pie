@@ -17,7 +17,16 @@ use std::{
     path::PathBuf,
     process::Stdio, // MODIFIED: Added for process spawning
 };
-// MODIFIED: Added necessary imports
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::ExternalPrinter;
+use rustyline::hint::Hinter;
+use rustyline::validate::{ValidationContext, ValidationResult, Validator};
+use rustyline::{Editor, Helper}; // The Helper trait is still needed
+use std::borrow::Cow::{self, Owned};
 use tokio::io::{AsyncBufReadExt, BufReader, stdin as tokio_stdin};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::oneshot;
@@ -159,13 +168,61 @@ async fn main() -> Result<()> {
 // SECTION: Command Handlers
 //================================================================================//
 
+// The incorrect `#[derive]` attribute has been removed.
+struct MyHelper;
+
+// To satisfy the `Helper` trait bounds, we must implement all its component traits.
+// For now, we'll provide empty implementations for the ones we don't need.
+
+impl Completer for MyHelper {
+    type Candidate = String;
+}
+
+impl Hinter for MyHelper {
+    type Hint = String;
+
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
+        None // No hints for now
+    }
+}
+
+// Your existing Highlighter implementation is correct.
+impl Highlighter for MyHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        let mut highlighted = line.to_string();
+
+        if let Some(end) = line.find(' ') {
+            let command = &line[..end];
+            let colored_command = format!("\x1b[34m{}\x1b[0m", command);
+            highlighted.replace_range(..end, &colored_command);
+        } else if !line.is_empty() {
+            let colored_command = format!("\x1b[34m{}\x1b[0m", line);
+            highlighted = colored_command;
+        }
+
+        Owned(highlighted)
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
+        true
+    }
+}
+
+impl Validator for MyHelper {
+    fn validate(&self, _ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+        Ok(ValidationResult::Valid(None)) // No validation
+    }
+}
+
+// Finally, we implement the `Helper` marker trait itself.
+impl Helper for MyHelper {}
+
 /// Starts the engine and drops into a client command-prompt session.
-// MODIFIED: Accepts backend_configs and launches them.
 async fn start_interactive_session(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
 ) -> Result<()> {
-    // Config is already built and logging is already initialized.
+    // 1. Initialize engine and client configurations
     let client_config = ClientConfig {
         host: engine_config.host.clone(),
         port: engine_config.port,
@@ -173,6 +230,7 @@ async fn start_interactive_session(
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
+    // 2. Start the main PIE engine server in a background task
     println!("🚀 Starting PIE engine in background...");
     let server_handle = tokio::spawn(async move {
         if let Err(e) = pie::run_server(engine_config, shutdown_rx).await {
@@ -182,7 +240,15 @@ async fn start_interactive_session(
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     println!("✅ Engine started.");
 
-    // MODIFIED: Launch backend processes
+    // 3. Initialize the interactive prompt with highlighting and an external printer
+    println!("Entering interactive session. Type 'help' for commands or use ↑/↓ for history.");
+    let mut rl = Editor::new()?;
+    rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
+    let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
+        Arc::new(Mutex::new(rl.create_external_printer()?));    let history_path = get_pie_home()?.join(".pie_history");
+    let _ = rl.load_history(&history_path);
+
+    // 4. Launch all configured backend services
     let mut backend_processes = Vec::new();
     if !backend_configs.is_empty() {
         println!("🚀 Launching backend services...");
@@ -190,19 +256,9 @@ async fn start_interactive_session(
         let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
 
         for backend_config in &backend_configs {
-            let backend_table = backend_config
-                .as_table()
-                .context("Each [[backend]] entry in config.toml must be a table.")?;
-
-            let backend_type = backend_table
-                .get("backend_type")
-                .and_then(|v| v.as_str())
-                .context("`backend_type` is missing or not a string.")?;
-
-            let exec_path = backend_table
-                .get("exec_path")
-                .and_then(|v| v.as_str())
-                .context("`exec_path` is missing or not a string.")?;
+            let backend_table = backend_config.as_table().context("Each [[backend]] entry in config.toml must be a table.")?;
+            let backend_type = backend_table.get("backend_type").and_then(|v| v.as_str()).context("`backend_type` is missing or not a string.")?;
+            let exec_path = backend_table.get("exec_path").and_then(|v| v.as_str()).context("`exec_path` is missing or not a string.")?;
 
             let mut cmd = if backend_type == "python" {
                 let mut cmd = TokioCommand::new("python");
@@ -212,75 +268,77 @@ async fn start_interactive_session(
                 TokioCommand::new(exec_path)
             };
 
-            // Inject required arguments
             let random_port: u16 = rand::thread_rng().gen_range(49152..=65535);
-            cmd.arg("--host").arg("localhost");
-            cmd.arg("--port").arg(random_port.to_string());
-            cmd.arg("--controller_host").arg(&client_config.host);
-            cmd.arg("--controller_port")
-                .arg(client_config.port.to_string());
-            cmd.arg("--auth_token").arg(&auth_token);
+            cmd.arg("--host").arg("localhost").arg("--port").arg(random_port.to_string()).arg("--controller_host").arg(&client_config.host).arg("--controller_port").arg(client_config.port.to_string()).arg("--auth_token").arg(&auth_token);
 
-            // Add all other arguments from the config
             for (key, value) in backend_table {
-                // Skip keys that are part of the launch command itself
-                if key == "backend_type" || key == "exec_path" {
-                    continue;
-                }
-                let arg_key = format!("--{}", key);
-                // `value.to_string()` wraps strings in quotes, so we remove them.
-                let arg_value = value.to_string().trim_matches('"').to_string();
-                cmd.arg(arg_key).arg(arg_value);
+                if key == "backend_type" || key == "exec_path" { continue; }
+                cmd.arg(format!("--{}", key)).arg(value.to_string().trim_matches('"').to_string());
             }
 
             println!("- Spawning backend: {}", exec_path);
+            let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().with_context(|| format!("Failed to spawn backend process: '{}'", exec_path))?;
+            
+            // Stream backend output using the external printer to avoid corrupting the prompt
+            let stdout = child.stdout.take().context("Could not capture stdout from backend process.")?;
+            let stderr = child.stderr.take().context("Could not capture stderr from backend process.")?;
 
-            // Spawn the child process, ignoring its output
-            let child = cmd
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .with_context(|| format!("Failed to spawn backend process: {}", exec_path))?;
+            let exec_path_stdout = exec_path.to_string();
+            // Clone the Arc for the new task.
+            let printer_stdout = Arc::clone(&printer);
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    // FIX: Lock the mutex before printing.
+                    let mut p = printer_stdout.lock().await;
+                    p.print(format!("[{}] {}", exec_path_stdout, line)).unwrap();
+                }
+            });
+
+            let exec_path_stderr = exec_path.to_string();
+            // Clone the Arc again for the stderr task.
+            let printer_stderr = Arc::clone(&printer);
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    // FIX: Lock the mutex here as well.
+                    let mut p = printer_stderr.lock().await;
+                    p.print(format!("[{}/stderr] {}", exec_path_stderr, line)).unwrap();
+                }
+            });
 
             backend_processes.push(child);
         }
         println!("✅ All backend services launched.");
     }
 
-    println!("Entering interactive session. Type 'help' for commands.");
+    // 5. Start the main interactive loop
+    loop {
+        match rl.readline("pie> ") {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+                let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                if parts.is_empty() { continue; }
 
-    let mut reader = BufReader::new(tokio_stdin());
-    let mut line = String::new();
-    let mut should_exit = false;
-
-    while !should_exit {
-        print!("pie> ");
-        io::stdout().flush()?;
-
-        line.clear();
-        if reader.read_line(&mut line).await? == 0 {
-            println!("\nExiting...");
-            break; // Exit on Ctrl+D
-        }
-
-        let parts: Vec<&str> = line.trim().split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-        // Updated loop logic to handle exit correctly
-        match handle_interactive_command(parts[0], &parts[1..], &client_config).await {
-            Ok(exit_signal) => {
-                should_exit = exit_signal;
+                // FIX: Pass the printer to the command handler.
+                match handle_interactive_command(parts[0], &parts[1..], &client_config, &printer).await {
+                    Ok(should_exit) if should_exit => break,
+                    Ok(_) => (),
+                    Err(e) => eprintln!("Error: {}", e),
+                }
             }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-            }
+            Err(ReadlineError::Interrupted) => println!("(To exit, type 'exit' or press Ctrl-D)"),
+            Err(ReadlineError::Eof) => { println!("Exiting..."); break; }
+            Err(err) => { eprintln!("Error reading line: {}", err); break; }
         }
     }
-    // --- GRACEFUL SHUTDOWN ---
-    println!("Shutting down services...");
 
-    // MODIFIED: Terminate all spawned backend processes.
+    // 6. Begin graceful shutdown
+    println!("Shutting down services...");
+    if let Err(err) = rl.save_history(&history_path) {
+        eprintln!("Warning: Failed to save command history: {}", err);
+    }
+
     for mut child in backend_processes {
         if let Some(pid) = child.id() {
             println!("- Terminating backend process with PID: {}", pid);
@@ -290,9 +348,7 @@ async fn start_interactive_session(
         }
     }
 
-    // Send the shutdown signal to the main engine.
     let _ = shutdown_tx.send(());
-    // Wait for the server task to finish its cleanup.
     server_handle.await?;
     println!("✅ Shutdown complete.");
 
@@ -304,6 +360,7 @@ async fn handle_interactive_command(
     command: &str,
     args: &[&str],
     client_config: &ClientConfig,
+    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
 ) -> Result<bool> {
     match command {
         "run" => {
@@ -313,7 +370,8 @@ async fn handle_interactive_command(
                 if *arg == "-d" || *arg == "--detach" {
                     detach = true;
                 } else if wasm_path.is_none() {
-                    wasm_path = Some(PathBuf::from(arg));
+                    let expanded_arg = shellexpand::tilde(arg);
+                    wasm_path = Some(PathBuf::from(expanded_arg.as_ref()));
                 }
             }
             if let Some(path) = wasm_path {
@@ -321,7 +379,8 @@ async fn handle_interactive_command(
                     wasm_path: path,
                     detach,
                 };
-                if let Err(e) = handle_run(run_args, client_config).await {
+                // FIX: Pass the printer along to handle_run.
+                if let Err(e) = handle_run(run_args, client_config, printer).await {
                     eprintln!("Failed to run inferlet: {}", e);
                 }
             } else {
@@ -340,7 +399,7 @@ async fn handle_interactive_command(
         }
         "exit" => {
             println!("Exiting...");
-            return Ok(true); // Signal to the main loop to exit.
+            return Ok(true);
         }
         _ => {
             println!(
@@ -349,20 +408,19 @@ async fn handle_interactive_command(
             );
         }
     }
-    Ok(false) // Do not exit the loop.
+    Ok(false)
 }
 
 /// Connects to the engine and executes a Wasm inferlet.
-async fn handle_run(args: RunArgs, client_config: &ClientConfig) -> Result<()> {
+async fn handle_run(
+    args: RunArgs,
+    client_config: &ClientConfig,
+    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<()> {
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
     let mut client = match Client::connect(&url).await {
         Ok(c) => c,
-        Err(_) => {
-            return Err(anyhow!(
-                "Could not connect to engine at {}. Is it running?",
-                url
-            ));
-        }
+        Err(_) => return Err(anyhow!("Could not connect to engine at {}. Is it running?", url)),
     };
 
     let token = create_jwt("default", pie::auth::Role::User)?;
@@ -381,30 +439,30 @@ async fn handle_run(args: RunArgs, client_config: &ClientConfig) -> Result<()> {
     let mut instance = client.launch_instance(&hash).await?;
     println!("✅ Instance launched with ID: {}", instance.id());
 
-    // If not detached, spawn a task to listen for output asynchronously.
-    // This prevents blocking the main command prompt.
     if !args.detach {
         println!("Streaming output for instance {}...", instance.id());
         let instance_id = instance.id().to_string();
+        
+        // FIX: Clone the Arc<Mutex<...>> for the new task.
+        let printer_clone = Arc::clone(printer);
         tokio::spawn(async move {
             while let Ok((event, message)) = instance.recv().await {
-                // Printing asynchronously can interfere with the prompt. Prepending a newline helps.
-                if event == "terminated" {
-                    println!(
-                        "\n[Instance {}] Terminated. Reason: {}",
-                        instance_id, message
-                    );
-                    break;
+                // Lock the printer to get mutable access.
+                let mut p = printer_clone.lock().await;
+                let output = if event == "terminated" {
+                    format!("[Instance {}] Terminated. Reason: {}", instance_id, message)
                 } else {
-                    println!("\n[Instance {}] {}: {}", instance_id, event, message);
+                    format!("[Instance {}] {}: {}", instance_id, event, message)
+                };
+                
+                // Print the line, which will automatically refresh the prompt.
+                p.print(output).unwrap();
+
+                if event == "terminated" {
+                    break;
                 }
             }
-            // Let the user know the stream is done and they can get a clean prompt.
-            print!(
-                "(Output stream for {} ended). Press Enter to refresh prompt.",
-                instance_id
-            );
-            let _ = io::stdout().flush();
+            // No more "Press Enter" message needed!
         });
     }
     Ok(())
