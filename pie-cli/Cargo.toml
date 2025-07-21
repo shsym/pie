@@ -7,6 +7,10 @@ description = "Programmable Inference Engine (PIE) Command-Line Interface"
 license = "MIT"
 repository = "https://github.com/pie-project/pie/pie-cli"
 
+[[bin]]
+name = "pie"
+path = "src/main.rs"
+
 [dependencies]
 pie = { path = "../pie" }
 tokio = { version = "1.38", features = ["full"] }

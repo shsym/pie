@@ -40,7 +40,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber, Layer};
 //================================================================================//
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "A CLI for the PIE system")]
+#[command(author, version, about = "PIE Command Line Interface")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
