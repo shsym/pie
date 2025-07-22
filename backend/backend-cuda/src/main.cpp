@@ -557,15 +557,15 @@ int main(int argc, char* argv[]) {
     app.add_option("--config", config_filepath_opt, "Path to a TOML configuration file.")->check(CLI::ExistingFile);
     app.add_option("--host", cli_config.host, "The hostname to bind to.");
     app.add_option("--port", cli_config.port, "The port number to listen on.");
-    app.add_option("--controller-host", cli_config.controller_host, "The controller hostname.");
-    app.add_option("--controller-port", cli_config.controller_port, "The controller port number.");
-    app.add_option("--auth-token", cli_config.auth_token, "The authentication token for the controller.");
+    app.add_option("--controller_host", cli_config.controller_host, "The controller hostname.");
+    app.add_option("--controller_port", cli_config.controller_port, "The controller port number.");
+    app.add_option("--auth_token", cli_config.auth_token, "The authentication token for the controller.");
     app.add_option("--model", cli_config.model_name, "The model name (e.g., 'llama-3.2-1b-instruct').");
-    app.add_option("--cache-dir", cache_dir_opt, "The directory for caching models.");
-    app.add_option("--kv-page-size", cli_config.kv_page_size, "The KV page size.");
-    app.add_option("--dist-size", cli_config.dist_size, "The distribution size.");
-    app.add_option("--max-num-kv-pages", cli_config.max_num_kv_pages, "The maximum number of KV pages.");
-    app.add_option("--max-num-embeds", cli_config.max_num_embeds, "The maximum number of embeddings.");
+    app.add_option("--cache_dir", cache_dir_opt, "The directory for caching models.");
+    app.add_option("--kv_page_size", cli_config.kv_page_size, "The KV page size.");
+    app.add_option("--dist_size", cli_config.dist_size, "The distribution size.");
+    app.add_option("--max_num_kv_pages", cli_config.max_num_kv_pages, "The maximum number of KV pages.");
+    app.add_option("--max_num_embeds", cli_config.max_num_embeds, "The maximum number of embeddings.");
     app.add_option("--device", cli_config.device, "The device to use (e.g., 'cuda:0').");
     app.add_option("--dtype", cli_config.dtype, "The data type (e.g., 'bfloat16').");
 
@@ -587,13 +587,13 @@ int main(int argc, char* argv[]) {
         // (Configuration merging logic remains the same)
         final_config.host = app.count("--host") > 0 ? cli_config.host : config_from_file["host"].value_or(final_config.host);
         final_config.port = app.count("--port") > 0 ? cli_config.port : config_from_file["port"].value_or(final_config.port);
-        final_config.controller_host = app.count("--controller-host") > 0 ? cli_config.controller_host : config_from_file["controller_host"].value_or(final_config.controller_host);
-        final_config.controller_port = app.count("--controller-port") > 0 ? cli_config.controller_port : config_from_file["controller_port"].value_or(final_config.controller_port);
+        final_config.controller_host = app.count("--controller_host") > 0 ? cli_config.controller_host : config_from_file["controller_host"].value_or(final_config.controller_host);
+        final_config.controller_port = app.count("--controller_port") > 0 ? cli_config.controller_port : config_from_file["controller_port"].value_or(final_config.controller_port);
         
         if (app.count("--model") > 0) final_config.model_name = cli_config.model_name;
         else if (auto node = config_from_file["model"]; node.is_string()) final_config.model_name = node.as_string()->get();
 
-        if (app.count("--auth-token") > 0) final_config.auth_token = cli_config.auth_token;
+        if (app.count("--auth_token") > 0) final_config.auth_token = cli_config.auth_token;
         else if (auto node = config_from_file["auth_token"]; node.is_string()) final_config.auth_token = node.as_string()->get();
 
         final_config.cache_dir = get_cache_dir(cache_dir_opt, config_from_file);

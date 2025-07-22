@@ -33,6 +33,37 @@ pub fn k_or_t(
     KorTStrategy::k_or_t(max_wait_time, min_size, max_size).into_box()
 }
 
+
+/// Creates a queue that uses an adaptive strategy to minimize latency
+/// by estimating the arrival rate `lambda` online.
+///
+/// # Arguments
+///
+/// * `initial_lambda` - An initial guess for the arrival rate (items per second).
+/// * `alpha` - The smoothing factor for the EWMA (e.g., 0.1). A higher value adapts faster but is less smooth.
+/// * `recalc_interval` - The number of arrivals after which to recalculate the optimal batch size.
+/// * `f_values` - A lookup table of `Duration`s where `f_values[n-1]` is the execution time for a batch of size `n`.
+/// * `max_size` - The maximum batch size to consider. Must be `<= f_values.len()`.
+pub fn adaptive(
+    initial_lambda: f64,
+    alpha: f64,
+    recalc_interval: u32,
+    f_values: Vec<Duration>,
+    max_size: usize,
+) -> Result<Box<dyn BatchingStrategy>, &'static str> {
+    AdaptiveStrategy::new(
+        initial_lambda,
+        alpha,
+        recalc_interval,
+        f_values,
+        max_size,
+    )
+        .map(|s| s.into_box())
+}
+
+
+
+
 /// "K-or-T" Strategy
 // 	For instance: If queue size reaches K, launch immediately; otherwise launch after T ms if K isn’t reached.
 // 	This ensures that the GPU does not stay idle for too long (bounded by T) and that short bursts of arrivals form a large enough batch to get good utilization (bounded by K).
@@ -117,6 +148,153 @@ impl BatchingStrategy for KorTStrategy {
         count
     }
 }
+
+
+
+/// An adaptive strategy that determines the optimal batch size (`n*`) by modeling
+/// the system as a queue to minimize average latency. It estimates the arrival
+/// rate `lambda` online and periodically recalculates `n*`.
+#[derive(Debug)]
+pub struct AdaptiveStrategy {
+    // Parameters for lambda estimation
+    alpha: f64,
+    avg_inter_arrival_time: Duration,
+    last_arrival_time: Option<Instant>,
+
+    // Parameters for recalculation
+    f_values: Vec<Duration>,
+    max_size: usize,
+    updates_since_recalc: u32,
+    recalc_interval: u32,
+
+    // The calculated optimal batch size
+    optimal_n: usize,
+    // The queue of items
+    items: VecDeque<Instant>,
+}
+
+impl AdaptiveStrategy {
+    /// Creates a new `AdaptiveStrategy` by calculating an initial optimal batch size.
+    pub fn new(
+        initial_lambda: f64,
+        alpha: f64,
+        recalc_interval: u32,
+        f_values: Vec<Duration>,
+        max_size: usize,
+    ) -> Result<Self, &'static str> {
+        if max_size == 0 || max_size > f_values.len() {
+            return Err("max_size must be > 0 and <= f_values.len()");
+        }
+
+        // Calculate the initial optimal_n based on the provided guess
+        let initial_n = Self::calculate_optimal_n(initial_lambda, &f_values, max_size)
+            .ok_or("Could not find a stable initial batch size.")?;
+
+        Ok(Self {
+            alpha,
+            // Initialize avg inter-arrival time based on the initial lambda guess
+            avg_inter_arrival_time: Duration::from_secs_f64(1.0 / initial_lambda),
+            last_arrival_time: None,
+            f_values,
+            max_size,
+            updates_since_recalc: 0,
+            recalc_interval,
+            optimal_n: initial_n,
+            items: VecDeque::new(),
+        })
+    }
+
+    /// Performs the core calculation to find the optimal batch size `n*`.
+    fn calculate_optimal_n(
+        lambda: f64,
+        f_values: &Vec<Duration>,
+        max_size: usize,
+    ) -> Option<usize> {
+        let mut best_n = 0;
+        let mut min_latency = f64::MAX;
+
+        for n in 1..=max_size {
+            let n_f64 = n as f64;
+            // Look up execution time from the vector
+            let fn_duration = f_values[n - 1];
+            let fn_seconds = fn_duration.as_secs_f64();
+
+            if lambda * fn_seconds >= n_f64 {
+                continue;
+            }
+
+            let w_batch = (n_f64 - 1.0) / (2.0 * lambda);
+            let w_queue = n_f64 / (2.0 * lambda * (n_f64 - lambda * fn_seconds));
+            let w_proc = fn_seconds;
+            let current_latency = w_batch + w_queue + w_proc;
+
+            if current_latency < min_latency {
+                min_latency = current_latency;
+                best_n = n;
+            }
+        }
+
+        if best_n > 0 {
+            Some(best_n)
+        } else {
+            None
+        }
+    }
+
+    /// Re-evaluates `optimal_n` using the latest `lambda` estimate.
+    fn recalculate(&mut self) {
+        let avg_iat_secs = self.avg_inter_arrival_time.as_secs_f64();
+        if avg_iat_secs < 1e-9 {
+            return;
+        } // Avoid division by zero
+        let lambda_estimate = 1.0 / avg_iat_secs;
+
+        // If a new stable n is found, update it. Otherwise, keep the old one.
+        if let Some(new_n) =
+            Self::calculate_optimal_n(lambda_estimate, &self.f_values, self.max_size)
+        {
+            self.optimal_n = new_n;
+        }
+    }
+
+    pub fn into_box(self) -> Box<dyn BatchingStrategy> {
+        Box::new(self)
+    }
+}
+
+impl BatchingStrategy for AdaptiveStrategy {
+    fn update(&mut self, now: Instant) {
+        self.items.push_back(now);
+
+        // Update the EWMA of the inter-arrival time
+        if let Some(last_time) = self.last_arrival_time {
+            let current_iat = now.duration_since(last_time);
+            let old_avg_secs = self.avg_inter_arrival_time.as_secs_f64();
+            let new_avg_secs =
+                self.alpha * current_iat.as_secs_f64() + (1.0 - self.alpha) * old_avg_secs;
+            self.avg_inter_arrival_time = Duration::from_secs_f64(new_avg_secs);
+        }
+        self.last_arrival_time = Some(now);
+
+        // Check if it's time to recalculate the optimal batch size
+        self.updates_since_recalc += 1;
+        if self.updates_since_recalc >= self.recalc_interval {
+            self.recalculate();
+            self.updates_since_recalc = 0;
+        }
+    }
+
+    fn batch(&mut self, _now: Instant) -> usize {
+        // Fire a batch of size `optimal_n` as soon as enough items are available.
+        if self.items.len() >= self.optimal_n {
+            self.items.drain(..self.optimal_n);
+            self.optimal_n
+        } else {
+            0
+        }
+    }
+}
+
 
 #[derive(Debug)]
 pub struct BatchQueue<T> {
