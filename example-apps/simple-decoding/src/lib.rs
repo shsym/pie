@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     const PING_COUNT: usize = 5;
     let mut total_duration = Duration::ZERO;
@@ -26,9 +26,9 @@ async fn main() -> Result<(), String> {
 
     let max_num_outputs = 128;
 
-    let available_models = pie::available_models();
+    let available_models = inferlet::available_models();
 
-    let model = pie::Model::new(available_models.first().unwrap()).unwrap();
+    let model = inferlet::Model::new(available_models.first().unwrap()).unwrap();
     let tokenizer = model.get_tokenizer();
 
     let mut ctx = model.create_context();

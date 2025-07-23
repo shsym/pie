@@ -1,3 +1,0 @@
-# SPI
-
-Symphony Programming Interface

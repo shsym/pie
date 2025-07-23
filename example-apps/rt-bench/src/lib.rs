@@ -1,10 +1,10 @@
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
 
-    let msg = pie::messaging_async::receive().await;
+    let msg = inferlet::messaging_async::receive().await;
 
-    pie::messaging::send(&msg);
+    inferlet::messaging::send(&msg);
 
     Ok(())
 }

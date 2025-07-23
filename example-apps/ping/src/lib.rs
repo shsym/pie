@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     const PING_COUNT: usize = 30;
     let mut total_duration = Duration::ZERO;
@@ -9,7 +9,7 @@ async fn main() -> Result<(), String> {
 
     for i in 1..=PING_COUNT {
         let start = Instant::now();
-        let resp = pie::ping::ping("hello");
+        let resp = inferlet::ping::ping("hello");
         let elapsed = start.elapsed();
         total_duration += elapsed;
 

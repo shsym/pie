@@ -1,12 +1,12 @@
 use boa_engine::{Context, Source};
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let max_num_outputs = 32;
 
     // Initialize the model and context
-    let available_models = pie::available_models();
-    let model = pie::Model::new(available_models.first().unwrap()).unwrap();
+    let available_models = inferlet::available_models();
+    let model = inferlet::Model::new(available_models.first().unwrap()).unwrap();
     let mut ctx = model.create_context();
 
     // Fill initial context with system prompt and user query

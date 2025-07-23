@@ -1,4 +1,4 @@
-# Symphony Toolkit
+# PIE Python Client
 
 A concise Python toolkit to interact with the Symphony server:
 

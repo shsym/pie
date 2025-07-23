@@ -1,5 +1,0 @@
-interface l4m-vision {
-    use l4m.{model, object-id, stream-id, synchronization-result};
-
-    embed-image: func(model:borrow<model>, stream-id: stream-id, embs: list<object-id>, image-blob: list<u8>);
-}

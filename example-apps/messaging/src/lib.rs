@@ -1,11 +1,11 @@
-use pie::Result;
+use inferlet::Result;
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<()> {
     println!("Let's chat!");
 
     for _ in 0..3 {
-        let s = pie::messaging_async::receive().await;
+        let s = inferlet::messaging_async::receive().await;
         println!("{}", s);
     }
 
@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     ];
 
     for i in 0..3 {
-        pie::messaging::send(responses[i]);
+        inferlet::messaging::send(responses[i]);
     }
 
     println!("It was nice chatting with you. Bye!");

@@ -7,5 +7,6 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-pie = { path = "../pie" }
+inferlet.workspace = true
+inferlet-macros.workspace = true
 anyhow = "1.0.95"

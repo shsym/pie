@@ -1,20 +1,20 @@
-use pie::stop_condition::{self, StopCondition};
+use inferlet::stop_condition::{self, StopCondition};
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
-    let prompt = pie::messaging_async::receive().await;
-    let max_num_outputs = pie::messaging_async::receive()
+    let prompt = inferlet::messaging_async::receive().await;
+    let max_num_outputs = inferlet::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(32);
-    let num_prompts = pie::messaging_async::receive()
+    let num_prompts = inferlet::messaging_async::receive()
         .await
         .parse()
         .unwrap_or(1);
 
-    let available_models = pie::available_models();
+    let available_models = inferlet::available_models();
 
-    let model = pie::Model::new(available_models.first().unwrap()).unwrap();
+    let model = inferlet::Model::new(available_models.first().unwrap()).unwrap();
     let tokenizer = model.get_tokenizer();
     let stop_str_token_ids = tokenizer.encode("<|eot_id|>");
 
@@ -102,7 +102,7 @@ async fn main() -> Result<(), String> {
 
     let results = futures::future::join_all(futures).await;
     let text = results.join("\n\n");
-    pie::messaging::send(&text);
+    inferlet::messaging::send(&text);
 
     Ok(())
 }

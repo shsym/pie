@@ -1,8 +1,8 @@
 use std::time::Instant;
-use pie::{sampler, stop_condition};
+use inferlet::{sampler, stop_condition};
 
 use std::collections::HashMap;
-use pie::drafter::Drafter;
+use inferlet::drafter::Drafter;
 
 pub struct FixedSizeQueue<T, const N: usize> {
     buf: [T; N],
@@ -220,14 +220,14 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> Drafter
     }
 }
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
     // TODO: Prepopulate the cache table with some entries
     let max_num_outputs = 128;
 
-    let model = pie::Model::new(&pie::available_models()[0]).unwrap();
+    let model = inferlet::Model::new(&inferlet::available_models()[0]).unwrap();
     let tokenizer = model.get_tokenizer();
 
     let mut ctx = model.create_context();

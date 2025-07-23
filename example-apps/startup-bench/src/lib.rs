@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
 
-    let flag = pie::messaging_async::receive().await;
+    let flag = inferlet::messaging_async::receive().await;
 
     let mut total_duration = Duration::ZERO;
 
@@ -11,7 +11,7 @@ async fn main() -> Result<(), String> {
 
     for i in 1..=PING_COUNT {
         let start = Instant::now();
-        let resp = pie::ping::ping("hello");
+        let resp = inferlet::ping::ping("hello");
         let elapsed = start.elapsed();
         total_duration += elapsed;
     }
@@ -22,7 +22,7 @@ async fn main() -> Result<(), String> {
     //     
     // }
 
-    pie::messaging::send(&avg_latency.as_micros().to_string());
+    inferlet::messaging::send(&avg_latency.as_micros().to_string());
     //println!("Average Latency: {:?}", avg_latency);
 
     Ok(())

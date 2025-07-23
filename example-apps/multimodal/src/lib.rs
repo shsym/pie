@@ -1,7 +1,7 @@
 use anyhow::Result;
 use image::{DynamicImage, load_from_memory};
-use pie::wstd::http::{Client, Method, Request};
-use pie::wstd::io::{AsyncRead, copy, empty};
+use inferlet::wstd::http::{Client, Method, Request};
+use inferlet::wstd::io::{AsyncRead, copy, empty};
 
 /// Asynchronously fetches the contents of the given URL as a String.
 pub async fn fetch_image(url: &str) -> Result<DynamicImage> {
@@ -27,7 +27,7 @@ pub async fn fetch_image(url: &str) -> Result<DynamicImage> {
     // Convert the buffer into a UTF-8 string.
     Ok(img)
 }
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<()> {
     // read example.com
 

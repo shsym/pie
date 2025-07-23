@@ -1,12 +1,12 @@
 use std::time::Instant;
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
     let max_num_outputs = 32;
 
-    let model = pie::Model::new(&pie::available_models()[0]).unwrap();
+    let model = inferlet::Model::new(&inferlet::available_models()[0]).unwrap();
 
     let mut common = model.create_context();
     common.fill("<|begin_of_text|>");

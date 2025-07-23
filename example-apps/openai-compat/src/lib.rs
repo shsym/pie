@@ -2,11 +2,11 @@ mod models;
 mod handlers;
 mod utils;
 
-use pie::wstd::http::body::IncomingBody;
-use pie::wstd::http::server::{Finished, Responder};
-use pie::wstd::http::Request;
+use inferlet::wstd::http::body::IncomingBody;
+use inferlet::wstd::http::server::{Finished, Responder};
+use inferlet::wstd::http::Request;
 
-#[pie::server_main]
+#[inferlet::server_main]
 async fn main(req: Request<IncomingBody>, res: Responder) -> Finished {
     // Log connection info
     println!("Received request from {} to {}",

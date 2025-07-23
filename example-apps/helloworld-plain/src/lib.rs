@@ -1,5 +1,5 @@
 wit_bindgen::generate!({
-    path: "../../api/wit",
+    path: "../../inferlet/wit",
     world: "app",
     pub_export_macro: true,
     export_macro_name: "export",

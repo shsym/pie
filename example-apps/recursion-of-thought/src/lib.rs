@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use pie::{Context, Model};
+use inferlet::{Context, Model};
 
 // Constants
 const DIVIDE_PROMPT_TEMPLATE: &str = "Your task is to analyze the given problem and decide whether it can be solved directly or needs to be divided into smaller subproblems. If the problem is simple and can be solved immediately, provide the solution wrapped in <leaf>final answer</leaf>. If not, divide the problem into exactly two independent subtasks such that solving these subtasks and combining their solutions will lead to the solution of the original problem. Present the subtasks wrapped in <branch>subtask1</branch> and <branch>subtask2</branch>. Be concise and ensure the subtasks are distinct and solvable. Problem: {}";
@@ -85,10 +85,10 @@ fn divide_and_conquer(
         }
     })
 }
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     // Initialize the Symphony model and context
-    let available_models = pie::available_models();
+    let available_models = inferlet::available_models();
     let model = Model::new(available_models.first().unwrap()).unwrap();
     let mut ctx = model.create_context();
     ctx.fill("<|begin_of_text|>");

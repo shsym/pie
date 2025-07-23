@@ -1,6 +1,6 @@
 use futures::future::join_all;
 use futures::{StreamExt, stream::FuturesUnordered};
-use pie::{Context, Model};
+use inferlet::{Context, Model};
 
 const PROPOSAL_PROMPT: &str = "Could you suggest a method or approach to solve the following question? Please provide a high-level plan without doing the actual calculation. Keep it concise, around 80 words. Question: {}";
 const AGGREGATE_PROMPT: &str = "Please compare the following solution with the one you just provided and aggregate their ideas into a single, improved solution:\n";
@@ -66,10 +66,10 @@ async fn aggregate_proposals_async(mut base_context: Context, question: &str) ->
     join_all(second_aggregation_tasks).await
 }
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     // Initialize the model and context
-    let available_models = pie::available_models();
+    let available_models = inferlet::available_models();
     let model = Model::new(available_models.first().unwrap()).unwrap();
     let mut ctx = model.create_context();
     ctx.fill("<|begin_of_text|>");

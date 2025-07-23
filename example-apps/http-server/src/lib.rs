@@ -1,10 +1,10 @@
-use pie::wstd::http::body::{BodyForthcoming, IncomingBody};
-use pie::wstd::http::server::{Finished, Responder};
-use pie::wstd::http::{IntoBody, Request, Response, StatusCode};
-use pie::wstd::io::{AsyncWrite, copy, empty};
-use pie::wstd::time::{Duration, Instant};
+use inferlet::wstd::http::body::{BodyForthcoming, IncomingBody};
+use inferlet::wstd::http::server::{Finished, Responder};
+use inferlet::wstd::http::{IntoBody, Request, Response, StatusCode};
+use inferlet::wstd::io::{AsyncWrite, copy, empty};
+use inferlet::wstd::time::{Duration, Instant};
 
-#[pie::server_main]
+#[inferlet::server_main]
 async fn main(req: Request<IncomingBody>, res: Responder) -> Finished {
     match req.uri().path_and_query().unwrap().as_str() {
         "/wait" => wait(req, res).await,
@@ -27,7 +27,7 @@ async fn wait(_req: Request<IncomingBody>, res: Responder) -> Finished {
     let now = Instant::now();
 
     // Sleep for one second.
-    pie::wstd::task::sleep(Duration::from_secs(1)).await;
+    inferlet::wstd::task::sleep(Duration::from_secs(1)).await;
 
     // Compute how long we slept for.
     let elapsed = Instant::now().duration_since(now).as_millis();

@@ -1,14 +1,14 @@
-use pie::wstd::time::Duration;
+use inferlet::wstd::time::Duration;
 
-#[pie::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let max_num_outputs = 32;
 
-    let available_models = pie::available_models();
+    let available_models = inferlet::available_models();
 
     // Simulate agentic behavior
 
-    let model = pie::Model::new(available_models.first().unwrap()).unwrap();
+    let model = inferlet::Model::new(available_models.first().unwrap()).unwrap();
 
     let mut ctx = model.create_context();
 
@@ -20,12 +20,12 @@ async fn main() -> Result<(), String> {
     let text = ctx.generate_until("<|eot_id|>", max_num_outputs).await;
 
     // simulate function calling
-    pie::wstd::task::sleep(Duration::from_millis(100)).await;
+    inferlet::wstd::task::sleep(Duration::from_millis(100)).await;
 
     ctx.fill("result from the function call");
 
 
-    pie::wstd::task::sleep(Duration::from_millis(100)).await;
+    inferlet::wstd::task::sleep(Duration::from_millis(100)).await;
 
     ctx.fill("result from the function call");
 
