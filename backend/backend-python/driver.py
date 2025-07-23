@@ -1,3 +1,5 @@
+"""TODO: Add module docstring."""
+
 import time
 from dataclasses import dataclass
 from typing import Union
@@ -5,26 +7,43 @@ from typing import Union
 import numpy as np
 import torch
 
-from l4m_pb2 import BatchAllocate, BatchDeallocate, BatchEmbedText, BatchMaskBlock, BatchCopyBlock, BatchDecodeTokenDistribution, BatchSampleTopKRequest, BatchSampleTopKResponse, \
-    ObjectKind, SampleTopKResponse, BatchFillBlock
+from l4m_pb2 import (  # pylint: disable=no-name-in-module
+    BatchAllocate,
+    BatchDeallocate,
+    BatchEmbedText,
+    BatchMaskBlock,
+    BatchCopyBlock,
+    BatchDecodeTokenDistribution,
+    BatchSampleTopKRequest,
+    BatchSampleTopKResponse,
+    ObjectKind,
+    SampleTopKResponse,
+    BatchFillBlock,
+)
 
-from l4m_vision_pb2 import BatchEmbedImage
+from l4m_vision_pb2 import BatchEmbedImage  # pylint: disable=no-name-in-module
 
 
 @dataclass
 class TextEmbed:
+    """TODO: Add class docstring."""
+
     token_id: int
     position_id: int
 
 
 @dataclass
 class ImageEmbed:
+    """TODO: Add class docstring."""
+
     vec_id: int
     position_id: tuple[int, int]
 
 
 @dataclass
 class Block:
+    """TODO: Add class docstring."""
+
     position_ids: np.ndarray
     occupancy: np.ndarray
 
@@ -34,12 +53,24 @@ Embed = Union[TextEmbed, ImageEmbed]
 
 
 class Driver:
+    """TODO: Add class docstring."""
+
     embeds: dict[int, Embed]
     blocks: dict[int, Block]
 
     # dist_storage: VectorStorage
 
-    def __init__(self, model, kv_page_size: int, dist_size: int, max_num_kv_pages: int, max_num_embeds: int, dtype: torch.dtype, device: str):
+    def __init__(
+        self,
+        model,
+        kv_page_size: int,
+        dist_size: int,
+        max_num_kv_pages: int,
+        max_num_embeds: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        """TODO: Add method docstring."""
         self.embeds = {}
         self.blocks = {}
 
@@ -53,64 +84,82 @@ class Driver:
 
         self.kv_cache_at_layer = [
             torch.randn(
-                (max_num_kv_pages, 2, kv_page_size,
-                 self.lm.config.num_key_value_heads,
-                 self.lm.config.head_size),
-                dtype=dtype, device=device
-            ) for _ in range(self.lm.config.num_layers)
+                (
+                    max_num_kv_pages,
+                    2,
+                    kv_page_size,
+                    self.lm.config.num_key_value_heads,
+                    self.lm.config.head_size,
+                ),
+                dtype=dtype,
+                device=device,
+            )
+            for _ in range(self.lm.config.num_layers)
         ]
 
-        self.embed_storage_p1 = torch.empty((max_num_embeds, dist_size), device=device, dtype=dtype)
+        self.embed_storage_p1 = torch.empty(
+            (max_num_embeds, dist_size), device=device, dtype=dtype
+        )
 
-        self.embed_storage_p2 = torch.empty((max_num_embeds, dist_size), device=device, dtype=torch.int32)
+        self.embed_storage_p2 = torch.empty(
+            (max_num_embeds, dist_size), device=device, dtype=torch.int32
+        )
 
         # self.dist_storage = dist_storage
 
         self.inter_fill_time = time.time()
 
     def allocate(self, cmds: BatchAllocate):
+        """TODO: Add method docstring."""
         # in current implementation, all allocations are already done in the constructor.
-        # but in the future, we may want to allocate more blocks than the GPU capacity, by offloading some of the blocks to the CPU memory.
+        # but in the future, we may want to allocate more blocks than the GPU capacity,
+        # by offloading some of the blocks to the CPU memory.
         # This logic should handle that case.
 
         for cmd in cmds.items:
             if cmd.kind == ObjectKind.OBJECT_KIND_KV_BLOCK:
                 for i in range(cmd.count):
-                    # print(f"Debug - allocate {cmd.count} blocks at offset {cmd.object_id_offset}, creating block {cmd.object_id_offset + i}")
 
                     self.blocks[cmd.object_id_offset + i] = Block(
                         position_ids=np.array([0] * self.kv_page_size),
-                        occupancy=np.array([False] * self.kv_page_size)
+                        occupancy=np.array([False] * self.kv_page_size),
                     )
 
             elif cmd.kind == ObjectKind.OBJECT_KIND_EMB:
                 # do nothing. Embeds are allocated on the fly.
-                ...
+                pass
             elif cmd.kind == ObjectKind.OBJECT_KIND_DIST:
                 # do nothing. Dists are allocated on the fly.
-                ...
+                pass
 
     def deallocate(self, cmds: BatchDeallocate):
+        """TODO: Add method docstring."""
         # in current implementation, all allocations are already done in the constructor.
         # so we don't need to deallocate anything.
-        ...
+        raise NotImplementedError("Not implemented")
 
     def embed_text(self, cmds: BatchEmbedText):
+        """TODO: Add method docstring."""
         # print(f"Debug - embed_text called with {len(cmds.items)} items")
         for _i, cmd in enumerate(cmds.items):
-            self.embeds[cmd.embedding_id] = TextEmbed(token_id=cmd.token_id, position_id=cmd.position_id)
+            self.embeds[cmd.embedding_id] = TextEmbed(
+                token_id=cmd.token_id, position_id=cmd.position_id
+            )
 
     def embed_image(self, cmds: BatchEmbedImage):
+        """TODO: Add method docstring."""
         # unimplemented
-        ...
+        raise NotImplementedError("Not implemented")
 
     def mask_block(self, cmds: BatchMaskBlock):
+        """TODO: Add method docstring."""
         for cmd in cmds.items:
             block = self.blocks[cmd.block_id]
             for i, m in enumerate(cmd.mask):
                 block.occupancy[i] = m
 
     def copy_block(self, cmds: BatchCopyBlock):
+        """TODO: Add method docstring."""
         for cmd in cmds.items:
             src_block = self.blocks[cmd.source_block_id]
             dst_block = self.blocks[cmd.destination_block_id]
@@ -118,33 +167,41 @@ class Driver:
             dst_start = cmd.destination_start
             length = cmd.length
 
-            dst_block.occupancy[dst_start:dst_start+length] = src_block.occupancy[src_start:src_start+length]
-            dst_block.position_ids[dst_start:dst_start+length] = src_block.position_ids[src_start:src_start+length]
+            dst_block.occupancy[dst_start : dst_start + length] = src_block.occupancy[
+                src_start : src_start + length
+            ]
+            dst_block.position_ids[dst_start : dst_start + length] = (
+                src_block.position_ids[src_start : src_start + length]
+            )
 
             for kv_cache_layer in self.kv_cache_at_layer:
-                kv_cache_layer[dst_block, :, dst_start:dst_start+length, :, :] = kv_cache_layer[src_block, :, src_start:src_start+length, :, :]
+                kv_cache_layer[dst_block, :, dst_start : dst_start + length, :, :] = (
+                    kv_cache_layer[src_block, :, src_start : src_start + length, :, :]
+                )
 
     @torch.inference_mode()
     def decode_token_distribution(self, cmds: BatchDecodeTokenDistribution):
+        """TODO: Add method docstring."""
         # start_time = time.time()
 
-        # TODO -> make this more efficient by batching.
+        # Make this more efficient by batching.
         # for i, cmd in enumerate(cmds.items):
-        #     dist = torch.softmax(self.lm.lm_head(self.embed_storage.ptr[cmd.embedding_id]), dim=-1)
+        #     dist = torch.softmax(
+        #         self.lm.lm_head(self.embed_storage.ptr[cmd.embedding_id]), dim=-1
+        #     )
         #     self.dist_storage.ptr[cmd.distribution_id] = dist
 
         # torch.cuda.synchronize()
         # print(f"decode_token_distribution elapsed time {(time.time() - start_time) * 1000}ms")
-        ...
+        raise NotImplementedError("Not implemented")
 
     @torch.inference_mode()
-    def sample_top_k_request(self, cmds: BatchSampleTopKRequest) -> BatchSampleTopKResponse:
-
-        start_time = time.time()
-
+    def sample_top_k_request(
+        self, cmds: BatchSampleTopKRequest
+    ) -> BatchSampleTopKResponse:
+        """TODO: Add method docstring."""
         res = []
-
-        for i, cmd in enumerate(cmds.items):
+        for cmd in cmds.items:
             # Get the stored logits/probabilities and token IDs
             topk_probs = self.embed_storage_p1[cmd.distribution_id].tolist()
             topk_tokens = self.embed_storage_p2[cmd.distribution_id].tolist()
@@ -154,7 +211,9 @@ class Driver:
             #     topk_tokens = topk_tokens[:cmd.k]
             #     topk_probs = topk_probs[:cmd.k]
 
-            res.append(SampleTopKResponse(token_ids=topk_tokens, probabilities=topk_probs))
+            res.append(
+                SampleTopKResponse(token_ids=topk_tokens, probabilities=topk_probs)
+            )
 
         # torch.cuda.synchronize()
         # elapsed_time = (time.time() - start_time) * 1000
@@ -164,8 +223,7 @@ class Driver:
 
     @torch.inference_mode()
     def fill_block(self, cmds: BatchFillBlock):
-
-        start_time = time.time()
+        """TODO: Add method docstring."""
 
         kv_page_indices = []
         kv_page_indptr = [0]
@@ -177,22 +235,19 @@ class Driver:
         new_token_ids = []
         new_position_ids = []
         output_embed_postproc = []
-        single_token_inference_mode = True
 
-        for i, cmd in enumerate(cmds.items):
+        for cmd in cmds.items:
             last_block_len = cmd.last_block_len  # change this name to "offset" later.
 
-            ctx_block_ids = cmd.context_block_ids  # block == page. make names consistent later.
+            ctx_block_ids = (
+                cmd.context_block_ids
+            )  # block == page. make names consistent later.
             input_embeds = cmd.input_embedding_ids
             output_embeds = cmd.output_embedding_ids
 
             kv_page_indices.extend(ctx_block_ids)
             kv_page_indptr.append(len(kv_page_indices))
             kv_last_page_lens.append(last_block_len)
-
-            # if offset + len(input_embeds) > NUM_TOKENS_IN_BLOCK:
-            #     # should never happen.
-            #     raise ValueError("Page size exceeded")
 
             qo_indices.extend(input_embeds)
             qo_indptr.append(len(qo_indices))
@@ -202,12 +257,11 @@ class Driver:
             inp_pos_ids = np.empty((len(input_embeds),), dtype=np.int32)
             inp_occupancy = np.zeros((len(input_embeds),), dtype=np.bool_)
 
-            if len(input_embeds) > 1:
-                single_token_inference_mode = False
+            total_ctx_tokens = (
+                self.kv_page_size * (len(ctx_block_ids) - 1) + last_block_len
+            )
 
-            total_ctx_tokens = self.kv_page_size * (len(ctx_block_ids) - 1) + last_block_len
-
-            for i in range(len(input_embeds)):
+            for i, input_embed in enumerate(input_embeds):
 
                 token_offset = total_ctx_tokens - len(input_embeds) + i
                 tgt_block_idx = token_offset // self.kv_page_size
@@ -217,8 +271,8 @@ class Driver:
 
                 tgt_block = self.blocks[tgt_block_id]
 
-                if input_embeds[i] in self.embeds:
-                    embed = self.embeds[input_embeds[i]]
+                if input_embed in self.embeds:
+                    embed = self.embeds[input_embed]
                     if isinstance(embed, TextEmbed):
                         new_token_ids.append(embed.token_id)
                         new_position_ids.append(embed.position_id)
@@ -227,24 +281,36 @@ class Driver:
                         tgt_block.occupancy[tgt_block_offset] = True
                         tgt_block.position_ids[tgt_block_offset] = embed.position_id
                 else:
-                    # should never happen, since the controller should have already checked that the input embeds are valid.
+                    # should never happen, since the controller should have already
+                    # checked that the input embeds are valid.
                     raise ValueError("Input embedding not found")
 
-            for i in range(len(output_embeds)):
-                output_embed_postproc.append({
-                    "idx": len(new_token_ids) - len(output_embeds) + i,
-                    "vec_id": output_embeds[i]
-                })
+
+            for i, embed in enumerate(output_embeds):
+                output_embed_postproc.append(
+                    {
+                        "idx": len(new_token_ids) - len(output_embeds) + i,
+                        "vec_id": embed,
+                    }
+                )
 
             # Get the full sequence length (context + input tokens)
             total_sequence_length = total_ctx_tokens  # + len(input_embeds)
 
             # Get position IDs and occupancy for the entire sequence
-            ctx_pos_ids = np.hstack([self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids])[:total_sequence_length]  # int
-            ctx_occupancy = np.hstack([self.blocks[ctx_id].occupancy for ctx_id in ctx_block_ids])[:total_sequence_length]  # bool
+            ctx_pos_ids = np.hstack(
+                [self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids]
+            )[
+                :total_sequence_length
+            ]  # int
+            ctx_occupancy = np.hstack(
+                [self.blocks[ctx_id].occupancy for ctx_id in ctx_block_ids]
+            )[
+                :total_sequence_length
+            ]  # bool
 
-            #print(f"ctx_pos_ids: {ctx_pos_ids}, ctx_occupancy: {ctx_occupancy}")
-        
+            # print(f"ctx_pos_ids: {ctx_pos_ids}, ctx_occupancy: {ctx_occupancy}")
+
             # Build the causal and valid masks
             casual_mask = ctx_pos_ids[None, :] <= inp_pos_ids[:, None]
             valid_mask = np.logical_and(ctx_occupancy[None, :], inp_occupancy[:, None])
@@ -257,7 +323,6 @@ class Driver:
         # concat all masks
         custom_mask = np.concatenate(custom_masks)
 
-
         # print all inputs
         # print('kv_page_indices', kv_page_indices)
         # print('kv_page_indptr', kv_page_indptr)
@@ -265,14 +330,26 @@ class Driver:
         # print('qo_indptr', qo_indptr)
         # print('custom_mask', custom_mask)
 
-        pt_new_token_ids = torch.as_tensor(new_token_ids, device=self.device, dtype=torch.int32)
-        pt_new_position_ids = torch.as_tensor(new_position_ids, device=self.device, dtype=torch.int32)
+        pt_new_token_ids = torch.as_tensor(
+            new_token_ids, device=self.device, dtype=torch.int32
+        )
+        pt_new_position_ids = torch.as_tensor(
+            new_position_ids, device=self.device, dtype=torch.int32
+        )
 
-        pt_kv_page_indices = torch.as_tensor(kv_page_indices, device=self.device, dtype=torch.int32)
-        pt_kv_page_indptr = torch.as_tensor(kv_page_indptr, device=self.device, dtype=torch.int32)
-        pt_kv_last_page_lens = torch.as_tensor(kv_last_page_lens, device=self.device, dtype=torch.int32)
+        pt_kv_page_indices = torch.as_tensor(
+            kv_page_indices, device=self.device, dtype=torch.int32
+        )
+        pt_kv_page_indptr = torch.as_tensor(
+            kv_page_indptr, device=self.device, dtype=torch.int32
+        )
+        pt_kv_last_page_lens = torch.as_tensor(
+            kv_last_page_lens, device=self.device, dtype=torch.int32
+        )
         pt_qo_indptr = torch.as_tensor(qo_indptr, device=self.device, dtype=torch.int32)
-        pt_custom_mask = torch.as_tensor(custom_mask, device=self.device, dtype=torch.bool)
+        pt_custom_mask = torch.as_tensor(
+            custom_mask, device=self.device, dtype=torch.bool
+        )
 
         input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
 
@@ -285,9 +362,7 @@ class Driver:
         # print('custom_mask', custom_masks)
 
         with torch.cuda.device(self.device):
-            
-            start_time = time.time()
-            
+
             output_embeds = self.lm.model.forward(
                 input_embeds=input_embeds,
                 position_ids=pt_new_position_ids,
@@ -297,19 +372,19 @@ class Driver:
                 kv_last_page_lens=pt_kv_last_page_lens,
                 qo_indptr=pt_qo_indptr,
                 custom_mask=pt_custom_mask,
-                single_token_inference_mode=False#single_token_inference_mode,
+                single_token_inference_mode=False,  # single_token_inference_mode,
             )
-            #print(f"output_embeds mean: {output_embeds.mean().item()}")
+            # print(f"output_embeds mean: {output_embeds.mean().item()}")
 
             # precompute the dists
             logits = self.lm.lm_head(output_embeds)
-            
-            #torch.cuda.synchronize()
-            #elapsed_time = (time.time() - start_time) * 1000
-            #print(f"forward pass elapsed time {elapsed_time:.2f}ms size {output_embeds.shape}")
+
+            # torch.cuda.synchronize()
+            # elapsed_time = (time.time() - start_time) * 1000
+            # print(f"forward pass elapsed time {elapsed_time:.2f}ms size {output_embeds.shape}")
             # topk
-            
-            #print(f"logits mean: {logits.mean().item()}")
+
+            # print(f"logits mean: {logits.mean().item()}")
             condensed = torch.topk(logits, k=self.dist_size, sorted=True)
 
         # print(logits.shape)
@@ -317,11 +392,15 @@ class Driver:
         for token_map in output_embed_postproc:
             vec_id = token_map["vec_id"]
             idx = token_map["idx"]
-            self.embed_storage_p1[vec_id].copy_(condensed.values[idx], non_blocking=True)
-            self.embed_storage_p2[vec_id].copy_(condensed.indices[idx], non_blocking=True)
+            self.embed_storage_p1[vec_id].copy_(
+                condensed.values[idx], non_blocking=True
+            )
+            self.embed_storage_p2[vec_id].copy_(
+                condensed.indices[idx], non_blocking=True
+            )
 
-        #torch.cuda.synchronize()
-        #elapsed_time = (time.time() - start_time) * 1000
-        #print(f"fill_block elapsed time {elapsed_time}ms size {output_embeds.shape}")
+        # torch.cuda.synchronize()
+        # elapsed_time = (time.time() - start_time) * 1000
+        # print(f"fill_block elapsed time {elapsed_time}ms size {output_embeds.shape}")
 
         self.inter_fill_time = time.time()

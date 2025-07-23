@@ -1,0 +1,3 @@
+interface ping {
+    ping: func(message:string) -> string;
+}

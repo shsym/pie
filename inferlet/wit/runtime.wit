@@ -1,0 +1,10 @@
+interface runtime {
+
+    get-version: func() -> string;
+    get-instance-id: func() -> string;
+
+    // TODO: telemetry
+
+    // TODO: spawning instances
+
+}
