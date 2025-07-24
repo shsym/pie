@@ -7,10 +7,10 @@ verbose = true
 log = "pie.log"
 
 [[backend]]
-backend_type = "cxx"
-exec_path = "../backend/backend-cuda/build/bin/pie_cuda_be"
-#backend_type = "python"
-#exec_path = "../backend/backend-python/server.py"
+#backend_type = "cxx"
+#exec_path = "../backend/backend-cuda/build/bin/pie_cuda_be"
+backend_type = "python"
+exec_path = "../backend/backend-python/server.py"
 model = "llama-3.2-1b-instruct"
 device = "cuda:0"
 dtype = "bfloat16"

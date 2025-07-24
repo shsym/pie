@@ -982,6 +982,7 @@ impl L4m {
                 TRIGGERS
                     .fill_block_trigger
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                //println!("BatchSync triggered");
             }
 
             if let Some((_, senders)) = event_table.remove(&correlation_id) {
