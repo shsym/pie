@@ -353,7 +353,8 @@ def run_zmq_server(router, engine, config, model_metadata):
                     elif command == "embed_text":
                         engine.embed_text(request.embed_text)
                     elif command == "fill_block":
-                        engine.fill_block(request.fill_block)
+                        res = engine.fill_block(request.fill_block)
+                        response = l4m_pb2.Response(correlation_id=request.correlation_id, batch_sync=res)
                     elif command == "mask_block":
                         engine.mask_block(request.mask_block)
                     elif command == "copy_block":

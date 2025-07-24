@@ -180,6 +180,10 @@ message GetInfoResponse {
   Tokenizer tokenizer = 7;
 }
 
+message BatchSyncResponse {
+
+}
+
 message Tokenizer {
   map<uint32, bytes> merge_table = 1;
   map<string, uint32> special_tokens = 2;
@@ -211,5 +215,6 @@ message Response {
   oneof command {
     BatchSampleTopKResponse sample_top_k = 2;
     GetInfoResponse get_info = 3;
+    BatchSyncResponse batch_sync = 4;
   }
 }

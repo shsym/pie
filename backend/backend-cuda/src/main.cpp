@@ -446,6 +446,9 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     }
                     model.handle_fill_block(commands);
 
+                    needs_response = true;
+                    auto* proto_response = response.mutable_batch_sync();
+
                 } else if (request.has_mask_block()) {
                     //std::cout << "[ZMQ Server Thread] Handling BatchMaskBlock request." << std::endl;
                     std::vector<Model::MaskBlockCommand> commands;

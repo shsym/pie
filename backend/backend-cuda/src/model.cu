@@ -376,7 +376,7 @@ void Model::ModelImpl::handle_fill_block(const std::vector<Model::FillBlockComma
     }
     scope.record("postproc");
 
-    cudaStreamSynchronize(stream);
+    //cudaStreamSynchronize(stream);
     profiler.print_report();
 
 }

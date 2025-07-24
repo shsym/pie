@@ -19,6 +19,7 @@ from l4m_pb2 import (  # pylint: disable=no-name-in-module
     ObjectKind,
     SampleTopKResponse,
     BatchFillBlock,
+    BatchSyncResponse
 )
 
 from l4m_vision_pb2 import BatchEmbedImage  # pylint: disable=no-name-in-module
@@ -136,7 +137,7 @@ class Driver:
         """TODO: Add method docstring."""
         # in current implementation, all allocations are already done in the constructor.
         # so we don't need to deallocate anything.
-        raise NotImplementedError("Not implemented")
+        pass
 
     def embed_text(self, cmds: BatchEmbedText):
         """TODO: Add method docstring."""
@@ -149,7 +150,7 @@ class Driver:
     def embed_image(self, cmds: BatchEmbedImage):
         """TODO: Add method docstring."""
         # unimplemented
-        raise NotImplementedError("Not implemented")
+        pass
 
     def mask_block(self, cmds: BatchMaskBlock):
         """TODO: Add method docstring."""
@@ -193,7 +194,7 @@ class Driver:
 
         # torch.cuda.synchronize()
         # print(f"decode_token_distribution elapsed time {(time.time() - start_time) * 1000}ms")
-        raise NotImplementedError("Not implemented")
+        pass
 
     @torch.inference_mode()
     def sample_top_k_request(
@@ -404,3 +405,5 @@ class Driver:
         # print(f"fill_block elapsed time {elapsed_time}ms size {output_embeds.shape}")
 
         self.inter_fill_time = time.time()
+
+        return BatchSyncResponse()

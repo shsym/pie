@@ -2,7 +2,7 @@ import asyncio
 import time
 from pathlib import Path
 from blake3 import blake3
-from symphony import SymphonyClient, Instance  # Assuming these are defined elsewhere
+from pie import SymphonyClient, Instance  # Assuming these are defined elsewhere
 import random
 
 async def main():
