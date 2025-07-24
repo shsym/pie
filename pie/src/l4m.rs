@@ -12,6 +12,7 @@ use rand::Rng;
 use std::cmp::{Ordering, PartialEq};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::AtomicBool;
 
 use serde::Serialize;
 use std::sync::Arc;
@@ -27,7 +28,6 @@ mod pb_bindings {
 mod pb_bindings_vision {
     include!(concat!(env!("OUT_DIR"), "/l4m.vision.rs"));
 }
-
 
 macro_rules! try_trap {
     ($result:expr, $inst_id:expr, $msg:expr) => {
@@ -46,6 +46,17 @@ const PROTOCOL_VISION: usize = 1;
 
 static AVAILABLE_MODELS: std::sync::LazyLock<boxcar::Vec<(String, usize)>> =
     std::sync::LazyLock::new(boxcar::Vec::new);
+
+/// Holds shared triggers for manual batching strategies.
+struct ManualTriggers {
+    fill_block_trigger: Arc<AtomicBool>,
+}
+
+// A static, lazily-initialized context to hold the triggers.
+static TRIGGERS: std::sync::LazyLock<ManualTriggers> =
+    std::sync::LazyLock::new(|| ManualTriggers {
+        fill_block_trigger: Arc::new(AtomicBool::new(true)),
+    });
 
 pub async fn attach_new_remote_backend(name: &str, endpoint: String) -> Option<()> {
     let backend = match backend::ZmqBackend::bind(&endpoint).await {
@@ -333,7 +344,11 @@ impl Batchable<BatchGroup> for Command {
                 //batching::k_or_t(Duration::from_millis(10), 30, None)
                 // 7ms, 14ms
                 //batching::t_only(Duration::from_millis(14))
-                batching::eager()
+                //batching::eager()
+
+                Box::new(batching::ManualStrategy::new(
+                    TRIGGERS.fill_block_trigger.clone(),
+                ))
             }
             Command::CopyBlock { .. } => batching::eager(),
             Command::MaskBlock { .. } => batching::eager(),
@@ -960,6 +975,15 @@ impl L4m {
             let correlation_id = resp.correlation_id;
             let payload = resp.command.unwrap();
 
+            // Handle BatchSync separately, as it's a general signal.
+            if let pb_bindings::response::Command::BatchSync(..) = &payload {
+                // Set the trigger to true. The CommandScheduler will pick this up
+                // on its next update and fire a batch of FillBlock commands.
+                TRIGGERS
+                    .fill_block_trigger
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+
             if let Some((_, senders)) = event_table.remove(&correlation_id) {
                 match payload {
                     pb_bindings::response::Command::SampleTopK(batch) => {
@@ -1002,6 +1026,10 @@ impl L4m {
                             }
                             _ => unreachable!(),
                         }
+                    }
+
+                    pb_bindings::response::Command::BatchSync(..) => {
+                        // fire the next batch, or set the ready flag to true.
                     }
                 }
             }

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub trait BatchingStrategy: Debug + Send {
@@ -33,7 +35,6 @@ pub fn k_or_t(
     KorTStrategy::k_or_t(max_wait_time, min_size, max_size).into_box()
 }
 
-
 /// Creates a queue that uses an adaptive strategy to minimize latency
 /// by estimating the arrival rate `lambda` online.
 ///
@@ -51,18 +52,55 @@ pub fn adaptive(
     f_values: Vec<Duration>,
     max_size: usize,
 ) -> Result<Box<dyn BatchingStrategy>, &'static str> {
-    AdaptiveStrategy::new(
-        initial_lambda,
-        alpha,
-        recalc_interval,
-        f_values,
-        max_size,
-    )
+    AdaptiveStrategy::new(initial_lambda, alpha, recalc_interval, f_values, max_size)
         .map(|s| s.into_box())
 }
 
+pub fn manual() -> (Box<dyn BatchingStrategy>, Arc<AtomicBool>) {
+    let trigger = Arc::new(AtomicBool::new(false));
+    let strategy = ManualStrategy {
+        count: 0,
+        trigger: trigger.clone(),
+    };
+    (Box::new(strategy), trigger)
+}
 
+/// A strategy that batches items only when an external trigger is fired.
+#[derive(Debug)]
+pub struct ManualStrategy {
+    count: usize,
+    trigger: Arc<AtomicBool>,
+}
 
+impl ManualStrategy {
+    /// Creates a new ManualStrategy that uses the provided atomic boolean as a trigger.
+    pub fn new(trigger: Arc<AtomicBool>) -> Self {
+        Self { count: 0, trigger }
+    }
+}
+
+impl BatchingStrategy for ManualStrategy {
+    fn update(&mut self, _now: Instant) {
+        // We only need to know how many items there are, not when they arrived.
+        self.count += 1;
+    }
+
+    fn batch(&mut self, _now: Instant) -> usize {
+        if self.count == 0 {
+            return 0;
+        }
+
+        // Atomically check if the trigger is set to true, and reset it to false.
+        // `swap` ensures we only fire once per trigger.
+        if self.trigger.swap(false, Ordering::SeqCst) {
+            let batch_size = self.count;
+            self.count = 0;
+            batch_size
+        } else {
+            0
+        }
+    }
+}
 
 /// "K-or-T" Strategy
 // 	For instance: If queue size reaches K, launch immediately; otherwise launch after T ms if K isn’t reached.
@@ -149,8 +187,6 @@ impl BatchingStrategy for KorTStrategy {
     }
 }
 
-
-
 /// An adaptive strategy that determines the optimal batch size (`n*`) by modeling
 /// the system as a queue to minimize average latency. It estimates the arrival
 /// rate `lambda` online and periodically recalculates `n*`.
@@ -234,11 +270,7 @@ impl AdaptiveStrategy {
             }
         }
 
-        if best_n > 0 {
-            Some(best_n)
-        } else {
-            None
-        }
+        if best_n > 0 { Some(best_n) } else { None }
     }
 
     /// Re-evaluates `optimal_n` using the latest `lambda` estimate.
@@ -294,7 +326,6 @@ impl BatchingStrategy for AdaptiveStrategy {
         }
     }
 }
-
 
 #[derive(Debug)]
 pub struct BatchQueue<T> {
