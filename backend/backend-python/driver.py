@@ -137,7 +137,6 @@ class Driver:
         """TODO: Add method docstring."""
         # in current implementation, all allocations are already done in the constructor.
         # so we don't need to deallocate anything.
-        pass
 
     def embed_text(self, cmds: BatchEmbedText):
         """TODO: Add method docstring."""
@@ -150,7 +149,6 @@ class Driver:
     def embed_image(self, cmds: BatchEmbedImage):
         """TODO: Add method docstring."""
         # unimplemented
-        pass
 
     def mask_block(self, cmds: BatchMaskBlock):
         """TODO: Add method docstring."""
@@ -194,7 +192,6 @@ class Driver:
 
         # torch.cuda.synchronize()
         # print(f"decode_token_distribution elapsed time {(time.time() - start_time) * 1000}ms")
-        pass
 
     @torch.inference_mode()
     def sample_top_k_request(

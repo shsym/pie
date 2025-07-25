@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# pre-commit hook: ensure pylint is installed, then run it on staged Python files
+
+set -e
+
+# Check for uv in PATH
+if ! command -v uv &> /dev/null; then
+  echo "Error: uv not found in your PATH."
+  echo "   Please install uv or add it to your PATH."
+  exit 1
+fi
+
+# Use the uv managed pylint to avoid import errors
+# Disabling refactor warnings for now
+lint_cmd="uv --project backend/backend-python run pylint --disable=R"
+
+# Gather all staged .py files
+staged_py=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$') || true
+
+# Nothing to lint
+if [[ -z "$staged_py" ]]; then
+  exit 0
+fi
+
+# Run pylint on each file and report problematic files
+problematic_files=()
+declare -A error_messages
+overall_status=0
+
+for file in $staged_py; do
+  error_output=$($lint_cmd "$file" 2>&1) || {
+    problematic_files+=("$file")
+    error_messages["$file"]="$error_output"
+    overall_status=1
+  }
+done
+
+if [[ $overall_status -ne 0 ]]; then
+  echo "Error: Pylint found issues in staged files."
+  for file in "${problematic_files[@]}"; do
+    echo "   - $file"
+  done
+  
+  echo ""
+  echo "Detailed error messages:"
+  echo "========================"
+  for file in "${problematic_files[@]}"; do
+    echo ""
+    echo "File: $file"
+    echo "---"
+    echo "${error_messages[$file]}"
+  done
+  
+  echo ""
+  echo "Commit aborted. Fix the above errors or stage only clean files."
+  exit 1
+fi
+
+# All good
+exit 0
