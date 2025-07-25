@@ -1,0 +1,45 @@
+interface model {
+
+    // Import pollable functionality from the WASI IO poll package
+    use wasi:io/poll@0.2.4.{pollable};
+
+    // Defines task priority levels
+    enum priority {
+        low,        // Lowest priority
+        normal,     // Default priority
+        high,       // Highest priority
+    }
+
+    // Retrieve a model by name; returns None if not found
+    get-model: func(name: string) -> option<model>;
+
+    // Get a list of all available model names
+    get-all-models: func() -> list<string>;
+
+    // Get names of models that have all specified traits (e.g. "input_text", "tokenize")
+    get-all-models-with-traits: func(traits: list<string>) -> list<string>;
+
+    // Resource representing a specific model instance
+    resource model {
+        get-name: func() -> string;                  // Returns the model's name (e.g. "llama-3.1-8b-instruct")
+        get-traits: func() -> list<string>;          // Returns the full set of model traits
+        get-description: func() -> string;           // Human-readable description of the model
+        get-version: func() -> string;               // Model version string (e.g. "1.0")
+        get-license: func() -> string;               // License name (e.g. "Llama")
+        get-prompt-template: func() -> string;       // Returns the prompt formatting template in Tera
+        create-queue: func() -> queue;               // Create a new command queue
+        debug-query: func(query: string) -> string;  // Sends a message to the model and returns the response
+    }
+
+    // Queue resource with methods for synchronization and priority control
+    resource queue {
+        synchronize: func() -> synchronization-result; // Begin synchronization process
+        set-priority: func(priority: priority);     // Change the queue's priority
+    }
+
+    // Result of a synchronization attempt
+    resource synchronization-result {
+        pollable: func() -> pollable;               // Returns a pollable for async readiness checks
+        get: func() -> option<bool>;                // Returns true if sync succeeded, false if failed, none if not ready
+    }
+}

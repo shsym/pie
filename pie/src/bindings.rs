@@ -1,8 +1,8 @@
 use wasmtime::component::HasSelf;
 
-mod l4m;
+pub mod l4m;
 mod l4m_vision;
-mod messaging;
+pub mod messaging;
 mod ping;
 mod runtime;
 

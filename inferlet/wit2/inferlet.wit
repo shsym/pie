@@ -1,0 +1,24 @@
+package pie:inferlet;
+
+world traits {
+    import allocate;
+    import forward;
+    import input-text;
+    import input-image;
+    import tokenize;
+    import output-text;
+}
+
+world inferlet {
+    include traits;
+    import model;
+    import runtime;
+    export run;
+}
+
+world inferlet-server {
+    include traits;
+    import model;
+    import runtime;
+    export wasi:http/incoming-handler@0.2.4;
+}

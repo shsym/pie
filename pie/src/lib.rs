@@ -21,6 +21,7 @@ mod runtime;
 pub mod server;
 mod tokenizer;
 mod utils;
+mod bindings2;
 
 // Re-export core components from internal modules
 use crate::auth::{create_jwt, init_secret};

@@ -243,7 +243,7 @@ impl AdaptiveStrategy {
     /// Performs the core calculation to find the optimal batch size `n*`.
     fn calculate_optimal_n(
         lambda: f64,
-        f_values: &Vec<Duration>,
+        f_values: &[Duration],
         max_size: usize,
     ) -> Option<usize> {
         let mut best_n = 0;
@@ -400,7 +400,7 @@ where
     pub fn push(&mut self, stream: S, item: T, now: Instant) {
         self.pending_items_by_stream
             .entry(stream)
-            .or_insert_with(VecDeque::new)
+            .or_default()
             .push_back((item, now));
     }
 
@@ -438,13 +438,13 @@ where
                     .push(item, timestamp);
 
                 self.current_group_by_stream
-                    .entry(stream.clone())
+                    .entry(stream)
                     .or_insert(curr_group);
 
                 self.streams_by_current_group
                     .entry(curr_group)
-                    .or_insert_with(Vec::new)
-                    .push(stream.clone());
+                    .or_default()
+                    .push(stream);
             }
 
             if queue.is_empty() {
