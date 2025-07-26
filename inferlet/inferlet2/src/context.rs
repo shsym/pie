@@ -1,128 +1,200 @@
 use crate::drafter::Drafter;
-use crate::l4m::ObjectType;
+use crate::pool::{Allocator, RcResourcePool, ResourcePool};
 use crate::sampler::Sampler;
 use crate::stop_condition::StopCondition;
-use crate::utils::{ResourcePool, ResourceRcPool};
-use crate::{drafter, l4m, l4m_async, sampler, stop_condition};
+use crate::{
+    allocate, core, forward, input_text, output_text_async, sampler, stop_condition, tokenize,
+};
 use std::cell::RefCell;
-use std::mem;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
-
-static STREAM: AtomicU32 = AtomicU32::new(0);
-
-fn get_unique_stream() -> u32 {
-    STREAM.fetch_add(1, Ordering::SeqCst)
-}
+use std::{fmt, mem};
 
 #[derive(Debug)]
-struct Resources {
-    block_ids: ResourceRcPool,
-    embed_ids: ResourcePool,
+struct KvPageAllocator {}
+
+#[derive(Debug)]
+struct EmbedAllocator {}
+
+impl Allocator for KvPageAllocator {
+    fn allocate(&self, queue: &core::Queue, ids: &[u32]) -> crate::pool::Result<()> {
+        allocate::allocate_kv_pages(queue, ids);
+        Ok(())
+    }
+
+    fn deallocate(&self, queue: &core::Queue, ids: &[u32]) -> crate::pool::Result<()> {
+        allocate::deallocate_kv_pages(queue, ids);
+        Ok(())
+    }
 }
 
-#[derive(Clone, Debug)]
-pub struct Model {
-    model: Rc<l4m::Model>,
-    block_size: usize,
-    tokenizer: Rc<l4m::Tokenizer>,
-    resources: Rc<RefCell<Resources>>,
+impl Allocator for EmbedAllocator {
+    fn allocate(&self, queue: &core::Queue, ids: &[u32]) -> crate::pool::Result<()> {
+        allocate::allocate_embeds(queue, ids);
+        Ok(())
+    }
+    fn deallocate(&self, queue: &core::Queue, ids: &[u32]) -> crate::pool::Result<()> {
+        allocate::deallocate_embeds(queue, ids);
+        Ok(())
+    }
+}
+
+thread_local! {
+    static KV_PAGE_POOL: RefCell<HashMap<u32, Rc<RefCell<RcResourcePool<KvPageAllocator>>>>> = RefCell::new(HashMap::new());
+    static EMBED_POOL: RefCell<HashMap<u32, Rc<RefCell<ResourcePool<EmbedAllocator>>>>> = RefCell::new(HashMap::new());
+}
+
+/// Helper function to get the KV page pool for a given queue.
+/// It accesses the global `OnceCell` and initializes the pool map on first use.
+fn get_kv_page_pool(queue: &core::Queue) -> Rc<RefCell<RcResourcePool<KvPageAllocator>>> {
+    let service_id = queue.get_service_id();
+
+    // Use .with() to access the thread-local static.
+    KV_PAGE_POOL.with(|pools| {
+        // Borrow the map mutably to insert a new pool if needed for this service_id.
+        let mut pools_map = pools.borrow_mut();
+        pools_map
+            .entry(service_id)
+            .or_insert_with(|| {
+                let new_pool = RcResourcePool::new(KvPageAllocator {}, u32::MAX, true, 20);
+                Rc::new(RefCell::new(new_pool))
+            })
+            .clone()
+    })
+}
+
+fn get_embed_pool(queue: &core::Queue) -> Rc<RefCell<ResourcePool<EmbedAllocator>>> {
+    let service_id = queue.get_service_id();
+
+    EMBED_POOL.with(|pools| {
+        let mut pools_map = pools.borrow_mut();
+        pools_map
+            .entry(service_id)
+            .or_insert_with(|| {
+                let new_pool = ResourcePool::new(EmbedAllocator {}, u32::MAX, true, 20);
+                Rc::new(RefCell::new(new_pool))
+            })
+            .clone()
+    })
+}
+
+pub fn allocate_kv_pages(queue: &core::Queue, count: usize) -> Result<Vec<u32>, ContextError> {
+    let pool = get_kv_page_pool(queue);
+    pool.borrow_mut()
+        .acquire_many(queue, count)
+        .map_err(|_| ContextError::OutOfMemory("Failed to allocate KV pages".to_string()))
+}
+
+pub fn deallocate_kv_pages(queue: &core::Queue, ids: &[u32]) -> Result<(), ContextError> {
+    let pool = get_kv_page_pool(queue);
+    pool.borrow_mut()
+        .release_many(queue, ids)
+        .map_err(|_| ContextError::OutOfMemory("Failed to deallocate KV pages".to_string()))
+}
+
+pub fn increment_rc_kv_pages(queue: &core::Queue, ids: &[u32]) {
+    let pool = get_kv_page_pool(queue);
+    pool.borrow_mut().increment_rc_many(ids);
+}
+
+pub fn allocate_embeds(queue: &core::Queue, count: usize) -> Result<Vec<u32>, ContextError> {
+    let pool = get_embed_pool(queue);
+    pool.borrow_mut()
+        .acquire_many(queue, count)
+        .map_err(|_| ContextError::OutOfMemory("Failed to allocate embeds".to_string()))
+}
+
+pub fn deallocate_embeds(queue: &core::Queue, ids: &[u32]) -> Result<(), ContextError> {
+    let pool = get_embed_pool(queue);
+    pool.borrow_mut()
+        .release_many(queue, ids)
+        .map_err(|_| ContextError::OutOfMemory("Failed to deallocate embeds".to_string()))
 }
 
 #[derive(Debug)]
 pub struct Context {
-    pub inner: Model,
-    pub stream: u32,
-    pub block_ids: Vec<u32>,
-    pub last_block_len: usize,
+    queue: core::Queue,
+    model: Rc<core::Model>,
 
-    pub token_ids: Vec<u32>,
-    pub pending_token_ids: Vec<u32>,
-    // occupied_block_ids: Vec<u32>,
-    // free_block_ids: Vec<u32>,
-    // pending_token_ids: Vec<u32>,
-    // processed_token_ids: Vec<u32>,
+    kv_page_ids: Vec<u32>,
+    last_kv_page_len: usize,
+
+    token_ids: Vec<u32>,
+    pending_token_ids: Vec<u32>,
+
+    kv_page_size: usize,
+
+    tokenizer: Rc<tokenize::Tokenizer>,
 }
 
-#[derive(Clone, Debug)]
-pub struct Tokenizer {
-    tokenizer: Rc<l4m::Tokenizer>,
+#[derive(Debug)]
+pub enum ContextError {
+    IncompatibleModel(String),
+    OutOfMemory(String),
 }
 
-impl Model {
-    pub fn available_models() -> Vec<String> {
-        l4m::get_all_models()
-    }
-
-    pub fn new(model_name: &str) -> Option<Self> {
-        if let Some(model) = l4m::get_model(model_name) {
-            // Prefetch the tokenizer
-            let tokenizer = model.get_tokenizer();
-            let model = Rc::new(model);
-
-            let resources = Resources {
-                block_ids: ResourceRcPool::new(model.clone(), ObjectType::Block, u32::MAX, true),
-                embed_ids: ResourcePool::new(model.clone(), ObjectType::Embed, u32::MAX, false),
-            };
-            let block_size = model.get_block_size() as usize;
-            Some(Self {
-                model: model.clone(),
-                block_size,
-                tokenizer: Rc::new(tokenizer),
-                resources: Rc::new(RefCell::new(resources)),
-            })
-        } else {
-            None
+impl fmt::Display for ContextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContextError::IncompatibleModel(msg) => write!(f, "Incompatible model: {}", msg),
+            ContextError::OutOfMemory(msg) => write!(f, "Out of memory: {}", msg),
         }
-    }
-
-    pub fn create_context(&self) -> Context {
-        Context {
-            inner: self.clone(),
-            stream: get_unique_stream(),
-            block_ids: Vec::new(),
-            last_block_len: 0,
-            token_ids: Vec::new(),
-            pending_token_ids: Vec::new(),
-        }
-    }
-
-    pub fn get_tokenizer(&self) -> Tokenizer {
-        Tokenizer {
-            tokenizer: self.tokenizer.clone(),
-        }
-    }
-
-    pub fn get_block_size(&self) -> usize {
-        self.model.get_block_size() as usize
-    }
-}
-
-impl Tokenizer {
-    pub fn encode(&self, text: &str) -> Vec<u32> {
-        self.tokenizer.tokenize(text)
-    }
-
-    pub fn decode(&self, token_ids: &[u32]) -> String {
-        self.tokenizer.detokenize(token_ids)
-    }
-
-    pub fn get_vocabs(&self) -> Vec<Vec<u8>> {
-        self.tokenizer.get_vocabs()
     }
 }
 
 impl Drop for Context {
     fn drop(&mut self) {
-        let taken = mem::take(&mut self.block_ids);
-        self.release(l4m::ObjectType::Block, &taken);
+        let taken = mem::take(&mut self.kv_page_ids);
+        deallocate_kv_pages(&self.queue, &taken).unwrap();
     }
 }
 
 impl Context {
-    pub fn stream(&self) -> u32 {
-        self.stream
+    pub fn new(model: core::Model) -> Result<Self, ContextError> {
+        Self::check_model_traits(&model, &["input_text", "tokenize", "output_text"])?;
+
+        let queue = model.create_queue();
+        let kv_page_size = allocate::get_kv_page_size(&queue) as usize;
+        let tokenizer = tokenize::get_tokenizer(&queue);
+
+        Ok(Context {
+            queue,
+            model: Rc::new(model),
+            kv_page_ids: Vec::new(),
+            last_kv_page_len: 0,
+            token_ids: Vec::new(),
+            pending_token_ids: Vec::new(),
+            kv_page_size,
+            tokenizer: Rc::new(tokenizer),
+        })
+    }
+
+    fn check_model_traits(
+        model: &core::Model,
+        required_traits: &[&str],
+    ) -> Result<(), ContextError> {
+        // Store the returned Vec<String> in a variable to extend its lifetime.
+        let available_traits_vec = model.get_traits();
+
+        let available_traits: HashSet<&str> =
+            available_traits_vec.iter().map(String::as_str).collect();
+
+        // Find any required traits that are not in the available set.
+        let missing: Vec<_> = required_traits
+            .iter()
+            .filter(|t| !available_traits.contains(*t))
+            .cloned()
+            .collect();
+
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(ContextError::IncompatibleModel(format!(
+                "Model '{}' is missing required traits: {:?}",
+                model.get_name(),
+                missing
+            )))
+        }
     }
 
     pub fn get_token_ids(&self) -> &[u32] {
@@ -130,63 +202,19 @@ impl Context {
     }
 
     pub fn get_text(&self) -> String {
-        self.inner.tokenizer.detokenize(&self.token_ids)
-    }
-
-    fn alloc(&mut self, ty: ObjectType, count: usize) -> Vec<u32> {
-        let ids = match ty {
-            ObjectType::Block => {
-                let ids = RefCell::borrow_mut(&self.inner.resources)
-                    .block_ids
-                    .acquire_many(self.stream, count)
-                    .unwrap();
-                ids
-            }
-            ObjectType::Embed => {
-                let ids = RefCell::borrow_mut(&self.inner.resources)
-                    .embed_ids
-                    .acquire_many(self.stream, count)
-                    .unwrap();
-                ids
-            }
-        };
-
-        ids
-    }
-
-    fn release(&mut self, ty: ObjectType, ids: &[u32]) {
-        match ty {
-            ObjectType::Block => {
-                RefCell::borrow_mut(&self.inner.resources)
-                    .block_ids
-                    .release_many(self.stream, ids)
-                    .unwrap();
-            }
-            ObjectType::Embed => {
-                RefCell::borrow_mut(&self.inner.resources)
-                    .embed_ids
-                    .release_many(self.stream, ids)
-                    .unwrap();
-            }
-        }
-    }
-
-    fn block_size(&self) -> usize {
-        self.inner.block_size
+        self.tokenizer.detokenize(&self.token_ids)
     }
 
     pub fn fork_unsafe(&self) -> Self {
+        increment_rc_kv_pages(&self.queue, &self.kv_page_ids);
 
-        self.inner
-            .resources
-            .borrow_mut()
-            .block_ids
-            .increment_rc_many(&self.block_ids);
         Context {
-            inner: self.inner.clone(),
-            stream: get_unique_stream(),
-            block_ids: self.block_ids.clone(),
-            last_block_len: self.block_size(),
+            queue: self.model.create_queue(),
+            model: self.model.clone(),
+            kv_page_size: self.kv_page_size,
+            tokenizer: self.tokenizer.clone(),
+            kv_page_ids: self.kv_page_ids.clone(),
+            last_kv_page_len: self.kv_page_size,
             token_ids: self.token_ids.clone(),
             pending_token_ids: self.pending_token_ids.clone(),
         }
@@ -194,23 +222,25 @@ impl Context {
 
     pub fn fork(&mut self) -> Self {
         // flush the pending tokens
-        if self.pending_token_ids.len() > 0 {
+        if !self.pending_token_ids.is_empty() {
             self.flush();
         }
 
-        let forked = if self.last_block_len == self.block_size() {
-            // easy case: the last block is full
+        let forked = if self.last_kv_page_len == self.kv_page_size {
+            // easy case: the last page is full
             Context {
-                inner: self.inner.clone(),
-                stream: get_unique_stream(),
-                block_ids: self.block_ids.clone(),
-                last_block_len: self.block_size(),
+                queue: self.model.create_queue(),
+                model: self.model.clone(),
+                kv_page_size: self.kv_page_size,
+                tokenizer: self.tokenizer.clone(),
+                kv_page_ids: self.kv_page_ids.clone(),
+                last_kv_page_len: self.kv_page_size,
                 token_ids: self.token_ids.clone(),
                 pending_token_ids: self.pending_token_ids.clone(),
             }
         } else {
-            let kept_block_len = self.block_ids.len() - 1;
-            let kept_tokens_len = kept_block_len * self.block_size();
+            let kept_kv_page_len = self.kv_page_ids.len() - 1;
+            let kept_tokens_len = kept_kv_page_len * self.kv_page_size;
 
             let forked_token_ids = self.token_ids[..kept_tokens_len].to_vec();
             let forked_pending_token_ids = [
@@ -218,48 +248,43 @@ impl Context {
                 &self.pending_token_ids[..],
             ]
             .concat();
-            let forked_block_ids = self.block_ids[..kept_block_len].to_vec();
-            let forked_last_block_len = if forked_block_ids.len() > 0 {
-                self.block_size()
+            let forked_kv_page_ids = self.kv_page_ids[..kept_kv_page_len].to_vec();
+            let forked_last_kv_page_len = if !forked_kv_page_ids.is_empty() {
+                self.kv_page_size
             } else {
                 0
             };
 
             Context {
-                inner: self.inner.clone(),
-                stream: get_unique_stream(),
-                block_ids: forked_block_ids,
-                last_block_len: forked_last_block_len,
+                queue: self.model.create_queue(),
+                model: self.model.clone(),
+                kv_page_size: self.kv_page_size,
+                tokenizer: self.tokenizer.clone(),
+                kv_page_ids: forked_kv_page_ids,
+                last_kv_page_len: forked_last_kv_page_len,
                 token_ids: forked_token_ids,
                 pending_token_ids: forked_pending_token_ids,
             }
         };
 
         // increase the refcount
-        self.inner
-            .resources
-            .borrow_mut()
-            .block_ids
-            .increment_rc_many(&forked.block_ids);
+        increment_rc_kv_pages(&forked.queue, &forked.kv_page_ids);
 
         forked
     }
 
     pub async fn generate_until(&mut self, stop_str: &str, max_tokens: usize) -> String {
         let mut sampler = sampler::GreedySampler::new();
-
-        let stop_str_token_ids = self.inner.tokenizer.tokenize(stop_str);
-
+        let stop_str_token_ids = self.tokenizer.tokenize(stop_str);
         let mut stop_condition = stop_condition::any(
             stop_condition::Until::new(stop_str_token_ids),
             stop_condition::Length::new(max_tokens),
         );
-
         self.generate(&mut sampler, &mut stop_condition).await
     }
 
     pub fn fill(&mut self, text: &str) {
-        let new_token_ids = self.inner.tokenizer.tokenize(text);
+        let new_token_ids = self.tokenizer.tokenize(text);
         self.fill_tokens(new_token_ids);
     }
 
@@ -276,7 +301,6 @@ impl Context {
             return;
         }
 
-        // take all pending tokens except the last one.
         let pending_token_ids = self
             .pending_token_ids
             .drain(..self.pending_token_ids.len() - 1)
@@ -286,79 +310,61 @@ impl Context {
             ..(self.token_ids.len() + pending_token_ids.len()) as u32)
             .collect::<Vec<u32>>();
 
-        let embed_ids = self.alloc(ObjectType::Embed, pending_token_ids.len());
+        let embed_ids = allocate_embeds(&self.queue, pending_token_ids.len()).unwrap();
+        input_text::embed_text(&self.queue, &embed_ids, &pending_token_ids, &position_ids);
 
-        self.inner
-            .model
-            .embed_text(self.stream, &embed_ids, &pending_token_ids, &position_ids);
-
-        // ensure we have enough blocks
-
-        let available_space = if self.block_ids.len() > 0 {
-            self.block_size() - self.last_block_len
+        let available_space = if !self.kv_page_ids.is_empty() {
+            self.kv_page_size - self.last_kv_page_len
         } else {
             0
         };
 
         if pending_token_ids.len() > available_space {
-            let needed_block_count =
-                (pending_token_ids.len() - available_space).div_ceil(self.block_size());
-            let new_block_ids = self.alloc(ObjectType::Block, needed_block_count);
-            self.block_ids.extend(new_block_ids);
+            let needed_page_count =
+                (pending_token_ids.len() - available_space).div_ceil(self.kv_page_size);
+            let new_kv_page_ids = allocate_kv_pages(&self.queue, needed_page_count).unwrap();
+            self.kv_page_ids.extend(new_kv_page_ids);
 
-            let remaining_tokens = (pending_token_ids.len() - available_space) % self.block_size();
-
-            self.last_block_len = if remaining_tokens == 0 {
-                self.block_size()
+            let remaining_tokens = (pending_token_ids.len() - available_space) % self.kv_page_size;
+            self.last_kv_page_len = if remaining_tokens == 0 {
+                self.kv_page_size
             } else {
                 remaining_tokens
             };
         } else {
-            self.last_block_len += pending_token_ids.len();
+            self.last_kv_page_len += pending_token_ids.len();
         }
 
-        // println!("context block_ids: {:?}", self.block_ids);
-        // println!("context last_block_len: {:?}", self.last_block_len);
-        // println!("context embed ids: {:?}", embed_ids);
-
-        self.inner.model.fill_block(
-            self.stream,
-            self.last_block_len as u32,
-            &self.block_ids,
+        forward::forward(
+            &self.queue,
+            self.last_kv_page_len as u32,
+            &self.kv_page_ids,
             &embed_ids,
             &[],
         );
 
         self.token_ids.extend(pending_token_ids);
-        // Free embeds
-        self.release(ObjectType::Embed, &embed_ids);
-    }
 
-    pub fn fill_image(&mut self, image_blob: &[u8]) {
-        //l4m_vision::embed_image(&self.model, self.stream, &[], image_blob);
+        deallocate_embeds(&self.queue, &embed_ids).unwrap();
     }
 
     pub async fn apply_sink(&mut self, sink_size: usize, window_size: usize) {
-        // flush the pending tokens
-
         if self.pending_token_ids.len() > 1 {
             self.flush();
         }
 
-        let num_pages_to_retain_begin = sink_size.div_ceil(self.block_size());
-        let num_pages_to_retain_end = window_size.div_ceil(self.block_size());
-        //println!("num blocks before sink: {}", self.block_ids.len());
+        let num_pages_to_retain_begin = sink_size.div_ceil(self.kv_page_size);
+        let num_pages_to_retain_end = window_size.div_ceil(self.kv_page_size);
 
-        if self.block_ids.len() > num_pages_to_retain_begin + num_pages_to_retain_end {
+        if self.kv_page_ids.len() > num_pages_to_retain_begin + num_pages_to_retain_end {
             let sink_start = num_pages_to_retain_begin;
-            let sink_end = self.block_ids.len() - num_pages_to_retain_end;
+            let sink_end = self.kv_page_ids.len() - num_pages_to_retain_end;
 
-            self.block_ids = self.block_ids[..=sink_start]
+            self.kv_page_ids = self.kv_page_ids[..=sink_start]
                 .iter()
-                .chain(self.block_ids[sink_end..].iter())
+                .chain(self.kv_page_ids[sink_end..].iter())
                 .cloned()
                 .collect();
-            //println!("num blocks after sink: {}", self.block_ids.len());
         }
     }
 
@@ -367,16 +373,14 @@ impl Context {
             self.flush();
         }
 
-        let num_pages_to_retain = window_size.div_ceil(self.block_size());
+        let num_pages_to_retain = window_size.div_ceil(self.kv_page_size);
 
-        if self.block_ids.len() > num_pages_to_retain {
-            let sink_start = self.block_ids.len() - num_pages_to_retain;
-
-            self.block_ids = self.block_ids[sink_start..].to_vec();
+        if self.kv_page_ids.len() > num_pages_to_retain {
+            let sink_start = self.kv_page_ids.len() - num_pages_to_retain;
+            self.kv_page_ids = self.kv_page_ids[sink_start..].to_vec();
         }
     }
 
-    // Simple autoregressive generation
     pub async fn generate<S: Sampler, C: StopCondition>(
         &mut self,
         sampler: &mut S,
@@ -386,83 +390,68 @@ impl Context {
             self.flush();
         }
 
-        // the seed must not be empty
-        assert!(self.pending_token_ids.len() == 1);
-        assert!(self.last_block_len != 0);
+        assert_eq!(self.pending_token_ids.len(), 1, "Must have one seed token");
+        assert_ne!(
+            self.last_kv_page_len, 0,
+            "Context must be filled before generation"
+        );
 
         let mut generated_token_ids = Vec::new();
-
-        let input_embed_id = self.alloc(ObjectType::Embed, 1);
-        let output_embed_id = self.alloc(ObjectType::Embed, 1);
+        let input_embed_id = allocate_embeds(&self.queue, 1).unwrap();
+        let output_embed_id = allocate_embeds(&self.queue, 1).unwrap();
 
         let mut next_token_id = self.pending_token_ids[0];
         let mut next_pos_id = self.token_ids.len() as u32;
 
         loop {
-            //let mut start = Instant::now();
-            // embed the next token
-            self.inner.model.embed_text(
-                self.stream,
+            input_text::embed_text(
+                &self.queue,
                 &input_embed_id,
                 &[next_token_id],
                 &[next_pos_id],
             );
 
-            // extend the block as needed
-            if self.last_block_len == self.block_size() || self.block_ids.len() == 0 {
-                let new_block_ids = self.alloc(ObjectType::Block, 1);
-                self.block_ids.extend(new_block_ids);
-                self.last_block_len = 1;
+            if self.last_kv_page_len == self.kv_page_size || self.kv_page_ids.is_empty() {
+                let new_kv_page_ids = allocate_kv_pages(&self.queue, 1).unwrap();
+                self.kv_page_ids.extend(new_kv_page_ids);
+                self.last_kv_page_len = 1;
             } else {
-                self.last_block_len += 1;
+                self.last_kv_page_len += 1;
             }
 
-            // fill the block
-            self.inner.model.fill_block(
-                self.stream,
-                self.last_block_len as u32,
-                &self.block_ids,
+            forward::forward(
+                &self.queue,
+                self.last_kv_page_len as u32,
+                &self.kv_page_ids,
                 &input_embed_id,
                 &output_embed_id,
             );
 
-            // sample the next token
-            let sampled = l4m_async::sample_top_k(
-                self.inner.model.clone(),
-                self.stream,
+            let sampled = output_text_async::get_next_token_distribution(
+                &self.queue,
                 output_embed_id.clone(),
-                32,
             )
             .await;
 
             let (next_token_ids, next_token_logits) = &sampled[0];
-            // get the next token id
             next_token_id = sampler.sample(next_token_ids, next_token_logits);
-            // update the position id
             next_pos_id += 1;
 
             generated_token_ids.push(next_token_id);
 
-            // stop condition
             if stop_condition.should_stop(&generated_token_ids) {
                 break;
             } else {
                 self.token_ids.push(next_token_id);
             }
-            //println!("TPOT: {:?}", elapsed);
         }
 
         self.pending_token_ids.clear();
         self.pending_token_ids.push(next_token_id);
+        deallocate_embeds(&self.queue, &input_embed_id).unwrap();
+        deallocate_embeds(&self.queue, &output_embed_id).unwrap();
 
-        // free the resources
-        self.release(ObjectType::Embed, &input_embed_id);
-        self.release(ObjectType::Embed, &output_embed_id);
-
-        // decode the generated tokens
-        let result = self.inner.tokenizer.detokenize(&generated_token_ids);
-
-        result
+        self.tokenizer.detokenize(&generated_token_ids)
     }
 
     pub async fn next(&mut self) -> (Vec<u32>, Vec<f32>) {
@@ -470,95 +459,89 @@ impl Context {
             self.flush();
         }
 
-        // the seed must not be empty
-        assert!(self.pending_token_ids.len() == 1);
-        assert!(self.last_block_len != 0);
+        assert_eq!(self.pending_token_ids.len(), 1, "Must have one seed token");
+        assert_ne!(
+            self.last_kv_page_len, 0,
+            "Context must be filled before generation"
+        );
 
-        let input_embed_id: Vec<u32> = self.alloc(ObjectType::Embed, 1);
-        let output_embed_id = self.alloc(ObjectType::Embed, 1);
+        let input_embed_id = allocate_embeds(&self.queue, 1).unwrap();
+        let output_embed_id = allocate_embeds(&self.queue, 1).unwrap();
 
         let next_token_id = self.pending_token_ids.pop().unwrap();
         let next_pos_id = self.token_ids.len() as u32;
-        // embed the next token
-        self.inner.model.embed_text(
-            self.stream,
+
+        input_text::embed_text(
+            &self.queue,
             &input_embed_id,
             &[next_token_id],
             &[next_pos_id],
         );
 
-        // extend the block as needed
-        if self.last_block_len == self.block_size() || self.block_ids.len() == 0 {
-            let new_block_ids = self.alloc(ObjectType::Block, 1);
-            self.block_ids.extend(new_block_ids);
-            self.last_block_len = 1;
+        if self.last_kv_page_len == self.kv_page_size || self.kv_page_ids.is_empty() {
+            let new_kv_page_ids = allocate_kv_pages(&self.queue, 1).unwrap();
+            self.kv_page_ids.extend(new_kv_page_ids);
+            self.last_kv_page_len = 1;
         } else {
-            self.last_block_len += 1;
+            self.last_kv_page_len += 1;
         }
 
-        // fill the block
-        self.inner.model.fill_block(
-            self.stream,
-            self.last_block_len as u32,
-            &self.block_ids,
+        forward::forward(
+            &self.queue,
+            self.last_kv_page_len as u32,
+            &self.kv_page_ids,
             &input_embed_id,
             &output_embed_id,
         );
 
-        // sample the next token
-        let sampled = l4m_async::sample_top_k(
-            self.inner.model.clone(),
-            self.stream,
-            output_embed_id.clone(),
-            32,
-        )
-        .await;
+        let sampled =
+            output_text_async::get_next_token_distribution(&self.queue, output_embed_id.clone())
+                .await;
 
         self.token_ids.push(next_token_id);
-        // free the resources
-        self.release(ObjectType::Embed, &input_embed_id);
-        self.release(ObjectType::Embed, &output_embed_id);
+
+        deallocate_embeds(&self.queue, &input_embed_id).unwrap();
+        deallocate_embeds(&self.queue, &output_embed_id).unwrap();
 
         sampled.into_iter().next().unwrap()
     }
 
-    // Simple autoregressive generation
     pub async fn generate_with_beam<C: StopCondition>(
         &mut self,
         stop_condition: &mut C,
         beam_size: usize,
     ) -> String {
         let mut beams = Vec::new();
-        beams.push((self.fork(), vec![], 0.0));
+        beams.push((self.fork(), vec![], 0.0f32));
 
         loop {
-            // check if we meets the stop condition
-            for (_, generated, _) in beams.iter() {
-                if stop_condition.should_stop(&generated) {
-                    return self.inner.tokenizer.detokenize(generated);
-                }
+            if let Some((_, generated_tokens, _)) = beams
+                .iter()
+                .find(|(_, genx, _)| stop_condition.should_stop(genx))
+            {
+                return self.tokenizer.detokenize(generated_tokens);
             }
 
             let mut next_beams = Vec::new();
             for (mut beam, generated, score) in beams.into_iter() {
-                let (next_token_ids, next_score) = beam.next().await;
-
-                for i in 0..beam_size {
+                let (next_token_ids, next_scores) = beam.next().await;
+                for i in 0..beam_size.min(next_token_ids.len()) {
                     let mut next_beam = beam.fork();
-                    next_beam.pending_token_ids.push(next_token_ids[i]);
-                    let next_generated = [generated.as_slice(), &[next_token_ids[i]]].concat();
-                    let next_score = score + next_score[i];
+                    next_beam.fill_token(next_token_ids[i]);
+                    let mut next_generated = generated.clone();
+                    next_generated.push(next_token_ids[i]);
+                    let next_score = score + next_scores[i];
                     next_beams.push((next_beam, next_generated, next_score));
                 }
             }
 
-            // get the top k beams by score in next_beam_cands
-            // sort the next_beam_cands by score
-            // and only keep the first beam_size beams
-            next_beams.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+            next_beams.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
             next_beams.truncate(beam_size);
-
             beams = next_beams;
+
+            if beams.is_empty() {
+                return String::new(); // Or handle as an error
+            }
         }
     }
 
@@ -567,198 +550,116 @@ impl Context {
         drafter: &mut D,
         sampler: &mut S,
         stop_condition: &mut C,
-        //stream: Option<UnboundedSender<u32>>,
     ) -> String {
         if self.pending_token_ids.len() > 1 {
             self.flush();
         }
 
-        // the seed must not be empty
-        assert!(self.pending_token_ids.len() == 1);
+        assert_eq!(self.pending_token_ids.len(), 1, "Must have one seed token");
 
         let mut generated_token_ids = Vec::new();
-
-        let mut next_token_ids = Vec::new();
-
-        next_token_ids.push(self.pending_token_ids[0]);
+        let mut next_token_ids = vec![self.pending_token_ids[0]];
 
         drafter.update(&self.token_ids);
 
         loop {
             drafter.update(&next_token_ids);
-
             let (spec_token_ids, spec_pos_ids) = drafter.draft();
-
             let combined_token_ids =
                 [next_token_ids.as_slice(), spec_token_ids.as_slice()].concat();
-            //let combined_pos_ids = [next_pos_ids.as_slice(), spec_pos_ids.as_slice()].concat();
 
             let combined_pos_ids = {
-                let offset = self.token_ids.len();
-                let mut res: Vec<u32> =
-                    (offset as u32..(offset + next_token_ids.len()) as u32).collect::<Vec<u32>>();
-
-                res.extend(spec_pos_ids.iter().map(|&x| x + offset as u32));
+                let offset = self.token_ids.len() as u32;
+                let mut res = (offset..offset + next_token_ids.len() as u32).collect::<Vec<u32>>();
+                res.extend(spec_pos_ids.iter().map(|&x| x + offset));
                 res
             };
 
-            let input_embed_id = self.alloc(ObjectType::Embed, combined_token_ids.len());
-            let output_embed_id = self.alloc(ObjectType::Embed, combined_token_ids.len());
+            let input_embed_id = allocate_embeds(&self.queue, combined_token_ids.len()).unwrap();
+            let output_embed_id = allocate_embeds(&self.queue, combined_token_ids.len()).unwrap();
 
-            // embed the next token
-            self.inner.model.embed_text(
-                self.stream,
+            input_text::embed_text(
+                &self.queue,
                 &input_embed_id,
                 &combined_token_ids,
                 &combined_pos_ids,
             );
 
-            // extend the block as needed
-            let available_space = self.block_size() - self.last_block_len;
-
+            let available_space = self.kv_page_size - self.last_kv_page_len;
             if combined_token_ids.len() > available_space {
-                let needed_block_count =
-                    (combined_token_ids.len() - available_space).div_ceil(self.block_size());
-                let new_block_ids = self.alloc(ObjectType::Block, needed_block_count);
-                self.block_ids.extend(new_block_ids);
-                self.last_block_len = (self.token_ids.len() + combined_token_ids.len())
-                    - (self.block_ids.len() - 1) * self.block_size();
+                let needed_page_count =
+                    (combined_token_ids.len() - available_space).div_ceil(self.kv_page_size);
+
+                let new_kv_page_ids = allocate_kv_pages(&self.queue, needed_page_count).unwrap();
+                self.kv_page_ids.extend(new_kv_page_ids);
+                self.last_kv_page_len = (self.token_ids.len() + combined_token_ids.len())
+                    - (self.kv_page_ids.len() - 1) * self.kv_page_size;
             } else {
-                self.last_block_len += combined_token_ids.len();
+                self.last_kv_page_len += combined_token_ids.len();
             }
 
-            // fill the block
-            self.inner.model.fill_block(
-                self.stream,
-                self.last_block_len as u32,
-                &self.block_ids,
+            forward::forward(
+                &self.queue,
+                self.last_kv_page_len as u32,
+                &self.kv_page_ids,
                 &input_embed_id,
                 &output_embed_id,
             );
 
-            let sampled = l4m_async::sample_top_k(
-                self.inner.model.clone(),
-                self.stream,
+            let sampled = output_text_async::get_next_token_distribution(
+                &self.queue,
                 output_embed_id[next_token_ids.len() - 1..].to_vec(),
-                32,
             )
             .await;
 
-            //assert_eq!(sampled.len(), max_trie_size + 1);
+            let mut verified_tokens = Vec::new();
+            let mut correct_spec_tokens = 0;
+            for i in 0..sampled.len() {
+                let (predicted_tokens, predicted_logits) = &sampled[i];
+                let sampled_token = sampler.sample(predicted_tokens, predicted_logits);
 
-            // the verification
-            let mut sampled_next_token_ids = Vec::new();
-
-            // The speculation "Trie" is a tree of possibilities. The first token is always correct.
-            // R[n] (P[n+1] P[n+2] P[n+3] P[n+2] P[n+3]) (P[n+1] P[n+2]) (P[n+1] P[n+2]) ...
-
-            let mut i = 0;
-            while i < sampled.len() {
-                let (next_token_ids, next_token_logits) = &sampled[i];
-                let next_token_id = sampler.sample(next_token_ids, next_token_logits);
-
-                // The first token (the root of Trie) is always correct.
-                if i == 0 {
-                    sampled_next_token_ids.push(next_token_id);
-                    i += 1;
-                    continue;
-                }
-
-                // we just got a freebie
-                if next_token_id == *sampled_next_token_ids.last().unwrap() {
-                    sampled_next_token_ids.push(next_token_id);
-
-                    // check if it has children
-                    if i < spec_pos_ids.len() && spec_pos_ids[i - 1] + 1 == spec_pos_ids[i] {
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                // we may have more chance, in one of our siblings
-                else if i < spec_pos_ids.len() {
-                    // check if the failed node has siblings
-                    let cur_lev = spec_pos_ids[i - 1];
-                    let mut next_sibling_offset = None;
-                    for (j, lev) in spec_pos_ids[i..].iter().copied().enumerate() {
-                        if lev < cur_lev {
-                            // we do not have any other options... T_T
-                            // our journey ends here
-                            break;
-                        } else if lev == cur_lev {
-                            // another "same" parent option.
-                            next_sibling_offset = Some(j + 1);
-                            break;
-                        }
-                    }
-
-                    if let Some(next_sibling_offset) = next_sibling_offset {
-                        i += next_sibling_offset;
-                    } else {
-                        break;
-                    }
+                if i < spec_token_ids.len() && sampled_token == spec_token_ids[i] {
+                    verified_tokens.push(sampled_token);
+                    correct_spec_tokens += 1;
                 } else {
+                    verified_tokens.push(sampled_token);
                     break;
                 }
             }
 
-            // exclude the tokens that are already in right place
-            let mut num_correct_specs_in_place = 0;
-            for (i, token_id) in sampled_next_token_ids.iter().enumerate() {
-                if spec_token_ids[i] == *token_id {
-                    num_correct_specs_in_place += 1;
-                } else {
-                    break;
+            let redundant_token_count = spec_token_ids.len() - correct_spec_tokens;
+            if self.last_kv_page_len > redundant_token_count {
+                self.last_kv_page_len -= redundant_token_count;
+            } else {
+                let mut remaining_redundancy = redundant_token_count - self.last_kv_page_len;
+                let redundant = self.kv_page_ids.pop().unwrap();
+                deallocate_kv_pages(&self.queue, &[redundant]).unwrap();
+
+                while remaining_redundancy > self.kv_page_size {
+                    let redundant = self.kv_page_ids.pop().unwrap();
+
+                    deallocate_kv_pages(&self.queue, &[redundant]).unwrap();
+                    remaining_redundancy -= self.kv_page_size;
                 }
+                self.last_kv_page_len = self.kv_page_size - remaining_redundancy;
             }
 
-            // shrink the blocks
-            let redundant_token_count = spec_token_ids.len() - num_correct_specs_in_place;
-
-            // easy case. just adjust the last block length
-            if self.last_block_len > redundant_token_count {
-                self.last_block_len -= redundant_token_count;
-            } else if self.last_block_len == redundant_token_count {
-                let block_id = self.block_ids.pop().unwrap();
-                self.last_block_len = self.block_size();
-                self.release(ObjectType::Block, &[block_id]);
-            }
-            // hard case. we need to shrink the blocks
-            else {
-                let redundant_block_count =
-                    (redundant_token_count - self.last_block_len).div_ceil(self.block_size());
-                // pop the blocks
-                for _ in 0..redundant_block_count {
-                    let block_id = self.block_ids.pop().unwrap();
-                    self.release(ObjectType::Block, &[block_id]);
-                }
-                self.last_block_len =
-                    (self.token_ids.len() + next_token_ids.len() + num_correct_specs_in_place)
-                        - (self.block_ids.len() - 1) * self.block_size();
-            }
-
-            next_token_ids = sampled_next_token_ids;
-
+            next_token_ids = verified_tokens;
             generated_token_ids.extend(&next_token_ids);
 
-            // stop condition
             if stop_condition.should_stop(&generated_token_ids) {
                 break;
             } else {
                 self.token_ids.extend(&next_token_ids);
             }
 
-            // free the resources
-            self.release(ObjectType::Embed, &input_embed_id);
-            self.release(ObjectType::Embed, &output_embed_id);
+            deallocate_embeds(&self.queue, &input_embed_id).unwrap();
+            deallocate_embeds(&self.queue, &output_embed_id).unwrap();
         }
 
         self.pending_token_ids.clear();
         self.pending_token_ids.extend(&next_token_ids);
 
-        // decode the generated tokens
-        let result = self.inner.tokenizer.detokenize(&generated_token_ids);
-
-        result
+        self.tokenizer.detokenize(&generated_token_ids)
     }
 }

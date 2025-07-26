@@ -1,6 +1,6 @@
 interface allocate {
 
-    use model.{queue};
+    use core.{queue};
 
     type object-id = u32;   // Object identifier type (unsigned 32-bit integer)
 

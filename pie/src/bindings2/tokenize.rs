@@ -15,7 +15,7 @@ pub struct Tokenizer {
 impl bindings2::pie::inferlet::tokenize::Host for InstanceState {
     async fn get_tokenizer(
         &mut self,
-        queue: Resource<bindings2::model::Queue>,
+        queue: Resource<bindings2::core::Queue>,
     ) -> anyhow::Result<Resource<Tokenizer>> {
         let q = self.table().get(&queue)?;
         let (tx, rx) = oneshot::channel();

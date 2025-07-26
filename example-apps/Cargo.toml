@@ -6,6 +6,7 @@ members = ["helloworld", "messaging", "ping", "prefix-sharing", "speculative-dec
 wit-bindgen = "0.43.0"
 inferlet = { path = "../inferlet/inferlet" }
 inferlet-macros = { path = "../inferlet/inferlet-macros" }
-
+inferlet2 = { path = "../inferlet/inferlet2" }
+inferlet-macros2 = { path = "../inferlet/inferlet-macros2" }
 [profile.release]
 lto = true

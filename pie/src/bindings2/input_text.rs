@@ -1,5 +1,5 @@
 use crate::bindings2;
-use crate::bindings2::model;
+use crate::bindings2::core;
 use crate::instance::InstanceState;
 use crate::l4m::Command;
 use crate::object::IdRepr;
@@ -9,7 +9,7 @@ use wasmtime_wasi::p2::IoView;
 impl bindings2::pie::inferlet::input_text::Host for InstanceState {
     async fn embed_text(
         &mut self,
-        queue: Resource<model::Queue>,
+        queue: Resource<core::Queue>,
         emb_ids: Vec<IdRepr>,
         tokens: Vec<u32>,
         positions: Vec<u32>,

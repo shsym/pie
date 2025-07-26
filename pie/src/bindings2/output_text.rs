@@ -1,5 +1,5 @@
 use crate::bindings2;
-use crate::bindings2::model;
+use crate::bindings2::core;
 use crate::instance::InstanceState;
 use crate::l4m::Command;
 use crate::object::IdRepr;
@@ -33,7 +33,7 @@ impl Pollable for DistributionResult {
 impl bindings2::pie::inferlet::output_text::Host for InstanceState {
     async fn get_next_token_distribution(
         &mut self,
-        queue: Resource<model::Queue>,
+        queue: Resource<core::Queue>,
         emb_ids: Vec<IdRepr>,
     ) -> anyhow::Result<Resource<DistributionResult>> {
         let inst_id = self.id();

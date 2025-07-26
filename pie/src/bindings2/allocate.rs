@@ -1,5 +1,5 @@
 use crate::bindings2;
-use crate::bindings2::model;
+use crate::bindings2::core;
 use crate::instance::InstanceState;
 use crate::l4m::{Command, ManagedTypes};
 use tokio::sync::oneshot;
@@ -9,7 +9,7 @@ use wasmtime_wasi::p2::IoView;
 type ObjectId = bindings2::pie::inferlet::allocate::ObjectId;
 
 impl bindings2::pie::inferlet::allocate::Host for InstanceState {
-    async fn get_kv_page_size(&mut self, queue: Resource<model::Queue>) -> anyhow::Result<u32> {
+    async fn get_kv_page_size(&mut self, queue: Resource<core::Queue>) -> anyhow::Result<u32> {
         let q = self.table().get(&queue)?;
         let (tx, rx) = oneshot::channel();
         Command::GetBlockSize { handle: tx }.dispatch(q.service_id)?;
@@ -19,7 +19,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
 
     async fn get_all_exported_kv_pages(
         &mut self,
-        queue: Resource<model::Queue>,
+        queue: Resource<core::Queue>,
     ) -> anyhow::Result<Vec<(String, u32)>> {
         let q = self.table().get(&queue)?;
         let (tx, rx) = oneshot::channel();
@@ -29,7 +29,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
 
     async fn allocate_kv_pages(
         &mut self,
-        queue: Resource<model::Queue>,
+        queue: Resource<core::Queue>,
         kv_page_ids: Vec<ObjectId>,
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
@@ -46,7 +46,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
 
     async fn deallocate_kv_pages(
         &mut self,
-        queue: Resource<model::Queue>,
+        queue: Resource<core::Queue>,
         kv_page_ids: Vec<ObjectId>,
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
@@ -63,7 +63,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
 
     async fn allocate_embeds(
         &mut self,
-        queue: Resource<model::Queue>,
+        queue: Resource<core::Queue>,
         embed_ids: Vec<ObjectId>,
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
@@ -80,7 +80,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
 
     async fn deallocate_embeds(
         &mut self,
-        queue: Resource<model::Queue>,
+        queue: Resource<core::Queue>,
         embed_ids: Vec<ObjectId>,
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
@@ -97,7 +97,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
 
     async fn copy_kv_page(
         &mut self,
-        queue: Resource<model::Queue>,
+        queue: Resource<core::Queue>,
         src_kv_page_id: ObjectId,
         dst_kv_page_id: ObjectId,
         src_offset: u32,
@@ -121,7 +121,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
 
     async fn export_kv_pages(
         &mut self,
-        queue: Resource<model::Queue>,
+        queue: Resource<core::Queue>,
         src_kv_page_ids: Vec<ObjectId>,
         name: String,
     ) -> anyhow::Result<()> {
@@ -139,7 +139,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
 
     async fn import_kv_pages(
         &mut self,
-        queue: Resource<model::Queue>,
+        queue: Resource<core::Queue>,
         dst_kv_page_ids: Vec<ObjectId>,
         name: String,
     ) -> anyhow::Result<()> {

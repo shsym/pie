@@ -1,10 +1,10 @@
 pub mod context;
 pub mod drafter;
-pub mod l4m_async;
-pub mod messaging_async;
+pub mod output_text_async;
+mod pool;
+pub mod core_async;
 pub mod sampler;
 pub mod stop_condition;
-mod utils;
 
 pub use inferlet_macros2::main;
 pub use inferlet_macros2::server_main;
@@ -12,7 +12,7 @@ pub use inferlet_macros2::server_main;
 pub use wstd;
 pub mod bindings {
     wit_bindgen::generate!({
-        path: "../wit",
+        path: "../wit2",
         world: "imports",
         pub_export_macro: true,
         with: {
@@ -24,8 +24,8 @@ pub mod bindings {
 
 pub mod bindings_app {
     wit_bindgen::generate!({
-        path: "../wit",
-        world: "app",
+        path: "../wit2",
+        world: "inferlet",
         pub_export_macro: true,
         default_bindings_module: "pie::bindings",
         with: {
@@ -36,8 +36,8 @@ pub mod bindings_app {
 
 pub mod bindings_server {
     wit_bindgen::generate!({
-        path: "../wit",
-        world: "server",
+        path: "../wit2",
+        world: "inferlet-server",
         pub_export_macro: true,
         default_bindings_module: "pie::bindings",
         with: {
@@ -55,20 +55,15 @@ pub mod bindings_server {
     });
 }
 
-pub use crate::bindings::{
-    pie::nbi::l4m, pie::nbi::l4m_vision, pie::nbi::messaging, pie::nbi::ping,
-    pie::nbi::runtime,
+pub use crate::bindings::pie::inferlet::{
+    allocate, core, forward, input_image, input_text, output_text, tokenize,
 };
 
-pub use crate::bindings_app::{export, exports::pie::nbi::run::Guest as RunSync};
-pub use crate::context::{Model, Context};
+pub use crate::bindings_app::{export, exports::pie::inferlet::run::Guest as RunSync};
+pub use crate::context::Context;
 pub use anyhow::Result;
 pub use wasi;
 use wasi::exports::http::incoming_handler::{IncomingRequest, ResponseOutparam};
-
-pub fn available_models() -> Vec<String> {
-    Model::available_models()
-}
 
 #[trait_variant::make(LocalRun: Send)]
 pub trait Run {

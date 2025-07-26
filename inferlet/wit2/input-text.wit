@@ -1,6 +1,6 @@
 interface input-text {
 
-    use model.{queue};
+    use core.{queue};
     use allocate.{object-id};         // Import object ID type for memory references
 
     // Converts input tokens into embeddings at specified positions

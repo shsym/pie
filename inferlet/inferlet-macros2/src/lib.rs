@@ -13,7 +13,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
             input_fn.sig.ident,
-            "The #[inferlet::main] attribute can only be used on async functions",
+            "The #[inferlet2::main] attribute can only be used on async functions",
         )
             .to_compile_error()
             .into();
@@ -22,16 +22,16 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Rename the user's function so that we can call it from our generated code.
     input_fn.sig.ident = inner_fn_name.clone();
 
-    // Generate a wrapper type that implements `inferlet::Run`.
+    // Generate a wrapper type that implements `inferlet2::Run`.
     // It calls the inner async function and maps the error to String.
     let expanded = quote! {
         #input_fn
 
         struct __PieMain;
 
-        impl inferlet::RunSync for __PieMain {
+        impl inferlet2::RunSync for __PieMain {
             fn run() -> Result<(), String> {
-                let result = inferlet::wstd::runtime::block_on(async { #inner_fn_name().await });
+                let result = inferlet2::wstd::runtime::block_on(async { #inner_fn_name().await });
                 if let Err(e) = result {
                     return Err(format!("{:?}", e));
                 }
@@ -39,7 +39,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        inferlet::export!(__PieMain with_types_in inferlet::bindings_app);
+        inferlet2::export!(__PieMain with_types_in inferlet2::bindings_app);
     };
 
     expanded.into()
@@ -58,7 +58,7 @@ pub fn server_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
             input_fn.sig.ident,
-            "The #[inferlet::server_main] attribute can only be used on async functions",
+            "The #[inferlet2::server_main] attribute can only be used on async functions",
         )
             .to_compile_error()
             .into();
@@ -67,27 +67,27 @@ pub fn server_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Rename the user's function so that we can call it from our generated code.
     input_fn.sig.ident = inner_fn_name.clone();
 
-    // Generate a wrapper type that implements `inferlet::Run`.
+    // Generate a wrapper type that implements `inferlet2::Run`.
     // It calls the inner async function and maps the error to String.
     let expanded = quote! {
         #input_fn
 
         struct __PieMain;
 
-        impl inferlet::bindings_server::exports::wasi::http::incoming_handler::Guest for __PieMain {
-            fn handle(request: inferlet::wasi::exports::http::incoming_handler::IncomingRequest, response_out: inferlet::wasi::exports::http::incoming_handler::ResponseOutparam) -> () {
-                let responder = inferlet::wstd::http::server::Responder::new(response_out);
-                let _finished: inferlet::wstd::http::server::Finished =
-                    match inferlet::wstd::http::request::try_from_incoming(request) {
+        impl inferlet2::bindings_server::exports::wasi::http::incoming_handler::Guest for __PieMain {
+            fn handle(request: inferlet2::wasi::exports::http::incoming_handler::IncomingRequest, response_out: inferlet2::wasi::exports::http::incoming_handler::ResponseOutparam) -> () {
+                let responder = inferlet2::wstd::http::server::Responder::new(response_out);
+                let _finished: inferlet2::wstd::http::server::Finished =
+                    match inferlet2::wstd::http::request::try_from_incoming(request) {
                         Ok(request) => {
-                            inferlet::wstd::runtime::block_on(async { #inner_fn_name(request, responder).await })
+                            inferlet2::wstd::runtime::block_on(async { #inner_fn_name(request, responder).await })
                         }
                         Err(err) => responder.fail(err),
                     };
             }
         }
 
-        inferlet::wasi::http::proxy::export!(__PieMain with_types_in inferlet::bindings_server);
+        inferlet2::wasi::http::proxy::export!(__PieMain with_types_in inferlet2::bindings_server);
     };
 
     expanded.into()

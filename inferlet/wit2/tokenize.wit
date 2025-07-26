@@ -1,6 +1,6 @@
 interface tokenize {
 
-    use model.{queue};                  // Import model definitions
+    use core.{queue};                  // Import model definitions
 
     // Retrieves the tokenizer associated with the given model
     get-tokenizer: func(queue: borrow<queue>) -> tokenizer;

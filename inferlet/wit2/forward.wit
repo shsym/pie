@@ -1,6 +1,6 @@
 interface forward {
 
-    use model.{queue};
+    use core.{queue};
     use allocate.{object-id};        // Import object ID type for memory references
 
     // Returns a list of available PEFT (parameter-efficient fine-tuning) adapter names

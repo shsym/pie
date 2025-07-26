@@ -9,16 +9,17 @@ world traits {
     import output-text;
 }
 
-world inferlet {
+world imports {
     include traits;
-    import model;
-    import runtime;
+    import core;
+}
+
+world inferlet {
+    include imports;
     export run;
 }
 
 world inferlet-server {
-    include traits;
-    import model;
-    import runtime;
+    include imports;
     export wasi:http/incoming-handler@0.2.4;
 }

@@ -1,37 +1,18 @@
 use std::time::{Duration, Instant};
 
-#[inferlet::main]
+#[inferlet2::main]
 async fn main() -> Result<(), String> {
-    const PING_COUNT: usize = 5;
-    let mut total_duration = Duration::ZERO;
-
-    // println!("Starting ping test with {} iterations...", PING_COUNT);
-
-    // for i in 1..=PING_COUNT {
-    //     let start = Instant::now();
-    //     let resp = symphony::ping::ping("hello");
-    //     let elapsed = start.elapsed();
-    //     total_duration += elapsed;
-
-    //     //println!("Ping {}: Response: {:?}, Latency: {:?}", i, resp, elapsed);
-    // }
-
-    // let avg_latency = total_duration / PING_COUNT as u32;
-    // //println!("\nPing test completed.");
-    // //println!("Total Pings: {}", PING_COUNT);
-    // println!("Average Latency: {:?}", avg_latency);
-
-    //let mut prev = start; // track the time of the previous token
     let start = Instant::now();
 
     let max_num_outputs = 128;
 
-    let available_models = inferlet::available_models();
+    let available_models = inferlet2::core::get_all_models();
 
-    let model = inferlet::Model::new(available_models.first().unwrap()).unwrap();
-    let tokenizer = model.get_tokenizer();
+    let model = inferlet2::core::get_model(available_models.first().unwrap()).unwrap();
+    let queue = model.create_queue();
+    let tokenizer = inferlet2::tokenize::get_tokenizer(&queue);
 
-    let mut ctx = model.create_context();
+    let mut ctx = inferlet2::context::Context::new(model).unwrap();
 
     ctx.fill("<|begin_of_text|>");
     ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
@@ -39,7 +20,7 @@ async fn main() -> Result<(), String> {
     ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
     let text = ctx.generate_until("<|eot_id|>", max_num_outputs).await;
-    let token_ids = tokenizer.encode(&text);
+    let token_ids = tokenizer.tokenize(&text);
     println!("Output: {:?} (total elapsed: {:?})", text, start.elapsed());
 
     // compute per token latency
