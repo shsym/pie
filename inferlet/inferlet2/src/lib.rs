@@ -1,18 +1,21 @@
-mod command;
 pub mod context;
-pub mod core_async;
 pub mod drafter;
-pub mod output_text_async;
 mod pool;
 pub mod sampler;
 pub mod stop_condition;
 mod traits;
 
+pub use crate::context::Context;
+use crate::wstd::runtime::AsyncPollable;
+pub use anyhow::Result;
 pub use inferlet_macros2::main;
 pub use inferlet_macros2::server_main;
+use std::collections::HashSet;
 use std::rc::Rc;
-
+pub use wasi;
+use wasi::exports::http::incoming_handler::{IncomingRequest, ResponseOutparam};
 pub use wstd;
+
 pub mod bindings {
     wit_bindgen::generate!({
         path: "../wit2",
@@ -54,20 +57,186 @@ pub mod bindings_server {
     });
 }
 
-pub use crate::bindings::pie::inferlet::{
+use crate::bindings::pie::inferlet::{
     allocate, core, forward, input_image, input_text, output_text, tokenize,
 };
 
 pub use crate::bindings_app::{export, exports::pie::inferlet::run::Guest as RunSync};
-pub use crate::context::Context;
-pub use anyhow::Result;
-pub use wasi;
-use wasi::exports::http::incoming_handler::{IncomingRequest, ResponseOutparam};
 
+//// --------------------------------- Core wrappers -------------------------------
+
+/// Represents a command queue for a model instance.
+///
+/// Queues are used to submit tasks to a model and manage their execution.
 #[derive(Clone, Debug)]
 pub struct Queue {
     pub(crate) inner: Rc<core::Queue>,
 }
+
+/// Represents a specific model instance, providing access to its metadata and functionality.
+#[derive(Clone, Debug)]
+pub struct Model {
+    pub(crate) inner: Rc<core::Model>,
+}
+
+/// Returns the runtime version string.
+pub fn get_version() -> String {
+    core::get_version()
+}
+
+/// Returns a unique identifier for the running instance.
+pub fn get_instance_id() -> String {
+    core::get_instance_id()
+}
+
+/// Retrieves POSIX-style CLI arguments passed to the inferlet from the remote user client.
+pub fn get_arguments() -> Vec<String> {
+    core::get_arguments()
+}
+
+/// Retrieve a model by its name.
+///
+/// Returns `None` if no model with the specified name is found.
+pub fn get_model(name: &str) -> Option<Model> {
+    core::get_model(name).map(|inner| Model {
+        inner: Rc::new(inner),
+    })
+}
+
+/// Get a list of all available model names.
+pub fn get_all_models() -> Vec<String> {
+    core::get_all_models()
+}
+
+/// Get names of models that have all specified traits (e.g. "input_text", "tokenize").
+pub fn get_all_models_with_traits(traits: &[String]) -> Vec<String> {
+    core::get_all_models_with_traits(traits)
+}
+
+/// Sends a message to the remote user client.
+pub fn send(message: &str) {
+    core::send(message)
+}
+
+/// Receives an incoming message from the remote user client.
+///
+/// This is an asynchronous operation that returns a `ReceiveResult`.
+pub async fn receive() -> String {
+    let future = core::receive(); // Changed from messaging::receive
+    let pollable = future.pollable();
+    AsyncPollable::new(pollable).wait_for().await;
+    future.get().unwrap()
+}
+
+/// Publishes a message to a topic, broadcasting it to all subscribers.
+pub fn broadcast(topic: &str, message: &str) {
+    core::broadcast(topic, message)
+}
+
+/// Subscribes to a topic and returns a `Subscription` handle.
+pub async fn subscribe<S: ToString>(topic: S) -> String {
+    let topic = topic.to_string();
+    let future = core::subscribe(&topic); // Changed from messaging::subscribe
+    let pollable = future.pollable();
+    AsyncPollable::new(pollable).wait_for().await;
+    future.get().unwrap()
+}
+
+/// Executes a debug command and returns the result as a string.
+pub fn debug_query(query: &str) -> String {
+    core::debug_query(query)
+}
+
+impl Model {
+    /// Returns the model's name (e.g. "llama-3.1-8b-instruct").
+    pub fn get_name(&self) -> String {
+        self.inner.get_name()
+    }
+
+    /// Returns the full set of model traits.
+    pub fn get_traits(&self) -> Vec<String> {
+        self.inner.get_traits()
+    }
+
+    pub fn has_traits(&self, required_traits: &[&str]) -> bool {
+        let available_traits_vec = self.get_traits();
+
+        let available_traits: HashSet<&str> =
+            available_traits_vec.iter().map(String::as_str).collect();
+
+        // Find any required traits that are not in the available set.
+        let missing: Vec<_> = required_traits
+            .iter()
+            .filter(|t| !available_traits.contains(*t))
+            .cloned()
+            .collect();
+
+        missing.is_empty()
+    }
+
+    /// Returns a human-readable description of the model.
+    pub fn get_description(&self) -> String {
+        self.inner.get_description()
+    }
+
+    /// Returns the model version string (e.g. "1.0").
+    pub fn get_version(&self) -> String {
+        self.inner.get_version()
+    }
+
+    /// Returns the license name (e.g. "Llama").
+    pub fn get_license(&self) -> String {
+        self.inner.get_license()
+    }
+
+    /// Returns the prompt formatting template in Tera format.
+    pub fn get_prompt_template(&self) -> String {
+        self.inner.get_prompt_template()
+    }
+
+    /// Gets the service ID for the model.
+    pub fn get_service_id(&self) -> u32 {
+        self.inner.get_service_id()
+    }
+
+    /// Create a new command queue for this model.
+    pub fn create_queue(&self) -> Queue {
+        Queue {
+            inner: Rc::new(self.inner.create_queue()),
+        }
+    }
+
+    /// Sends a debug message directly to the model and returns the response.
+    pub fn debug_query(&self, query: &str) -> String {
+        self.inner.debug_query(query)
+    }
+}
+
+/// Defines task priority levels.
+pub use crate::bindings::pie::inferlet::core::Priority;
+use crate::context::ContextError;
+
+impl Queue {
+    /// Gets the service ID for the queue.
+    pub fn get_service_id(&self) -> u32 {
+        self.inner.get_service_id()
+    }
+
+    /// Begins a synchronization process for the queue, returning a `SynchronizationResult`.
+    pub async fn synchronize(&self) -> bool {
+        let future = self.inner.synchronize(); // Changed from messaging::receive
+        let pollable = future.pollable();
+        AsyncPollable::new(pollable).wait_for().await;
+        future.get().unwrap()
+    }
+
+    /// Change the queue's priority.
+    pub fn set_priority(&self, priority: Priority) {
+        self.inner.set_priority(priority)
+    }
+}
+
+/// --------------------------------------------------------------------------------
 
 #[trait_variant::make(LocalRun: Send)]
 pub trait Run {

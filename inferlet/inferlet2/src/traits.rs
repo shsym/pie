@@ -1,6 +1,6 @@
-mod allocate;
-mod input_text;
-mod output_text;
-mod forward;
-mod tokenize;
-mod input_image;
+pub mod allocate;
+pub mod input_text;
+pub mod output_text;
+pub mod forward;
+pub mod tokenize;
+pub mod input_image;

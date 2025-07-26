@@ -29,7 +29,7 @@ pub trait Allocate {
     ///
     /// # Returns
     /// A `Vec<u32>` containing the unique IDs of the newly allocated pages.
-    fn allocate_kv_pages(&self, num_pages: u32) -> Vec<u32>;
+    fn allocate_kv_pages(&self, num_pages: usize) -> Vec<u32>;
 
     /// Deallocates a set of KV pages, returning them to the resource pool.
     ///
@@ -37,7 +37,7 @@ pub trait Allocate {
     /// * `page_ids`: A slice of page IDs to deallocate.
     fn deallocate_kv_pages(&self, page_ids: &[u32]);
 
-    fn increate_ref_count(&self, page_ids: &[u32]);
+    fn increase_ref_count(&self, page_ids: &[u32]);
 
     /// Allocates a specified number of embedding slots.
     ///
@@ -46,7 +46,7 @@ pub trait Allocate {
     ///
     /// # Returns
     /// A `Vec<u32>` containing the unique IDs of the newly allocated embeddings.
-    fn allocate_embeds(&self, num_embeds: u32) -> Vec<u32>;
+    fn allocate_embeds(&self, num_embeds: usize) -> Vec<u32>;
 
     /// Deallocates a set of embedding slots, returning them to the resource pool.
     ///
@@ -176,10 +176,10 @@ impl Allocate for Queue {
         allocate::get_all_exported_kv_pages(&self.inner)
     }
 
-    fn allocate_kv_pages(&self, num_pages: u32) -> Vec<u32> {
+    fn allocate_kv_pages(&self, num_pages: usize) -> Vec<u32> {
         let pool = get_kv_page_pool(&self.inner);
         pool.borrow_mut()
-            .acquire_many(&self.inner, num_pages as usize)
+            .acquire_many(&self.inner, num_pages)
             .expect("Failed to allocate KV pages from pool")
     }
 
@@ -190,15 +190,15 @@ impl Allocate for Queue {
             .expect("Failed to deallocate KV pages from pool");
     }
 
-    fn increate_ref_count(&self, page_ids: &[u32]) {
+    fn increase_ref_count(&self, page_ids: &[u32]) {
         let pool = get_kv_page_pool(&self.inner);
         pool.borrow_mut().increment_rc_many(page_ids);
     }
 
-    fn allocate_embeds(&self, num_embeds: u32) -> Vec<u32> {
+    fn allocate_embeds(&self, num_embeds: usize) -> Vec<u32> {
         let pool = get_embed_pool(&self.inner);
         pool.borrow_mut()
-            .acquire_many(&self.inner, num_embeds as usize)
+            .acquire_many(&self.inner, num_embeds)
             .expect("Failed to allocate embeds from pool")
     }
 
@@ -245,7 +245,7 @@ impl Allocate for Queue {
             return vec![];
         }
 
-        let allocated_ids = self.allocate_kv_pages(page_size.unwrap());
+        let allocated_ids = self.allocate_kv_pages(page_size.unwrap() as usize);
 
         // Use the page size if necessary (it's unclear from your snippet if it's used)
         // But if it's only `allocate::import_kv_pages`, call it and return the result:

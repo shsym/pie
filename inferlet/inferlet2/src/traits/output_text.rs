@@ -5,9 +5,9 @@ use crate::{output_text, wstd::runtime::AsyncPollable};
 #[derive(Clone, Debug)]
 pub struct Distribution {
     /// A vector of token IDs.
-    ids: Vec<u32>,
+    pub ids: Vec<u32>,
     /// A vector of probabilities corresponding to the token IDs.
-    probs: Vec<f32>,
+    pub probs: Vec<f32>,
 }
 
 /// Provides a way to generate text by predicting the next token.
