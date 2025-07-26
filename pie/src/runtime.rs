@@ -498,6 +498,7 @@ impl Runtime {
             // Attempt to call “run”
             let (_, run_export) = instance
                 .get_export(&mut store, None, "pie:nbi/run")
+                .or_else(|| instance.get_export(&mut store, None, "pie:inferlet/run"))
                 .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
 
             let (_, run_func_export) = instance

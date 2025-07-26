@@ -1,13 +1,16 @@
+mod command;
 pub mod context;
+pub mod core_async;
 pub mod drafter;
 pub mod output_text_async;
 mod pool;
-pub mod core_async;
 pub mod sampler;
 pub mod stop_condition;
+mod traits;
 
 pub use inferlet_macros2::main;
 pub use inferlet_macros2::server_main;
+use std::rc::Rc;
 
 pub use wstd;
 pub mod bindings {
@@ -43,13 +46,9 @@ pub mod bindings_server {
         with: {
             "wasi:io/poll@0.2.4": wasi::io::poll,
             "wasi:clocks/monotonic-clock@0.2.4": wasi::clocks::monotonic_clock,
-            //"wasi:clocks/wall-clock@0.2.4": wasi::clocks::wall_clock,
-            //"wasi:random/random@0.2.4": wasi::random::random,
-            //"wasi:cli/stdout@0.2.4": wasi::cli::stdout,
             "wasi:io/error@0.2.4": wasi::io::error,
             "wasi:io/streams@0.2.4": wasi::io::streams,
             "wasi:http/types@0.2.4": wasi::http::types,
-            //"wasi:http/incoming_handler@0.2.4": wasi::exports::http::incoming_handler,
         },
         generate_all,
     });
@@ -64,6 +63,11 @@ pub use crate::context::Context;
 pub use anyhow::Result;
 pub use wasi;
 use wasi::exports::http::incoming_handler::{IncomingRequest, ResponseOutparam};
+
+#[derive(Clone, Debug)]
+pub struct Queue {
+    pub(crate) inner: Rc<core::Queue>,
+}
 
 #[trait_variant::make(LocalRun: Send)]
 pub trait Run {

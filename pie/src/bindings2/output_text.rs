@@ -21,10 +21,9 @@ impl Pollable for DistributionResult {
         if self.done {
             return;
         }
-        for rx in self.receivers.drain(..) {
-            if let Ok(result) = rx.await {
-                self.results.push(result);
-            }
+        for rx in &mut self.receivers {
+            let result = rx.await.unwrap();
+            self.results.push(result);
         }
         self.done = true;
     }
