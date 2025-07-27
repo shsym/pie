@@ -1,6 +1,6 @@
 use crate::bindings2;
 use crate::instance::InstanceState;
-use crate::l4m::Command;
+use crate::model::Command;
 use crate::tokenizer::BytePairEncoder;
 use std::sync::Arc;
 use tokio::sync::oneshot;

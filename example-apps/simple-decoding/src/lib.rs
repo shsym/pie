@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
-    let max_num_outputs = 128;
+    let max_num_outputs = 16;
 
     let model = inferlet2::get_auto_model();
     let tokenizer = model.get_tokenizer();
@@ -17,7 +17,7 @@ async fn main() -> Result<(), String> {
     ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>");
     ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
-    let text = ctx.generate_until("<|eot_id|>", max_num_outputs).await;
+    let text = ctx.fork().generate_until("<|eot_id|>", max_num_outputs).await;
     let token_ids = tokenizer.tokenize(&text);
     println!("Output: {:?} (total elapsed: {:?})", text, start.elapsed());
 

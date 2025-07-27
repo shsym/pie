@@ -70,11 +70,12 @@ impl Context {
     /// `token_ids_pending` buffer of the new context to be recomputed, ensuring state isolation.
     ///
     /// This function will flush any pending tokens in the current context before forking.
-    pub fn fork(&mut self) -> Self {
+    pub fn fork(&self) -> Self {
         // flush the pending tokens
-        if !self.token_ids_pending.is_empty() {
-            self.flush();
-        }
+        // if self.token_ids_pending.len() + self.kv_page_last_len >= self.kv_page_size {
+        //     self.flush();
+        //     //println!("flushing");
+        // }
 
         let (new_tokens, new_pending, new_kv_pages, new_last_len) =
             if self.kv_page_last_len == self.kv_page_size {
@@ -100,6 +101,9 @@ impl Context {
                 ]
                 .concat();
 
+                //println!("kept: {:?}", self.tokenizer.detokenize(&forked_token_ids));
+                //println!("nxt: {:?}", self.tokenizer.detokenize(&forked_pending_token_ids));
+
                 let forked_last_kv_page_len = if !forked_kv_page_ids.is_empty() {
                     self.kv_page_size
                 } else {
@@ -123,6 +127,21 @@ impl Context {
             token_ids_pending: new_pending,
             kv_page_ids: new_kv_pages,
             kv_page_last_len: new_last_len,
+            kv_page_size: self.kv_page_size,
+        }
+    }
+
+    fn clone_unsafe(&self) -> Self {
+        self.queue.increase_ref_count(&self.kv_page_ids);
+
+        Context {
+            queue: self.queue.clone(),
+            model: self.model.clone(),
+            tokenizer: self.tokenizer.clone(),
+            token_ids: self.token_ids.clone(),
+            token_ids_pending: self.token_ids_pending.clone(),
+            kv_page_ids: self.kv_page_ids.clone(),
+            kv_page_last_len: self.kv_page_last_len,
             kv_page_size: self.kv_page_size,
         }
     }
@@ -296,6 +315,13 @@ impl Context {
 
         self.grow_kv_pages(1);
 
+        // println!("next token id: {}", next_token_id);
+        // println!("next pos id: {}", next_pos_id);
+        // println!("kv page last len: {}", self.kv_page_last_len);
+        // println!("kv page ids: {:?}", &self.kv_page_ids);
+        // println!("token ids: {:?}", &self.token_ids);
+        // println!("token ids pending: {:?}", &self.token_ids_pending);
+
         let sampled = self
             .queue
             .forward_text(
@@ -401,7 +427,7 @@ impl Context {
     ) -> String {
         let mut beams = Vec::new();
         // The score is the cumulative probability, starting at 1.0.
-        beams.push((self.fork(), vec![], 1.0f32));
+        beams.push((self.fork(), vec![], 0.0f32));
 
         loop {
             // Beams are sorted by score, so the first match is the best valid one found so far.
@@ -436,6 +462,10 @@ impl Context {
 
             let mut next_beams = Vec::new();
             for ((mut beam, generated, score), next_dist) in beams.into_iter().zip(next_dists) {
+                // print out the distributions
+                //println!("dist: {:?}", &next_dist.ids);
+                //println!("probs: {:?}", &next_dist.probs);
+
                 // Expand this beam with the top candidates.
                 for i in 0..beam_size.min(next_dist.ids.len()) {
                     let mut next_beam = beam.fork();
@@ -446,16 +476,18 @@ impl Context {
                     next_generated.push(next_dist.ids[i]);
 
                     // Update score by multiplying probabilities.
-                    let next_score = score * next_dist.probs[i];
+                    let next_score = score + next_dist.probs[i].ln();
 
                     next_beams.push((next_beam, next_generated, next_score));
                 }
             }
 
             // Prune: Sort all new candidates by score and keep only the top `beam_size`.
-            next_beams.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            next_beams.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
             next_beams.truncate(beam_size);
             beams = next_beams;
+
+            //println!("beam size: {}", beams.len());
         }
     }
 

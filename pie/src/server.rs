@@ -1,10 +1,10 @@
 use crate::instance::Id as InstanceId;
-use crate::l4m::attach_new_remote_backend;
+use crate::model::attach_new_remote_backend;
 use crate::messaging::dispatch_u2i;
 use crate::runtime::RuntimeError;
 use crate::service::{Service, ServiceError};
 use crate::utils::IdPool;
-use crate::{auth, l4m, messaging, runtime, service};
+use crate::{auth, model, messaging, runtime, service};
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -474,7 +474,7 @@ impl Client {
             }
             QUERY_MODEL_STATUS => {
                 // gather model status from all attached backends
-                let l4m_stats = l4m::gather_stats().await;
+                let l4m_stats = model::gather_stats().await;
 
                 self.send_response(corr_id, true, l4m_stats).await;
             }

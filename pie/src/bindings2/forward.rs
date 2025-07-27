@@ -1,7 +1,7 @@
 use crate::bindings2;
 use crate::bindings2::core;
 use crate::instance::InstanceState;
-use crate::l4m::Command;
+use crate::model::Command;
 use crate::object::IdRepr;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::IoView;
@@ -25,13 +25,13 @@ impl bindings2::pie::inferlet::forward::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::FillBlock {
+        Command::Forward {
             inst_id,
             stream_id: q.stream_id,
-            last_block_len: last_kv_page_len,
-            context: kv_page_ids,
-            inputs: input_emb_ids,
-            outputs: output_emb_ids,
+            kv_page_last_len: last_kv_page_len,
+            kv_pages: kv_page_ids,
+            input_embeds: input_emb_ids,
+            output_embeds: output_emb_ids,
         }
         .dispatch(q.service_id)?;
         Ok(())
@@ -48,13 +48,13 @@ impl bindings2::pie::inferlet::forward::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::FillBlock {
+        Command::Forward {
             inst_id,
             stream_id: q.stream_id,
-            last_block_len: last_kv_page_len,
-            context: kv_page_ids,
-            inputs: input_emb_ids,
-            outputs: output_emb_ids,
+            kv_page_last_len: last_kv_page_len,
+            kv_pages: kv_page_ids,
+            input_embeds: input_emb_ids,
+            output_embeds: output_emb_ids,
         }
         .dispatch(q.service_id)?;
         Ok(())
@@ -68,10 +68,10 @@ impl bindings2::pie::inferlet::forward::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::MaskBlock {
+        Command::MaskKvPage {
             inst_id,
             stream_id: q.stream_id,
-            block: kv_page_id,
+            kv_page: kv_page_id,
             mask,
         }
         .dispatch(q.service_id)?;

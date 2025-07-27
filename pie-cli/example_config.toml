@@ -14,8 +14,8 @@ exec_path = "../backend/backend-python/server.py"
 model = "llama-3.2-1b-instruct"
 device = "cuda:0"
 dtype = "bfloat16"
-kv_page_size = 32
-dist_size = 8
+kv_page_size = 16
+dist_size = 32
 max_num_kv_pages = 1000
 max_num_embeds = 50000
 

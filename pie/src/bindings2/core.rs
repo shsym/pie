@@ -1,5 +1,5 @@
 use crate::instance::InstanceState;
-use crate::l4m::{self, Command, StreamPriority};
+use crate::model::{self, Command, StreamPriority};
 use crate::messaging::{PubSubCommand, PushPullCommand, dispatch_i2i, dispatch_u2i};
 use crate::{bindings2, server};
 use std::mem;
@@ -158,7 +158,7 @@ impl bindings2::pie::inferlet::core::Host for InstanceState {
     }
 
     async fn get_model(&mut self, name: String) -> anyhow::Result<Option<Resource<Model>>> {
-        if let Some(service_id) = l4m::model_service_id(&name) {
+        if let Some(service_id) = model::model_service_id(&name) {
             let model = Model { name, service_id };
             let res = self.table().push(model)?;
             return Ok(Some(res));
@@ -167,7 +167,7 @@ impl bindings2::pie::inferlet::core::Host for InstanceState {
     }
 
     async fn get_all_models(&mut self) -> anyhow::Result<Vec<String>> {
-        Ok(l4m::available_models())
+        Ok(model::available_models())
     }
 
     async fn get_all_models_with_traits(
@@ -175,7 +175,7 @@ impl bindings2::pie::inferlet::core::Host for InstanceState {
         _traits: Vec<String>,
     ) -> anyhow::Result<Vec<String>> {
         // Placeholder: Implement trait filtering logic
-        Ok(l4m::available_models())
+        Ok(model::available_models())
     }
 }
 

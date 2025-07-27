@@ -9,9 +9,9 @@ use wasmtime::{
 };
 
 use crate::instance::{Id as InstanceId, InstanceState};
-use crate::{bindings, bindings2, l4m, server, service};
+use crate::{bindings, bindings2, model, server, service};
 
-use crate::l4m::cleanup_instance;
+use crate::model::cleanup_instance;
 use crate::service::{Service, ServiceError};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -359,7 +359,7 @@ impl Runtime {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
 
-            l4m::cleanup_instance(instance_id.clone());
+            model::cleanup_instance(instance_id.clone());
 
             server::Command::DetachInstance {
                 inst_id: instance_id.clone(),

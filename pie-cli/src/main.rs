@@ -7,9 +7,8 @@ use pie::{
     auth::{create_jwt, init_secret},
     client::{self, Client},
 };
-use rand::{Rng, distributions::Alphanumeric};
+use rand::{Rng, distr::Alphanumeric};
 use reqwest::Client as HttpClient;
-use rustyline::ExternalPrinter;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -17,7 +16,6 @@ use rustyline::hint::Hinter;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Helper}; // The Helper trait is still needed
 use serde::Deserialize;
-use std::borrow::Cow::{self, Owned};
 use std::sync::Arc;
 use std::{
     env,
@@ -26,7 +24,7 @@ use std::{
     path::PathBuf,
     process::Stdio, // MODIFIED: Added for process spawning
 };
-use tokio::io::{AsyncBufReadExt, BufReader, stdin as tokio_stdin};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
@@ -259,7 +257,7 @@ async fn start_interactive_session(
                 TokioCommand::new(exec_path)
             };
 
-            let random_port: u16 = rand::thread_rng().gen_range(49152..=65535);
+            let random_port: u16 = rand::rng().random_range(49152..=65535);
             cmd.arg("--host")
                 .arg("localhost")
                 .arg("--port")
@@ -619,7 +617,7 @@ fn build_configs(args: &StartArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
         file_config.enable_auth.unwrap_or(true)
     };
     let auth_secret = file_config.auth_secret.unwrap_or_else(|| {
-        rand::thread_rng()
+        rand::rng()
             .sample_iter(&Alphanumeric)
             .take(32)
             .map(char::from)

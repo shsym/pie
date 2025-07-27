@@ -1,7 +1,7 @@
 use crate::bindings2;
 use crate::bindings2::core;
 use crate::instance::InstanceState;
-use crate::l4m::Command;
+use crate::model::Command;
 use crate::object::IdRepr;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::IoView;

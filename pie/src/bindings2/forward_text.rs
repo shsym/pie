@@ -1,7 +1,7 @@
 use crate::bindings2;
 use crate::bindings2::core;
 use crate::instance::InstanceState;
-use crate::l4m::Command;
+use crate::model::Command;
 use crate::object::IdRepr;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
@@ -46,8 +46,8 @@ impl bindings2::pie::inferlet::forward_text::Host for InstanceState {
         Command::ForwardText {
             inst_id,
             stream_id: q.stream_id,
-            last_block_len: last_kv_page_len,
-            context: kv_page_ids,
+            kv_page_last_len: last_kv_page_len,
+            kv_pages: kv_page_ids,
             text: tokens,
             positions,
             output_indices,
@@ -78,8 +78,8 @@ impl bindings2::pie::inferlet::forward_text::Host for InstanceState {
         Command::ForwardText {
             inst_id,
             stream_id: q.stream_id,
-            last_block_len: last_kv_page_len,
-            context: kv_page_ids,
+            kv_page_last_len: last_kv_page_len,
+            kv_pages: kv_page_ids,
             text: tokens,
             positions,
             output_indices: vec![],

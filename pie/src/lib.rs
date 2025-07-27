@@ -13,7 +13,7 @@ mod backend;
 mod batching;
 mod bindings;
 mod instance;
-mod l4m;
+mod model;
 mod messaging;
 mod object;
 mod ping;

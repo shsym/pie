@@ -15,3 +15,4 @@ wasi = "0.14.2+wasi-0.2.4"
 num-traits = "0.2.19"
 inferlet-macros2 = { path = "../inferlet-macros2" }
 anyhow = "1.0.95"
+rand = "0.9.2"

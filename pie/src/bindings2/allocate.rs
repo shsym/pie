@@ -1,7 +1,7 @@
 use crate::bindings2;
 use crate::bindings2::core;
 use crate::instance::InstanceState;
-use crate::l4m::{Command, ManagedTypes};
+use crate::model::{Command, ManagedTypes};
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::IoView;
@@ -37,7 +37,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
         Command::Allocate {
             inst_id,
             stream_id: q.stream_id,
-            ty: ManagedTypes::KvBlock,
+            ty: ManagedTypes::KvPage,
             ids: kv_page_ids,
         }
         .dispatch(q.service_id)?;
@@ -54,7 +54,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
         Command::Deallocate {
             inst_id,
             stream_id: q.stream_id,
-            ty: ManagedTypes::KvBlock,
+            ty: ManagedTypes::KvPage,
             ids: kv_page_ids,
         }
         .dispatch(q.service_id)?;
@@ -71,7 +71,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
         Command::Allocate {
             inst_id,
             stream_id: q.stream_id,
-            ty: ManagedTypes::TokenEmb,
+            ty: ManagedTypes::Embed,
             ids: embed_ids,
         }
         .dispatch(q.service_id)?;
@@ -88,7 +88,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
         Command::Deallocate {
             inst_id,
             stream_id: q.stream_id,
-            ty: ManagedTypes::TokenEmb,
+            ty: ManagedTypes::Embed,
             ids: embed_ids,
         }
         .dispatch(q.service_id)?;
@@ -106,11 +106,11 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::CopyBlock {
+        Command::CopyKvPage {
             inst_id,
             stream_id: q.stream_id,
-            src_block: src_kv_page_id,
-            dst_block: dst_kv_page_id,
+            src_kv_page: src_kv_page_id,
+            dst_kv_page: dst_kv_page_id,
             src_token_offset: src_offset,
             dst_token_offset: dst_offset,
             size,
@@ -127,9 +127,9 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::ExportBlocks {
+        Command::ExportKvPages {
             inst_id,
-            blocks: src_kv_page_ids,
+            pages: src_kv_page_ids,
             resource_name: name,
         }
         .dispatch(q.service_id)?;
@@ -145,9 +145,9 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::ImportBlocks {
+        Command::ImportKvPages {
             inst_id,
-            blocks: dst_kv_page_ids,
+            kv_pages: dst_kv_page_ids,
             resource_name: name,
         }
         .dispatch(q.service_id)?;

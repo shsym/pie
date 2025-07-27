@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["helloworld", "messaging", "ping", "prefix-sharing", "speculative-decoding", "constrained-decoding", "simple-decoding", "parallel-generation", "function-calling", "helloworld-plain", "openai-compat", "http-server", "text-completion",  "tree-of-thought", "graph-of-thought", "recursion-of-thought", "skeleton-of-thought", "beam-search", "agent-react", "agent-react-bench", "agent-codeact", "agent-swarm", "attention-sink", "rt-bench", "startup-bench"]
-
+members = ["helloworld", "messaging", "ping", "prefix-sharing", "speculative-decoding", "simple-decoding", "parallel-generation", "function-calling", "helloworld-plain", "openai-compat", "http-server", "text-completion",  "tree-of-thought", "graph-of-thought", "recursion-of-thought", "skeleton-of-thought", "beam-search", "agent-react", "agent-react-bench", "agent-codeact", "agent-swarm", "attention-sink", "rt-bench", "startup-bench"]
+# "constrained-decoding",
 [workspace.dependencies]
 wit-bindgen = "0.43.0"
 inferlet = { path = "../inferlet/inferlet" }
