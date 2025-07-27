@@ -288,7 +288,7 @@ pub enum Command {
         text: Vec<u32>,
         positions: Vec<u32>,
         output_indices: Vec<u32>,
-        handle: oneshot::Sender<Vec<(Vec<u32>, Vec<f32>)>>,
+        handle: Option<oneshot::Sender<Vec<(Vec<u32>, Vec<f32>)>>>,
     },
 
     SampleTopK {
@@ -371,9 +371,13 @@ impl Batchable<BatchGroup> for Command {
                 batching::eager()
             }
 
-            Command::ForwardText { .. } => Box::new(batching::ManualStrategy::new(
-                TRIGGERS.forward_text_trigger.clone(),
-            )),
+            Command::ForwardText { .. } => {
+                Box::new(batching::ManualStrategy::new(
+                    TRIGGERS.forward_text_trigger.clone(),
+                ))
+
+                //batching::eager()
+            }
 
             Command::SampleTopK { .. } => {
                 //batching::t_only(Duration::from_micros(100))
@@ -407,7 +411,7 @@ impl Batchable<BatchGroup> for Command {
 pub enum Event {
     GetInfo(oneshot::Sender<Info>),
     SampleTopK(oneshot::Sender<(Vec<u32>, Vec<f32>)>),
-    ForwardText(oneshot::Sender<Vec<(Vec<u32>, Vec<f32>)>>),
+    ForwardText(Option<oneshot::Sender<Vec<(Vec<u32>, Vec<f32>)>>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -999,6 +1003,7 @@ impl L4m {
         loop {
             let res: Result<Option<(Stream, Command)>, tokio::time::error::Elapsed> =
                 if sch.has_pending_command() {
+                    //println!("scheduler has pending command");
                     // With pending tasks, wait up to 100µs for a new command.
                     timeout(Duration::from_micros(100), rx.recv()).await
                 } else {
@@ -1095,7 +1100,9 @@ impl L4m {
 
                             match event {
                                 Event::ForwardText(handle) => {
-                                    handle.send(distribs).ok();
+                                    if let Some(h) = handle {
+                                        h.send(distribs).ok();
+                                    }
                                 }
                                 _ => unreachable!(),
                             }
@@ -1156,6 +1163,7 @@ where
     }
 
     async fn update(&mut self, now: Instant) {
+        //println!("time: {:?}", now);
         for (_, cmd_batch) in self.cmd_batcher.batch(now) {
             self.flush(cmd_batch).await;
         }

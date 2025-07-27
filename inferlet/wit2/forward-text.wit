@@ -14,6 +14,14 @@ interface forward-text {
         output-indices: list<u32>,              // Output indices
     ) -> distribution-result;
 
+    forward-text-no-output: func(
+        queue: borrow<queue>,                   // Queue to schedule the operation
+        last-kv-page-len: u32,                  // Number of valid entries in the last KV page
+        kv-page-ids: list<object-id>,           // List of context key-value memory pages
+        tokens: list<u32>,                      // List of input token IDs
+        positions: list<u32>,                   // List of input token positions
+    );
+
     resource distribution-result {
 
         // Returns a pollable object to check when the result is ready

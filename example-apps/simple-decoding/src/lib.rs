@@ -7,13 +7,10 @@ async fn main() -> Result<(), String> {
 
     let max_num_outputs = 128;
 
-    let available_models = inferlet2::get_all_models();
+    let model = inferlet2::get_auto_model();
+    let tokenizer = model.get_tokenizer();
 
-    let model = inferlet2::get_model(available_models.first().unwrap()).unwrap();
-    let queue = model.create_queue();
-    let tokenizer = queue.get_tokenizer();
-
-    let mut ctx = inferlet2::Context::new(&model);
+    let mut ctx = model.create_context();
 
     ctx.fill("<|begin_of_text|>");
     ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");

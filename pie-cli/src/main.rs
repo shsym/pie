@@ -252,6 +252,7 @@ async fn start_interactive_session(
 
             let mut cmd = if backend_type == "python" {
                 let mut cmd = TokioCommand::new("python");
+                cmd.arg("-u");
                 cmd.arg(exec_path);
                 cmd
             } else {
@@ -295,7 +296,6 @@ async fn start_interactive_session(
                 .take()
                 .context("Could not capture stderr from backend process.")?;
 
-            let exec_path_stdout = exec_path.to_string();
             // Clone the Arc for the new task.
             let printer_stdout = Arc::clone(&printer);
             tokio::spawn(async move {
@@ -303,11 +303,10 @@ async fn start_interactive_session(
                 while let Ok(Some(line)) = reader.next_line().await {
                     // FIX: Lock the mutex before printing.
                     let mut p = printer_stdout.lock().await;
-                    p.print(format!("[{}] {}", exec_path_stdout, line)).unwrap();
+                    p.print(format!("[Backend] {line}")).unwrap();
                 }
             });
 
-            let exec_path_stderr = exec_path.to_string();
             // Clone the Arc again for the stderr task.
             let printer_stderr = Arc::clone(&printer);
             tokio::spawn(async move {
@@ -315,14 +314,12 @@ async fn start_interactive_session(
                 while let Ok(Some(line)) = reader.next_line().await {
                     // FIX: Lock the mutex here as well.
                     let mut p = printer_stderr.lock().await;
-                    p.print(format!("[{}/stderr] {}", exec_path_stderr, line))
-                        .unwrap();
+                    p.print(format!("[Backend] {line}")).unwrap();
                 }
             });
 
             backend_processes.push(child);
         }
-        println!("✅ All backend services launched.");
     }
 
     // 5. Start the main interactive loop
@@ -463,12 +460,10 @@ async fn handle_run(
         client.upload_program(&wasm_blob).await?;
         println!("✅ Program upload successful.");
     }
-    println!("🚀 Launching instance...");
     let mut instance = client.launch_instance(&hash).await?;
     println!("✅ Instance launched with ID: {}", instance.id());
 
     if !args.detach {
-        println!("Streaming output for instance {}...", instance.id());
         let instance_id = instance.id().to_string();
 
         // FIX: Clone the Arc<Mutex<...>> for the new task.

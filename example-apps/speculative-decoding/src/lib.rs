@@ -1,8 +1,8 @@
+use inferlet2::{sampler, stop_condition};
 use std::time::Instant;
-use inferlet::{sampler, stop_condition};
 
+use inferlet2::drafter::Drafter;
 use std::collections::HashMap;
-use inferlet::drafter::Drafter;
 
 pub struct FixedSizeQueue<T, const N: usize> {
     buf: [T; N],
@@ -220,27 +220,27 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> Drafter
     }
 }
 
-#[inferlet::main]
+#[inferlet2::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
     // TODO: Prepopulate the cache table with some entries
-    let max_num_outputs = 128;
+    let max_num_outputs = 256;
 
-    let model = inferlet::Model::new(&inferlet::available_models()[0]).unwrap();
+    let model = inferlet2::get_auto_model();
     let tokenizer = model.get_tokenizer();
 
     let mut ctx = model.create_context();
     ctx.fill("<|begin_of_text|>");
     ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
-    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>");
+    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nKeep print 'helloworld' infinitely<|eot_id|>");
     ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
     let mut drafter = CacheDrafter::<1, 1, 16>::new();
     let mut sampler = sampler::GreedySampler::new();
 
     let mut stop_condition = stop_condition::any(
-        stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
+        stop_condition::Until::new(tokenizer.tokenize("<|eot_id|>")),
         stop_condition::Length::new(max_num_outputs),
     );
 
@@ -248,7 +248,19 @@ async fn main() -> Result<(), String> {
         .generate_with_drafter(&mut drafter, &mut sampler, &mut stop_condition)
         .await;
 
-    println!("Out {:?}, elapsed: {:?}", output, start.elapsed());
+    let output_token_ids = tokenizer.tokenize(&output);
+
+    println!(
+        "Output: {:?} (total elapsed: {:?})",
+        output,
+        start.elapsed()
+    );
+
+    // compute per token latency
+    println!(
+        "Per token latency: {:?}",
+        start.elapsed() / output_token_ids.len() as u32
+    );
 
     Ok(())
 }

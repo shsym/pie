@@ -81,6 +81,7 @@ impl ManualStrategy {
 
 impl BatchingStrategy for ManualStrategy {
     fn update(&mut self, _now: Instant) {
+        //println!("item added: {:?}", self.count + 1);
         // We only need to know how many items there are, not when they arrived.
         self.count += 1;
     }
@@ -89,6 +90,7 @@ impl BatchingStrategy for ManualStrategy {
         if self.count == 0 {
             return 0;
         }
+        //println!("batch fired! {:?}", self.trigger);
 
         // Atomically check if the trigger is set to true, and reset it to false.
         // `swap` ensures we only fire once per trigger.
@@ -241,11 +243,7 @@ impl AdaptiveStrategy {
     }
 
     /// Performs the core calculation to find the optimal batch size `n*`.
-    fn calculate_optimal_n(
-        lambda: f64,
-        f_values: &[Duration],
-        max_size: usize,
-    ) -> Option<usize> {
+    fn calculate_optimal_n(lambda: f64, f_values: &[Duration], max_size: usize) -> Option<usize> {
         let mut best_n = 0;
         let mut min_latency = f64::MAX;
 
@@ -343,6 +341,10 @@ impl<T> BatchQueue<T> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     /// Push an item with the current timestamp.
     pub fn push(&mut self, item: T, now: Instant) {
         self.items.push_back(item);
@@ -394,7 +396,13 @@ where
     }
 
     pub fn has_pending_items(&self) -> bool {
-        !self.pending_items_by_stream.is_empty()
+        // First, check the initial holding pen.
+        if !self.pending_items_by_stream.is_empty() {
+            return true;
+        }
+
+        // IMPORTANT: Also check if any of the staged queues have items.
+        self.batch_queues_by_group.values().any(|q| !q.is_empty())
     }
 
     pub fn push(&mut self, stream: S, item: T, now: Instant) {

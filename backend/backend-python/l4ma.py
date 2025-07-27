@@ -14,26 +14,61 @@ from config import L4maConfig
 VERSION = "0.1.0"
 
 
+def create_fusion_map(model: nn.Module):
+    """
+    Analyzes the model and creates a map for fusing weights.
+
+    Returns:
+        A dictionary mapping {fused_tensor_name: {"sources": [source_names], "dim": cat_dim}}.
+    """
+    fusion_map = {}
+    for name, module in model.named_modules():
+        # --- Rule for L4maAttention QKV Fusion ---
+        if isinstance(module, L4maAttention):
+            # Handle weights
+            target_w = f"{name}.qkv_proj.weight"
+            sources_w = [f"{name}.q_proj.weight", f"{name}.k_proj.weight", f"{name}.v_proj.weight"]
+            fusion_map[target_w] = {"sources": sources_w, "dim": 0}
+
+            # Handle biases if they exist
+            if module.qkv_proj.bias is not None:
+                target_b = f"{name}.qkv_proj.bias"
+                sources_b = [f"{name}.q_proj.bias", f"{name}.k_proj.bias", f"{name}.v_proj.bias"]
+                fusion_map[target_b] = {"sources": sources_b, "dim": 0}
+
+        # --- Rule for L4maMlp Gate/Up Fusion ---
+        elif isinstance(module, L4maMlp):
+            target_w = f"{name}.gate_up_proj.weight"
+            sources_w = [f"{name}.gate_proj.weight", f"{name}.up_proj.weight"]
+            fusion_map[target_w] = {"sources": sources_w, "dim": 0}
+
+    return fusion_map
+
+
 class L4maMlp(nn.Module):
     def __init__(self, config: L4maConfig):
         super().__init__()
         self.config = config
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, device=config.device, dtype=config.dtype)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, device=config.device, dtype=config.dtype)
+        self.gate_up_proj = nn.Linear(
+            config.hidden_size,
+            2 * config.intermediate_size,  # Double the output dimension
+            bias=False,
+            device=config.device,
+            dtype=config.dtype
+        )
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False, device=config.device, dtype=config.dtype)
         self.act_fn = nn.SiLU()
 
     def forward(self, x):
-        
-        gate_proj = self.gate_proj(x)
-        up_proj = self.up_proj(x)
-        
-        #print(f"gate mean: {gate_proj.mean().item()}, up_proj mean: {up_proj.mean().item()}")
-        
+        gate_up_proj_out = self.gate_up_proj(x)
+        gate_proj, up_proj = gate_up_proj_out.chunk(2, dim=-1)
+        # interim = ops.activation.silu_and_mul(gate_up_proj_out)
+        # print(f"gate mean: {gate_proj.mean().item()}, up_proj mean: {up_proj.mean().item()}")
+
         interim = self.act_fn(gate_proj) * up_proj
-        
-        #print(f"interim shape: {interim.shape}, mean: {interim.mean().item()}")
-        
+
+        # print(f"interim shape: {interim.shape}, mean: {interim.mean().item()}")
+
         down_proj = self.down_proj(interim)
         return down_proj
 
@@ -45,9 +80,19 @@ class L4maAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        self.q_proj = nn.Linear(config.hidden_size, config.num_query_heads * config.head_size, bias=config.use_qkv_bias, device=config.device, dtype=config.dtype)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_size, bias=config.use_qkv_bias, device=config.device, dtype=config.dtype)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_size, bias=config.use_qkv_bias, device=config.device, dtype=config.dtype)
+        # Define the output sizes for Q, K, and V for clarity
+        self.q_size = config.num_query_heads * config.head_size
+        self.k_size = config.num_key_value_heads * config.head_size
+        self.v_size = config.num_key_value_heads * config.head_size
+
+        self.qkv_proj = nn.Linear(
+            config.hidden_size,
+            self.q_size + self.k_size + self.v_size,
+            bias=config.use_qkv_bias,
+            device=config.device,
+            dtype=config.dtype
+        )
+
         self.o_proj = nn.Linear(config.num_query_heads * config.head_size, config.hidden_size, bias=False, device=config.device, dtype=config.dtype)
 
     def forward(
@@ -60,28 +105,25 @@ class L4maAttention(nn.Module):
             kv_page_indptr: torch.Tensor,
             kv_last_page_lens: torch.Tensor,
             qo_indptr: torch.Tensor,
+            batch_indices: torch.Tensor,
+            batch_positions: torch.Tensor,
     ) -> torch.Tensor:
-        
-        
         # print the mean of qkv matirces
         # q_mean = self.q_proj.weight.mean().item()
         # k_mean = self.k_proj.weight.mean().item()
         # v_mean = self.v_proj.weight.mean().item()
         # print(f"Q Mean: {q_mean}, K Mean: {k_mean}, V Mean: {v_mean}")
-        
+
         n, _ = hidden_states.size()
-        page_size = kv_cache_at_layer[0].shape[2]
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        qkv_states = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = torch.split(
+            qkv_states,
+            [self.q_size, self.k_size, self.v_size],
+            dim=-1
+        )
 
-        # print the mean of qkv matirces
-        # q_mean = query_states.mean().item()
-        # k_mean = key_states.mean().item()
-        # v_mean = value_states.mean().item()
-        # print(f"Q Mean: {q_mean}, K Mean: {k_mean}, V Mean: {v_mean}")
-
+        # Reshape and continue as before
         query_states = query_states.view(n, self.config.num_query_heads, self.config.head_size)
         key_states = key_states.view(n, self.config.num_key_value_heads, self.config.head_size)
         value_states = value_states.view(n, self.config.num_key_value_heads, self.config.head_size)
@@ -94,23 +136,17 @@ class L4maAttention(nn.Module):
         # k_mean = key_states.mean().item()
         # print(f"Q Mean after rope: {q_mean}, K Mean after rope: {k_mean}")
 
-        batch_indices, positions = ops.get_batch_indices_positions(
-            append_indptr=qo_indptr,
-            seq_lens=ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size),
-            nnz=n
-        )
-        
         # if self.layer_idx == 0:
         #     print(f"batch_indices: {batch_indices}, positions: {positions}")
         #     print(f"kv_page_indices: {kv_page_indices}, kv_page_indptr: {kv_page_indptr}, kv_last_page_lens: {kv_last_page_lens}")
-        
-        #print(f"batch_indices: {batch_indices}, positions: {positions}")
+
+        # print(f"batch_indices: {batch_indices}, positions: {positions}")
 
         ops.append_paged_kv_cache(
             append_key=key_states,
             append_value=value_states,
             batch_indices=batch_indices,
-            positions=positions,
+            positions=batch_positions,
             paged_kv_cache=kv_cache_at_layer[self.layer_idx],
             kv_indices=kv_page_indices,
             kv_indptr=kv_page_indptr,
@@ -120,16 +156,16 @@ class L4maAttention(nn.Module):
 
         attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
         attn_output = attn_output.reshape(n, -1)
-        
+
         # for i in range(4):
         #     tgt = attn_output[i]
         #     print(f"attn_output[{i}]: {tgt.mean().item()}")
         #     print(f"attn_output[{i}]: {tgt[:8].tolist()})")
-        
+
         attn_output = self.o_proj(attn_output)
-        
+
         # print(f"attn_output shape: {attn_output.shape}, mean: {attn_output.mean().item()}")
-       
+
         return attn_output
 
 
@@ -153,6 +189,8 @@ class L4maDecoderLayer(nn.Module):
             kv_page_indptr: torch.Tensor,
             kv_last_page_lens: torch.Tensor,
             qo_indptr: torch.Tensor,
+            batch_indices: torch.Tensor,
+            batch_positions: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -168,22 +206,20 @@ class L4maDecoderLayer(nn.Module):
             kv_page_indptr=kv_page_indptr,
             kv_last_page_lens=kv_last_page_lens,
             qo_indptr=qo_indptr,
+            batch_indices=batch_indices,
+            batch_positions=batch_positions,
         )
-        
 
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        
 
-        
         hidden_states = self.mlp(hidden_states)
-        
-        #print(f"post_attention_layernorm shape after self-attention: {hidden_states.shape}, mean: {hidden_states.mean().item()}")
 
-        
+        # print(f"post_attention_layernorm shape after self-attention: {hidden_states.shape}, mean: {hidden_states.mean().item()}")
+
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -222,10 +258,17 @@ class L4maModel(nn.Module):
     ) -> torch.Tensor:
         # attention_mask = proc_mask(attention_mask, batch.dtype())
         hidden_states = input_embeds
-        
-        #print(f"mean of input_embeds: {hidden_states.mean().item()}")
-        
+        n, _ = hidden_states.size()
+
+        # print(f"mean of input_embeds: {hidden_states.mean().item()}")
+
         page_size = kv_cache_at_layer[0].shape[2]
+
+        batch_indices, batch_positions = ops.get_batch_indices_positions(
+            append_indptr=qo_indptr,
+            seq_lens=ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size),
+            nnz=n
+        )
 
         # check if its decoding (qo_indptr is )
         if single_token_inference_mode:
@@ -267,6 +310,8 @@ class L4maModel(nn.Module):
                 kv_page_indptr=kv_page_indptr,
                 kv_last_page_lens=kv_last_page_lens,
                 qo_indptr=qo_indptr,
+                batch_indices=batch_indices,
+                batch_positions=batch_positions,
             )
             # print(f"mean: {layer_outputs.mean().item()}")
             # print(layer_outputs.flatten()[:10].tolist())

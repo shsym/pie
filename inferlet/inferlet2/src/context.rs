@@ -5,6 +5,7 @@ use crate::traits::allocate::Allocate;
 use crate::traits::tokenize::{Tokenize, Tokenizer};
 use crate::{Model, Queue, sampler, stop_condition};
 
+use crate::traits::ForwardText;
 use crate::traits::forward::Forward;
 use crate::traits::input_text::InputText;
 use crate::traits::output_text::{Distribution, OutputText};
@@ -238,22 +239,28 @@ impl Context {
             ..(self.token_ids.len() + pending_token_ids.len()) as u32)
             .collect::<Vec<u32>>();
 
-        let embed_ids = self.queue.allocate_embeds(pending_token_ids.len());
-        self.queue
-            .embed_text(&embed_ids, &pending_token_ids, &position_ids);
+        // let embed_ids = self.queue.allocate_embeds(pending_token_ids.len());
+        // self.queue.embed_text(&embed_ids, &pending_token_ids, &position_ids);
 
         // First, ensure we have enough KV pages for all tokens.
         self.grow_kv_pages(pending_token_ids.len());
 
-        self.queue.forward(
+        // self.queue.forward(
+        //     self.kv_page_last_len as u32,
+        //     &self.kv_page_ids,
+        //     &embed_ids,
+        //     &[],
+        // );
+
+        self.queue.forward_text_no_output(
             self.kv_page_last_len as u32,
             &self.kv_page_ids,
-            &embed_ids,
-            &[],
+            &pending_token_ids,
+            &position_ids,
         );
 
         self.token_ids.extend(pending_token_ids);
-        self.queue.deallocate_embeds(&embed_ids);
+        // self.queue.deallocate_embeds(&embed_ids);
     }
 
     /// Performs a single, atomic autoregressive decoding step.
@@ -279,33 +286,33 @@ impl Context {
             "Context must be filled before generation"
         );
 
-        let input_embed_id = self.queue.allocate_embeds(1);
-        let output_embed_id = self.queue.allocate_embeds(1);
+        // let input_embed_id = self.queue.allocate_embeds(1);
+        // let output_embed_id = self.queue.allocate_embeds(1);
 
         let next_token_id = self.token_ids_pending.pop().unwrap();
         let next_pos_id = self.token_ids.len() as u32;
 
-        self.queue
-            .embed_text(&input_embed_id, &[next_token_id], &[next_pos_id]);
+        // self.queue.embed_text(&input_embed_id, &[next_token_id], &[next_pos_id]);
 
         self.grow_kv_pages(1);
 
-        self.queue.forward(
-            self.kv_page_last_len as u32,
-            &self.kv_page_ids,
-            &input_embed_id,
-            &output_embed_id,
-        );
-
         let sampled = self
             .queue
-            .get_next_token_distribution(&output_embed_id)
+            .forward_text(
+                self.kv_page_last_len as u32,
+                &self.kv_page_ids,
+                &[next_token_id],
+                &[next_pos_id],
+                &[0],
+            )
             .await;
+
+        // let sampled = self.queue.get_next_token_distribution(&output_embed_id).await;
 
         self.token_ids.push(next_token_id);
 
-        self.queue.deallocate_embeds(&input_embed_id);
-        self.queue.deallocate_embeds(&output_embed_id);
+        // self.queue.deallocate_embeds(&input_embed_id);
+        // self.queue.deallocate_embeds(&output_embed_id);
 
         // Only one token is generated. So it is safe to unwrap here.
         sampled.into_iter().next().unwrap()

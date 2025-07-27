@@ -1,3 +1,7 @@
+use inferlet2::sampler::Sampler;
+use inferlet2::traits::Tokenize;
+use inferlet2::traits::tokenize::Tokenizer;
+use llguidance::api::GrammarInit;
 use llguidance::earley::SlicedBiasComputer;
 use llguidance::{
     Constraint, ParserFactory,
@@ -6,12 +10,6 @@ use llguidance::{
 };
 use std::sync::Arc;
 use std::time::Instant;
-use inferlet::context::Tokenizer;
-use inferlet::drafter::Empty;
-use inferlet::sampler::Sampler;
-use inferlet::{Run, l4m};
-
-struct ConstrainedDecoding;
 
 const JSON_GRAMMAR: &str = r##"
 
@@ -112,11 +110,11 @@ impl ConstrainedSampler {
     ) -> Self {
         //let words = l4m::get_vocabs();
         let words = tokenizer.get_vocabs();
-        let eos_token = tokenizer.encode(eos_token)[0];
-        let bos_token = bos_token.map(|s| tokenizer.encode(s)[0]);
-        let pad_token = pad_token.map(|s| tokenizer.encode(s)[0]);
-        let unk_token = unk_token.map(|s| tokenizer.encode(s)[0]);
-        let end_of_turn_token = end_of_turn_token.map(|s| tokenizer.encode(s)[0]);
+        let eos_token = tokenizer.tokenize(eos_token)[0];
+        let bos_token = bos_token.map(|s| tokenizer.tokenize(s)[0]);
+        let pad_token = pad_token.map(|s| tokenizer.tokenize(s)[0]);
+        let unk_token = unk_token.map(|s| tokenizer.tokenize(s)[0]);
+        let end_of_turn_token = end_of_turn_token.map(|s| tokenizer.tokenize(s)[0]);
 
         let tokenizer = TrieTokenizer::new(
             &words,
@@ -133,7 +131,11 @@ impl ConstrainedSampler {
         let quiet = true;
 
         let parser = get_parser_factory(&tokenizer)
-            .create_parser_ext2(grm, if quiet { 0 } else { 2 }, if quiet { 1 } else { 2 })
+            .create_parser_from_init(
+                GrammarInit::Serialized(grm),
+                if quiet { 0 } else { 2 },
+                if quiet { 1 } else { 2 },
+            )
             .unwrap();
 
         let constraint = Constraint::new(parser);
@@ -184,55 +186,51 @@ impl Sampler for ConstrainedSampler {
     }
 }
 
-#[inferlet::main]
+#[inferlet2::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
-    let available_models = inferlet::available_models();
-    let model = inferlet::Model::new(available_models.first().unwrap()).unwrap();
+    let model = inferlet2::get_auto_model();
     let tokenizer = model.get_tokenizer();
-    let prompt = inferlet::messaging_async::receive().await;
 
-    let num_prompts = inferlet::messaging_async::receive()
-        .await
-        .parse()
-        .unwrap_or(1);
+    let mut ctx = model.create_context();
 
-    let mut futures = Vec::new();
-    for _ in 0..num_prompts {
-        let mut ctx = model.create_context();
-        let prompt = prompt.clone();
-        let mut sampler = ConstrainedSampler::new(
-            tokenizer.clone(),
-            JSON_GRAMMAR,
-            "<|end_of_text|>",
-            Some("<|begin_of_text|>"),
-            None,
-            None,
-            Some("<|eot_id|>"),
-        );
-        let mut stop_condition = inferlet::stop_condition::any(
-            inferlet::stop_condition::Until::new(tokenizer.encode("<|eot_id|>")),
-            inferlet::stop_condition::Length::new(32),
-        );
-        let future= async move {
+    let prompt = "what is the capital of France? output data";
 
-            ctx.fill("<|begin_of_text|>");
-            ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
-            ctx.fill("<|start_header_id|>user<|end_header_id|>\n\n");
-            ctx.fill(&prompt);
-            ctx.fill("<|eot_id|>");
-            ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    let mut sampler = ConstrainedSampler::new(
+        tokenizer.clone(),
+        JSON_GRAMMAR,
+        "<|end_of_text|>",
+        Some("<|begin_of_text|>"),
+        None,
+        None,
+        Some("<|eot_id|>"),
+    );
+    let mut stop_condition = inferlet2::stop_condition::any(
+        inferlet2::stop_condition::Until::new(tokenizer.tokenize("<|eot_id|>")),
+        inferlet2::stop_condition::Length::new(128),
+    );
+    ctx.fill("<|begin_of_text|>");
+    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
+    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\n");
+    ctx.fill(&prompt);
+    ctx.fill("<|eot_id|>");
+    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
-            ctx
-            .generate(&mut sampler, &mut stop_condition).await
-        };
-        futures.push(future);
+    let output = ctx.generate(&mut sampler, &mut stop_condition).await;
+    let output_token_ids = tokenizer.tokenize(&output);
 
-    }
-    let results = futures::future::join_all(futures).await;
-    let text = results.join("\n\n");
-    inferlet::messaging::send(&text);
-    
+    println!(
+        "Output: {:?} (total elapsed: {:?})",
+        output,
+        start.elapsed()
+    );
+
+    // compute per token latency
+    println!(
+        "Per token latency: {:?}",
+        start.elapsed() / output_token_ids.len() as u32
+    );
+
     Ok(())
 }

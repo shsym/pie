@@ -10,8 +10,8 @@ use wasmtime_wasi::p2::{DynPollable, IoView, Pollable, subscribe};
 
 #[derive(Debug)]
 pub struct DistributionResult {
-    receiver: Option<oneshot::Receiver<Vec<(Vec<u32>, Vec<f32>)>>>,
-    result: Option<Vec<(Vec<u32>, Vec<f32>)>>,
+    receiver: oneshot::Receiver<Vec<(Vec<u32>, Vec<f32>)>>,
+    result: Vec<(Vec<u32>, Vec<f32>)>,
     done: bool,
 }
 
@@ -21,11 +21,9 @@ impl Pollable for DistributionResult {
         if self.done {
             return;
         }
-        if let Some(rx) = self.receiver.take() {
-            if let Ok(result) = rx.await {
-                self.result = Some(result);
-            }
-        }
+
+        let res = (&mut self.receiver).await.unwrap();
+        self.result = res;
         self.done = true;
     }
 }
@@ -53,17 +51,43 @@ impl bindings2::pie::inferlet::forward_text::Host for InstanceState {
             text: tokens,
             positions,
             output_indices,
-            handle: tx,
+            handle: Some(tx),
         }
         .dispatch(q.service_id)?;
 
         let res = DistributionResult {
-            receiver: Some(rx),
-            result: None,
+            receiver: rx,
+            result: vec![],
             done: false,
         };
 
         Ok(self.table().push(res)?)
+    }
+
+    async fn forward_text_no_output(
+        &mut self,
+        queue: Resource<core::Queue>,
+        last_kv_page_len: u32,
+        kv_page_ids: Vec<IdRepr>,
+        tokens: Vec<u32>,
+        positions: Vec<u32>,
+    ) -> anyhow::Result<()> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+
+        Command::ForwardText {
+            inst_id,
+            stream_id: q.stream_id,
+            last_block_len: last_kv_page_len,
+            context: kv_page_ids,
+            text: tokens,
+            positions,
+            output_indices: vec![],
+            handle: None,
+        }
+        .dispatch(q.service_id)?;
+
+        Ok(())
     }
 }
 
@@ -79,7 +103,13 @@ impl bindings2::pie::inferlet::forward_text::HostDistributionResult for Instance
         &mut self,
         this: Resource<DistributionResult>,
     ) -> anyhow::Result<Option<Vec<(Vec<u32>, Vec<f32>)>>> {
-        Ok(self.table().get_mut(&this)?.result.clone())
+        let result = self.table().get_mut(&this)?;
+
+        if result.done {
+            Ok(Some(result.result.clone()))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn drop(&mut self, this: Resource<DistributionResult>) -> anyhow::Result<()> {

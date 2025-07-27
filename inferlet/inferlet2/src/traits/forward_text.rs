@@ -12,6 +12,14 @@ pub trait ForwardText {
         positions: &[u32],
         output_indices: &[u32],
     ) -> Vec<Distribution>;
+
+    fn forward_text_no_output(
+        &self,
+        last_kv_page_len: u32,
+        kv_page_ids: &[u32],
+        tokens: &[u32],
+        positions: &[u32],
+    );
 }
 
 impl ForwardText for Queue {
@@ -49,5 +57,21 @@ impl ForwardText for Queue {
             .into_iter()
             .map(|(ids, probs)| Distribution { ids, probs })
             .collect()
+    }
+
+    fn forward_text_no_output(
+        &self,
+        last_kv_page_len: u32,
+        kv_page_ids: &[u32],
+        tokens: &[u32],
+        positions: &[u32],
+    ) {
+        forward_text::forward_text_no_output(
+            &self.inner,
+            last_kv_page_len,
+            kv_page_ids,
+            tokens,
+            positions,
+        );
     }
 }

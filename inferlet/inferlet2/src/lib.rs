@@ -71,6 +71,7 @@ pub use crate::bindings_app::{export, exports::pie::inferlet::run::Guest as RunS
 #[derive(Clone, Debug)]
 pub struct Queue {
     pub(crate) inner: Rc<core::Queue>,
+    service_id: u32,
 }
 
 /// Represents a specific model instance, providing access to its metadata and functionality.
@@ -101,6 +102,18 @@ pub fn get_model(name: &str) -> Option<Model> {
     core::get_model(name).map(|inner| Model {
         inner: Rc::new(inner),
     })
+}
+
+pub fn get_auto_model() -> Model {
+    let models = get_all_models();
+    if models.is_empty() {
+        panic!("No models available");
+    }
+
+    // choose the first model
+    let model_name = models[0].clone();
+    let model = get_model(&model_name).unwrap();
+    model
 }
 
 /// Get a list of all available model names.
@@ -199,11 +212,21 @@ impl Model {
         self.inner.get_service_id()
     }
 
+    pub fn get_tokenizer(&self) -> Tokenizer {
+        let queue = self.create_queue();
+        queue.get_tokenizer()
+    }
+
     /// Create a new command queue for this model.
     pub fn create_queue(&self) -> Queue {
         Queue {
             inner: Rc::new(self.inner.create_queue()),
+            service_id: self.inner.get_service_id(),
         }
+    }
+
+    pub fn create_context(&self) -> Context {
+        Context::new(self)
     }
 
     /// Sends a debug message directly to the model and returns the response.
@@ -214,11 +237,13 @@ impl Model {
 
 /// Defines task priority levels.
 pub use crate::bindings::pie::inferlet::core::Priority;
+use crate::traits::Tokenize;
+use crate::traits::tokenize::Tokenizer;
 
 impl Queue {
     /// Gets the service ID for the queue.
     pub fn get_service_id(&self) -> u32 {
-        self.inner.get_service_id()
+        self.service_id
     }
 
     /// Begins a synchronization process for the queue, returning a `SynchronizationResult`.

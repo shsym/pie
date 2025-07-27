@@ -18,8 +18,10 @@ from l4m_pb2 import (  # pylint: disable=no-name-in-module
     BatchSampleTopKResponse,
     ObjectKind,
     SampleTopKResponse,
+    ForwardTextResponse,
     BatchFillBlock,
-    BatchSyncResponse
+    Distribution,
+    BatchSyncResponse, BatchForwardText, BatchForwardTextResponse
 )
 
 from l4m_vision_pb2 import BatchEmbedImage  # pylint: disable=no-name-in-module
@@ -62,14 +64,14 @@ class Driver:
     # dist_storage: VectorStorage
 
     def __init__(
-        self,
-        model,
-        kv_page_size: int,
-        dist_size: int,
-        max_num_kv_pages: int,
-        max_num_embeds: int,
-        dtype: torch.dtype,
-        device: str,
+            self,
+            model,
+            kv_page_size: int,
+            dist_size: int,
+            max_num_kv_pages: int,
+            max_num_embeds: int,
+            dtype: torch.dtype,
+            device: str,
     ):
         """TODO: Add method docstring."""
         self.embeds = {}
@@ -120,7 +122,6 @@ class Driver:
         for cmd in cmds.items:
             if cmd.kind == ObjectKind.OBJECT_KIND_KV_BLOCK:
                 for i in range(cmd.count):
-
                     self.blocks[cmd.object_id_offset + i] = Block(
                         position_ids=np.array([0] * self.kv_page_size),
                         occupancy=np.array([False] * self.kv_page_size),
@@ -166,16 +167,16 @@ class Driver:
             dst_start = cmd.destination_start
             length = cmd.length
 
-            dst_block.occupancy[dst_start : dst_start + length] = src_block.occupancy[
-                src_start : src_start + length
+            dst_block.occupancy[dst_start: dst_start + length] = src_block.occupancy[
+                src_start: src_start + length
             ]
-            dst_block.position_ids[dst_start : dst_start + length] = (
-                src_block.position_ids[src_start : src_start + length]
+            dst_block.position_ids[dst_start: dst_start + length] = (
+                src_block.position_ids[src_start: src_start + length]
             )
 
             for kv_cache_layer in self.kv_cache_at_layer:
-                kv_cache_layer[dst_block, :, dst_start : dst_start + length, :, :] = (
-                    kv_cache_layer[src_block, :, src_start : src_start + length, :, :]
+                kv_cache_layer[dst_block, :, dst_start: dst_start + length, :, :] = (
+                    kv_cache_layer[src_block, :, src_start: src_start + length, :, :]
                 )
 
     @torch.inference_mode()
@@ -195,7 +196,7 @@ class Driver:
 
     @torch.inference_mode()
     def sample_top_k_request(
-        self, cmds: BatchSampleTopKRequest
+            self, cmds: BatchSampleTopKRequest
     ) -> BatchSampleTopKResponse:
         """TODO: Add method docstring."""
         res = []
@@ -233,6 +234,7 @@ class Driver:
         new_token_ids = []
         new_position_ids = []
         output_embed_postproc = []
+        single_token_inference_mode = True
 
         for cmd in cmds.items:
             last_block_len = cmd.last_block_len  # change this name to "offset" later.
@@ -256,8 +258,11 @@ class Driver:
             inp_occupancy = np.zeros((len(input_embeds),), dtype=np.bool_)
 
             total_ctx_tokens = (
-                self.kv_page_size * (len(ctx_block_ids) - 1) + last_block_len
+                    self.kv_page_size * (len(ctx_block_ids) - 1) + last_block_len
             )
+
+            if len(input_embeds) > 1:
+                single_token_inference_mode = False
 
             for i, input_embed in enumerate(input_embeds):
 
@@ -282,7 +287,6 @@ class Driver:
                     # should never happen, since the controller should have already
                     # checked that the input embeds are valid.
                     raise ValueError("Input embedding not found")
-
 
             for i, embed in enumerate(output_embeds):
                 output_embed_postproc.append(
@@ -370,7 +374,7 @@ class Driver:
                 kv_last_page_lens=pt_kv_last_page_lens,
                 qo_indptr=pt_qo_indptr,
                 custom_mask=pt_custom_mask,
-                single_token_inference_mode=False,  # single_token_inference_mode,
+                single_token_inference_mode=single_token_inference_mode,
             )
             # print(f"output_embeds mean: {output_embeds.mean().item()}")
 
@@ -383,7 +387,9 @@ class Driver:
             # topk
 
             # print(f"logits mean: {logits.mean().item()}")
-            condensed = torch.topk(logits, k=self.dist_size, sorted=True)
+            probs = torch.softmax(logits, dim=-1)
+
+            condensed = torch.topk(probs, k=self.dist_size, sorted=True)
 
         # print(logits.shape)
         # store the logits in the output embeds  -> replace with torch.scatter later
@@ -404,3 +410,190 @@ class Driver:
         self.inter_fill_time = time.time()
 
         return BatchSyncResponse()
+
+    @torch.inference_mode()
+    def forward_text(self, cmds: BatchForwardText):
+        """TODO: Add method docstring."""
+
+        kv_page_indices = []
+        kv_page_indptr = [0]
+        kv_last_page_lens = []
+        qo_indices = []
+        qo_indptr = [0]
+        custom_masks = []
+
+        new_token_ids = []
+        new_position_ids = []
+
+        all_output_indices = []
+        all_output_indices_ptr = [0]
+        single_token_inference_mode = True
+
+        for cmd in cmds.items:
+            last_block_len = cmd.last_block_len
+
+            ctx_block_ids = (
+                cmd.context_block_ids
+            )  # block == page. make names consistent later.
+            # input_embeds = cmd.input_embedding_ids
+            # output_embeds = cmd.output_embedding_ids
+
+            input_token_ids = cmd.token_ids
+            input_position_ids = cmd.position_ids
+            output_indices = cmd.output_indices
+
+            kv_page_indices.extend(ctx_block_ids)
+            kv_page_indptr.append(len(kv_page_indices))
+            kv_last_page_lens.append(last_block_len)
+
+            qo_indices.extend(input_token_ids)  # dummy value - only used to compute the qo_indptr
+            qo_indptr.append(len(qo_indices))
+
+            # let's compute the mask.
+
+            inp_pos_ids = np.array(input_position_ids, dtype=np.int32)
+            inp_occupancy = np.ones((len(input_token_ids),), dtype=np.bool_)
+
+            total_ctx_tokens = (
+                    self.kv_page_size * (len(ctx_block_ids) - 1) + last_block_len
+            )
+
+            new_token_ids.extend(input_token_ids)
+            new_position_ids.extend(input_position_ids)
+            all_output_indices.extend(output_indices)
+            all_output_indices_ptr.append(len(all_output_indices))
+
+            if len(input_token_ids) > 1:
+                single_token_inference_mode = False
+
+            # Correctly iterate over the inputs of the CURRENT command
+            for i, pos in enumerate(input_position_ids):
+                # Calculate offset based on the CURRENT command's input length
+                token_offset = total_ctx_tokens - len(input_token_ids) + i
+
+                # Ensure the target block is indexed correctly
+                if token_offset < 0:
+                    raise IndexError(f"Calculated a negative token_offset ({token_offset}). Check if 'total_ctx_tokens' is set correctly.")
+
+                tgt_block_idx = token_offset // self.kv_page_size
+                tgt_block_offset = token_offset % self.kv_page_size
+
+                tgt_block_id = ctx_block_ids[tgt_block_idx]
+                tgt_block = self.blocks[tgt_block_id]
+
+                # Update the block with the correct position and occupancy
+                tgt_block.occupancy[tgt_block_offset] = True
+                tgt_block.position_ids[tgt_block_offset] = pos
+
+            total_sequence_length = total_ctx_tokens
+
+            # Get position IDs and occupancy for the entire sequence
+            ctx_pos_ids = np.hstack(
+                [self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids]
+            )[:total_sequence_length]
+
+            ctx_occupancy = np.hstack(
+                [self.blocks[ctx_id].occupancy for ctx_id in ctx_block_ids]
+            )[:total_sequence_length]
+
+            # print(f"ctx_pos_ids: {ctx_pos_ids}, ctx_occupancy: {ctx_occupancy}")
+
+            # Build the causal and valid masks
+            casual_mask = ctx_pos_ids[None, :] <= inp_pos_ids[:, None]
+            valid_mask = np.logical_and(ctx_occupancy[None, :], inp_occupancy[:, None])
+            mask = np.logical_and(casual_mask, valid_mask)
+
+            mask_flat = mask.flatten()
+            custom_masks.append(mask_flat)
+            # print(mask)
+
+        # concat all masks
+        custom_mask = np.concatenate(custom_masks)
+
+        # print all inputs
+        # print('kv_page_indices', kv_page_indices)
+        # print('kv_page_indptr', kv_page_indptr)
+        # print('kv_last_page_lens', kv_last_page_lens)
+        # print('qo_indptr', qo_indptr)
+        # print('custom_mask', custom_mask)
+
+        pt_new_token_ids = torch.as_tensor(
+            new_token_ids, device=self.device, dtype=torch.int32
+        )
+        pt_new_position_ids = torch.as_tensor(
+            new_position_ids, device=self.device, dtype=torch.int32
+        )
+
+        pt_kv_page_indices = torch.as_tensor(
+            kv_page_indices, device=self.device, dtype=torch.int32
+        )
+        pt_kv_page_indptr = torch.as_tensor(
+            kv_page_indptr, device=self.device, dtype=torch.int32
+        )
+        pt_kv_last_page_lens = torch.as_tensor(
+            kv_last_page_lens, device=self.device, dtype=torch.int32
+        )
+        pt_qo_indptr = torch.as_tensor(qo_indptr, device=self.device, dtype=torch.int32)
+        pt_custom_mask = torch.as_tensor(
+            custom_mask, device=self.device, dtype=torch.bool
+        )
+
+        pt_output_indices = torch.as_tensor(
+            all_output_indices, device=self.device, dtype=torch.int32)
+
+        input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
+
+        # torch.cuda.synchronize()
+        # print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
+        # print('kv_page_indices', kv_page_indices)
+        # print('kv_page_indptr', kv_page_indptr)
+        # print('kv_last_page_lens', kv_last_page_lens)
+        # print('qo_indptr', qo_indptr)
+        # print('custom_mask', custom_masks)
+
+        responses = []
+
+        with torch.cuda.device(self.device):
+
+            output_embeds = self.lm.model.forward(
+                input_embeds=input_embeds,
+                position_ids=pt_new_position_ids,
+                kv_cache_at_layer=self.kv_cache_at_layer,
+                kv_page_indices=pt_kv_page_indices,
+                kv_page_indptr=pt_kv_page_indptr,
+                kv_last_page_lens=pt_kv_last_page_lens,
+                qo_indptr=pt_qo_indptr,
+                custom_mask=pt_custom_mask,
+                single_token_inference_mode=single_token_inference_mode,
+            )
+            # print(f"output_embeds mean: {output_embeds.mean().item()}")
+
+            # precompute the dists
+            if len(all_output_indices) > 0:
+                output_embeds = output_embeds[pt_output_indices]
+                logits = self.lm.lm_head(output_embeds)
+                probs = torch.softmax(logits, dim=-1)
+                condensed = torch.topk(probs, k=self.dist_size, sorted=True)
+
+                batch_ids = condensed.indices.tolist()
+                batch_probs = condensed.values.tolist()
+
+                # reshape them based on all_output_indices_ptr
+                for i in range(len(all_output_indices_ptr) - 1):
+                    start = all_output_indices_ptr[i]
+                    end = all_output_indices_ptr[i + 1]
+                    dists = []
+                    for j in range(start, end):
+                        dist = Distribution(
+                            ids=batch_ids[j],
+                            probs=batch_probs[j]
+                        )
+                        dists.append(dist)
+                    res = ForwardTextResponse(
+                        distributions=dists
+                    )
+                    responses.append(res)
+
+        return BatchForwardTextResponse(
+            items=responses
+        )

@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-inferlet.workspace = true
-inferlet-macros.workspace = true
+inferlet2.workspace = true
+inferlet-macros2.workspace = true
 futures = "0.3.31"
-llguidance = { version = "0.6.31", default-features = false, features = ["lark"] }
+llguidance = { version = "1.1.1", default-features = false, features = ["lark"] }
