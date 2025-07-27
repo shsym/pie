@@ -50,12 +50,14 @@ static AVAILABLE_MODELS: std::sync::LazyLock<boxcar::Vec<(String, usize)>> =
 /// Holds shared triggers for manual batching strategies.
 struct ManualTriggers {
     fill_block_trigger: Arc<AtomicBool>,
+    forward_text_trigger: Arc<AtomicBool>,
 }
 
 // A static, lazily-initialized context to hold the triggers.
 static TRIGGERS: std::sync::LazyLock<ManualTriggers> =
     std::sync::LazyLock::new(|| ManualTriggers {
         fill_block_trigger: Arc::new(AtomicBool::new(true)),
+        forward_text_trigger: Arc::new(AtomicBool::new(true)),
     });
 
 pub async fn attach_new_remote_backend(name: &str, endpoint: String) -> Option<()> {
@@ -278,6 +280,17 @@ pub enum Command {
         positions: Vec<u32>,
     },
 
+    ForwardText {
+        inst_id: InstanceId,
+        stream_id: LocalStreamId,
+        last_block_len: u32,
+        context: Vec<IdRepr>,
+        text: Vec<u32>,
+        positions: Vec<u32>,
+        output_indices: Vec<u32>,
+        handle: oneshot::Sender<Vec<(Vec<u32>, Vec<f32>)>>,
+    },
+
     SampleTopK {
         inst_id: InstanceId,
         stream_id: LocalStreamId,
@@ -322,6 +335,7 @@ enum BatchGroup {
     CopyBlock,
     MaskBlock,
     EmbedText,
+    ForwardText,
     SampleTopK,
     Synchronize,
     EmbedImage,
@@ -357,6 +371,10 @@ impl Batchable<BatchGroup> for Command {
                 batching::eager()
             }
 
+            Command::ForwardText { .. } => Box::new(batching::ManualStrategy::new(
+                TRIGGERS.forward_text_trigger.clone(),
+            )),
+
             Command::SampleTopK { .. } => {
                 //batching::t_only(Duration::from_micros(100))
                 batching::eager()
@@ -376,6 +394,7 @@ impl Batchable<BatchGroup> for Command {
             Command::CopyBlock { .. } => BatchGroup::CopyBlock,
             Command::MaskBlock { .. } => BatchGroup::MaskBlock,
             Command::EmbedText { .. } => BatchGroup::EmbedText,
+            Command::ForwardText { .. } => BatchGroup::ForwardText,
             Command::SampleTopK { .. } => BatchGroup::SampleTopK,
             Command::Synchronize { .. } => BatchGroup::Synchronize,
             Command::EmbedImage { .. } => BatchGroup::EmbedImage,
@@ -388,6 +407,7 @@ impl Batchable<BatchGroup> for Command {
 pub enum Event {
     GetInfo(oneshot::Sender<Info>),
     SampleTopK(oneshot::Sender<(Vec<u32>, Vec<f32>)>),
+    ForwardText(oneshot::Sender<Vec<(Vec<u32>, Vec<f32>)>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -725,6 +745,38 @@ impl L4m {
                 ))
             }
 
+            Command::ForwardText {
+                inst_id,
+                stream_id,
+                last_block_len,
+                mut context,
+                text,
+                positions,
+                output_indices,
+                handle,
+            } => {
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::KvBlock, inst_id, &mut context),
+                    inst_id,
+                    "l4m::fill_block failed. some context blocks are invalid"
+                );
+
+                Some((
+                    Command::ForwardText {
+                        inst_id,
+                        stream_id,
+                        last_block_len,
+                        context,
+                        text,
+                        positions,
+                        output_indices,
+                        handle,
+                    },
+                    Stream::new(inst_id, stream_id),
+                ))
+            }
+
             Command::ExportBlocks {
                 inst_id,
                 mut blocks,
@@ -1029,6 +1081,27 @@ impl L4m {
                         }
                     }
 
+                    pb_bindings::response::Command::ForwardText(batch) => {
+                        TRIGGERS
+                            .forward_text_trigger
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+                        for (item, event) in batch.items.into_iter().zip(senders) {
+                            let mut distribs = Vec::new();
+
+                            for d in item.distributions {
+                                distribs.push((d.ids, d.probs));
+                            }
+
+                            match event {
+                                Event::ForwardText(handle) => {
+                                    handle.send(distribs).ok();
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+
                     pb_bindings::response::Command::BatchSync(..) => {
                         // fire the next batch, or set the ready flag to true.
                     }
@@ -1097,6 +1170,7 @@ where
             BatchGroup::Allocate => encode_pb_batch_allocate(correlation_id, batch),
             BatchGroup::Deallocate => encode_pb_batch_deallocate(correlation_id, batch),
             BatchGroup::FillBlock => encode_pb_batch_fill_block(correlation_id, batch),
+            BatchGroup::ForwardText => encode_pb_batch_forward_text(correlation_id, batch),
             BatchGroup::CopyBlock => encode_pb_batch_copy_block(correlation_id, batch),
             BatchGroup::MaskBlock => encode_pb_batch_mask_block(correlation_id, batch),
             BatchGroup::EmbedText => encode_pb_batch_embed_text(correlation_id, batch),
@@ -1369,6 +1443,46 @@ fn encode_pb_batch_fill_block(
     }
     .encode_to_vec();
     ((PROTOCOL_BASE, payload), None)
+}
+
+fn encode_pb_batch_forward_text(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let mut items = Vec::new();
+    let mut events = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::ForwardText {
+                inst_id: _,
+                stream_id: _,
+                last_block_len,
+                context,
+                text,
+                positions,
+                output_indices,
+                handle,
+            } => {
+                let pb = pb_bindings::ForwardText {
+                    last_block_len: last_block_len,
+                    context_block_ids: context,
+                    token_ids: text,
+                    position_ids: positions,
+                    output_indices: output_indices,
+                };
+                items.push(pb);
+                events.push(Event::ForwardText(handle));
+            }
+            _ => unreachable!(),
+        }
+    }
+    let cmd = pb_bindings::request::Command::ForwardText(pb_bindings::BatchForwardText { items });
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), Some(events))
 }
 
 fn encode_pb_batch_copy_block(

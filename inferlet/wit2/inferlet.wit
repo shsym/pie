@@ -3,9 +3,10 @@ package pie:inferlet;
 world traits {
     import allocate;
     import forward;
+    import forward-text;
+    import tokenize;
     import input-text;
     import input-image;
-    import tokenize;
     import output-text;
 }
 

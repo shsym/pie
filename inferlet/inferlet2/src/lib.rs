@@ -3,7 +3,7 @@ pub mod drafter;
 mod pool;
 pub mod sampler;
 pub mod stop_condition;
-mod traits;
+pub mod traits;
 
 pub use crate::context::Context;
 use crate::wstd::runtime::AsyncPollable;
@@ -58,7 +58,7 @@ pub mod bindings_server {
 }
 
 use crate::bindings::pie::inferlet::{
-    allocate, core, forward, input_image, input_text, output_text, tokenize,
+    allocate, core, forward, forward_text, input_image, input_text, output_text, tokenize,
 };
 
 pub use crate::bindings_app::{export, exports::pie::inferlet::run::Guest as RunSync};
@@ -214,7 +214,6 @@ impl Model {
 
 /// Defines task priority levels.
 pub use crate::bindings::pie::inferlet::core::Priority;
-use crate::context::ContextError;
 
 impl Queue {
     /// Gets the service ID for the queue.

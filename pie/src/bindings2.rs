@@ -7,6 +7,7 @@ mod input_image;
 mod input_text;
 mod output_text;
 //mod runtime;
+mod forward_text;
 mod tokenize;
 
 wasmtime::component::bindgen!({
@@ -22,6 +23,7 @@ wasmtime::component::bindgen!({
         "pie:inferlet/core/synchronization-result": core::SynchronizationResult,
         "pie:inferlet/tokenize/tokenizer": tokenize::Tokenizer,
         "pie:inferlet/output-text/distribution-result": output_text::DistributionResult,
+        "pie:inferlet/forward-text/distribution-result": forward_text::DistributionResult,
     },
     trappable_imports: true,
 });
@@ -31,6 +33,7 @@ where
     T: pie::inferlet::core::Host
         + pie::inferlet::allocate::Host
         + pie::inferlet::forward::Host
+        + pie::inferlet::forward_text::Host
         + pie::inferlet::input_text::Host
         + pie::inferlet::input_image::Host
         + pie::inferlet::output_text::Host
@@ -39,6 +42,7 @@ where
     pie::inferlet::core::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::inferlet::allocate::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::inferlet::forward::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::inferlet::forward_text::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::inferlet::input_text::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::inferlet::input_image::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::inferlet::output_text::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;

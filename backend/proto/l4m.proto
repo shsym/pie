@@ -84,10 +84,30 @@ message FillBlock {
   repeated uint32 output_embedding_ids = 4;
 }
 
+
+
 // A request to fill one or more blocks.
 message BatchFillBlock {
   // A batch of block fill items.
   repeated FillBlock items = 1;
+}
+
+message ForwardText {
+  // The ID of the block to fill.
+  uint32 last_block_len = 1;
+  // IDs of blocks providing context for the fill operation.
+  repeated uint32 context_block_ids = 2;
+
+  repeated uint32 token_ids = 3;
+
+  repeated uint32 position_ids = 4;
+
+  repeated uint32 output_indices = 5;
+}
+
+message BatchForwardText {
+  // A batch of forward text items.
+  repeated ForwardText items = 1;
 }
 
 // A single mask specification for a block.
@@ -184,6 +204,21 @@ message BatchSyncResponse {
 
 }
 
+message Distribution {
+  repeated uint32 ids = 1;
+  repeated float probs = 2;
+}
+
+
+message ForwardTextResponse {
+  repeated Distribution distributions = 1;
+}
+
+message BatchForwardTextResponse {
+  // A batch of forward text responses.
+  repeated ForwardTextResponse items = 1;
+}
+
 message Tokenizer {
   map<uint32, bytes> merge_table = 1;
   map<string, uint32> special_tokens = 2;
@@ -200,11 +235,12 @@ message Request {
     BatchDeallocate deallocate = 3;
     BatchEmbedText embed_text = 4;
     BatchFillBlock fill_block = 5;
-    BatchMaskBlock mask_block = 6;
-    BatchCopyBlock copy_block = 7;
-    BatchDecodeTokenDistribution decode_token_distribution = 8;
-    BatchSampleTopKRequest sample_top_k_request = 9;
-    GetInfoRequest get_info = 10;
+    BatchForwardText forward_text = 6;
+    BatchMaskBlock mask_block = 7;
+    BatchCopyBlock copy_block = 8;
+    BatchDecodeTokenDistribution decode_token_distribution = 9;
+    BatchSampleTopKRequest sample_top_k_request = 10;
+    GetInfoRequest get_info = 11;
   }
 }
 
@@ -216,5 +252,6 @@ message Response {
     BatchSampleTopKResponse sample_top_k = 2;
     GetInfoResponse get_info = 3;
     BatchSyncResponse batch_sync = 4;
+    BatchForwardTextResponse forward_text = 5;
   }
 }

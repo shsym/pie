@@ -1,15 +1,24 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use pie::{
+    Config as EngineConfig,
     auth::{create_jwt, init_secret},
     client::{self, Client},
-    Config as EngineConfig,
 };
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 use reqwest::Client as HttpClient;
+use rustyline::ExternalPrinter;
+use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::{ValidationContext, ValidationResult, Validator};
+use rustyline::{Editor, Helper}; // The Helper trait is still needed
 use serde::Deserialize;
+use std::borrow::Cow::{self, Owned};
+use std::sync::Arc;
 use std::{
     env,
     fs::{self},
@@ -17,18 +26,9 @@ use std::{
     path::PathBuf,
     process::Stdio, // MODIFIED: Added for process spawning
 };
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use rustyline::completion::Completer;
-use rustyline::error::ReadlineError;
-use rustyline::highlight::Highlighter;
-use rustyline::ExternalPrinter;
-use rustyline::hint::Hinter;
-use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Editor, Helper}; // The Helper trait is still needed
-use std::borrow::Cow::{self, Owned};
 use tokio::io::{AsyncBufReadExt, BufReader, stdin as tokio_stdin};
 use tokio::process::Command as TokioCommand;
+use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
@@ -187,26 +187,7 @@ impl Hinter for MyHelper {
 }
 
 // Your existing Highlighter implementation is correct.
-impl Highlighter for MyHelper {
-    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        let mut highlighted = line.to_string();
-
-        if let Some(end) = line.find(' ') {
-            let command = &line[..end];
-            let colored_command = format!("\x1b[34m{}\x1b[0m", command);
-            highlighted.replace_range(..end, &colored_command);
-        } else if !line.is_empty() {
-            let colored_command = format!("\x1b[34m{}\x1b[0m", line);
-            highlighted = colored_command;
-        }
-
-        Owned(highlighted)
-    }
-
-    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
-        true
-    }
-}
+impl Highlighter for MyHelper {}
 
 impl Validator for MyHelper {
     fn validate(&self, _ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
@@ -245,7 +226,8 @@ async fn start_interactive_session(
     let mut rl = Editor::new()?;
     rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
     let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
-        Arc::new(Mutex::new(rl.create_external_printer()?));    let history_path = get_pie_home()?.join(".pie_history");
+        Arc::new(Mutex::new(rl.create_external_printer()?));
+    let history_path = get_pie_home()?.join(".pie_history");
     let _ = rl.load_history(&history_path);
 
     // 4. Launch all configured backend services
@@ -256,9 +238,17 @@ async fn start_interactive_session(
         let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
 
         for backend_config in &backend_configs {
-            let backend_table = backend_config.as_table().context("Each [[backend]] entry in config.toml must be a table.")?;
-            let backend_type = backend_table.get("backend_type").and_then(|v| v.as_str()).context("`backend_type` is missing or not a string.")?;
-            let exec_path = backend_table.get("exec_path").and_then(|v| v.as_str()).context("`exec_path` is missing or not a string.")?;
+            let backend_table = backend_config
+                .as_table()
+                .context("Each [[backend]] entry in config.toml must be a table.")?;
+            let backend_type = backend_table
+                .get("backend_type")
+                .and_then(|v| v.as_str())
+                .context("`backend_type` is missing or not a string.")?;
+            let exec_path = backend_table
+                .get("exec_path")
+                .and_then(|v| v.as_str())
+                .context("`exec_path` is missing or not a string.")?;
 
             let mut cmd = if backend_type == "python" {
                 let mut cmd = TokioCommand::new("python");
@@ -269,19 +259,41 @@ async fn start_interactive_session(
             };
 
             let random_port: u16 = rand::thread_rng().gen_range(49152..=65535);
-            cmd.arg("--host").arg("localhost").arg("--port").arg(random_port.to_string()).arg("--controller_host").arg(&client_config.host).arg("--controller_port").arg(client_config.port.to_string()).arg("--auth_token").arg(&auth_token);
+            cmd.arg("--host")
+                .arg("localhost")
+                .arg("--port")
+                .arg(random_port.to_string())
+                .arg("--controller_host")
+                .arg(&client_config.host)
+                .arg("--controller_port")
+                .arg(client_config.port.to_string())
+                .arg("--auth_token")
+                .arg(&auth_token);
 
             for (key, value) in backend_table {
-                if key == "backend_type" || key == "exec_path" { continue; }
-                cmd.arg(format!("--{}", key)).arg(value.to_string().trim_matches('"').to_string());
+                if key == "backend_type" || key == "exec_path" {
+                    continue;
+                }
+                cmd.arg(format!("--{}", key))
+                    .arg(value.to_string().trim_matches('"').to_string());
             }
 
             println!("- Spawning backend: {}", exec_path);
-            let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().with_context(|| format!("Failed to spawn backend process: '{}'", exec_path))?;
-            
+            let mut child = cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .with_context(|| format!("Failed to spawn backend process: '{}'", exec_path))?;
+
             // Stream backend output using the external printer to avoid corrupting the prompt
-            let stdout = child.stdout.take().context("Could not capture stdout from backend process.")?;
-            let stderr = child.stderr.take().context("Could not capture stderr from backend process.")?;
+            let stdout = child
+                .stdout
+                .take()
+                .context("Could not capture stdout from backend process.")?;
+            let stderr = child
+                .stderr
+                .take()
+                .context("Could not capture stderr from backend process.")?;
 
             let exec_path_stdout = exec_path.to_string();
             // Clone the Arc for the new task.
@@ -303,7 +315,8 @@ async fn start_interactive_session(
                 while let Ok(Some(line)) = reader.next_line().await {
                     // FIX: Lock the mutex here as well.
                     let mut p = printer_stderr.lock().await;
-                    p.print(format!("[{}/stderr] {}", exec_path_stderr, line)).unwrap();
+                    p.print(format!("[{}/stderr] {}", exec_path_stderr, line))
+                        .unwrap();
                 }
             });
 
@@ -318,18 +331,28 @@ async fn start_interactive_session(
             Ok(line) => {
                 let _ = rl.add_history_entry(line.as_str());
                 let parts: Vec<&str> = line.trim().split_whitespace().collect();
-                if parts.is_empty() { continue; }
+                if parts.is_empty() {
+                    continue;
+                }
 
                 // FIX: Pass the printer to the command handler.
-                match handle_interactive_command(parts[0], &parts[1..], &client_config, &printer).await {
+                match handle_interactive_command(parts[0], &parts[1..], &client_config, &printer)
+                    .await
+                {
                     Ok(should_exit) if should_exit => break,
                     Ok(_) => (),
                     Err(e) => eprintln!("Error: {}", e),
                 }
             }
             Err(ReadlineError::Interrupted) => println!("(To exit, type 'exit' or press Ctrl-D)"),
-            Err(ReadlineError::Eof) => { println!("Exiting..."); break; }
-            Err(err) => { eprintln!("Error reading line: {}", err); break; }
+            Err(ReadlineError::Eof) => {
+                println!("Exiting...");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error reading line: {}", err);
+                break;
+            }
         }
     }
 
@@ -420,7 +443,12 @@ async fn handle_run(
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
     let mut client = match Client::connect(&url).await {
         Ok(c) => c,
-        Err(_) => return Err(anyhow!("Could not connect to engine at {}. Is it running?", url)),
+        Err(_) => {
+            return Err(anyhow!(
+                "Could not connect to engine at {}. Is it running?",
+                url
+            ));
+        }
     };
 
     let token = create_jwt("default", pie::auth::Role::User)?;
@@ -442,7 +470,7 @@ async fn handle_run(
     if !args.detach {
         println!("Streaming output for instance {}...", instance.id());
         let instance_id = instance.id().to_string();
-        
+
         // FIX: Clone the Arc<Mutex<...>> for the new task.
         let printer_clone = Arc::clone(printer);
         tokio::spawn(async move {
@@ -454,7 +482,7 @@ async fn handle_run(
                 } else {
                     format!("[Instance {}] {}: {}", instance_id, event, message)
                 };
-                
+
                 // Print the line, which will automatically refresh the prompt.
                 p.print(output).unwrap();
 
