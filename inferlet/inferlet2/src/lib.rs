@@ -155,6 +155,39 @@ pub async fn subscribe<S: ToString>(topic: S) -> String {
     future.get().unwrap()
 }
 
+/// Retrieves a value from the persistent store for a given key.
+///
+/// Returns `Some(value)` if the key exists, or `None` if it does not.
+pub fn store_get(key: &str) -> Option<String> {
+    core::store_get(key)
+}
+
+/// Sets a value in the persistent store for a given key.
+///
+/// This will create a new entry or overwrite an existing one.
+pub fn store_set(key: &str, value: &str) {
+    core::store_set(key, value)
+}
+
+/// Deletes a key-value pair from the store.
+///
+/// If the key does not exist, this function does nothing.
+pub fn store_delete(key: &str) {
+    core::store_delete(key)
+}
+
+/// Checks if a key exists in the store.
+///
+/// Returns `true` if the key exists, and `false` otherwise.
+pub fn store_exists(key: &str) -> bool {
+    core::store_exists(key)
+}
+
+/// Returns a list of all keys currently in the store.
+pub fn store_list_keys() -> Vec<String> {
+    core::store_list_keys()
+}
+
 /// Executes a debug command and returns the result as a string.
 pub fn debug_query(query: &str) -> String {
     core::debug_query(query)

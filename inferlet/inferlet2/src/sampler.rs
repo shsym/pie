@@ -48,7 +48,7 @@ impl TemperatureSampler {
         assert!(temperature >= 0.0, "Temperature must be non-negative.");
         Self {
             temperature,
-            rng: rand::thread_rng(),
+            rng: rand::rng(),
         }
     }
 }
@@ -85,7 +85,7 @@ impl TopKSampler {
     pub fn new(k: usize) -> Self {
         Self {
             k,
-            rng: rand::thread_rng(),
+            rng: rand::rng(),
         }
     }
 }
@@ -128,7 +128,7 @@ impl TopPSampler {
         assert!((0.0..=1.0).contains(&p), "p must be between 0.0 and 1.0.");
         Self {
             p,
-            rng: rand::thread_rng(),
+            rng: rand::rng(),
         }
     }
 }
@@ -186,7 +186,7 @@ impl TypicalSampler {
         );
         Self {
             mass,
-            rng: rand::thread_rng(),
+            rng: rand::rng(),
         }
     }
 }

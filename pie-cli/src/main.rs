@@ -76,14 +76,24 @@ pub struct StartArgs {
     pub verbose: bool,
 }
 
-#[derive(Args, Debug, Default)]
+/// Helper for clap to expand `~` in path arguments.
+fn expand_tilde(s: &str) -> Result<PathBuf, std::convert::Infallible> {
+    Ok(PathBuf::from(shellexpand::tilde(s).as_ref()))
+}
+
+#[derive(Parser, Debug)] // Changed from `Args` to `Parser`
 /// Arguments to submit an inferlet (Wasm program) to the engine.
 pub struct RunArgs {
     /// Path to the .wasm inferlet file.
+    #[arg(value_parser = expand_tilde)]
     pub wasm_path: PathBuf,
+
     /// Run the inferlet in the background and print its instance ID.
     #[arg(long, short)]
     pub detach: bool,
+
+    /// Arguments to pass to the Wasm program.
+    pub arguments: Vec<String>,
 }
 
 // Other command structs (ModelCommands, etc.) remain the same
@@ -325,14 +335,25 @@ async fn start_interactive_session(
         match rl.readline("pie> ") {
             Ok(line) => {
                 let _ = rl.add_history_entry(line.as_str());
-                let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                let parts: Vec<String> = match shlex::split(&line) {
+                    Some(parts) => parts,
+                    None => {
+                        eprintln!("Error: Mismatched quotes in command.");
+                        continue;
+                    }
+                };
                 if parts.is_empty() {
                     continue;
                 }
 
                 // FIX: Pass the printer to the command handler.
-                match handle_interactive_command(parts[0], &parts[1..], &client_config, &printer)
-                    .await
+                match handle_interactive_command(
+                    &parts[0],
+                    &parts[1..].iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+                    &client_config,
+                    &printer,
+                )
+                .await
                 {
                     Ok(should_exit) if should_exit => break,
                     Ok(_) => (),
@@ -382,27 +403,22 @@ async fn handle_interactive_command(
 ) -> Result<bool> {
     match command {
         "run" => {
-            let mut wasm_path = None;
-            let mut detach = false;
-            for arg in args {
-                if *arg == "-d" || *arg == "--detach" {
-                    detach = true;
-                } else if wasm_path.is_none() {
-                    let expanded_arg = shellexpand::tilde(arg);
-                    wasm_path = Some(PathBuf::from(expanded_arg.as_ref()));
+            // Prepend a dummy command name so clap can parse the args slice.
+            let clap_args = std::iter::once("run").chain(args.iter().copied());
+
+            match RunArgs::try_parse_from(clap_args) {
+                Ok(run_args) => {
+                    if let Err(e) = handle_run(run_args, client_config, printer).await {
+                        // Use the printer to avoid corrupting the prompt.
+                        let mut p = printer.lock().await;
+                        p.print(format!("Error running inferlet: {e}")).unwrap();
+                    }
                 }
-            }
-            if let Some(path) = wasm_path {
-                let run_args = RunArgs {
-                    wasm_path: path,
-                    detach,
-                };
-                // FIX: Pass the printer along to handle_run.
-                if let Err(e) = handle_run(run_args, client_config, printer).await {
-                    eprintln!("Failed to run inferlet: {}", e);
+                Err(e) => {
+                    // Clap's error messages are user-friendly and include usage.
+                    let mut p = printer.lock().await;
+                    p.print(e.to_string()).unwrap();
                 }
-            } else {
-                println!("Usage: run [--detach] <path_to_wasm_file>");
             }
         }
         "query" => {
@@ -410,7 +426,9 @@ async fn handle_interactive_command(
         }
         "help" => {
             println!("Available commands:");
-            println!("  run [--detach] <path>  - Run a .wasm inferlet");
+            println!(
+                "  run [--detach] <path> [ARGS]... - Run a .wasm inferlet with optional arguments"
+            );
             println!("  query                  - (Placeholder) Query the engine state");
             println!("  exit                   - Exit the PIE session");
             println!("  help                   - Show this help message");
@@ -458,7 +476,9 @@ async fn handle_run(
         client.upload_program(&wasm_blob).await?;
         println!("✅ Program upload successful.");
     }
-    let mut instance = client.launch_instance(&hash).await?;
+
+    let arguments = args.arguments.clone();
+    let mut instance = client.launch_instance(&hash, arguments).await?;
     println!("✅ Instance launched with ID: {}", instance.id());
 
     if !args.detach {

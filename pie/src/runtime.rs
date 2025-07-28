@@ -86,12 +86,14 @@ pub enum Command {
 
     LaunchInstance {
         program_hash: String,
+        arguments: Vec<String>,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
     },
 
     LaunchServerInstance {
         program_hash: String,
         port: u32,
+        arguments: Vec<String>,
         event: oneshot::Sender<Result<(), RuntimeError>>,
     },
 
@@ -178,17 +180,19 @@ impl Service for Runtime {
             Command::LaunchInstance {
                 program_hash: hash,
                 event,
+                arguments,
             } => {
-                let instance_id = self.launch_instance(&hash).await.unwrap();
+                let instance_id = self.launch_instance(&hash, arguments).await.unwrap();
                 event.send(Ok(instance_id)).unwrap();
             }
 
             Command::LaunchServerInstance {
                 program_hash: hash,
                 port,
+                arguments,
                 event,
             } => {
-                let _ = self.launch_server_instance(&hash, port).await;
+                let _ = self.launch_server_instance(&hash, port, arguments).await;
                 event.send(Ok(())).unwrap();
             }
 
@@ -306,7 +310,11 @@ impl Runtime {
     }
 
     /// Actually start a program instance
-    pub async fn launch_instance(&self, hash: &str) -> Result<InstanceId, RuntimeError> {
+    pub async fn launch_instance(
+        &self,
+        hash: &str,
+        arguments: Vec<String>,
+    ) -> Result<InstanceId, RuntimeError> {
         let component = self.get_component(hash)?;
 
         let instance_id = Uuid::new_v4();
@@ -315,7 +323,13 @@ impl Runtime {
         let engine = self.engine.clone();
         let linker = self.linker.clone();
 
-        let join_handle = tokio::spawn(Self::launch(instance_id, component, engine, linker));
+        let join_handle = tokio::spawn(Self::launch(
+            instance_id,
+            component,
+            arguments,
+            engine,
+            linker,
+        ));
 
         // Record in the “running_instances” so we can manage it later
         let instance_handle = InstanceHandle {
@@ -332,6 +346,7 @@ impl Runtime {
         &self,
         hash: &str,
         port: u32,
+        arguments: Vec<String>,
     ) -> Result<InstanceId, RuntimeError> {
         let instance_id = Uuid::new_v4();
         let component = self.get_component(hash)?;
@@ -341,7 +356,9 @@ impl Runtime {
         let linker = self.linker.clone();
         let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
 
-        let join_handle = tokio::spawn(Self::launch_server(addr, component, engine, linker));
+        let join_handle = tokio::spawn(Self::launch_server(
+            addr, component, arguments, engine, linker,
+        ));
 
         // Record in the “running_instances” so we can manage it later
         let instance_handle = InstanceHandle {
@@ -374,10 +391,11 @@ impl Runtime {
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
         component: Component,
+        arguments: Vec<String>,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
         let inst_id = Uuid::new_v4();
-        let inst_state = InstanceState::new(inst_id).await;
+        let inst_state = InstanceState::new(inst_id, arguments).await;
 
         let mut store = Store::new(&engine, inst_state);
         let (sender, receiver) = oneshot::channel();
@@ -431,6 +449,7 @@ impl Runtime {
     async fn launch_server(
         addr: SocketAddr,
         component: Component,
+        arguments: Vec<String>,
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
     ) {
@@ -448,7 +467,7 @@ impl Runtime {
                     let engine_ = engine.clone();
                     let linker_ = linker.clone();
                     let component_ = component.clone();
-
+                    let arguments_ = arguments.clone();
                     tokio::task::spawn(async {
                         if let Err(e) = http1::Builder::new()
                             .keep_alive(true)
@@ -459,6 +478,7 @@ impl Runtime {
                                         engine_.clone(),
                                         linker_.clone(),
                                         component_.clone(),
+                                        arguments_.clone(),
                                         req,
                                     )
                                 }),
@@ -480,10 +500,11 @@ impl Runtime {
     async fn launch(
         instance_id: InstanceId,
         component: Component,
+        arguments: Vec<String>,
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
     ) {
-        let inst_state = InstanceState::new(instance_id).await;
+        let inst_state = InstanceState::new(instance_id, arguments).await;
 
         // Wrap everything in a closure returning a Result,
         // so we can capture errors more systematically if desired:

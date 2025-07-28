@@ -302,10 +302,15 @@ impl Client {
         }
     }
 
-    pub async fn launch_instance(&mut self, program_hash: &str) -> Result<Instance> {
+    pub async fn launch_instance(
+        &mut self,
+        program_hash: &str,
+        arguments: Vec<String>,
+    ) -> Result<Instance> {
         let msg = ClientMessage::LaunchInstance {
             corr_id: 0,
             program_hash: program_hash.to_string(),
+            arguments,
         };
 
         let (successful, result) = self.send_msg_and_wait(msg).await?;
@@ -328,11 +333,17 @@ impl Client {
         }
     }
 
-    pub async fn launch_server_instance(&mut self, program_hash: &str, port: u32) -> Result<()> {
+    pub async fn launch_server_instance(
+        &mut self,
+        program_hash: &str,
+        port: u32,
+        arguments: Vec<String>,
+    ) -> Result<()> {
         let msg = ClientMessage::LaunchServerInstance {
             corr_id: 0,
             port,
             program_hash: program_hash.to_string(),
+            arguments,
         };
 
         let (successful, result) = self.send_msg_and_wait(msg).await?;

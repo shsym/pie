@@ -15,6 +15,7 @@ pub type Id = Uuid;
 
 pub struct InstanceState {
     id: Id,
+    arguments: Vec<String>,
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
@@ -41,7 +42,7 @@ impl WasiHttpView for InstanceState {
 // Define your custom stdout type.
 
 impl InstanceState {
-    pub async fn new(id: Uuid) -> Self {
+    pub async fn new(id: Uuid, arguments: Vec<String>) -> Self {
         let mut builder = WasiCtx::builder();
         builder.inherit_network(); // TODO: Replace with socket_addr_check later.
         builder.stdout(Stdout(shorten_uuid(&id)));
@@ -49,6 +50,7 @@ impl InstanceState {
 
         InstanceState {
             id,
+            arguments,
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
@@ -57,6 +59,10 @@ impl InstanceState {
 
     pub fn id(&self) -> Id {
         self.id
+    }
+
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
     }
 }
 

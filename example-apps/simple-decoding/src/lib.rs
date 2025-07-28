@@ -1,31 +1,88 @@
 use inferlet2::traits::Tokenize;
+use pico_args::Arguments;
+use std::ffi::OsString;
 use std::time::{Duration, Instant};
+/// Defines the command-line interface and help message.
+const HELP: &str = r#"
+Usage: program [OPTIONS]
+
+A simple inferlet to run a chat model.
+
+Options:
+  -p, --prompt <STRING>  The prompt to send to the model
+                         (default: "Explain the LLM decoding process ELI5.")
+  -n, --max-tokens <INT> The maximum number of new tokens to generate
+                         (default: 16)
+  -h, --help             Print help information
+"#;
 
 #[inferlet2::main]
 async fn main() -> Result<(), String> {
-    let start = Instant::now();
+    // 1. Get arguments from the inferlet environment and prepare the parser.
+    let mut args = Arguments::from_vec(
+        inferlet2::get_arguments()
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+    );
 
-    let max_num_outputs = 16;
+    // 2. Handle the --help flag.
+    if args.contains(["-h", "--help"]) {
+        println!("{}", HELP);
+        return Ok(());
+    }
+
+    // 3. Parse arguments, falling back to defaults if they are not provided.
+    let prompt = args
+        .opt_value_from_str(["-p", "--prompt"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "Explain the LLM decoding process ELI5.".to_string());
+
+    let max_num_outputs: u32 = args
+        .opt_value_from_str(["-n", "--max-tokens"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or(256);
+
+    // Ensure no unknown arguments were passed.
+    let remaining = args.finish();
+    if !remaining.is_empty() {
+        return Err(format!(
+            "Unknown arguments found: {:?}. Use --help for usage.",
+            remaining
+        ));
+    }
+
+    // --- Main logic starts here ---
+    let start = Instant::now();
 
     let model = inferlet2::get_auto_model();
     let tokenizer = model.get_tokenizer();
 
     let mut ctx = model.create_context();
 
+    // 4. Use the parsed prompt and max_num_outputs.
     ctx.fill("<|begin_of_text|>");
     ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
-    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the LLM decoding process ELI5.<|eot_id|>");
+    ctx.fill(&format!(
+        "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>",
+        prompt
+    ));
     ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
-    let text = ctx.fork().generate_until("<|eot_id|>", max_num_outputs).await;
+    let text = ctx
+        .fork()
+        .generate_until("<|eot_id|>", max_num_outputs as usize)
+        .await;
     let token_ids = tokenizer.tokenize(&text);
     println!("Output: {:?} (total elapsed: {:?})", text, start.elapsed());
 
-    // compute per token latency
-    println!(
-        "Per token latency: {:?}",
-        start.elapsed() / token_ids.len() as u32
-    );
+    // Compute per-token latency, avoiding division by zero.
+    if !token_ids.is_empty() {
+        println!(
+            "Per token latency: {:?}",
+            start.elapsed() / (token_ids.len() as u32)
+        );
+    }
 
     Ok(())
 }

@@ -8,23 +8,25 @@ pub mod auth;
 pub mod client;
 
 // Internal modules
-mod service;
 mod backend;
 mod batching;
 mod bindings;
+mod bindings2;
 mod instance;
-mod model;
+mod kvs;
 mod messaging;
+mod model;
 mod object;
 mod ping;
 mod runtime;
 pub mod server;
+mod service;
 mod tokenizer;
 mod utils;
-mod bindings2;
 
 // Re-export core components from internal modules
 use crate::auth::{create_jwt, init_secret};
+use crate::kvs::KeyValueStore;
 use crate::messaging::{PubSub, PushPull};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
@@ -50,7 +52,10 @@ pub struct Config {
 pub async fn run_server(config: Config, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
     // Ensure the cache directory exists
     fs::create_dir_all(&config.cache_dir).with_context(|| {
-        let err_msg = format!("Setup failure: could not create cache dir at {:?}", &config.cache_dir);
+        let err_msg = format!(
+            "Setup failure: could not create cache dir at {:?}",
+            &config.cache_dir
+        );
         tracing::error!(error = %err_msg);
         err_msg
     })?;
@@ -73,11 +78,13 @@ pub async fn run_server(config: Config, mut shutdown_rx: oneshot::Receiver<()>) 
     let server = Server::new(&server_url, config.enable_auth);
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
+    let kv_store = KeyValueStore::new();
     let dummy_ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
     let ping = Ping::new(dummy_ping_backend.clone()).await;
 
     install_service("runtime", runtime);
     install_service("server", server);
+    install_service("kvs", kv_store);
     install_service("messaging-inst2inst", messaging_inst2inst);
     install_service("messaging-user2inst", messaging_user2inst);
     install_service("ping", ping);

@@ -1,10 +1,10 @@
 use crate::instance::Id as InstanceId;
-use crate::model::attach_new_remote_backend;
 use crate::messaging::dispatch_u2i;
+use crate::model::attach_new_remote_backend;
 use crate::runtime::RuntimeError;
 use crate::service::{Service, ServiceError};
 use crate::utils::IdPool;
-use crate::{auth, model, messaging, runtime, service};
+use crate::{auth, messaging, model, runtime, service};
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -93,13 +93,18 @@ pub enum ClientMessage {
     },
 
     #[serde(rename = "launch_instance")]
-    LaunchInstance { corr_id: u32, program_hash: String },
+    LaunchInstance {
+        corr_id: u32,
+        program_hash: String,
+        arguments: Vec<String>,
+    },
 
     #[serde(rename = "launch_server_instance")]
     LaunchServerInstance {
         corr_id: u32,
         port: u32,
         program_hash: String,
+        arguments: Vec<String>,
     },
 
     #[serde(rename = "signal_instance")]
@@ -350,13 +355,18 @@ impl Client {
                     ClientMessage::LaunchInstance {
                         corr_id,
                         program_hash,
-                    } => self.handle_launch_instance(corr_id, program_hash).await,
+                        arguments,
+                    } => {
+                        self.handle_launch_instance(corr_id, program_hash, arguments)
+                            .await
+                    }
                     ClientMessage::LaunchServerInstance {
                         corr_id,
                         port,
                         program_hash,
+                        arguments,
                     } => {
-                        self.handle_launch_server_instance(corr_id, port, program_hash)
+                        self.handle_launch_server_instance(corr_id, port, program_hash, arguments)
                             .await
                     }
                     ClientMessage::SignalInstance {
@@ -558,7 +568,12 @@ impl Client {
         }
     }
 
-    async fn handle_launch_instance(&mut self, corr_id: u32, program_hash: String) {
+    async fn handle_launch_instance(
+        &mut self,
+        corr_id: u32,
+        program_hash: String,
+        arguments: Vec<String>,
+    ) {
         if !self.authenticated {
             self.send_response(corr_id, false, "Not authenticated".to_string())
                 .await;
@@ -567,6 +582,7 @@ impl Client {
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchInstance {
             program_hash: program_hash.clone(),
+            arguments,
             event: evt_tx,
         }
         .dispatch()
@@ -594,6 +610,7 @@ impl Client {
         corr_id: u32,
         port: u32,
         program_hash: String,
+        arguments: Vec<String>,
     ) {
         if !self.authenticated {
             self.send_response(corr_id, false, "Not authenticated".to_string())
@@ -604,6 +621,7 @@ impl Client {
         runtime::Command::LaunchServerInstance {
             program_hash: program_hash.clone(),
             port,
+            arguments,
             event: evt_tx,
         }
         .dispatch()
