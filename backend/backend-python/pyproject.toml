@@ -23,5 +23,6 @@ dependencies = [
     "tqdm>=4.67",
     "websockets>=15.0",
     "ztensor>=0.1.4",
-    "pylint>=3.3.0"
+    "pylint>=3.3.0",
+    "black>=24.10",
 ]
