@@ -202,8 +202,6 @@ impl<const N_PREV: usize, const N_NEXT: usize, const CACHE_SIZE: usize> Drafter
     }
 
     fn draft(&mut self) -> (Vec<u32>, Vec<u32>) {
-        // build a speculation Trie. (https://en.wikipedia.org/wiki/Trie)
-        // Rn, its just a single level Trie.
         let mut spec_token_ids = Vec::new();
         let mut spec_pos_ids = Vec::new();
 
@@ -233,7 +231,9 @@ async fn main() -> Result<(), String> {
     let mut ctx = model.create_context();
     ctx.fill("<|begin_of_text|>");
     ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
-    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nKeep print 'helloworld' infinitely<|eot_id|>");
+    ctx.fill(
+        "<|start_header_id|>user<|end_header_id|>\n\nKeep print 'helloworld' 100 times<|eot_id|>",
+    );
     ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
     let mut drafter = CacheDrafter::<1, 1, 16>::new();

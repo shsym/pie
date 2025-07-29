@@ -25,6 +25,8 @@ pub struct Context {
     token_mask_pending: Vec<Brle>,
     token_mask_current: Brle,
 
+    position_ids: Vec<u32>,
+
     kv_page_ids: Vec<u32>,
     kv_page_last_len: usize,
     kv_page_size: usize,
@@ -54,6 +56,7 @@ impl Context {
             token_ids_pending: Vec::new(),
             token_mask_pending: Vec::new(),
             token_mask_current: Brle::new(0),
+            position_ids: Vec::new(),
             kv_page_ids: Vec::new(),
             kv_page_last_len: 0,
             kv_page_size,
@@ -89,6 +92,7 @@ impl Context {
             token_ids_pending: Vec::new(),
             token_mask_pending: Vec::new(),
             token_mask_current: Brle::new(num_tokens),
+            position_ids: (0..num_tokens as u32).collect(),
             kv_page_ids: imported_page_ids,
             kv_page_last_len,
             kv_page_size,
@@ -129,7 +133,7 @@ impl Context {
     ///
     /// This function will flush any pending tokens in the current context before forking.
     pub fn fork(&self) -> Self {
-        let (new_tokens, new_pending, new_kv_pages, new_last_len) =
+        let (new_tokens, new_pending, new_kv_pages, new_last_len, new_pos_ids, new_mask_pending) =
             if self.kv_page_last_len == self.kv_page_size {
                 // Easy case: the last page is full, we can share everything.
                 (
@@ -137,6 +141,8 @@ impl Context {
                     self.token_ids_pending.clone(),
                     self.kv_page_ids.clone(),
                     self.kv_page_last_len,
+                    self.position_ids.clone(), // Clone position_ids
+                    self.token_mask_pending.clone(),
                 )
             } else {
                 // Hard case: the last page is partially full and must be recomputed.
@@ -145,6 +151,7 @@ impl Context {
 
                 let forked_token_ids = self.token_ids[..kept_tokens_len].to_vec();
                 let forked_kv_page_ids = self.kv_page_ids[..kept_kv_page_len].to_vec();
+                let forked_pos_ids = self.position_ids[..kept_tokens_len].to_vec();
 
                 let forked_pending_token_ids = [
                     &self.token_ids[kept_tokens_len..],
@@ -157,11 +164,26 @@ impl Context {
                 } else {
                     0
                 };
+
+                let mut mask_builder = self.token_mask_current.clone();
+                let parent_total_mask_len = self.token_ids.len() + self.token_ids_pending.len();
+                mask_builder.remove_range(kept_tokens_len, parent_total_mask_len);
+
+                // 2. Iteratively build the pending masks, appending `false` for each new
+                // pending token, which mimics the `fill_tokens` behavior.
+                let mut forked_mask_pending = Vec::with_capacity(forked_pending_token_ids.len());
+                for _ in 0..forked_pending_token_ids.len() {
+                    mask_builder.append(false);
+                    forked_mask_pending.push(mask_builder.clone());
+                }
+
                 (
                     forked_token_ids,
                     forked_pending_token_ids,
                     forked_kv_page_ids,
                     forked_last_kv_page_len,
+                    forked_pos_ids,
+                    forked_mask_pending,
                 )
             };
 
@@ -173,8 +195,9 @@ impl Context {
             tokenizer: self.tokenizer.clone(),
             token_ids: new_tokens,
             token_ids_pending: new_pending,
-            token_mask_pending: self.token_mask_pending.clone(),
+            token_mask_pending: new_mask_pending,
             token_mask_current: self.token_mask_current.clone(),
+            position_ids: new_pos_ids,
             kv_page_ids: new_kv_pages,
             kv_page_last_len: new_last_len,
             kv_page_size: self.kv_page_size,
@@ -201,6 +224,7 @@ impl Context {
         self.token_ids_pending.extend(new_token_ids);
 
         for _ in 0..n {
+            // always fill with false - we don't mask tokens to mask itself.
             self.token_mask_current.append(false);
             self.token_mask_pending
                 .push(self.token_mask_current.clone())
@@ -263,6 +287,9 @@ impl Context {
                 self.token_ids
                     .drain(page_start_token_idx..page_end_token_idx);
 
+                self.position_ids
+                    .drain(page_start_token_idx..page_end_token_idx);
+
                 // 3. Remove the same range from the current mask.
                 self.token_mask_current
                     .remove_range(page_start_token_idx, page_end_token_idx);
@@ -300,7 +327,12 @@ impl Context {
             return;
         }
 
-        let current_tokens = self.token_ids.len();
+        let current_tokens = if self.kv_page_ids.is_empty() {
+            self.kv_page_last_len
+        } else {
+            (self.kv_page_ids.len() - 1) * self.kv_page_size + self.kv_page_last_len
+        };
+
         // Safely calculate the new total number of tokens after the adjustment.
         let new_total_tokens = match current_tokens.checked_add_signed(num_tokens) {
             Some(n) => n,
@@ -363,9 +395,9 @@ impl Context {
         if self.token_ids_pending.len() < 2 {
             return;
         }
+        let process_count = self.token_ids_pending.len() - 1;
 
         // Process all but the last pending token, leaving it for the next generation step.
-        let process_count = self.token_ids_pending.len() - 1;
         let pending_token_ids = self
             .token_ids_pending
             .drain(..process_count)
@@ -377,11 +409,15 @@ impl Context {
             .map(|b| b.buffer)
             .collect::<Vec<Vec<u32>>>();
 
-        let position_ids = (self.token_ids.len() as u32
-            ..(self.token_ids.len() + pending_token_ids.len()) as u32)
-            .collect::<Vec<u32>>();
+        let last_pos = self.position_ids.last().map(|&p| p + 1).unwrap_or(0);
+        let position_ids =
+            (last_pos..(last_pos + pending_token_ids.len() as u32)).collect::<Vec<u32>>();
 
         self.grow_kv_pages(pending_token_ids.len());
+
+        println!("pending token ids: {:?}", &pending_token_ids);
+        println!("mask: {:?}", &mask);
+        println!("position ids: {:?}", &position_ids);
 
         self.queue.forward_text_no_output(
             self.kv_page_last_len as u32,
@@ -392,6 +428,7 @@ impl Context {
         );
 
         self.token_ids.extend(pending_token_ids);
+        self.position_ids.extend(&position_ids);
         // self.queue.deallocate_embeds(&embed_ids);
     }
 
@@ -422,8 +459,7 @@ impl Context {
         // let output_embed_id = self.queue.allocate_embeds(1);
 
         let next_token_id = self.token_ids_pending.pop().unwrap();
-        let next_pos_id = self.token_ids.len() as u32;
-
+        let next_pos_id = self.position_ids.last().map(|&p| p + 1).unwrap_or(0);
         // self.queue.embed_text(&input_embed_id, &[next_token_id], &[next_pos_id]);
 
         self.grow_kv_pages(1);
@@ -455,7 +491,7 @@ impl Context {
         // let sampled = self.queue.get_next_token_distribution(&output_embed_id).await;
 
         self.token_ids.push(next_token_id);
-
+        self.position_ids.push(next_pos_id);
         // self.queue.deallocate_embeds(&input_embed_id);
         // self.queue.deallocate_embeds(&output_embed_id);
 
@@ -660,16 +696,6 @@ impl Context {
         sampler: &mut S,
         stop_condition: &mut C,
     ) -> String {
-        // Ensure any prior inputs are processed and the KV cache is up to date.
-        self.flush();
-
-        // Speculative decoding requires a single seed token to start the process.
-        assert_eq!(
-            self.token_ids_pending.len(),
-            1,
-            "Must have exactly one seed token to start speculative generation."
-        );
-
         // Synchronize the drafter with the main model's history before starting.
         drafter.update(&self.token_ids);
 
@@ -680,36 +706,47 @@ impl Context {
         // multiple tokens at once.
         loop {
             // --- 1. Draft Phase ✍️ ---
-            // Pop the pending token, which serves as the seed for this speculative step.
-            let seed_token = self.token_ids_pending.pop().unwrap();
+            let token_ids_pending = mem::take(&mut self.token_ids_pending);
 
             // Update the drafter with the seed and generate a sequence of draft tokens.
-            drafter.update(&[seed_token]);
+            drafter.update(&token_ids_pending);
             let (draft_tokens, draft_pos_ids) = drafter.draft();
 
             // --- 2. Verification Phase ✅ ---
             // Combine the seed and draft tokens into a single batch for the main model.
-            let verification_batch_tokens = [&[seed_token], draft_tokens.as_slice()].concat();
-            let verification_batch_positions = {
-                let base_position = self.token_ids.len() as u32;
-                let mut positions = Vec::with_capacity(verification_batch_tokens.len());
-                positions.push(base_position); // Position for the seed token
-                // Add the drafter's relative positions to the current context length.
-                positions.extend(draft_pos_ids.iter().map(|&pos| pos + base_position));
+            let batch_tokens = [token_ids_pending.as_slice(), draft_tokens.as_slice()].concat();
+            //println!("pending len: {:?}", &token_ids_pending);
+
+            let batch_positions = {
+                let pos_offset = self.position_ids.last().map(|&p| p + 1).unwrap_or(0);
+                let pending_len = token_ids_pending.len() as u32;
+                let mut positions = Vec::with_capacity(batch_tokens.len());
+
+                // Extend with base position to base + pending_len
+                positions.extend(pos_offset..pos_offset + pending_len);
+                //println!("pending positions: {:?}", &positions);
+
+                // Extend with adjusted draft positions
+                positions.extend(
+                    draft_pos_ids
+                        .iter()
+                        .map(|&pos| pos_offset + pending_len - 1 + pos),
+                );
+
                 positions
             };
 
+            //println!("verification batch tokens: {:?}", &batch_tokens);
+            //println!("verification batch positions: {:?}", &batch_positions);
+
             // Allocate resources and expand the KV cache to accommodate the entire batch.
-            self.grow_kv_pages(verification_batch_tokens.len());
-            let input_embeds = self.queue.allocate_embeds(verification_batch_tokens.len());
-            let output_embeds = self.queue.allocate_embeds(verification_batch_tokens.len());
+            self.grow_kv_pages(batch_tokens.len());
+            let input_embeds = self.queue.allocate_embeds(batch_tokens.len());
+            let output_embeds = self.queue.allocate_embeds(batch_tokens.len());
 
             // Run a single, efficient forward pass on the main model with the combined tokens.
-            self.queue.embed_text(
-                &input_embeds,
-                &verification_batch_tokens,
-                &verification_batch_positions,
-            );
+            self.queue
+                .embed_text(&input_embeds, &batch_tokens, &batch_positions);
             self.queue.forward(
                 self.kv_page_last_len as u32,
                 &self.kv_page_ids,
@@ -718,51 +755,87 @@ impl Context {
             );
 
             // Get the resulting probability distributions for each token in the batch.
-            let output_distributions = self.queue.get_next_token_distribution(&output_embeds).await;
+            // size = draft_tokens.len() + 1
+            let output_distributions = self
+                .queue
+                .get_next_token_distribution(&output_embeds[token_ids_pending.len() - 1..])
+                .await;
 
-            // --- 3. Acceptance & Correction 🤝 ---
-            // Compare the main model's predictions with the drafter's guesses to see how many can be accepted.
-            let mut accepted_tokens = Vec::new();
-            let mut num_accepted_drafts = 0;
+            // --- 3. Trie Acceptance & Correction 🤝 ---
+            // The speculation "Trie" is a tree of possibilities. The first token is always correct.
+            // R[n] (P[n+1] P[n+2] P[n+3] P[n+2] P[n+3]) (P[n+1] P[n+2]) (P[n+1] P[n+2]) ...
 
-            for (i, token_distribution) in output_distributions.iter().enumerate() {
-                // Sample a token from the main (verifier) model's output distribution.
-                let verifier_token =
-                    sampler.sample(&token_distribution.ids, &token_distribution.probs);
+            let mut accepted_tokens: Vec<u32> = Vec::new();
+            let mut draft_token_idx = 0; // Current index in the verification batch.
 
-                // Check if the verifier's token matches the drafter's guess.
-                if i < draft_tokens.len() && verifier_token == draft_tokens[i] {
-                    // Match: The draft token was correct. Accept it and continue.
-                    accepted_tokens.push(verifier_token);
-                    num_accepted_drafts += 1;
+            let mut num_retained_draft_tokens = 0;
+            let mut contiguous_flag = true;
+
+            // accept the first token
+            let first_accepted_token =
+                sampler.sample(&output_distributions[0].ids, &output_distributions[0].probs);
+
+            accepted_tokens.push(first_accepted_token);
+
+            while draft_token_idx < draft_tokens.len() {
+                //let next_token = *accepted_draft_tokens.last().unwrap();
+                let last_accepted_token = *accepted_tokens.last().unwrap();
+
+                let draft_token = draft_tokens[draft_token_idx];
+                let draft_next_dist = &output_distributions[draft_token_idx + 1];
+                let draft_next_token = sampler.sample(&draft_next_dist.ids, &draft_next_dist.probs);
+
+                if last_accepted_token == draft_token {
+                    // MATCH: Accept token and continue down the current path.
+                    accepted_tokens.push(draft_next_token);
+
+                    if contiguous_flag {
+                        num_retained_draft_tokens += 1;
+                    }
+
+                    // Check if this path has a child in the drafted Trie.
+                    let has_child = draft_token_idx + 1 < draft_tokens.len()
+                        && draft_pos_ids[draft_token_idx] + 1 == draft_pos_ids[draft_token_idx + 1];
+                    if has_child {
+                        draft_token_idx += 1; // Move to verify the child.
+                    } else {
+                        // Nothing left to verify, so we're done.
+                        break;
+                    }
                 } else {
-                    // Mismatch: The verifier's token is the correct one.
-                    // Accept this token and terminate the verification for this step.
-                    accepted_tokens.push(verifier_token);
-                    break;
+                    contiguous_flag = false;
+
+                    // Attempt to find a sibling branch in the draft to jump to.
+                    let current_level = draft_pos_ids[draft_token_idx];
+                    let next_sibling_draft_idx = (draft_token_idx + 1..draft_tokens.len())
+                        .find(|&idx| draft_pos_ids[idx] == current_level);
+
+                    if let Some(sibling_idx) = next_sibling_draft_idx {
+                        // Jump the batch index to the sibling's position.
+                        draft_token_idx = sibling_idx;
+                    } else {
+                        // No more valid paths to check.
+                        break;
+                    }
                 }
             }
 
             // --- 4. State Update 🔄 ---
             // Rewind the KV cache to discard the states of any rejected draft tokens.
-            let redundant_draft_count = draft_tokens.len() - num_accepted_drafts;
-            self.shrink_kv_pages(redundant_draft_count);
+            let redundant_count =
+                batch_tokens.len() - token_ids_pending.len() - num_retained_draft_tokens;
 
-            // Update the main context's history to match the new KV cache state.
-            // The cache now holds the state for the `seed_token` and all accepted draft tokens.
-            self.token_ids.push(seed_token);
-            self.token_ids
-                .extend_from_slice(&accepted_tokens[..num_accepted_drafts]);
+            let num_tokens_to_keep = token_ids_pending.len() + num_retained_draft_tokens;
 
-            // Update the drafter with all newly accepted tokens to improve future drafts.
-            drafter.update(&accepted_tokens[..num_accepted_drafts]);
+            self.token_ids.extend(&batch_tokens[..num_tokens_to_keep]);
+            self.position_ids
+                .extend(&batch_positions[..num_tokens_to_keep]);
+            drafter.update(&batch_tokens[..num_tokens_to_keep]);
 
-            // Add all tokens from this step (seed + accepted) to the final output list.
+            self.shrink_kv_pages(redundant_count);
+
             all_generated_tokens.extend_from_slice(&accepted_tokens);
-
-            // The last accepted token (the correction) becomes the seed for the next iteration.
-            let next_seed_token = *accepted_tokens.last().unwrap();
-            self.fill_token(next_seed_token);
+            self.fill_tokens(accepted_tokens[num_retained_draft_tokens..].to_owned());
 
             // Clean up allocated resources for this step.
             self.queue.deallocate_embeds(&input_embeds);

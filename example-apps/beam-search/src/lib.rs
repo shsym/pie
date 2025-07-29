@@ -6,7 +6,7 @@ async fn main() -> Result<(), String> {
     let start = Instant::now();
 
     let max_num_outputs = 128;
-    let beam_size = 5;
+    let beam_size = 1;
 
     let model = inferlet2::get_auto_model();
     let tokenizer = model.get_tokenizer();
