@@ -1,6 +1,6 @@
 pub mod allocate;
 pub mod forward;
-mod forward_text;
+pub(crate) mod forward_text;
 pub mod input_image;
 pub mod input_text;
 pub mod output_text;

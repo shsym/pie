@@ -33,6 +33,7 @@ pub type Result<T> = std::result::Result<T, ResourcePoolError>;
 pub trait Allocator {
     fn allocate(&self, queue: &core::Queue, ids: &[u32]) -> Result<()>;
     fn deallocate(&self, queue: &core::Queue, ids: &[u32]) -> Result<()>;
+    fn import(&self, queue: &core::Queue, ids: &[u32], name: &str) -> Result<()>;
 }
 
 /// A fast, bounded ID pool that always returns the smallest available ID.
@@ -135,6 +136,45 @@ where
 
         if !to_alloc.is_empty() {
             self.allocator.allocate(queue, &to_alloc)?;
+        }
+
+        // Step 3: Commit state changes only after success.
+        for id in &ids_from_free {
+            self.free.remove(id);
+        }
+        self.next = next_id_end;
+
+        Ok(result)
+    }
+
+    pub fn import(&mut self, queue: &core::Queue, count: usize, name: &str) -> Result<Vec<u32>> {
+        // Step 1: Tentatively select IDs without modifying state.
+        let ids_from_free: Vec<u32> = self.free.iter().take(count).copied().collect();
+        let remaining_count = count.saturating_sub(ids_from_free.len());
+
+        let next_id_start = self.next;
+        let next_id_end = self
+            .next
+            .saturating_add(remaining_count as u32)
+            .min(self.max_capacity);
+        let ids_from_next: Vec<u32> = (next_id_start..next_id_end).collect();
+
+        let mut result = ids_from_free.clone();
+        result.extend_from_slice(&ids_from_next);
+
+        if result.len() < count {
+            return Err(ResourcePoolError::PoolExhausted);
+        }
+
+        // Step 2: Perform the fallible allocation.
+        let mut to_alloc = Vec::new();
+        if self.tight {
+            to_alloc.extend_from_slice(&ids_from_free);
+        }
+        to_alloc.extend_from_slice(&ids_from_next);
+
+        if !to_alloc.is_empty() {
+            self.allocator.import(queue, &to_alloc, name)?;
         }
 
         // Step 3: Commit state changes only after success.
@@ -265,6 +305,12 @@ where
 
     pub fn acquire_many(&mut self, queue: &core::Queue, count: usize) -> Result<Vec<u32>> {
         let ids = self.pool.acquire_many(queue, count)?;
+        self.increment_rc_many(&ids);
+        Ok(ids)
+    }
+
+    pub fn import(&mut self, queue: &core::Queue, count: usize, name: &str) -> Result<Vec<u32>> {
+        let ids = self.pool.import(queue, count, name)?;
         self.increment_rc_many(&ids);
         Ok(ids)
     }

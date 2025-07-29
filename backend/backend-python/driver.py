@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Union
 
 import numpy as np
+import numba
 import torch
 
 from l4m_pb2 import (  # pylint: disable=no-name-in-module
@@ -168,8 +169,8 @@ class Driver:
             length = cmd.length
 
             dst_block.occupancy[dst_start: dst_start + length] = src_block.occupancy[
-                src_start: src_start + length
-            ]
+                                                                 src_start: src_start + length
+                                                                 ]
             dst_block.position_ids[dst_start: dst_start + length] = (
                 src_block.position_ids[src_start: src_start + length]
             )
@@ -303,13 +304,13 @@ class Driver:
             ctx_pos_ids = np.hstack(
                 [self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids]
             )[
-                :total_sequence_length
-            ]  # int
+                          :total_sequence_length
+                          ]  # int
             ctx_occupancy = np.hstack(
                 [self.blocks[ctx_id].occupancy for ctx_id in ctx_block_ids]
             )[
-                :total_sequence_length
-            ]  # bool
+                            :total_sequence_length
+                            ]  # bool
 
             # print(f"ctx_pos_ids: {ctx_pos_ids}, ctx_occupancy: {ctx_occupancy}")
 
@@ -417,7 +418,7 @@ class Driver:
 
         kv_page_indices = []
         kv_page_indptr = [0]
-        kv_last_page_lens = []
+        kv_page_last_lens = []
         qo_indices = []
         qo_indptr = [0]
         custom_masks = []
@@ -430,82 +431,47 @@ class Driver:
         single_token_inference_mode = True
 
         for cmd in cmds.items:
-            last_block_len = cmd.last_block_len
 
-            ctx_block_ids = (
-                cmd.context_block_ids
-            )  # block == page. make names consistent later.
-            # input_embeds = cmd.input_embedding_ids
-            # output_embeds = cmd.output_embedding_ids
-
-            input_token_ids = cmd.token_ids
-            input_position_ids = cmd.position_ids
-            output_indices = cmd.output_indices
-
-            kv_page_indices.extend(ctx_block_ids)
+            kv_page_indices.extend(cmd.kv_page_ids)
             kv_page_indptr.append(len(kv_page_indices))
-            kv_last_page_lens.append(last_block_len)
-
-            qo_indices.extend(input_token_ids)  # dummy value - only used to compute the qo_indptr
+            kv_page_last_lens.append(cmd.kv_page_last_len)
+            qo_indices.extend(cmd.token_ids)
             qo_indptr.append(len(qo_indices))
 
-            # let's compute the mask.
+            num_total_tokens = self.kv_page_size * (len(cmd.kv_page_ids) - 1) + cmd.kv_page_last_len
+            num_context_tokens = num_total_tokens - len(cmd.token_ids)
 
-            inp_pos_ids = np.array(input_position_ids, dtype=np.int32)
-            inp_occupancy = np.ones((len(input_token_ids),), dtype=np.bool_)
-
-            total_ctx_tokens = (
-                    self.kv_page_size * (len(ctx_block_ids) - 1) + last_block_len
-            )
-
-            new_token_ids.extend(input_token_ids)
-            new_position_ids.extend(input_position_ids)
-            all_output_indices.extend(output_indices)
+            new_token_ids.extend(cmd.token_ids)
+            new_position_ids.extend(cmd.position_ids)
+            all_output_indices.extend(cmd.output_indices)
             all_output_indices_ptr.append(len(all_output_indices))
 
-            if len(input_token_ids) > 1:
+            if len(cmd.token_ids) > 1:
                 single_token_inference_mode = False
 
-            # Correctly iterate over the inputs of the CURRENT command
-            for i, pos in enumerate(input_position_ids):
-                # Calculate offset based on the CURRENT command's input length
-                token_offset = total_ctx_tokens - len(input_token_ids) + i
+            # --- New Mask Generation Logic ---
+            if len(cmd.mask) != len(cmd.token_ids):
+                raise ValueError(
+                    f"Mismatch between number of masks ({len(cmd.mask)}) and "
+                    f"input tokens ({len(cmd.token_ids)})."
+                )
 
-                # Ensure the target block is indexed correctly
-                if token_offset < 0:
-                    raise IndexError(f"Calculated a negative token_offset ({token_offset}). Check if 'total_ctx_tokens' is set correctly.")
+            cmd_mask = np.zeros((len(cmd.token_ids), num_total_tokens), dtype=np.bool_)
+            for i, brle_buffer in enumerate(cmd.mask):
+                # 1. Decode the provided BRLE mask for attention to the past context.
+                decoded_mask = _decode_brle(brle_buffer.buffer)
 
-                tgt_block_idx = token_offset // self.kv_page_size
-                tgt_block_offset = token_offset % self.kv_page_size
+                # The BRLE mask for query token `i` should cover the past context plus `i` previous new tokens.
+                expected_len = num_context_tokens + i + 1
+                if len(decoded_mask) != expected_len:
+                    raise ValueError(
+                        f"Decoded mask for token {i} has length {len(decoded_mask)}, but expected {expected_len}"
+                    )
 
-                tgt_block_id = ctx_block_ids[tgt_block_idx]
-                tgt_block = self.blocks[tgt_block_id]
+                cmd_mask[i, :expected_len] = decoded_mask
 
-                # Update the block with the correct position and occupancy
-                tgt_block.occupancy[tgt_block_offset] = True
-                tgt_block.position_ids[tgt_block_offset] = pos
-
-            total_sequence_length = total_ctx_tokens
-
-            # Get position IDs and occupancy for the entire sequence
-            ctx_pos_ids = np.hstack(
-                [self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids]
-            )[:total_sequence_length]
-
-            ctx_occupancy = np.hstack(
-                [self.blocks[ctx_id].occupancy for ctx_id in ctx_block_ids]
-            )[:total_sequence_length]
-
-            # print(f"ctx_pos_ids: {ctx_pos_ids}, ctx_occupancy: {ctx_occupancy}")
-
-            # Build the causal and valid masks
-            casual_mask = ctx_pos_ids[None, :] <= inp_pos_ids[:, None]
-            valid_mask = np.logical_and(ctx_occupancy[None, :], inp_occupancy[:, None])
-            mask = np.logical_and(casual_mask, valid_mask)
-
-            mask_flat = mask.flatten()
+            mask_flat = cmd_mask.flatten()
             custom_masks.append(mask_flat)
-            # print(mask)
 
         # concat all masks
         custom_mask = np.concatenate(custom_masks)
@@ -531,7 +497,7 @@ class Driver:
             kv_page_indptr, device=self.device, dtype=torch.int32
         )
         pt_kv_last_page_lens = torch.as_tensor(
-            kv_last_page_lens, device=self.device, dtype=torch.int32
+            kv_page_last_lens, device=self.device, dtype=torch.int32
         )
         pt_qo_indptr = torch.as_tensor(qo_indptr, device=self.device, dtype=torch.int32)
         pt_custom_mask = torch.as_tensor(
@@ -597,3 +563,27 @@ class Driver:
         return BatchForwardTextResponse(
             items=responses
         )
+
+
+def _decode_brle(brle_buffer: list[int]) -> np.ndarray:
+    """
+    Decodes a Binary Run-Length Encoded buffer into a boolean numpy array.
+    The format assumes alternating runs of False and True, starting with False.
+    """
+    if not brle_buffer:
+        return np.array([], dtype=bool)
+
+    total_size = sum(brle_buffer)
+    if total_size == 0:
+        return np.array([], dtype=bool)
+
+    decoded_array = np.empty(total_size, dtype=bool)
+    current_pos = 0
+    value = True  # originally False, but in attention masking, this is flipped to True
+    for run_len in brle_buffer:
+        if run_len > 0:
+            # Assign the current boolean value to the slice of the array
+            decoded_array[current_pos: current_pos + run_len] = value
+        current_pos += run_len
+        value = not value  # Flip value for the next run
+    return decoded_array

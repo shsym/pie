@@ -1,16 +1,16 @@
+use crate::brle::Brle;
 use crate::drafter::Drafter;
 use crate::sampler::Sampler;
 use crate::stop_condition::StopCondition;
 use crate::traits::allocate::Allocate;
-use crate::traits::tokenize::{Tokenize, Tokenizer};
-use crate::{Model, Queue, sampler, stop_condition};
-
-use crate::traits::ForwardText;
 use crate::traits::forward::Forward;
+use crate::traits::forward_text::ForwardText;
 use crate::traits::input_text::InputText;
 use crate::traits::output_text::{Distribution, OutputText};
+use crate::traits::tokenize::{Tokenize, Tokenizer};
+use crate::{Model, Queue, sampler, stop_condition};
 use std::cmp::Ordering;
-use std::{fmt, mem};
+use std::mem;
 use wit_bindgen::rt::async_support::futures::future::join_all;
 
 #[derive(Debug)]
@@ -21,6 +21,9 @@ pub struct Context {
 
     token_ids: Vec<u32>,
     token_ids_pending: Vec<u32>,
+
+    token_mask_pending: Vec<Brle>,
+    token_mask_current: Brle,
 
     kv_page_ids: Vec<u32>,
     kv_page_last_len: usize,
@@ -49,10 +52,55 @@ impl Context {
             tokenizer,
             token_ids: Vec::new(),
             token_ids_pending: Vec::new(),
+            token_mask_pending: Vec::new(),
+            token_mask_current: Brle::new(0),
             kv_page_ids: Vec::new(),
             kv_page_last_len: 0,
             kv_page_size,
         }
+    }
+
+    /// Creates a new Context from previously exported and now imported KV pages.
+    /// This is used to restore a context's state from a cache.
+    pub fn from_imported_state(
+        model: &Model,
+        imported_page_ids: Vec<u32>,
+        prefix_tokens: Vec<u32>,
+        kv_page_last_len: usize,
+    ) -> Self {
+        let queue = model.create_queue();
+        let kv_page_size = queue.get_kv_page_size() as usize;
+        let tokenizer = queue.get_tokenizer();
+
+        assert_eq!(
+            prefix_tokens.len(),
+            (imported_page_ids.len() - 1) * kv_page_size + kv_page_last_len,
+        );
+
+        let num_tokens = prefix_tokens.len();
+        // The new context takes ownership of the imported pages.
+        // It's assumed the state in these pages corresponds exactly
+        // to the provided prefix_tokens and kv_page_last_len.
+        Context {
+            queue,
+            model: model.clone(),
+            tokenizer,
+            token_ids: prefix_tokens,
+            token_ids_pending: Vec::new(),
+            token_mask_pending: Vec::new(),
+            token_mask_current: Brle::new(num_tokens),
+            kv_page_ids: imported_page_ids,
+            kv_page_last_len,
+            kv_page_size,
+        }
+    }
+
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    pub fn queue(&self) -> &Queue {
+        &self.queue
     }
 
     pub fn get_token_ids(&self) -> &[u32] {
@@ -63,6 +111,16 @@ impl Context {
         self.tokenizer.detokenize(&self.token_ids)
     }
 
+    /// Returns the unique IDs of the KV cache pages currently in use.
+    pub fn get_kv_page_ids(&self) -> &[u32] {
+        &self.kv_page_ids
+    }
+
+    /// Returns the number of tokens stored in the last KV cache page.
+    pub fn get_kv_page_last_len(&self) -> usize {
+        self.kv_page_last_len
+    }
+
     /// Creates a safe, copy-on-write fork of the context.
     ///
     /// This method creates a new context that shares the immutable history of the current
@@ -71,12 +129,6 @@ impl Context {
     ///
     /// This function will flush any pending tokens in the current context before forking.
     pub fn fork(&self) -> Self {
-        // flush the pending tokens
-        // if self.token_ids_pending.len() + self.kv_page_last_len >= self.kv_page_size {
-        //     self.flush();
-        //     //println!("flushing");
-        // }
-
         let (new_tokens, new_pending, new_kv_pages, new_last_len) =
             if self.kv_page_last_len == self.kv_page_size {
                 // Easy case: the last page is full, we can share everything.
@@ -87,22 +139,18 @@ impl Context {
                     self.kv_page_last_len,
                 )
             } else {
-                // Hard case: the last page is partially full and must be recomputed in the new context.
+                // Hard case: the last page is partially full and must be recomputed.
                 let kept_kv_page_len = self.kv_page_ids.len().saturating_sub(1);
                 let kept_tokens_len = kept_kv_page_len * self.kv_page_size;
 
                 let forked_token_ids = self.token_ids[..kept_tokens_len].to_vec();
                 let forked_kv_page_ids = self.kv_page_ids[..kept_kv_page_len].to_vec();
 
-                // All tokens from the partial page and any pending tokens must be reprocessed.
                 let forked_pending_token_ids = [
                     &self.token_ids[kept_tokens_len..],
                     &self.token_ids_pending[..],
                 ]
                 .concat();
-
-                //println!("kept: {:?}", self.tokenizer.detokenize(&forked_token_ids));
-                //println!("nxt: {:?}", self.tokenizer.detokenize(&forked_pending_token_ids));
 
                 let forked_last_kv_page_len = if !forked_kv_page_ids.is_empty() {
                     self.kv_page_size
@@ -125,23 +173,10 @@ impl Context {
             tokenizer: self.tokenizer.clone(),
             token_ids: new_tokens,
             token_ids_pending: new_pending,
+            token_mask_pending: self.token_mask_pending.clone(),
+            token_mask_current: self.token_mask_current.clone(),
             kv_page_ids: new_kv_pages,
             kv_page_last_len: new_last_len,
-            kv_page_size: self.kv_page_size,
-        }
-    }
-
-    fn clone_unsafe(&self) -> Self {
-        self.queue.increase_ref_count(&self.kv_page_ids);
-
-        Context {
-            queue: self.queue.clone(),
-            model: self.model.clone(),
-            tokenizer: self.tokenizer.clone(),
-            token_ids: self.token_ids.clone(),
-            token_ids_pending: self.token_ids_pending.clone(),
-            kv_page_ids: self.kv_page_ids.clone(),
-            kv_page_last_len: self.kv_page_last_len,
             kv_page_size: self.kv_page_size,
         }
     }
@@ -162,11 +197,93 @@ impl Context {
     }
 
     pub fn fill_tokens(&mut self, new_token_ids: Vec<u32>) {
+        let n = new_token_ids.len();
         self.token_ids_pending.extend(new_token_ids);
+
+        for _ in 0..n {
+            self.token_mask_current.append(false);
+            self.token_mask_pending
+                .push(self.token_mask_current.clone())
+        }
     }
 
     pub fn fill_token(&mut self, new_token_id: u32) {
         self.token_ids_pending.push(new_token_id);
+        self.token_mask_current.append(false);
+        self.token_mask_pending
+            .push(self.token_mask_current.clone())
+    }
+
+    pub fn mask_tokens(&mut self, indices: &[usize], mask: bool) {
+        self.token_mask_current.mask(indices, mask)
+    }
+
+    pub fn mask_token_range(&mut self, start: usize, end: usize, mask: bool) {
+        self.token_mask_current.mask_range(start, end, mask)
+    }
+
+    pub fn mask_token(&mut self, index: usize, mask: bool) {
+        self.token_mask_current.mask(&[index], mask)
+    }
+
+    /// Drops fully masked KV pages to save memory, supporting non-contiguous
+    /// dropping for optimizations like attention sink.
+    ///
+    /// The function iterates through all committed pages and checks if the tokens
+    /// corresponding to a page are all masked as `true`. If so, it deallocates
+    /// the page and removes the corresponding token ranges from the context's state.
+    ///
+    /// # Warning
+    ///
+    /// This operation modifies the token history non-contiguously, which can
+    /// break the assumptions of a standard causal attention model. It should
+    /// only be used with models and systems (like StreamingLLM) designed to
+    /// handle a KV cache with logical gaps.
+    pub fn drop_masked_kv_pages(&mut self) {
+        let num_committed_pages = self.token_ids.len() / self.kv_page_size;
+
+        // Iterate backwards to safely remove elements from vectors by index.
+        // We only consider dropping full pages, not the last (potentially partial) page.
+        for i in (0..num_committed_pages).rev() {
+            let page_start_token_idx = i * self.kv_page_size;
+            let page_end_token_idx = (i + 1) * self.kv_page_size;
+
+            if self.token_mask_current.is_range_all_value(
+                page_start_token_idx,
+                page_end_token_idx,
+                true,
+            ) {
+                // This page is fully masked and can be dropped.
+
+                // 1. Remove the page ID and deallocate the physical page.
+                let page_id_to_drop = self.kv_page_ids.remove(i);
+                self.queue.deallocate_kv_pages(&[page_id_to_drop]);
+
+                // 2. Remove the corresponding token range from the main token list.
+                self.token_ids
+                    .drain(page_start_token_idx..page_end_token_idx);
+
+                // 3. Remove the same range from the current mask.
+                self.token_mask_current
+                    .remove_range(page_start_token_idx, page_end_token_idx);
+
+                // 4. Remove the range from all historical pending masks.
+                for mask in &mut self.token_mask_pending {
+                    mask.remove_range(page_start_token_idx, page_end_token_idx);
+                }
+            }
+        }
+
+        // After removing tokens, the total count has changed, so we must
+        // recalculate the number of tokens stored in the last page.
+        let new_total_tokens = self.token_ids.len();
+        let last_page_len = new_total_tokens % self.kv_page_size;
+
+        self.kv_page_last_len = if last_page_len == 0 && new_total_tokens > 0 {
+            self.kv_page_size
+        } else {
+            last_page_len
+        };
     }
 
     /// Adjusts the number of KV pages to match the required number of tokens.
@@ -219,11 +336,11 @@ impl Context {
         };
     }
 
-    fn grow_kv_pages(&mut self, num_tokens: usize) {
+    pub fn grow_kv_pages(&mut self, num_tokens: usize) {
         self.adjust_kv_pages(num_tokens as isize);
     }
 
-    fn shrink_kv_pages(&mut self, num_tokens: usize) {
+    pub fn shrink_kv_pages(&mut self, num_tokens: usize) {
         // Convert the number of tokens to a negative adjustment for shrinking.
         self.adjust_kv_pages(-(num_tokens as isize));
     }
@@ -254,28 +371,24 @@ impl Context {
             .drain(..process_count)
             .collect::<Vec<u32>>();
 
+        let mask = self
+            .token_mask_pending
+            .drain(..process_count)
+            .map(|b| b.buffer)
+            .collect::<Vec<Vec<u32>>>();
+
         let position_ids = (self.token_ids.len() as u32
             ..(self.token_ids.len() + pending_token_ids.len()) as u32)
             .collect::<Vec<u32>>();
 
-        // let embed_ids = self.queue.allocate_embeds(pending_token_ids.len());
-        // self.queue.embed_text(&embed_ids, &pending_token_ids, &position_ids);
-
-        // First, ensure we have enough KV pages for all tokens.
         self.grow_kv_pages(pending_token_ids.len());
-
-        // self.queue.forward(
-        //     self.kv_page_last_len as u32,
-        //     &self.kv_page_ids,
-        //     &embed_ids,
-        //     &[],
-        // );
 
         self.queue.forward_text_no_output(
             self.kv_page_last_len as u32,
             &self.kv_page_ids,
             &pending_token_ids,
             &position_ids,
+            &mask,
         );
 
         self.token_ids.extend(pending_token_ids);
@@ -296,7 +409,7 @@ impl Context {
     ///
     /// A `Result` containing the `Distribution` over the next possible tokens,
     /// or an error if the generation step could not be performed.
-    async fn decode_step(&mut self) -> Distribution {
+    pub async fn decode_step(&mut self) -> Distribution {
         self.flush();
 
         assert_eq!(self.token_ids_pending.len(), 1, "Must have one seed token");
@@ -322,6 +435,11 @@ impl Context {
         // println!("token ids: {:?}", &self.token_ids);
         // println!("token ids pending: {:?}", &self.token_ids_pending);
 
+        let mask = mem::take(&mut self.token_mask_pending)
+            .into_iter()
+            .map(|brie| brie.buffer)
+            .collect::<Vec<Vec<u32>>>();
+
         let sampled = self
             .queue
             .forward_text(
@@ -329,6 +447,7 @@ impl Context {
                 &self.kv_page_ids,
                 &[next_token_id],
                 &[next_pos_id],
+                &mask,
                 &[0],
             )
             .await;

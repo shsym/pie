@@ -92,17 +92,23 @@ message BatchFillBlock {
   repeated FillBlock items = 1;
 }
 
+message BrleBuffer {
+  repeated uint32 buffer = 1;
+}
+
+
 message ForwardText {
-  // The ID of the block to fill.
-  uint32 last_block_len = 1;
-  // IDs of blocks providing context for the fill operation.
-  repeated uint32 context_block_ids = 2;
+  repeated uint32 kv_page_ids = 1;
+
+  uint32 kv_page_last_len = 2;
 
   repeated uint32 token_ids = 3;
 
   repeated uint32 position_ids = 4;
 
-  repeated uint32 output_indices = 5;
+  repeated BrleBuffer mask = 5;
+
+  repeated uint32 output_indices = 6;
 }
 
 message BatchForwardText {

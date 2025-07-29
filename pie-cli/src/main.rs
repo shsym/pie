@@ -470,16 +470,16 @@ async fn handle_run(
     let wasm_blob = fs::read(&args.wasm_path)
         .with_context(|| format!("Failed to read Wasm file at {:?}", args.wasm_path))?;
     let hash = client::hash_program(&wasm_blob);
-    println!("Program hash: {}", hash);
+    println!("Inferlet hash: {}", hash);
 
     if !client.program_exists(&hash).await? {
         client.upload_program(&wasm_blob).await?;
-        println!("✅ Program upload successful.");
+        println!("✅ Inferlet upload successful.");
     }
 
     let arguments = args.arguments.clone();
     let mut instance = client.launch_instance(&hash, arguments).await?;
-    println!("✅ Instance launched with ID: {}", instance.id());
+    println!("✅ Inferlet launched with ID: {}", instance.id());
 
     if !args.detach {
         let instance_id = instance.id().to_string();
@@ -491,9 +491,9 @@ async fn handle_run(
                 // Lock the printer to get mutable access.
                 let mut p = printer_clone.lock().await;
                 let output = if event == "terminated" {
-                    format!("[Instance {}] Terminated. Reason: {}", instance_id, message)
+                    format!("[Inferlet {}] Terminated. Reason: {}", instance_id, message)
                 } else {
-                    format!("[Instance {}] {}: {}", instance_id, event, message)
+                    format!("[Inferlet {}] {}: {}", instance_id, event, message)
                 };
 
                 // Print the line, which will automatically refresh the prompt.

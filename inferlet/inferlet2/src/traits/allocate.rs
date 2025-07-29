@@ -78,7 +78,9 @@ pub trait Allocate {
     /// # Parameters
     /// * `src_page_ids`: The IDs of the pages to export.
     /// * `name`: A `String` name to associate with the exported pages.
-    fn export_kv_pages(&self, src_page_ids: &[u32], name: String);
+    fn export_kv_pages(&self, src_page_ids: &[u32], name: String, persistent: bool);
+
+    fn unexport_kv_pages(&self, name: String);
 
     /// Imports a previously exported set of KV pages by name.
     ///
@@ -106,6 +108,16 @@ impl Allocator for KvPageAllocator {
         allocate::deallocate_kv_pages(queue, ids);
         Ok(())
     }
+
+    fn import(
+        &self,
+        queue: &core::Queue,
+        ids: &[u32],
+        name: &str,
+    ) -> Result<(), pool::ResourcePoolError> {
+        allocate::import_kv_pages(queue, ids, name);
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -118,6 +130,16 @@ impl Allocator for EmbedAllocator {
     }
     fn deallocate(&self, queue: &core::Queue, ids: &[u32]) -> Result<(), pool::ResourcePoolError> {
         allocate::deallocate_embeds(queue, ids);
+        Ok(())
+    }
+
+    fn import(
+        &self,
+        queue: &core::Queue,
+        ids: &[u32],
+        name: &str,
+    ) -> Result<(), pool::ResourcePoolError> {
+        panic!("Embeds cannot be imported");
         Ok(())
     }
 }
@@ -227,8 +249,12 @@ impl Allocate for Queue {
         )
     }
 
-    fn export_kv_pages(&self, src_page_ids: &[u32], name: String) {
-        allocate::export_kv_pages(&self.inner, src_page_ids, &name)
+    fn export_kv_pages(&self, src_page_ids: &[u32], name: String, persistent: bool) {
+        allocate::export_kv_pages(&self.inner, src_page_ids, &name, persistent)
+    }
+
+    fn unexport_kv_pages(&self, name: String) {
+        allocate::unexport_kv_pages(&self.inner, &name)
     }
 
     fn import_kv_pages(&self, name: String) -> Vec<u32> {
@@ -245,12 +271,9 @@ impl Allocate for Queue {
             return vec![];
         }
 
-        let allocated_ids = self.allocate_kv_pages(page_size.unwrap() as usize);
-
-        // Use the page size if necessary (it's unclear from your snippet if it's used)
-        // But if it's only `allocate::import_kv_pages`, call it and return the result:
-        allocate::import_kv_pages(&self.inner, &allocated_ids, &name);
-
-        allocated_ids
+        let pool = get_kv_page_pool(&self.inner);
+        pool.borrow_mut()
+            .import(&self.inner, page_size.unwrap() as usize, &name)
+            .expect("Failed to allocate KV pages from pool")
     }
 }

@@ -23,7 +23,7 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
     ) -> anyhow::Result<Vec<(String, u32)>> {
         let q = self.table().get(&queue)?;
         let (tx, rx) = oneshot::channel();
-        Command::GetAllExportedBlocks { handle: tx }.dispatch(q.service_id)?;
+        Command::GetAllExportedKvPages { handle: tx }.dispatch(q.service_id)?;
         rx.await.map_err(Into::into)
     }
 
@@ -124,12 +124,30 @@ impl bindings2::pie::inferlet::allocate::Host for InstanceState {
         queue: Resource<core::Queue>,
         src_kv_page_ids: Vec<ObjectId>,
         name: String,
+        persistent: bool,
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
         Command::ExportKvPages {
             inst_id,
             pages: src_kv_page_ids,
+            resource_name: name,
+            persistent,
+        }
+        .dispatch(q.service_id)?;
+
+        Ok(())
+    }
+
+    async fn unexport_kv_pages(
+        &mut self,
+        queue: Resource<core::Queue>,
+        name: String,
+    ) -> anyhow::Result<()> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+        Command::UnexportKvPages {
+            inst_id,
             resource_name: name,
         }
         .dispatch(q.service_id)?;

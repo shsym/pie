@@ -10,6 +10,7 @@ pub trait ForwardText {
         kv_page_ids: &[u32],
         tokens: &[u32],
         positions: &[u32],
+        mask: &[Vec<u32>],
         output_indices: &[u32],
     ) -> Vec<Distribution>;
 
@@ -19,6 +20,7 @@ pub trait ForwardText {
         kv_page_ids: &[u32],
         tokens: &[u32],
         positions: &[u32],
+        mask: &[Vec<u32>],
     );
 }
 
@@ -29,6 +31,7 @@ impl ForwardText for Queue {
         kv_page_ids: &[u32],
         tokens: &[u32],
         positions: &[u32],
+        mask: &[Vec<u32>],
         output_indices: &[u32],
     ) -> Vec<Distribution> {
         let result_future = forward_text::forward_text(
@@ -37,6 +40,7 @@ impl ForwardText for Queue {
             kv_page_ids,
             tokens,
             positions,
+            mask,
             output_indices,
         );
 
@@ -65,6 +69,7 @@ impl ForwardText for Queue {
         kv_page_ids: &[u32],
         tokens: &[u32],
         positions: &[u32],
+        mask: &[Vec<u32>],
     ) {
         forward_text::forward_text_no_output(
             &self.inner,
@@ -72,6 +77,7 @@ impl ForwardText for Queue {
             kv_page_ids,
             tokens,
             positions,
+            mask,
         );
     }
 }

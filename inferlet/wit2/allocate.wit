@@ -26,7 +26,10 @@ interface allocate {
     copy-kv-page: func(queue: borrow<queue>, src-kv-page-id: object-id, dst-kv-page-id: object-id, src-offset: u32, dst-offset: u32, size: u32);
 
     // Export KV pages under a given name
-    export-kv-pages: func(queue: borrow<queue>, src-kv-page-ids: list<object-id>, name: string);
+    export-kv-pages: func(queue: borrow<queue>, src-kv-page-ids: list<object-id>, name: string, persistent: bool);
+
+    // Undo the export of KV pages under a given name
+    unexport-kv-pages: func(queue: borrow<queue>, name: string);
 
     // Import KV pages by name into specified destination IDs
     import-kv-pages: func(queue: borrow<queue>, dst-kv-page-ids: list<object-id>, name: string);

@@ -26,7 +26,7 @@ pub struct Queue {
 
 #[derive(Debug)]
 pub struct SynchronizationResult {
-    receiver: Option<oneshot::Receiver<()>>,
+    receiver: oneshot::Receiver<()>,
     done: bool,
 }
 
@@ -82,9 +82,7 @@ impl Pollable for SynchronizationResult {
         if self.done {
             return;
         }
-        if let Some(receiver) = self.receiver.take() {
-            let _ = receiver.await.unwrap();
-        }
+        let _ = (&mut self.receiver).await.unwrap();
         self.done = true;
     }
 }
@@ -283,7 +281,7 @@ impl bindings2::pie::inferlet::core::HostQueue for InstanceState {
         .dispatch(queue.service_id)?;
 
         let result = SynchronizationResult {
-            receiver: Some(rx),
+            receiver: rx,
             done: false,
         };
         Ok(self.table().push(result)?)

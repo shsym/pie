@@ -43,6 +43,7 @@ macro_rules! try_trap {
 // Protocol definitions - backends dynamically report their supported protocols
 const PROTOCOL_BASE: usize = 0;
 const PROTOCOL_VISION: usize = 1;
+const GLOBAL_OWNER_ID: InstanceId = InstanceId::from_u128(0);
 
 static AVAILABLE_MODELS: std::sync::LazyLock<boxcar::Vec<(String, usize)>> =
     std::sync::LazyLock::new(boxcar::Vec::new);
@@ -216,7 +217,7 @@ pub enum Command {
         handle: oneshot::Sender<Arc<BytePairEncoder>>,
     },
 
-    GetAllExportedBlocks {
+    GetAllExportedKvPages {
         handle: oneshot::Sender<Vec<(String, IdRepr)>>,
     },
 
@@ -246,6 +247,12 @@ pub enum Command {
     ExportKvPages {
         inst_id: InstanceId,
         pages: Vec<IdRepr>,
+        resource_name: String,
+        persistent: bool,
+    },
+
+    UnexportKvPages {
+        inst_id: InstanceId,
         resource_name: String,
     },
 
@@ -287,6 +294,7 @@ pub enum Command {
         kv_pages: Vec<IdRepr>,
         text: Vec<u32>,
         positions: Vec<u32>,
+        mask: Vec<Vec<u32>>,
         output_indices: Vec<u32>,
         handle: Option<oneshot::Sender<Vec<(Vec<u32>, Vec<f32>)>>>,
     },
@@ -446,6 +454,7 @@ pub struct L4m {
     scheduler_loop_handle: tokio::task::JoinHandle<()>,
     event_loop_handle: tokio::task::JoinHandle<()>,
     exported_blocks: HashMap<String, ExportedBlocks>,
+    global_kv_page_id_pool: IdPool<u32>,
     objects: ObjectManager<InstanceId, ManagedTypes>,
     instance_launch_order: Vec<InstanceId>,
     stream_priorities: HashMap<Stream, StreamPriority>,
@@ -519,6 +528,7 @@ impl L4m {
             scheduler_loop_handle,
             event_loop_handle,
             exported_blocks: HashMap::new(),
+            global_kv_page_id_pool: IdPool::new(u32::MAX),
             objects,
             instance_launch_order: Vec::new(),
             stream_priorities: HashMap::new(),
@@ -568,7 +578,8 @@ impl L4m {
             }
         }
 
-        // Remove all exported blocks
+        // Remove all non-persistent exported blocks associated with the instance.
+        // Persistent blocks (owner: None) are retained.
         self.exported_blocks.retain(|_, v| v.owner != inst_id);
 
         cmds
@@ -609,12 +620,13 @@ impl L4m {
                 None
             }
 
-            Command::GetAllExportedBlocks { handle } => {
+            Command::GetAllExportedKvPages { handle } => {
                 let catalogue = self
                     .exported_blocks
                     .iter()
                     .map(|(k, v)| (k.clone(), v.addrs.len() as u32))
                     .collect();
+
                 handle.send(catalogue).ok();
                 None
             }
@@ -819,6 +831,7 @@ impl L4m {
                 mut kv_pages,
                 text,
                 positions,
+                mask,
                 output_indices,
                 handle,
             } => {
@@ -837,6 +850,7 @@ impl L4m {
                         kv_pages,
                         text,
                         positions,
+                        mask,
                         output_indices,
                         handle,
                     },
@@ -846,18 +860,96 @@ impl L4m {
 
             Command::ExportKvPages {
                 inst_id,
-                pages: mut blocks,
+                pages,
                 resource_name,
+                persistent,
             } => {
+                // Translate logical page names to physical block addresses.
+                // We clone `pages` because `translate_many` modifies the vector in place.
+                let mut physical_blocks = pages.clone();
                 try_trap!(
-                    self.objects
-                        .translate_many(ManagedTypes::KvPage, inst_id, &mut blocks),
+                    self.objects.translate_many(
+                        ManagedTypes::KvPage,
+                        inst_id,
+                        &mut physical_blocks
+                    ),
                     inst_id,
-                    "l4m::export_blocks failed. some blocks are invalid"
+                    "l4m::export_kv_pages failed. some blocks are invalid"
                 );
 
-                self.exported_blocks
-                    .insert(resource_name, ExportedBlocks::new(inst_id, blocks));
+                if persistent {
+                    // For persistent exports, create global references to the physical pages.
+                    // This increments their reference count, preventing them from being freed
+                    // when the original instance is destroyed.
+                    let num_pages = physical_blocks.len();
+                    let global_logical_ids: Vec<IdRepr> = (0..num_pages)
+                        .map(|_| self.global_kv_page_id_pool.acquire().unwrap())
+                        .collect();
+
+                    try_trap!(
+                        self.objects.create_ref_many(
+                            ManagedTypes::KvPage,
+                            GLOBAL_OWNER_ID,
+                            global_logical_ids.clone(),
+                            &physical_blocks
+                        ),
+                        inst_id,
+                        "l4m::export_kv_pages failed to create persistent references"
+                    );
+
+                    self.exported_blocks.insert(
+                        resource_name,
+                        ExportedBlocks::new(
+                            GLOBAL_OWNER_ID,
+                            physical_blocks,
+                            Some(global_logical_ids),
+                        ),
+                    );
+                } else {
+                    // For non-persistent export, the instance retains ownership.
+                    self.exported_blocks.insert(
+                        resource_name,
+                        ExportedBlocks::new(inst_id, physical_blocks, None),
+                    );
+                }
+                None // The command is fully handled here.
+            }
+
+            Command::UnexportKvPages {
+                inst_id,
+                resource_name,
+            } => {
+                // 1. Find the exported resource by its name and remove it from the map.
+                let exported_blocks = match self.exported_blocks.remove(&resource_name) {
+                    Some(blocks) => blocks,
+                    None => {
+                        runtime::trap(
+                            inst_id,
+                            format!(
+                                "l4m::unexport_kv_pages failed. Resource '{}' not found.",
+                                resource_name
+                            ),
+                        );
+                        return None;
+                    }
+                };
+
+                if exported_blocks.owner != inst_id && exported_blocks.owner != GLOBAL_OWNER_ID {
+                    return None;
+                }
+
+                // 3. If the resource had blocks, create a `Deallocate` command for the backend.
+                if !exported_blocks.addrs.is_empty() {
+                    let dealloc_cmd = Command::Deallocate {
+                        inst_id,
+                        stream_id: 0,
+                        ty: ManagedTypes::KvPage,
+                        ids: exported_blocks.addrs,
+                    };
+
+                    return Some((dealloc_cmd, Stream::new(inst_id, 0)));
+                }
+
                 None
             }
 
@@ -1278,11 +1370,18 @@ where
 struct ExportedBlocks {
     owner: InstanceId,
     addrs: Vec<IdRepr>,
+    /// For persistent blocks, stores the logical IDs within the global namespace
+    /// used for reference counting. Empty for non-persistent blocks.
+    global_refs: Option<Vec<IdRepr>>,
 }
 
 impl ExportedBlocks {
-    pub fn new(owner: InstanceId, addrs: Vec<IdRepr>) -> Self {
-        Self { owner, addrs }
+    pub fn new(owner: InstanceId, addrs: Vec<IdRepr>, global_refs: Option<Vec<IdRepr>>) -> Self {
+        Self {
+            owner,
+            addrs,
+            global_refs,
+        }
     }
 }
 
@@ -1527,19 +1626,26 @@ fn encode_pb_batch_forward_text(
             Command::ForwardText {
                 inst_id: _,
                 stream_id: _,
-                kv_page_last_len: last_block_len,
-                kv_pages: context,
+                kv_page_last_len,
+                kv_pages: kv_page_ids,
                 text,
                 positions,
+                mask,
                 output_indices,
                 handle,
             } => {
+                let mask = mask
+                    .into_iter()
+                    .map(|b| pb_bindings::BrleBuffer { buffer: b })
+                    .collect();
+
                 let pb = pb_bindings::ForwardText {
-                    last_block_len: last_block_len,
-                    context_block_ids: context,
+                    kv_page_ids,
+                    kv_page_last_len,
                     token_ids: text,
                     position_ids: positions,
-                    output_indices: output_indices,
+                    mask,
+                    output_indices,
                 };
                 items.push(pb);
                 events.push(Event::ForwardText(handle));

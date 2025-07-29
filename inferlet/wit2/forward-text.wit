@@ -11,6 +11,7 @@ interface forward-text {
         kv-page-ids: list<object-id>,           // List of context key-value memory pages
         tokens: list<u32>,                      // List of input token IDs
         positions: list<u32>,                   // List of input token positions
+        mask: list<list<u32>>,                  // 2d mask in BRLE format
         output-indices: list<u32>,              // Output indices
     ) -> distribution-result;
 
@@ -20,6 +21,7 @@ interface forward-text {
         kv-page-ids: list<object-id>,           // List of context key-value memory pages
         tokens: list<u32>,                      // List of input token IDs
         positions: list<u32>,                   // List of input token positions
+        mask: list<list<u32>>                   // 2d mask in BRLE format
     );
 
     resource distribution-result {

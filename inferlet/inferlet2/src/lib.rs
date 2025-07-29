@@ -1,3 +1,4 @@
+pub mod brle;
 pub mod context;
 pub mod drafter;
 mod pool;

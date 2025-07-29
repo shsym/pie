@@ -134,7 +134,7 @@ impl bindings::wit::pie::nbi::l4m::HostModel for InstanceState {
 
         let (tx, rx) = oneshot::channel();
 
-        Command::GetAllExportedBlocks { handle: tx }.dispatch(service_id)?;
+        Command::GetAllExportedKvPages { handle: tx }.dispatch(service_id)?;
 
         let result = rx
             .await
@@ -285,6 +285,7 @@ impl bindings::wit::pie::nbi::l4m::HostModel for InstanceState {
             inst_id: self.id(),
             pages: src_block_ids,
             resource_name: name,
+            persistent: false,
         }
         .dispatch(service_id)?;
         Ok(())

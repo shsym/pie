@@ -164,7 +164,6 @@ where
     pub fn create_many(
         &mut self,
         ty: TY,
-
         ns: NS,
         names: Vec<IdRepr>,
     ) -> Result<Vec<IdRepr>, ObjectError> {
@@ -182,7 +181,7 @@ where
         if ty.is_sharable() {
             let counter_map = self.ref_counter.entry(ty).or_insert_with(HashMap::new);
             for &id in &ids {
-                counter_map.insert(id, Counter::new(1));
+                counter_map.insert(id, Counter::new(0));
             }
         }
 
@@ -241,7 +240,6 @@ where
     pub fn create_ref_many(
         &mut self,
         ty: TY,
-
         ns: NS,
         names: Vec<IdRepr>,
         ids: &[IdRepr],
@@ -270,6 +268,14 @@ where
         let table = self.namespaces.entry(ty_ns).or_insert_with(HashMap::new);
         for (name, id) in names.into_iter().zip(ids.iter().copied()) {
             table.insert(name, id);
+        }
+
+        if ty.is_sharable() {
+            if let Some(counter_map) = self.ref_counter.get_mut(&ty) {
+                for id in ids {
+                    counter_map.get_mut(id).unwrap().inc();
+                }
+            }
         }
 
         Ok(())
@@ -321,8 +327,6 @@ where
         ns: NS,
         names: &[IdRepr],
     ) -> Result<Vec<IdRepr>, ObjectError> {
-
-
         // Get the namespace table for the given type and namespace.
         let ty_ns = (ty.clone(), ns);
         let table = self
@@ -338,11 +342,9 @@ where
         for name in names {
             // Remove the (name, id) pair from the namespace.
             if let Some(id) = table.remove(name) {
-
                 //println!("attempting to free, type: {:?}, id: {:?}", ty, id);
                 // Determine if the object should be freed.
                 let should_free = if ty.is_sharable() {
-
                     // let rc =self.ref_counter
                     // .get_mut(&ty)
                     // .unwrap()
@@ -366,7 +368,7 @@ where
                 if should_free {
                     //println!("freed, type: {:?}, id: {:?}", ty, id);
                     let _ = self.id_pool.get_mut(&ty).unwrap().release(id);
-                        freed_ids.push(id);
+                    freed_ids.push(id);
                 }
             }
         }

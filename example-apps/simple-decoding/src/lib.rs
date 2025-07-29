@@ -70,7 +70,6 @@ async fn main() -> Result<(), String> {
     ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
     let text = ctx
-        .fork()
         .generate_until("<|eot_id|>", max_num_outputs as usize)
         .await;
     let token_ids = tokenizer.tokenize(&text);
