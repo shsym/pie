@@ -15,21 +15,21 @@ use wit_bindgen::rt::async_support::futures::future::join_all;
 
 #[derive(Debug)]
 pub struct Context {
-    queue: Queue,
-    model: Model,
-    tokenizer: Tokenizer,
+    pub queue: Queue,
+    pub model: Model,
+    pub tokenizer: Tokenizer,
 
-    token_ids: Vec<u32>,
-    token_ids_pending: Vec<u32>,
+    pub token_ids: Vec<u32>,
+    pub token_ids_pending: Vec<u32>,
 
-    token_mask_pending: Vec<Brle>,
-    token_mask_current: Brle,
+    pub token_mask_pending: Vec<Brle>,
+    pub token_mask_current: Brle,
 
-    position_ids: Vec<u32>,
+    pub position_ids: Vec<u32>,
 
-    kv_page_ids: Vec<u32>,
-    kv_page_last_len: usize,
-    kv_page_size: usize,
+    pub kv_page_ids: Vec<u32>,
+    pub kv_page_last_len: usize,
+    pub kv_page_size: usize,
 }
 
 impl Drop for Context {
@@ -415,9 +415,9 @@ impl Context {
 
         self.grow_kv_pages(pending_token_ids.len());
 
-        println!("pending token ids: {:?}", &pending_token_ids);
-        println!("mask: {:?}", &mask);
-        println!("position ids: {:?}", &position_ids);
+        // println!("pending token ids: {:?}", &pending_token_ids);
+        // println!("mask: {:?}", &mask);
+        // println!("position ids: {:?}", &position_ids);
 
         self.queue.forward_text_no_output(
             self.kv_page_last_len as u32,
@@ -826,13 +826,13 @@ impl Context {
                 batch_tokens.len() - token_ids_pending.len() - num_retained_draft_tokens;
 
             let num_tokens_to_keep = token_ids_pending.len() + num_retained_draft_tokens;
+            self.shrink_kv_pages(redundant_count);
 
             self.token_ids.extend(&batch_tokens[..num_tokens_to_keep]);
             self.position_ids
                 .extend(&batch_positions[..num_tokens_to_keep]);
             drafter.update(&batch_tokens[..num_tokens_to_keep]);
 
-            self.shrink_kv_pages(redundant_count);
 
             all_generated_tokens.extend_from_slice(&accepted_tokens);
             self.fill_tokens(accepted_tokens[num_retained_draft_tokens..].to_owned());

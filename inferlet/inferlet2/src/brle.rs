@@ -17,7 +17,7 @@ pub struct Brle {
     /// The buffer of run lengths. Even indices are for `false` runs, odd for `true`.
     pub buffer: Vec<u32>,
     /// The total number of boolean values represented.
-    total_size: usize,
+    pub total_size: usize,
 }
 
 // Public API

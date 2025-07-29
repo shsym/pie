@@ -4,53 +4,39 @@ use inferlet2::stop_condition::{self, StopCondition};
 use inferlet2::Context;
 use std::time::Instant;
 
-/// Generates text autoregressively using an attention sink to manage a rolling KV cache.
+/// Generates text using a simple sliding window for KV cache management.
 ///
-/// This method is an optimized version of `generate` designed for handling very long
-/// sequences. It implements a sliding window attention mechanism, often called an
-/// "attention sink," to keep the KV cache size bounded.
-///
-pub async fn generate_with_attention_sink<S: Sampler, C: StopCondition>(
+/// This method keeps only the most recent `window_size` tokens in the KV cache.
+/// As new tokens are generated, the oldest tokens beyond the window size are
+/// masked and eventually evicted from the cache. This is the simplest form of
+/// windowed attention, suitable for tasks where only recent context is relevant.
+
+pub async fn generate_with_sliding_window<S: Sampler, C: StopCondition>(
     ctx: &mut Context,
     sampler: &mut S,
     stop_condition: &mut C,
-    attention_sink_initial_size: usize,
-    attention_sink_window_size: usize,
+    window_size: usize,
 ) -> String {
     let mut generated_token_ids = Vec::new();
-    let max_cache_size = attention_sink_initial_size + attention_sink_window_size;
-
     // The autoregressive generation loop
     loop {
-        // 1. Decode the next token
+        // 1. Decode the next token, sample, and add it to the pending buffer.
         let dist = ctx.decode_step().await;
         let next_token_id = sampler.sample(&dist.ids, &dist.probs);
         ctx.fill_token(next_token_id);
         generated_token_ids.push(next_token_id);
 
-        // 2. Check if the stop condition is met
+        // 2. Check for the stop condition.
         if stop_condition.should_stop(&generated_token_ids) {
             break;
         }
 
-        // 3. Apply attention sink logic
-        // This logic operates on the committed tokens that are present in the KV cache.
+        // 3. Apply sliding window logic.
         let committed_len = ctx.token_ids.len();
-
-        if committed_len > max_cache_size {
-            // Determine the range of tokens to "evict" from the attention window.
-            // These are the tokens that are no longer in the initial sink or the
-            // recent sliding window.
-            let num_to_evict = committed_len - max_cache_size;
-            let evict_start = attention_sink_initial_size;
-            let evict_end = attention_sink_initial_size + num_to_evict;
-
-            // Mask this range so the model ignores it in future forward passes.
-            ctx.mask_token_range(evict_start, evict_end, true);
-
-            // Attempt to drop any full KV cache pages that are now fully masked.
-            // This is the step that actually frees memory. It will only act when
-            // a page is completely filled with masked-out tokens.
+        if committed_len > window_size {
+            // Mask all tokens from the beginning that are now outside the window.
+            let evict_end = committed_len - window_size;
+            ctx.mask_token_range(1, evict_end, true);
             ctx.drop_masked_kv_pages();
         }
     }
@@ -63,8 +49,7 @@ async fn main() -> Result<(), String> {
     let start = Instant::now();
 
     let max_num_outputs = 512;
-    let attention_sink_initial_size = 64; // Number of tokens to speculate in parallel
-    let attention_sink_window_size = 32;
+    let window_size = 32;
     let model = inferlet2::get_auto_model();
     let tokenizer = model.get_tokenizer();
 
@@ -82,19 +67,14 @@ async fn main() -> Result<(), String> {
     );
 
     println!(
-        "Starting generation with Attention Sink (initial_size={}, window_size={})",
-        attention_sink_initial_size, attention_sink_window_size
+        "Starting generation with Windowed Attention ( window_size={})",
+        window_size
     );
 
     // Call the standalone function
-    let output = generate_with_attention_sink(
-        &mut ctx,
-        &mut sampler,
-        &mut stop_condition,
-        attention_sink_initial_size,
-        attention_sink_window_size,
-    )
-    .await;
+    let output =
+        generate_with_sliding_window(&mut ctx, &mut sampler, &mut stop_condition, window_size)
+            .await;
 
     let elapsed = start.elapsed();
     let output_token_ids = tokenizer.tokenize(&output);

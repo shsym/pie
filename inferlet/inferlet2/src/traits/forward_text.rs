@@ -1,7 +1,17 @@
 use crate::Queue;
 use crate::bindings::pie::inferlet::forward_text;
+use crate::brle::Brle;
 use crate::traits::output_text::Distribution;
 use wstd::io::AsyncPollable;
+
+pub fn causal_mask(num_total_tokens: u32, num_input_tokens: u32) -> Vec<Brle> {
+    let mut mask = Vec::new();
+    let offset = num_total_tokens - num_input_tokens;
+    for i in 0..num_input_tokens {
+        mask.push(Brle::new((offset + i + 1) as usize));
+    }
+    mask
+}
 
 pub trait ForwardText {
     async fn forward_text(
