@@ -169,8 +169,8 @@ class Driver:
             length = cmd.length
 
             dst_block.occupancy[dst_start: dst_start + length] = src_block.occupancy[
-                                                                 src_start: src_start + length
-                                                                 ]
+                src_start: src_start + length
+            ]
             dst_block.position_ids[dst_start: dst_start + length] = (
                 src_block.position_ids[src_start: src_start + length]
             )
@@ -304,13 +304,13 @@ class Driver:
             ctx_pos_ids = np.hstack(
                 [self.blocks[ctx_id].position_ids for ctx_id in ctx_block_ids]
             )[
-                          :total_sequence_length
-                          ]  # int
+                :total_sequence_length
+            ]  # int
             ctx_occupancy = np.hstack(
                 [self.blocks[ctx_id].occupancy for ctx_id in ctx_block_ids]
             )[
-                            :total_sequence_length
-                            ]  # bool
+                :total_sequence_length
+            ]  # bool
 
             # print(f"ctx_pos_ids: {ctx_pos_ids}, ctx_occupancy: {ctx_occupancy}")
 
@@ -442,9 +442,13 @@ class Driver:
             num_total_tokens = self.kv_page_size * (len(cmd.kv_page_ids) - 1) + cmd.kv_page_last_len
             num_context_tokens = num_total_tokens - len(cmd.token_ids)
 
+            output_indices = []
+            for x in cmd.output_indices:
+                output_indices.append(x + qo_indptr[-1] - len(cmd.token_ids))
+
             new_token_ids.extend(cmd.token_ids)
             new_position_ids.extend(cmd.position_ids)
-            all_output_indices.extend(cmd.output_indices)
+            all_output_indices.extend(output_indices)
             all_output_indices_ptr.append(len(all_output_indices))
 
             if len(cmd.token_ids) > 1:
@@ -512,11 +516,14 @@ class Driver:
 
         # torch.cuda.synchronize()
         # print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
-        # print('kv_page_indices', kv_page_indices)
-        # print('kv_page_indptr', kv_page_indptr)
-        # print('kv_last_page_lens', kv_last_page_lens)
-        # print('qo_indptr', qo_indptr)
-        # print('custom_mask', custom_masks)
+        print('kv_page_indices', kv_page_indices)
+        print('kv_page_indptr', kv_page_indptr)
+        print('kv_page_last_lens', kv_page_last_lens)
+        print('qo_indptr', qo_indptr)
+        print('custom_mask', custom_masks)
+        print('output_indices', all_output_indices)
+        print('new_token_ids', new_token_ids)
+        print('new_position_ids', new_position_ids)
 
         responses = []
 
@@ -561,8 +568,8 @@ class Driver:
                     )
                     responses.append(res)
 
-        #torch.cuda.synchronize()
-        #print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
+        # torch.cuda.synchronize()
+        # print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
         return BatchForwardTextResponse(
             items=responses
         )

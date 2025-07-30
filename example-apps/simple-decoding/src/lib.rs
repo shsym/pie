@@ -2,6 +2,7 @@ use inferlet2::traits::Tokenize;
 use pico_args::Arguments;
 use std::ffi::OsString;
 use std::time::{Duration, Instant};
+
 /// Defines the command-line interface and help message.
 const HELP: &str = r#"
 Usage: program [OPTIONS]
@@ -12,7 +13,8 @@ Options:
   -p, --prompt <STRING>  The prompt to send to the model
                          (default: "Explain the LLM decoding process ELI5.")
   -n, --max-tokens <INT> The maximum number of new tokens to generate
-                         (default: 16)
+                         (default: 256)
+  --output               Send the final output back to the user.
   -h, --help             Print help information
 "#;
 
@@ -42,6 +44,9 @@ async fn main() -> Result<(), String> {
         .opt_value_from_str(["-n", "--max-tokens"])
         .map_err(|e| e.to_string())?
         .unwrap_or(256);
+
+    // Check for the presence of the --output flag.
+    let send_output = args.contains("--output");
 
     // Ensure no unknown arguments were passed.
     let remaining = args.finish();
@@ -81,6 +86,11 @@ async fn main() -> Result<(), String> {
             "Per token latency: {:?}",
             start.elapsed() / (token_ids.len() as u32)
         );
+    }
+
+    // Send back the output to the user only if the --output flag was provided.
+    if send_output {
+        inferlet2::send(&text);
     }
 
     Ok(())

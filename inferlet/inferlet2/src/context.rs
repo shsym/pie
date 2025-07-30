@@ -447,22 +447,17 @@ impl Context {
     /// A `Result` containing the `Distribution` over the next possible tokens,
     /// or an error if the generation step could not be performed.
     pub async fn decode_step(&mut self) -> Distribution {
-        self.flush();
-
-        assert_eq!(self.token_ids_pending.len(), 1, "Must have one seed token");
-        assert_ne!(
-            self.kv_page_last_len, 0,
-            "Context must be filled before generation"
+        assert!(
+            !self.token_ids_pending.is_empty(),
+            "Must have at least one seed token"
         );
 
-        // let input_embed_id = self.queue.allocate_embeds(1);
-        // let output_embed_id = self.queue.allocate_embeds(1);
+        let pending_token_ids = mem::take(&mut self.token_ids_pending);
+        let last_pos_id = self.position_ids.last().map(|&p| p + 1).unwrap_or(0);
+        let position_ids =
+            (last_pos_id..(last_pos_id + pending_token_ids.len() as u32)).collect::<Vec<u32>>();
 
-        let next_token_id = self.token_ids_pending.pop().unwrap();
-        let next_pos_id = self.position_ids.last().map(|&p| p + 1).unwrap_or(0);
-        // self.queue.embed_text(&input_embed_id, &[next_token_id], &[next_pos_id]);
-
-        self.grow_kv_pages(1);
+        self.grow_kv_pages(pending_token_ids.len());
 
         // println!("next token id: {}", next_token_id);
         // println!("next pos id: {}", next_pos_id);
@@ -481,17 +476,17 @@ impl Context {
             .forward_text(
                 self.kv_page_last_len as u32,
                 &self.kv_page_ids,
-                &[next_token_id],
-                &[next_pos_id],
+                &pending_token_ids,
+                &position_ids,
                 &mask,
-                &[0],
+                &[pending_token_ids.len() as u32 - 1],
             )
             .await;
 
         // let sampled = self.queue.get_next_token_distribution(&output_embed_id).await;
 
-        self.token_ids.push(next_token_id);
-        self.position_ids.push(next_pos_id);
+        self.token_ids.extend(pending_token_ids);
+        self.position_ids.extend(position_ids);
         // self.queue.deallocate_embeds(&input_embed_id);
         // self.queue.deallocate_embeds(&output_embed_id);
 
