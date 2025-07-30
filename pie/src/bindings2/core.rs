@@ -32,7 +32,7 @@ pub struct SynchronizationResult {
 
 #[derive(Debug)]
 pub struct ReceiveResult {
-    receiver: Option<oneshot::Receiver<String>>,
+    receiver: oneshot::Receiver<String>,
     result: Option<String>,
     done: bool,
 }
@@ -52,11 +52,8 @@ impl Pollable for ReceiveResult {
         if self.done {
             return;
         }
-        if let Some(rx) = self.receiver.take() {
-            if let Ok(result) = rx.await {
-                self.result = Some(result);
-            }
-        }
+        let res = (&mut self.receiver).await.unwrap();
+        self.result = Some(res);
         self.done = true;
     }
 }
@@ -123,7 +120,7 @@ impl bindings2::pie::inferlet::core::Host for InstanceState {
             message: tx,
         });
         let res = ReceiveResult {
-            receiver: Some(rx),
+            receiver: rx,
             result: None,
             done: false,
         };

@@ -516,14 +516,14 @@ class Driver:
 
         # torch.cuda.synchronize()
         # print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
-        print('kv_page_indices', kv_page_indices)
-        print('kv_page_indptr', kv_page_indptr)
-        print('kv_page_last_lens', kv_page_last_lens)
-        print('qo_indptr', qo_indptr)
-        print('custom_mask', custom_masks)
-        print('output_indices', all_output_indices)
-        print('new_token_ids', new_token_ids)
-        print('new_position_ids', new_position_ids)
+        # print('kv_page_indices', kv_page_indices)
+        # print('kv_page_indptr', kv_page_indptr)
+        # print('kv_page_last_lens', kv_page_last_lens)
+        # print('qo_indptr', qo_indptr)
+        # print('custom_mask', custom_masks)
+        # print('output_indices', all_output_indices)
+        # print('new_token_ids', new_token_ids)
+        # print('new_position_ids', new_position_ids)
 
         responses = []
 
