@@ -116,16 +116,16 @@ class L4maAttention(nn.Module):
         )
 
     def forward(
-        self,
-        wrapper,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        kv_cache_at_layer: torch.Tensor,
-        kv_page_indices: torch.Tensor,
-        kv_page_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        batch_indices: torch.Tensor,
-        batch_positions: torch.Tensor,
+            self,
+            wrapper,
+            hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
+            kv_cache_at_layer: torch.Tensor,
+            kv_page_indices: torch.Tensor,
+            kv_page_indptr: torch.Tensor,
+            kv_last_page_lens: torch.Tensor,
+            batch_indices: torch.Tensor,
+            batch_positions: torch.Tensor,
     ) -> torch.Tensor:
         """TODO: Add method docstring."""
 
@@ -196,16 +196,16 @@ class L4maDecoderLayer(nn.Module):
         )
 
     def forward(
-        self,
-        wrapper,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        kv_cache_at_layer: torch.Tensor,
-        kv_page_indices: torch.Tensor,
-        kv_page_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        batch_indices: torch.Tensor,
-        batch_positions: torch.Tensor,
+            self,
+            wrapper,
+            hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
+            kv_cache_at_layer: torch.Tensor,
+            kv_page_indices: torch.Tensor,
+            kv_page_indptr: torch.Tensor,
+            kv_last_page_lens: torch.Tensor,
+            batch_indices: torch.Tensor,
+            batch_positions: torch.Tensor,
     ) -> torch.Tensor:
         """TODO: Add method docstring."""
         residual = hidden_states
@@ -277,16 +277,16 @@ class L4maModel(nn.Module):
         )
 
     def forward(
-        self,
-        input_embeds: torch.Tensor,
-        position_ids: torch.Tensor,
-        kv_cache_at_layer: torch.Tensor,
-        kv_page_indices: torch.Tensor,
-        kv_page_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        qo_indptr: torch.Tensor,
-        custom_mask: torch.Tensor,
-        single_token_inference_mode: bool = False,
+            self,
+            input_embeds: torch.Tensor,
+            position_ids: torch.Tensor,
+            kv_cache_at_layer: torch.Tensor,
+            kv_page_indices: torch.Tensor,
+            kv_page_indptr: torch.Tensor,
+            kv_last_page_lens: torch.Tensor,
+            qo_indptr: torch.Tensor,
+            custom_mask: torch.Tensor,
+            single_token_inference_mode: bool = False,
     ) -> torch.Tensor:
         """TODO: Add method docstring."""
         hidden_states = input_embeds

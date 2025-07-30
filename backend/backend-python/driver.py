@@ -416,6 +416,7 @@ class Driver:
     def forward_text(self, cmds: BatchForwardText):
         """TODO: Add method docstring."""
 
+        start_time = time.time()
         kv_page_indices = []
         kv_page_indptr = [0]
         kv_page_last_lens = []
@@ -560,6 +561,8 @@ class Driver:
                     )
                     responses.append(res)
 
+        #torch.cuda.synchronize()
+        #print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
         return BatchForwardTextResponse(
             items=responses
         )

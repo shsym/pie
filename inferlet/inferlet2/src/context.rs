@@ -525,7 +525,17 @@ impl Context {
 
         // The autoregressive generation loop
         loop {
+            // start time
+            //let start_time = Instant::now();
             let dist = self.decode_step().await;
+
+            // end time
+            //let elapsed_time = end_time.duration_since(start_time);
+            //println!("elapsed time: {:?}", elapsed_time);
+            // print out the distributions
+            //println!("dist: {:?}", &dist.ids);
+            //println!("probs: {:?}", &dist.probs);
+
             let next_token_id = sampler.sample(&dist.ids, &dist.probs);
             self.fill_token(next_token_id);
 
@@ -832,7 +842,6 @@ impl Context {
             self.position_ids
                 .extend(&batch_positions[..num_tokens_to_keep]);
             drafter.update(&batch_tokens[..num_tokens_to_keep]);
-
 
             all_generated_tokens.extend_from_slice(&accepted_tokens);
             self.fill_tokens(accepted_tokens[num_retained_draft_tokens..].to_owned());

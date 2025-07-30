@@ -206,8 +206,7 @@ impl Server {
             };
             if let Ok(mut client) = Client::new(id, stream, state.clone()).await {
                 let client_handle = task::spawn(async move {
-                    client.serve().await;
-                    client.cleanup().await;
+                    client.run().await;
                 });
 
                 state.clients.insert(id, client_handle);
@@ -324,83 +323,119 @@ impl Client {
         })
     }
 
-    async fn serve(&mut self) {
-        while let Some(cmd) = self.incoming_rx.recv().await {
-            match cmd {
-                ClientCommand::FromClient(message) => match message {
-                    ClientMessage::Authenticate { corr_id, token } => {
-                        self.handle_authenticate(corr_id, token).await
-                    }
-                    ClientMessage::Query {
-                        corr_id,
-                        subject,
-                        record,
-                    } => self.handle_query(corr_id, subject, record).await,
-                    ClientMessage::UploadProgram {
+    /// Manages the entire lifecycle of a client connection.
+    async fn run(&mut self) {
+        loop {
+            tokio::select! {
+                // To prevent starvation, prioritize processing existing messages
+                // over checking for disconnection.
+                biased;
+
+                // Branch 1: A new command was received from the client or an internal service.
+                Some(cmd) = self.incoming_rx.recv() => {
+                    self.handle_command(cmd).await;
+                },
+
+                // Branch 2: The reader task has finished. This is a primary signal
+                // that the client has disconnected.
+                _ = &mut self.reader_task => {
+                    // println!("Client {} disconnected (reader task finished).", self.id);
+                    break;
+                },
+
+                // Branch 3: The writer task has finished, likely due to a
+                // "broken pipe" error when trying to send a message.
+                _ = &mut self.writer_task => {
+                    // println!("Client {} disconnected (writer task finished).", self.id);
+                    break;
+                }
+
+                // The `else` branch is taken when all other branches are disabled,
+                // meaning the channel is closed and tasks are done. This is a clean shutdown.
+                else => break,
+            }
+        }
+
+        // The loop has exited, so we can now guarantee that cleanup will run.
+        self.cleanup().await;
+    }
+
+    /// Processes a single command. This contains the logic from your old `serve` method.
+    async fn handle_command(&mut self, cmd: ClientCommand) {
+        match cmd {
+            ClientCommand::FromClient(message) => match message {
+                ClientMessage::Authenticate { corr_id, token } => {
+                    self.handle_authenticate(corr_id, token).await
+                }
+                ClientMessage::Query {
+                    corr_id,
+                    subject,
+                    record,
+                } => self.handle_query(corr_id, subject, record).await,
+                ClientMessage::UploadProgram {
+                    corr_id,
+                    program_hash,
+                    chunk_index,
+                    total_chunks,
+                    chunk_data,
+                } => {
+                    self.handle_upload_program(
                         corr_id,
                         program_hash,
                         chunk_index,
                         total_chunks,
                         chunk_data,
-                    } => {
-                        self.handle_upload_program(
-                            corr_id,
-                            program_hash,
-                            chunk_index,
-                            total_chunks,
-                            chunk_data,
-                        )
+                    )
+                    .await
+                }
+                ClientMessage::LaunchInstance {
+                    corr_id,
+                    program_hash,
+                    arguments,
+                } => {
+                    self.handle_launch_instance(corr_id, program_hash, arguments)
                         .await
-                    }
-                    ClientMessage::LaunchInstance {
-                        corr_id,
-                        program_hash,
-                        arguments,
-                    } => {
-                        self.handle_launch_instance(corr_id, program_hash, arguments)
-                            .await
-                    }
-                    ClientMessage::LaunchServerInstance {
-                        corr_id,
-                        port,
-                        program_hash,
-                        arguments,
-                    } => {
-                        self.handle_launch_server_instance(corr_id, port, program_hash, arguments)
-                            .await
-                    }
-                    ClientMessage::SignalInstance {
-                        instance_id,
-                        message,
-                    } => self.handle_signal_instance(instance_id, message).await,
-                    ClientMessage::TerminateInstance { instance_id } => {
-                        self.handle_terminate_instance(instance_id).await
-                    }
-                    ClientMessage::AttachRemoteService {
+                }
+                ClientMessage::LaunchServerInstance {
+                    corr_id,
+                    port,
+                    program_hash,
+                    arguments,
+                } => {
+                    self.handle_launch_server_instance(corr_id, port, program_hash, arguments)
+                        .await
+                }
+                ClientMessage::SignalInstance {
+                    instance_id,
+                    message,
+                } => self.handle_signal_instance(instance_id, message).await,
+                ClientMessage::TerminateInstance { instance_id } => {
+                    self.handle_terminate_instance(instance_id).await
+                }
+                ClientMessage::AttachRemoteService {
+                    corr_id,
+                    endpoint,
+                    service_type,
+                    service_name,
+                } => {
+                    self.handle_attach_remote_service(
                         corr_id,
                         endpoint,
                         service_type,
                         service_name,
-                    } => {
-                        self.handle_attach_remote_service(
-                            corr_id,
-                            endpoint,
-                            service_type,
-                            service_name,
-                        )
-                        .await;
-                    }
-                },
-                ClientCommand::Internal(cmd) => match cmd {
-                    Command::Send { inst_id, message } => {
-                        self.send_inst_event(inst_id, "message".to_string(), message)
-                            .await
-                    }
-                    Command::DetachInstance { inst_id, reason } => {
-                        self.handle_detach_instance(inst_id, reason).await;
-                    }
-                },
-            }
+                    )
+                    .await;
+                }
+            },
+            ClientCommand::Internal(cmd) => match cmd {
+                Command::Send { inst_id, message } => {
+                    self.send_inst_event(inst_id, "message".to_string(), message)
+                        .await
+                }
+                Command::DetachInstance { inst_id, reason } => {
+                    self.handle_detach_instance(inst_id, reason).await;
+                }
+            },
         }
     }
 
@@ -441,7 +476,7 @@ impl Client {
         }
         self.inst_owned.retain(|&id| id != inst_id);
 
-        if let Some(_) = self.state.instance_chans.remove(&inst_id) {
+        if self.state.instance_chans.remove(&inst_id).is_some() {
             self.send_inst_event(inst_id, "terminated".to_string(), reason)
                 .await;
         }
@@ -559,8 +594,6 @@ impl Client {
                 .unwrap();
                 let _ = evt_rx.await.unwrap();
 
-                println!("Uploaded program with hash {}", file_hash);
-
                 self.send_response(corr_id, true, file_hash).await;
             }
 
@@ -593,9 +626,9 @@ impl Client {
                 //register
                 self.state
                     .instance_chans
-                    .insert(instance_id.clone(), self.incoming_tx.clone());
+                    .insert(instance_id, self.incoming_tx.clone());
 
-                self.inst_owned.push(instance_id.clone());
+                self.inst_owned.push(instance_id);
                 self.send_response(corr_id, true, instance_id.to_string())
                     .await;
             }
@@ -702,25 +735,29 @@ impl Client {
         }
     }
 
+    /// The cleanup logic is now guaranteed to run.
     async fn cleanup(&mut self) {
-        // remove all instances owned by this connection
-        for inst_id in self.inst_owned.iter() {
-            if let Some(_) = self.state.instance_chans.remove(inst_id) {
-                runtime::trap(*inst_id, "socket terminated");
+        // Terminate all instances owned by this client.
+        for inst_id in self.inst_owned.drain(..) {
+            if self.state.instance_chans.remove(&inst_id).is_some() {
+                runtime::trap(inst_id, "socket terminated");
             }
         }
 
+        // Abort the tasks to ensure they are stopped. It's safe to abort
+        // tasks that have already completed.
         self.reader_task.abort();
         self.writer_task.abort();
 
-        // remove the connection from the state
+        // Remove the client from the central map.
         self.state.clients.remove(&self.id);
 
+        // Release the client ID back to the pool.
         self.state
             .client_id_pool
             .lock()
             .await
             .release(self.id)
-            .unwrap()
+            .expect("Failed to release client ID");
     }
 }

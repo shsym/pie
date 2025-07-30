@@ -211,3 +211,6 @@ logs
 
 # No MCP files
 .memory-bank
+
+# raw eval data
+eval/

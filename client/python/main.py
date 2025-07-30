@@ -2,7 +2,7 @@ import asyncio
 import time
 from pathlib import Path
 from blake3 import blake3
-from pie import SymphonyClient, Instance  # Assuming these are defined elsewhere
+from pie import PieClient, Instance  # Assuming these are defined elsewhere
 import random
 
 async def main():
@@ -20,7 +20,7 @@ async def main():
     print(f"Using program: {program_name}")
 
     # Initialize and connect the client
-    client = SymphonyClient(server_uri)
+    client = PieClient(server_uri)
     await client.connect()
 
     # Read the program file and compute its hash
@@ -120,7 +120,7 @@ async def main_swarm():
     print(f"Using program: {program_name}")
 
     # Initialize and connect the client
-    client = SymphonyClient(server_uri)
+    client = PieClient(server_uri)
     await client.connect()
 
     # Read the program file and compute its hash
@@ -241,7 +241,7 @@ async def main_bench_agent():
     print(f"Using program: {program_name}")
 
     # Initialize and connect the client
-    client = SymphonyClient(server_uri)
+    client = PieClient(server_uri)
     await client.connect()
 
     # Read the program file and compute its hash
@@ -346,7 +346,7 @@ async def main_rt_bench():
     print(f"Using program: {program_name}")
 
     # Initialize and connect the client
-    client = SymphonyClient(server_uri)
+    client = PieClient(server_uri)
     await client.connect()
 
     # Read the program file and compute its hash
@@ -421,7 +421,7 @@ async def main_count_calls():
     program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
     server_uri = "ws://127.0.0.1:9123"
 
-    client = SymphonyClient(server_uri)
+    client = PieClient(server_uri)
     await client.connect()
 
     # Read the program file and compute its hash
@@ -466,7 +466,7 @@ async def main_startup_time():
     print(f"Using program: {program_name}")
 
     # Initialize and connect the client
-    client = SymphonyClient(server_uri)
+    client = PieClient(server_uri)
     await client.connect()
 
     # Read the program file and compute its hash

@@ -196,7 +196,7 @@ def load_model(config: dict):
         # ========================================================================
 
         # L4ma models often reuse the embed_tokens for the lm_head, so we need to copy it explicitly
-        if "lm_head.weight" in model_state_keys:
+        if "lm_head.weight" in model_state_keys and "lm_head.weight" not in loaded_keys:
             model.state_dict()["lm_head.weight"].copy_(model.model.embed_tokens.weight, non_blocking=True)
             loaded_keys.add("lm_head.weight")
 
