@@ -326,6 +326,13 @@ pub enum Command {
         embs: Vec<IdRepr>,
         image_blob: Vec<u8>,
     },
+
+    DebugQuery {
+        inst_id: InstanceId,
+        stream_id: LocalStreamId,
+        query: String,
+        handle: oneshot::Sender<String>,
+    },
 }
 
 impl Command {
@@ -347,6 +354,7 @@ enum BatchGroup {
     SampleTopK,
     Synchronize,
     EmbedImage,
+    DebugQuery,
 }
 
 impl Batchable<BatchGroup> for Command {
@@ -393,6 +401,7 @@ impl Batchable<BatchGroup> for Command {
             }
             Command::Synchronize { .. } => batching::eager(),
             Command::EmbedImage { .. } => batching::eager(),
+            Command::DebugQuery { .. } => batching::eager(),
             _ => unreachable!(),
         }
     }
@@ -410,6 +419,7 @@ impl Batchable<BatchGroup> for Command {
             Command::SampleTopK { .. } => BatchGroup::SampleTopK,
             Command::Synchronize { .. } => BatchGroup::Synchronize,
             Command::EmbedImage { .. } => BatchGroup::EmbedImage,
+            Command::DebugQuery { .. } => BatchGroup::DebugQuery,
             _ => unreachable!(),
         }
     }
@@ -420,6 +430,7 @@ pub enum Event {
     GetInfo(oneshot::Sender<Info>),
     SampleTopK(oneshot::Sender<(Vec<u32>, Vec<f32>)>),
     ForwardText(Option<oneshot::Sender<Vec<(Vec<u32>, Vec<f32>)>>>),
+    DebugQuery(oneshot::Sender<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1143,6 +1154,25 @@ impl L4m {
                     Stream::new(inst_id, stream_id),
                 ))
             }
+
+            Command::DebugQuery {
+                inst_id,
+                stream_id,
+                query,
+                handle,
+            } => {
+                // For debug queries, we simply send the query to the backend.
+                // The backend will handle it and return a response.
+                Some((
+                    Command::DebugQuery {
+                        inst_id,
+                        stream_id,
+                        query,
+                        handle,
+                    },
+                    Stream::new(inst_id, stream_id),
+                ))
+            }
         }
     }
 
@@ -1267,6 +1297,17 @@ impl L4m {
                     pb_bindings::response::Command::BatchSync(..) => {
                         // fire the next batch, or set the ready flag to true.
                     }
+
+                    pb_bindings::response::Command::DebugQuery(batch) => {
+                        for (item, event) in batch.items.into_iter().zip(senders) {
+                            match event {
+                                Event::DebugQuery(handle) => {
+                                    handle.send(item.response).ok();
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1353,6 +1394,7 @@ where
                 return;
             }
             BatchGroup::EmbedImage => encode_pb_batch_embed_image(correlation_id, batch),
+            BatchGroup::DebugQuery => encode_pb_batch_debug_query(correlation_id, batch),
             // _ => unreachable!(),
         };
 
@@ -1834,6 +1876,40 @@ fn encode_pb_batch_embed_image(
     }
     .encode_to_vec();
     ((PROTOCOL_VISION, payload), None)
+}
+
+fn encode_pb_batch_debug_query(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let mut items = Vec::new();
+    let mut events = Vec::new();
+
+    for cmd in batch {
+        match cmd {
+            Command::DebugQuery {
+                inst_id: _,
+                stream_id: _,
+                query,
+                handle,
+            } => {
+                let pb = pb_bindings::DebugQueryRequest { query };
+                items.push(pb);
+                events.push(Event::DebugQuery(handle));
+            }
+            _ => unreachable!(),
+        }
+    }
+    let cmd =
+        pb_bindings::request::Command::DebugQueryRequest(pb_bindings::BatchDebugQueryRequest {
+            items,
+        });
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), Some(events))
 }
 
 fn encode_pb_get_info(

@@ -1,4 +1,4 @@
-use inferlet2::{self, context::Context, traits::allocate::Allocate, wstd};
+use inferlet::{self, context::Context, traits::allocate::Allocate, wstd};
 use pico_args::Arguments;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -51,10 +51,10 @@ struct CachedPrefixState {
     kv_page_last_len: usize,
 }
 
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let mut args = Arguments::from_vec(
-        inferlet2::get_arguments()
+        inferlet::get_arguments()
             .into_iter()
             .map(OsString::from)
             .collect(),
@@ -70,23 +70,23 @@ async fn main() -> Result<(), String> {
     let invalidate_cache: bool = args.contains(["-i", "--invalidate-cache"]);
 
     let start = Instant::now();
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let queue = model.create_queue();
 
     let tokenizer = model.get_tokenizer();
     let mut ctx: Context;
 
-    if invalidate_cache && inferlet2::store_get(CACHE_FLAG_KEY) == Some("true".to_string()) {
+    if invalidate_cache && inferlet::store_get(CACHE_FLAG_KEY) == Some("true".to_string()) {
         queue.unexport_kv_pages(CACHE_EXPORT_NAME.to_string());
-        inferlet2::store_set(CACHE_FLAG_KEY, "false");
+        inferlet::store_set(CACHE_FLAG_KEY, "false");
     }
 
-    if inferlet2::store_get(CACHE_FLAG_KEY) == Some("true".to_string()) {
+    if inferlet::store_get(CACHE_FLAG_KEY) == Some("true".to_string()) {
         println!("✅ Cache HIT. Loading prefix from KV store.");
 
         let imported_page_ids = queue.import_kv_pages(CACHE_EXPORT_NAME.to_string());
         let state_json =
-            inferlet2::store_get(CACHE_STATE_KEY).ok_or("Cache Inconsistency: State missing")?;
+            inferlet::store_get(CACHE_STATE_KEY).ok_or("Cache Inconsistency: State missing")?;
         let state: CachedPrefixState = serde_json::from_str(&state_json).unwrap();
 
         ctx = Context::from_imported_state(
@@ -114,8 +114,8 @@ async fn main() -> Result<(), String> {
             .export_kv_pages(&page_ids, CACHE_EXPORT_NAME.to_string(), true);
 
         let state_json = serde_json::to_string(&state_to_cache).unwrap();
-        inferlet2::store_set(CACHE_STATE_KEY, &state_json);
-        inferlet2::store_set(CACHE_FLAG_KEY, "true");
+        inferlet::store_set(CACHE_STATE_KEY, &state_json);
+        inferlet::store_set(CACHE_FLAG_KEY, "true");
 
         ctx = prefill_ctx;
     }

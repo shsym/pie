@@ -25,6 +25,13 @@ pub struct Queue {
 }
 
 #[derive(Debug)]
+pub struct DebugQueryResult {
+    receiver: oneshot::Receiver<String>,
+    result: Option<String>,
+    done: bool,
+}
+
+#[derive(Debug)]
 pub struct SynchronizationResult {
     receiver: oneshot::Receiver<()>,
     done: bool,
@@ -44,6 +51,18 @@ pub struct Subscription {
     receiver: mpsc::Receiver<String>,
     result: Option<String>,
     done: bool,
+}
+
+#[async_trait]
+impl Pollable for DebugQueryResult {
+    async fn ready(&mut self) {
+        if self.done {
+            return;
+        }
+        let res = (&mut self.receiver).await.unwrap();
+        self.result = Some(res);
+        self.done = true;
+    }
 }
 
 #[async_trait]
@@ -99,9 +118,17 @@ impl bindings::pie::inferlet::core::Host for InstanceState {
         Ok(self.arguments().to_vec())
     }
 
-    async fn debug_query(&mut self, _query: String) -> anyhow::Result<String> {
-        // Placeholder
-        Ok("Debug query not implemented.".to_string())
+    async fn debug_query(&mut self, query: String) -> anyhow::Result<Resource<DebugQueryResult>> {
+        let (tx, rx) = oneshot::channel();
+
+        let res = DebugQueryResult {
+            receiver: rx,
+            result: None,
+            done: false,
+        };
+
+        crate::runtime::Command::DebugQuery { query, event: tx }.dispatch()?;
+        Ok(self.table().push(res)?)
     }
 
     async fn send(&mut self, message: String) -> anyhow::Result<()> {
@@ -244,14 +271,7 @@ impl bindings::pie::inferlet::core::HostModel for InstanceState {
         let res = self.table().push(queue)?;
         Ok(res)
     }
-    async fn debug_query(
-        &mut self,
-        _this: Resource<Model>,
-        _query: String,
-    ) -> anyhow::Result<String> {
-        // Placeholder
-        Ok("Debug query not implemented.".to_string())
-    }
+
     async fn drop(&mut self, this: Resource<Model>) -> anyhow::Result<()> {
         self.table().delete(this)?;
         Ok(())
@@ -304,7 +324,56 @@ impl bindings::pie::inferlet::core::HostQueue for InstanceState {
         Ok(())
     }
 
+    async fn debug_query(
+        &mut self,
+        this: Resource<Queue>,
+        query: String,
+    ) -> anyhow::Result<Resource<DebugQueryResult>> {
+        let inst_id = self.id();
+        let queue = self.table().get(&this)?;
+        // Placeholder
+        let (tx, rx) = oneshot::channel();
+
+        let res = DebugQueryResult {
+            receiver: rx,
+            result: None,
+            done: false,
+        };
+
+        Command::DebugQuery {
+            inst_id,
+            stream_id: queue.stream_id,
+            query,
+            handle: tx,
+        }
+        .dispatch(queue.service_id)?;
+        Ok(self.table().push(res)?)
+    }
+
     async fn drop(&mut self, this: Resource<Queue>) -> anyhow::Result<()> {
+        self.table().delete(this)?;
+        Ok(())
+    }
+}
+
+impl bindings::pie::inferlet::core::HostDebugQueryResult for InstanceState {
+    async fn pollable(
+        &mut self,
+        this: Resource<DebugQueryResult>,
+    ) -> anyhow::Result<Resource<DynPollable>> {
+        subscribe(self.table(), this)
+    }
+
+    async fn get(&mut self, this: Resource<DebugQueryResult>) -> anyhow::Result<Option<String>> {
+        let result = self.table().get_mut(&this)?;
+        if result.done {
+            Ok(result.result.clone())
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn drop(&mut self, this: Resource<DebugQueryResult>) -> anyhow::Result<()> {
         self.table().delete(this)?;
         Ok(())
     }

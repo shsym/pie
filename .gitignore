@@ -213,4 +213,4 @@ logs
 .memory-bank
 
 # raw eval data
-eval/
+bench/

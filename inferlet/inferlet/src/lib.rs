@@ -190,8 +190,11 @@ pub fn store_list_keys() -> Vec<String> {
 }
 
 /// Executes a debug command and returns the result as a string.
-pub fn debug_query(query: &str) -> String {
-    core::debug_query(query)
+pub async fn debug_query(query: &str) -> String {
+    let future = core::debug_query(query);
+    let pollable = future.pollable();
+    AsyncPollable::new(pollable).wait_for().await;
+    future.get().unwrap()
 }
 
 impl Model {
@@ -262,11 +265,6 @@ impl Model {
     pub fn create_context(&self) -> Context {
         Context::new(self)
     }
-
-    /// Sends a debug message directly to the model and returns the response.
-    pub fn debug_query(&self, query: &str) -> String {
-        self.inner.debug_query(query)
-    }
 }
 
 /// Defines task priority levels.
@@ -291,6 +289,13 @@ impl Queue {
     /// Change the queue's priority.
     pub fn set_priority(&self, priority: Priority) {
         self.inner.set_priority(priority)
+    }
+
+    pub async fn debug_query(&self, query: &str) -> String {
+        let future = self.inner.debug_query(query);
+        let pollable = future.pollable();
+        AsyncPollable::new(pollable).wait_for().await;
+        future.get().unwrap()
     }
 }
 

@@ -1,5 +1,5 @@
 use futures::future::join_all;
-use inferlet2::Context;
+use inferlet::Context;
 use pico_args::Arguments;
 use std::ffi::OsString;
 use std::time::Instant;
@@ -73,11 +73,11 @@ async fn plan_and_generate_parallel(
     join_all(leaf_futures).await
 }
 
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     // --- Argument Parsing ---
     let mut args = Arguments::from_vec(
-        inferlet2::get_arguments()
+        inferlet::get_arguments()
             .into_iter()
             .map(OsString::from)
             .collect(),
@@ -102,7 +102,7 @@ async fn main() -> Result<(), String> {
     let start = Instant::now();
 
     // --- Setup ---
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let mut ctx = model.create_context();
     ctx.fill("<|begin_of_text|>");
     ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");

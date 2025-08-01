@@ -1,6 +1,6 @@
 wit_bindgen::generate!({
     path: "../../inferlet/wit",
-    world: "app",
+    world: "inferlet",
     pub_export_macro: true,
     export_macro_name: "export",
     with: {
@@ -10,13 +10,12 @@ wit_bindgen::generate!({
 });
 
 struct HelloWorld;
-
-impl exports::pie::nbi::run::Guest for HelloWorld {
+impl exports::pie::inferlet::run::Guest for HelloWorld {
     fn run() -> Result<(), String> {
         println!("Hello World!!");
 
-        let inst_id = pie::nbi::runtime::get_instance_id();
-        let version = pie::nbi::runtime::get_version();
+        let inst_id = pie::inferlet::core::get_instance_id();
+        let version = pie::inferlet::core::get_version();
         println!(
             "I am an instance (id: {}) running in the PIE runtime (version: {}) !",
             inst_id, version

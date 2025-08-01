@@ -4,7 +4,10 @@ use inferlet::wstd::http::{IntoBody, Request, Response, StatusCode};
 use serde_json;
 use std::time::Instant;
 
-use crate::models::{ChatCompletionRequest, OpenAiResponse, ResponseChoice, ResponseChoiceMessage, UsageStats, TokensDetails, CompletionTokensDetails};
+use crate::models::{
+    ChatCompletionRequest, CompletionTokensDetails, OpenAiResponse, ResponseChoice,
+    ResponseChoiceMessage, TokensDetails, UsageStats,
+};
 use crate::utils::{generate_random_string, get_unix_timestamp};
 
 /// Handle chat completion requests
@@ -28,37 +31,16 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
         }
     };
 
-    println!("Request for model: {}, with {} messages",
-             chat_request.model, chat_request.messages.len());
+    println!(
+        "Request for model: {}, with {} messages",
+        chat_request.model,
+        chat_request.messages.len()
+    );
 
     // Start timing for performance metrics
     let start = Instant::now();
 
-    // Get available models and initialize
-    let available_models = inferlet::available_models();
-    if available_models.is_empty() {
-        eprintln!("No Symphony models available");
-        return handle_error(res).await;
-    }
-
-    // Match the requested model
-    let model_name = chat_request.model.as_str();
-    if !available_models.contains(&model_name.to_string()) {
-        eprintln!("Model {} not found", model_name);
-        // Print available models for debugging
-        for model in available_models.iter() {
-            println!("Available model: {}", model);
-        }
-        return handle_error(res).await;
-    }
-
-    let model = match inferlet::Model::new(model_name) {
-        Some(model) => model,
-        None => {
-            eprintln!("Failed to create model");
-            return handle_error(res).await;
-        }
-    };
+    let model = inferlet::get_auto_model();
 
     let tokenizer = model.get_tokenizer();
     let mut ctx = model.create_context();
@@ -70,7 +52,10 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
     let mut has_system = false;
     for message in &chat_request.messages {
         if message.role == "system" {
-            ctx.fill(&format!("<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>", message.content));
+            ctx.fill(&format!(
+                "<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
+                message.content
+            ));
             has_system = true;
             break;
         }
@@ -87,8 +72,10 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
             continue; // Already handled system messages
         }
 
-        ctx.fill(&format!("<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
-                         message.role, message.content));
+        ctx.fill(&format!(
+            "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+            message.role, message.content
+        ));
     }
 
     // Add the assistant prefix for generating the response
@@ -102,7 +89,7 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
     let generated_text = ctx.generate_until("<|eot_id|>", max_tokens as usize).await;
     let elapsed = start.elapsed();
 
-    let token_ids = tokenizer.encode(&generated_text);
+    let token_ids = tokenizer.tokenize(&generated_text);
     println!("Generated {} tokens in {:?}", token_ids.len(), elapsed);
 
     // Create response
@@ -110,8 +97,10 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
     let timestamp = get_unix_timestamp();
 
     // Calculate token counts
-    let prompt_tokens = chat_request.messages.iter()
-        .map(|m| tokenizer.encode(&m.content).len())
+    let prompt_tokens = chat_request
+        .messages
+        .iter()
+        .map(|m| tokenizer.tokenize(&m.content).len())
         .sum::<usize>();
     let completion_tokens = token_ids.len();
     let total_tokens = prompt_tokens + completion_tokens;
@@ -121,19 +110,17 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
         object: "chat.completion".to_string(),
         created: timestamp,
         model: chat_request.model.clone(),
-        choices: vec![
-            ResponseChoice {
-                index: 0,
-                message: ResponseChoiceMessage {
-                    role: "assistant".to_string(),
-                    content: generated_text,
-                    refusal: None,
-                    annotations: vec![],
-                },
-                logprobs: None,
-                finish_reason: "stop".to_string(),
-            }
-        ],
+        choices: vec![ResponseChoice {
+            index: 0,
+            message: ResponseChoiceMessage {
+                role: "assistant".to_string(),
+                content: generated_text,
+                refusal: None,
+                annotations: vec![],
+            },
+            logprobs: None,
+            finish_reason: "stop".to_string(),
+        }],
         usage: UsageStats {
             prompt_tokens: prompt_tokens as u32,
             completion_tokens: completion_tokens as u32,
@@ -161,8 +148,11 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
         }
     };
 
-    println!("Sending response: {} characters generated in {:?}",
-             response_data.choices[0].message.content.len(), elapsed);
+    println!(
+        "Sending response: {} characters generated in {:?}",
+        response_data.choices[0].message.content.len(),
+        elapsed
+    );
 
     // Create response with proper headers
     let response = Response::builder()

@@ -20,6 +20,7 @@ wasmtime::component::bindgen!({
         "pie:inferlet/core/receive-result": core::ReceiveResult,
         "pie:inferlet/core/model": core::Model,
         "pie:inferlet/core/queue": core::Queue,
+        "pie:inferlet/core/debug-query-result": core::DebugQueryResult,
         "pie:inferlet/core/synchronization-result": core::SynchronizationResult,
         "pie:inferlet/tokenize/tokenizer": tokenize::Tokenizer,
         "pie:inferlet/output-text/distribution-result": output_text::DistributionResult,

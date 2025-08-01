@@ -389,6 +389,9 @@ def run_zmq_server(router, engine, config, model_metadata):
                     elif command == "sample_top_k_request":
                         res = engine.sample_top_k_request(request.sample_top_k_request)
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, sample_top_k=res)
+                    elif command == "debug_query_request":
+                        res = engine.debug_query_request(request.debug_query_request)
+                        response = l4m_pb2.Response(correlation_id=request.correlation_id, debug_query=res)
                     elif command == "get_info":
                         print("Getting info from the engine.")
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(

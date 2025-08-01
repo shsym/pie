@@ -51,7 +51,7 @@ interface core {
     store-list-keys: func() -> list<string>;
 
     // Executes a debug command and returns the result as a string
-    debug-query: func(query: string) -> string;
+    debug-query: func(query: string) -> debug-query-result;
 
     // Resource representing a specific model instance
     resource model {
@@ -63,7 +63,6 @@ interface core {
         get-prompt-template: func() -> string;       // Returns the prompt formatting template in Tera
         get-service-id: func() -> u32;
         create-queue: func() -> queue;               // Create a new command queue
-        debug-query: func(query: string) -> string;  // Sends a message to the model and returns the response
     }
 
     // Defines task priority levels
@@ -78,6 +77,13 @@ interface core {
         get-service-id: func() -> u32;
         synchronize: func() -> synchronization-result; // Begin synchronization process
         set-priority: func(priority: priority);     // Change the queue's priority
+        debug-query: func(query: string) -> debug-query-result;  // Sends a message to the model and returns the response
+    }
+
+    // Debug query response
+    resource debug-query-result {
+        pollable: func() -> pollable;
+        get: func() -> option<string>;
     }
 
     // Result of a synchronization attempt

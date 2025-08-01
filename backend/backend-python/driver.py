@@ -22,7 +22,8 @@ from l4m_pb2 import (  # pylint: disable=no-name-in-module
     ForwardTextResponse,
     BatchFillBlock,
     Distribution,
-    BatchSyncResponse, BatchForwardText, BatchForwardTextResponse
+    BatchSyncResponse, BatchForwardText, BatchForwardTextResponse,
+    BatchDebugQueryRequest, BatchDebugQueryResponse, DebugQueryResponse
 )
 
 from l4m_vision_pb2 import BatchEmbedImage  # pylint: disable=no-name-in-module
@@ -571,6 +572,20 @@ class Driver:
         # torch.cuda.synchronize()
         # print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
         return BatchForwardTextResponse(
+            items=responses
+        )
+
+    def debug_query_request(self, cmds: BatchDebugQueryRequest):
+
+        responses = []
+        for cmd in cmds.items:
+            if cmd.query == "ping":
+                response = DebugQueryResponse(
+                    response="pong"
+                )
+                responses.append(response)
+
+        return BatchDebugQueryResponse(
             items=responses
         )
 

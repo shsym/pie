@@ -179,6 +179,15 @@ message BatchSampleTopKRequest {
   repeated SampleTopKRequest items = 1;
 }
 
+message DebugQueryRequest {
+  string query = 1;
+}
+
+message BatchDebugQueryRequest {
+  // A batch of debug query requests.
+  repeated DebugQueryRequest items = 1;
+}
+
 // The response containing decoded tokens.
 message SampleTopKResponse {
   // The decoded token IDs.
@@ -225,6 +234,17 @@ message BatchForwardTextResponse {
   repeated ForwardTextResponse items = 1;
 }
 
+message DebugQueryResponse {
+  // The response to the debug query.
+  string response = 1;
+}
+
+message BatchDebugQueryResponse {
+  // A batch of debug query responses.
+  repeated DebugQueryResponse items = 1;
+}
+
+
 message Tokenizer {
   map<uint32, bytes> merge_table = 1;
   map<string, uint32> special_tokens = 2;
@@ -246,10 +266,10 @@ message Request {
     BatchCopyBlock copy_block = 8;
     BatchDecodeTokenDistribution decode_token_distribution = 9;
     BatchSampleTopKRequest sample_top_k_request = 10;
-    GetInfoRequest get_info = 11;
+    BatchDebugQueryRequest debug_query_request = 11;
+    GetInfoRequest get_info = 12;
   }
 }
-
 
 message Response {
   uint32 correlation_id = 1;
@@ -259,5 +279,6 @@ message Response {
     GetInfoResponse get_info = 3;
     BatchSyncResponse batch_sync = 4;
     BatchForwardTextResponse forward_text = 5;
+    BatchDebugQueryResponse debug_query = 6;
   }
 }
