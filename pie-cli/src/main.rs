@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use pie::{
-    Config as EngineConfig,
+    BatchingStrategyConfiguration, Config as EngineConfig,
     auth::{create_jwt, init_secret},
     client::{self, Client},
 };
@@ -17,6 +17,7 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Helper}; // The Helper trait is still needed
 use serde::Deserialize;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{
     env,
     fs::{self},
@@ -74,6 +75,15 @@ pub struct StartArgs {
     /// Enable verbose console logging.
     #[arg(long, short)]
     pub verbose: bool,
+
+    #[arg(long)]
+    pub batching_strategy: Option<String>,
+    /// The 'k' parameter for the batching strategy.
+    #[arg(long)]
+    pub batching_strategy_k: Option<u32>,
+    /// The 't' parameter for the batching strategy.
+    #[arg(long)]
+    pub batching_strategy_t: Option<u32>,
 }
 
 /// Helper for clap to expand `~` in path arguments.
@@ -130,7 +140,9 @@ struct ConfigFile {
     cache_dir: Option<PathBuf>,
     verbose: Option<bool>,
     log: Option<PathBuf>,
-    // MODIFIED: Added field to capture backend configurations.
+    batching_strategy: Option<String>,
+    batching_strategy_k: Option<u32>,
+    batching_strategy_t: Option<u32>,
     #[serde(default)]
     backend: Vec<toml::Value>,
 }
@@ -643,6 +655,36 @@ fn build_configs(args: &StartArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
             .map(char::from)
             .collect()
     });
+    let strategy_name = args
+        .batching_strategy
+        .clone()
+        .or(file_config.batching_strategy)
+        .unwrap_or_else(|| "adaptive".to_string());
+
+    let k = args
+        .batching_strategy_k
+        .or(file_config.batching_strategy_k)
+        .unwrap_or(8) as usize;
+
+    let t_millis = args
+        .batching_strategy_t
+        .or(file_config.batching_strategy_t)
+        .unwrap_or(16) as u64;
+    let t = Duration::from_millis(t_millis);
+
+    // 2. Construct the enum based on the strategy name string
+    let batching_strategy = match strategy_name.to_lowercase().as_str() {
+        "adaptive" => Some(BatchingStrategyConfiguration::Adaptive),
+        "k" => Some(BatchingStrategyConfiguration::KOnly { k }),
+        "t" => Some(BatchingStrategyConfiguration::TOnly { t }),
+        "kort" => Some(BatchingStrategyConfiguration::KOrT { k, t }),
+        other => {
+            return Err(anyhow!(
+                "Unknown batching strategy: '{}'. Supported values are: 'adaptive', 'k', 't', 'kort'.",
+                other
+            ));
+        }
+    };
 
     let engine_config = EngineConfig {
         host: args
@@ -658,6 +700,7 @@ fn build_configs(args: &StartArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
             .unwrap_or_else(|| get_pie_home().unwrap().join("programs")),
         verbose: args.verbose || file_config.verbose.unwrap_or(false),
         log: args.log.clone().or(file_config.log),
+        batching_strategy,
     };
 
     // Return both the engine config and the backend configs

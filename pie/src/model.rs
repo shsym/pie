@@ -15,7 +15,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicBool;
 
 use serde::Serialize;
-use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot};
@@ -47,6 +49,27 @@ const GLOBAL_OWNER_ID: InstanceId = InstanceId::from_u128(0);
 
 static AVAILABLE_MODELS: std::sync::LazyLock<boxcar::Vec<(String, usize)>> =
     std::sync::LazyLock::new(boxcar::Vec::new);
+
+/// Defines the configurable batching strategy options.
+#[derive(Debug, Clone, Copy)]
+pub enum BatchingStrategyConfiguration {
+    /// Batch based only on a timeout.
+    TOnly { t: Duration },
+    /// Batch based only on the number of items.
+    KOnly { k: usize },
+    /// Batch based on whichever condition is met first: size `k` or timeout `t`.
+    KOrT { k: usize, t: Duration },
+    /// Use the adaptive (manual trigger) strategy.
+    Adaptive,
+}
+
+static FORWARD_STRATEGY: OnceLock<BatchingStrategyConfiguration> = OnceLock::new();
+
+pub fn set_batching_strategy(
+    strategy: BatchingStrategyConfiguration,
+) -> Result<(), BatchingStrategyConfiguration> {
+    FORWARD_STRATEGY.set(strategy)
+}
 
 /// Holds shared triggers for manual batching strategies.
 struct ManualTriggers {
@@ -376,9 +399,21 @@ impl Batchable<BatchGroup> for Command {
                 //batching::t_only(Duration::from_millis(14))
                 //batching::eager()
 
-                Box::new(batching::ManualStrategy::new(
-                    TRIGGERS.fill_block_trigger.clone(),
-                ))
+                // Box::new(batching::ManualStrategy::new(
+                //     TRIGGERS.fill_block_trigger.clone(),
+                // ));
+
+                let config = FORWARD_STRATEGY
+                    .get()
+                    .unwrap_or(&BatchingStrategyConfiguration::Adaptive);
+                match *config {
+                    BatchingStrategyConfiguration::TOnly { t } => batching::t_only(t),
+                    BatchingStrategyConfiguration::KOnly { k } => batching::k_only(k, None),
+                    BatchingStrategyConfiguration::KOrT { k, t } => batching::k_or_t(t, k, None),
+                    BatchingStrategyConfiguration::Adaptive => Box::new(
+                        batching::ManualStrategy::new(TRIGGERS.forward_text_trigger.clone()),
+                    ),
+                }
             }
             Command::CopyKvPage { .. } => batching::eager(),
             Command::MaskKvPage { .. } => batching::eager(),
@@ -388,9 +423,21 @@ impl Batchable<BatchGroup> for Command {
             }
 
             Command::ForwardText { .. } => {
-                Box::new(batching::ManualStrategy::new(
-                    TRIGGERS.forward_text_trigger.clone(),
-                ))
+                // Box::new(batching::ManualStrategy::new(
+                //     TRIGGERS.forward_text_trigger.clone(),
+                // ))
+
+                let config = FORWARD_STRATEGY
+                    .get()
+                    .unwrap_or(&BatchingStrategyConfiguration::Adaptive);
+                match *config {
+                    BatchingStrategyConfiguration::TOnly { t } => batching::t_only(t),
+                    BatchingStrategyConfiguration::KOnly { k } => batching::k_only(k, None),
+                    BatchingStrategyConfiguration::KOrT { k, t } => batching::k_or_t(t, k, None),
+                    BatchingStrategyConfiguration::Adaptive => Box::new(
+                        batching::ManualStrategy::new(TRIGGERS.forward_text_trigger.clone()),
+                    ),
+                }
 
                 //batching::eager()
             }

@@ -32,7 +32,9 @@ async fn main() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .unwrap_or_else(|| "Hello from the inferlet!".to_string());
 
-    inferlet::send(&msg);
+    println!("{}", msg);
+
+
 
     Ok(())
 }

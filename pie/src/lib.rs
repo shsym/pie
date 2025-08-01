@@ -27,6 +27,7 @@ mod utils;
 use crate::auth::{create_jwt, init_secret};
 use crate::kvs::KeyValueStore;
 use crate::messaging::{PubSub, PushPull};
+pub use crate::model::{BatchingStrategyConfiguration, set_batching_strategy};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
 use crate::server::Server;
@@ -42,6 +43,7 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub verbose: bool,
     pub log: Option<PathBuf>,
+    pub batching_strategy: Option<BatchingStrategyConfiguration>,
 }
 
 /// Runs the PIE server logic within an existing Tokio runtime.
@@ -66,6 +68,11 @@ pub async fn run_server(config: Config, mut shutdown_rx: oneshot::Receiver<()>) 
         tracing::info!("Use this token to authenticate: {}", token);
     } else {
         tracing::info!("Authentication is disabled.");
+    }
+
+    if let Some(batching_strategy) = &config.batching_strategy {
+        tracing::info!("Custom batching strategy is configured.");
+        set_batching_strategy(*batching_strategy);
     }
 
     // Set up core services

@@ -222,6 +222,9 @@ impl Service for Runtime {
             }
 
             Command::DebugQuery { query, event } => match query.as_str() {
+                "ping" => {
+                    event.send("pong".to_string()).unwrap();
+                }
                 "get_instance_count" => {
                     let count = self.running_instances.len();
                     event.send(count.to_string()).unwrap();
@@ -232,19 +235,33 @@ impl Service for Runtime {
                 }
                 // Add the new queries here
                 "list_running_instances" => {
-                    let instances: Vec<String> = self.running_instances
+                    let instances: Vec<String> = self
+                        .running_instances
                         .iter()
-                        .map(|item| format!("Instance ID: {}, Program Hash: {}", item.key(), item.value().hash))
+                        .map(|item| {
+                            format!(
+                                "Instance ID: {}, Program Hash: {}",
+                                item.key(),
+                                item.value().hash
+                            )
+                        })
                         .collect();
                     event.send(instances.join("\n")).unwrap();
                 }
                 "list_in_memory_programs" => {
-                    let keys: Vec<String> = self.programs_in_memory.iter().map(|item| item.key().clone()).collect();
+                    let keys: Vec<String> = self
+                        .programs_in_memory
+                        .iter()
+                        .map(|item| item.key().clone())
+                        .collect();
                     event.send(keys.join("\n")).unwrap();
                 }
                 "get_cache_dir" => {
-                    event.send(self.cache_dir.to_string_lossy().to_string()).unwrap();
+                    event
+                        .send(self.cache_dir.to_string_lossy().to_string())
+                        .unwrap();
                 }
+
                 _ => {
                     event.send(format!("Unknown query: {}", query)).unwrap();
                 }
