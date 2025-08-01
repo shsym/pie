@@ -6,8 +6,7 @@ async fn main() -> Result<(), String> {
 
     let max_num_outputs = 32;
 
-    let model = inferlet::Model::new(&inferlet::available_models()[0]).unwrap();
-
+    let model = inferlet::get_auto_model();
     let mut common = model.create_context();
     common.fill("<|begin_of_text|>");
     common.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");

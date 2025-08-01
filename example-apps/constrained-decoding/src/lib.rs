@@ -1,20 +1,18 @@
-use inferlet2::sampler::Sampler;
-use inferlet2::traits::Tokenize;
-use inferlet2::traits::tokenize::Tokenizer;
-use llguidance::api::GrammarInit;
-use llguidance::earley::SlicedBiasComputer;
-use llguidance::{
-    Constraint, ParserFactory,
-    api::TopLevelGrammar,
-    toktrie::{InferenceCapabilities, TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv},
-};
-use std::sync::Arc;
+mod tokenizer;
+
+use crate::tokenizer::BytePairEncoder;
+use inferlet::sampler::Sampler;
+use inferlet::traits::tokenize::Tokenizer;
+use llguidance::api::TopLevelGrammar;
+use llguidance::{Matcher, ParserFactory};
+use pico_args::Arguments;
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::time::Instant;
 
+/// Default grammar to use if none is provided via command-line arguments.
 const JSON_GRAMMAR: &str = r##"
-
 ?start: value
-
 ?value: object
         | array
         | string
@@ -22,215 +20,193 @@ const JSON_GRAMMAR: &str = r##"
         | "true"             -> true
         | "false"            -> false
         | "null"             -> null
-
 array  : "[" [value ("," value)*] "]"
 object : "{" [pair ("," pair)*] "}"
 pair   : string ":" value
-
 string : ESCAPED_STRING
-
 %import common.ESCAPED_STRING
 %import common.SIGNED_NUMBER
 %import common.WS
-
 %ignore WS
-
 "##;
 
-struct TrieTokenizer {
-    tok_trie: TokTrie,
-}
+/// Defines the command-line interface and help message.
+const HELP: &str = r#"
+Usage: program [OPTIONS]
 
-impl TrieTokenizer {
-    fn new(
-        words: &Vec<Vec<u8>>,
-        tok_eos: u32,
-        tok_bos: Option<u32>,
-        tok_pad: Option<u32>,
-        tok_unk: Option<u32>,
-        tok_end_of_turn: Option<u32>,
-    ) -> Self {
-        let info = TokRxInfo {
-            vocab_size: words.len() as u32,
-            tok_eos,
-            tok_bos,
-            tok_pad,
-            tok_unk,
-            tok_end_of_turn,
-        };
-        let tok_trie = TokTrie::from(&info, &words);
-        TrieTokenizer { tok_trie }
-    }
+A constrained sampler inferlet using a user-provided grammar.
 
-    fn to_env(self) -> TokEnv {
-        Arc::new(self)
-    }
-}
-
-impl TokenizerEnv for TrieTokenizer {
-    fn tok_trie(&self) -> &TokTrie {
-        &self.tok_trie
-    }
-
-    fn tokenize_bytes(&self, s: &[u8]) -> Vec<TokenId> {
-        self.tok_trie.greedy_tokenize(s)
-    }
-}
-
-fn get_parser_factory(env: &TokEnv) -> ParserFactory {
-    let mut fact = ParserFactory::new(
-        &env,
-        InferenceCapabilities {
-            ff_tokens: false,             // can the engine append multiple tokens?
-            backtrack: false,             // can the engine remove generated tokens?
-            conditional_ff_tokens: false, // not used
-            fork: false,                  // not used
-        },
-        &SlicedBiasComputer::general_slices(),
-    )
-    .unwrap();
-    fact.set_stderr_log_level(2);
-    fact.set_buffer_log_level(0);
-    fact
-}
+Options:
+  -p, --prompt <STRING>    The prompt to send to the model.
+                           (default: "what is the capital of France? output data")
+  -g, --grammar <STRING>   The Lark grammar to constrain the output.
+                           (default: A JSON grammar)
+  -n, --max-tokens <INT>   The maximum number of new tokens to generate.
+                           (default: 128)
+  -h, --help               Print help information.
+"#;
 
 struct ConstrainedSampler {
-    constraint: Constraint,
+    pub constraint: Matcher, // Public to allow advancing tokens from main
+    eos_token_id: u32,
 }
 
 impl ConstrainedSampler {
-    pub fn new(
-        tokenizer: Tokenizer,
-        lark: &str,
-        eos_token: &str,
-        bos_token: Option<&str>,
-        pad_token: Option<&str>,
-        unk_token: Option<&str>,
-        end_of_turn_token: Option<&str>,
-    ) -> Self {
-        //let words = l4m::get_vocabs();
-        let words = tokenizer.get_vocabs();
-        let eos_token = tokenizer.tokenize(eos_token)[0];
-        let bos_token = bos_token.map(|s| tokenizer.tokenize(s)[0]);
-        let pad_token = pad_token.map(|s| tokenizer.tokenize(s)[0]);
-        let unk_token = unk_token.map(|s| tokenizer.tokenize(s)[0]);
-        let end_of_turn_token = end_of_turn_token.map(|s| tokenizer.tokenize(s)[0]);
+    pub fn new(tokenizer: Tokenizer, lark: &str, eos_token_id: u32) -> Self {
+        let (ranks, words) = tokenizer.get_vocabs();
+        let rank_map: HashMap<u32, Vec<u8>> = ranks.into_iter().zip(words).collect();
 
-        let tokenizer = TrieTokenizer::new(
-            &words,
-            eos_token,
-            bos_token,
-            pad_token,
-            unk_token,
-            end_of_turn_token,
-        )
-        .to_env();
+        let mut special_tokens = HashMap::new();
+
+        special_tokens.insert("<|begin_of_text|>".to_string(), 128000);
+        special_tokens.insert("<|end_of_text|>".to_string(), 128001);
+        special_tokens.insert("<|start_header_id|>".to_string(), 128006);
+        special_tokens.insert("<|end_header_id|>".to_string(), 128007);
+        special_tokens.insert("<|eot_id|>".to_string(), 128009);
+
+        let pattern = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+        let tokenizer = BytePairEncoder::new(rank_map, special_tokens, pattern, eos_token_id);
+        let tokenizer_env = tokenizer.unwrap().to_env();
 
         let grm = TopLevelGrammar::from_lark(lark.to_string());
 
-        let quiet = true;
+        let factory = ParserFactory::new_simple(&tokenizer_env).unwrap();
+        let parser = factory.create_parser(grm);
 
-        let parser = get_parser_factory(&tokenizer)
-            .create_parser_from_init(
-                GrammarInit::Serialized(grm),
-                if quiet { 0 } else { 2 },
-                if quiet { 1 } else { 2 },
-            )
-            .unwrap();
-
-        let constraint = Constraint::new(parser);
-        ConstrainedSampler { constraint }
+        let constraint = Matcher::new(parser);
+        ConstrainedSampler {
+            constraint,
+            eos_token_id,
+        }
     }
 }
 
 impl Sampler for ConstrainedSampler {
-    fn sample(&mut self, token_ids: &[u32], logits: &[f32]) -> u32 {
-        let res = self.constraint.compute_mask().unwrap();
+    fn sample(&mut self, token_ids: &[u32], probs: &[f32]) -> u32 {
+        let res = self.constraint.compute_mask();
 
-        let sampled_token_id = if let Some(mask) = &res.sample_mask {
-            let mut max_logit = f32::NEG_INFINITY;
-            let mut max_logit_idx = 0;
-            let mut sampled = false;
+        if let Err(e) = res {
+            return self.eos_token_id;
+        }
 
-            // traverse the token_ids and return the first token_id that is allowed by the mask
-            for (i, token_id) in token_ids.iter().enumerate() {
-                let token_id = *token_id as TokenId;
-                let logit = logits[i];
-                if mask.is_allowed(token_id) {
-                    sampled = true;
-                    if logit > max_logit {
-                        max_logit = logit;
-                        max_logit_idx = i;
-                    }
+        let res = res.unwrap();
+
+        if res.is_empty() {
+            return self.eos_token_id;
+        }
+
+        let mut max_prob = f32::NEG_INFINITY;
+        let mut best_token = None;
+
+        // Find the highest-probability token that is allowed by the grammar mask.
+        for (i, &token_id) in token_ids.iter().enumerate() {
+            if res.is_allowed(token_id) {
+                if probs[i] > max_prob {
+                    max_prob = probs[i];
+                    best_token = Some(token_id);
                 }
             }
+        }
 
-            // check if any token was selected
-            if !sampled {
-                //println!("No token selected");
-                // if no token was selected, then select one allowed by the mask
-                mask.first_bit_set().unwrap() as u32
-            } else {
-                //println!("Token selected: {:?}", max_logit_idx);
-                token_ids[max_logit_idx]
-            }
+        let sampled_token_id = if let Some(token) = best_token {
+            token
         } else {
-            //println!("No mask found");
-            token_ids[0]
+            //println!("\n[Warning] No valid token found in model's candidates.");
+            return res.first_bit_set().unwrap_or(0) as u32;
         };
 
-        self.constraint
-            .commit_token(Some(sampled_token_id))
-            .unwrap();
+        // Commit the chosen token to advance the parser's state.
+        self.constraint.consume_token(sampled_token_id).unwrap();
+
         sampled_token_id
     }
 }
 
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
+    // 1. Get arguments from the inferlet environment and prepare the parser.
+    let mut args = Arguments::from_vec(
+        inferlet::get_arguments()
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+    );
+
+    // 2. Handle the --help flag.
+    if args.contains(["-h", "--help"]) {
+        println!("{}", HELP);
+        return Ok(());
+    }
+
+    // 3. Parse arguments, falling back to defaults if they are not provided.
+    let prompt = args
+        .opt_value_from_str(["-p", "--prompt"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "what is the capital of France? output data".to_string());
+
+    let grammar = args
+        .opt_value_from_str(["-g", "--grammar"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| JSON_GRAMMAR.to_string());
+
+    let max_tokens: usize = args
+        .opt_value_from_str(["-n", "--max-tokens"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or(128);
+
+    // 4. Ensure no unknown arguments were passed.
+    let remaining = args.finish();
+    if !remaining.is_empty() {
+        return Err(format!(
+            "Unknown arguments found: {:?}. Use --help for usage.",
+            remaining
+        ));
+    }
+
+    // --- Main logic starts here ---
     let start = Instant::now();
 
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let tokenizer = model.get_tokenizer();
-
     let mut ctx = model.create_context();
 
-    let prompt = "what is the capital of France? output data";
+    let eot_token_id = tokenizer.tokenize("<|eot_id|>")[0];
 
-    let mut sampler = ConstrainedSampler::new(
-        tokenizer.clone(),
-        JSON_GRAMMAR,
-        "<|end_of_text|>",
-        Some("<|begin_of_text|>"),
-        None,
-        None,
-        Some("<|eot_id|>"),
-    );
-    let mut stop_condition = inferlet2::stop_condition::any(
-        inferlet2::stop_condition::Until::new(tokenizer.tokenize("<|eot_id|>")),
-        inferlet2::stop_condition::Length::new(128),
-    );
-    ctx.fill("<|begin_of_text|>");
-    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
-    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\n");
-    ctx.fill(&prompt);
-    ctx.fill("<|eot_id|>");
-    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    let mut sampler = ConstrainedSampler::new(tokenizer.clone(), &grammar, eot_token_id);
 
+    // Assemble the full prompt that the model will process
+    let full_prompt = format!(
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+        prompt
+    );
+
+    // 6. Fill the model's context with the prompt
+    ctx.fill(&full_prompt);
+
+    // 8. Set up the stop condition.
+    let mut stop_condition = inferlet::stop_condition::any(
+        inferlet::stop_condition::Until::new(vec![eot_token_id]),
+        inferlet::stop_condition::Length::new(max_tokens),
+    );
+
+    // 9. Generate the output.
     let output = ctx.generate(&mut sampler, &mut stop_condition).await;
     let output_token_ids = tokenizer.tokenize(&output);
 
     println!(
-        "Output: {:?} (total elapsed: {:?})",
+        "\nOutput: {} (total elapsed: {:?})",
         output,
         start.elapsed()
     );
 
-    // compute per token latency
-    println!(
-        "Per token latency: {:?}",
-        start.elapsed() / output_token_ids.len() as u32
-    );
+    // Compute per-token latency, avoiding division by zero.
+    if !output_token_ids.is_empty() {
+        println!(
+            "Per token latency: {:?}",
+            start.elapsed() / (output_token_ids.len() as u32)
+        );
+    }
 
     Ok(())
 }

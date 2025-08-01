@@ -1,8 +1,28 @@
-use inferlet2::sampler::{self, Sampler};
-use inferlet2::stop_condition::{self, StopCondition};
-
-use inferlet2::Context;
+use inferlet::Context;
+use inferlet::sampler::{self, Sampler};
+use inferlet::stop_condition::{self, StopCondition};
+use inferlet::traits::Tokenize;
+use pico_args::Arguments;
+use std::ffi::OsString;
 use std::time::Instant;
+
+/// Defines the command-line interface and help message.
+const HELP: &str = r#"
+Usage: program [OPTIONS]
+
+A simple inferlet to run a chat model with a configurable attention sink.
+
+Options:
+  -p, --prompt <STRING>        The prompt to send to the model.
+                               (default: "Explain LLM decoding process in ELI5.")
+  -n, --max-tokens <INT>       The maximum number of new tokens to generate.
+                               (default: 512)
+  -s, --sink-size <INT>        The initial size of the attention sink.
+                               (default: 64)
+  -w, --sink-window <INT>      The sliding window size for the attention sink.
+                               (default: 32)
+  -h, --help                   Print help information.
+"#;
 
 /// Generates text autoregressively using an attention sink to manage a rolling KV cache.
 ///
@@ -58,20 +78,65 @@ pub async fn generate_with_attention_sink<S: Sampler, C: StopCondition>(
     ctx.tokenizer.detokenize(&generated_token_ids)
 }
 
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
+    // 1. Get arguments from the inferlet environment and prepare the parser.
+    let mut args = Arguments::from_vec(
+        inferlet::get_arguments()
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+    );
+
+    // 2. Handle the --help flag.
+    if args.contains(["-h", "--help"]) {
+        println!("{}", HELP);
+        return Ok(());
+    }
+
+    // 3. Parse arguments, falling back to defaults if they are not provided.
+    let max_num_outputs: usize = args
+        .opt_value_from_str(["-n", "--max-tokens"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or(512);
+
+    let attention_sink_initial_size: usize = args
+        .opt_value_from_str(["-s", "--sink-size"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or(64);
+
+    let attention_sink_window_size: usize = args
+        .opt_value_from_str(["-w", "--sink-window"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or(32);
+
+    let prompt = args
+        .opt_value_from_str(["-p", "--prompt"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "Explain LLM decoding process in ELI5.".to_string());
+
+    // 4. Ensure no unknown arguments were passed.
+    let remaining = args.finish();
+    if !remaining.is_empty() {
+        return Err(format!(
+            "Unknown arguments found: {:?}. Use --help for usage.",
+            remaining
+        ));
+    }
+
+    // --- Main logic starts here ---
     let start = Instant::now();
 
-    let max_num_outputs = 512;
-    let attention_sink_initial_size = 64; // Number of tokens to speculate in parallel
-    let attention_sink_window_size = 32;
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let tokenizer = model.get_tokenizer();
 
     let mut ctx = Context::new(&model);
     ctx.fill("<|begin_of_text|>");
     ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
-    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain LLM decoding process in ELI5.<|eot_id|>");
+    ctx.fill(&format!(
+        "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>",
+        prompt
+    ));
     ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
     let mut sampler = sampler::GreedySampler::new();
@@ -81,12 +146,7 @@ async fn main() -> Result<(), String> {
         stop_condition::Length::new(max_num_outputs),
     );
 
-    println!(
-        "Starting generation with Attention Sink (initial_size={}, window_size={})",
-        attention_sink_initial_size, attention_sink_window_size
-    );
-
-    // Call the standalone function
+    // Call the standalone function with the parsed arguments
     let output = generate_with_attention_sink(
         &mut ctx,
         &mut sampler,

@@ -1,11 +1,11 @@
-use inferlet2::wstd::time::Duration;
+use inferlet::wstd::time::Duration;
 use pico_args::Arguments;
 use rand::Rng;
 use std::ffi::OsString;
 
 // --- Help Message and Prompt Template ---
 const HELP: &str = r#"
-A benchmark script for ReAct-style function calling scenarios, implemented with inferlet2.
+A benchmark script for ReAct-style function calling scenarios, implemented with inferlet.
 This script is designed to be a direct comparison to its Python equivalent.
 
 USAGE:
@@ -34,10 +34,10 @@ After you perform an action, you will receive an observation with the result. Yo
 Question: Who is the director of the movie that won the Best Picture Oscar in the year the James Webb Space Telescope was launched?
 "#;
 
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let mut args = Arguments::from_vec(
-        inferlet2::get_arguments()
+        inferlet::get_arguments()
             .into_iter()
             .map(OsString::from)
             .collect(),
@@ -70,7 +70,7 @@ async fn main() -> Result<(), String> {
     let user_prompt = format!("TASK ID: {}\n{}", task_id, REACT_PROMPT_TEMPLATE);
 
     // 4. Set up the model and context.
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let mut ctx = model.create_context();
 
     // 5. Fill the context with the initial prompt structure.
@@ -89,7 +89,7 @@ async fn main() -> Result<(), String> {
 
         // c. Simulate tool execution delay.
         if function_call_delay > 0 {
-            inferlet2::wstd::task::sleep(Duration::from_millis(function_call_delay)).await;
+            inferlet::wstd::task::sleep(Duration::from_millis(function_call_delay)).await;
         }
 
         // d. Fill the context with a placeholder observation.

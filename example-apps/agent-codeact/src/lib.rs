@@ -70,10 +70,10 @@ The final answer is that the sum of the first 10 prime numbers is 129."#,
 ];
 
 // --- Main Application Logic ---
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let mut args = Arguments::from_vec(
-        inferlet2::get_arguments()
+        inferlet::get_arguments()
             .into_iter()
             .map(OsString::from)
             .collect(),
@@ -95,7 +95,7 @@ async fn main() -> Result<(), String> {
         .unwrap_or(256);
 
     // Set up the model and context
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let mut ctx = model.create_context();
 
     // Fill the context with the initial prompt structure

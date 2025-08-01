@@ -1,4 +1,4 @@
-use inferlet2::Context;
+use inferlet::Context;
 use std::time::Instant;
 
 /// Calculates the normalized probability of a list of candidate strings being generated from a given context.
@@ -77,10 +77,10 @@ pub async fn validate_outputs(ctx: &Context, candidates: &[String]) -> Vec<(Stri
         .collect()
 }
 
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let mut ctx = Context::new(&model);
 
     // 1. Set up the initial context (the "prompt")

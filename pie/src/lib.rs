@@ -11,7 +11,6 @@ pub mod client;
 mod backend;
 mod batching;
 mod bindings;
-mod bindings2;
 mod instance;
 mod kvs;
 mod messaging;

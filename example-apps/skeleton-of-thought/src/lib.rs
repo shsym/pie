@@ -1,85 +1,132 @@
 use futures::future::join_all;
-use inferlet::{Context, Model};
+use inferlet2::Context;
+use pico_args::Arguments;
+use std::ffi::OsString;
+use std::time::Instant;
 
-// Constants with improved prompt templates
-const PLAN_PROMPT_TEMPLATE: &str = "Generate up to {} key points that outline the answer to the following question: {}. Each point should be a concise statement of a main idea, enclosed in <point> tags. Do not elaborate on the points yet. Keep your entire response within 30 words.";
-const COMPLETE_PROMPT_TEMPLATE: &str = "Elaborate on the following point: {}. Your response should be complete and only concerned with this point. Keep it concise and within 80 words.";
+// --- Constants ---
 const ASSISTANT_PREFIX: &str = "<|start_header_id|>assistant<|end_header_id|>\n\n";
 const STOP_TOKEN: &str = "<|eot_id|>";
-const MAX_TOKENS: usize = 32;
+
+const HELP: &str = "
+Usage: plan_and_generate_parallel [OPTIONS]
+
+A program that first generates a plan (a list of key points) for a question, 
+and then elaborates on each point concurrently.
+
+Options:
+  -p, --num-points <POINTS>  Sets the maximum number of key points to generate in the plan [default: 3]
+  -t, --plan-tokens <TOKENS> Sets the max tokens for the planning generation [default: 80]
+  -e, --elab-tokens <TOKENS> Sets the max tokens for each elaboration generation [default: 80]
+  -h, --help                 Prints this help message
+";
 
 /// Generates a high-level plan and elaborates on each point in parallel.
-///
-/// # Arguments
-/// - `ctx`: The initial context containing the system prompt.
-/// - `question`: The question to answer.
-/// - `max_points`: The maximum number of points to generate in the plan.
-///
-/// # Returns
-/// A vector of elaborated responses, one for each point.
 async fn plan_and_generate_parallel(
-    mut ctx: Context,
+    ctx: Context, // `ctx` is consumed, as it's only used for forking.
     question: &str,
     max_points: usize,
+    plan_max_tokens: usize,
+    elab_max_tokens: usize,
 ) -> Vec<String> {
-    // Fork a context for generating the plan, preserving the original ctx
+    // 1. --- Planning Stage ---
+    // Fork a context for generating the plan.
     let mut plan_ctx = ctx.fork();
-    let plan_prompt = format!("{} {} {}", PLAN_PROMPT_TEMPLATE, max_points, question);
-    plan_ctx.fill(&plan_prompt);
+    let plan_prompt = format!(
+        "Generate up to {} key points that outline the answer to the following question: {}. Each point must be enclosed in <point> tags.",
+        max_points, question
+    );
+    plan_ctx.fill(&format!(
+        "<|start_header_id|>user<|end_header_id|>\n\n{}{}",
+        plan_prompt, STOP_TOKEN
+    ));
     plan_ctx.fill(ASSISTANT_PREFIX);
-    let output = plan_ctx.generate_until(STOP_TOKEN, MAX_TOKENS).await;
+    let output = plan_ctx.generate_until(STOP_TOKEN, plan_max_tokens).await;
 
-    // Robustly parse points from the output
-    let mut points = output
+    // 2. --- Point Parsing ---
+    // Robustly parse points from the output.
+    let points: Vec<String> = output
         .split("<point>")
-        .skip(1) // Skip any text before the first "<point>"
-        .filter_map(|s| {
-            let trimmed = s.trim();
-            if let Some(end) = trimmed.find("</point>") {
-                Some(trimmed[..end].to_string())
-            } else {
-                None // Ignore incomplete or malformed tags
-            }
-        })
-        .collect::<Vec<_>>();
+        .skip(1)
+        .filter_map(|s| s.split("</point>").next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
-    // check if points is empty
     if points.is_empty() {
-        points = vec!["Dummy Point 1".to_string(), "Dummy Point 2".to_string(), "Dummy Point 3".to_string()];
+        return Vec::new();
     }
 
-    // Generate elaborations in parallel using fresh contexts
+    // 3. --- Elaboration Stage (Parallel) ---
+    // Fork from the original base context for a clean state for each elaboration.
     let leaf_futures = points
         .into_iter()
         .map(|point| {
-            let mut elab_ctx = ctx.fork(); // Fork from original ctx for clean state
-            let complete_prompt = format!("{} {}", COMPLETE_PROMPT_TEMPLATE, point);
-            elab_ctx.fill(&complete_prompt);
+            let mut elab_ctx = ctx.fork();
+            let complete_prompt = format!("Elaborate on the following point: {}. Your response should be complete and only concerned with this point.", point);
+            elab_ctx.fill(&format!("<|start_header_id|>user<|end_header_id|>\n\n{}{}", complete_prompt, STOP_TOKEN));
             elab_ctx.fill(ASSISTANT_PREFIX);
-            async move { elab_ctx.generate_until(STOP_TOKEN, MAX_TOKENS).await }
+            async move { elab_ctx.generate_until(STOP_TOKEN, elab_max_tokens).await }
         })
         .collect::<Vec<_>>();
 
     join_all(leaf_futures).await
 }
 
-#[inferlet::main]
+#[inferlet2::main]
 async fn main() -> Result<(), String> {
-    // Initialize the model and context
-    let available_models = inferlet::available_models();
-    let model = Model::new(available_models.first().unwrap()).unwrap();
+    // --- Argument Parsing ---
+    let mut args = Arguments::from_vec(
+        inferlet2::get_arguments()
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+    );
+    if args.contains(["-h", "--help"]) {
+        println!("{}", HELP);
+        return Ok(());
+    }
+    let num_points: usize = args
+        .opt_value_from_str(["-p", "--num-points"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or(3);
+    let plan_max_tokens: usize = args
+        .opt_value_from_str(["-t", "--plan-tokens"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or(80);
+    let elab_max_tokens: usize = args
+        .opt_value_from_str(["-e", "--elab-tokens"])
+        .map_err(|e| e.to_string())?
+        .unwrap_or(80);
+
+    let start = Instant::now();
+
+    // --- Setup ---
+    let model = inferlet2::get_auto_model();
     let mut ctx = model.create_context();
     ctx.fill("<|begin_of_text|>");
     ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
 
-    // Define the question and parameters
     let question = "What are the defining characteristics of Rome?";
-    let max_points = 3;
 
-    // Execute and display results
-    let elaborations = plan_and_generate_parallel(ctx, question, max_points).await;
-    for (i, elaboration) in elaborations.iter().enumerate() {
-        println!("Elaboration {}: {}", i + 1, elaboration);
+    // --- Execute ---
+    println!(
+        "--- Starting plan and generate (plan: {} points, {} tokens; elab: {} tokens) ---",
+        num_points, plan_max_tokens, elab_max_tokens
+    );
+    let elaborations =
+        plan_and_generate_parallel(ctx, question, num_points, plan_max_tokens, elab_max_tokens)
+            .await;
+
+    println!("\n--- Completed in {:?} ---\n", start.elapsed());
+
+    // --- Print Results ---
+    if elaborations.is_empty() {
+        println!("No points were generated or elaborated upon.");
+    } else {
+        for (i, elaboration) in elaborations.iter().enumerate() {
+            println!("Elaboration {}:\n{}\n", i + 1, elaboration);
+        }
     }
 
     Ok(())

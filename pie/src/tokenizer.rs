@@ -104,7 +104,6 @@ pub struct BytePairEncoder {
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
     regex: Regex,
     special_regex: Regex,
-    sorted_token_bytes: Vec<Vec<u8>>,
 }
 
 impl BytePairEncoder {
@@ -216,8 +215,6 @@ impl BytePairEncoder {
             .collect();
 
         // Clone because I don't know how to tell Rust I'm not going to change the map
-        let mut sorted_token_bytes: Vec<Vec<u8>> = encoder.keys().cloned().collect();
-        sorted_token_bytes.sort();
 
         Self {
             encoder,
@@ -226,7 +223,6 @@ impl BytePairEncoder {
             special_tokens_decoder,
             regex,
             special_regex,
-            sorted_token_bytes,
         }
     }
 
@@ -242,8 +238,12 @@ impl BytePairEncoder {
         self.encode(text, &allowed_special)
     }
 
-    pub fn get_vocabs(&self) -> Vec<Vec<u8>> {
-        self.sorted_token_bytes.clone()
+    pub fn get_vocabs(&self) -> (Vec<Rank>, Vec<Vec<u8>>) {
+        // return decoder ranks and bytes
+        (
+            self.decoder.keys().cloned().collect(),
+            self.decoder.values().cloned().collect(),
+        )
     }
 }
 

@@ -7,5 +7,5 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-inferlet2.workspace = true
-inferlet-macros2.workspace = true
+inferlet.workspace = true
+inferlet-macros.workspace = true

@@ -1,4 +1,4 @@
-use inferlet2::sampler::Sampler;
+use inferlet::sampler::Sampler;
 use pico_args::Arguments;
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
@@ -119,11 +119,11 @@ impl Sampler for WatermarkSampler {
         chosen_id
     }
 }
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     // 1. Get arguments from the inferlet environment and prepare the parser.
     let mut args = Arguments::from_vec(
-        inferlet2::get_arguments()
+        inferlet::get_arguments()
             .into_iter()
             .map(OsString::from)
             .collect(),
@@ -152,12 +152,12 @@ async fn main() -> Result<(), String> {
     // --- Main logic starts here ---
     let start = Instant::now();
 
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let tokenizer = model.get_tokenizer();
     let mut sampler = WatermarkSampler::new(0.5, 0.0);
-    let mut stop_condition = inferlet2::stop_condition::any(
-        inferlet2::stop_condition::Until::new(tokenizer.tokenize("<|eot_id|>")),
-        inferlet2::stop_condition::Length::new(max_num_outputs as usize),
+    let mut stop_condition = inferlet::stop_condition::any(
+        inferlet::stop_condition::Until::new(tokenizer.tokenize("<|eot_id|>")),
+        inferlet::stop_condition::Length::new(max_num_outputs as usize),
     );
 
     let mut ctx = model.create_context();

@@ -18,7 +18,7 @@ impl exports::pie::nbi::run::Guest for HelloWorld {
         let inst_id = pie::nbi::runtime::get_instance_id();
         let version = pie::nbi::runtime::get_version();
         println!(
-            "I am an instance (id: {}) running in the Symphony runtime (version: {}) !",
+            "I am an instance (id: {}) running in the PIE runtime (version: {}) !",
             inst_id, version
         );
         Ok(())

@@ -71,11 +71,11 @@ fn get_agent_config(role: &str) -> Result<AgentConfig, String> {
     }
 }
 
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     // --- Argument Parsing ---
     let mut args = Arguments::from_vec(
-        inferlet2::get_arguments()
+        inferlet::get_arguments()
             .into_iter()
             .map(OsString::from)
             .collect(),
@@ -100,13 +100,13 @@ async fn main() -> Result<(), String> {
         .unwrap_or(96);
 
     // --- Setup ---
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let config = get_agent_config(&my_role)?;
 
     // --- Determine Input and Construct Prompt ---
     let (user_prompt, accumulated_story) = if let Some(prev_topic) = config.prev_topic {
         // Subsequent agents receive the work from the previous agent
-        let accumulated = inferlet2::subscribe(&format!("{}-{}", prev_topic, group_id)).await;
+        let accumulated = inferlet::subscribe(&format!("{}-{}", prev_topic, group_id)).await;
         let prompt = format!(
             "**Previous Story Elements:**\n---\n{}\n---\n\n**Your Specific Task:**\n{}",
             accumulated, config.task_instruction
@@ -114,7 +114,7 @@ async fn main() -> Result<(), String> {
         (prompt, accumulated)
     } else {
         // The first agent gets the initial prompt from the orchestrator
-        let initial_prompt = inferlet2::receive().await;
+        let initial_prompt = inferlet::receive().await;
         let prompt = format!(
             "{}\n\nRequest: A story about {}.",
             config.task_instruction, initial_prompt
@@ -147,13 +147,13 @@ async fn main() -> Result<(), String> {
 
     if let Some(next_topic) = config.next_topic {
         // Send to the next agent in the pipeline
-        inferlet2::broadcast(
+        inferlet::broadcast(
             &format!("{}-{}", next_topic, group_id),
             &new_accumulated_story,
         );
     } else {
         // Send the final completed story to the user
-        inferlet2::send(&new_accumulated_story);
+        inferlet::send(&new_accumulated_story);
     }
 
     Ok(())

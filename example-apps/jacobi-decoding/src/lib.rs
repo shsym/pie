@@ -1,9 +1,9 @@
-use inferlet2::sampler::{self, Sampler};
-use inferlet2::stop_condition::{self, StopCondition};
-use inferlet2::traits::ForwardText;
+use inferlet::sampler::{self, Sampler};
+use inferlet::stop_condition::{self, StopCondition};
+use inferlet::traits::ForwardText;
 
-use inferlet2::Context;
-use inferlet2::brle::Brle;
+use inferlet::Context;
+use inferlet::brle::Brle;
 use std::time::Instant;
 
 // NOTE: This is not a full implementation of Parallel Jacobi Decoding (PJD).
@@ -100,14 +100,14 @@ pub fn causal_mask(num_total_tokens: u32, num_input_tokens: u32) -> Vec<Vec<u32>
     mask
 }
 
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
     let max_num_outputs = 256;
     let speculation_length = 3; // Number of tokens to speculate in parallel
 
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let tokenizer = model.get_tokenizer();
 
     let mut ctx = Context::new(&model);

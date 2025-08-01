@@ -5,7 +5,7 @@ async fn main() -> Result<()> {
     println!("Let's chat!");
 
     for _ in 0..3 {
-        let s = inferlet::messaging_async::receive().await;
+        let s = inferlet::receive().await;
         println!("{}", s);
     }
 
@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     ];
 
     for i in 0..3 {
-        inferlet::messaging::send(responses[i]);
+        inferlet::send(responses[i]);
     }
 
     println!("It was nice chatting with you. Bye!");

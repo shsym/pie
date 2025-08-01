@@ -9,7 +9,7 @@ use wasmtime::{
 };
 
 use crate::instance::{Id as InstanceId, InstanceState};
-use crate::{bindings, bindings2, model, server, service};
+use crate::{bindings, model, server, service};
 
 use crate::model::cleanup_instance;
 use crate::service::{Service, ServiceError};
@@ -244,7 +244,6 @@ impl Runtime {
             .unwrap();
 
         bindings::add_to_linker(&mut linker).unwrap();
-        bindings2::add_to_linker(&mut linker).unwrap();
 
         let cache_dir = cache_dir.as_ref().join("programs");
         // Ensure the cache directory exists

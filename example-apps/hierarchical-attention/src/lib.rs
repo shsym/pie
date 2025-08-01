@@ -1,7 +1,7 @@
-use inferlet2::Context;
-use inferlet2::brle::Brle;
-use inferlet2::traits::ForwardText;
-use inferlet2::traits::tokenize::Tokenizer;
+use inferlet::Context;
+use inferlet::brle::Brle;
+use inferlet::traits::ForwardText;
+use inferlet::traits::tokenize::Tokenizer;
 use std::time::Instant;
 
 /// Implements hierarchical attention prefill based on XML structure.
@@ -142,10 +142,10 @@ pub async fn prefill_with_hierarchical_attention(ctx: &mut Context, xml_text: &s
     ctx.fill_token(next_token_id);
 }
 
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let mut ctx = Context::new(&model);
 
     let xml_document = r#"<article>

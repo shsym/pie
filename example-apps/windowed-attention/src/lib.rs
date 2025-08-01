@@ -1,7 +1,7 @@
-use inferlet2::sampler::{self, Sampler};
-use inferlet2::stop_condition::{self, StopCondition};
+use inferlet::sampler::{self, Sampler};
+use inferlet::stop_condition::{self, StopCondition};
 
-use inferlet2::Context;
+use inferlet::Context;
 use std::time::Instant;
 
 /// Generates text using a simple sliding window for KV cache management.
@@ -44,13 +44,13 @@ pub async fn generate_with_sliding_window<S: Sampler, C: StopCondition>(
     ctx.tokenizer.detokenize(&generated_token_ids)
 }
 
-#[inferlet2::main]
+#[inferlet::main]
 async fn main() -> Result<(), String> {
     let start = Instant::now();
 
     let max_num_outputs = 512;
     let window_size = 32;
-    let model = inferlet2::get_auto_model();
+    let model = inferlet::get_auto_model();
     let tokenizer = model.get_tokenizer();
 
     let mut ctx = Context::new(&model);
