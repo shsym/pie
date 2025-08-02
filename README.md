@@ -7,19 +7,19 @@
          width="30%">
     <p></p>
   </picture>
-
-[Getting started] | [Learn] | [Documentation] | [Contributing]
 </div>
 
-[Pie] is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
 
----
+**PIE** is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
 
-[pie]: https://pie-project.org/
-[Getting Started]: https://pie-project.org/learn/get-started
-[Learn]: https://pie-project.org/learn
-[Documentation]: https://pie-project.org/learn#learn-use
-[Contributing]: CONTRIBUTING.md
+> **Note** 🧪
+>
+> This software is in a **pre-release** stage and under active development. It's recommended for testing and research purposes only.
+
+> **SOSP'25 Artifact**
+>
+> Please check out the `sosp25` branch for the artifact and benchmark instructions.
+
 
 
 ## Getting Started
@@ -30,20 +30,6 @@
   Navigate to a backend directory and follow its `README.md` for setup:
   - [Python Backend](backend/backend-python/README.md)
   - [C++ Backend](backend/backend-cuda/README.md)
-
-
-
-# Installing flashinfer
-```
-# Set target CUDA architectures
-export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
-# Build AOT kernels. Will produce AOT kernels in aot-ops/
-python -m flashinfer.aot
-# Build AOT wheel
-python -m build --no-isolation --wheel
-# Install AOT wheel
-python -m pip install dist/flashinfer-*.whl
-```
 
 
 - **Add Wasm Target:**  
@@ -89,7 +75,7 @@ Download a model, start the engine, and run an inferlet.
    Launch the PIE engine with an example configuration. This opens the interactive PIE shell:
 
    ```bash
-   pie start --config ./pie-cli/example_config.yaml
+   pie start --config ./pie-cli/example_config.toml
    ```
 
 3. **Run an Inferlet:**  
@@ -98,3 +84,4 @@ Download a model, start the engine, and run an inferlet.
    ```bash
    pie> run ./example-apps/target/wasm32-wasip2/release/simple_decoding.wasm
    ```
+
