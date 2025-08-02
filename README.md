@@ -31,6 +31,21 @@
   - [Python Backend](backend/backend-python/README.md)
   - [C++ Backend](backend/backend-cuda/README.md)
 
+
+
+# Installing flashinfer
+```
+# Set target CUDA architectures
+export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
+# Build AOT kernels. Will produce AOT kernels in aot-ops/
+python -m flashinfer.aot
+# Build AOT wheel
+python -m build --no-isolation --wheel
+# Install AOT wheel
+python -m pip install dist/flashinfer-*.whl
+```
+
+
 - **Add Wasm Target:**  
   Install the WebAssembly target for Rust:
 

@@ -411,7 +411,7 @@ impl Batchable<BatchGroup> for Command {
                     BatchingStrategyConfiguration::KOnly { k } => batching::k_only(k, None),
                     BatchingStrategyConfiguration::KOrT { k, t } => batching::k_or_t(t, k, None),
                     BatchingStrategyConfiguration::Adaptive => Box::new(
-                        batching::ManualStrategy::new(TRIGGERS.forward_text_trigger.clone()),
+                        batching::ManualStrategy::new(TRIGGERS.fill_block_trigger.clone()),
                     ),
                 }
             }

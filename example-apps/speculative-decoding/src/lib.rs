@@ -217,11 +217,6 @@ async fn main() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .unwrap_or(256);
 
-    let n_next: usize = args
-        .opt_value_from_str("--n-next")
-        .map_err(|e| e.to_string())?
-        .unwrap_or(1);
-
     let remaining = args.finish();
     if !remaining.is_empty() {
         return Err(format!(
@@ -250,7 +245,6 @@ async fn main() -> Result<(), String> {
         stop_condition::Until::new(tokenizer.tokenize("<|eot_id|>")),
         stop_condition::Length::new(max_num_outputs),
     );
-
     // --- Generation with Drafter Selection ---
     let mut drafter = CacheDrafter::<1, 2, 4>::new();
 
