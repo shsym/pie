@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Programmable Inference Engine (PIE)"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie/pie"
 include = ["src", "Cargo.toml", "wit"]
 

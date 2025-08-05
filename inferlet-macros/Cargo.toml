@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Procedural macros for the inferlet library"
-license = "Apache 2.0"
+license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie/inferlet" # Or the specific sub-path
 keywords = ["wasi", "wasm", "pie", "inferlet"]
 

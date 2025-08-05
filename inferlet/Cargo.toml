@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Inferlet support library for PIE"
-license = "Apache 2.0"
+license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie/inferlet"
 keywords = ["wasi", "wasm", "pie", "inferlet"]
 categories = ["wasm"]
@@ -15,6 +15,6 @@ wit-bindgen = "0.43.0"
 wstd = "0.5.3"
 trait-variant = "0.1.2"
 wasi = "0.14.2+wasi-0.2.4"
-inferlet-macros = { path = "../inferlet-macros" }
+inferlet-macros = "0.1.0"
 anyhow = "1.0.95"
 rand = "0.9.2"
