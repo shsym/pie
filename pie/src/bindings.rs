@@ -11,7 +11,7 @@ mod forward_text;
 mod tokenize;
 
 wasmtime::component::bindgen!({
-    path: "../inferlet/wit",
+    path: "wit",
     world: "inferlet",
     async: true,
     with: {

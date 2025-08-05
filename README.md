@@ -75,13 +75,14 @@ Download a model, start the engine, and run an inferlet.
    Launch the PIE engine with an example configuration. This opens the interactive PIE shell:
 
    ```bash
-   pie start --config ./pie-cli/example_config.toml
+   cd pie-cli
+   pie start --config ./example_config.toml
    ```
 
 3. **Run an Inferlet:**  
    From within the PIE shell, execute a compiled inferlet:
 
    ```bash
-   pie> run ./example-apps/target/wasm32-wasip2/release/simple_decoding.wasm
+   pie> run ../example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
    ```
 
