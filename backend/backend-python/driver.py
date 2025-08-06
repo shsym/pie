@@ -589,6 +589,18 @@ class Driver:
             items=responses
         )
 
+    def create_adapter(self, cmd: CreateAdapter):
+        ...
+
+    def destroy_adapter(self, cmd: DestroyAdapter):
+        ...
+
+    def update_adapter(self, cmd: UpdateAdapter):
+        ...
+
+    def forward_with_mutation(self, cmds: BatchForwardWithMutation):
+        ...
+
 
 def _decode_brle(brle_buffer: list[int]) -> np.ndarray:
     """
