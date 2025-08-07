@@ -6,8 +6,10 @@ import torch
 from torch import nn
 
 import flashinfer as ops
+from flashinfer import SegmentGEMMWrapper
 
 from config import L4maConfig
+from adapter import Adapter, AdapterWithMutation, AdapterBuffer
 
 VERSION = "0.1.0"
 
@@ -117,6 +119,7 @@ class L4maAttention(nn.Module):
 
     def forward(
             self,
+            adapter_buffer: AdapterBuffer | None,
             wrapper,
             hidden_states: torch.Tensor,
             position_ids: torch.Tensor,
@@ -132,6 +135,14 @@ class L4maAttention(nn.Module):
         n, _ = hidden_states.size()
 
         qkv_states = self.qkv_proj(hidden_states)
+
+        # apply adapters if provided
+        if adapter_buffer is not None:
+            seg_size = adapter_buffer.segment_size
+            delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states[:seg_size])
+            qkv_states[:seg_size] += delta
+
+
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
         )
@@ -197,6 +208,7 @@ class L4maDecoderLayer(nn.Module):
 
     def forward(
             self,
+            adapter_buffer: AdapterBuffer | None,
             wrapper,
             hidden_states: torch.Tensor,
             position_ids: torch.Tensor,
@@ -214,6 +226,7 @@ class L4maDecoderLayer(nn.Module):
 
         # Self Attention
         hidden_states = self.self_attn(
+            adapter_buffer=adapter_buffer,
             wrapper=wrapper,
             hidden_states=hidden_states,
             position_ids=position_ids,
@@ -266,6 +279,7 @@ class L4maModel(nn.Module):
             dtype=config.dtype,
         )
 
+        # 128 MB workspace buffer for ops
         self.workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=config.device
         )
@@ -275,9 +289,14 @@ class L4maModel(nn.Module):
         self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
         )
+        self.wrapper_segment_gemm = ops.SegmentGEMMWrapper(
+            self.workspace_buffer
+        )
 
     def forward(
             self,
+            adapters: list[Adapter] | None,
+            adapter_indices: torch.Tensor | None,
             input_embeds: torch.Tensor,
             position_ids: torch.Tensor,
             kv_cache_at_layer: torch.Tensor,
@@ -299,6 +318,18 @@ class L4maModel(nn.Module):
             seq_lens=ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size),
             nnz=n,
         )
+
+        # concat all weights for segment gemm.
+        # we assume requests are sorted such that initial n requests are the ones with adapters
+        if adapters is not None:
+            adapter_buffer = AdapterBuffer(
+                adapters=adapters,
+                adapter_indices=adapter_indices,
+                x_indptr=qo_indptr[:adapter_indices.size(0) + 1],
+                segment_gemm_wrapper=self.wrapper_segment_gemm,
+            )
+        else:
+            adapter_buffer = None
 
         # check if its decoding (qo_indptr is )
         if single_token_inference_mode:
@@ -331,6 +362,7 @@ class L4maModel(nn.Module):
 
         for decoder_layer in self.layers:
             layer_outputs = decoder_layer(
+                adapter_buffer=adapter_buffer,
                 wrapper=wrapper,
                 hidden_states=hidden_states,
                 position_ids=position_ids,

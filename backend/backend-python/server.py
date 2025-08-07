@@ -392,7 +392,6 @@ def run_zmq_server(router, engine, config, model_metadata):
                     elif command == "debug_query_request":
                         res = engine.debug_query_request(request.debug_query_request)
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, debug_query=res)
-
                     elif command == "create_adapter":
                         engine.create_adapter(request.create_adapter)
                     elif command == "destroy_adapter":
