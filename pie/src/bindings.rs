@@ -9,7 +9,6 @@ mod output_text;
 //mod runtime;
 mod forward_text;
 mod tokenize;
-mod optimize;
 
 wasmtime::component::bindgen!({
     path: "wit",

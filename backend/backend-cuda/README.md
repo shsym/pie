@@ -40,6 +40,16 @@ cmake .. -G Ninja
 ninja
 ```
 
+## Running Unit Tests
+
+Build and execute all CUDA unit test binaries (they live in `build/bin/*`):
+
+```bash
+make run-unit-tests
+```
+
+This configures (if needed), builds the test executables, and runs them sequentially, failing fast on the first error.
+
 
 ## Running the Backend
 
