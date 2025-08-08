@@ -36,7 +36,7 @@ These commands will create a `build` directory, configure the project with CMake
 
 ```bash
 mkdir -p build && cd build
-cmake .. -G Ninja  
+cmake .. -G Ninja
 ninja
 ```
 

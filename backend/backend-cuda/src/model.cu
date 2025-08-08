@@ -39,6 +39,17 @@ struct Dist {
     std::vector<int32_t> token_ids;
 };
 
+static std::vector<bool> decode_brle(const std::vector<uint32_t>& brle_buffer) {
+    std::vector<bool> out;
+    out.reserve(brle_buffer.size() * 8); // heuristic
+    bool value = true; // matches python impl flipped semantics
+    for (auto run_len : brle_buffer) {
+        out.insert(out.end(), run_len, value);
+        value = !value;
+    }
+    return out;
+}
+
 
 // The actual implementation of the Server is hidden in this struct.
 struct Model::ModelImpl {
@@ -529,6 +540,77 @@ std::vector<Model::SampleTopKResult> Model::ModelImpl::handle_sample_top_k(const
         }
 
         results.push_back(res);
+    }
+    return results;
+}
+
+// ForwardText (batched implementation aggregating all items into single embed/fill/sample passes)
+std::vector<std::vector<Model::Distribution>> Model::handle_forward_text(const std::vector<ForwardTextCommand>& commands) {
+    std::vector<std::vector<Model::Distribution>> results(commands.size());
+    if (commands.empty()) return results;
+
+    // 1. Allocate embedding IDs for every token across all items (single static counter)
+    static uint32_t next_embed_id = 2'000'000; // reserved ephemeral id space
+    std::vector<EmbedTextCommand> all_embed_cmds;
+    all_embed_cmds.reserve([&](){ size_t s=0; for (auto& c:commands) s+=c.token_ids.size(); return s;}());
+
+    // Per-item token embedding ids for mapping output indices -> embedding ids
+    std::vector<std::vector<uint32_t>> per_item_embed_ids(commands.size());
+    for (size_t item_idx = 0; item_idx < commands.size(); ++item_idx) {
+        const auto& cmd = commands[item_idx];
+        per_item_embed_ids[item_idx].reserve(cmd.token_ids.size());
+        for (size_t t = 0; t < cmd.token_ids.size(); ++t) {
+            uint32_t emb_id = next_embed_id++;
+            per_item_embed_ids[item_idx].push_back(emb_id);
+            all_embed_cmds.push_back({emb_id, cmd.token_ids[t], cmd.position_ids[t]});
+        }
+    }
+    pimpl->handle_embed_text(all_embed_cmds);
+
+    // 2. Build all FillBlockCommands (one per ForwardText item) and gather output embedding ids
+    std::vector<FillBlockCommand> fill_cmds;
+    fill_cmds.reserve(commands.size());
+    std::vector<std::vector<uint32_t>> per_item_output_embed_ids(commands.size());
+    size_t total_requested_dists = 0;
+    for (size_t item_idx = 0; item_idx < commands.size(); ++item_idx) {
+        const auto& cmd = commands[item_idx];
+        const auto& embed_ids = per_item_embed_ids[item_idx];
+        auto& out_embed_ids = per_item_output_embed_ids[item_idx];
+        out_embed_ids.reserve(cmd.output_indices.size());
+        for (auto out_idx : cmd.output_indices) {
+            if (out_idx < embed_ids.size()) out_embed_ids.push_back(embed_ids[out_idx]);
+        }
+        total_requested_dists += out_embed_ids.size();
+        fill_cmds.push_back(FillBlockCommand{cmd.kv_page_last_len, cmd.kv_page_ids, embed_ids, out_embed_ids});
+    }
+
+    // NOTE: BRLE masks (cmd.brle_masks) are currently ignored; existing fill_block builds causal masks internally.
+    // A future enhancement would decode and integrate them into custom_masks_host inside handle_fill_block.
+
+    // 3. Single batched fill_block
+    if (!fill_cmds.empty()) {
+        pimpl->handle_fill_block(fill_cmds);
+    }
+
+    // 4. Collect sample commands for all requested output embeddings
+    std::vector<SampleTopKCommand> sample_cmds;
+    sample_cmds.reserve(total_requested_dists);
+    for (auto& out_ids : per_item_output_embed_ids) {
+        for (auto eid : out_ids) sample_cmds.push_back({eid, (uint32_t)pimpl->dist_size});
+    }
+    auto sample_results = pimpl->handle_sample_top_k(sample_cmds);
+
+    // 5. Reconstruct per-item distributions from flattened sample_results
+    size_t cursor = 0;
+    for (size_t item_idx = 0; item_idx < commands.size(); ++item_idx) {
+        auto& out_ids = per_item_output_embed_ids[item_idx];
+        auto& item_out = results[item_idx];
+        item_out.reserve(out_ids.size());
+        for (size_t j = 0; j < out_ids.size(); ++j) {
+            if (cursor >= sample_results.size()) break; // safety
+            auto& sr = sample_results[cursor++];
+            item_out.push_back(Model::Distribution{sr.token_ids, sr.probabilities});
+        }
     }
     return results;
 }

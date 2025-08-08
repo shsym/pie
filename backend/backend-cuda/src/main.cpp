@@ -449,6 +449,38 @@ void run_zmq_server(zmq::socket_t& router, const AppConfig& config, const ModelM
                     needs_response = true;
                     auto* proto_response = response.mutable_batch_sync();
 
+                } else if (request.has_forward_text()) {
+                    needs_response = true;
+                    const auto& batch_req = request.forward_text();
+                    std::vector<Model::ForwardTextCommand> cmds;
+                    cmds.reserve(batch_req.items_size());
+                    for (const auto& item : batch_req.items()) {
+                        Model::ForwardTextCommand c {
+                            item.kv_page_last_len(),
+                            {item.kv_page_ids().begin(), item.kv_page_ids().end()},
+                            {item.token_ids().begin(), item.token_ids().end()},
+                            {item.position_ids().begin(), item.position_ids().end()},
+                            {},
+                            {item.output_indices().begin(), item.output_indices().end()}
+                        };
+                        // capture BRLE masks
+                        c.brle_masks.reserve(item.mask_size());
+                        for (const auto& m : item.mask()) {
+                            c.brle_masks.push_back({m.buffer().begin(), m.buffer().end()});
+                        }
+                        cmds.push_back(std::move(c));
+                    }
+                    auto results = model.handle_forward_text(cmds);
+                    auto* forward_resp = response.mutable_forward_text();
+                    for (auto& item_res : results) {
+                        auto* item_proto = forward_resp->add_items();
+                        for (auto& dist : item_res) {
+                            auto* dist_proto = item_proto->add_distributions();
+                            dist_proto->mutable_ids()->Add(dist.token_ids.begin(), dist.token_ids.end());
+                            dist_proto->mutable_probs()->Add(dist.probabilities.begin(), dist.probabilities.end());
+                        }
+                    }
+
                 } else if (request.has_mask_block()) {
                     //std::cout << "[ZMQ Server Thread] Handling BatchMaskBlock request." << std::endl;
                     std::vector<Model::MaskBlockCommand> commands;
