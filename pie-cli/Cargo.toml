@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Programmable Inference Engine (PIE) Command-Line Interface"
-license = "MIT"
-repository = "https://github.com/pie-project/pie/pie-cli"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
 
 [[bin]]
 name = "pie"
 path = "src/main.rs"
 
 [dependencies]
-pie = { path = "../pie" }
+pie = { path = "../pie", version = "0.1.1"  }
 tokio = { version = "1.38", features = ["full"] }
 anyhow = "1.0"
 futures-util = { version = "0.3", features = ["sink"] }
