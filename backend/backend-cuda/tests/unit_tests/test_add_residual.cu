@@ -1,1 +1,0 @@
-// Removed: superseded by test_add_residual_full.cu which includes full implementation.

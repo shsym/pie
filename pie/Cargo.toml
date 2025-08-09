@@ -6,7 +6,7 @@ authors = ["In Gim <in.gim@yale.edu>"]
 description = "Programmable Inference Engine (PIE)"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie/pie"
-include = ["src", "Cargo.toml", "wit"]
+include = ["src", "Cargo.toml", "wit", "proto"]
 
 [lib]
 
