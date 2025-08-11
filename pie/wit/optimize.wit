@@ -1,0 +1,33 @@
+interface optimize {
+
+    use core.{queue};
+    use forward-text.{distribution-result};
+    use allocate.{object-id};
+    
+    create-adapter: func(
+        name: string
+    );
+
+    destroy-adapter: func(
+        name: string
+    );
+
+    update-adapter: func(
+        name: string,
+        score-list: list<f32>,
+        seed-list: list<s64>,
+    );
+
+    forward-with-mutation: func(
+        queue: borrow<queue>,
+        adapter: string,
+        seed: s64,
+        last-kv-page-len: u32,
+        kv-page-ids: list<object-id>,
+        tokens: list<u32>,
+        positions: list<u32>,
+        mask: list<list<u32>>,
+        output-indices: list<u32>,
+    ) -> option<distribution-result>;
+
+}

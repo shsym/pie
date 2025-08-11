@@ -1,12 +1,12 @@
 [package]
 name = "pie"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
 description = "Programmable Inference Engine (PIE)"
 license = "Apache-2.0"
-repository = "https://github.com/pie-project/pie/pie"
-include = ["src", "Cargo.toml", "wit"]
+repository = "https://github.com/pie-project/pie"
+include = ["src", "Cargo.toml", "build.rs", "wit", "proto"]
 
 [lib]
 
@@ -28,7 +28,7 @@ rmp-serde = "1.3.0"
 serde_bytes = "0.11.15"
 dashmap = "6.1.0"
 num-traits = "0.2.19"
-prost = "0.14.0"
+prost = "0.14.1"
 fancy-regex = "0.15.0"
 base64 = "0.22.1"
 thiserror = "2.0.11"

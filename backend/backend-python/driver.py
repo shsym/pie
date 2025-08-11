@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from typing import Union
 
 import numpy as np
-import numba
 import torch
 
+from adapter import Adapter, MutableAdapter, AdapterWithMutation
 from l4m_pb2 import (  # pylint: disable=no-name-in-module
     BatchAllocate,
     BatchDeallocate,
@@ -23,7 +23,8 @@ from l4m_pb2 import (  # pylint: disable=no-name-in-module
     BatchFillBlock,
     Distribution,
     BatchSyncResponse, BatchForwardText, BatchForwardTextResponse,
-    BatchDebugQueryRequest, BatchDebugQueryResponse, DebugQueryResponse
+    BatchDebugQueryRequest, BatchDebugQueryResponse, DebugQueryResponse,
+    CreateAdapter, DestroyAdapter, UpdateAdapter, BatchForwardWithMutation,
 )
 
 from l4m_vision_pb2 import BatchEmbedImage  # pylint: disable=no-name-in-module
@@ -62,6 +63,7 @@ class Driver:
 
     embeds: dict[int, Embed]
     blocks: dict[int, Block]
+    adapters: dict[str, Adapter]
 
     # dist_storage: VectorStorage
 
@@ -78,6 +80,7 @@ class Driver:
         """TODO: Add method docstring."""
         self.embeds = {}
         self.blocks = {}
+        self.adapters = {}
 
         self.lm = model
         self.kv_page_size = kv_page_size
@@ -586,6 +589,219 @@ class Driver:
                 responses.append(response)
 
         return BatchDebugQueryResponse(
+            items=responses
+        )
+
+    def create_adapter(self, cmd: CreateAdapter):
+
+        cfg = self.lm.config
+
+        self.adapters[cmd.name] = MutableAdapter(
+            num_layers=cfg.num_layers,
+            in_features=[cfg.hidden_size, cfg.hidden_size, cfg.hidden_size],
+            out_features=[cfg.head_size * cfg.num_query_heads, cfg.head_size * cfg.num_key_value_heads, cfg.head_size * cfg.num_key_value_heads],
+            rank=8,
+            alpha=4,
+            population_size=1000,
+            mu_fraction=0.25,
+            initial_sigma=0.0005,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+
+    def destroy_adapter(self, cmd: DestroyAdapter):
+        if cmd.name in self.adapters:
+            del self.adapters[cmd.name]
+
+    def update_adapter(self, cmd: UpdateAdapter):
+
+        if cmd.name in self.adapters:
+            adapter = self.adapters[cmd.name]
+            if isinstance(adapter, MutableAdapter):
+                adapter.update(cmd.scores, cmd.seeds)
+
+    def forward_with_mutation(self, cmds: BatchForwardWithMutation):
+
+        all_adapters = []
+        all_seeds = []
+        adapter_indices = []
+
+        kv_page_indices = []
+        kv_page_indptr = [0]
+        kv_page_last_lens = []
+        qo_indices = []
+        qo_indptr = [0]
+        custom_masks = []
+
+        new_token_ids = []
+        new_position_ids = []
+
+        all_output_indices = []
+        all_output_indices_ptr = [0]
+        single_token_inference_mode = True
+
+        for cmd in cmds.items:
+
+            if cmd.adapter not in self.adapters:
+                raise ValueError(f"Adapter {cmd.adapter} not found")
+
+            if cmd.seed in all_seeds:
+                index = all_seeds.index(cmd.seed)
+                adapter_indices.append(index)
+
+            else:
+                adapter = self.adapters[cmd.adapter]
+                if isinstance(adapter, MutableAdapter):
+                    mutated_adapter = AdapterWithMutation(adapter, cmd.seed)
+                    all_adapters.append(mutated_adapter)
+                    all_seeds.append(cmd.seed)
+                    adapter_indices.append(len(all_adapters) - 1)
+                else:
+                    pass
+
+            kv_page_indices.extend(cmd.kv_page_ids)
+            kv_page_indptr.append(len(kv_page_indices))
+            kv_page_last_lens.append(cmd.kv_page_last_len)
+            qo_indices.extend(cmd.token_ids)
+            qo_indptr.append(len(qo_indices))
+
+            num_total_tokens = self.kv_page_size * (len(cmd.kv_page_ids) - 1) + cmd.kv_page_last_len
+            num_context_tokens = num_total_tokens - len(cmd.token_ids)
+
+            output_indices = []
+            for x in cmd.output_indices:
+                output_indices.append(x + qo_indptr[-1] - len(cmd.token_ids))
+
+            new_token_ids.extend(cmd.token_ids)
+            new_position_ids.extend(cmd.position_ids)
+            all_output_indices.extend(output_indices)
+            all_output_indices_ptr.append(len(all_output_indices))
+
+            if len(cmd.token_ids) > 1:
+                single_token_inference_mode = False
+
+            # --- New Mask Generation Logic ---
+            if len(cmd.mask) != len(cmd.token_ids):
+                raise ValueError(
+                    f"Mismatch between number of masks ({len(cmd.mask)}) and "
+                    f"input tokens ({len(cmd.token_ids)})."
+                )
+
+            cmd_mask = np.zeros((len(cmd.token_ids), num_total_tokens), dtype=np.bool_)
+            for i, brle_buffer in enumerate(cmd.mask):
+                # 1. Decode the provided BRLE mask for attention to the past context.
+                decoded_mask = _decode_brle(brle_buffer.buffer)
+
+                # The BRLE mask for query token `i` should cover the past context plus `i` previous new tokens.
+                expected_len = num_context_tokens + i + 1
+                if len(decoded_mask) != expected_len:
+                    raise ValueError(
+                        f"Decoded mask for token {i} has length {len(decoded_mask)}, but expected {expected_len}"
+                    )
+
+                cmd_mask[i, :expected_len] = decoded_mask
+
+            mask_flat = cmd_mask.flatten()
+            custom_masks.append(mask_flat)
+
+        # concat all masks
+        custom_mask = np.concatenate(custom_masks)
+
+        # print all inputs
+        # print('kv_page_indices', kv_page_indices)
+        # print('kv_page_indptr', kv_page_indptr)
+        # print('kv_last_page_lens', kv_last_page_lens)
+        # print('qo_indptr', qo_indptr)
+        # print('custom_mask', custom_mask)
+        pt_adapter_indices = torch.as_tensor(
+            adapter_indices, device=self.device, dtype=torch.int32
+        )
+
+        pt_new_token_ids = torch.as_tensor(
+            new_token_ids, device=self.device, dtype=torch.int32
+        )
+        pt_new_position_ids = torch.as_tensor(
+            new_position_ids, device=self.device, dtype=torch.int32
+        )
+
+        pt_kv_page_indices = torch.as_tensor(
+            kv_page_indices, device=self.device, dtype=torch.int32
+        )
+        pt_kv_page_indptr = torch.as_tensor(
+            kv_page_indptr, device=self.device, dtype=torch.int32
+        )
+        pt_kv_last_page_lens = torch.as_tensor(
+            kv_page_last_lens, device=self.device, dtype=torch.int32
+        )
+        pt_qo_indptr = torch.as_tensor(qo_indptr, device=self.device, dtype=torch.int32)
+        pt_custom_mask = torch.as_tensor(
+            custom_mask, device=self.device, dtype=torch.bool
+        )
+
+        pt_output_indices = torch.as_tensor(
+            all_output_indices, device=self.device, dtype=torch.int32)
+
+        input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
+
+        # torch.cuda.synchronize()
+        # print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
+        # print('kv_page_indices', kv_page_indices)
+        # print('kv_page_indptr', kv_page_indptr)
+        # print('kv_page_last_lens', kv_page_last_lens)
+        # print('qo_indptr', qo_indptr)
+        # print('custom_mask', custom_masks)
+        # print('output_indices', all_output_indices)
+        # print('new_token_ids', new_token_ids)
+        # print('new_position_ids', new_position_ids)
+
+        responses = []
+
+        with torch.cuda.device(self.device):
+
+            output_embeds = self.lm.model.forward(
+                adapters=all_adapters,
+                adapter_indices=pt_adapter_indices,
+                input_embeds=input_embeds,
+                position_ids=pt_new_position_ids,
+                kv_cache_at_layer=self.kv_cache_at_layer,
+                kv_page_indices=pt_kv_page_indices,
+                kv_page_indptr=pt_kv_page_indptr,
+                kv_last_page_lens=pt_kv_last_page_lens,
+                qo_indptr=pt_qo_indptr,
+                custom_mask=pt_custom_mask,
+                single_token_inference_mode=single_token_inference_mode,
+            )
+            # print(f"output_embeds mean: {output_embeds.mean().item()}")
+
+            # precompute the dists
+            if len(all_output_indices) > 0:
+                output_embeds = output_embeds[pt_output_indices]
+                logits = self.lm.lm_head(output_embeds)
+                probs = torch.softmax(logits, dim=-1)
+                condensed = torch.topk(probs, k=self.dist_size, sorted=True)
+
+                batch_ids = condensed.indices.tolist()
+                batch_probs = condensed.values.tolist()
+
+                # reshape them based on all_output_indices_ptr
+                for i in range(len(all_output_indices_ptr) - 1):
+                    start = all_output_indices_ptr[i]
+                    end = all_output_indices_ptr[i + 1]
+                    dists = []
+                    for j in range(start, end):
+                        dist = Distribution(
+                            ids=batch_ids[j],
+                            probs=batch_probs[j]
+                        )
+                        dists.append(dist)
+                    res = ForwardTextResponse(
+                        distributions=dists
+                    )
+                    responses.append(res)
+
+        # torch.cuda.synchronize()
+        # print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
+        return BatchForwardTextResponse(
             items=responses
         )
 
