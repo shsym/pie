@@ -194,5 +194,8 @@ add_custom_target(
 
 # --- End of CMakeLists.txt ---
 
+# Enable CTest before adding test subdirectory so add_test() calls register
+enable_testing()
+
 add_subdirectory(tests)
 

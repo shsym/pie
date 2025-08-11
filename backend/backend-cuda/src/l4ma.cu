@@ -17,6 +17,7 @@
 
 #include "flashinfer_ops.cuh"
 #include "kernels.cuh"  // extracted primitive kernels & launchers
+#include "artifacts.hpp" // optional artifact dump utilities
 
 std::vector<uint8_t> packbits_little(const std::vector<bool>& data) {
     // Calculate the number of bytes needed, padding with zeros for the last byte if necessary.
@@ -389,6 +390,23 @@ void RMSNorm<T>::forward(
         output,
         num_tokens, d, d, d, config_.rms_norm_eps, false, stream
     );
+
+    if (artifacts::op_enabled("rmsnorm_forward")) {
+        std::string case_id = artifacts::get_env_str("PIE_ARTIFACT_CASE_ID", "auto");
+        auto dir = artifacts::ensure_dir_for_case("rmsnorm_forward", case_id);
+        artifacts::write_device_bin(dir, "input", input, (size_t)num_tokens * d);
+        artifacts::write_device_bin(dir, "weight", weight_.data(), (size_t)d);
+        artifacts::write_device_bin(dir, "output", output, (size_t)num_tokens * d);
+       // meta (no per-tensor checksum; raw .bin files are the contract)
+       std::ostringstream meta;
+       meta << "\"version\": \"1\",\n"
+           << "\"op\": \"rmsnorm_forward\",\n"
+           << "\"case_id\": " << artifacts::json_escape(case_id) << ",\n"
+           << "\"config\": {\"rms_norm_eps\": " << config_.rms_norm_eps << ", \"hidden_size\": " << d << ", \"num_tokens\": " << num_tokens << "},\n"
+           << "\"dtype_map\": {\"input\": \"bf16\", \"weight\": \"bf16\", \"output\": \"bf16\"},\n"
+           << "\"shape_map\": {\"input\": [" << num_tokens << ", " << d << "], \"weight\": [" << d << "], \"output\": [" << num_tokens << ", " << d << "]}";
+       artifacts::write_meta_json(dir, meta.str());
+    }
 }
 
 template <typename T>
@@ -432,6 +450,27 @@ void L4maMlp<T>::forward(
     gemm_cublasLt<T>(buffer.ltHandle, buffer.stream, up_proj_out.data(), down_proj_weights_.data(), nullptr, output, buffer.num_tokens, hidden_size, intermediate_size, cublas_workspace.data(), cublas_workspace_size, false, true);
     profiler.record("down_projection");
 
+    // Optional dumps for MLP
+    if (artifacts::op_enabled("mlp_forward")) {
+        std::string case_id = artifacts::get_env_str("PIE_ARTIFACT_CASE_ID", "auto");
+        auto dir = artifacts::ensure_dir_for_case("mlp_forward", case_id);
+        artifacts::write_device_bin(dir, "input", x, (size_t)buffer.num_tokens * hidden_size);
+        artifacts::write_device_bin(dir, "gate_proj_weight", gate_proj_weights_.data(), (size_t)hidden_size * intermediate_size);
+        artifacts::write_device_bin(dir, "up_proj_weight", up_proj_weights_.data(), (size_t)hidden_size * intermediate_size);
+        artifacts::write_device_bin(dir, "down_proj_weight", down_proj_weights_.data(), (size_t)intermediate_size * hidden_size);
+        artifacts::write_device_bin(dir, "gate_proj_out", gate_proj_out.data(), proj_count);
+        artifacts::write_device_bin(dir, "up_proj_out", up_proj_out.data(), proj_count);
+        artifacts::write_device_bin(dir, "output", output, (size_t)buffer.num_tokens * hidden_size);
+       std::ostringstream meta;
+       meta << "\"version\": \"1\",\n"
+           << "\"op\": \"mlp_forward\",\n"
+           << "\"case_id\": " << artifacts::json_escape(case_id) << ",\n"
+           << "\"config\": {\"hidden_size\": " << hidden_size << ", \"intermediate_size\": " << intermediate_size << ", \"num_tokens\": " << buffer.num_tokens << "},\n"
+           << "\"dtype_map\": {\"input\": \"bf16\", \"gate_proj_weight\": \"bf16\", \"up_proj_weight\": \"bf16\", \"down_proj_weight\": \"bf16\", \"gate_proj_out\": \"bf16\", \"up_proj_out\": \"bf16\", \"output\": \"bf16\"},\n"
+           << "\"shape_map\": {\"input\": [" << buffer.num_tokens << ", " << hidden_size << "], \"gate_proj_weight\": [" << hidden_size << ", " << intermediate_size << "], \"up_proj_weight\": [" << hidden_size << ", " << intermediate_size << "], \"down_proj_weight\": [" << intermediate_size << ", " << hidden_size << "], \"gate_proj_out\": [" << buffer.num_tokens << ", " << intermediate_size << "], \"up_proj_out\": [" << buffer.num_tokens << ", " << intermediate_size << "], \"output\": [" << buffer.num_tokens << ", " << hidden_size << "]}";
+       artifacts::write_meta_json(dir, meta.str());
+    }
+
     // 5. Deallocate buffers in reverse order of allocation (LIFO)
     buffer.deallocate(cublas_workspace);
     buffer.deallocate(gate_proj_out);
@@ -474,6 +513,78 @@ void L4maAttention<T>::forward(
     gemm_cublasLt<T>(buffer.ltHandle, buffer.stream, hidden_states, v_proj_weights_.data(), nullptr, v_proj.data(), num_tokens, num_key_value_heads * head_size, hidden_size, cublas_workspace.data(), cublas_workspace_size, false, true);
     profiler.record("v_projection");
 
+    // Optional: dump pre-RoPE projections and inputs
+    if (artifacts::op_enabled("l4ma_attention_forward")) {
+        std::string case_id = artifacts::get_env_str("PIE_ARTIFACT_CASE_ID", "auto");
+        auto dir = artifacts::ensure_dir_for_case("l4ma_attention_forward", case_id);
+        // Minimal meta; richer fields can be added later
+        std::ostringstream meta;
+        meta << "\"version\": \"1\",\n"
+             << "\"op\": \"l4ma_attention_forward\",\n"
+             << "\"case_id\": " << artifacts::json_escape(case_id) << ",\n"
+             << "\"config\": {\"hidden_size\": " << hidden_size
+             << ", \"head_size\": " << head_size
+             << ", \"num_q_heads\": " << num_query_heads
+             << ", \"num_kv_heads\": " << num_key_value_heads
+             << ", \"page_size\": " << buffer.page_size
+             << ", \"batch_size\": " << batch_size
+           << ", \"num_tokens\": " << num_tokens << "},\n";
+       // Dtype map (all bf16 here except index tensors which are s32/u8)
+       meta << "\"dtype_map\": {"
+           << "\"hidden_states\": \"bf16\","
+           << "\"q_proj\": \"bf16\", \"k_proj\": \"bf16\", \"v_proj\": \"bf16\","
+           << "\"q_after_rope\": \"bf16\", \"k_after_rope\": \"bf16\","
+           << "\"context_before_o_proj\": \"bf16\", \"attn_output\": \"bf16\","
+           << "\"q_proj_weight\": \"bf16\", \"k_proj_weight\": \"bf16\", \"v_proj_weight\": \"bf16\", \"o_proj_weight\": \"bf16\","
+           << "\"position_ids\": \"s32\", \"kv_page_indices\": \"s32\", \"kv_page_indptr\": \"s32\", \"kv_last_page_lens\": \"s32\","
+           << "\"kv_batch_indices\": \"s32\", \"kv_positions\": \"s32\", \"qo_indptr\": \"s32\", \"custom_mask\": \"u8\", \"mask_indptr\": \"s32\"},\n";
+       // Shape map (flattened row-major tensors)
+       meta << "\"shape_map\": {";
+       meta << "\"hidden_states\": [" << num_tokens << ", " << hidden_size << "],";
+       meta << "\"q_proj\": [" << num_tokens << ", " << (num_query_heads * head_size) << "],";
+       meta << "\"k_proj\": [" << num_tokens << ", " << (num_key_value_heads * head_size) << "],";
+       meta << "\"v_proj\": [" << num_tokens << ", " << (num_key_value_heads * head_size) << "],";
+       meta << "\"q_after_rope\": [" << num_tokens << ", " << (num_query_heads * head_size) << "],";
+       meta << "\"k_after_rope\": [" << num_tokens << ", " << (num_key_value_heads * head_size) << "],";
+       meta << "\"context_before_o_proj\": [" << num_tokens << ", " << (num_query_heads * head_size) << "],";
+       meta << "\"attn_output\": [" << num_tokens << ", " << hidden_size << "],";
+       // Weight shapes: (in_dim, out_dim) in row-major flattened order
+       meta << "\"q_proj_weight\": [" << hidden_size << ", " << (num_query_heads * head_size) << "],";
+       meta << "\"k_proj_weight\": [" << hidden_size << ", " << (num_key_value_heads * head_size) << "],";
+       meta << "\"v_proj_weight\": [" << hidden_size << ", " << (num_key_value_heads * head_size) << "],";
+       meta << "\"o_proj_weight\": [" << (num_query_heads * head_size) << ", " << hidden_size << "],";
+       meta << "\"position_ids\": [" << num_tokens << "],";
+       meta << "\"kv_page_indices\": [" << buffer.kv_page_indices.size() << "],";
+       meta << "\"kv_page_indptr\": [" << buffer.kv_page_indptr.size() << "],";
+       meta << "\"kv_last_page_lens\": [" << buffer.kv_last_page_lens.size() << "],";
+       meta << "\"kv_batch_indices\": [" << buffer.kv_batch_indices.size() << "],";
+       meta << "\"kv_positions\": [" << buffer.kv_positions.size() << "],";
+       meta << "\"qo_indptr\": [" << buffer.qo_indptr.size() << "],";
+       meta << "\"custom_mask\": [" << buffer.custom_mask.size() << "],";
+       meta << "\"mask_indptr\": [" << buffer.mask_indptr.size() << "]};\n";
+        artifacts::write_meta_json(dir, meta.str());
+
+        // Host-side metadata/index arrays
+        artifacts::write_device_bin(dir, "hidden_states", hidden_states, num_tokens * hidden_size);
+       // Projection weights (allowing Metal to recompute q/k/v if desired)
+       artifacts::write_device_bin(dir, "q_proj_weight", q_proj_weights_.data(), (size_t)hidden_size * num_query_heads * head_size);
+       artifacts::write_device_bin(dir, "k_proj_weight", k_proj_weights_.data(), (size_t)hidden_size * num_key_value_heads * head_size);
+       artifacts::write_device_bin(dir, "v_proj_weight", v_proj_weights_.data(), (size_t)hidden_size * num_key_value_heads * head_size);
+       artifacts::write_device_bin(dir, "o_proj_weight", o_proj_weights_.data(), (size_t)num_query_heads * head_size * hidden_size);
+        artifacts::write_device_bin(dir, "q_proj", q_proj.data(), q_proj_count);
+        artifacts::write_device_bin(dir, "k_proj", k_proj.data(), kv_proj_count);
+        artifacts::write_device_bin(dir, "v_proj", v_proj.data(), kv_proj_count);
+        artifacts::write_device_bin(dir, "position_ids", buffer.position_ids.data(), num_tokens);
+        artifacts::write_device_bin(dir, "kv_page_indices", buffer.kv_page_indices.data(), buffer.kv_page_indices.size());
+        artifacts::write_device_bin(dir, "kv_page_indptr", buffer.kv_page_indptr.data(), buffer.kv_page_indptr.size());
+        artifacts::write_device_bin(dir, "kv_last_page_lens", buffer.kv_last_page_lens.data(), buffer.kv_last_page_lens.size());
+        artifacts::write_device_bin(dir, "kv_batch_indices", buffer.kv_batch_indices.data(), buffer.kv_batch_indices.size());
+        artifacts::write_device_bin(dir, "kv_positions", buffer.kv_positions.data(), buffer.kv_positions.size());
+        artifacts::write_device_bin(dir, "qo_indptr", buffer.qo_indptr.data(), buffer.qo_indptr.size());
+        artifacts::write_device_bin(dir, "custom_mask", buffer.custom_mask.data(), buffer.custom_mask.size());
+        artifacts::write_device_bin(dir, "mask_indptr", buffer.mask_indptr.data(), buffer.mask_indptr.size());
+    }
+
     flashinfer::paged_kv_t<T, int32_t> paged_kv(
         num_key_value_heads, buffer.page_size, head_size, batch_size,
         flashinfer::QKVLayout::kNHD,
@@ -496,6 +607,16 @@ void L4maAttention<T>::forward(
     );
 
     profiler.record("apply_rope");
+
+    // Optional: dump q/k after RoPE application
+    if (artifacts::op_enabled("l4ma_attention_forward")) {
+        std::string case_id = artifacts::get_env_str("PIE_ARTIFACT_CASE_ID", "auto");
+        auto dir = artifacts::ensure_dir_for_case("l4ma_attention_forward", case_id);
+    // Ensure RoPE kernel has completed so we capture post-RoPE contents
+    cudaStreamSynchronize(buffer.stream);
+        artifacts::write_device_bin(dir, "q_after_rope", q_proj.data(), q_proj_count);
+        artifacts::write_device_bin(dir, "k_after_rope", k_proj.data(), kv_proj_count);
+    }
 
     flashinfer::AppendPagedKVCache<T, int32_t>(
         paged_kv, k_proj.data(), v_proj.data(),
@@ -525,9 +646,69 @@ void L4maAttention<T>::forward(
     );
     profiler.record("attention");
 
+    // Optional: dump attention context before o-proj
+    if (artifacts::op_enabled("l4ma_attention_forward")) {
+        std::string case_id = artifacts::get_env_str("PIE_ARTIFACT_CASE_ID", "auto");
+        auto dir = artifacts::ensure_dir_for_case("l4ma_attention_forward", case_id);
+        artifacts::write_device_bin(dir, "context_before_o_proj", o_proj_input_ptr, num_tokens * num_query_heads * head_size);
+    }
+
     // 5. Final output projection
     gemm_cublasLt<T>(buffer.ltHandle, buffer.stream, o_proj_input_ptr, o_proj_weights_.data(), nullptr, attn_output, num_tokens, hidden_size, num_query_heads * head_size, cublas_workspace.data(), cublas_workspace_size, false, true);
     profiler.record("o_projection");
+
+    // Optional: dump final attention output post o-proj
+    if (artifacts::op_enabled("l4ma_attention_forward")) {
+        std::string case_id = artifacts::get_env_str("PIE_ARTIFACT_CASE_ID", "auto");
+        auto dir = artifacts::ensure_dir_for_case("l4ma_attention_forward", case_id);
+        artifacts::write_device_bin(dir, "attn_output", attn_output, num_tokens * hidden_size);
+    // Overwrite meta.json with a comprehensive schema (no checksum_map).
+    cudaStreamSynchronize(buffer.stream);
+    std::ostringstream meta_full;
+    meta_full << "\"version\": \"1\",\n"
+          << "\"op\": \"l4ma_attention_forward\",\n"
+          << "\"case_id\": " << artifacts::json_escape(case_id) << ",\n"
+          << "\"config\": {\"hidden_size\": " << hidden_size
+          << ", \"head_size\": " << head_size
+          << ", \"num_q_heads\": " << num_query_heads
+          << ", \"num_kv_heads\": " << num_key_value_heads
+          << ", \"page_size\": " << buffer.page_size
+          << ", \"batch_size\": " << batch_size
+          << ", \"num_tokens\": " << num_tokens
+          << ", \"rope_theta\": " << config_.rope_theta
+          << ", \"rope_factor\": " << config_.rope_factor
+          << ", \"rope_low_freq_factor\": " << config_.rope_low_frequency_factor
+          << ", \"rope_high_freq_factor\": " << config_.rope_high_frequency_factor << "},\n"
+          << "\"dtype_map\": {"
+          << "\"hidden_states\": \"bf16\",\"q_proj\": \"bf16\",\"k_proj\": \"bf16\",\"v_proj\": \"bf16\"," 
+          << "\"q_after_rope\": \"bf16\",\"k_after_rope\": \"bf16\",\"context_before_o_proj\": \"bf16\",\"attn_output\": \"bf16\","
+          << "\"q_proj_weight\": \"bf16\",\"k_proj_weight\": \"bf16\",\"v_proj_weight\": \"bf16\",\"o_proj_weight\": \"bf16\","
+          << "\"position_ids\": \"s32\",\"kv_page_indices\": \"s32\",\"kv_page_indptr\": \"s32\",\"kv_last_page_lens\": \"s32\"," 
+          << "\"kv_batch_indices\": \"s32\",\"kv_positions\": \"s32\",\"qo_indptr\": \"s32\",\"custom_mask\": \"u8\",\"mask_indptr\": \"s32\"},\n"
+          << "\"shape_map\": {"
+          << "\"hidden_states\": [" << num_tokens << ", " << hidden_size << "],"
+          << "\"q_proj\": [" << num_tokens << ", " << (num_query_heads * head_size) << "],"
+          << "\"k_proj\": [" << num_tokens << ", " << (num_key_value_heads * head_size) << "],"
+          << "\"v_proj\": [" << num_tokens << ", " << (num_key_value_heads * head_size) << "],"
+          << "\"q_after_rope\": [" << num_tokens << ", " << (num_query_heads * head_size) << "],"
+          << "\"k_after_rope\": [" << num_tokens << ", " << (num_key_value_heads * head_size) << "],"
+          << "\"context_before_o_proj\": [" << num_tokens << ", " << (num_query_heads * head_size) << "],"
+          << "\"attn_output\": [" << num_tokens << ", " << hidden_size << "],"
+          << "\"q_proj_weight\": [" << hidden_size << ", " << (num_query_heads * head_size) << "],"
+          << "\"k_proj_weight\": [" << hidden_size << ", " << (num_key_value_heads * head_size) << "],"
+          << "\"v_proj_weight\": [" << hidden_size << ", " << (num_key_value_heads * head_size) << "],"
+          << "\"o_proj_weight\": [" << (num_query_heads * head_size) << ", " << hidden_size << "],"
+          << "\"position_ids\": [" << num_tokens << "],"
+          << "\"kv_page_indices\": [" << buffer.kv_page_indices.size() << "],"
+          << "\"kv_page_indptr\": [" << buffer.kv_page_indptr.size() << "],"
+          << "\"kv_last_page_lens\": [" << buffer.kv_last_page_lens.size() << "],"
+          << "\"kv_batch_indices\": [" << buffer.kv_batch_indices.size() << "],"
+          << "\"kv_positions\": [" << buffer.kv_positions.size() << "],"
+          << "\"qo_indptr\": [" << buffer.qo_indptr.size() << "],"
+          << "\"custom_mask\": [" << buffer.custom_mask.size() << "],"
+          << "\"mask_indptr\": [" << buffer.mask_indptr.size() << "]}";
+    artifacts::write_meta_json(dir, meta_full.str());
+    }
 
     // 6. Deallocate buffers in reverse order
     buffer.deallocate(cublas_workspace);

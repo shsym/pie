@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <map>
+#include "artifacts.hpp"
 
 
 
@@ -126,6 +127,27 @@ std::unique_ptr<L4maForCausalLM<T>> load_model_internal(const AppConfig& config,
     }
 
     std::cout << "\nSuccessfully loaded " << loaded_keys.size() << " expected weights." << std::endl;
+
+    // Optional: compute and write per-parameter checksums right after loading
+    if (artifacts::op_enabled("model_weights")) {
+        // Ensure any pending copies are visible
+        cudaDeviceSynchronize();
+        std::string case_id = artifacts::get_env_str("PIE_ARTIFACT_CASE_ID", "auto");
+        auto dir = artifacts::ensure_dir_for_case("model_weights", case_id);
+
+        // Build key/value pairs of name -> hex checksum
+        std::vector<std::pair<std::string, std::string>> kvs;
+        kvs.reserve(params_map.size());
+        for (const auto& [name, tensor_ptr] : params_map) {
+            if (!tensor_ptr || tensor_ptr->is_empty()) {
+                kvs.emplace_back(name, std::string(""));
+                continue;
+            }
+            uint64_t h = artifacts::compute_device_fnv1a64(tensor_ptr->data(), tensor_ptr->size());
+            kvs.emplace_back(name, artifacts::to_hex64(h));
+        }
+        artifacts::write_json_object(dir / "checksums.json", kvs);
+    }
 
     return model_ptr;
 }

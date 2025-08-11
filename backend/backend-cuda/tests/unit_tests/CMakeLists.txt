@@ -23,6 +23,8 @@ add_executable(test_cast_type_half test_cast_type_half.cu)
 add_executable(test_add_residual_full test_add_residual_full.cu)
 add_executable(test_act_and_mul_full test_act_and_mul_full.cu)
 add_executable(test_forward_text_full test_forward_text_full.cu metadata_loader.cpp)
+add_executable(test_artifacts_framework test_artifacts_framework.cu metadata_loader.cpp)
+add_executable(test_artifacts_compare test_artifacts_compare.cu metadata_loader.cpp)
 
 # Link against the CUDA runtime library and the common kernels library
 set(TEST_LIBS CUDA::cudart cuda_common_kernels CUDA::cublas CUDA::cublasLt)
@@ -36,6 +38,8 @@ if(DEFINED flashinfer_SOURCE_DIR)
   target_include_directories(test_add_residual_full PRIVATE ${flashinfer_SOURCE_DIR}/include ${flashinfer_SOURCE_DIR}/src/generated)
   target_include_directories(test_act_and_mul_full PRIVATE ${flashinfer_SOURCE_DIR}/include ${flashinfer_SOURCE_DIR}/src/generated)
   target_include_directories(test_forward_text_full PRIVATE ${flashinfer_SOURCE_DIR}/include ${flashinfer_SOURCE_DIR}/src/generated)
+  target_include_directories(test_artifacts_framework PRIVATE ${flashinfer_SOURCE_DIR}/include ${flashinfer_SOURCE_DIR}/src/generated)
+  target_include_directories(test_artifacts_compare PRIVATE ${flashinfer_SOURCE_DIR}/include ${flashinfer_SOURCE_DIR}/src/generated)
 endif()
 
 # Expose toml++ include dir (fetched via CPM) to test needing metadata parsing
@@ -45,8 +49,15 @@ endif()
 target_link_libraries(test_add_residual_full PRIVATE ${TEST_LIBS} decode_kernels prefill_kernels)
 target_link_libraries(test_act_and_mul_full PRIVATE ${TEST_LIBS} decode_kernels prefill_kernels)
 target_link_libraries(test_forward_text_full PRIVATE ${TEST_LIBS} decode_kernels prefill_kernels tomlplusplus::tomlplusplus)
+target_link_libraries(test_artifacts_framework PRIVATE ${TEST_LIBS} decode_kernels prefill_kernels tomlplusplus::tomlplusplus)
+target_link_libraries(test_artifacts_compare PRIVATE ${TEST_LIBS} decode_kernels prefill_kernels tomlplusplus::tomlplusplus)
 
 # NVCC options required by flashinfer (match main target)
-foreach(tgt IN ITEMS test_add_residual_full test_act_and_mul_full test_forward_text_full)
+foreach(tgt IN ITEMS test_add_residual_full test_act_and_mul_full test_forward_text_full test_artifacts_framework)
   target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>)
 endforeach()
+target_compile_options(test_artifacts_compare PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda --expt-relaxed-constexpr>)
+
+# Register the artifacts framework test with CTest
+add_test(NAME artifacts_framework COMMAND test_artifacts_framework)
+add_test(NAME artifacts_compare COMMAND test_artifacts_compare)
