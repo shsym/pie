@@ -6,6 +6,7 @@ use crate::traits::allocate::Allocate;
 use crate::traits::forward::Forward;
 use crate::traits::forward_text::ForwardText;
 use crate::traits::input_text::InputText;
+use crate::traits::optimize::Optimize;
 use crate::traits::output_text::{Distribution, OutputText};
 use crate::traits::tokenize::{Tokenize, Tokenizer};
 use crate::{Model, Queue, sampler, stop_condition};
@@ -471,17 +472,32 @@ impl Context {
             .map(|brie| brie.buffer)
             .collect::<Vec<Vec<u32>>>();
 
-        let sampled = self
-            .queue
-            .forward_text(
-                self.kv_page_last_len as u32,
-                &self.kv_page_ids,
-                &pending_token_ids,
-                &position_ids,
-                &mask,
-                &[pending_token_ids.len() as u32 - 1],
-            )
-            .await;
+        let sampled = if let Some(adapter) = self.model.get_adapter() {
+            self.queue
+                .forward_with_mutation(
+                    &adapter.name,
+                    adapter.seed,
+                    self.kv_page_last_len as u32,
+                    &self.kv_page_ids,
+                    &pending_token_ids,
+                    &position_ids,
+                    &mask,
+                    &[pending_token_ids.len() as u32 - 1],
+                )
+                .await
+                .unwrap()
+        } else {
+            self.queue
+                .forward_text(
+                    self.kv_page_last_len as u32,
+                    &self.kv_page_ids,
+                    &pending_token_ids,
+                    &position_ids,
+                    &mask,
+                    &[pending_token_ids.len() as u32 - 1],
+                )
+                .await
+        };
 
         // let sampled = self.queue.get_next_token_distribution(&output_embed_id).await;
 

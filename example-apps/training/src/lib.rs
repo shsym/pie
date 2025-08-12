@@ -2,22 +2,50 @@ use pico_args::Arguments;
 use std::ffi::OsString;
 use std::fmt;
 use std::str::FromStr;
+use inferlet::traits::Optimize;
 
 #[inferlet::main]
 async fn main() -> Result<(), String> {
 
+    let mut model = inferlet::get_auto_model();
+    let queue = model.create_queue();
 
-    // overall flow - 1 inferlet per each node
+    let tokenizer = model.get_tokenizer();
 
-    // 1. create an adapter (set the population size, etc).
-    // 2. prepare the dataloader
-    // in the training loop:
-    //      1. receive n random questions per population (random seed)
-    //      2. do rollout with random seeds
-    //      3. evaluate the score of the random seed
-    //      4. broadcast the score with others -> just send the score and seed back to the user
-    //      5. receive the score from others
-    //      6. update the population
+    //queue.update_adapter("evo", scores, seeds)
+    model.set_adapter("evo",13513513);
+
+    // if command == "initialize" {
+    //     // create an mutable adapter with the specified name.
+    //     should be only used once.
+     // CLI input: "name"
+
+    //     queue.create_adapter("evo");
+    //
+    //     // also create a prefix cache
+    //
+    // }
+    //
+    // else if command == "rollout" {
+    //
+    //     // do rollout with a random perturbation, or without perturbation (for evaluation)
+    //     13513513 is a received seed
+    //     questio
+    //     model.set_adapter("evo", 13513513);
+    //
+    //     // do a fork on a cached context.
+    //     for each zip(question, seed):
+    //         future.push(ctx.generate_until("<|eot_id|>", max_num_outputs).await;
+    ///    // await the future
+    ///    inferlet::send the output in json
+    // }
+    //
+    // else if command == "update" {
+    //     // update the population with the results of the rollouts
+    //     input = seeds:list[i64], scores:list[f32]
+    //     queue.update_adapter("evo", &scores, &seeds);
+    // }
+    //
 
     
     
