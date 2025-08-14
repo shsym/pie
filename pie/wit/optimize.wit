@@ -5,6 +5,7 @@ interface optimize {
     use allocate.{object-id};
     
     create-adapter: func(
+        queue: borrow<queue>,
         name: string,
         rank: u32,
         alpha: f32,
@@ -14,10 +15,12 @@ interface optimize {
     );
 
     destroy-adapter: func(
+        queue: borrow<queue>,
         name: string
     );
 
     update-adapter: func(
+        queue: borrow<queue>,
         name: string,
         scores: list<f32>,
         seeds: list<s64>,

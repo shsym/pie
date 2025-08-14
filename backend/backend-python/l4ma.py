@@ -138,9 +138,9 @@ class L4maAttention(nn.Module):
 
         # apply adapters if provided
         if adapter_buffer is not None:
-            seg_size = adapter_buffer.segment_size
-            delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states[:seg_size])
-            qkv_states[:seg_size] += delta
+            nnz = adapter_buffer.nnz
+            delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states[:nnz])
+            qkv_states[:nnz] += delta
 
 
         query_states, key_states, value_states = torch.split(
@@ -327,6 +327,7 @@ class L4maModel(nn.Module):
                 adapter_indices=adapter_indices,
                 x_indptr=qo_indptr[:adapter_indices.size(0) + 1],
                 segment_gemm_wrapper=self.wrapper_segment_gemm,
+                dtype=self.config.dtype,
             )
         else:
             adapter_buffer = None

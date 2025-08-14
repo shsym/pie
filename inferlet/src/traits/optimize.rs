@@ -41,6 +41,7 @@ impl Optimize for Queue {
         initial_sigma: f32,
     ) {
         optimize::create_adapter(
+            &self.inner,
             name,
             rank,
             alph,
@@ -51,11 +52,11 @@ impl Optimize for Queue {
     }
 
     fn destroy_adapter(&self, name: &str) {
-        optimize::destroy_adapter(name);
+        optimize::destroy_adapter(&self.inner, name);
     }
 
     fn update_adapter(&self, name: &str, scores: &[f32], seeds: &[i64]) {
-        optimize::update_adapter(name, scores, seeds);
+        optimize::update_adapter(&self.inner, name, scores, seeds);
     }
 
     async fn forward_with_mutation(

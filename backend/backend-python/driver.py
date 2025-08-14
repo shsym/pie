@@ -600,15 +600,15 @@ class Driver:
 
         self.adapters[cmd.name] = MutableAdapter(
             num_layers=cfg.num_layers,
-            in_features=[cfg.hidden_size, cfg.hidden_size, cfg.hidden_size],
+            in_features=cfg.hidden_size,
             out_features=[cfg.head_size * cfg.num_query_heads, cfg.head_size * cfg.num_key_value_heads, cfg.head_size * cfg.num_key_value_heads],
-            rank=8,
-            alpha=4,
-            population_size=1000,
-            mu_fraction=0.25,
-            initial_sigma=0.0005,
-            dtype=torch.bfloat16,
+            rank=cmd.rank,
+            alpha=cmd.alpha,
+            population_size=cmd.population_size,
+            mu_fraction=cmd.mu_fraction,
+            initial_sigma=cmd.initial_sigma,
             device=self.device,
+            dtype=torch.bfloat16,
         )
 
     def destroy_adapter(self, cmd: DestroyAdapter):
@@ -659,7 +659,7 @@ class Driver:
                     all_seeds.append(cmd.seed)
                     adapter_indices.append(len(all_adapters) - 1)
                 else:
-                    pass
+                    raise ValueError(f"Adapter {cmd.adapter} is not MutableAdapter.")
 
             kv_page_indices.extend(cmd.kv_page_ids)
             kv_page_indptr.append(len(kv_page_indices))

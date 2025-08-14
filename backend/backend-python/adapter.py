@@ -32,7 +32,7 @@ class Adapter:
         raise NotImplementedError("Subclasses should implement this method.")
 
     @property
-    def out_features(self) -> int:
+    def out_features(self) -> list[int]:
         """Returns the output feature dimension of the adapter."""
         raise NotImplementedError("Subclasses should implement this method.")
 
@@ -54,6 +54,9 @@ class AdapterBuffer:
     adapter_indices: torch.Tensor
     x_indptr: torch.Tensor
     segment_size: int
+    num_adapter_group: int
+    adapter_rank: int
+    adapter_out_features: list[int]
 
     down_proj_buffer: torch.Tensor
     up_proj_buffer: torch.Tensor
@@ -64,21 +67,32 @@ class AdapterBuffer:
                  adapters: list[Adapter],
                  adapter_indices: torch.Tensor,
                  x_indptr: torch.Tensor,
-                 segment_gemm_wrapper
+                 segment_gemm_wrapper,
+                 dtype: torch.dtype,
                  ):
+
         self.adapters = adapters
         self.adapter_indices = adapter_indices
         self.x_indptr = x_indptr
-        self.segment_size = x_indptr[-1].item()
+        self.num_segments = len(adapters)
+        self.nnz = x_indptr[-1].item()
         self.segment_gemm_wrapper = segment_gemm_wrapper
 
+        in_features = adapters[0].in_features
+        out_features = adapters[0].out_features
+        rank = adapters[0].rank
+        num_group = len(out_features)
+        self.num_adapter_group = num_group
+        self.adapter_rank = rank
+        self.adapter_out_features = out_features
+
         # buffers for storing weights
-        self.down_proj_buffer = torch.empty((len(adapters), adapters[0].in_features, adapters[0].rank), device=x_indptr.device)
-        self.up_proj_buffer = torch.empty((len(adapters), adapters[0].rank, adapters[0].out_features), device=x_indptr.device)
+        self.down_proj_buffer = torch.empty((self.num_segments, in_features, num_group * rank), device=x_indptr.device, dtype=dtype)
+        self.up_proj_buffer = torch.empty((self.num_segments, rank, sum(out_features)), device=x_indptr.device, dtype=dtype)
 
         # buffers for activations
-        self.down_buffer = torch.empty((self.segment_size, adapters[0].rank), device=x_indptr.device)
-        self.up_buffer = torch.empty((self.segment_size, adapters[0].out_features), device=x_indptr.device)
+        self.down_buffer = torch.empty((self.nnz, num_group * rank), device=x_indptr.device, dtype=dtype)
+        self.up_buffer = torch.empty((self.nnz, sum(out_features)), device=x_indptr.device, dtype=dtype)
 
     def compute_lora_delta(self, layer_idx: int, x: torch.Tensor) -> torch.Tensor:
         # first update the buffers with the current adapter weights
@@ -87,26 +101,55 @@ class AdapterBuffer:
             self.down_proj_buffer[i].copy_(adapter.down_proj(layer_idx))
             self.up_proj_buffer[i].copy_(adapter.up_proj(layer_idx))
 
+        # print out all tensor shapes
+        # print('down_proj_buffer', self.down_proj_buffer.shape)
+        # print('up_proj_buffer', self.up_proj_buffer.shape)
+        # print('down_buffer', self.down_buffer.shape)
+        # print('up_buffer', self.up_buffer.shape)
+        # print('x', x.shape)
+        # print('x_indptr', self.x_indptr.shape)
+        # print('adapter_indices', self.adapter_indices.shape)
+
         # do segmented GEMM
         self.segment_gemm_wrapper.run(
             x=x,
             weights=self.down_proj_buffer,
-            batch_size=self.segment_size,
+            batch_size=self.num_segments,
             weight_column_major=False,
             out=self.down_buffer,
             seg_indptr=self.x_indptr,
             weight_indices=self.adapter_indices
         )
 
-        self.segment_gemm_wrapper.run(
-            x=self.down_buffer,
-            weights=self.up_proj_buffer,
-            batch_size=self.segment_size,
-            weight_column_major=False,
-            out=self.up_buffer,
-            seg_indptr=self.x_indptr,
-            weight_indices=self.adapter_indices
-        )
+        #print('num_adapter_group', self.num_adapter_group)
+        #print('adapter_out_features', self.adapter_out_features)
+        down_buffer_by_grp = torch.split(self.down_buffer, self.adapter_rank, dim=-1)
+        up_proj_buffer_by_grp = torch.split(self.up_proj_buffer, self.adapter_out_features, dim=-1)
+        up_buffer_by_grp = torch.split(self.up_buffer, self.adapter_out_features, dim=-1)
+
+        # do segmented gemm by group (nnz, rank) * (seg, rank, out_features[i])
+
+        for i in range(self.num_adapter_group):
+
+            #print('down_buffer_by_grp', down_buffer_by_grp[i].shape)
+            #print('up_proj_buffer_by_grp', up_proj_buffer_by_grp[i].shape)
+            #print('up_buffer_by_grp', up_buffer_by_grp[i].shape)
+
+#             [Backend] num_adapter_group 3
+            # [Backend] adapter_out_features [2048, 512, 512]
+            # [Backend] down_buffer_by_grp torch.Size([475, 4])
+            # [Backend] up_proj_buffer_by_grp torch.Size([4, 4, 2048])
+            # [Backend] up_buffer_by_grp torch.Size([475, 2048])
+
+            self.segment_gemm_wrapper.run(
+                x=down_buffer_by_grp[i],
+                weights=up_proj_buffer_by_grp[i],
+                batch_size=self.num_segments,
+                weight_column_major=False,
+                out=up_buffer_by_grp[i],
+                seg_indptr=self.x_indptr,
+                weight_indices=self.adapter_indices
+            )
 
         scale = self.adapters[0].alpha / self.adapters[0].rank
         return scale * self.up_buffer
@@ -115,26 +158,26 @@ class AdapterBuffer:
 class BaseAdapter(Adapter):
     """A basic adapter implementation holding weight tensors for multiple layers."""
     base_num_layers: int
+    base_num_groups: int
     base_rank: int
     base_alpha: float
     base_in_features: int
-    base_out_features: int
+    base_out_features: list[int]
     base_weight_down: torch.Tensor
     base_weight_up: torch.Tensor
 
-    def __init__(self, num_layers: int, in_features: int | list[int], out_features: int | list[int], rank: int, alpha: float):
+    def __init__(self, num_layers: int, in_features: int, out_features: list[int], rank: int, alpha: float, dtype: torch.dtype):
         super().__init__()
+
         self.base_num_layers = num_layers
+        self.base_num_groups = len(out_features)
         self.base_rank = rank
         self.base_alpha = alpha
 
-        in_features_total = sum(in_features) if isinstance(in_features, list) else in_features
-        out_features_total = sum(out_features) if isinstance(out_features, list) else out_features
-
-        self.base_in_features = in_features_total
-        self.base_out_features = out_features_total
-        self.base_weight_down = torch.empty((num_layers, in_features_total, rank))
-        self.base_weight_up = torch.empty((num_layers, rank, out_features_total))
+        self.base_in_features = in_features
+        self.base_out_features = out_features
+        self.base_weight_down = torch.empty((num_layers, in_features, rank * len(out_features)), dtype=dtype)
+        self.base_weight_up = torch.empty((num_layers, rank, sum(out_features)), dtype=dtype)
 
     @property
     def num_layers(self) -> int:
@@ -153,7 +196,7 @@ class BaseAdapter(Adapter):
         return self.base_in_features
 
     @property
-    def out_features(self) -> int:
+    def out_features(self) -> list[int]:
         return self.base_out_features
 
     def down_proj(self, layer_idx: int) -> torch.Tensor:
@@ -176,17 +219,18 @@ class MutableAdapter(BaseAdapter):
 
     def __init__(self,
                  num_layers: int,
-                 in_features: int | list[int],
-                 out_features: int | list[int],
+                 in_features: int,
+                 out_features: list[int],
                  rank: int,
                  alpha: float,
                  population_size: int,
-                 mu_fraction: float = 0.5,
-                 initial_sigma: float = 0.02,
-                 dtype: torch.dtype = torch.float32,
-                 device: torch.device | str = None):
+                 mu_fraction: float,
+                 initial_sigma: float,
+                 device: torch.device,
+                 dtype: torch.dtype
+                 ):
 
-        super().__init__(num_layers, in_features, out_features, rank, alpha)
+        super().__init__(num_layers, in_features, out_features, rank, alpha, dtype)
 
         final_device = device if device is not None else self.base_weight_down.device
 
@@ -249,8 +293,8 @@ class MutableAdapter(BaseAdapter):
         for i, seed in enumerate(top_seeds):
             generator.manual_seed(seed)
             # Generate noise for all layers for the i-th individual at once
-            all_z_down[i] = torch.randn(*z_down_shape, generator=generator)
-            all_z_up[i] = torch.randn(*z_up_shape, generator=generator)
+            all_z_down[i] = torch.randn(*z_down_shape, generator=generator, device=device, dtype=dtype)
+            all_z_up[i] = torch.randn(*z_up_shape, generator=generator, device=device, dtype=dtype)
 
         # --- Step 2 - Loop through layers to apply updates ---
         for layer_idx in range(self.num_layers):
@@ -376,5 +420,5 @@ class AdapterWithMutation(Adapter):
         return self.adapter.in_features
 
     @property
-    def out_features(self) -> int:
+    def out_features(self) -> list[int]:
         return self.adapter.out_features

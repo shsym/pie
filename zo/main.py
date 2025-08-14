@@ -47,7 +47,7 @@ TRAINING_STEPS = 100
 POPULATION_SIZE = 4      # Total number of seeds per step across all clients
 TASKS_PER_SEED = 1        # Number of tasks to evaluate for each seed
 NUM_ROLLOUT_WORKERS = 1   # Number of inferlets PER CLIENT
-LORA_RANK = 4
+LORA_RANK = 8
 LORA_ALPHA = 8.0
 INITIAL_SIGMA = 0.02
 MU_FRACTION = 0.5
@@ -55,7 +55,7 @@ MAX_TOKENS_GEN = 128
 
 # --- Dataset Config ---
 # This would point to your actual dataset
-DATA_PATH = "./countdown_data"
+DATA_PATH = "./Countdown-Tasks-3to4"
 
 
 # ==============================================================================

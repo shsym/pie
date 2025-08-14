@@ -399,7 +399,7 @@ def run_zmq_server(router, engine, config, model_metadata):
                     elif command == "update_adapter":
                         engine.update_adapter(request.update_adapter)
                     elif command == "forward_with_mutation":
-                        res = engine.forward_with_mutation(request.forward_text)
+                        res = engine.forward_with_mutation(request.forward_with_mutation)
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, forward_text=res)
                     elif command == "get_info":
                         print("Getting info from the engine.")

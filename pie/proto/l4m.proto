@@ -190,6 +190,11 @@ message BatchDebugQueryRequest {
 
 message CreateAdapter {
   string name = 1;
+  uint32 rank = 2;
+  float alpha = 3;
+  uint32 population_size = 4;
+  float mu_fraction = 5;
+  float initial_sigma = 6;
 }
 
 message DestroyAdapter {

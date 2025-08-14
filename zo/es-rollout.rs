@@ -3,6 +3,7 @@ use inferlet::{
     self,
     context::Context,
 };
+use inferlet::traits::Optimize;
 use pico_args::Arguments;
 use serde::Serialize;
 use std::ffi::OsString;

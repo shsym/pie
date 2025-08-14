@@ -362,6 +362,11 @@ pub enum Command {
         inst_id: InstanceId,
         stream_id: LocalStreamId,
         name: String,
+        rank: u32,
+        alpha: f32,
+        population_size: u32,
+        mu_fraction: f32,
+        initial_sigma: f32,
     },
 
     DestroyAdapter {
@@ -1274,11 +1279,21 @@ impl L4m {
                 inst_id,
                 stream_id,
                 name,
+                rank,
+                alpha,
+                population_size,
+                mu_fraction,
+                initial_sigma,
             } => Some((
                 Command::CreateAdapter {
                     inst_id,
                     stream_id,
                     name,
+                    rank,
+                    alpha,
+                    population_size,
+                    mu_fraction,
+                    initial_sigma,
                 },
                 Stream::new(inst_id, stream_id),
             )),
@@ -2099,14 +2114,30 @@ fn encode_pb_create_adapter(
     batch: Vec<Command>,
 ) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
     let mut adapter_name = None;
+    let mut adapter_rank = None;
+    let mut adapter_alpha = None;
+    let mut adapter_population_size = None;
+    let mut adapter_mu_fraction = None;
+    let mut adapter_initial_sigma = None;
     for cmd in batch {
         match cmd {
             Command::CreateAdapter {
                 inst_id: _,
                 stream_id: _,
                 name,
+                rank,
+                alpha,
+                population_size,
+                mu_fraction,
+                initial_sigma,
             } => {
                 adapter_name = Some(name);
+                adapter_rank = Some(rank);
+                adapter_alpha = Some(alpha);
+                adapter_population_size = Some(population_size);
+                adapter_mu_fraction = Some(mu_fraction);
+                adapter_initial_sigma = Some(initial_sigma);
+
                 break;
             }
             _ => unreachable!(),
@@ -2115,6 +2146,11 @@ fn encode_pb_create_adapter(
 
     let cmd = pb_bindings::request::Command::CreateAdapter(pb_bindings::CreateAdapter {
         name: adapter_name.unwrap(),
+        rank: adapter_rank.unwrap(),
+        alpha: adapter_alpha.unwrap(),
+        population_size: adapter_population_size.unwrap(),
+        mu_fraction: adapter_mu_fraction.unwrap(),
+        initial_sigma: adapter_initial_sigma.unwrap(),
     });
     let payload = pb_bindings::Request {
         correlation_id,
