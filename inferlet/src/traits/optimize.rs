@@ -4,8 +4,15 @@ use crate::traits::output_text::Distribution;
 use wstd::io::AsyncPollable;
 
 pub trait Optimize {
-    fn create_adapter(&self, name: &str);
-
+    fn create_adapter(
+        &self,
+        name: &str,
+        rank: u32,
+        alph: f32,
+        population_size: u32,
+        mu_fraction: f32,
+        initial_sigma: f32,
+    );
     fn destroy_adapter(&self, name: &str);
 
     fn update_adapter(&self, name: &str, scores: &[f32], seeds: &[i64]);
@@ -24,8 +31,23 @@ pub trait Optimize {
 }
 
 impl Optimize for Queue {
-    fn create_adapter(&self, name: &str) {
-        optimize::create_adapter(name);
+    fn create_adapter(
+        &self,
+        name: &str,
+        rank: u32,
+        alph: f32,
+        population_size: u32,
+        mu_fraction: f32,
+        initial_sigma: f32,
+    ) {
+        optimize::create_adapter(
+            name,
+            rank,
+            alph,
+            population_size,
+            mu_fraction,
+            initial_sigma,
+        );
     }
 
     fn destroy_adapter(&self, name: &str) {

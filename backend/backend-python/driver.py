@@ -534,6 +534,8 @@ class Driver:
         with torch.cuda.device(self.device):
 
             output_embeds = self.lm.model.forward(
+                adapters=None,
+                adapter_indices=None,
                 input_embeds=input_embeds,
                 position_ids=pt_new_position_ids,
                 kv_cache_at_layer=self.kv_cache_at_layer,

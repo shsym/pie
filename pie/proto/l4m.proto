@@ -188,6 +188,43 @@ message BatchDebugQueryRequest {
   repeated DebugQueryRequest items = 1;
 }
 
+message CreateAdapter {
+  string name = 1;
+}
+
+message DestroyAdapter {
+  string name = 1;
+}
+
+message UpdateAdapter {
+  string name = 1;
+  repeated float scores = 2;
+  repeated int64 seeds = 3;
+}
+
+message ForwardWithMutation {
+  string adapter = 1;
+
+  int64 seed = 2;
+
+  repeated uint32 kv_page_ids = 3;
+
+  uint32 kv_page_last_len = 4;
+
+  repeated uint32 token_ids = 5;
+
+  repeated uint32 position_ids = 6;
+
+  repeated BrleBuffer mask = 7;
+
+  repeated uint32 output_indices = 8;
+
+}
+
+message BatchForwardWithMutation {
+  repeated ForwardWithMutation items = 1;
+}
+
 // The response containing decoded tokens.
 message SampleTopKResponse {
   // The decoded token IDs.
@@ -245,6 +282,8 @@ message BatchDebugQueryResponse {
 }
 
 
+
+
 message Tokenizer {
   map<uint32, bytes> merge_table = 1;
   map<string, uint32> special_tokens = 2;
@@ -267,7 +306,11 @@ message Request {
     BatchDecodeTokenDistribution decode_token_distribution = 9;
     BatchSampleTopKRequest sample_top_k_request = 10;
     BatchDebugQueryRequest debug_query_request = 11;
-    GetInfoRequest get_info = 12;
+    CreateAdapter create_adapter = 12;
+    DestroyAdapter destroy_adapter = 13;
+    UpdateAdapter update_adapter = 14;
+    BatchForwardWithMutation forward_with_mutation = 15;
+    GetInfoRequest get_info = 16;
   }
 }
 

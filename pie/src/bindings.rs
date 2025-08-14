@@ -39,7 +39,8 @@ where
         + pie::inferlet::input_text::Host
         + pie::inferlet::input_image::Host
         + pie::inferlet::output_text::Host
-        + pie::inferlet::tokenize::Host,
+        + pie::inferlet::tokenize::Host
+        + pie::inferlet::optimize::Host,
 {
     pie::inferlet::core::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::inferlet::allocate::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
@@ -49,5 +50,6 @@ where
     pie::inferlet::input_image::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::inferlet::output_text::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::inferlet::tokenize::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::inferlet::optimize::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     Ok(())
 }

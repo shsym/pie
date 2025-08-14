@@ -9,7 +9,15 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::async_trait;
 
 impl bindings::pie::inferlet::optimize::Host for InstanceState {
-    async fn create_adapter(&mut self, name: String) -> anyhow::Result<()> {
+    async fn create_adapter(
+        &mut self,
+        name: String,
+        rank: u32,
+        alph: f32,
+        population_size: u32,
+        mu_fraction: f32,
+        initial_sigma: f32,
+    ) -> anyhow::Result<()> {
         todo!()
     }
 
