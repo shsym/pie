@@ -97,7 +97,7 @@ async fn main() -> Result<(), String> {
         // Create the base context from scratch using the provided prefix.
         let mut base_ctx = model.create_context();
         base_ctx.fill(&prefix);
-        base_ctx.flush(); // Ensure the prefix KV cache is computed before forking.
+        //base_ctx.flush(); // Ensure the prefix KV cache is computed before forking.
 
         // Get the slice of tasks assigned to this seed.
         let start_index = i * num_tasks_per_seed;

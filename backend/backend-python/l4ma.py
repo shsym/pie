@@ -142,7 +142,6 @@ class L4maAttention(nn.Module):
             delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states[:nnz])
             qkv_states[:nnz] += delta
 
-
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
         )

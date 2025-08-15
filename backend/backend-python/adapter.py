@@ -91,9 +91,10 @@ class AdapterBuffer:
         self.up_proj_buffer = torch.empty((self.num_segments, rank, sum(out_features)), device=x_indptr.device, dtype=dtype)
 
         # buffers for activations
-        self.down_buffer = torch.empty((self.nnz, num_group * rank), device=x_indptr.device, dtype=dtype)
-        self.up_buffer = torch.empty((self.nnz, sum(out_features)), device=x_indptr.device, dtype=dtype)
+        self.down_buffer = torch.zeros((self.nnz, num_group * rank), device=x_indptr.device, dtype=dtype)
+        self.up_buffer = torch.zeros((self.nnz, sum(out_features)), device=x_indptr.device, dtype=dtype)
 
+    @torch.inference_mode()
     def compute_lora_delta(self, layer_idx: int, x: torch.Tensor) -> torch.Tensor:
         # first update the buffers with the current adapter weights
         for i in range(len(self.adapters)):
@@ -109,6 +110,10 @@ class AdapterBuffer:
         # print('x', x.shape)
         # print('x_indptr', self.x_indptr.shape)
         # print('adapter_indices', self.adapter_indices.shape)
+        # if torch.isnan(x).any():
+        #     print('x is nan', x)
+        # else:
+        #     print('x is not nan')
 
         # do segmented GEMM
         self.segment_gemm_wrapper.run(
@@ -121,8 +126,32 @@ class AdapterBuffer:
             weight_indices=self.adapter_indices
         )
 
-        #print('num_adapter_group', self.num_adapter_group)
-        #print('adapter_out_features', self.adapter_out_features)
+        # if torch.isnan(x).any():
+        #     print('x is nan2', x)
+        #     exit()
+        # else:
+        #     print('x is not nan2')
+        #
+        # if torch.isnan(self.down_proj_buffer).any():
+        #     print('down_proj_buffer is nan', self.down_proj_buffer)
+        #
+        #     exit()
+        # else:
+        #     print('down_proj_buffer is not nan')
+        #
+        # if torch.isnan(self.down_buffer).any():
+        #     print('down_buffer is nan', self.down_buffer)
+        #     print("x.shape", x.shape)
+        #     print("self.down_proj_buffer.shape", self.down_proj_buffer.shape)
+        #     print("x_indptr.shape", self.x_indptr.shape)
+        #     print("x_indptr", self.x_indptr)
+        #     print("layer_idx", layer_idx)
+        #     exit()
+        # else:
+        #     print('down_buffer is not nan')
+
+        # print('num_adapter_group', self.num_adapter_group)
+        # print('adapter_out_features', self.adapter_out_features)
         down_buffer_by_grp = torch.split(self.down_buffer, self.adapter_rank, dim=-1)
         up_proj_buffer_by_grp = torch.split(self.up_proj_buffer, self.adapter_out_features, dim=-1)
         up_buffer_by_grp = torch.split(self.up_buffer, self.adapter_out_features, dim=-1)
@@ -130,28 +159,29 @@ class AdapterBuffer:
         # do segmented gemm by group (nnz, rank) * (seg, rank, out_features[i])
 
         for i in range(self.num_adapter_group):
+            # print('down_buffer_by_grp', down_buffer_by_grp[i].shape)
+            # print('up_proj_buffer_by_grp', up_proj_buffer_by_grp[i].shape)
+            # print('up_buffer_by_grp', up_buffer_by_grp[i].shape)
 
-            #print('down_buffer_by_grp', down_buffer_by_grp[i].shape)
-            #print('up_proj_buffer_by_grp', up_proj_buffer_by_grp[i].shape)
-            #print('up_buffer_by_grp', up_buffer_by_grp[i].shape)
-
-#             [Backend] num_adapter_group 3
+            #             [Backend] num_adapter_group 3
             # [Backend] adapter_out_features [2048, 512, 512]
             # [Backend] down_buffer_by_grp torch.Size([475, 4])
             # [Backend] up_proj_buffer_by_grp torch.Size([4, 4, 2048])
             # [Backend] up_buffer_by_grp torch.Size([475, 2048])
 
-            self.segment_gemm_wrapper.run(
-                x=down_buffer_by_grp[i],
-                weights=up_proj_buffer_by_grp[i],
+            out = self.segment_gemm_wrapper.run(
+                x=down_buffer_by_grp[i].contiguous(),
+                weights=up_proj_buffer_by_grp[i].contiguous(),
                 batch_size=self.num_segments,
                 weight_column_major=False,
-                out=up_buffer_by_grp[i],
+                # out=up_buffer_by_grp[i],
                 seg_indptr=self.x_indptr,
                 weight_indices=self.adapter_indices
             )
+            up_buffer_by_grp[i].copy_(out)
 
         scale = self.adapters[0].alpha / self.adapters[0].rank
+
         return scale * self.up_buffer
 
 

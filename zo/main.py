@@ -44,14 +44,14 @@ INFERLET_SRC_FILES = [
 # --- ES Hyperparameters ---
 ADAPTER_NAME = "evo-countdown-v1"
 TRAINING_STEPS = 100
-POPULATION_SIZE = 4      # Total number of seeds per step across all clients
-TASKS_PER_SEED = 1        # Number of tasks to evaluate for each seed
-NUM_ROLLOUT_WORKERS = 1   # Number of inferlets PER CLIENT
+POPULATION_SIZE = 16  # Total number of seeds per step across all clients
+TASKS_PER_SEED = 4  # Number of tasks to evaluate for each seed
+NUM_ROLLOUT_WORKERS = 1  # Number of inferlets PER CLIENT
 LORA_RANK = 8
-LORA_ALPHA = 8.0
-INITIAL_SIGMA = 0.02
-MU_FRACTION = 0.5
-MAX_TOKENS_GEN = 128
+LORA_ALPHA = 16.0
+INITIAL_SIGMA = 0.0001
+MU_FRACTION = 0.25
+MAX_TOKENS_GEN = 512
 
 # --- Dataset Config ---
 # This would point to your actual dataset
@@ -230,6 +230,7 @@ async def main():
 
             # **MODIFIED: Run all rollout workers across all clients concurrently**
             worker_results_json = await asyncio.gather(*rollout_tasks)
+            # print(worker_results_json)
 
             # **MODIFIED: Combine results from all workers**
             generated_texts = []
@@ -253,7 +254,7 @@ async def main():
             # --- 4c. Aggregation Phase ---
             print("Phase: Aggregating Scores")
             aggregated_scores = [
-                np.mean(scores[i * TASKS_PER_SEED : (i + 1) * TASKS_PER_SEED])
+                np.mean(scores[i * TASKS_PER_SEED: (i + 1) * TASKS_PER_SEED])
                 for i in range(POPULATION_SIZE)
             ]
             print(f"Average reward for this step: {np.mean(scores):.4f}")
@@ -276,6 +277,7 @@ async def main():
             print(f"Step {step} completed in {step_duration:.2f} seconds.")
 
         print("\nTraining finished!")
+
 
 if __name__ == "__main__":
     try:
