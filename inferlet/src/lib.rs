@@ -79,14 +79,6 @@ pub struct Queue {
 #[derive(Clone, Debug)]
 pub struct Model {
     pub(crate) inner: Rc<core::Model>,
-    pub(crate) adapter: Option<Adapter>,
-}
-
-/// Represents a specific model instance, providing access to its metadata and functionality.
-#[derive(Clone, Debug)]
-pub struct Adapter {
-    pub name: String,
-    pub seed: i64,
 }
 
 /// Returns the runtime version string.
@@ -110,7 +102,6 @@ pub fn get_arguments() -> Vec<String> {
 pub fn get_model(name: &str) -> Option<Model> {
     core::get_model(name).map(|inner| Model {
         inner: Rc::new(inner),
-        adapter: None,
     })
 }
 
@@ -273,21 +264,6 @@ impl Model {
 
     pub fn create_context(&self) -> Context {
         Context::new(self)
-    }
-
-    pub fn set_adapter(&mut self, name: &str, seed: i64) {
-        self.adapter = Some(Adapter {
-            name: name.to_string(),
-            seed
-        })
-    }
-
-    pub fn get_adapter(&self) -> Option<&Adapter> {
-        self.adapter.as_ref()
-    }
-
-    pub fn remove_adapter(&mut self) {
-        self.adapter = None;
     }
 }
 

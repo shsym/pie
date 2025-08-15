@@ -16,6 +16,7 @@ import ping_pb2
 from config import parse_model_metadata
 from driver import Driver
 from l4ma import L4maForCausalLM, create_fusion_map
+from qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 import ztensor
 from tqdm import tqdm
 import threading  # Import the threading module
@@ -122,10 +123,15 @@ def load_model(config: dict):
     metadata.architecture.device = config.get('device', 'cuda:0')
     metadata.architecture.dtype = getattr(torch, config.get('dtype', 'bfloat16'))
 
-    model = L4maForCausalLM(metadata.architecture)
-
     # 1. Map fused tensor names to their original sources
-    fusion_map = create_fusion_map(model)
+    # Choose the appropriate model based on architecture type
+    if metadata.architecture.type.lower() == 'qwen3':
+        model = Qwen3ForCausalLM(metadata.architecture)
+        fusion_map = create_qwen3_fusion_map(model)
+    else:
+        # Default to L4MA for backward compatibility
+        model = L4maForCausalLM(metadata.architecture)
+        fusion_map = create_fusion_map(model)
 
     # 2. Create a reverse map for fast lookups (original source -> fused target)
     source_to_fusion_target = {
@@ -392,15 +398,6 @@ def run_zmq_server(router, engine, config, model_metadata):
                     elif command == "debug_query_request":
                         res = engine.debug_query_request(request.debug_query_request)
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, debug_query=res)
-                    elif command == "create_adapter":
-                        engine.create_adapter(request.create_adapter)
-                    elif command == "destroy_adapter":
-                        engine.destroy_adapter(request.destroy_adapter)
-                    elif command == "update_adapter":
-                        engine.update_adapter(request.update_adapter)
-                    elif command == "forward_with_mutation":
-                        res = engine.forward_with_mutation(request.forward_with_mutation)
-                        response = l4m_pb2.Response(correlation_id=request.correlation_id, forward_text=res)
                     elif command == "get_info":
                         print("Getting info from the engine.")
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
@@ -414,6 +411,7 @@ def run_zmq_server(router, engine, config, model_metadata):
                                 merge_table=model_metadata.tokenizer.merge_table,
                                 special_tokens=model_metadata.tokenizer.special_tokens,
                                 split_regex=model_metadata.tokenizer.split_regex,
+                                escape_non_printable=model_metadata.tokenizer.escape_non_printable,
                             )
                         ))
                     else:

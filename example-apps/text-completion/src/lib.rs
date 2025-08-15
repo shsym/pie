@@ -46,6 +46,10 @@ async fn main() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .unwrap_or(256);
 
+    let model_name: String = args
+        .value_from_str(["-m", "--model"])
+        .map_err(|e| e.to_string())?;
+
     // Check for the presence of the --output flag.
     let send_output = args.contains("--output");
 
@@ -66,15 +70,35 @@ async fn main() -> Result<(), String> {
 
     // Fallback to the original single-prompt logic.
     let mut ctx = model.create_context();
-    ctx.fill("<|begin_of_text|>");
-    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
-    ctx.fill(&format!(
-        "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>",
-        prompt
-    ));
-    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
+
+    if model_name == "llama-3.2" {
+        ctx.fill("<|begin_of_text|>");
+        ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
+        ctx.fill(&format!(
+            "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>",
+            prompt
+        ));
+        ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    } else if model_name == "qwen-3" {
+        ctx.fill(
+            "<|im_start|>system\nYou are a helpful, respectful and honest assistant.<|im_end|>\n",
+        );
+        ctx.fill(&format!("<|im_start|>user\n{}<|im_end|>\n", prompt));
+        ctx.fill("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    } else {
+        return Err(format!("Model {} is not supported.", model_name));
+    }
+
+    let end_token = if model_name == "llama-3.2" {
+        "<|eot_id|>"
+    } else if model_name == "qwen-3" {
+        "<|im_end|>"
+    } else {
+        return Err(format!("Model {} is not supported.", model_name));
+    };
+
     let final_text = ctx
-        .generate_until("<|eot_id|>", max_num_outputs as usize)
+        .generate_until(end_token, max_num_outputs as usize)
         .await;
 
     let token_ids = tokenizer.tokenize(&final_text);
