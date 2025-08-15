@@ -5,6 +5,7 @@ pub mod input_image;
 pub mod input_text;
 pub mod output_text;
 pub mod tokenize;
+pub mod optimize;
 
 // reexport traits
 pub use allocate::Allocate;
@@ -14,3 +15,4 @@ pub use input_image::InputImage;
 pub use input_text::InputText;
 pub use output_text::OutputText;
 pub use tokenize::Tokenize;
+pub use optimize::Optimize;
