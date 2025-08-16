@@ -188,6 +188,58 @@ message BatchDebugQueryRequest {
   repeated DebugQueryRequest items = 1;
 }
 
+message AllocateAdapters {
+  repeated uint32 adapters = 1;
+}
+
+message DeallocateAdapters {
+  repeated uint32 adapters = 1;
+}
+
+message InitializeAdapter {
+  uint32 adapter = 1;
+  uint32 rank = 2;
+  float alpha = 3;
+  uint32 population_size = 4;
+  float mu_fraction = 5;
+  float initial_sigma = 6;
+}
+
+message MutateAdapters {
+  repeated uint32 adapters = 1;
+  uint32 parent = 2;
+  repeated int64 seeds = 3;
+}
+
+
+message UpdateAdapter {
+  uint32 adapter = 1;
+  repeated float scores = 2;
+  repeated int64 seeds = 3;
+  float max_sigma = 4;
+}
+
+message ForwardWithAdapter {
+  uint32 adapter = 1;
+
+  repeated uint32 kv_page_ids = 2;
+
+  uint32 kv_page_last_len = 3;
+
+  repeated uint32 token_ids = 4;
+
+  repeated uint32 position_ids = 5;
+
+  repeated BrleBuffer mask = 6;
+
+  repeated uint32 output_indices = 7;
+
+}
+
+message BatchForwardWithAdapter {
+  repeated ForwardWithAdapter items = 1;
+}
+
 // The response containing decoded tokens.
 message SampleTopKResponse {
   // The decoded token IDs.
@@ -245,11 +297,12 @@ message BatchDebugQueryResponse {
 }
 
 
+
+
 message Tokenizer {
   map<uint32, bytes> merge_table = 1;
   map<string, uint32> special_tokens = 2;
   string split_regex = 3;
-  bool escape_non_printable = 4;
 }
 
 // -----------------------------------------------------------------------------
@@ -268,7 +321,13 @@ message Request {
     BatchDecodeTokenDistribution decode_token_distribution = 9;
     BatchSampleTopKRequest sample_top_k_request = 10;
     BatchDebugQueryRequest debug_query_request = 11;
-    GetInfoRequest get_info = 12;
+    AllocateAdapters allocate_adapters = 12;
+    DeallocateAdapters deallocate_adapters = 13;
+    InitializeAdapter initialize_adapter = 14;
+    MutateAdapters mutate_adapters = 15;
+    UpdateAdapter update_adapter = 16;
+    BatchForwardWithAdapter forward_with_adapter = 17;
+    GetInfoRequest get_info = 18;
   }
 }
 

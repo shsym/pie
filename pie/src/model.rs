@@ -356,6 +356,62 @@ pub enum Command {
         query: String,
         handle: oneshot::Sender<String>,
     },
+
+    /// ---- Optimizer -----
+    ///
+    ///
+    AllocateAdapters {
+        inst_id: InstanceId,
+        stream_id: LocalStreamId,
+        adapters: Vec<IdRepr>,
+    },
+
+    DeallocateAdapters {
+        inst_id: InstanceId,
+        stream_id: LocalStreamId,
+        adapters: Vec<IdRepr>,
+    },
+
+    InitializeAdapter {
+        inst_id: InstanceId,
+        stream_id: LocalStreamId,
+        adapter: IdRepr,
+        rank: u32,
+        alpha: f32,
+        population_size: u32,
+        mu_fraction: f32,
+        initial_sigma: f32,
+    },
+
+    MutateAdapters {
+        inst_id: InstanceId,
+        stream_id: LocalStreamId,
+        adapters: Vec<IdRepr>,
+        parent: IdRepr,
+        seeds: Vec<i64>,
+    },
+
+    UpdateAdapter {
+        inst_id: InstanceId,
+        stream_id: LocalStreamId,
+        adapter: IdRepr,
+        scores: Vec<f32>,
+        seeds: Vec<i64>,
+        max_sigma: f32,
+    },
+
+    ForwardWithAdapter {
+        inst_id: InstanceId,
+        stream_id: LocalStreamId,
+        adapter: IdRepr,
+        kv_page_last_len: u32,
+        kv_pages: Vec<IdRepr>,
+        text: Vec<u32>,
+        positions: Vec<u32>,
+        mask: Vec<Vec<u32>>,
+        output_indices: Vec<u32>,
+        handle: Option<oneshot::Sender<Vec<(Vec<u32>, Vec<f32>)>>>,
+    },
 }
 
 impl Command {
@@ -378,6 +434,13 @@ enum BatchGroup {
     Synchronize,
     EmbedImage,
     DebugQuery,
+    //
+    AllocateAdapters,
+    DeallocateAdapters,
+    InitializeAdapter,
+    MutateAdapters,
+    UpdateAdapter,
+    ForwardWithAdapter,
 }
 
 impl Batchable<BatchGroup> for Command {
@@ -449,6 +512,14 @@ impl Batchable<BatchGroup> for Command {
             Command::Synchronize { .. } => batching::eager(),
             Command::EmbedImage { .. } => batching::eager(),
             Command::DebugQuery { .. } => batching::eager(),
+            Command::AllocateAdapters { .. } => batching::eager(),
+            Command::DeallocateAdapters { .. } => batching::eager(),
+            Command::InitializeAdapter { .. } => batching::eager(),
+            Command::MutateAdapters { .. } => batching::eager(),
+            Command::UpdateAdapter { .. } => batching::eager(),
+            Command::ForwardWithAdapter { .. } => Box::new(batching::ManualStrategy::new(
+                TRIGGERS.forward_text_trigger.clone(),
+            )),
             _ => unreachable!(),
         }
     }
@@ -467,6 +538,13 @@ impl Batchable<BatchGroup> for Command {
             Command::Synchronize { .. } => BatchGroup::Synchronize,
             Command::EmbedImage { .. } => BatchGroup::EmbedImage,
             Command::DebugQuery { .. } => BatchGroup::DebugQuery,
+            Command::AllocateAdapters { .. } => BatchGroup::AllocateAdapters,
+            Command::DeallocateAdapters { .. } => BatchGroup::DeallocateAdapters,
+            Command::InitializeAdapter { .. } => BatchGroup::InitializeAdapter,
+            Command::MutateAdapters { .. } => BatchGroup::MutateAdapters,
+            Command::UpdateAdapter { .. } => BatchGroup::UpdateAdapter,
+            Command::ForwardWithAdapter { .. } => BatchGroup::ForwardWithAdapter,
+
             _ => unreachable!(),
         }
     }
@@ -1220,6 +1298,126 @@ impl L4m {
                     Stream::new(inst_id, stream_id),
                 ))
             }
+
+            Command::AllocateAdapters {
+                inst_id,
+                stream_id,
+                adapters,
+            } => Some((
+                Command::AllocateAdapters {
+                    inst_id,
+                    stream_id,
+                    adapters,
+                },
+                Stream::new(inst_id, stream_id),
+            )),
+            Command::DeallocateAdapters {
+                inst_id,
+                stream_id,
+                adapters,
+            } => Some((
+                Command::DeallocateAdapters {
+                    inst_id,
+                    stream_id,
+                    adapters,
+                },
+                Stream::new(inst_id, stream_id),
+            )),
+
+            Command::InitializeAdapter {
+                inst_id,
+                stream_id,
+                adapter,
+                rank,
+                alpha,
+                population_size,
+                mu_fraction,
+                initial_sigma,
+            } => Some((
+                Command::InitializeAdapter {
+                    inst_id,
+                    stream_id,
+                    adapter,
+                    rank,
+                    alpha,
+                    population_size,
+                    mu_fraction,
+                    initial_sigma,
+                },
+                Stream::new(inst_id, stream_id),
+            )),
+
+            Command::MutateAdapters {
+                inst_id,
+                stream_id,
+                adapters,
+                parent,
+                seeds,
+            } => Some((
+                Command::MutateAdapters {
+                    inst_id,
+                    stream_id,
+                    adapters,
+                    parent,
+                    seeds,
+                },
+                Stream::new(inst_id, stream_id),
+            )),
+
+            Command::UpdateAdapter {
+                inst_id,
+                stream_id,
+                adapter,
+                scores,
+                seeds,
+                max_sigma,
+            } => Some((
+                Command::UpdateAdapter {
+                    inst_id,
+                    stream_id,
+                    adapter,
+                    scores,
+                    seeds,
+                    max_sigma,
+                },
+                Stream::new(inst_id, stream_id),
+            )),
+
+            Command::ForwardWithAdapter {
+                inst_id,
+                stream_id,
+                adapter,
+                kv_page_last_len,
+                mut kv_pages,
+                text,
+                positions,
+                mask,
+                output_indices,
+                handle,
+            } => {
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::KvPage, inst_id, &mut kv_pages),
+                    inst_id,
+                    "l4m::fill_block failed. some context blocks are invalid"
+                );
+
+                Some((
+                    Command::ForwardWithAdapter {
+                        inst_id,
+                        stream_id,
+                        adapter,
+                        kv_page_last_len,
+                        kv_pages,
+                        text,
+                        positions,
+                        mask,
+                        output_indices,
+                        handle,
+                    },
+                    Stream::new(inst_id, stream_id),
+                ))
+            }
         }
     }
 
@@ -1295,13 +1493,11 @@ impl L4m {
                                 let merge_table = tokenizer.merge_table;
                                 let special_tokens = tokenizer.special_tokens;
                                 let pattern = tokenizer.split_regex;
-                                let escape_non_printable = tokenizer.escape_non_printable;
 
                                 let tokenizer = Arc::new(BytePairEncoder::new(
                                     merge_table,
                                     special_tokens,
                                     &pattern,
-                                    escape_non_printable,
                                 ));
 
                                 handle
@@ -1444,7 +1640,20 @@ where
             }
             BatchGroup::EmbedImage => encode_pb_batch_embed_image(correlation_id, batch),
             BatchGroup::DebugQuery => encode_pb_batch_debug_query(correlation_id, batch),
-            // _ => unreachable!(),
+            BatchGroup::AllocateAdapters => {
+                encode_pb_batch_allocate_adapters(correlation_id, batch)
+            }
+            BatchGroup::DeallocateAdapters => {
+                encode_pb_batch_deallocate_adapters(correlation_id, batch)
+            }
+            BatchGroup::InitializeAdapter => {
+                encode_pb_batch_initialize_adapter(correlation_id, batch)
+            }
+            BatchGroup::MutateAdapters => encode_pb_batch_mutate_adapters(correlation_id, batch),
+            BatchGroup::UpdateAdapter => encode_pb_batch_update_adapter(correlation_id, batch),
+            BatchGroup::ForwardWithAdapter => {
+                encode_pb_batch_forward_with_adapter(correlation_id, batch)
+            } // _ => unreachable!(),
         };
 
         if let Some(events) = event {
@@ -1542,7 +1751,6 @@ impl backend::Simulate for Simulator {
                             ("<|eot_id|>".to_string(), 128009)
                         ]),
                         split_regex: r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+".to_string(),
-                        escape_non_printable: false,
                     }),
                 }),
             ),
@@ -1952,6 +2160,187 @@ fn encode_pb_batch_debug_query(
     }
     let cmd =
         pb_bindings::request::Command::DebugQueryRequest(pb_bindings::BatchDebugQueryRequest {
+            items,
+        });
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), Some(events))
+}
+
+fn encode_pb_batch_allocate_adapters(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let cmd = match batch.into_iter().next().unwrap() {
+        Command::AllocateAdapters {
+            inst_id,
+            stream_id,
+            adapters,
+        } => pb_bindings::request::Command::AllocateAdapters(pb_bindings::AllocateAdapters {
+            adapters,
+        }),
+        _ => unreachable!(),
+    };
+
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+fn encode_pb_batch_deallocate_adapters(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let cmd = match batch.into_iter().next().unwrap() {
+        Command::DeallocateAdapters {
+            inst_id,
+            stream_id,
+            adapters,
+        } => pb_bindings::request::Command::DeallocateAdapters(pb_bindings::DeallocateAdapters {
+            adapters,
+        }),
+        _ => unreachable!(),
+    };
+
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+fn encode_pb_batch_initialize_adapter(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let cmd = match batch.into_iter().next().unwrap() {
+        Command::InitializeAdapter {
+            inst_id,
+            stream_id,
+            adapter,
+            rank,
+            alpha,
+            population_size,
+            mu_fraction,
+            initial_sigma,
+        } => pb_bindings::request::Command::InitializeAdapter(pb_bindings::InitializeAdapter {
+            adapter,
+            rank,
+            alpha,
+            population_size,
+            mu_fraction,
+            initial_sigma,
+        }),
+        _ => unreachable!(),
+    };
+
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+    .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+
+
+fn encode_pb_batch_mutate_adapters(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let cmd = match batch.into_iter().next().unwrap() {
+        Command::MutateAdapters {
+            inst_id, stream_id, adapters, parent, seeds
+        } => pb_bindings::request::Command::MutateAdapters(pb_bindings::MutateAdapters {
+            adapters, parent, seeds
+        }),
+        _ => unreachable!(),
+    };
+
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+        .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+
+
+
+fn encode_pb_batch_update_adapter(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let cmd = match batch.into_iter().next().unwrap() {
+        Command::UpdateAdapter {
+            inst_id, stream_id, adapter, scores, seeds, max_sigma
+        } => pb_bindings::request::Command::UpdateAdapter(pb_bindings::UpdateAdapter {
+            adapter, scores, seeds, max_sigma
+        }),
+        _ => unreachable!(),
+    };
+
+    let payload = pb_bindings::Request {
+        correlation_id,
+        command: Some(cmd),
+    }
+        .encode_to_vec();
+    ((PROTOCOL_BASE, payload), None)
+}
+
+
+
+
+fn encode_pb_batch_forward_with_adapter(
+    correlation_id: u32,
+    batch: Vec<Command>,
+) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
+    let mut items = Vec::new();
+    let mut events = Vec::new();
+    for cmd in batch {
+        match cmd {
+            Command::ForwardWithAdapter {
+                inst_id: _,
+                stream_id: _,
+                adapter,
+                kv_page_last_len,
+                kv_pages: kv_page_ids,
+                text,
+                positions,
+                mask,
+                output_indices,
+                handle,
+            } => {
+                let mask = mask
+                    .into_iter()
+                    .map(|b| pb_bindings::BrleBuffer { buffer: b })
+                    .collect();
+
+                let pb = pb_bindings::ForwardWithAdapter {
+                    adapter,
+                    kv_page_ids,
+                    kv_page_last_len,
+                    token_ids: text,
+                    position_ids: positions,
+                    mask,
+                    output_indices,
+                };
+                items.push(pb);
+                events.push(Event::ForwardText(handle));
+            }
+            _ => unreachable!(),
+        }
+    }
+    let cmd =
+        pb_bindings::request::Command::ForwardWithAdapter(pb_bindings::BatchForwardWithAdapter {
             items,
         });
     let payload = pb_bindings::Request {
