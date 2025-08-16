@@ -552,17 +552,21 @@ void multiply_bf16_cublas(cublasHandle_t handle,
     int ldb = transb ? k : n; // Leading dimension
     int ldc = n;              // Leading dimension for C
 
-    CUBLAS_CHECK(cublasGemmEx(handle,
-                              opB,
-                              opA,
-                              n,
-                              m,
-                              k,
-                              &alpha,
-                              B, CUDA_R_16BF, ldb,
-                              A, CUDA_R_16BF, lda,
-                              &beta,
-                              C, CUDA_R_16BF, ldc,
-                              CUDA_R_32F,
-                              CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    // Call cublasGemmEx separately, then check status, to avoid macro expansion
+    // across multiple lines which can trigger GCC-style line directive warnings
+    // in some toolchains.
+    cublasStatus_t gemm_status = cublasGemmEx(handle,
+                                              opB,
+                                              opA,
+                                              n,
+                                              m,
+                                              k,
+                                              &alpha,
+                                              B, CUDA_R_16BF, ldb,
+                                              A, CUDA_R_16BF, lda,
+                                              &beta,
+                                              C, CUDA_R_16BF, ldc,
+                                              CUDA_R_32F,
+                                              CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    CUBLAS_CHECK(gemm_status);
 }

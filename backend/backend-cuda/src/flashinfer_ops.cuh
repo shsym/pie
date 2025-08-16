@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include <flashinfer/attention/default_decode_params.cuh>
+#include <flashinfer/attention/decode.cuh>
 #include <flashinfer/attention/default_prefill_params.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
@@ -78,7 +79,7 @@ namespace flashinfer
             typename AttentionVariant, typename Params>
   cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                       float* tmp_s, bool enable_pdl,
-                                                      cudaStream_t stream); 
+                                                      cudaStream_t stream);
 
   class BatchDecodeHandler
   {
@@ -470,7 +471,9 @@ namespace flashinfer
     const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
     auto [qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h] =
         get_qkv_strides(kv_layout, 0, num_qo_heads, num_kv_heads, head_dim);
-    auto plan_info = handler->GetPlanInfo();
+  auto plan_info = handler->GetPlanInfo();
+  // Minimal fallback: if plan didn't set CTA tile size, choose a safe default
+  auto cta_tile_q = plan_info.cta_tile_q == 0 ? 128u : plan_info.cta_tile_q;
     DISPATCH_head_dim(
         head_dim, HEAD_DIM,
         {DISPATCH_mask_mode(
@@ -499,7 +502,7 @@ namespace flashinfer
                   params.total_num_rows = handler->GetTotalNumRows();
                   params.padded_batch_size = plan_info.padded_batch_size;
 
-                  DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+                  DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
                     BatchPrefillWithRaggedKVCacheDispatched<CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
                                                             POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
                                                             MASK_MODE, AttentionVariant>(
@@ -514,7 +517,7 @@ namespace flashinfer
       BatchPrefillHandler *handler, DTypeQ *q, IdType *qo_indptr, IdType *q_rope_offset,
       paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO *o, float *lse, uint32_t num_qo_heads,
       // mask
-      MaskMode mask_mode = MaskMode::kNone, 
+      MaskMode mask_mode = MaskMode::kNone,
       uint8_t* custom_mask = nullptr,
       IdType *mask_indptr = nullptr,
       // positional encoding
@@ -529,7 +532,9 @@ namespace flashinfer
     const uint32_t head_dim = paged_kv.head_dim;
     if (maybe_prefix_len_ptr != nullptr)
       mask_mode = MaskMode::kMultiItemScoring;
-    auto plan_info = handler->GetPlanInfo();
+  auto plan_info = handler->GetPlanInfo();
+  // Minimal fallback: if plan didn't set CTA tile size, choose a safe default
+  auto cta_tile_q = plan_info.cta_tile_q == 0 ? 128u : plan_info.cta_tile_q;
     DISPATCH_head_dim(
         head_dim, HEAD_DIM,
         {DISPATCH_mask_mode(
@@ -563,7 +568,7 @@ namespace flashinfer
                   params.maybe_token_pos_in_items_ptr = maybe_token_pos_in_items_ptr;
                   params.token_pos_in_items_len = token_pos_in_items_len;
                   params.maybe_max_item_len_ptr = maybe_max_item_len_ptr;
-                  DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+                  DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
                     return BatchPrefillWithPagedKVCacheDispatched<
                         CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
                         MASK_MODE, AttentionVariant>(params, handler->GetTmpV<DTypeO>(),

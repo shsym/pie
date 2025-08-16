@@ -213,3 +213,5 @@ logs
 .memory-bank
 
 # raw eval data
+.claude
+.mcp.json
