@@ -6,6 +6,7 @@ use inferlet::{
 use pico_args::Arguments;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
+use inferlet::wstd::time::Duration;
 
 /// Defines the command-line interface and help message.
 const HELP: &str = r#"
@@ -96,6 +97,7 @@ async fn main() -> Result<(), String> {
         mu_fraction,
         initial_sigma,
     );
+    inferlet::wstd::task::sleep(Duration::from_millis(100)).await;
     println!("✅ Adapter '{}' created successfully.", name);
 
     Ok(())

@@ -2,6 +2,7 @@ use inferlet::{self};
 use inferlet::traits::Optimize;
 use pico_args::Arguments;
 use std::ffi::OsString;
+use inferlet::wstd::time::Duration;
 
 /// Defines the command-line interface and help message.
 const HELP: &str = r#"
@@ -78,6 +79,9 @@ async fn main() -> Result<(), String> {
 
     // Perform the update operation.
     queue.update_adapter(&name, &scores, &seeds);
+
+    // sleep for 100ms
+    inferlet::wstd::task::sleep(Duration::from_millis(100)).await;
 
     println!("✅ Adapter '{}' updated successfully.", name);
 
