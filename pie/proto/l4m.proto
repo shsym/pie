@@ -303,6 +303,7 @@ message Tokenizer {
   map<uint32, bytes> merge_table = 1;
   map<string, uint32> special_tokens = 2;
   string split_regex = 3;
+  bool escape_non_printable = 4;
 }
 
 // -----------------------------------------------------------------------------

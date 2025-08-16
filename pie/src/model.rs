@@ -1493,11 +1493,13 @@ impl L4m {
                                 let merge_table = tokenizer.merge_table;
                                 let special_tokens = tokenizer.special_tokens;
                                 let pattern = tokenizer.split_regex;
+                                let escape_non_printable = tokenizer.escape_non_printable;
 
                                 let tokenizer = Arc::new(BytePairEncoder::new(
                                     merge_table,
                                     special_tokens,
                                     &pattern,
+                                    escape_non_printable,
                                 ));
 
                                 handle
@@ -1751,6 +1753,7 @@ impl backend::Simulate for Simulator {
                             ("<|eot_id|>".to_string(), 128009)
                         ]),
                         split_regex: r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+".to_string(),
+                        escape_non_printable: false,
                     }),
                 }),
             ),
