@@ -12,6 +12,7 @@ namespace {
 struct Args {
     std::string op;
     std::string case_id = "auto";
+    std::string backend = "cuda";       // Backend: "cuda", "metal", or "compare"
     int num_tokens = 128;          // Realistic sequence length
     int hidden_size = 4096;        // Llama 7B hidden size
     int vocab_size = 32000;        // Llama vocab size
@@ -97,6 +98,8 @@ Args parse_args(int argc, char** argv) {
             if (const char* v = next(i)) a.op = v; else throw std::runtime_error("--op requires value");
         } else if (flag == "--case") {
             if (const char* v = next(i)) a.case_id = v; else throw std::runtime_error("--case requires value");
+        } else if (flag == "--backend") {
+            if (const char* v = next(i)) a.backend = v; else throw std::runtime_error("--backend requires value");
         } else if (flag == "--num_tokens") {
             const char* v = next(i); if (!v || !parse_int(v, a.num_tokens)) throw std::runtime_error("--num_tokens int");
         } else if (flag == "--hidden_size") {
@@ -157,7 +160,14 @@ Args parse_args(int argc, char** argv) {
             const char* v = next(i); if (!v || !parse_u64(v, a.seed)) throw std::runtime_error("--seed u64");
         } else if (flag == "-h" || flag == "--help") {
             std::cout << "Usage:\n"
-                         "  metal_protocol_tests --op embedding_lookup [--case ID] [--num_tokens N] [--hidden_size D] [--vocab_size V] [--seed S]\n"
+                         "  metal_protocol_tests --op OP [--backend BACKEND] [--case ID] [OPTIONS...]\n"
+                         "\n"
+                         "Backends:\n"
+                         "  --backend cuda    Generate CUDA golden reference (default)\n"
+                         "  --backend metal   Run Metal implementation (macOS only)\n"
+                         "\n"
+                         "Operations:\n"
+                         "  metal_protocol_tests --op embedding_lookup [--backend BACKEND] [--case ID] [--num_tokens N] [--hidden_size D] [--vocab_size V] [--seed S]\n"
                          "  metal_protocol_tests --op extract_k_values [--case ID] [--M rows] [--N cols] [--k per_row] [--seed S]\n"
                          "  metal_protocol_tests --op rms_norm [--case ID] [--num_tokens N] [--hidden_size D] [--eps E] [--seed S]\n"
                          "  metal_protocol_tests --op silu_and_mul [--case ID] [--num_tokens N] [--intermediate_size I] [--seed S]\n"
@@ -196,24 +206,74 @@ int main(int argc, char** argv) {
                     + "_D" + std::to_string(args.hidden_size);
         }
 
+        // Validate backend selection
+        if (args.backend == "metal") {
+#ifndef METAL_SUPPORT_ENABLED
+            std::cerr << "Error: Metal backend requested but not compiled with Metal support" << std::endl;
+            std::cerr << "Build on macOS with Metal frameworks to enable Metal backend" << std::endl;
+            return 1;
+#endif
+        }
+        
+        // Route operations based on backend
         if (args.op == "embedding_lookup") {
             ops::EmbeddingConfig cfg{args.num_tokens, args.hidden_size, args.vocab_size};
-            ops::run_embedding_lookup(case_id, cfg, args.seed);
+            if (args.backend == "cuda") {
+                ops::run_embedding_lookup(case_id, cfg, args.seed);
+#ifdef METAL_SUPPORT_ENABLED
+            } else if (args.backend == "metal") {
+                ops::run_embedding_lookup_metal(case_id, cfg, args.seed);
+#endif
+            } else {
+                std::cerr << "Error: Unknown backend '" << args.backend << "'. Use 'cuda' or 'metal'" << std::endl;
+                return 1;
+            }
         } else if (args.op == "extract_k_values") {
             ops::ExtractKConfig cfg{args.M, args.N, args.k};
-            ops::run_extract_k_values(case_id, cfg, args.seed);
+            if (args.backend == "cuda") {
+                ops::run_extract_k_values(case_id, cfg, args.seed);
+#ifdef METAL_SUPPORT_ENABLED
+            } else if (args.backend == "metal") {
+                ops::run_extract_k_values_metal(case_id, cfg, args.seed);
+#endif
+            } else {
+                std::cerr << "Error: Unknown backend '" << args.backend << "'. Use 'cuda' or 'metal'" << std::endl;
+                return 1;
+            }
         } else if (args.op == "rms_norm") {
+            if (args.backend != "cuda") {
+                std::cerr << "Error: " << args.op << " operation only supports CUDA backend currently" << std::endl;
+                return 1;
+            }
             ops::RMSNormConfig cfg{args.num_tokens, args.hidden_size, args.eps};
             ops::run_rms_norm(case_id, cfg, args.seed);
         } else if (args.op == "silu_and_mul") {
             ops::SiLUAndMulConfig cfg{args.num_tokens, args.intermediate_size};
-            ops::run_silu_and_mul(case_id, cfg, args.seed);
+            if (args.backend == "cuda") {
+                ops::run_silu_and_mul(case_id, cfg, args.seed);
+#ifdef METAL_SUPPORT_ENABLED
+            } else if (args.backend == "metal") {
+                ops::run_silu_and_mul_metal(case_id, cfg, args.seed);
+#endif
+            } else {
+                std::cerr << "Error: Unknown backend '" << args.backend << "'. Use 'cuda' or 'metal'" << std::endl;
+                return 1;
+            }
         } else if (args.op == "add_residual") {
             ops::AddResidualConfig cfg{args.num_tokens, args.hidden_size};
             ops::run_add_residual(case_id, cfg, args.seed);
         } else if (args.op == "gemm") {
             ops::GemmConfig cfg{args.m, args.n, args.k, args.transa, args.transb, args.use_bias};
-            ops::run_gemm(case_id, cfg, args.seed);
+            if (args.backend == "cuda") {
+                ops::run_gemm(case_id, cfg, args.seed);
+#ifdef METAL_SUPPORT_ENABLED
+            } else if (args.backend == "metal") {
+                ops::run_gemm_metal(case_id, cfg, args.seed);
+#endif
+            } else {
+                std::cerr << "Error: Unknown backend '" << args.backend << "'. Use 'cuda' or 'metal'" << std::endl;
+                return 1;
+            }
         } else if (args.op == "cast_type") {
             ops::CastTypeConfig cfg{args.num_elements, args.input_dtype, args.output_dtype};
             ops::run_cast_type(case_id, cfg, args.seed);

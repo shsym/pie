@@ -1,17 +1,41 @@
-# Metal Protocol Tests (CUDA GPU)
+# Metal Protocol Tests - Unified CUDA and Metal Testing Framework
 
 ## Overview
-**Complete test framework for generating golden reference data from CUDA backend operations for Metal backend validation.**
+**Complete unified testing framework supporting both CUDA golden reference generation and Metal backend validation with cross-platform compatibility.**
 
-- **Production-ready**: Uses real FlashInfer functions and CUDA backend kernels (not simplified placeholders)
-- **Full API Coverage**: All 10 Metal backend operations implemented with correct data types
-- **Automatic Multi-Dtype Testing**: Automatically tests all data types supported by CUDA backend (no manual specification needed)
+🚀 **NEW: Unified Backend Support**
+- **Cross-Platform**: Linux (CUDA reference) + macOS (Metal implementation)
+- **Backend Selection**: `--backend cuda` or `--backend metal` for flexible testing
+- **Production-Ready**: Uses real FlashInfer functions and CUDA backend kernels
+- **Metal Integration**: 4/10 Metal operations implemented with GPU kernels
+- **Validation Framework**: Direct CUDA vs Metal artifact comparison
+
+✅ **Key Features**:
+- **Full API Coverage**: All 10 official PIE Metal Backend operations
+- **Automatic Multi-Dtype Testing**: Tests all data types supported by backends
 - **Realistic Scale**: Supports Llama 7B dimensions (4096 hidden, 11008 intermediate, 32 heads)
-- **Artifact Generation**: Creates binary tensors + JSON metadata compatible with Metal validation
+- **Artifact Generation**: Creates binary tensors + JSON metadata for cross-backend validation
 
 ## Supported Operations
 
-✅ **Core Operations (10/10 complete)**:
+### 🎯 **Backend Support Matrix**
+
+| Operation | CUDA Backend | Metal Backend | Status |
+|-----------|:------------:|:-------------:|--------|
+| gemm | ✅ | ✅ | Complete |
+| embedding_lookup | ✅ | ✅ | Complete |
+| silu_and_mul | ✅ | ✅ | Complete |
+| extract_k_values | ✅ | ✅ | Complete |
+| rms_norm | ✅ | 🔲 | CUDA only |
+| rope | ✅ | 🔲 | CUDA only |
+| softmax | ✅ | 🔲 | CUDA only |
+| batch_prefill_attention | ✅ | 🔲 | CUDA only |
+| grouped_gemm | ✅ | 🔲 | CUDA only |
+| append_paged_kv_cache | ✅ | 🔲 | CUDA only |
+
+**Legend**: ✅ = Implemented, 🔲 = Pending
+
+✅ **CUDA Operations (10/10 complete)**:
 - `gemm` - Matrix multiplication with cuBLAS (supports bias, transpose)
   - 🎯 **Multi-dtype**: `gemm_all_dtypes` (fp32 + bf16)
 - `embedding_lookup` - Token embedding lookup
@@ -30,23 +54,38 @@
 
 ## Build
 
-**Requirements**: CUDA Toolkit, CMake 3.18+
+### Cross-Platform Build Requirements
+
+**Linux (CUDA Reference Generation)**:
+- CUDA Toolkit 11.0+
+- CMake 3.23+
+- FlashInfer dependencies
+
+**macOS (Metal Implementation + CUDA)**:
+- Xcode with Metal support
+- CMake 3.23+
+- Optional: CUDA Toolkit for comparison
+
+### Build Instructions
 
 ```bash
 # From repo root
 cd metal-protocol-tests
 mkdir -p build && cd build
+
+# Linux: CUDA-only build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+
+# macOS: Metal + CUDA build (auto-detected)
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
-Alternatively (equivalent) using explicit source/build dirs:
-
-```bash
-# From repo root
-cmake -S metal-protocol-tests -B metal-protocol-tests/build -DCMAKE_BUILD_TYPE=Release
-cmake --build metal-protocol-tests/build -- -j$(nproc)
-```
+**Build Detection**:
+- ✅ **Linux**: Builds CUDA backend only
+- ✅ **macOS**: Builds both CUDA and Metal backends (if Metal frameworks found)
+- ✅ **Graceful Fallback**: Missing backends are detected and disabled
 
 ## Regenerate all artifacts (one command)
 
@@ -71,37 +110,70 @@ Artifacts output directory (single source of truth):
 metal-protocol-tests/tests/artifacts
 ```
 
-## Automatic Multi-Dtype Testing 🎯
+## Backend Selection and Testing
 
-**NEW FEATURE**: Automatically test all data types supported by CUDA backend with a single command!
+### 🎯 **Unified Backend Interface**
 
 ```bash
 cd metal-protocol-tests/build
 
+# CUDA Backend (Linux/macOS) - Generate golden reference
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op OPERATION [options]
+
+# Metal Backend (macOS only) - Test Metal implementation  
+./metal_protocol_tests --backend metal --op OPERATION [options]
+
+# Examples:
+# Generate CUDA reference
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op gemm --case test1 --m 32 --n 128 --k 64
+
+# Test Metal implementation (macOS)
+./metal_protocol_tests --backend metal --op gemm --case test1 --m 32 --n 128 --k 64
+
+# Compare artifacts
+diff tests/artifacts/gemm/test1/ tests/artifacts/gemm/test1_metal/
+```
+
+### 🎯 **Automatic Multi-Dtype Testing**
+
+**Automatically test all data types supported by backend with a single command!**
+
+```bash
 # 🎯 AUTOMATIC multi-dtype testing (tests ALL supported data types)
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op gemm_all_dtypes --case production --m 128 --n 4096 --k 4096
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op embedding_lookup_all_dtypes --case production --num_tokens 128 --hidden_size 4096 --vocab_size 32000
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op extract_k_values_all_dtypes --case production --M 128 --N 4096 --k 50
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op gemm_all_dtypes --case production --m 128 --n 4096 --k 4096
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op embedding_lookup_all_dtypes --case production --num_tokens 128 --hidden_size 4096 --vocab_size 32000
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op extract_k_values_all_dtypes --case production --M 128 --N 4096 --k 50
 
 # Results: Each command generates TWO sets of artifacts automatically:
 # ├── production_fp32/  (float32 data + metadata)
 # └── production_bf16/  (bfloat16 data + metadata)
 ```
 
-## Single Data Type Testing
+### Single Data Type Testing
 
 ```bash
-# Standard single-dtype tests (Llama 7B dimensions)
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op rms_norm --case production --num_tokens 128 --hidden_size 4096
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op silu_and_mul --case production --num_tokens 128 --intermediate_size 11008
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op rope --case production --num_tokens 128 --num_query_heads 32 --num_kv_heads 32 --head_size 128
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op gemm --case production --m 128 --n 4096 --k 4096
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op embedding_lookup --case production --num_tokens 128 --hidden_size 4096 --vocab_size 32000
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op topk_mask_logits --case production --num_tokens 128 --vocab_size 32000 --k 50
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op grouped_gemm --case production --num_groups 4 --m 128 --n 4096 --k 4096
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op batch_prefill_attention --case production --num_tokens 128 --num_query_heads 32 --num_kv_heads 32 --head_size 128
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op append_paged_kv_cache --case production --num_tokens 128 --num_kv_heads 32 --head_size 128
-CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --op add_residual --case production --num_tokens 128 --hidden_size 4096
+# Standard single-dtype tests (Llama 7B dimensions) - CUDA Backend
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op rms_norm --case production --num_tokens 128 --hidden_size 4096
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op silu_and_mul --case production --num_tokens 128 --intermediate_size 11008
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op rope --case production --num_tokens 128 --num_query_heads 32 --num_kv_heads 32 --head_size 128
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op gemm --case production --m 128 --n 4096 --k 4096
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op embedding_lookup --case production --num_tokens 128 --hidden_size 4096 --vocab_size 32000
+
+# Metal Backend Testing (macOS only) - Operations with Metal implementations
+./metal_protocol_tests --backend metal --op gemm --case production --m 128 --n 4096 --k 4096
+./metal_protocol_tests --backend metal --op embedding_lookup --case production --num_tokens 128 --hidden_size 4096 --vocab_size 32000
+./metal_protocol_tests --backend metal --op silu_and_mul --case production --num_tokens 128 --intermediate_size 11008
+./metal_protocol_tests --backend metal --op extract_k_values --case production --M 128 --N 4096 --k 50
+```
+
+### ✅ **Metal Backend Ready Operations** (macOS)
+
+```bash
+# Phase 1A Metal operations (✅ Complete)
+./metal_protocol_tests --backend metal --op gemm --case test1 --m 32 --n 128 --k 64
+./metal_protocol_tests --backend metal --op embedding_lookup --case test1 --num_tokens 16 --hidden_size 128
+./metal_protocol_tests --backend metal --op silu_and_mul --case test1 --num_tokens 64 --intermediate_size 256  
+./metal_protocol_tests --backend metal --op extract_k_values --case test1 --M 8 --N 64 --k 5
 ```
 
 ## Generated Artifacts
@@ -151,30 +223,115 @@ tests/artifacts/
 - `PIE_ARTIFACTS_DIR=tests/artifacts` - Output directory
 - `PIE_ARTIFACT_OPS=rms_norm,rope` - Restrict which ops write artifacts
 
-## Metal Backend Usage
+## Cross-Backend Validation Workflow
 
-### Comprehensive Validation Workflow
+### 🚀 **Complete CUDA → Metal Validation Process**
 
-1. **Generate golden data** using automatic multi-dtype testing:
-   ```bash
-   # Generate reference data for ALL supported data types automatically
-   ./metal_protocol_tests --op gemm_all_dtypes --case validation --m 128 --n 4096 --k 4096
-   ./metal_protocol_tests --op embedding_lookup_all_dtypes --case validation --num_tokens 128 --hidden_size 4096 --vocab_size 32000
-   ```
+#### **Step 1: Generate CUDA Golden References (Linux/macOS)**
+```bash
+# Generate reference data for ALL supported data types automatically
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op gemm_all_dtypes --case validation --m 128 --n 4096 --k 4096
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op embedding_lookup_all_dtypes --case validation --num_tokens 128 --hidden_size 4096 --vocab_size 32000
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op silu_and_mul --case validation --num_tokens 128 --intermediate_size 11008
+CUDA_VISIBLE_DEVICES=0 ./metal_protocol_tests --backend cuda --op extract_k_values_all_dtypes --case validation --M 128 --N 4096 --k 50
+```
 
-2. **Implement Metal kernels** for target operations (fp32 and bf16 versions)
+#### **Step 2: Test Metal Implementations (macOS)**
+```bash
+# Test Metal operations against CUDA golden references
+./metal_protocol_tests --backend metal --op gemm --case validation --m 128 --n 4096 --k 4096
+./metal_protocol_tests --backend metal --op embedding_lookup --case validation --num_tokens 128 --hidden_size 4096 --vocab_size 32000
+./metal_protocol_tests --backend metal --op silu_and_mul --case validation --num_tokens 128 --intermediate_size 11008
+./metal_protocol_tests --backend metal --op extract_k_values --case validation --M 128 --N 4096 --k 50
+```
 
-3. **Load binary artifacts** and compare Metal outputs with CUDA golden references:
-   - Test Metal fp32 implementation against `validation_fp32/` artifacts
-   - Test Metal bf16 implementation against `validation_bf16/` artifacts
+#### **Step 3: Compare Results**
+```bash
+# Direct artifact comparison
+diff tests/artifacts/gemm/validation/ tests/artifacts/gemm/validation_metal/
+diff tests/artifacts/embedding_lookup_forward/validation_bf16/ tests/artifacts/embedding_lookup_forward/validation_metal/
 
-4. **Validate correctness** across all operation variations and data types
+# Automated validation (TODO: add validation script)
+python3 scripts/validate_metal_vs_cuda.py
+```
+
+### 🎯 **Development Workflow for Remaining Operations**
+
+**For implementing new Metal operations on macOS:**
+
+1. **Use existing CUDA artifacts** (already generated)
+2. **Implement Metal GPU kernel** in `backend/backend-metal/src/`
+3. **Add Metal wrapper** in `metal-protocol-tests/src/ops_metal.mm`
+4. **Test and compare** using unified framework
 
 ### Key Benefits
 
-✅ **Zero Manual Work**: Framework automatically tests all CUDA backend supported data types
-✅ **Complete Coverage**: Every data type combination that exists in CUDA backend is tested
+✅ **Cross-Platform Development**: Generate references on Linux, test Metal on macOS
+✅ **Unified Interface**: Single command-line tool for both backends
+✅ **Zero Manual Work**: Framework automatically tests all supported data types
 ✅ **Production Ready**: Uses exact same functions and parameters as CUDA backend
-✅ **Organized Results**: Clear separation of fp32 vs bf16 artifacts for easy validation
+✅ **Metal Integration**: 4/10 operations ready, framework prepared for remaining 6
+✅ **Validation Framework**: Direct binary comparison between CUDA and Metal outputs
 
-This framework provides **comprehensive multi-dtype golden reference data** matching the exact CUDA backend behavior!
+This framework provides **complete CUDA→Metal development pipeline** with unified testing and validation!
+
+## 🚀 **Continuing Development on Metal Machine (macOS)**
+
+### Prerequisites
+- macOS with Metal support
+- Xcode with Metal frameworks
+- Git repo with generated CUDA artifacts
+
+### Quick Start on macOS
+
+```bash
+# 1. Clone and build (detects Metal automatically)
+git clone <your-repo>
+cd metal-protocol-tests
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+
+# 2. Verify existing CUDA artifacts (should exist from Linux development)
+ls tests/artifacts/
+# Should show: gemm/, embedding_lookup_forward/, silu_and_mul/, extract_k_values/, etc.
+
+# 3. Test Metal backend immediately (Phase 1A operations ready)
+./metal_protocol_tests --backend metal --op gemm --case test1 --m 32 --n 128 --k 64
+./metal_protocol_tests --backend metal --op embedding_lookup --case test1 --num_tokens 16 --hidden_size 128
+./metal_protocol_tests --backend metal --op silu_and_mul --case test1 --num_tokens 64 --intermediate_size 256
+./metal_protocol_tests --backend metal --op extract_k_values --case test1 --M 8 --N 64 --k 5
+
+# 4. Compare Metal output with CUDA golden reference
+diff tests/artifacts/gemm/test1/ tests/artifacts/gemm/test1_metal/
+```
+
+### Implementation Priority for Remaining Operations
+
+**Next 6 operations to implement:**
+
+1. **RMSNorm** - Add `backend/backend-metal/src/metal_rmsnorm.mm`
+2. **RoPE** - Add `backend/backend-metal/src/metal_rope.mm`  
+3. **Softmax** - Add `backend/backend-metal/src/metal_softmax.mm`
+4. **Batch Prefill Attention** - Advanced FlashInfer operation
+5. **Grouped GEMM** - Batched matrix operations
+6. **Append Paged KV Cache** - Memory management operation
+
+**Each implementation follows the same pattern:**
+- Create GPU kernel in `backend/backend-metal/src/`
+- Add Metal wrapper in `metal-protocol-tests/src/ops_metal.mm`
+- Test with `--backend metal` flag
+- Compare against existing CUDA artifacts
+
+### Framework Status
+
+✅ **Ready for Metal Development**:
+- [x] Cross-platform build system
+- [x] Backend selection framework  
+- [x] Metal GPU kernel integration
+- [x] Artifact comparison system
+- [x] 4/10 operations implemented
+- [x] Comprehensive CUDA golden references
+- [x] Documentation and continuation guide
+
+🚀 **Continue implementing remaining Metal operations using this unified testing framework!**

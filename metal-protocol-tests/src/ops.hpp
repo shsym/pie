@@ -188,4 +188,12 @@ void run_grouped_gemm_typed(const std::string& case_id, const GroupedGemmConfig&
 void run_all_dtypes_for_operation(const std::string& op_name, const std::string& base_case_id,
                                  const void* config_ptr, uint64_t seed);
 
+// Metal backend implementations (when Metal support is enabled)
+#ifdef METAL_SUPPORT_ENABLED
+void run_gemm_metal(const std::string& case_id, const GemmConfig& cfg, uint64_t seed);
+void run_embedding_lookup_metal(const std::string& case_id, const EmbeddingConfig& cfg, uint64_t seed);
+void run_silu_and_mul_metal(const std::string& case_id, const SiLUAndMulConfig& cfg, uint64_t seed);
+void run_extract_k_values_metal(const std::string& case_id, const ExtractKConfig& cfg, uint64_t seed);
+#endif
+
 } // namespace ops
