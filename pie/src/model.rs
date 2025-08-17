@@ -1,5 +1,5 @@
 use crate::backend::Backend;
-use crate::batching::{Batchable, Batcher, BatchingStrategy};
+use crate::batching::{Batchable, Batcher, BatchingStrategy, ManualStrategy};
 use crate::instance::Id as InstanceId;
 use crate::object::{IdRepr, ObjectManager, ObjectType, group_consecutive_ids};
 use crate::service::{Service, ServiceError, install_service};
@@ -17,6 +17,7 @@ use std::sync::atomic::AtomicBool;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
+use crate::runtime::trap;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -157,7 +158,7 @@ pub struct Info {
     pub kv_page_size: u32,
     pub num_kv_pages: u32,
     pub num_embeddings: u32,
-    pub num_distributions: u32,
+    pub num_adapters: u32,
 
     #[serde(skip)]
     pub tokenizer: Arc<BytePairEncoder>,
@@ -240,10 +241,6 @@ pub enum Command {
         handle: oneshot::Sender<Arc<BytePairEncoder>>,
     },
 
-    GetAllExportedKvPages {
-        handle: oneshot::Sender<Vec<(String, IdRepr)>>,
-    },
-
     Allocate {
         inst_id: InstanceId,
         stream_id: LocalStreamId,
@@ -258,6 +255,34 @@ pub enum Command {
         ids: Vec<IdRepr>,
     },
 
+    // --------------------
+    Export {
+        inst_id: InstanceId,
+        ty: ManagedTypes,
+        ids: Vec<IdRepr>,
+        resource_name: String,
+    },
+
+    GetExportedList {
+        inst_id: InstanceId,
+        ty: ManagedTypes,
+        handle: oneshot::Sender<Vec<(String, u32)>>,
+    },
+
+    Unexport {
+        inst_id: InstanceId,
+        ty: ManagedTypes,
+        resource_name: String,
+    },
+
+    Import {
+        inst_id: InstanceId,
+        ty: ManagedTypes,
+        ids: Vec<IdRepr>,
+        resource_name: String,
+    },
+
+    // --------------------
     Forward {
         inst_id: InstanceId,
         stream_id: LocalStreamId,
@@ -265,24 +290,6 @@ pub enum Command {
         kv_pages: Vec<IdRepr>,
         input_embeds: Vec<IdRepr>,
         output_embeds: Vec<IdRepr>,
-    },
-
-    ExportKvPages {
-        inst_id: InstanceId,
-        pages: Vec<IdRepr>,
-        resource_name: String,
-        persistent: bool,
-    },
-
-    UnexportKvPages {
-        inst_id: InstanceId,
-        resource_name: String,
-    },
-
-    ImportKvPages {
-        inst_id: InstanceId,
-        kv_pages: Vec<IdRepr>,
-        resource_name: String,
     },
 
     CopyKvPage {
@@ -358,20 +365,6 @@ pub enum Command {
     },
 
     /// ---- Optimizer -----
-    ///
-    ///
-    AllocateAdapters {
-        inst_id: InstanceId,
-        stream_id: LocalStreamId,
-        adapters: Vec<IdRepr>,
-    },
-
-    DeallocateAdapters {
-        inst_id: InstanceId,
-        stream_id: LocalStreamId,
-        adapters: Vec<IdRepr>,
-    },
-
     InitializeAdapter {
         inst_id: InstanceId,
         stream_id: LocalStreamId,
@@ -435,8 +428,6 @@ enum BatchGroup {
     EmbedImage,
     DebugQuery,
     //
-    AllocateAdapters,
-    DeallocateAdapters,
     InitializeAdapter,
     MutateAdapters,
     UpdateAdapter,
@@ -512,8 +503,6 @@ impl Batchable<BatchGroup> for Command {
             Command::Synchronize { .. } => batching::eager(),
             Command::EmbedImage { .. } => batching::eager(),
             Command::DebugQuery { .. } => batching::eager(),
-            Command::AllocateAdapters { .. } => batching::eager(),
-            Command::DeallocateAdapters { .. } => batching::eager(),
             Command::InitializeAdapter { .. } => batching::eager(),
             Command::MutateAdapters { .. } => batching::eager(),
             Command::UpdateAdapter { .. } => batching::eager(),
@@ -538,8 +527,6 @@ impl Batchable<BatchGroup> for Command {
             Command::Synchronize { .. } => BatchGroup::Synchronize,
             Command::EmbedImage { .. } => BatchGroup::EmbedImage,
             Command::DebugQuery { .. } => BatchGroup::DebugQuery,
-            Command::AllocateAdapters { .. } => BatchGroup::AllocateAdapters,
-            Command::DeallocateAdapters { .. } => BatchGroup::DeallocateAdapters,
             Command::InitializeAdapter { .. } => BatchGroup::InitializeAdapter,
             Command::MutateAdapters { .. } => BatchGroup::MutateAdapters,
             Command::UpdateAdapter { .. } => BatchGroup::UpdateAdapter,
@@ -562,20 +549,23 @@ pub enum Event {
 pub enum ManagedTypes {
     KvPage,
     Embed,
+    Adapter,
 }
 
 impl ObjectType for ManagedTypes {
     fn is_sharable(&self) -> bool {
         match self {
             ManagedTypes::KvPage => true,
-            ManagedTypes::Embed => false,
+            ManagedTypes::Embed => true,
+            ManagedTypes::Adapter => true,
         }
     }
 
     fn allow_remapping(&self) -> bool {
         match self {
             ManagedTypes::KvPage => false,
-            ManagedTypes::Embed => true,
+            ManagedTypes::Embed => false,
+            ManagedTypes::Adapter => false,
         }
     }
 }
@@ -589,7 +579,7 @@ pub struct L4m {
     scheduler: Sender<(Stream, Command)>,
     scheduler_loop_handle: tokio::task::JoinHandle<()>,
     event_loop_handle: tokio::task::JoinHandle<()>,
-    exported_blocks: HashMap<String, ExportedBlocks>,
+    exported: HashMap<ManagedTypes, HashMap<String, Vec<u32>>>,
     global_kv_page_id_pool: IdPool<u32>,
     objects: ObjectManager<InstanceId, ManagedTypes>,
     instance_launch_order: Vec<InstanceId>,
@@ -642,13 +632,13 @@ impl L4m {
         let info = info_rx.await.unwrap();
 
         tracing::info!(
-            "Backend service started: version={}, model_name={}, kv_page_size={}, num_kv_pages={}, num_embeddings={}, num_distributions={}",
+            "Backend service started: version={}, model_name={}, kv_page_size={}, num_kv_pages={}, num_embeddings={}, num_adapters={}",
             info.version,
             info.model_name,
             info.kv_page_size,
             info.num_kv_pages,
             info.num_embeddings,
-            info.num_distributions
+            info.num_adapters
         );
 
         let mut objects = ObjectManager::new();
@@ -658,12 +648,15 @@ impl L4m {
         objects
             .set_capacity(ManagedTypes::Embed, info.num_embeddings as IdRepr)
             .unwrap();
+        objects
+            .set_capacity(ManagedTypes::Adapter, info.num_adapters as IdRepr)
+            .unwrap();
 
         let driver = Self {
             scheduler: scheduler_tx,
             scheduler_loop_handle,
             event_loop_handle,
-            exported_blocks: HashMap::new(),
+            exported: HashMap::new(),
             global_kv_page_id_pool: IdPool::new(u32::MAX),
             objects,
             instance_launch_order: Vec::new(),
@@ -685,7 +678,8 @@ impl L4m {
 
             let type_name = match managed_type {
                 ManagedTypes::KvPage => "kvpage",
-                ManagedTypes::Embed => "emb",
+                ManagedTypes::Embed => "embed",
+                ManagedTypes::Adapter => "adapter",
                 // _ => "unknown",
             };
 
@@ -713,10 +707,6 @@ impl L4m {
                 });
             }
         }
-
-        // Remove all non-persistent exported blocks associated with the instance.
-        // Persistent blocks (owner: None) are retained.
-        self.exported_blocks.retain(|_, v| v.owner != inst_id);
 
         cmds
     }
@@ -753,17 +743,6 @@ impl L4m {
 
             Command::GetTokenizer { handle } => {
                 handle.send(self.info.tokenizer.clone()).ok();
-                None
-            }
-
-            Command::GetAllExportedKvPages { handle } => {
-                let catalogue = self
-                    .exported_blocks
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.addrs.len() as u32))
-                    .collect();
-
-                handle.send(catalogue).ok();
                 None
             }
 
@@ -892,6 +871,123 @@ impl L4m {
                 ))
             }
 
+            Command::Export {
+                inst_id,
+                ty,
+                mut ids,
+                resource_name,
+            } => {
+                // Translate logical page names to physical block addresses.
+                try_trap!(
+                    self.objects.translate_many(ty, inst_id, &mut ids),
+                    inst_id,
+                    "export failed. some blocks are invalid"
+                );
+
+                // check if it has already expored.
+                if self
+                    .exported
+                    .entry(ty.clone())
+                    .or_default()
+                    .contains_key(&resource_name)
+                {
+                    trap(inst_id, "Already exported");
+                    return None;
+                }
+
+                // prevent from deallocation
+                self.objects.inc_ref_count_many(ty, &ids);
+
+                self.exported
+                    .get_mut(&ty)
+                    .unwrap()
+                    .insert(resource_name, ids);
+
+                None
+            }
+
+            Command::GetExportedList {
+                inst_id: _, // Not used by this command.
+                ty,
+                handle,
+            } => {
+                // Collect the list of exported resources of a given type.
+                // The list contains the resource name and the number of items it holds.
+                let list = self
+                    .exported
+                    .get(&ty)
+                    .map(|exports| {
+                        exports
+                            .iter()
+                            .map(|(name, ids)| (name.clone(), ids.len() as u32))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                handle.send(list).ok();
+                None
+            }
+            Command::Unexport {
+                inst_id,
+                ty,
+                resource_name,
+            } => {
+                // Find and remove the resource from the exported list.
+                if let Some(physical_ids) = self
+                    .exported
+                    .get_mut(&ty)
+                    .and_then(|exports| exports.remove(&resource_name))
+                {
+                    // Decrement the reference count that was incremented during `Export`.
+                    // This allows the underlying objects to be deallocated if no other
+                    // instances are referencing them.
+                    self.objects.dec_ref_count_many(ty, &physical_ids);
+                } else {
+                    runtime::trap(
+                        inst_id,
+                        &format!("Unexport failed: resource '{}' not found.", resource_name),
+                    );
+                }
+                None
+            }
+            Command::Import {
+                inst_id,
+                ty,
+                ids,
+                resource_name,
+            } => {
+                // Find the physical IDs associated with the exported resource name.
+                match self.exported.get(&ty).and_then(|m| m.get(&resource_name)) {
+                    Some(physical_ids) => {
+                        // Ensure the user provides a matching number of logical IDs.
+                        if ids.len() != physical_ids.len() {
+                            runtime::trap(
+                                inst_id,
+                                &format!(
+                                    "Import failed: ID count mismatch (provided {}, required {}).",
+                                    ids.len(),
+                                    physical_ids.len()
+                                ),
+                            );
+                            return None;
+                        }
+                        // Create a new reference for the current instance, mapping its logical IDs
+                        // to the existing physical objects.
+                        try_trap!(
+                            self.objects.create_ref_many(ty, inst_id, ids, physical_ids),
+                            inst_id,
+                            "l4m::import failed"
+                        );
+                    }
+                    None => {
+                        runtime::trap(
+                            inst_id,
+                            &format!("Import failed: resource '{}' not found.", resource_name),
+                        );
+                    }
+                }
+                None
+            }
+
             Command::Forward {
                 inst_id,
                 stream_id,
@@ -992,133 +1088,6 @@ impl L4m {
                     },
                     Stream::new(inst_id, stream_id),
                 ))
-            }
-
-            Command::ExportKvPages {
-                inst_id,
-                pages,
-                resource_name,
-                persistent,
-            } => {
-                // Translate logical page names to physical block addresses.
-                // We clone `pages` because `translate_many` modifies the vector in place.
-                let mut physical_blocks = pages.clone();
-                try_trap!(
-                    self.objects.translate_many(
-                        ManagedTypes::KvPage,
-                        inst_id,
-                        &mut physical_blocks
-                    ),
-                    inst_id,
-                    "l4m::export_kv_pages failed. some blocks are invalid"
-                );
-
-                if persistent {
-                    // For persistent exports, create global references to the physical pages.
-                    // This increments their reference count, preventing them from being freed
-                    // when the original instance is destroyed.
-                    let num_pages = physical_blocks.len();
-                    let global_logical_ids: Vec<IdRepr> = (0..num_pages)
-                        .map(|_| self.global_kv_page_id_pool.acquire().unwrap())
-                        .collect();
-
-                    try_trap!(
-                        self.objects.create_ref_many(
-                            ManagedTypes::KvPage,
-                            GLOBAL_OWNER_ID,
-                            global_logical_ids.clone(),
-                            &physical_blocks
-                        ),
-                        inst_id,
-                        "l4m::export_kv_pages failed to create persistent references"
-                    );
-
-                    self.exported_blocks.insert(
-                        resource_name,
-                        ExportedBlocks::new(
-                            GLOBAL_OWNER_ID,
-                            physical_blocks,
-                            Some(global_logical_ids),
-                        ),
-                    );
-                } else {
-                    // For non-persistent export, the instance retains ownership.
-                    self.exported_blocks.insert(
-                        resource_name,
-                        ExportedBlocks::new(inst_id, physical_blocks, None),
-                    );
-                }
-                None // The command is fully handled here.
-            }
-
-            Command::UnexportKvPages {
-                inst_id,
-                resource_name,
-            } => {
-                // 1. Find the exported resource by its name and remove it from the map.
-                let exported_blocks = match self.exported_blocks.remove(&resource_name) {
-                    Some(blocks) => blocks,
-                    None => {
-                        runtime::trap(
-                            inst_id,
-                            format!(
-                                "l4m::unexport_kv_pages failed. Resource '{}' not found.",
-                                resource_name
-                            ),
-                        );
-                        return None;
-                    }
-                };
-
-                if exported_blocks.owner != inst_id && exported_blocks.owner != GLOBAL_OWNER_ID {
-                    return None;
-                }
-
-                // 3. If the resource had blocks, create a `Deallocate` command for the backend.
-                if !exported_blocks.addrs.is_empty() {
-                    let dealloc_cmd = Command::Deallocate {
-                        inst_id,
-                        stream_id: 0,
-                        ty: ManagedTypes::KvPage,
-                        ids: exported_blocks.addrs,
-                    };
-
-                    return Some((dealloc_cmd, Stream::new(inst_id, 0)));
-                }
-
-                None
-            }
-
-            Command::ImportKvPages {
-                inst_id,
-                kv_pages: blocks,
-                resource_name,
-            } => {
-                let exported = match self.exported_blocks.get(&resource_name) {
-                    Some(exp) => exp,
-                    None => {
-                        runtime::trap(
-                            inst_id,
-                            format!(
-                                "l4m::import_blocks failed. resource {} not found",
-                                resource_name
-                            ),
-                        );
-                        return None;
-                    }
-                };
-
-                try_trap!(
-                    self.objects.create_ref_many(
-                        ManagedTypes::KvPage,
-                        inst_id,
-                        blocks,
-                        &exported.addrs
-                    ),
-                    inst_id,
-                    "l4m::import_blocks failed"
-                );
-                None
             }
 
             Command::CopyKvPage {
@@ -1299,94 +1268,101 @@ impl L4m {
                 ))
             }
 
-            Command::AllocateAdapters {
-                inst_id,
-                stream_id,
-                adapters,
-            } => Some((
-                Command::AllocateAdapters {
-                    inst_id,
-                    stream_id,
-                    adapters,
-                },
-                Stream::new(inst_id, stream_id),
-            )),
-            Command::DeallocateAdapters {
-                inst_id,
-                stream_id,
-                adapters,
-            } => Some((
-                Command::DeallocateAdapters {
-                    inst_id,
-                    stream_id,
-                    adapters,
-                },
-                Stream::new(inst_id, stream_id),
-            )),
-
             Command::InitializeAdapter {
                 inst_id,
                 stream_id,
-                adapter,
+                mut adapter,
                 rank,
                 alpha,
                 population_size,
                 mu_fraction,
                 initial_sigma,
-            } => Some((
-                Command::InitializeAdapter {
+            } => {
+                try_trap!(
+                    self.objects
+                        .translate(ManagedTypes::Adapter, inst_id, &mut adapter),
                     inst_id,
-                    stream_id,
-                    adapter,
-                    rank,
-                    alpha,
-                    population_size,
-                    mu_fraction,
-                    initial_sigma,
-                },
-                Stream::new(inst_id, stream_id),
-            )),
+                    "InitializeAdapter failed. some context blocks are invalid"
+                );
+                Some((
+                    Command::InitializeAdapter {
+                        inst_id,
+                        stream_id,
+                        adapter,
+                        rank,
+                        alpha,
+                        population_size,
+                        mu_fraction,
+                        initial_sigma,
+                    },
+                    Stream::new(inst_id, stream_id),
+                ))
+            }
 
             Command::MutateAdapters {
                 inst_id,
                 stream_id,
-                adapters,
-                parent,
+                mut adapters,
+                mut parent,
                 seeds,
-            } => Some((
-                Command::MutateAdapters {
+            } => {
+                try_trap!(
+                    self.objects
+                        .translate_many(ManagedTypes::Adapter, inst_id, &mut adapters),
                     inst_id,
-                    stream_id,
-                    adapters,
-                    parent,
-                    seeds,
-                },
-                Stream::new(inst_id, stream_id),
-            )),
+                    "MutateAdapters failed. some context blocks are invalid"
+                );
+
+                try_trap!(
+                    self.objects
+                        .translate(ManagedTypes::Adapter, inst_id, &mut parent),
+                    inst_id,
+                    "InitializeAdapter failed. some context blocks are invalid"
+                );
+
+                Some((
+                    Command::MutateAdapters {
+                        inst_id,
+                        stream_id,
+                        adapters,
+                        parent,
+                        seeds,
+                    },
+                    Stream::new(inst_id, stream_id),
+                ))
+            }
 
             Command::UpdateAdapter {
                 inst_id,
                 stream_id,
-                adapter,
+                mut adapter,
                 scores,
                 seeds,
                 max_sigma,
-            } => Some((
-                Command::UpdateAdapter {
+            } => {
+                try_trap!(
+                    self.objects
+                        .translate(ManagedTypes::Adapter, inst_id, &mut adapter),
                     inst_id,
-                    stream_id,
-                    adapter,
-                    scores,
-                    seeds,
-                    max_sigma,
-                },
-                Stream::new(inst_id, stream_id),
-            )),
+                    "UpdateAdapter failed. some context blocks are invalid"
+                );
+                Some((
+                    Command::UpdateAdapter {
+                        inst_id,
+                        stream_id,
+                        adapter,
+                        scores,
+                        seeds,
+                        max_sigma,
+                    },
+                    Stream::new(inst_id, stream_id),
+                ))
+            }
 
             Command::ForwardWithAdapter {
                 inst_id,
                 stream_id,
-                adapter,
+                mut adapter,
                 kv_page_last_len,
                 mut kv_pages,
                 text,
@@ -1395,6 +1371,12 @@ impl L4m {
                 output_indices,
                 handle,
             } => {
+                try_trap!(
+                    self.objects
+                        .translate(ManagedTypes::Adapter, inst_id, &mut adapter),
+                    inst_id,
+                    "ForwardWithAdapter failed. some context blocks are invalid"
+                );
                 try_trap!(
                     self.objects
                         .translate_many(ManagedTypes::KvPage, inst_id, &mut kv_pages),
@@ -1509,7 +1491,7 @@ impl L4m {
                                         kv_page_size: info.kv_page_size,
                                         num_kv_pages: info.num_available_kv_pages,
                                         num_embeddings: info.num_available_embeddings,
-                                        num_distributions: info.num_available_distributions,
+                                        num_adapters: info.num_available_adapters,
                                         tokenizer,
                                     })
                                     .ok();
@@ -1642,12 +1624,6 @@ where
             }
             BatchGroup::EmbedImage => encode_pb_batch_embed_image(correlation_id, batch),
             BatchGroup::DebugQuery => encode_pb_batch_debug_query(correlation_id, batch),
-            BatchGroup::AllocateAdapters => {
-                encode_pb_batch_allocate_adapters(correlation_id, batch)
-            }
-            BatchGroup::DeallocateAdapters => {
-                encode_pb_batch_deallocate_adapters(correlation_id, batch)
-            }
             BatchGroup::InitializeAdapter => {
                 encode_pb_batch_initialize_adapter(correlation_id, batch)
             }
@@ -1665,25 +1641,6 @@ where
         self.backend
             .send(self.protocol_ids[protocol], payload)
             .unwrap();
-    }
-}
-
-#[derive(Debug)]
-struct ExportedBlocks {
-    owner: InstanceId,
-    addrs: Vec<IdRepr>,
-    /// For persistent blocks, stores the logical IDs within the global namespace
-    /// used for reference counting. Empty for non-persistent blocks.
-    global_refs: Option<Vec<IdRepr>>,
-}
-
-impl ExportedBlocks {
-    pub fn new(owner: InstanceId, addrs: Vec<IdRepr>, global_refs: Option<Vec<IdRepr>>) -> Self {
-        Self {
-            owner,
-            addrs,
-            global_refs,
-        }
     }
 }
 
@@ -1742,7 +1699,7 @@ impl backend::Simulate for Simulator {
                     kv_page_size: 128,
                     num_available_kv_pages: 1000000,
                     num_available_embeddings: 1000000,
-                    num_available_distributions: 100000,
+                    num_available_adapters: 100000,
                     tokenizer: Some(pb_bindings::Tokenizer {
                         merge_table: self.tokenizer_merge_table.clone(),
                         special_tokens: HashMap::from([
@@ -1833,6 +1790,7 @@ fn encode_pb_batch_deallocate_inner(batch: Vec<Command>) -> Vec<pb_bindings::Dea
                 let kind = match ty {
                     ManagedTypes::KvPage => pb_bindings::ObjectKind::KvBlock,
                     ManagedTypes::Embed => pb_bindings::ObjectKind::Emb,
+                    ManagedTypes::Adapter => pb_bindings::ObjectKind::Adapter,
                     _ => unreachable!(),
                 }
                 .into();
@@ -2173,52 +2131,6 @@ fn encode_pb_batch_debug_query(
     ((PROTOCOL_BASE, payload), Some(events))
 }
 
-fn encode_pb_batch_allocate_adapters(
-    correlation_id: u32,
-    batch: Vec<Command>,
-) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
-    let cmd = match batch.into_iter().next().unwrap() {
-        Command::AllocateAdapters {
-            inst_id,
-            stream_id,
-            adapters,
-        } => pb_bindings::request::Command::AllocateAdapters(pb_bindings::AllocateAdapters {
-            adapters,
-        }),
-        _ => unreachable!(),
-    };
-
-    let payload = pb_bindings::Request {
-        correlation_id,
-        command: Some(cmd),
-    }
-    .encode_to_vec();
-    ((PROTOCOL_BASE, payload), None)
-}
-
-fn encode_pb_batch_deallocate_adapters(
-    correlation_id: u32,
-    batch: Vec<Command>,
-) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
-    let cmd = match batch.into_iter().next().unwrap() {
-        Command::DeallocateAdapters {
-            inst_id,
-            stream_id,
-            adapters,
-        } => pb_bindings::request::Command::DeallocateAdapters(pb_bindings::DeallocateAdapters {
-            adapters,
-        }),
-        _ => unreachable!(),
-    };
-
-    let payload = pb_bindings::Request {
-        correlation_id,
-        command: Some(cmd),
-    }
-    .encode_to_vec();
-    ((PROTOCOL_BASE, payload), None)
-}
-
 fn encode_pb_batch_initialize_adapter(
     correlation_id: u32,
     batch: Vec<Command>,
@@ -2252,17 +2164,21 @@ fn encode_pb_batch_initialize_adapter(
     ((PROTOCOL_BASE, payload), None)
 }
 
-
-
 fn encode_pb_batch_mutate_adapters(
     correlation_id: u32,
     batch: Vec<Command>,
 ) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
     let cmd = match batch.into_iter().next().unwrap() {
         Command::MutateAdapters {
-            inst_id, stream_id, adapters, parent, seeds
+            inst_id,
+            stream_id,
+            adapters,
+            parent,
+            seeds,
         } => pb_bindings::request::Command::MutateAdapters(pb_bindings::MutateAdapters {
-            adapters, parent, seeds
+            adapters,
+            parent,
+            seeds,
         }),
         _ => unreachable!(),
     };
@@ -2271,12 +2187,9 @@ fn encode_pb_batch_mutate_adapters(
         correlation_id,
         command: Some(cmd),
     }
-        .encode_to_vec();
+    .encode_to_vec();
     ((PROTOCOL_BASE, payload), None)
 }
-
-
-
 
 fn encode_pb_batch_update_adapter(
     correlation_id: u32,
@@ -2284,9 +2197,17 @@ fn encode_pb_batch_update_adapter(
 ) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
     let cmd = match batch.into_iter().next().unwrap() {
         Command::UpdateAdapter {
-            inst_id, stream_id, adapter, scores, seeds, max_sigma
+            inst_id,
+            stream_id,
+            adapter,
+            scores,
+            seeds,
+            max_sigma,
         } => pb_bindings::request::Command::UpdateAdapter(pb_bindings::UpdateAdapter {
-            adapter, scores, seeds, max_sigma
+            adapter,
+            scores,
+            seeds,
+            max_sigma,
         }),
         _ => unreachable!(),
     };
@@ -2295,12 +2216,9 @@ fn encode_pb_batch_update_adapter(
         correlation_id,
         command: Some(cmd),
     }
-        .encode_to_vec();
+    .encode_to_vec();
     ((PROTOCOL_BASE, payload), None)
 }
-
-
-
 
 fn encode_pb_batch_forward_with_adapter(
     correlation_id: u32,

@@ -12,6 +12,12 @@ pub trait Optimize {
 
     fn deallocate_adapters(&self, adapter_ids: &[u32]);
 
+    fn export_adapter(&self, adapter_id: u32, name: &str);
+
+    fn unexport_adapter(&self, name: &str);
+
+    fn import_adapter(&self, name: &str) -> u32;
+
     fn initialize_adapter(
         &self,
         adapter_id: u32,
@@ -57,7 +63,7 @@ impl Allocator for AdapterAllocator {
         ids: &[u32],
         name: &str,
     ) -> Result<(), pool::ResourcePoolError> {
-        panic!("Adapters cannot be imported");
+        optimize::import_adapter(queue, ids[0], name);
         Ok(())
     }
 }
@@ -96,6 +102,23 @@ impl Optimize for Queue {
         pool.borrow_mut()
             .release_many(&self.inner, adapter_ids)
             .expect("Failed to deallocate adapters from pool");
+    }
+    fn export_adapter(&self, adapter_id: u32, name: &str) {
+        optimize::export_adapter(&self.inner, adapter_id, name);
+    }
+
+    fn unexport_adapter(&self, name: &str) {
+        optimize::unexport_adapter(&self.inner, name);
+    }
+
+    fn import_adapter(&self, name: &str) -> u32 {
+        let pool = get_adapter_pool(&self.inner);
+        pool.borrow_mut()
+            .import(&self.inner, 1, &name)
+            .expect("Failed to allocate adapter from pool")
+            .into_iter()
+            .next()
+            .unwrap()
     }
 
     fn initialize_adapter(

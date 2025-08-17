@@ -16,7 +16,7 @@ enum ObjectKind {
   OBJECT_KIND_EMB = 2;
 
   // Distribution.
-  OBJECT_KIND_DIST = 3;
+  OBJECT_KIND_ADAPTER = 3;
 }
 
 // -----------------------------------------------------------------------------
@@ -263,7 +263,7 @@ message GetInfoResponse {
   uint32 kv_page_size = 3;
   uint32 num_available_kv_pages = 4;
   uint32 num_available_embeddings = 5;
-  uint32 num_available_distributions = 6;
+  uint32 num_available_adapters = 6;
   Tokenizer tokenizer = 7;
 }
 

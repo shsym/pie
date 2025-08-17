@@ -65,6 +65,11 @@ class Driver:
     blocks: dict[int, Block]
     adapters: dict[str, Adapter]
 
+    max_num_kv_pages: int
+    max_num_embeds: int
+    max_num_adapters: int
+    max_adapter_rank: int
+
     # dist_storage: VectorStorage
 
     def __init__(
@@ -74,6 +79,8 @@ class Driver:
             dist_size: int,
             max_num_kv_pages: int,
             max_num_embeds: int,
+            max_num_adapters: int,
+            max_adapter_rank: int,
             dtype: torch.dtype,
             device: str,
     ):
@@ -87,11 +94,13 @@ class Driver:
         self.dist_size = dist_size
         self.max_num_kv_pages = max_num_kv_pages
         self.max_num_embeds = max_num_embeds
+        self.max_num_adapters = max_num_adapters
+        self.max_adapter_rank = max_adapter_rank
         self.dtype = dtype
         self.device = device
 
         self.kv_cache_at_layer = [
-            torch.randn(
+            torch.zeros(
                 (
                     max_num_kv_pages,
                     2,
@@ -101,6 +110,31 @@ class Driver:
                 ),
                 dtype=dtype,
                 device=device,
+            )
+            for _ in range(self.lm.config.num_layers)
+        ]
+
+        self.adapter_at_layer = [
+            (
+                torch.zeros(
+                    (
+                        max_num_kv_pages,
+                        self.lm.config.hidden_size,
+                        max_adapter_rank * 3,
+                    ),
+                    dtype=dtype,
+                    device=device,
+                ),
+                torch.zeros(
+                    (
+                        max_num_kv_pages,
+                        max_adapter_rank,
+                        self.lm.config.head_size * (
+                                self.lm.config.num_query_heads + self.lm.config.num_key_value_heads * 2),
+                    ),
+                    dtype=dtype,
+                    device=device,
+                ),
             )
             for _ in range(self.lm.config.num_layers)
         ]
@@ -135,7 +169,8 @@ class Driver:
             elif cmd.kind == ObjectKind.OBJECT_KIND_EMB:
                 # do nothing. Embeds are allocated on the fly.
                 pass
-            elif cmd.kind == ObjectKind.OBJECT_KIND_DIST:
+            elif cmd.kind == ObjectKind.OBJECT_KIND_ADAPTER:
+
                 # do nothing. Dists are allocated on the fly.
                 pass
 
@@ -595,40 +630,50 @@ class Driver:
         )
 
     @torch.inference_mode()
-    def create_adapter(self, cmd: CreateAdapter):
+    def initialize_adapter(self, cmd: InitializeAdapter):
 
         cfg = self.lm.config
 
-        self.adapters[cmd.name] = MutableAdapter(
-            num_layers=cfg.num_layers,
-            in_features=cfg.hidden_size,
-            out_features=[cfg.head_size * cfg.num_query_heads, cfg.head_size * cfg.num_key_value_heads, cfg.head_size * cfg.num_key_value_heads],
+        self.adapters[cmd.adapter] = MutableAdapter(
             rank=cmd.rank,
             alpha=cmd.alpha,
+            adapter_id=cmd.adapter,
+            adapters_by_layer=self.adapter_at_layer,
+            out_features=[cfg.head_size * cfg.num_query_heads,
+                          cfg.head_size * cfg.num_key_value_heads,
+                          cfg.head_size * cfg.num_key_value_heads],
             population_size=cmd.population_size,
             mu_fraction=cmd.mu_fraction,
-            initial_sigma=cmd.initial_sigma,
-            device=self.device,
-            dtype=torch.bfloat16,
+            initial_sigma=cmd.initial_sigma
         )
 
-    def destroy_adapter(self, cmd: DestroyAdapter):
-        if cmd.name in self.adapters:
-            del self.adapters[cmd.name]
+    @torch.inference_mode()
+    def mutate_adapters(self, cmd: MutateAdapters):
+
+        parent = self.adapters[cmd.parent]
+
+        if not isinstance(parent, MutableAdapter):
+            print('parent is not mutable adapter!')
+
+        for adapter_id, seed in zip(cmd.adapters, cmd.seeds):
+            parent.apply_mutation(self.adapter_at_layer, adapter_id, seed)
+            self.adapters[adapter_id] = Adapter(adapter_id,
+                                                rank=parent.rank,
+                                                alpha=parent.alpha,
+                                                out_features=parent.out_features)
 
     @torch.inference_mode()
     def update_adapter(self, cmd: UpdateAdapter):
 
         if cmd.name in self.adapters:
-            adapter = self.adapters[cmd.name]
+            adapter = self.adapters[cmd.adapter]
             if isinstance(adapter, MutableAdapter):
-                adapter.update(cmd.scores, cmd.seeds, cmd.max_sigma)
+                adapter.update(self.adapter_at_layer, cmd.scores, cmd.seeds, cmd.max_sigma)
 
     @torch.inference_mode()
     def forward_with_mutation(self, cmds: BatchForwardWithMutation):
 
         all_adapters = []
-        all_seeds = []
         adapter_indices = []
 
         kv_page_indices = []
@@ -650,19 +695,8 @@ class Driver:
             if cmd.adapter not in self.adapters:
                 raise ValueError(f"Adapter {cmd.adapter} not found")
 
-            if cmd.seed in all_seeds:
-                index = all_seeds.index(cmd.seed)
-                adapter_indices.append(index)
-
-            else:
-                adapter = self.adapters[cmd.adapter]
-                if isinstance(adapter, MutableAdapter):
-                    mutated_adapter = AdapterWithMutation(adapter, cmd.seed)
-                    all_adapters.append(mutated_adapter)
-                    all_seeds.append(cmd.seed)
-                    adapter_indices.append(len(all_adapters) - 1)
-                else:
-                    raise ValueError(f"Adapter {cmd.adapter} is not MutableAdapter.")
+            all_adapters.append(self.adapters[cmd.adapter])
+            adapter_indices.append(cmd.adapter)
 
             kv_page_indices.extend(cmd.kv_page_ids)
             kv_page_indptr.append(len(kv_page_indices))
@@ -809,7 +843,6 @@ class Driver:
 
         # clear all pytorch caches
         del all_adapters
-
 
         return BatchForwardTextResponse(
             items=responses

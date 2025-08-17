@@ -135,16 +135,21 @@ class L4maAttention(nn.Module):
         n, _ = hidden_states.size()
 
         qkv_states = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = torch.split(
+            qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
+        )
 
         # apply adapters if provided
         if adapter_buffer is not None:
             nnz = adapter_buffer.nnz
             delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states[:nnz])
-            qkv_states[:nnz] += delta
+            q_delta = delta[0]
+            k_delta = delta[1]
+            v_delta = delta[2]
 
-        query_states, key_states, value_states = torch.split(
-            qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
-        )
+            query_states.add_(q_delta)
+            key_states.add_(k_delta)
+            value_states.add_(v_delta)
 
         # Reshape and continue as before
         query_states = query_states.view(
@@ -297,9 +302,10 @@ class L4maModel(nn.Module):
             self,
             adapters: list[Adapter] | None,
             adapter_indices: torch.Tensor | None,
+            adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]],
             input_embeds: torch.Tensor,
             position_ids: torch.Tensor,
-            kv_cache_at_layer: torch.Tensor,
+            kv_cache_at_layer: list[torch.Tensor],
             kv_page_indices: torch.Tensor,
             kv_page_indptr: torch.Tensor,
             kv_last_page_lens: torch.Tensor,
@@ -323,14 +329,18 @@ class L4maModel(nn.Module):
         # we assume requests are sorted such that initial n requests are the ones with adapters
         if adapters is not None:
 
-            #print('forward!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+            rank = adapters[0].rank
+            alpha = adapters[0].alpha
+            out_features = adapters[0].out_features
 
             adapter_buffer = AdapterBuffer(
-                adapters=adapters,
+                rank=rank,
+                alpha=alpha,
+                adapter_at_layer=adapter_at_layer,
                 adapter_indices=adapter_indices,
                 x_indptr=qo_indptr[:adapter_indices.size(0) + 1],
                 segment_gemm_wrapper=self.wrapper_segment_gemm,
-                dtype=self.config.dtype,
+                out_features=out_features
             )
         else:
             adapter_buffer = None
@@ -343,10 +353,10 @@ class L4maModel(nn.Module):
                 last_page_len=kv_last_page_lens,
                 num_qo_heads=self.config.num_query_heads,
                 num_kv_heads=self.config.num_key_value_heads,
-                head_dim=self.config.hidden_size // self.config.num_query_heads,
+                head_dim=self.config.head_size,
                 page_size=page_size,
                 pos_encoding_mode="NONE",
-                q_data_type=torch.bfloat16,
+                q_data_type=self.config.dtype,
             )
             wrapper = self.wrapper_decode
         else:
@@ -357,10 +367,10 @@ class L4maModel(nn.Module):
                 paged_kv_last_page_len=kv_last_page_lens,
                 num_qo_heads=self.config.num_query_heads,
                 num_kv_heads=self.config.num_key_value_heads,
-                head_dim_qk=self.config.hidden_size // self.config.num_query_heads,
+                head_dim_qk=self.config.head_size,
                 page_size=page_size,
                 custom_mask=custom_mask,
-                q_data_type=torch.bfloat16,
+                q_data_type=self.config.dtype,
             )
             wrapper = self.wrapper_append
 

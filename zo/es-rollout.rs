@@ -87,10 +87,22 @@ async fn main() -> Result<(), String> {
     // The futures vector for a single-threaded (Wasm) environment does not need the `Send` bound.
     let mut futures: Vec<Pin<Box<dyn Future<Output = String>>>> = vec![];
 
+    // import the main adapter
+    let model = inferlet::get_auto_model();
+    let queue = model.queue();
+
+    let es_adapter = queue.import_adapter("es-adapter");
+
+    let perturbed_adapters = queue.allocate_adapters(seeds.len());
+    queue.mutate_adapters(perturbed_adapters)
+
     println!("🚀 Starting parallel rollout...");
     for (i, &seed) in seeds.iter().enumerate() {
         // Get a new model instance for each seed.
-        let mut model = inferlet::get_auto_model();
+        let mut model_with_adapter = model.clone();
+
+        //
+
         // Apply the adapter with the current seed.
         model.set_adapter(&name, seed);
 

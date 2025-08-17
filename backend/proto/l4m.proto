@@ -16,7 +16,7 @@ enum ObjectKind {
   OBJECT_KIND_EMB = 2;
 
   // Distribution.
-  OBJECT_KIND_DIST = 3;
+  OBJECT_KIND_ADAPTER = 3;
 }
 
 // -----------------------------------------------------------------------------
@@ -188,14 +188,6 @@ message BatchDebugQueryRequest {
   repeated DebugQueryRequest items = 1;
 }
 
-message AllocateAdapters {
-  repeated uint32 adapters = 1;
-}
-
-message DeallocateAdapters {
-  repeated uint32 adapters = 1;
-}
-
 message InitializeAdapter {
   uint32 adapter = 1;
   uint32 rank = 2;
@@ -263,7 +255,7 @@ message GetInfoResponse {
   uint32 kv_page_size = 3;
   uint32 num_available_kv_pages = 4;
   uint32 num_available_embeddings = 5;
-  uint32 num_available_distributions = 6;
+  uint32 num_available_adapters = 6;
   Tokenizer tokenizer = 7;
 }
 
@@ -322,13 +314,11 @@ message Request {
     BatchDecodeTokenDistribution decode_token_distribution = 9;
     BatchSampleTopKRequest sample_top_k_request = 10;
     BatchDebugQueryRequest debug_query_request = 11;
-    AllocateAdapters allocate_adapters = 12;
-    DeallocateAdapters deallocate_adapters = 13;
-    InitializeAdapter initialize_adapter = 14;
-    MutateAdapters mutate_adapters = 15;
-    UpdateAdapter update_adapter = 16;
-    BatchForwardWithAdapter forward_with_adapter = 17;
-    GetInfoRequest get_info = 18;
+    InitializeAdapter initialize_adapter = 12;
+    MutateAdapters mutate_adapters = 13;
+    UpdateAdapter update_adapter = 14;
+    BatchForwardWithAdapter forward_with_adapter = 15;
+    GetInfoRequest get_info = 16;
   }
 }
 

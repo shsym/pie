@@ -88,15 +88,20 @@ async fn main() -> Result<(), String> {
     let model = inferlet::get_auto_model();
     let queue = model.create_queue();
 
+    let adapter_id = queue.allocate_adapters(1)[0];
+
     // Create the Evolution Strategies adapter with the specified hyperparameters.
-    queue.create_adapter(
-        &name,
+    queue.initialize_adapter(
+        adapter_id,
         rank,
         alpha,
         population_size,
         mu_fraction,
         initial_sigma,
     );
+
+    queue.export_adapter(adapter_id, "es-adapter");
+
     inferlet::wstd::task::sleep(Duration::from_millis(100)).await;
     println!("✅ Adapter '{}' created successfully.", name);
 

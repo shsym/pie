@@ -3,7 +3,7 @@ use crate::bindings::core::Queue;
 use crate::bindings::forward_text::DistributionResult;
 use crate::bindings::pie::inferlet::allocate::ObjectId;
 use crate::instance::InstanceState;
-use crate::model::Command;
+use crate::model::{Command, ManagedTypes};
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::IoView;
@@ -16,10 +16,11 @@ impl bindings::pie::inferlet::optimize::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::AllocateAdapters {
+        Command::Allocate {
             inst_id,
             stream_id: q.stream_id,
-            adapters,
+            ty: ManagedTypes::Adapter,
+            ids: adapters,
         }
         .dispatch(q.service_id)?;
 
@@ -33,10 +34,66 @@ impl bindings::pie::inferlet::optimize::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::DeallocateAdapters {
+        Command::Deallocate {
             inst_id,
             stream_id: q.stream_id,
-            adapters,
+            ty: ManagedTypes::Adapter,
+            ids: adapters,
+        }
+        .dispatch(q.service_id)?;
+
+        Ok(())
+    }
+
+    async fn export_adapter(
+        &mut self,
+        queue: Resource<Queue>,
+        adapter: ObjectId,
+        name: String,
+    ) -> anyhow::Result<()> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+        Command::Export {
+            inst_id,
+            ty: ManagedTypes::Adapter,
+            ids: vec![adapter],
+            resource_name: name,
+        }
+        .dispatch(q.service_id)?;
+
+        Ok(())
+    }
+
+    async fn unexport_adapter(
+        &mut self,
+        queue: Resource<Queue>,
+        name: String,
+    ) -> anyhow::Result<()> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+        Command::Unexport {
+            inst_id,
+            ty: ManagedTypes::Adapter,
+            resource_name: name,
+        }
+        .dispatch(q.service_id)?;
+
+        Ok(())
+    }
+
+    async fn import_adapter(
+        &mut self,
+        queue: Resource<Queue>,
+        adapter: ObjectId,
+        name: String,
+    ) -> anyhow::Result<()> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+        Command::Import {
+            inst_id,
+            ty: ManagedTypes::Adapter,
+            ids: vec![adapter],
+            resource_name: name,
         }
         .dispatch(q.service_id)?;
 
