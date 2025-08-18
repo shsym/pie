@@ -79,7 +79,7 @@ pub struct Queue {
 #[derive(Clone, Debug)]
 pub struct Model {
     pub(crate) inner: Rc<core::Model>,
-    pub(crate) adapter: Option<u32>,
+    pub(crate) adapter: Option<(u32, i64)>,
 }
 
 /// Returns the runtime version string.
@@ -268,11 +268,11 @@ impl Model {
         Context::new(self)
     }
 
-    pub fn set_adapter(&mut self, adapter_id: u32) {
-        self.adapter = Some(adapter_id)
+    pub fn set_adapter(&mut self, adapter_id: u32, seed: i64) {
+        self.adapter = Some((adapter_id, seed))
     }
 
-    pub fn get_adapter(&self) -> Option<u32> {
+    pub fn get_adapter(&self) -> Option<(u32, i64)> {
         self.adapter
     }
 

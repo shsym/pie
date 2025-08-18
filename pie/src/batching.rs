@@ -56,51 +56,72 @@ pub fn adaptive(
         .map(|s| s.into_box())
 }
 
-pub fn manual() -> (Box<dyn BatchingStrategy>, Arc<AtomicBool>) {
+pub fn manual(min_wait_time: Duration) -> (Box<dyn BatchingStrategy>, Arc<AtomicBool>) {
     let trigger = Arc::new(AtomicBool::new(false));
     let strategy = ManualStrategy {
         count: 0,
         trigger: trigger.clone(),
+        min_wait_time,
+        first_item_time: None,
     };
     (Box::new(strategy), trigger)
 }
 
-/// A strategy that batches items only when an external trigger is fired.
+/// A strategy that batches items only when an external trigger is fired
+/// and a minimum wait time has passed.
 #[derive(Debug)]
 pub struct ManualStrategy {
     count: usize,
     trigger: Arc<AtomicBool>,
+    min_wait_time: Duration,
+    first_item_time: Option<Instant>,
 }
 
 impl ManualStrategy {
-    /// Creates a new ManualStrategy that uses the provided atomic boolean as a trigger.
-    pub fn new(trigger: Arc<AtomicBool>) -> Self {
-        Self { count: 0, trigger }
+    pub fn new(trigger: Arc<AtomicBool>, min_wait_time: Duration) -> Self {
+        Self {
+            count: 0,
+            trigger,
+            min_wait_time,
+            first_item_time: None,
+        }
     }
 }
 
 impl BatchingStrategy for ManualStrategy {
-    fn update(&mut self, _now: Instant) {
-        //println!("item added: {:?}", self.count + 1);
-        // We only need to know how many items there are, not when they arrived.
+    fn update(&mut self, now: Instant) {
         self.count += 1;
+        // NEW: capture the first enqueue time after queue was empty
+        if self.count == 1 {
+            self.first_item_time = Some(now);
+        }
     }
 
-    fn batch(&mut self, _now: Instant) -> usize {
+    fn batch(&mut self, now: Instant) -> usize {
         if self.count == 0 {
             return 0;
         }
-        //println!("batch fired! {:?}", self.trigger);
 
-        // Atomically check if the trigger is set to true, and reset it to false.
-        // `swap` ensures we only fire once per trigger.
-        if self.trigger.swap(false, Ordering::SeqCst) {
-            let batch_size = self.count;
-            self.count = 0;
-            batch_size
-        } else {
-            0
+        // NEW: ensure minimum wait since the first item
+        let waited_long_enough = match self.first_item_time {
+            Some(t0) => now.duration_since(t0) >= self.min_wait_time,
+            None => self.min_wait_time == Duration::from_secs(0),
+        };
+        if !waited_long_enough {
+            return 0;
         }
+
+        // CHANGED: don't clear the trigger unless we're actually going to fire
+        if self.trigger.load(Ordering::SeqCst) {
+            // try to consume the trigger exactly once
+            if self.trigger.swap(false, Ordering::SeqCst) {
+                let batch_size = self.count;
+                self.count = 0;
+                self.first_item_time = None; // reset the "round"
+                return batch_size;
+            }
+        }
+        0
     }
 }
 

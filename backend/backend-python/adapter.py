@@ -3,6 +3,7 @@ import time
 import torch
 import torch.nn as nn
 import math
+import rand_mv
 
 
 class Adapter:
@@ -52,7 +53,7 @@ class AdapterBuffer:
         self.segment_gemm_wrapper = segment_gemm_wrapper
         self.out_features = out_features
 
-        self.num_segments = x_indptr.shape[0]
+        self.num_segments = x_indptr.shape[0] - 1
         self.nnz = x_indptr[-1].item()
 
         num_group = len(out_features)
@@ -62,21 +63,36 @@ class AdapterBuffer:
 
     @torch.inference_mode()
     def compute_lora_delta(self, layer_idx: int, x: torch.Tensor) -> list[torch.Tensor]:
-        # start_time = time.time()
+        start_time = time.time()
         down_projs, up_projs = self.adapter_at_layer[layer_idx]
+
+        # if layer_idx == 0:
+        #     print('down_proj.shape', down_projs.shape)
+        #     print('up_projs.shape', up_projs.shape)
+        #     print('x.shape', x.shape)
+        #     print('num_segments', self.num_segments)
+        #     print('out_features', self.out_features)
+        #     print('num_adapter_group', self.num_adapter_group)
+        #     print('x_indptr', self.x_indptr)
 
         # do segmented GEMM
         down = self.segment_gemm_wrapper.run(
             x=x,
             weights=down_projs,
             batch_size=self.num_segments,
-            weight_column_major=False,
+            weight_column_major=True,
             seg_indptr=self.x_indptr,
             weight_indices=self.adapter_indices
         )
 
+        if layer_idx == 0:
+            # print elapsed time in millisecodns
+            torch.cuda.synchronize()
+            print("down elapsed time: ", (time.time() - start_time) * 1000)
+            start_time = time.time()
+
         down_buffer_by_grp = torch.split(down, self.rank, dim=-1)
-        up_proj_buffer_by_grp = torch.split(up_projs, self.out_features, dim=-1)
+        up_proj_buffer_by_grp = torch.split(up_projs, self.out_features, dim=1)
 
         # do segmented gemm by group (nnz, rank) * (seg, rank, out_features[i])
         out_list = []
@@ -86,11 +102,15 @@ class AdapterBuffer:
                 x=down_buffer_by_grp[i].contiguous(),
                 weights=up_proj_buffer_by_grp[i].contiguous(),
                 batch_size=self.num_segments,
-                weight_column_major=False,
+                weight_column_major=True,
                 seg_indptr=self.x_indptr,
                 weight_indices=self.adapter_indices
             )
             out_list.append(scale * out)
+
+        if layer_idx == 0:
+            torch.cuda.synchronize()
+            print("upelapsed time: ", (time.time() - start_time) * 1000)
 
         return out_list
 

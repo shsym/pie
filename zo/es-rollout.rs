@@ -89,25 +89,23 @@ async fn main() -> Result<(), String> {
 
     // import the main adapter
     let model = inferlet::get_auto_model();
-    let queue = model.queue();
+    let queue = model.create_queue();
 
     let es_adapter = queue.import_adapter("es-adapter");
 
     let perturbed_adapters = queue.allocate_adapters(seeds.len());
-    queue.mutate_adapters(perturbed_adapters)
+    queue.mutate_adapters(&perturbed_adapters, es_adapter, &seeds);
 
     println!("🚀 Starting parallel rollout...");
-    for (i, &seed) in seeds.iter().enumerate() {
+    for i in 0..seeds.len() {
         // Get a new model instance for each seed.
         let mut model_with_adapter = model.clone();
 
-        //
-
         // Apply the adapter with the current seed.
-        model.set_adapter(&name, seed);
+        model_with_adapter.set_adapter(perturbed_adapters[i]);
 
         // Create the base context from scratch using the provided prefix.
-        let mut base_ctx = model.create_context();
+        let mut base_ctx = model_with_adapter.create_context();
         base_ctx.fill(&prefix);
         //base_ctx.flush(); // Ensure the prefix KV cache is computed before forking.
 

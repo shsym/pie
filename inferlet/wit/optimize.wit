@@ -41,13 +41,6 @@ interface optimize {
         initial-sigma: f32
     );
 
-    mutate-adapters: func(
-        queue: borrow<queue>,
-        adapters: list<object-id>,
-        parent: object-id,
-        seeds: list<s64>,
-    );
-
     update-adapter: func(
         queue: borrow<queue>,
         adapter: object-id,
@@ -59,6 +52,7 @@ interface optimize {
     forward-with-adapter: func(
         queue: borrow<queue>,
         adapter: object-id,
+        seed: s64,
         last-kv-page-len: u32,
         kv-page-ids: list<object-id>,
         tokens: list<u32>,

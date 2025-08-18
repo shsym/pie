@@ -472,10 +472,11 @@ impl Context {
             .map(|brie| brie.buffer)
             .collect::<Vec<Vec<u32>>>();
 
-        let sampled = if let Some(adapter_id) = self.model.get_adapter() {
+        let sampled = if let Some((adapter_id, seed)) = self.model.get_adapter() {
             self.queue
                 .forward_with_adapter(
                     adapter_id,
+                    seed,
                     self.kv_page_last_len as u32,
                     &self.kv_page_ids,
                     &pending_token_ids,

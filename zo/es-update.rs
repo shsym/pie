@@ -83,9 +83,10 @@ async fn main() -> Result<(), String> {
         scores.len(),
         max_sigma
     );
+    let es_adapter = queue.import_adapter("es-adapter");
 
     // Perform the update operation with max_sigma.
-    queue.update_adapter(&name, &scores, &seeds, max_sigma);
+    queue.update_adapter(es_adapter, &scores, &seeds, max_sigma);
 
     // sleep for 100ms
     inferlet::wstd::task::sleep(Duration::from_millis(100)).await;

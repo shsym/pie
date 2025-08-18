@@ -7,7 +7,7 @@ from typing import Union
 import numpy as np
 import torch
 
-from adapter import Adapter, MutableAdapter, AdapterWithMutation
+from adapter import Adapter, MutableAdapter
 from l4m_pb2 import (  # pylint: disable=no-name-in-module
     BatchAllocate,
     BatchDeallocate,
@@ -24,7 +24,7 @@ from l4m_pb2 import (  # pylint: disable=no-name-in-module
     Distribution,
     BatchSyncResponse, BatchForwardText, BatchForwardTextResponse,
     BatchDebugQueryRequest, BatchDebugQueryResponse, DebugQueryResponse,
-    CreateAdapter, DestroyAdapter, UpdateAdapter, BatchForwardWithMutation,
+    InitializeAdapter, UpdateAdapter, BatchForwardWithAdapter,
 )
 
 from l4m_vision_pb2 import BatchEmbedImage  # pylint: disable=no-name-in-module
@@ -118,19 +118,19 @@ class Driver:
             (
                 torch.zeros(
                     (
-                        max_num_kv_pages,
-                        self.lm.config.hidden_size,
+                        max_num_adapters,
                         max_adapter_rank * 3,
+                        self.lm.config.hidden_size,
                     ),
                     dtype=dtype,
                     device=device,
                 ),
                 torch.zeros(
                     (
-                        max_num_kv_pages,
-                        max_adapter_rank,
+                        max_num_adapters,
                         self.lm.config.head_size * (
                                 self.lm.config.num_query_heads + self.lm.config.num_key_value_heads * 2),
+                        max_adapter_rank,
                     ),
                     dtype=dtype,
                     device=device,
@@ -571,6 +571,7 @@ class Driver:
             output_embeds = self.lm.model.forward(
                 adapters=None,
                 adapter_indices=None,
+                adapter_at_layer=self.adapter_at_layer,
                 input_embeds=input_embeds,
                 position_ids=pt_new_position_ids,
                 kv_cache_at_layer=self.kv_cache_at_layer,
@@ -648,33 +649,18 @@ class Driver:
         )
 
     @torch.inference_mode()
-    def mutate_adapters(self, cmd: MutateAdapters):
-
-        parent = self.adapters[cmd.parent]
-
-        if not isinstance(parent, MutableAdapter):
-            print('parent is not mutable adapter!')
-
-        for adapter_id, seed in zip(cmd.adapters, cmd.seeds):
-            parent.apply_mutation(self.adapter_at_layer, adapter_id, seed)
-            self.adapters[adapter_id] = Adapter(adapter_id,
-                                                rank=parent.rank,
-                                                alpha=parent.alpha,
-                                                out_features=parent.out_features)
-
-    @torch.inference_mode()
     def update_adapter(self, cmd: UpdateAdapter):
 
-        if cmd.name in self.adapters:
+        if cmd.adapter in self.adapters:
             adapter = self.adapters[cmd.adapter]
             if isinstance(adapter, MutableAdapter):
                 adapter.update(self.adapter_at_layer, cmd.scores, cmd.seeds, cmd.max_sigma)
 
     @torch.inference_mode()
-    def forward_with_mutation(self, cmds: BatchForwardWithMutation):
+    def forward_with_adapter(self, cmds: BatchForwardWithAdapter):
 
-        all_adapters = []
-        adapter_indices = []
+        adapter = None
+        seeds = []
 
         kv_page_indices = []
         kv_page_indptr = [0]
@@ -694,9 +680,8 @@ class Driver:
 
             if cmd.adapter not in self.adapters:
                 raise ValueError(f"Adapter {cmd.adapter} not found")
-
-            all_adapters.append(self.adapters[cmd.adapter])
-            adapter_indices.append(cmd.adapter)
+            adapter = self.adapters[cmd.adapter]
+            seeds.append(cmd.seed)
 
             kv_page_indices.extend(cmd.kv_page_ids)
             kv_page_indptr.append(len(kv_page_indices))
@@ -752,8 +737,8 @@ class Driver:
         # print('kv_last_page_lens', kv_last_page_lens)
         # print('qo_indptr', qo_indptr)
         # print('custom_mask', custom_mask)
-        pt_adapter_indices = torch.as_tensor(
-            adapter_indices, device=self.device, dtype=torch.int32
+        pt_seeds = torch.as_tensor(
+            seeds, device=self.device, dtype=torch.int32
         )
 
         pt_new_token_ids = torch.as_tensor(
@@ -798,8 +783,9 @@ class Driver:
         with torch.cuda.device(self.device):
 
             output_embeds = self.lm.model.forward(
-                adapters=all_adapters,
-                adapter_indices=pt_adapter_indices,
+                adapter=adapter,
+                seeds=pt_seeds,
+                adapter_at_layer=self.adapter_at_layer,
                 input_embeds=input_embeds,
                 position_ids=pt_new_position_ids,
                 kv_cache_at_layer=self.kv_cache_at_layer,
@@ -840,9 +826,6 @@ class Driver:
 
         torch.cuda.synchronize()
         print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
-
-        # clear all pytorch caches
-        del all_adapters
 
         return BatchForwardTextResponse(
             items=responses

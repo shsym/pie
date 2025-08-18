@@ -376,14 +376,6 @@ pub enum Command {
         initial_sigma: f32,
     },
 
-    MutateAdapters {
-        inst_id: InstanceId,
-        stream_id: LocalStreamId,
-        adapters: Vec<IdRepr>,
-        parent: IdRepr,
-        seeds: Vec<i64>,
-    },
-
     UpdateAdapter {
         inst_id: InstanceId,
         stream_id: LocalStreamId,
@@ -397,6 +389,7 @@ pub enum Command {
         inst_id: InstanceId,
         stream_id: LocalStreamId,
         adapter: IdRepr,
+        seed: i64,
         kv_page_last_len: u32,
         kv_pages: Vec<IdRepr>,
         text: Vec<u32>,
@@ -429,7 +422,6 @@ enum BatchGroup {
     DebugQuery,
     //
     InitializeAdapter,
-    MutateAdapters,
     UpdateAdapter,
     ForwardWithAdapter,
 }
@@ -464,9 +456,12 @@ impl Batchable<BatchGroup> for Command {
                     BatchingStrategyConfiguration::TOnly { t } => batching::t_only(t),
                     BatchingStrategyConfiguration::KOnly { k } => batching::k_only(k, None),
                     BatchingStrategyConfiguration::KOrT { k, t } => batching::k_or_t(t, k, None),
-                    BatchingStrategyConfiguration::Adaptive => Box::new(
-                        batching::ManualStrategy::new(TRIGGERS.fill_block_trigger.clone()),
-                    ),
+                    BatchingStrategyConfiguration::Adaptive => {
+                        Box::new(batching::ManualStrategy::new(
+                            TRIGGERS.fill_block_trigger.clone(),
+                            Duration::from_millis(5),
+                        ))
+                    }
                 }
             }
             Command::CopyKvPage { .. } => batching::eager(),
@@ -488,9 +483,12 @@ impl Batchable<BatchGroup> for Command {
                     BatchingStrategyConfiguration::TOnly { t } => batching::t_only(t),
                     BatchingStrategyConfiguration::KOnly { k } => batching::k_only(k, None),
                     BatchingStrategyConfiguration::KOrT { k, t } => batching::k_or_t(t, k, None),
-                    BatchingStrategyConfiguration::Adaptive => Box::new(
-                        batching::ManualStrategy::new(TRIGGERS.forward_text_trigger.clone()),
-                    ),
+                    BatchingStrategyConfiguration::Adaptive => {
+                        Box::new(batching::ManualStrategy::new(
+                            TRIGGERS.forward_text_trigger.clone(),
+                            Duration::from_millis(5),
+                        ))
+                    }
                 }
 
                 //batching::eager()
@@ -504,10 +502,10 @@ impl Batchable<BatchGroup> for Command {
             Command::EmbedImage { .. } => batching::eager(),
             Command::DebugQuery { .. } => batching::eager(),
             Command::InitializeAdapter { .. } => batching::eager(),
-            Command::MutateAdapters { .. } => batching::eager(),
             Command::UpdateAdapter { .. } => batching::eager(),
             Command::ForwardWithAdapter { .. } => Box::new(batching::ManualStrategy::new(
                 TRIGGERS.forward_text_trigger.clone(),
+                Duration::from_millis(5),
             )),
             _ => unreachable!(),
         }
@@ -528,7 +526,6 @@ impl Batchable<BatchGroup> for Command {
             Command::EmbedImage { .. } => BatchGroup::EmbedImage,
             Command::DebugQuery { .. } => BatchGroup::DebugQuery,
             Command::InitializeAdapter { .. } => BatchGroup::InitializeAdapter,
-            Command::MutateAdapters { .. } => BatchGroup::MutateAdapters,
             Command::UpdateAdapter { .. } => BatchGroup::UpdateAdapter,
             Command::ForwardWithAdapter { .. } => BatchGroup::ForwardWithAdapter,
 
@@ -1299,39 +1296,6 @@ impl L4m {
                 ))
             }
 
-            Command::MutateAdapters {
-                inst_id,
-                stream_id,
-                mut adapters,
-                mut parent,
-                seeds,
-            } => {
-                try_trap!(
-                    self.objects
-                        .translate_many(ManagedTypes::Adapter, inst_id, &mut adapters),
-                    inst_id,
-                    "MutateAdapters failed. some context blocks are invalid"
-                );
-
-                try_trap!(
-                    self.objects
-                        .translate(ManagedTypes::Adapter, inst_id, &mut parent),
-                    inst_id,
-                    "InitializeAdapter failed. some context blocks are invalid"
-                );
-
-                Some((
-                    Command::MutateAdapters {
-                        inst_id,
-                        stream_id,
-                        adapters,
-                        parent,
-                        seeds,
-                    },
-                    Stream::new(inst_id, stream_id),
-                ))
-            }
-
             Command::UpdateAdapter {
                 inst_id,
                 stream_id,
@@ -1363,6 +1327,7 @@ impl L4m {
                 inst_id,
                 stream_id,
                 mut adapter,
+                seed,
                 kv_page_last_len,
                 mut kv_pages,
                 text,
@@ -1389,6 +1354,7 @@ impl L4m {
                         inst_id,
                         stream_id,
                         adapter,
+                        seed,
                         kv_page_last_len,
                         kv_pages,
                         text,
@@ -1627,7 +1593,6 @@ where
             BatchGroup::InitializeAdapter => {
                 encode_pb_batch_initialize_adapter(correlation_id, batch)
             }
-            BatchGroup::MutateAdapters => encode_pb_batch_mutate_adapters(correlation_id, batch),
             BatchGroup::UpdateAdapter => encode_pb_batch_update_adapter(correlation_id, batch),
             BatchGroup::ForwardWithAdapter => {
                 encode_pb_batch_forward_with_adapter(correlation_id, batch)
@@ -1752,6 +1717,7 @@ fn encode_pb_batch_allocate_inner(batch: Vec<Command>) -> Vec<pb_bindings::Alloc
                 let kind = match ty {
                     ManagedTypes::KvPage => pb_bindings::ObjectKind::KvBlock,
                     ManagedTypes::Embed => pb_bindings::ObjectKind::Emb,
+                    ManagedTypes::Adapter => pb_bindings::ObjectKind::Adapter,
                     _ => unreachable!(),
                 }
                 .into();
@@ -2164,33 +2130,6 @@ fn encode_pb_batch_initialize_adapter(
     ((PROTOCOL_BASE, payload), None)
 }
 
-fn encode_pb_batch_mutate_adapters(
-    correlation_id: u32,
-    batch: Vec<Command>,
-) -> ((usize, Vec<u8>), Option<Vec<Event>>) {
-    let cmd = match batch.into_iter().next().unwrap() {
-        Command::MutateAdapters {
-            inst_id,
-            stream_id,
-            adapters,
-            parent,
-            seeds,
-        } => pb_bindings::request::Command::MutateAdapters(pb_bindings::MutateAdapters {
-            adapters,
-            parent,
-            seeds,
-        }),
-        _ => unreachable!(),
-    };
-
-    let payload = pb_bindings::Request {
-        correlation_id,
-        command: Some(cmd),
-    }
-    .encode_to_vec();
-    ((PROTOCOL_BASE, payload), None)
-}
-
 fn encode_pb_batch_update_adapter(
     correlation_id: u32,
     batch: Vec<Command>,
@@ -2232,6 +2171,7 @@ fn encode_pb_batch_forward_with_adapter(
                 inst_id: _,
                 stream_id: _,
                 adapter,
+                seed,
                 kv_page_last_len,
                 kv_pages: kv_page_ids,
                 text,
@@ -2247,6 +2187,7 @@ fn encode_pb_batch_forward_with_adapter(
 
                 let pb = pb_bindings::ForwardWithAdapter {
                     adapter,
+                    seed,
                     kv_page_ids,
                     kv_page_last_len,
                     token_ids: text,

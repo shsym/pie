@@ -28,13 +28,12 @@ pub trait Optimize {
         initial_sigma: f32,
     );
 
-    fn mutate_adapters(&self, adapter_ids: &[u32], parent_id: u32, seeds: &[i64]);
-
     fn update_adapter(&self, adapter_id: u32, scores: &[f32], seeds: &[i64], max_sigma: f32);
 
     async fn forward_with_adapter(
         &self,
         adapter_id: u32,
+        seed: i64,
         last_kv_page_len: u32,
         kv_page_ids: &[u32],
         tokens: &[u32],
@@ -141,10 +140,6 @@ impl Optimize for Queue {
         );
     }
 
-    fn mutate_adapters(&self, adapter_ids: &[u32], parent_id: u32, seeds: &[i64]) {
-        optimize::mutate_adapters(&self.inner, adapter_ids, parent_id, seeds);
-    }
-
     fn update_adapter(&self, adapter_id: u32, scores: &[f32], seeds: &[i64], max_sigma: f32) {
         optimize::update_adapter(&self.inner, adapter_id, scores, seeds, max_sigma);
     }
@@ -152,6 +147,7 @@ impl Optimize for Queue {
     async fn forward_with_adapter(
         &self,
         adapter_id: u32,
+        seed: i64,
         last_kv_page_len: u32,
         kv_page_ids: &[u32],
         tokens: &[u32],
@@ -162,6 +158,7 @@ impl Optimize for Queue {
         let result_future = optimize::forward_with_adapter(
             &self.inner,
             adapter_id,
+            seed,
             last_kv_page_len,
             kv_page_ids,
             tokens,

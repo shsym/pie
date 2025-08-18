@@ -127,27 +127,6 @@ impl bindings::pie::inferlet::optimize::Host for InstanceState {
         Ok(())
     }
 
-    async fn mutate_adapters(
-        &mut self,
-        queue: Resource<Queue>,
-        adapters: Vec<ObjectId>,
-        parent: ObjectId,
-        seeds: Vec<i64>,
-    ) -> anyhow::Result<()> {
-        let inst_id = self.id();
-        let q = self.table().get(&queue)?;
-        Command::MutateAdapters {
-            inst_id,
-            stream_id: q.stream_id,
-            adapters,
-            parent,
-            seeds,
-        }
-        .dispatch(q.service_id)?;
-
-        Ok(())
-    }
-
     async fn update_adapter(
         &mut self,
         queue: Resource<Queue>,
@@ -175,6 +154,7 @@ impl bindings::pie::inferlet::optimize::Host for InstanceState {
         &mut self,
         queue: Resource<Queue>,
         adapter: ObjectId,
+        seed: i64,
         last_kv_page_len: u32,
         kv_page_ids: Vec<ObjectId>,
         tokens: Vec<u32>,
@@ -190,6 +170,7 @@ impl bindings::pie::inferlet::optimize::Host for InstanceState {
                 inst_id,
                 stream_id: q.stream_id,
                 adapter,
+                seed,
                 kv_page_last_len: last_kv_page_len,
                 kv_pages: kv_page_ids,
                 text: tokens,
@@ -208,6 +189,7 @@ impl bindings::pie::inferlet::optimize::Host for InstanceState {
                 inst_id,
                 stream_id: q.stream_id,
                 adapter,
+                seed,
                 kv_page_last_len: last_kv_page_len,
                 kv_pages: kv_page_ids,
                 text: tokens,

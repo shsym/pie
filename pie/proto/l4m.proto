@@ -188,14 +188,6 @@ message BatchDebugQueryRequest {
   repeated DebugQueryRequest items = 1;
 }
 
-message AllocateAdapters {
-  repeated uint32 adapters = 1;
-}
-
-message DeallocateAdapters {
-  repeated uint32 adapters = 1;
-}
-
 message InitializeAdapter {
   uint32 adapter = 1;
   uint32 rank = 2;
@@ -203,12 +195,6 @@ message InitializeAdapter {
   uint32 population_size = 4;
   float mu_fraction = 5;
   float initial_sigma = 6;
-}
-
-message MutateAdapters {
-  repeated uint32 adapters = 1;
-  uint32 parent = 2;
-  repeated int64 seeds = 3;
 }
 
 
@@ -222,17 +208,19 @@ message UpdateAdapter {
 message ForwardWithAdapter {
   uint32 adapter = 1;
 
-  repeated uint32 kv_page_ids = 2;
+  int64 seed = 2;
 
-  uint32 kv_page_last_len = 3;
+  repeated uint32 kv_page_ids = 3;
 
-  repeated uint32 token_ids = 4;
+  uint32 kv_page_last_len = 4;
 
-  repeated uint32 position_ids = 5;
+  repeated uint32 token_ids = 5;
 
-  repeated BrleBuffer mask = 6;
+  repeated uint32 position_ids = 6;
 
-  repeated uint32 output_indices = 7;
+  repeated BrleBuffer mask = 7;
+
+  repeated uint32 output_indices = 8;
 
 }
 
@@ -322,13 +310,10 @@ message Request {
     BatchDecodeTokenDistribution decode_token_distribution = 9;
     BatchSampleTopKRequest sample_top_k_request = 10;
     BatchDebugQueryRequest debug_query_request = 11;
-    AllocateAdapters allocate_adapters = 12;
-    DeallocateAdapters deallocate_adapters = 13;
-    InitializeAdapter initialize_adapter = 14;
-    MutateAdapters mutate_adapters = 15;
-    UpdateAdapter update_adapter = 16;
-    BatchForwardWithAdapter forward_with_adapter = 17;
-    GetInfoRequest get_info = 18;
+    InitializeAdapter initialize_adapter = 12;
+    UpdateAdapter update_adapter = 13;
+    BatchForwardWithAdapter forward_with_adapter = 14;
+    GetInfoRequest get_info = 15;
   }
 }
 

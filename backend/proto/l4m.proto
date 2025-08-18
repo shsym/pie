@@ -197,12 +197,6 @@ message InitializeAdapter {
   float initial_sigma = 6;
 }
 
-message MutateAdapters {
-  repeated uint32 adapters = 1;
-  uint32 parent = 2;
-  repeated int64 seeds = 3;
-}
-
 
 message UpdateAdapter {
   uint32 adapter = 1;
@@ -214,17 +208,19 @@ message UpdateAdapter {
 message ForwardWithAdapter {
   uint32 adapter = 1;
 
-  repeated uint32 kv_page_ids = 2;
+  int64 seed = 2;
 
-  uint32 kv_page_last_len = 3;
+  repeated uint32 kv_page_ids = 3;
 
-  repeated uint32 token_ids = 4;
+  uint32 kv_page_last_len = 4;
 
-  repeated uint32 position_ids = 5;
+  repeated uint32 token_ids = 5;
 
-  repeated BrleBuffer mask = 6;
+  repeated uint32 position_ids = 6;
 
-  repeated uint32 output_indices = 7;
+  repeated BrleBuffer mask = 7;
+
+  repeated uint32 output_indices = 8;
 
 }
 
@@ -315,10 +311,9 @@ message Request {
     BatchSampleTopKRequest sample_top_k_request = 10;
     BatchDebugQueryRequest debug_query_request = 11;
     InitializeAdapter initialize_adapter = 12;
-    MutateAdapters mutate_adapters = 13;
-    UpdateAdapter update_adapter = 14;
-    BatchForwardWithAdapter forward_with_adapter = 15;
-    GetInfoRequest get_info = 16;
+    UpdateAdapter update_adapter = 13;
+    BatchForwardWithAdapter forward_with_adapter = 14;
+    GetInfoRequest get_info = 15;
   }
 }
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import torch
 from torch import nn
 
@@ -9,7 +11,7 @@ import flashinfer as ops
 from flashinfer import SegmentGEMMWrapper
 
 from config import L4maConfig
-from adapter import Adapter, AdapterWithMutation, AdapterBuffer
+from adapter import Adapter, AdapterBuffer
 
 VERSION = "0.1.0"
 
@@ -133,7 +135,6 @@ class L4maAttention(nn.Module):
         """TODO: Add method docstring."""
 
         n, _ = hidden_states.size()
-
         qkv_states = self.qkv_proj(hidden_states)
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
@@ -141,12 +142,12 @@ class L4maAttention(nn.Module):
 
         # apply adapters if provided
         if adapter_buffer is not None:
+
             nnz = adapter_buffer.nnz
             delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states[:nnz])
             q_delta = delta[0]
             k_delta = delta[1]
             v_delta = delta[2]
-
             query_states.add_(q_delta)
             key_states.add_(k_delta)
             value_states.add_(v_delta)
@@ -300,9 +301,8 @@ class L4maModel(nn.Module):
     @torch.inference_mode()
     def forward(
             self,
-            adapters: list[Adapter] | None,
-            adapter_indices: torch.Tensor | None,
-            adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]],
+            adapter: Adapter | None,
+            seeds: torch.Tensor | None,
             input_embeds: torch.Tensor,
             position_ids: torch.Tensor,
             kv_cache_at_layer: list[torch.Tensor],
@@ -327,7 +327,7 @@ class L4maModel(nn.Module):
 
         # concat all weights for segment gemm.
         # we assume requests are sorted such that initial n requests are the ones with adapters
-        if adapters is not None:
+        if adapter is not None:
 
             rank = adapters[0].rank
             alpha = adapters[0].alpha
