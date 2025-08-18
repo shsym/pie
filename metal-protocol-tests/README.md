@@ -294,8 +294,8 @@ This framework provides **complete CUDA→Metal development pipeline** with unif
 # 🔍 Validating artifact completeness...
 # ✅ Artifact validation passed
 # 📦 Archive: cuda_artifacts.tar.xz
-# 📏 Size: 178MB
-# 🗜️ Compression: 15.2% of original
+# 📏 Size: 892MB  
+# 🗜️ Compression: 75.4% of original
 ```
 
 #### **Step 2: Extract Artifacts (macOS)**
@@ -316,7 +316,7 @@ This framework provides **complete CUDA→Metal development pipeline** with unif
 
 - ✅ **Validation**: Auto-validates 11 operations, 21 cases, 99 files
 - ✅ **Completeness Check**: Ensures all expected files present
-- ✅ **Compression**: ~85% size reduction with xz compression
+- ✅ **Compression**: ~25% size reduction with xz compression
 - ✅ **Integrity**: Includes manifest for cross-platform validation
 - ✅ **Status Monitoring**: `./scripts/artifacts_transfer.sh status`
 

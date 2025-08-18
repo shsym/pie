@@ -121,12 +121,25 @@ compress_artifacts() {
     cd "$WORKSPACE_ROOT"
     echo -e "${BLUE}Creating compressed archive: cuda_artifacts.tar.xz${NC}"
     
-    # Include manifest in archive for validation on extraction
-    tar -cJf "$ARTIFACTS_ARCHIVE" \
+    # Use uncompressed tar first, then compress separately for reliability
+    echo -e "${YELLOW}Step 1/2: Creating uncompressed tar...${NC}"
+    tar -cf cuda_artifacts.tar \
         --directory="$WORKSPACE_ROOT" \
         metal-protocol-tests/tests/artifacts/ \
-        metal-protocol-tests/tests/artifact_manifest.json \
-        2>/dev/null
+        metal-protocol-tests/tests/artifact_manifest.json
+    
+    if [ ! -f cuda_artifacts.tar ]; then
+        echo -e "${RED}Error: Failed to create tar archive${NC}"
+        exit 1
+    fi
+    
+    echo -e "${YELLOW}Step 2/2: Compressing with xz (this may take a few minutes)...${NC}"
+    xz -T 0 cuda_artifacts.tar  # Use all CPU cores for faster compression
+    
+    if [ ! -f cuda_artifacts.tar.xz ]; then
+        echo -e "${RED}Error: Failed to compress archive${NC}"
+        exit 1
+    fi
     
     # Get archive info
     ARCHIVE_SIZE=$(du -h "$ARTIFACTS_ARCHIVE" | cut -f1)
