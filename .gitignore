@@ -215,3 +215,7 @@ logs
 # raw eval data
 .claude
 .mcp.json
+
+# artifacts (the reference values from the CUDA implementation)
+*artifacts.tar.xz
+artifact_manifest.json

@@ -275,34 +275,80 @@ python3 scripts/validate_metal_vs_cuda.py
 
 This framework provides **complete CUDA→Metal development pipeline** with unified testing and validation!
 
+## 📦 **Artifact Transfer for Cross-Platform Development**
+
+### 🚀 **Seamless Linux → macOS Transfer**
+
+**Problem**: CUDA artifacts generated on Linux need to be transferred to macOS for Metal validation.
+
+**Solution**: Automated compression/extraction with validation ensures artifact integrity.
+
+#### **Step 1: Compress Artifacts (Linux)**
+
+```bash
+# After generating CUDA artifacts on Linux
+./scripts/artifacts_transfer.sh compress
+
+# Output:
+# 🗜️  Compressing CUDA artifacts for transfer...
+# 🔍 Validating artifact completeness...
+# ✅ Artifact validation passed
+# 📦 Archive: cuda_artifacts.tar.xz
+# 📏 Size: 178MB
+# 🗜️ Compression: 15.2% of original
+```
+
+#### **Step 2: Extract Artifacts (macOS)**
+
+```bash
+# Transfer cuda_artifacts.tar.xz to macOS workspace root, then:
+./scripts/artifacts_transfer.sh extract
+
+# Output:
+# 📂 Extracting CUDA artifacts for Metal validation...
+# ✅ Extraction complete!
+# 📁 Location: metal-protocol-tests/tests/artifacts
+# 📄 Files: 99 artifacts
+# ✅ Artifact validation passed
+```
+
+#### **Features**
+
+- ✅ **Validation**: Auto-validates 11 operations, 21 cases, 99 files
+- ✅ **Completeness Check**: Ensures all expected files present
+- ✅ **Compression**: ~85% size reduction with xz compression
+- ✅ **Integrity**: Includes manifest for cross-platform validation
+- ✅ **Status Monitoring**: `./scripts/artifacts_transfer.sh status`
+
 ## 🚀 **Continuing Development on Metal Machine (macOS)**
 
 ### Prerequisites
-- macOS with Metal support
+- macOS with Metal support  
 - Xcode with Metal frameworks
-- Git repo with generated CUDA artifacts
+- CUDA artifacts (use transfer script above)
 
 ### Quick Start on macOS
 
 ```bash
-# 1. Clone and build (detects Metal automatically)
-git clone <your-repo>
-cd metal-protocol-tests
+# 1. Extract CUDA artifacts (if not already done)
+./scripts/artifacts_transfer.sh extract
+
+# 2. Build with Metal support (auto-detected)
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
-# 2. Verify existing CUDA artifacts (should exist from Linux development)
+# 3. Verify artifacts extracted correctly
 ls tests/artifacts/
 # Should show: gemm/, embedding_lookup_forward/, silu_and_mul/, extract_k_values/, etc.
 
-# 3. Test Metal backend immediately (Phase 1A operations ready)
+# 4. Test Metal backend immediately (Phase 1A operations ready)
 ./metal_protocol_tests --backend metal --op gemm --case test1 --m 32 --n 128 --k 64
 ./metal_protocol_tests --backend metal --op embedding_lookup --case test1 --num_tokens 16 --hidden_size 128
 ./metal_protocol_tests --backend metal --op silu_and_mul --case test1 --num_tokens 64 --intermediate_size 256
 ./metal_protocol_tests --backend metal --op extract_k_values --case test1 --M 8 --N 64 --k 5
 
-# 4. Compare Metal output with CUDA golden reference
+# 5. Compare Metal output with CUDA golden reference
 diff tests/artifacts/gemm/test1/ tests/artifacts/gemm/test1_metal/
 ```
 
