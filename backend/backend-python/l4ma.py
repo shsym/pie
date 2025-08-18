@@ -142,9 +142,7 @@ class L4maAttention(nn.Module):
 
         # apply adapters if provided
         if adapter_buffer is not None:
-
-            nnz = adapter_buffer.nnz
-            delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states[:nnz])
+            delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states)
             q_delta = delta[0]
             k_delta = delta[1]
             v_delta = delta[2]
@@ -329,18 +327,9 @@ class L4maModel(nn.Module):
         # we assume requests are sorted such that initial n requests are the ones with adapters
         if adapter is not None:
 
-            rank = adapters[0].rank
-            alpha = adapters[0].alpha
-            out_features = adapters[0].out_features
-
             adapter_buffer = AdapterBuffer(
-                rank=rank,
-                alpha=alpha,
-                adapter_at_layer=adapter_at_layer,
-                adapter_indices=adapter_indices,
-                x_indptr=qo_indptr[:adapter_indices.size(0) + 1],
-                segment_gemm_wrapper=self.wrapper_segment_gemm,
-                out_features=out_features
+                adapter=adapter,
+                seeds=seeds,
             )
         else:
             adapter_buffer = None

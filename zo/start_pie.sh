@@ -85,6 +85,8 @@ kv_page_size = 16
 dist_size = 16
 max_num_kv_pages = 70000
 max_num_embeds = 500000
+max_num_adapters = 2
+max_adapter_rank = 8
 EOF
 
   # Build PTY-wrapped command

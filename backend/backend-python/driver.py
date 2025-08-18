@@ -7,7 +7,7 @@ from typing import Union
 import numpy as np
 import torch
 
-from adapter import Adapter, MutableAdapter
+from adapter import Adapter, CmaesAdapter
 from l4m_pb2 import (  # pylint: disable=no-name-in-module
     BatchAllocate,
     BatchDeallocate,
@@ -571,7 +571,7 @@ class Driver:
             output_embeds = self.lm.model.forward(
                 adapters=None,
                 adapter_indices=None,
-                adapter_at_layer=self.adapter_at_layer,
+                #adapter_at_layer=self.adapter_at_layer,
                 input_embeds=input_embeds,
                 position_ids=pt_new_position_ids,
                 kv_cache_at_layer=self.kv_cache_at_layer,
@@ -635,17 +635,22 @@ class Driver:
 
         cfg = self.lm.config
 
-        self.adapters[cmd.adapter] = MutableAdapter(
+        self.adapters[cmd.adapter] = CmaesAdapter(
             rank=cmd.rank,
             alpha=cmd.alpha,
-            adapter_id=cmd.adapter,
-            adapters_by_layer=self.adapter_at_layer,
+            in_features=cfg.hidden_size,
             out_features=[cfg.head_size * cfg.num_query_heads,
                           cfg.head_size * cfg.num_key_value_heads,
                           cfg.head_size * cfg.num_key_value_heads],
+            num_layers=cfg.num_layers,
             population_size=cmd.population_size,
             mu_fraction=cmd.mu_fraction,
-            initial_sigma=cmd.initial_sigma
+            initial_sigma=cmd.initial_sigma,
+            min_sigma=1e-7,
+            min_var=1e-8,
+            max_var=1e4,
+            device=self.device,
+            dtype=self.dtype,
         )
 
     @torch.inference_mode()
@@ -653,8 +658,8 @@ class Driver:
 
         if cmd.adapter in self.adapters:
             adapter = self.adapters[cmd.adapter]
-            if isinstance(adapter, MutableAdapter):
-                adapter.update(self.adapter_at_layer, cmd.scores, cmd.seeds, cmd.max_sigma)
+            if isinstance(adapter, CmaesAdapter):
+                adapter.update(cmd.scores, cmd.seeds, cmd.max_sigma)
 
     @torch.inference_mode()
     def forward_with_adapter(self, cmds: BatchForwardWithAdapter):
@@ -681,7 +686,7 @@ class Driver:
             if cmd.adapter not in self.adapters:
                 raise ValueError(f"Adapter {cmd.adapter} not found")
             adapter = self.adapters[cmd.adapter]
-            seeds.append(cmd.seed)
+            seeds.extend([cmd.seed] * len(cmd.token_ids))
 
             kv_page_indices.extend(cmd.kv_page_ids)
             kv_page_indptr.append(len(kv_page_indices))
@@ -738,7 +743,7 @@ class Driver:
         # print('qo_indptr', qo_indptr)
         # print('custom_mask', custom_mask)
         pt_seeds = torch.as_tensor(
-            seeds, device=self.device, dtype=torch.int32
+            seeds, device=self.device, dtype=torch.long
         )
 
         pt_new_token_ids = torch.as_tensor(
@@ -785,7 +790,7 @@ class Driver:
             output_embeds = self.lm.model.forward(
                 adapter=adapter,
                 seeds=pt_seeds,
-                adapter_at_layer=self.adapter_at_layer,
+                # adapter_at_layer=self.adapter_at_layer,
                 input_embeds=input_embeds,
                 position_ids=pt_new_position_ids,
                 kv_cache_at_layer=self.kv_cache_at_layer,
@@ -824,8 +829,8 @@ class Driver:
                     )
                     responses.append(res)
 
-        torch.cuda.synchronize()
-        print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
+        #torch.cuda.synchronize()
+        #print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
 
         return BatchForwardTextResponse(
             items=responses

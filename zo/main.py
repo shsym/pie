@@ -24,13 +24,13 @@ from countdown import CountdownTasksDataset, reward_function, SYSTEM_MESSAGE, US
 # --- Server and Paths ---
 SERVER_URIS = [
     "ws://127.0.0.1:8080",
-    # "ws://127.0.0.1:8081",
-    # "ws://127.0.0.1:8082",
-    # "ws://127.0.0.1:8083",
-    # "ws://127.0.0.1:8084",
-    # "ws://127.0.0.1:8085",
-    # "ws://127.0.0.1:8086",
-    # "ws://127.0.0.1:8087",
+    "ws://127.0.0.1:8081",
+    "ws://127.0.0.1:8082",
+    "ws://127.0.0.1:8083",
+    "ws://127.0.0.1:8084",
+    "ws://127.0.0.1:8085",
+    "ws://127.0.0.1:8086",
+    "ws://127.0.0.1:8087",
 ]
 SCRIPT_DIR = Path(__file__).resolve().parent
 # NOTE: Update this path to your actual inferlet dependency location
@@ -51,7 +51,7 @@ INFERLET_SRC_FILES = [
 # --- ES Hyperparameters ---
 ADAPTER_NAME = "evo-countdown-v1"
 TRAINING_STEPS = 10000
-POPULATION_SIZE = 512  # Total number of seeds per step across all clients
+POPULATION_SIZE = 512 * 8  # Total number of seeds per step across all clients
 TASKS_PER_SEED = 4        # Number of tasks to evaluate for each seed
 NUM_ROLLOUT_WORKERS = 8   # Number of inferlets PER CLIENT
 LORA_RANK = 8
@@ -65,7 +65,7 @@ MAX_TOKENS_GEN = 512
 DATA_PATH = "./Countdown-Tasks-3to4"
 
 # --- W&B Config ---
-WANDB_PROJECT = os.getenv("WANDB_PROJECT", "pie-es")
+WANDB_PROJECT = os.getenv("WANDB_PROJECT", "pie-es-v2")
 WANDB_ENTITY = os.getenv("WANDB_ENTITY")
 WANDB_MODE = os.getenv("WANDB_MODE")  # e.g., "offline"
 WANDB_TAGS = ["es", "countdown", "lora"]

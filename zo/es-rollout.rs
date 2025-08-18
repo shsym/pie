@@ -93,16 +93,13 @@ async fn main() -> Result<(), String> {
 
     let es_adapter = queue.import_adapter("es-adapter");
 
-    let perturbed_adapters = queue.allocate_adapters(seeds.len());
-    queue.mutate_adapters(&perturbed_adapters, es_adapter, &seeds);
-
     println!("🚀 Starting parallel rollout...");
     for i in 0..seeds.len() {
         // Get a new model instance for each seed.
         let mut model_with_adapter = model.clone();
 
         // Apply the adapter with the current seed.
-        model_with_adapter.set_adapter(perturbed_adapters[i]);
+        model_with_adapter.set_adapter(es_adapter, seeds[i].clone());
 
         // Create the base context from scratch using the provided prefix.
         let mut base_ctx = model_with_adapter.create_context();

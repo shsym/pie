@@ -15,7 +15,7 @@ USER_TEMPLATE = (
     "Show your work in <think> </think> tags. "
     "And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>."
 )
-RESPONSE_PROMPT = "Let me solve this step by step.\n"
+RESPONSE_PROMPT = "Let me solve this step by step.\n<think>"
 
 
 class CountdownTasksDataset(Dataset):
