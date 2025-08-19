@@ -1,2 +1,8 @@
 tests/artifacts
 tests/artifacts*
+
+# No direct CMakeList; it should be either copied from a cuda_only or metal-only version
+CMakeLists.txt
+build
+build_metal
+build_cuda

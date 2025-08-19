@@ -285,7 +285,16 @@ int main(int argc, char** argv) {
             ops::run_topk_mask_logits(case_id, cfg, args.seed);
         } else if (args.op == "softmax") {
             ops::SoftmaxConfig cfg{args.batch_size, args.vocab_size, args.temperature};
-            ops::run_softmax(case_id, cfg, args.seed);
+            if (args.backend == "cuda") {
+                ops::run_softmax(case_id, cfg, args.seed);
+#ifdef METAL_SUPPORT_ENABLED
+            } else if (args.backend == "metal") {
+                ops::run_softmax_metal(case_id, cfg, args.seed);
+#endif
+            } else {
+                std::cerr << "Error: Unknown backend '" << args.backend << "'. Use 'cuda' or 'metal'" << std::endl;
+                return 1;
+            }
         } else if (args.op == "batch_prefill_attention") {
             ops::BatchPrefillAttentionConfig cfg{args.num_tokens, args.num_query_heads, args.num_kv_heads, args.head_size, args.kv_len, args.page_size};
             ops::run_batch_prefill_attention(case_id, cfg, args.seed);

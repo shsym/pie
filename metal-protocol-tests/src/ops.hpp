@@ -194,6 +194,7 @@ void run_gemm_metal(const std::string& case_id, const GemmConfig& cfg, uint64_t 
 void run_embedding_lookup_metal(const std::string& case_id, const EmbeddingConfig& cfg, uint64_t seed);
 void run_silu_and_mul_metal(const std::string& case_id, const SiLUAndMulConfig& cfg, uint64_t seed);
 void run_extract_k_values_metal(const std::string& case_id, const ExtractKConfig& cfg, uint64_t seed);
+void run_softmax_metal(const std::string& case_id, const SoftmaxConfig& cfg, uint64_t seed);
 #endif
 
 } // namespace ops
