@@ -17,19 +17,19 @@ kernel void silu_and_mul_bfloat16_kernel(
 ) {
     uint token_idx = gid.y; // grid Y dimension enumerates tokens
     uint dim_idx = gid.x;   // grid X dimension enumerates columns
-    
+
     if (token_idx >= num_tokens || dim_idx >= intermediate_size) {
         return;
     }
-    
+
     uint idx = token_idx * intermediate_size + dim_idx;
-    
+
     float gate_val = float(gate[idx]);
     float up_val = float(up[idx]);
-    
+
     // Apply SiLU activation to gate, then multiply by up
     float result = silu_activation(gate_val) * up_val;
-    
+
     output[idx] = bfloat(result);
 }
 
@@ -44,16 +44,16 @@ kernel void silu_and_mul_float32_kernel(
 ) {
     uint token_idx = gid.y;
     uint dim_idx = gid.x;
-    
+
     if (token_idx >= num_tokens || dim_idx >= intermediate_size) {
         return;
     }
-    
+
     uint idx = token_idx * intermediate_size + dim_idx;
-    
+
     float gate_val = gate[idx];
     float up_val = up[idx];
-    
+
     // Apply SiLU activation to gate, then multiply by up
     output[idx] = silu_activation(gate_val) * up_val;
 }

@@ -35,28 +35,28 @@ kernel void metal_rmsnorm_bfloat16(
     const uint32_t token_idx = tid.x;
     const uint32_t thread_id = lid.x;
     const uint32_t threads_per_group = 256; // Match typical Metal threadgroup size
-    
+
     if (token_idx >= params.num_tokens) {
         return;
     }
-    
+
     // Calculate base pointers for this token
     device const bfloat* input_token = input + token_idx * params.hidden_size;
     device bfloat* output_token = output + token_idx * params.hidden_size;
-    
+
     // Phase 1: Compute sum of squares using threadgroup reduction
     float local_sum = 0.0f;
-    
+
     // Each thread processes multiple elements (grid-stride loop)
     for (uint32_t i = thread_id; i < params.hidden_size; i += threads_per_group) {
         float val = float(input_token[i]);
         local_sum = fma(val, val, local_sum);
     }
-    
+
     // Store local sum in shared memory
     shared_sum[thread_id] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     // Parallel reduction to compute total sum
     for (uint32_t stride = threads_per_group / 2; stride > 0; stride /= 2) {
         if (thread_id < stride) {
@@ -64,14 +64,14 @@ kernel void metal_rmsnorm_bfloat16(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     // Thread 0 computes the RMS normalization factor
     float rms_scale = 0.0f;
     if (thread_id == 0) {
         float mean_square = shared_sum[0] / float(params.hidden_size);
         rms_scale = precise_rsqrt(mean_square + params.eps);
     }
-    
+
     // Broadcast RMS scale to all threads in threadgroup
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (thread_id == 0) {
@@ -79,7 +79,7 @@ kernel void metal_rmsnorm_bfloat16(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     rms_scale = shared_sum[0];
-    
+
     // Phase 2: Apply normalization and scaling
     for (uint32_t i = thread_id; i < params.hidden_size; i += threads_per_group) {
         float scaled = float(input_token[i]) * rms_scale * float(weight[i]);
@@ -91,7 +91,7 @@ kernel void metal_rmsnorm_bfloat16(
 // This version uses Metal's SIMD group reductions for smaller, faster reductions
 kernel void metal_rmsnorm_simd_bfloat16(
     device const bfloat* input         [[buffer(0)]],  // [num_tokens, hidden_size]
-    device const bfloat* weight        [[buffer(1)]],  // [hidden_size]  
+    device const bfloat* weight        [[buffer(1)]],  // [hidden_size]
     device bfloat* output              [[buffer(2)]],  // [num_tokens, hidden_size]
     constant RMSNormParams& params     [[buffer(3)]],
     threadgroup float* shared_sum      [[threadgroup(0)]],
@@ -106,36 +106,36 @@ kernel void metal_rmsnorm_simd_bfloat16(
     const uint32_t threads_per_group = 256;
     const uint32_t simd_size = 32;  // Metal SIMD group size
     const uint32_t num_simd_groups = threads_per_group / simd_size;
-    
+
     if (token_idx >= params.num_tokens) {
         return;
     }
-    
+
     device const bfloat* input_token = input + token_idx * params.hidden_size;
     device bfloat* output_token = output + token_idx * params.hidden_size;
-    
+
     // Phase 1: Compute sum of squares with SIMD group reduction
     float local_sum = 0.0f;
-    
+
     for (uint32_t i = thread_id; i < params.hidden_size; i += threads_per_group) {
         float val = float(input_token[i]);
         local_sum = fma(val, val, local_sum);
     }
-    
+
     // SIMD group reduction (more efficient than threadgroup for this size)
     local_sum = simd_sum(local_sum);
-    
+
     // Store SIMD group sums in shared memory
     if (simd_lane_id == 0) {
         shared_sum[simd_group_id] = local_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     // Final reduction across SIMD groups
     if (simd_group_id == 0) {
         float sum = (simd_lane_id < num_simd_groups) ? shared_sum[simd_lane_id] : 0.0f;
         sum = simd_sum(sum);
-        
+
         if (simd_lane_id == 0) {
             float mean_square = sum / float(params.hidden_size);
             float rms_scale = precise_rsqrt(mean_square + params.eps);
@@ -143,10 +143,10 @@ kernel void metal_rmsnorm_simd_bfloat16(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     // Broadcast RMS scale and apply normalization
     float rms_scale = shared_sum[0];
-    
+
     for (uint32_t i = thread_id; i < params.hidden_size; i += threads_per_group) {
         float scaled = float(input_token[i]) * rms_scale * float(weight[i]);
         output_token[i] = bfloat(scaled);
