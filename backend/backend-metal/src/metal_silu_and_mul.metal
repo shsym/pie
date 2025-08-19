@@ -15,8 +15,8 @@ kernel void silu_and_mul_bfloat16_kernel(
     constant uint& intermediate_size [[buffer(4)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
-    uint token_idx = gid.y;
-    uint dim_idx = gid.x;
+    uint token_idx = gid.y; // grid Y dimension enumerates tokens
+    uint dim_idx = gid.x;   // grid X dimension enumerates columns
     
     if (token_idx >= num_tokens || dim_idx >= intermediate_size) {
         return;

@@ -4,20 +4,9 @@ using namespace metal;
 // CUDA-compatible rsqrt approximation to match FlashInfer's rsqrt.approx.ftz.f32
 // This function approximates CUDA hardware behavior for consistent results
 inline float precise_rsqrt(float x) {
-    // Handle edge cases
-    if (x <= 0.0f || !isfinite(x)) {
-        return 1.0f / sqrt(x);  // fallback
-    }
-    
-    // Fast inverse square root approximation (similar to CUDA hardware)
-    // Based on IEEE 754 bit manipulation
-    uint32_t i = as_type<uint32_t>(x);
-    i = 0x5f3759df - (i >> 1);
-    float y = as_type<float>(i);
-    
-    // One Newton-Raphson iteration for improved accuracy
+    // Use hardware fast inverse square root and refine once (approx CUDA rsqrt.approx)
+    float y = fast::rsqrt(x);
     y = y * (1.5f - 0.5f * x * y * y);
-    
     return y;
 }
 
@@ -61,7 +50,7 @@ kernel void metal_rmsnorm_bfloat16(
     // Each thread processes multiple elements (grid-stride loop)
     for (uint32_t i = thread_id; i < params.hidden_size; i += threads_per_group) {
         float val = float(input_token[i]);
-        local_sum += val * val;
+        local_sum = fma(val, val, local_sum);
     }
     
     // Store local sum in shared memory
@@ -80,7 +69,7 @@ kernel void metal_rmsnorm_bfloat16(
     float rms_scale = 0.0f;
     if (thread_id == 0) {
         float mean_square = shared_sum[0] / float(params.hidden_size);
-        rms_scale = precise_rsqrt(mean_square + params.eps);  // CUDA-compatible rsqrt
+        rms_scale = precise_rsqrt(mean_square + params.eps);
     }
     
     // Broadcast RMS scale to all threads in threadgroup
@@ -93,8 +82,7 @@ kernel void metal_rmsnorm_bfloat16(
     
     // Phase 2: Apply normalization and scaling
     for (uint32_t i = thread_id; i < params.hidden_size; i += threads_per_group) {
-        float normalized = float(input_token[i]) * rms_scale;
-        float scaled = normalized * float(weight[i]);
+        float scaled = float(input_token[i]) * rms_scale * float(weight[i]);
         output_token[i] = bfloat(scaled);
     }
 }
@@ -131,7 +119,7 @@ kernel void metal_rmsnorm_simd_bfloat16(
     
     for (uint32_t i = thread_id; i < params.hidden_size; i += threads_per_group) {
         float val = float(input_token[i]);
-        local_sum += val * val;
+        local_sum = fma(val, val, local_sum);
     }
     
     // SIMD group reduction (more efficient than threadgroup for this size)
@@ -160,8 +148,7 @@ kernel void metal_rmsnorm_simd_bfloat16(
     float rms_scale = shared_sum[0];
     
     for (uint32_t i = thread_id; i < params.hidden_size; i += threads_per_group) {
-        float normalized = float(input_token[i]) * rms_scale;
-        float scaled = normalized * float(weight[i]);
+        float scaled = float(input_token[i]) * rms_scale * float(weight[i]);
         output_token[i] = bfloat(scaled);
     }
 }

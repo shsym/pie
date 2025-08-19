@@ -29,19 +29,21 @@ static bool initialize_metal_silu_and_mul() {
             return false;
         }
         
-        // Load shader library
+        // Load the Metal file from the same directory as this .mm file
         NSError* error = nil;
-        NSString* libraryPath = @"src/metal_silu_and_mul.metallib";
-        library = [device newLibraryWithFile:libraryPath error:&error];
-        if (!library) {
-            // Try loading from source if metallib doesn't exist
-            NSString* shaderSource = [NSString stringWithContentsOfFile:@"src/metal_silu_and_mul.metal" 
-                                                               encoding:NSUTF8StringEncoding 
-                                                                  error:&error];
-            if (shaderSource) {
-                library = [device newLibraryWithSource:shaderSource options:nil error:&error];
-            }
+        NSString* currentPath = [NSString stringWithUTF8String:__FILE__];
+        NSString* dirPath = [currentPath stringByDeletingLastPathComponent];
+        NSString* metalPath = [dirPath stringByAppendingPathComponent:@"metal_silu_and_mul.metal"];
+        
+        NSString* source = [NSString stringWithContentsOfFile:metalPath
+                                                     encoding:NSUTF8StringEncoding
+                                                        error:&error];
+        if (error) {
+            std::cerr << "Failed to read Metal source: " << error.localizedDescription.UTF8String << std::endl;
+            return false;
         }
+        
+        library = [device newLibraryWithSource:source options:nil error:&error];
         
         if (!library) {
             std::cerr << "Failed to load Metal library: " << error.localizedDescription.UTF8String << std::endl;
@@ -112,11 +114,12 @@ int metal_silu_and_mul_bfloat16(
         [encoder setBytes:&num_tokens length:sizeof(unsigned int) atIndex:3];
         [encoder setBytes:&intermediate_size length:sizeof(unsigned int) atIndex:4];
         
-        // Calculate thread groups
-        MTLSize threadsPerGroup = MTLSizeMake(std::min(intermediate_size, 256u), std::min(num_tokens, 256u), 1);
+        // Calculate thread groups: use 1D threadgroups in X to respect max threads per group (<=1024)
+        const uint32_t threadsX = std::min(intermediate_size, 256u);
+        MTLSize threadsPerGroup = MTLSizeMake(threadsX, 1, 1);
         MTLSize groupsPerGrid = MTLSizeMake(
-            (intermediate_size + threadsPerGroup.width - 1) / threadsPerGroup.width,
-            (num_tokens + threadsPerGroup.height - 1) / threadsPerGroup.height,
+            (intermediate_size + threadsX - 1) / threadsX,
+            num_tokens,
             1
         );
         

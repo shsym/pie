@@ -1,18 +1,21 @@
-#include "ops.hpp"
+#ifdef METAL_SUPPORT_ENABLED
 
-#include "artifacts.hpp" // reuse backend CUDA artifact helpers
+#include "ops.hpp"
+#include "artifacts.hpp" // host-only artifact helpers for writing/reading artifacts
 
 #include <iostream>
 #include <string>
 #include <vector>
 #include <cstdlib>
+#include <filesystem>
 
 namespace {
 
 struct Args {
     std::string op;
     std::string case_id = "auto";
-    std::string backend = "cuda";       // Backend: "cuda", "metal", or "compare"
+    bool auto_compare = true;           // Automatically compare with CUDA reference
+    std::string cuda_artifacts_dir = "../cuda-protocol-tests/tests/artifacts";  // CUDA reference directory
     int num_tokens = 128;          // Realistic sequence length
     int hidden_size = 4096;        // Llama 7B hidden size
     int vocab_size = 32000;        // Llama vocab size
@@ -98,8 +101,10 @@ Args parse_args(int argc, char** argv) {
             if (const char* v = next(i)) a.op = v; else throw std::runtime_error("--op requires value");
         } else if (flag == "--case") {
             if (const char* v = next(i)) a.case_id = v; else throw std::runtime_error("--case requires value");
-        } else if (flag == "--backend") {
-            if (const char* v = next(i)) a.backend = v; else throw std::runtime_error("--backend requires value");
+        } else if (flag == "--no-compare") {
+            a.auto_compare = false;
+        } else if (flag == "--cuda-artifacts-dir") {
+            if (const char* v = next(i)) a.cuda_artifacts_dir = v; else throw std::runtime_error("--cuda-artifacts-dir requires value");
         } else if (flag == "--num_tokens") {
             const char* v = next(i); if (!v || !parse_int(v, a.num_tokens)) throw std::runtime_error("--num_tokens int");
         } else if (flag == "--hidden_size") {
@@ -156,28 +161,35 @@ Args parse_args(int argc, char** argv) {
             const char* v = next(i); if (!v || !parse_int(v, a.page_size)) throw std::runtime_error("--page_size int");
         } else if (flag == "--temperature") {
             const char* v = next(i); if (!v || !parse_float(v, a.temperature)) throw std::runtime_error("--temperature float");
+        } else if (flag == "--batch_size") {
+            const char* v = next(i); if (!v || !parse_int(v, a.batch_size)) throw std::runtime_error("--batch_size int");
         } else if (flag == "--seed") {
             const char* v = next(i); if (!v || !parse_u64(v, a.seed)) throw std::runtime_error("--seed u64");
         } else if (flag == "-h" || flag == "--help") {
-            std::cout << "Usage:\n"
-                         "  metal_protocol_tests --op OP [--backend BACKEND] [--case ID] [OPTIONS...]\n"
-                         "\n"
-                         "Backends:\n"
-                         "  --backend cuda    Generate CUDA golden reference (default)\n"
-                         "  --backend metal   Run Metal implementation (macOS only)\n"
-                         "\n"
-                         "Operations:\n"
-                         "  metal_protocol_tests --op embedding_lookup [--backend BACKEND] [--case ID] [--num_tokens N] [--hidden_size D] [--vocab_size V] [--seed S]\n"
-                         "  metal_protocol_tests --op extract_k_values [--case ID] [--M rows] [--N cols] [--k per_row] [--seed S]\n"
-                         "  metal_protocol_tests --op rms_norm [--case ID] [--num_tokens N] [--hidden_size D] [--eps E] [--seed S]\n"
-                         "  metal_protocol_tests --op silu_and_mul [--case ID] [--num_tokens N] [--intermediate_size I] [--seed S]\n"
-                         "  metal_protocol_tests --op add_residual [--case ID] [--num_tokens N] [--hidden_size D] [--seed S]\n"
-                         "  metal_protocol_tests --op gemm [--case ID] [--m M] [--n N] [--k K] [--transa T] [--transb T] [--use_bias B] [--seed S]\n"
-                         "  metal_protocol_tests --op cast_type [--case ID] [--num_elements N] [--input_dtype T] [--output_dtype T] [--seed S]\n"
-                         "  metal_protocol_tests --op rope [--case ID] [--num_tokens N] [--num_heads H] [--head_size S] [--rope_theta T] [--rope_factor F] [--seed S]\n"
-                         "  metal_protocol_tests --op topk_mask_logits [--case ID] [--num_tokens N] [--vocab_size V] [--k K] [--seed S]\n"
-                         "  metal_protocol_tests --op softmax [--case ID] [--batch_size B] [--vocab_size V] [--temperature T] [--seed S]\n"
-                         "  metal_protocol_tests --op batch_prefill_attention [--case ID] [--num_tokens N] [--num_query_heads QH] [--num_kv_heads KH] [--head_size S] [--kv_len L] [--page_size P] [--seed S]\n";
+            std::cout << "Usage:\\n"
+                         "  metal_protocol_tests --op OP [--case ID] [OPTIONS...]\n"
+                         "\\n"
+                         "Metal Protocol Tests - Test Metal backend against CUDA golden reference\\n"
+                         "\\n"
+                         "Options:\\n"
+                         "  --op OP                     Operation to test (required)\\n"
+                         "  --case ID                   Test case identifier (default: auto)\\n"
+                         "  --no-compare                Skip automatic CUDA vs Metal comparison\\n"
+                         "  --cuda-artifacts-dir DIR    Directory containing CUDA reference artifacts\\n"
+                         "                              (default: ../cuda-protocol-tests/tests/artifacts)\\n"
+                         "\\n"
+                         "Operations:\\n"
+                         "  metal_protocol_tests --op embedding_lookup [--case ID] [--num_tokens N] [--hidden_size D] [--vocab_size V] [--seed S]\\n"
+                         "  metal_protocol_tests --op extract_k_values [--case ID] [--M rows] [--N cols] [--k per_row] [--seed S]\\n"
+                         "  metal_protocol_tests --op rms_norm [--case ID] [--num_tokens N] [--hidden_size D] [--eps E] [--seed S]\\n"
+                         "  metal_protocol_tests --op silu_and_mul [--case ID] [--num_tokens N] [--intermediate_size I] [--seed S]\\n"
+                         "  metal_protocol_tests --op add_residual [--case ID] [--num_tokens N] [--hidden_size D] [--seed S]\\n"
+                         "  metal_protocol_tests --op gemm [--case ID] [--m M] [--n N] [--k K] [--transa T] [--transb T] [--use_bias B] [--seed S]\\n"
+                         "  metal_protocol_tests --op cast_type [--case ID] [--num_elements N] [--input_dtype T] [--output_dtype T] [--seed S]\\n"
+                         "  metal_protocol_tests --op rope [--case ID] [--num_tokens N] [--num_heads H] [--head_size S] [--rope_theta T] [--rope_factor F] [--seed S]\\n"
+                         "  metal_protocol_tests --op topk_mask_logits [--case ID] [--num_tokens N] [--vocab_size V] [--k K] [--seed S]\\n"
+                         "  metal_protocol_tests --op softmax [--case ID] [--batch_size B] [--vocab_size V] [--temperature T] [--seed S]\\n"
+                         "  metal_protocol_tests --op batch_prefill_attention [--case ID] [--num_tokens N] [--num_query_heads QH] [--num_kv_heads KH] [--head_size S] [--kv_len L] [--page_size P] [--seed S]\\n";
             std::exit(0);
         } else {
             throw std::runtime_error("Unknown flag: " + flag);
@@ -192,6 +204,19 @@ Args parse_args(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
+    // Resolve comparator script path relative to the executable directory so CWD doesn't matter
+    std::filesystem::path exe_path = std::filesystem::absolute(argv[0]);
+    std::filesystem::path exe_dir = exe_path.parent_path();
+    std::filesystem::path comparator_script_path = (exe_dir / "../scripts/compare_artifacts.py").lexically_normal();
+    const std::string comparator_script = comparator_script_path.string();
+        // Resolve a default artifacts base inside the build directory (next to the executable)
+        // so runs don't spill artifacts into the repo root even if CWD changes.
+        std::filesystem::path default_metal_artifacts_base_path = (exe_dir / "tests/artifacts").lexically_normal();
+        const std::string default_metal_artifacts_base = default_metal_artifacts_base_path.string();
+        // If PIE_ARTIFACTS_DIR is not set, set it to our default under the build dir
+        if (std::getenv("PIE_ARTIFACTS_DIR") == nullptr) {
+            setenv("PIE_ARTIFACTS_DIR", default_metal_artifacts_base.c_str(), 1);
+        }
         // Ensure artifact writing is on unless explicitly disabled
         if (!artifacts::get_env_flag("PIE_WRITE_ARTIFACTS", false)) {
             std::cerr << "Note: enabling PIE_WRITE_ARTIFACTS=1 for this run" << std::endl;
@@ -206,122 +231,124 @@ int main(int argc, char** argv) {
                     + "_D" + std::to_string(args.hidden_size);
         }
 
-        // Validate backend selection
-        if (args.backend == "metal") {
-#ifndef METAL_SUPPORT_ENABLED
-            std::cerr << "Error: Metal backend requested but not compiled with Metal support" << std::endl;
-            std::cerr << "Build on macOS with Metal frameworks to enable Metal backend" << std::endl;
-            return 1;
-#endif
-        }
-        
-        // Route operations based on backend
+        // Auto-comparison function
+        auto run_comparison = [&](const std::string& op, const std::string& case_id) {
+            if (!args.auto_compare) {
+                return;
+            }
+
+            std::cout << "\\n=== Automatic Comparison with CUDA Reference ===" << std::endl;
+
+            // Construct comparison command
+            std::string comparison_cmd = std::string("python3 ") + comparator_script;
+            comparison_cmd += " --op " + op;
+            comparison_cmd += " --case " + case_id;
+            comparison_cmd += " --cuda-base " + args.cuda_artifacts_dir;
+            // Use the resolved artifacts base (env may override our default)
+            const char* env_metal_base = std::getenv("PIE_ARTIFACTS_DIR");
+            const std::string metal_artifacts_base = env_metal_base ? std::string(env_metal_base) : default_metal_artifacts_base;
+            comparison_cmd += " --metal-base " + metal_artifacts_base;
+            comparison_cmd += " --verbose";
+
+            std::cout << "Running: " << comparison_cmd << std::endl;
+
+            int result = std::system(comparison_cmd.c_str());
+            if (result == 0) {
+                std::cout << "✅ Metal implementation matches CUDA reference!" << std::endl;
+            } else {
+                std::cout << "❌ Metal implementation differs from CUDA reference. See details above." << std::endl;
+            }
+        };
+
+        // Route operations (Metal-only harness)
         if (args.op == "embedding_lookup") {
             ops::EmbeddingConfig cfg{args.num_tokens, args.hidden_size, args.vocab_size};
-            if (args.backend == "cuda") {
-                ops::run_embedding_lookup(case_id, cfg, args.seed);
-#ifdef METAL_SUPPORT_ENABLED
-            } else if (args.backend == "metal") {
-                ops::run_embedding_lookup_metal(case_id, cfg, args.seed);
-#endif
-            } else {
-                std::cerr << "Error: Unknown backend '" << args.backend << "'. Use 'cuda' or 'metal'" << std::endl;
-                return 1;
-            }
+            ops::run_embedding_lookup_metal(case_id, cfg, args.seed);
+            run_comparison("embedding_lookup_forward", case_id);
         } else if (args.op == "extract_k_values") {
             ops::ExtractKConfig cfg{args.M, args.N, args.k};
-            if (args.backend == "cuda") {
-                ops::run_extract_k_values(case_id, cfg, args.seed);
-#ifdef METAL_SUPPORT_ENABLED
-            } else if (args.backend == "metal") {
-                ops::run_extract_k_values_metal(case_id, cfg, args.seed);
-#endif
-            } else {
-                std::cerr << "Error: Unknown backend '" << args.backend << "'. Use 'cuda' or 'metal'" << std::endl;
-                return 1;
-            }
+            ops::run_extract_k_values_metal(case_id, cfg, args.seed);
+            run_comparison("extract_k_values", case_id);
         } else if (args.op == "rms_norm") {
-            if (args.backend != "cuda") {
-                std::cerr << "Error: " << args.op << " operation only supports CUDA backend currently" << std::endl;
-                return 1;
-            }
             ops::RMSNormConfig cfg{args.num_tokens, args.hidden_size, args.eps};
-            ops::run_rms_norm(case_id, cfg, args.seed);
+            ops::run_rms_norm_metal(case_id, cfg, args.seed);
+            run_comparison("rms_norm", case_id);
         } else if (args.op == "silu_and_mul") {
             ops::SiLUAndMulConfig cfg{args.num_tokens, args.intermediate_size};
-            if (args.backend == "cuda") {
-                ops::run_silu_and_mul(case_id, cfg, args.seed);
-#ifdef METAL_SUPPORT_ENABLED
-            } else if (args.backend == "metal") {
-                ops::run_silu_and_mul_metal(case_id, cfg, args.seed);
-#endif
-            } else {
-                std::cerr << "Error: Unknown backend '" << args.backend << "'. Use 'cuda' or 'metal'" << std::endl;
-                return 1;
-            }
+            ops::run_silu_and_mul_metal(case_id, cfg, args.seed);
+            run_comparison("silu_and_mul", case_id);
         } else if (args.op == "add_residual") {
             ops::AddResidualConfig cfg{args.num_tokens, args.hidden_size};
-            ops::run_add_residual(case_id, cfg, args.seed);
+            std::cerr << "Error: add_residual not implemented for Metal backend yet" << std::endl;
+            return 1;
         } else if (args.op == "gemm") {
             ops::GemmConfig cfg{args.m, args.n, args.k, args.transa, args.transb, args.use_bias};
-            if (args.backend == "cuda") {
-                ops::run_gemm(case_id, cfg, args.seed);
-#ifdef METAL_SUPPORT_ENABLED
-            } else if (args.backend == "metal") {
-                ops::run_gemm_metal(case_id, cfg, args.seed);
-#endif
-            } else {
-                std::cerr << "Error: Unknown backend '" << args.backend << "'. Use 'cuda' or 'metal'" << std::endl;
-                return 1;
-            }
+            ops::run_gemm_metal(case_id, cfg, args.seed);
+            run_comparison("gemm", case_id);
         } else if (args.op == "cast_type") {
             ops::CastTypeConfig cfg{args.num_elements, args.input_dtype, args.output_dtype};
-            ops::run_cast_type(case_id, cfg, args.seed);
+            std::cerr << "Error: cast_type not implemented for Metal backend yet" << std::endl;
+            return 1;
         } else if (args.op == "rope") {
             ops::RoPEConfig cfg{args.num_tokens, args.num_query_heads, args.num_kv_heads, args.head_size, args.rope_theta, args.rope_factor, args.rope_low_frequency_factor, args.rope_high_frequency_factor, args.max_position_embeddings};
-            ops::run_rope(case_id, cfg, args.seed);
+            std::cerr << "Error: rope not implemented for Metal backend yet" << std::endl;
+            return 1;
         } else if (args.op == "topk_mask_logits") {
             ops::TopKMaskConfig cfg{args.num_tokens, args.vocab_size, args.k};
-            ops::run_topk_mask_logits(case_id, cfg, args.seed);
+            std::cerr << "Error: topk_mask_logits not implemented for Metal backend yet" << std::endl;
+            return 1;
         } else if (args.op == "softmax") {
             ops::SoftmaxConfig cfg{args.batch_size, args.vocab_size, args.temperature};
-            if (args.backend == "cuda") {
-                ops::run_softmax(case_id, cfg, args.seed);
-#ifdef METAL_SUPPORT_ENABLED
-            } else if (args.backend == "metal") {
-                ops::run_softmax_metal(case_id, cfg, args.seed);
-#endif
-            } else {
-                std::cerr << "Error: Unknown backend '" << args.backend << "'. Use 'cuda' or 'metal'" << std::endl;
-                return 1;
-            }
+            ops::run_softmax_metal(case_id, cfg, args.seed);
+            run_comparison("softmax", case_id);
         } else if (args.op == "batch_prefill_attention") {
             ops::BatchPrefillAttentionConfig cfg{args.num_tokens, args.num_query_heads, args.num_kv_heads, args.head_size, args.kv_len, args.page_size};
-            ops::run_batch_prefill_attention(case_id, cfg, args.seed);
+            std::cerr << "Error: batch_prefill_attention not implemented for Metal backend yet" << std::endl;
+            return 1;
         } else if (args.op == "grouped_gemm") {
             ops::GroupedGemmConfig cfg{args.num_groups, args.m, args.n, args.k, args.transa, args.transb, args.use_bias};
-            ops::run_grouped_gemm(case_id, cfg, args.seed);
+            std::cerr << "Error: grouped_gemm not implemented for Metal backend yet" << std::endl;
+            return 1;
         } else if (args.op == "append_paged_kv_cache") {
             ops::AppendPagedKVCacheConfig cfg{args.num_tokens, args.num_kv_heads, args.head_size, args.page_size, args.max_num_pages, args.batch_size};
-            ops::run_append_paged_kv_cache(case_id, cfg, args.seed);
+            std::cerr << "Error: append_paged_kv_cache not implemented for Metal backend yet" << std::endl;
+            return 1;
         } else if (args.op == "gemm_all_dtypes") {
             ops::GemmConfig cfg{args.m, args.n, args.k, args.transa, args.transb, args.use_bias};
-            ops::run_all_dtypes_for_operation("gemm", case_id, &cfg, args.seed);
+            std::cerr << "Error: gemm_all_dtypes not implemented for Metal backend yet" << std::endl;
+            return 1;
         } else if (args.op == "embedding_lookup_all_dtypes") {
             ops::EmbeddingConfig cfg{args.num_tokens, args.hidden_size, args.vocab_size};
-            ops::run_all_dtypes_for_operation("embedding_lookup", case_id, &cfg, args.seed);
+            std::cerr << "Error: embedding_lookup_all_dtypes not implemented for Metal backend yet" << std::endl;
+            return 1;
         } else if (args.op == "extract_k_values_all_dtypes") {
             ops::ExtractKConfig cfg{args.M, args.N, args.k};
-            ops::run_all_dtypes_for_operation("extract_k_values", case_id, &cfg, args.seed);
+            std::cerr << "Error: extract_k_values_all_dtypes not implemented for Metal backend yet" << std::endl;
+            return 1;
         } else {
             std::cerr << "Unsupported op: " << args.op << "\n";
             return 2;
         }
 
-        std::cout << "Artifacts written under: tests/artifacts/" << args.op << "/" << case_id << "\n";
+    // Report where artifacts were written
+    const char* env_metal_base2 = std::getenv("PIE_ARTIFACTS_DIR");
+    const std::string metal_artifacts_base2 = env_metal_base2 ? std::string(env_metal_base2) : default_metal_artifacts_base;
+    std::cout << "Artifacts directory base: " << metal_artifacts_base2
+          << " (Metal runs append _metal to case folder)\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;
     }
 }
+
+#else // !METAL_SUPPORT_ENABLED
+
+#include <iostream>
+int main(int, char**) {
+    std::cerr << "Metal support is not enabled for this build.\n"
+                 "Build on macOS with Metal frameworks and ensure METAL_SUPPORT_ENABLED is defined by CMake." << std::endl;
+    return 1;
+}
+
+#endif // METAL_SUPPORT_ENABLED

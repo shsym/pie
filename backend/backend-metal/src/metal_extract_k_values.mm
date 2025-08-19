@@ -29,19 +29,21 @@ static bool initialize_metal_extract_k_values() {
             return false;
         }
         
-        // Load shader library
+        // Load the Metal file from the same directory as this .mm file
         NSError* error = nil;
-        NSString* libraryPath = @"src/metal_extract_k_values.metallib";
-        library = [device newLibraryWithFile:libraryPath error:&error];
-        if (!library) {
-            // Try loading from source if metallib doesn't exist
-            NSString* shaderSource = [NSString stringWithContentsOfFile:@"src/metal_extract_k_values.metal" 
-                                                               encoding:NSUTF8StringEncoding 
-                                                                  error:&error];
-            if (shaderSource) {
-                library = [device newLibraryWithSource:shaderSource options:nil error:&error];
-            }
+        NSString* currentPath = [NSString stringWithUTF8String:__FILE__];
+        NSString* dirPath = [currentPath stringByDeletingLastPathComponent];
+        NSString* metalPath = [dirPath stringByAppendingPathComponent:@"metal_extract_k_values.metal"];
+        
+        NSString* source = [NSString stringWithContentsOfFile:metalPath
+                                                     encoding:NSUTF8StringEncoding
+                                                        error:&error];
+        if (error) {
+            std::cerr << "Failed to read Metal source: " << error.localizedDescription.UTF8String << std::endl;
+            return false;
         }
+        
+        library = [device newLibraryWithSource:source options:nil error:&error];
         
         if (!library) {
             std::cerr << "Failed to load Metal library: " << error.localizedDescription.UTF8String << std::endl;

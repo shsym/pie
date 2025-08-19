@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Avoid 'set -e' to prevent abrupt exits on expected non-zero codes; keep -u and pipefail for safety.
+set -uo pipefail
 
 # Regenerate all metal protocol test artifacts (cleans old ones first)
 #
@@ -55,9 +56,14 @@ fi
 run() {
   if [[ -n "${DRY_RUN:-}" ]]; then
     echo "+ $*"
-  else
+    return 0
+  fi
   echo "+ $*" >&2
   "$@"
+  status=$?
+  if [[ $status -ne 0 ]]; then
+    echo "Command failed with status $status: $*" >&2
+    exit $status
   fi
 }
 
@@ -72,13 +78,7 @@ echo "==> Cleaning old artifacts"
 run rm -rf "$ART_DIR" "$BUILD_DIR/tests/artifacts"
 run mkdir -p "$ART_DIR"
 
-# 2) Ensure backend-cuda libs exist (required by this test binary)
-CUDA_LIB_DIR="$ROOT_DIR/backend/backend-cuda/build/lib"
-if [[ ! -d "$CUDA_LIB_DIR" ]] || [[ ! -f "$CUDA_LIB_DIR/libprefill_kernels.a" ]] || [[ ! -f "$CUDA_LIB_DIR/libdecode_kernels.a" ]]; then
-  echo "Error: backend-cuda libraries not found at $CUDA_LIB_DIR" >&2
-  echo "Please build the CUDA backend first (see backend/backend-cuda/README.md)." >&2
-  exit 1
-fi
+# 2) No CUDA dependencies are required for the Metal harness
 
 # 3) Build the metal_protocol_tests binary (unless skipped)
 if [[ -z "${SKIP_BUILD:-}" ]]; then
@@ -86,7 +86,14 @@ if [[ -z "${SKIP_BUILD:-}" ]]; then
   run mkdir -p "$BUILD_DIR"
   # Configure with explicit source/build args to avoid cd/quoting issues
   run cmake -S "$PROJECT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
-  run make -C "$BUILD_DIR" -j"$(nproc)"
+  # Portable CPU core detection: prefer nproc, fallback to sysctl (macOS), else 1
+  CORES=1
+  if command -v nproc >/dev/null 2>&1; then
+    CORES=$(nproc)
+  elif command -v sysctl >/dev/null 2>&1; then
+    CORES=$(sysctl -n hw.ncpu)
+  fi
+  run make -C "$BUILD_DIR" -j"$CORES"
 else
   echo "==> Skipping build (SKIP_BUILD=1)"
 fi
@@ -96,7 +103,7 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-# 4) Generate artifacts
+# 4) Generate artifacts (Metal-implemented ops only)
 echo "==> Generating artifacts into $ART_DIR (case: $FULL_CASE_ID)"
 export CUDA_VISIBLE_DEVICES="$GPU"
 
@@ -104,30 +111,14 @@ export CUDA_VISIBLE_DEVICES="$GPU"
 export PIE_WRITE_ARTIFACTS=1
 export PIE_ARTIFACTS_DIR="$ART_DIR"
 
-cd "$BUILD_DIR"
+cd "$BUILD_DIR" || { echo "Failed to cd to $BUILD_DIR" >&2; exit 1; }
 
-# Multi-dtype operations
-run "$BIN" --op gemm_all_dtypes --case "$FULL_CASE_ID" --m 128 --n 4096 --k 4096
-run "$BIN" --op embedding_lookup_all_dtypes --case "$FULL_CASE_ID" --num_tokens 128 --hidden_size 4096 --vocab_size 32000
-run "$BIN" --op extract_k_values_all_dtypes --case "$FULL_CASE_ID" --M 128 --N 4096 --k 50
-
-# Single-dtype operations
-run "$BIN" --op rms_norm --case "$FULL_CASE_ID" --num_tokens 128 --hidden_size 4096
-run "$BIN" --op silu_and_mul --case "$FULL_CASE_ID" --num_tokens 128 --intermediate_size 11008
-run "$BIN" --op rope --case "$FULL_CASE_ID" --num_tokens 128 --num_query_heads 32 --num_kv_heads 32 --head_size 128
-run "$BIN" --op topk_mask_logits --case "$FULL_CASE_ID" --num_tokens 128 --vocab_size 32000 --k 50
-run "$BIN" --op softmax --case "$FULL_CASE_ID" --vocab_size 32000 --temperature 1.0
-run "$BIN" --op grouped_gemm --case "$FULL_CASE_ID" --num_groups 4 --m 128 --n 4096 --k 4096
-run "$BIN" --op batch_prefill_attention --case "$FULL_CASE_ID" --num_tokens 128 --num_query_heads 32 --num_kv_heads 32 --head_size 128 --kv_len 2048 --page_size 16
-run "$BIN" --op append_paged_kv_cache --case "$FULL_CASE_ID" --num_tokens 128 --num_kv_heads 32 --head_size 128 --page_size 16 --max_num_pages 8 --batch_size 2
-run "$BIN" --op add_residual --case "$FULL_CASE_ID" --num_tokens 128 --hidden_size 4096
-
-# Example cast_type (conversion) sample
-run "$BIN" --op cast_type --case "$FULL_CASE_ID" --num_elements 1024 --input_dtype fp32 --output_dtype fp16
-
-# Optional: also generate single-dtype baselines for gemm and embedding_lookup (native dtype runs)
 run "$BIN" --op gemm --case "$FULL_CASE_ID" --m 128 --n 4096 --k 4096
 run "$BIN" --op embedding_lookup --case "$FULL_CASE_ID" --num_tokens 128 --hidden_size 4096 --vocab_size 32000
+run "$BIN" --op extract_k_values --case "$FULL_CASE_ID" --M 128 --N 4096 --k 50
+run "$BIN" --op rms_norm --case "$FULL_CASE_ID" --num_tokens 128 --hidden_size 4096
+run "$BIN" --op silu_and_mul --case "$FULL_CASE_ID" --num_tokens 128 --intermediate_size 11008
+run "$BIN" --op softmax --case "$FULL_CASE_ID" --batch_size 2 --vocab_size 32000 --temperature 1.0
 
 # Summary
 echo "==> Done. Artifacts written under: $ART_DIR"
