@@ -19,8 +19,8 @@ model = "llama-3.2-1b-instruct"
 device = "cuda:0"
 dtype = "bfloat16"
 kv_page_size = 16
-dist_size = 16
-max_num_kv_pages = 70000
-max_num_embeds = 500000
-max_num_adapters = 2
-max_adapter_rank = 8
+dist_size = 64
+max_num_kv_pages = 2000
+max_num_embeds = 50000
+
+
