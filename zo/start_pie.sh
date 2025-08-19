@@ -78,13 +78,13 @@ batching_strategy_t = 16
 [[backend]]
 backend_type = "python"
 exec_path = "${BACKEND_PATH}"
-model = "llama-3.2-1b-instruct"
+model = "qwen-3-4b"
 device = "${device}"
 dtype = "bfloat16"
 kv_page_size = 16
 dist_size = 16
-max_num_kv_pages = 70000
-max_num_embeds = 500000
+max_num_kv_pages = 24000
+max_num_embeds = 50000
 max_num_adapters = 2
 max_adapter_rank = 8
 EOF

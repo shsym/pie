@@ -289,17 +289,21 @@ class AdapterBuffer:
     @torch.inference_mode()
     def compute_lora_delta(self, layer_idx: int, x: torch.Tensor) -> list[torch.Tensor]:
         assert x.shape[0] == self.seeds.shape[0], "Batch size must match seeds."
-        B = x.shape[0]
         rank = self.adapter.rank
 
         # Short-hands
         out_indptr = self.adapter.out_features_indptr  # built from [d_q, d_k, d_v]
-        d_q, d_k, d_v = self.adapter.out_features
 
         # ===== 1) Noise paths =====
         # DOWN noise uses 3 equal chunks of size `rank` each (Q/K/V).
         Sd = self.adapter.qkv_down_sigma[layer_idx]  # (in_features, 3*rank)
+        Wd = self.adapter.qkv_down_weight[layer_idx]
+        Wu = self.adapter.qkv_up_weight[layer_idx]  # (rank, d_q+d_k+d_v)
+
         Sd_q, Sd_k, Sd_v = torch.split(Sd, [rank, rank, rank], dim=-1)
+
+        qkv_down = x @ Wd
+        d_q, d_k, d_v = torch.split(qkv_down, [rank, rank, rank], dim=-1)
 
         q_noise_down = rand_mv.batched_randn_matmul(
             x,
@@ -320,51 +324,52 @@ class AdapterBuffer:
             out_dtype=x.dtype,
         )
 
+        d_q = d_q + q_noise_down
+        d_k = d_k + k_noise_down
+        d_v = d_v + v_noise_down
+
         # UP noise uses column slices [d_q, d_k, d_v].
         Su = self.adapter.qkv_up_sigma[layer_idx]  # (rank, d_q+d_k+d_v)
         Su_q = Su[:, out_indptr[0]:out_indptr[1]].contiguous()
         Su_k = Su[:, out_indptr[1]:out_indptr[2]].contiguous()
         Su_v = Su[:, out_indptr[2]:out_indptr[3]].contiguous()
 
+        Wu_q = Wu[:, out_indptr[0]:out_indptr[1]]  # (rank, d_q)
+        Wu_k = Wu[:, out_indptr[1]:out_indptr[2]]  # (rank, d_k)
+        Wu_v = Wu[:, out_indptr[2]:out_indptr[3]]  # (rank, d_v)
+
+        u_q = d_q @ Wu_q
+        u_k = d_k @ Wu_k
+        u_v = d_v @ Wu_v
+
         q_noise_up = rand_mv.batched_randn_matmul(
-            q_noise_down,
+            d_q,
             seeds=self.seeds - layer_idx,
             S=Su_q,
             out_dtype=x.dtype,
         )
         k_noise_up = rand_mv.batched_randn_matmul(
-            k_noise_down,
+            d_k,
             seeds=self.seeds - (layer_idx + 100),
             S=Su_k,
             out_dtype=x.dtype,
         )
         v_noise_up = rand_mv.batched_randn_matmul(
-            v_noise_down,
+            d_v,
             seeds=self.seeds - (layer_idx + 200),
             S=Su_v,
             out_dtype=x.dtype,
         )
 
-        # ===== 2) Mean paths (deterministic LoRA delta) =====
-        # DOWN mean: (B, in_features) @ (in_features, 3*rank) -> split into 3 x (B, rank)
-        qkv_down = x @ self.adapter.qkv_down_weight[layer_idx]
-        q_down, k_down, v_down = torch.split(qkv_down, [rank, rank, rank], dim=-1)
-
-        # UP mean: take column slices for Q/K/V
-        W_up = self.adapter.qkv_up_weight[layer_idx]  # (rank, d_q+d_k+d_v)
-        Wq = W_up[:, out_indptr[0]:out_indptr[1]]  # (rank, d_q)
-        Wk = W_up[:, out_indptr[1]:out_indptr[2]]  # (rank, d_k)
-        Wv = W_up[:, out_indptr[2]:out_indptr[3]]  # (rank, d_v)
-
-        q_mean = q_down @ Wq
-        k_mean = k_down @ Wk
-        v_mean = v_down @ Wv
+        u_q = u_q + q_noise_up
+        u_k = u_k + k_noise_up
+        u_v = u_v + v_noise_up
 
         # ===== 3) Combine mean + noise =====
         scaling = self.adapter.alpha / float(rank)
 
-        q_final = scaling * (q_mean + q_noise_up)
-        k_final = scaling * (k_mean + k_noise_up)
-        v_final = scaling * (v_mean + v_noise_up)
+        q_final = scaling * u_q
+        k_final = scaling * u_k
+        v_final = scaling * u_v
 
         return [q_final, k_final, v_final]
