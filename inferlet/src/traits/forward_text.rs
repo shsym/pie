@@ -1,5 +1,5 @@
 use crate::Queue;
-use crate::bindings::pie::inferlet::forward_text;
+use crate::forward_text;
 use crate::brle::Brle;
 use crate::traits::output_text::Distribution;
 use wstd::io::AsyncPollable;

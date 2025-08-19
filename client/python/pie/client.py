@@ -2,7 +2,10 @@ import asyncio
 import msgpack
 import websockets
 import blake3
-
+import subprocess
+import tempfile
+from pathlib import Path
+import uuid
 
 class Instance:
     """Represents a running instance of a program on the server."""
@@ -153,6 +156,7 @@ class PieClient:
         msg = {"type": "query", "subject": subject, "record": record}
         return await self._send_msg_and_wait(msg)
 
+
     async def program_exists(self, program_hash: str) -> bool:
         """Check if a program with the given hash exists on the server."""
         successful, result = await self.query("program_exists", program_hash)
@@ -233,3 +237,107 @@ class PieClient:
         encoded = msgpack.packb(msg, use_bin_type=True)
         await self.ws.send(encoded)
 
+
+
+
+def _compile_rust_sync(rust_code: str, cargo_toml_content: str, package_name: str) -> bytes:
+    """
+    [Internal Synchronous Helper] Compiles rust code in a temporary directory.
+    This function is blocking and should be run in a separate thread.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        project_path = Path(temp_dir)
+        src_path = project_path / "src"
+        src_path.mkdir()
+
+        # Write the configuration and source files
+        (project_path / "Cargo.toml").write_text(cargo_toml_content)
+        (src_path / "lib.rs").write_text(rust_code)
+
+        # Define and run the compilation command
+        command = ["cargo", "build", "--target", "wasm32-wasip2", "--release"]
+
+        try:
+            print(f"🚀 Compiling crate '{package_name}'...")
+            # This is a blocking call
+            subprocess.run(
+                command,
+                cwd=project_path,
+                check=True,
+                capture_output=True,
+                text=True
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Error: `cargo` command not found. Ensure Rust is installed and in your PATH. "
+                "You also need the wasm32-wasip2 target. Install it with: `rustup target add wasm32-wasip2`"
+            )
+        except subprocess.CalledProcessError as e:
+            error_message = f"❌ Rust compilation failed.\n\n--- COMPILER OUTPUT ---\n{e.stderr}"
+            raise RuntimeError(error_message)
+
+        # Locate and read the compiled .wasm file
+        wasm_file_name = f"{package_name.replace('-', '_')}.wasm"
+        wasm_path = project_path / "target" / "wasm32-wasip2" / "release" / wasm_file_name
+
+        if not wasm_path.exists():
+            raise RuntimeError(f"Build succeeded but could not find WASM file at {wasm_path}")
+
+        print("✅ Compilation successful! Reading WASM binary.")
+        return wasm_path.read_bytes()
+
+async def compile_program(source: str|Path, dependencies: list[str]) -> bytes:
+    """
+    Compiles Rust source into a WASM binary and returns the bytes.
+
+    This function dynamically creates a temporary Cargo project, compiles the code
+    with the specified dependencies to the `wasm32-wasip2` target, reads the
+    resulting .wasm file into memory, and cleans up all intermediate files.
+
+    Args:
+        source: A string of Rust code or a Path object pointing to a .rs file.
+        dependencies: A list of dependency strings, e.g., ["tokio = \"1\"", "serde = \"1.0\""].
+
+    Returns:
+        The compiled WASM binary as a bytes object.
+
+    Raises:
+        FileNotFoundError: If the source path does not exist.
+        RuntimeError: If compilation fails or required tools are missing.
+    """
+    # 1. Resolve source code content from string or file path
+    rust_code: str
+    if isinstance(source, Path) or (isinstance(source, str) and source.endswith('.rs')):
+        source_path = Path(source)
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Source file not found at: {source_path}")
+        rust_code = source_path.read_text()
+    else:
+        rust_code = source
+
+    # 2. Prepare the Cargo.toml configuration
+    package_name = f"pie-temp-crate-{uuid.uuid4().hex[:8]}"
+    deps_str = "\n".join(dependencies)
+    cargo_toml_content = f"""
+[package]
+name = "{package_name}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+{deps_str}
+"""
+
+    # 3. Run the blocking compilation in a thread pool to avoid blocking the event loop
+    loop = asyncio.get_running_loop()
+    wasm_bytes = await loop.run_in_executor(
+        None,  # Use the default thread pool executor
+        _compile_rust_sync,
+        rust_code,
+        cargo_toml_content,
+        package_name
+    )
+    return wasm_bytes

@@ -14,13 +14,13 @@ batching_strategy_t = 16 # in milliseconds
 #exec_path = "../backend/backend-cuda/build/bin/pie_cuda_be"
 backend_type = "python"
 exec_path = "../backend/backend-python/server.py"
-model = "llama-3.2-1b-instruct"
+model = "qwen-3-4b" #"llama-3.2-1b-instruct"
 # model = "qwen-3-0.6b"
 device = "cuda:0"
 dtype = "bfloat16"
 kv_page_size = 16
-dist_size = 64
-max_num_kv_pages = 2000
+dist_size = 16
+max_num_kv_pages = 24000
 max_num_embeds = 50000
-
-
+max_num_adapters = 2
+max_adapter_rank = 8

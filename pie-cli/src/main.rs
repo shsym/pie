@@ -271,11 +271,11 @@ async fn start_interactive_session(
                 .context("`exec_path` is missing or not a string.")?;
 
             let mut cmd = if backend_type == "python" {
-                let mut cmd = TokioCommand::new("uv");
-                cmd.arg("--project");
-                cmd.arg("../backend/backend-python");
-                cmd.arg("run");
-                cmd.arg("python");
+                let mut cmd = TokioCommand::new("python");
+                // cmd.arg("--project");
+                // cmd.arg("../backend/backend-python");
+                // cmd.arg("run");
+                // cmd.arg("python");
                 cmd.arg("-u");
                 cmd.arg(exec_path);
                 cmd

@@ -33,14 +33,14 @@ pub trait Forward {
     /// * `page_ids` - A list of memory page IDs representing the context's KV cache.
     /// * `input_embed_ids` - A list of object IDs for the input embeddings.
     /// * `output_embed_ids` - A list of object IDs where the output embeddings will be written.
-    fn forward_with_adapter(
-        &self,
-        adapter_name: String,
-        last_kv_page_len: u32,
-        page_ids: &[u32],
-        input_embed_ids: &[u32],
-        output_embed_ids: &[u32],
-    );
+    // fn forward_with_adapter(
+    //     &self,
+    //     adapter_name: String,
+    //     last_kv_page_len: u32,
+    //     page_ids: &[u32],
+    //     input_embed_ids: &[u32],
+    //     output_embed_ids: &[u32],
+    // );
 
     /// Applies a boolean mask to a specific KV cache page.
     ///
@@ -74,23 +74,23 @@ impl Forward for Queue {
         )
     }
 
-    fn forward_with_adapter(
-        &self,
-        adapter_name: String,
-        last_kv_page_len: u32,
-        page_ids: &[u32],
-        input_embed_ids: &[u32],
-        output_embed_ids: &[u32],
-    ) {
-        forward::forward_with_adapter(
-            &self.inner,
-            &adapter_name,
-            last_kv_page_len,
-            page_ids,
-            input_embed_ids,
-            output_embed_ids,
-        )
-    }
+    // fn forward_with_adapter(
+    //     &self,
+    //     adapter_name: String,
+    //     last_kv_page_len: u32,
+    //     page_ids: &[u32],
+    //     input_embed_ids: &[u32],
+    //     output_embed_ids: &[u32],
+    // ) {
+    //     forward::forward_with_adapter(
+    //         &self.inner,
+    //         &adapter_name,
+    //         last_kv_page_len,
+    //         page_ids,
+    //         input_embed_ids,
+    //         output_embed_ids,
+    //     )
+    // }
 
     fn mask_kv_page(&self, page_id: u32, mask: &[bool]) {
         forward::mask_kv_page(&self.inner, page_id, mask)

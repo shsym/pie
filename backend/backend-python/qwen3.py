@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 import flashinfer as ops
-
+from adapter import Adapter, AdapterBuffer
 from config import L4maConfig
 
 VERSION = "0.1.0"
@@ -140,6 +140,7 @@ class Qwen3Attention(nn.Module):
 
     def forward(
             self,
+            adapter_buffer: AdapterBuffer | None,
             wrapper,
             hidden_states: torch.Tensor,
             position_ids: torch.Tensor,
@@ -158,6 +159,16 @@ class Qwen3Attention(nn.Module):
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
         )
+
+        # apply adapters if provided
+        if adapter_buffer is not None:
+            delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states)
+            q_delta = delta[0]
+            k_delta = delta[1]
+            v_delta = delta[2]
+            query_states.add_(q_delta)
+            key_states.add_(k_delta)
+            value_states.add_(v_delta)
 
         # Reshape and continue as before
         query_states = query_states.view(
@@ -227,6 +238,7 @@ class Qwen3DecoderLayer(nn.Module):
 
     def forward(
             self,
+            adapter_buffer: AdapterBuffer | None,
             wrapper,
             hidden_states: torch.Tensor,
             position_ids: torch.Tensor,
@@ -244,6 +256,7 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Self Attention
         hidden_states = self.self_attn(
+            adapter_buffer=adapter_buffer,
             wrapper=wrapper,
             hidden_states=hidden_states,
             position_ids=position_ids,
@@ -308,6 +321,8 @@ class Qwen3Model(nn.Module):
 
     def forward(
             self,
+            adapter: Adapter | None,
+            seeds: torch.Tensor | None,
             input_embeds: torch.Tensor,
             position_ids: torch.Tensor,
             kv_cache_at_layer: torch.Tensor,
@@ -323,6 +338,15 @@ class Qwen3Model(nn.Module):
         n, _ = hidden_states.size()
 
         page_size = kv_cache_at_layer[0].shape[2]
+
+        if adapter is not None:
+
+            adapter_buffer = AdapterBuffer(
+                adapter=adapter,
+                seeds=seeds,
+            )
+        else:
+            adapter_buffer = None
 
         batch_indices, batch_positions = ops.get_batch_indices_positions(
             append_indptr=qo_indptr,
@@ -361,6 +385,7 @@ class Qwen3Model(nn.Module):
 
         for decoder_layer in self.layers:
             layer_outputs = decoder_layer(
+                adapter_buffer=adapter_buffer,
                 wrapper=wrapper,
                 hidden_states=hidden_states,
                 position_ids=position_ids,
