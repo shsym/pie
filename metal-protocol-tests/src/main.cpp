@@ -291,24 +291,24 @@ int main(int argc, char** argv) {
             return 1;
         } else if (args.op == "rope") {
             ops::RoPEConfig cfg{args.num_tokens, args.num_query_heads, args.num_kv_heads, args.head_size, args.rope_theta, args.rope_factor, args.rope_low_frequency_factor, args.rope_high_frequency_factor, args.max_position_embeddings};
-            std::cerr << "Error: rope not implemented for Metal backend yet" << std::endl;
-            return 1;
+            ops::run_rope_metal(args.case_id, cfg, args.seed);
+            run_comparison("rope", args.case_id);
         } else if (args.op == "topk_mask_logits") {
             ops::TopKMaskConfig cfg{args.num_tokens, args.vocab_size, args.k};
-            std::cerr << "Error: topk_mask_logits not implemented for Metal backend yet" << std::endl;
-            return 1;
+            ops::run_topk_mask_logits_metal(args.case_id, cfg, args.seed);
+            run_comparison("topk_mask_logits", args.case_id);
         } else if (args.op == "softmax") {
             ops::SoftmaxConfig cfg{args.batch_size, args.vocab_size, args.temperature};
             ops::run_softmax_metal(case_id, cfg, args.seed);
             run_comparison("softmax", case_id);
         } else if (args.op == "batch_prefill_attention") {
             ops::BatchPrefillAttentionConfig cfg{args.num_tokens, args.num_query_heads, args.num_kv_heads, args.head_size, args.kv_len, args.page_size};
-            std::cerr << "Error: batch_prefill_attention not implemented for Metal backend yet" << std::endl;
-            return 1;
+            ops::run_batch_prefill_attention_metal(case_id, cfg, args.seed);
+            run_comparison("batch_prefill_attention", case_id);
         } else if (args.op == "grouped_gemm") {
             ops::GroupedGemmConfig cfg{args.num_groups, args.m, args.n, args.k, args.transa, args.transb, args.use_bias};
-            std::cerr << "Error: grouped_gemm not implemented for Metal backend yet" << std::endl;
-            return 1;
+            ops::run_grouped_gemm_metal(args.case_id, cfg, args.seed);
+            run_comparison("grouped_gemm", args.case_id);
         } else if (args.op == "append_paged_kv_cache") {
             ops::AppendPagedKVCacheConfig cfg{args.num_tokens, args.num_kv_heads, args.head_size, args.page_size, args.max_num_pages, args.batch_size};
             std::cerr << "Error: append_paged_kv_cache not implemented for Metal backend yet" << std::endl;

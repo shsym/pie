@@ -17,6 +17,10 @@
 #include "metal_extract_k_values.hpp"
 #include "metal_softmax.hpp"
 #include "metal_rmsnorm.hpp"
+#include "metal_rope.hpp"
+#include "metal_topk_mask_logits.hpp"
+#include "metal_grouped_gemm.hpp"
+#include "metal_batch_prefill_attention.hpp"
 
 #include "artifacts.hpp"
 
@@ -408,6 +412,385 @@ void run_rms_norm_metal(const std::string& case_id, const RMSNormConfig& cfg, ui
     }
 
     std::cout << "Metal RMS Norm completed successfully" << std::endl;
+}
+
+// Metal implementation of RoPE (Rotary Position Embedding)
+void run_rope_metal(const std::string& case_id, const RoPEConfig& cfg, uint64_t seed) {
+    using T = bfloat16_t;  // bfloat16 on Metal host side
+
+    const int num_tokens = cfg.num_tokens;
+    const int num_heads = cfg.num_query_heads; // Use query heads for the tensor size
+    const int head_size = cfg.head_size;
+    const float rope_theta = cfg.rope_theta;
+    const float rope_factor = cfg.rope_factor;
+
+    std::cout << "Running Metal RoPE: tokens=" << num_tokens << ", heads=" << num_heads 
+              << ", head_size=" << head_size << ", theta=" << rope_theta 
+              << ", factor=" << rope_factor << std::endl;
+
+    // Generate same test data as CUDA version would use
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // Query/Key tensor [num_tokens, num_heads, head_size]
+    std::vector<T> h_qk(static_cast<size_t>(num_tokens) * num_heads * head_size);
+    for (auto& v : h_qk) v = float_to_bf16(dist(rng));
+
+    // Position IDs [num_tokens] - sequential positions starting from 0
+    std::vector<int32_t> h_position_ids(num_tokens);
+    for (int i = 0; i < num_tokens; ++i) {
+        h_position_ids[i] = i;
+    }
+
+    // Call Metal RoPE implementation (in-place operation)
+    int result = metal_rope_bfloat16(
+        h_qk.data(), h_position_ids.data(),
+        num_tokens, num_heads, head_size,
+        rope_theta, rope_factor
+    );
+
+    if (result != 0) {
+        throw std::runtime_error("Metal RoPE execution failed with code: " + std::to_string(result));
+    }
+
+    // Write artifacts for comparison with CUDA
+    if (artifacts::op_enabled("rope")) {
+        auto dir = artifacts::ensure_dir_for_case("rope", case_id + "_metal");
+
+        artifacts::write_host_bin(dir, "input_qk", h_qk.data(), h_qk.size());
+        artifacts::write_host_bin(dir, "position_ids", h_position_ids.data(), h_position_ids.size());
+
+        std::ostringstream meta;
+        meta << "\"version\": \"1\",\n"
+             << "\"op\": \"rope\",\n"
+             << "\"backend\": \"metal\",\n"
+             << "\"case_id\": " << artifacts::json_escape(case_id) << ",\n"
+             << "\"config\": {\"num_tokens\": " << num_tokens
+             << ", \"num_query_heads\": " << cfg.num_query_heads
+             << ", \"num_kv_heads\": " << cfg.num_kv_heads
+             << ", \"head_size\": " << head_size
+             << ", \"rope_theta\": " << rope_theta
+             << ", \"rope_factor\": " << rope_factor
+             << ", \"rope_low_frequency_factor\": " << cfg.rope_low_frequency_factor
+             << ", \"rope_high_frequency_factor\": " << cfg.rope_high_frequency_factor
+             << ", \"max_position_embeddings\": " << cfg.max_position_embeddings << "},\n"
+             << "\"dtype_map\": {\"input_qk\": \"bf16\", \"position_ids\": \"s32\"},\n"
+             << "\"shape_map\": {\"input_qk\": [" << num_tokens << ", " << num_heads << ", " << head_size 
+             << "], \"position_ids\": [" << num_tokens << "]}";
+        artifacts::write_meta_json(dir, meta.str());
+    }
+
+    std::cout << "Metal RoPE completed successfully" << std::endl;
+}
+
+// Metal implementation of Top-K Mask Logits
+void run_topk_mask_logits_metal(const std::string& case_id, const TopKMaskConfig& cfg, uint64_t seed) {
+    using T = float;  // Use float for logits (common for sampling operations)
+
+    const int num_tokens = cfg.num_tokens;
+    const int vocab_size = cfg.vocab_size;
+    const int k = cfg.k;
+
+    std::cout << "Running Metal Top-K Mask Logits: tokens=" << num_tokens << ", vocab=" << vocab_size 
+              << ", k=" << k << std::endl;
+
+    // Generate same test data as CUDA version
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<float> dist(-5.0f, 5.0f);  // Reasonable logit range
+
+    // Input logits [num_tokens, vocab_size]
+    std::vector<T> h_logits(static_cast<size_t>(num_tokens) * vocab_size);
+    for (auto& v : h_logits) v = dist(rng);
+
+    // Make a copy for comparison (since operation is in-place)
+    std::vector<T> h_original_logits = h_logits;
+
+    // Call Metal Top-K mask implementation (in-place operation)
+    int result = metal_topk_mask_logits_float32(
+        h_logits.data(), num_tokens, vocab_size, k
+    );
+
+    if (result != 0) {
+        throw std::runtime_error("Metal Top-K mask execution failed with code: " + std::to_string(result));
+    }
+
+    // Write artifacts for comparison with CUDA
+    if (artifacts::op_enabled("topk_mask_logits")) {
+        auto dir = artifacts::ensure_dir_for_case("topk_mask_logits", case_id + "_metal");
+
+        artifacts::write_host_bin(dir, "input_logits", h_original_logits.data(), h_original_logits.size());
+        artifacts::write_host_bin(dir, "output_logits", h_logits.data(), h_logits.size());
+
+        std::ostringstream meta;
+        meta << "\"version\": \"1\",\n"
+             << "\"op\": \"topk_mask_logits\",\n"
+             << "\"backend\": \"metal\",\n"
+             << "\"case_id\": " << artifacts::json_escape(case_id) << ",\n"
+             << "\"config\": {\"num_tokens\": " << num_tokens
+             << ", \"vocab_size\": " << vocab_size
+             << ", \"k\": " << k << "},\n"
+             << "\"dtype_map\": {\"input_logits\": \"fp32\", \"output_logits\": \"fp32\"},\n"
+             << "\"shape_map\": {\"input_logits\": [" << num_tokens << ", " << vocab_size
+             << "], \"output_logits\": [" << num_tokens << ", " << vocab_size << "]}";
+        artifacts::write_meta_json(dir, meta.str());
+    }
+
+    std::cout << "Metal Top-K Mask Logits completed successfully" << std::endl;
+}
+
+// Metal implementation of Grouped GEMM
+void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig& cfg, uint64_t seed) {
+    using T = bfloat16_t;  // bfloat16 on Metal host side
+
+    const int num_groups = cfg.num_groups;
+    const int m = cfg.m;
+    const int n = cfg.n;
+    const int k = cfg.k;
+    const bool transa = cfg.transa;
+    const bool transb = cfg.transb;
+    const bool use_bias = cfg.use_bias;
+
+    std::cout << "Running Metal Grouped GEMM: groups=" << num_groups << ", m=" << m << ", n=" << n 
+              << ", k=" << k << ", transa=" << transa << ", transb=" << transb 
+              << ", use_bias=" << use_bias << std::endl;
+
+    // Generate same test data as CUDA version
+    std::mt19937_64 rng(seed);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // Create arrays to hold matrix data for each group
+    std::vector<std::vector<T>> A_matrices(num_groups);
+    std::vector<std::vector<T>> B_matrices(num_groups);
+    std::vector<std::vector<T>> C_matrices(num_groups);
+    std::vector<std::vector<T>> bias_matrices(num_groups);
+    
+    std::vector<void*> A_ptrs(num_groups);
+    std::vector<void*> B_ptrs(num_groups);
+    std::vector<void*> C_ptrs(num_groups);
+    std::vector<void*> bias_ptrs(num_groups);
+    
+    std::vector<int> m_array(num_groups, m);
+    std::vector<int> n_array(num_groups, n);
+    std::vector<int> k_array(num_groups, k);
+
+    // Initialize matrices for each group
+    for (int group = 0; group < num_groups; ++group) {
+        // A matrix size depends on transpose flag
+        size_t A_size = static_cast<size_t>(transa ? k * m : m * k);
+        A_matrices[group].resize(A_size);
+        for (auto& v : A_matrices[group]) v = float_to_bf16(dist(rng));
+        A_ptrs[group] = A_matrices[group].data();
+
+        // B matrix size depends on transpose flag  
+        size_t B_size = static_cast<size_t>(transb ? n * k : k * n);
+        B_matrices[group].resize(B_size);
+        for (auto& v : B_matrices[group]) v = float_to_bf16(dist(rng));
+        B_ptrs[group] = B_matrices[group].data();
+
+        // C matrix (output)
+        size_t C_size = static_cast<size_t>(m) * n;
+        C_matrices[group].resize(C_size, 0);
+        C_ptrs[group] = C_matrices[group].data();
+
+        // Bias vector (optional)
+        if (use_bias) {
+            bias_matrices[group].resize(n);
+            for (auto& v : bias_matrices[group]) v = float_to_bf16(dist(rng));
+            bias_ptrs[group] = bias_matrices[group].data();
+        } else {
+            bias_ptrs[group] = nullptr;
+        }
+    }
+
+    // Call Metal Grouped GEMM implementation
+    int result = metal_grouped_gemm_bfloat16(
+        A_ptrs.data(), B_ptrs.data(), C_ptrs.data(),
+        use_bias ? bias_ptrs.data() : nullptr,
+        m_array.data(), n_array.data(), k_array.data(),
+        num_groups, transa, transb
+    );
+
+    if (result != 0) {
+        throw std::runtime_error("Metal Grouped GEMM execution failed with code: " + std::to_string(result));
+    }
+
+    // Write artifacts for comparison with CUDA
+    if (artifacts::op_enabled("grouped_gemm")) {
+        auto dir = artifacts::ensure_dir_for_case("grouped_gemm", case_id + "_metal");
+
+        // Save each group's matrices
+        for (int group = 0; group < num_groups; ++group) {
+            std::string group_suffix = "_group" + std::to_string(group);
+            
+            artifacts::write_host_bin(dir, "A" + group_suffix, A_matrices[group].data(), A_matrices[group].size());
+            artifacts::write_host_bin(dir, "B" + group_suffix, B_matrices[group].data(), B_matrices[group].size());
+            artifacts::write_host_bin(dir, "C" + group_suffix, C_matrices[group].data(), C_matrices[group].size());
+            
+            if (use_bias) {
+                artifacts::write_host_bin(dir, "bias" + group_suffix, bias_matrices[group].data(), bias_matrices[group].size());
+            }
+        }
+
+        std::ostringstream meta;
+        meta << "\"version\": \"1\",\n"
+             << "\"op\": \"grouped_gemm\",\n"
+             << "\"backend\": \"metal\",\n"
+             << "\"case_id\": " << artifacts::json_escape(case_id) << ",\n"
+             << "\"config\": {\"num_groups\": " << num_groups
+             << ", \"m\": " << m << ", \"n\": " << n << ", \"k\": " << k
+             << ", \"transa\": " << (transa ? "true" : "false")
+             << ", \"transb\": " << (transb ? "true" : "false")
+             << ", \"use_bias\": " << (use_bias ? "true" : "false") << "},\n"
+             << "\"dtype_map\": {";
+        
+        for (int group = 0; group < num_groups; ++group) {
+            if (group > 0) meta << ", ";
+            std::string suffix = "_group" + std::to_string(group);
+            meta << "\"A" << suffix << "\": \"bf16\", \"B" << suffix << "\": \"bf16\", \"C" << suffix << "\": \"bf16\"";
+            if (use_bias) {
+                meta << ", \"bias" << suffix << "\": \"bf16\"";
+            }
+        }
+        
+        meta << "},\n\"shape_map\": {";
+        
+        for (int group = 0; group < num_groups; ++group) {
+            if (group > 0) meta << ", ";
+            std::string suffix = "_group" + std::to_string(group);
+            
+            int A_dim0 = transa ? k : m;
+            int A_dim1 = transa ? m : k;
+            int B_dim0 = transb ? n : k;
+            int B_dim1 = transb ? k : n;
+            
+            meta << "\"A" << suffix << "\": [" << A_dim0 << ", " << A_dim1 << "], "
+                 << "\"B" << suffix << "\": [" << B_dim0 << ", " << B_dim1 << "], "
+                 << "\"C" << suffix << "\": [" << m << ", " << n << "]";
+            
+            if (use_bias) {
+                meta << ", \"bias" << suffix << "\": [" << n << "]";
+            }
+        }
+        
+        meta << "}";
+        artifacts::write_meta_json(dir, meta.str());
+    }
+
+    std::cout << "Metal Grouped GEMM completed successfully" << std::endl;
+}
+
+// Metal implementation of Batch Prefill Attention operation
+void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPrefillAttentionConfig& cfg, uint64_t seed) {
+    using T = bfloat16_t;  // Metal host-side bfloat16
+    
+    const int num_tokens = cfg.num_tokens;
+    const int num_query_heads = cfg.num_query_heads;
+    const int num_kv_heads = cfg.num_kv_heads;
+    const int head_size = cfg.head_size;
+    const int kv_len = cfg.kv_len;
+    const int page_size = cfg.page_size;
+    
+    std::cout << "Running Metal Batch Prefill Attention: tokens=" << num_tokens 
+              << ", query_heads=" << num_query_heads 
+              << ", kv_heads=" << num_kv_heads 
+              << ", head_size=" << head_size 
+              << ", kv_len=" << kv_len 
+              << ", page_size=" << page_size << std::endl;
+    
+    // Initialize random number generator
+    std::mt19937 gen(seed);
+    std::normal_distribution<float> dist(0.0f, 0.1f);
+    
+    // Allocate input tensors
+    std::vector<T> Q(num_tokens * num_query_heads * head_size);
+    std::vector<T> K(kv_len * num_kv_heads * head_size);
+    std::vector<T> V(kv_len * num_kv_heads * head_size);
+    std::vector<T> O(num_tokens * num_query_heads * head_size);
+    
+    // Fill Q, K, V with random data
+    for (size_t i = 0; i < Q.size(); ++i) {
+        Q[i] = float_to_bf16(dist(gen));
+    }
+    
+    for (size_t i = 0; i < K.size(); ++i) {
+        K[i] = float_to_bf16(dist(gen));
+    }
+    
+    for (size_t i = 0; i < V.size(); ++i) {
+        V[i] = float_to_bf16(dist(gen));
+    }
+    
+    // Initialize output to zero
+    std::fill(O.begin(), O.end(), static_cast<T>(0));
+    
+    // Create simplified indptr and indices for testing
+    std::vector<int32_t> indptr(num_tokens + 1);
+    std::vector<int32_t> indices(num_tokens);
+    
+    for (int i = 0; i <= num_tokens; ++i) {
+        indptr[i] = i * kv_len / num_tokens; // Simplified: equal distribution
+    }
+    for (int i = 0; i < num_tokens; ++i) {
+        indices[i] = i;
+    }
+    
+    // Compute attention scale (typically 1/sqrt(head_size))
+    float scale = 1.0f / sqrtf(static_cast<float>(head_size));
+    
+    // Call Metal implementation
+    metal::batch_prefill_attention::batch_prefill_attention_bf16(
+        Q.data(), K.data(), V.data(),
+        indptr.data(), indices.data(),
+        O.data(),
+        num_tokens, num_query_heads, num_kv_heads, head_size, kv_len, page_size,
+        scale
+    );
+    
+    // Write artifacts
+    if (artifacts::op_enabled("batch_prefill_attention")) {
+        auto dir = artifacts::ensure_dir_for_case("batch_prefill_attention", case_id + "_metal");
+        
+        // Write input tensors
+        artifacts::write_host_bin(dir, "Q", Q.data(), Q.size());
+        artifacts::write_host_bin(dir, "K", K.data(), K.size());
+        artifacts::write_host_bin(dir, "V", V.data(), V.size());
+        
+        // Write output tensor
+        artifacts::write_host_bin(dir, "O", O.data(), O.size());
+        
+        // Write indices and pointers
+        artifacts::write_host_bin(dir, "indptr", indptr.data(), indptr.size());
+        artifacts::write_host_bin(dir, "indices", indices.data(), indices.size());
+    
+        // Write metadata
+        std::ostringstream meta;
+        meta << "\"version\": \"1\",\n"
+             << "\"op\": \"batch_prefill_attention\",\n"
+             << "\"backend\": \"metal\",\n"
+             << "\"case_id\": \"" << case_id << "\",\n"
+             << "\"config\": {"
+             << "\"num_tokens\": " << num_tokens << ", "
+             << "\"num_query_heads\": " << num_query_heads << ", "
+             << "\"num_kv_heads\": " << num_kv_heads << ", "
+             << "\"head_size\": " << head_size << ", "
+             << "\"kv_len\": " << kv_len << ", "
+             << "\"page_size\": " << page_size << ", "
+             << "\"scale\": " << scale
+             << "},\n"
+             << "\"dtype_map\": {\"Q\": \"bf16\", \"K\": \"bf16\", \"V\": \"bf16\", \"O\": \"bf16\", \"indptr\": \"s32\", \"indices\": \"s32\"},\n"
+             << "\"shape_map\": {"
+             << "\"Q\": [" << num_tokens << ", " << num_query_heads << ", " << head_size << "], "
+             << "\"K\": [" << kv_len << ", " << num_kv_heads << ", " << head_size << "], "
+             << "\"V\": [" << kv_len << ", " << num_kv_heads << ", " << head_size << "], "
+             << "\"O\": [" << num_tokens << ", " << num_query_heads << ", " << head_size << "], "
+             << "\"indptr\": [" << (num_tokens + 1) << "], "
+             << "\"indices\": [" << num_tokens << "]"
+             << "}";
+        
+        artifacts::write_meta_json(dir, meta.str());
+    }
+    
+    std::cout << "Metal Batch Prefill Attention completed successfully" << std::endl;
 }
 
 } // namespace ops

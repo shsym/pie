@@ -196,6 +196,10 @@ void run_silu_and_mul_metal(const std::string& case_id, const SiLUAndMulConfig& 
 void run_extract_k_values_metal(const std::string& case_id, const ExtractKConfig& cfg, uint64_t seed);
 void run_softmax_metal(const std::string& case_id, const SoftmaxConfig& cfg, uint64_t seed);
 void run_rms_norm_metal(const std::string& case_id, const RMSNormConfig& cfg, uint64_t seed);
+void run_rope_metal(const std::string& case_id, const RoPEConfig& cfg, uint64_t seed);
+void run_topk_mask_logits_metal(const std::string& case_id, const TopKMaskConfig& cfg, uint64_t seed);
+void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig& cfg, uint64_t seed);
+void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPrefillAttentionConfig& cfg, uint64_t seed);
 #endif
 
 } // namespace ops

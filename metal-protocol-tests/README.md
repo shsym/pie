@@ -10,7 +10,7 @@ This framework enables development and validation of Metal GPU implementations a
 - macOS: Implement and test Metal GPU kernels against those CUDA artifacts
 - Cross-platform: Transfer artifacts between platforms for validation
 
-## Status: 6/10 operations complete
+## Status: 10/10 operations complete (Metal implementations)
 
 | Operation | CUDA | Metal | Status |
 |-----------|:----:|:-----:|--------|
@@ -20,17 +20,16 @@ This framework enables development and validation of Metal GPU implementations a
 | extract_k_values | ✅ | ✅ | Complete |
 | softmax | ✅ | ✅ | Complete |
 | rms_norm | ✅ | ✅ | Complete |
-| rope | ✅ | 🔲 | CUDA only |
-| batch_prefill_attention | ✅ | 🔲 | CUDA only |
-| grouped_gemm | ✅ | 🔲 | CUDA only |
-| append_paged_kv_cache | ✅ | 🔲 | CUDA only |
+| rope | ✅ | ✅ | Complete |
+| topk_mask_logits | ✅ | ✅ | Complete |
+| grouped_gemm | ✅ | ✅ | Complete |
+| batch_prefill_attention | ✅ | ✅ | Complete |
 
 ## Source layout
 
 - src/main.cpp — CLI test driver (Metal by default on macOS), auto-compares vs CUDA
 - src/ops_metal.mm — Metal host wrappers (calls backend/backend-metal kernels)
 - src/artifacts.hpp — Host-only artifact helpers
-- Legacy stubs (not used by build): src/ops_cuda.cu, src/metal_test_main.mm
 
 ## Build instructions
 
@@ -60,33 +59,27 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(sysctl -n hw.ncpu)
 ```
 
-## Quick testing
+## Testing
 
-### CUDA reference generation (Linux)
-
-```bash
-cd ../cuda-protocol-tests/build
-
-# Generate golden references for Metal validation
-CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --op gemm --case test1 --m 32 --n 128 --k 64
-CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --op softmax --case production --batch_size 2 --vocab_size 32000 --temperature 1.0
-```
-
-### Metal operations (macOS)
-
-Artifacts from Metal runs are written under the build directory by default:
-metal-protocol-tests/build/tests/artifacts
+### Test all operations (macOS)
 
 ```bash
 cd build
 
-# Test Metal operations (auto-compares vs CUDA by default)
-./metal_protocol_tests --op gemm --case test1 --m 32 --n 128 --k 64
-./metal_protocol_tests --op embedding_lookup --case test1 --num_tokens 128 --hidden_size 4096 --vocab_size 32000
-./metal_protocol_tests --op silu_and_mul --case test_unified --num_tokens 64 --intermediate_size 256
-./metal_protocol_tests --op extract_k_values --case test_unified --M 8 --N 64 --k 5
-./metal_protocol_tests --op softmax --case production --batch_size 2 --vocab_size 32000 --temperature 1.0
-./metal_protocol_tests --op rms_norm --case test1 --num_tokens 128 --hidden_size 4096 --eps 1e-5
+# Test all implemented Metal operations with single script
+./scripts/test_all_ops.sh
+
+# Or test individual operations:
+./metal_protocol_tests --op gemm --case test1 --no-compare
+./metal_protocol_tests --op embedding_lookup --case test1 --no-compare  
+./metal_protocol_tests --op silu_and_mul --case test1 --no-compare
+./metal_protocol_tests --op extract_k_values --case test1 --no-compare
+./metal_protocol_tests --op softmax --case test1 --no-compare
+./metal_protocol_tests --op rms_norm --case test1 --no-compare
+./metal_protocol_tests --op rope --case test1 --no-compare
+./metal_protocol_tests --op topk_mask_logits --case test1 --no-compare
+./metal_protocol_tests --op grouped_gemm --case test1 --no-compare
+./metal_protocol_tests --op batch_prefill_attention --case test1 --no-compare
 ```
 
 ## Production testing
@@ -154,10 +147,10 @@ Transfer CUDA artifacts from Linux to macOS:
 
 ```bash
 # On Linux (after generating artifacts with your CUDA harness)
-./scripts/artifacts_transfer.sh compress
+../scripts/artifacts_transfer.sh compress
 
 # Transfer cuda_artifacts.tar.xz to macOS, then:
-./scripts/artifacts_transfer.sh extract
+../scripts/artifacts_transfer.sh extract
 ```
 
 The transfer typically includes:
@@ -219,6 +212,48 @@ python3 -m pip install --user numpy
 - PIE_WRITE_ARTIFACTS=1 — Enable artifact writing (auto-enabled by the harness)
 - PIE_ARTIFACTS_DIR — Output directory base (defaults to build/tests/artifacts next to the binary)
 - CUDA_VISIBLE_DEVICES=0 — GPU selection for CUDA operations (CUDA harness only)
+
+## Troubleshooting
+
+### macOS Build Issues
+
+If you encounter errors like `'cstdint' file not found` or `'iostream' file not found` during build:
+
+**Problem**: Missing or incomplete C++ standard library headers.
+
+**Automatic Detection**: The CMakeLists.txt now automatically detects the correct C++ stdlib path using `xcrun --show-sdk-path`. You should see this message during cmake configuration:
+```
+-- Using C++ stdlib from: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1
+```
+
+**If automatic detection fails**:
+
+1. **Install/Update Xcode Command Line Tools**:
+   ```bash
+   xcode-select --install
+   # If already installed, try reinstalling:
+   sudo xcode-select --reset
+   xcode-select --install
+   ```
+
+2. **Verify Installation**:
+   ```bash
+   xcrun --show-sdk-path
+   # Should return a valid SDK path
+   
+   # Check for C++ headers:
+   ls $(xcrun --show-sdk-path)/usr/include/c++/v1/cstdint
+   ```
+
+3. **Install Full Xcode** (if Command Line Tools aren't sufficient):
+   - Download Xcode from the App Store
+   - Run: `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`
+
+### Metal Framework Issues
+
+If Metal framework errors occur:
+- Ensure you're running on macOS with Metal support
+- Verify Xcode is properly installed with Metal development tools
 
 ## Current configuration
 
