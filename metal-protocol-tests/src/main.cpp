@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
             std::cout << "\\n=== Automatic Comparison with CUDA Reference ===" << std::endl;
 
             // Construct comparison command
-            std::string comparison_cmd = std::string("python3 ") + comparator_script;
+            std::string comparison_cmd = std::string("python ") + comparator_script;
             comparison_cmd += " --op " + op;
             comparison_cmd += " --case " + case_id;
             comparison_cmd += " --cuda-base " + args.cuda_artifacts_dir;

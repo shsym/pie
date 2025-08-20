@@ -697,17 +697,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
               << ", page_size=" << page_size << std::endl;
 
     // Try to load CUDA reference inputs if available to ensure apples-to-apples comparison
-    auto getenv_str = [](const char* name) -> std::string {
-        const char* v = std::getenv(name);
-        return v ? std::string(v) : std::string();
-    };
-    const std::string cuda_base_env = getenv_str("PIE_CUDA_ARTIFACTS_DIR");
-    const std::string case_env = getenv_str("PIE_CASE_ID").empty() ? case_id : getenv_str("PIE_CASE_ID");
-    const std::string op_env = getenv_str("PIE_OP").empty() ? std::string("batch_prefill_attention") : getenv_str("PIE_OP");
-    std::filesystem::path cuda_case_dir;
-    if (!cuda_base_env.empty()) {
-        cuda_case_dir = std::filesystem::path(cuda_base_env) / op_env / case_env;
-    }
+    std::filesystem::path cuda_case_dir = std::filesystem::path("metal-protocol-tests/tests/artifacts") / "batch_prefill_attention" / case_id;
 
     auto file_exists = [](const std::filesystem::path& p) -> bool {
         std::error_code ec; return std::filesystem::exists(p, ec);
@@ -752,7 +742,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
 
     // Try to load CUDA reference inputs if available, otherwise generate test data
     bool use_cuda_artifacts = false;
-    if (!cuda_base_env.empty()) {
+    if (file_exists(cuda_case_dir)) {
         auto q_input_p = cuda_case_dir / "q_input.bin";
         auto pkv_p = cuda_case_dir / "paged_k_cache.bin";
         auto pvv_p = cuda_case_dir / "paged_v_cache.bin";
@@ -792,18 +782,21 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
         // Generate synthetic test data for FlashInfer interface testing
         std::cout << "Generating synthetic test data for FlashInfer interface testing" << std::endl;
 
-        // Set up simple paging structure: 1 sequence with multiple pages
-        const int num_pages = 8;  // Use 8 pages for the test
+        // Set up paging structure to match CUDA reference expectations
+        // Calculate number of pages needed for kv_len tokens
+        const int num_pages = (cfg.kv_len + page_size - 1) / page_size;  // Round up
         qo_indptr = {0, num_tokens};
         kv_page_indptr = {0, num_pages};
         kv_page_indices.resize(num_pages);
         for (int i = 0; i < num_pages; ++i) {
             kv_page_indices[i] = i;
         }
-        kv_last_page_lens = {page_size};  // Last page is full
+        // Last page might be partially filled
+        const int last_page_len = cfg.kv_len - (num_pages - 1) * page_size;
+        kv_last_page_lens = {last_page_len};
 
         // Generate random test data using seed
-        std::mt19937 gen(seed);
+        std::mt19937_64 gen(seed);
         std::normal_distribution<float> dist(0.0f, 1.0f);
 
         // Generate q_input

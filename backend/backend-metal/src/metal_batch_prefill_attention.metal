@@ -18,28 +18,30 @@ kernel void batch_prefill_attention_unified_bf16_kernel(
     constant int& page_size [[buffer(10)]],
     constant float& scale [[buffer(11)]],
     uint3 tgid [[threadgroup_position_in_grid]],
-    uint3 tid [[thread_position_in_threadgroup]]
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint tid_in_tgp [[thread_index_in_threadgroup]]
 ) {
     uint qo_idx = tgid.x;
     if (qo_idx >= uint(num_qo)) return;
 
-    // Derive the sequence this qo belongs to from qo_indptr (assume single seq if trivial)
-    // For simplicity, map qo_idx to the first seq where qo_indptr[s] <= qo_idx < qo_indptr[s+1]
+    // Find which sequence this qo_idx belongs to by scanning qo_indptr
     int seq_id = 0;
-    int num_seqs = 0;
-    // We can't loop unknown length without explicit count; assume 1 seq if qo_indptr[1] == num_qo
-    // Minimal compatibility: treat entire qo range as one sequence
-    num_seqs = 1;
-    seq_id = 0;
+    // Scan through qo_indptr to find the sequence containing qo_idx
+    // qo_indptr[i] <= qo_idx < qo_indptr[i+1] means qo_idx belongs to sequence i
+    while (seq_id < 100 && qo_indptr[seq_id + 1] <= int(qo_idx)) { // safeguard against infinite loop
+        seq_id++;
+    }
 
+    // Get the KV page range for this sequence
     int kv_start = kv_page_indptr[seq_id];
     int kv_end = kv_page_indptr[seq_id + 1];
 
-    for (int d = int(tid.x); d < head_dim; d += 32) {
-        float out_val = 0.0f;
-        float sum_w = 0.0f;
+    // First pass: find maximum score for numerical stability (only thread 0)
+    threadgroup float shared_max_score;
 
-        // Accumulate over all pages and positions in a naive linearized way
+    if (tid_in_tgp == 0) {
+        float max_score = -INFINITY;
+
         for (int page_idx_pos = kv_start; page_idx_pos < kv_end; ++page_idx_pos) {
             int page_idx = kv_page_indices[page_idx_pos];
             int valid_len = kv_last_page_lens[seq_id];
@@ -51,7 +53,7 @@ kernel void batch_prefill_attention_unified_bf16_kernel(
             }
 
             for (int t = 0; t < loop_len; ++t) {
-                // Compute score = dot(q, k)
+                // Compute score = dot(q, k) * scale
                 float score = 0.0f;
                 for (int hd = 0; hd < head_dim; ++hd) {
                     float qv = float(q_input[qo_idx * head_dim + hd]);
@@ -59,8 +61,45 @@ kernel void batch_prefill_attention_unified_bf16_kernel(
                     score += qv * kv;
                 }
                 score *= scale;
-                float w = exp(score);
+                max_score = max(max_score, score);
+            }
+        }
+        shared_max_score = max_score;
+    }
+
+    // Synchronize all threads to ensure max_score is computed
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Second pass: compute attention output with numerical stability
+    for (int d = int(tid.x); d < head_dim; d += 32) {
+        float out_val = 0.0f;
+        float sum_w = 0.0f;
+
+        for (int page_idx_pos = kv_start; page_idx_pos < kv_end; ++page_idx_pos) {
+            int page_idx = kv_page_indices[page_idx_pos];
+            int valid_len = kv_last_page_lens[seq_id];
+            int loop_len = page_size;
+            // Last page may have shorter length
+            bool is_last = (page_idx_pos == kv_end - 1);
+            if (is_last && valid_len > 0) {
+                loop_len = valid_len;
+            }
+
+            for (int t = 0; t < loop_len; ++t) {
+                // Recompute score for this specific key token
+                float score = 0.0f;
+                for (int hd = 0; hd < head_dim; ++hd) {
+                    float qv = float(q_input[qo_idx * head_dim + hd]);
+                    float kv = float(paged_k_cache[page_idx * page_size * head_dim + t * head_dim + hd]);
+                    score += qv * kv;
+                }
+                score *= scale;
+
+                // Apply numerical stability by subtracting max_score
+                float stable_score = score - shared_max_score;
+                float w = exp(stable_score);
                 sum_w += w;
+
                 float vv = float(paged_v_cache[page_idx * page_size * head_dim + t * head_dim + d]);
                 out_val += w * vv;
             }
