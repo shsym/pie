@@ -4,13 +4,15 @@ Cross-platform testing harness for PIE Metal backend operations with CUDA golden
 
 ## Overview
 
-- macOS: Build and run the Metal harness to validate kernels
+General workflow follows these steps:
+
 - Linux: Generate CUDA golden references using the separate CUDA harness
-- Cross-platform: Transfer and compare artifacts between platforms
+- Cross-platform: Transfer CUDA artifacts to macOS
+- macOS: Build and run the Metal harness to validate against CUDA references
 
 ## Artifact preparation
 
-The sections below describe how to generate, transfer, structure, and validate CUDA artifacts. These are used as golden references for comparison on macOS.
+The sections below describe how to generate and transfer CUDA artifacts. These are used as golden references for comparison on macOS.
 
 ### Generate CUDA artifacts (Linux)
 
@@ -39,7 +41,7 @@ Quick generate (recommended): use the script to build and emit all common CUDA r
 GPU=0 CASE_ID=production bash cuda-protocol-tests/scripts/generate_cuda_artifacts.sh
 ```
 
-### Cross-platform transfer
+## Cross-platform transfer (Linux to macOS)
 
 Transfer CUDA artifacts from Linux to macOS using the helper script:
 
@@ -78,7 +80,9 @@ metal-protocol-tests/tests/artifacts/
    └── production/
 ```
 
-## Build (macOS)
+## Build and run Metal tests (macOS)
+
+### Build
 
 Requirements: Xcode with Metal support, CMake 3.23+
 
@@ -89,7 +93,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(sysctl -n hw.ncpu)
 ```
 
-### Build Errors
+#### Build Errors
 
 Dependency: numpy is required for comparison. On macOS:
 
@@ -105,7 +109,7 @@ sudo xcode-select --reset
 xcode-select --install
 ```
 
-## Metal Quick testing (macOS)
+### Quick testing
 
 From the `build` directory:
 
