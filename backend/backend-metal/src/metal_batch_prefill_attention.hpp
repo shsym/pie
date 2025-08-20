@@ -9,37 +9,26 @@
 namespace metal {
 namespace batch_prefill_attention {
 
-// Batch prefill attention with paged KV cache support
-void batch_prefill_attention_bf16(
-    const void* Q,                    // Query tensor: [num_tokens, num_query_heads, head_size]
-    const void* K,                    // Key tensor: [kv_len, num_kv_heads, head_size]
-    const void* V,                    // Value tensor: [kv_len, num_kv_heads, head_size]
-    const int32_t* indptr,           // Index pointer for attention lengths per sequence
-    const int32_t* indices,          // Token indices for each sequence
-    void* O,                         // Output tensor: [num_tokens, num_query_heads, head_size]
-    int num_tokens,
-    int num_query_heads,
-    int num_kv_heads,
-    int head_size,
-    int kv_len,
+// FlashInfer-style unified paged KV cache interface (bf16)
+// q_input: [num_qo, head_dim] (head_dim = num_query_heads * head_size)
+// paged_k_cache, paged_v_cache: [num_pages_total, page_size, head_dim]
+// qo_indptr: [num_seqs+1], kv_page_indptr: [num_seqs+1]
+// kv_page_indices: [total_pages_across_seqs]
+// kv_last_page_lens: [num_seqs]
+// output: [num_qo, head_dim]
+void batch_prefill_attention_unified_bf16(
+    const void* q_input,
+    const void* paged_k_cache,
+    const void* paged_v_cache,
+    const int32_t* qo_indptr,
+    const int32_t* kv_page_indptr,
+    const int32_t* kv_page_indices,
+    const int32_t* kv_last_page_lens,
+    void* output,
+    int num_qo,
+    int head_dim,
     int page_size,
-    float scale = 1.0f / sqrtf(64.0f)
-);
-
-void batch_prefill_attention_f32(
-    const void* Q,                    // Query tensor: [num_tokens, num_query_heads, head_size]
-    const void* K,                    // Key tensor: [kv_len, num_kv_heads, head_size]
-    const void* V,                    // Value tensor: [kv_len, num_kv_heads, head_size]
-    const int32_t* indptr,           // Index pointer for attention lengths per sequence
-    const int32_t* indices,          // Token indices for each sequence
-    void* O,                         // Output tensor: [num_tokens, num_query_heads, head_size]
-    int num_tokens,
-    int num_query_heads,
-    int num_kv_heads,
-    int head_size,
-    int kv_len,
-    int page_size,
-    float scale = 1.0f / sqrtf(64.0f)
+    float scale
 );
 
 } // namespace batch_prefill_attention

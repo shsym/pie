@@ -57,7 +57,7 @@ if(APPLE)
         OUTPUT_VARIABLE SDK_ROOT
         OUTPUT_STRIP_TRAILING_WHITESPACE
     )
-    
+
     # Check if C++ headers exist in the standard location
     set(CXX_STDLIB_PATH "${SDK_ROOT}/usr/include/c++/v1")
     if(EXISTS "${CXX_STDLIB_PATH}/cstdint")
@@ -90,8 +90,5 @@ target_link_libraries(metal_protocol_tests PRIVATE
     ${METAL_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
 )
-
-# Add Metal support compilation definition
-target_compile_definitions(metal_protocol_tests PRIVATE METAL_SUPPORT_ENABLED)
 
 # Metal shader files are loaded directly from backend/backend-metal/src/ using __FILE__ path resolution

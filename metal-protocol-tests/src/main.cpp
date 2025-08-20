@@ -1,5 +1,3 @@
-#ifdef METAL_SUPPORT_ENABLED
-
 #include "ops.hpp"
 #include "artifacts.hpp" // host-only artifact helpers for writing/reading artifacts
 
@@ -15,7 +13,7 @@ struct Args {
     std::string op;
     std::string case_id = "auto";
     bool auto_compare = true;           // Automatically compare with CUDA reference
-    std::string cuda_artifacts_dir = "../cuda-protocol-tests/tests/artifacts";  // CUDA reference directory
+    std::string cuda_artifacts_dir = "tests/artifacts";  // CUDA reference directory
     int num_tokens = 128;          // Realistic sequence length
     int hidden_size = 4096;        // Llama 7B hidden size
     int vocab_size = 32000;        // Llama vocab size
@@ -209,6 +207,13 @@ int main(int argc, char** argv) {
     std::filesystem::path exe_dir = exe_path.parent_path();
     std::filesystem::path comparator_script_path = (exe_dir / "../scripts/compare_artifacts.py").lexically_normal();
     const std::string comparator_script = comparator_script_path.string();
+
+        // Fix cuda_artifacts_dir to be absolute if it's still the default relative path
+        if (args.cuda_artifacts_dir == "tests/artifacts") {
+            std::filesystem::path default_cuda_artifacts_path = (exe_dir / "../tests/artifacts").lexically_normal();
+            args.cuda_artifacts_dir = default_cuda_artifacts_path.string();
+        }
+
         // Resolve a default artifacts base inside the build directory (next to the executable)
         // so runs don't spill artifacts into the repo root even if CWD changes.
         std::filesystem::path default_metal_artifacts_base_path = (exe_dir / "tests/artifacts").lexically_normal();
@@ -341,14 +346,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-
-#else // !METAL_SUPPORT_ENABLED
-
-#include <iostream>
-int main(int, char**) {
-    std::cerr << "Metal support is not enabled for this build.\n"
-                 "Build on macOS with Metal frameworks and ensure METAL_SUPPORT_ENABLED is defined by CMake." << std::endl;
-    return 1;
-}
-
-#endif // METAL_SUPPORT_ENABLED

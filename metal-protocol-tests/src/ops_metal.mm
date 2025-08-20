@@ -1,14 +1,15 @@
 // Metal GPU implementations that call into backend/backend-metal kernels
 // This allows metal-protocol-tests to test actual Metal GPU execution
 
-#ifdef METAL_SUPPORT_ENABLED
-
 #include "ops.hpp"
 #include <iostream>
 #include <vector>
 #include <sstream>
 #include <random>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <numeric>
 
 // Include Metal implementations from backend-metal
 #include "metal_gemm.hpp"
@@ -424,8 +425,8 @@ void run_rope_metal(const std::string& case_id, const RoPEConfig& cfg, uint64_t 
     const float rope_theta = cfg.rope_theta;
     const float rope_factor = cfg.rope_factor;
 
-    std::cout << "Running Metal RoPE: tokens=" << num_tokens << ", heads=" << num_heads 
-              << ", head_size=" << head_size << ", theta=" << rope_theta 
+    std::cout << "Running Metal RoPE: tokens=" << num_tokens << ", heads=" << num_heads
+              << ", head_size=" << head_size << ", theta=" << rope_theta
               << ", factor=" << rope_factor << std::endl;
 
     // Generate same test data as CUDA version would use
@@ -475,7 +476,7 @@ void run_rope_metal(const std::string& case_id, const RoPEConfig& cfg, uint64_t 
              << ", \"rope_high_frequency_factor\": " << cfg.rope_high_frequency_factor
              << ", \"max_position_embeddings\": " << cfg.max_position_embeddings << "},\n"
              << "\"dtype_map\": {\"input_qk\": \"bf16\", \"position_ids\": \"s32\"},\n"
-             << "\"shape_map\": {\"input_qk\": [" << num_tokens << ", " << num_heads << ", " << head_size 
+             << "\"shape_map\": {\"input_qk\": [" << num_tokens << ", " << num_heads << ", " << head_size
              << "], \"position_ids\": [" << num_tokens << "]}";
         artifacts::write_meta_json(dir, meta.str());
     }
@@ -491,7 +492,7 @@ void run_topk_mask_logits_metal(const std::string& case_id, const TopKMaskConfig
     const int vocab_size = cfg.vocab_size;
     const int k = cfg.k;
 
-    std::cout << "Running Metal Top-K Mask Logits: tokens=" << num_tokens << ", vocab=" << vocab_size 
+    std::cout << "Running Metal Top-K Mask Logits: tokens=" << num_tokens << ", vocab=" << vocab_size
               << ", k=" << k << std::endl;
 
     // Generate same test data as CUDA version
@@ -550,8 +551,8 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
     const bool transb = cfg.transb;
     const bool use_bias = cfg.use_bias;
 
-    std::cout << "Running Metal Grouped GEMM: groups=" << num_groups << ", m=" << m << ", n=" << n 
-              << ", k=" << k << ", transa=" << transa << ", transb=" << transb 
+    std::cout << "Running Metal Grouped GEMM: groups=" << num_groups << ", m=" << m << ", n=" << n
+              << ", k=" << k << ", transa=" << transa << ", transb=" << transb
               << ", use_bias=" << use_bias << std::endl;
 
     // Generate same test data as CUDA version
@@ -563,12 +564,12 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
     std::vector<std::vector<T>> B_matrices(num_groups);
     std::vector<std::vector<T>> C_matrices(num_groups);
     std::vector<std::vector<T>> bias_matrices(num_groups);
-    
+
     std::vector<void*> A_ptrs(num_groups);
     std::vector<void*> B_ptrs(num_groups);
     std::vector<void*> C_ptrs(num_groups);
     std::vector<void*> bias_ptrs(num_groups);
-    
+
     std::vector<int> m_array(num_groups, m);
     std::vector<int> n_array(num_groups, n);
     std::vector<int> k_array(num_groups, k);
@@ -581,7 +582,7 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
         for (auto& v : A_matrices[group]) v = float_to_bf16(dist(rng));
         A_ptrs[group] = A_matrices[group].data();
 
-        // B matrix size depends on transpose flag  
+        // B matrix size depends on transpose flag
         size_t B_size = static_cast<size_t>(transb ? n * k : k * n);
         B_matrices[group].resize(B_size);
         for (auto& v : B_matrices[group]) v = float_to_bf16(dist(rng));
@@ -621,11 +622,11 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
         // Save each group's matrices
         for (int group = 0; group < num_groups; ++group) {
             std::string group_suffix = "_group" + std::to_string(group);
-            
+
             artifacts::write_host_bin(dir, "A" + group_suffix, A_matrices[group].data(), A_matrices[group].size());
             artifacts::write_host_bin(dir, "B" + group_suffix, B_matrices[group].data(), B_matrices[group].size());
             artifacts::write_host_bin(dir, "C" + group_suffix, C_matrices[group].data(), C_matrices[group].size());
-            
+
             if (use_bias) {
                 artifacts::write_host_bin(dir, "bias" + group_suffix, bias_matrices[group].data(), bias_matrices[group].size());
             }
@@ -642,7 +643,7 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
              << ", \"transb\": " << (transb ? "true" : "false")
              << ", \"use_bias\": " << (use_bias ? "true" : "false") << "},\n"
              << "\"dtype_map\": {";
-        
+
         for (int group = 0; group < num_groups; ++group) {
             if (group > 0) meta << ", ";
             std::string suffix = "_group" + std::to_string(group);
@@ -651,27 +652,27 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
                 meta << ", \"bias" << suffix << "\": \"bf16\"";
             }
         }
-        
+
         meta << "},\n\"shape_map\": {";
-        
+
         for (int group = 0; group < num_groups; ++group) {
             if (group > 0) meta << ", ";
             std::string suffix = "_group" + std::to_string(group);
-            
+
             int A_dim0 = transa ? k : m;
             int A_dim1 = transa ? m : k;
             int B_dim0 = transb ? n : k;
             int B_dim1 = transb ? k : n;
-            
+
             meta << "\"A" << suffix << "\": [" << A_dim0 << ", " << A_dim1 << "], "
                  << "\"B" << suffix << "\": [" << B_dim0 << ", " << B_dim1 << "], "
                  << "\"C" << suffix << "\": [" << m << ", " << n << "]";
-            
+
             if (use_bias) {
                 meta << ", \"bias" << suffix << "\": [" << n << "]";
             }
         }
-        
+
         meta << "}";
         artifacts::write_meta_json(dir, meta.str());
     }
@@ -682,117 +683,201 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
 // Metal implementation of Batch Prefill Attention operation
 void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPrefillAttentionConfig& cfg, uint64_t seed) {
     using T = bfloat16_t;  // Metal host-side bfloat16
-    
-    const int num_tokens = cfg.num_tokens;
+
+    const int num_tokens = cfg.num_tokens;         // qo tokens
     const int num_query_heads = cfg.num_query_heads;
-    const int num_kv_heads = cfg.num_kv_heads;
     const int head_size = cfg.head_size;
-    const int kv_len = cfg.kv_len;
+    const int head_dim = num_query_heads * head_size;
     const int page_size = cfg.page_size;
-    
-    std::cout << "Running Metal Batch Prefill Attention: tokens=" << num_tokens 
-              << ", query_heads=" << num_query_heads 
-              << ", kv_heads=" << num_kv_heads 
-              << ", head_size=" << head_size 
-              << ", kv_len=" << kv_len 
+
+    std::cout << "Running Metal Batch Prefill Attention: tokens=" << num_tokens
+              << ", query_heads=" << num_query_heads
+              << ", head_size=" << head_size
+              << ", head_dim=" << head_dim
               << ", page_size=" << page_size << std::endl;
-    
-    // Initialize random number generator
-    std::mt19937 gen(seed);
-    std::normal_distribution<float> dist(0.0f, 0.1f);
-    
-    // Allocate input tensors
-    std::vector<T> Q(num_tokens * num_query_heads * head_size);
-    std::vector<T> K(kv_len * num_kv_heads * head_size);
-    std::vector<T> V(kv_len * num_kv_heads * head_size);
-    std::vector<T> O(num_tokens * num_query_heads * head_size);
-    
-    // Fill Q, K, V with random data
-    for (size_t i = 0; i < Q.size(); ++i) {
-        Q[i] = float_to_bf16(dist(gen));
+
+    // Try to load CUDA reference inputs if available to ensure apples-to-apples comparison
+    auto getenv_str = [](const char* name) -> std::string {
+        const char* v = std::getenv(name);
+        return v ? std::string(v) : std::string();
+    };
+    const std::string cuda_base_env = getenv_str("PIE_CUDA_ARTIFACTS_DIR");
+    const std::string case_env = getenv_str("PIE_CASE_ID").empty() ? case_id : getenv_str("PIE_CASE_ID");
+    const std::string op_env = getenv_str("PIE_OP").empty() ? std::string("batch_prefill_attention") : getenv_str("PIE_OP");
+    std::filesystem::path cuda_case_dir;
+    if (!cuda_base_env.empty()) {
+        cuda_case_dir = std::filesystem::path(cuda_base_env) / op_env / case_env;
     }
-    
-    for (size_t i = 0; i < K.size(); ++i) {
-        K[i] = float_to_bf16(dist(gen));
+
+    auto file_exists = [](const std::filesystem::path& p) -> bool {
+        std::error_code ec; return std::filesystem::exists(p, ec);
+    };
+    auto read_bytes = [](const std::filesystem::path& p) -> std::vector<uint8_t> {
+        std::ifstream ifs(p, std::ios::binary);
+        if (!ifs.is_open()) return {};
+        ifs.seekg(0, std::ios::end);
+        std::streamsize size = ifs.tellg();
+        ifs.seekg(0, std::ios::beg);
+        std::vector<uint8_t> buf(static_cast<size_t>(std::max<int64_t>(0, size)));
+        if (size > 0) ifs.read(reinterpret_cast<char*>(buf.data()), size);
+        return buf;
+    };
+    auto read_vec_s32 = [&](const std::filesystem::path& p) -> std::vector<int32_t> {
+        std::vector<uint8_t> bytes = read_bytes(p);
+        size_t n = bytes.size() / sizeof(int32_t);
+        std::vector<int32_t> v(n);
+        if (n) memcpy(v.data(), bytes.data(), n * sizeof(int32_t));
+        return v;
+    };
+    auto read_vec_bf16 = [&](const std::filesystem::path& p, size_t expected = 0) -> std::vector<T> {
+        std::vector<uint8_t> bytes = read_bytes(p);
+        size_t n = bytes.size() / sizeof(T);
+        if (expected && n != expected) {
+            std::cerr << "Warning: " << p << " element count mismatch; expected " << expected << ", got " << n << std::endl;
+        }
+        std::vector<T> v(n);
+        if (n) memcpy(v.data(), bytes.data(), n * sizeof(T));
+        return v;
+    };
+
+    // Allocate containers
+    std::vector<T> q_input(static_cast<size_t>(num_tokens) * head_dim);
+    std::vector<T> paged_k_cache;
+    std::vector<T> paged_v_cache;
+    std::vector<T> output(static_cast<size_t>(num_tokens) * head_dim);
+    std::vector<int32_t> qo_indptr{0, num_tokens};
+    std::vector<int32_t> kv_page_indptr;
+    std::vector<int32_t> kv_page_indices;
+    std::vector<int32_t> kv_last_page_lens;
+
+    // Try to load CUDA reference inputs if available, otherwise generate test data
+    bool use_cuda_artifacts = false;
+    if (!cuda_base_env.empty()) {
+        auto q_input_p = cuda_case_dir / "q_input.bin";
+        auto pkv_p = cuda_case_dir / "paged_k_cache.bin";
+        auto pvv_p = cuda_case_dir / "paged_v_cache.bin";
+        auto qo_indptr_p = cuda_case_dir / "qo_indptr.bin";
+        auto kv_page_indptr_p = cuda_case_dir / "kv_page_indptr.bin";
+        auto kv_page_indices_p = cuda_case_dir / "kv_page_indices.bin";
+        auto kv_last_page_lens_p = cuda_case_dir / "kv_last_page_lens.bin";
+
+        // Check if all required CUDA reference files exist
+        std::vector<std::filesystem::path> required_files = {
+            q_input_p, pkv_p, pvv_p, qo_indptr_p, kv_page_indptr_p, kv_page_indices_p, kv_last_page_lens_p
+        };
+
+        bool all_files_exist = true;
+        for (const auto& file : required_files) {
+            if (!file_exists(file)) {
+                all_files_exist = false;
+                break;
+            }
+        }
+
+        if (all_files_exist) {
+            // Load CUDA reference inputs
+            qo_indptr = read_vec_s32(qo_indptr_p);
+            kv_page_indptr = read_vec_s32(kv_page_indptr_p);
+            kv_page_indices = read_vec_s32(kv_page_indices_p);
+            kv_last_page_lens = read_vec_s32(kv_last_page_lens_p);
+            q_input = read_vec_bf16(q_input_p, static_cast<size_t>(num_tokens) * head_dim);
+            paged_k_cache = read_vec_bf16(pkv_p);
+            paged_v_cache = read_vec_bf16(pvv_p);
+            use_cuda_artifacts = true;
+            std::cout << "Loaded CUDA reference inputs from: " << cuda_case_dir << std::endl;
+        }
     }
-    
-    for (size_t i = 0; i < V.size(); ++i) {
-        V[i] = float_to_bf16(dist(gen));
+
+    if (!use_cuda_artifacts) {
+        // Generate synthetic test data for FlashInfer interface testing
+        std::cout << "Generating synthetic test data for FlashInfer interface testing" << std::endl;
+
+        // Set up simple paging structure: 1 sequence with multiple pages
+        const int num_pages = 8;  // Use 8 pages for the test
+        qo_indptr = {0, num_tokens};
+        kv_page_indptr = {0, num_pages};
+        kv_page_indices.resize(num_pages);
+        for (int i = 0; i < num_pages; ++i) {
+            kv_page_indices[i] = i;
+        }
+        kv_last_page_lens = {page_size};  // Last page is full
+
+        // Generate random test data using seed
+        std::mt19937 gen(seed);
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+
+        // Generate q_input
+        q_input.resize(static_cast<size_t>(num_tokens) * head_dim);
+        for (auto& val : q_input) {
+            val = static_cast<T>(dist(gen));
+        }
+
+        // Generate paged K and V caches
+        size_t cache_size = static_cast<size_t>(num_pages) * page_size * head_dim;
+        paged_k_cache.resize(cache_size);
+        paged_v_cache.resize(cache_size);
+        for (auto& val : paged_k_cache) {
+            val = static_cast<T>(dist(gen));
+        }
+        for (auto& val : paged_v_cache) {
+            val = static_cast<T>(dist(gen));
+        }
     }
-    
-    // Initialize output to zero
-    std::fill(O.begin(), O.end(), static_cast<T>(0));
-    
-    // Create simplified indptr and indices for testing
-    std::vector<int32_t> indptr(num_tokens + 1);
-    std::vector<int32_t> indices(num_tokens);
-    
-    for (int i = 0; i <= num_tokens; ++i) {
-        indptr[i] = i * kv_len / num_tokens; // Simplified: equal distribution
-    }
-    for (int i = 0; i < num_tokens; ++i) {
-        indices[i] = i;
-    }
-    
-    // Compute attention scale (typically 1/sqrt(head_size))
+    std::fill(output.begin(), output.end(), static_cast<T>(0));
+
     float scale = 1.0f / sqrtf(static_cast<float>(head_size));
-    
-    // Call Metal implementation
-    metal::batch_prefill_attention::batch_prefill_attention_bf16(
-        Q.data(), K.data(), V.data(),
-        indptr.data(), indices.data(),
-        O.data(),
-        num_tokens, num_query_heads, num_kv_heads, head_size, kv_len, page_size,
-        scale
+
+    // Call new unified Metal implementation
+    metal::batch_prefill_attention::batch_prefill_attention_unified_bf16(
+        q_input.data(),
+        paged_k_cache.data(),
+        paged_v_cache.data(),
+        qo_indptr.data(),
+        kv_page_indptr.data(),
+        kv_page_indices.data(),
+        kv_last_page_lens.data(),
+        output.data(),
+        num_tokens, head_dim, page_size, scale
     );
-    
-    // Write artifacts
+
+    // Write artifacts to match CUDA test_unified tensors
     if (artifacts::op_enabled("batch_prefill_attention")) {
         auto dir = artifacts::ensure_dir_for_case("batch_prefill_attention", case_id + "_metal");
-        
-        // Write input tensors
-        artifacts::write_host_bin(dir, "Q", Q.data(), Q.size());
-        artifacts::write_host_bin(dir, "K", K.data(), K.size());
-        artifacts::write_host_bin(dir, "V", V.data(), V.size());
-        
-        // Write output tensor
-        artifacts::write_host_bin(dir, "O", O.data(), O.size());
-        
-        // Write indices and pointers
-        artifacts::write_host_bin(dir, "indptr", indptr.data(), indptr.size());
-        artifacts::write_host_bin(dir, "indices", indices.data(), indices.size());
-    
-        // Write metadata
+
+        artifacts::write_host_bin(dir, "q_input", q_input.data(), q_input.size());
+        artifacts::write_host_bin(dir, "k_input", paged_k_cache.data(), paged_k_cache.size());
+        artifacts::write_host_bin(dir, "v_input", paged_v_cache.data(), paged_v_cache.size());
+        artifacts::write_host_bin(dir, "paged_k_cache", paged_k_cache.data(), paged_k_cache.size());
+        artifacts::write_host_bin(dir, "paged_v_cache", paged_v_cache.data(), paged_v_cache.size());
+        artifacts::write_host_bin(dir, "output", output.data(), output.size());
+        artifacts::write_host_bin(dir, "qo_indptr", qo_indptr.data(), qo_indptr.size());
+        artifacts::write_host_bin(dir, "kv_page_indptr", kv_page_indptr.data(), kv_page_indptr.size());
+        artifacts::write_host_bin(dir, "kv_page_indices", kv_page_indices.data(), kv_page_indices.size());
+        artifacts::write_host_bin(dir, "kv_last_page_lens", kv_last_page_lens.data(), kv_last_page_lens.size());
+
         std::ostringstream meta;
         meta << "\"version\": \"1\",\n"
              << "\"op\": \"batch_prefill_attention\",\n"
-             << "\"backend\": \"metal\",\n"
              << "\"case_id\": \"" << case_id << "\",\n"
-             << "\"config\": {"
-             << "\"num_tokens\": " << num_tokens << ", "
-             << "\"num_query_heads\": " << num_query_heads << ", "
-             << "\"num_kv_heads\": " << num_kv_heads << ", "
-             << "\"head_size\": " << head_size << ", "
-             << "\"kv_len\": " << kv_len << ", "
-             << "\"page_size\": " << page_size << ", "
-             << "\"scale\": " << scale
-             << "},\n"
-             << "\"dtype_map\": {\"Q\": \"bf16\", \"K\": \"bf16\", \"V\": \"bf16\", \"O\": \"bf16\", \"indptr\": \"s32\", \"indices\": \"s32\"},\n"
-             << "\"shape_map\": {"
-             << "\"Q\": [" << num_tokens << ", " << num_query_heads << ", " << head_size << "], "
-             << "\"K\": [" << kv_len << ", " << num_kv_heads << ", " << head_size << "], "
-             << "\"V\": [" << kv_len << ", " << num_kv_heads << ", " << head_size << "], "
-             << "\"O\": [" << num_tokens << ", " << num_query_heads << ", " << head_size << "], "
-             << "\"indptr\": [" << (num_tokens + 1) << "], "
-             << "\"indices\": [" << num_tokens << "]"
-             << "}";
-        
+             << "\"config\": {\"num_tokens\": " << num_tokens
+             << ", \"num_query_heads\": " << num_query_heads
+             << ", \"num_kv_heads\": " << cfg.num_kv_heads
+             << ", \"head_size\": " << head_size
+             << ", \"kv_len\": " << cfg.kv_len
+             << ", \"page_size\": " << page_size
+             << ", \"batch_size\": 1, \"num_pages\": " << kv_page_indices.size() << "},\n"
+             << "\"dtype_map\": {\"q_input\": \"bf16\", \"k_input\": \"bf16\", \"v_input\": \"bf16\", \"paged_k_cache\": \"bf16\", \"paged_v_cache\": \"bf16\", \"output\": \"bf16\", \"qo_indptr\": \"s32\", \"kv_page_indptr\": \"s32\", \"kv_page_indices\": \"s32\", \"kv_last_page_lens\": \"s32\"},\n"
+             << "\"shape_map\": {\"q_input\": [" << num_tokens << ", " << head_dim << "], "
+             << "\"k_input\": [" << (kv_page_indices.size() * page_size) << ", " << head_dim << "], "
+             << "\"v_input\": [" << (kv_page_indices.size() * page_size) << ", " << head_dim << "], "
+             << "\"paged_k_cache\": [" << kv_page_indices.size() << ", " << page_size << ", " << head_dim << "], "
+             << "\"paged_v_cache\": [" << kv_page_indices.size() << ", " << page_size << ", " << head_dim << "], "
+             << "\"output\": [" << num_tokens << ", " << head_dim << "], "
+             << "\"qo_indptr\": [2], \"kv_page_indptr\": [2], \"kv_page_indices\": [" << kv_page_indices.size() << "], \"kv_last_page_lens\": [1]}";
         artifacts::write_meta_json(dir, meta.str());
     }
-    
+
     std::cout << "Metal Batch Prefill Attention completed successfully" << std::endl;
 }
 
 } // namespace ops
-
-#endif // METAL_SUPPORT_ENABLED

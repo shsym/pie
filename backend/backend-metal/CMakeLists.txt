@@ -22,11 +22,11 @@ include_directories(src)
 # Metal libraries (define libraries first, then executables)
 
 # Metal GEMM library
-add_library(metal_gemm 
+add_library(metal_gemm
     src/metal_gemm.mm
 )
 
-target_link_libraries(metal_gemm 
+target_link_libraries(metal_gemm
     ${METAL_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
 )
@@ -36,11 +36,11 @@ set_target_properties(metal_gemm PROPERTIES
 )
 
 # Metal Softmax library
-add_library(metal_softmax 
+add_library(metal_softmax
     src/metal_softmax.mm
 )
 
-target_link_libraries(metal_softmax 
+target_link_libraries(metal_softmax
     ${METAL_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
 )
@@ -54,7 +54,7 @@ add_library(metal_embedding
     src/metal_embedding.mm
 )
 
-target_link_libraries(metal_embedding 
+target_link_libraries(metal_embedding
     ${METAL_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
 )
@@ -68,7 +68,7 @@ add_library(metal_silu_and_mul
     src/metal_silu_and_mul.mm
 )
 
-target_link_libraries(metal_silu_and_mul 
+target_link_libraries(metal_silu_and_mul
     ${METAL_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
 )
@@ -82,7 +82,7 @@ add_library(metal_extract_k_values
     src/metal_extract_k_values.mm
 )
 
-target_link_libraries(metal_extract_k_values 
+target_link_libraries(metal_extract_k_values
     ${METAL_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
 )
@@ -98,7 +98,7 @@ add_executable(final_test_softmax
     src/final_test_softmax.cpp
 )
 
-target_link_libraries(final_test_softmax 
+target_link_libraries(final_test_softmax
     metal_softmax
     ${METAL_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
@@ -132,5 +132,11 @@ configure_file(
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_extract_k_values.metal
     ${CMAKE_BINARY_DIR}/metal_extract_k_values.metal
+    COPYONLY
+)
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_batch_prefill_attention.metal
+    ${CMAKE_BINARY_DIR}/metal_batch_prefill_attention.metal
     COPYONLY
 )
