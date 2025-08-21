@@ -571,7 +571,7 @@ class Driver:
             output_embeds = self.lm.model.forward(
                 adapters=None,
                 adapter_indices=None,
-                #adapter_at_layer=self.adapter_at_layer,
+                # adapter_at_layer=self.adapter_at_layer,
                 input_embeds=input_embeds,
                 position_ids=pt_new_position_ids,
                 kv_cache_at_layer=self.kv_cache_at_layer,
@@ -677,7 +677,6 @@ class Driver:
         if cmd.adapter in self.adapters:
             adapter = self.adapters[cmd.adapter]
             if isinstance(adapter, CmaesAdapter):
-
                 print("Updating CmaesAdapter with:")
                 print("  rank:", adapter.rank)
                 print("  alpha:", adapter.alpha)
@@ -773,6 +772,10 @@ class Driver:
             seeds, device=self.device, dtype=torch.long
         )
 
+        # if all seeds are zero -> eval mode
+        if pt_seeds.sum() == 0:
+            pt_seeds = None
+
         pt_new_token_ids = torch.as_tensor(
             new_token_ids, device=self.device, dtype=torch.int32
         )
@@ -811,7 +814,7 @@ class Driver:
         # print('new_position_ids', new_position_ids)
 
         responses = []
-        #print(pt_seeds)
+        # print(pt_seeds)
 
         with torch.cuda.device(self.device):
 
@@ -857,8 +860,8 @@ class Driver:
                     )
                     responses.append(res)
 
-        #torch.cuda.synchronize()
-        #print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
+        # torch.cuda.synchronize()
+        # print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
 
         return BatchForwardTextResponse(
             items=responses

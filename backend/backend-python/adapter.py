@@ -277,17 +277,54 @@ class AdapterBuffer:
     (This class was provided as part of the original context.)
     """
     adapter: CmaesAdapter
-    seeds: torch.Tensor
+    seeds: torch.Tensor | None
 
     def __init__(self,
                  adapter: CmaesAdapter,
-                 seeds: torch.Tensor,
+                 seeds: torch.Tensor | None,
                  ):
         self.adapter = adapter
         self.seeds = seeds
 
     @torch.inference_mode()
     def compute_lora_delta(self, layer_idx: int, x: torch.Tensor) -> list[torch.Tensor]:
+        if self.seeds is None:
+            self.compute_lora_delta_no_noise(layer_idx, x)
+        else:
+            self.compute_lora_delta_with_noise(layer_idx, x)
+
+    @torch.inference_mode()
+    def compute_lora_delta_no_noise(self, layer_idx: int, x: torch.Tensor) -> list[torch.Tensor]:
+        rank = self.adapter.rank
+
+        # Short-hands
+        out_indptr = self.adapter.out_features_indptr  # built from [d_q, d_k, d_v]
+
+        Wd = self.adapter.qkv_down_weight[layer_idx]
+        Wu = self.adapter.qkv_up_weight[layer_idx]  # (rank, d_q+d_k+d_v)
+
+        qkv_down = x @ Wd
+        d_q, d_k, d_v = torch.split(qkv_down, [rank, rank, rank], dim=-1)
+
+        Wu_q = Wu[:, out_indptr[0]:out_indptr[1]]  # (rank, d_q)
+        Wu_k = Wu[:, out_indptr[1]:out_indptr[2]]  # (rank, d_k)
+        Wu_v = Wu[:, out_indptr[2]:out_indptr[3]]  # (rank, d_v)
+
+        u_q = d_q @ Wu_q
+        u_k = d_k @ Wu_k
+        u_v = d_v @ Wu_v
+
+        # ===== 3) Combine mean + noise =====
+        scaling = self.adapter.alpha / float(rank)
+
+        q_final = scaling * u_q
+        k_final = scaling * u_k
+        v_final = scaling * u_v
+
+        return [q_final, k_final, v_final]
+
+    @torch.inference_mode()
+    def compute_lora_delta_with_noise(self, layer_idx: int, x: torch.Tensor) -> list[torch.Tensor]:
         assert x.shape[0] == self.seeds.shape[0], "Batch size must match seeds."
         rank = self.adapter.rank
 
