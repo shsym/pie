@@ -4,7 +4,7 @@
 
 set -e
 
-CASE_ID="auto"
+CASE_ID=""
 EXTRA_FLAGS=""
 
 # Parse command line arguments
@@ -26,8 +26,25 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Resolve paths relative to this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${SCRIPT_DIR}/.."
+BIN="${PROJECT_ROOT}/build/metal_protocol_tests"
+# Fallbacks if using multi-config generators (e.g., Xcode) or different build dir layout
+if [[ ! -x "$BIN" ]]; then
+    if [[ -x "${PROJECT_ROOT}/build/Release/metal_protocol_tests" ]]; then
+        BIN="${PROJECT_ROOT}/build/Release/metal_protocol_tests"
+    elif [[ -x "${PROJECT_ROOT}/metal_protocol_tests" ]]; then
+        BIN="${PROJECT_ROOT}/metal_protocol_tests"
+    fi
+fi
+
 echo "=== Testing All Metal Protocol Operations ==="
-echo "Case ID: $CASE_ID"
+if [[ -n "$CASE_ID" ]]; then
+    echo "Case ID: $CASE_ID"
+else
+    echo "Case: auto-select"
+fi
 if [[ -n "$EXTRA_FLAGS" ]]; then
     echo "Mode: Testing only (no comparison)"
 else
@@ -56,7 +73,20 @@ for op_cmd in "${operations[@]}"; do
     op_name=$(echo $op_cmd | cut -d' ' -f1)
     echo -n "🔄 Testing $op_name... "
     
-    if ./metal_protocol_tests --op $op_cmd --case $CASE_ID $EXTRA_FLAGS >/dev/null 2>&1; then
+    # Build command with optional --case only when explicitly provided
+    CMD=("$BIN" --op)
+    # Split op command into args safely
+    read -r -a OP_ARGS <<< "$op_cmd"
+    CMD+=("${OP_ARGS[@]}")
+    if [[ -n "$CASE_ID" ]]; then
+        CMD+=(--case "$CASE_ID")
+    fi
+    if [[ -n "$EXTRA_FLAGS" ]]; then
+        read -r -a EXTRA_ARR <<< "$EXTRA_FLAGS"
+        CMD+=("${EXTRA_ARR[@]}")
+    fi
+
+    if "${CMD[@]}" >/dev/null 2>&1; then
         echo "✅ PASS"
         ((passed++))
     else

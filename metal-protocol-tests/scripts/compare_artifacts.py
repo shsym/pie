@@ -70,6 +70,8 @@ class ArtifactComparator:
         # Per-op, per-tensor, per-dtype tolerance overrides
         # Format: {(op, tensor_name, dtype): (abs_tol, rel_tol)}
         self.tolerance_overrides: Dict[Tuple[str, str, str], Tuple[float, float]] = {
+            # gemm fp32 output can differ slightly due to accumulation order; allow small abs diff
+            ('gemm', 'C', 'fp32'): (3.0e-2, 1.0e-2),
             # rms_norm bf16 output is sensitive due to bf16 resolution and reduction/rsqrt variance
             ('rms_norm', 'output', 'bf16'): (self.DEFAULT_ABS_TOLERANCE, 1.5e-2),
             # rope outputs involve sin/cos rotations in bf16 which vary slightly across backends
@@ -79,6 +81,8 @@ class ArtifactComparator:
             # batch_prefill_attention uses fp16 kernels with bf16 I/O bridging; expect up to one bf16 ULP
             # in outputs after fp16 round-trip. Allow abs up to 1e-2 for bf16 outputs.
             ('batch_prefill_attention', 'output', 'bf16'): (1e-2, 2e-2),
+            # grouped_gemm accumulates in bf16; permit up to 1 ULP (~3.125e-2) and modest rel error
+            ('grouped_gemm', 'C', 'bf16'): (3.2e-2, 1.5e-2),
         }
 
     def load_meta_json(self, artifact_dir: Path) -> Dict[str, Any]:

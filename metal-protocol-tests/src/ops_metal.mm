@@ -141,7 +141,7 @@ void print_vec_stats(const std::string& name, const std::vector<T>& vec, size_t 
 
 // Metal implementation of GEMM operation
 void run_gemm_metal(const std::string& case_id, const GemmConfig& cfg, uint64_t seed) {
-    using T = bfloat16_t;  // Metal host-side bfloat16
+    using T = bfloat16_t;  // Metal host-side bfloat16 for kernel IO
 
     const int m = cfg.m;
     const int n = cfg.n;
@@ -149,61 +149,179 @@ void run_gemm_metal(const std::string& case_id, const GemmConfig& cfg, uint64_t 
 
     std::cout << "Running Metal GEMM: m=" << m << ", n=" << n << ", k=" << k << std::endl;
 
-    // Generate same test data as CUDA version
-    std::mt19937_64 rng(seed);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-
-    std::vector<T> h_A(static_cast<size_t>(m) * k);
-    std::vector<T> h_B(static_cast<size_t>(k) * n);
-    std::vector<T> h_C(static_cast<size_t>(m) * n, 0);
-
-    for (auto& v : h_A) v = float_to_bf16(dist(rng));
-    // Initialize B with layout matching transb flag and CUDA artifact convention
-    // If transb=true, B is stored as [n, k] row-major (so op uses B^T)
-    // If transb=false, B is stored as [k, n] row-major
-    if (cfg.transb) {
-        // rows = n, cols = k, index = row * k + col
-        for (int row = 0; row < n; ++row) {
-            for (int col = 0; col < k; ++col) {
-                h_B[static_cast<size_t>(row) * k + col] = float_to_bf16(dist(rng));
-            }
-        }
+    // Try to load CUDA reference inputs A/B to guarantee apples-to-apples comparison
+    // Determine CUDA artifacts path
+    std::filesystem::path cuda_base_dir;
+    if (const char* envp = std::getenv("PIE_CUDA_ARTIFACTS_DIR")) {
+        cuda_base_dir = std::filesystem::path(envp);
     } else {
-        // rows = k, cols = n, index = row * n + col
-        for (int row = 0; row < k; ++row) {
-            for (int col = 0; col < n; ++col) {
-                h_B[static_cast<size_t>(row) * n + col] = float_to_bf16(dist(rng));
+        std::filesystem::path this_file(__FILE__);
+        cuda_base_dir = this_file.parent_path().parent_path() / "tests" / "artifacts";
+    }
+    auto cuda_case_dir = cuda_base_dir / "gemm" / case_id;
+
+    auto file_exists = [](const std::filesystem::path& p) -> bool {
+        std::error_code ec; return std::filesystem::exists(p, ec);
+    };
+    auto read_bytes = [](const std::filesystem::path& p) -> std::vector<uint8_t> {
+        std::ifstream ifs(p, std::ios::binary);
+        if (!ifs.is_open()) return {};
+        ifs.seekg(0, std::ios::end);
+        std::streamsize size = ifs.tellg();
+        ifs.seekg(0, std::ios::beg);
+        std::vector<uint8_t> buf(static_cast<size_t>(std::max<int64_t>(0, size)));
+        if (size > 0) ifs.read(reinterpret_cast<char*>(buf.data()), size);
+        return buf;
+    };
+    auto read_vec_bf16 = [&](const std::filesystem::path& p, size_t expected = 0) -> std::vector<T> {
+        std::vector<uint8_t> bytes = read_bytes(p);
+        size_t n_el = bytes.size() / sizeof(T);
+        if (expected && n_el != expected) {
+            std::cerr << "Warning: " << p << " element count mismatch; expected " << expected << ", got " << n_el << std::endl;
+        }
+        std::vector<T> v(n_el);
+        if (n_el) memcpy(v.data(), bytes.data(), n_el * sizeof(T));
+        return v;
+    };
+    auto read_vec_fp32 = [&](const std::filesystem::path& p, size_t expected = 0) -> std::vector<float> {
+        std::vector<uint8_t> bytes = read_bytes(p);
+        size_t n_el = bytes.size() / sizeof(float);
+        if (expected && n_el != expected) {
+            std::cerr << "Warning: " << p << " element count mismatch; expected " << expected << ", got " << n_el << std::endl;
+        }
+        std::vector<float> v(n_el);
+        if (n_el) memcpy(v.data(), bytes.data(), n_el * sizeof(float));
+        return v;
+    };
+
+    // Heuristic: detect CUDA dtype (fp32 vs bf16) by scanning meta.json text
+    bool cuda_ref_fp32 = false;
+    try {
+        auto meta_p = cuda_case_dir / "meta.json";
+        if (file_exists(meta_p)) {
+            std::ifstream fin(meta_p);
+            std::string meta((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+            if (meta.find("\"fp32\"") != std::string::npos || meta.find("\"float32\"") != std::string::npos) cuda_ref_fp32 = true;
+        }
+    } catch (...) {}
+
+    // Prepare host buffers
+    std::vector<T> h_A_bf16, h_B_bf16, h_C_bf16(static_cast<size_t>(m) * n, 0);
+    std::vector<float> A_fp32_in, B_fp32_in, C_fp32_out, Bias_fp32_in;
+
+    bool loaded_cuda_inputs = false;
+    if (file_exists(cuda_case_dir / "A.bin") && file_exists(cuda_case_dir / "B.bin")) {
+        loaded_cuda_inputs = true;
+        if (cuda_ref_fp32) {
+            A_fp32_in = read_vec_fp32(cuda_case_dir / "A.bin", static_cast<size_t>(cfg.transa ? k * m : m * k));
+            B_fp32_in = read_vec_fp32(cuda_case_dir / "B.bin", static_cast<size_t>(cfg.transb ? n * k : k * n));
+            // Convert to bf16 for kernel
+            h_A_bf16.resize(A_fp32_in.size());
+            h_B_bf16.resize(B_fp32_in.size());
+            for (size_t i = 0; i < A_fp32_in.size(); ++i) h_A_bf16[i] = float_to_bf16(A_fp32_in[i]);
+            for (size_t i = 0; i < B_fp32_in.size(); ++i) h_B_bf16[i] = float_to_bf16(B_fp32_in[i]);
+            // Optional bias for fp32 reference
+            if (cfg.use_bias && file_exists(cuda_case_dir / "bias.bin")) {
+                Bias_fp32_in = read_vec_fp32(cuda_case_dir / "bias.bin", static_cast<size_t>(n));
             }
+        } else {
+            h_A_bf16 = read_vec_bf16(cuda_case_dir / "A.bin", static_cast<size_t>(cfg.transa ? k * m : m * k));
+            h_B_bf16 = read_vec_bf16(cuda_case_dir / "B.bin", static_cast<size_t>(cfg.transb ? n * k : k * n));
         }
     }
 
-    // Call Metal GEMM implementation
-    // Initialize Metal GEMM once
-    if (!initialize_metal_gemm()) {
-        throw std::runtime_error("Failed to initialize Metal GEMM");
+    if (!loaded_cuda_inputs) {
+        // Fallback: random inputs (won't match CUDA values)
+        std::mt19937_64 rng(seed);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        h_A_bf16.resize(static_cast<size_t>(m) * k);
+        h_B_bf16.resize(static_cast<size_t>(k) * n);
+        for (auto& v : h_A_bf16) v = float_to_bf16(dist(rng));
+        if (cfg.transb) {
+            for (int row = 0; row < n; ++row)
+                for (int col = 0; col < k; ++col)
+                    h_B_bf16[static_cast<size_t>(row) * k + col] = float_to_bf16(dist(rng));
+        } else {
+            for (int row = 0; row < k; ++row)
+                for (int col = 0; col < n; ++col)
+                    h_B_bf16[static_cast<size_t>(row) * n + col] = float_to_bf16(dist(rng));
+        }
     }
-    // Note: current backend-metal API ignores device/queue parameters and uses internal globals
-    metal_gemm_bfloat16(
-        nil /*device*/, nil /*queue*/,
-        h_A.data(), h_B.data(), nullptr /*bias*/, h_C.data(),
-        m, n, k,
-        nullptr /*workspace*/, 0 /*workspace_size*/,
-        cfg.transa, cfg.transb
-    );
 
-    // Write artifacts for comparison with CUDA
+    // Compute C: prefer fp32 path if CUDA reference is fp32 and inputs loaded; else use bf16 Metal kernel
+    if (cuda_ref_fp32 && loaded_cuda_inputs) {
+        // Use float32 grouped GEMM path (CPU fallback in backend) for apples-to-apples with CUDA fp32
+        std::vector<float> C_fp32(static_cast<size_t>(m) * n, 0.0f);
+        const float* A_ptr = A_fp32_in.data();
+        const float* B_ptr = B_fp32_in.data();
+        float* C_ptr = C_fp32.data();
+        const float* bias_ptr = (Bias_fp32_in.empty() ? nullptr : Bias_fp32_in.data());
+        int m_arr[1] = { m };
+        int n_arr[1] = { n };
+        int k_arr[1] = { k };
+        // Only pass bias array when bias exists; otherwise pass nullptr to avoid enabling has_bias
+        const float* const* bias_arg = bias_ptr ? &bias_ptr : nullptr;
+        int status = metal_grouped_gemm_float32(
+            &A_ptr, &B_ptr, &C_ptr,
+            bias_arg,
+            m_arr, n_arr, k_arr,
+            1, cfg.transa, cfg.transb
+        );
+        if (status != 0) {
+            throw std::runtime_error("float32 grouped_gemm path failed with status " + std::to_string(status));
+        }
+        // Convert to bf16 for potential further uses (not required, but keeps h_C_bf16 sized)
+        for (size_t i = 0; i < h_C_bf16.size(); ++i) h_C_bf16[i] = float_to_bf16(C_fp32[i]);
+        C_fp32_out = std::move(C_fp32);
+    } else {
+        // Initialize and run Metal GEMM (bf16 kernel)
+        if (!initialize_metal_gemm()) {
+            throw std::runtime_error("Failed to initialize Metal GEMM");
+        }
+        metal_gemm_bfloat16(
+            nullptr /*device*/, nullptr /*queue*/,
+            h_A_bf16.data(), h_B_bf16.data(), nullptr /*bias*/, h_C_bf16.data(),
+            m, n, k,
+            nullptr /*workspace*/, 0 /*workspace_size*/,
+            cfg.transa, cfg.transb
+        );
+    }
+
+    // Write artifacts matching CUDA dtype and shapes
     if (artifacts::op_enabled("gemm")) {
         auto dir = artifacts::ensure_dir_for_case("gemm", case_id + "_metal");
 
-        artifacts::write_host_bin(dir, "A", h_A.data(), h_A.size());
-        artifacts::write_host_bin(dir, "B", h_B.data(), h_B.size());
-        artifacts::write_host_bin(dir, "C", h_C.data(), h_C.size());
+        const int A_dim0 = cfg.transa ? k : m;
+        const int A_dim1 = cfg.transa ? m : k;
+        const int B_dim0 = cfg.transb ? n : k;
+        const int B_dim1 = cfg.transb ? k : n;
 
-    std::ostringstream meta;
-    const int A_dim0 = cfg.transa ? k : m;
-    const int A_dim1 = cfg.transa ? m : k;
-    const int B_dim0 = cfg.transb ? n : k;
-    const int B_dim1 = cfg.transb ? k : n;
+        if (cuda_ref_fp32) {
+            // Inputs: write exact CUDA fp32 copies when available; otherwise, convert our bf16 to fp32
+            if (!A_fp32_in.empty() && !B_fp32_in.empty()) {
+                artifacts::write_vector_bin(dir, "A", A_fp32_in);
+                artifacts::write_vector_bin(dir, "B", B_fp32_in);
+            } else {
+                std::vector<float> A_conv(h_A_bf16.size()), B_conv(h_B_bf16.size());
+                for (size_t i = 0; i < h_A_bf16.size(); ++i) A_conv[i] = bf16_to_float(h_A_bf16[i]);
+                for (size_t i = 0; i < h_B_bf16.size(); ++i) B_conv[i] = bf16_to_float(h_B_bf16[i]);
+                artifacts::write_vector_bin(dir, "A", A_conv);
+                artifacts::write_vector_bin(dir, "B", B_conv);
+            }
+            // Output: if computed in fp32 path, we already have C_fp32_out; otherwise, convert bf16 result
+            if (C_fp32_out.empty()) {
+                C_fp32_out.resize(h_C_bf16.size());
+                for (size_t i = 0; i < h_C_bf16.size(); ++i) C_fp32_out[i] = bf16_to_float(h_C_bf16[i]);
+            }
+            artifacts::write_vector_bin(dir, "C", C_fp32_out);
+        } else {
+            // bf16 path
+            artifacts::write_host_bin(dir, "A", h_A_bf16.data(), h_A_bf16.size());
+            artifacts::write_host_bin(dir, "B", h_B_bf16.data(), h_B_bf16.size());
+            artifacts::write_host_bin(dir, "C", h_C_bf16.data(), h_C_bf16.size());
+        }
+
+        std::ostringstream meta;
         meta << "\"version\": \"1\",\n"
              << "\"op\": \"gemm\",\n"
              << "\"backend\": \"metal\",\n"
@@ -212,8 +330,8 @@ void run_gemm_metal(const std::string& case_id, const GemmConfig& cfg, uint64_t 
              << ", \"transa\": " << (cfg.transa ? "true" : "false")
              << ", \"transb\": " << (cfg.transb ? "true" : "false")
              << ", \"use_bias\": " << (cfg.use_bias ? "true" : "false") << "},\n"
-         << "\"dtype_map\": {\"A\": \"bf16\", \"B\": \"bf16\", \"C\": \"bf16\"},\n"
-         << "\"shape_map\": {\"A\": [" << A_dim0 << ", " << A_dim1 << "], \"B\": [" << B_dim0 << ", " << B_dim1 << "], \"C\": [" << m << ", " << n << "]}";
+             << "\"dtype_map\": {\"A\": \"" << (cuda_ref_fp32 ? "fp32" : "bf16") << "\", \"B\": \"" << (cuda_ref_fp32 ? "fp32" : "bf16") << "\", \"C\": \"" << (cuda_ref_fp32 ? "fp32" : "bf16") << "\"},\n"
+             << "\"shape_map\": {\"A\": [" << A_dim0 << ", " << A_dim1 << "], \"B\": [" << B_dim0 << ", " << B_dim1 << "], \"C\": [" << m << ", " << n << "]}";
         artifacts::write_meta_json(dir, meta.str());
     }
 
@@ -680,16 +798,36 @@ void run_topk_mask_logits_metal(const std::string& case_id, const TopKMaskConfig
     std::cout << "Running Metal Top-K Mask Logits: tokens=" << num_tokens << ", vocab=" << vocab_size
               << ", k=" << k << std::endl;
 
-    // Generate same test data as CUDA version
-    std::mt19937_64 rng(seed);
-    std::uniform_real_distribution<float> dist(-5.0f, 5.0f);  // Reasonable logit range
-
-    // Input logits [num_tokens, vocab_size]
+    // Try to load CUDA reference input logits for apples-to-apples comparison
     std::vector<T> h_logits(static_cast<size_t>(num_tokens) * vocab_size);
-    for (auto& v : h_logits) v = dist(rng);
-
-    // Make a copy for comparison (since operation is in-place)
-    std::vector<T> h_original_logits = h_logits;
+    std::vector<T> h_original_logits;
+    {
+        std::filesystem::path cuda_base_dir;
+        if (const char* envp = std::getenv("PIE_CUDA_ARTIFACTS_DIR")) {
+            cuda_base_dir = std::filesystem::path(envp);
+        } else {
+            std::filesystem::path this_file(__FILE__);
+            cuda_base_dir = this_file.parent_path().parent_path() / "tests" / "artifacts";
+        }
+        auto cuda_case_dir = cuda_base_dir / "topk_mask_logits" / case_id;
+        auto p = cuda_case_dir / "input_logits.bin";
+        std::error_code ec;
+        if (std::filesystem::exists(p, ec)) {
+            std::ifstream ifs(p, std::ios::binary);
+            ifs.seekg(0, std::ios::end);
+            size_t bytes = static_cast<size_t>(ifs.tellg());
+            ifs.seekg(0, std::ios::beg);
+            h_original_logits.resize(bytes / sizeof(float));
+            if (bytes) ifs.read(reinterpret_cast<char*>(h_original_logits.data()), bytes);
+            h_logits = h_original_logits;
+        } else {
+            // Generate same test data as CUDA version expectations
+            std::mt19937_64 rng(seed);
+            std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
+            for (auto& v : h_logits) v = dist(rng);
+            h_original_logits = h_logits;
+        }
+    }
 
     // Call Metal Top-K mask implementation (in-place operation)
     int result = metal_topk_mask_logits_float32(
@@ -705,7 +843,8 @@ void run_topk_mask_logits_metal(const std::string& case_id, const TopKMaskConfig
         auto dir = artifacts::ensure_dir_for_case("topk_mask_logits", case_id + "_metal");
 
         artifacts::write_host_bin(dir, "input_logits", h_original_logits.data(), h_original_logits.size());
-        artifacts::write_host_bin(dir, "output_logits", h_logits.data(), h_logits.size());
+        // Match CUDA naming: masked logits after operation
+        artifacts::write_host_bin(dir, "masked_logits", h_logits.data(), h_logits.size());
 
         std::ostringstream meta;
         meta << "\"version\": \"1\",\n"
@@ -715,9 +854,9 @@ void run_topk_mask_logits_metal(const std::string& case_id, const TopKMaskConfig
              << "\"config\": {\"num_tokens\": " << num_tokens
              << ", \"vocab_size\": " << vocab_size
              << ", \"k\": " << k << "},\n"
-             << "\"dtype_map\": {\"input_logits\": \"fp32\", \"output_logits\": \"fp32\"},\n"
+             << "\"dtype_map\": {\"input_logits\": \"fp32\", \"masked_logits\": \"fp32\"},\n"
              << "\"shape_map\": {\"input_logits\": [" << num_tokens << ", " << vocab_size
-             << "], \"output_logits\": [" << num_tokens << ", " << vocab_size << "]}";
+             << "], \"masked_logits\": [" << num_tokens << ", " << vocab_size << "]}";
         artifacts::write_meta_json(dir, meta.str());
     }
 
@@ -740,10 +879,6 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
               << ", k=" << k << ", transa=" << transa << ", transb=" << transb
               << ", use_bias=" << use_bias << std::endl;
 
-    // Generate same test data as CUDA version
-    std::mt19937_64 rng(seed);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-
     // Create arrays to hold matrix data for each group
     std::vector<std::vector<T>> A_matrices(num_groups);
     std::vector<std::vector<T>> B_matrices(num_groups);
@@ -759,33 +894,101 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
     std::vector<int> n_array(num_groups, n);
     std::vector<int> k_array(num_groups, k);
 
-    // Initialize matrices for each group
-    for (int group = 0; group < num_groups; ++group) {
-        // A matrix size depends on transpose flag
-        size_t A_size = static_cast<size_t>(transa ? k * m : m * k);
-        A_matrices[group].resize(A_size);
-        for (auto& v : A_matrices[group]) v = float_to_bf16(dist(rng));
-        A_ptrs[group] = A_matrices[group].data();
+    // Attempt to load CUDA reference inputs for apples-to-apples comparison
+    auto file_exists = [](const std::filesystem::path& p) -> bool {
+        std::error_code ec; return std::filesystem::exists(p, ec);
+    };
+    auto read_bytes = [](const std::filesystem::path& p) -> std::vector<uint8_t> {
+        std::ifstream ifs(p, std::ios::binary);
+        if (!ifs.is_open()) return {};
+        ifs.seekg(0, std::ios::end);
+        std::streamsize size = ifs.tellg();
+        ifs.seekg(0, std::ios::beg);
+        std::vector<uint8_t> buf(static_cast<size_t>(std::max<int64_t>(0, size)));
+        if (size > 0) ifs.read(reinterpret_cast<char*>(buf.data()), size);
+        return buf;
+    };
 
-        // B matrix size depends on transpose flag
-        size_t B_size = static_cast<size_t>(transb ? n * k : k * n);
-        B_matrices[group].resize(B_size);
-        for (auto& v : B_matrices[group]) v = float_to_bf16(dist(rng));
-        B_ptrs[group] = B_matrices[group].data();
+    bool loaded_cuda_inputs = false;
+    std::filesystem::path cuda_base_dir;
+    if (const char* envp = std::getenv("PIE_CUDA_ARTIFACTS_DIR")) {
+        cuda_base_dir = std::filesystem::path(envp);
+    } else {
+        std::filesystem::path this_file(__FILE__);
+        cuda_base_dir = this_file.parent_path().parent_path() / "tests" / "artifacts";
+    }
+    auto cuda_case_dir = cuda_base_dir / "grouped_gemm" / case_id;
 
-        // C matrix (output)
-        size_t C_size = static_cast<size_t>(m) * n;
-        C_matrices[group].resize(C_size, 0);
-        C_ptrs[group] = C_matrices[group].data();
+    const size_t A_elems_per_group = static_cast<size_t>(transa ? (k * m) : (m * k));
+    const size_t B_elems_per_group = static_cast<size_t>(transb ? (n * k) : (k * n));
+    const size_t C_elems_per_group = static_cast<size_t>(m) * n;
 
-        // Bias vector (optional)
-        if (use_bias) {
-            bias_matrices[group].resize(n);
-            for (auto& v : bias_matrices[group]) v = float_to_bf16(dist(rng));
-            bias_ptrs[group] = bias_matrices[group].data();
+    if (file_exists(cuda_case_dir / "A.bin") && file_exists(cuda_case_dir / "B.bin")) {
+        // Read flattened bf16 tensors and split into groups
+        std::vector<uint8_t> A_bytes = read_bytes(cuda_case_dir / "A.bin");
+        std::vector<uint8_t> B_bytes = read_bytes(cuda_case_dir / "B.bin");
+        size_t A_elems = A_bytes.size() / sizeof(T);
+        size_t B_elems = B_bytes.size() / sizeof(T);
+        if (A_elems == static_cast<size_t>(num_groups) * A_elems_per_group &&
+            B_elems == static_cast<size_t>(num_groups) * B_elems_per_group) {
+            const T* A_flat = reinterpret_cast<const T*>(A_bytes.data());
+            const T* B_flat = reinterpret_cast<const T*>(B_bytes.data());
+            for (int g = 0; g < num_groups; ++g) {
+                A_matrices[g].assign(A_flat + g * A_elems_per_group, A_flat + (g + 1) * A_elems_per_group);
+                B_matrices[g].assign(B_flat + g * B_elems_per_group, B_flat + (g + 1) * B_elems_per_group);
+                A_ptrs[g] = A_matrices[g].data();
+                B_ptrs[g] = B_matrices[g].data();
+            }
+            loaded_cuda_inputs = true;
+            std::cout << "✅ Loaded CUDA reference A/B for grouped_gemm from: " << cuda_case_dir << std::endl;
         } else {
-            bias_ptrs[group] = nullptr;
+            std::cerr << "Warning: CUDA A/B sizes do not match expected group sizes. Falling back to random inputs." << std::endl;
         }
+        // Optional bias
+        if (use_bias && file_exists(cuda_case_dir / "bias.bin")) {
+            std::vector<uint8_t> bias_bytes = read_bytes(cuda_case_dir / "bias.bin");
+            size_t bias_elems = bias_bytes.size() / sizeof(T);
+            if (bias_elems == static_cast<size_t>(num_groups) * static_cast<size_t>(n)) {
+                const T* Bias_flat = reinterpret_cast<const T*>(bias_bytes.data());
+                for (int g = 0; g < num_groups; ++g) {
+                    bias_matrices[g].assign(Bias_flat + g * static_cast<size_t>(n), Bias_flat + (g + 1) * static_cast<size_t>(n));
+                    bias_ptrs[g] = bias_matrices[g].data();
+                }
+            }
+        }
+    }
+
+    if (!loaded_cuda_inputs) {
+        // Generate same test data as CUDA version when reference isn't available
+        std::mt19937_64 rng(seed);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (int group = 0; group < num_groups; ++group) {
+            // A matrix
+            A_matrices[group].resize(A_elems_per_group);
+            for (auto& v : A_matrices[group]) v = float_to_bf16(dist(rng));
+            A_ptrs[group] = A_matrices[group].data();
+            // B matrix
+            B_matrices[group].resize(B_elems_per_group);
+            for (auto& v : B_matrices[group]) v = float_to_bf16(dist(rng));
+            B_ptrs[group] = B_matrices[group].data();
+            // Bias
+            if (use_bias) {
+                bias_matrices[group].resize(n);
+                for (auto& v : bias_matrices[group]) v = float_to_bf16(dist(rng));
+                bias_ptrs[group] = bias_matrices[group].data();
+            } else {
+                bias_ptrs[group] = nullptr;
+            }
+        }
+    } else if (!use_bias) {
+        // Ensure bias_ptrs are null when not used
+        std::fill(bias_ptrs.begin(), bias_ptrs.end(), nullptr);
+    }
+
+    // Allocate outputs C
+    for (int group = 0; group < num_groups; ++group) {
+        C_matrices[group].resize(C_elems_per_group, 0);
+        C_ptrs[group] = C_matrices[group].data();
     }
 
     // Call Metal Grouped GEMM implementation
@@ -815,6 +1018,28 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
             if (use_bias) {
                 artifacts::write_host_bin(dir, "bias" + group_suffix, bias_matrices[group].data(), bias_matrices[group].size());
             }
+        }
+
+        // Additionally, write flattened A/B/C to match CUDA artifact naming if present
+        {
+            // Flatten by concatenating groups in order
+            size_t A_total = 0, B_total = 0, C_total = 0;
+            for (int g = 0; g < num_groups; ++g) {
+                A_total += A_matrices[g].size();
+                B_total += B_matrices[g].size();
+                C_total += C_matrices[g].size();
+            }
+            std::vector<T> A_flat; A_flat.reserve(A_total);
+            std::vector<T> B_flat; B_flat.reserve(B_total);
+            std::vector<T> C_flat; C_flat.reserve(C_total);
+            for (int g = 0; g < num_groups; ++g) {
+                A_flat.insert(A_flat.end(), A_matrices[g].begin(), A_matrices[g].end());
+                B_flat.insert(B_flat.end(), B_matrices[g].begin(), B_matrices[g].end());
+                C_flat.insert(C_flat.end(), C_matrices[g].begin(), C_matrices[g].end());
+            }
+            artifacts::write_host_bin(dir, "A", A_flat.data(), A_flat.size());
+            artifacts::write_host_bin(dir, "B", B_flat.data(), B_flat.size());
+            artifacts::write_host_bin(dir, "C", C_flat.data(), C_flat.size());
         }
 
         std::ostringstream meta;

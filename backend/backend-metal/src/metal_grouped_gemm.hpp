@@ -31,10 +31,10 @@ int metal_grouped_gemm_bfloat16(
 );
 
 int metal_grouped_gemm_float32(
-    float** A_ptrs,                  // Array of pointers to A matrices
-    float** B_ptrs,                  // Array of pointers to B matrices
+    const float* const* A_ptrs,      // Array of pointers to A matrices (const data)
+    const float* const* B_ptrs,      // Array of pointers to B matrices (const data)
     float** C_ptrs,                  // Array of pointers to output C matrices
-    float** bias_ptrs,               // Array of pointers to bias vectors (can be null)
+    const float* const* bias_ptrs,   // Array of pointers to bias vectors (can be null)
     const int* m_array,              // Array of m dimensions [num_groups]
     const int* n_array,              // Array of n dimensions [num_groups]
     const int* k_array,              // Array of k dimensions [num_groups]
