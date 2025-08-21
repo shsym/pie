@@ -27,8 +27,10 @@ void batch_prefill_attention_unified_bf16(
     void* output,
     int num_qo,
     int head_dim,
+    int head_size,
     int page_size,
-    float scale
+    float scale,
+    int num_kv_pages
 );
 
 } // namespace batch_prefill_attention

@@ -856,7 +856,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
             q_input[i] = float_to_bf16(f);
         }
 
-        // Generate paged K and V caches
+        // Generate paged K and V caches - each key should have head_dim elements (all heads concatenated)
         size_t cache_size = static_cast<size_t>(num_pages) * page_size * head_dim;
         paged_k_cache.resize(cache_size);
         paged_v_cache.resize(cache_size);
@@ -874,6 +874,14 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
     print_vec_stats("paged_v_cache", paged_v_cache, 16);
 
     float scale = 1.0f / sqrtf(static_cast<float>(head_size));
+    std::cout << "\n🔍 DEBUG: Host-side parameter values:" << std::endl;
+    std::cout << "  head_size: " << head_size << std::endl;
+    std::cout << "  sqrt(head_size): " << sqrtf(static_cast<float>(head_size)) << std::endl;
+    std::cout << "  scale = 1/sqrt(head_size): " << scale << std::endl;
+    std::cout << "  num_tokens: " << num_tokens << std::endl;
+    std::cout << "  head_dim: " << head_dim << std::endl;
+    std::cout << "  page_size: " << page_size << std::endl;
+    std::cout << "  kv_page_indices.size(): " << kv_page_indices.size() << std::endl;
 
     try {
         auto start = std::chrono::high_resolution_clock::now();
@@ -887,7 +895,8 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
             kv_page_indices.data(),
             kv_last_page_lens.data(),
             output.data(),
-            num_tokens, head_dim, page_size, scale
+            num_tokens, head_dim, head_size, page_size, scale,
+            static_cast<int>(kv_page_indices.size())  // Pass actual number of pages
         );
         auto end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> elapsed = end - start;
