@@ -97,16 +97,16 @@ std::string extract_json_string(const std::string& json, const std::string& key)
     std::string search = "\"" + key + "\":";
     size_t pos = json.find(search);
     if (pos == std::string::npos) return "";
-    
+
     pos += search.length();
     while (pos < json.length() && std::isspace(json[pos])) pos++;
-    
+
     if (pos >= json.length() || json[pos] != '"') return "";
     pos++; // skip opening quote
-    
+
     size_t end = json.find('"', pos);
     if (end == std::string::npos) return "";
-    
+
     return json.substr(pos, end - pos);
 }
 
@@ -114,18 +114,18 @@ int extract_json_int(const std::string& json, const std::string& key, int defaul
     std::string search = "\"" + key + "\":";
     size_t pos = json.find(search);
     if (pos == std::string::npos) return default_val;
-    
+
     pos += search.length();
     while (pos < json.length() && std::isspace(json[pos])) pos++;
-    
+
     std::string num_str;
     while (pos < json.length() && (std::isdigit(json[pos]) || json[pos] == '-')) {
         num_str += json[pos];
         pos++;
     }
-    
+
     if (num_str.empty()) return default_val;
-    
+
     try {
         return std::stoi(num_str);
     } catch (...) {
@@ -137,18 +137,18 @@ float extract_json_float(const std::string& json, const std::string& key, float 
     std::string search = "\"" + key + "\":";
     size_t pos = json.find(search);
     if (pos == std::string::npos) return default_val;
-    
+
     pos += search.length();
     while (pos < json.length() && std::isspace(json[pos])) pos++;
-    
+
     std::string num_str;
     while (pos < json.length() && (std::isdigit(json[pos]) || json[pos] == '.' || json[pos] == '-' || json[pos] == 'e' || json[pos] == 'E' || json[pos] == '+')) {
         num_str += json[pos];
         pos++;
     }
-    
+
     if (num_str.empty()) return default_val;
-    
+
     try {
         return std::stof(num_str);
     } catch (...) {
@@ -159,26 +159,26 @@ float extract_json_float(const std::string& json, const std::string& key, float 
 // Read CUDA reference metadata and override parameters if auto_compare is enabled
 void override_with_cuda_metadata(Args& args, const std::string& cuda_artifacts_dir) {
     if (!args.auto_compare) return;
-    
+
     // Map operation names to their CUDA artifact directory names
     std::string cuda_op_name = args.op;
     if (args.op == "embedding_lookup") cuda_op_name = "embedding_lookup_forward";
-    
+
     std::filesystem::path cuda_meta_path = std::filesystem::path(cuda_artifacts_dir) / cuda_op_name / args.case_id / "meta.json";
-    
+
     if (!std::filesystem::exists(cuda_meta_path)) {
         std::cerr << "Note: CUDA reference metadata not found at " << cuda_meta_path << ", using command-line parameters" << std::endl;
         return;
     }
-    
+
     try {
         std::ifstream file(cuda_meta_path);
         std::stringstream buffer;
         buffer << file.rdbuf();
         std::string json_content = buffer.str();
-        
+
         std::cout << "Reading CUDA reference metadata from " << cuda_meta_path << std::endl;
-        
+
         // Extract config parameters from JSON
         args.num_tokens = extract_json_int(json_content, "num_tokens", args.num_tokens);
         args.hidden_size = extract_json_int(json_content, "hidden_size", args.hidden_size);
@@ -198,18 +198,18 @@ void override_with_cuda_metadata(Args& args, const std::string& cuda_artifacts_d
         args.page_size = extract_json_int(json_content, "page_size", args.page_size);
         args.num_groups = extract_json_int(json_content, "num_groups", args.num_groups);
         args.max_num_pages = extract_json_int(json_content, "max_num_pages", args.max_num_pages);
-        
+
         args.eps = extract_json_float(json_content, "eps", args.eps);
         args.temperature = extract_json_float(json_content, "temperature", args.temperature);
         args.rope_theta = extract_json_float(json_content, "rope_theta", args.rope_theta);
         args.rope_factor = extract_json_float(json_content, "rope_factor", args.rope_factor);
         args.rope_low_frequency_factor = extract_json_float(json_content, "rope_low_frequency_factor", args.rope_low_frequency_factor);
         args.rope_high_frequency_factor = extract_json_float(json_content, "rope_high_frequency_factor", args.rope_high_frequency_factor);
-        
+
         std::cout << "Overridden parameters from CUDA reference:" << std::endl;
         std::cout << "  num_tokens=" << args.num_tokens << ", hidden_size=" << args.hidden_size << ", vocab_size=" << args.vocab_size << std::endl;
         std::cout << "  batch_size=" << args.batch_size << ", temperature=" << args.temperature << std::endl;
-        
+
     } catch (const std::exception& e) {
         std::cerr << "Warning: Failed to read CUDA metadata from " << cuda_meta_path << ": " << e.what() << std::endl;
         std::cerr << "Using command-line parameters instead" << std::endl;
@@ -379,10 +379,14 @@ int main(int argc, char** argv) {
     const std::string comparator_script = comparator_script_path.string();
 
         // Fix cuda_artifacts_dir to be absolute if it's still the default relative path
+        // Default to artifacts checked in under metal-protocol-tests/tests/artifacts
         if (args.cuda_artifacts_dir == "tests/artifacts") {
+            // exe_dir: <repo>/metal-protocol-tests/build
             std::filesystem::path default_cuda_artifacts_path = (exe_dir / "../tests/artifacts").lexically_normal();
             args.cuda_artifacts_dir = default_cuda_artifacts_path.string();
         }
+        // Also export for per-op wrappers that look up CUDA inputs directly
+        setenv("PIE_CUDA_ARTIFACTS_DIR", args.cuda_artifacts_dir.c_str(), 1);
 
     // If requested case doesn't exist (or is 'auto'), try to auto-select an available CUDA reference case
     maybe_autoselect_cuda_case(args);
@@ -463,11 +467,7 @@ int main(int argc, char** argv) {
             ops::AddResidualConfig cfg{args.num_tokens, args.hidden_size};
             std::cerr << "Error: add_residual not implemented for Metal backend yet" << std::endl;
             return 1;
-        } else if (args.op == "gemm") {
-            ops::GemmConfig cfg{args.m, args.n, args.k, args.transa, args.transb, args.use_bias};
-            ops::run_gemm_metal(case_id, cfg, args.seed);
-            run_comparison("gemm", case_id);
-        } else if (args.op == "cast_type") {
+    } else if (args.op == "cast_type") {
             ops::CastTypeConfig cfg{args.num_elements, args.input_dtype, args.output_dtype};
             std::cerr << "Error: cast_type not implemented for Metal backend yet" << std::endl;
             return 1;
@@ -495,11 +495,7 @@ int main(int argc, char** argv) {
             ops::AppendPagedKVCacheConfig cfg{args.num_tokens, args.num_kv_heads, args.head_size, args.page_size, args.max_num_pages, args.batch_size};
             std::cerr << "Error: append_paged_kv_cache not implemented for Metal backend yet" << std::endl;
             return 1;
-        } else if (args.op == "gemm_all_dtypes") {
-            ops::GemmConfig cfg{args.m, args.n, args.k, args.transa, args.transb, args.use_bias};
-            std::cerr << "Error: gemm_all_dtypes not implemented for Metal backend yet" << std::endl;
-            return 1;
-        } else if (args.op == "embedding_lookup_all_dtypes") {
+    } else if (args.op == "embedding_lookup_all_dtypes") {
             ops::EmbeddingConfig cfg{args.num_tokens, args.hidden_size, args.vocab_size};
             std::cerr << "Error: embedding_lookup_all_dtypes not implemented for Metal backend yet" << std::endl;
             return 1;

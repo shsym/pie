@@ -8,7 +8,7 @@ extern "C" {
 // Corresponds to FlashInfer Grouped GEMM operations
 // Performs multiple GEMM operations in parallel, each with potentially different dimensions
 // - A_ptrs: Array of pointers to A matrices [num_groups]
-// - B_ptrs: Array of pointers to B matrices [num_groups]  
+// - B_ptrs: Array of pointers to B matrices [num_groups]
 // - C_ptrs: Array of pointers to C matrices [num_groups]
 // - bias_ptrs: Array of pointers to bias vectors [num_groups] (optional)
 // - m_array: Array of m dimensions for each GEMM [num_groups]

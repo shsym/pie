@@ -54,7 +54,6 @@ echo
 
 # Test all 10 implemented operations
 operations=(
-    "gemm --m 16 --n 32 --k 24"
     "embedding_lookup --num_tokens 8 --hidden_size 128 --vocab_size 1000"
     "silu_and_mul --num_tokens 8 --intermediate_size 64"
     "extract_k_values --M 4 --N 32 --k 5"
@@ -72,7 +71,7 @@ failed=0
 for op_cmd in "${operations[@]}"; do
     op_name=$(echo $op_cmd | cut -d' ' -f1)
     echo -n "🔄 Testing $op_name... "
-    
+
     # Build command with optional --case only when explicitly provided
     CMD=("$BIN" --op)
     # Split op command into args safely

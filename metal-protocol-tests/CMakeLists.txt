@@ -27,7 +27,15 @@ get_filename_component(REPO_ROOT ${CMAKE_SOURCE_DIR} DIRECTORY)
 # Define Metal-only sources (unified test driver + ops wrappers)
 set(METAL_SOURCES
     src/main.cpp
-    src/ops_metal.mm
+    src/ops_embedding_lookup.mm
+    src/ops_silu_and_mul.mm
+    src/ops_extract_k_values.mm
+    src/ops_softmax.mm
+    src/ops_rms_norm.mm
+    src/ops_rope.mm
+    src/ops_grouped_gemm.mm
+    src/ops_batch_prefill_attention.mm
+    src/ops_topk_mask_logits.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_gemm.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_embedding.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_silu_and_mul.mm
@@ -76,7 +84,15 @@ endif()
 
 # Set Objective-C++ compiler flags for Metal sources
 set_source_files_properties(
-    src/ops_metal.mm
+    src/ops_embedding_lookup.mm
+    src/ops_silu_and_mul.mm
+    src/ops_extract_k_values.mm
+    src/ops_softmax.mm
+    src/ops_rms_norm.mm
+    src/ops_rope.mm
+    src/ops_grouped_gemm.mm
+    src/ops_batch_prefill_attention.mm
+    src/ops_topk_mask_logits.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_gemm.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_embedding.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_silu_and_mul.mm

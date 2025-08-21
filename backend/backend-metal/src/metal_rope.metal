@@ -27,43 +27,43 @@ kernel void metal_rope_bfloat16(
     const uint32_t token_idx = gid.x;
     const uint32_t head_idx = gid.y;
     const uint32_t pair_idx = gid.z;  // Index of the (x, y) pair within the head
-    
+
     // Bounds check
-    if (token_idx >= params.num_tokens || 
-        head_idx >= params.num_heads || 
+    if (token_idx >= params.num_tokens ||
+        head_idx >= params.num_heads ||
         pair_idx >= params.head_size / 2) {
         return;
     }
-    
+
     // Calculate tensor indices
-    const uint32_t base_idx = token_idx * params.num_heads * params.head_size + 
+    const uint32_t base_idx = token_idx * params.num_heads * params.head_size +
                               head_idx * params.head_size;
     // Pair across halves: x at [i], y at [i + head_size/2]
     const uint32_t x_idx = base_idx + pair_idx;
     const uint32_t y_idx = base_idx + pair_idx + params.head_size / 2;
-    
+
     // Get position for this token
     const float position = float(position_ids[token_idx]);
-    
+
     // Compute rotary frequency for this pair
     // freq = 1.0 / (rope_theta^(2*pair_idx/head_size)) * rope_factor
     const float exponent = (2.0f * float(pair_idx)) / float(params.head_size);
     const float freq_base = powr(params.rope_theta, exponent);
     const float freq = params.rope_factor / freq_base;
-    
+
     // Compute angle
     const float theta = position * freq;
     const float cos_theta = cos(theta);
     const float sin_theta = sin(theta);
-    
+
     // Load current values
     const float x = float(input_qk[x_idx]);
     const float y = float(input_qk[y_idx]);
-    
+
     // Apply rotation
     const float x_rot = x * cos_theta - y * sin_theta;
     const float y_rot = x * sin_theta + y * cos_theta;
-    
+
     // Store rotated values
     input_qk[x_idx] = bfloat(x_rot);
     input_qk[y_idx] = bfloat(y_rot);
@@ -79,43 +79,43 @@ kernel void metal_rope_float32(
     const uint32_t token_idx = gid.x;
     const uint32_t head_idx = gid.y;
     const uint32_t pair_idx = gid.z;  // Index of the (x, y) pair within the head
-    
+
     // Bounds check
-    if (token_idx >= params.num_tokens || 
-        head_idx >= params.num_heads || 
+    if (token_idx >= params.num_tokens ||
+        head_idx >= params.num_heads ||
         pair_idx >= params.head_size / 2) {
         return;
     }
-    
+
     // Calculate tensor indices
-    const uint32_t base_idx = token_idx * params.num_heads * params.head_size + 
+    const uint32_t base_idx = token_idx * params.num_heads * params.head_size +
                               head_idx * params.head_size;
     // Pair across halves: x at [i], y at [i + head_size/2]
     const uint32_t x_idx = base_idx + pair_idx;
     const uint32_t y_idx = base_idx + pair_idx + params.head_size / 2;
-    
+
     // Get position for this token
     const float position = float(position_ids[token_idx]);
-    
+
     // Compute rotary frequency for this pair
     // freq = 1.0 / (rope_theta^(2*pair_idx/head_size)) * rope_factor
     const float exponent = (2.0f * float(pair_idx)) / float(params.head_size);
     const float freq_base = powr(params.rope_theta, exponent);
     const float freq = params.rope_factor / freq_base;
-    
+
     // Compute angle
     const float theta = position * freq;
     const float cos_theta = cos(theta);
     const float sin_theta = sin(theta);
-    
+
     // Load current values
     const float x = input_qk[x_idx];
     const float y = input_qk[y_idx];
-    
+
     // Apply rotation
     const float x_rot = x * cos_theta - y * sin_theta;
     const float y_rot = x * sin_theta + y * cos_theta;
-    
+
     // Store rotated values
     input_qk[x_idx] = x_rot;
     input_qk[y_idx] = y_rot;

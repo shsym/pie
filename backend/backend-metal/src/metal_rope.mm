@@ -23,19 +23,19 @@ static bool initialize_metal_rope() {
                 std::cerr << "Metal device creation failed" << std::endl;
                 return;
             }
-            
+
             commandQueue = [device newCommandQueue];
             if (!commandQueue) {
                 std::cerr << "Metal command queue creation failed" << std::endl;
                 return;
             }
-            
+
             // Load the Metal file from the same directory as this .mm file
             NSError* error = nil;
             NSString* currentPath = [NSString stringWithUTF8String:__FILE__];
             NSString* dirPath = [currentPath stringByDeletingLastPathComponent];
             NSString* metalPath = [dirPath stringByAppendingPathComponent:@"metal_rope.metal"];
-            
+
             NSString* source = [NSString stringWithContentsOfFile:metalPath
                                                          encoding:NSUTF8StringEncoding
                                                             error:&error];
@@ -43,23 +43,23 @@ static bool initialize_metal_rope() {
                 std::cerr << "Failed to read Metal source: " << error.localizedDescription.UTF8String << std::endl;
                 return;
             }
-            
+
             library = [device newLibraryWithSource:source options:nil error:&error];
             if (error) {
                 std::cerr << "Metal library compilation failed: " << error.localizedDescription.UTF8String << std::endl;
                 return;
             }
-            
+
             // Create pipeline states for both variants
             id<MTLFunction> ropeBF16Function = [library newFunctionWithName:@"metal_rope_bfloat16"];
             id<MTLFunction> ropeF32Function = [library newFunctionWithName:@"metal_rope_float32"];
             id<MTLFunction> ropeF16Function = [library newFunctionWithName:@"metal_rope_float16"];
-            
+
             if (!ropeBF16Function) {
                 std::cerr << "Failed to find metal_rope_bfloat16 function" << std::endl;
                 return;
             }
-            
+
             if (!ropeF32Function) {
                 std::cerr << "Failed to find metal_rope_float32 function" << std::endl;
                 return;
@@ -68,13 +68,13 @@ static bool initialize_metal_rope() {
                 std::cerr << "Failed to find metal_rope_float16 function" << std::endl;
                 return;
             }
-            
+
             ropeBF16PipelineState = [device newComputePipelineStateWithFunction:ropeBF16Function error:&error];
             if (error) {
                 std::cerr << "RoPE BF16 pipeline state creation failed: " << error.localizedDescription.UTF8String << std::endl;
                 return;
             }
-            
+
             ropeF32PipelineState = [device newComputePipelineStateWithFunction:ropeF32Function error:&error];
             if (error) {
                 std::cerr << "RoPE F32 pipeline state creation failed: " << error.localizedDescription.UTF8String << std::endl;
@@ -87,8 +87,8 @@ static bool initialize_metal_rope() {
             }
         }
     });
-    
-    return (device != nil && commandQueue != nil && library != nil && 
+
+    return (device != nil && commandQueue != nil && library != nil &&
             ropeBF16PipelineState != nil && ropeF32PipelineState != nil && ropeF16PipelineState != nil);
 }
 
@@ -115,36 +115,36 @@ int metal_rope_bfloat16(
             std::cerr << "Metal RoPE initialization failed" << std::endl;
             return -1;
         }
-        
+
         // Validate inputs
         if (!input_qk || !position_ids || num_tokens == 0 || num_heads == 0 || head_size == 0) {
             std::cerr << "Invalid RoPE parameters" << std::endl;
             return -2;
         }
-        
+
         // RoPE requires head_size to be even (pairs of elements)
         if (head_size % 2 != 0) {
             std::cerr << "RoPE requires even head_size, got: " << head_size << std::endl;
             return -2;
         }
-        
+
         // Create Metal buffers
         const size_t tensor_size = static_cast<size_t>(num_tokens) * num_heads * head_size * sizeof(uint16_t);
         const size_t position_size = num_tokens * sizeof(int32_t);
-        
-        id<MTLBuffer> tensorBuffer = [device newBufferWithBytes:input_qk 
-                                                         length:tensor_size 
+
+        id<MTLBuffer> tensorBuffer = [device newBufferWithBytes:input_qk
+                                                         length:tensor_size
                                                         options:MTLResourceStorageModeShared];
-        
-        id<MTLBuffer> positionBuffer = [device newBufferWithBytes:position_ids 
-                                                           length:position_size 
+
+        id<MTLBuffer> positionBuffer = [device newBufferWithBytes:position_ids
+                                                           length:position_size
                                                           options:MTLResourceStorageModeShared];
-        
+
         if (!tensorBuffer || !positionBuffer) {
             std::cerr << "Metal buffer allocation failed" << std::endl;
             return -3;
         }
-        
+
         // Set up parameters
         RoPEParams params = {
             .num_tokens = num_tokens,
@@ -153,50 +153,50 @@ int metal_rope_bfloat16(
             .rope_theta = rope_theta,
             .rope_factor = rope_factor
         };
-        
-        id<MTLBuffer> paramsBuffer = [device newBufferWithBytes:&params 
-                                                         length:sizeof(RoPEParams) 
+
+        id<MTLBuffer> paramsBuffer = [device newBufferWithBytes:&params
+                                                         length:sizeof(RoPEParams)
                                                         options:MTLResourceStorageModeShared];
-        
+
         // Create command buffer and encoder
         id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-        
+
         [encoder setComputePipelineState:ropeBF16PipelineState];
         [encoder setBuffer:tensorBuffer offset:0 atIndex:0];
         [encoder setBuffer:positionBuffer offset:0 atIndex:1];
         [encoder setBuffer:paramsBuffer offset:0 atIndex:2];
-        
+
         // Configure dispatch: we need (num_tokens, num_heads, head_size/2) threads
         // Each thread processes one pair of elements
         MTLSize threadsPerGrid = MTLSizeMake(num_tokens, num_heads, head_size / 2);
         MTLSize threadsPerThreadgroup = MTLSizeMake(16, 4, 4);  // Adjust based on GPU capabilities
-        
+
         // Ensure threadgroup size doesn't exceed limits
         NSUInteger maxThreadsPerThreadgroup = ropeBF16PipelineState.maxTotalThreadsPerThreadgroup;
-        NSUInteger totalThreadsPerThreadgroup = threadsPerThreadgroup.width * 
-                                                threadsPerThreadgroup.height * 
+        NSUInteger totalThreadsPerThreadgroup = threadsPerThreadgroup.width *
+                                                threadsPerThreadgroup.height *
                                                 threadsPerThreadgroup.depth;
-        
+
         if (totalThreadsPerThreadgroup > maxThreadsPerThreadgroup) {
             // Fallback to smaller threadgroup
             threadsPerThreadgroup = MTLSizeMake(8, 4, 4);
             totalThreadsPerThreadgroup = 8 * 4 * 4;
-            
+
             if (totalThreadsPerThreadgroup > maxThreadsPerThreadgroup) {
                 threadsPerThreadgroup = MTLSizeMake(8, 8, 1);
             }
         }
-        
-        [encoder dispatchThreads:threadsPerGrid 
+
+        [encoder dispatchThreads:threadsPerGrid
            threadsPerThreadgroup:threadsPerThreadgroup];
-        
+
         [encoder endEncoding];
-        
+
         // Execute and wait for completion
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
-        
+
         // Check for execution errors
         if (commandBuffer.status == MTLCommandBufferStatusError) {
             std::cerr << "Metal command buffer execution failed" << std::endl;
@@ -205,10 +205,10 @@ int metal_rope_bfloat16(
             }
             return -4;
         }
-        
+
         // Copy result back to input buffer (in-place operation)
         memcpy(input_qk, tensorBuffer.contents, tensor_size);
-        
+
         return 0;  // Success
     }
 }
@@ -228,36 +228,36 @@ int metal_rope_float32(
             std::cerr << "Metal RoPE initialization failed" << std::endl;
             return -1;
         }
-        
+
         // Validate inputs
         if (!input_qk || !position_ids || num_tokens == 0 || num_heads == 0 || head_size == 0) {
             std::cerr << "Invalid RoPE parameters" << std::endl;
             return -2;
         }
-        
+
         // RoPE requires head_size to be even (pairs of elements)
         if (head_size % 2 != 0) {
             std::cerr << "RoPE requires even head_size, got: " << head_size << std::endl;
             return -2;
         }
-        
+
         // Create Metal buffers
         const size_t tensor_size = static_cast<size_t>(num_tokens) * num_heads * head_size * sizeof(float);
         const size_t position_size = num_tokens * sizeof(int32_t);
-        
-        id<MTLBuffer> tensorBuffer = [device newBufferWithBytes:input_qk 
-                                                         length:tensor_size 
+
+        id<MTLBuffer> tensorBuffer = [device newBufferWithBytes:input_qk
+                                                         length:tensor_size
                                                         options:MTLResourceStorageModeShared];
-        
-        id<MTLBuffer> positionBuffer = [device newBufferWithBytes:position_ids 
-                                                           length:position_size 
+
+        id<MTLBuffer> positionBuffer = [device newBufferWithBytes:position_ids
+                                                           length:position_size
                                                           options:MTLResourceStorageModeShared];
-        
+
         if (!tensorBuffer || !positionBuffer) {
             std::cerr << "Metal buffer allocation failed" << std::endl;
             return -3;
         }
-        
+
         // Set up parameters
         RoPEParams params = {
             .num_tokens = num_tokens,
@@ -266,50 +266,50 @@ int metal_rope_float32(
             .rope_theta = rope_theta,
             .rope_factor = rope_factor
         };
-        
-        id<MTLBuffer> paramsBuffer = [device newBufferWithBytes:&params 
-                                                         length:sizeof(RoPEParams) 
+
+        id<MTLBuffer> paramsBuffer = [device newBufferWithBytes:&params
+                                                         length:sizeof(RoPEParams)
                                                         options:MTLResourceStorageModeShared];
-        
+
         // Create command buffer and encoder
         id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-        
+
         [encoder setComputePipelineState:ropeF32PipelineState];
         [encoder setBuffer:tensorBuffer offset:0 atIndex:0];
         [encoder setBuffer:positionBuffer offset:0 atIndex:1];
         [encoder setBuffer:paramsBuffer offset:0 atIndex:2];
-        
+
         // Configure dispatch: we need (num_tokens, num_heads, head_size/2) threads
         // Each thread processes one pair of elements
         MTLSize threadsPerGrid = MTLSizeMake(num_tokens, num_heads, head_size / 2);
         MTLSize threadsPerThreadgroup = MTLSizeMake(16, 4, 4);  // Adjust based on GPU capabilities
-        
+
         // Ensure threadgroup size doesn't exceed limits
         NSUInteger maxThreadsPerThreadgroup = ropeF32PipelineState.maxTotalThreadsPerThreadgroup;
-        NSUInteger totalThreadsPerThreadgroup = threadsPerThreadgroup.width * 
-                                                threadsPerThreadgroup.height * 
+        NSUInteger totalThreadsPerThreadgroup = threadsPerThreadgroup.width *
+                                                threadsPerThreadgroup.height *
                                                 threadsPerThreadgroup.depth;
-        
+
         if (totalThreadsPerThreadgroup > maxThreadsPerThreadgroup) {
             // Fallback to smaller threadgroup
             threadsPerThreadgroup = MTLSizeMake(8, 4, 4);
             totalThreadsPerThreadgroup = 8 * 4 * 4;
-            
+
             if (totalThreadsPerThreadgroup > maxThreadsPerThreadgroup) {
                 threadsPerThreadgroup = MTLSizeMake(8, 8, 1);
             }
         }
-        
-        [encoder dispatchThreads:threadsPerGrid 
+
+        [encoder dispatchThreads:threadsPerGrid
            threadsPerThreadgroup:threadsPerThreadgroup];
-        
+
         [encoder endEncoding];
-        
+
         // Execute and wait for completion
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
-        
+
         // Check for execution errors
         if (commandBuffer.status == MTLCommandBufferStatusError) {
             std::cerr << "Metal command buffer execution failed" << std::endl;
@@ -318,10 +318,10 @@ int metal_rope_float32(
             }
             return -4;
         }
-        
+
         // Copy result back to input buffer (in-place operation)
         memcpy(input_qk, tensorBuffer.contents, tensor_size);
-        
+
         return 0;  // Success
     }
 }

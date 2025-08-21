@@ -10,7 +10,7 @@ extern "C" {
 // - input_qk: [num_tokens, num_heads, head_size] query/key tensor (modified in-place)
 // - position_ids: [num_tokens] position indices for each token
 // - num_tokens: Number of tokens in the sequence
-// - num_heads: Number of attention heads  
+// - num_heads: Number of attention heads
 // - head_size: Size of each attention head
 // - rope_theta: Base for the rotary frequency computation (default 10000.0)
 // - rope_factor: Scaling factor for RoPE (default 1.0)
