@@ -216,6 +216,49 @@ void override_with_cuda_metadata(Args& args, const std::string& cuda_artifacts_d
     }
 }
 
+// Try to auto-select a CUDA case if requested case doesn't exist or is 'auto'
+void maybe_autoselect_cuda_case(Args& args) {
+    if (!args.auto_compare) return;
+    // Map op name to CUDA artifacts op folder
+    std::string cuda_op_name = args.op;
+    if (args.op == "embedding_lookup") cuda_op_name = "embedding_lookup_forward";
+
+    std::filesystem::path op_dir = std::filesystem::path(args.cuda_artifacts_dir) / cuda_op_name;
+    if (!std::filesystem::exists(op_dir) || !std::filesystem::is_directory(op_dir)) {
+        return; // Nothing to auto-select from
+    }
+
+    auto meta_for = [&](const std::string& case_name) {
+        return op_dir / case_name / "meta.json";
+    };
+
+    auto exists_meta = [&](const std::string& case_name) {
+        auto p = meta_for(case_name);
+        return std::filesystem::exists(p);
+    };
+
+    bool need_select = (args.case_id == "auto") || !exists_meta(args.case_id);
+    if (!need_select) return;
+
+    // Prefer 'test_unified' if present, else the first directory entry with meta.json
+    if (exists_meta("test_unified")) {
+        std::cout << "Auto-selecting CUDA reference case: test_unified" << std::endl;
+        args.case_id = "test_unified";
+        return;
+    }
+
+    for (auto& entry : std::filesystem::directory_iterator(op_dir)) {
+        if (!entry.is_directory()) continue;
+        auto name = entry.path().filename().string();
+        if (exists_meta(name)) {
+            std::cout << "Auto-selecting CUDA reference case: " << name << std::endl;
+            args.case_id = name;
+            return;
+        }
+    }
+    // If we got here, no meta.json cases found; leave args.case_id as-is
+}
+
 Args parse_args(int argc, char** argv) {
     Args a;
     for (int i = 1; i < argc; ++i) {
@@ -328,6 +371,7 @@ Args parse_args(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
+    bool comparison_ok = true; // Track CUDA vs Metal comparison result
     // Resolve comparator script path relative to the executable directory so CWD doesn't matter
     std::filesystem::path exe_path = std::filesystem::absolute(argv[0]);
     std::filesystem::path exe_dir = exe_path.parent_path();
@@ -340,7 +384,10 @@ int main(int argc, char** argv) {
             args.cuda_artifacts_dir = default_cuda_artifacts_path.string();
         }
 
-        // Override parameters with CUDA reference metadata if comparison is enabled
+    // If requested case doesn't exist (or is 'auto'), try to auto-select an available CUDA reference case
+    maybe_autoselect_cuda_case(args);
+
+    // Override parameters with CUDA reference metadata if comparison is enabled
         override_with_cuda_metadata(args, args.cuda_artifacts_dir);
 
         // Resolve a default artifacts base inside the build directory (next to the executable)
@@ -366,7 +413,7 @@ int main(int argc, char** argv) {
         }
 
         // Auto-comparison function
-        auto run_comparison = [&](const std::string& op, const std::string& case_id) {
+    auto run_comparison = [&](const std::string& op, const std::string& case_id) {
             if (!args.auto_compare) {
                 return;
             }
@@ -391,6 +438,7 @@ int main(int argc, char** argv) {
                 std::cout << "✅ Metal implementation matches CUDA reference!" << std::endl;
             } else {
                 std::cout << "❌ Metal implementation differs from CUDA reference. See details above." << std::endl;
+                comparison_ok = false;
             }
         };
 
@@ -461,6 +509,12 @@ int main(int argc, char** argv) {
             return 1;
         } else {
             std::cerr << "Unsupported op: " << args.op << "\n";
+            return 2;
+        }
+
+        // If comparison failed, propagate failure via exit code so scripts can detect it
+        if (args.auto_compare && !comparison_ok) {
+            std::cerr << "Comparison with CUDA reference failed" << "\n";
             return 2;
         }
 

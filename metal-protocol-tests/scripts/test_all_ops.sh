@@ -4,7 +4,7 @@
 
 set -e
 
-CASE_ID="test1"
+CASE_ID="auto"
 EXTRA_FLAGS=""
 
 # Parse command line arguments
