@@ -16,6 +16,7 @@ struct Args {
     std::string case_id = "auto";
     bool auto_compare = true;           // Automatically compare with CUDA reference
     std::string cuda_artifacts_dir = "tests/artifacts";  // CUDA reference directory
+    bool write_meta_from_cli = false;   // Emit minimal CUDA meta.json from CLI params and exit
     int num_tokens = 128;          // Realistic sequence length
     int hidden_size = 4096;        // Llama 7B hidden size
     int vocab_size = 32000;        // Llama vocab size
@@ -61,6 +62,45 @@ bool parse_int(const char* s, int& out) {
     if (!end || *end != '\0') return false;
     out = static_cast<int>(v);
     return true;
+}
+
+// Emit a minimal CUDA-style meta.json based on current Args for the given op/case
+void emit_cuda_meta_from_cli(const Args& args) {
+    // Map operation names where CUDA artifacts differ
+    std::string cuda_op_name = args.op == "embedding_lookup" ? "embedding_lookup_forward" : args.op;
+    std::filesystem::path dir = std::filesystem::path(args.cuda_artifacts_dir) / cuda_op_name / args.case_id;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    (void)ec;
+    std::filesystem::path meta = dir / "meta.json";
+    std::ostringstream os;
+    os << "{\n";
+    os << "  \"op\": \"" << cuda_op_name << "\",\n";
+    os << "  \"case_id\": \"" << args.case_id << "\",\n";
+    os << "  \"num_tokens\": " << args.num_tokens << ",\n";
+    os << "  \"hidden_size\": " << args.hidden_size << ",\n";
+    os << "  \"vocab_size\": " << args.vocab_size << ",\n";
+    os << "  \"intermediate_size\": " << args.intermediate_size << ",\n";
+    os << "  \"M\": " << args.M << ",\n";
+    os << "  \"N\": " << args.N << ",\n";
+    os << "  \"k\": " << args.k << ",\n";
+    os << "  \"m\": " << args.m << ",\n";
+    os << "  \"n\": " << args.n << ",\n";
+    os << "  \"batch_size\": " << args.batch_size << ",\n";
+    os << "  \"num_heads\": " << args.num_heads << ",\n";
+    os << "  \"head_size\": " << args.head_size << ",\n";
+    os << "  \"num_query_heads\": " << args.num_query_heads << ",\n";
+    os << "  \"num_kv_heads\": " << args.num_kv_heads << ",\n";
+    os << "  \"kv_len\": " << args.kv_len << ",\n";
+    os << "  \"page_size\": " << args.page_size << ",\n";
+    os << "  \"num_groups\": " << args.num_groups << ",\n";
+    os << "  \"max_num_pages\": " << args.max_num_pages << ",\n";
+    os << "  \"eps\": " << args.eps << ",\n";
+    os << "  \"temperature\": " << args.temperature << "\n";
+    os << "}\n";
+    std::ofstream ofs(meta);
+    ofs << os.str();
+    std::cout << "Wrote CUDA-style meta.json to " << meta << std::endl;
 }
 
 bool parse_u64(const char* s, uint64_t& out) {
@@ -167,8 +207,8 @@ void override_with_cuda_metadata(Args& args, const std::string& cuda_artifacts_d
     std::filesystem::path cuda_meta_path = std::filesystem::path(cuda_artifacts_dir) / cuda_op_name / args.case_id / "meta.json";
 
     if (!std::filesystem::exists(cuda_meta_path)) {
-        std::cerr << "Note: CUDA reference metadata not found at " << cuda_meta_path << ", using command-line parameters" << std::endl;
-        return;
+        // Caller should have enforced meta presence already. Keep this as a hard error path.
+        throw std::runtime_error(std::string("Required CUDA meta.json not found at ") + cuda_meta_path.string());
     }
 
     try {
@@ -272,6 +312,8 @@ Args parse_args(int argc, char** argv) {
             a.auto_compare = false;
         } else if (flag == "--cuda-artifacts-dir") {
             if (const char* v = next(i)) a.cuda_artifacts_dir = v; else throw std::runtime_error("--cuda-artifacts-dir requires value");
+        } else if (flag == "--write-meta-from-cli") {
+            a.write_meta_from_cli = true;
         } else if (flag == "--num_tokens") {
             const char* v = next(i); if (!v || !parse_int(v, a.num_tokens)) throw std::runtime_error("--num_tokens int");
         } else if (flag == "--hidden_size") {
@@ -342,6 +384,7 @@ Args parse_args(int argc, char** argv) {
                          "  --op OP                     Operation to test (required)\\n"
                          "  --case ID                   Test case identifier (default: auto)\\n"
                          "  --no-compare                Skip automatic CUDA vs Metal comparison\\n"
+                         "  --write-meta-from-cli       Emit CUDA-style meta.json based on CLI and exit (for ad-hoc)\n"
                          "  --cuda-artifacts-dir DIR    Directory containing CUDA reference artifacts\\n"
                          "                              (default: ../cuda-protocol-tests/tests/artifacts)\\n"
                          "\\n"
@@ -379,11 +422,14 @@ int main(int argc, char** argv) {
     const std::string comparator_script = comparator_script_path.string();
 
         // Fix cuda_artifacts_dir to be absolute if it's still the default relative path
-        // Default to artifacts checked in under metal-protocol-tests/tests/artifacts
+        // Prefer cuda-protocol-tests/tests/artifacts; fall back to metal-protocol-tests/tests/artifacts
         if (args.cuda_artifacts_dir == "tests/artifacts") {
             // exe_dir: <repo>/metal-protocol-tests/build
-            std::filesystem::path default_cuda_artifacts_path = (exe_dir / "../tests/artifacts").lexically_normal();
-            args.cuda_artifacts_dir = default_cuda_artifacts_path.string();
+            std::filesystem::path candidate_cuda = (exe_dir / "../../cuda-protocol-tests/tests/artifacts").lexically_normal();
+            std::filesystem::path fallback_metal = (exe_dir / "../tests/artifacts").lexically_normal();
+            std::filesystem::path chosen = std::filesystem::exists(candidate_cuda) ? candidate_cuda : fallback_metal;
+            args.cuda_artifacts_dir = chosen.string();
+            std::cout << "Using CUDA artifacts from: " << args.cuda_artifacts_dir << std::endl;
         }
         // Also export for per-op wrappers that look up CUDA inputs directly
         setenv("PIE_CUDA_ARTIFACTS_DIR", args.cuda_artifacts_dir.c_str(), 1);
@@ -391,8 +437,24 @@ int main(int argc, char** argv) {
     // If requested case doesn't exist (or is 'auto'), try to auto-select an available CUDA reference case
     maybe_autoselect_cuda_case(args);
 
-    // Override parameters with CUDA reference metadata if comparison is enabled
-        override_with_cuda_metadata(args, args.cuda_artifacts_dir);
+    // Handle meta emission for ad-hoc runs, or enforce presence of CUDA meta when comparing
+    if (args.auto_compare) {
+        // Map op name for CUDA artifacts
+        std::string cuda_op_name = args.op == "embedding_lookup" ? "embedding_lookup_forward" : args.op;
+        std::filesystem::path cuda_meta_path = std::filesystem::path(args.cuda_artifacts_dir) / cuda_op_name / args.case_id / "meta.json";
+        if (args.write_meta_from_cli) {
+            emit_cuda_meta_from_cli(args);
+            std::cout << "Exiting after writing meta (no execution performed)." << std::endl;
+            return 0;
+        }
+        if (!std::filesystem::exists(cuda_meta_path)) {
+            throw std::runtime_error(std::string("Missing required CUDA meta.json for ") + cuda_op_name + "/" + args.case_id +
+                                     ". Run with --write-meta-from-cli to generate one for ad-hoc runs, or provide valid artifacts under --cuda-artifacts-dir.");
+        }
+    }
+
+    // Override parameters with CUDA reference metadata (enforced above)
+    override_with_cuda_metadata(args, args.cuda_artifacts_dir);
 
         // Resolve a default artifacts base inside the build directory (next to the executable)
         // so runs don't spill artifacts into the repo root even if CWD changes.
