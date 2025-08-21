@@ -38,8 +38,9 @@ kernel void metal_rope_bfloat16(
     // Calculate tensor indices
     const uint32_t base_idx = token_idx * params.num_heads * params.head_size + 
                               head_idx * params.head_size;
-    const uint32_t x_idx = base_idx + pair_idx * 2;
-    const uint32_t y_idx = base_idx + pair_idx * 2 + 1;
+    // Pair across halves: x at [i], y at [i + head_size/2]
+    const uint32_t x_idx = base_idx + pair_idx;
+    const uint32_t y_idx = base_idx + pair_idx + params.head_size / 2;
     
     // Get position for this token
     const float position = float(position_ids[token_idx]);
@@ -89,8 +90,9 @@ kernel void metal_rope_float32(
     // Calculate tensor indices
     const uint32_t base_idx = token_idx * params.num_heads * params.head_size + 
                               head_idx * params.head_size;
-    const uint32_t x_idx = base_idx + pair_idx * 2;
-    const uint32_t y_idx = base_idx + pair_idx * 2 + 1;
+    // Pair across halves: x at [i], y at [i + head_size/2]
+    const uint32_t x_idx = base_idx + pair_idx;
+    const uint32_t y_idx = base_idx + pair_idx + params.head_size / 2;
     
     // Get position for this token
     const float position = float(position_ids[token_idx]);
@@ -117,4 +119,45 @@ kernel void metal_rope_float32(
     // Store rotated values
     input_qk[x_idx] = x_rot;
     input_qk[y_idx] = y_rot;
+}
+
+// Float16 (half) I/O kernel: compute in float for accuracy, store as half
+kernel void metal_rope_float16(
+    device half* input_qk             [[buffer(0)]],  // [num_tokens, num_heads, head_size] input/output tensor (half)
+    device const int* position_ids    [[buffer(1)]],  // [num_tokens] position indices
+    constant RoPEParams& params       [[buffer(2)]],
+    uint3 gid                         [[thread_position_in_grid]]
+) {
+    const uint32_t token_idx = gid.x;
+    const uint32_t head_idx = gid.y;
+    const uint32_t pair_idx = gid.z;  // Index of the (x, y) pair within the head
+
+    if (token_idx >= params.num_tokens ||
+        head_idx >= params.num_heads ||
+        pair_idx >= params.head_size / 2) {
+        return;
+    }
+
+    const uint32_t base_idx = token_idx * params.num_heads * params.head_size +
+                              head_idx * params.head_size;
+    const uint32_t x_idx = base_idx + pair_idx;
+    const uint32_t y_idx = base_idx + pair_idx + params.head_size / 2;
+
+    const float position = float(position_ids[token_idx]);
+    const float exponent = (2.0f * float(pair_idx)) / float(params.head_size);
+    const float freq_base = powr(params.rope_theta, exponent);
+    const float freq = params.rope_factor / freq_base;
+    const float theta = position * freq;
+    const float cos_theta = cos(theta);
+    const float sin_theta = sin(theta);
+
+    // Load as half then promote to float
+    const float x = float(input_qk[x_idx]);
+    const float y = float(input_qk[y_idx]);
+    const float x_rot = x * cos_theta - y * sin_theta;
+    const float y_rot = x * sin_theta + y * cos_theta;
+
+    // Store back as half
+    input_qk[x_idx] = half(x_rot);
+    input_qk[y_idx] = half(y_rot);
 }

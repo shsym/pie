@@ -12,6 +12,7 @@ static id<MTLCommandQueue> commandQueue = nil;
 static id<MTLLibrary> library = nil;
 static id<MTLComputePipelineState> ropeBF16PipelineState = nil;
 static id<MTLComputePipelineState> ropeF32PipelineState = nil;
+static id<MTLComputePipelineState> ropeF16PipelineState = nil;
 static dispatch_once_t onceToken;
 
 static bool initialize_metal_rope() {
@@ -52,6 +53,7 @@ static bool initialize_metal_rope() {
             // Create pipeline states for both variants
             id<MTLFunction> ropeBF16Function = [library newFunctionWithName:@"metal_rope_bfloat16"];
             id<MTLFunction> ropeF32Function = [library newFunctionWithName:@"metal_rope_float32"];
+            id<MTLFunction> ropeF16Function = [library newFunctionWithName:@"metal_rope_float16"];
             
             if (!ropeBF16Function) {
                 std::cerr << "Failed to find metal_rope_bfloat16 function" << std::endl;
@@ -60,6 +62,10 @@ static bool initialize_metal_rope() {
             
             if (!ropeF32Function) {
                 std::cerr << "Failed to find metal_rope_float32 function" << std::endl;
+                return;
+            }
+            if (!ropeF16Function) {
+                std::cerr << "Failed to find metal_rope_float16 function" << std::endl;
                 return;
             }
             
@@ -74,11 +80,16 @@ static bool initialize_metal_rope() {
                 std::cerr << "RoPE F32 pipeline state creation failed: " << error.localizedDescription.UTF8String << std::endl;
                 return;
             }
+            ropeF16PipelineState = [device newComputePipelineStateWithFunction:ropeF16Function error:&error];
+            if (error) {
+                std::cerr << "RoPE F16 pipeline state creation failed: " << error.localizedDescription.UTF8String << std::endl;
+                return;
+            }
         }
     });
     
     return (device != nil && commandQueue != nil && library != nil && 
-            ropeBF16PipelineState != nil && ropeF32PipelineState != nil);
+            ropeBF16PipelineState != nil && ropeF32PipelineState != nil && ropeF16PipelineState != nil);
 }
 
 struct RoPEParams {
@@ -312,5 +323,76 @@ int metal_rope_float32(
         memcpy(input_qk, tensorBuffer.contents, tensor_size);
         
         return 0;  // Success
+    }
+}
+
+// Metal implementation of RoPE for float16 (half I/O)
+int metal_rope_float16(
+    uint16_t* input_qk,              // Input/output tensor [num_tokens, num_heads, head_size] in IEEE half
+    const int32_t* position_ids,     // Position IDs [num_tokens]
+    unsigned int num_tokens,         // Number of tokens (sequence length)
+    unsigned int num_heads,          // Number of attention heads
+    unsigned int head_size,          // Size of each attention head
+    float rope_theta,                // Base for rotary frequency (e.g., 10000.0)
+    float rope_factor                // Scaling factor for RoPE (e.g., 1.0)
+) {
+    @autoreleasepool {
+        if (!initialize_metal_rope()) {
+            std::cerr << "Metal RoPE initialization failed" << std::endl;
+            return -1;
+        }
+        if (!input_qk || !position_ids || num_tokens == 0 || num_heads == 0 || head_size == 0) {
+            std::cerr << "Invalid RoPE parameters" << std::endl;
+            return -2;
+        }
+        if (head_size % 2 != 0) {
+            std::cerr << "RoPE requires even head_size, got: " << head_size << std::endl;
+            return -2;
+        }
+
+        const size_t tensor_size = static_cast<size_t>(num_tokens) * num_heads * head_size * sizeof(uint16_t);
+        const size_t position_size = num_tokens * sizeof(int32_t);
+
+        id<MTLBuffer> tensorBuffer = [device newBufferWithBytes:input_qk length:tensor_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> positionBuffer = [device newBufferWithBytes:position_ids length:position_size options:MTLResourceStorageModeShared];
+        if (!tensorBuffer || !positionBuffer) {
+            std::cerr << "Metal buffer allocation failed" << std::endl;
+            return -3;
+        }
+
+        RoPEParams params = { num_tokens, num_heads, head_size, rope_theta, rope_factor };
+        id<MTLBuffer> paramsBuffer = [device newBufferWithBytes:&params length:sizeof(RoPEParams) options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:ropeF16PipelineState];
+        [encoder setBuffer:tensorBuffer offset:0 atIndex:0];
+        [encoder setBuffer:positionBuffer offset:0 atIndex:1];
+        [encoder setBuffer:paramsBuffer offset:0 atIndex:2];
+
+        MTLSize threadsPerGrid = MTLSizeMake(num_tokens, num_heads, head_size / 2);
+        MTLSize threadsPerThreadgroup = MTLSizeMake(16, 4, 4);
+        NSUInteger maxThreadsPerThreadgroup = ropeF16PipelineState.maxTotalThreadsPerThreadgroup;
+        NSUInteger totalThreadsPerThreadgroup = threadsPerThreadgroup.width * threadsPerThreadgroup.height * threadsPerThreadgroup.depth;
+        if (totalThreadsPerThreadgroup > maxThreadsPerThreadgroup) {
+            threadsPerThreadgroup = MTLSizeMake(8, 8, 2);
+        }
+
+        [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.status == MTLCommandBufferStatusError) {
+            std::cerr << "Metal command buffer execution failed" << std::endl;
+            if (commandBuffer.error) {
+                std::cerr << "Error: " << commandBuffer.error.localizedDescription.UTF8String << std::endl;
+            }
+            return -4;
+        }
+
+        memcpy(input_qk, tensorBuffer.contents, tensor_size);
+        return 0;
     }
 }

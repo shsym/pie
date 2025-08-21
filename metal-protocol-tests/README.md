@@ -124,6 +124,15 @@ bash ../scripts/test_all_ops.sh
 ./metal_protocol_tests --op softmax --case test1 --batch_size 2 --vocab_size 100
 ```
 
+### Precision selection rule for kernel execution
+
+To ensure apples-to-apples comparison against CUDA artifacts, the Metal harness auto-selects kernel precision based on the CUDA reference dtype for each op when applicable (currently implemented for RoPE and attention-style paths):
+
+- If the CUDA reference is bf16: use fp16 kernels, with host-side conversion bf16 -> fp32 -> fp16 for inputs and fp16 -> fp32 -> bf16 for outputs. This preserves numerical behavior while leveraging Metal’s native half I/O.
+- If the CUDA reference is fp32: use fp32 kernels directly with host-side bf16 <-> fp32 conversion as needed for artifact parity.
+
+The harness inspects the CUDA case’s meta.json (for example: tests/artifacts/rope/{case}/meta.json) to infer the reference dtype. If the meta is unavailable, it defaults to the fp32 path.
+
 ### Operation Status
 
 | Operation | Status | Test Command |

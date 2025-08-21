@@ -34,6 +34,17 @@ int metal_rope_float32(
     float rope_factor                // Scaling factor for RoPE (e.g., 1.0)
 );
 
+// Float16 API: input/output buffer is half (IEEE fp16). Internally compute in float for accuracy.
+int metal_rope_float16(
+    uint16_t* input_qk,              // Input/output tensor [num_tokens, num_heads, head_size] in IEEE half (fp16)
+    const int32_t* position_ids,     // Position IDs [num_tokens]
+    unsigned int num_tokens,         // Number of tokens (sequence length)
+    unsigned int num_heads,          // Number of attention heads
+    unsigned int head_size,          // Size of each attention head
+    float rope_theta,                // Base for rotary frequency (e.g., 10000.0)
+    float rope_factor                // Scaling factor for RoPE (e.g., 1.0)
+);
+
 #ifdef __cplusplus
 }
 #endif
