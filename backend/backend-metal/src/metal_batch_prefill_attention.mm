@@ -11,7 +11,7 @@
 // Conversion utilities for bfloat16 to IEEE half
 namespace {
     using bfloat16_t = uint16_t;
-    
+
     // Convert bfloat16 to float32
     inline float bf16_to_float(bfloat16_t bf16) {
         uint32_t bits = static_cast<uint32_t>(bf16) << 16;
@@ -19,23 +19,23 @@ namespace {
         std::memcpy(&f, &bits, sizeof(f));
         return f;
     }
-    
+
     // Convert float32 to IEEE half precision (16-bit)
     inline uint16_t float_to_half(float f) {
         union { float f; uint32_t i; } u;
         u.f = f;
-        
+
         // Handle special cases first
         if (f == 0.0f) return u.i >> 16; // Preserve sign of zero
         if (!std::isfinite(f)) {
             if (std::isnan(f)) return 0x7e00; // NaN
             return (u.i >> 16) | 0x7c00; // Infinity with correct sign
         }
-        
+
         uint32_t sign = (u.i >> 16) & 0x8000;
         int32_t exp = ((u.i >> 23) & 0xff) - 127 + 15;
         uint32_t mantissa = (u.i >> 13) & 0x3ff;
-        
+
         if (exp <= 0) {
             // Underflow to zero
             return static_cast<uint16_t>(sign);
@@ -46,7 +46,7 @@ namespace {
             return static_cast<uint16_t>(sign | (exp << 10) | mantissa);
         }
     }
-    
+
     // Convert bfloat16 to IEEE half via float32
     inline uint16_t bf16_to_half(bfloat16_t bf16) {
         return float_to_half(bf16_to_float(bf16));
@@ -95,16 +95,16 @@ namespace {
         // Round to nearest even by adding 0x8000 before truncation
         return static_cast<bfloat16_t>((bits + 0x8000u) >> 16);
     }
-    
+
     // Convert a vector of bfloat16 data to IEEE half format
     std::vector<uint16_t> convert_bf16_to_half(const void* bf16_data, size_t count) {
         const bfloat16_t* src = static_cast<const bfloat16_t*>(bf16_data);
         std::vector<uint16_t> result(count);
-        
+
         for (size_t i = 0; i < count; ++i) {
             result[i] = bf16_to_half(src[i]);
         }
-        
+
         return result;
     }
 }
@@ -158,10 +158,10 @@ void batch_prefill_attention_unified_bf16(
 
         size_t q_count = static_cast<size_t>(num_qo) * head_dim;
         size_t q_bytes = q_count * sizeof(uint16_t);
-        
+
         // Convert Q input from bfloat16 to IEEE half format for Metal kernel
         std::vector<uint16_t> q_half_data = convert_bf16_to_half(q_input, q_count);
-        
+
         // Note: we don't know total pages from here; assume callers provide consistent arrays and derive from kv_page_indices length
         // For unified path, caller should pass correct linearized buffers
 
@@ -201,11 +201,11 @@ void batch_prefill_attention_unified_bf16(
         // Calculate actual buffer sizes based on provided parameters
         size_t pkpv_count = static_cast<size_t>(num_kv_pages) * page_size * head_dim;
         size_t pkpv_bytes = pkpv_count * sizeof(uint16_t);
-        
+
         // Convert K and V cache data from bfloat16 to IEEE half format for Metal kernel
         std::vector<uint16_t> k_half_data = convert_bf16_to_half(paged_k_cache, pkpv_count);
         std::vector<uint16_t> v_half_data = convert_bf16_to_half(paged_v_cache, pkpv_count);
-        
+
         pk_buf = [device newBufferWithBytes:k_half_data.data() length:pkpv_bytes options:MTLResourceStorageModeShared];
         pv_buf = [device newBufferWithBytes:v_half_data.data() length:pkpv_bytes options:MTLResourceStorageModeShared];
 

@@ -747,7 +747,19 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
               << ", page_size=" << page_size << std::endl;
 
     // Try to load CUDA reference inputs if available to ensure apples-to-apples comparison
-    std::filesystem::path cuda_case_dir = std::filesystem::path("metal-protocol-tests/tests/artifacts") / "batch_prefill_attention" / case_id;
+    // Resolve CUDA artifacts base directory:
+    // 1) PIE_CUDA_ARTIFACTS_DIR env var, or
+    // 2) Absolute path derived from this source file: <repo>/metal-protocol-tests/tests/artifacts
+    std::filesystem::path cuda_base_dir;
+    if (const char* envp = std::getenv("PIE_CUDA_ARTIFACTS_DIR")) {
+        cuda_base_dir = std::filesystem::path(envp);
+    } else {
+        // __FILE__ points to .../metal-protocol-tests/src/ops_metal.mm
+        std::filesystem::path this_file(__FILE__);
+        auto project_root = this_file.parent_path().parent_path(); // .../metal-protocol-tests
+        cuda_base_dir = project_root / "tests" / "artifacts";
+    }
+    std::filesystem::path cuda_case_dir = cuda_base_dir / "batch_prefill_attention" / case_id;
 
     auto file_exists = [](const std::filesystem::path& p) -> bool {
         std::error_code ec; return std::filesystem::exists(p, ec);
@@ -911,6 +923,15 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
 
     print_vec_stats("output", output);
 
+    // Derive kv_len from paging arrays to reflect CUDA metadata
+    int num_pages_actual = static_cast<int>(kv_page_indices.size());
+    int kv_len_actual = 0;
+    if (!kv_last_page_lens.empty()) {
+        kv_len_actual = (num_pages_actual > 0)
+            ? (num_pages_actual - 1) * page_size + kv_last_page_lens[0]
+            : 0;
+    }
+
     // Write artifacts to match CUDA test_unified tensors
     if (artifacts::op_enabled("batch_prefill_attention")) {
         auto dir = artifacts::ensure_dir_for_case("batch_prefill_attention", case_id + "_metal");
@@ -927,24 +948,24 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
         artifacts::write_host_bin(dir, "kv_last_page_lens", kv_last_page_lens.data(), kv_last_page_lens.size());
 
         std::ostringstream meta;
-        meta << "\"version\": \"1\",\n"
+    meta << "\"version\": \"1\",\n"
              << "\"op\": \"batch_prefill_attention\",\n"
              << "\"case_id\": \"" << case_id << "\",\n"
              << "\"config\": {\"num_tokens\": " << num_tokens
              << ", \"num_query_heads\": " << num_query_heads
              << ", \"num_kv_heads\": " << cfg.num_kv_heads
              << ", \"head_size\": " << head_size
-             << ", \"kv_len\": " << cfg.kv_len
+         << ", \"kv_len\": " << (kv_len_actual > 0 ? kv_len_actual : cfg.kv_len)
              << ", \"page_size\": " << page_size
-             << ", \"batch_size\": 1, \"num_pages\": " << kv_page_indices.size() << "},\n"
+         << ", \"batch_size\": 1, \"num_pages\": " << num_pages_actual << "},\n"
              << "\"dtype_map\": {\"q_input\": \"bf16\", \"k_input\": \"bf16\", \"v_input\": \"bf16\", \"paged_k_cache\": \"bf16\", \"paged_v_cache\": \"bf16\", \"output\": \"bf16\", \"qo_indptr\": \"s32\", \"kv_page_indptr\": \"s32\", \"kv_page_indices\": \"s32\", \"kv_last_page_lens\": \"s32\"},\n"
              << "\"shape_map\": {\"q_input\": [" << num_tokens << ", " << head_dim << "], "
-             << "\"k_input\": [" << (kv_page_indices.size() * page_size) << ", " << head_dim << "], "
-             << "\"v_input\": [" << (kv_page_indices.size() * page_size) << ", " << head_dim << "], "
-             << "\"paged_k_cache\": [" << kv_page_indices.size() << ", " << page_size << ", " << head_dim << "], "
-             << "\"paged_v_cache\": [" << kv_page_indices.size() << ", " << page_size << ", " << head_dim << "], "
+         << "\"k_input\": [" << (num_pages_actual * page_size) << ", " << head_dim << "], "
+         << "\"v_input\": [" << (num_pages_actual * page_size) << ", " << head_dim << "], "
+         << "\"paged_k_cache\": [" << num_pages_actual << ", " << page_size << ", " << head_dim << "], "
+         << "\"paged_v_cache\": [" << num_pages_actual << ", " << page_size << ", " << head_dim << "], "
              << "\"output\": [" << num_tokens << ", " << head_dim << "], "
-             << "\"qo_indptr\": [2], \"kv_page_indptr\": [2], \"kv_page_indices\": [" << kv_page_indices.size() << "], \"kv_last_page_lens\": [1]}";
+         << "\"qo_indptr\": [2], \"kv_page_indptr\": [2], \"kv_page_indices\": [" << num_pages_actual << "], \"kv_last_page_lens\": [1]}";
         artifacts::write_meta_json(dir, meta.str());
     }
 
