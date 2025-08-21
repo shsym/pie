@@ -42,10 +42,15 @@ set(METAL_SOURCES
 
 add_executable(metal_protocol_tests ${METAL_SOURCES})
 
+set_target_properties(metal_protocol_tests PROPERTIES
+    CXX_STANDARD 17
+    OBJCXX_STANDARD 17
+)
+
 # Include directories
 target_include_directories(metal_protocol_tests PRIVATE
-    ${REPO_ROOT}/backend/backend-metal/src
-    src
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${REPO_ROOT}/backend/backend-metal/src"
 )
 
 # Detect C++ standard library include path automatically

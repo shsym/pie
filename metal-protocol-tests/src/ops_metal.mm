@@ -1,17 +1,17 @@
 // Metal GPU implementations that call into backend/backend-metal kernels
 // This allows metal-protocol-tests to test actual Metal GPU execution
 
-#include "ops.hpp"
+#include <cstdint>
 #include <iostream>
 #include <vector>
-#include <sstream>
 #include <random>
-#include <cmath>
 #include <filesystem>
 #include <fstream>
-#include <numeric>
-
-// Include Metal implementations from backend-metal
+#include <algorithm>
+#include <chrono>
+#include <limits>
+#include "ops.hpp"
+#include "artifacts.hpp"
 #include "metal_gemm.hpp"
 #include "metal_embedding.hpp"
 #include "metal_silu_and_mul.hpp"
@@ -23,7 +23,6 @@
 #include "metal_grouped_gemm.hpp"
 #include "metal_batch_prefill_attention.hpp"
 
-#include "artifacts.hpp"
 
 namespace ops {
 
@@ -40,6 +39,57 @@ static inline float bf16_to_float(bfloat16_t bf) {
     float f;
     memcpy(&f, &bits, sizeof(f));
     return f;
+}
+
+template<typename T>
+void print_vec_stats(const std::string& name, const std::vector<T>& vec) {
+    if (vec.empty()) {
+        std::cout << "📊 " << name << " is empty." << std::endl;
+        return;
+    }
+    float min_val = std::numeric_limits<float>::max();
+    float max_val = std::numeric_limits<float>::lowest();
+    double sum_val = 0.0;
+    size_t non_zero_count = 0;
+    for (const auto& val_bf16 : vec) {
+        float val = bf16_to_float(val_bf16);
+        if (val < min_val) min_val = val;
+        if (val > max_val) max_val = val;
+        sum_val += val;
+        if (std::abs(val) > 1e-9f) non_zero_count++;
+    }
+    std::cout << "📊 " << name << " range: [" << min_val << ", " << max_val
+              << "], avg=" << sum_val / vec.size()
+              << ", non_zero=" << non_zero_count << "/" << vec.size()
+              << " (" << (100.0 * non_zero_count / vec.size()) << "%)" << std::endl;
+}
+
+template<typename T>
+void print_vec_stats(const std::string& name, const std::vector<T>& vec, size_t n) {
+    if (vec.empty()) {
+        std::cout << "📊 " << name << " is empty." << std::endl;
+        return;
+    }
+    size_t count = std::min(n, vec.size());
+    if (count == 0) {
+        print_vec_stats(name, vec);
+        return;
+    }
+    float min_val = std::numeric_limits<float>::max();
+    float max_val = std::numeric_limits<float>::lowest();
+    double sum_val = 0.0;
+    size_t non_zero_count = 0;
+    for (size_t i = 0; i < count; ++i) {
+        float val = bf16_to_float(vec[i]);
+        if (val < min_val) min_val = val;
+        if (val > max_val) max_val = val;
+        sum_val += val;
+        if (std::abs(val) > 1e-9f) non_zero_count++;
+    }
+    std::cout << "📊 " << name << " range (first " << count << "): [" << min_val << ", " << max_val
+              << "], avg=" << sum_val / count
+              << ", non_zero=" << non_zero_count << "/" << count
+              << ", total_size=" << vec.size() << std::endl;
 }
 
 // Metal implementation of GEMM operation
@@ -690,7 +740,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
     const int head_dim = num_query_heads * head_size;
     const int page_size = cfg.page_size;
 
-    std::cout << "Running Metal Batch Prefill Attention: tokens=" << num_tokens
+    std::cout << "\n🚀 Running Metal Batch Prefill Attention: tokens=" << num_tokens
               << ", query_heads=" << num_query_heads
               << ", head_size=" << head_size
               << ", head_dim=" << head_dim
@@ -774,13 +824,13 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
             paged_k_cache = read_vec_bf16(pkv_p);
             paged_v_cache = read_vec_bf16(pvv_p);
             use_cuda_artifacts = true;
-            std::cout << "Loaded CUDA reference inputs from: " << cuda_case_dir << std::endl;
+            std::cout << "✅ Loaded CUDA reference inputs from: " << cuda_case_dir << std::endl;
         }
     }
 
     if (!use_cuda_artifacts) {
         // Generate synthetic test data for FlashInfer interface testing
-        std::cout << "Generating synthetic test data for FlashInfer interface testing" << std::endl;
+        std::cout << "🔧 Generating synthetic test data for FlashInfer interface testing" << std::endl;
 
         // Set up paging structure to match CUDA reference expectations
         // Calculate number of pages needed for kv_len tokens
@@ -801,8 +851,9 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
 
         // Generate q_input
         q_input.resize(static_cast<size_t>(num_tokens) * head_dim);
-        for (auto& val : q_input) {
-            val = static_cast<T>(dist(gen));
+        for (size_t i = 0; i < q_input.size(); ++i) {
+            float f = dist(gen);
+            q_input[i] = float_to_bf16(f);
         }
 
         // Generate paged K and V caches
@@ -810,28 +861,46 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
         paged_k_cache.resize(cache_size);
         paged_v_cache.resize(cache_size);
         for (auto& val : paged_k_cache) {
-            val = static_cast<T>(dist(gen));
+            val = float_to_bf16(dist(gen));
         }
         for (auto& val : paged_v_cache) {
-            val = static_cast<T>(dist(gen));
+            val = float_to_bf16(dist(gen));
         }
     }
     std::fill(output.begin(), output.end(), static_cast<T>(0));
 
+    print_vec_stats("q_input", q_input, 16);
+    print_vec_stats("paged_k_cache", paged_k_cache, 16);
+    print_vec_stats("paged_v_cache", paged_v_cache, 16);
+
     float scale = 1.0f / sqrtf(static_cast<float>(head_size));
 
-    // Call new unified Metal implementation
-    metal::batch_prefill_attention::batch_prefill_attention_unified_bf16(
-        q_input.data(),
-        paged_k_cache.data(),
-        paged_v_cache.data(),
-        qo_indptr.data(),
-        kv_page_indptr.data(),
-        kv_page_indices.data(),
-        kv_last_page_lens.data(),
-        output.data(),
-        num_tokens, head_dim, page_size, scale
-    );
+    try {
+        auto start = std::chrono::high_resolution_clock::now();
+        // Call new unified Metal implementation
+        metal::batch_prefill_attention::batch_prefill_attention_unified_bf16(
+            q_input.data(),
+            paged_k_cache.data(),
+            paged_v_cache.data(),
+            qo_indptr.data(),
+            kv_page_indptr.data(),
+            kv_page_indices.data(),
+            kv_last_page_lens.data(),
+            output.data(),
+            num_tokens, head_dim, page_size, scale
+        );
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double, std::milli> elapsed = end - start;
+        std::cout << "\n⏱️  Metal kernel execution time: " << elapsed.count() << " ms" << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "\n❌ Metal kernel execution failed: " << e.what() << std::endl;
+        // Optionally re-throw or handle the error as needed
+        throw;
+    }
+
+
+    print_vec_stats("output", output);
 
     // Write artifacts to match CUDA test_unified tensors
     if (artifacts::op_enabled("batch_prefill_attention")) {
@@ -870,7 +939,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
         artifacts::write_meta_json(dir, meta.str());
     }
 
-    std::cout << "Metal Batch Prefill Attention completed successfully" << std::endl;
+    std::cout << "\n✅ Metal Batch Prefill Attention completed successfully" << std::endl;
 }
 
 } // namespace ops

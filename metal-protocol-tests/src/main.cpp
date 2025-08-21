@@ -6,6 +6,8 @@
 #include <vector>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 
 namespace {
 
@@ -88,6 +90,130 @@ bool parse_bool(const char* s, bool& out) {
         return true;
     }
     return false;
+}
+
+// Simple JSON value extraction (for basic config reading)
+std::string extract_json_string(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    
+    pos += search.length();
+    while (pos < json.length() && std::isspace(json[pos])) pos++;
+    
+    if (pos >= json.length() || json[pos] != '"') return "";
+    pos++; // skip opening quote
+    
+    size_t end = json.find('"', pos);
+    if (end == std::string::npos) return "";
+    
+    return json.substr(pos, end - pos);
+}
+
+int extract_json_int(const std::string& json, const std::string& key, int default_val) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return default_val;
+    
+    pos += search.length();
+    while (pos < json.length() && std::isspace(json[pos])) pos++;
+    
+    std::string num_str;
+    while (pos < json.length() && (std::isdigit(json[pos]) || json[pos] == '-')) {
+        num_str += json[pos];
+        pos++;
+    }
+    
+    if (num_str.empty()) return default_val;
+    
+    try {
+        return std::stoi(num_str);
+    } catch (...) {
+        return default_val;
+    }
+}
+
+float extract_json_float(const std::string& json, const std::string& key, float default_val) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return default_val;
+    
+    pos += search.length();
+    while (pos < json.length() && std::isspace(json[pos])) pos++;
+    
+    std::string num_str;
+    while (pos < json.length() && (std::isdigit(json[pos]) || json[pos] == '.' || json[pos] == '-' || json[pos] == 'e' || json[pos] == 'E' || json[pos] == '+')) {
+        num_str += json[pos];
+        pos++;
+    }
+    
+    if (num_str.empty()) return default_val;
+    
+    try {
+        return std::stof(num_str);
+    } catch (...) {
+        return default_val;
+    }
+}
+
+// Read CUDA reference metadata and override parameters if auto_compare is enabled
+void override_with_cuda_metadata(Args& args, const std::string& cuda_artifacts_dir) {
+    if (!args.auto_compare) return;
+    
+    // Map operation names to their CUDA artifact directory names
+    std::string cuda_op_name = args.op;
+    if (args.op == "embedding_lookup") cuda_op_name = "embedding_lookup_forward";
+    
+    std::filesystem::path cuda_meta_path = std::filesystem::path(cuda_artifacts_dir) / cuda_op_name / args.case_id / "meta.json";
+    
+    if (!std::filesystem::exists(cuda_meta_path)) {
+        std::cerr << "Note: CUDA reference metadata not found at " << cuda_meta_path << ", using command-line parameters" << std::endl;
+        return;
+    }
+    
+    try {
+        std::ifstream file(cuda_meta_path);
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        std::string json_content = buffer.str();
+        
+        std::cout << "Reading CUDA reference metadata from " << cuda_meta_path << std::endl;
+        
+        // Extract config parameters from JSON
+        args.num_tokens = extract_json_int(json_content, "num_tokens", args.num_tokens);
+        args.hidden_size = extract_json_int(json_content, "hidden_size", args.hidden_size);
+        args.vocab_size = extract_json_int(json_content, "vocab_size", args.vocab_size);
+        args.intermediate_size = extract_json_int(json_content, "intermediate_size", args.intermediate_size);
+        args.M = extract_json_int(json_content, "M", args.M);
+        args.N = extract_json_int(json_content, "N", args.N);
+        args.k = extract_json_int(json_content, "k", args.k);
+        args.m = extract_json_int(json_content, "m", args.m);
+        args.n = extract_json_int(json_content, "n", args.n);
+        args.batch_size = extract_json_int(json_content, "batch_size", args.batch_size);
+        args.num_heads = extract_json_int(json_content, "num_heads", args.num_heads);
+        args.head_size = extract_json_int(json_content, "head_size", args.head_size);
+        args.num_query_heads = extract_json_int(json_content, "num_query_heads", args.num_query_heads);
+        args.num_kv_heads = extract_json_int(json_content, "num_kv_heads", args.num_kv_heads);
+        args.kv_len = extract_json_int(json_content, "kv_len", args.kv_len);
+        args.page_size = extract_json_int(json_content, "page_size", args.page_size);
+        args.num_groups = extract_json_int(json_content, "num_groups", args.num_groups);
+        args.max_num_pages = extract_json_int(json_content, "max_num_pages", args.max_num_pages);
+        
+        args.eps = extract_json_float(json_content, "eps", args.eps);
+        args.temperature = extract_json_float(json_content, "temperature", args.temperature);
+        args.rope_theta = extract_json_float(json_content, "rope_theta", args.rope_theta);
+        args.rope_factor = extract_json_float(json_content, "rope_factor", args.rope_factor);
+        args.rope_low_frequency_factor = extract_json_float(json_content, "rope_low_frequency_factor", args.rope_low_frequency_factor);
+        args.rope_high_frequency_factor = extract_json_float(json_content, "rope_high_frequency_factor", args.rope_high_frequency_factor);
+        
+        std::cout << "Overridden parameters from CUDA reference:" << std::endl;
+        std::cout << "  num_tokens=" << args.num_tokens << ", hidden_size=" << args.hidden_size << ", vocab_size=" << args.vocab_size << std::endl;
+        std::cout << "  batch_size=" << args.batch_size << ", temperature=" << args.temperature << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Warning: Failed to read CUDA metadata from " << cuda_meta_path << ": " << e.what() << std::endl;
+        std::cerr << "Using command-line parameters instead" << std::endl;
+    }
 }
 
 Args parse_args(int argc, char** argv) {
@@ -214,6 +340,9 @@ int main(int argc, char** argv) {
             args.cuda_artifacts_dir = default_cuda_artifacts_path.string();
         }
 
+        // Override parameters with CUDA reference metadata if comparison is enabled
+        override_with_cuda_metadata(args, args.cuda_artifacts_dir);
+
         // Resolve a default artifacts base inside the build directory (next to the executable)
         // so runs don't spill artifacts into the repo root even if CWD changes.
         std::filesystem::path default_metal_artifacts_base_path = (exe_dir / "tests/artifacts").lexically_normal();
@@ -253,7 +382,7 @@ int main(int argc, char** argv) {
             const char* env_metal_base = std::getenv("PIE_ARTIFACTS_DIR");
             const std::string metal_artifacts_base = env_metal_base ? std::string(env_metal_base) : default_metal_artifacts_base;
             comparison_cmd += " --metal-base " + metal_artifacts_base;
-            comparison_cmd += " --verbose";
+            // Skip --verbose to reduce output clutter
 
             std::cout << "Running: " << comparison_cmd << std::endl;
 
