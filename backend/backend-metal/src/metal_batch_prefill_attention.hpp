@@ -33,5 +33,23 @@ void batch_prefill_attention_unified_bf16(
     int num_kv_pages
 );
 
+// Native float32 variant (no host-side dtype conversions)
+void batch_prefill_attention_unified_f32(
+    const float* q_input,
+    const float* paged_k_cache,
+    const float* paged_v_cache,
+    const int32_t* qo_indptr,
+    const int32_t* kv_page_indptr,
+    const int32_t* kv_page_indices,
+    const int32_t* kv_last_page_lens,
+    float* output,
+    int num_qo,
+    int head_dim,
+    int head_size,
+    int page_size,
+    float scale,
+    int num_kv_pages
+);
+
 } // namespace batch_prefill_attention
 } // namespace metal

@@ -42,7 +42,7 @@ kernel void softmax_kernel(
     
     // Reduce to find global max
     for (uint stride = threadgroup_size / 2; stride > 0; stride /= 2) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threadgroup_size) {
             shared_memory[tid] = max(shared_memory[tid], shared_memory[tid + stride]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -66,7 +66,7 @@ kernel void softmax_kernel(
     
     // Reduce to find global sum
     for (uint stride = threadgroup_size / 2; stride > 0; stride /= 2) {
-        if (tid < stride) {
+        if (tid < stride && tid + stride < threadgroup_size) {
             shared_memory[tid] += shared_memory[tid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -1,124 +1,128 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Top-K Mask Logits Metal implementation
-// Corresponds to flashinfer::sampling::TopKMaskLogits from FlashInfer
-// Applies top-k masking by setting non-top-k values to -infinity
+struct Pair { float val; uint idx; };
 
-struct TopKMaskParams {
-    uint32_t num_tokens;     // Number of tokens (batch dimension)
-    uint32_t vocab_size;     // Vocabulary size
-    uint32_t k;              // Number of top-k values to keep per token
-};
-
-// Helper: in-place insert into descending-sorted top-k buffer
-inline void insert_topk(thread float* topk, thread uint& count, float val, uint K) {
-    if (count < K) {
-        // Insert at end then bubble up to keep descending order
-        uint i = count;
-        topk[i] = val;
-        while (i > 0 && topk[i] > topk[i - 1]) {
-            float tmp = topk[i - 1];
-            topk[i - 1] = topk[i];
-            topk[i] = tmp;
-            --i;
-        }
-        count++;
-    } else if (K > 0 && val > topk[K - 1]) {
-        // Replace smallest (tail) and bubble up
-        topk[K - 1] = val;
-        uint i = K - 1;
-        while (i > 0 && topk[i] > topk[i - 1]) {
-            float tmp = topk[i - 1];
-            topk[i - 1] = topk[i];
-            topk[i] = tmp;
-            --i;
-        }
+void heapify_down(threadgroup Pair* heap, uint n, uint root) {
+    uint i = root;
+    while (true) {
+        uint smallest = i, l = 2 * i + 1, r = 2 * i + 2;
+        if (l < n && heap[l].val < heap[smallest].val) smallest = l;
+        if (r < n && heap[r].val < heap[smallest].val) smallest = r;
+        if (smallest == i) break;
+        Pair t = heap[i]; heap[i] = heap[smallest]; heap[smallest] = t;
+        i = smallest;
     }
 }
+void build_min_heap(threadgroup Pair* heap, uint n) {
+    int start = int(n / 2) - 1;
+    for (int ii = start; ii >= 0; --ii) heapify_down(heap, n, uint(ii));
+}
 
-// Top-K mask kernel using threadgroup memory for sorting
-// Each threadgroup processes one token, threads cooperate to find top-k
+struct TopKMaskParams { uint32_t num_tokens, vocab_size, k; };
+
+// ===== Float32 =====
 kernel void metal_topk_mask_logits_float32(
-    device float* logits              [[buffer(0)]],  // [num_tokens, vocab_size] input/output logits
-    constant TopKMaskParams& params   [[buffer(1)]],
-    uint3 gid                         [[thread_position_in_grid]],
-    uint3 lid                         [[thread_position_in_threadgroup]],
-    uint3 tid                         [[threadgroup_position_in_grid]]
+    device float* logits [[buffer(0)]],
+    constant TopKMaskParams& params [[buffer(1)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]]
 ) {
-    const uint32_t token_idx = tid.x;
-    const uint32_t thread_id = lid.x;
-    const uint32_t threads_per_group = 256; // Match typical Metal threadgroup size
+    const uint token_idx = tg, thread_id = lid;
+    if (token_idx >= params.num_tokens) return;
 
-    if (token_idx >= params.num_tokens) {
-        return;
-    }
-
-    // Calculate base pointer for this token
     device float* token_logits = logits + token_idx * params.vocab_size;
 
-    // Compute threshold (k-th largest) using a single thread to ensure correctness
-    threadgroup float threshold_shared[1];
-    if (thread_id == 0) {
-        const uint MAX_K = 128u; // safety cap
-        const uint K = min(params.k, MAX_K);
-        float topk[128];
-        uint count = 0u;
-        for (uint i = 0u; i < params.vocab_size; ++i) {
-            insert_topk(topk, count, token_logits[i], K);
-        }
-        float threshold = (K > 0u) ? topk[K - 1u] : -INFINITY;
-        threshold_shared[0] = threshold;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float kth_largest = threshold_shared[0];
+    threadgroup Pair top_k_heap[256];
+    threadgroup uint top_k_idx[256];
 
-    // Apply mask: set values below k-th largest to -infinity
-    for (uint32_t i = thread_id; i < params.vocab_size; i += threads_per_group) {
-        if (token_logits[i] < kth_largest) {
-            token_logits[i] = -INFINITY;
+    uint k = min(params.k, params.vocab_size);
+    k = min(k, (uint)256);
+
+    if (thread_id == 0 && k > 0) {
+        // Initialize heap with first k
+        for (uint i = 0; i < k; ++i) {
+            float v = token_logits[i];
+            top_k_heap[i].val = v;
+            top_k_heap[i].idx = i;
         }
+        build_min_heap(top_k_heap, k);
+
+        // Scan remainder
+        for (uint i = k; i < params.vocab_size; ++i) {
+            float v = token_logits[i];
+            if (v > top_k_heap[0].val) {
+                top_k_heap[0].val = v;
+                top_k_heap[0].idx = i;
+                heapify_down(top_k_heap, k, 0);
+            }
+        }
+        // Extract indices (order doesn’t matter)
+        for (uint j = 0; j < k; ++j) top_k_idx[j] = top_k_heap[j].idx;
+    }
+
+    // All threads wait for top_k_idx to be ready
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Parallel masking: write -inf only if NOT in top-k
+    for (uint i = thread_id; i < params.vocab_size; i += tg_size) {
+        bool keep = false;
+        // Linear membership test: O(k), k ≤ 256
+        for (uint j = 0; j < k; ++j) {
+            if (i == top_k_idx[j]) { keep = true; break; }
+        }
+        if (!keep) token_logits[i] = -INFINITY;
     }
 }
 
-// bfloat16 version
+// ===== bfloat16 =====
 kernel void metal_topk_mask_logits_bfloat16(
-    device bfloat* logits             [[buffer(0)]],  // [num_tokens, vocab_size] input/output logits
-    constant TopKMaskParams& params   [[buffer(1)]],
-    uint3 gid                         [[thread_position_in_grid]],
-    uint3 lid                         [[thread_position_in_threadgroup]],
-    uint3 tid                         [[threadgroup_position_in_grid]]
+    device bfloat* logits [[buffer(0)]],
+    constant TopKMaskParams& params [[buffer(1)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]]
 ) {
-    const uint32_t token_idx = tid.x;
-    const uint32_t thread_id = lid.x;
-    const uint32_t threads_per_group = 256;
+    const uint token_idx = tg, thread_id = lid;
+    if (token_idx >= params.num_tokens) return;
 
-    if (token_idx >= params.num_tokens) {
-        return;
-    }
-
-    // Calculate base pointer for this token
     device bfloat* token_logits = logits + token_idx * params.vocab_size;
-    // Compute threshold using single-thread top-k selection
-    threadgroup float threshold_shared[1];
-    if (thread_id == 0) {
-        const uint MAX_K = 128u;
-        const uint K = min(params.k, MAX_K);
-        float topk[128];
-        uint count = 0u;
-        for (uint i = 0u; i < params.vocab_size; ++i) {
-            insert_topk(topk, count, float(token_logits[i]), K);
-        }
-        float threshold = (K > 0u) ? topk[K - 1u] : -INFINITY;
-        threshold_shared[0] = threshold;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float kth_largest = threshold_shared[0];
 
-    // Apply mask: set values below k-th largest to -infinity
-    for (uint32_t i = thread_id; i < params.vocab_size; i += threads_per_group) {
-        if (float(token_logits[i]) < kth_largest) {
-            token_logits[i] = bfloat(-INFINITY);
+    threadgroup Pair top_k_heap[256];
+    threadgroup uint top_k_idx[256];
+
+    uint k = min(params.k, params.vocab_size);
+    k = min(k, (uint)256);
+
+    if (thread_id == 0 && k > 0) {
+        // Initialize heap with first k (convert to float for comparisons)
+        for (uint i = 0; i < k; ++i) {
+            float v = float(token_logits[i]);
+            top_k_heap[i].val = v;
+            top_k_heap[i].idx = i;
         }
+        build_min_heap(top_k_heap, k);
+
+        // Scan remainder
+        for (uint i = k; i < params.vocab_size; ++i) {
+            float v = float(token_logits[i]);
+            if (v > top_k_heap[0].val) {
+                top_k_heap[0].val = v;
+                top_k_heap[0].idx = i;
+                heapify_down(top_k_heap, k, 0);
+            }
+        }
+        for (uint j = 0; j < k; ++j) top_k_idx[j] = top_k_heap[j].idx;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = thread_id; i < params.vocab_size; i += tg_size) {
+        bool keep = false;
+        for (uint j = 0; j < k; ++j) {
+            if (i == top_k_idx[j]) { keep = true; break; }
+        }
+        if (!keep) token_logits[i] = bfloat(-INFINITY);
     }
 }

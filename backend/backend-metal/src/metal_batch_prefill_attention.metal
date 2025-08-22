@@ -216,3 +216,159 @@ kernel void batch_prefill_attention_unified_bf16_kernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+// Float32 variant of the unified prefill attention kernel
+kernel void batch_prefill_attention_unified_f32_kernel(
+    device const float* q_input [[buffer(0)]],
+    device const float* paged_k_cache [[buffer(1)]],
+    device const float* paged_v_cache [[buffer(2)]],
+    device const int* qo_indptr [[buffer(3)]],
+    device const int* kv_page_indptr [[buffer(4)]],
+    device const int* kv_page_indices [[buffer(5)]],
+    device const int* kv_last_page_lens [[buffer(6)]],
+    device float* output [[buffer(7)]],
+    constant Params& params [[buffer(8)]],
+    device float* debug_out [[buffer(9)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid_in_tgp [[thread_index_in_threadgroup]]
+) {
+    const int num_qo = params.num_qo;
+    const int head_dim = params.head_dim;
+    const int head_size = params.head_size;
+    const int page_size = params.page_size;
+    const float scale = params.scale;
+
+    uint qo_idx = tgid.x;
+    if (qo_idx >= uint(num_qo)) return;
+    if (head_dim > MAX_HEAD_DIM) return;
+
+    threadgroup float q_s[MAX_HEAD_DIM];
+    threadgroup float k_block[BLOCK_SIZE][MAX_HEAD_DIM];
+    threadgroup float v_block[BLOCK_SIZE][MAX_HEAD_DIM];
+    threadgroup float w_block[BLOCK_SIZE];
+    threadgroup float m_i;
+    threadgroup float l_i;
+    threadgroup float acc_i[MAX_HEAD_DIM];
+    threadgroup float temp_reduce[TGP_SIZE];
+
+    const int num_heads = max(1, head_dim / max(1, head_size));
+
+    int seq_id = 0;
+    while (seq_id < 100 && qo_indptr[seq_id + 1] <= int(qo_idx)) { seq_id++; }
+    int kv_start_page_pos = kv_page_indptr[seq_id];
+    int kv_end_page_pos = kv_page_indptr[seq_id + 1];
+    int num_pages = kv_end_page_pos - kv_start_page_pos;
+
+    if (qo_idx == 0 && tid_in_tgp == 0 && debug_out != nullptr) {
+        debug_out[0] = scale;
+        debug_out[1] = (float)head_dim;
+        debug_out[2] = (float)page_size;
+        debug_out[3] = (float)num_qo;
+        debug_out[5] = (float)num_pages;
+    }
+
+    if (num_pages <= 0) {
+        for (int d = tid_in_tgp; d < head_dim; d += TGP_SIZE) {
+            output[qo_idx * head_dim + d] = 0.0f;
+        }
+        return;
+    }
+    int last_page_len = kv_last_page_lens[seq_id];
+    int total_kv_len = (num_pages - 1) * page_size + last_page_len;
+    if (qo_idx == 0 && tid_in_tgp == 0 && debug_out != nullptr) {
+        debug_out[4] = (float)total_kv_len;
+        debug_out[6] = (float)last_page_len;
+    }
+
+    for (int h = 0; h < num_heads; ++h) {
+        if (tid_in_tgp == 0) { m_i = -INFINITY; l_i = 0.0f; }
+        for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) { acc_i[d] = 0.0f; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        int q_base = int(qo_idx) * head_dim + h * head_size;
+        for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
+            q_s[d] = q_input[q_base + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int block_start = 0; block_start < total_kv_len; block_start += BLOCK_SIZE) {
+            if (tid_in_tgp < BLOCK_SIZE) {
+                int global_key_idx = block_start + tid_in_tgp;
+                if (global_key_idx < total_kv_len) {
+                    int page_offset = global_key_idx / page_size;
+                    int in_page_offset = global_key_idx % page_size;
+                    int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
+                    uint base_addr = page_idx * page_size * head_dim + in_page_offset * head_dim + h * head_size;
+                    for (int d = 0; d < head_size; ++d) {
+                        k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
+                        v_block[tid_in_tgp][d] = paged_v_cache[base_addr + d];
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float score = 0.0f;
+            int global_key_idx_score = block_start + tid_in_tgp;
+            if (tid_in_tgp < BLOCK_SIZE && global_key_idx_score < total_kv_len) {
+                for (int d = 0; d < head_size; ++d) {
+                    score += q_s[d] * k_block[tid_in_tgp][d];
+                }
+                score *= scale;
+            } else {
+                score = -INFINITY;
+            }
+
+            temp_reduce[tid_in_tgp] = score;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = TGP_SIZE / 2; s > 0; s >>= 1) {
+                if (tid_in_tgp < s) temp_reduce[tid_in_tgp] = max(temp_reduce[tid_in_tgp], temp_reduce[tid_in_tgp + s]);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            float m_j = temp_reduce[0];
+
+            threadgroup float m_prev;
+            if (tid_in_tgp == 0) { m_prev = m_i; m_i = max(m_i, m_j); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float scale_factor = exp(m_prev - m_i);
+            if (tid_in_tgp == 0) { l_i *= scale_factor; }
+            for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) { acc_i[d] *= scale_factor; }
+
+            float w = (score > -INFINITY) ? exp(score - m_i) : 0.0f;
+            if (tid_in_tgp < BLOCK_SIZE) { w_block[tid_in_tgp] = w; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            temp_reduce[tid_in_tgp] = (tid_in_tgp < BLOCK_SIZE) ? w : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = TGP_SIZE / 2; s > 0; s >>= 1) {
+                if (tid_in_tgp < s) temp_reduce[tid_in_tgp] += temp_reduce[tid_in_tgp + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid_in_tgp == 0) { l_i += temp_reduce[0]; }
+
+            int dims_per_thread = (head_size + TGP_SIZE - 1) / TGP_SIZE;
+            for (int i = 0; i < dims_per_thread; ++i) {
+                int d = tid_in_tgp * dims_per_thread + i;
+                if (d < head_size) {
+                    float sum_wv_d = 0.0f;
+                    int num_keys_in_block = min((int)BLOCK_SIZE, total_kv_len - block_start);
+                    for (int j = 0; j < num_keys_in_block; ++j) {
+                        sum_wv_d += w_block[j] * v_block[j][d];
+                    }
+                    acc_i[d] += sum_wv_d;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        int out_base = int(qo_idx) * head_dim + h * head_size;
+        for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
+            if (l_i > 1e-9f) {
+                output[out_base + d] = acc_i[d] / l_i;
+            } else {
+                output[out_base + d] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}

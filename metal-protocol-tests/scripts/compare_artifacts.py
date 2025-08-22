@@ -124,7 +124,7 @@ class ArtifactComparator:
             ) from e
 
     def compare_tensors(self, cuda_tensor: np.ndarray, metal_tensor: np.ndarray,
-                       tensor_name: str) -> Dict[str, Any]:
+                       tensor_name: str, operation: str = None) -> Dict[str, Any]:
         """Compare two tensors with comprehensive numerical analysis"""
         if cuda_tensor.shape != metal_tensor.shape:
             return {
@@ -137,6 +137,63 @@ class ArtifactComparator:
         # Convert to float64 for high-precision comparison
         cuda_f64 = cuda_tensor.astype(np.float64)
         metal_f64 = metal_tensor.astype(np.float64)
+
+        # Special handling for topk_mask_logits: compare based on which indices are preserved
+        if operation == "topk_mask_logits" and tensor_name == "masked_logits":
+            # For top-k masking, what matters is that the same indices are kept (non-infinity)
+            cuda_kept_mask = np.isfinite(cuda_f64)
+            metal_kept_mask = np.isfinite(metal_f64)
+            
+            # Check if the same indices are preserved
+            indices_match = np.array_equal(cuda_kept_mask, metal_kept_mask)
+            
+            if indices_match:
+                # If indices match, compare only the finite values
+                cuda_finite = cuda_f64[cuda_kept_mask]
+                metal_finite = metal_f64[metal_kept_mask]
+                
+                if len(cuda_finite) > 0:
+                    abs_diff_finite = np.abs(cuda_finite - metal_finite)
+                    max_abs_error = np.max(abs_diff_finite)
+                    mean_abs_error = np.mean(abs_diff_finite)
+                    
+                    cuda_abs_finite = np.abs(cuda_finite)
+                    rel_diff_finite = np.where(cuda_abs_finite > 1e-10, 
+                                             abs_diff_finite / cuda_abs_finite, 0.0)
+                    max_rel_error = np.max(rel_diff_finite)
+                    mean_rel_error = np.mean(rel_diff_finite)
+                else:
+                    max_abs_error = mean_abs_error = max_rel_error = mean_rel_error = 0.0
+                
+                # Check tolerance on finite values only
+                abs_pass = max_abs_error <= self.abs_tolerance
+                rel_pass = max_rel_error <= self.rel_tolerance
+                status = 'PASS' if (abs_pass or rel_pass) else 'FAIL'
+                
+                return {
+                    'status': status,
+                    'max_abs_error': max_abs_error,
+                    'max_rel_error': max_rel_error,
+                    'mean_abs_error': mean_abs_error,
+                    'mean_rel_error': mean_rel_error,
+                    'abs_tolerance_pass': abs_pass,
+                    'rel_tolerance_pass': rel_pass,
+                    'notes': f"topk_mask_logits: compared {len(cuda_finite)} finite values, indices match"
+                }
+            else:
+                # Different indices are preserved - this is a failure
+                cuda_kept_count = np.sum(cuda_kept_mask)
+                metal_kept_count = np.sum(metal_kept_mask)
+                return {
+                    'status': 'FAIL',
+                    'max_abs_error': float('inf'),
+                    'max_rel_error': float('inf'),
+                    'mean_abs_error': float('inf'),
+                    'mean_rel_error': float('inf'),
+                    'abs_tolerance_pass': False,
+                    'rel_tolerance_pass': False,
+                    'error': f"topk_mask_logits: different indices preserved (CUDA: {cuda_kept_count}, Metal: {metal_kept_count})"
+                }
 
         # Handle infinities: when both values are the same infinity, treat as exact match (zero error)
         same_inf_mask = np.isinf(cuda_f64) & np.isinf(metal_f64) & (np.sign(cuda_f64) == np.sign(metal_f64))
@@ -250,7 +307,7 @@ class ArtifactComparator:
                             f"abs={self.abs_tolerance:.2e}, rel={self.rel_tolerance:.2e}"
                         )
 
-                comparison = self.compare_tensors(cuda_tensor, metal_tensor, tensor_name)
+                comparison = self.compare_tensors(cuda_tensor, metal_tensor, tensor_name, operation)
 
                 # Restore original tolerances for next tensors
                 self.abs_tolerance, self.rel_tolerance = orig_abs_tol, orig_rel_tol

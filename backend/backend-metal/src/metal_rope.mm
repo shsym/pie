@@ -98,6 +98,7 @@ struct RoPEParams {
     uint32_t head_size;      // Size of each attention head
     float rope_theta;        // Base for rotary frequency computation (e.g., 10000.0)
     float rope_factor;       // Scaling factor for RoPE (e.g., 1.0)
+    bool interleaved;        // Layout: true = even/odd indices, false = split halves
 };
 
 // Metal implementation of RoPE for bfloat16
@@ -151,7 +152,8 @@ int metal_rope_bfloat16(
             .num_heads = num_heads,
             .head_size = head_size,
             .rope_theta = rope_theta,
-            .rope_factor = rope_factor
+            .rope_factor = rope_factor,
+            .interleaved = false  // Match CUDA FlashInfer default (non-interleaved)
         };
 
         id<MTLBuffer> paramsBuffer = [device newBufferWithBytes:&params
@@ -264,7 +266,8 @@ int metal_rope_float32(
             .num_heads = num_heads,
             .head_size = head_size,
             .rope_theta = rope_theta,
-            .rope_factor = rope_factor
+            .rope_factor = rope_factor,
+            .interleaved = false  // Match CUDA FlashInfer default (non-interleaved)
         };
 
         id<MTLBuffer> paramsBuffer = [device newBufferWithBytes:&params
@@ -360,7 +363,7 @@ int metal_rope_float16(
             return -3;
         }
 
-        RoPEParams params = { num_tokens, num_heads, head_size, rope_theta, rope_factor };
+        RoPEParams params = { num_tokens, num_heads, head_size, rope_theta, rope_factor, false };
         id<MTLBuffer> paramsBuffer = [device newBufferWithBytes:&params length:sizeof(RoPEParams) options:MTLResourceStorageModeShared];
 
         id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];

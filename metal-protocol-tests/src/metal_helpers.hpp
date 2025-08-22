@@ -8,8 +8,11 @@
 #include <iostream>
 #include <vector>
 
-// Pull in bfloat16_t alias from Metal GEMM header (uint16_t)
-#include "metal_gemm.hpp"
+// Define bfloat16_t alias locally (matches backend host mapping)
+#ifndef PIE_HAS_BFLOAT16_ALIAS
+#define PIE_HAS_BFLOAT16_ALIAS 1
+using bfloat16_t = uint16_t;
+#endif
 
 // bf16 conversions
 static inline bfloat16_t float_to_bf16(float f) {

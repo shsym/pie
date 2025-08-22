@@ -177,12 +177,13 @@ void batch_prefill_attention_unified_bf16(
         id<MTLBuffer> kv_page_indices_buf = nil;
         id<MTLBuffer> kv_last_page_lens_buf = nil;
         id<MTLBuffer> out_buf = [device newBufferWithLength:q_bytes options:MTLResourceStorageModeShared];
-        // Small debug buffer (7 floats)
+    // Small debug buffer (7 floats)
         const size_t debug_floats = 7;
         id<MTLBuffer> debug_buf = [device newBufferWithLength:debug_floats * sizeof(float) options:MTLResourceStorageModeShared];
         if (debug_buf && debug_buf.contents) {
             memset(debug_buf.contents, 0, debug_floats * sizeof(float));
         }
+
 
         // Create buffers with unknown lengths by scanning simple arrays sizes from context is not possible here.
         // We require caller to provide arrays with known sizes and pass those sizes externally in a higher-level layer.
@@ -267,6 +268,98 @@ void batch_prefill_attention_unified_bf16(
                       << ", num_pages=" << dbg[5]
                       << ", last_page_len=" << dbg[6]
                       << std::endl;
+        }
+    }
+}
+
+void batch_prefill_attention_unified_f32(
+    const float* q_input,
+    const float* paged_k_cache,
+    const float* paged_v_cache,
+    const int32_t* qo_indptr,
+    const int32_t* kv_page_indptr,
+    const int32_t* kv_page_indices,
+    const int32_t* kv_last_page_lens,
+    float* output,
+    int num_qo,
+    int head_dim,
+    int head_size,
+    int page_size,
+    float scale,
+    int num_kv_pages
+) {
+    @autoreleasepool {
+        id<MTLDevice> device = get_metal_device();
+        if (!device) { std::cerr << "Failed to get Metal device" << std::endl; return; }
+        id<MTLLibrary> library = get_metal_library();
+        if (!library) { std::cerr << "Failed to get Metal library" << std::endl; return; }
+
+        NSError* error = nil;
+        id<MTLFunction> function = [library newFunctionWithName:@"batch_prefill_attention_unified_f32_kernel"];
+        if (!function) { std::cerr << "Failed to find batch_prefill_attention_unified_f32_kernel" << std::endl; return; }
+        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (error || !pipeline) { std::cerr << "Failed to create pipeline: " << (error ? error.localizedDescription.UTF8String : "unknown") << std::endl; return; }
+
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        id<MTLCommandBuffer> cmd = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        size_t q_count = static_cast<size_t>(num_qo) * head_dim;
+        size_t q_bytes = q_count * sizeof(float);
+
+        id<MTLBuffer> q_buf = [device newBufferWithBytes:q_input length:q_bytes options:MTLResourceStorageModeShared];
+        if (!paged_k_cache || !paged_v_cache || !qo_indptr || !kv_page_indptr || !kv_page_indices || !kv_last_page_lens) {
+            std::cerr << "Unified API requires non-null paged buffers and indices" << std::endl; return;
+        }
+
+        size_t pkpv_count = static_cast<size_t>(num_kv_pages) * page_size * head_dim;
+        size_t pkpv_bytes = pkpv_count * sizeof(float);
+
+        id<MTLBuffer> pk_buf = [device newBufferWithBytes:paged_k_cache length:pkpv_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pv_buf = [device newBufferWithBytes:paged_v_cache length:pkpv_bytes options:MTLResourceStorageModeShared];
+
+        size_t qo_indptr_elems = static_cast<size_t>(num_qo) + 1;
+        size_t kv_page_indptr_elems = static_cast<size_t>(num_qo) + 1; // assume one seq for simplicity
+        size_t kv_page_indices_elems = static_cast<size_t>(num_kv_pages);
+        size_t kv_last_page_lens_elems = static_cast<size_t>(num_qo);
+
+        id<MTLBuffer> qo_indptr_buf = [device newBufferWithBytes:qo_indptr length:qo_indptr_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_page_indptr_buf = [device newBufferWithBytes:kv_page_indptr length:kv_page_indptr_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_page_indices_buf = [device newBufferWithBytes:kv_page_indices length:kv_page_indices_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_last_page_lens_buf = [device newBufferWithBytes:kv_last_page_lens length:kv_last_page_lens_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+
+        id<MTLBuffer> out_buf = [device newBufferWithLength:q_bytes options:MTLResourceStorageModeShared];
+        const size_t debug_floats = 7;
+        id<MTLBuffer> debug_buf = [device newBufferWithLength:debug_floats * sizeof(float) options:MTLResourceStorageModeShared];
+        if (debug_buf && debug_buf.contents) memset(debug_buf.contents, 0, debug_floats * sizeof(float));
+
+        struct Params { int num_qo; int head_dim; int head_size; int page_size; float scale; };
+        Params p = { num_qo, head_dim, head_size, page_size, scale };
+        id<MTLBuffer> params_buf = [device newBufferWithBytes:&p length:sizeof(Params) options:MTLResourceStorageModeShared];
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q_buf offset:0 atIndex:0];
+        [enc setBuffer:pk_buf offset:0 atIndex:1];
+        [enc setBuffer:pv_buf offset:0 atIndex:2];
+        [enc setBuffer:qo_indptr_buf offset:0 atIndex:3];
+        [enc setBuffer:kv_page_indptr_buf offset:0 atIndex:4];
+        [enc setBuffer:kv_page_indices_buf offset:0 atIndex:5];
+        [enc setBuffer:kv_last_page_lens_buf offset:0 atIndex:6];
+        [enc setBuffer:out_buf offset:0 atIndex:7];
+        [enc setBuffer:params_buf offset:0 atIndex:8];
+        [enc setBuffer:debug_buf offset:0 atIndex:9];
+
+        MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);
+        MTLSize threadgroupsPerGrid = MTLSizeMake(num_qo, 1, 1);
+        [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+        [enc endEncoding];
+
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        if (cmd.error) { std::cerr << "Metal command buffer error: " << cmd.error.localizedDescription.UTF8String << std::endl; return; }
+
+        if (out_buf && out_buf.contents && output) {
+            memcpy(output, out_buf.contents, q_bytes);
         }
     }
 }

@@ -4,6 +4,10 @@ using namespace metal;
 // RoPE (Rotary Position Embedding) Metal implementation
 // Corresponds to flashinfer::pos_enc::apply_llama31_rope_pos_ids_inplace from FlashInfer
 // Applies rotary position embedding to query and key tensors in-place
+//
+// Supports both layout modes:
+// - Non-interleaved (default): Rotates first half [0, head_size/2) with second half [head_size/2, head_size)
+// - Interleaved: Rotates even indices [0,2,4...] with odd indices [1,3,5...]
 
 struct RoPEParams {
     uint32_t num_tokens;     // Number of tokens in the sequence
@@ -11,6 +15,7 @@ struct RoPEParams {
     uint32_t head_size;      // Size of each attention head
     float rope_theta;        // Base for rotary frequency computation (e.g., 10000.0)
     float rope_factor;       // Scaling factor for RoPE (e.g., 1.0)
+    bool interleaved;        // Layout: true = even/odd indices, false = split halves
 };
 
 // RoPE kernel that processes pairs of elements in each head
@@ -35,12 +40,20 @@ kernel void metal_rope_bfloat16(
         return;
     }
 
-    // Calculate tensor indices
+    // Calculate tensor indices based on layout
     const uint32_t base_idx = token_idx * params.num_heads * params.head_size +
                               head_idx * params.head_size;
-    // Pair across halves: x at [i], y at [i + head_size/2]
-    const uint32_t x_idx = base_idx + pair_idx;
-    const uint32_t y_idx = base_idx + pair_idx + params.head_size / 2;
+    
+    uint32_t x_idx, y_idx;
+    if (params.interleaved) {
+        // Interleaved layout: even/odd indices [0,1,2,3...] -> pairs (0,1), (2,3), etc.
+        x_idx = base_idx + pair_idx * 2;
+        y_idx = base_idx + pair_idx * 2 + 1;
+    } else {
+        // Non-interleaved layout: split halves [0,1,2,3...] -> pairs (0,2), (1,3), etc.
+        x_idx = base_idx + pair_idx;
+        y_idx = base_idx + pair_idx + params.head_size / 2;
+    }
 
     // Get position for this token
     const float position = float(position_ids[token_idx]);
@@ -86,13 +99,22 @@ kernel void metal_rope_float32(
         pair_idx >= params.head_size / 2) {
         return;
     }
-
-    // Calculate tensor indices
+    
+    // Calculate tensor indices based on layout
     const uint32_t base_idx = token_idx * params.num_heads * params.head_size +
                               head_idx * params.head_size;
-    // Pair across halves: x at [i], y at [i + head_size/2]
-    const uint32_t x_idx = base_idx + pair_idx;
-    const uint32_t y_idx = base_idx + pair_idx + params.head_size / 2;
+    
+    uint32_t x_idx, y_idx;
+    if (params.interleaved) {
+        // Interleaved layout: even/odd indices [0,1,2,3...] -> pairs (0,1), (2,3), etc.
+        x_idx = base_idx + pair_idx * 2;
+        y_idx = base_idx + pair_idx * 2 + 1;
+    } else {
+        // Non-interleaved layout: split halves [0,1,2,3...] -> pairs (0,2), (1,3), etc.
+        x_idx = base_idx + pair_idx;
+        y_idx = base_idx + pair_idx + params.head_size / 2;
+    }
+    
 
     // Get position for this token
     const float position = float(position_ids[token_idx]);

@@ -200,9 +200,8 @@ int metal_rmsnorm_float32(
     unsigned int hidden_size,    // Hidden dimension size
     float eps                    // Epsilon for numerical stability (e.g., 1e-5)
 ) {
-    // Note: This function would require a separate float32 Metal kernel
-    // For now, we'll convert to bfloat16 and back (with precision loss warning)
-    std::cerr << "Warning: metal_rmsnorm_float32 not implemented, using bfloat16 conversion" << std::endl;
+    // Note: Uses bf16 Metal kernel with fp32↔bf16 conversion
+    // This is the current implementation until native fp32 Metal kernel is added
     
     // Convert float32 to bfloat16
     std::vector<uint16_t> input_bf16(static_cast<size_t>(num_tokens) * hidden_size);

@@ -77,6 +77,7 @@ void emit_cuda_meta_from_cli(const Args& args) {
     os << "{\n";
     os << "  \"op\": \"" << cuda_op_name << "\",\n";
     os << "  \"case_id\": \"" << args.case_id << "\",\n";
+    os << "  \"dtype\": \"" << args.dtype << "\",\n";
     os << "  \"num_tokens\": " << args.num_tokens << ",\n";
     os << "  \"hidden_size\": " << args.hidden_size << ",\n";
     os << "  \"vocab_size\": " << args.vocab_size << ",\n";
@@ -100,7 +101,7 @@ void emit_cuda_meta_from_cli(const Args& args) {
     os << "}\n";
     std::ofstream ofs(meta);
     ofs << os.str();
-    std::cout << "Wrote CUDA-style meta.json to " << meta << std::endl;
+    std::cout << "Wrote CUDA-style meta.json to " << meta << " with dtype=" << args.dtype << std::endl;
 }
 
 bool parse_u64(const char* s, uint64_t& out) {
@@ -246,7 +247,7 @@ void override_with_cuda_metadata(Args& args, const std::string& cuda_artifacts_d
         args.rope_low_frequency_factor = extract_json_float(json_content, "rope_low_frequency_factor", args.rope_low_frequency_factor);
         args.rope_high_frequency_factor = extract_json_float(json_content, "rope_high_frequency_factor", args.rope_high_frequency_factor);
 
-        std::cout << "Overridden parameters from CUDA reference:" << std::endl;
+        std::cout << "Loaded parameters from CUDA reference:" << std::endl;
         std::cout << "  num_tokens=" << args.num_tokens << ", hidden_size=" << args.hidden_size << ", vocab_size=" << args.vocab_size << std::endl;
         std::cout << "  batch_size=" << args.batch_size << ", temperature=" << args.temperature << std::endl;
 
@@ -374,6 +375,8 @@ Args parse_args(int argc, char** argv) {
             const char* v = next(i); if (!v || !parse_int(v, a.batch_size)) throw std::runtime_error("--batch_size int");
         } else if (flag == "--seed") {
             const char* v = next(i); if (!v || !parse_u64(v, a.seed)) throw std::runtime_error("--seed u64");
+        } else if (flag == "--dtype") {
+            if (const char* v = next(i)) a.dtype = v; else throw std::runtime_error("--dtype requires value");
         } else if (flag == "-h" || flag == "--help") {
             std::cout << "Usage:\\n"
                          "  metal_protocol_tests --op OP [--case ID] [OPTIONS...]\n"

@@ -111,3 +111,46 @@ kernel void metal_embedding_lookup_vectorized_bfloat16(
         }
     }
 }
+
+// Float32 version of embedding lookup kernel
+kernel void metal_embedding_lookup_float32(
+    device const float* embedding_matrix  [[buffer(0)]],  // [vocab_size, hidden_size] embedding table
+    device const int32_t* indices         [[buffer(1)]],  // [num_tokens] token indices to lookup
+    device float* output                   [[buffer(2)]],  // [num_tokens, hidden_size] output embeddings
+    constant EmbeddingParams& params       [[buffer(3)]],
+    uint3 gid                              [[thread_position_in_grid]],
+    uint3 lid                              [[thread_position_in_threadgroup]],
+    uint3 tid                              [[threadgroup_position_in_grid]]
+) {
+    // Each threadgroup processes one token lookup
+    const uint32_t token_idx = tid.x;
+
+    if (token_idx >= params.num_tokens) {
+        return;
+    }
+
+    // Get the vocabulary index for this token (with bounds checking)
+    const int32_t vocab_idx = indices[token_idx];
+    if (vocab_idx < 0 || vocab_idx >= static_cast<int32_t>(params.vocab_size)) {
+        // Invalid index - zero out the output
+        for (uint32_t i = lid.x; i < params.hidden_size; i += 32) {
+            if (i < params.hidden_size) {
+                output[token_idx * params.hidden_size + i] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    // Calculate source and destination pointers
+    device const float* source_embedding = embedding_matrix + vocab_idx * params.hidden_size;
+    device float* dest_embedding = output + token_idx * params.hidden_size;
+
+    // Use all threads in the threadgroup to copy the embedding vector
+    const uint32_t threads_per_group = 32;
+
+    for (uint32_t i = lid.x; i < params.hidden_size; i += threads_per_group) {
+        if (i < params.hidden_size) {
+            dest_embedding[i] = source_embedding[i];
+        }
+    }
+}
