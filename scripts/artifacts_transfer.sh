@@ -11,7 +11,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ARTIFACTS_ARCHIVE="$WORKSPACE_ROOT/cuda_artifacts.tar.xz"
-ARTIFACTS_SOURCE="$WORKSPACE_ROOT/metal-protocol-tests/tests/artifacts"
+CUDA_ARTIFACTS_SOURCE="$WORKSPACE_ROOT/cuda-protocol-tests/build/tests/artifacts"
+METAL_ARTIFACTS_TARGET="$WORKSPACE_ROOT/metal-protocol-tests/tests/artifacts"
+LLAMA31_CONFIG="$WORKSPACE_ROOT/cuda-protocol-tests/llama31_configs.json"
 MANIFEST_FILE="$WORKSPACE_ROOT/metal-protocol-tests/tests/artifact_manifest.json"
 MANIFEST_GENERATOR="$SCRIPT_DIR/generate_artifact_manifest.py"
 
@@ -26,6 +28,7 @@ print_usage() {
     echo "Usage: $0 [compress|extract]"
     echo ""
     echo "Commands:"
+    echo "  generate  - Generate Llama 3.1 CUDA artifacts"
     echo "  compress  - Compress artifacts from Linux machine for transfer"
     echo "  extract   - Extract artifacts on macOS machine for Metal validation"
     echo ""
@@ -37,7 +40,8 @@ print_usage() {
     echo "  ./scripts/artifacts_transfer.sh extract"
     echo ""
     echo "Archive location: cuda_artifacts.tar.xz (workspace root)"
-    echo "Artifacts path:   metal-protocol-tests/tests/artifacts/"
+    echo "CUDA source:      cuda-protocol-tests/build/tests/artifacts/"
+    echo "Metal target:     metal-protocol-tests/tests/artifacts/"
 }
 
 check_requirements() {
@@ -68,19 +72,25 @@ validate_artifacts() {
         return 0
     fi
     
+    # Determine which artifacts directory to use
+    local artifacts_dir="$CUDA_ARTIFACTS_SOURCE"
+    if [ ! -d "$artifacts_dir" ] && [ -d "$METAL_ARTIFACTS_TARGET" ]; then
+        artifacts_dir="$METAL_ARTIFACTS_TARGET"
+    fi
+    
     # Generate or update manifest if artifacts exist
-    if [ -d "$ARTIFACTS_SOURCE" ]; then
-        python3 "$MANIFEST_GENERATOR" generate "$ARTIFACTS_SOURCE" >/dev/null 2>&1
+    if [ -d "$artifacts_dir" ]; then
+        python3 "$MANIFEST_GENERATOR" generate "$artifacts_dir" >/dev/null 2>&1
     fi
     
     # Validate if both artifacts and manifest exist
-    if [ -d "$ARTIFACTS_SOURCE" ] && [ -f "$MANIFEST_FILE" ]; then
-        if python3 "$MANIFEST_GENERATOR" validate "$ARTIFACTS_SOURCE" "$MANIFEST_FILE" >/dev/null 2>&1; then
+    if [ -d "$artifacts_dir" ] && [ -f "$MANIFEST_FILE" ]; then
+        if python3 "$MANIFEST_GENERATOR" validate "$artifacts_dir" "$MANIFEST_FILE" >/dev/null 2>&1; then
             echo -e "${GREEN}✅ Artifact validation passed${NC}"
             return 0
         else
             echo -e "${RED}❌ Artifact validation failed${NC}"
-            python3 "$MANIFEST_GENERATOR" validate "$ARTIFACTS_SOURCE" "$MANIFEST_FILE" 2>&1 | sed 's/^/  /'
+            python3 "$MANIFEST_GENERATOR" validate "$artifacts_dir" "$MANIFEST_FILE" 2>&1 | sed 's/^/  /'
             
             if [ "$should_exit_on_failure" = true ]; then
                 echo -e "${RED}Fix artifacts before compressing${NC}"
@@ -94,25 +104,80 @@ validate_artifacts() {
     fi
 }
 
+generate_llama31_artifacts() {
+    echo -e "${BLUE}🔄 Generating Llama 3.1 CUDA artifacts...${NC}"
+    
+    if [ ! -f "$LLAMA31_CONFIG" ]; then
+        echo -e "${RED}Error: Llama 3.1 config not found: $LLAMA31_CONFIG${NC}"
+        exit 1
+    fi
+    
+    cd "$WORKSPACE_ROOT/cuda-protocol-tests/build"
+    
+    # Generate artifacts for key operations with Llama 3.1 8B configuration
+    echo -e "${YELLOW}Generating RMS Norm artifacts...${NC}"
+    CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op rms_norm --case llama31_prod --num_tokens 512
+    
+    echo -e "${YELLOW}Generating SiLU and Mul artifacts...${NC}"
+    CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op silu_and_mul --case llama31_prod --num_tokens 512
+    
+    echo -e "${YELLOW}Generating RoPE artifacts...${NC}"
+    CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op rope --case llama31_prod --num_tokens 512
+    
+    echo -e "${YELLOW}Generating GEMM artifacts (QKV projection)...${NC}"
+    CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op gemm --case llama31_qkv --m 512 --n 4096 --k 4096
+    
+    echo -e "${YELLOW}Generating GEMM artifacts (O projection)...${NC}"
+    CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op gemm --case llama31_o_proj --m 512 --n 4096 --k 4096
+    
+    echo -e "${YELLOW}Generating GEMM artifacts (Gate/Up projection)...${NC}"
+    CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op gemm --case llama31_gate_up --m 512 --n 6144 --k 4096
+    
+    echo -e "${YELLOW}Generating GEMM artifacts (Down projection)...${NC}"
+    CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op gemm --case llama31_down --m 512 --n 4096 --k 6144
+    
+    echo -e "${YELLOW}Generating embedding lookup artifacts...${NC}"
+    CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op embedding_lookup --case llama31_prod --num_tokens 512
+    
+    echo -e "${YELLOW}Generating softmax artifacts...${NC}"
+    CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op softmax --case llama31_prod --batch_size 8
+    
+    echo -e "${GREEN}✅ Llama 3.1 artifact generation complete!${NC}"
+}
+
 compress_artifacts() {
     echo -e "${BLUE}🗜️  Compressing CUDA artifacts for transfer...${NC}"
     
-    if [ ! -d "$ARTIFACTS_SOURCE" ]; then
-        echo -e "${RED}Error: Artifacts directory not found: $ARTIFACTS_SOURCE${NC}"
+    # Check if we should generate artifacts first
+    if [ ! -d "$CUDA_ARTIFACTS_SOURCE" ]; then
+        echo -e "${YELLOW}CUDA artifacts not found, generating them...${NC}"
+        generate_llama31_artifacts
+    fi
+    
+    if [ ! -d "$CUDA_ARTIFACTS_SOURCE" ]; then
+        echo -e "${RED}Error: Artifacts directory not found: $CUDA_ARTIFACTS_SOURCE${NC}"
         echo "Generate CUDA artifacts first using:"
-        echo "  cd metal-protocol-tests && bash scripts/regenerate_artifacts.sh"
+        echo "  cd cuda-protocol-tests/build && ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op rms_norm --case test"
         exit 1
     fi
     
     # Check if artifacts exist
-    ARTIFACT_COUNT=$(find "$ARTIFACTS_SOURCE" -name "*.bin" -o -name "*.json" | wc -l)
+    ARTIFACT_COUNT=$(find "$CUDA_ARTIFACTS_SOURCE" -name "*.bin" -o -name "*.json" | wc -l)
     if [ "$ARTIFACT_COUNT" -eq 0 ]; then
-        echo -e "${RED}Error: No artifacts found in $ARTIFACTS_SOURCE${NC}"
-        echo "Generate CUDA artifacts first using the test framework"
+        echo -e "${RED}Error: No artifacts found in $CUDA_ARTIFACTS_SOURCE${NC}"
+        echo "Generate CUDA artifacts first using the CUDA protocol tests"
         exit 1
     fi
     
     echo -e "${YELLOW}Found $ARTIFACT_COUNT artifact files${NC}"
+    
+    # Copy artifacts to Metal target location for validation and archiving
+    echo -e "${BLUE}Copying artifacts to Metal target location...${NC}"
+    mkdir -p "$(dirname "$METAL_ARTIFACTS_TARGET")"
+    cp -r "$CUDA_ARTIFACTS_SOURCE" "$METAL_ARTIFACTS_TARGET"
+    
+    # Copy config file too
+    cp "$LLAMA31_CONFIG" "$WORKSPACE_ROOT/metal-protocol-tests/"
     
     # Validate artifacts before compression
     validate_artifacts true
@@ -126,7 +191,8 @@ compress_artifacts() {
     tar -cf cuda_artifacts.tar \
         --directory="$WORKSPACE_ROOT" \
         metal-protocol-tests/tests/artifacts/ \
-        metal-protocol-tests/tests/artifact_manifest.json
+        metal-protocol-tests/llama31_configs.json \
+        metal-protocol-tests/tests/artifact_manifest.json 2>/dev/null || true
     
     if [ ! -f cuda_artifacts.tar ]; then
         echo -e "${RED}Error: Failed to create tar archive${NC}"
@@ -143,7 +209,7 @@ compress_artifacts() {
     
     # Get archive info
     ARCHIVE_SIZE=$(du -h "$ARTIFACTS_ARCHIVE" | cut -f1)
-    COMPRESSION_RATIO=$(echo "scale=1; $(stat -f%z "$ARTIFACTS_ARCHIVE" 2>/dev/null || stat -c%s "$ARTIFACTS_ARCHIVE") * 100 / $(du -sb "$ARTIFACTS_SOURCE" | cut -f1)" | bc 2>/dev/null || echo "N/A")
+    COMPRESSION_RATIO=$(echo "scale=1; $(stat -f%z "$ARTIFACTS_ARCHIVE" 2>/dev/null || stat -c%s "$ARTIFACTS_ARCHIVE") * 100 / $(du -sb "$METAL_ARTIFACTS_TARGET" | cut -f1)" | bc 2>/dev/null || echo "N/A")
     
     echo -e "${GREEN}✅ Compression complete!${NC}"
     echo -e "📦 Archive: ${BLUE}$ARTIFACTS_ARCHIVE${NC}"
@@ -212,11 +278,22 @@ show_status() {
         echo -e "📦 Archive: ${RED}Not found${NC}"
     fi
     
-    if [ -d "$ARTIFACTS_SOURCE" ]; then
-        ARTIFACT_COUNT=$(find "$ARTIFACTS_SOURCE" -name "*.bin" -o -name "*.json" | wc -l)
-        echo -e "📁 Artifacts: ${GREEN}Found${NC} (${YELLOW}$ARTIFACT_COUNT files${NC})"
+    # Check both CUDA and Metal artifact locations
+    local artifacts_found=false
+    if [ -d "$CUDA_ARTIFACTS_SOURCE" ]; then
+        ARTIFACT_COUNT=$(find "$CUDA_ARTIFACTS_SOURCE" -name "*.bin" -o -name "*.json" | wc -l)
+        echo -e "📁 CUDA Artifacts: ${GREEN}Found${NC} (${YELLOW}$ARTIFACT_COUNT files${NC})"
+        artifacts_found=true
+    else
+        echo -e "📁 CUDA Artifacts: ${RED}Not found${NC}"
+    fi
+    
+    if [ -d "$METAL_ARTIFACTS_TARGET" ]; then
+        ARTIFACT_COUNT=$(find "$METAL_ARTIFACTS_TARGET" -name "*.bin" -o -name "*.json" | wc -l)
+        echo -e "📁 Metal Artifacts: ${GREEN}Found${NC} (${YELLOW}$ARTIFACT_COUNT files${NC})"
+        artifacts_found=true
         
-        # Show validation status
+        # Show validation status for Metal artifacts
         if [ -f "$MANIFEST_FILE" ]; then
             echo -e "📋 Manifest: ${GREEN}Found${NC}"
             validate_artifacts false >/dev/null 2>&1
@@ -232,11 +309,11 @@ show_status() {
         # Show operation coverage using manifest if available
         if [ -f "$MANIFEST_FILE" ] && [ -f "$MANIFEST_GENERATOR" ]; then
             echo -e "${BLUE}Operation Coverage:${NC}"
-            python3 "$MANIFEST_GENERATOR" summary "$MANIFEST_FILE" 2>/dev/null | grep "  •" | sed 's/^//'
+            python3 "$MANIFEST_GENERATOR" summary "$MANIFEST_FILE" 2>/dev/null | grep "  •" | sed 's/^//' || true
         else
             # Fallback to directory listing
             echo -e "${BLUE}Operation Coverage:${NC}"
-            for op_dir in "$ARTIFACTS_SOURCE"/*; do
+            for op_dir in "$METAL_ARTIFACTS_TARGET"/*; do
                 if [ -d "$op_dir" ]; then
                     op_name=$(basename "$op_dir")
                     case_count=$(find "$op_dir" -mindepth 1 -maxdepth 1 -type d | wc -l)
@@ -245,20 +322,24 @@ show_status() {
             done
         fi
     else
-        echo -e "📁 Artifacts: ${RED}Not found${NC}"
+        echo -e "📁 Metal Artifacts: ${RED}Not found${NC}"
+    fi
+    
+    if [ "$artifacts_found" = false ]; then
+        echo -e "📁 No artifacts found in either location"
     fi
     
     echo ""
     echo -e "${BLUE}Next Steps:${NC}"
-    if [ ! -f "$ARTIFACTS_ARCHIVE" ] && [ ! -d "$ARTIFACTS_SOURCE" ]; then
-        echo -e "  1. Generate CUDA artifacts: ${YELLOW}cd metal-protocol-tests && bash scripts/regenerate_artifacts.sh${NC}"
+    if [ ! -f "$ARTIFACTS_ARCHIVE" ] && [ ! -d "$CUDA_ARTIFACTS_SOURCE" ] && [ ! -d "$METAL_ARTIFACTS_TARGET" ]; then
+        echo -e "  1. Generate CUDA artifacts: ${YELLOW}cd cuda-protocol-tests/build && ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op rms_norm --case test${NC}"
         echo -e "  2. Compress for transfer: ${YELLOW}./scripts/artifacts_transfer.sh compress${NC}"
-    elif [ -d "$ARTIFACTS_SOURCE" ] && [ ! -f "$ARTIFACTS_ARCHIVE" ]; then
+    elif [ -d "$CUDA_ARTIFACTS_SOURCE" ] && [ ! -f "$ARTIFACTS_ARCHIVE" ]; then
         echo -e "  • Compress artifacts: ${YELLOW}./scripts/artifacts_transfer.sh compress${NC}"
-    elif [ -f "$ARTIFACTS_ARCHIVE" ] && [ ! -d "$ARTIFACTS_SOURCE" ]; then
+    elif [ -f "$ARTIFACTS_ARCHIVE" ] && [ ! -d "$METAL_ARTIFACTS_TARGET" ]; then
         echo -e "  • Extract artifacts: ${YELLOW}./scripts/artifacts_transfer.sh extract${NC}"
     else
-        echo -e "  • All ready! Test Metal: ${YELLOW}cd metal-protocol-tests/build && ./metal_protocol_tests --backend metal --op gemm --case test1 --m 32 --n 128 --k 64${NC}"
+        echo -e "  • All ready! Test Metal: ${YELLOW}cd metal-protocol-tests/build && ./metal_protocol_tests --backend metal --config llama31_configs.json --op gemm --case llama31_qkv${NC}"
     fi
 }
 
@@ -266,6 +347,9 @@ main() {
     check_requirements
     
     case "${1:-status}" in
+        generate)
+            generate_llama31_artifacts
+            ;;
         compress)
             compress_artifacts
             ;;

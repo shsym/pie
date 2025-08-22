@@ -152,6 +152,14 @@ void run_all_dtypes_for_operation(const std::string& op_name, const std::string&
         run_add_residual_typed<float>(base_case_id, *cfg, seed);
         run_add_residual_typed<__half>(base_case_id, *cfg, seed);
         run_add_residual_typed<__nv_bfloat16>(base_case_id, *cfg, seed);
+    } else if (op_name == "softmax") {
+        const auto* cfg = static_cast<const SoftmaxConfig*>(config_ptr);
+        std::cout << "Running softmax with supported data types (FlashInfer limitation: float only)...\n";
+        run_softmax_typed<float>(base_case_id, *cfg, seed);
+    } else if (op_name == "topk_mask_logits") {
+        const auto* cfg = static_cast<const TopKMaskConfig*>(config_ptr);
+        std::cout << "Running topk_mask_logits with supported data types (FlashInfer limitation: float only)...\n";
+        run_topk_mask_logits_typed<float>(base_case_id, *cfg, seed);
     }
 }
 

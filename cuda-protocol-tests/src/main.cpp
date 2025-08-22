@@ -1,5 +1,6 @@
 #include "ops.hpp"
 #include "artifacts.hpp"
+#include "config_loader.hpp"
 
 #include <iostream>
 #include <string>
@@ -11,6 +12,8 @@ namespace {
 struct Args {
     std::string op;
     std::string case_id = "auto";
+    std::string config_file;
+    std::string model_size = "8B";
     int num_tokens = 128;
     int hidden_size = 4096;
     int vocab_size = 32000;
@@ -92,6 +95,10 @@ Args parse_args(int argc, char** argv) {
             if (const char* v = next(i)) a.op = v; else throw std::runtime_error("--op requires value");
         } else if (flag == "--case") {
             if (const char* v = next(i)) a.case_id = v; else throw std::runtime_error("--case requires value");
+        } else if (flag == "--config") {
+            if (const char* v = next(i)) a.config_file = v; else throw std::runtime_error("--config requires value");
+        } else if (flag == "--model") {
+            if (const char* v = next(i)) a.model_size = v; else throw std::runtime_error("--model requires value");
         } else if (flag == "--num_tokens") {
             const char* v = next(i); if (!v || !parse_int(v, a.num_tokens)) throw std::runtime_error("--num_tokens int");
         } else if (flag == "--hidden_size") {
@@ -126,12 +133,40 @@ Args parse_args(int argc, char** argv) {
             if (const char* v = next(i)) a.output_dtype = v; else throw std::runtime_error("--output_dtype requires value");
         } else if (flag == "--seed") {
             const char* v = next(i); if (!v || !parse_u64(v, a.seed)) throw std::runtime_error("--seed u64");
+        } else if (flag == "--batch_size") {
+            const char* v = next(i); if (!v || !parse_int(v, a.batch_size)) throw std::runtime_error("--batch_size int");
+        } else if (flag == "--temperature") {
+            const char* v = next(i); if (!v || !parse_float(v, a.temperature)) throw std::runtime_error("--temperature float");
+        } else if (flag == "--num_query_heads") {
+            const char* v = next(i); if (!v || !parse_int(v, a.num_query_heads)) throw std::runtime_error("--num_query_heads int");
+        } else if (flag == "--num_kv_heads") {
+            const char* v = next(i); if (!v || !parse_int(v, a.num_kv_heads)) throw std::runtime_error("--num_kv_heads int");
+        } else if (flag == "--head_size") {
+            const char* v = next(i); if (!v || !parse_int(v, a.head_size)) throw std::runtime_error("--head_size int");
+        } else if (flag == "--kv_len") {
+            const char* v = next(i); if (!v || !parse_int(v, a.kv_len)) throw std::runtime_error("--kv_len int");
+        } else if (flag == "--page_size") {
+            const char* v = next(i); if (!v || !parse_int(v, a.page_size)) throw std::runtime_error("--page_size int");
+        } else if (flag == "--rope_theta") {
+            const char* v = next(i); if (!v || !parse_float(v, a.rope_theta)) throw std::runtime_error("--rope_theta float");
+        } else if (flag == "--rope_factor") {
+            const char* v = next(i); if (!v || !parse_float(v, a.rope_factor)) throw std::runtime_error("--rope_factor float");
+        } else if (flag == "--rope_low_frequency_factor") {
+            const char* v = next(i); if (!v || !parse_float(v, a.rope_low_frequency_factor)) throw std::runtime_error("--rope_low_frequency_factor float");
+        } else if (flag == "--rope_high_frequency_factor") {
+            const char* v = next(i); if (!v || !parse_float(v, a.rope_high_frequency_factor)) throw std::runtime_error("--rope_high_frequency_factor float");
+        } else if (flag == "--max_position_embeddings") {
+            const char* v = next(i); if (!v || !parse_int(v, a.max_position_embeddings)) throw std::runtime_error("--max_position_embeddings int");
         } else if (flag == "-h" || flag == "--help") {
             std::cout << "CUDA Protocol Tests - Generate Golden Reference Data\\n"
                          "Usage:\\n"
-                         "  cuda_protocol_tests --op OP [--case ID] [OPTIONS...]\\n"
+                         "  cuda_protocol_tests --op OP [--config FILE] [--model SIZE] [--case ID] [OPTIONS...]\\n"
                          "\\n"
                          "This tool generates CUDA golden reference artifacts for Metal validation.\\n"
+                         "\\n"
+                         "Configuration:\\n"
+                         "  --config FILE    Load model configuration from JSON file (e.g., llama31_configs.json)\\n"
+                         "  --model SIZE     Model size to use from config (8B, 70B, 405B) [default: 8B]\\n"
                          "\\n"
                          "Operations:\\n"
                          "  cuda_protocol_tests --op embedding_lookup [--case ID] [--num_tokens N] [--hidden_size D] [--vocab_size V] [--seed S]\\n"
@@ -141,7 +176,11 @@ Args parse_args(int argc, char** argv) {
                          "  cuda_protocol_tests --op gemm [--case ID] [--m M] [--n N] [--k K] [--transa T] [--transb T] [--use_bias B] [--seed S]\\n"
                          "  cuda_protocol_tests --op rope [--case ID] [--num_tokens N] [--num_heads H] [--head_size S] [--rope_theta T] [--rope_factor F] [--seed S]\\n"
                          "  cuda_protocol_tests --op softmax [--case ID] [--batch_size B] [--vocab_size V] [--temperature T] [--seed S]\\n"
-                         "  cuda_protocol_tests --op batch_prefill_attention [--case ID] [--num_tokens N] [--num_query_heads QH] [--num_kv_heads KH] [--head_size S] [--kv_len L] [--page_size P] [--seed S]\\n";
+                         "  cuda_protocol_tests --op batch_prefill_attention [--case ID] [--num_tokens N] [--num_query_heads QH] [--num_kv_heads KH] [--head_size S] [--kv_len L] [--page_size P] [--seed S]\\n"
+                         "\\n"
+                         "Examples:\\n"
+                         "  cuda_protocol_tests --config llama31_configs.json --model 8B --op rms_norm --case llama31_128\\n"
+                         "  cuda_protocol_tests --config llama31_configs.json --model 70B --op gemm --case qkv_proj --m 512\\n";
             std::exit(0);
         } else {
             throw std::runtime_error("Unknown flag: " + flag);
@@ -151,11 +190,51 @@ Args parse_args(int argc, char** argv) {
     return a;
 }
 
+// Load configuration from JSON file and update args
+void apply_config(Args& args) {
+    if (args.config_file.empty()) return;
+    
+    try {
+        config::Value config = config::load_json(args.config_file);
+        
+        // Navigate to the specified model size
+        if (!config.has("models") || !config["models"].has(args.model_size)) {
+            throw std::runtime_error("Model size '" + args.model_size + "' not found in config");
+        }
+        
+        const auto& model = config["models"][args.model_size];
+        const auto& arch = model["architecture"];
+        
+        // Apply architecture defaults
+        args.hidden_size = arch["hidden_size"].as_int();
+        args.intermediate_size = arch["intermediate_size"].as_int();
+        args.vocab_size = arch["vocab_size"].as_int();
+        args.num_query_heads = arch["num_attention_heads"].as_int();
+        args.num_kv_heads = arch["num_key_value_heads"].as_int();
+        args.head_size = arch["head_size"].as_int();
+        args.max_position_embeddings = arch["max_position_embeddings"].as_int();
+        args.rope_theta = arch["rope_theta"].as_float();
+        args.eps = arch["eps"].as_float();
+        
+        std::cout << "Loaded " << model["name"].as_string() << " configuration:\n";
+        std::cout << "  Hidden size: " << args.hidden_size << "\n";
+        std::cout << "  Intermediate size: " << args.intermediate_size << "\n";
+        std::cout << "  Vocab size: " << args.vocab_size << "\n";
+        std::cout << "  Attention heads: " << args.num_query_heads << "/" << args.num_kv_heads << "\n";
+        
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Failed to load config: " + std::string(e.what()));
+    }
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
+        
+        // Apply configuration from JSON file if provided
+        apply_config(args);
 
         // Ensure artifact writing is on
         if (!artifacts::get_env_flag("PIE_WRITE_ARTIFACTS", false)) {

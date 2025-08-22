@@ -190,6 +190,12 @@ template<typename T>
 void run_rope_typed(const std::string& case_id, const RoPEConfig& cfg, uint64_t seed);
 
 template<typename T>
+void run_softmax_typed(const std::string& case_id, const SoftmaxConfig& cfg, uint64_t seed);
+
+template<typename T>
+void run_topk_mask_logits_typed(const std::string& case_id, const TopKMaskConfig& cfg, uint64_t seed);
+
+template<typename T>
 void run_grouped_gemm_typed(const std::string& case_id, const GroupedGemmConfig& cfg, uint64_t seed);
 
 // Automatic multi-dtype testing function

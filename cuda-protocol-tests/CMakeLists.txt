@@ -73,6 +73,8 @@ set(CUDA_SOURCES
     src/test_kernels/embed_fp16.cu
     src/test_kernels/extract_k_values_fp16.cu
     src/test_kernels/gemm_fp16.cu
+    src/test_kernels/softmax_multi_dtype.cu
+    src/test_kernels/topk_mask_multi_dtype.cu
 )
 
 add_executable(cuda_protocol_tests ${CUDA_SOURCES})

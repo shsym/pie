@@ -26,3 +26,14 @@ void gemm_cublasLt(cublasLtHandle_t ltHandle, cudaStream_t stream,
                    bool transa, bool transb);
 
 // Template specialization for __half is implemented in gemm_fp16.cu
+
+// Multi-dtype FlashInfer wrappers for operations that backend uses in single dtype
+template<typename T>
+cudaError_t online_softmax_test_local(T* logits, T* output, uint32_t batch_size, uint32_t vocab_size,
+                                     T* temperature_arr, T temperature_val, void* workspace_buffer,
+                                     size_t workspace_buffer_size, bool enable_pdl, cudaStream_t stream);
+
+template<typename T>
+cudaError_t topk_mask_logits_test_local(T* logits, T* masked_logits, int32_t* top_k_arr,
+                                       uint32_t batch_size, uint32_t top_k_val, uint32_t vocab_size,
+                                       cudaStream_t stream);
