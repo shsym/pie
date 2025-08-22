@@ -169,6 +169,14 @@ void run_append_paged_kv_cache(const std::string& case_id,
 template<typename T>
 void run_gemm_typed(const std::string& case_id, const GemmConfig& cfg, uint64_t seed);
 
+// Typed embedding lookup (T: data type, I: index type)
+template<typename T, typename I>
+void run_embedding_lookup_typed(const std::string& case_id, const EmbeddingConfig& cfg, uint64_t seed);
+
+// Typed extract_k_values
+template<typename T>
+void run_extract_k_values_typed(const std::string& case_id, const ExtractKConfig& cfg, uint64_t seed);
+
 template<typename T>
 void run_rms_norm_typed(const std::string& case_id, const RMSNormConfig& cfg, uint64_t seed);
 
