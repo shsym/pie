@@ -26,15 +26,20 @@ kernel void extract_k_values_bfloat16_kernel(
         device bfloat* value_output_row = V + row_idx * k;
         device int32_t* index_output_row = I + row_idx * k;
 
-        const bfloat neg_inf = bfloat(-INFINITY);
         uint found = 0u;
         for (uint col = 0u; col < N && found < k; ++col) {
             bfloat val = input_row[col];
-            if (val != neg_inf) {
+            if (val != bfloat(0.0f)) {  // Extract non-zero values
                 value_output_row[found] = val;
                 index_output_row[found] = int32_t(col);
                 ++found;
             }
+        }
+        
+        // Explicitly zero any unfilled slots
+        for (uint i = found; i < k; ++i) {
+            value_output_row[i] = bfloat(0.0f);
+            index_output_row[i] = 0;
         }
     }
 }
@@ -60,15 +65,21 @@ kernel void extract_k_values_float32_kernel(
         device float* value_output_row = V + row_idx * k;
         device int32_t* index_output_row = I + row_idx * k;
 
-        const float neg_inf = -INFINITY;
         uint found = 0u;
         for (uint col = 0u; col < N && found < k; ++col) {
             float val = input_row[col];
-            if (val != neg_inf) {
+            // Handle both data formats: -INFINITY or zero as sentinel
+            if (val != 0.0f && val != -INFINITY && !isinf(val)) {
                 value_output_row[found] = val;
                 index_output_row[found] = int32_t(col);
                 ++found;
             }
+        }
+        
+        // Explicitly zero any unfilled slots  
+        for (uint i = found; i < k; ++i) {
+            value_output_row[i] = 0.0f;
+            index_output_row[i] = 0;
         }
     }
 }

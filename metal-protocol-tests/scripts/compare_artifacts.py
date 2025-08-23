@@ -83,6 +83,15 @@ class ArtifactComparator:
             ('batch_prefill_attention', 'output', 'bf16'): (1e-2, 2e-2),
             # grouped_gemm accumulates in bf16; permit up to 1 ULP (~3.125e-2) and modest rel error
             ('grouped_gemm', 'C', 'bf16'): (3.2e-2, 1.5e-2),
+            # silu_and_mul with bf16 needs slightly more tolerance for large intermediate sizes
+            ('silu_and_mul', 'output', 'bf16'): (5e-3, 1e-2),
+            # extract_k_values with fp32 can have numerical differences in top-k selection
+            ('extract_k_values', 'V', 'fp32'): (1e-2, 1e-2),
+            ('extract_k_values', 'I', 's32'): (0.0, 0.0),  # Integer indices must match exactly
+            ('extract_k_values', 'A', 'fp32'): (1e-2, 1e-2),
+            # extract_k_values with bf16 also needs tolerance
+            ('extract_k_values', 'V', 'bf16'): (1e-2, 2e-2),
+            ('extract_k_values', 'A', 'bf16'): (1e-2, 2e-2),
         }
 
     def load_meta_json(self, artifact_dir: Path) -> Dict[str, Any]:

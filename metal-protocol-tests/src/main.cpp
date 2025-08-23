@@ -225,9 +225,28 @@ void override_with_cuda_metadata(Args& args, const std::string& cuda_artifacts_d
         args.hidden_size = extract_json_int(json_content, "hidden_size", args.hidden_size);
         args.vocab_size = extract_json_int(json_content, "vocab_size", args.vocab_size);
         args.intermediate_size = extract_json_int(json_content, "intermediate_size", args.intermediate_size);
-        args.M = extract_json_int(json_content, "M", args.M);
-        args.N = extract_json_int(json_content, "N", args.N);
-        args.k = extract_json_int(json_content, "k", args.k);
+        
+        // Extract M, N, k from nested "config" object if present (new CUDA artifact format)
+        std::string config_search = "\"config\":";
+        size_t config_pos = json_content.find(config_search);
+        if (config_pos != std::string::npos) {
+            // Find the config object content between braces
+            size_t config_start = json_content.find('{', config_pos + config_search.length());
+            if (config_start != std::string::npos) {
+                size_t config_end = json_content.find('}', config_start);
+                if (config_end != std::string::npos) {
+                    std::string config_content = json_content.substr(config_start, config_end - config_start + 1);
+                    args.M = extract_json_int(config_content, "M", args.M);
+                    args.N = extract_json_int(config_content, "N", args.N);
+                    args.k = extract_json_int(config_content, "k", args.k);
+                }
+            }
+        } else {
+            // Fallback to root level for backward compatibility
+            args.M = extract_json_int(json_content, "M", args.M);
+            args.N = extract_json_int(json_content, "N", args.N);
+            args.k = extract_json_int(json_content, "k", args.k);
+        }
         args.m = extract_json_int(json_content, "m", args.m);
         args.n = extract_json_int(json_content, "n", args.n);
         args.batch_size = extract_json_int(json_content, "batch_size", args.batch_size);

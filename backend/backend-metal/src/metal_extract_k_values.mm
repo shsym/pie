@@ -104,6 +104,10 @@ int metal_extract_k_values_bfloat16(
             return -1;
         }
         
+        // Initialize output buffers to zero to handle unfilled elements
+        memset(valueBuffer.contents, 0, output_value_size);
+        memset(indexBuffer.contents, 0, output_index_size);
+        
         // Create command buffer and encoder
         id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
@@ -171,6 +175,10 @@ int metal_extract_k_values_float32(
             std::cerr << "Failed to create Metal buffers" << std::endl;
             return -1;
         }
+        
+        // Initialize output buffers to zero to handle unfilled elements
+        memset(valueBuffer.contents, 0, output_value_size);
+        memset(indexBuffer.contents, 0, output_index_size);
         
         // Create command buffer and encoder
         id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
