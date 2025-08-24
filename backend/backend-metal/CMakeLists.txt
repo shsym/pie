@@ -91,6 +91,34 @@ set_target_properties(metal_extract_k_values PROPERTIES
     COMPILE_FLAGS "-fobjc-arc"
 )
 
+# Metal TopK Mask Logits library
+add_library(metal_topk_mask_logits
+    src/metal_topk_mask_logits.mm
+)
+
+target_link_libraries(metal_topk_mask_logits
+    ${METAL_FRAMEWORK}
+    ${FOUNDATION_FRAMEWORK}
+)
+
+set_target_properties(metal_topk_mask_logits PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc"
+)
+
+# Metal Common library
+add_library(metal_common
+    src/metal_common.mm
+)
+
+target_link_libraries(metal_common
+    ${METAL_FRAMEWORK}
+    ${FOUNDATION_FRAMEWORK}
+)
+
+set_target_properties(metal_common PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc"
+)
+
 # Test executables
 
 # Final validation test for softmax
@@ -104,39 +132,79 @@ target_link_libraries(final_test_softmax
     ${FOUNDATION_FRAMEWORK}
 )
 
-# Copy Metal shaders to build directory
+# Set output directories
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+
+# Create shaders directory and copy Metal shaders
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders)
+
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_gemm.metal
-    ${CMAKE_BINARY_DIR}/metal_gemm.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_gemm.metal
     COPYONLY
 )
 
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_softmax.metal
-    ${CMAKE_BINARY_DIR}/metal_softmax.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_softmax.metal
     COPYONLY
 )
 
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_embedding.metal
-    ${CMAKE_BINARY_DIR}/metal_embedding.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_embedding.metal
     COPYONLY
 )
 
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_silu_and_mul.metal
-    ${CMAKE_BINARY_DIR}/metal_silu_and_mul.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_silu_and_mul.metal
     COPYONLY
 )
 
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_extract_k_values.metal
-    ${CMAKE_BINARY_DIR}/metal_extract_k_values.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_extract_k_values.metal
     COPYONLY
 )
 
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_batch_prefill_attention.metal
-    ${CMAKE_BINARY_DIR}/metal_batch_prefill_attention.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_batch_prefill_attention.metal
     COPYONLY
 )
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_topk_mask_logits.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_topk_mask_logits.metal
+    COPYONLY
+)
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_rmsnorm.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_rmsnorm.metal
+    COPYONLY
+)
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_rope.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_rope.metal
+    COPYONLY
+)
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_grouped_gemm.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_grouped_gemm.metal
+    COPYONLY
+)
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_add_residual.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_add_residual.metal
+    COPYONLY
+)
+
+# Include tests subdirectory
+add_subdirectory(tests)

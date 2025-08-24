@@ -6,6 +6,10 @@
 // Metal backend for batch prefill attention operation
 // This implements FlashInfer-style attention with paged memory management
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 namespace metal {
 namespace batch_prefill_attention {
 
@@ -53,3 +57,7 @@ void batch_prefill_attention_unified_f32(
 
 } // namespace batch_prefill_attention
 } // namespace metal
+
+#ifdef __cplusplus
+}
+#endif

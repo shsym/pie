@@ -1,0 +1,54 @@
+# Build directories (out-of-source builds)
+build/
+cmake-build-*/
+out/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+
+# Object files
+*.obj
+*.o
+
+# Libraries
+*.a
+*.lib
+*.dylib
+*.so
+
+# Executables
+tests/test_metal_*
+tests/test_*compatibility*
+tests/test_*validation*
+tests/test_*debug*
+tests/test_*inference*
+tests/test_simple_*
+tests/test_softmax_*
+tests/test_end_to_end_*
+
+# Keep test source files
+!tests/src/**/*.cpp
+!tests/src/**/*.mm
+!tests/CMakeLists.txt
+
+# Metal shader copies (originals in src/ should be kept)
+tests/*.metal
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+Testing/
+tests/libmetal_*.a

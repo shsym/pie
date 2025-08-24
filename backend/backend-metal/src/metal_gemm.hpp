@@ -7,6 +7,10 @@
 // Metal bfloat16 type mapping
 using bfloat16_t = uint16_t;  // Metal bfloat maps to uint16_t in host code
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * @brief Metal implementation of GEMM operation matching cuBLAS behavior
  * 
@@ -57,3 +61,7 @@ bool initialize_metal_gemm();
  * Releases Metal resources allocated by initialize_metal_gemm
  */
 void cleanup_metal_gemm();
+
+#ifdef __cplusplus
+}
+#endif

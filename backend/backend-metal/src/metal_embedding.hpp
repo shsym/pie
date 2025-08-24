@@ -7,6 +7,10 @@
 // Metal bfloat16 type mapping
 using bfloat16_t = uint16_t;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /**
  * @brief Metal implementation of embedding lookup matching CUDA backend behavior
  *
@@ -65,3 +69,7 @@ bool initialize_metal_embedding();
  * Releases Metal resources allocated by initialize_metal_embedding
  */
 void cleanup_metal_embedding();
+
+#ifdef __cplusplus
+}
+#endif

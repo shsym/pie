@@ -1,0 +1,150 @@
+# Makefile for Individual Metal Kernel Tests
+# Tests each Metal kernel implementation independently
+
+CXX = clang++
+CXXFLAGS = -std=c++17 -O2 -g
+OBJCFLAGS = -std=c++17 -O2 -g -fobjc-arc
+LDFLAGS = -framework Metal -framework Foundation
+
+# Source directory
+SRCDIR = src
+
+# Common object files needed by multiple tests
+COMMON_OBJS = \
+	metal_common.o \
+	metal_tensor.o \
+	metal_buffer.o
+
+# Test executables
+TESTS = \
+	test_metal_softmax \
+	test_metal_gemm \
+	test_metal_rmsnorm \
+	test_metal_extract_k_values \
+	test_metal_topk_mask_logits \
+	test_metal_performance
+
+# Default target
+all: $(TESTS)
+
+# Common objects
+metal_common.o: $(SRCDIR)/metal_common.mm $(SRCDIR)/metal_common.hpp
+	$(CXX) $(OBJCFLAGS) -I$(SRCDIR) -c -o $@ $<
+
+metal_tensor.o: $(SRCDIR)/metal_tensor.mm $(SRCDIR)/metal_tensor.hpp
+	$(CXX) $(OBJCFLAGS) -I$(SRCDIR) -c -o $@ $<
+
+metal_buffer.o: $(SRCDIR)/metal_buffer.mm $(SRCDIR)/metal_buffer.hpp
+	$(CXX) $(OBJCFLAGS) -I$(SRCDIR) -c -o $@ $<
+
+# Softmax test
+test_metal_softmax: test_metal_softmax.o $(SRCDIR)/metal_softmax.o $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^
+
+test_metal_softmax.o: test_metal_softmax.cpp
+	$(CXX) $(CXXFLAGS) -I. -c -o $@ $<
+
+$(SRCDIR)/metal_softmax.o: $(SRCDIR)/metal_softmax.mm $(SRCDIR)/metal_softmax.hpp
+	$(CXX) $(OBJCFLAGS) -I$(SRCDIR) -c -o $@ $<
+
+# GEMM test
+test_metal_gemm: test_metal_gemm.o $(SRCDIR)/metal_gemm.o $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^
+
+test_metal_gemm.o: test_metal_gemm.cpp
+	$(CXX) $(CXXFLAGS) -I. -c -o $@ $<
+
+$(SRCDIR)/metal_gemm.o: $(SRCDIR)/metal_gemm.mm $(SRCDIR)/metal_gemm.hpp
+	$(CXX) $(OBJCFLAGS) -I$(SRCDIR) -c -o $@ $<
+
+# RMSNorm test
+test_metal_rmsnorm: test_metal_rmsnorm.o $(SRCDIR)/metal_rmsnorm.o $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^
+
+test_metal_rmsnorm.o: test_metal_rmsnorm.cpp
+	$(CXX) $(CXXFLAGS) -I. -c -o $@ $<
+
+$(SRCDIR)/metal_rmsnorm.o: $(SRCDIR)/metal_rmsnorm.mm $(SRCDIR)/metal_rmsnorm.hpp
+	$(CXX) $(OBJCFLAGS) -I$(SRCDIR) -c -o $@ $<
+
+# Extract K Values test
+test_metal_extract_k_values: test_metal_extract_k_values.o $(SRCDIR)/metal_extract_k_values.o $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^
+
+test_metal_extract_k_values.o: test_metal_extract_k_values.cpp
+	$(CXX) $(CXXFLAGS) -I. -c -o $@ $<
+
+$(SRCDIR)/metal_extract_k_values.o: $(SRCDIR)/metal_extract_k_values.mm $(SRCDIR)/metal_extract_k_values.hpp
+	$(CXX) $(OBJCFLAGS) -I$(SRCDIR) -c -o $@ $<
+
+# TopK Mask Logits test
+test_metal_topk_mask_logits: test_metal_topk_mask_logits.o $(SRCDIR)/metal_topk_mask_logits.o $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^
+
+test_metal_topk_mask_logits.o: test_metal_topk_mask_logits.cpp
+	$(CXX) $(CXXFLAGS) -I. -c -o $@ $<
+
+$(SRCDIR)/metal_topk_mask_logits.o: $(SRCDIR)/metal_topk_mask_logits.mm $(SRCDIR)/metal_topk_mask_logits.hpp
+	$(CXX) $(OBJCFLAGS) -I$(SRCDIR) -c -o $@ $<
+
+# Run all tests
+test: $(TESTS)
+	@echo "=== Running Metal Kernel Tests ==="
+	@for test in $(TESTS); do \
+		echo "Running $$test..."; \
+		./$$test || exit 1; \
+		echo ""; \
+	done
+	@echo "🎉 All Metal kernel tests passed!"
+
+# Clean
+clean:
+	rm -f *.o $(TESTS) $(SRCDIR)/*.o
+
+# Individual test targets
+test-softmax: test_metal_softmax
+	./test_metal_softmax
+
+test-gemm: test_metal_gemm
+	./test_metal_gemm
+
+test-rmsnorm: test_metal_rmsnorm
+	./test_metal_rmsnorm
+
+test-extract-k: test_metal_extract_k_values
+	./test_metal_extract_k_values
+
+# End-to-End Inference test
+test_end_to_end_inference: test_end_to_end_inference.o $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^
+
+test_end_to_end_inference.o: test_end_to_end_inference.mm
+	$(CXX) $(OBJCFLAGS) -I. -c -o $@ $<
+
+# Individual test targets
+test-softmax: test_metal_softmax
+	./test_metal_softmax
+
+test-gemm: test_metal_gemm
+	./test_metal_gemm
+
+test-rmsnorm: test_metal_rmsnorm
+	./test_metal_rmsnorm
+
+test-extract-k: test_metal_extract_k_values
+	./test_metal_extract_k_values
+
+test-topk: test_metal_topk_mask_logits
+	./test_metal_topk_mask_logits
+
+# Metal Performance test
+test_metal_performance: test_metal_performance.o $(SRCDIR)/metal_softmax.o $(SRCDIR)/metal_extract_k_values.o $(SRCDIR)/metal_topk_mask_logits.o $(COMMON_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^
+
+test_metal_performance.o: test_metal_performance.cpp
+	$(CXX) $(CXXFLAGS) -I. -c -o $@ $<
+
+test-perf: test_metal_performance
+	./test_metal_performance
+
+.PHONY: all test clean test-softmax test-gemm test-rmsnorm test-extract-k test-topk test-perf
