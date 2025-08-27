@@ -23,7 +23,6 @@ from pie import PieClient, Instance, compile_program
 # Use the refactored imports
 from countdown import CountdownTasksDataset, reward_function, SYSTEM_MESSAGE, USER_TEMPLATE, RESPONSE_PROMPT
 
-
 # ==============================================================================
 # Configuration
 # ==============================================================================
@@ -228,7 +227,7 @@ async def _process_client_rollouts_cross_client(
         global_queue: deque,
         queue_lock: asyncio.Lock,
         client_idx: int,
-        pbar: Optional[tqdm] = None,   # <<< added shared progress bar handle
+        pbar: Optional[tqdm] = None,  # <<< added shared progress bar handle
 ):
     """Adaptive cross-client scheduler using a shared global queue."""
     capacity = _compute_client_capacity(server_uri)
@@ -309,7 +308,6 @@ async def main():
             "training_steps": TRAINING_STEPS,
             "population_size": POPULATION_SIZE,
             "tasks_per_seed": TASKS_PER_SEED,
-            # >>> CHANGED: remove num_rollout_workers_per_client; add new knobs
             "num_rollouts_per_worker": NUM_ROLLOUTS_PER_WORKER,
             "default_max_tokens_per_server": DEFAULT_MAX_TOKENS_PER_SERVER,
             "max_tokens_per_server": MAX_TOKENS_PER_SERVER,
@@ -545,7 +543,6 @@ async def main():
                         "es/mean_population_score": mean_population_score,
                         "es/mean_fittest_score": top_mu_mean,
                         "episodes_text": wandb.Html(episode_html),
-                        # >>> NEW: rollout budget + capacity diagnostics
                         "rollout/missing_seeds": int(missing_seeds),
                         "rollout/max_concurrent_workers_per_client": cap_map,
                     },
