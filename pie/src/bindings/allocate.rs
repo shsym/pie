@@ -21,15 +21,9 @@ impl bindings::pie::inferlet::allocate::Host for InstanceState {
         &mut self,
         queue: Resource<core::Queue>,
     ) -> anyhow::Result<Vec<(String, u32)>> {
-        let inst_id = self.id();
         let q = self.table().get(&queue)?;
         let (tx, rx) = oneshot::channel();
-        Command::GetExportedList {
-            inst_id,
-            ty: ManagedTypes::KvPage,
-            handle: tx,
-        }
-        .dispatch(q.service_id)?;
+        Command::GetAllExportedKvPages { handle: tx }.dispatch(q.service_id)?;
         rx.await.map_err(Into::into)
     }
 
@@ -134,11 +128,11 @@ impl bindings::pie::inferlet::allocate::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::Export {
+        Command::ExportKvPages {
             inst_id,
-            ty: ManagedTypes::KvPage,
-            ids: src_kv_page_ids,
+            pages: src_kv_page_ids,
             resource_name: name,
+            persistent,
         }
         .dispatch(q.service_id)?;
 
@@ -152,9 +146,8 @@ impl bindings::pie::inferlet::allocate::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::Unexport {
+        Command::UnexportKvPages {
             inst_id,
-            ty: ManagedTypes::KvPage,
             resource_name: name,
         }
         .dispatch(q.service_id)?;
@@ -170,10 +163,9 @@ impl bindings::pie::inferlet::allocate::Host for InstanceState {
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let q = self.table().get(&queue)?;
-        Command::Import {
+        Command::ImportKvPages {
             inst_id,
-            ty: ManagedTypes::KvPage,
-            ids: dst_kv_page_ids,
+            kv_pages: dst_kv_page_ids,
             resource_name: name,
         }
         .dispatch(q.service_id)?;
