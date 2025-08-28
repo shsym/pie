@@ -119,22 +119,22 @@ void run_batch_prefill_attention(const std::string& case_id,
 	// Layout: [page_idx][token_in_page][head][dim]
 	const int tokens_per_page = page_size;
 	const int head_data_size = num_kv_heads * head_size;
-	
+
 	// Copy data page by page to respect paged layout
 	for (int page_idx = 0; page_idx < static_cast<int>(num_pages); page_idx++) {
 		int start_token = page_idx * tokens_per_page;
 		int tokens_in_this_page = std::min(tokens_per_page, kv_len - start_token);
-		
+
 		if (tokens_in_this_page <= 0) break;
-		
+
 		// Source: K[start_token:start_token+tokens_in_this_page, :, :]
 		T* src_k = d_k + start_token * head_data_size;
 		T* src_v = d_v + start_token * head_data_size;
-		
+
 		// Destination: paged_k[page_idx, 0:tokens_in_this_page, :, :]
 		T* dst_k = d_paged_k + page_idx * tokens_per_page * head_data_size;
 		T* dst_v = d_paged_v + page_idx * tokens_per_page * head_data_size;
-		
+
 		size_t copy_bytes = tokens_in_this_page * head_data_size * sizeof(T);
 		check_cuda(cudaMemcpyAsync(dst_k, src_k, copy_bytes, cudaMemcpyDeviceToDevice, stream));
 		check_cuda(cudaMemcpyAsync(dst_v, src_v, copy_bytes, cudaMemcpyDeviceToDevice, stream));
@@ -147,16 +147,21 @@ void run_batch_prefill_attention(const std::string& case_id,
 		prefill_handler.SetCUDAStream(stream);
 		// Minimal plan to initialize handler workspace; mirrors usage pattern in backend
 		// Here we provide host copies of indptr arrays for planning.
-		prefill_handler.UpdatePageLockedBufferSize(8 * 1024 * 1024);
-		// Allocate temporary dummy buffers for plan; small scratch sizes suffice for tests
+		// Calculate workspace size based on problem size - larger contexts need more memory
+		const size_t base_workspace_size = 64 * 1024 * 1024; // 64 MB base
+		const size_t context_factor = (kv_len * num_query_heads * head_size * sizeof(T)) / (1024 * 1024);
+		const size_t workspace_size = base_workspace_size + context_factor * 1024 * 1024;
+
+		prefill_handler.UpdatePageLockedBufferSize(workspace_size);
+		// Allocate workspace buffers proportional to problem size
 		void* float_buf = nullptr;
 		void* int_buf = nullptr;
-		ops::check_cuda(cudaMalloc(&float_buf, 8 * 1024 * 1024));
-		ops::check_cuda(cudaMalloc(&int_buf, 4 * 1024 * 1024));
+		ops::check_cuda(cudaMalloc(&float_buf, workspace_size));
+		ops::check_cuda(cudaMalloc(&int_buf, workspace_size / 2));
 		// host vectors already exist: h_qo_indptr, h_kv_page_indptr
 		prefill_handler.Plan<T, I>(
-			float_buf, 8 * 1024 * 1024,
-			int_buf, 4 * 1024 * 1024,
+			float_buf, workspace_size,
+			int_buf, workspace_size / 2,
 			h_qo_indptr.data(), h_kv_page_indptr.data(),
 			/*total_num_rows*/ static_cast<uint32_t>(num_tokens),
 			/*batch_size*/ static_cast<uint32_t>(batch_size),
@@ -168,7 +173,7 @@ void run_batch_prefill_attention(const std::string& case_id,
 
 		// Use FlashInfer's default scale (1/sqrt(head_size)) by not specifying explicit scale
 		// This matches the standard attention scaling behavior
-		
+
 		flashinfer::BatchPrefillWithPagedKVCacheWrapper<T, T, T, I>(
 			&prefill_handler,
 			d_q,                    // query
@@ -198,11 +203,11 @@ void run_batch_prefill_attention(const std::string& case_id,
 	// Validate output is not all zeros (indicates successful attention computation)
 	std::vector<T> h_o_validation(o_size);
 	check_cuda(cudaMemcpy(h_o_validation.data(), d_o, o_size * sizeof(T), cudaMemcpyDeviceToHost));
-	
+
 	int nonzero_count = 0;
 	float sum_abs = 0.0f;
 	float max_abs = 0.0f;
-	
+
 	for (size_t i = 0; i < h_o_validation.size(); i++) {
 		float val = static_cast<float>(h_o_validation[i]);
 		float abs_val = std::abs(val);
@@ -212,15 +217,15 @@ void run_batch_prefill_attention(const std::string& case_id,
 			max_abs = std::max(max_abs, abs_val);
 		}
 	}
-	
+
 	std::cout << "\n📊 CUDA Output Validation:" << std::endl;
 	std::cout << "  Total elements: " << h_o_validation.size() << std::endl;
-	std::cout << "  Non-zero elements: " << nonzero_count << " (" 
+	std::cout << "  Non-zero elements: " << nonzero_count << " ("
 	          << (100.0f * nonzero_count / h_o_validation.size()) << "%)" << std::endl;
 	std::cout << "  Sum of absolute values: " << sum_abs << std::endl;
 	std::cout << "  Max absolute value: " << max_abs << std::endl;
 	std::cout << "  Average absolute value: " << (nonzero_count > 0 ? sum_abs / nonzero_count : 0.0f) << std::endl;
-	
+
 	if (nonzero_count == 0) {
 		std::cerr << "❌ ERROR: Output is all zeros! FlashInfer attention failed." << std::endl;
 		std::cerr << "   This indicates an issue with paged KV cache setup or FlashInfer parameters." << std::endl;
