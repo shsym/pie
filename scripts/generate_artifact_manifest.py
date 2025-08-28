@@ -36,7 +36,7 @@ def analyze_artifacts_directory(artifacts_dir: Path) -> Dict:
             continue
             
         op_name = op_dir.name
-        manifest["operations"][op_name] = {"cases": {}, "file_patterns": set()}
+        manifest["operations"][op_name] = {"cases": {}, "file_patterns": []}
         
         for case_dir in op_dir.iterdir():
             if not case_dir.is_dir():

@@ -11,7 +11,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ARTIFACTS_ARCHIVE="$WORKSPACE_ROOT/cuda_artifacts.tar.xz"
-CUDA_ARTIFACTS_SOURCE="$WORKSPACE_ROOT/cuda-protocol-tests/build/tests/artifacts"
+CUDA_ARTIFACTS_SOURCE="$WORKSPACE_ROOT/metal-protocol-tests/tests/artifacts"
 METAL_ARTIFACTS_TARGET="$WORKSPACE_ROOT/metal-protocol-tests/tests/artifacts"
 LLAMA31_CONFIG="$WORKSPACE_ROOT/cuda-protocol-tests/llama31_configs.json"
 MANIFEST_FILE="$WORKSPACE_ROOT/metal-protocol-tests/tests/artifact_manifest.json"
@@ -40,7 +40,7 @@ print_usage() {
     echo "  ./scripts/artifacts_transfer.sh extract"
     echo ""
     echo "Archive location: cuda_artifacts.tar.xz (workspace root)"
-    echo "CUDA source:      cuda-protocol-tests/build/tests/artifacts/"
+    echo "Artifacts source: metal-protocol-tests/tests/artifacts/"
     echo "Metal target:     metal-protocol-tests/tests/artifacts/"
 }
 
@@ -171,16 +171,14 @@ compress_artifacts() {
     
     echo -e "${YELLOW}Found $ARTIFACT_COUNT artifact files${NC}"
     
-    # Copy artifacts to Metal target location for validation and archiving
-    echo -e "${BLUE}Copying artifacts to Metal target location...${NC}"
-    mkdir -p "$(dirname "$METAL_ARTIFACTS_TARGET")"
-    cp -r "$CUDA_ARTIFACTS_SOURCE" "$METAL_ARTIFACTS_TARGET"
+    # Since CUDA_ARTIFACTS_SOURCE and METAL_ARTIFACTS_TARGET are the same, no copying needed
+    echo -e "${BLUE}Using artifacts directly from Metal target location...${NC}"
     
     # Copy config file too
     cp "$LLAMA31_CONFIG" "$WORKSPACE_ROOT/metal-protocol-tests/"
     
-    # Validate artifacts before compression
-    validate_artifacts true
+    # Validate artifacts using manifest
+    validate_artifacts "$METAL_ARTIFACTS_TARGET" true
     
     # Create archive with progress
     cd "$WORKSPACE_ROOT"
@@ -205,6 +203,12 @@ compress_artifacts() {
     if [ ! -f cuda_artifacts.tar.xz ]; then
         echo -e "${RED}Error: Failed to compress archive${NC}"
         exit 1
+    fi
+    
+    # Clean up uncompressed tar if it still exists (xz usually removes it automatically)
+    if [ -f cuda_artifacts.tar ]; then
+        rm cuda_artifacts.tar
+        echo -e "${BLUE}🧹 Cleaned up uncompressed tar file${NC}"
     fi
     
     # Get archive info
