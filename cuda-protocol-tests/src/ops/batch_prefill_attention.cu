@@ -101,7 +101,7 @@ void run_batch_prefill_attention(const std::string& case_id,
 	check_cuda(cudaMemcpyAsync(d_kv_last_page_lens, h_kv_last_page_lens.data(), batch_size * sizeof(I), cudaMemcpyHostToDevice, stream));
 	check_cuda(cudaMemcpyAsync(d_mask_indptr, h_mask_indptr.data(), (batch_size + 1) * sizeof(I), cudaMemcpyHostToDevice, stream));
 
-	// Initialize paged KV cache to zero
+	// Initialize paged KV cache to zero first
 	check_cuda(cudaMemsetAsync(d_paged_k, 0, page_data_size * sizeof(T), stream));
 	check_cuda(cudaMemsetAsync(d_paged_v, 0, page_data_size * sizeof(T), stream));
 
@@ -115,10 +115,30 @@ void run_batch_prefill_attention(const std::string& case_id,
 		d_kv_last_page_lens
 	);
 
-	// Copy K, V data to paged format (simple linear copy for test)
-	const size_t copy_size = std::min(kv_size, page_data_size);
-	check_cuda(cudaMemcpyAsync(d_paged_k, d_k, copy_size * sizeof(T), cudaMemcpyDeviceToDevice, stream));
-	check_cuda(cudaMemcpyAsync(d_paged_v, d_v, copy_size * sizeof(T), cudaMemcpyDeviceToDevice, stream));
+	// Properly copy K, V data to paged format respecting page layout
+	// Layout: [page_idx][token_in_page][head][dim]
+	const int tokens_per_page = page_size;
+	const int head_data_size = num_kv_heads * head_size;
+	
+	// Copy data page by page to respect paged layout
+	for (int page_idx = 0; page_idx < static_cast<int>(num_pages); page_idx++) {
+		int start_token = page_idx * tokens_per_page;
+		int tokens_in_this_page = std::min(tokens_per_page, kv_len - start_token);
+		
+		if (tokens_in_this_page <= 0) break;
+		
+		// Source: K[start_token:start_token+tokens_in_this_page, :, :]
+		T* src_k = d_k + start_token * head_data_size;
+		T* src_v = d_v + start_token * head_data_size;
+		
+		// Destination: paged_k[page_idx, 0:tokens_in_this_page, :, :]
+		T* dst_k = d_paged_k + page_idx * tokens_per_page * head_data_size;
+		T* dst_v = d_paged_v + page_idx * tokens_per_page * head_data_size;
+		
+		size_t copy_bytes = tokens_in_this_page * head_data_size * sizeof(T);
+		check_cuda(cudaMemcpyAsync(dst_k, src_k, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+		check_cuda(cudaMemcpyAsync(dst_v, src_v, copy_bytes, cudaMemcpyDeviceToDevice, stream));
+	}
 
 	// Use real FlashInfer BatchPrefillWithPagedKVCacheWrapper only; no fallback.
 	// This matches the actual CUDA backend implementation in l4ma.cu via flashinfer_ops.cuh.
@@ -146,6 +166,9 @@ void run_batch_prefill_attention(const std::string& case_id,
 			/*page_size*/ static_cast<uint32_t>(page_size)
 		);
 
+		// Use FlashInfer's default scale (1/sqrt(head_size)) by not specifying explicit scale
+		// This matches the standard attention scaling behavior
+		
 		flashinfer::BatchPrefillWithPagedKVCacheWrapper<T, T, T, I>(
 			&prefill_handler,
 			d_q,                    // query
@@ -160,7 +183,7 @@ void run_batch_prefill_attention(const std::string& case_id,
 			/*mask_indptr*/ d_mask_indptr,
 			/*pos_enc*/ flashinfer::PosEncodingMode::kNone,
 			/*use_fp16_qk_reduction*/ false,
-			/*maybe_sm_scale*/ std::optional<float>(),
+			/*maybe_sm_scale*/ std::optional<float>(),  // Use default scale
 			/*rope_scale*/ 1.0f,
 			/*rope_theta*/ 1e4f,
 			/*stream*/ stream
@@ -171,6 +194,42 @@ void run_batch_prefill_attention(const std::string& case_id,
 	}
 
 	check_cuda(cudaStreamSynchronize(stream));
+
+	// Validate output is not all zeros (indicates successful attention computation)
+	std::vector<T> h_o_validation(o_size);
+	check_cuda(cudaMemcpy(h_o_validation.data(), d_o, o_size * sizeof(T), cudaMemcpyDeviceToHost));
+	
+	int nonzero_count = 0;
+	float sum_abs = 0.0f;
+	float max_abs = 0.0f;
+	
+	for (size_t i = 0; i < h_o_validation.size(); i++) {
+		float val = static_cast<float>(h_o_validation[i]);
+		float abs_val = std::abs(val);
+		if (abs_val > 1e-8f) {
+			nonzero_count++;
+			sum_abs += abs_val;
+			max_abs = std::max(max_abs, abs_val);
+		}
+	}
+	
+	std::cout << "\n📊 CUDA Output Validation:" << std::endl;
+	std::cout << "  Total elements: " << h_o_validation.size() << std::endl;
+	std::cout << "  Non-zero elements: " << nonzero_count << " (" 
+	          << (100.0f * nonzero_count / h_o_validation.size()) << "%)" << std::endl;
+	std::cout << "  Sum of absolute values: " << sum_abs << std::endl;
+	std::cout << "  Max absolute value: " << max_abs << std::endl;
+	std::cout << "  Average absolute value: " << (nonzero_count > 0 ? sum_abs / nonzero_count : 0.0f) << std::endl;
+	
+	if (nonzero_count == 0) {
+		std::cerr << "❌ ERROR: Output is all zeros! FlashInfer attention failed." << std::endl;
+		std::cerr << "   This indicates an issue with paged KV cache setup or FlashInfer parameters." << std::endl;
+	} else if (nonzero_count < static_cast<int>(h_o_validation.size()) * 0.1f) {
+		std::cerr << "⚠️  WARNING: Output has very few non-zero values (" << nonzero_count << "/" << h_o_validation.size() << ")." << std::endl;
+		std::cerr << "   This may indicate partial attention computation issues." << std::endl;
+	} else {
+		std::cout << "✅ SUCCESS: Output contains meaningful attention values." << std::endl;
+	}
 
 	if (artifacts::op_enabled("batch_prefill_attention")) {
 		auto dir = artifacts::ensure_dir_for_case("batch_prefill_attention", case_id);
