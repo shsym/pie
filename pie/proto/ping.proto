@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package ping;
+
+message Ping {
+  uint32 correlation_id = 1;
+  string message = 2;
+}
+
+message Pong {
+  uint32 correlation_id = 1;
+  string message = 2;
+}

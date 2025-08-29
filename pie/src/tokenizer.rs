@@ -104,6 +104,7 @@ pub struct BytePairEncoder {
     special_tokens_decoder: HashMap<Rank, Vec<u8>>,
     regex: Regex,
     special_regex: Regex,
+    escape_non_printable: bool,
 }
 
 impl BytePairEncoder {
@@ -116,7 +117,12 @@ impl BytePairEncoder {
         // Then, convert the bytes to a UTF-8 string.
         // Using `from_utf8_lossy` would silently replace invalid sequences with
         // the Unicode replacement character;
-        let decoded_string = String::from_utf8_lossy(&*decoded_bytes).to_string();
+        let mut decoded_string = String::from_utf8_lossy(&*decoded_bytes).to_string();
+
+        if self.escape_non_printable {
+            let decoded_bytes = unescape_non_printable(&decoded_string).unwrap();
+            decoded_string = String::from_utf8_lossy(&*decoded_bytes).to_string();
+        }
 
         Ok(decoded_string)
     }
@@ -137,6 +143,14 @@ impl BytePairEncoder {
 
     pub fn encode(&self, text: &str, allowed_special: &HashSet<&str>) -> Vec<Rank> {
         let mut ret = vec![];
+
+        let escaped_text = escape_non_printable(text.as_bytes());
+
+        let text = if self.escape_non_printable {
+            &escaped_text
+        } else {
+            text
+        };
 
         let mut start = 0;
         let mut last_piece_token_len = 0;
@@ -189,6 +203,7 @@ impl BytePairEncoder {
         decoder: HashMap<Rank, Vec<u8>>,
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
+        escape_non_printable: bool,
     ) -> Self {
         let regex = Regex::new(pattern).unwrap();
 
@@ -223,6 +238,7 @@ impl BytePairEncoder {
             special_tokens_decoder,
             regex,
             special_regex,
+            escape_non_printable,
         }
     }
 
@@ -291,6 +307,76 @@ pub fn load_merge_rules(path: &str) -> Result<HashMap<Rank, Vec<u8>>, Box<dyn st
 
     Ok(ret)
 }
+
+/// Generate the 256-entry “byte-level” maps.
+///
+///  * `enc[byte] -> char`  (stage-2 encoding)
+///  * `dec[char] -> byte`  (stage-2 decoding)
+///
+/// The algorithm is identical to OpenAI-tiktoken’s `bytes_to_unicode()`.
+///
+/// Printable ranges kept as-is:
+///   1.  '!' (0x21) .. '~' (0x7E)
+///   2.  '¡' (0xA1) .. '¬' (0xAC)
+///   3.  '®' (0xAE) .. 'ÿ' (0xFF)
+///
+/// Everything else (control bytes, space, TAB, …) is
+/// remapped to the BMP starting at U+0100.
+fn build_tables() -> ([char; 256], HashMap<char, u8>) {
+    // Step 1: collect the “safe” byte values we keep unchanged
+    let mut bs: Vec<u8> = (b'!'..=b'~').collect();                    // 0x21–0x7E
+    bs.extend(0xA1..=0xAC);                                          // 0xA1–0xAC
+    bs.extend(0xAE..=0xFF);                                          // 0xAE–0xFF
+
+    // cs will hold the *Unicode code points* corresponding to bs
+    let mut cs: Vec<u32> = bs.iter().map(|&b| b as u32).collect();
+
+    // Step 2: assign code points ≥ 0x100 to the remaining bytes
+    let mut n = 0u32;
+    for b in 0u8..=255 {
+        if !bs.contains(&b) {
+            bs.push(b);
+            cs.push(256 + n);    // U+0100, U+0101, …
+            n += 1;
+        }
+    }
+
+    // Convert to char
+    let cs: Vec<char> = cs.into_iter().map(|u| char::from_u32(u).unwrap()).collect();
+
+    // Zip into the forward & reverse tables
+    let mut enc = ['\0'; 256];
+    let mut dec = HashMap::with_capacity(256);
+    for (b, ch) in bs.into_iter().zip(cs.into_iter()) {
+        enc[b as usize] = ch;
+        dec.insert(ch, b);
+    }
+    (enc, dec)
+}
+
+/// Encode a byte slice with the Qwen/GPT byte-level mapping.
+pub fn escape_non_printable(bytes: &[u8]) -> String {
+    static TABLES: once_cell::sync::Lazy<([char; 256], HashMap<char, u8>)> =
+        once_cell::sync::Lazy::new(build_tables);
+
+    bytes.iter().map(|&b| TABLES.0[b as usize]).collect()
+}
+
+/// Decode a stage-2 string back to raw bytes.
+pub fn unescape_non_printable(s: &str) -> Option<Vec<u8>> {
+    static TABLES: once_cell::sync::Lazy<([char; 256], HashMap<char, u8>)> =
+        once_cell::sync::Lazy::new(build_tables);
+
+    let mut out = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        match TABLES.1.get(&ch) {
+            Some(&b) => out.push(b),
+            None => return None, // invalid symbol
+        }
+    }
+    Some(out)
+}
+
 //
 // pub fn empty_tokenizer() -> BytePairEncoder {
 //     // Create an empty encoder with no merge rules and no special tokens

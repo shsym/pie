@@ -83,6 +83,6 @@ Download a model, start the engine, and run an inferlet.
    From within the PIE shell, execute a compiled inferlet:
 
    ```bash
-   pie> run ../example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
+   pie> run ../example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --model "llama-3.2" --prompt "What is the capital of France?"
    ```
 

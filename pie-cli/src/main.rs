@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use nix;
 use pie::{
     BatchingStrategyConfiguration, Config as EngineConfig,
     auth::{create_jwt, init_secret},
@@ -271,7 +272,11 @@ async fn start_interactive_session(
                 .context("`exec_path` is missing or not a string.")?;
 
             let mut cmd = if backend_type == "python" {
-                let mut cmd = TokioCommand::new("python");
+                let mut cmd = TokioCommand::new("uv");
+                cmd.arg("--project");
+                cmd.arg("../backend/backend-python");
+                cmd.arg("run");
+                cmd.arg("python");
                 cmd.arg("-u");
                 cmd.arg(exec_path);
                 cmd
@@ -297,6 +302,14 @@ async fn start_interactive_session(
                 }
                 cmd.arg(format!("--{}", key))
                     .arg(value.to_string().trim_matches('"').to_string());
+            }
+
+            // Make sure the backend process is a process group leader.
+            unsafe {
+                cmd.pre_exec(|| {
+                    nix::unistd::setsid()?;
+                    Ok(())
+                });
             }
 
             println!("- Spawning backend: {}", exec_path);
@@ -390,11 +403,14 @@ async fn start_interactive_session(
         eprintln!("Warning: Failed to save command history: {}", err);
     }
 
-    for mut child in backend_processes {
+    for child in backend_processes {
         if let Some(pid) = child.id() {
-            println!("- Terminating backend process with PID: {}", pid);
-            if let Err(e) = child.kill().await {
-                eprintln!("  Failed to terminate process {}: {}", pid, e);
+            println!("- Terminating backend process group with PID: {}", pid);
+            if let Err(e) = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            ) {
+                eprintln!("  Failed to terminate process group {}: {}", pid, e);
             }
         }
     }
