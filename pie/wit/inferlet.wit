@@ -8,6 +8,7 @@ world traits {
     import input-text;
     import input-image;
     import output-text;
+    import optimize;
 }
 
 world imports {

@@ -281,6 +281,26 @@ where
         Ok(())
     }
 
+    pub fn inc_ref_count_many(&mut self, ty: TY, ids: &[IdRepr]) {
+        if ty.is_sharable() {
+            if let Some(counter_map) = self.ref_counter.get_mut(&ty) {
+                for id in ids {
+                    counter_map.get_mut(id).unwrap().inc();
+                }
+            }
+        }
+    }
+
+    pub fn dec_ref_count_many(&mut self, ty: TY, ids: &[IdRepr]) {
+        if ty.is_sharable() {
+            if let Some(counter_map) = self.ref_counter.get_mut(&ty) {
+                for id in ids {
+                    counter_map.get_mut(id).unwrap().dec();
+                }
+            }
+        }
+    }
+
     pub fn destroy(
         &mut self,
         ty: TY,

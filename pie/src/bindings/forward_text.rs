@@ -10,9 +10,9 @@ use wasmtime_wasi::p2::{DynPollable, IoView, Pollable, subscribe};
 
 #[derive(Debug)]
 pub struct DistributionResult {
-    receiver: oneshot::Receiver<Vec<(Vec<u32>, Vec<f32>)>>,
-    result: Vec<(Vec<u32>, Vec<f32>)>,
-    done: bool,
+    pub receiver: oneshot::Receiver<Vec<(Vec<u32>, Vec<f32>)>>,
+    pub result: Vec<(Vec<u32>, Vec<f32>)>,
+    pub done: bool,
 }
 
 #[async_trait]
