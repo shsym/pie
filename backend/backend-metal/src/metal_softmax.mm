@@ -7,8 +7,10 @@
 // Static Metal device and library - initialized once
 static id<MTLDevice> g_device = nil;
 static id<MTLLibrary> g_library = nil;
+static id<MTLLibrary> g_tiled_library = nil;
 static id<MTLComputePipelineState> g_softmax_pipeline = nil;
-static id<MTLComputePipelineState> g_softmax_large_pipeline = nil;
+static id<MTLComputePipelineState> g_softmax_large_tiled_pipeline = nil;
+static id<MTLComputePipelineState> g_softmax_large_online_tiled_pipeline = nil;
 static id<MTLCommandQueue> g_command_queue = nil;
 
 static bool initialize_metal_softmax() {
@@ -65,8 +67,42 @@ static bool initialize_metal_softmax() {
             return false;
         }
         
-        // Large vocabulary pipeline commented out for now
-        // TODO: Implement large vocabulary softmax pipeline when needed
+        // Load tiled softmax library for large vocabularies
+        NSString* tiledMetalPath = [dirPath stringByAppendingPathComponent:@"metal_softmax_tiled.metal"];
+        NSString* tiledSource = [NSString stringWithContentsOfFile:tiledMetalPath
+                                                           encoding:NSUTF8StringEncoding
+                                                              error:&error];
+        
+        if (!error && tiledSource) {
+            g_tiled_library = [g_device newLibraryWithSource:tiledSource options:nil error:&error];
+            if (!error && g_tiled_library) {
+                // Create tiled pipeline
+                id<MTLFunction> tiled_function = [g_tiled_library newFunctionWithName:@"softmax_large_tiled"];
+                if (tiled_function) {
+                    g_softmax_large_tiled_pipeline = [g_device newComputePipelineStateWithFunction:tiled_function error:&error];
+                    if (error) {
+                        std::cerr << "Failed to create tiled softmax pipeline: " << error.localizedDescription.UTF8String << std::endl;
+                        g_softmax_large_tiled_pipeline = nil;
+                    }
+                }
+                
+                // Create online tiled pipeline (optional advanced optimization)
+                id<MTLFunction> online_tiled_function = [g_tiled_library newFunctionWithName:@"softmax_large_online_tiled"];
+                if (online_tiled_function) {
+                    g_softmax_large_online_tiled_pipeline = [g_device newComputePipelineStateWithFunction:online_tiled_function error:&error];
+                    if (error) {
+                        std::cerr << "Failed to create online tiled softmax pipeline: " << error.localizedDescription.UTF8String << std::endl;
+                        g_softmax_large_online_tiled_pipeline = nil;
+                    }
+                }
+                
+                std::cout << "Tiled softmax kernels loaded: " 
+                          << (g_softmax_large_tiled_pipeline ? "basic=✅" : "basic=❌") << " "
+                          << (g_softmax_large_online_tiled_pipeline ? "online=✅" : "online=❌") << std::endl;
+            }
+        } else {
+            std::cout << "Tiled softmax kernels not found - using standard kernel only" << std::endl;
+        }
         
         std::cout << "Metal softmax initialization successful" << std::endl;
         return true;
@@ -122,20 +158,38 @@ int metal_softmax_float(
         id<MTLCommandBuffer> command_buffer = [g_command_queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         
-        // Standard softmax kernel - handles any vocabulary size with loops
-        [encoder setComputePipelineState:g_softmax_pipeline];
+        // Intelligent kernel selection based on vocabulary size
+        id<MTLComputePipelineState> chosen_pipeline = g_softmax_pipeline;  // Default fallback
+        uint32_t threadgroup_size = 256;  // Default for tiled kernels
+        size_t shared_mem_size = 0;
+        
+        // Use tiled kernels for large vocabularies (>16K) where cache thrashing dominates
+        if (vocab_size > 16384 && g_softmax_large_tiled_pipeline) {
+            chosen_pipeline = g_softmax_large_tiled_pipeline;
+            threadgroup_size = 256;  // Optimized for tiling
+            
+            const uint32_t TILE_SIZE = 2048;
+            // Shared memory: threadgroup_size floats for reduction + TILE_SIZE for cache
+            shared_mem_size = (threadgroup_size + TILE_SIZE) * sizeof(float);
+            
+            std::cout << "Using tiled kernel for vocab_size=" << vocab_size 
+                      << " (cache-friendly, target 5-9x speedup)" << std::endl;
+        } else {
+            // Use standard kernel for smaller vocabularies
+            const uint32_t max_threadgroup_size = 1024;
+            threadgroup_size = std::min(static_cast<uint32_t>(vocab_size), max_threadgroup_size);
+            shared_mem_size = threadgroup_size * sizeof(float);
+        }
+        
+        [encoder setComputePipelineState:chosen_pipeline];
         [encoder setBuffer:input_buffer offset:0 atIndex:0];
         [encoder setBuffer:output_buffer offset:0 atIndex:1];
         [encoder setBuffer:batch_size_buffer offset:0 atIndex:2];
         [encoder setBuffer:vocab_size_buffer offset:0 atIndex:3];
         [encoder setBuffer:temperature_buffer offset:0 atIndex:4];
         
-        // Threadgroup size: min(vocab_size, max_threadgroup_size)
-        const uint32_t max_threadgroup_size = 1024;
-        uint32_t threadgroup_size = std::min(static_cast<uint32_t>(vocab_size), max_threadgroup_size);
-        
-        // Shared memory size: threadgroup_size floats
-        [encoder setThreadgroupMemoryLength:threadgroup_size * sizeof(float) atIndex:0];
+        // Configure shared memory and dispatch parameters
+        [encoder setThreadgroupMemoryLength:shared_mem_size atIndex:0];
         
         MTLSize threads_per_threadgroup = MTLSizeMake(threadgroup_size, 1, 1);
         MTLSize threadgroups = MTLSizeMake(batch_size, 1, 1);

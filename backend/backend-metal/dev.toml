@@ -1,0 +1,41 @@
+# Metal Backend Configuration
+# This file should match the structure and values of backend-cuda/dev.toml
+
+# Server configuration (for consistency)
+host = "localhost"
+port = 9224  # Different port from CUDA backend (9223)
+
+# Controller connection (same as CUDA)
+controller_host = "localhost"
+controller_port = 9123
+auth_token = "your-secret-auth-token-here"
+
+# Model configuration (match CUDA)
+model = "llama-3.2-1b-instruct"
+
+# Device configuration
+device = "default"  # Use default Metal device
+
+# Data type configuration (match CUDA)
+dtype = "bfloat16"
+
+# KV cache configuration (match CUDA values)
+kv_page_size = 32  # CRITICAL: This was 16 in Metal, 32 in CUDA
+dist_size = 64
+
+# Memory limits (match CUDA)
+max_num_kv_pages = 1000
+max_num_embeds = 50000
+
+# Metal-specific compilation settings
+[metal_compile_flags]
+# These will be passed as -D flags to Metal shader compiler
+block_size_override = false  # If true, use block_size below instead of kv_page_size
+block_size = 32  # Only used if block_size_override = true
+max_head_dim = 256  # Maximum head dimension supported by kernel
+
+# Metal-specific performance settings
+[metal_performance]
+threadgroup_size = 128  # Must match TGP_SIZE in kernel
+enable_optimized_kernels = false  # Use optimized kernel variants when available
+debug_mode = true  # Enable kernel debug output

@@ -105,6 +105,48 @@ set_target_properties(metal_topk_mask_logits PROPERTIES
     COMPILE_FLAGS "-fobjc-arc"
 )
 
+# Metal Batch Prefill Attention library
+add_library(metal_batch_prefill_attention
+    src/metal_batch_prefill_attention.mm
+)
+
+target_link_libraries(metal_batch_prefill_attention
+    ${METAL_FRAMEWORK}
+    ${FOUNDATION_FRAMEWORK}
+)
+
+set_target_properties(metal_batch_prefill_attention PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc"
+)
+
+# Metal Unified Batch Prefill Attention library
+add_library(metal_batch_prefill_attention_unified
+    src/metal_batch_prefill_attention_unified.mm
+)
+
+target_link_libraries(metal_batch_prefill_attention_unified
+    ${METAL_FRAMEWORK}
+    ${FOUNDATION_FRAMEWORK}
+)
+
+set_target_properties(metal_batch_prefill_attention_unified PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc"
+)
+
+# Metal Data Type Conversion library
+add_library(metal_dtype_conversion
+    src/metal_dtype_conversion.mm
+)
+
+target_link_libraries(metal_dtype_conversion
+    ${METAL_FRAMEWORK}
+    ${FOUNDATION_FRAMEWORK}
+)
+
+set_target_properties(metal_dtype_conversion PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc"
+)
+
 # Metal Common library
 add_library(metal_common
     src/metal_common.mm
@@ -176,6 +218,19 @@ configure_file(
     COPYONLY
 )
 
+# Commented out - these files no longer exist after cleanup
+# configure_file(
+#     ${CMAKE_SOURCE_DIR}/src/metal_batch_prefill_attention_optimized.metal
+#     ${CMAKE_BINARY_DIR}/shaders/metal_batch_prefill_attention_optimized.metal
+#     COPYONLY
+# )
+
+# configure_file(
+#     ${CMAKE_SOURCE_DIR}/src/metal_batch_prefill_attention_unified.metal
+#     ${CMAKE_BINARY_DIR}/shaders/metal_batch_prefill_attention_unified.metal
+#     COPYONLY
+# )
+
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_topk_mask_logits.metal
     ${CMAKE_BINARY_DIR}/shaders/metal_topk_mask_logits.metal
@@ -203,6 +258,12 @@ configure_file(
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_add_residual.metal
     ${CMAKE_BINARY_DIR}/shaders/metal_add_residual.metal
+    COPYONLY
+)
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_batch_prefill_attention_flashattention.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_batch_prefill_attention_flashattention.metal
     COPYONLY
 )
 

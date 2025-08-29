@@ -19,8 +19,10 @@ namespace ops {
 void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPrefillAttentionConfig& cfg, uint64_t seed) {
     const int num_tokens = cfg.num_tokens;         // qo tokens
     const int num_query_heads = cfg.num_query_heads;
+    const int num_kv_heads = cfg.num_kv_heads;
     const int head_size = cfg.head_size;
     const int head_dim = num_query_heads * head_size;
+    const int kv_head_dim = num_kv_heads * head_size;
     const int page_size = cfg.page_size;
 
     // Detect target dtype from CUDA reference meta.json
@@ -176,19 +178,14 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
     try {
         auto start = std::chrono::high_resolution_clock::now();
         if (dtype_info.dtype == DType::FP32) {
-            // Prepare FP32 buffers and call native f32 kernel
-            q_input_f32.resize(q_input.size());
-            output_f32.resize(output.size());
-            paged_k_cache_f32.resize(paged_k_cache.size());
-            paged_v_cache_f32.resize(paged_v_cache.size());
-            for (size_t i = 0; i < q_input.size(); ++i) q_input_f32[i] = bf16_to_float(q_input[i]);
-            for (size_t i = 0; i < paged_k_cache.size(); ++i) paged_k_cache_f32[i] = bf16_to_float(paged_k_cache[i]);
-            for (size_t i = 0; i < paged_v_cache.size(); ++i) paged_v_cache_f32[i] = bf16_to_float(paged_v_cache[i]);
+            std::cout << "✅ Using native f32 kernel (linking issues resolved!)" << std::endl;
             metal::batch_prefill_attention::batch_prefill_attention_unified_f32(
-                q_input_f32.data(), paged_k_cache_f32.data(), paged_v_cache_f32.data(),
+                reinterpret_cast<const float*>(q_input.data()), 
+                reinterpret_cast<const float*>(paged_k_cache.data()), 
+                reinterpret_cast<const float*>(paged_v_cache.data()),
                 qo_indptr.data(), kv_page_indptr.data(), kv_page_indices.data(),
-                kv_last_page_lens.data(), output_f32.data(),
-                num_tokens, head_dim, head_size, page_size, scale,
+                kv_last_page_lens.data(), reinterpret_cast<float*>(output.data()),
+                num_tokens, head_dim, kv_head_dim, head_size, page_size, num_query_heads, num_kv_heads, scale,
                 static_cast<int>(kv_page_indices.size())
             );
         }
@@ -199,7 +196,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
                 q_input.data(), paged_k_cache.data(), paged_v_cache.data(),
                 qo_indptr.data(), kv_page_indptr.data(), kv_page_indices.data(),
                 kv_last_page_lens.data(), output.data(),
-                num_tokens, head_dim, head_size, page_size, scale,
+                num_tokens, head_dim, kv_head_dim, head_size, page_size, num_query_heads, num_kv_heads, scale,
                 static_cast<int>(kv_page_indices.size())
             );
             std::cout << "Note: Using bf16 kernel for fp16 request (fp16 kernel not yet implemented)" << std::endl;
@@ -210,7 +207,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
                 q_input.data(), paged_k_cache.data(), paged_v_cache.data(),
                 qo_indptr.data(), kv_page_indptr.data(), kv_page_indices.data(),
                 kv_last_page_lens.data(), output.data(),
-                num_tokens, head_dim, head_size, page_size, scale,
+                num_tokens, head_dim, kv_head_dim, head_size, page_size, num_query_heads, num_kv_heads, scale,
                 static_cast<int>(kv_page_indices.size())
             );
         }

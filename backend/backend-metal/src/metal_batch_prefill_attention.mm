@@ -135,16 +135,30 @@ void batch_prefill_attention_unified_bf16(
     void* output,
     int num_qo,
     int head_dim,
+    int kv_head_dim,      // NEW: KV head dimension for MQA/GQA  
     int head_size,
     int page_size,
+    int num_query_heads,  // NEW: Number of query heads
+    int num_kv_heads,     // NEW: Number of KV heads
     float scale,
-    int num_kv_pages  // Add parameter to specify actual number of pages
+    int num_kv_pages
 ) {
+    std::cout << "🟢 [ENTRY] batch_prefill_attention_unified_bf16 called!" << std::endl;
+    std::cout.flush();
+    std::cout << "🔍 [PATH] Parameters: num_qo=" << num_qo << ", head_dim=" << head_dim 
+              << ", head_size=" << head_size << ", page_size=" << page_size 
+              << ", scale=" << scale << std::endl;
+    std::cout.flush();
     @autoreleasepool {
+        std::cout << "🔍 [PATH] Getting Metal device..." << std::endl;
         id<MTLDevice> device = get_metal_device();
-        if (!device) { std::cerr << "Failed to get Metal device" << std::endl; return; }
+        if (!device) { std::cerr << "❌ Failed to get Metal device" << std::endl; return; }
+        std::cout << "✅ Metal device obtained" << std::endl;
+        
+        std::cout << "🔍 [PATH] Getting Metal library..." << std::endl;
         id<MTLLibrary> library = get_metal_library();
-        if (!library) { std::cerr << "Failed to get Metal library" << std::endl; return; }
+        if (!library) { std::cerr << "❌ Failed to get Metal library" << std::endl; return; }
+        std::cout << "✅ Metal library obtained" << std::endl;
 
         NSError* error = nil;
         id<MTLFunction> function = [library newFunctionWithName:@"batch_prefill_attention_unified_bf16_kernel"];
@@ -177,11 +191,21 @@ void batch_prefill_attention_unified_bf16(
         id<MTLBuffer> kv_page_indices_buf = nil;
         id<MTLBuffer> kv_last_page_lens_buf = nil;
         id<MTLBuffer> out_buf = [device newBufferWithLength:q_bytes options:MTLResourceStorageModeShared];
-    // Small debug buffer (7 floats)
-        const size_t debug_floats = 7;
+    // Small debug buffer (expanded for parameter workaround)
+        const size_t debug_floats = 20;
         id<MTLBuffer> debug_buf = [device newBufferWithLength:debug_floats * sizeof(float) options:MTLResourceStorageModeShared];
         if (debug_buf && debug_buf.contents) {
             memset(debug_buf.contents, 0, debug_floats * sizeof(float));
+            // WORKAROUND: Pass parameters through debug buffer
+            float* debug_data = (float*)debug_buf.contents;
+            debug_data[10] = (float)num_qo;
+            debug_data[11] = (float)head_dim; 
+            debug_data[12] = (float)head_size;
+            debug_data[13] = (float)page_size;
+            debug_data[14] = scale;
+            std::cout << "🔧 [WORKAROUND] Parameters passed via debug buffer: num_qo=" << debug_data[10] 
+                      << ", head_dim=" << debug_data[11] << ", head_size=" << debug_data[12] 
+                      << ", page_size=" << debug_data[13] << ", scale=" << debug_data[14] << std::endl;
         }
 
 
@@ -200,7 +224,7 @@ void batch_prefill_attention_unified_bf16(
         }
 
         // Calculate actual buffer sizes based on provided parameters
-        size_t pkpv_count = static_cast<size_t>(num_kv_pages) * page_size * head_dim;
+        size_t pkpv_count = static_cast<size_t>(num_kv_pages) * page_size * kv_head_dim;
         size_t pkpv_bytes = pkpv_count * sizeof(uint16_t);
 
         // Convert K and V cache data from bfloat16 to IEEE half format for Metal kernel
@@ -232,8 +256,21 @@ void batch_prefill_attention_unified_bf16(
     [enc setBuffer:out_buf offset:0 atIndex:7];
 
     // Uniform parameter buffer to avoid scalar setBytes corruption
-    struct Params { int num_qo; int head_dim; int head_size; int page_size; float scale; };
-    Params p = { num_qo, head_dim, head_size, page_size, scale };
+    struct Params {
+        int num_qo;
+        int head_dim;        // Query head dimension (num_query_heads * head_size)
+        int kv_head_dim;     // KV head dimension (num_kv_heads * head_size) 
+        int head_size;
+        int page_size;
+        int num_query_heads; // Number of query heads
+        int num_kv_heads;    // Number of KV heads (for MQA/GQA support)
+        float scale;
+    };
+    Params p = { num_qo, head_dim, kv_head_dim, head_size, page_size, num_query_heads, num_kv_heads, scale };
+    
+    // Debug: Print parameter values being passed to kernel (ORIGINAL PATH - SIMPLIFIED)
+    std::cout << "\n🔧 [HOST DEBUG - ORIGINAL] Parameters: num_qo=" << p.num_qo << ", scale=" << p.scale << std::endl;
+    
     id<MTLBuffer> params_buf = [device newBufferWithBytes:&p length:sizeof(Params) options:MTLResourceStorageModeShared];
     [enc setBuffer:params_buf offset:0 atIndex:8];
     [enc setBuffer:debug_buf offset:0 atIndex:9];
@@ -272,7 +309,203 @@ void batch_prefill_attention_unified_bf16(
     }
 }
 
-void batch_prefill_attention_unified_f32(
+static id<MTLLibrary> get_metal_library() {
+    static id<MTLLibrary> library = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        id<MTLDevice> device = get_metal_device();
+        if (device) {
+            NSError* error = nil;
+            // Load source from both the original and optimized .metal files (same folder as this .mm)
+            NSString* currentPath = [NSString stringWithUTF8String:__FILE__];
+            NSString* dirPath = [currentPath stringByDeletingLastPathComponent];
+            
+            // Load original shaders
+            NSString* metalPath = [dirPath stringByAppendingPathComponent:@"metal_batch_prefill_attention.metal"];
+            NSString* originalSource = [NSString stringWithContentsOfFile:metalPath encoding:NSUTF8StringEncoding error:&error];
+            if (error || !originalSource) {
+                std::cerr << "Failed to load original Metal source for batch_prefill_attention";
+                if (error) std::cerr << ": " << error.localizedDescription.UTF8String;
+                std::cerr << std::endl;
+                return;
+            }
+            
+            // Load optimized shaders
+            NSString* optimizedPath = [dirPath stringByAppendingPathComponent:@"metal_batch_prefill_attention_optimized.metal"];
+            NSString* optimizedSource = [NSString stringWithContentsOfFile:optimizedPath encoding:NSUTF8StringEncoding error:&error];
+            if (error || !optimizedSource) {
+                std::cout << "Warning: Failed to load optimized Metal source, will use original only";
+                if (error) std::cout << ": " << error.localizedDescription.UTF8String;
+                std::cout << std::endl;
+                // Just use original source
+                optimizedSource = @"";
+            }
+            
+            // Combine both sources
+            NSString* combinedSource = [NSString stringWithFormat:@"%@\n\n// Optimized kernels:\n%@", originalSource, optimizedSource];
+            
+            library = [device newLibraryWithSource:combinedSource options:nil error:&error];
+            if (!library || error) {
+                NSLog(@"Failed to compile combined Metal shaders: %@", error ? error.localizedDescription : @"Unknown error");
+            } else {
+                std::cout << "Successfully loaded combined Metal library (original + optimized)" << std::endl;
+            }
+        }
+    });
+    return library;
+}
+
+// Optimized Attention Implementations
+
+void batch_prefill_attention_optimized_bf16(
+    const void* q_input,
+    const void* paged_k_cache,
+    const void* paged_v_cache,
+    const int32_t* qo_indptr,
+    const int32_t* kv_page_indptr,
+    const int32_t* kv_page_indices,
+    const int32_t* kv_last_page_lens,
+    void* output,
+    int num_qo,
+    int head_dim,
+    int head_size,
+    int page_size,
+    float scale,
+    int num_kv_pages
+) {
+    std::cout << "🔥 [ENTRY] batch_prefill_attention_optimized_bf16 called!" << std::endl;
+    @autoreleasepool {
+        id<MTLDevice> device = get_metal_device();
+        if (!device) { std::cerr << "Failed to get Metal device" << std::endl; return; }
+        id<MTLLibrary> library = get_metal_library();
+        if (!library) { std::cerr << "Failed to get Metal library" << std::endl; return; }
+
+        NSError* error = nil;
+        
+        // Try to load optimized kernel first
+        id<MTLFunction> function = [library newFunctionWithName:@"batch_prefill_attention_optimized_bf16_kernel"];
+        if (!function) {
+            // Fallback to original kernel if optimized not available
+            std::cout << "Optimized attention kernel not found, falling back to original" << std::endl;
+            function = [library newFunctionWithName:@"batch_prefill_attention_unified_bf16_kernel"];
+        }
+        
+        if (!function) { 
+            std::cerr << "Failed to find attention kernel (optimized or fallback)" << std::endl; 
+            return; 
+        }
+        
+        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (error || !pipeline) { 
+            std::cerr << "Failed to create pipeline: " << (error ? error.localizedDescription.UTF8String : "unknown") << std::endl; 
+            return; 
+        }
+
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        id<MTLCommandBuffer> cmd = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        size_t q_count = static_cast<size_t>(num_qo) * head_dim;
+        size_t q_bytes = q_count * sizeof(uint16_t);
+
+        // Convert Q input from bfloat16 to IEEE half format for Metal kernel
+        std::vector<uint16_t> q_half_data = convert_bf16_to_half(q_input, q_count);
+        id<MTLBuffer> q_buf = [device newBufferWithBytes:q_half_data.data() length:q_bytes options:MTLResourceStorageModeShared];
+
+        id<MTLBuffer> out_buf = [device newBufferWithLength:q_bytes options:MTLResourceStorageModeShared];
+
+        // Small debug buffer 
+        const size_t debug_floats = 7;
+        id<MTLBuffer> debug_buf = [device newBufferWithLength:debug_floats * sizeof(float) options:MTLResourceStorageModeShared];
+        if (debug_buf && debug_buf.contents) {
+            memset(debug_buf.contents, 0, debug_floats * sizeof(float));
+        }
+
+        if (!paged_k_cache || !paged_v_cache || !qo_indptr || !kv_page_indptr || !kv_page_indices || !kv_last_page_lens) {
+            std::cerr << "Optimized API requires non-null paged buffers and indices" << std::endl; 
+            return;
+        }
+
+        // Calculate actual buffer sizes based on provided parameters
+        size_t pkpv_count = static_cast<size_t>(num_kv_pages) * page_size * head_dim;
+        size_t pkpv_bytes = pkpv_count * sizeof(uint16_t);
+
+        // Convert K and V cache data from bfloat16 to IEEE half format
+        std::vector<uint16_t> k_half_data = convert_bf16_to_half(paged_k_cache, pkpv_count);
+        std::vector<uint16_t> v_half_data = convert_bf16_to_half(paged_v_cache, pkpv_count);
+
+        id<MTLBuffer> pk_buf = [device newBufferWithBytes:k_half_data.data() length:pkpv_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pv_buf = [device newBufferWithBytes:v_half_data.data() length:pkpv_bytes options:MTLResourceStorageModeShared];
+
+        // Calculate array sizes
+        size_t qo_indptr_elems = static_cast<size_t>(num_qo) + 1;
+        size_t kv_page_indptr_elems = static_cast<size_t>(num_qo) + 1;
+        size_t kv_page_indices_elems = static_cast<size_t>(num_kv_pages);
+        size_t kv_last_page_lens_elems = static_cast<size_t>(num_qo);
+
+        id<MTLBuffer> qo_indptr_buf = [device newBufferWithBytes:qo_indptr length:qo_indptr_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_page_indptr_buf = [device newBufferWithBytes:kv_page_indptr length:kv_page_indptr_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_page_indices_buf = [device newBufferWithBytes:kv_page_indices length:kv_page_indices_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_last_page_lens_buf = [device newBufferWithBytes:kv_last_page_lens length:kv_last_page_lens_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q_buf offset:0 atIndex:0];
+        [enc setBuffer:pk_buf offset:0 atIndex:1];
+        [enc setBuffer:pv_buf offset:0 atIndex:2];
+        [enc setBuffer:qo_indptr_buf offset:0 atIndex:3];
+        [enc setBuffer:kv_page_indptr_buf offset:0 atIndex:4];
+        [enc setBuffer:kv_page_indices_buf offset:0 atIndex:5];
+        [enc setBuffer:kv_last_page_lens_buf offset:0 atIndex:6];
+        [enc setBuffer:out_buf offset:0 atIndex:7];
+
+        // Uniform parameter buffer
+        struct Params { int num_qo; int head_dim; int kv_head_dim; int head_size; int page_size; int num_query_heads; int num_kv_heads; float scale; };
+        // Calculate KV parameters from existing values (temporary fix)
+        int num_query_heads = head_dim / head_size;  
+        int num_kv_heads = 8;  // TODO: Get from function parameter
+        int kv_head_dim = num_kv_heads * head_size;
+        Params p = { num_qo, head_dim, kv_head_dim, head_size, page_size, num_query_heads, num_kv_heads, scale };
+        id<MTLBuffer> params_buf = [device newBufferWithBytes:&p length:sizeof(Params) options:MTLResourceStorageModeShared];
+        [enc setBuffer:params_buf offset:0 atIndex:8];
+        [enc setBuffer:debug_buf offset:0 atIndex:9];
+
+        MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);  // Must match TGP_SIZE in kernel
+        MTLSize threadgroupsPerGrid = MTLSizeMake(num_qo, 1, 1);
+        [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        if (cmd.error) { 
+            std::cerr << "Metal command buffer error: " << cmd.error.localizedDescription.UTF8String << std::endl; 
+            return; 
+        }
+
+        // Convert kernel half output back to bfloat16
+        if (out_buf && out_buf.contents && output) {
+            uint16_t* out_half = (uint16_t*)out_buf.contents;
+            bfloat16_t* out_bf16 = (bfloat16_t*)output;
+            for (size_t i = 0; i < q_count; ++i) {
+                float f = half_to_float(out_half[i]);
+                out_bf16[i] = float_to_bf16(f);
+            }
+        }
+
+        // Print debug info
+        if (debug_buf && debug_buf.contents) {
+            float* dbg = (float*)debug_buf.contents;
+            std::cout << "\n[Optimized Attention Debug] scale=" << dbg[0]
+                      << ", head_dim=" << dbg[1]
+                      << ", page_size=" << dbg[2]
+                      << ", num_qo=" << dbg[3]
+                      << ", total_kv_len=" << dbg[4]
+                      << ", num_pages=" << dbg[5]
+                      << ", last_page_len=" << dbg[6]
+                      << std::endl;
+        }
+    }
+}
+
+void batch_prefill_attention_optimized_f32(
     const float* q_input,
     const float* paged_k_cache,
     const float* paged_v_cache,
@@ -285,6 +518,142 @@ void batch_prefill_attention_unified_f32(
     int head_dim,
     int head_size,
     int page_size,
+    float scale,
+    int num_kv_pages
+) {
+    @autoreleasepool {
+        id<MTLDevice> device = get_metal_device();
+        if (!device) { std::cerr << "Failed to get Metal device" << std::endl; return; }
+        id<MTLLibrary> library = get_metal_library();
+        if (!library) { std::cerr << "Failed to get Metal library" << std::endl; return; }
+
+        NSError* error = nil;
+        
+        // Try to load optimized kernel first
+        id<MTLFunction> function = [library newFunctionWithName:@"batch_prefill_attention_optimized_f32_kernel"];
+        if (!function) {
+            // Fallback to original kernel if optimized not available
+            std::cout << "Optimized f32 attention kernel not found, falling back to original" << std::endl;
+            function = [library newFunctionWithName:@"batch_prefill_attention_unified_f32_kernel"];
+        }
+        
+        if (!function) { 
+            std::cerr << "Failed to find f32 attention kernel (optimized or fallback)" << std::endl; 
+            return; 
+        }
+        
+        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (error || !pipeline) { 
+            std::cerr << "Failed to create f32 pipeline: " << (error ? error.localizedDescription.UTF8String : "unknown") << std::endl; 
+            return; 
+        }
+
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        id<MTLCommandBuffer> cmd = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        size_t q_count = static_cast<size_t>(num_qo) * head_dim;
+        size_t q_bytes = q_count * sizeof(float);
+
+        id<MTLBuffer> q_buf = [device newBufferWithBytes:q_input length:q_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [device newBufferWithLength:q_bytes options:MTLResourceStorageModeShared];
+
+        // Debug buffer
+        const size_t debug_floats = 7;
+        id<MTLBuffer> debug_buf = [device newBufferWithLength:debug_floats * sizeof(float) options:MTLResourceStorageModeShared];
+        if (debug_buf && debug_buf.contents) {
+            memset(debug_buf.contents, 0, debug_floats * sizeof(float));
+        }
+
+        if (!paged_k_cache || !paged_v_cache || !qo_indptr || !kv_page_indptr || !kv_page_indices || !kv_last_page_lens) {
+            std::cerr << "Optimized f32 API requires non-null buffers" << std::endl; 
+            return;
+        }
+
+        // Calculate KV buffer sizes
+        size_t pkpv_count = static_cast<size_t>(num_kv_pages) * page_size * head_dim;
+        size_t pkpv_bytes = pkpv_count * sizeof(float);
+
+        id<MTLBuffer> pk_buf = [device newBufferWithBytes:paged_k_cache length:pkpv_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pv_buf = [device newBufferWithBytes:paged_v_cache length:pkpv_bytes options:MTLResourceStorageModeShared];
+
+        // Calculate array sizes
+        size_t qo_indptr_elems = static_cast<size_t>(num_qo) + 1;
+        size_t kv_page_indptr_elems = static_cast<size_t>(num_qo) + 1;
+        size_t kv_page_indices_elems = static_cast<size_t>(num_kv_pages);
+        size_t kv_last_page_lens_elems = static_cast<size_t>(num_qo);
+
+        id<MTLBuffer> qo_indptr_buf = [device newBufferWithBytes:qo_indptr length:qo_indptr_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_page_indptr_buf = [device newBufferWithBytes:kv_page_indptr length:kv_page_indptr_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_page_indices_buf = [device newBufferWithBytes:kv_page_indices length:kv_page_indices_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_last_page_lens_buf = [device newBufferWithBytes:kv_last_page_lens length:kv_last_page_lens_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q_buf offset:0 atIndex:0];
+        [enc setBuffer:pk_buf offset:0 atIndex:1];
+        [enc setBuffer:pv_buf offset:0 atIndex:2];
+        [enc setBuffer:qo_indptr_buf offset:0 atIndex:3];
+        [enc setBuffer:kv_page_indptr_buf offset:0 atIndex:4];
+        [enc setBuffer:kv_page_indices_buf offset:0 atIndex:5];
+        [enc setBuffer:kv_last_page_lens_buf offset:0 atIndex:6];
+        [enc setBuffer:out_buf offset:0 atIndex:7];
+
+        // Parameters
+        struct Params { int num_qo; int head_dim; int kv_head_dim; int head_size; int page_size; int num_query_heads; int num_kv_heads; float scale; };
+        // Calculate KV parameters from existing values (temporary fix)
+        int num_query_heads = head_dim / head_size;  
+        int num_kv_heads = 8;  // TODO: Get from function parameter
+        int kv_head_dim = num_kv_heads * head_size;
+        Params p = { num_qo, head_dim, kv_head_dim, head_size, page_size, num_query_heads, num_kv_heads, scale };
+        id<MTLBuffer> params_buf = [device newBufferWithBytes:&p length:sizeof(Params) options:MTLResourceStorageModeShared];
+        [enc setBuffer:params_buf offset:0 atIndex:8];
+        [enc setBuffer:debug_buf offset:0 atIndex:9];
+
+        MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);
+        MTLSize threadgroupsPerGrid = MTLSizeMake(num_qo, 1, 1);
+        [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        
+        if (cmd.error) { 
+            std::cerr << "Metal f32 command buffer error: " << cmd.error.localizedDescription.UTF8String << std::endl; 
+            return; 
+        }
+
+        // Copy output
+        if (out_buf && out_buf.contents && output) {
+            memcpy(output, out_buf.contents, q_bytes);
+        }
+
+        // Debug output
+        if (debug_buf && debug_buf.contents) {
+            float* dbg = (float*)debug_buf.contents;
+            std::cout << "\n[Optimized F32 Attention Debug] scale=" << dbg[0]
+                      << ", head_dim=" << dbg[1]
+                      << ", page_size=" << dbg[2] 
+                      << ", num_qo=" << dbg[3]
+                      << std::endl;
+        }
+    }
+}
+
+void batch_prefill_attention_unified_f32(
+    const float* q_input,
+    const float* paged_k_cache,
+    const float* paged_v_cache,
+    const int32_t* qo_indptr,
+    const int32_t* kv_page_indptr,
+    const int32_t* kv_page_indices,
+    const int32_t* kv_last_page_lens,
+    float* output,
+    int num_qo,
+    int head_dim,
+    int kv_head_dim,      // NEW: KV head dimension for MQA/GQA
+    int head_size,
+    int page_size,
+    int num_query_heads,  // NEW: Number of query heads
+    int num_kv_heads,     // NEW: Number of KV heads
     float scale,
     int num_kv_pages
 ) {
@@ -312,7 +681,7 @@ void batch_prefill_attention_unified_f32(
             std::cerr << "Unified API requires non-null paged buffers and indices" << std::endl; return;
         }
 
-        size_t pkpv_count = static_cast<size_t>(num_kv_pages) * page_size * head_dim;
+        size_t pkpv_count = static_cast<size_t>(num_kv_pages) * page_size * kv_head_dim;
         size_t pkpv_bytes = pkpv_count * sizeof(float);
 
         id<MTLBuffer> pk_buf = [device newBufferWithBytes:paged_k_cache length:pkpv_bytes options:MTLResourceStorageModeShared];
@@ -329,13 +698,66 @@ void batch_prefill_attention_unified_f32(
         id<MTLBuffer> kv_last_page_lens_buf = [device newBufferWithBytes:kv_last_page_lens length:kv_last_page_lens_elems * sizeof(int32_t) options:MTLResourceStorageModeShared];
 
         id<MTLBuffer> out_buf = [device newBufferWithLength:q_bytes options:MTLResourceStorageModeShared];
-        const size_t debug_floats = 7;
+        const size_t debug_floats = 20; // Expanded to include parameter workaround
         id<MTLBuffer> debug_buf = [device newBufferWithLength:debug_floats * sizeof(float) options:MTLResourceStorageModeShared];
-        if (debug_buf && debug_buf.contents) memset(debug_buf.contents, 0, debug_floats * sizeof(float));
+        if (debug_buf && debug_buf.contents) {
+            memset(debug_buf.contents, 0, debug_floats * sizeof(float));
+            // WORKAROUND: Pass parameters through debug buffer
+            float* debug_data = (float*)debug_buf.contents;
+            debug_data[10] = (float)num_qo;
+            debug_data[11] = (float)head_dim; 
+            debug_data[12] = (float)head_size;
+            debug_data[13] = (float)page_size;
+            debug_data[14] = scale;
+            std::cout << "🔧 [WORKAROUND] Parameters passed via debug buffer: num_qo=" << debug_data[10] 
+                      << ", head_dim=" << debug_data[11] << ", head_size=" << debug_data[12] 
+                      << ", page_size=" << debug_data[13] << ", scale=" << debug_data[14] << std::endl;
+        }
 
-        struct Params { int num_qo; int head_dim; int head_size; int page_size; float scale; };
-        Params p = { num_qo, head_dim, head_size, page_size, scale };
+        struct Params { int num_qo; int head_dim; int kv_head_dim; int head_size; int page_size; int num_query_heads; int num_kv_heads; float scale; };
+        Params p = { num_qo, head_dim, kv_head_dim, head_size, page_size, num_query_heads, num_kv_heads, scale };
+        
+        // Debug: Print parameter values being passed to kernel
+        std::cout << "\n🔧 [HOST DEBUG] Parameters being passed to Metal kernel:" << std::endl;
+        std::cout << "  p.num_qo: " << p.num_qo << std::endl;
+        std::cout << "  p.head_dim: " << p.head_dim << std::endl;
+        std::cout << "  p.head_size: " << p.head_size << std::endl;
+        std::cout << "  p.page_size: " << p.page_size << std::endl;
+        std::cout << "  p.scale: " << p.scale << std::endl;
+        std::cout << "  sizeof(Params): " << sizeof(Params) << std::endl;
+        
+        // Debug: Print raw buffer contents to verify memory layout
+        uint8_t* raw_bytes = (uint8_t*)&p;
+        std::cout << "  Raw struct bytes: ";
+        for (size_t i = 0; i < sizeof(Params); ++i) {
+            std::printf("%02x ", raw_bytes[i]);
+        }
+        std::cout << std::endl;
+        
+        // Also verify individual field addresses and sizes
+        std::cout << "  Field offsets: num_qo@" << ((char*)&p.num_qo - (char*)&p) 
+                  << ", head_dim@" << ((char*)&p.head_dim - (char*)&p)
+                  << ", head_size@" << ((char*)&p.head_size - (char*)&p) 
+                  << ", page_size@" << ((char*)&p.page_size - (char*)&p)
+                  << ", scale@" << ((char*)&p.scale - (char*)&p) << std::endl;
+        
         id<MTLBuffer> params_buf = [device newBufferWithBytes:&p length:sizeof(Params) options:MTLResourceStorageModeShared];
+        
+        // Debug: Verify buffer contents after creation
+        uint8_t* buf_bytes = (uint8_t*)params_buf.contents;
+        std::cout << "  Buffer contents: ";
+        for (size_t i = 0; i < sizeof(Params); ++i) {
+            std::printf("%02x ", buf_bytes[i]);
+        }
+        std::cout << std::endl;
+        
+        // Also interpret buffer as Params struct to verify
+        Params* buf_params = (Params*)params_buf.contents;
+        std::cout << "  Buffer as struct: num_qo=" << buf_params->num_qo 
+                  << ", head_dim=" << buf_params->head_dim
+                  << ", head_size=" << buf_params->head_size
+                  << ", page_size=" << buf_params->page_size
+                  << ", scale=" << buf_params->scale << std::endl;
 
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:q_buf offset:0 atIndex:0];
@@ -363,31 +785,6 @@ void batch_prefill_attention_unified_f32(
         }
     }
 }
-static id<MTLLibrary> get_metal_library() {
-    static id<MTLLibrary> library = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        id<MTLDevice> device = get_metal_device();
-        if (device) {
-            NSError* error = nil;
-            // Load source from the adjacent .metal file (same folder as this .mm)
-            NSString* currentPath = [NSString stringWithUTF8String:__FILE__];
-            NSString* dirPath = [currentPath stringByDeletingLastPathComponent];
-            NSString* metalPath = [dirPath stringByAppendingPathComponent:@"metal_batch_prefill_attention.metal"];
-            NSString* shaderSource = [NSString stringWithContentsOfFile:metalPath encoding:NSUTF8StringEncoding error:&error];
-            if (error || !shaderSource) {
-                std::cerr << "Failed to load Metal source for batch_prefill_attention";
-                if (error) std::cerr << ": " << error.localizedDescription.UTF8String;
-                std::cerr << std::endl;
-                return;
-            }
-            library = [device newLibraryWithSource:shaderSource options:nil error:&error];
-            if (!library || error) {
-                NSLog(@"Failed to compile Metal shaders: %@", error ? error.localizedDescription : @"Unknown error");
-            }
-        }
-    });
-    return library;
-}
+
 } // namespace batch_prefill_attention
 } // namespace metal

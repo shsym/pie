@@ -5,18 +5,40 @@ using namespace metal;
 // TGP_SIZE: Threads per threadgroup. This should be a power of 2, e.g., 64, 128, 256.
 // It determines the degree of parallelism for processing one query.
 #define TGP_SIZE 128
-// BLOCK_SIZE: The number of keys processed in parallel by the threadgroup in each step.
-#define BLOCK_SIZE 8
+// BLOCK_SIZE: The number of keys processed in parallel by the threadgroup in each step. 
+// Should match page_size for optimal memory alignment.
+// TODO: This should be passed as compilation flag: -D BLOCK_SIZE=${page_size}
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 16  // Default fallback
+#endif
+
+// Smart kernel block size based on memory constraints (32KB limit)
+// F32 uses 4x more memory than BF16, so needs smaller block size
+#ifdef FP32_KERNEL
+  #if BLOCK_SIZE > 16
+    #define KERNEL_BLOCK_SIZE 16  // Cap at 16 for f32 (~30KB memory usage)
+  #else
+    #define KERNEL_BLOCK_SIZE BLOCK_SIZE
+  #endif
+#else  // BF16 kernel
+  #define KERNEL_BLOCK_SIZE BLOCK_SIZE  // BF16 can handle up to 32
+#endif
+
 // MAX_HEAD_DIM: The kernel uses fixed-size shared memory arrays for performance.
-// Set to 512 to match the test configuration (8 heads × 64 head_size = 512 head_dim)
-#define MAX_HEAD_DIM 512
+// Memory calculation: 
+// BF16: 2KB + KERNEL_BLOCK_SIZE * 1028 bytes ≤ 32KB
+// F32:  2.5KB + KERNEL_BLOCK_SIZE * 2052 bytes ≤ 32KB  
+#define MAX_HEAD_DIM 256
 
 // Small uniform parameter block passed via buffer(8)
 struct Params {
     int num_qo;
-    int head_dim;
+    int head_dim;        // Query head dimension (num_query_heads * head_size)
+    int kv_head_dim;     // KV head dimension (num_kv_heads * head_size) 
     int head_size;
     int page_size;
+    int num_query_heads; // Number of query heads
+    int num_kv_heads;    // Number of KV heads (for MQA/GQA support)
     float scale;
 };
 
@@ -37,22 +59,25 @@ kernel void batch_prefill_attention_unified_bf16_kernel(
     // Read parameters from the uniform buffer
     const int num_qo = params.num_qo;
     const int head_dim = params.head_dim;
+    const int kv_head_dim = params.kv_head_dim;
     const int head_size = params.head_size;
     const int page_size = params.page_size;
+    const int num_query_heads = params.num_query_heads;
+    const int num_kv_heads = params.num_kv_heads;
     const float scale = params.scale;
 
     // Each threadgroup handles one query token.
     uint qo_idx = tgid.x;
     if (qo_idx >= uint(num_qo)) return;
 
-    // This check is good practice but will cause a compile-time error if head_dim is a compile-time constant.
-    if (head_dim > MAX_HEAD_DIM) return;
+    // Check if head_size (dimension per head) exceeds our threadgroup memory limit
+    if (head_size > MAX_HEAD_DIM) return;
 
     // --- Shared Memory Declaration ---
     threadgroup half q_s[MAX_HEAD_DIM];
-    threadgroup half k_block[BLOCK_SIZE][MAX_HEAD_DIM];
-    threadgroup half v_block[BLOCK_SIZE][MAX_HEAD_DIM];
-    threadgroup float w_block[BLOCK_SIZE];
+    threadgroup half k_block[KERNEL_BLOCK_SIZE][MAX_HEAD_DIM];
+    threadgroup half v_block[KERNEL_BLOCK_SIZE][MAX_HEAD_DIM];
+    threadgroup float w_block[KERNEL_BLOCK_SIZE];
 
     // Online softmax accumulators (allocated once, reused per head)
     threadgroup float m_i;
@@ -62,8 +87,8 @@ kernel void batch_prefill_attention_unified_bf16_kernel(
     // Temporary reduction scratchpad
     threadgroup float temp_reduce[TGP_SIZE];
 
-    // Validate head_size and determine number of heads
-    const int num_heads = max(1, head_dim / max(1, head_size));
+    // Use the explicitly provided number of query heads
+    const int num_heads = num_query_heads;
 
     // --- Get Sequence and KV Page Information ---
     // PERF: This linear scan can be slow for batches with many sequences. A binary search would be faster.
@@ -114,15 +139,18 @@ kernel void batch_prefill_attention_unified_bf16_kernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // --- Main Loop: Process KV Cache in Parallel Blocks ---
-        for (int block_start = 0; block_start < total_kv_len; block_start += BLOCK_SIZE) {
+        // Process keys in KERNEL_BLOCK_SIZE chunks for memory efficiency
+        for (int block_start = 0; block_start < total_kv_len; block_start += KERNEL_BLOCK_SIZE) {
             // Load K/V for this block and head slice
-            if (tid_in_tgp < BLOCK_SIZE) {
+            if (tid_in_tgp < KERNEL_BLOCK_SIZE) {
                 int global_key_idx = block_start + tid_in_tgp;
                 if (global_key_idx < total_kv_len) {
                     int page_offset = global_key_idx / page_size;
                     int in_page_offset = global_key_idx % page_size;
                     int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
-                    uint base_addr = page_idx * page_size * head_dim + in_page_offset * head_dim + h * head_size;
+                    // Map query head to KV head for MQA/GQA support
+                    int kv_head = h / max(1, num_query_heads / num_kv_heads);
+                    uint base_addr = page_idx * page_size * kv_head_dim + in_page_offset * kv_head_dim + kv_head * head_size;
 
                     for (int d = 0; d < head_size; ++d) {
                         k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
@@ -135,7 +163,7 @@ kernel void batch_prefill_attention_unified_bf16_kernel(
             // Compute scores for this block (per head)
             float score = 0.0f;
             int global_key_idx_score = block_start + tid_in_tgp;
-            if (tid_in_tgp < BLOCK_SIZE && global_key_idx_score < total_kv_len) {
+            if (tid_in_tgp < KERNEL_BLOCK_SIZE && global_key_idx_score < total_kv_len) {
                 for (int d = 0; d < head_size; ++d) {
                     score += float(q_s[d]) * float(k_block[tid_in_tgp][d]);
                 }
@@ -172,13 +200,13 @@ kernel void batch_prefill_attention_unified_bf16_kernel(
 
             // 3) compute weights and update accumulators
             float w = (score > -INFINITY) ? exp(score - m_i) : 0.0f;
-            if (tid_in_tgp < BLOCK_SIZE) {
+            if (tid_in_tgp < KERNEL_BLOCK_SIZE) {
                 w_block[tid_in_tgp] = w;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // Update l_i (sum of weights)
-            temp_reduce[tid_in_tgp] = (tid_in_tgp < BLOCK_SIZE) ? w : 0.0f;
+            temp_reduce[tid_in_tgp] = (tid_in_tgp < KERNEL_BLOCK_SIZE) ? w : 0.0f;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint s = TGP_SIZE / 2; s > 0; s >>= 1) {
                 if (tid_in_tgp < s) temp_reduce[tid_in_tgp] += temp_reduce[tid_in_tgp + s];
@@ -194,7 +222,7 @@ kernel void batch_prefill_attention_unified_bf16_kernel(
                 int d = tid_in_tgp * dims_per_thread + i;
                 if (d < head_size) {
                     float sum_wv_d = 0.0f;
-                    int num_keys_in_block = min((int)BLOCK_SIZE, total_kv_len - block_start);
+                    int num_keys_in_block = min((int)KERNEL_BLOCK_SIZE, total_kv_len - block_start);
                     for (int j = 0; j < num_keys_in_block; ++j) {
                         sum_wv_d += w_block[j] * float(v_block[j][d]);
                     }
@@ -234,24 +262,29 @@ kernel void batch_prefill_attention_unified_f32_kernel(
 ) {
     const int num_qo = params.num_qo;
     const int head_dim = params.head_dim;
+    const int kv_head_dim = params.kv_head_dim;
     const int head_size = params.head_size;
     const int page_size = params.page_size;
+    const int num_query_heads = params.num_query_heads;
+    const int num_kv_heads = params.num_kv_heads;
     const float scale = params.scale;
 
     uint qo_idx = tgid.x;
     if (qo_idx >= uint(num_qo)) return;
-    if (head_dim > MAX_HEAD_DIM) return;
+    // Check if head_size (dimension per head) exceeds our threadgroup memory limit
+    if (head_size > MAX_HEAD_DIM) return;
 
     threadgroup float q_s[MAX_HEAD_DIM];
-    threadgroup float k_block[BLOCK_SIZE][MAX_HEAD_DIM];
-    threadgroup float v_block[BLOCK_SIZE][MAX_HEAD_DIM];
-    threadgroup float w_block[BLOCK_SIZE];
+    threadgroup float k_block[KERNEL_BLOCK_SIZE][MAX_HEAD_DIM];
+    threadgroup float v_block[KERNEL_BLOCK_SIZE][MAX_HEAD_DIM];
+    threadgroup float w_block[KERNEL_BLOCK_SIZE];
     threadgroup float m_i;
     threadgroup float l_i;
     threadgroup float acc_i[MAX_HEAD_DIM];
     threadgroup float temp_reduce[TGP_SIZE];
 
-    const int num_heads = max(1, head_dim / max(1, head_size));
+    // Use the explicitly provided number of query heads
+    const int num_heads = num_query_heads;
 
     int seq_id = 0;
     while (seq_id < 100 && qo_indptr[seq_id + 1] <= int(qo_idx)) { seq_id++; }
@@ -291,14 +324,16 @@ kernel void batch_prefill_attention_unified_f32_kernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (int block_start = 0; block_start < total_kv_len; block_start += BLOCK_SIZE) {
-            if (tid_in_tgp < BLOCK_SIZE) {
+        for (int block_start = 0; block_start < total_kv_len; block_start += KERNEL_BLOCK_SIZE) {
+            if (tid_in_tgp < KERNEL_BLOCK_SIZE) {
                 int global_key_idx = block_start + tid_in_tgp;
                 if (global_key_idx < total_kv_len) {
                     int page_offset = global_key_idx / page_size;
                     int in_page_offset = global_key_idx % page_size;
                     int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
-                    uint base_addr = page_idx * page_size * head_dim + in_page_offset * head_dim + h * head_size;
+                    // Map query head to KV head for MQA/GQA support
+                    int kv_head = h / max(1, num_query_heads / num_kv_heads);
+                    uint base_addr = page_idx * page_size * kv_head_dim + in_page_offset * kv_head_dim + kv_head * head_size;
                     for (int d = 0; d < head_size; ++d) {
                         k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
                         v_block[tid_in_tgp][d] = paged_v_cache[base_addr + d];
@@ -309,7 +344,7 @@ kernel void batch_prefill_attention_unified_f32_kernel(
 
             float score = 0.0f;
             int global_key_idx_score = block_start + tid_in_tgp;
-            if (tid_in_tgp < BLOCK_SIZE && global_key_idx_score < total_kv_len) {
+            if (tid_in_tgp < KERNEL_BLOCK_SIZE && global_key_idx_score < total_kv_len) {
                 for (int d = 0; d < head_size; ++d) {
                     score += q_s[d] * k_block[tid_in_tgp][d];
                 }
@@ -335,10 +370,10 @@ kernel void batch_prefill_attention_unified_f32_kernel(
             for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) { acc_i[d] *= scale_factor; }
 
             float w = (score > -INFINITY) ? exp(score - m_i) : 0.0f;
-            if (tid_in_tgp < BLOCK_SIZE) { w_block[tid_in_tgp] = w; }
+            if (tid_in_tgp < KERNEL_BLOCK_SIZE) { w_block[tid_in_tgp] = w; }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            temp_reduce[tid_in_tgp] = (tid_in_tgp < BLOCK_SIZE) ? w : 0.0f;
+            temp_reduce[tid_in_tgp] = (tid_in_tgp < KERNEL_BLOCK_SIZE) ? w : 0.0f;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint s = TGP_SIZE / 2; s > 0; s >>= 1) {
                 if (tid_in_tgp < s) temp_reduce[tid_in_tgp] += temp_reduce[tid_in_tgp + s];
@@ -351,7 +386,7 @@ kernel void batch_prefill_attention_unified_f32_kernel(
                 int d = tid_in_tgp * dims_per_thread + i;
                 if (d < head_size) {
                     float sum_wv_d = 0.0f;
-                    int num_keys_in_block = min((int)BLOCK_SIZE, total_kv_len - block_start);
+                    int num_keys_in_block = min((int)KERNEL_BLOCK_SIZE, total_kv_len - block_start);
                     for (int j = 0; j < num_keys_in_block; ++j) {
                         sum_wv_d += w_block[j] * v_block[j][d];
                     }

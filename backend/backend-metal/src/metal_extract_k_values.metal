@@ -29,7 +29,7 @@ kernel void extract_k_values_bfloat16_kernel(
         uint found = 0u;
         for (uint col = 0u; col < N && found < k; ++col) {
             bfloat val = input_row[col];
-            if (val != bfloat(0.0f)) {  // Extract non-zero values
+            if (val != bfloat(-INFINITY)) {  // Extract non-negative-infinity values
                 value_output_row[found] = val;
                 index_output_row[found] = int32_t(col);
                 ++found;
@@ -68,8 +68,7 @@ kernel void extract_k_values_float32_kernel(
         uint found = 0u;
         for (uint col = 0u; col < N && found < k; ++col) {
             float val = input_row[col];
-            // Handle both data formats: -INFINITY or zero as sentinel
-            if (val != 0.0f && val != -INFINITY && !isinf(val)) {
+            if (val != -INFINITY) {  // Extract non-negative-infinity values (same as CUDA)
                 value_output_row[found] = val;
                 index_output_row[found] = int32_t(col);
                 ++found;

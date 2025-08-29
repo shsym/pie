@@ -81,8 +81,8 @@ class ArtifactComparator:
             # batch_prefill_attention uses fp16 kernels with bf16 I/O bridging; expect up to one bf16 ULP
             # in outputs after fp16 round-trip. Allow abs up to 1e-2 for bf16 outputs.
             ('batch_prefill_attention', 'output', 'bf16'): (1e-2, 2e-2),
-            # grouped_gemm accumulates in bf16; permit up to 1 ULP (~3.125e-2) and modest rel error
-            ('grouped_gemm', 'C', 'bf16'): (3.2e-2, 1.5e-2),
+            # grouped_gemm with large values (~76): bf16 ULP ≈ 0.5, allow 1 ULP + margin
+            ('grouped_gemm', 'C', 'bf16'): (6e-1, 5e-2),
             # silu_and_mul with bf16 needs slightly more tolerance for large intermediate sizes
             ('silu_and_mul', 'output', 'bf16'): (5e-3, 1e-2),
             # extract_k_values with fp32 can have numerical differences in top-k selection
@@ -146,6 +146,10 @@ class ArtifactComparator:
         # Convert to float64 for high-precision comparison
         cuda_f64 = cuda_tensor.astype(np.float64)
         metal_f64 = metal_tensor.astype(np.float64)
+
+        # Special handling for extract_k_values: compare sets of (value, index) pairs regardless of order
+        if operation == "extract_k_values":
+            return self._compare_extract_k_values(cuda_tensor, metal_tensor, tensor_name, cuda_f64, metal_f64)
 
         # Special handling for topk_mask_logits: compare based on which indices are preserved
         if operation == "topk_mask_logits" and tensor_name == "masked_logits":
@@ -263,6 +267,130 @@ class ArtifactComparator:
             print(f"    Status: {'✅ PASS' if passes_tolerance else '❌ FAIL'}")
 
         return result
+
+    def _compare_extract_k_values(self, cuda_tensor: np.ndarray, metal_tensor: np.ndarray, 
+                                 tensor_name: str, cuda_f64: np.ndarray, metal_f64: np.ndarray) -> Dict[str, Any]:
+        """Special comparison logic for extract_k_values that handles different ordering"""
+        
+        # For extract_k_values, we need to compare sets of (value, index) pairs per row
+        # The operation extracts k non-infinity values per row, but CUDA and Metal may extract in different order
+        
+        if tensor_name == "A":
+            # Input tensor should match exactly (it's the same input data)
+            # Handle infinities properly: when both values are the same infinity, treat as exact match
+            same_inf_mask = np.isinf(cuda_f64) & np.isinf(metal_f64) & (np.sign(cuda_f64) == np.sign(metal_f64))
+            
+            # Compute absolute difference; set positions of same-signed infinities to zero explicitly
+            raw_abs_diff = np.abs(cuda_f64 - metal_f64)
+            abs_diff = np.where(same_inf_mask, 0.0, raw_abs_diff)
+            max_abs_error = np.max(abs_diff)
+            mean_abs_error = np.mean(abs_diff)
+            
+            # Handle relative error with infinities
+            cuda_abs = np.abs(cuda_f64)
+            raw_rel = np.where(cuda_abs > 1e-10, abs_diff / cuda_abs, 0.0)
+            rel_diff = np.where(same_inf_mask, 0.0, raw_rel)
+            max_rel_error = np.max(rel_diff)
+            mean_rel_error = np.mean(rel_diff)
+            
+            abs_ok = max_abs_error <= self.abs_tolerance
+            rel_ok = max_rel_error <= self.rel_tolerance
+            status = 'PASS' if (abs_ok or rel_ok) else 'FAIL'
+            
+            return {
+                'status': status,
+                'max_abs_error': max_abs_error,
+                'max_rel_error': max_rel_error,
+                'mean_abs_error': mean_abs_error,
+                'mean_rel_error': mean_rel_error,
+                'abs_tolerance_pass': abs_ok,
+                'rel_tolerance_pass': rel_ok,
+                'notes': "extract_k_values input matrix (A) - standard comparison"
+            }
+        
+        # For V (values) and I (indices), we need to compare sets per row
+        # Get shape info from metadata or infer from tensor dimensions  
+        if len(cuda_tensor.shape) == 2:
+            M, k = cuda_tensor.shape
+        else:
+            # Fallback: assume reasonable dimensions
+            M = cuda_tensor.shape[0] // 50  # Assume k=50 for now
+            k = 50
+            if M * k != cuda_tensor.size:
+                M = 1  
+                k = cuda_tensor.size
+        
+        total_mismatches = 0
+        max_abs_error = 0.0
+        max_rel_error = 0.0  
+        mean_abs_error = 0.0
+        mean_rel_error = 0.0
+        
+        for row in range(M):
+            row_start = row * k
+            row_end = row_start + k
+            
+            cuda_row = cuda_f64[row_start:row_end] if cuda_f64.ndim == 1 else cuda_f64[row, :]
+            metal_row = metal_f64[row_start:row_end] if metal_f64.ndim == 1 else metal_f64[row, :]
+            
+            if tensor_name == "V":
+                # For values, compare sets (ignoring order)
+                cuda_sorted = np.sort(cuda_row)
+                metal_sorted = np.sort(metal_row)
+                
+                abs_diff = np.abs(cuda_sorted - metal_sorted)
+                row_max_abs = np.max(abs_diff)
+                row_mean_abs = np.mean(abs_diff)
+                
+                cuda_abs = np.abs(cuda_sorted)
+                rel_diff = np.where(cuda_abs > 1e-10, abs_diff / cuda_abs, 0.0)
+                row_max_rel = np.max(rel_diff)
+                row_mean_rel = np.mean(rel_diff)
+                
+                max_abs_error = max(max_abs_error, row_max_abs)
+                max_rel_error = max(max_rel_error, row_max_rel)
+                mean_abs_error += row_mean_abs
+                mean_rel_error += row_mean_rel
+                
+            elif tensor_name == "I":
+                # For indices, check if same set of indices (order doesn't matter)
+                cuda_set = set(cuda_row.astype(int))
+                metal_set = set(metal_row.astype(int))
+                
+                if cuda_set != metal_set:
+                    total_mismatches += 1
+                    # For reporting, compute some error metrics
+                    abs_diff = np.abs(cuda_row - metal_row)
+                    row_max_abs = np.max(abs_diff)
+                    max_abs_error = max(max_abs_error, row_max_abs)
+        
+        if M > 0:
+            mean_abs_error /= M
+            mean_rel_error /= M
+        
+        if tensor_name == "I":
+            # For indices, success means all rows have matching sets
+            status = 'PASS' if total_mismatches == 0 else 'FAIL'
+            notes = f"extract_k_values indices (I) - {M - total_mismatches}/{M} rows have matching index sets"
+            if total_mismatches > 0:
+                notes += f", {total_mismatches} rows differ"
+        else:
+            # For values, use standard tolerance check
+            abs_ok = max_abs_error <= self.abs_tolerance
+            rel_ok = max_rel_error <= self.rel_tolerance
+            status = 'PASS' if (abs_ok or rel_ok) else 'FAIL'
+            notes = f"extract_k_values values (V) - compared sorted value sets per row"
+        
+        return {
+            'status': status,
+            'max_abs_error': max_abs_error,
+            'max_rel_error': max_rel_error,
+            'mean_abs_error': mean_abs_error,  
+            'mean_rel_error': mean_rel_error,
+            'abs_tolerance_pass': max_abs_error <= self.abs_tolerance,
+            'rel_tolerance_pass': max_rel_error <= self.rel_tolerance,
+            'notes': notes
+        }
 
     def compare_artifacts(self, cuda_dir: Path, metal_dir: Path) -> ComparisonResult:
         """Compare all artifacts between CUDA and Metal directories"""

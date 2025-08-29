@@ -1,14 +1,25 @@
 # Metal Backend Test Suite
 cmake_minimum_required(VERSION 3.23)
+project(MetalBackendTests)
 
 # Enable testing
 enable_testing()
+
+# Find the Metal framework
+find_library(METAL_FRAMEWORK Metal REQUIRED)
+find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+
+# Add the parent build directory for libraries
+link_directories(../build)
 
 # Common test dependencies
 set(METAL_TEST_LIBS
     metal_softmax
     metal_extract_k_values  
     metal_topk_mask_logits
+    metal_batch_prefill_attention
+    metal_batch_prefill_attention_unified
+    metal_dtype_conversion
     metal_common
     ${METAL_FRAMEWORK}
     ${FOUNDATION_FRAMEWORK}
@@ -57,10 +68,25 @@ add_metal_test(test_metal_edge_cases_robust src/integration/test_metal_edge_case
 
 # Performance Tests
 add_metal_test(test_metal_performance src/performance/test_metal_performance.cpp)
+add_metal_test(test_metal_softmax_benchmark src/performance/test_metal_softmax_benchmark.cpp)
+add_metal_test(test_tiled_performance_validation src/performance/test_tiled_performance_validation.cpp)
+
+# Attention Performance Tests (Objective-C++ since they use Metal APIs)
+add_metal_objcpp_test(test_attention_benchmark src/performance/test_attention_benchmark.mm)
+add_metal_objcpp_test(test_attention_correctness src/performance/test_attention_correctness.mm)
+add_metal_objcpp_test(test_unified_attention_correctness src/performance/test_unified_attention_correctness.mm)
+add_metal_objcpp_test(test_kernel_comparison src/performance/test_kernel_comparison.mm)
+add_metal_objcpp_test(test_f16_native_attention src/performance/test_f16_native_attention.mm)
+add_metal_objcpp_test(test_flash_attention_tiled src/performance/test_flash_attention_tiled.mm)
+add_metal_objcpp_test(test_flash_attention_flashinfer src/performance/test_flash_attention_flashinfer.mm)
+add_metal_objcpp_test(test_attention_accuracy_comparison src/performance/test_attention_accuracy_comparison.mm)
+add_metal_objcpp_test(test_flash_attention_block_optimized src/performance/test_flash_attention_block_optimized.mm)
+add_metal_objcpp_test(test_attention_performance_comparison src/performance/test_attention_performance_comparison.mm)
 
 # Core Integration Tests
 add_metal_test(test_metal_extract_k_values src/integration/test_metal_extract_k_values.cpp)
 add_metal_test(test_metal_softmax src/integration/test_metal_softmax.cpp)
+add_metal_test(test_metal_softmax_tiled src/integration/test_metal_softmax_tiled.cpp)
 add_metal_test(test_metal_topk_mask_logits src/integration/test_metal_topk_mask_logits.cpp)
 
 # Full Pipeline Tests (Objective-C++)
@@ -105,6 +131,11 @@ set_tests_properties(
 
 set_tests_properties(
     test_metal_performance
+    test_metal_softmax_benchmark
+    test_tiled_performance_validation
+    test_attention_benchmark
+    test_attention_correctness
+    test_unified_attention_correctness
     PROPERTIES LABELS "performance"
 )
 
@@ -178,7 +209,7 @@ message(STATUS "Metal Backend Test Suite Configuration:")
 message(STATUS "  Unit Tests: test_metal_unit_*")
 message(STATUS "  Data Type Tests: test_metal_dtype_*") 
 message(STATUS "  Edge Case Tests: test_metal_edge_cases*")
-message(STATUS "  Performance Tests: test_metal_performance")
+message(STATUS "  Performance Tests: test_metal_performance, test_*_benchmark, test_attention_*")
 message(STATUS "  Integration Tests: Core Metal operations + full pipeline tests")
 message(STATUS "  Compatibility Tests: test_*_compatibility, test_compilation_validation")
 message(STATUS "  Debug Tests: test_*debug* (excluded from main test suite)")
