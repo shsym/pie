@@ -209,6 +209,7 @@ bin/
 logs
 *.log
 .plan
+.dev.md
 
 # No MCP files
 .memory-bank

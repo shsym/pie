@@ -7,21 +7,22 @@
 #include <cmath>
 #include <memory>
 
-// Test configuration structures (minimal versions for testing)
-struct TestAppConfig {
-    std::string device = "metal:0";
-    std::string dtype = "bfloat16";
-    int kv_page_size = 16;
-    int max_batch_size = 32;
-    bool enable_profiling = true;
+// Test configuration structures (must match backend interface)
+struct AppConfig {
+    std::string model_path = "/tmp/test_model";
+    std::string cache_dir = "/tmp/cache";
+    bool verbose = false;
+    int32_t kv_page_size = 16;
+    int32_t dist_size = 64;
+    size_t max_num_kv_pages = 14000;
+    size_t max_num_embeds = 50000;
 };
 
-struct TestModelMetadata {
-    std::string model_type = "L4MA";
-    std::string version = "1.0";
-    L4maConfig model_config;
-    size_t model_size_bytes = 1024 * 1024 * 100; // 100MB test model
+struct ModelMetadata {
+    std::string model_name = "L4MA";
     std::string checkpoint_path = "/tmp/test_model.ckpt";
+    L4maConfig config;
+    size_t total_params = 125000000; // 125M parameters
 };
 
 // Test configuration - initialize with realistic values
@@ -58,9 +59,8 @@ L4maConfig create_test_l4ma_config() {
 class MetalFullInferencePipelineTest {
 public:
     MetalFullInferencePipelineTest() {
-        config_.model_config = create_test_l4ma_config();
-        app_config_.max_batch_size = 4;
-        app_config_.enable_profiling = true;
+        config_.config = create_test_l4ma_config();
+        app_config_.verbose = true;
     }
     
     bool run() {
@@ -106,8 +106,8 @@ public:
     }
     
 private:
-    TestAppConfig app_config_;
-    TestModelMetadata config_;
+    AppConfig app_config_;
+    ModelMetadata config_;
     std::unique_ptr<MetalModel> model_;
     
     bool initialize_metal_backend() {
@@ -393,7 +393,7 @@ private:
                 command.token_ids.resize(seq_len);
                 command.position_ids.resize(seq_len);
                 for (int i = 0; i < seq_len; ++i) {
-                    command.token_ids[i] = (i + b * 1000) % config_.model_config.vocab_size;
+                    command.token_ids[i] = (i + b * 1000) % config_.config.vocab_size;
                     command.position_ids[i] = i;
                 }
                 
@@ -437,8 +437,8 @@ private:
             std::cerr << "Warning: Low throughput detected" << std::endl;
         }
         
-        // Print profiling report if enabled
-        if (app_config_.enable_profiling) {
+        // Print profiling report if verbose enabled
+        if (app_config_.verbose) {
             MetalModelProfiler::printProfilingReport();
         }
         

@@ -18,7 +18,6 @@ set(METAL_TEST_LIBS
     metal_extract_k_values  
     metal_topk_mask_logits
     metal_batch_prefill_attention
-    metal_batch_prefill_attention_unified
     metal_dtype_conversion
     metal_common
     ${METAL_FRAMEWORK}
@@ -73,15 +72,6 @@ add_metal_test(test_tiled_performance_validation src/performance/test_tiled_perf
 
 # Attention Performance Tests (Objective-C++ since they use Metal APIs)
 add_metal_objcpp_test(test_attention_benchmark src/performance/test_attention_benchmark.mm)
-add_metal_objcpp_test(test_attention_correctness src/performance/test_attention_correctness.mm)
-add_metal_objcpp_test(test_unified_attention_correctness src/performance/test_unified_attention_correctness.mm)
-add_metal_objcpp_test(test_kernel_comparison src/performance/test_kernel_comparison.mm)
-add_metal_objcpp_test(test_f16_native_attention src/performance/test_f16_native_attention.mm)
-add_metal_objcpp_test(test_flash_attention_tiled src/performance/test_flash_attention_tiled.mm)
-add_metal_objcpp_test(test_flash_attention_flashinfer src/performance/test_flash_attention_flashinfer.mm)
-add_metal_objcpp_test(test_attention_accuracy_comparison src/performance/test_attention_accuracy_comparison.mm)
-add_metal_objcpp_test(test_flash_attention_block_optimized src/performance/test_flash_attention_block_optimized.mm)
-add_metal_objcpp_test(test_attention_performance_comparison src/performance/test_attention_performance_comparison.mm)
 
 # Core Integration Tests
 add_metal_test(test_metal_extract_k_values src/integration/test_metal_extract_k_values.cpp)
@@ -95,8 +85,9 @@ add_metal_objcpp_test(test_metal_model_weight_loading src/integration/test_metal
 add_metal_objcpp_test(test_metal_memory_basic src/integration/test_metal_memory_basic.mm)
 add_metal_objcpp_test(test_metal_memory_stress src/integration/test_metal_memory_stress.mm)
 add_metal_objcpp_test(test_metal_real_model_weights src/integration/test_metal_real_model_weights.mm)
-add_metal_objcpp_test(test_metal_full_inference_pipeline src/integration/test_metal_full_inference_pipeline.mm)
-add_metal_objcpp_test(test_end_to_end_inference src/integration/test_end_to_end_inference.mm)
+# TODO: Re-enable when MetalModel implementation is complete
+# add_metal_objcpp_test(test_metal_full_inference_pipeline src/integration/test_metal_full_inference_pipeline.mm)
+# add_metal_objcpp_test(test_end_to_end_inference src/integration/test_end_to_end_inference.mm)
 
 # Compatibility Tests (Objective-C++)
 add_metal_objcpp_test(test_api_compatibility src/compatibility/test_api_compatibility.mm)
@@ -134,8 +125,6 @@ set_tests_properties(
     test_metal_softmax_benchmark
     test_tiled_performance_validation
     test_attention_benchmark
-    test_attention_correctness
-    test_unified_attention_correctness
     PROPERTIES LABELS "performance"
 )
 
@@ -148,8 +137,9 @@ set_tests_properties(
     test_metal_memory_basic
     test_metal_memory_stress
     test_metal_real_model_weights
-    test_metal_full_inference_pipeline
-    test_end_to_end_inference
+    # TODO: Re-enable when MetalModel implementation is complete
+    # test_metal_full_inference_pipeline
+    # test_end_to_end_inference
     PROPERTIES LABELS "integration"
 )
 

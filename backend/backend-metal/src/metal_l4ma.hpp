@@ -8,7 +8,7 @@
 #include "metal_rmsnorm_wrapper.hpp"
 #include "metal_rope_wrapper.hpp"
 #include "metal_silu_and_mul_wrapper.hpp"
-#include "metal_batch_prefill_attention_wrapper.hpp"
+#include "metal_batch_prefill_attention.hpp"
 #include <Metal/Metal.h>
 #include <map>
 #include <memory>
@@ -353,16 +353,38 @@ void MetalL4maAttention<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<
     // 3. Batch prefill attention
     auto context_out = buffer.template allocate<T>(num_tokens * num_query_heads * head_size);
     
-    MetalBatchPrefillAttention::batch_prefill_attention_unified(
-        q_proj.data(), kv_cache_k, kv_cache_v,
-        reinterpret_cast<const int32_t*>(buffer.qo_indptr.data()),
-        reinterpret_cast<const int32_t*>(buffer.kv_page_indptr.data()),
-        reinterpret_cast<const int32_t*>(buffer.kv_page_indices.data()),
-        reinterpret_cast<const int32_t*>(buffer.kv_last_page_lens.data()),
-        context_out.data(), num_tokens, head_size, head_size, buffer.page_size,
-        1.0f / std::sqrt(float(head_size)), // scale
-        static_cast<int>(buffer.kv_page_indices.size())
-    );
+    if constexpr (std::is_same_v<T, float>) {
+        metal::batch_prefill_attention::batch_prefill_attention_unified_f32(
+            q_proj.data(), kv_cache_k, kv_cache_v,
+            reinterpret_cast<const int32_t*>(buffer.qo_indptr.data()),
+            reinterpret_cast<const int32_t*>(buffer.kv_page_indptr.data()),
+            reinterpret_cast<const int32_t*>(buffer.kv_page_indices.data()),
+            reinterpret_cast<const int32_t*>(buffer.kv_last_page_lens.data()),
+            context_out.data(), num_tokens, 
+            config_.num_query_heads * head_size,    // head_dim
+            config_.num_key_value_heads * head_size, // kv_head_dim
+            head_size, buffer.page_size,
+            config_.num_query_heads, config_.num_key_value_heads,
+            1.0f / std::sqrt(float(head_size)), // scale
+            static_cast<int>(buffer.kv_page_indices.size())
+        );
+    } else {
+        // For non-float types, use bf16 version
+        metal::batch_prefill_attention::batch_prefill_attention_unified_bf16(
+            q_proj.data(), kv_cache_k, kv_cache_v,
+            reinterpret_cast<const int32_t*>(buffer.qo_indptr.data()),
+            reinterpret_cast<const int32_t*>(buffer.kv_page_indptr.data()),
+            reinterpret_cast<const int32_t*>(buffer.kv_page_indices.data()),
+            reinterpret_cast<const int32_t*>(buffer.kv_last_page_lens.data()),
+            context_out.data(), num_tokens, 
+            config_.num_query_heads * head_size,    // head_dim
+            config_.num_key_value_heads * head_size, // kv_head_dim
+            head_size, buffer.page_size,
+            config_.num_query_heads, config_.num_key_value_heads,
+            1.0f / std::sqrt(float(head_size)), // scale
+            static_cast<int>(buffer.kv_page_indices.size())
+        );
+    }
     profiler.record("batch_prefill_attention");
     
     // 4. Output projection
