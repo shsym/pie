@@ -11,7 +11,7 @@
 #include "ops.hpp"
 #include "artifacts.hpp"
 #include "metal_helpers.hpp"
-#include "metal_batch_prefill_attention.hpp"
+#include "metal_batch_prefill_handle.hpp"
 #include "dtype_utils.hpp"
 
 namespace ops {
@@ -39,6 +39,19 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
               << ", head_dim=" << head_dim
               << ", page_size=" << page_size
               << ", dtype=" << dtype_info.dtype_str << std::endl;
+    
+    // Create batch prefill attention handle
+    auto* attention_handle = metal::batch_prefill_attention::metal_batch_prefill_create_handle(
+        1024,  // max_batch_size
+        8192,  // max_seq_length
+        num_query_heads,
+        head_dim  // max_head_dim
+    );
+    
+    if (!attention_handle) {
+        std::cerr << "❌ Failed to create batch prefill attention handle" << std::endl;
+        return;
+    }
 
     // Resolve CUDA artifacts base directory
     std::filesystem::path cuda_base_dir;
@@ -173,13 +186,35 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
     std::cout << "  page_size: " << page_size << std::endl;
     std::cout << "  kv_page_indices.size(): " << kv_page_indices.size() << std::endl;
 
-    // Route to appropriate kernel based on detected dtype
-    // Note: Currently only bf16 kernel exists (batch_prefill_attention_unified_bf16)
+    // Route to appropriate kernel based on detected dtype with handle-based API
     try {
+        // Get workspace requirements
+        auto workspace = metal::batch_prefill_attention::metal_batch_prefill_get_workspace(
+            attention_handle,
+            num_tokens,
+            head_dim,
+            kv_head_dim,
+            page_size,
+            static_cast<int>(kv_page_indices.size())
+        );
+        
+        // Allocate workspace buffer using device from handle
+        id<MTLBuffer> workspace_buffer = [attention_handle->device newBufferWithLength:workspace.total_size
+                                                                               options:MTLResourceStorageModeShared];
+        if (!workspace_buffer) {
+            std::cerr << "❌ Failed to allocate workspace buffer of size " << workspace.total_size << " bytes" << std::endl;
+            return;
+        }
+        
+        std::cout << "📦 Workspace allocated: " << workspace.total_size << " bytes" << std::endl;
+        
         auto start = std::chrono::high_resolution_clock::now();
         if (dtype_info.dtype == DType::FP32) {
-            std::cout << "✅ Using native f32 kernel (linking issues resolved!)" << std::endl;
+            std::cout << "✅ Using native f32 kernel with handle-based API" << std::endl;
             metal::batch_prefill_attention::batch_prefill_attention_unified_f32(
+                attention_handle,
+                [workspace_buffer contents],
+                [workspace_buffer length],
                 reinterpret_cast<const float*>(q_input.data()), 
                 reinterpret_cast<const float*>(paged_k_cache.data()), 
                 reinterpret_cast<const float*>(paged_v_cache.data()),
@@ -190,9 +225,12 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
             );
         }
         else if (dtype_info.dtype == DType::FP16) {
-            // TODO: Use fp16 kernel when available (batch_prefill_attention_unified_float16)
-            // For now, use bf16 kernel
+            // For fp16, use bf16 kernel with handle-based API
+            std::cout << "✅ Using bf16 kernel for fp16 with handle-based API" << std::endl;
             metal::batch_prefill_attention::batch_prefill_attention_unified_bf16(
+                attention_handle,
+                [workspace_buffer contents],
+                [workspace_buffer length],
                 q_input.data(), paged_k_cache.data(), paged_v_cache.data(),
                 qo_indptr.data(), kv_page_indptr.data(), kv_page_indices.data(),
                 kv_last_page_lens.data(), output.data(),
@@ -202,8 +240,12 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
             std::cout << "Note: Using bf16 kernel for fp16 request (fp16 kernel not yet implemented)" << std::endl;
         }
         else {
-            // Default bf16 path
+            // Default bf16 path with handle-based API
+            std::cout << "✅ Using bf16 kernel with handle-based API" << std::endl;
             metal::batch_prefill_attention::batch_prefill_attention_unified_bf16(
+                attention_handle,
+                [workspace_buffer contents],
+                [workspace_buffer length],
                 q_input.data(), paged_k_cache.data(), paged_v_cache.data(),
                 qo_indptr.data(), kv_page_indptr.data(), kv_page_indices.data(),
                 kv_last_page_lens.data(), output.data(),
@@ -216,6 +258,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
         std::cout << "\n⏱️  Metal kernel execution time: " << elapsed.count() << " ms" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "\n❌ Metal kernel execution failed: " << e.what() << std::endl;
+        metal::batch_prefill_attention::metal_batch_prefill_destroy_handle(attention_handle);
         throw;
     }
 
@@ -306,6 +349,9 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
        artifacts::write_meta_json(dir, meta.str());
     }
 
+    // Clean up handle
+    metal::batch_prefill_attention::metal_batch_prefill_destroy_handle(attention_handle);
+    
     std::cout << "\n✅ Metal Batch Prefill Attention completed successfully" << std::endl;
 }
 

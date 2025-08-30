@@ -8,7 +8,7 @@
 #include "metal_rmsnorm_wrapper.hpp"
 #include "metal_rope_wrapper.hpp"
 #include "metal_silu_and_mul_wrapper.hpp"
-#include "metal_batch_prefill_attention.hpp"
+#include "metal_batch_prefill_handle.hpp"
 #include <Metal/Metal.h>
 #include <map>
 #include <memory>
@@ -85,6 +85,7 @@ template <typename T>
 class MetalL4maAttention : public MetalModule<T> {
 public:
     explicit MetalL4maAttention(const L4maConfig& config);
+    ~MetalL4maAttention();
     
     void forward(MetalProfileScope profiler,
                  MetalL4maBuffer<T>& buffer,
@@ -101,6 +102,7 @@ private:
     MetalTensor<T> k_proj_weights_;
     MetalTensor<T> v_proj_weights_;
     MetalTensor<T> o_proj_weights_;
+    metal::batch_prefill_attention::MetalBatchPrefillHandle* attention_handle_;
 };
 
 /**
@@ -304,6 +306,22 @@ MetalL4maAttention<T>::MetalL4maAttention(const L4maConfig& config) : config_(co
     k_proj_weights_ = MetalTensor<T>({num_key_value_heads * head_size, hidden_size});
     v_proj_weights_ = MetalTensor<T>({num_key_value_heads * head_size, hidden_size});
     o_proj_weights_ = MetalTensor<T>({hidden_size, num_query_heads * head_size});
+    
+    // Create batch prefill attention handle
+    attention_handle_ = metal::batch_prefill_attention::metal_batch_prefill_create_handle(
+        1024,  // max_batch_size
+        8192,  // max_seq_length
+        static_cast<int>(num_query_heads),
+        static_cast<int>(num_query_heads * head_size)  // max_head_dim
+    );
+}
+
+template <typename T>
+MetalL4maAttention<T>::~MetalL4maAttention() {
+    if (attention_handle_) {
+        metal::batch_prefill_attention::metal_batch_prefill_destroy_handle(attention_handle_);
+        attention_handle_ = nullptr;
+    }
 }
 
 template <typename T>
@@ -350,37 +368,66 @@ void MetalL4maAttention<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<
                            config_.rope_theta, config_.rope_factor);
     profiler.record("apply_rope");
     
-    // 3. Batch prefill attention
+    // 3. Batch prefill attention with handle-based API
     auto context_out = buffer.template allocate<T>(num_tokens * num_query_heads * head_size);
+    
+    // Get workspace requirements
+    auto workspace = metal::batch_prefill_attention::metal_batch_prefill_get_workspace(
+        attention_handle_,
+        static_cast<int>(num_tokens),
+        static_cast<int>(config_.num_query_heads * head_size),    // head_dim
+        static_cast<int>(config_.num_key_value_heads * head_size), // kv_head_dim
+        static_cast<int>(buffer.page_size),
+        static_cast<int>(buffer.kv_page_indices.size())
+    );
+    
+    // Allocate workspace buffer
+    auto& metalContext = MetalContext::getInstance();
+    id<MTLBuffer> workspace_buffer = [metalContext.getDevice() newBufferWithLength:workspace.total_size
+                                                                            options:MTLResourceStorageModeShared];
     
     if constexpr (std::is_same_v<T, float>) {
         metal::batch_prefill_attention::batch_prefill_attention_unified_f32(
-            q_proj.data(), kv_cache_k, kv_cache_v,
+            attention_handle_,
+            [workspace_buffer contents],
+            [workspace_buffer length],
+            reinterpret_cast<const float*>(q_proj.data()), 
+            reinterpret_cast<const float*>(kv_cache_k), 
+            reinterpret_cast<const float*>(kv_cache_v),
             reinterpret_cast<const int32_t*>(buffer.qo_indptr.data()),
             reinterpret_cast<const int32_t*>(buffer.kv_page_indptr.data()),
             reinterpret_cast<const int32_t*>(buffer.kv_page_indices.data()),
             reinterpret_cast<const int32_t*>(buffer.kv_last_page_lens.data()),
-            context_out.data(), num_tokens, 
-            config_.num_query_heads * head_size,    // head_dim
-            config_.num_key_value_heads * head_size, // kv_head_dim
-            head_size, buffer.page_size,
-            config_.num_query_heads, config_.num_key_value_heads,
+            reinterpret_cast<float*>(context_out.data()),
+            static_cast<int>(num_tokens),
+            static_cast<int>(config_.num_query_heads * head_size),    // head_dim
+            static_cast<int>(config_.num_key_value_heads * head_size), // kv_head_dim
+            static_cast<int>(head_size),
+            static_cast<int>(buffer.page_size),
+            static_cast<int>(config_.num_query_heads),
+            static_cast<int>(config_.num_key_value_heads),
             1.0f / std::sqrt(float(head_size)), // scale
             static_cast<int>(buffer.kv_page_indices.size())
         );
     } else {
         // For non-float types, use bf16 version
         metal::batch_prefill_attention::batch_prefill_attention_unified_bf16(
+            attention_handle_,
+            [workspace_buffer contents],
+            [workspace_buffer length],
             q_proj.data(), kv_cache_k, kv_cache_v,
             reinterpret_cast<const int32_t*>(buffer.qo_indptr.data()),
             reinterpret_cast<const int32_t*>(buffer.kv_page_indptr.data()),
             reinterpret_cast<const int32_t*>(buffer.kv_page_indices.data()),
             reinterpret_cast<const int32_t*>(buffer.kv_last_page_lens.data()),
-            context_out.data(), num_tokens, 
-            config_.num_query_heads * head_size,    // head_dim
-            config_.num_key_value_heads * head_size, // kv_head_dim
-            head_size, buffer.page_size,
-            config_.num_query_heads, config_.num_key_value_heads,
+            context_out.data(),
+            static_cast<int>(num_tokens),
+            static_cast<int>(config_.num_query_heads * head_size),    // head_dim
+            static_cast<int>(config_.num_key_value_heads * head_size), // kv_head_dim
+            static_cast<int>(head_size),
+            static_cast<int>(buffer.page_size),
+            static_cast<int>(config_.num_query_heads),
+            static_cast<int>(config_.num_key_value_heads),
             1.0f / std::sqrt(float(head_size)), // scale
             static_cast<int>(buffer.kv_page_indices.size())
         );

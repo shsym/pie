@@ -20,82 +20,15 @@ namespace batch_prefill_attention {
 // kv_page_indices: [total_pages_across_seqs]
 // kv_last_page_lens: [num_seqs]
 // output: [num_qo, head_dim]
-void batch_prefill_attention_unified_bf16(
-    const void* q_input,
-    const void* paged_k_cache,
-    const void* paged_v_cache,
-    const int32_t* qo_indptr,
-    const int32_t* kv_page_indptr,
-    const int32_t* kv_page_indices,
-    const int32_t* kv_last_page_lens,
-    void* output,
-    int num_qo,
-    int head_dim,
-    int kv_head_dim,      // NEW: KV head dimension for MQA/GQA  
-    int head_size,
-    int page_size,
-    int num_query_heads,  // NEW: Number of query heads
-    int num_kv_heads,     // NEW: Number of KV heads
-    float scale,
-    int num_kv_pages
-);
-
-// Native float32 variant (no host-side dtype conversions)
-void batch_prefill_attention_unified_f32(
-    const float* q_input,
-    const float* paged_k_cache,
-    const float* paged_v_cache,
-    const int32_t* qo_indptr,
-    const int32_t* kv_page_indptr,
-    const int32_t* kv_page_indices,
-    const int32_t* kv_last_page_lens,
-    float* output,
-    int num_qo,
-    int head_dim,
-    int kv_head_dim,      // NEW: KV head dimension for MQA/GQA
-    int head_size,
-    int page_size,
-    int num_query_heads,  // NEW: Number of query heads
-    int num_kv_heads,     // NEW: Number of KV heads
-    float scale,
-    int num_kv_pages
-);
-
-// Optimized variants with performance improvements
-// Use these for better performance with the same API compatibility
-void batch_prefill_attention_optimized_bf16(
-    const void* q_input,
-    const void* paged_k_cache,
-    const void* paged_v_cache,
-    const int32_t* qo_indptr,
-    const int32_t* kv_page_indptr,
-    const int32_t* kv_page_indices,
-    const int32_t* kv_last_page_lens,
-    void* output,
-    int num_qo,
-    int head_dim,
-    int head_size,
-    int page_size,
-    float scale,
-    int num_kv_pages
-);
-
-void batch_prefill_attention_optimized_f32(
-    const float* q_input,
-    const float* paged_k_cache,
-    const float* paged_v_cache,
-    const int32_t* qo_indptr,
-    const int32_t* kv_page_indptr,
-    const int32_t* kv_page_indices,
-    const int32_t* kv_last_page_lens,
-    float* output,
-    int num_qo,
-    int head_dim,
-    int head_size,
-    int page_size,
-    float scale,
-    int num_kv_pages
-);
+// OLD API REMOVED - Use handle-based API in metal_batch_prefill_handle.hpp
+// 
+// Migration guide:
+// 1. Include "metal_batch_prefill_handle.hpp" 
+// 2. Create handle: auto* handle = metal_batch_prefill_create_handle()
+// 3. Get workspace: auto workspace = metal_batch_prefill_get_workspace(handle, ...)
+// 4. Allocate workspace buffer: auto buffer = [device newBufferWithLength:workspace.total_size ...]
+// 5. Call: batch_prefill_attention_unified_bf16(handle, [buffer contents], [buffer length], ...)
+// 6. Destroy handle when done: metal_batch_prefill_destroy_handle(handle)
 
 } // namespace batch_prefill_attention
 } // namespace metal
