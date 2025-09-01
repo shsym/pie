@@ -3,6 +3,8 @@ interface core {
     // Import pollable functionality from the WASI IO poll package
     use wasi:io/poll@0.2.4.{pollable};
 
+    type pointer = u32;
+
     // Returns the runtime version string
     get-version: func() -> string;
 
@@ -20,6 +22,9 @@ interface core {
 
     // Get names of models that have all specified traits (e.g. "input_text", "tokenize")
     get-all-models-with-traits: func(traits: list<string>) -> list<string>;
+
+    // Get the size of a KV page
+    get-kv-page-size: func(queue: borrow<queue>) -> u32;
 
     // Sends a message to the remote user client
     send: func(message: string);
@@ -52,6 +57,47 @@ interface core {
 
     // Executes a debug command and returns the result as a string
     debug-query: func(query: string) -> debug-query-result;
+
+    // resources
+
+    allocate-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        count: u32,
+    ) -> list<pointer>;
+
+
+    deallocate-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        ptrs: list<pointer>
+    );
+
+    get-all-exported-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+    ) -> list<tuple<string, u32>>;
+
+
+    export-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        ptrs: list<pointer>,
+        name: string
+    );
+
+    unexport-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        name: string
+    );
+
+
+    import-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        name: string
+    ) -> list<pointer>;
 
     // Resource representing a specific model instance
     resource model {

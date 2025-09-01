@@ -9,12 +9,14 @@ pub mod client;
 
 // Internal modules
 mod backend;
-mod batching;
+mod batching_old;
 mod bindings;
+mod handler;
 mod instance;
 mod kvs;
 mod messaging;
 mod model;
+mod model_old;
 mod object;
 mod ping;
 mod runtime;
@@ -22,12 +24,13 @@ pub mod server;
 mod service;
 mod tokenizer;
 mod utils;
+mod batching;
 
 // Re-export core components from internal modules
 use crate::auth::{create_jwt, init_secret};
 use crate::kvs::KeyValueStore;
 use crate::messaging::{PubSub, PushPull};
-pub use crate::model::{BatchingStrategyConfiguration, set_batching_strategy};
+pub use crate::model_old::{BatchingStrategyConfiguration, set_batching_strategy};
 use crate::ping::Ping;
 use crate::runtime::Runtime;
 use crate::server::Server;

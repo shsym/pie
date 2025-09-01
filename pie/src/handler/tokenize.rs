@@ -1,6 +1,7 @@
 use crate::bindings;
+use crate::handler::core::Queue;
 use crate::instance::InstanceState;
-use crate::model::Command;
+use crate::model_old::Command;
 use crate::tokenizer::BytePairEncoder;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -15,7 +16,7 @@ pub struct Tokenizer {
 impl bindings::pie::inferlet::tokenize::Host for InstanceState {
     async fn get_tokenizer(
         &mut self,
-        queue: Resource<bindings::core::Queue>,
+        queue: Resource<Queue>,
     ) -> anyhow::Result<Resource<Tokenizer>> {
         let q = self.table().get(&queue)?;
         let (tx, rx) = oneshot::channel();
@@ -44,7 +45,10 @@ impl bindings::pie::inferlet::tokenize::HostTokenizer for InstanceState {
         tokenizer.inner.decode(&tokens).map_err(Into::into)
     }
 
-    async fn get_vocabs(&mut self, this: Resource<Tokenizer>) -> anyhow::Result<(Vec<u32>, Vec<Vec<u8>>)> {
+    async fn get_vocabs(
+        &mut self,
+        this: Resource<Tokenizer>,
+    ) -> anyhow::Result<(Vec<u32>, Vec<Vec<u8>>)> {
         let tokenizer = self.table().get(&this)?;
         Ok(tokenizer.inner.get_vocabs())
     }

@@ -1,6 +1,7 @@
 use crate::instance::InstanceState;
 use crate::messaging::{PubSubCommand, PushPullCommand, dispatch_i2i, dispatch_u2i};
-use crate::model::{self, Command, StreamPriority};
+use crate::model::ResourceId;
+use crate::model_old::{self, Command, ManagedTypes, StreamPriority};
 use crate::{bindings, kvs, server};
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -179,7 +180,7 @@ impl bindings::pie::inferlet::core::Host for InstanceState {
     }
 
     async fn get_model(&mut self, name: String) -> anyhow::Result<Option<Resource<Model>>> {
-        if let Some(service_id) = model::model_service_id(&name) {
+        if let Some(service_id) = model_old::model_service_id(&name) {
             let model = Model { name, service_id };
             let res = self.table().push(model)?;
             return Ok(Some(res));
@@ -188,7 +189,7 @@ impl bindings::pie::inferlet::core::Host for InstanceState {
     }
 
     async fn get_all_models(&mut self) -> anyhow::Result<Vec<String>> {
-        Ok(model::available_models())
+        Ok(model_old::available_models())
     }
 
     async fn get_all_models_with_traits(
@@ -196,7 +197,7 @@ impl bindings::pie::inferlet::core::Host for InstanceState {
         _traits: Vec<String>,
     ) -> anyhow::Result<Vec<String>> {
         // Placeholder: Implement trait filtering logic
-        Ok(model::available_models())
+        Ok(model_old::available_models())
     }
 
     async fn store_set(&mut self, key: String, value: String) -> anyhow::Result<()> {
@@ -226,6 +227,123 @@ impl bindings::pie::inferlet::core::Host for InstanceState {
         kvs::dispatch(kvs::Command::ListKeys { response: tx })?;
         let res = rx.await?;
         Ok(res)
+    }
+
+    async fn get_kv_page_size(&mut self, queue: Resource<Queue>) -> anyhow::Result<u32> {
+        let q = self.table().get(&queue)?;
+        let (tx, rx) = oneshot::channel();
+        Command::GetBlockSize { handle: tx }.dispatch(q.service_id)?;
+        let block_size = rx.await?;
+        Ok(block_size)
+    }
+
+    async fn get_all_exported_resources(
+        &mut self,
+        queue: Resource<Queue>,
+        resource_type: u32,
+    ) -> anyhow::Result<Vec<(String, u32)>> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+        let (tx, rx) = oneshot::channel();
+        Command::GetExportedList {
+            inst_id,
+            ty: ManagedTypes::KvPage,
+            handle: tx,
+        }
+        .dispatch(q.service_id)?;
+        rx.await.map_err(Into::into)
+    }
+
+    async fn allocate_resources(
+        &mut self,
+        queue: Resource<Queue>,
+        resource_type: u32,
+        count: u32,
+    ) -> anyhow::Result<Vec<ResourceId>> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+        Command::Allocate {
+            inst_id,
+            stream_id: q.stream_id,
+            ty: ManagedTypes::KvPage,
+            ids: kv_page_ids,
+        }
+        .dispatch(q.service_id)?;
+        Ok(())
+    }
+
+    async fn deallocate_resources(
+        &mut self,
+        queue: Resource<Queue>,
+        resource_type: u32,
+        ptrs: Vec<ResourceId>,
+    ) -> anyhow::Result<()> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+        Command::Deallocate {
+            inst_id,
+            stream_id: q.stream_id,
+            ty: ManagedTypes::KvPage,
+            ids: kv_page_ids,
+        }
+        .dispatch(q.service_id)?;
+        Ok(())
+    }
+
+    async fn export_resources(
+        &mut self,
+        queue: Resource<Queue>,
+        resource_type: u32,
+        ptrs: Vec<ResourceId>,
+        name: String,
+    ) -> anyhow::Result<()> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+        Command::Export {
+            inst_id,
+            ty: ManagedTypes::KvPage,
+            ids: src_kv_page_ids,
+            resource_name: name,
+        }
+        .dispatch(q.service_id)?;
+
+        Ok(())
+    }
+
+    async fn unexport_resources(
+        &mut self,
+        queue: Resource<Queue>,
+        resource_type: u32,
+        name: String,
+    ) -> anyhow::Result<()> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+        Command::Unexport {
+            inst_id,
+            ty: ManagedTypes::KvPage,
+            resource_name: name,
+        }
+        .dispatch(q.service_id)?;
+
+        Ok(())
+    }
+
+    async fn import_resources(
+        &mut self,
+        queue: Resource<Queue>,
+        resource_type: u32,
+        name: String,
+    ) -> anyhow::Result<Vec<ResourceId>> {
+        let inst_id = self.id();
+        let q = self.table().get(&queue)?;
+        Command::Import {
+            inst_id,
+            ty: ManagedTypes::KvPage,
+            ids: dst_kv_page_ids,
+            resource_name: name,
+        }
+        .dispatch(q.service_id)?;
+        Ok(())
     }
 }
 

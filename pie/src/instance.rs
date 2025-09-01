@@ -1,6 +1,9 @@
+use crate::model_old::ManagedTypes;
+use crate::model::ResourceId;
 use bytes::Bytes;
 use colored::*;
 use prost::bytes;
+use std::collections::HashMap;
 use std::io;
 use std::io::{IsTerminal, Write};
 use uuid::Uuid;
@@ -14,11 +17,18 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 pub type Id = Uuid;
 
 pub struct InstanceState {
+    // Wasm states
     id: Id,
     arguments: Vec<String>,
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
+
+    // some heuristics
+    start_time: std::time::Instant,
+
+    // virtual resources
+    resources: HashMap<ManagedTypes, HashMap<ResourceId, ResourceId>>,
 }
 
 impl IoView for InstanceState {
@@ -54,6 +64,8 @@ impl InstanceState {
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
+            start_time: std::time::Instant::now(),
+            resources: HashMap::new(),
         }
     }
 
