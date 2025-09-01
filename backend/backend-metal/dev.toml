@@ -37,5 +37,4 @@ max_head_dim = 256  # Maximum head dimension supported by kernel
 # Metal-specific performance settings
 [metal_performance]
 threadgroup_size = 128  # Must match TGP_SIZE in kernel
-enable_optimized_kernels = false  # Use optimized kernel variants when available
 debug_mode = true  # Enable kernel debug output

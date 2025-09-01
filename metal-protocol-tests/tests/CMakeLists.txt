@@ -35,6 +35,7 @@ set(BACKEND_SOURCES
     ${BACKEND_SRC_PATH}/metal_softmax.mm
     ${BACKEND_SRC_PATH}/metal_extract_k_values.mm
     ${BACKEND_SRC_PATH}/metal_topk_mask_logits.mm
+    ${BACKEND_SRC_PATH}/metal_attention_naive.mm
 )
 
 # Additional backend libraries to link against
@@ -149,6 +150,12 @@ add_executable(test_performance_suite
 )
 target_link_libraries(test_performance_suite ${COMMON_LIBRARIES} ${BACKEND_LIBS})
 
+add_executable(test_attention_algorithm_comparison
+    src/performance/test_attention_algorithm_comparison.mm
+    ${BACKEND_SOURCES}
+)
+target_link_libraries(test_attention_algorithm_comparison ${COMMON_LIBRARIES} ${BACKEND_LIBS})
+
 # ============================================================================
 # Compatibility Tests (API compatibility checks)
 # ============================================================================
@@ -213,6 +220,15 @@ add_custom_target(run_performance_tests
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+# Algorithmic optimization validation
+add_custom_target(run_algorithm_validation
+    COMMAND echo "=== Running Algorithmic Optimization Validation ==="
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_attention_algorithm_comparison
+    COMMAND echo "✅ Algorithm validation completed"
+    DEPENDS test_attention_algorithm_comparison
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 # Compatibility tests
 add_custom_target(run_compatibility_tests
     COMMAND echo "=== Running Compatibility Tests ==="
@@ -265,6 +281,7 @@ add_custom_target(test_stats
     COMMAND echo "  run_integration_tests"
     COMMAND echo "  run_stress_tests" 
     COMMAND echo "  run_performance_tests"
+    COMMAND echo "  run_algorithm_validation"
     COMMAND echo "  run_compatibility_tests"
 )
 

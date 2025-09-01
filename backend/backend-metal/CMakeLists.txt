@@ -147,18 +147,7 @@ set_target_properties(metal_common PROPERTIES
     COMPILE_FLAGS "-fobjc-arc"
 )
 
-# Test executables
-
-# Final validation test for softmax
-add_executable(final_test_softmax
-    src/final_test_softmax.cpp
-)
-
-target_link_libraries(final_test_softmax
-    metal_softmax
-    ${METAL_FRAMEWORK}
-    ${FOUNDATION_FRAMEWORK}
-)
+# Test executables are defined in the tests/ subdirectory
 
 # Set output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -247,5 +236,7 @@ configure_file(
     COPYONLY
 )
 
-# Include tests subdirectory
-add_subdirectory(tests)
+# Include tests subdirectory only if present (optional local tests/executables)
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt)
+    add_subdirectory(tests)
+endif()
