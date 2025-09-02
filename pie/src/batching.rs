@@ -5,161 +5,117 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
-pub enum BatchingConfig {
-    Bounded {
-        max_wait_time: Duration,
-        min_size: usize,
-        max_size: Option<usize>,
-    },
-    Triggered {
-        // Will be populated by the model service at initialization.
-        trigger: Option<Arc<AtomicBool>>,
-        min_wait_time: Duration,
-    },
-}
-
-impl BatchingConfig {
-    pub fn to_policy(&self) -> Box<dyn BatchingPolicy> {
-        match self {
-            Self::Bounded {
-                max_wait_time,
-                min_size,
-                max_size,
-            } => BoundedPolicy::new(*max_wait_time, *min_size, *max_size).into_box(),
-            Self::Triggered {
-                trigger,
-                min_wait_time,
-            } => TriggeredPolicy::new(trigger.clone().unwrap(), *min_wait_time).into_box(),
-        }
-    }
-}
-
-/// Defines the strategy for when to form a batch from a queue of items.
-trait BatchingPolicy: Debug + Send {
-    /// Notifies the policy that a new item has been added.
+pub trait BatchingStrategy: Debug + Send {
     fn update(&mut self, now: Instant);
 
-    /// Checks if a batch is ready according to the policy.
-    /// Returns the size of the batch to be formed, or 0 if no batch is ready.
-    fn poll(&mut self, now: Instant) -> usize;
-
-    /// Hints at the optimal time to wait before the next poll.
-    ///
-    /// Returns `Some(duration)` to suggest sleeping for that amount of time.
-    /// Returns `Some(Duration::ZERO)` if a batch is ready to be polled immediately.
-    /// Returns `None` if no time-based hint is applicable (e.g., when waiting for
-    /// an external trigger or if the queue is empty).
-    fn next_poll_in(&self, now: Instant) -> Option<Duration>;
+    fn batch(&mut self, now: Instant) -> usize;
 }
 
-pub fn immediate() -> Box<dyn BatchingPolicy> {
-    BoundedPolicy::eager().into_box()
+pub fn eager() -> Box<dyn BatchingStrategy> {
+    KorTStrategy::eager().into_box()
 }
 
-pub fn k_only(min_size: usize, max_size: Option<usize>) -> Box<dyn BatchingPolicy> {
-    BoundedPolicy::k_only(min_size, max_size).into_box()
+pub fn immediate() -> Box<dyn BatchingStrategy> {
+    KorTStrategy::immediate().into_box()
 }
 
-pub fn t_only(max_wait_time: Duration) -> Box<dyn BatchingPolicy> {
-    BoundedPolicy::t_only(max_wait_time).into_box()
+pub fn k_only(min_size: usize, max_size: Option<usize>) -> Box<dyn BatchingStrategy> {
+    KorTStrategy::k_only(min_size, max_size).into_box()
+}
+
+pub fn t_only(max_wait_time: Duration) -> Box<dyn BatchingStrategy> {
+    KorTStrategy::t_only(max_wait_time).into_box()
 }
 
 pub fn k_or_t(
     max_wait_time: Duration,
     min_size: usize,
     max_size: Option<usize>,
-) -> Box<dyn BatchingPolicy> {
-    BoundedPolicy::k_or_t(max_wait_time, min_size, max_size).into_box()
+) -> Box<dyn BatchingStrategy> {
+    KorTStrategy::k_or_t(max_wait_time, min_size, max_size).into_box()
 }
 
-/// A policy that forms a batch only when an external trigger is fired
-/// and a minimum wait time has passed since the first item arrived.
+/// Creates a queue that uses an adaptive strategy to minimize latency
+/// by estimating the arrival rate `lambda` online.
+///
+/// # Arguments
+///
+/// * `initial_lambda` - An initial guess for the arrival rate (items per second).
+/// * `alpha` - The smoothing factor for the EWMA (e.g., 0.1). A higher value adapts faster but is less smooth.
+/// * `recalc_interval` - The number of arrivals after which to recalculate the optimal batch size.
+/// * `f_values` - A lookup table of `Duration`s where `f_values[n-1]` is the execution time for a batch of size `n`.
+/// * `max_size` - The maximum batch size to consider. Must be `<= f_values.len()`.
+pub fn adaptive(
+    initial_lambda: f64,
+    alpha: f64,
+    recalc_interval: u32,
+    f_values: Vec<Duration>,
+    max_size: usize,
+) -> Result<Box<dyn BatchingStrategy>, &'static str> {
+    AdaptiveStrategy::new(initial_lambda, alpha, recalc_interval, f_values, max_size)
+        .map(|s| s.into_box())
+}
+
+pub fn manual() -> (Box<dyn BatchingStrategy>, Arc<AtomicBool>) {
+    let trigger = Arc::new(AtomicBool::new(false));
+    let strategy = ManualStrategy {
+        count: 0,
+        trigger: trigger.clone(),
+    };
+    (Box::new(strategy), trigger)
+}
+
+/// A strategy that batches items only when an external trigger is fired.
 #[derive(Debug)]
-pub struct TriggeredPolicy {
+pub struct ManualStrategy {
     count: usize,
     trigger: Arc<AtomicBool>,
-    min_wait_time: Duration,
-    first_item_time: Option<Instant>,
 }
 
-impl TriggeredPolicy {
-    pub fn new(trigger: Arc<AtomicBool>, min_wait_time: Duration) -> Self {
-        Self {
-            count: 0,
-            trigger,
-            min_wait_time,
-            first_item_time: None,
-        }
-    }
-
-    fn into_box(self) -> Box<dyn BatchingPolicy> {
-        Box::new(self)
+impl ManualStrategy {
+    /// Creates a new ManualStrategy that uses the provided atomic boolean as a trigger.
+    pub fn new(trigger: Arc<AtomicBool>) -> Self {
+        Self { count: 0, trigger }
     }
 }
 
-impl BatchingPolicy for TriggeredPolicy {
-    fn update(&mut self, now: Instant) {
+impl BatchingStrategy for ManualStrategy {
+    fn update(&mut self, _now: Instant) {
+        //println!("item added: {:?}", self.count + 1);
+        // We only need to know how many items there are, not when they arrived.
         self.count += 1;
-        // If this is the first item in a new batch, record its arrival time.
-        if self.count == 1 {
-            self.first_item_time = Some(now);
-        }
     }
 
-    fn poll(&mut self, now: Instant) -> usize {
+    fn batch(&mut self, _now: Instant) -> usize {
         if self.count == 0 {
             return 0;
         }
+        //println!("batch fired! {:?}", self.trigger);
 
-        // Check if the minimum wait time has passed since the first item arrived.
-        let waited_long_enough = match self.first_item_time {
-            Some(t0) => now.duration_since(t0) >= self.min_wait_time,
-            None => self.min_wait_time == Duration::from_secs(0),
-        };
-        if !waited_long_enough {
-            return 0;
+        // Atomically check if the trigger is set to true, and reset it to false.
+        // `swap` ensures we only fire once per trigger.
+        if self.trigger.swap(false, Ordering::SeqCst) {
+            let batch_size = self.count;
+            self.count = 0;
+            batch_size
+        } else {
+            0
         }
-
-        // Atomically check and consume the trigger.
-        // This ensures that even if polled multiple times while triggered,
-        // a batch is formed only once per trigger event.
-        if self.trigger.load(Ordering::SeqCst) {
-            if self.trigger.swap(false, Ordering::SeqCst) {
-                let batch_size = self.count;
-                self.count = 0;
-                self.first_item_time = None; // Reset for the next batch.
-                return batch_size;
-            }
-        }
-        0
-    }
-
-    fn next_poll_in(&self, now: Instant) -> Option<Duration> {
-        if let Some(first_item_time) = self.first_item_time {
-            let elapsed = now.duration_since(first_item_time);
-            if elapsed < self.min_wait_time {
-                return Some(self.min_wait_time - elapsed);
-            }
-        }
-        // If the queue is empty, or the min_wait_time has passed, the next poll
-        // depends on the external trigger, for which we cannot provide a time hint.
-        None
     }
 }
 
-/// A policy that forms a batch when either a minimum number of items (`min_size`)
-/// have queued up or a maximum wait time (`max_wait_time`) has passed since the
-/// first item arrived. This is often called a "K-or-T" strategy.
+/// "K-or-T" Strategy
+// 	For instance: If queue size reaches K, launch immediately; otherwise launch after T ms if K isn’t reached.
+// 	This ensures that the GPU does not stay idle for too long (bounded by T) and that short bursts of arrivals form a large enough batch to get good utilization (bounded by K).
 #[derive(Debug)]
-pub struct BoundedPolicy {
+pub struct KorTStrategy {
     max_wait_time: Duration,
     min_size: usize,
     max_size: usize,
     items: VecDeque<Instant>,
 }
 
-impl BoundedPolicy {
+impl KorTStrategy {
     pub fn new(max_wait_time: Duration, min_size: usize, max_size: Option<usize>) -> Self {
         Self {
             max_wait_time,
@@ -169,38 +125,37 @@ impl BoundedPolicy {
         }
     }
 
-    /// Creates a policy where batches are formed as soon as at least one item is present.
+    pub fn into_box(self) -> Box<dyn BatchingStrategy> {
+        Box::new(self)
+    }
+
+    /// Creates a queue that is "eager": batches are emitted immediately.
     pub fn eager() -> Self {
-        BoundedPolicy::new(Duration::from_secs_f32(0.0), 1, Some(usize::MAX))
+        KorTStrategy::new(Duration::from_secs_f32(0.0), 1, Some(usize::MAX))
     }
 
-    /// Creates a policy where a batch of size 1 is formed immediately for each item.
     pub fn immediate() -> Self {
-        BoundedPolicy::new(Duration::from_secs_f32(0.0), 1, Some(1))
+        KorTStrategy::new(Duration::from_secs_f32(0.0), 1, Some(1))
     }
 
-    /// Creates a policy that only uses the item count threshold (`min_size`).
+    /// Creates a queue that only uses the item count threshold.
     /// If `max_size` is not provided, it defaults to the given `min_size`.
     pub fn k_only(min_size: usize, max_size: Option<usize>) -> Self {
-        BoundedPolicy::new(Duration::MAX, min_size, max_size)
+        KorTStrategy::new(Duration::MAX, min_size, max_size)
     }
 
-    /// Creates a policy that only uses the time threshold (`max_wait_time`).
+    /// Creates a queue that only uses the time threshold.
     pub fn t_only(max_wait_time: Duration) -> Self {
-        BoundedPolicy::new(max_wait_time, usize::MAX, Some(usize::MAX))
+        KorTStrategy::new(max_wait_time, usize::MAX, Some(usize::MAX))
     }
 
-    /// Creates a policy that forms a batch when either the item count or time threshold is met.
+    /// Creates a queue that batches when either the time or count threshold is met.
     pub fn k_or_t(max_wait_time: Duration, min_size: usize, max_size: Option<usize>) -> Self {
-        BoundedPolicy::new(max_wait_time, min_size, max_size)
-    }
-
-    fn into_box(self) -> Box<dyn BatchingPolicy> {
-        Box::new(self)
+        KorTStrategy::new(max_wait_time, min_size, max_size)
     }
 }
 
-impl Clone for BoundedPolicy {
+impl Clone for KorTStrategy {
     fn clone(&self) -> Self {
         Self {
             max_wait_time: self.max_wait_time,
@@ -211,12 +166,12 @@ impl Clone for BoundedPolicy {
     }
 }
 
-impl BatchingPolicy for BoundedPolicy {
+impl BatchingStrategy for KorTStrategy {
     fn update(&mut self, now: Instant) {
         self.items.push_back(now);
     }
 
-    fn poll(&mut self, now: Instant) -> usize {
+    fn batch(&mut self, now: Instant) -> usize {
         let first = match self.items.front() {
             Some(&first) => first,
             None => return 0,
@@ -227,46 +182,162 @@ impl BatchingPolicy for BoundedPolicy {
             return 0;
         }
 
-        // A batching condition was met. Form a batch of up to `max_size` items.
+        // Otherwise, drain up to max_size items.
         let count = self.items.len().min(self.max_size);
-        self.items.drain(..count);
+        self.items.drain(..count).count();
         count
     }
+}
 
-    fn next_poll_in(&self, now: Instant) -> Option<Duration> {
-        let first = match self.items.front() {
-            Some(&first) => first,
-            None => return None, // Queue is empty, no hint.
-        };
+/// An adaptive strategy that determines the optimal batch size (`n*`) by modeling
+/// the system as a queue to minimize average latency. It estimates the arrival
+/// rate `lambda` online and periodically recalculates `n*`.
+#[derive(Debug)]
+pub struct AdaptiveStrategy {
+    // Parameters for lambda estimation
+    alpha: f64,
+    avg_inter_arrival_time: Duration,
+    last_arrival_time: Option<Instant>,
 
-        // If the size condition is already met, the batch is ready.
-        if self.items.len() >= self.min_size {
-            return Some(Duration::ZERO);
+    // Parameters for recalculation
+    f_values: Vec<Duration>,
+    max_size: usize,
+    updates_since_recalc: u32,
+    recalc_interval: u32,
+
+    // The calculated optimal batch size
+    optimal_n: usize,
+    // The queue of items
+    items: VecDeque<Instant>,
+}
+
+impl AdaptiveStrategy {
+    /// Creates a new `AdaptiveStrategy` by calculating an initial optimal batch size.
+    pub fn new(
+        initial_lambda: f64,
+        alpha: f64,
+        recalc_interval: u32,
+        f_values: Vec<Duration>,
+        max_size: usize,
+    ) -> Result<Self, &'static str> {
+        if max_size == 0 || max_size > f_values.len() {
+            return Err("max_size must be > 0 and <= f_values.len()");
         }
 
-        // Otherwise, the next guaranteed opportunity to form a batch is when the time limit expires.
-        let elapsed = now.duration_since(first);
-        if elapsed < self.max_wait_time {
-            Some(self.max_wait_time - elapsed)
+        // Calculate the initial optimal_n based on the provided guess
+        let initial_n = Self::calculate_optimal_n(initial_lambda, &f_values, max_size)
+            .ok_or("Could not find a stable initial batch size.")?;
+
+        Ok(Self {
+            alpha,
+            // Initialize avg inter-arrival time based on the initial lambda guess
+            avg_inter_arrival_time: Duration::from_secs_f64(1.0 / initial_lambda),
+            last_arrival_time: None,
+            f_values,
+            max_size,
+            updates_since_recalc: 0,
+            recalc_interval,
+            optimal_n: initial_n,
+            items: VecDeque::new(),
+        })
+    }
+
+    /// Performs the core calculation to find the optimal batch size `n*`.
+    fn calculate_optimal_n(lambda: f64, f_values: &[Duration], max_size: usize) -> Option<usize> {
+        let mut best_n = 0;
+        let mut min_latency = f64::MAX;
+
+        for n in 1..=max_size {
+            let n_f64 = n as f64;
+            // Look up execution time from the vector
+            let fn_duration = f_values[n - 1];
+            let fn_seconds = fn_duration.as_secs_f64();
+
+            if lambda * fn_seconds >= n_f64 {
+                continue;
+            }
+
+            let w_batch = (n_f64 - 1.0) / (2.0 * lambda);
+            let w_queue = n_f64 / (2.0 * lambda * (n_f64 - lambda * fn_seconds));
+            let w_proc = fn_seconds;
+            let current_latency = w_batch + w_queue + w_proc;
+
+            if current_latency < min_latency {
+                min_latency = current_latency;
+                best_n = n;
+            }
+        }
+
+        if best_n > 0 { Some(best_n) } else { None }
+    }
+
+    /// Re-evaluates `optimal_n` using the latest `lambda` estimate.
+    fn recalculate(&mut self) {
+        let avg_iat_secs = self.avg_inter_arrival_time.as_secs_f64();
+        if avg_iat_secs < 1e-9 {
+            return;
+        } // Avoid division by zero
+        let lambda_estimate = 1.0 / avg_iat_secs;
+
+        // If a new stable n is found, update it. Otherwise, keep the old one.
+        if let Some(new_n) =
+            Self::calculate_optimal_n(lambda_estimate, &self.f_values, self.max_size)
+        {
+            self.optimal_n = new_n;
+        }
+    }
+
+    pub fn into_box(self) -> Box<dyn BatchingStrategy> {
+        Box::new(self)
+    }
+}
+
+impl BatchingStrategy for AdaptiveStrategy {
+    fn update(&mut self, now: Instant) {
+        self.items.push_back(now);
+
+        // Update the EWMA of the inter-arrival time
+        if let Some(last_time) = self.last_arrival_time {
+            let current_iat = now.duration_since(last_time);
+            let old_avg_secs = self.avg_inter_arrival_time.as_secs_f64();
+            let new_avg_secs =
+                self.alpha * current_iat.as_secs_f64() + (1.0 - self.alpha) * old_avg_secs;
+            self.avg_inter_arrival_time = Duration::from_secs_f64(new_avg_secs);
+        }
+        self.last_arrival_time = Some(now);
+
+        // Check if it's time to recalculate the optimal batch size
+        self.updates_since_recalc += 1;
+        if self.updates_since_recalc >= self.recalc_interval {
+            self.recalculate();
+            self.updates_since_recalc = 0;
+        }
+    }
+
+    fn batch(&mut self, _now: Instant) -> usize {
+        // Fire a batch of size `optimal_n` as soon as enough items are available.
+        if self.items.len() >= self.optimal_n {
+            self.items.drain(..self.optimal_n);
+            self.optimal_n
         } else {
-            // Time has expired, the batch is ready.
-            Some(Duration::ZERO)
+            0
         }
     }
 }
 
-/// A container that holds items and uses a `BatchingPolicy` to form batches.
 #[derive(Debug)]
-pub struct Batcher<T> {
+pub struct BatchQueue<T> {
+    // cmd, timestamp, response_sender
     items: VecDeque<T>,
-    policy: Box<dyn BatchingPolicy>,
+
+    strategy: Box<dyn BatchingStrategy>,
 }
 
-impl<T> Batcher<T> {
-    pub fn new(policy: Box<dyn BatchingPolicy>) -> Self {
+impl<T> BatchQueue<T> {
+    pub fn new(strategy: Box<dyn BatchingStrategy>) -> Self {
         Self {
             items: VecDeque::new(),
-            policy,
+            strategy,
         }
     }
 
@@ -274,15 +345,14 @@ impl<T> Batcher<T> {
         self.items.is_empty()
     }
 
-    /// Pushes an item into the batcher and notifies the batching policy.
+    /// Push an item with the current timestamp.
     pub fn push(&mut self, item: T, now: Instant) {
         self.items.push_back(item);
-        self.policy.update(now);
+        self.strategy.update(now);
     }
 
-    /// Polls the batching policy and returns a batch if one is ready.
-    pub fn poll(&mut self, now: Instant) -> Option<Vec<T>> {
-        let num_items = self.policy.poll(now);
+    pub fn batch(&mut self, now: Instant) -> Option<Vec<T>> {
+        let num_items = self.strategy.batch(now);
         if num_items > 0 {
             Some(self.drain_batch(num_items))
         } else {
@@ -290,163 +360,128 @@ impl<T> Batcher<T> {
         }
     }
 
-    /// Hints at the optimal duration to wait before the next poll.
-    pub fn next_poll_in(&self, now: Instant) -> Option<Duration> {
-        self.policy.next_poll_in(now)
-    }
-
-    /// Drains `count` items from the front of the queue.
+    /// Drains up to `max_size` items from the front of the queue.
     fn drain_batch(&mut self, count: usize) -> Vec<T> {
         self.items.drain(0..count).collect()
     }
 }
 
-/// Manages batching for multiple independent streams of items.
-///
-/// This struct enforces a strict ordering constraint: for any given stream (`S`),
-/// it will only process items for one handler type (`H`) at a time. It will not
-/// start processing items for a new handler type until the pending batch for the
-/// current handler has been dispatched.
-///
-/// This is managed by a state machine using four key data structures:
-/// - `queued`: A temporary holding area for items arriving from each stream.
-/// - `pending`: A set of batch queues, one for each handler type (`H`), where items
-///   are placed after passing the ordering check.
-/// - `active_handlers`: Tracks the handler type (`H`) currently being batched for a
-///   given stream (`S`). This acts as a lock to enforce ordering.
-/// - `handler_to_streams`: Tracks the source stream for each individual item in a `pending`
-///   batch. This is needed to release the correct stream lock in `active_handlers`
-///   after a batch is dispatched.
-#[derive(Debug)]
-pub struct MultiStreamBatcher<H, T, S> {
-    active_handlers: HashMap<S, H>,
-    handler_to_streams: HashMap<H, Vec<S>>,
-    queued: HashMap<S, VecDeque<(H, T, Instant)>>,
-    pending: HashMap<H, Batcher<T>>,
+pub trait Batchable<G> {
+    fn strategy(&self) -> Box<dyn BatchingStrategy>;
+
+    fn group(&self) -> G;
 }
 
-impl<H, T, S> MultiStreamBatcher<H, T, S>
-where
-    H: Eq + Hash + Debug + Copy,
-    S: Eq + Hash + Debug + Copy + Ord,
-{
-    pub fn new(config: HashMap<H, BatchingConfig>) -> Self {
-        let pending = config
-            .into_iter()
-            .map(|(handler, config)| {
-                let policy = config.to_policy();
-                (handler, Batcher::<T>::new(policy))
-            })
-            .collect();
+#[derive(Debug)]
+pub struct Batcher<T, S, G> {
+    current_group_by_stream: HashMap<S, G>,
+    streams_by_current_group: HashMap<G, Vec<S>>,
+    pending_items_by_stream: HashMap<S, VecDeque<(T, Instant)>>,
+    batch_queues_by_group: HashMap<G, BatchQueue<T>>,
+}
 
+impl<T, S, G> Batcher<T, S, G>
+where
+    T: Batchable<G>,
+    S: Eq + Hash + Debug + Copy + Ord,
+    G: Eq + Hash + Debug + Copy,
+{
+    pub fn new() -> Self {
         Self {
-            active_handlers: HashMap::new(),
-            handler_to_streams: HashMap::new(),
-            queued: HashMap::new(),
-            pending,
+            current_group_by_stream: HashMap::new(),
+            streams_by_current_group: HashMap::new(),
+            pending_items_by_stream: HashMap::new(),
+            batch_queues_by_group: HashMap::new(),
         }
     }
 
     pub fn has_pending_items(&self) -> bool {
-        !self.queued.is_empty() || self.pending.values().any(|q| !q.is_empty())
+        // First, check the initial holding pen.
+        if !self.pending_items_by_stream.is_empty() {
+            return true;
+        }
+
+        // IMPORTANT: Also check if any of the staged queues have items.
+        self.batch_queues_by_group.values().any(|q| !q.is_empty())
     }
 
-    pub fn push(&mut self, stream: S, handler: H, item: T, now: Instant) {
-        self.queued
+    pub fn push(&mut self, stream: S, item: T, now: Instant) {
+        self.pending_items_by_stream
             .entry(stream)
             .or_default()
-            .push_back((handler, item, now));
+            .push_back((item, now));
     }
 
-    /// Processes queued items and forms batches from pending queues.
-    ///
-    /// This method operates in two phases:
-    /// 1. **Promotion**: It moves items from `queued` to the appropriate `pending`
-    ///    batch queue, respecting the strict ordering constraints.
-    /// 2. **Batching**: It checks each `pending` queue to see if a batch is ready
-    ///    according to its scheduling policy.
-    pub fn poll(&mut self, now: Instant) -> Vec<(H, Vec<T>)> {
-        self.promote_queued_items();
-        self.collect_ready_batches(now)
-    }
+    pub fn batch(&mut self, now: Instant) -> Vec<(G, Vec<T>)> {
+        // Horizontal batching: group commands by stream and type.
+        let mut empty_streams = Vec::new();
 
-    /// Hints at the optimal duration to wait before the next poll across all managed batchers.
-    ///
-    /// Returns the smallest wait time hint among all active batchers, or `None` if no
-    /// batcher provides a time-based hint.
-    pub fn next_poll_in(&self, now: Instant) -> Option<Duration> {
-        self.pending
-            .values()
-            .filter_map(|batcher| batcher.next_poll_in(now))
-            .min()
-    }
+        // Sort by stream priority
+        let mut streams_sorted: Vec<S> = self.pending_items_by_stream.keys().copied().collect();
+        streams_sorted.sort();
 
-    /// **Phase 1: Promote items from `queued` to `pending` queues.**
-    ///
-    /// This function iterates through each stream's queue, promoting consecutive items
-    /// that share the same handler type. This process stops for a given stream if it
-    /// encounters an item with a different handler type than the one currently "locked"
-    /// for that stream in `active_handlers`.
-    fn promote_queued_items(&mut self) {
-        let streams = self.queued.keys().copied().collect::<Vec<_>>();
+        for stream in streams_sorted {
+            let queue = self.pending_items_by_stream.get_mut(&stream).unwrap();
 
-        for stream in streams {
-            let queue = self.queued.get_mut(&stream).unwrap();
+            // non-flushed commands sharing the same stream in the cmd_batcher
+            // None -> no commands in the batch queue with the same stream
+            let mut prev_group = self.current_group_by_stream.get(&stream).cloned();
 
-            // Get the handler type currently being processed for this stream, if any.
-            let mut active_handler = self.active_handlers.get(&stream).copied();
+            while !queue.is_empty() {
+                let curr_group = queue.front().unwrap().0.group();
 
-            while let Some((handler, _, _)) = queue.front() {
-                // If the next item's handler is different from the active one,
-                // we must wait. This enforces the strict ordering.
-                if let Some(active_handler) = active_handler {
-                    if *handler != active_handler {
+                // Vertical batching: Same kind of consecutive commands are batched together.
+                // if the current command is different from the previous one, stop batching.
+                if let Some(prev_group) = prev_group {
+                    if curr_group != prev_group {
                         break;
                     }
-                } else {
-                    // This is the first item being processed for this stream; it sets the active handler.
-                    active_handler = Some(*handler);
-                    self.active_handlers.insert(stream, *handler);
                 }
+                prev_group = Some(curr_group);
 
-                // The item is eligible for promotion. Move it from `queued` to `pending`.
-                let (handler, item, timestamp) = queue.pop_front().unwrap();
-                self.pending
-                    .get_mut(&handler)
-                    .unwrap()
+                let (item, timestamp) = queue.pop_front().unwrap();
+                self.batch_queues_by_group
+                    .entry(curr_group)
+                    .or_insert(BatchQueue::<T>::new(item.strategy()))
                     .push(item, timestamp);
-                self.handler_to_streams
-                    .entry(handler)
+
+                self.current_group_by_stream
+                    .entry(stream)
+                    .or_insert(curr_group);
+
+                self.streams_by_current_group
+                    .entry(curr_group)
                     .or_default()
                     .push(stream);
             }
-        }
 
-        // Clean up streams whose queues have been fully drained.
-        self.queued.retain(|_stream, queue| !queue.is_empty());
-    }
-
-    /// **Phase 2: Collect ready batches from `pending` queues.**
-    ///
-    /// Iterates through all pending queues and drains them if their batching
-    /// policy indicates they are ready. When a batch is formed, it releases the
-    /// stream locks in `active_handlers`.
-    fn collect_ready_batches(&mut self, now: Instant) -> Vec<(H, Vec<T>)> {
-        let mut ready_batches: Vec<(H, Vec<T>)> = Vec::new();
-
-        for (handler, queue) in self.pending.iter_mut() {
-            if let Some(batch) = queue.poll(now) {
-                // A batch is ready. Release the handler lock for all streams
-                // that contributed an item to this batch.
-                let streams_in_batch = self.handler_to_streams.get_mut(handler).unwrap();
-                for stream in streams_in_batch.drain(..batch.len()) {
-                    self.active_handlers.remove(&stream);
-                }
-
-                ready_batches.push((*handler, batch));
+            if queue.is_empty() {
+                empty_streams.push(stream);
             }
         }
 
-        ready_batches
+        for stream in empty_streams {
+            self.pending_items_by_stream.remove(&stream);
+        }
+
+        // Batch commands and return them.
+        let mut batches = Vec::new();
+
+        for (grp, queue) in self.batch_queues_by_group.iter_mut() {
+            if let Some(cmds) = queue.batch(now) {
+                for stream in self
+                    .streams_by_current_group
+                    .get_mut(grp)
+                    .unwrap()
+                    .drain(..cmds.len())
+                {
+                    self.current_group_by_stream.remove(&stream);
+                }
+
+                batches.push((*grp, cmds));
+            }
+        }
+
+        batches
     }
 }

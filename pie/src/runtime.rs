@@ -9,9 +9,9 @@ use wasmtime::{
 };
 
 use crate::instance::{Id as InstanceId, InstanceState};
-use crate::{bindings, model_old, server, service};
+use crate::{bindings, model, server, service};
 
-use crate::model_old::cleanup_instance;
+use crate::model::cleanup_instance;
 use crate::service::{Service, ServiceError};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -28,22 +28,13 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static SERVICE_ID_RUNTIME: OnceLock<usize> = OnceLock::new();
 
-pub fn trap(instance_id: InstanceId, cause: TerminationCause) {
-    Command::Trap {
-        inst_id: instance_id,
-        cause,
-    }
-    .dispatch()
-    .unwrap();
-}
-
-pub fn trap_exception<T>(instance_id: InstanceId, exception: T)
+pub fn trap<T>(instance_id: InstanceId, message: T)
 where
     T: ToString,
 {
     Command::Trap {
-        inst_id: instance_id,
-        cause: TerminationCause::Exception(exception.to_string()),
+        instance_id,
+        message: message.to_string(),
     }
     .dispatch()
     .unwrap();
@@ -107,12 +98,12 @@ pub enum Command {
     },
 
     Trap {
-        inst_id: InstanceId,
-        cause: TerminationCause,
+        instance_id: InstanceId,
+        message: String,
     },
 
     Warn {
-        inst_id: InstanceId,
+        instance_id: InstanceId,
         message: String,
     },
 
@@ -151,15 +142,6 @@ pub struct Runtime {
 
     /// Running server instances
     running_server_instances: DashMap<InstanceId, InstanceHandle>,
-}
-
-#[derive(Debug, Clone)]
-pub enum TerminationCause {
-    Normal,
-    Signal,
-    Exception(String),
-    SystemError(String),
-    OutOfResources(String),
 }
 
 pub struct InstanceHandle {
@@ -219,12 +201,18 @@ impl Service for Runtime {
                 event.send(Ok(())).unwrap();
             }
 
-            Command::Trap { inst_id, cause } => {
-                self.terminate_instance(inst_id, cause).await;
+            Command::Trap {
+                instance_id,
+                message,
+            } => {
+                self.terminate_instance(instance_id, message).await;
             }
 
-            Command::Warn { inst_id, message } => server::Command::Send {
-                inst_id,
+            Command::Warn {
+                instance_id,
+                message,
+            } => server::Command::Send {
+                inst_id: instance_id.clone(),
                 message: message.clone(),
             }
             .dispatch()
@@ -434,24 +422,15 @@ impl Runtime {
     }
 
     /// Terminate (abort) a running instance
-    pub async fn terminate_instance(&self, instance_id: InstanceId, cause: TerminationCause) {
+    pub async fn terminate_instance(&self, instance_id: InstanceId, reason: String) {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
 
-            model_old::cleanup_instance(instance_id.clone());
-
-            let (termination_code, message) = match cause {
-                TerminationCause::Normal => (0, "Normal termination".to_string()),
-                TerminationCause::Signal => (1, "Signal termination".to_string()),
-                TerminationCause::Exception(message) => (2, message),
-                TerminationCause::SystemError(message) => (3, message),
-                TerminationCause::OutOfResources(message) => (4, message),
-            };
+            model::cleanup_instance(instance_id.clone());
 
             server::Command::DetachInstance {
                 inst_id: instance_id.clone(),
-                termination_code,
-                message,
+                reason,
             }
             .dispatch()
             .ok();
@@ -622,16 +601,14 @@ impl Runtime {
             println!("Instance {instance_id} failed: {err}");
             server::Command::DetachInstance {
                 inst_id: instance_id.clone(),
-                termination_code: 2,
-                message: err.to_string(),
+                reason: format!("{err}"),
             }
             .dispatch()
             .ok();
         } else {
             server::Command::DetachInstance {
                 inst_id: instance_id.clone(),
-                termination_code: 0,
-                message: "instance normally finished".to_string(),
+                reason: format!("instance normally finished"),
             }
             .dispatch()
             .ok();

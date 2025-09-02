@@ -1,16 +1,16 @@
 use crate::bindings;
-use crate::handler::core::Queue;
+use crate::bindings::core;
 use crate::instance::InstanceState;
-use crate::model::ResourceId;
-use crate::model_old::Command;
+use crate::model::Command;
+use crate::object::IdRepr;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::IoView;
 
-impl bindings::pie::inferlet::image::Host for InstanceState {
+impl bindings::pie::inferlet::input_image::Host for InstanceState {
     async fn embed_image(
         &mut self,
-        queue: Resource<Queue>,
-        emb_ids: Vec<ResourceId>,
+        queue: Resource<core::Queue>,
+        emb_ids: Vec<IdRepr>,
         image_blob: Vec<u8>,
         _position_offset: u32, // Placeholder for position_offset
     ) -> anyhow::Result<()> {
@@ -28,7 +28,7 @@ impl bindings::pie::inferlet::image::Host for InstanceState {
 
     async fn calculate_embed_size(
         &mut self,
-        _queue: Resource<Queue>,
+        _queue: Resource<core::Queue>,
         _image_width: u32,
         _image_height: u32,
     ) -> anyhow::Result<u32> {
