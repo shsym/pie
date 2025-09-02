@@ -60,15 +60,13 @@ inline int find_sequence_id(device const int* qo_indptr, int qo_idx) {
 
 // Calculate paged KV cache address for MQA/GQA support
 inline uint calculate_kv_address(
-    int global_key_idx,
+    int in_page_offset,
     int page_size,
     int kv_head_dim,
     int head_size,
     int page_idx,
     int kv_head
 ) {
-    int page_offset = global_key_idx / page_size;
-    int in_page_offset = global_key_idx % page_size;
     return page_idx * page_size * kv_head_dim + in_page_offset * kv_head_dim + kv_head * head_size;
 }
 

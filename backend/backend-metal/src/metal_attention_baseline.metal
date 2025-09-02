@@ -108,7 +108,7 @@ kernel void batch_prefill_attention_unified_bf16_baseline_kernel(
                     int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
                     // Map query head to KV head for MQA/GQA support
                     int kv_head = map_query_to_kv_head(h, num_query_heads, num_kv_heads);
-                    uint base_addr = calculate_kv_address(global_key_idx, page_size, kv_head_dim, head_size, page_idx, kv_head);
+                    uint base_addr = calculate_kv_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
 
                     for (int d = 0; d < head_size; ++d) {
                         k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];

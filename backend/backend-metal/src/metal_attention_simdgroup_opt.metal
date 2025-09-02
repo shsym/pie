@@ -126,7 +126,7 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
                     int in_page_offset = global_key_idx % page_size;
                     int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
                     int kv_head = map_query_to_kv_head(h, num_query_heads, num_kv_heads);
-                    uint base_addr = calculate_kv_address(global_key_idx, page_size, kv_head_dim, head_size, page_idx, kv_head);
+                    uint base_addr = calculate_kv_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
 
                     for (int d = 0; d < head_size; ++d) {
                         k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
@@ -136,12 +136,14 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // --- OPTIMIZATION 1: Split-d parallel score computation ---
+            // Compute scores for this block (per head) - FIXED: Use baseline approach for correctness
             float score = 0.0f;
             int global_key_idx_score = block_start + tid_in_tgp;
-            
             if (tid_in_tgp < KERNEL_BLOCK_SIZE && global_key_idx_score < total_kv_len) {
-                score = split_d_dot_product(q_s, k_block[tid_in_tgp], head_size, simd_lane_id) * scale;
+                for (int d = 0; d < head_size; ++d) {
+                    score += float(q_s[d]) * float(k_block[tid_in_tgp][d]);
+                }
+                score *= scale;
             } else {
                 score = -INFINITY;
             }
@@ -346,7 +348,7 @@ kernel void batch_prefill_attention_unified_bf16_per_head_kernel(
                 int in_page_offset = global_key_idx % page_size;
                 int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
                 int kv_head = map_query_to_kv_head(int(h), num_query_heads, num_kv_heads);
-                uint base_addr = calculate_kv_address(global_key_idx, page_size, kv_head_dim, head_size, page_idx, kv_head);
+                uint base_addr = calculate_kv_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
 
                 // VECTORIZATION: Use half4 loads where possible for better bandwidth
                 int d = 0;

@@ -5,6 +5,8 @@
 #include "metal_rope.hpp"
 #include <iostream>
 #include <cassert>
+#include <thread>
+#include <chrono>
 
 // Global Metal objects (initialized once)
 static id<MTLDevice> device = nil;

@@ -195,12 +195,6 @@ configure_file(
 
 # Copy Metal attention shaders
 configure_file(
-    ${CMAKE_SOURCE_DIR}/src/metal_batch_prefill_attention.metal
-    ${CMAKE_BINARY_DIR}/shaders/metal_batch_prefill_attention.metal
-    COPYONLY
-)
-
-configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_attention_common.metal
     ${CMAKE_BINARY_DIR}/shaders/metal_attention_common.metal
     COPYONLY
@@ -218,18 +212,11 @@ configure_file(
     COPYONLY
 )
 
-# Commented out - these files no longer exist after cleanup
-# configure_file(
-#     ${CMAKE_SOURCE_DIR}/src/metal_batch_prefill_attention_optimized.metal
-#     ${CMAKE_BINARY_DIR}/shaders/metal_batch_prefill_attention_optimized.metal
-#     COPYONLY
-# )
-
-# configure_file(
-#     ${CMAKE_SOURCE_DIR}/src/metal_batch_prefill_attention_unified.metal
-#     ${CMAKE_BINARY_DIR}/shaders/metal_batch_prefill_attention_unified.metal
-#     COPYONLY
-# )
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_attention_naive.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_attention_naive.metal
+    COPYONLY
+)
 
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_topk_mask_logits.metal

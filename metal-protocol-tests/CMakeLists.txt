@@ -47,6 +47,7 @@ set(METAL_SOURCES
     ${REPO_ROOT}/backend/backend-metal/src/metal_grouped_gemm.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_batch_prefill_attention.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_attention_naive.mm
+    ${REPO_ROOT}/backend/backend-metal/src/metal_common.mm
 )
 
 add_executable(metal_protocol_tests ${METAL_SOURCES})
@@ -104,6 +105,7 @@ set_source_files_properties(
     ${REPO_ROOT}/backend/backend-metal/src/metal_topk_mask_logits.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_grouped_gemm.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_batch_prefill_attention.mm
+    ${REPO_ROOT}/backend/backend-metal/src/metal_common.mm
     PROPERTIES COMPILE_FLAGS "-fobjc-arc"
 )
 

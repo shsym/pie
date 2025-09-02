@@ -6,32 +6,32 @@
 #include <iostream>
 
 namespace MetalGEMM {
-    
+
     static bool initialized_ = false;
-    
+
     bool initialize() {
         if (initialized_) {
             return true;
         }
-        
+
         // Initialize the Metal context first
         auto& context = MetalContext::getInstance();
         if (!context.initialize()) {
             std::cerr << "Failed to initialize Metal context for GEMM" << std::endl;
             return false;
         }
-        
+
         // Initialize the Metal GEMM kernel
         if (!initialize_metal_gemm()) {
             std::cerr << "Failed to initialize Metal GEMM kernels" << std::endl;
             return false;
         }
-        
+
         initialized_ = true;
         std::cout << "Metal GEMM wrapper initialized successfully" << std::endl;
         return true;
     }
-    
+
     void cleanup() {
         if (initialized_) {
             cleanup_metal_gemm();
@@ -39,11 +39,11 @@ namespace MetalGEMM {
             std::cout << "Metal GEMM wrapper cleaned up" << std::endl;
         }
     }
-    
+
     bool is_initialized() {
         return initialized_;
     }
-    
+
     // Check if initialized before GEMM operations
     static void ensure_initialized() {
         if (!initialized_) {
@@ -52,31 +52,31 @@ namespace MetalGEMM {
             }
         }
     }
-    
+
 } // namespace MetalGEMM
 
 // Explicit template instantiations for supported types
 namespace MetalGEMM {
-    
+
     // Template instantiations for gemm
-    template void gemm<bfloat16_t>(id<MTLCommandBuffer>, const bfloat16_t*, const bfloat16_t*, 
+    template void gemm<bfloat16_t>(id<MTLCommandBuffer>, const bfloat16_t*, const bfloat16_t*,
                                    const bfloat16_t*, bfloat16_t*, int, int, int, void*, size_t, bool, bool);
-    
-    template void gemm<float>(id<MTLCommandBuffer>, const float*, const float*, 
+
+    template void gemm<float>(id<MTLCommandBuffer>, const float*, const float*,
                              const float*, float*, int, int, int, void*, size_t, bool, bool);
-    
+
     // Template instantiations for gemm_tensor
-    template void gemm_tensor<bfloat16_t>(const MetalTensor<bfloat16_t>&, const MetalTensor<bfloat16_t>&, 
+    template void gemm_tensor<bfloat16_t>(const MetalTensor<bfloat16_t>&, const MetalTensor<bfloat16_t>&,
                                           MetalTensor<bfloat16_t>&, const MetalTensor<bfloat16_t>*, bool, bool);
-    
-    template void gemm_tensor<float>(const MetalTensor<float>&, const MetalTensor<float>&, 
+
+    template void gemm_tensor<float>(const MetalTensor<float>&, const MetalTensor<float>&,
                                      MetalTensor<float>&, const MetalTensor<float>*, bool, bool);
-    
+
     // Template instantiations for gemm_batched
-    template void gemm_batched<bfloat16_t>(int, const bfloat16_t* const*, const bfloat16_t* const*, 
+    template void gemm_batched<bfloat16_t>(int, const bfloat16_t* const*, const bfloat16_t* const*,
                                            bfloat16_t* const*, const int*, const int*, const int*, bool, bool);
-    
-    template void gemm_batched<float>(int, const float* const*, const float* const*, 
+
+    template void gemm_batched<float>(int, const float* const*, const float* const*,
                                       float* const*, const int*, const int*, const int*, bool, bool);
 }
 
@@ -93,5 +93,5 @@ void gemm_cublasLt_metal(id<MTLCommandBuffer> commandBuffer,
 }
 
 // Explicit instantiation of the CUDA API compatibility function
-template void gemm_cublasLt_metal<bfloat16_t>(id<MTLCommandBuffer>, const bfloat16_t*, const bfloat16_t*, 
+template void gemm_cublasLt_metal<bfloat16_t>(id<MTLCommandBuffer>, const bfloat16_t*, const bfloat16_t*,
                                                const bfloat16_t*, bfloat16_t*, int, int, int, void*, size_t, bool, bool);

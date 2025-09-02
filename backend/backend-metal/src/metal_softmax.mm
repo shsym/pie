@@ -3,6 +3,8 @@
 #include <Foundation/Foundation.h>
 #include <iostream>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 // Static Metal device and library - initialized once
 static id<MTLDevice> g_device = nil;
@@ -197,15 +199,60 @@ int metal_softmax_float(
         [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_threadgroup];
         
         [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        
-        // Check for Metal errors
-        if (command_buffer.status == MTLCommandBufferStatusError) {
-            std::cerr << "Metal command buffer error in softmax" << std::endl;
-            if (command_buffer.error) {
-                std::cerr << "Error: " << command_buffer.error.localizedDescription.UTF8String << std::endl;
+        // Enhanced retry logic with detailed error reporting (3 retries as requested)
+        int retries = 3;
+        NSError* cmdError = nil;
+        while (retries > 0) {
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            cmdError = command_buffer.error;
+            
+            if (!cmdError && command_buffer.status == MTLCommandBufferStatusCompleted) {
+                break; // Success!
             }
+            
+            retries--;
+            if (retries > 0) {
+                std::cerr << "❌ Metal command buffer failed in softmax (attempt " << (4-retries) << "/3):" << std::endl;
+                if (cmdError) {
+                    std::cerr << "   Error: " << cmdError.localizedDescription.UTF8String << std::endl;
+                    std::cerr << "   Code: " << cmdError.code << std::endl;
+                    std::cerr << "   Domain: " << cmdError.domain.UTF8String << std::endl;
+                }
+                std::cerr << "   Batch size: " << batch_size << ", Vocab size: " << vocab_size << std::endl;
+                
+                // Brief retry delay
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                
+                // Create new command buffer for retry
+                command_buffer = [g_command_queue commandBuffer];
+                encoder = [command_buffer computeCommandEncoder];
+                
+                [encoder setComputePipelineState:chosen_pipeline];
+                [encoder setBuffer:input_buffer offset:0 atIndex:0];
+                [encoder setBuffer:output_buffer offset:0 atIndex:1];
+                [encoder setBuffer:batch_size_buffer offset:0 atIndex:2];
+                [encoder setBuffer:vocab_size_buffer offset:0 atIndex:3];
+                [encoder setBuffer:temperature_buffer offset:0 atIndex:4];
+                [encoder setThreadgroupMemoryLength:shared_mem_size atIndex:0];
+                [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_threadgroup];
+                [encoder endEncoding];
+            }
+        }
+        
+        // Final error check
+        if (cmdError || command_buffer.status == MTLCommandBufferStatusError) {
+            std::cerr << "💥 FINAL ERROR: Metal softmax command buffer failed after 3 retries" << std::endl;
+            if (cmdError) {
+                std::cerr << "   Final error: " << cmdError.localizedDescription.UTF8String << std::endl;
+                std::cerr << "   Code: " << cmdError.code << " Domain: " << cmdError.domain.UTF8String << std::endl;
+                if (cmdError.code == 14) {
+                    std::cerr << "   💡 This is an Internal Metal error - may be caused by GPU memory pressure" << std::endl;
+                } else if (cmdError.code == 5) {
+                    std::cerr << "   💡 This is an Innocent Victim error - caused by GPU recovery from another error" << std::endl;
+                }
+            }
+            std::cerr << "   Parameters: batch_size=" << batch_size << ", vocab_size=" << vocab_size << ", temperature=" << temperature << std::endl;
             return -1;
         }
         

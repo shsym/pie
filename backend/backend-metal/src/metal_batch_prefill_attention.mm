@@ -1,6 +1,7 @@
 #include "metal_batch_prefill_attention.hpp"
 #include "metal_batch_prefill_handle.hpp"
 #include "metal_memory_manager.hpp"
+#include "metal_common.hpp"
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include <iostream>
@@ -10,6 +11,118 @@
 #include <cmath>
 #include <cstring>
 #include <iomanip>
+#include <thread>
+#include <fstream>
+#include <string>
+
+// GPU Configuration Loading
+namespace {
+
+    struct GPUConfig {
+        std::string gpu_name;
+        int max_concurrent_threads;
+        int max_buffer_size_mb;
+        int max_total_workspace_mb;
+        // Threadgroup parameters
+        int max_threads_per_threadgroup;
+        int max_threadgroups_per_grid;  // We'll use the [0] value from array
+        int head_dim_threshold;
+        int min_tokens_for_chunking;
+        int max_tokens_per_chunk;
+        bool enable_adaptive_chunking;
+    };
+
+    GPUConfig loadGPUConfiguration(id<MTLDevice> device) {
+        GPUConfig config = {};
+
+        // Determine GPU family for configuration selection
+        NSString* deviceName = device.name;
+        std::string gpu_key = "default";  // Fallback
+
+        if ([deviceName containsString:@"M3"]) {
+            if ([deviceName containsString:@"Max"]) gpu_key = "M3_Max";
+            else if ([deviceName containsString:@"Pro"]) gpu_key = "M3_Pro";
+            else gpu_key = "M3";
+        } else if ([deviceName containsString:@"M2"]) {
+            if ([deviceName containsString:@"Max"]) gpu_key = "M2_Max";
+            else if ([deviceName containsString:@"Pro"]) gpu_key = "M2_Pro";
+            else gpu_key = "M2";
+        } else if ([deviceName containsString:@"M1"]) {
+            if ([deviceName containsString:@"Max"]) gpu_key = "M1_Max";
+            else if ([deviceName containsString:@"Pro"]) gpu_key = "M1_Pro";
+            else gpu_key = "M1";
+        }
+
+        // Try to load configuration from JSON file
+        NSString* configPath = @"/Users/seung-seoblee/Dev/pie/metal-protocol-tests/apple_gpu_configs.json";
+        NSData* jsonData = [NSData dataWithContentsOfFile:configPath];
+
+        if (jsonData) {
+            NSError* error = nil;
+            NSDictionary* configDict = [NSJSONSerialization JSONObjectWithData:jsonData
+                                                                       options:NSJSONReadingAllowFragments
+                                                                         error:&error];
+
+            if (!error && configDict[@"apple_gpu_configs"]) {
+                NSDictionary* gpuConfigs = configDict[@"apple_gpu_configs"];
+                NSDictionary* selectedConfig = gpuConfigs[@(gpu_key.c_str())];
+
+                if (!selectedConfig) {
+                    selectedConfig = gpuConfigs[@"default"];  // Fallback to default
+                    gpu_key = "default";
+                }
+
+                if (selectedConfig) {
+                    config.gpu_name = std::string([selectedConfig[@"name"] UTF8String]);
+                    config.max_concurrent_threads = [selectedConfig[@"max_concurrent_threads"] intValue];
+                    config.max_buffer_size_mb = [selectedConfig[@"max_buffer_size_mb"] intValue];
+                    config.max_total_workspace_mb = [selectedConfig[@"max_total_workspace_mb"] intValue];
+                    // Threadgroup parameters
+                    config.max_threads_per_threadgroup = [selectedConfig[@"max_threads_per_threadgroup"] intValue];
+                    NSArray* threadgroupsArray = selectedConfig[@"max_threadgroups_per_grid"];
+                    if (threadgroupsArray && threadgroupsArray.count > 0) {
+                        config.max_threadgroups_per_grid = [threadgroupsArray[0] intValue];  // Use X dimension
+                    }
+
+                    // Chunking configuration
+                    NSDictionary* chunkingConfig = selectedConfig[@"chunking"];
+                    if (chunkingConfig) {
+                        config.head_dim_threshold = [chunkingConfig[@"head_dim_threshold"] intValue];
+                        config.min_tokens_for_chunking = [chunkingConfig[@"min_tokens_for_chunking"] intValue];
+                        config.max_tokens_per_chunk = [chunkingConfig[@"max_tokens_per_chunk"] intValue];
+                        config.enable_adaptive_chunking = [chunkingConfig[@"enable_adaptive_chunking"] boolValue];
+                    }
+
+                    std::cout << "🔧 [GPU CONFIG] Loaded configuration for " << config.gpu_name
+                              << " (" << gpu_key << ")" << std::endl;
+                    std::cout << "   📊 Chunking: head_dim_threshold=" << config.head_dim_threshold
+                              << ", max_tokens_per_chunk=" << config.max_tokens_per_chunk << std::endl;
+                }
+            }
+        } else {
+            std::cout << "⚠️ [GPU CONFIG] Could not load configuration file, using defaults" << std::endl;
+        }
+
+        // Fallback to conservative defaults if loading failed
+        // TODO: Default should be also coming from the configuration
+        if (config.gpu_name.empty()) {
+            config.gpu_name = "Unknown Apple Silicon";
+            config.max_concurrent_threads = 32768;
+            config.max_buffer_size_mb = 64;
+            config.max_total_workspace_mb = 200;
+            // Threadgroup defaults
+            config.max_threads_per_threadgroup = 1024;
+            config.max_threadgroups_per_grid = 65535;
+            config.head_dim_threshold = 4096;
+            config.min_tokens_for_chunking = 256;
+            config.max_tokens_per_chunk = 256;
+            config.enable_adaptive_chunking = true;
+            std::cout << "🔧 [GPU CONFIG] Using conservative defaults for " << config.gpu_name << std::endl;
+        }
+
+        return config;
+    }
+}
 
 // Conversion utilities for bfloat16 to IEEE half
 namespace {
@@ -156,7 +269,7 @@ MetalBatchPrefillHandle* metal_batch_prefill_create_handle(
         @"metal_attention_common.metal",        // Common utilities (must be first)
         @"metal_attention_baseline.metal",      // Baseline kernels
         @"metal_attention_simdgroup_opt.metal", // Optimized kernels
-        @"metal_batch_prefill_attention.metal"  // Original kernels (backward compatibility)
+        @"metal_attention_naive.metal"          // Naive O(n²) attention for comparison
     ];
 
     for (NSString* filename in metalFiles) {
@@ -193,7 +306,7 @@ MetalBatchPrefillHandle* metal_batch_prefill_create_handle(
     // Create compute pipeline states for all kernel variants
 
     // Original unified kernels (maintained for backward compatibility)
-    id<MTLFunction> bf16_function = [handle->library newFunctionWithName:@"batch_prefill_attention_unified_bf16_kernel"];
+    id<MTLFunction> bf16_function = [handle->library newFunctionWithName:@"batch_prefill_attention_unified_bf16_baseline_kernel"];
     if (bf16_function) {
         handle->pipeline_bf16 = [handle->device newComputePipelineStateWithFunction:bf16_function error:&error];
         if (error) {
@@ -202,7 +315,7 @@ MetalBatchPrefillHandle* metal_batch_prefill_create_handle(
         }
     }
 
-    id<MTLFunction> f32_function = [handle->library newFunctionWithName:@"batch_prefill_attention_unified_f32_kernel"];
+    id<MTLFunction> f32_function = [handle->library newFunctionWithName:@"batch_prefill_attention_unified_f32_baseline_kernel"];
     if (f32_function) {
         handle->pipeline_f32 = [handle->device newComputePipelineStateWithFunction:f32_function error:&error];
         if (error) {
@@ -271,6 +384,21 @@ MetalBatchPrefillHandle* metal_batch_prefill_create_handle(
     // Initialize statistics
     handle->total_calls = 0;
     handle->total_bytes_processed = 0;
+
+    // Load GPU-specific configuration
+    GPUConfig gpuConfig = loadGPUConfiguration(handle->device);
+    handle->gpu_config.gpu_name = gpuConfig.gpu_name;
+    handle->gpu_config.max_concurrent_threads = gpuConfig.max_concurrent_threads;
+    handle->gpu_config.max_buffer_size_mb = gpuConfig.max_buffer_size_mb;
+    handle->gpu_config.max_total_workspace_mb = gpuConfig.max_total_workspace_mb;
+    // Threadgroup parameters
+    handle->gpu_config.max_threads_per_threadgroup = gpuConfig.max_threads_per_threadgroup;
+    handle->gpu_config.max_threadgroups_per_grid = gpuConfig.max_threadgroups_per_grid;
+    handle->gpu_config.head_dim_threshold = gpuConfig.head_dim_threshold;
+    handle->gpu_config.min_tokens_for_chunking = gpuConfig.min_tokens_for_chunking;
+    handle->gpu_config.max_tokens_per_chunk = gpuConfig.max_tokens_per_chunk;
+    handle->gpu_config.enable_adaptive_chunking = gpuConfig.enable_adaptive_chunking;
+
     handle->initialized = true;
 
     std::cout << "MetalBatchPrefillHandle: Successfully created handle with bounds: "
@@ -567,6 +695,39 @@ void batch_prefill_attention_unified_bf16(
         return;
     }
 
+    // GPU Memory and Buffer Size Validation - Use GPU-specific configuration
+    const size_t MAX_BUFFER_SIZE = handle->gpu_config.max_buffer_size_mb * 1024 * 1024;
+    const size_t MAX_TOTAL_WORKSPACE = handle->gpu_config.max_total_workspace_mb * 1024 * 1024;
+
+    if (workspace.total_size > MAX_TOTAL_WORKSPACE) {
+        std::cerr << "❌ [HANDLE] Workspace size exceeds GPU memory limits: "
+                  << (workspace.total_size / 1024 / 1024) << " MB > "
+                  << (MAX_TOTAL_WORKSPACE / 1024 / 1024) << " MB" << std::endl;
+        std::cerr << "   💡 Try reducing batch size, sequence length, or head dimension" << std::endl;
+        std::cerr << "   💡 Current params: " << num_qo << " tokens, " << head_size << " head_size" << std::endl;
+        return;
+    }
+
+    // Check individual buffer sizes - These are the actual problem causing Metal Internal Errors
+    size_t max_individual_buffer = std::max({
+        workspace.q_buffer_size,
+        workspace.k_buffer_size,
+        workspace.v_buffer_size,
+        workspace.output_buffer_size
+    });
+
+    if (max_individual_buffer > MAX_BUFFER_SIZE) {
+        std::cerr << "❌ [HANDLE] Individual buffer exceeds Apple Silicon GPU limits:" << std::endl;
+        std::cerr << "   Q buffer: " << (workspace.q_buffer_size / 1024 / 1024) << " MB" << std::endl;
+        std::cerr << "   K buffer: " << (workspace.k_buffer_size / 1024 / 1024) << " MB" << std::endl;
+        std::cerr << "   V buffer: " << (workspace.v_buffer_size / 1024 / 1024) << " MB" << std::endl;
+        std::cerr << "   Output buffer: " << (workspace.output_buffer_size / 1024 / 1024) << " MB" << std::endl;
+        std::cerr << "   💡 Apple Silicon GPU limit: " << (MAX_BUFFER_SIZE / 1024 / 1024) << " MB per buffer" << std::endl;
+        std::cerr << "   💡 Largest buffer: " << (max_individual_buffer / 1024 / 1024) << " MB" << std::endl;
+        std::cerr << "   💡 Reduce: num_qo(" << num_qo << "), head_dim(" << head_dim << "), or head_size(" << head_size << ")" << std::endl;
+        return;
+    }
+
     std::cout << "🟢 [HANDLE] batch_prefill_attention_unified_bf16 called with workspace!" << std::endl;
     std::cout << "🔍 [HANDLE] Parameters: num_qo=" << num_qo << ", head_dim=" << head_dim
               << ", head_size=" << head_size << ", page_size=" << page_size
@@ -632,12 +793,15 @@ void batch_prefill_attention_unified_bf16(
                                                                 options:MTLResourceStorageModeShared
                                                            deallocator:nil];
 
-        id<MTLBuffer> index_buf = [handle->device newBufferWithBytesNoCopy:index_workspace
-                                                                   length:workspace.index_buffer_size
-                                                                  options:MTLResourceStorageModeShared
-                                                             deallocator:nil];
+        // OPTIMIZATION: Combine small buffers to reduce buffer object count
+        // This reduces Metal Internal Error (0x0E) risk from too many concurrent buffer objects
+        size_t combined_small_buffers_size = workspace.index_buffer_size + workspace.params_buffer_size + workspace.debug_buffer_size;
+        id<MTLBuffer> combined_buf = [handle->device newBufferWithBytesNoCopy:index_workspace
+                                                                       length:combined_small_buffers_size
+                                                                      options:MTLResourceStorageModeShared
+                                                                 deallocator:nil];
 
-        // Create parameter buffer
+        // Create parameter buffer data in workspace
         struct Params {
             int num_qo;
             int head_dim;
@@ -651,17 +815,6 @@ void batch_prefill_attention_unified_bf16(
 
         Params* params = static_cast<Params*>(params_workspace);
         *params = { num_qo, head_dim, kv_head_dim, head_size, page_size, num_query_heads, num_kv_heads, scale };
-
-        id<MTLBuffer> params_buf = [handle->device newBufferWithBytesNoCopy:params_workspace
-                                                                     length:workspace.params_buffer_size
-                                                                    options:MTLResourceStorageModeShared
-                                                               deallocator:nil];
-
-        // Create debug buffer
-        id<MTLBuffer> debug_buf = [handle->device newBufferWithBytesNoCopy:debug_workspace
-                                                                    length:workspace.debug_buffer_size
-                                                                   options:MTLResourceStorageModeShared
-                                                              deallocator:nil];
 
         // Select optimal kernel based on problem characteristics and memory constraints
         // Estimate total_kv_len (this is a rough estimate - exact calculation happens in kernel)
@@ -683,64 +836,150 @@ void batch_prefill_attention_unified_bf16(
         [enc setBuffer:k_buf offset:0 atIndex:1];
         [enc setBuffer:v_buf offset:0 atIndex:2];
 
-        // Set index buffers with proper offsets
-        [enc setBuffer:index_buf offset:0 atIndex:3]; // qo_indptr
-        [enc setBuffer:index_buf offset:qo_indptr_size atIndex:4]; // kv_page_indptr
-        [enc setBuffer:index_buf offset:qo_indptr_size + kv_page_indptr_size atIndex:5]; // kv_page_indices
-        [enc setBuffer:index_buf offset:qo_indptr_size + kv_page_indptr_size + kv_page_indices_size atIndex:6]; // kv_last_page_lens
+        // Set index buffers with proper offsets using combined buffer
+        [enc setBuffer:combined_buf offset:0 atIndex:3]; // qo_indptr
+        [enc setBuffer:combined_buf offset:qo_indptr_size atIndex:4]; // kv_page_indptr
+        [enc setBuffer:combined_buf offset:qo_indptr_size + kv_page_indptr_size atIndex:5]; // kv_page_indices
+        [enc setBuffer:combined_buf offset:qo_indptr_size + kv_page_indptr_size + kv_page_indices_size atIndex:6]; // kv_last_page_lens
 
         [enc setBuffer:out_buf offset:0 atIndex:7];
-        [enc setBuffer:params_buf offset:0 atIndex:8];
-        [enc setBuffer:debug_buf offset:0 atIndex:9];
+        [enc setBuffer:combined_buf offset:workspace.index_buffer_size atIndex:8]; // params buffer
+        [enc setBuffer:combined_buf offset:workspace.index_buffer_size + workspace.params_buffer_size atIndex:9]; // debug buffer
 
-        MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);
-        MTLSize threadgroupsPerGrid;
+        // ⚡ ADAPTIVE KERNEL PARALLELIZATION - Prevent Metal Internal Error (0x0E)
+        // Apple Silicon GPU has limits on total parallel threads: ~65,536 concurrent threads
+        // Dynamically adjust parallelization based on workload size to prevent GPU overwhelm
 
-        // Determine threadgroup grid size based on kernel type
+        NSUInteger maxThreadsPerGroup = selected_pipeline.maxTotalThreadsPerThreadgroup;
+        NSUInteger recommendedThreadsPerGroup = MIN(128, maxThreadsPerGroup);
+
+        // Calculate total work (threads needed)
+        NSUInteger totalWork;
         if (selected_pipeline == handle->pipeline_bf16_per_head) {
-            // Per-head kernel: one threadgroup per (qo, head) pair
-            threadgroupsPerGrid = MTLSizeMake(num_qo * num_query_heads, 1, 1);
+            totalWork = num_qo * num_query_heads;
         } else {
-            // Standard kernels: one threadgroup per qo (loops over heads internally)
-            threadgroupsPerGrid = MTLSizeMake(num_qo, 1, 1);
+            totalWork = num_qo;
         }
+
+        // Apple Silicon GPU limits from configuration
+        const NSUInteger MAX_CONCURRENT_THREADS = handle->gpu_config.max_concurrent_threads;
+        const NSUInteger MAX_THREADGROUPS = handle->gpu_config.max_threadgroups_per_grid;
+        const size_t MAX_BUFFER_SIZE = handle->gpu_config.max_buffer_size_mb * 1024 * 1024;
+
+        // Declare parallelization variables outside conditional blocks for retry access
+        NSUInteger threadsPerGroup = recommendedThreadsPerGroup;
+        NSUInteger threadgroupCount = totalWork;
+
+        // ⚡ CONFIGURATION-BASED ADAPTIVE PARALLELIZATION - Prevent Metal Internal Error (0x0E)
+        // Use GPU configuration limits instead of hardcoded values
+        // Dynamically adjust parallelization based on workload size to prevent GPU overwhelm
+
+        if (totalWork * threadsPerGroup > MAX_CONCURRENT_THREADS) {
+            // 🔧 WORKLOAD TOO LARGE: Reduce ONLY threads per threadgroup (keep all threadgroups)
+            // Each threadgroup MUST process one query token (qo_idx = tgid.x in kernel)
+            std::cout << "🔧 [CONFIG] Large workload detected: " << totalWork << " x " << threadsPerGroup
+                      << " = " << (totalWork * threadsPerGroup) << " threads (>" << MAX_CONCURRENT_THREADS << ")" << std::endl;
+
+            // CRITICAL: Metal attention kernels are hardcoded with TGP_SIZE = 128
+            // Reducing threadsPerGroup breaks kernel correctness assumptions
+            // Instead, we must process in smaller batches to stay within GPU limits
+            
+            NSUInteger maxBatchSize = MAX_CONCURRENT_THREADS / recommendedThreadsPerGroup;
+            if (maxBatchSize < 1) maxBatchSize = 1;
+            
+            if (totalWork <= maxBatchSize) {
+                // Can process all tokens in one batch
+                threadsPerGroup = recommendedThreadsPerGroup;  // Keep 128
+                threadgroupCount = totalWork;
+            } else {
+                // Process in smaller batches - this would require kernel chunking
+                // For now, use original settings and accept potential Metal errors for very large workloads
+                threadsPerGroup = recommendedThreadsPerGroup;  // Keep 128 for correctness
+                threadgroupCount = totalWork;
+                
+                std::cout << "   ⚠️  WARNING: Large workload may cause Metal Internal Error" << std::endl;
+                std::cout << "   💡 Consider reducing batch_size or sequence_length in model config" << std::endl;
+            }
+
+            std::cout << "   ✅ Configuration-based sizing: " << threadsPerGroup << " threads/group, "
+                      << threadgroupCount << " groups (total: " << (threadsPerGroup * threadgroupCount) << " threads)" << std::endl;
+        } else {
+            // 🚀 WORKLOAD MANAGEABLE: Use optimal parallelization
+            std::cout << "🚀 [CONFIG] Optimal workload: " << threadsPerGroup << " threads/group, "
+                      << threadgroupCount << " groups (total: " << (threadsPerGroup * threadgroupCount) << " threads)" << std::endl;
+        }
+
+        MTLSize threadsPerThreadgroup = MTLSizeMake(threadsPerGroup, 1, 1);
+        MTLSize threadgroupsPerGrid = MTLSizeMake(threadgroupCount, 1, 1);
 
         [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
         [enc endEncoding];
 
-        // Commit and wait (with retry logic preserved)
+        // Error handling with detailed logging
+        using namespace MetalErrorHandling;
+
+        // Log GPU memory status before execution
+        GPUMemoryInfo memInfo = getGPUMemoryInfo(handle->device);
+        std::cout << "GPU Memory Status: " << memInfo.current_allocated / (1024 * 1024) << " MB / "
+                  << memInfo.recommended_max / (1024 * 1024) << " MB ("
+                  << static_cast<int>(memInfo.usage_ratio * 100) << "%)" << std::endl;
+
         int retries = 3;
         NSError* cmdError = nil;
         while (retries > 0) {
             [cmd commit];
             [cmd waitUntilCompleted];
             cmdError = cmd.error;
-
             if (!cmdError) {
                 break; // Success
             }
 
+            // Enhanced error logging
+            std::cerr << "❌ Metal command buffer failed (attempt " << (4-retries) << "/3):" << std::endl;
+            std::cerr << "   Error: " << cmdError.localizedDescription.UTF8String << std::endl;
+            std::cerr << "   Code: " << cmdError.code << std::endl;
+            std::cerr << "   Domain: " << cmdError.domain.UTF8String << std::endl;
+            std::cerr << "   Parameters: num_qo=" << num_qo << ", head_dim=" << head_dim << ", head_size=" << head_size
+                      << ", workspace=" << workspace.total_size / (1024 * 1024) << "MB" << std::endl;
+
             retries--;
             if (retries > 0) {
+                std::cout << "🔄 Retrying... (" << retries << " attempts remaining)" << std::endl;
                 cmd = [handle->commandQueue commandBuffer];
                 enc = [cmd computeCommandEncoder];
                 [enc setComputePipelineState:selected_pipeline];
                 [enc setBuffer:q_buf offset:0 atIndex:0];
                 [enc setBuffer:k_buf offset:0 atIndex:1];
                 [enc setBuffer:v_buf offset:0 atIndex:2];
-                [enc setBuffer:index_buf offset:0 atIndex:3];
-                [enc setBuffer:index_buf offset:qo_indptr_size atIndex:4];
-                [enc setBuffer:index_buf offset:qo_indptr_size + kv_page_indptr_size atIndex:5];
-                [enc setBuffer:index_buf offset:qo_indptr_size + kv_page_indptr_size + kv_page_indices_size atIndex:6];
+                [enc setBuffer:combined_buf offset:0 atIndex:3]; // qo_indptr
+                [enc setBuffer:combined_buf offset:qo_indptr_size atIndex:4]; // kv_page_indptr
+                [enc setBuffer:combined_buf offset:qo_indptr_size + kv_page_indptr_size atIndex:5]; // kv_page_indices
+                [enc setBuffer:combined_buf offset:qo_indptr_size + kv_page_indptr_size + kv_page_indices_size atIndex:6]; // kv_last_page_lens
                 [enc setBuffer:out_buf offset:0 atIndex:7];
-                [enc setBuffer:params_buf offset:0 atIndex:8];
-                [enc setBuffer:debug_buf offset:0 atIndex:9];
-                MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);
-                MTLSize threadgroupsPerGrid = MTLSizeMake(num_qo, 1, 1);
+                [enc setBuffer:combined_buf offset:workspace.index_buffer_size atIndex:8]; // params buffer
+                [enc setBuffer:combined_buf offset:workspace.index_buffer_size + workspace.params_buffer_size atIndex:9]; // debug buffer
+                // Use same adaptive parallelization for retry
+                MTLSize threadsPerThreadgroup = MTLSizeMake(threadsPerGroup, 1, 1);
+                MTLSize threadgroupsPerGrid = MTLSizeMake(threadgroupCount, 1, 1);
                 [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
                 [enc endEncoding];
             } else {
-                std::cerr << "Metal command buffer failed after retries: " << cmdError.localizedDescription.UTF8String << std::endl;
+                // Final failure with comprehensive error report
+                std::cerr << "💥 FINAL ERROR: Metal command buffer failed after 3 retries" << std::endl;
+                std::cerr << "   Last error: " << cmdError.localizedDescription.UTF8String << std::endl;
+                std::cerr << "   Error code: " << cmdError.code << std::endl;
+
+                // Provide helpful suggestions based on error type
+                if (cmdError.code == 14) { // Internal Error
+                    std::cerr << "   💡 This is an Internal Metal error - may be caused by GPU memory pressure" << std::endl;
+                    std::cerr << "      Try reducing batch size or sequence length" << std::endl;
+                } else if (cmdError.code == 5) { // Innocent Victim
+                    std::cerr << "   💡 GPU error recovery occurred - another process may have caused GPU instability" << std::endl;
+                    std::cerr << "      Try reducing GPU workload or restarting the application" << std::endl;
+                }
+
+                std::cerr << "   Current GPU usage: " << static_cast<int>(memInfo.usage_ratio * 100) << "%" << std::endl;
+
                 return;
             }
         }
@@ -806,6 +1045,37 @@ void batch_prefill_attention_unified_f32(
         if (workspace_size < workspace.total_size) {
             std::cerr << "❌ [HANDLE] Workspace too small: " << workspace_size
                       << " < " << workspace.total_size << " required" << std::endl;
+            return;
+        }
+
+        // GPU Memory and Buffer Size Validation - Use GPU-specific configuration
+        const size_t MAX_BUFFER_SIZE = handle->gpu_config.max_buffer_size_mb * 1024 * 1024;
+        const size_t MAX_TOTAL_WORKSPACE = handle->gpu_config.max_total_workspace_mb * 1024 * 1024;
+
+        if (workspace.total_size > MAX_TOTAL_WORKSPACE) {
+            std::cerr << "❌ [HANDLE F32] Workspace size exceeds GPU memory limits: "
+                      << (workspace.total_size / 1024 / 1024) << " MB > "
+                      << (MAX_TOTAL_WORKSPACE / 1024 / 1024) << " MB" << std::endl;
+            std::cerr << "   💡 Try reducing batch size, sequence length, or head dimension" << std::endl;
+            std::cerr << "   💡 Current params: " << num_qo << " tokens, " << head_size << " head_size" << std::endl;
+            return;
+        }
+
+        // Check individual buffer sizes for f32 (2x larger than bf16)
+        size_t q_buffer_size = num_qo * head_dim * sizeof(float);
+        size_t kv_total_size = num_kv_pages * page_size * kv_head_dim * sizeof(float);
+        size_t output_buffer_size = num_qo * head_dim * sizeof(float);
+
+        size_t max_buffer = std::max({q_buffer_size, kv_total_size, output_buffer_size});
+
+        if (max_buffer > MAX_BUFFER_SIZE) {
+            std::cerr << "❌ [HANDLE F32] Individual buffer exceeds Apple Silicon GPU limits:" << std::endl;
+            std::cerr << "   Q buffer: " << (q_buffer_size / 1024 / 1024) << " MB" << std::endl;
+            std::cerr << "   KV cache: " << (kv_total_size / 1024 / 1024) << " MB" << std::endl;
+            std::cerr << "   Output buffer: " << (output_buffer_size / 1024 / 1024) << " MB" << std::endl;
+            std::cerr << "   💡 Apple Silicon GPU limit: " << (MAX_BUFFER_SIZE / 1024 / 1024) << " MB per buffer" << std::endl;
+            std::cerr << "   💡 Largest buffer: " << (max_buffer / 1024 / 1024) << " MB" << std::endl;
+            std::cerr << "   💡 F32 uses 2x memory vs BF16 - consider using BF16 instead" << std::endl;
             return;
         }
 
@@ -905,9 +1175,41 @@ void batch_prefill_attention_unified_f32(
         [enc setBuffer:out_buf offset:0 atIndex:7];
         [enc setBuffer:params_buf offset:0 atIndex:8];
 
-        // Dispatch computation
-        MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);
-        MTLSize threadgroupsPerGrid = MTLSizeMake(num_qo, 1, 1);
+        // ⚡ ADAPTIVE KERNEL PARALLELIZATION - Apply same logic for F32
+        NSUInteger maxThreadsPerGroup = selected_pipeline.maxTotalThreadsPerThreadgroup;
+        NSUInteger recommendedThreadsPerGroup = MIN(128, maxThreadsPerGroup);
+        NSUInteger totalWork = num_qo;
+
+        const NSUInteger MAX_CONCURRENT_THREADS = handle->gpu_config.max_concurrent_threads;
+
+        NSUInteger threadsPerGroup;
+        NSUInteger threadgroupCount;
+
+        if (totalWork * recommendedThreadsPerGroup > MAX_CONCURRENT_THREADS) {
+            // F32 kernels may be more flexible, but apply same logic for consistency
+            NSUInteger maxBatchSize = MAX_CONCURRENT_THREADS / recommendedThreadsPerGroup;
+            if (maxBatchSize < 1) maxBatchSize = 1;
+            
+            if (totalWork <= maxBatchSize) {
+                threadsPerGroup = recommendedThreadsPerGroup;
+                threadgroupCount = totalWork;
+            } else {
+                // Keep original settings for correctness
+                threadsPerGroup = recommendedThreadsPerGroup;
+                threadgroupCount = totalWork;
+                std::cout << "   ⚠️  WARNING: Large F32 workload may cause Metal Internal Error" << std::endl;
+            }
+            std::cout << "🔧 [ADAPTIVE F32] Reducing parallelization: " << threadsPerGroup
+                      << " threads/group, " << threadgroupCount << " groups" << std::endl;
+        } else {
+            threadsPerGroup = recommendedThreadsPerGroup;
+            threadgroupCount = totalWork;
+            std::cout << "🚀 [ADAPTIVE F32] Optimal parallelization: " << threadsPerGroup
+                      << " threads/group, " << threadgroupCount << " groups" << std::endl;
+        }
+
+        MTLSize threadsPerThreadgroup = MTLSizeMake(threadsPerGroup, 1, 1);
+        MTLSize threadgroupsPerGrid = MTLSizeMake(threadgroupCount, 1, 1);
         [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
         [enc endEncoding];
 

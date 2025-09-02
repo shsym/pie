@@ -5,6 +5,8 @@
 #include "metal_topk_mask_logits.hpp"
 #include <iostream>
 #include <cassert>
+#include <thread>
+#include <chrono>
 
 // Global Metal objects (initialized once)
 static id<MTLDevice> device = nil;
@@ -150,16 +152,56 @@ int metal_topk_mask_logits_float32(
 
         [encoder endEncoding];
 
-        // Execute and wait for completion
-        [commandBuffer commit];
-        [commandBuffer waitUntilCompleted];
-
-        // Check for execution errors
-        if (commandBuffer.status == MTLCommandBufferStatusError) {
-            std::cerr << "Metal command buffer execution failed" << std::endl;
-            if (commandBuffer.error) {
-                std::cerr << "Error: " << commandBuffer.error.localizedDescription.UTF8String << std::endl;
+        // Enhanced retry logic with detailed error reporting (3 retries as requested)
+        int retries = 3;
+        NSError* cmdError = nil;
+        while (retries > 0) {
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted];
+            cmdError = commandBuffer.error;
+            
+            if (!cmdError && commandBuffer.status == MTLCommandBufferStatusCompleted) {
+                break; // Success!
             }
+            
+            retries--;
+            if (retries > 0) {
+                std::cerr << "❌ Metal command buffer failed in topk_mask_f32 (attempt " << (4-retries) << "/3):" << std::endl;
+                if (cmdError) {
+                    std::cerr << "   Error: " << cmdError.localizedDescription.UTF8String << std::endl;
+                    std::cerr << "   Code: " << cmdError.code << std::endl;
+                    std::cerr << "   Domain: " << cmdError.domain.UTF8String << std::endl;
+                }
+                std::cerr << "   Parameters: num_tokens=" << num_tokens << ", vocab_size=" << vocab_size << ", k=" << k << std::endl;
+                
+                // Brief retry delay
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                
+                // Create new command buffer for retry
+                commandBuffer = [commandQueue commandBuffer];
+                encoder = [commandBuffer computeCommandEncoder];
+                
+                [encoder setComputePipelineState:topkF32PipelineState];
+                [encoder setBuffer:logitsBuffer offset:0 atIndex:0];
+                [encoder setBuffer:paramsBuffer offset:0 atIndex:1];
+                [encoder dispatchThreadgroups:threadgroupsPerGridSize threadsPerThreadgroup:threadsPerThreadgroupSize];
+                [encoder endEncoding];
+            }
+        }
+        
+        // Final error check
+        if (cmdError || commandBuffer.status == MTLCommandBufferStatusError) {
+            std::cerr << "💥 FINAL ERROR: Metal topk_mask_f32 command buffer failed after 3 retries" << std::endl;
+            if (cmdError) {
+                std::cerr << "   Final error: " << cmdError.localizedDescription.UTF8String << std::endl;
+                std::cerr << "   Code: " << cmdError.code << " Domain: " << cmdError.domain.UTF8String << std::endl;
+                if (cmdError.code == 14) {
+                    std::cerr << "   💡 This is an Internal Metal error - may be caused by GPU memory pressure" << std::endl;
+                } else if (cmdError.code == 5) {
+                    std::cerr << "   💡 This is an Innocent Victim error - caused by GPU recovery from another error" << std::endl;
+                }
+            }
+            std::cerr << "   Parameters: num_tokens=" << num_tokens << ", vocab_size=" << vocab_size << ", k=" << k << std::endl;
             return -4;
         }
 
@@ -233,16 +275,56 @@ int metal_topk_mask_logits_bfloat16(
 
         [encoder endEncoding];
 
-        // Execute and wait for completion
-        [commandBuffer commit];
-        [commandBuffer waitUntilCompleted];
-
-        // Check for execution errors
-        if (commandBuffer.status == MTLCommandBufferStatusError) {
-            std::cerr << "Metal command buffer execution failed" << std::endl;
-            if (commandBuffer.error) {
-                std::cerr << "Error: " << commandBuffer.error.localizedDescription.UTF8String << std::endl;
+        // Enhanced retry logic with detailed error reporting (3 retries as requested)
+        int retries = 3;
+        NSError* cmdError = nil;
+        while (retries > 0) {
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted];
+            cmdError = commandBuffer.error;
+            
+            if (!cmdError && commandBuffer.status == MTLCommandBufferStatusCompleted) {
+                break; // Success!
             }
+            
+            retries--;
+            if (retries > 0) {
+                std::cerr << "❌ Metal command buffer failed in topk_mask_bf16 (attempt " << (4-retries) << "/3):" << std::endl;
+                if (cmdError) {
+                    std::cerr << "   Error: " << cmdError.localizedDescription.UTF8String << std::endl;
+                    std::cerr << "   Code: " << cmdError.code << std::endl;
+                    std::cerr << "   Domain: " << cmdError.domain.UTF8String << std::endl;
+                }
+                std::cerr << "   Parameters: num_tokens=" << num_tokens << ", vocab_size=" << vocab_size << ", k=" << k << std::endl;
+                
+                // Brief retry delay
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                
+                // Create new command buffer for retry
+                commandBuffer = [commandQueue commandBuffer];
+                encoder = [commandBuffer computeCommandEncoder];
+                
+                [encoder setComputePipelineState:topkBF16PipelineState];
+                [encoder setBuffer:logitsBuffer offset:0 atIndex:0];
+                [encoder setBuffer:paramsBuffer offset:0 atIndex:1];
+                [encoder dispatchThreadgroups:threadgroupsPerGridSize threadsPerThreadgroup:threadsPerThreadgroupSize];
+                [encoder endEncoding];
+            }
+        }
+        
+        // Final error check
+        if (cmdError || commandBuffer.status == MTLCommandBufferStatusError) {
+            std::cerr << "💥 FINAL ERROR: Metal topk_mask_bf16 command buffer failed after 3 retries" << std::endl;
+            if (cmdError) {
+                std::cerr << "   Final error: " << cmdError.localizedDescription.UTF8String << std::endl;
+                std::cerr << "   Code: " << cmdError.code << " Domain: " << cmdError.domain.UTF8String << std::endl;
+                if (cmdError.code == 14) {
+                    std::cerr << "   💡 This is an Internal Metal error - may be caused by GPU memory pressure" << std::endl;
+                } else if (cmdError.code == 5) {
+                    std::cerr << "   💡 This is an Innocent Victim error - caused by GPU recovery from another error" << std::endl;
+                }
+            }
+            std::cerr << "   Parameters: num_tokens=" << num_tokens << ", vocab_size=" << vocab_size << ", k=" << k << std::endl;
             return -4;
         }
 

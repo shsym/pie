@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cmath>
+#include <string>
 #import <Metal/Metal.h>
 
 #ifdef __cplusplus
@@ -46,6 +47,22 @@ struct MetalBatchPrefillHandle {
     // Usage statistics
     size_t total_calls;
     size_t total_bytes_processed;
+    
+    // GPU Configuration (loaded from apple_gpu_configs.json)
+    struct {
+        std::string gpu_name;
+        int max_concurrent_threads;
+        int max_buffer_size_mb;
+        int max_total_workspace_mb;
+        // Threadgroup parameters
+        int max_threads_per_threadgroup;
+        int max_threadgroups_per_grid;  // We'll use the [0] value from array
+        // Chunking parameters
+        int head_dim_threshold;
+        int min_tokens_for_chunking;
+        int max_tokens_per_chunk;
+        bool enable_adaptive_chunking;
+    } gpu_config;
     
     // Internal state
     bool initialized;
