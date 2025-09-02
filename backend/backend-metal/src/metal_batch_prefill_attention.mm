@@ -249,6 +249,19 @@ MetalBatchPrefillHandle* metal_batch_prefill_create_handle(
         }
     }
     
+    // Per-head mapping kernels (Priority 2)
+    id<MTLFunction> bf16_per_head_function = [handle->library newFunctionWithName:@"batch_prefill_attention_unified_bf16_per_head_kernel"];
+    if (bf16_per_head_function) {
+        handle->pipeline_bf16_per_head = [handle->device newComputePipelineStateWithFunction:bf16_per_head_function error:&error];
+        if (error) {
+            std::cerr << "MetalBatchPrefillHandle: Failed to create BF16 per-head pipeline: " 
+                      << error.localizedDescription.UTF8String << std::endl;
+        }
+    }
+    
+    // Note: F32 per-head kernel not implemented yet - would be similar to BF16 version
+    handle->pipeline_f32_per_head = nil;
+    
     // Set configuration bounds
     handle->max_batch_size = max_batch_size;
     handle->max_seq_length = max_seq_length;
@@ -411,16 +424,24 @@ namespace {
             case KernelOptimizationLevel::SIMDGROUP_OPT:
                 return handle->pipeline_bf16_simdgroup ? handle->pipeline_bf16_simdgroup : handle->pipeline_bf16_baseline;
                 
+            case KernelOptimizationLevel::PER_HEAD_OPT:
+                return handle->pipeline_bf16_per_head ? handle->pipeline_bf16_per_head : 
+                       (handle->pipeline_bf16_simdgroup ? handle->pipeline_bf16_simdgroup : handle->pipeline_bf16_baseline);
+                
             case KernelOptimizationLevel::AUTO:
             default:
                 // Auto selection based on memory constraints and problem characteristics
-                // Priority 0 optimizations are most effective for small sequences (128-512 tokens)
-                // where thread utilization is a major bottleneck
-                if (total_kv_len <= 512 && head_size <= 128) {
-                    // Small sequences: prefer simdgroup if memory allows
+                // Priority 2 optimizations (per-head) are most effective for small batch sizes
+                // where GPU occupancy is low due to insufficient threadgroups
+                if (num_tokens <= 16 && total_kv_len <= 512 && head_size <= 128) {
+                    // Very small batches: use per-head mapping for better occupancy
+                    return handle->pipeline_bf16_per_head ? handle->pipeline_bf16_per_head : 
+                           (handle->pipeline_bf16_simdgroup ? handle->pipeline_bf16_simdgroup : handle->pipeline_bf16_baseline);
+                } else if (total_kv_len <= 512 && head_size <= 128) {
+                    // Small sequences: prefer simdgroup for thread utilization
                     return handle->pipeline_bf16_simdgroup ? handle->pipeline_bf16_simdgroup : handle->pipeline_bf16_baseline;
                 } else {
-                    // Large sequences: use baseline (simdgroup overhead not worth it)
+                    // Large sequences: use baseline (optimization overhead not worth it)
                     return handle->pipeline_bf16_baseline ? handle->pipeline_bf16_baseline : handle->pipeline_bf16;
                 }
         }
@@ -470,6 +491,17 @@ namespace {
                     }
                 }
                 // Fall back to baseline if simdgroup doesn't fit
+                return handle->pipeline_f32_baseline ? handle->pipeline_f32_baseline : handle->pipeline_f32;
+                
+            case KernelOptimizationLevel::PER_HEAD_OPT:
+                // F32 per-head kernel not implemented yet, fall back to simdgroup or baseline
+                if (handle->pipeline_f32_simdgroup) {
+                    AttentionMemoryLayout simdgroup_layout = AttentionMemoryManager::calculate_memory_usage(
+                        head_size, page_size, true, false);
+                    if (!simdgroup_layout.exceeds_limit()) {
+                        return handle->pipeline_f32_simdgroup;
+                    }
+                }
                 return handle->pipeline_f32_baseline ? handle->pipeline_f32_baseline : handle->pipeline_f32;
                 
             case KernelOptimizationLevel::AUTO:
@@ -660,7 +692,17 @@ void batch_prefill_attention_unified_bf16(
         [enc setBuffer:debug_buf offset:0 atIndex:9];
         
         MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);
-        MTLSize threadgroupsPerGrid = MTLSizeMake(num_qo, 1, 1);
+        MTLSize threadgroupsPerGrid;
+        
+        // Determine threadgroup grid size based on kernel type
+        if (selected_pipeline == handle->pipeline_bf16_per_head) {
+            // Per-head kernel: one threadgroup per (qo, head) pair
+            threadgroupsPerGrid = MTLSizeMake(num_qo * num_query_heads, 1, 1);
+        } else {
+            // Standard kernels: one threadgroup per qo (loops over heads internally)
+            threadgroupsPerGrid = MTLSizeMake(num_qo, 1, 1);
+        }
+        
         [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
         [enc endEncoding];
         

@@ -12,13 +12,15 @@ struct QuickBenchmarkResult {
     const char* config_name;
     double baseline_time_ms;
     double simdgroup_time_ms;
-    double speedup_factor;
+    double per_head_time_ms;
+    double simdgroup_speedup;
+    double per_head_speedup;
     bool success;
 };
 
 int main() {
-    std::cout << "⚡ Quick Metal FlashAttention Priority 0 Performance Validation" << std::endl;
-    std::cout << "=============================================================" << std::endl;
+    std::cout << "⚡ Quick Metal FlashAttention Priority 0 & 2 Performance Validation" << std::endl;
+    std::cout << "=================================================================" << std::endl;
     
     // Create handle
     MetalBatchPrefillHandle* handle = metal_batch_prefill_create_handle(512, 2048, 32, 1024);
@@ -99,18 +101,47 @@ int main() {
         end = high_resolution_clock::now();
         result.simdgroup_time_ms = duration_cast<microseconds>(end - start).count() / (1000.0 * 3);
         
-        result.speedup_factor = result.baseline_time_ms / result.simdgroup_time_ms;
+        // Test per-head optimized (Priority 2)
+        start = high_resolution_clock::now();
+        for (int i = 0; i < 3; i++) {
+            batch_prefill_attention_unified_bf16(
+                handle, workspace_buffer.data(), workspace_buffer.size(),
+                q_data.data(), k_data.data(), v_data.data(),
+                qo_indptr.data(), kv_page_indptr.data(), kv_page_indices.data(),
+                kv_last_page_lens.data(), output_data.data(),
+                config.num_tokens, config.head_dim, config.head_dim, config.head_size, 16,
+                num_heads, num_heads, scale, config.pages, KernelOptimizationLevel::PER_HEAD_OPT
+            );
+        }
+        end = high_resolution_clock::now();
+        result.per_head_time_ms = duration_cast<microseconds>(end - start).count() / (1000.0 * 3);
+        
+        result.simdgroup_speedup = result.baseline_time_ms / result.simdgroup_time_ms;
+        result.per_head_speedup = result.baseline_time_ms / result.per_head_time_ms;
         result.success = true;
         
         std::cout << "  📋 Baseline: " << std::fixed << std::setprecision(2) << result.baseline_time_ms << "ms" << std::endl;
         std::cout << "  ⚡ Simdgroup: " << std::fixed << std::setprecision(2) << result.simdgroup_time_ms << "ms" << std::endl;
-        std::cout << "  🚀 Speedup: " << std::fixed << std::setprecision(2) << result.speedup_factor << "x";
+        std::cout << "  🎯 Per-head: " << std::fixed << std::setprecision(2) << result.per_head_time_ms << "ms" << std::endl;
         
-        if (result.speedup_factor > 1.3) {
+        std::cout << "  🚀 Simdgroup speedup: " << std::fixed << std::setprecision(2) << result.simdgroup_speedup << "x";
+        if (result.simdgroup_speedup > 1.3) {
             std::cout << " ✅ EXCELLENT";
-        } else if (result.speedup_factor > 1.1) {
+        } else if (result.simdgroup_speedup > 1.1) {
             std::cout << " ✅ GOOD";
-        } else if (result.speedup_factor > 0.9) {
+        } else if (result.simdgroup_speedup > 0.9) {
+            std::cout << " ➖ NEUTRAL";
+        } else {
+            std::cout << " ❌ SLOWER";
+        }
+        std::cout << std::endl;
+        
+        std::cout << "  🎯 Per-head speedup: " << std::fixed << std::setprecision(2) << result.per_head_speedup << "x";
+        if (result.per_head_speedup > 1.3) {
+            std::cout << " ✅ EXCELLENT";
+        } else if (result.per_head_speedup > 1.1) {
+            std::cout << " ✅ GOOD";
+        } else if (result.per_head_speedup > 0.9) {
             std::cout << " ➖ NEUTRAL";
         } else {
             std::cout << " ❌ SLOWER";
@@ -121,38 +152,62 @@ int main() {
     }
     
     // Summary
-    std::cout << "\n📊 PRIORITY 0 PERFORMANCE VALIDATION SUMMARY" << std::endl;
-    std::cout << "============================================" << std::endl;
+    std::cout << "\n📊 PRIORITY 0 & 2 PERFORMANCE VALIDATION SUMMARY" << std::endl;
+    std::cout << "================================================" << std::endl;
     
-    double total_speedup = 0.0;
-    int good_results = 0;
+    double total_simdgroup_speedup = 0.0;
+    double total_per_head_speedup = 0.0;
+    int simdgroup_good_results = 0;
+    int per_head_good_results = 0;
     
     for (const auto& result : results) {
-        std::cout << "📝 " << result.config_name << ": " << std::fixed << std::setprecision(2) << result.speedup_factor << "x";
-        if (result.speedup_factor > 1.1) {
+        std::cout << "📝 " << result.config_name << ":" << std::endl;
+        std::cout << "  ⚡ Simdgroup: " << std::fixed << std::setprecision(2) << result.simdgroup_speedup << "x";
+        if (result.simdgroup_speedup > 1.1) {
             std::cout << " ✅";
-            good_results++;
-        } else if (result.speedup_factor < 0.9) {
+            simdgroup_good_results++;
+        } else if (result.simdgroup_speedup < 0.9) {
             std::cout << " ❌";
         }
         std::cout << std::endl;
-        total_speedup += result.speedup_factor;
+        
+        std::cout << "  🎯 Per-head: " << std::fixed << std::setprecision(2) << result.per_head_speedup << "x";
+        if (result.per_head_speedup > 1.1) {
+            std::cout << " ✅";
+            per_head_good_results++;
+        } else if (result.per_head_speedup < 0.9) {
+            std::cout << " ❌";
+        }
+        std::cout << std::endl;
+        
+        total_simdgroup_speedup += result.simdgroup_speedup;
+        total_per_head_speedup += result.per_head_speedup;
     }
     
-    double avg_speedup = total_speedup / results.size();
-    std::cout << "\n🎯 FINAL RESULTS:" << std::endl;
-    std::cout << "   📈 Average speedup: " << std::fixed << std::setprecision(2) << avg_speedup << "x" << std::endl;
-    std::cout << "   ✅ Good results: " << good_results << "/" << results.size() << std::endl;
+    double avg_simdgroup_speedup = total_simdgroup_speedup / results.size();
+    double avg_per_head_speedup = total_per_head_speedup / results.size();
     
-    if (avg_speedup >= 1.3) {
-        std::cout << "   🏆 PRIORITY 0 VALIDATION: PASSED ✅" << std::endl;
-        std::cout << "   🎉 Target 30%+ speedup achieved!" << std::endl;
-    } else if (avg_speedup >= 1.1) {
-        std::cout << "   ✅ PRIORITY 0 VALIDATION: PARTIAL SUCCESS" << std::endl;
-        std::cout << "   📊 Modest improvement achieved" << std::endl;
-    } else {
+    std::cout << "\n🎯 FINAL RESULTS:" << std::endl;
+    std::cout << "   📈 Average simdgroup speedup: " << std::fixed << std::setprecision(2) << avg_simdgroup_speedup << "x" << std::endl;
+    std::cout << "   🎯 Average per-head speedup: " << std::fixed << std::setprecision(2) << avg_per_head_speedup << "x" << std::endl;
+    std::cout << "   ✅ Simdgroup good results: " << simdgroup_good_results << "/" << results.size() << std::endl;
+    std::cout << "   ✅ Per-head good results: " << per_head_good_results << "/" << results.size() << std::endl;
+    
+    bool priority0_passed = avg_simdgroup_speedup >= 1.3;
+    bool priority2_passed = avg_per_head_speedup >= 1.2; // Slightly lower target for Priority 2
+    
+    if (priority0_passed && priority2_passed) {
+        std::cout << "   🏆 ALL VALIDATIONS: PASSED ✅" << std::endl;
+        std::cout << "   🎉 Both Priority 0 and Priority 2 optimizations successful!" << std::endl;
+    } else if (priority0_passed) {
+        std::cout << "   ✅ PRIORITY 0 VALIDATION: PASSED" << std::endl;
+        std::cout << "   ⚠️ PRIORITY 2 VALIDATION: NEEDS TUNING" << std::endl;
+    } else if (priority2_passed) {
+        std::cout << "   ✅ PRIORITY 2 VALIDATION: PASSED" << std::endl;
         std::cout << "   ⚠️ PRIORITY 0 VALIDATION: NEEDS TUNING" << std::endl;
-        std::cout << "   🔍 Performance below expectations" << std::endl;
+    } else {
+        std::cout << "   ⚠️ BOTH VALIDATIONS: NEED TUNING" << std::endl;
+        std::cout << "   🔍 Performance below expectations for both optimization levels" << std::endl;
     }
     
     metal_batch_prefill_destroy_handle(handle);

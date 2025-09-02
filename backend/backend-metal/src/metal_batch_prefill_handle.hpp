@@ -33,6 +33,10 @@ struct MetalBatchPrefillHandle {
     id<MTLComputePipelineState> pipeline_bf16_simdgroup;
     id<MTLComputePipelineState> pipeline_f32_simdgroup;
     
+    // Per-head mapping kernels (Priority 2)
+    id<MTLComputePipelineState> pipeline_bf16_per_head;
+    id<MTLComputePipelineState> pipeline_f32_per_head;
+    
     // Configuration bounds (for validation)
     int max_batch_size;
     int max_seq_length; 
@@ -54,6 +58,7 @@ struct MetalBatchPrefillHandle {
 enum class KernelOptimizationLevel {
     BASELINE,      // Reference implementation for correctness validation
     SIMDGROUP_OPT, // Priority 0: Simdgroup reductions and optimizations
+    PER_HEAD_OPT,  // Priority 2: One threadgroup per (qo, head) with vectorization
     AUTO           // Automatic selection based on problem size and device capabilities
 };
 
