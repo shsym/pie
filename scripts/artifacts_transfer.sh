@@ -438,7 +438,7 @@ show_status() {
     elif [ -f "$ARTIFACTS_ARCHIVE" ] && [ ! -d "$METAL_ARTIFACTS_TARGET" ]; then
         echo -e "  • Extract artifacts: ${YELLOW}./scripts/artifacts_transfer.sh extract${NC}"
     else
-        echo -e "  • All ready! Test Metal: ${YELLOW}cd metal-protocol-tests/build && ./metal_protocol_tests --backend metal --config llama31_configs.json --op gemm --case llama31_qkv${NC}"
+        echo -e "  • All ready! Test Metal: ${YELLOW}cd ../metal-protocol-tests/script && ./test_all_ops.sh${NC}"
     fi
 }
 
