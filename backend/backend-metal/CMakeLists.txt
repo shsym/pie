@@ -8,6 +8,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Enable Objective-C++ for Metal integration
 enable_language(OBJCXX)
 
+# Optimization options
+option(USE_SIMDGROUP_REDUCTIONS "Enable Metal simdgroup optimizations for attention kernels" OFF)
+
 # Find required frameworks on macOS
 if(APPLE)
     find_library(METAL_FRAMEWORK Metal REQUIRED)
@@ -119,6 +122,11 @@ set_target_properties(metal_batch_prefill_attention PROPERTIES
     COMPILE_FLAGS "-fobjc-arc"
 )
 
+# Add simdgroup optimization flag to Metal shaders
+if(USE_SIMDGROUP_REDUCTIONS)
+    target_compile_definitions(metal_batch_prefill_attention PRIVATE USE_SIMDGROUP_REDUCTIONS=1)
+endif()
+
 # Metal Data Type Conversion library
 add_library(metal_dtype_conversion
     src/metal_dtype_conversion.mm
@@ -147,7 +155,59 @@ set_target_properties(metal_common PROPERTIES
     COMPILE_FLAGS "-fobjc-arc"
 )
 
-# Test executables are defined in the tests/ subdirectory
+# Test executables 
+
+# Kernel selection validation test
+add_executable(test_kernel_selection src/test_kernel_selection.mm)
+
+target_link_libraries(test_kernel_selection 
+    metal_batch_prefill_attention 
+    ${METAL_FRAMEWORK} 
+    ${FOUNDATION_FRAMEWORK}
+)
+
+set_target_properties(test_kernel_selection PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc"
+)
+
+# Performance benchmark test
+add_executable(attention_performance_benchmark src/attention_performance_benchmark.mm)
+
+target_link_libraries(attention_performance_benchmark 
+    metal_batch_prefill_attention 
+    ${METAL_FRAMEWORK} 
+    ${FOUNDATION_FRAMEWORK}
+)
+
+set_target_properties(attention_performance_benchmark PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc"
+)
+
+# Quick performance validation test  
+add_executable(quick_performance_validation src/quick_performance_validation.mm)
+
+target_link_libraries(quick_performance_validation 
+    metal_batch_prefill_attention 
+    ${METAL_FRAMEWORK} 
+    ${FOUNDATION_FRAMEWORK}
+)
+
+set_target_properties(quick_performance_validation PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc"
+)
+
+# Memory management test
+add_executable(test_memory_management src/test_memory_management.mm)
+
+target_link_libraries(test_memory_management 
+    metal_batch_prefill_attention 
+    ${METAL_FRAMEWORK} 
+    ${FOUNDATION_FRAMEWORK}
+)
+
+set_target_properties(test_memory_management PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc"
+)
 
 # Set output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -187,9 +247,28 @@ configure_file(
     COPYONLY
 )
 
+# Copy Metal attention shaders
 configure_file(
     ${CMAKE_SOURCE_DIR}/src/metal_batch_prefill_attention.metal
     ${CMAKE_BINARY_DIR}/shaders/metal_batch_prefill_attention.metal
+    COPYONLY
+)
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_attention_common.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_attention_common.metal
+    COPYONLY
+)
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_attention_baseline.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_attention_baseline.metal
+    COPYONLY
+)
+
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/metal_attention_simdgroup_opt.metal
+    ${CMAKE_BINARY_DIR}/shaders/metal_attention_simdgroup_opt.metal
     COPYONLY
 )
 

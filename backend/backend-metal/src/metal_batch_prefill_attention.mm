@@ -1,5 +1,6 @@
 #include "metal_batch_prefill_attention.hpp"
 #include "metal_batch_prefill_handle.hpp"
+#include "metal_memory_manager.hpp"
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include <iostream>
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 
 // Conversion utilities for bfloat16 to IEEE half
 namespace {
@@ -141,21 +143,46 @@ MetalBatchPrefillHandle* metal_batch_prefill_create_handle(
         return nullptr;
     }
     
-    // Load Metal library
+    // Load Metal library - combine all Metal source files
     NSError* error = nil;
     NSString* currentPath = [NSString stringWithUTF8String:__FILE__];
     NSString* dirPath = [currentPath stringByDeletingLastPathComponent];
-    NSString* metalPath = [dirPath stringByAppendingPathComponent:@"metal_batch_prefill_attention.metal"];
-    NSString* metalSource = [NSString stringWithContentsOfFile:metalPath encoding:NSUTF8StringEncoding error:&error];
     
-    if (error || !metalSource) {
-        std::cerr << "MetalBatchPrefillHandle: Failed to load Metal source: " 
-                  << (error ? error.localizedDescription.UTF8String : "file not found") << std::endl;
+    // Load all Metal source files and combine them
+    NSMutableString* combinedSource = [[NSMutableString alloc] init];
+    
+    // List of Metal files to load (in dependency order)
+    NSArray* metalFiles = @[
+        @"metal_attention_common.metal",        // Common utilities (must be first)
+        @"metal_attention_baseline.metal",      // Baseline kernels
+        @"metal_attention_simdgroup_opt.metal", // Optimized kernels  
+        @"metal_batch_prefill_attention.metal"  // Original kernels (backward compatibility)
+    ];
+    
+    for (NSString* filename in metalFiles) {
+        NSString* metalPath = [dirPath stringByAppendingPathComponent:filename];
+        NSString* metalSource = [NSString stringWithContentsOfFile:metalPath encoding:NSUTF8StringEncoding error:&error];
+        
+        if (error || !metalSource) {
+            std::cerr << "MetalBatchPrefillHandle: Failed to load Metal source (" 
+                      << filename.UTF8String << "): " 
+                      << (error ? error.localizedDescription.UTF8String : "file not found") << std::endl;
+            delete handle;
+            return nullptr;
+        }
+        
+        [combinedSource appendString:metalSource];
+        [combinedSource appendString:@"\n\n"]; // Add spacing between files
+        error = nil; // Reset error for next iteration
+    }
+    
+    if (combinedSource.length == 0) {
+        std::cerr << "MetalBatchPrefillHandle: No Metal source loaded" << std::endl;
         delete handle;
         return nullptr;
     }
     
-    handle->library = [handle->device newLibraryWithSource:metalSource options:nil error:&error];
+    handle->library = [handle->device newLibraryWithSource:combinedSource options:nil error:&error];
     if (!handle->library || error) {
         std::cerr << "MetalBatchPrefillHandle: Failed to compile Metal library: " 
                   << (error ? error.localizedDescription.UTF8String : "unknown error") << std::endl;
@@ -163,7 +190,9 @@ MetalBatchPrefillHandle* metal_batch_prefill_create_handle(
         return nullptr;
     }
     
-    // Create compute pipeline states
+    // Create compute pipeline states for all kernel variants
+    
+    // Original unified kernels (maintained for backward compatibility)
     id<MTLFunction> bf16_function = [handle->library newFunctionWithName:@"batch_prefill_attention_unified_bf16_kernel"];
     if (bf16_function) {
         handle->pipeline_bf16 = [handle->device newComputePipelineStateWithFunction:bf16_function error:&error];
@@ -178,6 +207,44 @@ MetalBatchPrefillHandle* metal_batch_prefill_create_handle(
         handle->pipeline_f32 = [handle->device newComputePipelineStateWithFunction:f32_function error:&error];
         if (error) {
             std::cerr << "MetalBatchPrefillHandle: Failed to create F32 pipeline: " 
+                      << error.localizedDescription.UTF8String << std::endl;
+        }
+    }
+    
+    // Baseline reference kernels
+    id<MTLFunction> bf16_baseline_function = [handle->library newFunctionWithName:@"batch_prefill_attention_unified_bf16_baseline_kernel"];
+    if (bf16_baseline_function) {
+        handle->pipeline_bf16_baseline = [handle->device newComputePipelineStateWithFunction:bf16_baseline_function error:&error];
+        if (error) {
+            std::cerr << "MetalBatchPrefillHandle: Failed to create BF16 baseline pipeline: " 
+                      << error.localizedDescription.UTF8String << std::endl;
+        }
+    }
+    
+    id<MTLFunction> f32_baseline_function = [handle->library newFunctionWithName:@"batch_prefill_attention_unified_f32_baseline_kernel"];
+    if (f32_baseline_function) {
+        handle->pipeline_f32_baseline = [handle->device newComputePipelineStateWithFunction:f32_baseline_function error:&error];
+        if (error) {
+            std::cerr << "MetalBatchPrefillHandle: Failed to create F32 baseline pipeline: " 
+                      << error.localizedDescription.UTF8String << std::endl;
+        }
+    }
+    
+    // Simdgroup optimized kernels (Priority 0)
+    id<MTLFunction> bf16_simdgroup_function = [handle->library newFunctionWithName:@"batch_prefill_attention_unified_bf16_simdgroup_kernel"];
+    if (bf16_simdgroup_function) {
+        handle->pipeline_bf16_simdgroup = [handle->device newComputePipelineStateWithFunction:bf16_simdgroup_function error:&error];
+        if (error) {
+            std::cerr << "MetalBatchPrefillHandle: Failed to create BF16 simdgroup pipeline: " 
+                      << error.localizedDescription.UTF8String << std::endl;
+        }
+    }
+    
+    id<MTLFunction> f32_simdgroup_function = [handle->library newFunctionWithName:@"batch_prefill_attention_unified_f32_simdgroup_kernel"];
+    if (f32_simdgroup_function) {
+        handle->pipeline_f32_simdgroup = [handle->device newComputePipelineStateWithFunction:f32_simdgroup_function error:&error];
+        if (error) {
+            std::cerr << "MetalBatchPrefillHandle: Failed to create F32 simdgroup pipeline: " 
                       << error.localizedDescription.UTF8String << std::endl;
         }
     }
@@ -289,6 +356,142 @@ MetalBatchPrefillWorkspace metal_batch_prefill_get_workspace(
 }
 
 // ============================================================================
+// Kernel Selection Logic
+// ============================================================================
+
+namespace {
+    using namespace metal::memory;
+    
+    // Helper function to select optimal kernel based on problem size, memory constraints, and device capabilities
+    id<MTLComputePipelineState> select_bf16_kernel(
+        MetalBatchPrefillHandle* handle,
+        KernelOptimizationLevel opt_level,
+        int num_tokens,
+        int total_kv_len,
+        int head_size,
+        int page_size,
+        bool debug_memory = false
+    ) {
+        // Get optimal memory configuration
+        OptimalKernelConfig memory_config = AttentionMemoryManager::get_optimal_config(
+            head_size, page_size, false); // BF16
+        
+        if (debug_memory) {
+            std::cout << "🧮 Memory-aware kernel selection for BF16:" << std::endl;
+            std::cout << "   📊 Requested head_size: " << head_size << std::endl;
+            std::cout << "   🎯 Strategy: " << memory_config.strategy << std::endl;
+            AttentionMemoryManager::print_memory_analysis(head_size, page_size, false, false);
+            AttentionMemoryManager::print_memory_analysis(head_size, page_size, false, true);
+        }
+        
+        // Handle memory constraints
+        if (memory_config.force_baseline) {
+            if (debug_memory) {
+                std::cout << "   🔄 Forced to use baseline due to memory constraints" << std::endl;
+            }
+            return handle->pipeline_bf16_baseline ? handle->pipeline_bf16_baseline : handle->pipeline_bf16;
+        }
+        
+        // Handle head size that requires partitioning
+        if (memory_config.num_threadgroups_per_head > 1) {
+            if (debug_memory) {
+                std::cout << "   ⚠️ Large head size requires " << memory_config.num_threadgroups_per_head 
+                          << " threadgroups - using baseline for safety" << std::endl;
+            }
+            // For now, fall back to baseline for multi-threadgroup scenarios
+            // TODO: Implement head partitioning in future optimization
+            return handle->pipeline_bf16_baseline ? handle->pipeline_bf16_baseline : handle->pipeline_bf16;
+        }
+        
+        // Memory-optimized selection logic
+        switch (opt_level) {
+            case KernelOptimizationLevel::BASELINE:
+                return handle->pipeline_bf16_baseline ? handle->pipeline_bf16_baseline : handle->pipeline_bf16;
+                
+            case KernelOptimizationLevel::SIMDGROUP_OPT:
+                return handle->pipeline_bf16_simdgroup ? handle->pipeline_bf16_simdgroup : handle->pipeline_bf16_baseline;
+                
+            case KernelOptimizationLevel::AUTO:
+            default:
+                // Auto selection based on memory constraints and problem characteristics
+                // Priority 0 optimizations are most effective for small sequences (128-512 tokens)
+                // where thread utilization is a major bottleneck
+                if (total_kv_len <= 512 && head_size <= 128) {
+                    // Small sequences: prefer simdgroup if memory allows
+                    return handle->pipeline_bf16_simdgroup ? handle->pipeline_bf16_simdgroup : handle->pipeline_bf16_baseline;
+                } else {
+                    // Large sequences: use baseline (simdgroup overhead not worth it)
+                    return handle->pipeline_bf16_baseline ? handle->pipeline_bf16_baseline : handle->pipeline_bf16;
+                }
+        }
+    }
+    
+    id<MTLComputePipelineState> select_f32_kernel(
+        MetalBatchPrefillHandle* handle,
+        KernelOptimizationLevel opt_level,
+        int num_tokens,
+        int total_kv_len,
+        int head_size,
+        int page_size,
+        bool debug_memory = false
+    ) {
+        // F32 uses 4x more memory than BF16, so memory constraints are more severe
+        OptimalKernelConfig memory_config = AttentionMemoryManager::get_optimal_config(
+            head_size, page_size, true); // F32
+        
+        if (debug_memory) {
+            std::cout << "🧮 Memory-aware kernel selection for F32:" << std::endl;
+            std::cout << "   📊 Requested head_size: " << head_size << std::endl;
+            std::cout << "   🎯 Strategy: " << memory_config.strategy << std::endl;
+            AttentionMemoryManager::print_memory_analysis(head_size, page_size, true, false);
+            AttentionMemoryManager::print_memory_analysis(head_size, page_size, true, true);
+        }
+        
+        // F32 kernels are much more memory constrained - be conservative
+        if (memory_config.force_baseline || memory_config.num_threadgroups_per_head > 1) {
+            if (debug_memory) {
+                std::cout << "   🔄 Using baseline due to F32 memory constraints" << std::endl;
+            }
+            return handle->pipeline_f32_baseline ? handle->pipeline_f32_baseline : handle->pipeline_f32;
+        }
+        
+        // F32 memory-optimized selection logic
+        switch (opt_level) {
+            case KernelOptimizationLevel::BASELINE:
+                return handle->pipeline_f32_baseline ? handle->pipeline_f32_baseline : handle->pipeline_f32;
+                
+            case KernelOptimizationLevel::SIMDGROUP_OPT:
+                // Check if simdgroup kernel fits in memory
+                if (handle->pipeline_f32_simdgroup) {
+                    AttentionMemoryLayout simdgroup_layout = AttentionMemoryManager::calculate_memory_usage(
+                        head_size, page_size, true, false);
+                    if (!simdgroup_layout.exceeds_limit()) {
+                        return handle->pipeline_f32_simdgroup;
+                    }
+                }
+                // Fall back to baseline if simdgroup doesn't fit
+                return handle->pipeline_f32_baseline ? handle->pipeline_f32_baseline : handle->pipeline_f32;
+                
+            case KernelOptimizationLevel::AUTO:
+            default:
+                // For F32, be more conservative due to memory constraints
+                if (total_kv_len <= 256 && head_size <= 64) { // Much smaller thresholds for F32
+                    // Only use simdgroup for very small problems with F32
+                    if (handle->pipeline_f32_simdgroup) {
+                        AttentionMemoryLayout simdgroup_layout = AttentionMemoryManager::calculate_memory_usage(
+                            head_size, page_size, true, false);
+                        if (!simdgroup_layout.exceeds_limit()) {
+                            return handle->pipeline_f32_simdgroup;
+                        }
+                    }
+                }
+                // Default to baseline for F32 due to memory constraints
+                return handle->pipeline_f32_baseline ? handle->pipeline_f32_baseline : handle->pipeline_f32;
+        }
+    }
+}
+
+// ============================================================================
 // New Handle-Based Attention Functions
 // ============================================================================
 
@@ -312,7 +515,8 @@ void batch_prefill_attention_unified_bf16(
     int num_query_heads,
     int num_kv_heads,
     float scale,
-    int num_kv_pages
+    int num_kv_pages,
+    KernelOptimizationLevel opt_level
 ) {
     if (!handle || !handle->initialized || !workspace_buffer) {
         std::cerr << "batch_prefill_attention_unified_bf16: Invalid handle or workspace" << std::endl;
@@ -425,11 +629,22 @@ void batch_prefill_attention_unified_bf16(
                                                                    options:MTLResourceStorageModeShared
                                                               deallocator:nil];
         
+        // Select optimal kernel based on problem characteristics and memory constraints
+        // Estimate total_kv_len (this is a rough estimate - exact calculation happens in kernel)
+        int estimated_total_kv_len = (num_kv_pages > 0) ? (num_kv_pages - 1) * page_size + page_size : 0;
+        id<MTLComputePipelineState> selected_pipeline = select_bf16_kernel(
+            handle, opt_level, num_qo, estimated_total_kv_len, head_size, page_size, true); // Enable debug for large heads
+        
+        if (!selected_pipeline) {
+            std::cerr << "batch_prefill_attention_unified_bf16: No suitable kernel found" << std::endl;
+            return;
+        }
+        
         // Execute Metal kernel
         id<MTLCommandBuffer> cmd = [handle->commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         
-        [enc setComputePipelineState:handle->pipeline_bf16];
+        [enc setComputePipelineState:selected_pipeline];
         [enc setBuffer:q_buf offset:0 atIndex:0];
         [enc setBuffer:k_buf offset:0 atIndex:1];
         [enc setBuffer:v_buf offset:0 atIndex:2];
@@ -465,7 +680,7 @@ void batch_prefill_attention_unified_bf16(
             if (retries > 0) {
                 cmd = [handle->commandQueue commandBuffer];
                 enc = [cmd computeCommandEncoder];
-                [enc setComputePipelineState:handle->pipeline_bf16];
+                [enc setComputePipelineState:selected_pipeline];
                 [enc setBuffer:q_buf offset:0 atIndex:0];
                 [enc setBuffer:k_buf offset:0 atIndex:1];
                 [enc setBuffer:v_buf offset:0 atIndex:2];
@@ -524,7 +739,8 @@ void batch_prefill_attention_unified_f32(
     int num_query_heads,
     int num_kv_heads,
     float scale,
-    int num_kv_pages
+    int num_kv_pages,
+    KernelOptimizationLevel opt_level
 ) {
     @autoreleasepool {
         if (!handle || !handle->device || !handle->pipeline_f32) {
@@ -620,11 +836,21 @@ void batch_prefill_attention_unified_f32(
                                                                     options:MTLResourceStorageModeShared
                                                                deallocator:nil];
         
+        // Select optimal kernel based on problem characteristics and memory constraints  
+        int estimated_total_kv_len = (num_kv_pages > 0) ? (num_kv_pages - 1) * page_size + page_size : 0;
+        id<MTLComputePipelineState> selected_pipeline = select_f32_kernel(
+            handle, opt_level, num_qo, estimated_total_kv_len, head_size, page_size, true); // Enable debug for F32 memory analysis
+        
+        if (!selected_pipeline) {
+            std::cerr << "batch_prefill_attention_unified_f32: No suitable kernel found" << std::endl;
+            return;
+        }
+        
         // Create command buffer and encoder
         id<MTLCommandBuffer> cmd = [handle->commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         
-        [enc setComputePipelineState:handle->pipeline_f32];
+        [enc setComputePipelineState:selected_pipeline];
         [enc setBuffer:q_buf offset:0 atIndex:0];
         [enc setBuffer:pk_buf offset:0 atIndex:1];
         [enc setBuffer:pv_buf offset:0 atIndex:2];

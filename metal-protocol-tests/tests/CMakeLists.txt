@@ -83,6 +83,20 @@ add_executable(test_batch_attention_unit
 )
 target_link_libraries(test_batch_attention_unit ${COMMON_LIBRARIES} ${BACKEND_LIBS})
 
+# Kernel selection test
+add_executable(test_kernel_selection_unit
+    src/unit/test_kernel_selection.mm
+    ${BACKEND_SOURCES}
+)
+target_link_libraries(test_kernel_selection_unit ${COMMON_LIBRARIES} ${BACKEND_LIBS})
+
+# Memory management test
+add_executable(test_memory_management_unit
+    src/unit/test_memory_management.mm
+    ${BACKEND_SOURCES}
+)
+target_link_libraries(test_memory_management_unit ${COMMON_LIBRARIES} ${BACKEND_LIBS})
+
 # ============================================================================
 # Integration Tests (Full workflows - medium execution time)
 # ============================================================================
@@ -156,6 +170,20 @@ add_executable(test_attention_algorithm_comparison
 )
 target_link_libraries(test_attention_algorithm_comparison ${COMMON_LIBRARIES} ${BACKEND_LIBS})
 
+# Quick performance validation
+add_executable(test_quick_performance_validation
+    src/performance/quick_performance_validation.mm
+    ${BACKEND_SOURCES}
+)
+target_link_libraries(test_quick_performance_validation ${COMMON_LIBRARIES} ${BACKEND_LIBS})
+
+# Full attention performance benchmark
+add_executable(test_attention_performance_benchmark
+    src/performance/attention_performance_benchmark.mm
+    ${BACKEND_SOURCES}
+)
+target_link_libraries(test_attention_performance_benchmark ${COMMON_LIBRARIES} ${BACKEND_LIBS})
+
 # ============================================================================
 # Compatibility Tests (API compatibility checks)
 # ============================================================================
@@ -183,8 +211,10 @@ add_custom_target(run_unit_tests
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_extract_k_values_unit
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_topk_mask_unit
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_batch_attention_unit
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_kernel_selection_unit
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_memory_management_unit
     COMMAND echo "✅ Unit tests completed"
-    DEPENDS test_softmax_unit test_extract_k_values_unit test_topk_mask_unit test_batch_attention_unit
+    DEPENDS test_softmax_unit test_extract_k_values_unit test_topk_mask_unit test_batch_attention_unit test_kernel_selection_unit test_memory_management_unit
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -215,8 +245,10 @@ add_custom_target(run_stress_tests
 add_custom_target(run_performance_tests
     COMMAND echo "=== Running Performance Tests (10+ minutes) ==="
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_performance_suite
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_quick_performance_validation
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_attention_performance_benchmark
     COMMAND echo "✅ Performance tests completed"
-    DEPENDS test_performance_suite
+    DEPENDS test_performance_suite test_quick_performance_validation test_attention_performance_benchmark
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -224,8 +256,9 @@ add_custom_target(run_performance_tests
 add_custom_target(run_algorithm_validation
     COMMAND echo "=== Running Algorithmic Optimization Validation ==="
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_attention_algorithm_comparison
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/bin/test_quick_performance_validation
     COMMAND echo "✅ Algorithm validation completed"
-    DEPENDS test_attention_algorithm_comparison
+    DEPENDS test_attention_algorithm_comparison test_quick_performance_validation
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -266,12 +299,12 @@ add_custom_target(clean_organized_tests
 # Test statistics
 add_custom_target(test_stats
     COMMAND echo "=== Organized Test Suite Statistics ==="
-    COMMAND echo "Unit Tests:         4 tests  (under 1 minute)"
+    COMMAND echo "Unit Tests:         6 tests  (under 1 minute)"
     COMMAND echo "Integration Tests:  5 tests  (2-5 minutes)"
     COMMAND echo "Stress Tests:       2 tests  (5-10 minutes)"
-    COMMAND echo "Performance Tests:  1 test   (10+ minutes)"
+    COMMAND echo "Performance Tests:  3 tests  (10+ minutes)"
     COMMAND echo "Compatibility Tests: 2 tests (varies)"
-    COMMAND echo "Total:             14 tests"
+    COMMAND echo "Total:             18 tests"
     COMMAND echo ""
     COMMAND echo "Available targets:"
     COMMAND echo "  run_smoke_tests        - Unit tests only (fastest)"
@@ -286,6 +319,6 @@ add_custom_target(test_stats
 )
 
 message(STATUS "Organized Metal Protocol Test Suite configured")
-message(STATUS "Total tests: 14 (reduced from 31+ redundant tests)")
-message(STATUS "Structure: unit(4) + integration(5) + stress(2) + performance(1) + compatibility(2)")
+message(STATUS "Total tests: 18 (reduced from 31+ redundant tests)")
+message(STATUS "Structure: unit(6) + integration(5) + stress(2) + performance(3) + compatibility(2)")
 message(STATUS "Use 'make test_stats' to see available targets")

@@ -21,9 +21,17 @@ struct MetalBatchPrefillHandle {
     id<MTLCommandQueue> commandQueue;
     id<MTLLibrary> library;
     
-    // Pipeline states for different kernels
+    // Pipeline states for different kernels and optimization levels
     id<MTLComputePipelineState> pipeline_bf16;
     id<MTLComputePipelineState> pipeline_f32;
+    
+    // Baseline reference kernels
+    id<MTLComputePipelineState> pipeline_bf16_baseline;
+    id<MTLComputePipelineState> pipeline_f32_baseline;
+    
+    // Simdgroup optimized kernels (Priority 0)
+    id<MTLComputePipelineState> pipeline_bf16_simdgroup;
+    id<MTLComputePipelineState> pipeline_f32_simdgroup;
     
     // Configuration bounds (for validation)
     int max_batch_size;
@@ -37,6 +45,16 @@ struct MetalBatchPrefillHandle {
     
     // Internal state
     bool initialized;
+};
+
+/**
+ * @brief Kernel optimization level selection
+ * Controls which kernel variant to use at runtime
+ */
+enum class KernelOptimizationLevel {
+    BASELINE,      // Reference implementation for correctness validation
+    SIMDGROUP_OPT, // Priority 0: Simdgroup reductions and optimizations
+    AUTO           // Automatic selection based on problem size and device capabilities
 };
 
 /**
@@ -147,6 +165,7 @@ MetalBatchPrefillWorkspace metal_batch_prefill_get_workspace(
  * @param num_kv_heads Number of KV heads (for MQA/GQA)
  * @param scale Attention scaling factor (usually 1/sqrt(head_size))
  * @param num_kv_pages Total number of KV cache pages
+ * @param opt_level Kernel optimization level (default: AUTO)
  */
 void batch_prefill_attention_unified_bf16(
     MetalBatchPrefillHandle* handle,
@@ -168,7 +187,8 @@ void batch_prefill_attention_unified_bf16(
     int num_query_heads,
     int num_kv_heads,
     float scale,
-    int num_kv_pages
+    int num_kv_pages,
+    KernelOptimizationLevel opt_level = KernelOptimizationLevel::AUTO
 );
 
 /**
@@ -195,7 +215,8 @@ void batch_prefill_attention_unified_f32(
     int num_query_heads,
     int num_kv_heads,
     float scale,
-    int num_kv_pages
+    int num_kv_pages,
+    KernelOptimizationLevel opt_level = KernelOptimizationLevel::AUTO
 );
 
 // ============================================================================
