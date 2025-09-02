@@ -8,6 +8,29 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Enable Objective-C++ for Metal integration
 enable_language(OBJCXX)
 
+# Use libc++ explicitly and ensure headers are discoverable on macOS
+if(APPLE)
+    # Prefer libc++ for both C++ and Objective-C++
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+    set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -stdlib=libc++")
+
+    # Detect the SDK C++ headers path (works with Command Line Tools and full Xcode)
+    execute_process(
+        COMMAND xcrun --show-sdk-path
+        OUTPUT_VARIABLE SDK_ROOT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    set(CXX_STDLIB_PATH "${SDK_ROOT}/usr/include/c++/v1")
+    if(EXISTS "${CXX_STDLIB_PATH}/cstdint")
+        # Add as a system include to avoid warnings from standard headers
+        include_directories(SYSTEM ${CXX_STDLIB_PATH})
+        message(STATUS "Using C++ stdlib from: ${CXX_STDLIB_PATH}")
+    else()
+        message(WARNING "C++ stdlib headers not found at expected location: ${CXX_STDLIB_PATH}")
+        message(WARNING "You may need to install Xcode Command Line Tools: xcode-select --install")
+    endif()
+endif()
+
 # Optimization options
 option(USE_SIMDGROUP_REDUCTIONS "Enable Metal simdgroup optimizations for attention kernels" OFF)
 

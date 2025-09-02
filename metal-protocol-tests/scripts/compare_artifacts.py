@@ -156,33 +156,33 @@ class ArtifactComparator:
             # For top-k masking, what matters is that the same indices are kept (non-infinity)
             cuda_kept_mask = np.isfinite(cuda_f64)
             metal_kept_mask = np.isfinite(metal_f64)
-            
+
             # Check if the same indices are preserved
             indices_match = np.array_equal(cuda_kept_mask, metal_kept_mask)
-            
+
             if indices_match:
                 # If indices match, compare only the finite values
                 cuda_finite = cuda_f64[cuda_kept_mask]
                 metal_finite = metal_f64[metal_kept_mask]
-                
+
                 if len(cuda_finite) > 0:
                     abs_diff_finite = np.abs(cuda_finite - metal_finite)
                     max_abs_error = np.max(abs_diff_finite)
                     mean_abs_error = np.mean(abs_diff_finite)
-                    
+
                     cuda_abs_finite = np.abs(cuda_finite)
-                    rel_diff_finite = np.where(cuda_abs_finite > 1e-10, 
+                    rel_diff_finite = np.where(cuda_abs_finite > 1e-10,
                                              abs_diff_finite / cuda_abs_finite, 0.0)
                     max_rel_error = np.max(rel_diff_finite)
                     mean_rel_error = np.mean(rel_diff_finite)
                 else:
                     max_abs_error = mean_abs_error = max_rel_error = mean_rel_error = 0.0
-                
+
                 # Check tolerance on finite values only
                 abs_pass = max_abs_error <= self.abs_tolerance
                 rel_pass = max_rel_error <= self.rel_tolerance
                 status = 'PASS' if (abs_pass or rel_pass) else 'FAIL'
-                
+
                 return {
                     'status': status,
                     'max_abs_error': max_abs_error,
@@ -268,35 +268,35 @@ class ArtifactComparator:
 
         return result
 
-    def _compare_extract_k_values(self, cuda_tensor: np.ndarray, metal_tensor: np.ndarray, 
+    def _compare_extract_k_values(self, cuda_tensor: np.ndarray, metal_tensor: np.ndarray,
                                  tensor_name: str, cuda_f64: np.ndarray, metal_f64: np.ndarray) -> Dict[str, Any]:
         """Special comparison logic for extract_k_values that handles different ordering"""
-        
+
         # For extract_k_values, we need to compare sets of (value, index) pairs per row
         # The operation extracts k non-infinity values per row, but CUDA and Metal may extract in different order
-        
+
         if tensor_name == "A":
             # Input tensor should match exactly (it's the same input data)
             # Handle infinities properly: when both values are the same infinity, treat as exact match
             same_inf_mask = np.isinf(cuda_f64) & np.isinf(metal_f64) & (np.sign(cuda_f64) == np.sign(metal_f64))
-            
+
             # Compute absolute difference; set positions of same-signed infinities to zero explicitly
             raw_abs_diff = np.abs(cuda_f64 - metal_f64)
             abs_diff = np.where(same_inf_mask, 0.0, raw_abs_diff)
             max_abs_error = np.max(abs_diff)
             mean_abs_error = np.mean(abs_diff)
-            
+
             # Handle relative error with infinities
             cuda_abs = np.abs(cuda_f64)
             raw_rel = np.where(cuda_abs > 1e-10, abs_diff / cuda_abs, 0.0)
             rel_diff = np.where(same_inf_mask, 0.0, raw_rel)
             max_rel_error = np.max(rel_diff)
             mean_rel_error = np.mean(rel_diff)
-            
+
             abs_ok = max_abs_error <= self.abs_tolerance
             rel_ok = max_rel_error <= self.rel_tolerance
             status = 'PASS' if (abs_ok or rel_ok) else 'FAIL'
-            
+
             return {
                 'status': status,
                 'max_abs_error': max_abs_error,
@@ -307,9 +307,9 @@ class ArtifactComparator:
                 'rel_tolerance_pass': rel_ok,
                 'notes': "extract_k_values input matrix (A) - standard comparison"
             }
-        
+
         # For V (values) and I (indices), we need to compare sets per row
-        # Get shape info from metadata or infer from tensor dimensions  
+        # Get shape info from metadata or infer from tensor dimensions
         if len(cuda_tensor.shape) == 2:
             M, k = cuda_tensor.shape
         else:
@@ -317,57 +317,57 @@ class ArtifactComparator:
             M = cuda_tensor.shape[0] // 50  # Assume k=50 for now
             k = 50
             if M * k != cuda_tensor.size:
-                M = 1  
+                M = 1
                 k = cuda_tensor.size
-        
+
         total_mismatches = 0
         max_abs_error = 0.0
-        max_rel_error = 0.0  
+        max_rel_error = 0.0
         mean_abs_error = 0.0
         mean_rel_error = 0.0
-        
+
         for row in range(M):
             row_start = row * k
             row_end = row_start + k
-            
+
             cuda_row = cuda_f64[row_start:row_end] if cuda_f64.ndim == 1 else cuda_f64[row, :]
             metal_row = metal_f64[row_start:row_end] if metal_f64.ndim == 1 else metal_f64[row, :]
-            
+
             if tensor_name == "V":
                 # For values, compare sets (ignoring order)
                 cuda_sorted = np.sort(cuda_row)
                 metal_sorted = np.sort(metal_row)
-                
+
                 abs_diff = np.abs(cuda_sorted - metal_sorted)
                 row_max_abs = np.max(abs_diff)
                 row_mean_abs = np.mean(abs_diff)
-                
+
                 cuda_abs = np.abs(cuda_sorted)
                 rel_diff = np.where(cuda_abs > 1e-10, abs_diff / cuda_abs, 0.0)
                 row_max_rel = np.max(rel_diff)
                 row_mean_rel = np.mean(rel_diff)
-                
+
                 max_abs_error = max(max_abs_error, row_max_abs)
                 max_rel_error = max(max_rel_error, row_max_rel)
                 mean_abs_error += row_mean_abs
                 mean_rel_error += row_mean_rel
-                
+
             elif tensor_name == "I":
                 # For indices, check if same set of indices (order doesn't matter)
                 cuda_set = set(cuda_row.astype(int))
                 metal_set = set(metal_row.astype(int))
-                
+
                 if cuda_set != metal_set:
                     total_mismatches += 1
                     # For reporting, compute some error metrics
                     abs_diff = np.abs(cuda_row - metal_row)
                     row_max_abs = np.max(abs_diff)
                     max_abs_error = max(max_abs_error, row_max_abs)
-        
+
         if M > 0:
             mean_abs_error /= M
             mean_rel_error /= M
-        
+
         if tensor_name == "I":
             # For indices, success means all rows have matching sets
             status = 'PASS' if total_mismatches == 0 else 'FAIL'
@@ -380,12 +380,12 @@ class ArtifactComparator:
             rel_ok = max_rel_error <= self.rel_tolerance
             status = 'PASS' if (abs_ok or rel_ok) else 'FAIL'
             notes = f"extract_k_values values (V) - compared sorted value sets per row"
-        
+
         return {
             'status': status,
             'max_abs_error': max_abs_error,
             'max_rel_error': max_rel_error,
-            'mean_abs_error': mean_abs_error,  
+            'mean_abs_error': mean_abs_error,
             'mean_rel_error': mean_rel_error,
             'abs_tolerance_pass': max_abs_error <= self.abs_tolerance,
             'rel_tolerance_pass': max_rel_error <= self.rel_tolerance,

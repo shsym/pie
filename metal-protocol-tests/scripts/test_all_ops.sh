@@ -52,6 +52,16 @@ else
 fi
 echo
 
+# Check if python is available and numpy is installed
+if ! command -v python3 &> /dev/null; then
+    echo "Python3 is not installed. Please install Python3 to run the tests."
+    exit 1
+fi
+if ! python3 -c "import numpy" &> /dev/null; then
+    echo "Numpy is not installed. Please install numpy (e.g., via 'pip install numpy') to run the tests."
+    exit 1
+fi
+
 # Test all 10 implemented operations
 operations=(
     "embedding_lookup --num_tokens 8 --hidden_size 128 --vocab_size 1000"
