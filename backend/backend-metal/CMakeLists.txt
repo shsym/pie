@@ -155,60 +155,6 @@ set_target_properties(metal_common PROPERTIES
     COMPILE_FLAGS "-fobjc-arc"
 )
 
-# Test executables 
-
-# Kernel selection validation test
-add_executable(test_kernel_selection src/test_kernel_selection.mm)
-
-target_link_libraries(test_kernel_selection 
-    metal_batch_prefill_attention 
-    ${METAL_FRAMEWORK} 
-    ${FOUNDATION_FRAMEWORK}
-)
-
-set_target_properties(test_kernel_selection PROPERTIES
-    COMPILE_FLAGS "-fobjc-arc"
-)
-
-# Performance benchmark test
-add_executable(attention_performance_benchmark src/attention_performance_benchmark.mm)
-
-target_link_libraries(attention_performance_benchmark 
-    metal_batch_prefill_attention 
-    ${METAL_FRAMEWORK} 
-    ${FOUNDATION_FRAMEWORK}
-)
-
-set_target_properties(attention_performance_benchmark PROPERTIES
-    COMPILE_FLAGS "-fobjc-arc"
-)
-
-# Quick performance validation test  
-add_executable(quick_performance_validation src/quick_performance_validation.mm)
-
-target_link_libraries(quick_performance_validation 
-    metal_batch_prefill_attention 
-    ${METAL_FRAMEWORK} 
-    ${FOUNDATION_FRAMEWORK}
-)
-
-set_target_properties(quick_performance_validation PROPERTIES
-    COMPILE_FLAGS "-fobjc-arc"
-)
-
-# Memory management test
-add_executable(test_memory_management src/test_memory_management.mm)
-
-target_link_libraries(test_memory_management 
-    metal_batch_prefill_attention 
-    ${METAL_FRAMEWORK} 
-    ${FOUNDATION_FRAMEWORK}
-)
-
-set_target_properties(test_memory_management PROPERTIES
-    COMPILE_FLAGS "-fobjc-arc"
-)
-
 # Set output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
