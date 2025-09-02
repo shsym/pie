@@ -322,3 +322,8 @@ message(STATUS "Organized Metal Protocol Test Suite configured")
 message(STATUS "Total tests: 18 (reduced from 31+ redundant tests)")
 message(STATUS "Structure: unit(6) + integration(5) + stress(2) + performance(3) + compatibility(2)")
 message(STATUS "Use 'make test_stats' to see available targets")
+
+# Test executable: Simdgroup debug test (standalone)
+add_executable(test_simdgroup_debug src/debug/test_simdgroup_debug.mm ${BACKEND_SOURCES})
+target_link_libraries(test_simdgroup_debug ${COMMON_LIBRARIES} ${BACKEND_LIBS})
+

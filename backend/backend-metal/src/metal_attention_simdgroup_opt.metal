@@ -1,3 +1,9 @@
+#include <metal_stdlib>
+using namespace metal;
+
+// Note: metal_attention_common.metal is loaded first by the Metal library loader
+// All constants and utilities from common.metal are available here
+
 // --- Priority 0 Simdgroup Optimizations ---
 // 1. Simdgroup reductions for block max/sum (reduces barriers from O(log2(128)) to ~1)
 // 2. Split-d parallel score computation (better utilization across head dimension)
@@ -177,7 +183,14 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
                 l_i += l_j;
             }
 
-            // Direct V accumulation without storing weights - eliminates w_block entirely
+            // Store weights for this block (needed for correct V accumulation)
+            threadgroup float w_block[KERNEL_BLOCK_SIZE];
+            if (tid_in_tgp < KERNEL_BLOCK_SIZE) {
+                w_block[tid_in_tgp] = w;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // V accumulation using correct per-key weights
             int dims_per_thread = (head_size + TGP_SIZE - 1) / TGP_SIZE;
             for (int i = 0; i < dims_per_thread; ++i) {
                 int d = tid_in_tgp * dims_per_thread + i;
@@ -185,14 +198,9 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
                     float sum_wv_d = 0.0f;
                     int num_keys_in_block = min((int)KERNEL_BLOCK_SIZE, total_kv_len - block_start);
                     
-                    // Each thread accumulates its assigned dimension across all keys in block
+                    // Use correct per-key weights stored in w_block
                     for (int j = 0; j < num_keys_in_block; ++j) {
-                        int key_thread = j; // Thread that computed weight for key j
-                        float key_weight = (key_thread < KERNEL_BLOCK_SIZE && 
-                                          (block_start + key_thread) < total_kv_len) ?
-                                          exp(score - m_i) : 0.0f; // Recompute weight on-the-fly
-                        
-                        sum_wv_d += key_weight * float(v_block[j][d]);
+                        sum_wv_d += w_block[j] * float(v_block[j][d]);
                     }
                     
                     acc_i[d] += sum_wv_d;
@@ -429,7 +437,14 @@ kernel void batch_prefill_attention_unified_bf16_per_head_kernel(
             l_i += l_j;
         }
 
-        // VECTORIZED V accumulation
+        // Store weights for correct V accumulation
+        threadgroup float w_block[KERNEL_BLOCK_SIZE];
+        if (tid_in_tgp < KERNEL_BLOCK_SIZE) {
+            w_block[tid_in_tgp] = w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // VECTORIZED V accumulation with correct weights
         int dims_per_thread = (head_size + TGP_SIZE - 1) / TGP_SIZE;
         for (int i = 0; i < dims_per_thread; ++i) {
             int d = tid_in_tgp * dims_per_thread + i;
@@ -437,10 +452,9 @@ kernel void batch_prefill_attention_unified_bf16_per_head_kernel(
                 float sum_wv_d = 0.0f;
                 int num_keys_in_block = min((int)KERNEL_BLOCK_SIZE, total_kv_len - block_start);
                 
+                // Use correct per-key weights stored in w_block
                 for (int j = 0; j < num_keys_in_block; ++j) {
-                    // Recompute weight for key j
-                    float key_weight = exp(score - m_i); // Use current thread's score
-                    sum_wv_d += key_weight * float(v_block[j][d]);
+                    sum_wv_d += w_block[j] * float(v_block[j][d]);
                 }
                 
                 acc_i[d] += sum_wv_d;
