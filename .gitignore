@@ -209,6 +209,7 @@ bin/
 logs
 *.log
 .plan
+.docs
 .dev.md
 
 # No MCP files
