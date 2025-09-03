@@ -283,6 +283,9 @@ int main(int argc, char** argv) {
         } else if (args.op == "append_paged_kv_cache") {
             ops::AppendPagedKVCacheConfig cfg{args.num_tokens, args.num_kv_heads, args.head_size, args.page_size, args.max_num_pages, args.batch_size};
             ops::run_append_paged_kv_cache(case_id, cfg, args.seed);
+        } else if (args.op == "add_residual") {
+            ops::AddResidualConfig cfg{args.num_tokens, args.hidden_size};
+            ops::run_add_residual(case_id, cfg, args.seed);
         } else if (args.op == "gemm_all_dtypes") {
             ops::GemmConfig cfg{args.m, args.n, args.k, args.transa, args.transb, args.use_bias};
             ops::run_all_dtypes_for_operation("gemm", case_id, &cfg, args.seed);
@@ -313,6 +316,9 @@ int main(int argc, char** argv) {
         } else if (args.op == "append_paged_kv_cache_all_dtypes") {
             ops::AppendPagedKVCacheConfig cfg{args.num_tokens, args.num_kv_heads, args.head_size, args.page_size, args.max_num_pages, args.batch_size};
             ops::run_all_dtypes_for_operation("append_paged_kv_cache", case_id, &cfg, args.seed);
+        } else if (args.op == "add_residual_all_dtypes") {
+            ops::AddResidualConfig cfg{args.num_tokens, args.hidden_size};
+            ops::run_all_dtypes_for_operation("add_residual", case_id, &cfg, args.seed);
         } else {
             std::cerr << "Unsupported op: " << args.op << std::endl;
             return 2;

@@ -14,7 +14,7 @@ ARTIFACTS_ARCHIVE="$WORKSPACE_ROOT/cuda_artifacts.tar.xz"
 CUDA_ARTIFACTS_SOURCE="$WORKSPACE_ROOT/cuda-protocol-tests/tests/artifacts"
 METAL_ARTIFACTS_TARGET="$WORKSPACE_ROOT/metal-protocol-tests/tests/artifacts"
 LLAMA31_CONFIG="$WORKSPACE_ROOT/cuda-protocol-tests/llama31_configs.json"
-MANIFEST_FILE="$WORKSPACE_ROOT/metal-protocol-tests/tests/artifact_manifest.json"
+MANIFEST_FILE="$WORKSPACE_ROOT/cuda-protocol-tests/tests/artifact_manifest.json"
 MANIFEST_GENERATOR="$SCRIPT_DIR/generate_artifact_manifest.py"
 
 # Colors for output
@@ -46,7 +46,7 @@ print_usage() {
     echo "  ./scripts/artifacts_transfer.sh extract --skip-verification"
     echo ""
     echo "Archive location: cuda_artifacts.tar.xz (workspace root)"
-    echo "Artifacts source: metal-protocol-tests/tests/artifacts/"
+    echo "Artifacts source: cuda-protocol-tests/tests/artifacts/"
     echo "Metal target:     metal-protocol-tests/tests/artifacts/"
 }
 
@@ -194,9 +194,9 @@ compress_artifacts() {
     echo -e "${YELLOW}Step 1/2: Creating uncompressed tar...${NC}"
     tar -cf cuda_artifacts.tar \
         --directory="$WORKSPACE_ROOT" \
-        metal-protocol-tests/tests/artifacts/ \
-        metal-protocol-tests/llama31_configs.json \
-        metal-protocol-tests/tests/artifact_manifest.json 2>/dev/null || true
+        cuda-protocol-tests/tests/artifacts/ \
+        cuda-protocol-tests/llama31_configs.json \
+        cuda-protocol-tests/tests/artifact_manifest.json 2>/dev/null || true
 
     if [ ! -f cuda_artifacts.tar ]; then
         echo -e "${RED}Error: Failed to create tar archive${NC}"
@@ -219,7 +219,7 @@ compress_artifacts() {
 
     # Get archive info
     ARCHIVE_SIZE=$(du -h "$ARTIFACTS_ARCHIVE" | cut -f1)
-    COMPRESSION_RATIO=$(echo "scale=1; $(stat -f%z "$ARTIFACTS_ARCHIVE" 2>/dev/null || stat -c%s "$ARTIFACTS_ARCHIVE") * 100 / $(du -sb "$METAL_ARTIFACTS_TARGET" | cut -f1)" | bc 2>/dev/null || echo "N/A")
+    COMPRESSION_RATIO=$(echo "scale=1; $(stat -f%z "$ARTIFACTS_ARCHIVE" 2>/dev/null || stat -c%s "$ARTIFACTS_ARCHIVE") * 100 / $(du -sb "$CUDA_ARTIFACTS_SOURCE" | cut -f1)" | bc 2>/dev/null || echo "N/A")
 
     echo -e "${GREEN}✅ Compression complete!${NC}"
     echo -e "📦 Archive: ${BLUE}$ARTIFACTS_ARCHIVE${NC}"

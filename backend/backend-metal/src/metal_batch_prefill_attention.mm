@@ -15,6 +15,8 @@
 #include <chrono>
 #include <fstream>
 #include <string>
+#include <filesystem>
+#include "workspace_utils.hpp"
 
 // GPU Configuration Loading
 namespace {
@@ -55,8 +57,13 @@ namespace {
         }
 
         // Try to load configuration from JSON file
-        NSString* configPath = @"/Users/seung-seoblee/Dev/pie/metal-protocol-tests/apple_gpu_configs.json";
-        NSData* jsonData = [NSData dataWithContentsOfFile:configPath];
+        auto workspace_root = workspace_utils::find_workspace_root();
+        NSString* configPath = nil;
+        if (!workspace_root.empty()) {
+            auto config_file_path = workspace_root / "metal-protocol-tests" / "apple_gpu_configs.json";
+            configPath = [NSString stringWithUTF8String:config_file_path.c_str()];
+        }
+        NSData* jsonData = configPath ? [NSData dataWithContentsOfFile:configPath] : nil;
 
         if (jsonData) {
             NSError* error = nil;
