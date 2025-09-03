@@ -292,15 +292,36 @@ int main(int argc, char** argv) {
         } else if (args.op == "extract_k_values_all_dtypes") {
             ops::ExtractKConfig cfg{args.M, args.N, args.k};
             ops::run_all_dtypes_for_operation("extract_k_values", case_id, &cfg, args.seed);
+        } else if (args.op == "rms_norm_all_dtypes") {
+            ops::RMSNormConfig cfg{args.num_tokens, args.hidden_size, args.eps};
+            ops::run_all_dtypes_for_operation("rms_norm", case_id, &cfg, args.seed);
+        } else if (args.op == "silu_and_mul_all_dtypes") {
+            ops::SiLUAndMulConfig cfg{args.num_tokens, args.intermediate_size};
+            ops::run_all_dtypes_for_operation("silu_and_mul", case_id, &cfg, args.seed);
+        } else if (args.op == "rope_all_dtypes") {
+            ops::RoPEConfig cfg{args.num_tokens, args.num_query_heads, args.num_kv_heads, args.head_size, args.rope_theta, args.rope_factor};
+            ops::run_all_dtypes_for_operation("rope", case_id, &cfg, args.seed);
+        } else if (args.op == "softmax_all_dtypes") {
+            ops::SoftmaxConfig cfg{args.batch_size, args.vocab_size, args.temperature};
+            ops::run_all_dtypes_for_operation("softmax", case_id, &cfg, args.seed);
+        } else if (args.op == "topk_mask_logits_all_dtypes") {
+            ops::TopKMaskConfig cfg{args.num_tokens, args.vocab_size, args.k};
+            ops::run_all_dtypes_for_operation("topk_mask_logits", case_id, &cfg, args.seed);
+        } else if (args.op == "batch_prefill_attention_all_dtypes") {
+            ops::BatchPrefillAttentionConfig cfg{args.num_tokens, args.num_query_heads, args.num_kv_heads, args.head_size, args.kv_len, args.page_size};
+            ops::run_all_dtypes_for_operation("batch_prefill_attention", case_id, &cfg, args.seed);
+        } else if (args.op == "append_paged_kv_cache_all_dtypes") {
+            ops::AppendPagedKVCacheConfig cfg{args.num_tokens, args.num_kv_heads, args.head_size, args.page_size, args.max_num_pages, args.batch_size};
+            ops::run_all_dtypes_for_operation("append_paged_kv_cache", case_id, &cfg, args.seed);
         } else {
-            std::cerr << "Unsupported op: " << args.op << "\\n";
+            std::cerr << "Unsupported op: " << args.op << std::endl;
             return 2;
         }
 
-        std::cout << "CUDA golden reference artifacts written under: tests/artifacts/" << args.op << "/" << case_id << "\\n";
+        std::cout << "CUDA golden reference artifacts written under: tests/artifacts/" << args.op << "/" << case_id << std::endl;
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << "\\n";
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
 }

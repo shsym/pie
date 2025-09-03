@@ -14,11 +14,31 @@
 #   GPU=1 scripts/generate_cuda_artifacts.sh production
 #   scripts/generate_cuda_artifacts.sh validation
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")"/../.. && pwd)
+# Detect workspace root more robustly
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [[ "$SCRIPT_DIR" == */cuda-protocol-tests/scripts ]]; then
+    # Running from cuda-protocol-tests/scripts
+    ROOT_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
+else
+    # Try to find workspace root by looking for key directories
+    SEARCH_DIR="$SCRIPT_DIR"
+    while [[ "$SEARCH_DIR" != "/" ]]; do
+        if [[ -d "$SEARCH_DIR/cuda-protocol-tests" && -d "$SEARCH_DIR/metal-protocol-tests" ]]; then
+            ROOT_DIR="$SEARCH_DIR"
+            break
+        fi
+        SEARCH_DIR=$(dirname "$SEARCH_DIR")
+    done
+    if [[ -z "$ROOT_DIR" ]]; then
+        echo "Error: Could not find workspace root containing both cuda-protocol-tests and metal-protocol-tests" >&2
+        exit 1
+    fi
+fi
+
 CUDA_PROJECT_DIR="$ROOT_DIR/cuda-protocol-tests"
 BUILD_DIR="$CUDA_PROJECT_DIR/build"
 BIN="$BUILD_DIR/cuda_protocol_tests"
-ART_DIR="$ROOT_DIR/metal-protocol-tests/tests/artifacts"
+ART_DIR="$ROOT_DIR/cuda-protocol-tests/tests/artifacts"
 CUDA_BACKEND_DIR="$ROOT_DIR/backend/backend-cuda"
 GPU=${GPU:-0}
 CASE_ID=${1:-production}
@@ -39,27 +59,27 @@ validate_operation() {
   local op_name="$1"
   local case_id="$2"
   local op_dir="$ART_DIR/$op_name/$case_id"
-  
+
   if [[ ! -d "$op_dir" ]]; then
     echo "❌ VALIDATION FAILED: No artifacts directory for $op_name/$case_id" >&2
     return 1
   fi
-  
+
   # Find output files (different ops have different output file patterns)
   local output_files=()
   while IFS= read -r -d '' file; do
     output_files+=("$file")
-  done < <(find "$op_dir" -name "output.bin" -o -name "*output*.bin" -o -name "masked_logits.bin" -o -name "q_output.bin" -o -name "k_output.bin" -o -name "V.bin" -o -name "C.bin" -o -name "Y.bin" -o -name "embeddings.bin" -o -name "*cache*.bin" -print0 2>/dev/null)
-  
+  done < <(find "$op_dir" \( -name "output.bin" -o -name "*output*.bin" -o -name "masked_logits.bin" -o -name "q_output.bin" -o -name "k_output.bin" -o -name "V.bin" -o -name "C.bin" -o -name "Y.bin" -o -name "embeddings.bin" -o -name "*cache*.bin" -o -name "A.bin" -o -name "B.bin" -o -name "gate.bin" -o -name "up.bin" \) -print0 2>/dev/null)
+
   if [[ ${#output_files[@]} -eq 0 ]]; then
     echo "⚠️  WARNING: No recognizable output files for $op_name/$case_id" >&2
     return 0  # Not necessarily an error - some ops might have different patterns
   fi
-  
+
   local all_zero_files=()
   local total_files=${#output_files[@]}
   local nonzero_files=0
-  
+
   for output_file in "${output_files[@]}"; do
     if [[ -f "$output_file" && -s "$output_file" ]]; then
       # Check if file has any non-zero bytes in first 1KB
@@ -70,7 +90,7 @@ validate_operation() {
       fi
     fi
   done
-  
+
   if [[ $nonzero_files -eq 0 && ${#all_zero_files[@]} -gt 0 ]]; then
     echo "❌ VALIDATION FAILED: $op_name/$case_id - all output files contain only zeros: ${all_zero_files[*]}" >&2
     return 1
@@ -79,7 +99,7 @@ validate_operation() {
   else
     echo "✅ VALIDATED: $op_name/$case_id - $nonzero_files/$total_files output files contain meaningful data" >&2
   fi
-  
+
   return 0
 }
 
@@ -88,9 +108,10 @@ run_and_validate() {
   local op_name="$1"
   local case_id="$2"
   shift 2
-  
+
   echo "==> Running $op_name with case $case_id"
   if run "$BIN" --op "$op_name" --case "$case_id" "$@"; then
+    sleep 0.5  # Brief delay to ensure files are fully written
     validate_operation "$op_name" "$case_id"
     return $?
   else
@@ -110,6 +131,12 @@ if [[ ! -f "$CUDA_BACKEND_DIR/build/lib/libprefill_kernels.a" || ! -f "$CUDA_BAC
   echo "Error: CUDA backend libraries not found. Please build backend-cuda first:" >&2
   echo "  cd backend/backend-cuda && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j\"\${NPROC:-$(command -v nproc >/dev/null && nproc || echo 1)}\"" >&2
   exit 1
+fi
+
+# Clean up any recursive artifacts directories first
+if [[ -d "$ART_DIR/artifacts" ]]; then
+    echo "==> Cleaning up recursive artifacts directory..."
+    run rm -rf "$ART_DIR/artifacts"
 fi
 
 # Ensure artifacts directory exists
@@ -145,20 +172,20 @@ FAILED_OPS=()
 WARNED_OPS=()
 TOTAL_OPS=0
 
-# Core matmul/activations/normalization  
+# Core matmul/activations/normalization
 run_and_validate gemm "$FULL_CASE_ID" --m 128 --n 4096 --k 4096 || FAILED_OPS+=("gemm")
 TOTAL_OPS=$((TOTAL_OPS + 1))
 
 # Note: embedding_lookup operation creates artifacts under "embedding_lookup_forward" directory
 if run "$BIN" --op embedding_lookup --case "$FULL_CASE_ID" --num_tokens 128 --hidden_size 4096 --vocab_size 32000; then
   validate_operation "embedding_lookup_forward" "$FULL_CASE_ID" || FAILED_OPS+=("embedding_lookup")
-else  
+else
   echo "❌ EXECUTION FAILED: embedding_lookup --case $FULL_CASE_ID" >&2
   FAILED_OPS+=("embedding_lookup")
 fi
 TOTAL_OPS=$((TOTAL_OPS + 1))
 
-run_and_validate extract_k_values "$FULL_CASE_ID" --M 128 --N 4096 --k 50 || FAILED_OPS+=("extract_k_values")  
+run_and_validate extract_k_values "$FULL_CASE_ID" --M 128 --N 4096 --k 50 || FAILED_OPS+=("extract_k_values")
 TOTAL_OPS=$((TOTAL_OPS + 1))
 
 run_and_validate rms_norm "$FULL_CASE_ID" --num_tokens 128 --hidden_size 4096 || FAILED_OPS+=("rms_norm")
@@ -188,17 +215,27 @@ TOTAL_OPS=$((TOTAL_OPS + 1))
 run_and_validate grouped_gemm "$FULL_CASE_ID" --m 128 --n 4096 --k 4096 || FAILED_OPS+=("grouped_gemm")
 TOTAL_OPS=$((TOTAL_OPS + 1))
 
-# Multi-dtype variants for selected ops (creates *_bf16/*_fp32 cases under each op)
-echo "==> Generating multi-dtype variants..."
-run "$BIN" --op gemm_all_dtypes             --case "${FULL_CASE_ID}"
-run "$BIN" --op embedding_lookup_all_dtypes --case "${FULL_CASE_ID}"
-run "$BIN" --op extract_k_values_all_dtypes --case "${FULL_CASE_ID}"
+# Multi-dtype variants for all supported ops (creates *_fp32/*_f16/*_bf16 cases under each op)
+echo "==> Generating multi-dtype variants for all operations..."
+echo "    This generates f16, bf16, and f32 variants for each operation"
+
+# Core operations with all dtypes (using smaller dimensions for gemm to avoid memory issues)
+run "$BIN" --op gemm_all_dtypes             --case "${FULL_CASE_ID}" --m 128 --n 2048 --k 2048
+run "$BIN" --op embedding_lookup_all_dtypes --case "${FULL_CASE_ID}" --num_tokens 128 --hidden_size 4096 --vocab_size 32000
+run "$BIN" --op extract_k_values_all_dtypes --case "${FULL_CASE_ID}" --M 128 --N 4096 --k 50
+run "$BIN" --op rms_norm_all_dtypes         --case "${FULL_CASE_ID}" --num_tokens 128 --hidden_size 4096
+run "$BIN" --op silu_and_mul_all_dtypes     --case "${FULL_CASE_ID}" --num_tokens 128 --intermediate_size 11008
+run "$BIN" --op rope_all_dtypes             --case "${FULL_CASE_ID}" --num_tokens 128 --num_query_heads 32 --num_kv_heads 32 --head_size 128
+run "$BIN" --op softmax_all_dtypes          --case "${FULL_CASE_ID}" --batch_size 2 --vocab_size 32000 --temperature 1.0
+run "$BIN" --op topk_mask_logits_all_dtypes --case "${FULL_CASE_ID}" --num_tokens 128 --vocab_size 32000 --k 50
+run "$BIN" --op batch_prefill_attention_all_dtypes --case "${FULL_CASE_ID}" --num_tokens 128 --num_query_heads 32 --num_kv_heads 8 --head_size 128 --kv_len 2048 --page_size 16
+run "$BIN" --op append_paged_kv_cache_all_dtypes --case "${FULL_CASE_ID}" --num_tokens 128 --num_kv_heads 8 --head_size 128 --page_size 16 --batch_size 2
 
 # Post-process: generate/update manifest if available
 MANIFEST_GENERATOR="$ROOT_DIR/scripts/generate_artifact_manifest.py"
 if [[ -f "$MANIFEST_GENERATOR" ]]; then
   echo "==> Generating artifact manifest..."
-  (cd "$ROOT_DIR/scripts" && python3 generate_artifact_manifest.py generate ../metal-protocol-tests/tests/artifacts) || true
+  (cd "$ROOT_DIR/scripts" && python3 generate_artifact_manifest.py generate "$ART_DIR") || true
 fi
 
 # Validation Summary Report

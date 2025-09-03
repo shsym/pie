@@ -160,6 +160,16 @@ void run_all_dtypes_for_operation(const std::string& op_name, const std::string&
         const auto* cfg = static_cast<const TopKMaskConfig*>(config_ptr);
         std::cout << "Running topk_mask_logits with supported data types (FlashInfer limitation: float only)...\n";
         run_topk_mask_logits_typed<float>(base_case_id, *cfg, seed);
+    } else if (op_name == "batch_prefill_attention") {
+        const auto* cfg = static_cast<const BatchPrefillAttentionConfig*>(config_ptr);
+        std::cout << "Running batch prefill attention with supported data types (FlashInfer limitation: 16-bit only)...\n";
+        run_batch_prefill_attention_typed<__half>(base_case_id, *cfg, seed);
+        run_batch_prefill_attention_typed<__nv_bfloat16>(base_case_id, *cfg, seed);
+    } else if (op_name == "append_paged_kv_cache") {
+        const auto* cfg = static_cast<const AppendPagedKVCacheConfig*>(config_ptr);
+        std::cout << "Running append paged KV cache with supported data types (FlashInfer limitation: 16-bit only)...\n";
+        run_append_paged_kv_cache_typed<__half>(base_case_id, *cfg, seed);
+        run_append_paged_kv_cache_typed<__nv_bfloat16>(base_case_id, *cfg, seed);
     }
 }
 

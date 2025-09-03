@@ -1,5 +1,6 @@
 #include "ops.hpp"
-#include "artifacts.hpp" // host-only artifact helpers for writing/reading artifacts
+#include "artifacts.hpp"
+#include "workspace_utils.hpp" // host-only artifact helpers for writing/reading artifacts
 
 #include <iostream>
 #include <string>
@@ -444,13 +445,9 @@ int main(int argc, char** argv) {
     const std::string comparator_script = comparator_script_path.string();
 
         // Fix cuda_artifacts_dir to be absolute if it's still the default relative path
-        // Prefer cuda-protocol-tests/tests/artifacts; fall back to metal-protocol-tests/tests/artifacts
         if (args.cuda_artifacts_dir == "tests/artifacts") {
-            // exe_dir: <repo>/metal-protocol-tests/build
-            std::filesystem::path candidate_cuda = (exe_dir / "../../cuda-protocol-tests/tests/artifacts").lexically_normal();
-            std::filesystem::path fallback_metal = (exe_dir / "../tests/artifacts").lexically_normal();
-            std::filesystem::path chosen = std::filesystem::exists(candidate_cuda) ? candidate_cuda : fallback_metal;
-            args.cuda_artifacts_dir = chosen.string();
+            auto cuda_artifacts_path = workspace_utils::get_cuda_artifacts_dir();
+            args.cuda_artifacts_dir = cuda_artifacts_path.string();
             std::cout << "Using CUDA artifacts from: " << args.cuda_artifacts_dir << std::endl;
         }
         // Also export for per-op wrappers that look up CUDA inputs directly

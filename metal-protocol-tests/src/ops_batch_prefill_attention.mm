@@ -13,6 +13,7 @@
 #include "metal_helpers.hpp"
 #include "metal_batch_prefill_handle.hpp"
 #include "dtype_utils.hpp"
+#include "workspace_utils.hpp"
 
 namespace ops {
 
@@ -39,7 +40,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
               << ", head_dim=" << head_dim
               << ", page_size=" << page_size
               << ", dtype=" << dtype_info.dtype_str << std::endl;
-    
+
     // Create batch prefill attention handle
     auto* attention_handle = metal::batch_prefill_attention::metal_batch_prefill_create_handle(
         1024,  // max_batch_size
@@ -47,20 +48,17 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
         num_query_heads,
         head_dim  // max_head_dim
     );
-    
+
     if (!attention_handle) {
         std::cerr << "❌ Failed to create batch prefill attention handle" << std::endl;
         return;
     }
 
     // Resolve CUDA artifacts base directory
-    std::filesystem::path cuda_base_dir;
-    if (const char* envp = std::getenv("PIE_CUDA_ARTIFACTS_DIR")) {
-        cuda_base_dir = std::filesystem::path(envp);
-    } else {
-        std::filesystem::path this_file(__FILE__);
-        auto project_root = this_file.parent_path().parent_path(); // .../metal-protocol-tests
-        cuda_base_dir = project_root / "tests" / "artifacts";
+    auto cuda_base_dir = workspace_utils::get_cuda_artifacts_dir();
+    if (cuda_base_dir.empty()) {
+        std::cerr << "Error: Could not find workspace root or CUDA artifacts directory" << std::endl;
+        return;
     }
     std::filesystem::path cuda_case_dir = cuda_base_dir / "batch_prefill_attention" / case_id;
 
@@ -197,7 +195,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
             page_size,
             static_cast<int>(kv_page_indices.size())
         );
-        
+
         // Allocate workspace buffer using device from handle
         id<MTLBuffer> workspace_buffer = [attention_handle->device newBufferWithLength:workspace.total_size
                                                                                options:MTLResourceStorageModeShared];
@@ -205,9 +203,9 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
             std::cerr << "❌ Failed to allocate workspace buffer of size " << workspace.total_size << " bytes" << std::endl;
             return;
         }
-        
+
         std::cout << "📦 Workspace allocated: " << workspace.total_size << " bytes" << std::endl;
-        
+
         auto start = std::chrono::high_resolution_clock::now();
         if (dtype_info.dtype == DType::FP32) {
             std::cout << "✅ Using native f32 kernel with handle-based API" << std::endl;
@@ -215,8 +213,8 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
                 attention_handle,
                 [workspace_buffer contents],
                 [workspace_buffer length],
-                reinterpret_cast<const float*>(q_input.data()), 
-                reinterpret_cast<const float*>(paged_k_cache.data()), 
+                reinterpret_cast<const float*>(q_input.data()),
+                reinterpret_cast<const float*>(paged_k_cache.data()),
                 reinterpret_cast<const float*>(paged_v_cache.data()),
                 qo_indptr.data(), kv_page_indptr.data(), kv_page_indices.data(),
                 kv_last_page_lens.data(), reinterpret_cast<float*>(output.data()),
@@ -351,7 +349,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
 
     // Clean up handle
     metal::batch_prefill_attention::metal_batch_prefill_destroy_handle(attention_handle);
-    
+
     std::cout << "\n✅ Metal Batch Prefill Attention completed successfully" << std::endl;
 }
 

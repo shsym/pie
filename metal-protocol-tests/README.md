@@ -75,7 +75,7 @@ metal-protocol-tests/build/tests/artifacts/
 CUDA artifacts typically live under:
 
 ```text
-metal-protocol-tests/tests/artifacts/
+cuda-protocol-tests/tests/artifacts/
 └── softmax/
    └── production/
 ```

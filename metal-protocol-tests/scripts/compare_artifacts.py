@@ -17,7 +17,7 @@ Examples:
     python scripts/compare_artifacts.py --case production --all-ops
 
     # Custom directories
-    python scripts/compare_artifacts.py --cuda-dir cuda-protocol-tests/tests/artifacts/gemm/test1 --metal-dir tests/artifacts/gemm/test1
+    python scripts/compare_artifacts.py --cuda-dir ../cuda-protocol-tests/tests/artifacts/gemm/test1 --metal-dir tests/artifacts/gemm/test1
 """
 
 import argparse
@@ -606,7 +606,7 @@ def main():
     parser.add_argument('--all-ops', action='store_true', help='Compare all operations for the given case')
 
     # Base directories
-    parser.add_argument('--cuda-base', type=Path, default=Path('cuda-protocol-tests/tests/artifacts'),
+    parser.add_argument('--cuda-base', type=Path, default=Path('../cuda-protocol-tests/tests/artifacts'),
                        help='Base directory for CUDA artifacts')
     parser.add_argument('--metal-base', type=Path, default=Path('tests/artifacts'),
                        help='Base directory for Metal artifacts')

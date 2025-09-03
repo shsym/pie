@@ -13,10 +13,10 @@
 
 namespace ops {
 
-void run_batch_prefill_attention(const std::string& case_id,
+template<typename T>
+void run_batch_prefill_attention_typed(const std::string& case_id,
 								 const BatchPrefillAttentionConfig& cfg,
 								 uint64_t seed) {
-	using T = __nv_bfloat16;
 	using I = int32_t;
 
 	const int num_tokens = cfg.num_tokens;
@@ -289,5 +289,16 @@ void run_batch_prefill_attention(const std::string& case_id,
 	cudaFree(d_q);
 	cudaStreamDestroy(stream);
 }
+
+// Non-templated wrapper that calls the templated version with bf16
+void run_batch_prefill_attention(const std::string& case_id,
+								 const BatchPrefillAttentionConfig& cfg,
+								 uint64_t seed) {
+	run_batch_prefill_attention_typed<__nv_bfloat16>(case_id, cfg, seed);
+}
+
+// Explicit template instantiations (FlashInfer only supports 16-bit types for attention)
+template void run_batch_prefill_attention_typed<__half>(const std::string&, const BatchPrefillAttentionConfig&, uint64_t);
+template void run_batch_prefill_attention_typed<__nv_bfloat16>(const std::string&, const BatchPrefillAttentionConfig&, uint64_t);
 
 } // namespace ops

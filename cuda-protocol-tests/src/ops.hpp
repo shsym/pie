@@ -136,6 +136,11 @@ void run_batch_prefill_attention(const std::string& case_id,
                                  const BatchPrefillAttentionConfig& cfg,
                                  uint64_t seed);
 
+template<typename T>
+void run_batch_prefill_attention_typed(const std::string& case_id,
+                                      const BatchPrefillAttentionConfig& cfg,
+                                      uint64_t seed);
+
 // Grouped GEMM operation test (multiple GEMMs in batch)
 struct GroupedGemmConfig {
     int num_groups;     // Number of separate GEMM operations
@@ -164,6 +169,11 @@ struct AppendPagedKVCacheConfig {
 void run_append_paged_kv_cache(const std::string& case_id,
                                const AppendPagedKVCacheConfig& cfg,
                                uint64_t seed);
+
+template<typename T>
+void run_append_paged_kv_cache_typed(const std::string& case_id,
+                                    const AppendPagedKVCacheConfig& cfg,
+                                    uint64_t seed);
 
 // Template versions of operations for multi-dtype testing
 template<typename T>
