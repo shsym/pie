@@ -426,14 +426,8 @@ def run_zmq_server(router, engine, config, model_metadata):
                             num_available_embeddings=config.get("max_num_embeds"),
                             num_available_distributions=0,
                             tokenizer=l4m_pb2.Tokenizer(
-                                merge_table=[
-                                    l4m_pb2.Tokenizer.MergeTableEntry(key=k, value=v)
-                                    for k, v in model_metadata.tokenizer.merge_table.items()
-                                ],
-                                special_tokens=[
-                                    l4m_pb2.Tokenizer.SpecialTokensEntry(key=k, value=v)
-                                    for k, v in model_metadata.tokenizer.special_tokens.items()
-                                ],
+                                merge_table=model_metadata.tokenizer.merge_table,
+                                special_tokens=model_metadata.tokenizer.special_tokens,
                                 split_regex=model_metadata.tokenizer.split_regex,
                                 escape_non_printable=model_metadata.tokenizer.escape_non_printable,
                             )

@@ -7,8 +7,8 @@ name = "pie-torch-backend"
 version = "0.1.0"
 description = "Your project description"
 authors = [{ name="In Gim", email="in.gim@yale.edu" }]
-license = { text = "MIT" }
-requires-python = ">=3.11"
+license = "MIT"
+requires-python = ">=3.12"
 
 dependencies = [
     "fire>=0.6",
@@ -27,3 +27,6 @@ dependencies = [
     "black>=24.10",
     "numba>=0.61.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["config*", "legacy*"]
