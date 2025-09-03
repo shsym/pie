@@ -6,8 +6,8 @@ import torch
 from torch import nn
 
 import flashinfer as ops
-from adapter import Adapter, AdapterBuffer
-from config import L4maConfig
+
+from config.qwen3 import Qwen3ArchConfig
 
 VERSION = "0.1.0"
 
@@ -48,7 +48,7 @@ def create_fusion_map(model: nn.Module):
             target_w = f"{name}.gate_up_proj.weight"
             sources_w = [f"{name}.gate_proj.weight", f"{name}.up_proj.weight"]
             fusion_map[target_w] = {"sources": sources_w, "dim": 0}
-            
+
             # Handle biases (Qwen3 uses bias in MLP layers)
             target_b = f"{name}.gate_up_proj.bias"
             sources_b = [f"{name}.gate_proj.bias", f"{name}.up_proj.bias"]
@@ -60,7 +60,7 @@ def create_fusion_map(model: nn.Module):
 class Qwen3Mlp(nn.Module):
     """Qwen3 MLP layer with SiLU activation function and bias in feed-forward layers."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: Qwen3ArchConfig):
         """Initialize the Qwen3 MLP layer."""
         super().__init__()
         self.config = config
@@ -94,7 +94,7 @@ class Qwen3Mlp(nn.Module):
 class Qwen3Attention(nn.Module):
     """Qwen3 attention module with FlashInfer support and QK normalization."""
 
-    def __init__(self, config: L4maConfig, layer_idx: int):
+    def __init__(self, config: Qwen3ArchConfig, layer_idx: int):
         """Initialize the Qwen3 attention module."""
         super().__init__()
         self.config = config
@@ -106,8 +106,8 @@ class Qwen3Attention(nn.Module):
         self.v_size = config.num_key_value_heads * config.head_size
 
         # Qwen3 uses attention_bias for QKV projections
-        attention_bias = getattr(config, 'attention_bias', False)
-        
+        attention_bias = getattr(config, "attention_bias", False)
+
         self.qkv_proj = nn.Linear(
             config.hidden_size,
             self.q_size + self.k_size + self.v_size,
@@ -126,30 +126,29 @@ class Qwen3Attention(nn.Module):
 
         # Qwen3 uses QK normalization - critical for stability
         self.q_norm = nn.RMSNorm(
-            config.head_size, 
+            config.head_size,
             eps=config.rms_norm_eps,
             device=config.device,
             dtype=config.dtype,
         )
         self.k_norm = nn.RMSNorm(
-            config.head_size, 
+            config.head_size,
             eps=config.rms_norm_eps,
             device=config.device,
             dtype=config.dtype,
         )
 
     def forward(
-            self,
-            adapter_buffer: AdapterBuffer | None,
-            wrapper,
-            hidden_states: torch.Tensor,
-            position_ids: torch.Tensor,
-            kv_cache_at_layer: torch.Tensor,
-            kv_page_indices: torch.Tensor,
-            kv_page_indptr: torch.Tensor,
-            kv_last_page_lens: torch.Tensor,
-            batch_indices: torch.Tensor,
-            batch_positions: torch.Tensor,
+        self,
+        wrapper,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass through the attention module."""
 
@@ -159,16 +158,6 @@ class Qwen3Attention(nn.Module):
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
         )
-
-        # apply adapters if provided
-        if adapter_buffer is not None:
-            delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states)
-            q_delta = delta[0]
-            k_delta = delta[1]
-            v_delta = delta[2]
-            query_states.add_(q_delta)
-            key_states.add_(k_delta)
-            value_states.add_(v_delta)
 
         # Reshape and continue as before
         query_states = query_states.view(
@@ -190,8 +179,12 @@ class Qwen3Attention(nn.Module):
             q=query_states,
             k=key_states,
             pos_ids=position_ids,
-            rope_theta=self.config.rope_theta
+            rope_theta=self.config.rope_theta,
         )
+
+        # Ensure query_states matches the configured dtype for FlashInfer plan
+        if query_states.dtype != self.config.dtype:
+            query_states = query_states.to(self.config.dtype)
 
         ops.append_paged_kv_cache(
             append_key=key_states,
@@ -216,7 +209,7 @@ class Qwen3Attention(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     """Qwen3 decoder layer."""
 
-    def __init__(self, config: L4maConfig, layer_idx: int):
+    def __init__(self, config: Qwen3ArchConfig, layer_idx: int):
         """Initialize the Qwen3 decoder layer."""
         super().__init__()
 
@@ -237,17 +230,16 @@ class Qwen3DecoderLayer(nn.Module):
         )
 
     def forward(
-            self,
-            adapter_buffer: AdapterBuffer | None,
-            wrapper,
-            hidden_states: torch.Tensor,
-            position_ids: torch.Tensor,
-            kv_cache_at_layer: torch.Tensor,
-            kv_page_indices: torch.Tensor,
-            kv_page_indptr: torch.Tensor,
-            kv_last_page_lens: torch.Tensor,
-            batch_indices: torch.Tensor,
-            batch_positions: torch.Tensor,
+        self,
+        wrapper,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass through the decoder layer."""
         residual = hidden_states
@@ -256,7 +248,6 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Self Attention
         hidden_states = self.self_attn(
-            adapter_buffer=adapter_buffer,
             wrapper=wrapper,
             hidden_states=hidden_states,
             position_ids=position_ids,
@@ -284,7 +275,7 @@ class Qwen3DecoderLayer(nn.Module):
 class Qwen3Model(nn.Module):
     """Qwen3 model with FlashInfer support."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: Qwen3ArchConfig):
         """Initialize the Qwen3 model."""
         super().__init__()
         self.config = config
@@ -320,33 +311,22 @@ class Qwen3Model(nn.Module):
         )
 
     def forward(
-            self,
-            adapter: Adapter | None,
-            seeds: torch.Tensor | None,
-            input_embeds: torch.Tensor,
-            position_ids: torch.Tensor,
-            kv_cache_at_layer: torch.Tensor,
-            kv_page_indices: torch.Tensor,
-            kv_page_indptr: torch.Tensor,
-            kv_last_page_lens: torch.Tensor,
-            qo_indptr: torch.Tensor,
-            custom_mask: torch.Tensor,
-            single_token_inference_mode: bool = False,
+        self,
+        input_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        custom_mask: torch.Tensor,
+        single_token_inference_mode: bool = False,
     ) -> torch.Tensor:
         """Forward pass through the Qwen3 model."""
         hidden_states = input_embeds
         n, _ = hidden_states.size()
 
         page_size = kv_cache_at_layer[0].shape[2]
-
-        if adapter is not None:
-
-            adapter_buffer = AdapterBuffer(
-                adapter=adapter,
-                seeds=seeds,
-            )
-        else:
-            adapter_buffer = None
 
         batch_indices, batch_positions = ops.get_batch_indices_positions(
             append_indptr=qo_indptr,
@@ -365,7 +345,7 @@ class Qwen3Model(nn.Module):
                 head_dim=self.config.head_size,
                 page_size=page_size,
                 pos_encoding_mode="NONE",
-                q_data_type=torch.bfloat16,
+                q_data_type=self.config.dtype,
             )
             wrapper = self.wrapper_decode
         else:
@@ -379,13 +359,12 @@ class Qwen3Model(nn.Module):
                 head_dim_qk=self.config.head_size,
                 page_size=page_size,
                 custom_mask=custom_mask,
-                q_data_type=torch.bfloat16,
+                q_data_type=self.config.dtype,
             )
             wrapper = self.wrapper_append
 
         for decoder_layer in self.layers:
             layer_outputs = decoder_layer(
-                adapter_buffer=adapter_buffer,
                 wrapper=wrapper,
                 hidden_states=hidden_states,
                 position_ids=position_ids,
@@ -403,10 +382,11 @@ class Qwen3Model(nn.Module):
 
         return hidden_states
 
+
 class Qwen3ForCausalLM(nn.Module):
     """Qwen3 model for causal language modeling."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: Qwen3ArchConfig):
         """Initialize the Qwen3 causal LM model."""
         super().__init__()
         self.config = config

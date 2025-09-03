@@ -1,13 +1,13 @@
 """TODO: Add module docstring."""
-import gc
+
 import time
 from dataclasses import dataclass
 from typing import Union
 
 import numpy as np
+import numba
 import torch
 
-from adapter import Adapter, CmaesAdapter
 from l4m_pb2 import (  # pylint: disable=no-name-in-module
     BatchAllocate,
     BatchDeallocate,
@@ -23,8 +23,7 @@ from l4m_pb2 import (  # pylint: disable=no-name-in-module
     BatchFillBlock,
     Distribution,
     BatchSyncResponse, BatchForwardText, BatchForwardTextResponse,
-    BatchDebugQueryRequest, BatchDebugQueryResponse, DebugQueryResponse,
-    InitializeAdapter, UpdateAdapter, BatchForwardWithAdapter,
+    BatchDebugQueryRequest, BatchDebugQueryResponse, DebugQueryResponse
 )
 
 from l4m_vision_pb2 import BatchEmbedImage  # pylint: disable=no-name-in-module
@@ -63,12 +62,6 @@ class Driver:
 
     embeds: dict[int, Embed]
     blocks: dict[int, Block]
-    adapters: dict[str, Adapter]
-
-    max_num_kv_pages: int
-    max_num_embeds: int
-    max_num_adapters: int
-    max_adapter_rank: int
 
     # dist_storage: VectorStorage
 
@@ -79,28 +72,23 @@ class Driver:
             dist_size: int,
             max_num_kv_pages: int,
             max_num_embeds: int,
-            max_num_adapters: int,
-            max_adapter_rank: int,
             dtype: torch.dtype,
             device: str,
     ):
         """TODO: Add method docstring."""
         self.embeds = {}
         self.blocks = {}
-        self.adapters = {}
 
         self.lm = model
         self.kv_page_size = kv_page_size
         self.dist_size = dist_size
         self.max_num_kv_pages = max_num_kv_pages
         self.max_num_embeds = max_num_embeds
-        self.max_num_adapters = max_num_adapters
-        self.max_adapter_rank = max_adapter_rank
         self.dtype = dtype
         self.device = device
 
         self.kv_cache_at_layer = [
-            torch.zeros(
+            torch.randn(
                 (
                     max_num_kv_pages,
                     2,
@@ -110,31 +98,6 @@ class Driver:
                 ),
                 dtype=dtype,
                 device=device,
-            )
-            for _ in range(self.lm.config.num_layers)
-        ]
-
-        self.adapter_at_layer = [
-            (
-                torch.zeros(
-                    (
-                        max_num_adapters,
-                        max_adapter_rank * 3,
-                        self.lm.config.hidden_size,
-                    ),
-                    dtype=dtype,
-                    device=device,
-                ),
-                torch.zeros(
-                    (
-                        max_num_adapters,
-                        self.lm.config.head_size * (
-                                self.lm.config.num_query_heads + self.lm.config.num_key_value_heads * 2),
-                        max_adapter_rank,
-                    ),
-                    dtype=dtype,
-                    device=device,
-                ),
             )
             for _ in range(self.lm.config.num_layers)
         ]
@@ -169,8 +132,7 @@ class Driver:
             elif cmd.kind == ObjectKind.OBJECT_KIND_EMB:
                 # do nothing. Embeds are allocated on the fly.
                 pass
-            elif cmd.kind == ObjectKind.OBJECT_KIND_ADAPTER:
-
+            elif cmd.kind == ObjectKind.OBJECT_KIND_DIST:
                 # do nothing. Dists are allocated on the fly.
                 pass
 
@@ -403,8 +365,9 @@ class Driver:
         # print('qo_indptr', qo_indptr)
         # print('custom_mask', custom_masks)
 
-        with torch.cuda.device(self.device):
-
+        # Fix for AMP/autocast thread locality issue
+        # Ensure consistent dtype (bfloat16) in worker thread
+        with torch.cuda.device(self.device), torch.amp.autocast('cuda', dtype=self.dtype):
             output_embeds = self.lm.model.forward(
                 input_embeds=input_embeds,
                 position_ids=pt_new_position_ids,
@@ -566,12 +529,10 @@ class Driver:
 
         responses = []
 
-        with torch.cuda.device(self.device):
-
+        # Fix for AMP/autocast thread locality issue
+        # Ensure consistent dtype (bfloat16) in worker thread
+        with torch.cuda.device(self.device), torch.amp.autocast('cuda', dtype=self.dtype):
             output_embeds = self.lm.model.forward(
-                adapters=None,
-                adapter_indices=None,
-                # adapter_at_layer=self.adapter_at_layer,
                 input_embeds=input_embeds,
                 position_ids=pt_new_position_ids,
                 kv_cache_at_layer=self.kv_cache_at_layer,
@@ -627,243 +588,6 @@ class Driver:
                 responses.append(response)
 
         return BatchDebugQueryResponse(
-            items=responses
-        )
-
-    @torch.inference_mode()
-    def initialize_adapter(self, cmd: InitializeAdapter):
-
-        cfg = self.lm.config
-
-        print("Creating CmaesAdapter with:")
-        print("  rank:", cmd.rank)
-        print("  alpha:", cmd.alpha)
-        print("  in_features:", cfg.hidden_size)
-        print("  out_features:", [
-            cfg.head_size * cfg.num_query_heads,
-            cfg.head_size * cfg.num_key_value_heads,
-            cfg.head_size * cfg.num_key_value_heads
-        ])
-        print("  num_layers:", cfg.num_layers)
-        print("  population_size:", cmd.population_size)
-        print("  mu_fraction:", cmd.mu_fraction)
-        print("  initial_sigma:", cmd.initial_sigma)
-        print("  min_sigma:", 1e-7)
-        print("  min_var:", 1e-8)
-        print("  max_var:", 1e4)
-        print("  device:", self.device)
-
-        self.adapters[cmd.adapter] = CmaesAdapter(
-            rank=cmd.rank,
-            alpha=cmd.alpha,
-            in_features=cfg.hidden_size,
-            out_features=[cfg.head_size * cfg.num_query_heads,
-                          cfg.head_size * cfg.num_key_value_heads,
-                          cfg.head_size * cfg.num_key_value_heads],
-            num_layers=cfg.num_layers,
-            population_size=cmd.population_size,
-            mu_fraction=cmd.mu_fraction,
-            initial_sigma=cmd.initial_sigma,
-            min_sigma=1e-7,
-            min_var=1e-8,
-            max_var=1e4,
-            device=self.device,
-            dtype=self.dtype,
-        )
-
-    @torch.inference_mode()
-    def update_adapter(self, cmd: UpdateAdapter):
-
-        if cmd.adapter in self.adapters:
-            adapter = self.adapters[cmd.adapter]
-            if isinstance(adapter, CmaesAdapter):
-                print("Updating CmaesAdapter with:")
-                print("  rank:", adapter.rank)
-                print("  alpha:", adapter.alpha)
-                print("  in_features:", adapter.in_features)
-                print("  scores:", cmd.scores)
-                print("  seeds:", cmd.seeds)
-                print("  max_sigma:", cmd.max_sigma)
-
-                adapter.update(cmd.scores, cmd.seeds, cmd.max_sigma)
-
-    @torch.inference_mode()
-    def forward_with_adapter(self, cmds: BatchForwardWithAdapter):
-
-        adapter = None
-        seeds = []
-
-        kv_page_indices = []
-        kv_page_indptr = [0]
-        kv_page_last_lens = []
-        qo_indices = []
-        qo_indptr = [0]
-        custom_masks = []
-
-        new_token_ids = []
-        new_position_ids = []
-
-        all_output_indices = []
-        all_output_indices_ptr = [0]
-        single_token_inference_mode = True
-        start_time = time.time()
-        for cmd in cmds.items:
-
-            if cmd.adapter not in self.adapters:
-                raise ValueError(f"Adapter {cmd.adapter} not found")
-            adapter = self.adapters[cmd.adapter]
-            seeds.extend([cmd.seed] * len(cmd.token_ids))
-
-            kv_page_indices.extend(cmd.kv_page_ids)
-            kv_page_indptr.append(len(kv_page_indices))
-            kv_page_last_lens.append(cmd.kv_page_last_len)
-            qo_indices.extend(cmd.token_ids)
-            qo_indptr.append(len(qo_indices))
-
-            num_total_tokens = self.kv_page_size * (len(cmd.kv_page_ids) - 1) + cmd.kv_page_last_len
-            num_context_tokens = num_total_tokens - len(cmd.token_ids)
-
-            output_indices = []
-            for x in cmd.output_indices:
-                output_indices.append(x + qo_indptr[-1] - len(cmd.token_ids))
-
-            new_token_ids.extend(cmd.token_ids)
-            new_position_ids.extend(cmd.position_ids)
-            all_output_indices.extend(output_indices)
-            all_output_indices_ptr.append(len(all_output_indices))
-
-            if len(cmd.token_ids) > 1:
-                single_token_inference_mode = False
-
-            # --- New Mask Generation Logic ---
-            if len(cmd.mask) != len(cmd.token_ids):
-                raise ValueError(
-                    f"Mismatch between number of masks ({len(cmd.mask)}) and "
-                    f"input tokens ({len(cmd.token_ids)})."
-                )
-
-            cmd_mask = np.zeros((len(cmd.token_ids), num_total_tokens), dtype=np.bool_)
-            for i, brle_buffer in enumerate(cmd.mask):
-                # 1. Decode the provided BRLE mask for attention to the past context.
-                decoded_mask = _decode_brle(brle_buffer.buffer)
-
-                # The BRLE mask for query token `i` should cover the past context plus `i` previous new tokens.
-                expected_len = num_context_tokens + i + 1
-                if len(decoded_mask) != expected_len:
-                    raise ValueError(
-                        f"Decoded mask for token {i} has length {len(decoded_mask)}, but expected {expected_len}"
-                    )
-
-                cmd_mask[i, :expected_len] = decoded_mask
-
-            mask_flat = cmd_mask.flatten()
-            custom_masks.append(mask_flat)
-
-        # concat all masks
-        custom_mask = np.concatenate(custom_masks)
-
-        # print all inputs
-        # print('kv_page_indices', kv_page_indices)
-        # print('kv_page_indptr', kv_page_indptr)
-        # print('kv_last_page_lens', kv_last_page_lens)
-        # print('qo_indptr', qo_indptr)
-        # print('custom_mask', custom_mask)
-        pt_seeds = torch.as_tensor(
-            seeds, device=self.device, dtype=torch.long
-        )
-
-        # if all seeds are zero -> eval mode
-        if pt_seeds.sum() == 0:
-            pt_seeds = None
-
-        pt_new_token_ids = torch.as_tensor(
-            new_token_ids, device=self.device, dtype=torch.int32
-        )
-        pt_new_position_ids = torch.as_tensor(
-            new_position_ids, device=self.device, dtype=torch.int32
-        )
-
-        pt_kv_page_indices = torch.as_tensor(
-            kv_page_indices, device=self.device, dtype=torch.int32
-        )
-        pt_kv_page_indptr = torch.as_tensor(
-            kv_page_indptr, device=self.device, dtype=torch.int32
-        )
-        pt_kv_last_page_lens = torch.as_tensor(
-            kv_page_last_lens, device=self.device, dtype=torch.int32
-        )
-        pt_qo_indptr = torch.as_tensor(qo_indptr, device=self.device, dtype=torch.int32)
-        pt_custom_mask = torch.as_tensor(
-            custom_mask, device=self.device, dtype=torch.bool
-        )
-
-        pt_output_indices = torch.as_tensor(
-            all_output_indices, device=self.device, dtype=torch.int32)
-
-        input_embeds = self.lm.model.embed_tokens(pt_new_token_ids)
-
-        # torch.cuda.synchronize()
-        # print(f"prepare time {(time.time() - start_time) * 1000}ms  ")
-        # print('kv_page_indices', kv_page_indices)
-        # print('kv_page_indptr', kv_page_indptr)
-        # print('kv_page_last_lens', kv_page_last_lens)
-        # print('qo_indptr', qo_indptr)
-        # print('custom_mask', custom_masks)
-        # print('output_indices', all_output_indices)
-        # print('new_token_ids', new_token_ids)
-        # print('new_position_ids', new_position_ids)
-
-        responses = []
-        # print(pt_seeds)
-
-        with torch.cuda.device(self.device):
-
-            output_embeds = self.lm.model.forward(
-                adapter=adapter,
-                seeds=pt_seeds,
-                # adapter_at_layer=self.adapter_at_layer,
-                input_embeds=input_embeds,
-                position_ids=pt_new_position_ids,
-                kv_cache_at_layer=self.kv_cache_at_layer,
-                kv_page_indices=pt_kv_page_indices,
-                kv_page_indptr=pt_kv_page_indptr,
-                kv_last_page_lens=pt_kv_last_page_lens,
-                qo_indptr=pt_qo_indptr,
-                custom_mask=pt_custom_mask,
-                single_token_inference_mode=single_token_inference_mode,
-            )
-            # print(f"output_embeds mean: {output_embeds.mean().item()}")
-
-            # precompute the dists
-            if len(all_output_indices) > 0:
-                output_embeds = output_embeds[pt_output_indices]
-                logits = self.lm.lm_head(output_embeds)
-                probs = torch.softmax(logits, dim=-1)
-                condensed = torch.topk(probs, k=self.dist_size, sorted=True)
-
-                batch_ids = condensed.indices.tolist()
-                batch_probs = condensed.values.tolist()
-
-                # reshape them based on all_output_indices_ptr
-                for i in range(len(all_output_indices_ptr) - 1):
-                    start = all_output_indices_ptr[i]
-                    end = all_output_indices_ptr[i + 1]
-                    dists = []
-                    for j in range(start, end):
-                        dist = Distribution(
-                            ids=batch_ids[j],
-                            probs=batch_probs[j]
-                        )
-                        dists.append(dist)
-                    res = ForwardTextResponse(
-                        distributions=dists
-                    )
-                    responses.append(res)
-
-        # torch.cuda.synchronize()
-        # print(f"forward_text time {(time.time() - start_time) * 1000}ms  ")
-
-        return BatchForwardTextResponse(
             items=responses
         )
 

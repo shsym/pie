@@ -13,7 +13,8 @@ import handshake_pb2
 import l4m_pb2
 import l4m_vision_pb2
 import ping_pb2
-from config import parse_model_metadata
+from config.qwen3 import parse_model_metadata as parse_qwen3_metadata
+from config.l4ma import parse_model_metadata as parse_l4ma_metadata
 from driver import Driver
 from l4ma import L4maForCausalLM, create_fusion_map
 from qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
@@ -35,8 +36,6 @@ def main(config: str = None,
          dist_size: int = 32,
          max_num_kv_pages: int = 1000,
          max_num_embeds: int = 50000,
-         max_num_adapters: int = 2048,
-         max_adapter_rank: int = 8,
          device: str = 'cuda:0',
          dtype: str = 'bfloat16'):
     """
@@ -73,20 +72,14 @@ def main(config: str = None,
     final_config = {
         'host': host if host != 'localhost' else config_from_file.get('host', 'localhost'),
         'port': port if port != 10123 else config_from_file.get('port', 10123),
-        'controller_host': controller_host if controller_host != 'localhost' else config_from_file.get(
-            'controller_host', 'localhost'),
-        'controller_port': controller_port if controller_port != 9123 else config_from_file.get('controller_port',
-                                                                                                9123),
+        'controller_host': controller_host if controller_host != 'localhost' else config_from_file.get('controller_host', 'localhost'),
+        'controller_port': controller_port if controller_port != 9123 else config_from_file.get('controller_port', 9123),
         'auth_token': auth_token if auth_token is not None else config_from_file.get('auth_token'),
         'model': model if model is not None else config_from_file.get('model'),
         'kv_page_size': kv_page_size if kv_page_size != 32 else config_from_file.get('kv_page_size', 32),
         'dist_size': dist_size if dist_size != 32 else config_from_file.get('dist_size', 32),
-        'max_num_kv_pages': max_num_kv_pages if max_num_kv_pages != 1000 else config_from_file.get('max_num_kv_pages',
-                                                                                                   1000),
+        'max_num_kv_pages': max_num_kv_pages if max_num_kv_pages != 1000 else config_from_file.get('max_num_kv_pages', 1000),
         'max_num_embeds': max_num_embeds if max_num_embeds != 50000 else config_from_file.get('max_num_embeds', 50000),
-        'max_num_adapters': max_num_adapters if max_num_adapters != 2048 else config_from_file.get('max_num_adapters',
-                                                                                                   2048),
-        'max_adapter_rank': max_adapter_rank if max_adapter_rank != 8 else config_from_file.get('max_adapter_rank', 8),
         'device': device if device != 'cuda:0' else config_from_file.get('device', 'cuda:0'),
         'dtype': dtype if dtype != 'bfloat16' else config_from_file.get('dtype', 'bfloat16'),
     }
@@ -111,6 +104,17 @@ def main(config: str = None,
     start_service(final_config, model, model_metadata)
 
 
+def detect_architecture_type(metadata_path: str) -> str:
+    """Detect the architecture type from the TOML file."""
+    try:
+        with open(metadata_path, "rb") as f:
+            data = tomli.load(f)
+        arch_data = data.get("architecture", {})
+        return arch_data.get("type", "").lower()
+    except Exception as e:
+        raise RuntimeError(f"Failed to detect architecture type from {metadata_path}: {e}")
+
+
 def load_model(config: dict):
     model_name = config.get('model')
     if not model_name:
@@ -126,7 +130,13 @@ def load_model(config: dict):
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Metadata file not found at: {metadata_path}")
 
-    metadata = parse_model_metadata(metadata_path)
+    # Detect architecture type and use appropriate parser
+    arch_type = detect_architecture_type(metadata_path)
+    if arch_type == "qwen3":
+        metadata = parse_qwen3_metadata(metadata_path)
+    else:
+        # Default to L4MA parser for backward compatibility
+        metadata = parse_l4ma_metadata(metadata_path)
 
     metadata.architecture.device = config.get('device', 'cuda:0')
     metadata.architecture.dtype = getattr(torch, config.get('dtype', 'bfloat16'))
@@ -200,8 +210,7 @@ def load_model(config: dict):
                 # Load the newly created fused tensor into the model
                 param = model.state_dict()[target_name]
                 if fused_tensor.shape != param.shape:
-                    print(
-                        f"    Warning: Shape mismatch for fused tensor '{target_name}'. ZT: {fused_tensor.shape}, Model: {param.shape}. Skipping.")
+                    print(f"    Warning: Shape mismatch for fused tensor '{target_name}'. ZT: {fused_tensor.shape}, Model: {param.shape}. Skipping.")
                     continue
 
                 with torch.no_grad():
@@ -224,7 +233,8 @@ def load_model(config: dict):
         else:
             print("\nSuccessfully loaded all expected model weights.")
 
-        # Move the entire model to the specified device
+        # Move the entire model to the specified device and dtype
+        model.to(device=metadata.architecture.device, dtype=metadata.architecture.dtype)
         model.eval()  # Set the model to evaluation mode
 
         return model, metadata
@@ -253,8 +263,6 @@ def start_service(config, model, model_metadata):
                     dist_size=config.get("dist_size"),
                     max_num_kv_pages=config.get("max_num_kv_pages"),
                     max_num_embeds=config.get("max_num_embeds"),
-                    max_num_adapters=config.get("max_num_adapters"),
-                    max_adapter_rank=config.get("max_adapter_rank"),
                     dtype=getattr(torch, config.get('dtype', 'bfloat16')),
                     device=config.get("device"))
 
@@ -336,8 +344,7 @@ def register(config, endpoint):
             print(f"Registered with the controller at {config.get('controller_host')}:{config.get('controller_port')}")
 
     except ConnectionRefusedError:
-        print(
-            f"Failed to connect to the controller at {config.get('controller_host')}:{config.get('controller_port')}.")
+        print(f"Failed to connect to the controller at {config.get('controller_host')}:{config.get('controller_port')}.")
         print("Please ensure the controller is running and accessible.")
     except Exception as e:
         print(f"An error occurred during registration: {e}")
@@ -383,7 +390,6 @@ def run_zmq_server(router, engine, config, model_metadata):
                 if protocol == "l4m":
                     request = l4m_pb2.Request()
                     request.ParseFromString(payload)
-                    #print(payload, "@", request)
                     command = request.WhichOneof("command")
                     response = None
 
@@ -411,32 +417,23 @@ def run_zmq_server(router, engine, config, model_metadata):
                     elif command == "debug_query_request":
                         res = engine.debug_query_request(request.debug_query_request)
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, debug_query=res)
-                    elif command == "initialize_adapter":
-                        engine.initialize_adapter(request.initialize_adapter)
-                    elif command == "update_adapter":
-                        engine.update_adapter(request.update_adapter)
-                    elif command == "forward_with_adapter":
-                        res = engine.forward_with_adapter(request.forward_with_adapter)
-                        response = l4m_pb2.Response(correlation_id=request.correlation_id, forward_text=res)
                     elif command == "get_info":
-                        print("Getting info from the engine.")
-                        response = l4m_pb2.Response(correlation_id=request.correlation_id,
-                                                    get_info=l4m_pb2.GetInfoResponse(
-                                                        version="0.1",
-                                                        model_name=f"{config.get('model')}-{config.get('version', '')}",
-                                                        kv_page_size=config.get("kv_page_size"),
-                                                        num_available_kv_pages=config.get("max_num_kv_pages"),
-                                                        num_available_embeddings=config.get("max_num_embeds"),
-                                                        num_available_adapters=config.get("max_num_adapters"),
-                                                        tokenizer=l4m_pb2.Tokenizer(
-                                                            merge_table=model_metadata.tokenizer.merge_table,
-                                                            special_tokens=model_metadata.tokenizer.special_tokens,
-                                                            split_regex=model_metadata.tokenizer.split_regex,
-                                                            escape_non_printable=model_metadata.tokenizer.escape_non_printable,
-                                                        )
-                                                    ))
+                        response = l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
+                            version="0.1",
+                            model_name=f"{config.get('model')}-{config.get('version', '')}",
+                            kv_page_size=config.get("kv_page_size"),
+                            num_available_kv_pages=config.get("max_num_kv_pages"),
+                            num_available_embeddings=config.get("max_num_embeds"),
+                            num_available_distributions=0,
+                            tokenizer=l4m_pb2.Tokenizer(
+                                merge_table=model_metadata.tokenizer.merge_table,
+                                special_tokens=model_metadata.tokenizer.special_tokens,
+                                split_regex=model_metadata.tokenizer.split_regex,
+                                escape_non_printable=model_metadata.tokenizer.escape_non_printable,
+                            )
+                        ))
                     else:
-                        print("No valid command found in request.", command)
+                        print("No valid command found in request.")
 
                     if response is not None:
                         reply_payload = response.SerializeToString()
