@@ -13,8 +13,7 @@ import handshake_pb2
 import l4m_pb2
 import l4m_vision_pb2
 import ping_pb2
-from config.qwen3 import parse_model_metadata as parse_qwen3_metadata
-from config.l4ma import parse_model_metadata as parse_l4ma_metadata
+from config.common import ModelInfo
 from driver import Driver
 from l4ma import L4maForCausalLM, create_fusion_map
 from qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
@@ -130,14 +129,8 @@ def load_model(config: dict):
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Metadata file not found at: {metadata_path}")
 
-    # Detect architecture type and use appropriate parser
-    arch_type = detect_architecture_type(metadata_path)
-    if arch_type == "qwen3":
-        metadata = parse_qwen3_metadata(metadata_path)
-    else:
-        # Default to L4MA parser for backward compatibility
-        metadata = parse_l4ma_metadata(metadata_path)
 
+    metadata = ModelInfo.parse_model_metadata(metadata_path)
     metadata.architecture.device = config.get('device', 'cuda:0')
     metadata.architecture.dtype = getattr(torch, config.get('dtype', 'bfloat16'))
 

@@ -7,7 +7,7 @@ from torch import nn
 
 import flashinfer as ops
 
-from config.qwen3 import Qwen3ArchConfig
+from config.qwen3 import Qwen3Arch
 
 VERSION = "0.1.0"
 
@@ -60,7 +60,7 @@ def create_fusion_map(model: nn.Module):
 class Qwen3Mlp(nn.Module):
     """Qwen3 MLP layer with SiLU activation function and bias in feed-forward layers."""
 
-    def __init__(self, config: Qwen3ArchConfig):
+    def __init__(self, config: Qwen3Arch):
         """Initialize the Qwen3 MLP layer."""
         super().__init__()
         self.config = config
@@ -94,7 +94,7 @@ class Qwen3Mlp(nn.Module):
 class Qwen3Attention(nn.Module):
     """Qwen3 attention module with FlashInfer support and QK normalization."""
 
-    def __init__(self, config: Qwen3ArchConfig, layer_idx: int):
+    def __init__(self, config: Qwen3Arch, layer_idx: int):
         """Initialize the Qwen3 attention module."""
         super().__init__()
         self.config = config
@@ -209,7 +209,7 @@ class Qwen3Attention(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     """Qwen3 decoder layer."""
 
-    def __init__(self, config: Qwen3ArchConfig, layer_idx: int):
+    def __init__(self, config: Qwen3Arch, layer_idx: int):
         """Initialize the Qwen3 decoder layer."""
         super().__init__()
 
@@ -275,7 +275,7 @@ class Qwen3DecoderLayer(nn.Module):
 class Qwen3Model(nn.Module):
     """Qwen3 model with FlashInfer support."""
 
-    def __init__(self, config: Qwen3ArchConfig):
+    def __init__(self, config: Qwen3Arch):
         """Initialize the Qwen3 model."""
         super().__init__()
         self.config = config
@@ -386,7 +386,7 @@ class Qwen3Model(nn.Module):
 class Qwen3ForCausalLM(nn.Module):
     """Qwen3 model for causal language modeling."""
 
-    def __init__(self, config: Qwen3ArchConfig):
+    def __init__(self, config: Qwen3Arch):
         """Initialize the Qwen3 causal LM model."""
         super().__init__()
         self.config = config

@@ -24,8 +24,4 @@ jobs:
 
       # Run black format check
       - name: Run black format check
-        run: |
-          uvx black --check \
-            backend/backend-python/config/*.py \
-            backend/backend-python/l4ma.py \
-            backend/backend-python/qwen3.py
+        run: ./tests/backend-python-format.sh
