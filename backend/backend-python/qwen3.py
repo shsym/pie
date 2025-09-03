@@ -7,7 +7,7 @@ from torch import nn
 
 import flashinfer as ops
 
-from config import L4maConfig
+from config.qwen3 import Qwen3ArchConfig
 
 VERSION = "0.1.0"
 
@@ -48,7 +48,7 @@ def create_fusion_map(model: nn.Module):
             target_w = f"{name}.gate_up_proj.weight"
             sources_w = [f"{name}.gate_proj.weight", f"{name}.up_proj.weight"]
             fusion_map[target_w] = {"sources": sources_w, "dim": 0}
-            
+
             # Handle biases (Qwen3 uses bias in MLP layers)
             target_b = f"{name}.gate_up_proj.bias"
             sources_b = [f"{name}.gate_proj.bias", f"{name}.up_proj.bias"]
@@ -60,7 +60,7 @@ def create_fusion_map(model: nn.Module):
 class Qwen3Mlp(nn.Module):
     """Qwen3 MLP layer with SiLU activation function and bias in feed-forward layers."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: Qwen3ArchConfig):
         """Initialize the Qwen3 MLP layer."""
         super().__init__()
         self.config = config
@@ -94,7 +94,7 @@ class Qwen3Mlp(nn.Module):
 class Qwen3Attention(nn.Module):
     """Qwen3 attention module with FlashInfer support and QK normalization."""
 
-    def __init__(self, config: L4maConfig, layer_idx: int):
+    def __init__(self, config: Qwen3ArchConfig, layer_idx: int):
         """Initialize the Qwen3 attention module."""
         super().__init__()
         self.config = config
@@ -107,7 +107,7 @@ class Qwen3Attention(nn.Module):
 
         # Qwen3 uses attention_bias for QKV projections
         attention_bias = getattr(config, 'attention_bias', False)
-        
+
         self.qkv_proj = nn.Linear(
             config.hidden_size,
             self.q_size + self.k_size + self.v_size,
@@ -126,13 +126,13 @@ class Qwen3Attention(nn.Module):
 
         # Qwen3 uses QK normalization - critical for stability
         self.q_norm = nn.RMSNorm(
-            config.head_size, 
+            config.head_size,
             eps=config.rms_norm_eps,
             device=config.device,
             dtype=config.dtype,
         )
         self.k_norm = nn.RMSNorm(
-            config.head_size, 
+            config.head_size,
             eps=config.rms_norm_eps,
             device=config.device,
             dtype=config.dtype,
@@ -209,7 +209,7 @@ class Qwen3Attention(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     """Qwen3 decoder layer."""
 
-    def __init__(self, config: L4maConfig, layer_idx: int):
+    def __init__(self, config: Qwen3ArchConfig, layer_idx: int):
         """Initialize the Qwen3 decoder layer."""
         super().__init__()
 
@@ -275,7 +275,7 @@ class Qwen3DecoderLayer(nn.Module):
 class Qwen3Model(nn.Module):
     """Qwen3 model with FlashInfer support."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: Qwen3ArchConfig):
         """Initialize the Qwen3 model."""
         super().__init__()
         self.config = config
@@ -385,7 +385,7 @@ class Qwen3Model(nn.Module):
 class Qwen3ForCausalLM(nn.Module):
     """Qwen3 model for causal language modeling."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: Qwen3ArchConfig):
         """Initialize the Qwen3 causal LM model."""
         super().__init__()
         self.config = config

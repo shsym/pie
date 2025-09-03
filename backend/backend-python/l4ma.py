@@ -7,7 +7,7 @@ from torch import nn
 
 import flashinfer as ops
 
-from config import L4maConfig
+from config.l4ma import L4maArchConfig
 
 VERSION = "0.1.0"
 
@@ -54,7 +54,7 @@ def create_fusion_map(model: nn.Module):
 class L4maMlp(nn.Module):
     """TODO: Add class docstring."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: L4maArchConfig):
         """TODO: Add method docstring."""
         super().__init__()
         self.config = config
@@ -88,7 +88,7 @@ class L4maMlp(nn.Module):
 class L4maAttention(nn.Module):
     """TODO: Add class docstring."""
 
-    def __init__(self, config: L4maConfig, layer_idx: int):
+    def __init__(self, config: L4maArchConfig, layer_idx: int):
         """TODO: Add method docstring."""
         super().__init__()
         self.config = config
@@ -179,7 +179,7 @@ class L4maAttention(nn.Module):
 class L4maDecoderLayer(nn.Module):
     """TODO: Add class docstring."""
 
-    def __init__(self, config: L4maConfig, layer_idx: int):
+    def __init__(self, config: L4maArchConfig, layer_idx: int):
         """TODO: Add method docstring."""
         super().__init__()
 
@@ -245,7 +245,7 @@ class L4maDecoderLayer(nn.Module):
 class L4maModel(nn.Module):
     """TODO: Add class docstring."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: L4maArchConfig):
         """TODO: Add method docstring."""
         super().__init__()
         self.config = config
@@ -356,7 +356,7 @@ class L4maModel(nn.Module):
 class L4maForCausalLM(nn.Module):
     """TODO: Add class docstring."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: L4maArchConfig):
         """TODO: Add method docstring."""
         super().__init__()
         self.config = config

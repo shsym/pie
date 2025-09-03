@@ -13,7 +13,8 @@ import handshake_pb2
 import l4m_pb2
 import l4m_vision_pb2
 import ping_pb2
-from config import parse_model_metadata
+from config.qwen3 import parse_model_metadata as parse_qwen3_metadata
+from config.l4ma import parse_model_metadata as parse_l4ma_metadata
 from driver import Driver
 from l4ma import L4maForCausalLM, create_fusion_map
 from qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
@@ -103,6 +104,17 @@ def main(config: str = None,
     start_service(final_config, model, model_metadata)
 
 
+def detect_architecture_type(metadata_path: str) -> str:
+    """Detect the architecture type from the TOML file."""
+    try:
+        with open(metadata_path, "rb") as f:
+            data = tomli.load(f)
+        arch_data = data.get("architecture", {})
+        return arch_data.get("type", "").lower()
+    except Exception as e:
+        raise RuntimeError(f"Failed to detect architecture type from {metadata_path}: {e}")
+
+
 def load_model(config: dict):
     model_name = config.get('model')
     if not model_name:
@@ -118,7 +130,13 @@ def load_model(config: dict):
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Metadata file not found at: {metadata_path}")
 
-    metadata = parse_model_metadata(metadata_path)
+    # Detect architecture type and use appropriate parser
+    arch_type = detect_architecture_type(metadata_path)
+    if arch_type == "qwen3":
+        metadata = parse_qwen3_metadata(metadata_path)
+    else:
+        # Default to L4MA parser for backward compatibility
+        metadata = parse_l4ma_metadata(metadata_path)
 
     metadata.architecture.device = config.get('device', 'cuda:0')
     metadata.architecture.dtype = getattr(torch, config.get('dtype', 'bfloat16'))
@@ -400,7 +418,6 @@ def run_zmq_server(router, engine, config, model_metadata):
                         res = engine.debug_query_request(request.debug_query_request)
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, debug_query=res)
                     elif command == "get_info":
-                        print("Getting info from the engine.")
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
                             version="0.1",
                             model_name=f"{config.get('model')}-{config.get('version', '')}",
