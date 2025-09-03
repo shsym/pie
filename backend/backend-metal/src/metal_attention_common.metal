@@ -160,3 +160,23 @@ inline float split_d_dot_product(
     
     return simd_sum(partial_score);
 }
+
+// Split-dimension parallel dot product computation for float arrays
+inline float split_d_dot_product_f32(
+    threadgroup const float* q_s,
+    threadgroup const float* k_row,
+    int head_size,
+    uint simd_lane_id
+) {
+    const int elems_per_lane = (head_size + SIMD_SIZE - 1) / SIMD_SIZE;
+    float partial_score = 0.0f;
+    
+    for (int i = 0; i < elems_per_lane; ++i) {
+        int d = simd_lane_id * elems_per_lane + i;
+        if (d < head_size) {
+            partial_score += q_s[d] * k_row[d];
+        }
+    }
+    
+    return simd_sum(partial_score);
+}

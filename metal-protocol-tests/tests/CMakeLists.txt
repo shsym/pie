@@ -1,8 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 project(MetalProtocolTestsOrganized)
 
+# Enable Objective-C++ for Metal on macOS
+enable_language(OBJCXX)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_OBJCXX_STANDARD 17)
+set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+
+# Ensure we use libc++ and ARC where appropriate
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -fobjc-arc -stdlib=libc++")
 
 # Find required frameworks
 find_library(METAL_LIBRARY Metal REQUIRED)
@@ -23,9 +32,9 @@ include_directories(src/performance)
 link_directories(${BACKEND_BUILD_PATH})
 
 # Common libraries and frameworks
-set(COMMON_LIBRARIES 
-    ${METAL_LIBRARY} 
-    ${METALPERFORMANCESHADERS_LIBRARY} 
+set(COMMON_LIBRARIES
+    ${METAL_LIBRARY}
+    ${METALPERFORMANCESHADERS_LIBRARY}
     ${FOUNDATION_LIBRARY}
 )
 
@@ -41,7 +50,7 @@ set(BACKEND_SOURCES
 # Additional backend libraries to link against
 set(BACKEND_LIBS
     metal_softmax
-    metal_extract_k_values  
+    metal_extract_k_values
     metal_topk_mask_logits
     metal_batch_prefill_attention
     metal_dtype_conversion
@@ -51,14 +60,26 @@ set(BACKEND_LIBS
 # Set output directory for all targets
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
 
-# Compiler flags
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fobjc-arc")
+# Detect and include C++ stdlib headers from the active SDK (helps CLT-only setups)
+execute_process(
+    COMMAND xcrun --show-sdk-path
+    OUTPUT_VARIABLE SDK_ROOT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+set(CXX_STDLIB_PATH "${SDK_ROOT}/usr/include/c++/v1")
+if(EXISTS "${CXX_STDLIB_PATH}/cstdint")
+    include_directories(SYSTEM ${CXX_STDLIB_PATH})
+    message(STATUS "Using C++ stdlib from: ${CXX_STDLIB_PATH}")
+else()
+    message(WARNING "C++ stdlib headers not found at expected location: ${CXX_STDLIB_PATH}")
+    message(WARNING "You may need to install/update Xcode Command Line Tools: xcode-select --install")
+endif()
 
 # ============================================================================
 # Unit Tests (Core functionality - fast execution)
 # ============================================================================
 
-add_executable(test_softmax_unit 
+add_executable(test_softmax_unit
     src/unit/test_softmax.cpp
     ${BACKEND_SOURCES}
 )
@@ -312,7 +333,7 @@ add_custom_target(test_stats
     COMMAND echo "  run_all_organized_tests - All organized tests"
     COMMAND echo "  run_unit_tests"
     COMMAND echo "  run_integration_tests"
-    COMMAND echo "  run_stress_tests" 
+    COMMAND echo "  run_stress_tests"
     COMMAND echo "  run_performance_tests"
     COMMAND echo "  run_algorithm_validation"
     COMMAND echo "  run_compatibility_tests"
@@ -323,7 +344,12 @@ message(STATUS "Total tests: 18 (reduced from 31+ redundant tests)")
 message(STATUS "Structure: unit(6) + integration(5) + stress(2) + performance(3) + compatibility(2)")
 message(STATUS "Use 'make test_stats' to see available targets")
 
-# Test executable: Simdgroup debug test (standalone)
-add_executable(test_simdgroup_debug src/debug/test_simdgroup_debug.mm ${BACKEND_SOURCES})
-target_link_libraries(test_simdgroup_debug ${COMMON_LIBRARIES} ${BACKEND_LIBS})
+# Test executable: Simdgroup debug test (standalone, optional)
+# Only add this target if the debug source exists to avoid configure-time errors on clean checkouts
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/debug/test_simdgroup_debug.mm")
+    add_executable(test_simdgroup_debug src/debug/test_simdgroup_debug.mm ${BACKEND_SOURCES})
+    target_link_libraries(test_simdgroup_debug ${COMMON_LIBRARIES} ${BACKEND_LIBS})
+else()
+    message(STATUS "Skipping test_simdgroup_debug: src/debug/test_simdgroup_debug.mm not found")
+endif()
 

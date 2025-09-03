@@ -208,22 +208,22 @@ int main() {
     try {
         AttentionBenchmark benchmark;
         
-        // Define benchmark configurations - focus on Priority 0 target scenarios
+        // Define benchmark configurations - aligned with Llama 3.1 and GPU limits
         std::vector<BenchmarkConfig> configs = {
-            // Small sequences (Priority 0 optimization targets)
-            {128, 2048, 2048, 64, 16, 8, 32, 32, "Small: 128 tokens, 64 head_size"},
-            {256, 4096, 4096, 64, 16, 16, 64, 64, "Small: 256 tokens, 64 head_size"},
-            {512, 4096, 4096, 128, 16, 32, 32, 32, "Medium: 512 tokens, 128 head_size"},
+            // Short prompts (chat/simple queries)
+            {128, 4096, 4096, 128, 16, 8, 32, 8, "Short: 128 tokens, 128 head_size"},
+            {256, 4096, 4096, 128, 16, 16, 32, 8, "Short: 256 tokens, 128 head_size"},
             
-            // Edge of optimization benefit
-            {512, 8192, 8192, 128, 16, 32, 64, 64, "Medium: 512 tokens, 128 head_size (large head_dim)"},
+            // Medium prompts (typical interactions)
+            {512, 4096, 4096, 128, 16, 32, 32, 8, "Medium: 512 tokens, 128 head_size"},
+            {512, 8192, 8192, 128, 16, 32, 64, 8, "Medium: 512 tokens, 128 head_size (8B model)"},
             
-            // Large sequences (should favor baseline)
-            {1024, 8192, 8192, 128, 16, 64, 64, 64, "Large: 1024 tokens, 128 head_size"},
-            {2048, 16384, 16384, 256, 16, 128, 64, 64, "Large: 2048 tokens, 256 head_size"},
+            // Long prompts (RAG/document processing) - should use chunking
+            {1024, 4096, 4096, 128, 16, 64, 32, 8, "Long: 1024 tokens, 128 head_size"},
+            {2048, 4096, 4096, 128, 16, 128, 32, 8, "Long: 2048 tokens, 128 head_size (RAG)"},
             
-            // Memory stress tests
-            {128, 16384, 16384, 256, 16, 8, 64, 64, "Memory stress: 128 tokens, 256 head_size"},
+            // Very long prompts (large document processing) - chunking required
+            {4096, 4096, 4096, 128, 16, 256, 32, 8, "Very Long: 4096 tokens, 128 head_size (chunked)"},
         };
         
         std::vector<BenchmarkResult> results;

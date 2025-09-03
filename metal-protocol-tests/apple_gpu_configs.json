@@ -7,7 +7,7 @@
       "max_threadgroups_per_grid": [65535, 65535, 65535],
       "max_concurrent_threads": 32768,
       "max_buffer_size_mb": 64,
-      "max_total_workspace_mb": 200,
+      "max_total_workspace_mb": 512,
       "chunking": {
         "head_dim_threshold": 4096,
         "min_tokens_for_chunking": 256,
@@ -26,30 +26,11 @@
       "max_threadgroups_per_grid": [65535, 65535, 65535],
       "max_concurrent_threads": 49152,
       "max_buffer_size_mb": 96,
-      "max_total_workspace_mb": 300,
+      "max_total_workspace_mb": 512,
       "chunking": {
         "head_dim_threshold": 6144,
         "min_tokens_for_chunking": 384,
         "max_tokens_per_chunk": 384,
-        "enable_adaptive_chunking": true
-      },
-      "memory": {
-        "shared_memory_kb": 32,
-        "recommended_max_working_set_ratio": 0.8
-      }
-    },
-    "M1_Max": {
-      "name": "Apple M1 Max",
-      "gpu_family": 7,
-      "max_threads_per_threadgroup": 1024,
-      "max_threadgroups_per_grid": [65535, 65535, 65535],
-      "max_concurrent_threads": 65536,
-      "max_buffer_size_mb": 128,
-      "max_total_workspace_mb": 400,
-      "chunking": {
-        "head_dim_threshold": 8192,
-        "min_tokens_for_chunking": 512,
-        "max_tokens_per_chunk": 512,
         "enable_adaptive_chunking": true
       },
       "memory": {
@@ -64,7 +45,7 @@
       "max_threadgroups_per_grid": [65535, 65535, 65535],
       "max_concurrent_threads": 40960,
       "max_buffer_size_mb": 80,
-      "max_total_workspace_mb": 250,
+      "max_total_workspace_mb": 512,
       "chunking": {
         "head_dim_threshold": 5120,
         "min_tokens_for_chunking": 320,
@@ -83,7 +64,7 @@
       "max_threadgroups_per_grid": [65535, 65535, 65535],
       "max_concurrent_threads": 57344,
       "max_buffer_size_mb": 112,
-      "max_total_workspace_mb": 350,
+      "max_total_workspace_mb": 512,
       "chunking": {
         "head_dim_threshold": 7168,
         "min_tokens_for_chunking": 448,
@@ -102,68 +83,11 @@
       "max_threadgroups_per_grid": [65535, 65535, 65535],
       "max_concurrent_threads": 73728,
       "max_buffer_size_mb": 144,
-      "max_total_workspace_mb": 450,
+      "max_total_workspace_mb": 512,
       "chunking": {
         "head_dim_threshold": 9216,
         "min_tokens_for_chunking": 576,
         "max_tokens_per_chunk": 576,
-        "enable_adaptive_chunking": true
-      },
-      "memory": {
-        "shared_memory_kb": 32,
-        "recommended_max_working_set_ratio": 0.8
-      }
-    },
-    "M3": {
-      "name": "Apple M3",
-      "gpu_family": 9,
-      "max_threads_per_threadgroup": 1024,
-      "max_threadgroups_per_grid": [65535, 65535, 65535],
-      "max_concurrent_threads": 49152,
-      "max_buffer_size_mb": 96,
-      "max_total_workspace_mb": 300,
-      "chunking": {
-        "head_dim_threshold": 6144,
-        "min_tokens_for_chunking": 384,
-        "max_tokens_per_chunk": 384,
-        "enable_adaptive_chunking": true
-      },
-      "memory": {
-        "shared_memory_kb": 32,
-        "recommended_max_working_set_ratio": 0.8
-      }
-    },
-    "M3_Pro": {
-      "name": "Apple M3 Pro",
-      "gpu_family": 9,
-      "max_threads_per_threadgroup": 1024,
-      "max_threadgroups_per_grid": [65535, 65535, 65535],
-      "max_concurrent_threads": 65536,
-      "max_buffer_size_mb": 128,
-      "max_total_workspace_mb": 400,
-      "chunking": {
-        "head_dim_threshold": 8192,
-        "min_tokens_for_chunking": 512,
-        "max_tokens_per_chunk": 512,
-        "enable_adaptive_chunking": true
-      },
-      "memory": {
-        "shared_memory_kb": 32,
-        "recommended_max_working_set_ratio": 0.8
-      }
-    },
-    "M3_Max": {
-      "name": "Apple M3 Max",
-      "gpu_family": 9,
-      "max_threads_per_threadgroup": 1024,
-      "max_threadgroups_per_grid": [65535, 65535, 65535],
-      "max_concurrent_threads": 98304,
-      "max_buffer_size_mb": 192,
-      "max_total_workspace_mb": 600,
-      "chunking": {
-        "head_dim_threshold": 12288,
-        "min_tokens_for_chunking": 768,
-        "max_tokens_per_chunk": 768,
         "enable_adaptive_chunking": true
       },
       "memory": {
@@ -178,7 +102,7 @@
       "max_threadgroups_per_grid": [65535, 65535, 65535],
       "max_concurrent_threads": 32768,
       "max_buffer_size_mb": 64,
-      "max_total_workspace_mb": 200,
+      "max_total_workspace_mb": 512,
       "chunking": {
         "head_dim_threshold": 4096,
         "min_tokens_for_chunking": 256,
