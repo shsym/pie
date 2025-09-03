@@ -7,10 +7,10 @@
 
 namespace ops {
 
-void run_append_paged_kv_cache(const std::string& case_id,
+template<typename T>
+void run_append_paged_kv_cache_typed(const std::string& case_id,
 							   const AppendPagedKVCacheConfig& cfg,
 							   uint64_t seed) {
-	using T = __nv_bfloat16;
 	using I = int32_t;
 
 	const int num_tokens = cfg.num_tokens;
@@ -174,5 +174,16 @@ void run_append_paged_kv_cache(const std::string& case_id,
 	cudaFree(d_v_input);
 	cudaFree(d_k_input);
 }
+
+// Non-templated wrapper that calls the templated version with bf16
+void run_append_paged_kv_cache(const std::string& case_id,
+							   const AppendPagedKVCacheConfig& cfg,
+							   uint64_t seed) {
+	run_append_paged_kv_cache_typed<__nv_bfloat16>(case_id, cfg, seed);
+}
+
+// Explicit template instantiations (FlashInfer only supports 16-bit types for KV operations)
+template void run_append_paged_kv_cache_typed<__half>(const std::string&, const AppendPagedKVCacheConfig&, uint64_t);
+template void run_append_paged_kv_cache_typed<__nv_bfloat16>(const std::string&, const AppendPagedKVCacheConfig&, uint64_t);
 
 } // namespace ops

@@ -5,6 +5,8 @@
 #include <cassert>
 #include <cstdint>
 #include <algorithm>
+#include <filesystem>
+#include "workspace_utils.hpp"
 
 // Metal reference implementation of the Metal GEMM kernel logic
 // This allows testing the algorithm on Linux without actual Metal execution
@@ -138,7 +140,8 @@ bool compare_arrays(const std::vector<bfloat16_t>& a, const std::vector<bfloat16
 
 // Test Metal reference implementation against CUDA reference data
 bool test_metal_vs_cuda_artifacts() {
-    const std::string artifacts_dir = "../../metal-protocol-tests/tests/artifacts/gemm/test1/";
+    auto artifacts_base = workspace_utils::get_cuda_artifacts_dir();
+    const std::string artifacts_dir = (artifacts_base / "gemm" / "test1").string() + "/";
     
     try {
         // Load CUDA reference data (bfloat16 stored as uint16_t)

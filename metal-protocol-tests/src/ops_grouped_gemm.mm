@@ -12,6 +12,7 @@
 #include "metal_helpers.hpp"
 #include "metal_grouped_gemm.hpp"
 #include "dtype_utils.hpp"
+#include "workspace_utils.hpp"
 
 namespace ops {
 
@@ -67,12 +68,10 @@ void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig&
     };
 
     bool loaded_cuda_inputs = false;
-    std::filesystem::path cuda_base_dir;
-    if (const char* envp = std::getenv("PIE_CUDA_ARTIFACTS_DIR")) {
-        cuda_base_dir = std::filesystem::path(envp);
-    } else {
-        std::filesystem::path this_file(__FILE__);
-        cuda_base_dir = this_file.parent_path().parent_path() / "tests" / "artifacts";
+    auto cuda_base_dir = workspace_utils::get_cuda_artifacts_dir();
+    if (cuda_base_dir.empty()) {
+        std::cerr << "Error: Could not find workspace root or CUDA artifacts directory" << std::endl;
+        return;
     }
     auto cuda_case_dir = cuda_base_dir / "grouped_gemm" / case_id;
 

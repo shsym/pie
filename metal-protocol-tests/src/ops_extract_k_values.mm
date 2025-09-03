@@ -12,6 +12,7 @@
 #include "metal_helpers.hpp"
 #include "metal_extract_k_values.hpp"
 #include "dtype_utils.hpp"
+#include "workspace_utils.hpp"
 
 namespace ops {
 
@@ -40,8 +41,8 @@ void run_extract_k_values_metal(const std::string& case_id, const ExtractKConfig
     std::vector<int32_t> h_I(I_size);
 
     // Load input data from CUDA reference artifacts to ensure exact match
-    std::string cuda_artifacts_base = "/Users/seung-seoblee/Dev/pie/metal-protocol-tests/tests/artifacts";
-    std::string cuda_case_dir = cuda_artifacts_base + "/extract_k_values/" + case_id;
+    auto cuda_artifacts_base = workspace_utils::get_cuda_artifacts_dir();
+    std::string cuda_case_dir = (cuda_artifacts_base / "extract_k_values" / case_id).string();
     std::string input_path = cuda_case_dir + "/A.bin";
     
     std::ifstream cuda_file(input_path, std::ios::binary);
