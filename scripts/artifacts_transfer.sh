@@ -177,8 +177,8 @@ compress_artifacts() {
 
     echo -e "${YELLOW}Found $ARTIFACT_COUNT artifact files${NC}"
 
-    # Since CUDA_ARTIFACTS_SOURCE and METAL_ARTIFACTS_TARGET are the same, no copying needed
-    echo -e "${BLUE}Using artifacts directly from Metal target location...${NC}"
+    # Artifacts will be extracted to their original CUDA location for Metal protocol tests to use
+    echo -e "${BLUE}Preparing artifacts for extraction to CUDA location...${NC}"
 
     # Copy config file too
     cp "$LLAMA31_CONFIG" "$WORKSPACE_ROOT/metal-protocol-tests/"
@@ -326,8 +326,8 @@ extract_artifacts() {
 
     # Start file counting in background while checking directory existence
     {
-        if [ -d "$METAL_ARTIFACTS_TARGET" ]; then
-            EXTRACTED_COUNT=$(find "$METAL_ARTIFACTS_TARGET" -name "*.bin" -o -name "*.json" | wc -l)
+        if [ -d "$CUDA_ARTIFACTS_SOURCE" ]; then
+            EXTRACTED_COUNT=$(find "$CUDA_ARTIFACTS_SOURCE" -name "*.bin" -o -name "*.json" | wc -l)
             echo "$EXTRACTED_COUNT" > /tmp/extracted_count_$$
         else
             echo "0" > /tmp/extracted_count_$$
@@ -336,14 +336,14 @@ extract_artifacts() {
     count_pid=$!
 
     # Check if extraction succeeded
-    if [ -d "$METAL_ARTIFACTS_TARGET" ]; then
+    if [ -d "$CUDA_ARTIFACTS_SOURCE" ]; then
         # Wait for file counting to complete
         wait $count_pid
         EXTRACTED_COUNT=$(cat /tmp/extracted_count_$$ 2>/dev/null || echo "0")
         rm -f /tmp/extracted_count_$$
 
         echo -e "${GREEN}✅ Extraction complete!${NC}"
-        echo -e "📁 Location: ${BLUE}$METAL_ARTIFACTS_TARGET${NC}"
+        echo -e "📁 Location: ${BLUE}$CUDA_ARTIFACTS_SOURCE${NC}"
         echo -e "📄 Files: ${YELLOW}$EXTRACTED_COUNT artifacts${NC}"
 
         # Validate extracted artifacts unless skipping verification
@@ -362,7 +362,8 @@ extract_artifacts() {
         # Clean up temp file if extraction failed
         wait $count_pid 2>/dev/null || true
         rm -f /tmp/extracted_count_$$
-        echo -e "${RED}Error: Extraction failed - artifacts directory not created${NC}"
+        echo -e "${RED}Error: Extraction failed - CUDA artifacts directory not created${NC}"
+        echo -e "Expected location: ${BLUE}$CUDA_ARTIFACTS_SOURCE${NC}"
         exit 1
     fi
 }

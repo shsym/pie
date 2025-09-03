@@ -3,6 +3,12 @@
 #include <filesystem>
 #include <string>
 #include <cstdlib>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 namespace workspace_utils {
 
@@ -35,9 +41,22 @@ inline std::filesystem::path find_workspace_root() {
 
     // If that fails, try from executable location
     char exe_path_buf[1024];
+    bool exe_found = false;
+    
+#ifdef __APPLE__
+    uint32_t size = sizeof(exe_path_buf);
+    if (_NSGetExecutablePath(exe_path_buf, &size) == 0) {
+        exe_found = true;
+    }
+#elif defined(__linux__)
     ssize_t len = readlink("/proc/self/exe", exe_path_buf, sizeof(exe_path_buf) - 1);
     if (len != -1) {
         exe_path_buf[len] = '\0';
+        exe_found = true;
+    }
+#endif
+    
+    if (exe_found) {
         std::filesystem::path exe_dir = std::filesystem::path(exe_path_buf).parent_path();
 
         current = exe_dir;

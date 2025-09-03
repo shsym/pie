@@ -49,16 +49,16 @@ run_test() {
     local test_name="$1"
     local test_binary="$2"
     local category="$3"
-    
+
     if [ ! -f "$test_binary" ]; then
         echo -e "${YELLOW}⚠️  SKIPPED: $test_name (binary not found)${NC}"
         TEST_RESULTS+=("SKIP:$category:$test_name:Binary not found")
         ((SKIPPED_TESTS++))
         return
     fi
-    
+
     echo -e "${PURPLE}🔄 Running: $test_name${NC}"
-    
+
     local test_start=$(date +%s.%3N)
     if timeout 300 "$test_binary" > /dev/null 2>&1; then
         local test_end=$(date +%s.%3N)
@@ -85,30 +85,30 @@ run_category() {
     local estimated_time="$3"
     shift 3
     local tests=("$@")
-    
+
     print_subsection "$category Tests - $description (Est: $estimated_time)"
-    
+
     local category_start=$(date +%s.%3N)
     local category_passed=0
     local category_failed=0
     local category_skipped=0
-    
+
     for test_spec in "${tests[@]}"; do
         IFS=':' read -r test_name test_binary <<< "$test_spec"
         run_test "$test_name" "$test_binary" "$category"
-        
+
         case "${TEST_RESULTS[${#TEST_RESULTS[@]}-1]}" in
             PASS:*) ((category_passed++)) ;;
             FAIL:*) ((category_failed++)) ;;
             SKIP:*) ((category_skipped++)) ;;
         esac
     done
-    
+
     local category_end=$(date +%s.%3N)
     local category_duration=$(echo "$category_end - $category_start" | bc -l)
-    
+
     echo -e "\n${CYAN}$category Summary: ${category_passed} passed, ${category_failed} failed, ${category_skipped} skipped (${category_duration}s)${NC}"
-    
+
     if [ $category_failed -gt 0 ]; then
         return 1
     fi
@@ -118,11 +118,11 @@ run_category() {
 # Main execution
 main() {
     print_section "Metal Protocol Tests - Organized Test Suite"
-    
+
     echo -e "${BLUE}Starting comprehensive test execution...${NC}"
     echo -e "Test directory: $PWD"
     echo -e "Timestamp: $(date)"
-    
+
     # Build tests first if needed
     if [ ! -d "build" ] || [ ! -f "bin/test_softmax_unit" ]; then
         print_subsection "Building Tests"
@@ -134,7 +134,7 @@ main() {
             exit 1
         fi
     fi
-    
+
     # Define test categories and their tests
     local unit_tests=(
         "Softmax Unit:bin/test_softmax_unit"
@@ -142,7 +142,7 @@ main() {
         "TopK Mask Unit:bin/test_topk_mask_unit"
         "Batch Attention Unit:bin/test_batch_attention_unit"
     )
-    
+
     local integration_tests=(
         "Softmax Integration:bin/test_softmax_integration"
         "Extract K Integration:bin/test_extract_k_integration"
@@ -150,45 +150,45 @@ main() {
         "Edge Cases:bin/test_edge_cases"
         "Data Type Validation:bin/test_dtype_validation"
     )
-    
+
     local stress_tests=(
         "Memory Basic:bin/test_memory_basic"
         "Resource Reuse:bin/test_resource_reuse"
     )
-    
+
     local performance_tests=(
         "Performance Suite:bin/test_performance_suite"
     )
-    
+
     local compatibility_tests=(
         "API Compatibility:bin/test_api_compatibility"
         "CUDA Compatibility:bin/test_cuda_compatibility"
     )
-    
+
     # Run test categories
     local category_results=()
-    
+
     # Unit tests (fast smoke tests)
     if run_category "Unit" "Core functionality - fast execution" "< 1 minute" "${unit_tests[@]}"; then
         category_results+=("Unit: PASSED")
     else
         category_results+=("Unit: FAILED")
     fi
-    
-    # Integration tests (medium complexity)  
+
+    # Integration tests (medium complexity)
     if run_category "Integration" "Full workflows - medium execution" "2-5 minutes" "${integration_tests[@]}"; then
         category_results+=("Integration: PASSED")
     else
         category_results+=("Integration: FAILED")
     fi
-    
+
     # Stress tests (resource management)
     if run_category "Stress" "Resource management - long execution" "5-10 minutes" "${stress_tests[@]}"; then
         category_results+=("Stress: PASSED")
     else
         category_results+=("Stress: FAILED")
     fi
-    
+
     # Performance tests (optional benchmarks)
     echo -e "\n${YELLOW}⚠️  Performance tests are optional and may take 10+ minutes${NC}"
     read -p "Run performance tests? (y/N): " -n 1 -r
@@ -203,20 +203,20 @@ main() {
         echo -e "${YELLOW}⏭️  Performance tests skipped${NC}"
         category_results+=("Performance: SKIPPED")
     fi
-    
+
     # Compatibility tests
     if run_category "Compatibility" "API compatibility checks" "varies" "${compatibility_tests[@]}"; then
         category_results+=("Compatibility: PASSED")
     else
         category_results+=("Compatibility: FAILED")
     fi
-    
+
     # Final summary
     local end_time=$(date +%s)
     local total_duration=$((end_time - START_TIME))
-    
+
     print_section "Final Test Results"
-    
+
     echo -e "${BLUE}Category Results:${NC}"
     for result in "${category_results[@]}"; do
         if [[ $result == *"PASSED"* ]]; then
@@ -227,14 +227,14 @@ main() {
             echo -e "  ${YELLOW}⏭️  $result${NC}"
         fi
     done
-    
+
     echo -e "\n${BLUE}Overall Statistics:${NC}"
     echo -e "  Total Tests: $TOTAL_TESTS"
     echo -e "  ${GREEN}Passed: $PASSED_TESTS${NC}"
     echo -e "  ${RED}Failed: $FAILED_TESTS${NC}"
     echo -e "  ${YELLOW}Skipped: $SKIPPED_TESTS${NC}"
     echo -e "  Total Time: ${total_duration}s"
-    
+
     # Detailed test results
     echo -e "\n${BLUE}Detailed Test Results:${NC}"
     for result in "${TEST_RESULTS[@]}"; do
@@ -245,7 +245,7 @@ main() {
             SKIP) echo -e "  ${YELLOW}⏭️  $category - $test_name ($duration)${NC}" ;;
         esac
     done
-    
+
     # Performance analysis
     if [ ${#TEST_TIMES[@]} -gt 0 ]; then
         echo -e "\n${BLUE}Performance Analysis:${NC}"
@@ -258,20 +258,11 @@ main() {
         echo -e "  Total test execution: ${total_test_time}s"
         echo -e "  Overhead time: $((total_duration - ${total_test_time%.*}))s"
     fi
-    
+
     # Exit with appropriate code
     if [ $FAILED_TESTS -eq 0 ]; then
         echo -e "\n${GREEN}🎉 ALL TESTS PASSED!${NC}"
         echo -e "${GREEN}The organized test suite is working correctly.${NC}"
-        
-        # Show comparison with old system
-        echo -e "\n${BLUE}Improvement Summary:${NC}"
-        echo -e "  ${GREEN}✅ Eliminated 17+ redundant tests (31 → 14)${NC}"
-        echo -e "  ${GREEN}✅ Clear test organization (unit/integration/stress/performance/compatibility)${NC}"
-        echo -e "  ${GREEN}✅ All binaries in organized structure${NC}"
-        echo -e "  ${GREEN}✅ Timing and detailed reporting${NC}"
-        echo -e "  ${GREEN}✅ Metal Internal Error (0x0000000e) fixed via handle-based API${NC}"
-        
         return 0
     else
         echo -e "\n${RED}❌ SOME TESTS FAILED${NC}"
