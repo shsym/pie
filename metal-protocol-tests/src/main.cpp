@@ -74,31 +74,83 @@ void emit_cuda_meta_from_cli(const Args& args) {
     (void)ec;
     std::filesystem::path meta = dir / "meta.json";
     std::ostringstream os;
-    os << "{\n";
-    os << "  \"op\": \"" << cuda_op_name << "\",\n";
-    os << "  \"case_id\": \"" << args.case_id << "\",\n";
-    os << "  \"dtype\": \"" << args.dtype << "\",\n";
-    os << "  \"num_tokens\": " << args.num_tokens << ",\n";
-    os << "  \"hidden_size\": " << args.hidden_size << ",\n";
-    os << "  \"vocab_size\": " << args.vocab_size << ",\n";
-    os << "  \"intermediate_size\": " << args.intermediate_size << ",\n";
-    os << "  \"M\": " << args.M << ",\n";
-    os << "  \"N\": " << args.N << ",\n";
-    os << "  \"k\": " << args.k << ",\n";
-    os << "  \"m\": " << args.m << ",\n";
-    os << "  \"n\": " << args.n << ",\n";
-    os << "  \"batch_size\": " << args.batch_size << ",\n";
-    os << "  \"num_heads\": " << args.num_heads << ",\n";
-    os << "  \"head_size\": " << args.head_size << ",\n";
-    os << "  \"num_query_heads\": " << args.num_query_heads << ",\n";
-    os << "  \"num_kv_heads\": " << args.num_kv_heads << ",\n";
-    os << "  \"kv_len\": " << args.kv_len << ",\n";
-    os << "  \"page_size\": " << args.page_size << ",\n";
-    os << "  \"num_groups\": " << args.num_groups << ",\n";
-    os << "  \"max_num_pages\": " << args.max_num_pages << ",\n";
-    os << "  \"eps\": " << args.eps << ",\n";
-    os << "  \"temperature\": " << args.temperature << "\n";
-    os << "}\n";
+
+    // Generate new format for batch_prefill_attention, old format for others
+    if (args.op == "batch_prefill_attention") {
+        // Calculate dimensions
+        int head_dim = args.num_query_heads * args.head_size;
+        int kv_head_dim = args.num_kv_heads * args.head_size;
+        int num_pages = (args.kv_len + args.page_size - 1) / args.page_size; // Ceiling division
+
+        os << "{\n";
+        os << "  \"version\": \"1\",\n";
+        os << "  \"op\": \"" << cuda_op_name << "\",\n";
+        os << "  \"backend\": \"cuda\",\n";
+        os << "  \"case_id\": \"" << args.case_id << "\",\n";
+        os << "  \"config\": {\n";
+        os << "    \"num_tokens\": " << args.num_tokens << ",\n";
+        os << "    \"num_query_heads\": " << args.num_query_heads << ",\n";
+        os << "    \"num_kv_heads\": " << args.num_kv_heads << ",\n";
+        os << "    \"head_size\": " << args.head_size << ",\n";
+        os << "    \"kv_len\": " << args.kv_len << ",\n";
+        os << "    \"page_size\": " << args.page_size << ",\n";
+        os << "    \"batch_size\": 1,\n";
+        os << "    \"num_pages\": " << num_pages << "\n";
+        os << "  },\n";
+        os << "  \"dtype_map\": {\n";
+        os << "    \"q_input\": \"" << args.dtype << "\",\n";
+        os << "    \"k_input\": \"" << args.dtype << "\",\n";
+        os << "    \"v_input\": \"" << args.dtype << "\",\n";
+        os << "    \"paged_k_cache\": \"" << args.dtype << "\",\n";
+        os << "    \"paged_v_cache\": \"" << args.dtype << "\",\n";
+        os << "    \"output\": \"" << args.dtype << "\",\n";
+        os << "    \"qo_indptr\": \"s32\",\n";
+        os << "    \"kv_page_indptr\": \"s32\",\n";
+        os << "    \"kv_page_indices\": \"s32\",\n";
+        os << "    \"kv_last_page_lens\": \"s32\"\n";
+        os << "  },\n";
+        os << "  \"shape_map\": {\n";
+        os << "    \"q_input\": [" << args.num_tokens << ", " << head_dim << "],\n";
+        os << "    \"k_input\": [" << (num_pages * args.page_size) << ", " << kv_head_dim << "],\n";
+        os << "    \"v_input\": [" << (num_pages * args.page_size) << ", " << kv_head_dim << "],\n";
+        os << "    \"paged_k_cache\": [" << num_pages << ", " << args.page_size << ", " << kv_head_dim << "],\n";
+        os << "    \"paged_v_cache\": [" << num_pages << ", " << args.page_size << ", " << kv_head_dim << "],\n";
+        os << "    \"output\": [" << args.num_tokens << ", " << head_dim << "],\n";
+        os << "    \"qo_indptr\": [2],\n";
+        os << "    \"kv_page_indptr\": [2],\n";
+        os << "    \"kv_page_indices\": [" << num_pages << "],\n";
+        os << "    \"kv_last_page_lens\": [1]\n";
+        os << "  }\n";
+        os << "}\n";
+    } else {
+        // Legacy format for other operations
+        os << "{\n";
+        os << "  \"op\": \"" << cuda_op_name << "\",\n";
+        os << "  \"case_id\": \"" << args.case_id << "\",\n";
+        os << "  \"dtype\": \"" << args.dtype << "\",\n";
+        os << "  \"num_tokens\": " << args.num_tokens << ",\n";
+        os << "  \"hidden_size\": " << args.hidden_size << ",\n";
+        os << "  \"vocab_size\": " << args.vocab_size << ",\n";
+        os << "  \"intermediate_size\": " << args.intermediate_size << ",\n";
+        os << "  \"M\": " << args.M << ",\n";
+        os << "  \"N\": " << args.N << ",\n";
+        os << "  \"k\": " << args.k << ",\n";
+        os << "  \"m\": " << args.m << ",\n";
+        os << "  \"n\": " << args.n << ",\n";
+        os << "  \"batch_size\": " << args.batch_size << ",\n";
+        os << "  \"num_heads\": " << args.num_heads << ",\n";
+        os << "  \"head_size\": " << args.head_size << ",\n";
+        os << "  \"num_query_heads\": " << args.num_query_heads << ",\n";
+        os << "  \"num_kv_heads\": " << args.num_kv_heads << ",\n";
+        os << "  \"kv_len\": " << args.kv_len << ",\n";
+        os << "  \"page_size\": " << args.page_size << ",\n";
+        os << "  \"num_groups\": " << args.num_groups << ",\n";
+        os << "  \"max_num_pages\": " << args.max_num_pages << ",\n";
+        os << "  \"eps\": " << args.eps << ",\n";
+        os << "  \"temperature\": " << args.temperature << "\n";
+        os << "}\n";
+    }
+
     std::ofstream ofs(meta);
     ofs << os.str();
     std::cout << "Wrote CUDA-style meta.json to " << meta << " with dtype=" << args.dtype << std::endl;
@@ -225,7 +277,7 @@ void override_with_cuda_metadata(Args& args, const std::string& cuda_artifacts_d
         args.hidden_size = extract_json_int(json_content, "hidden_size", args.hidden_size);
         args.vocab_size = extract_json_int(json_content, "vocab_size", args.vocab_size);
         args.intermediate_size = extract_json_int(json_content, "intermediate_size", args.intermediate_size);
-        
+
         // Extract M, N, k from nested "config" object if present (new CUDA artifact format)
         std::string config_search = "\"config\":";
         size_t config_pos = json_content.find(config_search);

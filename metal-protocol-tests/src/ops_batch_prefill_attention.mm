@@ -340,10 +340,10 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
            << ", \"batch_size\": 1, \"num_pages\": " << num_pages_actual << "},\n"
            << "\"dtype_map\": {\"q_input\": \"" << dtype_info.dtype_str << "\", \"k_input\": \"" << dtype_info.dtype_str << "\", \"v_input\": \"" << dtype_info.dtype_str << "\", \"paged_k_cache\": \"" << dtype_info.dtype_str << "\", \"paged_v_cache\": \"" << dtype_info.dtype_str << "\", \"output\": \"" << dtype_info.dtype_str << "\", \"qo_indptr\": \"s32\", \"kv_page_indptr\": \"s32\", \"kv_page_indices\": \"s32\", \"kv_last_page_lens\": \"s32\"},\n"
            << "\"shape_map\": {\"q_input\": [" << num_tokens << ", " << head_dim << "], "
-           << "\"k_input\": [" << (num_pages_actual * page_size) << ", " << head_dim << "], "
-           << "\"v_input\": [" << (num_pages_actual * page_size) << ", " << head_dim << "], "
-           << "\"paged_k_cache\": [" << num_pages_actual << ", " << page_size << ", " << head_dim << "], "
-           << "\"paged_v_cache\": [" << num_pages_actual << ", " << page_size << ", " << head_dim << "], "
+           << "\"k_input\": [" << (num_pages_actual * page_size) << ", " << kv_head_dim << "], "
+           << "\"v_input\": [" << (num_pages_actual * page_size) << ", " << kv_head_dim << "], "
+           << "\"paged_k_cache\": [" << num_pages_actual << ", " << page_size << ", " << kv_head_dim << "], "
+           << "\"paged_v_cache\": [" << num_pages_actual << ", " << page_size << ", " << kv_head_dim << "], "
            << "\"output\": [" << num_tokens << ", " << head_dim << "], "
            << "\"qo_indptr\": [2], \"kv_page_indptr\": [2], \"kv_page_indices\": [" << num_pages_actual << "], \"kv_last_page_lens\": [1]}";
        artifacts::write_meta_json(dir, meta.str());
