@@ -1,11 +1,10 @@
 use crate::bindings;
+use crate::handler::core::Model;
 use crate::instance::InstanceState;
-use crate::model::Command;
 use crate::tokenizer::BytePairEncoder;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 use wasmtime::component::Resource;
-use wasmtime_wasi::p2::IoView;
+use wasmtime_wasi::WasiView;
 
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
@@ -15,13 +14,11 @@ pub struct Tokenizer {
 impl bindings::pie::inferlet::tokenize::Host for InstanceState {
     async fn get_tokenizer(
         &mut self,
-        queue: Resource<bindings::core::Queue>,
+        model: Resource<Model>,
     ) -> anyhow::Result<Resource<Tokenizer>> {
-        let q = self.table().get(&queue)?;
-        let (tx, rx) = oneshot::channel();
-        Command::GetTokenizer { handle: tx }.dispatch(q.service_id)?;
-        let inner = rx.await?;
-        Ok(self.table().push(Tokenizer { inner })?)
+        let inner = self.ctx().table.get(&model)?.info.tokenizer.clone();
+
+        Ok(self.ctx().table.push(Tokenizer { inner })?)
     }
 }
 
@@ -31,7 +28,7 @@ impl bindings::pie::inferlet::tokenize::HostTokenizer for InstanceState {
         this: Resource<Tokenizer>,
         text: String,
     ) -> anyhow::Result<Vec<u32>> {
-        let tokenizer = self.table().get(&this)?;
+        let tokenizer = self.ctx().table.get(&this)?;
         Ok(tokenizer.inner.encode_with_special_tokens(&text))
     }
 
@@ -40,17 +37,20 @@ impl bindings::pie::inferlet::tokenize::HostTokenizer for InstanceState {
         this: Resource<Tokenizer>,
         tokens: Vec<u32>,
     ) -> anyhow::Result<String> {
-        let tokenizer = self.table().get(&this)?;
+        let tokenizer = self.ctx().table.get(&this)?;
         tokenizer.inner.decode(&tokens).map_err(Into::into)
     }
 
-    async fn get_vocabs(&mut self, this: Resource<Tokenizer>) -> anyhow::Result<(Vec<u32>, Vec<Vec<u8>>)> {
-        let tokenizer = self.table().get(&this)?;
+    async fn get_vocabs(
+        &mut self,
+        this: Resource<Tokenizer>,
+    ) -> anyhow::Result<(Vec<u32>, Vec<Vec<u8>>)> {
+        let tokenizer = self.ctx().table.get(&this)?;
         Ok(tokenizer.inner.get_vocabs())
     }
 
     async fn drop(&mut self, this: Resource<Tokenizer>) -> anyhow::Result<()> {
-        self.table().delete(this)?;
+        self.ctx().table.delete(this)?;
         Ok(())
     }
 }

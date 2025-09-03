@@ -1,0 +1,11 @@
+interface adapter {
+
+    use core.{queue, pointer};
+    use forward.{forward-pass};
+
+    set-adapter: func(
+        pass: borrow<forward-pass>,
+        adapter-ptr: pointer
+    );
+
+}

@@ -1,12 +1,11 @@
-interface input-image {
+interface image {
 
-    use core.{queue};
-    use allocate.{object-id};         // Import object ID type for memory references
+    use core.{queue, pointer};
 
     // Embeds an image blob into model-compatible embeddings
     embed-image: func(
         queue: borrow<queue>,         // Queue to execute the embedding operation
-        emb-ids: list<object-id>,     // Output object IDs where image embeddings will be stored
+        emb-ptrs: list<pointer>,     // Output object IDs where image embeddings will be stored
         image-blob: list<u8>,         // Raw image data (e.g. JPEG/PNG bytes)
         position-offset: u32          // Positional offset in the embedding space
     );

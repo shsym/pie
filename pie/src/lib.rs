@@ -3,20 +3,17 @@ use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
-// Public modules
 pub mod auth;
-pub mod client;
-
-// Internal modules
-mod backend;
 mod batching;
 mod bindings;
+pub mod client;
+mod handler;
 mod instance;
 mod kvs;
 mod messaging;
 mod model;
 mod object;
-mod ping;
+mod resource;
 mod runtime;
 pub mod server;
 mod service;
@@ -27,8 +24,6 @@ mod utils;
 use crate::auth::{create_jwt, init_secret};
 use crate::kvs::KeyValueStore;
 use crate::messaging::{PubSub, PushPull};
-pub use crate::model::{BatchingStrategyConfiguration, set_batching_strategy};
-use crate::ping::Ping;
 use crate::runtime::Runtime;
 use crate::server::Server;
 use crate::service::install_service;
@@ -43,7 +38,6 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub verbose: bool,
     pub log: Option<PathBuf>,
-    pub batching_strategy: Option<BatchingStrategyConfiguration>,
 }
 
 /// Runs the PIE server logic within an existing Tokio runtime.
@@ -70,11 +64,6 @@ pub async fn run_server(config: Config, mut shutdown_rx: oneshot::Receiver<()>) 
         tracing::info!("Authentication is disabled.");
     }
 
-    if let Some(batching_strategy) = &config.batching_strategy {
-        tracing::info!("Custom batching strategy is configured.");
-        set_batching_strategy(*batching_strategy);
-    }
-
     // Set up core services
     let runtime = Runtime::new(&config.cache_dir);
     runtime.load_existing_programs()?;
@@ -85,15 +74,12 @@ pub async fn run_server(config: Config, mut shutdown_rx: oneshot::Receiver<()>) 
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
     let kv_store = KeyValueStore::new();
-    let dummy_ping_backend = backend::SimulatedBackend::new(ping::Simulator::new()).await;
-    let ping = Ping::new(dummy_ping_backend.clone()).await;
 
     install_service("runtime", runtime);
     install_service("server", server);
     install_service("kvs", kv_store);
     install_service("messaging-inst2inst", messaging_inst2inst);
     install_service("messaging-user2inst", messaging_user2inst);
-    install_service("ping", ping);
 
     tracing::info!("✅ PIE runtime started successfully on {}", server_url);
 

@@ -4,7 +4,7 @@ use futures::{SinkExt, StreamExt};
 use rmp_serde::{decode, encode};
 use std::sync::Arc;
 
-use crate::instance::Id as InstanceId;
+use crate::instance::InstanceId;
 use crate::server::{CHUNK_SIZE_BYTES, ClientMessage, QUERY_PROGRAM_EXISTS, ServerMessage};
 use crate::utils::IdPool;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -148,7 +148,10 @@ impl Client {
                     } => {
                         let inst_id = Uuid::parse_str(&instance_id).unwrap();
                         if let Some(sender) = inst_event_tx_.get(&inst_id) {
-                            let _ = sender.send((event, message)).await.ok();
+                            let _ = sender
+                                .send(((event as u32).to_string(), message))
+                                .await
+                                .ok();
                         }
                     }
                     ServerMessage::ServerEvent { message } => {

@@ -1,0 +1,13 @@
+fire>=0.6
+msgpack>=0.5
+platformdirs>=4.3
+protobuf>=6.31
+pyzmq>=27.0.0
+requests>=2.32
+tomli>=2.2
+torch>=2.7
+tqdm>=4.67
+websockets>=15.0
+ztensor>=0.1.4
+pylint>=3.3.0
+black>=24.10
