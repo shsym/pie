@@ -169,6 +169,7 @@ set(BACKEND_SOURCES_ORGANIZED
     ${BACKEND_SRC_PATH}/metal_embedding.mm
     ${BACKEND_SRC_PATH}/metal_buffer.mm
     ${BACKEND_SRC_PATH}/metal_tensor.mm
+    ${BACKEND_SRC_PATH}/metal_kv_cache.mm
 )
 
 # Additional backend libraries to link against
