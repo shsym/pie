@@ -437,11 +437,9 @@ void MetalL4maAttention<T>::forward(MetalL4maBuffer<T>& buffer, T* attn_output,
                            num_tokens, num_key_value_heads, head_size,
                            config_.rope_theta, config_.rope_factor);
     MetalProfiler::getInstance().record("apply_rope");
-    std::cout << "    ✅ Applied RoPE to K projections\n";
 
     // 3. Batch prefill attention with handle-based API
     auto context_out = buffer.template allocate<T>(num_tokens * num_query_heads * head_size);
-    std::cout << "    🔄 Performing batch prefill attention\n";
 
     // Use total_kv_pages if positive, otherwise use minimal allocation (0 pages)
     int kv_pages_for_workspace = std::max(0, total_kv_pages);
@@ -455,8 +453,6 @@ void MetalL4maAttention<T>::forward(MetalL4maBuffer<T>& buffer, T* attn_output,
         static_cast<int>(buffer.page_size),
         kv_pages_for_workspace
     );
-    std::cout << "      🗂️  Required workspace: " << workspace_info.total_size << " bytes ("
-              << (workspace_info.total_size / 1024 / 1024) << " MB) for " << kv_pages_for_workspace << " KV pages\n";
 
     // Check if we have enough memory available
     if (workspace_info.total_size == 0) {
@@ -469,7 +465,6 @@ void MetalL4maAttention<T>::forward(MetalL4maBuffer<T>& buffer, T* attn_output,
         throw std::runtime_error("Insufficient memory for attention workspace: need " +
                                 std::to_string(workspace_info.total_size) + " bytes");
     }
-    std::cout << "      ✅ Allocated attention workspace successfully\n";
 
     if constexpr (std::is_same_v<T, float>) {
         metal::batch_prefill_attention::batch_prefill_attention_unified_f32(
