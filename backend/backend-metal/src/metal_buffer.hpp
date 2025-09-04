@@ -331,8 +331,6 @@ void MetalStackAllocator::deallocate(MetalTensor<T>& tensor) {
     if (current_offset_ >= tensor_bytes) {
         current_offset_ -= tensor_bytes;
     }
-    // Note: In a real implementation, we'd need to track allocations more carefully
-    std::cout << "Deallocated MetalTensor of size " << tensor_bytes << " bytes. New offset: " << current_offset_ << std::endl;
 }
 
 template <typename T>

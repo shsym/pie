@@ -77,27 +77,19 @@ void MetalL4maModel<T>::forward(MetalL4maBuffer<T>& buffer,
         config_.hidden_size
     );
     MetalProfiler::getInstance().record("token_embedding");
-    std::cout << "  ✅ Token embedding lookup completed\n";
 
     // 2. Forward through all decoder layers
     MetalProfiler::getInstance().recordStart("attention");
     for (int layer_idx = 0; layer_idx < config_.num_layers; ++layer_idx) {
-        std::cout << "  🔄 Processing layer (kv_cache)" << layer_idx + 1 << "/" << config_.num_layers << "\n";
-
         // Get KV cache for this layer
         auto [kv_cache_k, kv_cache_v] = kv_cache.get_layer_pointers(layer_idx);
-        std::cout << "  🔄 Processing layer (kv_cache complete)" << layer_idx + 1 << "/" << config_.num_layers << "\n";
-
         layers_[layer_idx].forward(buffer, hidden_ptr, kv_cache_k, kv_cache_v, kv_cache.get_num_pages());
-        std::cout << "    ✅ Layer " << layer_idx + 1 << " forward pass completed\n";
     }
     MetalProfiler::getInstance().recordEnd("attention");
-    std::cout << "  ✅ Completed forward pass through " << config_.num_layers << " layers\n";
 
     // 3. Final layer normalization
     norm_.forward(final_norm_output, hidden_ptr, num_tokens, buffer.commandBuffer);
     MetalProfiler::getInstance().record("final_norm");
-    std::cout << "  ✅ Final layer normalization completed\n";
 
     // Deallocate if we owned the temporary hidden buffer
     if (hidden_owns) {

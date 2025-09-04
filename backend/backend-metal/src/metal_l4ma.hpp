@@ -288,53 +288,38 @@ void MetalL4maMlp<T>::forward(MetalL4maBuffer<T>& buffer, T* output, const T* x)
     size_t hidden_size = config_.hidden_size;
     size_t intermediate_size = config_.intermediate_size;
 
+    // Allocate intermediate tensors from buffer
+    auto gate_proj_out = buffer.template allocate<T>(buffer.num_tokens * intermediate_size);
+    auto up_proj_out = buffer.template allocate<T>(buffer.num_tokens * intermediate_size);
+
     auto& context = MetalContext::getInstance();
 
-    // Use scoped block to control tensor lifetime
-    {
-        // Test with static tensors to avoid destructor calls
-        size_t gate_proj_size = buffer.num_tokens * intermediate_size;
-        size_t up_proj_size = buffer.num_tokens * intermediate_size;
+    // 1. Gate and Up projections using GEMM namespace
+    MetalGEMM::gemm(buffer.commandBuffer, x, up_proj_weights_.data(), static_cast<const T*>(nullptr), up_proj_out.data(),
+                    buffer.num_tokens, intermediate_size, hidden_size,
+                    nullptr, 0, false, true);
+    MetalProfiler::getInstance().record("up_projection");
 
-        static MetalTensor<T> gate_proj_tensor({16384});  // Static size to avoid allocation each time
-        static MetalTensor<T> up_proj_tensor({16384});
+    MetalGEMM::gemm(buffer.commandBuffer, x, gate_proj_weights_.data(), static_cast<const T*>(nullptr), gate_proj_out.data(),
+                    buffer.num_tokens, intermediate_size, hidden_size,
+                    nullptr, 0, false, true);
+    MetalProfiler::getInstance().record("gate_projection");
 
-        T* gate_proj_out = gate_proj_tensor.data();
-        T* up_proj_out = up_proj_tensor.data();
-        std::cout << "    ✅ Using static tensors for MLP (destructors never called)\n";
+    // 2. SiLU activation and multiplication
+    MetalSiLUMul::silu_and_mul(gate_proj_out.data(), up_proj_out.data(),
+                               up_proj_out.data(), // reuse for result
+                               buffer.num_tokens, intermediate_size, buffer.commandBuffer);
+    MetalProfiler::getInstance().record("silu_and_mul");
 
-        // 1. Gate and Up projections using GEMM namespace
-        MetalGEMM::gemm(buffer.commandBuffer, x, up_proj_weights_.data(), static_cast<const T*>(nullptr), up_proj_out,
-                        buffer.num_tokens, intermediate_size, hidden_size,
-                        nullptr, 0, false, true);
-        MetalProfiler::getInstance().record("up_projection");
-        std::cout << "    ✅ Up projection completed\n";
+    // 3. Down projection
+    MetalGEMM::gemm(buffer.commandBuffer, up_proj_out.data(), down_proj_weights_.data(), static_cast<const T*>(nullptr), output,
+                    buffer.num_tokens, hidden_size, intermediate_size,
+                    nullptr, 0, false, true);
+    MetalProfiler::getInstance().record("down_projection");
 
-        MetalGEMM::gemm(buffer.commandBuffer, x, gate_proj_weights_.data(), static_cast<const T*>(nullptr), gate_proj_out,
-                        buffer.num_tokens, intermediate_size, hidden_size,
-                        nullptr, 0, false, true);
-        MetalProfiler::getInstance().record("gate_projection");
-        std::cout << "    ✅ Gate projection completed\n";
-
-        // 2. SiLU activation and multiplication
-        MetalSiLUMul::silu_and_mul(gate_proj_out, up_proj_out,
-                                   up_proj_out, // reuse for result
-                                   buffer.num_tokens, intermediate_size, buffer.commandBuffer);
-        MetalProfiler::getInstance().record("silu_and_mul");
-        std::cout << "    ✅ SiLU and multiplication completed\n";
-
-        // 3. Down projection
-        MetalGEMM::gemm(buffer.commandBuffer, up_proj_out, down_proj_weights_.data(), static_cast<const T*>(nullptr), output,
-                        buffer.num_tokens, hidden_size, intermediate_size,
-                        nullptr, 0, false, true);
-        MetalProfiler::getInstance().record("down_projection");
-        std::cout << "    ✅ Down projection completed\n";
-
-        // Tensors will be destroyed here, at end of scope
-        std::cout << "    ✅ Intermediate tensors going out of scope\n";
-    }
-
-    std::cout << "    ✅ MLP computation completed\n";
+    // Deallocate intermediate tensors
+    buffer.deallocate(gate_proj_out);
+    buffer.deallocate(up_proj_out);
 }
 
 template <typename T>
@@ -533,14 +518,12 @@ void MetalL4maAttention<T>::forward(MetalL4maBuffer<T>& buffer, T* attn_output,
         );
     }
     MetalProfiler::getInstance().record("batch_prefill_attention");
-    std::cout << "    ✅ Completed batch prefill attention\n";
 
     // 4. Output projection
     MetalGEMM::gemm(buffer.commandBuffer, context_out.data(), o_proj_weights_.data(), static_cast<const T*>(nullptr), attn_output,
                     num_tokens, hidden_size, num_query_heads * head_size,
                     nullptr, 0, false, true);
     MetalProfiler::getInstance().record("output_projection");
-    std::cout << "    ✅ Output projection completed\n";
 
     // Deallocate intermediate tensors
     buffer.deallocate(q_proj);
@@ -606,12 +589,10 @@ void MetalL4maDecoderLayer<T>::forward(MetalL4maBuffer<T>& buffer,
     // 1. Input layer normalization
     input_layernorm_.forward(normed_hidden_ptr, hidden_states, num_tokens, buffer.commandBuffer);
     MetalProfiler::getInstance().record("input_layernorm");
-    std::cout << "    ✅ Input layer normalization completed\n";
 
     // 2. Self attention
     self_attn_.forward(buffer, attn_output_ptr,
                       normed_hidden_ptr, kv_cache_k, kv_cache_v, total_kv_pages);
-    std::cout << "    ✅ Self-attention completed\n";
 
     // 3. Residual connection (add attention output to original hidden states)
     // TODO: Use metal_add_residual
@@ -619,23 +600,19 @@ void MetalL4maDecoderLayer<T>::forward(MetalL4maBuffer<T>& buffer,
         hidden_states[i] += attn_output_ptr[i];
     }
     MetalProfiler::getInstance().record("attention_residual");
-    std::cout << "    ✅ Attention residual connection completed\n";
 
     // 4. Post attention layer normalization
     post_attention_layernorm_.forward(normed_attn_ptr, hidden_states, num_tokens, buffer.commandBuffer);
     MetalProfiler::getInstance().record("post_attention_layernorm");
-    std::cout << "    ✅ Post-attention layer normalization completed\n";
 
     // 5. MLP
     mlp_.forward(buffer, mlp_output_ptr, normed_attn_ptr);
-    std::cout << "    ✅ MLP block completed\n";
 
     // 6. Residual connection (add MLP output to hidden states)
     // TODO: Use metal_add_residual
     for (size_t i = 0; i < num_tokens * hidden_size; ++i) {
         hidden_states[i] += mlp_output_ptr[i];
     }
-    std::cout << "    ✅ MLP residual connection completed\n";
     MetalProfiler::getInstance().record("mlp_residual");
 
     // Deallocate only if we owned temporaries (stack allocator path)
@@ -645,7 +622,6 @@ void MetalL4maDecoderLayer<T>::forward(MetalL4maBuffer<T>& buffer,
         buffer.deallocate(normed_attn_owned);
         buffer.deallocate(mlp_output_owned);
     }
-    std::cout << "    ✅ Deallocated intermediate tensors for Decoder Layer\n";
 }
 
 template <typename T>

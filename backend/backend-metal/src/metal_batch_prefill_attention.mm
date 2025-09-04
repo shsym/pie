@@ -760,33 +760,13 @@ void batch_prefill_attention_unified_bf16(
         size_t q_count = static_cast<size_t>(num_qo) * head_dim;
         size_t kv_count = static_cast<size_t>(num_kv_pages) * page_size * kv_head_dim;
 
-        // BUFFER VALIDATION: Verify each workspace region is accessible
-        std::cout << "🔍 [BUFFER CHECK] Validating workspace regions..." << std::endl;
-        std::cout << "   Workspace base: " << (void*)workspace_base << std::endl;
-        std::cout << "   Q workspace: " << q_workspace << " (size: " << workspace.q_buffer_size << ")" << std::endl;
-        std::cout << "   K workspace: " << k_workspace << " (size: " << workspace.k_buffer_size << ")" << std::endl;
-        std::cout << "   V workspace: " << v_workspace << " (size: " << workspace.v_buffer_size << ")" << std::endl;
-        std::cout << "   Counts: q_count=" << q_count << ", kv_count=" << kv_count << std::endl;
-
-        // Convert BF16 to Half in workspace
-        std::cout << "🔄 [DATA CONVERSION] Converting BF16 to Half..." << std::endl;
-        std::cout << "   Q input ptr: " << q_input << ", count: " << q_count << std::endl;
-        std::cout << "   K cache ptr: " << paged_k_cache << ", count: " << kv_count << std::endl;
-        std::cout << "   V cache ptr: " << paged_v_cache << ", count: " << kv_count << std::endl;
-
         std::vector<uint16_t> q_half_data = convert_bf16_to_half(q_input, q_count);
         std::vector<uint16_t> k_half_data = convert_bf16_to_half(paged_k_cache, kv_count);
         std::vector<uint16_t> v_half_data = convert_bf16_to_half(paged_v_cache, kv_count);
 
         // Copy converted data to workspace with validation
-        std::cout << "🔄 [MEMORY COPY] Copying converted data to workspace..." << std::endl;
-        std::cout << "   Q: " << q_half_data.size() << " elements -> " << q_workspace << std::endl;
         std::memcpy(q_workspace, q_half_data.data(), q_half_data.size() * sizeof(uint16_t));
-
-        std::cout << "   K: " << k_half_data.size() << " elements -> " << k_workspace << std::endl;
         std::memcpy(k_workspace, k_half_data.data(), k_half_data.size() * sizeof(uint16_t));
-
-        std::cout << "   V: " << v_half_data.size() << " elements -> " << v_workspace << std::endl;
         std::memcpy(v_workspace, v_half_data.data(), v_half_data.size() * sizeof(uint16_t));
 
         // Copy index data to workspace
@@ -795,12 +775,6 @@ void batch_prefill_attention_unified_bf16(
         size_t kv_page_indptr_size = (num_qo + 1) * sizeof(int32_t);
         size_t kv_page_indices_size = num_kv_pages * sizeof(int32_t);
         size_t kv_last_page_lens_size = num_qo * sizeof(int32_t);
-
-        std::cout << "🔄 [INDEX COPY] Copying index data to workspace..." << std::endl;
-        std::cout << "   Index workspace: " << index_workspace << ", total buffer size: " << workspace.index_buffer_size << std::endl;
-        std::cout << "   Sizes: qo=" << qo_indptr_size << ", kv_page=" << kv_page_indptr_size
-                  << ", indices=" << kv_page_indices_size << ", lens=" << kv_last_page_lens_size << std::endl;
-        std::cout << "   Total needed: " << (qo_indptr_size + kv_page_indptr_size + kv_page_indices_size + kv_last_page_lens_size) << std::endl;
 
         // Validate pointers before memcpy
         if (!qo_indptr) {
@@ -822,82 +796,59 @@ void batch_prefill_attention_unified_bf16(
         if (workspace.index_buffer_size > 1) {
             test_index[workspace.index_buffer_size-1] = 0xFF;
         }
-        std::cout << "   ✅ Index workspace accessible" << std::endl;
-
-        std::cout << "   Copying qo_indptr: " << (void*)qo_indptr << " -> " << ((char*)index_workspace + index_offset) << std::endl;
         std::memcpy((char*)index_workspace + index_offset, qo_indptr, qo_indptr_size);
         index_offset += qo_indptr_size;
-        std::cout << "   ✅ qo_indptr copied, new offset: " << index_offset << std::endl;
-
-        std::cout << "   Copying kv_page_indptr: " << (void*)kv_page_indptr << " -> " << ((char*)index_workspace + index_offset) << std::endl;
         std::memcpy((char*)index_workspace + index_offset, kv_page_indptr, kv_page_indptr_size);
         index_offset += kv_page_indptr_size;
-        std::cout << "   ✅ kv_page_indptr copied, new offset: " << index_offset << std::endl;
-
         if (num_kv_pages > 0 && kv_page_indices) {
-            std::cout << "   Copying kv_page_indices: " << (void*)kv_page_indices << " -> " << ((char*)index_workspace + index_offset) << std::endl;
             std::memcpy((char*)index_workspace + index_offset, kv_page_indices, kv_page_indices_size);
             index_offset += kv_page_indices_size;
-            std::cout << "   ✅ kv_page_indices copied, new offset: " << index_offset << std::endl;
         } else {
             std::cout << "   Skipping kv_page_indices (num_kv_pages=" << num_kv_pages << ")" << std::endl;
         }
 
-        std::cout << "   Copying kv_last_page_lens: " << (void*)kv_last_page_lens << " -> " << ((char*)index_workspace + index_offset) << std::endl;
         std::memcpy((char*)index_workspace + index_offset, kv_last_page_lens, kv_last_page_lens_size);
-        std::cout << "   ✅ kv_last_page_lens copied" << std::endl;
 
-        std::cout << "🔄 [METAL BUFFERS] Creating Metal buffer views..." << std::endl;
-
-        // Create Metal buffer views (no allocation!)
-        std::cout << "   Creating Q buffer: " << q_workspace << ", size=" << workspace.q_buffer_size << std::endl;
+        // Create Metal buffer views
         id<MTLBuffer> q_buf = [handle->device newBufferWithBytesNoCopy:q_workspace
-                                                               length:workspace.q_buffer_size
-                                                              options:MTLResourceStorageModeShared
-                                                         deallocator:nil];
+                               length:workspace.q_buffer_size
+                               options:MTLResourceStorageModeShared
+                               deallocator:nil];
         if (!q_buf) {
             std::cerr << "❌ Failed to create Q buffer!" << std::endl;
             return;
         }
-        std::cout << "   ✅ Q buffer created" << std::endl;
-
-        std::cout << "   Creating K buffer: " << k_workspace << ", size=" << workspace.k_buffer_size << std::endl;
         id<MTLBuffer> k_buf = [handle->device newBufferWithBytesNoCopy:k_workspace
-                                                               length:workspace.k_buffer_size
-                                                              options:MTLResourceStorageModeShared
-                                                         deallocator:nil];
+                                length:workspace.k_buffer_size
+                                options:MTLResourceStorageModeShared
+                                deallocator:nil];
         if (!k_buf) {
             std::cerr << "❌ Failed to create K buffer!" << std::endl;
             return;
         }
-        std::cout << "   ✅ K buffer created" << std::endl;
 
-        std::cout << "   Creating V buffer: " << v_workspace << ", size=" << workspace.v_buffer_size << std::endl;
         id<MTLBuffer> v_buf = [handle->device newBufferWithBytesNoCopy:v_workspace
-                                                               length:workspace.v_buffer_size
-                                                              options:MTLResourceStorageModeShared
-                                                         deallocator:nil];
+                               length:workspace.v_buffer_size
+                               options:MTLResourceStorageModeShared
+                               deallocator:nil];
         if (!v_buf) {
             std::cerr << "❌ Failed to create V buffer!" << std::endl;
             return;
         }
-        std::cout << "   ✅ V buffer created" << std::endl;
 
-        std::cout << "   Creating output buffer: " << output_workspace << ", size=" << workspace.output_buffer_size << std::endl;
         id<MTLBuffer> out_buf = [handle->device newBufferWithBytesNoCopy:output_workspace
-                                                                 length:workspace.output_buffer_size
-                                                                options:MTLResourceStorageModeShared
-                                                           deallocator:nil];
+                                 length:workspace.output_buffer_size
+                                 options:MTLResourceStorageModeShared
+                                 deallocator:nil];
         if (!out_buf) {
             std::cerr << "❌ Failed to create output buffer!" << std::endl;
             return;
         }
-        std::cout << "   ✅ Output buffer created" << std::endl;
 
         // OPTIMIZATION: Combine small buffers to reduce buffer object count
         // This reduces Metal Internal Error (0x0E) risk from too many concurrent buffer objects
         size_t combined_small_buffers_size = workspace.index_buffer_size + workspace.params_buffer_size + workspace.debug_buffer_size;
-        std::cout << "   Creating combined buffer: " << index_workspace << ", size=" << combined_small_buffers_size << std::endl;
+
         id<MTLBuffer> combined_buf = [handle->device newBufferWithBytesNoCopy:index_workspace
                                                                        length:combined_small_buffers_size
                                                                       options:MTLResourceStorageModeShared
@@ -906,7 +857,6 @@ void batch_prefill_attention_unified_bf16(
             std::cerr << "❌ Failed to create combined buffer!" << std::endl;
             return;
         }
-        std::cout << "   ✅ Combined buffer created" << std::endl;
 
         // Create parameter buffer data in workspace
         Params* params = static_cast<Params*>(params_workspace);
