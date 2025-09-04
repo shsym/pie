@@ -1,4 +1,4 @@
-name: Python Code Format Check
+name: Python Black Format Check
 
 on:
   push:

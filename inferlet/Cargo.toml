@@ -1,9 +1,9 @@
 [package]
 name = "inferlet"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["In Gim <in.gim@yale.edu>"]
-description = "Inferlet support library for PIE"
+description = "Inferlet support library for Pie"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 keywords = ["wasi", "wasm", "pie", "inferlet"]
@@ -11,10 +11,11 @@ categories = ["wasm"]
 include = ["src", "Cargo.toml", "wit"]
 
 [dependencies]
-wit-bindgen = "0.43.0"
+wit-bindgen = "0.45.0"
 wstd = "0.5.3"
 trait-variant = "0.1.2"
-wasi = "0.14.2+wasi-0.2.4"
+wasi = "0.14.3"
 inferlet-macros = "0.1.0"
 anyhow = "1.0.95"
 rand = "0.9.2"
+futures = "0.3.31"

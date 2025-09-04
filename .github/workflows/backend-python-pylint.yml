@@ -1,4 +1,4 @@
-name: Python Pylint
+name: Python Pylint Linter Check
 
 on:
   pull_request:

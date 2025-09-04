@@ -3,6 +3,8 @@ interface core {
     // Import pollable functionality from the WASI IO poll package
     use wasi:io/poll@0.2.4.{pollable};
 
+    type pointer = u32;
+
     // Returns the runtime version string
     get-version: func() -> string;
 
@@ -53,15 +55,52 @@ interface core {
     // Executes a debug command and returns the result as a string
     debug-query: func(query: string) -> debug-query-result;
 
+    // resources
+    allocate-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        count: u32,
+    ) -> list<pointer>;
+
+
+    deallocate-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        ptrs: list<pointer>
+    );
+
+    get-all-exported-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+    ) -> list<tuple<string, u32>>;
+
+    release-exported-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        name: string
+    );
+
+    export-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        ptrs: list<pointer>,
+        name: string
+    );
+
+    import-resources: func(
+        queue: borrow<queue>,
+        resource-type: u32,
+        name: string
+    ) -> list<pointer>;
+
     // Resource representing a specific model instance
     resource model {
         get-name: func() -> string;                  // Returns the model's name (e.g. "llama-3.1-8b-instruct")
         get-traits: func() -> list<string>;          // Returns the full set of model traits
         get-description: func() -> string;           // Human-readable description of the model
-        get-version: func() -> string;               // Model version string (e.g. "1.0")
-        get-license: func() -> string;               // License name (e.g. "Llama")
         get-prompt-template: func() -> string;       // Returns the prompt formatting template in Tera
         get-service-id: func() -> u32;
+        get-kv-page-size: func() -> u32; // Get the size of a KV page
         create-queue: func() -> queue;               // Create a new command queue
     }
 

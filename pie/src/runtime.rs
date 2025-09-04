@@ -1,21 +1,19 @@
+use crate::instance::{InstanceId, InstanceState};
+use crate::service::{Service, ServiceError};
+use crate::{bindings, model, server, service};
+use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
+use thiserror::Error;
+use tokio::sync::oneshot;
 use uuid::Uuid;
+use wasmtime::component::Resource;
 use wasmtime::{
     Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store,
     component::Component, component::Linker,
 };
-
-use crate::instance::{Id as InstanceId, InstanceState};
-use crate::{bindings, model, server, service};
-
-use crate::model::cleanup_instance;
-use crate::service::{Service, ServiceError};
-use thiserror::Error;
-use tokio::sync::oneshot;
-use wasmtime::component::Resource;
 use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::bindings::exports::wasi::http::incoming_handler::{
     IncomingRequest, ResponseOutparam,
@@ -28,13 +26,22 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static SERVICE_ID_RUNTIME: OnceLock<usize> = OnceLock::new();
 
-pub fn trap<T>(instance_id: InstanceId, message: T)
+pub fn trap(instance_id: InstanceId, cause: TerminationCause) {
+    Command::Trap {
+        inst_id: instance_id,
+        cause,
+    }
+    .dispatch()
+    .unwrap();
+}
+
+pub fn trap_exception<T>(instance_id: InstanceId, exception: T)
 where
     T: ToString,
 {
     Command::Trap {
-        instance_id,
-        message: message.to_string(),
+        inst_id: instance_id,
+        cause: TerminationCause::Exception(exception.to_string()),
     }
     .dispatch()
     .unwrap();
@@ -98,18 +105,18 @@ pub enum Command {
     },
 
     Trap {
-        instance_id: InstanceId,
-        message: String,
+        inst_id: InstanceId,
+        cause: TerminationCause,
     },
 
     Warn {
-        instance_id: InstanceId,
+        inst_id: InstanceId,
         message: String,
     },
 
     DebugQuery {
         query: String,
-        event: oneshot::Sender<String>,
+        event: oneshot::Sender<Bytes>,
     },
 }
 
@@ -142,6 +149,15 @@ pub struct Runtime {
 
     /// Running server instances
     running_server_instances: DashMap<InstanceId, InstanceHandle>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TerminationCause {
+    Normal,
+    Signal,
+    Exception(String),
+    SystemError(String),
+    OutOfResources(String),
 }
 
 pub struct InstanceHandle {
@@ -201,18 +217,12 @@ impl Service for Runtime {
                 event.send(Ok(())).unwrap();
             }
 
-            Command::Trap {
-                instance_id,
-                message,
-            } => {
-                self.terminate_instance(instance_id, message).await;
+            Command::Trap { inst_id, cause } => {
+                self.terminate_instance(inst_id, cause).await;
             }
 
-            Command::Warn {
-                instance_id,
-                message,
-            } => server::Command::Send {
-                inst_id: instance_id.clone(),
+            Command::Warn { inst_id, message } => server::Command::Send {
+                inst_id,
                 message: message.clone(),
             }
             .dispatch()
@@ -223,15 +233,15 @@ impl Service for Runtime {
 
             Command::DebugQuery { query, event } => match query.as_str() {
                 "ping" => {
-                    event.send("pong".to_string()).unwrap();
+                    event.send("pong".into()).unwrap();
                 }
                 "get_instance_count" => {
                     let count = self.running_instances.len();
-                    event.send(count.to_string()).unwrap();
+                    event.send(count.to_string().into()).unwrap();
                 }
                 "get_server_instance_count" => {
                     let count = self.running_server_instances.len();
-                    event.send(count.to_string()).unwrap();
+                    event.send(count.to_string().into()).unwrap();
                 }
                 // Add the new queries here
                 "list_running_instances" => {
@@ -246,7 +256,7 @@ impl Service for Runtime {
                             )
                         })
                         .collect();
-                    event.send(instances.join("\n")).unwrap();
+                    event.send(instances.join("\n").into()).unwrap();
                 }
                 "list_in_memory_programs" => {
                     let keys: Vec<String> = self
@@ -254,16 +264,18 @@ impl Service for Runtime {
                         .iter()
                         .map(|item| item.key().clone())
                         .collect();
-                    event.send(keys.join("\n")).unwrap();
+                    event.send(keys.join("\n").into()).unwrap();
                 }
                 "get_cache_dir" => {
                     event
-                        .send(self.cache_dir.to_string_lossy().to_string())
+                        .send(self.cache_dir.to_string_lossy().to_string().into())
                         .unwrap();
                 }
 
                 _ => {
-                    event.send(format!("Unknown query: {}", query)).unwrap();
+                    event
+                        .send(format!("Unknown query: {}", query).into())
+                        .unwrap();
                 }
             },
         }
@@ -422,15 +434,24 @@ impl Runtime {
     }
 
     /// Terminate (abort) a running instance
-    pub async fn terminate_instance(&self, instance_id: InstanceId, reason: String) {
+    pub async fn terminate_instance(&self, instance_id: InstanceId, cause: TerminationCause) {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
 
             model::cleanup_instance(instance_id.clone());
 
+            let (termination_code, message) = match cause {
+                TerminationCause::Normal => (0, "Normal termination".to_string()),
+                TerminationCause::Signal => (1, "Signal termination".to_string()),
+                TerminationCause::Exception(message) => (2, message),
+                TerminationCause::SystemError(message) => (3, message),
+                TerminationCause::OutOfResources(message) => (4, message),
+            };
+
             server::Command::DetachInstance {
                 inst_id: instance_id.clone(),
-                reason,
+                termination_code,
+                message,
             }
             .dispatch()
             .ok();
@@ -601,20 +622,22 @@ impl Runtime {
             println!("Instance {instance_id} failed: {err}");
             server::Command::DetachInstance {
                 inst_id: instance_id.clone(),
-                reason: format!("{err}"),
+                termination_code: 2,
+                message: err.to_string(),
             }
             .dispatch()
             .ok();
         } else {
             server::Command::DetachInstance {
                 inst_id: instance_id.clone(),
-                reason: format!("instance normally finished"),
+                termination_code: 0,
+                message: "instance normally finished".to_string(),
             }
             .dispatch()
             .ok();
         }
 
         // force cleanup of the remaining resources
-        cleanup_instance(instance_id);
+        model::cleanup_instance(instance_id);
     }
 }

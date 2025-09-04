@@ -8,6 +8,7 @@ use rand::{Rng, SeedableRng};
 use std::ffi::OsString;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Instant;
+use inferlet::traits::Tokenize;
 
 /// Injects a watermark by partitioning the vocabulary into a "green list" and a "red list"
 /// based on the hash of the previous token. It then boosts the probabilities of tokens

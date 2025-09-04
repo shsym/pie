@@ -1,5 +1,5 @@
-use crate::Queue;
 use crate::tokenize;
+use crate::{Model, Queue};
 use std::rc::Rc;
 
 /// A handle to a text tokenizer engine.
@@ -23,6 +23,12 @@ pub trait Tokenize {
 }
 
 impl Tokenizer {
+    pub fn new(model: &Model) -> Tokenizer {
+        Tokenizer {
+            inner: Rc::new(tokenize::get_tokenizer(&model.inner)),
+        }
+    }
+
     /// Converts a string of text into a sequence of token IDs.
     ///
     /// # Parameters
@@ -55,10 +61,8 @@ impl Tokenizer {
     }
 }
 
-impl Tokenize for Queue {
+impl Tokenize for Model {
     fn get_tokenizer(&self) -> Tokenizer {
-        Tokenizer {
-            inner: Rc::new(tokenize::get_tokenizer(&self.inner)),
-        }
+        Tokenizer::new(self)
     }
 }
