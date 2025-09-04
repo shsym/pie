@@ -156,6 +156,19 @@ set(BACKEND_SOURCES_ORGANIZED
     ${BACKEND_SRC_PATH}/metal_extract_k_values.mm
     ${BACKEND_SRC_PATH}/metal_topk_mask_logits.mm
     ${BACKEND_SRC_PATH}/metal_attention_naive.mm
+    ${BACKEND_SRC_PATH}/metal_common.mm
+    ${BACKEND_SRC_PATH}/metal_l4ma.mm
+    ${BACKEND_SRC_PATH}/metal_rmsnorm.mm
+    ${BACKEND_SRC_PATH}/metal_rmsnorm_wrapper.mm
+    ${BACKEND_SRC_PATH}/metal_rope.mm
+    ${BACKEND_SRC_PATH}/metal_rope_wrapper.mm
+    ${BACKEND_SRC_PATH}/metal_silu_and_mul.mm
+    ${BACKEND_SRC_PATH}/metal_silu_and_mul_wrapper.mm
+    ${BACKEND_SRC_PATH}/metal_gemm.mm
+    ${BACKEND_SRC_PATH}/metal_gemm_wrapper.mm
+    ${BACKEND_SRC_PATH}/metal_embedding.mm
+    ${BACKEND_SRC_PATH}/metal_buffer.mm
+    ${BACKEND_SRC_PATH}/metal_tensor.mm
 )
 
 # Additional backend libraries to link against
@@ -271,6 +284,28 @@ set_target_properties(test_metal_tensor_loading_unit PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
 )
 
+# Model weight loading integration test
+add_executable(test_model_weight_loading_integration
+    tests/src/integration/test_model_weight_loading.mm
+    ${BACKEND_SOURCES_ORGANIZED}
+)
+target_link_libraries(test_model_weight_loading_integration ${COMMON_LIBRARIES_ORGANIZED})
+target_compile_definitions(test_model_weight_loading_integration PRIVATE ${NLOHMANN_JSON_CFLAGS_OTHER})
+set_target_properties(test_model_weight_loading_integration PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
+)
+
+# Forward pass integration test
+add_executable(test_forward_pass_integration
+    tests/src/integration/test_forward_pass.mm
+    ${BACKEND_SOURCES_ORGANIZED}
+)
+target_link_libraries(test_forward_pass_integration ${COMMON_LIBRARIES_ORGANIZED})
+target_compile_definitions(test_forward_pass_integration PRIVATE ${NLOHMANN_JSON_CFLAGS_OTHER})
+set_target_properties(test_forward_pass_integration PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
+)
+
 # ============================================================================
 # Custom targets for organized test execution
 # ============================================================================
@@ -287,8 +322,11 @@ add_custom_target(run_unit_tests
     COMMAND ${ORGANIZED_TESTS_BIN_DIR}/test_ztensor_reader_unit
     COMMAND ${ORGANIZED_TESTS_BIN_DIR}/test_real_ztensor_unit
     COMMAND ${ORGANIZED_TESTS_BIN_DIR}/test_metal_tensor_loading_unit
-    COMMAND echo "✅ Unit tests completed"
-    DEPENDS test_softmax_unit test_extract_k_values_unit test_topk_mask_unit test_kernel_selection_unit test_memory_management_unit test_ztensor_reader_unit test_real_ztensor_unit test_metal_tensor_loading_unit
+    COMMAND echo "=== Running Integration Tests ==="
+    COMMAND ${ORGANIZED_TESTS_BIN_DIR}/test_model_weight_loading_integration
+    COMMAND ${ORGANIZED_TESTS_BIN_DIR}/test_forward_pass_integration
+    COMMAND echo "✅ All tests completed"
+    DEPENDS test_softmax_unit test_extract_k_values_unit test_topk_mask_unit test_kernel_selection_unit test_memory_management_unit test_ztensor_reader_unit test_real_ztensor_unit test_metal_tensor_loading_unit test_model_weight_loading_integration test_forward_pass_integration
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -297,10 +335,11 @@ add_custom_target(test_stats
     COMMAND echo "=== Metal Protocol Tests Statistics ==="
     COMMAND echo "Main Protocol Test:     1 executable - metal_protocol_tests"
     COMMAND echo "Organized Unit Tests:   8 tests  - under 1 minute"
+    COMMAND echo "Integration Tests:      2 tests  - model weight loading, forward pass"
     COMMAND echo ""
     COMMAND echo "Available targets:"
     COMMAND echo "  metal_protocol_tests   - Main protocol test executable"
-    COMMAND echo "  run_unit_tests         - All organized unit tests"
+    COMMAND echo "  run_unit_tests         - All organized unit + integration tests"
     COMMAND echo "  test_stats             - This statistics summary"
     COMMAND echo "  clean_all              - Clean all build artifacts"
 )

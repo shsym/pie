@@ -3,15 +3,18 @@
 #include "metal_rmsnorm_wrapper.hpp"
 #include "metal_rope_wrapper.hpp"
 #include "metal_silu_and_mul_wrapper.hpp"
-#include "metal_batch_prefill_attention_wrapper.hpp"
+#include "metal_batch_prefill_attention.hpp"
 #include "metal_embedding.hpp"
 #include "metal_topk_mask_logits.hpp"
 #include "metal_softmax.hpp"
 #include "metal_extract_k_values.hpp"
+#include "../../backend-cuda/src/ztensor.hpp"
 #include <cstring>
+#include <cfloat>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <algorithm>
 
 // L4maConfig is defined in metal_common.hpp - no need to redefine
 // Use the existing L4maConfig from metal_common.hpp
@@ -33,9 +36,9 @@ struct AppConfig {
 template <typename T>
 MetalL4maModel<T>::MetalL4maModel(const L4maConfig& config) : config_(config), norm_(config) {
     // Initialize embedding weights
-    embed_tokens_weight_ = MetalTensor<T>({static_cast<size_t>(config_.vocab_size), 
+    embed_tokens_weight_ = MetalTensor<T>({static_cast<size_t>(config_.vocab_size),
                                          static_cast<size_t>(config_.hidden_size)});
-    
+
     // Initialize decoder layers
     layers_.reserve(config_.num_layers);
     for (int i = 0; i < config_.num_layers; ++i) {
@@ -44,15 +47,15 @@ MetalL4maModel<T>::MetalL4maModel(const L4maConfig& config) : config_(config), n
 }
 
 template <typename T>
-void MetalL4maModel<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<T>& buffer, 
+void MetalL4maModel<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<T>& buffer,
                                MetalL4maKVCache<T>& kv_cache, T* final_norm_output) {
     size_t num_tokens = buffer.num_tokens;
     size_t hidden_size = config_.hidden_size;
-    
+
     // Allocate hidden states buffer
     auto hidden_states = buffer.template allocate<T>(num_tokens * hidden_size);
-    
-    // 1. Token embedding lookup using metal_embedding  
+
+    // 1. Token embedding lookup using metal_embedding
     auto& context = MetalContext::getInstance();
     metal_embedding_lookup_bfloat16(
         context.getDevice(), context.getCommandQueue(),
@@ -64,21 +67,21 @@ void MetalL4maModel<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<T>& 
         config_.hidden_size
     );
     profiler.record("token_embedding");
-    
+
     // 2. Forward through all decoder layers
     for (int layer_idx = 0; layer_idx < config_.num_layers; ++layer_idx) {
         auto layer_profiler = profiler.scope("layer_" + std::to_string(layer_idx));
-        
+
         // Get KV cache for this layer
         auto [kv_cache_k, kv_cache_v] = kv_cache.get_layer_pointers(layer_idx);
-        
+
         layers_[layer_idx].forward(layer_profiler, buffer, hidden_states.data(), kv_cache_k, kv_cache_v);
     }
-    
+
     // 3. Final layer normalization
     norm_.forward(final_norm_output, hidden_states.data(), num_tokens, buffer.commandBuffer);
     profiler.record("final_norm");
-    
+
     // Deallocate hidden states
     buffer.deallocate(hidden_states);
 }
@@ -86,10 +89,10 @@ void MetalL4maModel<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<T>& 
 template <typename T>
 std::map<std::string, MetalTensor<T>*> MetalL4maModel<T>::get_parameters() {
     std::map<std::string, MetalTensor<T>*> params;
-    
+
     // Add embedding parameters
     params["embed_tokens.weight"] = &embed_tokens_weight_;
-    
+
     // Add layer parameters
     for (size_t layer_idx = 0; layer_idx < layers_.size(); ++layer_idx) {
         auto layer_params = layers_[layer_idx].get_parameters();
@@ -97,13 +100,13 @@ std::map<std::string, MetalTensor<T>*> MetalL4maModel<T>::get_parameters() {
             params["layers." + std::to_string(layer_idx) + "." + name] = tensor;
         }
     }
-    
+
     // Add final norm parameters
     auto norm_params = norm_.get_parameters();
     for (auto& [name, tensor] : norm_params) {
         params["norm." + name] = tensor;
     }
-    
+
     return params;
 }
 
@@ -115,20 +118,20 @@ MetalL4maForCausalLM<T>::MetalL4maForCausalLM(const L4maConfig& config) : config
 template <typename T>
 std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::forward(
     MetalProfileScope profiler, MetalL4maBuffer<T>& buffer, MetalL4maKVCache<T>& kv_cache) {
-    
+
     size_t num_tokens = buffer.num_tokens;
     size_t hidden_size = config_.hidden_size;
     size_t vocab_size = config_.vocab_size;
-    
+
     // Allocate final norm output
     auto final_norm_output = buffer.template allocate<T>(num_tokens * hidden_size);
-    
+
     // 1. Forward through the model
     model_.forward(profiler.scope("model"), buffer, kv_cache, final_norm_output.data());
-    
+
     // 2. Language model head (reuse embedding weights)
     auto logits = buffer.template allocate<T>(num_tokens * vocab_size);
-    
+
     auto& context = MetalContext::getInstance();
     metal_gemm_bfloat16(
         context.getDevice(), context.getCommandQueue(),
@@ -141,12 +144,12 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
         false, false // no transpose
     );
     profiler.record("lm_head");
-    
+
     // 3. Apply top-k mask and softmax to get final probabilities
     constexpr int top_k = 50; // Default top-k value
     auto topk_values = buffer.template allocate<float>(num_tokens * top_k);
     auto topk_indices = buffer.template allocate<int32_t>(num_tokens * top_k);
-    
+
     // Apply top-k masking to logits
     int result = metal_topk_mask_logits_bfloat16(
         logits.data(), // in-place masking
@@ -158,13 +161,13 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
         throw std::runtime_error("Failed to apply top-k masking");
     }
     profiler.record("topk_mask");
-    
+
     // Apply softmax to get probabilities (convert bfloat16 to float temporarily)
     auto logits_float = buffer.template allocate<float>(num_tokens * vocab_size);
     MetalCast::bfloat16_to_float(context.getDevice(), context.getCommandQueue(),
                                 reinterpret_cast<const bfloat16_t*>(logits.data()),
                                 logits_float.data(), num_tokens * vocab_size);
-    
+
     int softmax_result = metal_softmax_float(
         logits_float.data(),
         logits_float.data(), // in-place softmax
@@ -175,17 +178,17 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     if (softmax_result != 0) {
         throw std::runtime_error("Failed to apply softmax");
     }
-    
+
     // Convert back to bfloat16
     MetalCast::float_to_bfloat16(context.getDevice(), context.getCommandQueue(),
                                 logits_float.data(),
                                 reinterpret_cast<bfloat16_t*>(logits.data()),
                                 num_tokens * vocab_size);
-    
+
     buffer.deallocate(logits_float);
     profiler.record("softmax");
-    
-    // Extract top-k values and indices  
+
+    // Extract top-k values and indices
     int extract_result = metal_extract_k_values_bfloat16(
         reinterpret_cast<const bfloat16_t*>(logits.data()),
         topk_values.data(),
@@ -198,20 +201,20 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
         throw std::runtime_error("Failed to extract top-k values");
     }
     profiler.record("extract_k_values");
-    
+
     // Copy results to host vectors
     std::vector<float> result_values(num_tokens * top_k);
     std::vector<int32_t> result_indices(num_tokens * top_k);
-    
+
     std::memcpy(result_values.data(), topk_values.data(), num_tokens * top_k * sizeof(float));
     std::memcpy(result_indices.data(), topk_indices.data(), num_tokens * top_k * sizeof(int32_t));
-    
+
     // Deallocate intermediate tensors
     buffer.deallocate(final_norm_output);
     buffer.deallocate(logits);
     buffer.deallocate(topk_values);
     buffer.deallocate(topk_indices);
-    
+
     return std::make_pair(std::move(result_values), std::move(result_indices));
 }
 
@@ -224,70 +227,160 @@ std::map<std::string, MetalTensor<T>*> MetalL4maForCausalLM<T>::get_parameters()
 
 // Model loading utilities implementation
 namespace MetalModelUtils {
-    
+
+    // Forward declarations
+    std::string map_parameter_name_to_ztensor(const std::string& metal_name);
+
+    template<typename T>
+    void initialize_parameter_randomly(MetalTensor<T>& tensor, const std::string& param_name);
+
+    template<typename T>
+    bool verify_tensor_shape_compatibility(const MetalTensor<T>& metal_tensor,
+                                          const ztensor::TensorInfo& ztensor_info,
+                                          const std::string& metal_name,
+                                          const std::string& ztensor_name);
+
     template<typename T>
     std::unique_ptr<MetalL4maForCausalLM<T>> load_model_internal(
         const AppConfig& config, const ModelMetadata& metadata) {
-        
+
         // Validate configuration
         if (!validate_model_config(metadata.config)) {
             std::cerr << "Invalid model configuration for Metal backend" << std::endl;
             return nullptr;
         }
-        
+
         std::cout << "Loading Metal L4MA model: " << metadata.model_name << std::endl;
         std::cout << "Model config:" << std::endl;
         std::cout << "  vocab_size: " << metadata.config.vocab_size << std::endl;
         std::cout << "  hidden_size: " << metadata.config.hidden_size << std::endl;
         std::cout << "  num_layers: " << metadata.config.num_layers << std::endl;
         std::cout << "  num_heads: " << metadata.config.num_query_heads << std::endl;
-        
+
         // Create model
         auto model = std::make_unique<MetalL4maForCausalLM<T>>(metadata.config);
-        
-        // Load parameters from checkpoint
-        std::string weight_file = metadata.checkpoint_path + "/model.safetensors";
-        
+
+        // Load parameters from zTensor checkpoint file
+        std::string weight_file = metadata.checkpoint_path;
+
         if (config.verbose) {
             std::cout << "Loading weights from: " << weight_file << std::endl;
         }
-        
+
         // Get all parameter tensors
         auto param_map = model->get_parameters();
-        
-        // TODO: Implement actual safetensors loading
-        // For now, initialize with random values for testing
-        std::cout << "Warning: Using random initialization (safetensors loading not implemented)" << std::endl;
-        
-        for (auto& [name, tensor] : param_map) {
-            // Initialize with small random values
-            size_t num_elements = 1;
-            for (size_t dim : tensor->shape()) {
-                num_elements *= dim;
+
+        // Load weights from zTensor file
+        try {
+            ztensor::zTensorReader reader(weight_file);
+            auto tensor_list = reader.list_tensors();
+
+            if (config.verbose) {
+                std::cout << "Found " << tensor_list.size() << " tensors in model file" << std::endl;
             }
-            
-            std::vector<T> random_data(num_elements);
-            for (size_t i = 0; i < num_elements; ++i) {
-                // Simple random initialization
-                random_data[i] = static_cast<T>((rand() / float(RAND_MAX) - 0.5f) * 0.1f);
+
+            // Track loaded tensors for verification
+            int loaded_count = 0;
+            int total_count = param_map.size();
+
+            for (auto& [param_name, tensor] : param_map) {
+                // Map Metal parameter names to zTensor names
+                std::string ztensor_name = map_parameter_name_to_ztensor(param_name);
+
+                // Check if tensor exists in the zTensor file
+                auto it = std::find(tensor_list.begin(), tensor_list.end(), ztensor_name);
+                if (it == tensor_list.end()) {
+                    if (config.verbose) {
+                        std::cout << "Warning: Parameter '" << param_name
+                                 << "' (mapped to '" << ztensor_name << "') not found in model file. "
+                                 << "Using random initialization." << std::endl;
+                    }
+
+                    // Fall back to random initialization for missing parameters
+                    initialize_parameter_randomly(*tensor, param_name);
+                    continue;
+                }
+
+                // Load tensor info and data
+                auto info = reader.get_tensor_info(ztensor_name);
+                const void* raw_data = reader.get_raw_tensor_pointer(ztensor_name);
+
+                // Verify shape compatibility
+                if (!verify_tensor_shape_compatibility(*tensor, info, param_name, ztensor_name)) {
+                    std::cerr << "Shape mismatch for parameter " << param_name << std::endl;
+                    return nullptr;
+                }
+
+                // Calculate total elements
+                size_t total_elements = 1;
+                for (auto dim : info.shape) {
+                    total_elements *= dim;
+                }
+
+                // Load data using copyFromMappedMemory
+                tensor->copyFromMappedMemory(raw_data, total_elements);
+
+                // Calculate and log weight statistics for verification
+                if (config.verbose && total_elements > 0) {
+                    // Cast to appropriate type based on tensor data type
+                    if (info.dtype == "bfloat16") {
+                        const uint16_t* bf16_data = static_cast<const uint16_t*>(raw_data);
+                        float sum = 0.0f, min_val = FLT_MAX, max_val = -FLT_MAX;
+
+                        for (size_t i = 0; i < total_elements; ++i) {
+                            // Convert bfloat16 to float32 for statistics
+                            uint32_t f32_bits = static_cast<uint32_t>(bf16_data[i]) << 16;
+                            float value = *reinterpret_cast<const float*>(&f32_bits);
+                            sum += value;
+                            min_val = std::min(min_val, value);
+                            max_val = std::max(max_val, value);
+                        }
+                        float mean_val = sum / total_elements;
+
+                        std::cout << "  Weight stats: min=" << min_val << ", max=" << max_val
+                                 << ", mean=" << mean_val << std::endl;
+                    } else if (info.dtype == "float32") {
+                        const float* f32_data = static_cast<const float*>(raw_data);
+                        float sum = 0.0f, min_val = FLT_MAX, max_val = -FLT_MAX;
+
+                        for (size_t i = 0; i < total_elements; ++i) {
+                            sum += f32_data[i];
+                            min_val = std::min(min_val, f32_data[i]);
+                            max_val = std::max(max_val, f32_data[i]);
+                        }
+                        float mean_val = sum / total_elements;
+
+                        std::cout << "  Weight stats: min=" << min_val << ", max=" << max_val
+                                 << ", mean=" << mean_val << std::endl;
+                    }
+                }
+
+                loaded_count++;
+                if (config.verbose) {
+                    std::cout << "Loaded parameter: " << param_name << " <- " << ztensor_name
+                             << " (" << total_elements << " elements)" << std::endl;
+                }
             }
-            
-            if (!load_parameter_tensor(*tensor, random_data.data(), num_elements, name)) {
-                std::cerr << "Failed to load parameter: " << name << std::endl;
-                return nullptr;
-            }
-            
-            if (config.verbose && name.find("embed_tokens") != std::string::npos) {
-                std::cout << "Loaded parameter: " << name << " (" << num_elements << " elements)" << std::endl;
+
+            std::cout << "Successfully loaded " << loaded_count << "/" << total_count
+                     << " parameters from " << weight_file << std::endl;
+
+        } catch (const std::exception& e) {
+            std::cerr << "Error loading zTensor file: " << e.what() << std::endl;
+            std::cerr << "Falling back to random initialization" << std::endl;
+
+            // Fall back to random initialization for all parameters
+            for (auto& [name, tensor] : param_map) {
+                initialize_parameter_randomly(*tensor, name);
             }
         }
-        
+
         std::cout << "Model loaded successfully with " << param_map.size() << " parameter tensors" << std::endl;
         return model;
     }
-    
+
     template<typename T>
-    bool load_parameter_tensor(MetalTensor<T>& target_tensor, const T* host_data, 
+    bool load_parameter_tensor(MetalTensor<T>& target_tensor, const T* host_data,
                               size_t num_elements, const std::string& tensor_name) {
         try {
             // Verify size matches
@@ -295,65 +388,141 @@ namespace MetalModelUtils {
             for (size_t dim : target_tensor.shape()) {
                 expected_elements *= dim;
             }
-            
+
             if (expected_elements != num_elements) {
-                std::cerr << "Size mismatch for tensor " << tensor_name 
-                         << ": expected " << expected_elements 
+                std::cerr << "Size mismatch for tensor " << tensor_name
+                         << ": expected " << expected_elements
                          << ", got " << num_elements << std::endl;
                 return false;
             }
-            
+
             // Copy data to Metal buffer
             target_tensor.copyFromHost(host_data);
             return true;
-            
+
         } catch (const std::exception& e) {
             std::cerr << "Error loading tensor " << tensor_name << ": " << e.what() << std::endl;
             return false;
         }
     }
-    
+
+    /**
+     * @brief Map Metal parameter names to zTensor names
+     *
+     * Converts parameter names from the Metal model format (e.g., "layers.0.self_attn.q_proj.weight")
+     * to the format used in zTensor files (e.g., "model.layers.0.self_attn.q_proj.weight")
+     */
+    std::string map_parameter_name_to_ztensor(const std::string& metal_name) {
+        // Add "model." prefix for most parameters
+        if (metal_name.find("embed_tokens") == 0) {
+            return "model." + metal_name;
+        }
+
+        if (metal_name.find("layers.") == 0) {
+            return "model." + metal_name;
+        }
+
+        if (metal_name.find("norm.") == 0) {
+            return "model." + metal_name;
+        }
+
+        // For other parameters, just add the prefix
+        return "model." + metal_name;
+    }
+
+    /**
+     * @brief Initialize parameter with random values (fallback)
+     */
+    template<typename T>
+    void initialize_parameter_randomly(MetalTensor<T>& tensor, const std::string& param_name) {
+        size_t num_elements = 1;
+        for (size_t dim : tensor.shape()) {
+            num_elements *= dim;
+        }
+
+        std::vector<T> random_data(num_elements);
+        for (size_t i = 0; i < num_elements; ++i) {
+            // Simple random initialization
+            random_data[i] = static_cast<T>((rand() / float(RAND_MAX) - 0.5f) * 0.1f);
+        }
+
+        tensor.copyFromHost(random_data.data());
+    }
+
+    /**
+     * @brief Verify tensor shape compatibility between Metal and zTensor
+     */
+    template<typename T>
+    bool verify_tensor_shape_compatibility(const MetalTensor<T>& metal_tensor,
+                                          const ztensor::TensorInfo& ztensor_info,
+                                          const std::string& metal_name,
+                                          const std::string& ztensor_name) {
+        const auto& metal_shape = metal_tensor.shape();
+        const auto& ztensor_shape = ztensor_info.shape;
+
+        if (metal_shape.size() != ztensor_shape.size()) {
+            std::cerr << "Dimension mismatch for " << metal_name << " <- " << ztensor_name
+                     << ": Metal has " << metal_shape.size() << " dims, zTensor has "
+                     << ztensor_shape.size() << " dims" << std::endl;
+            return false;
+        }
+
+        for (size_t i = 0; i < metal_shape.size(); ++i) {
+            if (metal_shape[i] != static_cast<size_t>(ztensor_shape[i])) {
+                std::cerr << "Shape mismatch for " << metal_name << " <- " << ztensor_name
+                         << " at dimension " << i << ": Metal has " << metal_shape[i]
+                         << ", zTensor has " << ztensor_shape[i] << std::endl;
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     bool validate_model_config(const L4maConfig& config) {
         // Basic validation checks
-        if (config.vocab_size <= 0 || config.hidden_size <= 0 || 
+        if (config.vocab_size <= 0 || config.hidden_size <= 0 ||
             config.num_layers <= 0 || config.num_query_heads <= 0) {
             std::cerr << "Invalid model dimensions" << std::endl;
             return false;
         }
-        
+
         if (config.hidden_size % config.num_query_heads != 0) {
             std::cerr << "hidden_size must be divisible by num_query_heads" << std::endl;
             return false;
         }
-        
+
         if (config.head_size != config.hidden_size / config.num_query_heads) {
             std::cerr << "head_size mismatch: expected " << (config.hidden_size / config.num_query_heads)
                      << ", got " << config.head_size << std::endl;
             return false;
         }
-        
+
         // Check Metal-specific constraints
         auto& context = MetalContext::getInstance();
         if (!context.getDevice()) {
             std::cerr << "Metal device not available" << std::endl;
             return false;
         }
-        
+
         return true;
     }
-    
+
     // Explicit template instantiations
     template std::unique_ptr<MetalL4maForCausalLM<float>> load_model_internal(
         const AppConfig& config, const ModelMetadata& metadata);
     template std::unique_ptr<MetalL4maForCausalLM<bfloat16_t>> load_model_internal(
         const AppConfig& config, const ModelMetadata& metadata);
-        
-    template bool load_parameter_tensor(MetalTensor<float>& target_tensor, 
-                                       const float* host_data, size_t num_elements, 
+
+    template bool load_parameter_tensor(MetalTensor<float>& target_tensor,
+                                       const float* host_data, size_t num_elements,
                                        const std::string& tensor_name);
-    template bool load_parameter_tensor(MetalTensor<bfloat16_t>& target_tensor, 
-                                       const bfloat16_t* host_data, size_t num_elements, 
+    template bool load_parameter_tensor(MetalTensor<bfloat16_t>& target_tensor,
+                                       const bfloat16_t* host_data, size_t num_elements,
                                        const std::string& tensor_name);
+
+    template void initialize_parameter_randomly(MetalTensor<float>& tensor, const std::string& param_name);
+    template void initialize_parameter_randomly(MetalTensor<bfloat16_t>& tensor, const std::string& param_name);
 }
 
 // Explicit template instantiations for all model classes
