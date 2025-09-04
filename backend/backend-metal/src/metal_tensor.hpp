@@ -80,14 +80,54 @@ public:
     bool isContiguous() const { return true; } // Metal tensors are always contiguous
     void synchronize() const; // Wait for Metal operations to complete
 
-private:
+    // Create view into existing buffer without ownership
+    static MetalTensor<T> createView(id<MTLBuffer> buffer, const std::vector<size_t>& shape, size_t offset_bytes = 0);
+
+    // Check if this tensor is a view (doesn't own its buffer)
+    bool isView() const { return is_view_; }
+
+protected:
+    bool is_view_ = false; // Flag to indicate if this is a view
     void calculateStrides();
     size_t calculateTotalSize() const;
-
     std::vector<size_t> shape_;
     std::vector<size_t> strides_;
     size_t total_size_;
     MetalBuffer<T> buffer_;
+
+private:
+    // Private members for internal use only
+};
+
+/**
+ * @brief Memory view into existing Metal buffer without ownership
+ * Allows zero-copy tensor operations by referencing existing memory
+ */
+template<typename T>
+class MetalTensorView : public MetalTensor<T> {
+public:
+    // Create view from existing buffer at offset
+    MetalTensorView(id<MTLBuffer> buffer, const std::vector<size_t>& shape, size_t offset_bytes = 0);
+
+    // Move constructor and assignment
+    MetalTensorView(MetalTensorView&& other) noexcept = default;
+    MetalTensorView& operator=(MetalTensorView&& other) noexcept = default;
+
+    // Delete copy operations
+    MetalTensorView(const MetalTensorView&) = delete;
+    MetalTensorView& operator=(const MetalTensorView&) = delete;
+
+    ~MetalTensorView() = default; // No cleanup needed for views
+
+    // Get offset into the original buffer
+    size_t getOffset() const { return offset_bytes_; }
+
+    // Get the original buffer this view references
+    id<MTLBuffer> getOriginalBuffer() const { return original_buffer_; }
+
+private:
+    id<MTLBuffer> original_buffer_; // Original buffer we're viewing into
+    size_t offset_bytes_;           // Offset into original buffer
 };
 
 /**
@@ -386,4 +426,45 @@ namespace MetalTensorFactory {
     MetalTensor<T> fromData(const T* data, const std::vector<size_t>& shape) {
         return MetalTensor<T>(data, shape);
     }
+}
+
+// MetalTensorView implementations
+template<typename T>
+MetalTensorView<T>::MetalTensorView(id<MTLBuffer> buffer, const std::vector<size_t>& shape, size_t offset_bytes)
+    : original_buffer_(buffer), offset_bytes_(offset_bytes) {
+
+    // Set up the tensor properties
+    this->shape_ = shape;
+    this->total_size_ = 1;
+    for (size_t dim : shape) {
+        this->total_size_ *= dim;
+    }
+    this->calculateStrides();
+    this->is_view_ = true;
+
+    // Create a view buffer that references the existing buffer at offset
+    if (buffer && this->total_size_ > 0) {
+        this->buffer_ = MetalBuffer<T>(buffer, this->total_size_, offset_bytes, true);
+    }
+}
+
+// MetalTensor createView static method implementation
+template<typename T>
+MetalTensor<T> MetalTensor<T>::createView(id<MTLBuffer> buffer, const std::vector<size_t>& shape, size_t offset_bytes) {
+    // Create a view tensor that references existing buffer memory
+    MetalTensor<T> view_tensor;
+    view_tensor.shape_ = shape;
+    view_tensor.total_size_ = 1;
+    for (size_t dim : shape) {
+        view_tensor.total_size_ *= dim;
+    }
+    view_tensor.calculateStrides();
+    view_tensor.is_view_ = true;
+
+    // Create a view buffer that references the existing buffer at offset
+    if (buffer && view_tensor.total_size_ > 0) {
+        view_tensor.buffer_ = MetalBuffer<T>(buffer, view_tensor.total_size_, offset_bytes, true);
+    }
+
+    return view_tensor;
 }

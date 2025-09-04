@@ -103,6 +103,9 @@ public:
     // Create buffer from data
     MetalBuffer(const T* data, size_t count);
 
+    // Create view buffer (references existing buffer without ownership)
+    MetalBuffer(id<MTLBuffer> existing_buffer, size_t count, size_t offset_bytes = 0, bool is_view = true);
+
     // Move constructor
     MetalBuffer(MetalBuffer&& other) noexcept;
 
@@ -136,9 +139,17 @@ public:
     // Copy data to host
     void copyToHost(T* hostData, size_t count) const;
 
+    // Check if this buffer is a view
+    bool isView() const { return is_view_; }
+
+    // Get offset for view buffers
+    size_t getOffset() const { return offset_bytes_; }
+
 private:
     id<MTLBuffer> buffer_ = nullptr;
     size_t count_ = 0;
+    bool is_view_ = false;
+    size_t offset_bytes_ = 0;
 };
 
 /**
@@ -344,10 +355,19 @@ MetalBuffer<T>::MetalBuffer(const T* data, size_t count) : MetalBuffer(count) {
 }
 
 template<typename T>
+MetalBuffer<T>::MetalBuffer(id<MTLBuffer> existing_buffer, size_t count, size_t offset_bytes, bool is_view)
+    : buffer_(existing_buffer), count_(count), is_view_(is_view), offset_bytes_(offset_bytes) {
+    METAL_CHECK(existing_buffer != nullptr, "Existing buffer is null");
+    METAL_CHECK(offset_bytes + count * sizeof(T) <= [existing_buffer length], "View exceeds buffer bounds");
+}
+
+template<typename T>
 MetalBuffer<T>::MetalBuffer(MetalBuffer&& other) noexcept
-    : buffer_(other.buffer_), count_(other.count_) {
+    : buffer_(other.buffer_), count_(other.count_), is_view_(other.is_view_), offset_bytes_(other.offset_bytes_) {
     other.buffer_ = nullptr;
     other.count_ = 0;
+    other.is_view_ = false;
+    other.offset_bytes_ = 0;
 }
 
 template<typename T>
@@ -355,8 +375,12 @@ MetalBuffer<T>& MetalBuffer<T>::operator=(MetalBuffer&& other) noexcept {
     if (this != &other) {
         buffer_ = other.buffer_;
         count_ = other.count_;
+        is_view_ = other.is_view_;
+        offset_bytes_ = other.offset_bytes_;
         other.buffer_ = nullptr;
         other.count_ = 0;
+        other.is_view_ = false;
+        other.offset_bytes_ = 0;
     }
     return *this;
 }
@@ -364,7 +388,11 @@ MetalBuffer<T>& MetalBuffer<T>::operator=(MetalBuffer&& other) noexcept {
 template<typename T>
 T* MetalBuffer<T>::data() const {
     if (!buffer_) return nullptr;
-    return static_cast<T*>([buffer_ contents]);
+    T* base_ptr = static_cast<T*>([buffer_ contents]);
+    if (is_view_ && offset_bytes_ > 0) {
+        return base_ptr + (offset_bytes_ / sizeof(T));
+    }
+    return base_ptr;
 }
 
 template<typename T>

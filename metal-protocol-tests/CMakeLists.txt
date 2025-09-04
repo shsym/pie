@@ -284,6 +284,16 @@ set_target_properties(test_metal_tensor_loading_unit PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
 )
 
+add_executable(test_memory_optimization_unit
+    tests/src/unit/test_memory_optimization.mm
+    ${BACKEND_SOURCES_ORGANIZED}
+)
+target_link_libraries(test_memory_optimization_unit ${COMMON_LIBRARIES_ORGANIZED} ${BACKEND_LIBS})
+target_compile_definitions(test_memory_optimization_unit PRIVATE ${NLOHMANN_JSON_CFLAGS_OTHER})
+set_target_properties(test_memory_optimization_unit PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
+)
+
 # Model weight loading integration test
 add_executable(test_model_weight_loading_integration
     tests/src/integration/test_model_weight_loading.mm
