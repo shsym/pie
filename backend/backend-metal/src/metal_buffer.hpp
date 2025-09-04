@@ -308,21 +308,17 @@ template<typename T>
 MetalTensor<T> MetalStackAllocator::allocate(size_t count) {
     size_t required_bytes = count * sizeof(T);
     size_t aligned_offset = align_offset(current_offset_, alignof(T));
+    std::cout << "Current offset: " << current_offset_ << ", Aligned offset: " << aligned_offset << std::endl;
 
     if (aligned_offset + required_bytes > total_size_) {
+        std::cout << "Current offset: " << current_offset_ << ", Aligned offset: " << aligned_offset << ", Required bytes: " << required_bytes << ", Total size: " << total_size_ << std::endl;
         throw std::runtime_error("MetalStackAllocator: Insufficient memory");
     }
 
-    // Create view of the buffer at the allocated offset
+    // Return a tensor view into the pre-allocated stack buffer (no copy, no new allocation)
     id<MTLBuffer> metal_buffer = buffer_.getBuffer();
-    MetalTensor<T> tensor({count});
-
-    // Copy data from the main buffer to the tensor's buffer at the right offset
-    auto& context = MetalContext::getInstance();
-    MetalMemory::copyBuffer(context.getCommandQueue(),
-                           metal_buffer, aligned_offset,
-                           tensor.getMetalBuffer(), 0,
-                           required_bytes);
+    MetalTensor<T> tensor = MetalTensor<T>::createView(metal_buffer, {count}, aligned_offset);
+    std::cout << "Created MetalTensor view at offset " << aligned_offset << " with size " << required_bytes << " bytes." << std::endl;
 
     current_offset_ = aligned_offset + required_bytes;
     return tensor;
@@ -336,6 +332,7 @@ void MetalStackAllocator::deallocate(MetalTensor<T>& tensor) {
         current_offset_ -= tensor_bytes;
     }
     // Note: In a real implementation, we'd need to track allocations more carefully
+    std::cout << "Deallocated MetalTensor of size " << tensor_bytes << " bytes. New offset: " << current_offset_ << std::endl;
 }
 
 template <typename T>
@@ -394,11 +391,27 @@ size_t MetalL4maBuffer<T>::get_workspace_size(
     // Attention output
     tensor_sizes += max_num_tokens * hidden_size * sizeof(T);
 
+    // Metal attention workspace (this was missing!)
+    // Each attention layer needs workspace for K/V cache conversion and intermediate buffers
+    // Based on metal_batch_prefill_get_workspace calculation:
+    // - Q buffer: max_num_tokens * head_dim * sizeof(uint16_t)
+    // - K buffer: max_kv_pages * page_size * kv_head_dim * sizeof(uint16_t)
+    // - V buffer: max_kv_pages * page_size * kv_head_dim * sizeof(uint16_t)
+    // - Plus index and debug buffers
+    size_t max_kv_pages = 128; // Conservative estimate for large models
+    size_t page_size = 16;     // Standard page size
+    size_t attention_workspace = 0;
+    attention_workspace += max_num_tokens * num_heads * head_size * sizeof(uint16_t); // Q buffer
+    attention_workspace += max_kv_pages * page_size * num_kv_heads * head_size * sizeof(uint16_t) * 2; // K+V buffers
+    attention_workspace += max_num_tokens * num_heads * head_size * sizeof(uint16_t); // Output buffer
+    attention_workspace += 1024; // Index and debug buffers
+    tensor_sizes += attention_workspace;
+
     // Distribution storage
     tensor_sizes += max_num_tokens * dist_size * (sizeof(T) + sizeof(int32_t)); // values + indices
 
-    // Add some padding for alignment
-    tensor_sizes += 4096;
+    // Add padding for alignment and safety margin
+    tensor_sizes += 8192;
 
     return tensor_sizes;
 }
@@ -568,8 +581,37 @@ void MetalL4maBuffer<T>::planWithMapping(
         }
     }
 
-    // Continue with other tensors... (abbreviated for brevity)
-    // Similar pattern for all other tensor inputs
+    if (kv_page_indptr_ptr && kv_page_indptr_count > 0) {
+        auto* region = memory_pool.allocate_persistent(kv_page_indptr_count * sizeof(int32_t), "kv_page_indptr");
+        if (region) {
+            void* base_ptr = [pool_buffer contents];
+            int32_t* region_ptr = reinterpret_cast<int32_t*>(static_cast<char*>(base_ptr) + region->offset);
+            std::memcpy(region_ptr, kv_page_indptr_ptr, kv_page_indptr_count * sizeof(int32_t));
+            kv_page_indptr = MetalTensor<int32_t>::createView(pool_buffer, {kv_page_indptr_count}, region->offset);
+        }
+    }
+
+    if (kv_last_page_lens_ptr && kv_last_page_lens_count > 0) {
+        auto* region = memory_pool.allocate_persistent(kv_last_page_lens_count * sizeof(int32_t), "kv_last_page_lens");
+        if (region) {
+            void* base_ptr = [pool_buffer contents];
+            int32_t* region_ptr = reinterpret_cast<int32_t*>(static_cast<char*>(base_ptr) + region->offset);
+            std::memcpy(region_ptr, kv_last_page_lens_ptr, kv_last_page_lens_count * sizeof(int32_t));
+            kv_last_page_lens = MetalTensor<int32_t>::createView(pool_buffer, {kv_last_page_lens_count}, region->offset);
+        }
+    }
+
+    if (qo_indptr_ptr && qo_indptr_count > 0) {
+        auto* region = memory_pool.allocate_persistent(qo_indptr_count * sizeof(int32_t), "qo_indptr");
+        if (region) {
+            void* base_ptr = [pool_buffer contents];
+            int32_t* region_ptr = reinterpret_cast<int32_t*>(static_cast<char*>(base_ptr) + region->offset);
+            std::memcpy(region_ptr, qo_indptr_ptr, qo_indptr_count * sizeof(int32_t));
+            qo_indptr = MetalTensor<int32_t>::createView(pool_buffer, {qo_indptr_count}, region->offset);
+        }
+    }
+
+    // Note: page_size is set in constructor and cannot be changed here
 
     std::cout << "Planned buffer with zero-copy memory mapping, "
               << num_tokens << " tokens, " << batch_size << " batches" << std::endl;

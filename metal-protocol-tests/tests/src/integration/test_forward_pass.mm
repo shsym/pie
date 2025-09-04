@@ -11,6 +11,7 @@
 
 // Include Metal backend headers
 #include "metal_l4ma.hpp"
+#include "metal_model.hpp"
 #include "metal_common.hpp"
 #include "metal_tensor.hpp"
 #include "metal_buffer.hpp"
@@ -68,6 +69,9 @@ public:
         test_output_shape_validation();
 
         std::cout << "=== All Forward Pass Infrastructure Tests Passed! ===" << std::endl;
+
+        // Print profiling report
+        MetalModelProfiler::printProfilingReport();
     }
 
 private:
@@ -764,13 +768,11 @@ private:
 
             // CRITICAL POINT: Now attempt the actual forward pass with properly initialized KV cache
             std::cout << "      🚀 ATTEMPTING ACTUAL FORWARD PASS WITH INITIALIZED KV CACHE" << std::endl;
-            std::cout << "      📊 This is the moment of truth - testing if KV cache initialization fixed the segfault" << std::endl;
 
             try {
                 // Create profiler scope - we can pass nullptr for profiler since we're just testing
                 auto& context = MetalContext::getInstance();
                 auto command_buffer = [context.getCommandQueue() commandBuffer];
-                MetalProfileScope profiler(nullptr, "forward_pass_test", command_buffer);
 
                 // First, let's validate all buffers and parameters that will be passed to the attention kernel
                 std::cout << "      🔍 VALIDATING ALL BUFFERS BEFORE KERNEL EXECUTION..." << std::endl;
@@ -786,7 +788,7 @@ private:
                 // Execute the actual forward pass that previously caused segfaults
                 std::cout << "      🔥 Calling model.forward() - the previously segfaulting operation..." << std::endl;
 
-                auto result = model.forward(profiler, buffer, kv_cache);
+                auto result = model.forward(buffer, kv_cache);
 
                 // If we reach here, the segfault is fixed!
                 std::cout << "      ✅ SUCCESS! Forward pass completed without segfault!" << std::endl;

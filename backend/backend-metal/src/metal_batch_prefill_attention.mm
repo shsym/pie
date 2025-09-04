@@ -500,6 +500,10 @@ MetalBatchPrefillWorkspace metal_batch_prefill_get_workspace(
     std::cout << "MetalBatchPrefillWorkspace: Required workspace size: "
               << (workspace.total_size / 1024 / 1024) << " MB for "
               << num_tokens << " tokens, " << num_kv_pages << " pages" << std::endl;
+    std::cout << "DEBUG WORKSPACE: total_size=" << workspace.total_size << " bytes, offset=" << offset << std::endl;
+    std::cout << "DEBUG WORKSPACE: q_buffer_size=" << workspace.q_buffer_size
+              << ", k_buffer_size=" << workspace.k_buffer_size
+              << ", v_buffer_size=" << workspace.v_buffer_size << std::endl;
 
     return workspace;
 }
@@ -756,13 +760,33 @@ void batch_prefill_attention_unified_bf16(
         size_t q_count = static_cast<size_t>(num_qo) * head_dim;
         size_t kv_count = static_cast<size_t>(num_kv_pages) * page_size * kv_head_dim;
 
+        // BUFFER VALIDATION: Verify each workspace region is accessible
+        std::cout << "🔍 [BUFFER CHECK] Validating workspace regions..." << std::endl;
+        std::cout << "   Workspace base: " << (void*)workspace_base << std::endl;
+        std::cout << "   Q workspace: " << q_workspace << " (size: " << workspace.q_buffer_size << ")" << std::endl;
+        std::cout << "   K workspace: " << k_workspace << " (size: " << workspace.k_buffer_size << ")" << std::endl;
+        std::cout << "   V workspace: " << v_workspace << " (size: " << workspace.v_buffer_size << ")" << std::endl;
+        std::cout << "   Counts: q_count=" << q_count << ", kv_count=" << kv_count << std::endl;
+
         // Convert BF16 to Half in workspace
+        std::cout << "🔄 [DATA CONVERSION] Converting BF16 to Half..." << std::endl;
+        std::cout << "   Q input ptr: " << q_input << ", count: " << q_count << std::endl;
+        std::cout << "   K cache ptr: " << paged_k_cache << ", count: " << kv_count << std::endl;
+        std::cout << "   V cache ptr: " << paged_v_cache << ", count: " << kv_count << std::endl;
+
         std::vector<uint16_t> q_half_data = convert_bf16_to_half(q_input, q_count);
         std::vector<uint16_t> k_half_data = convert_bf16_to_half(paged_k_cache, kv_count);
         std::vector<uint16_t> v_half_data = convert_bf16_to_half(paged_v_cache, kv_count);
 
+        // Copy converted data to workspace with validation
+        std::cout << "🔄 [MEMORY COPY] Copying converted data to workspace..." << std::endl;
+        std::cout << "   Q: " << q_half_data.size() << " elements -> " << q_workspace << std::endl;
         std::memcpy(q_workspace, q_half_data.data(), q_half_data.size() * sizeof(uint16_t));
+
+        std::cout << "   K: " << k_half_data.size() << " elements -> " << k_workspace << std::endl;
         std::memcpy(k_workspace, k_half_data.data(), k_half_data.size() * sizeof(uint16_t));
+
+        std::cout << "   V: " << v_half_data.size() << " elements -> " << v_workspace << std::endl;
         std::memcpy(v_workspace, v_half_data.data(), v_half_data.size() * sizeof(uint16_t));
 
         // Copy index data to workspace
@@ -772,55 +796,119 @@ void batch_prefill_attention_unified_bf16(
         size_t kv_page_indices_size = num_kv_pages * sizeof(int32_t);
         size_t kv_last_page_lens_size = num_qo * sizeof(int32_t);
 
+        std::cout << "🔄 [INDEX COPY] Copying index data to workspace..." << std::endl;
+        std::cout << "   Index workspace: " << index_workspace << ", total buffer size: " << workspace.index_buffer_size << std::endl;
+        std::cout << "   Sizes: qo=" << qo_indptr_size << ", kv_page=" << kv_page_indptr_size
+                  << ", indices=" << kv_page_indices_size << ", lens=" << kv_last_page_lens_size << std::endl;
+        std::cout << "   Total needed: " << (qo_indptr_size + kv_page_indptr_size + kv_page_indices_size + kv_last_page_lens_size) << std::endl;
+
+        // Validate pointers before memcpy
+        if (!qo_indptr) {
+            std::cerr << "❌ qo_indptr is null!" << std::endl;
+        }
+        if (!kv_page_indptr) {
+            std::cerr << "❌ kv_page_indptr is null!" << std::endl;
+        }
+        if (!kv_page_indices && num_kv_pages > 0) {
+            std::cerr << "❌ kv_page_indices is null but num_kv_pages=" << num_kv_pages << std::endl;
+        }
+        if (!kv_last_page_lens) {
+            std::cerr << "❌ kv_last_page_lens is null!" << std::endl;
+        }
+
+        // Test index workspace accessibility
+        volatile uint8_t* test_index = (volatile uint8_t*)index_workspace;
+        test_index[0] = 0xFF;
+        if (workspace.index_buffer_size > 1) {
+            test_index[workspace.index_buffer_size-1] = 0xFF;
+        }
+        std::cout << "   ✅ Index workspace accessible" << std::endl;
+
+        std::cout << "   Copying qo_indptr: " << (void*)qo_indptr << " -> " << ((char*)index_workspace + index_offset) << std::endl;
         std::memcpy((char*)index_workspace + index_offset, qo_indptr, qo_indptr_size);
         index_offset += qo_indptr_size;
+        std::cout << "   ✅ qo_indptr copied, new offset: " << index_offset << std::endl;
+
+        std::cout << "   Copying kv_page_indptr: " << (void*)kv_page_indptr << " -> " << ((char*)index_workspace + index_offset) << std::endl;
         std::memcpy((char*)index_workspace + index_offset, kv_page_indptr, kv_page_indptr_size);
         index_offset += kv_page_indptr_size;
-        std::memcpy((char*)index_workspace + index_offset, kv_page_indices, kv_page_indices_size);
-        index_offset += kv_page_indices_size;
+        std::cout << "   ✅ kv_page_indptr copied, new offset: " << index_offset << std::endl;
+
+        if (num_kv_pages > 0 && kv_page_indices) {
+            std::cout << "   Copying kv_page_indices: " << (void*)kv_page_indices << " -> " << ((char*)index_workspace + index_offset) << std::endl;
+            std::memcpy((char*)index_workspace + index_offset, kv_page_indices, kv_page_indices_size);
+            index_offset += kv_page_indices_size;
+            std::cout << "   ✅ kv_page_indices copied, new offset: " << index_offset << std::endl;
+        } else {
+            std::cout << "   Skipping kv_page_indices (num_kv_pages=" << num_kv_pages << ")" << std::endl;
+        }
+
+        std::cout << "   Copying kv_last_page_lens: " << (void*)kv_last_page_lens << " -> " << ((char*)index_workspace + index_offset) << std::endl;
         std::memcpy((char*)index_workspace + index_offset, kv_last_page_lens, kv_last_page_lens_size);
+        std::cout << "   ✅ kv_last_page_lens copied" << std::endl;
+
+        std::cout << "🔄 [METAL BUFFERS] Creating Metal buffer views..." << std::endl;
 
         // Create Metal buffer views (no allocation!)
+        std::cout << "   Creating Q buffer: " << q_workspace << ", size=" << workspace.q_buffer_size << std::endl;
         id<MTLBuffer> q_buf = [handle->device newBufferWithBytesNoCopy:q_workspace
                                                                length:workspace.q_buffer_size
                                                               options:MTLResourceStorageModeShared
                                                          deallocator:nil];
+        if (!q_buf) {
+            std::cerr << "❌ Failed to create Q buffer!" << std::endl;
+            return;
+        }
+        std::cout << "   ✅ Q buffer created" << std::endl;
 
+        std::cout << "   Creating K buffer: " << k_workspace << ", size=" << workspace.k_buffer_size << std::endl;
         id<MTLBuffer> k_buf = [handle->device newBufferWithBytesNoCopy:k_workspace
                                                                length:workspace.k_buffer_size
                                                               options:MTLResourceStorageModeShared
                                                          deallocator:nil];
+        if (!k_buf) {
+            std::cerr << "❌ Failed to create K buffer!" << std::endl;
+            return;
+        }
+        std::cout << "   ✅ K buffer created" << std::endl;
 
+        std::cout << "   Creating V buffer: " << v_workspace << ", size=" << workspace.v_buffer_size << std::endl;
         id<MTLBuffer> v_buf = [handle->device newBufferWithBytesNoCopy:v_workspace
                                                                length:workspace.v_buffer_size
                                                               options:MTLResourceStorageModeShared
                                                          deallocator:nil];
+        if (!v_buf) {
+            std::cerr << "❌ Failed to create V buffer!" << std::endl;
+            return;
+        }
+        std::cout << "   ✅ V buffer created" << std::endl;
 
+        std::cout << "   Creating output buffer: " << output_workspace << ", size=" << workspace.output_buffer_size << std::endl;
         id<MTLBuffer> out_buf = [handle->device newBufferWithBytesNoCopy:output_workspace
                                                                  length:workspace.output_buffer_size
                                                                 options:MTLResourceStorageModeShared
                                                            deallocator:nil];
+        if (!out_buf) {
+            std::cerr << "❌ Failed to create output buffer!" << std::endl;
+            return;
+        }
+        std::cout << "   ✅ Output buffer created" << std::endl;
 
         // OPTIMIZATION: Combine small buffers to reduce buffer object count
         // This reduces Metal Internal Error (0x0E) risk from too many concurrent buffer objects
         size_t combined_small_buffers_size = workspace.index_buffer_size + workspace.params_buffer_size + workspace.debug_buffer_size;
+        std::cout << "   Creating combined buffer: " << index_workspace << ", size=" << combined_small_buffers_size << std::endl;
         id<MTLBuffer> combined_buf = [handle->device newBufferWithBytesNoCopy:index_workspace
                                                                        length:combined_small_buffers_size
                                                                       options:MTLResourceStorageModeShared
                                                                  deallocator:nil];
+        if (!combined_buf) {
+            std::cerr << "❌ Failed to create combined buffer!" << std::endl;
+            return;
+        }
+        std::cout << "   ✅ Combined buffer created" << std::endl;
 
         // Create parameter buffer data in workspace
-        struct Params {
-            int num_qo;
-            int head_dim;
-            int kv_head_dim;
-            int head_size;
-            int page_size;
-            int num_query_heads;
-            int num_kv_heads;
-            float scale;
-        };
-
         Params* params = static_cast<Params*>(params_workspace);
         *params = { num_qo, head_dim, kv_head_dim, head_size, page_size, num_query_heads, num_kv_heads, scale };
 
@@ -828,7 +916,7 @@ void batch_prefill_attention_unified_bf16(
         // Estimate total_kv_len (this is a rough estimate - exact calculation happens in kernel)
         int estimated_total_kv_len = (num_kv_pages > 0) ? (num_kv_pages - 1) * page_size + page_size : 0;
         id<MTLComputePipelineState> selected_pipeline = select_bf16_kernel(
-            handle, opt_level, num_qo, estimated_total_kv_len, head_size, page_size, true); // Enable debug for large heads
+            handle, opt_level, num_qo, estimated_total_kv_len, head_size, page_size, false);
 
         if (!selected_pipeline) {
             std::cerr << "batch_prefill_attention_unified_bf16: No suitable kernel found" << std::endl;
@@ -891,10 +979,10 @@ void batch_prefill_attention_unified_bf16(
             // CRITICAL: Metal attention kernels are hardcoded with TGP_SIZE = 128
             // Reducing threadsPerGroup breaks kernel correctness assumptions
             // Instead, we must process in smaller batches to stay within GPU limits
-            
+
             NSUInteger maxBatchSize = MAX_CONCURRENT_THREADS / recommendedThreadsPerGroup;
             if (maxBatchSize < 1) maxBatchSize = 1;
-            
+
             if (totalWork <= maxBatchSize) {
                 // Can process all tokens in one batch
                 threadsPerGroup = recommendedThreadsPerGroup;  // Keep 128
@@ -904,7 +992,7 @@ void batch_prefill_attention_unified_bf16(
                 // For now, use original settings and accept potential Metal errors for very large workloads
                 threadsPerGroup = recommendedThreadsPerGroup;  // Keep 128 for correctness
                 threadgroupCount = totalWork;
-                
+
                 std::cout << "   ⚠️  WARNING: Large workload may cause Metal Internal Error" << std::endl;
                 std::cout << "   💡 Consider reducing batch_size or sequence_length in model config" << std::endl;
             }
@@ -935,7 +1023,7 @@ void batch_prefill_attention_unified_bf16(
         int retries = 3;
         NSError* cmdError = nil;
         bool success = false;
-        
+
         while (retries > 0) {
             [cmd commit];
             [cmd waitUntilCompleted];
@@ -956,11 +1044,11 @@ void batch_prefill_attention_unified_bf16(
             retries--;
             if (retries > 0) {
                 std::cout << "🔄 Retrying... (" << retries << " attempts remaining)" << std::endl;
-                
+
                 // 🔧 RESOURCE CLEANUP: Proper Metal resource management to prevent buildup
                 // Wait a bit to let GPU recover from potential resource contention
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                
+
                 // Create fresh command buffer for retry - old one is auto-released by ARC
                 cmd = [handle->commandQueue commandBuffer];
                 enc = [cmd computeCommandEncoder];
@@ -1206,7 +1294,7 @@ void batch_prefill_attention_unified_f32(
             // F32 kernels may be more flexible, but apply same logic for consistency
             NSUInteger maxBatchSize = MAX_CONCURRENT_THREADS / recommendedThreadsPerGroup;
             if (maxBatchSize < 1) maxBatchSize = 1;
-            
+
             if (totalWork <= maxBatchSize) {
                 threadsPerGroup = recommendedThreadsPerGroup;
                 threadgroupCount = totalWork;
@@ -1239,6 +1327,145 @@ void batch_prefill_attention_unified_f32(
         handle->total_bytes_processed += workspace.total_size;
 
         std::cout << "✅ [HANDLE F32] Metal batch attention completed successfully using workspace!" << std::endl;
+    }
+}
+
+// ============================================================================
+// Diagnostic function for buffer validation
+// ============================================================================
+
+int batch_prefill_attention_diagnostic(
+    MetalBatchPrefillHandle* handle,
+    void* workspace_buffer,
+    size_t workspace_size,
+    const void* q_input,
+    const void* paged_k_cache,
+    const void* paged_v_cache,
+    const int32_t* qo_indptr,
+    const int32_t* kv_page_indptr,
+    const int32_t* kv_page_indices,
+    const int32_t* kv_last_page_lens,
+    void* output,
+    int num_qo,
+    int head_dim,
+    int kv_head_dim,
+    int head_size,
+    int page_size,
+    int num_query_heads,
+    int num_kv_heads,
+    float scale,
+    int num_kv_pages,
+    float* debug_output,
+    int debug_size
+) {
+    @autoreleasepool {
+        if (!handle || debug_size < 20) {
+            std::cerr << "❌ [DIAGNOSTIC] Invalid handle or debug buffer too small" << std::endl;
+            return -1;
+        }
+
+        std::cout << "🔍 [DIAGNOSTIC] Starting buffer accessibility test..." << std::endl;
+
+        // Initialize debug output
+        for (int i = 0; i < debug_size; ++i) {
+            debug_output[i] = -99.0f; // Uninitialized marker
+        }
+
+        // Create command buffer
+        id<MTLCommandBuffer> cmd = [handle->commandQueue commandBuffer];
+        cmd.label = @"BufferDiagnosticTest";
+
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        enc.label = @"BufferDiagnosticEncoder";
+
+        // Use baseline pipeline for diagnostics
+        [enc setComputePipelineState:handle->pipeline_bf16_baseline];
+
+        // Create debug buffer for GPU output
+        id<MTLBuffer> debug_buffer = [handle->device newBufferWithBytes:debug_output
+                                                                length:debug_size * sizeof(float)
+                                                               options:MTLResourceStorageModeShared];
+
+        // Set all buffers exactly as they would be in normal operation
+        size_t kv_cache_size = static_cast<size_t>(num_kv_pages) * page_size * kv_head_dim * sizeof(uint16_t);
+        [enc setBuffer:[handle->device newBufferWithBytes:q_input length:num_qo * head_dim * sizeof(uint16_t) options:MTLResourceStorageModeShared]
+                offset:0 atIndex:0];  // q_input
+        [enc setBuffer:[handle->device newBufferWithBytes:paged_k_cache length:kv_cache_size options:MTLResourceStorageModeShared]
+                offset:0 atIndex:1];  // paged_k_cache
+        [enc setBuffer:[handle->device newBufferWithBytes:paged_v_cache length:kv_cache_size options:MTLResourceStorageModeShared]
+                offset:0 atIndex:2];  // paged_v_cache
+        [enc setBuffer:[handle->device newBufferWithBytes:qo_indptr length:(num_qo + 1) * sizeof(int32_t) options:MTLResourceStorageModeShared]
+                offset:0 atIndex:3];  // qo_indptr
+        [enc setBuffer:[handle->device newBufferWithBytes:kv_page_indptr length:(num_qo + 1) * sizeof(int32_t) options:MTLResourceStorageModeShared]
+                offset:0 atIndex:4];  // kv_page_indptr
+        [enc setBuffer:[handle->device newBufferWithBytes:kv_page_indices length:128 * sizeof(int32_t) options:MTLResourceStorageModeShared]
+                offset:0 atIndex:5];  // kv_page_indices
+        [enc setBuffer:[handle->device newBufferWithBytes:kv_last_page_lens length:num_qo * sizeof(int32_t) options:MTLResourceStorageModeShared]
+                offset:0 atIndex:6];  // kv_last_page_lens
+        [enc setBuffer:[handle->device newBufferWithBytes:output length:num_qo * head_dim * sizeof(uint16_t) options:MTLResourceStorageModeShared]
+                offset:0 atIndex:7];  // output
+
+        // Create params struct
+        Params params = {
+            .num_qo = num_qo,
+            .head_dim = head_dim,
+            .kv_head_dim = kv_head_dim,
+            .head_size = head_size,
+            .page_size = page_size,
+            .num_query_heads = num_query_heads,
+            .num_kv_heads = num_kv_heads,
+            .scale = scale
+        };
+
+        [enc setBytes:&params length:sizeof(params) atIndex:8];  // params
+        [enc setBuffer:debug_buffer offset:0 atIndex:9];         // debug_out
+
+        // Dispatch minimal grid - just one threadgroup with one thread
+        MTLSize threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+        MTLSize threadgroupsPerGrid = MTLSizeMake(1, 1, 1);
+        [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+        [enc endEncoding];
+
+        std::cout << "🚀 [DIAGNOSTIC] Executing diagnostic kernel..." << std::endl;
+
+        // Execute and wait
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if (cmd.status != MTLCommandBufferStatusCompleted) {
+            std::cerr << "❌ [DIAGNOSTIC] Command buffer failed with status: " << (int)cmd.status << std::endl;
+            if (cmd.error) {
+                NSLog(@"Command buffer error: %@", cmd.error.localizedDescription);
+            }
+            return -2;
+        }
+
+        // Copy results back
+        memcpy(debug_output, debug_buffer.contents, debug_size * sizeof(float));
+
+        std::cout << "✅ [DIAGNOSTIC] Kernel completed, analyzing results..." << std::endl;
+
+        // Analyze diagnostic results
+        for (int i = 0; i < debug_size && i < 12; ++i) {
+            float value = debug_output[i];
+            if (value == -99.0f) {
+                std::cout << "   debug[" << i << "] = " << value << " (uninitialized)" << std::endl;
+            } else if (value == -1.0f) {
+                std::cout << "   debug[" << i << "] = " << value << " (not tested)" << std::endl;
+            } else if (value >= 100.0f) {
+                std::cout << "   debug[" << i << "] = " << value << " ✅" << std::endl;
+            } else {
+                std::cout << "   debug[" << i << "] = " << value << " (unknown)" << std::endl;
+            }
+        }
+
+        if (debug_output[11] == 9999.0f) {
+            std::cout << "🎉 [DIAGNOSTIC] All buffer tests completed successfully!" << std::endl;
+            return 0;
+        } else {
+            std::cout << "❌ [DIAGNOSTIC] Test failed or incomplete" << std::endl;
+            return -3;
+        }
     }
 }
 

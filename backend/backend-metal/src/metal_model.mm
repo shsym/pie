@@ -53,14 +53,14 @@ void MetalModel::MetalModelImpl::handle_allocate(const std::vector<MetalModel::A
                     blocks[block_id] = Block(kv_page_size);
                 }
                 break;
-                
+
             case MetalModel::ObjectKind::EMB:
                 for (uint32_t i = 0; i < cmd.count; ++i) {
                     uint32_t embed_id = cmd.object_id_offset + i;
                     embeds[embed_id] = TextEmbed{};
                 }
                 break;
-                
+
             case MetalModel::ObjectKind::DIST:
                 for (uint32_t i = 0; i < cmd.count; ++i) {
                     uint32_t dist_id = cmd.object_id_offset + i;
@@ -70,7 +70,7 @@ void MetalModel::MetalModelImpl::handle_allocate(const std::vector<MetalModel::A
                     dists[dist_id] = std::move(new_dist);
                 }
                 break;
-                
+
             default:
                 std::cerr << "Unknown allocation kind: " << static_cast<int>(cmd.kind) << std::endl;
                 break;
@@ -87,21 +87,21 @@ void MetalModel::MetalModelImpl::handle_deallocate(const std::vector<MetalModel:
                     blocks.erase(block_id);
                 }
                 break;
-                
+
             case MetalModel::ObjectKind::EMB:
                 for (uint32_t i = 0; i < cmd.count; ++i) {
                     uint32_t embed_id = cmd.object_id_offset + i;
                     embeds.erase(embed_id);
                 }
                 break;
-                
+
             case MetalModel::ObjectKind::DIST:
                 for (uint32_t i = 0; i < cmd.count; ++i) {
                     uint32_t dist_id = cmd.object_id_offset + i;
                     dists.erase(dist_id);
                 }
                 break;
-                
+
             default:
                 std::cerr << "Unknown deallocation kind: " << static_cast<int>(cmd.kind) << std::endl;
                 break;
@@ -125,23 +125,23 @@ void MetalModel::MetalModelImpl::handle_fill_block(const std::vector<MetalModel:
     for (const auto& cmd : commands) {
         // Setup buffer for input processing
         std::vector<int32_t> input_ids_temp, position_ids_temp;
-        
+
         // Process input embeddings to fill KV cache blocks
         for (size_t i = 0; i < cmd.input_embedding_ids.size(); ++i) {
             uint32_t embed_id = cmd.input_embedding_ids[i];
             auto embed_it = embeds.find(embed_id);
-            
+
             if (embed_it != embeds.end()) {
                 // Add token and position to temporary vectors
                 input_ids_temp.push_back(embed_it->second.token_id);
                 position_ids_temp.push_back(embed_it->second.position_id);
             }
         }
-        
+
         // Copy to buffer tensors
         buffer->input_ids.copyFromHost(input_ids_temp.data());
         buffer->position_ids.copyFromHost(position_ids_temp.data());
-        
+
         // Update block page information
         for (uint32_t block_id : cmd.context_block_ids) {
             auto block_it = blocks.find(block_id);
@@ -152,24 +152,24 @@ void MetalModel::MetalModelImpl::handle_fill_block(const std::vector<MetalModel:
                 }
             }
         }
-        
+
         buffer->num_tokens = cmd.input_embedding_ids.size();
-        
+
         // Copy page indices to buffer
         buffer->kv_page_indices.copyFromHost(reinterpret_cast<const int32_t*>(cmd.context_block_ids.data()));
-        
+
         // Set up page pointers for KV cache
         std::vector<uint32_t> page_indptr;
         page_indptr.push_back(0);
         page_indptr.push_back(static_cast<uint32_t>(cmd.context_block_ids.size()));
         buffer->kv_page_indptr.copyFromHost(reinterpret_cast<const int32_t*>(page_indptr.data()));
-        
+
         // Set up query output pointers
         std::vector<uint32_t> qo_indptr;
         qo_indptr.push_back(0);
         qo_indptr.push_back(static_cast<uint32_t>(cmd.output_embedding_ids.size()));
         buffer->qo_indptr.copyFromHost(reinterpret_cast<const int32_t*>(qo_indptr.data()));
-        
+
         // Set up last page lengths
         std::vector<uint32_t> last_page_lens;
         last_page_lens.push_back(cmd.last_block_len);
@@ -195,16 +195,16 @@ void MetalModel::MetalModelImpl::handle_copy_block(const std::vector<MetalModel:
     for (const auto& cmd : commands) {
         auto src_it = blocks.find(cmd.source_block_id);
         auto dst_it = blocks.find(cmd.destination_block_id);
-        
+
         if (src_it != blocks.end() && dst_it != blocks.end()) {
             // Copy KV cache data from source to destination
             // This would involve Metal buffer operations in a full implementation
-            
+
             // For now, just copy the metadata
             size_t copy_len = std::min(cmd.length, static_cast<uint32_t>(kv_page_size));
             size_t src_start = std::min(cmd.source_start, static_cast<uint32_t>(kv_page_size));
             size_t dst_start = std::min(cmd.destination_start, static_cast<uint32_t>(kv_page_size));
-            
+
             for (size_t i = 0; i < copy_len; ++i) {
                 if (src_start + i < kv_page_size && dst_start + i < kv_page_size) {
                     dst_it->second.position_ids[dst_start + i] = src_it->second.position_ids[src_start + i];
@@ -217,10 +217,10 @@ void MetalModel::MetalModelImpl::handle_copy_block(const std::vector<MetalModel:
 
 void MetalModel::MetalModelImpl::handle_decode_token_distribution(const std::vector<MetalModel::DecodeTokenDistributionCommand>& commands) {
     if (commands.empty()) return;
-    
+
     // Setup buffer for inference
     buffer->num_tokens = commands.size();
-    
+
     // Collect embedding data
     std::vector<int32_t> input_ids_temp, position_ids_temp;
     for (const auto& cmd : commands) {
@@ -230,23 +230,23 @@ void MetalModel::MetalModelImpl::handle_decode_token_distribution(const std::vec
             position_ids_temp.push_back(embed_it->second.position_id);
         }
     }
-    
+
     // Copy to buffer tensors
     buffer->input_ids.copyFromHost(input_ids_temp.data());
     buffer->position_ids.copyFromHost(position_ids_temp.data());
-    
+
     // Run model inference
-    MetalProfiler profiler_instance;
     auto& context = MetalContext::getInstance();
     id<MTLCommandBuffer> commandBuffer = [context.getCommandQueue() commandBuffer];
-    auto profiler = profiler_instance.scope("decode_token_distribution", commandBuffer);
-    auto [values, indices] = model->forward(profiler, *buffer, *kv_cache);
-    
+    MetalProfiler::getInstance().recordStart("decode_token_distribution", commandBuffer);
+    auto [values, indices] = model->forward(*buffer, *kv_cache);
+    MetalProfiler::getInstance().recordEnd("decode_token_distribution");
+
     // Store results in distribution objects
     for (size_t i = 0; i < commands.size(); ++i) {
         uint32_t dist_id = commands[i].distribution_id;
         auto dist_it = dists.find(dist_id);
-        
+
         if (dist_it != dists.end()) {
             // Extract top-k results for this token
             size_t offset = i * dist_size;
@@ -263,57 +263,57 @@ void MetalModel::MetalModelImpl::handle_decode_token_distribution(const std::vec
 std::vector<MetalModel::SampleTopKResult> MetalModel::MetalModelImpl::handle_sample_top_k(const std::vector<MetalModel::SampleTopKCommand>& commands) {
     std::vector<MetalModel::SampleTopKResult> results;
     results.reserve(commands.size());
-    
+
     for (const auto& cmd : commands) {
         MetalModel::SampleTopKResult result;
-        
+
         auto dist_it = dists.find(cmd.distribution_id);
         if (dist_it != dists.end()) {
             const auto& dist = dist_it->second;
-            
+
             // Take top-k elements (they should already be sorted from model inference)
             uint32_t k = std::min(cmd.k, static_cast<uint32_t>(dist.token_ids.size()));
-            
+
             result.token_ids.reserve(k);
             result.probabilities.reserve(k);
-            
+
             for (uint32_t i = 0; i < k; ++i) {
                 result.token_ids.push_back(dist.token_ids[i]);
                 result.probabilities.push_back(dist.probabilities[i]);
             }
         }
-        
+
         results.push_back(std::move(result));
     }
-    
+
     return results;
 }
 
 // Implementation of MetalModel public interface
-MetalModel::MetalModel(const AppConfig& config, const ModelMetadata& metadata) 
+MetalModel::MetalModel(const AppConfig& config, const ModelMetadata& metadata)
     : pimpl(std::make_unique<MetalModelImpl>()) {
-    
+
     std::cout << "Initializing Metal Model..." << std::endl;
-    
+
     // Initialize Metal context
     auto& metal_context = MetalContext::getInstance();
     if (!metal_context.getDevice()) {
         throw std::runtime_error("Metal device not available");
     }
-    
+
     // Create command buffer
     pimpl->commandBuffer = metal_context.getCommandQueue().commandBuffer;
-    
+
     // Store configuration
     pimpl->kv_page_size = config.kv_page_size;
     pimpl->dist_size = config.dist_size;
-    
+
     // Load model
     pimpl->model = MetalModelUtils::load_model_internal<bfloat16_t>(config, metadata);
     if (!pimpl->model) {
         throw std::runtime_error("Failed to load Metal model");
     }
-    
+
     // Initialize buffer and KV cache
     pimpl->buffer = std::make_unique<MetalL4maBuffer<bfloat16_t>>(
         metadata.config,        // L4maConfig
@@ -321,13 +321,13 @@ MetalModel::MetalModel(const AppConfig& config, const ModelMetadata& metadata)
         config.dist_size,       // dist_size
         config.max_num_embeds * metadata.config.hidden_size * sizeof(bfloat16_t) // workspace_size
     );
-    
+
     pimpl->kv_cache = std::make_unique<MetalL4maKVCache<bfloat16_t>>(
         metadata.config,        // L4maConfig
         config.max_num_kv_pages, // num_kv_pages
         config.kv_page_size     // page_size
     );
-    
+
     std::cout << "Metal Model initialized successfully" << std::endl;
     std::cout << "  Model: " << metadata.model_name << std::endl;
     std::cout << "  Parameters: " << metadata.total_params << std::endl;
@@ -378,24 +378,24 @@ std::vector<MetalModel::SampleTopKResult> MetalModel::handle_sample_top_k(const 
 std::vector<std::vector<MetalModel::Distribution>> MetalModel::handle_forward_text(const std::vector<ForwardTextCommand>& commands) {
     std::vector<std::vector<Distribution>> results;
     results.reserve(commands.size());
-    
+
     for (const auto& cmd : commands) {
         std::vector<Distribution> item_distributions;
-        
+
         // Setup buffer for this forward pass
         pimpl->buffer->num_tokens = cmd.token_ids.size();
         pimpl->buffer->input_ids.copyFromHost(reinterpret_cast<const int32_t*>(cmd.token_ids.data()));
         pimpl->buffer->position_ids.copyFromHost(reinterpret_cast<const int32_t*>(cmd.position_ids.data()));
         pimpl->buffer->kv_page_indices.copyFromHost(reinterpret_cast<const int32_t*>(cmd.kv_page_ids.data()));
-        
+
         // Set up page pointers
         std::vector<uint32_t> page_indptr = {0, static_cast<uint32_t>(cmd.kv_page_ids.size())};
         pimpl->buffer->kv_page_indptr.copyFromHost(reinterpret_cast<const int32_t*>(page_indptr.data()));
-        
+
         // Set up last page lengths
         std::vector<uint32_t> last_page_lens = {cmd.kv_page_last_len};
         pimpl->buffer->kv_last_page_lens.copyFromHost(reinterpret_cast<const int32_t*>(last_page_lens.data()));
-        
+
         // Set up query output pointers based on output_indices
         std::vector<uint32_t> qo_indptr;
         qo_indptr.push_back(0);
@@ -403,48 +403,48 @@ std::vector<std::vector<MetalModel::Distribution>> MetalModel::handle_forward_te
             qo_indptr.push_back(qo_indptr.back() + 1);
         }
         pimpl->buffer->qo_indptr.copyFromHost(reinterpret_cast<const int32_t*>(qo_indptr.data()));
-        
+
         // Run inference
-        MetalProfiler profiler_instance;
         auto& context = MetalContext::getInstance();
         id<MTLCommandBuffer> commandBuffer = [context.getCommandQueue() commandBuffer];
-        auto profiler = profiler_instance.scope("forward_text", commandBuffer);
-        auto [values, indices] = pimpl->model->forward(profiler, *pimpl->buffer, *pimpl->kv_cache);
-        
+        MetalProfiler::getInstance().recordStart("forward_text", commandBuffer);
+        auto [values, indices] = pimpl->model->forward(*pimpl->buffer, *pimpl->kv_cache);
+        MetalProfiler::getInstance().recordEnd("forward_text");
+
         // Convert results to Distribution objects
         size_t top_k = 50; // Default top-k
         for (size_t out_idx = 0; out_idx < cmd.output_indices.size(); ++out_idx) {
             Distribution dist;
-            
+
             // Extract top-k values for this output position
             size_t offset = out_idx * top_k;
             if (offset + top_k <= values.size()) {
                 dist.probabilities.assign(values.begin() + offset, values.begin() + offset + top_k);
-                
+
                 // Convert int32_t indices to uint32_t token_ids
                 for (size_t i = 0; i < top_k && offset + i < indices.size(); ++i) {
                     dist.token_ids.push_back(static_cast<uint32_t>(indices[offset + i]));
                 }
             }
-            
+
             item_distributions.push_back(std::move(dist));
         }
-        
+
         results.push_back(std::move(item_distributions));
     }
-    
+
     return results;
 }
 
 // Factory and utility implementations
 namespace MetalModelLoader {
-    
+
     template<typename T>
     std::unique_ptr<MetalL4maForCausalLM<T>> load_model_internal(
         const AppConfig& config, const ModelMetadata& metadata) {
         return MetalModelUtils::load_model_internal<T>(config, metadata);
     }
-    
+
     bool initialize_metal_backend() {
         try {
             auto& context = MetalContext::getInstance();
@@ -453,15 +453,15 @@ namespace MetalModelLoader {
             return false;
         }
     }
-    
+
     void cleanup_metal_backend() {
         // Metal resources are automatically cleaned up
     }
-    
+
     bool validate_model_metadata(const ModelMetadata& metadata) {
         return MetalModelUtils::validate_model_config(metadata.config);
     }
-    
+
     // Explicit template instantiations
     template std::unique_ptr<MetalL4maForCausalLM<float>> load_model_internal(
         const AppConfig& config, const ModelMetadata& metadata);
@@ -470,29 +470,29 @@ namespace MetalModelLoader {
 }
 
 namespace MetalModelFactory {
-    
+
     std::unique_ptr<MetalModel> createModel(const AppConfig& config, const ModelMetadata& metadata) {
         if (!MetalModelLoader::initialize_metal_backend()) {
             throw std::runtime_error("Failed to initialize Metal backend");
         }
-        
+
         if (!MetalModelLoader::validate_model_metadata(metadata)) {
             throw std::runtime_error("Invalid model metadata for Metal backend");
         }
-        
+
         return std::make_unique<MetalModel>(config, metadata);
     }
-    
+
     bool isMetalAvailable() {
         return MetalModelLoader::initialize_metal_backend();
     }
-    
+
     MetalDeviceInfo getDeviceInfo() {
         MetalDeviceInfo info{};
-        
+
         auto& context = MetalContext::getInstance();
         id<MTLDevice> device = context.getDevice();
-        
+
         if (device) {
             info.name = [device.name UTF8String];
             info.max_buffer_length = device.maxBufferLength;
@@ -500,23 +500,21 @@ namespace MetalModelFactory {
             info.supports_bfloat16 = true; // Assume modern Metal devices support bfloat16
             info.supports_function_pointers = [device supportsFamily:MTLGPUFamilyMac2];
         }
-        
+
         return info;
     }
 }
 
 // Global profiler instance
 namespace MetalModelProfiler {
-    MetalProfiler globalProfiler;
-    
     void enableProfiling(bool enabled) {
-        globalProfiler.setEnabled(enabled);
+        MetalProfiler::getInstance().setEnabled(enabled);
     }
-    
+
     void printProfilingReport() {
-        globalProfiler.print_report();
+        MetalProfiler::getInstance().print_report();
     }
-    
+
     void resetProfiling() {
         // Reset not implemented in MetalProfiler
         // Would need to clear timings_ vector
@@ -526,16 +524,16 @@ namespace MetalModelProfiler {
 namespace MetalModelDiagnostics {
     static ErrorInfo lastError;
     static bool verboseErrors = false;
-    
+
     bool validateModelState(const MetalModel& model) {
         // Basic validation - could be expanded
         return true;
     }
-    
+
     ErrorInfo getLastError() {
         return lastError;
     }
-    
+
     void enableVerboseErrors(bool enabled) {
         verboseErrors = enabled;
     }

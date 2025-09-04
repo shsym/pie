@@ -47,13 +47,23 @@ MetalL4maModel<T>::MetalL4maModel(const L4maConfig& config) : config_(config), n
 }
 
 template <typename T>
-void MetalL4maModel<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<T>& buffer,
+void MetalL4maModel<T>::forward(MetalL4maBuffer<T>& buffer,
                                MetalL4maKVCache<T>& kv_cache, T* final_norm_output) {
     size_t num_tokens = buffer.num_tokens;
     size_t hidden_size = config_.hidden_size;
 
-    // Allocate hidden states buffer
-    auto hidden_states = buffer.template allocate<T>(num_tokens * hidden_size);
+    // Choose hidden states backing: use persistent workspace if available, otherwise stack-alloc
+    T* hidden_ptr = nullptr;
+    bool hidden_owns = false; // whether we must deallocate
+    MetalTensor<T> hidden_states_owned; // only valid if hidden_owns=true
+    if (auto* ws0 = buffer.getLayerWorkspace(0)) {
+        // Use residual buffer as the persistent hidden state across layers
+        hidden_ptr = ws0->residual_buffer.data();
+    } else {
+        hidden_states_owned = buffer.template allocate<T>(num_tokens * hidden_size);
+        hidden_ptr = hidden_states_owned.data();
+        hidden_owns = true;
+    }
 
     // 1. Token embedding lookup using metal_embedding
     auto& context = MetalContext::getInstance();
@@ -63,27 +73,39 @@ void MetalL4maModel<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<T>& 
         config_.vocab_size,
         reinterpret_cast<const int32_t*>(buffer.input_ids.data()),
         num_tokens,
-        reinterpret_cast<bfloat16_t*>(hidden_states.data()),
+        reinterpret_cast<bfloat16_t*>(hidden_ptr),
         config_.hidden_size
     );
-    profiler.record("token_embedding");
+    MetalProfiler::getInstance().record("token_embedding");
+    std::cout << "  ✅ Token embedding lookup completed\n";
 
     // 2. Forward through all decoder layers
+    MetalProfiler::getInstance().recordStart("attention");
     for (int layer_idx = 0; layer_idx < config_.num_layers; ++layer_idx) {
-        auto layer_profiler = profiler.scope("layer_" + std::to_string(layer_idx));
+        std::cout << "  🔄 Processing layer (kv_cache)" << layer_idx + 1 << "/" << config_.num_layers << "\n";
 
         // Get KV cache for this layer
         auto [kv_cache_k, kv_cache_v] = kv_cache.get_layer_pointers(layer_idx);
+        std::cout << "  🔄 Processing layer (kv_cache complete)" << layer_idx + 1 << "/" << config_.num_layers << "\n";
 
-        layers_[layer_idx].forward(layer_profiler, buffer, hidden_states.data(), kv_cache_k, kv_cache_v);
+        layers_[layer_idx].forward(buffer, hidden_ptr, kv_cache_k, kv_cache_v, kv_cache.get_num_pages());
+        std::cout << "    ✅ Layer " << layer_idx + 1 << " forward pass completed\n";
     }
+    MetalProfiler::getInstance().recordEnd("attention");
+    std::cout << "  ✅ Completed forward pass through " << config_.num_layers << " layers\n";
 
     // 3. Final layer normalization
-    norm_.forward(final_norm_output, hidden_states.data(), num_tokens, buffer.commandBuffer);
-    profiler.record("final_norm");
+    norm_.forward(final_norm_output, hidden_ptr, num_tokens, buffer.commandBuffer);
+    MetalProfiler::getInstance().record("final_norm");
+    std::cout << "  ✅ Final layer normalization completed\n";
 
-    // Deallocate hidden states
-    buffer.deallocate(hidden_states);
+    // Deallocate if we owned the temporary hidden buffer
+    if (hidden_owns) {
+        buffer.deallocate(hidden_states_owned);
+        std::cout << "  ✅ Deallocated intermediate hidden states (stack)\n";
+    } else {
+        std::cout << "  ♻️  Reused persistent workspace for hidden states\n";
+    }
 }
 
 template <typename T>
@@ -117,7 +139,7 @@ MetalL4maForCausalLM<T>::MetalL4maForCausalLM(const L4maConfig& config) : config
 
 template <typename T>
 std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::forward(
-    MetalProfileScope profiler, MetalL4maBuffer<T>& buffer, MetalL4maKVCache<T>& kv_cache) {
+    MetalL4maBuffer<T>& buffer, MetalL4maKVCache<T>& kv_cache) {
 
     size_t num_tokens = buffer.num_tokens;
     size_t hidden_size = config_.hidden_size;
@@ -127,7 +149,9 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     auto final_norm_output = buffer.template allocate<T>(num_tokens * hidden_size);
 
     // 1. Forward through the model
-    model_.forward(profiler.scope("model"), buffer, kv_cache, final_norm_output.data());
+    MetalProfiler::getInstance().recordStart("model");
+    model_.forward(buffer, kv_cache, final_norm_output.data());
+    MetalProfiler::getInstance().recordEnd("model");
 
     // 2. Language model head (reuse embedding weights)
     auto logits = buffer.template allocate<T>(num_tokens * vocab_size);
@@ -143,7 +167,7 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
         nullptr, 0, // workspace (unused for compatibility)
         false, false // no transpose
     );
-    profiler.record("lm_head");
+    MetalProfiler::getInstance().record("lm_head");
 
     // 3. Apply top-k mask and softmax to get final probabilities
     constexpr int top_k = 50; // Default top-k value
@@ -160,7 +184,7 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     if (result != 0) {
         throw std::runtime_error("Failed to apply top-k masking");
     }
-    profiler.record("topk_mask");
+    MetalProfiler::getInstance().record("topk_mask");
 
     // Apply softmax to get probabilities (convert bfloat16 to float temporarily)
     auto logits_float = buffer.template allocate<float>(num_tokens * vocab_size);
@@ -186,7 +210,7 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
                                 num_tokens * vocab_size);
 
     buffer.deallocate(logits_float);
-    profiler.record("softmax");
+    MetalProfiler::getInstance().record("softmax");
 
     // Extract top-k values and indices
     int extract_result = metal_extract_k_values_bfloat16(
@@ -200,7 +224,7 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     if (extract_result != 0) {
         throw std::runtime_error("Failed to extract top-k values");
     }
-    profiler.record("extract_k_values");
+    MetalProfiler::getInstance().record("extract_k_values");
 
     // Copy results to host vectors
     std::vector<float> result_values(num_tokens * top_k);

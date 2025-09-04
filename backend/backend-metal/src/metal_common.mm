@@ -49,34 +49,35 @@ void MetalContext::cleanup() {
     }
 }
 
-// MetalProfileScope implementation
-MetalProfileScope::MetalProfileScope(MetalProfiler* profiler, const std::string& name, id<MTLCommandBuffer> commandBuffer)
-    : profiler_(profiler), name_(name), commandBuffer_(commandBuffer) {
-    // Metal profiling would be implemented here
-    // For now, we'll do basic timing
-}
-
-MetalProfileScope::~MetalProfileScope() {
-    // End profiling scope
-}
-
-void MetalProfileScope::record(const std::string& checkpoint) {
-    // Record profiling checkpoint
-    if (profiler_ && profiler_->isEnabled()) {
-        // Implementation would record timing checkpoint
-    }
-}
-
-MetalProfileScope MetalProfileScope::scope(const std::string& name) {
-    return MetalProfileScope(profiler_, name_, commandBuffer_);
-}
-
-// MetalProfiler implementation
+// MetalProfiler singleton implementation
 MetalProfiler::MetalProfiler(bool enabled) : enabled_(enabled) {
 }
 
-MetalProfileScope MetalProfiler::scope(const std::string& name, id<MTLCommandBuffer> commandBuffer) {
-    return MetalProfileScope(this, name, commandBuffer);
+MetalProfiler& MetalProfiler::getInstance() {
+    static MetalProfiler instance(true);
+    return instance;
+}
+
+void MetalProfiler::recordStart(const std::string& name, id<MTLCommandBuffer> commandBuffer) {
+    if (!enabled_) return;
+    start_times_[name] = std::chrono::high_resolution_clock::now();
+}
+
+void MetalProfiler::recordEnd(const std::string& name) {
+    if (!enabled_) return;
+    auto it = start_times_.find(name);
+    if (it != start_times_.end()) {
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - it->second);
+        timings_.push_back({name, duration.count() / 1000.0}); // Convert to milliseconds
+        start_times_.erase(it);
+    }
+}
+
+void MetalProfiler::record(const std::string& checkpoint) {
+    if (!enabled_) return;
+    // For simple checkpoints, just record them with current timestamp
+    timings_.push_back({checkpoint, 0.0});
 }
 
 void MetalProfiler::print_report() {
@@ -359,9 +360,10 @@ bool MetalComputePipelineManager::registerKernelLibrary(const std::string& libra
     }
 
     NSString* pathStr = [NSString stringWithUTF8String:libraryPath.c_str()];
+    NSURL* libraryURL = [NSURL fileURLWithPath:pathStr];
     NSError* error = nil;
 
-    id<MTLLibrary> library = [context.getDevice() newLibraryWithFile:pathStr error:&error];
+    id<MTLLibrary> library = [context.getDevice() newLibraryWithURL:libraryURL error:&error];
 
     if (error) {
         std::cerr << "Failed to load Metal library from " << libraryPath

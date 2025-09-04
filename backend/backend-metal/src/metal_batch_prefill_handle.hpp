@@ -21,33 +21,36 @@ struct MetalBatchPrefillHandle {
     id<MTLDevice> device;
     id<MTLCommandQueue> commandQueue;
     id<MTLLibrary> library;
-    
+
     // Pipeline states for different kernels and optimization levels
     id<MTLComputePipelineState> pipeline_bf16;
     id<MTLComputePipelineState> pipeline_f32;
-    
+
     // Baseline reference kernels
     id<MTLComputePipelineState> pipeline_bf16_baseline;
     id<MTLComputePipelineState> pipeline_f32_baseline;
-    
+
     // Simdgroup optimized kernels (Priority 0)
     id<MTLComputePipelineState> pipeline_bf16_simdgroup;
     id<MTLComputePipelineState> pipeline_f32_simdgroup;
-    
+
     // Per-head mapping kernels (Priority 2)
     id<MTLComputePipelineState> pipeline_bf16_per_head;
     id<MTLComputePipelineState> pipeline_f32_per_head;
-    
+
+    // Diagnostic kernel for buffer validation
+    id<MTLComputePipelineState> pipeline_diagnostic;
+
     // Configuration bounds (for validation)
     int max_batch_size;
-    int max_seq_length; 
+    int max_seq_length;
     int max_heads;
     int max_head_dim;
-    
+
     // Usage statistics
     size_t total_calls;
     size_t total_bytes_processed;
-    
+
     // GPU Configuration (loaded from apple_gpu_configs.json)
     struct {
         std::string gpu_name;
@@ -63,7 +66,7 @@ struct MetalBatchPrefillHandle {
         int max_tokens_per_chunk;
         bool enable_adaptive_chunking;
     } gpu_config;
-    
+
     // Internal state
     bool initialized;
 };
@@ -86,31 +89,45 @@ enum class KernelOptimizationLevel {
 struct MetalBatchPrefillWorkspace {
     // Total workspace size required
     size_t total_size;
-    
+
     // Buffer offsets within workspace
     size_t q_buffer_offset;        // Query buffer (converted from BF16 to Half)
     size_t q_buffer_size;
-    
+
     size_t k_buffer_offset;        // Key cache buffer (converted)
     size_t k_buffer_size;
-    
+
     size_t v_buffer_offset;        // Value cache buffer (converted)
     size_t v_buffer_size;
-    
+
     size_t output_buffer_offset;   // Output buffer
     size_t output_buffer_size;
-    
+
     size_t index_buffer_offset;    // Combined index arrays
     size_t index_buffer_size;
-    
+
     size_t params_buffer_offset;   // Kernel parameters
     size_t params_buffer_size;
-    
+
     size_t debug_buffer_offset;    // Debug buffer
     size_t debug_buffer_size;
-    
+
     // Alignment padding
     size_t alignment_padding;
+};
+
+/**
+ * @brief Parameters for the Metal attention kernel
+ */
+struct Params {
+    int num_qo;
+    int head_dim;
+    int kv_head_dim;
+    int head_size;
+    int page_size;
+    int num_query_heads;
+    int num_kv_heads;
+    float scale;
 };
 
 // ============================================================================
@@ -127,7 +144,7 @@ struct MetalBatchPrefillWorkspace {
  */
 MetalBatchPrefillHandle* metal_batch_prefill_create_handle(
     int max_batch_size = 1024,
-    int max_seq_length = 8192, 
+    int max_seq_length = 8192,
     int max_heads = 64,
     int max_head_dim = 8192
 );
@@ -163,18 +180,18 @@ MetalBatchPrefillWorkspace metal_batch_prefill_get_workspace(
 
 /**
  * @brief FlashInfer-style unified paged KV cache interface (bf16) with handle/workspace
- * 
+ *
  * This is the new primary API that uses explicit handle and workspace management.
  * All memory allocations are done by the user and passed as workspace.
- * 
+ *
  * @param handle Valid MetalBatchPrefillHandle
  * @param workspace_buffer User-allocated Metal buffer contents (from [buffer contents])
  * @param workspace_size Size of workspace buffer in bytes
  * @param q_input Query input: [num_qo, head_dim] in bfloat16
- * @param paged_k_cache Key cache: [num_pages_total, page_size, kv_head_dim] in bfloat16  
+ * @param paged_k_cache Key cache: [num_pages_total, page_size, kv_head_dim] in bfloat16
  * @param paged_v_cache Value cache: [num_pages_total, page_size, kv_head_dim] in bfloat16
  * @param qo_indptr Query offset pointers: [num_seqs+1]
- * @param kv_page_indptr KV page offset pointers: [num_seqs+1] 
+ * @param kv_page_indptr KV page offset pointers: [num_seqs+1]
  * @param kv_page_indices KV page indices: [total_pages_across_seqs]
  * @param kv_last_page_lens Last page lengths: [num_seqs]
  * @param output Output buffer: [num_qo, head_dim] in bfloat16
@@ -189,6 +206,38 @@ MetalBatchPrefillWorkspace metal_batch_prefill_get_workspace(
  * @param num_kv_pages Total number of KV cache pages
  * @param opt_level Kernel optimization level (default: AUTO)
  */
+/**
+ * @brief Diagnostic function to test buffer accessibility
+ * Uses minimal diagnostic kernel to isolate segfault sources
+ * @param debug_output Float array to receive diagnostic codes
+ * @param debug_size Size of debug output array (should be >= 20)
+ * @return 0 on success, negative on error
+ */
+int batch_prefill_attention_diagnostic(
+    MetalBatchPrefillHandle* handle,
+    void* workspace_buffer,
+    size_t workspace_size,
+    const void* q_input,
+    const void* paged_k_cache,
+    const void* paged_v_cache,
+    const int32_t* qo_indptr,
+    const int32_t* kv_page_indptr,
+    const int32_t* kv_page_indices,
+    const int32_t* kv_last_page_lens,
+    void* output,
+    int num_qo,
+    int head_dim,
+    int kv_head_dim,
+    int head_size,
+    int page_size,
+    int num_query_heads,
+    int num_kv_heads,
+    float scale,
+    int num_kv_pages,
+    float* debug_output,
+    int debug_size
+);
+
 void batch_prefill_attention_unified_bf16(
     MetalBatchPrefillHandle* handle,
     void* workspace_buffer,

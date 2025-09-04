@@ -7,6 +7,7 @@
 #include <vector>
 #include <map>
 #include <stdexcept>
+#include <chrono>
 
 // Metal bfloat16 type mapping - matches existing convention
 using bfloat16_t = uint16_t;
@@ -153,36 +154,23 @@ private:
 };
 
 /**
- * @brief Profile scope for Metal operations
- * Similar to CUDA ProfileScope but for Metal command buffers
- */
-class MetalProfileScope {
-public:
-    MetalProfileScope(MetalProfiler* profiler, const std::string& name, id<MTLCommandBuffer> commandBuffer);
-    ~MetalProfileScope();
-
-    // Record a checkpoint
-    void record(const std::string& checkpoint);
-
-    // Create sub-scope
-    MetalProfileScope scope(const std::string& name);
-
-private:
-    MetalProfiler* profiler_;
-    std::string name_;
-    id<MTLCommandBuffer> commandBuffer_;
-};
-
-/**
- * @brief Profiler for Metal operations
+ * @brief Singleton profiler for Metal operations
  * Tracks timing and performance metrics for Metal operations
+ * Eliminates the need for MetalProfileScope objects
  */
 class MetalProfiler {
 public:
-    explicit MetalProfiler(bool enabled = true);
+    // Singleton access
+    static MetalProfiler& getInstance();
 
-    // Create profile scope
-    MetalProfileScope scope(const std::string& name, id<MTLCommandBuffer> commandBuffer);
+    // Record operation start
+    void recordStart(const std::string& name, id<MTLCommandBuffer> commandBuffer = nullptr);
+
+    // Record operation end
+    void recordEnd(const std::string& name);
+
+    // Record a checkpoint within an operation
+    void record(const std::string& checkpoint);
 
     // Print profiling report
     void print_report();
@@ -192,9 +180,16 @@ public:
     bool isEnabled() const { return enabled_; }
 
 private:
-    friend class MetalProfileScope;
+    MetalProfiler(bool enabled = true);
+    ~MetalProfiler() = default;
+
+    // Delete copy constructor and assignment
+    MetalProfiler(const MetalProfiler&) = delete;
+    MetalProfiler& operator=(const MetalProfiler&) = delete;
+
     bool enabled_;
     std::vector<std::pair<std::string, double>> timings_;
+    std::map<std::string, std::chrono::high_resolution_clock::time_point> start_times_;
 };
 
 /**

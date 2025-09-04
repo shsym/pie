@@ -79,8 +79,7 @@ public:
     MetalL4maMlp& operator=(const MetalL4maMlp&) = delete;
 
     // Forward pass with Metal buffer management
-    void forward(MetalProfileScope profiler,
-                 MetalL4maBuffer<T>& buffer,
+    void forward(MetalL4maBuffer<T>& buffer,
                  T* output,
                  const T* x);
 
@@ -111,12 +110,12 @@ public:
     MetalL4maAttention(const MetalL4maAttention&) = delete;
     MetalL4maAttention& operator=(const MetalL4maAttention&) = delete;
 
-    void forward(MetalProfileScope profiler,
-                 MetalL4maBuffer<T>& buffer,
+    void forward(MetalL4maBuffer<T>& buffer,
                  T* attn_output,
                  const T* hidden_states,
                  T* kv_cache_k,
-                 T* kv_cache_v);
+                 T* kv_cache_v,
+                 int32_t total_kv_pages = -1);  // Add parameter for total KV cache pages
 
     std::map<std::string, MetalTensor<T>*> get_parameters() override;
 
@@ -146,11 +145,11 @@ public:
     MetalL4maDecoderLayer(const MetalL4maDecoderLayer&) = delete;
     MetalL4maDecoderLayer& operator=(const MetalL4maDecoderLayer&) = delete;
 
-    void forward(MetalProfileScope profiler,
-                 MetalL4maBuffer<T>& buffer,
+    void forward(MetalL4maBuffer<T>& buffer,
                  T* hidden_states,
                  T* kv_cache_k,
-                 T* kv_cache_v);
+                 T* kv_cache_v,
+                 int32_t total_kv_pages = -1);  // Add parameter for total KV cache pages
 
     std::map<std::string, MetalTensor<T>*> get_parameters() override;
 
@@ -179,8 +178,7 @@ public:
     MetalL4maModel(const MetalL4maModel&) = delete;
     MetalL4maModel& operator=(const MetalL4maModel&) = delete;
 
-    void forward(MetalProfileScope profiler,
-                 MetalL4maBuffer<T>& buffer,
+    void forward(MetalL4maBuffer<T>& buffer,
                  MetalL4maKVCache<T>& kv_cache,
                  T* final_norm_output);
 
@@ -206,7 +204,6 @@ public:
 
     // Main forward pass - returns top-k values and indices
     std::pair<std::vector<float>, std::vector<int32_t>> forward(
-        MetalProfileScope profiler,
         MetalL4maBuffer<T>& buffer,
         MetalL4maKVCache<T>& kv_cache
     );
@@ -287,42 +284,57 @@ MetalL4maMlp<T>::MetalL4maMlp(const L4maConfig& config) : config_(config) {
 }
 
 template <typename T>
-void MetalL4maMlp<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<T>& buffer, T* output, const T* x) {
+void MetalL4maMlp<T>::forward(MetalL4maBuffer<T>& buffer, T* output, const T* x) {
     size_t hidden_size = config_.hidden_size;
     size_t intermediate_size = config_.intermediate_size;
 
-    // Allocate intermediate tensors from buffer
-    auto gate_proj_out = buffer.template allocate<T>(buffer.num_tokens * intermediate_size);
-    auto up_proj_out = buffer.template allocate<T>(buffer.num_tokens * intermediate_size);
-
     auto& context = MetalContext::getInstance();
 
-    // 1. Gate and Up projections using GEMM namespace
-    MetalGEMM::gemm(buffer.commandBuffer, x, up_proj_weights_.data(), static_cast<const T*>(nullptr), up_proj_out.data(),
-                    buffer.num_tokens, intermediate_size, hidden_size,
-                    nullptr, 0, false, true);
-    profiler.record("up_projection");
+    // Use scoped block to control tensor lifetime
+    {
+        // Test with static tensors to avoid destructor calls
+        size_t gate_proj_size = buffer.num_tokens * intermediate_size;
+        size_t up_proj_size = buffer.num_tokens * intermediate_size;
 
-    MetalGEMM::gemm(buffer.commandBuffer, x, gate_proj_weights_.data(), static_cast<const T*>(nullptr), gate_proj_out.data(),
-                    buffer.num_tokens, intermediate_size, hidden_size,
-                    nullptr, 0, false, true);
-    profiler.record("gate_projection");
+        static MetalTensor<T> gate_proj_tensor({16384});  // Static size to avoid allocation each time
+        static MetalTensor<T> up_proj_tensor({16384});
 
-    // 2. SiLU activation and multiplication
-    MetalSiLUMul::silu_and_mul(gate_proj_out.data(), up_proj_out.data(),
-                               up_proj_out.data(), // reuse for result
-                               buffer.num_tokens, intermediate_size, buffer.commandBuffer);
-    profiler.record("silu_and_mul");
+        T* gate_proj_out = gate_proj_tensor.data();
+        T* up_proj_out = up_proj_tensor.data();
+        std::cout << "    ✅ Using static tensors for MLP (destructors never called)\n";
 
-    // 3. Down projection
-    MetalGEMM::gemm(buffer.commandBuffer, up_proj_out.data(), down_proj_weights_.data(), static_cast<const T*>(nullptr), output,
-                    buffer.num_tokens, hidden_size, intermediate_size,
-                    nullptr, 0, false, true);
-    profiler.record("down_projection");
+        // 1. Gate and Up projections using GEMM namespace
+        MetalGEMM::gemm(buffer.commandBuffer, x, up_proj_weights_.data(), static_cast<const T*>(nullptr), up_proj_out,
+                        buffer.num_tokens, intermediate_size, hidden_size,
+                        nullptr, 0, false, true);
+        MetalProfiler::getInstance().record("up_projection");
+        std::cout << "    ✅ Up projection completed\n";
 
-    // Deallocate intermediate tensors
-    buffer.deallocate(gate_proj_out);
-    buffer.deallocate(up_proj_out);
+        MetalGEMM::gemm(buffer.commandBuffer, x, gate_proj_weights_.data(), static_cast<const T*>(nullptr), gate_proj_out,
+                        buffer.num_tokens, intermediate_size, hidden_size,
+                        nullptr, 0, false, true);
+        MetalProfiler::getInstance().record("gate_projection");
+        std::cout << "    ✅ Gate projection completed\n";
+
+        // 2. SiLU activation and multiplication
+        MetalSiLUMul::silu_and_mul(gate_proj_out, up_proj_out,
+                                   up_proj_out, // reuse for result
+                                   buffer.num_tokens, intermediate_size, buffer.commandBuffer);
+        MetalProfiler::getInstance().record("silu_and_mul");
+        std::cout << "    ✅ SiLU and multiplication completed\n";
+
+        // 3. Down projection
+        MetalGEMM::gemm(buffer.commandBuffer, up_proj_out, down_proj_weights_.data(), static_cast<const T*>(nullptr), output,
+                        buffer.num_tokens, hidden_size, intermediate_size,
+                        nullptr, 0, false, true);
+        MetalProfiler::getInstance().record("down_projection");
+        std::cout << "    ✅ Down projection completed\n";
+
+        // Tensors will be destroyed here, at end of scope
+        std::cout << "    ✅ Intermediate tensors going out of scope\n";
+    }
+
+    std::cout << "    ✅ MLP computation completed\n";
 }
 
 template <typename T>
@@ -398,8 +410,8 @@ MetalL4maAttention<T>& MetalL4maAttention<T>::operator=(MetalL4maAttention&& oth
 }
 
 template <typename T>
-void MetalL4maAttention<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<T>& buffer, T* attn_output,
-                                   const T* hidden_states, T* kv_cache_k, T* kv_cache_v) {
+void MetalL4maAttention<T>::forward(MetalL4maBuffer<T>& buffer, T* attn_output,
+                                   const T* hidden_states, T* kv_cache_k, T* kv_cache_v, int32_t total_kv_pages) {
     size_t num_tokens = buffer.num_tokens;
     size_t hidden_size = config_.hidden_size;
     size_t num_query_heads = config_.num_query_heads;
@@ -417,17 +429,17 @@ void MetalL4maAttention<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<
     MetalGEMM::gemm(buffer.commandBuffer, hidden_states, q_proj_weights_.data(), static_cast<const T*>(nullptr), q_proj.data(),
                     num_tokens, num_query_heads * head_size, hidden_size,
                     nullptr, 0, false, true);
-    profiler.record("q_projection");
+    MetalProfiler::getInstance().record("q_projection");
 
     MetalGEMM::gemm(buffer.commandBuffer, hidden_states, k_proj_weights_.data(), static_cast<const T*>(nullptr), k_proj.data(),
                     num_tokens, num_key_value_heads * head_size, hidden_size,
                     nullptr, 0, false, true);
-    profiler.record("k_projection");
+    MetalProfiler::getInstance().record("k_projection");
 
     MetalGEMM::gemm(buffer.commandBuffer, hidden_states, v_proj_weights_.data(), static_cast<const T*>(nullptr), v_proj.data(),
                     num_tokens, num_key_value_heads * head_size, hidden_size,
                     nullptr, 0, false, true);
-    profiler.record("v_projection");
+    MetalProfiler::getInstance().record("v_projection");
 
     // 2. Apply RoPE to Q and K using RoPE namespace
     MetalRoPE::rope_inplace(q_proj.data(),
@@ -439,31 +451,46 @@ void MetalL4maAttention<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<
                            reinterpret_cast<const int32_t*>(buffer.position_ids.data()),
                            num_tokens, num_key_value_heads, head_size,
                            config_.rope_theta, config_.rope_factor);
-    profiler.record("apply_rope");
+    MetalProfiler::getInstance().record("apply_rope");
+    std::cout << "    ✅ Applied RoPE to K projections\n";
 
     // 3. Batch prefill attention with handle-based API
     auto context_out = buffer.template allocate<T>(num_tokens * num_query_heads * head_size);
+    std::cout << "    🔄 Performing batch prefill attention\n";
+
+    // Use total_kv_pages if positive, otherwise use minimal allocation (0 pages)
+    int kv_pages_for_workspace = std::max(0, total_kv_pages);
 
     // Get workspace requirements
-    auto workspace = metal::batch_prefill_attention::metal_batch_prefill_get_workspace(
+    auto workspace_info = metal::batch_prefill_attention::metal_batch_prefill_get_workspace(
         attention_handle_,
         static_cast<int>(num_tokens),
         static_cast<int>(config_.num_query_heads * head_size),    // head_dim
         static_cast<int>(config_.num_key_value_heads * head_size), // kv_head_dim
         static_cast<int>(buffer.page_size),
-        static_cast<int>(buffer.kv_page_indices.size())
+        kv_pages_for_workspace
     );
+    std::cout << "      🗂️  Required workspace: " << workspace_info.total_size << " bytes ("
+              << (workspace_info.total_size / 1024 / 1024) << " MB) for " << kv_pages_for_workspace << " KV pages\n";
 
-    // Allocate workspace buffer
-    auto& metalContext = MetalContext::getInstance();
-    id<MTLBuffer> workspace_buffer = [metalContext.getDevice() newBufferWithLength:workspace.total_size
-                                                                            options:MTLResourceStorageModeShared];
+    // Check if we have enough memory available
+    if (workspace_info.total_size == 0) {
+        throw std::runtime_error("Failed to calculate workspace requirements for attention");
+    }
+
+    // Try to allocate workspace from the buffer pool
+    auto workspace = buffer.template allocate<uint8_t>(workspace_info.total_size);
+    if (!workspace.data()) {
+        throw std::runtime_error("Insufficient memory for attention workspace: need " +
+                                std::to_string(workspace_info.total_size) + " bytes");
+    }
+    std::cout << "      ✅ Allocated attention workspace successfully\n";
 
     if constexpr (std::is_same_v<T, float>) {
         metal::batch_prefill_attention::batch_prefill_attention_unified_f32(
             attention_handle_,
-            [workspace_buffer contents],
-            [workspace_buffer length],
+            workspace.data(),
+            workspace.size(),
             reinterpret_cast<const float*>(q_proj.data()),
             reinterpret_cast<const float*>(kv_cache_k),
             reinterpret_cast<const float*>(kv_cache_v),
@@ -480,14 +507,14 @@ void MetalL4maAttention<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<
             static_cast<int>(config_.num_query_heads),
             static_cast<int>(config_.num_key_value_heads),
             1.0f / std::sqrt(float(head_size)), // scale
-            static_cast<int>(buffer.kv_page_indices.size())
+            kv_pages_for_workspace  // Use total KV cache capacity
         );
     } else {
         // For non-float types, use bf16 version
         metal::batch_prefill_attention::batch_prefill_attention_unified_bf16(
             attention_handle_,
-            [workspace_buffer contents],
-            [workspace_buffer length],
+            workspace.data(),
+            workspace.size(),
             q_proj.data(), kv_cache_k, kv_cache_v,
             reinterpret_cast<const int32_t*>(buffer.qo_indptr.data()),
             reinterpret_cast<const int32_t*>(buffer.kv_page_indptr.data()),
@@ -502,22 +529,25 @@ void MetalL4maAttention<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<
             static_cast<int>(config_.num_query_heads),
             static_cast<int>(config_.num_key_value_heads),
             1.0f / std::sqrt(float(head_size)), // scale
-            static_cast<int>(buffer.kv_page_indices.size())
+            kv_pages_for_workspace  // Use total KV cache capacity
         );
     }
-    profiler.record("batch_prefill_attention");
+    MetalProfiler::getInstance().record("batch_prefill_attention");
+    std::cout << "    ✅ Completed batch prefill attention\n";
 
     // 4. Output projection
     MetalGEMM::gemm(buffer.commandBuffer, context_out.data(), o_proj_weights_.data(), static_cast<const T*>(nullptr), attn_output,
                     num_tokens, hidden_size, num_query_heads * head_size,
                     nullptr, 0, false, true);
-    profiler.record("output_projection");
+    MetalProfiler::getInstance().record("output_projection");
+    std::cout << "    ✅ Output projection completed\n";
 
     // Deallocate intermediate tensors
     buffer.deallocate(q_proj);
     buffer.deallocate(k_proj);
     buffer.deallocate(v_proj);
     buffer.deallocate(context_out);
+    buffer.deallocate(workspace);
 }
 
 template <typename T>
@@ -540,51 +570,82 @@ MetalL4maDecoderLayer<T>::MetalL4maDecoderLayer(const L4maConfig& config)
 }
 
 template <typename T>
-void MetalL4maDecoderLayer<T>::forward(MetalProfileScope profiler, MetalL4maBuffer<T>& buffer,
-                                      T* hidden_states, T* kv_cache_k, T* kv_cache_v) {
+void MetalL4maDecoderLayer<T>::forward(MetalL4maBuffer<T>& buffer,
+                                      T* hidden_states, T* kv_cache_k, T* kv_cache_v, int32_t total_kv_pages) {
     size_t num_tokens = buffer.num_tokens;
     size_t hidden_size = config_.hidden_size;
 
-    // Allocate intermediate tensors
-    auto normed_hidden_states = buffer.template allocate<T>(num_tokens * hidden_size);
-    auto attn_output = buffer.template allocate<T>(num_tokens * hidden_size);
-    auto normed_attn_output = buffer.template allocate<T>(num_tokens * hidden_size);
-    auto mlp_output = buffer.template allocate<T>(num_tokens * hidden_size);
+    // Prefer persistent workspaces when available
+    T* normed_hidden_ptr;
+    T* attn_output_ptr;
+    T* normed_attn_ptr;
+    T* mlp_output_ptr;
+    bool owns_temporaries = false;
+    MetalTensor<T> normed_hidden_owned;
+    MetalTensor<T> attn_output_owned;
+    MetalTensor<T> normed_attn_owned;
+    MetalTensor<T> mlp_output_owned;
+    if (auto* ws = buffer.getLayerWorkspace(0)) {
+        // Use the first workspace’s slices for intermediates; each layer receives same-shape buffers
+        normed_hidden_ptr = ws->residual_buffer.data();
+        attn_output_ptr = ws->attention_output.data();
+        normed_attn_ptr = ws->hidden_states.data();
+        mlp_output_ptr = ws->mlp_output.data();
+    } else {
+        owns_temporaries = true;
+        normed_hidden_owned = buffer.template allocate<T>(num_tokens * hidden_size);
+        attn_output_owned = buffer.template allocate<T>(num_tokens * hidden_size);
+        normed_attn_owned = buffer.template allocate<T>(num_tokens * hidden_size);
+        mlp_output_owned = buffer.template allocate<T>(num_tokens * hidden_size);
+        normed_hidden_ptr = normed_hidden_owned.data();
+        attn_output_ptr = attn_output_owned.data();
+        normed_attn_ptr = normed_attn_owned.data();
+        mlp_output_ptr = mlp_output_owned.data();
+    }
 
     // 1. Input layer normalization
-    input_layernorm_.forward(normed_hidden_states.data(), hidden_states, num_tokens, buffer.commandBuffer);
-    profiler.record("input_layernorm");
+    input_layernorm_.forward(normed_hidden_ptr, hidden_states, num_tokens, buffer.commandBuffer);
+    MetalProfiler::getInstance().record("input_layernorm");
+    std::cout << "    ✅ Input layer normalization completed\n";
 
     // 2. Self attention
-    self_attn_.forward(profiler.scope("self_attention"), buffer, attn_output.data(),
-                      normed_hidden_states.data(), kv_cache_k, kv_cache_v);
+    self_attn_.forward(buffer, attn_output_ptr,
+                      normed_hidden_ptr, kv_cache_k, kv_cache_v, total_kv_pages);
+    std::cout << "    ✅ Self-attention completed\n";
 
     // 3. Residual connection (add attention output to original hidden states)
-    // TODO: Use metal_add_residual when implemented
+    // TODO: Use metal_add_residual
     for (size_t i = 0; i < num_tokens * hidden_size; ++i) {
-        hidden_states[i] += attn_output.data()[i];
+        hidden_states[i] += attn_output_ptr[i];
     }
-    profiler.record("attention_residual");
+    MetalProfiler::getInstance().record("attention_residual");
+    std::cout << "    ✅ Attention residual connection completed\n";
 
     // 4. Post attention layer normalization
-    post_attention_layernorm_.forward(normed_attn_output.data(), hidden_states, num_tokens, buffer.commandBuffer);
-    profiler.record("post_attention_layernorm");
+    post_attention_layernorm_.forward(normed_attn_ptr, hidden_states, num_tokens, buffer.commandBuffer);
+    MetalProfiler::getInstance().record("post_attention_layernorm");
+    std::cout << "    ✅ Post-attention layer normalization completed\n";
 
     // 5. MLP
-    mlp_.forward(profiler.scope("mlp"), buffer, mlp_output.data(), normed_attn_output.data());
+    mlp_.forward(buffer, mlp_output_ptr, normed_attn_ptr);
+    std::cout << "    ✅ MLP block completed\n";
 
     // 6. Residual connection (add MLP output to hidden states)
-    // TODO: Use metal_add_residual when implemented
+    // TODO: Use metal_add_residual
     for (size_t i = 0; i < num_tokens * hidden_size; ++i) {
-        hidden_states[i] += mlp_output.data()[i];
+        hidden_states[i] += mlp_output_ptr[i];
     }
-    profiler.record("mlp_residual");
+    std::cout << "    ✅ MLP residual connection completed\n";
+    MetalProfiler::getInstance().record("mlp_residual");
 
-    // Deallocate intermediate tensors
-    buffer.deallocate(normed_hidden_states);
-    buffer.deallocate(attn_output);
-    buffer.deallocate(normed_attn_output);
-    buffer.deallocate(mlp_output);
+    // Deallocate only if we owned temporaries (stack allocator path)
+    if (owns_temporaries) {
+        buffer.deallocate(normed_hidden_owned);
+        buffer.deallocate(attn_output_owned);
+        buffer.deallocate(normed_attn_owned);
+        buffer.deallocate(mlp_output_owned);
+    }
+    std::cout << "    ✅ Deallocated intermediate tensors for Decoder Layer\n";
 }
 
 template <typename T>
