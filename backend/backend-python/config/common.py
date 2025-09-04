@@ -25,6 +25,7 @@ class Tokenizer:
 class CommonArch:
     """Base architecture configuration with common fields."""
 
+    # Fields that will be set by the model config file
     type: str
     num_layers: int
     num_query_heads: int
@@ -35,6 +36,10 @@ class CommonArch:
     vocab_size: int
     use_qkv_bias: bool
     rms_norm_eps: float
+
+    # Fields that will be set by the backend config file
+    device: str
+    dtype: str
 
 
 @dataclass
@@ -51,7 +56,7 @@ class ModelInfo:
     template_content: str
 
     @staticmethod
-    def parse_model_metadata(cfg_file_path: str) -> "ModelInfo":
+    def load_from_file(cfg_file_path: str, device: str, dtype: str) -> "ModelInfo":
         """
         Parses a dictionary (from loaded TOML data) into the ModelMetadata struct,
         with improved and informative error handling.
@@ -60,9 +65,17 @@ class ModelInfo:
         # Load and parse TOML file
         cfg = ModelConfig.load_from_file(cfg_file_path)
 
-        # Get architecture information
-        common_arch_dict = cfg.get_common_arch_dict()
-        match common_arch_dict["type"]:
+        # Set the device and dtype fields we got from the backend config file
+        # so that they will be populated in the architecture object
+        arch_dict = cfg.get_required_key(cfg.root, "architecture")
+        arch_dict["device"] = device
+        arch_dict["dtype"] = dtype
+
+        # Get the architecture object
+        match arch_dict["type"]:
+            # Disable pylint import-outside-toplevel check for this block
+            # because we need to do lazy import for the architecture classes
+            # to avoid circular imports
             case "l4ma":
                 from .l4ma import L4maArch  # pylint: disable=import-outside-toplevel
 
@@ -72,9 +85,7 @@ class ModelInfo:
 
                 arch = Qwen3Arch.from_config(cfg)
             case _:
-                raise ValueError(
-                    f"Unsupported architecture type: {common_arch_dict['type']}"
-                )
+                raise ValueError(f"Unsupported architecture type: {arch_dict['type']}")
 
         # Get other common information
         tokenizer = cfg.get_tokenizer()
@@ -152,6 +163,8 @@ class ModelConfig:
             "vocab_size": get_required_arch_key("vocab_size"),
             "use_qkv_bias": get_required_arch_key("use_qkv_bias"),
             "rms_norm_eps": get_required_arch_key("rms_norm_eps"),
+            "device": get_required_arch_key("device"),
+            "dtype": get_required_arch_key("dtype"),
         }
 
     def get_chat_template_dict(self) -> dict:

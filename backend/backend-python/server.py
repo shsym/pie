@@ -130,18 +130,18 @@ def load_model(config: dict):
         raise FileNotFoundError(f"Metadata file not found at: {metadata_path}")
 
 
-    metadata = ModelInfo.parse_model_metadata(metadata_path)
-    metadata.architecture.device = config.get('device', 'cuda:0')
-    metadata.architecture.dtype = getattr(torch, config.get('dtype', 'bfloat16'))
+    model_device = config.get('device', 'cuda:0')
+    model_dtype = getattr(torch, config.get('dtype', 'bfloat16'))
+    model_info = ModelInfo.load_from_file(metadata_path, model_device, model_dtype)
 
     # 1. Map fused tensor names to their original sources
     # Choose the appropriate model based on architecture type
-    if metadata.architecture.type.lower() == 'qwen3':
-        model = Qwen3ForCausalLM(metadata.architecture)
+    if model_info.architecture.type.lower() == 'qwen3':
+        model = Qwen3ForCausalLM(model_info.architecture)
         fusion_map = create_qwen3_fusion_map(model)
     else:
         # Default to L4MA for backward compatibility
-        model = L4maForCausalLM(metadata.architecture)
+        model = L4maForCausalLM(model_info.architecture)
         fusion_map = create_fusion_map(model)
 
     # 2. Create a reverse map for fast lookups (original source -> fused target)
@@ -161,7 +161,7 @@ def load_model(config: dict):
     # print(f"Found {len(metadata.parameters)} parameter file(s) to load.")
 
     try:
-        for param_file in metadata.parameters:
+        for param_file in model_info.parameters:
             weights_path = os.path.join(model_path, model_name, param_file)
             # ... (existing file existence check) ...
 
@@ -227,10 +227,10 @@ def load_model(config: dict):
             print("\nSuccessfully loaded all expected model weights.")
 
         # Move the entire model to the specified device and dtype
-        model.to(device=metadata.architecture.device, dtype=metadata.architecture.dtype)
+        model.to(device=model_info.architecture.device, dtype=model_info.architecture.dtype)
         model.eval()  # Set the model to evaluation mode
 
-        return model, metadata
+        return model, model_info
 
 
     except ztensor.ZTensorError as e:
