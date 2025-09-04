@@ -70,8 +70,10 @@ class ArtifactComparator:
         # Per-op, per-tensor, per-dtype tolerance overrides
         # Format: {(op, tensor_name, dtype): (abs_tol, rel_tol)}
         self.tolerance_overrides: Dict[Tuple[str, str, str], Tuple[float, float]] = {
-            # gemm fp32 output can differ slightly due to accumulation order; allow small abs diff
-            ('gemm', 'C', 'fp32'): (3.0e-2, 1.0e-2),
+            # gemm fp32 with pure f32 computation (cross-platform precision differences in accumulation)
+            ('gemm', 'C', 'fp32'): (2.5e-2, 1.0e-2),
+            # gemm bf16 has expected quantization error of up to 0.5 from f32->bf16 conversion
+            ('gemm', 'C', 'bf16'): (5.1e-1, 5.0e-2),
             # rms_norm bf16 output is sensitive due to bf16 resolution and reduction/rsqrt variance
             ('rms_norm', 'output', 'bf16'): (self.DEFAULT_ABS_TOLERANCE, 1.5e-2),
             # rope outputs involve sin/cos rotations in bf16 which vary slightly across backends

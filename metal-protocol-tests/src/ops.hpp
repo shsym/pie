@@ -198,5 +198,8 @@ void run_rope_metal(const std::string& case_id, const RoPEConfig& cfg, uint64_t 
 void run_topk_mask_logits_metal(const std::string& case_id, const TopKMaskConfig& cfg, uint64_t seed);
 void run_grouped_gemm_metal(const std::string& case_id, const GroupedGemmConfig& cfg, uint64_t seed);
 void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPrefillAttentionConfig& cfg, uint64_t seed);
+void run_gemm_metal(const std::string& case_id, const GemmConfig& cfg, uint64_t seed);
+void run_add_residual_metal(const std::string& case_id, const AddResidualConfig& cfg, uint64_t seed);
+void run_append_paged_kv_cache_metal(const std::string& case_id, const AppendPagedKVCacheConfig& cfg, uint64_t seed);
 
 } // namespace ops

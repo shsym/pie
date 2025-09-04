@@ -596,10 +596,14 @@ int main(int argc, char** argv) {
             ops::SiLUAndMulConfig cfg{args.num_tokens, args.intermediate_size};
             ops::run_silu_and_mul_metal(case_id, cfg, args.seed);
             run_comparison("silu_and_mul", case_id);
+        } else if (args.op == "gemm") {
+            ops::GemmConfig cfg{args.m, args.n, args.k, args.transa, args.transb, args.use_bias};
+            ops::run_gemm_metal(case_id, cfg, args.seed);
+            run_comparison("gemm", case_id);
         } else if (args.op == "add_residual") {
             ops::AddResidualConfig cfg{args.num_tokens, args.hidden_size};
-            std::cerr << "Error: add_residual not implemented for Metal backend yet" << std::endl;
-            return 1;
+            ops::run_add_residual_metal(case_id, cfg, args.seed);
+            run_comparison("add_residual", case_id);
     } else if (args.op == "cast_type") {
             ops::CastTypeConfig cfg{args.num_elements, args.input_dtype, args.output_dtype};
             std::cerr << "Error: cast_type not implemented for Metal backend yet" << std::endl;
@@ -626,8 +630,8 @@ int main(int argc, char** argv) {
             run_comparison("grouped_gemm", args.case_id);
         } else if (args.op == "append_paged_kv_cache") {
             ops::AppendPagedKVCacheConfig cfg{args.num_tokens, args.num_kv_heads, args.head_size, args.page_size, args.max_num_pages, args.batch_size};
-            std::cerr << "Error: append_paged_kv_cache not implemented for Metal backend yet" << std::endl;
-            return 1;
+            ops::run_append_paged_kv_cache_metal(args.case_id, cfg, args.seed);
+            run_comparison("append_paged_kv_cache", args.case_id);
     } else if (args.op == "embedding_lookup_all_dtypes") {
             ops::EmbeddingConfig cfg{args.num_tokens, args.hidden_size, args.vocab_size};
             std::cerr << "Error: embedding_lookup_all_dtypes not implemented for Metal backend yet" << std::endl;

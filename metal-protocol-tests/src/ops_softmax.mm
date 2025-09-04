@@ -35,11 +35,67 @@ void run_softmax_metal(const std::string& case_id, const SoftmaxConfig& cfg, uin
     std::vector<bfloat16_t> h_input_bf16(logits_size);
     std::vector<bfloat16_t> h_output_bf16(logits_size, float_to_bf16(0.0f));
 
-    // Generate test data in bf16 (consistent host type)
-    std::mt19937_64 rng(seed);
-    std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
+    // Helper functions for file operations (following pattern from ops_gemm.mm)
+    auto file_exists = [](const std::filesystem::path& p) -> bool {
+        std::error_code ec; return std::filesystem::exists(p, ec);
+    };
+    auto read_bytes = [](const std::filesystem::path& p) -> std::vector<uint8_t> {
+        std::ifstream ifs(p, std::ios::binary);
+        if (!ifs.is_open()) return {};
+        ifs.seekg(0, std::ios::end);
+        auto size = ifs.tellg();
+        ifs.seekg(0, std::ios::beg);
+        std::vector<uint8_t> buf(static_cast<size_t>(size));
+        ifs.read(reinterpret_cast<char*>(buf.data()), size);
+        return buf;
+    };
 
-    for (auto& v : h_input_bf16) v = float_to_bf16(dist(rng));
+    // Try to load input logits from CUDA reference artifacts
+    std::string cuda_base_dir = artifacts::get_env_str("PIE_CUDA_ARTIFACTS_DIR",
+                               "/Users/seung-seoblee/Workspace/pie/cuda-protocol-tests/tests/artifacts");
+    auto cuda_case_dir = std::filesystem::path(cuda_base_dir) / "softmax" / case_id;
+
+    if (file_exists(cuda_case_dir / "input_logits.bin")) {
+        try {
+            std::vector<uint8_t> input_bytes = read_bytes(cuda_case_dir / "input_logits.bin");
+
+            if (dtype_info.dtype == DType::FP32 && input_bytes.size() == logits_size * sizeof(float)) {
+                const float* input_data = reinterpret_cast<const float*>(input_bytes.data());
+                for (size_t i = 0; i < logits_size; ++i) {
+                    h_input_bf16[i] = float_to_bf16(input_data[i]);
+                }
+                std::cout << "✅ Loaded CUDA reference input_logits from " << cuda_case_dir << " (fp32 -> bf16)" << std::endl;
+            } else if (dtype_info.dtype == DType::FP16 && input_bytes.size() == logits_size * sizeof(uint16_t)) {
+                const uint16_t* input_data = reinterpret_cast<const uint16_t*>(input_bytes.data());
+                for (size_t i = 0; i < logits_size; ++i) {
+                    h_input_bf16[i] = float_to_bf16(half_to_float(input_data[i]));
+                }
+                std::cout << "✅ Loaded CUDA reference input_logits from " << cuda_case_dir << " (fp16 -> bf16)" << std::endl;
+            } else if (dtype_info.dtype == DType::BF16 && input_bytes.size() == logits_size * sizeof(bfloat16_t)) {
+                const bfloat16_t* input_data = reinterpret_cast<const bfloat16_t*>(input_bytes.data());
+                for (size_t i = 0; i < logits_size; ++i) {
+                    h_input_bf16[i] = input_data[i];
+                }
+                std::cout << "✅ Loaded CUDA reference input_logits from " << cuda_case_dir << " (bf16)" << std::endl;
+            } else {
+                std::cerr << "Size or dtype mismatch for input_logits.bin: expected " << logits_size
+                          << " elements of " << dtype_info.dtype_str << ", got " << input_bytes.size() << " bytes" << std::endl;
+                throw std::runtime_error("CUDA input format mismatch");
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "⚠️  Could not load CUDA reference input, generating new data: " << e.what() << std::endl;
+            // Fallback to generating test data
+            std::mt19937_64 rng(seed);
+            std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
+            for (auto& v : h_input_bf16) v = float_to_bf16(dist(rng));
+        }
+    } else {
+        std::cerr << "⚠️  CUDA reference input_logits.bin not found at " << cuda_case_dir << ", generating test data" << std::endl;
+        // Fallback to generating test data
+        std::mt19937_64 rng(seed);
+        std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
+        for (auto& v : h_input_bf16) v = float_to_bf16(dist(rng));
+    }
 
     int result = 0;
 

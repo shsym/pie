@@ -36,6 +36,9 @@ set(METAL_SOURCES
     src/ops_grouped_gemm.mm
     src/ops_batch_prefill_attention.mm
     src/ops_topk_mask_logits.mm
+    src/ops_gemm.mm
+    src/ops_add_residual.mm
+    src/ops_append_paged_kv_cache.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_gemm.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_embedding.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_silu_and_mul.mm
@@ -47,6 +50,8 @@ set(METAL_SOURCES
     ${REPO_ROOT}/backend/backend-metal/src/metal_grouped_gemm.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_batch_prefill_attention.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_attention_naive.mm
+    ${REPO_ROOT}/backend/backend-metal/src/metal_add_residual.mm
+    ${REPO_ROOT}/backend/backend-metal/src/metal_append_paged_kv_cache.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_common.mm
 )
 
@@ -95,6 +100,9 @@ set_source_files_properties(
     src/ops_grouped_gemm.mm
     src/ops_batch_prefill_attention.mm
     src/ops_topk_mask_logits.mm
+    src/ops_gemm.mm
+    src/ops_add_residual.mm
+    src/ops_append_paged_kv_cache.mm  # TODO: Implement backend kernel first
     ${REPO_ROOT}/backend/backend-metal/src/metal_gemm.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_embedding.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_silu_and_mul.mm
@@ -105,6 +113,8 @@ set_source_files_properties(
     ${REPO_ROOT}/backend/backend-metal/src/metal_topk_mask_logits.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_grouped_gemm.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_batch_prefill_attention.mm
+    ${REPO_ROOT}/backend/backend-metal/src/metal_add_residual.mm
+    ${REPO_ROOT}/backend/backend-metal/src/metal_append_paged_kv_cache.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_common.mm
     PROPERTIES COMPILE_FLAGS "-fobjc-arc"
 )
