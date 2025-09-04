@@ -15,8 +15,8 @@ import l4m_vision_pb2
 import ping_pb2
 from config.common import ModelInfo
 from driver import Driver
-from l4ma import L4maForCausalLM, create_fusion_map
-from qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
+from model.l4ma import L4maForCausalLM, create_fusion_map
+from model.qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 import ztensor
 from tqdm import tqdm
 import threading  # Import the threading module

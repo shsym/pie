@@ -2,7 +2,6 @@ mod tokenizer;
 
 use crate::tokenizer::BytePairEncoder;
 use inferlet::sampler::Sampler;
-use inferlet::traits::Tokenize;
 use inferlet::traits::tokenize::Tokenizer;
 use llguidance::api::TopLevelGrammar;
 use llguidance::{Matcher, ParserFactory};

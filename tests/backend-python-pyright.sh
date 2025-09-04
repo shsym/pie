@@ -11,5 +11,4 @@ UV_NO_SYNC=1 UV_OFFLINE=1 uv \
     --project ${ROOT}/backend/backend-python \
     run pyright \
     ${ROOT}/backend/backend-python/config/*.py \
-    ${ROOT}/backend/backend-python/l4ma.py \
-    ${ROOT}/backend/backend-python/qwen3.py
+    ${ROOT}/backend/backend-python/model/*.py

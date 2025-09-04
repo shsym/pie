@@ -1,5 +1,4 @@
-use inferlet::traits::{Forward, Tokenize};
-use inferlet::{self, context::Context, wstd};
+use inferlet::{self, context::Context, traits::allocate::Allocate, wstd};
 use pico_args::Arguments;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -78,14 +77,14 @@ async fn main() -> Result<(), String> {
     let mut ctx: Context;
 
     if invalidate_cache && inferlet::store_get(CACHE_FLAG_KEY) == Some("true".to_string()) {
-        queue.release_exported_kv_pages(CACHE_EXPORT_NAME);
+        queue.unexport_kv_pages(CACHE_EXPORT_NAME.to_string());
         inferlet::store_set(CACHE_FLAG_KEY, "false");
     }
 
     if inferlet::store_get(CACHE_FLAG_KEY) == Some("true".to_string()) {
         println!("✅ Cache HIT. Loading prefix from KV store.");
 
-        let imported_page_ids = queue.import_kv_pages(CACHE_EXPORT_NAME);
+        let imported_page_ids = queue.import_kv_pages(CACHE_EXPORT_NAME.to_string());
         let state_json =
             inferlet::store_get(CACHE_STATE_KEY).ok_or("Cache Inconsistency: State missing")?;
         let state: CachedPrefixState = serde_json::from_str(&state_json).unwrap();
@@ -104,6 +103,7 @@ async fn main() -> Result<(), String> {
         prefill_ctx.flush();
 
         // Directly use the new library getters
+        let page_ids = prefill_ctx.get_kv_page_ids().to_vec();
         let state_to_cache = CachedPrefixState {
             token_ids: prefill_ctx.get_token_ids().to_vec(),
             kv_page_last_len: prefill_ctx.get_kv_page_last_len(),
@@ -111,7 +111,7 @@ async fn main() -> Result<(), String> {
 
         prefill_ctx
             .queue()
-            .export_kv_pages(&prefill_ctx.kv_pages, CACHE_EXPORT_NAME);
+            .export_kv_pages(&page_ids, CACHE_EXPORT_NAME.to_string(), true);
 
         let state_json = serde_json::to_string(&state_to_cache).unwrap();
         inferlet::store_set(CACHE_STATE_KEY, &state_json);

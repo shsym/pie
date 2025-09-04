@@ -1,12 +1,16 @@
-pub mod adapter;
-pub mod evolve;
+pub mod allocate;
 pub mod forward;
-pub mod image;
+pub(crate) mod forward_text;
+pub mod input_image;
+pub mod input_text;
+pub mod output_text;
 pub mod tokenize;
 
 // reexport traits
-pub use adapter::{Adapter, SetAdapter};
-pub use evolve::{Evolve, SetAdapterSeed};
+pub use allocate::Allocate;
 pub use forward::Forward;
-pub use image::Image;
+pub use forward_text::ForwardText;
+pub use input_image::InputImage;
+pub use input_text::InputText;
+pub use output_text::OutputText;
 pub use tokenize::Tokenize;

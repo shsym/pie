@@ -1,6 +1,6 @@
 use inferlet::sampler::{self, Sampler};
 use inferlet::stop_condition::{self, StopCondition};
-use inferlet::traits::{Forward,  Tokenize};
+use inferlet::traits::ForwardText;
 
 use inferlet::Context;
 use inferlet::brle::Brle;
@@ -48,13 +48,17 @@ pub async fn generate_with_pjd<S: Sampler, C: StopCondition>(
             ((pending_tokens.len() as u32 - 1)..(pending_tokens.len() + gamma) as u32).collect();
 
         // Run a single forward pass to get distributions for all `gamma + 1` positions.
-        let p = ctx.queue.create_forward_pass();
-        p.kv_cache(&ctx.kv_pages, ctx.kv_page_last_len);
-        p.input_tokens(&batch_tokens, &batch_positions);
-        p.attention_mask(&masks_for_batch);
-        p.output_distributions(&sample_indices);
-
-        let output_distributions = p.execute().await.distributions.unwrap();
+        let output_distributions = ctx
+            .queue
+            .forward_text(
+                ctx.kv_page_last_len as u32,
+                &ctx.kv_page_ids,
+                &batch_tokens,
+                &batch_positions,
+                &masks_for_batch,
+                &sample_indices,
+            )
+            .await;
 
         // 5. Sample from each distribution to get the accepted tokens.
         let accepted_tokens: Vec<u32> = output_distributions

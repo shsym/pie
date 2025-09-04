@@ -1,13 +1,14 @@
-use crate::instance::InstanceId;
+use crate::instance::Id as InstanceId;
 use crate::messaging::dispatch_u2i;
-use crate::model::Model;
+use crate::model::attach_new_remote_backend;
 use crate::runtime::RuntimeError;
-use crate::service::{Service, ServiceError, install_service};
+use crate::service::{Service, ServiceError};
 use crate::utils::IdPool;
 use crate::{auth, messaging, model, runtime, service};
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use rmp_serde::decode;
 use serde::{Deserialize, Serialize};
 use std::mem;
 use std::sync::{Arc, OnceLock};
@@ -138,21 +139,12 @@ pub enum ServerMessage {
     #[serde(rename = "instance_event")]
     InstanceEvent {
         instance_id: String,
-        event: EventCode,
+        event: String,
         message: String,
     },
 
     #[serde(rename = "server_event")]
     ServerEvent { message: String },
-}
-#[derive(Debug, Serialize, Deserialize)]
-pub enum EventCode {
-    Message = 0,
-    Completed = 1,
-    Aborted = 2,
-    Exception = 3,
-    ServerError = 4,
-    OutOfResources = 5,
 }
 
 type ClientId = u32;
@@ -165,8 +157,7 @@ pub enum Command {
     },
     DetachInstance {
         inst_id: InstanceId,
-        termination_code: u32,
-        message: String,
+        reason: String,
     },
 }
 
@@ -294,7 +285,7 @@ impl Client {
                 match msg {
                     Message::Binary(bin) => {
                         // Decode via rmp-serde
-                        match rmp_serde::decode::from_slice::<ClientMessage>(&bin) {
+                        match decode::from_slice::<ClientMessage>(&bin) {
                             Ok(client_message) => {
                                 incoming_tx
                                     .send(ClientCommand::FromClient(client_message))
@@ -438,16 +429,11 @@ impl Client {
             },
             ClientCommand::Internal(cmd) => match cmd {
                 Command::Send { inst_id, message } => {
-                    self.send_inst_event(inst_id, EventCode::Message, message)
+                    self.send_inst_event(inst_id, "message".to_string(), message)
                         .await
                 }
-                Command::DetachInstance {
-                    inst_id,
-                    termination_code,
-                    message,
-                } => {
-                    self.handle_detach_instance(inst_id, termination_code, message)
-                        .await;
+                Command::DetachInstance { inst_id, reason } => {
+                    self.handle_detach_instance(inst_id, reason).await;
                 }
             },
         }
@@ -475,7 +461,7 @@ impl Client {
         self.send(msg).await;
     }
 
-    async fn send_inst_event(&mut self, inst_id: InstanceId, event: EventCode, message: String) {
+    async fn send_inst_event(&mut self, inst_id: InstanceId, event: String, message: String) {
         self.send(ServerMessage::InstanceEvent {
             instance_id: inst_id.to_string(),
             event,
@@ -484,28 +470,15 @@ impl Client {
         .await;
     }
 
-    async fn handle_detach_instance(
-        &mut self,
-        inst_id: InstanceId,
-        termination_code: u32,
-        message: String,
-    ) {
+    async fn handle_detach_instance(&mut self, inst_id: InstanceId, reason: String) {
         if !self.authenticated {
             return;
         }
         self.inst_owned.retain(|&id| id != inst_id);
 
         if self.state.instance_chans.remove(&inst_id).is_some() {
-            let event_code = match termination_code {
-                0 => EventCode::Completed,
-                1 => EventCode::Aborted,
-                2 => EventCode::Exception,
-                3 => EventCode::ServerError,
-                4 => EventCode::OutOfResources,
-                _ => EventCode::ServerError,
-            };
-
-            self.send_inst_event(inst_id, event_code, message).await;
+            self.send_inst_event(inst_id, "terminated".to_string(), reason)
+                .await;
         }
     }
 
@@ -546,10 +519,9 @@ impl Client {
             }
             QUERY_MODEL_STATUS => {
                 // gather model status from all attached backends
-                let runtime_stats = model::runtime_stats().await;
-                let runtime_stats_json = serde_json::to_string(&runtime_stats).unwrap();
+                let l4m_stats = model::gather_stats().await;
 
-                self.send_response(corr_id, true, runtime_stats_json).await;
+                self.send_response(corr_id, true, l4m_stats).await;
             }
             _ => {
                 println!("Unknown query subject: {}", subject);
@@ -719,7 +691,7 @@ impl Client {
         }
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.inst_owned.contains(&inst_id) {
-                runtime::trap(inst_id, runtime::TerminationCause::Signal);
+                runtime::trap(inst_id, "user terminated the program");
             }
         }
     }
@@ -732,47 +704,33 @@ impl Client {
         service_name: String,
     ) {
         if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".into())
+            self.send_response(corr_id, false, "Not authenticated".to_string())
                 .await;
-            return;
         }
-
         match service_type.as_str() {
-            "model" => {
-                // Try to create the model; fail fast on error.
-                let model = match Model::new(&endpoint).await {
-                    Ok(m) => m,
-                    Err(_) => {
-                        self.send_response(
-                            corr_id,
-                            false,
-                            "Failed to attach to L4M backend".into(),
-                        )
+            "l4m" => {
+                if attach_new_remote_backend(&service_name, endpoint)
+                    .await
+                    .is_some()
+                {
+                    self.send_response(corr_id, true, "Attached to L4M backend".to_string())
                         .await;
-                        return;
-                    }
-                };
-
-                // Try to install; fail fast on error.
-                let Some(service_id) = install_service(&service_name, model) else {
-                    self.send_response(corr_id, false, "Failed to register to L4M backend".into())
-                        .await;
-                    return;
-                };
-
-                // Success path.
-                model::register_model(service_name, service_id);
+                } else {
+                    self.send_response(
+                        corr_id,
+                        false,
+                        "Failed to attach to L4M backend".to_string(),
+                    )
+                    .await;
+                }
+            }
+            _ => {
                 self.send_response(
                     corr_id,
-                    true,
-                    "Model service registration successful".into(),
+                    false,
+                    format!("Unknown service type: {}", service_type),
                 )
                 .await;
-            }
-
-            other => {
-                self.send_response(corr_id, false, format!("Unknown service type: {other}"))
-                    .await;
             }
         }
     }
@@ -782,7 +740,7 @@ impl Client {
         // Terminate all instances owned by this client.
         for inst_id in self.inst_owned.drain(..) {
             if self.state.instance_chans.remove(&inst_id).is_some() {
-                runtime::trap_exception(inst_id, "socket terminated");
+                runtime::trap(inst_id, "socket terminated");
             }
         }
 

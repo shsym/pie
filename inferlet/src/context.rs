@@ -2,13 +2,16 @@ use crate::brle::Brle;
 use crate::drafter::Drafter;
 use crate::sampler::Sampler;
 use crate::stop_condition::StopCondition;
-use crate::traits::forward::{Distribution, Forward, KvPage};
+use crate::traits::allocate::Allocate;
+use crate::traits::forward::Forward;
+use crate::traits::forward_text::ForwardText;
+use crate::traits::input_text::InputText;
+use crate::traits::output_text::{Distribution, OutputText};
 use crate::traits::tokenize::{Tokenize, Tokenizer};
-use crate::traits::{Adapter, SetAdapter, SetAdapterSeed};
 use crate::{Model, Queue, sampler, stop_condition};
-use futures::future::join_all;
 use std::cmp::Ordering;
 use std::mem;
+use wit_bindgen::rt::async_support::futures::future::join_all;
 
 #[derive(Debug)]
 pub struct Context {
@@ -24,19 +27,26 @@ pub struct Context {
 
     pub position_ids: Vec<u32>,
 
-    pub kv_pages: Vec<KvPage>,
+    pub kv_page_ids: Vec<u32>,
     pub kv_page_last_len: usize,
     pub kv_page_size: usize,
+}
 
-    pub adapter_ptr: Option<u32>,
-    pub adapter_random_seed: Option<i64>,
+impl Drop for Context {
+    fn drop(&mut self) {
+        self.queue.deallocate_kv_pages(&self.kv_page_ids);
+    }
 }
 
 impl Context {
     pub fn new(model: &Model) -> Self {
+        if !model.has_traits(&["input_text", "tokenize", "output_text"]) {
+            panic!("Model must have input_text, tokenize, and output_text traits");
+        }
+
         let queue = model.create_queue();
-        let kv_page_size = model.get_kv_page_size() as usize;
-        let tokenizer = model.get_tokenizer();
+        let kv_page_size = queue.get_kv_page_size() as usize;
+        let tokenizer = queue.get_tokenizer();
 
         Context {
             queue,
@@ -47,41 +57,27 @@ impl Context {
             token_mask_pending: Vec::new(),
             token_mask_current: Brle::new(0),
             position_ids: Vec::new(),
-            kv_pages: Vec::new(),
+            kv_page_ids: Vec::new(),
             kv_page_last_len: 0,
             kv_page_size,
-            adapter_ptr: None,
-            adapter_random_seed: None,
         }
-    }
-
-    pub fn set_adapter(&mut self, adapter_ptr: u32) {
-        self.adapter_ptr = Some(adapter_ptr);
-    }
-
-    pub fn remove_adapter(&mut self) {
-        self.adapter_ptr = None;
-    }
-
-    pub fn set_adapter_random_seed(&mut self, seed: i64) {
-        self.adapter_random_seed = Some(seed);
     }
 
     /// Creates a new Context from previously exported and now imported KV pages.
     /// This is used to restore a context's state from a cache.
     pub fn from_imported_state(
         model: &Model,
-        kv_pages: Vec<KvPage>,
+        imported_page_ids: Vec<u32>,
         prefix_tokens: Vec<u32>,
         kv_page_last_len: usize,
     ) -> Self {
         let queue = model.create_queue();
-        let kv_page_size = model.get_kv_page_size() as usize;
-        let tokenizer = model.get_tokenizer();
+        let kv_page_size = queue.get_kv_page_size() as usize;
+        let tokenizer = queue.get_tokenizer();
 
         assert_eq!(
             prefix_tokens.len(),
-            (kv_pages.len() - 1) * kv_page_size + kv_page_last_len,
+            (imported_page_ids.len() - 1) * kv_page_size + kv_page_last_len,
         );
 
         let num_tokens = prefix_tokens.len();
@@ -97,11 +93,9 @@ impl Context {
             token_mask_pending: Vec::new(),
             token_mask_current: Brle::new(num_tokens),
             position_ids: (0..num_tokens as u32).collect(),
-            kv_pages,
+            kv_page_ids: imported_page_ids,
             kv_page_last_len,
             kv_page_size,
-            adapter_ptr: None,
-            adapter_random_seed: None,
         }
     }
 
@@ -122,8 +116,8 @@ impl Context {
     }
 
     /// Returns the unique IDs of the KV cache pages currently in use.
-    pub fn get_kv_page_ptrs(&self) -> Vec<u32> {
-        self.kv_pages.iter().map(|p| p.ptr()).collect()
+    pub fn get_kv_page_ids(&self) -> &[u32] {
+        &self.kv_page_ids
     }
 
     /// Returns the number of tokens stored in the last KV cache page.
@@ -139,65 +133,61 @@ impl Context {
     ///
     /// This function will flush any pending tokens in the current context before forking.
     pub fn fork(&self) -> Self {
-        let (
-            new_tokens,
-            new_pending,
-            new_kv_page_ptrs,
-            new_kv_page_last_len,
-            new_pos_ids,
-            new_mask_pending,
-        ) = if self.kv_page_last_len == self.kv_page_size {
-            // Easy case: the last page is full, we can share everything.
-            (
-                self.token_ids.clone(),
-                self.token_ids_pending.clone(),
-                self.kv_pages.clone(),
-                self.kv_page_last_len,
-                self.position_ids.clone(), // Clone position_ids
-                self.token_mask_pending.clone(),
-            )
-        } else {
-            // Hard case: the last page is partially full and must be recomputed.
-            let kept_kv_page_len = self.kv_pages.len().saturating_sub(1);
-            let kept_tokens_len = kept_kv_page_len * self.kv_page_size;
-
-            let forked_token_ids = self.token_ids[..kept_tokens_len].to_vec();
-            let forked_kv_page_ptrs = self.kv_pages[..kept_kv_page_len].to_vec();
-            let forked_pos_ids = self.position_ids[..kept_tokens_len].to_vec();
-
-            let forked_pending_token_ids = [
-                &self.token_ids[kept_tokens_len..],
-                &self.token_ids_pending[..],
-            ]
-            .concat();
-
-            let forked_last_kv_page_len = if !forked_kv_page_ptrs.is_empty() {
-                self.kv_page_size
+        let (new_tokens, new_pending, new_kv_pages, new_last_len, new_pos_ids, new_mask_pending) =
+            if self.kv_page_last_len == self.kv_page_size {
+                // Easy case: the last page is full, we can share everything.
+                (
+                    self.token_ids.clone(),
+                    self.token_ids_pending.clone(),
+                    self.kv_page_ids.clone(),
+                    self.kv_page_last_len,
+                    self.position_ids.clone(), // Clone position_ids
+                    self.token_mask_pending.clone(),
+                )
             } else {
-                0
+                // Hard case: the last page is partially full and must be recomputed.
+                let kept_kv_page_len = self.kv_page_ids.len().saturating_sub(1);
+                let kept_tokens_len = kept_kv_page_len * self.kv_page_size;
+
+                let forked_token_ids = self.token_ids[..kept_tokens_len].to_vec();
+                let forked_kv_page_ids = self.kv_page_ids[..kept_kv_page_len].to_vec();
+                let forked_pos_ids = self.position_ids[..kept_tokens_len].to_vec();
+
+                let forked_pending_token_ids = [
+                    &self.token_ids[kept_tokens_len..],
+                    &self.token_ids_pending[..],
+                ]
+                .concat();
+
+                let forked_last_kv_page_len = if !forked_kv_page_ids.is_empty() {
+                    self.kv_page_size
+                } else {
+                    0
+                };
+
+                let mut mask_builder = self.token_mask_current.clone();
+                let parent_total_mask_len = self.token_ids.len() + self.token_ids_pending.len();
+                mask_builder.remove_range(kept_tokens_len, parent_total_mask_len);
+
+                // 2. Iteratively build the pending masks, appending `false` for each new
+                // pending token, which mimics the `fill_tokens` behavior.
+                let mut forked_mask_pending = Vec::with_capacity(forked_pending_token_ids.len());
+                for _ in 0..forked_pending_token_ids.len() {
+                    mask_builder.append(false);
+                    forked_mask_pending.push(mask_builder.clone());
+                }
+
+                (
+                    forked_token_ids,
+                    forked_pending_token_ids,
+                    forked_kv_page_ids,
+                    forked_last_kv_page_len,
+                    forked_pos_ids,
+                    forked_mask_pending,
+                )
             };
 
-            let mut mask_builder = self.token_mask_current.clone();
-            let parent_total_mask_len = self.token_ids.len() + self.token_ids_pending.len();
-            mask_builder.remove_range(kept_tokens_len, parent_total_mask_len);
-
-            // 2. Iteratively build the pending masks, appending `false` for each new
-            // pending token, which mimics the `fill_tokens` behavior.
-            let mut forked_mask_pending = Vec::with_capacity(forked_pending_token_ids.len());
-            for _ in 0..forked_pending_token_ids.len() {
-                mask_builder.append(false);
-                forked_mask_pending.push(mask_builder.clone());
-            }
-
-            (
-                forked_token_ids,
-                forked_pending_token_ids,
-                forked_kv_page_ptrs,
-                forked_last_kv_page_len,
-                forked_pos_ids,
-                forked_mask_pending,
-            )
-        };
+        self.queue.increase_ref_count(&new_kv_pages);
 
         Context {
             queue: self.model.create_queue(),
@@ -208,11 +198,9 @@ impl Context {
             token_mask_pending: new_mask_pending,
             token_mask_current: self.token_mask_current.clone(),
             position_ids: new_pos_ids,
-            kv_pages: new_kv_page_ptrs,
-            kv_page_last_len: new_kv_page_last_len,
+            kv_page_ids: new_kv_pages,
+            kv_page_last_len: new_last_len,
             kv_page_size: self.kv_page_size,
-            adapter_ptr: self.adapter_ptr,
-            adapter_random_seed: self.adapter_random_seed,
         }
     }
 
@@ -292,7 +280,8 @@ impl Context {
                 // This page is fully masked and can be dropped.
 
                 // 1. Remove the page ID and deallocate the physical page.
-                self.kv_pages.remove(i);
+                let page_id_to_drop = self.kv_page_ids.remove(i);
+                self.queue.deallocate_kv_pages(&[page_id_to_drop]);
 
                 // 2. Remove the corresponding token range from the main token list.
                 self.token_ids
@@ -338,10 +327,10 @@ impl Context {
             return;
         }
 
-        let current_tokens = if self.kv_pages.is_empty() {
+        let current_tokens = if self.kv_page_ids.is_empty() {
             self.kv_page_last_len
         } else {
-            (self.kv_pages.len() - 1) * self.kv_page_size + self.kv_page_last_len
+            (self.kv_page_ids.len() - 1) * self.kv_page_size + self.kv_page_last_len
         };
 
         // Safely calculate the new total number of tokens after the adjustment.
@@ -350,19 +339,20 @@ impl Context {
             None => panic!("Token count adjustment resulted in underflow"),
         };
 
-        let current_pages = self.kv_pages.len();
+        let current_pages = self.kv_page_ids.len();
         let required_pages = new_total_tokens.div_ceil(self.kv_page_size);
 
         match required_pages.cmp(&current_pages) {
             Ordering::Greater => {
                 // Grow: Allocate new pages if more are needed.
                 let new_pages_needed = required_pages - current_pages;
-                let new_kv_page_ids = self.queue.new_kv_pages(new_pages_needed);
-                self.kv_pages.extend(new_kv_page_ids);
+                let new_kv_page_ids = self.queue.allocate_kv_pages(new_pages_needed);
+                self.kv_page_ids.extend(new_kv_page_ids);
             }
             Ordering::Less => {
                 // Shrink: Deallocate pages that are no longer needed.
-                let _ = self.kv_pages.split_off(required_pages);
+                let redundant_page_ids = self.kv_page_ids.split_off(required_pages);
+                self.queue.deallocate_kv_pages(&redundant_page_ids);
             }
             Ordering::Equal => {
                 // No change in the number of pages is required.
@@ -399,7 +389,7 @@ impl Context {
     ///
     /// This method will do nothing if there are fewer than two tokens in the pending buffer,
     /// as there must be at least one token to flush and one to keep.
-    pub async fn flush(&mut self) {
+    pub fn flush(&mut self) {
         // We need at least two pending tokens: one to be the "seed" for the next forward pass,
         // and one (or more) to be flushed into the KV cache now.
         if self.token_ids_pending.len() < 2 {
@@ -429,12 +419,13 @@ impl Context {
         // println!("mask: {:?}", &mask);
         // println!("position ids: {:?}", &position_ids);
 
-        let p = self.queue.create_forward_pass();
-        p.input_tokens(&pending_token_ids, &position_ids);
-        p.kv_cache(&self.kv_pages, self.kv_page_last_len);
-        p.attention_mask(&mask);
-
-        let _ = p.execute().await;
+        self.queue.forward_text_no_output(
+            self.kv_page_last_len as u32,
+            &self.kv_page_ids,
+            &pending_token_ids,
+            &position_ids,
+            &mask,
+        );
 
         self.token_ids.extend(pending_token_ids);
         self.position_ids.extend(&position_ids);
@@ -480,28 +471,27 @@ impl Context {
             .map(|brie| brie.buffer)
             .collect::<Vec<Vec<u32>>>();
 
-        let p = self.queue.create_forward_pass();
+        let sampled = self
+            .queue
+            .forward_text(
+                self.kv_page_last_len as u32,
+                &self.kv_page_ids,
+                &pending_token_ids,
+                &position_ids,
+                &mask,
+                &[pending_token_ids.len() as u32 - 1],
+            )
+            .await;
 
-        if let Some(adapter_ptr) = self.adapter_ptr {
-            p.set_adapter(adapter_ptr);
-
-            if let Some(adapter_random_seed) = self.adapter_random_seed {
-                p.set_adapter_seed(adapter_random_seed);
-            }
-        }
-
-        p.input_tokens(&pending_token_ids, &position_ids);
-        p.kv_cache(&self.kv_pages, self.kv_page_last_len);
-        p.attention_mask(&mask);
-        p.output_distributions(&[pending_token_ids.len() as u32 - 1]);
-
-        let res = p.execute().await;
-        let sampled = res.distributions.unwrap().into_iter().next().unwrap();
+        // let sampled = self.queue.get_next_token_distribution(&output_embed_id).await;
 
         self.token_ids.extend(pending_token_ids);
         self.position_ids.extend(position_ids);
+        // self.queue.deallocate_embeds(&input_embed_id);
+        // self.queue.deallocate_embeds(&output_embed_id);
 
-        sampled
+        // Only one token is generated. So it is safe to unwrap here.
+        sampled.into_iter().next().unwrap()
     }
 
     /// Generates text autoregressively until a stop condition is met.
@@ -605,16 +595,17 @@ impl Context {
                 beams.iter().find(|(_, g, _)| stop_condition.should_stop(g))
             {
                 // Deallocate the pages previously held by `self`.
-                let _ = mem::take(&mut self.kv_pages);
+                let old_pages = mem::take(&mut self.kv_page_ids);
+                self.queue.deallocate_kv_pages(&old_pages);
 
                 // Adopt the state from the winning beam.
                 self.kv_page_last_len = beam.kv_page_last_len;
                 self.token_ids = beam.token_ids.clone();
                 self.token_ids_pending = beam.token_ids_pending.clone();
-                self.kv_pages = beam.kv_pages.clone();
+                self.kv_page_ids = beam.kv_page_ids.clone();
 
                 // Increment the ref count for the newly adopted pages, as `self` is a new owner.
-                //self.queue.increase_ref_count(&self.kv_page_ptrs);
+                self.queue.increase_ref_count(&self.kv_page_ids);
 
                 return self.tokenizer.detokenize(generated_tokens);
             }
@@ -666,6 +657,21 @@ impl Context {
     /// model to propose a sequence of candidate tokens. These draft tokens are then
     /// verified in a single, parallel forward pass by the main model.
     ///
+    /// ### Algorithm
+    /// 1.  **✍️ Draft**: A single pending token in the context is used to prompt the
+    ///     `drafter`, which generates a short sequence of speculative future tokens.
+    /// 2.  **✅ Verify**: The seed token and all draft tokens are combined into a
+    ///     single batch and processed by the main model in one forward pass. This is
+    ///     the core optimization, as it computes multiple steps' worth of information
+    ///     simultaneously.
+    /// 3.  **🤝 Accept & Correct**: The main model's output distributions are compared
+    ///     against the draft tokens. The function accepts draft tokens as long as they
+    ///     match the tokens sampled from the main model's output. When a mismatch
+    ///     occurs, the draft is rejected, and the main model's sampled token is used
+    ///     as the correction.
+    /// 4.  **🔄 Update**: The context's state (token history and KV cache) is efficiently
+    ///     updated to reflect all accepted tokens. The loop then continues, using the
+    ///     last accepted token as the seed for the next draft.
     ///
     /// This process allows the model to generate multiple tokens for the cost of a
     /// single forward pass when the drafter's predictions are correct, significantly
@@ -704,12 +710,14 @@ impl Context {
         // Each iteration performs one step of speculative decoding, which may accept
         // multiple tokens at once.
         loop {
+            // --- 1. Draft Phase ✍️ ---
             let token_ids_pending = mem::take(&mut self.token_ids_pending);
 
             // Update the drafter with the seed and generate a sequence of draft tokens.
             drafter.update(&all_generated_tokens);
             let (draft_tokens, draft_pos_ids) = drafter.draft();
 
+            // --- 2. Verification Phase ✅ ---
             // Combine the seed and draft tokens into a single batch for the main model.
             let batch_tokens = [token_ids_pending.as_slice(), draft_tokens.as_slice()].concat();
             //println!("pending len: {:?}", &token_ids_pending);
@@ -738,16 +746,27 @@ impl Context {
 
             // Allocate resources and expand the KV cache to accommodate the entire batch.
             self.grow_kv_pages(batch_tokens.len());
+            let input_embeds = self.queue.allocate_embeds(batch_tokens.len());
+            let output_embeds = self.queue.allocate_embeds(batch_tokens.len());
 
-            let out_range = token_ids_pending.len() - 1..batch_tokens.len();
+            // Run a single, efficient forward pass on the main model with the combined tokens.
+            self.queue
+                .embed_text(&input_embeds, &batch_tokens, &batch_positions);
+            self.queue.forward(
+                self.kv_page_last_len as u32,
+                &self.kv_page_ids,
+                &input_embeds,
+                &output_embeds,
+            );
 
-            let p = self.queue.create_forward_pass();
-            p.input_tokens(&batch_tokens, &batch_positions);
-            p.kv_cache(&self.kv_pages, self.kv_page_last_len);
-            p.output_distributions(&out_range.map(|x| x as u32).collect::<Vec<_>>());
+            // Get the resulting probability distributions for each token in the batch.
+            // size = draft_tokens.len() + 1
+            let output_distributions = self
+                .queue
+                .get_next_token_distribution(&output_embeds[token_ids_pending.len() - 1..])
+                .await;
 
-            let res = p.execute().await;
-            let output_distributions = res.distributions.unwrap();
+            // --- 3. Trie Acceptance & Correction 🤝 ---
             // The speculation "Trie" is a tree of possibilities. The first token is always correct.
             // R[n] (P[n+1] P[n+2] P[n+3] P[n+2] P[n+3]) (P[n+1] P[n+2]) (P[n+1] P[n+2]) ...
 
@@ -806,6 +825,7 @@ impl Context {
                 }
             }
 
+            // --- 4. State Update 🔄 ---
             // Rewind the KV cache to discard the states of any rejected draft tokens.
             let redundant_count =
                 batch_tokens.len() - token_ids_pending.len() - num_retained_draft_tokens;
@@ -820,6 +840,10 @@ impl Context {
 
             all_generated_tokens.extend_from_slice(&accepted_tokens);
             self.fill_tokens(accepted_tokens[num_retained_draft_tokens..].to_owned());
+
+            // Clean up allocated resources for this step.
+            self.queue.deallocate_embeds(&input_embeds);
+            self.queue.deallocate_embeds(&output_embeds);
 
             // Check if the stop condition has been met after the step is complete.
             if stop_condition.should_stop(&all_generated_tokens) {
