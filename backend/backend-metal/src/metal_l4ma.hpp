@@ -9,11 +9,13 @@
 #include "metal_rope_wrapper.hpp"
 #include "metal_silu_and_mul_wrapper.hpp"
 #include "metal_batch_prefill_handle.hpp"
+#include "metal_add_residual.hpp"
 #include <Metal/Metal.h>
 #include <map>
 #include <memory>
 #include <vector>
 #include <string>
+#include <type_traits>
 
 // Forward declarations
 struct L4maConfig;
@@ -590,9 +592,29 @@ void MetalL4maDecoderLayer<T>::forward(MetalL4maBuffer<T>& buffer,
                       normed_hidden_ptr, kv_cache_k, kv_cache_v, total_kv_pages);
 
     // 3. Residual connection (add attention output to original hidden states)
-    // TODO: Use metal_add_residual
-    for (size_t i = 0; i < num_tokens * hidden_size; ++i) {
-        hidden_states[i] += attn_output_ptr[i];
+    auto& context = MetalContext::getInstance();
+    try {
+        if constexpr (std::is_same_v<T, bfloat16_t>) {
+            metal_add_residual_inplace_bfloat16(
+                context.getDevice(),
+                context.getCommandQueue(),
+                hidden_states,
+                attn_output_ptr,
+                num_tokens * hidden_size
+            );
+        } else if constexpr (std::is_same_v<T, float>) {
+            metal_add_residual_inplace_float32(
+                context.getDevice(),
+                context.getCommandQueue(),
+                hidden_states,
+                attn_output_ptr,
+                num_tokens * hidden_size
+            );
+        } else {
+            throw std::runtime_error("Unsupported data type for GPU residual addition");
+        }
+    } catch (const std::exception& e) {
+        throw std::runtime_error("GPU residual addition failed in attention block: " + std::string(e.what()));
     }
     MetalProfiler::getInstance().record("attention_residual");
 
@@ -604,9 +626,28 @@ void MetalL4maDecoderLayer<T>::forward(MetalL4maBuffer<T>& buffer,
     mlp_.forward(buffer, mlp_output_ptr, normed_attn_ptr);
 
     // 6. Residual connection (add MLP output to hidden states)
-    // TODO: Use metal_add_residual
-    for (size_t i = 0; i < num_tokens * hidden_size; ++i) {
-        hidden_states[i] += mlp_output_ptr[i];
+    try {
+        if constexpr (std::is_same_v<T, bfloat16_t>) {
+            metal_add_residual_inplace_bfloat16(
+                context.getDevice(),
+                context.getCommandQueue(),
+                hidden_states,
+                mlp_output_ptr,
+                num_tokens * hidden_size
+            );
+        } else if constexpr (std::is_same_v<T, float>) {
+            metal_add_residual_inplace_float32(
+                context.getDevice(),
+                context.getCommandQueue(),
+                hidden_states,
+                mlp_output_ptr,
+                num_tokens * hidden_size
+            );
+        } else {
+            throw std::runtime_error("Unsupported data type for GPU residual addition");
+        }
+    } catch (const std::exception& e) {
+        throw std::runtime_error("GPU residual addition failed in MLP block: " + std::string(e.what()));
     }
     MetalProfiler::getInstance().record("mlp_residual");
 

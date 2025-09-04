@@ -64,6 +64,7 @@ public:
         setup_metal_context();
         test_single_token_forward();
         test_multiple_tokens_forward();
+        test_conversational_input();
         test_layer_outputs();
         test_no_nan_inf_verification();
         test_output_shape_validation();
@@ -794,14 +795,96 @@ private:
                 std::cout << "      ✅ SUCCESS! Forward pass completed without segfault!" << std::endl;
                 std::cout << "      🎉 Segfault has been RESOLVED by proper KV cache initialization!" << std::endl;
 
-                // Validate the results
+                // Validate the results with detailed token distribution analysis
                 auto& [top_values, top_indices] = result;
                 std::cout << "      📊 Results: " << top_values.size() << " top values, "
                          << top_indices.size() << " top indices" << std::endl;
 
                 if (!top_values.empty() && !top_indices.empty()) {
-                    std::cout << "      📈 Top token: " << top_indices[0]
-                             << " (score: " << top_values[0] << ")" << std::endl;
+                    std::cout << "      📈 DETAILED TOKEN DISTRIBUTION ANALYSIS:" << std::endl;
+                    
+                    // Show top 10 tokens with their scores
+                    size_t num_to_show = std::min(static_cast<size_t>(10), top_values.size());
+                    std::cout << "      📈 Top " << num_to_show << " tokens:" << std::endl;
+                    
+                    for (size_t i = 0; i < num_to_show; ++i) {
+                        std::cout << "        " << (i+1) << ". Token " << top_indices[i] 
+                                 << ": " << std::fixed << std::setprecision(6) << top_values[i] << std::endl;
+                    }
+                    
+                    // Analyze distribution characteristics
+                    std::cout << "      📊 DISTRIBUTION CHARACTERISTICS:" << std::endl;
+                    
+                    // Calculate score range and distribution
+                    float max_score = top_values[0];
+                    float min_score = top_values[std::min(static_cast<size_t>(49), top_values.size()-1)];
+                    float score_range = max_score - min_score;
+                    
+                    std::cout << "        Max score: " << std::fixed << std::setprecision(6) << max_score << std::endl;
+                    std::cout << "        Min score (top-50): " << std::fixed << std::setprecision(6) << min_score << std::endl;
+                    std::cout << "        Score range: " << std::fixed << std::setprecision(6) << score_range << std::endl;
+                    
+                    // Check for reasonable token distribution
+                    bool reasonable_distribution = true;
+                    std::string distribution_analysis;
+                    
+                    // Check 1: Top token shouldn't be too dominant (>99% probability would be suspicious)
+                    if (max_score > 50.0f) {  // Very high logit suggesting near certainty
+                        distribution_analysis += "⚠️  Very high top token score (possible overconfidence)\n";
+                        reasonable_distribution = false;
+                    }
+                    
+                    // Check 2: Distribution should show some spread (not all same values)
+                    if (score_range < 0.001f && top_values.size() > 1) {
+                        distribution_analysis += "⚠️  Very narrow score range (possible numerical issues)\n";
+                        reasonable_distribution = false;
+                    }
+                    
+                    // Check 3: Scores should be finite (no NaN or Inf)
+                    bool has_invalid = false;
+                    for (size_t i = 0; i < std::min(static_cast<size_t>(10), top_values.size()); ++i) {
+                        if (!std::isfinite(top_values[i])) {
+                            has_invalid = true;
+                            break;
+                        }
+                    }
+                    if (has_invalid) {
+                        distribution_analysis += "❌ Invalid scores detected (NaN/Inf values)\n";
+                        reasonable_distribution = false;
+                    }
+                    
+                    // Check 4: Token indices should be valid (within vocab range)
+                    bool has_invalid_tokens = false;
+                    for (size_t i = 0; i < std::min(static_cast<size_t>(10), top_indices.size()); ++i) {
+                        if (top_indices[i] < 0 || top_indices[i] >= config.vocab_size) {
+                            has_invalid_tokens = true;
+                            break;
+                        }
+                    }
+                    if (has_invalid_tokens) {
+                        distribution_analysis += "❌ Invalid token indices detected (out of vocab range)\n";
+                        reasonable_distribution = false;
+                    }
+                    
+                    if (reasonable_distribution) {
+                        std::cout << "        ✅ Token distribution appears REASONABLE" << std::endl;
+                        std::cout << "          - Finite scores with good spread" << std::endl;
+                        std::cout << "          - Valid token indices within vocab range" << std::endl;
+                        std::cout << "          - No signs of numerical instability" << std::endl;
+                    } else {
+                        std::cout << "        ⚠️  Token distribution has POTENTIAL ISSUES:" << std::endl;
+                        std::cout << distribution_analysis << std::endl;
+                    }
+                    
+                    // Additional vocabulary analysis
+                    std::cout << "      📚 VOCABULARY ANALYSIS:" << std::endl;
+                    std::cout << "        Model vocab size: " << config.vocab_size << std::endl;
+                    std::cout << "        Returned top-k size: " << top_values.size() << std::endl;
+                    
+                    // Check if we're getting reasonable token coverage
+                    float coverage_ratio = static_cast<float>(top_values.size()) / config.vocab_size;
+                    std::cout << "        Coverage ratio: " << std::fixed << std::setprecision(4) 
+                             << (coverage_ratio * 100.0f) << "% of vocab" << std::endl;
                 }
 
                 return; // Success - exit the function

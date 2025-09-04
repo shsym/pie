@@ -1,5 +1,6 @@
 #include "metal_model.hpp"
 #include "metal_l4ma.hpp"
+#include "metal_add_residual.hpp"
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
@@ -448,7 +449,17 @@ namespace MetalModelLoader {
     bool initialize_metal_backend() {
         try {
             auto& context = MetalContext::getInstance();
-            return context.getDevice() != nil;
+            if (context.getDevice() == nil) {
+                return false;
+            }
+
+            // Initialize Metal add_residual operations
+            if (!initialize_metal_add_residual()) {
+                std::cerr << "Failed to initialize metal_add_residual" << std::endl;
+                return false;
+            }
+
+            return true;
         } catch (...) {
             return false;
         }
