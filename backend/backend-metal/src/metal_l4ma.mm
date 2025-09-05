@@ -13,8 +13,12 @@
 #include <cfloat>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <memory>
 #include <algorithm>
+#include <unordered_set>
+#include <vector>
+#include <utility>
 
 // L4maConfig is defined in metal_common.hpp - no need to redefine
 // Use the existing L4maConfig from metal_common.hpp
@@ -161,12 +165,50 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     );
     MetalProfiler::getInstance().record("lm_head");
 
+    // DEBUG: Check input values to lm_head GEMM and the resulting logits
+    if (num_tokens > 0) {
+        // Check final_norm_output values (input to lm_head)
+        std::cout << "🔍 [DEBUG] final_norm_output (input to lm_head, first 10):" << std::endl;
+        float max_norm_val = 0.0f;
+        for (int i = 0; i < std::min(10, static_cast<int>(hidden_size)); ++i) {
+            float val = static_cast<float>(final_norm_output.data()[i]);
+            std::cout << "  norm_out[" << i << "] = " << std::fixed << std::setprecision(6) << val << std::endl;
+            max_norm_val = std::max(max_norm_val, std::abs(val));
+        }
+        std::cout << "  Max final_norm magnitude: " << max_norm_val << std::endl;
+
+        // Check embedding weight values (used in lm_head)
+        auto& embed_weights = model_.get_embed_tokens_weight();
+        std::cout << "🔍 [DEBUG] embedding_weights (used in lm_head, first 10):" << std::endl;
+        float max_weight_val = 0.0f;
+        for (int i = 0; i < std::min(10, static_cast<int>(hidden_size)); ++i) {
+            float val = static_cast<float>(embed_weights.data()[i]);
+            std::cout << "  embed_weight[" << i << "] = " << std::fixed << std::setprecision(6) << val << std::endl;
+            max_weight_val = std::max(max_weight_val, std::abs(val));
+        }
+        std::cout << "  Max embedding weight magnitude: " << max_weight_val << std::endl;
+
+        // Check resulting logits
+        bfloat16_t* logits_bf16 = reinterpret_cast<bfloat16_t*>(logits.data());
+        std::cout << "🔍 [DEBUG] Raw logits after lm_head (first 10 values):" << std::endl;
+        float max_logit = 0.0f;
+        for (int i = 0; i < std::min(10, static_cast<int>(vocab_size)); ++i) {
+            float val = static_cast<float>(logits_bf16[i]);
+            std::cout << "  logits[" << i << "] = " << std::fixed << std::setprecision(6) << val << std::endl;
+            max_logit = std::max(max_logit, std::abs(val));
+        }
+        std::cout << "  Max logit magnitude: " << max_logit << std::endl;
+    }
+
     // 3. Apply top-k mask and softmax to get final probabilities
     constexpr int top_k = 50; // Default top-k value
     auto topk_values = buffer.template allocate<float>(num_tokens * top_k);
     auto topk_indices = buffer.template allocate<int32_t>(num_tokens * top_k);
 
     // Apply top-k masking to logits
+    std::cout << "🔍 [PIPELINE] Applying topk_mask (k=" << top_k << ")" << std::endl;
+
+
     int result = metal_topk_mask_logits_bfloat16(
         logits.data(), // in-place masking
         num_tokens,
@@ -178,33 +220,74 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     }
     MetalProfiler::getInstance().record("topk_mask");
 
-    // Apply softmax to get probabilities (convert bfloat16 to float temporarily)
-    auto logits_float = buffer.template allocate<float>(num_tokens * vocab_size);
+    // DEBUG: Check ALL logits after topk_mask using proper conversion
+    std::cout << "  🔍 AFTER topk_mask kernel:" << std::endl;
+    auto debug_after = buffer.template allocate<float>(vocab_size);  // Check ALL values
     MetalCast::bfloat16_to_float(context.getDevice(), context.getCommandQueue(),
                                 reinterpret_cast<const bfloat16_t*>(logits.data()),
-                                logits_float.data(), num_tokens * vocab_size);
+                                debug_after.data(), vocab_size);
+    int finite_after = 0;
+    float max_after = -1e9f;
+    for (size_t i = 0; i < vocab_size; ++i) {
+        if (debug_after.data()[i] > -65000.0f) {  // Not masked
+            finite_after++;
+            if (finite_after <= 3) {
+                std::cout << "    Preserved[" << i << "] = " << debug_after.data()[i] << std::endl;
+            }
+            max_after = std::max(max_after, debug_after.data()[i]);
+        }
+    }
+    std::cout << "    After: " << finite_after << "/" << top_k << " unmasked values, max=" << max_after << std::endl;
 
-    int softmax_result = metal_softmax_float(
-        logits_float.data(),
-        logits_float.data(), // in-place softmax
-        num_tokens,
-        vocab_size,
-        1.0f // temperature
-    );
-    if (softmax_result != 0) {
-        throw std::runtime_error("Failed to apply softmax");
+    // MEMORY DEBUG: Capture pointer and first few bytes after successful topk_mask
+    void* logits_ptr_after_topk = logits.data();
+    bfloat16_t* logits_bf16_after_topk = reinterpret_cast<bfloat16_t*>(logits.data());
+    std::vector<uint16_t> first_bytes_after_topk;
+    for (int i = 0; i < 10; ++i) {
+        first_bytes_after_topk.push_back(static_cast<uint16_t>(logits_bf16_after_topk[i]));
+    }
+    std::cout << "  🔍 MEMORY: logits.data() = " << logits_ptr_after_topk << std::endl;
+    std::cout << "  🔍 MEMORY: first 10 raw bytes = ";
+    for (int i = 0; i < 10; ++i) {
+        std::cout << "0x" << std::hex << first_bytes_after_topk[i] << std::dec;
+        if (i < 9) std::cout << " ";
+    }
+    std::cout << std::endl;
+
+    // Check the FULL logits.data() buffer for unmasked values
+    int full_unmasked_count = 0;
+    std::cout << "  🔍 MEMORY: Checking FULL logits.data() buffer for unmasked values..." << std::endl;
+    for (size_t i = 0; i < vocab_size; ++i) {
+        uint16_t raw_bf16 = static_cast<uint16_t>(logits_bf16_after_topk[i]);
+        if (raw_bf16 != 0xc780) {
+            full_unmasked_count++;
+            if (full_unmasked_count <= 5) {
+                float single_val;
+                MetalCast::bfloat16_to_float(context.getDevice(), context.getCommandQueue(),
+                                           &logits_bf16_after_topk[i], &single_val, 1);
+                std::cout << "    logits.data()[" << i << "] = 0x" << std::hex << raw_bf16
+                          << std::dec << " = " << single_val << std::endl;
+            }
+        }
+    }
+    std::cout << "  🔍 MEMORY: Found " << full_unmasked_count << " unmasked values in FULL logits.data()" << std::endl;
+
+    // Verify topk_mask worked correctly
+    if (num_tokens > 0) {
+        bfloat16_t* logits_bf16 = reinterpret_cast<bfloat16_t*>(logits.data());
+        int unmasked_count = 0;
+        for (size_t i = 0; i < vocab_size; ++i) {
+            uint16_t raw_bf16 = static_cast<uint16_t>(logits_bf16[i]);
+            if (raw_bf16 != 0xc780) {
+                unmasked_count++;
+            }
+        }
+        std::cout << "  ✅ topk_mask: " << unmasked_count << "/" << top_k << " values preserved" << std::endl;
     }
 
-    // Convert back to bfloat16
-    MetalCast::float_to_bfloat16(context.getDevice(), context.getCommandQueue(),
-                                logits_float.data(),
-                                reinterpret_cast<bfloat16_t*>(logits.data()),
-                                num_tokens * vocab_size);
+    // Step 1: Extract top-k logits and indices (before softmax)
+    std::cout << "🔍 [PIPELINE] Step 1: Extracting top-k masked logits" << std::endl;
 
-    buffer.deallocate(logits_float);
-    MetalProfiler::getInstance().record("softmax");
-
-    // Extract top-k values and indices
     int extract_result = metal_extract_k_values_bfloat16(
         reinterpret_cast<const bfloat16_t*>(logits.data()),
         topk_values.data(),
@@ -217,6 +300,55 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
         throw std::runtime_error("Failed to extract top-k values");
     }
     MetalProfiler::getInstance().record("extract_k_values");
+
+    // Verify we extracted the expected logits
+    if (num_tokens > 0) {
+        int extracted_count = 0;
+        float max_logit = -1e9f;
+        for (int i = 0; i < top_k; ++i) {
+            float val = topk_values.data()[i];
+            if (val != 0.0f && val > -65000.0f) {  // Valid extracted logit
+                extracted_count++;
+                max_logit = std::max(max_logit, val);
+            }
+        }
+        std::cout << "  ✅ Extracted " << extracted_count << "/" << top_k << " logits, max=" << max_logit << std::endl;
+    }
+
+    // Step 2: Apply softmax only to the extracted top-k logits
+    std::cout << "🔍 [PIPELINE] Step 2: Applying softmax to top-k logits" << std::endl;
+
+    int softmax_result = metal_softmax_float(
+        topk_values.data(),
+        topk_values.data(), // in-place softmax on k values only
+        num_tokens,
+        top_k, // Process only k values, not full vocab
+        1.0f   // temperature
+    );
+    if (softmax_result != 0) {
+        throw std::runtime_error("Failed to apply softmax to top-k values");
+    }
+    MetalProfiler::getInstance().record("softmax");
+
+    // Verify softmax produced valid probabilities
+    if (num_tokens > 0) {
+        float prob_sum = 0.0f;
+        float max_prob = 0.0f;
+        int non_zero_probs = 0;
+
+        for (int i = 0; i < top_k; ++i) {
+            float val = topk_values.data()[i];
+            prob_sum += val;
+            if (val > 1e-10f) {
+                non_zero_probs++;
+                max_prob = std::max(max_prob, val);
+            }
+        }
+
+        std::cout << "  ✅ Softmax: sum=" << std::fixed << std::setprecision(8) << prob_sum
+                  << ", non_zero=" << non_zero_probs << ", max=" << max_prob << std::endl;
+    }
+
 
     // Copy results to host vectors
     std::vector<float> result_values(num_tokens * top_k);

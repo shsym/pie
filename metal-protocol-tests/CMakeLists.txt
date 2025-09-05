@@ -102,7 +102,7 @@ set_source_files_properties(
     src/ops_topk_mask_logits.mm
     src/ops_gemm.mm
     src/ops_add_residual.mm
-    src/ops_append_paged_kv_cache.mm  # TODO: Implement backend kernel first
+    src/ops_append_paged_kv_cache.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_gemm.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_embedding.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_silu_and_mul.mm
@@ -167,6 +167,7 @@ set(BACKEND_SOURCES_ORGANIZED
     ${BACKEND_SRC_PATH}/metal_gemm.mm
     ${BACKEND_SRC_PATH}/metal_gemm_wrapper.mm
     ${BACKEND_SRC_PATH}/metal_embedding.mm
+    ${BACKEND_SRC_PATH}/metal_add_residual.mm
     ${BACKEND_SRC_PATH}/metal_buffer.mm
     ${BACKEND_SRC_PATH}/metal_tensor.mm
     ${BACKEND_SRC_PATH}/metal_kv_cache.mm
@@ -311,10 +312,28 @@ set_target_properties(test_model_weight_loading_integration PROPERTIES
 add_executable(test_forward_pass_integration
     tests/src/integration/test_forward_pass.mm
     ${BACKEND_SOURCES_ORGANIZED}
+    ${REPO_ROOT}/backend/backend-cuda/src/bpe.cpp
 )
 target_link_libraries(test_forward_pass_integration ${COMMON_LIBRARIES_ORGANIZED})
 target_compile_definitions(test_forward_pass_integration PRIVATE ${NLOHMANN_JSON_CFLAGS_OTHER})
+target_include_directories(test_forward_pass_integration PRIVATE
+    ${REPO_ROOT}
+    ${REPO_ROOT}/backend/backend-cuda/src
+)
 set_target_properties(test_forward_pass_integration PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
+)
+
+# Tokenization utility for getting conversational token IDs
+add_executable(tokenize_conversational
+    tests/src/debug/tokenize_conversational.cpp
+    ${REPO_ROOT}/backend/backend-cuda/src/bpe.cpp
+)
+target_include_directories(tokenize_conversational PRIVATE
+    ${REPO_ROOT}
+    ${REPO_ROOT}/backend/backend-cuda/src
+)
+set_target_properties(tokenize_conversational PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
 )
 

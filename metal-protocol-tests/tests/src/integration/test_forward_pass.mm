@@ -18,9 +18,13 @@
 #include "metal_kv_cache.hpp"
 #include "metal_embedding.hpp"
 #include "metal_rmsnorm_wrapper.hpp"
+
+// Include BPE tokenizer for decoding
+#include "bpe.hpp"
 #include "metal_rope_wrapper.hpp"
 #include "metal_silu_and_mul_wrapper.hpp"
 #include "metal_gemm_wrapper.hpp"
+#include "metal_add_residual.hpp"
 #include "../../backend-cuda/src/ztensor.hpp"
 #include <chrono>
 
@@ -29,6 +33,58 @@ struct ForwardPassResult {
     std::unique_ptr<MetalTensor<bfloat16_t>> logits;
     bool success = false;
 };
+
+// Helper function to load BPE tokenizer and decode tokens
+std::string decode_tokens(const std::vector<int32_t>& token_ids) {
+    try {
+        // Try to find tokenizer file - use PIE_MODEL_PATH directory if available
+        std::vector<std::string> possible_tokenizer_paths;
+
+        // First try to derive from PIE_MODEL_PATH
+        const char* model_path_env = std::getenv("PIE_MODEL_PATH");
+        if (model_path_env) {
+            std::string model_path(model_path_env);
+            // Extract directory from model path (remove filename)
+            size_t last_slash = model_path.find_last_of("/\\");
+            if (last_slash != std::string::npos) {
+                std::string model_dir = model_path.substr(0, last_slash);
+                possible_tokenizer_paths.push_back(model_dir + "/llama-3.2.vocab");
+                possible_tokenizer_paths.push_back(model_dir + "/tokenizer.model");
+            }
+        }
+
+        // Add other common paths
+        possible_tokenizer_paths.insert(possible_tokenizer_paths.end(), {
+            std::string(std::getenv("HOME") ? std::getenv("HOME") : ".") + "/.cache/pie/models/llama-3.2-1b-instruct/llama-3.2.vocab",
+            std::string(std::getenv("HOME") ? std::getenv("HOME") : ".") + "/Library/Caches/pie/models/llama-3.2-1b-instruct/llama-3.2.vocab",
+            std::string(std::getenv("PIE_HOME") ? std::getenv("PIE_HOME") : ".") + "/models/llama-3.2-1b-instruct/llama-3.2.vocab",
+        });
+
+        // Try to load tokenizer and decode
+        for (const auto& path : possible_tokenizer_paths) {
+            try {
+                auto tokenizer = bpe::llama3_tokenizer(path);
+                std::vector<uint32_t> tokens(token_ids.begin(), token_ids.end());
+                return tokenizer.decode(tokens);
+            } catch (const std::exception& e) {
+                // Continue to next path
+                continue;
+            }
+        }
+
+        // If no tokenizer found, return token IDs as fallback
+        std::string fallback = "[";
+        for (size_t i = 0; i < token_ids.size(); ++i) {
+            if (i > 0) fallback += ", ";
+            fallback += std::to_string(token_ids[i]);
+        }
+        fallback += "]";
+        return fallback;
+
+    } catch (const std::exception& e) {
+        return "[decoding error: " + std::string(e.what()) + "]";
+    }
+}
 
 /**
  * @brief Forward Pass Integration Test
@@ -112,6 +168,12 @@ private:
                 throw std::runtime_error("Failed to initialize Metal Gemm");
             }
             std::cout << "    ✅ Metal Gemm initialized" << std::endl;
+
+            // Initialize Metal add_residual operations (required for proper forward pass)
+            if (!initialize_metal_add_residual()) {
+                throw std::runtime_error("Failed to initialize Metal add_residual");
+            }
+            std::cout << "    ✅ Metal add_residual initialized" << std::endl;
 
         } catch (const std::exception& e) {
             std::cerr << "  ❌ Failed to setup Metal context: " << e.what() << std::endl;
@@ -333,6 +395,180 @@ private:
 
         } catch (const std::exception& e) {
             std::cerr << "  ❌ Exception in multiple tokens forward: " << e.what() << std::endl;
+            throw;
+        }
+    }
+
+    void test_conversational_input() {
+        std::cout << "Testing conversational input: \"Hello, how are you?\"..." << std::endl;
+
+        try {
+            // Load model
+            ztensor::zTensorReader reader(model_path);
+            L4maConfig config = auto_detect_config_from_ztensor(reader);
+
+            auto model = std::make_unique<MetalL4maForCausalLM<bfloat16_t>>(config);
+            if (!model) {
+                throw std::runtime_error("Failed to create model");
+            }
+
+            std::cout << "  Model created successfully (vocab=" << config.vocab_size
+                     << ", hidden=" << config.hidden_size << ", layers=" << config.num_layers << ")" << std::endl;
+
+            // Load model weights
+            if (!load_model_weights_from_ztensor(*model, reader)) {
+                throw std::runtime_error("Failed to load model weights for conversational test");
+            }
+            std::cout << "  ✅ Model weights loaded from zTensor file" << std::endl;
+
+            // Initialize memory pool
+            const size_t pool_size = 600 * 1024 * 1024; // 600MB for conversational input
+            PersistentMemoryPool memory_pool(pool_size);
+            if (!memory_pool.initialize()) {
+                throw std::runtime_error("Failed to initialize memory pool");
+            }
+
+            // Calculate workspace size for conversational sequence
+            const size_t max_num_tokens = 8; // Slightly more than our 6 tokens
+            const size_t max_batch_size = 1;
+            const size_t max_kv_seqlens = 2048;
+            const size_t dist_size = 50;
+
+            size_t workspace_size = MetalL4maBuffer<bfloat16_t>::get_workspace_size(
+                config, max_num_tokens, max_batch_size, max_kv_seqlens, dist_size);
+
+            // Create buffer
+            MetalL4maBuffer<bfloat16_t> buffer(config, 16, dist_size, workspace_size);
+
+            // Create KV cache
+            const int32_t num_kv_pages = 128;
+            const int page_size = 16;
+            MetalL4maKVCache<bfloat16_t> kv_cache(config, num_kv_pages, page_size);
+
+            // *** ACTUAL BPE TOKENIZATION RESULTS FOR "Hello, how are you?" ***
+            // These are the real tokens from llama-3.2.vocab tokenizer
+            std::vector<int32_t> input_ids = {
+                9906,   // "Hello"
+                11,     // ","
+                1268,   // " how"
+                527,    // " are"
+                499,    // " you"
+                30      // "?"
+            }; // Total: 6 tokens (no BOS token from BPE)
+
+            std::vector<int32_t> position_ids = {0, 1, 2, 3, 4, 5};
+            std::vector<int32_t> qo_indptr = {0, static_cast<int32_t>(input_ids.size())};
+
+            // Set up KV cache paging for conversational sequence
+            const int num_pages = 1;  // 6 tokens fits in 1 page (page_size=16)
+            std::vector<int32_t> kv_page_indptr = {0, num_pages};
+            std::vector<int32_t> kv_page_indices = {0};
+            std::vector<int32_t> kv_last_page_lens = {static_cast<int32_t>(input_ids.size())};
+
+            // Get command buffer and plan buffer
+            auto& context = MetalContext::getInstance();
+            auto command_buffer = [context.getCommandQueue() commandBuffer];
+
+            buffer.planWithMapping(
+                command_buffer,
+                memory_pool,
+                input_ids.data(), input_ids.size(),
+                position_ids.data(), position_ids.size(),
+                kv_page_indices.data(), kv_page_indices.size(),
+                kv_page_indptr.data(), kv_page_indptr.size(),
+                kv_last_page_lens.data(), kv_last_page_lens.size(),
+                qo_indptr.data(), qo_indptr.size(),
+                nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0
+            );
+
+            std::cout << "  Buffer planned for conversational input (" << input_ids.size() << " tokens)" << std::endl;
+
+            // Initialize KV cache with zeros (prevent segfaults)
+            for (int layer_idx = 0; layer_idx < config.num_layers; ++layer_idx) {
+                auto [k_cache_ptr, v_cache_ptr] = kv_cache.get_layer_pointers(layer_idx);
+                const size_t kv_elements_per_head = config.head_size;
+                const size_t kv_elements_per_token = config.num_key_value_heads * kv_elements_per_head;
+                const size_t kv_cache_page_size = kv_cache.get_page_size();
+                const size_t kv_elements_per_page = kv_elements_per_token * kv_cache_page_size;
+
+                memset(k_cache_ptr, 0, kv_elements_per_page * sizeof(bfloat16_t));
+                memset(v_cache_ptr, 0, kv_elements_per_page * sizeof(bfloat16_t));
+            }
+
+            std::cout << "  🚀 Running forward pass on conversational input..." << std::endl;
+
+            // Execute the forward pass
+            auto result = model->forward(buffer, kv_cache);
+
+            // Analyze results with detailed token distribution
+            auto& [top_values, top_indices] = result;
+            std::cout << "  ✅ SUCCESS! Conversational forward pass completed!" << std::endl;
+            std::cout << "  📊 Results: " << top_values.size() << " top values, "
+                     << top_indices.size() << " top indices" << std::endl;
+
+            if (!top_values.empty() && !top_indices.empty()) {
+                std::cout << "  📈 CONVERSATIONAL RESPONSE ANALYSIS:" << std::endl;
+
+                // Show top 10 response tokens with decoded text
+                size_t num_to_show = std::min(static_cast<size_t>(10), top_values.size());
+                std::cout << "    Top " << num_to_show << " response tokens:" << std::endl;
+
+                std::vector<int32_t> top_token_ids;
+                for (size_t i = 0; i < num_to_show; ++i) {
+                    top_token_ids.push_back(top_indices[i]);
+                    std::cout << "      " << (i+1) << ". Token " << top_indices[i]
+                             << ": " << std::fixed << std::setprecision(4) << top_values[i];
+
+                    // Decode single token to show what it represents
+                    std::string decoded = decode_tokens({top_indices[i]});
+                    std::cout << " → \"" << decoded << "\"" << std::endl;
+                }
+
+                // Show what a complete response might look like using top tokens
+                std::cout << "\n    🤖 PREDICTED RESPONSE PREVIEW:" << std::endl;
+                std::cout << "    Input: \"Hello, how are you?\"" << std::endl;
+
+                // Show top 3 most likely completions
+                for (int completion = 0; completion < 3 && completion < static_cast<int>(num_to_show); ++completion) {
+                    std::vector<int32_t> response_tokens = {top_indices[completion]};
+                    std::string decoded_response = decode_tokens(response_tokens);
+                    std::cout << "    Response option " << (completion + 1)
+                             << " (prob=" << std::fixed << std::setprecision(3) << top_values[completion] << "): \""
+                             << decoded_response << "\"" << std::endl;
+                }
+
+                // Check distribution quality for conversational response
+                float max_score = top_values[0];
+                float min_score = top_values[std::min(static_cast<size_t>(9), top_values.size()-1)];
+                float score_range = max_score - min_score;
+
+                std::cout << "    📊 Response token distribution:" << std::endl;
+                std::cout << "      Max score: " << std::fixed << std::setprecision(4) << max_score << std::endl;
+                std::cout << "      Score range: " << std::fixed << std::setprecision(4) << score_range << std::endl;
+
+                // Validate response quality
+                bool good_response = true;
+                if (max_score > 50.0f) {
+                    std::cout << "      ⚠️  Very high confidence (may be overconfident)" << std::endl;
+                    good_response = false;
+                }
+                if (score_range < 0.01f) {
+                    std::cout << "      ⚠️  Very narrow score range" << std::endl;
+                    good_response = false;
+                }
+
+                if (good_response) {
+                    std::cout << "      ✅ Response token distribution looks reasonable" << std::endl;
+                    std::cout << "      💬 Model successfully processed: \"Hello, how are you?\"" << std::endl;
+                } else {
+                    std::cout << "      ⚠️  Response distribution may need investigation" << std::endl;
+                }
+            }
+
+            std::cout << "  ✅ Conversational input test completed successfully!" << std::endl;
+
+        } catch (const std::exception& e) {
+            std::cerr << "  ❌ Exception in conversational input test: " << e.what() << std::endl;
             throw;
         }
     }
@@ -802,44 +1038,44 @@ private:
 
                 if (!top_values.empty() && !top_indices.empty()) {
                     std::cout << "      📈 DETAILED TOKEN DISTRIBUTION ANALYSIS:" << std::endl;
-                    
+
                     // Show top 10 tokens with their scores
                     size_t num_to_show = std::min(static_cast<size_t>(10), top_values.size());
                     std::cout << "      📈 Top " << num_to_show << " tokens:" << std::endl;
-                    
+
                     for (size_t i = 0; i < num_to_show; ++i) {
-                        std::cout << "        " << (i+1) << ". Token " << top_indices[i] 
+                        std::cout << "        " << (i+1) << ". Token " << top_indices[i]
                                  << ": " << std::fixed << std::setprecision(6) << top_values[i] << std::endl;
                     }
-                    
+
                     // Analyze distribution characteristics
                     std::cout << "      📊 DISTRIBUTION CHARACTERISTICS:" << std::endl;
-                    
+
                     // Calculate score range and distribution
                     float max_score = top_values[0];
                     float min_score = top_values[std::min(static_cast<size_t>(49), top_values.size()-1)];
                     float score_range = max_score - min_score;
-                    
+
                     std::cout << "        Max score: " << std::fixed << std::setprecision(6) << max_score << std::endl;
                     std::cout << "        Min score (top-50): " << std::fixed << std::setprecision(6) << min_score << std::endl;
                     std::cout << "        Score range: " << std::fixed << std::setprecision(6) << score_range << std::endl;
-                    
+
                     // Check for reasonable token distribution
                     bool reasonable_distribution = true;
                     std::string distribution_analysis;
-                    
+
                     // Check 1: Top token shouldn't be too dominant (>99% probability would be suspicious)
                     if (max_score > 50.0f) {  // Very high logit suggesting near certainty
                         distribution_analysis += "⚠️  Very high top token score (possible overconfidence)\n";
                         reasonable_distribution = false;
                     }
-                    
+
                     // Check 2: Distribution should show some spread (not all same values)
                     if (score_range < 0.001f && top_values.size() > 1) {
                         distribution_analysis += "⚠️  Very narrow score range (possible numerical issues)\n";
                         reasonable_distribution = false;
                     }
-                    
+
                     // Check 3: Scores should be finite (no NaN or Inf)
                     bool has_invalid = false;
                     for (size_t i = 0; i < std::min(static_cast<size_t>(10), top_values.size()); ++i) {
@@ -852,7 +1088,7 @@ private:
                         distribution_analysis += "❌ Invalid scores detected (NaN/Inf values)\n";
                         reasonable_distribution = false;
                     }
-                    
+
                     // Check 4: Token indices should be valid (within vocab range)
                     bool has_invalid_tokens = false;
                     for (size_t i = 0; i < std::min(static_cast<size_t>(10), top_indices.size()); ++i) {
@@ -865,7 +1101,7 @@ private:
                         distribution_analysis += "❌ Invalid token indices detected (out of vocab range)\n";
                         reasonable_distribution = false;
                     }
-                    
+
                     if (reasonable_distribution) {
                         std::cout << "        ✅ Token distribution appears REASONABLE" << std::endl;
                         std::cout << "          - Finite scores with good spread" << std::endl;
@@ -875,15 +1111,15 @@ private:
                         std::cout << "        ⚠️  Token distribution has POTENTIAL ISSUES:" << std::endl;
                         std::cout << distribution_analysis << std::endl;
                     }
-                    
+
                     // Additional vocabulary analysis
                     std::cout << "      📚 VOCABULARY ANALYSIS:" << std::endl;
                     std::cout << "        Model vocab size: " << config.vocab_size << std::endl;
                     std::cout << "        Returned top-k size: " << top_values.size() << std::endl;
-                    
+
                     // Check if we're getting reasonable token coverage
                     float coverage_ratio = static_cast<float>(top_values.size()) / config.vocab_size;
-                    std::cout << "        Coverage ratio: " << std::fixed << std::setprecision(4) 
+                    std::cout << "        Coverage ratio: " << std::fixed << std::setprecision(4)
                              << (coverage_ratio * 100.0f) << "% of vocab" << std::endl;
                 }
 

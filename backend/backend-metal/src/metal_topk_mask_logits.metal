@@ -123,6 +123,6 @@ kernel void metal_topk_mask_logits_bfloat16(
         for (uint j = 0; j < k; ++j) {
             if (i == top_k_idx[j]) { keep = true; break; }
         }
-        if (!keep) token_logits[i] = bfloat(-INFINITY);
+        if (!keep) token_logits[i] = bfloat(-65504.0f);  // Large negative value within bfloat16 range
     }
 }

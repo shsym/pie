@@ -408,8 +408,8 @@ size_t MetalL4maBuffer<T>::get_workspace_size(
     // Distribution storage
     tensor_sizes += max_num_tokens * dist_size * (sizeof(T) + sizeof(int32_t)); // values + indices
 
-    // Add padding for alignment and safety margin
-    tensor_sizes += 8192;
+    // Add padding for alignment and safety margin (increased for multi-token sequences)
+    tensor_sizes += 32768; // 32KB padding to handle multi-token conversational input
 
     return tensor_sizes;
 }

@@ -29,13 +29,13 @@ kernel void extract_k_values_bfloat16_kernel(
         uint found = 0u;
         for (uint col = 0u; col < N && found < k; ++col) {
             bfloat val = input_row[col];
-            if (val != bfloat(-INFINITY)) {  // Extract non-negative-infinity values
+            if (val != bfloat(-65536.0f)) {  // Extract non-masked values (matches actual runtime value 0xc780)
                 value_output_row[found] = val;
                 index_output_row[found] = int32_t(col);
                 ++found;
             }
         }
-        
+
         // Explicitly zero any unfilled slots
         for (uint i = found; i < k; ++i) {
             value_output_row[i] = bfloat(0.0f);
@@ -74,8 +74,8 @@ kernel void extract_k_values_float32_kernel(
                 ++found;
             }
         }
-        
-        // Explicitly zero any unfilled slots  
+
+        // Explicitly zero any unfilled slots
         for (uint i = found; i < k; ++i) {
             value_output_row[i] = 0.0f;
             index_output_row[i] = 0;
