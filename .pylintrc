@@ -1,0 +1,14 @@
+[MASTER]
+# Make pylint see your stubs without altering runtime code
+# init-hook = 'import sys, os; sys.path.insert(0, os.path.abspath("stubs"))'
+
+[TYPECHECK]
+# Don't complain that flashinfer isn't installed
+ignored-modules = flashinfer
+
+# Avoid "no-member" on dynamic attrs under that module (regex supported)
+generated-members = flashinfer.*,flashinfer.attn.*,flashinfer.kv.*
+
+[MESSAGES CONTROL]
+# Keep other checks strict; no need to disable E0401 globally
+# disable =

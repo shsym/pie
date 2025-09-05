@@ -13,10 +13,10 @@ import handshake_pb2
 import l4m_pb2
 import l4m_vision_pb2
 import ping_pb2
-from config import parse_model_metadata
+from config.common import ModelInfo
 from driver import Driver
-from l4ma import L4maForCausalLM, create_fusion_map
-from qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
+from model.l4ma import L4maForCausalLM, create_fusion_map
+from model.qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 import ztensor
 from tqdm import tqdm
 import threading  # Import the threading module
@@ -103,6 +103,17 @@ def main(config: str = None,
     start_service(final_config, model, model_metadata)
 
 
+def detect_architecture_type(metadata_path: str) -> str:
+    """Detect the architecture type from the TOML file."""
+    try:
+        with open(metadata_path, "rb") as f:
+            data = tomli.load(f)
+        arch_data = data.get("architecture", {})
+        return arch_data.get("type", "").lower()
+    except Exception as e:
+        raise RuntimeError(f"Failed to detect architecture type from {metadata_path}: {e}")
+
+
 def load_model(config: dict):
     model_name = config.get('model')
     if not model_name:
@@ -118,19 +129,19 @@ def load_model(config: dict):
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Metadata file not found at: {metadata_path}")
 
-    metadata = parse_model_metadata(metadata_path)
 
-    metadata.architecture.device = config.get('device', 'cuda:0')
-    metadata.architecture.dtype = getattr(torch, config.get('dtype', 'bfloat16'))
+    model_device = config.get('device', 'cuda:0')
+    model_dtype = getattr(torch, config.get('dtype', 'bfloat16'))
+    model_info = ModelInfo.load_from_file(metadata_path, model_device, model_dtype)
 
     # 1. Map fused tensor names to their original sources
     # Choose the appropriate model based on architecture type
-    if metadata.architecture.type.lower() == 'qwen3':
-        model = Qwen3ForCausalLM(metadata.architecture)
+    if model_info.architecture.type.lower() == 'qwen3':
+        model = Qwen3ForCausalLM(model_info.architecture)
         fusion_map = create_qwen3_fusion_map(model)
     else:
         # Default to L4MA for backward compatibility
-        model = L4maForCausalLM(metadata.architecture)
+        model = L4maForCausalLM(model_info.architecture)
         fusion_map = create_fusion_map(model)
 
     # 2. Create a reverse map for fast lookups (original source -> fused target)
@@ -150,7 +161,7 @@ def load_model(config: dict):
     # print(f"Found {len(metadata.parameters)} parameter file(s) to load.")
 
     try:
-        for param_file in metadata.parameters:
+        for param_file in model_info.parameters:
             weights_path = os.path.join(model_path, model_name, param_file)
             # ... (existing file existence check) ...
 
@@ -215,10 +226,11 @@ def load_model(config: dict):
         else:
             print("\nSuccessfully loaded all expected model weights.")
 
-        # Move the entire model to the specified device
+        # Move the entire model to the specified device and dtype
+        model.to(device=model_info.architecture.device, dtype=model_info.architecture.dtype)
         model.eval()  # Set the model to evaluation mode
 
-        return model, metadata
+        return model, model_info
 
 
     except ztensor.ZTensorError as e:
@@ -399,7 +411,6 @@ def run_zmq_server(router, engine, config, model_metadata):
                         res = engine.debug_query_request(request.debug_query_request)
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, debug_query=res)
                     elif command == "get_info":
-                        print("Getting info from the engine.")
                         response = l4m_pb2.Response(correlation_id=request.correlation_id, get_info=l4m_pb2.GetInfoResponse(
                             version="0.1",
                             model_name=f"{config.get('model')}-{config.get('version', '')}",
