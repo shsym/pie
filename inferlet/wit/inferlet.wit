@@ -1,13 +1,11 @@
 package pie:inferlet;
 
 world traits {
-    import allocate;
     import forward;
-    import forward-text;
     import tokenize;
-    import input-text;
-    import input-image;
-    import output-text;
+    import image;
+    import adapter;
+    import evolve;
 }
 
 world imports {

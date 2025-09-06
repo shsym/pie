@@ -3,6 +3,7 @@ use inferlet::stop_condition::{self, StopCondition};
 
 use inferlet::Context;
 use std::time::Instant;
+use inferlet::traits::Tokenize;
 
 /// Generates text using a simple sliding window for KV cache management.
 ///

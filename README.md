@@ -1,88 +1,161 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://pie-project.org/images/pie-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="https://pie-project.org/images/pie-light.svg">
-    <img alt="Pie: Programmable serving system for emerging LLM applications"
-         src="https://pie-project.org/images/pie-light.svg"
-         width="30%">
-    <p></p>
-  </picture>
-</div>
+
+# Piggybacked Evolution (Pevo) on Pie
+
+This summarizes the steps to set up and run Piggybacked Evolution (Pevo) using the Pie inference engine.
+
+### Step 1: Install the FlashInfer Library
 
 
-**PIE** is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
-
-> **Note** 🧪
->
-> This software is in a **pre-release** stage and under active development. It's recommended for testing and research purposes only.
-
-> **SOSP'25 Artifact**
->
-> Please check out the `sosp25` branch for the artifact and benchmark instructions.
+Go to `backend/backend-python` directory for the following steps.
 
 
 
-## Getting Started
+1.  **Determine your GPU's CUDA Compute Capability.**
+    Run the following command to find your GPU's compute capability version. You will need this for the next step.
 
-### 1. Prerequisites
+    ```bash
+    nvidia-smi --query-gpu=compute_cap --format=csv
+    ```
 
-- **Configure a Backend:**  
-  Navigate to a backend directory and follow its `README.md` for setup:
-  - [Python Backend](backend/backend-python/README.md)
-  - [C++ Backend](backend/backend-cuda/README.md)
+    This will output a version number, for example, `8.6`.
+
+2.  **Clone, Configure, and Build FlashInfer.**
+    The following script clones the FlashInfer repository and builds it. **Important:** Before running, replace `"8.6"` in the `export TORCH_CUDA_ARCH_LIST` line with the compute capability you found in the previous step.
+
+    ```bash
+    pip install torch # Ensure you have the PyTorch installed
+    
+    # Clone the repository and its submodules
+    git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
+    cd flashinfer
+
+    # IMPORTANT: Set your target CUDA architecture below
+    export TORCH_CUDA_ARCH_LIST="8.6" # Replace "8.6" with your compute_cap value
+
+    # Build the Ahead-of-Time (AOT) kernels. This will take some time (~5-10 minutes).
+    python -m flashinfer.aot
+
+    # Build the wheel package
+    python -m pip install --no-build-isolation --verbose .
+
+    cd ../
+    ```
+
+### Step 2: Compile Protobuf Definitions
+
+This step uses the Protocol Buffers compiler (`protoc`) to generate the necessary Python code for data serialization and communication within the backend.
+
+```bash
+# Make the script executable
+chmod +x build_proto.sh
+
+# Run the script
+./build_proto.sh
+```
+
+### Step 3: Install the PIE Torch Backend
+
+Now, you can install the dependencies.
+
+```bash
+pip install -r requirements.txt
+```
+
+### Step 4: Install the PIE Client
+
+Go to `client/python` directory for the following steps.
+
+```bash
+pip install -e .
+```
 
 
-- **Add Wasm Target:**  
-  Install the WebAssembly target for Rust:
+### Step 5. Install the CLI 
 
-  ```bash
-  rustup target add wasm32-wasip2
-  ```
-  This is required to compile Rust-based inferlets in the `example-apps` directory.
+The pie-cli is the primary tool for managing the PIE system. If you don't have Rust installed, please follow the [Rust installation guide](https://www.rust-lang.org/tools/install).
 
 
-### 2. Build
+```
+cd pie-cli
+cargo install --path .
+```
 
-Build the **PIE CLI** and the example inferlets.
+Verify the installation by checking the help message:
 
-- **Build the PIE CLI:**  
-  From the repository root, run:
+```bash
+pie --help
+```
 
-  ```bash
-  cd pie-cli && cargo install --path .
-  ```
+### Step 6: Download and Register LLMs
 
-- **Build the Examples:**  
+Next, download the models used in our examples
+Download all the models will quite a bit of time and ~70 GB of disk space.
 
-  ```bash
-  cd example-apps && cargo build --target wasm32-wasip2 --release
-  ```
+```bash
+pie model add "llama-3.2-1b-instruct"
+pie model add "llama-3.2-3b-instruct"
+pie model add "llama-3.1-8b-instruct"
+pie model add "qwen-3-1.7b"
+pie model add "qwen-3-4b"
+pie model add "qwen-3-8b"
+```
 
 
+You can list all registered models to confirm they were added correctly:
 
-### 3. Run an Inferlet
+```bash
+pie model list
+```
 
-Download a model, start the engine, and run an inferlet.
+### Step 7: Add the WebAssembly Target to compile Inferlets
 
-1. **Download a Model:**  
-   Use the PIE CLI to add a model from the [model index](https://github.com/pie-project/model-index):
 
-   ```bash
-   pie model add "llama-3.2-1b-instruct"
-   ```
+1.  **Add the `wasm32-wasip2` target to your Rust toolchain:**
+    ```bash
+    rustup target add wasm32-wasip2
+    ```
 
-2. **Start the Engine:**  
-   Launch the PIE engine with an example configuration. This opens the interactive PIE shell:
 
-   ```bash
-   cd pie-cli
-   pie start --config ./example_config.toml
-   ```
+### Step 8: Setup the wandb for logging
 
-3. **Run an Inferlet:**  
-   From within the PIE shell, execute a compiled inferlet:
+```
+pip install wandb
+wandb login
+```
 
-   ```bash
-   pie> run ../example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --model "llama-3.2" --prompt "What is the capital of France?"
-   ```
+### Step 9. Quick Sanity Check for Multi-GPU Training
+
+For a quick sanity check, run the training with a single GPU:
+
+```
+cd pie-cli
+pie start --config ./example_config.toml
+```
+
+Set the `SERVER_URIS` in `main.py` to point to this server:
+```
+SERVER_URIS = [
+    "ws://127.0.0.1:8080",
+]
+```
+
+
+and launch the script:
+```
+python main.py
+```
+
+
+For multi-GPU training, please refer to the `start_pie.sh` for an example of launching a multi-GPU server, and `stop_pie.sh` for stopping the server.
+
+You can simply add more SERVER_URIS in `main.py` to use more GPUs.
+
+### Step 10. Run your own training
+
+I will provide a more documentation for how to customize the Pevo training.
+
+For now, you can refer to the `main.py` for the main training loop, and 
+read `es-init.rs` for the ES initiaization, `es-rollout.rs` for the rollout, and `es-update.rs` for the update logic.
+
+The actual CMA-ES implementation is located at `backend/backend-python/adapter.py`.
 

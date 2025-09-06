@@ -3,7 +3,7 @@ use inferlet::wstd::http::server::{Finished, Responder};
 use inferlet::wstd::http::{IntoBody, Request, Response, StatusCode};
 use serde_json;
 use std::time::Instant;
-
+use inferlet::traits::Tokenize;
 use crate::models::{
     ChatCompletionRequest, CompletionTokensDetails, OpenAiResponse, ResponseChoice,
     ResponseChoiceMessage, TokensDetails, UsageStats,

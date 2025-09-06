@@ -1,6 +1,6 @@
 use inferlet::Context;
 use inferlet::brle::Brle;
-use inferlet::traits::ForwardText;
+use inferlet::traits::Forward;
 use inferlet::traits::tokenize::Tokenizer;
 use std::time::Instant;
 
@@ -18,7 +18,6 @@ use std::time::Instant;
 /// * `ctx`: A mutable reference to the context to be prefilled.
 /// * `xml_text`: A string slice containing the XML document to process.
 pub async fn prefill_with_hierarchical_attention(ctx: &mut Context, xml_text: &str) {
-
     #[derive(Debug, Clone)]
     struct XmlNode {
         id: usize,
@@ -124,16 +123,16 @@ pub async fn prefill_with_hierarchical_attention(ctx: &mut Context, xml_text: &s
 
     // 3. Prepare for and execute the forward pass.
     let mut pending_token_ids = parsed.tokens;
-    let mut position_ids: Vec<u32> = (0..num_tokens as u32).collect();
+    let position_ids: Vec<u32> = (0..num_tokens as u32).collect();
     ctx.grow_kv_pages(num_tokens);
 
-    ctx.queue.forward_text_no_output(
-        ctx.kv_page_last_len as u32,
-        &ctx.kv_page_ids,
-        &pending_token_ids,
-        &position_ids,
-        &attention_masks_rle,
-    );
+    let p = ctx.queue.create_forward_pass();
+
+    p.kv_cache(&ctx.kv_pages, ctx.kv_page_last_len);
+    p.attention_mask(&attention_masks_rle);
+    p.input_tokens(&pending_token_ids, &position_ids);
+
+    let _ = p.execute().await;
 
     let next_token_id = pending_token_ids.pop().unwrap();
     // 4. Update the context's state.

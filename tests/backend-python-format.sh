@@ -6,4 +6,5 @@ ROOT="$(dirname "$(dirname "${BASH_SOURCE[0]}")")"
 
 uvx black --check \
     ${ROOT}/backend/backend-python/config/*.py \
-    ${ROOT}/backend/backend-python/model/*.py
+    ${ROOT}/backend/backend-python/l4ma.py \
+    ${ROOT}/backend/backend-python/qwen3.py
