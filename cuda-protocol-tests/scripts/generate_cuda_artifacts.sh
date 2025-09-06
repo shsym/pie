@@ -44,6 +44,7 @@ fi
 CUDA_PROJECT_DIR="$ROOT_DIR/cuda-protocol-tests"
 BUILD_DIR="$CUDA_PROJECT_DIR/build"
 BIN="$BUILD_DIR/cuda_protocol_tests"
+INTEGRATION_BIN="$BUILD_DIR/cuda_integration_tests"
 ART_DIR="$ROOT_DIR/cuda-protocol-tests/tests/artifacts"
 CUDA_BACKEND_DIR="$ROOT_DIR/backend/backend-cuda"
 CONFIG_FILE="$CUDA_PROJECT_DIR/llama31_configs.json"
@@ -182,6 +183,37 @@ run_operation() {
   run "${cmd_args[@]}"
 }
 
+# Run integration test for layer-by-layer artifact generation
+run_integration_test() {
+  local test_case="$1"
+
+  echo "==> Running layer-by-layer integration test: $test_case"
+
+  if [[ ! -x "$INTEGRATION_BIN" ]]; then
+    echo "❌ Integration test binary not found at $INTEGRATION_BIN" >&2
+    return 1
+  fi
+
+  if run "$INTEGRATION_BIN" "$test_case"; then
+    echo "✅ Integration test completed successfully"
+
+    # Validate that layer artifacts were created
+    local integration_dir="$ART_DIR/forward_pass_integration/$test_case/layer_artifacts"
+    if [[ -d "$integration_dir" ]]; then
+      local layer_count=$(find "$integration_dir" -name "layer_*" -type d | wc -l)
+      local tensor_count=$(find "$integration_dir" -name "*.bin" | wc -l)
+      echo "✅ Generated layer-by-layer artifacts: $layer_count layers, $tensor_count tensor files"
+      return 0
+    else
+      echo "⚠️  Integration test completed but no layer artifacts found at $integration_dir" >&2
+      return 1
+    fi
+  else
+    echo "❌ Integration test failed" >&2
+    return 1
+  fi
+}
+
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Error: required command '$1' not found in PATH" >&2; exit 127; }; }
 
 # Tooling checks
@@ -228,7 +260,12 @@ else
 fi
 
 if [[ ! -x "$BIN" ]]; then
-  echo "Error: binary not found at $BIN" >&2
+  echo "Error: protocol tests binary not found at $BIN" >&2
+  exit 1
+fi
+
+if [[ ! -x "$INTEGRATION_BIN" ]]; then
+  echo "Error: integration tests binary not found at $INTEGRATION_BIN" >&2
   exit 1
 fi
 
@@ -308,9 +345,9 @@ if [[ "$RUN_LLAMA" == "1" ]]; then
   run_and_validate add_residual "llama31_prod" with_config --num_tokens 512 || FAILED_OPS+=("llama31_add_residual")
   TOTAL_OPS=$((TOTAL_OPS + 1))
 
-  # Forward pass integration test with real model
-  echo "==> Running forward pass integration test..."
-  run_and_validate forward_pass_integration "llama31_integration" "" || FAILED_OPS+=("llama31_forward_pass_integration")
+  # Layer-by-layer integration test with real model (generates individual tensor artifacts)
+  echo "==> Running layer-by-layer integration test..."
+  run_integration_test "real_model_forward_pass" || FAILED_OPS+=("layer_by_layer_integration")
   TOTAL_OPS=$((TOTAL_OPS + 1))
 fi
 

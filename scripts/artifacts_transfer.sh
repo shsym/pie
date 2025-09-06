@@ -123,9 +123,15 @@ generate_llama31_artifacts() {
     # Generate forward pass integration artifacts first (requires model)
     echo -e "${YELLOW}Generating Forward Pass Integration artifacts...${NC}"
     if [ -n "$PIE_MODEL_PATH" ]; then
-        CUDA_VISIBLE_DEVICES=0 PIE_MODEL_PATH="$PIE_MODEL_PATH" ./cuda_protocol_tests --op forward_pass_integration --case llama31_integration
+        CUDA_VISIBLE_DEVICES=0 PIE_MODEL_PATH="$PIE_MODEL_PATH" ./cuda_integration_tests real_model_forward_pass
     else
-        echo -e "${YELLOW}  Skipping integration test (PIE_MODEL_PATH not set)${NC}"
+        # Try to run integration test without PIE_MODEL_PATH - it may use cached model
+        echo -e "${YELLOW}Attempting integration test with cached model...${NC}"
+        if CUDA_VISIBLE_DEVICES=0 ./cuda_integration_tests real_model_forward_pass 2>/dev/null; then
+            echo -e "${GREEN}✅ Integration test completed with cached model${NC}"
+        else
+            echo -e "${YELLOW}  Skipping integration test (no model available)${NC}"
+        fi
     fi
 
     # Generate artifacts for key operations with Llama 3.1 8B configuration
@@ -185,6 +191,17 @@ compress_artifacts() {
 
     echo -e "${YELLOW}Found $ARTIFACT_COUNT artifact files${NC}"
 
+    # Show breakdown of artifact types
+    BIN_COUNT=$(find "$CUDA_ARTIFACTS_SOURCE" -name "*.bin" | wc -l)
+    JSON_COUNT=$(find "$CUDA_ARTIFACTS_SOURCE" -name "*.json" | wc -l)
+    INTEGRATION_COUNT=$(find "$CUDA_ARTIFACTS_SOURCE" -path "*/forward_pass_integration/*" -name "*.bin" 2>/dev/null | wc -l)
+
+    echo -e "${BLUE}  • Binary files: ${YELLOW}$BIN_COUNT${NC}"
+    echo -e "${BLUE}  • Metadata files: ${YELLOW}$JSON_COUNT${NC}"
+    if [ "$INTEGRATION_COUNT" -gt 0 ]; then
+        echo -e "${BLUE}  • Integration test tensors: ${YELLOW}$INTEGRATION_COUNT${NC}"
+    fi
+
     # Artifacts will be extracted to their original CUDA location for Metal protocol tests to use
     echo -e "${BLUE}Preparing artifacts for extraction to CUDA location...${NC}"
 
@@ -192,7 +209,7 @@ compress_artifacts() {
     cp "$LLAMA31_CONFIG" "$WORKSPACE_ROOT/metal-protocol-tests/"
 
     # Validate artifacts using manifest
-    validate_artifacts "$METAL_ARTIFACTS_TARGET" true
+    validate_artifacts true
 
     # Create archive with progress
     cd "$WORKSPACE_ROOT"

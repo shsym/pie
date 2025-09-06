@@ -182,7 +182,10 @@ if(EXISTS "${CUDA_BACKEND_DIR}/src/ztensor.hpp")
     )
 
     # Same compiler options and definitions
-    target_compile_definitions(cuda_integration_tests PRIVATE CUDA_SUPPORT_ENABLED)
+    target_compile_definitions(cuda_integration_tests PRIVATE
+        CUDA_SUPPORT_ENABLED
+        CMAKE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
 
     target_compile_options(
         cuda_integration_tests PRIVATE
