@@ -144,14 +144,14 @@ run_and_validate() {
 
   echo "==> Running $op_name with case $case_id"
   local cmd_args=("$BIN" --op "$op_name" --case "$case_id")
-  
+
   # Add Llama config if requested
   if [[ "$use_config" == "with_config" ]]; then
     cmd_args+=(--config "$CONFIG_FILE" --model "$LLAMA_MODEL")
   fi
-  
+
   cmd_args+=("$@")
-  
+
   if run "${cmd_args[@]}"; then
     sleep 0.5  # Brief delay to ensure files are fully written
     validate_operation "$op_name" "$case_id"
@@ -171,14 +171,14 @@ run_operation() {
 
   echo "==> Running $op_name with case $case_id"
   local cmd_args=("$BIN" --op "$op_name" --case "$case_id")
-  
+
   # Add Llama config if requested
   if [[ "$use_config" == "with_config" ]]; then
     cmd_args+=(--config "$CONFIG_FILE" --model "$LLAMA_MODEL")
   fi
-  
+
   cmd_args+=("$@")
-  
+
   run "${cmd_args[@]}"
 }
 
@@ -215,10 +215,10 @@ if [[ -z "${SKIP_BUILD:-}" ]]; then
   run mkdir -p "$BUILD_DIR"
   run cmake -S "$CUDA_PROJECT_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
   CORES=1
-  if command -v nproc >/dev/null 2>&1; then 
+  if command -v nproc >/dev/null 2>&1; then
     CORES=$(($(nproc) - 1))
     if [[ $CORES -lt 1 ]]; then CORES=1; fi
-  elif command -v sysctl >/dev/null 2>&1; then 
+  elif command -v sysctl >/dev/null 2>&1; then
     CORES=$(($(sysctl -n hw.ncpu) - 1))
     if [[ $CORES -lt 1 ]]; then CORES=1; fi
   fi
@@ -243,7 +243,7 @@ echo "==> Generating CUDA artifacts into $ART_DIR"
 if [[ "$RUN_GENERIC" == "1" && "$RUN_LLAMA" == "1" ]]; then
   echo "    Modes: Generic + Llama $LLAMA_MODEL (case: $FULL_CASE_ID)"
 elif [[ "$RUN_LLAMA" == "1" ]]; then
-  echo "    Mode: Llama $LLAMA_MODEL only (case: $FULL_CASE_ID)"  
+  echo "    Mode: Llama $LLAMA_MODEL only (case: $FULL_CASE_ID)"
 else
   echo "    Mode: Generic only (case: $FULL_CASE_ID)"
 fi
@@ -256,30 +256,30 @@ TOTAL_OPS=0
 # Generate Llama-specific test cases
 if [[ "$RUN_LLAMA" == "1" ]]; then
   echo "==> Generating Llama-specific test cases..."
-  
+
   # Llama 3.1 production cases with config-driven parameters
   run_and_validate rms_norm "llama31_prod" with_config --num_tokens 512 || FAILED_OPS+=("llama31_rms_norm")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   run_and_validate silu_and_mul "llama31_prod" with_config --num_tokens 512 || FAILED_OPS+=("llama31_silu_and_mul")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   run_and_validate rope "llama31_prod" with_config --num_tokens 512 || FAILED_OPS+=("llama31_rope")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   # Llama projection-specific GEMM cases
   run_and_validate gemm "llama31_qkv" with_config --m 512 --n 4096 --k 4096 || FAILED_OPS+=("llama31_gemm_qkv")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   run_and_validate gemm "llama31_o_proj" with_config --m 512 --n 4096 --k 4096 || FAILED_OPS+=("llama31_gemm_o_proj")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   run_and_validate gemm "llama31_gate_up" with_config --m 512 --n 6144 --k 4096 || FAILED_OPS+=("llama31_gemm_gate_up")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   run_and_validate gemm "llama31_down" with_config --m 512 --n 4096 --k 6144 || FAILED_OPS+=("llama31_gemm_down")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   # Note: embedding_lookup operation creates artifacts under "embedding_lookup_forward" directory
   if run "$BIN" --op embedding_lookup --case "llama31_prod" --config "$CONFIG_FILE" --model "$LLAMA_MODEL" --num_tokens 512; then
     validate_operation "embedding_lookup_forward" "llama31_prod" || FAILED_OPS+=("llama31_embedding_lookup")
@@ -288,32 +288,37 @@ if [[ "$RUN_LLAMA" == "1" ]]; then
     FAILED_OPS+=("llama31_embedding_lookup")
   fi
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   run_and_validate softmax "llama31_prod" with_config --batch_size 8 || FAILED_OPS+=("llama31_softmax")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   run_and_validate topk_mask_logits "llama31_prod" with_config --num_tokens 4 --k 50 || FAILED_OPS+=("llama31_topk_mask_logits")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   run_and_validate extract_k_values "llama31_prod" with_config --M 4 --k 50 || FAILED_OPS+=("llama31_extract_k_values")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   # Attention and KV cache with Llama 3.1 8B parameters
   run_and_validate batch_prefill_attention "llama31_prod" with_config --num_tokens 128 --num_query_heads 32 --num_kv_heads 8 --head_size 128 --kv_len 2048 --page_size 16 || FAILED_OPS+=("llama31_batch_prefill_attention")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   run_and_validate append_paged_kv_cache "llama31_prod" with_config --num_tokens 128 --num_kv_heads 8 --head_size 128 --page_size 16 --batch_size 2 || FAILED_OPS+=("llama31_append_paged_kv_cache")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   run_and_validate add_residual "llama31_prod" with_config --num_tokens 512 || FAILED_OPS+=("llama31_add_residual")
+  TOTAL_OPS=$((TOTAL_OPS + 1))
+
+  # Forward pass integration test with real model
+  echo "==> Running forward pass integration test..."
+  run_and_validate forward_pass_integration "llama31_integration" "" || FAILED_OPS+=("llama31_forward_pass_integration")
   TOTAL_OPS=$((TOTAL_OPS + 1))
 fi
 
-# Generate generic test cases  
+# Generate generic test cases
 if [[ "$RUN_GENERIC" == "1" ]]; then
-  # Original generic test cases with hardcoded parameters  
+  # Original generic test cases with hardcoded parameters
   echo "==> Generating generic test cases..."
-  
+
   # Core matmul/activations/normalization
   run_and_validate gemm "$FULL_CASE_ID" "" --m 128 --n 4096 --k 4096 || FAILED_OPS+=("generic_gemm")
   TOTAL_OPS=$((TOTAL_OPS + 1))
@@ -356,7 +361,7 @@ if [[ "$RUN_GENERIC" == "1" ]]; then
   # Optional: grouped GEMM (remove unsupported --num_groups flag for now)
   run_and_validate grouped_gemm "$FULL_CASE_ID" "" --m 128 --n 4096 --k 4096 || FAILED_OPS+=("generic_grouped_gemm")
   TOTAL_OPS=$((TOTAL_OPS + 1))
-  
+
   # Add missing add_residual operation
   run_and_validate add_residual "$FULL_CASE_ID" "" --num_tokens 128 --hidden_size 4096 || FAILED_OPS+=("generic_add_residual")
   TOTAL_OPS=$((TOTAL_OPS + 1))

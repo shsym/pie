@@ -70,7 +70,7 @@ Tensor<T>::Tensor(const ByteTensor& byte_buffer, size_t byte_offset, size_t coun
     if (byte_offset + count * sizeof(T) > byte_buffer.size() * sizeof(uint8_t)) {
         throw std::out_of_range("Reinterpreting view is out of bounds of the source byte buffer.");
     }
-    
+
     // This now works because of the corrected 'friend' declaration.
     T* typed_ptr = reinterpret_cast<T*>(byte_buffer.data() + byte_offset);
     this->data_ = std::shared_ptr<T>(byte_buffer.data_, typed_ptr);
@@ -109,7 +109,9 @@ void Tensor<T>::from_pointer(const T* data, size_t count) {
 }
 
 template <typename T>
-float Tensor<T>::mean() const requires std::is_same_v<T, float> || std::is_same_v<T, __nv_bfloat16>
+template <typename U>
+typename std::enable_if_t<std::is_same_v<U, float> || std::is_same_v<U, __nv_bfloat16>, float>
+Tensor<T>::mean() const
 {
     if (size_ == 0) return 0.0f;
 

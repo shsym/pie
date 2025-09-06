@@ -122,12 +122,16 @@ add_library(
   src/common.cu
   src/tensor.cu
   src/model.cu
+  src/l4ma.cu
 )
 
 target_include_directories(
   cuda_common_kernels
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${flashinfer_SOURCE_DIR}/include
           ${flashinfer_SOURCE_DIR}/src/generated)
+
+target_compile_options(cuda_common_kernels PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 
 target_link_libraries(cuda_common_kernels INTERFACE zstd)
 

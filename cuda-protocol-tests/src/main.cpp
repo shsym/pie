@@ -177,10 +177,17 @@ Args parse_args(int argc, char** argv) {
                          "  cuda_protocol_tests --op rope [--case ID] [--num_tokens N] [--num_heads H] [--head_size S] [--rope_theta T] [--rope_factor F] [--seed S]\\n"
                          "  cuda_protocol_tests --op softmax [--case ID] [--batch_size B] [--vocab_size V] [--temperature T] [--seed S]\\n"
                          "  cuda_protocol_tests --op batch_prefill_attention [--case ID] [--num_tokens N] [--num_query_heads QH] [--num_kv_heads KH] [--head_size S] [--kv_len L] [--page_size P] [--seed S]\\n"
+                         "  cuda_protocol_tests --op forward_pass_integration [--case ID] [--seed S]\\n"
+                         "\\n"
+                         "Integration Testing:\\n"
+                         "  cuda_protocol_tests --op forward_pass_integration --case single_token    # Single token forward pass with layer recording\\n"
+                         "  cuda_protocol_tests --op forward_pass_integration --case conversational # Test with conversational input\\n"
+                         "  PIE_MODEL_PATH=/path/to/model.zt cuda_protocol_tests --op forward_pass_integration --case custom\\n"
                          "\\n"
                          "Examples:\\n"
                          "  cuda_protocol_tests --config llama31_configs.json --model 8B --op rms_norm --case llama31_128\\n"
-                         "  cuda_protocol_tests --config llama31_configs.json --model 70B --op gemm --case qkv_proj --m 512\\n";
+                         "  cuda_protocol_tests --config llama31_configs.json --model 70B --op gemm --case qkv_proj --m 512\\n"
+                         "  PIE_MODEL_PATH=/path/to/llama-3.2-1b-bf16.zt cuda_protocol_tests --op forward_pass_integration --case single_token\\n";
             std::exit(0);
         } else {
             throw std::runtime_error("Unknown flag: " + flag);
@@ -193,18 +200,18 @@ Args parse_args(int argc, char** argv) {
 // Load configuration from JSON file and update args
 void apply_config(Args& args) {
     if (args.config_file.empty()) return;
-    
+
     try {
         config::Value config = config::load_json(args.config_file);
-        
+
         // Navigate to the specified model size
         if (!config.has("models") || !config["models"].has(args.model_size)) {
             throw std::runtime_error("Model size '" + args.model_size + "' not found in config");
         }
-        
+
         const auto& model = config["models"][args.model_size];
         const auto& arch = model["architecture"];
-        
+
         // Apply architecture defaults
         args.hidden_size = arch["hidden_size"].as_int();
         args.intermediate_size = arch["intermediate_size"].as_int();
@@ -215,13 +222,13 @@ void apply_config(Args& args) {
         args.max_position_embeddings = arch["max_position_embeddings"].as_int();
         args.rope_theta = arch["rope_theta"].as_float();
         args.eps = arch["eps"].as_float();
-        
+
         std::cout << "Loaded " << model["name"].as_string() << " configuration:\n";
         std::cout << "  Hidden size: " << args.hidden_size << "\n";
         std::cout << "  Intermediate size: " << args.intermediate_size << "\n";
         std::cout << "  Vocab size: " << args.vocab_size << "\n";
         std::cout << "  Attention heads: " << args.num_query_heads << "/" << args.num_kv_heads << "\n";
-        
+
     } catch (const std::exception& e) {
         throw std::runtime_error("Failed to load config: " + std::string(e.what()));
     }
@@ -232,7 +239,7 @@ void apply_config(Args& args) {
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
-        
+
         // Apply configuration from JSON file if provided
         apply_config(args);
 
@@ -319,6 +326,8 @@ int main(int argc, char** argv) {
         } else if (args.op == "add_residual_all_dtypes") {
             ops::AddResidualConfig cfg{args.num_tokens, args.hidden_size};
             ops::run_all_dtypes_for_operation("add_residual", case_id, &cfg, args.seed);
+        } else if (args.op == "forward_pass_integration") {
+            ops::run_forward_pass_integration(case_id, args.seed);
         } else {
             std::cerr << "Unsupported op: " << args.op << std::endl;
             return 2;

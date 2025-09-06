@@ -212,6 +212,10 @@ void run_grouped_gemm_typed(const std::string& case_id, const GroupedGemmConfig&
 void run_all_dtypes_for_operation(const std::string& op_name, const std::string& base_case_id,
                                  const void* config_ptr, uint64_t seed);
 
+// Forward pass integration testing
+void run_forward_pass_integration(const std::string& case_id, uint64_t seed);
+void create_placeholder_artifacts(const std::string& base_path);
+
 // Metal backend implementations
 void run_gemm_metal(const std::string& case_id, const GemmConfig& cfg, uint64_t seed);
 void run_embedding_lookup_metal(const std::string& case_id, const EmbeddingConfig& cfg, uint64_t seed);

@@ -70,6 +70,7 @@ set(CUDA_SOURCES
     src/ops/batch_prefill_attention.cu
     src/ops/grouped_gemm.cu
     src/ops/append_paged_kv_cache.cu
+    src/ops/forward_pass_integration.cu
     src/test_kernels/embed_fp16.cu
     src/test_kernels/extract_k_values_fp16.cu
     src/test_kernels/gemm_fp16.cu
@@ -135,3 +136,81 @@ target_compile_options(
                     --extended-lambda
                     --expt-relaxed-constexpr
                     >)
+
+# --- Integration Tests ---
+# Single integration test binary for end-to-end model testing
+
+set(INTEGRATION_SOURCES
+    tests/src/integration/test_forward_pass_cuda_direct_functions.cu
+    tests/src/integration/cuda_context.cu
+    ${CUDA_BACKEND_DIR}/src/bpe.cpp
+)
+
+# Check if we can build integration tests (requires zTensor support)
+if(EXISTS "${CUDA_BACKEND_DIR}/src/ztensor.hpp")
+    add_executable(cuda_integration_tests ${INTEGRATION_SOURCES})
+
+    # Same architecture requirements as main tests
+    set_property(TARGET cuda_integration_tests PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+
+    # Include directories (same as main tests plus integration test includes)
+    target_include_directories(cuda_integration_tests PRIVATE
+        src
+        tests/src
+        ${CUDA_BACKEND_DIR}/src
+        ${CUDA_BACKEND_DIR}/build/_deps/flashinfer-src/include
+        ${CUDA_BACKEND_DIR}/build/_deps/flashinfer-src/src
+        ${CUDA_BACKEND_DIR}/build/_deps/flashinfer-src/src/generated
+        ${CUDA_BACKEND_DIR}/third_party/cutlass/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+    )
+
+    # Link all CUDA backend libraries to resolve L4ma classes
+    target_link_libraries(cuda_integration_tests PRIVATE
+        ${BACKEND_LIB_DIR}/libcuda_common_kernels.a  # Contains Model class implementation
+        ${BACKEND_LIB_DIR}/libprefill_kernels.a      # Contains L4ma classes
+        ${BACKEND_LIB_DIR}/libdecode_kernels.a       # Contains L4ma classes
+        CUDA::cublas
+        CUDA::cublasLt
+        CUDA::curand
+        CUDA::cudart
+        pthread
+        # Link order matters for static libraries - try reverse order for circular deps
+        ${BACKEND_LIB_DIR}/libdecode_kernels.a
+        ${BACKEND_LIB_DIR}/libprefill_kernels.a
+        ${BACKEND_LIB_DIR}/libcuda_common_kernels.a
+    )
+
+    # Same compiler options and definitions
+    target_compile_definitions(cuda_integration_tests PRIVATE CUDA_SUPPORT_ENABLED)
+
+    target_compile_options(
+        cuda_integration_tests PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+            --extended-lambda
+            --expt-relaxed-constexpr
+            -Wno-deprecated-gpu-targets
+        -Xcompiler=-Wno-sign-compare
+            -diag-suppress=177
+        >
+    )
+
+    target_compile_options(
+        cuda_integration_tests
+        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+                        -Xcompiler=-Wall
+                        -Xcompiler=-Wextra
+                        -Wno-unused-parameter
+                        --extended-lambda
+                        --expt-relaxed-constexpr
+                        >)
+
+    set_target_properties(cuda_integration_tests PROPERTIES
+        CUDA_RUNTIME_LIBRARY Shared
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+
+    message(STATUS "Integration test enabled - single target: cuda_integration_tests")
+else()
+    message(STATUS "Integration tests disabled - zTensor support not found")
+endif()

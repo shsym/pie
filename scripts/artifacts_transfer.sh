@@ -120,6 +120,14 @@ generate_llama31_artifacts() {
 
     cd "$WORKSPACE_ROOT/cuda-protocol-tests/build"
 
+    # Generate forward pass integration artifacts first (requires model)
+    echo -e "${YELLOW}Generating Forward Pass Integration artifacts...${NC}"
+    if [ -n "$PIE_MODEL_PATH" ]; then
+        CUDA_VISIBLE_DEVICES=0 PIE_MODEL_PATH="$PIE_MODEL_PATH" ./cuda_protocol_tests --op forward_pass_integration --case llama31_integration
+    else
+        echo -e "${YELLOW}  Skipping integration test (PIE_MODEL_PATH not set)${NC}"
+    fi
+
     # Generate artifacts for key operations with Llama 3.1 8B configuration
     echo -e "${YELLOW}Generating RMS Norm artifacts...${NC}"
     CUDA_VISIBLE_DEVICES=0 ./cuda_protocol_tests --config ../llama31_configs.json --model 8B --op rms_norm --case llama31_prod --num_tokens 512

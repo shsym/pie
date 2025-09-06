@@ -51,7 +51,9 @@ public:
     void from_pointer(const T* data, size_t count);
 
     // --- Debugging Methods ---
-    float mean() const requires std::is_same_v<T, float> || std::is_same_v<T, __nv_bfloat16>;
+    template<typename U = T>
+    typename std::enable_if_t<std::is_same_v<U, float> || std::is_same_v<U, __nv_bfloat16>, float>
+    mean() const;
     void print(size_t start_index = 0, size_t count = -1) const;
 
 private:
