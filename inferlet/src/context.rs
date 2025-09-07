@@ -493,7 +493,7 @@ impl Context {
         p.input_tokens(&pending_token_ids, &position_ids);
         p.kv_cache(&self.kv_pages, self.kv_page_last_len);
         p.attention_mask(&mask);
-        p.output_distributions(&[pending_token_ids.len() as u32 - 1]);
+        p.output_distributions(&[pending_token_ids.len() as u32 - 1], 1.0, None);
 
         let res = p.execute().await;
         let sampled = res.distributions.unwrap().into_iter().next().unwrap();
@@ -744,7 +744,7 @@ impl Context {
             let p = self.queue.create_forward_pass();
             p.input_tokens(&batch_tokens, &batch_positions);
             p.kv_cache(&self.kv_pages, self.kv_page_last_len);
-            p.output_distributions(&out_range.map(|x| x as u32).collect::<Vec<_>>());
+            p.output_distributions(&out_range.map(|x| x as u32).collect::<Vec<_>>(), 1.0, None);
 
             let res = p.execute().await;
             let output_distributions = res.distributions.unwrap();

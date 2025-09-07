@@ -22,6 +22,19 @@ interface forward {
         queue: borrow<queue>
     ) -> forward-pass;
 
+
+    attention-mask: func(
+        pass: borrow<forward-pass>,
+        mask: list<list<u32>>,
+    );
+
+    kv-cache: func(
+        pass: borrow<forward-pass>,
+        kv-page-ptrs: list<pointer>,
+        last-kv-page-len: u32,
+    );
+
+
     input-embeddings: func(
         pass: borrow<forward-pass>,
         emb-ptrs: list<pointer>,
@@ -45,45 +58,44 @@ interface forward {
     output-distributions: func(
         pass: borrow<forward-pass>,
         indices: list<u32>,
+        temperature: f32,
+        top-k: option<u32>,
     );
-
 
     output-tokens: func(
         pass: borrow<forward-pass>,
         indices: list<u32>,
-        samplers: list<u32>
-    );
-
-
-    attention-mask: func(
-        pass: borrow<forward-pass>,
-        mask: list<list<u32>>,
-    );
-
-    kv-cache: func(
-        pass: borrow<forward-pass>,
-        kv-page-ptrs: list<pointer>,
-        last-kv-page-len: u32,
-    );
-
-    sampler-temperature: func(
-        pass: borrow<forward-pass>,
         temperature: f32,
     );
 
-    sampler-top-k: func(
+    output-tokens-top-k: func(
         pass: borrow<forward-pass>,
-        top-k: u32,
+        indices: list<u32>,
+        temperature: f32,
+        top-k: u32
     );
 
-    sampler-top-p: func(
+    output-tokens-top-p: func(
         pass: borrow<forward-pass>,
+        indices: list<u32>,
+        temperature: f32,
         top-p: f32,
     );
 
-    sampler-min-p: func(
+    output-tokens-min-p: func(
         pass: borrow<forward-pass>,
+        indices: list<u32>,
+        temperature: f32,
         min-p: f32,
     );
+
+    output-tokens-top-k-top-p: func(
+        pass: borrow<forward-pass>,
+        indices: list<u32>,
+        temperature: f32,
+        top-k: u32,
+        top-p: f32
+    );
+
 
 }

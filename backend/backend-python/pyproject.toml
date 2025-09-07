@@ -3,16 +3,16 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pie-torch-backend"
+name = "pie-backend"
 version = "0.1.0"
 description = "Your project description"
-authors = [{ name="In Gim", email="in.gim@yale.edu" }]
+authors = [{ name = "In Gim", email = "in.gim@yale.edu" }]
 license = "MIT"
 requires-python = ">=3.12"
 
 dependencies = [
     "fire>=0.6",
-    "flashinfer-python==0.2.7.post1",
+    "flashinfer-python>=0.3.1",
     "msgpack>=0.5",
     "platformdirs>=4.3",
     "protobuf>=6.31",
@@ -31,3 +31,8 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["config*", "legacy*"]
+
+[tool.uv.workspace]
+members = [
+    "pie-backend",
+]

@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import time
-
 import torch
 from torch import nn
 
 import flashinfer as ops
-from flashinfer import SegmentGEMMWrapper
+from ..adapter import AdapterSubpass
 
-from config import L4maConfig
-from adapter import Adapter, AdapterBuffer
+from ..config.l4ma import L4maArch
 
 VERSION = "0.1.0"
 
@@ -58,7 +55,7 @@ def create_fusion_map(model: nn.Module):
 class L4maMlp(nn.Module):
     """TODO: Add class docstring."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: L4maArch):
         """TODO: Add method docstring."""
         super().__init__()
         self.config = config
@@ -92,7 +89,7 @@ class L4maMlp(nn.Module):
 class L4maAttention(nn.Module):
     """TODO: Add class docstring."""
 
-    def __init__(self, config: L4maConfig, layer_idx: int):
+    def __init__(self, config: L4maArch, layer_idx: int):
         """TODO: Add method docstring."""
         super().__init__()
         self.config = config
@@ -121,7 +118,6 @@ class L4maAttention(nn.Module):
 
     def forward(
             self,
-            adapter_buffer: AdapterBuffer | None,
             wrapper,
             hidden_states: torch.Tensor,
             position_ids: torch.Tensor,
@@ -131,24 +127,26 @@ class L4maAttention(nn.Module):
             kv_last_page_lens: torch.Tensor,
             batch_indices: torch.Tensor,
             batch_positions: torch.Tensor,
+            adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """TODO: Add method docstring."""
 
         n, _ = hidden_states.size()
+
         qkv_states = self.qkv_proj(hidden_states)
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
         )
 
         # apply adapters if provided
-        if adapter_buffer is not None:
-            delta = adapter_buffer.compute_lora_delta(self.layer_idx, hidden_states)
-            q_delta = delta[0]
-            k_delta = delta[1]
-            v_delta = delta[2]
-            query_states.add_(q_delta)
-            key_states.add_(k_delta)
-            value_states.add_(v_delta)
+        if adapter_subpass is not None:
+            adapter_subpass.execute(
+                self.layer_idx,
+                hidden_states,
+                q_state=query_states,
+                k_state=key_states,
+                v_state=value_states
+            )
 
         # Reshape and continue as before
         query_states = query_states.view(
@@ -165,6 +163,11 @@ class L4maAttention(nn.Module):
         ops.apply_llama31_rope_pos_ids_inplace(
             q=query_states, k=key_states, pos_ids=position_ids
         )
+
+        # Ensure query_states matches the configured dtype for FlashInfer plan
+        if query_states.dtype != self.config.dtype:
+            print('warn: query dtype does not match config dtype!')
+            query_states = query_states.to(self.config.dtype)
 
         ops.append_paged_kv_cache(
             append_key=key_states,
@@ -189,7 +192,7 @@ class L4maAttention(nn.Module):
 class L4maDecoderLayer(nn.Module):
     """TODO: Add class docstring."""
 
-    def __init__(self, config: L4maConfig, layer_idx: int):
+    def __init__(self, config: L4maArch, layer_idx: int):
         """TODO: Add method docstring."""
         super().__init__()
 
@@ -211,7 +214,6 @@ class L4maDecoderLayer(nn.Module):
 
     def forward(
             self,
-            adapter_buffer: AdapterBuffer | None,
             wrapper,
             hidden_states: torch.Tensor,
             position_ids: torch.Tensor,
@@ -221,6 +223,7 @@ class L4maDecoderLayer(nn.Module):
             kv_last_page_lens: torch.Tensor,
             batch_indices: torch.Tensor,
             batch_positions: torch.Tensor,
+            adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """TODO: Add method docstring."""
         residual = hidden_states
@@ -229,7 +232,6 @@ class L4maDecoderLayer(nn.Module):
 
         # Self Attention
         hidden_states = self.self_attn(
-            adapter_buffer=adapter_buffer,
             wrapper=wrapper,
             hidden_states=hidden_states,
             position_ids=position_ids,
@@ -239,6 +241,7 @@ class L4maDecoderLayer(nn.Module):
             kv_last_page_lens=kv_last_page_lens,
             batch_indices=batch_indices,
             batch_positions=batch_positions,
+            adapter_subpass=adapter_subpass,
         )
 
         hidden_states = residual + hidden_states
@@ -257,7 +260,7 @@ class L4maDecoderLayer(nn.Module):
 class L4maModel(nn.Module):
     """TODO: Add class docstring."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: L4maArch):
         """TODO: Add method docstring."""
         super().__init__()
         self.config = config
@@ -282,7 +285,6 @@ class L4maModel(nn.Module):
             dtype=config.dtype,
         )
 
-        # 128 MB workspace buffer for ops
         self.workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=config.device
         )
@@ -292,26 +294,26 @@ class L4maModel(nn.Module):
         self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
         )
-        self.wrapper_segment_gemm = ops.SegmentGEMMWrapper(
-            self.workspace_buffer
-        )
 
-    @torch.inference_mode()
     def forward(
             self,
-            adapter_at_layer: list[torch.Tensor],
-            adapter_indices: list[int],
-            adapter_rand_seeds: list[int],
-            adapter_indptr: list[int],
+            # input
             input_embeds: torch.Tensor,
             position_ids: torch.Tensor,
+            qo_indptr: torch.Tensor,
+
+            # kv cache
             kv_cache_at_layer: list[torch.Tensor],
             kv_page_indices: torch.Tensor,
             kv_page_indptr: torch.Tensor,
             kv_last_page_lens: torch.Tensor,
-            qo_indptr: torch.Tensor,
+
+            # mask
             custom_mask: torch.Tensor,
-            single_token_inference_mode: bool = False,
+            single_token_inference_mode: bool,
+
+            # subpasses
+            adapter_subpass: AdapterSubpass | None
     ) -> torch.Tensor:
         """TODO: Add method docstring."""
         hidden_states = input_embeds
@@ -324,17 +326,6 @@ class L4maModel(nn.Module):
             seq_lens=ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size),
             nnz=n,
         )
-
-        # concat all weights for segment gemm.
-        # we assume requests are sorted such that initial n requests are the ones with adapters
-        if adapter is not None:
-
-            adapter_buffer = AdapterBuffer(
-                adapter=adapter,
-                seeds=seeds,
-            )
-        else:
-            adapter_buffer = None
 
         # check if its decoding (qo_indptr is )
         if single_token_inference_mode:
@@ -367,7 +358,6 @@ class L4maModel(nn.Module):
 
         for decoder_layer in self.layers:
             layer_outputs = decoder_layer(
-                adapter_buffer=adapter_buffer,
                 wrapper=wrapper,
                 hidden_states=hidden_states,
                 position_ids=position_ids,
@@ -377,6 +367,7 @@ class L4maModel(nn.Module):
                 kv_last_page_lens=kv_last_page_lens,
                 batch_indices=batch_indices,
                 batch_positions=batch_positions,
+                adapter_subpass=adapter_subpass,
             )
 
             hidden_states = layer_outputs
@@ -389,7 +380,7 @@ class L4maModel(nn.Module):
 class L4maForCausalLM(nn.Module):
     """TODO: Add class docstring."""
 
-    def __init__(self, config: L4maConfig):
+    def __init__(self, config: L4maArch):
         """TODO: Add method docstring."""
         super().__init__()
         self.config = config

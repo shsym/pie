@@ -1,6 +1,7 @@
+use crate::handler::Handler;
 use crate::handler::core::Queue;
-use crate::handler::{EmbedImageRequest, Handler};
 use crate::instance::InstanceState;
+use crate::model::EmbedImageRequest;
 use crate::resource::ResourceId;
 use crate::{bindings, model, resource};
 use bytes::Bytes;

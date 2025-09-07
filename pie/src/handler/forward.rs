@@ -1,9 +1,12 @@
+use crate::handler::Handler;
 use crate::handler::core::Queue;
-use crate::handler::{ForwardPassRequest, ForwardPassResponse, Handler};
 use crate::instance::InstanceState;
+use crate::model::{ForwardPassRequest, ForwardPassResponse};
 use crate::resource::ResourceId;
 use crate::{bindings, model, resource};
 use bytes::Bytes;
+use std::collections::HashMap;
+use std::iter;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -24,14 +27,9 @@ pub struct ForwardPass {
     kv_page_ptrs: Vec<u32>,
     kv_page_last_len: u32,
     output_token_indices: Vec<u32>,
-    output_token_samplers: Vec<u32>,
-    output_dist_indices: Vec<u32>,
+    output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     output_embed_ptrs: Vec<u32>,
     output_embed_indices: Vec<u32>,
-    sampler_temperature: f32,
-    sampler_top_k: u32,
-    sampler_top_p: f32,
-    sampler_min_p: f32,
 }
 
 #[derive(Debug)]
@@ -40,6 +38,15 @@ pub struct ForwardPassResult {
     pub distributions: Vec<(Vec<u32>, Vec<f32>)>,
     pub tokens: Vec<u32>,
     pub done: bool,
+}
+
+enum Sampler {
+    Distribution = 0,
+    Multinomial = 1,
+    TopP = 2,
+    TopK = 3,
+    MinP = 4,
+    TopKTopP = 5,
 }
 
 #[async_trait]
@@ -80,13 +87,8 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
             kv_page_last_len: 0,
             output_token_indices: vec![],
             output_token_samplers: vec![],
-            output_dist_indices: vec![],
             output_embed_ptrs: vec![],
             output_embed_indices: vec![],
-            sampler_temperature: 0.60,
-            sampler_top_k: 50,
-            sampler_top_p: 0.9,
-            sampler_min_p: 0.2,
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -112,8 +114,8 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         })?;
 
         let pass = self.ctx().table.get_mut(&pass)?;
-        pass.input_embed_ptrs = emb_ptrs;
-        pass.input_embed_positions = positions;
+        pass.input_embed_ptrs.extend(emb_ptrs);
+        pass.input_embed_positions.extend(positions);
         Ok(())
     }
 
@@ -124,8 +126,8 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         positions: Vec<u32>,
     ) -> anyhow::Result<()> {
         let pass = self.ctx().table.get_mut(&pass)?;
-        pass.input_tokens = input_tokens;
-        pass.input_token_positions = positions;
+        pass.input_tokens.extend(input_tokens);
+        pass.input_token_positions.extend(positions);
         Ok(())
     }
 
@@ -149,8 +151,8 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         })?;
 
         let pass = self.ctx().table.get_mut(&pass)?;
-        pass.output_embed_ptrs = emb_ptrs;
-        pass.output_embed_indices = indices;
+        pass.output_embed_ptrs.extend(emb_ptrs);
+        pass.output_embed_indices.extend(indices);
         Ok(())
     }
 
@@ -158,9 +160,21 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         &mut self,
         pass: Resource<ForwardPass>,
         indices: Vec<u32>,
+        temperature: f32,
+        top_k: Option<u32>,
     ) -> anyhow::Result<()> {
+        let mut sampler = HashMap::new();
+        sampler.insert(
+            "sampler".to_string(),
+            rmpv::Value::from(Sampler::Distribution as u32),
+        );
+        sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
+        sampler.insert("top_k".to_string(), rmpv::Value::from(top_k.unwrap_or(32)));
+
         let pass = self.ctx().table.get_mut(&pass)?;
-        pass.output_dist_indices = indices;
+        pass.output_token_samplers
+            .extend(iter::repeat(sampler.clone()).take(indices.len()));
+        pass.output_token_indices.extend(indices);
         Ok(())
     }
 
@@ -168,11 +182,121 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         &mut self,
         pass: Resource<ForwardPass>,
         indices: Vec<u32>,
-        samplers: Vec<u32>,
+        temperature: f32,
     ) -> anyhow::Result<()> {
+        let mut sampler = HashMap::new();
+
+        sampler.insert(
+            "sampler".to_string(),
+            rmpv::Value::from(Sampler::Multinomial as u32),
+        );
+        sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
+
+        let samplers = iter::repeat(sampler.clone())
+            .take(indices.len())
+            .collect::<Vec<_>>();
+
         let pass = self.ctx().table.get_mut(&pass)?;
-        pass.output_token_indices = indices;
-        pass.output_token_samplers = samplers;
+        pass.output_token_indices.extend(indices);
+        pass.output_token_samplers.extend(samplers);
+        Ok(())
+    }
+
+    async fn output_tokens_top_p(
+        &mut self,
+        pass: Resource<ForwardPass>,
+        indices: Vec<u32>,
+        temperature: f32,
+        top_p: f32,
+    ) -> anyhow::Result<()> {
+        let mut sampler = HashMap::new();
+
+        sampler.insert(
+            "sampler".to_string(),
+            rmpv::Value::from(Sampler::TopP as u32),
+        );
+        sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
+        sampler.insert("top_p".to_string(), rmpv::Value::from(top_p));
+
+        let pass = self.ctx().table.get_mut(&pass)?;
+        pass.output_token_samplers
+            .extend(iter::repeat(sampler.clone()).take(indices.len()));
+        pass.output_token_indices.extend(indices);
+
+        Ok(())
+    }
+
+    async fn output_tokens_top_k(
+        &mut self,
+        pass: Resource<ForwardPass>,
+        indices: Vec<u32>,
+        temperature: f32,
+        top_k: u32,
+    ) -> anyhow::Result<()> {
+        let mut sampler = HashMap::new();
+
+        sampler.insert(
+            "sampler".to_string(),
+            rmpv::Value::from(Sampler::TopK as u32),
+        );
+        sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
+        sampler.insert("top_k".to_string(), rmpv::Value::from(top_k));
+
+        let pass = self.ctx().table.get_mut(&pass)?;
+        pass.output_token_samplers
+            .extend(iter::repeat(sampler.clone()).take(indices.len()));
+        pass.output_token_indices.extend(indices);
+
+        Ok(())
+    }
+
+    async fn output_tokens_min_p(
+        &mut self,
+        pass: Resource<ForwardPass>,
+        indices: Vec<u32>,
+        temperature: f32,
+        min_p: f32,
+    ) -> anyhow::Result<()> {
+        let mut sampler = HashMap::new();
+
+        sampler.insert(
+            "sampler".to_string(),
+            rmpv::Value::from(Sampler::MinP as u32),
+        );
+        sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
+        sampler.insert("min_p".to_string(), rmpv::Value::from(min_p));
+
+        let pass = self.ctx().table.get_mut(&pass)?;
+        pass.output_token_samplers
+            .extend(iter::repeat(sampler.clone()).take(indices.len()));
+        pass.output_token_indices.extend(indices);
+
+        Ok(())
+    }
+
+    async fn output_tokens_top_k_top_p(
+        &mut self,
+        pass: Resource<ForwardPass>,
+        indices: Vec<u32>,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+    ) -> anyhow::Result<()> {
+        let mut sampler = HashMap::new();
+
+        sampler.insert(
+            "sampler".to_string(),
+            rmpv::Value::from(Sampler::TopKTopP as u32),
+        );
+        sampler.insert("temperature".to_string(), rmpv::Value::from(temperature));
+        sampler.insert("top_k".to_string(), rmpv::Value::from(top_k));
+        sampler.insert("top_p".to_string(), rmpv::Value::from(top_p));
+
+        let pass = self.ctx().table.get_mut(&pass)?;
+        pass.output_token_samplers
+            .extend(iter::repeat(sampler.clone()).take(indices.len()));
+        pass.output_token_indices.extend(indices);
+
         Ok(())
     }
 
@@ -211,47 +335,6 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         pass.kv_page_last_len = kv_page_last_len;
         Ok(())
     }
-
-    async fn sampler_temperature(
-        &mut self,
-        pass: Resource<ForwardPass>,
-        temperature: f32,
-    ) -> anyhow::Result<()> {
-        let pass = self.ctx().table.get_mut(&pass)?;
-        pass.sampler_temperature = temperature;
-
-        Ok(())
-    }
-
-    async fn sampler_top_k(
-        &mut self,
-        pass: Resource<ForwardPass>,
-        top_k: u32,
-    ) -> anyhow::Result<()> {
-        let pass = self.ctx().table.get_mut(&pass)?;
-        pass.sampler_top_k = top_k;
-        Ok(())
-    }
-
-    async fn sampler_top_p(
-        &mut self,
-        pass: Resource<ForwardPass>,
-        top_p: f32,
-    ) -> anyhow::Result<()> {
-        let pass = self.ctx().table.get_mut(&pass)?;
-        pass.sampler_top_p = top_p;
-        Ok(())
-    }
-
-    async fn sampler_min_p(
-        &mut self,
-        pass: Resource<ForwardPass>,
-        min_p: f32,
-    ) -> anyhow::Result<()> {
-        let pass = self.ctx().table.get_mut(&pass)?;
-        pass.sampler_min_p = min_p;
-        Ok(())
-    }
 }
 
 impl bindings::pie::inferlet::forward::HostForwardPass for InstanceState {
@@ -262,7 +345,7 @@ impl bindings::pie::inferlet::forward::HostForwardPass for InstanceState {
         // 1) Check whether we need output (immutable borrow)
         let returns_output = {
             let pass = self.ctx().table.get(&this)?;
-            !pass.output_dist_indices.is_empty() || !pass.output_token_indices.is_empty()
+            !pass.output_token_indices.is_empty()
         };
 
         // 2) Build the request by MOVING data out of the pass (mutable borrow)
@@ -285,13 +368,8 @@ impl bindings::pie::inferlet::forward::HostForwardPass for InstanceState {
                 kv_page_last_len: pass.kv_page_last_len,
                 output_token_indices: take(&mut pass.output_token_indices),
                 output_token_samplers: take(&mut pass.output_token_samplers),
-                output_dist_indices: take(&mut pass.output_dist_indices),
                 output_embed_ptrs: take(&mut pass.output_embed_ptrs),
                 output_embed_indices: take(&mut pass.output_embed_indices),
-                sampler_temperature: pass.sampler_temperature,
-                sampler_top_k: pass.sampler_top_k,
-                sampler_top_p: pass.sampler_top_p,
-                sampler_min_p: pass.sampler_min_p,
             };
 
             (request, service_id, stream_id)

@@ -6,9 +6,9 @@ import torch
 from torch import nn
 
 import flashinfer as ops
-from adapter import AdapterSubpass
+from ..adapter import AdapterSubpass
 
-from config.qwen3 import Qwen3Arch
+from ..config.qwen3 import Qwen3Arch
 
 VERSION = "0.1.0"
 

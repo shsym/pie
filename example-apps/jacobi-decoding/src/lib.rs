@@ -1,6 +1,6 @@
 use inferlet::sampler::{self, Sampler};
 use inferlet::stop_condition::{self, StopCondition};
-use inferlet::traits::{Forward,  Tokenize};
+use inferlet::traits::{Forward, Tokenize};
 
 use inferlet::Context;
 use inferlet::brle::Brle;
@@ -52,7 +52,7 @@ pub async fn generate_with_pjd<S: Sampler, C: StopCondition>(
         p.kv_cache(&ctx.kv_pages, ctx.kv_page_last_len);
         p.input_tokens(&batch_tokens, &batch_positions);
         p.attention_mask(&masks_for_batch);
-        p.output_distributions(&sample_indices);
+        p.output_distributions(&sample_indices, 1.0, None);
 
         let output_distributions = p.execute().await.distributions.unwrap();
 

@@ -100,23 +100,80 @@ pub async fn runtime_stats() -> HashMap<String, String> {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HandshakeRequest {
-    version: String,
+    pub version: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HandshakeResponse {
-    version: String,
-    model_name: String,
-    model_traits: Vec<String>,
-    model_description: String,
-    prompt_template: String,
-    prompt_template_type: String,
-    kv_page_size: u32,
-    resources: Vec<(u32, u32)>,
-    tokenizer_merge_table: Vec<(u32, Vec<u8>)>,
-    tokenizer_special_tokens: Vec<(String, u32)>,
-    tokenizer_split_regex: String,
-    tokenizer_escape_non_printable: bool,
+    pub version: String,
+    pub model_name: String,
+    pub model_traits: Vec<String>,
+    pub model_description: String,
+    pub prompt_template: String,
+    pub prompt_template_type: String,
+    pub kv_page_size: u32,
+    pub resources: Vec<(u32, u32)>,
+    pub tokenizer_merge_table: Vec<(u32, Vec<u8>)>,
+    pub tokenizer_special_tokens: Vec<(String, u32)>,
+    pub tokenizer_split_regex: String,
+    pub tokenizer_escape_non_printable: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueryRequest {
+    pub query: String,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueryResponse {
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForwardPassRequest {
+    pub input_tokens: Vec<u32>,
+    pub input_token_positions: Vec<u32>,
+    pub input_embed_ptrs: Vec<u32>,
+    pub input_embed_positions: Vec<u32>,
+    pub adapter: Option<u32>,
+    pub adapter_seed: Option<i64>,
+    pub mask: Vec<Vec<u32>>,
+    pub kv_page_ptrs: Vec<u32>,
+    pub kv_page_last_len: u32,
+    pub output_token_indices: Vec<u32>,
+    pub output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
+    pub output_embed_ptrs: Vec<u32>,
+    pub output_embed_indices: Vec<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForwardPassResponse {
+    pub tokens: Vec<u32>,
+    pub dists: Vec<(Vec<u32>, Vec<f32>)>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EmbedImageRequest {
+    pub embed_ptrs: Vec<u32>,
+    pub image_blob: Vec<u8>,
+    pub position_offset: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InitializeAdapterRequest {
+    pub adapter_ptr: u32,
+    pub rank: u32,
+    pub alpha: f32,
+    pub population_size: u32,
+    pub mu_fraction: f32,
+    pub initial_sigma: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateAdapterRequest {
+    pub adapter_ptr: u32,
+    pub scores: Vec<f32>,
+    pub seeds: Vec<i64>,
+    pub max_sigma: f32,
 }
 
 /// Defines the set of operations available for the key-value store.

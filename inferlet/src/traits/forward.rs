@@ -1,6 +1,6 @@
 use crate::brle::Brle;
-use crate::{Queue, Resource, store_get};
-use crate::{forward, store_set};
+use crate::forward;
+use crate::{Queue, Resource};
 use std::rc::Rc;
 use wstd::io::AsyncPollable;
 
@@ -22,14 +22,6 @@ pub struct Distribution {
     pub ids: Vec<u32>,
     /// A vector of probabilities corresponding to the token IDs.
     pub probs: Vec<f32>,
-}
-
-pub enum Sampler {
-    Multinomial = 0,
-    TopP = 1,
-    TopK = 2,
-    MinP = 3,
-    TopKTopP = 4,
 }
 
 // "Smart" kv page
@@ -144,11 +136,11 @@ impl Forward for Queue {
     }
 
     fn export_kv_page_ptrs(&self, ptrs: &[u32], name: &str) {
-        todo!()
+        self.export_resource(Resource::KvPage, ptrs, name)
     }
 
     fn import_kv_page_ptrs(&self, name: &str) -> Vec<u32> {
-        todo!()
+        self.import_resource(Resource::KvPage, name)
     }
 
     fn get_all_exported_kv_pages(&self) -> Vec<(String, u32)> {
@@ -239,15 +231,37 @@ impl ForwardPass {
         forward::output_embeddings(&self.inner, embed_ptrs, indices);
     }
 
-    pub fn output_distributions(&self, indices: &[u32]) {
-        forward::output_distributions(&self.inner, indices);
+    pub fn output_distributions(&self, indices: &[u32], temperature: f32, top_k: Option<u32>) {
+        forward::output_distributions(&self.inner, indices, temperature, top_k);
     }
 
-    pub fn output_tokens(&self, indices: &[u32], samplers: &[u32]) {
-        forward::output_tokens(&self.inner, indices, samplers);
+    pub fn output_tokens(&self, indices: &[u32], temperature: f32) {
+        forward::output_tokens(&self.inner, indices, temperature);
     }
 
-    pub fn attention_mask(&self, mask: &Vec<Vec<u32>>) {
+    pub fn output_tokens_top_p(&self, indices: &[u32], temperature: f32, top_p: f32) {
+        forward::output_tokens_top_p(&self.inner, indices, temperature, top_p);
+    }
+
+    pub fn output_tokens_top_k(&self, indices: &[u32], temperature: f32, top_k: u32) {
+        forward::output_tokens_top_k(&self.inner, indices, temperature, top_k);
+    }
+
+    pub fn output_tokens_min_p(&self, indices: &[u32], temperature: f32, min_p: f32) {
+        forward::output_tokens_min_p(&self.inner, indices, temperature, min_p);
+    }
+
+    pub fn output_tokens_top_k_top_p(
+        &self,
+        indices: &[u32],
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+    ) {
+        forward::output_tokens_top_k_top_p(&self.inner, indices, temperature, top_k, top_p);
+    }
+
+    pub fn attention_mask(&self, mask: &[Vec<u32>]) {
         forward::attention_mask(&self.inner, mask);
     }
 
@@ -258,21 +272,5 @@ impl ForwardPass {
 
     pub fn kv_cache_ptrs(&self, kv_page_ptrs: &[u32], last_kv_page_len: usize) {
         forward::kv_cache(&self.inner, kv_page_ptrs, last_kv_page_len as u32);
-    }
-
-    pub fn sampler_temperature(&self, temperature: f32) {
-        forward::sampler_temperature(&self.inner, temperature);
-    }
-
-    pub fn sampler_top_p(&self, top_p: f32) {
-        forward::sampler_top_p(&self.inner, top_p);
-    }
-
-    pub fn sampler_top_k(&self, top_k: u32) {
-        forward::sampler_top_k(&self.inner, top_k);
-    }
-
-    pub fn sampler_min_p(&self, min_p: f32) {
-        forward::sampler_min_p(&self.inner, min_p);
     }
 }

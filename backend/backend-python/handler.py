@@ -232,6 +232,9 @@ def _decode_brle(brle_buffer: list[int]) -> np.ndarray:
 class ForwardPassBatch:
     """Consolidates and processes a batch of forward pass requests."""
 
+    # Static constant for the maximum top_k value for distributions.
+    TOP_K_MAX_BOUND = 1024
+
     def __init__(self, handler: Handler):
         """Initializes the batch processor."""
         self._handler = handler
@@ -253,19 +256,14 @@ class ForwardPassBatch:
         self.single_token_inference_mode: bool = True
         self.adapter_subpass_needed: bool = False
 
-        # Output mapping
+        # Output mapping for all logit-based operations (dists and sampling)
         self.indices_for_logits: list[int] = []
-        self.subindices_for_dists: list[int] = []
-        self.subindices_for_sampling: list[int] = []
         self.indices_for_embed_storage: list[int] = []
         self.embed_storage_pointers: list[int] = []
 
-        # Attributes for multiple samplers
+        # Sampler type and consolidated parameters
         self.sampler_type: list[int] = []
-        self.sampler_top_k: list[int] = []
-        self.sampler_top_p: list[float] = []
-        self.sampler_min_p: list[float] = []
-        self.sampler_temperature: list[float] = []
+        self.sampler_params: list[dict] = []
 
     def add_request(self, req: message.ForwardPassRequest):
         """Processes and adds a single request to the batch."""
@@ -288,25 +286,26 @@ class ForwardPassBatch:
             self.indices_for_embed_storage.append(token_idx + self.total_tokens_in_batch)
             self.embed_storage_pointers.append(storage_ptr)
 
-        # Handle output mappings for tokens requiring logits (for distributions or sampling)
-        output_indices_set = set(req.output_dist_indices) | set(req.output_token_indices)
-        sorted_output_indices = sorted(list(output_indices_set))
-
-        logit_tensor_offset = len(self.indices_for_logits)
-        for token_idx in req.output_dist_indices:
-            self.subindices_for_dists.append(sorted_output_indices.index(token_idx) + logit_tensor_offset)
-
-        # Iterate through token and sampler indices, storing sampler type and parameters.
-        for token_idx, sampler_idx in zip(req.output_token_indices, req.output_token_samplers):
-            self.subindices_for_sampling.append(sorted_output_indices.index(token_idx) + logit_tensor_offset)
-            self.sampler_type.append(sampler_idx)
-            self.sampler_top_k.append(req.sampler_top_k)
-            self.sampler_top_p.append(req.sampler_top_p)
-            self.sampler_min_p.append(req.sampler_min_p)
-            self.sampler_temperature.append(req.sampler_temperature)
-
-        for token_idx in sorted_output_indices:
+        # Handle output mappings for tokens requiring logits.
+        for token_idx in req.output_token_indices:
             self.indices_for_logits.append(token_idx + self.total_tokens_in_batch)
+
+        # Extract sampler configurations.
+        # sampler_idx=0 is for distributions, existing samplers are shifted by +1.
+        for sampler_config in req.output_token_samplers:
+            params = {}
+            sampler_idx = sampler_config["sampler"]
+            self.sampler_type.append(sampler_idx)
+
+            if sampler_idx == 0:
+                params["top_k"] = min(sampler_config.get("top_k", self.TOP_K_MAX_BOUND), self.TOP_K_MAX_BOUND)
+            else:
+                params["top_k"] = sampler_config.get("top_k", 0)
+                params["top_p"] = sampler_config.get("top_p", 1.0)
+                params["min_p"] = sampler_config.get("min_p", 0.0)
+
+            params["temperature"] = sampler_config.get("temperature", 1.0)
+            self.sampler_params.append(params)
 
         # Handle input tokens and positions
         self.batch_token_ids.extend(req.input_tokens)
@@ -386,89 +385,92 @@ class ForwardPassBatch:
         if not self.indices_for_logits:
             return [message.ForwardPassResponse(dists=[], tokens=[]) for _ in self._original_reqs]
 
-        # Calculate logits only for the required tokens
+        # Calculate logits for all required tokens (both dists and samples)
         logits = self._handler.lm.lm_head(output_embeds[self.indices_for_logits])
 
-        # Get top-k distributions from unscaled logits
-        topk_token_ids, topk_probabilities = [], []
-        if self.subindices_for_dists:
-            probs_for_dists = torch.softmax(logits[self.subindices_for_dists], dim=-1)
-            topk_results = torch.topk(probs_for_dists, k=self._handler.dist_size, sorted=True)
-            topk_token_ids = topk_results.indices.tolist()
-            topk_probabilities = topk_results.values.tolist()
+        # Apply temperature scaling to all logits
+        temperatures = torch.tensor(
+            [p['temperature'] for p in self.sampler_params],
+            device=self._handler.device,
+            dtype=self._handler.dtype
+        ).unsqueeze(1)
+        scaled_logits = logits / torch.clamp(temperatures, min=1e-6)
 
-        # Sample tokens from temperature-scaled logits
-        sampled_token_ids = []
-        if self.subindices_for_sampling:
-            logits_for_sampling = logits[self.subindices_for_sampling]
+        # We compute probabilities for the entire batch of logit requests
+        probs = torch.softmax(scaled_logits, dim=-1)
 
-            # Apply temperature scaling
-            temperatures = torch.tensor(
-                self.sampler_temperature,
-                device=self._handler.device,
-                dtype=self._handler.dtype
-            ).unsqueeze(1)
-            # Clamp temperature to avoid division by zero
-            scaled_logits = logits_for_sampling / torch.clamp(temperatures, min=1e-6)
+        # Group requests by sampler type for efficient batch processing
+        sampler_groups = {}
+        for i, sampler_idx in enumerate(self.sampler_type):
+            if sampler_idx not in sampler_groups:
+                sampler_groups[sampler_idx] = []
+            sampler_groups[sampler_idx].append(i)
 
-            probs_for_sampling = torch.softmax(scaled_logits, dim=-1)
+        num_logit_requests = len(self.indices_for_logits)
+        # Initialize result containers. Using lists of Nones helps place results correctly.
+        final_dists = [None] * num_logit_requests
+        final_tokens_tensor = torch.empty(num_logit_requests, dtype=torch.long, device=self._handler.device)
 
-            num_samples = len(self.subindices_for_sampling)
-            sampled_tokens_tensor = torch.empty(num_samples, dtype=torch.long, device=self._handler.device)
+        for sampler_idx, indices in sampler_groups.items():
+            if not indices:
+                continue
 
-            # Group requests by sampler type for efficient batch processing
-            sampler_groups = {}
-            for i, sampler_idx in enumerate(self.sampler_type):
-                if sampler_idx not in sampler_groups:
-                    sampler_groups[sampler_idx] = []
-                sampler_groups[sampler_idx].append(i)
+            indices_tensor = torch.tensor(indices, device=self._handler.device, dtype=torch.long)
+            group_probs = probs.index_select(0, indices_tensor)
 
-            # Process each group of samplers
-            for sampler_idx, indices in sampler_groups.items():
-                if not indices:
-                    continue
+            # Handle distributions (sampler_idx=0)
+            if sampler_idx == 0:
+                group_top_k = [self.sampler_params[i]['top_k'] for i in indices]
+                max_k = max(group_top_k) if group_top_k else 0
+                if max_k > 0:
+                    topk_vals, topk_inds = torch.topk(group_probs, k=max_k, sorted=True)
+                    for i, original_idx in enumerate(indices):
+                        k = self.sampler_params[original_idx]['top_k']
+                        ids = topk_inds[i, :k].tolist()
+                        vals = topk_vals[i, :k].tolist()
+                        final_dists[original_idx] = list(zip(ids, vals))
 
-                indices_tensor = torch.tensor(indices, device=self._handler.device, dtype=torch.long)
-                group_probs = probs_for_sampling.index_select(0, indices_tensor)
+            # Handle sampling operations (sampler_idx > 0)
+            else:
                 sampled = None
-
-                if sampler_idx == 0:  # sampling_from_probs
+                if sampler_idx == 1:  # Old 0: sampling_from_probs
                     sampled = ops.sampling.sampling_from_probs(group_probs)
-                elif sampler_idx == 1:  # top_p_sampling_from_probs
-                    top_p_vals = torch.tensor([self.sampler_top_p[i] for i in indices], device=self._handler.device, dtype=self._handler.dtype)
+                elif sampler_idx == 2:  # Old 1: top_p_sampling_from_probs
+                    top_p_vals = torch.tensor([self.sampler_params[i]['top_p'] for i in indices], device=self._handler.device, dtype=self._handler.dtype)
                     sampled = ops.sampling.top_p_sampling_from_probs(group_probs, top_p=top_p_vals)
-                elif sampler_idx == 2:  # top_k_sampling_from_probs
-                    top_k_vals = torch.tensor([self.sampler_top_k[i] for i in indices], device=self._handler.device, dtype=torch.long)
+                elif sampler_idx == 3:  # Old 2: top_k_sampling_from_probs
+                    top_k_vals = torch.tensor([self.sampler_params[i]['top_k'] for i in indices], device=self._handler.device, dtype=torch.long)
                     sampled = ops.sampling.top_k_sampling_from_probs(group_probs, top_k=top_k_vals)
-                elif sampler_idx == 3:  # min_p_sampling_from_probs
-                    min_p_vals = torch.tensor([self.sampler_min_p[i] for i in indices], device=self._handler.device, dtype=self._handler.dtype)
+                elif sampler_idx == 4:  # Old 3: min_p_sampling_from_probs
+                    min_p_vals = torch.tensor([self.sampler_params[i]['min_p'] for i in indices], device=self._handler.device, dtype=self._handler.dtype)
                     sampled = ops.sampling.min_p_sampling_from_probs(group_probs, min_p=min_p_vals)
-                elif sampler_idx == 4:  # top_k_top_p_sampling_from_probs
-                    top_k_vals = torch.tensor([self.sampler_top_k[i] for i in indices], device=self._handler.device, dtype=torch.long)
-                    top_p_vals = torch.tensor([self.sampler_top_p[i] for i in indices], device=self._handler.device, dtype=self._handler.dtype)
+                elif sampler_idx == 5:  # Old 4: top_k_top_p_sampling_from_probs
+                    top_k_vals = torch.tensor([self.sampler_params[i]['top_k'] for i in indices], device=self._handler.device, dtype=torch.long)
+                    top_p_vals = torch.tensor([self.sampler_params[i]['top_p'] for i in indices], device=self._handler.device, dtype=self._handler.dtype)
                     sampled = ops.sampling.top_k_top_p_sampling_from_probs(group_probs, top_k=top_k_vals, top_p=top_p_vals)
                 else:
                     raise ValueError(f"Unknown sampler index: {sampler_idx}")
 
-                # Place the sampled tokens back into the results tensor in the correct order
-                sampled_tokens_tensor.scatter_(0, indices_tensor, sampled)
-
-            sampled_token_ids = sampled_tokens_tensor.tolist()
+                # Place sampled tokens into the main tensor at their original batch positions
+                final_tokens_tensor.scatter_(0, indices_tensor, sampled)
 
         # Distribute batched results back to individual responses
         responses = []
-        dist_cursor, token_cursor = 0, 0
+        cursor = 0
         for req in self._original_reqs:
-            num_dists = len(req.output_dist_indices)
-            ids_slice = topk_token_ids[dist_cursor: dist_cursor + num_dists]
-            probs_slice = topk_probabilities[dist_cursor: dist_cursor + num_dists]
-            request_dists = list(zip(ids_slice, probs_slice))
-            dist_cursor += num_dists
+            num_outputs = len(req.output_token_indices)
+            request_dists = []
+            request_tokens = []
 
-            num_tokens = len(req.output_token_indices)
-            request_tokens = sampled_token_ids[token_cursor: token_cursor + num_tokens]
-            token_cursor += num_tokens
+            # Iterate through the slice of results belonging to this request
+            for i in range(cursor, cursor + num_outputs):
+                if self.sampler_type[i] == 0:  # This was a distribution request
+                    if final_dists[i] is not None:
+                        request_dists.append(final_dists[i])
+                else:  # This was a sampling request
+                    request_tokens.append(final_tokens_tensor[i].item())
 
             responses.append(message.ForwardPassResponse(dists=request_dists, tokens=request_tokens))
+            cursor += num_outputs
 
         return responses
