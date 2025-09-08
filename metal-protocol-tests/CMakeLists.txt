@@ -53,6 +53,7 @@ set(METAL_SOURCES
     ${REPO_ROOT}/backend/backend-metal/src/metal_add_residual.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_append_paged_kv_cache.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_common.mm
+    ${REPO_ROOT}/backend/backend-metal/src/metal_dtype_conversion.mm
 )
 
 add_executable(metal_protocol_tests ${METAL_SOURCES})
@@ -341,6 +342,47 @@ target_include_directories(test_forward_pass_metal_context PRIVATE
 set_target_properties(test_forward_pass_metal_context PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
 )
+
+# ============================================================================
+# Validation Tools Library (for testing infrastructure)
+# ============================================================================
+
+# Create a validation tools library for shared utilities
+set(VALIDATION_TOOLS_SOURCES
+    tests/src/tools/artifact_reader.mm
+    tests/src/tools/tensor_comparator.mm
+    tests/src/tools/dtype_validator.mm
+    tests/src/tools/validation_reporter.mm
+    ${BACKEND_SRC_PATH}/metal_common.mm
+    ${BACKEND_SRC_PATH}/metal_dtype_conversion.mm
+)
+
+add_library(validation_tools STATIC ${VALIDATION_TOOLS_SOURCES})
+target_link_libraries(validation_tools ${COMMON_LIBRARIES_ORGANIZED} ${BACKEND_LIBS})
+target_compile_definitions(validation_tools PRIVATE ${NLOHMANN_JSON_CFLAGS_OTHER})
+target_include_directories(validation_tools PUBLIC
+    tests/src/tools
+    ${REPO_ROOT}
+    ${BACKEND_SRC_PATH}
+)
+
+# Forward pass validation integration test (using validation tools)
+add_executable(test_forward_pass_validation
+    tests/src/integration/test_forward_pass_validation.mm
+)
+target_link_libraries(test_forward_pass_validation validation_tools ${COMMON_LIBRARIES_ORGANIZED})
+target_compile_definitions(test_forward_pass_validation PRIVATE ${NLOHMANN_JSON_CFLAGS_OTHER})
+target_include_directories(test_forward_pass_validation PRIVATE
+    tests/src/tools
+    ${REPO_ROOT}
+)
+set_target_properties(test_forward_pass_validation PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
+)
+
+# ============================================================================
+# Debug Utilities
+# ============================================================================
 
 # Tokenization utility for getting conversational token IDs
 add_executable(tokenize_conversational
