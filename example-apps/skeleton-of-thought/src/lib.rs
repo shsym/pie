@@ -41,7 +41,7 @@ async fn plan_and_generate_parallel(
         plan_prompt, STOP_TOKEN
     ));
     plan_ctx.fill(ASSISTANT_PREFIX);
-    let output = plan_ctx.generate_until(STOP_TOKEN, plan_max_tokens).await;
+    let output = plan_ctx.generate_until(plan_max_tokens).await;
 
     // 2. --- Point Parsing ---
     // Robustly parse points from the output.
@@ -66,7 +66,7 @@ async fn plan_and_generate_parallel(
             let complete_prompt = format!("Elaborate on the following point: {}. Your response should be complete and only concerned with this point.", point);
             elab_ctx.fill(&format!("<|start_header_id|>user<|end_header_id|>\n\n{}{}", complete_prompt, STOP_TOKEN));
             elab_ctx.fill(ASSISTANT_PREFIX);
-            async move { elab_ctx.generate_until(STOP_TOKEN, elab_max_tokens).await }
+            async move { elab_ctx.generate_until(elab_max_tokens).await }
         })
         .collect::<Vec<_>>();
 

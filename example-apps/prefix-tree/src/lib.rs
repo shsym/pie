@@ -150,7 +150,7 @@ async fn main() -> Result<(), String> {
             ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
             // The async move block takes ownership of `ctx`, resolving the lifetime issue.
             // We then await the future returned by `generate_until`.
-            ctx.generate_until("<|eot_id|>", max_num_outputs_per_prompt)
+            ctx.generate_until(max_num_outputs_per_prompt)
                 .await
         })
         .collect();

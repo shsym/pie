@@ -86,7 +86,7 @@ pub async fn handle_chat_completion(req: Request<IncomingBody>, res: Responder) 
     println!("Generating response with max_tokens: {}", max_tokens);
 
     // Generate text until end token
-    let generated_text = ctx.generate_until("<|eot_id|>", max_tokens as usize).await;
+    let generated_text = ctx.generate_until(max_tokens as usize).await;
     let elapsed = start.elapsed();
 
     let token_ids = tokenizer.tokenize(&generated_text);

@@ -97,15 +97,8 @@ async fn main() -> Result<(), String> {
     // Set up the model and context
     let model = inferlet::get_auto_model();
     let mut ctx = model.create_context();
-
-    // Fill the context with the initial prompt structure
-    ctx.fill("<|begin_of_text|>");
-    ctx.fill(&format!(
-        "<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
-        CODEACT_PROMPT_TEMPLATE
-    ));
-    ctx.fill("<|start_header_id|>user<|end_header_id|>\n\nCalculate the sum of the first 10 prime numbers.<|eot_id|>");
-    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    ctx.fill_system(CODEACT_PROMPT_TEMPLATE);
+    ctx.fill_user("Calculate the sum of the first 10 prime numbers.");
 
     // --- Agentic Loop ---
     let num_code_turns = std::cmp::min(num_function_calls, HARDCODED_RESPONSES.len() - 1);
@@ -113,15 +106,10 @@ async fn main() -> Result<(), String> {
     for i in 0..num_code_turns {
         // 1. Call the real LLM to include its inference delay in the benchmark.
         //    The actual response is discarded to ensure deterministic behavior.
-        let _ = ctx.generate_until("<|eot_id|>", tokens_between_calls).await;
+        let _ = ctx.generate_until(tokens_between_calls).await;
 
         // 2. Use the hardcoded response for this turn to control the logic.
         let assistant_response = HARDCODED_RESPONSES[i];
-
-        // 3. Manually fill the context with the hardcoded response and stop token.
-        //    This replaces the model's actual output in the conversation history.
-        ctx.fill(assistant_response);
-        ctx.fill("<|eot_id|>");
 
         // 4. Extract and execute JS code from the hardcoded response.
         if let Some(js_code) = extract_js_code(assistant_response) {
@@ -138,9 +126,7 @@ async fn main() -> Result<(), String> {
     }
 
     // 6. Perform a final LLM call and use the final hardcoded text response.
-    let _ = ctx.generate_until("<|eot_id|>", tokens_between_calls).await;
-    ctx.fill(HARDCODED_RESPONSES[num_code_turns]);
-    ctx.fill("<|eot_id|>");
+    let _ = ctx.generate_until(tokens_between_calls).await;
 
     Ok(())
 }

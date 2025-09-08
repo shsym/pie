@@ -123,19 +123,11 @@ async fn main() -> Result<(), String> {
     };
 
     let mut ctx = model.create_context();
-    ctx.fill("<|begin_of_text|>");
-    ctx.fill(&format!(
-        "<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
-        config.system_message
-    ));
-    ctx.fill(&format!(
-        "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>",
-        user_prompt
-    ));
-    ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
-    ctx.fill(&format!("### {}\n", config.section_header)); // Prime the model
+    ctx.fill_system(&config.system_message);
+    ctx.fill_user(&user_prompt);
 
-    let contribution = ctx.generate_until("<|eot_id|>", tokens_per_step).await;
+
+    let contribution = ctx.generate_until(tokens_per_step).await;
 
     // --- Format and Send Output ---
     let new_accumulated_story = format!(

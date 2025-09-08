@@ -329,7 +329,6 @@ class Qwen3Model(nn.Module):
             input_embeds: torch.Tensor,
             position_ids: torch.Tensor,
             qo_indptr: torch.Tensor,
-
             kv_cache_at_layer: torch.Tensor,
             kv_page_indices: torch.Tensor,
             kv_page_indptr: torch.Tensor,

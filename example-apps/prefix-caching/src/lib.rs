@@ -127,7 +127,7 @@ async fn main() -> Result<(), String> {
     );
     ctx.fill(&final_prompt);
 
-    let text = ctx.generate_until("<|eot_id|>", max_num_outputs).await;
+    let text = ctx.generate_until(max_num_outputs).await;
     let token_ids = tokenizer.tokenize(&text);
     println!("Output: {:?} (total elapsed: {:?})", text, start.elapsed());
 

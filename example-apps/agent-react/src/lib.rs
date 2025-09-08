@@ -74,18 +74,13 @@ async fn main() -> Result<(), String> {
     let mut ctx = model.create_context();
 
     // 5. Fill the context with the initial prompt structure.
-    ctx.fill("<|begin_of_text|>");
-    ctx.fill("<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful, respectful and honest assistant.<|eot_id|>");
-    ctx.fill(&format!(
-        "<|start_header_id|>user<|end_header_id|>\n\n{}",
-        user_prompt
-    ));
-    ctx.fill("<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n");
+    ctx.fill_system("You are a helpful, respectful and honest assistant.");
+    ctx.fill_user(&user_prompt);
 
     // 6. Run the main agent loop, simulating function call cycles.
     for i in 0..num_function_calls {
         // Generate the Thought/Action from the LLM. The generated text is implicitly added to the context.
-        ctx.generate_until("<|eot_id|>", tokens_between_calls).await;
+        ctx.generate_until(tokens_between_calls).await;
 
         // c. Simulate tool execution delay.
         if function_call_delay > 0 {

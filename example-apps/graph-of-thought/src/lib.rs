@@ -54,7 +54,7 @@ async fn run_hierarchical_aggregation(
         .map(|max_tokens| {
             let mut ctx = base_context.fork();
             async move {
-                let proposal_text = ctx.generate_until(EOT_ID, max_tokens).await;
+                let proposal_text = ctx.generate_until(max_tokens).await;
                 (proposal_text, ctx)
             }
         })
@@ -83,7 +83,7 @@ async fn run_hierarchical_aggregation(
             proposal_ctx.fill(&aggregation_prompt);
             first_aggregation_tasks.push(async move {
                 let aggregation_text = proposal_ctx
-                    .generate_until(EOT_ID, aggregation_tokens)
+                    .generate_until(aggregation_tokens)
                     .await;
                 (aggregation_text, proposal_ctx)
             });
@@ -113,7 +113,7 @@ async fn run_hierarchical_aggregation(
             aggregation_ctx.fill(&final_prompt);
             second_aggregation_tasks.push(async move {
                 aggregation_ctx
-                    .generate_until(EOT_ID, aggregation_tokens)
+                    .generate_until(aggregation_tokens)
                     .await
             });
         }

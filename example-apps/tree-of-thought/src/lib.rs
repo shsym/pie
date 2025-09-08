@@ -77,7 +77,7 @@ async fn main() -> Result<(), String> {
             propose_ctx.fill(EOT_ID);
             propose_ctx.fill(ASSISTANT_HEADER);
             propose_ctx
-                .generate_until(EOT_ID, max_tokens_per_step)
+                .generate_until(max_tokens_per_step)
                 .await;
 
             // Level 2: Execute Plan
@@ -89,7 +89,7 @@ async fn main() -> Result<(), String> {
                     execute_ctx.fill(EOT_ID);
                     execute_ctx.fill(ASSISTANT_HEADER);
                     execute_ctx
-                        .generate_until(EOT_ID, max_tokens_per_step)
+                        .generate_until(max_tokens_per_step)
                         .await;
 
                     // Level 3: Reflect on Solution
@@ -101,7 +101,7 @@ async fn main() -> Result<(), String> {
                             reflect_ctx.fill(EOT_ID);
                             reflect_ctx.fill(ASSISTANT_HEADER);
                             reflect_ctx
-                                .generate_until(EOT_ID, max_tokens_per_step)
+                                .generate_until(max_tokens_per_step)
                                 .await;
                             reflect_ctx // Return the final context for this leaf
                         }

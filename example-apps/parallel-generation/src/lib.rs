@@ -19,7 +19,7 @@ async fn main() -> Result<(), String> {
         );
         ctx1.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
-        let output = ctx1.generate_until("<|eot_id|>", max_num_outputs).await;
+        let output = ctx1.generate_until(max_num_outputs).await;
 
         println!("Output: {:?} (elapsed: {:?})", output, start.elapsed());
     };
@@ -29,7 +29,7 @@ async fn main() -> Result<(), String> {
         ctx2.fill("<|start_header_id|>user<|end_header_id|>\n\nExplain the Espresso making process ELI5.<|eot_id|>");
         ctx2.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
-        let output = ctx2.generate_until("<|eot_id|>", max_num_outputs).await;
+        let output = ctx2.generate_until(max_num_outputs).await;
 
         println!("Output: {:?} (elapsed: {:?})", output, start.elapsed());
     };

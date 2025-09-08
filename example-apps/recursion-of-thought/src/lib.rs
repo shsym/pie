@@ -71,7 +71,7 @@ fn divide_and_conquer<'a>(
             let solve_prompt = format!("{} {}", SOLVE_PROMPT, question);
             solve_ctx.fill(&solve_prompt);
             solve_ctx.fill(ASSISTANT_PREFIX);
-            return solve_ctx.generate_until(STOP_TOKEN, max_tokens).await;
+            return solve_ctx.generate_until(max_tokens).await;
         }
 
         // Recursive Step: Try to divide the problem.
@@ -79,7 +79,7 @@ fn divide_and_conquer<'a>(
         let divide_prompt = format!("{}", DIVIDE_PROMPT_TEMPLATE.replace("{}", question));
         divide_ctx.fill(&divide_prompt);
         divide_ctx.fill(ASSISTANT_PREFIX);
-        let response = divide_ctx.generate_until(STOP_TOKEN, max_tokens).await;
+        let response = divide_ctx.generate_until(max_tokens).await;
 
         match parse_response(&response) {
             // Case 1: The model provided a direct answer (leaf node).
@@ -99,7 +99,7 @@ fn divide_and_conquer<'a>(
                 );
                 merge_ctx.fill(&merge_prompt);
                 merge_ctx.fill(ASSISTANT_PREFIX);
-                merge_ctx.generate_until(STOP_TOKEN, max_tokens).await
+                merge_ctx.generate_until(max_tokens).await
             }
             // Case 3: Error in parsing the response.
             Err(e) => format!("Parsing Error: {}", e),

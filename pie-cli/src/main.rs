@@ -390,15 +390,21 @@ async fn start_interactive_session(
         eprintln!("Warning: Failed to save command history: {}", err);
     }
 
-    for child in backend_processes {
+    // Iterate through the child processes, signal them, and wait for them to exit.
+    for mut child in backend_processes { // <-- Make `child` mutable to call .wait()
         if let Some(pid) = child.id() {
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
             println!("- Terminating backend process group with PID: {}", pid);
-            if let Err(e) = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            ) {
-                eprintln!("  Failed to terminate process group {}: {}", pid, e);
+
+            // Send SIGTERM to the entire process group.
+            if let Err(e) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM) {
+                eprintln!("  Failed to send SIGTERM to process group {}: {}", pid, e);
             }
+        }
+
+        // This prevents the main program from exiting before cleanup is complete.
+        if let Err(e) = child.wait().await {
+            eprintln!("  Error while waiting for backend process to exit: {}", e);
         }
     }
 

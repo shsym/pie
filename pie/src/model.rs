@@ -428,7 +428,7 @@ impl Model {
         // Store Instant for request timeout handling.
         let mut event_table: HashMap<(u32, usize), (oneshot::Sender<Bytes>, Instant)> =
             HashMap::new();
-        const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+        const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
         loop {
             // NEW: Dynamic sleep for timeout checks.
