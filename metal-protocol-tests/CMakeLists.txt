@@ -182,6 +182,7 @@ set(BACKEND_LIBS
     metal_topk_mask_logits
     metal_batch_prefill_attention
     metal_dtype_conversion
+    metal_embedding
     metal_common
 )
 
@@ -369,12 +370,15 @@ target_include_directories(validation_tools PUBLIC
 # Forward pass validation integration test (using validation tools)
 add_executable(test_forward_pass_validation
     tests/src/integration/test_forward_pass_validation.mm
+    ${BACKEND_SOURCES_ORGANIZED}
 )
-target_link_libraries(test_forward_pass_validation validation_tools ${COMMON_LIBRARIES_ORGANIZED})
+target_link_libraries(test_forward_pass_validation validation_tools ${COMMON_LIBRARIES_ORGANIZED} ${BACKEND_LIBS})
 target_compile_definitions(test_forward_pass_validation PRIVATE ${NLOHMANN_JSON_CFLAGS_OTHER})
 target_include_directories(test_forward_pass_validation PRIVATE
     tests/src/tools
     ${REPO_ROOT}
+    ${BACKEND_SRC_PATH}
+    ${REPO_ROOT}/backend/backend-cuda/src
 )
 set_target_properties(test_forward_pass_validation PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
