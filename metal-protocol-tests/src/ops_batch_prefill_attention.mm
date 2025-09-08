@@ -350,7 +350,7 @@ void run_batch_prefill_attention_metal(const std::string& case_id, const BatchPr
     // Clean up handle
     metal::batch_prefill_attention::metal_batch_prefill_destroy_handle(attention_handle);
 
-    std::cout << "\n✅ Metal Batch Prefill Attention completed successfully" << std::endl;
+    // std::cout << "\n✅ Metal Batch Prefill Attention completed successfully" << std::endl;
 }
 
 } // namespace ops

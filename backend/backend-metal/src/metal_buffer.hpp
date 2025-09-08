@@ -308,7 +308,7 @@ template<typename T>
 MetalTensor<T> MetalStackAllocator::allocate(size_t count) {
     size_t required_bytes = count * sizeof(T);
     size_t aligned_offset = align_offset(current_offset_, alignof(T));
-    std::cout << "Current offset: " << current_offset_ << ", Aligned offset: " << aligned_offset << std::endl;
+    // std::cout << "Current offset: " << current_offset_ << ", Aligned offset: " << aligned_offset << std::endl;
 
     if (aligned_offset + required_bytes > total_size_) {
         std::cout << "Current offset: " << current_offset_ << ", Aligned offset: " << aligned_offset << ", Required bytes: " << required_bytes << ", Total size: " << total_size_ << std::endl;
@@ -318,7 +318,7 @@ MetalTensor<T> MetalStackAllocator::allocate(size_t count) {
     // Return a tensor view into the pre-allocated stack buffer (no copy, no new allocation)
     id<MTLBuffer> metal_buffer = buffer_.getBuffer();
     MetalTensor<T> tensor = MetalTensor<T>::createView(metal_buffer, {count}, aligned_offset);
-    std::cout << "Created MetalTensor view at offset " << aligned_offset << " with size " << required_bytes << " bytes." << std::endl;
+    // std::cout << "Created MetalTensor view at offset " << aligned_offset << " with size " << required_bytes << " bytes." << std::endl;
 
     current_offset_ = aligned_offset + required_bytes;
     return tensor;
@@ -609,10 +609,24 @@ void MetalL4maBuffer<T>::planWithMapping(
         }
     }
 
+    // Handle output_indices_src
+    if (output_indices_src_ptr && output_indices_src_count > 0) {
+        auto* region = memory_pool.allocate_persistent(output_indices_src_count * sizeof(int32_t), "output_indices_src");
+        if (region) {
+            void* base_ptr = [pool_buffer contents];
+            int32_t* region_ptr = reinterpret_cast<int32_t*>(static_cast<char*>(base_ptr) + region->offset);
+            std::memcpy(region_ptr, output_indices_src_ptr, output_indices_src_count * sizeof(int32_t));
+            output_indices_src = MetalTensor<int32_t>::createView(pool_buffer, {output_indices_src_count}, region->offset);
+            // std::cout << "🔧 [BUFFER FIX] Set output_indices_src with " << output_indices_src_count << " indices" << std::endl;
+        }
+    } else {
+        std::cout << "🔧 [BUFFER DEBUG] No output_indices_src provided" << std::endl;
+    }
+
     // Note: page_size is set in constructor and cannot be changed here
 
-    std::cout << "Planned buffer with zero-copy memory mapping, "
-              << num_tokens << " tokens, " << batch_size << " batches" << std::endl;
+    // std::cout << "Planned buffer with zero-copy memory mapping, "
+    //           << num_tokens << " tokens, " << batch_size << " batches" << std::endl;
 }
 
 template <typename T>

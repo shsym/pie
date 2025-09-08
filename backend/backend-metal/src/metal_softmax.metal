@@ -40,13 +40,14 @@ kernel void softmax_kernel(
     shared_memory[tid] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Reduce to find global max
-    for (uint stride = threadgroup_size / 2; stride > 0; stride /= 2) {
-        if (tid < stride && tid + stride < threadgroup_size) {
-            shared_memory[tid] = max(shared_memory[tid], shared_memory[tid + stride]);
+    // Reduce to find global max (sequential reduction for correctness)
+    // Use simple sequential reduction to ensure all values are included
+    if (tid == 0) {
+        for (uint i = 1; i < threadgroup_size; ++i) {
+            shared_memory[0] = max(shared_memory[0], shared_memory[i]);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float global_max = shared_memory[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -68,13 +69,14 @@ kernel void softmax_kernel(
     shared_memory[tid] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Reduce to find global sum
-    for (uint stride = threadgroup_size / 2; stride > 0; stride /= 2) {
-        if (tid < stride && tid + stride < threadgroup_size) {
-            shared_memory[tid] += shared_memory[tid + stride];
+    // Reduce to find global sum (sequential reduction for correctness)
+    // Use simple sequential reduction to ensure all values are included
+    if (tid == 0) {
+        for (uint i = 1; i < threadgroup_size; ++i) {
+            shared_memory[0] += shared_memory[i];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float global_sum = shared_memory[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);

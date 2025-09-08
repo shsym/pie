@@ -10,6 +10,7 @@
 #include "metal_silu_and_mul_wrapper.hpp"
 #include "metal_batch_prefill_handle.hpp"
 #include "metal_add_residual.hpp"
+#include "metal_append_paged_kv_cache.hpp"
 #include <Metal/Metal.h>
 #include <map>
 #include <memory>
@@ -468,7 +469,76 @@ void MetalL4maAttention<T>::forward(MetalL4maBuffer<T>& buffer, T* attn_output,
                                 std::to_string(workspace_info.total_size) + " bytes");
     }
 
-    if constexpr (std::is_same_v<T, float>) {
+    // 2.5. CRITICAL: Store K and V in paged KV cache before attention
+    std::cout << "🔧 [DEBUG] About to call append KV cache - Type: "
+              << (std::is_same_v<T, bfloat16_t> ? "bfloat16" : std::is_same_v<T, float> ? "float32" : "unknown")
+              << std::endl;
+
+    if constexpr (std::is_same_v<T, bfloat16_t>) {
+        std::cout << "🔧 [KV CACHE] Populating KV cache for bfloat16 with "
+                  << num_tokens << " tokens" << std::endl;
+
+        // TODO: Replace with actual metal_append_paged_kv_cache_bfloat16 call once linker issues are fixed
+        // For now, manually populate the KV cache with the computed K,V values
+        // This simulates what metal_append_paged_kv_cache would do
+
+        const size_t kv_head_size = config_.num_key_value_heads * head_size;
+        const size_t kv_total_elements = num_tokens * kv_head_size;
+
+        // Copy K and V values to the cache (simplified, assumes single page)
+        if (kv_cache_k && kv_cache_v && kv_total_elements > 0) {
+            std::memcpy(kv_cache_k, k_proj.data(), kv_total_elements * sizeof(T));
+            std::memcpy(kv_cache_v, v_proj.data(), kv_total_elements * sizeof(T));
+
+            std::cout << "✅ [KV CACHE] Manually populated KV cache: "
+                      << kv_total_elements << " K elements, " << kv_total_elements << " V elements" << std::endl;
+        } else {
+            std::cout << "❌ [KV CACHE] Failed to populate - null pointers or zero elements" << std::endl;
+        }
+
+        // For non-float types, use bf16 version
+        metal::batch_prefill_attention::batch_prefill_attention_unified_bf16(
+            attention_handle_,
+            workspace.data(),
+            workspace.size(),
+            q_proj.data(), kv_cache_k, kv_cache_v,
+            reinterpret_cast<const int32_t*>(buffer.qo_indptr.data()),
+            reinterpret_cast<const int32_t*>(buffer.kv_page_indptr.data()),
+            reinterpret_cast<const int32_t*>(buffer.kv_page_indices.data()),
+            reinterpret_cast<const int32_t*>(buffer.kv_last_page_lens.data()),
+            context_out.data(),
+            static_cast<int>(num_tokens),
+            static_cast<int>(config_.num_query_heads * head_size),    // head_dim
+            static_cast<int>(config_.num_key_value_heads * head_size), // kv_head_dim
+            static_cast<int>(head_size),
+            static_cast<int>(buffer.page_size),
+            static_cast<int>(config_.num_query_heads),
+            static_cast<int>(config_.num_key_value_heads),
+            1.0f / std::sqrt(float(head_size)), // scale
+            kv_pages_for_workspace  // Use total KV cache capacity
+        );
+    } else if constexpr (std::is_same_v<T, float>) {
+        std::cout << "🔧 [KV CACHE] Populating KV cache for float32 with "
+                  << num_tokens << " tokens" << std::endl;
+
+        // TODO: Replace with actual metal_append_paged_kv_cache_float32 call once linker issues are fixed
+        // For now, manually populate the KV cache with the computed K,V values
+        // This simulates what metal_append_paged_kv_cache would do
+
+        const size_t kv_head_size = config_.num_key_value_heads * head_size;
+        const size_t kv_total_elements = num_tokens * kv_head_size;
+
+        // Copy K and V values to the cache (simplified, assumes single page)
+        if (kv_cache_k && kv_cache_v && kv_total_elements > 0) {
+            std::memcpy(kv_cache_k, k_proj.data(), kv_total_elements * sizeof(T));
+            std::memcpy(kv_cache_v, v_proj.data(), kv_total_elements * sizeof(T));
+
+            std::cout << "✅ [KV CACHE] Manually populated KV cache: "
+                      << kv_total_elements << " K elements, " << kv_total_elements << " V elements" << std::endl;
+        } else {
+            std::cout << "❌ [KV CACHE] Failed to populate - null pointers or zero elements" << std::endl;
+        }
+
         metal::batch_prefill_attention::batch_prefill_attention_unified_f32(
             attention_handle_,
             workspace.data(),
@@ -491,29 +561,8 @@ void MetalL4maAttention<T>::forward(MetalL4maBuffer<T>& buffer, T* attn_output,
             1.0f / std::sqrt(float(head_size)), // scale
             kv_pages_for_workspace  // Use total KV cache capacity
         );
-    } else {
-        // For non-float types, use bf16 version
-        metal::batch_prefill_attention::batch_prefill_attention_unified_bf16(
-            attention_handle_,
-            workspace.data(),
-            workspace.size(),
-            q_proj.data(), kv_cache_k, kv_cache_v,
-            reinterpret_cast<const int32_t*>(buffer.qo_indptr.data()),
-            reinterpret_cast<const int32_t*>(buffer.kv_page_indptr.data()),
-            reinterpret_cast<const int32_t*>(buffer.kv_page_indices.data()),
-            reinterpret_cast<const int32_t*>(buffer.kv_last_page_lens.data()),
-            context_out.data(),
-            static_cast<int>(num_tokens),
-            static_cast<int>(config_.num_query_heads * head_size),    // head_dim
-            static_cast<int>(config_.num_key_value_heads * head_size), // kv_head_dim
-            static_cast<int>(head_size),
-            static_cast<int>(buffer.page_size),
-            static_cast<int>(config_.num_query_heads),
-            static_cast<int>(config_.num_key_value_heads),
-            1.0f / std::sqrt(float(head_size)), // scale
-            kv_pages_for_workspace  // Use total KV cache capacity
-        );
     }
+    std::cout << "🔧 [DEBUG] Completed append KV cache and attention calls" << std::endl;
     MetalProfiler::getInstance().record("batch_prefill_attention");
 
     // 4. Output projection

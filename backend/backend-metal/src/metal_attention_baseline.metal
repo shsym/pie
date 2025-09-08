@@ -324,18 +324,18 @@ kernel void batch_prefill_attention_unified_bf16_baseline_kernel(
                         if (debug_out != nullptr) debug_out[37] = 15.0f;  // First V element accessible
                     }
 
-                    // CRITICAL: Only perform minimal memory access to test bounds
-                    // Instead of the full head_size loop, just do a few elements to isolate the crash
-                    int safe_limit = min(head_size, 4);  // Test just first 4 elements
-                    for (int d = 0; d < safe_limit; ++d) {
+                    // CRITICAL FIX: Load full head_size elements for proper attention
+                    // This was previously limited to 4 elements for debugging, but we need
+                    // the full key/value vectors for correct attention computation
+                    for (int d = 0; d < head_size; ++d) {
                         k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
                         v_block[tid_in_tgp][d] = paged_v_cache[base_addr + d];
                     }
 
-                    // DEBUG: Log successful partial memory access
+                    // DEBUG: Log successful full memory access
                     if (tid_in_tgp == 0 && debug_out != nullptr) {
-                        debug_out[38] = 16.0f;  // Partial memory access completed successfully
-                        debug_out[39] = float(safe_limit);  // Number of elements accessed
+                        debug_out[38] = 16.0f;  // Full memory access completed successfully
+                        debug_out[39] = float(head_size);  // Full head_size elements accessed
                     }
                 }
             }

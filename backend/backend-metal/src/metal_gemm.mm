@@ -1,4 +1,5 @@
 #include "metal_gemm.hpp"
+#include "metal_dtype_conversion.hpp"
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include <stdexcept>
@@ -213,11 +214,9 @@ void metal_gemm_bfloat16(
         // Copy float32 result back - temporarily keeping bfloat16 conversion for interface compatibility
         float* C_f32_result = static_cast<float*>([bufferC contents]);
 
-        // Convert float32 result to bfloat16 (until we can change interface to f32)
+        // Convert float32 result to bfloat16 using centralized conversion
         for (size_t i = 0; i < C_elems; ++i) {
-            uint32_t f32_bits = *reinterpret_cast<uint32_t*>(&C_f32_result[i]);
-            // Simple truncation: take upper 16 bits
-            C[i] = static_cast<bfloat16_t>(f32_bits >> 16);
+            C[i] = metal::DTypeConverter::f32_to_bf16(C_f32_result[i]);
         }
     }
 }

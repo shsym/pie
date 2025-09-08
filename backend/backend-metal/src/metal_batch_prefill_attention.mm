@@ -2,6 +2,7 @@
 #include "metal_batch_prefill_handle.hpp"
 #include "metal_memory_manager.hpp"
 #include "metal_common.hpp"
+#include "metal_append_paged_kv_cache.hpp"
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include <iostream>
@@ -422,6 +423,51 @@ void metal_batch_prefill_destroy_handle(MetalBatchPrefillHandle* handle) {
     std::cout << "MetalBatchPrefillHandle: Destroying handle. Total calls: " << handle->total_calls
               << ", Total bytes processed: " << (handle->total_bytes_processed / 1024 / 1024) << " MB" << std::endl;
 
+    // CRITICAL: Ensure all pending operations complete before destroying handle
+    // This prevents MTLCommandBufferErrorDomain errors during cleanup
+    if (handle->commandQueue) {
+        // Create a final command buffer to act as a synchronization fence
+        id<MTLCommandBuffer> sync_cmd = [handle->commandQueue commandBuffer];
+        sync_cmd.label = @"HandleDestroySyncFence";
+        [sync_cmd commit];
+        [sync_cmd waitUntilCompleted];
+
+        if (sync_cmd.error) {
+            std::cerr << "⚠️  Warning: Sync fence failed during handle destruction: "
+                      << [[sync_cmd.error localizedDescription] UTF8String] << std::endl;
+        }
+
+        // Additional safety: Allow Metal's internal resource cleanup to complete
+        // This is especially important for continuous test runs where resources
+        // are created and destroyed rapidly. Use exponential backoff for robustness.
+        auto start_cleanup = std::chrono::steady_clock::now();
+        int cleanup_attempts = 0;
+        const int max_cleanup_attempts = 3;
+
+        while (cleanup_attempts < max_cleanup_attempts) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10 + (cleanup_attempts * 5)));
+
+            // Try creating a minimal test buffer to verify GPU is ready for next operations
+            @autoreleasepool {
+                id<MTLBuffer> test_buffer = [handle->device newBufferWithLength:1024
+                                                                        options:MTLResourceStorageModeShared];
+                if (test_buffer) {
+                    // GPU resources are available
+                    break;
+                }
+            }
+            cleanup_attempts++;
+        }
+
+        auto cleanup_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_cleanup).count();
+
+        if (cleanup_attempts > 0) {
+            std::cout << "⏱️  GPU resource cleanup took " << cleanup_duration << "ms ("
+                      << cleanup_attempts << " attempts)" << std::endl;
+        }
+    }
+
     // Metal objects will be automatically released by ARC
     handle->device = nil;
     handle->commandQueue = nil;
@@ -497,13 +543,13 @@ MetalBatchPrefillWorkspace metal_batch_prefill_get_workspace(
     workspace.alignment_padding = align(offset) - offset;
     workspace.total_size = align(offset);
 
-    std::cout << "MetalBatchPrefillWorkspace: Required workspace size: "
-              << (workspace.total_size / 1024 / 1024) << " MB for "
-              << num_tokens << " tokens, " << num_kv_pages << " pages" << std::endl;
-    std::cout << "DEBUG WORKSPACE: total_size=" << workspace.total_size << " bytes, offset=" << offset << std::endl;
-    std::cout << "DEBUG WORKSPACE: q_buffer_size=" << workspace.q_buffer_size
-              << ", k_buffer_size=" << workspace.k_buffer_size
-              << ", v_buffer_size=" << workspace.v_buffer_size << std::endl;
+    // std::cout << "MetalBatchPrefillWorkspace: Required workspace size: "
+    //           << (workspace.total_size / 1024 / 1024) << " MB for "
+    //           << num_tokens << " tokens, " << num_kv_pages << " pages" << std::endl;
+    // std::cout << "DEBUG WORKSPACE: total_size=" << workspace.total_size << " bytes, offset=" << offset << std::endl;
+    // std::cout << "DEBUG WORKSPACE: q_buffer_size=" << workspace.q_buffer_size
+    //           << ", k_buffer_size=" << workspace.k_buffer_size
+    //           << ", v_buffer_size=" << workspace.v_buffer_size << std::endl;
 
     return workspace;
 }
@@ -740,10 +786,10 @@ void batch_prefill_attention_unified_bf16(
         return;
     }
 
-    std::cout << "🟢 [HANDLE] batch_prefill_attention_unified_bf16 called with workspace!" << std::endl;
-    std::cout << "🔍 [HANDLE] Parameters: num_qo=" << num_qo << ", head_dim=" << head_dim
-              << ", head_size=" << head_size << ", page_size=" << page_size
-              << ", scale=" << scale << std::endl;
+    // std::cout << "🟢 [HANDLE] batch_prefill_attention_unified_bf16 called with workspace!" << std::endl;
+    // std::cout << "🔍 [HANDLE] Parameters: num_qo=" << num_qo << ", head_dim=" << head_dim
+    //           << ", head_size=" << head_size << ", page_size=" << page_size
+    //           << ", scale=" << scale << std::endl;
 
     @autoreleasepool {
         // Get workspace regions
@@ -764,10 +810,38 @@ void batch_prefill_attention_unified_bf16(
         std::vector<uint16_t> k_half_data = convert_bf16_to_half(paged_k_cache, kv_count);
         std::vector<uint16_t> v_half_data = convert_bf16_to_half(paged_v_cache, kv_count);
 
+        // Debug: Check first few values of KV cache
+        std::cout << "🔍 [KV CACHE DEBUG] KV cache data (first 10 values):" << std::endl;
+        std::cout << "  K cache: [";
+        for (int i = 0; i < std::min(10, (int)k_half_data.size()); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << k_half_data[i];
+        }
+        std::cout << "]" << std::endl;
+        std::cout << "  V cache: [";
+        for (int i = 0; i < std::min(10, (int)v_half_data.size()); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << v_half_data[i];
+        }
+        std::cout << "]" << std::endl;
+
         // Copy converted data to workspace with validation
         std::memcpy(q_workspace, q_half_data.data(), q_half_data.size() * sizeof(uint16_t));
         std::memcpy(k_workspace, k_half_data.data(), k_half_data.size() * sizeof(uint16_t));
         std::memcpy(v_workspace, v_half_data.data(), v_half_data.size() * sizeof(uint16_t));
+
+        // Debug: Show values being passed
+        std::cout << "🔍 [METAL PREFILL] Parameters received:" << std::endl;
+        std::cout << "  num_qo=" << num_qo << ", num_kv_pages=" << num_kv_pages << std::endl;
+        std::cout << "  kv_page_indices pointer: " << (void*)kv_page_indices << std::endl;
+        if (kv_page_indices && num_kv_pages > 0) {
+            std::cout << "  First few kv_page_indices: [";
+            for (int i = 0; i < std::min(5, num_kv_pages); ++i) {
+                if (i > 0) std::cout << ", ";
+                std::cout << kv_page_indices[i];
+            }
+            std::cout << "]" << std::endl;
+        }
 
         // Copy index data to workspace
         size_t index_offset = 0;
@@ -951,8 +1025,8 @@ void batch_prefill_attention_unified_bf16(
                       << threadgroupCount << " groups (total: " << (threadsPerGroup * threadgroupCount) << " threads)" << std::endl;
         } else {
             // 🚀 WORKLOAD MANAGEABLE: Use optimal parallelization
-            std::cout << "🚀 [CONFIG] Optimal workload: " << threadsPerGroup << " threads/group, "
-                      << threadgroupCount << " groups (total: " << (threadsPerGroup * threadgroupCount) << " threads)" << std::endl;
+            // std::cout << "🚀 [CONFIG] Optimal workload: " << threadsPerGroup << " threads/group, "
+            //           << threadgroupCount << " groups (total: " << (threadsPerGroup * threadgroupCount) << " threads)" << std::endl;
         }
 
         MTLSize threadsPerThreadgroup = MTLSizeMake(threadsPerGroup, 1, 1);
@@ -966,9 +1040,9 @@ void batch_prefill_attention_unified_bf16(
 
         // Log GPU memory status before execution
         GPUMemoryInfo memInfo = getGPUMemoryInfo(handle->device);
-        std::cout << "GPU Memory Status: " << memInfo.current_allocated / (1024 * 1024) << " MB / "
-                  << memInfo.recommended_max / (1024 * 1024) << " MB ("
-                  << static_cast<int>(memInfo.usage_ratio * 100) << "%)" << std::endl;
+        // std::cout << "GPU Memory Status: " << memInfo.current_allocated / (1024 * 1024) << " MB / "
+        //           << memInfo.recommended_max / (1024 * 1024) << " MB ("
+        //           << static_cast<int>(memInfo.usage_ratio * 100) << "%)" << std::endl;
 
         int retries = 3;
         NSError* cmdError = nil;
@@ -980,6 +1054,22 @@ void batch_prefill_attention_unified_bf16(
             cmdError = cmd.error;
             if (!cmdError) {
                 success = true;
+
+                // DEBUG: Read and print debug buffer contents
+                char* base_ptr = static_cast<char*>(combined_buf.contents);
+                float* debug_data = reinterpret_cast<float*>(base_ptr + workspace.index_buffer_size + workspace.params_buffer_size);
+                std::cout << "🔍 [DEBUG] Metal attention kernel debug values:" << std::endl;
+                std::cout << "    debug[13] (first page index): " << debug_data[13] << std::endl;
+                std::cout << "    debug[15] (key0 base_addr): " << debug_data[15] << std::endl;
+                std::cout << "    debug[16] (key0 page_idx): " << debug_data[16] << std::endl;
+                std::cout << "    debug[17] (key0 value): " << debug_data[17] << std::endl;
+                std::cout << "    debug[18] (key1 base_addr): " << debug_data[18] << std::endl;
+                std::cout << "    debug[19] (key1 page_idx): " << debug_data[19] << std::endl;
+                std::cout << "    debug[20] (key1 value): " << debug_data[20] << std::endl;
+                std::cout << "    debug[21] (key2 base_addr): " << debug_data[21] << std::endl;
+                std::cout << "    debug[22] (key2 page_idx): " << debug_data[22] << std::endl;
+                std::cout << "    debug[23] (key2 value): " << debug_data[23] << std::endl;
+
                 break; // Success
             }
 
@@ -1053,7 +1143,7 @@ void batch_prefill_attention_unified_bf16(
         handle->total_calls++;
         handle->total_bytes_processed += workspace.total_size;
 
-        std::cout << "✅ [HANDLE] Metal batch attention completed successfully using workspace!" << std::endl;
+        // std::cout << "✅ [HANDLE] Metal batch attention completed successfully using workspace!" << std::endl;
     }
 }
 
@@ -1276,7 +1366,7 @@ void batch_prefill_attention_unified_f32(
         handle->total_calls++;
         handle->total_bytes_processed += workspace.total_size;
 
-        std::cout << "✅ [HANDLE F32] Metal batch attention completed successfully using workspace!" << std::endl;
+        // std::cout << "✅ [HANDLE F32] Metal batch attention completed successfully using workspace!" << std::endl;
     }
 }
 

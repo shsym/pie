@@ -1,4 +1,5 @@
 #import "metal_common.hpp"
+#include "metal_dtype_conversion.hpp"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <iostream>
@@ -214,37 +215,17 @@ namespace MetalCast {
 
     void bfloat16_to_float(id<MTLDevice> device, id<MTLCommandQueue> commandQueue,
                           const bfloat16_t* input, float* output, size_t count) {
-        // Convert bfloat16 to float32 by extending precision
+        // Use centralized dtype conversion
         for (size_t i = 0; i < count; i++) {
-            // bfloat16 format: 1 sign bit, 8 exponent bits, 7 mantissa bits
-            // float32 format: 1 sign bit, 8 exponent bits, 23 mantissa bits
-            // Conversion: shift bfloat16 left by 16 bits to add 16 zeros to mantissa
-            uint32_t extended_bits = static_cast<uint32_t>(input[i]) << 16;
-            output[i] = *reinterpret_cast<float*>(&extended_bits);
+            output[i] = metal::DTypeConverter::bf16_to_f32(input[i]);
         }
     }
 
     void float_to_bfloat16(id<MTLDevice> device, id<MTLCommandQueue> commandQueue,
                           const float* input, bfloat16_t* output, size_t count) {
-        // Convert float32 to bfloat16 by truncating precision
+        // Use centralized dtype conversion
         for (size_t i = 0; i < count; i++) {
-            // Extract the float32 bits
-            uint32_t float_bits = *reinterpret_cast<const uint32_t*>(&input[i]);
-
-            // Handle special cases (NaN, infinity, zero)
-            if ((float_bits & 0x7F800000) == 0x7F800000) {
-                // NaN or infinity - preserve as is
-                output[i] = static_cast<bfloat16_t>(float_bits >> 16);
-            } else if ((float_bits & 0x7FFFFFFF) == 0) {
-                // Zero (positive or negative) - preserve as is
-                output[i] = static_cast<bfloat16_t>(float_bits >> 16);
-            } else {
-                // Normal case: truncate mantissa with proper rounding
-                // Add rounding bias to bit 15 (the bit that will become the LSB of bfloat16)
-                uint32_t rounding_bias = 0x7FFF + ((float_bits >> 16) & 1);  // round-to-even
-                uint32_t rounded = float_bits + rounding_bias;
-                output[i] = static_cast<bfloat16_t>(rounded >> 16);
-            }
+            output[i] = metal::DTypeConverter::f32_to_bf16(input[i]);
         }
     }
 }

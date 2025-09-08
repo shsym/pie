@@ -95,6 +95,13 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
     if (qo_idx == 0 && tid_in_tgp == 0 && debug_out != nullptr) {
         debug_out[4] = (float)total_kv_len;
         debug_out[6] = (float)last_page_len;
+        // DEBUG: KV page indexing values
+        debug_out[10] = (float)seq_id;
+        debug_out[11] = (float)kv_start_page_pos;
+        debug_out[12] = (float)kv_end_page_pos;
+        if (num_pages > 0) {
+            debug_out[13] = (float)kv_page_indices[kv_start_page_pos];  // First page index
+        }
     }
 
     // --- Per-head processing: compute attention independently for each head ---
@@ -105,7 +112,7 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
             m_i = -INFINITY;
             l_i = 0.0f;
         }
-        
+
         int q_base = int(qo_idx) * head_dim + h * head_size;
         for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
             acc_i[d] = 0.0f;
@@ -125,6 +132,14 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
                     int kv_head = map_query_to_kv_head(h, num_query_heads, num_kv_heads);
                     uint base_addr = calculate_kv_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
 
+                    // Debug: Show address calculation for first few keys
+                    if (qo_idx == 0 && tid_in_tgp == 0 && h == 0 && global_key_idx < 3 && debug_out != nullptr) {
+                        int debug_idx = 15 + global_key_idx * 3;  // Use debug[15-23] for address info
+                        debug_out[debug_idx] = (float)base_addr;
+                        debug_out[debug_idx + 1] = (float)page_idx;
+                        debug_out[debug_idx + 2] = (global_key_idx < total_kv_len) ? paged_k_cache[base_addr] : -999.0f;
+                    }
+
                     for (int d = 0; d < head_size; ++d) {
                         k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
                         v_block[tid_in_tgp][d] = paged_v_cache[base_addr + d];
@@ -137,7 +152,7 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
             // Use manual unrolling instead of simdgroup operations to avoid cross-key issues
             float score = 0.0f;
             int global_key_idx_score = block_start + tid_in_tgp;
-            
+
             if (tid_in_tgp < KERNEL_BLOCK_SIZE && global_key_idx_score < total_kv_len) {
                 // --- OPTIMIZATION 2: Vectorized memory access with float4 ---
                 int d = 0;
@@ -147,10 +162,10 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
                         // Load 4 half values and convert to float4
                         half4 q_vec = *reinterpret_cast<threadgroup const half4*>(&q_s[d]);
                         half4 k_vec = *reinterpret_cast<threadgroup const half4*>(&k_block[tid_in_tgp][d]);
-                        
+
                         float4 q_f = float4(q_vec);
                         float4 k_f = float4(k_vec);
-                        
+
                         // Vector dot product
                         float4 prod = q_f * k_f;
                         score += prod.x + prod.y + prod.z + prod.w;
@@ -164,12 +179,12 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
                         score += float(q_s[d+3]) * float(k_block[tid_in_tgp][d+3]);
                     }
                 }
-                
+
                 // Handle remaining dimensions
                 for (; d < head_size; ++d) {
                     score += float(q_s[d]) * float(k_block[tid_in_tgp][d]);
                 }
-                
+
                 score *= scale;
             } else {
                 score = -INFINITY;
@@ -221,11 +236,11 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
 
             // --- OPTIMIZATION 3: Vectorized V accumulation with loop unrolling ---
             int num_keys_in_block = min((int)KERNEL_BLOCK_SIZE, total_kv_len - block_start);
-            
+
             // Process dimensions in batches for better cache utilization
             for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
                 float sum_wv_d = 0.0f;
-                
+
                 // --- OPTIMIZATION 4: Vectorized weight-value multiplication ---
                 int j = 0;
                 // Process 4 weights and values at once using vector operations
@@ -233,11 +248,11 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
                     for (; j < num_keys_in_block; j += 4) {
                         // Load 4 weights as vector
                         float4 w_vec = *reinterpret_cast<threadgroup const float4*>(&w_block[j]);
-                        
+
                         // Load 4 V values for current dimension
                         half4 v_vec = half4(v_block[j][d], v_block[j+1][d], v_block[j+2][d], v_block[j+3][d]);
                         float4 v_f = float4(v_vec);
-                        
+
                         // Vector multiply and sum
                         float4 prod = w_vec * v_f;
                         sum_wv_d += prod.x + prod.y + prod.z + prod.w;
@@ -251,12 +266,12 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
                         sum_wv_d += w_block[j+3] * float(v_block[j+3][d]);
                     }
                 }
-                
+
                 // Handle remaining keys
                 for (; j < num_keys_in_block; ++j) {
                     sum_wv_d += w_block[j] * float(v_block[j][d]);
                 }
-                
+
                 acc_i[d] += sum_wv_d;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -307,7 +322,7 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
 
     // F32 kernels use 2x memory compared to BF16, so stricter limits apply
     // Conservative limit for F32 to fit in 32KB threadgroup memory
-    const int MAX_F32_HEAD_DIM = 128;  
+    const int MAX_F32_HEAD_DIM = 128;
     if (head_size > MAX_F32_HEAD_DIM) return;
 
     const int num_simd_groups = TGP_SIZE / SIMD_SIZE;
@@ -354,6 +369,13 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
     if (qo_idx == 0 && tid_in_tgp == 0 && debug_out != nullptr) {
         debug_out[4] = (float)total_kv_len;
         debug_out[6] = (float)last_page_len;
+        // DEBUG: KV page indexing values
+        debug_out[10] = (float)seq_id;
+        debug_out[11] = (float)kv_start_page_pos;
+        debug_out[12] = (float)kv_end_page_pos;
+        if (num_pages > 0) {
+            debug_out[13] = (float)kv_page_indices[kv_start_page_pos];  // First page index
+        }
     }
 
     // --- Per-head processing: compute attention independently for each head ---
@@ -364,7 +386,7 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
             m_i = -INFINITY;
             l_i = 0.0f;
         }
-        
+
         int q_base = int(qo_idx) * head_dim + h * head_size;
         for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
             acc_i[d] = 0.0f;
@@ -384,6 +406,15 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
                     int kv_head = map_query_to_kv_head(h, num_query_heads, num_kv_heads);
                     uint base_addr = calculate_kv_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
 
+                    // DEBUG: Log first key access details (F32 kernel)
+                    if (qo_idx == 0 && h == 0 && block_start == 0 && tid_in_tgp == 0 && debug_out != nullptr) {
+                        debug_out[19] = (float)page_idx;          // Page ID being accessed
+                        debug_out[20] = (float)base_addr;         // Calculated base address
+                        debug_out[21] = paged_k_cache[base_addr]; // First key value accessed
+                        debug_out[22] = (float)in_page_offset;    // Position within page
+                        debug_out[23] = (float)page_offset;       // Which page in sequence
+                    }
+
                     for (int d = 0; d < head_size; ++d) {
                         k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
                         v_block[tid_in_tgp][d] = paged_v_cache[base_addr + d];
@@ -396,7 +427,7 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
             // Use manual unrolling instead of simdgroup operations to avoid cross-key issues
             float score = 0.0f;
             int global_key_idx_score = block_start + tid_in_tgp;
-            
+
             if (tid_in_tgp < KERNEL_BLOCK_SIZE && global_key_idx_score < total_kv_len) {
                 // --- OPTIMIZATION 2: Vectorized memory access with float4 (F32) ---
                 int d = 0;
@@ -406,7 +437,7 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
                         // Load 4 float values as vector
                         float4 q_vec = *reinterpret_cast<threadgroup const float4*>(&q_s[d]);
                         float4 k_vec = *reinterpret_cast<threadgroup const float4*>(&k_block[tid_in_tgp][d]);
-                        
+
                         // Vector dot product
                         float4 prod = q_vec * k_vec;
                         score += prod.x + prod.y + prod.z + prod.w;
@@ -420,12 +451,12 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
                         score += q_s[d+3] * k_block[tid_in_tgp][d+3];
                     }
                 }
-                
+
                 // Handle remaining dimensions
                 for (; d < head_size; ++d) {
                     score += q_s[d] * k_block[tid_in_tgp][d];
                 }
-                
+
                 score *= scale;
             } else {
                 score = -INFINITY;
@@ -477,11 +508,11 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
 
             // --- OPTIMIZATION 3: Vectorized V accumulation with loop unrolling for F32 ---
             int num_keys_in_block = min((int)KERNEL_BLOCK_SIZE, total_kv_len - block_start);
-            
+
             // Process dimensions in batches for better cache utilization
             for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
                 float sum_wv_d = 0.0f;
-                
+
                 // --- OPTIMIZATION 4: Vectorized weight-value multiplication (F32) ---
                 int j = 0;
                 // Process 4 weights and values at once using vector operations
@@ -489,10 +520,10 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
                     for (; j < num_keys_in_block; j += 4) {
                         // Load 4 weights as vector
                         float4 w_vec = *reinterpret_cast<threadgroup const float4*>(&w_block[j]);
-                        
+
                         // Load 4 V values for current dimension
                         float4 v_vec = float4(v_block[j][d], v_block[j+1][d], v_block[j+2][d], v_block[j+3][d]);
-                        
+
                         // Vector multiply and sum
                         float4 prod = w_vec * v_vec;
                         sum_wv_d += prod.x + prod.y + prod.z + prod.w;
@@ -506,12 +537,12 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
                         sum_wv_d += w_block[j+3] * v_block[j+3][d];
                     }
                 }
-                
+
                 // Handle remaining keys
                 for (; j < num_keys_in_block; ++j) {
                     sum_wv_d += w_block[j] * v_block[j][d];
                 }
-                
+
                 acc_i[d] += sum_wv_d;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);

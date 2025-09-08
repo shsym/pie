@@ -324,6 +324,24 @@ set_target_properties(test_forward_pass_integration PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
 )
 
+# Metal context integration test
+add_executable(test_forward_pass_metal_context
+    tests/src/integration/test_forward_pass_metal_context.mm
+    tests/src/integration/metal_context.mm
+    ${BACKEND_SOURCES_ORGANIZED}
+    ${REPO_ROOT}/backend/backend-cuda/src/bpe.cpp
+)
+target_link_libraries(test_forward_pass_metal_context ${COMMON_LIBRARIES_ORGANIZED})
+target_compile_definitions(test_forward_pass_metal_context PRIVATE ${NLOHMANN_JSON_CFLAGS_OTHER})
+target_include_directories(test_forward_pass_metal_context PRIVATE
+    ${REPO_ROOT}
+    ${REPO_ROOT}/backend/backend-cuda/src
+    tests/src/integration
+)
+set_target_properties(test_forward_pass_metal_context PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
+)
+
 # Tokenization utility for getting conversational token IDs
 add_executable(tokenize_conversational
     tests/src/debug/tokenize_conversational.cpp
@@ -334,6 +352,42 @@ target_include_directories(tokenize_conversational PRIVATE
     ${REPO_ROOT}/backend/backend-cuda/src
 )
 set_target_properties(tokenize_conversational PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
+)
+
+add_executable(debug_chat_positions
+    tests/src/debug/debug_chat_positions.cpp
+    ${REPO_ROOT}/backend/backend-cuda/src/bpe.cpp
+)
+target_include_directories(debug_chat_positions PRIVATE
+    ${REPO_ROOT}
+    ${REPO_ROOT}/backend/backend-cuda/src
+)
+set_target_properties(debug_chat_positions PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
+)
+
+add_executable(decode_specific_tokens
+    tests/src/debug/decode_specific_tokens.cpp
+    ${REPO_ROOT}/backend/backend-cuda/src/bpe.cpp
+)
+target_include_directories(decode_specific_tokens PRIVATE
+    ${REPO_ROOT}
+    ${REPO_ROOT}/backend/backend-cuda/src
+)
+set_target_properties(decode_specific_tokens PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
+)
+
+add_executable(test_tokenizer_debug
+    tests/src/debug/test_tokenizer_debug.cpp
+    ${REPO_ROOT}/backend/backend-cuda/src/bpe.cpp
+)
+target_include_directories(test_tokenizer_debug PRIVATE
+    ${REPO_ROOT}
+    ${REPO_ROOT}/backend/backend-cuda/src
+)
+set_target_properties(test_tokenizer_debug PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${ORGANIZED_TESTS_BIN_DIR}
 )
 
@@ -356,8 +410,9 @@ add_custom_target(run_unit_tests
     COMMAND echo "=== Running Integration Tests ==="
     COMMAND ${ORGANIZED_TESTS_BIN_DIR}/test_model_weight_loading_integration
     COMMAND ${ORGANIZED_TESTS_BIN_DIR}/test_forward_pass_integration
+    COMMAND ${ORGANIZED_TESTS_BIN_DIR}/test_forward_pass_metal_context
     COMMAND echo "✅ All tests completed"
-    DEPENDS test_softmax_unit test_extract_k_values_unit test_topk_mask_unit test_kernel_selection_unit test_memory_management_unit test_ztensor_reader_unit test_real_ztensor_unit test_metal_tensor_loading_unit test_model_weight_loading_integration test_forward_pass_integration
+    DEPENDS test_softmax_unit test_extract_k_values_unit test_topk_mask_unit test_kernel_selection_unit test_memory_management_unit test_ztensor_reader_unit test_real_ztensor_unit test_metal_tensor_loading_unit test_model_weight_loading_integration test_forward_pass_integration test_forward_pass_metal_context
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

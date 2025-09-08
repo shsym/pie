@@ -129,6 +129,9 @@ int metal_softmax_float(
             return -1;
         }
 
+        // Parameters validated: batch_size=" << batch_size
+        // << ", vocab_size=" << vocab_size << ", temperature=" << temperature
+
         const size_t input_size = static_cast<size_t>(batch_size) * vocab_size;
 
         // Create Metal buffers
@@ -202,6 +205,9 @@ int metal_softmax_float(
 
         MTLSize threads_per_threadgroup = MTLSizeMake(threadgroup_size, 1, 1);
         MTLSize threadgroups = MTLSizeMake(batch_size, 1, 1);
+
+        // GPU Dispatch: threadgroups.width << " threadgroups, "
+        // << threads_per_threadgroup.width << " threads each"
 
         [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_threadgroup];
 

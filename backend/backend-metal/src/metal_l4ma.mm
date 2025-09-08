@@ -56,6 +56,8 @@ void MetalL4maModel<T>::forward(MetalL4maBuffer<T>& buffer,
     size_t num_tokens = buffer.num_tokens;
     size_t hidden_size = config_.hidden_size;
 
+    std::cout << "🔧 [DEBUG] MetalL4maModel::forward() called with " << num_tokens << " tokens" << std::endl;
+
     // Choose hidden states backing: use persistent workspace if available, otherwise stack-alloc
     T* hidden_ptr = nullptr;
     bool hidden_owns = false; // whether we must deallocate
@@ -82,12 +84,16 @@ void MetalL4maModel<T>::forward(MetalL4maBuffer<T>& buffer,
     );
     MetalProfiler::getInstance().record("token_embedding");
 
+
     // 2. Forward through all decoder layers
     MetalProfiler::getInstance().recordStart("attention");
+
+
     for (int layer_idx = 0; layer_idx < config_.num_layers; ++layer_idx) {
         // Get KV cache for this layer
         auto [kv_cache_k, kv_cache_v] = kv_cache.get_layer_pointers(layer_idx);
         layers_[layer_idx].forward(buffer, hidden_ptr, kv_cache_k, kv_cache_v, kv_cache.get_num_pages());
+
     }
     MetalProfiler::getInstance().recordEnd("attention");
 
@@ -98,7 +104,7 @@ void MetalL4maModel<T>::forward(MetalL4maBuffer<T>& buffer,
     // Deallocate if we owned the temporary hidden buffer
     if (hidden_owns) {
         buffer.deallocate(hidden_states_owned);
-        std::cout << "  ✅ Deallocated intermediate hidden states (stack)\n";
+        // std::cout << "  ✅ Deallocated intermediate hidden states (stack)\n";
     } else {
         std::cout << "  ♻️  Reused persistent workspace for hidden states\n";
     }
@@ -141,6 +147,23 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     size_t hidden_size = config_.hidden_size;
     size_t vocab_size = config_.vocab_size;
 
+    std::cout << "🔧 [DEBUG] MetalL4maForCausalLM::forward() called with " << num_tokens << " tokens" << std::endl;
+
+    // *** KEY FIX: Handle output_indices_src like CUDA does ***
+    size_t num_output_tokens = num_tokens; // Default: all tokens
+    bool use_output_indices = false;
+
+    // Check if we have specific output indices (like CUDA does)
+    if (buffer.output_indices_src.data() && buffer.output_indices_src.size() > 0) {
+        num_output_tokens = buffer.output_indices_src.size();
+        use_output_indices = true;
+        // std::cout << "🎯 [POSITION FIX] Using output_indices_src: " << num_output_tokens
+        //           << " positions specified" << std::endl;
+    } else {
+        // std::cout << "⚠️  [POSITION] No output_indices_src - using all " << num_tokens
+        //           << " positions" << std::endl;
+    }
+
     // Allocate final norm output
     auto final_norm_output = buffer.template allocate<T>(num_tokens * hidden_size);
 
@@ -149,56 +172,44 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     model_.forward(buffer, kv_cache, final_norm_output.data());
     MetalProfiler::getInstance().recordEnd("model");
 
-    // 2. Language model head (reuse embedding weights)
-    auto logits = buffer.template allocate<T>(num_tokens * vocab_size);
+    // 2. Handle final hidden states based on output indices (like CUDA)
+    T* final_hidden_states_ptr = final_norm_output.data();
+    auto gathered_states = buffer.template allocate<T>(0); // Will resize if needed
+
+    if (use_output_indices && num_output_tokens != num_tokens) {
+        // Need to gather specific positions (like CUDA does)
+        gathered_states = buffer.template allocate<T>(num_output_tokens * hidden_size);
+
+        // Implement gathering operation like CUDA does
+        for (size_t i = 0; i < num_output_tokens; ++i) {
+            // Get the actual position from output_indices_src
+            int32_t src_pos = buffer.output_indices_src.data()[i];
+
+            const T* src_ptr = final_norm_output.data() + src_pos * hidden_size;
+            T* dst_ptr = gathered_states.data() + i * hidden_size;
+            std::memcpy(dst_ptr, src_ptr, hidden_size * sizeof(T));
+
+            // std::cout << "🎯 [GATHER] Copied hidden states from position " << src_pos << std::endl;
+        }
+        final_hidden_states_ptr = gathered_states.data();
+    }
+
+    // 3. Language model head (reuse embedding weights)
+    auto logits = buffer.template allocate<T>(num_output_tokens * vocab_size);
 
     auto& context = MetalContext::getInstance();
     metal_gemm_bfloat16(
         context.getDevice(), context.getCommandQueue(),
-        reinterpret_cast<const bfloat16_t*>(final_norm_output.data()),
+        reinterpret_cast<const bfloat16_t*>(final_hidden_states_ptr), // Use gathered states if available
         reinterpret_cast<const bfloat16_t*>(model_.get_embed_tokens_weight().data()),
         nullptr, // no bias
         reinterpret_cast<bfloat16_t*>(logits.data()),
-        num_tokens, vocab_size, hidden_size,
+        num_output_tokens, vocab_size, hidden_size, // Use num_output_tokens instead of num_tokens
         nullptr, 0, // workspace (unused for compatibility)
-        false, false // no transpose
+        false, true // transpose B (embedding weights)
     );
     MetalProfiler::getInstance().record("lm_head");
 
-    // DEBUG: Check input values to lm_head GEMM and the resulting logits
-    if (num_tokens > 0) {
-        // Check final_norm_output values (input to lm_head)
-        std::cout << "🔍 [DEBUG] final_norm_output (input to lm_head, first 10):" << std::endl;
-        float max_norm_val = 0.0f;
-        for (int i = 0; i < std::min(10, static_cast<int>(hidden_size)); ++i) {
-            float val = static_cast<float>(final_norm_output.data()[i]);
-            std::cout << "  norm_out[" << i << "] = " << std::fixed << std::setprecision(6) << val << std::endl;
-            max_norm_val = std::max(max_norm_val, std::abs(val));
-        }
-        std::cout << "  Max final_norm magnitude: " << max_norm_val << std::endl;
-
-        // Check embedding weight values (used in lm_head)
-        auto& embed_weights = model_.get_embed_tokens_weight();
-        std::cout << "🔍 [DEBUG] embedding_weights (used in lm_head, first 10):" << std::endl;
-        float max_weight_val = 0.0f;
-        for (int i = 0; i < std::min(10, static_cast<int>(hidden_size)); ++i) {
-            float val = static_cast<float>(embed_weights.data()[i]);
-            std::cout << "  embed_weight[" << i << "] = " << std::fixed << std::setprecision(6) << val << std::endl;
-            max_weight_val = std::max(max_weight_val, std::abs(val));
-        }
-        std::cout << "  Max embedding weight magnitude: " << max_weight_val << std::endl;
-
-        // Check resulting logits
-        bfloat16_t* logits_bf16 = reinterpret_cast<bfloat16_t*>(logits.data());
-        std::cout << "🔍 [DEBUG] Raw logits after lm_head (first 10 values):" << std::endl;
-        float max_logit = 0.0f;
-        for (int i = 0; i < std::min(10, static_cast<int>(vocab_size)); ++i) {
-            float val = static_cast<float>(logits_bf16[i]);
-            std::cout << "  logits[" << i << "] = " << std::fixed << std::setprecision(6) << val << std::endl;
-            max_logit = std::max(max_logit, std::abs(val));
-        }
-        std::cout << "  Max logit magnitude: " << max_logit << std::endl;
-    }
 
     // 3. Apply top-k mask and softmax to get final probabilities
     constexpr int top_k = 50; // Default top-k value
@@ -206,7 +217,6 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     auto topk_indices = buffer.template allocate<int32_t>(num_tokens * top_k);
 
     // Apply top-k masking to logits
-    std::cout << "🔍 [PIPELINE] Applying topk_mask (k=" << top_k << ")" << std::endl;
 
 
     int result = metal_topk_mask_logits_bfloat16(
@@ -220,73 +230,10 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     }
     MetalProfiler::getInstance().record("topk_mask");
 
-    // DEBUG: Check ALL logits after topk_mask using proper conversion
-    std::cout << "  🔍 AFTER topk_mask kernel:" << std::endl;
-    auto debug_after = buffer.template allocate<float>(vocab_size);  // Check ALL values
-    MetalCast::bfloat16_to_float(context.getDevice(), context.getCommandQueue(),
-                                reinterpret_cast<const bfloat16_t*>(logits.data()),
-                                debug_after.data(), vocab_size);
-    int finite_after = 0;
-    float max_after = -1e9f;
-    for (size_t i = 0; i < vocab_size; ++i) {
-        if (debug_after.data()[i] > -65000.0f) {  // Not masked
-            finite_after++;
-            if (finite_after <= 3) {
-                std::cout << "    Preserved[" << i << "] = " << debug_after.data()[i] << std::endl;
-            }
-            max_after = std::max(max_after, debug_after.data()[i]);
-        }
-    }
-    std::cout << "    After: " << finite_after << "/" << top_k << " unmasked values, max=" << max_after << std::endl;
 
-    // MEMORY DEBUG: Capture pointer and first few bytes after successful topk_mask
-    void* logits_ptr_after_topk = logits.data();
-    bfloat16_t* logits_bf16_after_topk = reinterpret_cast<bfloat16_t*>(logits.data());
-    std::vector<uint16_t> first_bytes_after_topk;
-    for (int i = 0; i < 10; ++i) {
-        first_bytes_after_topk.push_back(static_cast<uint16_t>(logits_bf16_after_topk[i]));
-    }
-    std::cout << "  🔍 MEMORY: logits.data() = " << logits_ptr_after_topk << std::endl;
-    std::cout << "  🔍 MEMORY: first 10 raw bytes = ";
-    for (int i = 0; i < 10; ++i) {
-        std::cout << "0x" << std::hex << first_bytes_after_topk[i] << std::dec;
-        if (i < 9) std::cout << " ";
-    }
-    std::cout << std::endl;
 
-    // Check the FULL logits.data() buffer for unmasked values
-    int full_unmasked_count = 0;
-    std::cout << "  🔍 MEMORY: Checking FULL logits.data() buffer for unmasked values..." << std::endl;
-    for (size_t i = 0; i < vocab_size; ++i) {
-        uint16_t raw_bf16 = static_cast<uint16_t>(logits_bf16_after_topk[i]);
-        if (raw_bf16 != 0xc780) {
-            full_unmasked_count++;
-            if (full_unmasked_count <= 5) {
-                float single_val;
-                MetalCast::bfloat16_to_float(context.getDevice(), context.getCommandQueue(),
-                                           &logits_bf16_after_topk[i], &single_val, 1);
-                std::cout << "    logits.data()[" << i << "] = 0x" << std::hex << raw_bf16
-                          << std::dec << " = " << single_val << std::endl;
-            }
-        }
-    }
-    std::cout << "  🔍 MEMORY: Found " << full_unmasked_count << " unmasked values in FULL logits.data()" << std::endl;
-
-    // Verify topk_mask worked correctly
-    if (num_tokens > 0) {
-        bfloat16_t* logits_bf16 = reinterpret_cast<bfloat16_t*>(logits.data());
-        int unmasked_count = 0;
-        for (size_t i = 0; i < vocab_size; ++i) {
-            uint16_t raw_bf16 = static_cast<uint16_t>(logits_bf16[i]);
-            if (raw_bf16 != 0xc780) {
-                unmasked_count++;
-            }
-        }
-        std::cout << "  ✅ topk_mask: " << unmasked_count << "/" << top_k << " values preserved" << std::endl;
-    }
 
     // Step 1: Extract top-k logits and indices (before softmax)
-    std::cout << "🔍 [PIPELINE] Step 1: Extracting top-k masked logits" << std::endl;
 
     int extract_result = metal_extract_k_values_bfloat16(
         reinterpret_cast<const bfloat16_t*>(logits.data()),
@@ -301,53 +248,6 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
     }
     MetalProfiler::getInstance().record("extract_k_values");
 
-    // Verify we extracted the expected logits
-    if (num_tokens > 0) {
-        int extracted_count = 0;
-        float max_logit = -1e9f;
-        for (int i = 0; i < top_k; ++i) {
-            float val = topk_values.data()[i];
-            if (val != 0.0f && val > -65000.0f) {  // Valid extracted logit
-                extracted_count++;
-                max_logit = std::max(max_logit, val);
-            }
-        }
-        std::cout << "  ✅ Extracted " << extracted_count << "/" << top_k << " logits, max=" << max_logit << std::endl;
-    }
-
-    // Step 2: Apply softmax only to the extracted top-k logits
-    std::cout << "🔍 [PIPELINE] Step 2: Applying softmax to top-k logits" << std::endl;
-
-    int softmax_result = metal_softmax_float(
-        topk_values.data(),
-        topk_values.data(), // in-place softmax on k values only
-        num_tokens,
-        top_k, // Process only k values, not full vocab
-        1.0f   // temperature
-    );
-    if (softmax_result != 0) {
-        throw std::runtime_error("Failed to apply softmax to top-k values");
-    }
-    MetalProfiler::getInstance().record("softmax");
-
-    // Verify softmax produced valid probabilities
-    if (num_tokens > 0) {
-        float prob_sum = 0.0f;
-        float max_prob = 0.0f;
-        int non_zero_probs = 0;
-
-        for (int i = 0; i < top_k; ++i) {
-            float val = topk_values.data()[i];
-            prob_sum += val;
-            if (val > 1e-10f) {
-                non_zero_probs++;
-                max_prob = std::max(max_prob, val);
-            }
-        }
-
-        std::cout << "  ✅ Softmax: sum=" << std::fixed << std::setprecision(8) << prob_sum
-                  << ", non_zero=" << non_zero_probs << ", max=" << max_prob << std::endl;
-    }
 
 
     // Copy results to host vectors
@@ -356,6 +256,7 @@ std::pair<std::vector<float>, std::vector<int32_t>> MetalL4maForCausalLM<T>::for
 
     std::memcpy(result_values.data(), topk_values.data(), num_tokens * top_k * sizeof(float));
     std::memcpy(result_indices.data(), topk_indices.data(), num_tokens * top_k * sizeof(int32_t));
+
 
     // Deallocate intermediate tensors
     buffer.deallocate(final_norm_output);
@@ -398,12 +299,6 @@ namespace MetalModelUtils {
             return nullptr;
         }
 
-        std::cout << "Loading Metal L4MA model: " << metadata.model_name << std::endl;
-        std::cout << "Model config:" << std::endl;
-        std::cout << "  vocab_size: " << metadata.config.vocab_size << std::endl;
-        std::cout << "  hidden_size: " << metadata.config.hidden_size << std::endl;
-        std::cout << "  num_layers: " << metadata.config.num_layers << std::endl;
-        std::cout << "  num_heads: " << metadata.config.num_query_heads << std::endl;
 
         // Create model
         auto model = std::make_unique<MetalL4maForCausalLM<T>>(metadata.config);
@@ -411,9 +306,6 @@ namespace MetalModelUtils {
         // Load parameters from zTensor checkpoint file
         std::string weight_file = metadata.checkpoint_path;
 
-        if (config.verbose) {
-            std::cout << "Loading weights from: " << weight_file << std::endl;
-        }
 
         // Get all parameter tensors
         auto param_map = model->get_parameters();
@@ -423,9 +315,6 @@ namespace MetalModelUtils {
             ztensor::zTensorReader reader(weight_file);
             auto tensor_list = reader.list_tensors();
 
-            if (config.verbose) {
-                std::cout << "Found " << tensor_list.size() << " tensors in model file" << std::endl;
-            }
 
             // Track loaded tensors for verification
             int loaded_count = 0;
@@ -438,12 +327,6 @@ namespace MetalModelUtils {
                 // Check if tensor exists in the zTensor file
                 auto it = std::find(tensor_list.begin(), tensor_list.end(), ztensor_name);
                 if (it == tensor_list.end()) {
-                    if (config.verbose) {
-                        std::cout << "Warning: Parameter '" << param_name
-                                 << "' (mapped to '" << ztensor_name << "') not found in model file. "
-                                 << "Using random initialization." << std::endl;
-                    }
-
                     // Fall back to random initialization for missing parameters
                     initialize_parameter_randomly(*tensor, param_name);
                     continue;
@@ -468,50 +351,10 @@ namespace MetalModelUtils {
                 // Load data using copyFromMappedMemory
                 tensor->copyFromMappedMemory(raw_data, total_elements);
 
-                // Calculate and log weight statistics for verification
-                if (config.verbose && total_elements > 0) {
-                    // Cast to appropriate type based on tensor data type
-                    if (info.dtype == "bfloat16") {
-                        const uint16_t* bf16_data = static_cast<const uint16_t*>(raw_data);
-                        float sum = 0.0f, min_val = FLT_MAX, max_val = -FLT_MAX;
-
-                        for (size_t i = 0; i < total_elements; ++i) {
-                            // Convert bfloat16 to float32 for statistics
-                            uint32_t f32_bits = static_cast<uint32_t>(bf16_data[i]) << 16;
-                            float value = *reinterpret_cast<const float*>(&f32_bits);
-                            sum += value;
-                            min_val = std::min(min_val, value);
-                            max_val = std::max(max_val, value);
-                        }
-                        float mean_val = sum / total_elements;
-
-                        std::cout << "  Weight stats: min=" << min_val << ", max=" << max_val
-                                 << ", mean=" << mean_val << std::endl;
-                    } else if (info.dtype == "float32") {
-                        const float* f32_data = static_cast<const float*>(raw_data);
-                        float sum = 0.0f, min_val = FLT_MAX, max_val = -FLT_MAX;
-
-                        for (size_t i = 0; i < total_elements; ++i) {
-                            sum += f32_data[i];
-                            min_val = std::min(min_val, f32_data[i]);
-                            max_val = std::max(max_val, f32_data[i]);
-                        }
-                        float mean_val = sum / total_elements;
-
-                        std::cout << "  Weight stats: min=" << min_val << ", max=" << max_val
-                                 << ", mean=" << mean_val << std::endl;
-                    }
-                }
-
                 loaded_count++;
-                if (config.verbose) {
-                    std::cout << "Loaded parameter: " << param_name << " <- " << ztensor_name
-                             << " (" << total_elements << " elements)" << std::endl;
-                }
             }
 
-            std::cout << "Successfully loaded " << loaded_count << "/" << total_count
-                     << " parameters from " << weight_file << std::endl;
+            std::cout << "✅ Model loaded: " << loaded_count << "/" << total_count << " parameters" << std::endl;
 
         } catch (const std::exception& e) {
             std::cerr << "Error loading zTensor file: " << e.what() << std::endl;
@@ -523,7 +366,6 @@ namespace MetalModelUtils {
             }
         }
 
-        std::cout << "Model loaded successfully with " << param_map.size() << " parameter tensors" << std::endl;
         return model;
     }
 
