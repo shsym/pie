@@ -17,7 +17,7 @@ class Tokenizer:
     type: str
     merge_table: dict[int, bytes]
     split_regex: str
-    special_tokens: dict[int, str]
+    special_tokens: dict[str, int]
     escape_non_printable: bool
 
 
@@ -54,6 +54,7 @@ class ModelInfo:
     tokenizer: Tokenizer
     template_type: str
     template_content: str
+    stop_tokens: list[str]
 
     @staticmethod
     def load_from_file(cfg_file_path: str, device: str, dtype: str) -> "ModelInfo":
@@ -177,6 +178,7 @@ class ModelConfig:
         return {
             "template_type": get_required_template_key("type"),
             "template_content": get_required_template_key("content"),
+            "stop_tokens": get_required_template_key("stop_tokens"),
         }
 
     def get_metadata_fields(self) -> dict:

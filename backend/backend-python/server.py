@@ -10,9 +10,9 @@ import fire
 import msgpack
 import msgspec
 import torch
-import tomli
 import ztensor
 import zmq
+from msgspec import structs
 from platformdirs import user_cache_dir
 from tqdm import tqdm
 from websockets.sync.client import connect
@@ -25,91 +25,63 @@ from message import (EmbedImageRequest, ForwardPassRequest, HandshakeRequest,
 from model.qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 
 
-def get_final_config(config_path: str) -> dict:
+def main(
+        model: str,
+        host: str = 'localhost',
+        port: int = 10123,
+        controller_host: str = 'localhost',
+        controller_port: int = 9123,
+        auth_token: str = None,
+        cache_dir: str = None,
+        kv_page_size: int = 16,
+        max_dist_size: int = 64,
+        max_num_kv_pages: int = 1024,
+        max_num_embeds: int = 128,
+        max_num_adapters: int = 48,
+        max_adapter_rank: int = 8,
+        device: str = 'cuda:0',
+        dtype: str = 'bfloat16'
+):
     """
-    Resolves the final configuration from a TOML file, environment variables, and defaults.
-
-    The precedence order for settings is:
-    1.  **TOML Configuration File**
-    2.  **Environment Variables** (only for `cache_dir` via `PIE_HOME`)
-    3.  **Default Values**
+    Runs the application with configuration provided as command-line arguments.
 
     Args:
-        config_path: The path to the TOML configuration file.
-
-    Returns:
-        A dictionary containing the final, resolved configuration.
+        model: Name of the model to load (required).
+        host: Hostname for the ZMQ service to bind to.
+        port: Port for the ZMQ service to bind to.
+        controller_host: Hostname of the controller to register with.
+        controller_port: Port of the controller to register with.
+        auth_token: Authentication token for connecting to the controller.
+        cache_dir: Directory for model cache. Defaults to PIE_HOME env var,
+                   then the platform-specific user cache dir.
+        kv_page_size: The size of each page in the key-value cache.
+        max_dist_size: Maximum distance for embeddings.
+        max_num_kv_pages: Maximum number of pages in the key-value cache.
+        max_num_embeds: Maximum number of embeddings to store.
+        max_num_adapters: Maximum number of adapters that can be loaded.
+        max_adapter_rank: Maximum rank for any loaded adapter.
+        device: The device to run the model on (e.g., 'cuda:0' or 'cpu').
+        dtype: The data type for model weights (e.g., 'bfloat16', 'float16').
     """
-    # 1. Default configuration values
-    DEFAULTS = {
-        'host': 'localhost',
-        'port': 10123,
-        'controller_host': 'localhost',
-        'controller_port': 9123,
-        'auth_token': None,
-        'model': None,
-        'cache_dir': None,
-        'kv_page_size': 32,
-        'dist_size': 32,
-        'max_num_kv_pages': 1000,
-        'max_num_embeds': 50000,
-        'max_num_adapters': 48,
-        'max_adapter_rank': 8,
-        'device': 'cuda:0',
-        'dtype': 'bfloat16'
-    }
-
-    # 2. Load configuration from TOML file
-    config_from_file = {}
-    if config_path:
-        try:
-            with open(config_path, "rb") as f:
-                config_from_file = tomli.load(f)
-        except FileNotFoundError:
-            print(f"Error: Configuration file not found at '{config_path}'", file=sys.stderr)
-            sys.exit(1)
-        except tomli.TOMLDecodeError as e:
-            print(f"Error decoding TOML file '{config_path}': {e}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        print("Error: A configuration file must be provided via the --config argument.", file=sys.stderr)
-        sys.exit(1)
-
-    # 3. Build the final configuration dictionary
-    final_config = DEFAULTS.copy()
-    final_config.update(config_from_file)
-
-    # 4. Handle `cache_dir` with its unique precedence: File > Env > Platform Default
-    final_config['cache_dir'] = (
-            config_from_file.get('cache_dir') or
+    # Resolve cache_dir using the precedence: CLI arg > Environment Var > Platform Default
+    resolved_cache_dir = (
+            cache_dir or
             os.environ.get('PIE_HOME') or
             str(Path(user_cache_dir('pie')))
     )
 
-    if not final_config.get('model'):
-        print("Error: A 'model' must be specified in the config file.", file=sys.stderr)
-        sys.exit(1)
-
-    return final_config
-
-
-def main(config: str):
-    """
-    Runs the application using settings from the specified configuration file.
-
-    Args:
-        config (str): The path to a TOML configuration file.
-    """
-    final_config = get_final_config(config)
+    # Create a config dictionary from function arguments for downstream use.
+    # The 'locals()' function conveniently captures all arguments.
+    config = locals()
+    config['cache_dir'] = resolved_cache_dir  # Update with the resolved path
 
     print("--- Configuration ---")
-    for key, value in final_config.items():
+    for key, value in config.items():
         print(f"{key}: {value}")
     print("----------------------")
 
-    model_instance, model_metadata = load_model(final_config)
-
-    start_service(final_config, model_instance, model_metadata)
+    model_instance, model_metadata = load_model(config)
+    start_service(config, model_instance, model_metadata)
 
 
 def load_model(config: dict):
@@ -220,7 +192,7 @@ def start_service(config, model, model_info):
     handler = Handler(model=model,
                       model_info=model_info,
                       kv_page_size=config["kv_page_size"],
-                      dist_size=config["dist_size"],
+                      max_dist_size=config["max_dist_size"],
                       max_num_kv_pages=config["max_num_kv_pages"],
                       max_num_embeds=config["max_num_embeds"],
                       max_num_adapters=config["max_num_adapters"],
@@ -267,7 +239,7 @@ def register(config, endpoint):
             # Register the service endpoint
             websocket.send(msgpack.packb({
                 "type": "attach_remote_service", "corr_id": 0, "endpoint": endpoint,
-                "service_name": "example_service", "service_type": "l4m"
+                "service_name": config["model"], "service_type": "model"
             }, use_bin_type=True))
             reg_response = msgpack.unpackb(websocket.recv(), raw=False)
             if not reg_response.get("successful"):

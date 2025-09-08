@@ -2,6 +2,7 @@ pub use crate::bindings::pie::inferlet::core::Priority;
 use crate::bindings::pie::inferlet::{adapter, core, evolve, forward, image, tokenize};
 pub use crate::bindings_app::{export, exports::pie::inferlet::run::Guest as RunSync};
 pub use crate::context::Context;
+pub use crate::chat::ChatFormatter;
 use crate::wstd::runtime::AsyncPollable;
 pub use anyhow::Result;
 pub use inferlet_macros::main;
@@ -14,6 +15,7 @@ pub use wstd;
 
 pub mod brle;
 pub mod context;
+pub mod chat;
 pub mod drafter;
 mod pool;
 pub mod sampler;
@@ -71,7 +73,6 @@ pub struct Queue {
 #[derive(Clone, Debug)]
 pub struct Model {
     pub(crate) inner: Rc<core::Model>,
-    pub(crate) adapter: Option<(u32, i64)>,
 }
 
 pub enum Resource {
@@ -101,7 +102,6 @@ pub fn get_arguments() -> Vec<String> {
 pub fn get_model(name: &str) -> Option<Model> {
     core::get_model(name).map(|inner| Model {
         inner: Rc::new(inner),
-        adapter: None,
     })
 }
 
@@ -232,6 +232,10 @@ impl Model {
     /// Returns the prompt formatting template in Tera format.
     pub fn get_prompt_template(&self) -> String {
         self.inner.get_prompt_template()
+    }
+
+    pub fn get_stop_tokens(&self) -> Vec<String> {
+        self.inner.get_stop_tokens()
     }
 
     /// Gets the service ID for the model.

@@ -111,10 +111,11 @@ pub struct HandshakeResponse {
     pub model_description: String,
     pub prompt_template: String,
     pub prompt_template_type: String,
+    pub prompt_stop_tokens: Vec<String>,
     pub kv_page_size: u32,
-    pub resources: Vec<(u32, u32)>,
-    pub tokenizer_merge_table: Vec<(u32, Vec<u8>)>,
-    pub tokenizer_special_tokens: Vec<(String, u32)>,
+    pub resources: HashMap<u32, u32>,
+    pub tokenizer_merge_table: HashMap<u32, Vec<u8>>,
+    pub tokenizer_special_tokens: HashMap<String, u32>,
     pub tokenizer_split_regex: String,
     pub tokenizer_escape_non_printable: bool,
 }
@@ -242,6 +243,7 @@ pub struct ModelInfo {
     pub description: String,
     pub prompt_template: String,
     pub prompt_template_type: String,
+    pub prompt_stop_tokens: Vec<String>,
     pub tokenizer: Arc<BytePairEncoder>,
     pub kv_page_size: u32,
 }
@@ -303,15 +305,11 @@ impl Model {
             })?),
         ))?;
 
-        let handshake_info =
-            rmp_serde::from_slice::<HandshakeResponse>(&handshake_rx.await?.to_vec())?;
+        let handshake_info = rmp_serde::from_slice::<HandshakeResponse>(&handshake_rx.await?)?;
 
         let tokenizer = Arc::new(BytePairEncoder::new(
             handshake_info.tokenizer_merge_table.into_iter().collect(),
-            handshake_info
-                .tokenizer_special_tokens
-                .into_iter()
-                .collect(),
+            handshake_info.tokenizer_special_tokens,
             &handshake_info.tokenizer_split_regex,
             handshake_info.tokenizer_escape_non_printable,
         ));
@@ -322,12 +320,12 @@ impl Model {
             description: handshake_info.model_description,
             prompt_template: handshake_info.prompt_template,
             prompt_template_type: handshake_info.prompt_template_type,
+            prompt_stop_tokens: handshake_info.prompt_stop_tokens,
             tokenizer,
             kv_page_size: handshake_info.kv_page_size,
         };
 
-        let resource_manager =
-            ResourceManager::new(handshake_info.resources.iter().cloned().collect());
+        let resource_manager = ResourceManager::new(handshake_info.resources);
 
         Ok(Model {
             info,
@@ -489,6 +487,7 @@ impl Model {
                             for (idx, payload) in frames.into_iter().enumerate() {
                                 let key = (received_corr_id, idx);
                                 if let Some((sender, _)) = event_table.remove(&key) {
+                                    // println!("data: {:?}", payload);
                                     let _ = sender.send(payload);
                                 }
                             }

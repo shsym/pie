@@ -6,9 +6,9 @@ import torch
 from torch import nn
 
 import flashinfer as ops
-from ..adapter import AdapterSubpass
+from adapter import AdapterSubpass
 
-from ..config.l4ma import L4maArch
+from config.l4ma import L4maArch
 
 VERSION = "0.1.0"
 

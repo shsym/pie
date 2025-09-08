@@ -99,6 +99,7 @@ interface core {
         get-traits: func() -> list<string>;          // Returns the full set of model traits
         get-description: func() -> string;           // Human-readable description of the model
         get-prompt-template: func() -> string;       // Returns the prompt formatting template in Tera
+        get-stop-tokens: func() -> list<string>;
         get-service-id: func() -> u32;
         get-kv-page-size: func() -> u32; // Get the size of a KV page
         create-queue: func() -> queue;               // Create a new command queue

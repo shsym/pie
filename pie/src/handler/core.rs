@@ -385,6 +385,11 @@ impl bindings::pie::inferlet::core::HostModel for InstanceState {
         Ok(prompt_template)
     }
 
+    async fn get_stop_tokens(&mut self, this: Resource<Model>) -> anyhow::Result<Vec<String>> {
+        let stop_tokens = self.ctx().table.get(&this)?.info.prompt_stop_tokens.clone();
+        Ok(stop_tokens)
+    }
+
     async fn get_service_id(&mut self, this: Resource<Model>) -> anyhow::Result<u32> {
         Ok(self.ctx().table.get(&this)?.service_id as u32)
     }

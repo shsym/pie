@@ -75,15 +75,6 @@ pub struct StartArgs {
     /// Enable verbose console logging.
     #[arg(long, short)]
     pub verbose: bool,
-
-    #[arg(long)]
-    pub batching_strategy: Option<String>,
-    /// The 'k' parameter for the batching strategy.
-    #[arg(long)]
-    pub batching_strategy_k: Option<u32>,
-    /// The 't' parameter for the batching strategy.
-    #[arg(long)]
-    pub batching_strategy_t: Option<u32>,
 }
 
 /// Helper for clap to expand `~` in path arguments.
@@ -268,11 +259,11 @@ async fn start_interactive_session(
                 .context("`exec_path` is missing or not a string.")?;
 
             let mut cmd = if backend_type == "python" {
-                let mut cmd = TokioCommand::new("python");
-                // cmd.arg("--project");
-                // cmd.arg("../backend/backend-python");
-                // cmd.arg("run");
-                // cmd.arg("python");
+                let mut cmd = TokioCommand::new("uv");
+                cmd.arg("--project");
+                cmd.arg("../backend/backend-python");
+                cmd.arg("run");
+                cmd.arg("python");
                 cmd.arg("-u");
                 cmd.arg(exec_path);
                 cmd

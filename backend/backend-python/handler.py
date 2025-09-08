@@ -26,7 +26,7 @@ class Handler:
             model,
             model_info: ModelInfo,
             kv_page_size: int,
-            dist_size: int,
+            max_dist_size: int,
             max_num_kv_pages: int,
             max_num_embeds: int,
             max_num_adapters: int,
@@ -40,7 +40,7 @@ class Handler:
         self.lm = model
         self.model_info = model_info
         self.kv_page_size = kv_page_size
-        self.dist_size = dist_size
+        self.max_dist_size = max_dist_size
         self.max_num_kv_pages = max_num_kv_pages
         self.max_num_embeds = max_num_embeds
         self.max_num_adapters = max_num_adapters
@@ -106,6 +106,7 @@ class Handler:
                 model_description=self.model_info.description,
                 prompt_template=self.model_info.template_content,
                 prompt_template_type=self.model_info.template_type,
+                prompt_stop_tokens=self.model_info.stop_tokens,
                 kv_page_size=self.kv_page_size,
                 resources={
                     0: self.max_num_kv_pages,
@@ -298,7 +299,7 @@ class ForwardPassBatch:
             self.sampler_type.append(sampler_idx)
 
             if sampler_idx == 0:
-                params["top_k"] = min(sampler_config.get("top_k", self.TOP_K_MAX_BOUND), self.TOP_K_MAX_BOUND)
+                params["top_k"] = min(sampler_config.get("top_k", self._handler.max_dist_size), self._handler.max_dist_size)
             else:
                 params["top_k"] = sampler_config.get("top_k", 0)
                 params["top_p"] = sampler_config.get("top_p", 1.0)

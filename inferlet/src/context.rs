@@ -5,7 +5,7 @@ use crate::stop_condition::StopCondition;
 use crate::traits::forward::{Distribution, Forward, KvPage};
 use crate::traits::tokenize::{Tokenize, Tokenizer};
 use crate::traits::{Adapter, SetAdapter, SetAdapterSeed};
-use crate::{Model, Queue, sampler, stop_condition};
+use crate::{ChatFormatter, Model, Queue, sampler, stop_condition};
 use futures::future::join_all;
 use std::cmp::Ordering;
 use std::mem;
@@ -15,6 +15,7 @@ pub struct Context {
     pub queue: Queue,
     pub model: Model,
     pub tokenizer: Tokenizer,
+    pub formatter: ChatFormatter,
 
     pub token_ids: Vec<u32>,
     pub token_ids_pending: Vec<u32>,
@@ -37,11 +38,11 @@ impl Context {
         let queue = model.create_queue();
         let kv_page_size = model.get_kv_page_size() as usize;
         let tokenizer = model.get_tokenizer();
-
         Context {
             queue,
             model: model.clone(),
             tokenizer,
+            formatter: ChatFormatter::new(),
             token_ids: Vec::new(),
             token_ids_pending: Vec::new(),
             token_mask_pending: Vec::new(),
@@ -92,6 +93,7 @@ impl Context {
             queue,
             model: model.clone(),
             tokenizer,
+            formatter: ChatFormatter::new(),
             token_ids: prefix_tokens,
             token_ids_pending: Vec::new(),
             token_mask_pending: Vec::new(),
@@ -203,6 +205,7 @@ impl Context {
             queue: self.model.create_queue(),
             model: self.model.clone(),
             tokenizer: self.tokenizer.clone(),
+            formatter: self.formatter.clone(),
             token_ids: new_tokens,
             token_ids_pending: new_pending,
             token_mask_pending: new_mask_pending,
@@ -216,13 +219,15 @@ impl Context {
         }
     }
 
-    pub async fn generate_until(&mut self, stop_str: &str, max_tokens: usize) -> String {
+    pub async fn generate_until(&mut self, max_tokens: usize) -> String {
         let mut sampler = sampler::GreedySampler::new();
-        let stop_str_token_ids = self.tokenizer.tokenize(stop_str);
-        let mut stop_condition = stop_condition::any(
-            stop_condition::Until::new(stop_str_token_ids),
-            stop_condition::Length::new(max_tokens),
-        );
+        let mut cond_list: Vec<Box<dyn StopCondition>> = Vec::new();
+        for stop_token in self.model.get_stop_tokens() {
+            let stop_token_ids = self.tokenizer.tokenize(&stop_token);
+            cond_list.push(Box::new(stop_condition::Until::new(stop_token_ids)));
+        }
+        cond_list.push(Box::new(stop_condition::Length::new(max_tokens)));
+        let mut stop_condition = stop_condition::StopConditionList::new(cond_list);
         self.generate(&mut sampler, &mut stop_condition).await
     }
 
@@ -232,6 +237,8 @@ impl Context {
     }
 
     pub fn fill_tokens(&mut self, new_token_ids: Vec<u32>) {
+        self.flush_chat_messages();
+
         let n = new_token_ids.len();
         self.token_ids_pending.extend(new_token_ids);
 
@@ -244,10 +251,24 @@ impl Context {
     }
 
     pub fn fill_token(&mut self, new_token_id: u32) {
+        self.flush_chat_messages();
+
         self.token_ids_pending.push(new_token_id);
         self.token_mask_current.append(false);
         self.token_mask_pending
             .push(self.token_mask_current.clone())
+    }
+
+    pub fn fill_system(&mut self, text: &str) {
+        self.formatter.system(text);
+    }
+
+    pub fn fill_user(&mut self, text: &str) {
+        self.formatter.user(text);
+    }
+
+    pub fn assistant(&mut self, text: &str) {
+        self.formatter.assistant(text);
     }
 
     pub fn mask_tokens(&mut self, indices: &[usize], mask: bool) {
@@ -387,25 +408,24 @@ impl Context {
         self.adjust_kv_pages(-(num_tokens as isize));
     }
 
+    fn flush_chat_messages(&mut self) {
+        if self.formatter.has_messages() {
+            let p = self
+                .formatter
+                .render(&self.model.get_prompt_template(), true);
+            self.formatter.clear();
+            self.fill(&p);
+        }
+    }
+
     /// Processes a batch of pending tokens to update the model's internal state.
-    ///
-    /// This function is a key step between providing input and generating output. It takes
-    /// all tokens from the pending buffer (`token_ids_pending`) **except for the last one**
-    /// and runs a forward pass on the model. This operation populates the model's
-    /// Key-Value (KV) cache with the state corresponding to the flushed tokens.
-    ///
-    /// The final token is intentionally left in the pending buffer to serve as the input
-    /// "seed" for the subsequent generation step (e.g., a call to `generate()` or `next()`).
-    ///
-    /// This method will do nothing if there are fewer than two tokens in the pending buffer,
-    /// as there must be at least one token to flush and one to keep.
     pub async fn flush(&mut self) {
-        // We need at least two pending tokens: one to be the "seed" for the next forward pass,
-        // and one (or more) to be flushed into the KV cache now.
-        if self.token_ids_pending.len() < 2 {
+        self.flush_chat_messages();
+
+        if self.token_ids_pending.is_empty() {
             return;
         }
-        let process_count = self.token_ids_pending.len() - 1;
+        let process_count = self.token_ids_pending.len();
 
         // Process all but the last pending token, leaving it for the next generation step.
         let pending_token_ids = self
@@ -526,6 +546,8 @@ impl Context {
         sampler: &mut S,
         stop_condition: &mut C,
     ) -> String {
+        self.flush_chat_messages();
+
         let mut generated_token_ids = Vec::new();
 
         // The autoregressive generation loop

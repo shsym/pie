@@ -740,13 +740,15 @@ impl Client {
         match service_type.as_str() {
             "model" => {
                 // Try to create the model; fail fast on error.
-                let model = match Model::new(&endpoint).await {
+                let model_service = match Model::new(&endpoint).await {
                     Ok(m) => m,
-                    Err(_) => {
+                    Err(e) => {
+
+                        println!("Failed to create model backend: {:?}", e);
                         self.send_response(
                             corr_id,
                             false,
-                            "Failed to attach to L4M backend".into(),
+                            "Failed to attach to model backend server".into(),
                         )
                         .await;
                         return;
@@ -754,9 +756,13 @@ impl Client {
                 };
 
                 // Try to install; fail fast on error.
-                let Some(service_id) = install_service(&service_name, model) else {
-                    self.send_response(corr_id, false, "Failed to register to L4M backend".into())
-                        .await;
+                let Some(service_id) = install_service(&service_name, model_service) else {
+                    self.send_response(
+                        corr_id,
+                        false,
+                        "Failed to register the model service".into(),
+                    )
+                    .await;
                     return;
                 };
 

@@ -18,10 +18,11 @@ class HandshakeResponse(msgspec.Struct, gc=False):
     model_description: str
     prompt_template: str
     prompt_template_type: str
+    prompt_stop_tokens: list[str]
     kv_page_size: int
     resources: dict[int, int]  # Use built-in list and tuple
     tokenizer_merge_table: dict[int, bytes]
-    tokenizer_special_tokens: dict[int, str]
+    tokenizer_special_tokens: dict[str, int]
     tokenizer_split_regex: str
     tokenizer_escape_non_printable: bool
 
