@@ -24,6 +24,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 get_filename_component(REPO_ROOT ${CMAKE_SOURCE_DIR} DIRECTORY)
 set(CUDA_BACKEND_DIR "${REPO_ROOT}/backend/backend-cuda")
 
+# Include CPM.cmake for package management (use backend's version)
+include(${CUDA_BACKEND_DIR}/cmake/CPM.cmake)
+
+# Add zstd dependency for zTensor decompression support
+cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
+
 # Find CUDA toolkit (modern package name)
 find_package(CUDAToolkit REQUIRED)
 
@@ -175,6 +181,7 @@ if(EXISTS "${CUDA_BACKEND_DIR}/src/ztensor.hpp")
         CUDA::curand
         CUDA::cudart
         pthread
+        zstd  # Required for zTensor decompression
         # Link order matters for static libraries - try reverse order for circular deps
         ${BACKEND_LIB_DIR}/libdecode_kernels.a
         ${BACKEND_LIB_DIR}/libprefill_kernels.a

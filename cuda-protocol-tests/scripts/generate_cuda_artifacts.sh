@@ -153,14 +153,20 @@ run_and_validate() {
 
   cmd_args+=("$@")
 
+  local result=0
   if run "${cmd_args[@]}"; then
     sleep 0.5  # Brief delay to ensure files are fully written
     validate_operation "$op_name" "$case_id"
-    return $?
+    result=$?
   else
     echo "❌ EXECUTION FAILED: $op_name --case $case_id $*" >&2
-    return 1
+    result=1
   fi
+
+  # Clean up GPU memory after each test to prevent OOM
+  cleanup_gpu_memory
+
+  return $result
 }
 
 # Run operation without validation (for multi-dtype variants)
@@ -180,7 +186,14 @@ run_operation() {
 
   cmd_args+=("$@")
 
+  local result=0
   run "${cmd_args[@]}"
+  result=$?
+
+  # Clean up GPU memory after each test to prevent OOM
+  cleanup_gpu_memory
+
+  return $result
 }
 
 # Run integration test for layer-by-layer artifact generation
@@ -194,6 +207,12 @@ run_integration_test() {
     return 1
   fi
 
+  local result=0
+  # Set PIE_MODEL_PATH if not already set (integration test needs this)
+  if [[ -z "${PIE_MODEL_PATH:-}" ]]; then
+    export PIE_MODEL_PATH="${PIE_MODEL_PATH:-/home/sslee/.cache/pie/models/llama-3.2-1b-instruct/llama-3.2-1b-instruct.zt}"
+  fi
+
   if run "$INTEGRATION_BIN" "$test_case"; then
     echo "✅ Integration test completed successfully"
 
@@ -203,18 +222,53 @@ run_integration_test() {
       local layer_count=$(find "$integration_dir" -name "layer_*" -type d | wc -l)
       local tensor_count=$(find "$integration_dir" -name "*.bin" | wc -l)
       echo "✅ Generated layer-by-layer artifacts: $layer_count layers, $tensor_count tensor files"
-      return 0
+      result=0
     else
       echo "⚠️  Integration test completed but no layer artifacts found at $integration_dir" >&2
-      return 1
+      result=1
     fi
   else
     echo "❌ Integration test failed" >&2
-    return 1
+    result=1
   fi
+
+  # Clean up GPU memory after integration test (it uses the most memory)
+  echo "  🔄 Integration test memory cleanup (heavy test completed)..."
+  cleanup_gpu_memory
+
+  return $result
 }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Error: required command '$1' not found in PATH" >&2; exit 127; }; }
+
+# GPU memory cleanup function
+cleanup_gpu_memory() {
+  echo "  🧹 Cleaning up GPU memory..."
+  # Force CUDA device synchronization and reset
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    # Check current GPU memory usage
+    local gpu_mem_before=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU" 2>/dev/null || echo "unknown")
+
+    # Reset the CUDA context to free all memory
+    # This will terminate any existing CUDA processes for the current device
+    nvidia-smi --gpu-reset -i "$GPU" >/dev/null 2>&1 || true
+
+    # Small delay to ensure reset completes
+    sleep 1
+
+    local gpu_mem_after=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU" 2>/dev/null || echo "unknown")
+    echo "    GPU memory: $gpu_mem_before MB → $gpu_mem_after MB"
+  else
+    echo "    nvidia-smi not available, skipping GPU memory check"
+  fi
+
+  # Also clean up any zombie processes
+  pkill -f "cuda_protocol_tests" 2>/dev/null || true
+  pkill -f "cuda_integration_tests" 2>/dev/null || true
+
+  # Brief delay to ensure cleanup completes
+  sleep 0.5
+}
 
 # Tooling checks
 need_cmd cmake
@@ -250,9 +304,13 @@ if [[ -z "${SKIP_BUILD:-}" ]]; then
   if command -v nproc >/dev/null 2>&1; then
     CORES=$(($(nproc) - 1))
     if [[ $CORES -lt 1 ]]; then CORES=1; fi
+    # Cap CUDA compilation to avoid nvcc termination issues
+    if [[ $CORES -gt 8 ]]; then CORES=8; fi
   elif command -v sysctl >/dev/null 2>&1; then
     CORES=$(($(sysctl -n hw.ncpu) - 1))
     if [[ $CORES -lt 1 ]]; then CORES=1; fi
+    # Cap CUDA compilation to avoid nvcc termination issues
+    if [[ $CORES -gt 8 ]]; then CORES=8; fi
   fi
   run make -C "$BUILD_DIR" -j"$CORES"
 else
