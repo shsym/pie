@@ -117,17 +117,17 @@ class L4maAttention(nn.Module):
         )
 
     def forward(
-            self,
-            wrapper,
-            hidden_states: torch.Tensor,
-            position_ids: torch.Tensor,
-            kv_cache_at_layer: torch.Tensor,
-            kv_page_indices: torch.Tensor,
-            kv_page_indptr: torch.Tensor,
-            kv_last_page_lens: torch.Tensor,
-            batch_indices: torch.Tensor,
-            batch_positions: torch.Tensor,
-            adapter_subpass: AdapterSubpass | None,
+        self,
+        wrapper,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """TODO: Add method docstring."""
 
@@ -145,7 +145,7 @@ class L4maAttention(nn.Module):
                 hidden_states,
                 q_state=query_states,
                 k_state=key_states,
-                v_state=value_states
+                v_state=value_states,
             )
 
         # Reshape and continue as before
@@ -166,7 +166,7 @@ class L4maAttention(nn.Module):
 
         # Ensure query_states matches the configured dtype for FlashInfer plan
         if query_states.dtype != self.config.dtype:
-            print('warn: query dtype does not match config dtype!')
+            print("warn: query dtype does not match config dtype!")
             query_states = query_states.to(self.config.dtype)
 
         ops.append_paged_kv_cache(
@@ -213,17 +213,17 @@ class L4maDecoderLayer(nn.Module):
         )
 
     def forward(
-            self,
-            wrapper,
-            hidden_states: torch.Tensor,
-            position_ids: torch.Tensor,
-            kv_cache_at_layer: torch.Tensor,
-            kv_page_indices: torch.Tensor,
-            kv_page_indptr: torch.Tensor,
-            kv_last_page_lens: torch.Tensor,
-            batch_indices: torch.Tensor,
-            batch_positions: torch.Tensor,
-            adapter_subpass: AdapterSubpass | None,
+        self,
+        wrapper,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """TODO: Add method docstring."""
         residual = hidden_states
@@ -296,24 +296,21 @@ class L4maModel(nn.Module):
         )
 
     def forward(
-            self,
-            # input
-            input_embeds: torch.Tensor,
-            position_ids: torch.Tensor,
-            qo_indptr: torch.Tensor,
-
-            # kv cache
-            kv_cache_at_layer: list[torch.Tensor],
-            kv_page_indices: torch.Tensor,
-            kv_page_indptr: torch.Tensor,
-            kv_last_page_lens: torch.Tensor,
-
-            # mask
-            custom_mask: torch.Tensor,
-            single_token_inference_mode: bool,
-
-            # subpasses
-            adapter_subpass: AdapterSubpass | None
+        self,
+        # input
+        input_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        # kv cache
+        kv_cache_at_layer: list[torch.Tensor],
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        # mask
+        custom_mask: torch.Tensor,
+        single_token_inference_mode: bool,
+        # subpasses
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """TODO: Add method docstring."""
         hidden_states = input_embeds

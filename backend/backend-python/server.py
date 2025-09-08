@@ -20,27 +20,33 @@ from websockets.sync.client import connect
 from config.common import ModelInfo
 from handler import Handler
 from model.l4ma import L4maForCausalLM, create_fusion_map as create_l4ma_fusion_map
-from message import (EmbedImageRequest, ForwardPassRequest, HandshakeRequest,
-                     InitializeAdapterRequest, QueryRequest, UpdateAdapterRequest)
+from message import (
+    EmbedImageRequest,
+    ForwardPassRequest,
+    HandshakeRequest,
+    InitializeAdapterRequest,
+    QueryRequest,
+    UpdateAdapterRequest,
+)
 from model.qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 
 
 def main(
-        model: str,
-        host: str = 'localhost',
-        port: int = 10123,
-        controller_host: str = 'localhost',
-        controller_port: int = 9123,
-        auth_token: str = None,
-        cache_dir: str = None,
-        kv_page_size: int = 16,
-        max_dist_size: int = 64,
-        max_num_kv_pages: int = 1024,
-        max_num_embeds: int = 128,
-        max_num_adapters: int = 48,
-        max_adapter_rank: int = 8,
-        device: str = 'cuda:0',
-        dtype: str = 'bfloat16'
+    model: str,
+    host: str = "localhost",
+    port: int = 10123,
+    controller_host: str = "localhost",
+    controller_port: int = 9123,
+    auth_token: str = None,
+    cache_dir: str = None,
+    kv_page_size: int = 16,
+    max_dist_size: int = 64,
+    max_num_kv_pages: int = 1024,
+    max_num_embeds: int = 128,
+    max_num_adapters: int = 48,
+    max_adapter_rank: int = 8,
+    device: str = "cuda:0",
+    dtype: str = "bfloat16",
 ):
     """
     Runs the application with configuration provided as command-line arguments.
@@ -65,15 +71,13 @@ def main(
     """
     # Resolve cache_dir using the precedence: CLI arg > Environment Var > Platform Default
     resolved_cache_dir = (
-            cache_dir or
-            os.environ.get('PIE_HOME') or
-            str(Path(user_cache_dir('pie')))
+        cache_dir or os.environ.get("PIE_HOME") or str(Path(user_cache_dir("pie")))
     )
 
     # Create a config dictionary from function arguments for downstream use.
     # The 'locals()' function conveniently captures all arguments.
     config = locals()
-    config['cache_dir'] = resolved_cache_dir  # Update with the resolved path
+    config["cache_dir"] = resolved_cache_dir  # Update with the resolved path
 
     print("--- Configuration ---")
     for key, value in config.items():
@@ -85,20 +89,20 @@ def main(
 
 
 def load_model(config: dict):
-    model_name = config['model']
-    cache_dir = config['cache_dir']
+    model_name = config["model"]
+    cache_dir = config["cache_dir"]
     model_path = Path(cache_dir) / "models"
     metadata_path = model_path / f"{model_name}.toml"
 
     if not metadata_path.exists():
         raise FileNotFoundError(f"Metadata file not found at: {metadata_path}")
 
-    model_device = config['device']
-    model_dtype = getattr(torch, config['dtype'])
+    model_device = config["device"]
+    model_dtype = getattr(torch, config["dtype"])
     model_info = ModelInfo.load_from_file(str(metadata_path), model_device, model_dtype)
 
     # Instantiate model and create fusion map based on architecture
-    if model_info.architecture.type.lower() == 'qwen3':
+    if model_info.architecture.type.lower() == "qwen3":
         model = Qwen3ForCausalLM(model_info.architecture)
         fusion_map = create_qwen3_fusion_map(model)
     else:
@@ -121,11 +125,17 @@ def load_model(config: dict):
             weights_path = model_path / model_name / param_file
             with ztensor.Reader(str(weights_path)) as reader:
                 tensor_names = reader.get_tensor_names()
-                pbar_desc = f"Loading {param_file[:30]}..." if len(param_file) > 30 else f"Loading {param_file}"
+                pbar_desc = (
+                    f"Loading {param_file[:30]}..."
+                    if len(param_file) > 30
+                    else f"Loading {param_file}"
+                )
                 for name in tqdm(tensor_names, desc=pbar_desc, unit="tensors"):
                     # If tensor is part of a fusion, buffer it
                     if name in source_to_fusion_target:
-                        pending_fusion_tensors[name] = reader.read_tensor(name, to="torch")
+                        pending_fusion_tensors[name] = reader.read_tensor(
+                            name, to="torch"
+                        )
                         continue
 
                     # Load standard, non-fused tensor
@@ -133,7 +143,9 @@ def load_model(config: dict):
                         param = model.state_dict()[name]
                         tensor_data = reader.read_tensor(name, to="torch")
                         if tensor_data.shape != param.shape:
-                            print(f"    Warning: Shape mismatch for tensor '{name}'. Skipping.")
+                            print(
+                                f"    Warning: Shape mismatch for tensor '{name}'. Skipping."
+                            )
                             continue
                         with torch.no_grad():
                             param.copy_(tensor_data, non_blocking=True)
@@ -147,7 +159,9 @@ def load_model(config: dict):
                 fused_tensor = torch.cat(tensors_to_fuse, dim=details["dim"])
                 param = model.state_dict()[target_name]
                 if fused_tensor.shape != param.shape:
-                    print(f"    Warning: Shape mismatch for fused tensor '{target_name}'. Skipping.")
+                    print(
+                        f"    Warning: Shape mismatch for fused tensor '{target_name}'. Skipping."
+                    )
                     continue
                 with torch.no_grad():
                     param.copy_(fused_tensor, non_blocking=True)
@@ -155,7 +169,9 @@ def load_model(config: dict):
 
         # Handle weight tying for lm_head
         if "lm_head.weight" in model_state_keys and "lm_head.weight" not in loaded_keys:
-            model.state_dict()["lm_head.weight"].copy_(model.model.embed_tokens.weight, non_blocking=True)
+            model.state_dict()["lm_head.weight"].copy_(
+                model.model.embed_tokens.weight, non_blocking=True
+            )
             loaded_keys.add("lm_head.weight")
 
         missing_keys = model_state_keys - loaded_keys
@@ -170,10 +186,15 @@ def load_model(config: dict):
         return model, model_info
 
     except ztensor.ZTensorError as e:
-        print(f"Fatal Error: Failed to read a ztensor file. Error: {e}", file=sys.stderr)
+        print(
+            f"Fatal Error: Failed to read a ztensor file. Error: {e}", file=sys.stderr
+        )
         sys.exit(1)
     except Exception as e:
-        print(f"An unexpected fatal error occurred during model loading: {e}", file=sys.stderr)
+        print(
+            f"An unexpected fatal error occurred during model loading: {e}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
@@ -189,16 +210,18 @@ def start_service(config, model, model_info):
         endpoint = f"tcp://{config['host']}:{config['port']}"
         real_endpoint = f"tcp://*:{config['port']}"
 
-    handler = Handler(model=model,
-                      model_info=model_info,
-                      kv_page_size=config["kv_page_size"],
-                      max_dist_size=config["max_dist_size"],
-                      max_num_kv_pages=config["max_num_kv_pages"],
-                      max_num_embeds=config["max_num_embeds"],
-                      max_num_adapters=config["max_num_adapters"],
-                      max_adapter_rank=config["max_adapter_rank"],
-                      dtype=getattr(torch, config['dtype']),
-                      device=config["device"])
+    handler = Handler(
+        model=model,
+        model_info=model_info,
+        kv_page_size=config["kv_page_size"],
+        max_dist_size=config["max_dist_size"],
+        max_num_kv_pages=config["max_num_kv_pages"],
+        max_num_embeds=config["max_num_embeds"],
+        max_num_adapters=config["max_num_adapters"],
+        max_adapter_rank=config["max_adapter_rank"],
+        dtype=getattr(torch, config["dtype"]),
+        device=config["device"],
+    )
 
     context = zmq.Context()
     socket = context.socket(zmq.ROUTER)
@@ -228,22 +251,41 @@ def register(config, endpoint):
     try:
         with connect(controller_addr) as websocket:
             # Authenticate with the controller
-            websocket.send(msgpack.packb({
-                "type": "authenticate", "corr_id": 0, "token": config["auth_token"]
-            }, use_bin_type=True))
+            websocket.send(
+                msgpack.packb(
+                    {
+                        "type": "authenticate",
+                        "corr_id": 0,
+                        "token": config["auth_token"],
+                    },
+                    use_bin_type=True,
+                )
+            )
             auth_response = msgpack.unpackb(websocket.recv(), raw=False)
             if not auth_response.get("successful"):
-                print(f"Authentication failed: {auth_response.get('result', 'Unknown error')}")
+                print(
+                    f"Authentication failed: {auth_response.get('result', 'Unknown error')}"
+                )
                 sys.exit(1)
 
             # Register the service endpoint
-            websocket.send(msgpack.packb({
-                "type": "attach_remote_service", "corr_id": 0, "endpoint": endpoint,
-                "service_name": config["model"], "service_type": "model"
-            }, use_bin_type=True))
+            websocket.send(
+                msgpack.packb(
+                    {
+                        "type": "attach_remote_service",
+                        "corr_id": 0,
+                        "endpoint": endpoint,
+                        "service_name": config["model"],
+                        "service_type": "model",
+                    },
+                    use_bin_type=True,
+                )
+            )
             reg_response = msgpack.unpackb(websocket.recv(), raw=False)
             if not reg_response.get("successful"):
-                print(f"Controller registration failed: {reg_response.get('result', 'Unknown error')}")
+                print(
+                    f"Controller registration failed: {reg_response.get('result', 'Unknown error')}"
+                )
                 sys.exit(1)
 
             print(f"Registered with controller at {controller_addr}")
@@ -280,11 +322,14 @@ def run_zmq_server(socket, handler):
 
             client_identity, corr_id_bytes, handler_id_bytes = message[:3]
             try:
-                corr_id = struct.unpack('>I', corr_id_bytes)[0]
-                handler_id = struct.unpack('>I', handler_id_bytes)[0]
+                corr_id = struct.unpack(">I", corr_id_bytes)[0]
+                handler_id = struct.unpack(">I", handler_id_bytes)[0]
                 reqs = [DECODERS[handler_id].decode(m) for m in message[3:]]
             except (struct.error, KeyError, msgspec.DecodeError) as e:
-                print(f"[!] Error decoding request header or payload: {e}", file=sys.stderr)
+                print(
+                    f"[!] Error decoding request header or payload: {e}",
+                    file=sys.stderr,
+                )
                 continue
 
             if not reqs:
@@ -309,8 +354,9 @@ def run_zmq_server(socket, handler):
                     print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
 
             if resps:
-                response_msg = [client_identity, corr_id_bytes, handler_id_bytes] + \
-                               [MSGPACK_ENCODER.encode(r) for r in resps]
+                response_msg = [client_identity, corr_id_bytes, handler_id_bytes] + [
+                    MSGPACK_ENCODER.encode(r) for r in resps
+                ]
                 socket.send_multipart(response_msg)
 
         except zmq.ZMQError as e:

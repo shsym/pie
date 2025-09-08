@@ -7,6 +7,7 @@ from typing import Optional
 # 1. DATA STRUCTURES (using msgspec.Struct and modern type hints)
 # ==============================================================================
 
+
 class HandshakeRequest(msgspec.Struct, gc=False):
     version: str
 

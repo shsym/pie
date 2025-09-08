@@ -21,7 +21,7 @@ Cargo.lock
 .idea/
 
 # VSCode
-.vscode
+# .vscode is not sensitive to security, so we can keep it in the repo. Useful for Pylint configuration.
 *.code-workspace
 
 # Byte-compiled / optimized / DLL files

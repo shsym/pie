@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+
 class _TorchProfiler:
     """The internal profiler class. Users should interact with the global API."""
 
@@ -14,7 +15,9 @@ class _TorchProfiler:
         name: str
         parent: _TorchProfiler.Node | None
         children: list[_TorchProfiler.Node] = field(default_factory=list)
-        times: list[float] = field(default_factory=list) # Raw timings for this node (self time)
+        times: list[float] = field(
+            default_factory=list
+        )  # Raw timings for this node (self time)
         # Metrics calculated from timings
         count: int = 0
         mean: float = 0.0
@@ -38,7 +41,7 @@ class _TorchProfiler:
             new_node = self.Node(name=full_path, parent=self.active_node)
             self.active_node.children.append(new_node)
             self._node_map[full_path] = new_node
-        
+
         return self.Timer(self, self._node_map[full_path])
 
     class Timer(ContextDecorator):
@@ -59,7 +62,7 @@ class _TorchProfiler:
             torch.cuda.synchronize()
             elapsed_ms = self.start_event.elapsed_time(stop_event)
             self.node.times.append(elapsed_ms)
-            
+
             if self.node.parent:
                 self.profiler.active_node = self.node.parent
             return False
@@ -82,17 +85,27 @@ class _TorchProfiler:
             return node.total_mean
 
         calculate_total(self.root)
-        
+
         print("\n--- 🌲 Performance Report 🌲 ---")
-        print(f"{'Operation':<50} {'Avg Latency (ms)':<20} {'% of Parent':<15} {'Std Dev (ms)':<20} {'Samples':<10}")
+        print(
+            f"{'Operation':<50} {'Avg Latency (ms)':<20} {'% of Parent':<15} {'Std Dev (ms)':<20} {'Samples':<10}"
+        )
         print("-" * 115)
 
-        def print_node(node: _TorchProfiler.Node, indent: str = "", is_last: bool = True):
+        def print_node(
+            node: _TorchProfiler.Node, indent: str = "", is_last: bool = True
+        ):
             if not node.name.startswith("root"):
-                name_part = node.name.split('.')[-1]
+                name_part = node.name.split(".")[-1]
                 line_char = "└── " if is_last else "├── "
-                parent_total = node.parent.total_mean if node.parent else node.total_mean
-                percent_str = f"{(node.total_mean / parent_total * 100):.1f}%" if parent_total > 1e-6 else ""
+                parent_total = (
+                    node.parent.total_mean if node.parent else node.total_mean
+                )
+                percent_str = (
+                    f"{(node.total_mean / parent_total * 100):.1f}%"
+                    if parent_total > 1e-6
+                    else ""
+                )
 
                 print(
                     f"{indent}{line_char}{name_part:<{46 - len(indent)}}"
@@ -104,10 +117,10 @@ class _TorchProfiler:
                 child_indent = indent + ("    " if is_last else "│   ")
                 for i, child in enumerate(node.children):
                     print_node(child, child_indent, i == len(node.children) - 1)
-        
+
         for i, child in enumerate(self.root.children):
-            print_node(child, is_last= i == len(self.root.children) - 1)
-            
+            print_node(child, is_last=i == len(self.root.children) - 1)
+
         print("-" * 115)
 
     def reset(self):
@@ -120,6 +133,7 @@ class _TorchProfiler:
 # --- GLOBAL PROFILER API ---
 PROFILER = _TorchProfiler()
 
+
 def start_profile(name: str) -> ContextDecorator:
     """
     Starts a new profiling scope. Use as a context manager.
@@ -129,9 +143,11 @@ def start_profile(name: str) -> ContextDecorator:
     """
     return PROFILER.start(name)
 
+
 def report_profiling_results():
     """Calculates and prints the final hierarchical report."""
     PROFILER.report()
+
 
 def reset_profiler():
     """Resets all profiling data."""

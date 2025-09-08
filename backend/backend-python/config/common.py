@@ -85,6 +85,12 @@ class ModelInfo:
                 from .qwen3 import Qwen3Arch  # pylint: disable=import-outside-toplevel
 
                 arch = Qwen3Arch.from_config(cfg)
+            case "gptoss":
+                from .gptoss import (  # pylint: disable=import-outside-toplevel
+                    GPTOSSArch,
+                )
+
+                arch = GPTOSSArch.from_config(cfg)
             case _:
                 raise ValueError(f"Unsupported architecture type: {arch_dict['type']}")
 

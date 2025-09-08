@@ -140,17 +140,17 @@ class Qwen3Attention(nn.Module):
         )
 
     def forward(
-            self,
-            wrapper,
-            hidden_states: torch.Tensor,
-            position_ids: torch.Tensor,
-            kv_cache_at_layer: torch.Tensor,
-            kv_page_indices: torch.Tensor,
-            kv_page_indptr: torch.Tensor,
-            kv_last_page_lens: torch.Tensor,
-            batch_indices: torch.Tensor,
-            batch_positions: torch.Tensor,
-            adapter_subpass: AdapterSubpass | None
+        self,
+        wrapper,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the attention module."""
 
@@ -168,7 +168,7 @@ class Qwen3Attention(nn.Module):
                 hidden_states,
                 q_state=query_states,
                 k_state=key_states,
-                v_state=value_states
+                v_state=value_states,
             )
 
         # Reshape and continue as before
@@ -242,17 +242,17 @@ class Qwen3DecoderLayer(nn.Module):
         )
 
     def forward(
-            self,
-            wrapper,
-            hidden_states: torch.Tensor,
-            position_ids: torch.Tensor,
-            kv_cache_at_layer: torch.Tensor,
-            kv_page_indices: torch.Tensor,
-            kv_page_indptr: torch.Tensor,
-            kv_last_page_lens: torch.Tensor,
-            batch_indices: torch.Tensor,
-            batch_positions: torch.Tensor,
-            adapter_subpass: AdapterSubpass | None
+        self,
+        wrapper,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the decoder layer."""
         residual = hidden_states
@@ -325,17 +325,17 @@ class Qwen3Model(nn.Module):
         )
 
     def forward(
-            self,
-            input_embeds: torch.Tensor,
-            position_ids: torch.Tensor,
-            qo_indptr: torch.Tensor,
-            kv_cache_at_layer: torch.Tensor,
-            kv_page_indices: torch.Tensor,
-            kv_page_indptr: torch.Tensor,
-            kv_last_page_lens: torch.Tensor,
-            custom_mask: torch.Tensor,
-            single_token_inference_mode: bool,
-            adapter_subpass: AdapterSubpass | None
+        self,
+        input_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        custom_mask: torch.Tensor,
+        single_token_inference_mode: bool,
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the Qwen3 model."""
         hidden_states = input_embeds
