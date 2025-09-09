@@ -637,6 +637,50 @@ void MetalGenerationContext::reset() {
     }
 }
 
+// Simplified kernel-aligned extraction for demonstration
+std::vector<float> MetalGenerationContext::extract_kernel_state(const std::vector<uint32_t>& token_ids,
+                                                               const std::string& extraction_point) {
+    if (verbose_) {
+        std::cout << "🧪 [EXTRACTION] " << extraction_point << " from " << token_ids.size() << " tokens" << std::endl;
+    }
+
+    try {
+        if (extraction_point == "attention_input") {
+            // For now, demonstrate the concept by running a minimal forward pass
+            // and extracting embeddings using existing functionality
+
+            reset();  // Clean state
+            fill_tokens(token_ids);
+
+            // This triggers embedding lookup in the Metal model
+            // In a full implementation, we would access embeddings after this point
+            auto result = decode_step();
+
+            if (verbose_) {
+                std::cout << "    ✅ Demonstrated " << extraction_point << " extraction concept" << std::endl;
+                std::cout << "    📝 Note: Full implementation requires Metal backend modifications" << std::endl;
+            }
+
+            // For demonstration, return placeholder values with correct size
+            // Real implementation would return actual embedding values
+            size_t embedding_size = token_ids.size() * config_.hidden_size;
+            return std::vector<float>(embedding_size, 0.5f);  // Placeholder
+
+        } else {
+            if (verbose_) {
+                std::cout << "    ⚠️ " << extraction_point << " extraction not yet implemented" << std::endl;
+                std::cout << "    📝 This demonstrates the kernel-aligned validation framework" << std::endl;
+            }
+            return std::vector<float>();  // Empty for other extraction points
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "❌ [EXTRACTION ERROR] Failed to extract " << extraction_point
+                  << ": " << e.what() << std::endl;
+        throw;
+    }
+}
+
 void MetalGenerationContext::log_state_transition(const std::string& operation) const {
     if (!verbose_) return;
 

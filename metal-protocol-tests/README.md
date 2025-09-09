@@ -147,3 +147,50 @@ The harness inspects the CUDA case’s meta.json (for example: tests/artifacts/r
 | topk_mask_logits | ✅ | `--op topk_mask_logits --num_tokens 4 --vocab_size 50 --k 10` |
 | grouped_gemm | ✅ | `--op grouped_gemm` |
 | batch_prefill_attention | ✅ | `--op batch_prefill_attention --num_tokens 4 --num_query_heads 2 --num_kv_heads 2 --head_size 8 --kv_len 16 --page_size 128` |
+
+## End-to-end Testing
+
+Full pipeline testing with Llama 3.2 1B Instruct model for conversational inference.
+
+### Prerequisites
+
+1. **Model Download**: Download the Llama 3.2 1B Instruct model in zTensor format
+   ```bash
+   # Model should be available at:
+   ~/.cache/pie/llama-3.2-1b-instruct/llama-3.2-1b-instruct.zt
+   # Or set custom path with PIE_MODEL_PATH environment variable
+   ```
+
+2. **Build Integration Test**:
+   ```bash
+   cd metal-protocol-tests
+   mkdir -p build && cd build
+   cmake .. -DCMAKE_BUILD_TYPE=Release
+   make test_forward_pass_integration
+   ```
+
+### Running End-to-End Tests
+
+**Basic test with default model path**:
+```bash
+./tests/bin/test_forward_pass_integration
+```
+
+**Test with custom model path**:
+```bash
+PIE_MODEL_PATH="/path/to/your/model.zt" ./tests/bin/test_forward_pass_integration
+```
+
+### What the Test Does
+
+1. **Model Loading**: Loads Llama 3.2 1B Instruct weights from zTensor format
+2. **Chat Format**: Uses proper Llama 3.2 Instruct chat template:
+   ```
+   <|begin_of_text|><|start_header_id|>user<|end_header_id|>
+
+   Hello, how are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+   ```
+3. **Forward Pass**: Runs complete inference through all 16 transformer layers
+4. **Probability Analysis**: Extracts top-50 token probabilities for next token prediction
+5. **Validation**: Verifies probability distributions sum to 1.0 (correct softmax normalization)

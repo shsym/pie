@@ -231,6 +231,18 @@ public:
      */
     void reset();
 
+    // --- Kernel-aligned Extraction for CUDA Validation ---
+
+    /**
+     * @brief Extract intermediate values at specific kernel boundaries
+     * Provides streamlined access to Metal computation states for CUDA comparison
+     * @param token_ids Tokens to process
+     * @param extraction_point Kernel boundary: "attention_input", "query", "key", "value", "attention_output"
+     * @return Extracted values as float32 vector for comparison
+     */
+    std::vector<float> extract_kernel_state(const std::vector<uint32_t>& token_ids,
+                                           const std::string& extraction_point);
+
 private:
     // --- Internal KV Cache Management (mirrors CUDA Context) ---
 

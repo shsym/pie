@@ -274,6 +274,7 @@ std::map<std::string, MetalTensor<T>*> MetalL4maForCausalLM<T>::get_parameters()
     return model_.get_parameters();
 }
 
+
 // Model loading utilities implementation
 namespace MetalModelUtils {
 

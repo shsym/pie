@@ -117,6 +117,7 @@ set_source_files_properties(
     ${REPO_ROOT}/backend/backend-metal/src/metal_add_residual.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_append_paged_kv_cache.mm
     ${REPO_ROOT}/backend/backend-metal/src/metal_common.mm
+    ${REPO_ROOT}/backend/backend-metal/src/metal_dtype_conversion.mm
     PROPERTIES COMPILE_FLAGS "-fobjc-arc"
 )
 
@@ -173,6 +174,7 @@ set(BACKEND_SOURCES_ORGANIZED
     ${BACKEND_SRC_PATH}/metal_tensor.mm
     ${BACKEND_SRC_PATH}/metal_kv_cache.mm
     ${BACKEND_SRC_PATH}/metal_model.mm
+    ${BACKEND_SRC_PATH}/metal_dtype_conversion.mm
 )
 
 # Additional backend libraries to link against
