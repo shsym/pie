@@ -3,7 +3,7 @@ use crate::instance::InstanceState;
 use crate::messaging::{PubSubCommand, PushPullCommand, dispatch_i2i, dispatch_u2i};
 use crate::model::ModelInfo;
 use crate::resource::{ResourceId, ResourceTypeId};
-use crate::{bindings, kvs, model, resource, server};
+use crate::{bindings, kvs, model, server};
 use bytes::Bytes;
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -120,11 +120,6 @@ impl bindings::pie::inferlet::core::Host for InstanceState {
 
     async fn get_arguments(&mut self) -> anyhow::Result<Vec<String>> {
         Ok(self.arguments().to_vec())
-    }
-
-    async fn set_return(&mut self, value: String) -> anyhow::Result<()> {
-        self.return_value = Some(value);
-        Ok(())
     }
 
     async fn get_model(&mut self, name: String) -> anyhow::Result<Option<Resource<Model>>> {
@@ -311,24 +306,11 @@ impl bindings::pie::inferlet::core::Host for InstanceState {
         &mut self,
         queue: Resource<Queue>,
         resource_type: ResourceTypeId,
-        mut ptrs: Vec<ResourceId>,
+        ptrs: Vec<ResourceId>,
         name: String,
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let svc_id = self.ctx().table.get(&queue)?.service_id;
-
-        ptrs.iter_mut().try_for_each(|ptr| {
-            *ptr = self
-                .translate_resource_ptr(svc_id, resource_type, *ptr)
-                .ok_or_else(|| {
-                    anyhow::format_err!(
-                        "Failed to translate exported reousrces with ptr: {:?}",
-                        ptr
-                    )
-                })?;
-            Ok::<_, anyhow::Error>(())
-        })?;
-
         model::Command::Export {
             inst_id,
             type_id: resource_type,

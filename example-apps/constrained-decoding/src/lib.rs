@@ -1,7 +1,7 @@
 mod tokenizer;
 
 use crate::tokenizer::BytePairEncoder;
-use inferlet::sampler::Sample;
+use inferlet::sampler::Sampler;
 use inferlet::traits::Tokenize;
 use inferlet::traits::tokenize::Tokenizer;
 use llguidance::api::TopLevelGrammar;
@@ -83,7 +83,7 @@ impl ConstrainedSampler {
     }
 }
 
-impl Sample for ConstrainedSampler {
+impl Sampler for ConstrainedSampler {
     fn sample(&mut self, token_ids: &[u32], probs: &[f32]) -> u32 {
         let res = self.constraint.compute_mask();
 

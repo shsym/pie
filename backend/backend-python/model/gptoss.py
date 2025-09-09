@@ -1,0 +1,638 @@
+"""GPT OSS Large Language Model Architecture"""
+
+from __future__ import annotations
+
+import math
+import torch
+from torch import nn
+import torch.distributed as dist
+
+import flashinfer as ops
+from adapter import AdapterSubpass
+
+from config.gptoss import GPTOSSArch
+
+VERSION = "0.1.0"
+
+
+def create_fusion_map(model: nn.Module):
+    """
+    Analyzes the model and creates a map for fusing weights.
+
+    Returns:
+        A dictionary mapping {fused_tensor_name: {"sources": [source_names], "dim": cat_dim}}.
+    """
+    fusion_map = {}
+    for name, module in model.named_modules():
+        # --- Rule for GPTOSSAttention QKV Fusion ---
+        if isinstance(module, GPTOSSAttention):
+            # Handle weights
+            target_w = f"{name}.qkv_proj.weight"
+            sources_w = [
+                f"{name}.q_proj.weight",
+                f"{name}.k_proj.weight",
+                f"{name}.v_proj.weight",
+            ]
+            fusion_map[target_w] = {"sources": sources_w, "dim": 0}
+
+            # Handle biases if they exist
+            if module.qkv_proj.bias is not None:
+                target_b = f"{name}.qkv_proj.bias"
+                sources_b = [
+                    f"{name}.q_proj.bias",
+                    f"{name}.k_proj.bias",
+                    f"{name}.v_proj.bias",
+                ]
+                fusion_map[target_b] = {"sources": sources_b, "dim": 0}
+
+    return fusion_map
+
+
+class RMSNorm(nn.Module):
+    """RMS Normalization layer."""
+
+    def __init__(
+        self, num_features: int, eps: float = 1e-05, device: torch.device | None = None
+    ):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.scale = nn.Parameter(
+            torch.ones(num_features, device=device, dtype=torch.float32)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the RMSNorm layer."""
+        assert x.shape[-1] == self.num_features
+        t, dtype = x.float(), x.dtype
+        t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + self.eps)
+        return (t * self.scale).to(dtype)
+
+
+def _apply_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply rotary embedding to input tensor."""
+    cos = cos.unsqueeze(-2).to(x.dtype)
+    sin = sin.unsqueeze(-2).to(x.dtype)
+    x1, x2 = torch.chunk(x, 2, dim=-1)
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    return torch.cat((o1, o2), dim=-1)
+
+
+class RotaryEmbedding(nn.Module):
+    """Rotary Position Embedding with YaRN scaling support."""
+
+    def __init__(
+        self,
+        head_dim: int,
+        base: int,
+        dtype: torch.dtype,
+        initial_context_length: int = 4096,
+        scaling_factor: float = 1.0,
+        ntk_alpha: float = 1.0,
+        ntk_beta: float = 32.0,
+        device: torch.device | None = None,
+    ) -> None:
+        super().__init__()
+        self.head_dim = head_dim
+        self.base = base
+        self.dtype = dtype
+        self.initial_context_length = initial_context_length
+        self.scaling_factor = scaling_factor
+        self.ntk_alpha = ntk_alpha
+        self.ntk_beta = ntk_beta
+        self.device = device
+
+    def _compute_concentration_and_inv_freq(self) -> tuple[float, torch.Tensor]:
+        """See YaRN paper: https://arxiv.org/abs/2309.00071"""
+        freq = self.base ** (
+            torch.arange(0, self.head_dim, 2, dtype=torch.float, device=self.device)
+            / self.head_dim
+        )
+        if self.scaling_factor > 1.0:
+            concentration = (
+                0.1 * math.log(self.scaling_factor) + 1.0
+            )  # YaRN concentration
+
+            d_half = self.head_dim / 2
+            # NTK by parts
+            low = (
+                d_half
+                * math.log(self.initial_context_length / (self.ntk_beta * 2 * math.pi))
+                / math.log(self.base)
+            )
+            high = (
+                d_half
+                * math.log(self.initial_context_length / (self.ntk_alpha * 2 * math.pi))
+                / math.log(self.base)
+            )
+            assert 0 < low < high < d_half - 1
+
+            interpolation = 1.0 / (self.scaling_factor * freq)
+            extrapolation = 1.0 / freq
+
+            ramp = (
+                torch.arange(d_half, dtype=torch.float32, device=freq.device) - low
+            ) / (high - low)
+            mask = 1 - ramp.clamp(0, 1)
+
+            inv_freq = interpolation * (1 - mask) + extrapolation * mask
+        else:
+            concentration = 1.0
+            inv_freq = 1.0 / freq
+
+        return concentration, inv_freq
+
+    def _compute_cos_sin(self, num_tokens: int):
+        """Compute cosine and sine values for rotary embedding."""
+        concentration, inv_freq = self._compute_concentration_and_inv_freq()
+        t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        cos = freqs.cos() * concentration
+        sin = freqs.sin() * concentration
+        return cos, sin
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary embedding to query and key tensors."""
+        num_tokens = query.shape[0]
+        cos, sin = self._compute_cos_sin(num_tokens)
+
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_dim)
+        query = _apply_rotary_emb(query, cos, sin)
+        query = query.reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, self.head_dim)
+        key = _apply_rotary_emb(key, cos, sin)
+        key = key.reshape(key_shape)
+        return query, key
+
+
+def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
+    """SwiGLU activation function with clamping."""
+    x_glu, x_linear = x[..., ::2], x[..., 1::2]
+    # Clamp the input values
+    x_glu = x_glu.clamp(min=None, max=limit)
+    x_linear = x_linear.clamp(min=-limit, max=limit)
+    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+    # Note we add an extra bias of 1 to the linear layer
+    return out_glu * (x_linear + 1)
+
+
+class GPTOSSAttention(nn.Module):
+    """GPT OSS attention module with FlashInfer support and sink tokens."""
+
+    def __init__(self, config: GPTOSSArch, layer_idx: int):
+        """Initialize the GPT OSS attention module."""
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = config.head_size
+        self.num_attention_heads = config.num_query_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        # Only apply sliding window to every other layer
+        self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
+
+        # Define the output sizes for Q, K, and V for clarity
+        self.q_size = config.num_query_heads * config.head_size
+        self.k_size = config.num_key_value_heads * config.head_size
+        self.v_size = config.num_key_value_heads * config.head_size
+
+        # Sink tokens parameter
+        self.sinks = nn.Parameter(
+            torch.empty(
+                config.num_query_heads,
+                device=torch.device(config.device),
+                dtype=getattr(torch, config.dtype),
+            )
+        )
+
+        self.norm = RMSNorm(config.hidden_size, device=torch.device(config.device))
+
+        qkv_dim = config.head_size * (
+            config.num_query_heads + 2 * config.num_key_value_heads
+        )
+        self.qkv_proj = nn.Linear(
+            config.hidden_size,
+            qkv_dim,
+            device=torch.device(config.device),
+            dtype=getattr(torch, config.dtype),
+        )
+        self.o_proj = nn.Linear(
+            config.head_size * config.num_query_heads,
+            config.hidden_size,
+            device=torch.device(config.device),
+            dtype=getattr(torch, config.dtype),
+        )
+        self.sm_scale = 1 / math.sqrt(config.head_size)
+
+        self.rope = RotaryEmbedding(
+            config.head_size,
+            int(config.rope_theta),
+            torch.float32,
+            initial_context_length=config.initial_context_length,
+            scaling_factor=config.rope_scaling_factor,
+            ntk_alpha=config.rope_ntk_alpha,
+            ntk_beta=config.rope_ntk_beta,
+            device=torch.device(config.device),
+        )
+
+    def forward(
+        self,
+        wrapper,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,  # pylint: disable=unused-argument
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
+        adapter_subpass: AdapterSubpass | None,
+    ) -> torch.Tensor:
+        """Forward pass through the attention module."""
+        n, _ = hidden_states.size()
+
+        # Pre-attention norm
+        t = self.norm(hidden_states)
+        qkv_states = self.qkv_proj(t)
+
+        query_states, key_states, value_states = torch.split(
+            qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
+        )
+
+        # apply adapters if provided
+        if adapter_subpass is not None:
+            adapter_subpass.execute(
+                self.layer_idx,
+                hidden_states,
+                q_state=query_states,
+                k_state=key_states,
+                v_state=value_states,
+            )
+
+        # Reshape for multi-head attention
+        query_states = query_states.view(
+            -1,
+            self.num_key_value_heads,
+            self.num_attention_heads // self.num_key_value_heads,
+            self.head_dim,
+        )
+        key_states = key_states.view(-1, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(-1, self.num_key_value_heads, self.head_dim)
+
+        # Apply rotary embedding
+        query_states, key_states = self.rope(query_states, key_states)
+
+        # Use FlashInfer for efficient attention computation
+        ops.append_paged_kv_cache(
+            append_key=key_states,
+            append_value=value_states,
+            batch_indices=batch_indices,
+            positions=batch_positions,
+            paged_kv_cache=kv_cache_at_layer[self.layer_idx],
+            kv_indices=kv_page_indices,
+            kv_indptr=kv_page_indptr,
+            kv_last_page_len=kv_last_page_lens,
+            kv_layout="NHD",
+        )
+
+        attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
+        attn_output = attn_output.reshape(n, -1)
+
+        attn_output = self.o_proj(attn_output)
+
+        # Residual connection
+        return hidden_states + attn_output
+
+
+class GPTOSSMlp(nn.Module):
+    """GPT OSS MLP layer with Mixture of Experts."""
+
+    def __init__(self, config: GPTOSSArch):
+        """Initialize the GPT OSS MLP layer."""
+        super().__init__()
+        self.config = config
+        self.num_experts = config.num_experts
+        self.experts_per_token = config.experts_per_token
+        self.swiglu_limit = config.swiglu_limit
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+        self.norm = RMSNorm(config.hidden_size, device=torch.device(config.device))
+        self.gate = nn.Linear(
+            config.hidden_size,
+            config.num_experts,
+            device=torch.device(config.device),
+            dtype=getattr(torch, config.dtype),
+        )
+
+        assert config.intermediate_size % self.world_size == 0
+        self.mlp1_weight = nn.Parameter(
+            torch.empty(
+                (
+                    config.num_experts,
+                    config.intermediate_size * 2 // self.world_size,
+                    config.hidden_size,
+                ),
+                device=torch.device(config.device),
+                dtype=getattr(torch, config.dtype),
+            )
+        )
+        self.mlp1_bias = nn.Parameter(
+            torch.empty(
+                (config.num_experts, config.intermediate_size * 2 // self.world_size),
+                device=torch.device(config.device),
+                dtype=getattr(torch, config.dtype),
+            )
+        )
+        self.mlp2_weight = nn.Parameter(
+            torch.empty(
+                (
+                    config.num_experts,
+                    config.hidden_size,
+                    config.intermediate_size // self.world_size,
+                ),
+                device=torch.device(config.device),
+                dtype=getattr(torch, config.dtype),
+            )
+        )
+        self.mlp2_bias = nn.Parameter(
+            torch.empty(
+                (config.num_experts, config.hidden_size),
+                device=torch.device(config.device),
+                dtype=getattr(torch, config.dtype),
+            )
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the MLP layer."""
+        t = self.norm(x)
+        g = self.gate(t)
+        experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
+        expert_weights = torch.nn.functional.softmax(experts.values, dim=1)
+        expert_indices = experts.indices
+
+        # MLP #1
+        mlp1_weight = self.mlp1_weight[expert_indices, ...]
+        mlp1_bias = self.mlp1_bias[expert_indices, ...]
+        t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
+        t = swiglu(t, limit=self.swiglu_limit)
+
+        # MLP #2
+        mlp2_weight = self.mlp2_weight[expert_indices, ...]
+        mlp2_bias = self.mlp2_bias[expert_indices, ...]
+        t = torch.einsum("beck,bek->bec", mlp2_weight, t)
+        if self.world_size > 1:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t += mlp2_bias
+
+        # Weighted sum of experts
+        t = torch.einsum("bec,be->bc", t, expert_weights)
+
+        return x + t
+
+
+class GPTOSSDecoderLayer(nn.Module):
+    """GPT OSS decoder layer."""
+
+    def __init__(self, config: GPTOSSArch, layer_idx: int):
+        """Initialize the GPT OSS decoder layer."""
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.self_attn = GPTOSSAttention(config, layer_idx)
+        self.mlp = GPTOSSMlp(config)
+
+    def forward(
+        self,
+        wrapper,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
+        adapter_subpass: AdapterSubpass | None,
+    ) -> torch.Tensor:
+        """Forward pass through the decoder layer."""
+        # Self Attention
+        hidden_states = self.self_attn(
+            wrapper=wrapper,
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            kv_cache_at_layer=kv_cache_at_layer,
+            kv_page_indices=kv_page_indices,
+            kv_page_indptr=kv_page_indptr,
+            kv_last_page_lens=kv_last_page_lens,
+            batch_indices=batch_indices,
+            batch_positions=batch_positions,
+            adapter_subpass=adapter_subpass,
+        )
+
+        # MLP
+        hidden_states = self.mlp(hidden_states)
+
+        return hidden_states
+
+
+class GPTOSSModel(nn.Module):
+    """GPT OSS model with FlashInfer support."""
+
+    def __init__(self, config: GPTOSSArch):
+        """Initialize the GPT OSS model."""
+        super().__init__()
+        self.config = config
+
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            padding_idx=0,
+            device=torch.device(config.device),
+            dtype=getattr(torch, config.dtype),
+        )
+        self.layers = nn.ModuleList(
+            [
+                GPTOSSDecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_layers)
+            ]
+        )
+        self.norm = RMSNorm(
+            config.hidden_size,
+            device=torch.device(config.device),
+        )
+
+        self.workspace_buffer = torch.empty(
+            128 * 1024 * 1024, dtype=torch.uint8, device=torch.device(config.device)
+        )
+        self.wrapper_decode = ops.BatchDecodeWithPagedKVCacheWrapper(
+            self.workspace_buffer, "NHD"
+        )
+        self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(
+            self.workspace_buffer, "NHD"
+        )
+
+    def forward(
+        self,
+        input_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        custom_mask: torch.Tensor,
+        single_token_inference_mode: bool,
+        adapter_subpass: AdapterSubpass | None,
+    ) -> torch.Tensor:
+        """Forward pass through the GPT OSS model."""
+        hidden_states = input_embeds
+        n, _ = hidden_states.size()
+
+        page_size = kv_cache_at_layer[0].shape[2]
+
+        batch_indices, batch_positions = ops.get_batch_indices_positions(
+            append_indptr=qo_indptr,
+            seq_lens=ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size),
+            nnz=n,
+        )
+
+        # check if its decoding (qo_indptr is )
+        if single_token_inference_mode:
+            self.wrapper_decode.plan(
+                indptr=kv_page_indptr,
+                indices=kv_page_indices,
+                last_page_len=kv_last_page_lens,
+                num_qo_heads=self.config.num_query_heads,
+                num_kv_heads=self.config.num_key_value_heads,
+                head_dim=self.config.head_size,
+                page_size=page_size,
+                pos_encoding_mode="NONE",
+                q_data_type=self.config.dtype,
+            )
+            wrapper = self.wrapper_decode
+        else:
+            self.wrapper_append.plan(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=kv_page_indptr,
+                paged_kv_indices=kv_page_indices,
+                paged_kv_last_page_len=kv_last_page_lens,
+                num_qo_heads=self.config.num_query_heads,
+                num_kv_heads=self.config.num_key_value_heads,
+                head_dim_qk=self.config.head_size,
+                page_size=page_size,
+                custom_mask=custom_mask,
+                q_data_type=self.config.dtype,
+            )
+            wrapper = self.wrapper_append
+
+        for decoder_layer in self.layers:
+            layer_outputs = decoder_layer(
+                wrapper=wrapper,
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                kv_cache_at_layer=kv_cache_at_layer,
+                kv_page_indices=kv_page_indices,
+                kv_page_indptr=kv_page_indptr,
+                kv_last_page_lens=kv_last_page_lens,
+                batch_indices=batch_indices,
+                batch_positions=batch_positions,
+                adapter_subpass=adapter_subpass,
+            )
+
+            hidden_states = layer_outputs
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states
+
+
+class GPTOSSForCausalLM(nn.Module):
+    """GPT OSS model for causal language modeling."""
+
+    def __init__(self, config: GPTOSSArch):
+        """Initialize the GPT OSS causal LM model."""
+        super().__init__()
+        self.config = config
+        self.model = GPTOSSModel(config)
+        self.lm_head = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            device=torch.device(config.device),
+            dtype=getattr(torch, config.dtype),
+        )
+
+    def forward(self):
+        """
+        Should not be called. Method 'forward' is abstract in class
+        'torch.nn.modules.module' so must be overridden in child class.
+        """
+        raise NotImplementedError("Should not be called")
+
+
+class GPTOSSTokenGenerator:
+    """Token generator for GPT OSS model (adapted from original implementation)."""
+
+    @torch.inference_mode()
+    def __init__(self, model: GPTOSSForCausalLM):
+        self.model = model
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt_tokens: list[int],
+        stop_tokens: list[int],
+        temperature: float = 1.0,
+        max_tokens: int = 0,
+        return_logprobs: bool = False,
+    ):
+        """Generate tokens from the model."""
+        tokens = list(prompt_tokens)
+        num_generated_tokens = 0
+        device = self.model.config.device
+
+        while max_tokens == 0 or num_generated_tokens < max_tokens:
+            # Create dummy inputs for the forward pass - this would need to be
+            # properly implemented based on how the project handles tokenization
+            input_ids = torch.as_tensor(tokens, dtype=torch.int32, device=device)
+
+            # This is a simplified version - the actual implementation would need
+            # to properly handle the model forward pass with all required inputs
+            # like kv_cache, position_ids, etc.
+            with torch.no_grad():
+                # Get embeddings
+                input_embeds = self.model.model.embed_tokens(input_ids)
+
+                # This is where you'd need to implement the proper forward pass
+                # with all the required FlashInfer components
+                # For now, we'll use a placeholder
+                logits = self.model.lm_head(input_embeds[-1:])  # Only last token
+
+            if temperature == 0.0:
+                predicted_token = torch.argmax(logits, dim=-1).item()
+            else:
+                probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
+                predicted_token = torch.multinomial(probs, num_samples=1).item()
+
+            tokens.append(int(predicted_token))
+            num_generated_tokens += 1
+
+            if return_logprobs:
+                logprobs = torch.log_softmax(logits, dim=-1)
+                selected_logprobs = logprobs[0, int(predicted_token)].item()
+                yield predicted_token, selected_logprobs
+            else:
+                yield predicted_token
+
+            if predicted_token in stop_tokens:
+                break

@@ -138,7 +138,7 @@ pub enum ServerMessage {
     #[serde(rename = "instance_event")]
     InstanceEvent {
         instance_id: String,
-        event: u32,
+        event: EventCode,
         message: String,
     },
 
@@ -478,7 +478,7 @@ impl Client {
     async fn send_inst_event(&mut self, inst_id: InstanceId, event: EventCode, message: String) {
         self.send(ServerMessage::InstanceEvent {
             instance_id: inst_id.to_string(),
-            event: event as u32,
+            event,
             message,
         })
         .await;
@@ -743,6 +743,7 @@ impl Client {
                 let model_service = match Model::new(&endpoint).await {
                     Ok(m) => m,
                     Err(e) => {
+
                         println!("Failed to create model backend: {:?}", e);
                         self.send_response(
                             corr_id,
