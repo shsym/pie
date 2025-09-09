@@ -14,6 +14,9 @@ interface core {
     // Retrieves POSIX-style CLI arguments passed to the inferlet from the remote user client
     get-arguments: func() -> list<string>;
 
+    // Sets the return value for the inferlet
+    set-return: func(value: string);
+
     // Retrieve a model by name; returns None if not found
     get-model: func(name: string) -> option<model>;
 

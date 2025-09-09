@@ -6,6 +6,17 @@ import subprocess
 import tempfile
 from pathlib import Path
 import uuid
+from enum import Enum
+
+
+class Event(Enum):
+    Message = 0
+    Completed = 1
+    Aborted = 2
+    Exception = 3
+    ServerError = 4
+    OutOfResources = 5
+
 
 class Instance:
     """Represents a running instance of a program on the server."""
@@ -22,11 +33,14 @@ class Instance:
         """Send a message to the instance."""
         await self.client.signal_instance(self.instance_id, message)
 
-    async def recv(self) -> tuple[str, str]:
+    async def recv(self) -> tuple[Event, str]:
         """Receive an event from the instance. Blocks until an event is available."""
         if self.event_queue is None:
             raise Exception("Event queue is not available for this instance.")
         event, msg = await self.event_queue.get()
+
+        # map event -> Event
+        event = Event(event)
         return event, msg
 
     async def terminate(self):
@@ -156,7 +170,6 @@ class PieClient:
         msg = {"type": "query", "subject": subject, "record": record}
         return await self._send_msg_and_wait(msg)
 
-
     async def program_exists(self, program_hash: str) -> bool:
         """Check if a program with the given hash exists on the server."""
         successful, result = await self.query("program_exists", program_hash)
@@ -238,8 +251,6 @@ class PieClient:
         await self.ws.send(encoded)
 
 
-
-
 def _compile_rust_sync(rust_code: str, cargo_toml_content: str, package_name: str) -> bytes:
     """
     [Internal Synchronous Helper] Compiles rust code in a temporary directory.
@@ -286,7 +297,8 @@ def _compile_rust_sync(rust_code: str, cargo_toml_content: str, package_name: st
         print("✅ Compilation successful! Reading WASM binary.")
         return wasm_path.read_bytes()
 
-async def compile_program(source: str|Path, dependencies: list[str]) -> bytes:
+
+async def compile_program(source: str | Path, dependencies: list[str]) -> bytes:
     """
     Compiles Rust source into a WASM binary and returns the bytes.
 

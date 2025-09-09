@@ -1,8 +1,9 @@
 pub use crate::bindings::pie::inferlet::core::Priority;
 use crate::bindings::pie::inferlet::{adapter, core, evolve, forward, image, tokenize};
 pub use crate::bindings_app::{export, exports::pie::inferlet::run::Guest as RunSync};
-pub use crate::context::Context;
 pub use crate::chat::ChatFormatter;
+pub use crate::context::Context;
+pub use crate::sampler::Sampler;
 use crate::wstd::runtime::AsyncPollable;
 pub use anyhow::Result;
 pub use inferlet_macros::main;
@@ -14,8 +15,8 @@ use wasi::exports::http::incoming_handler::{IncomingRequest, ResponseOutparam};
 pub use wstd;
 
 pub mod brle;
-pub mod context;
 pub mod chat;
+pub mod context;
 pub mod drafter;
 mod pool;
 pub mod sampler;
@@ -94,6 +95,10 @@ pub fn get_instance_id() -> String {
 /// Retrieves POSIX-style CLI arguments passed to the inferlet from the remote user client.
 pub fn get_arguments() -> Vec<String> {
     core::get_arguments()
+}
+
+pub fn set_return(value: &str) {
+    core::set_return(value);
 }
 
 /// Retrieve a model by its name.

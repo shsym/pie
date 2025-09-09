@@ -1,9 +1,9 @@
-use inferlet::sampler::{self, Sampler};
+use inferlet::sampler::{self, Sample};
 use inferlet::stop_condition::{self, StopCondition};
 
-use inferlet::Context;
-use std::time::Instant;
+use inferlet::{Context, Sampler};
 use inferlet::traits::Tokenize;
+use std::time::Instant;
 
 /// Generates text using a simple sliding window for KV cache management.
 ///
@@ -12,9 +12,9 @@ use inferlet::traits::Tokenize;
 /// masked and eventually evicted from the cache. This is the simplest form of
 /// windowed attention, suitable for tasks where only recent context is relevant.
 
-pub async fn generate_with_sliding_window<S: Sampler, C: StopCondition>(
+pub async fn generate_with_sliding_window<S: Sample, C: StopCondition>(
     ctx: &mut Context,
-    sampler: &mut S,
+    sampler: Sampler,
     stop_condition: &mut C,
     window_size: usize,
 ) -> String {
@@ -22,7 +22,7 @@ pub async fn generate_with_sliding_window<S: Sampler, C: StopCondition>(
     // The autoregressive generation loop
     loop {
         // 1. Decode the next token, sample, and add it to the pending buffer.
-        let dist = ctx.decode_step().await;
+        let dist = ctx.decode_step_dist().await;
         let next_token_id = sampler.sample(&dist.ids, &dist.probs);
         ctx.fill_token(next_token_id);
         generated_token_ids.push(next_token_id);

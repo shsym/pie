@@ -295,6 +295,18 @@ async fn start_interactive_session(
             unsafe {
                 cmd.pre_exec(|| {
                     nix::unistd::setsid()?;
+
+                    // On Linux, ask the kernel to send SIGKILL to this process when
+                    // the parent (the Rust program) dies. This handles accidental termination.
+                    #[cfg(target_os = "linux")]
+                    {
+                        // libc::PR_SET_PDEATHSIG is the raw constant for this operation.
+                        // SIGKILL is a non-catchable, non-ignorable signal.
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                            // If prctl fails, return an error from the closure.
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
                     Ok(())
                 });
             }

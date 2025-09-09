@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemFn};
+use syn::{ItemFn, parse_macro_input};
 
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -15,8 +15,8 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             input_fn.sig.ident,
             "The #[inferlet::main] attribute can only be used on async functions",
         )
-            .to_compile_error()
-            .into();
+        .to_compile_error()
+        .into();
     }
 
     // Rename the user's function so that we can call it from our generated code.
@@ -32,10 +32,14 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
         impl inferlet::RunSync for __PieMain {
             fn run() -> Result<(), String> {
                 let result = inferlet::wstd::runtime::block_on(async { #inner_fn_name().await });
-                if let Err(e) = result {
-                    return Err(format!("{:?}", e));
+                match result {
+                    Ok(_) => {
+                        return Ok(())
+                    },
+                    Err(e) => {
+                        return Err(format!("{:?}", e))
+                    }
                 }
-                Ok(())
             }
         }
 
@@ -44,8 +48,6 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     expanded.into()
 }
-
-
 
 #[proc_macro_attribute]
 pub fn server_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -60,8 +62,8 @@ pub fn server_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             input_fn.sig.ident,
             "The #[inferlet::server_main] attribute can only be used on async functions",
         )
-            .to_compile_error()
-            .into();
+        .to_compile_error()
+        .into();
     }
 
     // Rename the user's function so that we can call it from our generated code.
