@@ -1,9 +1,8 @@
 pub use crate::bindings::pie::inferlet::core::Priority;
 use crate::bindings::pie::inferlet::{adapter, core, evolve, forward, image, tokenize};
 pub use crate::bindings_app::{export, exports::pie::inferlet::run::Guest as RunSync};
-pub use crate::chat::ChatFormatter;
 pub use crate::context::Context;
-pub use crate::sampler::Sampler;
+pub use crate::chat::ChatFormatter;
 use crate::wstd::runtime::AsyncPollable;
 pub use anyhow::Result;
 pub use inferlet_macros::main;
@@ -15,8 +14,8 @@ use wasi::exports::http::incoming_handler::{IncomingRequest, ResponseOutparam};
 pub use wstd;
 
 pub mod brle;
-pub mod chat;
 pub mod context;
+pub mod chat;
 pub mod drafter;
 mod pool;
 pub mod sampler;
@@ -76,11 +75,6 @@ pub struct Model {
     pub(crate) inner: Rc<core::Model>,
 }
 
-#[derive(Debug)]
-pub struct Blob {
-    pub(crate) inner: core::Blob,
-}
-
 pub enum Resource {
     KvPage = 0,
     Embed = 1,
@@ -100,10 +94,6 @@ pub fn get_instance_id() -> String {
 /// Retrieves POSIX-style CLI arguments passed to the inferlet from the remote user client.
 pub fn get_arguments() -> Vec<String> {
     core::get_arguments()
-}
-
-pub fn set_return(value: &str) {
-    core::set_return(value);
 }
 
 /// Retrieve a model by its name.
@@ -150,23 +140,6 @@ pub async fn receive() -> String {
     let pollable = future.pollable();
     AsyncPollable::new(pollable).wait_for().await;
     future.get().unwrap()
-}
-
-/// Sends a message to the remote user client.
-pub fn send_blob(blob: Blob) {
-    core::send_blob(blob.inner)
-}
-
-/// Receives an incoming message from the remote user client.
-///
-/// This is an asynchronous operation that returns a `ReceiveResult`.
-pub async fn receive_blob() -> Blob {
-    let future = core::receive_blob(); // Changed from messaging::receive
-    let pollable = future.pollable();
-    AsyncPollable::new(pollable).wait_for().await;
-    let blob = future.get().unwrap();
-
-    Blob { inner: blob }
 }
 
 /// Publishes a message to a topic, broadcasting it to all subscribers.
@@ -335,14 +308,6 @@ impl Queue {
 
     pub fn release_exported_resources(&self, resource: Resource, name: &str) {
         core::release_exported_resources(&self.inner, resource as u32, name)
-    }
-}
-
-impl Blob {
-    pub fn new(data: Vec<u8>) -> Blob {
-        let data = core::Blob::new(&data);
-
-        Blob { inner: data }
     }
 }
 

@@ -1,8 +1,6 @@
 use crate::bindings::pie::inferlet::adapter;
-use crate::traits::forward::ForwardPass;
-use crate::{Blob, Queue, Resource};
-use std::rc::Rc;
-use wstd::io::AsyncPollable;
+use crate::traits::forward::{ForwardPass};
+use crate::{Queue, Resource};
 
 pub trait Adapter {
     fn allocate_adapter(&self) -> u32;
@@ -11,9 +9,6 @@ pub trait Adapter {
     fn import_adapter(&self, name: &str) -> u32;
     fn get_all_exported_adapters(&self) -> Vec<String>;
     fn release_exported_adapter(&self, name: &str);
-
-    fn upload_adapter(&self, adapter_ptr: u32, name: &str, adapter_data: Blob);
-    async fn download_adapter(&self, adapter_ptr: u32, name: &str) -> Blob;
 }
 
 pub trait SetAdapter {
@@ -52,21 +47,6 @@ impl Adapter for Queue {
 
     fn release_exported_adapter(&self, name: &str) {
         self.release_exported_resources(Resource::Adapter, name)
-    }
-
-    fn upload_adapter(&self, adapter_ptr: u32, name: &str, blob: Blob) {
-        adapter::upload_adapter(&self.inner, adapter_ptr, name, blob.inner);
-    }
-
-    async fn download_adapter(&self, adapter_ptr: u32, name: &str) -> Blob {
-        let future = adapter::download_adapter(&self.inner, adapter_ptr, name);
-        let pollable = future.pollable();
-        AsyncPollable::new(pollable).wait_for().await;
-        let blob = future.get().unwrap();
-
-        Blob {
-            inner: blob,
-        }
     }
 }
 

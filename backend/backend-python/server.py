@@ -1,4 +1,3 @@
-import enum
 import os
 import random
 import struct
@@ -20,7 +19,7 @@ from websockets.sync.client import connect
 
 from config.common import ModelInfo
 from handler import Handler
-from model.l4ma import L4maForCausalLM, L4maTensorLoader
+from model.l4ma import L4maForCausalLM, create_fusion_map as create_l4ma_fusion_map
 from message import (
     EmbedImageRequest,
     ForwardPassRequest,
@@ -28,23 +27,8 @@ from message import (
     InitializeAdapterRequest,
     QueryRequest,
     UpdateAdapterRequest,
-    HeartbeatRequest,
-    UploadAdapterRequest,
-    DownloadAdapterRequest,
 )
-from model.qwen3 import Qwen3ForCausalLM, Qwen3TensorLoader
-
-
-class HandlerId(enum.Enum):
-    HANDSHAKE = 0
-    HEARTBEAT = 1
-    QUERY = 2
-    FORWARD_PASS = 3
-    EMBED_IMAGE = 4
-    INITIALIZE_ADAPTER = 5
-    UPDATE_ADAPTER = 6
-    UPLOAD_HANDLER = 7
-    DOWNLOAD_HANDLER = 8
+from model.qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 
 
 def main(
@@ -117,86 +101,71 @@ def load_model(config: dict):
     model_dtype = getattr(torch, config["dtype"])
     model_info = ModelInfo.load_from_file(str(metadata_path), model_device, model_dtype)
 
-    # Instantiate model and create tensor loader based on architecture
+    # Instantiate model and create fusion map based on architecture
     if model_info.architecture.type.lower() == "qwen3":
         model = Qwen3ForCausalLM(model_info.architecture)
-        tensor_loader = Qwen3TensorLoader(model)
+        fusion_map = create_qwen3_fusion_map(model)
     else:
         model = L4maForCausalLM(model_info.architecture)
-        tensor_loader = L4maTensorLoader(model)
+        fusion_map = create_l4ma_fusion_map(model)
 
-    # Prepare for loading
+    # Create a reverse map for quick lookup of fusion targets
+    source_to_fusion_target = {
+        source: target
+        for target, details in fusion_map.items()
+        for source in details["sources"]
+    }
+
+    pending_fusion_tensors = {}
     model_state_keys = set(model.state_dict().keys())
     loaded_keys = set()
-    
-    # Track which checkpoint file each tensor comes from
-    checkpoint_tensor_to_file = {}
-    
-    # First pass: scan all checkpoint files to build tensor-to-file mapping
-    print("Scanning checkpoint files...")
+
     try:
         for param_file in model_info.parameters:
             weights_path = model_path / model_name / param_file
             with ztensor.Reader(str(weights_path)) as reader:
                 tensor_names = reader.get_tensor_names()
                 pbar_desc = (
-                    f"Scanning {param_file[:30]}..."
+                    f"Loading {param_file[:30]}..."
                     if len(param_file) > 30
-                    else f"Scanning {param_file}"
+                    else f"Loading {param_file}"
                 )
                 for name in tqdm(tensor_names, desc=pbar_desc, unit="tensors"):
-                    checkpoint_tensor_to_file[name] = weights_path
+                    # If tensor is part of a fusion, buffer it
+                    if name in source_to_fusion_target:
+                        pending_fusion_tensors[name] = reader.read_tensor(
+                            name, to="torch"
+                        )
+                        continue
 
-        # Second pass: process all runtime tensors using the tensor loader
-        print("\nProcessing runtime tensors...")
-        
-        for runtime_tensor_name in tqdm(model_state_keys, desc="Processing tensors", unit="tensors"):
-            if runtime_tensor_name in loaded_keys:
-                continue  # Skip already loaded tensors
-                
-            # Query which checkpoint tensors are needed
-            required_checkpoint_tensors = tensor_loader.query(runtime_tensor_name)
-            
-            # Load required checkpoint tensors on demand
-            available_tensors = {}
-            missing_tensors = []
-            
-            for checkpoint_name in required_checkpoint_tensors:
-                if checkpoint_name not in checkpoint_tensor_to_file:
-                    missing_tensors.append(checkpoint_name)
+                    # Load standard, non-fused tensor
+                    if name in model_state_keys and name not in loaded_keys:
+                        param = model.state_dict()[name]
+                        tensor_data = reader.read_tensor(name, to="torch")
+                        if tensor_data.shape != param.shape:
+                            print(
+                                f"    Warning: Shape mismatch for tensor '{name}'. Skipping."
+                            )
+                            continue
+                        with torch.no_grad():
+                            param.copy_(tensor_data, non_blocking=True)
+                        loaded_keys.add(name)
+
+        # Process all buffered tensors for fusion
+        for target_name, details in fusion_map.items():
+            source_names = details["sources"]
+            if all(s in pending_fusion_tensors for s in source_names):
+                tensors_to_fuse = [pending_fusion_tensors[s] for s in source_names]
+                fused_tensor = torch.cat(tensors_to_fuse, dim=details["dim"])
+                param = model.state_dict()[target_name]
+                if fused_tensor.shape != param.shape:
+                    print(
+                        f"    Warning: Shape mismatch for fused tensor '{target_name}'. Skipping."
+                    )
                     continue
-                
-                try:
-                    checkpoint_file_path = checkpoint_tensor_to_file[checkpoint_name]
-                    with ztensor.Reader(str(checkpoint_file_path)) as reader:
-                        available_tensors[checkpoint_name] = reader.read_tensor(checkpoint_name, to="torch")
-                except Exception as e:
-                    print(f"    Error loading checkpoint tensor '{checkpoint_name}': {e}")
-                    missing_tensors.append(checkpoint_name)
-            
-            if missing_tensors:
-                # Weight tying for lm_head.weight is handled separately
-                if runtime_tensor_name != "lm_head.weight":
-                    print(f"    Warning: Missing checkpoint tensors for '{runtime_tensor_name}': {missing_tensors}")
-                continue
-            
-            # Load the runtime tensor using the tensor loader
-            try:
-                runtime_tensor = tensor_loader.load(runtime_tensor_name, available_tensors)
-                param = model.state_dict()[runtime_tensor_name]
-                
-                if runtime_tensor.shape != param.shape:
-                    print(f"    Warning: Shape mismatch for tensor '{runtime_tensor_name}'. "
-                          f"Expected {param.shape}, got {runtime_tensor.shape}. Skipping.")
-                    continue
-                    
                 with torch.no_grad():
-                    param.copy_(runtime_tensor, non_blocking=True)
-                loaded_keys.add(runtime_tensor_name)
-                
-            except Exception as e:
-                print(f"    Error loading tensor '{runtime_tensor_name}': {e}")
-                continue
+                    param.copy_(fused_tensor, non_blocking=True)
+                loaded_keys.add(target_name)
 
         # Handle weight tying for lm_head
         if "lm_head.weight" in model_state_keys and "lm_head.weight" not in loaded_keys:
@@ -280,8 +249,7 @@ def register(config, endpoint):
     """
     controller_addr = f"ws://{config['controller_host']}:{config['controller_port']}"
     try:
-        # MODIFICATION 1: Added 'open_timeout=10' to attempt connection for 10 seconds.
-        with connect(controller_addr, open_timeout=10) as websocket:
+        with connect(controller_addr) as websocket:
             # Authenticate with the controller
             websocket.send(
                 msgpack.packb(
@@ -298,8 +266,7 @@ def register(config, endpoint):
                 print(
                     f"Authentication failed: {auth_response.get('result', 'Unknown error')}"
                 )
-                # Use os._exit(1) to terminate the entire process immediately from a thread
-                os._exit(1)
+                sys.exit(1)
 
             # Register the service endpoint
             websocket.send(
@@ -319,71 +286,38 @@ def register(config, endpoint):
                 print(
                     f"Controller registration failed: {reg_response.get('result', 'Unknown error')}"
                 )
-                os._exit(1)
+                sys.exit(1)
 
             print(f"Registered with controller at {controller_addr}")
 
-    # MODIFICATION 2: Catch connection errors (including timeout) and exit the program.
-    # The 'TimeoutError' is raised by 'open_timeout'.
-    except (ConnectionRefusedError, TimeoutError) as e:
-        print(
-            f"Failed to connect to the controller at {controller_addr} within 10 seconds."
-        )
-        print(f"Error: {e}")
-        print("Please ensure the controller is running and accessible. Terminating.")
-        os._exit(1)
+    except ConnectionRefusedError:
+        print(f"Failed to connect to the controller at {controller_addr}.")
+        print("Please ensure the controller is running and accessible.")
     except Exception as e:
-        print(f"An unexpected error occurred during registration: {e}. Terminating.")
-        os._exit(1)
+        print(f"An error occurred during registration: {e}")
 
 
 def run_zmq_server(socket, handler):
     """
     Runs the ZMQ server loop, listening for and processing client requests.
-    Exits the program if a heartbeat is not received for 7 seconds or if any
-    exception occurs.
     """
-    # --- MODIFICATION: Set heartbeat timeout and initialize timer ---
-    HEARTBEAT_TIMEOUT = 7  # seconds
-    last_heartbeat_time = time.monotonic()
-
-    # --- CORRECTION: Keys should be integer values of the enums ---
-    DECODERS = {
-        HandlerId.HANDSHAKE.value: msgspec.msgpack.Decoder(HandshakeRequest),
-        HandlerId.HEARTBEAT.value: msgspec.msgpack.Decoder(HeartbeatRequest),
-        HandlerId.QUERY.value: msgspec.msgpack.Decoder(QueryRequest),
-        HandlerId.FORWARD_PASS.value: msgspec.msgpack.Decoder(ForwardPassRequest),
-        HandlerId.EMBED_IMAGE.value: msgspec.msgpack.Decoder(EmbedImageRequest),
-        HandlerId.INITIALIZE_ADAPTER.value: msgspec.msgpack.Decoder(
-            InitializeAdapterRequest
-        ),
-        HandlerId.UPDATE_ADAPTER.value: msgspec.msgpack.Decoder(UpdateAdapterRequest),
-        HandlerId.UPLOAD_HANDLER.value: msgspec.msgpack.Decoder(UploadAdapterRequest),
-        HandlerId.DOWNLOAD_HANDLER.value: msgspec.msgpack.Decoder(
-            DownloadAdapterRequest
-        ),
-    }
     MSGPACK_ENCODER = msgspec.msgpack.Encoder()
+    DECODERS = {
+        0: msgspec.msgpack.Decoder(HandshakeRequest),
+        1: msgspec.msgpack.Decoder(QueryRequest),
+        2: msgspec.msgpack.Decoder(ForwardPassRequest),
+        3: msgspec.msgpack.Decoder(EmbedImageRequest),
+        4: msgspec.msgpack.Decoder(InitializeAdapterRequest),
+        5: msgspec.msgpack.Decoder(UpdateAdapterRequest),
+    }
 
-    poller = zmq.Poller()
-    poller.register(socket, zmq.POLLIN)
-
-    try:
-        while True:
-            # Check for heartbeat timeout before waiting for a message
-            if time.monotonic() - last_heartbeat_time > HEARTBEAT_TIMEOUT:
-                os._exit(1)  # Use os._exit for immediate termination from a thread
-
-            # Poll for 1 second to remain responsive to the heartbeat check
-            events = dict(poller.poll(timeout=1000))
-            if socket in events:
-                message = socket.recv_multipart()
-            else:
-                # Poller timed out, loop again to re-check the heartbeat timer
-                continue
+    while True:
+        try:
+            # ROUTER sockets expect [client_id, corr_id, handler_id, payload...]
+            message = socket.recv_multipart()
 
             if len(message) < 3:
-                print(f"[!] Received invalid message: {message}")
+                print(f"[!] Received invalid message: {message}", file=sys.stderr)
                 continue
 
             client_identity, corr_id_bytes, handler_id_bytes = message[:3]
@@ -392,36 +326,30 @@ def run_zmq_server(socket, handler):
                 handler_id = struct.unpack(">I", handler_id_bytes)[0]
                 reqs = [DECODERS[handler_id].decode(m) for m in message[3:]]
             except (struct.error, KeyError, msgspec.DecodeError) as e:
-                print(f"[!] Error decoding request header or payload: {e}")
+                print(
+                    f"[!] Error decoding request header or payload: {e}",
+                    file=sys.stderr,
+                )
                 continue
 
             if not reqs:
-                print(f"[!] Received empty request body")
+                print(f"[!] Received empty request body", file=sys.stderr)
                 continue
 
             resps = []
-            # The match statement correctly compares the integer handler_id with enum values
             match handler_id:
-                case HandlerId.HANDSHAKE.value:
+                case 0:
                     resps = handler.handshake(reqs)
-                case HandlerId.HEARTBEAT.value:
-                    # print(f"[*] Heartbeat received at {time.time()}")
-                    last_heartbeat_time = time.monotonic()
-                    resps = handler.heartbeat(reqs)
-                case HandlerId.QUERY.value:
+                case 1:
                     resps = handler.query(reqs)
-                case HandlerId.FORWARD_PASS.value:
+                case 2:
                     resps = handler.forward_pass(reqs)
-                case HandlerId.EMBED_IMAGE.value:
+                case 3:
                     handler.embed_image(reqs)
-                case HandlerId.INITIALIZE_ADAPTER.value:
+                case 4:
                     handler.initialize_adapter(reqs)
-                case HandlerId.UPDATE_ADAPTER.value:
+                case 5:
                     handler.update_adapter(reqs)
-                case HandlerId.UPLOAD_HANDLER.value:
-                    handler.upload_handler(reqs)
-                case HandlerId.DOWNLOAD_HANDLER.value:
-                    resps = handler.download_handler(reqs)
                 case _:
                     print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
 
@@ -431,21 +359,10 @@ def run_zmq_server(socket, handler):
                 ]
                 socket.send_multipart(response_msg)
 
-    except Exception as e:
-        print(
-            f"\n[!!!] A fatal, unhandled error occurred in the ZMQ server loop: {e}",
-        )
-        import traceback
-
-        traceback.print_exc()
-        os._exit(1)
+        except zmq.ZMQError as e:
+            print(f"ZMQ Error in server loop: {e}", file=sys.stderr)
+            break
 
 
 if __name__ == "__main__":
-    # log_file = open("service.log", "w", buffering=1)
-
-    # Redirect stdout and stderr to the log file
-    # sys.stdout = log_file
-    # sys.stderr = log_file
-    # --------------------------
     fire.Fire(main)
