@@ -1,4 +1,4 @@
-use inferlet::sampler::{self, Sampler};
+use inferlet::sampler::{self, Sample};
 use inferlet::stop_condition::{self, StopCondition};
 use inferlet::traits::{Forward, Tokenize};
 
@@ -8,7 +8,7 @@ use std::time::Instant;
 
 // NOTE: This is not a full implementation of Parallel Jacobi Decoding (PJD).
 // It demonstrates a single step in the PJD process without the refinement step,
-pub async fn generate_with_pjd<S: Sampler, C: StopCondition>(
+pub async fn generate_with_pjd<S: Sample, C: StopCondition>(
     ctx: &mut Context,
     sampler: &mut S,
     stop_condition: &mut C,

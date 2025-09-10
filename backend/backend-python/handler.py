@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 import message
-from adapter import AdapterSubpass
+from adapter import CmaesAdapter, AdapterSubpass
 import flashinfer as ops
 
 from config.common import ModelInfo
@@ -69,8 +69,8 @@ class Handler:
                 torch.zeros(
                     (
                         max_num_adapters,
-                        max_adapter_rank * 3,
                         self.lm.config.hidden_size,
+                        max_adapter_rank * 3,
                     ),
                     dtype=dtype,
                     device=device,
@@ -78,12 +78,12 @@ class Handler:
                 torch.zeros(
                     (
                         max_num_adapters,
+                        max_adapter_rank,
                         self.lm.config.head_size
                         * (
                             self.lm.config.num_query_heads
                             + self.lm.config.num_key_value_heads * 2
                         ),
-                        max_adapter_rank,
                     ),
                     dtype=dtype,
                     device=device,
@@ -127,6 +127,15 @@ class Handler:
             resps.append(resp)
         return resps
 
+    def heartbeat(
+        self, reqs: list[message.HeartbeatRequest]
+    ) -> list[message.HeartbeatResponse]:
+        resps = []
+        for req in reqs:
+            resp = message.HeartbeatResponse()
+            resps.append(resp)
+        return resps
+
     def query(self, reqs: list[message.QueryRequest]) -> list[message.QueryResponse]:
         resps = []
         for req in reqs:
@@ -166,14 +175,59 @@ class Handler:
         cfg = self.lm.config
 
         for req in reqs:
-            pass
+            self.adapters[req.adapter_ptr] = CmaesAdapter(
+                adapter_id=req.adapter_ptr,
+                adapter_at_layer=self.adapter_at_layer,
+                rank=req.rank,
+                alpha=req.alpha,
+                in_features=cfg.hidden_size,
+                out_features=[
+                    cfg.head_size * cfg.num_query_heads,
+                    cfg.head_size * cfg.num_key_value_heads,
+                    cfg.head_size * cfg.num_key_value_heads,
+                ],
+                num_layers=cfg.num_layers,
+                population_size=req.population_size,
+                mu_fraction=req.mu_fraction,
+                initial_sigma=req.initial_sigma,
+                min_sigma=1e-7,
+                min_var=1e-8,
+                max_var=1e4,
+                device=self.device,
+                dtype=self.dtype,
+            )
 
     @torch.inference_mode()
     def update_adapter(self, reqs: list[message.UpdateAdapterRequest]):
 
         for req in reqs:
             if req.adapter_ptr in self.adapters:
-                pass
+                adapter = self.adapters[req.adapter_ptr]
+                if isinstance(adapter, CmaesAdapter):
+                    adapter.update(req.scores, req.seeds, req.max_sigma)
+
+    @torch.inference_mode()
+    def upload_adapter(self, reqs: list[message.UploadAdapterRequest]):
+        for req in reqs:
+            if req.adapter_ptr in self.adapters:
+                adapter = self.adapters[req.adapter_ptr]
+                if isinstance(adapter, CmaesAdapter):
+                    adapter.upload(req.adapter_data)
+
+    @torch.inference_mode()
+    def download_adapter(
+        self, reqs: list[message.DownloadAdapterRequest]
+    ) -> list[message.DownloadAdapterResponse]:
+        resps = []
+        for req in reqs:
+            if req.adapter_ptr in self.adapters:
+                adapter = self.adapters[req.adapter_ptr]
+                if isinstance(adapter, CmaesAdapter):
+                    data = adapter.download()
+                    resp = message.DownloadAdapterResponse(adapter_data=data)
+                    resps.append(resp)
+
+        return resps
 
     @torch.inference_mode()
     def forward_pass(self, reqs: list[message.ForwardPassRequest]):
@@ -291,7 +345,7 @@ class ForwardPassBatch:
         for token_idx in req.output_token_indices:
             self.indices_for_logits.append(token_idx + self.total_tokens_in_batch)
 
-        # Extract sampler configurations.
+        # Extract _sampler configurations.
         # sampler_idx=0 is for distributions, existing samplers are shifted by +1.
         for sampler_config in req.output_token_samplers:
             params = {}
@@ -354,7 +408,16 @@ class ForwardPassBatch:
     def finalize(self) -> dict:
         """Finalizes batch preparation, creating tensors and the adapter subpass."""
         device = self._handler.device
-
+        # print('seeds', self.seeds)
+        # print('adapter_indices', self.adapter_indices)
+        # print('qo_indptr', self.qo_indptr)
+        # print('kv_page_indices', self.kv_page_indices)
+        # print('kv_page_indptr', self.kv_page_indptr)
+        # print('kv_last_page_lengths', self.kv_last_page_lengths)
+        # #print('attention_masks', self.attention_masks)
+        # print('batch_token_ids', self.batch_token_ids)
+        # print('batch_position_ids', self.batch_position_ids)
+        # print('single_token_inference_mode', self.single_token_inference_mode)
         adapter_subpass = None
         if self.adapter_subpass_needed:
             seeds_tensor = torch.as_tensor(self.seeds, device=device, dtype=torch.long)
@@ -432,7 +495,7 @@ class ForwardPassBatch:
         # We compute probabilities for the entire batch of logit requests
         probs = torch.softmax(scaled_logits, dim=-1)
 
-        # Group requests by sampler type for efficient batch processing
+        # Group requests by _sampler type for efficient batch processing
         sampler_groups = {}
         for i, sampler_idx in enumerate(self.sampler_type):
             if sampler_idx not in sampler_groups:
@@ -443,7 +506,7 @@ class ForwardPassBatch:
         # Initialize result containers. Using lists of Nones helps place results correctly.
         final_dists = [None] * num_logit_requests
         final_tokens_tensor = torch.empty(
-            num_logit_requests, dtype=torch.long, device=self._handler.device
+            num_logit_requests, dtype=torch.int32, device=self._handler.device
         )
 
         for sampler_idx, indices in sampler_groups.items():
@@ -476,7 +539,7 @@ class ForwardPassBatch:
                     top_p_vals = torch.tensor(
                         [self.sampler_params[i]["top_p"] for i in indices],
                         device=self._handler.device,
-                        dtype=self._handler.dtype,
+                        dtype=torch.float32,
                     )
                     sampled = ops.sampling.top_p_sampling_from_probs(
                         group_probs, top_p=top_p_vals
@@ -485,7 +548,7 @@ class ForwardPassBatch:
                     top_k_vals = torch.tensor(
                         [self.sampler_params[i]["top_k"] for i in indices],
                         device=self._handler.device,
-                        dtype=torch.long,
+                        dtype=torch.int32,
                     )
                     sampled = ops.sampling.top_k_sampling_from_probs(
                         group_probs, top_k=top_k_vals
@@ -494,7 +557,7 @@ class ForwardPassBatch:
                     min_p_vals = torch.tensor(
                         [self.sampler_params[i]["min_p"] for i in indices],
                         device=self._handler.device,
-                        dtype=self._handler.dtype,
+                        dtype=torch.float32,
                     )
                     sampled = ops.sampling.min_p_sampling_from_probs(
                         group_probs, min_p=min_p_vals
@@ -503,18 +566,18 @@ class ForwardPassBatch:
                     top_k_vals = torch.tensor(
                         [self.sampler_params[i]["top_k"] for i in indices],
                         device=self._handler.device,
-                        dtype=torch.long,
+                        dtype=torch.int32,
                     )
                     top_p_vals = torch.tensor(
                         [self.sampler_params[i]["top_p"] for i in indices],
                         device=self._handler.device,
-                        dtype=self._handler.dtype,
+                        dtype=torch.float32,
                     )
                     sampled = ops.sampling.top_k_top_p_sampling_from_probs(
                         group_probs, top_k=top_k_vals, top_p=top_p_vals
                     )
                 else:
-                    raise ValueError(f"Unknown sampler index: {sampler_idx}")
+                    raise ValueError(f"Unknown _sampler index: {sampler_idx}")
 
                 # Place sampled tokens into the main tensor at their original batch positions
                 final_tokens_tensor.scatter_(0, indices_tensor, sampled)

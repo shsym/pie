@@ -75,6 +75,9 @@ pub struct InstanceState {
     // Wasm states
     id: InstanceId,
     arguments: Vec<String>,
+    pub(crate) return_value: Option<String>,
+
+    // WASI states
     wasi_ctx: WasiCtx,
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
@@ -118,6 +121,7 @@ impl InstanceState {
         InstanceState {
             id,
             arguments,
+            return_value: None,
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
@@ -131,6 +135,10 @@ impl InstanceState {
 
     pub fn arguments(&self) -> &[String] {
         &self.arguments
+    }
+
+    pub fn return_value(&self) -> Option<String> {
+        self.return_value.clone()
     }
 
     pub fn map_resources(

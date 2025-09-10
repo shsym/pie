@@ -130,6 +130,12 @@ pub struct QueryResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct HeartbeatRequest {}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HeartbeatResponse {}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ForwardPassRequest {
     pub input_tokens: Vec<u32>,
     pub input_token_positions: Vec<u32>,
@@ -175,6 +181,23 @@ pub struct UpdateAdapterRequest {
     pub scores: Vec<f32>,
     pub seeds: Vec<i64>,
     pub max_sigma: f32,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UploadAdapterRequest {
+    pub adapter_ptr: u32,
+    pub name: String,
+    pub adapter_data: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DownloadAdapterRequest {
+    pub adapter_ptr: u32,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DownloadAdapterResponse {
+    pub adapter_data: Vec<u8>,
 }
 
 /// Defines the set of operations available for the key-value store.
@@ -425,13 +448,20 @@ impl Model {
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         let mut corr_id: u32 = 0;
-        // Store Instant for request timeout handling.
         let mut event_table: HashMap<(u32, usize), (oneshot::Sender<Bytes>, Instant)> =
             HashMap::new();
         const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+        // --- NEW: Heartbeat Configuration ---
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+        let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let mut heartbeat_pending: Option<Instant> = None;
+        // Use a special correlation ID to distinguish heartbeats from regular requests.
+        let heartbeat_corr_id = u32::MAX;
+        // --- End of New Code ---
+
         loop {
-            // NEW: Dynamic sleep for timeout checks.
             let sleep_duration = event_table
                 .values()
                 .map(|(_, instant)| {
@@ -445,6 +475,31 @@ impl Model {
                     println!("[Info] Shutdown signal received, exiting backend worker.");
                     break;
                 },
+
+                _ = heartbeat_interval.tick() => {
+                    if let Some(sent_at) = heartbeat_pending {
+                        if sent_at.elapsed() > HEARTBEAT_TIMEOUT {
+                            eprintln!("[Warn] backend not responsive");
+                        }
+                    }
+
+                    let heartbeat_req = HeartbeatRequest {};
+                    // This unwrap is safe for an empty struct.
+                    let payload = Bytes::from(rmp_serde::to_vec_named(&heartbeat_req).unwrap());
+
+                    let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(3);
+                    frames.push_back(Bytes::copy_from_slice(&heartbeat_corr_id.to_be_bytes()));
+                    frames.push_back(Bytes::copy_from_slice(&Handler::Heartbeat.get_handler_id().to_be_bytes()));
+                    frames.push_back(payload);
+
+                    if let Err(e) = socket.send(ZmqMessage::try_from(frames).unwrap()).await {
+                        eprintln!("[Error] Socket send failed for heartbeat: {:?}", e);
+                    } else {
+                        heartbeat_pending = Some(Instant::now());
+                    }
+                },
+                // --- End of New Code ---
+
                 maybe_command = rx.recv() => {
                     if let Some((handler, payload)) = maybe_command {
                         let current_corr_id = corr_id;
@@ -461,7 +516,6 @@ impl Model {
 
                         for (idx, sender) in senders.into_iter().enumerate() {
                             if let Some(sender) = sender {
-                                // NEW: Store the Instant along with the sender.
                                 event_table.insert((current_corr_id, idx), (sender, Instant::now()));
                             }
                         }
@@ -475,7 +529,6 @@ impl Model {
                     match result {
                         Ok(zmq_msg) => {
                             let mut frames = zmq_msg.into_vecdeque();
-                            // Safely parse incoming frames to prevent panics.
                             let Some(corr_id_bytes) = frames.pop_front() else { continue; };
                             let Some(handler_id_bytes) = frames.pop_front() else { continue; };
                             let Ok(corr_id_slice) = corr_id_bytes.as_ref().try_into() else { continue; };
@@ -484,10 +537,16 @@ impl Model {
                             let received_corr_id = u32::from_be_bytes(corr_id_slice);
                             let received_handler_id = u32::from_be_bytes(handler_id_slice);
 
+                            // --- MODIFIED: Handle Heartbeat Response ---
+                            if received_corr_id == heartbeat_corr_id {
+                                heartbeat_pending = None;
+                                continue; // Skip further processing for heartbeats.
+                            }
+                            // --- End of Modification ---
+
                             for (idx, payload) in frames.into_iter().enumerate() {
                                 let key = (received_corr_id, idx);
                                 if let Some((sender, _)) = event_table.remove(&key) {
-                                    // println!("data: {:?}", payload);
                                     let _ = sender.send(payload);
                                 }
                             }
@@ -504,9 +563,8 @@ impl Model {
                 },
                 _ = tokio::time::sleep(sleep_duration) => {
                     let now = Instant::now();
-                    event_table.retain(|_key, (sender, instant)| {
+                    event_table.retain(|_key, (_, instant)| {
                         if now.duration_since(*instant) > REQUEST_TIMEOUT {
-                            // The receiver will get a RecvError, indicating the request failed.
                             eprintln!("[Warn] Request timed out. Dropping sender.");
                             false
                         } else {

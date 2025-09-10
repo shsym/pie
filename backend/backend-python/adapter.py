@@ -40,12 +40,12 @@ def run_length_encode(data: list[int]) -> list[tuple[int, int]]:
 class AdapterSubpass:
 
     def __init__(
-        self,
-        adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]],
-        adapter_indices: list[int],
-        adapter_extras: dict[int, Adapter],
-        rand_seeds: torch.Tensor,
-        qo_indptr: list[int],
+            self,
+            adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]],
+            adapter_indices: list[int],
+            adapter_extras: dict[int, Adapter],
+            rand_seeds: torch.Tensor,
+            qo_indptr: list[int],
     ):
         self.adapter_at_layer = adapter_at_layer
         self.adapter_indices = adapter_indices
@@ -55,12 +55,12 @@ class AdapterSubpass:
         self.qo_indptr = qo_indptr
 
     def execute(
-        self,
-        layer_idx: int,
-        xs: torch.Tensor,
-        q_state: torch.Tensor,
-        k_state: torch.Tensor,
-        v_state: torch.Tensor,
+            self,
+            layer_idx: int,
+            xs: torch.Tensor,
+            q_state: torch.Tensor,
+            k_state: torch.Tensor,
+            v_state: torch.Tensor,
     ):
         i = 0
         for adapter_index, count in self.adapter_indices_rle:
@@ -121,7 +121,7 @@ class Adapter:
     out_features_indptr: list[int]
 
     def __init__(
-        self, adapter_id: int, rank: int, alpha: float, out_features: list[int]
+            self, adapter_id: int, rank: int, alpha: float, out_features: list[int]
     ):
         self.adapter_id = adapter_id
         self.rank = rank

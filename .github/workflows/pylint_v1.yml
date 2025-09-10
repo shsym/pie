@@ -1,0 +1,55 @@
+name: Lint Python (PR changed files)
+
+on:
+  pull_request:
+    paths:
+      - 'backend/backend-python/**/*.py'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout (full history for reliable diffs)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute changed Python files under backend/backend-python
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # PR base/head SHAs (avoid github.sha merge commit semantics)
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # Ensure both sides exist locally (robust for forks)
+          git fetch --no-tags --prune --depth=1 origin "${{ github.event.pull_request.base.ref }}":pr_base || true
+          git fetch --no-tags --prune --depth=1 origin "pull/${{ github.event.pull_request.number }}/head":pr_head || true
+
+          LEFT=$(git rev-parse --verify pr_base 2>/dev/null || echo "$BASE_SHA")
+          RIGHT=$(git rev-parse --verify pr_head 2>/dev/null || echo "$HEAD_SHA")
+
+          FILES=$(git diff --name-only --diff-filter=ACMRT "$LEFT" "$RIGHT" -- \
+                    'backend/backend-python' \
+                  | grep -E '\.py$' || true)
+
+          FILES="${FILES//$'\n'/ }"
+          echo "files=${FILES}" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv (provides uvx)
+        run: pipx install uv
+
+      - name: Run Black on changed files (no build)
+        shell: bash
+        run: |
+          FILES="${{ steps.changes.outputs.files }}"
+          if [ -z "$FILES" ]; then
+            echo "No Python files changed under backend/backend-python."
+            exit 0
+          fi
+          echo "Linting: $FILES"
+          uvx black --check $FILES
