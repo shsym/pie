@@ -6,58 +6,14 @@ authors = [{ name = "In Gim", email = "in.gim@yale.edu" }]
 license = "MIT"
 requires-python = ">=3.11"
 
-# Core dependencies - cross-platform compatible
 dependencies = [
     "fire>=0.6",
     "msgpack>=0.5",
     "platformdirs>=4.3",
-    "protobuf>=6.31",
     "pyzmq>=27.0.0",
     "requests>=2.32",
-    "tomli>=2.2",
-    "torch>=2.7",
     "tqdm>=4.67",
     "websockets>=15.0",
     "ztensor>=0.1.4",
-    "numpy>=1.24.0,<2.3.0",
-    "pylint>=3.3.0",
-    "black>=24.10",
-    "numba>=0.61.0",
-    "pyright>=1.1.405",
     "msgspec>=0.19.0"
 ]
-
-[project.optional-dependencies]
-# CUDA support - Linux only (flashinfer requires CUDA-capable hardware)
-cuda = [
-    "flashinfer-python>=0.3.1; platform_system=='Linux'",
-]
-
-# macOS-specific dependencies for Metal backend debugging
-macos = [
-    # Core PyObjC for Objective-C bridge (more stable than full PyObjC suite)
-    "pyobjc-core>=10.0,<11.0; platform_system=='Darwin'",
-    # Essential Metal framework bindings only
-    "pyobjc-framework-Metal>=10.0,<11.0; platform_system=='Darwin'",
-    "pyobjc-framework-MetalKit>=10.0,<11.0; platform_system=='Darwin'",
-    "pyobjc-framework-Cocoa>=10.0,<11.0; platform_system=='Darwin'",
-]
-
-# Debug framework dependencies - cross-platform
-debug = [
-    # Development Tools - Code quality and type safety (additional to core)
-    "mypy>=1.5.0,<2.0.0",
-    # Plugin Bindings - Multi-language support
-    "pybind11~=3.0",
-    # Testing Framework - TDD Approach
-    "pytest~=8.4.2",
-    "pytest-asyncio~=1.1.0",
-    "pytest-cov~=7.0.0",
-    "pytest-mock>=3.11.0,<4.0.0",
-    # Type Extensions
-    "typing-extensions~=4.15.0",
-]
-
-[tool.uv]
-# Ensure cross-platform compatibility by not failing on unavailable platform-specific packages
-environments = ["platform_system == 'Darwin'", "platform_system == 'Linux'"]

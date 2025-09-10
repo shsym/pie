@@ -2,10 +2,13 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use pie::client::InstanceEvent;
+use pie::server::EventCode;
 use pie::{
     Config as EngineConfig,
     auth::{create_jwt, init_secret},
     client::{self, Client},
+    server,
 };
 use rand::{Rng, distr::Alphanumeric};
 use reqwest::Client as HttpClient;
@@ -33,7 +36,6 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, FmtSubscriber, Layer};
-
 //================================================================================//
 // SECTION: CLI Command & Config Structs
 //================================================================================//
@@ -295,6 +297,18 @@ async fn start_interactive_session(
             unsafe {
                 cmd.pre_exec(|| {
                     nix::unistd::setsid()?;
+
+                    // On Linux, ask the kernel to send SIGKILL to this process when
+                    // the parent (the Rust program) dies. This handles accidental termination.
+                    #[cfg(target_os = "linux")]
+                    {
+                        // libc::PR_SET_PDEATHSIG is the raw constant for this operation.
+                        // SIGKILL is a non-catchable, non-ignorable signal.
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                            // If prctl fails, return an error from the closure.
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
                     Ok(())
                 });
             }
@@ -319,22 +333,49 @@ async fn start_interactive_session(
             // Clone the Arc for the new task.
             let printer_stdout = Arc::clone(&printer);
             tokio::spawn(async move {
-                let mut reader = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    // FIX: Lock the mutex before printing.
-                    let mut p = printer_stdout.lock().await;
-                    p.print(format!("[Backend] {line}")).unwrap();
+                use tokio::io::AsyncReadExt;
+                let mut reader = BufReader::new(stdout);
+                let mut buffer = [0; 1024]; // Read in 1KB chunks
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) => break, // EOF, the child process has closed its stdout
+                        Ok(n) => {
+                            // We've received `n` bytes. Convert to a string (lossily) and print.
+                            let output = String::from_utf8_lossy(&buffer[..n]);
+                            let mut p = printer_stdout.lock().await;
+                            // Use `print!` to avoid adding an extra newline
+                            p.print(format!("[Backend] {}", output)).unwrap();
+                        }
+                        Err(e) => {
+                            // Handle read error, e.g., print it and break
+                            let mut p = printer_stdout.lock().await;
+                            p.print(format!("[Backend Read Error] {}", e)).unwrap();
+                            break;
+                        }
+                    }
                 }
             });
 
             // Clone the Arc again for the stderr task.
             let printer_stderr = Arc::clone(&printer);
             tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    // FIX: Lock the mutex here as well.
-                    let mut p = printer_stderr.lock().await;
-                    p.print(format!("[Backend] {line}")).unwrap();
+                use tokio::io::AsyncReadExt;
+                let mut reader = BufReader::new(stderr);
+                let mut buffer = [0; 1024];
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let output = String::from_utf8_lossy(&buffer[..n]);
+                            let mut p = printer_stderr.lock().await;
+                            p.print(format!("[Backend] {}", output)).unwrap();
+                        }
+                        Err(e) => {
+                            let mut p = printer_stderr.lock().await;
+                            p.print(format!("[Backend Read Error] {}", e)).unwrap();
+                            break;
+                        }
+                    }
                 }
             });
 
@@ -391,7 +432,8 @@ async fn start_interactive_session(
     }
 
     // Iterate through the child processes, signal them, and wait for them to exit.
-    for mut child in backend_processes { // <-- Make `child` mutable to call .wait()
+    for mut child in backend_processes {
+        // <-- Make `child` mutable to call .wait()
         if let Some(pid) = child.id() {
             let pgid = nix::unistd::Pid::from_raw(pid as i32);
             println!("- Terminating backend process group with PID: {}", pid);
@@ -490,7 +532,7 @@ async fn handle_run(
 
     let wasm_blob = fs::read(&args.wasm_path)
         .with_context(|| format!("Failed to read Wasm file at {:?}", args.wasm_path))?;
-    let hash = client::hash_program(&wasm_blob);
+    let hash = client::hash_blob(&wasm_blob);
     println!("Inferlet hash: {}", hash);
 
     if !client.program_exists(&hash).await? {
@@ -508,20 +550,28 @@ async fn handle_run(
         // FIX: Clone the Arc<Mutex<...>> for the new task.
         let printer_clone = Arc::clone(printer);
         tokio::spawn(async move {
-            while let Ok((event, message)) = instance.recv().await {
-                // Lock the printer to get mutable access.
-                let mut p = printer_clone.lock().await;
-                let output = if event == "terminated" {
-                    format!("[Inferlet {}] Terminated. Reason: {}", instance_id, message)
-                } else {
-                    format!("[Inferlet {}] {}: {}", instance_id, event, message)
-                };
+            while let Ok(event) = instance.recv().await {
+                match event {
+                    // Handle events that have a specific code and a text message.
+                    InstanceEvent::Event { code, message } => {
+                        // Determine if this event signals the end of the instance's execution.
+                        // Any event other than a simple 'Message' is considered a final state.
+                        let is_terminated = !matches!(code, EventCode::Message);
 
-                // Print the line, which will automatically refresh the prompt.
-                p.print(output).unwrap();
+                        // Format the output string.
+                        // Using the Debug representation of `code` is a clean way to get its name (e.g., "Completed").
+                        let output = format!("[Inferlet {}] {:?}: {}", instance_id, code, message);
 
-                if event == "terminated" {
-                    break;
+                        // Lock the printer, print the message, and then immediately release the lock.
+                        printer_clone.lock().await.print(output).unwrap();
+
+                        // If the instance's execution is finished, break out of the loop.
+                        if is_terminated {
+                            break;
+                        }
+                    }
+                    // If we receive a raw data blob, we'll ignore it and wait for the next event.
+                    InstanceEvent::Blob(_) => continue,
                 }
             }
             // No more "Press Enter" message needed!

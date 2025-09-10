@@ -6,6 +6,7 @@ use crate::service::{Service, ServiceError, install_service};
 use crate::utils::IdPool;
 use crate::{auth, messaging, model, runtime, service};
 use anyhow::Result;
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -112,6 +113,17 @@ pub enum ClientMessage {
         message: String,
     },
 
+    #[serde(rename = "upload_blob")]
+    UploadBlob {
+        corr_id: u32,
+        instance_id: String,
+        blob_hash: String,
+        chunk_index: usize,
+        total_chunks: usize,
+        #[serde(with = "serde_bytes")]
+        chunk_data: Vec<u8>,
+    },
+
     #[serde(rename = "terminate_instance")]
     TerminateInstance { instance_id: String },
 
@@ -138,8 +150,19 @@ pub enum ServerMessage {
     #[serde(rename = "instance_event")]
     InstanceEvent {
         instance_id: String,
-        event: EventCode,
+        event: u32,
         message: String,
+    },
+
+    #[serde(rename = "download_blob")]
+    DownloadBlob {
+        corr_id: u32,
+        instance_id: String,
+        blob_hash: String,
+        chunk_index: usize,
+        total_chunks: usize,
+        #[serde(with = "serde_bytes")]
+        chunk_data: Vec<u8>,
     },
 
     #[serde(rename = "server_event")]
@@ -155,6 +178,20 @@ pub enum EventCode {
     OutOfResources = 5,
 }
 
+impl EventCode {
+    pub fn from_u32(code: u32) -> Option<EventCode> {
+        match code {
+            0 => Some(EventCode::Message),
+            1 => Some(EventCode::Completed),
+            2 => Some(EventCode::Aborted),
+            3 => Some(EventCode::Exception),
+            4 => Some(EventCode::ServerError),
+            5 => Some(EventCode::OutOfResources),
+            _ => None,
+        }
+    }
+}
+
 type ClientId = u32;
 
 #[derive(Debug)]
@@ -162,6 +199,10 @@ pub enum Command {
     Send {
         inst_id: InstanceId,
         message: String,
+    },
+    SendBlob {
+        inst_id: InstanceId,
+        data: Bytes,
     },
     DetachInstance {
         inst_id: InstanceId,
@@ -228,21 +269,26 @@ impl Service for Server {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
-        let inst_id = match cmd {
-            Command::Send { inst_id, .. } | Command::DetachInstance { inst_id, .. } => inst_id,
+        // Correctly extract instance_id from all relevant commands
+        let inst_id = match &cmd {
+            Command::Send { inst_id, .. }
+            | Command::DetachInstance { inst_id, .. }
+            | Command::SendBlob { inst_id, .. } => *inst_id,
         };
 
-        // send it to the client if it's connected
+        // Send it to the client if it's connected
         if let Some(chan) = self.state.instance_chans.get(&inst_id) {
             chan.send(ClientCommand::Internal(cmd)).await.ok();
         }
     }
 }
 
+/// A generic struct to manage chunked, in-flight uploads for both programs and blobs.
 struct InFlightUpload {
-    program_hash: String,
+    hash: String,
     total_chunks: usize,
     buffer: Vec<u8>,
+    next_chunk_index: usize,
 }
 
 struct Client {
@@ -251,7 +297,8 @@ struct Client {
 
     state: Arc<ServerState>,
 
-    inflight_upload: Option<InFlightUpload>,
+    inflight_program_upload: Option<InFlightUpload>,
+    inflight_blob_uploads: DashMap<String, InFlightUpload>,
     inst_owned: Vec<InstanceId>,
 
     write_tx: mpsc::Sender<WsMessage>,
@@ -293,7 +340,6 @@ impl Client {
             while let Some(Ok(msg)) = ws_reader.next().await {
                 match msg {
                     Message::Binary(bin) => {
-                        // Decode via rmp-serde
                         match rmp_serde::decode::from_slice::<ClientMessage>(&bin) {
                             Ok(client_message) => {
                                 incoming_tx
@@ -306,14 +352,8 @@ impl Client {
                             }
                         }
                     }
-                    Message::Close(_) => {
-                        break;
-                    }
-                    Message::Text(_) | Message::Ping(_) | Message::Pong(_) => {}
-                    _ => {
-                        eprintln!("Unexpected message type from client");
-                        // ignore
-                    }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
             }
         });
@@ -322,7 +362,8 @@ impl Client {
             id,
             authenticated: !state.enable_auth,
             state,
-            inflight_upload: None,
+            inflight_program_upload: None,
+            inflight_blob_uploads: DashMap::new(),
             inst_owned: Vec::new(),
             write_tx,
             incoming_rx,
@@ -336,40 +377,19 @@ impl Client {
     async fn run(&mut self) {
         loop {
             tokio::select! {
-                // To prevent starvation, prioritize processing existing messages
-                // over checking for disconnection.
                 biased;
-
-                // Branch 1: A new command was received from the client or an internal service.
                 Some(cmd) = self.incoming_rx.recv() => {
                     self.handle_command(cmd).await;
                 },
-
-                // Branch 2: The reader task has finished. This is a primary signal
-                // that the client has disconnected.
-                _ = &mut self.reader_task => {
-                    // println!("Client {} disconnected (reader task finished).", self.id);
-                    break;
-                },
-
-                // Branch 3: The writer task has finished, likely due to a
-                // "broken pipe" error when trying to send a message.
-                _ = &mut self.writer_task => {
-                    // println!("Client {} disconnected (writer task finished).", self.id);
-                    break;
-                }
-
-                // The `else` branch is taken when all other branches are disabled,
-                // meaning the channel is closed and tasks are done. This is a clean shutdown.
+                _ = &mut self.reader_task => break,
+                _ = &mut self.writer_task => break,
                 else => break,
             }
         }
-
-        // The loop has exited, so we can now guarantee that cleanup will run.
         self.cleanup().await;
     }
 
-    /// Processes a single command. This contains the logic from your old `serve` method.
+    /// Processes a single command.
     async fn handle_command(&mut self, cmd: ClientCommand) {
         match cmd {
             ClientCommand::FromClient(message) => match message {
@@ -435,6 +455,24 @@ impl Client {
                     )
                     .await;
                 }
+                ClientMessage::UploadBlob {
+                    corr_id,
+                    instance_id,
+                    blob_hash,
+                    chunk_index,
+                    total_chunks,
+                    chunk_data,
+                } => {
+                    self.handle_upload_blob(
+                        corr_id,
+                        instance_id,
+                        blob_hash,
+                        chunk_index,
+                        total_chunks,
+                        chunk_data,
+                    )
+                    .await;
+                }
             },
             ClientCommand::Internal(cmd) => match cmd {
                 Command::Send { inst_id, message } => {
@@ -449,36 +487,39 @@ impl Client {
                     self.handle_detach_instance(inst_id, termination_code, message)
                         .await;
                 }
+                Command::SendBlob { inst_id, data } => {
+                    self.handle_send_blob(inst_id, data).await;
+                }
             },
         }
     }
 
-    async fn send(&mut self, msg: ServerMessage) {
-        match rmp_serde::to_vec_named(&msg) {
-            Ok(encoded) => {
-                if let Err(e) = self.write_tx.send(WsMessage::Binary(encoded.into())).await {
-                    eprintln!("WS write error: {:?}", e);
-                }
-            }
-            Err(e) => {
-                eprintln!("MessagePack encode error: {:?}", e);
+    async fn send(&self, msg: ServerMessage) {
+        if let Ok(encoded) = rmp_serde::to_vec_named(&msg) {
+            if self
+                .write_tx
+                .send(WsMessage::Binary(encoded.into()))
+                .await
+                .is_err()
+            {
+                eprintln!("WS write error for client {}", self.id);
             }
         }
     }
 
-    async fn send_response(&mut self, corr_id: u32, successful: bool, result: String) {
-        let msg = ServerMessage::Response {
+    async fn send_response(&self, corr_id: u32, successful: bool, result: String) {
+        self.send(ServerMessage::Response {
             corr_id,
             successful,
             result,
-        };
-        self.send(msg).await;
+        })
+        .await;
     }
 
-    async fn send_inst_event(&mut self, inst_id: InstanceId, event: EventCode, message: String) {
+    async fn send_inst_event(&self, inst_id: InstanceId, event: EventCode, message: String) {
         self.send(ServerMessage::InstanceEvent {
             instance_id: inst_id.to_string(),
-            event,
+            event: event as u32,
             message,
         })
         .await;
@@ -500,11 +541,8 @@ impl Client {
                 0 => EventCode::Completed,
                 1 => EventCode::Aborted,
                 2 => EventCode::Exception,
-                3 => EventCode::ServerError,
-                4 => EventCode::OutOfResources,
                 _ => EventCode::ServerError,
             };
-
             self.send_inst_event(inst_id, event_code, message).await;
         }
     }
@@ -528,32 +566,31 @@ impl Client {
         if !self.authenticated {
             self.send_response(corr_id, false, "Not authenticated".to_string())
                 .await;
+            return;
         }
 
         match subject.as_str() {
             QUERY_PROGRAM_EXISTS => {
                 let (evt_tx, evt_rx) = oneshot::channel();
-
                 runtime::Command::ProgramExists {
-                    hash: record.clone(),
+                    hash: record,
                     event: evt_tx,
                 }
                 .dispatch()
                 .unwrap();
-
-                let exists = evt_rx.await.unwrap();
-                self.send_response(corr_id, true, exists.to_string()).await;
+                self.send_response(corr_id, true, evt_rx.await.unwrap().to_string())
+                    .await;
             }
             QUERY_MODEL_STATUS => {
-                // gather model status from all attached backends
                 let runtime_stats = model::runtime_stats().await;
-                let runtime_stats_json = serde_json::to_string(&runtime_stats).unwrap();
-
-                self.send_response(corr_id, true, runtime_stats_json).await;
+                self.send_response(
+                    corr_id,
+                    true,
+                    serde_json::to_string(&runtime_stats).unwrap(),
+                )
+                .await;
             }
-            _ => {
-                println!("Unknown query subject: {}", subject);
-            }
+            _ => println!("Unknown query subject: {}", subject),
         }
     }
 
@@ -568,14 +605,7 @@ impl Client {
         if !self.authenticated {
             self.send_response(corr_id, false, "Not authenticated".to_string())
                 .await;
-        }
-
-        if self.inflight_upload.is_none() {
-            self.inflight_upload = Some(InFlightUpload {
-                program_hash: program_hash.clone(),
-                total_chunks,
-                buffer: Vec::new(),
-            });
+            return;
         }
 
         if chunk_data.len() > CHUNK_SIZE_BYTES {
@@ -583,49 +613,92 @@ impl Client {
                 corr_id,
                 false,
                 format!(
-                    "chunk size {} exceeds limit {}",
+                    "Chunk size {} exceeds limit {}",
                     chunk_data.len(),
                     CHUNK_SIZE_BYTES
                 ),
             )
             .await;
-
-            self.inflight_upload = None;
+            self.inflight_program_upload = None;
             return;
         }
 
-        let inflight_upload = self.inflight_upload.as_mut().unwrap();
-        inflight_upload.buffer.append(&mut chunk_data);
+        // Initialize upload on first chunk
+        if self.inflight_program_upload.is_none() {
+            if chunk_index != 0 {
+                self.send_response(corr_id, false, "First chunk index must be 0".to_string())
+                    .await;
+                return;
+            }
+            self.inflight_program_upload = Some(InFlightUpload {
+                hash: program_hash.clone(),
+                total_chunks,
+                buffer: Vec::new(),
+                next_chunk_index: 0,
+            });
+        }
 
-        // The last chunk
-        if chunk_index == total_chunks - 1 {
-            let file_hash = blake3::hash(&inflight_upload.buffer).to_hex().to_string();
+        let inflight = self.inflight_program_upload.as_ref().unwrap();
 
-            if file_hash != inflight_upload.program_hash {
+        // Validate chunk consistency
+        if total_chunks != inflight.total_chunks {
+            self.send_response(
+                corr_id,
+                false,
+                format!(
+                    "Chunk count mismatch: expected {}, got {}",
+                    inflight.total_chunks, total_chunks
+                ),
+            )
+            .await;
+            self.inflight_program_upload = None;
+            return;
+        }
+        if chunk_index != inflight.next_chunk_index {
+            self.send_response(
+                corr_id,
+                false,
+                format!(
+                    "Out-of-order chunk: expected {}, got {}",
+                    inflight.next_chunk_index, chunk_index
+                ),
+            )
+            .await;
+            self.inflight_program_upload = None;
+            return;
+        }
+
+        let inflight = self.inflight_program_upload.as_mut().unwrap();
+
+        inflight.buffer.append(&mut chunk_data);
+        inflight.next_chunk_index += 1;
+
+        // On final chunk, verify and save
+        if inflight.next_chunk_index == total_chunks {
+            let final_hash = blake3::hash(&inflight.buffer).to_hex().to_string();
+            if final_hash != program_hash {
                 self.send_response(
                     corr_id,
                     false,
                     format!(
-                        "hash mismatch: expected {}, got {}",
-                        program_hash, file_hash
+                        "Hash mismatch: expected {}, got {}",
+                        program_hash, final_hash
                     ),
                 )
                 .await;
             } else {
                 let (evt_tx, evt_rx) = oneshot::channel();
                 runtime::Command::UploadProgram {
-                    hash: file_hash.clone(),
-                    raw: mem::take(&mut inflight_upload.buffer),
+                    hash: final_hash.clone(),
+                    raw: mem::take(&mut inflight.buffer),
                     event: evt_tx,
                 }
                 .dispatch()
                 .unwrap();
-                let _ = evt_rx.await.unwrap();
-
-                self.send_response(corr_id, true, file_hash).await;
+                evt_rx.await.unwrap().unwrap();
+                self.send_response(corr_id, true, final_hash).await;
             }
-
-            self.inflight_upload = None;
+            self.inflight_program_upload = None;
         }
     }
 
@@ -638,31 +711,27 @@ impl Client {
         if !self.authenticated {
             self.send_response(corr_id, false, "Not authenticated".to_string())
                 .await;
+            return;
         }
 
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchInstance {
-            program_hash: program_hash.clone(),
+            program_hash,
             arguments,
             event: evt_tx,
         }
         .dispatch()
         .unwrap();
-
         match evt_rx.await.unwrap() {
             Ok(instance_id) => {
-                //register
                 self.state
                     .instance_chans
                     .insert(instance_id, self.incoming_tx.clone());
-
                 self.inst_owned.push(instance_id);
                 self.send_response(corr_id, true, instance_id.to_string())
                     .await;
             }
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-            }
+            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
         }
     }
 
@@ -676,26 +745,24 @@ impl Client {
         if !self.authenticated {
             self.send_response(corr_id, false, "Not authenticated".to_string())
                 .await;
+            return;
         }
 
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchServerInstance {
-            program_hash: program_hash.clone(),
+            program_hash,
             port,
             arguments,
             event: evt_tx,
         }
         .dispatch()
         .unwrap();
-
         match evt_rx.await.unwrap() {
             Ok(_) => {
                 self.send_response(corr_id, true, "server launched".to_string())
-                    .await;
+                    .await
             }
-            Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
-            }
+            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
         }
     }
 
@@ -736,76 +803,162 @@ impl Client {
                 .await;
             return;
         }
-
         match service_type.as_str() {
-            "model" => {
-                // Try to create the model; fail fast on error.
-                let model_service = match Model::new(&endpoint).await {
-                    Ok(m) => m,
-                    Err(e) => {
-
-                        println!("Failed to create model backend: {:?}", e);
-                        self.send_response(
-                            corr_id,
-                            false,
-                            "Failed to attach to model backend server".into(),
-                        )
-                        .await;
-                        return;
+            "model" => match Model::new(&endpoint).await {
+                Ok(model_service) => {
+                    if let Some(service_id) = install_service(&service_name, model_service) {
+                        model::register_model(service_name, service_id);
+                        self.send_response(corr_id, true, "Model service registered".into())
+                            .await;
+                    } else {
+                        self.send_response(corr_id, false, "Failed to register model".into())
+                            .await;
                     }
-                };
-
-                // Try to install; fail fast on error.
-                let Some(service_id) = install_service(&service_name, model_service) else {
-                    self.send_response(
-                        corr_id,
-                        false,
-                        "Failed to register the model service".into(),
-                    )
-                    .await;
-                    return;
-                };
-
-                // Success path.
-                model::register_model(service_name, service_id);
-                self.send_response(
-                    corr_id,
-                    true,
-                    "Model service registration successful".into(),
-                )
-                .await;
-            }
-
+                }
+                Err(_) => {
+                    self.send_response(corr_id, false, "Failed to attach to model backend".into())
+                        .await
+                }
+            },
             other => {
                 self.send_response(corr_id, false, format!("Unknown service type: {other}"))
-                    .await;
+                    .await
             }
         }
     }
 
-    /// The cleanup logic is now guaranteed to run.
+    /// Handles a blob chunk uploaded by the client for a specific instance.
+    async fn handle_upload_blob(
+        &mut self,
+        corr_id: u32,
+        instance_id: String,
+        blob_hash: String,
+        chunk_index: usize,
+        total_chunks: usize,
+        mut chunk_data: Vec<u8>,
+    ) {
+        if !self.authenticated {
+            self.send_response(corr_id, false, "Not authenticated".to_string())
+                .await;
+            return;
+        }
+
+        let inst_id = match Uuid::parse_str(&instance_id) {
+            Ok(id) => id,
+            Err(_) => {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!("Invalid instance_id: {}", instance_id),
+                )
+                .await;
+                return;
+            }
+        };
+        if !self.inst_owned.contains(&inst_id) {
+            self.send_response(
+                corr_id,
+                false,
+                format!("Instance not owned by client: {}", instance_id),
+            )
+            .await;
+            return;
+        }
+
+        // Initialize or retrieve the in-flight upload
+        if !self.inflight_blob_uploads.contains_key(&blob_hash) {
+            if chunk_index != 0 {
+                self.send_response(corr_id, false, "First chunk index must be 0".to_string())
+                    .await;
+                return;
+            }
+            self.inflight_blob_uploads.insert(
+                blob_hash.clone(),
+                InFlightUpload {
+                    hash: blob_hash.clone(),
+                    total_chunks,
+                    buffer: Vec::with_capacity(total_chunks * CHUNK_SIZE_BYTES),
+                    next_chunk_index: 0,
+                },
+            );
+        }
+
+        if let Some(mut inflight) = self.inflight_blob_uploads.get_mut(&blob_hash) {
+            if total_chunks != inflight.total_chunks || chunk_index != inflight.next_chunk_index {
+                let error_msg = if total_chunks != inflight.total_chunks {
+                    format!(
+                        "Chunk count mismatch: expected {}, got {}",
+                        inflight.total_chunks, total_chunks
+                    )
+                } else {
+                    format!(
+                        "Out-of-order chunk: expected {}, got {}",
+                        inflight.next_chunk_index, chunk_index
+                    )
+                };
+                self.send_response(corr_id, false, error_msg).await;
+                self.inflight_blob_uploads.remove(&blob_hash); // Abort upload
+                return;
+            }
+
+            inflight.buffer.append(&mut chunk_data);
+            inflight.next_chunk_index += 1;
+
+            if inflight.next_chunk_index == total_chunks {
+                let final_hash = blake3::hash(&inflight.buffer).to_hex().to_string();
+
+                if final_hash == blob_hash {
+                    dispatch_u2i(messaging::PushPullCommand::PushBlob {
+                        topic: inst_id.to_string(),
+                        message: Bytes::from(mem::take(&mut inflight.buffer)),
+                    });
+                    self.send_response(corr_id, true, "Blob sent to instance".to_string())
+                        .await;
+                } else {
+                    self.send_response(
+                        corr_id,
+                        false,
+                        format!("Hash mismatch: expected {}, got {}", blob_hash, final_hash),
+                    )
+                    .await;
+                }
+                self.inflight_blob_uploads.remove(&blob_hash);
+            }
+        }
+    }
+
+    /// Handles an internal command to send a blob to the connected client.
+    async fn handle_send_blob(&mut self, inst_id: InstanceId, data:Bytes) {
+        if !self.authenticated {
+            return;
+        }
+
+        let blob_hash = blake3::hash(&data).to_hex().to_string();
+        let total_chunks = (data.len() + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES;
+
+        for (i, chunk) in data.chunks(CHUNK_SIZE_BYTES).enumerate() {
+            self.send(ServerMessage::DownloadBlob {
+                corr_id: 0,
+                instance_id: inst_id.to_string(),
+                blob_hash: blob_hash.clone(),
+                chunk_index: i,
+                total_chunks,
+                chunk_data: chunk.to_vec(),
+            })
+            .await;
+        }
+    }
+
+    /// Cleans up client resources upon disconnection.
     async fn cleanup(&mut self) {
-        // Terminate all instances owned by this client.
         for inst_id in self.inst_owned.drain(..) {
             if self.state.instance_chans.remove(&inst_id).is_some() {
                 runtime::trap_exception(inst_id, "socket terminated");
             }
         }
-
-        // Abort the tasks to ensure they are stopped. It's safe to abort
-        // tasks that have already completed.
         self.reader_task.abort();
         self.writer_task.abort();
-
-        // Remove the client from the central map.
         self.state.clients.remove(&self.id);
-
-        // Release the client ID back to the pool.
-        self.state
-            .client_id_pool
-            .lock()
-            .await
-            .release(self.id)
-            .expect("Failed to release client ID");
+        self.state.client_id_pool.lock().await.release(self.id).ok();
     }
 }

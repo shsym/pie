@@ -1,14 +1,16 @@
-use inferlet::sampler::Sampler;
+use inferlet::Sampler;
+use inferlet::sampler::Sample;
+use inferlet::traits::Tokenize;
 use pico_args::Arguments;
 use rand::distr::Distribution;
 use rand::distr::weighted::WeightedIndex;
 use rand::rngs::ThreadRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
+use std::cell::{Cell, RefCell}; // Import Cell and RefCell
 use std::ffi::OsString;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Instant;
-use inferlet::traits::Tokenize;
 
 /// Injects a watermark by partitioning the vocabulary into a "green list" and a "red list"
 /// based on the hash of the previous token. It then boosts the probabilities of tokens
@@ -19,10 +21,10 @@ pub struct WatermarkSampler {
     /// The bias added to the logits of the green-listed tokens to increase their probability.
     delta: f32,
     /// The previously generated token ID, used to seed the green/red list generation.
-    /// `None` indicates the start of a sequence.
-    previous_token: Option<u32>,
-    /// Random number generator for sampling.
-    rng: ThreadRng,
+    /// `None` indicates the start of a sequence. Wrapped in a `Cell` for interior mutability.
+    previous_token: Cell<Option<u32>>,
+    /// Random number generator for sampling. Wrapped in a `RefCell` for interior mutability.
+    rng: RefCell<ThreadRng>,
 }
 
 impl WatermarkSampler {
@@ -39,15 +41,17 @@ impl WatermarkSampler {
         Self {
             gamma,
             delta,
-            previous_token: None, // No previous token at the beginning
-            rng: rand::rng(),
+            // Initialize the fields with their respective interior mutability wrappers.
+            previous_token: Cell::new(None),
+            rng: RefCell::new(rand::thread_rng()),
         }
     }
 
     /// Hashes the previous token to create a seed for the RNG.
     /// This ensures the green/red list is deterministic based on the context.
     fn get_seed(&self) -> u64 {
-        match self.previous_token {
+        // Use `get()` to read the value from the `Cell`.
+        match self.previous_token.get() {
             Some(token) => {
                 let mut hasher = DefaultHasher::new();
                 token.hash(&mut hasher);
@@ -59,13 +63,15 @@ impl WatermarkSampler {
     }
 }
 
-impl Sampler for WatermarkSampler {
-    fn sample(&mut self, ids: &[u32], probs: &[f32]) -> u32 {
+impl Sample for WatermarkSampler {
+    // The signature now takes `&self` instead of `&mut self`.
+    fn sample(&self, ids: &[u32], probs: &[f32]) -> u32 {
         if ids.is_empty() {
             // Handle the edge case of an empty input.
             // This could be an error or a special token like EOS.
             // Here, we'll arbitrarily return 0.
-            self.previous_token = Some(0);
+            // Use `set()` to update the value inside the `Cell`.
+            self.previous_token.set(Some(0));
             return 0;
         }
 
@@ -110,16 +116,18 @@ impl Sampler for WatermarkSampler {
         // Sample from the new, watermarked distribution.
         let dist = WeightedIndex::new(&watermarked_probs)
             .expect("Failed to create watermarked distribution.");
-        let chosen_idx = dist.sample(&mut self.rng);
+        // Get a mutable borrow of the RNG from the `RefCell`.
+        let chosen_idx = dist.sample(&mut *self.rng.borrow_mut());
 
         let chosen_id = ids[chosen_idx];
 
-        // Update the previous token for the next sampling step.
-        self.previous_token = Some(chosen_id);
+        // Update the previous token for the next sampling step using `set()`.
+        self.previous_token.set(Some(chosen_id));
 
         chosen_id
     }
 }
+
 #[inferlet::main]
 async fn main() -> Result<(), String> {
     // 1. Get arguments from the inferlet environment and prepare the parser.
@@ -155,7 +163,8 @@ async fn main() -> Result<(), String> {
 
     let model = inferlet::get_auto_model();
     let tokenizer = model.get_tokenizer();
-    let mut sampler = WatermarkSampler::new(0.5, 0.0);
+    // The `sampler` no longer needs to be mutable.
+    let sampler = WatermarkSampler::new(0.5, 0.0);
     let mut stop_condition = inferlet::stop_condition::any(
         inferlet::stop_condition::Until::new(tokenizer.tokenize("<|eot_id|>")),
         inferlet::stop_condition::Length::new(max_num_outputs as usize),
@@ -172,7 +181,15 @@ async fn main() -> Result<(), String> {
     ));
     ctx.fill("<|start_header_id|>assistant<|end_header_id|>\n\n");
 
-    let text = ctx.generate(&mut sampler, &mut stop_condition).await;
+    let text = ctx
+        .generate(
+            Sampler::Custom {
+                temperature: 1.0,
+                sampler: Box::new(sampler),
+            },
+            &mut stop_condition,
+        )
+        .await;
     let token_ids = tokenizer.tokenize(&text);
     println!("Output: {:?} (total elapsed: {:?})", text, start.elapsed());
 

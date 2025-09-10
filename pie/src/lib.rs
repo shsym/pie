@@ -12,7 +12,6 @@ mod instance;
 mod kvs;
 mod messaging;
 mod model;
-mod object;
 mod resource;
 mod runtime;
 pub mod server;
