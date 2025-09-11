@@ -20,19 +20,16 @@ from websockets.sync.client import connect
 
 from config.common import ModelInfo
 from handler import Handler
-from model.l4ma import L4maForCausalLM, L4maTensorLoader
+from model.l4ma import L4maForCausalLM, create_fusion_map as create_l4ma_fusion_map
 from message import (
     EmbedImageRequest,
     ForwardPassRequest,
     HandshakeRequest,
     InitializeAdapterRequest,
     QueryRequest,
-    UpdateAdapterRequest,
-    HeartbeatRequest,
-    UploadAdapterRequest,
-    DownloadAdapterRequest,
+    UpdateAdapterRequest, HeartbeatRequest, UploadAdapterRequest, DownloadAdapterRequest,
 )
-from model.qwen3 import Qwen3ForCausalLM, Qwen3TensorLoader
+from model.qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 
 
 class HandlerId(enum.Enum):
@@ -43,26 +40,26 @@ class HandlerId(enum.Enum):
     EMBED_IMAGE = 4
     INITIALIZE_ADAPTER = 5
     UPDATE_ADAPTER = 6
-    UPLOAD_HANDLER = 7
-    DOWNLOAD_HANDLER = 8
+    UPLOAD_ADAPTER = 7
+    DOWNLOAD_ADAPTER = 8
 
 
 def main(
-    model: str,
-    host: str = "localhost",
-    port: int = 10123,
-    controller_host: str = "localhost",
-    controller_port: int = 9123,
-    auth_token: str = None,
-    cache_dir: str = None,
-    kv_page_size: int = 16,
-    max_dist_size: int = 64,
-    max_num_kv_pages: int = 1024,
-    max_num_embeds: int = 128,
-    max_num_adapters: int = 48,
-    max_adapter_rank: int = 8,
-    device: str = "cuda:0",
-    dtype: str = "bfloat16",
+        model: str,
+        host: str = "localhost",
+        port: int = 10123,
+        controller_host: str = "localhost",
+        controller_port: int = 9123,
+        auth_token: str = None,
+        cache_dir: str = None,
+        kv_page_size: int = 16,
+        max_dist_size: int = 64,
+        max_num_kv_pages: int = 1024,
+        max_num_embeds: int = 128,
+        max_num_adapters: int = 48,
+        max_adapter_rank: int = 8,
+        device: str = "cuda:0",
+        dtype: str = "bfloat16",
 ):
     """
     Runs the application with configuration provided as command-line arguments.
@@ -87,7 +84,7 @@ def main(
     """
     # Resolve cache_dir using the precedence: CLI arg > Environment Var > Platform Default
     resolved_cache_dir = (
-        cache_dir or os.environ.get("PIE_HOME") or str(Path(user_cache_dir("pie")))
+            cache_dir or os.environ.get("PIE_HOME") or str(Path(user_cache_dir("pie")))
     )
 
     # Create a config dictionary from function arguments for downstream use.
@@ -117,86 +114,71 @@ def load_model(config: dict):
     model_dtype = getattr(torch, config["dtype"])
     model_info = ModelInfo.load_from_file(str(metadata_path), model_device, model_dtype)
 
-    # Instantiate model and create tensor loader based on architecture
+    # Instantiate model and create fusion map based on architecture
     if model_info.architecture.type.lower() == "qwen3":
         model = Qwen3ForCausalLM(model_info.architecture)
-        tensor_loader = Qwen3TensorLoader(model)
+        fusion_map = create_qwen3_fusion_map(model)
     else:
         model = L4maForCausalLM(model_info.architecture)
-        tensor_loader = L4maTensorLoader(model)
+        fusion_map = create_l4ma_fusion_map(model)
 
-    # Prepare for loading
+    # Create a reverse map for quick lookup of fusion targets
+    source_to_fusion_target = {
+        source: target
+        for target, details in fusion_map.items()
+        for source in details["sources"]
+    }
+
+    pending_fusion_tensors = {}
     model_state_keys = set(model.state_dict().keys())
     loaded_keys = set()
-    
-    # Track which checkpoint file each tensor comes from
-    checkpoint_tensor_to_file = {}
-    
-    # First pass: scan all checkpoint files to build tensor-to-file mapping
-    print("Scanning checkpoint files...")
+
     try:
         for param_file in model_info.parameters:
             weights_path = model_path / model_name / param_file
             with ztensor.Reader(str(weights_path)) as reader:
                 tensor_names = reader.get_tensor_names()
                 pbar_desc = (
-                    f"Scanning {param_file[:30]}..."
+                    f"Loading {param_file[:30]}..."
                     if len(param_file) > 30
-                    else f"Scanning {param_file}"
+                    else f"Loading {param_file}"
                 )
                 for name in tqdm(tensor_names, desc=pbar_desc, unit="tensors"):
-                    checkpoint_tensor_to_file[name] = weights_path
+                    # If tensor is part of a fusion, buffer it
+                    if name in source_to_fusion_target:
+                        pending_fusion_tensors[name] = reader.read_tensor(
+                            name, to="torch"
+                        )
+                        continue
 
-        # Second pass: process all runtime tensors using the tensor loader
-        print("\nProcessing runtime tensors...")
-        
-        for runtime_tensor_name in tqdm(model_state_keys, desc="Processing tensors", unit="tensors"):
-            if runtime_tensor_name in loaded_keys:
-                continue  # Skip already loaded tensors
-                
-            # Query which checkpoint tensors are needed
-            required_checkpoint_tensors = tensor_loader.query(runtime_tensor_name)
-            
-            # Load required checkpoint tensors on demand
-            available_tensors = {}
-            missing_tensors = []
-            
-            for checkpoint_name in required_checkpoint_tensors:
-                if checkpoint_name not in checkpoint_tensor_to_file:
-                    missing_tensors.append(checkpoint_name)
+                    # Load standard, non-fused tensor
+                    if name in model_state_keys and name not in loaded_keys:
+                        param = model.state_dict()[name]
+                        tensor_data = reader.read_tensor(name, to="torch")
+                        if tensor_data.shape != param.shape:
+                            print(
+                                f"    Warning: Shape mismatch for tensor '{name}'. Skipping."
+                            )
+                            continue
+                        with torch.no_grad():
+                            param.copy_(tensor_data, non_blocking=True)
+                        loaded_keys.add(name)
+
+        # Process all buffered tensors for fusion
+        for target_name, details in fusion_map.items():
+            source_names = details["sources"]
+            if all(s in pending_fusion_tensors for s in source_names):
+                tensors_to_fuse = [pending_fusion_tensors[s] for s in source_names]
+                fused_tensor = torch.cat(tensors_to_fuse, dim=details["dim"])
+                param = model.state_dict()[target_name]
+                if fused_tensor.shape != param.shape:
+                    print(
+                        f"    Warning: Shape mismatch for fused tensor '{target_name}'. Skipping."
+                    )
                     continue
-                
-                try:
-                    checkpoint_file_path = checkpoint_tensor_to_file[checkpoint_name]
-                    with ztensor.Reader(str(checkpoint_file_path)) as reader:
-                        available_tensors[checkpoint_name] = reader.read_tensor(checkpoint_name, to="torch")
-                except Exception as e:
-                    print(f"    Error loading checkpoint tensor '{checkpoint_name}': {e}")
-                    missing_tensors.append(checkpoint_name)
-            
-            if missing_tensors:
-                # Weight tying for lm_head.weight is handled separately
-                if runtime_tensor_name != "lm_head.weight":
-                    print(f"    Warning: Missing checkpoint tensors for '{runtime_tensor_name}': {missing_tensors}")
-                continue
-            
-            # Load the runtime tensor using the tensor loader
-            try:
-                runtime_tensor = tensor_loader.load(runtime_tensor_name, available_tensors)
-                param = model.state_dict()[runtime_tensor_name]
-                
-                if runtime_tensor.shape != param.shape:
-                    print(f"    Warning: Shape mismatch for tensor '{runtime_tensor_name}'. "
-                          f"Expected {param.shape}, got {runtime_tensor.shape}. Skipping.")
-                    continue
-                    
                 with torch.no_grad():
-                    param.copy_(runtime_tensor, non_blocking=True)
-                loaded_keys.add(runtime_tensor_name)
-                
-            except Exception as e:
-                print(f"    Error loading tensor '{runtime_tensor_name}': {e}")
-                continue
+                    param.copy_(fused_tensor, non_blocking=True)
+                loaded_keys.add(target_name)
 
         # Handle weight tying for lm_head
         if "lm_head.weight" in model_state_keys and "lm_head.weight" not in loaded_keys:
@@ -358,10 +340,8 @@ def run_zmq_server(socket, handler):
             InitializeAdapterRequest
         ),
         HandlerId.UPDATE_ADAPTER.value: msgspec.msgpack.Decoder(UpdateAdapterRequest),
-        HandlerId.UPLOAD_HANDLER.value: msgspec.msgpack.Decoder(UploadAdapterRequest),
-        HandlerId.DOWNLOAD_HANDLER.value: msgspec.msgpack.Decoder(
-            DownloadAdapterRequest
-        ),
+        HandlerId.UPLOAD_ADAPTER.value: msgspec.msgpack.Decoder(UploadAdapterRequest),
+        HandlerId.DOWNLOAD_ADAPTER.value: msgspec.msgpack.Decoder(DownloadAdapterRequest),
     }
     MSGPACK_ENCODER = msgspec.msgpack.Encoder()
 
@@ -392,7 +372,9 @@ def run_zmq_server(socket, handler):
                 handler_id = struct.unpack(">I", handler_id_bytes)[0]
                 reqs = [DECODERS[handler_id].decode(m) for m in message[3:]]
             except (struct.error, KeyError, msgspec.DecodeError) as e:
-                print(f"[!] Error decoding request header or payload: {e}")
+                print(
+                    f"[!] Error decoding request header or payload: {e}"
+                )
                 continue
 
             if not reqs:
@@ -418,10 +400,10 @@ def run_zmq_server(socket, handler):
                     handler.initialize_adapter(reqs)
                 case HandlerId.UPDATE_ADAPTER.value:
                     handler.update_adapter(reqs)
-                case HandlerId.UPLOAD_HANDLER.value:
-                    handler.upload_handler(reqs)
-                case HandlerId.DOWNLOAD_HANDLER.value:
-                    resps = handler.download_handler(reqs)
+                case HandlerId.UPLOAD_ADAPTER.value:
+                    handler.upload_adapter(reqs)
+                case HandlerId.DOWNLOAD_ADAPTER.value:
+                    resps = handler.download_adapter(reqs)
                 case _:
                     print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
 
@@ -436,7 +418,6 @@ def run_zmq_server(socket, handler):
             f"\n[!!!] A fatal, unhandled error occurred in the ZMQ server loop: {e}",
         )
         import traceback
-
         traceback.print_exc()
         os._exit(1)
 

@@ -90,7 +90,7 @@ class UpdateAdapterRequest(msgspec.Struct, gc=False):
 class UploadAdapterRequest(msgspec.Struct, gc=False):
     adapter_ptr: int
     name: str
-    adapter_data: bytes
+    adapter_data: list[int]
 
 
 class DownloadAdapterRequest(msgspec.Struct, gc=False):
@@ -99,4 +99,4 @@ class DownloadAdapterRequest(msgspec.Struct, gc=False):
 
 
 class DownloadAdapterResponse(msgspec.Struct, gc=False):
-    adapter_data: bytes
+    adapter_data: list[int]
