@@ -1,5 +1,4 @@
 use inferlet::traits::Tokenize;
-use inferlet::{Sampler, set_return};
 use pico_args::Arguments;
 use std::ffi::OsString;
 use std::time::Instant;
@@ -15,6 +14,7 @@ Options:
                            (default: "Explain the LLM decoding process ELI5.")
   -n, --max-tokens <INT>   The maximum number of new tokens to generate
                            (default: 256)
+  --output                 Send the final output back to the user.
   -h, --help               Print help information
 "#;
 
@@ -45,6 +45,9 @@ async fn main() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .unwrap_or(256);
 
+    // Check for the presence of the --output flag.
+    let send_output = args.contains("--output");
+
     // Ensure no unknown arguments were passed.
     let remaining = args.finish();
     if !remaining.is_empty() {
@@ -64,9 +67,7 @@ async fn main() -> Result<(), String> {
     ctx.fill_system("You are a helpful, respectful and honest assistant.");
     ctx.fill_user(&prompt);
 
-    let final_text = ctx
-        .generate_until(Sampler::top_p(0.6, 0.95), max_num_outputs as usize)
-        .await;
+    let final_text = ctx.generate_until(max_num_outputs as usize).await;
 
     let token_ids = tokenizer.tokenize(&final_text);
     println!(
@@ -82,7 +83,11 @@ async fn main() -> Result<(), String> {
             start.elapsed() / (token_ids.len() as u32)
         );
     }
-    set_return(&final_text);
+
+    // Send back the output to the user only if the --output flag was provided.
+    if send_output {
+        inferlet::send(&final_text);
+    }
 
     Ok(())
 }

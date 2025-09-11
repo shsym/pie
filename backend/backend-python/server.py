@@ -1,4 +1,3 @@
-import enum
 import os
 import random
 import struct
@@ -27,39 +26,27 @@ from message import (
     HandshakeRequest,
     InitializeAdapterRequest,
     QueryRequest,
-    UpdateAdapterRequest, HeartbeatRequest, UploadAdapterRequest, DownloadAdapterRequest,
+    UpdateAdapterRequest,
 )
 from model.qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 
 
-class HandlerId(enum.Enum):
-    HANDSHAKE = 0
-    HEARTBEAT = 1
-    QUERY = 2
-    FORWARD_PASS = 3
-    EMBED_IMAGE = 4
-    INITIALIZE_ADAPTER = 5
-    UPDATE_ADAPTER = 6
-    UPLOAD_ADAPTER = 7
-    DOWNLOAD_ADAPTER = 8
-
-
 def main(
-        model: str,
-        host: str = "localhost",
-        port: int = 10123,
-        controller_host: str = "localhost",
-        controller_port: int = 9123,
-        auth_token: str = None,
-        cache_dir: str = None,
-        kv_page_size: int = 16,
-        max_dist_size: int = 64,
-        max_num_kv_pages: int = 1024,
-        max_num_embeds: int = 128,
-        max_num_adapters: int = 48,
-        max_adapter_rank: int = 8,
-        device: str = "cuda:0",
-        dtype: str = "bfloat16",
+    model: str,
+    host: str = "localhost",
+    port: int = 10123,
+    controller_host: str = "localhost",
+    controller_port: int = 9123,
+    auth_token: str = None,
+    cache_dir: str = None,
+    kv_page_size: int = 16,
+    max_dist_size: int = 64,
+    max_num_kv_pages: int = 1024,
+    max_num_embeds: int = 128,
+    max_num_adapters: int = 48,
+    max_adapter_rank: int = 8,
+    device: str = "cuda:0",
+    dtype: str = "bfloat16",
 ):
     """
     Runs the application with configuration provided as command-line arguments.
@@ -84,7 +71,7 @@ def main(
     """
     # Resolve cache_dir using the precedence: CLI arg > Environment Var > Platform Default
     resolved_cache_dir = (
-            cache_dir or os.environ.get("PIE_HOME") or str(Path(user_cache_dir("pie")))
+        cache_dir or os.environ.get("PIE_HOME") or str(Path(user_cache_dir("pie")))
     )
 
     # Create a config dictionary from function arguments for downstream use.
@@ -262,8 +249,7 @@ def register(config, endpoint):
     """
     controller_addr = f"ws://{config['controller_host']}:{config['controller_port']}"
     try:
-        # MODIFICATION 1: Added 'open_timeout=10' to attempt connection for 10 seconds.
-        with connect(controller_addr, open_timeout=10) as websocket:
+        with connect(controller_addr) as websocket:
             # Authenticate with the controller
             websocket.send(
                 msgpack.packb(
@@ -280,8 +266,7 @@ def register(config, endpoint):
                 print(
                     f"Authentication failed: {auth_response.get('result', 'Unknown error')}"
                 )
-                # Use os._exit(1) to terminate the entire process immediately from a thread
-                os._exit(1)
+                sys.exit(1)
 
             # Register the service endpoint
             websocket.send(
@@ -301,69 +286,38 @@ def register(config, endpoint):
                 print(
                     f"Controller registration failed: {reg_response.get('result', 'Unknown error')}"
                 )
-                os._exit(1)
+                sys.exit(1)
 
             print(f"Registered with controller at {controller_addr}")
 
-    # MODIFICATION 2: Catch connection errors (including timeout) and exit the program.
-    # The 'TimeoutError' is raised by 'open_timeout'.
-    except (ConnectionRefusedError, TimeoutError) as e:
-        print(
-            f"Failed to connect to the controller at {controller_addr} within 10 seconds."
-        )
-        print(f"Error: {e}")
-        print("Please ensure the controller is running and accessible. Terminating.")
-        os._exit(1)
+    except ConnectionRefusedError:
+        print(f"Failed to connect to the controller at {controller_addr}.")
+        print("Please ensure the controller is running and accessible.")
     except Exception as e:
-        print(f"An unexpected error occurred during registration: {e}. Terminating.")
-        os._exit(1)
+        print(f"An error occurred during registration: {e}")
 
 
 def run_zmq_server(socket, handler):
     """
     Runs the ZMQ server loop, listening for and processing client requests.
-    Exits the program if a heartbeat is not received for 7 seconds or if any
-    exception occurs.
     """
-    # --- MODIFICATION: Set heartbeat timeout and initialize timer ---
-    HEARTBEAT_TIMEOUT = 7  # seconds
-    last_heartbeat_time = time.monotonic()
-
-    # --- CORRECTION: Keys should be integer values of the enums ---
-    DECODERS = {
-        HandlerId.HANDSHAKE.value: msgspec.msgpack.Decoder(HandshakeRequest),
-        HandlerId.HEARTBEAT.value: msgspec.msgpack.Decoder(HeartbeatRequest),
-        HandlerId.QUERY.value: msgspec.msgpack.Decoder(QueryRequest),
-        HandlerId.FORWARD_PASS.value: msgspec.msgpack.Decoder(ForwardPassRequest),
-        HandlerId.EMBED_IMAGE.value: msgspec.msgpack.Decoder(EmbedImageRequest),
-        HandlerId.INITIALIZE_ADAPTER.value: msgspec.msgpack.Decoder(
-            InitializeAdapterRequest
-        ),
-        HandlerId.UPDATE_ADAPTER.value: msgspec.msgpack.Decoder(UpdateAdapterRequest),
-        HandlerId.UPLOAD_ADAPTER.value: msgspec.msgpack.Decoder(UploadAdapterRequest),
-        HandlerId.DOWNLOAD_ADAPTER.value: msgspec.msgpack.Decoder(DownloadAdapterRequest),
-    }
     MSGPACK_ENCODER = msgspec.msgpack.Encoder()
+    DECODERS = {
+        0: msgspec.msgpack.Decoder(HandshakeRequest),
+        1: msgspec.msgpack.Decoder(QueryRequest),
+        2: msgspec.msgpack.Decoder(ForwardPassRequest),
+        3: msgspec.msgpack.Decoder(EmbedImageRequest),
+        4: msgspec.msgpack.Decoder(InitializeAdapterRequest),
+        5: msgspec.msgpack.Decoder(UpdateAdapterRequest),
+    }
 
-    poller = zmq.Poller()
-    poller.register(socket, zmq.POLLIN)
-
-    try:
-        while True:
-            # Check for heartbeat timeout before waiting for a message
-            if time.monotonic() - last_heartbeat_time > HEARTBEAT_TIMEOUT:
-                os._exit(1)  # Use os._exit for immediate termination from a thread
-
-            # Poll for 1 second to remain responsive to the heartbeat check
-            events = dict(poller.poll(timeout=1000))
-            if socket in events:
-                message = socket.recv_multipart()
-            else:
-                # Poller timed out, loop again to re-check the heartbeat timer
-                continue
+    while True:
+        try:
+            # ROUTER sockets expect [client_id, corr_id, handler_id, payload...]
+            message = socket.recv_multipart()
 
             if len(message) < 3:
-                print(f"[!] Received invalid message: {message}")
+                print(f"[!] Received invalid message: {message}", file=sys.stderr)
                 continue
 
             client_identity, corr_id_bytes, handler_id_bytes = message[:3]
@@ -373,37 +327,29 @@ def run_zmq_server(socket, handler):
                 reqs = [DECODERS[handler_id].decode(m) for m in message[3:]]
             except (struct.error, KeyError, msgspec.DecodeError) as e:
                 print(
-                    f"[!] Error decoding request header or payload: {e}"
+                    f"[!] Error decoding request header or payload: {e}",
+                    file=sys.stderr,
                 )
                 continue
 
             if not reqs:
-                print(f"[!] Received empty request body")
+                print(f"[!] Received empty request body", file=sys.stderr)
                 continue
 
             resps = []
-            # The match statement correctly compares the integer handler_id with enum values
             match handler_id:
-                case HandlerId.HANDSHAKE.value:
+                case 0:
                     resps = handler.handshake(reqs)
-                case HandlerId.HEARTBEAT.value:
-                    # print(f"[*] Heartbeat received at {time.time()}")
-                    last_heartbeat_time = time.monotonic()
-                    resps = handler.heartbeat(reqs)
-                case HandlerId.QUERY.value:
+                case 1:
                     resps = handler.query(reqs)
-                case HandlerId.FORWARD_PASS.value:
+                case 2:
                     resps = handler.forward_pass(reqs)
-                case HandlerId.EMBED_IMAGE.value:
+                case 3:
                     handler.embed_image(reqs)
-                case HandlerId.INITIALIZE_ADAPTER.value:
+                case 4:
                     handler.initialize_adapter(reqs)
-                case HandlerId.UPDATE_ADAPTER.value:
+                case 5:
                     handler.update_adapter(reqs)
-                case HandlerId.UPLOAD_ADAPTER.value:
-                    handler.upload_adapter(reqs)
-                case HandlerId.DOWNLOAD_ADAPTER.value:
-                    resps = handler.download_adapter(reqs)
                 case _:
                     print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
 
@@ -413,20 +359,10 @@ def run_zmq_server(socket, handler):
                 ]
                 socket.send_multipart(response_msg)
 
-    except Exception as e:
-        print(
-            f"\n[!!!] A fatal, unhandled error occurred in the ZMQ server loop: {e}",
-        )
-        import traceback
-        traceback.print_exc()
-        os._exit(1)
+        except zmq.ZMQError as e:
+            print(f"ZMQ Error in server loop: {e}", file=sys.stderr)
+            break
 
 
 if __name__ == "__main__":
-    # log_file = open("service.log", "w", buffering=1)
-
-    # Redirect stdout and stderr to the log file
-    # sys.stdout = log_file
-    # sys.stderr = log_file
-    # --------------------------
     fire.Fire(main)
