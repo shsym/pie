@@ -17,3 +17,4 @@ ping_pb2.pyi
 debug_framework/*.db
 debug_framework/*.sqlite
 debug_framework/*.sqlite3
+debug_framework/data/

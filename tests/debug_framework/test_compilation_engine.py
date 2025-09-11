@@ -30,25 +30,22 @@ except ImportError:
 class TestCompilationEngine:
     """Test suite for CompilationEngine service functionality."""
 
-    def test_compilation_engine_import_fails(self):
-        """Test that CompilationEngine import fails (TDD requirement)."""
-        with pytest.raises(ImportError):
-            from debug_framework.services.compilation_engine import CompilationEngine
+    def test_compilation_engine_import_succeeds(self):
+        """Test that CompilationEngine import succeeds (implementation complete)."""
+        from debug_framework.services.compilation_engine import CompilationEngine
+        assert CompilationEngine is not None
 
     @pytest.mark.skipif(not COMPILATION_ENGINE_AVAILABLE, reason="CompilationEngine not implemented")
     def test_compilation_engine_initialization(self):
         """Test CompilationEngine service initialization."""
         engine = CompilationEngine(
             output_directory="/tmp/compiled_plugins",
-            cache_directory="/tmp/compilation_cache",
-            toolchain_paths={"clang": "/usr/bin/clang", "nvcc": "/usr/local/cuda/bin/nvcc"}
+            toolchain_paths={"cmake": "/usr/bin/cmake", "xcrun": "/usr/bin/xcrun"}
         )
 
         assert engine.output_directory == "/tmp/compiled_plugins"
-        assert engine.cache_directory == "/tmp/compilation_cache"
-        assert engine.toolchain_paths["clang"] == "/usr/bin/clang"
-        assert engine.compilation_history == []
-        assert engine.active_compilations == {}
+        assert engine.toolchain_paths["cmake"] == "/usr/bin/cmake"
+        assert engine.toolchain_paths["xcrun"] == "/usr/bin/xcrun"
 
     @pytest.mark.skipif(not COMPILATION_ENGINE_AVAILABLE, reason="CompilationEngine not implemented")
     def test_toolchain_detection(self):
@@ -59,8 +56,7 @@ class TestCompilationEngine:
             # Mock different toolchain availability per platform
             def mock_which_behavior(cmd):
                 toolchain_map = {
-                    "clang": "/usr/bin/clang",
-                    "clang++": "/usr/bin/clang++",
+                    "cmake": "/usr/bin/cmake",
                 }
 
                 if platform.system() == "Darwin":
@@ -77,185 +73,163 @@ class TestCompilationEngine:
             toolchains = engine.detect_available_toolchains()
 
             # Always available
-            assert "cpp" in toolchains
-            assert toolchains["cpp"]["compiler"] == "/usr/bin/clang++"
+            assert "cmake" in toolchains
+            assert toolchains["cmake"] == "/usr/bin/cmake"
 
             # Platform-specific
             if platform.system() == "Darwin":
-                assert "metal" in toolchains
-                assert toolchains["metal"]["compiler"] == "/usr/bin/xcrun"
+                assert "xcrun" in toolchains
+                assert toolchains["xcrun"] == "/usr/bin/xcrun"
 
             # Environment-dependent
             if os.environ.get("CUDA_HOME"):
-                assert "cuda" in toolchains
-                assert toolchains["cuda"]["compiler"] == "/usr/local/cuda/bin/nvcc"
+                assert "nvcc" in toolchains
+                assert toolchains["nvcc"] == "/usr/local/cuda/bin/nvcc"
 
     @pytest.mark.skipif(not COMPILATION_ENGINE_AVAILABLE, reason="CompilationEngine not implemented")
     @pytest.mark.skipif(platform.system() != "Darwin", reason="Metal compilation only available on macOS")
-    def test_metal_compilation_macos(self):
-        """Test Metal plugin compilation on macOS with proper two-step pipeline."""
+    def test_metal_compilation_cmake_delegation(self):
+        """Test Metal plugin compilation delegates to CMake."""
         engine = CompilationEngine("/tmp/compiled_plugins")
 
         plugin_spec = {
-            "name": "metal_attention_plugin",
-            "source_file": "/path/to/metal_attention.cpp",
-            "backend_type": "metal",
-            "compilation_flags": ["-std=c++17", "-O3"],
-            "frameworks": ["Metal", "Foundation"],
-            "include_paths": ["/usr/local/include"],
-            "library_paths": ["/usr/local/lib"]
+            "name": "metal_kernels",
+            "backend_dir": "/home/sslee/Workspace/pie/backend/backend-metal",
+            "backend_type": "metal"
         }
 
         with patch('subprocess.run') as mock_subprocess, \
              patch('shutil.which') as mock_which, \
              patch('os.path.exists') as mock_exists:
 
-            # Mock xcrun availability
-            mock_which.side_effect = lambda cmd: "/usr/bin/xcrun" if cmd == "xcrun" else None
+            # Mock cmake and xcrun availability
+            mock_which.side_effect = lambda cmd: {
+                "cmake": "/usr/bin/cmake",
+                "xcrun": "/usr/bin/xcrun"
+            }.get(cmd)
             mock_exists.return_value = True
 
-            # Mock two-step Metal compilation process
+            # Mock CMake configure and build steps
             mock_subprocess.side_effect = [
-                # Step 1: xcrun metal -c source.cpp -> source.air
-                MagicMock(returncode=0, stdout=b"Metal frontend compilation successful"),
-                # Step 2: xcrun metallib source.air -> library.metallib
-                MagicMock(returncode=0, stdout=b"Metal library creation successful")
+                # Step 1: cmake configure
+                MagicMock(returncode=0, stdout=b"CMake configuration successful"),
+                # Step 2: cmake build
+                MagicMock(returncode=0, stdout=b"CMake build successful")
             ]
 
             result = engine.compile_plugin(plugin_spec)
 
             assert result["status"] == "success"
-            assert result["output_path"].endswith(".metallib")
-            assert "metal_attention_plugin" in result["output_path"]
+            assert result["output_path"].endswith("pie_metal_kernels.metallib")
 
-            # Verify two-step Metal compilation pipeline
+            # Verify CMake delegation (2 calls: configure + build)
             assert mock_subprocess.call_count == 2
 
-            # First call: xcrun metal compilation to .air
+            # First call: cmake configure
             first_call_cmd = mock_subprocess.call_args_list[0][0][0]
-            assert "xcrun" in first_call_cmd[0]
-            assert "metal" in first_call_cmd
-            assert "-c" in first_call_cmd  # Compile only, don't link
-            assert any(arg.endswith(".air") for arg in first_call_cmd)  # Output .air file
+            assert "cmake" in first_call_cmd[0]
+            assert "-B" in first_call_cmd  # Build directory
+            assert "-S" in first_call_cmd  # Source directory
 
-            # Second call: xcrun metallib to create .metallib
+            # Second call: cmake build
             second_call_cmd = mock_subprocess.call_args_list[1][0][0]
-            assert "xcrun" in second_call_cmd[0]
-            assert "metallib" in second_call_cmd
-            assert any(arg.endswith(".metallib") for arg in second_call_cmd)  # Output .metallib
-
-            # Verify Metal-specific frameworks
-            combined_cmd = " ".join(first_call_cmd + second_call_cmd)
-            assert "-framework" in combined_cmd
-            assert "Metal" in combined_cmd
+            assert "cmake" in second_call_cmd[0]
+            assert "--build" in second_call_cmd
 
     @pytest.mark.skipif(not COMPILATION_ENGINE_AVAILABLE, reason="CompilationEngine not implemented")
-    def test_cuda_compilation_with_nvcc_gating(self):
-        """Test CUDA plugin compilation with proper nvcc gating."""
+    def test_cuda_compilation_cmake_delegation(self):
+        """Test CUDA plugin compilation delegates to CMake."""
         engine = CompilationEngine("/tmp/compiled_plugins")
 
         plugin_spec = {
-            "name": "cuda_softmax_plugin",
-            "source_file": "/path/to/cuda_softmax.cu",
-            "backend_type": "cuda",
-            "compilation_flags": ["-O3", "-arch=sm_75", "--shared"],
-            "include_paths": ["/usr/local/cuda/include"],
-            "library_paths": ["/usr/local/cuda/lib64"],
-            "libraries": ["cuda", "cudart"],
-            "host_compiler_flags": ["-Wall", "-Wextra"],  # Host compiler specific flags
-            "host_compiler_path": "/usr/bin/gcc-9"  # Specific host compiler selection
+            "name": "cuda_kernels",
+            "backend_dir": "/home/sslee/Workspace/pie/backend/backend-cuda",
+            "backend_type": "cuda"
         }
 
         with patch('subprocess.run') as mock_subprocess, \
              patch('shutil.which') as mock_which, \
              patch('os.path.exists') as mock_exists:
 
-            # Test with nvcc available
-            mock_which.side_effect = lambda cmd: "/usr/local/cuda/bin/nvcc" if cmd == "nvcc" else None
+            # Test with cmake and nvcc available
+            mock_which.side_effect = lambda cmd: {
+                "cmake": "/usr/bin/cmake",
+                "nvcc": "/usr/local/cuda/bin/nvcc"
+            }.get(cmd)
             mock_exists.return_value = True
-            mock_subprocess.return_value = MagicMock(
-                returncode=0,
-                stdout=b"CUDA compilation successful",
-                stderr=b""
-            )
+
+            # Mock CMake configure and build steps
+            mock_subprocess.side_effect = [
+                # Step 1: cmake configure
+                MagicMock(returncode=0, stdout=b"CMake configuration successful"),
+                # Step 2: cmake build
+                MagicMock(returncode=0, stdout=b"CMake build successful")
+            ]
 
             result = engine.compile_plugin(plugin_spec)
 
             assert result["status"] == "success"
-            assert result["output_path"].endswith(".so")
+            assert result["output_path"].endswith("pie_cuda_be")
 
-            # Verify CUDA-specific compilation command construction
-            compile_cmd = mock_subprocess.call_args[0][0]
-            assert "nvcc" in compile_cmd[0]
-            assert "-arch=sm_75" in compile_cmd
-            assert "--shared" in compile_cmd
+            # Verify CMake delegation (2 calls: configure + build)
+            assert mock_subprocess.call_count == 2
 
-            # Verify host compiler flags are passed through --compiler-options
-            cmd_str = " ".join(compile_cmd)
-            assert "--compiler-options" in cmd_str or "-Xcompiler" in cmd_str
-            if "--compiler-options" in cmd_str:
-                # Flags should be grouped after --compiler-options
-                assert "-Wall,-Wextra" in cmd_str or "\"-Wall -Wextra\"" in cmd_str
+            # First call: cmake configure
+            first_call_cmd = mock_subprocess.call_args_list[0][0][0]
+            assert "cmake" in first_call_cmd[0]
+            assert "-B" in first_call_cmd
+            assert "-S" in first_call_cmd
 
-            # Verify host compiler selection via -ccbin or --compiler-bindir
-            assert any(flag in cmd_str for flag in ["-ccbin", "--compiler-bindir"])
-            if "-ccbin" in cmd_str:
-                assert "/usr/bin/gcc-9" in cmd_str
-            elif "--compiler-bindir" in cmd_str:
-                assert "/usr/bin" in cmd_str  # Directory containing gcc-9
+            # Second call: cmake build
+            second_call_cmd = mock_subprocess.call_args_list[1][0][0]
+            assert "cmake" in second_call_cmd[0]
+            assert "--build" in second_call_cmd
 
-        # Test fallback when nvcc unavailable
+        # Test fallback when cmake unavailable
         with patch('shutil.which') as mock_which:
-            mock_which.side_effect = lambda cmd: None  # nvcc not found
+            mock_which.side_effect = lambda cmd: None  # cmake not found
 
-            result = engine.compile_plugin(plugin_spec)
+            engine_no_cmake = CompilationEngine("/tmp/compiled_plugins")
+            result = engine_no_cmake.compile_plugin(plugin_spec)
 
             assert result["status"] == "error"
-            assert "CUDA compiler not found" in result["error_message"]
+            assert "CMake not found" in result["error_message"]
 
     @pytest.mark.skipif(not COMPILATION_ENGINE_AVAILABLE, reason="CompilationEngine not implemented")
-    def test_cpp_compilation_generic(self):
-        """Test generic C++ plugin compilation with proper toolchain detection."""
+    def test_backend_validation(self):
+        """Test backend directory and CMakeLists.txt validation."""
         engine = CompilationEngine("/tmp/compiled_plugins")
 
+        # Test missing backend directory
         plugin_spec = {
-            "name": "cpp_reference_plugin",
-            "source_file": "/path/to/reference.cpp",
-            "backend_type": "cpp",
-            "compilation_flags": ["-std=c++17", "-O3", "-fPIC", "-shared"],
-            "include_paths": ["/usr/local/include", "/opt/homebrew/include"],
-            "library_paths": ["/usr/local/lib"],
-            "libraries": ["pthread"]
+            "name": "missing_backend",
+            "backend_dir": "/nonexistent/backend",
+            "backend_type": "cpp"
         }
 
-        with patch('subprocess.run') as mock_subprocess, \
-             patch('shutil.which') as mock_which, \
-             patch('os.path.exists') as mock_exists:
+        result = engine.compile_plugin(plugin_spec)
+        assert result["status"] == "error"
+        assert "Backend directory not found" in result["error_message"]
 
-            # Mock compiler availability (prefer clang++ over g++)
-            mock_which.side_effect = lambda cmd: {
-                "clang++": "/usr/bin/clang++",
-                "g++": "/usr/bin/g++"
-            }.get(cmd)
+        # Test missing CMakeLists.txt
+        with patch('os.path.exists') as mock_exists:
+            # Directory exists but no CMakeLists.txt
+            def exists_mock(path):
+                if path.endswith('CMakeLists.txt'):
+                    return False
+                return True
 
-            mock_exists.return_value = True
-            mock_subprocess.return_value = MagicMock(
-                returncode=0,
-                stdout=b"C++ compilation successful"
-            )
+            mock_exists.side_effect = exists_mock
 
-            result = engine.compile_plugin(plugin_spec)
+            plugin_spec_no_cmake = {
+                "name": "no_cmake_backend",
+                "backend_dir": "/some/backend",
+                "backend_type": "cpp"
+            }
 
-            assert result["status"] == "success"
-            output_ext = ".dylib" if platform.system() == "Darwin" else ".so"
-            assert result["output_path"].endswith(output_ext)
-
-            # Verify C++ compilation command
-            compile_cmd = mock_subprocess.call_args[0][0]
-            assert any(compiler in compile_cmd[0] for compiler in ["clang++", "g++"])
-            assert "-std=c++17" in compile_cmd
-            assert "-fPIC" in compile_cmd
-            assert "-shared" in compile_cmd
+            result = engine.compile_plugin(plugin_spec_no_cmake)
+            assert result["status"] == "error"
+            assert "CMakeLists.txt not found" in result["error_message"]
 
     @pytest.mark.skipif(not COMPILATION_ENGINE_AVAILABLE, reason="CompilationEngine not implemented")
     def test_compilation_error_handling(self):
@@ -264,37 +238,45 @@ class TestCompilationEngine:
 
         plugin_spec = {
             "name": "broken_plugin",
-            "source_file": "/path/to/broken.cpp",
-            "backend_type": "cpp",
-            "compilation_flags": ["-std=c++17"]
+            "backend_dir": "/home/sslee/Workspace/pie/backend/backend-metal",
+            "backend_type": "metal"
         }
 
-        # Test compilation failure
+        # Test CMake build failure
         with patch('subprocess.run') as mock_subprocess, \
-             patch('os.path.exists') as mock_exists:
+             patch('os.path.exists') as mock_exists, \
+             patch('shutil.which') as mock_which:
 
             mock_exists.return_value = True
-            mock_subprocess.return_value = MagicMock(
-                returncode=1,
-                stdout=b"",
-                stderr=b"error: 'undeclared_function' was not declared in this scope"
-            )
+            mock_which.side_effect = lambda cmd: {"cmake": "/usr/bin/cmake"}.get(cmd)
+
+            # Mock configure success, build failure
+            mock_subprocess.side_effect = [
+                MagicMock(returncode=0, stdout=b"Configure success"),
+                MagicMock(
+                    returncode=1,
+                    stdout=b"",
+                    stderr=b"error: 'undeclared_function' was not declared in this scope"
+                )
+            ]
 
             result = engine.compile_plugin(plugin_spec)
 
             assert result["status"] == "error"
             assert "undeclared_function" in result["error_message"]
             assert result["output_path"] is None
-            assert "stderr" in result
 
-        # Test missing source file
-        with patch('os.path.exists') as mock_exists:
-            mock_exists.return_value = False
+        # Test missing backend directory
+        plugin_spec_missing = {
+            "name": "missing_plugin",
+            "backend_dir": "/nonexistent/backend",
+            "backend_type": "metal"
+        }
 
-            result = engine.compile_plugin(plugin_spec)
+        result = engine.compile_plugin(plugin_spec_missing)
 
-            assert result["status"] == "error"
-            assert "Source file not found" in result["error_message"]
+        assert result["status"] == "error"
+        assert "Backend directory not found" in result["error_message"]
 
     @pytest.mark.skipif(not COMPILATION_ENGINE_AVAILABLE, reason="CompilationEngine not implemented")
     def test_content_based_compilation_caching(self):

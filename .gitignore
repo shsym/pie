@@ -216,8 +216,8 @@ logs
 .memory-bank
 
 # raw eval data
-cuda-protocol-tests
-metal-protocol-tests
+cuda-protocol-tests*
+metal-protocol-tests*
 cuda_artifacts.tar*
 
 # Github Spec-kit

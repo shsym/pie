@@ -277,6 +277,8 @@ class TestValidationEngine:
                 "pre_processing", "post_embedding", "post_attention", "post_mlp", "post_processing"
             ]
             mock_session.get_execution_order_indices = lambda: execution_order_map
+            mock_session.get_enabled_checkpoints.return_value = ["post_attention", "post_embedding", "post_mlp"]
+            mock_session.config = {"enabled_checkpoints": ["post_attention", "post_embedding", "post_mlp"]}
             mock_session_class.return_value = mock_session
 
             session_id = engine.create_session(
@@ -334,12 +336,21 @@ class TestValidationEngine:
         with patch('debug_framework.models.debug_session.DebugSession') as mock_session_class:
             mock_session = MagicMock()
             mock_session.id = "progress_test"
-            mock_session.get_enabled_checkpoints.return_value = ["cp1", "cp2", "cp3", "cp4"]
+            mock_session.get_enabled_checkpoints.return_value = ["post_embedding", "post_attention", "post_mlp", "post_processing"]
+            mock_session.config = {"enabled_checkpoints": ["post_embedding", "post_attention", "post_mlp", "post_processing"]}
+
+            # Set up _progress_tracking to use real values, not MagicMock
+            mock_session._progress_tracking = {
+                "completed_checkpoints": 0,
+                "current_checkpoint": None,
+                "total_checkpoints": 4
+            }
+
             mock_session_class.return_value = mock_session
 
             session_id = engine.create_session(
                 model_path="/path/to/model.zt",
-                config={"enabled_checkpoints": ["cp1", "cp2", "cp3", "cp4"]},
+                config={"enabled_checkpoints": ["post_embedding", "post_attention", "post_mlp", "post_processing"]},
                 reference_backend="pytorch",
                 alternative_backend="metal"
             )
@@ -348,16 +359,16 @@ class TestValidationEngine:
             start_progress = engine.get_validation_progress(session_id)
             initial_percentage = start_progress.get("progress_percentage", 0.0)
 
-            engine.update_progress(session_id, "cp1", "completed")
+            engine.update_progress(session_id, "post_embedding", "completed")
             intermediate_progress = engine.get_validation_progress(session_id)
 
-            engine.update_progress(session_id, "cp2", "in_progress")
+            engine.update_progress(session_id, "post_attention", "in_progress")
             final_progress = engine.get_validation_progress(session_id)
 
             # Verify non-decreasing progress percentages
             assert final_progress["total_checkpoints"] == 4
             assert final_progress["completed_checkpoints"] == 1
-            assert final_progress["current_checkpoint"] == "cp2"
+            assert final_progress["current_checkpoint"] == "post_attention"
             assert final_progress["progress_percentage"] == pytest.approx(25.0, abs=0.001)
             assert final_progress["progress_percentage"] >= intermediate_progress.get("progress_percentage", 0.0)
             assert intermediate_progress.get("progress_percentage", 0.0) >= initial_percentage

@@ -24,10 +24,10 @@ except ImportError:
 class TestValidationReport:
     """Test suite for ValidationReport model functionality."""
 
-    def test_validation_report_import_fails(self):
-        """Test that ValidationReport import fails (TDD requirement)."""
-        with pytest.raises(ImportError):
-            from debug_framework.models.validation_report import ValidationReport
+    def test_validation_report_import_succeeds(self):
+        """Test that ValidationReport import succeeds (implementation complete)."""
+        from debug_framework.models.validation_report import ValidationReport
+        assert ValidationReport is not None
 
     @pytest.mark.skipif(not VALIDATIONREPORT_AVAILABLE, reason="ValidationReport not implemented")
     def test_validation_report_creation(self):
@@ -47,7 +47,7 @@ class TestValidationReport:
         report = ValidationReport(
             session_id=1,
             report_type="summary",
-            overall_status="pass",
+            overall_status="partial",
             total_checkpoints=5,
             passed_checkpoints=3,
             failed_checkpoints=1,
@@ -60,7 +60,7 @@ class TestValidationReport:
 
         assert report.session_id == 1
         assert report.report_type == "summary"
-        assert report.overall_status == "pass"
+        assert report.overall_status == "partial"
         assert report.total_checkpoints == 5
         assert report.passed_checkpoints == 3
         assert report.failed_checkpoints == 1
@@ -74,7 +74,7 @@ class TestValidationReport:
     def test_report_type_validation(self):
         """Test report type validation."""
         valid_types = ["summary", "detailed"]  # Removed "html" - that's an export format
-        performance_summary = {"reference_backend": {"total_time_ms": 100}}
+        performance_summary = {"reference_backend": {"total_time_ms": 100}, "alternative_backend": {"total_time_ms": 90}}
 
         # Test valid report types
         for report_type in valid_types:
@@ -109,21 +109,46 @@ class TestValidationReport:
     def test_overall_status_validation(self):
         """Test overall status validation."""
         valid_statuses = ["pass", "fail", "partial", "error"]
-        performance_summary = {"reference_backend": {"total_time_ms": 100}}
+        performance_summary = {"reference_backend": {"total_time_ms": 100}, "alternative_backend": {"total_time_ms": 90}}
 
         # Test valid statuses
         for status in valid_statuses:
-            report = ValidationReport(
-                session_id=1,
-                report_type="summary",
-                overall_status=status,
-                total_checkpoints=1,
-                passed_checkpoints=1 if status == "pass" else 0,
-                failed_checkpoints=0 if status == "pass" else 1,
-                error_checkpoints=0,
-                performance_summary=performance_summary,
-                report_content="Test report"
-            )
+            if status == "pass":
+                report = ValidationReport(
+                    session_id=1,
+                    report_type="summary",
+                    overall_status=status,
+                    total_checkpoints=1,
+                    passed_checkpoints=1,
+                    failed_checkpoints=0,
+                    error_checkpoints=0,
+                    performance_summary=performance_summary,
+                    report_content="Test report"
+                )
+            elif status == "error":
+                report = ValidationReport(
+                    session_id=1,
+                    report_type="summary",
+                    overall_status=status,
+                    total_checkpoints=1,
+                    passed_checkpoints=0,
+                    failed_checkpoints=0,
+                    error_checkpoints=1,
+                    performance_summary=performance_summary,
+                    report_content="Test report"
+                )
+            else:  # "fail" or "partial"
+                report = ValidationReport(
+                    session_id=1,
+                    report_type="summary",
+                    overall_status=status,
+                    total_checkpoints=1,
+                    passed_checkpoints=0,
+                    failed_checkpoints=1,
+                    error_checkpoints=0,
+                    performance_summary=performance_summary,
+                    report_content="Test report"
+                )
             assert report.overall_status == status
 
         # Test invalid status
@@ -143,7 +168,7 @@ class TestValidationReport:
     @pytest.mark.skipif(not VALIDATIONREPORT_AVAILABLE, reason="ValidationReport not implemented")
     def test_checkpoint_count_validation(self):
         """Test checkpoint count consistency validation."""
-        performance_summary = {"reference_backend": {"total_time_ms": 100}}
+        performance_summary = {"reference_backend": {"total_time_ms": 100}, "alternative_backend": {"total_time_ms": 90}}
 
         # Valid checkpoint counts
         report = ValidationReport(
@@ -181,7 +206,7 @@ class TestValidationReport:
     @pytest.mark.skipif(not VALIDATIONREPORT_AVAILABLE, reason="ValidationReport not implemented")
     def test_overall_status_consistency(self):
         """Test overall status reflects checkpoint outcomes accurately."""
-        performance_summary = {"reference_backend": {"total_time_ms": 100}}
+        performance_summary = {"reference_backend": {"total_time_ms": 100}, "alternative_backend": {"total_time_ms": 90}}
 
         # Test "pass" status requires all non-skipped checkpoints passed
         report_pass = ValidationReport(
@@ -586,7 +611,7 @@ class TestValidationReport:
         # Test CSV export (summary data)
         with patch('builtins.open', mock_open()) as mock_file:
             report.export_csv("/path/to/report.csv")
-            mock_file.assert_called_with("/path/to/report.csv", 'w')
+            mock_file.assert_called_with("/path/to/report.csv", 'w', newline='')
 
         # Test text export
         with patch('builtins.open', mock_open()) as mock_file:

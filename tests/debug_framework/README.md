@@ -35,3 +35,11 @@ uv run pytest ../../tests/debug_framework/test_plugin_registry.py::TestPluginReg
 
 - `tests/debug_framework/` - Unit tests for individual components
 - `tests/debug_framework/integration/` - Integration tests for component workflows
+
+### Database
+
+The debug framework uses a SQLite database that is **automatically created** when first used at:
+```
+backend/backend-python/debug_framework/data/debug_framework.db
+```
+No manual setup required - the database and schema are initialized automatically.
