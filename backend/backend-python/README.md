@@ -1,48 +1,17 @@
-# PIE Backend Python
 
-Cross-platform Python backend with debugging framework support.
+# PIE Torch Backend
 
-## Environment Setup
-
-### Prerequisites
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) package manager
-
-### Quick Start
-
-```bash
-# macOS - Metal backend debugging
-uv sync --extra debug --extra macos
-
-# Linux - CUDA backend support
-uv sync --extra debug --extra cuda
-
-# All available dependencies (platform-filtered)
-uv sync --all-extras
+```
+uv venv
+uv pip install flashinfer-python==0.3.1
+uv pip install torch torchvision pytorch_triton --index-url https://download.pytorch.org/whl/cu126 --force-reinstall
 ```
 
-### Dependency Groups
 
-- **Core**: Cross-platform dependencies (torch, numpy, ztensor)
-- **debug**: TDD framework (pytest, pybind11, mypy, black)
-- **cuda**: Linux-only CUDA support (flashinfer-python)
-- **macos**: macOS-only Metal framework bindings (PyObjC)
-
-### Development
-
-```bash
-# Run tests
-uv run pytest
-
-# Type checking
-uv run mypy .
-
-# Code formatting
-uv run black .
+In DeltaAI:
+```aiignore
+module load cuda/12.6.1
+module load git-lfs
+module load gcc/11.4.0
+module load cudnn/9.3.0.75
 ```
-
-### Multi-Language Plugin Support
-
-- **C libraries**: ctypes (built-in)
-- **C++**: pybind11
-- **Objective-C/Metal**: PyObjC (macOS only)

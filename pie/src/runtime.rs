@@ -589,8 +589,7 @@ impl Runtime {
 
             // Attempt to call “run”
             let (_, run_export) = instance
-                .get_export(&mut store, None, "pie:nbi/run")
-                .or_else(|| instance.get_export(&mut store, None, "pie:inferlet/run"))
+                .get_export(&mut store, None, "pie:inferlet/run")
                 .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
 
             let (_, run_func_export) = instance
@@ -603,8 +602,9 @@ impl Runtime {
 
             return match run_func.call_async(&mut store, ()).await {
                 Ok((Ok(()),)) => {
+                    let return_value = store.data().return_value();
                     //println!("Instance {instance_id} finished normally");
-                    Ok(())
+                    Ok(return_value)
                 }
                 Ok((Err(runtime_err),)) => {
                     //eprintln!("Instance {instance_id} returned an error");
@@ -618,23 +618,26 @@ impl Runtime {
         }
         .await;
 
-        if let Err(err) = result {
-            println!("Instance {instance_id} failed: {err}");
-            server::Command::DetachInstance {
-                inst_id: instance_id.clone(),
-                termination_code: 2,
-                message: err.to_string(),
+        match result {
+            Ok(return_value) => {
+                server::Command::DetachInstance {
+                    inst_id: instance_id.clone(),
+                    termination_code: 0,
+                    message: return_value.unwrap_or("".to_string()),
+                }
+                .dispatch()
+                .ok();
             }
-            .dispatch()
-            .ok();
-        } else {
-            server::Command::DetachInstance {
-                inst_id: instance_id.clone(),
-                termination_code: 0,
-                message: "instance normally finished".to_string(),
+            Err(err) => {
+                println!("Instance {instance_id} failed: {err}");
+                server::Command::DetachInstance {
+                    inst_id: instance_id.clone(),
+                    termination_code: 2,
+                    message: err.to_string(),
+                }
+                .dispatch()
+                .ok();
             }
-            .dispatch()
-            .ok();
         }
 
         // force cleanup of the remaining resources

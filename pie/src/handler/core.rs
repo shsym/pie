@@ -3,7 +3,7 @@ use crate::instance::InstanceState;
 use crate::messaging::{PubSubCommand, PushPullCommand, dispatch_i2i, dispatch_u2i};
 use crate::model::ModelInfo;
 use crate::resource::{ResourceId, ResourceTypeId};
-use crate::{bindings, kvs, model, server};
+use crate::{bindings, kvs, model, resource, server};
 use bytes::Bytes;
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -19,6 +19,11 @@ static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(0);
 pub struct Model {
     pub service_id: usize,
     pub info: ModelInfo,
+}
+
+#[derive(Debug, Clone)]
+pub struct Blob {
+    pub data: Bytes,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +50,13 @@ pub struct ReceiveResult {
     receiver: oneshot::Receiver<String>,
     result: Option<String>,
     done: bool,
+}
+
+#[derive(Debug)]
+pub struct BlobResult {
+    pub(crate) receiver: oneshot::Receiver<Bytes>,
+    pub(crate) result: Option<Bytes>,
+    pub(crate) done: bool,
 }
 
 #[derive(Debug)]
@@ -77,6 +89,19 @@ impl Pollable for ReceiveResult {
         }
         let res = (&mut self.receiver).await.unwrap();
         self.result = Some(res);
+        self.done = true;
+    }
+}
+
+#[async_trait]
+impl Pollable for BlobResult {
+    async fn ready(&mut self) {
+        if self.done {
+            return;
+        }
+        let res = (&mut self.receiver).await.unwrap();
+        self.result = Some(res);
+
         self.done = true;
     }
 }
@@ -122,6 +147,11 @@ impl bindings::pie::inferlet::core::Host for InstanceState {
         Ok(self.arguments().to_vec())
     }
 
+    async fn set_return(&mut self, value: String) -> anyhow::Result<()> {
+        self.return_value = Some(value);
+        Ok(())
+    }
+
     async fn get_model(&mut self, name: String) -> anyhow::Result<Option<Resource<Model>>> {
         if let Some(service_id) = model::model_service_id(&name) {
             let (tx, rx) = oneshot::channel();
@@ -162,6 +192,31 @@ impl bindings::pie::inferlet::core::Host for InstanceState {
             message: tx,
         });
         let res = ReceiveResult {
+            receiver: rx,
+            result: None,
+            done: false,
+        };
+        Ok(self.ctx().table.push(res)?)
+    }
+
+    async fn send_blob(&mut self, blob: Resource<Blob>) -> anyhow::Result<()> {
+        let data = mem::take(&mut self.ctx().table.get_mut(&blob)?.data);
+
+        server::Command::SendBlob {
+            inst_id: self.id(),
+            data,
+        }
+        .dispatch()?;
+        Ok(())
+    }
+
+    async fn receive_blob(&mut self) -> anyhow::Result<Resource<BlobResult>> {
+        let (tx, rx) = oneshot::channel();
+        dispatch_u2i(PushPullCommand::PullBlob {
+            topic: self.id().to_string(),
+            message: tx,
+        });
+        let res = BlobResult {
             receiver: rx,
             result: None,
             done: false,
@@ -306,11 +361,24 @@ impl bindings::pie::inferlet::core::Host for InstanceState {
         &mut self,
         queue: Resource<Queue>,
         resource_type: ResourceTypeId,
-        ptrs: Vec<ResourceId>,
+        mut ptrs: Vec<ResourceId>,
         name: String,
     ) -> anyhow::Result<()> {
         let inst_id = self.id();
         let svc_id = self.ctx().table.get(&queue)?.service_id;
+
+        ptrs.iter_mut().try_for_each(|ptr| {
+            *ptr = self
+                .translate_resource_ptr(svc_id, resource_type, *ptr)
+                .ok_or_else(|| {
+                    anyhow::format_err!(
+                        "Failed to translate exported reousrces with ptr: {:?}",
+                        ptr
+                    )
+                })?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+
         model::Command::Export {
             inst_id,
             type_id: resource_type,
@@ -544,6 +612,66 @@ impl bindings::pie::inferlet::core::HostReceiveResult for InstanceState {
     }
 
     async fn drop(&mut self, this: Resource<ReceiveResult>) -> anyhow::Result<()> {
+        self.ctx().table.delete(this)?;
+        Ok(())
+    }
+}
+
+impl bindings::pie::inferlet::core::HostBlob for InstanceState {
+    async fn new(
+        &mut self,
+        data: Vec<u8>,
+    ) -> anyhow::Result<Resource<Blob>> {
+        let blob = Blob { data:Bytes::from(data) };
+        let res = self.ctx().table.push(blob)?;
+        Ok(res)
+    }
+
+    async fn read(
+        &mut self,
+        this: Resource<Blob>,
+        offset: u64,
+        size: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let blob = self.ctx().table.get(&this)?;
+        let data = blob
+            .data
+            .get(offset as usize..(offset + size) as usize)
+            .unwrap();
+        Ok(data.to_vec())
+    }
+
+    async fn size(&mut self, this: Resource<Blob>) -> anyhow::Result<u64> {
+        let blob = self.ctx().table.get(&this)?;
+        Ok(blob.data.len() as u64)
+    }
+
+    async fn drop(&mut self, this: Resource<Blob>) -> anyhow::Result<()> {
+        self.ctx().table.delete(this)?;
+        Ok(())
+    }
+}
+
+impl bindings::pie::inferlet::core::HostBlobResult for InstanceState {
+    async fn pollable(
+        &mut self,
+        this: Resource<BlobResult>,
+    ) -> anyhow::Result<Resource<DynPollable>> {
+        subscribe(self.ctx().table, this)
+    }
+
+    async fn get(&mut self, this: Resource<BlobResult>) -> anyhow::Result<Option<Resource<Blob>>> {
+        let has_result = self.ctx().table.get(&this)?.result.is_some();
+        if has_result {
+            let data = mem::take(&mut self.ctx().table.get_mut(&this)?.result).unwrap();
+            let blob = Blob { data };
+            Ok(Some(self.ctx().table.push(blob)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn drop(&mut self, this: Resource<BlobResult>) -> anyhow::Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
     }
