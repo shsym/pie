@@ -39,7 +39,7 @@ set(METAL_AIR_FILES "")
 foreach(METAL_SOURCE ${METAL_SOURCES})
     get_filename_component(KERNEL_NAME ${METAL_SOURCE} NAME_WE)
     set(AIR_FILE "${CMAKE_BINARY_DIR}/${KERNEL_NAME}.air")
-    
+
     # Compile .metal to .air
     add_custom_command(
         OUTPUT ${AIR_FILE}
@@ -47,7 +47,7 @@ foreach(METAL_SOURCE ${METAL_SOURCES})
         DEPENDS ${METAL_SOURCE}
         COMMENT "Compiling Metal kernel: ${KERNEL_NAME}"
     )
-    
+
     list(APPEND METAL_AIR_FILES ${AIR_FILE})
 endforeach()
 
@@ -64,8 +64,8 @@ add_custom_command(
 add_custom_target(pie_metal_kernels ALL DEPENDS ${METALLIB_OUTPUT})
 
 # Python bindings module
-pybind11_add_module(metal_bindings 
-    src/bindings.cpp
+pybind11_add_module(metal_bindings
+    src/bindings.mm
 )
 
 # Link Metal framework

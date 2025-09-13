@@ -1,8 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Note: metal_attention_common.metal is loaded first by the Metal library loader
-// All constants and utilities from common.metal are available here
+// Include common constants and utilities
+#include "metal_attention_common.metal"
 
 // --- Simdgroup Optimizations ---
 // 1. Simdgroup reductions for block max/sum (reduces barriers from O(log2(128)) to ~1)

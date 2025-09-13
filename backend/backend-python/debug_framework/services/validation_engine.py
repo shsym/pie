@@ -48,7 +48,7 @@ class ValidationEngine:
         # Initialize database manager
         if database_manager is not None:
             self.database_manager = database_manager
-            self.database_path = database_manager.database_path
+            self.database_path = str(database_manager.db_path)
         else:
             self.database_path = database_path or "/tmp/debug.db"
             self.database_manager = DatabaseManager(self.database_path)

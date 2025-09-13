@@ -22,7 +22,14 @@ try:
     from config.l4ma import L4maArch
     L4MA_MODEL_AVAILABLE = True
 except ImportError:
+    # Create placeholder classes for when L4MA is not available
     L4MA_MODEL_AVAILABLE = False
+    L4maModel = None
+    L4maForCausalLM = None
+    L4maAttention = None
+    L4maMlp = None
+    L4maDecoderLayer = None
+    L4maArch = None
 
 from .backend_interfaces import BackendInterface, BackendType, TensorComputationResult
 
@@ -37,14 +44,14 @@ class L4MAPythonBackend(BackendInterface):
 
     def __init__(
         self,
-        l4ma_model_reference: Optional[Union[L4maModel, L4maForCausalLM]] = None,
+        l4ma_model_reference: Optional[Union['L4maModel', 'L4maForCausalLM']] = None,
         device: str = 'cpu'
     ):
         super().__init__(BackendType.L4MA_PYTHON)
         self.l4ma_model_ref = l4ma_model_reference
         self.device = device
-        self._component_cache: Dict[str, nn.Module] = {}
-        self._default_config: Optional[L4maArch] = None
+        self._component_cache: Dict[str, Any] = {}
+        self._default_config: Optional[Any] = None
 
     def initialize(self) -> bool:
         """Initialize L4MA Python backend."""
@@ -62,9 +69,10 @@ class L4MAPythonBackend(BackendInterface):
 
             # Validate model reference if provided
             if self.l4ma_model_ref is not None:
-                if not isinstance(self.l4ma_model_ref, (L4maModel, L4maForCausalLM)):
-                    warnings.warn("Invalid L4MA model reference provided")
-                    return False
+                if L4maModel and L4maForCausalLM:
+                    if not isinstance(self.l4ma_model_ref, (L4maModel, L4maForCausalLM)):
+                        warnings.warn("Invalid L4MA model reference provided")
+                        return False
 
                 # Extract configuration from model
                 if hasattr(self.l4ma_model_ref, 'config'):
@@ -73,7 +81,7 @@ class L4MAPythonBackend(BackendInterface):
                     self._default_config = self.l4ma_model_ref.model.config
 
             # Create a default configuration if none available
-            if self._default_config is None:
+            if self._default_config is None and L4maArch:
                 self._default_config = L4maArch(
                     # CommonArch fields
                     type="l4ma",
@@ -94,6 +102,24 @@ class L4MAPythonBackend(BackendInterface):
                     rope_low_frequency_factor=1.0,
                     rope_theta=10000.0
                 )
+            elif self._default_config is None:
+                # Create a simple mock config when L4MA is not available
+                self._default_config = type('MockConfig', (), {
+                    'type': "l4ma",
+                    'num_layers': 32,
+                    'num_query_heads': 32,
+                    'num_key_value_heads': 32,
+                    'head_size': 128,
+                    'hidden_size': 4096,
+                    'intermediate_size': 16384,
+                    'vocab_size': 32768,
+                    'use_qkv_bias': False,
+                    'rms_norm_eps': 1e-6,
+                    'rope_factor': 1.0,
+                    'rope_high_frequency_factor': 4.0,
+                    'rope_low_frequency_factor': 1.0,
+                    'rope_theta': 10000.0,
+                })()
 
             self.initialization_time = time.perf_counter() - start_time
             self.is_available = True
@@ -117,11 +143,11 @@ class L4MAPythonBackend(BackendInterface):
 
         if cache_key not in self._component_cache:
             try:
-                if component_type == "attention":
+                if component_type == "attention" and L4maAttention:
                     config = self._create_config(config_override)
                     component = L4maAttention(config, layer_idx=0)
 
-                elif component_type == "mlp":
+                elif component_type == "mlp" and L4maMlp:
                     config = self._create_config(config_override)
                     component = L4maMlp(config)
 
@@ -159,33 +185,37 @@ class L4MAPythonBackend(BackendInterface):
 
         return self._component_cache[cache_key]
 
-    def _create_config(self, config_override: Optional[Dict[str, Any]] = None) -> L4maArch:
+    def _create_config(self, config_override: Optional[Dict[str, Any]] = None) -> Any:
         """Create L4MA config with optional overrides."""
         config_dict = {
             # CommonArch fields
-            'type': self._default_config.type,
-            'num_layers': self._default_config.num_layers,
-            'num_query_heads': self._default_config.num_query_heads,
-            'num_key_value_heads': self._default_config.num_key_value_heads,
-            'head_size': self._default_config.head_size,
-            'hidden_size': self._default_config.hidden_size,
-            'intermediate_size': self._default_config.intermediate_size,
-            'vocab_size': self._default_config.vocab_size,
-            'use_qkv_bias': self._default_config.use_qkv_bias,
-            'rms_norm_eps': self._default_config.rms_norm_eps,
+            'type': getattr(self._default_config, 'type', 'l4ma'),
+            'num_layers': getattr(self._default_config, 'num_layers', 32),
+            'num_query_heads': getattr(self._default_config, 'num_query_heads', 32),
+            'num_key_value_heads': getattr(self._default_config, 'num_key_value_heads', 32),
+            'head_size': getattr(self._default_config, 'head_size', 128),
+            'hidden_size': getattr(self._default_config, 'hidden_size', 4096),
+            'intermediate_size': getattr(self._default_config, 'intermediate_size', 16384),
+            'vocab_size': getattr(self._default_config, 'vocab_size', 32768),
+            'use_qkv_bias': getattr(self._default_config, 'use_qkv_bias', False),
+            'rms_norm_eps': getattr(self._default_config, 'rms_norm_eps', 1e-6),
             'device': self.device,
             'dtype': torch.float32,
             # L4maArch specific fields
-            'rope_factor': self._default_config.rope_factor,
-            'rope_high_frequency_factor': self._default_config.rope_high_frequency_factor,
-            'rope_low_frequency_factor': self._default_config.rope_low_frequency_factor,
-            'rope_theta': self._default_config.rope_theta,
+            'rope_factor': getattr(self._default_config, 'rope_factor', 1.0),
+            'rope_high_frequency_factor': getattr(self._default_config, 'rope_high_frequency_factor', 4.0),
+            'rope_low_frequency_factor': getattr(self._default_config, 'rope_low_frequency_factor', 1.0),
+            'rope_theta': getattr(self._default_config, 'rope_theta', 10000.0),
         }
 
         if config_override:
             config_dict.update(config_override)
 
-        return L4maArch(**config_dict)
+        if L4maArch:
+            return L4maArch(**config_dict)
+        else:
+            # Return a mock config object when L4MA is not available
+            return type('MockConfig', (), config_dict)()
 
     def run_attention(
         self,

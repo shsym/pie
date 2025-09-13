@@ -370,6 +370,38 @@ class MockBackend(BackendInterface):
         )
 
 
+def get_recommended_backend() -> BackendType:
+    """
+    Get the recommended backend type based on the current platform and availability.
+
+    Returns:
+        BackendType: The recommended backend for the current system
+    """
+    import sys
+    import platform
+
+    # Check if running on Apple Silicon or Intel Mac
+    if sys.platform == 'darwin':
+        # Check for Apple Silicon
+        if platform.machine() == 'arm64':
+            return BackendType.METAL
+        else:
+            # Intel Mac - Metal is still preferred over CPU
+            return BackendType.METAL
+
+    # For CUDA systems (Linux/Windows with NVIDIA GPU)
+    try:
+        import subprocess
+        result = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
+        if result.returncode == 0:
+            return BackendType.CUDA
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
+
+    # Default fallback to L4MA Python for CPU
+    return BackendType.L4MA_PYTHON
+
+
 def create_backend(backend_type: BackendType, **kwargs) -> BackendInterface:
     """
     Factory function to create backend instances.
@@ -411,3 +443,39 @@ def create_backend(backend_type: BackendType, **kwargs) -> BackendInterface:
         raise RuntimeError(f"Failed to initialize {backend_type.value} backend")
 
     return backend
+
+
+def create_auto_backend(**kwargs) -> BackendInterface:
+    """
+    Create a backend automatically based on the current system.
+
+    Args:
+        **kwargs: Backend-specific initialization parameters
+
+    Returns:
+        Initialized backend instance
+
+    Raises:
+        RuntimeError: If no suitable backend can be initialized
+    """
+    recommended_type = get_recommended_backend()
+
+    # Try the recommended backend first
+    try:
+        return create_backend(recommended_type, **kwargs)
+    except (ValueError, RuntimeError) as e:
+        warnings.warn(f"Failed to initialize recommended backend {recommended_type.value}: {e}")
+
+    # Try fallback backends in order of preference
+    fallback_order = [BackendType.L4MA_PYTHON, BackendType.MOCK]
+
+    for fallback_type in fallback_order:
+        if fallback_type != recommended_type:
+            try:
+                return create_backend(fallback_type, **kwargs)
+            except (ValueError, RuntimeError) as e:
+                warnings.warn(f"Failed to initialize fallback backend {fallback_type.value}: {e}")
+                continue
+
+    # If all else fails, raise an error
+    raise RuntimeError("Could not initialize any backend. Please check your system configuration.")
