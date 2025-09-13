@@ -1,6 +1,12 @@
-use wasmtime::component::HasSelf;
+pub mod core;
+pub mod forward;
+pub mod image;
 
-use crate::handler::{adapter, core, evolve, forward, image, tokenize};
+pub mod adapter;
+pub mod evolve;
+pub mod tokenize;
+
+use wasmtime::component::HasSelf;
 
 wasmtime::component::bindgen!({
     path: "wit",

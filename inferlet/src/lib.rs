@@ -5,7 +5,7 @@ pub use crate::chat::ChatFormatter;
 pub use crate::context::Context;
 pub use crate::sampler::Sampler;
 use crate::stop_condition::StopCondition;
-use crate::traits::Tokenize;
+use crate::interface::Tokenize;
 use crate::wstd::runtime::AsyncPollable;
 pub use anyhow::{Context as AnyhowContext, Error, Result, anyhow, bail, ensure, format_err};
 pub use inferlet_macros::main;
@@ -24,7 +24,7 @@ pub mod drafter;
 mod pool;
 pub mod sampler;
 pub mod stop_condition;
-pub mod traits;
+pub mod interface;
 
 pub mod bindings {
     wit_bindgen::generate!({

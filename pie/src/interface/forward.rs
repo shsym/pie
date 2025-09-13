@@ -1,12 +1,13 @@
-use crate::handler::Handler;
-use crate::handler::core::Queue;
+use crate::interface::pie::inferlet as inferlet;
+use crate::interface::core::Queue;
 use crate::instance::InstanceState;
-use crate::model::{ForwardPassRequest, ForwardPassResponse};
-use crate::resource::ResourceId;
-use crate::{bindings, model, resource};
-use bytes::Bytes;
+use crate::model::request::{ForwardPassRequest, ForwardPassResponse, Request};
+use crate::model::resource::{EMBED_TYPE_ID, KV_PAGE_TYPE_ID, ResourceId};
+use crate::model::submit_request;
+use anyhow::Result;
 use std::collections::HashMap;
 use std::iter;
+use std::mem::take;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -15,8 +16,7 @@ use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 
 #[derive(Debug)]
 pub struct ForwardPass {
-    pub service_id: usize,
-    pub stream_id: u32,
+    pub queue: Queue,
     input_tokens: Vec<u32>,
     input_token_positions: Vec<u32>,
     input_embed_ptrs: Vec<u32>,
@@ -34,7 +34,7 @@ pub struct ForwardPass {
 
 #[derive(Debug)]
 pub struct ForwardPassResult {
-    pub receiver: oneshot::Receiver<Bytes>,
+    pub receiver: oneshot::Receiver<ForwardPassResponse>,
     pub distributions: Vec<(Vec<u32>, Vec<f32>)>,
     pub tokens: Vec<u32>,
     pub done: bool,
@@ -58,24 +58,21 @@ impl Pollable for ForwardPassResult {
 
         let res = (&mut self.receiver).await.unwrap();
 
-        if let Ok(res) = rmp_serde::from_slice::<ForwardPassResponse>(&res) {
-            self.distributions = res.dists;
-            self.tokens = res.tokens;
-        }
+        self.distributions = res.dists;
+        self.tokens = res.tokens;
 
         self.done = true;
     }
 }
 
-impl bindings::pie::inferlet::forward::Host for InstanceState {
+impl inferlet::forward::Host for InstanceState {
     async fn create_forward_pass(
         &mut self,
         queue: Resource<Queue>,
-    ) -> anyhow::Result<Resource<ForwardPass>> {
+    ) -> Result<Resource<ForwardPass>> {
         let queue = self.ctx().table.get(&queue)?.clone();
         let pass = ForwardPass {
-            service_id: queue.service_id,
-            stream_id: queue.stream_id,
+            queue,
             input_tokens: vec![],
             input_token_positions: vec![],
             input_embed_ptrs: vec![],
@@ -98,18 +95,11 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         pass: Resource<ForwardPass>,
         mut emb_ptrs: Vec<ResourceId>,
         positions: Vec<u32>,
-    ) -> anyhow::Result<()> {
-        let svc_id = self.ctx().table.get(&pass)?.service_id;
+    ) -> Result<()> {
+        let svc_id = self.ctx().table.get(&pass)?.queue.service_id;
 
         emb_ptrs.iter_mut().try_for_each(|emb_ptr| {
-            *emb_ptr = self
-                .translate_resource_ptr(svc_id, resource::EMBED_TYPE_ID, *emb_ptr)
-                .ok_or_else(|| {
-                    anyhow::format_err!(
-                        "Failed to translate input embedding with ptr: {:?}",
-                        emb_ptr
-                    )
-                })?;
+            *emb_ptr = self.translate_resource_ptr(svc_id, EMBED_TYPE_ID, *emb_ptr)?;
             Ok::<_, anyhow::Error>(())
         })?;
 
@@ -124,7 +114,7 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         pass: Resource<ForwardPass>,
         input_tokens: Vec<u32>,
         positions: Vec<u32>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let pass = self.ctx().table.get_mut(&pass)?;
         pass.input_tokens.extend(input_tokens);
         pass.input_token_positions.extend(positions);
@@ -136,17 +126,10 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         pass: Resource<ForwardPass>,
         mut emb_ptrs: Vec<ResourceId>,
         indices: Vec<u32>,
-    ) -> anyhow::Result<()> {
-        let svc_id = self.ctx().table.get(&pass)?.service_id;
+    ) -> Result<()> {
+        let svc_id = self.ctx().table.get(&pass)?.queue.service_id;
         emb_ptrs.iter_mut().try_for_each(|emb_ptr| {
-            *emb_ptr = self
-                .translate_resource_ptr(svc_id, resource::EMBED_TYPE_ID, *emb_ptr)
-                .ok_or_else(|| {
-                    anyhow::format_err!(
-                        "Failed to translate output embedding with ptr: {:?}",
-                        emb_ptr
-                    )
-                })?;
+            *emb_ptr = self.translate_resource_ptr(svc_id, EMBED_TYPE_ID, *emb_ptr)?;
             Ok::<_, anyhow::Error>(())
         })?;
 
@@ -162,7 +145,7 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         indices: Vec<u32>,
         temperature: f32,
         top_k: Option<u32>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let mut sampler = HashMap::new();
         sampler.insert(
             "sampler".to_string(),
@@ -183,7 +166,7 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         pass: Resource<ForwardPass>,
         indices: Vec<u32>,
         temperature: f32,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let mut sampler = HashMap::new();
 
         sampler.insert(
@@ -208,7 +191,7 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         indices: Vec<u32>,
         temperature: f32,
         top_p: f32,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let mut sampler = HashMap::new();
 
         sampler.insert(
@@ -232,7 +215,7 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         indices: Vec<u32>,
         temperature: f32,
         top_k: u32,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let mut sampler = HashMap::new();
 
         sampler.insert(
@@ -256,7 +239,7 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         indices: Vec<u32>,
         temperature: f32,
         min_p: f32,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let mut sampler = HashMap::new();
 
         sampler.insert(
@@ -281,7 +264,7 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         temperature: f32,
         top_k: u32,
         top_p: f32,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let mut sampler = HashMap::new();
 
         sampler.insert(
@@ -304,7 +287,7 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         &mut self,
         pass: Resource<ForwardPass>,
         mask: Vec<Vec<u32>>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let pass = self.ctx().table.get_mut(&pass)?;
         pass.mask = mask;
         Ok(())
@@ -315,18 +298,11 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
         pass: Resource<ForwardPass>,
         mut kv_page_ptrs: Vec<ResourceId>,
         kv_page_last_len: u32,
-    ) -> anyhow::Result<()> {
-        let svc_id = self.ctx().table.get(&pass)?.service_id;
+    ) -> Result<()> {
+        let svc_id = self.ctx().table.get(&pass)?.queue.service_id;
 
         kv_page_ptrs.iter_mut().try_for_each(|kv_page_ptr| {
-            *kv_page_ptr = self
-                .translate_resource_ptr(svc_id, resource::KV_PAGE_TYPE_ID, *kv_page_ptr)
-                .ok_or_else(|| {
-                    anyhow::format_err!(
-                        "Failed to translate KV cache page with ptr: {:?}",
-                        kv_page_ptr
-                    )
-                })?;
+            *kv_page_ptr = self.translate_resource_ptr(svc_id, KV_PAGE_TYPE_ID, *kv_page_ptr)?;
             Ok::<_, anyhow::Error>(())
         })?;
 
@@ -337,11 +313,11 @@ impl bindings::pie::inferlet::forward::Host for InstanceState {
     }
 }
 
-impl bindings::pie::inferlet::forward::HostForwardPass for InstanceState {
+impl inferlet::forward::HostForwardPass for InstanceState {
     async fn execute(
         &mut self,
         this: Resource<ForwardPass>,
-    ) -> anyhow::Result<Option<Resource<ForwardPassResult>>> {
+    ) -> Result<Option<Resource<ForwardPassResult>>> {
         // 1) Check whether we need output (immutable borrow)
         let returns_output = {
             let pass = self.ctx().table.get(&this)?;
@@ -349,12 +325,12 @@ impl bindings::pie::inferlet::forward::HostForwardPass for InstanceState {
         };
 
         // 2) Build the request by MOVING data out of the pass (mutable borrow)
-        let (request, service_id, stream_id) = {
-            use std::mem::take;
-
+        let (request, svc_id, queue_id, priority) = {
             let pass = self.ctx().table.get_mut(&this)?;
-            let service_id = pass.service_id;
-            let stream_id = pass.stream_id;
+
+            let svc_id = pass.queue.service_id;
+            let queue_id = pass.queue.uid;
+            let priority = pass.queue.priority;
 
             let request = ForwardPassRequest {
                 input_tokens: take(&mut pass.input_tokens),
@@ -372,23 +348,15 @@ impl bindings::pie::inferlet::forward::HostForwardPass for InstanceState {
                 output_embed_indices: take(&mut pass.output_embed_indices),
             };
 
-            (request, service_id, stream_id)
+            (request, svc_id, queue_id, priority)
         };
-
-        let data = Bytes::from(rmp_serde::to_vec_named(&request)?);
-        let inst_id = self.id();
 
         if returns_output {
             let (tx, rx) = oneshot::channel();
 
-            model::Command::Submit {
-                inst_id,
-                cmd_queue_id: stream_id,
-                handler: Handler::ForwardPass,
-                data,
-                response: Some(tx),
-            }
-            .dispatch(service_id)?;
+            let req = Request::ForwardPass(request, Some(tx));
+
+            submit_request(svc_id, queue_id, priority, req)?;
 
             let res = ForwardPassResult {
                 receiver: rx,
@@ -399,59 +367,51 @@ impl bindings::pie::inferlet::forward::HostForwardPass for InstanceState {
 
             Ok(Some(self.ctx().table.push(res)?))
         } else {
-            model::Command::Submit {
-                inst_id,
-                cmd_queue_id: stream_id,
-                handler: Handler::ForwardPass,
-                data,
-                response: None,
-            }
-            .dispatch(service_id)?;
+            let req = Request::ForwardPass(request, None);
+
+            submit_request(svc_id, queue_id, priority, req)?;
 
             Ok(None)
         }
     }
-    async fn drop(&mut self, this: Resource<ForwardPass>) -> anyhow::Result<()> {
+    async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
     }
 }
 
-impl bindings::pie::inferlet::forward::HostForwardPassResult for InstanceState {
+impl inferlet::forward::HostForwardPassResult for InstanceState {
     async fn pollable(
         &mut self,
         this: Resource<ForwardPassResult>,
-    ) -> anyhow::Result<Resource<DynPollable>> {
+    ) -> Result<Resource<DynPollable>> {
         subscribe(self.ctx().table, this)
     }
 
     async fn get_distributions(
         &mut self,
         this: Resource<ForwardPassResult>,
-    ) -> anyhow::Result<Option<Vec<(Vec<u32>, Vec<f32>)>>> {
+    ) -> Result<Option<Vec<(Vec<u32>, Vec<f32>)>>> {
         let result = self.ctx().table.get_mut(&this)?;
 
         if result.done {
-            Ok(Some(std::mem::take(&mut result.distributions)))
+            Ok(Some(take(&mut result.distributions)))
         } else {
             Ok(None)
         }
     }
 
-    async fn get_tokens(
-        &mut self,
-        this: Resource<ForwardPassResult>,
-    ) -> anyhow::Result<Option<Vec<u32>>> {
+    async fn get_tokens(&mut self, this: Resource<ForwardPassResult>) -> Result<Option<Vec<u32>>> {
         let result = self.ctx().table.get_mut(&this)?;
 
         if result.done {
-            Ok(Some(std::mem::take(&mut result.tokens)))
+            Ok(Some(take(&mut result.tokens)))
         } else {
             Ok(None)
         }
     }
 
-    async fn drop(&mut self, this: Resource<ForwardPassResult>) -> anyhow::Result<()> {
+    async fn drop(&mut self, this: Resource<ForwardPassResult>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
     }

@@ -1,4 +1,4 @@
-use inferlet::traits::{Adapter, Evolve};
+use inferlet::interface::{Adapter, Evolve};
 use inferlet::wstd::time::Duration;
 use inferlet::{self, Args, Result, bail};
 

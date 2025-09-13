@@ -1,4 +1,3 @@
-# main.py
 import asyncio
 import json
 import os
@@ -48,7 +47,7 @@ class TrainingConfig:
     TRAINING_STEPS: int = 10000
     POPULATION_SIZE: int = 512
     TASKS_PER_SEED: int = 4
-    NUM_ROLLOUTS_PER_WORKER: int = 8
+    NUM_ROLLOUTS_PER_WORKER: int = 1 # This is now the batch size
     LORA_RANK: int = 8
     LORA_ALPHA: float = 16.0
     INITIAL_SIGMA: float = 0.005
@@ -66,11 +65,7 @@ class TrainingConfig:
 
     # --- Evaluation Configuration ---
     EVAL_EVERY_N_STEPS: int = 2
-    EVAL_TASKS_PER_WORKER: int = 16
-
-    # --- Token Budgets ---
-    DEFAULT_MAX_TOKENS_PER_SERVER: int = 512 * 100
-    MAX_TOKENS_PER_SERVER: Dict[str, int] = field(default_factory=dict)
+    EVAL_TASKS_PER_WORKER: int = 1
 
     # --- W&B Config ---
     WANDB_PROJECT: str = os.getenv("WANDB_PROJECT", "pie-es-v5")
@@ -88,9 +83,7 @@ class TrainingConfig:
             "es-rollout": self.WASM_DIR / "es_rollout.wasm",
             "es-update": self.WASM_DIR / "es_update.wasm",
         }
-        self.MAX_TOKENS_PER_SERVER = {
-            uri: self.DEFAULT_MAX_TOKENS_PER_SERVER for uri in self.SERVER_URIS
-        }
+
         # Update adapter name based on dataset
         self.ADAPTER_NAME = f"evo-{self.DATASET_NAME}-v1"
 
@@ -102,7 +95,7 @@ class TrainingConfig:
 async def launch_and_get_result(
         client: PieClient,
         program_hash: str,
-        arguments: list[str],
+        arguments: List[str],
         worker_id: Any = 0,
         verbose: bool = False,
 ) -> Optional[str]:
@@ -124,15 +117,6 @@ async def launch_and_get_result(
                 tqdm.write(f"❌ Worker {worker_id} / {instance.instance_id} / {event}] {message}")
             break
     return final_payload
-
-
-async def _as_completed_iter(tasks):
-    """Helper to iterate over tasks as they complete."""
-    pending = set(tasks)
-    while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for d in done:
-            yield d
 
 
 def _create_eval_wandb_html(generations: List[Dict]) -> wandb.Html:
@@ -329,39 +313,63 @@ class ESOrchestrator:
         tqdm.write("✅ Adapter initialized on all clients.")
 
     async def _run_distributed_rollouts(self, base_seeds, dataset, batch_size, desc="rollout"):
-        """Manages the full distributed rollout and result collection phase."""
+        """
+        Manages the full distributed rollout using a continuous, dynamic scheduling strategy.
+
+        This implementation avoids distinct phases. Instead, it uses a central work queue
+        and persistent client workers. Each worker processes batches concurrently up to a
+        calculated capacity. When a batch finishes, the worker immediately pulls new work
+        from the queue. If a batch is preempted (fails), its individual tasks are returned
+        to the central queue to be retried by any available worker. This ensures maximum
+        server utilization.
+        """
+        # --- 1. PREPARATION: Create all individual tasks and load them into a shared queue ---
         if desc == "evaluation":
             num_tasks = len(dataset)
             all_tasks = [dataset[i] for i in range(num_tasks)]
             seeds_to_run = base_seeds
-        else:  # Training
+        else: # Training
             num_tasks = self.config.POPULATION_SIZE * self.config.TASKS_PER_SEED
             task_indices = np.random.choice(len(dataset), size=(self.config.POPULATION_SIZE, self.config.TASKS_PER_SEED))
             all_tasks = [dataset[i] for i in task_indices.flatten()]
             seeds_to_run = np.repeat(base_seeds, self.config.TASKS_PER_SEED)
 
-        work_queue = deque((int(s), t) for s, t in zip(seeds_to_run, all_tasks))
-        queue_lock = asyncio.Lock()
+        # The work_queue contains individual (seed, task) tuples.
+        work_queue = deque(zip(seeds_to_run, all_tasks))
 
+        # Calculate the initial fair share of tasks for each worker.
+        # This determines how many concurrent batches each worker will try to launch initially.
+        initial_tasks_per_worker = np.ceil(num_tasks / len(self.clients)) if self.clients else 0
+
+        queue_lock = asyncio.Lock()
         results = {"texts": [], "seeds": [], "tasks": [], "caps": {}}
-        client_tasks = []
-        with tqdm(total=num_tasks, desc=f"Step {desc}", dynamic_ncols=True, leave=False) as pbar:
+
+        pbar = tqdm(total=num_tasks, desc=f"Step {desc}", dynamic_ncols=True, leave=False)
+        try:
+            # --- 2. LAUNCH PERSISTENT WORKERS ---
+            # Each client gets one worker that runs until the shared work_queue is empty.
+            client_tasks = []
             for i, (client, uri) in enumerate(zip(self.clients, self.config.SERVER_URIS)):
                 task = asyncio.create_task(self._client_rollout_worker(
                     client, uri, self.program_hashes["es-rollout"],
-                    work_queue, queue_lock, f"C{i}", pbar, batch_size
+                    work_queue, queue_lock, f"C{i}", pbar, batch_size,
+                    initial_tasks_per_worker  # Pass the initial task count
                 ))
                 client_tasks.append(task)
 
-            async for completed in _as_completed_iter(client_tasks):
-                texts_i, seeds_i, tasks_i, cap_i, uri_i = await completed
+            # --- 3. GATHER RESULTS ---
+            # Wait for all workers to complete and collect their results.
+            all_worker_results = await asyncio.gather(*client_tasks)
+            for texts_i, seeds_i, tasks_i, cap_i, uri_i in all_worker_results:
                 results["texts"].extend(texts_i)
                 results["seeds"].extend(seeds_i)
                 results["tasks"].extend(tasks_i)
                 results["caps"][uri_i] = cap_i
+        finally:
+            pbar.close()
+
         return results
 
-    # ▼▼▼ MODIFICATION START ▼▼▼
     def _score_and_aggregate(self, base_seeds, rollout_results):
         """Scores generations and aggregates them by seed using generic verifier."""
         reward_infos = [
@@ -403,15 +411,16 @@ class ESOrchestrator:
         }
         return aggregated_scores, metrics
 
-    # ▲▲▲ MODIFICATION END ▲▲▲
-
     async def _run_update_phase(self, base_seeds, aggregated_scores, step: int):
         """Broadcasts the update command to all clients and handles checkpointing."""
         tqdm.write("Phase: Update")
+
+        # Round scores to avoid overly long argument strings from float precision.
+        scores_str = ",".join(f"{s:.6f}" for s in aggregated_scores)
+
         update_args = [
             "--name", self.config.ADAPTER_NAME,
-            "--seeds", ",".join(map(str, base_seeds)),
-            "--scores", ",".join(map(str, aggregated_scores)),
+            "--scores", scores_str,
             "--max-sigma", str(self.config.MAX_SIGMA),
         ]
 
@@ -467,84 +476,114 @@ class ESOrchestrator:
             wandb.summary["final_eval_mean_reward"] = metrics["eval/mean_reward"]
         return metrics
 
-    # ▲▲▲ MODIFICATION END ▲▲▲
+    async def _run_batch(self, client, program_hash, seeds, tasks, who):
+        """Helper to run a single batch."""
+        rollouts = []
+        for seed, task in zip(seeds, tasks):
+            hasher = blake3(str(seed).encode('utf-8'))
+            task_problem_str = task.get('problem', str(task))
+            hasher.update(task_problem_str.encode('utf-8'))
+            uid = hasher.hexdigest()
+            rollouts.append({
+                "uid": uid,
+                "task": task_problem_str,
+                "seed": int(seed)
+            })
+        rollouts_json = json.dumps(rollouts)
+
+        args = [
+            "--name", self.config.ADAPTER_NAME,
+            "--rollouts", rollouts_json,
+            "--max-num-outputs", str(self.config.MAX_TOKENS_GEN),
+            "--system-prompt", self.config.SYSTEM_PROMPT,
+        ]
+        res_json = await launch_and_get_result(client, program_hash, args, who, self.config.VERBOSE_WORKER_LOGS)
+        if res_json:
+            try:
+                texts = json.loads(res_json)
+                if isinstance(texts, list) and len(texts) == len(seeds):
+                    return texts
+            except (json.JSONDecodeError, TypeError):
+                tqdm.write(f"Warning: JSON decode failed for worker {who}.")
+                pass
+        # Return None to signal preemption/failure.
+        return None
 
     async def _client_rollout_worker(
-            self, client, server_uri, program_hash, work_queue, queue_lock, client_id, pbar, batch_size
+            self, client, server_uri, program_hash, work_queue, queue_lock, client_id, pbar, batch_size,
+            initial_tasks_per_worker
     ):
-        """The core logic for a single client pulling from the shared work queue."""
+        """
+        The core logic for a single client worker. It continuously pulls work from the
+        shared queue, runs batches concurrently up to its capacity, and returns
+        results when all work is done.
+        """
+        # The worker's concurrency level ("capacity") is determined by its initial
+        # fair share of the total workload. It will attempt to launch this many batches
+        # at the start, creating the desired "overload" phase dynamically.
+        capacity = int(np.ceil(initial_tasks_per_worker / batch_size))
 
-        def _compute_capacity():
-            budget = self.config.MAX_TOKENS_PER_SERVER.get(server_uri, self.config.DEFAULT_MAX_TOKENS_PER_SERVER)
-            denom = self.config.MAX_TOKENS_GEN * batch_size
-            return max(1, budget // max(1, denom))
-
-        async def _pop_batch():
-            async with queue_lock:
-                if not work_queue: return None, None
-                batch_limit = min(batch_size, len(work_queue))
-                return zip(*[work_queue.popleft() for _ in range(batch_limit)])
-
-        async def _run_batch_with_retry(seeds, tasks, who, max_retries=1):
-            for attempt in range(max_retries + 1):
-                # Use "problem" key which is consistent across new datasets
-                tasks_json = json.dumps([item["problem"] for item in tasks])
-                args = ["--name", self.config.ADAPTER_NAME, "--seeds", ",".join(map(str, seeds)),
-                        "--tasks-json", tasks_json, "--max-num-outputs", str(self.config.MAX_TOKENS_GEN),
-                        "--system-prompt", self.config.SYSTEM_PROMPT]
-                res_json = await launch_and_get_result(client, program_hash, args, f"{who}-try{attempt + 1}", self.config.VERBOSE_WORKER_LOGS)
-                if res_json:
-                    try:
-                        texts = json.loads(res_json)
-                        if isinstance(texts, list) and len(texts) == len(seeds):
-                            return texts
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-            return None
-
-        capacity = _compute_capacity()
-        tqdm.write(f"Client {client_id} @ {server_uri}: capacity={capacity}, batch_size={batch_size}")
+        tqdm.write(f"Client {client_id} @ {server_uri}: capacity set to {capacity} batches based on initial fair share.")
 
         texts_out, seeds_out, tasks_out = [], [], []
         running_tasks = set()
         task_meta = {}
         batch_num = 0
 
-        while len(running_tasks) < capacity:
-            seeds, tasks = await _pop_batch()
-            if not seeds: break
-
-            who = f"{client_id}-B{batch_num}"
-            batch_num += 1
-            task = asyncio.create_task(_run_batch_with_retry(seeds, tasks, who))
-            running_tasks.add(task)
-            task_meta[task] = (seeds, tasks)
-
-        while running_tasks:
-            done, pending = await asyncio.wait(running_tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                seeds, tasks = task_meta.pop(task)
-                texts = task.result()
-                if texts:
-                    texts_out.extend(texts)
-                    seeds_out.extend(seeds)
-                    tasks_out.extend(tasks)
-
-                if pbar: pbar.update(len(seeds))
-
-                new_seeds, new_tasks = await _pop_batch()
-                if new_seeds:
+        # Initially populate the worker's running tasks up to its capacity.
+        async with queue_lock:
+            for _ in range(capacity):
+                if not work_queue: break
+                batch_limit = min(batch_size, len(work_queue))
+                new_work = [work_queue.popleft() for _ in range(batch_limit)]
+                if new_work:
+                    seeds, tasks = zip(*new_work)
                     who = f"{client_id}-B{batch_num}"
                     batch_num += 1
-                    new_task = asyncio.create_task(_run_batch_with_retry(new_seeds, new_tasks, who))
-                    pending.add(new_task)
-                    task_meta[new_task] = (new_seeds, new_tasks)
+                    task = asyncio.create_task(self._run_batch(client, program_hash, list(seeds), list(tasks), who))
+                    running_tasks.add(task)
+                    task_meta[task] = (list(seeds), list(tasks))
 
+        # Main loop: As tasks complete, process results and pull new work to maintain capacity.
+        while running_tasks:
+            done, pending = await asyncio.wait(running_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+            for task in done:
+                # This entire block is protected by a lock to prevent race conditions
+                # on the shared `work_queue`.
+                async with queue_lock:
+                    seeds, tasks = task_meta.pop(task)
+                    texts = task.result()
+
+                    if texts:  # Batch succeeded
+                        texts_out.extend(texts)
+                        seeds_out.extend(seeds)
+                        tasks_out.extend(tasks)
+                        pbar.update(len(seeds))
+                    else:  # Batch failed, add individual tasks back to the shared work_queue
+                        tqdm.write(f"Worker {client_id}: Batch failed. Re-queuing {len(seeds)} tasks.")
+                        for seed, single_task in zip(seeds, tasks):
+                            work_queue.append((seed, single_task))
+
+                    # Try to pull a new batch from the queue to replace the one that just finished.
+                    if work_queue:
+                        batch_limit = min(batch_size, len(work_queue))
+                        new_work = [work_queue.popleft() for _ in range(batch_limit)]
+
+                        if new_work:
+                            new_seeds, new_tasks = zip(*new_work)
+                            who = f"{client_id}-B{batch_num}"
+                            batch_num += 1
+                            new_task = asyncio.create_task(self._run_batch(client, program_hash, list(new_seeds), list(new_tasks), who))
+                            # Add new task to the 'pending' set to be awaited in the next cycle.
+                            pending.add(new_task)
+                            task_meta[new_task] = (list(new_seeds), list(new_tasks))
+
+            # ensuring all completed tasks in 'done' are processed before updating the set of running tasks.
             running_tasks = pending
 
+        # When the loop finishes, all work is done for this worker.
         return texts_out, seeds_out, tasks_out, capacity, server_uri
-
 
 # ==============================================================================
 # 4. Main Execution Block

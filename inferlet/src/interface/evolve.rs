@@ -1,6 +1,6 @@
 use crate::Queue;
 use crate::bindings::pie::inferlet::evolve;
-use crate::traits::forward::ForwardPass;
+use crate::interface::forward::ForwardPass;
 
 pub trait Evolve {
     fn initialize_adapter(

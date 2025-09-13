@@ -1,7 +1,7 @@
 use futures::future::join_all;
 use inferlet::bindings::pie::inferlet::core::store_delete;
 use inferlet::stop_condition::{StopCondition, ends_with_any, max_len};
-use inferlet::traits::Adapter;
+use inferlet::interface::Adapter;
 use inferlet::{self, Args, Result, Sampler, bail, store_get, store_set};
 use serde::Deserialize;
 use std::future::Future;
@@ -22,7 +22,7 @@ async fn main(mut args: Args) -> Result<String> {
     let max_num_outputs: usize = args.value_from_str("--max-num-outputs")?;
 
     // Parse the tasks from a JSON string.
-    let rollouts_str: String = args.value_from_str("--tasks-json")?;
+    let rollouts_str: String = args.value_from_str("--rollouts")?;
     let rollouts: Vec<Rollout> = serde_json::from_str(&rollouts_str)?;
 
     // The futures vector for a single-threaded (Wasm) environment does not need the `Send` bound.

@@ -1,5 +1,5 @@
 use crate::bindings::pie::inferlet::adapter;
-use crate::traits::forward::ForwardPass;
+use crate::interface::forward::ForwardPass;
 use crate::{Blob, Queue, Resource};
 use std::rc::Rc;
 use wstd::io::AsyncPollable;

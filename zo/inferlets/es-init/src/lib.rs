@@ -1,6 +1,6 @@
-use inferlet::traits::Adapter;
+use inferlet::interface::Adapter;
 use inferlet::wstd::time::Duration;
-use inferlet::{self, Args, Blob, Result, get_auto_model, store_exists, traits::Evolve};
+use inferlet::{self, Args, Blob, Result, get_auto_model, store_exists, interface::Evolve};
 
 #[inferlet::main]
 async fn main(mut args: Args) -> Result<()> {
