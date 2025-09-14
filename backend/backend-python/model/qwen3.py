@@ -162,14 +162,14 @@ class Qwen3Attention(nn.Module):
         )
 
         # apply adapters if provided
-        # if adapter_subpass is not None:
-        #     adapter_subpass.execute(
-        #         self.layer_idx,
-        #         hidden_states,
-        #         q_state=query_states,
-        #         k_state=key_states,
-        #         v_state=value_states,
-        #     )
+        if adapter_subpass is not None:
+            adapter_subpass.execute(
+                self.layer_idx,
+                hidden_states,
+                q_state=query_states,
+                k_state=key_states,
+                v_state=value_states,
+            )
 
         # Reshape and continue as before
         query_states = query_states.view(

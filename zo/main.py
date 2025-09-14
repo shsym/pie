@@ -37,7 +37,6 @@ class TrainingConfig:
     DATASET_NAME: str = "countdown"  # "countdown" or "math"
     # Path for file-based datasets like Countdown
     DATA_PATH: str = "./Countdown-Tasks-3to4"
-    DATASET_TEST_SIZE: int = 1
 
     # --- Inferlet WASM Paths ---
     INFERLET_WASM_PATHS: Dict[str, Path] = field(default_factory=dict)
@@ -64,11 +63,12 @@ class TrainingConfig:
     CHECKPOINT_EVERY_N_STEPS: int = 5
 
     # --- Evaluation Configuration ---
+    DATASET_TEST_SIZE: int = 100
     EVAL_EVERY_N_STEPS: int = 2
     EVAL_TASKS_PER_WORKER: int = 1
 
     # --- W&B Config ---
-    WANDB_PROJECT: str = os.getenv("WANDB_PROJECT", "pie-es-v5")
+    WANDB_PROJECT: str = os.getenv("WANDB_PROJECT", "pie-es-v6")
     WANDB_ENTITY: str = os.getenv("WANDB_ENTITY")
     WANDB_MODE: str = os.getenv("WANDB_MODE")
     WANDB_TAGS: List[str] = field(default_factory=lambda: ["es", "countdown", "lora"])
@@ -492,9 +492,9 @@ class ESOrchestrator:
             """Periodically prints the worker's status."""
             while True:
                 try:
-                    tqdm.write(
-                        f"⏱️  [{client_id}] Capacity: {capacity} | Active: {len(running_tasks)} | Peak Active: {peak_concurrency} | Completed: {num_completed} | Preempted: {num_preempted} | Queue: {len(work_queue)}"
-                    )
+                    # tqdm.write(
+                    #     f"⏱️  [{client_id}] Capacity: {capacity} | Active: {len(running_tasks)} | Peak Active: {peak_concurrency} | Completed: {num_completed} | Preempted: {num_preempted} | Queue: {len(work_queue)}"
+                    # )
                     await asyncio.sleep(2)
                 except asyncio.CancelledError:
                     break

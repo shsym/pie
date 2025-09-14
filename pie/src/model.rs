@@ -376,7 +376,7 @@ impl Model {
         let heartbeat_corr_id = u32::MAX;
 
         // Define the stats printing interval.
-        const STATS_PRINT_INTERVAL: Duration = Duration::from_secs(3);
+        const STATS_PRINT_INTERVAL: Duration = Duration::from_secs(30);
         let mut stats_interval = tokio::time::interval(STATS_PRINT_INTERVAL);
 
         loop {
