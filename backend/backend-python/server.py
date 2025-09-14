@@ -53,6 +53,7 @@ def main(
         auth_token: str = None,
         cache_dir: str = None,
         kv_page_size: int = 16,
+        max_batch_tokens: int = 1024 * 16,
         max_dist_size: int = 64,
         max_num_kv_pages: int = 1024,
         max_num_embeds: int = 128,
@@ -227,6 +228,7 @@ def start_service(config, model, model_info):
         model=model,
         model_info=model_info,
         kv_page_size=config["kv_page_size"],
+        max_batch_tokens=config["max_batch_tokens"],
         max_dist_size=config["max_dist_size"],
         max_num_kv_pages=config["max_num_kv_pages"],
         max_num_embeds=config["max_num_embeds"],
@@ -393,7 +395,9 @@ def run_zmq_server(socket, handler):
                 case HandlerId.QUERY.value:
                     resps = handler.query(reqs)
                 case HandlerId.FORWARD_PASS.value:
+                    #print("reqs.len", len(reqs))
                     resps = handler.forward_pass(reqs)
+                    #print("resps", resps)
                 case HandlerId.EMBED_IMAGE.value:
                     handler.embed_image(reqs)
                 case HandlerId.INITIALIZE_ADAPTER.value:

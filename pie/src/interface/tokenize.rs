@@ -2,7 +2,7 @@ use crate::instance::InstanceState;
 use crate::interface::core::Model;
 use crate::interface::pie::inferlet;
 use crate::model::tokenizer::BytePairEncoder;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -28,7 +28,14 @@ impl inferlet::tokenize::HostTokenizer for InstanceState {
 
     async fn detokenize(&mut self, this: Resource<Tokenizer>, tokens: Vec<u32>) -> Result<String> {
         let tokenizer = self.ctx().table.get(&this)?;
-        tokenizer.inner.decode(&tokens).map_err(Into::into)
+        let out = tokenizer.inner.decode(&tokens);
+
+        if let Ok(out) = out {
+            Ok(out)
+        } else {
+            println!("Failed to decode tokens: {:?}", out);
+            bail!("Failed to decode tokens: {:?}", out);
+        }
     }
 
     async fn get_vocabs(&mut self, this: Resource<Tokenizer>) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {

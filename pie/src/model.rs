@@ -189,6 +189,7 @@ pub struct ModelInfo {
     pub prompt_stop_tokens: Vec<String>,
     pub tokenizer: Arc<BytePairEncoder>,
     pub kv_page_size: u32,
+    pub max_batch_tokens: usize,
 }
 
 /// An in-memory key-value store service.
@@ -211,8 +212,11 @@ impl Model {
 
         let mut batch_triggers = HashMap::new();
         let forward_pass_trigger = Arc::new(AtomicBool::new(true));
-        let forward_pass_policy =
-            ForwardPassPolicy::new(forward_pass_trigger.clone(), Duration::ZERO);
+        let forward_pass_policy = ForwardPassPolicy::new(
+            forward_pass_trigger.clone(),
+            handshake_info.max_batch_tokens,
+            Duration::ZERO,
+        );
         let batch_policy = BatchPolicySelector::new(forward_pass_policy);
 
         batch_triggers.insert(FORWARD_PASS_ID, forward_pass_trigger);
@@ -237,6 +241,7 @@ impl Model {
         ));
 
         let tokenizer = Arc::new(BytePairEncoder::new(
+            handshake_info.tokenizer_num_vocab,
             handshake_info.tokenizer_merge_table.into_iter().collect(),
             handshake_info.tokenizer_special_tokens,
             &handshake_info.tokenizer_split_regex,
@@ -252,6 +257,7 @@ impl Model {
             prompt_stop_tokens: handshake_info.prompt_stop_tokens,
             tokenizer,
             kv_page_size: handshake_info.kv_page_size,
+            max_batch_tokens: handshake_info.max_batch_tokens,
         };
 
         let resource_manager = ResourceManager::new(handshake_info.resources);
@@ -264,53 +270,6 @@ impl Model {
             scheduling_worker_handle: Some(scheduling_worker_handle),
             backend_worker_handle: Some(backend_worker_handle),
         })
-    }
-
-    async fn send_zmq_message(
-        socket: &mut DealerSocket,
-        corr_id: u32,
-        handler_id: u32,
-        payload: Bytes,
-    ) -> Result<()> {
-        let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(3);
-        frames.push_back(Bytes::copy_from_slice(&corr_id.to_be_bytes()));
-        frames.push_back(Bytes::copy_from_slice(&handler_id.to_be_bytes()));
-        frames.push_back(payload);
-        socket.send(ZmqMessage::try_from(frames).unwrap()).await?;
-        Ok(())
-    }
-
-    async fn send_zmq_messages(
-        socket: &mut DealerSocket,
-        corr_id: u32,
-        handler_id: u32,
-        payloads: Vec<Bytes>,
-    ) -> Result<()> {
-        let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(3);
-        frames.push_back(Bytes::copy_from_slice(&corr_id.to_be_bytes()));
-        frames.push_back(Bytes::copy_from_slice(&handler_id.to_be_bytes()));
-        frames.extend(payloads);
-        socket.send(ZmqMessage::try_from(frames).unwrap()).await?;
-        Ok(())
-    }
-
-    async fn recv_zmq_messages(socket: &mut DealerSocket) -> Result<(u32, u32, VecDeque<Bytes>)> {
-        let zmq_msg = socket.recv().await?;
-
-        let mut frames = zmq_msg.into_vecdeque();
-        let corr_id_bytes = frames
-            .pop_front()
-            .ok_or(anyhow::format_err!("Missing correlation ID frame"))?;
-        let handler_id_bytes = frames
-            .pop_front()
-            .ok_or(anyhow::format_err!("Missing handler ID frame"))?;
-        let corr_id_slice = corr_id_bytes.as_ref().try_into()?;
-        let handler_id_slice = handler_id_bytes.as_ref().try_into()?;
-
-        let received_corr_id = u32::from_be_bytes(corr_id_slice);
-        let received_handler_id = u32::from_be_bytes(handler_id_slice);
-
-        Ok((received_corr_id, received_handler_id, frames))
     }
 
     async fn handshake(socket: &mut DealerSocket) -> Result<HandshakeResponse> {
@@ -337,7 +296,6 @@ impl Model {
         Ok(handshake_info)
     }
 
-    // NEW: Graceful shutdown method.
     pub async fn shutdown(mut self) -> Result<()> {
         println!("[Info] Shutting down model service...");
         self.shutdown_tx.send(())?;
@@ -417,6 +375,10 @@ impl Model {
         // Use a special correlation ID to distinguish heartbeats from regular requests.
         let heartbeat_corr_id = u32::MAX;
 
+        // Define the stats printing interval.
+        const STATS_PRINT_INTERVAL: Duration = Duration::from_secs(3);
+        let mut stats_interval = tokio::time::interval(STATS_PRINT_INTERVAL);
+
         loop {
             let sleep_duration = event_table
                 .values()
@@ -430,6 +392,19 @@ impl Model {
                 _ = shutdown_rx.recv() => {
                     println!("[Info] Shutdown signal received, exiting backend worker.");
                     break;
+                },
+
+                // Add a new arm to the select macro to handle the stats interval tick.
+                _ = stats_interval.tick() => {
+                    let stats = runtime_stats().await;
+                    println!("\n----- Runtime Stats -----");
+                    // Pretty-print the stats for better readability.
+                    let mut sorted_stats: Vec<_> = stats.iter().collect();
+                    sorted_stats.sort_by_key(|(k, _)| *k);
+                    for (key, value) in sorted_stats {
+                        println!("{:<40} | {}", key, value);
+                    }
+                    println!("-------------------------\n");
                 },
 
                 _ = heartbeat_interval.tick() => {
@@ -454,7 +429,6 @@ impl Model {
                         heartbeat_pending = Some(Instant::now());
                     }
                 },
-                // --- End of New Code ---
 
                 maybe_command = batch_rx.recv() => {
                     if let Some(requests) = maybe_command {
@@ -546,6 +520,53 @@ impl Model {
         self.resource_manager.append_stats_to(&mut stats);
 
         stats
+    }
+
+    async fn send_zmq_message(
+        socket: &mut DealerSocket,
+        corr_id: u32,
+        handler_id: u32,
+        payload: Bytes,
+    ) -> Result<()> {
+        let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(3);
+        frames.push_back(Bytes::copy_from_slice(&corr_id.to_be_bytes()));
+        frames.push_back(Bytes::copy_from_slice(&handler_id.to_be_bytes()));
+        frames.push_back(payload);
+        socket.send(ZmqMessage::try_from(frames).unwrap()).await?;
+        Ok(())
+    }
+
+    async fn send_zmq_messages(
+        socket: &mut DealerSocket,
+        corr_id: u32,
+        handler_id: u32,
+        payloads: Vec<Bytes>,
+    ) -> Result<()> {
+        let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(3);
+        frames.push_back(Bytes::copy_from_slice(&corr_id.to_be_bytes()));
+        frames.push_back(Bytes::copy_from_slice(&handler_id.to_be_bytes()));
+        frames.extend(payloads);
+        socket.send(ZmqMessage::try_from(frames).unwrap()).await?;
+        Ok(())
+    }
+
+    async fn recv_zmq_messages(socket: &mut DealerSocket) -> Result<(u32, u32, VecDeque<Bytes>)> {
+        let zmq_msg = socket.recv().await?;
+
+        let mut frames = zmq_msg.into_vecdeque();
+        let corr_id_bytes = frames
+            .pop_front()
+            .ok_or(anyhow::format_err!("Missing correlation ID frame"))?;
+        let handler_id_bytes = frames
+            .pop_front()
+            .ok_or(anyhow::format_err!("Missing handler ID frame"))?;
+        let corr_id_slice = corr_id_bytes.as_ref().try_into()?;
+        let handler_id_slice = handler_id_bytes.as_ref().try_into()?;
+
+        let received_corr_id = u32::from_be_bytes(corr_id_slice);
+        let received_handler_id = u32::from_be_bytes(handler_id_slice);
+
+        Ok((received_corr_id, received_handler_id, frames))
     }
 }
 

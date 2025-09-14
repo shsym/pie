@@ -1,10 +1,10 @@
-use crate::interface::pie::inferlet as inferlet;
-use crate::interface::core::Queue;
 use crate::instance::InstanceState;
+use crate::interface::core::Queue;
+use crate::interface::pie::inferlet;
 use crate::model::request::{ForwardPassRequest, ForwardPassResponse, Request};
 use crate::model::resource::{EMBED_TYPE_ID, KV_PAGE_TYPE_ID, ResourceId};
 use crate::model::submit_request;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::iter;
 use std::mem::take;
@@ -56,10 +56,10 @@ impl Pollable for ForwardPassResult {
             return;
         }
 
-        let res = (&mut self.receiver).await.unwrap();
-
-        self.distributions = res.dists;
-        self.tokens = res.tokens;
+        if let Ok(res) = (&mut self.receiver).await {
+            self.distributions = res.dists;
+            self.tokens = res.tokens;
+        }
 
         self.done = true;
     }
@@ -71,6 +71,7 @@ impl inferlet::forward::Host for InstanceState {
         queue: Resource<Queue>,
     ) -> Result<Resource<ForwardPass>> {
         let queue = self.ctx().table.get(&queue)?.clone();
+
         let pass = ForwardPass {
             queue,
             input_tokens: vec![],
@@ -104,6 +105,15 @@ impl inferlet::forward::Host for InstanceState {
         })?;
 
         let pass = self.ctx().table.get_mut(&pass)?;
+
+        if pass.input_tokens.len() + emb_ptrs.len() > pass.queue.info.max_batch_tokens {
+            bail!(
+                "max batch tokens exceeded, input tokens: {}, max tokens: {}",
+                emb_ptrs.len(),
+                pass.queue.info.max_batch_tokens
+            );
+        }
+
         pass.input_embed_ptrs.extend(emb_ptrs);
         pass.input_embed_positions.extend(positions);
         Ok(())
@@ -116,6 +126,29 @@ impl inferlet::forward::Host for InstanceState {
         positions: Vec<u32>,
     ) -> Result<()> {
         let pass = self.ctx().table.get_mut(&pass)?;
+
+        if pass.input_tokens.len() + input_tokens.len() > pass.queue.info.max_batch_tokens {
+            println!(
+                "max batch tokens exceeded, input tokens: {}, max tokens: {}",
+                input_tokens.len(),
+                pass.queue.info.max_batch_tokens
+            );
+            bail!(
+                "max batch tokens exceeded, input tokens: {}, max tokens: {}",
+                input_tokens.len(),
+                pass.queue.info.max_batch_tokens
+            );
+        }
+
+        // check if token ids are in the vocab range
+        let num_vocabs = pass.queue.info.tokenizer.num_vocab() as u32;
+        for &token in input_tokens.iter() {
+            if token >= num_vocabs {
+                println!("token id {} is out of range", token);
+                bail!("token id {} is out of range", token);
+            }
+        }
+
         pass.input_tokens.extend(input_tokens);
         pass.input_token_positions.extend(positions);
         Ok(())

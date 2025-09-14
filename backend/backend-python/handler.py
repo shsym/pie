@@ -26,6 +26,7 @@ class Handler:
             model,
             model_info: ModelInfo,
             kv_page_size: int,
+            max_batch_tokens: int,
             max_dist_size: int,
             max_num_kv_pages: int,
             max_num_embeds: int,
@@ -40,6 +41,7 @@ class Handler:
         self.lm = model
         self.model_info = model_info
         self.kv_page_size = kv_page_size
+        self.max_batch_tokens = max_batch_tokens
         self.max_dist_size = max_dist_size
         self.max_num_kv_pages = max_num_kv_pages
         self.max_num_embeds = max_num_embeds
@@ -108,11 +110,13 @@ class Handler:
                 prompt_template_type=self.model_info.template_type,
                 prompt_stop_tokens=self.model_info.stop_tokens,
                 kv_page_size=self.kv_page_size,
+                max_batch_tokens=self.max_batch_tokens,
                 resources={
                     0: self.max_num_kv_pages,
                     1: self.max_num_embeds,
                     2: self.max_num_adapters,
                 },
+                tokenizer_num_vocab=self.model_info.tokenizer.num_vocab,
                 tokenizer_merge_table=self.model_info.tokenizer.merge_table,
                 tokenizer_special_tokens=self.model_info.tokenizer.special_tokens,
                 tokenizer_split_regex=self.model_info.tokenizer.split_regex,
@@ -236,7 +240,7 @@ class Handler:
 
             # 4. Package the model outputs into response messages.
             responses = batch.package_responses(output_embeds)
-
+        #print(responses)
         return responses
 
 

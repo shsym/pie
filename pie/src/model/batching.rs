@@ -1,7 +1,6 @@
 use crate::model::request::Request;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
-use std::mem;
 use std::mem::{Discriminant, discriminant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +9,7 @@ use std::time::{Duration, Instant};
 type StreamId = u32;
 
 trait BatchPolicy {
-    fn next_poll_in(&self, queue: &Vec<QueuedRequest>, now: Instant) -> Option<Duration>;
+    fn next_poll_in(&self, queue: &[QueuedRequest], now: Instant) -> Option<Duration>;
 
     fn try_form_batch(
         &mut self,
@@ -44,7 +43,7 @@ impl BatchPolicySelector {
 }
 
 impl BatchPolicy for BatchPolicySelector {
-    fn next_poll_in(&self, queue: &Vec<QueuedRequest>, now: Instant) -> Option<Duration> {
+    fn next_poll_in(&self, queue: &[QueuedRequest], now: Instant) -> Option<Duration> {
         match queue.iter().next()?.req {
             Request::ForwardPass(_, _) => self.forward_pass.next_poll_in(queue, now),
             _ => self.eager.next_poll_in(queue, now),
@@ -84,11 +83,6 @@ impl ThresholdPolicy {
         Self::new(Duration::from_secs_f32(0.0), 1, Some(usize::MAX))
     }
 
-    /// Creates a policy where a batch of size 1 is formed immediately for each item.
-    pub fn immediate() -> Self {
-        Self::new(Duration::from_secs_f32(0.0), 1, Some(1))
-    }
-
     /// Creates a policy that only uses the item count threshold (`min_size`).
     /// If `max_size` is not provided, it defaults to the given `min_size`.
     pub fn k_only(min_size: usize, max_size: Option<usize>) -> Self {
@@ -107,7 +101,7 @@ impl ThresholdPolicy {
 }
 
 impl BatchPolicy for ThresholdPolicy {
-    fn next_poll_in(&self, queue: &Vec<QueuedRequest>, now: Instant) -> Option<Duration> {
+    fn next_poll_in(&self, queue: &[QueuedRequest], now: Instant) -> Option<Duration> {
         // If the size condition is already met, the batch is ready.
         if queue.len() >= self.min_size {
             return Some(Duration::ZERO);
@@ -145,22 +139,22 @@ impl BatchPolicy for ThresholdPolicy {
 #[derive(Debug)]
 pub struct ForwardPassPolicy {
     trigger: Arc<AtomicBool>,
+    max_batch_tokens: usize,
     min_wait_time: Duration,
-    max_batch_tokens: u32,
 }
 
 impl ForwardPassPolicy {
-    pub fn new(trigger: Arc<AtomicBool>, min_wait_time: Duration) -> Self {
+    pub fn new(trigger: Arc<AtomicBool>, max_batch_tokens: usize, min_wait_time: Duration) -> Self {
         Self {
             trigger,
             min_wait_time,
-            max_batch_tokens: 0,
+            max_batch_tokens,
         }
     }
 }
 
 impl BatchPolicy for ForwardPassPolicy {
-    fn next_poll_in(&self, queue: &Vec<QueuedRequest>, now: Instant) -> Option<Duration> {
+    fn next_poll_in(&self, queue: &[QueuedRequest], now: Instant) -> Option<Duration> {
         let first_item_time = queue.iter().next()?.enqueued_at;
         let elapsed = now.duration_since(first_item_time);
         if now.duration_since(first_item_time) < self.min_wait_time {
@@ -177,15 +171,30 @@ impl BatchPolicy for ForwardPassPolicy {
     ) -> Option<Vec<QueuedRequest>> {
         let first_item_time = queue.iter().next()?.enqueued_at;
         let waited_long_enough = now.duration_since(first_item_time) >= self.min_wait_time;
-
         if !waited_long_enough {
             return None;
         }
 
         if self.trigger.load(Ordering::SeqCst) {
             if self.trigger.swap(false, Ordering::SeqCst) {
-                let all = mem::take(queue);
-                return Some(all);
+                let mut tokens_in_batch = 0;
+                let mut num_requests_to_drain = queue.len(); // Default to draining the entire queue.
+
+                for (i, request) in queue.iter().enumerate() {
+                    if let Request::ForwardPass(req, _) = &request.req {
+                        tokens_in_batch += req.input_tokens.len() + req.input_embed_ptrs.len();
+
+                        if tokens_in_batch >= self.max_batch_tokens {
+                            num_requests_to_drain = i + 1;
+                            break;
+                        }
+                    }
+                }
+                //
+                // println!("Tokens in batch: {}", tokens_in_batch);
+                // println!("Num requests to drain: {}", num_requests_to_drain);
+
+                return Some(queue.drain(..num_requests_to_drain).collect());
             }
         }
 
@@ -193,22 +202,6 @@ impl BatchPolicy for ForwardPassPolicy {
     }
 }
 
-/// Manages batching for multiple independent streams of items.
-///
-/// This struct enforces a strict ordering constraint: for any given stream (`S`),
-/// it will only process items for one handler type (`H`) at a time. It will not
-/// start processing items for a new handler type until the pending batch for the
-/// current handler has been dispatched.
-///
-/// This is managed by a state machine using four key data structures:
-/// - `queued`: A temporary holding area for items arriving from each stream.
-/// - `pending`: A set of batch queues, one for each handler type (`H`), where items
-///   are placed after passing the ordering check.
-/// - `active_handlers`: Tracks the handler type (`H`) currently being batched for a
-///   given stream (`S`). This acts as a lock to enforce ordering.
-/// - `handler_to_streams`: Tracks the source stream for each individual item in a `pending`
-///   batch. This is needed to release the correct stream lock in `active_handlers`
-///   after a batch is dispatched.
 #[derive(Debug)]
 pub struct BatchScheduler {
     stream_lock: HashMap<StreamId, Discriminant<Request>>,
@@ -226,10 +219,6 @@ impl BatchScheduler {
             pending: HashMap::new(),
             policy_selector: policy,
         }
-    }
-
-    pub fn has_pending_items(&self) -> bool {
-        !self.queued.is_empty() || self.pending.values().any(|q| !q.is_empty())
     }
 
     pub fn push(&mut self, stream: StreamId, priority: u32, req: Request, now: Instant) {

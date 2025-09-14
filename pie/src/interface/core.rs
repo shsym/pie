@@ -1,5 +1,6 @@
 use crate::instance::InstanceState;
-use crate::interface::pie::inferlet as inferlet;
+use crate::interface::pie::inferlet;
+use crate::interface::pie::inferlet::core::Priority;
 use crate::messaging::{PubSubCommand, PushPullCommand, dispatch_i2i, dispatch_u2i};
 use crate::model::request::{QueryRequest, QueryResponse, Request};
 use crate::model::resource::{ResourceId, ResourceTypeId};
@@ -8,12 +9,12 @@ use crate::{kvs, model, server};
 use anyhow::{Result, bail, format_err};
 use bytes::Bytes;
 use std::mem;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 use wasmtime_wasi::{WasiView, async_trait};
-use crate::interface::pie::inferlet::core::Priority;
 
 // A counter to generate unique stream IDs for new queues
 static NEXT_QUEUE_ID: AtomicU32 = AtomicU32::new(0);
@@ -21,7 +22,7 @@ static NEXT_QUEUE_ID: AtomicU32 = AtomicU32::new(0);
 #[derive(Debug, Clone)]
 pub struct Model {
     pub service_id: usize,
-    pub info: ModelInfo,
+    pub info: Arc<ModelInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -29,9 +30,10 @@ pub struct Blob {
     pub data: Bytes,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Queue {
     pub service_id: usize,
+    pub info: Arc<ModelInfo>,
     pub uid: u32,
     pub priority: u32,
 }
@@ -161,7 +163,10 @@ impl inferlet::core::Host for InstanceState {
             let (tx, rx) = oneshot::channel();
             model::Command::GetInfo { response: tx }.dispatch(service_id)?;
             let info = rx.await?;
-            let model = Model { service_id, info };
+            let model = Model {
+                service_id,
+                info: Arc::new(info),
+            };
             let res = self.ctx().table.push(model)?;
             return Ok(Some(res));
         }
@@ -182,7 +187,7 @@ impl inferlet::core::Host for InstanceState {
             inst_id: self.id(),
             message,
         }
-        .dispatch()?;
+            .dispatch()?;
         Ok(())
     }
 
@@ -207,7 +212,7 @@ impl inferlet::core::Host for InstanceState {
             inst_id: self.id(),
             data,
         }
-        .dispatch()?;
+            .dispatch()?;
         Ok(())
     }
 
@@ -307,7 +312,7 @@ impl inferlet::core::Host for InstanceState {
             count: count as usize,
             response: tx,
         }
-        .dispatch(svc_id)?;
+            .dispatch(svc_id)?;
 
         let phys_ptrs = rx.await?;
         let virt_ptrs = self.map_resources(svc_id, resource_type, &phys_ptrs);
@@ -330,7 +335,7 @@ impl inferlet::core::Host for InstanceState {
             type_id: resource_type,
             ptrs,
         }
-        .dispatch(svc_id)?;
+            .dispatch(svc_id)?;
 
         Ok(())
     }
@@ -346,7 +351,7 @@ impl inferlet::core::Host for InstanceState {
             type_id: resource_type,
             response: tx,
         }
-        .dispatch(q.service_id)?;
+            .dispatch(q.service_id)?;
 
         // convert list of phys ptrs -> size
         let c = rx
@@ -379,7 +384,7 @@ impl inferlet::core::Host for InstanceState {
             ptrs,
             name,
         }
-        .dispatch(svc_id)?;
+            .dispatch(svc_id)?;
 
         Ok(())
     }
@@ -397,7 +402,7 @@ impl inferlet::core::Host for InstanceState {
             type_id: resource_type,
             name,
         }
-        .dispatch(svc_id)?;
+            .dispatch(svc_id)?;
 
         Ok(())
     }
@@ -419,7 +424,7 @@ impl inferlet::core::Host for InstanceState {
             name,
             response: tx,
         }
-        .dispatch(svc_id)?;
+            .dispatch(svc_id)?;
 
         let phys_ptrs = rx.await?;
         let virt_ptrs = self.map_resources(svc_id, resource_type, &phys_ptrs);
@@ -465,6 +470,7 @@ impl inferlet::core::HostModel for InstanceState {
         let model = self.ctx().table.get(&this)?;
         let queue = Queue {
             service_id: model.service_id,
+            info: model.info.clone(),
             uid: NEXT_QUEUE_ID.fetch_add(1, Ordering::SeqCst),
             priority: 0,
         };

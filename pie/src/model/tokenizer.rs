@@ -98,6 +98,7 @@ impl std::error::Error for DecodeError {}
 
 #[derive(Clone, Debug)]
 pub struct BytePairEncoder {
+    num_vocab: usize,
     encoder: HashMap<Vec<u8>, Rank>,
     special_tokens_encoder: HashMap<String, Rank>,
     decoder: HashMap<Rank, Vec<u8>>,
@@ -108,6 +109,10 @@ pub struct BytePairEncoder {
 }
 
 impl BytePairEncoder {
+    pub fn num_vocab(&self) -> usize {
+        self.num_vocab
+    }
+
     pub fn decode(&self, tokens: &[Rank]) -> Result<String, DecodeError> {
         // First, decode raw bytes from the tokens.
         let decoded_bytes = self.decode_bytes(tokens).map_err(|err| DecodeError {
@@ -200,6 +205,7 @@ impl BytePairEncoder {
     }
 
     pub(crate) fn new(
+        num_vocab: usize,
         decoder: HashMap<Rank, Vec<u8>>,
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
@@ -232,6 +238,7 @@ impl BytePairEncoder {
         // Clone because I don't know how to tell Rust I'm not going to change the map
 
         Self {
+            num_vocab,
             encoder,
             special_tokens_encoder,
             decoder,
@@ -324,9 +331,9 @@ pub fn load_merge_rules(path: &str) -> Result<HashMap<Rank, Vec<u8>>, Box<dyn st
 /// remapped to the BMP starting at U+0100.
 fn build_tables() -> ([char; 256], HashMap<char, u8>) {
     // Step 1: collect the “safe” byte values we keep unchanged
-    let mut bs: Vec<u8> = (b'!'..=b'~').collect();                    // 0x21–0x7E
-    bs.extend(0xA1..=0xAC);                                          // 0xA1–0xAC
-    bs.extend(0xAE..=0xFF);                                          // 0xAE–0xFF
+    let mut bs: Vec<u8> = (b'!'..=b'~').collect(); // 0x21–0x7E
+    bs.extend(0xA1..=0xAC); // 0xA1–0xAC
+    bs.extend(0xAE..=0xFF); // 0xAE–0xFF
 
     // cs will hold the *Unicode code points* corresponding to bs
     let mut cs: Vec<u32> = bs.iter().map(|&b| b as u32).collect();
@@ -336,7 +343,7 @@ fn build_tables() -> ([char; 256], HashMap<char, u8>) {
     for b in 0u8..=255 {
         if !bs.contains(&b) {
             bs.push(b);
-            cs.push(256 + n);    // U+0100, U+0101, …
+            cs.push(256 + n); // U+0100, U+0101, …
             n += 1;
         }
     }

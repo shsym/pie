@@ -1,6 +1,8 @@
 use inferlet::interface::Adapter;
 use inferlet::wstd::time::Duration;
-use inferlet::{self, Args, Blob, Result, get_auto_model, store_exists, interface::Evolve};
+use inferlet::{
+    self, Args, Blob, Result, get_auto_model, interface::Evolve, store_exists, store_set,
+};
 
 #[inferlet::main]
 async fn main(mut args: Args) -> Result<()> {
@@ -13,12 +15,12 @@ async fn main(mut args: Args) -> Result<()> {
     let upload: Option<String> = args.opt_value_from_str("--upload")?;
 
     // --- 2. Initialization and Adapter Creation ---
-    println!("🔧 Initializing model and queue...");
     let model = get_auto_model();
     let queue = model.create_queue();
 
     let adapter_id = if !store_exists(&name) {
         let adapter_id = queue.allocate_adapter();
+        println!("🔧 Initializing adapter...");
 
         // Create the Evolution Strategies adapter with the specified hyperparameters.
         queue.initialize_adapter(
@@ -31,8 +33,12 @@ async fn main(mut args: Args) -> Result<()> {
         );
 
         queue.export_adapter(adapter_id, &name);
+        store_set(&name, "true");
+
         adapter_id
     } else {
+        println!("🔧 Existing adapter found. Importing adapter...");
+
         queue.import_adapter(&name)
     };
 

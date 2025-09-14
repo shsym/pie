@@ -34,8 +34,8 @@ pub enum Request {
 impl Request {
     pub fn is_eager(&self) -> bool {
         match self {
-            Request::ForwardPass(_, _) => true,
-            _ => false,
+            Request::ForwardPass(_, _) => false,
+            _ => true,
         }
     }
 
@@ -129,8 +129,9 @@ pub struct HandshakeResponse {
     pub prompt_template_type: String,
     pub prompt_stop_tokens: Vec<String>,
     pub kv_page_size: u32,
-    pub max_batch_tokens: u32,
+    pub max_batch_tokens: usize,
     pub resources: HashMap<u32, u32>,
+    pub tokenizer_num_vocab: usize,
     pub tokenizer_merge_table: HashMap<u32, Vec<u8>>,
     pub tokenizer_special_tokens: HashMap<String, u32>,
     pub tokenizer_split_regex: String,

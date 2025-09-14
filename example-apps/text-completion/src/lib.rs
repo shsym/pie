@@ -1,12 +1,12 @@
-use inferlet::stop_condition::{StopCondition, ends_with_any, max_len};
 use inferlet::interface::Tokenize;
+use inferlet::stop_condition::{StopCondition, ends_with_any, max_len};
 use inferlet::{Args, Result, Sampler};
 use std::time::Instant;
 
 #[inferlet::main]
 async fn main(mut args: Args) -> Result<String> {
     let prompt: String = args.value_from_str(["-p", "--prompt"])?;
-    let max_num_outputs: usize = args.value_from_str(["-n", "--max-tokens"])?;
+    let max_num_outputs: usize = args.value_from_str(["-n", "--max-tokens"]).unwrap_or(256);
 
     let start = Instant::now();
 
