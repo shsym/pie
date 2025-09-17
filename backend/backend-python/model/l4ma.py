@@ -10,6 +10,18 @@ from adapter import AdapterSubpass
 
 from config.l4ma import L4maArch
 
+# Import debug framework checkpoint decorator
+try:
+    from debug_framework.decorators.checkpoint_decorator import checkpoint_validation
+    CHECKPOINT_DECORATOR_AVAILABLE = True
+except ImportError:
+    CHECKPOINT_DECORATOR_AVAILABLE = False
+    # Fallback no-op decorator
+    def checkpoint_validation(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
 VERSION = "0.1.0"
 
 
@@ -75,6 +87,14 @@ class L4maMlp(nn.Module):
         )
         self.act_fn = nn.SiLU()
 
+    @checkpoint_validation(
+        checkpoint_name="l4ma_mlp_forward",
+        capture_tensors=True,
+        include_metadata=True,
+        tolerance=1e-5,
+        backend_comparison=None,
+        performance_monitoring=True
+    )
     def forward(self, x):
         """TODO: Add method docstring."""
         gate_up_proj_out = self.gate_up_proj(x)
@@ -116,6 +136,14 @@ class L4maAttention(nn.Module):
             dtype=config.dtype,
         )
 
+    @checkpoint_validation(
+        checkpoint_name="l4ma_attention_forward",
+        capture_tensors=True,
+        include_metadata=True,
+        tolerance=1e-5,
+        backend_comparison=None,
+        performance_monitoring=True
+    )
     def forward(
         self,
         wrapper,
@@ -212,6 +240,14 @@ class L4maDecoderLayer(nn.Module):
             dtype=config.dtype,
         )
 
+    @checkpoint_validation(
+        checkpoint_name="l4ma_decoder_layer_forward",
+        capture_tensors=True,
+        include_metadata=True,
+        tolerance=1e-5,
+        backend_comparison=None,
+        performance_monitoring=True
+    )
     def forward(
         self,
         wrapper,
@@ -295,6 +331,14 @@ class L4maModel(nn.Module):
             self.workspace_buffer, "NHD"
         )
 
+    @checkpoint_validation(
+        checkpoint_name="l4ma_model_forward",
+        capture_tensors=True,
+        include_metadata=True,
+        tolerance=1e-5,
+        backend_comparison=None,
+        performance_monitoring=True
+    )
     def forward(
         self,
         # input

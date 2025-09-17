@@ -15,7 +15,6 @@ class Tokenizer:
     """Struct for tokenizer configuration."""
 
     type: str
-    num_vocab:int
     merge_table: dict[int, bytes]
     split_regex: str
     special_tokens: dict[str, int]
@@ -86,6 +85,12 @@ class ModelInfo:
                 from .qwen3 import Qwen3Arch  # pylint: disable=import-outside-toplevel
 
                 arch = Qwen3Arch.from_config(cfg)
+            case "gptoss":
+                from .gptoss import (  # pylint: disable=import-outside-toplevel
+                    GPTOSSArch,
+                )
+
+                arch = GPTOSSArch.from_config(cfg)
             case _:
                 raise ValueError(f"Unsupported architecture type: {arch_dict['type']}")
 
@@ -198,13 +203,9 @@ class ModelConfig:
     def get_tokenizer(self) -> Tokenizer:
         """Get the tokenizer from the configuration."""
         tokenizer_data = self.get_required_key(self.root, "tokenizer")
-        architecture_data = self.get_required_key(self.root, "architecture")
 
         def get_required_tokenizer_key(key: str):
             return self.get_required_key(tokenizer_data, key)
-
-        def get_required_architecture_key(key: str):
-            return self.get_required_key(architecture_data, key)
 
         vocab_file_name = get_required_tokenizer_key("vocabulary_file")
         model_name = self.get_required_key(self.root, "name")
@@ -224,7 +225,6 @@ class ModelConfig:
 
         return Tokenizer(
             type=get_required_tokenizer_key("type"),
-            num_vocab=get_required_architecture_key("vocab_size"),
             merge_table=merge_rules,
             split_regex=get_required_tokenizer_key("split_regex"),
             special_tokens=special_tokens,

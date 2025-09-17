@@ -21,9 +21,7 @@ class HandshakeResponse(msgspec.Struct, gc=False):
     prompt_template_type: str
     prompt_stop_tokens: list[str]
     kv_page_size: int
-    max_batch_tokens: int
     resources: dict[int, int]  # Use built-in list and tuple
-    tokenizer_num_vocab: int
     tokenizer_merge_table: dict[int, bytes]
     tokenizer_special_tokens: dict[str, int]
     tokenizer_split_regex: str
@@ -36,14 +34,6 @@ class QueryRequest(msgspec.Struct, gc=False):
 
 class QueryResponse(msgspec.Struct, gc=False):
     value: str
-
-
-class HeartbeatRequest(msgspec.Struct, gc=False):
-    pass
-
-
-class HeartbeatResponse(msgspec.Struct, gc=False):
-    pass
 
 
 class ForwardPassRequest(msgspec.Struct, gc=False):
@@ -87,18 +77,3 @@ class UpdateAdapterRequest(msgspec.Struct, gc=False):
     scores: list[float]
     seeds: list[int]
     max_sigma: float
-
-
-class UploadAdapterRequest(msgspec.Struct, gc=False):
-    adapter_ptr: int
-    name: str
-    adapter_data: list[int]
-
-
-class DownloadAdapterRequest(msgspec.Struct, gc=False):
-    adapter_ptr: int
-    name: str
-
-
-class DownloadAdapterResponse(msgspec.Struct, gc=False):
-    adapter_data: list[int]

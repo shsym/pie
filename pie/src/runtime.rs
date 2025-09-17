@@ -1,7 +1,6 @@
 use crate::instance::{InstanceId, InstanceState};
-use crate::model::request::QueryResponse;
 use crate::service::{Service, ServiceError};
-use crate::{interface, model, server, service};
+use crate::{bindings, model, server, service};
 use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
@@ -117,7 +116,7 @@ pub enum Command {
 
     DebugQuery {
         query: String,
-        event: oneshot::Sender<QueryResponse>,
+        event: oneshot::Sender<Bytes>,
     },
 }
 
@@ -232,50 +231,53 @@ impl Service for Runtime {
                 event.send(VERSION.to_string()).unwrap();
             }
 
-            Command::DebugQuery { query, event } => {
-                let res = match query.as_str() {
-                    "ping" => {
-                        format!("pong")
-                    }
-                    "get_instance_count" => {
-                        format!("{}", self.running_instances.len())
-                    }
-                    "get_server_instance_count" => {
-                        format!("{}", self.running_server_instances.len())
-                    }
-                    // Add the new queries here
-                    "list_running_instances" => {
-                        let instances: Vec<String> = self
-                            .running_instances
-                            .iter()
-                            .map(|item| {
-                                format!(
-                                    "Instance ID: {}, Program Hash: {}",
-                                    item.key(),
-                                    item.value().hash
-                                )
-                            })
-                            .collect();
+            Command::DebugQuery { query, event } => match query.as_str() {
+                "ping" => {
+                    event.send("pong".into()).unwrap();
+                }
+                "get_instance_count" => {
+                    let count = self.running_instances.len();
+                    event.send(count.to_string().into()).unwrap();
+                }
+                "get_server_instance_count" => {
+                    let count = self.running_server_instances.len();
+                    event.send(count.to_string().into()).unwrap();
+                }
+                // Add the new queries here
+                "list_running_instances" => {
+                    let instances: Vec<String> = self
+                        .running_instances
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "Instance ID: {}, Program Hash: {}",
+                                item.key(),
+                                item.value().hash
+                            )
+                        })
+                        .collect();
+                    event.send(instances.join("\n").into()).unwrap();
+                }
+                "list_in_memory_programs" => {
+                    let keys: Vec<String> = self
+                        .programs_in_memory
+                        .iter()
+                        .map(|item| item.key().clone())
+                        .collect();
+                    event.send(keys.join("\n").into()).unwrap();
+                }
+                "get_cache_dir" => {
+                    event
+                        .send(self.cache_dir.to_string_lossy().to_string().into())
+                        .unwrap();
+                }
 
-                        format!("{}", instances.join("\n"))
-                    }
-                    "list_in_memory_programs" => {
-                        let keys: Vec<String> = self
-                            .programs_in_memory
-                            .iter()
-                            .map(|item| item.key().clone())
-                            .collect();
-
-                        format!("{}", keys.join("\n"))
-                    }
-
-                    _ => {
-                        format!("Unknown query: {}", query)
-                    }
-                };
-
-                event.send(QueryResponse { value: res }).unwrap();
-            }
+                _ => {
+                    event
+                        .send(format!("Unknown query: {}", query).into())
+                        .unwrap();
+                }
+            },
         }
     }
 }
@@ -290,7 +292,7 @@ impl Runtime {
 
         // TODO: Adjust settings later: https://docs.wasmtime.dev/api/wasmtime/struct.PoolingAllocationConfig.html
 
-        //config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
+        config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
 
         let engine = Engine::new(&config).unwrap();
 
@@ -304,7 +306,7 @@ impl Runtime {
             .map_err(|e| RuntimeError::Other(format!("Failed to link WASI: {e}")))
             .unwrap();
 
-        interface::add_to_linker(&mut linker).unwrap();
+        bindings::add_to_linker(&mut linker).unwrap();
 
         let cache_dir = cache_dir.as_ref().join("programs");
         // Ensure the cache directory exists
@@ -587,7 +589,8 @@ impl Runtime {
 
             // Attempt to call “run”
             let (_, run_export) = instance
-                .get_export(&mut store, None, "pie:inferlet/run")
+                .get_export(&mut store, None, "pie:nbi/run")
+                .or_else(|| instance.get_export(&mut store, None, "pie:inferlet/run"))
                 .ok_or_else(|| RuntimeError::Other("No 'run' function found".into()))?;
 
             let (_, run_func_export) = instance
@@ -600,9 +603,8 @@ impl Runtime {
 
             return match run_func.call_async(&mut store, ()).await {
                 Ok((Ok(()),)) => {
-                    let return_value = store.data().return_value();
                     //println!("Instance {instance_id} finished normally");
-                    Ok(return_value)
+                    Ok(())
                 }
                 Ok((Err(runtime_err),)) => {
                     //eprintln!("Instance {instance_id} returned an error");
@@ -616,26 +618,23 @@ impl Runtime {
         }
         .await;
 
-        match result {
-            Ok(return_value) => {
-                server::Command::DetachInstance {
-                    inst_id: instance_id.clone(),
-                    termination_code: 0,
-                    message: return_value.unwrap_or("".to_string()),
-                }
-                .dispatch()
-                .ok();
+        if let Err(err) = result {
+            println!("Instance {instance_id} failed: {err}");
+            server::Command::DetachInstance {
+                inst_id: instance_id.clone(),
+                termination_code: 2,
+                message: err.to_string(),
             }
-            Err(err) => {
-                println!("Instance {instance_id} failed: {err}");
-                server::Command::DetachInstance {
-                    inst_id: instance_id.clone(),
-                    termination_code: 2,
-                    message: err.to_string(),
-                }
-                .dispatch()
-                .ok();
+            .dispatch()
+            .ok();
+        } else {
+            server::Command::DetachInstance {
+                inst_id: instance_id.clone(),
+                termination_code: 0,
+                message: "instance normally finished".to_string(),
             }
+            .dispatch()
+            .ok();
         }
 
         // force cleanup of the remaining resources

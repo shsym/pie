@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{ItemFn, parse_macro_input};
+use syn::{parse_macro_input, ItemFn};
 
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -31,36 +31,11 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl inferlet::RunSync for __PieMain {
             fn run() -> Result<(), String> {
-                let args = inferlet::Args::from_vec(
-                    inferlet::get_arguments()
-                        .into_iter()
-                        .map(std::ffi::OsString::from)
-                        .collect(),
-                );
-
-                let result = inferlet::wstd::runtime::block_on(async { #inner_fn_name(args).await });
-
-                match result {
-                    Ok(r) => {
-                        // This block contains the new logic.
-                        use std::any::Any;
-                        let r_any: &dyn Any = &r;
-                        let output = if let Some(s) = r_any.downcast_ref::<String>() {
-                            s.clone()
-                        } else if let Some(s) = r_any.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else {
-                            // Fallback for all other types
-                            format!("{:?}", r)
-                        };
-
-                        inferlet::set_return(&output);
-                        Ok(())
-                    },
-                    Err(e) => {
-                        Err(format!("{:?}", e))
-                    }
+                let result = inferlet::wstd::runtime::block_on(async { #inner_fn_name().await });
+                if let Err(e) = result {
+                    return Err(format!("{:?}", e));
                 }
+                Ok(())
             }
         }
 
@@ -69,6 +44,9 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     expanded.into()
 }
+
+
+
 #[proc_macro_attribute]
 pub fn server_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the input tokens into a syntax tree
@@ -82,8 +60,8 @@ pub fn server_main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             input_fn.sig.ident,
             "The #[inferlet::server_main] attribute can only be used on async functions",
         )
-        .to_compile_error()
-        .into();
+            .to_compile_error()
+            .into();
     }
 
     // Rename the user's function so that we can call it from our generated code.
