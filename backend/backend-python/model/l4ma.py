@@ -87,6 +87,18 @@ class L4maMlp(nn.Module):
         )
         self.act_fn = nn.SiLU()
 
+    def forward(self, x):
+        # Gate/Up projection for Metal GEMM kernel comparison
+        gate_up_proj_out = self._gate_up_projection(x)
+        gate_proj, up_proj = gate_up_proj_out.chunk(2, dim=-1)
+
+        # SiLU activation for Metal activation kernel comparison
+        interim = self._silu_activation(gate_proj, up_proj)
+
+        # Down projection for Metal GEMM kernel comparison
+        down_proj = self._down_projection(interim)
+        return down_proj
+
     @checkpoint_validation(
         checkpoint_name="l4ma_mlp_forward",
         capture_tensors=True,
@@ -95,15 +107,33 @@ class L4maMlp(nn.Module):
         backend_comparison=None,
         performance_monitoring=True
     )
-    def forward(self, x):
-        """TODO: Add method docstring."""
-        gate_up_proj_out = self.gate_up_proj(x)
-        gate_proj, up_proj = gate_up_proj_out.chunk(2, dim=-1)
+    def _gate_up_projection(self, x):
+        """Gate/Up projection for Metal GEMM kernel comparison."""
+        return self.gate_up_proj(x)
 
-        interim = self.act_fn(gate_proj) * up_proj
+    @checkpoint_validation(
+        checkpoint_name="l4ma_mlp_activation",
+        capture_tensors=True,
+        include_metadata=True,
+        tolerance=1e-5,
+        backend_comparison=None,
+        performance_monitoring=True
+    )
+    def _silu_activation(self, gate_proj, up_proj):
+        """SiLU activation for Metal activation kernel comparison."""
+        return self.act_fn(gate_proj) * up_proj
 
-        down_proj = self.down_proj(interim)
-        return down_proj
+    @checkpoint_validation(
+        checkpoint_name="l4ma_mlp_down_proj",
+        capture_tensors=True,
+        include_metadata=True,
+        tolerance=1e-5,
+        backend_comparison=None,
+        performance_monitoring=True
+    )
+    def _down_projection(self, interim):
+        """Down projection for Metal GEMM kernel comparison."""
+        return self.down_proj(interim)
 
 
 class L4maAttention(nn.Module):
@@ -136,14 +166,6 @@ class L4maAttention(nn.Module):
             dtype=config.dtype,
         )
 
-    @checkpoint_validation(
-        checkpoint_name="l4ma_attention_forward",
-        capture_tensors=True,
-        include_metadata=True,
-        tolerance=1e-5,
-        backend_comparison=None,
-        performance_monitoring=True
-    )
     def forward(
         self,
         wrapper,
@@ -209,12 +231,29 @@ class L4maAttention(nn.Module):
             kv_layout="NHD",
         )
 
-        attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
-        attn_output = attn_output.reshape(n, -1)
+        # Execute attention computation and capture for Metal backend comparison
+        attn_output = self._attention_computation(wrapper, query_states, kv_cache_at_layer)
 
         attn_output = self.o_proj(attn_output)
 
         return attn_output
+
+    @checkpoint_validation(
+        checkpoint_name="l4ma_attention_forward",
+        capture_tensors=True,
+        include_metadata=True,
+        tolerance=1e-5,
+        backend_comparison=None,
+        performance_monitoring=True
+    )
+    def _attention_computation(
+        self,
+        wrapper,
+        query_states: torch.Tensor,
+        kv_cache_at_layer: torch.Tensor
+    ) -> torch.Tensor:
+        attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
+        return attn_output.reshape(attn_output.size(0), -1)
 
 
 class L4maDecoderLayer(nn.Module):
@@ -264,7 +303,8 @@ class L4maDecoderLayer(nn.Module):
         """TODO: Add method docstring."""
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        # Input normalization for Metal RMSNorm kernel comparison
+        hidden_states = self._input_normalization(hidden_states)
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -284,13 +324,38 @@ class L4maDecoderLayer(nn.Module):
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Post-attention normalization for Metal RMSNorm kernel comparison
+        hidden_states = self._post_attention_normalization(hidden_states)
 
         hidden_states = self.mlp(hidden_states)
 
         hidden_states = residual + hidden_states
 
         return hidden_states
+
+    @checkpoint_validation(
+        checkpoint_name="l4ma_input_norm",
+        capture_tensors=True,
+        include_metadata=True,
+        tolerance=1e-5,
+        backend_comparison=None,
+        performance_monitoring=True
+    )
+    def _input_normalization(self, hidden_states):
+        """Input RMSNorm for Metal normalization kernel comparison."""
+        return self.input_layernorm(hidden_states)
+
+    @checkpoint_validation(
+        checkpoint_name="l4ma_post_attention_norm",
+        capture_tensors=True,
+        include_metadata=True,
+        tolerance=1e-5,
+        backend_comparison=None,
+        performance_monitoring=True
+    )
+    def _post_attention_normalization(self, hidden_states):
+        """Post-attention RMSNorm for Metal normalization kernel comparison."""
+        return self.post_attention_layernorm(hidden_states)
 
 
 class L4maModel(nn.Module):

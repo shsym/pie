@@ -96,7 +96,7 @@ def initialize_framework(config: Optional[Dict[str, Any]] = None) -> bool:
         try:
             db_manager = DatabaseManager(str(db_path))
             # Verify database is working
-            db_manager.get_connection()
+            db_manager._get_connection()
         except Exception as e:
             raise DebugFrameworkError(f"Database initialization failed: {e}")
 
