@@ -145,21 +145,22 @@ class TensorValidationCriticalTest:
             # Continue anyway - we'll handle this in the test
 
     def _tensor_capture_callback(self, checkpoint_name: str, tensor_data: Any, metadata: Dict[str, Any]):
-        """Callback to capture tensor data during inference."""
+        """Callback to capture tensor data during inference, including input tensors."""
         with self.capture_lock:
             if not self.recording_active:
                 return
 
-            # Store captured tensor information
+            # Store captured tensor information for output tensor
             capture_info = {
                 'checkpoint_name': checkpoint_name,
                 'tensor_data': tensor_data,
                 'metadata': metadata,
                 'timestamp': time.perf_counter(),
-                'memory_hash': None  # Will compute for validation
+                'memory_hash': None,  # Will compute for validation
+                'tensor_type': 'output'  # Mark as output tensor
             }
 
-            # Compute memory hash for later validation
+            # Compute memory hash for output tensor
             if hasattr(tensor_data, 'numpy'):
                 # PyTorch tensor
                 numpy_data = tensor_data.detach().cpu().numpy()
@@ -184,8 +185,29 @@ class TensorValidationCriticalTest:
                         capture_info['tensor_key'] = key
                         break
 
+            # Capture output tensor if we got valid data
             if capture_info['memory_hash']:
                 self.captured_tensors.append(capture_info)
+
+            # Capture input tensors if available
+            if 'captured_inputs' in metadata:
+                for input_name, input_tensor_data in metadata['captured_inputs'].items():
+                    input_capture_info = {
+                        'checkpoint_name': f"{checkpoint_name}_input_{input_name}",
+                        'tensor_data': input_tensor_data,
+                        'metadata': metadata,
+                        'timestamp': time.perf_counter(),
+                        'memory_hash': None,
+                        'tensor_type': 'input',
+                        'input_name': input_name,
+                        'parent_checkpoint': checkpoint_name
+                    }
+
+                    # Input tensors are already numpy arrays from our decorator
+                    if isinstance(input_tensor_data, np.ndarray):
+                        input_capture_info['memory_hash'] = hashlib.sha256(input_tensor_data.tobytes()).hexdigest()
+                        input_capture_info['numpy_data'] = input_tensor_data.copy()
+                        self.captured_tensors.append(input_capture_info)
 
     def capture_real_tensors(self) -> bool:
         """Capture real tensor data during inference to test with."""

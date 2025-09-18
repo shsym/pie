@@ -244,7 +244,11 @@ class L4maAttention(nn.Module):
         include_metadata=True,
         tolerance=1e-5,
         backend_comparison=None,
-        performance_monitoring=True
+        performance_monitoring=True,
+        capture_inputs={
+            'query_states': 'query_states',
+            'kv_cache_at_layer': 'kv_cache_at_layer'
+        }
     )
     def _attention_computation(
         self,
@@ -252,6 +256,10 @@ class L4maAttention(nn.Module):
         query_states: torch.Tensor,
         kv_cache_at_layer: torch.Tensor
     ) -> torch.Tensor:
+        # Capture input tensors for Metal kernel verification
+        # Query states are directly passed
+        # Key/Value states need to be extracted from the KV cache
+
         attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
         return attn_output.reshape(attn_output.size(0), -1)
 

@@ -67,7 +67,8 @@ def checkpoint_validation(
     include_metadata: bool = True,
     tolerance: float = 1e-5,
     backend_comparison: Optional[str] = None,
-    performance_monitoring: bool = False
+    performance_monitoring: bool = False,
+    capture_inputs: Optional[Dict[str, Any]] = None
 ) -> Callable:
     """
     Decorator for L4MA model validation checkpoints.
@@ -82,6 +83,7 @@ def checkpoint_validation(
         tolerance: Numerical tolerance for tensor comparisons
         backend_comparison: Backend to compare against ('metal', 'pytorch', None)
         performance_monitoring: Whether to collect performance statistics
+        capture_inputs: Dictionary specifying input tensors to capture (e.g., {'query': 'query_states', 'kv_cache': 'kv_cache_at_layer'})
 
     Returns:
         Decorated function with validation checkpoint
@@ -126,7 +128,9 @@ def checkpoint_validation(
                         validation_callback=validation_callback,
                         include_metadata=include_metadata,
                         tolerance=tolerance,
-                        backend_comparison=backend_comparison
+                        backend_comparison=backend_comparison,
+                        capture_inputs=capture_inputs,
+                        func=func
                     )
 
                 return result
@@ -159,6 +163,57 @@ def checkpoint_validation(
     return decorator
 
 
+def _capture_input_tensors(capture_inputs: Dict[str, Any], args: tuple, kwargs: dict, func: Callable) -> Dict[str, Any]:
+    """
+    Extract specified input tensors from function arguments.
+
+    Args:
+        capture_inputs: Dictionary mapping output names to parameter names
+        args: Function positional arguments
+        kwargs: Function keyword arguments
+        func: The decorated function for signature inspection
+
+    Returns:
+        Dictionary of captured tensor data
+    """
+    import inspect
+    captured = {}
+
+    try:
+        # Get function signature to map positional args to parameter names
+        sig = inspect.signature(func)
+        param_names = list(sig.parameters.keys())
+
+        # Create mapping of parameter names to values
+        all_params = {}
+
+        # Map positional arguments (skip 'self' if present)
+        start_idx = 1 if param_names and param_names[0] == 'self' else 0
+        for i, arg_value in enumerate(args[start_idx:], start=start_idx):
+            if i < len(param_names):
+                all_params[param_names[i]] = arg_value
+
+        # Add keyword arguments
+        all_params.update(kwargs)
+
+        # Extract specified tensors
+        for output_name, param_name in capture_inputs.items():
+            if param_name in all_params:
+                tensor_data = _extract_tensor_data(all_params[param_name])
+                if tensor_data is not None:
+                    captured[output_name] = tensor_data
+
+    except Exception:
+        # Fallback: try direct parameter matching if inspection fails
+        for output_name, param_name in capture_inputs.items():
+            if param_name in kwargs:
+                tensor_data = _extract_tensor_data(kwargs[param_name])
+                if tensor_data is not None:
+                    captured[output_name] = tensor_data
+
+    return captured
+
+
 def _perform_validation_capture(
     checkpoint_name: str,
     result: Any,
@@ -167,7 +222,9 @@ def _perform_validation_capture(
     validation_callback: Callable,
     include_metadata: bool,
     tolerance: float,
-    backend_comparison: Optional[str]
+    backend_comparison: Optional[str],
+    capture_inputs: Optional[Dict[str, Any]] = None,
+    func: Optional[Callable] = None
 ) -> None:
     """
     Perform tensor validation and capture with optimized performance.
@@ -194,6 +251,12 @@ def _perform_validation_capture(
                 'tolerance': tolerance,
                 'backend_comparison': backend_comparison
             }
+
+            # Add input capture specification to metadata for validation callback to use
+            if capture_inputs and func:
+                metadata['capture_inputs_spec'] = capture_inputs
+                # Extract and capture specified input tensors
+                metadata['captured_inputs'] = _capture_input_tensors(capture_inputs, args, kwargs, func)
 
         # Call validation callback asynchronously for performance
         validation_callback(checkpoint_name, tensor_data, metadata)
