@@ -199,16 +199,18 @@ def _capture_input_tensors(capture_inputs: Dict[str, Any], args: tuple, kwargs: 
         # Extract specified tensors
         for output_name, param_name in capture_inputs.items():
             if param_name in all_params:
-                tensor_data = _extract_tensor_data(all_params[param_name])
-                if tensor_data is not None:
+                extraction_result = _extract_tensor_data(all_params[param_name])
+                if extraction_result is not None:
+                    tensor_data, original_dtype = extraction_result
                     captured[output_name] = tensor_data
 
     except Exception:
         # Fallback: try direct parameter matching if inspection fails
         for output_name, param_name in capture_inputs.items():
             if param_name in kwargs:
-                tensor_data = _extract_tensor_data(kwargs[param_name])
-                if tensor_data is not None:
+                extraction_result = _extract_tensor_data(kwargs[param_name])
+                if extraction_result is not None:
+                    tensor_data, original_dtype = extraction_result
                     captured[output_name] = tensor_data
 
     return captured
@@ -234,10 +236,12 @@ def _perform_validation_capture(
     """
     try:
         # Convert result to numpy for consistent processing
-        tensor_data = _extract_tensor_data(result)
+        extraction_result = _extract_tensor_data(result)
 
-        if tensor_data is None:
+        if extraction_result is None:
             return
+
+        tensor_data, original_dtype = extraction_result
 
         # Build metadata only if requested
         metadata = {}
@@ -245,7 +249,7 @@ def _perform_validation_capture(
             metadata = {
                 'checkpoint_name': checkpoint_name,
                 'tensor_shape': tensor_data.shape,
-                'tensor_dtype': str(tensor_data.dtype),
+                'tensor_dtype': original_dtype,  # Use original dtype, not converted dtype
                 'timestamp': time.perf_counter(),
                 'thread_id': threading.get_ident(),
                 'tolerance': tolerance,
@@ -267,18 +271,21 @@ def _perform_validation_capture(
         pass
 
 
-def _extract_tensor_data(result: Any) -> Optional[np.ndarray]:
+def _extract_tensor_data(result: Any) -> Optional[tuple]:
     """
     Extract tensor data from various result types with minimal overhead.
 
     Supports PyTorch tensors, numpy arrays, and tuples containing tensors.
+
+    Returns:
+        Tuple of (numpy_array, original_dtype_str) or None
     """
     if result is None:
         return None
 
     # Handle numpy arrays directly
     if isinstance(result, np.ndarray):
-        return result
+        return (result, str(result.dtype))
 
     # Handle PyTorch tensors
     if hasattr(result, 'detach') and hasattr(result, 'cpu'):
@@ -286,21 +293,24 @@ def _extract_tensor_data(result: Any) -> Optional[np.ndarray]:
             # Detach and move to CPU first
             tensor_cpu = result.detach().cpu()
 
-            # Handle bfloat16 which is not supported by numpy directly
-            if 'bfloat16' in str(tensor_cpu.dtype):
-                # print(f"DEBUG: Converting bfloat16 to float32 for numpy compatibility")
-                # Import torch locally to avoid import issues
+            # Handle bfloat16 - preserve exact bits by storing as raw bytes
+            original_dtype_str = str(tensor_cpu.dtype)
+            if 'bfloat16' in original_dtype_str:
                 import torch
-                tensor_cpu = tensor_cpu.to(torch.float32)
+                # Store the exact bfloat16 bits as uint16 (bfloat16 is 16-bit format)
+                # This preserves the exact bit representation without any precision loss
+                raw_data = tensor_cpu.view(torch.uint16).numpy()
+                # Store as uint16 to preserve exact bits - metadata will indicate bfloat16
+                return (raw_data, original_dtype_str)
 
             if hasattr(tensor_cpu, 'numpy'):
                 numpy_result = tensor_cpu.numpy()
                 # print(f"DEBUG: Converted to numpy: shape={numpy_result.shape}, dtype={numpy_result.dtype}")
-                return numpy_result
+                return (numpy_result, original_dtype_str)
             else:
                 numpy_result = np.array(tensor_cpu)
                 # print(f"DEBUG: Converted via np.array: shape={numpy_result.shape}, dtype={numpy_result.dtype}")
-                return numpy_result
+                return (numpy_result, original_dtype_str)
         except Exception as e:
             # print(f"DEBUG: Failed to convert PyTorch tensor to numpy: {e}")
             return None
