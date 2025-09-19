@@ -19,7 +19,7 @@ from websockets.sync.client import connect
 
 from config.common import ModelInfo
 from handler import Handler
-from model.l4ma import L4maForCausalLM, create_fusion_map as create_l4ma_fusion_map
+from model_factory import create_model_and_fusion_map
 from message import (
     EmbedImageRequest,
     ForwardPassRequest,
@@ -28,7 +28,6 @@ from message import (
     QueryRequest,
     UpdateAdapterRequest,
 )
-from model.qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 
 
 def main(
@@ -102,12 +101,12 @@ def load_model(config: dict):
     model_info = ModelInfo.load_from_file(str(metadata_path), model_device, model_dtype)
 
     # Instantiate model and create fusion map based on architecture
-    if model_info.architecture.type.lower() == "qwen3":
-        model = Qwen3ForCausalLM(model_info.architecture)
-        fusion_map = create_qwen3_fusion_map(model)
-    else:
-        model = L4maForCausalLM(model_info.architecture)
-        fusion_map = create_l4ma_fusion_map(model)
+    try:
+        model, fusion_map = create_model_and_fusion_map(model_info)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Failed to instantiate model for architecture {model_info.architecture.type}: {exc}"
+        ) from exc
 
     # Create a reverse map for quick lookup of fusion targets
     source_to_fusion_target = {

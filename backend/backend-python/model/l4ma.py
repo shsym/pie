@@ -1,14 +1,19 @@
-"""Llama-Like Large Language Model Architecture (L4MA)"""
+"""Llama-Like Large Language Model Architecture (L4MA).
+
+This module now focuses on the architecture itself and relies on an injected
+runtime backend for kernel-specific behaviour (e.g. FlashInfer or Metal).
+"""
 
 from __future__ import annotations
+
+from typing import Sequence
 
 import torch
 from torch import nn
 
-import flashinfer as ops
 from adapter import AdapterSubpass
-
 from config.l4ma import L4maArch
+from .l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
 
 # Import debug framework checkpoint decorator
 try:
@@ -16,10 +21,11 @@ try:
     CHECKPOINT_DECORATOR_AVAILABLE = True
 except ImportError:
     CHECKPOINT_DECORATOR_AVAILABLE = False
-    # Fallback no-op decorator
-    def checkpoint_validation(*args, **kwargs):
+
+    def checkpoint_validation(*args, **kwargs):  # type: ignore[override]
         def decorator(func):
             return func
+
         return decorator
 
 VERSION = "0.1.0"
@@ -32,6 +38,7 @@ def create_fusion_map(model: nn.Module):
     Returns:
         A dictionary mapping {fused_tensor_name: {"sources": [source_names], "dim": cat_dim}}.
     """
+
     fusion_map = {}
     for name, module in model.named_modules():
         # --- Rule for L4maAttention QKV Fusion ---
@@ -65,10 +72,9 @@ def create_fusion_map(model: nn.Module):
 
 
 class L4maMlp(nn.Module):
-    """TODO: Add class docstring."""
+    """Feed-forward network block used in each decoder layer."""
 
     def __init__(self, config: L4maArch):
-        """TODO: Add method docstring."""
         super().__init__()
         self.config = config
         self.gate_up_proj = nn.Linear(
@@ -88,14 +94,11 @@ class L4maMlp(nn.Module):
         self.act_fn = nn.SiLU()
 
     def forward(self, x):
-        # Gate/Up projection for Metal GEMM kernel comparison
         gate_up_proj_out = self._gate_up_projection(x)
         gate_proj, up_proj = gate_up_proj_out.chunk(2, dim=-1)
 
-        # SiLU activation for Metal activation kernel comparison
         interim = self._silu_activation(gate_proj, up_proj)
 
-        # Down projection for Metal GEMM kernel comparison
         down_proj = self._down_projection(interim)
         return down_proj
 
@@ -105,7 +108,7 @@ class L4maMlp(nn.Module):
         include_metadata=True,
         tolerance=1e-5,
         backend_comparison=None,
-        performance_monitoring=True
+        performance_monitoring=True,
     )
     def _gate_up_projection(self, x):
         """Gate/Up projection for Metal GEMM kernel comparison."""
@@ -117,7 +120,7 @@ class L4maMlp(nn.Module):
         include_metadata=True,
         tolerance=1e-5,
         backend_comparison=None,
-        performance_monitoring=True
+        performance_monitoring=True,
     )
     def _silu_activation(self, gate_proj, up_proj):
         """SiLU activation for Metal activation kernel comparison."""
@@ -129,7 +132,7 @@ class L4maMlp(nn.Module):
         include_metadata=True,
         tolerance=1e-5,
         backend_comparison=None,
-        performance_monitoring=True
+        performance_monitoring=True,
     )
     def _down_projection(self, interim):
         """Down projection for Metal GEMM kernel comparison."""
@@ -137,10 +140,9 @@ class L4maMlp(nn.Module):
 
 
 class L4maAttention(nn.Module):
-    """TODO: Add class docstring."""
+    """Multi-head attention block for the decoder."""
 
     def __init__(self, config: L4maArch, layer_idx: int):
-        """TODO: Add method docstring."""
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -168,18 +170,13 @@ class L4maAttention(nn.Module):
 
     def forward(
         self,
-        wrapper,
+        runtime: L4maForwardContext,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_cache_at_layer: torch.Tensor,
-        kv_page_indices: torch.Tensor,
-        kv_page_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        batch_indices: torch.Tensor,
-        batch_positions: torch.Tensor,
+        kv_cache_at_layer: Sequence[torch.Tensor],
         adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
-        """TODO: Add method docstring."""
+        """Attention forward pass that delegates runtime specifics."""
 
         n, _ = hidden_states.size()
 
@@ -198,7 +195,7 @@ class L4maAttention(nn.Module):
                 v_state=value_states,
             )
 
-        # Reshape and continue as before
+        # Reshape for multi-head attention
         query_states = query_states.view(
             n, self.config.num_query_heads, self.config.head_size
         )
@@ -209,66 +206,33 @@ class L4maAttention(nn.Module):
             n, self.config.num_key_value_heads, self.config.head_size
         )
 
-        # print(position_ids)
-        ops.apply_llama31_rope_pos_ids_inplace(
-            q=query_states, k=key_states, pos_ids=position_ids
-        )
+        runtime.apply_rope(query_states, key_states, position_ids)
 
-        # Ensure query_states matches the configured dtype for FlashInfer plan
         if query_states.dtype != self.config.dtype:
-            print("warn: query dtype does not match config dtype!")
             query_states = query_states.to(self.config.dtype)
 
-        ops.append_paged_kv_cache(
-            append_key=key_states,
-            append_value=value_states,
-            batch_indices=batch_indices,
-            positions=batch_positions,
-            paged_kv_cache=kv_cache_at_layer[self.layer_idx],
-            kv_indices=kv_page_indices,
-            kv_indptr=kv_page_indptr,
-            kv_last_page_len=kv_last_page_lens,
-            kv_layout="NHD",
+        runtime.append_kv_cache(
+            layer_idx=self.layer_idx,
+            key_states=key_states,
+            value_states=value_states,
+            kv_cache_layer=kv_cache_at_layer[self.layer_idx],
         )
 
-        # Execute attention computation and capture for Metal backend comparison
-        attn_output = self._attention_computation(wrapper, query_states, kv_cache_at_layer)
+        attn_output = runtime.run_attention(
+            layer_idx=self.layer_idx,
+            query_states=query_states,
+            kv_cache_layer=kv_cache_at_layer[self.layer_idx],
+        )
 
         attn_output = self.o_proj(attn_output)
 
         return attn_output
 
-    @checkpoint_validation(
-        checkpoint_name="l4ma_attention_forward",
-        capture_tensors=True,
-        include_metadata=True,
-        tolerance=1e-5,
-        backend_comparison=None,
-        performance_monitoring=True,
-        capture_inputs={
-            'query_states': 'query_states',
-            'kv_cache_at_layer': 'kv_cache_at_layer'
-        }
-    )
-    def _attention_computation(
-        self,
-        wrapper,
-        query_states: torch.Tensor,
-        kv_cache_at_layer: torch.Tensor
-    ) -> torch.Tensor:
-        # Capture input tensors for Metal kernel verification
-        # Query states are directly passed
-        # Key/Value states need to be extracted from the KV cache
-
-        attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
-        return attn_output.reshape(attn_output.size(0), -1)
-
 
 class L4maDecoderLayer(nn.Module):
-    """TODO: Add class docstring."""
+    """Single decoder layer consisting of attention + MLP."""
 
     def __init__(self, config: L4maArch, layer_idx: int):
-        """TODO: Add method docstring."""
         super().__init__()
 
         self.self_attn = L4maAttention(config, layer_idx)
@@ -293,46 +257,33 @@ class L4maDecoderLayer(nn.Module):
         include_metadata=True,
         tolerance=1e-5,
         backend_comparison=None,
-        performance_monitoring=True
+        performance_monitoring=True,
     )
     def forward(
         self,
-        wrapper,
+        runtime: L4maForwardContext,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        kv_cache_at_layer: torch.Tensor,
-        kv_page_indices: torch.Tensor,
-        kv_page_indptr: torch.Tensor,
-        kv_last_page_lens: torch.Tensor,
-        batch_indices: torch.Tensor,
-        batch_positions: torch.Tensor,
+        kv_cache_at_layer: Sequence[torch.Tensor],
         adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
-        """TODO: Add method docstring."""
+        """Run the decoder layer using the provided runtime context."""
+
         residual = hidden_states
 
-        # Input normalization for Metal RMSNorm kernel comparison
         hidden_states = self._input_normalization(hidden_states)
 
-        # Self Attention
         hidden_states = self.self_attn(
-            wrapper=wrapper,
+            runtime=runtime,
             hidden_states=hidden_states,
             position_ids=position_ids,
             kv_cache_at_layer=kv_cache_at_layer,
-            kv_page_indices=kv_page_indices,
-            kv_page_indptr=kv_page_indptr,
-            kv_last_page_lens=kv_last_page_lens,
-            batch_indices=batch_indices,
-            batch_positions=batch_positions,
             adapter_subpass=adapter_subpass,
         )
 
         hidden_states = residual + hidden_states
 
-        # Fully Connected
         residual = hidden_states
-        # Post-attention normalization for Metal RMSNorm kernel comparison
         hidden_states = self._post_attention_normalization(hidden_states)
 
         hidden_states = self.mlp(hidden_states)
@@ -347,7 +298,7 @@ class L4maDecoderLayer(nn.Module):
         include_metadata=True,
         tolerance=1e-5,
         backend_comparison=None,
-        performance_monitoring=True
+        performance_monitoring=True,
     )
     def _input_normalization(self, hidden_states):
         """Input RMSNorm for Metal normalization kernel comparison."""
@@ -359,7 +310,7 @@ class L4maDecoderLayer(nn.Module):
         include_metadata=True,
         tolerance=1e-5,
         backend_comparison=None,
-        performance_monitoring=True
+        performance_monitoring=True,
     )
     def _post_attention_normalization(self, hidden_states):
         """Post-attention RMSNorm for Metal normalization kernel comparison."""
@@ -367,12 +318,12 @@ class L4maDecoderLayer(nn.Module):
 
 
 class L4maModel(nn.Module):
-    """TODO: Add class docstring."""
+    """Backbone model for the L4MA architecture."""
 
-    def __init__(self, config: L4maArch):
-        """TODO: Add method docstring."""
+    def __init__(self, config: L4maArch, backend: L4maBackend):
         super().__init__()
         self.config = config
+        self.backend = backend
 
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
@@ -394,23 +345,13 @@ class L4maModel(nn.Module):
             dtype=config.dtype,
         )
 
-        self.workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=config.device
-        )
-        self.wrapper_decode = ops.BatchDecodeWithPagedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
-        )
-        self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
-        )
-
     @checkpoint_validation(
         checkpoint_name="l4ma_model_forward",
         capture_tensors=True,
         include_metadata=True,
         tolerance=1e-5,
         backend_comparison=None,
-        performance_monitoring=True
+        performance_monitoring=True,
     )
     def forward(
         self,
@@ -419,72 +360,45 @@ class L4maModel(nn.Module):
         position_ids: torch.Tensor,
         qo_indptr: torch.Tensor,
         # kv cache
-        kv_cache_at_layer: list[torch.Tensor],
+        kv_cache_at_layer: Sequence[torch.Tensor],
         kv_page_indices: torch.Tensor,
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
         # mask
-        custom_mask: torch.Tensor,
+        custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
         # subpasses
         adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
-        """TODO: Add method docstring."""
+        """Forward pass through all decoder layers using the injected backend."""
+
         hidden_states = input_embeds
         n, _ = hidden_states.size()
 
-        page_size = kv_cache_at_layer[0].shape[2]
-
-        batch_indices, batch_positions = ops.get_batch_indices_positions(
-            append_indptr=qo_indptr,
-            seq_lens=ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size),
-            nnz=n,
+        runtime_inputs = RuntimeInputs(
+            num_tokens=n,
+            kv_cache_at_layer=kv_cache_at_layer,
+            kv_page_indices=kv_page_indices,
+            kv_page_indptr=kv_page_indptr,
+            kv_last_page_lens=kv_last_page_lens,
+            qo_indptr=qo_indptr,
+            custom_mask=custom_mask,
+            single_token_inference_mode=single_token_inference_mode,
         )
 
-        # check if its decoding (qo_indptr is )
-        if single_token_inference_mode:
-            self.wrapper_decode.plan(
-                indptr=kv_page_indptr,
-                indices=kv_page_indices,
-                last_page_len=kv_last_page_lens,
-                num_qo_heads=self.config.num_query_heads,
-                num_kv_heads=self.config.num_key_value_heads,
-                head_dim=self.config.head_size,
-                page_size=page_size,
-                pos_encoding_mode="NONE",
-                q_data_type=self.config.dtype,
-            )
-            wrapper = self.wrapper_decode
-        else:
-            self.wrapper_append.plan(
-                qo_indptr=qo_indptr,
-                paged_kv_indptr=kv_page_indptr,
-                paged_kv_indices=kv_page_indices,
-                paged_kv_last_page_len=kv_last_page_lens,
-                num_qo_heads=self.config.num_query_heads,
-                num_kv_heads=self.config.num_key_value_heads,
-                head_dim_qk=self.config.head_size,
-                page_size=page_size,
-                custom_mask=custom_mask,
-                q_data_type=self.config.dtype,
-            )
-            wrapper = self.wrapper_append
+        runtime = self.backend.create_forward_context(
+            config=self.config,
+            inputs=runtime_inputs,
+        )
 
         for decoder_layer in self.layers:
-            layer_outputs = decoder_layer(
-                wrapper=wrapper,
+            hidden_states = decoder_layer(
+                runtime=runtime,
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 kv_cache_at_layer=kv_cache_at_layer,
-                kv_page_indices=kv_page_indices,
-                kv_page_indptr=kv_page_indptr,
-                kv_last_page_lens=kv_last_page_lens,
-                batch_indices=batch_indices,
-                batch_positions=batch_positions,
                 adapter_subpass=adapter_subpass,
             )
-
-            hidden_states = layer_outputs
 
         hidden_states = self.norm(hidden_states)
 
@@ -492,13 +406,12 @@ class L4maModel(nn.Module):
 
 
 class L4maForCausalLM(nn.Module):
-    """TODO: Add class docstring."""
+    """Top-level causal language model wrapper for L4MA architecture."""
 
-    def __init__(self, config: L4maArch):
-        """TODO: Add method docstring."""
+    def __init__(self, config: L4maArch, backend: L4maBackend):
         super().__init__()
         self.config = config
-        self.model = L4maModel(config)
+        self.model = L4maModel(config, backend)
         self.lm_head = nn.Linear(
             config.hidden_size,
             config.vocab_size,
@@ -507,9 +420,17 @@ class L4maForCausalLM(nn.Module):
             dtype=config.dtype,
         )
 
-    def forward(self):
-        """
-        Should not be called. Method 'forward' is abstract in class
-        'torch.nn.modules.module' so must be overridden in child class.
-        """
+    def forward(self):  # pragma: no cover - interface parity placeholder
+        """The handler uses dedicated methods rather than Module.forward."""
         raise NotImplementedError("Should not be called")
+
+
+__all__ = [
+    "L4maForCausalLM",
+    "L4maModel",
+    "L4maDecoderLayer",
+    "L4maAttention",
+    "L4maMlp",
+    "create_fusion_map",
+    "VERSION",
+]

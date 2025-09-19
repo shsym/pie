@@ -30,6 +30,9 @@ from handler import Handler, ForwardPassBatch
 import message
 from config.common import ModelInfo
 from model.l4ma import L4maForCausalLM
+from model.l4ma_runtime import FlashInferL4maBackend
+
+FLASHINFER_AVAILABLE = FlashInferL4maBackend.is_available()
 
 # Try to import debug framework integration
 try:
@@ -84,7 +87,12 @@ class BackendReuseIntegrationTest:
             self.model_info = ModelInfo.load_from_file(str(metadata_path), device, dtype)
 
             # Create L4MA model using the configuration
-            model = L4maForCausalLM(self.model_info.architecture)
+            if not FLASHINFER_AVAILABLE:
+                print("FlashInfer backend unavailable; skipping handler reuse test.")
+                return False
+
+            backend = FlashInferL4maBackend()
+            model = L4maForCausalLM(self.model_info.architecture, backend=backend)
 
             # Load weights using production approach (ztensor)
             model_path = metadata_path.parent / "llama-3.2-1b-instruct" / "llama-3.2-1b-instruct.zt"

@@ -94,15 +94,24 @@ public:
                 throw std::runtime_error(errorMsg);
             }
 
-            // Get input data
+            // Get input data and preserve shape
             auto buf = input.request();
             size_t num_elements = buf.size;
             size_t buffer_size = num_elements * sizeof(float);
 
-            // Softmax kernel expects 2D input [batch_size, vocab_size]
-            // For 1D input, treat as single batch
-            uint32_t batch_size = 1;
-            uint32_t vocab_size = static_cast<uint32_t>(num_elements);
+            // Handle different input shapes while preserving them
+            uint32_t batch_size, vocab_size;
+            if (buf.ndim == 2) {
+                batch_size = static_cast<uint32_t>(buf.shape[0]);
+                vocab_size = static_cast<uint32_t>(buf.shape[1]);
+            } else if (buf.ndim == 1) {
+                // For 1D input, treat as single batch
+                batch_size = 1;
+                vocab_size = static_cast<uint32_t>(num_elements);
+            } else {
+                throw std::runtime_error("Softmax supports 1D and 2D tensors only");
+            }
+
             float temperature = 1.0f;
 
             // Create Metal buffers
@@ -145,8 +154,8 @@ public:
             [commandBuffer commit];
             [commandBuffer waitUntilCompleted];
 
-            // Create output array
-            auto result = py::array_t<float>(num_elements);
+            // Create output array with same shape as input (shape preservation)
+            auto result = py::array_t<float>(buf.shape, buf.strides);
             auto result_buf = result.request();
             memcpy(result_buf.ptr, [outputBuffer contents], buffer_size);
 
@@ -160,8 +169,237 @@ public:
         }
     }
 
+    py::array_t<float> execute_attention_with_kv_cache(
+        py::array_t<float> query, py::array_t<float> kv_cache,
+        py::array_t<int> kv_page_indices, py::array_t<int> kv_page_indptr, py::array_t<int> kv_last_page_lens,
+        int num_query_heads = 32, int num_kv_heads = 32, int head_size = 128, int page_size = 16) {
+        @autoreleasepool {
+            // Use the actual paged attention kernel with real L4MA KV cache layout
+            NSString *kernelName = @"batch_prefill_attention_unified_f32_simdgroup_kernel";
+            id<MTLFunction> kernelFunction = [library newFunctionWithName:kernelName];
+
+            // TODO: We need to use bf16 if the input is bf16 - for now we assume f32
+            if (!kernelFunction) {
+                // Try half precision version if f32 not found
+                kernelName = @"batch_prefill_attention_unified_bf16_simdgroup_kernel";
+                kernelFunction = [library newFunctionWithName:kernelName];
+            }
+
+            if (!kernelFunction) {
+                throw std::runtime_error("Production attention kernel not found");
+            }
+
+            // Convert inputs to proper format and validate
+            py::array_t<float> q_f32 = validate_and_convert_to_float32(query, "query");
+            py::array_t<float> kv_f32 = validate_and_convert_to_float32(kv_cache, "kv_cache");
+
+            auto q_buf = q_f32.request();
+            auto kv_buf = kv_f32.request();
+            auto kv_indices_buf = kv_page_indices.request();
+            auto kv_indptr_buf = kv_page_indptr.request();
+            auto kv_lens_buf = kv_last_page_lens.request();
+
+            // Validate query shape - expect [batch*seq, num_heads, head_size] or [batch*seq, num_heads * head_size]
+            if (q_buf.ndim < 2 || q_buf.ndim > 3) {
+                throw std::runtime_error("Query must be 2D or 3D tensor");
+            }
+
+            size_t batch_seq_len = q_buf.shape[0];
+            size_t query_dim = (q_buf.ndim == 3) ? q_buf.shape[1] * q_buf.shape[2] : q_buf.shape[1];
+
+            // Infer attention configuration from actual tensor shapes to avoid metadata mismatches
+            py::ssize_t inferred_page_size = kv_buf.shape[2];
+            py::ssize_t inferred_num_kv_heads = kv_buf.shape[3];
+            py::ssize_t inferred_head_size = kv_buf.shape[4];
+
+            if (inferred_head_size <= 0 || inferred_num_kv_heads <= 0 || inferred_page_size <= 0) {
+                throw std::runtime_error("Invalid KV cache shape detected when inferring attention parameters");
+            }
+
+            if (query_dim % static_cast<size_t>(inferred_head_size) != 0) {
+                throw std::runtime_error("Query dimensions are not divisible by inferred head size");
+            }
+
+            int inferred_num_query_heads = static_cast<int>(query_dim / static_cast<size_t>(inferred_head_size));
+
+            num_query_heads = inferred_num_query_heads;
+            num_kv_heads = static_cast<int>(inferred_num_kv_heads);
+            head_size = static_cast<int>(inferred_head_size);
+            page_size = static_cast<int>(inferred_page_size);
+
+            // Create parameter structure matching the Metal kernel
+            struct Params {
+                int num_qo;
+                int head_dim;
+                int kv_head_dim;
+                int head_size;
+                int page_size;
+                int num_query_heads;
+                int num_kv_heads;
+                float scale;
+            };
+
+            Params params = {
+                .num_qo = static_cast<int>(batch_seq_len),
+                .head_dim = static_cast<int>(query_dim),
+                .kv_head_dim = num_kv_heads * head_size,
+                .head_size = head_size,
+                .page_size = page_size,
+                .num_query_heads = num_query_heads,
+                .num_kv_heads = num_kv_heads,
+                .scale = 1.0f / sqrtf(static_cast<float>(head_size))
+            };
+
+            // Create compute pipeline state
+            NSError *error = nil;
+            id<MTLComputePipelineState> pipelineState = [device newComputePipelineStateWithFunction:kernelFunction error:&error];
+            if (!pipelineState) {
+                throw std::runtime_error("Failed to create attention pipeline state");
+            }
+
+            // Create output tensor with same shape as query
+            auto result = py::array_t<float>({static_cast<py::ssize_t>(batch_seq_len), static_cast<py::ssize_t>(query_dim)});
+            auto result_buf = result.request();
+
+            // Create Metal buffers using actual L4MA data layout
+            size_t query_size = batch_seq_len * query_dim * sizeof(float);
+            id<MTLBuffer> qBuffer = [device newBufferWithBytes:q_buf.ptr length:query_size options:MTLResourceStorageModeShared];
+            id<MTLBuffer> outputBuffer = [device newBufferWithLength:query_size options:MTLResourceStorageModeShared];
+            id<MTLBuffer> paramsBuffer = [device newBufferWithBytes:&params length:sizeof(Params) options:MTLResourceStorageModeShared];
+
+            // Split captured KV cache tensors into distinct K and V buffers
+            if (kv_buf.ndim != 5 || kv_buf.shape[1] != 2) {
+                throw std::runtime_error("KV cache tensor must have shape [num_pages, 2, page_size, num_kv_heads, head_size]");
+            }
+
+            py::ssize_t num_pages = kv_buf.shape[0];
+            py::ssize_t elements_per_page = kv_buf.shape[2] * kv_buf.shape[3] * kv_buf.shape[4];
+
+            size_t kv_elements_per_cache = static_cast<size_t>(num_pages) *
+                                            static_cast<size_t>(elements_per_page);
+            size_t single_cache_size = kv_elements_per_cache * sizeof(float);
+
+            const float* kv_data = static_cast<const float*>(kv_buf.ptr);
+
+            id<MTLBuffer> kCacheBuffer = [device newBufferWithLength:single_cache_size options:MTLResourceStorageModeShared];
+            id<MTLBuffer> vCacheBuffer = [device newBufferWithLength:single_cache_size options:MTLResourceStorageModeShared];
+
+            if (!qBuffer || !kCacheBuffer || !vCacheBuffer || !outputBuffer || !paramsBuffer) {
+                if (qBuffer) [qBuffer release];
+                if (kCacheBuffer) [kCacheBuffer release];
+                if (vCacheBuffer) [vCacheBuffer release];
+                if (outputBuffer) [outputBuffer release];
+                if (paramsBuffer) [paramsBuffer release];
+                [pipelineState release];
+                [kernelFunction release];
+                throw std::runtime_error("Failed to create Metal buffers for KV cache attention");
+            }
+
+            float* k_dest = static_cast<float*>([kCacheBuffer contents]);
+            float* v_dest = static_cast<float*>([vCacheBuffer contents]);
+
+            if (!k_dest || !v_dest) {
+                [qBuffer release];
+                [kCacheBuffer release];
+                [vCacheBuffer release];
+                [outputBuffer release];
+                [paramsBuffer release];
+                [pipelineState release];
+                [kernelFunction release];
+                throw std::runtime_error("Failed to map Metal buffers for KV cache attention");
+            }
+
+            size_t page_stride = static_cast<size_t>(elements_per_page);
+            size_t interleaved_stride = page_stride * 2;  // account for combined K/V dimension
+            for (py::ssize_t page = 0; page < num_pages; ++page) {
+                const float* page_base = kv_data + static_cast<size_t>(page) * interleaved_stride;
+                memcpy(k_dest + static_cast<size_t>(page) * page_stride, page_base, page_stride * sizeof(float));
+                memcpy(v_dest + static_cast<size_t>(page) * page_stride, page_base + page_stride, page_stride * sizeof(float));
+            }
+
+            // Use actual L4MA page indices
+            id<MTLBuffer> kvPageIndicesBuffer = [device newBufferWithBytes:kv_indices_buf.ptr
+                                                                    length:kv_indices_buf.size * sizeof(int)
+                                                                   options:MTLResourceStorageModeShared];
+            id<MTLBuffer> kvPageIndptrBuffer = [device newBufferWithBytes:kv_indptr_buf.ptr
+                                                                   length:kv_indptr_buf.size * sizeof(int)
+                                                                  options:MTLResourceStorageModeShared];
+            id<MTLBuffer> kvLastPageLensBuffer = [device newBufferWithBytes:kv_lens_buf.ptr
+                                                                     length:kv_lens_buf.size * sizeof(int)
+                                                                    options:MTLResourceStorageModeShared];
+
+            // Create QO indptr (simple case for debug framework)
+            std::vector<int> qo_indptr = {0, static_cast<int>(batch_seq_len)};
+            id<MTLBuffer> qoIndptrBuffer = [device newBufferWithBytes:qo_indptr.data()
+                                                               length:qo_indptr.size() * sizeof(int)
+                                                              options:MTLResourceStorageModeShared];
+
+            // Execute the kernel with actual L4MA layout
+            id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+            id<MTLBuffer> debugBuffer = [device newBufferWithLength:100 * sizeof(float) options:MTLResourceStorageModeShared];
+
+            [encoder setComputePipelineState:pipelineState];
+            [encoder setBuffer:qBuffer offset:0 atIndex:0];           // q_input
+            [encoder setBuffer:kCacheBuffer offset:0 atIndex:1];      // paged_k_cache
+            [encoder setBuffer:vCacheBuffer offset:0 atIndex:2];      // paged_v_cache
+            [encoder setBuffer:qoIndptrBuffer offset:0 atIndex:3];    // qo_indptr
+            [encoder setBuffer:kvPageIndptrBuffer offset:0 atIndex:4]; // kv_page_indptr
+            [encoder setBuffer:kvPageIndicesBuffer offset:0 atIndex:5]; // kv_page_indices
+            [encoder setBuffer:kvLastPageLensBuffer offset:0 atIndex:6]; // kv_last_page_lens
+            [encoder setBuffer:outputBuffer offset:0 atIndex:7];      // output
+            [encoder setBuffer:paramsBuffer offset:0 atIndex:8];      // params
+            [encoder setBuffer:debugBuffer offset:0 atIndex:9];       // debug_out
+
+            // Dispatch the kernel
+            MTLSize threadsPerThreadgroup = MTLSizeMake(128, 1, 1);  // TGP_SIZE from metal_attention_common.metal
+            MTLSize threadgroupsPerGrid = MTLSizeMake(batch_seq_len, 1, 1);
+            [encoder dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+
+            [encoder endEncoding];
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted];
+
+            // Copy result back
+            memcpy(result_buf.ptr, [outputBuffer contents], query_size);
+
+            // Debug: capture kernel metadata for investigation
+            if (debugBuffer) {
+                float* debug_ptr = static_cast<float*>([debugBuffer contents]);
+                if (debug_ptr != nullptr) {
+                    py::print("[MetalAttentionDebug] scale=", debug_ptr[0],
+                              " head_dim=", debug_ptr[1],
+                              " page_size=", debug_ptr[2],
+                              " num_qo=", debug_ptr[3],
+                              " total_kv_len=", debug_ptr[4],
+                              " last_page_len=", debug_ptr[6]);
+                }
+            }
+
+            // Cleanup
+            [qBuffer release];
+            [kCacheBuffer release];
+            [vCacheBuffer release];
+            [outputBuffer release];
+            [paramsBuffer release];
+            [qoIndptrBuffer release];
+            [kvPageIndptrBuffer release];
+            [kvPageIndicesBuffer release];
+            [kvLastPageLensBuffer release];
+            if (debugBuffer) {
+                [debugBuffer release];
+            }
+            [pipelineState release];
+            [kernelFunction release];
+
+            return result;
+        }
+    }
+
     py::array_t<float> execute_attention(
-        py::array_t<float> q, py::array_t<float> k, py::array_t<float> v) {
+        py::array_t<float> q, py::array_t<float> k, py::array_t<float> v,
+        int num_query_heads = 32, int num_kv_heads = 32, int head_size = 128, int page_size = 16) {
         @autoreleasepool {
             // Use production paged attention kernel
             NSString *kernelName = @"batch_prefill_attention_unified_f32_simdgroup_kernel";
@@ -194,11 +432,12 @@ public:
             size_t batch_seq_len = q_buf.shape[0];
             size_t hidden_dim = q_buf.shape[1];
 
-            // Set default parameters for debug testing
-            int num_query_heads = 2;
-            int num_kv_heads = 2;
-            int head_size = hidden_dim / num_query_heads;  // Infer head size from dimensions
-            int page_size = 16;
+            // Use passed parameters from model metadata
+            // Validate that head_size matches the tensor dimensions
+            if (hidden_dim != num_query_heads * head_size) {
+                // Try to infer head_size if mismatch (for debug framework compatibility)
+                head_size = hidden_dim / num_query_heads;
+            }
 
             // For debug framework, simulate paged attention with simple batched attention
             // In production, this would use proper page tables and KV cache
@@ -334,18 +573,10 @@ public:
             id<MTLFunction> gemmFunction = [library newFunctionWithName:gemmKernelName];
 
             if (!siluFunction || !gemmFunction) {
-                // Fallback to simple ReLU for debug framework compatibility
-                auto buf = input.request();
-                auto result = py::array_t<float>(buf.size);
-                auto result_buf = result.request();
-
-                const float* input_ptr = static_cast<const float*>(buf.ptr);
-                float* output_ptr = static_cast<float*>(result_buf.ptr);
-
-                for (size_t i = 0; i < buf.size; ++i) {
-                    output_ptr[i] = std::max(0.0f, input_ptr[i]); // ReLU activation
-                }
-                return result;
+                std::string missing_kernels = "";
+                if (!siluFunction) missing_kernels += "silu_and_mul_float32_kernel ";
+                if (!gemmFunction) missing_kernels += "metal_grouped_gemm_float32 ";
+                throw std::runtime_error("MLP kernels not found: " + missing_kernels + ". Build system may not have compiled kernels properly.");
             }
 
             // Production implementation using Metal MLP kernels
@@ -475,51 +706,7 @@ public:
             id<MTLFunction> kernelFunction = [library newFunctionWithName:kernelName];
 
             if (!kernelFunction) {
-                // Fallback to CPU implementation for debug compatibility
-
-            auto indices_buf = indices.request();
-            auto table_buf = embedding_table.request();
-
-            if (table_buf.ndim != 2) {
-                throw std::runtime_error("Embedding table must be 2D [vocab_size, embed_dim]");
-            }
-
-            uint32_t vocab_size = static_cast<uint32_t>(table_buf.shape[0]);
-            uint32_t embed_dim = static_cast<uint32_t>(table_buf.shape[1]);
-            uint32_t num_indices = static_cast<uint32_t>(indices_buf.size);
-
-            // Create output shape: input_shape + [embed_dim]
-            std::vector<ssize_t> output_shape;
-            for (int i = 0; i < indices_buf.ndim; i++) {
-                output_shape.push_back(indices_buf.shape[i]);
-            }
-            output_shape.push_back(embed_dim);
-
-            auto result = py::array_t<float>(output_shape);
-            auto result_buf = result.request();
-
-            const int32_t* indices_ptr = static_cast<const int32_t*>(indices_buf.ptr);
-            const float* table_ptr = static_cast<const float*>(table_buf.ptr);
-            float* output_ptr = static_cast<float*>(result_buf.ptr);
-
-            // Perform embedding lookup
-            for (uint32_t i = 0; i < num_indices; i++) {
-                int32_t idx = indices_ptr[i];
-
-                // Bounds checking
-                if (idx < 0 || idx >= static_cast<int32_t>(vocab_size)) {
-                    // Zero embedding for out-of-bounds indices
-                    for (uint32_t d = 0; d < embed_dim; d++) {
-                        output_ptr[i * embed_dim + d] = 0.0f;
-                    }
-                } else {
-                    // Copy embedding vector
-                    for (uint32_t d = 0; d < embed_dim; d++) {
-                        output_ptr[i * embed_dim + d] = table_ptr[idx * embed_dim + d];
-                    }
-                }
-            }
-            return result;
+                throw std::runtime_error("Embedding kernel not found: metal_embedding_lookup_float32. Build system may not have compiled kernels properly.");
             }
 
             // Production Metal embedding implementation
@@ -741,6 +928,8 @@ PYBIND11_MODULE(metal_bindings, m) {
              "Execute softmax kernel on input array")
         .def("execute_attention", &MetalKernelExecutor::execute_attention,
              "Execute attention kernel with Q, K, V inputs")
+        .def("execute_attention_with_kv_cache", &MetalKernelExecutor::execute_attention_with_kv_cache,
+             "Execute attention kernel with Q and KV cache in L4MA format")
         .def("execute_mlp", &MetalKernelExecutor::execute_mlp,
              "Execute MLP kernel on input array")
         .def("execute_embedding", &MetalKernelExecutor::execute_embedding,
