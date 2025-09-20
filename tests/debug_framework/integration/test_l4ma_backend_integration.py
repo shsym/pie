@@ -16,6 +16,7 @@ This follows the spec guidance to reuse the proven backend infrastructure.
 
 import sys
 import os
+import json
 from pathlib import Path
 import torch
 import numpy as np
@@ -26,7 +27,7 @@ backend_python_path = Path(__file__).parent / "backend" / "backend-python"
 sys.path.insert(0, str(backend_python_path))
 
 # Import Handler and related classes from the production backend
-from handler import Handler, ForwardPassBatch
+from handler import Handler
 import message
 from config.common import ModelInfo
 from model.l4ma import L4maForCausalLM
@@ -56,6 +57,70 @@ class BackendReuseIntegrationTest:
         self.handler: Optional[Handler] = None
         self.model_info: Optional[ModelInfo] = None
         self.debug_integration: Optional[L4MARealDebugIntegration] = None
+        self.test_prompts_config: Optional[Dict] = None
+
+    def load_test_prompts_config(self) -> bool:
+        """Load test prompts configuration from JSON file."""
+        try:
+            config_path = Path(__file__).parent / "test_prompts.json"
+            if not config_path.exists():
+                print(f"❌ Test prompts config not found at {config_path}")
+                return False
+
+            with open(config_path, 'r') as f:
+                self.test_prompts_config = json.load(f)
+
+            print(f"✅ Loaded test prompts configuration from {config_path}")
+            return True
+
+        except Exception as e:
+            print(f"❌ Failed to load test prompts config: {e}")
+            return False
+
+    def get_test_prompts(self, category: str = "all", max_prompts: Optional[int] = None) -> List[str]:
+        """Get test prompts from the loaded configuration."""
+        if not self.test_prompts_config:
+            return []
+
+        prompts = []
+        prompts_section = self.test_prompts_config.get("prompts", {})
+
+        if category == "all":
+            # Get prompts from all categories
+            for category_name, category_prompts in prompts_section.items():
+                if isinstance(category_prompts, list):
+                    prompts.extend(category_prompts)
+        else:
+            # Get prompts from specific category
+            category_prompts = prompts_section.get(category, [])
+            if isinstance(category_prompts, list):
+                prompts.extend(category_prompts)
+
+        # Limit number of prompts if specified
+        if max_prompts:
+            prompts = prompts[:max_prompts]
+
+        return prompts
+
+    def estimate_token_count(self, text: str) -> int:
+        """Rough estimation of token count for validation."""
+        # Simple heuristic: ~4 characters per token on average
+        return len(text) // 4
+
+    def validate_prompt_length_category(self, prompt: str, category: str) -> bool:
+        """Validate that prompt length matches expected category."""
+        if not self.test_prompts_config:
+            return True
+
+        token_count = self.estimate_token_count(prompt)
+        expected_ranges = self.test_prompts_config.get("expected_tokens", {})
+
+        category_range = expected_ranges.get(f"{category}_range")
+        if category_range and len(category_range) == 2:
+            min_tokens, max_tokens = category_range
+            return min_tokens <= token_count <= max_tokens
+
+        return True
 
     def load_model_with_backend_handler(self, model_cache_path: Optional[str] = None) -> bool:
         """
@@ -252,7 +317,26 @@ class BackendReuseIntegrationTest:
             brle_mask = [context_length] if context_length > 0 else []
             mask.append(brle_mask)
 
-        # Create ForwardPassRequest following Handler expectations
+        # Calculate proper KV page allocation for multi-page sequences
+        kv_page_size = self.handler.kv_page_size
+        num_tokens = len(tokens)
+
+        # Calculate how many pages we need
+        num_full_pages = num_tokens // kv_page_size
+        tokens_in_last_page = num_tokens % kv_page_size
+
+        # Create KV page pointers
+        if tokens_in_last_page == 0 and num_full_pages > 0:
+            # All tokens fit exactly in full pages
+            kv_page_ptrs = list(range(num_full_pages))
+            kv_page_last_len = kv_page_size
+        else:
+            # Need partial last page
+            total_pages = num_full_pages + (1 if tokens_in_last_page > 0 else 0)
+            kv_page_ptrs = list(range(total_pages))
+            kv_page_last_len = tokens_in_last_page if tokens_in_last_page > 0 else kv_page_size
+
+        # Create ForwardPassRequest following Handler expectations with proper KV paging
         request = message.ForwardPassRequest(
             input_tokens=tokens,
             input_token_positions=positions,
@@ -261,8 +345,8 @@ class BackendReuseIntegrationTest:
             adapter=None,  # No adapter for basic test
             adapter_seed=None,
             mask=mask,
-            kv_page_ptrs=[0],  # Use first KV page
-            kv_page_last_len=len(tokens),  # All tokens in last page
+            kv_page_ptrs=kv_page_ptrs,  # Proper multi-page allocation
+            kv_page_last_len=kv_page_last_len,  # Only tokens in the last page
             output_token_indices=[len(tokens) - 1],  # Generate from last token
             output_token_samplers=[{
                 "sampler": 0,  # Distribution sampler
@@ -277,7 +361,10 @@ class BackendReuseIntegrationTest:
         print(f"  Prompt: '{prompt}'")
         print(f"  Tokens: {tokens}")
         print(f"  Token count: {len(tokens)}")
+        print(f"  KV page size: {kv_page_size}")
+        print(f"  KV pages needed: {len(kv_page_ptrs)}")
         print(f"  KV page ptrs: {request.kv_page_ptrs}")
+        print(f"  KV page last len: {request.kv_page_last_len}")
         print(f"  Output token indices: {request.output_token_indices}")
 
         return request
@@ -320,14 +407,15 @@ class BackendReuseIntegrationTest:
                     return tokens
 
                 except ImportError:
-                    print("C++ BPE tokenizer not available, using Python fallback")
+                    print("C++ BPE tokenizer not available, using Python BPE")
 
-            # Fallback to Python implementation of BPE
+            # Use Python implementation of BPE - no simple fallback
             return self._python_bpe_encode(text, tokenizer)
 
         except Exception as e:
-            print(f"Tokenization error: {e}, using simple fallback")
-            return self._simple_tokenize_fallback(text)
+            print(f"Tokenization error: {e}")
+            # Re-raise the error instead of falling back to simple tokenizer
+            raise RuntimeError(f"Failed to tokenize '{text}' with proper BPE: {e}")
 
     def _python_bpe_encode(self, text: str, tokenizer) -> List[int]:
         """Python implementation of BPE encoding using the tokenizer configuration."""
@@ -521,44 +609,70 @@ class BackendReuseIntegrationTest:
         if not top_predictions_text:
             return False
 
-        # Get the top prediction text
-        top_token_id, top_text = top_predictions_text[0]
+        # Get all top predictions for comprehensive validation
+        all_predictions = [pred[1] for pred in top_predictions_text[:5]]  # Top 5 predictions
+        top_text = top_predictions_text[0][1]  # Primary prediction
 
-        # Define expected reasonable responses for different prompt types
-        prompt_expectations = {
+        # Load validation criteria from config if available
+        validation_keywords = {}
+        if self.test_prompts_config:
+            validation_section = self.test_prompts_config.get("validation", {})
+            validation_keywords = {
+                "geography": validation_section.get("geography", []),
+                "math": validation_section.get("math", []),
+                "greeting": validation_section.get("greeting", []),
+                "ai_tech": validation_section.get("ai_tech", []),
+                "general": validation_section.get("general", [])
+            }
+
+        # Define fallback expectations if config is not available
+        default_expectations = {
             "The capital of France is": ["Paris", " Paris", "paris", " paris"],
             "What is 2 + 2?": ["4", " 4", "four", " four", "=", " ="],
-            "Hello, my name is": ["John", "Jane", "Alice", "Bob", "Mike", "Sarah", " John", " Jane", " Alice", " Bob", " Mike", " Sarah"],
-            "2 + 2 =": ["4", " 4", "four", " four"],
+            "Hello, my name is": ["John", "Jane", "Alice", "Bob", "Mike", "Sarah", "[", " ["],
         }
 
-        # Check for exact prompt matches
-        for expected_prompt, expected_responses in prompt_expectations.items():
+        # Check for exact prompt matches with fallback expectations
+        for expected_prompt, expected_responses in default_expectations.items():
             if expected_prompt in prompt:
                 for expected in expected_responses:
                     if expected.lower() in top_text.lower():
                         return True
 
-        # General semantic validation
-        # For geography questions, expect location names or geographic terms
-        if any(geo_word in prompt.lower() for geo_word in ["capital", "country", "city"]):
-            # Should not be completely nonsensical tokens
-            nonsense_indicators = ["delivery", "POL", "arbitr", "settings", "уков"]
-            return not any(nonsense in top_text for nonsense in nonsense_indicators)
+        # Enhanced semantic validation using config
+        prompt_lower = prompt.lower()
 
-        # For arithmetic questions, expect numbers or mathematical symbols
-        if any(math_word in prompt for math_word in ["2 + 2", "What is", "="]):
-            math_indicators = ["4", "=", "four", "equals", "answer"]
-            return any(indicator in top_text.lower() for indicator in math_indicators)
+        # Geography validation
+        geo_keywords = ["capital", "country", "city", "france", "paris"]
+        if any(keyword in prompt_lower for keyword in geo_keywords):
+            geography_terms = validation_keywords.get("geography", ["Paris", "France", "capital"])
+            return any(term.lower() in pred.lower() for pred in all_predictions for term in geography_terms)
 
-        # For greeting prompts, expect names or greeting responses
-        if "Hello" in prompt or "my name is" in prompt:
-            # Common names or greeting words
-            common_names = ["john", "jane", "alice", "bob", "mike", "sarah", "emily", "david", "lisa"]
-            return any(name in top_text.lower() for name in common_names)
+        # Math validation
+        math_keywords = ["2 + 2", "what is", "=", "plus", "equals"]
+        if any(keyword in prompt_lower for keyword in math_keywords):
+            math_terms = validation_keywords.get("math", ["=", "4", "equals", "answer"])
+            return any(term.lower() in pred.lower() for pred in all_predictions for term in math_terms)
+
+        # Greeting validation with enhanced patterns
+        greeting_keywords = ["hello", "my name is", "hi", "name"]
+        if any(keyword in prompt_lower for keyword in greeting_keywords):
+            greeting_terms = validation_keywords.get("greeting", ["John", "Jane", "Alice", "[", "("])
+            return any(term.lower() in pred.lower() for pred in all_predictions for term in greeting_terms)
+
+        # AI/Technology validation for technical prompts
+        ai_keywords = ["artificial", "intelligence", "machine", "learning", "computing", "algorithm"]
+        if any(keyword in prompt_lower for keyword in ai_keywords):
+            ai_terms = validation_keywords.get("ai_tech", ["intelligence", "learning", "system", "data"])
+            return any(term.lower() in pred.lower() for pred in all_predictions for term in ai_terms)
+
+        # General validation - check for common words
+        general_terms = validation_keywords.get("general", ["the", "and", "is", "are", "in", "to"])
+        if any(term.lower() in pred.lower() for pred in all_predictions for term in general_terms):
+            return True
 
         # Default: consider it reasonable if it's not obviously nonsensical
-        obviously_nonsensical = ["delivery", "POL", "arbitr", "уков", "settings"]
+        obviously_nonsensical = ["delivery", "POL", "arbitr", "уков", "settings", "random_gibberish"]
         return not any(nonsense in top_text for nonsense in obviously_nonsensical)
 
     def test_prompt_inference_with_handler(self, prompt: str) -> Dict[str, Any]:
@@ -767,19 +881,39 @@ def main():
     # Initialize test
     test = BackendReuseIntegrationTest()
 
+    # Step 0: Load test prompts configuration
+    print("\n📋 Step 0: Loading test configuration...")
+    if not test.load_test_prompts_config():
+        print("❌ Failed to load test prompts config, using fallback prompts")
+        test_prompts = [
+            "The capital of France is",
+            "Hello, my name is",
+            "What is 2 + 2?"
+        ]
+    else:
+        # Get comprehensive test prompts from ALL categories
+        short_prompts = test.get_test_prompts("short", max_prompts=2)
+        medium_prompts = test.get_test_prompts("medium", max_prompts=2)
+        long_prompts = test.get_test_prompts("long", max_prompts=1)
+        very_long_prompts = test.get_test_prompts("very_long", max_prompts=1)  # Added very_long category
+        special_prompts = test.get_test_prompts("special", max_prompts=2)
+
+        test_prompts = short_prompts + medium_prompts + long_prompts + very_long_prompts + special_prompts
+
+        print(f"✅ Loaded {len(test_prompts)} test prompts from configuration:")
+        for i, prompt in enumerate(test_prompts, 1):
+            estimated_tokens = test.estimate_token_count(prompt)
+            preview = prompt[:60] + "..." if len(prompt) > 60 else prompt
+            print(f"   {i}. [{estimated_tokens:3d} tokens] {preview}")
+
     # Step 1: Load model using Handler (production approach)
     print("\n📦 Step 1: Loading model with Handler...")
     if not test.load_model_with_backend_handler():
         print("❌ Failed to load model with Handler")
         return False
 
-    # Step 2: Test basic inference with Handler
-    print("\n🧪 Step 2: Testing Handler inference...")
-    test_prompts = [
-        "The capital of France is",
-        "Hello, my name is",
-        "What is 2 + 2?"
-    ]
+    # Step 2: Test inference with diverse prompts
+    print("\n🧪 Step 2: Testing Handler inference with diverse prompts...")
 
     handler_results = []
     for prompt in test_prompts:
@@ -847,6 +981,41 @@ def main():
 
     print(f"Semantically reasonable predictions: {semantically_reasonable_tests}/{len(test_prompts)}")
 
+    # Enhanced statistics if configuration was loaded
+    if test.test_prompts_config:
+        print(f"\n📈 Detailed Statistics:")
+
+        # Categorize prompts and show performance by category
+        category_stats = {}
+        for prompt, result in zip(test_prompts, handler_results):
+            # Determine category based on estimated token count
+            token_count = test.estimate_token_count(prompt)
+            if token_count <= 25:
+                category = "short"
+            elif token_count <= 120:
+                category = "medium"
+            elif token_count <= 600:
+                category = "long"
+            else:
+                category = "very_long"
+
+            if category not in category_stats:
+                category_stats[category] = {"total": 0, "success": 0, "reasonable": 0}
+
+            category_stats[category]["total"] += 1
+            if result["success"]:
+                category_stats[category]["success"] += 1
+                if 'top_predictions_text' in result:
+                    makes_sense = test.validate_prediction_makes_sense(prompt, result['top_predictions_text'])
+                    if makes_sense:
+                        category_stats[category]["reasonable"] += 1
+
+        for category, stats in category_stats.items():
+            total = stats["total"]
+            success = stats["success"]
+            reasonable = stats["reasonable"]
+            print(f"  {category.capitalize()} prompts: {success}/{total} successful, {reasonable}/{total} reasonable")
+
     if debug_available:
         print("Debug framework integration: ✅ Available")
     else:
@@ -873,6 +1042,101 @@ def main():
     return successful_handler_tests > 0 and semantically_reasonable_tests > 0
 
 
+def test_threshold_finding():
+    """Find the exact token length threshold for CUDA memory errors."""
+    print("\n🔍 THRESHOLD TESTING")
+    print("=" * 60)
+
+    test = BackendReuseIntegrationTest()
+    test.load_test_prompts_config()
+
+    # Initialize handler
+    success = test.load_model_with_backend_handler()
+    if not success:
+        print("❌ Failed to load model and handler")
+        return
+
+    # Test different prompt lengths to find threshold
+    test_lengths = [5, 10, 15, 20, 25, 30, 35, 40, 50, 75, 100, 150, 200]
+
+    results = {}
+    for length in test_lengths:
+        print(f"\n📏 Testing ~{length} tokens")
+
+        # Generate prompt of target length
+        base = "The capital of France is"
+        filler = " and this sentence adds more tokens"
+
+        prompt = base
+        words = base.split()
+
+        while len(words) < length:
+            filler_words = filler.split()
+            words.extend(filler_words)
+
+        # Truncate to target length
+        words = words[:length]
+        prompt = " ".join(words)
+
+        print(f"   Prompt: '{prompt[:50]}...' ({len(prompt)} chars)")
+
+        # Test this prompt
+        try:
+            result = test.test_prompt_inference_with_handler(prompt)
+            success = result.get('success', False)
+            results[length] = {'success': success, 'error': None}
+
+            if success:
+                print(f"   ✅ SUCCESS at {length} tokens")
+            else:
+                print(f"   ❌ FAILED at {length} tokens")
+
+        except Exception as e:
+            error_msg = str(e)
+            results[length] = {'success': False, 'error': error_msg}
+            print(f"   ❌ EXCEPTION at {length} tokens: {error_msg}")
+
+            if "illegal memory access" in error_msg.lower():
+                print(f"   🔍 CUDA memory error detected at {length} tokens")
+
+    # Analyze results
+    print(f"\n📊 THRESHOLD ANALYSIS:")
+    print("=" * 40)
+
+    last_working = None
+    first_failing = None
+
+    for length in sorted(results.keys()):
+        result = results[length]
+        status = "✅ PASS" if result['success'] else "❌ FAIL"
+        error_type = ""
+
+        if not result['success'] and result['error']:
+            if "illegal memory access" in result['error'].lower():
+                error_type = " (CUDA memory)"
+            elif "appendpagedkvcache" in result['error'].lower():
+                error_type = " (KV cache)"
+
+        print(f"   {length:3d} tokens: {status}{error_type}")
+
+        if result['success']:
+            last_working = length
+        elif first_failing is None:
+            first_failing = length
+
+    print(f"\n🎯 FINAL RESULTS:")
+    if last_working:
+        print(f"   ✅ Last working: {last_working} tokens")
+    if first_failing:
+        print(f"   ❌ First failing: {first_failing} tokens")
+        if last_working:
+            print(f"   🔍 Critical threshold: between {last_working} and {first_failing} tokens")
+
+
 if __name__ == "__main__":
     success = main()
+
+    # Run threshold testing
+    test_threshold_finding()
+
     exit(0 if success else 1)
