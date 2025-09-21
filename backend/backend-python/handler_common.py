@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
@@ -212,7 +213,7 @@ class Handler:
         model_inputs = batch.finalize()
 
         # 3. Run the forward pass through the model.
-        with torch.cuda.device(self.device):
+        with _device_context(self.device):
             output_embeds = self.lm.model.forward(
                 kv_cache_at_layer=self.kv_cache_at_layer, **model_inputs
             )
@@ -221,6 +222,23 @@ class Handler:
             responses = batch.package_responses(output_embeds)
 
         return responses
+
+
+@contextmanager
+def _device_context(device: str):
+    """Context manager that activates the appropriate device when possible."""
+    if not device:
+        yield
+        return
+
+    if device.startswith("cuda") and torch.cuda.is_available():
+        with torch.cuda.device(device):
+            yield
+        return
+
+    # For CPU/MPS/Metal we rely on tensors already being on the target device.
+    with nullcontext():
+        yield
 
 
 def _decode_brle(brle_buffer: list[int]) -> np.ndarray:
