@@ -8,6 +8,7 @@ reusing this shared infrastructure.
 
 from __future__ import annotations
 
+import enum
 import os
 import sys
 import random
@@ -27,14 +28,27 @@ from websockets.sync.client import connect
 
 from config.common import ModelInfo
 from message import (
+    DownloadAdapterRequest,
     EmbedImageRequest,
     ForwardPassRequest,
     HandshakeRequest,
+    HeartbeatRequest,
     InitializeAdapterRequest,
     QueryRequest,
     UpdateAdapterRequest,
+    UploadAdapterRequest,
 )
 
+class HandlerId(enum.Enum):
+    HANDSHAKE = 0
+    HEARTBEAT = 1
+    QUERY = 2
+    FORWARD_PASS = 3
+    EMBED_IMAGE = 4
+    INITIALIZE_ADAPTER = 5
+    UPDATE_ADAPTER = 6
+    UPLOAD_HANDLER = 7
+    DOWNLOAD_HANDLER = 8
 
 @dataclass
 class ServerConfig:
@@ -182,29 +196,56 @@ def register(config: Dict[str, Any], endpoint: str) -> None:
 
             print(f"Registered with controller at {controller_addr}")
 
-    except ConnectionRefusedError:
+    except (ConnectionRefusedError, TimeoutError) as exc:
         print(f"Failed to connect to the controller at {controller_addr}.")
-        print("Please ensure the controller is running and accessible.")
+        print(f"Error: {exc}")
+        print("Please ensure the controller is running and accessible. Terminating.")
+        os._exit(1)
     except Exception as exc:  # pragma: no cover - defensive logging
-        print(f"An error occurred during registration: {exc}")
+        print(f"An unexpected error occurred during registration: {exc}. Terminating.")
+        os._exit(1)
 
 
 def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
-    """Core ZMQ service loop dispatching requests to the handler."""
+    """Core ZMQ service loop dispatching requests to the handler.
+
+    Exits the program if a heartbeat is not received for 60 seconds or if any
+    exception occurs.
+    """
+    # Heartbeat timeout and timer setup (60 seconds for FlashInfer JIT compilation)
+    HEARTBEAT_TIMEOUT = 60  # seconds
+    last_heartbeat_time = time.monotonic()
 
     msgpack_encoder = msgspec.msgpack.Encoder()
     decoders = {
-        0: msgspec.msgpack.Decoder(HandshakeRequest),
-        1: msgspec.msgpack.Decoder(QueryRequest),
-        2: msgspec.msgpack.Decoder(ForwardPassRequest),
-        3: msgspec.msgpack.Decoder(EmbedImageRequest),
-        4: msgspec.msgpack.Decoder(InitializeAdapterRequest),
-        5: msgspec.msgpack.Decoder(UpdateAdapterRequest),
+        HandlerId.HANDSHAKE.value: msgspec.msgpack.Decoder(HandshakeRequest),
+        HandlerId.HEARTBEAT.value: msgspec.msgpack.Decoder(HeartbeatRequest),
+        HandlerId.QUERY.value: msgspec.msgpack.Decoder(QueryRequest),
+        HandlerId.FORWARD_PASS.value: msgspec.msgpack.Decoder(ForwardPassRequest),
+        HandlerId.EMBED_IMAGE.value: msgspec.msgpack.Decoder(EmbedImageRequest),
+        HandlerId.INITIALIZE_ADAPTER.value: msgspec.msgpack.Decoder(InitializeAdapterRequest),
+        HandlerId.UPDATE_ADAPTER.value: msgspec.msgpack.Decoder(UpdateAdapterRequest),
+        HandlerId.UPLOAD_HANDLER.value: msgspec.msgpack.Decoder(UploadAdapterRequest),
+        HandlerId.DOWNLOAD_HANDLER.value: msgspec.msgpack.Decoder(DownloadAdapterRequest),
     }
 
-    while True:
-        try:
-            message = socket.recv_multipart()
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)
+
+    try:
+        while True:
+            # Check for heartbeat timeout before waiting for a message
+            if time.monotonic() - last_heartbeat_time > HEARTBEAT_TIMEOUT:
+                print(f"[!] Heartbeat timeout after {HEARTBEAT_TIMEOUT}s, exiting", file=sys.stderr)
+                os._exit(1)  # Use os._exit for immediate termination from a thread
+
+            # Poll for 1 second to remain responsive to the heartbeat check
+            events = dict(poller.poll(timeout=1000))
+            if socket in events:
+                message = socket.recv_multipart()
+            else:
+                # Poller timed out, loop again to re-check the heartbeat timer
+                continue
 
             if len(message) < 3:
                 print(f"[!] Received invalid message: {message}", file=sys.stderr)
@@ -228,18 +269,26 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
 
             resps = []
             match handler_id:
-                case 0:
+                case HandlerId.HANDSHAKE.value:
                     resps = handler.handshake(reqs)
-                case 1:
+                case HandlerId.HEARTBEAT.value:
+                    # Update heartbeat timer when heartbeat is received
+                    last_heartbeat_time = time.monotonic()
+                    resps = handler.heartbeat(reqs)
+                case HandlerId.QUERY.value:
                     resps = handler.query(reqs)
-                case 2:
+                case HandlerId.FORWARD_PASS.value:
                     resps = handler.forward_pass(reqs)
-                case 3:
+                case HandlerId.EMBED_IMAGE.value:
                     handler.embed_image(reqs)
-                case 4:
+                case HandlerId.INITIALIZE_ADAPTER.value:
                     handler.initialize_adapter(reqs)
-                case 5:
+                case HandlerId.UPDATE_ADAPTER.value:
                     handler.update_adapter(reqs)
+                case HandlerId.UPLOAD_HANDLER.value:
+                    handler.upload_handler(reqs)
+                case HandlerId.DOWNLOAD_HANDLER.value:
+                    resps = handler.download_handler(reqs)
                 case _:
                     print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
 
@@ -249,12 +298,18 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
                 ]
                 socket.send_multipart(response_msg)
 
-        except zmq.ZMQError as exc:
-            print(f"ZMQ Error in server loop: {exc}", file=sys.stderr)
-            break
+    except Exception as exc:
+        print(
+            f"\n[!!!] Unhandled error occurred in the ZMQ server loop: {exc}",
+            file=sys.stderr,
+        )
+        import traceback
+        traceback.print_exc()
+        os._exit(1)
 
 
 __all__ = [
+    "HandlerId",
     "ServerConfig",
     "build_config",
     "print_config",

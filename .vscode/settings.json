@@ -2,6 +2,5 @@
     "pylint.args": [
         "--init-hook=import sys; sys.path.insert(0, './backend/backend-python')"
     ],
-    "python.defaultInterpreterPath": "./backend/backend-python/.venv/bin/python",
-    "cmake.sourceDirectory": "/Users/seung-seoblee/Dev/pie/backend/backend-cuda"
+    "python.defaultInterpreterPath": "./backend/backend-python/.venv/bin/python"
 }

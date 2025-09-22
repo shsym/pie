@@ -1,5 +1,5 @@
 use inferlet::Context;
-use inferlet::sampler::{self, Sampler};
+use inferlet::sampler::{self, Sample};
 use inferlet::stop_condition::{self, StopCondition};
 use inferlet::traits::Tokenize;
 use pico_args::Arguments;
@@ -30,7 +30,7 @@ Options:
 /// sequences. It implements a sliding window attention mechanism, often called an
 /// "attention sink," to keep the KV cache size bounded.
 ///
-pub async fn generate_with_attention_sink<S: Sampler, C: StopCondition>(
+pub async fn generate_with_attention_sink<S: Sample, C: StopCondition>(
     ctx: &mut Context,
     sampler: &mut S,
     stop_condition: &mut C,

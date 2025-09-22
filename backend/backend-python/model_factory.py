@@ -30,6 +30,13 @@ def create_model_and_fusion_map(model_info: ModelInfo):
         fusion_map = create_qwen3_fusion_map(model)
         return model, fusion_map
 
+    if arch_type == "gptoss":
+        from model.gptoss import GPTOSSForCausalLM, create_fusion_map as create_gptoss_fusion_map
+
+        model = GPTOSSForCausalLM(model_info.architecture)
+        fusion_map = create_gptoss_fusion_map(model)
+        return model, fusion_map
+
     raise ValueError(f"Unsupported architecture type: {model_info.architecture.type}")
 
 

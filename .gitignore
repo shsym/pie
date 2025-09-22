@@ -23,6 +23,7 @@ Cargo.lock
 # VSCode
 # .vscode is not sensitive to security, so we can keep it in the repo. Useful for Pylint configuration.
 *.code-workspace
+.vscode
 
 # Other local ide/environment
 .claude

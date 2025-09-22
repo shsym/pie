@@ -1,7 +1,3 @@
-[build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "pie-backend"
 version = "0.1.0"
@@ -10,24 +6,15 @@ authors = [{ name = "In Gim", email = "in.gim@yale.edu" }]
 license = "MIT"
 requires-python = ">=3.11"
 
-# Core dependencies - cross-platform compatible
 dependencies = [
     "fire>=0.6",
     "msgpack>=0.5",
     "platformdirs>=4.3",
-    "protobuf>=6.31",
     "pyzmq>=27.0.0",
     "requests>=2.32",
-    "tomli>=2.2",
-    "torch>=2.7",
     "tqdm>=4.67",
     "websockets>=15.0",
     "ztensor>=0.1.4",
-    "numpy>=1.24.0,<2.3.0",
-    "pylint>=3.3.0",
-    "black>=24.10",
-    "numba>=0.61.0",
-    "pyright>=1.1.405",
     "msgspec>=0.19.0"
 ]
 

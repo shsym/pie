@@ -36,6 +36,14 @@ class QueryResponse(msgspec.Struct, gc=False):
     value: str
 
 
+class HeartbeatRequest(msgspec.Struct, gc=False):
+    pass
+
+
+class HeartbeatResponse(msgspec.Struct, gc=False):
+    pass
+
+
 class ForwardPassRequest(msgspec.Struct, gc=False):
     input_tokens: list[int]
     input_token_positions: list[int]
@@ -77,3 +85,18 @@ class UpdateAdapterRequest(msgspec.Struct, gc=False):
     scores: list[float]
     seeds: list[int]
     max_sigma: float
+
+
+class UploadAdapterRequest(msgspec.Struct, gc=False):
+    adapter_ptr: int
+    name: str
+    adapter_data: bytes
+
+
+class DownloadAdapterRequest(msgspec.Struct, gc=False):
+    adapter_ptr: int
+    name: str
+
+
+class DownloadAdapterResponse(msgspec.Struct, gc=False):
+    adapter_data: bytes

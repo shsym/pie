@@ -66,15 +66,52 @@ def load_model(config: dict, create_model_fn: CreateModelFn) -> tuple[torch.nn.M
                         continue
 
                     if name in model_state_keys and name not in loaded_keys:
-                        param = model.state_dict()[name]
                         tensor_data = reader.read_tensor(name, to="torch")
+                        param = model.state_dict()[name]
+
                         if tensor_data.shape != param.shape:
                             print(
                                 f"    Warning: Shape mismatch for tensor '{name}'. Skipping."
                             )
                             continue
+                        if tensor_data.dtype != param.dtype:
+                            tensor_data = tensor_data.to(dtype=param.dtype)
+                        if tensor_data.device != param.device:
+                            tensor_data = tensor_data.to(device=param.device)
+
+                        if name == "model.layers.0.input_layernorm.weight":
+                            print("[ModelLoaderDebug] copying", name)
+                            print(
+                                "[ModelLoaderDebug] source",
+                                name,
+                                "dtype=",
+                                tensor_data.dtype,
+                                "device=",
+                                tensor_data.device,
+                                "min=",
+                                float(tensor_data.min()),
+                                "max=",
+                                float(tensor_data.max()),
+                            )
+                            print(
+                                "[ModelLoaderDebug] target before copy",
+                                name,
+                                "dtype=",
+                                param.dtype,
+                                "device=",
+                                param.device,
+                            )
                         with torch.no_grad():
                             param.copy_(tensor_data, non_blocking=True)
+                        if name == "model.layers.0.input_layernorm.weight":
+                            print(
+                                "[ModelLoaderDebug] target after copy",
+                                name,
+                                "min=",
+                                float(param.min()),
+                                "max=",
+                                float(param.max()),
+                            )
                         loaded_keys.add(name)
 
         for target_name, details in fusion_map.items():

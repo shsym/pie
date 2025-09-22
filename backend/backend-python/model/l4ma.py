@@ -5,7 +5,9 @@ runtime backend for kernel-specific behaviour (e.g. FlashInfer or Metal).
 """
 
 from __future__ import annotations
+from typing import List, Dict
 
+import os
 from typing import Sequence
 
 import torch
@@ -13,20 +15,9 @@ from torch import nn
 
 from adapter import AdapterSubpass
 from config.l4ma import L4maArch
+from config.common import TensorLoader
 from .l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
-
-# Import debug framework checkpoint decorator
-try:
-    from debug_framework.decorators.checkpoint_decorator import checkpoint_validation
-    CHECKPOINT_DECORATOR_AVAILABLE = True
-except ImportError:
-    CHECKPOINT_DECORATOR_AVAILABLE = False
-
-    def checkpoint_validation(*args, **kwargs):  # type: ignore[override]
-        def decorator(func):
-            return func
-
-        return decorator
+from debug_utils import is_tensor_debug_enabled, checkpoint_validation
 
 VERSION = "0.1.0"
 
@@ -69,6 +60,81 @@ def create_fusion_map(model: nn.Module):
             fusion_map[target_w] = {"sources": sources_w, "dim": 0}
 
     return fusion_map
+
+
+class L4maTensorLoader(TensorLoader):
+    """
+    TensorLoader implementation for L4ma models.
+
+    Handles fusion of QKV projections and gate/up projections based on the
+    model architecture.
+    """
+
+    def __init__(self, model: nn.Module):
+        """
+        Initialize the tensor loader with a model instance.
+
+        Args:
+            model: The L4ma model instance
+        """
+        self.model = model
+        self._fusion_map = create_fusion_map(model)
+
+        # Create reverse mapping for quick lookup
+        self._source_to_target = {
+            source: target
+            for target, details in self._fusion_map.items()
+            for source in details["sources"]
+        }
+
+    def query(self, runtime_tensor_name: str) -> List[str]:
+        """
+        Query which checkpoint tensors are needed for a given runtime tensor.
+
+        Args:
+            runtime_tensor_name: Name of the tensor in the runtime model
+
+        Returns:
+            List of checkpoint tensor names needed to construct the runtime tensor
+        """
+        if runtime_tensor_name in self._fusion_map:
+            # This is a fusion target, return its source tensors
+            return self._fusion_map[runtime_tensor_name]["sources"]
+        else:
+            # This is a regular tensor, return itself
+            return [runtime_tensor_name]
+
+    def load(
+        self, runtime_tensor_name: str, checkpoint_tensors: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Load and transform checkpoint tensors into the runtime tensor.
+
+        Args:
+            runtime_tensor_name: Name of the tensor in the runtime model
+            checkpoint_tensors: Dictionary mapping checkpoint tensor names to their loaded tensors
+
+        Returns:
+            The constructed runtime tensor
+        """
+        if runtime_tensor_name in self._fusion_map:
+            # This is a fusion target, concatenate the source tensors
+            fusion_info = self._fusion_map[runtime_tensor_name]
+            source_names = fusion_info["sources"]
+            concat_dim = fusion_info["dim"]
+
+            # Get all source tensors in order
+            source_tensors = [checkpoint_tensors[name] for name in source_names]
+
+            # Concatenate along the specified dimension
+            return torch.cat(source_tensors, dim=concat_dim)
+        else:
+            # This is a regular tensor, return it directly
+            if runtime_tensor_name not in checkpoint_tensors:
+                raise KeyError(
+                    f"Tensor '{runtime_tensor_name}' not found in checkpoint tensors"
+                )
+            return checkpoint_tensors[runtime_tensor_name]
 
 
 class L4maMlp(nn.Module):
@@ -180,10 +246,110 @@ class L4maAttention(nn.Module):
 
         n, _ = hidden_states.size()
 
+        if hidden_states.numel() and is_tensor_debug_enabled():
+            attn_input_min, attn_input_max = hidden_states.aminmax()
+            attn_input_nan = torch.isnan(hidden_states).any().item()
+            attn_input_inf = torch.isinf(hidden_states).any().item()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.layer_idx}",
+                "stage=attn_input",
+                "dtype=",
+                hidden_states.dtype,
+                "min=",
+                float(attn_input_min),
+                "max=",
+                float(attn_input_max),
+                "has_nan=",
+                bool(attn_input_nan),
+                "has_inf=",
+                bool(attn_input_inf),
+            )
+
         qkv_states = self.qkv_proj(hidden_states)
+        if qkv_states.numel() and is_tensor_debug_enabled():
+            qkv_min, qkv_max = qkv_states.aminmax()
+            qkv_nan = torch.isnan(qkv_states).any().item()
+            qkv_inf = torch.isinf(qkv_states).any().item()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.layer_idx}",
+                "stage=qkv_proj",
+                "dtype=",
+                qkv_states.dtype,
+                "min=",
+                float(qkv_min),
+                "max=",
+                float(qkv_max),
+                "has_nan=",
+                bool(qkv_nan),
+                "has_inf=",
+                bool(qkv_inf),
+            )
+
         query_states, key_states, value_states = torch.split(
             qkv_states, [self.q_size, self.k_size, self.v_size], dim=-1
         )
+
+        if query_states.numel() and is_tensor_debug_enabled():
+            q_min, q_max = query_states.aminmax()
+            q_nan = torch.isnan(query_states).any().item()
+            q_inf = torch.isinf(query_states).any().item()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.layer_idx}",
+                "stage=query_states",
+                "dtype=",
+                query_states.dtype,
+                "min=",
+                float(q_min),
+                "max=",
+                float(q_max),
+                "has_nan=",
+                bool(q_nan),
+                "has_inf=",
+                bool(q_inf),
+            )
+
+        if key_states.numel() and is_tensor_debug_enabled():
+            k_min, k_max = key_states.aminmax()
+            k_nan = torch.isnan(key_states).any().item()
+            k_inf = torch.isinf(key_states).any().item()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.layer_idx}",
+                "stage=key_states",
+                "dtype=",
+                key_states.dtype,
+                "min=",
+                float(k_min),
+                "max=",
+                float(k_max),
+                "has_nan=",
+                bool(k_nan),
+                "has_inf=",
+                bool(k_inf),
+            )
+
+        if value_states.numel() and is_tensor_debug_enabled():
+            v_min, v_max = value_states.aminmax()
+            v_nan = torch.isnan(value_states).any().item()
+            v_inf = torch.isinf(value_states).any().item()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.layer_idx}",
+                "stage=value_states",
+                "dtype=",
+                value_states.dtype,
+                "min=",
+                float(v_min),
+                "max=",
+                float(v_max),
+                "has_nan=",
+                bool(v_nan),
+                "has_inf=",
+                bool(v_inf),
+            )
 
         # apply adapters if provided
         if adapter_subpass is not None:
@@ -224,7 +390,47 @@ class L4maAttention(nn.Module):
             kv_cache_layer=kv_cache_at_layer[self.layer_idx],
         )
 
+        if attn_output.numel() and is_tensor_debug_enabled():
+            attn_min, attn_max = attn_output.aminmax()
+            attn_nan = torch.isnan(attn_output).any().item()
+            attn_inf = torch.isinf(attn_output).any().item()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.layer_idx}",
+                "stage=attn_output",
+                "dtype=",
+                attn_output.dtype,
+                "min=",
+                float(attn_min),
+                "max=",
+                float(attn_max),
+                "has_nan=",
+                bool(attn_nan),
+                "has_inf=",
+                bool(attn_inf),
+            )
+
         attn_output = self.o_proj(attn_output)
+
+        if attn_output.numel() and is_tensor_debug_enabled():
+            o_proj_min, o_proj_max = attn_output.aminmax()
+            o_proj_nan = torch.isnan(attn_output).any().item()
+            o_proj_inf = torch.isinf(attn_output).any().item()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.layer_idx}",
+                "stage=o_proj",
+                "dtype=",
+                attn_output.dtype,
+                "min=",
+                float(o_proj_min),
+                "max=",
+                float(o_proj_max),
+                "has_nan=",
+                bool(o_proj_nan),
+                "has_inf=",
+                bool(o_proj_inf),
+            )
 
         return attn_output
 
@@ -271,7 +477,75 @@ class L4maDecoderLayer(nn.Module):
 
         residual = hidden_states
 
+        if hidden_states.numel() and is_tensor_debug_enabled():
+            pre_norm_min, pre_norm_max = hidden_states.aminmax()
+            pre_norm_nan = torch.isnan(hidden_states).any().item()
+            pre_norm_inf = torch.isinf(hidden_states).any().item()
+            weight = self.input_layernorm.weight
+            weight_min, weight_max = weight.aminmax()
+            with torch.no_grad():
+                manual_input = hidden_states.to(torch.float32)
+                denom = torch.rsqrt(
+                    manual_input.pow(2).mean(dim=-1, keepdim=True)
+                    + self.input_layernorm.eps
+                )
+                manual_norm = manual_input * denom
+                manual_norm = manual_norm * weight.to(torch.float32)
+                manual_min, manual_max = manual_norm.aminmax()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.self_attn.layer_idx}",
+                "stage=decoder_input_norm_weight",
+                "dtype=",
+                weight.dtype,
+                "min=",
+                float(weight_min),
+                "max=",
+                float(weight_max),
+                "sample=",
+                [float(x) for x in weight.flatten()[:8].cpu()],
+            )
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.self_attn.layer_idx}",
+                "stage=decoder_pre_input_norm",
+                "dtype=",
+                hidden_states.dtype,
+                "min=",
+                float(pre_norm_min),
+                "max=",
+                float(pre_norm_max),
+                "has_nan=",
+                bool(pre_norm_nan),
+                "has_inf=",
+                bool(pre_norm_inf),
+                "manual_min=",
+                float(manual_min),
+                "manual_max=",
+                float(manual_max),
+            )
+
         hidden_states = self._input_normalization(hidden_states)
+
+        if hidden_states.numel() and is_tensor_debug_enabled():
+            post_norm_min, post_norm_max = hidden_states.aminmax()
+            post_norm_nan = torch.isnan(hidden_states).any().item()
+            post_norm_inf = torch.isinf(hidden_states).any().item()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.self_attn.layer_idx}",
+                "stage=decoder_post_input_norm",
+                "dtype=",
+                hidden_states.dtype,
+                "min=",
+                float(post_norm_min),
+                "max=",
+                float(post_norm_max),
+                "has_nan=",
+                bool(post_norm_nan),
+                "has_inf=",
+                bool(post_norm_inf),
+            )
 
         hidden_states = self.self_attn(
             runtime=runtime,
@@ -283,12 +557,100 @@ class L4maDecoderLayer(nn.Module):
 
         hidden_states = residual + hidden_states
 
+        if hidden_states.numel() and is_tensor_debug_enabled():
+            post_attn_min, post_attn_max = hidden_states.aminmax()
+            post_attn_nan = torch.isnan(hidden_states).any().item()
+            post_attn_inf = torch.isinf(hidden_states).any().item()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.self_attn.layer_idx}",
+                "stage=decoder_post_attention_residual",
+                "dtype=",
+                hidden_states.dtype,
+                "min=",
+                float(post_attn_min),
+                "max=",
+                float(post_attn_max),
+                "has_nan=",
+                bool(post_attn_nan),
+                "has_inf=",
+                bool(post_attn_inf),
+            )
+
         residual = hidden_states
         hidden_states = self._post_attention_normalization(hidden_states)
+
+        if hidden_states.numel() and is_tensor_debug_enabled():
+            post_attn_norm_min, post_attn_norm_max = hidden_states.aminmax()
+            post_attn_norm_nan = torch.isnan(hidden_states).any().item()
+            post_attn_norm_inf = torch.isinf(hidden_states).any().item()
+            weight = self.post_attention_layernorm.weight
+            weight_min, weight_max = weight.aminmax()
+            with torch.no_grad():
+                manual_input = residual.to(torch.float32)
+                denom = torch.rsqrt(
+                    manual_input.pow(2).mean(dim=-1, keepdim=True)
+                    + self.post_attention_layernorm.eps
+                )
+                manual_norm = manual_input * denom
+                manual_norm = manual_norm * weight.to(torch.float32)
+                manual_min, manual_max = manual_norm.aminmax()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.self_attn.layer_idx}",
+                "stage=decoder_post_attn_norm_weight",
+                "dtype=",
+                weight.dtype,
+                "min=",
+                float(weight_min),
+                "max=",
+                float(weight_max),
+                "sample=",
+                [float(x) for x in weight.flatten()[:8].cpu()],
+            )
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.self_attn.layer_idx}",
+                "stage=decoder_post_attention_norm",
+                "dtype=",
+                hidden_states.dtype,
+                "min=",
+                float(post_attn_norm_min),
+                "max=",
+                float(post_attn_norm_max),
+                "has_nan=",
+                bool(post_attn_norm_nan),
+                "has_inf=",
+                bool(post_attn_norm_inf),
+                "manual_min=",
+                float(manual_min),
+                "manual_max=",
+                float(manual_max),
+            )
 
         hidden_states = self.mlp(hidden_states)
 
         hidden_states = residual + hidden_states
+
+        if hidden_states.numel() and is_tensor_debug_enabled():
+            post_mlp_min, post_mlp_max = hidden_states.aminmax()
+            post_mlp_nan = torch.isnan(hidden_states).any().item()
+            post_mlp_inf = torch.isinf(hidden_states).any().item()
+            print(
+                "[MetalTensorDebug]",
+                f"layer={self.self_attn.layer_idx}",
+                "stage=decoder_post_mlp_residual",
+                "dtype=",
+                hidden_states.dtype,
+                "min=",
+                float(post_mlp_min),
+                "max=",
+                float(post_mlp_max),
+                "has_nan=",
+                bool(post_mlp_nan),
+                "has_inf=",
+                bool(post_mlp_inf),
+            )
 
         return hidden_states
 

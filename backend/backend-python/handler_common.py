@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import contextmanager, nullcontext
 
@@ -11,18 +12,7 @@ import torch
 import message
 from adapter import AdapterSubpass
 from config.common import ModelInfo
-
-# Import debug framework checkpoint decorator
-try:
-    from debug_framework.decorators.checkpoint_decorator import checkpoint_validation
-    CHECKPOINT_DECORATOR_AVAILABLE = True
-except ImportError:
-    CHECKPOINT_DECORATOR_AVAILABLE = False
-    # Fallback no-op decorator
-    def checkpoint_validation(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
+from debug_utils import is_tensor_debug_enabled, checkpoint_validation
 
 
 class Handler:
@@ -61,6 +51,7 @@ class Handler:
         self.max_adapter_rank = max_adapter_rank
         self.dtype = dtype
         self.device = device
+        self.logits_dtype = dtype
 
         self.kv_cache_at_layer = [
             torch.zeros(
@@ -223,6 +214,21 @@ class Handler:
 
         return responses
 
+    def heartbeat(self, reqs: list[message.HeartbeatRequest]) -> list[message.HeartbeatResponse]:
+        """Handle heartbeat requests to keep the connection alive."""
+        resps = []
+        for req in reqs:
+            resps.append(message.HeartbeatResponse())
+        return resps
+
+    def upload_handler(self, reqs: list[message.UploadAdapterRequest]):
+        """Handle adapter upload requests."""
+        raise NotImplementedError("upload_handler not yet implemented")
+
+    def download_handler(self, reqs: list[message.DownloadAdapterRequest]) -> list[message.DownloadAdapterResponse]:
+        """Handle adapter download requests."""
+        raise NotImplementedError("download_handler not yet implemented")
+
 
 @contextmanager
 def _device_context(device: str):
@@ -273,6 +279,7 @@ class ForwardPassBatch:
     def __init__(self, handler: Handler):
         """Initializes the batch processor."""
         self._handler = handler
+        self.logits_dtype = getattr(handler, "logits_dtype", handler.dtype)
         self._original_reqs: list[message.ForwardPassRequest] = []
 
         # Inputs for the model
@@ -414,6 +421,26 @@ class ForwardPassBatch:
         )
         input_embeds = self._handler.lm.model.embed_tokens(token_ids_tensor)
 
+        if input_embeds.numel() and is_tensor_debug_enabled():
+            embed_min, embed_max = input_embeds.aminmax()
+            has_nan = torch.isnan(input_embeds).any().item()
+            has_inf = torch.isinf(input_embeds).any().item()
+            print(
+                "[MetalTensorDebug] stage=input_embeds",
+                "dtype=",
+                input_embeds.dtype,
+                "device=",
+                input_embeds.device,
+                "min=",
+                float(embed_min),
+                "max=",
+                float(embed_max),
+                "has_nan=",
+                bool(has_nan),
+                "has_inf=",
+                bool(has_inf),
+            )
+
         return {
             "input_embeds": input_embeds,
             "position_ids": torch.as_tensor(
@@ -457,18 +484,31 @@ class ForwardPassBatch:
             ]
 
         # Calculate logits for all required tokens (both dists and samples)
-        logits = self._handler.lm.lm_head(output_embeds[self.indices_for_logits])
+        logits_input = output_embeds[self.indices_for_logits]
+        if logits_input.dtype != self.logits_dtype:
+            logits_input = logits_input.to(self.logits_dtype)
+
+        logits = self._handler.lm.lm_head(logits_input)
+
+
+        # Promote logits to handler dtype for numerically stable softmax on Metal/MPS
+        if logits.dtype != self.logits_dtype:
+            logits = logits.to(dtype=self.logits_dtype)
 
         # Apply temperature scaling to all logits
         temperatures = torch.tensor(
             [p["temperature"] for p in self.sampler_params],
             device=self._handler.device,
-            dtype=self._handler.dtype,
+            dtype=self.logits_dtype,
         ).unsqueeze(1)
         scaled_logits = logits / torch.clamp(temperatures, min=1e-6)
 
+
         # We compute probabilities for the entire batch of logit requests
         probs = torch.softmax(scaled_logits, dim=-1)
+
+        if not torch.isfinite(probs).all():
+            raise RuntimeError("Non-finite probabilities produced by LM head")
 
         # Group requests by sampler type for efficient batch processing
         sampler_groups = {}
@@ -555,6 +595,9 @@ class ForwardPassBatch:
                     raise ValueError(f"Unknown sampler index: {sampler_idx}")
 
                 # Place sampled tokens into the main tensor at their original batch positions
+                # Ensure sampled tokens have the correct dtype (torch.long for token indices)
+                if sampled.dtype != torch.long:
+                    sampled = sampled.to(torch.long)
                 final_tokens_tensor.scatter_(0, indices_tensor, sampled)
 
         # Distribute batched results back to individual responses

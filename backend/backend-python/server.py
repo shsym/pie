@@ -1,3 +1,7 @@
+# pylint: disable-all
+# type: ignore
+# Ignoring checks for pylint and pyright since we are actively working on this file
+
 import fire
 
 from handler import Handler
@@ -74,3 +78,7 @@ def main(
         model=model_instance,
         model_info=model_metadata,
     )
+
+
+if __name__ == "__main__":
+    fire.Fire(main)
