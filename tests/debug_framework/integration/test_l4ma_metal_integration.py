@@ -35,6 +35,11 @@ def test_l4ma_integration():
         # Test import L4MA models
         try:
             from model.l4ma import L4maModel, L4maForCausalLM
+            from model.l4ma_runtime import FlashInferL4maBackend
+
+            if not FlashInferL4maBackend.is_available():
+                print("FlashInfer backend unavailable; skipping metal integration test model creation.")
+                return None
             from config.l4ma import L4maArch
             print("✅ L4MA models imported successfully")
         except ImportError as e:
@@ -110,7 +115,12 @@ def test_l4ma_integration():
             )
 
             # Create the L4MA model (without loading weights)
-            test_model = L4maForCausalLM(test_config)
+            if not FlashInferL4maBackend.is_available():
+                print("FlashInfer backend unavailable; skipping metal integration test model creation.")
+                return False
+
+            backend = FlashInferL4maBackend()
+            test_model = L4maForCausalLM(test_config, backend=backend)
             print("✅ L4MA model created with PIE-compatible configuration")
             print(f"   Model layers: {test_config.num_layers}")
             print(f"   Hidden size: {test_config.hidden_size}")

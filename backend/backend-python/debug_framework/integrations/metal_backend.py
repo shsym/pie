@@ -266,18 +266,17 @@ class MetalBackend(BackendInterface):
             else:
                 raise ValueError(f"Unsupported query shape: {query.shape}")
 
-            # Create default page indices if not provided (for debug framework)
             if kv_page_indices is None or kv_page_indptr is None or kv_last_page_lens is None:
-                # Simple debug setup
                 kv_page_indices = np.array([0], dtype=np.int32)
                 kv_page_indptr = np.array([0, 1], dtype=np.int32)
                 kv_last_page_lens = np.array([batch_seq], dtype=np.int32)
 
-            # Use the new Metal binding method that accepts L4MA KV cache format
-            # Pass all parameters as positional arguments (pybind11 requirement)
+            query_f32 = np.asarray(query_2d, dtype=np.float32, order="C")
+            kv_f32 = np.asarray(kv_cache, dtype=np.float32, order="C")
+
             result = self._metal_executor.execute_attention_with_kv_cache(
-                query_2d.astype(np.float32),
-                kv_cache.astype(np.float32),
+                query_f32,
+                kv_f32,
                 kv_page_indices.astype(np.int32),
                 kv_page_indptr.astype(np.int32),
                 kv_last_page_lens.astype(np.int32),
