@@ -1,9 +1,13 @@
+"""
+Adapter module for LoRA-style model adaptations.
+
+This module provides classes and functions for handling adapter functionality
+including run-length encoding and adapter subpass execution.
+"""
+
 from __future__ import annotations
 
-import time
 import torch
-import torch.nn as nn
-import math
 
 
 def run_length_encode(data: list[int]) -> list[tuple[int, int]]:
@@ -38,6 +42,7 @@ def run_length_encode(data: list[int]) -> list[tuple[int, int]]:
 
 
 class AdapterSubpass:
+    """Handles execution of adapter operations during model inference."""
 
     def __init__(
             self,
@@ -62,6 +67,7 @@ class AdapterSubpass:
             k_state: torch.Tensor,
             v_state: torch.Tensor,
     ):
+        """Execute adapter operations for the given layer and tensors."""
         i = 0
         for adapter_index, count in self.adapter_indices_rle:
 
@@ -70,13 +76,13 @@ class AdapterSubpass:
             x = xs[x_start:x_end]
 
             rand_seeds = self.rand_seeds[i : i + count]
-            inject_noise = rand_seeds.any().item()
+            _ = rand_seeds.any().item()  # Check for noise injection (unused for now)
 
             assert x.shape[0] == rand_seeds.shape[0], "Batch size must match seeds."
 
             # DOWN noise uses 3 equal chunks of size `rank` each (Q/K/V).
-            Wd = self.adapter_at_layer[layer_idx][0][adapter_index]
-            Wu = self.adapter_at_layer[layer_idx][1][
+            w_down = self.adapter_at_layer[layer_idx][0][adapter_index]
+            w_up = self.adapter_at_layer[layer_idx][1][
                 adapter_index
             ]  # (rank, d_q+d_k+d_v)
             adapter_info = self.adapter_extras[adapter_index]
@@ -84,16 +90,16 @@ class AdapterSubpass:
             rank = adapter_info.rank
             out_indptr = adapter_info.out_features_indptr  # built from [d_q, d_k, d_v]
 
-            qkv_down = x @ Wd
+            qkv_down = x @ w_down
             d_q, d_k, d_v = torch.split(qkv_down, [rank, rank, rank], dim=-1)
 
-            Wu_q = Wu[:, out_indptr[0] : out_indptr[1]]  # (rank, d_q)
-            Wu_k = Wu[:, out_indptr[1] : out_indptr[2]]  # (rank, d_k)
-            Wu_v = Wu[:, out_indptr[2] : out_indptr[3]]  # (rank, d_v)
+            w_up_q = w_up[:, out_indptr[0] : out_indptr[1]]  # (rank, d_q)
+            w_up_k = w_up[:, out_indptr[1] : out_indptr[2]]  # (rank, d_k)
+            w_up_v = w_up[:, out_indptr[2] : out_indptr[3]]  # (rank, d_v)
 
-            u_q = d_q @ Wu_q
-            u_k = d_k @ Wu_k
-            u_v = d_v @ Wu_v
+            u_q = d_q @ w_up_q
+            u_k = d_k @ w_up_k
+            u_v = d_v @ w_up_v
 
             # ===== 3) Combine mean + noise =====
             scaling = adapter_info.alpha / float(rank)
@@ -129,7 +135,7 @@ class Adapter:
         self.out_features = out_features
 
         self.out_features_indptr = [0]
-        for i in range(len(out_features)):
+        for feature_size in out_features:
             self.out_features_indptr.append(
-                self.out_features_indptr[-1] + out_features[i]
+                self.out_features_indptr[-1] + feature_size
             )

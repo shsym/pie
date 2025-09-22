@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from contextlib import contextmanager, nullcontext
 
@@ -105,9 +104,10 @@ class Handler:
     def handshake(
         self, reqs: list[message.HandshakeRequest]
     ) -> list[message.HandshakeResponse]:
+        """Handle handshake requests."""
         resps = []
-        for req in reqs:
-            # req.version
+        for _ in reqs:
+            # Request details not currently used
 
             resp = message.HandshakeResponse(
                 version=self.model_info.version,
@@ -132,6 +132,7 @@ class Handler:
         return resps
 
     def query(self, reqs: list[message.QueryRequest]) -> list[message.QueryResponse]:
+        """Handle query requests."""
         resps = []
         for req in reqs:
             value = "unknown query"
@@ -140,7 +141,7 @@ class Handler:
                     value = "pong"
             resp = message.QueryResponse(value=value)
             resps.append(resp)
-        return resp
+        return resps
 
     def embed_image(self, reqs: list[message.EmbedImageRequest]):
         """
@@ -149,7 +150,8 @@ class Handler:
         for req in reqs:
             if len(req.embed_ptrs) > self.max_num_embeds:
                 raise ValueError(
-                    f"Number of embed pointers {len(req.embed_ptrs)} exceeds maximum {self.max_num_embeds}."
+                    f"Number of embed pointers {len(req.embed_ptrs)} exceeds "
+                    f"maximum {self.max_num_embeds}."
                 )
 
             image_tensor = self.ops.decode_image(
@@ -166,15 +168,15 @@ class Handler:
 
     @torch.inference_mode()
     def initialize_adapter(self, reqs: list[message.InitializeAdapterRequest]):
+        """Initialize adapter functionality."""
+        # cfg = self.lm.config  # Available if needed
 
-        cfg = self.lm.config
-
-        for req in reqs:
-            pass
+        for _ in reqs:
+            pass  # Request details not currently used
 
     @torch.inference_mode()
     def update_adapter(self, reqs: list[message.UpdateAdapterRequest]):
-
+        """Update adapter functionality."""
         for req in reqs:
             if req.adapter_ptr in self.adapters:
                 pass
@@ -186,7 +188,7 @@ class Handler:
         include_metadata=True,
         tolerance=1e-5,
         backend_comparison=None,
-        performance_monitoring=True
+        performance_monitoring=True,
     )
     def forward_pass(self, reqs: list[message.ForwardPassRequest]):
         """
@@ -214,19 +216,25 @@ class Handler:
 
         return responses
 
-    def heartbeat(self, reqs: list[message.HeartbeatRequest]) -> list[message.HeartbeatResponse]:
+    def heartbeat(
+        self, reqs: list[message.HeartbeatRequest]
+    ) -> list[message.HeartbeatResponse]:
         """Handle heartbeat requests to keep the connection alive."""
         resps = []
-        for req in reqs:
+        for _ in reqs:
             resps.append(message.HeartbeatResponse())
         return resps
 
     def upload_handler(self, reqs: list[message.UploadAdapterRequest]):
         """Handle adapter upload requests."""
+        _ = reqs  # Parameter not currently used
         raise NotImplementedError("upload_handler not yet implemented")
 
-    def download_handler(self, reqs: list[message.DownloadAdapterRequest]) -> list[message.DownloadAdapterResponse]:
+    def download_handler(
+        self, reqs: list[message.DownloadAdapterRequest]
+    ) -> list[message.DownloadAdapterResponse]:
         """Handle adapter download requests."""
+        _ = reqs  # Parameter not currently used
         raise NotImplementedError("download_handler not yet implemented")
 
 
@@ -390,7 +398,8 @@ class ForwardPassBatch:
             expected_len = context_length + i + 1
             if len(decoded_mask) != expected_len:
                 raise ValueError(
-                    f"Decoded mask for token {i} has length {len(decoded_mask)}, but expected {expected_len}"
+                    f"Decoded mask for token {i} has length {len(decoded_mask)}, "
+                    f"but expected {expected_len}"
                 )
             request_attention_mask[i, :expected_len] = decoded_mask
 
@@ -490,7 +499,6 @@ class ForwardPassBatch:
 
         logits = self._handler.lm.lm_head(logits_input)
 
-
         # Promote logits to handler dtype for numerically stable softmax on Metal/MPS
         if logits.dtype != self.logits_dtype:
             logits = logits.to(dtype=self.logits_dtype)
@@ -502,7 +510,6 @@ class ForwardPassBatch:
             dtype=self.logits_dtype,
         ).unsqueeze(1)
         scaled_logits = logits / torch.clamp(temperatures, min=1e-6)
-
 
         # We compute probabilities for the entire batch of logit requests
         probs = torch.softmax(scaled_logits, dim=-1)
@@ -519,7 +526,9 @@ class ForwardPassBatch:
 
         num_logit_requests = len(self.indices_for_logits)
         # Initialize result containers. Using lists of Nones helps place results correctly.
-        final_dists = [None] * num_logit_requests
+        final_dists: list[tuple[list[int], list[float]] | None] = [
+            None
+        ] * num_logit_requests
         final_tokens_tensor = torch.empty(
             num_logit_requests, dtype=torch.long, device=self._handler.device
         )

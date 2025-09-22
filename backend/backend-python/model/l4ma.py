@@ -5,19 +5,17 @@ runtime backend for kernel-specific behaviour (e.g. FlashInfer or Metal).
 """
 
 from __future__ import annotations
-from typing import List, Dict
-
-import os
-from typing import Sequence
+from typing import Dict, List, Sequence
 
 import torch
 from torch import nn
+
+from debug_utils import is_tensor_debug_enabled, checkpoint_validation
 
 from adapter import AdapterSubpass
 from config.l4ma import L4maArch
 from config.common import TensorLoader
 from .l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
-from debug_utils import is_tensor_debug_enabled, checkpoint_validation
 
 VERSION = "0.1.0"
 
@@ -160,6 +158,7 @@ class L4maMlp(nn.Module):
         self.act_fn = nn.SiLU()
 
     def forward(self, x):
+        """Forward pass through the MLP layer."""
         gate_up_proj_out = self._gate_up_projection(x)
         gate_proj, up_proj = gate_up_proj_out.chunk(2, dim=-1)
 
@@ -482,12 +481,12 @@ class L4maDecoderLayer(nn.Module):
             pre_norm_nan = torch.isnan(hidden_states).any().item()
             pre_norm_inf = torch.isinf(hidden_states).any().item()
             weight = self.input_layernorm.weight
-            weight_min, weight_max = weight.aminmax()
+            weight_min, weight_max = tuple(weight.aminmax())
             with torch.no_grad():
                 manual_input = hidden_states.to(torch.float32)
+                eps = self.input_layernorm.eps or 1e-6
                 denom = torch.rsqrt(
-                    manual_input.pow(2).mean(dim=-1, keepdim=True)
-                    + self.input_layernorm.eps
+                    manual_input.pow(2).mean(dim=-1, keepdim=True) + eps
                 )
                 manual_norm = manual_input * denom
                 manual_norm = manual_norm * weight.to(torch.float32)
@@ -503,7 +502,7 @@ class L4maDecoderLayer(nn.Module):
                 "max=",
                 float(weight_max),
                 "sample=",
-                [float(x) for x in weight.flatten()[:8].cpu()],
+                weight.flatten().detach().cpu().numpy().tolist()[:8],
             )
             print(
                 "[MetalTensorDebug]",
@@ -585,12 +584,12 @@ class L4maDecoderLayer(nn.Module):
             post_attn_norm_nan = torch.isnan(hidden_states).any().item()
             post_attn_norm_inf = torch.isinf(hidden_states).any().item()
             weight = self.post_attention_layernorm.weight
-            weight_min, weight_max = weight.aminmax()
+            weight_min, weight_max = tuple(weight.aminmax())
             with torch.no_grad():
                 manual_input = residual.to(torch.float32)
+                eps = self.post_attention_layernorm.eps or 1e-6
                 denom = torch.rsqrt(
-                    manual_input.pow(2).mean(dim=-1, keepdim=True)
-                    + self.post_attention_layernorm.eps
+                    manual_input.pow(2).mean(dim=-1, keepdim=True) + eps
                 )
                 manual_norm = manual_input * denom
                 manual_norm = manual_norm * weight.to(torch.float32)
@@ -606,7 +605,7 @@ class L4maDecoderLayer(nn.Module):
                 "max=",
                 float(weight_max),
                 "sample=",
-                [float(x) for x in weight.flatten()[:8].cpu()],
+                weight.flatten().detach().cpu().numpy().tolist()[:8],
             )
             print(
                 "[MetalTensorDebug]",

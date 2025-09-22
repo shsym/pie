@@ -12,8 +12,12 @@ from .base import L4maBackend, L4maForwardContext, RuntimeInputs
 
 try:  # pragma: no cover - optional dependency guard
     import flashinfer as ops  # type: ignore[import]
+    # FlashInfer wrapper types - using object as fallback for type checking
+    # Union type not available when FlashInfer is missing
+    FlashInferWrapper = object  # type: ignore[misc]
 except ImportError:  # pragma: no cover - optional dependency guard
     ops = None
+    FlashInferWrapper = object  # type: ignore[misc]
 
 
 def _infer_page_size(kv_cache_at_layer) -> int:
@@ -42,7 +46,7 @@ class _FlashInferForwardContext(L4maForwardContext):
         *,
         config: L4maArch,
         inputs: RuntimeInputs,
-        wrapper: ops.BatchDecodeWithPagedKVCacheWrapper | ops.BatchPrefillWithPagedKVCacheWrapper,
+        wrapper: FlashInferWrapper,  # type: ignore[name-defined]
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
         metadata: FlashInferRuntimeMetadata,
@@ -64,6 +68,7 @@ class _FlashInferForwardContext(L4maForwardContext):
 
     @property
     def metadata(self) -> FlashInferRuntimeMetadata:
+        """Get the runtime metadata."""
         return self._metadata
 
     def apply_rope(
@@ -72,7 +77,9 @@ class _FlashInferForwardContext(L4maForwardContext):
         key_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> None:
-        ops.apply_llama31_rope_pos_ids_inplace(
+        if ops is None:
+            raise RuntimeError("FlashInfer not available")
+        ops.apply_llama31_rope_pos_ids_inplace(  # type: ignore
             q=query_states,
             k=key_states,
             pos_ids=position_ids,
@@ -85,7 +92,10 @@ class _FlashInferForwardContext(L4maForwardContext):
         value_states: torch.Tensor,
         kv_cache_layer: torch.Tensor,
     ) -> None:
-        ops.append_paged_kv_cache(
+        _ = layer_idx  # Parameter not currently used
+        if ops is None:
+            raise RuntimeError("FlashInfer not available")
+        ops.append_paged_kv_cache(  # type: ignore
             append_key=key_states,
             append_value=value_states,
             batch_indices=self._batch_indices,
@@ -103,6 +113,7 @@ class _FlashInferForwardContext(L4maForwardContext):
         query_states: torch.Tensor,
         kv_cache_layer: torch.Tensor,
     ) -> torch.Tensor:
+        _ = layer_idx  # Parameter not currently used
         attn_output = self.wrapper.run(query_states, kv_cache_layer)
         return attn_output.reshape(attn_output.size(0), -1)
 
@@ -115,22 +126,35 @@ class FlashInferL4maBackend(L4maBackend):
         """Return True if the FlashInfer runtime dependency is present."""
         return ops is not None
 
-    def __init__(self, workspace_size_bytes: int = 128 * 1024 * 1024, kv_layout: str = "NHD") -> None:
+    def __init__(
+        self,
+        workspace_size_bytes: int = 128 * 1024 * 1024,
+        kv_layout: str = "NHD"
+    ) -> None:
         if ops is None:
             raise RuntimeError(
-                "flashinfer is not available. Install flashinfer-python to use FlashInferL4maBackend."
+                "flashinfer is not available. "
+                "Install flashinfer-python to use FlashInferL4maBackend."
             )
 
         self.workspace_size_bytes = workspace_size_bytes
         self.kv_layout = kv_layout
 
         self._workspace_buffer: Optional[torch.Tensor] = None
-        self._decode_wrapper: Optional[ops.BatchDecodeWithPagedKVCacheWrapper] = None
-        self._prefill_wrapper: Optional[ops.BatchPrefillWithPagedKVCacheWrapper] = None
+        # Type ignore: FlashInfer types are optional dependencies not available in CI
+        self._decode_wrapper: Optional[  # type: ignore[name-defined]
+            ops.BatchDecodeWithPagedKVCacheWrapper
+        ] = None
+        self._prefill_wrapper: Optional[  # type: ignore[name-defined]
+            ops.BatchPrefillWithPagedKVCacheWrapper
+        ] = None
 
     def _ensure_workspace(self, device: torch.device | str) -> None:
         tensor_device = torch.device(device)
-        if self._workspace_buffer is not None and self._workspace_buffer.device == tensor_device:
+        if (
+            self._workspace_buffer is not None
+            and self._workspace_buffer.device == tensor_device
+        ):
             return
 
         self._workspace_buffer = torch.empty(
@@ -138,6 +162,8 @@ class FlashInferL4maBackend(L4maBackend):
             dtype=torch.uint8,
             device=tensor_device,
         )
+        if ops is None:
+            raise RuntimeError("FlashInfer not available")
         self._decode_wrapper = ops.BatchDecodeWithPagedKVCacheWrapper(
             self._workspace_buffer, self.kv_layout
         )
@@ -152,6 +178,9 @@ class FlashInferL4maBackend(L4maBackend):
         inputs: RuntimeInputs,
     ) -> L4maForwardContext:
         self._ensure_workspace(config.device)
+
+        if ops is None:
+            raise RuntimeError("FlashInfer not available")
 
         page_size = _infer_page_size(inputs.kv_cache_at_layer)
         seq_lens = ops.get_seq_lens(

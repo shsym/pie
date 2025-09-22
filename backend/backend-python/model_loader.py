@@ -16,7 +16,9 @@ from config.common import ModelInfo
 CreateModelFn = Callable[[ModelInfo], Tuple[torch.nn.Module, dict]]
 
 
-def load_model(config: dict, create_model_fn: CreateModelFn) -> tuple[torch.nn.Module, ModelInfo]:
+def load_model(
+    config: dict, create_model_fn: CreateModelFn
+) -> tuple[torch.nn.Module, ModelInfo]:
     """Load a model using the provided factory function and fusion metadata."""
 
     model_name = config["model"]
@@ -67,6 +69,11 @@ def load_model(config: dict, create_model_fn: CreateModelFn) -> tuple[torch.nn.M
 
                     if name in model_state_keys and name not in loaded_keys:
                         tensor_data = reader.read_tensor(name, to="torch")
+                        if tensor_data is None:
+                            print(
+                                f"    Warning: Could not read tensor '{name}'. Skipping."
+                            )
+                            continue
                         param = model.state_dict()[name]
 
                         if tensor_data.shape != param.shape:
@@ -74,24 +81,51 @@ def load_model(config: dict, create_model_fn: CreateModelFn) -> tuple[torch.nn.M
                                 f"    Warning: Shape mismatch for tensor '{name}'. Skipping."
                             )
                             continue
-                        if tensor_data.dtype != param.dtype:
-                            tensor_data = tensor_data.to(dtype=param.dtype)
-                        if tensor_data.device != param.device:
-                            tensor_data = tensor_data.to(device=param.device)
+                        # Convert to torch.Tensor if needed and check dtype/device compatibility
+                        tensor_dtype = getattr(tensor_data, "dtype", None)
+                        if (
+                            hasattr(tensor_data, "dtype")
+                            and tensor_dtype != param.dtype
+                        ):
+                            if hasattr(tensor_data, "to"):
+                                tensor_data = getattr(tensor_data, "to")(
+                                    dtype=param.dtype
+                                )
+                        tensor_device = getattr(tensor_data, "device", None)
+                        if (
+                            hasattr(tensor_data, "device")
+                            and tensor_device != param.device
+                        ):
+                            if hasattr(tensor_data, "to"):
+                                tensor_data = getattr(tensor_data, "to")(
+                                    device=param.device
+                                )
 
                         if name == "model.layers.0.input_layernorm.weight":
                             print("[ModelLoaderDebug] copying", name)
+                            dtype_val = getattr(tensor_data, "dtype", "unknown")
+                            device_val = getattr(tensor_data, "device", "unknown")
+                            min_val = (
+                                float(tensor_data.min())
+                                if hasattr(tensor_data, "min")
+                                else "unknown"
+                            )
+                            max_val = (
+                                float(tensor_data.max())
+                                if hasattr(tensor_data, "max")
+                                else "unknown"
+                            )
                             print(
                                 "[ModelLoaderDebug] source",
                                 name,
                                 "dtype=",
-                                tensor_data.dtype,
+                                dtype_val,
                                 "device=",
-                                tensor_data.device,
+                                device_val,
                                 "min=",
-                                float(tensor_data.min()),
+                                min_val,
                                 "max=",
-                                float(tensor_data.max()),
+                                max_val,
                             )
                             print(
                                 "[ModelLoaderDebug] target before copy",
@@ -130,9 +164,12 @@ def load_model(config: dict, create_model_fn: CreateModelFn) -> tuple[torch.nn.M
                 loaded_keys.add(target_name)
 
         if "lm_head.weight" in model_state_keys and "lm_head.weight" not in loaded_keys:
-            model.state_dict()["lm_head.weight"].copy_(
-                model.model.embed_tokens.weight, non_blocking=True
-            )
+            if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+                embed_tokens = getattr(model.model, "embed_tokens")
+                if hasattr(embed_tokens, "weight"):
+                    model.state_dict()["lm_head.weight"].copy_(
+                        embed_tokens.weight, non_blocking=True
+                    )
             loaded_keys.add("lm_head.weight")
 
         missing_keys = model_state_keys - loaded_keys
@@ -151,13 +188,13 @@ def load_model(config: dict, create_model_fn: CreateModelFn) -> tuple[torch.nn.M
             f"Fatal Error: Failed to read a ztensor file. Error: {exc}",
             file=sys.stderr,
         )
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
     except Exception as exc:
         print(
             f"An unexpected fatal error occurred during model loading: {exc}",
             file=sys.stderr,
         )
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
 
 
 __all__ = ["load_model"]

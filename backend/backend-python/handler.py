@@ -47,8 +47,18 @@ class PythonHandler(Handler):
             device=device,
         )
 
-        print(f"✅ PythonHandler initialized with FlashInfer backend")
+        print("✅ PythonHandler initialized with FlashInfer backend")
         print(f"   FlashInfer available: {flashinfer_ops.available}")
+
+    def upload_handler(self, reqs):
+        """Handle adapter upload requests."""
+        _ = reqs  # Parameter not currently used
+        raise NotImplementedError("upload_handler not yet implemented")
+
+    def download_handler(self, reqs):
+        """Handle adapter download requests."""
+        _ = reqs  # Parameter not currently used
+        raise NotImplementedError("download_handler not yet implemented")
 
 
 # For backwards compatibility, create Handler as an alias to PythonHandler

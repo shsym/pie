@@ -1,6 +1,13 @@
-import msgspec
+"""
+Message types for PIE backend communication.
+
+This module defines all the request and response message structures used for
+communication between the PIE backend and clients using msgspec.
+"""
 
 from typing import Optional
+
+import msgspec
 
 
 # ==============================================================================
@@ -9,10 +16,12 @@ from typing import Optional
 
 
 class HandshakeRequest(msgspec.Struct, gc=False):
+    """Request message for handshake with version information."""
     version: str
 
 
 class HandshakeResponse(msgspec.Struct, gc=False):
+    """Response message containing model and tokenizer information."""
     version: str
     model_name: str
     model_traits: list[str]  # Use built-in list
@@ -29,22 +38,25 @@ class HandshakeResponse(msgspec.Struct, gc=False):
 
 
 class QueryRequest(msgspec.Struct, gc=False):
+    """Request message for querying the model."""
     query: str
 
 
 class QueryResponse(msgspec.Struct, gc=False):
+    """Response message containing query result."""
     value: str
 
 
 class HeartbeatRequest(msgspec.Struct, gc=False):
-    pass
+    """Request message for keepalive heartbeat."""
 
 
 class HeartbeatResponse(msgspec.Struct, gc=False):
-    pass
+    """Response message for keepalive heartbeat."""
 
 
 class ForwardPassRequest(msgspec.Struct, gc=False):
+    """Request message for forward pass inference."""
     input_tokens: list[int]
     input_token_positions: list[int]
     input_embed_ptrs: list[int]
@@ -61,17 +73,20 @@ class ForwardPassRequest(msgspec.Struct, gc=False):
 
 
 class ForwardPassResponse(msgspec.Struct, gc=False):
+    """Response message containing inference results."""
     tokens: list[int]
     dists: list[tuple[list[int], list[float]]]
 
 
 class EmbedImageRequest(msgspec.Struct, gc=False):
+    """Request message for image embedding."""
     embed_ptrs: list[int]
     image_blob: bytes
     position_offset: int
 
 
 class InitializeAdapterRequest(msgspec.Struct, gc=False):
+    """Request message for adapter initialization."""
     adapter_ptr: int
     rank: int
     alpha: float
@@ -81,6 +96,7 @@ class InitializeAdapterRequest(msgspec.Struct, gc=False):
 
 
 class UpdateAdapterRequest(msgspec.Struct, gc=False):
+    """Request message for adapter updates."""
     adapter_ptr: int
     scores: list[float]
     seeds: list[int]
@@ -88,15 +104,18 @@ class UpdateAdapterRequest(msgspec.Struct, gc=False):
 
 
 class UploadAdapterRequest(msgspec.Struct, gc=False):
+    """Request message for adapter upload."""
     adapter_ptr: int
     name: str
     adapter_data: bytes
 
 
 class DownloadAdapterRequest(msgspec.Struct, gc=False):
+    """Request message for adapter download."""
     adapter_ptr: int
     name: str
 
 
 class DownloadAdapterResponse(msgspec.Struct, gc=False):
+    """Response message containing adapter data."""
     adapter_data: bytes

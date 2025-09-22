@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import enum
 import os
-import sys
 import random
 import struct
+import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Type
@@ -39,7 +40,10 @@ from message import (
     UploadAdapterRequest,
 )
 
+
 class HandlerId(enum.Enum):
+    """Enumeration of handler message types."""
+
     HANDSHAKE = 0
     HEARTBEAT = 1
     QUERY = 2
@@ -49,6 +53,7 @@ class HandlerId(enum.Enum):
     UPDATE_ADAPTER = 6
     UPLOAD_HANDLER = 7
     DOWNLOAD_HANDLER = 8
+
 
 @dataclass
 class ServerConfig:
@@ -71,6 +76,7 @@ class ServerConfig:
     dtype: str
 
     def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary."""
         return self.__dict__.copy()
 
 
@@ -158,16 +164,16 @@ def register(config: Dict[str, Any], endpoint: str) -> None:
     controller_addr = f"ws://{config['controller_host']}:{config['controller_port']}"
     try:
         with connect(controller_addr) as websocket:
-            websocket.send(
-                msgpack.packb(
-                    {
-                        "type": "authenticate",
-                        "corr_id": 0,
-                        "token": config["auth_token"],
-                    },
-                    use_bin_type=True,
-                )
+            auth_msg = msgpack.packb(
+                {
+                    "type": "authenticate",
+                    "corr_id": 0,
+                    "token": config["auth_token"],
+                },
+                use_bin_type=True,
             )
+            if auth_msg is not None:
+                websocket.send(auth_msg)
             auth_response = msgpack.unpackb(websocket.recv(), raw=False)
             if not auth_response.get("successful"):
                 print(
@@ -175,18 +181,18 @@ def register(config: Dict[str, Any], endpoint: str) -> None:
                 )
                 sys.exit(1)
 
-            websocket.send(
-                msgpack.packb(
-                    {
-                        "type": "attach_remote_service",
-                        "corr_id": 0,
-                        "endpoint": endpoint,
-                        "service_name": config["model"],
-                        "service_type": "model",
-                    },
-                    use_bin_type=True,
-                )
+            reg_msg = msgpack.packb(
+                {
+                    "type": "attach_remote_service",
+                    "corr_id": 0,
+                    "endpoint": endpoint,
+                    "service_name": config["model"],
+                    "service_type": "model",
+                },
+                use_bin_type=True,
             )
+            if reg_msg is not None:
+                websocket.send(reg_msg)
             reg_response = msgpack.unpackb(websocket.recv(), raw=False)
             if not reg_response.get("successful"):
                 print(
@@ -201,7 +207,7 @@ def register(config: Dict[str, Any], endpoint: str) -> None:
         print(f"Error: {exc}")
         print("Please ensure the controller is running and accessible. Terminating.")
         os._exit(1)
-    except Exception as exc:  # pragma: no cover - defensive logging
+    except (OSError, ValueError, RuntimeError) as exc:
         print(f"An unexpected error occurred during registration: {exc}. Terminating.")
         os._exit(1)
 
@@ -213,7 +219,7 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
     exception occurs.
     """
     # Heartbeat timeout and timer setup (60 seconds for FlashInfer JIT compilation)
-    HEARTBEAT_TIMEOUT = 60  # seconds
+    heartbeat_timeout = 60  # seconds
     last_heartbeat_time = time.monotonic()
 
     msgpack_encoder = msgspec.msgpack.Encoder()
@@ -223,10 +229,14 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
         HandlerId.QUERY.value: msgspec.msgpack.Decoder(QueryRequest),
         HandlerId.FORWARD_PASS.value: msgspec.msgpack.Decoder(ForwardPassRequest),
         HandlerId.EMBED_IMAGE.value: msgspec.msgpack.Decoder(EmbedImageRequest),
-        HandlerId.INITIALIZE_ADAPTER.value: msgspec.msgpack.Decoder(InitializeAdapterRequest),
+        HandlerId.INITIALIZE_ADAPTER.value: msgspec.msgpack.Decoder(
+            InitializeAdapterRequest
+        ),
         HandlerId.UPDATE_ADAPTER.value: msgspec.msgpack.Decoder(UpdateAdapterRequest),
         HandlerId.UPLOAD_HANDLER.value: msgspec.msgpack.Decoder(UploadAdapterRequest),
-        HandlerId.DOWNLOAD_HANDLER.value: msgspec.msgpack.Decoder(DownloadAdapterRequest),
+        HandlerId.DOWNLOAD_HANDLER.value: msgspec.msgpack.Decoder(
+            DownloadAdapterRequest
+        ),
     }
 
     poller = zmq.Poller()
@@ -235,8 +245,11 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
     try:
         while True:
             # Check for heartbeat timeout before waiting for a message
-            if time.monotonic() - last_heartbeat_time > HEARTBEAT_TIMEOUT:
-                print(f"[!] Heartbeat timeout after {HEARTBEAT_TIMEOUT}s, exiting", file=sys.stderr)
+            if time.monotonic() - last_heartbeat_time > heartbeat_timeout:
+                print(
+                    f"[!] Heartbeat timeout after {heartbeat_timeout}s, exiting",
+                    file=sys.stderr,
+                )
                 os._exit(1)  # Use os._exit for immediate termination from a thread
 
             # Poll for 1 second to remain responsive to the heartbeat check
@@ -253,7 +266,9 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
 
             client_identity, corr_id_bytes, handler_id_bytes = message[:3]
             try:
-                corr_id = struct.unpack(">I", corr_id_bytes)[0]
+                _ = struct.unpack(">I", corr_id_bytes)[
+                    0
+                ]  # corr_id extracted but not used
                 handler_id = struct.unpack(">I", handler_id_bytes)[0]
                 reqs = [decoders[handler_id].decode(m) for m in message[3:]]
             except (struct.error, KeyError, msgspec.DecodeError) as exc:
@@ -264,7 +279,7 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
                 continue
 
             if not reqs:
-                print(f"[!] Received empty request body", file=sys.stderr)
+                print("[!] Received empty request body", file=sys.stderr)
                 continue
 
             resps = []
@@ -298,12 +313,11 @@ def run_zmq_server(socket: zmq.Socket, handler: Any) -> None:
                 ]
                 socket.send_multipart(response_msg)
 
-    except Exception as exc:
+    except (zmq.ZMQError, OSError, ValueError, RuntimeError, KeyError) as exc:
         print(
             f"\n[!!!] Unhandled error occurred in the ZMQ server loop: {exc}",
             file=sys.stderr,
         )
-        import traceback
         traceback.print_exc()
         os._exit(1)
 
