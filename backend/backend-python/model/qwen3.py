@@ -1,15 +1,13 @@
 """Qwen 3 Large Language Model Architecture (Qwen3)"""
 
 from __future__ import annotations
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import torch
 from torch import nn
 
-from common import AdapterSubpass, TensorLoader
+from common import AdapterSubpass, TensorLoader, Qwen3Arch
 import flashinfer as ops
-
-from config.qwen3 import Qwen3Arch
 
 VERSION = "0.1.0"
 
@@ -226,7 +224,7 @@ class Qwen3Attention(nn.Module):
         kv_last_page_lens: torch.Tensor,
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
-        adapter_subpass: AdapterSubpass | None,
+        adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
         """Forward pass through the attention module."""
 
@@ -328,7 +326,7 @@ class Qwen3DecoderLayer(nn.Module):
         kv_last_page_lens: torch.Tensor,
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
-        adapter_subpass: AdapterSubpass | None,
+        adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
         """Forward pass through the decoder layer."""
         residual = hidden_states
@@ -411,7 +409,7 @@ class Qwen3Model(nn.Module):
         kv_last_page_lens: torch.Tensor,
         custom_mask: torch.Tensor,
         single_token_inference_mode: bool,
-        adapter_subpass: AdapterSubpass | None,
+        adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
         """Forward pass through the Qwen3 model."""
         hidden_states = input_embeds

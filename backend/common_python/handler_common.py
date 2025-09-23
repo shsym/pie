@@ -11,7 +11,7 @@ import torch
 import message
 
 # Safe import of adapter functionality
-from adapter_import_utils import AdapterSubpass, ensure_adapter_available
+from adapter_import_utils import ensure_adapter_available
 
 from config.common import ModelInfo
 from debug_utils import is_tensor_debug_enabled, checkpoint_validation
@@ -438,9 +438,9 @@ class ForwardPassBatch:
 
         adapter_subpass = None
         if self.adapter_subpass_needed:
-            AdapterSubpassClass = ensure_adapter_available()
+            adapter_subpass_class = ensure_adapter_available()
             seeds_tensor = torch.as_tensor(self.seeds, device=device, dtype=torch.long)
-            adapter_subpass = AdapterSubpassClass(
+            adapter_subpass = adapter_subpass_class(
                 adapter_at_layer=self._handler.adapter_at_layer,
                 adapter_indices=self.adapter_indices,
                 adapter_extras=self._handler.adapters,
