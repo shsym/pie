@@ -1,15 +1,17 @@
 """GPT OSS Large Language Model Architecture"""
 
 from __future__ import annotations
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 import math
 import torch
 from torch import nn
 import torch.distributed as dist
 
-from common import AdapterSubpass, TensorLoader, GPTOSSArch
+from common import AdapterSubpass, TensorLoader
 import flashinfer as ops
+
+from config.gptoss import GPTOSSArch
 
 VERSION = "0.1.0"
 
@@ -523,7 +525,7 @@ class GPTOSSAttention(nn.Module):
         kv_last_page_lens: torch.Tensor,
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
-        adapter_subpass: Optional[AdapterSubpass],
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the attention module."""
         n, _ = hidden_states.size()
@@ -739,7 +741,7 @@ class GPTOSSDecoderLayer(nn.Module):
         kv_last_page_lens: torch.Tensor,
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
-        adapter_subpass: Optional[AdapterSubpass],
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the decoder layer."""
         residual = hidden_states
@@ -836,7 +838,7 @@ class GPTOSSModel(nn.Module):
         kv_last_page_lens: torch.Tensor,
         custom_mask: torch.Tensor,
         single_token_inference_mode: bool,
-        adapter_subpass: Optional[AdapterSubpass],
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the GPT OSS model."""
         hidden_states = input_embeds
