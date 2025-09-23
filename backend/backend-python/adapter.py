@@ -45,12 +45,12 @@ class AdapterSubpass:
     """Handles execution of adapter operations during model inference."""
 
     def __init__(
-            self,
-            adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]],
-            adapter_indices: list[int],
-            adapter_extras: dict[int, Adapter],
-            rand_seeds: torch.Tensor,
-            qo_indptr: list[int],
+        self,
+        adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]],
+        adapter_indices: list[int],
+        adapter_extras: dict[int, Adapter],
+        rand_seeds: torch.Tensor,
+        qo_indptr: list[int],
     ):
         self.adapter_at_layer = adapter_at_layer
         self.adapter_indices = adapter_indices
@@ -60,12 +60,12 @@ class AdapterSubpass:
         self.qo_indptr = qo_indptr
 
     def execute(
-            self,
-            layer_idx: int,
-            xs: torch.Tensor,
-            q_state: torch.Tensor,
-            k_state: torch.Tensor,
-            v_state: torch.Tensor,
+        self,
+        layer_idx: int,
+        xs: torch.Tensor,
+        q_state: torch.Tensor,
+        k_state: torch.Tensor,
+        v_state: torch.Tensor,
     ):
         """Execute adapter operations for the given layer and tensors."""
         i = 0
@@ -76,7 +76,6 @@ class AdapterSubpass:
             x = xs[x_start:x_end]
 
             rand_seeds = self.rand_seeds[i : i + count]
-            _ = rand_seeds.any().item()  # Check for noise injection (unused for now)
 
             assert x.shape[0] == rand_seeds.shape[0], "Batch size must match seeds."
 
@@ -127,7 +126,7 @@ class Adapter:
     out_features_indptr: list[int]
 
     def __init__(
-            self, adapter_id: int, rank: int, alpha: float, out_features: list[int]
+        self, adapter_id: int, rank: int, alpha: float, out_features: list[int]
     ):
         self.adapter_id = adapter_id
         self.rank = rank
@@ -136,6 +135,4 @@ class Adapter:
 
         self.out_features_indptr = [0]
         for feature_size in out_features:
-            self.out_features_indptr.append(
-                self.out_features_indptr[-1] + feature_size
-            )
+            self.out_features_indptr.append(self.out_features_indptr[-1] + feature_size)

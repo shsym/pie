@@ -5,9 +5,8 @@ This module provides the FlashInfer-based handler for the Python backend.
 It instantiates the common Handler class with FlashInfer operations.
 """
 
-from handler_common import Handler
+from common import Handler, ModelInfo
 from backend_ops import FlashInferOps
-from config.common import ModelInfo
 import torch
 
 

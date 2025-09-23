@@ -5,14 +5,15 @@ runtime backend for kernel-specific behaviour (e.g. FlashInfer or Metal).
 """
 
 from __future__ import annotations
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Optional
 
 import torch
 from torch import nn
 
 from debug_utils import is_tensor_debug_enabled, checkpoint_validation
 
-from adapter import AdapterSubpass
+# Safe import of adapter functionality
+from adapter_import_utils import AdapterSubpass
 from config.l4ma import L4maArch
 from config.common import TensorLoader
 from .l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
@@ -239,7 +240,7 @@ class L4maAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         kv_cache_at_layer: Sequence[torch.Tensor],
-        adapter_subpass: AdapterSubpass | None,
+        adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
         """Attention forward pass that delegates runtime specifics."""
 
@@ -470,7 +471,7 @@ class L4maDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         kv_cache_at_layer: Sequence[torch.Tensor],
-        adapter_subpass: AdapterSubpass | None,
+        adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
         """Run the decoder layer using the provided runtime context."""
 
@@ -729,7 +730,7 @@ class L4maModel(nn.Module):
         custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
         # subpasses
-        adapter_subpass: AdapterSubpass | None,
+        adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
         """Forward pass through all decoder layers using the injected backend."""
 

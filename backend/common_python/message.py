@@ -17,11 +17,13 @@ import msgspec
 
 class HandshakeRequest(msgspec.Struct, gc=False):
     """Request message for handshake with version information."""
+
     version: str
 
 
 class HandshakeResponse(msgspec.Struct, gc=False):
     """Response message containing model and tokenizer information."""
+
     version: str
     model_name: str
     model_traits: list[str]  # Use built-in list
@@ -39,11 +41,13 @@ class HandshakeResponse(msgspec.Struct, gc=False):
 
 class QueryRequest(msgspec.Struct, gc=False):
     """Request message for querying the model."""
+
     query: str
 
 
 class QueryResponse(msgspec.Struct, gc=False):
     """Response message containing query result."""
+
     value: str
 
 
@@ -57,6 +61,7 @@ class HeartbeatResponse(msgspec.Struct, gc=False):
 
 class ForwardPassRequest(msgspec.Struct, gc=False):
     """Request message for forward pass inference."""
+
     input_tokens: list[int]
     input_token_positions: list[int]
     input_embed_ptrs: list[int]
@@ -64,22 +69,24 @@ class ForwardPassRequest(msgspec.Struct, gc=False):
     adapter: Optional[int]
     adapter_seed: Optional[int]
     mask: list[list[int]]
-    kv_page_ptrs: list[int]
-    kv_page_last_len: int
-    output_token_indices: list[int]
-    output_token_samplers: list[dict]
-    output_embed_ptrs: list[int]
-    output_embed_indices: list[int]
+    kv_page_ptrs: list[int] = msgspec.field(default_factory=list)
+    kv_page_last_len: int = 0
+    output_token_indices: list[int] = msgspec.field(default_factory=list)
+    output_token_samplers: list[dict] = msgspec.field(default_factory=list)
+    output_embed_ptrs: list[int] = msgspec.field(default_factory=list)
+    output_embed_indices: list[int] = msgspec.field(default_factory=list)
 
 
 class ForwardPassResponse(msgspec.Struct, gc=False):
     """Response message containing inference results."""
+
     tokens: list[int]
     dists: list[tuple[list[int], list[float]]]
 
 
 class EmbedImageRequest(msgspec.Struct, gc=False):
     """Request message for image embedding."""
+
     embed_ptrs: list[int]
     image_blob: bytes
     position_offset: int
@@ -87,6 +94,7 @@ class EmbedImageRequest(msgspec.Struct, gc=False):
 
 class InitializeAdapterRequest(msgspec.Struct, gc=False):
     """Request message for adapter initialization."""
+
     adapter_ptr: int
     rank: int
     alpha: float
@@ -97,6 +105,7 @@ class InitializeAdapterRequest(msgspec.Struct, gc=False):
 
 class UpdateAdapterRequest(msgspec.Struct, gc=False):
     """Request message for adapter updates."""
+
     adapter_ptr: int
     scores: list[float]
     seeds: list[int]
@@ -105,6 +114,7 @@ class UpdateAdapterRequest(msgspec.Struct, gc=False):
 
 class UploadAdapterRequest(msgspec.Struct, gc=False):
     """Request message for adapter upload."""
+
     adapter_ptr: int
     name: str
     adapter_data: bytes
@@ -112,10 +122,12 @@ class UploadAdapterRequest(msgspec.Struct, gc=False):
 
 class DownloadAdapterRequest(msgspec.Struct, gc=False):
     """Request message for adapter download."""
+
     adapter_ptr: int
     name: str
 
 
 class DownloadAdapterResponse(msgspec.Struct, gc=False):
     """Response message containing adapter data."""
+
     adapter_data: bytes

@@ -7,11 +7,12 @@ from typing import Optional
 
 import torch
 
-from config.l4ma import L4maArch
-from .base import L4maBackend, L4maForwardContext, RuntimeInputs
+from common import L4maArch
+from common_model.l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
 
 try:  # pragma: no cover - optional dependency guard
     import flashinfer as ops  # type: ignore[import]
+
     # FlashInfer wrapper types - using object as fallback for type checking
     # Union type not available when FlashInfer is missing
     FlashInferWrapper = object  # type: ignore[misc]
@@ -47,6 +48,7 @@ class _FlashInferForwardContext(L4maForwardContext):
         config: L4maArch,
         inputs: RuntimeInputs,
         wrapper: FlashInferWrapper,  # type: ignore[name-defined]
+        kv_layout: str,
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
         metadata: FlashInferRuntimeMetadata,
@@ -54,16 +56,19 @@ class _FlashInferForwardContext(L4maForwardContext):
         self._config = config
         self._inputs = inputs
         self.wrapper = wrapper
+        self._kv_layout = kv_layout
         self._batch_indices = batch_indices
         self._batch_positions = batch_positions
         self._metadata = metadata
 
     @property
     def batch_indices(self) -> torch.Tensor:
+        """Get the batch indices tensor."""
         return self._batch_indices
 
     @property
     def batch_positions(self) -> torch.Tensor:
+        """Get the batch positions tensor."""
         return self._batch_positions
 
     @property
@@ -77,6 +82,7 @@ class _FlashInferForwardContext(L4maForwardContext):
         key_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> None:
+        """Apply RoPE encoding to query and key states."""
         if ops is None:
             raise RuntimeError("FlashInfer not available")
         ops.apply_llama31_rope_pos_ids_inplace(  # type: ignore
@@ -92,6 +98,7 @@ class _FlashInferForwardContext(L4maForwardContext):
         value_states: torch.Tensor,
         kv_cache_layer: torch.Tensor,
     ) -> None:
+        """Append key and value states to the KV cache."""
         _ = layer_idx  # Parameter not currently used
         if ops is None:
             raise RuntimeError("FlashInfer not available")
@@ -104,7 +111,7 @@ class _FlashInferForwardContext(L4maForwardContext):
             kv_indices=self._inputs.kv_page_indices,
             kv_indptr=self._inputs.kv_page_indptr,
             kv_last_page_len=self._inputs.kv_last_page_lens,
-            kv_layout="NHD",
+            kv_layout=self._kv_layout,
         )
 
     def run_attention(
@@ -113,6 +120,7 @@ class _FlashInferForwardContext(L4maForwardContext):
         query_states: torch.Tensor,
         kv_cache_layer: torch.Tensor,
     ) -> torch.Tensor:
+        """Run attention computation using FlashInfer."""
         _ = layer_idx  # Parameter not currently used
         attn_output = self.wrapper.run(query_states, kv_cache_layer)
         return attn_output.reshape(attn_output.size(0), -1)
@@ -127,9 +135,7 @@ class FlashInferL4maBackend(L4maBackend):
         return ops is not None
 
     def __init__(
-        self,
-        workspace_size_bytes: int = 128 * 1024 * 1024,
-        kv_layout: str = "NHD"
+        self, workspace_size_bytes: int = 128 * 1024 * 1024, kv_layout: str = "NHD"
     ) -> None:
         if ops is None:
             raise RuntimeError(
@@ -143,10 +149,10 @@ class FlashInferL4maBackend(L4maBackend):
         self._workspace_buffer: Optional[torch.Tensor] = None
         # Type ignore: FlashInfer types are optional dependencies not available in CI
         self._decode_wrapper: Optional[  # type: ignore[name-defined]
-            ops.BatchDecodeWithPagedKVCacheWrapper
+            ops.BatchDecodeWithPagedKVCacheWrapper  # type: ignore[name-defined]
         ] = None
         self._prefill_wrapper: Optional[  # type: ignore[name-defined]
-            ops.BatchPrefillWithPagedKVCacheWrapper
+            ops.BatchPrefillWithPagedKVCacheWrapper  # type: ignore[name-defined]
         ] = None
 
     def _ensure_workspace(self, device: torch.device | str) -> None:
@@ -177,6 +183,7 @@ class FlashInferL4maBackend(L4maBackend):
         config: L4maArch,
         inputs: RuntimeInputs,
     ) -> L4maForwardContext:
+        """Create a forward context for FlashInfer execution."""
         self._ensure_workspace(config.device)
 
         if ops is None:
@@ -234,6 +241,7 @@ class FlashInferL4maBackend(L4maBackend):
             config=config,
             inputs=inputs,
             wrapper=wrapper,
+            kv_layout=self.kv_layout,
             batch_indices=batch_indices,
             batch_positions=batch_positions,
             metadata=metadata,

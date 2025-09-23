@@ -2,12 +2,33 @@
 
 from __future__ import annotations
 
-from config.common import ModelInfo
-from config.l4ma import L4maArch
-from config.qwen3 import Qwen3Arch
-from config.gptoss import GPTOSSArch
-from model.l4ma import L4maForCausalLM, create_fusion_map as create_l4ma_fusion_map
-from model.l4ma_runtime import FlashInferL4maBackend
+import sys
+from pathlib import Path
+
+# Use repo_utils for consistent path setup
+_repo_utils_path = Path(__file__).parent.parent.parent / "repo_utils.py"
+sys.path.insert(0, str(_repo_utils_path.parent))
+
+import repo_utils  # pylint: disable=wrong-import-position
+
+repo_utils.setup_pie_imports()
+
+# pylint: disable=wrong-import-position,wrong-import-order  # Must come after repo_utils setup
+from common import (
+    ModelInfo,
+    L4maArch,
+    Qwen3Arch,
+    GPTOSSArch,
+)
+
+# Import model components from common_python (base classes)
+from common_model.l4ma import (
+    L4maForCausalLM,
+    create_fusion_map as create_l4ma_fusion_map,
+)
+
+# Import model components from local backend-python model directory
+from model.l4ma_flashinfer import FlashInferL4maBackend
 from model.qwen3 import Qwen3ForCausalLM, create_fusion_map as create_qwen3_fusion_map
 from model.gptoss import (
     GPTOSSForCausalLM,

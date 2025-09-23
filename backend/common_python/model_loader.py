@@ -81,71 +81,28 @@ def load_model(
                                 f"    Warning: Shape mismatch for tensor '{name}'. Skipping."
                             )
                             continue
-                        # Convert to torch.Tensor if needed and check dtype/device compatibility
-                        tensor_dtype = getattr(tensor_data, "dtype", None)
-                        if (
-                            hasattr(tensor_data, "dtype")
-                            and tensor_dtype != param.dtype
-                        ):
-                            if hasattr(tensor_data, "to"):
-                                tensor_data = getattr(tensor_data, "to")(
-                                    dtype=param.dtype
-                                )
-                        tensor_device = getattr(tensor_data, "device", None)
-                        if (
-                            hasattr(tensor_data, "device")
-                            and tensor_device != param.device
-                        ):
-                            if hasattr(tensor_data, "to"):
-                                tensor_data = getattr(tensor_data, "to")(
-                                    device=param.device
-                                )
+                        # Ensure dtype/device compatibility using a single conversion
+                        if hasattr(tensor_data, "to"):
+                            needs_conversion = False
+                            conversion_kwargs = {}
 
-                        if name == "model.layers.0.input_layernorm.weight":
-                            print("[ModelLoaderDebug] copying", name)
-                            dtype_val = getattr(tensor_data, "dtype", "unknown")
-                            device_val = getattr(tensor_data, "device", "unknown")
-                            min_val = (
-                                float(tensor_data.min())
-                                if hasattr(tensor_data, "min")
-                                else "unknown"
-                            )
-                            max_val = (
-                                float(tensor_data.max())
-                                if hasattr(tensor_data, "max")
-                                else "unknown"
-                            )
-                            print(
-                                "[ModelLoaderDebug] source",
-                                name,
-                                "dtype=",
-                                dtype_val,
-                                "device=",
-                                device_val,
-                                "min=",
-                                min_val,
-                                "max=",
-                                max_val,
-                            )
-                            print(
-                                "[ModelLoaderDebug] target before copy",
-                                name,
-                                "dtype=",
-                                param.dtype,
-                                "device=",
-                                param.device,
-                            )
+                            if hasattr(tensor_data, "dtype"):
+                                tensor_dtype = getattr(tensor_data, "dtype")
+                                if tensor_dtype != param.dtype:
+                                    conversion_kwargs["dtype"] = param.dtype
+                                    needs_conversion = True
+
+                            if hasattr(tensor_data, "device"):
+                                tensor_device = getattr(tensor_data, "device")
+                                if tensor_device != param.device:
+                                    conversion_kwargs["device"] = param.device
+                                    needs_conversion = True
+
+                            if needs_conversion:
+                                to_method = getattr(tensor_data, "to")
+                                tensor_data = to_method(**conversion_kwargs)
                         with torch.no_grad():
                             param.copy_(tensor_data, non_blocking=True)
-                        if name == "model.layers.0.input_layernorm.weight":
-                            print(
-                                "[ModelLoaderDebug] target after copy",
-                                name,
-                                "min=",
-                                float(param.min()),
-                                "max=",
-                                float(param.max()),
-                            )
                         loaded_keys.add(name)
 
         for target_name, details in fusion_map.items():
@@ -167,10 +124,12 @@ def load_model(
             if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
                 embed_tokens = getattr(model.model, "embed_tokens")
                 if hasattr(embed_tokens, "weight"):
-                    model.state_dict()["lm_head.weight"].copy_(
-                        embed_tokens.weight, non_blocking=True
+                    target_tensor = model.state_dict()["lm_head.weight"]
+                    source_tensor = getattr(embed_tokens, "weight").to(
+                        dtype=target_tensor.dtype, device=target_tensor.device
                     )
-            loaded_keys.add("lm_head.weight")
+                    target_tensor.copy_(source_tensor, non_blocking=True)
+                    loaded_keys.add("lm_head.weight")
 
         missing_keys = model_state_keys - loaded_keys
         if missing_keys:
