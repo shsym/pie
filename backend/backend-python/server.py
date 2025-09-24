@@ -4,10 +4,14 @@
 
 import fire
 
+from common import (
+    load_model as load_model_common,
+    build_config,
+    print_config,
+    start_service,
+)
 from handler import Handler
 from model_factory import create_model_and_fusion_map
-from model_loader import load_model as load_model_common
-from server_common import build_config, print_config, start_service
 
 
 def main(

@@ -6,16 +6,19 @@ import sys
 from pathlib import Path
 
 BACKEND_PYTHON_PATH = Path(__file__).resolve().parents[2] / "backend-python"
+COMMON_PYTHON_PATH = Path(__file__).resolve().parents[2] / "common_python"
 if str(BACKEND_PYTHON_PATH) not in sys.path:
     sys.path.insert(0, str(BACKEND_PYTHON_PATH))
+if str(COMMON_PYTHON_PATH) not in sys.path:
+    sys.path.insert(0, str(COMMON_PYTHON_PATH))
 
 from dataclasses import asdict
 
 from config.common import ModelInfo
-from model.l4ma import L4maForCausalLM, create_fusion_map as create_l4ma_fusion_map
+from common_model.l4ma import L4maForCausalLM, create_fusion_map as create_l4ma_fusion_map
 
 from l4ma_runtime import MetalL4maBackend
-from debug_framework.integrations.metal_backend import MetalBackend
+from metal_backend import MetalBackend
 
 
 def create_model_and_fusion_map(model_info: ModelInfo):

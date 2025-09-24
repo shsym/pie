@@ -10,17 +10,20 @@ from typing import Any, Optional
 
 import torch
 
-# Ensure backend-python modules are importable so we can reuse shared interfaces
+# Ensure backend-python and common_python modules are importable so we can reuse shared interfaces
 BACKEND_PYTHON_PATH = Path(__file__).resolve().parents[2] / "backend-python"
+COMMON_PYTHON_PATH = Path(__file__).resolve().parents[2] / "common_python"
 if str(BACKEND_PYTHON_PATH) not in sys.path:
     sys.path.insert(0, str(BACKEND_PYTHON_PATH))
+if str(COMMON_PYTHON_PATH) not in sys.path:
+    sys.path.insert(0, str(COMMON_PYTHON_PATH))
 
-from model.l4ma_runtime.base import L4maBackend, L4maForwardContext, RuntimeInputs
+from common_model.l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
 from config.l4ma import L4maArch
 from debug_utils import is_tensor_debug_enabled, is_capture_debug_enabled
 
 try:  # pragma: no cover - optional dependency guard
-    from debug_framework.integrations.metal_backend import MetalBackend
+    from metal_backend import MetalBackend
 except ImportError:  # pragma: no cover - optional dependency guard
     MetalBackend = None  # type: ignore[assignment]
 

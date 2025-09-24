@@ -25,7 +25,7 @@ class MetalOps(BackendOps):
         super().__init__("metal")
         # Check if Metal backend is available
         try:
-            from debug_framework.integrations.metal_backend import MetalBackend
+            from metal_backend import MetalBackend
             self.available = True
             print("✅ Metal backend available for operations")
         except ImportError:

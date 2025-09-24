@@ -17,7 +17,7 @@ from config.l4ma import L4maArch
 
 # Import Metal backend
 try:
-    from debug_framework.integrations.metal_backend import MetalBackend
+    from metal_backend import MetalBackend
     METAL_BACKEND_AVAILABLE = True
 except ImportError:
     METAL_BACKEND_AVAILABLE = False
