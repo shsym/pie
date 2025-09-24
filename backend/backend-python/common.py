@@ -14,10 +14,10 @@ repo_utils.setup_pie_imports()
 # Import from common_python modules - import what's actually used by backend-python
 # pylint: disable=unused-import  # These are re-exported for the module interface
 # pylint: disable=wrong-import-position,wrong-import-order  # Must come after repo_utils setup
-from config.common import ModelInfo, TensorLoader
+from config.common import ModelInfo
 from config.l4ma import L4maArch
 from config.qwen3 import Qwen3Arch
-from config.gptoss import GPTOSSArch
+from config.gptoss import GptOssArch
 from model_loader import load_model
 from server_common import build_config, print_config, start_service
 from handler_common import Handler
