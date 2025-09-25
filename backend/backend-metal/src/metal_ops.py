@@ -61,12 +61,16 @@ class MetalOps(BackendOps):
         """Simple multinomial sampling using PyTorch (fallback until Metal implementation)."""
         # For now, use PyTorch's multinomial sampling
         # TODO: Implement Metal kernel for sampling
-        print("🔧 Using PyTorch multinomial sampling (Metal implementation pending)")
         return torch.multinomial(probs, 1).squeeze(-1)
 
     def _metal_top_p_sample(self, probs: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
         """Top-p sampling implementation using Metal-optimized approach."""
-        print("🔧 Using Metal-optimized top-p sampling")
+
+        # Validate inputs
+        if probs.size(0) == 0:
+            raise ValueError("Cannot sample from empty batch")
+        if not torch.isfinite(probs).all():
+            raise ValueError("Non-finite probabilities detected")
 
         # Sort probabilities in descending order
         sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
@@ -75,26 +79,43 @@ class MetalOps(BackendOps):
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
         # Create mask for probabilities to keep (cumulative probability <= top_p)
-        # We keep at least one token even if its probability exceeds top_p
-        keep_mask = cumulative_probs <= top_p.unsqueeze(-1)
-        keep_mask[..., 0] = True  # Always keep the highest probability token
+        # Handle broadcasting more robustly
+        if top_p.numel() == 1:
+            # Single top_p value - use scalar comparison for efficiency
+            threshold = top_p.item()
+            keep_mask = cumulative_probs <= threshold
+        else:
+            # Multiple top_p values - use tensor broadcasting
+            keep_mask = cumulative_probs <= top_p.unsqueeze(-1)
+
+        # Always keep at least the highest probability token
+        keep_mask[..., 0] = True
 
         # Set probabilities of filtered tokens to 0
         filtered_probs = sorted_probs.clone()
         filtered_probs[~keep_mask] = 0.0
 
-        # Renormalize
-        filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
+        # Renormalize and validate
+        prob_sums = filtered_probs.sum(dim=-1, keepdim=True)
+        if (prob_sums <= 0).any():
+            raise ValueError("Filtered probabilities sum to zero; cannot sample")
+        filtered_probs = filtered_probs / prob_sums
 
         # Sample from filtered distribution
         sampled_indices = torch.multinomial(filtered_probs, 1).squeeze(-1)
 
         # Map back to original indices
-        return sorted_indices.gather(-1, sampled_indices.unsqueeze(-1)).squeeze(-1)
+        result = sorted_indices.gather(-1, sampled_indices.unsqueeze(-1)).squeeze(-1)
+
+        # Validate result
+        vocab_size = probs.size(-1)
+        if (result < 0).any() or (result >= vocab_size).any():
+            raise ValueError(f"Invalid token IDs generated: {result}")
+
+        return result
 
     def _metal_top_k_sample(self, probs: torch.Tensor, top_k: torch.Tensor) -> torch.Tensor:
         """Top-k sampling implementation using Metal-optimized approach."""
-        print("🔧 Using Metal-optimized top-k sampling")
 
         if top_k.numel() == 0:
             raise ValueError("top_k tensor must contain at least one element")
@@ -127,7 +148,6 @@ class MetalOps(BackendOps):
 
     def _metal_min_p_sample(self, probs: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
         """Min-p sampling implementation using Metal-optimized approach."""
-        print("🔧 Using Metal-optimized min-p sampling")
 
         # Find maximum probability
         max_prob = torch.max(probs, dim=-1, keepdim=True)[0]

@@ -49,8 +49,28 @@ class MetalHandler(BaseHandler):
             device=device,
         )
 
-        print("✅ MetalHandler initialized with Metal backend")
-        print(f"   Metal kernels available: {metal_ops.available}")
+        # CRITICAL FIX: Keep logits_dtype consistent with model dtype to prevent precision issues
+        # The original override to float32 may cause dtype mismatches that corrupt outputs
+        # If we need higher precision for sampling, we should convert at the sampling stage only
+        print(f"🔧 MetalHandler initialized with dtype={dtype}")
+        print(f"   Model first param dtype: {next(model.parameters()).dtype}")
+        print(f"   Handler dtype: {self.dtype}")
+        print(f"   Logits dtype: {self.logits_dtype}")
+
+        # Keep logits_dtype aligned with model dtype to prevent conversion issues
+        # self.logits_dtype = torch.float32  # DISABLED: May cause corruption
+
+        # Log initialization complete
+
+    def upload_handler(self, reqs):
+        """Handle adapter upload requests."""
+        _ = reqs  # Parameter not currently used
+        raise NotImplementedError("upload_handler not yet implemented")
+
+    def download_handler(self, reqs):
+        """Handle adapter download requests."""
+        _ = reqs  # Parameter not currently used
+        raise NotImplementedError("download_handler not yet implemented")
 
 
 # Alias that mirrors backend-python/handler.py so imports can use `from handler import Handler`

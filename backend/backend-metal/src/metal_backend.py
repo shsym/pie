@@ -184,6 +184,8 @@ class MetalBackend:
         kv_page_indices: Optional[np.ndarray] = None,
         kv_page_indptr: Optional[np.ndarray] = None,
         kv_last_page_lens: Optional[np.ndarray] = None,
+        qo_indptr: Optional[np.ndarray] = None,
+        custom_mask: Optional[np.ndarray] = None,
         **kwargs
     ) -> TensorComputationResult:
         """
@@ -227,27 +229,44 @@ class MetalBackend:
                 kv_page_indptr = np.array([0, 1], dtype=np.int32)
                 kv_last_page_lens = np.array([batch_seq], dtype=np.int32)
 
+            if qo_indptr is None:
+                qo_indptr = np.array([0, batch_seq], dtype=np.int32)
+
             query_f32 = np.asarray(query_2d, dtype=np.float32, order="C")
             kv_f32 = np.asarray(kv_cache, dtype=np.float32, order="C")
 
-            result = self._metal_executor.execute_attention_with_kv_cache(
-                query_f32,
-                kv_f32,
-                kv_page_indices.astype(np.int32),
-                kv_page_indptr.astype(np.int32),
-                kv_last_page_lens.astype(np.int32),
-                self._attention_config['num_query_heads'],
-                self._attention_config['num_kv_heads'],
-                self._attention_config['head_size'],
-                self._attention_config['page_size']
-            )
+            # Prefer masked kernel if provided and a custom_mask is available
+            if custom_mask is not None and hasattr(self._metal_executor, 'execute_attention_with_kv_cache_masked'):
+                result = self._metal_executor.execute_attention_with_kv_cache_masked(
+                    query_f32,
+                    kv_f32,
+                    kv_page_indices.astype(np.int32),
+                    kv_page_indptr.astype(np.int32),
+                    kv_last_page_lens.astype(np.int32),
+                    qo_indptr.astype(np.int32),
+                    self._attention_config['num_query_heads'],
+                    self._attention_config['num_kv_heads'],
+                    self._attention_config['head_size'],
+                    self._attention_config['page_size'],
+                    custom_mask.astype(np.uint8)
+                )
+            else:
+                result = self._metal_executor.execute_attention_with_kv_cache(
+                    query_f32,
+                    kv_f32,
+                    kv_page_indices.astype(np.int32),
+                    kv_page_indptr.astype(np.int32),
+                    kv_last_page_lens.astype(np.int32),
+                    qo_indptr.astype(np.int32),
+                    self._attention_config['num_query_heads'],
+                    self._attention_config['num_kv_heads'],
+                    self._attention_config['head_size'],
+                    self._attention_config['page_size']
+                )
 
             computation_time = time.perf_counter() - start_time
 
-            print(f"✅ Metal KV cache attention completed:")
-            print(f"   Query: {query.shape} → Output: {result.shape}")
-            print(f"   KV cache: {kv_cache.shape}")
-            print(f"   Computation time: {computation_time:.4f}s")
+            # Debug prints removed for production
 
             return TensorComputationResult(
                 output=result,
@@ -258,7 +277,8 @@ class MetalBackend:
                     'kv_cache_shape': kv_cache.shape,
                     'device': self._device_info,
                     'kernels_available': self._available_kernels.get('attention', False),
-                    'use_real_kv_cache': True
+                    'use_real_kv_cache': True,
+                    'masked': custom_mask is not None and hasattr(self._metal_executor, 'execute_attention_with_kv_cache_masked')
                 }
             )
 
@@ -274,7 +294,8 @@ class MetalBackend:
             'metallib_path': self._metallib_path,
             'available_kernels': self._available_kernels.copy(),
             'metal_backend_path': self.metal_backend_path,
-            'platform_support': sys.platform == 'darwin'
+            'platform_support': sys.platform == 'darwin',
+            'masked_attention': bool(self._metal_executor and hasattr(self._metal_executor, 'execute_attention_with_kv_cache_masked'))
         }
 
     def cleanup(self):

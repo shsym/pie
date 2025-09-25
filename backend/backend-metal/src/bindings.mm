@@ -199,6 +199,7 @@ public:
     py::array_t<float> execute_attention_with_kv_cache(
         py::array query, py::array kv_cache,
         py::array_t<int> kv_page_indices, py::array_t<int> kv_page_indptr, py::array_t<int> kv_last_page_lens,
+        py::array_t<int> qo_indptr,
         int num_query_heads = 32, int num_kv_heads = 32, int head_size = 128, int page_size = 16) {
         @autoreleasepool {
             auto q_buf = query.request();
@@ -206,6 +207,7 @@ public:
             auto kv_indices_buf = kv_page_indices.request();
             auto kv_indptr_buf = kv_page_indptr.request();
             auto kv_lens_buf = kv_last_page_lens.request();
+            auto qo_indptr_buf = qo_indptr.request();
 
             TensorDType tensor_dtype;
             if (q_buf.format == py::format_descriptor<float>::format()) {
@@ -402,10 +404,9 @@ public:
                                                                      length:kv_lens_buf.size * sizeof(int)
                                                                     options:MTLResourceStorageModeShared];
 
-            // Create QO indptr (simple case for debug framework)
-            std::vector<int> qo_indptr = {0, static_cast<int>(batch_seq_len)};
-            id<MTLBuffer> qoIndptrBuffer = [device newBufferWithBytes:qo_indptr.data()
-                                                               length:qo_indptr.size() * sizeof(int)
+            // Use the real QO indptr from input
+            id<MTLBuffer> qoIndptrBuffer = [device newBufferWithBytes:qo_indptr_buf.ptr
+                                                               length:qo_indptr_buf.size * sizeof(int)
                                                               options:MTLResourceStorageModeShared];
 
             // Execute the kernel with actual L4MA layout
@@ -446,17 +447,9 @@ public:
                 }
             }
 
-            // Debug: capture kernel metadata for investigation
+            // Debug buffer cleanup (debug prints removed)
             if (debugBuffer) {
-                float* debug_ptr = static_cast<float*>([debugBuffer contents]);
-                if (debug_ptr != nullptr) {
-                    py::print("[MetalAttentionDebug] scale=", debug_ptr[0],
-                              " head_dim=", debug_ptr[1],
-                              " page_size=", debug_ptr[2],
-                              " num_qo=", debug_ptr[3],
-                              " total_kv_len=", debug_ptr[4],
-                              " last_page_len=", debug_ptr[6]);
-                }
+                // No debug output needed in production
             }
 
             // Cleanup

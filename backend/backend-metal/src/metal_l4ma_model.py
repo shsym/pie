@@ -190,12 +190,16 @@ class MetalL4maModel:
 
         This maintains the same interface as the original PyTorch model.
         """
-        # Convert PyTorch tensors to numpy for Metal backend
+        # Convert PyTorch tensors to numpy for Metal backend with proper dtype handling
         if input_ids is not None:
             input_ids_np = input_ids.cpu().numpy().astype(np.int32)
         elif input_embeds is not None:
-            # Handle pre-computed embeddings
-            hidden_states_np = input_embeds.cpu().numpy().astype(np.float32)
+            # Handle pre-computed embeddings - preserve precision for bfloat16
+            if input_embeds.dtype == torch.bfloat16:
+                # bfloat16 -> float32 conversion (unavoidable for NumPy compatibility)
+                hidden_states_np = input_embeds.cpu().to(torch.float32).numpy()
+            else:
+                hidden_states_np = input_embeds.cpu().numpy().astype(np.float32)
             input_ids_np = None
         else:
             raise ValueError("Either input_ids or input_embeds must be provided")

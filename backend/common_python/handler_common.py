@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import logging
 import time
+from pathlib import Path
 from contextlib import contextmanager, nullcontext
 
 import numpy as np
@@ -15,6 +18,23 @@ from adapter_import_utils import ensure_adapter_available
 
 from config.common import ModelInfo
 from debug_utils import is_tensor_debug_enabled
+
+
+def _get_handler_debug_logger():
+    """Get or create a debug logger for handler debugging."""
+    logger = logging.getLogger('metal_handler_debug')
+    if not logger.handlers:
+        # Set up file logging
+        log_file = Path(os.environ.get("METAL_DEBUG_LOG_FILE", "/tmp/metal_debug.log"))
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        handler = logging.FileHandler(log_file, mode='a')  # append mode
+        formatter = logging.Formatter('%(asctime)s [HANDLER] %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+
+    return logger
 
 
 class Handler:
@@ -189,6 +209,35 @@ class Handler:
         """
         Processes a batch of forward pass requests through the language model.
         """
+
+        # DEBUG: Log incoming requests and model state for debugging
+        debug_handler = os.environ.get("METAL_DEBUG_HANDLER", "0") == "1"
+        logger = None
+        if debug_handler:
+            logger = _get_handler_debug_logger()
+            logger.info("=== FORWARD PASS REQUEST DEBUG ===")
+
+            # Log model state
+            first_param = next(self.lm.parameters())
+            logger.info(f"Model state:")
+            logger.info(f"  first_param device: {first_param.device}")
+            logger.info(f"  first_param dtype: {first_param.dtype}")
+            logger.info(f"  handler device: {self.device}")
+            logger.info(f"  handler dtype: {self.dtype}")
+            logger.info(f"  logits_dtype: {self.logits_dtype}")
+
+            for i, req in enumerate(reqs):
+                logger.info(f"Request {i}:")
+                logger.info(f"  input_tokens: {req.input_tokens}")
+                logger.info(f"  input_token_positions: {req.input_token_positions}")
+                logger.info(f"  output_token_indices: {req.output_token_indices}")
+                logger.info(f"  output_token_samplers: {req.output_token_samplers}")
+                logger.info(f"  kv_page_ptrs: {req.kv_page_ptrs}")
+                logger.info(f"  kv_page_last_len: {req.kv_page_last_len}")
+                logger.info(f"  mask: {req.mask}")
+                logger.info(f"  adapter: {req.adapter}")
+            logger.info("=====================================\n")
+
         # Sort requests by adapter to optimize the adapter subpass.
         reqs = sorted(reqs, key=lambda o: (o.adapter is None, o.adapter))
 
@@ -514,13 +563,33 @@ class ForwardPassBatch:
 
         # Calculate logits for all required tokens (both dists and samples)
         logits_input = output_embeds[self.indices_for_logits]
+
+        # DEBUG: Log logits computation details
+        debug_logits = os.environ.get("METAL_DEBUG_HANDLER", "0") == "1"
+        debug_logger = None
+        if debug_logits:
+            debug_logger = _get_handler_debug_logger()
+            debug_logger.info("=== LOGITS COMPUTATION DEBUG ===")
+            debug_logger.info(f"output_embeds shape: {output_embeds.shape}, dtype: {output_embeds.dtype}")
+            debug_logger.info(f"logits_input shape: {logits_input.shape}, dtype: {logits_input.dtype}")
+            debug_logger.info(f"handler logits_dtype: {self.logits_dtype}")
+            debug_logger.info(f"indices_for_logits: {self.indices_for_logits}")
+
         if logits_input.dtype != self.logits_dtype:
+            if debug_logits and debug_logger:
+                debug_logger.info(f"Converting logits_input from {logits_input.dtype} to {self.logits_dtype}")
             logits_input = logits_input.to(self.logits_dtype)
 
         logits = self._handler.lm.lm_head(logits_input)
 
+        if debug_logits and debug_logger:
+            debug_logger.info(f"Raw logits shape: {logits.shape}, dtype: {logits.dtype}")
+            debug_logger.info(f"Raw logits stats: min={float(logits.min()):.6f}, max={float(logits.max()):.6f}, mean={float(logits.mean()):.6f}")
+
         # Promote logits to handler dtype for numerically stable softmax on Metal/MPS
         if logits.dtype != self.logits_dtype:
+            if debug_logits and debug_logger:
+                debug_logger.info(f"Converting logits from {logits.dtype} to {self.logits_dtype}")
             logits = logits.to(dtype=self.logits_dtype)
 
         # Apply temperature scaling to all logits
@@ -534,8 +603,29 @@ class ForwardPassBatch:
         # We compute probabilities for the entire batch of logit requests
         probs = torch.softmax(scaled_logits, dim=-1)
 
+        if debug_logits and debug_logger:
+            debug_logger.info(f"Probabilities computed - shape: {probs.shape}, dtype: {probs.dtype}")
+            # Log top-5 probabilities for the first request
+            if len(probs) > 0:
+                top_probs, top_indices = torch.topk(probs[0], k=5)
+                debug_logger.info(f"First request top-5: indices={top_indices.tolist()}, probs={top_probs.tolist()}")
+            debug_logger.info("=================================\n")
+
         if not torch.isfinite(probs).all():
             raise RuntimeError("Non-finite probabilities produced by LM head")
+
+        # # DEBUG: Log probabilities and sampler configuration
+        # print("\n=== SAMPLING PARAMETERS DEBUG ===")
+        # print(f"Number of logit requests: {len(self.indices_for_logits)}")
+        # print(f"Sampler types: {self.sampler_type}")
+        # for i, params in enumerate(self.sampler_params):
+        #     print(f"Sampler {i}: type={self.sampler_type[i]}, params={params}")
+
+        # # Log top probabilities for debugging
+        # top_probs, top_indices = torch.topk(probs, k=5, dim=-1)
+        # for i in range(min(len(probs), 3)):  # Log first 3 requests max
+        #     print(f"Request {i} top-5 probs: indices={top_indices[i].tolist()}, probs={top_probs[i].tolist()}")
+        # print("===================================\n")
 
         # Group requests by sampler type for efficient batch processing
         sampler_groups = {}
@@ -650,5 +740,19 @@ class ForwardPassBatch:
                 message.ForwardPassResponse(dists=request_dists, tokens=request_tokens)
             )
             cursor += num_outputs
+
+        # DEBUG: Log final responses
+        debug_handler_final = os.environ.get("METAL_DEBUG_HANDLER", "0") == "1"
+        if debug_handler_final:
+            logger_final = _get_handler_debug_logger()
+            logger_final.info("=== FORWARD PASS RESPONSE DEBUG ===")
+            for i, resp in enumerate(responses):
+                logger_final.info(f"Response {i}:")
+                logger_final.info(f"  dists: {len(resp.dists)} distributions")
+                logger_final.info(f"  tokens: {resp.tokens}")
+                if resp.dists:
+                    for j, (ids, probs) in enumerate(resp.dists):
+                        logger_final.info(f"  dist[{j}]: top ids={ids[:5]}, top probs={probs[:5]}")
+            logger_final.info("======================================\n")
 
         return responses

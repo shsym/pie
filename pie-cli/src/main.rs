@@ -77,6 +77,9 @@ pub struct StartArgs {
     /// Enable verbose console logging.
     #[arg(long, short)]
     pub verbose: bool,
+    /// Run in daemon mode (non-interactive).
+    #[arg(long)]
+    pub daemon: bool,
 }
 
 /// Helper for clap to expand `~` in path arguments.
@@ -160,8 +163,12 @@ async fn main() -> Result<()> {
             // 2. Initialize logging based on the config and get the file-writer guard
             let _guard = init_logging(&engine_config)?;
 
-            // 3. Start the interactive session, passing both configs
-            start_interactive_session(engine_config, backend_configs).await?;
+            // 3. Start the session (interactive or daemon mode)
+            if args.daemon {
+                start_daemon_session(engine_config, backend_configs).await?;
+            } else {
+                start_interactive_session(engine_config, backend_configs).await?;
+            }
         }
         Commands::Model(cmd) => {
             // Model commands don't start the engine, so they can use a simple logger
@@ -445,6 +452,142 @@ async fn start_interactive_session(
         }
 
         // This prevents the main program from exiting before cleanup is complete.
+        if let Err(e) = child.wait().await {
+            eprintln!("  Error while waiting for backend process to exit: {}", e);
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+    server_handle.await?;
+    println!("✅ Shutdown complete.");
+
+    Ok(())
+}
+
+/// Starts the engine and backend services in daemon mode (non-interactive).
+async fn start_daemon_session(
+    engine_config: EngineConfig,
+    backend_configs: Vec<toml::Value>,
+) -> Result<()> {
+    // 1. Initialize engine configuration
+    let client_config = ClientConfig {
+        host: engine_config.host.clone(),
+        port: engine_config.port,
+        auth_secret: engine_config.auth_secret.clone(),
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    // 2. Start the main PIE engine server in a background task
+    println!("🚀 Starting PIE engine in daemon mode...");
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = pie::run_server(engine_config, shutdown_rx).await {
+            eprintln!("\n[Engine Error] Engine failed: {}", e);
+        }
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    println!("✅ Engine started.");
+
+    // 3. Launch all configured backend services
+    let mut backend_processes = Vec::new();
+    if !backend_configs.is_empty() {
+        println!("🚀 Launching backend services...");
+        init_secret(&client_config.auth_secret);
+        let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
+
+        for backend_config in &backend_configs {
+            let backend_table = backend_config
+                .as_table()
+                .context("Each [[backend]] entry in config.toml must be a table.")?;
+            let backend_type = backend_table
+                .get("backend_type")
+                .and_then(|v| v.as_str())
+                .context("`backend_type` is missing or not a string.")?;
+            let exec_path = backend_table
+                .get("exec_path")
+                .and_then(|v| v.as_str())
+                .context("`exec_path` is missing or not a string.")?;
+
+            let mut cmd = if backend_type == "python" {
+                let mut cmd = TokioCommand::new("uv");
+                cmd.arg("--project");
+                cmd.arg("../backend/backend-python");
+                cmd.arg("run");
+                cmd.arg("python");
+                cmd.arg("-u");
+                cmd.arg(exec_path);
+                cmd
+            } else {
+                TokioCommand::new(exec_path)
+            };
+
+            let random_port: u16 = rand::rng().random_range(49152..=65535);
+            cmd.arg("--host")
+                .arg("localhost")
+                .arg("--port")
+                .arg(random_port.to_string())
+                .arg("--controller_host")
+                .arg(&client_config.host)
+                .arg("--controller_port")
+                .arg(client_config.port.to_string())
+                .arg("--auth_token")
+                .arg(&auth_token);
+
+            for (key, value) in backend_table {
+                if key == "backend_type" || key == "exec_path" {
+                    continue;
+                }
+                cmd.arg(format!("--{}", key))
+                    .arg(value.to_string().trim_matches('"').to_string());
+            }
+
+            // Process group setup (same as interactive mode)
+            unsafe {
+                cmd.pre_exec(|| {
+                    nix::unistd::setsid()?;
+                    #[cfg(target_os = "linux")]
+                    {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+
+            println!("- Spawning backend: {}", exec_path);
+            let child = cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .with_context(|| format!("Failed to spawn backend process: '{}'", exec_path))?;
+
+            // In daemon mode, we'll just capture the output but not stream it to console
+            // to avoid cluttering. It will still go to logs if configured.
+
+            backend_processes.push(child);
+        }
+    }
+
+    println!("✅ PIE daemon started successfully.");
+    println!("   Engine: http://{}:{}", client_config.host, client_config.port);
+    println!("   Press Ctrl+C to shutdown gracefully.");
+
+    // 4. Wait for shutdown signal (Ctrl+C)
+    tokio::signal::ctrl_c().await?;
+    println!("\n📡 Shutdown signal received, shutting down gracefully...");
+
+    // 5. Begin graceful shutdown
+    // Terminate backend processes
+    for mut child in backend_processes {
+        if let Some(pid) = child.id() {
+            let pgid = nix::unistd::Pid::from_raw(pid as i32);
+            println!("- Terminating backend process group with PID: {}", pid);
+
+            if let Err(e) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM) {
+                eprintln!("  Failed to send SIGTERM to process group {}: {}", pid, e);
+            }
+        }
+
         if let Err(e) = child.wait().await {
             eprintln!("  Error while waiting for backend process to exit: {}", e);
         }
