@@ -16,7 +16,6 @@ import struct
 import sys
 import threading
 import time
-import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Type, Optional
@@ -201,7 +200,7 @@ def start_service(
     finally:
         try:
             socket.setsockopt(zmq.LINGER, 0)
-        except Exception:
+        except (AttributeError, OSError):
             pass
         socket.close()
         context.term()
@@ -303,9 +302,7 @@ def run_zmq_server(
 
     try:
         hb_status = "disabled" if hb_timeout is None else f"{hb_timeout}s"
-        logger.info(
-            "ZMQ server loop starting (heartbeat timeout: %s)", hb_status
-        )
+        logger.info("ZMQ server loop starting (heartbeat timeout: %s)", hb_status)
         while not stop_event.is_set():
             # Check for heartbeat timeout before waiting for a message (if enabled)
             if hb_timeout is not None:
@@ -313,7 +310,8 @@ def run_zmq_server(
                 last_check = max(last_heartbeat_time, last_activity_time)
                 if now - last_check > hb_timeout:
                     logger.error(
-                        "[!] Heartbeat timeout after %ss (last_heartbeat=%.3fs, last_activity=%.3fs). Shutting down.",
+                        "[!] Heartbeat timeout after %ss "
+                        "(last_heartbeat=%.3fs, last_activity=%.3fs). Shutting down.",
                         hb_timeout,
                         now - last_heartbeat_time,
                         now - last_activity_time,
@@ -321,7 +319,7 @@ def run_zmq_server(
                     # Graceful shutdown: stop server loop and allow outer finally to clean up
                     try:
                         socket.setsockopt(zmq.LINGER, 0)
-                    except Exception:
+                    except (AttributeError, OSError):
                         pass
                     stop_event.set()
                     return
@@ -346,7 +344,9 @@ def run_zmq_server(
                 handler_id = struct.unpack(">I", handler_id_bytes)[0]
                 reqs = [decoders[handler_id].decode(m) for m in message[3:]]
             except (struct.error, KeyError, msgspec.DecodeError) as exc:
-                logger.exception("[!] Error decoding request header or payload: %s", exc)
+                logger.exception(
+                    "[!] Error decoding request header or payload: %s", exc
+                )
                 continue
 
             if not reqs:
@@ -407,7 +407,7 @@ def run_zmq_server(
         )
         try:
             socket.setsockopt(zmq.LINGER, 0)
-        except Exception:
+        except (AttributeError, OSError):
             pass
         stop_event.set()
         return

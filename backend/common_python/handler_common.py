@@ -23,14 +23,14 @@ from debug_utils import is_tensor_debug_enabled
 
 def _get_handler_debug_logger():
     """Get or create a debug logger for handler debugging."""
-    logger = logging.getLogger('metal_handler_debug')
+    logger = logging.getLogger("metal_handler_debug")
     if not logger.handlers:
         # Set up file logging
         log_file = Path(os.environ.get("METAL_DEBUG_LOG_FILE", "/tmp/metal_debug.log"))
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
-        handler = logging.FileHandler(log_file, mode='a')  # append mode
-        formatter = logging.Formatter('%(asctime)s [HANDLER] %(message)s')
+        handler = logging.FileHandler(log_file, mode="a")  # append mode
+        formatter = logging.Formatter("%(asctime)s [HANDLER] %(message)s")
         handler.setFormatter(formatter)
         logger.addHandler(handler)
         logger.setLevel(logging.DEBUG)
@@ -38,7 +38,9 @@ def _get_handler_debug_logger():
     return logger
 
 
-def _record_request_response(reqs: list[message.ForwardPassRequest], responses: list[message.ForwardPassResponse]):
+def _record_request_response(
+    reqs: list[message.ForwardPassRequest], responses: list[message.ForwardPassResponse]
+):
     """Record request/response pairs for empirical analysis."""
     record_enabled = os.environ.get("METAL_RECORD_REQ_RES", "0") == "1"
     if not record_enabled:
@@ -70,32 +72,36 @@ def _record_request_response(reqs: list[message.ForwardPassRequest], responses: 
                     "output_embed_indices": req.output_embed_indices,
                 },
                 "response": {
-                    "dists": [[list(dist[0]), list(dist[1])] for dist in resp.dists] if resp.dists else [],
-                    "embeds": resp.embeds if hasattr(resp, 'embeds') else [],
-                }
+                    "dists": (
+                        [[list(dist[0]), list(dist[1])] for dist in resp.dists]
+                        if resp.dists
+                        else []
+                    ),
+                    "tokens": resp.tokens if resp.tokens else [],
+                },
             }
 
             # Append to JSONL file
-            with open(record_file, 'a') as f:
+            with open(record_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
 
-    except Exception as e:
+    except (OSError, ValueError, TypeError) as e:
         # Don't let recording errors break the handler
         logger = _get_handler_debug_logger()
-        logger.error(f"Failed to record request/response: {e}")
+        logger.error("Failed to record request/response: %s", e)
 
 
 def _decode_tokens_for_recording(token_ids: list[int], tokenizer) -> str:
     """Helper to decode token IDs for readable recording (best effort)."""
     try:
-        if hasattr(tokenizer, 'decode'):
+        if hasattr(tokenizer, "decode"):
             return tokenizer.decode(token_ids)
-        elif hasattr(tokenizer, 'convert_tokens_to_string'):
+        elif hasattr(tokenizer, "convert_tokens_to_string"):
             tokens = [tokenizer.convert_ids_to_tokens([tid])[0] for tid in token_ids]
             return tokenizer.convert_tokens_to_string(tokens)
         else:
             return str(token_ids)  # Fallback to raw IDs
-    except:
+    except (AttributeError, ValueError, TypeError, KeyError):
         return str(token_ids)  # Fallback to raw IDs
 
 
@@ -281,23 +287,23 @@ class Handler:
 
             # Log model state
             first_param = next(self.lm.parameters())
-            logger.info(f"Model state:")
-            logger.info(f"  first_param device: {first_param.device}")
-            logger.info(f"  first_param dtype: {first_param.dtype}")
-            logger.info(f"  handler device: {self.device}")
-            logger.info(f"  handler dtype: {self.dtype}")
-            logger.info(f"  logits_dtype: {self.logits_dtype}")
+            logger.info("Model state:")
+            logger.info("  first_param device: %s", first_param.device)
+            logger.info("  first_param dtype: %s", first_param.dtype)
+            logger.info("  handler device: %s", self.device)
+            logger.info("  handler dtype: %s", self.dtype)
+            logger.info("  logits_dtype: %s", self.logits_dtype)
 
             for i, req in enumerate(reqs):
-                logger.info(f"Request {i}:")
-                logger.info(f"  input_tokens: {req.input_tokens}")
-                logger.info(f"  input_token_positions: {req.input_token_positions}")
-                logger.info(f"  output_token_indices: {req.output_token_indices}")
-                logger.info(f"  output_token_samplers: {req.output_token_samplers}")
-                logger.info(f"  kv_page_ptrs: {req.kv_page_ptrs}")
-                logger.info(f"  kv_page_last_len: {req.kv_page_last_len}")
-                logger.info(f"  mask: {req.mask}")
-                logger.info(f"  adapter: {req.adapter}")
+                logger.info("Request %s:", i)
+                logger.info("  input_tokens: %s", req.input_tokens)
+                logger.info("  input_token_positions: %s", req.input_token_positions)
+                logger.info("  output_token_indices: %s", req.output_token_indices)
+                logger.info("  output_token_samplers: %s", req.output_token_samplers)
+                logger.info("  kv_page_ptrs: %s", req.kv_page_ptrs)
+                logger.info("  kv_page_last_len: %s", req.kv_page_last_len)
+                logger.info("  mask: %s", req.mask)
+                logger.info("  adapter: %s", req.adapter)
             logger.info("=====================================\n")
 
         # Sort requests by adapter to optimize the adapter subpass.
@@ -635,26 +641,47 @@ class ForwardPassBatch:
         if debug_logits:
             debug_logger = _get_handler_debug_logger()
             debug_logger.info("=== LOGITS COMPUTATION DEBUG ===")
-            debug_logger.info(f"output_embeds shape: {output_embeds.shape}, dtype: {output_embeds.dtype}")
-            debug_logger.info(f"logits_input shape: {logits_input.shape}, dtype: {logits_input.dtype}")
-            debug_logger.info(f"handler logits_dtype: {self.logits_dtype}")
-            debug_logger.info(f"indices_for_logits: {self.indices_for_logits}")
+            debug_logger.info(
+                "output_embeds shape: %s, dtype: %s",
+                output_embeds.shape,
+                output_embeds.dtype,
+            )
+            debug_logger.info(
+                "logits_input shape: %s, dtype: %s",
+                logits_input.shape,
+                logits_input.dtype,
+            )
+            debug_logger.info("handler logits_dtype: %s", self.logits_dtype)
+            debug_logger.info("indices_for_logits: %s", self.indices_for_logits)
 
         if logits_input.dtype != self.logits_dtype:
             if debug_logits and debug_logger:
-                debug_logger.info(f"Converting logits_input from {logits_input.dtype} to {self.logits_dtype}")
+                debug_logger.info(
+                    "Converting logits_input from %s to %s",
+                    logits_input.dtype,
+                    self.logits_dtype,
+                )
             logits_input = logits_input.to(self.logits_dtype)
 
         logits = self._handler.lm.lm_head(logits_input)
 
         if debug_logits and debug_logger:
-            debug_logger.info(f"Raw logits shape: {logits.shape}, dtype: {logits.dtype}")
-            debug_logger.info(f"Raw logits stats: min={float(logits.min()):.6f}, max={float(logits.max()):.6f}, mean={float(logits.mean()):.6f}")
+            debug_logger.info(
+                "Raw logits shape: %s, dtype: %s", logits.shape, logits.dtype
+            )
+            debug_logger.info(
+                "Raw logits stats: min=%.6f, max=%.6f, mean=%.6f",
+                float(logits.min()),
+                float(logits.max()),
+                float(logits.mean()),
+            )
 
         # Promote logits to handler dtype for numerically stable softmax on Metal/MPS
         if logits.dtype != self.logits_dtype:
             if debug_logits and debug_logger:
-                debug_logger.info(f"Converting logits from {logits.dtype} to {self.logits_dtype}")
+                debug_logger.info(
+                    "Converting logits from %s to %s", logits.dtype, self.logits_dtype
+                )
             logits = logits.to(dtype=self.logits_dtype)
 
         # Apply temperature scaling to all logits
@@ -669,11 +696,19 @@ class ForwardPassBatch:
         probs = torch.softmax(scaled_logits, dim=-1)
 
         if debug_logits and debug_logger:
-            debug_logger.info(f"Probabilities computed - shape: {probs.shape}, dtype: {probs.dtype}")
+            debug_logger.info(
+                "Probabilities computed - shape: %s, dtype: %s",
+                probs.shape,
+                probs.dtype,
+            )
             # Log top-5 probabilities for the first request
             if len(probs) > 0:
                 top_probs, top_indices = torch.topk(probs[0], k=5)
-                debug_logger.info(f"First request top-5: indices={top_indices.tolist()}, probs={top_probs.tolist()}")
+                debug_logger.info(
+                    "First request top-5: indices=%s, probs=%s",
+                    top_indices.tolist(),
+                    top_probs.tolist(),
+                )
             debug_logger.info("=================================\n")
 
         if not torch.isfinite(probs).all():
@@ -689,7 +724,8 @@ class ForwardPassBatch:
         # # Log top probabilities for debugging
         # top_probs, top_indices = torch.topk(probs, k=5, dim=-1)
         # for i in range(min(len(probs), 3)):  # Log first 3 requests max
-        #     print(f"Request {i} top-5 probs: indices={top_indices[i].tolist()}, probs={top_probs[i].tolist()}")
+        #     print(f"Request {i} top-5 probs: indices={top_indices[i].tolist()}, "
+        #           f"probs={top_probs[i].tolist()}")
         # print("===================================\n")
 
         # Group requests by sampler type for efficient batch processing
@@ -812,12 +848,17 @@ class ForwardPassBatch:
             logger_final = _get_handler_debug_logger()
             logger_final.info("=== FORWARD PASS RESPONSE DEBUG ===")
             for i, resp in enumerate(responses):
-                logger_final.info(f"Response {i}:")
-                logger_final.info(f"  dists: {len(resp.dists)} distributions")
-                logger_final.info(f"  tokens: {resp.tokens}")
+                logger_final.info("Response %s:", i)
+                logger_final.info("  dists: %s distributions", len(resp.dists))
+                logger_final.info("  tokens: %s", resp.tokens)
                 if resp.dists:
                     for j, (ids, probs) in enumerate(resp.dists):
-                        logger_final.info(f"  dist[{j}]: top ids={ids[:5]}, top probs={probs[:5]}")
+                        logger_final.info(
+                            "  dist[%s]: top ids=%s, top probs=%s",
+                            j,
+                            ids[:5],
+                            probs[:5],
+                        )
             logger_final.info("======================================\n")
 
         return responses
