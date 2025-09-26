@@ -117,11 +117,16 @@ def main():
         first_param = next(model_instance.parameters())
         print(f"   After conversion: device={first_param.device}, dtype={first_param.dtype}")
 
+        # Enable controller registration when controller_host/port are provided
+        # This allows the backend to work both standalone (for testing) and with PIE engine
+        should_register = config.get("controller_host") is not None and config.get("controller_port") is not None
+
         start_service(
             config=config,
             handler_cls=MetalHandler,
             model=model_instance,
             model_info=model_metadata,
+            register_with_controller=should_register,
         )
 
     # Run with fire

@@ -192,7 +192,7 @@ class TokenizerUtil:
             print(f"Decoding error: {e}")
             return f"[DECODE_ERROR: {token_ids}]"
 
-    def _python_bpe_decode(self, token_ids: List[int]) -> str:
+    def _python_bpe_decode(self, token_ids: List[int], verbose: bool=False) -> str:
         """Python implementation of BPE decoding."""
         if not self.model_info:
             return ""
@@ -216,7 +216,8 @@ class TokenizerUtil:
 
         try:
             decoded_text = decoded_bytes.decode('utf-8', errors='replace')
-            print(f"✅ Used Python BPE decoder: {token_ids} -> '{decoded_text}'")
+            if verbose:
+                print(f"✅ Used Python BPE decoder: {token_ids} -> '{decoded_text}'")
             return decoded_text
         except UnicodeDecodeError:
             return decoded_bytes.decode('utf-8', errors='replace')

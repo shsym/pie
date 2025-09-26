@@ -148,9 +148,15 @@ def start_service(
     socket.bind(real_endpoint)
 
     # Heartbeat timeout can be configured via env; default remains 60s
+    # But disable heartbeat when not registered with controller (standalone mode)
     heartbeat_timeout_env = os.environ.get("PIE_HEARTBEAT_TIMEOUT")
     heartbeat_timeout: Optional[int] = None
-    if heartbeat_timeout_env:
+
+    if not register_with_controller:
+        # Standalone mode - no controller to send heartbeats, so disable timeout
+        heartbeat_timeout = None
+        logger.info("Standalone mode: heartbeat timeout disabled")
+    elif heartbeat_timeout_env:
         try:
             heartbeat_timeout = int(heartbeat_timeout_env)
         except ValueError:
@@ -158,6 +164,11 @@ def start_service(
                 "Invalid PIE_HEARTBEAT_TIMEOUT value '%s'; using default.",
                 heartbeat_timeout_env,
             )
+            heartbeat_timeout = 60  # Use default on parse error
+    else:
+        # Default heartbeat timeout when registered with controller
+        heartbeat_timeout = 60
+        logger.info("Controller registration enabled: heartbeat timeout set to 60s")
 
     # Stop event for graceful shutdown instead of os._exit
     stop_event = threading.Event()
@@ -264,8 +275,8 @@ def run_zmq_server(
     exception occurs.
     """
     logger = logging.getLogger("pie.backend")
-    # Heartbeat timeout and timer setup (default 60 seconds)
-    hb_timeout = heartbeat_timeout or 60  # seconds
+    # Heartbeat timeout and timer setup (default 60 seconds, None means disabled)
+    hb_timeout = heartbeat_timeout  # Can be None (disabled) or int (seconds)
     last_heartbeat_time = time.monotonic()
     # Track last activity (any request) to avoid false positives while busy
     last_activity_time = last_heartbeat_time
@@ -291,27 +302,29 @@ def run_zmq_server(
     poller.register(socket, zmq.POLLIN)
 
     try:
+        hb_status = "disabled" if hb_timeout is None else f"{hb_timeout}s"
         logger.info(
-            "ZMQ server loop starting (heartbeat timeout: %ss)", hb_timeout
+            "ZMQ server loop starting (heartbeat timeout: %s)", hb_status
         )
         while not stop_event.is_set():
-            # Check for heartbeat timeout before waiting for a message
-            now = time.monotonic()
-            last_check = max(last_heartbeat_time, last_activity_time)
-            if now - last_check > hb_timeout:
-                logger.error(
-                    "[!] Heartbeat timeout after %ss (last_heartbeat=%.3fs, last_activity=%.3fs). Shutting down.",
-                    hb_timeout,
-                    now - last_heartbeat_time,
-                    now - last_activity_time,
-                )
-                # Graceful shutdown: stop server loop and allow outer finally to clean up
-                try:
-                    socket.setsockopt(zmq.LINGER, 0)
-                except Exception:
-                    pass
-                stop_event.set()
-                return
+            # Check for heartbeat timeout before waiting for a message (if enabled)
+            if hb_timeout is not None:
+                now = time.monotonic()
+                last_check = max(last_heartbeat_time, last_activity_time)
+                if now - last_check > hb_timeout:
+                    logger.error(
+                        "[!] Heartbeat timeout after %ss (last_heartbeat=%.3fs, last_activity=%.3fs). Shutting down.",
+                        hb_timeout,
+                        now - last_heartbeat_time,
+                        now - last_activity_time,
+                    )
+                    # Graceful shutdown: stop server loop and allow outer finally to clean up
+                    try:
+                        socket.setsockopt(zmq.LINGER, 0)
+                    except Exception:
+                        pass
+                    stop_event.set()
+                    return
 
             # Poll for 1 second to remain responsive to the heartbeat check
             events = dict(poller.poll(timeout=1000))

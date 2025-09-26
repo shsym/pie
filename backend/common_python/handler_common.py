@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import logging
 import time
+import json
 from pathlib import Path
 from contextlib import contextmanager, nullcontext
 
@@ -35,6 +36,67 @@ def _get_handler_debug_logger():
         logger.setLevel(logging.DEBUG)
 
     return logger
+
+
+def _record_request_response(reqs: list[message.ForwardPassRequest], responses: list[message.ForwardPassResponse]):
+    """Record request/response pairs for empirical analysis."""
+    record_enabled = os.environ.get("METAL_RECORD_REQ_RES", "0") == "1"
+    if not record_enabled:
+        return
+
+    record_file = Path(os.environ.get("METAL_RECORD_FILE", "/tmp/metal_req_res.jsonl"))
+    record_file.parent.mkdir(parents=True, exist_ok=True)
+
+    timestamp = time.time()
+
+    try:
+        for i, (req, resp) in enumerate(zip(reqs, responses)):
+            record = {
+                "timestamp": timestamp,
+                "request_id": i,
+                "request": {
+                    "input_tokens": req.input_tokens,
+                    "input_token_positions": req.input_token_positions,
+                    "input_embed_ptrs": req.input_embed_ptrs,
+                    "input_embed_positions": req.input_embed_positions,
+                    "adapter": req.adapter,
+                    "adapter_seed": req.adapter_seed,
+                    "mask": req.mask,
+                    "kv_page_ptrs": req.kv_page_ptrs,
+                    "kv_page_last_len": req.kv_page_last_len,
+                    "output_token_indices": req.output_token_indices,
+                    "output_token_samplers": req.output_token_samplers,
+                    "output_embed_ptrs": req.output_embed_ptrs,
+                    "output_embed_indices": req.output_embed_indices,
+                },
+                "response": {
+                    "dists": [[list(dist[0]), list(dist[1])] for dist in resp.dists] if resp.dists else [],
+                    "embeds": resp.embeds if hasattr(resp, 'embeds') else [],
+                }
+            }
+
+            # Append to JSONL file
+            with open(record_file, 'a') as f:
+                f.write(json.dumps(record) + "\n")
+
+    except Exception as e:
+        # Don't let recording errors break the handler
+        logger = _get_handler_debug_logger()
+        logger.error(f"Failed to record request/response: {e}")
+
+
+def _decode_tokens_for_recording(token_ids: list[int], tokenizer) -> str:
+    """Helper to decode token IDs for readable recording (best effort)."""
+    try:
+        if hasattr(tokenizer, 'decode'):
+            return tokenizer.decode(token_ids)
+        elif hasattr(tokenizer, 'convert_tokens_to_string'):
+            tokens = [tokenizer.convert_ids_to_tokens([tid])[0] for tid in token_ids]
+            return tokenizer.convert_tokens_to_string(tokens)
+        else:
+            return str(token_ids)  # Fallback to raw IDs
+    except:
+        return str(token_ids)  # Fallback to raw IDs
 
 
 class Handler:
@@ -257,6 +319,9 @@ class Handler:
 
             # 4. Package the model outputs into response messages.
             responses = batch.package_responses(output_embeds)
+
+        # 5. Record request/response pairs for empirical analysis
+        _record_request_response(reqs, responses)
 
         return responses
 
