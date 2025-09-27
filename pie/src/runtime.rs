@@ -1,7 +1,7 @@
 use crate::instance::{InstanceId, InstanceState};
 use crate::model::request::QueryResponse;
 use crate::service::{Service, ServiceError};
-use crate::{interface, model, server, service};
+use crate::{api, model, server, service};
 use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
@@ -304,7 +304,7 @@ impl Runtime {
             .map_err(|e| RuntimeError::Other(format!("Failed to link WASI: {e}")))
             .unwrap();
 
-        interface::add_to_linker(&mut linker).unwrap();
+        api::add_to_linker(&mut linker).unwrap();
 
         let cache_dir = cache_dir.as_ref().join("programs");
         // Ensure the cache directory exists

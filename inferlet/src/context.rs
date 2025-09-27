@@ -1,11 +1,11 @@
+use crate::adapter::SetAdapter;
 use crate::brle::Brle;
 use crate::drafter::Drafter;
+use crate::evolve::SetAdapterSeed;
+use crate::forward::{Distribution, Forward, KvPage};
 use crate::sampler::Sample;
-use crate::stop_condition::{StopCondition};
-use crate::interface::forward::{Distribution, Forward, KvPage};
-use crate::interface::tokenize::{Tokenize, Tokenizer};
-use crate::interface::{Adapter, SetAdapter, SetAdapterSeed};
-use crate::{ChatFormatter, Model, Queue, Sampler, sampler, stop_condition};
+use crate::stop_condition::StopCondition;
+use crate::{ChatFormatter, Model, Queue, Sampler, Tokenizer, sampler, stop_condition};
 use futures::future::join_all;
 use std::cmp::Ordering;
 use std::mem;
@@ -642,7 +642,7 @@ impl Context {
     pub async fn generate<S: StopCondition>(
         &mut self,
         sampler: Sampler,
-        stop_condition:S,
+        stop_condition: S,
     ) -> String {
         let mut generated_token_ids = Vec::new();
 

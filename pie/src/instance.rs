@@ -1,4 +1,4 @@
-use crate::interface::core::Queue;
+use crate::api::core::Queue;
 use crate::model::resource::{ResourceId, ResourceTypeId};
 use crate::utils;
 use anyhow::{Result, bail, format_err};
