@@ -4,10 +4,13 @@ pub use crate::bindings_app::{export, exports::pie::inferlet::run::Guest as RunS
 pub use crate::chat::ChatFormatter;
 pub use crate::context::Context;
 pub use crate::sampler::Sampler;
+use crate::stop_condition::StopCondition;
+use crate::interface::Tokenize;
 use crate::wstd::runtime::AsyncPollable;
-pub use anyhow::Result;
+pub use anyhow::{Context as AnyhowContext, Error, Result, anyhow, bail, ensure, format_err};
 pub use inferlet_macros::main;
 pub use inferlet_macros::server_main;
+pub use pico_args::Arguments as Args;
 use std::collections::HashSet;
 use std::rc::Rc;
 pub use wasi;
@@ -21,7 +24,7 @@ pub mod drafter;
 mod pool;
 pub mod sampler;
 pub mod stop_condition;
-pub mod traits;
+pub mod interface;
 
 pub mod bindings {
     wit_bindgen::generate!({
@@ -261,8 +264,13 @@ impl Model {
         self.inner.get_prompt_template()
     }
 
-    pub fn get_stop_tokens(&self) -> Vec<String> {
-        self.inner.get_stop_tokens()
+    pub fn eos_tokens(&self) -> Vec<Vec<u32>> {
+        let tokenizer = self.get_tokenizer();
+        self.inner
+            .get_stop_tokens()
+            .into_iter()
+            .map(|t| tokenizer.tokenize(&t))
+            .collect()
     }
 
     /// Gets the service ID for the model.

@@ -1,13 +1,14 @@
 """Qwen 3 Large Language Model Architecture (Qwen3)"""
 
 from __future__ import annotations
-from typing import Optional
 
 import torch
 from torch import nn
 
-from common import AdapterSubpass, Qwen3Arch
 import flashinfer as ops
+from adapter import AdapterSubpass
+
+from config.qwen3 import Qwen3Arch
 
 VERSION = "0.1.0"
 
@@ -30,7 +31,7 @@ def create_fusion_map(model: nn.Module):
                 f"{name}.k_proj.weight",
                 f"{name}.v_proj.weight",
             ]
-            fusion_map[target_w] = {"sources": sources_w, "dim": 0, "op": "fusion"}
+            fusion_map[target_w] = {"sources": sources_w, "dim": 0}
 
             # Handle biases if they exist
             if module.qkv_proj.bias is not None:
@@ -40,19 +41,19 @@ def create_fusion_map(model: nn.Module):
                     f"{name}.k_proj.bias",
                     f"{name}.v_proj.bias",
                 ]
-                fusion_map[target_b] = {"sources": sources_b, "dim": 0, "op": "fusion"}
+                fusion_map[target_b] = {"sources": sources_b, "dim": 0}
 
         # --- Rule for Qwen3Mlp Gate/Up Fusion ---
         elif isinstance(module, Qwen3Mlp):
             # Handle weights
             target_w = f"{name}.gate_up_proj.weight"
             sources_w = [f"{name}.gate_proj.weight", f"{name}.up_proj.weight"]
-            fusion_map[target_w] = {"sources": sources_w, "dim": 0, "op": "fusion"}
+            fusion_map[target_w] = {"sources": sources_w, "dim": 0}
 
             # Handle biases (Qwen3 uses bias in MLP layers)
             target_b = f"{name}.gate_up_proj.bias"
             sources_b = [f"{name}.gate_proj.bias", f"{name}.up_proj.bias"]
-            fusion_map[target_b] = {"sources": sources_b, "dim": 0, "op": "fusion"}
+            fusion_map[target_b] = {"sources": sources_b, "dim": 0}
 
     return fusion_map
 
@@ -149,7 +150,7 @@ class Qwen3Attention(nn.Module):
         kv_last_page_lens: torch.Tensor,
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
-        adapter_subpass: Optional[AdapterSubpass],
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the attention module."""
 
@@ -251,7 +252,7 @@ class Qwen3DecoderLayer(nn.Module):
         kv_last_page_lens: torch.Tensor,
         batch_indices: torch.Tensor,
         batch_positions: torch.Tensor,
-        adapter_subpass: Optional[AdapterSubpass],
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the decoder layer."""
         residual = hidden_states
@@ -334,7 +335,7 @@ class Qwen3Model(nn.Module):
         kv_last_page_lens: torch.Tensor,
         custom_mask: torch.Tensor,
         single_token_inference_mode: bool,
-        adapter_subpass: Optional[AdapterSubpass],
+        adapter_subpass: AdapterSubpass | None,
     ) -> torch.Tensor:
         """Forward pass through the Qwen3 model."""
         hidden_states = input_embeds
@@ -420,14 +421,3 @@ class Qwen3ForCausalLM(nn.Module):
         'torch.nn.modules.module' so must be overridden in child class.
         """
         raise NotImplementedError("Should not be called")
-
-
-__all__ = [
-    "create_fusion_map",
-    "Qwen3Mlp",
-    "Qwen3Attention",
-    "Qwen3DecoderLayer",
-    "Qwen3Model",
-    "Qwen3ForCausalLM",
-    "VERSION",
-]

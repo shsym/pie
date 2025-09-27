@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["es-init", "es-rollout", "es-update"]
+
+[workspace.dependencies]
+inferlet = { path = "../../inferlet" }
+inferlet-macros = { path = "../../inferlet-macros" }
+[profile.release]
+lto = true
