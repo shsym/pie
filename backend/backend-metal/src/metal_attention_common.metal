@@ -45,6 +45,7 @@ struct Params {
     int num_query_heads; // Number of query heads
     int num_kv_heads;    // Number of KV heads (for MQA/GQA support)
     float scale;
+    int total_kv_len;    // Total KV sequence length for mask indexing
 };
 
 // --- Common Utility Functions ---

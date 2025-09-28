@@ -48,7 +48,12 @@ def main():
     from server_common import start_service, build_config, print_config
 
     # Import debug registration
-    from debug_server_common import register_with_debug
+    try:
+        from debug_server_common import register_with_debug
+    except ModuleNotFoundError:
+        def register_with_debug(*_, **__):
+            # Optional dependency used by some deployments; skip when unavailable.
+            return None
 
     import fire
     import torch

@@ -48,19 +48,15 @@ class MetalHandler(BaseHandler):
             dtype=dtype,
             device=device,
         )
+        # Use float32 for logits/softmax on Metal for numerical stability during sampling
+        # Model weights and activations remain in the configured dtype (e.g., bfloat16)
+        # Only the logits path (softmax + sampling inputs) is promoted to float32.
+        self.logits_dtype = torch.float32
 
-        # CRITICAL FIX: Keep logits_dtype consistent with model dtype to prevent precision issues
-        # The original override to float32 may cause dtype mismatches that corrupt outputs
-        # If we need higher precision for sampling, we should convert at the sampling stage only
         print(f"🔧 MetalHandler initialized with dtype={dtype}")
         print(f"   Model first param dtype: {next(model.parameters()).dtype}")
         print(f"   Handler dtype: {self.dtype}")
         print(f"   Logits dtype: {self.logits_dtype}")
-
-        # Keep logits_dtype aligned with model dtype to prevent conversion issues
-        # self.logits_dtype = torch.float32  # DISABLED: May cause corruption
-
-        # Log initialization complete
 
     def upload_handler(self, reqs):
         """Handle adapter upload requests."""

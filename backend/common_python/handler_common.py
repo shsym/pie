@@ -684,50 +684,6 @@ class ForwardPassBatch:
                 )
             logits = logits.to(dtype=self.logits_dtype)
 
-        # Apply temperature scaling to all logits
-        temperatures = torch.tensor(
-            [p["temperature"] for p in self.sampler_params],
-            device=self._handler.device,
-            dtype=self.logits_dtype,
-        ).unsqueeze(1)
-        scaled_logits = logits / torch.clamp(temperatures, min=1e-6)
-
-        # We compute probabilities for the entire batch of logit requests
-        probs = torch.softmax(scaled_logits, dim=-1)
-
-        if debug_logits and debug_logger:
-            debug_logger.info(
-                "Probabilities computed - shape: %s, dtype: %s",
-                probs.shape,
-                probs.dtype,
-            )
-            # Log top-5 probabilities for the first request
-            if len(probs) > 0:
-                top_probs, top_indices = torch.topk(probs[0], k=5)
-                debug_logger.info(
-                    "First request top-5: indices=%s, probs=%s",
-                    top_indices.tolist(),
-                    top_probs.tolist(),
-                )
-            debug_logger.info("=================================\n")
-
-        if not torch.isfinite(probs).all():
-            raise RuntimeError("Non-finite probabilities produced by LM head")
-
-        # # DEBUG: Log probabilities and sampler configuration
-        # print("\n=== SAMPLING PARAMETERS DEBUG ===")
-        # print(f"Number of logit requests: {len(self.indices_for_logits)}")
-        # print(f"Sampler types: {self.sampler_type}")
-        # for i, params in enumerate(self.sampler_params):
-        #     print(f"Sampler {i}: type={self.sampler_type[i]}, params={params}")
-
-        # # Log top probabilities for debugging
-        # top_probs, top_indices = torch.topk(probs, k=5, dim=-1)
-        # for i in range(min(len(probs), 3)):  # Log first 3 requests max
-        #     print(f"Request {i} top-5 probs: indices={top_indices[i].tolist()}, "
-        #           f"probs={top_probs[i].tolist()}")
-        # print("===================================\n")
-
         # Group requests by sampler type for efficient batch processing
         sampler_groups = {}
         for i, sampler_idx in enumerate(self.sampler_type):
@@ -744,6 +700,7 @@ class ForwardPassBatch:
             num_logit_requests, dtype=torch.long, device=self._handler.device
         )
 
+        # Process each sampler group separately with its own temperature
         for sampler_idx, indices in sampler_groups.items():
             if not indices:
                 continue
@@ -751,7 +708,40 @@ class ForwardPassBatch:
             indices_tensor = torch.tensor(
                 indices, device=self._handler.device, dtype=torch.long
             )
-            group_probs = probs.index_select(0, indices_tensor)
+
+            # Extract logits for this sampler group
+            group_logits = logits.index_select(0, indices_tensor)
+
+            # Apply temperature scaling specific to this sampler group
+            group_temperatures = torch.tensor(
+                [self.sampler_params[i]["temperature"] for i in indices],
+                device=self._handler.device,
+                dtype=self.logits_dtype,
+            ).unsqueeze(1)
+            group_scaled_logits = group_logits / torch.clamp(group_temperatures, min=1e-6)
+
+            # Compute probabilities for this sampler group
+            group_probs = torch.softmax(group_scaled_logits, dim=-1)
+
+            if debug_logits and debug_logger:
+                debug_logger.info(
+                    "Sampler %s probabilities - shape: %s, dtype: %s",
+                    sampler_idx,
+                    group_probs.shape,
+                    group_probs.dtype,
+                )
+                # Log top-5 probabilities for the first request in this group
+                if len(group_probs) > 0:
+                    top_probs, top_indices = torch.topk(group_probs[0], k=5)
+                    debug_logger.info(
+                        "Sampler %s first request top-5: indices=%s, probs=%s",
+                        sampler_idx,
+                        top_indices.tolist(),
+                        top_probs.tolist(),
+                    )
+
+            if not torch.isfinite(group_probs).all():
+                raise RuntimeError(f"Non-finite probabilities produced for sampler {sampler_idx}")
 
             # Handle distributions (sampler_idx=0)
             if sampler_idx == 0:
@@ -819,6 +809,9 @@ class ForwardPassBatch:
                 if sampled.dtype != torch.long:
                     sampled = sampled.to(torch.long)
                 final_tokens_tensor.scatter_(0, indices_tensor, sampled)
+
+        if debug_logits and debug_logger:
+            debug_logger.info("=================================\n")
 
         # Distribute batched results back to individual responses
         responses = []

@@ -36,6 +36,7 @@ class MetalBackend:
     def __init__(self, metal_backend_path: Optional[str] = None, model_metadata: Optional[Dict[str, Any]] = None):
         self.metal_backend_path = metal_backend_path
         self._metal_executor = None
+        self._metal_attention_executor = None
         self._metallib_path: Optional[str] = None
         self._available_kernels: Dict[str, bool] = {}
         self._device_info: Optional[str] = None
@@ -99,19 +100,26 @@ class MetalBackend:
                     sys.path.insert(0, build_lib_path)
 
                 import metal_bindings
-                self._metal_executor = metal_bindings.MetalKernelExecutor(self._metallib_path)
+                import metal_attention_bindings
 
-                # Get device info and available kernels
+                self._metal_executor = metal_bindings.MetalKernelExecutor(self._metallib_path)
+                self._metal_attention_executor = metal_attention_bindings.MetalAttentionExecutor(self._metallib_path)
+
+                # Get device info and available kernels from both executors
                 self._device_info = self._metal_executor.get_device_info()
                 available_kernels = self._metal_executor.list_available_kernels()
+                attention_kernels = self._metal_attention_executor.list_available_kernels()
+
+                # Combine kernel lists
+                all_kernels = list(set(available_kernels + attention_kernels))
 
                 # Track which operations we can perform
                 self._available_kernels = {
-                    'attention': any('attention' in kernel.lower() for kernel in available_kernels),
-                    'softmax': any('softmax' in kernel.lower() for kernel in available_kernels),
-                    'embedding': any('embedding' in kernel.lower() for kernel in available_kernels),
-                    'mlp': any('gemm' in kernel.lower() or 'mlp' in kernel.lower() for kernel in available_kernels),
-                    'normalization': any('norm' in kernel.lower() for kernel in available_kernels)
+                    'attention': any('attention' in kernel.lower() for kernel in all_kernels),
+                    'softmax': any('softmax' in kernel.lower() for kernel in all_kernels),
+                    'embedding': any('embedding' in kernel.lower() for kernel in all_kernels),
+                    'mlp': any('gemm' in kernel.lower() or 'mlp' in kernel.lower() for kernel in all_kernels),
+                    'normalization': any('norm' in kernel.lower() for kernel in all_kernels)
                 }
 
                 self.initialization_time = time.perf_counter() - start_time
@@ -119,7 +127,7 @@ class MetalBackend:
 
                 print(f"Metal backend initialized successfully")
                 print(f"  Device: {self._device_info}")
-                print(f"  Available kernels: {len(available_kernels)}")
+                print(f"  Available kernels: {len(all_kernels)} (general: {len(available_kernels)}, attention: {len(attention_kernels)})")
                 print(f"  Metallib: {os.path.basename(self._metallib_path)}")
                 return True
 
@@ -235,9 +243,13 @@ class MetalBackend:
             query_f32 = np.asarray(query_2d, dtype=np.float32, order="C")
             kv_f32 = np.asarray(kv_cache, dtype=np.float32, order="C")
 
+            # Use the attention executor for attention operations
+            if not self._metal_attention_executor:
+                raise RuntimeError("Metal attention executor not initialized")
+
             # Prefer masked kernel if provided and a custom_mask is available
-            if custom_mask is not None and hasattr(self._metal_executor, 'execute_attention_with_kv_cache_masked'):
-                result = self._metal_executor.execute_attention_with_kv_cache_masked(
+            if custom_mask is not None and hasattr(self._metal_attention_executor, 'execute_attention_with_kv_cache_masked'):
+                result = self._metal_attention_executor.execute_attention_with_kv_cache_masked(
                     query_f32,
                     kv_f32,
                     kv_page_indices.astype(np.int32),
@@ -251,7 +263,7 @@ class MetalBackend:
                     custom_mask.astype(np.uint8)
                 )
             else:
-                result = self._metal_executor.execute_attention_with_kv_cache(
+                result = self._metal_attention_executor.execute_attention_with_kv_cache(
                     query_f32,
                     kv_f32,
                     kv_page_indices.astype(np.int32),
@@ -295,7 +307,7 @@ class MetalBackend:
             'available_kernels': self._available_kernels.copy(),
             'metal_backend_path': self.metal_backend_path,
             'platform_support': sys.platform == 'darwin',
-            'masked_attention': bool(self._metal_executor and hasattr(self._metal_executor, 'execute_attention_with_kv_cache_masked'))
+            'masked_attention': bool(self._metal_attention_executor and hasattr(self._metal_attention_executor, 'execute_attention_with_kv_cache_masked'))
         }
 
     def cleanup(self):
@@ -303,6 +315,10 @@ class MetalBackend:
         if self._metal_executor:
             # MetalKernelExecutor handles its own cleanup in destructor
             self._metal_executor = None
+
+        if self._metal_attention_executor:
+            # MetalAttentionExecutor handles its own cleanup in destructor
+            self._metal_attention_executor = None
 
         # Clear cached data
         self._available_kernels.clear()
