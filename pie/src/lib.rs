@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 pub mod auth;
 pub mod client;
 mod instance;
-mod api;
+mod interface;
 mod kvs;
 mod messaging;
 mod model;

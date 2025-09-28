@@ -1,3 +1,4 @@
+use inferlet::interface::Tokenize;
 use inferlet::stop_condition::{StopCondition, ends_with_any, max_len};
 use inferlet::{Args, Result, Sampler};
 use std::time::Instant;
