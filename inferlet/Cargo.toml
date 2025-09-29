@@ -11,13 +11,12 @@ categories = ["wasm"]
 include = ["src", "Cargo.toml", "wit"]
 
 [dependencies]
-wit-bindgen = "0.45.0"
-wstd = "0.5.3"
+wit-bindgen = "0.46.0"
+wstd = "0.5.6"
 trait-variant = "0.1.2"
-wasi = "0.14.3"
+wasi = "0.14.7"
 inferlet-macros = { version = "0.1.0", path = "../inferlet-macros" } # Adjust the path as needed
 anyhow = "1.0.95"
-rand = "0.9.2"
 futures = "0.3.31"
 minijinja = { version = "2.12.0", features = ["loader"] }
 serde = { version = "1.0.219", features = ["derive"] }
