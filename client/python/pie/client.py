@@ -74,9 +74,6 @@ class PieClient:
         self.inst_event_queues = {}
         self.pending_downloads = {}  # For reassembling blob chunks
 
-        # 🔻 FIX 1/3: Buffer for early events to prevent race conditions.
-        self.orphan_events = {}
-
     async def __aenter__(self):
         """Enter the async context, establishing the connection."""
         await self.connect()
@@ -119,21 +116,12 @@ class PieClient:
             if corr_id in self.pending_requests:
                 future = self.pending_requests.pop(corr_id)
                 future.set_result((message.get("successful"), message.get("result")))
-
         elif msg_type == "instance_event":
-            # 🔻 FIX 2/3: Buffer orphan events instead of discarding them.
             instance_id = message.get("instance_id")
-            event_tuple = (message.get("event"), message.get("message"))
-
             if instance_id in self.inst_event_queues:
-                # Queue exists, proceed as normal
-                await self.inst_event_queues[instance_id].put(event_tuple)
-            else:
-                # Queue doesn't exist yet, buffer the event
-                if instance_id not in self.orphan_events:
-                    self.orphan_events[instance_id] = []
-                self.orphan_events[instance_id].append(event_tuple)
-
+                event = message.get("event")
+                msg = message.get("message")
+                await self.inst_event_queues[instance_id].put((event, msg))
         elif msg_type == "download_blob":
             await self._handle_blob_chunk(message)
         elif msg_type == "server_event":
@@ -289,16 +277,7 @@ class PieClient:
         successful, result = await self._send_msg_and_wait(msg)
         if successful:
             instance_id = result
-            # Create the queue as before
-            queue = asyncio.Queue()
-            self.inst_event_queues[instance_id] = queue
-
-            # 🔻 FIX 3/3: Check for and replay any events that arrived early.
-            if instance_id in self.orphan_events:
-                early_events = self.orphan_events.pop(instance_id)
-                for event_tuple in early_events:
-                    await queue.put(event_tuple)
-
+            self.inst_event_queues[instance_id] = asyncio.Queue()
             return Instance(self, instance_id)
         raise Exception(f"Failed to launch instance: {result}")
 

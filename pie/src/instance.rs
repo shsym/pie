@@ -1,7 +1,5 @@
-use crate::api::core::Queue;
-use crate::model::resource::{ResourceId, ResourceTypeId};
+use crate::resource::{ResourceId, ResourceTypeId};
 use crate::utils;
-use anyhow::{Result, bail, format_err};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::io;
@@ -11,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 use uuid::Uuid;
-use wasmtime::component::{Resource, ResourceTable};
+use wasmtime::component::ResourceTable;
 use wasmtime_wasi::async_trait;
 use wasmtime_wasi::cli::IsTerminal;
 use wasmtime_wasi::cli::StdoutStream;
@@ -143,10 +141,6 @@ impl InstanceState {
         self.return_value.clone()
     }
 
-    pub fn read_queue(&self, queue: &Resource<Queue>) -> Result<(usize, u32, u32)> {
-        let q = self.resource_table.get(&queue)?;
-        Ok((q.service_id, q.uid, q.priority))
-    }
     pub fn map_resources(
         &mut self,
         service_id: usize,
@@ -176,21 +170,13 @@ impl InstanceState {
         service_id: usize,
         resource_type: ResourceTypeId,
         virt_id: ResourceId,
-    ) -> Result<ResourceId> {
-        let m = self
-            .resources
-            .get(&(service_id, resource_type))
-            .ok_or(format_err!(
-                "Failed to find resource mapper for service_id: {:?}, resource_type: {:?}",
-                service_id,
-                resource_type
-            ))?;
-        let phys_id = m.translate(virt_id).ok_or(format_err!(
-            "Failed to translate resource pointer: {:?} -> {:?}",
-            virt_id,
-            m.virtual_to_physical
-        ))?;
-        Ok(phys_id)
+    ) -> Option<ResourceId> {
+        let m = self.resources.get(&(service_id, resource_type));
+        if let Some(m) = m {
+            m.translate(virt_id)
+        } else {
+            None
+        }
     }
 }
 

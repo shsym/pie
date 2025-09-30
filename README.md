@@ -10,7 +10,7 @@
 </div>
 
 
-**Pie** is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
+**PIE** is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
 
 > **Note** 🧪
 >

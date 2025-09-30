@@ -1,17 +1,19 @@
 """
 Python Backend Handler
 
-This module provides the FlashInfer-based handler for the Python backend.
-It instantiates the common Handler class with FlashInfer operations.
+This module provides the backend handler for the Python backend.
+It instantiates the common Handler class with the appropriate operations
+backend (Metal on Apple Silicon, FlashInfer elsewhere).
 """
 
-from common import Handler, ModelInfo
-from backend_ops import FlashInferOps
 import torch
+
+from common import Handler, ModelInfo
+from backend_ops import get_backend_ops
 
 
 class PythonHandler(Handler):
-    """Python backend handler using FlashInfer operations."""
+    """Python backend handler using appropriate operations backend."""
 
     def __init__(
         self,
@@ -21,35 +23,33 @@ class PythonHandler(Handler):
         max_dist_size: int,
         max_num_kv_pages: int,
         max_num_embeds: int,
-        max_batch_tokens: int,
         max_num_adapters: int,
         max_adapter_rank: int,
         dtype: torch.dtype,
         device: str,
     ):
-        """Initialize Python handler with FlashInfer operations."""
+        """Initialize Python handler with appropriate operations backend."""
 
-        # Create FlashInfer ops instance
-        flashinfer_ops = FlashInferOps()
+        # Get appropriate backend (Metal on Apple Silicon, FlashInfer elsewhere)
+        backend_ops = get_backend_ops()
 
-        # Initialize parent with FlashInfer ops
+        # Initialize parent with selected backend
         super().__init__(
             model=model,
             model_info=model_info,
-            ops=flashinfer_ops,
+            ops=backend_ops,
             kv_page_size=kv_page_size,
             max_dist_size=max_dist_size,
             max_num_kv_pages=max_num_kv_pages,
             max_num_embeds=max_num_embeds,
-            max_batch_tokens=max_batch_tokens,
             max_num_adapters=max_num_adapters,
             max_adapter_rank=max_adapter_rank,
             dtype=dtype,
             device=device,
         )
 
-        print("✅ PythonHandler initialized with FlashInfer backend")
-        print(f"   FlashInfer available: {flashinfer_ops.available}")
+        print(f"✅ PythonHandler initialized with {backend_ops.backend_name} backend")
+        print(f"   {backend_ops.backend_name} available: {backend_ops.available}")
 
     def upload_handler(self, reqs):
         """Handle adapter upload requests."""

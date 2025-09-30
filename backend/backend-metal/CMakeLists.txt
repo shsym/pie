@@ -63,30 +63,51 @@ add_custom_command(
 # Create custom target for Metal library
 add_custom_target(pie_metal_kernels ALL DEPENDS ${METALLIB_OUTPUT})
 
-# Python bindings module
+# Python bindings module (main bindings)
 pybind11_add_module(metal_bindings
     src/bindings.mm
 )
 
-# Link Metal framework
+# Python attention bindings module (dedicated attention bindings)
+pybind11_add_module(metal_attention_bindings
+    src/attention_bindings.mm
+)
+
+# Link Metal framework to both modules
 target_link_libraries(metal_bindings PRIVATE
     "-framework Metal"
     "-framework Foundation"
 )
 
-# Set target properties for Python module
+target_link_libraries(metal_attention_bindings PRIVATE
+    "-framework Metal"
+    "-framework Foundation"
+)
+
+# Set target properties for Python modules
 set_target_properties(metal_bindings PROPERTIES
+    CXX_VISIBILITY_PRESET "hidden"
+    VISIBILITY_INLINES_HIDDEN YES
+)
+
+set_target_properties(metal_attention_bindings PROPERTIES
     CXX_VISIBILITY_PRESET "hidden"
     VISIBILITY_INLINES_HIDDEN YES
 )
 
 # Ensure Metal library is built before bindings
 add_dependencies(metal_bindings pie_metal_kernels)
+add_dependencies(metal_attention_bindings pie_metal_kernels)
 
 # Copy metallib to bindings output directory for runtime access
 add_custom_command(TARGET metal_bindings POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy ${METALLIB_OUTPUT} $<TARGET_FILE_DIR:metal_bindings>/
     COMMENT "Copying metallib to bindings directory"
+)
+
+add_custom_command(TARGET metal_attention_bindings POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy ${METALLIB_OUTPUT} $<TARGET_FILE_DIR:metal_attention_bindings>/
+    COMMENT "Copying metallib to attention bindings directory"
 )
 
 # Custom run target (optional)
