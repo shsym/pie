@@ -1,10 +1,19 @@
-use crate::batching::{BatchingConfig, MultiStreamBatcher};
-use crate::handler::{Handler, get_batching_config};
+pub mod batching;
+pub mod request;
+pub mod resource;
+pub mod tokenizer;
+
 use crate::instance::InstanceId;
-use crate::resource::{ResourceId, ResourceManager, ResourceTypeId};
+use crate::model::batching::{BatchPolicySelector, BatchScheduler, ForwardPassPolicy};
+use crate::model::request::{
+    FORWARD_PASS_ID, HANDSHAKE_ID, HandshakeRequest, HandshakeResponse, HeartbeatRequest, Request,
+};
+use crate::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
+use crate::model::tokenizer::BytePairEncoder;
 use crate::runtime::trap_exception;
 use crate::service::{self, Service, ServiceError};
-use crate::tokenizer::BytePairEncoder;
+use anyhow::Result;
+use anyhow::bail;
 use bytes::Bytes;
 use futures::future;
 use serde::{Deserialize, Serialize};
@@ -98,117 +107,28 @@ pub async fn runtime_stats() -> HashMap<String, String> {
     aggregated_stats
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HandshakeRequest {
-    pub version: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HandshakeResponse {
-    pub version: String,
-    pub model_name: String,
-    pub model_traits: Vec<String>,
-    pub model_description: String,
-    pub prompt_template: String,
-    pub prompt_template_type: String,
-    pub prompt_stop_tokens: Vec<String>,
-    pub kv_page_size: u32,
-    pub resources: HashMap<u32, u32>,
-    pub tokenizer_merge_table: HashMap<u32, Vec<u8>>,
-    pub tokenizer_special_tokens: HashMap<String, u32>,
-    pub tokenizer_split_regex: String,
-    pub tokenizer_escape_non_printable: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct QueryRequest {
-    pub query: String,
-}
-#[derive(Debug, Serialize, Deserialize)]
-pub struct QueryResponse {
-    pub value: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HeartbeatRequest {}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HeartbeatResponse {}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ForwardPassRequest {
-    pub input_tokens: Vec<u32>,
-    pub input_token_positions: Vec<u32>,
-    pub input_embed_ptrs: Vec<u32>,
-    pub input_embed_positions: Vec<u32>,
-    pub adapter: Option<u32>,
-    pub adapter_seed: Option<i64>,
-    pub mask: Vec<Vec<u32>>,
-    pub kv_page_ptrs: Vec<u32>,
-    pub kv_page_last_len: u32,
-    pub output_token_indices: Vec<u32>,
-    pub output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
-    pub output_embed_ptrs: Vec<u32>,
-    pub output_embed_indices: Vec<u32>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ForwardPassResponse {
-    pub tokens: Vec<u32>,
-    pub dists: Vec<(Vec<u32>, Vec<f32>)>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EmbedImageRequest {
-    pub embed_ptrs: Vec<u32>,
-    pub image_blob: Vec<u8>,
-    pub position_offset: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InitializeAdapterRequest {
-    pub adapter_ptr: u32,
-    pub rank: u32,
-    pub alpha: f32,
-    pub population_size: u32,
-    pub mu_fraction: f32,
-    pub initial_sigma: f32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UpdateAdapterRequest {
-    pub adapter_ptr: u32,
-    pub scores: Vec<f32>,
-    pub seeds: Vec<i64>,
-    pub max_sigma: f32,
-}
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UploadAdapterRequest {
-    pub adapter_ptr: u32,
-    pub name: String,
-    pub adapter_data: Vec<u8>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DownloadAdapterRequest {
-    pub adapter_ptr: u32,
-    pub name: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DownloadAdapterResponse {
-    pub adapter_data: Vec<u8>,
+pub fn submit_request(
+    service_id: usize,
+    cmd_queue_id: CmdQueueId,
+    priority: u32,
+    req: Request,
+) -> Result<()> {
+    Command::Submit {
+        cmd_queue_id,
+        priority,
+        req,
+    }
+    .dispatch(service_id)?;
+    Ok(())
 }
 
 /// Defines the set of operations available for the key-value store.
 #[derive(Debug)]
 pub enum Command {
     Submit {
-        inst_id: InstanceId,
         cmd_queue_id: CmdQueueId,
-        handler: Handler,
-        data: Bytes,
-        response: Option<oneshot::Sender<Bytes>>,
+        priority: u32,
+        req: Request,
     },
     GetInfo {
         response: oneshot::Sender<ModelInfo>,
@@ -269,6 +189,7 @@ pub struct ModelInfo {
     pub prompt_stop_tokens: Vec<String>,
     pub tokenizer: Arc<BytePairEncoder>,
     pub kv_page_size: u32,
+    pub max_batch_tokens: usize,
 }
 
 /// An in-memory key-value store service.
@@ -276,28 +197,29 @@ pub struct ModelInfo {
 pub struct Model {
     info: ModelInfo,
     resource_manager: ResourceManager,
-
     shutdown_tx: broadcast::Sender<()>,
-    scheduler_tx:
-        mpsc::UnboundedSender<(Handler, CmdQueueId, Option<oneshot::Sender<Bytes>>, Bytes)>,
+    scheduler_tx: mpsc::UnboundedSender<(CmdQueueId, u32, Request)>,
     scheduling_worker_handle: Option<JoinHandle<()>>,
     backend_worker_handle: Option<JoinHandle<()>>,
 }
 
 impl Model {
-    pub async fn new(endpoint: &str) -> anyhow::Result<Self> {
+    pub async fn new(endpoint: &str) -> Result<Self> {
         let mut socket = DealerSocket::new();
         socket.connect(endpoint).await?;
 
-        let mut batching_config = get_batching_config();
+        let handshake_info = Self::handshake(&mut socket).await?;
+
         let mut batch_triggers = HashMap::new();
-        for (handler, cfg) in batching_config.iter_mut() {
-            if let BatchingConfig::Triggered { trigger, .. } = cfg {
-                let t = Arc::new(AtomicBool::new(true));
-                batch_triggers.insert(handler.get_handler_id(), t.clone());
-                *trigger = Some(t.clone());
-            }
-        }
+        let forward_pass_trigger = Arc::new(AtomicBool::new(true));
+        let forward_pass_policy = ForwardPassPolicy::new(
+            forward_pass_trigger.clone(),
+            handshake_info.max_batch_tokens,
+            Duration::ZERO,
+        );
+        let batch_policy = BatchPolicySelector::new(forward_pass_policy);
+
+        batch_triggers.insert(FORWARD_PASS_ID, forward_pass_trigger);
 
         let (backend_tx, backend_rx) = mpsc::unbounded_channel();
         let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel();
@@ -312,25 +234,14 @@ impl Model {
             shutdown_rx,
         ));
         let scheduling_worker_handle = tokio::spawn(Self::scheduling_worker(
-            batching_config,
+            batch_policy,
             scheduler_rx,
             backend_tx,
             shutdown_tx.subscribe(),
         ));
 
-        let (handshake_tx, handshake_rx) = oneshot::channel();
-        scheduler_tx.send((
-            Handler::Handshake,
-            0,
-            Some(handshake_tx),
-            Bytes::from(rmp_serde::to_vec_named(&HandshakeRequest {
-                version: "0.1.0".to_string(),
-            })?),
-        ))?;
-
-        let handshake_info = rmp_serde::from_slice::<HandshakeResponse>(&handshake_rx.await?)?;
-
         let tokenizer = Arc::new(BytePairEncoder::new(
+            handshake_info.tokenizer_num_vocab,
             handshake_info.tokenizer_merge_table.into_iter().collect(),
             handshake_info.tokenizer_special_tokens,
             &handshake_info.tokenizer_split_regex,
@@ -346,6 +257,7 @@ impl Model {
             prompt_stop_tokens: handshake_info.prompt_stop_tokens,
             tokenizer,
             kv_page_size: handshake_info.kv_page_size,
+            max_batch_tokens: handshake_info.max_batch_tokens,
         };
 
         let resource_manager = ResourceManager::new(handshake_info.resources);
@@ -360,8 +272,31 @@ impl Model {
         })
     }
 
-    // NEW: Graceful shutdown method.
-    pub async fn shutdown(mut self) -> anyhow::Result<()> {
+    async fn handshake(socket: &mut DealerSocket) -> Result<HandshakeResponse> {
+        let req = Bytes::from(rmp_serde::to_vec_named(&HandshakeRequest {
+            version: "0.1.0".to_string(),
+        })?);
+
+        Self::send_zmq_message(socket, 0, HANDSHAKE_ID, req).await?;
+        let (corr_id, handler_id, mut frames) = Self::recv_zmq_messages(socket).await?;
+
+        if corr_id != 0 {
+            bail!("[Error] Invalid correlation ID in handshake response.");
+        }
+
+        if handler_id != HANDSHAKE_ID {
+            bail!("[Error] Invalid handler ID in handshake response.");
+        }
+
+        let handshake_frame = frames
+            .pop_front()
+            .ok_or(anyhow::format_err!("Missing handshake frame"))?;
+        let handshake_info = rmp_serde::from_slice::<HandshakeResponse>(&handshake_frame)?;
+
+        Ok(handshake_info)
+    }
+
+    pub async fn shutdown(mut self) -> Result<()> {
         println!("[Info] Shutting down model service...");
         self.shutdown_tx.send(())?;
 
@@ -376,17 +311,12 @@ impl Model {
     }
 
     async fn scheduling_worker(
-        config: HashMap<Handler, BatchingConfig>,
-        mut rx: mpsc::UnboundedReceiver<(
-            Handler,
-            CmdQueueId,
-            Option<oneshot::Sender<Bytes>>,
-            Bytes,
-        )>,
-        backend_tx: mpsc::UnboundedSender<(Handler, Vec<(Option<oneshot::Sender<Bytes>>, Bytes)>)>,
+        batch_policy: BatchPolicySelector,
+        mut req_rx: mpsc::UnboundedReceiver<(CmdQueueId, u32, Request)>,
+        backend_tx: mpsc::UnboundedSender<Vec<Request>>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
-        let mut batcher = MultiStreamBatcher::new(config.clone());
+        let mut sched = BatchScheduler::new(batch_policy);
         let mut next_poll_duration: Option<Duration> = None;
         const IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -398,15 +328,15 @@ impl Model {
                     println!("[Info] Shutdown signal received, exiting scheduling worker.");
                     break;
                 },
-                maybe_msg = rx.recv() => {
-                    if let Some((handler, cmd_queue_id, sender, msg)) = maybe_msg {
-                        if !config.contains_key(&handler) {
-                            if backend_tx.send((handler, vec![(sender, msg)])).is_err() {
+                maybe_msg = req_rx.recv() => {
+                    if let Some((cmd_queue_id, priority, request )) = maybe_msg {
+                        if request.is_eager() {
+                            if backend_tx.send(vec![request]).is_err() {
                                eprintln!("[Warn] Backend channel closed, could not send non-batched message.");
                             }
                             continue;
                         }
-                        batcher.push(cmd_queue_id, handler, (sender, msg), Instant::now());
+                        sched.push(cmd_queue_id, priority, request, Instant::now());
                     } else {
                         println!("[Info] Command channel closed, shutting down scheduler handler.");
                         break;
@@ -415,51 +345,39 @@ impl Model {
                 _ = tokio::time::sleep(sleep_duration) => {}
             }
 
-            let batch = batcher.poll(Instant::now());
-            for (batch_handler, batch_payload) in batch {
-                if batch_handler == Handler::Synchronize {
-                    if let Some((sender, _)) = batch_payload.into_iter().next() {
-                        if let Some(sender) = sender {
-                            // FIX: Log error if send fails.
-                            if sender.send(Bytes::default()).is_err() {
-                                println!(
-                                    "[Warn] Synchronize response channel closed before sending."
-                                );
-                            }
-                        }
+            let batches = sched.schedule(Instant::now());
+            for batch in batches {
+                if batch.first().unwrap().is_sync_req() {
+                    if let Request::Synchronize(sender) = batch.into_iter().next().unwrap() {
+                        sender.send(()).ok();
                     }
-                    continue;
-                }
-
-                if !batch_payload.is_empty() {
-                    if backend_tx.send((batch_handler, batch_payload)).is_err() {
-                        eprintln!("[Warn] Backend channel closed, could not send batch.");
-                    }
+                } else {
+                    backend_tx.send(batch).ok();
                 }
             }
-            next_poll_duration = batcher.next_poll_in(Instant::now());
+            next_poll_duration = sched.next_poll_in(Instant::now());
         }
     }
 
     async fn backend_worker(
         mut socket: DealerSocket,
-        mut rx: mpsc::UnboundedReceiver<(Handler, Vec<(Option<oneshot::Sender<Bytes>>, Bytes)>)>,
+        mut batch_rx: mpsc::UnboundedReceiver<Vec<Request>>,
         batch_triggers: HashMap<HandlerId, Arc<AtomicBool>>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         let mut corr_id: u32 = 0;
-        let mut event_table: HashMap<(u32, usize), (oneshot::Sender<Bytes>, Instant)> =
-            HashMap::new();
-        const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-
-        // --- NEW: Heartbeat Configuration ---
+        let mut event_table: HashMap<(u32, usize), (Request, Instant)> = HashMap::new();
+        const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
         const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
         let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         let mut heartbeat_pending: Option<Instant> = None;
         // Use a special correlation ID to distinguish heartbeats from regular requests.
         let heartbeat_corr_id = u32::MAX;
-        // --- End of New Code ---
+
+        // Define the stats printing interval.
+        const STATS_PRINT_INTERVAL: Duration = Duration::from_secs(30);
+        let mut stats_interval = tokio::time::interval(STATS_PRINT_INTERVAL);
 
         loop {
             let sleep_duration = event_table
@@ -476,6 +394,19 @@ impl Model {
                     break;
                 },
 
+                // Add a new arm to the select macro to handle the stats interval tick.
+                _ = stats_interval.tick() => {
+                    let stats = runtime_stats().await;
+                    println!("\n----- Runtime Stats -----");
+                    // Pretty-print the stats for better readability.
+                    let mut sorted_stats: Vec<_> = stats.iter().collect();
+                    sorted_stats.sort_by_key(|(k, _)| *k);
+                    for (key, value) in sorted_stats {
+                        println!("{:<40} | {}", key, value);
+                    }
+                    println!("-------------------------\n");
+                },
+
                 _ = heartbeat_interval.tick() => {
                     if let Some(sent_at) = heartbeat_pending {
                         if sent_at.elapsed() > HEARTBEAT_TIMEOUT {
@@ -483,40 +414,43 @@ impl Model {
                         }
                     }
 
-                    let heartbeat_req = HeartbeatRequest {};
-                    // This unwrap is safe for an empty struct.
-                    let payload = Bytes::from(rmp_serde::to_vec_named(&heartbeat_req).unwrap());
+                    let heartbeat_req = Request::Heartbeat(HeartbeatRequest {});
+                    let payload = heartbeat_req.serialize_req().unwrap();
+                    let res = Self::send_zmq_message(
+                        &mut socket,
+                        heartbeat_corr_id,
+                        heartbeat_req.handler_id(),
+                        payload
+                    ).await;
 
-                    let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(3);
-                    frames.push_back(Bytes::copy_from_slice(&heartbeat_corr_id.to_be_bytes()));
-                    frames.push_back(Bytes::copy_from_slice(&Handler::Heartbeat.get_handler_id().to_be_bytes()));
-                    frames.push_back(payload);
-
-                    if let Err(e) = socket.send(ZmqMessage::try_from(frames).unwrap()).await {
+                    if let Err(e) = res {
                         eprintln!("[Error] Socket send failed for heartbeat: {:?}", e);
                     } else {
                         heartbeat_pending = Some(Instant::now());
                     }
                 },
-                // --- End of New Code ---
 
-                maybe_command = rx.recv() => {
-                    if let Some((handler, payload)) = maybe_command {
+                maybe_command = batch_rx.recv() => {
+                    if let Some(requests) = maybe_command {
                         let current_corr_id = corr_id;
-                        let (senders, batch): (Vec<_>, Vec<_>) = payload.into_iter().unzip();
-                        let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(2 + batch.len());
-                        frames.push_back(Bytes::copy_from_slice(&current_corr_id.to_be_bytes()));
-                        frames.push_back(Bytes::copy_from_slice(&handler.get_handler_id().to_be_bytes()));
-                        frames.extend(batch);
+                        let handler_id = requests.first().unwrap().handler_id();
+                        let serialized:Vec<Bytes> = requests.iter().map(|request| request.serialize_req().unwrap()).collect();
 
-                        if let Err(e) = socket.send(ZmqMessage::try_from(frames).unwrap()).await {
+                        let res = Self::send_zmq_messages(
+                            &mut socket,
+                            current_corr_id,
+                            handler_id,
+                            serialized
+                        ).await;
+
+                        if let Err(e) = res {
                             eprintln!("[Error] Socket send failed for corr_id {}: {:?}", current_corr_id, e);
                             continue;
                         }
 
-                        for (idx, sender) in senders.into_iter().enumerate() {
-                            if let Some(sender) = sender {
-                                event_table.insert((current_corr_id, idx), (sender, Instant::now()));
+                        for (idx, request) in requests.into_iter().enumerate() {
+                            if request.has_response() {
+                                event_table.insert((current_corr_id, idx), (request, Instant::now()));
                             }
                         }
                         corr_id = corr_id.wrapping_add(1);
@@ -525,29 +459,19 @@ impl Model {
                         break;
                     }
                 },
-                result = socket.recv() => {
+                result = Self::recv_zmq_messages(&mut socket) => {
                     match result {
-                        Ok(zmq_msg) => {
-                            let mut frames = zmq_msg.into_vecdeque();
-                            let Some(corr_id_bytes) = frames.pop_front() else { continue; };
-                            let Some(handler_id_bytes) = frames.pop_front() else { continue; };
-                            let Ok(corr_id_slice) = corr_id_bytes.as_ref().try_into() else { continue; };
-                            let Ok(handler_id_slice) = handler_id_bytes.as_ref().try_into() else { continue; };
+                        Ok((received_corr_id, received_handler_id, frames)) => {
 
-                            let received_corr_id = u32::from_be_bytes(corr_id_slice);
-                            let received_handler_id = u32::from_be_bytes(handler_id_slice);
-
-                            // --- MODIFIED: Handle Heartbeat Response ---
                             if received_corr_id == heartbeat_corr_id {
                                 heartbeat_pending = None;
                                 continue; // Skip further processing for heartbeats.
                             }
-                            // --- End of Modification ---
 
                             for (idx, payload) in frames.into_iter().enumerate() {
                                 let key = (received_corr_id, idx);
-                                if let Some((sender, _)) = event_table.remove(&key) {
-                                    let _ = sender.send(payload);
+                                if let Some((request, _)) = event_table.remove(&key) {
+                                    let _ = request.deserialize_resp(payload);
                                 }
                             }
 
@@ -576,17 +500,11 @@ impl Model {
         }
     }
 
-    pub fn submit(
-        &self,
-        handler: Handler,
-        cmd_queue_id: CmdQueueId,
-        sender: Option<oneshot::Sender<Bytes>>,
-        msg: Bytes,
-    ) {
+    pub fn submit(&self, cmd_queue_id: CmdQueueId, priority: u32, req: Request) {
         // FIX: Log error if the scheduler channel is closed.
         if self
             .scheduler_tx
-            .send((handler, cmd_queue_id, sender, msg))
+            .send((cmd_queue_id, priority, req))
             .is_err()
         {
             eprintln!("[Error] Failed to submit command: Scheduler channel is closed.");
@@ -603,6 +521,53 @@ impl Model {
 
         stats
     }
+
+    async fn send_zmq_message(
+        socket: &mut DealerSocket,
+        corr_id: u32,
+        handler_id: u32,
+        payload: Bytes,
+    ) -> Result<()> {
+        let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(3);
+        frames.push_back(Bytes::copy_from_slice(&corr_id.to_be_bytes()));
+        frames.push_back(Bytes::copy_from_slice(&handler_id.to_be_bytes()));
+        frames.push_back(payload);
+        socket.send(ZmqMessage::try_from(frames).unwrap()).await?;
+        Ok(())
+    }
+
+    async fn send_zmq_messages(
+        socket: &mut DealerSocket,
+        corr_id: u32,
+        handler_id: u32,
+        payloads: Vec<Bytes>,
+    ) -> Result<()> {
+        let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(3);
+        frames.push_back(Bytes::copy_from_slice(&corr_id.to_be_bytes()));
+        frames.push_back(Bytes::copy_from_slice(&handler_id.to_be_bytes()));
+        frames.extend(payloads);
+        socket.send(ZmqMessage::try_from(frames).unwrap()).await?;
+        Ok(())
+    }
+
+    async fn recv_zmq_messages(socket: &mut DealerSocket) -> Result<(u32, u32, VecDeque<Bytes>)> {
+        let zmq_msg = socket.recv().await?;
+
+        let mut frames = zmq_msg.into_vecdeque();
+        let corr_id_bytes = frames
+            .pop_front()
+            .ok_or(anyhow::format_err!("Missing correlation ID frame"))?;
+        let handler_id_bytes = frames
+            .pop_front()
+            .ok_or(anyhow::format_err!("Missing handler ID frame"))?;
+        let corr_id_slice = corr_id_bytes.as_ref().try_into()?;
+        let handler_id_slice = handler_id_bytes.as_ref().try_into()?;
+
+        let received_corr_id = u32::from_be_bytes(corr_id_slice);
+        let received_handler_id = u32::from_be_bytes(handler_id_slice);
+
+        Ok((received_corr_id, received_handler_id, frames))
+    }
 }
 
 impl Service for Model {
@@ -611,13 +576,11 @@ impl Service for Model {
     async fn handle(&mut self, cmd: Self::Command) {
         match cmd {
             Command::Submit {
-                inst_id: _,
-                handler,
                 cmd_queue_id,
-                data,
-                response,
+                priority,
+                req,
             } => {
-                self.submit(handler, cmd_queue_id, response, data);
+                self.submit(cmd_queue_id, priority, req);
             }
 
             Command::GetInfo { response } => {

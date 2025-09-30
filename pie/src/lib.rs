@@ -4,19 +4,15 @@ use std::path::PathBuf;
 use tokio::sync::oneshot;
 
 pub mod auth;
-mod batching;
-mod bindings;
 pub mod client;
-mod handler;
 mod instance;
+mod api;
 mod kvs;
 mod messaging;
 mod model;
-mod resource;
 mod runtime;
 pub mod server;
 mod service;
-mod tokenizer;
 mod utils;
 
 // Re-export core components from internal modules

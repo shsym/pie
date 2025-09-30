@@ -12,7 +12,6 @@ from common import (
 )
 from handler import Handler
 from model_factory import create_model_and_fusion_map
-from platform_detection import is_apple_silicon
 
 
 def main(
@@ -27,9 +26,10 @@ def main(
     max_dist_size: int = 64,
     max_num_kv_pages: int = 1024,
     max_num_embeds: int = 128,
+    max_batch_tokens: int = 10240,
     max_num_adapters: int = 48,
     max_adapter_rank: int = 8,
-    device: str = None,
+    device: str = "cuda:0",
     dtype: str = "bfloat16",
 ):
     """
@@ -48,17 +48,12 @@ def main(
         max_dist_size: Maximum distance for embeddings.
         max_num_kv_pages: Maximum number of pages in the key-value cache.
         max_num_embeds: Maximum number of embeddings to store.
+        max_batch_tokens: Maximum number of tokens in a batch.
         max_num_adapters: Maximum number of adapters that can be loaded.
         max_adapter_rank: Maximum rank for any loaded adapter.
-        device: The device to run the model on (e.g., 'mps', 'cuda:0', 'cpu').
-                Auto-detects to 'mps' on Apple Silicon, 'cuda:0' otherwise.
+        device: The device to run the model on (e.g., 'cuda:0' or 'cpu').
         dtype: The data type for model weights (e.g., 'bfloat16', 'float16').
     """
-    # Auto-detect device if not specified
-    if device is None:
-        device = 'mps' if is_apple_silicon() else 'cuda:0'
-        print(f"Auto-detected device: {device}")
-
     config = build_config(
         model=model,
         host=host,
@@ -71,6 +66,7 @@ def main(
         max_dist_size=max_dist_size,
         max_num_kv_pages=max_num_kv_pages,
         max_num_embeds=max_num_embeds,
+        max_batch_tokens=max_batch_tokens,
         max_num_adapters=max_num_adapters,
         max_adapter_rank=max_adapter_rank,
         device=device,

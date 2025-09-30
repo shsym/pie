@@ -1,11 +1,11 @@
+use crate::adapter::SetAdapter;
 use crate::brle::Brle;
 use crate::drafter::Drafter;
+use crate::forward::{Distribution, Forward, KvPage};
 use crate::sampler::Sample;
 use crate::stop_condition::StopCondition;
-use crate::traits::forward::{Distribution, Forward, KvPage};
-use crate::traits::tokenize::{Tokenize, Tokenizer};
-use crate::traits::{Adapter, SetAdapter, SetAdapterSeed};
-use crate::{ChatFormatter, Model, Queue, Sampler, sampler, stop_condition};
+use crate::zo::SetAdapterSeed;
+use crate::{ChatFormatter, Model, Queue, Sampler, Tokenizer};
 use futures::future::join_all;
 use std::cmp::Ordering;
 use std::mem;
@@ -31,6 +31,8 @@ pub struct Context {
 
     pub adapter_ptr: Option<u32>,
     pub adapter_random_seed: Option<i64>,
+
+    pub begin_of_sequence: bool,
 }
 
 impl Context {
@@ -53,6 +55,7 @@ impl Context {
             kv_page_size,
             adapter_ptr: None,
             adapter_random_seed: None,
+            begin_of_sequence: true,
         }
     }
 
@@ -104,6 +107,7 @@ impl Context {
             kv_page_size,
             adapter_ptr: None,
             adapter_random_seed: None,
+            begin_of_sequence: false,
         }
     }
 
@@ -216,18 +220,8 @@ impl Context {
             kv_page_size: self.kv_page_size,
             adapter_ptr: self.adapter_ptr,
             adapter_random_seed: self.adapter_random_seed,
+            begin_of_sequence: self.begin_of_sequence,
         }
-    }
-
-    pub async fn generate_until(&mut self, sampler: Sampler, max_tokens: usize) -> String {
-        let mut cond_list: Vec<Box<dyn StopCondition>> = Vec::new();
-        for stop_token in self.model.get_stop_tokens() {
-            let stop_token_ids = self.tokenizer.tokenize(&stop_token);
-            cond_list.push(Box::new(stop_condition::Until::new(stop_token_ids)));
-        }
-        cond_list.push(Box::new(stop_condition::Length::new(max_tokens)));
-        let mut stop_condition = stop_condition::StopConditionList::new(cond_list);
-        self.generate(sampler, &mut stop_condition).await
     }
 
     pub fn fill(&mut self, text: &str) {
@@ -236,8 +230,6 @@ impl Context {
     }
 
     pub fn fill_tokens(&mut self, new_token_ids: Vec<u32>) {
-        self.flush_chat_messages();
-
         let n = new_token_ids.len();
         self.token_ids_pending.extend(new_token_ids);
 
@@ -247,27 +239,35 @@ impl Context {
             self.token_mask_pending
                 .push(self.token_mask_current.clone())
         }
+        self.begin_of_sequence = false;
     }
 
     pub fn fill_token(&mut self, new_token_id: u32) {
-        self.flush_chat_messages();
-
         self.token_ids_pending.push(new_token_id);
         self.token_mask_current.append(false);
         self.token_mask_pending
-            .push(self.token_mask_current.clone())
+            .push(self.token_mask_current.clone());
+        self.begin_of_sequence = false;
     }
 
     pub fn fill_system(&mut self, text: &str) {
         self.formatter.system(text);
+        self.flush_chat_messages2(false);
     }
 
     pub fn fill_user(&mut self, text: &str) {
         self.formatter.user(text);
+        self.flush_chat_messages2(true);
     }
 
-    pub fn assistant(&mut self, text: &str) {
+    pub fn fill_user_only(&mut self, text: &str) {
+        self.formatter.user(text);
+        self.flush_chat_messages2(false);
+    }
+
+    pub fn fill_assistant(&mut self, text: &str) {
         self.formatter.assistant(text);
+        self.flush_chat_messages2(false);
     }
 
     pub fn mask_tokens(&mut self, indices: &[usize], mask: bool) {
@@ -407,11 +407,14 @@ impl Context {
         self.adjust_kv_pages(-(num_tokens as isize));
     }
 
-    fn flush_chat_messages(&mut self) {
+    fn flush_chat_messages2(&mut self, add_generation_prompt: bool) {
         if self.formatter.has_messages() {
-            let p = self
-                .formatter
-                .render(&self.model.get_prompt_template(), true);
+            let p = self.formatter.render(
+                &self.model.get_prompt_template(),
+                add_generation_prompt,
+                self.begin_of_sequence,
+            );
+            self.begin_of_sequence = false;
             self.formatter.clear();
             self.fill(&p);
         }
@@ -419,8 +422,6 @@ impl Context {
 
     /// Processes a batch of pending tokens to update the model's internal state.
     pub async fn flush(&mut self) {
-        self.flush_chat_messages();
-
         if self.token_ids_pending.is_empty() {
             return;
         }
@@ -648,13 +649,11 @@ impl Context {
     /// # Returns
     ///
     /// A `Result` containing the generated `String` upon successful completion.
-    pub async fn generate<C: StopCondition>(
+    pub async fn generate<S: StopCondition>(
         &mut self,
         sampler: Sampler,
-        stop_condition: &mut C,
+        stop_condition: S,
     ) -> String {
-        self.flush_chat_messages();
-
         let mut generated_token_ids = Vec::new();
 
         // The autoregressive generation loop
@@ -663,18 +662,11 @@ impl Context {
             //let start_time = Instant::now();
             let next_token_id = self.decode_step(&sampler).await;
 
-            // end time
-            //let elapsed_time = end_time.duration_since(start_time);
-            //println!("elapsed time: {:?}", elapsed_time);
-            // print out the distributions
-            //println!("dist: {:?}", &dist.ids);
-            //println!("probs: {:?}", &dist.probs);
-
             self.fill_token(next_token_id);
 
             generated_token_ids.push(next_token_id);
 
-            if stop_condition.should_stop(&generated_token_ids) {
+            if stop_condition.check(&generated_token_ids) {
                 break;
             }
         }
@@ -730,7 +722,7 @@ impl Context {
         loop {
             // Beams are sorted by score, so the first match is the best valid one found so far.
             if let Some((beam, generated_tokens, _)) =
-                beams.iter().find(|(_, g, _)| stop_condition.should_stop(g))
+                beams.iter().find(|(_, g, _)| stop_condition.check(g))
             {
                 // Deallocate the pages previously held by `self`.
                 let _ = mem::take(&mut self.kv_pages);
@@ -758,7 +750,7 @@ impl Context {
             let next_dists = join_all(next_dist_futures).await;
 
             let mut next_beams = Vec::new();
-            for ((mut beam, generated, score), next_dist) in beams.into_iter().zip(next_dists) {
+            for ((beam, generated, score), next_dist) in beams.into_iter().zip(next_dists) {
                 // print out the distributions
                 //println!("dist: {:?}", &next_dist.ids);
                 //println!("probs: {:?}", &next_dist.probs);
@@ -950,7 +942,7 @@ impl Context {
             self.fill_tokens(accepted_tokens[num_retained_draft_tokens..].to_owned());
 
             // Check if the stop condition has been met after the step is complete.
-            if stop_condition.should_stop(&all_generated_tokens) {
+            if stop_condition.check(&all_generated_tokens) {
                 break;
             }
         }

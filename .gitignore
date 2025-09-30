@@ -28,7 +28,6 @@ Cargo.lock
 # Other local ide/environment
 .claude
 .codex
-.kilocode
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
