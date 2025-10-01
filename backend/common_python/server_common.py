@@ -28,7 +28,6 @@ import zmq
 from platformdirs import user_cache_dir
 from websockets.sync.client import connect
 
-from config.common import ModelInfo
 from message import (
     DownloadAdapterRequest,
     EmbedImageRequest,
@@ -108,8 +107,6 @@ def start_service(
     *,
     config: Dict[str, Any],
     handler_cls: Type,
-    model: Any,
-    model_info: ModelInfo,
     register_with_controller: bool = True,
 ) -> None:
     """Spin up the backend service using the provided handler implementation."""
@@ -123,8 +120,7 @@ def start_service(
         real_endpoint = f"tcp://*:{config['port']}"
 
     handler = handler_cls(
-        model=model,
-        model_info=model_info,
+        config=config,
         kv_page_size=config["kv_page_size"],
         max_dist_size=config["max_dist_size"],
         max_num_kv_pages=config["max_num_kv_pages"],

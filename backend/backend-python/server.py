@@ -5,13 +5,11 @@
 import fire
 
 from common import (
-    load_model as load_model_common,
     build_config,
     print_config,
     start_service,
 )
 from handler import Handler
-from model_factory import create_model_and_fusion_map
 
 
 def main(
@@ -75,15 +73,9 @@ def main(
 
     print_config(config)
 
-    model_instance, model_metadata = load_model_common(
-        config,
-        create_model_and_fusion_map,
-    )
     start_service(
         config=config,
         handler_cls=Handler,
-        model=model_instance,
-        model_info=model_metadata,
     )
 
 

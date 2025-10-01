@@ -5,7 +5,7 @@ This module provides the FlashInfer-based handler for the Python backend.
 It instantiates the common Handler class with FlashInfer operations.
 """
 
-from common import Handler, ModelInfo
+from common import Handler
 from backend_ops import FlashInferOps
 import torch
 
@@ -15,8 +15,7 @@ class PythonHandler(Handler):
 
     def __init__(
         self,
-        model,
-        model_info: ModelInfo,
+        config: dict,
         kv_page_size: int,
         max_dist_size: int,
         max_num_kv_pages: int,
@@ -34,8 +33,7 @@ class PythonHandler(Handler):
 
         # Initialize parent with FlashInfer ops
         super().__init__(
-            model=model,
-            model_info=model_info,
+            config=config,
             ops=flashinfer_ops,
             kv_page_size=kv_page_size,
             max_dist_size=max_dist_size,

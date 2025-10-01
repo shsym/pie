@@ -17,11 +17,10 @@ from config.common import ModelInfo
 CreateModelFn = Callable[[ModelInfo], Tuple[torch.nn.Module, dict]]
 
 
-def load_model(
-    config: dict, create_model_fn: CreateModelFn
-) -> tuple[torch.nn.Module, ModelInfo]:
-    """Load a model using the provided factory function and fusion metadata."""
+def load_model_info(config: dict) -> ModelInfo:
+    """Load the model information from the metadata file."""
 
+    # Locate the metadata file from the backend config.
     model_name = config["model"]
     cache_dir = config["cache_dir"]
     model_path = Path(cache_dir) / "models"
@@ -30,10 +29,23 @@ def load_model(
     if not metadata_path.exists():
         raise FileNotFoundError(f"Metadata file not found at: {metadata_path}")
 
+    # Load the model information from the metadata file.
     model_device = config["device"]
     model_dtype = getattr(torch, config["dtype"])
     model_info = ModelInfo.load_from_file(str(metadata_path), model_device, model_dtype)
 
+    return model_info
+
+
+def load_model(
+    config: dict, model_info: ModelInfo, create_model_fn: CreateModelFn
+) -> torch.nn.Module:
+    """Load a model using the provided factory function and fusion metadata."""
+    model_name = config["model"]
+    cache_dir = config["cache_dir"]
+    model_path = Path(cache_dir) / "models"
+
+    # Instantiate the model and its fusion map.
     try:
         model, fusion_map = create_model_fn(model_info)
     except RuntimeError as exc:
@@ -41,118 +53,49 @@ def load_model(
             f"Failed to instantiate model for architecture {model_info.architecture.type}: {exc}"
         ) from exc
 
-    source_to_fusion_target = {
-        source: target
-        for target, details in fusion_map.items()
-        for source in details["sources"]
-    }
+    tensor_to_file_map = {}
+    file_readers = {}
 
-    pending_fusion_tensors = {}
+    # Scan the tensor files and build the mapping of tensor names to the corresponding files.
+    for param_file in tqdm(
+        model_info.parameters, desc="Scanning tensor files", unit="files"
+    ):
+        weights_path = model_path / model_name / param_file
+        reader = ztensor.Reader(str(weights_path))
+        file_readers[param_file] = reader
+
+        tensor_names = reader.get_tensor_names()
+        for name in tensor_names:
+            tensor_to_file_map[name] = param_file
+
     model_state_keys = set(model.state_dict().keys())
     loaded_keys = set()
+    model_state = model.state_dict()
 
     try:
-        for param_file in model_info.parameters:
-            weights_path = model_path / model_name / param_file
-            with ztensor.Reader(str(weights_path)) as reader:
-                tensor_names = reader.get_tensor_names()
-                pbar_desc = (
-                    f"Loading {param_file[:30]}..."
-                    if len(param_file) > 30
-                    else f"Loading {param_file}"
-                )
-                for name in tqdm(tensor_names, desc=pbar_desc, unit="tensors"):
-                    if name in source_to_fusion_target:
-                        pending_fusion_tensors[name] = reader.read_tensor(
-                            name, to="torch"
-                        )
-                        continue
-
-                    if name in model_state_keys and name not in loaded_keys:
-                        tensor_data = reader.read_tensor(name, to="torch")
-                        if tensor_data is None:
-                            print(
-                                f"    Warning: Could not read tensor '{name}'. Skipping."
-                            )
-                            continue
-                        param = model.state_dict()[name]
-
-                        if tensor_data.shape != param.shape:
-                            print(
-                                f"    Warning: Shape mismatch for tensor '{name}'. Skipping."
-                            )
-                            continue
-                        # Ensure dtype/device compatibility using a single conversion
-                        if hasattr(tensor_data, "to"):
-                            needs_conversion = False
-                            conversion_kwargs = {}
-
-                            if hasattr(tensor_data, "dtype"):
-                                tensor_dtype = getattr(tensor_data, "dtype")
-                                if tensor_dtype != param.dtype:
-                                    conversion_kwargs["dtype"] = param.dtype
-                                    needs_conversion = True
-
-                            if hasattr(tensor_data, "device"):
-                                tensor_device = getattr(tensor_data, "device")
-                                if tensor_device != param.device:
-                                    conversion_kwargs["device"] = param.device
-                                    needs_conversion = True
-
-                            if needs_conversion:
-                                to_method = getattr(tensor_data, "to")
-                                tensor_data = to_method(**conversion_kwargs)
-                        with torch.no_grad():
-                            param.copy_(tensor_data, non_blocking=True)
-                        loaded_keys.add(name)
-
-        for target_name, details in tqdm(
-            fusion_map.items(), desc="Fusing tensors", unit="tensors"
+        # Load the parameters from the files to the model.
+        for param_name in tqdm(
+            model_state_keys, desc="Loading model parameters", unit="tensors"
         ):
-            source_names = details["sources"]
-            if all(s in pending_fusion_tensors for s in source_names):
-                param = model.state_dict()[target_name]
-                if details["op"] == "fusion":
-                    dim = details["dim"]
-                    current_offset = 0
-                    slice_indices = [slice(None)] * param.ndim
+            param = model_state[param_name]
 
-                    with torch.no_grad():
-                        for source_name in source_names:
-                            source_tensor = pending_fusion_tensors[source_name]
+            if param_name in fusion_map:
+                success = _load_fused_parameter(
+                    param_name,
+                    param,
+                    fusion_map[param_name],
+                    tensor_to_file_map,
+                    file_readers,
+                )
+            else:
+                success = _load_regular_parameter(
+                    param_name, param, tensor_to_file_map, file_readers
+                )
 
-                            slice_size = source_tensor.shape[dim]
-                            slice_indices[dim] = slice(
-                                current_offset, current_offset + slice_size
-                            )
+            if success:
+                loaded_keys.add(param_name)
 
-                            param[tuple(slice_indices)].copy_(
-                                source_tensor, non_blocking=True
-                            )
-                            current_offset += slice_size
-
-                elif details["op"] == "dequantize_mxfp4":
-                    blocks, scales = [pending_fusion_tensors[s] for s in source_names]
-                    fused_tensor = dequantize_from_mxfp4(
-                        blocks,
-                        scales,
-                        fp4_values=details["fp4_values"],
-                        dtype=param.dtype,
-                        device=param.device,
-                    )
-                    if fused_tensor.shape != param.shape:
-                        print(
-                            f"    Warning: Shape mismatch for fused tensor '{target_name}'. "
-                            "Skipping."
-                        )
-                        continue
-                    with torch.no_grad():
-                        param.copy_(fused_tensor, non_blocking=True)
-                else:
-                    raise ValueError(f"Unknown fusion operation: {details['op']}")
-
-                loaded_keys.add(target_name)
-
+        # Handle weight tying for the LM head.
         if "lm_head.weight" in model_state_keys and "lm_head.weight" not in loaded_keys:
             if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
                 embed_tokens = getattr(model.model, "embed_tokens")
@@ -173,7 +116,7 @@ def load_model(
             print("\nSuccessfully loaded all expected model weights.")
 
         model.eval()
-        return model, model_info
+        return model
 
     except ztensor.ZTensorError as exc:
         print(
@@ -189,7 +132,105 @@ def load_model(
         raise SystemExit(1) from exc
 
 
-def dequantize_from_mxfp4(
+def _load_fused_parameter(
+    param_name: str,
+    param: torch.Tensor,
+    fusion_details: dict,
+    tensor_to_file_map: dict,
+    file_readers: dict,
+) -> bool:
+    """Load and process a fusion parameter (concatenation or dequantization).
+
+    Returns True if successful, False if the parameter loading is skipped due to errors.
+    """
+    source_names = fusion_details["sources"]
+
+    source_tensors = []
+    for source_name in source_names:
+        if source_name not in tensor_to_file_map:
+            print(
+                f"    Warning: Could not load fusion source tensor '{source_name}'. "
+                f"Skipping fusion for '{param_name}'."
+            )
+            return False
+
+        param_file = tensor_to_file_map[source_name]
+        reader = file_readers[param_file]
+        tensor_data = reader.read_tensor(source_name, to="torch")
+        source_tensors.append(tensor_data)
+
+    with torch.no_grad():
+        if fusion_details["op"] == "fusion":
+            dim = fusion_details["dim"]
+
+            if param.shape[dim] != sum(
+                source_tensor.shape[dim] for source_tensor in source_tensors
+            ):
+                print(
+                    f"    Warning: Shape mismatch for fused tensor '{param_name}'. "
+                    "Skipping."
+                )
+                return False
+
+            current_offset = 0
+            slice_indices = [slice(None)] * param.ndim
+
+            for source_tensor in source_tensors:
+                slice_size = source_tensor.shape[dim]
+                slice_indices[dim] = slice(current_offset, current_offset + slice_size)
+
+                param[tuple(slice_indices)].copy_(source_tensor, non_blocking=True)
+                current_offset += slice_size
+
+        elif fusion_details["op"] == "dequantize_mxfp4":
+            blocks, scales = source_tensors[0], source_tensors[1]
+            fused_tensor = _dequantize_from_mxfp4(
+                blocks,
+                scales,
+                fp4_values=fusion_details["fp4_values"],
+                dtype=param.dtype,
+                device=str(param.device),
+            )
+            if fused_tensor.shape != param.shape:
+                print(
+                    f"    Warning: Shape mismatch for fused tensor '{param_name}'. "
+                    "Skipping."
+                )
+                return False
+
+            param.copy_(fused_tensor, non_blocking=True)
+        else:
+            raise ValueError(f"Unknown fusion operation: {fusion_details['op']}")
+
+    return True
+
+
+def _load_regular_parameter(
+    param_name: str, param: torch.Tensor, tensor_to_file_map: dict, file_readers: dict
+) -> bool:
+    """Load and process a regular (non-fused) parameter.
+
+    Returns True if successful, False if the parameter loading is skipped due to errors.
+    """
+    if param_name not in tensor_to_file_map:
+        print(f"    Warning: Could not read tensor '{param_name}'. Skipping.")
+        return False
+
+    param_file = tensor_to_file_map[param_name]
+    reader = file_readers[param_file]
+    tensor_data = reader.read_tensor(param_name, to="torch")
+
+    if tensor_data.shape != param.shape:
+        print(f"    Warning: Shape mismatch for tensor '{param_name}'. Skipping.")
+        return False
+
+    with torch.no_grad():
+        param.copy_(tensor_data, non_blocking=True)
+
+    return True
+
+
+def _dequantize_from_mxfp4(
     blocks: torch.Tensor,
     scales: torch.Tensor,
     fp4_values: Iterable[float],
@@ -235,4 +276,4 @@ def dequantize_from_mxfp4(
     return out.reshape(*prefix_shape, g, b * 2).view(*prefix_shape, g * b * 2)
 
 
-__all__ = ["load_model"]
+__all__ = ["load_model", "load_model_info"]

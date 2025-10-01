@@ -13,7 +13,6 @@ import message
 # Safe import of adapter functionality
 from adapter_import_utils import ensure_adapter_available
 
-from config.common import ModelInfo
 from debug_utils import is_tensor_debug_enabled, checkpoint_validation
 
 
@@ -27,8 +26,7 @@ class Handler:
 
     def __init__(
         self,
-        model,
-        model_info: ModelInfo,
+        config: dict,
         ops,  # Backend operations (FlashInferOps, MetalOps, etc.)
         kv_page_size: int,
         max_dist_size: int,
@@ -44,8 +42,12 @@ class Handler:
         self.adapters = {}
         self.ops = ops  # backend operations
 
-        self.lm = model
-        self.model_info = model_info
+        # Put imports here to avoid circular import
+        # pylint: disable=import-outside-toplevel
+        from model_loader import load_model, load_model_info
+        from model_factory import create_model_and_fusion_map
+
+        self.model_info = load_model_info(config)
         self.kv_page_size = kv_page_size
         self.max_dist_size = max_dist_size
         self.max_num_kv_pages = max_num_kv_pages
@@ -57,20 +59,30 @@ class Handler:
         self.device = device
         self.logits_dtype = dtype
 
+        # Allocate big contiguous tensors first before loading the model,
+        # since during model loading, many temporary tensors are created,
+        # which may lead to fragmentation and out-of-memory errors if big
+        # tensors are not allocated up front.
         self.kv_cache_at_layer = [
             torch.zeros(
                 (
                     max_num_kv_pages,
                     2,
                     kv_page_size,
-                    self.lm.config.num_key_value_heads,
-                    self.lm.config.head_size,
+                    self.model_info.architecture.num_key_value_heads,
+                    self.model_info.architecture.head_size,
                 ),
                 dtype=dtype,
                 device=device,
             )
-            for _ in range(self.lm.config.num_layers)
+            for _ in range(self.model_info.architecture.num_layers)
         ]
+
+        self.embeds = torch.empty(
+            (max_num_embeds, self.model_info.architecture.hidden_size),
+            device=device,
+            dtype=dtype,
+        )
 
         self.adapter_at_layer = [
             (
@@ -78,7 +90,7 @@ class Handler:
                     (
                         max_num_adapters,
                         max_adapter_rank * 3,
-                        self.lm.config.hidden_size,
+                        self.model_info.architecture.hidden_size,
                     ),
                     dtype=dtype,
                     device=device,
@@ -86,10 +98,10 @@ class Handler:
                 torch.zeros(
                     (
                         max_num_adapters,
-                        self.lm.config.head_size
+                        self.model_info.architecture.head_size
                         * (
-                            self.lm.config.num_query_heads
-                            + self.lm.config.num_key_value_heads * 2
+                            self.model_info.architecture.num_query_heads
+                            + self.model_info.architecture.num_key_value_heads * 2
                         ),
                         max_adapter_rank,
                     ),
@@ -97,11 +109,13 @@ class Handler:
                     device=device,
                 ),
             )
-            for _ in range(self.lm.config.num_layers)
+            for _ in range(self.model_info.architecture.num_layers)
         ]
 
-        self.embeds = torch.empty(
-            (max_num_embeds, self.lm.config.hidden_size), device=device, dtype=dtype
+        self.lm = load_model(
+            config,
+            self.model_info,
+            create_model_and_fusion_map,
         )
 
         self.inter_fill_time = time.time()
