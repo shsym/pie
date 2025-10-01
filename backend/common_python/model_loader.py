@@ -113,8 +113,24 @@ def load_model(
             if all(s in pending_fusion_tensors for s in source_names):
                 param = model.state_dict()[target_name]
                 if details["op"] == "fusion":
-                    tensors_to_fuse = [pending_fusion_tensors[s] for s in source_names]
-                    fused_tensor = torch.cat(tensors_to_fuse, dim=details["dim"])
+                    dim = details["dim"]
+                    current_offset = 0
+                    slice_indices = [slice(None)] * param.ndim
+
+                    with torch.no_grad():
+                        for source_name in source_names:
+                            source_tensor = pending_fusion_tensors[source_name]
+
+                            slice_size = source_tensor.shape[dim]
+                            slice_indices[dim] = slice(
+                                current_offset, current_offset + slice_size
+                            )
+
+                            param[tuple(slice_indices)].copy_(
+                                source_tensor, non_blocking=True
+                            )
+                            current_offset += slice_size
+
                 elif details["op"] == "dequantize_mxfp4":
                     blocks, scales = [pending_fusion_tensors[s] for s in source_names]
                     fused_tensor = dequantize_from_mxfp4(
@@ -124,15 +140,17 @@ def load_model(
                         dtype=param.dtype,
                         device=param.device,
                     )
+                    if fused_tensor.shape != param.shape:
+                        print(
+                            f"    Warning: Shape mismatch for fused tensor '{target_name}'. "
+                            "Skipping."
+                        )
+                        continue
+                    with torch.no_grad():
+                        param.copy_(fused_tensor, non_blocking=True)
                 else:
                     raise ValueError(f"Unknown fusion operation: {details['op']}")
-                if fused_tensor.shape != param.shape:
-                    print(
-                        f"    Warning: Shape mismatch for fused tensor '{target_name}'. Skipping."
-                    )
-                    continue
-                with torch.no_grad():
-                    param.copy_(fused_tensor, non_blocking=True)
+
                 loaded_keys.add(target_name)
 
         if "lm_head.weight" in model_state_keys and "lm_head.weight" not in loaded_keys:
