@@ -43,10 +43,10 @@ jobs:
       - name: Install uv (provides uvx)
         run: pipx install uv
 
-      - name: Install pie-metal locally
+      - name: Sync backend-python dependencies and install pie-metal
         run: |
-          cd pie-metal
-          uv pip install -e . --system
+          uv --project backend/backend-python sync
+          uv pip install --python backend/backend-python/.venv -e ./pie-metal
 
       - name: Run Black on changed files (no build)
         shell: bash

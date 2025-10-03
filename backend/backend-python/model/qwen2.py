@@ -6,7 +6,8 @@ from typing import Optional
 import torch
 from torch import nn
 
-from common import AdapterSubpass, Qwen2Arch
+from adapter_utils import AdapterSubpass
+from config.qwen2 import Qwen2Arch
 import flashinfer as ops
 
 VERSION = "0.1.0"

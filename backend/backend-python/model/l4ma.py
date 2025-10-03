@@ -11,9 +11,9 @@ import torch
 from torch import nn
 
 # Safe import of adapter functionality
-from adapter_import_utils import AdapterSubpass
+from adapter_utils import AdapterSubpass
 from config.l4ma import L4maArch
-from .l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
+from model.l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
 
 VERSION = "0.1.0"
 

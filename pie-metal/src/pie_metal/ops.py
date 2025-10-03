@@ -621,6 +621,18 @@ def get_batch_indices_positions(
 
 
 # Optional: Basic sampling operations for completeness
+class image:
+    """Image operations namespace (FlashInfer API compatibility)"""
+
+    @staticmethod
+    def decode_image(image_blob: bytes, dtype: torch.dtype, device: str) -> torch.Tensor:
+        """Decode image from bytes to tensor - not yet implemented for Metal."""
+        raise NotImplementedError(
+            "Image decoding not yet implemented in pie-metal. "
+            "This feature will be added in a future release."
+        )
+
+
 class sampling:
     """Sampling operations namespace (basic PyTorch implementations)"""
 
@@ -649,6 +661,32 @@ class sampling:
         # Map back to original token indices
         return torch.gather(sorted_indices, -1, sampled_sorted_idx.unsqueeze(-1)).squeeze(-1)
 
+    @staticmethod
+    def top_k_sampling_from_probs(probs: torch.Tensor, top_k: torch.Tensor) -> torch.Tensor:
+        """Top-k sampling - not yet implemented for Metal."""
+        raise NotImplementedError(
+            "top_k_sampling not yet implemented in pie-metal. "
+            "This feature will be added in a future release."
+        )
+
+    @staticmethod
+    def min_p_sampling_from_probs(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
+        """Min-p sampling - not yet implemented for Metal."""
+        raise NotImplementedError(
+            "min_p_sampling not yet implemented in pie-metal. "
+            "This feature will be added in a future release."
+        )
+
+    @staticmethod
+    def top_k_top_p_sampling_from_probs(
+        probs: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+    ) -> torch.Tensor:
+        """Combined top-k and top-p sampling - not yet implemented for Metal."""
+        raise NotImplementedError(
+            "top_k_top_p_sampling not yet implemented in pie-metal. "
+            "This feature will be added in a future release."
+        )
+
 
 # Export all public functions and classes
 __all__ = [
@@ -658,5 +696,6 @@ __all__ = [
     "append_paged_kv_cache",
     "get_seq_lens",
     "get_batch_indices_positions",
+    "image",
     "sampling",
 ]

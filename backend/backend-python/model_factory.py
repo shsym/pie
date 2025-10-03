@@ -1,106 +1,117 @@
-"""Factory helpers for constructing backend models and fusion maps."""
+"""Factory helpers for constructing backend models and fusion maps.
+
+Registry-based model creation with platform-specific support.
+"""
+
+# pylint: disable=import-outside-toplevel  # Intentional for lazy loading
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+from typing import Callable, NamedTuple
 
-# Use repo_utils for consistent path setup
-_repo_utils_path = Path(__file__).parent.parent.parent / "repo_utils.py"
-sys.path.insert(0, str(_repo_utils_path.parent))
-
-import repo_utils  # pylint: disable=wrong-import-position
-
-repo_utils.setup_pie_imports()
-
-# pylint: disable=wrong-import-position,wrong-import-order  # Must come after repo_utils setup
-from common import (
-    ModelInfo,
-    L4maArch,
-    Qwen2Arch,
-    Qwen3Arch,
-    GptOssArch,
-)
-
-# Import model components from common_python (base classes)
-from common_model.l4ma import (
-    L4maForCausalLM,
-    create_fusion_map as create_l4ma_fusion_map,
-)
-
-# Conditionally import models that require flashinfer (not available on macOS with pie-metal)
+from config.common import ModelInfo
 from platform_detection import is_apple_silicon
 
+
+class ArchitectureSpec(NamedTuple):
+    """Specification for creating a model architecture."""
+
+    create_model: Callable[[ModelInfo], tuple]
+    description: str
+
+
+def _create_l4ma_model(model_info: ModelInfo):
+    """Create L4MA model and fusion map."""
+    from config.l4ma import L4maArch
+    from model.l4ma import L4maForCausalLM, create_fusion_map
+    from model.l4ma_flashinfer import FlashInferL4maBackend
+
+    backend = FlashInferL4maBackend()
+    arch = L4maArch(**model_info.architecture.__dict__)
+    model = L4maForCausalLM(arch, backend=backend)
+    fusion_map = create_fusion_map(model)
+    return model, fusion_map
+
+
+# Build registry based on platform
+ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec | None] = {
+    # L4MA is always available (works with both flashinfer and pie-metal)
+    "l4ma": ArchitectureSpec(
+        create_model=_create_l4ma_model,
+        description="Llama-like architecture with FlashInfer/pie-metal backend",
+    ),
+}
+
+# Add FlashInfer-only architectures if not on Apple Silicon
 IS_APPLE_SILICON = is_apple_silicon()
 
-if IS_APPLE_SILICON:
-    from model.l4ma_flashinfer import FlashInferL4maBackend
+if not IS_APPLE_SILICON:
 
-    # On Apple Silicon, these models are not supported yet
-    Qwen3ForCausalLM = None  # type: ignore  # pylint: disable=invalid-name
-    create_qwen3_fusion_map = None  # type: ignore  # pylint: disable=invalid-name
-    Qwen2ForCausalLM = None  # type: ignore  # pylint: disable=invalid-name
-    create_qwen2_fusion_map = None  # type: ignore  # pylint: disable=invalid-name
-    GptOssForCausalLM = None  # type: ignore  # pylint: disable=invalid-name
-    create_gptoss_fusion_map = None  # type: ignore  # pylint: disable=invalid-name
-else:
-    # Import model components from local backend-python model directory
-    from model.l4ma_flashinfer import FlashInferL4maBackend
-    from model.qwen2 import (
-        Qwen2ForCausalLM,
-        create_fusion_map as create_qwen2_fusion_map,
-    )
-    from model.qwen3 import (
-        Qwen3ForCausalLM,
-        create_fusion_map as create_qwen3_fusion_map,
-    )
-    from model.gptoss import (
-        GptOssForCausalLM,
-        create_fusion_map as create_gptoss_fusion_map,
+    def _create_qwen2_model(model_info: ModelInfo):
+        from config.qwen2 import Qwen2Arch
+        from model.qwen2 import Qwen2ForCausalLM, create_fusion_map
+
+        arch = Qwen2Arch(**model_info.architecture.__dict__)
+        model = Qwen2ForCausalLM(arch)
+        fusion_map = create_fusion_map(model)
+        return model, fusion_map
+
+    def _create_qwen3_model(model_info: ModelInfo):
+        from config.qwen3 import Qwen3Arch
+        from model.qwen3 import Qwen3ForCausalLM, create_fusion_map
+
+        arch = Qwen3Arch(**model_info.architecture.__dict__)
+        model = Qwen3ForCausalLM(arch)
+        fusion_map = create_fusion_map(model)
+        return model, fusion_map
+
+    def _create_gptoss_model(model_info: ModelInfo):
+        from config.gptoss import GptOssArch
+        from model.gptoss import GptOssForCausalLM, create_fusion_map
+
+        arch = GptOssArch(**model_info.architecture.__dict__)
+        model = GptOssForCausalLM(arch)
+        fusion_map = create_fusion_map(model)
+        return model, fusion_map
+
+    ARCHITECTURE_REGISTRY.update(
+        {
+            "qwen2": ArchitectureSpec(
+                create_model=_create_qwen2_model,
+                description="Qwen2 architecture (requires FlashInfer)",
+            ),
+            "qwen3": ArchitectureSpec(
+                create_model=_create_qwen3_model,
+                description="Qwen3 architecture (requires FlashInfer)",
+            ),
+            "gptoss": ArchitectureSpec(
+                create_model=_create_gptoss_model,
+                description="GPT OSS architecture (requires FlashInfer)",
+            ),
+        }
     )
 
 
 def create_model_and_fusion_map(model_info: ModelInfo):
-    """Instantiate a model and its fusion map based on the architecture."""
+    """Create a model and fusion map based on architecture type.
+
+    Args:
+        model_info: Model information containing architecture details
+
+    Returns:
+        Tuple of (model, fusion_map)
+
+    Raises:
+        RuntimeError: If architecture is not supported on this platform
+    """
     arch_type = model_info.architecture.type.lower()
 
-    if arch_type == "l4ma":
-        if not FlashInferL4maBackend.is_available():
-            raise RuntimeError(
-                "FlashInfer backend is not available; cannot instantiate L4MA model."
-            )
+    spec = ARCHITECTURE_REGISTRY.get(arch_type)
+    if spec is None:
+        supported = list(ARCHITECTURE_REGISTRY.keys())
+        raise RuntimeError(
+            f"Architecture '{arch_type}' is not supported on this platform. "
+            f"Supported architectures: {supported}"
+        )
 
-        backend = FlashInferL4maBackend()
-        l4ma_arch = L4maArch(**model_info.architecture.__dict__)
-        model = L4maForCausalLM(l4ma_arch, backend=backend)
-        fusion_map = create_l4ma_fusion_map(model)
-        return model, fusion_map
-
-    if arch_type == "qwen2":
-        if Qwen2ForCausalLM is None or create_qwen2_fusion_map is None:
-            raise RuntimeError("Qwen2 model is not supported on this platform.")
-        qwen2_arch = Qwen2Arch(**model_info.architecture.__dict__)
-        model = Qwen2ForCausalLM(qwen2_arch)
-        fusion_map = create_qwen2_fusion_map(model)
-        return model, fusion_map
-
-    if arch_type == "qwen3":
-        if Qwen3ForCausalLM is None or create_qwen3_fusion_map is None:
-            raise RuntimeError("Qwen3 model is not supported on this platform.")
-        qwen3_arch = Qwen3Arch(**model_info.architecture.__dict__)
-        model = Qwen3ForCausalLM(qwen3_arch)
-        fusion_map = create_qwen3_fusion_map(model)
-        return model, fusion_map
-
-    if arch_type == "gptoss":
-        if GptOssForCausalLM is None or create_gptoss_fusion_map is None:
-            raise RuntimeError("GptOss model is not supported on this platform.")
-        gptoss_arch = GptOssArch(**model_info.architecture.__dict__)
-        model = GptOssForCausalLM(gptoss_arch)
-        fusion_map = create_gptoss_fusion_map(model)
-        return model, fusion_map
-
-    raise ValueError(f"Unsupported architecture type: {model_info.architecture.type}")
-
-
-__all__ = ["create_model_and_fusion_map"]
+    return spec.create_model(model_info)

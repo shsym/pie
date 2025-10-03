@@ -49,23 +49,18 @@ def setup_pie_imports() -> None:
     """
     Set up sys.path to enable PIE imports from anywhere in the repo.
 
-    Adds the repo root, common_python, and backend-python directories to sys.path,
+    Adds the repo root and backend-python directory to sys.path,
     allowing imports to work consistently regardless of working directory.
     """
     repo_root = find_repo_root()
-    common_python_path = repo_root / "backend" / "common_python"
     backend_python_path = repo_root / "backend" / "backend-python"
 
     repo_root_str = str(repo_root)
-    common_python_str = str(common_python_path)
     backend_python_str = str(backend_python_path)
 
     # Add paths if not already present
     if repo_root_str not in sys.path:
         sys.path.insert(0, repo_root_str)
-
-    if common_python_str not in sys.path:
-        sys.path.insert(0, common_python_str)
 
     if backend_python_str not in sys.path:
         sys.path.insert(0, backend_python_str)

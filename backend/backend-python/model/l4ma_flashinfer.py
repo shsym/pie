@@ -7,19 +7,26 @@ Supports both FlashInfer and pie-metal backends:
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 import torch
 
-from common import L4maArch
-from common_model.l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
+from config.l4ma import L4maArch
+from model.l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
+from platform_detection import is_apple_silicon
 
-# Import unified backend ops with automatic platform selection
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from backend_ops import ops  # pylint: disable=wrong-import-position
+# Direct import of backend operations based on platform
+if is_apple_silicon():
+    try:
+        import pie_metal.ops as ops  # type: ignore[import-not-found]
+    except ImportError:
+        ops = None  # type: ignore[assignment]
+else:
+    try:
+        import flashinfer as ops  # type: ignore[import-not-found,no-redef]
+    except ImportError:
+        ops = None  # type: ignore[assignment]
 
 FlashInferWrapper = object  # type: ignore[misc]
 
@@ -171,10 +178,10 @@ class FlashInferL4maBackend(L4maBackend):
             dtype=torch.uint8,
             device=tensor_device,
         )
-        self._decode_wrapper = ops.BatchDecodeWithPagedKVCacheWrapper(
+        self._decode_wrapper = ops.BatchDecodeWithPagedKVCacheWrapper(  # type: ignore[union-attr]
             self._workspace_buffer, self.kv_layout
         )
-        self._prefill_wrapper = ops.BatchPrefillWithPagedKVCacheWrapper(
+        self._prefill_wrapper = ops.BatchPrefillWithPagedKVCacheWrapper(  # type: ignore[union-attr]
             self._workspace_buffer, self.kv_layout
         )
 
@@ -189,13 +196,14 @@ class FlashInferL4maBackend(L4maBackend):
 
         page_size = _infer_page_size(inputs.kv_cache_at_layer)
 
-        seq_lens = ops.get_seq_lens(
+        seq_lens = ops.get_seq_lens(  # type: ignore[union-attr]
             inputs.kv_page_indptr,
             inputs.kv_last_page_lens,
             page_size,
         )
 
-        batch_indices, batch_positions = ops.get_batch_indices_positions(
+        get_positions = ops.get_batch_indices_positions  # type: ignore
+        batch_indices, batch_positions = get_positions(
             append_indptr=inputs.qo_indptr,
             seq_lens=seq_lens,
             nnz=inputs.num_tokens,
