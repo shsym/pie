@@ -10,6 +10,8 @@ uvx black --check \
     ${ROOT}/backend/backend-python/__init__.py \
     ${ROOT}/backend/backend-python/adapter.py \
     ${ROOT}/backend/backend-python/backend_ops.py \
+    ${ROOT}/backend/backend-python/flashinfer_ops.py \
+    ${ROOT}/backend/backend-python/metal_ops.py \
     ${ROOT}/backend/backend-python/common.py \
     ${ROOT}/backend/backend-python/handler.py \
     ${ROOT}/backend/backend-python/model_factory.py \

@@ -10,6 +10,7 @@ from common import (
     start_service,
 )
 from handler import Handler
+from platform_detection import is_apple_silicon
 
 
 def main(
@@ -28,7 +29,7 @@ def main(
     max_adapter_rank: int = 8,
     max_num_kv_pages: Optional[int] = None,
     gpu_mem_headroom: Optional[float] = None,
-    device: str = "cuda:0",
+    device: str = None,
     dtype: str = "bfloat16",
 ):
     """
@@ -50,9 +51,15 @@ def main(
         max_batch_tokens: Maximum number of tokens in a batch.
         max_num_adapters: Maximum number of adapters that can be loaded.
         max_adapter_rank: Maximum rank for any loaded adapter.
-        device: The device to run the model on (e.g., 'cuda:0' or 'cpu').
+        device: The device to run the model on (e.g., 'mps', 'cuda:0', 'cpu').
+                Auto-detects to 'mps' on Apple Silicon, 'cuda:0' otherwise.
         dtype: The data type for model weights (e.g., 'bfloat16', 'float16').
     """
+    # Auto-detect device if not specified
+    if device is None:
+        device = "mps" if is_apple_silicon() else "cuda:0"
+        print(f"Auto-detected device: {device}")
+
     config = build_config(
         model=model,
         host=host,

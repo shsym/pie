@@ -13,8 +13,6 @@ import message
 # Safe import of adapter functionality
 from adapter_import_utils import ensure_adapter_available
 
-from debug_utils import is_tensor_debug_enabled, checkpoint_validation
-
 
 class Handler:
     """TODO: Add class docstring."""
@@ -118,6 +116,18 @@ class Handler:
             self.model_info,
             create_model_and_fusion_map,
         )
+
+        # Validate model structure has required attributes and they are callable
+        if not hasattr(self.lm, "lm_head"):
+            raise AttributeError("Loaded model is missing required 'lm_head' attribute")
+        if not callable(self.lm.lm_head):  # type: ignore[attr-defined]
+            raise TypeError("Model 'lm_head' attribute must be callable")
+        if not hasattr(self.lm, "model"):
+            raise AttributeError("Loaded model is missing required 'model' attribute")
+        if not hasattr(self.lm.model, "embed_tokens"):  # type: ignore[attr-defined]
+            raise AttributeError("Model is missing required 'embed_tokens' method")
+        if not callable(self.lm.model.embed_tokens):  # type: ignore[attr-defined]
+            raise TypeError("Model 'embed_tokens' attribute must be callable")
 
         # If `gpu_mem_headroom` is set by the user, then we have to allocate the KV
         # cache at the end and dynamically calculate the number of KV pages based on
@@ -240,7 +250,7 @@ class Handler:
             image_tensor = self.ops.decode_image(
                 req.image_blob, dtype=self.dtype, device=self.device
             )
-            image_embed = self.lm.model.embed_image(image_tensor)
+            image_embed = self.lm.model.embed_image(image_tensor)  # type: ignore[attr-defined]
 
             for i, ptr in enumerate(req.embed_ptrs):
                 if ptr < 0 or ptr >= self.max_num_embeds:
@@ -265,14 +275,6 @@ class Handler:
                 pass
 
     @torch.inference_mode()
-    @checkpoint_validation(
-        checkpoint_name="handler_forward_pass",
-        capture_tensors=True,
-        include_metadata=True,
-        tolerance=1e-5,
-        backend_comparison=None,
-        performance_monitoring=True,
-    )
     def forward_pass(self, reqs: list[message.ForwardPassRequest]):
         """
         Processes a batch of forward pass requests through the language model.
@@ -290,7 +292,7 @@ class Handler:
 
         # 3. Run the forward pass through the model.
         with _device_context(self.device):
-            output_embeds = self.lm.model.forward(
+            output_embeds = self.lm.model.forward(  # type: ignore[attr-defined]
                 kv_cache_at_layer=self.kv_cache_at_layer, **model_inputs
             )
 
@@ -536,27 +538,8 @@ class ForwardPassBatch:
         token_ids_tensor = torch.as_tensor(
             self.batch_token_ids, device=device, dtype=torch.int32
         )
-        input_embeds = self._handler.lm.model.embed_tokens(token_ids_tensor)
-
-        if input_embeds.numel() and is_tensor_debug_enabled():
-            embed_min, embed_max = input_embeds.aminmax()
-            has_nan = torch.isnan(input_embeds).any().item()
-            has_inf = torch.isinf(input_embeds).any().item()
-            print(
-                "[MetalTensorDebug] stage=input_embeds",
-                "dtype=",
-                input_embeds.dtype,
-                "device=",
-                input_embeds.device,
-                "min=",
-                float(embed_min),
-                "max=",
-                float(embed_max),
-                "has_nan=",
-                bool(has_nan),
-                "has_inf=",
-                bool(has_inf),
-            )
+        embed_tokens = self._handler.lm.model.embed_tokens  # type: ignore[attr-defined]
+        input_embeds = embed_tokens(token_ids_tensor)  # type: ignore[operator]
 
         return {
             "input_embeds": input_embeds,
@@ -605,7 +588,7 @@ class ForwardPassBatch:
         if logits_input.dtype != self.logits_dtype:
             logits_input = logits_input.to(self.logits_dtype)
 
-        logits = self._handler.lm.lm_head(logits_input)
+        logits = self._handler.lm.lm_head(logits_input)  # type: ignore[attr-defined, operator]
 
         # Promote logits to handler dtype for numerically stable softmax on Metal/MPS
         if logits.dtype != self.logits_dtype:

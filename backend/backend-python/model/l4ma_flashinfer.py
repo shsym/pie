@@ -1,8 +1,15 @@
-"""FlashInfer-backed runtime implementation for the L4MA architecture."""
+"""FlashInfer-backed runtime implementation for the L4MA architecture.
+
+Supports both FlashInfer and pie-metal backends:
+- pie-metal: Metal-accelerated operations for macOS with Apple Silicon
+- FlashInfer: CUDA-accelerated operations for other platforms
+"""
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -10,15 +17,11 @@ import torch
 from common import L4maArch
 from common_model.l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
 
-try:  # pragma: no cover - optional dependency guard
-    import flashinfer as ops  # type: ignore[import]
+# Import unified backend ops with automatic platform selection
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from backend_ops import ops  # pylint: disable=wrong-import-position
 
-    # FlashInfer wrapper types - using object as fallback for type checking
-    # Union type not available when FlashInfer is missing
-    FlashInferWrapper = object  # type: ignore[misc]
-except ImportError:  # pragma: no cover - optional dependency guard
-    ops = None
-    FlashInferWrapper = object  # type: ignore[misc]
+FlashInferWrapper = object  # type: ignore[misc]
 
 
 def _infer_page_size(kv_cache_at_layer) -> int:
@@ -83,12 +86,14 @@ class _FlashInferForwardContext(L4maForwardContext):
         position_ids: torch.Tensor,
     ) -> None:
         """Apply RoPE encoding to query and key states."""
-        if ops is None:
-            raise RuntimeError("FlashInfer not available")
         ops.apply_llama31_rope_pos_ids_inplace(  # type: ignore
             q=query_states,
             k=key_states,
             pos_ids=position_ids,
+            rope_scale=self._config.rope_factor,
+            rope_theta=self._config.rope_theta,
+            low_freq_factor=self._config.rope_low_frequency_factor,
+            high_freq_factor=self._config.rope_high_frequency_factor,
         )
 
     def append_kv_cache(
@@ -100,8 +105,6 @@ class _FlashInferForwardContext(L4maForwardContext):
     ) -> None:
         """Append key and value states to the KV cache."""
         _ = layer_idx  # Parameter not currently used
-        if ops is None:
-            raise RuntimeError("FlashInfer not available")
         ops.append_paged_kv_cache(  # type: ignore
             append_key=key_states,
             append_value=value_states,
@@ -122,7 +125,7 @@ class _FlashInferForwardContext(L4maForwardContext):
     ) -> torch.Tensor:
         """Run attention computation using FlashInfer."""
         _ = layer_idx  # Parameter not currently used
-        attn_output = self.wrapper.run(query_states, kv_cache_layer)
+        attn_output = self.wrapper.run(query_states, kv_cache_layer)  # type: ignore[attr-defined]
         return attn_output.reshape(attn_output.size(0), -1)
 
 
@@ -168,8 +171,6 @@ class FlashInferL4maBackend(L4maBackend):
             dtype=torch.uint8,
             device=tensor_device,
         )
-        if ops is None:
-            raise RuntimeError("FlashInfer not available")
         self._decode_wrapper = ops.BatchDecodeWithPagedKVCacheWrapper(
             self._workspace_buffer, self.kv_layout
         )
@@ -186,15 +187,14 @@ class FlashInferL4maBackend(L4maBackend):
         """Create a forward context for FlashInfer execution."""
         self._ensure_workspace(config.device)
 
-        if ops is None:
-            raise RuntimeError("FlashInfer not available")
-
         page_size = _infer_page_size(inputs.kv_cache_at_layer)
+
         seq_lens = ops.get_seq_lens(
             inputs.kv_page_indptr,
             inputs.kv_last_page_lens,
             page_size,
         )
+
         batch_indices, batch_positions = ops.get_batch_indices_positions(
             append_indptr=inputs.qo_indptr,
             seq_lens=seq_lens,

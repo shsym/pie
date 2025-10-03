@@ -45,14 +45,18 @@ struct Params {
     int num_query_heads; // Number of query heads
     int num_kv_heads;    // Number of KV heads (for MQA/GQA support)
     float scale;
+    int total_kv_len;    // Total KV sequence length for mask indexing
 };
 
 // --- Common Utility Functions ---
 
 // Efficient sequence ID lookup (can be optimized to binary search later)
 inline int find_sequence_id(device const int* qo_indptr, int qo_idx) {
+    // Walk qo_indptr until we find the sequence whose end exceeds qo_idx.
+    // Assumes qo_indptr is length (num_sequences + 1) with qo_indptr[last] == total_tokens.
+    // This guarantees termination without needing an arbitrary cap.
     int seq_id = 0;
-    while (seq_id < 100 && qo_indptr[seq_id + 1] <= qo_idx) {
+    while (qo_indptr[seq_id + 1] <= qo_idx) {
         seq_id++;
     }
     return seq_id;

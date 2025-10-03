@@ -44,7 +44,9 @@ def load_model(
     model_name = config["model"]
     cache_dir = config["cache_dir"]
     model_path = Path(cache_dir) / "models"
-
+    # Use blocking copy for MPS device to avoid race conditions
+    # MPS async operations may not complete before function returns
+    use_non_blocking = config["device"] != "mps"
     # Instantiate the model and its fusion map.
     try:
         model, fusion_map = create_model_fn(model_info)
@@ -56,23 +58,23 @@ def load_model(
     tensor_to_file_map = {}
     file_readers = {}
 
-    # Scan the tensor files and build the mapping of tensor names to the corresponding files.
-    for param_file in tqdm(
-        model_info.parameters, desc="Scanning tensor files", unit="files"
-    ):
-        weights_path = model_path / model_name / param_file
-        reader = ztensor.Reader(str(weights_path))
-        file_readers[param_file] = reader
-
-        tensor_names = reader.get_tensor_names()
-        for name in tensor_names:
-            tensor_to_file_map[name] = param_file
-
-    model_state_keys = set(model.state_dict().keys())
-    loaded_keys = set()
-    model_state = model.state_dict()
-
     try:
+        # Scan the tensor files and build the mapping of tensor names to the corresponding files.
+        for param_file in tqdm(
+            model_info.parameters, desc="Scanning tensor files", unit="files"
+        ):
+            weights_path = model_path / model_name / param_file
+            reader = ztensor.Reader(str(weights_path))
+            file_readers[param_file] = reader
+
+            tensor_names = reader.get_tensor_names()
+            for name in tensor_names:
+                tensor_to_file_map[name] = param_file
+
+        model_state_keys = set(model.state_dict().keys())
+        loaded_keys = set()
+        model_state = model.state_dict()
+
         # Load the parameters from the files to the model.
         for param_name in tqdm(
             model_state_keys, desc="Loading model parameters", unit="tensors"
@@ -86,10 +88,15 @@ def load_model(
                     fusion_map[param_name],
                     tensor_to_file_map,
                     file_readers,
+                    use_non_blocking,
                 )
             else:
                 success = _load_regular_parameter(
-                    param_name, param, tensor_to_file_map, file_readers
+                    param_name,
+                    param,
+                    tensor_to_file_map,
+                    file_readers,
+                    use_non_blocking,
                 )
 
             if success:
@@ -104,7 +111,8 @@ def load_model(
                     source_tensor = getattr(embed_tokens, "weight").to(
                         dtype=target_tensor.dtype, device=target_tensor.device
                     )
-                    target_tensor.copy_(source_tensor, non_blocking=True)
+                    param = model_state["lm_head.weight"]
+                    target_tensor.copy_(source_tensor, non_blocking=use_non_blocking)
                     loaded_keys.add("lm_head.weight")
 
         missing_keys = model_state_keys - loaded_keys
@@ -138,6 +146,7 @@ def _load_fused_parameter(
     fusion_details: dict,
     tensor_to_file_map: dict,
     file_readers: dict,
+    non_blocking: bool = True,
 ) -> bool:
     """Load and process a fusion parameter (concatenation or dequantization).
 
@@ -179,7 +188,9 @@ def _load_fused_parameter(
                 slice_size = source_tensor.shape[dim]
                 slice_indices[dim] = slice(current_offset, current_offset + slice_size)
 
-                param[tuple(slice_indices)].copy_(source_tensor, non_blocking=True)
+                param[tuple(slice_indices)].copy_(
+                    source_tensor, non_blocking=non_blocking
+                )
                 current_offset += slice_size
 
         elif fusion_details["op"] == "dequantize_mxfp4":
@@ -198,7 +209,7 @@ def _load_fused_parameter(
                 )
                 return False
 
-            param.copy_(fused_tensor, non_blocking=True)
+            param.copy_(fused_tensor, non_blocking=non_blocking)
         else:
             raise ValueError(f"Unknown fusion operation: {fusion_details['op']}")
 
@@ -206,7 +217,11 @@ def _load_fused_parameter(
 
 
 def _load_regular_parameter(
-    param_name: str, param: torch.Tensor, tensor_to_file_map: dict, file_readers: dict
+    param_name: str,
+    param: torch.Tensor,
+    tensor_to_file_map: dict,
+    file_readers: dict,
+    non_blocking: bool = True,
 ) -> bool:
     """Load and process a regular (non-fused) parameter.
 
@@ -225,7 +240,7 @@ def _load_regular_parameter(
         return False
 
     with torch.no_grad():
-        param.copy_(tensor_data, non_blocking=True)
+        param.copy_(tensor_data, non_blocking=non_blocking)
 
     return True
 

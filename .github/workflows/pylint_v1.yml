@@ -43,6 +43,11 @@ jobs:
       - name: Install uv (provides uvx)
         run: pipx install uv
 
+      - name: Install pie-metal locally
+        run: |
+          cd pie-metal
+          uv pip install -e . --system
+
       - name: Run Black on changed files (no build)
         shell: bash
         run: |
