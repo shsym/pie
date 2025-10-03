@@ -146,9 +146,12 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
                         debug_out[debug_idx + 2] = (global_key_idx < total_kv_len) ? paged_k_cache[base_addr] : -999.0f;
                     }
 
+                    // Calculate V address with offset within interleaved page
+                    uint v_addr = calculate_v_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
+
                     for (int d = 0; d < head_size; ++d) {
                         k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
-                        v_block[tid_in_tgp][d] = paged_v_cache[base_addr + d];
+                        v_block[tid_in_tgp][d] = paged_v_cache[v_addr + d];
                     }
                 }
             }
@@ -435,9 +438,12 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
                         debug_out[23] = (float)page_offset;       // Which page in sequence
                     }
 
+                    // Calculate V address with offset within interleaved page
+                    uint v_addr = calculate_v_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
+
                     for (int d = 0; d < head_size; ++d) {
                         k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
-                        v_block[tid_in_tgp][d] = paged_v_cache[base_addr + d];
+                        v_block[tid_in_tgp][d] = paged_v_cache[v_addr + d];
                     }
                 }
             }
@@ -700,12 +706,13 @@ kernel void batch_prefill_attention_unified_bf16_per_head_kernel(
                 int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
                 int kv_head = map_query_to_kv_head(int(h), num_query_heads, num_kv_heads);
                 uint base_addr = calculate_kv_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
+                uint v_addr = calculate_v_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
 
                 // VECTORIZATION: Use half4 loads where possible for better bandwidth
                 int d = 0;
                 for (; d + 3 < head_size; d += 4) {
                     half4 k_vec = *((device half4*)(paged_k_cache + base_addr + d));
-                    half4 v_vec = *((device half4*)(paged_v_cache + base_addr + d));
+                    half4 v_vec = *((device half4*)(paged_v_cache + v_addr + d));
 
                     k_block[tid_in_tgp][d] = k_vec.x;
                     k_block[tid_in_tgp][d+1] = k_vec.y;
@@ -720,7 +727,7 @@ kernel void batch_prefill_attention_unified_bf16_per_head_kernel(
                 // Handle remaining elements
                 for (; d < head_size; ++d) {
                     k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
-                    v_block[tid_in_tgp][d] = paged_v_cache[base_addr + d];
+                    v_block[tid_in_tgp][d] = paged_v_cache[v_addr + d];
                 }
             }
         }

@@ -214,6 +214,7 @@ bin/
 logs
 *.log
 .plan
+*profiling_result.json
 
 # No MCP files
 .memory-bank

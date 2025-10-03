@@ -20,6 +20,9 @@ import message
 from adapter_utils import ensure_adapter_available
 from platform_detection import is_apple_silicon
 
+# Import profiler for performance analysis
+from profiler import start_profile
+
 # Direct import of backend operations based on platform
 # pie_metal now provides the same API structure as flashinfer
 if is_apple_silicon():
@@ -311,25 +314,31 @@ class Handler:
         """
         Processes a batch of forward pass requests through the language model.
         """
-        # Sort requests by adapter to optimize the adapter subpass.
-        reqs = sorted(reqs, key=lambda o: (o.adapter is None, o.adapter))
+        with start_profile("forward_pass_total"):
+            # Sort requests by adapter to optimize the adapter subpass.
+            with start_profile("request_sorting"):
+                reqs = sorted(reqs, key=lambda o: (o.adapter is None, o.adapter))
 
-        # 1. Consolidate and process all requests into a single batch.
-        batch = ForwardPassBatch(self)
-        for req in reqs:
-            batch.add_request(req)
+            # 1. Consolidate and process all requests into a single batch.
+            with start_profile("batch_consolidation"):
+                batch = ForwardPassBatch(self)
+                for req in reqs:
+                    batch.add_request(req)
 
-        # 2. Finalize the batch to get model inputs as tensors.
-        model_inputs = batch.finalize()
+            # 2. Finalize the batch to get model inputs as tensors.
+            with start_profile("batch_finalize"):
+                model_inputs = batch.finalize()
 
-        # 3. Run the forward pass through the model.
-        with _device_context(self.device):
-            output_embeds = self.lm.model.forward(  # type: ignore[attr-defined]
-                kv_cache_at_layer=self.kv_cache_at_layer, **model_inputs
-            )
+            # 3. Run the forward pass through the model.
+            with start_profile("model_forward"):
+                with _device_context(self.device):
+                    output_embeds = self.lm.model.forward(  # type: ignore[attr-defined]
+                        kv_cache_at_layer=self.kv_cache_at_layer, **model_inputs
+                    )
 
             # 4. Package the model outputs into response messages.
-            responses = batch.package_responses(output_embeds)
+            with start_profile("package_responses"):
+                responses = batch.package_responses(output_embeds)
 
         return responses
 
@@ -550,52 +559,61 @@ class ForwardPassBatch:
         """Finalizes batch preparation, creating tensors and the adapter subpass."""
         device = self._handler.device
 
-        adapter_subpass = None
-        if self.adapter_subpass_needed:
-            adapter_subpass_class = ensure_adapter_available()
-            seeds_tensor = torch.as_tensor(self.seeds, device=device, dtype=torch.long)
-            adapter_subpass = adapter_subpass_class(
-                adapter_at_layer=self._handler.adapter_at_layer,
-                adapter_indices=self.adapter_indices,
-                adapter_extras=self._handler.adapters,
-                rand_seeds=seeds_tensor,
-                qo_indptr=self.qo_indptr,
+        with start_profile("finalize_adapter_setup"):
+            adapter_subpass = None
+            if self.adapter_subpass_needed:
+                adapter_subpass_class = ensure_adapter_available()
+                seeds_tensor = torch.as_tensor(
+                    self.seeds, device=device, dtype=torch.long
+                )
+                adapter_subpass = adapter_subpass_class(
+                    adapter_at_layer=self._handler.adapter_at_layer,
+                    adapter_indices=self.adapter_indices,
+                    adapter_extras=self._handler.adapters,
+                    rand_seeds=seeds_tensor,
+                    qo_indptr=self.qo_indptr,
+                )
+
+        with start_profile("finalize_tensor_creation"):
+            batched_attention_mask = (
+                np.concatenate(self.attention_masks)
+                if self.attention_masks
+                else np.array([], dtype=np.bool_)
+            )
+            token_ids_tensor = torch.as_tensor(
+                self.batch_token_ids, device=device, dtype=torch.int32
             )
 
-        batched_attention_mask = (
-            np.concatenate(self.attention_masks)
-            if self.attention_masks
-            else np.array([], dtype=np.bool_)
-        )
-        token_ids_tensor = torch.as_tensor(
-            self.batch_token_ids, device=device, dtype=torch.int32
-        )
-        embed_tokens = self._handler.lm.model.embed_tokens  # type: ignore[attr-defined]
-        input_embeds = embed_tokens(token_ids_tensor)  # type: ignore[operator]
+        with start_profile("finalize_embedding_lookup"):
+            embed_tokens = self._handler.lm.model.embed_tokens  # type: ignore[attr-defined]
+            input_embeds = embed_tokens(token_ids_tensor)  # type: ignore[operator]
 
-        return {
-            "input_embeds": input_embeds,
-            "position_ids": torch.as_tensor(
-                self.batch_position_ids, device=device, dtype=torch.int32
-            ),
-            "qo_indptr": torch.as_tensor(
-                self.qo_indptr, device=device, dtype=torch.int32
-            ),
-            "kv_page_indices": torch.as_tensor(
-                self.kv_page_indices, device=device, dtype=torch.int32
-            ),
-            "kv_page_indptr": torch.as_tensor(
-                self.kv_page_indptr, device=device, dtype=torch.int32
-            ),
-            "kv_last_page_lens": torch.as_tensor(
-                self.kv_last_page_lengths, device=device, dtype=torch.int32
-            ),
-            "custom_mask": torch.as_tensor(
-                batched_attention_mask, device=device, dtype=torch.bool
-            ),
-            "single_token_inference_mode": self.single_token_inference_mode,
-            "adapter_subpass": adapter_subpass,
-        }
+        with start_profile("finalize_create_input_dict"):
+            result = {
+                "input_embeds": input_embeds,
+                "position_ids": torch.as_tensor(
+                    self.batch_position_ids, device=device, dtype=torch.int32
+                ),
+                "qo_indptr": torch.as_tensor(
+                    self.qo_indptr, device=device, dtype=torch.int32
+                ),
+                "kv_page_indices": torch.as_tensor(
+                    self.kv_page_indices, device=device, dtype=torch.int32
+                ),
+                "kv_page_indptr": torch.as_tensor(
+                    self.kv_page_indptr, device=device, dtype=torch.int32
+                ),
+                "kv_last_page_lens": torch.as_tensor(
+                    self.kv_last_page_lengths, device=device, dtype=torch.int32
+                ),
+                "custom_mask": torch.as_tensor(
+                    batched_attention_mask, device=device, dtype=torch.bool
+                ),
+                "single_token_inference_mode": self.single_token_inference_mode,
+                "adapter_subpass": adapter_subpass,
+            }
+
+        return result
 
     def package_responses(
         self, output_embeds: torch.Tensor

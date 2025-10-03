@@ -63,6 +63,8 @@ inline int find_sequence_id(device const int* qo_indptr, int qo_idx) {
 }
 
 // Calculate paged KV cache address for MQA/GQA support
+// Handles interleaved K/V layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
+// Within each page: K at offset 0, V at offset (page_size * kv_head_dim)
 inline uint calculate_kv_address(
     int in_page_offset,
     int page_size,
@@ -71,7 +73,22 @@ inline uint calculate_kv_address(
     int page_idx,
     int kv_head
 ) {
-    return page_idx * page_size * kv_head_dim + in_page_offset * kv_head_dim + kv_head * head_size;
+    // Each page contains both K and V: stride is 2 * page_size * kv_head_dim
+    // K is at offset 0 within page, V is at offset (page_size * kv_head_dim)
+    return page_idx * (2 * page_size * kv_head_dim) + in_page_offset * kv_head_dim + kv_head * head_size;
+}
+
+// Calculate V cache address (K + offset within page)
+inline uint calculate_v_address(
+    int in_page_offset,
+    int page_size,
+    int kv_head_dim,
+    int head_size,
+    int page_idx,
+    int kv_head
+) {
+    // V starts at (page_size * kv_head_dim) offset within each page
+    return page_idx * (2 * page_size * kv_head_dim) + (page_size * kv_head_dim) + in_page_offset * kv_head_dim + kv_head * head_size;
 }
 
 // Map query head to KV head for MQA/GQA support

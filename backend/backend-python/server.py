@@ -11,6 +11,7 @@ from __future__ import annotations
 import enum
 import os
 import random
+import signal
 import struct
 import sys
 import queue
@@ -26,6 +27,8 @@ import torch
 import zmq
 from platformdirs import user_cache_dir
 from websockets.sync.client import connect
+
+# Note: profiler.save_profiling_json is imported at shutdown time (line 188)
 
 from message import (
     DownloadAdapterRequest,
@@ -165,13 +168,31 @@ def start_service(
             daemon=True,
         ).start()
 
+    # Setup shutdown flag and signal handlers
+    shutdown_event = threading.Event()
+
+    def shutdown_handler(signum, _frame):
+        if not shutdown_event.is_set():
+            print(f"\nReceived signal {signum}, shutting down server...")
+            shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
+
     try:
-        # Block forever until receiving keyboard interrupt
-        while True:
-            threading.Event().wait()
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
+        # Block until shutdown signal
+        shutdown_event.wait()
     finally:
+        # Save profiling results before shutdown (JSON only, no stdout report)
+        from profiler import (  # pylint: disable=import-outside-toplevel
+            save_profiling_json,
+        )
+
+        try:
+            json_path = save_profiling_json(output_dir=".")
+            print(f"📁 Profiling results saved to: {json_path}")
+        except (OSError, ValueError, RuntimeError) as e:
+            print(f"⚠️  Failed to save profiling results: {e}")
         socket.close()
         context.term()
         print("Server shutdown complete.")

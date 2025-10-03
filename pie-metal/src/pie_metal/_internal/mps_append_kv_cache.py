@@ -47,31 +47,33 @@ class AppendKVCacheCompiler(BaseShaderCompiler):
         self,
         k_input: torch.Tensor,
         v_input: torch.Tensor,
-        paged_k_cache: torch.Tensor,
-        paged_v_cache: torch.Tensor,
+        paged_kv_cache: torch.Tensor,
         kv_batch_indices: torch.Tensor,
         kv_positions: torch.Tensor,
         kv_page_indices: torch.Tensor,
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
-        num_kv_heads: Optional[int] = None,
-        head_size: Optional[int] = None
+        num_kv_heads: int,
+        head_size: int,
+        page_size: int
     ) -> None:
         """
-        Run append_paged_kv_cache using compiled MPS kernels.
+        Run append_paged_kv_cache using compiled MPS kernels with unified buffer.
 
-        Modifies paged_k_cache and paged_v_cache in-place.
+        Modifies paged_kv_cache in-place.
 
         Args:
             k_input: Key states to append [num_tokens, num_kv_heads * head_size]
             v_input: Value states to append [num_tokens, num_kv_heads * head_size]
-            paged_k_cache: Paged K cache [max_num_pages, page_size, num_kv_heads * head_size]
-            paged_v_cache: Paged V cache [max_num_pages, page_size, num_kv_heads * head_size]
+            paged_kv_cache: Unified KV cache buffer (flattened 1D tensor)
             kv_batch_indices: Batch index for each token [num_tokens]
             kv_positions: Position within sequence [num_tokens]
             kv_page_indices: Page indices [max_num_pages]
             kv_page_indptr: Page indptr [batch_size + 1]
             kv_last_page_lens: Last page lengths [batch_size]
+            num_kv_heads: Number of KV heads (required)
+            head_size: Head dimension (required)
+            page_size: Page size (required - cannot be inferred from flattened buffer)
         """
         if not self.can_use_mps_kernels() or 'append_kv_cache' not in self.compiled_libraries:
             raise RuntimeError("Append KV cache MPS kernels not available")
@@ -79,49 +81,21 @@ class AppendKVCacheCompiler(BaseShaderCompiler):
         # Ensure all tensors are on MPS device first
         k_input = k_input.to('mps') if k_input.device.type != 'mps' else k_input
         v_input = v_input.to('mps') if v_input.device.type != 'mps' else v_input
-        paged_k_cache = paged_k_cache.to('mps') if paged_k_cache.device.type != 'mps' else paged_k_cache
-        paged_v_cache = paged_v_cache.to('mps') if paged_v_cache.device.type != 'mps' else paged_v_cache
+        paged_kv_cache = paged_kv_cache.to('mps') if paged_kv_cache.device.type != 'mps' else paged_kv_cache
 
-        # DEBUG MODE: Clone caches for comparison (before any modifications)
-        if DEBUG_ENABLED:
-            from . import debug_utils
-            from . import pytorch_reference
-
-            # Clone all caches before modification
-            paged_k_cache_clone_pytorch = paged_k_cache.clone()
-            paged_v_cache_clone_pytorch = paged_v_cache.clone()
-
-            # Collect input metadata
-            input_metadata = [
-                debug_utils.collect_tensor_metadata(k_input, "k_input"),
-                debug_utils.collect_tensor_metadata(v_input, "v_input"),
-                debug_utils.collect_tensor_metadata(paged_k_cache, "paged_k_cache (before)"),
-                debug_utils.collect_tensor_metadata(paged_v_cache, "paged_v_cache (before)"),
-            ]
-
-            # Run PyTorch reference on cloned caches (do this first)
-            if num_kv_heads is None or head_size is None:
-                raise ValueError("num_kv_heads and head_size must be provided for debug mode")
-
-            pytorch_reference.append_paged_kv_cache_reference(
-                k_input, v_input,
-                paged_k_cache_clone_pytorch, paged_v_cache_clone_pytorch,
-                kv_batch_indices, kv_positions,
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                num_kv_heads, head_size
+        # Validate required parameters
+        if num_kv_heads is None or head_size is None or page_size is None:
+            raise ValueError(
+                "num_kv_heads, head_size, and page_size must be provided to run_append_paged_kv_cache_mps"
             )
 
         # Get dimensions
         num_tokens = k_input.shape[0]
-        page_size = paged_k_cache.shape[1]
-        max_num_pages = paged_k_cache.shape[0]
         batch_size = kv_page_indptr.shape[0] - 1
 
-        # Use provided num_kv_heads and head_size (required parameters)
-        if num_kv_heads is None or head_size is None:
-            raise ValueError(
-                "num_kv_heads and head_size must be provided to run_append_paged_kv_cache_mps"
-            )
+        # Calculate max_num_pages from unified buffer
+        # Unified buffer layout: [num_pages * 2 * page_size * num_kv_heads * head_size]
+        max_num_pages = paged_kv_cache.numel() // (2 * page_size * num_kv_heads * head_size)
 
         # Create params tensor matching AppendPagedKVCacheParams struct
         params = torch.tensor([
@@ -157,55 +131,19 @@ class AppendKVCacheCompiler(BaseShaderCompiler):
             # Each thread handles one element at position (token_idx, head_idx, head_offset)
             # The Metal kernel expects thread_position_in_grid with x=token, y=head, z=offset
 
-            # Call Metal append_kv_cache kernel (modifies caches in-place)
+            # Call Metal append_kv_cache kernel (modifies unified cache in-place)
             getattr(lib, kernel_name)(
-                k_input,                        # buffer(0)
-                v_input,                        # buffer(1)
-                paged_k_cache,                  # buffer(2)
-                paged_v_cache,                  # buffer(3)
-                kv_batch_indices.to(torch.int32),  # buffer(4)
-                kv_positions.to(torch.int32),       # buffer(5)
-                kv_page_indices.to(torch.int32),    # buffer(6)
-                kv_page_indptr.to(torch.int32),     # buffer(7)
-                kv_last_page_lens.to(torch.int32),  # buffer(8)
-                params.float(),                  # buffer(9) - Metal expects float buffer
+                k_input,                             # buffer(0)
+                v_input,                             # buffer(1)
+                paged_kv_cache,                      # buffer(2) - unified KV cache
+                kv_batch_indices.to(torch.int32),    # buffer(3)
+                kv_positions.to(torch.int32),        # buffer(4)
+                kv_page_indices.to(torch.int32),     # buffer(5)
+                kv_page_indptr.to(torch.int32),      # buffer(6)
+                kv_last_page_lens.to(torch.int32),   # buffer(7)
+                params.float(),                      # buffer(8) - Metal expects float buffer
                 threads=(num_tokens, num_kv_heads, head_size),
                 group_size=(8, 8, 8)  # Use 3D threadgroup to match 3D dispatch
             )
         else:
             raise RuntimeError(f"Append KV cache kernel {kernel_name} not found in compiled library")
-
-        # DEBUG MODE: Compare Metal output with PyTorch reference
-        if DEBUG_ENABLED:
-            from . import debug_utils
-
-            # Compare Metal vs PyTorch outputs (K cache)
-            matches_k, diagnostics_k = debug_utils.compare_tensors(
-                paged_k_cache, paged_k_cache_clone_pytorch,
-                atol=DEBUG_ATOL, rtol=DEBUG_RTOL,
-                operation_name="Append KV Cache (K)"
-            )
-
-            # Compare Metal vs PyTorch outputs (V cache)
-            matches_v, diagnostics_v = debug_utils.compare_tensors(
-                paged_v_cache, paged_v_cache_clone_pytorch,
-                atol=DEBUG_ATOL, rtol=DEBUG_RTOL,
-                operation_name="Append KV Cache (V)"
-            )
-
-            # Generate and print reports
-            report_k = debug_utils.generate_report(
-                diagnostics_k, input_metadata, verbosity=DEBUG_VERBOSITY
-            )
-            if report_k:
-                print(report_k)
-
-            report_v = debug_utils.generate_report(
-                diagnostics_v, input_metadata, verbosity=DEBUG_VERBOSITY
-            )
-            if report_v:
-                print(report_v)
-
-            # Warnings if mismatches detected
-            if (not matches_k or not matches_v) and DEBUG_VERBOSITY >= VERBOSITY_DETAILED:
-                print("WARNING: Append KV cache Metal kernel output differs from PyTorch reference")

@@ -1,14 +1,19 @@
 """
-PyTorch CUDA profiler for hierarchical performance analysis.
+PyTorch backend-agnostic profiler for hierarchical performance analysis.
 
 This module provides a profiler that tracks nested operations and reports
 timing statistics in a hierarchical tree structure.
+Supports CUDA, MPS (Metal), and CPU backends.
 """
 
 from __future__ import annotations
 
+import json
+import time
 from contextlib import ContextDecorator
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -43,7 +48,7 @@ class _TorchProfiler:
             return name
         return f"{self.active_node.name}.{name}"
 
-    def start(self, name: str) -> ContextDecorator:
+    def start(self, name: str) -> _TorchProfiler.Timer:
         """Creates a new profiling scope context manager."""
         full_path = self._get_full_path(name)
         if full_path not in self._node_map:
@@ -59,23 +64,26 @@ class _TorchProfiler:
         def __init__(self, profiler: _TorchProfiler, node: _TorchProfiler.Node):
             self.profiler = profiler
             self.node = node
-            self.start_event = None
+            self.start_time: float = 0.0
+
+        @staticmethod
+        def _synchronize():
+            """Synchronize the appropriate backend."""
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                torch.cuda.synchronize()
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                torch.mps.synchronize()
 
         def __enter__(self):
             self.profiler.active_node = self.node
-            self.start_event = torch.cuda.Event(enable_timing=True)
-            self.start_event.record(stream=torch.cuda.current_stream())
+            self._synchronize()
+            self.start_time = time.perf_counter()
             return self
 
         def __exit__(self, *exc):
             _ = exc  # Exception info not currently used
-            stop_event = torch.cuda.Event(enable_timing=True)
-            stop_event.record(stream=torch.cuda.current_stream())
-            stop_event.synchronize()
-            if self.start_event is not None:
-                elapsed_ms = self.start_event.elapsed_time(stop_event)
-            else:
-                elapsed_ms = 0.0
+            self._synchronize()
+            elapsed_ms = (time.perf_counter() - self.start_time) * 1000
             self.node.times.append(elapsed_ms)
 
             if self.node.parent:
@@ -138,6 +146,90 @@ class _TorchProfiler:
 
         print("-" * 115)
 
+    def to_dict(self, include_samples: bool = False) -> dict:
+        """Converts the profiling tree to a dictionary for JSON serialization.
+
+        Args:
+            include_samples: If True, includes individual sample times in the output
+        """
+
+        def calculate_total(node: _TorchProfiler.Node) -> float:
+            if len(node.times) > 0:
+                node.total_mean = float(np.mean(node.times))
+            for child in node.children:
+                calculate_total(child)
+            return node.total_mean
+
+        calculate_total(self.root)
+
+        # Calculate the absolute root total (sum of all top-level operations)
+        absolute_total = sum(child.total_mean for child in self.root.children)
+
+        def node_to_dict(node: _TorchProfiler.Node, root_total: float) -> dict:
+            """Recursively convert a node to a dictionary."""
+            result = {
+                "name": node.name.split(".")[-1] if "." in node.name else node.name,
+                "full_path": node.name,
+                "samples": len(node.times),
+                "avg_latency_ms": float(np.mean(node.times)) if node.times else 0.0,
+                "std_dev_ms": float(np.std(node.times)) if len(node.times) > 1 else 0.0,
+                "min_ms": float(np.min(node.times)) if node.times else 0.0,
+                "max_ms": float(np.max(node.times)) if node.times else 0.0,
+                "total_mean_ms": node.total_mean,
+            }
+
+            if include_samples:
+                result["times_ms"] = [float(t) for t in node.times]
+
+            # Calculate percentage relative to parent
+            if node.parent and node.parent.total_mean > 0:
+                result["percent_of_parent"] = (
+                    node.total_mean / node.parent.total_mean
+                ) * 100
+
+            # Calculate percentage relative to absolute root
+            if root_total > 0:
+                result["percent_of_total"] = (node.total_mean / root_total) * 100
+
+            if node.children:
+                result["children"] = [
+                    node_to_dict(child, root_total) for child in node.children
+                ]
+
+            return result
+
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "profiling_tree": [
+                node_to_dict(child, absolute_total) for child in self.root.children
+            ],
+        }
+
+    def save_to_json(self, output_dir: str = ".", include_samples: bool = False) -> str:
+        """
+        Saves profiling results to a timestamped JSON file.
+
+        Args:
+            output_dir: Directory to save the JSON file (default: current directory)
+            include_samples: If True, includes individual sample times in the output
+
+        Returns:
+            Path to the saved JSON file
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_profiling_result.json"
+        output_path = Path(output_dir) / filename
+
+        # Ensure output directory exists
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+        # Convert to dict and save
+        data = self.to_dict(include_samples=include_samples)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+        return str(output_path)
+
     def reset(self):
         """Clears all collected data for a fresh run."""
         self._node_map.clear()
@@ -149,7 +241,7 @@ class _TorchProfiler:
 PROFILER = _TorchProfiler()
 
 
-def start_profile(name: str) -> ContextDecorator:
+def start_profile(name: str) -> _TorchProfiler.Timer:
     """
     Starts a new profiling scope. Use as a context manager.
     Example:
@@ -159,9 +251,42 @@ def start_profile(name: str) -> ContextDecorator:
     return PROFILER.start(name)
 
 
-def report_profiling_results():
-    """Calculates and prints the final hierarchical report."""
+def report_profiling_results(
+    save_json: bool = True, output_dir: str = ".", include_samples: bool = False
+) -> str | None:
+    """
+    Calculates and prints the final hierarchical report.
+
+    Args:
+        save_json: If True, also saves results to a timestamped JSON file
+        output_dir: Directory to save the JSON file (default: current directory)
+        include_samples: If True, includes individual sample times in the JSON output
+
+    Returns:
+        Path to the saved JSON file if save_json=True, otherwise None
+    """
     PROFILER.report()
+
+    if save_json:
+        json_path = PROFILER.save_to_json(output_dir, include_samples=include_samples)
+        print(f"\n📁 Profiling results saved to: {json_path}")
+        return json_path
+
+    return None
+
+
+def save_profiling_json(output_dir: str = ".", include_samples: bool = False) -> str:
+    """
+    Saves profiling results to a timestamped JSON file.
+
+    Args:
+        output_dir: Directory to save the JSON file (default: current directory)
+        include_samples: If True, includes individual sample times in the output
+
+    Returns:
+        Path to the saved JSON file
+    """
+    return PROFILER.save_to_json(output_dir, include_samples=include_samples)
 
 
 def reset_profiler():

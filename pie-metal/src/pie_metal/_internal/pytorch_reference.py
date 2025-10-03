@@ -241,12 +241,6 @@ def append_paged_kv_cache_reference(
     num_tokens = k_input.shape[0]
     page_size = paged_k_cache.shape[1]
 
-    # DEBUG
-    import os
-    debug_kv = os.environ.get('PIE_METAL_DEBUG_KV_CACHE') == '1'
-    if debug_kv:
-        print(f"[DEBUG KV APPEND] num_tokens={num_tokens}, page_size={page_size}")
-
     # Process each token
     for token_idx in range(num_tokens):
         batch_idx = kv_batch_indices[token_idx].item()
@@ -263,9 +257,6 @@ def append_paged_kv_cache_reference(
         # Copy K and V values to cache
         # Input: [num_tokens, num_kv_heads * head_size]
         # Cache: [max_num_pages, page_size, num_kv_heads * head_size]
-        if debug_kv and (token_idx < 3 or token_idx >= num_tokens - 2):
-            print(f"[DEBUG KV APPEND] token={token_idx}/{num_tokens}, pos={position}, page={global_page_idx}, offset={offset_in_page}")
-
         paged_k_cache[global_page_idx, offset_in_page, :] = k_input[token_idx, :]
         paged_v_cache[global_page_idx, offset_in_page, :] = v_input[token_idx, :]
 
@@ -329,33 +320,16 @@ def attention_reference(
             continue
         kv_seq_len = (num_kv_pages - 1) * page_size + last_page_len
 
-        # DEBUG
-        import os
-        debug_kv = os.environ.get('PIE_METAL_DEBUG_KV_CACHE') == '1'
-
         # Gather K and V from paged cache
         # K: [num_kv_pages, page_size, num_kv_heads, head_dim]
         # V: [num_kv_pages, page_size, num_kv_heads, head_dim]
         k_pages = []
         v_pages = []
 
-        if debug_kv and batch_idx == 0:
-            print(f"[DEBUG KV RETRIEVE] num_kv_pages={num_kv_pages}, kv_seq_len={kv_seq_len}, last_page_len={last_page_len}")
-
         for page_offset in range(num_kv_pages):
             global_page_idx = kv_page_indices[kv_page_start + page_offset].item()
             k_page = kv_cache[global_page_idx, 0, :, :, :]  # [page_size, num_kv_heads, head_dim]
             v_page = kv_cache[global_page_idx, 1, :, :, :]
-
-            if debug_kv and batch_idx == 0:
-                print(f"[DEBUG KV RETRIEVE] page_offset={page_offset}, global_page_idx={global_page_idx}")
-                print(f"  k_page[0, 0, :5]: {k_page[0, 0, :5].tolist()}")
-                if page_offset == 0:
-                    print(f"  k_page[15, 0, :5]: {k_page[15, 0, :5].tolist()}")  # Last slot of first page
-                if page_offset == 1:
-                    print(f"  k_page[0, 0, :5]: {k_page[0, 0, :5].tolist()}")  # First slot of second page
-                    print(f"  k_page[1, 0, :5]: {k_page[1, 0, :5].tolist()}")  # Second slot of second page
-
             k_pages.append(k_page)
             v_pages.append(v_page)
 
@@ -363,26 +337,9 @@ def attention_reference(
         k_flat = torch.cat(k_pages, dim=0)
         v_flat = torch.cat(v_pages, dim=0)
 
-        if debug_kv and batch_idx == 0:
-            print(f"[DEBUG KV RETRIEVE] Before trim: k_flat.shape={k_flat.shape}")
-
         # Trim to actual sequence length
         k_flat = k_flat[:kv_seq_len, :, :]  # [kv_seq_len, num_kv_heads, head_dim]
         v_flat = v_flat[:kv_seq_len, :, :]
-
-        if debug_kv and batch_idx == 0:
-            print(f"[DEBUG KV RETRIEVE] After trim: k_flat.shape={k_flat.shape}")
-            print(f"  k_flat[0, 0, :5]: {k_flat[0, 0, :5].tolist()}")
-            if kv_seq_len > 7:
-                print(f"  k_flat[7, 0, :5]: {k_flat[7, 0, :5].tolist()}")
-            if kv_seq_len > 8:
-                print(f"  k_flat[8, 0, :5]: {k_flat[8, 0, :5].tolist()}")
-            if kv_seq_len > 15:
-                print(f"  k_flat[15, 0, :5]: {k_flat[15, 0, :5].tolist()}")  # Last of first page
-            if kv_seq_len > 16:
-                print(f"  k_flat[16, 0, :5]: {k_flat[16, 0, :5].tolist()}")  # First of second page
-            if kv_seq_len > 17:
-                print(f"  k_flat[17, 0, :5]: {k_flat[17, 0, :5].tolist()}")  # Second of second page
 
         # Get queries for this batch: [num_queries, num_heads, head_dim]
         q_batch = query[q_start:q_end, :, :]
@@ -401,30 +358,7 @@ def attention_reference(
         q_batch_transposed = q_batch.transpose(0, 1)  # [num_heads, num_queries, head_dim]
         k_transposed = k_flat.transpose(0, 1).transpose(1, 2)  # [num_heads, head_dim, kv_seq_len]
 
-        # DEBUG: Check Q and K values before computing scores
-        import os
-        if os.environ.get('PIE_METAL_DEBUG_ATTENTION') == '1' and batch_idx == 0:
-            print(f"[DEBUG attention scores] Q norm: {q_batch.norm().item():.4f}, K norm: {k_flat.norm().item():.4f}")
-            print(f"[DEBUG attention scores] Q[0,0,:5]: {q_batch[0,0,:5].cpu().tolist()}")
-            print(f"[DEBUG attention scores] K[0,0,:5]: {k_flat[0,0,:5].cpu().tolist()}")
-            print(f"[DEBUG attention scores] scale: {scale}")
-            # Check if all queries are the same (bug check)
-            if num_queries >= 3:
-                q0_norm = q_batch[0].norm().item()
-                q1_norm = q_batch[1].norm().item()
-                q2_norm = q_batch[2].norm().item()
-                print(f"[DEBUG attention scores] Q norms: q[0]={q0_norm:.4f}, q[1]={q1_norm:.4f}, q[2]={q2_norm:.4f}")
-                if abs(q0_norm - q1_norm) < 0.001 and abs(q1_norm - q2_norm) < 0.001:
-                    print(f"[DEBUG attention scores] ⚠️  WARNING: All queries have same norm - might be duplicated!")
-
         scores = torch.bmm(q_batch_transposed, k_transposed) * scale  # [num_heads, num_queries, kv_seq_len]
-
-        # DEBUG: Check raw scores before masking
-        if os.environ.get('PIE_METAL_DEBUG_ATTENTION') == '1' and batch_idx == 0:
-            scores_transposed_for_debug = scores.transpose(0, 1)  # [num_queries, num_heads, kv_seq_len]
-            print(f"[DEBUG attention scores] Raw scores (before mask) [0,0,:min(5,kv_seq_len)]: {scores_transposed_for_debug[0,0,:min(5,kv_seq_len)].cpu().tolist()}")
-            if kv_seq_len > 5:
-                print(f"[DEBUG attention scores] Raw scores (before mask) [0,0,-5:]: {scores_transposed_for_debug[0,0,-5:].cpu().tolist()}")
 
         scores = scores.transpose(0, 1)  # [num_queries, num_heads, kv_seq_len]
 
@@ -510,19 +444,6 @@ def attention_reference(
                 # Combine with causal mask (logical OR: mask if EITHER says to mask)
                 causal_mask = causal_mask | batch_custom_mask
 
-        # DEBUG
-        import os
-        if os.environ.get('PIE_METAL_DEBUG_ATTENTION') == '1':
-            print(f"[DEBUG attention] num_queries={num_queries}, kv_seq_len={kv_seq_len}")
-            print(f"  diagonal={kv_seq_len - num_queries + 1}")
-            print(f"  custom_mask provided: {custom_mask is not None}")
-            print(f"  causal_mask sum (num masked): {causal_mask.sum().item()} / {causal_mask.numel()}")
-            # Show mask pattern for first few queries
-            if num_queries >= 3:
-                print(f"  causal_mask[0,:5]: {causal_mask[0,:min(5,kv_seq_len)].cpu().tolist()}")
-                print(f"  causal_mask[1,:5]: {causal_mask[1,:min(5,kv_seq_len)].cpu().tolist()}")
-                print(f"  causal_mask[2,:5]: {causal_mask[2,:min(5,kv_seq_len)].cpu().tolist()}")
-
         # Try using PyTorch's native scaled_dot_product_attention for better MPS support
         use_native_sdpa = os.environ.get('PIE_METAL_USE_NATIVE_SDPA', '0') == '1'
 
@@ -553,17 +474,6 @@ def attention_reference(
             mask_value = -1e9 if scores.dtype == torch.float32 else -65504.0
             scores = scores.masked_fill(causal_mask.unsqueeze(1), mask_value)
 
-            # DEBUG: Check scores after masking
-            if os.environ.get('PIE_METAL_DEBUG_ATTENTION') == '1' and batch_idx == 0:
-                print(f"[DEBUG attention scores] After masking [0,0,:min(5,kv_seq_len)]: {scores[0,0,:min(5,kv_seq_len)].cpu().tolist()}")
-                if num_queries >= 3:
-                    print(f"[DEBUG attention scores] After masking [1,0,:min(5,kv_seq_len)]: {scores[1,0,:min(5,kv_seq_len)].cpu().tolist()}")
-                    print(f"[DEBUG attention scores] After masking [2,0,:min(5,kv_seq_len)]: {scores[2,0,:min(5,kv_seq_len)].cpu().tolist()}")
-                if kv_seq_len > 5:
-                    print(f"[DEBUG attention scores] After masking [0,0,-5:]: {scores[0,0,-5:].cpu().tolist()}")
-                # Check for extreme values
-                print(f"[DEBUG attention scores] Max score: {scores.max().item():.4f}, Min score: {scores.min().item():.4f}")
-
             # Apply softmax
             attn_weights = torch.softmax(scores, dim=-1)  # [num_queries, num_heads, kv_seq_len]
 
@@ -577,23 +487,6 @@ def attention_reference(
 
         # Write to output buffer
         output[q_start:q_end, :, :] = attn_output
-
-        # DEBUG
-        import os
-        if os.environ.get('PIE_METAL_DEBUG_ATTENTION') == '1' and batch_idx == 0:
-            print(f"[DEBUG attention] batch={batch_idx}, num_queries={num_queries}, kv_seq_len={kv_seq_len}")
-            print(f"  attn_output shape: {attn_output.shape}")
-            print(f"  attn_output[0,0,:5]: {attn_output[0,0,:5].cpu().tolist()}")
-            print(f"  attn_weights[0,0,:min(5,kv_seq_len)]: {attn_weights[0,0,:min(5,kv_seq_len)].cpu().tolist()}")
-            if num_queries >= 3:
-                print(f"  attn_weights[1,0,:min(5,kv_seq_len)]: {attn_weights[1,0,:min(5,kv_seq_len)].cpu().tolist()}")
-                print(f"  attn_weights[2,0,:min(5,kv_seq_len)]: {attn_weights[2,0,:min(5,kv_seq_len)].cpu().tolist()}")
-            if num_queries >= 10:
-                # Show a later query position to see if it attends to more positions
-                mid_q = num_queries // 2
-                last_q = num_queries - 1
-                print(f"  attn_weights[{mid_q},0,:min(10,kv_seq_len)]: {attn_weights[mid_q,0,:min(10,kv_seq_len)].cpu().tolist()}")
-                print(f"  attn_weights[{last_q},0,:min(10,kv_seq_len)]: {attn_weights[last_q,0,:min(10,kv_seq_len)].cpu().tolist()}")
 
     # Flatten to 2D for FlashInfer API compatibility: [num_tokens, num_heads * head_dim]
     return output.view(num_tokens, num_heads * head_dim)

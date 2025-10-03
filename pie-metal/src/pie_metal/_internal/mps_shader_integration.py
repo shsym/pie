@@ -70,22 +70,22 @@ class MPSShaderCompiler:
         self,
         k_input: torch.Tensor,
         v_input: torch.Tensor,
-        paged_k_cache: torch.Tensor,
-        paged_v_cache: torch.Tensor,
+        paged_kv_cache: torch.Tensor,
         kv_batch_indices: torch.Tensor,
         kv_positions: torch.Tensor,
         kv_page_indices: torch.Tensor,
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
-        num_kv_heads: Optional[int] = None,
-        head_size: Optional[int] = None
+        num_kv_heads: int,
+        head_size: int,
+        page_size: int
     ) -> None:
-        """Run append_paged_kv_cache using compiled MPS kernels."""
+        """Run append_paged_kv_cache using compiled MPS kernels with unified buffer."""
         self.append_kv_cache_compiler.run_append_paged_kv_cache_mps(
-            k_input, v_input, paged_k_cache, paged_v_cache,
+            k_input, v_input, paged_kv_cache,
             kv_batch_indices, kv_positions, kv_page_indices,
             kv_page_indptr, kv_last_page_lens,
-            num_kv_heads, head_size
+            num_kv_heads, head_size, page_size
         )
 
 

@@ -14,6 +14,7 @@ from torch import nn
 from adapter_utils import AdapterSubpass
 from config.l4ma import L4maArch
 from model.l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
+from profiler import start_profile
 
 VERSION = "0.1.0"
 
@@ -223,25 +224,31 @@ class L4maDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Run the decoder layer using the provided runtime context."""
 
-        residual = hidden_states
+        with start_profile("input_norm"):
+            residual = hidden_states
+            hidden_states = self._input_normalization(hidden_states)
 
-        hidden_states = self._input_normalization(hidden_states)
+        with start_profile("attention"):
+            hidden_states = self.self_attn(
+                runtime=runtime,
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                kv_cache_at_layer=kv_cache_at_layer,
+                adapter_subpass=adapter_subpass,
+            )
 
-        hidden_states = self.self_attn(
-            runtime=runtime,
-            hidden_states=hidden_states,
-            position_ids=position_ids,
-            kv_cache_at_layer=kv_cache_at_layer,
-            adapter_subpass=adapter_subpass,
-        )
-        hidden_states = residual + hidden_states
+        with start_profile("attention_residual"):
+            hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = self._post_attention_normalization(hidden_states)
+        with start_profile("post_attn_norm"):
+            residual = hidden_states
+            hidden_states = self._post_attention_normalization(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        with start_profile("mlp"):
+            hidden_states = self.mlp(hidden_states)
 
-        hidden_states = residual + hidden_states
+        with start_profile("mlp_residual"):
+            hidden_states = residual + hidden_states
 
         return hidden_states
 
@@ -300,34 +307,40 @@ class L4maModel(nn.Module):
     ) -> torch.Tensor:
         """Forward pass through all decoder layers using the injected backend."""
 
-        hidden_states = input_embeds
-        n, _ = hidden_states.size()
+        with start_profile("model_setup"):
+            hidden_states = input_embeds
+            n, _ = hidden_states.size()
 
-        runtime_inputs = RuntimeInputs(
-            num_tokens=n,
-            kv_cache_at_layer=kv_cache_at_layer,
-            kv_page_indices=kv_page_indices,
-            kv_page_indptr=kv_page_indptr,
-            kv_last_page_lens=kv_last_page_lens,
-            qo_indptr=qo_indptr,
-            custom_mask=custom_mask,
-            single_token_inference_mode=single_token_inference_mode,
-        )
-
-        runtime = self.backend.create_forward_context(
-            config=self.config,
-            inputs=runtime_inputs,
-        )
-
-        for _layer_idx, decoder_layer in enumerate(self.layers):
-            hidden_states = decoder_layer(
-                runtime=runtime,
-                hidden_states=hidden_states,
-                position_ids=position_ids,
+            runtime_inputs = RuntimeInputs(
+                num_tokens=n,
                 kv_cache_at_layer=kv_cache_at_layer,
-                adapter_subpass=adapter_subpass,
+                kv_page_indices=kv_page_indices,
+                kv_page_indptr=kv_page_indptr,
+                kv_last_page_lens=kv_last_page_lens,
+                qo_indptr=qo_indptr,
+                custom_mask=custom_mask,
+                single_token_inference_mode=single_token_inference_mode,
             )
-        hidden_states = self.norm(hidden_states)
+
+            runtime = self.backend.create_forward_context(
+                config=self.config,
+                inputs=runtime_inputs,
+            )
+
+        with start_profile("decoder_layers"):
+            for layer_idx, decoder_layer in enumerate(self.layers):
+                with start_profile(f"layer_{layer_idx}"):
+                    hidden_states = decoder_layer(
+                        runtime=runtime,
+                        hidden_states=hidden_states,
+                        position_ids=position_ids,
+                        kv_cache_at_layer=kv_cache_at_layer,
+                        adapter_subpass=adapter_subpass,
+                    )
+
+        with start_profile("final_norm"):
+            hidden_states = self.norm(hidden_states)
+
         return hidden_states
 
 
