@@ -1,0 +1,78 @@
+# Git
+.git
+.gitignore
+.gitattributes
+.github
+
+# Build artifacts
+**/target/
+**/build/
+**/*.o
+**/*.a
+**/*.so
+**/*.dylib
+**/*.wasm
+Cargo.lock
+!pie-cli/Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.claude/
+.codex/
+.spec-kit/
+
+# Logs
+*.log
+logs/
+pie.log
+pie_cuda.log
+
+# Cache
+.cache/
+*.cache
+
+# Test artifacts
+cuda_artifacts.tar.xz
+
+# Documentation (keep README)
+docs/
+*.md
+!README.md
+
+# Config files (we'll copy specific ones)
+*.toml
+!pie-cli/example_config.toml
+!pie-cli/metal_config.toml
+
+# Other
+*.bak
+*.tmp
+*.temp
+*.pid
+node_modules/
