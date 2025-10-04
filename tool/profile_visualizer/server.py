@@ -15,31 +15,6 @@ class ProfileVisualizerHandler(SimpleHTTPRequestHandler):
     root_directory = None
     static_dir = None
 
-    def _sanitize_path(self, requested_path):
-        """
-        Sanitize and validate a path to prevent directory traversal attacks.
-
-        Args:
-            requested_path: The path requested by the client
-
-        Returns:
-            Sanitized absolute path if valid, root_directory if path escapes bounds
-        """
-        if not requested_path:
-            return self.search_directory
-
-        # Resolve to absolute path and normalize
-        abs_path = Path(requested_path).resolve()
-        root_path = Path(self.root_directory).resolve()
-
-        # Check if the resolved path is within the root directory
-        try:
-            abs_path.relative_to(root_path)
-            return str(abs_path)
-        except ValueError:
-            # Path escapes the root directory, return root instead
-            return str(root_path)
-
     def do_GET(self):
         """Handle GET requests."""
         if self.path == "/" or self.path == "/index.html":
@@ -53,26 +28,25 @@ class ProfileVisualizerHandler(SimpleHTTPRequestHandler):
         elif self.path.startswith("/list_files"):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             base_path = query.get("path", [""])[0]
-            sanitized_path = self._sanitize_path(base_path)
-            files = self._list_json_files(sanitized_path)
+            if not base_path:
+                base_path = self.search_directory
+            files = self._list_json_files(base_path)
             self._serve_json(files)
         elif self.path.startswith("/list_dirs"):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             base_path = query.get("path", [""])[0]
-            sanitized_path = self._sanitize_path(base_path)
-            dirs = self._list_directories(sanitized_path)
+            if not base_path:
+                base_path = self.search_directory
+            dirs = self._list_directories(base_path)
             self._serve_json(dirs)
         elif self.path.startswith("/load_file?"):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             filepath = query.get("path", [""])[0]
-            sanitized_path = self._sanitize_path(filepath)
-            if os.path.exists(sanitized_path):
+            if filepath and os.path.exists(filepath):
                 try:
-                    with open(sanitized_path, "r", encoding="utf-8") as f:
+                    with open(filepath, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     self._serve_json(data)
-                except (json.JSONDecodeError, ValueError) as e:
-                    self.send_error(400, f"Error parsing JSON: {str(e)}")
                 except Exception as e:  # pylint: disable=broad-except
                     self.send_error(400, f"Error loading file: {str(e)}")
             else:
@@ -173,30 +147,20 @@ class ProfileVisualizerHandler(SimpleHTTPRequestHandler):
 
         dirs.sort(key=lambda x: x["name"])
 
-        # Add parent directory option, but only if it doesn't escape root_directory
+        # Add parent directory option (always show .. to allow going up)
         parent = os.path.dirname(abs_base)
-        root_abs = Path(self.root_directory).resolve()
-        parent_path = Path(parent).resolve()
-
-        # Only add parent if it's within root_directory bounds
         if parent != abs_base:  # Not at filesystem root
-            try:
-                parent_path.relative_to(root_abs)
-                # Parent is within allowed directory
-                dirs.insert(
-                    0,
-                    {
-                        "path": parent,
-                        "name": "..",
-                        "relative_path": os.path.relpath(parent, self.root_directory)
-                        if parent != self.root_directory
-                        else ".",
-                    },
-                )
-                print(f"[DEBUG] Added parent directory: {parent}")
-            except ValueError:
-                # Parent would escape root_directory, don't add it
-                print(f"[DEBUG] Parent directory {parent} outside root, not adding")
+            dirs.insert(
+                0,
+                {
+                    "path": parent,
+                    "name": "..",
+                    "relative_path": os.path.relpath(parent, self.root_directory)
+                    if parent != self.root_directory
+                    else ".",
+                },
+            )
+            print(f"[DEBUG] Added parent directory: {parent}")
 
         print(f"[DEBUG] Returning {len(dirs)} directories")
         return dirs
