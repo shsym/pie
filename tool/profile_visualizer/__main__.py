@@ -39,8 +39,12 @@ def main():
             sys.exit(1)
 
         # Load profiling data
-        with open(json_path, "r", encoding="utf-8") as f:
-            initial_data = json.load(f)
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                initial_data = json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Error: Failed to parse JSON from {json_path}: {e}")
+            sys.exit(1)
 
         # Set search directory to the parent directory of the provided file
         search_dir = str(json_path.parent.absolute())

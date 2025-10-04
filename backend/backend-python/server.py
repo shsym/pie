@@ -28,8 +28,7 @@ import zmq
 from platformdirs import user_cache_dir
 from websockets.sync.client import connect
 
-# Import profiler for performance analysis
-from profiler import report_profiling_results
+# Note: profiler.save_profiling_json is imported at shutdown time (line 188)
 
 from message import (
     DownloadAdapterRequest,
@@ -185,11 +184,14 @@ def start_service(
         shutdown_event.wait()
     finally:
         # Save profiling results before shutdown (JSON only, no stdout report)
-        from profiler import save_profiling_json
+        from profiler import (  # pylint: disable=import-outside-toplevel
+            save_profiling_json,
+        )
+
         try:
             json_path = save_profiling_json(output_dir=".")
             print(f"📁 Profiling results saved to: {json_path}")
-        except Exception as e:
+        except (OSError, ValueError, RuntimeError) as e:
             print(f"⚠️  Failed to save profiling results: {e}")
         socket.close()
         context.term()
