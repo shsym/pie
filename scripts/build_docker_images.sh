@@ -1,0 +1,66 @@
+#!/bin/bash
+# Build Pie Docker images for verified CUDA/PyTorch combinations
+# Only specific tested versions are supported
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Check if running as root
+if [ "$EUID" -eq 0 ]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
+# Verified CUDA/PyTorch combinations
+# Format: "CUDA_VERSION:CUDA_MINOR:PYTORCH_CUDA:TAG"
+declare -a VERIFIED_CONFIGS=(
+    "12.6:1:cu126:cuda12.6"
+)
+
+echo "=================================================="
+echo "Building Pie Docker Images"
+echo "=================================================="
+echo ""
+echo "Verified configurations:"
+for config in "${VERIFIED_CONFIGS[@]}"; do
+    IFS=':' read -r cuda_ver cuda_minor torch_cuda tag <<< "$config"
+    echo "  - CUDA ${cuda_ver}.${cuda_minor} + PyTorch ${torch_cuda} → pie:${tag}"
+done
+echo ""
+
+cd "$PROJECT_ROOT"
+
+# Build each verified configuration
+for config in "${VERIFIED_CONFIGS[@]}"; do
+    IFS=':' read -r cuda_ver cuda_minor torch_cuda tag <<< "$config"
+
+    echo "Building pie:${tag}..."
+    echo "→ CUDA: ${cuda_ver}.${cuda_minor}"
+    echo "→ PyTorch: ${torch_cuda}"
+
+    $SUDO docker build \
+        --build-arg CUDA_VERSION=${cuda_ver} \
+        --build-arg CUDA_MINOR=${cuda_minor} \
+        --build-arg PYTORCH_CUDA=${torch_cuda} \
+        -t pie:${tag} \
+        -t pie:latest \
+        .
+
+    echo "✓ Built pie:${tag}"
+    echo ""
+done
+
+echo "=================================================="
+echo "Build Summary"
+echo "=================================================="
+echo ""
+echo "Available images:"
+$SUDO docker images | grep -E "^pie" || echo "No pie images found"
+echo ""
+echo "To run:"
+echo "  $SUDO docker run --gpus all -it pie:latest"
+echo ""
+echo "Build complete!"

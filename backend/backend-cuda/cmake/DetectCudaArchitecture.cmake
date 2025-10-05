@@ -3,6 +3,12 @@
 
 # Auto-detect CUDA architecture based on available GPU
 function(detect_cuda_architectures)
+  # Skip detection if CMAKE_CUDA_ARCHITECTURES is already set
+  if(DEFINED CMAKE_CUDA_ARCHITECTURES AND CMAKE_CUDA_ARCHITECTURES)
+    message(STATUS "Using pre-defined CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+    return()
+  endif()
+
   # Query GPU compute capability
   execute_process(
     COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits
@@ -34,5 +40,6 @@ function(detect_cuda_architectures)
   message(
     FATAL_ERROR
       "CUDA Architecture Detection Failed: nvidia-smi is available but failed to query GPU information.\n"
+      "Please set CMAKE_CUDA_ARCHITECTURES manually (e.g., -DCMAKE_CUDA_ARCHITECTURES=\"80;86;89;90\")\n"
   )
 endfunction()
