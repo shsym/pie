@@ -42,7 +42,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber, Layer};
 //================================================================================//
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "PIE Command Line Interface")]
+#[command(author, version, about = "Pie Command Line Interface")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -63,7 +63,7 @@ enum Commands {
 }
 
 #[derive(Args, Debug)]
-/// Arguments for starting the PIE engine.
+/// Arguments for starting the Pie engine.
 pub struct ServeArgs {
     /// Path to a custom TOML configuration file.
     #[arg(long)]
@@ -89,12 +89,11 @@ pub struct ServeArgs {
 /// Arguments to submit an inferlet (Wasm program) to the engine in the shell.
 pub struct RunArgs {
     /// Path to the .wasm inferlet file.
-    #[arg(long, short, value_parser = expand_tilde)]
+    #[arg(value_parser = expand_tilde)]
     pub inferlet: PathBuf,
     /// Path to a custom TOML configuration file.
     #[arg(long, short)]
     pub config: Option<PathBuf>,
-    /// Accept arguments after `--` and pass them to the Wasm program.
     /// A log file to write to.
     #[arg(long)]
     pub log: Option<PathBuf>,
@@ -145,6 +144,8 @@ pub enum ConfigCommands {
     Init(ConfigInitArgs),
     /// Update the entries of the default config file.
     Update(ConfigUpdateArgs),
+    /// Show the content of the default config file.
+    Show,
 }
 
 #[derive(Args, Debug)]
@@ -416,13 +417,16 @@ async fn handle_shell_command(
         "query" => {
             println!("(Query functionality not yet implemented)");
         }
+        "stat" => {
+            print_backend_stats(client_config, printer).await?;
+        }
         "help" => {
             println!("Available commands:");
             println!(
                 "  run [--detach] <path> [ARGS]... - Run a .wasm inferlet with optional arguments"
             );
             println!("  query                  - (Placeholder) Query the engine state");
-            println!("  exit                   - Exit the PIE session");
+            println!("  exit                   - Exit the Pie session");
             println!("  help                   - Show this help message");
         }
         "exit" => {
@@ -553,6 +557,9 @@ async fn handle_config_command(command: ConfigCommands) -> Result<()> {
         ConfigCommands::Update(args) => {
             update_default_config_file(args)?;
         }
+        ConfigCommands::Show => {
+            show_default_config_file()?;
+        }
     }
     Ok(())
 }
@@ -569,11 +576,12 @@ fn build_configs(
     verbose: bool,
     log: Option<PathBuf>,
 ) -> Result<(EngineConfig, Vec<toml::Value>)> {
-    let config_path = config_path
-        .map(Ok)
-        .unwrap_or_else(get_default_config_path)?;
-    let config_str = fs::read_to_string(&config_path)
-        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+    let config_str = match config_path {
+        Some(path) => fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file at {:?}", path))?,
+        None => fs::read_to_string(&get_default_config_path()?)
+            .context("Failed to read default config file. Try running `pie config init` first.")?,
+    };
     let cfg_file: ConfigFile = toml::from_str(&config_str)?;
 
     let enable_auth = if no_auth {
@@ -678,7 +686,7 @@ fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<
 }
 
 fn init_default_config_file(exec_path: &str, backend_type: &str) -> Result<()> {
-    println!("⚙️ Initializing PIE configuration...");
+    println!("⚙️ Initializing Pie configuration...");
 
     let config_path = get_default_config_path()?;
 
@@ -749,7 +757,7 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!("⚙️ Updating PIE configuration...");
+    println!("⚙️ Updating Pie configuration...");
 
     let config_path = get_default_config_path()?;
 
@@ -902,6 +910,28 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
     Ok(())
 }
 
+fn show_default_config_file() -> Result<()> {
+    let config_path = get_default_config_path()?;
+
+    // Check if config file exists
+    if !config_path.exists() {
+        anyhow::bail!(
+            "Configuration file not found at {:?}. Run `pie config init` first.",
+            config_path
+        );
+    }
+
+    // Read and display the config file content
+    let config_content = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+
+    println!("📄 Configuration file at {:?}:", config_path);
+    println!();
+    println!("{}", config_content);
+
+    Ok(())
+}
+
 async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>> {
     let client = HttpClient::new();
     let res = client.get(url).send().await?.error_for_status()?;
@@ -999,8 +1029,8 @@ async fn start_engine_and_backend(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = oneshot::channel();
 
-    // Start the main PIE engine server
-    println!("🚀 Starting PIE engine...");
+    // Start the main Pie engine server
+    println!("🚀 Starting Pie engine...");
     let server_handle = tokio::spawn(async move {
         if let Err(e) = pie::run_server(engine_config, ready_tx, shutdown_rx).await {
             eprintln!("\n[Engine Error] Engine failed: {}", e);
@@ -1295,6 +1325,20 @@ async fn run_inferlet(
         });
     }
 
+    Ok(())
+}
+
+async fn print_backend_stats(
+    client_config: &ClientConfig,
+    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+    let stats = client.query_backend_stats().await?;
+    {
+        let mut p = printer.lock().await;
+        p.print("Backend runtime stats:\n".to_string()).unwrap();
+        p.print(format!("{}\n", stats)).unwrap();
+    }
     Ok(())
 }
 
