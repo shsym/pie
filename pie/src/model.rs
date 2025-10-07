@@ -16,6 +16,7 @@ use anyhow::Result;
 use anyhow::bail;
 use bytes::Bytes;
 use futures::future;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -106,27 +107,6 @@ pub async fn runtime_stats() -> HashMap<String, String> {
     aggregated_stats
 }
 
-/// Stop sending heartbeat requests to all registered models.
-/// This function should be called before terminating the backend to
-/// prevent broken pipe errors due to sending heartbeat requests to
-/// the backend after it has exited.
-pub async fn stop_heartbeat() {
-    let mut ack_receivers = Vec::new();
-    for (_, (_, service_id)) in REGISTERED_MODELS.iter() {
-        let (tx, rx) = oneshot::channel();
-        Command::StopHeartbeat { acknowledge: tx }
-            .dispatch(*service_id)
-            .unwrap();
-        ack_receivers.push(rx);
-    }
-
-    // Wait until all models have confirmed that they have stopped their heartbeat.
-    // We unwrap because these are internal channels and should never fail.
-    for rx in ack_receivers {
-        rx.await.unwrap();
-    }
-}
-
 pub fn submit_request(
     service_id: usize,
     cmd_queue_id: CmdQueueId,
@@ -191,9 +171,6 @@ pub enum Command {
         type_id: ResourceTypeId,
         name: String,
     },
-    StopHeartbeat {
-        acknowledge: oneshot::Sender<()>,
-    },
 }
 
 impl Command {
@@ -221,8 +198,6 @@ pub struct Model {
     info: ModelInfo,
     resource_manager: ResourceManager,
     shutdown_tx: broadcast::Sender<()>,
-    stop_heartbeat_tx: Option<oneshot::Sender<()>>,
-    stop_heartbeat_ack_rx: Option<oneshot::Receiver<()>>,
     scheduler_tx: mpsc::UnboundedSender<(CmdQueueId, u32, Request)>,
     scheduling_worker_handle: Option<JoinHandle<()>>,
     backend_worker_handle: Option<JoinHandle<()>>,
@@ -249,16 +224,13 @@ impl Model {
         let (backend_tx, backend_rx) = mpsc::unbounded_channel();
         let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel();
 
+        // NEW: Shutdown channel for workers.
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let (stop_heartbeat_tx, stop_heartbeat_rx) = oneshot::channel();
-        let (stop_heartbeat_ack_tx, stop_heartbeat_ack_rx) = oneshot::channel();
 
         let backend_worker_handle = tokio::spawn(Self::backend_worker(
             socket,
             backend_rx,
             batch_triggers,
-            stop_heartbeat_rx,
-            stop_heartbeat_ack_tx,
             shutdown_rx,
         ));
         let scheduling_worker_handle = tokio::spawn(Self::scheduling_worker(
@@ -294,8 +266,6 @@ impl Model {
             info,
             resource_manager,
             scheduler_tx,
-            stop_heartbeat_tx: Some(stop_heartbeat_tx),
-            stop_heartbeat_ack_rx: Some(stop_heartbeat_ack_rx),
             shutdown_tx,
             scheduling_worker_handle: Some(scheduling_worker_handle),
             backend_worker_handle: Some(backend_worker_handle),
@@ -393,8 +363,6 @@ impl Model {
         mut socket: DealerSocket,
         mut batch_rx: mpsc::UnboundedReceiver<Vec<Request>>,
         batch_triggers: HashMap<HandlerId, Arc<AtomicBool>>,
-        stop_heartbeat_rx: oneshot::Receiver<()>,
-        stop_heartbeat_ack_tx: oneshot::Sender<()>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         let mut corr_id: u32 = 0;
@@ -406,26 +374,10 @@ impl Model {
         let mut heartbeat_pending: Option<Instant> = None;
         // Use a special correlation ID to distinguish heartbeats from regular requests.
         let heartbeat_corr_id = u32::MAX;
-        let mut stop_heartbeat = false;
-        let mut stop_heartbeat_rx = Some(stop_heartbeat_rx);
-        let mut stop_heartbeat_ack_tx = Some(stop_heartbeat_ack_tx);
 
-        /// Helper function to wait on the stop heartbeat receiver if it has not been notified.
-        /// Once the receiver is notified, the receiver will be set to None.
-        /// We need to do this because after the oneshot receiver is notified, we must not use
-        /// it in the select statement in the loop below.
-        async fn recv_stop_heartbeat(
-            stop_heartbeat_rx: &mut Option<oneshot::Receiver<()>>,
-        ) -> Result<(), oneshot::error::RecvError> {
-            match stop_heartbeat_rx {
-                Some(rx) => {
-                    rx.await?;
-                    stop_heartbeat_rx.take();
-                    Ok(())
-                }
-                None => std::future::pending().await, // Never resolves
-            }
-        }
+        // Define the stats printing interval.
+        const STATS_PRINT_INTERVAL: Duration = Duration::from_secs(30);
+        let mut stats_interval = tokio::time::interval(STATS_PRINT_INTERVAL);
 
         loop {
             let sleep_duration = event_table
@@ -442,22 +394,20 @@ impl Model {
                     break;
                 },
 
-                res = recv_stop_heartbeat(&mut stop_heartbeat_rx) => {
-                    if let Err(e) = res {
-                        eprintln!("[Error] Stop heartbeat signal failed: {:?}", e);
-                        continue;
+                // Add a new arm to the select macro to handle the stats interval tick.
+                _ = stats_interval.tick() => {
+                    let stats = runtime_stats().await;
+                    println!("\n----- Runtime Stats -----");
+                    // Pretty-print the stats for better readability.
+                    let mut sorted_stats: Vec<_> = stats.iter().collect();
+                    sorted_stats.sort_by_key(|(k, _)| *k);
+                    for (key, value) in sorted_stats {
+                        println!("{:<40} | {}", key, value);
                     }
-                    stop_heartbeat = true;
-                    if let Err(e) = stop_heartbeat_ack_tx.take().unwrap().send(()) {
-                        eprintln!("[Error] Heartbeat stopped signal failed: {:?}", e);
-                    }
+                    println!("-------------------------\n");
                 },
 
                 _ = heartbeat_interval.tick() => {
-                    if stop_heartbeat {
-                        continue;
-                    }
-
                     if let Some(sent_at) = heartbeat_pending {
                         if sent_at.elapsed() > HEARTBEAT_TIMEOUT {
                             eprintln!("[Warn] backend not responsive");
@@ -711,16 +661,6 @@ impl Service for Model {
             } => {
                 if let Err(e) = self.resource_manager.release_exported(type_id, name) {
                     trap_exception(inst_id, e);
-                }
-            }
-            Command::StopHeartbeat {
-                acknowledge: response,
-            } => {
-                if let Some(stop_heartbeat_tx) = self.stop_heartbeat_tx.take() {
-                    // These are internal channels and should never fail, so we unwrap.
-                    stop_heartbeat_tx.send(()).unwrap();
-                    self.stop_heartbeat_ack_rx.take().unwrap().await.unwrap();
-                    response.send(()).unwrap();
                 }
             }
         }
