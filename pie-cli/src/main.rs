@@ -8,19 +8,21 @@ use pie::{
     Config as EngineConfig,
     auth::{create_jwt, init_secret},
     client::{self, Client},
-    server,
 };
 use rand::{Rng, distr::Alphanumeric};
+use regex::Regex;
 use reqwest::Client as HttpClient;
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
+use rustyline::history::FileHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Editor, Helper}; // The Helper trait is still needed
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 use std::{
     env,
     fs::{self},
@@ -28,10 +30,12 @@ use std::{
     path::PathBuf,
     process::Stdio, // MODIFIED: Added for process spawning
 };
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command as TokioCommand;
+use tokio::io::BufReader;
+use tokio::process::{Child, Command as TokioCommand};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
-use tokio::sync::oneshot;
+use tokio::sync::oneshot::{self, Sender};
+use tokio::task::JoinHandle;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -41,7 +45,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber, Layer};
 //================================================================================//
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "PIE Command Line Interface")]
+#[command(author, version, about = "Pie Command Line Interface")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -49,16 +53,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start the PIE engine and enter an interactive session.
-    Start(StartArgs),
+    /// Start the Pie engine and enter an interactive session.
+    Serve(ServeArgs),
+    /// Run an inferlet with a one-shot Pie engine.
+    Run(RunArgs),
     #[command(subcommand)]
     /// Manage local models.
     Model(ModelCommands),
+    #[command(subcommand)]
+    /// Manage configuration.
+    Config(ConfigCommands),
 }
 
 #[derive(Args, Debug)]
-/// Arguments for starting the PIE engine.
-pub struct StartArgs {
+/// Arguments for starting the Pie engine.
+pub struct ServeArgs {
     /// Path to a custom TOML configuration file.
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -79,17 +88,34 @@ pub struct StartArgs {
     pub verbose: bool,
 }
 
+#[derive(Args, Debug)]
+/// Arguments to submit an inferlet (Wasm program) to the engine in the shell.
+pub struct RunArgs {
+    /// Path to the .wasm inferlet file.
+    #[arg(value_parser = expand_tilde)]
+    pub inferlet: PathBuf,
+    /// Path to a custom TOML configuration file.
+    #[arg(long, short)]
+    pub config: Option<PathBuf>,
+    /// A log file to write to.
+    #[arg(long)]
+    pub log: Option<PathBuf>,
+    /// Arguments to pass to the inferlet after `--`.
+    #[arg(last = true)]
+    pub arguments: Vec<String>,
+}
+
 /// Helper for clap to expand `~` in path arguments.
 fn expand_tilde(s: &str) -> Result<PathBuf, std::convert::Infallible> {
     Ok(PathBuf::from(shellexpand::tilde(s).as_ref()))
 }
 
-#[derive(Parser, Debug)] // Changed from `Args` to `Parser`
-/// Arguments to submit an inferlet (Wasm program) to the engine.
-pub struct RunArgs {
+#[derive(Parser, Debug)]
+/// Arguments to submit an inferlet (Wasm program) to the engine in the shell.
+pub struct ShellRunArgs {
     /// Path to the .wasm inferlet file.
     #[arg(value_parser = expand_tilde)]
-    pub wasm_path: PathBuf,
+    pub inferlet_path: PathBuf,
 
     /// Run the inferlet in the background and print its instance ID.
     #[arg(long, short)]
@@ -102,10 +128,16 @@ pub struct RunArgs {
 // Other command structs (ModelCommands, etc.) remain the same
 #[derive(Subcommand, Debug)]
 pub enum ModelCommands {
+    /// List downloaded models.
     List,
+    /// Download a model from the model registry.
     Add(AddModelArgs),
+    /// Delete a downloaded model.
     Remove(RemoveModelArgs),
-    Serve(ModelServeArgs),
+    /// Search for models in the model registry.
+    Search(SearchModelArgs),
+    /// Show information about a model from the model registry.
+    Info(InfoModelArgs),
 }
 #[derive(Args, Debug)]
 pub struct AddModelArgs {
@@ -116,15 +148,103 @@ pub struct RemoveModelArgs {
     pub model_name: String,
 }
 #[derive(Args, Debug)]
-pub struct ModelServeArgs {
+pub struct SearchModelArgs {
+    /// Optional regular expression to filter model names.
+    pub pattern: Option<String>,
+}
+#[derive(Args, Debug)]
+pub struct InfoModelArgs {
+    /// Name of the model to get information about.
     pub model_name: String,
-    /// Port to serve the model on
-    #[arg(long, default_value = "8080")]
-    pub port: u16,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommands {
+    /// Create a default config file.
+    Init(ConfigInitArgs),
+    /// Update the entries of the default config file.
+    Update(ConfigUpdateArgs),
+    /// Show the content of the default config file.
+    Show,
+}
+
+#[derive(Args, Debug)]
+pub struct ConfigInitArgs {
+    /// Backend type (e.g., "python", "metal")
+    pub backend_type: String,
+    /// Path to the backend executable
+    pub exec_path: String,
+}
+
+#[derive(Args, Debug)]
+pub struct ConfigUpdateArgs {
+    // Engine configuration options
+    /// The network host to bind to
+    #[arg(long)]
+    pub host: Option<String>,
+    /// The network port to use
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Enable or disable authentication
+    #[arg(long)]
+    pub enable_auth: Option<bool>,
+    /// Authentication secret
+    #[arg(long)]
+    pub auth_secret: Option<String>,
+    /// Cache directory path
+    #[arg(long)]
+    pub cache_dir: Option<String>,
+    /// Enable verbose logging
+    #[arg(long)]
+    pub verbose: Option<bool>,
+    /// Log file path
+    #[arg(long)]
+    pub log: Option<String>,
+
+    // Backend configuration options (prefixed with backend-)
+    /// Backend type
+    #[arg(long)]
+    pub backend_type: Option<String>,
+    /// Backend executable path
+    #[arg(long)]
+    pub backend_exec_path: Option<String>,
+    /// Model name
+    #[arg(long)]
+    pub backend_model: Option<String>,
+    /// Device (e.g., "cuda:0", "mps")
+    #[arg(long)]
+    pub backend_device: Option<String>,
+    /// Data type (e.g., "bfloat16", "float16")
+    #[arg(long)]
+    pub backend_dtype: Option<String>,
+    /// KV page size
+    #[arg(long)]
+    pub backend_kv_page_size: Option<i64>,
+    /// Maximum batch tokens
+    #[arg(long)]
+    pub backend_max_batch_tokens: Option<i64>,
+    /// Maximum distribution size
+    #[arg(long)]
+    pub backend_max_dist_size: Option<i64>,
+    /// Maximum number of KV pages
+    #[arg(long)]
+    pub backend_max_num_kv_pages: Option<i64>,
+    /// Maximum number of embeddings
+    #[arg(long)]
+    pub backend_max_num_embeds: Option<i64>,
+    /// Maximum number of adapters
+    #[arg(long)]
+    pub backend_max_num_adapters: Option<i64>,
+    /// Maximum adapter rank
+    #[arg(long)]
+    pub backend_max_adapter_rank: Option<i64>,
+    /// GPU memory headroom
+    #[arg(long)]
+    pub backend_gpu_mem_headroom: Option<f64>,
 }
 
 // Helper struct for parsing the TOML config file
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug)]
 struct ConfigFile {
     host: Option<String>,
     port: Option<u16>,
@@ -153,15 +273,36 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start(args) => {
-            // MODIFIED: Build both engine and backend configs.
-            let (engine_config, backend_configs) = build_configs(&args)?;
+        Commands::Serve(args) => {
+            let (engine_config, backend_configs) = build_configs(
+                args.config,
+                args.no_auth,
+                args.host,
+                args.port,
+                args.verbose,
+                args.log,
+            )?;
 
-            // 2. Initialize logging based on the config and get the file-writer guard
+            // Initialize logging based on the config and get the file-writer guard
             let _guard = init_logging(&engine_config)?;
 
-            // 3. Start the interactive session, passing both configs
-            start_interactive_session(engine_config, backend_configs).await?;
+            handle_serve_command(engine_config, backend_configs).await?;
+        }
+        Commands::Run(args) => {
+            // Build both engine and backend configs.
+            let (engine_config, backend_configs) =
+                build_configs(args.config, false, None, None, false, args.log)?;
+
+            // Initialize logging based on the config and get the file-writer guard
+            let _guard = init_logging(&engine_config)?;
+
+            handle_run_command(
+                engine_config,
+                backend_configs,
+                args.inferlet,
+                args.arguments,
+            )
+            .await?;
         }
         Commands::Model(cmd) => {
             // Model commands don't start the engine, so they can use a simple logger
@@ -170,6 +311,14 @@ async fn main() -> Result<()> {
                 .finish();
             tracing::subscriber::set_global_default(subscriber)?;
             handle_model_command(cmd).await?;
+        }
+        Commands::Config(cmd) => {
+            // Config commands don't start the engine, so they can use a simple logger
+            let subscriber = FmtSubscriber::builder()
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)?;
+            handle_config_command(cmd).await?;
         }
     }
     Ok(())
@@ -208,257 +357,62 @@ impl Validator for MyHelper {
 // Finally, we implement the `Helper` marker trait itself.
 impl Helper for MyHelper {}
 
-/// Starts the engine and drops into a client command-prompt session.
-async fn start_interactive_session(
+/// Handles the `pie serve` command.
+async fn handle_serve_command(
     engine_config: EngineConfig,
     backend_configs: Vec<toml::Value>,
 ) -> Result<()> {
-    // 1. Initialize engine and client configurations
-    let client_config = ClientConfig {
-        host: engine_config.host.clone(),
-        port: engine_config.port,
-        auth_secret: engine_config.auth_secret.clone(),
-    };
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (rl, printer) = create_editor_and_printer().await?;
 
-    // 2. Start the main PIE engine server in a background task
-    println!("🚀 Starting PIE engine in background...");
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = pie::run_server(engine_config, shutdown_rx).await {
-            eprintln!("\n[Engine Error] Engine failed: {}", e);
-        }
-    });
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    println!("✅ Engine started.");
+    // Start the engine and backend services
+    let (shutdown_tx, server_handle, backend_processes, client_config) =
+        start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
 
-    // 3. Initialize the interactive prompt with highlighting and an external printer
-    println!("Entering interactive session. Type 'help' for commands or use ↑/↓ for history.");
-    let mut rl = Editor::new()?;
-    rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
-    let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
-        Arc::new(Mutex::new(rl.create_external_printer()?));
-    let history_path = get_pie_home()?.join(".pie_history");
-    let _ = rl.load_history(&history_path);
+    // Start the interactive session, passing both configs
+    run_shell(&client_config, rl, printer).await?;
 
-    // 4. Launch all configured backend services
-    let mut backend_processes = Vec::new();
-    if !backend_configs.is_empty() {
-        println!("🚀 Launching backend services...");
-        init_secret(&client_config.auth_secret);
-        let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
-
-        for backend_config in &backend_configs {
-            let backend_table = backend_config
-                .as_table()
-                .context("Each [[backend]] entry in config.toml must be a table.")?;
-            let backend_type = backend_table
-                .get("backend_type")
-                .and_then(|v| v.as_str())
-                .context("`backend_type` is missing or not a string.")?;
-            let exec_path = backend_table
-                .get("exec_path")
-                .and_then(|v| v.as_str())
-                .context("`exec_path` is missing or not a string.")?;
-
-            let mut cmd = if backend_type == "python" {
-                let mut cmd = TokioCommand::new("uv");
-                cmd.arg("--project");
-                cmd.arg("../backend/backend-python");
-                cmd.arg("run");
-                cmd.arg("python");
-                cmd.arg("-u");
-                cmd.arg(exec_path);
-                cmd
-            } else {
-                TokioCommand::new(exec_path)
-            };
-
-            let random_port: u16 = rand::rng().random_range(49152..=65535);
-            cmd.arg("--host")
-                .arg("localhost")
-                .arg("--port")
-                .arg(random_port.to_string())
-                .arg("--controller_host")
-                .arg(&client_config.host)
-                .arg("--controller_port")
-                .arg(client_config.port.to_string())
-                .arg("--auth_token")
-                .arg(&auth_token);
-
-            for (key, value) in backend_table {
-                if key == "backend_type" || key == "exec_path" {
-                    continue;
-                }
-                cmd.arg(format!("--{}", key))
-                    .arg(value.to_string().trim_matches('"').to_string());
-            }
-
-            // Make sure the backend process is a process group leader.
-            unsafe {
-                cmd.pre_exec(|| {
-                    nix::unistd::setsid()?;
-
-                    // On Linux, ask the kernel to send SIGKILL to this process when
-                    // the parent (the Rust program) dies. This handles accidental termination.
-                    #[cfg(target_os = "linux")]
-                    {
-                        // libc::PR_SET_PDEATHSIG is the raw constant for this operation.
-                        // SIGKILL is a non-catchable, non-ignorable signal.
-                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
-                            // If prctl fails, return an error from the closure.
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    Ok(())
-                });
-            }
-
-            println!("- Spawning backend: {}", exec_path);
-            let mut child = cmd
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .with_context(|| format!("Failed to spawn backend process: '{}'", exec_path))?;
-
-            // Stream backend output using the external printer to avoid corrupting the prompt
-            let stdout = child
-                .stdout
-                .take()
-                .context("Could not capture stdout from backend process.")?;
-            let stderr = child
-                .stderr
-                .take()
-                .context("Could not capture stderr from backend process.")?;
-
-            // Clone the Arc for the new task.
-            let printer_stdout = Arc::clone(&printer);
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut reader = BufReader::new(stdout);
-                let mut buffer = [0; 1024]; // Read in 1KB chunks
-                loop {
-                    match reader.read(&mut buffer).await {
-                        Ok(0) => break, // EOF, the child process has closed its stdout
-                        Ok(n) => {
-                            // We've received `n` bytes. Convert to a string (lossily) and print.
-                            let output = String::from_utf8_lossy(&buffer[..n]);
-                            let mut p = printer_stdout.lock().await;
-                            // Use `print!` to avoid adding an extra newline
-                            p.print(format!("[Backend] {}", output)).unwrap();
-                        }
-                        Err(e) => {
-                            // Handle read error, e.g., print it and break
-                            let mut p = printer_stdout.lock().await;
-                            p.print(format!("[Backend Read Error] {}", e)).unwrap();
-                            break;
-                        }
-                    }
-                }
-            });
-
-            // Clone the Arc again for the stderr task.
-            let printer_stderr = Arc::clone(&printer);
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut reader = BufReader::new(stderr);
-                let mut buffer = [0; 1024];
-                loop {
-                    match reader.read(&mut buffer).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let output = String::from_utf8_lossy(&buffer[..n]);
-                            let mut p = printer_stderr.lock().await;
-                            p.print(format!("[Backend] {}", output)).unwrap();
-                        }
-                        Err(e) => {
-                            let mut p = printer_stderr.lock().await;
-                            p.print(format!("[Backend Read Error] {}", e)).unwrap();
-                            break;
-                        }
-                    }
-                }
-            });
-
-            backend_processes.push(child);
-        }
-    }
-
-    // 5. Start the main interactive loop
-    loop {
-        match rl.readline("pie> ") {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                let parts: Vec<String> = match shlex::split(&line) {
-                    Some(parts) => parts,
-                    None => {
-                        eprintln!("Error: Mismatched quotes in command.");
-                        continue;
-                    }
-                };
-                if parts.is_empty() {
-                    continue;
-                }
-
-                // FIX: Pass the printer to the command handler.
-                match handle_interactive_command(
-                    &parts[0],
-                    &parts[1..].iter().map(AsRef::as_ref).collect::<Vec<_>>(),
-                    &client_config,
-                    &printer,
-                )
-                .await
-                {
-                    Ok(should_exit) if should_exit => break,
-                    Ok(_) => (),
-                    Err(e) => eprintln!("Error: {}", e),
-                }
-            }
-            Err(ReadlineError::Interrupted) => println!("(To exit, type 'exit' or press Ctrl-D)"),
-            Err(ReadlineError::Eof) => {
-                println!("Exiting...");
-                break;
-            }
-            Err(err) => {
-                eprintln!("Error reading line: {}", err);
-                break;
-            }
-        }
-    }
-
-    // 6. Begin graceful shutdown
-    println!("Shutting down services...");
-    if let Err(err) = rl.save_history(&history_path) {
-        eprintln!("Warning: Failed to save command history: {}", err);
-    }
-
-    // Iterate through the child processes, signal them, and wait for them to exit.
-    for mut child in backend_processes {
-        // <-- Make `child` mutable to call .wait()
-        if let Some(pid) = child.id() {
-            let pgid = nix::unistd::Pid::from_raw(pid as i32);
-            println!("- Terminating backend process group with PID: {}", pid);
-
-            // Send SIGTERM to the entire process group.
-            if let Err(e) = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM) {
-                eprintln!("  Failed to send SIGTERM to process group {}: {}", pid, e);
-            }
-        }
-
-        // This prevents the main program from exiting before cleanup is complete.
-        if let Err(e) = child.wait().await {
-            eprintln!("  Error while waiting for backend process to exit: {}", e);
-        }
-    }
-
-    let _ = shutdown_tx.send(());
-    server_handle.await?;
-    println!("✅ Shutdown complete.");
+    // Terminate the engine and backend services
+    terminate_engine_and_backend(
+        &client_config,
+        backend_processes,
+        shutdown_tx,
+        server_handle,
+    )
+    .await?;
 
     Ok(())
 }
 
-/// Parses and executes commands entered in the interactive session.
-async fn handle_interactive_command(
+/// Handles the `pie run` command.
+async fn handle_run_command(
+    engine_config: EngineConfig,
+    backend_configs: Vec<toml::Value>,
+    inferlet_path: PathBuf,
+    arguments: Vec<String>,
+) -> Result<()> {
+    let (_rl, printer) = create_editor_and_printer().await?;
+
+    // Start the engine and backend services
+    let (shutdown_tx, server_handle, backend_processes, client_config) =
+        start_engine_and_backend(engine_config, backend_configs, printer.clone()).await?;
+
+    // Run the inferlet
+    run_inferlet(&client_config, inferlet_path, arguments, false, &printer).await?;
+    wait_for_instance_finish(&client_config).await?;
+
+    // Terminate the engine and backend services
+    terminate_engine_and_backend(
+        &client_config,
+        backend_processes,
+        shutdown_tx,
+        server_handle,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Parses and executes commands in the shell.
+async fn handle_shell_command(
     command: &str,
     args: &[&str],
     client_config: &ClientConfig,
@@ -469,9 +423,17 @@ async fn handle_interactive_command(
             // Prepend a dummy command name so clap can parse the args slice.
             let clap_args = std::iter::once("run").chain(args.iter().copied());
 
-            match RunArgs::try_parse_from(clap_args) {
+            match ShellRunArgs::try_parse_from(clap_args) {
                 Ok(run_args) => {
-                    if let Err(e) = handle_run(run_args, client_config, printer).await {
+                    if let Err(e) = run_inferlet(
+                        client_config,
+                        run_args.inferlet_path,
+                        run_args.arguments,
+                        run_args.detach,
+                        printer,
+                    )
+                    .await
+                    {
                         // Use the printer to avoid corrupting the prompt.
                         let mut p = printer.lock().await;
                         p.print(format!("Error running inferlet: {e}")).unwrap();
@@ -487,13 +449,16 @@ async fn handle_interactive_command(
         "query" => {
             println!("(Query functionality not yet implemented)");
         }
+        "stat" => {
+            print_backend_stats(client_config, printer).await?;
+        }
         "help" => {
             println!("Available commands:");
             println!(
                 "  run [--detach] <path> [ARGS]... - Run a .wasm inferlet with optional arguments"
             );
             println!("  query                  - (Placeholder) Query the engine state");
-            println!("  exit                   - Exit the PIE session");
+            println!("  exit                   - Exit the Pie session");
             println!("  help                   - Show this help message");
         }
         "exit" => {
@@ -510,76 +475,7 @@ async fn handle_interactive_command(
     Ok(false)
 }
 
-/// Connects to the engine and executes a Wasm inferlet.
-async fn handle_run(
-    args: RunArgs,
-    client_config: &ClientConfig,
-    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
-) -> Result<()> {
-    let url = format!("ws://{}:{}", client_config.host, client_config.port);
-    let mut client = match Client::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => {
-            return Err(anyhow!(
-                "Could not connect to engine at {}. Is it running?",
-                url
-            ));
-        }
-    };
-
-    let token = create_jwt("default", pie::auth::Role::User)?;
-    client.authenticate(&token).await?;
-
-    let wasm_blob = fs::read(&args.wasm_path)
-        .with_context(|| format!("Failed to read Wasm file at {:?}", args.wasm_path))?;
-    let hash = client::hash_blob(&wasm_blob);
-    println!("Inferlet hash: {}", hash);
-
-    if !client.program_exists(&hash).await? {
-        client.upload_program(&wasm_blob).await?;
-        println!("✅ Inferlet upload successful.");
-    }
-
-    let arguments = args.arguments.clone();
-    let mut instance = client.launch_instance(&hash, arguments).await?;
-    println!("✅ Inferlet launched with ID: {}", instance.id());
-
-    if !args.detach {
-        let instance_id = instance.id().to_string();
-
-        // FIX: Clone the Arc<Mutex<...>> for the new task.
-        let printer_clone = Arc::clone(printer);
-        tokio::spawn(async move {
-            while let Ok(event) = instance.recv().await {
-                match event {
-                    // Handle events that have a specific code and a text message.
-                    InstanceEvent::Event { code, message } => {
-                        // Determine if this event signals the end of the instance's execution.
-                        // Any event other than a simple 'Message' is considered a final state.
-                        let is_terminated = !matches!(code, EventCode::Message);
-
-                        // Format the output string.
-                        // Using the Debug representation of `code` is a clean way to get its name (e.g., "Completed").
-                        let output = format!("[Inferlet {}] {:?}: {}", instance_id, code, message);
-
-                        // Lock the printer, print the message, and then immediately release the lock.
-                        printer_clone.lock().await.print(output).unwrap();
-
-                        // If the instance's execution is finished, break out of the loop.
-                        if is_terminated {
-                            break;
-                        }
-                    }
-                    // If we receive a raw data blob, we'll ignore it and wait for the next event.
-                    InstanceEvent::Blob(_) => continue,
-                }
-            }
-            // No more "Press Enter" message needed!
-        });
-    }
-    Ok(())
-}
-
+/// Handles the `pie model` command.
 async fn handle_model_command(command: ModelCommands) -> Result<()> {
     match command {
         ModelCommands::List => {
@@ -680,8 +576,139 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
                 anyhow::bail!("Model '{}' not found locally.", args.model_name);
             }
         }
-        ModelCommands::Serve(_args) => {
-            return Err(anyhow!("`model serve` is not yet implemented."));
+        ModelCommands::Search(args) => {
+            println!("🔍 Searching for models...");
+
+            #[derive(Deserialize)]
+            struct Item {
+                name: String,
+                #[serde(rename = "type")]
+                item_type: String,
+            }
+
+            // Check available files under pie-project/model-index repository
+            let url = "https://api.github.com/repos/pie-project/model-index/contents";
+            let client = reqwest::Client::new();
+            let response = client
+                .get(url)
+                .query(&[("ref", "main")])
+                .header("User-Agent", "pie-index-list/1.0")
+                .send()
+                .await?;
+
+            let status = response.status();
+            let response_text = response.text().await?;
+
+            // Try to parse as an array first, if that fails, check if it's an error response
+            let items: Vec<Item> = match serde_json::from_str(&response_text) {
+                Ok(items) => items,
+                // Try to instead parse as a GitHub API error response if the initial parsing fails
+                Err(_) => {
+                    #[derive(Deserialize)]
+                    struct GitHubError {
+                        message: String,
+                    }
+
+                    if let Ok(error) = serde_json::from_str::<GitHubError>(&response_text) {
+                        anyhow::bail!("{}", error.message);
+                    } else {
+                        anyhow::bail!("GitHub API request failed with status: {}", status);
+                    }
+                }
+            };
+
+            // Compile regex if pattern is provided
+            let regex = if let Some(pattern) = &args.pattern {
+                Some(Regex::new(pattern).context("Invalid regular expression")?)
+            } else {
+                None
+            };
+
+            // Print matching model names
+            for name in items
+                .into_iter()
+                // Keep only files that are .toml and not traits.toml
+                .filter(|i| {
+                    i.item_type == "file" && i.name.ends_with(".toml") && i.name != "traits.toml"
+                })
+                // Remove the .toml suffix from the model name
+                .map(|i| i.name.strip_suffix(".toml").unwrap_or(&i.name).to_string())
+                // Filter by regex if provided
+                .filter(|name| regex.as_ref().map_or(true, |r| r.is_match(name)))
+            {
+                println!("{name}");
+            }
+        }
+        ModelCommands::Info(args) => {
+            println!("📋 Getting model information for '{}'...", args.model_name);
+
+            // Fetch the TOML file content
+            let url = format!(
+                "https://raw.githubusercontent.com/pie-project/model-index/main/{}.toml",
+                args.model_name
+            );
+            let client = reqwest::Client::new();
+            let response = client
+                .get(&url)
+                .header("User-Agent", "pie-index-info/1.0")
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                anyhow::bail!("Model '{}' not found in the registry", args.model_name);
+            }
+
+            let toml_content = response.text().await?;
+
+            // Parse the TOML content
+            let parsed_toml: toml::Value =
+                toml::from_str(&toml_content).context("Failed to parse TOML file")?;
+
+            // Extract and display the architecture section
+            if let Some(architecture) = parsed_toml.get("architecture") {
+                println!("\n🏗️  Architecture:");
+                match architecture {
+                    toml::Value::Table(table) => {
+                        print_toml_table(table, 1);
+                    }
+                    _ => {
+                        println!("  {}", format_toml_value(architecture));
+                    }
+                }
+            } else {
+                println!("❌ No architecture section found in the model configuration");
+            }
+
+            // Check if the model is downloaded locally
+            let models_root = get_pie_home()?.join("models");
+            let model_files_dir = models_root.join(&args.model_name);
+            let metadata_path = models_root.join(format!("{}.toml", args.model_name));
+
+            let is_downloaded = model_files_dir.exists() && metadata_path.exists();
+            println!("\n📦 Download Status:");
+            if is_downloaded {
+                println!("  ✅ Downloaded locally");
+                println!("  📁 Location: {}", model_files_dir.display());
+            } else {
+                println!("  ❌ Not downloaded");
+                println!("  💡 Use `pie model add {}` to download", args.model_name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handles the `pie config` command.
+async fn handle_config_command(command: ConfigCommands) -> Result<()> {
+    match command {
+        ConfigCommands::Init(args) => {
+            init_default_config_file(&args.exec_path, &args.backend_type)?;
+        }
+        ConfigCommands::Update(args) => {
+            update_default_config_file(args)?;
+        }
+        ConfigCommands::Show => {
+            show_default_config_file()?;
         }
     }
     Ok(())
@@ -691,23 +718,28 @@ async fn handle_model_command(command: ModelCommands) -> Result<()> {
 // SECTION: Helpers
 //================================================================================//
 
-/// Merges config from file and CLI args to create the final EngineConfig.
-// MODIFIED: Renamed to build_configs and now returns backend configs as well.
-fn build_configs(args: &StartArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
-    let file_config: ConfigFile = if let Some(path) = &args.config {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file at {:?}", path))?;
-        toml::from_str(&content)?
-    } else {
-        ConfigFile::default()
+fn build_configs(
+    config_path: Option<PathBuf>,
+    no_auth: bool,
+    host: Option<String>,
+    port: Option<u16>,
+    verbose: bool,
+    log: Option<PathBuf>,
+) -> Result<(EngineConfig, Vec<toml::Value>)> {
+    let config_str = match config_path {
+        Some(path) => fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file at {:?}", path))?,
+        None => fs::read_to_string(&get_default_config_path()?)
+            .context("Failed to read default config file. Try running `pie config init` first.")?,
     };
+    let cfg_file: ConfigFile = toml::from_str(&config_str)?;
 
-    let enable_auth = if args.no_auth {
+    let enable_auth = if no_auth {
         false
     } else {
-        file_config.enable_auth.unwrap_or(true)
+        cfg_file.enable_auth.unwrap_or(true)
     };
-    let auth_secret = file_config.auth_secret.unwrap_or_else(|| {
+    let auth_secret = cfg_file.auth_secret.unwrap_or_else(|| {
         rand::rng()
             .sample_iter(&Alphanumeric)
             .take(32)
@@ -716,23 +748,26 @@ fn build_configs(args: &StartArgs) -> Result<(EngineConfig, Vec<toml::Value>)> {
     });
 
     let engine_config = EngineConfig {
-        host: args
-            .host
+        host: host
             .clone()
-            .or(file_config.host)
+            .or(cfg_file.host)
             .unwrap_or_else(|| "127.0.0.1".to_string()),
-        port: args.port.or(file_config.port).unwrap_or(8080),
+        port: port.or(cfg_file.port).unwrap_or(8080),
         enable_auth,
         auth_secret,
-        cache_dir: file_config
+        cache_dir: cfg_file
             .cache_dir
             .unwrap_or_else(|| get_pie_home().unwrap().join("programs")),
-        verbose: args.verbose || file_config.verbose.unwrap_or(false),
-        log: args.log.clone().or(file_config.log),
+        verbose: verbose || cfg_file.verbose.unwrap_or(false),
+        log: log.clone().or(cfg_file.log),
     };
 
+    if cfg_file.backend.is_empty() {
+        anyhow::bail!("No backend configurations found in the configuration file.");
+    }
+
     // Return both the engine config and the backend configs
-    Ok((engine_config, file_config.backend))
+    Ok((engine_config, cfg_file.backend))
 }
 
 fn get_pie_home() -> Result<PathBuf> {
@@ -743,6 +778,308 @@ fn get_pie_home() -> Result<PathBuf> {
             .map(|p| p.join("pie"))
             .ok_or_else(|| anyhow!("Failed to find home dir"))
     }
+}
+
+fn get_shell_history_path() -> Result<PathBuf> {
+    let pie_home = get_pie_home()?;
+    let history_path = pie_home.join(".pie_history");
+    Ok(history_path)
+}
+
+fn get_default_config_path() -> Result<PathBuf> {
+    let pie_home = get_pie_home()?;
+    let config_path = pie_home.join("config.toml");
+    Ok(config_path)
+}
+
+fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<String> {
+    // Create the backend configuration as a TOML table
+    let backend_table = [
+        (
+            "backend_type",
+            toml::Value::String(backend_type.to_string()),
+        ),
+        ("exec_path", toml::Value::String(exec_path.to_string())),
+        ("model", toml::Value::String("qwen-3-0.6b".into())),
+        ("device", toml::Value::String("cuda:0".into())),
+        ("dtype", toml::Value::String("bfloat16".into())),
+        ("kv_page_size", toml::Value::Integer(16)),
+        ("max_batch_tokens", toml::Value::Integer(10240)),
+        ("max_dist_size", toml::Value::Integer(32)),
+        ("max_num_kv_pages", toml::Value::Integer(10240)),
+        ("max_num_embeds", toml::Value::Integer(128)),
+        ("max_num_adapters", toml::Value::Integer(32)),
+        ("max_adapter_rank", toml::Value::Integer(8)),
+        ("gpu_mem_headroom", toml::Value::Float(10.0)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect::<toml::Table>();
+
+    // Create the ConfigFile object
+    let config_file = ConfigFile {
+        host: Some("127.0.0.1".to_string()),
+        port: Some(8080),
+        enable_auth: None,
+        auth_secret: None,
+        cache_dir: None,
+        verbose: None,
+        log: None,
+        backend: vec![toml::Value::Table(backend_table)],
+    };
+
+    // Serialize to TOML string
+    let config_content =
+        toml::to_string_pretty(&config_file).context("Failed to serialize config to TOML")?;
+
+    Ok(config_content)
+}
+
+fn init_default_config_file(exec_path: &str, backend_type: &str) -> Result<()> {
+    println!("⚙️ Initializing Pie configuration...");
+
+    let config_path = get_default_config_path()?;
+
+    // Check if config file already exists
+    if config_path.exists() {
+        print!(
+            "⚠️ Configuration file already exists at {:?}. Overwrite? [y/N] ",
+            config_path
+        );
+        io::stdout().flush().context("Failed to flush stdout")?;
+
+        let mut confirmation = String::new();
+        io::stdin()
+            .read_line(&mut confirmation)
+            .context("Failed to read user input")?;
+
+        if confirmation.trim().to_lowercase() != "y" {
+            println!("Aborted by user.");
+            return Ok(());
+        }
+    }
+
+    // Create the directory if it doesn't exist
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create config directory at {:?}", parent))?;
+    }
+
+    // Create the default config file
+    let config_content = create_default_config_content(&exec_path, &backend_type)?;
+    fs::write(&config_path, &config_content)
+        .with_context(|| format!("Failed to write config file at {:?}", config_path))?;
+
+    println!("✅ Configuration file created at {:?}", config_path);
+    println!("Config file content:");
+    println!("{}", config_content);
+
+    Ok(())
+}
+
+fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
+    // Check if any update options were provided
+    let has_engine_updates = args.host.is_some()
+        || args.port.is_some()
+        || args.enable_auth.is_some()
+        || args.auth_secret.is_some()
+        || args.cache_dir.is_some()
+        || args.verbose.is_some()
+        || args.log.is_some();
+
+    let has_backend_updates = args.backend_type.is_some()
+        || args.backend_exec_path.is_some()
+        || args.backend_model.is_some()
+        || args.backend_device.is_some()
+        || args.backend_dtype.is_some()
+        || args.backend_kv_page_size.is_some()
+        || args.backend_max_batch_tokens.is_some()
+        || args.backend_max_dist_size.is_some()
+        || args.backend_max_num_kv_pages.is_some()
+        || args.backend_max_num_embeds.is_some()
+        || args.backend_max_num_adapters.is_some()
+        || args.backend_max_adapter_rank.is_some()
+        || args.backend_gpu_mem_headroom.is_some();
+
+    if !has_engine_updates && !has_backend_updates {
+        println!("⚠️ No configuration options provided to update.");
+        println!("Use `pie config update --help` to see available options.");
+        return Ok(());
+    }
+
+    println!("⚙️ Updating Pie configuration...");
+
+    let config_path = get_default_config_path()?;
+
+    // Check if config file exists
+    if !config_path.exists() {
+        anyhow::bail!(
+            "Configuration file not found at {:?}. Run `pie config init` first.",
+            config_path
+        );
+    }
+
+    // Read and parse the existing config file
+    let config_str = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+    let mut config_file: ConfigFile = toml::from_str(&config_str)
+        .with_context(|| format!("Failed to parse config file at {:?}", config_path))?;
+
+    // Update engine configuration fields
+    if let Some(host) = args.host {
+        config_file.host = Some(host);
+        println!("✅ Updated host");
+    }
+    if let Some(port) = args.port {
+        config_file.port = Some(port);
+        println!("✅ Updated port");
+    }
+    if let Some(enable_auth) = args.enable_auth {
+        config_file.enable_auth = Some(enable_auth);
+        println!("✅ Updated enable_auth");
+    }
+    if let Some(auth_secret) = args.auth_secret {
+        config_file.auth_secret = Some(auth_secret);
+        println!("✅ Updated auth_secret");
+    }
+    if let Some(cache_dir) = args.cache_dir {
+        config_file.cache_dir = Some(PathBuf::from(cache_dir));
+        println!("✅ Updated cache_dir");
+    }
+    if let Some(verbose) = args.verbose {
+        config_file.verbose = Some(verbose);
+        println!("✅ Updated verbose");
+    }
+    if let Some(log) = args.log {
+        config_file.log = Some(PathBuf::from(log));
+        println!("✅ Updated log");
+    }
+
+    // Update backend configuration fields
+    if has_backend_updates {
+        if config_file.backend.is_empty() {
+            anyhow::bail!(
+                "No backend configuration found in config file. Cannot update backend settings."
+            );
+        }
+
+        // Update the first backend entry (assuming single backend for now)
+        if let Some(toml::Value::Table(backend_table)) = config_file.backend.get_mut(0) {
+            if let Some(backend_type) = args.backend_type {
+                backend_table.insert(
+                    "backend_type".to_string(),
+                    toml::Value::String(backend_type),
+                );
+                println!("✅ Updated backend_type");
+            }
+            if let Some(exec_path) = args.backend_exec_path {
+                backend_table.insert("exec_path".to_string(), toml::Value::String(exec_path));
+                println!("✅ Updated backend exec_path");
+            }
+            if let Some(model) = args.backend_model {
+                backend_table.insert("model".to_string(), toml::Value::String(model));
+                println!("✅ Updated backend model");
+            }
+            if let Some(device) = args.backend_device {
+                backend_table.insert("device".to_string(), toml::Value::String(device));
+                println!("✅ Updated backend device");
+            }
+            if let Some(dtype) = args.backend_dtype {
+                backend_table.insert("dtype".to_string(), toml::Value::String(dtype));
+                println!("✅ Updated backend dtype");
+            }
+            if let Some(kv_page_size) = args.backend_kv_page_size {
+                backend_table.insert(
+                    "kv_page_size".to_string(),
+                    toml::Value::Integer(kv_page_size),
+                );
+                println!("✅ Updated backend kv_page_size");
+            }
+            if let Some(max_batch_tokens) = args.backend_max_batch_tokens {
+                backend_table.insert(
+                    "max_batch_tokens".to_string(),
+                    toml::Value::Integer(max_batch_tokens),
+                );
+                println!("✅ Updated backend max_batch_tokens");
+            }
+            if let Some(max_dist_size) = args.backend_max_dist_size {
+                backend_table.insert(
+                    "max_dist_size".to_string(),
+                    toml::Value::Integer(max_dist_size),
+                );
+                println!("✅ Updated backend max_dist_size");
+            }
+            if let Some(max_num_kv_pages) = args.backend_max_num_kv_pages {
+                backend_table.insert(
+                    "max_num_kv_pages".to_string(),
+                    toml::Value::Integer(max_num_kv_pages),
+                );
+                println!("✅ Updated backend max_num_kv_pages");
+            }
+            if let Some(max_num_embeds) = args.backend_max_num_embeds {
+                backend_table.insert(
+                    "max_num_embeds".to_string(),
+                    toml::Value::Integer(max_num_embeds),
+                );
+                println!("✅ Updated backend max_num_embeds");
+            }
+            if let Some(max_num_adapters) = args.backend_max_num_adapters {
+                backend_table.insert(
+                    "max_num_adapters".to_string(),
+                    toml::Value::Integer(max_num_adapters),
+                );
+                println!("✅ Updated backend max_num_adapters");
+            }
+            if let Some(max_adapter_rank) = args.backend_max_adapter_rank {
+                backend_table.insert(
+                    "max_adapter_rank".to_string(),
+                    toml::Value::Integer(max_adapter_rank),
+                );
+                println!("✅ Updated backend max_adapter_rank");
+            }
+            if let Some(gpu_mem_headroom) = args.backend_gpu_mem_headroom {
+                backend_table.insert(
+                    "gpu_mem_headroom".to_string(),
+                    toml::Value::Float(gpu_mem_headroom),
+                );
+                println!("✅ Updated backend gpu_mem_headroom");
+            }
+        } else {
+            anyhow::bail!("Invalid backend configuration format in config file.");
+        }
+    }
+
+    // Serialize and write the updated config back to file
+    let updated_config_content = toml::to_string_pretty(&config_file)
+        .context("Failed to serialize updated config to TOML")?;
+
+    fs::write(&config_path, updated_config_content)
+        .with_context(|| format!("Failed to write updated config file at {:?}", config_path))?;
+
+    println!("✅ Configuration file updated at {:?}", config_path);
+    Ok(())
+}
+
+fn show_default_config_file() -> Result<()> {
+    let config_path = get_default_config_path()?;
+
+    // Check if config file exists
+    if !config_path.exists() {
+        anyhow::bail!(
+            "Configuration file not found at {:?}. Run `pie config init` first.",
+            config_path
+        );
+    }
+
+    // Read and display the config file content
+    let config_content = fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file at {:?}", config_path))?;
+
+    println!("📄 Configuration file at {:?}:", config_path);
+    println!();
+    println!("{}", config_content);
+
+    Ok(())
 }
 
 async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>> {
@@ -826,4 +1163,540 @@ fn init_logging(config: &EngineConfig) -> Result<Option<WorkerGuard>> {
         .init();
 
     Ok(guard)
+}
+
+async fn start_engine_and_backend(
+    engine_config: EngineConfig,
+    backend_configs: Vec<toml::Value>,
+    printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<(Sender<()>, JoinHandle<()>, Vec<Child>, ClientConfig)> {
+    // Initialize engine and client configurations
+    let client_config = ClientConfig {
+        host: engine_config.host.clone(),
+        port: engine_config.port,
+        auth_secret: engine_config.auth_secret.clone(),
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+
+    // Start the main Pie engine server
+    println!("🚀 Starting Pie engine...");
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = pie::run_server(engine_config, ready_tx, shutdown_rx).await {
+            eprintln!("\n[Engine Error] Engine failed: {}", e);
+        }
+    });
+    ready_rx.await.unwrap();
+    println!("✅ Engine started.");
+
+    // Launch all configured backend services
+    let mut backend_processes = Vec::new();
+    if !backend_configs.is_empty() {
+        println!("🚀 Launching backend services...");
+        init_secret(&client_config.auth_secret);
+        let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
+
+        for backend_config in &backend_configs {
+            let backend_table = backend_config
+                .as_table()
+                .context("Each [[backend]] entry in config.toml must be a table.")?;
+            let backend_type = backend_table
+                .get("backend_type")
+                .and_then(|v| v.as_str())
+                .context("`backend_type` is missing or not a string.")?;
+            let exec_path = backend_table
+                .get("exec_path")
+                .and_then(|v| v.as_str())
+                .context("`exec_path` is missing or not a string.")?;
+            let exec_parent_path = Path::new(exec_path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .context("`exec_path` has no parent directory.")?;
+
+            let mut cmd = if backend_type == "python" {
+                let mut cmd = TokioCommand::new("uv");
+                cmd.arg("--project");
+                cmd.arg(exec_parent_path);
+                cmd.arg("run");
+                cmd.arg("python");
+                cmd.arg("-u");
+                cmd.arg(exec_path);
+                cmd
+            } else {
+                TokioCommand::new(exec_path)
+            };
+
+            let random_port: u16 = rand::rng().random_range(49152..=65535);
+            cmd.arg("--host")
+                .arg("localhost")
+                .arg("--port")
+                .arg(random_port.to_string())
+                .arg("--controller_host")
+                .arg(&client_config.host)
+                .arg("--controller_port")
+                .arg(client_config.port.to_string())
+                .arg("--auth_token")
+                .arg(&auth_token);
+
+            for (key, value) in backend_table {
+                if key == "backend_type" || key == "exec_path" {
+                    continue;
+                }
+                cmd.arg(format!("--{}", key))
+                    .arg(value.to_string().trim_matches('"').to_string());
+            }
+
+            // On Linux, ask the kernel to send SIGKILL to this process when
+            // the parent (the Rust program) dies. This handles accidental termination.
+            #[cfg(target_os = "linux")]
+            unsafe {
+                cmd.pre_exec(|| {
+                    {
+                        // libc::PR_SET_PDEATHSIG is the raw constant for this operation.
+                        // SIGKILL is a non-catchable, non-ignorable signal.
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                            // If prctl fails, return an error from the closure.
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+
+            println!("- Spawning backend: {}", exec_path);
+            let mut child = cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .with_context(|| format!("Failed to spawn backend process: '{}'", exec_path))?;
+
+            // Stream backend output using the external printer to avoid corrupting the prompt
+            let stdout = child
+                .stdout
+                .take()
+                .context("Could not capture stdout from backend process.")?;
+            let stderr = child
+                .stderr
+                .take()
+                .context("Could not capture stderr from backend process.")?;
+
+            let printer_clone = Arc::clone(&printer);
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = BufReader::new(stdout);
+                let mut buffer = [0; 1024]; // Read in 1KB chunks
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) => break, // EOF, the child process has closed its stdout
+                        Ok(n) => {
+                            // We've received `n` bytes. Convert to a string (lossily) and print.
+                            let output = String::from_utf8_lossy(&buffer[..n]);
+                            // Use `print!` to avoid adding an extra newline
+                            printer_clone
+                                .lock()
+                                .await
+                                .print(format!("[Backend] {}", output))
+                                .unwrap();
+                        }
+                        Err(e) => {
+                            // Handle read error, e.g., print it and break
+                            printer_clone
+                                .lock()
+                                .await
+                                .print(format!("[Backend Read Error] {}", e))
+                                .unwrap();
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let printer_clone = Arc::clone(&printer);
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut reader = BufReader::new(stderr);
+                let mut buffer = [0; 1024];
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let output = String::from_utf8_lossy(&buffer[..n]);
+                            printer_clone
+                                .lock()
+                                .await
+                                .print(format!("[Backend] {}", output))
+                                .unwrap();
+                        }
+                        Err(e) => {
+                            printer_clone
+                                .lock()
+                                .await
+                                .print(format!("[Backend Read Error] {}", e))
+                                .unwrap();
+                            break;
+                        }
+                    }
+                }
+            });
+
+            backend_processes.push(child);
+        }
+    }
+
+    wait_for_backend_ready(&client_config, backend_processes.len()).await?;
+
+    Ok((shutdown_tx, server_handle, backend_processes, client_config))
+}
+
+async fn create_editor_and_printer() -> Result<(
+    Editor<MyHelper, FileHistory>,
+    Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+)> {
+    let mut rl = Editor::new()?;
+    rl.set_helper(Some(MyHelper)); // Enable our custom highlighter
+    let printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>> =
+        Arc::new(Mutex::new(rl.create_external_printer()?));
+    let history_path = get_shell_history_path()?;
+    let _ = rl.load_history(&history_path);
+
+    Ok((rl, printer))
+}
+
+/// Runs the interactive shell.
+async fn run_shell(
+    client_config: &ClientConfig,
+    mut rl: Editor<MyHelper, FileHistory>,
+    printer: Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<()> {
+    println!("Entering interactive session. Type 'help' for commands or use ↑/↓ for history.");
+
+    // The main interactive loop
+    loop {
+        match rl.readline("pie> ") {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+                let parts: Vec<String> = match shlex::split(&line) {
+                    Some(parts) => parts,
+                    None => {
+                        eprintln!("Error: Mismatched quotes in command.");
+                        continue;
+                    }
+                };
+                if parts.is_empty() {
+                    continue;
+                }
+
+                match handle_shell_command(
+                    &parts[0],
+                    &parts[1..].iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+                    client_config,
+                    &printer,
+                )
+                .await
+                {
+                    Ok(should_exit) if should_exit => break,
+                    Ok(_) => (),
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            }
+            Err(ReadlineError::Interrupted) => println!("(To exit, type 'exit' or press Ctrl-D)"),
+            Err(ReadlineError::Eof) => {
+                println!("Exiting...");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error reading line: {}", err);
+                break;
+            }
+        }
+    }
+
+    println!("Shutting down services...");
+    if let Err(err) = rl.save_history(&get_shell_history_path()?) {
+        eprintln!("Warning: Failed to save command history: {}", err);
+    }
+
+    Ok(())
+}
+
+/// Runs the inferlet.
+async fn run_inferlet(
+    client_config: &ClientConfig,
+    inferlet_path: PathBuf,
+    arguments: Vec<String>,
+    detach: bool,
+    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+
+    let inferlet_blob = fs::read(&inferlet_path)
+        .with_context(|| format!("Failed to read Wasm file at {:?}", inferlet_path))?;
+    let hash = client::hash_blob(&inferlet_blob);
+    println!("Inferlet hash: {}", hash);
+
+    if !client.program_exists(&hash).await? {
+        client.upload_program(&inferlet_blob).await?;
+        println!("✅ Inferlet upload successful.");
+    }
+
+    let mut instance = client.launch_instance(&hash, arguments).await?;
+    println!("✅ Inferlet launched with ID: {}", instance.id());
+
+    if !detach {
+        let instance_id = instance.id().to_string();
+
+        let printer_clone = Arc::clone(printer);
+        tokio::spawn(async move {
+            while let Ok(event) = instance.recv().await {
+                match event {
+                    // Handle events that have a specific code and a text message.
+                    InstanceEvent::Event { code, message } => {
+                        // Determine if this event signals the end of the instance's execution.
+                        // Any event other than a simple 'Message' is considered a final state.
+                        let is_terminated = !matches!(code, EventCode::Message);
+
+                        // Format the output string.
+                        // Using the Debug representation of `code` is a clean way to get its name (e.g., "Completed").
+                        let output = format!("[Inferlet {}] {:?}: {}", instance_id, code, message);
+
+                        // Lock the printer, print the message, and then immediately release the lock.
+                        printer_clone.lock().await.print(output).unwrap();
+
+                        // If the instance's execution is finished, break out of the loop.
+                        if is_terminated {
+                            break;
+                        }
+                    }
+                    // If we receive a raw data blob, we'll ignore it and wait for the next event.
+                    InstanceEvent::Blob(_) => continue,
+                }
+            }
+            // No more "Press Enter" message needed!
+        });
+    }
+
+    Ok(())
+}
+
+async fn print_backend_stats(
+    client_config: &ClientConfig,
+    printer: &Arc<Mutex<dyn rustyline::ExternalPrinter + Send>>,
+) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+    let stats = client.query_backend_stats().await?;
+    {
+        let mut p = printer.lock().await;
+        p.print("Backend runtime stats:\n".to_string()).unwrap();
+        p.print(format!("{}\n", stats)).unwrap();
+    }
+    Ok(())
+}
+
+/// Stops the backend heartbeat.
+async fn stop_backend_heartbeat(client_config: &ClientConfig) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+    println!("🔄 Stopping backend heartbeat...");
+    client.stop_backend_heartbeat().await?;
+    println!("✅ Backend heartbeat stopped.");
+    Ok(())
+}
+
+/// Terminates the engine and backend processes.
+async fn terminate_engine_and_backend(
+    client_config: &ClientConfig,
+    backend_processes: Vec<Child>,
+    shutdown_tx: oneshot::Sender<()>,
+    server_handle: tokio::task::JoinHandle<()>,
+) -> Result<()> {
+    println!();
+
+    // Stop the backend heartbeat before sending the signals to the backend processes.
+    // This is to avoid broken pipe errors due to sending signals to the backend processes
+    // after they have exited.
+    stop_backend_heartbeat(client_config).await?;
+    println!("🔄 Terminating backend processes...");
+
+    // Iterate through the child processes, signal them, and wait for them to exit.
+    for mut child in backend_processes {
+        if let Some(pid) = child.id() {
+            let pid = nix::unistd::Pid::from_raw(pid as i32);
+            println!("🔄 Terminating backend uv process with PID: {}", pid);
+
+            // Send SIGTERM to the `uv` process. It will forward the signal to the backend process.
+            if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
+                eprintln!("  Failed to send SIGTERM to uv process {}: {}", pid, e);
+            }
+
+            // Wait for the `uv` process to exit. By the time it exits, the backend process will
+            // have been terminated.
+            let exit_status = child.wait().await;
+
+            if let Err(e) = exit_status {
+                eprintln!("  Error while waiting for uv process to exit: {}", e);
+            }
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+    server_handle.await?;
+    println!("✅ Shutdown complete.");
+
+    Ok(())
+}
+
+/// Connects to the engine and authenticates the client.
+async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
+    let url = format!("ws://{}:{}", client_config.host, client_config.port);
+    let client = match Client::connect(&url).await {
+        Ok(c) => c,
+        Err(_) => {
+            anyhow::bail!("Could not connect to engine at {}. Is it running?", url);
+        }
+    };
+
+    let token = create_jwt("default", pie::auth::Role::User)?;
+    client.authenticate(&token).await?;
+    Ok(client)
+}
+
+/// Waits for all backend processes to be attached. If any backend process terminates prematurely
+/// (before registering), this function will fail immediately.
+async fn wait_for_backend_ready(client_config: &ClientConfig, num_backends: usize) -> Result<()> {
+    let backend_query_client = connect_and_authenticate(&client_config).await?;
+
+    // Set up SIGCHLD signal handler to detect when child processes terminate prematurely
+    let mut sigchld =
+        signal(SignalKind::child()).context("Failed to set up SIGCHLD signal handler")?;
+
+    // Get initial backend state
+    let (mut num_attached, mut num_rejected) = tokio::select! {
+        result = backend_query_client.wait_backend_change(None, None) => {
+            result?
+        }
+        _ = sigchld.recv() => {
+            anyhow::bail!(
+                "Backend process(es) terminated prematurely before registering. \
+                 Check backend logs for errors."
+            );
+        }
+    };
+
+    // Wait for all backends to be attached
+    while (num_attached as usize) < num_backends && num_rejected == 0 {
+        (num_attached, num_rejected) = tokio::select! {
+            result = backend_query_client
+                .wait_backend_change(
+                    Some(num_attached),
+                    Some(num_rejected)
+                ) => {
+                result?
+            }
+            _ = sigchld.recv() => {
+                anyhow::bail!(
+                    "Backend process(es) terminated prematurely before registering. \
+                     Check backend logs for errors."
+                );
+            }
+        };
+    }
+
+    // We expect no backends to be rejected and the number of attached backends
+    // to match the number of backend processes.
+    if (num_attached as usize) != num_backends || num_rejected != 0 {
+        anyhow::bail!(
+            "Unexpected backend state: {} backend(s) attached, {} backend(s) rejected",
+            num_attached,
+            num_rejected
+        );
+    }
+
+    Ok(())
+}
+
+/// Waits for the instance to finish.
+async fn wait_for_instance_finish(client_config: &ClientConfig) -> Result<()> {
+    let client = connect_and_authenticate(client_config).await?;
+
+    // Query the number of attached, detached, and rejected instances.
+    let (mut num_attached, mut num_detached, mut num_rejected) =
+        client.wait_instance_change(None, None, None).await?;
+
+    // If no instances are attached, detached, or rejected, wait for a change.
+    while num_attached == 0 && num_detached == 0 && num_rejected == 0 {
+        (num_attached, num_detached, num_rejected) = client
+            .wait_instance_change(Some(0), Some(0), Some(0))
+            .await?;
+    }
+
+    // We expect either the inferlet was launched successfully (num_attached == 1)
+    // or the inferlet was already terminated (num_attached == 0 && num_detached == 1).
+    if !((num_attached == 1 && num_detached == 0 && num_rejected == 0)
+        || (num_attached == 1 && num_detached == 1 && num_rejected == 0))
+    {
+        anyhow::bail!(
+            "Unexpected instance state: {} instance(s) attached, {} instance(s) detached, {} instance(s) rejected",
+            num_attached,
+            num_detached,
+            num_rejected
+        );
+    }
+
+    // If the inferlet was just started, wait for it to finish.
+    while num_attached == 1 && num_detached == 0 && num_rejected == 0 {
+        (num_attached, num_detached, num_rejected) = client
+            .wait_instance_change(Some(1), Some(0), Some(0))
+            .await?;
+    }
+
+    // Check that the inferlet was terminated.
+    if !(num_attached == 1 && num_detached == 1 && num_rejected == 0) {
+        anyhow::bail!(
+            "Unexpected instance state: {} instance(s) attached, {} instance(s) detached, {} instance(s) rejected",
+            num_attached,
+            num_detached,
+            num_rejected
+        );
+    }
+
+    Ok(())
+}
+
+/// Helper function to print TOML tables with proper indentation
+fn print_toml_table(table: &toml::value::Table, indent_level: usize) {
+    let indent = "  ".repeat(indent_level);
+
+    for (key, value) in table {
+        match value {
+            toml::Value::Table(nested_table) => {
+                println!("{}{}:", indent, key);
+                print_toml_table(nested_table, indent_level + 1);
+            }
+            _ => {
+                println!("{}{}: {}", indent, key, format_toml_value(value));
+            }
+        }
+    }
+}
+
+/// Helper function to format TOML values for display
+fn format_toml_value(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(format_toml_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+        toml::Value::Table(table) => {
+            // For inline tables, keep the compact format
+            let items: Vec<String> = table
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, format_toml_value(v)))
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        toml::Value::Datetime(dt) => dt.to_string(),
+    }
 }
