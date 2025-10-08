@@ -48,6 +48,8 @@ struct ClientInner {
     ws_writer_tx: UnboundedSender<Message>,
     corr_id_pool: Mutex<IdPool<CorrId>>,
     pending_requests: DashMap<CorrId, oneshot::Sender<(bool, String)>>,
+    backend_change_waiters: DashMap<CorrId, oneshot::Sender<(u32, u32)>>,
+    instance_change_waiters: DashMap<CorrId, oneshot::Sender<(u32, u32, u32)>>,
     inst_event_tx: DashMap<InstanceId, mpsc::Sender<InstanceEvent>>,
     // Use a Mutex per entry to avoid deadlocking the DashMap shard
     pending_downloads: DashMap<String, Mutex<DownloadState>>, // Key: blob_hash
@@ -154,6 +156,8 @@ impl Client {
             ws_writer_tx: ws_writer_tx.clone(),
             corr_id_pool: Mutex::new(IdPool::new(CorrId::MAX)),
             pending_requests: DashMap::new(),
+            backend_change_waiters: DashMap::new(),
+            instance_change_waiters: DashMap::new(),
             inst_event_tx: DashMap::new(),
             pending_downloads: DashMap::new(),
         });
@@ -203,7 +207,9 @@ impl Client {
         let corr_id_ref = match &mut msg {
             ClientMessage::Authenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
-            | ClientMessage::LaunchInstance { corr_id, .. } => corr_id,
+            | ClientMessage::LaunchInstance { corr_id, .. }
+            | ClientMessage::StopBackendHeartbeat { corr_id }
+            | ClientMessage::QueryBackendStats { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
         *corr_id_ref = corr_id_new;
@@ -243,6 +249,26 @@ impl Client {
             Ok(result)
         } else {
             anyhow::bail!("Query failed: {}", result)
+        }
+    }
+
+    pub async fn query_backend_stats(&self) -> Result<String> {
+        let msg = ClientMessage::QueryBackendStats { corr_id: 0 };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        if successful {
+            Ok(result)
+        } else {
+            anyhow::bail!("Query backend stats failed: {}", result)
+        }
+    }
+
+    pub async fn stop_backend_heartbeat(&self) -> Result<()> {
+        let msg = ClientMessage::StopBackendHeartbeat { corr_id: 0 };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        if successful {
+            Ok(())
+        } else {
+            anyhow::bail!("Stop backend heartbeat failed: {}", result)
         }
     }
 
@@ -313,6 +339,50 @@ impl Client {
             anyhow::bail!("Launch instance failed: {}", result)
         }
     }
+
+    pub async fn wait_backend_change(
+        &self,
+        cur_num_attached_backends: Option<u32>,
+        cur_num_detached_backends: Option<u32>,
+    ) -> Result<(u32, u32)> {
+        let corr_id = self.inner.corr_id_pool.lock().await.acquire()?;
+        let msg = ClientMessage::WaitBackendChange {
+            corr_id,
+            cur_num_attached_backends,
+            cur_num_detached_backends,
+        };
+        let (tx, rx) = oneshot::channel();
+        self.inner.backend_change_waiters.insert(corr_id, tx);
+        self.inner
+            .ws_writer_tx
+            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+        let (num_attached, num_rejected) = rx.await?;
+        self.inner.corr_id_pool.lock().await.release(corr_id)?;
+        Ok((num_attached, num_rejected))
+    }
+
+    pub async fn wait_instance_change(
+        &self,
+        cur_num_attached_instances: Option<u32>,
+        cur_num_detached_instances: Option<u32>,
+        cur_num_rejected_instances: Option<u32>,
+    ) -> Result<(u32, u32, u32)> {
+        let corr_id = self.inner.corr_id_pool.lock().await.acquire()?;
+        let msg = ClientMessage::WaitInstanceChange {
+            corr_id,
+            cur_num_attached_instances,
+            cur_num_detached_instances,
+            cur_num_rejected_instances,
+        };
+        let (tx, rx) = oneshot::channel();
+        self.inner.instance_change_waiters.insert(corr_id, tx);
+        self.inner
+            .ws_writer_tx
+            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+        let (num_attached, num_detached, num_rejected) = rx.await?;
+        self.inner.corr_id_pool.lock().await.release(corr_id)?;
+        Ok((num_attached, num_detached, num_rejected))
+    }
 }
 
 /// Main message handler function called by the reader task.
@@ -329,6 +399,25 @@ async fn handle_server_message(
         } => {
             if let Some((_, sender)) = inner.pending_requests.remove(&corr_id) {
                 sender.send((successful, result)).ok();
+            }
+        }
+        ServerMessage::BackendChange {
+            corr_id,
+            num_attached,
+            num_rejected,
+        } => {
+            if let Some((_, sender)) = inner.backend_change_waiters.remove(&corr_id) {
+                sender.send((num_attached, num_rejected)).ok();
+            }
+        }
+        ServerMessage::InstanceChange {
+            corr_id,
+            num_attached,
+            num_detached,
+            num_rejected,
+        } => {
+            if let Some((_, sender)) = inner.instance_change_waiters.remove(&corr_id) {
+                sender.send((num_attached, num_detached, num_rejected)).ok();
             }
         }
         ServerMessage::InstanceEvent {

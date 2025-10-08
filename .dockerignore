@@ -86,11 +86,6 @@ docs/
 *.md
 !README.md
 
-# Config files (we'll copy specific ones)
-*.toml
-!pie-cli/example_config.toml
-!pie-cli/metal_config.toml
-
 # Other
 *.bak
 *.tmp

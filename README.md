@@ -19,7 +19,7 @@
 
 ## Getting Started
 
-### Docker (Recommended for CUDA)
+### Docker
 
 The easiest way to run Pie with CUDA support is using our pre-built Docker image.
 
@@ -27,52 +27,42 @@ The easiest way to run Pie with CUDA support is using our pre-built Docker image
 - NVIDIA GPU (SM 8.0+), NVIDIA, and Docker
 - Tested on Ubuntu 24.04, CUDA 12.7
 
-**Step 1: Install NVIDIA Container Toolkit** (one-time setup)
+**Step 1: Install NVIDIA Container Toolkit**
 
 ```bash
-# Run the installation script
 ./scripts/install_nvidia_container_toolkit.sh
 ```
-
-This script will:
-- Verify NVIDIA drivers are installed
-- Install NVIDIA Container Toolkit
-- Configure Docker to use NVIDIA runtime
-- Test GPU access
 
 **Step 2: Pull Image and Download Model**
 
 ```bash
-# Option A: Pull pre-built image from Docker Hub (when available)
 docker pull sslee0cs/pie:latest
-
-# Download a model into pie-models volume
 docker run --rm --gpus all -v pie-models:/root/.cache/pie sslee0cs/pie:latest \
   /workspace/pie-cli/target/release/pie model add "llama-3.2-1b-instruct"
 ```
 
 **Step 3: Start PIE Engine**
-
+To start PIE with interactive shell (uses Python backend):
 ```bash
-# Start PIE with interactive shell (uses Python backend with flashinfer)
-docker run --gpus all -it -v pie-models:/root/.cache/pie sslee0cs/pie:latest
+docker run --gpus all --rm -it -v pie-models:/root/.cache/pie sslee0cs/pie:latest
 ```
-
-This opens the PIE interactive shell with:
-- **Python backend** using flashinfer for GPU acceleration
-- **Model cache** mounted for persistence
 
 **Step 4: Run Inferlets**
 
-From within the PIE shell:
+From within the PIE shell, after you see the model parameters are fully loaded:
 
 ```bash
 pie> run example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
 ```
+You can see a message saying that an inferlet has been lauched.
+```
+✅ Inferlet launched with ID: ...
+```
+Note the the very first inferlet response may take a few minutes due to the JIT compliation of FlashInfer.
 
 ### Local Installation
 
-### 1. Prerequisites
+#### Prerequisites
 
 - **Configure a Backend:**
   Navigate to a backend directory and follow its `README.md` for setup:
@@ -88,7 +78,7 @@ pie> run example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --pro
   This is required to compile Rust-based inferlets in the `example-apps` directory.
 
 
-### 2. Build
+#### Step 1: Build
 
 Build the **PIE CLI** and the example inferlets.
 
@@ -106,7 +96,7 @@ Build the **PIE CLI** and the example inferlets.
   ```
 
 
-### 3. Run an Inferlet
+#### Step 2: Run an Inferlet
 
 Download a model, start the engine, and run an inferlet.
 
