@@ -60,4 +60,4 @@ RUN cd backend/backend-python \
 WORKDIR /workspace
 
 # Use docker_config.toml with Python backend and absolute paths
-CMD ["pie", "start", "--config", "/workspace/pie-cli/docker_config.toml"]
+CMD ["pie", "serve", "--config", "/workspace/pie-cli/docker_config.toml"]
