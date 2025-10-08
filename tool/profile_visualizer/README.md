@@ -12,23 +12,30 @@ A web-based tool for visualizing profiling data from the PIE backend.
 - **Percent of Total**: All percentages shown relative to total execution time
 
 ## Usage
+
 Inside the `tool` directory:
 
-### Start with a specific profiling file:
+### Start with a specific profiling file
 
 ```bash
 python -m profile_visualizer path/to/profiling_result.json
 ```
 
-### Start without a file (browse from workspace root):
+### Start without a file (browse from workspace root)
 
 ```bash
 python -m profile_visualizer
 ```
 
+### Start at a specified port
+
+```bash
+python -m profile_visualizer --port 8080
+```
+
 ## Structure
 
-```
+```bash
 profile_visualizer/
 ├── __init__.py          # Package initialization
 ├── __main__.py          # Entry point (python -m profile_visualizer)
