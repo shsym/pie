@@ -19,21 +19,16 @@
 
 ## Getting Started
 
-### Docker
+### Docker Installation
 
 The easiest way to run Pie with CUDA support is using our pre-built Docker image.
 
 **Prerequisites:**
 - NVIDIA GPU (SM 8.0+), NVIDIA, and Docker
 - Tested on Ubuntu 24.04, CUDA 12.7
+- Install NVIDIA Container Toolkit
 
-**Step 1: Install NVIDIA Container Toolkit**
-
-```bash
-./scripts/install_nvidia_container_toolkit.sh
-```
-
-**Step 2: Pull Image and Download Model**
+**Step 1: Pull Image and Download Model**
 
 ```bash
 docker pull sslee0cs/pie:latest
@@ -41,13 +36,13 @@ docker run --rm --gpus all -v pie-models:/root/.cache/pie sslee0cs/pie:latest \
   /workspace/pie-cli/target/release/pie model add "llama-3.2-1b-instruct"
 ```
 
-**Step 3: Start PIE Engine**
+**Step 2: Start PIE Engine**
 To start PIE with interactive shell (uses Python backend):
 ```bash
 docker run --gpus all --rm -it -v pie-models:/root/.cache/pie sslee0cs/pie:latest
 ```
 
-**Step 4: Run Inferlets**
+**Step 3: Run Inferlets**
 
 From within the PIE shell, after you see the model parameters are fully loaded:
 
@@ -60,7 +55,7 @@ You can see a message saying that an inferlet has been lauched.
 ```
 Note the the very first inferlet response may take a few minutes due to the JIT compliation of FlashInfer.
 
-### Local Installation
+### Manual Installation
 
 #### Prerequisites
 
@@ -123,41 +118,3 @@ Download a model, start the engine, and run an inferlet.
    ```
 
 
-## Building from Source
-
-### Building the Docker Image
-
-Build verified CUDA/PyTorch combinations:
-
-```bash
-# Build all verified configurations
-./scripts/build_docker_images.sh
-
-# Or build manually
-docker build -t pie:latest .
-```
-
-**Verified Configurations:**
-
-| CUDA Version | PyTorch | Flashinfer | Status |
-|--------------|---------|------------|--------|
-| 12.6.1       | cu126   | 0.3.1      | ✅ Tested |
-
-**Requirements:**
-- NVIDIA driver supporting CUDA 12.6+ (check with `nvidia-smi`)
-- Docker with NVIDIA Container Toolkit installed
-
-**To add more CUDA versions:**
-Edit `scripts/build_docker_images.sh` and add to `VERIFIED_CONFIGS` array after testing the combination.
-
-The build process:
-1. Installs CUDA development toolkit
-2. Compiles CUDA backend with CMake/Ninja
-3. Builds PIE CLI and inferlets with Rust/Cargo
-4. Sets up Python environment with flashinfer, PyTorch, and Triton
-
-**Note:** Initial build may take 30-60 minutes depending on your system.
-
-### Building Locally Without Docker
-
-Follow the [Local Installation](#local-installation) instructions above to build PIE components individually on your host system.
