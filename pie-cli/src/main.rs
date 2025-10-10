@@ -814,6 +814,7 @@ fn create_default_config_content(exec_path: &str, backend_type: &str) -> Result<
         ("max_num_adapters", toml::Value::Integer(32)),
         ("max_adapter_rank", toml::Value::Integer(8)),
         ("gpu_mem_headroom", toml::Value::Float(10.0)),
+        ("enable_profiling", toml::Value::Boolean(false)),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
