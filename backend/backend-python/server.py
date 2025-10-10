@@ -97,6 +97,20 @@ def print_config(config: Dict[str, Any]) -> None:
     print("----------------------")
 
 
+def save_profiling_if_enabled(config: Dict[str, Any]) -> None:
+    """Save profiling results if profiling is enabled in config."""
+    if not config.get("enable_profiling", False):
+        return
+
+    from profiler import save_profiling_json  # pylint: disable=import-outside-toplevel
+
+    try:
+        json_path = save_profiling_json(output_dir=".")
+        print(f"📁 Profiling results saved to: {json_path}")
+    except (OSError, ValueError, RuntimeError) as e:
+        print(f"⚠️  Failed to save profiling results: {e}")
+
+
 def start_service(
     *,
     config: Dict[str, Any],
@@ -104,6 +118,13 @@ def start_service(
     register_with_controller: bool = True,
 ) -> None:
     """Spin up the backend service using the provided handler implementation."""
+
+    # Initialize profiler state based on configuration
+    from profiler import (
+        set_profiling_enabled,
+    )  # pylint: disable=import-outside-toplevel
+
+    set_profiling_enabled(config.get("enable_profiling", False))
 
     if config["controller_host"] in ["127.0.0.1", "localhost"]:
         unique_id = random.randint(1000, 9999)
@@ -185,16 +206,8 @@ def start_service(
         # Block until shutdown signal
         shutdown_event.wait()
     finally:
-        # Save profiling results before shutdown (JSON only, no stdout report)
-        from profiler import (  # pylint: disable=import-outside-toplevel
-            save_profiling_json,
-        )
-
-        try:
-            json_path = save_profiling_json(output_dir=".")
-            print(f"📁 Profiling results saved to: {json_path}")
-        except (OSError, ValueError, RuntimeError) as e:
-            print(f"⚠️  Failed to save profiling results: {e}")
+        # Save profiling results before shutdown if enabled
+        save_profiling_if_enabled(config)
         socket.close()
         context.term()
         print("Server shutdown complete.")
@@ -454,6 +467,7 @@ def main(
     gpu_mem_headroom: float | None = None,
     device: str | None = None,
     dtype: str = "bfloat16",
+    enable_profiling: bool = False,
 ):
     """
     Runs the application with configuration provided as command-line arguments.
@@ -477,6 +491,7 @@ def main(
         device: The device to run the model on (e.g., 'mps', 'cuda:0', 'cpu').
                 Auto-detects to 'mps' on Apple Silicon, 'cuda:0' otherwise.
         dtype: The data type for model weights (e.g., 'bfloat16', 'float16').
+        enable_profiling: Enable performance profiling (default: False).
     """
     # Import here to avoid circular imports
     # pylint: disable=import-outside-toplevel
@@ -506,6 +521,7 @@ def main(
         gpu_mem_headroom=gpu_mem_headroom,
         device=device,
         dtype=dtype,
+        enable_profiling=enable_profiling,
     )
 
     print_config(config)

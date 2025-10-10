@@ -241,6 +241,9 @@ pub struct ConfigUpdateArgs {
     /// GPU memory headroom
     #[arg(long)]
     pub backend_gpu_mem_headroom: Option<f64>,
+    /// Enable profiling
+    #[arg(long)]
+    pub backend_enable_profiling: Option<bool>,
 }
 
 // Helper struct for parsing the TOML config file
@@ -899,7 +902,8 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         || args.backend_max_num_embeds.is_some()
         || args.backend_max_num_adapters.is_some()
         || args.backend_max_adapter_rank.is_some()
-        || args.backend_gpu_mem_headroom.is_some();
+        || args.backend_gpu_mem_headroom.is_some()
+        || args.backend_enable_profiling.is_some();
 
     if !has_engine_updates && !has_backend_updates {
         println!("⚠️ No configuration options provided to update.");
@@ -1043,6 +1047,13 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
                     toml::Value::Float(gpu_mem_headroom),
                 );
                 println!("✅ Updated backend gpu_mem_headroom");
+            }
+            if let Some(enable_profiling) = args.backend_enable_profiling {
+                backend_table.insert(
+                    "enable_profiling".to_string(),
+                    toml::Value::Boolean(enable_profiling),
+                );
+                println!("✅ Updated backend enable_profiling");
             }
         } else {
             anyhow::bail!("Invalid backend configuration format in config file.");

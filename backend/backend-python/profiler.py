@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import time
-from contextlib import ContextDecorator
+from contextlib import ContextDecorator, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +20,27 @@ import torch
 
 
 class _TorchProfiler:
-    """The internal profiler class. Users should interact with the global API."""
+    """The internal profiler class. Users should interact with the global API.
+
+    This is a singleton - only one instance should exist via the PROFILER global.
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        # Only initialize once
+        if hasattr(self, "_initialized"):
+            return
+        self._initialized = True
+        self._node_map: dict[str, _TorchProfiler.Node] = {}
+        self.root = self.Node(name="root", parent=None)
+        self.active_node = self.root
+        self.enabled = False  # Profiling disabled by default
 
     @dataclass
     class Node:
@@ -37,11 +57,6 @@ class _TorchProfiler:
         mean: float = 0.0
         std: float = 0.0
         total_mean: float = 0.0  # Includes children's total_mean
-
-    def __init__(self):
-        self._node_map: dict[str, _TorchProfiler.Node] = {}
-        self.root = self.Node(name="root", parent=None)
-        self.active_node = self.root
 
     def _get_full_path(self, name: str) -> str:
         if self.active_node is self.root:
@@ -241,14 +256,26 @@ class _TorchProfiler:
 PROFILER = _TorchProfiler()
 
 
-def start_profile(name: str) -> _TorchProfiler.Timer:
+def set_profiling_enabled(enabled: bool) -> None:
+    """
+    Enable or disable profiling globally.
+
+    Args:
+        enabled: If True, profiling is enabled. If False, profiling is disabled.
+    """
+    PROFILER.enabled = enabled
+
+
+def start_profile(name: str) -> _TorchProfiler.Timer | nullcontext:
     """
     Starts a new profiling scope. Use as a context manager.
     Example:
         with start_profile("my_operation"):
             ...
     """
-    return PROFILER.start(name)
+    if PROFILER.enabled:
+        return PROFILER.start(name)
+    return nullcontext()
 
 
 def report_profiling_results(
