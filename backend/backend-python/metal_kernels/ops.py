@@ -1,5 +1,5 @@
 """
-FlashInfer-compatible API for pie-metal.
+FlashInfer-compatible API for metal_kernels.
 
 This module provides a drop-in replacement for FlashInfer operations using
 Metal acceleration on macOS with Apple Silicon. When Metal is not available,
@@ -42,9 +42,9 @@ def _validate_mps_device(tensor: torch.Tensor, name: str) -> None:
 
     if tensor.device.type != 'mps':
         raise RuntimeError(
-            f"pie-metal requires all tensors to be on MPS device. "
+            f"metal_kernels requires all tensors to be on MPS device. "
             f"Tensor '{name}' is on {tensor.device}. "
-            f"Please move all tensors to MPS before calling pie-metal operations:\n"
+            f"Please move all tensors to MPS before calling metal_kernels operations:\n"
             f"  tensor = tensor.to('mps')\n"
             f"Or set config.device='mps' when initializing the model."
         )
@@ -63,7 +63,7 @@ def _initialize_mps_backend() -> bool:
         return True  # Return True to allow initialization to proceed
 
     if not IS_APPLE_SILICON:
-        print("❌ pie-metal requires macOS with Apple Silicon (M1/M2/M3)")
+        print("❌ metal_kernels requires macOS with Apple Silicon (M1/M2/M3)")
         print("   Install FlashInfer for other platforms:")
         print("   pip install flashinfer")
         return False
@@ -96,7 +96,7 @@ def _initialize_mps_backend() -> bool:
         _mps_available = _mps_compiler.can_use_mps_kernels()
 
         if _mps_available:
-            print("✅ pie-metal initialized with PyTorch MPS shader compilation")
+            print("✅ metal_kernels initialized with PyTorch MPS shader compilation")
             print(f"   Available shader libraries: {list(_mps_compiler.compiled_libraries.keys())}")
             return True
         else:
@@ -234,7 +234,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
 
         if not _mps_available or _mps_compiler is None:
-            raise RuntimeError("MPS backend not initialized - pie-metal requires MPS support")
+            raise RuntimeError("MPS backend not initialized - metal_kernels requires MPS support")
 
         return _mps_compiler.run_attention_mps(
             query=query,
@@ -319,7 +319,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
 
         if not _mps_available or _mps_compiler is None:
-            raise RuntimeError("MPS backend not initialized - pie-metal requires MPS support")
+            raise RuntimeError("MPS backend not initialized - metal_kernels requires MPS support")
 
         return _mps_compiler.run_attention_mps(
             query=query,
@@ -416,7 +416,7 @@ def apply_llama31_rope_pos_ids_inplace(
 
     # Verify Metal kernels are available
     if not _mps_available or _mps_compiler is None or 'rope' not in _mps_compiler.compiled_libraries:
-        raise RuntimeError("Metal RoPE kernels not available. pie-metal requires MPS support.")
+        raise RuntimeError("Metal RoPE kernels not available. metal_kernels requires MPS support.")
 
     # Validate all tensors are on MPS device
     _validate_mps_device(q, "q")
@@ -554,7 +554,7 @@ def append_paged_kv_cache(
     # If you reach here, Metal kernel was not available
     raise RuntimeError(
         "Metal append_paged_kv_cache kernel not available. "
-        "pie-metal requires Metal support on Apple Silicon."
+        "metal_kernels requires Metal support on Apple Silicon."
     )
 
 
@@ -630,7 +630,7 @@ class image:
     def decode_image(image_blob: bytes, dtype: torch.dtype, device: str) -> torch.Tensor:
         """Decode image from bytes to tensor - not yet implemented for Metal."""
         raise NotImplementedError(
-            "Image decoding not yet implemented in pie-metal. "
+            "Image decoding not yet implemented in metal_kernels. "
             "This feature will be added in a future release."
         )
 
@@ -667,7 +667,7 @@ class sampling:
     def top_k_sampling_from_probs(probs: torch.Tensor, top_k: torch.Tensor) -> torch.Tensor:
         """Top-k sampling - not yet implemented for Metal."""
         raise NotImplementedError(
-            "top_k_sampling not yet implemented in pie-metal. "
+            "top_k_sampling not yet implemented in metal_kernels. "
             "This feature will be added in a future release."
         )
 
@@ -675,7 +675,7 @@ class sampling:
     def min_p_sampling_from_probs(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
         """Min-p sampling - not yet implemented for Metal."""
         raise NotImplementedError(
-            "min_p_sampling not yet implemented in pie-metal. "
+            "min_p_sampling not yet implemented in metal_kernels. "
             "This feature will be added in a future release."
         )
 
@@ -685,7 +685,7 @@ class sampling:
     ) -> torch.Tensor:
         """Combined top-k and top-p sampling - not yet implemented for Metal."""
         raise NotImplementedError(
-            "top_k_top_p_sampling not yet implemented in pie-metal. "
+            "top_k_top_p_sampling not yet implemented in metal_kernels. "
             "This feature will be added in a future release."
         )
 

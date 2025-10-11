@@ -24,16 +24,16 @@ from platform_detection import is_apple_silicon
 from profiler import start_profile
 
 # Direct import of backend operations based on platform
-# pie_metal now provides the same API structure as flashinfer
+# metal_kernels now provides the same API structure as flashinfer
 if is_apple_silicon():
     try:
-        import pie_metal.ops as ops  # type: ignore[import-not-found]
+        import metal_kernels.ops as ops  # type: ignore[import-not-found]
 
-        BACKEND_NAME = "pie-metal"
+        BACKEND_NAME = "metal_kernels"
         BACKEND_AVAILABLE = True
     except ImportError:
         ops = None  # type: ignore[assignment]
-        BACKEND_NAME = "pie-metal"
+        BACKEND_NAME = "metal_kernels"
         BACKEND_AVAILABLE = False
 else:
     try:

@@ -1,5 +1,5 @@
 """
-pie-metal: Metal-accelerated FlashInfer replacement for macOS
+metal_kernels: Metal-accelerated FlashInfer replacement for macOS
 
 A drop-in replacement for FlashInfer that uses Apple's Metal Performance Shaders
 for attention operations on macOS with Apple Silicon.

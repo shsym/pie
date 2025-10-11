@@ -12,7 +12,8 @@ import sys
 import os
 from pathlib import Path
 
-workspace_dir = Path(__file__).resolve().parent.parent
+# Add backend-python to path (we're in tests/metal_kernels_debug/)
+workspace_dir = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(workspace_dir / 'backend' / 'backend-python'))
 
 # DO NOT set PIE_METAL_PYTORCH_MODE - we want to test actual Metal kernels
@@ -172,7 +173,7 @@ with torch.no_grad():
                         k_mps_before_rope = k_mps.clone()
 
                 # Apply RoPE using MPS Metal kernels
-                from pie_metal.ops import apply_llama31_rope_pos_ids_inplace
+                from metal_kernels.ops import apply_llama31_rope_pos_ids_inplace
 
                 if layer_idx == 0:
                     print(f"\n  🔧 Before MPS RoPE:")
@@ -270,7 +271,7 @@ with torch.no_grad():
                         kv_cache_mps[layer_idx][0, 1, i, :, :] = v_mps[i, :, :]
 
                 # Attention using MPS Metal kernels
-        from pie_metal.ops import BatchPrefillWithPagedKVCacheWrapper
+        from metal_kernels.ops import BatchPrefillWithPagedKVCacheWrapper
 
         with start_profile("attention"):
             with start_profile("attention_wrapper_setup"):

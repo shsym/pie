@@ -35,10 +35,10 @@ def _create_l4ma_model(model_info: ModelInfo):
 
 # Build registry based on platform
 ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec | None] = {
-    # L4MA is always available (works with both flashinfer and pie-metal)
+    # L4MA is always available (works with both flashinfer and metal_kernels)
     "l4ma": ArchitectureSpec(
         create_model=_create_l4ma_model,
-        description="Llama-like architecture with FlashInfer/pie-metal backend",
+        description="Llama-like architecture with FlashInfer/metal_kernels backend",
     ),
 }
 

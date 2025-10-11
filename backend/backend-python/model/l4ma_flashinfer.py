@@ -1,7 +1,7 @@
 """FlashInfer-backed runtime implementation for the L4MA architecture.
 
-Supports both FlashInfer and pie-metal backends:
-- pie-metal: Metal-accelerated operations for macOS with Apple Silicon
+Supports both FlashInfer and metal_kernels backends:
+- metal_kernels: Metal-accelerated operations for macOS with Apple Silicon
 - FlashInfer: CUDA-accelerated operations for other platforms
 """
 
@@ -19,7 +19,7 @@ from platform_detection import is_apple_silicon
 # Direct import of backend operations based on platform
 if is_apple_silicon():
     try:
-        import pie_metal.ops as ops  # type: ignore[import-not-found]
+        import metal_kernels.ops as ops  # type: ignore[import-not-found]
     except ImportError:
         ops = None  # type: ignore[assignment]
 else:
