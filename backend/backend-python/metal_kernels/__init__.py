@@ -11,6 +11,7 @@ __author__ = "PIE Metal Team"
 # Import main API for convenience
 try:
     from . import ops
+
     __all__ = ["ops"]
 except ImportError:
     # Metal backend not available, graceful degradation

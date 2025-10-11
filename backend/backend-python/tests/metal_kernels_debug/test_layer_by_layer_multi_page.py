@@ -15,21 +15,24 @@ from pathlib import Path
 
 # Add backend-python to path (we're in tests/metal_kernels_debug/)
 workspace_dir = Path(__file__).resolve().parent.parent.parent.parent
-sys.path.insert(0, str(workspace_dir / 'backend' / 'backend-python'))
+sys.path.insert(0, str(workspace_dir / "backend" / "backend-python"))
 
-os.environ['PIE_METAL_PYTORCH_MODE'] = '1'
+os.environ["PIE_METAL_PYTORCH_MODE"] = "1"
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-cache_dir = os.path.expanduser('~/Library/Caches/pie')
+cache_dir = os.path.expanduser("~/Library/Caches/pie")
 
-def test_scenario(num_tokens, page_size=16, model_hf=None, model_pt=None, tokenizer=None):
+
+def test_scenario(
+    num_tokens, page_size=16, model_hf=None, model_pt=None, tokenizer=None
+):
     """Test a specific number of tokens with given page size."""
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print(f"SCENARIO: {num_tokens} tokens, page_size={page_size}")
-    print("="*80)
+    print("=" * 80)
 
     num_pages = (num_tokens + page_size - 1) // page_size
     last_page_len = num_tokens % page_size if num_tokens % page_size != 0 else page_size
@@ -57,7 +60,10 @@ def test_scenario(num_tokens, page_size=16, model_hf=None, model_pt=None, tokeni
         print(f"  Embeddings diff: {embed_diff:.6e}")
 
         # Process each layer
-        from metal_kernels._internal.pytorch_reference import rope_reference, attention_reference
+        from metal_kernels._internal.pytorch_reference import (
+            rope_reference,
+            attention_reference,
+        )
 
         num_heads = 32
         num_kv_heads = 8
@@ -68,7 +74,9 @@ def test_scenario(num_tokens, page_size=16, model_hf=None, model_pt=None, tokeni
         kv_cache_pt = []
         for _ in range(16):
             # PAGED KV cache: [num_pages, 2, page_size, num_kv_heads, head_dim]
-            cache_layer = torch.zeros(num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float32)
+            cache_layer = torch.zeros(
+                num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float32
+            )
             kv_cache_pt.append(cache_layer)
 
         # KV paging parameters
@@ -85,7 +93,12 @@ def test_scenario(num_tokens, page_size=16, model_hf=None, model_pt=None, tokeni
             print(f"     qo_indptr: {qo_indptr.tolist()}")
 
         # Get HF full output
-        hf_outputs = model_hf(input_ids.unsqueeze(0), output_hidden_states=True, output_attentions=True, use_cache=False)
+        hf_outputs = model_hf(
+            input_ids.unsqueeze(0),
+            output_hidden_states=True,
+            output_attentions=True,
+            use_cache=False,
+        )
         hf_hidden_states = hf_outputs.hidden_states
         hf_attentions = hf_outputs.attentions
 
@@ -109,7 +122,7 @@ def test_scenario(num_tokens, page_size=16, model_hf=None, model_pt=None, tokeni
 
             # QKV projection
             qkv_pt = layer_pt.self_attn.qkv_proj(hidden_pt_norm)
-            q_pt, k_pt, v_pt = torch.split(qkv_pt, [32*64, 8*64, 8*64], dim=-1)
+            q_pt, k_pt, v_pt = torch.split(qkv_pt, [32 * 64, 8 * 64, 8 * 64], dim=-1)
 
             # Reshape
             q_pt = q_pt.view(num_tokens, num_heads, head_dim)
@@ -118,12 +131,28 @@ def test_scenario(num_tokens, page_size=16, model_hf=None, model_pt=None, tokeni
 
             # Apply RoPE
             rope_theta = 500000.0
-            q_pt = rope_reference(q_pt, position_ids_pt, rope_theta=rope_theta, rope_factor=32.0,
-                                 interleaved=False, inplace=False, low_freq_factor=1.0,
-                                 high_freq_factor=4.0, old_context_len=8192)
-            k_pt = rope_reference(k_pt, position_ids_pt, rope_theta=rope_theta, rope_factor=32.0,
-                                 interleaved=False, inplace=False, low_freq_factor=1.0,
-                                 high_freq_factor=4.0, old_context_len=8192)
+            q_pt = rope_reference(
+                q_pt,
+                position_ids_pt,
+                rope_theta=rope_theta,
+                rope_factor=32.0,
+                interleaved=False,
+                inplace=False,
+                low_freq_factor=1.0,
+                high_freq_factor=4.0,
+                old_context_len=8192,
+            )
+            k_pt = rope_reference(
+                k_pt,
+                position_ids_pt,
+                rope_theta=rope_theta,
+                rope_factor=32.0,
+                interleaved=False,
+                inplace=False,
+                low_freq_factor=1.0,
+                high_freq_factor=4.0,
+                old_context_len=8192,
+            )
 
             # Manually populate KV cache across pages
             # The cache has shape: [num_pages, 2, page_size, num_kv_heads, head_dim]
@@ -131,21 +160,35 @@ def test_scenario(num_tokens, page_size=16, model_hf=None, model_pt=None, tokeni
             for token_idx in range(num_tokens):
                 page_idx = token_idx // page_size
                 slot_idx = token_idx % page_size
-                kv_cache_pt[layer_idx][page_idx, 0, slot_idx, :, :] = k_pt[token_idx, :, :]
-                kv_cache_pt[layer_idx][page_idx, 1, slot_idx, :, :] = v_pt[token_idx, :, :]
+                kv_cache_pt[layer_idx][page_idx, 0, slot_idx, :, :] = k_pt[
+                    token_idx, :, :
+                ]
+                kv_cache_pt[layer_idx][page_idx, 1, slot_idx, :, :] = v_pt[
+                    token_idx, :, :
+                ]
 
             # Debug: Check cache population for failing cases
             if layer_idx == 0 and num_tokens in [17, 25]:
                 print(f"\n  📍 Layer 0 cache check:")
-                print(f"     Page 0, slot 15 (last of page 1): k norm = {kv_cache_pt[0][0, 0, 15, :, :].norm().item():.4f}")
-                print(f"     Page 1, slot 0 (first of page 2): k norm = {kv_cache_pt[0][1, 0, 0, :, :].norm().item():.4f}")
+                print(
+                    f"     Page 0, slot 15 (last of page 1): k norm = {kv_cache_pt[0][0, 0, 15, :, :].norm().item():.4f}"
+                )
+                print(
+                    f"     Page 1, slot 0 (first of page 2): k norm = {kv_cache_pt[0][1, 0, 0, :, :].norm().item():.4f}"
+                )
                 if num_tokens >= 25:
-                    print(f"     Page 1, slot 8 (9th token in page 2): k norm = {kv_cache_pt[0][1, 0, 8, :, :].norm().item():.4f}")
+                    print(
+                        f"     Page 1, slot 8 (9th token in page 2): k norm = {kv_cache_pt[0][1, 0, 8, :, :].norm().item():.4f}"
+                    )
 
             # Attention
             attn_out_pt = attention_reference(
-                q_pt, kv_cache_pt[layer_idx],
-                kv_page_indices, kv_page_indptr, kv_last_page_lens, qo_indptr
+                q_pt,
+                kv_cache_pt[layer_idx],
+                kv_page_indices,
+                kv_page_indptr,
+                kv_last_page_lens,
+                qo_indptr,
             )
 
             # O projection
@@ -167,7 +210,9 @@ def test_scenario(num_tokens, page_size=16, model_hf=None, model_pt=None, tokeni
             else:
                 hidden_pt_for_comparison = hidden_pt
 
-            output_diff = (hidden_hf_output - hidden_pt_for_comparison).abs().max().item()
+            output_diff = (
+                (hidden_hf_output - hidden_pt_for_comparison).abs().max().item()
+            )
 
             if output_diff > max_layer_diff:
                 max_layer_diff = output_diff
@@ -176,7 +221,9 @@ def test_scenario(num_tokens, page_size=16, model_hf=None, model_pt=None, tokeni
                 first_diverge_layer = layer_idx
 
             if layer_idx < 3 or output_diff > 1e-5:
-                print(f"  Layer {layer_idx:2d}: input_diff={input_diff:.6e}, output_diff={output_diff:.6e}")
+                print(
+                    f"  Layer {layer_idx:2d}: input_diff={input_diff:.6e}, output_diff={output_diff:.6e}"
+                )
 
         # Final norm and logits
         # NOTE: hf_hidden_states[-1] already has norm applied!
@@ -203,20 +250,27 @@ def test_scenario(num_tokens, page_size=16, model_hf=None, model_pt=None, tokeni
             print(f"\n  ✅ PASS: All layers match (max diff: {max_layer_diff:.6e})")
             return True
         elif logits_diff < logits_threshold:
-            print(f"\n  ⚠️  Layer divergence: {max_layer_diff:.6e} (first at layer {first_diverge_layer if first_diverge_layer else 'N/A'})")
-            print(f"      ✅ But logits match within tolerance! (diff: {logits_diff:.6e} < {logits_threshold})")
+            print(
+                f"\n  ⚠️  Layer divergence: {max_layer_diff:.6e} (first at layer {first_diverge_layer if first_diverge_layer else 'N/A'})"
+            )
+            print(
+                f"      ✅ But logits match within tolerance! (diff: {logits_diff:.6e} < {logits_threshold})"
+            )
             return True
         else:
             print(f"\n  ❌ DIVERGENCE: Max layer diff: {max_layer_diff:.6e}")
             if first_diverge_layer is not None:
                 print(f"      First divergence at layer {first_diverge_layer}")
-            print(f"      Logits differ by {logits_diff:.6e} (threshold: {logits_threshold})")
+            print(
+                f"      Logits differ by {logits_diff:.6e} (threshold: {logits_threshold})"
+            )
             return False
 
+
 def main():
-    print("="*80)
+    print("=" * 80)
     print("MULTI-PAGE LAYER-BY-LAYER TEST")
-    print("="*80)
+    print("=" * 80)
 
     # Load models once
     print("\nLoading models...")
@@ -226,20 +280,28 @@ def main():
         torch_dtype=torch.float32,
         attn_implementation="eager",
     )
-    model_hf = model_hf.to('cpu').to(torch.float32)
+    model_hf = model_hf.to("cpu").to(torch.float32)
     model_hf.eval()
 
     from common import load_model as load_model_common, build_config
     from model_factory import create_model_and_fusion_map
 
     config = build_config(
-        model='llama-3.2-1b-instruct',
-        host='localhost', port=62105,
-        controller_host='127.0.0.1', controller_port=8080,
-        auth_token=None, cache_dir=cache_dir,
-        kv_page_size=16, max_dist_size=32, max_num_kv_pages=10240,
-        max_num_embeds=128, max_num_adapters=32, max_adapter_rank=8,
-        device='cpu', dtype='float32',
+        model="llama-3.2-1b-instruct",
+        host="localhost",
+        port=62105,
+        controller_host="127.0.0.1",
+        controller_port=8080,
+        auth_token=None,
+        cache_dir=cache_dir,
+        kv_page_size=16,
+        max_dist_size=32,
+        max_num_kv_pages=10240,
+        max_num_embeds=128,
+        max_num_adapters=32,
+        max_adapter_rank=8,
+        device="cpu",
+        dtype="float32",
     )
 
     model_pt, _ = load_model_common(config, create_model_and_fusion_map)
@@ -247,8 +309,7 @@ def main():
     model_pt.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(
-        "meta-llama/Llama-3.2-1B-Instruct",
-        cache_dir=cache_dir
+        "meta-llama/Llama-3.2-1B-Instruct", cache_dir=cache_dir
     )
 
     print("✅ Models loaded")
@@ -271,9 +332,9 @@ def main():
         results.append((description, passed))
 
     # Summary
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("SUMMARY")
-    print("="*80)
+    print("=" * 80)
 
     for desc, passed in results:
         status = "✅ PASS" if passed else "❌ FAIL"
@@ -285,6 +346,7 @@ def main():
     else:
         print("\n⚠️  Some scenarios failed")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

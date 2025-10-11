@@ -5,17 +5,30 @@ This module compiles and executes our existing Metal attention kernels
 directly through PyTorch's MPS backend, enabling true zero-copy operations.
 """
 
-import torch
 from typing import Optional
+
+import torch
+
+from .mps_append_kv_cache import AppendKVCacheCompiler
 from .mps_attention import AttentionCompiler
 from .mps_rope import RoPECompiler
-from .mps_append_kv_cache import AppendKVCacheCompiler
 
 
 class MPSShaderCompiler:
-    """Unified facade for all MPS Metal kernel operations."""
+    """Unified facade for all MPS Metal kernel operations (Singleton)."""
+
+    _instance: Optional["MPSShaderCompiler"] = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
     def __init__(self):
+        # Only initialize once
+        if hasattr(self, "_initialized"):
+            return
+        self._initialized = True
         print("Initializing MPS Shader Compiler...")
         self.attention_compiler = AttentionCompiler()
         self.rope_compiler = RoPECompiler()
@@ -33,9 +46,11 @@ class MPSShaderCompiler:
 
     def can_use_mps_kernels(self) -> bool:
         """Check if we can use compiled MPS kernels."""
-        return (self.attention_compiler.can_use_mps_kernels() or
-                self.rope_compiler.can_use_mps_kernels() or
-                self.append_kv_cache_compiler.can_use_mps_kernels())
+        return (
+            self.attention_compiler.can_use_mps_kernels()
+            or self.rope_compiler.can_use_mps_kernels()
+            or self.append_kv_cache_compiler.can_use_mps_kernels()
+        )
 
     def run_attention_mps(
         self,
@@ -45,12 +60,17 @@ class MPSShaderCompiler:
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
         qo_indptr: torch.Tensor,
-        custom_mask: Optional[torch.Tensor] = None
+        custom_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run attention using compiled MPS kernels."""
         return self.attention_compiler.run_attention_mps(
-            query, kv_cache, kv_page_indices, kv_page_indptr,
-            kv_last_page_lens, qo_indptr, custom_mask
+            query,
+            kv_cache,
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens,
+            qo_indptr,
+            custom_mask,
         )
 
     def run_rope_mps(
@@ -59,7 +79,7 @@ class MPSShaderCompiler:
         position_ids: torch.Tensor,
         rope_theta: float = 10000.0,
         rope_factor: float = 1.0,
-        interleaved: bool = False
+        interleaved: bool = False,
     ) -> None:
         """Run RoPE using compiled MPS kernels."""
         self.rope_compiler.run_rope_mps(
@@ -78,27 +98,27 @@ class MPSShaderCompiler:
         kv_last_page_lens: torch.Tensor,
         num_kv_heads: int,
         head_size: int,
-        page_size: int
+        page_size: int,
     ) -> None:
         """Run append_paged_kv_cache using compiled MPS kernels with unified buffer."""
         self.append_kv_cache_compiler.run_append_paged_kv_cache_mps(
-            k_input, v_input, paged_kv_cache,
-            kv_batch_indices, kv_positions, kv_page_indices,
-            kv_page_indptr, kv_last_page_lens,
-            num_kv_heads, head_size, page_size
+            k_input,
+            v_input,
+            paged_kv_cache,
+            kv_batch_indices,
+            kv_positions,
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens,
+            num_kv_heads,
+            head_size,
+            page_size,
         )
 
 
-# Global compiler instance
-_shader_compiler: Optional[MPSShaderCompiler] = None
-
-
 def get_mps_compiler() -> MPSShaderCompiler:
-    """Get or create the global MPS shader compiler."""
-    global _shader_compiler
-    if _shader_compiler is None:
-        _shader_compiler = MPSShaderCompiler()
-    return _shader_compiler
+    """Get or create the singleton MPS shader compiler instance."""
+    return MPSShaderCompiler()
 
 
 def run_mps_attention(
@@ -108,7 +128,7 @@ def run_mps_attention(
     kv_page_indptr: torch.Tensor,
     kv_last_page_lens: torch.Tensor,
     qo_indptr: torch.Tensor,
-    custom_mask: Optional[torch.Tensor] = None
+    custom_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run attention using PyTorch MPS compiled shaders."""
 
@@ -116,8 +136,13 @@ def run_mps_attention(
 
     if compiler.can_use_mps_kernels():
         return compiler.run_attention_mps(
-            query, kv_cache, kv_page_indices, kv_page_indptr,
-            kv_last_page_lens, qo_indptr, custom_mask
+            query,
+            kv_cache,
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens,
+            qo_indptr,
+            custom_mask,
         )
     else:
         raise RuntimeError(

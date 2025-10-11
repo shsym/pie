@@ -13,7 +13,7 @@ from .mps_config import (
     DEBUG_ATOL,
     DEBUG_RTOL,
     DEBUG_VERBOSITY,
-    VERBOSITY_DETAILED
+    VERBOSITY_DETAILED,
 )
 
 
@@ -37,9 +37,9 @@ class RoPECompiler(BaseShaderCompiler):
 
         try:
             # Compile the RoPE shader library
-            if self._compile_shader(rope_source, 'rope'):
+            if self._compile_shader(rope_source, "rope"):
                 print("✅ Compiled RoPE kernels for MPS")
-        except Exception as e:
+        except (RuntimeError, OSError) as e:
             print(f"⚠️  Failed to compile RoPE kernels: {e}")
 
     def run_rope_mps(
@@ -48,7 +48,7 @@ class RoPECompiler(BaseShaderCompiler):
         position_ids: torch.Tensor,
         rope_theta: float = 10000.0,
         rope_factor: float = 1.0,
-        interleaved: bool = False
+        interleaved: bool = False,
     ) -> None:
         """
         Run RoPE (Rotary Position Embedding) using compiled MPS kernels.
@@ -64,11 +64,15 @@ class RoPECompiler(BaseShaderCompiler):
             rope_factor: RoPE scaling factor (default: 1.0)
             interleaved: Layout mode (default: False for non-interleaved)
         """
-        if not self.can_use_mps_kernels() or 'rope' not in self.compiled_libraries:
+        if not self.can_use_mps_kernels() or "rope" not in self.compiled_libraries:
             raise RuntimeError("RoPE MPS kernels not available")
 
         # DEBUG MODE: Run PyTorch reference and compare
+        input_metadata = []
+        original_data = None
+        pytorch_output = None
         if DEBUG_ENABLED:
+            # pylint: disable=import-outside-toplevel
             from . import debug_utils
             from . import pytorch_reference
 
@@ -84,7 +88,11 @@ class RoPECompiler(BaseShaderCompiler):
 
             # Run PyTorch reference on clone
             pytorch_output = pytorch_reference.rope_reference(
-                input_clone_for_pytorch, position_ids, rope_theta, rope_factor, interleaved
+                input_clone_for_pytorch,
+                position_ids,
+                rope_theta,
+                rope_factor,
+                interleaved,
             )
 
             # Temporarily modify input_qk to point to our metal clone
@@ -92,22 +100,27 @@ class RoPECompiler(BaseShaderCompiler):
             input_qk.data = input_clone_for_metal.data
 
         # Verify tensors are on MPS device
-        if input_qk.device.type != 'mps':
+        if input_qk.device.type != "mps":
             raise RuntimeError(f"input_qk must be on MPS device, got {input_qk.device}")
-        if position_ids.device.type != 'mps':
-            position_ids = position_ids.to('mps')
+        if position_ids.device.type != "mps":
+            position_ids = position_ids.to("mps")
 
         # Get dimensions
         num_tokens, num_heads, head_size = input_qk.shape
 
         # DEBUG: Log input parameters
         if DEBUG_ENABLED and DEBUG_VERBOSITY >= VERBOSITY_DETAILED:
-            print(f"\n🔍 [RoPE MPS] Input parameters:")
+            print("\n🔍 [RoPE MPS] Input parameters:")
             print(f"   input_qk.shape: {input_qk.shape}")
             print(f"   input_qk.dtype: {input_qk.dtype}")
             print(f"   input_qk.device: {input_qk.device}")
             print(f"   position_ids.shape: {position_ids.shape}")
-            print(f"   position_ids first 5: {position_ids[:5].cpu().tolist() if len(position_ids) >= 5 else position_ids.cpu().tolist()}")
+            first_5 = (
+                position_ids[:5].cpu().tolist()
+                if len(position_ids) >= 5
+                else position_ids.cpu().tolist()
+            )
+            print(f"   position_ids first 5: {first_5}")
             print(f"   rope_theta: {rope_theta}")
             print(f"   rope_factor: {rope_factor}")
             print(f"   interleaved: {interleaved}")
@@ -121,6 +134,7 @@ class RoPECompiler(BaseShaderCompiler):
 
         # Check if input is contiguous
         was_contiguous = input_qk.is_contiguous()
+        input_qk_contiguous = None
 
         if was_contiguous:
             # Can directly flatten as a view (shares memory)
@@ -131,14 +145,18 @@ class RoPECompiler(BaseShaderCompiler):
             input_qk_flat = input_qk_contiguous.view(-1)
 
         # Create params tensor matching RoPEParams struct
-        params = torch.tensor([
-            num_tokens,
-            num_heads,
-            head_size,
-            rope_theta,
-            rope_factor,
-            1 if interleaved else 0  # bool as int
-        ], dtype=torch.float32, device='mps')
+        params = torch.tensor(
+            [
+                num_tokens,
+                num_heads,
+                head_size,
+                rope_theta,
+                rope_factor,
+                1 if interleaved else 0,  # bool as int
+            ],
+            dtype=torch.float32,
+            device="mps",
+        )
 
         # DEBUG: Log params being passed to kernel
         if DEBUG_ENABLED and DEBUG_VERBOSITY >= VERBOSITY_DETAILED:
@@ -146,14 +164,14 @@ class RoPECompiler(BaseShaderCompiler):
             print(f"   input_qk_flat.shape: {input_qk_flat.shape}")
             print(f"   grid threads: ({num_tokens}, {num_heads}, {head_size // 2})")
 
-        lib = self.compiled_libraries['rope']
+        lib = self.compiled_libraries["rope"]
 
         # Select kernel based on dtype
-        kernel_name = 'metal_rope_float32'
+        kernel_name = "metal_rope_float32"
         if input_qk.dtype == torch.float16:
-            kernel_name = 'metal_rope_float16'
+            kernel_name = "metal_rope_float16"
         elif input_qk.dtype == torch.bfloat16:
-            kernel_name = 'metal_rope_bfloat16'
+            kernel_name = "metal_rope_bfloat16"
 
         if hasattr(lib, kernel_name):
             # RoPE uses 3D grid: (num_tokens, num_heads, head_size/2)
@@ -168,23 +186,33 @@ class RoPECompiler(BaseShaderCompiler):
             #   gid.y = head_idx (0 to num_heads-1)
             #   gid.z = pair_idx (0 to num_pairs-1)
             getattr(lib, kernel_name)(
-                input_qk_flat,      # buffer(0): flattened input/output tensor
+                input_qk_flat,  # buffer(0): flattened input/output tensor
                 position_ids.to(torch.int32),  # buffer(1): position IDs
-                params,             # buffer(2): RoPEParams
+                params,  # buffer(2): RoPEParams
                 threads=(num_tokens, num_heads, num_pairs),  # 3D grid dispatch
-                group_size=(8, 8, 4)  # 3D threadgroup size (total 256 threads)
+                group_size=(8, 8, 4),  # 3D threadgroup size (total 256 threads)
             )
 
             # If input was not contiguous, copy the modified data back
             if not was_contiguous:
+                assert (
+                    input_qk_contiguous is not None
+                ), "input_qk_contiguous must be set"
                 input_qk.copy_(input_qk_contiguous)
 
         else:
-            raise RuntimeError(f"RoPE kernel {kernel_name} not found in compiled library")
+            raise RuntimeError(
+                f"RoPE kernel {kernel_name} not found in compiled library"
+            )
 
         # DEBUG MODE: Compare outputs
         if DEBUG_ENABLED:
-            from . import debug_utils
+            from . import debug_utils  # pylint: disable=import-outside-toplevel
+
+            assert original_data is not None, "original_data must be set in debug mode"
+            assert (
+                pytorch_output is not None
+            ), "pytorch_output must be set in debug mode"
 
             # Restore original data pointer and get metal output
             metal_output = input_qk.data
@@ -192,9 +220,11 @@ class RoPECompiler(BaseShaderCompiler):
 
             # Compare Metal vs PyTorch
             matches, diagnostics = debug_utils.compare_tensors(
-                metal_output, pytorch_output,
-                atol=DEBUG_ATOL, rtol=DEBUG_RTOL,
-                operation_name="RoPE"
+                metal_output,
+                pytorch_output,
+                atol=DEBUG_ATOL,
+                rtol=DEBUG_RTOL,
+                operation_name="RoPE",
             )
 
             # Generate and print report
@@ -206,7 +236,9 @@ class RoPECompiler(BaseShaderCompiler):
 
             # If mismatch detected at high verbosity, could raise error
             if not matches and DEBUG_VERBOSITY >= VERBOSITY_DETAILED:
-                print("WARNING: RoPE Metal kernel output differs from PyTorch reference")
+                print(
+                    "WARNING: RoPE Metal kernel output differs from PyTorch reference"
+                )
 
             # Copy the metal result to the original input_qk
             input_qk.data.copy_(metal_output)

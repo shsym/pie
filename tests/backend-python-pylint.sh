@@ -24,4 +24,6 @@ PYTHONPATH=${ROOT}:${ROOT}/backend/backend-python uv run \
     ${ROOT}/backend/backend-python/profiler.py \
     ${ROOT}/backend/backend-python/server.py \
     ${ROOT}/backend/backend-python/config/*.py \
-    ${ROOT}/backend/backend-python/model/*.py
+    ${ROOT}/backend/backend-python/model/*.py \
+    ${ROOT}/backend/backend-python/metal_kernels/*.py \
+    ${ROOT}/backend/backend-python/metal_kernels/_internal/*.py

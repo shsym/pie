@@ -266,7 +266,7 @@ def set_profiling_enabled(enabled: bool) -> None:
     PROFILER.enabled = enabled
 
 
-def start_profile(name: str) -> _TorchProfiler.Timer | nullcontext:
+def start_profile(name: str) -> _TorchProfiler.Timer | nullcontext[None]:
     """
     Starts a new profiling scope. Use as a context manager.
     Example:

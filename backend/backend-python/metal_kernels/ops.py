@@ -8,22 +8,26 @@ it raises informative errors directing users to use PyTorch implementations.
 Can be run in PyTorch-only mode via PIE_METAL_PYTORCH_MODE=1 for testing.
 """
 
+import os
 import platform
 import sys
-from typing import Tuple, Dict, Any, Optional
+from typing import Any, Dict, Optional, Tuple
+
 import torch
-import os
+
+from ._internal.mps_shader_integration import get_mps_compiler
+from ._internal.pytorch_reference import (
+    append_paged_kv_cache_reference,
+    attention_reference,
+    rope_reference,
+)
 
 # Detect hardware capabilities
 IS_MACOS = platform.system() == "Darwin"
 IS_APPLE_SILICON = IS_MACOS and platform.processor() == "arm"
 
 # Check if PyTorch-only mode is enabled
-PYTORCH_MODE = os.environ.get('PIE_METAL_PYTORCH_MODE', '0') == '1'
-
-# Global MPS shader compiler instance (initialized lazily)
-_mps_compiler = None
-_mps_available = False
+PYTORCH_MODE = os.environ.get("PIE_METAL_PYTORCH_MODE", "0") == "1"
 
 
 def _validate_mps_device(tensor: torch.Tensor, name: str) -> None:
@@ -40,7 +44,7 @@ def _validate_mps_device(tensor: torch.Tensor, name: str) -> None:
     if PYTORCH_MODE:
         return
 
-    if tensor.device.type != 'mps':
+    if tensor.device.type != "mps":
         raise RuntimeError(
             f"metal_kernels requires all tensors to be on MPS device. "
             f"Tensor '{name}' is on {tensor.device}. "
@@ -52,14 +56,11 @@ def _validate_mps_device(tensor: torch.Tensor, name: str) -> None:
 
 def _initialize_mps_backend() -> bool:
     """Initialize MPS shader backend - returns success status"""
-    global _mps_compiler, _mps_available
-
     # If PyTorch mode is enabled, skip Metal initialization
     if PYTORCH_MODE:
         print("⚠️  PIE_METAL_PYTORCH_MODE=1: Using PyTorch reference implementations")
         print("   Metal kernels disabled - operations will use pure PyTorch")
         print("   This mode is for testing/debugging only and will be slower")
-        _mps_available = False
         return True  # Return True to allow initialization to proceed
 
     if not IS_APPLE_SILICON:
@@ -77,32 +78,30 @@ def _initialize_mps_backend() -> bool:
 
     # Validate MPS device can be created
     try:
-        test_tensor = torch.tensor([1.0], device='mps')
+        test_tensor = torch.tensor([1.0], device="mps")
         del test_tensor
-    except Exception as e:
+    except (RuntimeError, OSError) as e:
         print(f"❌ Cannot create tensors on MPS device: {e}")
         print("   Please check your PyTorch MPS installation")
         sys.exit(1)
 
     # Set default device to MPS for all PyTorch operations
-    torch.set_default_device('mps')
+    torch.set_default_device("mps")
     print("✅ Set default PyTorch device to 'mps'")
     print("   All tensors will be created on MPS device by default")
 
     try:
-        # Try MPS shader approach first (preferred)
-        from ._internal.mps_shader_integration import get_mps_compiler
-        _mps_compiler = get_mps_compiler()
-        _mps_available = _mps_compiler.can_use_mps_kernels()
-
-        if _mps_available:
+        # Initialize MPS shader compiler (singleton)
+        compiler = get_mps_compiler()
+        if compiler.can_use_mps_kernels():
             print("✅ metal_kernels initialized with PyTorch MPS shader compilation")
-            print(f"   Available shader libraries: {list(_mps_compiler.compiled_libraries.keys())}")
+            print(
+                f"   Available shader libraries: {list(compiler.compiled_libraries.keys())}"
+            )
             return True
-        else:
-            print("❌ MPS shader compilation not available")
+        print("❌ MPS shader compilation not available")
 
-    except Exception as e:
+    except (RuntimeError, ImportError, AttributeError) as e:
         print(f"❌ MPS shader initialization failed: {e}")
 
     # MPS initialization failed
@@ -111,15 +110,11 @@ def _initialize_mps_backend() -> bool:
     print("   1. You have PyTorch 2.0+ with MPS support")
     print("   2. Xcode Command Line Tools are installed")
     print("   3. Your system supports Metal compute")
-    print("\n   Install FlashInfer as an alternative:")
-    print("   pip install flashinfer")
     sys.exit(1)
 
 
 # Initialize on import
-_backend_available = _initialize_mps_backend()
-
-
+_initialize_mps_backend()
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
@@ -144,18 +139,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._is_planned = False
         self._pytorch_mode = PYTORCH_MODE
 
-    def plan(self,
-             qo_indptr: torch.Tensor,
-             paged_kv_indptr: torch.Tensor,
-             paged_kv_indices: torch.Tensor,
-             paged_kv_last_page_len: torch.Tensor,
-             num_qo_heads: int,
-             num_kv_heads: int,
-             head_dim_qk: int,
-             page_size: int,
-             pos_encoding_mode: str = "NONE",
-             custom_mask: Optional[torch.Tensor] = None,
-             q_data_type: torch.dtype = torch.float16) -> None:
+    def plan(
+        self,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        page_size: int,
+        pos_encoding_mode: str = "NONE",  # pylint: disable=unused-argument
+        custom_mask: Optional[torch.Tensor] = None,
+        q_data_type: torch.dtype = torch.float16,
+    ) -> None:
         """
         Plan the prefill attention operation
 
@@ -183,16 +180,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
             _validate_mps_device(custom_mask, "custom_mask")
 
         self._planned_params = {
-            'qo_indptr': qo_indptr,
-            'kv_page_indptr': paged_kv_indptr,
-            'kv_page_indices': paged_kv_indices,
-            'kv_last_page_lens': paged_kv_last_page_len,
-            'num_query_heads': num_qo_heads,
-            'num_kv_heads': num_kv_heads,
-            'head_size': head_dim_qk,
-            'page_size': page_size,
-            'custom_mask': custom_mask,
-            'q_data_type': q_data_type,
+            "qo_indptr": qo_indptr,
+            "kv_page_indptr": paged_kv_indptr,
+            "kv_page_indices": paged_kv_indices,
+            "kv_last_page_lens": paged_kv_last_page_len,
+            "num_query_heads": num_qo_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_size": head_dim_qk,
+            "page_size": page_size,
+            "custom_mask": custom_mask,
+            "q_data_type": q_data_type,
         }
         self._is_planned = True
 
@@ -222,28 +219,24 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         # If PyTorch mode is enabled, use PyTorch reference implementation
         if self._pytorch_mode:
-            from ._internal.pytorch_reference import attention_reference
             return attention_reference(
                 query=query,
                 kv_cache=kv_cache,
-                kv_page_indices=self._planned_params['kv_page_indices'],
-                kv_page_indptr=self._planned_params['kv_page_indptr'],
-                kv_last_page_lens=self._planned_params['kv_last_page_lens'],
-                qo_indptr=self._planned_params['qo_indptr'],
-                custom_mask=self._planned_params['custom_mask']
+                kv_page_indices=self._planned_params["kv_page_indices"],
+                kv_page_indptr=self._planned_params["kv_page_indptr"],
+                kv_last_page_lens=self._planned_params["kv_last_page_lens"],
+                qo_indptr=self._planned_params["qo_indptr"],
+                custom_mask=self._planned_params["custom_mask"],
             )
 
-        if not _mps_available or _mps_compiler is None:
-            raise RuntimeError("MPS backend not initialized - metal_kernels requires MPS support")
-
-        return _mps_compiler.run_attention_mps(
+        return get_mps_compiler().run_attention_mps(
             query=query,
             kv_cache=kv_cache,
-            kv_page_indices=self._planned_params['kv_page_indices'],
-            kv_page_indptr=self._planned_params['kv_page_indptr'],
-            kv_last_page_lens=self._planned_params['kv_last_page_lens'],
-            qo_indptr=self._planned_params['qo_indptr'],
-            custom_mask=self._planned_params['custom_mask'],
+            kv_page_indices=self._planned_params["kv_page_indices"],
+            kv_page_indptr=self._planned_params["kv_page_indptr"],
+            kv_last_page_lens=self._planned_params["kv_last_page_lens"],
+            qo_indptr=self._planned_params["qo_indptr"],
+            custom_mask=self._planned_params["custom_mask"],
         )
 
 
@@ -262,16 +255,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._is_planned = False
         self._pytorch_mode = PYTORCH_MODE
 
-    def plan(self,
-             indptr: torch.Tensor,
-             indices: torch.Tensor,
-             last_page_len: torch.Tensor,
-             num_qo_heads: int,
-             num_kv_heads: int,
-             head_dim: int,
-             page_size: int,
-             pos_encoding_mode: str = "NONE",
-             q_data_type: torch.dtype = torch.float16) -> None:
+    def plan(
+        self,
+        indptr: torch.Tensor,
+        indices: torch.Tensor,
+        last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        pos_encoding_mode: str = "NONE",  # pylint: disable=unused-argument
+        q_data_type: torch.dtype = torch.float16,
+    ) -> None:
         """Plan decode operation - simpler than prefill (single token per sequence)"""
         # Validate all input tensors are on MPS device
         _validate_mps_device(indptr, "indptr")
@@ -279,14 +274,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _validate_mps_device(last_page_len, "last_page_len")
 
         self._planned_params = {
-            'kv_page_indptr': indptr,
-            'kv_page_indices': indices,
-            'kv_last_page_lens': last_page_len,
-            'num_query_heads': num_qo_heads,
-            'num_kv_heads': num_kv_heads,
-            'head_size': head_dim,
-            'page_size': page_size,
-            'q_data_type': q_data_type,
+            "kv_page_indptr": indptr,
+            "kv_page_indices": indices,
+            "kv_last_page_lens": last_page_len,
+            "num_query_heads": num_qo_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_size": head_dim,
+            "page_size": page_size,
+            "q_data_type": q_data_type,
         }
         self._is_planned = True
 
@@ -302,31 +297,27 @@ class BatchDecodeWithPagedKVCacheWrapper:
         # For decode, we have one token per batch element
         assert self._planned_params is not None, "plan() must be called before run()"
 
-        batch_size = self._planned_params['kv_page_indptr'].shape[0] - 1
+        batch_size = self._planned_params["kv_page_indptr"].shape[0] - 1
         qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=query.device)
 
         # If PyTorch mode is enabled, use PyTorch reference implementation
         if self._pytorch_mode:
-            from ._internal.pytorch_reference import attention_reference
             return attention_reference(
                 query=query,
                 kv_cache=kv_cache,
-                kv_page_indices=self._planned_params['kv_page_indices'],
-                kv_page_indptr=self._planned_params['kv_page_indptr'],
-                kv_last_page_lens=self._planned_params['kv_last_page_lens'],
+                kv_page_indices=self._planned_params["kv_page_indices"],
+                kv_page_indptr=self._planned_params["kv_page_indptr"],
+                kv_last_page_lens=self._planned_params["kv_last_page_lens"],
                 qo_indptr=qo_indptr,
-                custom_mask=None
+                custom_mask=None,
             )
 
-        if not _mps_available or _mps_compiler is None:
-            raise RuntimeError("MPS backend not initialized - metal_kernels requires MPS support")
-
-        return _mps_compiler.run_attention_mps(
+        return get_mps_compiler().run_attention_mps(
             query=query,
             kv_cache=kv_cache,
-            kv_page_indices=self._planned_params['kv_page_indices'],
-            kv_page_indptr=self._planned_params['kv_page_indptr'],
-            kv_last_page_lens=self._planned_params['kv_last_page_lens'],
+            kv_page_indices=self._planned_params["kv_page_indices"],
+            kv_page_indptr=self._planned_params["kv_page_indptr"],
+            kv_last_page_lens=self._planned_params["kv_last_page_lens"],
             qo_indptr=qo_indptr,
             custom_mask=None,
         )
@@ -390,33 +381,30 @@ def apply_llama31_rope_pos_ids_inplace(
 
     # If PyTorch mode is enabled, use PyTorch reference implementation
     if PYTORCH_MODE:
-        from ._internal.pytorch_reference import rope_reference
         # Apply RoPE in-place with LLaMA 3.1-style wavelength-based scaling
         rope_reference(
-            q, pos_ids,
+            q,
+            pos_ids,
             rope_theta=rope_theta,
             rope_factor=rope_scale,
             interleaved=interleave,
             inplace=True,
             low_freq_factor=low_freq_factor,
             high_freq_factor=high_freq_factor,
-            old_context_len=old_context_len
+            old_context_len=old_context_len,
         )
         rope_reference(
-            k, pos_ids,
+            k,
+            pos_ids,
             rope_theta=rope_theta,
             rope_factor=rope_scale,
             interleaved=interleave,
             inplace=True,
             low_freq_factor=low_freq_factor,
             high_freq_factor=high_freq_factor,
-            old_context_len=old_context_len
+            old_context_len=old_context_len,
         )
         return
-
-    # Verify Metal kernels are available
-    if not _mps_available or _mps_compiler is None or 'rope' not in _mps_compiler.compiled_libraries:
-        raise RuntimeError("Metal RoPE kernels not available. metal_kernels requires MPS support.")
 
     # Validate all tensors are on MPS device
     _validate_mps_device(q, "q")
@@ -424,17 +412,20 @@ def apply_llama31_rope_pos_ids_inplace(
     _validate_mps_device(pos_ids, "pos_ids")
 
     # Apply RoPE to both query and key tensors using Metal kernels
-    _mps_compiler.run_rope_mps(
-        q, pos_ids,
+    compiler = get_mps_compiler()
+    compiler.run_rope_mps(
+        q,
+        pos_ids,
         rope_theta=rope_theta,
         rope_factor=rope_scale,
-        interleaved=interleave
+        interleaved=interleave,
     )
-    _mps_compiler.run_rope_mps(
-        k, pos_ids,
+    compiler.run_rope_mps(
+        k,
+        pos_ids,
         rope_theta=rope_theta,
         rope_factor=rope_scale,
-        interleaved=interleave
+        interleaved=interleave,
     )
 
 
@@ -447,7 +438,7 @@ def append_paged_kv_cache(
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_last_page_len: torch.Tensor,
-    kv_layout: str = "NHD"
+    kv_layout: str = "NHD",  # pylint: disable=unused-argument
 ) -> None:
     """
     Append key-value states to paged KV cache using Metal kernels
@@ -475,11 +466,11 @@ def append_paged_kv_cache(
 
     # If PyTorch mode is enabled, use PyTorch reference implementation
     if PYTORCH_MODE:
-        from ._internal.pytorch_reference import append_paged_kv_cache_reference
         # Extract dimensions
         num_tokens, num_kv_heads, head_dim = append_key.shape
 
-        # Flatten key/value inputs: [num_tokens, num_kv_heads, head_dim] -> [num_tokens, num_kv_heads * head_dim]
+        # Flatten key/value inputs:
+        # [num_tokens, num_kv_heads, head_dim] -> [num_tokens, num_kv_heads * head_dim]
         append_key_flat = append_key.reshape(num_tokens, num_kv_heads * head_dim)
         append_value_flat = append_value.reshape(num_tokens, num_kv_heads * head_dim)
 
@@ -494,34 +485,42 @@ def append_paged_kv_cache(
         )
 
         append_paged_kv_cache_reference(
-            append_key_flat, append_value_flat, paged_k, paged_v,
-            batch_indices, positions, kv_indices, kv_indptr, kv_last_page_len,
-            num_kv_heads=num_kv_heads, head_size=head_dim
+            append_key_flat,
+            append_value_flat,
+            paged_k,
+            paged_v,
+            batch_indices,
+            positions,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            _num_kv_heads=num_kv_heads,
+            _head_size=head_dim,
         )
         return
 
     # Import profiler for detailed timing
-    try:
-        from profiler import start_profile
-    except ImportError:
-        from contextlib import nullcontext
-        def start_profile(name):
-            return nullcontext()
+    from profiler import start_profile  # pylint: disable=import-outside-toplevel
 
     try:
         # Try to use Metal append_kv_cache kernel via MPSShaderCompiler
-        from ._internal.mps_shader_integration import get_mps_compiler
-
         compiler = get_mps_compiler()
-        if compiler.can_use_mps_kernels() and 'append_kv_cache' in compiler.compiled_libraries:
+        if (
+            compiler.can_use_mps_kernels()
+            and "append_kv_cache" in compiler.compiled_libraries
+        ):
             with start_profile("append_kv_input_reshape"):
                 # Extract dimensions
                 num_tokens, num_kv_heads, head_dim = append_key.shape
 
                 # Reshape inputs for Metal kernel
                 # Metal expects [num_tokens, num_kv_heads * head_dim] for key/value
-                k_flat = append_key.contiguous().reshape(num_tokens, num_kv_heads * head_dim)
-                v_flat = append_value.contiguous().reshape(num_tokens, num_kv_heads * head_dim)
+                k_flat = append_key.contiguous().reshape(
+                    num_tokens, num_kv_heads * head_dim
+                )
+                v_flat = append_value.contiguous().reshape(
+                    num_tokens, num_kv_heads * head_dim
+                )
 
             # OPTIMIZATION: Pass unified KV cache buffer (same as attention kernel)
             # Layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
@@ -529,7 +528,7 @@ def append_paged_kv_cache(
             # Kernel will handle interleaved K/V with proper offset calculations
 
             # Extract shape info BEFORE flattening (needed by compiler)
-            num_pages, _, page_size, _, _ = paged_kv_cache.shape
+            _num_pages, _, page_size, _, _ = paged_kv_cache.shape
 
             with start_profile("append_kv_prepare_unified"):
                 # Flatten entire unified cache (no copy - just a view!)
@@ -537,11 +536,17 @@ def append_paged_kv_cache(
 
             with start_profile("append_kv_metal_kernel"):
                 compiler.run_append_paged_kv_cache_mps(
-                    k_flat, v_flat, paged_kv_unified,
-                    batch_indices, positions, kv_indices, kv_indptr, kv_last_page_len,
+                    k_flat,
+                    v_flat,
+                    paged_kv_unified,
+                    batch_indices,
+                    positions,
+                    kv_indices,
+                    kv_indptr,
+                    kv_last_page_len,
                     num_kv_heads=num_kv_heads,
                     head_size=head_dim,
-                    page_size=page_size
+                    page_size=page_size,
                 )
 
             # No copy needed! Kernel wrote directly to unified cache with proper offsets
@@ -559,9 +564,7 @@ def append_paged_kv_cache(
 
 
 def get_seq_lens(
-    kv_page_indptr: torch.Tensor,
-    kv_last_page_lens: torch.Tensor,
-    page_size: int
+    kv_page_indptr: torch.Tensor, kv_last_page_lens: torch.Tensor, page_size: int
 ) -> torch.Tensor:
     """Calculate sequence lengths from paging metadata"""
     # Validate input tensors are on MPS device
@@ -580,9 +583,7 @@ def get_seq_lens(
 
 
 def get_batch_indices_positions(
-    append_indptr: torch.Tensor,
-    seq_lens: torch.Tensor,
-    nnz: int
+    append_indptr: torch.Tensor, seq_lens: torch.Tensor, nnz: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Get batch indices and positions for tokens"""
     # Validate input tensors are on MPS device
@@ -613,21 +614,20 @@ def get_batch_indices_positions(
         pos_end = seq_len
 
         positions[start_idx:end_idx] = torch.arange(
-            pos_start,
-            pos_end,
-            dtype=torch.int32,
-            device=device
+            pos_start, pos_end, dtype=torch.int32, device=device
         )
 
     return batch_indices, positions
 
 
 # Optional: Basic sampling operations for completeness
-class image:
+class image:  # pylint: disable=invalid-name
     """Image operations namespace (FlashInfer API compatibility)"""
 
     @staticmethod
-    def decode_image(image_blob: bytes, dtype: torch.dtype, device: str) -> torch.Tensor:
+    def decode_image(
+        image_blob: bytes, dtype: torch.dtype, device: str
+    ) -> torch.Tensor:
         """Decode image from bytes to tensor - not yet implemented for Metal."""
         raise NotImplementedError(
             "Image decoding not yet implemented in metal_kernels. "
@@ -635,7 +635,7 @@ class image:
         )
 
 
-class sampling:
+class sampling:  # pylint: disable=invalid-name
     """Sampling operations namespace (basic PyTorch implementations)"""
 
     @staticmethod
@@ -644,7 +644,9 @@ class sampling:
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     @staticmethod
-    def top_p_sampling_from_probs(probs: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
+    def top_p_sampling_from_probs(
+        probs: torch.Tensor, top_p: torch.Tensor
+    ) -> torch.Tensor:
         """Top-p (nucleus) sampling from probability distribution"""
         # Simple implementation - can be enhanced
         sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
@@ -661,10 +663,14 @@ class sampling:
         sampled_sorted_idx = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
 
         # Map back to original token indices
-        return torch.gather(sorted_indices, -1, sampled_sorted_idx.unsqueeze(-1)).squeeze(-1)
+        return torch.gather(
+            sorted_indices, -1, sampled_sorted_idx.unsqueeze(-1)
+        ).squeeze(-1)
 
     @staticmethod
-    def top_k_sampling_from_probs(probs: torch.Tensor, top_k: torch.Tensor) -> torch.Tensor:
+    def top_k_sampling_from_probs(
+        probs: torch.Tensor, top_k: torch.Tensor
+    ) -> torch.Tensor:
         """Top-k sampling - not yet implemented for Metal."""
         raise NotImplementedError(
             "top_k_sampling not yet implemented in metal_kernels. "
@@ -672,7 +678,9 @@ class sampling:
         )
 
     @staticmethod
-    def min_p_sampling_from_probs(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
+    def min_p_sampling_from_probs(
+        probs: torch.Tensor, min_p: torch.Tensor
+    ) -> torch.Tensor:
         """Min-p sampling - not yet implemented for Metal."""
         raise NotImplementedError(
             "min_p_sampling not yet implemented in metal_kernels. "

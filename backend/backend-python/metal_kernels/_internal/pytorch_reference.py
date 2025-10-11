@@ -6,9 +6,11 @@ They use only PyTorch native operations and are designed to match the exact sema
 of the Metal kernels.
 """
 
-import torch
+import math
+import os
 from typing import Optional
-import torch.nn.functional as F
+
+import torch
 
 
 def rope_reference(
@@ -47,16 +49,21 @@ def rope_reference(
     Returns:
         Output tensor with RoPE applied (same shape as input_qk)
     """
-    # Support both 3D [num_tokens, num_heads, head_size] and 4D [batch, num_tokens, num_heads, head_size]
+    # Support both 3D [num_tokens, num_heads, head_size] and
+    # 4D [batch, num_tokens, num_heads, head_size]
     if input_qk.ndim == 3:
         # 3D input: single sequence
         num_tokens, num_heads, head_size = input_qk.shape
-        batch_size = None
+        _batch_size = None  # pylint: disable=unused-variable
     elif input_qk.ndim == 4:
         # 4D input: batched sequences
-        batch_size, num_tokens, num_heads, head_size = input_qk.shape
+        _batch_size, num_tokens, num_heads, head_size = (
+            input_qk.shape
+        )  # pylint: disable=unused-variable
     else:
-        raise ValueError(f"input_qk must be 3D or 4D, got {input_qk.ndim}D tensor with shape {input_qk.shape}")
+        raise ValueError(
+            f"input_qk must be 3D or 4D, got {input_qk.ndim}D tensor with shape {input_qk.shape}"
+        )
 
     device = input_qk.device
     dtype = input_qk.dtype
@@ -71,7 +78,6 @@ def rope_reference(
 
     # Apply LLaMA 3.1-style wavelength-based selective scaling
     # Following HuggingFace's exact implementation
-    import math
 
     # Compute wavelengths for each frequency
     wavelen = 2 * math.pi / inv_freq_base
@@ -86,11 +92,17 @@ def rope_reference(
     # otherwise: smooth interpolation
 
     # Start with low-frequency scaling (divide by factor for long wavelengths)
-    inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq_base / rope_factor, inv_freq_base)
+    inv_freq_llama = torch.where(
+        wavelen > low_freq_wavelen, inv_freq_base / rope_factor, inv_freq_base
+    )
 
     # Apply smooth interpolation for medium frequencies
-    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / rope_factor + smooth_factor * inv_freq_llama
+    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
+        high_freq_factor - low_freq_factor
+    )
+    smoothed_inv_freq = (
+        1 - smooth_factor
+    ) * inv_freq_llama / rope_factor + smooth_factor * inv_freq_llama
 
     # Determine which frequencies are in the medium range
     is_medium_freq = ~(wavelen < high_freq_wavelen) & ~(wavelen > low_freq_wavelen)
@@ -112,26 +124,38 @@ def rope_reference(
     cos_freqs = torch.cos(freqs)  # [num_tokens, head_size // 2]
     sin_freqs = torch.sin(freqs)  # [num_tokens, head_size // 2]
 
-    # For non-interleaved layout (HuggingFace style), we need to concatenate freqs with itself
-    # HuggingFace does: torch.cat((freqs, freqs), dim=-1) to get [f0, f1, ..., f31, f0, f1, ..., f31]
+    # For non-interleaved layout (HuggingFace style), concatenate freqs
+    # torch.cat((freqs, freqs), dim=-1) gives [f0, f1, ..., f31, f0, f1, ..., f31]
     # NOT repeat_interleave which would give [f0, f0, f1, f1, ...]
     if not interleaved:
-        import os
-        if os.environ.get('DEBUG_ROPE'):
-            print(f"    [rope_reference] Using NON-INTERLEAVED mode with concatenation")
+        if os.environ.get("DEBUG_ROPE"):
+            print("    [rope_reference] Using NON-INTERLEAVED mode with concatenation")
 
         # Concatenate freqs with itself: [c0, c1, c2, ...] -> [c0, c1, c2, ..., c0, c1, c2, ...]
         # cos/sin_freqs shape: [num_tokens, head_size//2] or [batch, num_tokens, head_size//2]
         last_dim = -1
-        cos_expanded = torch.cat([cos_freqs, cos_freqs], dim=last_dim)  # [..., num_tokens, head_size]
-        sin_expanded = torch.cat([sin_freqs, sin_freqs], dim=last_dim)  # [..., num_tokens, head_size]
+        cos_expanded = torch.cat(
+            [cos_freqs, cos_freqs], dim=last_dim
+        )  # [..., num_tokens, head_size]
+        sin_expanded = torch.cat(
+            [sin_freqs, sin_freqs], dim=last_dim
+        )  # [..., num_tokens, head_size]
 
-        # Apply rotation using vectorized operations (supports both 3D and 4D inputs)
-        # output shape: [num_tokens, num_heads, head_size] or [batch, num_tokens, num_heads, head_size]
+        # Apply rotation using vectorized operations
+        # (supports both 3D and 4D inputs)
+        # output shape: [num_tokens, num_heads, head_size]
+        # or [batch, num_tokens, num_heads, head_size]
+
+        # Initialize variables to satisfy type checker
+        first_half = None
+        second_half = None
+        cos_t = None
+        sin_t = None
+
         if input_qk.ndim == 3:
             # 3D: [num_tokens, num_heads, head_size]
-            first_half = output[:, :, :head_size//2]
-            second_half = output[:, :, head_size//2:]
+            first_half = output[:, :, : head_size // 2]
+            second_half = output[:, :, head_size // 2 :]
 
             # Broadcast cos/sin: [num_tokens, head_size] -> [num_tokens, 1, head_size]
             cos_t = cos_expanded.unsqueeze(1)  # [num_tokens, 1, head_size]
@@ -139,8 +163,8 @@ def rope_reference(
 
         elif input_qk.ndim == 4:
             # 4D: [batch, num_tokens, num_heads, head_size]
-            first_half = output[:, :, :, :head_size//2]
-            second_half = output[:, :, :, head_size//2:]
+            first_half = output[:, :, :, : head_size // 2]
+            second_half = output[:, :, :, head_size // 2 :]
 
             # Broadcast cos/sin
             # If position_ids is 1D, cos_expanded is [num_tokens, head_size]
@@ -159,27 +183,31 @@ def rope_reference(
         # After repeat_interleave, cos_t and sin_t are full head_size with repeated values
         # We apply the SAME cos/sin to both halves (not split them!)
 
+        # Type assertion for variables set in if/elif above
+        assert first_half is not None and second_half is not None
+        assert cos_t is not None and sin_t is not None
+
         first_half_float = first_half.float()
         second_half_float = second_half.float()
 
         # HuggingFace formula:
         # first_half_new = first_half * cos - second_half * sin
         # second_half_new = second_half * cos + first_half * sin
-        cos_first = cos_t[..., :head_size//2]
-        cos_second = cos_t[..., head_size//2:]
-        sin_first = sin_t[..., :head_size//2]
-        sin_second = sin_t[..., head_size//2:]
+        cos_first = cos_t[..., : head_size // 2]
+        cos_second = cos_t[..., head_size // 2 :]
+        sin_first = sin_t[..., : head_size // 2]
+        sin_second = sin_t[..., head_size // 2 :]
 
         new_first_half = first_half_float * cos_first - second_half_float * sin_first
         new_second_half = second_half_float * cos_second + first_half_float * sin_second
 
         # Write back with original dtype
         if input_qk.ndim == 3:
-            output[:, :, :head_size//2] = new_first_half.to(dtype)
-            output[:, :, head_size//2:] = new_second_half.to(dtype)
+            output[:, :, : head_size // 2] = new_first_half.to(dtype)
+            output[:, :, head_size // 2 :] = new_second_half.to(dtype)
         else:  # 4D
-            output[:, :, :, :head_size//2] = new_first_half.to(dtype)
-            output[:, :, :, head_size//2:] = new_second_half.to(dtype)
+            output[:, :, :, : head_size // 2] = new_first_half.to(dtype)
+            output[:, :, :, head_size // 2 :] = new_second_half.to(dtype)
     else:
         # Interleaved layout: process pairs
         for token_idx in range(num_tokens):
@@ -216,9 +244,9 @@ def append_paged_kv_cache_reference(
     kv_positions: torch.Tensor,
     kv_page_indices: torch.Tensor,
     kv_page_indptr: torch.Tensor,
-    kv_last_page_lens: torch.Tensor,
-    num_kv_heads: int,
-    head_size: int
+    _kv_last_page_lens: torch.Tensor,
+    _num_kv_heads: int,
+    _head_size: int,
 ) -> None:
     """
     PyTorch reference implementation of append_paged_kv_cache.
@@ -243,16 +271,18 @@ def append_paged_kv_cache_reference(
 
     # Process each token
     for token_idx in range(num_tokens):
-        batch_idx = kv_batch_indices[token_idx].item()
-        position = kv_positions[token_idx].item()
+        batch_idx = int(kv_batch_indices[token_idx].item())
+        position = int(kv_positions[token_idx].item())
 
         # Calculate which page and offset within page
         page_idx_within_batch = position // page_size
         offset_in_page = position % page_size
 
         # Get the global page index
-        page_start = kv_page_indptr[batch_idx].item()
-        global_page_idx = kv_page_indices[page_start + page_idx_within_batch].item()
+        page_start = int(kv_page_indptr[batch_idx].item())
+        global_page_idx = int(
+            kv_page_indices[page_start + page_idx_within_batch].item()
+        )
 
         # Copy K and V values to cache
         # Input: [num_tokens, num_kv_heads * head_size]
@@ -268,7 +298,7 @@ def attention_reference(
     kv_page_indptr: torch.Tensor,
     kv_last_page_lens: torch.Tensor,
     qo_indptr: torch.Tensor,
-    custom_mask: Optional[torch.Tensor] = None
+    custom_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     PyTorch reference implementation of paged attention.
@@ -288,13 +318,18 @@ def attention_reference(
         Output tensor [num_tokens, num_heads * head_dim] (flattened for FlashInfer compatibility)
     """
     num_tokens, num_heads, head_dim = query.shape
-    num_pages, _, page_size, num_kv_heads, _ = kv_cache.shape
-    batch_size = qo_indptr.shape[0] - 1
+    _num_pages, _, page_size, num_kv_heads, _ = (
+        kv_cache.shape
+    )  # pylint: disable=unused-variable
+    # Explicitly cast to int for type checker
+    page_size = int(page_size)
+    num_kv_heads = int(num_kv_heads)
+    batch_size = int(qo_indptr.shape[0] - 1)
     device = query.device
     dtype = query.dtype
 
     # Scale for attention
-    scale = 1.0 / (head_dim ** 0.5)
+    scale = 1.0 / (head_dim**0.5)
 
     # Output buffer
     output = torch.zeros(num_tokens, num_heads, head_dim, device=device, dtype=dtype)
@@ -302,18 +337,18 @@ def attention_reference(
     # Process each batch separately
     for batch_idx in range(batch_size):
         # Get query range for this batch
-        q_start = qo_indptr[batch_idx].item()
-        q_end = qo_indptr[batch_idx + 1].item()
+        q_start = int(qo_indptr[batch_idx].item())
+        q_end = int(qo_indptr[batch_idx + 1].item())
         num_queries = q_end - q_start
 
         if num_queries == 0:
             continue
 
         # Get KV page range for this batch
-        kv_page_start = kv_page_indptr[batch_idx].item()
-        kv_page_end = kv_page_indptr[batch_idx + 1].item()
+        kv_page_start = int(kv_page_indptr[batch_idx].item())
+        kv_page_end = int(kv_page_indptr[batch_idx + 1].item())
         num_kv_pages = kv_page_end - kv_page_start
-        last_page_len = kv_last_page_lens[batch_idx].item()
+        last_page_len = int(kv_last_page_lens[batch_idx].item())
 
         # Compute total KV sequence length
         if num_kv_pages == 0:
@@ -327,8 +362,10 @@ def attention_reference(
         v_pages = []
 
         for page_offset in range(num_kv_pages):
-            global_page_idx = kv_page_indices[kv_page_start + page_offset].item()
-            k_page = kv_cache[global_page_idx, 0, :, :, :]  # [page_size, num_kv_heads, head_dim]
+            global_page_idx = int(kv_page_indices[kv_page_start + page_offset].item())
+            k_page = kv_cache[
+                global_page_idx, 0, :, :, :
+            ]  # [page_size, num_kv_heads, head_dim]
             v_page = kv_cache[global_page_idx, 1, :, :, :]
             k_pages.append(k_page)
             v_pages.append(v_page)
@@ -348,17 +385,25 @@ def attention_reference(
         if num_kv_heads != num_heads:
             # Repeat KV heads to match query heads
             head_repeat = num_heads // num_kv_heads
-            k_flat = k_flat.repeat_interleave(head_repeat, dim=1)  # [kv_seq_len, num_heads, head_dim]
+            k_flat = k_flat.repeat_interleave(
+                head_repeat, dim=1
+            )  # [kv_seq_len, num_heads, head_dim]
             v_flat = v_flat.repeat_interleave(head_repeat, dim=1)
 
         # Compute attention scores: Q @ K^T
         # Q: [num_queries, num_heads, head_dim]
         # K: [kv_seq_len, num_heads, head_dim]
         # Scores: [num_queries, num_heads, kv_seq_len]
-        q_batch_transposed = q_batch.transpose(0, 1)  # [num_heads, num_queries, head_dim]
-        k_transposed = k_flat.transpose(0, 1).transpose(1, 2)  # [num_heads, head_dim, kv_seq_len]
+        q_batch_transposed = q_batch.transpose(
+            0, 1
+        )  # [num_heads, num_queries, head_dim]
+        k_transposed = k_flat.transpose(0, 1).transpose(
+            1, 2
+        )  # [num_heads, head_dim, kv_seq_len]
 
-        scores = torch.bmm(q_batch_transposed, k_transposed) * scale  # [num_heads, num_queries, kv_seq_len]
+        scores = (
+            torch.bmm(q_batch_transposed, k_transposed) * scale
+        )  # [num_heads, num_queries, kv_seq_len]
 
         scores = scores.transpose(0, 1)  # [num_queries, num_heads, kv_seq_len]
 
@@ -366,11 +411,14 @@ def attention_reference(
         # Each query at position i can attend to KV positions [0, i]
         # The queries start at position (kv_seq_len - num_queries)
         #
-        # For prefill: queries are being added, so query i is at absolute position (kv_seq_len - num_queries + i)
-        # For decode: typically num_queries=1, query is at position (kv_seq_len - 1)
+        # For prefill: queries are being added, so query i is at absolute
+        # position (kv_seq_len - num_queries + i)
+        # For decode: typically num_queries=1, query is at position
+        # (kv_seq_len - 1)
         #
         # Causal mask: upper triangular with diagonal such that:
-        #   query i (at absolute pos k = kv_seq_len - num_queries + i) can see KV [0..k]
+        #   query i (at absolute pos k = kv_seq_len - num_queries + i)
+        #   can see KV [0..k]
         #   This means masking KV positions [k+1..kv_seq_len-1]
         #   In the [num_queries x kv_seq_len] matrix, this is positions [i+1..kv_seq_len-1] in row i
         #   But we need to account for the query's absolute position
@@ -378,9 +426,11 @@ def attention_reference(
         # Actually, simpler approach:
         # Query i is at absolute position (kv_seq_len - num_queries + i)
         # It can attend to all positions up to and including its own position
-        # So we want to mask everything AFTER position (kv_seq_len - num_queries + i)
+        # So we want to mask everything AFTER position
+        # (kv_seq_len - num_queries + i)
         #
-        # For a standard causal mask: torch.triu(ones, diagonal=1) masks upper triangle excluding diagonal
+        # For a standard causal mask: torch.triu(ones, diagonal=1)
+        # masks upper triangle excluding diagonal
         # We want: torch.triu(ones, diagonal=kv_seq_len - num_queries + 1)
         # Wait, that's what we had... let me recalculate
         #
@@ -419,7 +469,7 @@ def attention_reference(
 
         causal_mask = torch.triu(
             torch.ones(num_queries, kv_seq_len, device=device, dtype=torch.bool),
-            diagonal=kv_seq_len - num_queries + 1
+            diagonal=kv_seq_len - num_queries + 1,
         )
 
         # Apply custom_mask if provided
@@ -433,9 +483,13 @@ def attention_reference(
                 expected_size = num_queries * kv_seq_len
                 if custom_mask.numel() >= expected_size:
                     # Extract the portion for this batch and reshape
-                    mask_start = q_start * kv_seq_len  # Approximate - may need adjustment
+                    mask_start = (
+                        q_start * kv_seq_len
+                    )  # Approximate - may need adjustment
                     mask_end = mask_start + expected_size
-                    batch_custom_mask = custom_mask[mask_start:mask_end].reshape(num_queries, kv_seq_len)
+                    batch_custom_mask = custom_mask[mask_start:mask_end].reshape(
+                        num_queries, kv_seq_len
+                    )
                     # Combine with causal mask (logical OR: mask if EITHER says to mask)
                     causal_mask = causal_mask | batch_custom_mask
             else:
@@ -445,9 +499,11 @@ def attention_reference(
                 causal_mask = causal_mask | batch_custom_mask
 
         # Try using PyTorch's native scaled_dot_product_attention for better MPS support
-        use_native_sdpa = os.environ.get('PIE_METAL_USE_NATIVE_SDPA', '0') == '1'
+        use_native_sdpa = os.environ.get("PIE_METAL_USE_NATIVE_SDPA", "0") == "1"
 
-        if use_native_sdpa and hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+        if use_native_sdpa and hasattr(
+            torch.nn.functional, "scaled_dot_product_attention"
+        ):
             # Prepare inputs for native SDPA: (batch, heads, seq, dim)
             # We have: q_batch_transposed [heads, queries, dim], k_transposed [heads, dim, kv_seq]
             q_sdpa = q_batch_transposed  # [heads, queries, dim]
@@ -459,14 +515,19 @@ def attention_reference(
             attn_mask = ~causal_mask if num_queries > 1 else None
 
             # Call native SDPA
+            # pylint: disable=not-callable  # Function existence checked by hasattr above
             attn_output_transposed = torch.nn.functional.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa,
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
                 attn_mask=attn_mask,
                 dropout_p=0.0,
-                is_causal=(attn_mask is None and num_queries > 1)
+                is_causal=(attn_mask is None and num_queries > 1),
             )  # [heads, queries, dim]
 
-            attn_output = attn_output_transposed.transpose(0, 1)  # [queries, heads, dim]
+            attn_output = attn_output_transposed.transpose(
+                0, 1
+            )  # [queries, heads, dim]
         else:
             # Original manual implementation
             # Use large negative value instead of -inf for numerical stability on MPS
@@ -475,15 +536,23 @@ def attention_reference(
             scores = scores.masked_fill(causal_mask.unsqueeze(1), mask_value)
 
             # Apply softmax
-            attn_weights = torch.softmax(scores, dim=-1)  # [num_queries, num_heads, kv_seq_len]
+            attn_weights = torch.softmax(
+                scores, dim=-1
+            )  # [num_queries, num_heads, kv_seq_len]
 
             # Apply attention to values: attn_weights @ V
             # V: [kv_seq_len, num_heads, head_dim]
             # Output: [num_queries, num_heads, head_dim]
-            attn_weights_transposed = attn_weights.transpose(0, 1)  # [num_heads, num_queries, kv_seq_len]
+            attn_weights_transposed = attn_weights.transpose(
+                0, 1
+            )  # [num_heads, num_queries, kv_seq_len]
             v_transposed = v_flat.transpose(0, 1)  # [num_heads, kv_seq_len, head_dim]
-            attn_output = torch.bmm(attn_weights_transposed, v_transposed)  # [num_heads, num_queries, head_dim]
-            attn_output = attn_output.transpose(0, 1)  # [num_queries, num_heads, head_dim]
+            attn_output = torch.bmm(
+                attn_weights_transposed, v_transposed
+            )  # [num_heads, num_queries, head_dim]
+            attn_output = attn_output.transpose(
+                0, 1
+            )  # [num_queries, num_heads, head_dim]
 
         # Write to output buffer
         output[q_start:q_end, :, :] = attn_output
