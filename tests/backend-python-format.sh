@@ -16,7 +16,7 @@ uvx black --check \
     ${ROOT}/backend/backend-python/model_factory.py \
     ${ROOT}/backend/backend-python/model_loader.py \
     ${ROOT}/backend/backend-python/platform_detection.py \
-    ${ROOT}/backend/backend-python/profiler.py \
+    ${ROOT}/backend/backend-python/profiler/*.py \
     ${ROOT}/backend/backend-python/server.py \
     ${ROOT}/backend/backend-python/config/*.py \
     ${ROOT}/backend/backend-python/model/*.py \

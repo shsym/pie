@@ -28,7 +28,7 @@ import zmq
 from platformdirs import user_cache_dir
 from websockets.sync.client import connect
 
-# Note: profiler.save_profiling_json is imported at shutdown time
+from profiler import initialize_memory_tracker
 
 from message import (
     DownloadAdapterRequest,
@@ -98,15 +98,23 @@ def print_config(config: Dict[str, Any]) -> None:
 
 
 def save_profiling_if_enabled(config: Dict[str, Any]) -> None:
-    """Save profiling results if profiling is enabled in config."""
+    """
+    DEPRECATED: Profiling is now handled by save_memory_profiling_if_enabled.
+    This function is kept for backward compatibility but does nothing.
+    """
+    _ = config  # Unused parameter kept for API compatibility
+
+
+def save_memory_profiling_if_enabled(config: Dict[str, Any]) -> None:
+    """Save unified profiling results if enabled."""
     if not config.get("enable_profiling", False):
         return
 
-    from profiler import save_profiling_json  # pylint: disable=import-outside-toplevel
+    from profiler import get_memory_tracker  # pylint: disable=import-outside-toplevel
 
     try:
-        json_path = save_profiling_json(output_dir=".")
-        print(f"📁 Profiling results saved to: {json_path}")
+        tracker = get_memory_tracker()
+        tracker.stop()
     except (OSError, ValueError, RuntimeError) as e:
         print(f"⚠️  Failed to save profiling results: {e}")
 
@@ -119,12 +127,14 @@ def start_service(
 ) -> None:
     """Spin up the backend service using the provided handler implementation."""
 
-    # Initialize profiler state based on configuration
-    from profiler import (  # pylint: disable=import-outside-toplevel
-        set_profiling_enabled,
-    )
+    # Initialize profiler
+    enable_profiling = config.get("enable_profiling", False)
 
-    set_profiling_enabled(config.get("enable_profiling", False))
+    initialize_memory_tracker(
+        output_dir=".",
+        enabled=enable_profiling,
+        enable_timing=enable_profiling,
+    )
 
     if config["controller_host"] in ["127.0.0.1", "localhost"]:
         unique_id = random.randint(1000, 9999)
@@ -208,6 +218,7 @@ def start_service(
     finally:
         # Save profiling results before shutdown if enabled
         save_profiling_if_enabled(config)
+        save_memory_profiling_if_enabled(config)
         socket.close()
         context.term()
         print("Server shutdown complete.")
@@ -491,7 +502,7 @@ def main(
         device: The device to run the model on (e.g., 'mps', 'cuda:0', 'cpu').
                 Auto-detects to 'mps' on Apple Silicon, 'cuda:0' otherwise.
         dtype: The data type for model weights (e.g., 'bfloat16', 'float16').
-        enable_profiling: Enable performance profiling (default: False).
+        enable_profiling: Enable unified profiler (timing + tensor tracking) (default: False).
     """
     # Import here to avoid circular imports
     # pylint: disable=import-outside-toplevel

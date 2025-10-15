@@ -23,28 +23,32 @@ from platform_detection import is_apple_silicon
 # Import profiler for performance analysis
 from profiler import start_profile
 
+# Module-level variables for backend detection
+backend_name: str
+backend_available: bool
+
 # Direct import of backend operations based on platform
 # metal_kernels now provides the same API structure as flashinfer
 if is_apple_silicon():
     try:
         import metal_kernels.ops as ops  # type: ignore[import-not-found]
 
-        BACKEND_NAME = "metal_kernels"
-        BACKEND_AVAILABLE = True
+        backend_name = "metal_kernels"
+        backend_available = True
     except ImportError:
         ops = None  # type: ignore[assignment]
-        BACKEND_NAME = "metal_kernels"
-        BACKEND_AVAILABLE = False
+        backend_name = "metal_kernels"
+        backend_available = False
 else:
     try:
         import flashinfer as ops  # type: ignore[import-not-found]
 
-        BACKEND_NAME = "flashinfer"
-        BACKEND_AVAILABLE = True
+        backend_name = "flashinfer"
+        backend_available = True
     except ImportError:
         ops = None  # type: ignore[assignment]
-        BACKEND_NAME = "flashinfer"
-        BACKEND_AVAILABLE = False
+        backend_name = "flashinfer"
+        backend_available = False
 
 
 class Handler:
@@ -62,9 +66,10 @@ class Handler:
         """Initialize handler with platform-appropriate backend operations."""
         self.adapters = {}
         self.ops = ops  # backend operations module (flashinfer or pie_metal.ops)
+        self.config = config  # Store config for later use
 
-        print(f"✅ Handler initialized with {BACKEND_NAME} backend")
-        print(f"   {BACKEND_NAME} available: {BACKEND_AVAILABLE}")
+        print(f"✅ Handler initialized with {backend_name} backend")
+        print(f"   {backend_name} available: {backend_available}")
 
         # Put imports here to avoid circular import
         # pylint: disable=import-outside-toplevel
@@ -331,16 +336,42 @@ class Handler:
 
             # 3. Run the forward pass through the model.
             with start_profile("model_forward"):
-                with _device_context(self.device):
-                    output_embeds = self.lm.model.forward(  # type: ignore[attr-defined]
-                        kv_cache_at_layer=self.kv_cache_at_layer, **model_inputs
-                    )
+                # Track PyTorch operations with fine-grained detail
+                tracker_context = self._get_tracker()
+
+                with tracker_context:
+                    with _device_context(self.device):
+                        output_embeds = self.lm.model.forward(  # type: ignore[attr-defined]
+                            kv_cache_at_layer=self.kv_cache_at_layer, **model_inputs
+                        )
 
             # 4. Package the model outputs into response messages.
             with start_profile("package_responses"):
                 responses = batch.package_responses(output_embeds)
 
         return responses
+
+    def _get_tracker(self):
+        """
+        Get profiling tracker for fine-grained operation tracking.
+
+        When profiling is enabled, this registers forward hooks on all leaf modules
+        to capture exact tensor IDs and execution order. The hook data is saved in
+        the operation_log section of the unified profile JSON.
+        """
+        if not self.config.get("enable_profiling", False):
+            return nullcontext()
+
+        try:
+            # pylint: disable=import-outside-toplevel
+            from profiler import get_memory_tracker
+            from profiler.hook_based_tracker import create_hook_tracker
+
+            tracker = get_memory_tracker()
+            hook_tracker = create_hook_tracker(tracker)
+            return hook_tracker.track_model_with_hooks(self.lm.model)  # type: ignore[arg-type]
+        except (ImportError, OSError, RuntimeError, AttributeError):
+            return nullcontext()
 
     def heartbeat(
         self, reqs: list[message.HeartbeatRequest]

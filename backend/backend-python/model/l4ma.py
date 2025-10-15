@@ -14,7 +14,7 @@ from torch import nn
 from adapter_utils import AdapterSubpass
 from config.l4ma import L4maArch
 from model.l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
-from profiler import start_profile
+from profiler import start_profile, profile_attention
 
 VERSION = "0.1.0"
 
@@ -181,11 +181,14 @@ class L4maAttention(nn.Module):
             kv_cache_layer=kv_cache_at_layer[self.layer_idx],
         )
 
-        attn_output = runtime.run_attention(
-            layer_idx=self.layer_idx,
-            query_states=query_states,
-            kv_cache_layer=kv_cache_at_layer[self.layer_idx],
-        )
+        with profile_attention(
+            self.layer_idx, query_states, kv_cache_at_layer[self.layer_idx]
+        ):
+            attn_output = runtime.run_attention(
+                layer_idx=self.layer_idx,
+                query_states=query_states,
+                kv_cache_layer=kv_cache_at_layer[self.layer_idx],
+            )
 
         attn_output = self.o_proj(attn_output)
 

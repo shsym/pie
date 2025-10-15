@@ -21,10 +21,13 @@ sys.path.insert(0, str(workspace_dir / "backend" / "backend-python"))
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Import profiler
-from profiler import start_profile, report_profiling_results, reset_profiler
+# Import profiler (unified profiler)
+from profiler import start_profile, initialize_memory_tracker, get_memory_tracker
 
 cache_dir = os.path.expanduser("~/Library/Caches/pie")
+
+# Initialize unified profiler
+initialize_memory_tracker(output_dir=".", enabled=True, enable_timing=True)
 
 print("=" * 80)
 print("LAYER-BY-LAYER DIVERGENCE FINDER: HF vs MPS")
@@ -452,4 +455,9 @@ with torch.no_grad():
 print("\n" + "=" * 80)
 print("PROFILING RESULTS")
 print("=" * 80)
-report_profiling_results()
+
+# Save profiling data using unified profiler
+tracker = get_memory_tracker()
+profile_file = tracker.save_snapshot()
+print(f"Profiling data saved to: {profile_file}")
+print("Use the profile visualizer to view detailed timing breakdown.")
