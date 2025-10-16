@@ -16,9 +16,16 @@ from .mps_config import MPS_COMPILE_AVAILABLE, MPS_DEVICE_AVAILABLE
 class BaseShaderCompiler:
     """Base class for Metal shader compilation and management."""
 
-    def __init__(self):
+    def __init__(self, page_size: int = 16):
+        """
+        Initialize the base shader compiler.
+
+        Args:
+            page_size: KV cache page size for BLOCK_SIZE compilation (default: 16)
+        """
         self.compiled_libraries: Dict[str, Any] = {}
         self.kernel_dir = Path(__file__).parent / "metal" / "kernels"
+        self.page_size = page_size
 
     def can_use_mps_kernels(self) -> bool:
         """Check if we can use compiled MPS kernels."""
@@ -89,3 +96,29 @@ class BaseShaderCompiler:
         except (RuntimeError, OSError, AttributeError) as e:
             print(f"❌ Failed to compile {library_name} shader: {e}")
             return False
+
+    def _warmup_kernel(self, library_name: str, kernel_name: str) -> None:
+        """
+        Warm up a specific kernel by checking its existence.
+
+        This triggers PSO (Pipeline State Object) creation, which validates
+        threadgroup memory limits and catches configuration errors early.
+
+        Args:
+            library_name: Name of the compiled library
+            kernel_name: Name of the kernel function to warm up
+
+        Raises:
+            RuntimeError: If PSO creation fails (e.g., threadgroup memory exceeded)
+        """
+        if library_name not in self.compiled_libraries:
+            return
+
+        lib = self.compiled_libraries[library_name]
+
+        # hasattr() triggers PSO creation - this will fail if threadgroup memory exceeds limit
+        if not hasattr(lib, kernel_name):
+            raise RuntimeError(
+                f"Kernel '{kernel_name}' not found in library '{library_name}'. "
+                f"Shader compilation may have failed."
+            )

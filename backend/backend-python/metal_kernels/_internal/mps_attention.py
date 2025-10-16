@@ -25,8 +25,14 @@ from .mps_shader_compiler import BaseShaderCompiler
 class AttentionCompiler(BaseShaderCompiler):
     """Compiles and runs Metal attention kernels."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, page_size: int = 16):
+        """
+        Initialize AttentionCompiler with dynamic BLOCK_SIZE.
+
+        Args:
+            page_size: KV cache page size for BLOCK_SIZE compilation (default: 16)
+        """
+        super().__init__(page_size=page_size)
         self._compile_attention_kernels()
 
     def _compile_attention_kernels(self):
@@ -51,8 +57,8 @@ class AttentionCompiler(BaseShaderCompiler):
 
         # Transform Params struct to params_raw for torch.mps.compile_shader compatibility
         processed_simdgroup = processed_simdgroup.replace(
-            "constant Params& params [[buffer(8)]]",
-            "device const float* params_raw [[buffer(8)]]",
+            "constant Params& params [[buffer(7)]]",
+            "device const float* params_raw [[buffer(7)]]",
         )
 
         # Replace parameter access patterns
@@ -91,10 +97,17 @@ class AttentionCompiler(BaseShaderCompiler):
         for old, new in param_replacements:
             processed_simdgroup = processed_simdgroup.replace(old, new)
 
-        # Compile the full optimized attention kernels
+        # Inject BLOCK_SIZE define based on page_size configuration
+        # This allows dynamic configuration without modifying Metal source code
+        block_size_define = f"#define BLOCK_SIZE {self.page_size}"
+
+        # Compile the full optimized attention kernels with injected BLOCK_SIZE
         full_source = f"""
 #include <metal_stdlib>
 using namespace metal;
+
+// Dynamically injected BLOCK_SIZE from configuration
+{block_size_define}
 
 {processed_common}
 
@@ -104,7 +117,17 @@ using namespace metal;
         try:
             # Compile the actual optimized shader library
             if self._compile_shader(full_source, "attention"):
-                print("✅ Compiled OPTIMIZED Metal attention kernels for MPS")
+                print(
+                    f"✅ Compiled OPTIMIZED Metal attention kernels for MPS "
+                    f"(BLOCK_SIZE={self.page_size})"
+                )
+                # Warm up: trigger PSO creation to catch threadgroup memory errors early
+                self._warmup_kernel(
+                    "attention", "batch_prefill_attention_unified_fp16_simdgroup_kernel"
+                )
+                self._warmup_kernel(
+                    "attention", "batch_prefill_attention_unified_f32_simdgroup_kernel"
+                )
             else:
                 print("   Falling back to simple implementation")
                 self._compile_simple_kernels()
@@ -269,7 +292,20 @@ using namespace metal;
         qo_indptr: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run the actual optimized Metal attention kernel."""
+        """Run the actual optimized Metal attention kernel.
+
+        Unified KV Cache Buffer Design:
+        -------------------------------
+        Buffer Layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
+
+        Within each page:
+          - K cache: offset 0 to (page_size * num_kv_heads * head_dim - 1)
+          - V cache: offset (page_size * num_kv_heads * head_dim) to end
+
+        The Metal kernel uses calculate_k_offset() and calculate_v_offset() to
+        compute absolute offsets from the unified buffer start for accessing
+        K and V data respectively.
+        """
 
         lib = self.compiled_libraries["attention"]
 
@@ -297,26 +333,18 @@ using namespace metal;
             params = torch.tensor(params_data, dtype=torch.float32, device="mps")
 
         # Prepare tensors in the exact format expected by the kernel
-        # OPTIMIZATION: Pass unified KV cache without copying
+        # - Pass unified KV cache as single buffer (no copying)
         # Layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
-        # kv_cache.view(-1) creates a view with NO COPY
+        # kv_cache.contiguous().view(-1) creates a contiguous view
         #
         # Memory layout per page:
         #   - K cache: elements [0 ... page_size*kv_head_dim-1]
         #   - V cache: elements [page_size*kv_head_dim ... 2*page_size*kv_head_dim-1]
 
         with start_profile("attn_kv_buffer_flatten"):
-            # Flatten entire KV cache as unified buffer
-            # (no copy - just a view)
-            paged_kv_unified = kv_cache.view(-1)
-
-            # Stride within each page to go from K to V (in number of elements)
-            # kv_stride_per_page = page_size * num_kv_heads * head_dim
-
-            # Pass unified buffer to both K and V parameters
-            # Kernel will add offset to access V
-            paged_k_cache = paged_kv_unified
-            paged_v_cache = paged_kv_unified  # Same buffer, kernel uses offset
+            # Single unified KV cache buffer
+            # Ensure contiguous for optimal memory access
+            paged_kv_cache = kv_cache.contiguous().view(-1)
 
         with start_profile("attn_query_flatten"):
             # Reshape query for kernel:
@@ -328,11 +356,11 @@ using namespace metal;
 
         # Launch the actual optimized kernel!
         with start_profile("attn_metal_kernel"):
-            # Select kernel based on dtype: f32 for float32, bf16 for float16/bfloat16
+            # Select kernel based on dtype: f32 for float32, fp16 for float16
             if query.dtype == torch.float32:
                 kernel_name = "batch_prefill_attention_unified_f32_simdgroup_kernel"
             else:
-                kernel_name = "batch_prefill_attention_unified_bf16_simdgroup_kernel"
+                kernel_name = "batch_prefill_attention_unified_fp16_simdgroup_kernel"
 
             # Configure dispatch parameters
             threads_per_threadgroup = 128
@@ -346,15 +374,14 @@ using namespace metal;
             # Call the optimized simdgroup kernel with exact parameter layout and dispatch config
             getattr(lib, kernel_name)(
                 q_input,  # q_input [buffer(0)]
-                paged_k_cache,  # paged_k_cache [buffer(1)]
-                paged_v_cache,  # paged_v_cache [buffer(2)]
-                qo_indptr.to(torch.int32),  # qo_indptr [buffer(3)]
-                kv_page_indptr.to(torch.int32),  # kv_page_indptr [buffer(4)]
-                kv_page_indices.to(torch.int32),  # kv_page_indices [buffer(5)]
-                kv_last_page_lens.to(torch.int32),  # kv_last_page_lens [buffer(6)]
-                output,  # output [buffer(7)]
-                params,  # params [buffer(8)]
-                debug_out,  # debug_out [buffer(9)]
+                paged_kv_cache,  # paged_kv_cache [buffer(1)] - unified KV cache
+                qo_indptr.to(torch.int32),  # qo_indptr [buffer(2)]
+                kv_page_indptr.to(torch.int32),  # kv_page_indptr [buffer(3)]
+                kv_page_indices.to(torch.int32),  # kv_page_indices [buffer(4)]
+                kv_last_page_lens.to(torch.int32),  # kv_last_page_lens [buffer(5)]
+                output,  # output [buffer(6)]
+                params,  # params [buffer(7)]
+                debug_out,  # debug_out [buffer(8)]
                 threads=(total_threads, 1, 1),
                 group_size=(threads_per_threadgroup, 1, 1),
             )

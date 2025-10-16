@@ -9,33 +9,38 @@ using namespace metal;
 
 // BLOCK_SIZE: The number of keys processed in parallel by the threadgroup in each step.
 // Should match page_size for optimal memory alignment.
-// TODO: This should be passed as compilation flag: -D BLOCK_SIZE=${page_size}
+// NOTE: BLOCK_SIZE is dynamically injected by Python at compilation time via #define.
+// Configuration flow:
+//   1. TOML config (kv_page_size) -> server.py sets PIE_METAL_PAGE_SIZE env var
+//   2. metal_kernels/ops.py reads PIE_METAL_PAGE_SIZE at import time
+//   3. mps_attention.py injects #define BLOCK_SIZE at shader compilation
+// See: metal_kernels/_internal/mps_attention.py::_compile_attention_kernels()
 #ifndef BLOCK_SIZE
-#define BLOCK_SIZE 16  // Default fallback
+#define BLOCK_SIZE 16  // Fallback for standalone compilation/testing only
 #endif
 
 // Smart kernel block size based on memory constraints (32KB limit)
-// F32 uses 4x more memory than BF16, so needs smaller block size
+// F32 uses 4x more memory than FP16, so needs smaller block size
 #ifdef FP32_KERNEL
   #if BLOCK_SIZE > 16
     #define KERNEL_BLOCK_SIZE 16  // Cap at 16 for f32 (~30KB memory usage)
   #else
     #define KERNEL_BLOCK_SIZE BLOCK_SIZE
   #endif
-#else  // BF16 kernel
-  #define KERNEL_BLOCK_SIZE BLOCK_SIZE  // BF16 can handle up to 32
+#else  // FP16 kernel
+  #define KERNEL_BLOCK_SIZE BLOCK_SIZE  // FP16 can handle up to 32
 #endif
 
 // MAX_HEAD_DIM: The kernel uses fixed-size shared memory arrays for performance.
 // Memory calculation:
-// BF16: 2KB + KERNEL_BLOCK_SIZE * 1028 bytes ≤ 32KB
+// FP16: 2KB + KERNEL_BLOCK_SIZE * 1028 bytes ≤ 32KB
 // F32:  2.5KB + KERNEL_BLOCK_SIZE * 2052 bytes ≤ 32KB
 #define MAX_HEAD_DIM 256
 
 // Metal SIMD group size on Apple Silicon
 #define SIMD_SIZE 32
 
-// Small uniform parameter block passed via buffer(8)
+// Small uniform parameter block passed via buffer(7)
 struct Params {
     int num_qo;
     int head_dim;        // Query head dimension (num_query_heads * head_size)
@@ -62,10 +67,11 @@ inline int find_sequence_id(device const int* qo_indptr, int qo_idx) {
     return seq_id;
 }
 
-// Calculate paged KV cache address for MQA/GQA support
-// Handles interleaved K/V layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
+// Calculate K cache offset in unified KV cache buffer for MQA/GQA support
+// Unified buffer layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
 // Within each page: K at offset 0, V at offset (page_size * kv_head_dim)
-inline uint calculate_kv_address(
+// Returns: Absolute offset from unified buffer start for K data
+inline uint calculate_k_offset(
     int in_page_offset,
     int page_size,
     int kv_head_dim,
@@ -74,12 +80,16 @@ inline uint calculate_kv_address(
     int kv_head
 ) {
     // Each page contains both K and V: stride is 2 * page_size * kv_head_dim
-    // K is at offset 0 within page, V is at offset (page_size * kv_head_dim)
-    return page_idx * (2 * page_size * kv_head_dim) + in_page_offset * kv_head_dim + kv_head * head_size;
+    // K is at offset 0 within page
+    return page_idx * (2 * page_size * kv_head_dim) +
+           0 * (page_size * kv_head_dim) +  // K is at offset 0
+           in_page_offset * kv_head_dim +
+           kv_head * head_size;
 }
 
-// Calculate V cache address (K + offset within page)
-inline uint calculate_v_address(
+// Calculate V cache offset in unified KV cache buffer for MQA/GQA support
+// Returns: Absolute offset from unified buffer start for V data
+inline uint calculate_v_offset(
     int in_page_offset,
     int page_size,
     int kv_head_dim,
@@ -88,7 +98,10 @@ inline uint calculate_v_address(
     int kv_head
 ) {
     // V starts at (page_size * kv_head_dim) offset within each page
-    return page_idx * (2 * page_size * kv_head_dim) + (page_size * kv_head_dim) + in_page_offset * kv_head_dim + kv_head * head_size;
+    return page_idx * (2 * page_size * kv_head_dim) +
+           1 * (page_size * kv_head_dim) +  // V is after K
+           in_page_offset * kv_head_dim +
+           kv_head * head_size;
 }
 
 // Map query head to KV head for MQA/GQA support

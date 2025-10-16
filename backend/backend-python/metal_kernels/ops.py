@@ -30,6 +30,55 @@ IS_APPLE_SILICON = IS_MACOS and platform.processor() == "arm"
 PYTORCH_MODE = os.environ.get("PIE_METAL_PYTORCH_MODE", "0") == "1"
 
 
+def _validate_page_size(page_size: int) -> None:
+    """
+    Validate page_size configuration for Metal kernel compilation.
+
+    Args:
+        page_size: The KV cache page size to validate
+
+    Raises:
+        ValueError: If page_size is invalid
+    """
+    # Check if page_size is a power of 2
+    if page_size <= 0 or (page_size & (page_size - 1)) != 0:
+        raise ValueError(
+            f"page_size must be a power of 2. Got: {page_size}. "
+            f"Valid values: 8, 16, 32, 64, etc."
+        )
+
+    # Check dtype-specific memory constraints
+    # Metal threadgroup memory limit: 32KB on Apple Silicon
+    #
+    # Accurate memory usage calculation for MAX_HEAD_DIM=256:
+    # FP16 kernel threadgroup memory:
+    #   - q_s[256]: 512 bytes
+    #   - k_block[BLOCK_SIZE][256]: BLOCK_SIZE * 512 bytes
+    #   - v_block[BLOCK_SIZE][256]: BLOCK_SIZE * 512 bytes
+    #   - acc_i[256]: 1024 bytes
+    #   - w_block[BLOCK_SIZE]: BLOCK_SIZE * 4 bytes
+    #   - simd_scratch[4]: 16 bytes
+    #   - m_i, l_i: 8 bytes
+    # Total: 1560 + BLOCK_SIZE * 1028 bytes
+    #
+    # For power-of-2 page sizes:
+    #   - page_size=16: 1560 + 16*1028 = 17,008 bytes ✓
+    #   - page_size=32: 1560 + 32*1028 = 34,456 bytes ✗ (exceeds 32KB limit)
+    #
+    # F32 kernel uses MAX_F32_HEAD_DIM=128 and capped KERNEL_BLOCK_SIZE=16,
+    # so it stays under 32KB automatically.
+    #
+    # Hard limit: page_size must be <= 16 (power of 2 constraint)
+    if page_size > 16:
+        estimated_memory = 1560 + page_size * 1028
+        raise ValueError(
+            f"page_size={page_size} exceeds Metal threadgroup memory limit (32KB). "
+            f"Maximum supported: 16 (power of 2). "
+            f"Your configuration would require ~{estimated_memory} bytes. "
+            f"Valid values: 1, 2, 4, 8, 16"
+        )
+
+
 def _validate_mps_device(tensor: torch.Tensor, name: str) -> None:
     """Validate that a tensor is on MPS device.
 
@@ -54,8 +103,23 @@ def _validate_mps_device(tensor: torch.Tensor, name: str) -> None:
         )
 
 
-def _initialize_mps_backend() -> bool:
-    """Initialize MPS shader backend - returns success status"""
+def _initialize_mps_backend(page_size: int = 16) -> bool:
+    """
+    Initialize MPS shader backend with dynamic BLOCK_SIZE configuration.
+
+    Args:
+        page_size: KV cache page size for BLOCK_SIZE compilation (default: 16)
+
+    Returns:
+        True if initialization succeeded, False otherwise
+    """
+    # Validate page_size before initialization
+    try:
+        _validate_page_size(page_size)
+    except ValueError as e:
+        print(f"❌ Invalid page_size configuration: {e}")
+        sys.exit(1)
+
     # If PyTorch mode is enabled, skip Metal initialization
     if PYTORCH_MODE:
         print("⚠️  PIE_METAL_PYTORCH_MODE=1: Using PyTorch reference implementations")
@@ -91,8 +155,8 @@ def _initialize_mps_backend() -> bool:
     print("   All tensors will be created on MPS device by default")
 
     try:
-        # Initialize MPS shader compiler (singleton)
-        compiler = get_mps_compiler()
+        # Initialize MPS shader compiler (singleton) with page_size configuration
+        compiler = get_mps_compiler(page_size=page_size)
         if compiler.can_use_mps_kernels():
             print("✅ metal_kernels initialized with PyTorch MPS shader compilation")
             print(
@@ -113,8 +177,11 @@ def _initialize_mps_backend() -> bool:
     sys.exit(1)
 
 
-# Initialize on import
-_initialize_mps_backend()
+# Read page_size from environment variable or use default
+_PAGE_SIZE_FROM_ENV = int(os.environ.get("PIE_METAL_PAGE_SIZE", "16"))
+
+# Initialize on import with page_size from environment
+_initialize_mps_backend(page_size=_PAGE_SIZE_FROM_ENV)
 
 
 class BatchPrefillWithPagedKVCacheWrapper:

@@ -19,18 +19,25 @@ class MPSShaderCompiler:
 
     _instance: Optional["MPSShaderCompiler"] = None
 
-    def __new__(cls):
+    def __new__(cls, page_size: int = 16):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self):
+    def __init__(self, page_size: int = 16):
+        """
+        Initialize MPS Shader Compiler with dynamic BLOCK_SIZE configuration.
+
+        Args:
+            page_size: KV cache page size for BLOCK_SIZE compilation (default: 16)
+        """
         # Only initialize once
         if hasattr(self, "_initialized"):
             return
         self._initialized = True
-        print("Initializing MPS Shader Compiler...")
-        self.attention_compiler = AttentionCompiler()
+        self.page_size = page_size
+        print(f"Initializing MPS Shader Compiler (BLOCK_SIZE={page_size})...")
+        self.attention_compiler = AttentionCompiler(page_size=page_size)
         self.rope_compiler = RoPECompiler()
         self.append_kv_cache_compiler = AppendKVCacheCompiler()
         print("✅ Metal shaders compiled successfully")
@@ -116,9 +123,18 @@ class MPSShaderCompiler:
         )
 
 
-def get_mps_compiler() -> MPSShaderCompiler:
-    """Get or create the singleton MPS shader compiler instance."""
-    return MPSShaderCompiler()
+def get_mps_compiler(page_size: int = 16) -> MPSShaderCompiler:
+    """
+    Get or create the singleton MPS shader compiler instance.
+
+    Args:
+        page_size: KV cache page size for BLOCK_SIZE compilation (default: 16)
+                   Only used on first initialization, ignored on subsequent calls.
+
+    Returns:
+        MPSShaderCompiler singleton instance
+    """
+    return MPSShaderCompiler(page_size=page_size)
 
 
 def run_mps_attention(

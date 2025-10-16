@@ -10,18 +10,33 @@ using namespace metal;
 // 3. Fused weight computation with V accumulation (eliminates w_block storage and barriers)
 // 4. One TG per (qo, head) mapping (improves GPU occupancy for small batches)
 // 5. Vectorization improvements (better memory bandwidth utilization)
+//
+// --- Unified KV Cache Buffer Design ---
+// This kernel uses a SINGLE unified buffer for both K and V caches (buffer(1)).
+// Buffer layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
+//
+// Within each page (size = 2 * page_size * num_kv_heads * head_dim elements):
+//   - K cache: offset 0 to (page_size * num_kv_heads * head_dim - 1)
+//   - V cache: offset (page_size * num_kv_heads * head_dim) to end
+//
+// The kernel uses calculate_k_offset() and calculate_v_offset() helper functions
+// to compute absolute offsets from the unified buffer start.
+//
+// Example for page_size=16, num_kv_heads=2, head_dim=64:
+//   Page 0: [K_data: 2048 elements][V_data: 2048 elements]
+//   Page 1: [K_data: 2048 elements][V_data: 2048 elements]
+//   ...
 
-kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
+kernel void batch_prefill_attention_unified_fp16_simdgroup_kernel(
     device const half* q_input [[buffer(0)]],
-    device const half* paged_k_cache [[buffer(1)]],
-    device const half* paged_v_cache [[buffer(2)]],
-    device const int* qo_indptr [[buffer(3)]],
-    device const int* kv_page_indptr [[buffer(4)]],
-    device const int* kv_page_indices [[buffer(5)]],
-    device const int* kv_last_page_lens [[buffer(6)]],
-    device half* output [[buffer(7)]],
-    constant Params& params [[buffer(8)]],
-    device float* debug_out [[buffer(9)]],
+    device const half* paged_kv_cache [[buffer(1)]],
+    device const int* qo_indptr [[buffer(2)]],
+    device const int* kv_page_indptr [[buffer(3)]],
+    device const int* kv_page_indices [[buffer(4)]],
+    device const int* kv_last_page_lens [[buffer(5)]],
+    device half* output [[buffer(6)]],
+    constant Params& params [[buffer(7)]],
+    device float* debug_out [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint tid_in_tgp [[thread_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
@@ -136,22 +151,50 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
                     int in_page_offset = global_key_idx % page_size;
                     int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
                     int kv_head = map_query_to_kv_head(h, num_query_heads, num_kv_heads);
-                    uint base_addr = calculate_kv_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
+                    uint k_offset = calculate_k_offset(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
 
                     // Debug: Show address calculation for first few keys
                     if (qo_idx == 0 && tid_in_tgp == 0 && h == 0 && global_key_idx < 3 && debug_out != nullptr) {
                         int debug_idx = 15 + global_key_idx * 3;  // Use debug[15-23] for address info
-                        debug_out[debug_idx] = (float)base_addr;
+                        debug_out[debug_idx] = (float)k_offset;
                         debug_out[debug_idx + 1] = (float)page_idx;
-                        debug_out[debug_idx + 2] = (global_key_idx < total_kv_len) ? paged_k_cache[base_addr] : -999.0f;
+                        debug_out[debug_idx + 2] = (global_key_idx < total_kv_len) ? paged_kv_cache[k_offset] : -999.0f;
                     }
 
-                    // Calculate V address with offset within interleaved page
-                    uint v_addr = calculate_v_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
+                    // Calculate V offset within unified KV cache
+                    uint v_offset = calculate_v_offset(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
 
-                    for (int d = 0; d < head_size; ++d) {
-                        k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
-                        v_block[tid_in_tgp][d] = paged_v_cache[v_addr + d];
+                    // Vectorization with half4 loads
+                    // Metal supports half4 for FP16 (8 bytes = 64-bit aligned load)
+                    int d = 0;
+                    if ((head_size & 3) == 0) {  // Head size is multiple of 4
+                        for (; d + 3 < head_size; d += 4) {
+                            // Load 4 half values at once (8 bytes = 64-bit aligned load)
+                            half4 k_vec = *((device half4*)(paged_kv_cache + k_offset + d));
+                            half4 v_vec = *((device half4*)(paged_kv_cache + v_offset + d));
+
+                            // Store to threadgroup memory using vector stores
+                            *((threadgroup half4*)&k_block[tid_in_tgp][d]) = k_vec;
+                            *((threadgroup half4*)&v_block[tid_in_tgp][d]) = v_vec;
+                        }
+                    } else {
+                        // Fallback: process 4 at a time even if not aligned
+                        for (; d + 3 < head_size; d += 4) {
+                            k_block[tid_in_tgp][d] = paged_kv_cache[k_offset + d];
+                            k_block[tid_in_tgp][d+1] = paged_kv_cache[k_offset + d + 1];
+                            k_block[tid_in_tgp][d+2] = paged_kv_cache[k_offset + d + 2];
+                            k_block[tid_in_tgp][d+3] = paged_kv_cache[k_offset + d + 3];
+
+                            v_block[tid_in_tgp][d] = paged_kv_cache[v_offset + d];
+                            v_block[tid_in_tgp][d+1] = paged_kv_cache[v_offset + d + 1];
+                            v_block[tid_in_tgp][d+2] = paged_kv_cache[v_offset + d + 2];
+                            v_block[tid_in_tgp][d+3] = paged_kv_cache[v_offset + d + 3];
+                        }
+                    }
+                    // Handle remaining elements
+                    for (; d < head_size; ++d) {
+                        k_block[tid_in_tgp][d] = paged_kv_cache[k_offset + d];
+                        v_block[tid_in_tgp][d] = paged_kv_cache[v_offset + d];
                     }
                 }
             }
@@ -165,7 +208,7 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
             if (tid_in_tgp < KERNEL_BLOCK_SIZE && global_key_idx_score < effective_kv_len) {
                 // --- OPTIMIZATION 2: Vectorized memory access with float4 ---
                 int d = 0;
-                // Process 4 dimensions at a time using vectorized operations for BF16
+                // Process 4 dimensions at a time using vectorized operations for FP16
                 if ((head_size & 3) == 0) {  // Head size is multiple of 4
                     for (; d < head_size; d += 4) {
                         // Load 4 half values and convert to float4
@@ -301,15 +344,14 @@ kernel void batch_prefill_attention_unified_bf16_simdgroup_kernel(
 
 kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
     device const float* q_input [[buffer(0)]],
-    device const float* paged_k_cache [[buffer(1)]],
-    device const float* paged_v_cache [[buffer(2)]],
-    device const int* qo_indptr [[buffer(3)]],
-    device const int* kv_page_indptr [[buffer(4)]],
-    device const int* kv_page_indices [[buffer(5)]],
-    device const int* kv_last_page_lens [[buffer(6)]],
-    device float* output [[buffer(7)]],
-    constant Params& params [[buffer(8)]],
-    device float* debug_out [[buffer(9)]],
+    device const float* paged_kv_cache [[buffer(1)]],
+    device const int* qo_indptr [[buffer(2)]],
+    device const int* kv_page_indptr [[buffer(3)]],
+    device const int* kv_page_indices [[buffer(4)]],
+    device const int* kv_last_page_lens [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant Params& params [[buffer(7)]],
+    device float* debug_out [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint tid_in_tgp [[thread_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
@@ -329,7 +371,7 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
     uint qo_idx = tgid.x;
     if (qo_idx >= uint(num_qo)) return;
 
-    // F32 kernels use 2x memory compared to BF16, so stricter limits apply
+    // F32 kernels use 2x memory compared to FP16, so stricter limits apply
     // Conservative limit for F32 to fit in 32KB threadgroup memory
     const int MAX_F32_HEAD_DIM = 128;
     if (head_size > MAX_F32_HEAD_DIM) return;
@@ -427,23 +469,50 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
                     int in_page_offset = global_key_idx % page_size;
                     int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
                     int kv_head = map_query_to_kv_head(h, num_query_heads, num_kv_heads);
-                    uint base_addr = calculate_kv_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
+                    uint k_offset = calculate_k_offset(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
 
                     // DEBUG: Log first key access details (F32 kernel)
                     if (qo_idx == 0 && h == 0 && block_start == 0 && tid_in_tgp == 0 && debug_out != nullptr) {
                         debug_out[19] = (float)page_idx;          // Page ID being accessed
-                        debug_out[20] = (float)base_addr;         // Calculated base address
-                        debug_out[21] = paged_k_cache[base_addr]; // First key value accessed
+                        debug_out[20] = (float)k_offset;          // Calculated K offset
+                        debug_out[21] = paged_kv_cache[k_offset]; // First key value accessed
                         debug_out[22] = (float)in_page_offset;    // Position within page
                         debug_out[23] = (float)page_offset;       // Which page in sequence
                     }
 
-                    // Calculate V address with offset within interleaved page
-                    uint v_addr = calculate_v_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
+                    // Calculate V offset within unified KV cache
+                    uint v_offset = calculate_v_offset(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
 
-                    for (int d = 0; d < head_size; ++d) {
-                        k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
-                        v_block[tid_in_tgp][d] = paged_v_cache[v_addr + d];
+                    // Vectorization with float4 loads for F32
+                    int d = 0;
+                    if ((head_size & 3) == 0) {  // Head size is multiple of 4
+                        for (; d + 3 < head_size; d += 4) {
+                            // Load 4 float values at once (16 bytes = 128-bit aligned load)
+                            float4 k_vec = *((device float4*)(paged_kv_cache + k_offset + d));
+                            float4 v_vec = *((device float4*)(paged_kv_cache + v_offset + d));
+
+                            // Store to threadgroup memory using vector stores
+                            *((threadgroup float4*)&k_block[tid_in_tgp][d]) = k_vec;
+                            *((threadgroup float4*)&v_block[tid_in_tgp][d]) = v_vec;
+                        }
+                    } else {
+                        // Fallback: process 4 at a time even if not aligned
+                        for (; d + 3 < head_size; d += 4) {
+                            k_block[tid_in_tgp][d] = paged_kv_cache[k_offset + d];
+                            k_block[tid_in_tgp][d+1] = paged_kv_cache[k_offset + d + 1];
+                            k_block[tid_in_tgp][d+2] = paged_kv_cache[k_offset + d + 2];
+                            k_block[tid_in_tgp][d+3] = paged_kv_cache[k_offset + d + 3];
+
+                            v_block[tid_in_tgp][d] = paged_kv_cache[v_offset + d];
+                            v_block[tid_in_tgp][d+1] = paged_kv_cache[v_offset + d + 1];
+                            v_block[tid_in_tgp][d+2] = paged_kv_cache[v_offset + d + 2];
+                            v_block[tid_in_tgp][d+3] = paged_kv_cache[v_offset + d + 3];
+                        }
+                    }
+                    // Handle remaining elements
+                    for (; d < head_size; ++d) {
+                        k_block[tid_in_tgp][d] = paged_kv_cache[k_offset + d];
+                        v_block[tid_in_tgp][d] = paged_kv_cache[v_offset + d];
                     }
                 }
             }
@@ -591,262 +660,3 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
 // Each threadgroup handles exactly one (query_token, head) pair instead of looping over heads
 // Benefits: Better GPU occupancy for small batches, multiplies TG count by num_query_heads
 
-kernel void batch_prefill_attention_unified_bf16_per_head_kernel(
-    device const half* q_input [[buffer(0)]],
-    device const half* paged_k_cache [[buffer(1)]],
-    device const half* paged_v_cache [[buffer(2)]],
-    device const int* qo_indptr [[buffer(3)]],
-    device const int* kv_page_indptr [[buffer(4)]],
-    device const int* kv_page_indices [[buffer(5)]],
-    device const int* kv_last_page_lens [[buffer(6)]],
-    device half* output [[buffer(7)]],
-    constant Params& params [[buffer(8)]],
-    device float* debug_out [[buffer(9)]],
-    uint3 tgid [[threadgroup_position_in_grid]],
-    uint tid_in_tgp [[thread_index_in_threadgroup]],
-    uint simd_lane_id [[thread_index_in_simdgroup]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]]
-) {
-    // Read parameters from the uniform buffer
-    const int num_qo = params.num_qo;
-    const int head_dim = params.head_dim;
-    const int kv_head_dim = params.kv_head_dim;
-    const int head_size = params.head_size;
-    const int page_size = params.page_size;
-    const int num_query_heads = params.num_query_heads;
-    const int num_kv_heads = params.num_kv_heads;
-    const float scale = params.scale;
-
-    // NEW: Each threadgroup handles one (qo, head) pair
-    // Grid dimensions: (num_qo * num_query_heads, 1, 1)
-    uint linear_tid = tgid.x;
-    uint qo_idx = linear_tid / num_query_heads;
-    uint h = linear_tid % num_query_heads;
-
-    if (qo_idx >= uint(num_qo)) return;
-
-    // Check if head_size exceeds our threadgroup memory limit
-    if (head_size > MAX_HEAD_DIM) return;
-
-    const int num_simd_groups = TGP_SIZE / SIMD_SIZE;
-
-    // --- Shared Memory Declaration ---
-    // Same memory layout as Priority 0 kernel but only for single head
-    threadgroup half q_s[MAX_HEAD_DIM];
-    threadgroup half k_block[KERNEL_BLOCK_SIZE][MAX_HEAD_DIM];
-    threadgroup half v_block[KERNEL_BLOCK_SIZE][MAX_HEAD_DIM];
-
-    // Online softmax accumulators (single head only)
-    threadgroup float m_i;
-    threadgroup float l_i;
-    threadgroup float acc_i[MAX_HEAD_DIM];
-
-    // Simdgroup reduction scratchpad
-    threadgroup float simd_scratch[4];
-
-    // --- Get Sequence and KV Page Information ---
-    int seq_id = find_sequence_id(qo_indptr, int(qo_idx));
-    int kv_start_page_pos = kv_page_indptr[seq_id];
-    int kv_end_page_pos = kv_page_indptr[seq_id + 1];
-    int num_pages = kv_end_page_pos - kv_start_page_pos;
-
-    if (num_pages <= 0) {
-        // Zero out this head's output
-        int output_base = int(qo_idx) * head_dim + int(h) * head_size;
-        for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
-            output[output_base + d] = 0.0h;
-        }
-        return;
-    }
-
-    int last_page_len = kv_last_page_lens[seq_id];
-    int total_kv_len = (num_pages - 1) * page_size + last_page_len;
-    int seq_start = qo_indptr[seq_id];
-    int seq_pos = int(qo_idx) - seq_start;
-    seq_pos = max(seq_pos, 0);
-    // Causal masking: query at position seq_pos attends to [0, kv_seq_start + seq_pos]
-    // where kv_seq_start = total_kv_len - num_qo (queries append to end of KV sequence)
-    int kv_seq_start = total_kv_len - num_qo;
-    int effective_kv_len = min(total_kv_len, kv_seq_start + seq_pos + 1);
-
-    if (effective_kv_len <= 0) {
-        int output_base = int(qo_idx) * head_dim + int(h) * head_size;
-        for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
-            output[output_base + d] = 0.0h;
-        }
-        return;
-    }
-
-    // --- Single Head Processing (no loop needed) ---
-    // Initialize online softmax state
-    if (tid_in_tgp == 0) {
-        m_i = -INFINITY;
-        l_i = 0.0f;
-    }
-    for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
-        acc_i[d] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // --- Load Query slice for this head into Shared Memory ---
-    int q_base = int(qo_idx) * head_dim + int(h) * head_size;
-    for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
-        q_s[d] = q_input[q_base + d];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // --- Main Loop: Process KV Cache in Blocks ---
-    for (int block_start = 0; block_start < effective_kv_len; block_start += KERNEL_BLOCK_SIZE) {
-        // Load K/V for this block and head slice - VECTORIZED
-        if (tid_in_tgp < KERNEL_BLOCK_SIZE) {
-            int global_key_idx = block_start + tid_in_tgp;
-            if (global_key_idx < effective_kv_len) {
-                int page_offset = global_key_idx / page_size;
-                int in_page_offset = global_key_idx % page_size;
-                int page_idx = kv_page_indices[kv_start_page_pos + page_offset];
-                int kv_head = map_query_to_kv_head(int(h), num_query_heads, num_kv_heads);
-                uint base_addr = calculate_kv_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
-                uint v_addr = calculate_v_address(in_page_offset, page_size, kv_head_dim, head_size, page_idx, kv_head);
-
-                // VECTORIZATION: Use half4 loads where possible for better bandwidth
-                int d = 0;
-                for (; d + 3 < head_size; d += 4) {
-                    half4 k_vec = *((device half4*)(paged_k_cache + base_addr + d));
-                    half4 v_vec = *((device half4*)(paged_v_cache + v_addr + d));
-
-                    k_block[tid_in_tgp][d] = k_vec.x;
-                    k_block[tid_in_tgp][d+1] = k_vec.y;
-                    k_block[tid_in_tgp][d+2] = k_vec.z;
-                    k_block[tid_in_tgp][d+3] = k_vec.w;
-
-                    v_block[tid_in_tgp][d] = v_vec.x;
-                    v_block[tid_in_tgp][d+1] = v_vec.y;
-                    v_block[tid_in_tgp][d+2] = v_vec.z;
-                    v_block[tid_in_tgp][d+3] = v_vec.w;
-                }
-                // Handle remaining elements
-                for (; d < head_size; ++d) {
-                    k_block[tid_in_tgp][d] = paged_k_cache[base_addr + d];
-                    v_block[tid_in_tgp][d] = paged_v_cache[v_addr + d];
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // --- Split-d parallel score computation with vectorization ---
-        float score = 0.0f;
-        int global_key_idx_score = block_start + tid_in_tgp;
-
-        if (tid_in_tgp < KERNEL_BLOCK_SIZE && global_key_idx_score < effective_kv_len) {
-            // VECTORIZED dot product computation
-            float acc = 0.0f;
-            int d = 0;
-            for (; d + 3 < head_size; d += 4) {
-                half4 q_vec = half4(q_s[d], q_s[d+1], q_s[d+2], q_s[d+3]);
-                half4 k_vec = half4(k_block[tid_in_tgp][d], k_block[tid_in_tgp][d+1],
-                                   k_block[tid_in_tgp][d+2], k_block[tid_in_tgp][d+3]);
-
-                acc += float(q_vec.x) * float(k_vec.x);
-                acc += float(q_vec.y) * float(k_vec.y);
-                acc += float(q_vec.z) * float(k_vec.z);
-                acc += float(q_vec.w) * float(k_vec.w);
-            }
-            // Handle remaining elements
-            for (; d < head_size; ++d) {
-                acc += float(q_s[d]) * float(k_block[tid_in_tgp][d]);
-            }
-            score = acc * scale;
-        } else {
-            score = -INFINITY;
-        }
-
-        // --- Simdgroup reduction for block max ---
-        float m_j = simdgroup_max_reduction(
-            (tid_in_tgp < KERNEL_BLOCK_SIZE) ? score : -INFINITY,
-            simd_scratch, tid_in_tgp, simd_lane_id, simd_group_id, KERNEL_BLOCK_SIZE
-        );
-
-        // Update global max and rescale accumulators
-        threadgroup float m_prev;
-        if (tid_in_tgp == 0) {
-            m_prev = m_i;
-            m_i = max(m_i, m_j);
-            simd_scratch[0] = m_prev;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        m_prev = simd_scratch[0];
-
-        float scale_factor = fast::exp(m_prev - m_i);
-        if (tid_in_tgp == 0) {
-            l_i *= scale_factor;
-        }
-        for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
-            acc_i[d] *= scale_factor;
-        }
-
-        // --- Fused weight computation with V accumulation ---
-        float w = (score > -INFINITY) ? fast::exp(score - m_i) : 0.0f;
-
-        // Simdgroup sum for weights
-        float l_j = simdgroup_sum_reduction(
-            (tid_in_tgp < KERNEL_BLOCK_SIZE) ? w : 0.0f,
-            simd_scratch, tid_in_tgp, simd_lane_id, simd_group_id, KERNEL_BLOCK_SIZE
-        );
-
-        if (tid_in_tgp == 0) {
-            l_i += l_j;
-        }
-
-        // Store weights for correct V accumulation
-        threadgroup float w_block[KERNEL_BLOCK_SIZE];
-        if (tid_in_tgp < KERNEL_BLOCK_SIZE) {
-            w_block[tid_in_tgp] = w;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // VECTORIZED V accumulation with correct weights
-        int dims_per_thread = (head_size + TGP_SIZE - 1) / TGP_SIZE;
-        for (int i = 0; i < dims_per_thread; ++i) {
-            int d = tid_in_tgp * dims_per_thread + i;
-            if (d < head_size) {
-                float sum_wv_d = 0.0f;
-        int num_keys_in_block = min((int)KERNEL_BLOCK_SIZE, effective_kv_len - block_start);
-
-                // Use correct per-key weights stored in w_block
-                for (int j = 0; j < num_keys_in_block; ++j) {
-                    sum_wv_d += w_block[j] * float(v_block[j][d]);
-                }
-
-                acc_i[d] += sum_wv_d;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // --- Finalization and Output ---
-    if (tid_in_tgp == 0 && l_i == 0.0f) {
-        l_i = 1.0f; // Avoid division by zero
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float inv_l_i = 1.0f / l_i;
-    int output_base = int(qo_idx) * head_dim + int(h) * head_size;
-
-    // VECTORIZED output writing
-    int d = 0;
-    for (; d + 3 < head_size && d + 3 < MAX_HEAD_DIM; d += 4) {
-        if (tid_in_tgp * 4 + 3 < head_size) {
-            half4 result = half4(
-                half(acc_i[tid_in_tgp * 4] * inv_l_i),
-                half(acc_i[tid_in_tgp * 4 + 1] * inv_l_i),
-                half(acc_i[tid_in_tgp * 4 + 2] * inv_l_i),
-                half(acc_i[tid_in_tgp * 4 + 3] * inv_l_i)
-            );
-            *((device half4*)(output + output_base + tid_in_tgp * 4)) = result;
-        }
-    }
-    // Handle remaining elements with regular stride
-    for (int d = tid_in_tgp; d < head_size; d += TGP_SIZE) {
-        output[output_base + d] = half(acc_i[d] * inv_l_i);
-    }
-}

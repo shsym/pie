@@ -504,6 +504,10 @@ def main(
         dtype: The data type for model weights (e.g., 'bfloat16', 'float16').
         enable_profiling: Enable unified profiler (timing + tensor tracking) (default: False).
     """
+    # Set PIE_METAL_PAGE_SIZE from config before importing handler
+    # This ensures metal_kernels.ops initializes with the correct page_size
+    os.environ["PIE_METAL_PAGE_SIZE"] = str(kv_page_size)
+
     # Import here to avoid circular imports
     # pylint: disable=import-outside-toplevel
     from handler import Handler
