@@ -724,6 +724,38 @@ async fn handle_config_command(command: ConfigCommands) -> Result<()> {
 // SECTION: Helpers
 //================================================================================//
 
+/// Convert a backend config TOML table into command-line arguments.
+/// Handles boolean values specially to work correctly with typer/click in Python.
+fn backend_config_to_args(backend_table: &toml::map::Map<String, toml::Value>) -> Vec<String> {
+    let mut args = Vec::new();
+
+    for (key, value) in backend_table {
+        // Skip internal keys that aren't command-line arguments
+        if key == "backend_type" || key == "exec_path" {
+            continue;
+        }
+
+        // Handle boolean values specially
+        match value {
+            toml::Value::Boolean(false) => {
+                // Skip false booleans entirely (absence means False in typer)
+                continue;
+            }
+            toml::Value::Boolean(true) => {
+                // For true booleans, pass the flag without a value
+                args.push(format!("--{}", key));
+            }
+            _ => {
+                // For other types, pass key and value
+                args.push(format!("--{}", key));
+                args.push(value.to_string().trim_matches('"').to_string());
+            }
+        }
+    }
+
+    args
+}
+
 fn build_configs(
     config_path: Option<PathBuf>,
     no_auth: bool,
@@ -1262,12 +1294,10 @@ async fn start_engine_and_backend(
                 .arg("--auth_token")
                 .arg(&auth_token);
 
-            for (key, value) in backend_table {
-                if key == "backend_type" || key == "exec_path" {
-                    continue;
-                }
-                cmd.arg(format!("--{}", key))
-                    .arg(value.to_string().trim_matches('"').to_string());
+            // Convert backend config to command-line arguments
+            let backend_args = backend_config_to_args(&backend_table);
+            for arg in backend_args {
+                cmd.arg(arg);
             }
 
             // On Linux, ask the kernel to send SIGKILL to this process when
