@@ -282,6 +282,51 @@ using namespace metal;
 
         return result
 
+    # Metal constant memory limit (64KB)
+    CONSTANT_MEMORY_LIMIT = 64 * 1024
+
+    def _validate_constant_buffer_sizes(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+    ) -> None:
+        """Validate that index buffers fit in Metal constant memory (64KB).
+
+        Metal constant address space has a 64KB limit. This validation ensures
+        index buffers don't exceed this limit before kernel launch.
+
+        Args:
+            qo_indptr: Query offset indirection pointer
+            kv_page_indptr: KV page indirection pointer
+            kv_page_indices: KV page indices
+            kv_last_page_lens: Last page lengths
+
+        Raises:
+            RuntimeError: If total buffer size exceeds constant memory limit
+        """
+        total_size = (
+            qo_indptr.numel() * qo_indptr.element_size()
+            + kv_page_indptr.numel() * kv_page_indptr.element_size()
+            + kv_page_indices.numel() * kv_page_indices.element_size()
+            + kv_last_page_lens.numel() * kv_last_page_lens.element_size()
+        )
+
+        if total_size > self.CONSTANT_MEMORY_LIMIT:
+            raise RuntimeError(
+                f"Index buffers ({total_size} bytes) exceed Metal constant "
+                f"memory limit ({self.CONSTANT_MEMORY_LIMIT} bytes). "
+                f"Consider reducing max_num_pages or batch_size."
+            )
+
+        # Log warning if approaching limit (>80% usage)
+        usage_percent = (total_size / self.CONSTANT_MEMORY_LIMIT) * 100
+        if usage_percent > 80:
+            print(
+                f"⚠️  Constant memory usage: {usage_percent:.1f}% ({total_size} bytes)"
+            )
+
     def _run_full_attention(
         self,
         query: torch.Tensor,
@@ -308,6 +353,11 @@ using namespace metal;
         """
 
         lib = self.compiled_libraries["attention"]
+
+        # Validate that index buffers fit in Metal constant memory (64KB limit)
+        self._validate_constant_buffer_sizes(
+            qo_indptr, kv_page_indptr, kv_page_indices, kv_last_page_lens
+        )
 
         with start_profile("attn_params_setup"):
             # Extract dimensions
