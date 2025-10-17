@@ -298,17 +298,14 @@ kernel void batch_prefill_attention_unified_fp16_simdgroup_kernel(
             );
 
             // Online softmax: update running max and rescale previous accumulators
-            threadgroup float m_prev;
+            // Thread 0 updates m_i and broadcasts old value via simd_scratch
             if (tid_in_tgp == 0) {
-                m_prev = m_i;
+                float m_prev_local = m_i;
                 m_i = max(m_i, m_j);
-                simd_scratch[0] = m_prev; // Store for broadcast
+                simd_scratch[0] = m_prev_local;
             }
-            // Synchronize threads - no memory fence needed since simd_scratch[0]
-            // was written by thread 0 before this barrier, and we only need to
-            // ensure thread 0's write is complete (ordering handled by GPU)
-            threadgroup_barrier(mem_flags::mem_none);
-            m_prev = simd_scratch[0]; // Broadcast previous max
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float m_prev = simd_scratch[0]; // All threads read broadcasted value
 
             float scale_factor = fast::exp(m_prev - m_i);
             if (tid_in_tgp == 0) {
@@ -694,17 +691,14 @@ kernel void batch_prefill_attention_unified_f32_simdgroup_kernel(
             );
 
             // Online softmax: update running max and rescale previous accumulators
-            threadgroup float m_prev;
+            // Thread 0 updates m_i and broadcasts old value via simd_scratch
             if (tid_in_tgp == 0) {
-                m_prev = m_i;
+                float m_prev_local = m_i;
                 m_i = max(m_i, m_j);
-                simd_scratch[0] = m_prev; // Store for broadcast
+                simd_scratch[0] = m_prev_local;
             }
-            // Synchronize threads - no memory fence needed since simd_scratch[0]
-            // was written by thread 0 before this barrier, and we only need to
-            // ensure thread 0's write is complete (ordering handled by GPU)
-            threadgroup_barrier(mem_flags::mem_none);
-            m_prev = simd_scratch[0]; // Broadcast previous max
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float m_prev = simd_scratch[0]; // All threads read broadcasted value
 
             float scale_factor = fast::exp(m_prev - m_i);
             if (tid_in_tgp == 0) {
