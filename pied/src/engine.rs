@@ -1,9 +1,9 @@
 //! Engine and backend management for the Pie CLI.
 
 use anyhow::{Context, Result};
-use pie::client::{Instance, InstanceEvent};
-use pie::server::EventCode;
-use pie::{
+use libpie::client::{Instance, InstanceEvent};
+use libpie::server::EventCode;
+use libpie::{
     Config as EngineConfig,
     auth::{create_jwt, init_secret},
     client::{self, Client},
@@ -118,7 +118,7 @@ pub async fn start_engine_and_backend(
     // Start the main Pie engine server
     println!("🚀 Starting Pie engine...");
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = pie::run_server(engine_config, ready_tx, shutdown_rx).await {
+        if let Err(e) = libpie::run_server(engine_config, ready_tx, shutdown_rx).await {
             eprintln!("\n[Engine Error] Engine failed: {}", e);
         }
     });
@@ -130,7 +130,7 @@ pub async fn start_engine_and_backend(
     if !backend_configs.is_empty() {
         println!("🚀 Launching backend services...");
         init_secret(&client_config.auth_secret);
-        let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
+        let auth_token = create_jwt("backend-service", libpie::auth::Role::User)?;
 
         for backend_config in &backend_configs {
             let backend_table = backend_config
@@ -432,14 +432,11 @@ async fn stream_inferlet_output(mut instance: Instance, printer: SharedPrinter) 
 /// Connects to the engine and authenticates the client.
 pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
-    let client = match Client::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => {
-            anyhow::bail!("Could not connect to engine at {}. Is it running?", url);
-        }
-    };
+    let client = Client::connect(&url)
+        .await
+        .with_context(|| format!("Could not connect to engine at {}. Is it running?", url))?;
 
-    let token = create_jwt("default", pie::auth::Role::User)?;
+    let token = create_jwt("default", libpie::auth::Role::User)?;
     client.authenticate(&token).await?;
     Ok(client)
 }
