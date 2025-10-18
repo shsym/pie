@@ -37,6 +37,7 @@ docker run --rm --gpus all -v pie-models:/root/.cache/pie sslee0cs/pie:latest \
 ```
 
 **Step 2: Start PIE Engine**
+
 To start PIE with interactive shell (uses Python backend):
 ```bash
 docker run --gpus all --rm -it -v pie-models:/root/.cache/pie sslee0cs/pie:latest
