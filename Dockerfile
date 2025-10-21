@@ -1,4 +1,4 @@
-# Dockerfile for Pie with CUDA support
+# Dockerfile for Pie with CUDA support (Multi-stage build)
 # Supports specific verified CUDA/PyTorch combinations only
 # See scripts/build_docker_images.sh for supported versions
 
@@ -6,7 +6,10 @@ ARG CUDA_VERSION=12.6
 ARG CUDA_MINOR=1
 ARG PYTORCH_CUDA=cu126
 
-FROM nvidia/cuda:${CUDA_VERSION}.${CUDA_MINOR}-devel-ubuntu24.04
+# ============================================================================
+# Stage 1: Builder - Build all components with full development toolchain
+# ============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}.${CUDA_MINOR}-devel-ubuntu24.04 AS builder
 
 # Re-declare args after FROM
 ARG CUDA_VERSION
@@ -20,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
     PATH="/workspace/backend/backend-python/.venv/bin:/usr/local/cargo/bin:/root/.local/bin:${PATH}"
 
-# Install all dependencies
+# Install all build dependencies
 RUN apt-get update && apt-get install -y \
     git cmake ninja-build curl wget build-essential pkg-config \
     libzmq3-dev libcbor-dev libzstd-dev \
@@ -41,7 +44,7 @@ RUN cd backend/backend-cuda && mkdir -p build && cd build \
     && ninja
 
 # Install PIE CLI globally
-RUN cd pie-cli && cargo install --path .
+RUN cd pie && cargo install --path .
 
 # Build example inferlets
 RUN cd example-apps && cargo build --target wasm32-wasip2 --release
@@ -56,8 +59,49 @@ RUN cd backend/backend-python \
     && uv pip install -e ".[cuda,debug]" \
     && uv pip install ninja
 
-# Set default working directory for runtime
+# ============================================================================
+# Stage 2: Runtime - Minimal production image with only runtime dependencies
+# ============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}.${CUDA_MINOR}-runtime-ubuntu24.04
+
+# Re-declare args after FROM
+ARG CUDA_VERSION
+ARG PYTORCH_CUDA
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIE_HOME=/root/.cache/pie \
+    TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
+    PATH="/workspace/backend/backend-python/.venv/bin:/usr/local/bin:${PATH}"
+
+# Install ONLY runtime dependencies (no -dev packages, no build tools)
+RUN apt-get update && apt-get install -y \
+    python3.12 python3-pip python3.12-venv \
+    libzmq5 libcbor0.10 libzstd1 libssl3 \
+    curl wget \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /workspace
 
+# Copy PIE CLI binary from builder
+COPY --from=builder /usr/local/cargo/bin/pie /usr/local/bin/pie
+
+# Copy CUDA backend binary
+COPY --from=builder /workspace/backend/backend-cuda/build/bin/pie_cuda_be /workspace/backend/backend-cuda/build/bin/pie_cuda_be
+
+# Copy Python virtual environment
+COPY --from=builder /workspace/backend/backend-python/.venv /workspace/backend/backend-python/.venv
+
+# Copy Python backend source code
+COPY --from=builder /workspace/backend/backend-python/*.py /workspace/backend/backend-python/
+COPY --from=builder /workspace/backend/backend-python/model /workspace/backend/backend-python/model
+COPY --from=builder /workspace/backend/backend-python/metal_kernels /workspace/backend/backend-python/metal_kernels
+
+# Copy example inferlets
+COPY --from=builder /workspace/example-apps/target/wasm32-wasip2/release/*.wasm /workspace/example-apps/
+
+# Copy configuration file
+COPY --from=builder /workspace/pie/docker_config.toml /workspace/pie/docker_config.toml
+
 # Use docker_config.toml with Python backend and absolute paths
-CMD ["pie", "serve", "--config", "/workspace/pie-cli/docker_config.toml"]
+CMD ["pie", "serve", "--config", "/workspace/pie/docker_config.toml"]
