@@ -33,12 +33,28 @@ def _create_l4ma_model(model_info: ModelInfo):
     return model, fusion_map
 
 
+def _create_qwen3_model(model_info: ModelInfo):
+    """Create Qwen3 model and fusion map (supports both CUDA and Apple Silicon)."""
+    from config.qwen3 import Qwen3Arch
+    from model.qwen3 import Qwen3ForCausalLM, create_fusion_map
+
+    arch = Qwen3Arch(**model_info.architecture.__dict__)
+    model = Qwen3ForCausalLM(arch)
+    fusion_map = create_fusion_map(model)
+    return model, fusion_map
+
+
 # Build registry based on platform
 ARCHITECTURE_REGISTRY: dict[str, ArchitectureSpec | None] = {
     # L4MA is always available (works with both flashinfer and metal_kernels)
     "l4ma": ArchitectureSpec(
         create_model=_create_l4ma_model,
         description="Llama-like architecture with FlashInfer/metal_kernels backend",
+    ),
+    # Qwen3 is now available on both platforms (uses conditional imports)
+    "qwen3": ArchitectureSpec(
+        create_model=_create_qwen3_model,
+        description="Qwen3 architecture with FlashInfer/metal_kernels backend",
     ),
 }
 
@@ -56,15 +72,6 @@ if not IS_APPLE_SILICON:
         fusion_map = create_fusion_map(model)
         return model, fusion_map
 
-    def _create_qwen3_model(model_info: ModelInfo):
-        from config.qwen3 import Qwen3Arch
-        from model.qwen3 import Qwen3ForCausalLM, create_fusion_map
-
-        arch = Qwen3Arch(**model_info.architecture.__dict__)
-        model = Qwen3ForCausalLM(arch)
-        fusion_map = create_fusion_map(model)
-        return model, fusion_map
-
     def _create_gptoss_model(model_info: ModelInfo):
         from config.gptoss import GptOssArch
         from model.gptoss import GptOssForCausalLM, create_fusion_map
@@ -79,10 +86,6 @@ if not IS_APPLE_SILICON:
             "qwen2": ArchitectureSpec(
                 create_model=_create_qwen2_model,
                 description="Qwen2 architecture (requires FlashInfer)",
-            ),
-            "qwen3": ArchitectureSpec(
-                create_model=_create_qwen3_model,
-                description="Qwen3 architecture (requires FlashInfer)",
             ),
             "gptoss": ArchitectureSpec(
                 create_model=_create_gptoss_model,

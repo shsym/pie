@@ -37,7 +37,6 @@ docker run --rm --gpus all -v pie-models:/root/.cache/pie sslee0cs/pie:latest \
 ```
 
 **Step 2: Start PIE Engine**
-
 To start PIE with interactive shell (uses Python backend):
 ```bash
 docker run --gpus all --rm -it -v pie-models:/root/.cache/pie sslee0cs/pie:latest
@@ -76,50 +75,46 @@ Note the the very first inferlet response may take a few minutes due to the JIT 
 
 #### Step 1: Build
 
-Build the **CLIs** and the example inferlets.
+Build the **PIE CLI** and the example inferlets.
 
-1. **Build the engine `pie` and the client CLI `picli`:**
-   From the repository root, run
+- **Build the PIE CLI:**
+  From the repository root, run:
 
-   ```bash
-   cd pie && cargo install --path .
-   ```
+  ```bash
+  cd pie-cli && cargo install --path .
+  ```
 
-   Also, from the repository root, run
-   ```bash
-   cd client/cli && cargo install --path .
-   ```
+- **Build the Examples:**
 
-2. **Build the Examples:**
+  ```bash
+  cd example-apps && cargo build --target wasm32-wasip2 --release
+  ```
 
-   ```bash
-   cd example-apps && cargo build --target wasm32-wasip2 --release
-   ```
 
-#### Step 2: Configure engine and backend
+#### Step 2: Run an Inferlet
 
-1. Create default configuration file (substitute `$REPO` to the actual cloned repository path)
-   ```bash
-   pie config init python $REPO/backend/backend-python/server.py
-   ```
+Download a model, start the engine, and run an inferlet.
 
-2. Download the model
-   ```bash
-   pie model add qwen-3-0.6b
-   ```
-
-#### Step 3: Run an Inferlet
-
-1. **Start the Engine:**
-   Launch the Pie engine with the default configuration
+1. **Download a Model:**
+   Use the PIE CLI to add a model from the [model index](https://github.com/pie-project/model-index):
 
    ```bash
-   pie
+   pie model add "llama-3.2-1b-instruct"
    ```
 
-2. **Run an Inferlet:**
-   From another terminal window, run
+2. **Start the Engine:**
+   Launch the PIE engine with an example configuration. This opens the interactive PIE shell:
 
    ```bash
-   picli submit $REPO/example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
+   cd pie-cli
+   pie start --config ./example_config.toml
    ```
+
+3. **Run an Inferlet:**
+   From within the PIE shell, execute a compiled inferlet:
+
+   ```bash
+   pie> run ../example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
+   ```
+
+

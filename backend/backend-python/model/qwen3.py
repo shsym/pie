@@ -8,7 +8,19 @@ from torch import nn
 
 from adapter_utils import AdapterSubpass
 from config.qwen3 import Qwen3Arch
-import flashinfer as ops
+from platform_detection import is_apple_silicon
+
+# Conditional import: use metal_kernels on Apple Silicon, flashinfer on CUDA
+if is_apple_silicon():
+    try:
+        import metal_kernels.ops as ops  # type: ignore[import-not-found]
+    except ImportError:
+        ops = None  # type: ignore[assignment]
+else:
+    try:
+        import flashinfer as ops  # type: ignore[import-not-found,no-redef]
+    except ImportError:
+        ops = None  # type: ignore[assignment]
 
 VERSION = "0.1.0"
 

@@ -390,6 +390,69 @@ class BatchDecodeWithPagedKVCacheWrapper:
         )
 
 
+def apply_rope_pos_ids_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    rope_theta: float = 10000.0,
+    interleave: bool = False,
+) -> None:
+    """
+    Apply standard RoPE encoding in-place using Metal kernels.
+
+    This is a drop-in replacement for FlashInfer's apply_rope_pos_ids_inplace.
+    Simplified version without scaling factors (for Qwen3 and similar models).
+
+    Parameters:
+        q: Query ragged tensor, shape: (nnz, num_q_heads, head_dim) - modified in-place
+        k: Key ragged tensor, shape: (nnz, num_k_heads, head_dim) - modified in-place
+        pos_ids: Position indices, shape: (nnz)
+        rope_theta: The theta value used in rope embedding (default: 10000.0)
+        interleave: Whether to use interleaved layout (default: False)
+    """
+    # If PyTorch mode is enabled, use PyTorch reference implementation
+    if PYTORCH_MODE:
+        rope_reference(
+            q,
+            pos_ids,
+            rope_theta=rope_theta,
+            rope_factor=1.0,  # No scaling for standard RoPE
+            interleaved=interleave,
+            inplace=True,
+        )
+        rope_reference(
+            k,
+            pos_ids,
+            rope_theta=rope_theta,
+            rope_factor=1.0,  # No scaling for standard RoPE
+            interleaved=interleave,
+            inplace=True,
+        )
+        return
+
+    # Validate all tensors are on MPS device
+    _validate_mps_device(q, "q")
+    _validate_mps_device(k, "k")
+    _validate_mps_device(pos_ids, "pos_ids")
+
+    # Apply RoPE to both query and key tensors using Metal kernels
+    compiler = get_mps_compiler()
+    compiler.run_rope_mps(
+        q,
+        pos_ids,
+        rope_theta=rope_theta,
+        rope_factor=1.0,  # No scaling for standard RoPE
+        interleaved=interleave,
+    )
+    compiler.run_rope_mps(
+        k,
+        pos_ids,
+        rope_theta=rope_theta,
+        rope_factor=1.0,  # No scaling for standard RoPE
+        interleaved=interleave,
+    )
+
+
 def apply_llama31_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -769,6 +832,7 @@ class sampling:  # pylint: disable=invalid-name
 __all__ = [
     "BatchPrefillWithPagedKVCacheWrapper",
     "BatchDecodeWithPagedKVCacheWrapper",
+    "apply_rope_pos_ids_inplace",
     "apply_llama31_rope_pos_ids_inplace",
     "append_paged_kv_cache",
     "get_seq_lens",
