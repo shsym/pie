@@ -25,7 +25,6 @@ import msgpack
 import msgspec
 import torch
 import zmq
-from platformdirs import user_cache_dir
 from websockets.sync.client import connect
 
 from profiler import initialize_memory_tracker
@@ -61,8 +60,16 @@ class HandlerId(enum.Enum):
 
 def resolve_cache_dir(cache_dir: str | None) -> str:
     """Resolve the cache directory using CLI arg > env var > default."""
+    if cache_dir:
+        return cache_dir
 
-    return cache_dir or os.environ.get("PIE_HOME") or str(Path(user_cache_dir("pie")))
+    if "PIE_HOME" in os.environ:
+        return os.environ["PIE_HOME"]
+
+    # Use ~/.cache/pie consistently across all platforms (Linux, macOS, etc.)
+    # This matches the C++ backend implementation in utils.hpp
+    home = Path.home()
+    return str(home / ".cache" / "pie")
 
 
 def build_config(**kwargs: Any) -> Dict[str, Any]:

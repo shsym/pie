@@ -1,13 +1,16 @@
 //! Engine and backend management for the Pie CLI.
 
+use crate::config::ConfigFile;
+use crate::engine;
+use crate::output::SharedPrinter;
+use crate::path;
+
 use anyhow::{Context, Result};
-use pie::client::{Instance, InstanceEvent};
-use pie::server::EventCode;
-use pie::{
-    Config as EngineConfig,
-    auth::{create_jwt, init_secret},
-    client::{self, Client},
-};
+use engine::Config as EngineConfig;
+use pie_client::auth;
+use pie_client::client::{self, Client};
+use pie_client::client::{Instance, InstanceEvent};
+use pie_client::message::EventCode;
 use rand::{Rng, distr::Alphanumeric};
 use std::path::Path;
 use std::sync::Arc;
@@ -17,10 +20,6 @@ use tokio::process::{Child, Command as TokioCommand};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot::{self, Sender};
 use tokio::task::JoinHandle;
-
-use crate::config::ConfigFile;
-use crate::output::SharedPrinter;
-use crate::path;
 
 // Helper struct for what client commands need to know
 #[derive(Debug, Clone)]
@@ -118,7 +117,7 @@ pub async fn start_engine_and_backend(
     // Start the main Pie engine server
     println!("🚀 Starting Pie engine...");
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = pie::run_server(engine_config, ready_tx, shutdown_rx).await {
+        if let Err(e) = engine::run_server(engine_config, ready_tx, shutdown_rx).await {
             eprintln!("\n[Engine Error] Engine failed: {}", e);
         }
     });
@@ -129,8 +128,8 @@ pub async fn start_engine_and_backend(
     let mut backend_processes = Vec::new();
     if !backend_configs.is_empty() {
         println!("🚀 Launching backend services...");
-        init_secret(&client_config.auth_secret);
-        let auth_token = create_jwt("backend-service", pie::auth::Role::User)?;
+        auth::init_secret(&client_config.auth_secret);
+        let auth_token = auth::create_jwt("backend-service", auth::Role::User)?;
 
         for backend_config in &backend_configs {
             let backend_table = backend_config
@@ -432,14 +431,11 @@ async fn stream_inferlet_output(mut instance: Instance, printer: SharedPrinter) 
 /// Connects to the engine and authenticates the client.
 pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Client> {
     let url = format!("ws://{}:{}", client_config.host, client_config.port);
-    let client = match Client::connect(&url).await {
-        Ok(c) => c,
-        Err(_) => {
-            anyhow::bail!("Could not connect to engine at {}. Is it running?", url);
-        }
-    };
+    let client = Client::connect(&url)
+        .await
+        .with_context(|| format!("Could not connect to engine at {}. Is it running?", url))?;
 
-    let token = create_jwt("default", pie::auth::Role::User)?;
+    let token = auth::create_jwt("default", auth::Role::User)?;
     client.authenticate(&token).await?;
     Ok(client)
 }

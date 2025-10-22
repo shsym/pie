@@ -1,8 +1,8 @@
-use crate::instance::{InstanceId, InstanceState};
+use super::instance::{InstanceId, InstanceState};
+use super::service::{Service, ServiceError};
+use super::{api, server, service};
+use crate::model;
 use crate::model::request::QueryResponse;
-use crate::service::{Service, ServiceError};
-use crate::{api, model, server, service};
-use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
 use std::net::SocketAddr;
@@ -12,8 +12,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 use wasmtime::component::Resource;
 use wasmtime::{
-    Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store,
-    component::Component, component::Linker,
+    Config, Engine, PoolingAllocationConfig, Store, component::Component, component::Linker,
 };
 use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::bindings::exports::wasi::http::incoming_handler::{

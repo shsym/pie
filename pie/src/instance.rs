@@ -1,7 +1,7 @@
-use crate::api::core::Queue;
+use super::api::core::Queue;
+use super::utils;
 use crate::model::resource::{ResourceId, ResourceTypeId};
-use crate::utils;
-use anyhow::{Result, bail, format_err};
+use anyhow::{Result, format_err};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::io;

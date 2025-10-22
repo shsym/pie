@@ -24,11 +24,9 @@ def _create_l4ma_model(model_info: ModelInfo):
     """Create L4MA model and fusion map."""
     from config.l4ma import L4maArch
     from model.l4ma import L4maForCausalLM, create_fusion_map
-    from model.l4ma_flashinfer import FlashInferL4maBackend
 
-    backend = FlashInferL4maBackend()
     arch = L4maArch(**model_info.architecture.__dict__)
-    model = L4maForCausalLM(arch, backend=backend)
+    model = L4maForCausalLM(arch)
     fusion_map = create_fusion_map(model)
     return model, fusion_map
 

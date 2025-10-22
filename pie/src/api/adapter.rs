@@ -1,3 +1,4 @@
+use crate::api::core::forward::ForwardPass;
 use crate::api::core::{Blob, BlobResult, Queue};
 use crate::api::inferlet;
 use crate::instance::InstanceState;
@@ -8,7 +9,6 @@ use anyhow::Result;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
-use crate::api::core::forward::ForwardPass;
 
 impl inferlet::adapter::common::Host for InstanceState {
     async fn set_adapter(

@@ -24,7 +24,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Import profiler (unified profiler)
 from profiler import start_profile, initialize_memory_tracker, get_memory_tracker
 
-cache_dir = os.path.expanduser("~/Library/Caches/pie")
+cache_dir = os.path.expanduser("~/.cache/pie")
 
 # Initialize unified profiler
 initialize_memory_tracker(output_dir=".", enabled=True, enable_timing=True)

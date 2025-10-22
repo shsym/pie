@@ -66,19 +66,9 @@ namespace utils {
         }
         std::filesystem::path home_path(home);
 
-#if defined(__APPLE__)
-        // macOS: ~/Library/Caches
-        return home_path / "Library" / "Caches";
-#else
-        // Linux: Follow XDG Base Directory Specification
-        const char *xdg_cache_home = std::getenv("XDG_CACHE_HOME");
-        if (xdg_cache_home && std::strlen(xdg_cache_home) > 0)
-        {
-            return std::filesystem::path(xdg_cache_home);
-        }
-        // Default to ~/.cache
+        // Use ~/.cache consistently across all platforms for simplicity
+        // This ensures Docker volume mounts work identically across OSes
         return home_path / ".cache";
-#endif
 #endif
         // This throw statement is now unreachable due to the platform-specific #if/#else structure
         // ensuring a return or throw within each branch.

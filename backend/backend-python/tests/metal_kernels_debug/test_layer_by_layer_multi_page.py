@@ -22,7 +22,7 @@ os.environ["PIE_METAL_PYTORCH_MODE"] = "1"
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-cache_dir = os.path.expanduser("~/Library/Caches/pie")
+cache_dir = os.path.expanduser("~/.cache/pie")
 
 
 def test_scenario(

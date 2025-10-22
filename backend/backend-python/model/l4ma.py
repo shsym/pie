@@ -1,7 +1,8 @@
 """Llama-Like Large Language Model Architecture (L4MA).
 
-This module now focuses on the architecture itself and relies on an injected
-runtime backend for kernel-specific behaviour (e.g. FlashInfer or Metal).
+Supports both FlashInfer and metal_kernels backends:
+- metal_kernels: Metal-accelerated operations for macOS with Apple Silicon
+- FlashInfer: CUDA-accelerated operations for other platforms
 """
 
 from __future__ import annotations
@@ -13,10 +14,32 @@ from torch import nn
 # Safe import of adapter functionality
 from adapter_utils import AdapterSubpass
 from config.l4ma import L4maArch
-from model.l4ma_runtime import L4maBackend, L4maForwardContext, RuntimeInputs
+from platform_detection import is_apple_silicon
 from profiler import start_profile, profile_attention
 
+# Direct import of backend operations based on platform
+if is_apple_silicon():
+    try:
+        import metal_kernels.ops as ops  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise RuntimeError(f"metal_kernels backend is not available: {e}") from e
+else:
+    try:
+        import flashinfer as ops  # type: ignore[import-not-found,no-redef]
+    except ImportError as e:
+        raise RuntimeError(f"flashinfer backend is not available: {e}") from e
+
 VERSION = "0.1.0"
+
+
+def _infer_page_size(kv_cache_at_layer) -> int:
+    """Infer the page size from the KV cache tensor shape."""
+    if not kv_cache_at_layer:
+        raise ValueError("kv_cache_at_layer must contain at least one tensor")
+    first_layer = kv_cache_at_layer[0]
+    if first_layer.ndim < 3:
+        raise ValueError("Unexpected KV cache tensor shape; expected >= 3 dimensions")
+    return int(first_layer.shape[2])
 
 
 def create_fusion_map(model: nn.Module):
@@ -133,13 +156,18 @@ class L4maAttention(nn.Module):
 
     def forward(
         self,
-        runtime: L4maForwardContext,
+        wrapper,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         kv_cache_at_layer: Sequence[torch.Tensor],
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
         adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
-        """Attention forward pass that delegates runtime specifics."""
+        """Attention forward pass using FlashInfer ops directly."""
 
         n, _ = hidden_states.size()
         qkv_states = self.qkv_proj(hidden_states)
@@ -169,27 +197,39 @@ class L4maAttention(nn.Module):
             n, self.config.num_key_value_heads, self.config.head_size
         )
 
-        runtime.apply_rope(query_states, key_states, position_ids)
+        # Apply RoPE encoding
+        ops.apply_llama31_rope_pos_ids_inplace(
+            q=query_states,
+            k=key_states,
+            pos_ids=position_ids,
+            rope_scale=self.config.rope_factor,
+            rope_theta=self.config.rope_theta,
+            low_freq_factor=self.config.rope_low_frequency_factor,
+            high_freq_factor=self.config.rope_high_frequency_factor,
+        )
 
         if query_states.dtype != self.config.dtype:
             query_states = query_states.to(self.config.dtype)
 
-        runtime.append_kv_cache(
-            layer_idx=self.layer_idx,
-            key_states=key_states,
-            value_states=value_states,
-            kv_cache_layer=kv_cache_at_layer[self.layer_idx],
+        # Append to KV cache
+        ops.append_paged_kv_cache(
+            append_key=key_states,
+            append_value=value_states,
+            batch_indices=batch_indices,
+            positions=batch_positions,
+            paged_kv_cache=kv_cache_at_layer[self.layer_idx],
+            kv_indices=kv_page_indices,
+            kv_indptr=kv_page_indptr,
+            kv_last_page_len=kv_last_page_lens,
+            kv_layout="NHD",
         )
 
         with profile_attention(
             self.layer_idx, query_states, kv_cache_at_layer[self.layer_idx]
         ):
-            attn_output = runtime.run_attention(
-                layer_idx=self.layer_idx,
-                query_states=query_states,
-                kv_cache_layer=kv_cache_at_layer[self.layer_idx],
-            )
+            attn_output = wrapper.run(query_states, kv_cache_at_layer[self.layer_idx])
 
+        attn_output = attn_output.reshape(n, -1)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -219,13 +259,18 @@ class L4maDecoderLayer(nn.Module):
 
     def forward(
         self,
-        runtime: L4maForwardContext,
+        wrapper,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         kv_cache_at_layer: Sequence[torch.Tensor],
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        batch_positions: torch.Tensor,
         adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
-        """Run the decoder layer using the provided runtime context."""
+        """Run the decoder layer."""
 
         with start_profile("input_norm"):
             residual = hidden_states
@@ -233,10 +278,15 @@ class L4maDecoderLayer(nn.Module):
 
         with start_profile("attention"):
             hidden_states = self.self_attn(
-                runtime=runtime,
+                wrapper=wrapper,
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 kv_cache_at_layer=kv_cache_at_layer,
+                kv_page_indices=kv_page_indices,
+                kv_page_indptr=kv_page_indptr,
+                kv_last_page_lens=kv_last_page_lens,
+                batch_indices=batch_indices,
+                batch_positions=batch_positions,
                 adapter_subpass=adapter_subpass,
             )
 
@@ -267,10 +317,9 @@ class L4maDecoderLayer(nn.Module):
 class L4maModel(nn.Module):
     """Backbone model for the L4MA architecture."""
 
-    def __init__(self, config: L4maArch, backend: L4maBackend):
+    def __init__(self, config: L4maArch):
         super().__init__()
         self.config = config
-        self.backend = backend
         self.embed_tokens = nn.Embedding(
             config.vocab_size,
             config.hidden_size,
@@ -291,6 +340,17 @@ class L4maModel(nn.Module):
             dtype=config.dtype,
         )
 
+        # FlashInfer wrappers for attention operations
+        self.workspace_buffer = torch.empty(
+            128 * 1024 * 1024, dtype=torch.uint8, device=config.device
+        )
+        self.wrapper_decode = ops.BatchDecodeWithPagedKVCacheWrapper(
+            self.workspace_buffer, "NHD"
+        )
+        self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(
+            self.workspace_buffer, "NHD"
+        )
+
     def forward(
         self,
         # input
@@ -308,36 +368,67 @@ class L4maModel(nn.Module):
         # subpasses
         adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
-        """Forward pass through all decoder layers using the injected backend."""
+        """Forward pass through all decoder layers."""
 
         with start_profile("model_setup"):
             hidden_states = input_embeds
             n, _ = hidden_states.size()
 
-            runtime_inputs = RuntimeInputs(
-                num_tokens=n,
-                kv_cache_at_layer=kv_cache_at_layer,
-                kv_page_indices=kv_page_indices,
-                kv_page_indptr=kv_page_indptr,
-                kv_last_page_lens=kv_last_page_lens,
-                qo_indptr=qo_indptr,
-                custom_mask=custom_mask,
-                single_token_inference_mode=single_token_inference_mode,
+            page_size = _infer_page_size(kv_cache_at_layer)
+
+            seq_lens = ops.get_seq_lens(
+                kv_page_indptr,
+                kv_last_page_lens,
+                page_size,
             )
 
-            runtime = self.backend.create_forward_context(
-                config=self.config,
-                inputs=runtime_inputs,
+            batch_indices, batch_positions = ops.get_batch_indices_positions(
+                append_indptr=qo_indptr,
+                seq_lens=seq_lens,
+                nnz=n,
             )
+
+            if single_token_inference_mode:
+                wrapper = self.wrapper_decode
+                wrapper.plan(
+                    indptr=kv_page_indptr,
+                    indices=kv_page_indices,
+                    last_page_len=kv_last_page_lens,
+                    num_qo_heads=self.config.num_query_heads,
+                    num_kv_heads=self.config.num_key_value_heads,
+                    head_dim=self.config.head_size,
+                    page_size=page_size,
+                    pos_encoding_mode="NONE",
+                    q_data_type=self.config.dtype,
+                )
+            else:
+                wrapper = self.wrapper_append
+                wrapper.plan(
+                    qo_indptr=qo_indptr,
+                    paged_kv_indptr=kv_page_indptr,
+                    paged_kv_indices=kv_page_indices,
+                    paged_kv_last_page_len=kv_last_page_lens,
+                    num_qo_heads=self.config.num_query_heads,
+                    num_kv_heads=self.config.num_key_value_heads,
+                    head_dim_qk=self.config.head_size,
+                    page_size=page_size,
+                    custom_mask=custom_mask,
+                    q_data_type=self.config.dtype,
+                )
 
         with start_profile("decoder_layers"):
             for layer_idx, decoder_layer in enumerate(self.layers):
                 with start_profile(f"layer_{layer_idx}"):
                     hidden_states = decoder_layer(
-                        runtime=runtime,
+                        wrapper=wrapper,
                         hidden_states=hidden_states,
                         position_ids=position_ids,
                         kv_cache_at_layer=kv_cache_at_layer,
+                        kv_page_indices=kv_page_indices,
+                        kv_page_indptr=kv_page_indptr,
+                        kv_last_page_lens=kv_last_page_lens,
+                        batch_indices=batch_indices,
+                        batch_positions=batch_positions,
                         adapter_subpass=adapter_subpass,
                     )
 
@@ -350,10 +441,10 @@ class L4maModel(nn.Module):
 class L4maForCausalLM(nn.Module):
     """Top-level causal language model wrapper for L4MA architecture."""
 
-    def __init__(self, config: L4maArch, backend: L4maBackend):
+    def __init__(self, config: L4maArch):
         super().__init__()
         self.config = config
-        self.model = L4maModel(config, backend)
+        self.model = L4maModel(config)
         self.lm_head = nn.Linear(
             config.hidden_size,
             config.vocab_size,

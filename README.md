@@ -32,28 +32,24 @@ The easiest way to run Pie with CUDA support is using our pre-built Docker image
 
 ```bash
 docker pull sslee0cs/pie:latest
-docker run --rm --gpus all -v pie-models:/root/.cache/pie sslee0cs/pie:latest \
-  /workspace/pie-cli/target/release/pie model add "llama-3.2-1b-instruct"
+mkdir -p ~/.cache
+docker run --rm --gpus all -it -v ~/.cache:/root/.cache sslee0cs/pie:latest \
+  pie model add "llama-3.2-1b-instruct"
 ```
 
-**Step 2: Start PIE Engine**
-To start PIE with interactive shell (uses Python backend):
+- Models are downloaded into `~/.cache/pie/models/` and persist across container runs.
+
+- FlashInfer's JIT-compiled kernels are cached in `~/.cache/flashinfer/` to avoid recompilation.
+
+
+**Step 2: Run an Inferlet**
 ```bash
-docker run --gpus all --rm -it -v pie-models:/root/.cache/pie sslee0cs/pie:latest
+docker run --gpus all --rm -it -v ~/.cache:/root/.cache sslee0cs/pie:latest \
+  pie run --config /workspace/pie/docker_config.toml \
+  /workspace/example-apps/text_completion.wasm -- --prompt "What is the capital of France?"
 ```
 
-**Step 3: Run Inferlets**
-
-From within the PIE shell, after you see the model parameters are fully loaded:
-
-```bash
-pie> run example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
-```
-You can see a message saying that an inferlet has been lauched.
-```
-✅ Inferlet launched with ID: ...
-```
-Note the the very first inferlet response may take a few minutes due to the JIT compliation of FlashInfer.
+Note that the very first inferlet response may take a few minutes due to the JIT compilation of FlashInfer.
 
 ### Manual Installation
 
@@ -75,46 +71,50 @@ Note the the very first inferlet response may take a few minutes due to the JIT 
 
 #### Step 1: Build
 
-Build the **PIE CLI** and the example inferlets.
+Build the **CLIs** and the example inferlets.
 
-- **Build the PIE CLI:**
-  From the repository root, run:
-
-  ```bash
-  cd pie-cli && cargo install --path .
-  ```
-
-- **Build the Examples:**
-
-  ```bash
-  cd example-apps && cargo build --target wasm32-wasip2 --release
-  ```
-
-
-#### Step 2: Run an Inferlet
-
-Download a model, start the engine, and run an inferlet.
-
-1. **Download a Model:**
-   Use the PIE CLI to add a model from the [model index](https://github.com/pie-project/model-index):
+1. **Build the engine `pie` and the client CLI `picli`:**
+   From the repository root, run
 
    ```bash
-   pie model add "llama-3.2-1b-instruct"
+   cd pie && cargo install --path .
    ```
 
-2. **Start the Engine:**
-   Launch the PIE engine with an example configuration. This opens the interactive PIE shell:
+   Also, from the repository root, run
+   ```bash
+   cd client/cli && cargo install --path .
+   ```
+
+2. **Build the Examples:**
 
    ```bash
-   cd pie-cli
-   pie start --config ./example_config.toml
+   cd example-apps && cargo build --target wasm32-wasip2 --release
    ```
 
-3. **Run an Inferlet:**
-   From within the PIE shell, execute a compiled inferlet:
+#### Step 2: Configure engine and backend
+
+1. Create default configuration file (substitute `$REPO` to the actual cloned repository path)
+   ```bash
+   pie config init python $REPO/backend/backend-python/server.py
+   ```
+
+2. Download the model
+   ```bash
+   pie model add qwen-3-0.6b
+   ```
+
+#### Step 3: Run an Inferlet
+
+1. **Start the Engine:**
+   Launch the Pie engine with the default configuration
 
    ```bash
-   pie> run ../example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
+   pie
    ```
 
+2. **Run an Inferlet:**
+   From another terminal window, run
 
+   ```bash
+   picli submit $REPO/example-apps/target/wasm32-wasip2/release/text_completion.wasm -- --prompt "What is the capital of France?"
+   ```

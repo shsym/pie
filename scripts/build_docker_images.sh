@@ -62,7 +62,7 @@ for config in "${VERIFIED_CONFIGS[@]}"; do
         --build-arg CUDA_VERSION=${cuda_ver} \
         --build-arg CUDA_MINOR=${cuda_minor} \
         --build-arg PYTORCH_CUDA=${torch_cuda} \
-        -f Dockerfile.dev \
+        --target development \
         -t pie:${tag}-dev \
         -t pie:dev \
         .
@@ -79,10 +79,12 @@ echo "Available images:"
 $SUDO docker images | grep -E "^pie" || echo "No pie images found"
 echo ""
 echo "To run:"
-echo "  Latest: $SUDO docker run --gpus all -it -v pie-models:/root/.cache/pie pie:latest"
-echo "  Development: $SUDO docker run --gpus all -it -v pie-models:/root/.cache/pie pie:dev"
+echo "  Latest: $SUDO docker run --gpus all -it -v ~/.cache:/root/.cache pie:latest"
+echo "  Development: $SUDO docker run --gpus all -it -v ~/.cache:/root/.cache pie:dev"
+echo ""
+echo "Note: Mount ~/.cache (not just ~/.cache/pie) to persist both models and FlashInfer JIT cache"
 echo ""
 echo "To download a model first:"
-echo "  $SUDO docker run --rm --gpus all -v pie-models:/root/.cache/pie pie:latest pie model add \"llama-3.2-1b-instruct\""
+echo "  $SUDO docker run --rm --gpus all -v ~/.cache:/root/.cache pie:latest pie model add \"llama-3.2-1b-instruct\""
 echo ""
 echo "Build complete!"

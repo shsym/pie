@@ -1,5 +1,6 @@
-use crate::instance::InstanceState;
 use crate::api::core::Queue;
+use crate::api::inferlet;
+use crate::instance::InstanceState;
 use crate::model::request::{ForwardPassRequest, ForwardPassResponse, Request};
 use crate::model::resource::{EMBED_TYPE_ID, KV_PAGE_TYPE_ID, ResourceId};
 use crate::model::submit_request;
@@ -12,7 +13,6 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 use wasmtime_wasi::async_trait;
 use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
-use crate::api::inferlet;
 
 #[derive(Debug)]
 pub struct ForwardPass {
