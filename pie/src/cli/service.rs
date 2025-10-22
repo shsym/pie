@@ -4,6 +4,7 @@ use crate::config::ConfigFile;
 use crate::engine;
 use crate::output::SharedPrinter;
 use crate::path;
+use crate::server::InternalEvent;
 
 use anyhow::{Context, Result};
 use engine::Config as EngineConfig;
@@ -277,23 +278,23 @@ pub async fn start_engine_and_backend(
         }
     }
 
-    wait_for_backend_ready(&client_config, backend_processes.len()).await?;
+    wait_for_backend_ready(backend_processes.len()).await?;
 
     Ok((shutdown_tx, server_handle, backend_processes, client_config))
 }
 
 /// Stops the backend heartbeat.
-pub async fn stop_backend_heartbeat(client_config: &ClientConfig) -> Result<()> {
-    let client = connect_and_authenticate(client_config).await?;
+pub async fn stop_backend_heartbeat() -> Result<()> {
     println!("🔄 Stopping backend heartbeat...");
-    client.stop_backend_heartbeat().await?;
+    let (tx, rx) = oneshot::channel();
+    InternalEvent::StopBackendHeartbeat { tx }.dispatch()?;
+    rx.await?;
     println!("✅ Backend heartbeat stopped.");
     Ok(())
 }
 
 /// Terminates the engine and backend processes.
 pub async fn terminate_engine_and_backend(
-    client_config: &ClientConfig,
     backend_processes: Vec<Child>,
     shutdown_tx: oneshot::Sender<()>,
     server_handle: tokio::task::JoinHandle<()>,
@@ -303,7 +304,7 @@ pub async fn terminate_engine_and_backend(
     // Stop the backend heartbeat before sending the signals to the backend processes.
     // This is to avoid broken pipe errors due to sending signals to the backend processes
     // after they have exited.
-    stop_backend_heartbeat(client_config).await?;
+    stop_backend_heartbeat().await?;
     println!("🔄 Terminating backend processes...");
 
     // Iterate through the child processes, signal them, and wait for them to exit.
@@ -442,19 +443,22 @@ pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Cl
 
 /// Waits for all backend processes to be attached. If any backend process terminates prematurely
 /// (before registering), this function will fail immediately.
-pub async fn wait_for_backend_ready(
-    client_config: &ClientConfig,
-    num_backends: usize,
-) -> Result<()> {
-    let backend_query_client = connect_and_authenticate(&client_config).await?;
-
+pub async fn wait_for_backend_ready(num_backends: usize) -> Result<()> {
     // Set up SIGCHLD signal handler to detect when child processes terminate prematurely
     let mut sigchld =
         signal(SignalKind::child()).context("Failed to set up SIGCHLD signal handler")?;
 
+    let (tx, rx) = oneshot::channel();
+    InternalEvent::WaitBackendChange {
+        cur_num_attached_backends: None,
+        cur_num_rejected_backends: None,
+        tx,
+    }
+    .dispatch()?;
+
     // Get initial backend state
     let (mut num_attached, mut num_rejected) = tokio::select! {
-        result = backend_query_client.wait_backend_change(None, None) => {
+        result = rx => {
             result?
         }
         _ = sigchld.recv() => {
@@ -467,12 +471,15 @@ pub async fn wait_for_backend_ready(
 
     // Wait for all backends to be attached
     while (num_attached as usize) < num_backends && num_rejected == 0 {
+        let (tx, rx) = oneshot::channel();
+        InternalEvent::WaitBackendChange {
+            cur_num_attached_backends: Some(num_attached),
+            cur_num_rejected_backends: Some(num_rejected),
+            tx,
+        }
+        .dispatch()?;
         (num_attached, num_rejected) = tokio::select! {
-            result = backend_query_client
-                .wait_backend_change(
-                    Some(num_attached),
-                    Some(num_rejected)
-                ) => {
+            result = rx => {
                 result?
             }
             _ = sigchld.recv() => {
