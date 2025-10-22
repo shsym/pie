@@ -11,7 +11,7 @@ import torch
 import ztensor
 from tqdm import tqdm
 
-from config.common import ModelInfo
+from model.config import ModelInfo
 
 
 CreateModelFn = Callable[[ModelInfo], Tuple[torch.nn.Module, dict]]

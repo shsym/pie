@@ -1,28 +1,57 @@
 """Qwen 3 Large Language Model Architecture (Qwen3)"""
 
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 from torch import nn
 
 from adapter_utils import AdapterSubpass
-from config.qwen3 import Qwen3Arch
+from model.config import CommonArch, ModelConfig
 from platform_detection import is_apple_silicon
 
-# Conditional import: use metal_kernels on Apple Silicon, flashinfer on CUDA
+# Direct import of backend operations based on platform
 if is_apple_silicon():
     try:
         import metal_kernels.ops as ops  # type: ignore[import-not-found]
-    except ImportError:
-        ops = None  # type: ignore[assignment]
+    except ImportError as e:
+        raise RuntimeError(f"metal_kernels backend is not available: {e}") from e
 else:
     try:
         import flashinfer as ops  # type: ignore[import-not-found,no-redef]
-    except ImportError:
-        ops = None  # type: ignore[assignment]
+    except ImportError as e:
+        raise RuntimeError(f"flashinfer backend is not available: {e}") from e
 
 VERSION = "0.1.0"
+
+
+@dataclass
+class Qwen3Arch(CommonArch):
+    """Qwen3 specific architecture configuration."""
+
+    rope_theta: float
+
+    @staticmethod
+    def from_config(cfg: ModelConfig) -> "Qwen3Arch":
+        """Parse Qwen3-specific architecture configuration."""
+        # Get common architecture fields
+        common_arch_dict = cfg.get_common_arch_dict()
+
+        # Get all the fields for the architecture section to grab other
+        # architecture-specific fields
+        arch_dict = cfg.get_required_key(cfg.root, "architecture")
+
+        # Get RoPE configuration (Qwen3 uses simpler RoPE with only theta)
+        rope_dict = cfg.get_required_key(arch_dict, "rope")
+        rope_theta = cfg.get_required_key(rope_dict, "theta")
+
+        return Qwen3Arch(
+            # Common fields
+            **common_arch_dict,
+            # Qwen3-specific fields
+            rope_theta=rope_theta,
+        )
 
 
 def create_fusion_map(model: nn.Module):

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Callable, NamedTuple
 
-from config.common import ModelInfo
+from model.config import ModelInfo
 from platform_detection import is_apple_silicon
 
 
@@ -22,8 +22,7 @@ class ArchitectureSpec(NamedTuple):
 
 def _create_l4ma_model(model_info: ModelInfo):
     """Create L4MA model and fusion map."""
-    from config.l4ma import L4maArch
-    from model.l4ma import L4maForCausalLM, create_fusion_map
+    from model.l4ma import L4maArch, L4maForCausalLM, create_fusion_map
 
     arch = L4maArch(**model_info.architecture.__dict__)
     model = L4maForCausalLM(arch)
@@ -33,8 +32,7 @@ def _create_l4ma_model(model_info: ModelInfo):
 
 def _create_qwen3_model(model_info: ModelInfo):
     """Create Qwen3 model and fusion map (supports both CUDA and Apple Silicon)."""
-    from config.qwen3 import Qwen3Arch
-    from model.qwen3 import Qwen3ForCausalLM, create_fusion_map
+    from model.qwen3 import Qwen3Arch, Qwen3ForCausalLM, create_fusion_map
 
     arch = Qwen3Arch(**model_info.architecture.__dict__)
     model = Qwen3ForCausalLM(arch)
@@ -62,8 +60,7 @@ IS_APPLE_SILICON = is_apple_silicon()
 if not IS_APPLE_SILICON:
 
     def _create_qwen2_model(model_info: ModelInfo):
-        from config.qwen2 import Qwen2Arch
-        from model.qwen2 import Qwen2ForCausalLM, create_fusion_map
+        from model.qwen2 import Qwen2Arch, Qwen2ForCausalLM, create_fusion_map
 
         arch = Qwen2Arch(**model_info.architecture.__dict__)
         model = Qwen2ForCausalLM(arch)
@@ -71,8 +68,7 @@ if not IS_APPLE_SILICON:
         return model, fusion_map
 
     def _create_gptoss_model(model_info: ModelInfo):
-        from config.gptoss import GptOssArch
-        from model.gptoss import GptOssForCausalLM, create_fusion_map
+        from model.gptoss import GptOssArch, GptOssForCausalLM, create_fusion_map
 
         arch = GptOssArch(**model_info.architecture.__dict__)
         model = GptOssForCausalLM(arch)

@@ -77,30 +77,31 @@ class ModelInfo:
         arch_dict["dtype"] = dtype
 
         # Get the architecture object
+        # Note: Import architecture classes from their respective model files
+        # pylint: disable=import-outside-toplevel
         match arch_dict["type"]:
-            # Disable pylint import-outside-toplevel check for this block
-            # because we need to do lazy import for the architecture classes
-            # to avoid circular imports
             case "l4ma":
-                from .l4ma import L4maArch  # pylint: disable=import-outside-toplevel
+                from model.l4ma import (
+                    L4maArch,
+                )  # pylint: disable=import-outside-toplevel
 
                 arch = L4maArch.from_config(cfg)
             case "qwen2":
-                from .qwen2 import (  # pylint: disable=import-outside-toplevel
+                from model.qwen2 import (
                     Qwen2Arch,
-                )
+                )  # pylint: disable=import-outside-toplevel
 
                 arch = Qwen2Arch.from_config(cfg)
             case "qwen3":
-                from .qwen3 import (  # pylint: disable=import-outside-toplevel
+                from model.qwen3 import (
                     Qwen3Arch,
-                )
+                )  # pylint: disable=import-outside-toplevel
 
                 arch = Qwen3Arch.from_config(cfg)
             case "gptoss":
-                from .gptoss import (  # pylint: disable=import-outside-toplevel
+                from model.gptoss import (
                     GptOssArch,
-                )
+                )  # pylint: disable=import-outside-toplevel
 
                 arch = GptOssArch.from_config(cfg)
             case _:

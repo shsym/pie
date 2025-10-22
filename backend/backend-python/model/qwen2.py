@@ -1,16 +1,45 @@
 """Qwen 2 Large Language Model Architecture (Qwen2)"""
 
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 from torch import nn
 
 from adapter_utils import AdapterSubpass
-from config.qwen2 import Qwen2Arch
+from model.config import CommonArch, ModelConfig
 import flashinfer as ops
 
 VERSION = "0.1.0"
+
+
+@dataclass
+class Qwen2Arch(CommonArch):
+    """Qwen2 specific architecture configuration."""
+
+    rope_theta: float
+
+    @staticmethod
+    def from_config(cfg: ModelConfig) -> "Qwen2Arch":
+        """Parse Qwen2-specific architecture configuration."""
+        # Get common architecture fields
+        common_arch_dict = cfg.get_common_arch_dict()
+
+        # Get all the fields for the architecture section to grab other
+        # architecture-specific fields
+        arch_dict = cfg.get_required_key(cfg.root, "architecture")
+
+        # Get RoPE configuration
+        rope_dict = cfg.get_required_key(arch_dict, "rope")
+        rope_theta = cfg.get_required_key(rope_dict, "theta")
+
+        return Qwen2Arch(
+            # Common fields
+            **common_arch_dict,
+            # Qwen2-specific fields
+            rope_theta=rope_theta,
+        )
 
 
 def create_fusion_map(model: nn.Module):

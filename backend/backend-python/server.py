@@ -59,17 +59,31 @@ class HandlerId(enum.Enum):
 
 
 def resolve_cache_dir(cache_dir: str | None) -> str:
-    """Resolve the cache directory using CLI arg > env var > default."""
+    """Resolve the cache directory using CLI arg > env var > default.
+
+    - Windows: Uses %LOCALAPPDATA%/pie
+    - Unix (Linux, macOS, etc.): Uses ~/.cache/pie for Docker compatibility
+    """
     if cache_dir:
         return cache_dir
 
     if "PIE_HOME" in os.environ:
         return os.environ["PIE_HOME"]
 
-    # Use ~/.cache/pie consistently across all platforms (Linux, macOS, etc.)
-    # This matches the C++ backend implementation in utils.hpp
-    home = Path.home()
-    return str(home / ".cache" / "pie")
+    # Platform-specific cache directory (matches C++ backend in utils.hpp)
+    if sys.platform == "win32":
+        # Windows: Use LOCALAPPDATA for cache (standard on Windows)
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if not local_appdata:
+            raise RuntimeError(
+                "Could not determine cache directory. "
+                "Please set %LOCALAPPDATA% or specify --cache-dir"
+            )
+        return str(Path(local_appdata) / "pie")
+    else:
+        # Unix (Linux, macOS): Use ~/.cache for Docker volume mount compatibility
+        home = Path.home()
+        return str(home / ".cache" / "pie")
 
 
 def build_config(**kwargs: Any) -> Dict[str, Any]:
