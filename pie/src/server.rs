@@ -10,7 +10,9 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use pie_client::auth;
-use pie_client::message::{CHUNK_SIZE_BYTES, QUERY_MODEL_STATUS, QUERY_PROGRAM_EXISTS};
+use pie_client::message::{
+    CHUNK_SIZE_BYTES, QUERY_BACKEND_STATS, QUERY_MODEL_STATUS, QUERY_PROGRAM_EXISTS,
+};
 use pie_client::message::{ClientMessage, EventCode, ServerMessage};
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -99,9 +101,66 @@ struct ServerState {
     client_id_pool: Mutex<IdPool<ClientId>>,
     clients: DashMap<ClientId, JoinHandle<()>>,
     client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
-    backend_attached_count: AtomicU32,
-    backend_rejected_count: AtomicU32,
-    backend_notify: Notify,
+    backend_status: Arc<BackendStatus>,
+}
+
+struct BackendStatus {
+    attached_count: AtomicU32,
+    rejected_count: AtomicU32,
+    count_change_notify: Notify,
+}
+
+impl BackendStatus {
+    fn new() -> Self {
+        Self {
+            attached_count: AtomicU32::new(0),
+            rejected_count: AtomicU32::new(0),
+            count_change_notify: Notify::new(),
+        }
+    }
+
+    fn increment_attached_count(&self) {
+        self.attached_count.fetch_add(1, Ordering::SeqCst);
+        self.count_change_notify.notify_waiters();
+    }
+
+    fn increment_rejected_count(&self) {
+        self.rejected_count.fetch_add(1, Ordering::SeqCst);
+        self.count_change_notify.notify_waiters();
+    }
+
+    fn notify_when_count_change(
+        self: Arc<Self>,
+        cur_num_attached_backends: Option<u32>,
+        cur_num_detached_backends: Option<u32>,
+        tx: oneshot::Sender<(u32, u32)>,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                // IMPORTANT: Create the notified future BEFORE checking the condition
+                // to avoid race condition where notification happens between check and wait
+                let notified = self.count_change_notify.notified();
+
+                let num_attached = self.attached_count.load(Ordering::SeqCst);
+                let num_rejected = self.rejected_count.load(Ordering::SeqCst);
+
+                // Check if values have changed from what client knows
+                let attached_changed =
+                    cur_num_attached_backends.map_or(true, |v| v != num_attached);
+                let rejected_changed =
+                    cur_num_detached_backends.map_or(true, |v| v != num_rejected);
+
+                // Send back the new values if they have changed
+                if attached_changed || rejected_changed {
+                    tx.send((num_attached, num_rejected)).unwrap();
+                    return;
+                }
+
+                // Wait for notification of backend changes
+                notified.await;
+            }
+        });
+    }
 }
 
 pub struct Server {
@@ -116,9 +175,7 @@ impl Server {
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
             client_cmd_txs: DashMap::new(),
-            backend_attached_count: AtomicU32::new(0),
-            backend_rejected_count: AtomicU32::new(0),
-            backend_notify: Notify::new(),
+            backend_status: Arc::new(BackendStatus::new()),
         });
 
         let listener_loop = task::spawn(Self::listener_loop(ip_port.to_string(), state.clone()));
@@ -170,8 +227,7 @@ impl Service for Server {
                     cur_num_rejected_backends,
                     tx,
                 } => {
-                    handle_wait_backend_change(
-                        &self.state,
+                    Arc::clone(&self.state.backend_status).notify_when_count_change(
                         cur_num_attached_backends,
                         cur_num_rejected_backends,
                         tx,
@@ -377,9 +433,6 @@ impl Session {
                     )
                     .await;
                 }
-                ClientMessage::QueryBackendStats { corr_id } => {
-                    self.handle_query_backend_stats(corr_id).await;
-                }
             },
             SessionEvent::InstanceEvent(cmd) => match cmd {
                 InstanceEvent::SendMsgToClient { inst_id, message } => {
@@ -496,6 +549,17 @@ impl Session {
                     serde_json::to_string(&runtime_stats).unwrap(),
                 )
                 .await;
+            }
+            QUERY_BACKEND_STATS => {
+                let runtime_stats = model::runtime_stats().await;
+                let mut sorted_stats: Vec<_> = runtime_stats.iter().collect();
+                sorted_stats.sort_by_key(|(k, _)| *k);
+
+                let mut stats_str = String::new();
+                for (key, value) in sorted_stats {
+                    stats_str.push_str(&format!("{:<40} | {}\n", key, value));
+                }
+                self.send_response(corr_id, true, stats_str).await;
             }
             _ => println!("Unknown query subject: {}", subject),
         }
@@ -719,35 +783,23 @@ impl Session {
                         model::register_model(service_name, service_id);
                         self.send_response(corr_id, true, "Model service registered".into())
                             .await;
-                        self.state
-                            .backend_attached_count
-                            .fetch_add(1, Ordering::SeqCst);
-                        self.state.backend_notify.notify_waiters();
+                        self.state.backend_status.increment_attached_count();
                     } else {
                         self.send_response(corr_id, false, "Failed to register model".into())
                             .await;
-                        self.state
-                            .backend_rejected_count
-                            .fetch_add(1, Ordering::SeqCst);
-                        self.state.backend_notify.notify_waiters();
+                        self.state.backend_status.increment_rejected_count();
                     }
                 }
                 Err(_) => {
                     self.send_response(corr_id, false, "Failed to attach to model backend".into())
                         .await;
-                    self.state
-                        .backend_rejected_count
-                        .fetch_add(1, Ordering::SeqCst);
-                    self.state.backend_notify.notify_waiters();
+                    self.state.backend_status.increment_rejected_count();
                 }
             },
             other => {
                 self.send_response(corr_id, false, format!("Unknown service type: {other}"))
                     .await;
-                self.state
-                    .backend_rejected_count
-                    .fetch_add(1, Ordering::SeqCst);
-                self.state.backend_notify.notify_waiters();
+                self.state.backend_status.increment_rejected_count();
             }
         }
     }
@@ -872,23 +924,6 @@ impl Session {
             })
             .await;
         }
-    }
-
-    async fn handle_query_backend_stats(&mut self, corr_id: u32) {
-        if !self.authenticated {
-            self.send_response(corr_id, false, "Not authenticated".into())
-                .await;
-            return;
-        }
-        let runtime_stats = model::runtime_stats().await;
-        let mut sorted_stats: Vec<_> = runtime_stats.iter().collect();
-        sorted_stats.sort_by_key(|(k, _)| *k);
-
-        let mut stats_str = String::new();
-        for (key, value) in sorted_stats {
-            stats_str.push_str(&format!("{:<40} | {}\n", key, value));
-        }
-        self.send_response(corr_id, true, stats_str).await;
     }
 
     /// Cleans up client resources upon disconnection.
