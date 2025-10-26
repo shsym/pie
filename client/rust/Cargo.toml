@@ -3,7 +3,7 @@ name = "pie-client"
 version = "0.2.0"
 edition = "2024"
 authors = ["Pie Team"]
-description = "Programmable Inference Engine (Pie) Client"
+description = "Pie Client"
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
