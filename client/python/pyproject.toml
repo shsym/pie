@@ -5,13 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pie-client"
 version = "0.1.0"
-description = "Pie Client"
+description = "A client for interacting with the PIE."
 readme = "README.md"
 requires-python = ">=3.8"
-license = "Apache-2.0"
+license = "MIT"
 authors = [
     { name = "In Gim", email = "in.gim@yale.edu" },
 ]
+
 dependencies = [
     "websockets==11.0.3",
     "msgpack==0.5.6",
@@ -19,8 +20,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/pie-project/pie"
+Homepage = "https://github.com/pie-project/pie/client/python"
 
 [tool.setuptools]
 packages = ["pie"]
-license-files = []
