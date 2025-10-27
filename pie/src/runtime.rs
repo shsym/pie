@@ -153,7 +153,7 @@ pub struct Runtime {
 
 #[derive(Debug, Clone)]
 pub enum TerminationCause {
-    Normal,
+    Normal(String),
     Signal,
     Exception(String),
     SystemError(String),
@@ -382,20 +382,27 @@ impl Runtime {
         let engine = self.engine.clone();
         let linker = self.linker.clone();
 
+        // Create a oneshot channel to signal when the task can start
+        let (start_tx, start_rx) = oneshot::channel();
+
         let join_handle = tokio::spawn(Self::launch(
             instance_id,
             component,
             arguments,
             engine,
             linker,
+            start_rx,
         ));
 
-        // Record in the “running_instances” so we can manage it later
+        // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             hash: hash.to_string(),
             join_handle,
         };
         self.running_instances.insert(instance_id, instance_handle);
+
+        // Signal the task to start now that the join_handle is in the map
+        let _ = start_tx.send(());
 
         Ok(instance_id)
     }
@@ -415,11 +422,14 @@ impl Runtime {
         let linker = self.linker.clone();
         let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
 
+        // Create a oneshot channel to signal when the task can start
+        let (start_tx, start_rx) = oneshot::channel();
+
         let join_handle = tokio::spawn(Self::launch_server(
-            addr, component, arguments, engine, linker,
+            addr, component, arguments, engine, linker, start_rx,
         ));
 
-        // Record in the “running_instances” so we can manage it later
+        // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             hash: hash.to_string(),
             join_handle,
@@ -427,18 +437,21 @@ impl Runtime {
         self.running_server_instances
             .insert(instance_id, instance_handle);
 
+        // Signal the task to start now that the join_handle is in the map
+        let _ = start_tx.send(());
+
         Ok(instance_id)
     }
 
-    /// Terminate (abort) a running instance
-    pub async fn terminate_instance(&self, instance_id: InstanceId, cause: TerminationCause) {
+    /// Terminate or abort a running instance
+    async fn terminate_instance(&self, instance_id: InstanceId, cause: TerminationCause) {
         if let Some((_, handle)) = self.running_instances.remove(&instance_id) {
             handle.join_handle.abort();
 
             model::cleanup_instance(instance_id.clone());
 
             let (termination_code, message) = match cause {
-                TerminationCause::Normal => (0, "Normal termination".to_string()),
+                TerminationCause::Normal(message) => (0, message),
                 TerminationCause::Signal => (1, "Signal termination".to_string()),
                 TerminationCause::Exception(message) => (2, message),
                 TerminationCause::SystemError(message) => (3, message),
@@ -520,7 +533,11 @@ impl Runtime {
         arguments: Vec<String>,
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
+        start_rx: oneshot::Receiver<()>,
     ) {
+        // Wait for the signal to start
+        let _ = start_rx.await;
+
         let result = async {
             let socket = tokio::net::TcpSocket::new_v4()?;
             socket.set_reuseaddr(!cfg!(windows))?;
@@ -571,7 +588,11 @@ impl Runtime {
         arguments: Vec<String>,
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
+        start_rx: oneshot::Receiver<()>,
     ) {
+        // Wait for the signal to start
+        let _ = start_rx.await;
+
         let inst_state = InstanceState::new(instance_id, arguments).await;
 
         // Wrap everything in a closure returning a Result,
@@ -617,27 +638,22 @@ impl Runtime {
 
         match result {
             Ok(return_value) => {
-                server::InstanceEvent::DetachInstance {
-                    inst_id: instance_id.clone(),
-                    termination_code: 0,
-                    message: return_value.unwrap_or("".to_string()),
+                Command::Trap {
+                    inst_id: instance_id,
+                    cause: TerminationCause::Normal(return_value.unwrap_or_default()),
                 }
                 .dispatch()
                 .ok();
             }
             Err(err) => {
                 println!("Instance {instance_id} failed: {err}");
-                server::InstanceEvent::DetachInstance {
-                    inst_id: instance_id.clone(),
-                    termination_code: 2,
-                    message: err.to_string(),
+                Command::Trap {
+                    inst_id: instance_id,
+                    cause: TerminationCause::Exception(err.to_string()),
                 }
                 .dispatch()
                 .ok();
             }
         }
-
-        // force cleanup of the remaining resources
-        model::cleanup_instance(instance_id);
     }
 }
