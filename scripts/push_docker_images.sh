@@ -1,7 +1,7 @@
 #!/bin/bash
 # Push PIE Docker images to Docker Hub
 # Usage: ./scripts/push_docker_images.sh [username]
-# Default username: sslee0cs
+# Default username: pieproject
 
 set -e
 
@@ -13,7 +13,7 @@ else
 fi
 
 # Configuration
-USERNAME="${1:-sslee0cs}"
+USERNAME="${1:-pieproject}"
 IMAGE_NAME="pie"
 
 echo "================================"
