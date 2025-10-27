@@ -31,9 +31,9 @@ The easiest way to run Pie with CUDA support is using our pre-built Docker image
 **Step 1: Pull Image and Download Model**
 
 ```bash
-docker pull sslee0cs/pie:latest
+docker pull pieproject/pie:latest
 mkdir -p ~/.cache
-docker run --rm --gpus all -it -v ~/.cache:/root/.cache sslee0cs/pie:latest \
+docker run --rm --gpus all -it -v ~/.cache:/root/.cache pieproject/pie:latest \
   pie model add "llama-3.2-1b-instruct"
 ```
 
@@ -44,7 +44,7 @@ docker run --rm --gpus all -it -v ~/.cache:/root/.cache sslee0cs/pie:latest \
 
 **Step 2: Run an Inferlet**
 ```bash
-docker run --gpus all --rm -it -v ~/.cache:/root/.cache sslee0cs/pie:latest \
+docker run --gpus all --rm -it -v ~/.cache:/root/.cache pieproject/pie:latest \
   pie run --config /workspace/pie/docker_config.toml \
   /workspace/example-apps/text_completion.wasm -- --prompt "What is the capital of France?"
 ```
