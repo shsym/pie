@@ -98,6 +98,7 @@ impl InternalEvent {
 
 struct ServerState {
     enable_auth: bool,
+    internal_auth_token: String,
     client_id_pool: Mutex<IdPool<ClientId>>,
     clients: DashMap<ClientId, JoinHandle<()>>,
     client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
@@ -169,9 +170,10 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(ip_port: &str, enable_auth: bool) -> Self {
+    pub fn new(ip_port: &str, enable_auth: bool, internal_auth_token: String) -> Self {
         let state = Arc::new(ServerState {
             enable_auth,
+            internal_auth_token,
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
             client_cmd_txs: DashMap::new(),
@@ -265,7 +267,7 @@ struct Session {
     client_cmd_rx: mpsc::Receiver<SessionEvent>,
     client_cmd_tx: mpsc::Sender<SessionEvent>,
 
-    resp_pump: JoinHandle<()>,
+    send_pump: JoinHandle<()>,
     recv_pump: JoinHandle<()>,
 }
 
@@ -286,7 +288,7 @@ impl Session {
         let ws_stream = accept_async(tcp_stream).await?;
         let (mut ws_writer, mut ws_reader) = ws_stream.split();
 
-        let resp_pump = task::spawn(async move {
+        let send_pump = task::spawn(async move {
             while let Some(message) = ws_msg_rx.recv().await {
                 if let Err(e) = ws_writer.send(message).await {
                     println!("Error writing to ws stream: {:?}", e);
@@ -333,7 +335,7 @@ impl Session {
             ws_msg_tx,
             client_cmd_rx,
             client_cmd_tx,
-            resp_pump,
+            send_pump,
             recv_pump,
         };
 
@@ -350,7 +352,7 @@ impl Session {
                         session.handle_command(cmd).await;
                     },
                     _ = &mut session.recv_pump => break,
-                    _ = &mut session.resp_pump => break,
+                    _ = &mut session.send_pump => break,
                     else => break,
                 }
             }
@@ -368,15 +370,22 @@ impl Session {
                 cmd
             },
             _ = &mut self.recv_pump => { bail!("Socket terminated"); },
-            _ = &mut self.resp_pump => { bail!("Socket terminated"); },
+            _ = &mut self.send_pump => { bail!("Socket terminated"); },
             else => { bail!("Socket terminated"); },
         };
 
-        let SessionEvent::ClientRequest(ClientMessage::Authenticate { corr_id, token }) = cmd
-        else {
-            bail!("Expected Authenticate message");
-        };
+        match cmd {
+            SessionEvent::ClientRequest(ClientMessage::Authenticate { corr_id, token }) => {
+                self.external_authenticate(corr_id, token).await
+            }
+            SessionEvent::ClientRequest(ClientMessage::InternalAuthenticate { corr_id, token }) => {
+                self.internal_authenticate(corr_id, token).await
+            }
+            _ => bail!("Expected Authenticate message"),
+        }
+    }
 
+    async fn external_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
         let Ok(claims) = auth::validate_jwt(&token) else {
             self.send_response(corr_id, false, "Invalid token".to_string())
                 .await;
@@ -387,11 +396,26 @@ impl Session {
         Ok(())
     }
 
+    async fn internal_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
+        if token != self.state.internal_auth_token {
+            self.send_response(corr_id, false, "Invalid token".to_string())
+                .await;
+            bail!("Invalid token")
+        }
+        self.send_response(corr_id, true, "Authenticated".to_string())
+            .await;
+        Ok(())
+    }
+
     /// Processes a single command.
     async fn handle_command(&mut self, cmd: SessionEvent) {
         match cmd {
             SessionEvent::ClientRequest(message) => match message {
                 ClientMessage::Authenticate { corr_id, token: _ } => {
+                    self.send_response(corr_id, true, "Already authenticated".to_string())
+                        .await;
+                }
+                ClientMessage::InternalAuthenticate { corr_id, token: _ } => {
                     self.send_response(corr_id, true, "Already authenticated".to_string())
                         .await;
                 }
@@ -910,8 +934,13 @@ impl Drop for Session {
                 runtime::trap_exception(inst_id, "socket terminated");
             }
         }
+
+        // Abort the receive pump so that it no longer receives messages from the client.
+        // Note that we DO NOT abort the send pump because there might be pending messages
+        // that need to be sent to the client. When this session is dropped, the `ws_msg_tx`
+        // object will also be dropped, which will cause the send pump to terminate.
         self.recv_pump.abort();
-        self.resp_pump.abort();
+
         self.state.clients.remove(&self.id);
 
         let id = self.id;
