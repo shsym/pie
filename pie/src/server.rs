@@ -6,7 +6,7 @@ use super::{messaging, runtime, service};
 use crate::auth::{AuthorizedClients, PublicKey};
 use crate::model;
 use crate::model::Model;
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -15,11 +15,11 @@ use pie_client::message::{
     CHUNK_SIZE_BYTES, QUERY_BACKEND_STATS, QUERY_MODEL_STATUS, QUERY_PROGRAM_EXISTS,
 };
 use pie_client::message::{ClientMessage, EventCode, ServerMessage};
-use rand::TryRngCore;
-use rand::rngs::OsRng;
+use ring::rand::{SecureRandom, SystemRandom};
 use std::mem;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -411,10 +411,13 @@ impl Session {
             }
         };
 
-        // Generate a cryptographically secure random challenge (32 bytes = 256 bits)
-        let challenge: Vec<u8> = (0..32)
-            .map(|_| OsRng.try_next_u32().map(|n| (n & 0xFF) as u8).unwrap())
-            .collect();
+        // Generate a cryptographically secure random challenge (48 bytes = 384 bits)
+        // Use `ring::rand::SystemRandom` for cryptographic randomness.
+        // Size chosen to match ECDSA P-384, the highest security level supported.
+        let rng = SystemRandom::new();
+        let mut challenge = [0u8; 48];
+        rng.fill(&mut challenge)
+            .map_err(|e| anyhow!("Failed to generate random challenge: {}", e))?;
 
         // Encode the challenge as base64 and send it to the client
         let challenge_b64 = base64::engine::general_purpose::STANDARD.encode(&challenge);
@@ -473,14 +476,25 @@ impl Session {
     /// This method is used for internal communication between the backend and the engine
     /// as well as between the Pie shell and the engine. This is not used for user authentication.
     async fn internal_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
-        if token != self.state.internal_auth_token {
-            self.send_response(corr_id, false, "Invalid token".to_string())
+        if token == self.state.internal_auth_token {
+            self.send_response(corr_id, true, "Authenticated".to_string())
                 .await;
-            bail!("Invalid token")
+            return Ok(());
         }
-        self.send_response(corr_id, true, "Authenticated".to_string())
+
+        // Add random delay to mitigate timing-based side-channel attacks
+        let rng = SystemRandom::new();
+        let mut random_bytes = [0u8; 2];
+        rng.fill(&mut random_bytes)
+            .map_err(|e| anyhow!("Failed to generate random delay: {:?}", e))?;
+
+        // Sleep for 1000-3000 milliseconds
+        let delay_ms = 1000 + (u16::from_le_bytes(random_bytes) % 2001) as u64;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+        self.send_response(corr_id, false, "Invalid token".to_string())
             .await;
-        Ok(())
+        bail!("Invalid token")
     }
 
     /// Processes a single command.
