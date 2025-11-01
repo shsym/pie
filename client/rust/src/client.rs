@@ -206,7 +206,8 @@ impl Client {
             | ClientMessage::Signature { corr_id, .. }
             | ClientMessage::InternalAuthenticate { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
-            | ClientMessage::LaunchInstance { corr_id, .. } => corr_id,
+            | ClientMessage::LaunchInstance { corr_id, .. }
+            | ClientMessage::Ping { corr_id } => corr_id,
             _ => anyhow::bail!("Invalid message type for this helper"),
         };
         *corr_id_ref = corr_id_new;
@@ -239,7 +240,13 @@ impl Client {
             )
         }
 
-        // Decode the base64-encoded challenge from the server
+        // If the server has disabled authentication, we can return early.
+        if result == "Already authenticated" {
+            return Ok(());
+        }
+
+        // Otherwise, the server has enabled authentication and we need to sign
+        // the challenge encoded in base64 with the private key.
         let challenge = base64::engine::general_purpose::STANDARD
             .decode(result.as_bytes())
             .context("Failed to decode challenge from base64")?;
@@ -363,6 +370,16 @@ impl Client {
             })
         } else {
             anyhow::bail!("Launch instance failed: {}", result)
+        }
+    }
+
+    pub async fn ping(&self) -> Result<()> {
+        let msg = ClientMessage::Ping { corr_id: 0 };
+        let (successful, result) = self.send_msg_and_wait(msg).await?;
+        if successful {
+            Ok(())
+        } else {
+            anyhow::bail!("Ping failed: {}", result)
         }
     }
 }
