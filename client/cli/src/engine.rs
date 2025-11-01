@@ -181,14 +181,16 @@ pub async fn connect_and_authenticate(client_config: &ClientConfig) -> Result<Cl
         }
     };
 
+    let result = client
+        .authenticate(&client_config.username, &client_config.private_key)
+        .await;
+
     if client_config.enable_auth {
-        let private_key = client_config
-            .private_key
-            .as_ref()
-            .context("Private key is required when authentication is enabled")?;
-        client
-            .authenticate(&client_config.username, private_key)
-            .await?;
+        result.context("Failed to authenticate with engine using the specified private key")?;
+    } else {
+        result.context(
+            "Failed to authenticate with engine (client public key authentication disabled)",
+        )?;
     }
 
     Ok(client)
