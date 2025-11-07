@@ -12,12 +12,12 @@ log = "pie_metal.log"
 [[backend]]
 backend_type = "python"
 exec_path = "../backend/backend-python/server.py"
-model = "qwen-3-0.6b"   # Qwen 3 0.6B model
+model = "llama-3.2-1b-instruct"
 device = "mps"          # Use MPS device for Metal acceleration
 dtype = "float16"        # Use float16 for Metal (native support in custom kernels)
 kv_page_size = 16
 max_dist_size = 32
-max_num_kv_pages = 10240
+max_num_kv_pages = 1024
 max_num_embeds = 128
 max_num_adapters = 32
 max_adapter_rank = 8
