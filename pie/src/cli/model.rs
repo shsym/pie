@@ -298,24 +298,6 @@ async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>
     let res = client.get(url).send().await?.error_for_status()?;
     let total_size = res.content_length().unwrap_or(0);
 
-    let pb = ProgressBar::new(total_size);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{msg} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")?
-            .progress_chars("##-"),
-    );
-    pb.set_message(message.to_string());
-
-    let mut downloaded = 0;
-    let mut stream = res.bytes_stream();
-    let mut content = Vec::with_capacity(total_size as usize);
-
-    while let Some(item) = stream.next().await {
-        let chunk = item?;
-        downloaded += chunk.len();
-        content.extend_from_slice(&chunk);
-        pb.set_position(downloaded as u64);
-    }
     let file_name = url
         .rsplit('/')
         .next()
@@ -324,8 +306,56 @@ async fn download_file_with_progress(url: &str, message: &str) -> Result<Vec<u8>
         .next()
         .unwrap_or("file");
 
-    pb.finish_with_message(format!("✅ Downloaded {}", file_name));
-    Ok(content)
+    // When PIE_FORCE_PROGRESS is set, manually write progress to stderr
+    // because indicatif won't output to piped stderr even with stderr_with_hz()
+    let force_progress = std::env::var("PIE_FORCE_PROGRESS").is_ok();
+
+    if force_progress {
+        // For piped stderr (GUI apps), write simple text progress
+        let mut downloaded = 0;
+        let mut stream = res.bytes_stream();
+        let mut content = Vec::with_capacity(total_size as usize);
+        let mut last_update = std::time::Instant::now();
+
+        while let Some(item) = stream.next().await {
+            let chunk = item?;
+            downloaded += chunk.len();
+            content.extend_from_slice(&chunk);
+
+            // Update every 250ms to avoid flooding stderr
+            if last_update.elapsed().as_millis() > 250 {
+                let downloaded_mb = downloaded as f64 / (1024.0 * 1024.0);
+                let total_mb = total_size as f64 / (1024.0 * 1024.0);
+                eprintln!("Downloading {}... {:.2} MiB/{:.2} MiB", file_name, downloaded_mb, total_mb);
+                last_update = std::time::Instant::now();
+            }
+        }
+        eprintln!("✅ Downloaded {}", file_name);
+        Ok(content)
+    } else {
+        // For TTY (normal terminal), use indicatif progress bar
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{msg} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec})")?
+                .progress_chars("##-"),
+        );
+        pb.set_message(message.to_string());
+
+        let mut downloaded = 0;
+        let mut stream = res.bytes_stream();
+        let mut content = Vec::with_capacity(total_size as usize);
+
+        while let Some(item) = stream.next().await {
+            let chunk = item?;
+            downloaded += chunk.len();
+            content.extend_from_slice(&chunk);
+            pb.set_position(downloaded as u64);
+        }
+
+        pb.finish_with_message(format!("✅ Downloaded {}", file_name));
+        Ok(content)
+    }
 }
 
 /// Helper function to print TOML tables with proper indentation
