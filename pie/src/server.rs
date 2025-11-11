@@ -1,5 +1,5 @@
 use crate::auth::{AuthorizedUsers, PublicKey};
-use crate::instance::{InstanceId, OutputChannel};
+use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
 use crate::messaging::{self, dispatch_u2i};
 use crate::model;
 use crate::model::Model;
@@ -668,6 +668,24 @@ impl Session {
         .await;
     }
 
+    async fn send_launch_result(&self, corr_id: u32, successful: bool, message: String) {
+        self.send(ServerMessage::InstanceLaunchResult {
+            corr_id,
+            successful,
+            message,
+        })
+        .await;
+    }
+
+    async fn send_attach_result(&self, corr_id: u32, successful: bool, message: String) {
+        self.send(ServerMessage::InstanceAttachResult {
+            corr_id,
+            successful,
+            message,
+        })
+        .await;
+    }
+
     async fn send_inst_event(&self, inst_id: InstanceId, event: EventCode, message: String) {
         self.send(ServerMessage::InstanceEvent {
             instance_id: inst_id.to_string(),
@@ -861,40 +879,54 @@ impl Session {
         }
         .dispatch()
         .unwrap();
+
         match evt_rx.await.unwrap() {
-            Ok(instance_id) => {
+            // The instance was launched successfully. Notify the client about the instance ID.
+            Ok((output_delivery_ctrl, instance_id)) => {
+                // If the instance is not detached, add it to the attached instances so that its
+                // output can be streamed to the client after it is launched.
                 if !detached {
                     self.state
                         .client_cmd_txs
                         .insert(instance_id, self.client_cmd_tx.clone());
                     self.attached_instances.push(instance_id);
                 }
-                self.send_response(corr_id, true, instance_id.to_string())
+
+                // Send the instance ID to the client before allowing output. This is especially
+                // important for attached instances to prevent a race condition where output
+                // arrives at the client side before the client receives the instance ID.
+                self.send_launch_result(corr_id, true, instance_id.to_string())
                     .await;
+                output_delivery_ctrl.allow_output();
             }
+            // The instance failed to launch. Notify the client about the error.
             Err(e) => {
-                self.send_response(corr_id, false, e.to_string()).await;
+                self.send_launch_result(corr_id, false, e.to_string()).await;
             }
         }
     }
 
     async fn handle_attach_instance(&mut self, corr_id: u32, instance_id: String) {
-        let (evt_tx, evt_rx) = oneshot::channel();
-
+        // Parse the instance ID from the string.
         let inst_id = match Uuid::parse_str(&instance_id) {
             Ok(id) => id,
             Err(_) => {
-                self.send_response(corr_id, false, "Invalid instance_id".to_string())
+                self.send_attach_result(corr_id, false, "Invalid instance_id".to_string())
                     .await;
                 return;
             }
         };
 
+        // Add the instance to the attached instances so that its output can be streamed
+        // to the client after it is attached.
         self.state
             .client_cmd_txs
             .insert(inst_id, self.client_cmd_tx.clone());
         self.attached_instances.push(inst_id);
 
+        let (evt_tx, evt_rx) = oneshot::channel();
+
+        // Change instance state to attached.
         runtime::Command::AttachInstance {
             inst_id,
             event: evt_tx,
@@ -903,20 +935,42 @@ impl Session {
         .unwrap();
 
         match evt_rx.await.unwrap() {
-            AttachInstanceResult::AttachedRunning | AttachInstanceResult::AttachedFinished => {
-                self.send_response(corr_id, true, "Instance attached".to_string())
+            // The instance was attached successfully. Notify the client first and then change
+            // the output delivery mode to streamed so that the client can start receiving output.
+            AttachInstanceResult::AttachedRunning(output_delivery_ctrl) => {
+                self.send_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
+                output_delivery_ctrl.set_output_delivery(OutputDelivery::Streamed);
             }
+            // The instance has finished execution. Notify the client first and then change the
+            // output delivery mode to streamed so that the client can receive the final output.
+            // Then, terminate the instance and notify the client about the termination.
+            AttachInstanceResult::AttachedFinished(output_delivery_ctrl, cause) => {
+                self.send_attach_result(corr_id, true, "Instance attached".to_string())
+                    .await;
+                output_delivery_ctrl.set_output_delivery(OutputDelivery::Streamed);
+
+                runtime::Command::TerminateInstance {
+                    inst_id,
+                    notification_to_client: Some(cause),
+                }
+                .dispatch()
+                .unwrap();
+            }
+            // The instance was not found.
+            // Remove it from the attached instances and notify the client about the error.
             AttachInstanceResult::InstanceNotFound => {
                 self.state.client_cmd_txs.remove(&inst_id);
                 self.attached_instances.retain(|&id| id != inst_id);
-                self.send_response(corr_id, false, "Instance not found".to_string())
+                self.send_attach_result(corr_id, false, "Instance not found".to_string())
                     .await;
             }
+            // The instance is already attached to another client.
+            // Remove it from the attached instances and notify the client about the error.
             AttachInstanceResult::AlreadyAttached => {
                 self.state.client_cmd_txs.remove(&inst_id);
                 self.attached_instances.retain(|&id| id != inst_id);
-                self.send_response(corr_id, false, "Instance already attached".to_string())
+                self.send_attach_result(corr_id, false, "Instance already attached".to_string())
                     .await;
             }
         }
@@ -962,7 +1016,7 @@ impl Session {
 
     async fn handle_terminate_instance(&mut self, instance_id: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
-            runtime::Command::AbortInstance {
+            runtime::Command::TerminateInstance {
                 inst_id,
                 notification_to_client: Some(runtime::TerminationCause::Signal),
             }
@@ -1142,7 +1196,7 @@ impl Drop for Session {
                 // Request the runtime to terminate the instance.
                 // Need not to notify the client because the client has disconnected
                 // from this session.
-                runtime::Command::AbortInstance {
+                runtime::Command::TerminateInstance {
                     inst_id,
                     notification_to_client: None,
                 }
