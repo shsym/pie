@@ -1,12 +1,10 @@
 use crate::auth::{AuthorizedUsers, PublicKey};
 use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
-use crate::messaging::{self, dispatch_u2i};
+use crate::messaging::PushPullCommand;
 use crate::model;
 use crate::model::Model;
 use crate::runtime::{self, AttachInstanceResult, TerminationCause};
-use crate::service::{
-    self, LegacyService, LegacyServiceError, ServiceCommand, install_legacy_service,
-};
+use crate::service::{CommandDispatcher, Service, ServiceCommand};
 use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -29,6 +27,22 @@ use tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
 type ClientId = u32;
+
+/// The sender of the command channel, which is used to send commands to the
+/// handler task.
+static COMMAND_DISPATCHER: OnceLock<CommandDispatcher<ServerEvent>> = OnceLock::new();
+
+/// Starts the server service. A daemon task will be spawned to handle the
+/// commands dispatched from other services.
+pub fn start_service(
+    ip_port: &str,
+    enable_auth: bool,
+    authorized_users: AuthorizedUsers,
+    internal_auth_token: String,
+) {
+    let server = Server::new(ip_port, enable_auth, authorized_users, internal_auth_token);
+    server.start(&COMMAND_DISPATCHER);
+}
 
 #[derive(Debug)]
 pub enum ServerEvent {
@@ -81,23 +95,18 @@ pub enum InternalEvent {
     },
 }
 
-impl ServerEvent {
-    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
-        static SERVICE_ID_SERVER: OnceLock<usize> = OnceLock::new();
-        let service_id = *SERVICE_ID_SERVER
-            .get_or_init(move || service::get_legacy_service_id("server").unwrap());
-        service::dispatch_legacy(service_id, self)
-    }
+impl ServiceCommand for ServerEvent {
+    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &COMMAND_DISPATCHER;
 }
 
 impl InstanceEvent {
-    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
+    pub fn dispatch(self) {
         ServerEvent::from(self).dispatch()
     }
 }
 
 impl InternalEvent {
-    pub fn dispatch(self) -> Result<(), LegacyServiceError> {
+    pub fn dispatch(self) {
         ServerEvent::from(self).dispatch()
     }
 }
@@ -171,12 +180,12 @@ impl BackendStatus {
     }
 }
 
-pub struct Server {
+struct Server {
     state: Arc<ServerState>,
 }
 
 impl Server {
-    pub fn new(
+    fn new(
         ip_port: &str,
         enable_auth: bool,
         authorized_users: AuthorizedUsers,
@@ -217,7 +226,7 @@ impl Server {
     }
 }
 
-impl LegacyService for Server {
+impl Service for Server {
     type Command = ServerEvent;
 
     async fn handle(&mut self, cmd: Self::Command) {
@@ -1026,10 +1035,11 @@ impl Session {
     async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
         if let Ok(inst_id) = Uuid::parse_str(&instance_id) {
             if self.attached_instances.contains(&inst_id) {
-                dispatch_u2i(messaging::PushPullCommand::Push {
+                PushPullCommand::Push {
                     topic: inst_id.to_string(),
                     message,
-                });
+                }
+                .dispatch();
             }
         }
     }
@@ -1060,8 +1070,7 @@ impl Session {
         match service_type.as_str() {
             "model" => match Model::new(&endpoint).await {
                 Ok(model_service) => {
-                    if let Some(service_id) = install_legacy_service(&service_name, model_service) {
-                        model::register_model(service_name, service_id);
+                    if model::install_model(service_name, model_service).is_some() {
                         self.send_response(corr_id, true, "Model service registered".into())
                             .await;
                         self.state.backend_status.increment_attached_count();
@@ -1159,10 +1168,11 @@ impl Session {
                 let final_hash = blake3::hash(&inflight.buffer).to_hex().to_string();
 
                 if final_hash == blob_hash {
-                    dispatch_u2i(messaging::PushPullCommand::PushBlob {
+                    PushPullCommand::PushBlob {
                         topic: inst_id.to_string(),
                         message: Bytes::from(mem::take(&mut inflight.buffer)),
-                    });
+                    }
+                    .dispatch();
                     self.send_response(corr_id, true, "Blob sent to instance".to_string())
                         .await;
                 } else {

@@ -6,10 +6,9 @@ use tokio::sync::oneshot;
 
 use crate::auth::AuthorizedUsers;
 use crate::kvs;
-use crate::messaging::{PubSub, PushPull};
+use crate::messaging;
 use crate::runtime;
-use crate::server::Server;
-use crate::service::install_legacy_service;
+use crate::server;
 
 /// Configuration for the PIE engine.
 #[derive(Debug)]
@@ -83,20 +82,15 @@ pub async fn run_server(
         }
     }
 
-    let server = Server::new(
+    runtime::start_service(&config.cache_dir);
+    server::start_service(
         &server_url,
         config.enable_auth,
         authorized_users,
         internal_auth_token.clone(),
     );
-    let messaging_inst2inst = PubSub::new();
-    let messaging_user2inst = PushPull::new();
-
-    runtime::start_service(&config.cache_dir);
-    install_legacy_service("server", server);
     kvs::start_service();
-    install_legacy_service("messaging-inst2inst", messaging_inst2inst);
-    install_legacy_service("messaging-user2inst", messaging_user2inst);
+    messaging::start_service();
 
     tracing::info!("✅ PIE runtime started successfully on {}", server_url);
     ready_tx.send(internal_auth_token).unwrap();
