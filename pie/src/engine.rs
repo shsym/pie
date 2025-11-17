@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use tokio::sync::oneshot;
 
 use crate::auth::AuthorizedUsers;
-use crate::kvs::KeyValueStore;
+use crate::kvs;
 use crate::messaging::{PubSub, PushPull};
-use crate::runtime::Runtime;
+use crate::runtime;
 use crate::server::Server;
-use crate::service::install_service;
+use crate::service::install_legacy_service;
 
 /// Configuration for the PIE engine.
 #[derive(Debug)]
@@ -47,10 +47,6 @@ pub async fn run_server(
     } else {
         tracing::info!("Authentication is disabled.");
     }
-
-    // Set up core services
-    let runtime = Runtime::new(&config.cache_dir);
-    runtime.load_existing_programs()?;
 
     let server_url = format!("{}:{}", config.host, config.port);
 
@@ -95,13 +91,12 @@ pub async fn run_server(
     );
     let messaging_inst2inst = PubSub::new();
     let messaging_user2inst = PushPull::new();
-    let kv_store = KeyValueStore::new();
 
-    install_service("runtime", runtime);
-    install_service("server", server);
-    install_service("kvs", kv_store);
-    install_service("messaging-inst2inst", messaging_inst2inst);
-    install_service("messaging-user2inst", messaging_user2inst);
+    runtime::start_service(&config.cache_dir);
+    install_legacy_service("server", server);
+    kvs::start_service();
+    install_legacy_service("messaging-inst2inst", messaging_inst2inst);
+    install_legacy_service("messaging-user2inst", messaging_user2inst);
 
     tracing::info!("✅ PIE runtime started successfully on {}", server_url);
     ready_tx.send(internal_auth_token).unwrap();

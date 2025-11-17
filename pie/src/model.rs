@@ -10,7 +10,7 @@ use super::model::request::{
 use super::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
 use super::model::tokenizer::BytePairEncoder;
 use super::runtime::{self, TerminationCause};
-use super::service::{self, Service, ServiceError};
+use super::service::{self, LegacyService, LegacyServiceError, ServiceCommand};
 use crate::instance::InstanceId;
 use anyhow::Result;
 use anyhow::bail;
@@ -150,8 +150,7 @@ where
         inst_id,
         notification_to_client: Some(TerminationCause::Exception(exception.to_string())),
     }
-    .dispatch()
-    .unwrap();
+    .dispatch();
 }
 
 /// Defines the set of operations available for the key-value store.
@@ -209,8 +208,8 @@ pub enum Command {
 }
 
 impl Command {
-    pub fn dispatch(self, service_id: usize) -> Result<(), ServiceError> {
-        service::dispatch(service_id, self)
+    pub fn dispatch(self, service_id: usize) -> Result<(), LegacyServiceError> {
+        service::dispatch_legacy(service_id, self)
     }
 }
 
@@ -632,7 +631,7 @@ impl Model {
     }
 }
 
-impl Service for Model {
+impl LegacyService for Model {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
