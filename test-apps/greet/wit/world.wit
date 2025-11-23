@@ -1,6 +1,0 @@
-package greet:app;
-
-world greet {
-    import greet:lib/greet;
-}
-

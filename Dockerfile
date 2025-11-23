@@ -38,10 +38,10 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /workspace
 COPY . .
 
-# Build CUDA backend
-RUN cd backend/backend-cuda && mkdir -p build && cd build \
-    && cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" \
-    && ninja
+# Build CUDA backend (disabled - using Python backend only)
+# RUN cd backend/backend-cuda && mkdir -p build && cd build \
+#     && cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" \
+#     && ninja
 
 # Install PIE CLI globally
 RUN cd pie && cargo install --path .
@@ -64,8 +64,15 @@ RUN cd backend/backend-python \
 # ============================================================================
 FROM builder AS development
 
-# Keep container running for development
-CMD ["tail", "-f", "/dev/null"]
+# Copy entrypoint script for auth setup
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Set entrypoint to handle auth setup before starting server
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# Default command: start PIE server for development (allows pie-cli connections)
+CMD ["pie", "serve", "--config", "/workspace/pie/docker_config.toml"]
 
 # ============================================================================
 # Stage 3: Runtime - Use devel image for FlashInfer JIT compilation support
@@ -99,8 +106,8 @@ WORKDIR /workspace
 COPY --from=builder /usr/local/cargo/bin/pie /usr/local/bin/pie
 COPY --from=builder /root/.local/bin/uv /usr/local/bin/uv
 
-# Copy CUDA backend binary
-COPY --from=builder /workspace/backend/backend-cuda/build/bin/pie_cuda_be /workspace/backend/backend-cuda/build/bin/pie_cuda_be
+# Copy CUDA backend binary (disabled - using Python backend only)
+# COPY --from=builder /workspace/backend/backend-cuda/build/bin/pie_cuda_be /workspace/backend/backend-cuda/build/bin/pie_cuda_be
 
 # Copy Python virtual environment
 COPY --from=builder /workspace/backend/backend-python/.venv /workspace/backend/backend-python/.venv
@@ -117,5 +124,12 @@ COPY --from=builder /workspace/example-apps/target/wasm32-wasip2/release/*.wasm 
 # Copy configuration file
 COPY --from=builder /workspace/pie/docker_config.toml /workspace/pie/docker_config.toml
 
-# Use docker_config.toml with Python backend and absolute paths
+# Copy entrypoint script for auth setup
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Set entrypoint to handle auth setup before starting server
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# Default command: start PIE server
 CMD ["pie", "serve", "--config", "/workspace/pie/docker_config.toml"]
