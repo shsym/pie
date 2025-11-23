@@ -209,6 +209,7 @@ program_cache/
 backend/backend-pytorch
 
 bin/
+*.wasm
 
 # logs and temporary files
 logs

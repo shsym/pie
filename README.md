@@ -21,35 +21,51 @@
 
 ### Docker Installation
 
-The easiest way to run Pie with CUDA support is using our pre-built Docker image.
+Run Pie server in Docker and connect to it using the `pie-cli` client.
 
 **Prerequisites:**
-- NVIDIA GPU (SM 8.0+), NVIDIA, and Docker
-- Tested on Ubuntu 24.04, CUDA 12.7
-- Install NVIDIA Container Toolkit
+- NVIDIA GPU with Docker and NVIDIA Container Toolkit
+- SSH key pair (generate with `ssh-keygen -t ed25519` if needed)
+- `pie-cli` binary ([download from GitHub releases](https://github.com/pie-project/pie/releases))
 
-**Step 1: Pull Image and Download Model**
+**Step 1: Start Pie Server**
 
 ```bash
-docker pull pieproject/pie:latest
-mkdir -p ~/.cache
-docker run --rm --gpus all -it -v ~/.cache:/root/.cache pieproject/pie:latest \
-  pie model add "llama-3.2-1b-instruct"
+docker run --rm --gpus all -p 8080:8080 \
+  --name pie-server \
+  -e PIE_AUTH_USER="$(whoami)" \
+  -e PIE_AUTH_KEY="$(cat ~/.ssh/id_ed25519.pub)" \
+  -v ~/.cache:/root/.cache \
+  pieproject/pie:latest
 ```
 
-- Models are downloaded into `~/.cache/pie/models/` and persist across container runs.
+The server will start with the name `pie-server` and authenticate using your SSH public key. Models are cached in `~/.cache/` for persistence.
 
-- FlashInfer's JIT-compiled kernels are cached in `~/.cache/flashinfer/` to avoid recompilation.
+**Step 2: Configure and Test Connection**
 
+In a new terminal:
 
-**Step 2: Run an Inferlet**
 ```bash
-docker run --gpus all --rm -it -v ~/.cache:/root/.cache pieproject/pie:latest \
-  pie run --config /workspace/pie/docker_config.toml \
-  /workspace/example-apps/text_completion.wasm -- --prompt "What is the capital of France?"
+# Configure pie-cli (uses localhost:8080 by default)
+pie-cli config init --enable-auth true
+
+# Test connection
+pie-cli ping
 ```
 
-Note that the very first inferlet response may take a few minutes due to the JIT compilation of FlashInfer.
+**Step 3: Run Text Completion**
+
+Copy the example inferlet and run it:
+
+```bash
+# Copy inferlet from container (one-time)
+docker cp pie-server:/workspace/example-apps/text_completion.wasm ./
+
+# Submit for execution
+pie-cli submit ./text_completion.wasm -- --prompt "What is the capital of France?"
+```
+
+**Note:** The first run may take a few minutes for model download and kernel compilation. Subsequent runs are much faster thanks to caching.
 
 ### Manual Installation
 
