@@ -197,7 +197,7 @@ inline std::ostream& operator<<(std::ostream& os, const AppConfig& config) {
        << indent << "    Port: " << config.port << "\n"
        << indent << "    Controller Host: " << config.controller_host << "\n"
        << indent << "    Controller Port: " << config.controller_port << "\n";
-    detail::print_optional(os, "Auth Token", config.auth_token, indent + "    ");
+    detail::print_optional(os, "Internal Auth Token", config.internal_auth_token, indent + "    ");
 
     os << indent << "  Model & Cache:\n"
        << indent << "    Model Name: " << config.model_name << "\n"
