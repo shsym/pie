@@ -36,27 +36,20 @@ class AttentionCompiler(BaseShaderCompiler):
         self._compile_attention_kernels()
 
     def _compile_attention_kernels(self):
-        """Compile the actual optimized Metal attention kernels."""
+        """Compile the MLX Steel Attention-based kernels."""
         if not MPS_COMPILE_AVAILABLE:
             return
 
-        # Read the actual optimized kernel sources
-        common_source = self._read_metal_file("metal_attention_common.metal")
-        simdgroup_source = self._read_metal_file("metal_attention_simdgroup_opt.metal")
+        # Read the MLX Steel Attention-based kernel source (self-contained, no common header needed)
+        kernel_source = self._read_metal_file("metal_attention_simdgroup_opt.metal")
 
-        if not common_source or not simdgroup_source:
-            print("⚠️  Could not find optimized Metal kernel sources, using fallback")
+        if not kernel_source:
+            print("⚠️  Could not find Metal kernel source, using fallback")
             self._compile_simple_kernels()
             return
 
-        # Process the common header to resolve includes
-        processed_common = self._process_common_header(common_source)
-
-        # Process the simdgroup source to resolve includes
-        processed_simdgroup = self._resolve_includes(simdgroup_source, processed_common)
-
         # Transform Params struct to params_raw for torch.mps.compile_shader compatibility
-        processed_simdgroup = processed_simdgroup.replace(
+        processed_source = kernel_source.replace(
             "constant Params& params [[buffer(7)]]",
             "device const float* params_raw [[buffer(7)]]",
         )
@@ -95,39 +88,42 @@ class AttentionCompiler(BaseShaderCompiler):
         ]
 
         for old, new in param_replacements:
-            processed_simdgroup = processed_simdgroup.replace(old, new)
+            processed_source = processed_source.replace(old, new)
 
         # Inject BLOCK_SIZE define based on page_size configuration
-        # This allows dynamic configuration without modifying Metal source code
         block_size_define = f"#define BLOCK_SIZE {self.page_size}"
 
-        # Compile the full optimized attention kernels with injected BLOCK_SIZE
+        # Compile the kernels
         full_source = f"""
-#include <metal_stdlib>
-using namespace metal;
-
 // Dynamically injected BLOCK_SIZE from configuration
 {block_size_define}
 
-{processed_common}
-
-{processed_simdgroup}
+{processed_source}
 """
 
         try:
             # Compile the actual optimized shader library
             if self._compile_shader(full_source, "attention"):
                 print(
-                    f"✅ Compiled OPTIMIZED Metal attention kernels for MPS "
-                    f"(BLOCK_SIZE={self.page_size})"
+                    f"✅ Compiled kernels for MPS "
+                    f"(BLOCK_SIZE={self.page_size}, head_dim≤128)"
                 )
                 # Warm up: trigger PSO creation to catch threadgroup memory errors early
+                # Prefill kernels
                 self._warmup_kernel(
                     "attention", "batch_prefill_attention_unified_fp16_simdgroup_kernel"
                 )
                 self._warmup_kernel(
                     "attention", "batch_prefill_attention_unified_f32_simdgroup_kernel"
                 )
+                # Decode kernels (MLX sdpa_vector architecture)
+                for head_dim in [64, 128]:
+                    self._warmup_kernel(
+                        "attention", f"attention_decode_v2_fp16_{head_dim}"
+                    )
+                    self._warmup_kernel(
+                        "attention", f"attention_decode_v2_f32_{head_dim}"
+                    )
             else:
                 print("   Falling back to simple implementation")
                 self._compile_simple_kernels()
@@ -359,10 +355,21 @@ using namespace metal;
             qo_indptr, kv_page_indptr, kv_page_indices, kv_last_page_lens
         )
 
+        # Metal kernel constraint: maximum head dimension is 128
+        max_head_dim = 128
+
         with start_profile("attn_params_setup"):
             # Extract dimensions
             num_tokens, num_heads, head_dim = query.shape
             _num_pages, _, page_size, num_kv_heads, _ = kv_cache.shape
+
+            # Validate head dimension against Metal kernel limit
+            if head_dim > max_head_dim:
+                raise ValueError(
+                    f"Head dimension {head_dim} exceeds Metal kernel limit of {max_head_dim}. "
+                    f"This kernel only supports head_dim <= {max_head_dim}."
+                )
+
             scale = 1.0 / (head_dim**0.5)
 
             # Create the Params struct exactly as expected by the Metal kernel
@@ -406,35 +413,78 @@ using namespace metal;
 
         # Launch the actual optimized kernel!
         with start_profile("attn_metal_kernel"):
-            # Select kernel based on dtype: f32 for float32, fp16 for float16
-            if query.dtype == torch.float32:
-                kernel_name = "batch_prefill_attention_unified_f32_simdgroup_kernel"
-            else:
-                kernel_name = "batch_prefill_attention_unified_fp16_simdgroup_kernel"
+            # Decode mode: single query token (num_tokens == 1)
+            # Uses MLX sdpa_vector architecture with 1024 threads
+            is_decode = num_tokens == 1
 
-            # Configure dispatch parameters
-            threads_per_threadgroup = 128
-            total_threads = num_tokens * threads_per_threadgroup
+            if is_decode:
+                # Decode kernel: MLX sdpa_vector architecture
+                # Grid: (num_heads, 1, 1) - one threadgroup per head
+                # Threadgroup: 1024 threads (32 simdgroups × 32 lanes)
+                dtype_prefix = "f32" if query.dtype == torch.float32 else "fp16"
+                kernel_name = f"attention_decode_v2_{dtype_prefix}_{head_dim}"
 
-            if not hasattr(lib, kernel_name):
-                raise RuntimeError(
-                    f"Kernel {kernel_name} not found in compiled library"
+                if not hasattr(lib, kernel_name):
+                    raise RuntimeError(
+                        f"Decode kernel {kernel_name} not found. "
+                        f"Supported head_dim: 64, 128"
+                    )
+
+                # Decode dispatch: one threadgroup per head, 1024 threads each
+                getattr(lib, kernel_name)(
+                    q_input,  # q_input [buffer(0)]
+                    paged_kv_cache,  # paged_kv_cache [buffer(1)]
+                    qo_indptr.to(torch.int32),  # qo_indptr [buffer(2)]
+                    kv_page_indptr.to(torch.int32),  # kv_page_indptr [buffer(3)]
+                    kv_page_indices.to(torch.int32),  # kv_page_indices [buffer(4)]
+                    kv_last_page_lens.to(torch.int32),  # kv_last_page_lens [buffer(5)]
+                    output,  # output [buffer(6)]
+                    params,  # params [buffer(7)]
+                    debug_out,  # debug_out [buffer(8)]
+                    threads=(num_heads * 1024, 1, 1),
+                    group_size=(1024, 1, 1),
                 )
+            else:
+                # Prefill kernel: MLX Steel Attention architecture
+                # - FP16: BQ=32, 128 threads (4 simdgroups)
+                # - F32:  BQ=16, 64 threads (2 simdgroups) - reduced for memory
+                if query.dtype == torch.float32:
+                    kernel_name = "batch_prefill_attention_unified_f32_simdgroup_kernel"
+                    bq = 16  # Query block size for f32
+                    threads_per_threadgroup = 64  # 2 simdgroups for f32
+                else:
+                    kernel_name = (
+                        "batch_prefill_attention_unified_fp16_simdgroup_kernel"
+                    )
+                    bq = 32  # Query block size for fp16
+                    threads_per_threadgroup = 128  # 4 simdgroups for fp16
 
-            # Call the optimized simdgroup kernel with exact parameter layout and dispatch config
-            getattr(lib, kernel_name)(
-                q_input,  # q_input [buffer(0)]
-                paged_kv_cache,  # paged_kv_cache [buffer(1)] - unified KV cache
-                qo_indptr.to(torch.int32),  # qo_indptr [buffer(2)]
-                kv_page_indptr.to(torch.int32),  # kv_page_indptr [buffer(3)]
-                kv_page_indices.to(torch.int32),  # kv_page_indices [buffer(4)]
-                kv_last_page_lens.to(torch.int32),  # kv_last_page_lens [buffer(5)]
-                output,  # output [buffer(6)]
-                params,  # params [buffer(7)]
-                debug_out,  # debug_out [buffer(8)]
-                threads=(total_threads, 1, 1),
-                group_size=(threads_per_threadgroup, 1, 1),
-            )
+                # Grid dispatch: (ceil(num_qo / BQ), num_heads, 1)
+                # Each threadgroup processes BQ query tokens for one head
+                num_q_blocks = (num_tokens + bq - 1) // bq
+                total_threads_x = num_q_blocks * threads_per_threadgroup
+                total_threads_y = num_heads
+
+                if not hasattr(lib, kernel_name):
+                    raise RuntimeError(
+                        f"Kernel {kernel_name} not found in compiled library"
+                    )
+
+                # Call the MLX Steel Attention kernel
+                # Grid: (ceil(num_qo/BQ), num_heads, 1), Threadgroup: (TGP_SIZE, 1, 1)
+                getattr(lib, kernel_name)(
+                    q_input,  # q_input [buffer(0)]
+                    paged_kv_cache,  # paged_kv_cache [buffer(1)] - unified KV cache
+                    qo_indptr.to(torch.int32),  # qo_indptr [buffer(2)]
+                    kv_page_indptr.to(torch.int32),  # kv_page_indptr [buffer(3)]
+                    kv_page_indices.to(torch.int32),  # kv_page_indices [buffer(4)]
+                    kv_last_page_lens.to(torch.int32),  # kv_last_page_lens [buffer(5)]
+                    output,  # output [buffer(6)]
+                    params,  # params [buffer(7)]
+                    debug_out,  # debug_out [buffer(8)]
+                    threads=(total_threads_x, total_threads_y, 1),
+                    group_size=(threads_per_threadgroup, 1, 1),
+                )
 
         # Output is already in correct 1D layout written by kernel
         # Kernel writes with stride (num_heads * head_dim) per token
