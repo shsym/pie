@@ -2,10 +2,13 @@
 resolver = "2"
 members = [
     "constrained-decoding",
+    "graph-of-thought",
+    "parallel-generation",
     "prefix-caching",
     "prefix-tree",
     "recursion-of-thought",
     "text-completion",
+    "tree-of-thought",
     "watermarking",
     "windowed-attention",
 ]
