@@ -3,11 +3,13 @@ resolver = "2"
 members = [
     "constrained-decoding",
     "graph-of-thought",
+    "kvs",
     "output-validation",
     "parallel-generation",
     "prefix-caching",
     "prefix-tree",
     "recursion-of-thought",
+    "skeleton-of-thought",
     "text-completion",
     "tree-of-thought",
     "watermarking",
