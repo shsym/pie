@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "agent-codeact",
     "agent-react",
+    "agent-swarm",
     "attention-sink",
     "beam-search",
     "constrained-decoding",
