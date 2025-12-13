@@ -1,5 +1,5 @@
 [package]
-name = "text-completion"
+name = "image-fetch"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,3 +9,4 @@ crate-type = ["cdylib"]
 [dependencies]
 inferlet.workspace = true
 inferlet-macros.workspace = true
+image = "0.25.5"
