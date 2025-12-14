@@ -22,7 +22,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::task::{self, JoinHandle};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
@@ -306,10 +306,13 @@ impl Model {
         let (stop_heartbeat_tx, stop_heartbeat_rx) = oneshot::channel();
         let (stop_heartbeat_ack_tx, stop_heartbeat_ack_rx) = oneshot::channel();
 
+        let scheduler_notify = Arc::new(Notify::new());
+
         let backend_worker_handle = tokio::spawn(Self::backend_worker(
             socket,
             backend_rx,
             batch_triggers,
+            scheduler_notify.clone(),
             stop_heartbeat_rx,
             stop_heartbeat_ack_tx,
             shutdown_rx,
@@ -318,6 +321,7 @@ impl Model {
             batch_policy,
             scheduler_rx,
             backend_tx,
+            scheduler_notify,
             shutdown_tx.subscribe(),
         ));
 
@@ -397,6 +401,7 @@ impl Model {
         batch_policy: BatchPolicySelector,
         mut req_rx: mpsc::UnboundedReceiver<(CmdQueueId, u32, Request)>,
         backend_tx: mpsc::UnboundedSender<Vec<Request>>,
+        scheduler_notify: Arc<Notify>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         let mut sched = BatchScheduler::new(batch_policy);
@@ -425,6 +430,7 @@ impl Model {
                         break;
                     }
                 },
+                _ = scheduler_notify.notified() => {},
                 _ = tokio::time::sleep(sleep_duration) => {}
             }
 
@@ -446,6 +452,7 @@ impl Model {
         mut socket: DealerSocket,
         mut batch_rx: mpsc::UnboundedReceiver<Vec<Request>>,
         batch_triggers: HashMap<HandlerId, Arc<AtomicBool>>,
+        scheduler_notify: Arc<Notify>,
         stop_heartbeat_rx: oneshot::Receiver<()>,
         stop_heartbeat_ack_tx: oneshot::Sender<()>,
         mut shutdown_rx: broadcast::Receiver<()>,
@@ -580,6 +587,7 @@ impl Model {
 
                             if let Some(trigger) = batch_triggers.get(&received_handler_id) {
                                 trigger.store(true, std::sync::atomic::Ordering::SeqCst);
+                                scheduler_notify.notify_one();
                             }
                         },
                         Err(e) => {
