@@ -1,14 +1,6 @@
 // Beam Search Example - JavaScript/TypeScript Inferlet
-// Demonstrates beam search decoding for text generation using the inferlet library
-
-import {
-  getAutoModel,
-  getArguments,
-  send,
-  Context,
-  maxLen,
-  endsWithAny,
-} from 'inferlet';
+// Demonstrates beam search decoding for text generation
+// No boilerplate needed - just write top-level code!
 
 const HELP = `
 Usage: beam-search-js [OPTIONS]
@@ -67,16 +59,13 @@ function parseArgs(args: string[]): {
   return { help, prompt, maxTokens, beamSize, system };
 }
 
-// Main implementation
-async function main(): Promise<void> {
-  const args = getArguments();
-  const { help, prompt, maxTokens, beamSize, system } = parseArgs(args);
+// Main logic - top-level await!
+const args = getArguments();
+const { help, prompt: userPrompt, maxTokens, beamSize, system } = parseArgs(args);
 
-  if (help) {
-    send(HELP);
-    return;
-  }
-
+if (help) {
+  send(HELP);
+} else {
   // Validate numeric arguments
   if (!Number.isFinite(maxTokens) || !Number.isInteger(maxTokens) || maxTokens <= 0) {
     throw new Error(
@@ -95,16 +84,9 @@ async function main(): Promise<void> {
   // Create a context for generation
   const ctx = new Context(model);
 
-  // Format prompt in Llama 3 style
-  const formattedPrompt = `<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-${system}<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-${prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-`;
-
-  ctx.fill(formattedPrompt);
+  // Use ChatFormatter for proper prompt formatting (model-agnostic)
+  ctx.fillSystem(system);
+  ctx.fillUser(userPrompt);
 
   // Create stop condition
   const eosTokens = model.eosTokens().map((arr) => [...arr]);
@@ -117,15 +99,3 @@ ${prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
   send(result);
   send('\n');
 }
-
-// Export in WIT-compatible format for inferlet:core/run interface
-export const run = {
-  run: async (): Promise<{ tag: 'ok' } | { tag: 'err'; val: string }> => {
-    try {
-      await main();
-      return { tag: 'ok' };
-    } catch (e) {
-      return { tag: 'err', val: String(e) };
-    }
-  },
-};

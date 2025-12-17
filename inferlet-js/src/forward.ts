@@ -28,6 +28,10 @@ export interface ForwardPassResult {
   tokens?: number[];
 }
 
+// Enable to trace KvPage lifecycle for debugging
+const DEBUG_KVPAGE = false;
+let kvPageIdCounter = 0;
+
 /**
  * Represents a KV cache page with automatic resource management.
  * When the last reference is dropped, the page is deallocated.
@@ -37,10 +41,15 @@ export class KvPage {
   private _ptr: number;
   private _released: boolean = false;
   private _refCount: number = 1;
+  private _debugId: number;
 
   constructor(queue: Queue, ptr: number) {
     this._queue = queue;
     this._ptr = ptr;
+    this._debugId = kvPageIdCounter++;
+    if (DEBUG_KVPAGE) {
+      console.log(`[KvPage] CREATE id=${this._debugId} ptr=${this._ptr} refCount=${this._refCount}`);
+    }
   }
 
   /**
@@ -51,11 +60,32 @@ export class KvPage {
   }
 
   /**
+   * Returns the current reference count (for debugging).
+   */
+  get refCount(): number {
+    return this._refCount;
+  }
+
+  /**
+   * Returns whether this page has been released.
+   */
+  get isReleased(): boolean {
+    return this._released;
+  }
+
+  /**
    * Increment the reference count.
    * Call this when sharing this page with another Context.
    */
   ref(): void {
+    if (this._released) {
+      console.error(`[KvPage] ERROR: ref() on released page id=${this._debugId} ptr=${this._ptr}`);
+      throw new Error(`Cannot ref a released KvPage (ptr=${this._ptr})`);
+    }
     this._refCount++;
+    if (DEBUG_KVPAGE) {
+      console.log(`[KvPage] REF id=${this._debugId} ptr=${this._ptr} refCount=${this._refCount}`);
+    }
   }
 
   /**
@@ -64,10 +94,19 @@ export class KvPage {
    */
   unref(): boolean {
     if (this._released) {
+      if (DEBUG_KVPAGE) {
+        console.log(`[KvPage] SKIP unref (already released) id=${this._debugId} ptr=${this._ptr}`);
+      }
       return false;
     }
     this._refCount--;
+    if (DEBUG_KVPAGE) {
+      console.log(`[KvPage] UNREF id=${this._debugId} ptr=${this._ptr} refCount=${this._refCount}`);
+    }
     if (this._refCount <= 0) {
+      if (DEBUG_KVPAGE) {
+        console.log(`[KvPage] DEALLOCATE id=${this._debugId} ptr=${this._ptr}`);
+      }
       this._queue.deallocateKvPagePtr(this._ptr);
       this._released = true;
       return true;

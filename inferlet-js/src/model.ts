@@ -106,14 +106,14 @@ export class Queue implements Forward {
    * Deallocate resources of the specified type
    */
   deallocateResources(resource: Resource, ptrs: number[]): void {
-    apiCommon.deallocateResources(this.inner, resource, ptrs);
+    apiCommon.deallocateResources(this.inner, resource, new Uint32Array(ptrs));
   }
 
   /**
    * Export resources with a name for later import
    */
   exportResources(resource: Resource, ptrs: number[], name: string): void {
-    apiCommon.exportResources(this.inner, resource, ptrs, name);
+    apiCommon.exportResources(this.inner, resource, new Uint32Array(ptrs), name);
   }
 
   /**

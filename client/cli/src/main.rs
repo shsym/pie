@@ -7,6 +7,7 @@ mod build;
 mod config;
 mod engine;
 mod list;
+mod create;
 mod path;
 mod ping;
 mod submit;
@@ -16,6 +17,7 @@ use attach::AttachArgs;
 use build::BuildArgs;
 use config::ConfigCommands;
 use list::ListArgs;
+use create::CreateArgs;
 use ping::PingArgs;
 use submit::SubmitArgs;
 
@@ -32,6 +34,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Create a new JavaScript/TypeScript inferlet project.
+    Create(CreateArgs),
     /// Build a JavaScript/TypeScript inferlet into a WebAssembly component.
     Build(BuildArgs),
     /// Submit an inferlet to a running Pie engine.
@@ -54,6 +58,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Create(args) => {
+            create::handle_create_command(args).await?;
+        }
         Commands::Build(args) => {
             build::handle_build_command(args).await?;
         }

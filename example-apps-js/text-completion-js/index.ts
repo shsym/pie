@@ -1,15 +1,6 @@
 // Text Completion Example - JavaScript/TypeScript Inferlet
 // Demonstrates basic text generation using the inferlet library
-
-import {
-  getAutoModel,
-  getArguments,
-  send,
-  Context,
-  Sampler,
-  maxLen,
-  endsWithAny,
-} from 'inferlet';
+// No boilerplate needed - just write top-level code!
 
 const HELP = `
 Usage: text-completion-js [OPTIONS]
@@ -59,16 +50,13 @@ function parseArgs(args: string[]): {
   return { help, prompt, maxTokens, system };
 }
 
-// Main implementation
-async function main(): Promise<void> {
-  const args = getArguments();
-  const { help, prompt, maxTokens, system } = parseArgs(args);
+// Main logic - top-level await!
+const args = getArguments();
+const { help, prompt: userPrompt, maxTokens, system } = parseArgs(args);
 
-  if (help) {
-    send(HELP);
-    return;
-  }
-
+if (help) {
+  send(HELP);
+} else {
   // Validate numeric arguments
   if (!Number.isFinite(maxTokens) || !Number.isInteger(maxTokens) || maxTokens <= 0) {
     throw new Error(
@@ -82,16 +70,9 @@ async function main(): Promise<void> {
   // Create a context for generation
   const ctx = new Context(model);
 
-  // Format prompt in Llama 3 style
-  const formattedPrompt = `<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-${system}<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-${prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-`;
-
-  ctx.fill(formattedPrompt);
+  // Use ChatFormatter for proper prompt formatting
+  ctx.fillSystem(system);
+  ctx.fillUser(userPrompt);
 
   // Create sampler and stop condition
   const sampler = Sampler.topP(0.6, 0.95);
@@ -105,17 +86,3 @@ ${prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
   send(result);
   send('\n');
 }
-
-// Export in WIT-compatible format for inferlet:core/run interface
-export const run = {
-  run: async (): Promise<{ tag: 'ok' } | { tag: 'err'; val: string }> => {
-    try {
-      await main();
-      return { tag: 'ok' };
-    } catch (e) {
-      const err = e instanceof Error ? `${e.message}\n${e.stack}` : String(e);
-      send(`\nERROR: ${err}\n`);
-      return { tag: 'err', val: String(e) };
-    }
-  },
-};

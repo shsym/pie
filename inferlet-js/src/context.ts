@@ -9,6 +9,10 @@ import { KvPage, ForwardPass, type Distribution } from './forward.js';
 import { Sampler, type SamplerType } from './sampler.js';
 import type { StopCondition } from './stop-condition.js';
 
+// Debug tracing for Context
+const DEBUG_CONTEXT = false;
+let contextIdCounter = 0;
+
 /**
  * Context manages the state for text generation, including:
  * - Token history and pending tokens
@@ -39,6 +43,8 @@ export class Context {
 
   beginOfSequence: boolean = true;
 
+  private _debugId: number;
+
   constructor(model: Model) {
     this.queue = model.createQueue();
     this.kvPageSize = model.getKvPageSize();
@@ -46,6 +52,10 @@ export class Context {
     this.model = model;
     this.formatter = new ChatFormatter();
     this.tokenMaskCurrent = Brle.new(0);
+    this._debugId = contextIdCounter++;
+    if (DEBUG_CONTEXT) {
+      console.log(`[Context] CREATE id=${this._debugId}`);
+    }
   }
 
   /**
@@ -151,13 +161,24 @@ export class Context {
    */
   fork(): Context {
     const forked = new Context(this.model);
+    const isEasyCase = this.kvPageLastLen === this.kvPageSize;
 
-    if (this.kvPageLastLen === this.kvPageSize) {
+    if (DEBUG_CONTEXT) {
+      const pagePtrs = this.kvPages.map(p => p.ptr).join(',');
+      console.log(`[Context] FORK parent=${this._debugId} child=${forked._debugId} ` +
+        `kvPageLastLen=${this.kvPageLastLen} kvPageSize=${this.kvPageSize} ` +
+        `isEasyCase=${isEasyCase} pages=[${pagePtrs}]`);
+    }
+
+    if (isEasyCase) {
       // Easy case: the last page is full, we can share everything.
       forked.tokenIds = [...this.tokenIds];
       forked.tokenIdsPending = [...this.tokenIdsPending];
       forked.kvPages = [...this.kvPages];
       // Increment ref count for shared pages
+      if (DEBUG_CONTEXT) {
+        console.log(`[Context] FORK easy case: ref'ing ${forked.kvPages.length} pages`);
+      }
       for (const page of forked.kvPages) {
         page.ref();
       }
@@ -173,6 +194,10 @@ export class Context {
       forked.tokenIds = this.tokenIds.slice(0, keptTokensLen);
       forked.kvPages = this.kvPages.slice(0, keptKvPageLen);
       // Increment ref count for shared pages
+      if (DEBUG_CONTEXT) {
+        const keptPtrs = forked.kvPages.map(p => p.ptr).join(',');
+        console.log(`[Context] FORK hard case: keeping ${keptKvPageLen} pages [${keptPtrs}], dropping last page`);
+      }
       for (const page of forked.kvPages) {
         page.ref();
       }
@@ -217,6 +242,10 @@ export class Context {
    * Safe to call multiple times.
    */
   release(): void {
+    if (DEBUG_CONTEXT) {
+      const pagePtrs = this.kvPages.map(p => `${p.ptr}(rc=${p.refCount})`).join(',');
+      console.log(`[Context] RELEASE id=${this._debugId} pages=[${pagePtrs}]`);
+    }
     for (const page of this.kvPages) {
       page.release();
     }
@@ -330,10 +359,21 @@ export class Context {
     if (requiredPages > currentPages) {
       // Grow: Allocate new pages
       const newPagesNeeded = requiredPages - currentPages;
+      if (DEBUG_CONTEXT) {
+        console.log(`[Context] GROW id=${this._debugId} allocating ${newPagesNeeded} new pages`);
+      }
       const newKvPages = this.queue.newKvPages(newPagesNeeded);
       this.kvPages.push(...newKvPages);
+      if (DEBUG_CONTEXT) {
+        const allPtrs = this.kvPages.map(p => p.ptr).join(',');
+        console.log(`[Context] GROW id=${this._debugId} now has pages=[${allPtrs}]`);
+      }
     } else if (requiredPages < currentPages) {
       // Shrink: Release excess pages
+      if (DEBUG_CONTEXT) {
+        const toReleasePtrs = this.kvPages.slice(requiredPages).map(p => `${p.ptr}(rc=${p.refCount})`).join(',');
+        console.log(`[Context] SHRINK id=${this._debugId} releasing pages=[${toReleasePtrs}]`);
+      }
       const pagesToRelease = this.kvPages.splice(requiredPages);
       for (const page of pagesToRelease) {
         page.release();
@@ -568,26 +608,68 @@ export class Context {
   ): Promise<string> {
     type BeamState = [Context, number[], number]; // [context, generated_tokens, score]
     let beams: BeamState[] = [[this.fork(), [], 0.0]];
+    let iteration = 0;
+
+    if (DEBUG_CONTEXT) {
+      console.log(`[BeamSearch] START parent=${this._debugId} beamSize=${beamSize}`);
+    }
 
     while (true) {
+      iteration++;
+      if (DEBUG_CONTEXT) {
+        const beamInfo = beams.map(([ctx, gen, score]) =>
+          `ctx=${ctx._debugId} pages=${ctx.kvPages.length} gen=${gen.length}`
+        ).join('; ');
+        console.log(`[BeamSearch] ITERATION ${iteration} beams=[${beamInfo}]`);
+      }
+
       // Check if any beam satisfies the stop condition
       const completedBeam = beams.find(([, generated]) =>
         stopCondition.check(generated)
       );
 
       if (completedBeam) {
-        const [beam, generatedTokens] = completedBeam;
+        const [winningBeam, generatedTokens] = completedBeam;
+
+        if (DEBUG_CONTEXT) {
+          console.log(`[BeamSearch] COMPLETE winner=${winningBeam._debugId} tokens=${generatedTokens.length}`);
+        }
+
+        // Release the old pages held by `this` before adopting new ones
+        this.release();
 
         // Adopt the state from the winning beam
-        this.kvPageLastLen = beam.kvPageLastLen;
-        this.tokenIds = [...beam.tokenIds];
-        this.tokenIdsPending = [...beam.tokenIdsPending];
-        this.kvPages = [...beam.kvPages];
+        this.kvPageLastLen = winningBeam.kvPageLastLen;
+        this.tokenIds = [...winningBeam.tokenIds];
+        this.tokenIdsPending = [...winningBeam.tokenIdsPending];
+        this.kvPages = [...winningBeam.kvPages];
+
+        if (DEBUG_CONTEXT) {
+          const adoptedPtrs = this.kvPages.map(p => `${p.ptr}(rc=${p.refCount})`).join(',');
+          console.log(`[BeamSearch] ADOPT pages=[${adoptedPtrs}] ref'ing them`);
+        }
+
+        // Increment ref count for adopted pages since `this` is now an owner
+        for (const page of this.kvPages) {
+          page.ref();
+        }
+
+        if (DEBUG_CONTEXT) {
+          console.log(`[BeamSearch] RELEASE all ${beams.length} beams`);
+        }
+
+        // Release all beams (their pages will be decremented, deallocated if refCount reaches 0)
+        for (const [beam] of beams) {
+          beam.release();
+        }
 
         return this.tokenizer.detokenize(new Uint32Array(generatedTokens));
       }
 
       // Progress all beams in parallel
+      if (DEBUG_CONTEXT) {
+        console.log(`[BeamSearch] DECODE ${beams.length} beams`);
+      }
       const nextDists = await Promise.all(
         beams.map(([beam]) => beam.decodeStepDist())
       );
@@ -597,6 +679,10 @@ export class Context {
       for (let i = 0; i < beams.length; i++) {
         const [beam, generated, score] = beams[i];
         const nextDist = nextDists[i];
+
+        if (DEBUG_CONTEXT) {
+          console.log(`[BeamSearch] EXPAND beam=${beam._debugId} into ${Math.min(beamSize, nextDist.ids.length)} children`);
+        }
 
         // Expand with top candidates
         for (let j = 0; j < Math.min(beamSize, nextDist.ids.length); j++) {
@@ -608,10 +694,27 @@ export class Context {
 
           nextBeams.push([nextBeam, nextGenerated, nextScore]);
         }
+
+        // Release the old beam after forking - its pages are now shared with children
+        if (DEBUG_CONTEXT) {
+          console.log(`[BeamSearch] RELEASE parent beam=${beam._debugId}`);
+        }
+        beam.release();
       }
 
       // Prune: Sort by score (descending) and keep top beamSize
       nextBeams.sort((a, b) => b[2] - a[2]);
+
+      // Release pruned beams before discarding them
+      const prunedBeams = nextBeams.slice(beamSize);
+      if (DEBUG_CONTEXT && prunedBeams.length > 0) {
+        const prunedIds = prunedBeams.map(([ctx]) => ctx._debugId).join(',');
+        console.log(`[BeamSearch] PRUNE ${prunedBeams.length} beams: [${prunedIds}]`);
+      }
+      for (const [prunedCtx] of prunedBeams) {
+        prunedCtx.release();
+      }
+
       beams = nextBeams.slice(0, beamSize);
     }
   }
