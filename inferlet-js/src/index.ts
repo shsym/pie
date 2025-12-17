@@ -37,3 +37,19 @@ export { Model, Queue, getModel, getAllModels, getAutoModel, getAllModelsWithTra
 // Re-export ChatFormatter
 export { ChatFormatter } from './chat.js';
 export type { ToolCall } from './chat.js';
+
+// Re-export Brle
+export { Brle, causalMask } from './brle.js';
+
+// Re-export ForwardPass and related types
+export { ForwardPass, KvPage, Resource, causalMask as forwardCausalMask } from './forward.js';
+export type { Distribution, ForwardPassResult, Forward } from './forward.js';
+
+// Re-export Context
+export { Context } from './context.js';
+
+// Re-export messaging functions
+export { send, receive, sendBlob, receiveBlob, broadcast, subscribe, Blob } from './messaging.js';
+
+// Re-export KVS functions
+export { storeGet, storeSet, storeDelete, storeExists, storeListKeys } from './kvs.js';

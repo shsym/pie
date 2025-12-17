@@ -1,9 +1,9 @@
 // Runtime wrapper functions for inferlet-core-runtime bindings
 // These functions wrap the WASM component bindings with a clean TypeScript API
 
-import * as runtime from './bindings/interfaces/inferlet-core-runtime.js';
-import type { Pollable } from './bindings/interfaces/wasi-io-poll.js';
-import type { DebugQueryResult as DebugQueryResultResource } from './bindings/interfaces/inferlet-core-common.js';
+import * as runtime from 'inferlet:core/runtime';
+import type { Pollable } from 'wasi:io/poll';
+import type { DebugQueryResult as DebugQueryResultResource } from 'inferlet:core/common';
 
 /**
  * Returns the runtime version string

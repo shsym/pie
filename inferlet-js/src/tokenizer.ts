@@ -1,8 +1,8 @@
 // Tokenizer class for text tokenization and detokenization
 // Mirrors the Rust Tokenizer from inferlet/src/lib.rs
 
-import { Tokenizer as TokenizerBinding, getTokenizer } from './bindings/interfaces/inferlet-core-tokenize.js';
-import type { Model } from './bindings/interfaces/inferlet-core-common.js';
+import { Tokenizer as TokenizerBinding, getTokenizer } from 'inferlet:core/tokenize';
+import type { Model } from 'inferlet:core/common';
 
 /**
  * Tokenizer class that wraps the WIT tokenize bindings

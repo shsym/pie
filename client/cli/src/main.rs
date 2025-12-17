@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 
 mod abort;
 mod attach;
+mod build;
 mod config;
 mod engine;
 mod list;
@@ -12,6 +13,7 @@ mod submit;
 
 use abort::AbortArgs;
 use attach::AttachArgs;
+use build::BuildArgs;
 use config::ConfigCommands;
 use list::ListArgs;
 use ping::PingArgs;
@@ -30,6 +32,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Build a JavaScript/TypeScript inferlet into a WebAssembly component.
+    Build(BuildArgs),
     /// Submit an inferlet to a running Pie engine.
     Submit(SubmitArgs),
     /// Check if the Pie engine is alive and responsive.
@@ -50,6 +54,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Build(args) => {
+            build::handle_build_command(args).await?;
+        }
         Commands::Submit(args) => {
             submit::handle_submit_command(args).await?;
         }

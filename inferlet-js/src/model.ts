@@ -1,28 +1,39 @@
 // Model and Queue wrapper classes for inferlet-core bindings
 // These classes wrap the WASM component bindings with a clean TypeScript API
 
-import * as runtime from './bindings/interfaces/inferlet-core-runtime.js';
+import * as runtime from 'inferlet:core/runtime';
+import * as apiCommon from 'inferlet:core/common';
+import * as apiForward from 'inferlet:core/forward';
 import type {
   Model as ModelResource,
   Queue as QueueResource,
   Priority,
   SynchronizationResult,
   DebugQueryResult,
-} from './bindings/interfaces/inferlet-core-common.js';
-import type { Pollable } from './bindings/interfaces/wasi-io-poll.js';
+} from 'inferlet:core/common';
+import type { Pollable } from 'wasi:io/poll';
 import { Tokenizer } from './tokenizer.js';
+import { ForwardPass, KvPage, Resource, type Forward } from './forward.js';
 
 /**
  * Represents a command queue for a specific model instance.
  * Queues manage the execution of commands and resource allocation.
+ * Implements the Forward interface for creating forward passes and managing resources.
  */
-export class Queue {
+export class Queue implements Forward {
   private readonly inner: QueueResource;
   private readonly serviceId: number;
 
   constructor(inner: QueueResource, serviceId: number) {
     this.inner = inner;
     this.serviceId = serviceId;
+  }
+
+  /**
+   * Gets the raw inner queue resource (for internal use)
+   */
+  getInner(): QueueResource {
+    return this.inner;
   }
 
   /**
@@ -78,6 +89,215 @@ export class Queue {
     }
 
     return value;
+  }
+
+  // ============================================
+  // Forward interface implementation
+  // ============================================
+
+  /**
+   * Allocate resources of the specified type
+   */
+  allocateResources(resource: Resource, count: number): number[] {
+    return [...apiCommon.allocateResources(this.inner, resource, count)];
+  }
+
+  /**
+   * Deallocate resources of the specified type
+   */
+  deallocateResources(resource: Resource, ptrs: number[]): void {
+    apiCommon.deallocateResources(this.inner, resource, ptrs);
+  }
+
+  /**
+   * Export resources with a name for later import
+   */
+  exportResources(resource: Resource, ptrs: number[], name: string): void {
+    apiCommon.exportResources(this.inner, resource, ptrs, name);
+  }
+
+  /**
+   * Import resources by name
+   */
+  importResources(resource: Resource, name: string): number[] {
+    return [...apiCommon.importResources(this.inner, resource, name)];
+  }
+
+  /**
+   * Get all exported resources of a type
+   */
+  getAllExportedResources(resource: Resource): [string, number][] {
+    return apiCommon.getAllExportedResources(this.inner, resource).map(([name, count]) => [name, count]);
+  }
+
+  /**
+   * Release exported resources by name
+   */
+  releaseExportedResources(resource: Resource, name: string): void {
+    apiCommon.releaseExportedResources(this.inner, resource, name);
+  }
+
+  // KvPage management with smart pointers
+
+  /**
+   * Allocate a new KV page with automatic resource management
+   */
+  newKvPage(): KvPage {
+    const ptr = this.allocateKvPagePtr();
+    return new KvPage(this, ptr);
+  }
+
+  /**
+   * Allocate multiple KV pages with automatic resource management
+   */
+  newKvPages(count: number): KvPage[] {
+    return this.allocateKvPagePtrs(count).map((ptr) => new KvPage(this, ptr));
+  }
+
+  // KvPage raw pointer management
+
+  /**
+   * Allocate a single KV page pointer
+   */
+  allocateKvPagePtr(): number {
+    const ptrs = this.allocateResources(Resource.KvPage, 1);
+    return ptrs[0];
+  }
+
+  /**
+   * Allocate multiple KV page pointers
+   */
+  allocateKvPagePtrs(count: number): number[] {
+    return this.allocateResources(Resource.KvPage, count);
+  }
+
+  /**
+   * Deallocate a single KV page pointer
+   */
+  deallocateKvPagePtr(ptr: number): void {
+    this.deallocateResources(Resource.KvPage, [ptr]);
+  }
+
+  /**
+   * Deallocate multiple KV page pointers
+   */
+  deallocateKvPagePtrs(ptrs: number[]): void {
+    this.deallocateResources(Resource.KvPage, ptrs);
+  }
+
+  // KvPage export/import
+
+  /**
+   * Export KV pages for later import
+   */
+  exportKvPages(kvPages: KvPage[], name: string): void {
+    const ptrs = kvPages.map((kv) => kv.ptr);
+    this.exportResources(Resource.KvPage, ptrs, name);
+  }
+
+  /**
+   * Import KV pages by name
+   */
+  importKvPages(name: string): KvPage[] {
+    const ptrs = this.importResources(Resource.KvPage, name);
+    return ptrs.map((ptr) => new KvPage(this, ptr));
+  }
+
+  /**
+   * Export KV page pointers for later import
+   */
+  exportKvPagePtrs(ptrs: number[], name: string): void {
+    this.exportResources(Resource.KvPage, ptrs, name);
+  }
+
+  /**
+   * Import KV page pointers by name
+   */
+  importKvPagePtrs(name: string): number[] {
+    return this.importResources(Resource.KvPage, name);
+  }
+
+  /**
+   * Get all exported KV pages
+   */
+  getAllExportedKvPages(): [string, number][] {
+    return this.getAllExportedResources(Resource.KvPage);
+  }
+
+  /**
+   * Release exported KV pages by name
+   */
+  releaseExportedKvPages(name: string): void {
+    this.releaseExportedResources(Resource.KvPage, name);
+  }
+
+  // Embedding pointer management
+
+  /**
+   * Allocate a single embedding pointer
+   */
+  allocateEmbedPtr(): number {
+    const ptrs = this.allocateResources(Resource.Embed, 1);
+    return ptrs[0];
+  }
+
+  /**
+   * Allocate multiple embedding pointers
+   */
+  allocateEmbedPtrs(count: number): number[] {
+    return this.allocateResources(Resource.Embed, count);
+  }
+
+  /**
+   * Deallocate a single embedding pointer
+   */
+  deallocateEmbedPtr(ptr: number): void {
+    this.deallocateResources(Resource.Embed, [ptr]);
+  }
+
+  /**
+   * Deallocate multiple embedding pointers
+   */
+  deallocateEmbedPtrs(ptrs: number[]): void {
+    this.deallocateResources(Resource.Embed, ptrs);
+  }
+
+  /**
+   * Export embedding pointers for later import
+   */
+  exportEmbedPtrs(ptrs: number[], name: string): void {
+    this.exportResources(Resource.Embed, ptrs, name);
+  }
+
+  /**
+   * Import embedding pointers by name
+   */
+  importEmbedPtrs(name: string): number[] {
+    return this.importResources(Resource.Embed, name);
+  }
+
+  /**
+   * Get all exported embeddings
+   */
+  getAllExportedEmbeds(): [string, number][] {
+    return this.getAllExportedResources(Resource.Embed);
+  }
+
+  /**
+   * Release exported embeddings by name
+   */
+  releaseExportedEmbeds(name: string): void {
+    this.releaseExportedResources(Resource.Embed, name);
+  }
+
+  // ForwardPass creation
+
+  /**
+   * Create a new forward pass for executing model inference
+   */
+  createForwardPass(): ForwardPass {
+    const inner = apiForward.createForwardPass(this.inner);
+    return new ForwardPass(inner);
   }
 }
 
@@ -171,7 +391,12 @@ export class Model {
     return new Queue(queueResource, this.getServiceId());
   }
 
-  // Note: createContext() will be added in Task 10
+  /**
+   * Create a new context for this model
+   * Note: This returns a Context that must be imported from './context.js'
+   * to avoid circular dependencies
+   */
+  // createContext() is implemented via the Context constructor: new Context(model)
 }
 
 /**

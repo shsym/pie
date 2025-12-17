@@ -2,7 +2,7 @@
 /**
  * Retrieves the tokenizer associated with the given model
  */
-export function getTokenizer(queue: Model): Tokenizer;
+export function getTokenizer(model: Model): Tokenizer;
 export type Model = import('./inferlet-core-common.js').Model;
 
 export class Tokenizer {

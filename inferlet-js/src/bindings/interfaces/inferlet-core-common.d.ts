@@ -60,28 +60,28 @@ export class Model {
    * This type does not have a public constructor.
    */
   private constructor();
-  getName(): string;
   /**
   * Returns the model's name (e.g. "llama-3.1-8b-instruct")
   */
-  getTraits(): Array<string>;
+  getName(): string;
   /**
   * Returns the full set of model traits
   */
-  getDescription(): string;
+  getTraits(): Array<string>;
   /**
   * Human-readable description of the model
   */
-  getPromptTemplate(): string;
+  getDescription(): string;
   /**
   * Returns the prompt formatting template in Tera
   */
+  getPromptTemplate(): string;
   getStopTokens(): Array<string>;
   getServiceId(): number;
-  getKvPageSize(): number;
   /**
   * Get the size of a KV page
   */
+  getKvPageSize(): number;
   createQueue(): Queue;
 }
 
@@ -91,14 +91,14 @@ export class Queue {
    */
   private constructor();
   getServiceId(): number;
-  synchronize(): SynchronizationResult;
   /**
   * Begin synchronization process
   */
-  setPriority(priority: Priority): void;
+  synchronize(): SynchronizationResult;
   /**
   * Change the queue's priority
   */
+  setPriority(priority: Priority): void;
   debugQuery(query: string): DebugQueryResult;
 }
 
@@ -107,9 +107,9 @@ export class SynchronizationResult {
    * This type does not have a public constructor.
    */
   private constructor();
-  pollable(): Pollable;
   /**
   * Returns a pollable for async readiness checks
   */
+  pollable(): Pollable;
   get(): boolean | undefined;
 }
