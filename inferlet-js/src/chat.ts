@@ -1,9 +1,4 @@
-import nunjucks from 'nunjucks';
-
-// Configure nunjucks to not autoescape (similar to minijinja behavior)
-const env = new nunjucks.Environment(null, {
-  autoescape: false,
-});
+import { Template } from '@huggingface/jinja';
 
 /**
  * Represents a single tool call.
@@ -123,7 +118,7 @@ export class ChatFormatter {
 
   /**
    * Renders the entire conversation into a single formatted string prompt.
-   * @param template The Nunjucks template string
+   * @param template The Jinja2 template string
    * @param addGenerationPrompt Whether to add a generation prompt
    * @param beginOfSequence Whether to include begin of sequence token
    * @returns The rendered conversation string
@@ -133,7 +128,8 @@ export class ChatFormatter {
     addGenerationPrompt: boolean,
     beginOfSequence: boolean
   ): string {
-    return env.renderString(template, {
+    const tmpl = new Template(template);
+    return tmpl.render({
       messages: this.messages,
       add_generation_prompt: addGenerationPrompt,
       begin_of_sequence: beginOfSequence,

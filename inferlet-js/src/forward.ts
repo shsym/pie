@@ -36,6 +36,7 @@ export class KvPage {
   private _queue: Queue;
   private _ptr: number;
   private _released: boolean = false;
+  private _refCount: number = 1;
 
   constructor(queue: Queue, ptr: number) {
     this._queue = queue;
@@ -50,14 +51,36 @@ export class KvPage {
   }
 
   /**
-   * Explicitly release this KV page.
+   * Increment the reference count.
+   * Call this when sharing this page with another Context.
+   */
+  ref(): void {
+    this._refCount++;
+  }
+
+  /**
+   * Decrement the reference count and release if it reaches zero.
+   * Returns true if the page was actually deallocated.
+   */
+  unref(): boolean {
+    if (this._released) {
+      return false;
+    }
+    this._refCount--;
+    if (this._refCount <= 0) {
+      this._queue.deallocateKvPagePtr(this._ptr);
+      this._released = true;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Explicitly release this KV page (decrements ref count).
    * Called automatically when the page is no longer needed.
    */
   release(): void {
-    if (!this._released) {
-      this._queue.deallocateKvPagePtr(this._ptr);
-      this._released = true;
-    }
+    this.unref();
   }
 }
 

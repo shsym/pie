@@ -1,4 +1,4 @@
-// inferlet-js - JavaScript library for writing Pie inferlets
+// inferlet - JavaScript library for writing Pie inferlets
 // This mirrors the Rust inferlet crate API
 
 export const VERSION = '0.1.0';

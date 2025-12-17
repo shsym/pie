@@ -420,7 +420,8 @@ def _decode_brle(brle_buffer: list[int]) -> np.ndarray:
 
     decoded_array = np.empty(total_size, dtype=bool)
     current_pos = 0
-    value = False  # BRLE format: first element is False run count, alternating thereafter
+    value = False
+    # ^BRLE format: first element is False run count, alternating thereafter
     for run_len in brle_buffer:
         if run_len > 0:
             decoded_array[current_pos : current_pos + run_len] = value

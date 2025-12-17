@@ -1,5 +1,5 @@
 // Beam Search Example - JavaScript/TypeScript Inferlet
-// Demonstrates beam search decoding for text generation using the inferlet-js library
+// Demonstrates beam search decoding for text generation using the inferlet library
 
 import {
   getAutoModel,
@@ -8,7 +8,7 @@ import {
   Context,
   maxLen,
   endsWithAny,
-} from 'inferlet-js';
+} from 'inferlet';
 
 const HELP = `
 Usage: beam-search-js [OPTIONS]

@@ -1,5 +1,5 @@
 // Text Completion Example - JavaScript/TypeScript Inferlet
-// Demonstrates basic text generation using the inferlet-js library
+// Demonstrates basic text generation using the inferlet library
 
 import {
   getAutoModel,
@@ -9,7 +9,7 @@ import {
   Sampler,
   maxLen,
   endsWithAny,
-} from 'inferlet-js';
+} from 'inferlet';
 
 const HELP = `
 Usage: text-completion-js [OPTIONS]

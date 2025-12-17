@@ -174,7 +174,7 @@ fn run_esbuild(
         .arg("--target=es2020")
         .arg("--main-fields=module,main")  // Resolve package entry points on neutral platform
         .arg(format!("--outfile={}", output_file.display()))
-        .arg(format!("--alias:inferlet-js={}", inferlet_js_path.join("src").join("index.ts").display()));
+        .arg(format!("--alias:inferlet={}", inferlet_js_path.join("src").join("index.ts").display()));
 
     if debug {
         cmd.arg("--sourcemap=inline");

@@ -8,7 +8,7 @@ import { Sampler } from '../sampler.js';
 import { maxLen, endsWithAny } from '../stop-condition.js';
 import { ChatFormatter } from '../chat.js';
 
-describe('inferlet-js exports (pure TypeScript)', () => {
+describe('inferlet exports (pure TypeScript)', () => {
   describe('Sampler', () => {
     it('should be importable and create instances', () => {
       const sampler = Sampler.greedy();

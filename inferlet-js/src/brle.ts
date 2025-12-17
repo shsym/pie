@@ -26,15 +26,15 @@ export class Brle {
   }
 
   /**
-   * Creates a new `Brle` instance representing `size` `true` values.
-   * This is the default causal mask behavior (all visible).
+   * Creates a new `Brle` instance representing `size` `false` values.
+   * Matches Rust semantics where FALSE = visible (can attend).
    */
   static new(size: number): Brle {
     if (size === 0) {
       return new Brle([], 0);
     }
-    // All true values: [0, size] means 0 false values, then size true values
-    return new Brle([0, size], size);
+    // All false values: [size] means size false values (visible positions)
+    return new Brle([size], size);
   }
 
   /**

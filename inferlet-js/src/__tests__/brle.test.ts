@@ -10,13 +10,13 @@ describe('Brle', () => {
       expect(brle.buffer).toEqual([]);
     });
 
-    it('should create a Brle with all true values', () => {
+    it('should create a Brle with all false values (visible positions)', () => {
       const brle = Brle.new(5);
       expect(brle.len()).toBe(5);
       expect(brle.isEmpty()).toBe(false);
-      // [0, 5] means 0 false, 5 true
-      expect(brle.buffer).toEqual([0, 5]);
-      expect(brle.toArray()).toEqual([true, true, true, true, true]);
+      // [5] means 5 false values (visible positions, matching Rust semantics)
+      expect(brle.buffer).toEqual([5]);
+      expect(brle.toArray()).toEqual([false, false, false, false, false]);
     });
   });
 
@@ -191,12 +191,11 @@ describe('Brle', () => {
       ]);
     });
 
-    it('should handle all-true sequence', () => {
+    it('should handle all-false sequence', () => {
       const brle = Brle.new(5);
       const runs = [...brle.iterRuns()];
       expect(runs).toEqual([
-        [false, 0, 0],  // 0 false values
-        [true, 0, 5],   // 5 true values
+        [false, 0, 5],  // 5 false values (visible positions)
       ]);
     });
   });
@@ -206,21 +205,21 @@ describe('causalMask', () => {
   it('should create correct masks for single token', () => {
     const masks = causalMask(1, 1);
     expect(masks.length).toBe(1);
-    // First token can only see itself
+    // First token can only see itself (false = visible/can attend)
     expect(masks[0].len()).toBe(1);
-    expect(masks[0].toArray()).toEqual([true]);
+    expect(masks[0].toArray()).toEqual([false]);
   });
 
   it('should create correct masks for multiple tokens', () => {
     const masks = causalMask(3, 3);
     expect(masks.length).toBe(3);
 
-    // Token 0 can see position 0
-    expect(masks[0].toArray()).toEqual([true]);
+    // Token 0 can see position 0 (false = visible)
+    expect(masks[0].toArray()).toEqual([false]);
     // Token 1 can see positions 0, 1
-    expect(masks[1].toArray()).toEqual([true, true]);
+    expect(masks[1].toArray()).toEqual([false, false]);
     // Token 2 can see positions 0, 1, 2
-    expect(masks[2].toArray()).toEqual([true, true, true]);
+    expect(masks[2].toArray()).toEqual([false, false, false]);
   });
 
   it('should handle offset correctly', () => {
@@ -228,12 +227,12 @@ describe('causalMask', () => {
     const masks = causalMask(5, 2);
     expect(masks.length).toBe(2);
 
-    // First new token (at position 3) can see positions 0-3
+    // First new token (at position 3) can see positions 0-3 (false = visible)
     expect(masks[0].len()).toBe(4);
-    expect(masks[0].toArray()).toEqual([true, true, true, true]);
+    expect(masks[0].toArray()).toEqual([false, false, false, false]);
 
     // Second new token (at position 4) can see positions 0-4
     expect(masks[1].len()).toBe(5);
-    expect(masks[1].toArray()).toEqual([true, true, true, true, true]);
+    expect(masks[1].toArray()).toEqual([false, false, false, false, false]);
   });
 });

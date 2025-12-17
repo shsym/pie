@@ -157,6 +157,10 @@ export class Context {
       forked.tokenIds = [...this.tokenIds];
       forked.tokenIdsPending = [...this.tokenIdsPending];
       forked.kvPages = [...this.kvPages];
+      // Increment ref count for shared pages
+      for (const page of forked.kvPages) {
+        page.ref();
+      }
       forked.kvPageLastLen = this.kvPageLastLen;
       forked.positionIds = [...this.positionIds];
       forked.tokenMaskPending = this.tokenMaskPending.map((m) => m.clone());
@@ -168,6 +172,10 @@ export class Context {
 
       forked.tokenIds = this.tokenIds.slice(0, keptTokensLen);
       forked.kvPages = this.kvPages.slice(0, keptKvPageLen);
+      // Increment ref count for shared pages
+      for (const page of forked.kvPages) {
+        page.ref();
+      }
       forked.positionIds = this.positionIds.slice(0, keptTokensLen);
 
       // Combine uncommitted tokens from last page with pending tokens
@@ -201,6 +209,18 @@ export class Context {
     forked.beginOfSequence = this.beginOfSequence;
 
     return forked;
+  }
+
+  /**
+   * Release all KV pages held by this context.
+   * Call this when the context is no longer needed to free resources.
+   * Safe to call multiple times.
+   */
+  release(): void {
+    for (const page of this.kvPages) {
+      page.release();
+    }
+    this.kvPages = [];
   }
 
   /**
