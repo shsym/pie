@@ -57,6 +57,32 @@ fn get_inferlet_js_path() -> Result<PathBuf> {
     )
 }
 
+/// Validate that a project path is safe (no path traversal)
+fn validate_project_name(name: &str) -> Result<()> {
+    // Check for path traversal sequences
+    if name.contains("..") {
+        bail!("Project name cannot contain '..' (path traversal). Got: '{}'", name);
+    }
+
+    // Check for empty or whitespace-only name
+    if name.trim().is_empty() {
+        bail!("Project name cannot be empty or whitespace-only");
+    }
+
+    // Extract the final component (actual project name) for additional checks
+    let project_name = Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+
+    // Check that the final component doesn't start with a dot (hidden files)
+    if project_name.starts_with('.') {
+        bail!("Project name cannot start with '.' (hidden file). Got: '{}'", project_name);
+    }
+
+    Ok(())
+}
+
 fn generate_index(dir: &Path, name: &str, ext: &str) -> Result<()> {
     let content = format!(
         r#"// {} - JavaScript/TypeScript Inferlet
@@ -129,6 +155,9 @@ fn generate_tsconfig(dir: &Path, inferlet_path: &Path) -> Result<()> {
 }
 
 pub async fn handle_create_command(args: CreateArgs) -> Result<()> {
+    // Validate project name first
+    validate_project_name(&args.name)?;
+
     // If -o is provided, join it with the name; otherwise use name directly as path
     let project_dir = match args.output {
         Some(output) => output.join(&args.name),

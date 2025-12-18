@@ -8,12 +8,10 @@ import type {
   Model as ModelResource,
   Queue as QueueResource,
   Priority,
-  SynchronizationResult,
-  DebugQueryResult,
 } from 'inferlet:core/common';
-import type { Pollable } from 'wasi:io/poll';
 import { Tokenizer } from './tokenizer.js';
 import { ForwardPass, KvPage, Resource, type Forward } from './forward.js';
+import { awaitFuture } from './async-utils.js';
 
 /**
  * Represents a command queue for a specific model instance.
@@ -43,31 +41,13 @@ export class Queue implements Forward {
     return this.#serviceId;
   }
 
-  // Deprecated methods for backward compatibility
-  /** @deprecated Use `inner` getter instead */
-  getInner(): QueueResource { return this.#inner; }
-  /** @deprecated Use `serviceId` getter instead */
-  getServiceId(): number { return this.#serviceId; }
 
   /**
    * Begins a synchronization process for the queue (async)
    * Returns true if synchronization was successful
    */
   async synchronize(): Promise<boolean> {
-    const result: SynchronizationResult = this.#inner.synchronize();
-    const pollable: Pollable = result.pollable();
-
-    // Block until the result is ready
-    pollable.block();
-
-    // Get the result
-    const value = result.get();
-
-    if (value === undefined) {
-      throw new Error('synchronize result was undefined after pollable was ready');
-    }
-
-    return value;
+    return awaitFuture(this.#inner.synchronize(), 'synchronize result was undefined');
   }
 
   /**
@@ -81,20 +61,7 @@ export class Queue implements Forward {
    * Executes a debug command on the queue and returns the result (async)
    */
   async debugQuery(query: string): Promise<string> {
-    const result: DebugQueryResult = this.#inner.debugQuery(query);
-    const pollable: Pollable = result.pollable();
-
-    // Block until the result is ready
-    pollable.block();
-
-    // Get the result
-    const value = result.get();
-
-    if (value === undefined) {
-      throw new Error('debugQuery result was undefined after pollable was ready');
-    }
-
-    return value;
+    return awaitFuture(this.#inner.debugQuery(query), 'debugQuery result was undefined');
   }
 
   // ============================================
@@ -306,11 +273,6 @@ export class Queue implements Forward {
     return this.getAllExportedResources(Resource.Embed);
   }
 
-  // Deprecated methods
-  /** @deprecated Use `allExportedKvPages` getter instead */
-  getAllExportedKvPages(): [string, number][] { return this.allExportedKvPages; }
-  /** @deprecated Use `allExportedEmbeds` getter instead */
-  getAllExportedEmbeds(): [string, number][] { return this.allExportedEmbeds; }
 }
 
 /**
@@ -414,23 +376,6 @@ export class Model {
     return new Queue(queueResource, this.serviceId);
   }
 
-  // Deprecated methods for backward compatibility
-  /** @deprecated Use `name` getter instead */
-  getName(): string { return this.name; }
-  /** @deprecated Use `traits` getter instead */
-  getTraits(): string[] { return this.traits; }
-  /** @deprecated Use `description` getter instead */
-  getDescription(): string { return this.description; }
-  /** @deprecated Use `promptTemplate` getter instead */
-  getPromptTemplate(): string { return this.promptTemplate; }
-  /** @deprecated Use `stopTokens` getter instead */
-  getStopTokens(): string[] { return this.stopTokens; }
-  /** @deprecated Use `serviceId` getter instead */
-  getServiceId(): number { return this.serviceId; }
-  /** @deprecated Use `kvPageSize` getter instead */
-  getKvPageSize(): number { return this.kvPageSize; }
-  /** @deprecated Use `tokenizer` getter instead */
-  getTokenizer(): Tokenizer { return this.tokenizer; }
 }
 
 /**

@@ -54,6 +54,7 @@ fn ensure_npm_dependencies(package_dir: &Path) -> Result<()> {
 
     let output = Command::new("npm")
         .arg("install")
+        .arg("--ignore-scripts")
         .current_dir(package_dir)
         .output()
         .context("Failed to run npm install")?;

@@ -2,8 +2,7 @@
 // These functions wrap the WASM component bindings with a clean TypeScript API
 
 import * as runtime from 'inferlet:core/runtime';
-import type { Pollable } from 'wasi:io/poll';
-import type { DebugQueryResult as DebugQueryResultResource } from 'inferlet:core/common';
+import { awaitFuture } from './async-utils.js';
 
 /**
  * Returns the runtime version string
@@ -38,20 +37,5 @@ export function setReturn(value: string): void {
  * This function handles the pollable resource to wait for the result
  */
 export async function debugQuery(query: string): Promise<string> {
-  const result: DebugQueryResultResource = runtime.debugQuery(query);
-
-  // Get the pollable for async waiting
-  const pollable: Pollable = result.pollable();
-
-  // Block until the result is ready
-  pollable.block();
-
-  // Get the result (should be available now)
-  const value = result.get();
-
-  if (value === undefined) {
-    throw new Error('debugQuery result was undefined after pollable was ready');
-  }
-
-  return value;
+  return awaitFuture(runtime.debugQuery(query), 'debugQuery result was undefined');
 }

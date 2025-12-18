@@ -190,7 +190,9 @@ export function parseArgs<T extends ArgSchema>(schema: T): ParsedArgs<T> {
       } else if (opt.type === 'string') {
         defaults[key] = '';
       } else if (opt.type === 'number') {
-        defaults[key] = 0;
+        // Use min value if specified, otherwise 0
+        const numOpt = opt as { min?: number };
+        defaults[key] = numOpt.min ?? 0;
       }
     }
     return { ...defaults, help: true, helpText } as ParsedArgs<T>;

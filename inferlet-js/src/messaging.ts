@@ -2,7 +2,7 @@
 // Mirrors the Rust messaging functions from inferlet/src/lib.rs
 
 import * as message from 'inferlet:core/message';
-import type { Pollable } from 'wasi:io/poll';
+import { awaitFuture } from './async-utils.js';
 
 /**
  * Represents a binary blob that can be sent/received.
@@ -60,17 +60,7 @@ export function send(msg: string): void {
  * @returns A promise that resolves to the received message
  */
 export async function receive(): Promise<string> {
-  const future = message.receive();
-  const pollable: Pollable = future.pollable();
-
-  // Use pollable.block() which is the WASI way to wait
-  pollable.block();
-
-  const result = future.get();
-  if (result === undefined) {
-    throw new Error('receive() returned undefined');
-  }
-  return result;
+  return awaitFuture(message.receive(), 'receive() returned undefined');
 }
 
 /**
@@ -87,16 +77,7 @@ export function sendBlob(blob: Blob): void {
  * @returns A promise that resolves to the received blob
  */
 export async function receiveBlob(): Promise<Blob> {
-  const future = message.receiveBlob();
-  const pollable: Pollable = future.pollable();
-
-  // Use pollable.block() which is the WASI way to wait
-  pollable.block();
-
-  const result = future.get();
-  if (result === undefined) {
-    throw new Error('receiveBlob() returned undefined');
-  }
+  const result = awaitFuture(message.receiveBlob(), 'receiveBlob() returned undefined');
   return Blob.fromWit(result);
 }
 
@@ -116,15 +97,5 @@ export function broadcast(topic: string, msg: string): void {
  * @returns A promise that resolves to the received message
  */
 export async function subscribe(topic: string): Promise<string> {
-  const future = message.subscribe(topic);
-  const pollable: Pollable = future.pollable();
-
-  // Use pollable.block() which is the WASI way to wait
-  pollable.block();
-
-  const result = future.get();
-  if (result === undefined) {
-    throw new Error('subscribe() returned undefined');
-  }
-  return result;
+  return awaitFuture(message.subscribe(topic), 'subscribe() returned undefined');
 }

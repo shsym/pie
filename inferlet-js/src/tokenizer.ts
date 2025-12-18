@@ -61,12 +61,4 @@ export class Tokenizer {
   get splitRegex(): string {
     return this.inner.getSplitRegex();
   }
-
-  // Deprecated methods for backward compatibility
-  /** @deprecated Use `vocabs` getter instead */
-  getVocabs(): [Uint32Array, Array<Uint8Array>] { return this.vocabs; }
-  /** @deprecated Use `specialTokens` getter instead */
-  getSpecialTokens(): [Uint32Array, Array<Uint8Array>] { return this.specialTokens; }
-  /** @deprecated Use `splitRegex` getter instead */
-  getSplitRegex(): string { return this.splitRegex; }
 }

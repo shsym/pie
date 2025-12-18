@@ -686,4 +686,37 @@ describe('parseArgs', () => {
       expect(args.prompt).toBe('Hello, world! How are you?');
     });
   });
+
+  describe('help defaults with min constraint', () => {
+    it('should use min value for numbers without explicit default on help', () => {
+      vi.mocked(runtime.getArguments).mockReturnValue(['--help']);
+
+      const args = parseArgs({
+        count: {
+          type: 'number',
+          min: 1,
+          description: 'Count value'
+        }
+      } as const);
+
+      expect(args.help).toBe(true);
+      expect(args.count).toBe(1);  // Should use min, not 0
+    });
+
+    it('should prefer explicit default over min on help', () => {
+      vi.mocked(runtime.getArguments).mockReturnValue(['--help']);
+
+      const args = parseArgs({
+        count: {
+          type: 'number',
+          default: 10,
+          min: 1,
+          description: 'Count value'
+        }
+      } as const);
+
+      expect(args.help).toBe(true);
+      expect(args.count).toBe(10);  // Should use explicit default
+    });
+  });
 });
