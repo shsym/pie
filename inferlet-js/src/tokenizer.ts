@@ -40,33 +40,33 @@ export class Tokenizer {
   }
 
   /**
-   * Retrieves the entire vocabulary of the tokenizer.
-   *
-   * @returns A tuple containing:
-   *   - A Uint32Array of token IDs
-   *   - An array of Uint8Array byte sequences representing the tokens
+   * The entire vocabulary of the tokenizer.
+   * Returns a tuple of [token IDs, byte sequences]
    */
-  getVocabs(): [Uint32Array, Array<Uint8Array>] {
+  get vocabs(): [Uint32Array, Array<Uint8Array>] {
     return this.inner.getVocabs();
   }
 
   /**
-   * Retrieves the special tokens recognized by the tokenizer.
-   *
-   * @returns A tuple containing:
-   *   - A Uint32Array of special token IDs
-   *   - An array of Uint8Array byte sequences representing the special tokens
+   * The special tokens recognized by the tokenizer.
+   * Returns a tuple of [special token IDs, byte sequences]
    */
-  getSpecialTokens(): [Uint32Array, Array<Uint8Array>] {
+  get specialTokens(): [Uint32Array, Array<Uint8Array>] {
     return this.inner.getSpecialTokens();
   }
 
   /**
-   * Retrieves the split regular expression used by the tokenizer.
-   *
-   * @returns A string representing the split regular expression
+   * The split regular expression used by the tokenizer.
    */
-  getSplitRegex(): string {
+  get splitRegex(): string {
     return this.inner.getSplitRegex();
   }
+
+  // Deprecated methods for backward compatibility
+  /** @deprecated Use `vocabs` getter instead */
+  getVocabs(): [Uint32Array, Array<Uint8Array>] { return this.vocabs; }
+  /** @deprecated Use `specialTokens` getter instead */
+  getSpecialTokens(): [Uint32Array, Array<Uint8Array>] { return this.specialTokens; }
+  /** @deprecated Use `splitRegex` getter instead */
+  getSplitRegex(): string { return this.splitRegex; }
 }

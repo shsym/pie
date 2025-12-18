@@ -9,9 +9,6 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    },
-    "./globals": {
-      "types": "./src/globals.d.ts"
     }
   },
   "scripts": {

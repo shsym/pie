@@ -12,9 +12,9 @@ export {
   debugQuery,
 } from './runtime.js';
 
-// Re-export Sampler
+// Re-export Sampler and sampling types
 export { Sampler } from './sampler.js';
-export type { SamplerType } from './sampler.js';
+export type { SamplerType, SamplingConfig } from './sampler.js';
 
 // Re-export StopCondition
 export {
@@ -45,11 +45,16 @@ export { Brle, causalMask } from './brle.js';
 export { ForwardPass, KvPage, Resource, causalMask as forwardCausalMask } from './forward.js';
 export type { Distribution, ForwardPassResult, Forward } from './forward.js';
 
-// Re-export Context
+// Re-export Context and generation types
 export { Context } from './context.js';
+export type { MessageRole, ChatMessage, StopConfig, GenerateOptions } from './context.js';
 
 // Re-export messaging functions
 export { send, receive, sendBlob, receiveBlob, broadcast, subscribe, Blob } from './messaging.js';
 
 // Re-export KVS functions
 export { storeGet, storeSet, storeDelete, storeExists, storeListKeys } from './kvs.js';
+
+// Re-export argument parsing
+export { parseArgs } from './args.js';
+export type { ArgSchema, ArgOption, StringOption, NumberOption, BooleanOption, ParsedArgs } from './args.js';

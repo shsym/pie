@@ -1,6 +1,9 @@
 // Sampler types and configurations for text generation
 // Mirrors the Rust Sampler enum from inferlet/src/sampler.rs
 
+/**
+ * Internal sampler type discriminated union (used by the runtime)
+ */
 export type SamplerType =
   | { type: 'Custom'; temperature: number; sampler: object }
   | { type: 'Multinomial'; temperature: number }
@@ -8,6 +11,21 @@ export type SamplerType =
   | { type: 'TopK'; temperature: number; top_k: number }
   | { type: 'MinP'; temperature: number; min_p: number }
   | { type: 'TopKTopP'; temperature: number; top_k: number; top_p: number };
+
+/**
+ * User-friendly sampling configuration object.
+ * All properties are optional - unspecified values use defaults.
+ */
+export interface SamplingConfig {
+  /** Controls randomness (0.0 = greedy, higher = more random). Default: 1.0 */
+  temperature?: number;
+  /** Top-p (nucleus) sampling threshold (typically 0.9-0.95) */
+  topP?: number;
+  /** Top-k sampling - number of top tokens to consider */
+  topK?: number;
+  /** Min-p sampling - minimum probability relative to top token */
+  minP?: number;
+}
 
 export class Sampler {
   private constructor(private readonly config: SamplerType) {}
@@ -18,6 +36,16 @@ export class Sampler {
    */
   static greedy(): Sampler {
     return new Sampler({ type: 'Multinomial', temperature: 0.0 });
+  }
+
+  /**
+   * Creates a multinomial sampler with the given temperature
+   * Samples from the probability distribution with no filtering
+   *
+   * @param temperature - Controls randomness (0.0 = greedy, higher = more random)
+   */
+  static multinomial(temperature: number): Sampler {
+    return new Sampler({ type: 'Multinomial', temperature });
   }
 
   /**

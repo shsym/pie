@@ -5,7 +5,7 @@ import { Template } from '@huggingface/jinja';
  */
 export interface ToolCall {
   name: string;
-  arguments: any; // JSON value, similar to serde_json::Value
+  arguments: unknown; // JSON value - use unknown for type safety
 }
 
 /**

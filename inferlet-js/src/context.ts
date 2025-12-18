@@ -6,12 +6,47 @@ import { Tokenizer } from './tokenizer.js';
 import { ChatFormatter } from './chat.js';
 import { Brle } from './brle.js';
 import { KvPage, ForwardPass, type Distribution } from './forward.js';
-import { Sampler, type SamplerType } from './sampler.js';
-import type { StopCondition } from './stop-condition.js';
+import { Sampler, type SamplerType, type SamplingConfig } from './sampler.js';
+import { MaxLen, AnyEndsWith, type StopCondition } from './stop-condition.js';
 
 // Debug tracing for Context
 const DEBUG_CONTEXT = false;
 let contextIdCounter = 0;
+
+/**
+ * Message role for chat messages
+ */
+export type MessageRole = 'system' | 'user' | 'assistant';
+
+/**
+ * Chat message format
+ */
+export interface ChatMessage {
+  role: MessageRole;
+  content: string;
+}
+
+/**
+ * Stop condition configuration
+ */
+export interface StopConfig {
+  /** Maximum number of tokens to generate */
+  maxTokens?: number;
+  /** Stop sequences as tokenized arrays */
+  sequences?: number[][];
+}
+
+/**
+ * Options for the generate() method
+ */
+export interface GenerateOptions {
+  /** Optional messages to fill before generating */
+  messages?: ChatMessage[];
+  /** Sampling configuration - either a config object or a Sampler instance */
+  sampling: SamplingConfig | Sampler;
+  /** Stop conditions */
+  stop: StopConfig;
+}
 
 /**
  * Context manages the state for text generation, including:
@@ -47,8 +82,8 @@ export class Context {
 
   constructor(model: Model) {
     this.queue = model.createQueue();
-    this.kvPageSize = model.getKvPageSize();
-    this.tokenizer = model.getTokenizer();
+    this.kvPageSize = model.kvPageSize;
+    this.tokenizer = model.tokenizer;
     this.model = model;
     this.formatter = new ChatFormatter();
     this.tokenMaskCurrent = Brle.new(0);
@@ -69,7 +104,7 @@ export class Context {
     kvPageLastLen: number
   ): Context {
     const ctx = new Context(model);
-    const kvPageSize = model.getKvPageSize();
+    const kvPageSize = model.kvPageSize;
 
     // Verify the token count matches the KV page state
     const expectedTokens = (kvPages.length - 1) * kvPageSize + kvPageLastLen;
@@ -90,46 +125,32 @@ export class Context {
   }
 
   /**
-   * Get the model associated with this context
+   * The text representation of all tokens (computed on access)
    */
-  getModel(): Model {
-    return this.model;
-  }
-
-  /**
-   * Get the queue associated with this context
-   */
-  getQueue(): Queue {
-    return this.queue;
-  }
-
-  /**
-   * Get all token IDs in the context
-   */
-  getTokenIds(): number[] {
-    return this.tokenIds;
-  }
-
-  /**
-   * Get the text representation of all tokens
-   */
-  getText(): string {
+  get text(): string {
     return this.tokenizer.detokenize(new Uint32Array(this.tokenIds));
   }
 
   /**
-   * Returns the unique IDs of the KV cache pages currently in use
+   * The unique IDs of the KV cache pages currently in use
    */
-  getKvPagePtrs(): number[] {
+  get kvPagePtrs(): number[] {
     return this.kvPages.map((p) => p.ptr);
   }
 
-  /**
-   * Returns the number of tokens stored in the last KV cache page
-   */
-  getKvPageLastLen(): number {
-    return this.kvPageLastLen;
-  }
+  // Deprecated methods for backward compatibility
+  /** @deprecated Access `model` property directly */
+  getModel(): Model { return this.model; }
+  /** @deprecated Access `queue` property directly */
+  getQueue(): Queue { return this.queue; }
+  /** @deprecated Access `tokenIds` property directly */
+  getTokenIds(): number[] { return this.tokenIds; }
+  /** @deprecated Use `text` getter instead */
+  getText(): string { return this.text; }
+  /** @deprecated Use `kvPagePtrs` getter instead */
+  getKvPagePtrs(): number[] { return this.kvPagePtrs; }
+  /** @deprecated Access `kvPageLastLen` property directly */
+  getKvPageLastLen(): number { return this.kvPageLastLen; }
 
   /**
    * Set the adapter pointer for LoRA inference
@@ -406,7 +427,7 @@ export class Context {
   private flushChatMessages(addGenerationPrompt: boolean): void {
     if (this.formatter.hasMessages()) {
       const prompt = this.formatter.render(
-        this.model.getPromptTemplate(),
+        this.model.promptTemplate,
         addGenerationPrompt,
         this.beginOfSequence
       );
@@ -581,8 +602,75 @@ export class Context {
 
   /**
    * Generates text autoregressively until a stop condition is met.
+   *
+   * Can be called with either:
+   * - New API: generate(options: GenerateOptions)
+   * - Legacy API: generate(sampler: Sampler, stopCondition: StopCondition)
+   *
+   * @example New API with messages
+   * ```ts
+   * const result = await ctx.generate({
+   *   messages: [
+   *     { role: 'system', content: 'You are helpful.' },
+   *     { role: 'user', content: 'Hello!' }
+   *   ],
+   *   sampling: { topP: 0.95, temperature: 0.6 },
+   *   stop: { maxTokens: 256, sequences: model.eosTokens }
+   * });
+   * ```
+   *
+   * @example New API with Sampler preset
+   * ```ts
+   * const result = await ctx.generate({
+   *   sampling: Sampler.reasoning(),
+   *   stop: { maxTokens: 256, sequences: model.eosTokens }
+   * });
+   * ```
+   *
+   * @example Legacy API (deprecated)
+   * ```ts
+   * const result = await ctx.generate(sampler, stopCondition);
+   * ```
    */
-  async generate(sampler: Sampler, stopCondition: StopCondition): Promise<string> {
+  async generate(optionsOrSampler: GenerateOptions | Sampler, stopCondition?: StopCondition): Promise<string> {
+    let sampler: Sampler;
+    let stop: StopCondition;
+
+    if (optionsOrSampler instanceof Sampler) {
+      // Legacy API: generate(sampler, stopCondition)
+      if (!stopCondition) {
+        throw new Error('stopCondition is required when using legacy generate API');
+      }
+      sampler = optionsOrSampler;
+      stop = stopCondition;
+    } else {
+      // New API: generate(options)
+      const options = optionsOrSampler;
+
+      // Fill messages if provided
+      if (options.messages) {
+        for (const msg of options.messages) {
+          switch (msg.role) {
+            case 'system':
+              this.fillSystem(msg.content);
+              break;
+            case 'user':
+              this.fillUser(msg.content);
+              break;
+            case 'assistant':
+              this.fillAssistant(msg.content);
+              break;
+          }
+        }
+      }
+
+      // Convert sampling config to Sampler
+      sampler = this.toSampler(options.sampling);
+
+      // Convert stop config to StopCondition
+      stop = this.toStopCondition(options.stop);
+    }
+
     const generatedTokenIds: number[] = [];
 
     // The autoregressive generation loop
@@ -591,12 +679,75 @@ export class Context {
       this.fillToken(nextTokenId);
       generatedTokenIds.push(nextTokenId);
 
-      if (stopCondition.check(generatedTokenIds)) {
+      if (stop.check(generatedTokenIds)) {
         break;
       }
     }
 
     return this.tokenizer.detokenize(new Uint32Array(generatedTokenIds));
+  }
+
+  /**
+   * Convert a SamplingConfig or Sampler to a Sampler instance
+   */
+  private toSampler(sampling: SamplingConfig | Sampler): Sampler {
+    // If it's already a Sampler instance, use it directly
+    if (sampling instanceof Sampler) {
+      return sampling;
+    }
+
+    // It's a user-friendly SamplingConfig
+    const config = sampling as SamplingConfig;
+    const temp = config.temperature ?? 1.0;
+
+    // Determine which sampler type to use based on provided options
+    if (config.topK !== undefined && config.topP !== undefined) {
+      return Sampler.topKTopP(temp, config.topK, config.topP);
+    }
+    if (config.topP !== undefined) {
+      return Sampler.topP(temp, config.topP);
+    }
+    if (config.topK !== undefined) {
+      return Sampler.topK(temp, config.topK);
+    }
+    if (config.minP !== undefined) {
+      return Sampler.minP(temp, config.minP);
+    }
+
+    // Default: greedy if temp is 0, otherwise basic multinomial
+    if (temp === 0) {
+      return Sampler.greedy();
+    }
+
+    // Return multinomial sampler with the given temperature
+    return Sampler.multinomial(temp);
+  }
+
+  /**
+   * Convert a StopConfig to a StopCondition
+   */
+  private toStopCondition(stopConfig: StopConfig): StopCondition {
+    const conditions: StopCondition[] = [];
+
+    if (stopConfig.maxTokens !== undefined) {
+      conditions.push(new MaxLen(stopConfig.maxTokens));
+    }
+
+    if (stopConfig.sequences !== undefined && stopConfig.sequences.length > 0) {
+      conditions.push(new AnyEndsWith(stopConfig.sequences));
+    }
+
+    if (conditions.length === 0) {
+      throw new Error('At least one stop condition (maxTokens or sequences) must be specified');
+    }
+
+    // Combine all conditions with OR
+    let result = conditions[0];
+    for (let i = 1; i < conditions.length; i++) {
+      result = result.or(conditions[i]);
+    }
+
+    return result;
   }
 
   /**

@@ -21,34 +21,40 @@ import { ForwardPass, KvPage, Resource, type Forward } from './forward.js';
  * Implements the Forward interface for creating forward passes and managing resources.
  */
 export class Queue implements Forward {
-  private readonly inner: QueueResource;
-  private readonly serviceId: number;
+  readonly #inner: QueueResource;
+  readonly #serviceId: number;
 
   constructor(inner: QueueResource, serviceId: number) {
-    this.inner = inner;
-    this.serviceId = serviceId;
+    this.#inner = inner;
+    this.#serviceId = serviceId;
   }
 
   /**
-   * Gets the raw inner queue resource (for internal use)
+   * The raw inner queue resource (for internal use)
    */
-  getInner(): QueueResource {
-    return this.inner;
+  get inner(): QueueResource {
+    return this.#inner;
   }
 
   /**
-   * Gets the service ID for the queue
+   * The service ID for the queue
    */
-  getServiceId(): number {
-    return this.serviceId;
+  get serviceId(): number {
+    return this.#serviceId;
   }
+
+  // Deprecated methods for backward compatibility
+  /** @deprecated Use `inner` getter instead */
+  getInner(): QueueResource { return this.#inner; }
+  /** @deprecated Use `serviceId` getter instead */
+  getServiceId(): number { return this.#serviceId; }
 
   /**
    * Begins a synchronization process for the queue (async)
    * Returns true if synchronization was successful
    */
   async synchronize(): Promise<boolean> {
-    const result: SynchronizationResult = this.inner.synchronize();
+    const result: SynchronizationResult = this.#inner.synchronize();
     const pollable: Pollable = result.pollable();
 
     // Block until the result is ready
@@ -68,14 +74,14 @@ export class Queue implements Forward {
    * Change the queue's priority
    */
   setPriority(priority: Priority): void {
-    this.inner.setPriority(priority);
+    this.#inner.setPriority(priority);
   }
 
   /**
    * Executes a debug command on the queue and returns the result (async)
    */
   async debugQuery(query: string): Promise<string> {
-    const result: DebugQueryResult = this.inner.debugQuery(query);
+    const result: DebugQueryResult = this.#inner.debugQuery(query);
     const pollable: Pollable = result.pollable();
 
     // Block until the result is ready
@@ -99,42 +105,42 @@ export class Queue implements Forward {
    * Allocate resources of the specified type
    */
   allocateResources(resource: Resource, count: number): number[] {
-    return [...apiCommon.allocateResources(this.inner, resource, count)];
+    return [...apiCommon.allocateResources(this.#inner, resource, count)];
   }
 
   /**
    * Deallocate resources of the specified type
    */
   deallocateResources(resource: Resource, ptrs: number[]): void {
-    apiCommon.deallocateResources(this.inner, resource, new Uint32Array(ptrs));
+    apiCommon.deallocateResources(this.#inner, resource, new Uint32Array(ptrs));
   }
 
   /**
    * Export resources with a name for later import
    */
   exportResources(resource: Resource, ptrs: number[], name: string): void {
-    apiCommon.exportResources(this.inner, resource, new Uint32Array(ptrs), name);
+    apiCommon.exportResources(this.#inner, resource, new Uint32Array(ptrs), name);
   }
 
   /**
    * Import resources by name
    */
   importResources(resource: Resource, name: string): number[] {
-    return [...apiCommon.importResources(this.inner, resource, name)];
+    return [...apiCommon.importResources(this.#inner, resource, name)];
   }
 
   /**
    * Get all exported resources of a type
    */
   getAllExportedResources(resource: Resource): [string, number][] {
-    return apiCommon.getAllExportedResources(this.inner, resource).map(([name, count]) => [name, count]);
+    return apiCommon.getAllExportedResources(this.#inner, resource).map(([name, count]) => [name, count]);
   }
 
   /**
    * Release exported resources by name
    */
   releaseExportedResources(resource: Resource, name: string): void {
-    apiCommon.releaseExportedResources(this.inner, resource, name);
+    apiCommon.releaseExportedResources(this.#inner, resource, name);
   }
 
   // KvPage management with smart pointers
@@ -218,13 +224,6 @@ export class Queue implements Forward {
   }
 
   /**
-   * Get all exported KV pages
-   */
-  getAllExportedKvPages(): [string, number][] {
-    return this.getAllExportedResources(Resource.KvPage);
-  }
-
-  /**
    * Release exported KV pages by name
    */
   releaseExportedKvPages(name: string): void {
@@ -277,13 +276,6 @@ export class Queue implements Forward {
   }
 
   /**
-   * Get all exported embeddings
-   */
-  getAllExportedEmbeds(): [string, number][] {
-    return this.getAllExportedResources(Resource.Embed);
-  }
-
-  /**
    * Release exported embeddings by name
    */
   releaseExportedEmbeds(name: string): void {
@@ -296,9 +288,29 @@ export class Queue implements Forward {
    * Create a new forward pass for executing model inference
    */
   createForwardPass(): ForwardPass {
-    const inner = apiForward.createForwardPass(this.inner);
+    const inner = apiForward.createForwardPass(this.#inner);
     return new ForwardPass(inner);
   }
+
+  /**
+   * All exported KV pages
+   */
+  get allExportedKvPages(): [string, number][] {
+    return this.getAllExportedResources(Resource.KvPage);
+  }
+
+  /**
+   * All exported embeddings
+   */
+  get allExportedEmbeds(): [string, number][] {
+    return this.getAllExportedResources(Resource.Embed);
+  }
+
+  // Deprecated methods
+  /** @deprecated Use `allExportedKvPages` getter instead */
+  getAllExportedKvPages(): [string, number][] { return this.allExportedKvPages; }
+  /** @deprecated Use `allExportedEmbeds` getter instead */
+  getAllExportedEmbeds(): [string, number][] { return this.allExportedEmbeds; }
 }
 
 /**
@@ -307,21 +319,25 @@ export class Queue implements Forward {
 export class Model {
   private readonly inner: ModelResource;
 
+  // Lazy caches
+  #tokenizerCache: Tokenizer | null = null;
+  #eosTokensCache: number[][] | null = null;
+
   constructor(inner: ModelResource) {
     this.inner = inner;
   }
 
   /**
-   * Returns the model's name (e.g. "llama-3.1-8b-instruct")
+   * The model's name (e.g. "llama-3.1-8b-instruct")
    */
-  getName(): string {
+  get name(): string {
     return this.inner.getName();
   }
 
   /**
-   * Returns the full set of model traits
+   * The full set of model traits
    */
-  getTraits(): string[] {
+  get traits(): string[] {
     return this.inner.getTraits();
   }
 
@@ -329,58 +345,65 @@ export class Model {
    * Checks if the model has all the specified traits
    */
   hasTraits(requiredTraits: string[]): boolean {
-    const availableTraits = new Set(this.getTraits());
+    const availableTraits = new Set(this.traits);
     return requiredTraits.every(trait => availableTraits.has(trait));
   }
 
   /**
-   * Returns a human-readable description of the model
+   * A human-readable description of the model
    */
-  getDescription(): string {
+  get description(): string {
     return this.inner.getDescription();
   }
 
   /**
-   * Returns the prompt formatting template in Tera format
+   * The prompt formatting template in Jinja format
    */
-  getPromptTemplate(): string {
+  get promptTemplate(): string {
     return this.inner.getPromptTemplate();
   }
 
   /**
-   * Returns the stop tokens for the model
+   * The stop tokens for the model (as strings)
    */
-  getStopTokens(): string[] {
+  get stopTokens(): string[] {
     return this.inner.getStopTokens();
   }
 
   /**
-   * Gets the service ID for the model
+   * The service ID for the model
    */
-  getServiceId(): number {
+  get serviceId(): number {
     return this.inner.getServiceId();
   }
 
   /**
-   * Get the size of a KV page for this model
+   * The size of a KV page for this model
    */
-  getKvPageSize(): number {
+  get kvPageSize(): number {
     return this.inner.getKvPageSize();
   }
 
   /**
-   * Get the tokenizer for this model
+   * The tokenizer for this model (lazy cached)
    */
-  getTokenizer(): Tokenizer {
-    return new Tokenizer(this.inner);
+  get tokenizer(): Tokenizer {
+    if (!this.#tokenizerCache) {
+      this.#tokenizerCache = new Tokenizer(this.inner);
+    }
+    return this.#tokenizerCache;
   }
 
   /**
-   * Returns the EOS (end-of-sequence) tokens as tokenized arrays
+   * The EOS (end-of-sequence) tokens as tokenized arrays (lazy cached)
    */
-  eosTokens(): Uint32Array[] {
-    const tokenizer = new Tokenizer(this.inner);
-    return this.getStopTokens().map(stopToken => tokenizer.tokenize(stopToken));
+  get eosTokens(): number[][] {
+    if (!this.#eosTokensCache) {
+      this.#eosTokensCache = this.stopTokens.map(stopToken =>
+        [...this.tokenizer.tokenize(stopToken)]
+      );
+    }
+    return this.#eosTokensCache;
   }
 
   /**
@@ -388,15 +411,26 @@ export class Model {
    */
   createQueue(): Queue {
     const queueResource = this.inner.createQueue();
-    return new Queue(queueResource, this.getServiceId());
+    return new Queue(queueResource, this.serviceId);
   }
 
-  /**
-   * Create a new context for this model
-   * Note: This returns a Context that must be imported from './context.js'
-   * to avoid circular dependencies
-   */
-  // createContext() is implemented via the Context constructor: new Context(model)
+  // Deprecated methods for backward compatibility
+  /** @deprecated Use `name` getter instead */
+  getName(): string { return this.name; }
+  /** @deprecated Use `traits` getter instead */
+  getTraits(): string[] { return this.traits; }
+  /** @deprecated Use `description` getter instead */
+  getDescription(): string { return this.description; }
+  /** @deprecated Use `promptTemplate` getter instead */
+  getPromptTemplate(): string { return this.promptTemplate; }
+  /** @deprecated Use `stopTokens` getter instead */
+  getStopTokens(): string[] { return this.stopTokens; }
+  /** @deprecated Use `serviceId` getter instead */
+  getServiceId(): number { return this.serviceId; }
+  /** @deprecated Use `kvPageSize` getter instead */
+  getKvPageSize(): number { return this.kvPageSize; }
+  /** @deprecated Use `tokenizer` getter instead */
+  getTokenizer(): Tokenizer { return this.tokenizer; }
 }
 
 /**
