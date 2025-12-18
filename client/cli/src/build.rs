@@ -1,11 +1,13 @@
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use regex::Regex;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::fs;
 use std::env;
+use swc_common::{sync::Lrc, SourceMap, FileName};
+use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax};
+use swc_ecma_ast::{Decl, ExportDecl, ModuleDecl, ModuleItem, Pat};
 
 #[derive(Args, Debug)]
 pub struct BuildArgs {
@@ -322,64 +324,155 @@ fn check_for_nodejs_imports(bundled_js: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check for forbidden patterns in user code that conflict with auto-wrapping
+/// Check for forbidden patterns in user code using AST analysis
 fn validate_user_code(bundled_js: &Path) -> Result<()> {
     let content = fs::read_to_string(bundled_js)
         .context("Failed to read bundled JS for validation")?;
 
-    // Check for export const run (various forms)
-    // Patterns to catch: export const run, export { run }, export { x as run }
-    let export_run_patterns = [
-        r"export\s+const\s+run\s*=",
-        r"export\s+let\s+run\s*=",
-        r"export\s+var\s+run\s*=",
-        r"export\s+function\s+run\s*\(",
-        r"export\s*\{\s*run\s*\}",
-        r"export\s*\{\s*\w+\s+as\s+run\s*\}",
-    ];
+    // Parse JavaScript into AST
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(
+        FileName::Custom(bundled_js.display().to_string()).into(),
+        content
+    );
 
-    for pattern in &export_run_patterns {
-        let re = Regex::new(pattern).unwrap();
-        if re.is_match(&content) {
-            bail!(
-                "User code must not export 'run' - it is auto-generated.\n\n\
-                 To fix: Remove the 'export const run = {{ ... }}' block from your code.\n\
-                 The WIT interface is now automatically created by pie-cli build."
-            );
+    let lexer = Lexer::new(
+        Syntax::Es(Default::default()),
+        Default::default(),
+        StringInput::from(&*fm),
+        None,
+    );
+
+    let mut parser = Parser::new_from(lexer);
+
+    let module = parser.parse_module().map_err(|e| {
+        anyhow::anyhow!("Failed to parse JavaScript: {:?}", e)
+    })?;
+
+    // Walk AST looking for forbidden exports
+    for item in &module.body {
+        if let ModuleItem::ModuleDecl(decl) = item {
+            check_module_decl(decl)?;
         }
     }
 
-    // Check for function main() at module level
-    // This is tricky - we want top-level main, not class methods or nested functions
-    // Simple heuristic: look for "function main(" or "async function main("
-    // at the start of a line or after export
-    let main_patterns = [
-        r"(?m)^function\s+main\s*\(",
-        r"(?m)^async\s+function\s+main\s*\(",
-        r"(?m)^export\s+function\s+main\s*\(",
-        r"(?m)^export\s+async\s+function\s+main\s*\(",
-        r"(?m)^const\s+main\s*=\s*(async\s*)?\(",
-        r"(?m)^let\s+main\s*=\s*(async\s*)?\(",
-    ];
+    Ok(())
+}
 
-    for pattern in &main_patterns {
-        let re = Regex::new(pattern).unwrap();
-        if re.is_match(&content) {
-            bail!(
-                "User code must not define a 'main()' function - use top-level code instead.\n\n\
-                 To fix: Move your code from inside main() to the top level:\n\n\
-                 Before:\n\
-                   async function main() {{\n\
-                     const model = getAutoModel();\n\
-                     // ...\n\
-                   }}\n\n\
-                 After:\n\
-                   const model = getAutoModel();\n\
-                   // ..."
-            );
+/// Check a module declaration for forbidden exports
+fn check_module_decl(decl: &ModuleDecl) -> Result<()> {
+    match decl {
+        // export const run = ..., export function run(), etc.
+        ModuleDecl::ExportDecl(ExportDecl { decl, .. }) => {
+            check_decl_for_forbidden_names(decl)?;
         }
+        // export { run }, export { foo as run }
+        ModuleDecl::ExportNamed(named) => {
+            for spec in &named.specifiers {
+                if let swc_ecma_ast::ExportSpecifier::Named(n) = spec {
+                    let exported_name = n.exported.as_ref().unwrap_or(&n.orig);
+                    if let swc_ecma_ast::ModuleExportName::Ident(ident) = exported_name {
+                        check_forbidden_export_name(&ident.sym)?;
+                    }
+                }
+            }
+        }
+        // export default function run() - check if named 'run' or 'main'
+        ModuleDecl::ExportDefaultDecl(default_decl) => {
+            if let swc_ecma_ast::DefaultDecl::Fn(fn_expr) = &default_decl.decl {
+                if let Some(ident) = &fn_expr.ident {
+                    // Default export with explicit name - rare but check it
+                    check_forbidden_export_name(&ident.sym)?;
+                }
+            }
+        }
+        _ => {}
     }
+    Ok(())
+}
 
+/// Check a declaration for forbidden export names
+fn check_decl_for_forbidden_names(decl: &Decl) -> Result<()> {
+    match decl {
+        Decl::Fn(fn_decl) => {
+            check_forbidden_export_name(&fn_decl.ident.sym)?;
+        }
+        Decl::Var(var_decl) => {
+            for decl in &var_decl.decls {
+                check_pattern_for_forbidden_names(&decl.name)?;
+            }
+        }
+        Decl::Class(class_decl) => {
+            check_forbidden_export_name(&class_decl.ident.sym)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Recursively check a pattern for forbidden names (handles destructuring)
+fn check_pattern_for_forbidden_names(pat: &Pat) -> Result<()> {
+    match pat {
+        // Simple identifier: export const run = ...
+        Pat::Ident(ident) => {
+            check_forbidden_export_name(&ident.id.sym)?;
+        }
+        // Array destructuring: export const [run] = arr
+        Pat::Array(array_pat) => {
+            for elem in &array_pat.elems {
+                if let Some(elem_pat) = elem {
+                    check_pattern_for_forbidden_names(elem_pat)?;
+                }
+            }
+        }
+        // Object destructuring: export const { run } = obj
+        Pat::Object(object_pat) => {
+            for prop in &object_pat.props {
+                match prop {
+                    swc_ecma_ast::ObjectPatProp::KeyValue(kv) => {
+                        // Check the value pattern (e.g., { foo: run })
+                        check_pattern_for_forbidden_names(&kv.value)?;
+                    }
+                    swc_ecma_ast::ObjectPatProp::Assign(assign) => {
+                        // Check the key (e.g., { run })
+                        check_forbidden_export_name(&assign.key.sym)?;
+                    }
+                    swc_ecma_ast::ObjectPatProp::Rest(rest) => {
+                        // Check rest pattern (e.g., { ...run })
+                        check_pattern_for_forbidden_names(&rest.arg)?;
+                    }
+                }
+            }
+        }
+        // Rest pattern: export const [...run] = arr
+        Pat::Rest(rest_pat) => {
+            check_pattern_for_forbidden_names(&rest_pat.arg)?;
+        }
+        // Assignment pattern: export const [run = 1] = arr
+        Pat::Assign(assign_pat) => {
+            check_pattern_for_forbidden_names(&assign_pat.left)?;
+        }
+        // Invalid or expression patterns - skip
+        Pat::Invalid(_) | Pat::Expr(_) => {}
+    }
+    Ok(())
+}
+
+/// Check if an export name is forbidden
+fn check_forbidden_export_name(name: &str) -> Result<()> {
+    if name == "run" {
+        bail!(
+            "User code must not export 'run' - it is auto-generated.\n\n\
+             To fix: Remove the 'export const run = {{ ... }}' block from your code.\n\
+             The WIT interface is now automatically created by pie-cli build."
+        );
+    }
+    if name == "main" {
+        bail!(
+            "User code must not export 'main' - use top-level code instead.\n\n\
+             To fix: Move your code from inside main() to the top level."
+        );
+    }
     Ok(())
 }
 
@@ -519,4 +612,128 @@ pub async fn handle_build_command(args: BuildArgs) -> Result<()> {
     println!("   Output: {} ({:.1} KB)", args.output.display(), wasm_size as f64 / 1024.0);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn validate_code_str(code: &str) -> Result<()> {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(code.as_bytes())?;
+        validate_user_code(file.path())
+    }
+
+    #[test]
+    fn test_rejects_export_run() {
+        let result = validate_code_str("export const run = () => {};");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("run"));
+    }
+
+    #[test]
+    fn test_allows_run_in_string() {
+        // This should NOT be rejected - it's just a string
+        let result = validate_code_str(r#"console.log("export const run = 1");"#);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_allows_run_in_comment() {
+        // This should NOT be rejected - it's just a comment
+        let result = validate_code_str("// export const run = 1\nconst x = 1;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rejects_unicode_escape_bypass() {
+        // Unicode escape for 'e' in export - should still be rejected
+        let result = validate_code_str(r"\u0065xport const run = () => {};");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rejects_export_main() {
+        let result = validate_code_str("export function main() {}");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("main"));
+    }
+
+    #[test]
+    fn test_allows_main_in_object() {
+        // main as object property should be allowed
+        let result = validate_code_str("const obj = { main: () => {} };");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_allows_main_as_method() {
+        // main as class method should be allowed
+        let result = validate_code_str("class Foo { main() {} }");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rejects_object_destructuring() {
+        // Object destructuring should be caught
+        let result = validate_code_str("export const { run } = obj;");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("run"));
+    }
+
+    #[test]
+    fn test_rejects_array_destructuring() {
+        // Array destructuring should be caught
+        let result = validate_code_str("export const [run] = arr;");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("run"));
+    }
+
+    #[test]
+    fn test_rejects_nested_object_destructuring() {
+        // Nested object destructuring: { foo: run }
+        let result = validate_code_str("export const { foo: run } = obj;");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("run"));
+    }
+
+    #[test]
+    fn test_rejects_rest_destructuring() {
+        // Rest pattern: { ...run }
+        let result = validate_code_str("export const { ...run } = obj;");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("run"));
+    }
+
+    #[test]
+    fn test_rejects_array_rest_destructuring() {
+        // Array rest pattern: [...run]
+        let result = validate_code_str("export const [...run] = arr;");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("run"));
+    }
+
+    #[test]
+    fn test_rejects_assignment_destructuring() {
+        // Assignment pattern with default: [run = 1]
+        let result = validate_code_str("export const [run = 1] = arr;");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("run"));
+    }
+
+    #[test]
+    fn test_allows_nested_destructuring_without_run() {
+        // Nested destructuring without forbidden names should be allowed
+        let result = validate_code_str("export const { foo: bar, baz } = obj;");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_allows_complex_destructuring() {
+        // Complex destructuring without forbidden names should be allowed
+        let result = validate_code_str("export const [a, { b, c: d }, ...rest] = data;");
+        assert!(result.is_ok());
+    }
 }

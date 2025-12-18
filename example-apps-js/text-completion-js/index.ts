@@ -31,12 +31,12 @@ if (!args.help) {
   // Create a context for generation
   const ctx = new Context(model);
 
-  // Generate the response using the new object-based API
+  // Fill the context with messages
+  ctx.fillSystem(args.system);
+  ctx.fillUser(args.prompt);
+
+  // Generate the response
   const result = await ctx.generate({
-    messages: [
-      { role: 'system', content: args.system },
-      { role: 'user', content: args.prompt }
-    ],
     sampling: Sampler.topP(0.6, 0.95),
     stop: { maxTokens: args.maxTokens, sequences: model.eosTokens }
   });

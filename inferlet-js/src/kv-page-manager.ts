@@ -52,19 +52,18 @@ export class KvPageManager {
   }
 
   /**
-   * Fork for copy-on-write sharing
+   * Fork for copy-on-write sharing.
+   *
+   * IMPORTANT: Only shares FULL pages. Partial pages are dropped because:
+   * - Shared pages point to the same memory
+   * - If two contexts write to the same position, they corrupt each other
+   * - Full pages are read-only (new writes go to new pages)
+   * - Partial pages would be written to, so must be unique per context
    */
-  fork(): KvPageManager {
-    const forked = new KvPageManager(this.queue, this.pageSize);
-    forked.pages = [...this.pages];
-    forked._lastPageLen = this._lastPageLen;
-
-    // Increment ref count for shared pages
-    for (const page of forked.pages) {
-      page.ref();
-    }
-
-    return forked;
+  fork(): { manager: KvPageManager; droppedTokenCount: number } {
+    // Always use forkPartial behavior to ensure no writable pages are shared.
+    // This is critical for beam search where multiple contexts write independently.
+    return this.forkPartial();
   }
 
   /**
@@ -110,6 +109,14 @@ export class KvPageManager {
     for (const page of this.pages) {
       page.ref();
     }
+  }
+
+  /**
+   * Import pages from external source (e.g., cache restore)
+   */
+  importPages(pages: KvPage[], lastPageLen: number): void {
+    this.pages = pages;
+    this._lastPageLen = lastPageLen;
   }
 
   private adjust(numTokens: number): void {

@@ -198,12 +198,13 @@ export function parseArgs<T extends ArgSchema>(schema: T): ParsedArgs<T> {
     return { ...defaults, help: true, helpText } as ParsedArgs<T>;
   }
 
-  // Build lookup maps
+  // Build lookup maps - support both kebab-case and camelCase
   const keyByKebab = new Map<string, string>();
   const keyByAlias = new Map<string, string>();
 
   for (const [key, opt] of Object.entries(schema)) {
-    keyByKebab.set(toKebabCase(key), key);
+    keyByKebab.set(toKebabCase(key), key);  // --max-tokens -> maxTokens
+    keyByKebab.set(key, key);                // --maxTokens -> maxTokens (also allow camelCase)
     if (opt.alias) {
       keyByAlias.set(opt.alias, key);
     }

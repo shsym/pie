@@ -8,10 +8,9 @@ import { Brle } from './brle.js';
 import { KvPage, ForwardPass, type Distribution } from './forward.js';
 import { Sampler, type SamplerType, type SamplingConfig } from './sampler.js';
 import { MaxLen, AnyEndsWith, type StopCondition } from './stop-condition.js';
+import { KvPageManager } from './kv-page-manager.js';
+import { ImmutableArray } from './immutable-array.js';
 
-// Debug tracing for Context
-const DEBUG_CONTEXT = false;
-let contextIdCounter = 0;
 
 /**
  * Message role for chat messages
@@ -40,8 +39,6 @@ export interface StopConfig {
  * Options for the generate() method
  */
 export interface GenerateOptions {
-  /** Optional messages to fill before generating */
-  messages?: ChatMessage[];
   /** Sampling configuration - either a config object or a Sampler instance */
   sampling: SamplingConfig | Sampler;
   /** Stop conditions */
@@ -61,16 +58,15 @@ export class Context {
   tokenizer: Tokenizer;
   formatter: ChatFormatter;
 
-  tokenIds: number[] = [];
+  private _tokenIds: ImmutableArray<number> = ImmutableArray.empty();
   tokenIdsPending: number[] = [];
 
   tokenMaskPending: Brle[] = [];
   tokenMaskCurrent: Brle;
 
-  positionIds: number[] = [];
+  private _positionIds: ImmutableArray<number> = ImmutableArray.empty();
 
-  kvPages: KvPage[] = [];
-  kvPageLastLen: number = 0;
+  private kvPageManager: KvPageManager;
   kvPageSize: number;
 
   adapterPtr?: number;
@@ -78,19 +74,57 @@ export class Context {
 
   beginOfSequence: boolean = true;
 
-  private _debugId: number;
-
   constructor(model: Model) {
     this.queue = model.createQueue();
     this.kvPageSize = model.kvPageSize;
+    this.kvPageManager = new KvPageManager(this.queue, this.kvPageSize);
     this.tokenizer = model.tokenizer;
     this.model = model;
     this.formatter = new ChatFormatter();
     this.tokenMaskCurrent = Brle.new(0);
-    this._debugId = contextIdCounter++;
-    if (DEBUG_CONTEXT) {
-      console.log(`[Context] CREATE id=${this._debugId}`);
-    }
+  }
+
+  /**
+   * The committed token IDs (as regular array for backward compatibility)
+   */
+  get tokenIds(): number[] {
+    return this._tokenIds.toArray();
+  }
+
+  set tokenIds(value: number[]) {
+    this._tokenIds = ImmutableArray.from(value);
+  }
+
+  /**
+   * The position IDs (as regular array for backward compatibility)
+   */
+  get positionIds(): number[] {
+    return this._positionIds.toArray();
+  }
+
+  set positionIds(value: number[]) {
+    this._positionIds = ImmutableArray.from(value);
+  }
+
+  /**
+   * The KV pages array (for backward compatibility)
+   */
+  get kvPages(): KvPage[] {
+    return this.kvPageManager.allPages;
+  }
+
+  /**
+   * The last page length
+   */
+  get kvPageLastLen(): number {
+    return this.kvPageManager.lastPageLen;
+  }
+
+  /**
+   * The unique IDs of the KV cache pages currently in use
+   */
+  get kvPagePtrs(): number[] {
+    return this.kvPageManager.ptrs;
   }
 
   /**
@@ -114,10 +148,12 @@ export class Context {
       );
     }
 
-    ctx.tokenIds = [...prefixTokens];
-    ctx.positionIds = Array.from({ length: prefixTokens.length }, (_, i) => i);
-    ctx.kvPages = kvPages;
-    ctx.kvPageLastLen = kvPageLastLen;
+    ctx._tokenIds = ImmutableArray.from([...prefixTokens]);
+    ctx._positionIds = ImmutableArray.from(Array.from({ length: prefixTokens.length }, (_, i) => i));
+
+    // Import pages into manager
+    ctx.kvPageManager.importPages(kvPages, kvPageLastLen);
+
     ctx.tokenMaskCurrent = Brle.new(prefixTokens.length);
     ctx.beginOfSequence = false;
 
@@ -128,14 +164,7 @@ export class Context {
    * The text representation of all tokens (computed on access)
    */
   get text(): string {
-    return this.tokenizer.detokenize(new Uint32Array(this.tokenIds));
-  }
-
-  /**
-   * The unique IDs of the KV cache pages currently in use
-   */
-  get kvPagePtrs(): number[] {
-    return this.kvPages.map((p) => p.ptr);
+    return this.tokenizer.detokenize(new Uint32Array(this._tokenIds.toArray()));
   }
 
   /**
@@ -162,86 +191,52 @@ export class Context {
   /**
    * Creates a safe, copy-on-write fork of the context.
    *
-   * This method creates a new context that shares the immutable history of the current
-   * one. If the last KV-cache page is not full, its tokens are moved to the
-   * `tokenIdsPending` buffer of the new context to be recomputed, ensuring state isolation.
+   * This method creates a new context that shares only FULL KV cache pages.
+   * Partial pages are dropped and their tokens moved to pending buffer for
+   * recomputation. This ensures state isolation - shared pages are read-only
+   * (full pages won't be written to), and writable pages are unique per context.
    */
   fork(): Context {
     const forked = new Context(this.model);
-    const isEasyCase = this.kvPageLastLen === this.kvPageSize;
 
-    if (DEBUG_CONTEXT) {
-      const pagePtrs = this.kvPages.map(p => p.ptr).join(',');
-      console.log(`[Context] FORK parent=${this._debugId} child=${forked._debugId} ` +
-        `kvPageLastLen=${this.kvPageLastLen} kvPageSize=${this.kvPageSize} ` +
-        `isEasyCase=${isEasyCase} pages=[${pagePtrs}]`);
+    // Always use forkPartial behavior to ensure no writable pages are shared.
+    // This drops partial pages and moves their tokens to pending for recomputation.
+    const { manager: forkedKvManager, droppedTokenCount } = this.kvPageManager.fork();
+    forked.kvPageManager = forkedKvManager;
+
+    const keptTokensLen = forkedKvManager.totalTokens;
+
+    forked._tokenIds = this._tokenIds.slice(0, keptTokensLen);
+    forked._positionIds = this._positionIds.slice(0, keptTokensLen);
+
+    // Combine uncommitted tokens from last page with pending tokens
+    forked.tokenIdsPending = [
+      ...this._tokenIds.toArray().slice(keptTokensLen),
+      ...this.tokenIdsPending,
+    ];
+
+    // Rebuild the mask for pending tokens
+    // Optimization: Build final mask first, then truncate (avoids O(n²) clone+append)
+    let maskBuilder = this.tokenMaskCurrent.clone();
+    const parentTotalMaskLen = this.tokenIds.length + this.tokenIdsPending.length;
+    maskBuilder.removeRange(keptTokensLen, parentTotalMaskLen);
+
+    const pendingCount = forked.tokenIdsPending.length;
+    const baseLen = maskBuilder.len();
+
+    // Append all positions at once
+    for (let i = 0; i < pendingCount; i++) {
+      maskBuilder.append(false);
     }
 
-    if (isEasyCase) {
-      // Easy case: the last page is full, we can share everything.
-      forked.tokenIds = [...this.tokenIds];
-      forked.tokenIdsPending = [...this.tokenIdsPending];
-      forked.kvPages = [...this.kvPages];
-      // Increment ref count for shared pages
-      if (DEBUG_CONTEXT) {
-        console.log(`[Context] FORK easy case: ref'ing ${forked.kvPages.length} pages`);
-      }
-      for (const page of forked.kvPages) {
-        page.ref();
-      }
-      forked.kvPageLastLen = this.kvPageLastLen;
-      forked.positionIds = [...this.positionIds];
-      forked.tokenMaskPending = this.tokenMaskPending.map((m) => m.clone());
-      forked.tokenMaskCurrent = this.tokenMaskCurrent.clone();
-    } else {
-      // Hard case: the last page is partially full and must be recomputed.
-      const keptKvPageLen = Math.max(0, this.kvPages.length - 1);
-      const keptTokensLen = keptKvPageLen * this.kvPageSize;
-
-      forked.tokenIds = this.tokenIds.slice(0, keptTokensLen);
-      forked.kvPages = this.kvPages.slice(0, keptKvPageLen);
-      // Increment ref count for shared pages
-      if (DEBUG_CONTEXT) {
-        const keptPtrs = forked.kvPages.map(p => p.ptr).join(',');
-        console.log(`[Context] FORK hard case: keeping ${keptKvPageLen} pages [${keptPtrs}], dropping last page`);
-      }
-      for (const page of forked.kvPages) {
-        page.ref();
-      }
-      forked.positionIds = this.positionIds.slice(0, keptTokensLen);
-
-      // Combine uncommitted tokens from last page with pending tokens
-      forked.tokenIdsPending = [
-        ...this.tokenIds.slice(keptTokensLen),
-        ...this.tokenIdsPending,
-      ];
-
-      forked.kvPageLastLen =
-        forked.kvPages.length > 0 ? this.kvPageSize : 0;
-
-      // Rebuild the mask for pending tokens
-      // Optimization: Build final mask first, then truncate (avoids O(n²) clone+append)
-      let maskBuilder = this.tokenMaskCurrent.clone();
-      const parentTotalMaskLen = this.tokenIds.length + this.tokenIdsPending.length;
-      maskBuilder.removeRange(keptTokensLen, parentTotalMaskLen);
-
-      const pendingCount = forked.tokenIdsPending.length;
-      const baseLen = maskBuilder.len();
-
-      // Append all positions at once
-      for (let i = 0; i < pendingCount; i++) {
-        maskBuilder.append(false);
-      }
-
-      // Build masks by truncating from final (cheaper than repeated clone+append)
-      forked.tokenMaskPending = [];
-      for (let i = 0; i < pendingCount; i++) {
-        forked.tokenMaskPending.push(maskBuilder.truncate(baseLen + i + 1));
-      }
-
-      // tokenMaskCurrent includes both committed and pending tokens
-      forked.tokenMaskCurrent = maskBuilder;
+    // Build masks by truncating from final (cheaper than repeated clone+append)
+    forked.tokenMaskPending = [];
+    for (let i = 0; i < pendingCount; i++) {
+      forked.tokenMaskPending.push(maskBuilder.truncate(baseLen + i + 1));
     }
+
+    // tokenMaskCurrent includes both committed and pending tokens
+    forked.tokenMaskCurrent = maskBuilder;
 
     forked.adapterPtr = this.adapterPtr;
     forked.adapterRandomSeed = this.adapterRandomSeed;
@@ -256,14 +251,7 @@ export class Context {
    * Safe to call multiple times.
    */
   release(): void {
-    if (DEBUG_CONTEXT) {
-      const pagePtrs = this.kvPages.map(p => `${p.ptr}(rc=${p.refCount})`).join(',');
-      console.log(`[Context] RELEASE id=${this._debugId} pages=[${pagePtrs}]`);
-    }
-    for (const page of this.kvPages) {
-      page.release();
-    }
-    this.kvPages = [];
+    this.kvPageManager.release();
   }
 
   /**
@@ -352,66 +340,17 @@ export class Context {
   }
 
   /**
-   * Adjusts the number of KV pages to match the required number of tokens.
-   */
-  private adjustKvPages(numTokens: number): void {
-    if (numTokens === 0) return;
-
-    const currentTokens =
-      this.kvPages.length === 0
-        ? this.kvPageLastLen
-        : (this.kvPages.length - 1) * this.kvPageSize + this.kvPageLastLen;
-
-    const newTotalTokens = currentTokens + numTokens;
-    if (newTotalTokens < 0) {
-      throw new Error('Token count adjustment resulted in underflow');
-    }
-
-    const currentPages = this.kvPages.length;
-    const requiredPages = Math.ceil(newTotalTokens / this.kvPageSize);
-
-    if (requiredPages > currentPages) {
-      // Grow: Allocate new pages
-      const newPagesNeeded = requiredPages - currentPages;
-      if (DEBUG_CONTEXT) {
-        console.log(`[Context] GROW id=${this._debugId} allocating ${newPagesNeeded} new pages`);
-      }
-      const newKvPages = this.queue.newKvPages(newPagesNeeded);
-      this.kvPages.push(...newKvPages);
-      if (DEBUG_CONTEXT) {
-        const allPtrs = this.kvPages.map(p => p.ptr).join(',');
-        console.log(`[Context] GROW id=${this._debugId} now has pages=[${allPtrs}]`);
-      }
-    } else if (requiredPages < currentPages) {
-      // Shrink: Release excess pages
-      if (DEBUG_CONTEXT) {
-        const toReleasePtrs = this.kvPages.slice(requiredPages).map(p => `${p.ptr}(rc=${p.refCount})`).join(',');
-        console.log(`[Context] SHRINK id=${this._debugId} releasing pages=[${toReleasePtrs}]`);
-      }
-      const pagesToRelease = this.kvPages.splice(requiredPages);
-      for (const page of pagesToRelease) {
-        page.release();
-      }
-    }
-
-    // Update the length of the last page
-    const lastPageLen = newTotalTokens % this.kvPageSize;
-    this.kvPageLastLen =
-      lastPageLen === 0 && newTotalTokens > 0 ? this.kvPageSize : lastPageLen;
-  }
-
-  /**
    * Grow the KV cache by the specified number of tokens
    */
   growKvPages(numTokens: number): void {
-    this.adjustKvPages(numTokens);
+    this.kvPageManager.grow(numTokens);
   }
 
   /**
    * Shrink the KV cache by the specified number of tokens
    */
   shrinkKvPages(numTokens: number): void {
-    this.adjustKvPages(-numTokens);
+    this.kvPageManager.shrink(numTokens);
   }
 
   /**
@@ -465,8 +404,8 @@ export class Context {
 
     await p.execute();
 
-    this.tokenIds.push(...pendingTokenIds);
-    this.positionIds.push(...positionIds);
+    this._tokenIds = this._tokenIds.pushAll(pendingTokenIds);
+    this._positionIds = this._positionIds.pushAll(positionIds);
   }
 
   /**
@@ -542,8 +481,8 @@ export class Context {
       throw new Error('No token generated');
     }
 
-    this.tokenIds.push(...pendingTokenIds);
-    this.positionIds.push(...positionIds);
+    this._tokenIds = this._tokenIds.pushAll(pendingTokenIds);
+    this._positionIds = this._positionIds.pushAll(positionIds);
 
     return sampled;
   }
@@ -587,8 +526,8 @@ export class Context {
 
     const dist = res.distributions[0];
 
-    this.tokenIds.push(...pendingTokenIds);
-    this.positionIds.push(...positionIds);
+    this._tokenIds = this._tokenIds.pushAll(pendingTokenIds);
+    this._positionIds = this._positionIds.pushAll(positionIds);
 
     return dist;
   }
@@ -596,26 +535,28 @@ export class Context {
   /**
    * Generates text autoregressively until a stop condition is met.
    *
+   * Fill context with messages using fillSystem(), fillUser(), fillAssistant()
+   * before calling generate().
+   *
    * Can be called with either:
    * - New API: generate(options: GenerateOptions)
    * - Legacy API: generate(sampler: Sampler, stopCondition: StopCondition)
    *
-   * @example New API with messages
+   * @example New API with stateful context
    * ```ts
+   * ctx.fillSystem('You are helpful.');
+   * ctx.fillUser('Hello!');
+   *
    * const result = await ctx.generate({
-   *   messages: [
-   *     { role: 'system', content: 'You are helpful.' },
-   *     { role: 'user', content: 'Hello!' }
-   *   ],
-   *   sampling: { topP: 0.95, temperature: 0.6 },
+   *   sampling: Sampler.topP(0.6, 0.95),
    *   stop: { maxTokens: 256, sequences: model.eosTokens }
    * });
    * ```
    *
-   * @example New API with Sampler preset
+   * @example New API with sampling config
    * ```ts
    * const result = await ctx.generate({
-   *   sampling: Sampler.reasoning(),
+   *   sampling: { topP: 0.95, temperature: 0.6 },
    *   stop: { maxTokens: 256, sequences: model.eosTokens }
    * });
    * ```
@@ -639,23 +580,6 @@ export class Context {
     } else {
       // New API: generate(options)
       const options = optionsOrSampler;
-
-      // Fill messages if provided
-      if (options.messages) {
-        for (const msg of options.messages) {
-          switch (msg.role) {
-            case 'system':
-              this.fillSystem(msg.content);
-              break;
-            case 'user':
-              this.fillUser(msg.content);
-              break;
-            case 'assistant':
-              this.fillAssistant(msg.content);
-              break;
-          }
-        }
-      }
 
       // Convert sampling config to Sampler
       sampler = this.toSampler(options.sampling);
@@ -751,22 +675,10 @@ export class Context {
     beamSize: number
   ): Promise<string> {
     type BeamState = [Context, number[], number]; // [context, generated_tokens, score]
-    let beams: BeamState[] = [[this.fork(), [], 0.0]];
-    let iteration = 0;
 
-    if (DEBUG_CONTEXT) {
-      console.log(`[BeamSearch] START parent=${this._debugId} beamSize=${beamSize}`);
-    }
+    let beams: BeamState[] = [[this.fork(), [], 0.0]];
 
     while (true) {
-      iteration++;
-      if (DEBUG_CONTEXT) {
-        const beamInfo = beams.map(([ctx, gen, score]) =>
-          `ctx=${ctx._debugId} pages=${ctx.kvPages.length} gen=${gen.length}`
-        ).join('; ');
-        console.log(`[BeamSearch] ITERATION ${iteration} beams=[${beamInfo}]`);
-      }
-
       // Check if any beam satisfies the stop condition
       const completedBeam = beams.find(([, generated]) =>
         stopCondition.check(generated)
@@ -775,34 +687,13 @@ export class Context {
       if (completedBeam) {
         const [winningBeam, generatedTokens] = completedBeam;
 
-        if (DEBUG_CONTEXT) {
-          console.log(`[BeamSearch] COMPLETE winner=${winningBeam._debugId} tokens=${generatedTokens.length}`);
-        }
-
-        // Release the old pages held by `this` before adopting new ones
-        this.release();
-
         // Adopt the state from the winning beam
-        this.kvPageLastLen = winningBeam.kvPageLastLen;
-        this.tokenIds = [...winningBeam.tokenIds];
+        this.kvPageManager.adopt(winningBeam.kvPageManager);
+        this._tokenIds = winningBeam._tokenIds.fork();
+        this._positionIds = winningBeam._positionIds.fork();
         this.tokenIdsPending = [...winningBeam.tokenIdsPending];
-        this.kvPages = [...winningBeam.kvPages];
 
-        if (DEBUG_CONTEXT) {
-          const adoptedPtrs = this.kvPages.map(p => `${p.ptr}(rc=${p.refCount})`).join(',');
-          console.log(`[BeamSearch] ADOPT pages=[${adoptedPtrs}] ref'ing them`);
-        }
-
-        // Increment ref count for adopted pages since `this` is now an owner
-        for (const page of this.kvPages) {
-          page.ref();
-        }
-
-        if (DEBUG_CONTEXT) {
-          console.log(`[BeamSearch] RELEASE all ${beams.length} beams`);
-        }
-
-        // Release all beams (their pages will be decremented, deallocated if refCount reaches 0)
+        // Release all beams
         for (const [beam] of beams) {
           beam.release();
         }
@@ -811,9 +702,6 @@ export class Context {
       }
 
       // Progress all beams in parallel
-      if (DEBUG_CONTEXT) {
-        console.log(`[BeamSearch] DECODE ${beams.length} beams`);
-      }
       const nextDists = await Promise.all(
         beams.map(([beam]) => beam.decodeStepDist())
       );
@@ -824,37 +712,28 @@ export class Context {
         const [beam, generated, score] = beams[i];
         const nextDist = nextDists[i];
 
-        if (DEBUG_CONTEXT) {
-          console.log(`[BeamSearch] EXPAND beam=${beam._debugId} into ${Math.min(beamSize, nextDist.ids.length)} children`);
-        }
-
         // Expand with top candidates
-        for (let j = 0; j < Math.min(beamSize, nextDist.ids.length); j++) {
+        const expandCount = Math.min(beamSize, nextDist.ids.length);
+        for (let j = 0; j < expandCount; j++) {
           const nextBeam = beam.fork();
-          nextBeam.fillToken(nextDist.ids[j]);
+          const tokenId = nextDist.ids[j];
+          nextBeam.fillToken(tokenId);
 
-          const nextGenerated = [...generated, nextDist.ids[j]];
+          const nextGenerated = [...generated, tokenId];
           const nextScore = score + Math.log(nextDist.probs[j]);
 
           nextBeams.push([nextBeam, nextGenerated, nextScore]);
         }
 
-        // Release the old beam after forking - its pages are now shared with children
-        if (DEBUG_CONTEXT) {
-          console.log(`[BeamSearch] RELEASE parent beam=${beam._debugId}`);
-        }
+        // Release the old beam after forking
         beam.release();
       }
 
       // Prune: Sort by score (descending) and keep top beamSize
       nextBeams.sort((a, b) => b[2] - a[2]);
 
-      // Release pruned beams before discarding them
+      // Release pruned beams
       const prunedBeams = nextBeams.slice(beamSize);
-      if (DEBUG_CONTEXT && prunedBeams.length > 0) {
-        const prunedIds = prunedBeams.map(([ctx]) => ctx._debugId).join(',');
-        console.log(`[BeamSearch] PRUNE ${prunedBeams.length} beams: [${prunedIds}]`);
-      }
       for (const [prunedCtx] of prunedBeams) {
         prunedCtx.release();
       }
