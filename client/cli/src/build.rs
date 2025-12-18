@@ -287,12 +287,15 @@ fn run_componentize_js(
     Ok(())
 }
 
-/// Check for Node.js-specific imports that won't work in WASM
+/// Check for Node.js-specific imports that won't work in WASM.
+/// Note: Some modules have Web API equivalents (url->URL, crypto->crypto.subtle,
+/// stream->ReadableStream, buffer->Uint8Array) that work as globals, but
+/// importing the Node.js module directly will always fail.
 fn check_for_nodejs_imports(bundled_js: &Path) -> Result<()> {
     let content = fs::read_to_string(bundled_js)
         .context("Failed to read bundled JS")?;
 
-    let nodejs_modules = ["fs", "path", "child_process", "net", "os", "http", "https", "crypto"];
+    let nodejs_modules = ["fs", "path", "events", "os", "crypto", "child_process", "net", "http", "https", "stream", "util", "url", "buffer", "process", "domain"];
     let mut warnings = Vec::new();
 
     for module in nodejs_modules {
@@ -649,8 +652,9 @@ mod tests {
 
     #[test]
     fn test_rejects_unicode_escape_bypass() {
-        // Unicode escape for 'e' in export - should still be rejected
-        let result = validate_code_str(r"\u0065xport const run = () => {};");
+        // Unicode escape for 'e' in export (\u0065 = 'e') - should still be rejected.
+        // Use escaped backslash so JS parser receives: \u0065xport const run = () => {};
+        let result = validate_code_str("\\u0065xport const run = () => {};");
         assert!(result.is_err());
     }
 

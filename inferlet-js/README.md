@@ -128,3 +128,43 @@ The generated `tsconfig.json` provides full IDE support:
 - No explicit imports needed
 
 Path mappings point to `inferlet-js/src/` for type definitions.
+
+## Testing
+
+```bash
+npm test              # Unit tests + mock-based WASM tests
+npm run test:unit     # Unit tests only (fast)
+npm run test:wasm     # Mock-based WASM tests
+npm run test:integration  # Real WASM execution tests (requires pie-cli)
+npm run test:all      # Everything
+npm run test:watch    # Watch mode
+```
+
+### Test Structure
+
+- **Unit tests** (`src/__tests__/`) - Fast tests for individual modules (sampler, chat, args, etc.)
+- **Mock WASM tests** (`test/wasm/__tests__/`) - Tests using vitest aliases to mock WIT imports
+- **Integration tests** (`test/integration/__tests__/`) - Real WASM execution tests
+
+### Integration Tests
+
+Integration tests verify the full pipeline: TypeScript → WASM → JS execution.
+
+```
+TypeScript source → pie-cli build → .wasm → jco transpile → Node.js execution
+```
+
+These tests require `pie-cli` in PATH. They:
+1. Build test fixtures to WASM using `pie-cli build`
+2. Transpile WASM to JS using `jco transpile`
+3. Execute the transpiled component with mock host functions
+4. Verify outputs are captured correctly
+
+Test fixtures are in `test/integration/fixtures/`. To add a new fixture:
+
+```bash
+mkdir test/integration/fixtures/my-test
+# Create index.ts and package.json
+```
+
+Then add tests in `test/integration/__tests__/`.

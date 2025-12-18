@@ -140,11 +140,30 @@ export class Context {
     const ctx = new Context(model);
     const kvPageSize = model.kvPageSize;
 
+    // Validate kvPageLastLen is within valid range
+    if (kvPageLastLen < 0 || kvPageLastLen > kvPageSize) {
+      throw new Error(
+        `kvPageLastLen out of range: expected 0..${kvPageSize}, got ${kvPageLastLen}`
+      );
+    }
+
+    // Handle empty state and validate kvPages/kvPageLastLen consistency
+    let expectedTokens: number;
+    if (kvPages.length === 0) {
+      if (kvPageLastLen !== 0) {
+        throw new Error(
+          `Invalid state: kvPages is empty but kvPageLastLen is ${kvPageLastLen} (must be 0 when kvPages is empty)`
+        );
+      }
+      expectedTokens = 0;
+    } else {
+      expectedTokens = (kvPages.length - 1) * kvPageSize + kvPageLastLen;
+    }
+
     // Verify the token count matches the KV page state
-    const expectedTokens = (kvPages.length - 1) * kvPageSize + kvPageLastLen;
     if (prefixTokens.length !== expectedTokens) {
       throw new Error(
-        `Token count mismatch: expected ${expectedTokens}, got ${prefixTokens.length}`
+        `Token count mismatch: expected ${expectedTokens}, got ${prefixTokens.length} (kvPages.length=${kvPages.length}, kvPageLastLen=${kvPageLastLen}, kvPageSize=${kvPageSize})`
       );
     }
 
