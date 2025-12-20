@@ -1,5 +1,5 @@
 // Sampler types and configurations for text generation
-// Mirrors the Rust Sampler enum from inferlet/src/sampler.rs
+// Used for backend integration with the Pie runtime
 
 /**
  * Internal sampler type discriminated union (used by the runtime)
@@ -15,6 +15,11 @@ export type SamplerType =
 /**
  * User-friendly sampling configuration object.
  * All properties are optional - unspecified values use defaults.
+ *
+ * @example
+ * { topP: 0.95, temperature: 0.6 }
+ * { topK: 50, temperature: 0.8 }
+ * { topK: 40, topP: 0.92, temperature: 0.9 }
  */
 export interface SamplingConfig {
   /** Controls randomness (0.0 = greedy, higher = more random). Default: 1.0 */
@@ -27,91 +32,26 @@ export interface SamplingConfig {
   minP?: number;
 }
 
-export class Sampler {
-  private constructor(private readonly config: SamplerType) {}
+/**
+ * Convert a SamplingConfig to the internal SamplerType for backend integration
+ */
+export function toSamplerType(config: SamplingConfig): SamplerType {
+  const temp = config.temperature ?? 1.0;
 
-  /**
-   * Creates a greedy sampler (temperature = 0.0)
-   * Always selects the most likely token
-   */
-  static greedy(): Sampler {
-    return new Sampler({ type: 'Multinomial', temperature: 0.0 });
+  // Determine which sampler type to use based on provided options
+  if (config.topK !== undefined && config.topP !== undefined) {
+    return { type: 'TopKTopP', temperature: temp, top_k: config.topK, top_p: config.topP };
+  }
+  if (config.topP !== undefined) {
+    return { type: 'TopP', temperature: temp, top_p: config.topP };
+  }
+  if (config.topK !== undefined) {
+    return { type: 'TopK', temperature: temp, top_k: config.topK };
+  }
+  if (config.minP !== undefined) {
+    return { type: 'MinP', temperature: temp, min_p: config.minP };
   }
 
-  /**
-   * Creates a multinomial sampler with the given temperature
-   * Samples from the probability distribution with no filtering
-   *
-   * @param temperature - Controls randomness (0.0 = greedy, higher = more random)
-   */
-  static multinomial(temperature: number): Sampler {
-    return new Sampler({ type: 'Multinomial', temperature });
-  }
-
-  /**
-   * Creates a top-p (nucleus) sampler
-   * Samples from the smallest set of tokens whose cumulative probability >= top_p
-   *
-   * @param temperature - Controls randomness (0.0 = greedy, higher = more random)
-   * @param top_p - Cumulative probability threshold (typically 0.9-0.95)
-   */
-  static topP(temperature: number, top_p: number): Sampler {
-    return new Sampler({ type: 'TopP', temperature, top_p });
-  }
-
-  /**
-   * Creates a top-k sampler
-   * Samples from the k most likely tokens
-   *
-   * @param temperature - Controls randomness (0.0 = greedy, higher = more random)
-   * @param top_k - Number of top tokens to consider
-   */
-  static topK(temperature: number, top_k: number): Sampler {
-    return new Sampler({ type: 'TopK', temperature, top_k });
-  }
-
-  /**
-   * Creates a min-p sampler
-   * Filters out tokens with probability < (min_p * max_probability)
-   *
-   * @param temperature - Controls randomness (0.0 = greedy, higher = more random)
-   * @param min_p - Minimum probability threshold relative to the top token
-   */
-  static minP(temperature: number, min_p: number): Sampler {
-    return new Sampler({ type: 'MinP', temperature, min_p });
-  }
-
-  /**
-   * Creates a combined top-k and top-p sampler
-   * First applies top-k filtering, then top-p filtering
-   *
-   * @param temperature - Controls randomness (0.0 = greedy, higher = more random)
-   * @param top_k - Number of top tokens to consider
-   * @param top_p - Cumulative probability threshold
-   */
-  static topKTopP(temperature: number, top_k: number, top_p: number): Sampler {
-    return new Sampler({ type: 'TopKTopP', temperature, top_k, top_p });
-  }
-
-  /**
-   * Creates a sampler optimized for reasoning tasks
-   * Uses top_k_top_p(0.6, 20, 0.95)
-   */
-  static reasoning(): Sampler {
-    return Sampler.topKTopP(0.6, 20, 0.95);
-  }
-
-  /**
-   * Gets the sampler configuration
-   */
-  getConfig(): SamplerType {
-    return this.config;
-  }
-
-  /**
-   * Converts the sampler to a plain object for serialization
-   */
-  toJSON(): SamplerType {
-    return this.config;
-  }
+  // Default: multinomial (greedy if temp is 0)
+  return { type: 'Multinomial', temperature: temp };
 }

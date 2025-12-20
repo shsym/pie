@@ -1,7 +1,7 @@
 // Text Completion Example - JavaScript/TypeScript Inferlet
 // Demonstrates basic text generation using the inferlet library
 
-import { Context, Sampler, getAutoModel, getArguments, send } from 'inferlet';
+import { Context, getAutoModel, getArguments, send } from 'inferlet';
 
 // Get parsed arguments
 const args = getArguments();
@@ -21,7 +21,7 @@ ctx.fillUser(prompt);
 
 // Generate the response
 const result = await ctx.generate({
-  sampling: Sampler.topP(0.6, 0.95),
+  sampling: { topP: 0.95, temperature: 0.6 },
   stop: { maxTokens, sequences: model.eosTokens }
 });
 

@@ -12,21 +12,11 @@ export {
   debugQuery,
 } from './runtime.js';
 
-// Re-export Sampler and sampling types
-export { Sampler } from './sampler.js';
+// Re-export Sampler types (no class, just types for config)
+export { toSamplerType } from './sampler.js';
 export type { SamplerType, SamplingConfig } from './sampler.js';
 
-// Re-export StopCondition
-export {
-  MaxLen,
-  EndsWith,
-  AnyEndsWith,
-  Or,
-  maxLen,
-  endsWith,
-  endsWithAny,
-} from './stop-condition.js';
-export type { StopCondition } from './stop-condition.js';
+
 
 // Re-export Tokenizer
 export { Tokenizer } from './tokenizer.js';
@@ -47,7 +37,7 @@ export type { Distribution, ForwardPassResult, Forward } from './forward.js';
 
 // Re-export Context and generation types
 export { Context } from './context.js';
-export type { MessageRole, ChatMessage, StopConfig, GenerateOptions } from './context.js';
+export type { MessageRole, ChatMessage, StopConfig, GenerateOptions, GenerateBeamOptions } from './context.js';
 
 // Re-export messaging functions
 export { send, receive, sendBlob, receiveBlob, broadcast, subscribe, Blob } from './messaging.js';

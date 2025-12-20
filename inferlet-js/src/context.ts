@@ -6,8 +6,7 @@ import { Tokenizer } from './tokenizer.js';
 import { ChatFormatter } from './chat.js';
 import { Brle } from './brle.js';
 import { KvPage, ForwardPass, type Distribution } from './forward.js';
-import { Sampler, type SamplerType, type SamplingConfig } from './sampler.js';
-import { MaxLen, AnyEndsWith, type StopCondition } from './stop-condition.js';
+import { toSamplerType, type SamplerType, type SamplingConfig } from './sampler.js';
 import { KvPageManager } from './kv-page-manager.js';
 
 
@@ -39,8 +38,18 @@ export interface StopConfig {
  * Options for the generate() method
  */
 export interface GenerateOptions {
-  /** Sampling configuration - either a config object or a Sampler instance */
-  sampling: SamplingConfig | Sampler;
+  /** Sampling configuration */
+  sampling: SamplingConfig;
+  /** Stop conditions */
+  stop: StopConfig;
+}
+
+/**
+ * Options for the generateWithBeam() method
+ */
+export interface GenerateBeamOptions {
+  /** Number of beams to use */
+  beamSize: number;
   /** Stop conditions */
   stop: StopConfig;
 }
@@ -431,7 +440,7 @@ export class Context {
    * Performs a single autoregressive decoding step.
    * Returns the sampled token ID.
    */
-  async decodeStep(sampler: Sampler): Promise<number> {
+  private async decodeStep(samplerType: SamplerType): Promise<number> {
     if (this.tokenIdsPending.length === 0) {
       throw new Error('Must have at least one seed token');
     }
@@ -457,39 +466,38 @@ export class Context {
     p.attentionMask(mask);
 
     const outputIdx = pendingTokenIds.length - 1;
-    const config = sampler.getConfig();
 
     // Configure output based on sampler type
-    switch (config.type) {
+    switch (samplerType.type) {
       case 'Multinomial':
-        p.outputTokens([outputIdx], config.temperature);
+        p.outputTokens([outputIdx], samplerType.temperature);
         break;
       case 'TopP':
-        p.outputTokensTopP([outputIdx], config.temperature, config.top_p);
+        p.outputTokensTopP([outputIdx], samplerType.temperature, samplerType.top_p);
         break;
       case 'TopK':
-        p.outputTokensTopK([outputIdx], config.temperature, config.top_k);
+        p.outputTokensTopK([outputIdx], samplerType.temperature, samplerType.top_k);
         break;
       case 'MinP':
-        p.outputTokensMinP([outputIdx], config.temperature, config.min_p);
+        p.outputTokensMinP([outputIdx], samplerType.temperature, samplerType.min_p);
         break;
       case 'TopKTopP':
         p.outputTokensTopKTopP(
           [outputIdx],
-          config.temperature,
-          config.top_k,
-          config.top_p
+          samplerType.temperature,
+          samplerType.top_k,
+          samplerType.top_p
         );
         break;
       case 'Custom':
-        p.outputDistributions([outputIdx], config.temperature, undefined);
+        p.outputDistributions([outputIdx], samplerType.temperature, undefined);
         break;
     }
 
     const res = await p.execute();
 
     let sampled: number;
-    if (config.type === 'Custom' && res.distributions) {
+    if (samplerType.type === 'Custom' && res.distributions) {
       // Custom sampler needs to sample from distribution
       const dist = res.distributions[0];
       // For now, just take the highest probability token
@@ -557,65 +565,38 @@ export class Context {
    * Fill context with messages using fillSystem(), fillUser(), fillAssistant()
    * before calling generate().
    *
-   * Can be called with either:
-   * - New API: generate(options: GenerateOptions)
-   * - Legacy API: generate(sampler: Sampler, stopCondition: StopCondition)
-   *
-   * @example New API with stateful context
+   * @example
    * ```ts
    * ctx.fillSystem('You are helpful.');
    * ctx.fillUser('Hello!');
    *
    * const result = await ctx.generate({
-   *   sampling: Sampler.topP(0.6, 0.95),
-   *   stop: { maxTokens: 256, sequences: model.eosTokens }
-   * });
-   * ```
-   *
-   * @example New API with sampling config
-   * ```ts
-   * const result = await ctx.generate({
    *   sampling: { topP: 0.95, temperature: 0.6 },
    *   stop: { maxTokens: 256, sequences: model.eosTokens }
    * });
    * ```
-   *
-   * @example Legacy API (deprecated)
-   * ```ts
-   * const result = await ctx.generate(sampler, stopCondition);
-   * ```
    */
-  async generate(optionsOrSampler: GenerateOptions | Sampler, stopCondition?: StopCondition): Promise<string> {
-    let sampler: Sampler;
-    let stop: StopCondition;
+  async generate(options: GenerateOptions): Promise<string> {
+    const samplerType = toSamplerType(options.sampling);
+    const { maxTokens, sequences } = options.stop;
 
-    if (optionsOrSampler instanceof Sampler) {
-      // Legacy API: generate(sampler, stopCondition)
-      if (!stopCondition) {
-        throw new Error('stopCondition is required when using legacy generate API');
-      }
-      sampler = optionsOrSampler;
-      stop = stopCondition;
-    } else {
-      // New API: generate(options)
-      const options = optionsOrSampler;
-
-      // Convert sampling config to Sampler
-      sampler = this.toSampler(options.sampling);
-
-      // Convert stop config to StopCondition
-      stop = this.toStopCondition(options.stop);
+    if (maxTokens === undefined && (sequences === undefined || sequences.length === 0)) {
+      throw new Error('At least one stop condition (maxTokens or sequences) must be specified');
     }
 
     const generatedTokenIds: number[] = [];
 
     // The autoregressive generation loop
     while (true) {
-      const nextTokenId = await this.decodeStep(sampler);
+      const nextTokenId = await this.decodeStep(samplerType);
       this.fillToken(nextTokenId);
       generatedTokenIds.push(nextTokenId);
 
-      if (stop.check(generatedTokenIds)) {
+      // Check stop conditions
+      if (maxTokens !== undefined && generatedTokenIds.length >= maxTokens) {
+        break;
+      }
+      if (sequences !== undefined && this.endsWithAny(generatedTokenIds, sequences)) {
         break;
       }
     }
@@ -624,84 +605,62 @@ export class Context {
   }
 
   /**
-   * Convert a SamplingConfig or Sampler to a Sampler instance
+   * Check if tokenIds ends with any of the given sequences
    */
-  private toSampler(sampling: SamplingConfig | Sampler): Sampler {
-    // If it's already a Sampler instance, use it directly
-    if (sampling instanceof Sampler) {
-      return sampling;
-    }
+  private endsWithAny(tokenIds: number[], sequences: number[][]): boolean {
+    for (const seq of sequences) {
+      if (seq.length === 0) continue;
+      if (tokenIds.length < seq.length) continue;
 
-    // It's a user-friendly SamplingConfig
-    const config = sampling as SamplingConfig;
-    const temp = config.temperature ?? 1.0;
-
-    // Determine which sampler type to use based on provided options
-    if (config.topK !== undefined && config.topP !== undefined) {
-      return Sampler.topKTopP(temp, config.topK, config.topP);
+      let matches = true;
+      const start = tokenIds.length - seq.length;
+      for (let i = 0; i < seq.length; i++) {
+        if (tokenIds[start + i] !== seq[i]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) return true;
     }
-    if (config.topP !== undefined) {
-      return Sampler.topP(temp, config.topP);
-    }
-    if (config.topK !== undefined) {
-      return Sampler.topK(temp, config.topK);
-    }
-    if (config.minP !== undefined) {
-      return Sampler.minP(temp, config.minP);
-    }
-
-    // Default: greedy if temp is 0, otherwise basic multinomial
-    if (temp === 0) {
-      return Sampler.greedy();
-    }
-
-    // Return multinomial sampler with the given temperature
-    return Sampler.multinomial(temp);
-  }
-
-  /**
-   * Convert a StopConfig to a StopCondition
-   */
-  private toStopCondition(stopConfig: StopConfig): StopCondition {
-    const conditions: StopCondition[] = [];
-
-    if (stopConfig.maxTokens !== undefined) {
-      conditions.push(new MaxLen(stopConfig.maxTokens));
-    }
-
-    if (stopConfig.sequences !== undefined && stopConfig.sequences.length > 0) {
-      conditions.push(new AnyEndsWith(stopConfig.sequences));
-    }
-
-    if (conditions.length === 0) {
-      throw new Error('At least one stop condition (maxTokens or sequences) must be specified');
-    }
-
-    // Combine all conditions with OR
-    let result = conditions[0];
-    for (let i = 1; i < conditions.length; i++) {
-      result = result.or(conditions[i]);
-    }
-
-    return result;
+    return false;
   }
 
   /**
    * Generates text using beam search decoding until a stop condition is met.
+   *
+   * @example
+   * ```ts
+   * const result = await ctx.generateWithBeam({
+   *   beamSize: 4,
+   *   stop: { maxTokens: 128, sequences: model.eosTokens }
+   * });
+   * ```
    */
-  async generateWithBeam(
-    stopCondition: StopCondition,
-    beamSize: number
-  ): Promise<string> {
+  async generateWithBeam(options: GenerateBeamOptions): Promise<string> {
+    const { beamSize, stop } = options;
+    const { maxTokens, sequences } = stop;
+
+    if (maxTokens === undefined && (sequences === undefined || sequences.length === 0)) {
+      throw new Error('At least one stop condition (maxTokens or sequences) must be specified');
+    }
+
     type BeamState = [Context, number[], number]; // [context, generated_tokens, score]
 
     let beams: BeamState[] = [[this.fork(), [], 0.0]];
 
+    const checkStop = (generated: number[]): boolean => {
+      if (maxTokens !== undefined && generated.length >= maxTokens) {
+        return true;
+      }
+      if (sequences !== undefined && this.endsWithAny(generated, sequences)) {
+        return true;
+      }
+      return false;
+    };
+
     while (true) {
       // Check if any beam satisfies the stop condition
-      const completedBeam = beams.find(([, generated]) =>
-        stopCondition.check(generated)
-      );
+      const completedBeam = beams.find(([, generated]) => checkStop(generated));
 
       if (completedBeam) {
         const [winningBeam, generatedTokens] = completedBeam;
