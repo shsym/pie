@@ -55,6 +55,3 @@ export { send, receive, sendBlob, receiveBlob, broadcast, subscribe, Blob } from
 // Re-export KVS functions
 export { storeGet, storeSet, storeDelete, storeExists, storeListKeys } from './kvs.js';
 
-// Re-export argument parsing
-export { parseArgs } from './args.js';
-export type { ArgSchema, ArgOption, StringOption, NumberOption, BooleanOption, ParsedArgs } from './args.js';

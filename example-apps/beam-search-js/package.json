@@ -1,5 +1,5 @@
 {
-  "name": "text-completion-js",
+  "name": "beam-search",
   "version": "0.1.0",
   "type": "module",
   "main": "index.ts"

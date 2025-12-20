@@ -13,12 +13,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "vitest run src/__tests__ test/wasm/__tests__",
+    "test": "vitest run src/__tests__",
     "test:watch": "vitest",
-    "test:unit": "vitest run src/__tests__",
-    "test:wasm": "vitest run test/wasm/__tests__",
-    "test:integration": "vitest run test/integration/__tests__",
-    "test:all": "vitest run",
     "generate-bindings": "jco types ../inferlet/wit -o src/bindings --world-name exec"
   },
   "dependencies": {
