@@ -14,7 +14,7 @@ dependencies = [
     "requests>=2.32",
     "tqdm>=4.67",
     "websockets>=15.0",
-    "ztensor>=0.1.4",
+    "ztensor>=1.1.1",
     "msgspec>=0.19.0",
     "einops>=0.8.1",
     "setuptools>=80.9.0",
@@ -23,7 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 # CUDA support - Linux only (flashinfer requires CUDA-capable hardware)
 cuda = [
-    "flashinfer-python>=0.3.1; platform_system=='Linux'",
+    "flashinfer-python>=0.5.3; platform_system=='Linux'",
 ]
 
 # macOS-specific dependencies for Metal backend debugging
