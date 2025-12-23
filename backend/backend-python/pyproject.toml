@@ -35,6 +35,9 @@ metal = [
     "pyobjc-framework-Cocoa>=10.0,<11.0",
 ]
 
+[project.scripts]
+pie-backend = "pie_backend.__main__:entrypoint"
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 

@@ -228,7 +228,7 @@ class ModelConfig:
         model_name = self.get_required_key(self.root, "name")
 
         metadata_dir = os.path.dirname(os.path.abspath(self.path))
-        vocab_file_path = os.path.join(metadata_dir, model_name, vocab_file_name)
+        vocab_file_path = os.path.join(metadata_dir, "models", model_name, vocab_file_name)
 
         try:
             merge_rules = ModelConfig._load_merge_rules(vocab_file_path)

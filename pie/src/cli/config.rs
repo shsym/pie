@@ -73,9 +73,12 @@ pub struct ConfigUpdateArgs {
     /// Device (e.g., "cuda:0", "mps")
     #[arg(long)]
     pub backend_device: Option<String>,
-    /// Data type (e.g., "bfloat16", "float16")
+    /// Activation data type (e.g., "bfloat16", "float16")
     #[arg(long)]
-    pub backend_dtype: Option<String>,
+    pub backend_activation_dtype: Option<String>,
+    /// Weight data type (e.g., "int4", "int8", "float8")
+    #[arg(long)]
+    pub backend_weight_dtype: Option<String>,
     /// KV page size
     #[arg(long)]
     pub backend_kv_page_size: Option<i64>,
@@ -151,15 +154,15 @@ fn create_default_config_content(exec_path: Option<String>, backend_type: &str) 
         if exec_path.is_some() {
             println!("⚠️ Warning: exec_path is not used for dummy backend and will be ignored.");
         }
-    } else if exec_path.is_none() {
-        anyhow::bail!(
-            "exec_path is required for backend type '{}'. \
-             Please provide the path to the backend executable.",
-            backend_type
-        );
     }
 
-    let exec_path = exec_path.unwrap_or_default();
+    let exec_path = exec_path.unwrap_or_else(|| {
+        if backend_type == "dummy" {
+            String::new()
+        } else {
+            "pie-backend".to_string()
+        }
+    });
 
     // Create the backend configuration as a TOML table
     let mut backend_fields: Vec<(&str, toml::Value)> = vec![(
@@ -173,7 +176,8 @@ fn create_default_config_content(exec_path: Option<String>, backend_type: &str) 
             ("exec_path", toml::Value::String(exec_path)),
             ("model", toml::Value::String("qwen-3-0.6b".into())),
             ("device", toml::Value::String("cuda:0".into())),
-            ("dtype", toml::Value::String("bfloat16".into())),
+            ("activation_dtype", toml::Value::String("bfloat16".into())),
+            // weight_dtype is omitted by default (None)
             ("kv_page_size", toml::Value::Integer(16)),
             ("max_batch_tokens", toml::Value::Integer(10240)),
             ("max_dist_size", toml::Value::Integer(32)),
@@ -314,7 +318,8 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         backend_exec_path,
         backend_model,
         backend_device,
-        backend_dtype,
+        backend_activation_dtype,
+        backend_weight_dtype,
         backend_kv_page_size,
         backend_max_batch_tokens,
         backend_max_dist_size,
@@ -336,7 +341,8 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         backend_exec_path,
         backend_model,
         backend_device,
-        backend_dtype,
+        backend_activation_dtype,
+        backend_weight_dtype,
         backend_kv_page_size,
         backend_max_batch_tokens,
         backend_max_dist_size,
@@ -401,7 +407,8 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
                 ("exec_path", backend_exec_path),
                 ("model", backend_model),
                 ("device", backend_device),
-                ("dtype", backend_dtype),
+                ("activation_dtype", backend_activation_dtype),
+                ("weight_dtype", backend_weight_dtype),
                 ("kv_page_size", backend_kv_page_size),
                 ("max_batch_tokens", backend_max_batch_tokens),
                 ("max_dist_size", backend_max_dist_size),
