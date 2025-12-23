@@ -8,7 +8,7 @@ import random
 async def main():
     # Define the program name and construct the file path
     program_name = "graph_of_thought"#"text_completion"# # # 
-    program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
+    program_path = Path(f"../../sdk/inferlet-examples/target/wasm32-wasip2/release/{program_name}.wasm")
 
     # Check if the program file exists
     if not program_path.exists():
@@ -108,7 +108,7 @@ async def main_swarm():
     
     # Define the program name and construct the file path
     program_name = "agent_swarm"#"text_completion"# # # 
-    program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
+    program_path = Path(f"../../sdk/inferlet-examples/target/wasm32-wasip2/release/{program_name}.wasm")
 
     # Check if the program file exists
     if not program_path.exists():
@@ -229,7 +229,7 @@ async def main_bench_agent():
     
      # Define the program name and construct the file path
     program_name = "agent_react_bench"#"text_completion"# # # 
-    program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
+    program_path = Path(f"../../sdk/inferlet-examples/target/wasm32-wasip2/release/{program_name}.wasm")
 
     # Check if the program file exists
     if not program_path.exists():
@@ -334,7 +334,7 @@ async def main_rt_bench():
     
      # Define the program name and construct the file path
     program_name = "rt_bench"#"text_completion"# # # 
-    program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
+    program_path = Path(f"../../sdk/inferlet-examples/target/wasm32-wasip2/release/{program_name}.wasm")
 
     # Check if the program file exists
     if not program_path.exists():
@@ -418,7 +418,7 @@ async def main_rt_bench():
 
 async def main_count_calls():
     program_name = "beam_search"
-    program_path = Path(f"../example-apps/target/wasm32-wasip2/release/{program_name}.wasm")
+    program_path = Path(f"../../sdk/inferlet-examples/target/wasm32-wasip2/release/{program_name}.wasm")
     server_uri = "ws://127.0.0.1:9123"
 
     client = PieClient(server_uri)

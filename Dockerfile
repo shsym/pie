@@ -21,7 +21,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIE_HOME=/root/.cache/pie \
     TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
-    PATH="/workspace/backend/backend-python/.venv/bin:/usr/local/cargo/bin:/root/.local/bin:${PATH}"
+    PATH="/workspace/engine/backend-python/.venv/bin:/usr/local/cargo/bin:/root/.local/bin:${PATH}"
 
 # Install all build dependencies
 RUN apt-get update && apt-get install -y \
@@ -44,13 +44,13 @@ COPY . .
 #     && ninja
 
 # Install PIE CLI globally
-RUN cd pie && cargo install --path .
+RUN cd runtime && cargo install --path .
 
 # Build example inferlets
-RUN cd example-apps && cargo build --target wasm32-wasip2 --release
+RUN cd sdk/inferlet-examples && cargo build --target wasm32-wasip2 --release
 
 # Setup Python backend with flashinfer (using verified PyTorch CUDA version)
-RUN cd backend/backend-python \
+RUN cd engine/backend-python \
     && uv venv \
     && . .venv/bin/activate \
     && uv pip install flashinfer-python==0.3.1 \
@@ -72,7 +72,7 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 # Default command: start PIE server for development (allows pie-cli connections)
-CMD ["pie", "serve", "--config", "/workspace/pie/docker_config.toml"]
+CMD ["pie", "serve", "--config", "/workspace/runtime/docker_config.toml"]
 
 # ============================================================================
 # Stage 3: Runtime - Use devel image for FlashInfer JIT compilation support
@@ -91,7 +91,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIE_HOME=/root/.cache/pie \
     TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
-    PATH="/workspace/backend/backend-python/.venv/bin:/usr/local/bin:${PATH}"
+    PATH="/workspace/engine/backend-python/.venv/bin:/usr/local/bin:${PATH}"
 
 # Install only runtime dependencies (CUDA dev tools already in devel base)
 RUN apt-get update && apt-get install -y \
@@ -110,19 +110,19 @@ COPY --from=builder /root/.local/bin/uv /usr/local/bin/uv
 # COPY --from=builder /workspace/backend/backend-cuda/build/bin/pie_cuda_be /workspace/backend/backend-cuda/build/bin/pie_cuda_be
 
 # Copy Python virtual environment
-COPY --from=builder /workspace/backend/backend-python/.venv /workspace/backend/backend-python/.venv
+COPY --from=builder /workspace/engine/backend-python/.venv /workspace/engine/backend-python/.venv
 
 # Copy Python backend source code (exclude cache, build, and temp files)
-COPY --from=builder /workspace/backend/backend-python/ /workspace/backend/backend-python/
-RUN find /workspace/backend/backend-python -name "__pycache__" -type d -exec rm -rf {} + || true && \
-    find /workspace/backend/backend-python -name "*.pyc" -delete || true && \
-    rm -rf /workspace/backend/backend-python/build || true
+COPY --from=builder /workspace/engine/backend-python/ /workspace/engine/backend-python/
+RUN find /workspace/engine/backend-python -name "__pycache__" -type d -exec rm -rf {} + || true && \
+    find /workspace/engine/backend-python -name "*.pyc" -delete || true && \
+    rm -rf /workspace/engine/backend-python/build || true
 
 # Copy example inferlets
-COPY --from=builder /workspace/example-apps/target/wasm32-wasip2/release/*.wasm /workspace/example-apps/
+COPY --from=builder /workspace/sdk/inferlet-examples/target/wasm32-wasip2/release/*.wasm /workspace/sdk/inferlet-examples/
 
 # Copy configuration file
-COPY --from=builder /workspace/pie/docker_config.toml /workspace/pie/docker_config.toml
+COPY --from=builder /workspace/runtime/docker_config.toml /workspace/runtime/docker_config.toml
 
 # Copy entrypoint script for auth setup
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
@@ -132,4 +132,4 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 # Default command: start PIE server
-CMD ["pie", "serve", "--config", "/workspace/pie/docker_config.toml"]
+CMD ["pie", "serve", "--config", "/workspace/runtime/docker_config.toml"]

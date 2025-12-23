@@ -12,7 +12,7 @@
 **/*.so
 **/*.dylib
 Cargo.lock
-!pie-cli/Cargo.lock
+!client/cli/Cargo.lock
 
 # Don't exclude .wasm since they're built during Docker build
 # **/*.wasm

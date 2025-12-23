@@ -239,8 +239,8 @@ copy_inferlets() {
     echo "=== Copying Inferlets from Container ==="
     echo ""
 
-    sudo docker cp pie-test-server:/workspace/example-apps/echo.wasm ./echo.wasm
-    sudo docker cp pie-test-server:/workspace/example-apps/text_completion.wasm ./text_completion.wasm
+    sudo docker cp pie-test-server:/workspace/sdk/inferlet-examples/echo.wasm ./echo.wasm
+    sudo docker cp pie-test-server:/workspace/sdk/inferlet-examples/text_completion.wasm ./text_completion.wasm
 
     if [ -f ./echo.wasm ] && [ -f ./text_completion.wasm ]; then
         echo "✅ Inferlets copied:"

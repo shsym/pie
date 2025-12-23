@@ -59,7 +59,7 @@ Copy the example inferlet and run it:
 
 ```bash
 # Copy inferlet from container (one-time)
-docker cp pie-server:/workspace/example-apps/text_completion.wasm ./
+docker cp pie-server:/workspace/sdk/inferlet-examples/text_completion.wasm ./
 
 # Submit for execution
 pie-cli submit ./text_completion.wasm -- --prompt "What is the capital of France?"
@@ -73,7 +73,7 @@ pie-cli submit ./text_completion.wasm -- --prompt "What is the capital of France
 
 - **Configure a Backend:**
   Navigate to a backend directory and follow its `README.md` for setup:
-    - [Python Backend](backend/backend-python/README.md)
+    - [Python Backend](engine/backend-python/README.md)
 
 
 - **Add Wasm Target:**
@@ -82,7 +82,7 @@ pie-cli submit ./text_completion.wasm -- --prompt "What is the capital of France
   ```bash
   rustup target add wasm32-wasip2
   ```
-  This is required to compile Rust-based inferlets in the `example-apps` directory.
+  This is required to compile Rust-based inferlets in the `sdk/inferlet-examples` directory.
 
 
 #### Step 1: Build
@@ -94,7 +94,7 @@ Build the **CLIs** and the example inferlets.
    From the repository root, run
 
    ```bash
-   cd pie && cargo install --path .
+   cd runtime && cargo install --path .
    ```
 
    Also, from the repository root, run
@@ -106,7 +106,7 @@ Build the **CLIs** and the example inferlets.
 
    From the repository root, run
    ```bash
-   cd example-apps && cargo build --target wasm32-wasip2 --release
+   cd sdk/inferlet-examples && cargo build --target wasm32-wasip2 --release
    ```
 
 #### Step 2: Configure Engine and Backend
@@ -115,7 +115,7 @@ Build the **CLIs** and the example inferlets.
 
    Substitute `$REPO` to the actual repository root and run
    ```bash
-   pie config init python $REPO/backend/backend-python/server.py
+   pie config init python $REPO/engine/backend-python/src/pie_backend/server.py
    ```
 
 2. **Download the model:**
@@ -130,7 +130,7 @@ Build the **CLIs** and the example inferlets.
    Run an inferlet directly with the engine. Due to JIT compilation of FlashInfer kernels, the first run will have **very long** latency.
    ```bash
    pie run \
-       $REPO/example-apps/target/wasm32-wasip2/release/text_completion.wasm \
+       $REPO/sdk/inferlet-examples/target/wasm32-wasip2/release/text_completion.wasm \
        -- \
        --prompt "Where is the capital of France?"
    ```
@@ -176,7 +176,7 @@ Build the **CLIs** and the example inferlets.
    From another terminal window, run
    ```bash
    pie-cli submit \
-       $REPO/example-apps/target/wasm32-wasip2/release/text_completion.wasm \
+       $REPO/sdk/inferlet-examples/target/wasm32-wasip2/release/text_completion.wasm \
        -- \
        --prompt "Where is the capital of France?"
    ```
