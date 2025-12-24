@@ -29,10 +29,10 @@ pub enum ConfigCommands {
 
 #[derive(Args, Debug)]
 pub struct ConfigInitArgs {
-    /// Backend type (e.g., "python", "metal", "dummy")
-    pub backend_type: String,
-    /// Path to the backend executable (not used for "dummy" backend)
-    pub exec_path: Option<String>,
+    /// Initialize a dummy backend instead of the default Python backend
+    #[arg(long)]
+    pub dummy: bool,
+
     /// Path where the config file should be saved (uses default path if not specified)
     #[arg(long)]
     pub path: Option<String>,
@@ -88,9 +88,7 @@ pub struct ConfigUpdateArgs {
     /// Maximum distribution size
     #[arg(long)]
     pub backend_max_dist_size: Option<i64>,
-    /// Maximum number of KV pages
-    #[arg(long)]
-    pub backend_max_num_kv_pages: Option<i64>,
+    // max_num_kv_pages is deprecated and removed
     /// Maximum number of embeddings
     #[arg(long)]
     pub backend_max_num_embeds: Option<i64>,
@@ -100,9 +98,9 @@ pub struct ConfigUpdateArgs {
     /// Maximum adapter rank
     #[arg(long)]
     pub backend_max_adapter_rank: Option<i64>,
-    /// GPU memory headroom
+    /// GPU memory utilization (0.0 to 1.0)
     #[arg(long)]
-    pub backend_gpu_mem_headroom: Option<f64>,
+    pub backend_gpu_mem_utilization: Option<f64>,
     /// Enable profiling
     #[arg(long)]
     pub backend_enable_profiling: Option<bool>,
@@ -135,7 +133,9 @@ pub async fn handle_config_command(command: ConfigCommands) -> Result<()> {
 
 /// Handles the `pie config init` subcommand.
 async fn handle_config_init_subcommand(args: ConfigInitArgs) -> Result<()> {
-    init_default_config_file(args.exec_path, &args.backend_type, args.path)
+    let backend_type = if args.dummy { "dummy" } else { "python" };
+
+    init_default_config_file(backend_type, args.path)
 }
 
 /// Handles the `pie config update` subcommand.
@@ -148,21 +148,12 @@ async fn handle_config_show_subcommand(custom_path: Option<String>) -> Result<()
     show_default_config_file(custom_path)
 }
 
-fn create_default_config_content(exec_path: Option<String>, backend_type: &str) -> Result<String> {
-    // Validate `exec_path` based on backend type
-    if backend_type == "dummy" {
-        if exec_path.is_some() {
-            println!("⚠️ Warning: exec_path is not used for dummy backend and will be ignored.");
-        }
-    }
-
-    let exec_path = exec_path.unwrap_or_else(|| {
-        if backend_type == "dummy" {
-            String::new()
-        } else {
-            "pie-backend".to_string()
-        }
-    });
+fn create_default_config_content(backend_type: &str) -> Result<String> {
+    let exec_path = if backend_type == "dummy" {
+        String::new()
+    } else {
+        "pie-backend".to_string()
+    };
 
     // Create the backend configuration as a TOML table
     let mut backend_fields: Vec<(&str, toml::Value)> = vec![(
@@ -181,11 +172,11 @@ fn create_default_config_content(exec_path: Option<String>, backend_type: &str) 
             ("kv_page_size", toml::Value::Integer(16)),
             ("max_batch_tokens", toml::Value::Integer(10240)),
             ("max_dist_size", toml::Value::Integer(32)),
-            ("max_num_kv_pages", toml::Value::Integer(10240)),
+            // max_num_kv_pages is removed
             ("max_num_embeds", toml::Value::Integer(128)),
             ("max_num_adapters", toml::Value::Integer(32)),
             ("max_adapter_rank", toml::Value::Integer(8)),
-            ("gpu_mem_headroom", toml::Value::Float(10.0)),
+            ("gpu_mem_utilization", toml::Value::Float(0.9)),
             ("enable_profiling", toml::Value::Boolean(false)),
         ]);
     }
@@ -214,7 +205,6 @@ fn create_default_config_content(exec_path: Option<String>, backend_type: &str) 
 }
 
 fn init_default_config_file(
-    exec_path: Option<String>,
     backend_type: &str,
     custom_path: Option<String>,
 ) -> Result<()> {
@@ -252,7 +242,7 @@ fn init_default_config_file(
     }
 
     // Create the default config file
-    let config_content = create_default_config_content(exec_path, backend_type)?;
+    let config_content = create_default_config_content(backend_type)?;
     fs::write(&config_path, &config_content)
         .with_context(|| format!("Failed to write config file at {:?}", config_path))?;
 
@@ -323,11 +313,11 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         backend_kv_page_size,
         backend_max_batch_tokens,
         backend_max_dist_size,
-        backend_max_num_kv_pages,
+        // backend_max_num_kv_pages removed
         backend_max_num_embeds,
         backend_max_num_adapters,
         backend_max_adapter_rank,
-        backend_gpu_mem_headroom,
+        backend_gpu_mem_utilization,
         backend_enable_profiling,
         // Path field
         path,
@@ -346,11 +336,11 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
         backend_kv_page_size,
         backend_max_batch_tokens,
         backend_max_dist_size,
-        backend_max_num_kv_pages,
+        // backend_max_num_kv_pages removed
         backend_max_num_embeds,
         backend_max_num_adapters,
         backend_max_adapter_rank,
-        backend_gpu_mem_headroom,
+        backend_gpu_mem_utilization,
         backend_enable_profiling,
     ];
 
@@ -412,11 +402,11 @@ fn update_default_config_file(args: ConfigUpdateArgs) -> Result<()> {
                 ("kv_page_size", backend_kv_page_size),
                 ("max_batch_tokens", backend_max_batch_tokens),
                 ("max_dist_size", backend_max_dist_size),
-                ("max_num_kv_pages", backend_max_num_kv_pages),
+                // max_num_kv_pages is removed
                 ("max_num_embeds", backend_max_num_embeds),
                 ("max_num_adapters", backend_max_num_adapters),
                 ("max_adapter_rank", backend_max_adapter_rank),
-                ("gpu_mem_headroom", backend_gpu_mem_headroom),
+                ("gpu_mem_utilization", backend_gpu_mem_utilization),
                 ("enable_profiling", backend_enable_profiling),
             });
         } else {

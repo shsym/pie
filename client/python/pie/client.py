@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import msgpack
 import websockets
 import blake3
@@ -7,6 +8,9 @@ import tempfile
 from pathlib import Path
 import uuid
 from enum import Enum
+from dataclasses import dataclass
+
+from .crypto import ParsedPrivateKey
 
 
 class Event(Enum):
@@ -18,6 +22,17 @@ class Event(Enum):
     ServerError = 4
     OutOfResources = 5
     Blob = 6  # Represents a binary data blob
+    Stdout = 7  # Streaming stdout output
+    Stderr = 8  # Streaming stderr output
+
+
+@dataclass
+class InstanceInfo:
+    """Information about a running instance."""
+    id: str
+    cmd_name: str
+    arguments: list[str]
+    status: str  # "Attached", "Detached", or "Finished"
 
 
 class Instance:
@@ -71,10 +86,13 @@ class PieClient:
         self.listener_task = None
         self.corr_id_counter = 0
         self.pending_requests = {}
+        self.pending_launch_requests = {}
+        self.pending_attach_requests = {}
+        self.pending_list_requests = {}
         self.inst_event_queues = {}
         self.pending_downloads = {}  # For reassembling blob chunks
 
-        # 🔻 FIX 1/3: Buffer for early events to prevent race conditions.
+        # Buffer for early events to prevent race conditions.
         self.orphan_events = {}
 
     async def __aenter__(self):
@@ -114,25 +132,92 @@ class PieClient:
     async def _process_server_message(self, message: dict):
         """Route incoming server messages based on their type."""
         msg_type = message.get("type")
+        
         if msg_type == "response":
             corr_id = message.get("corr_id")
             if corr_id in self.pending_requests:
                 future = self.pending_requests.pop(corr_id)
                 future.set_result((message.get("successful"), message.get("result")))
 
+        elif msg_type == "challenge":
+            # Auth challenge response - treat like a regular response
+            corr_id = message.get("corr_id")
+            if corr_id in self.pending_requests:
+                future = self.pending_requests.pop(corr_id)
+                # successful=True with challenge as the result
+                future.set_result((True, message.get("challenge")))
+
+        elif msg_type == "instance_launch_result":
+            corr_id = message.get("corr_id")
+            if corr_id in self.pending_launch_requests:
+                future = self.pending_launch_requests.pop(corr_id)
+                successful = message.get("successful")
+                instance_id = message.get("message")
+                if successful:
+                    # Create event queue before resolving to prevent race condition
+                    queue = asyncio.Queue()
+                    self.inst_event_queues[instance_id] = queue
+                    # Replay any orphan events
+                    if instance_id in self.orphan_events:
+                        early_events = self.orphan_events.pop(instance_id)
+                        for event_tuple in early_events:
+                            await queue.put(event_tuple)
+                future.set_result((successful, instance_id))
+
+        elif msg_type == "instance_attach_result":
+            corr_id = message.get("corr_id")
+            if corr_id in self.pending_attach_requests:
+                future, instance_id = self.pending_attach_requests.pop(corr_id)
+                successful = message.get("successful")
+                result_msg = message.get("message")
+                if successful:
+                    # Create event queue before resolving to prevent race condition
+                    queue = asyncio.Queue()
+                    self.inst_event_queues[instance_id] = queue
+                    # Replay any orphan events
+                    if instance_id in self.orphan_events:
+                        early_events = self.orphan_events.pop(instance_id)
+                        for event_tuple in early_events:
+                            await queue.put(event_tuple)
+                future.set_result((successful, result_msg))
+
+        elif msg_type == "live_instances":
+            corr_id = message.get("corr_id")
+            if corr_id in self.pending_list_requests:
+                future = self.pending_list_requests.pop(corr_id)
+                instances_raw = message.get("instances", [])
+                instances = [
+                    InstanceInfo(
+                        id=inst.get("id"),
+                        cmd_name=inst.get("cmd_name"),
+                        arguments=inst.get("arguments", []),
+                        status=inst.get("status", "Unknown")
+                    )
+                    for inst in instances_raw
+                ]
+                future.set_result(instances)
+
         elif msg_type == "instance_event":
-            # 🔻 FIX 2/3: Buffer orphan events instead of discarding them.
             instance_id = message.get("instance_id")
             event_tuple = (message.get("event"), message.get("message"))
 
             if instance_id in self.inst_event_queues:
-                # Queue exists, proceed as normal
                 await self.inst_event_queues[instance_id].put(event_tuple)
             else:
                 # Queue doesn't exist yet, buffer the event
                 if instance_id not in self.orphan_events:
                     self.orphan_events[instance_id] = []
                 self.orphan_events[instance_id].append(event_tuple)
+
+        elif msg_type == "streaming_output":
+            instance_id = message.get("instance_id")
+            output = message.get("output", {})
+            if instance_id in self.inst_event_queues:
+                # output is {"Stdout": text} or {"Stderr": text}
+                if "Stdout" in output:
+                    await self.inst_event_queues[instance_id].put((Event.Stdout.value, output["Stdout"]))
+                elif "Stderr" in output:
+                    await self.inst_event_queues[instance_id].put((Event.Stderr.value, output["Stderr"]))
 
         elif msg_type == "download_blob":
             await self._handle_blob_chunk(message)
@@ -213,14 +298,82 @@ class PieClient:
         await self.ws.send(encoded)
         return await future
 
-    async def authenticate(self, token: str) -> tuple[bool, str]:
-        """Authenticate the client with the server using a token."""
-        msg = {"type": "authenticate", "token": token}
+    async def authenticate(
+        self,
+        username: str,
+        private_key: ParsedPrivateKey | None = None
+    ) -> None:
+        """
+        Authenticate the client with the server using public key authentication.
+        
+        :param username: The username to authenticate as.
+        :param private_key: The private key for signing the challenge.
+                           Required if the server has authentication enabled.
+        :raises Exception: If authentication fails.
+        """
+        # Send identification request
+        msg = {"type": "identification", "username": username}
         successful, result = await self._send_msg_and_wait(msg)
+        
+        if not successful:
+            raise Exception(f"Username '{username}' rejected by server: {result}")
+        
+        # Check if server has disabled authentication
+        if result == "Authenticated (Engine disabled authentication)":
+            print("[PieClient] Authenticated successfully (server auth disabled).")
+            return
+        
+        # Server returned a challenge - we need to sign it
+        if private_key is None:
+            raise Exception(
+                "Server requires public key authentication but no private key provided"
+            )
+        
+        # Decode the base64-encoded challenge
+        try:
+            challenge = base64.b64decode(result)
+        except Exception as e:
+            raise Exception(f"Failed to decode challenge from server: {e}")
+        
+        # Sign the challenge
+        signature_bytes = private_key.sign(challenge)
+        signature_b64 = base64.b64encode(signature_bytes).decode('utf-8')
+        
+        # Send the signature
+        msg = {"type": "signature", "signature": signature_b64}
+        successful, result = await self._send_msg_and_wait(msg)
+        
         if successful:
             print("[PieClient] Authenticated successfully.")
         else:
-            print(f"[PieClient] Authentication failed: {result}")
+            raise Exception(f"Signature verification failed for username '{username}': {result}")
+
+    async def internal_authenticate(self, token: str) -> None:
+        """
+        Authenticate the client with the server using an internal token.
+        This is used for internal communication (backend <-> engine, shell <-> engine).
+        
+        :param token: The internal authentication token.
+        :raises Exception: If authentication fails.
+        """
+        msg = {"type": "internal_authenticate", "token": token}
+        successful, result = await self._send_msg_and_wait(msg)
+        if successful:
+            print("[PieClient] Internal authentication successful.")
+        else:
+            raise Exception(f"Internal authentication failed: {result}")
+
+    async def identify(self, username: str) -> tuple[bool, str]:
+        """
+        [DEPRECATED] Use authenticate() instead.
+        Legacy method for simple username identification.
+        """
+        msg = {"type": "identification", "username": username}
+        successful, result = await self._send_msg_and_wait(msg)
+        if successful:
+            print("[PieClient] Identified successfully.")
+        else:
+            print(f"[PieClient] Identification failed: {result}")
         return successful, result
 
     async def query(self, subject: str, record: str) -> tuple[bool, str]:
@@ -283,41 +436,104 @@ class PieClient:
         template = {"type": "upload_blob", "instance_id": instance_id, "blob_hash": blob_hash}
         await self._upload_chunked(blob_bytes, template)
 
-    async def launch_instance(self, program_hash: str, arguments: list[str] = None) -> Instance:
+    async def launch_instance(
+        self,
+        program_hash: str,
+        arguments: list[str] | None = None,
+        cmd_name: str = "default",
+        detached: bool = False
+    ) -> Instance:
         """Launch an instance of a program."""
-        msg = {"type": "launch_instance", "program_hash": program_hash, "arguments": arguments or []}
-        successful, result = await self._send_msg_and_wait(msg)
+        corr_id = self._get_next_corr_id()
+        msg = {
+            "type": "launch_instance",
+            "corr_id": corr_id,
+            "program_hash": program_hash,
+            "arguments": arguments or [],
+            "cmd_name": cmd_name,
+            "detached": detached,
+        }
+        
+        future = asyncio.get_event_loop().create_future()
+        self.pending_launch_requests[corr_id] = future
+        encoded = msgpack.packb(msg, use_bin_type=True)
+        await self.ws.send(encoded)
+        
+        successful, instance_id = await future
+        
         if successful:
-            instance_id = result
-            # Create the queue as before
-            queue = asyncio.Queue()
-            self.inst_event_queues[instance_id] = queue
-
-            # 🔻 FIX 3/3: Check for and replay any events that arrived early.
-            if instance_id in self.orphan_events:
-                early_events = self.orphan_events.pop(instance_id)
-                for event_tuple in early_events:
-                    await queue.put(event_tuple)
-
             return Instance(self, instance_id)
-        raise Exception(f"Failed to launch instance: {result}")
+        raise Exception(f"Failed to launch instance: {instance_id}")
 
-    async def launch_server_instance(self, program_hash: str, port: int, arguments: list[str] = None):
-        """Launch a server instance of a program on a specific port."""
-        msg = {"type": "launch_server_instance", "port": port, "program_hash": program_hash, "arguments": arguments or []}
+    async def attach_instance(self, instance_id: str) -> Instance:
+        """
+        Attach to an existing detached instance.
+        
+        :param instance_id: The UUID of the instance to attach to.
+        :return: An Instance object for the attached instance.
+        :raises Exception: If attachment fails.
+        """
+        corr_id = self._get_next_corr_id()
+        msg = {
+            "type": "attach_instance",
+            "corr_id": corr_id,
+            "instance_id": instance_id,
+        }
+        
+        future = asyncio.get_event_loop().create_future()
+        self.pending_attach_requests[corr_id] = (future, instance_id)
+        encoded = msgpack.packb(msg, use_bin_type=True)
+        await self.ws.send(encoded)
+        
+        successful, result = await future
+        
+        if successful:
+            return Instance(self, instance_id)
+        raise Exception(f"Failed to attach to instance: {result}")
+
+    async def list_instances(self) -> list[InstanceInfo]:
+        """
+        Get a list of all running instances on the server.
+        
+        :return: List of InstanceInfo objects.
+        """
+        corr_id = self._get_next_corr_id()
+        msg = {"type": "list_instances", "corr_id": corr_id}
+        
+        future = asyncio.get_event_loop().create_future()
+        self.pending_list_requests[corr_id] = future
+        encoded = msgpack.packb(msg, use_bin_type=True)
+        await self.ws.send(encoded)
+        
+        return await future
+
+    async def ping(self) -> None:
+        """
+        Ping the server to check connectivity.
+        
+        :raises Exception: If ping fails.
+        """
+        msg = {"type": "ping"}
         successful, result = await self._send_msg_and_wait(msg)
         if not successful:
-            raise Exception(f"Failed to launch server instance: {result}")
+            raise Exception(f"Ping failed: {result}")
 
     async def signal_instance(self, instance_id: str, message: str):
         """Send a signal/message to a running instance (fire-and-forget)."""
         msg = {"type": "signal_instance", "instance_id": instance_id, "message": message}
         await self.ws.send(msgpack.packb(msg, use_bin_type=True))
 
-    async def terminate_instance(self, instance_id: str):
-        """Request the server to terminate a running instance (fire-and-forget)."""
+    async def terminate_instance(self, instance_id: str) -> None:
+        """
+        Request the server to terminate a running instance.
+        
+        :param instance_id: The UUID of the instance to terminate.
+        :raises Exception: If termination fails.
+        """
         msg = {"type": "terminate_instance", "instance_id": instance_id}
-        await self.ws.send(msgpack.packb(msg, use_bin_type=True))
+        successful, result = await self._send_msg_and_wait(msg)
+        if not successful:
+            raise Exception(f"Failed to terminate instance: {result}")
 
 
 def _compile_rust_sync(rust_code: str, cargo_toml_content: str, package_name: str) -> bytes:

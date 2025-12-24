@@ -1,9 +1,5 @@
-// Ignoring FlashInfer for now because the CI environment cannot have it installed
 {
     "include": [
-        "engine/backend-python/src"
-    ],
-    "extraPaths": [
         "engine/backend-python/src"
     ],
     "reportMissingImports": "error"

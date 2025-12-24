@@ -13,10 +13,10 @@ fi
 
 # Use the uv managed pylint to avoid import errors
 # Disabling refactor warnings for now
-pylint_cmd="uv --project backend/backend-python run pylint --disable=R"
+pylint_cmd="uv --project engine/backend-python run pylint --disable=R"
 
 # Black formatting check command
-black_cmd="uv --project backend/backend-python run black --check --quiet"
+black_cmd="uv --project engine/backend-python run black --check --quiet"
 
 # Gather all staged .py files
 staged_py=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$') || true

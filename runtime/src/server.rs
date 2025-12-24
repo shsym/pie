@@ -401,6 +401,19 @@ impl Session {
 
     /// Authenticates a user client using public key.
     async fn external_authenticate(&mut self, corr_id: u32, username: String) -> Result<()> {
+        // If authentication is disabled, we authorize the user immediately without
+        // checking if they are in the authorized users file or challenging them.
+
+        if !self.state.enable_auth {
+            self.send_response(
+                corr_id,
+                true,
+                "Authenticated (Engine disabled authentication)".to_string(),
+            )
+            .await;
+            return Ok(());
+        }
+
         // Check if the username is in the authorized users file and get the user's public keys
         let public_keys: Vec<PublicKey> = match self.state.authorized_users.get(&username) {
             Some(keys) => keys.public_keys().cloned().collect(),
@@ -414,18 +427,6 @@ impl Session {
                 bail!("User '{}' is not authorized", username)
             }
         };
-
-        // If authentication is disabled, we authorize the user as long as they are
-        // in the authorized users file and need not to challenge them.
-        if !self.state.enable_auth {
-            self.send_response(
-                corr_id,
-                true,
-                "Authenticated (Engine disabled authentication)".to_string(),
-            )
-            .await;
-            return Ok(());
-        }
 
         // Generate a cryptographically secure random challenge (48 bytes = 384 bits)
         // Use `ring::rand::SystemRandom` for cryptographic randomness.

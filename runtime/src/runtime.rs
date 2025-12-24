@@ -896,7 +896,7 @@ impl Runtime {
                 .dispatch();
             }
             Err(err) => {
-                println!("Instance {instance_id} failed: {err}");
+                tracing::info!("Instance {instance_id} failed: {err}");
                 Command::FinishInstance {
                     inst_id: instance_id,
                     cause: TerminationCause::Exception(err.to_string()),

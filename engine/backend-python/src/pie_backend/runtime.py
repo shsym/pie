@@ -22,7 +22,7 @@ import torch.distributed as dist
 from .config import RuntimeConfig
 from .batching import BatchBuilder, Batch
 from .loader import ModelLoader
-from .adapter import AdapterSubpass
+from .adapter import AdapterSubpass, CmaesAdapter
 from .model import llama3, qwen2, qwen3, common
 from . import message
 
@@ -91,6 +91,9 @@ class Runtime:
                 self.kv_cache_at_layer = llama3.create_kv_cache(
                     self.model_config, config
                 )
+                
+                # Evaluate and store max_num_kv_pages in config
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
 
             case "qwen2":
                 # Create model config
@@ -107,6 +110,9 @@ class Runtime:
                 self.kv_cache_at_layer = qwen2.create_kv_cache(
                     self.model_config, config
                 )
+
+                # Evaluate and store max_num_kv_pages in config
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
             case "qwen3":
                 # Create model config
                 self.model_config = qwen3.ModelConfig.from_dict(normalized_arch)
@@ -122,6 +128,9 @@ class Runtime:
                 self.kv_cache_at_layer = qwen3.create_kv_cache(
                     self.model_config, config
                 )
+
+                # Evaluate and store max_num_kv_pages in config
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
             case _:
                 raise ValueError(f"Unsupported architecture type: {self.type}")
 
@@ -137,12 +146,6 @@ class Runtime:
         self._init_adapter_states()
 
 
-    # For backward compatibility, expose forward_pass as alias to engine
-    @property
-    def forward_pass(self) -> llama3.ForwardPass:
-        """Backward compatibility alias for self.engine."""
-        return self.engine
-
     def _init_adapter_states(self) -> None:
         """Initialize adapter memory tensors."""
         device = self.config.device
@@ -152,8 +155,8 @@ class Runtime:
                 torch.zeros(
                     (
                         self.config.max_num_adapters,
-                        self.config.max_adapter_rank * 3,
                         self.model_config.dim_hidden,
+                        self.config.max_adapter_rank * 3,
                     ),
                     dtype=self.config.activation_dtype,
                     device=device,
@@ -161,12 +164,12 @@ class Runtime:
                 torch.zeros(
                     (
                         self.config.max_num_adapters,
+                        self.config.max_adapter_rank,
                         self.model_config.dim_head
                         * (
                             self.model_config.num_q_heads
                             + self.model_config.num_kv_heads * 2
                         ),
-                        self.config.max_adapter_rank,
                     ),
                     dtype=self.config.activation_dtype,
                     device=device,
@@ -356,15 +359,25 @@ class Runtime:
 
     def upload_adapter(self, reqs: list[message.UploadAdapterRequest]) -> None:
         """Upload adapter weights."""
-        # TODO: implement adapter upload
-        pass
+        for req in reqs:
+            if req.adapter_ptr in self.adapters:
+                adapter = self.adapters[req.adapter_ptr]
+                if isinstance(adapter, CmaesAdapter):
+                    adapter.upload(req.name, req.adapter_data)
 
     def download_adapter(
         self, reqs: list[message.DownloadAdapterRequest]
     ) -> list[message.DownloadAdapterResponse]:
         """Download adapter weights."""
-        # TODO: implement adapter download
-        return [message.DownloadAdapterResponse(adapter_data=b"") for _ in reqs]
+        resps = []
+        for req in reqs:
+            if req.adapter_ptr in self.adapters:
+                adapter = self.adapters[req.adapter_ptr]
+                if isinstance(adapter, CmaesAdapter):
+                    data = adapter.download(req.name)
+                    resp = message.DownloadAdapterResponse(adapter_data=data)
+                    resps.append(resp)
+        return resps
 
     # ========================================================================
     # Internal Adapter Methods
@@ -380,7 +393,33 @@ class Runtime:
         mu_fraction: float,
         initial_sigma: float,
     ):
-        raise NotImplementedError
+        cfg = self.model_config
+        
+        # Check if adapter limits are exceeded
+        if adapter_ptr >= self.config.max_num_adapters:
+             raise ValueError(f"Adapter pointer {adapter_ptr} exceeds max_num_adapters {self.config.max_num_adapters}")
+        
+        self.adapters[adapter_ptr] = CmaesAdapter(
+            adapter_id=adapter_ptr,
+            adapter_at_layer=self.adapter_at_layer,
+            rank=rank,
+            alpha=alpha,
+            in_features=cfg.dim_hidden,
+            out_features=[
+                cfg.dim_head * cfg.num_q_heads,
+                cfg.dim_head * cfg.num_kv_heads,
+                cfg.dim_head * cfg.num_kv_heads
+            ],
+            num_layers=cfg.num_layers,
+            population_size=population_size,
+            mu_fraction=mu_fraction,
+            initial_sigma=initial_sigma,
+            min_sigma=1e-7,
+            min_var=1e-8,
+            max_var=1e4,
+            device=self.config.device,
+            dtype=self.config.activation_dtype,
+        )
 
     @torch.inference_mode()
     def _update_adapter(
@@ -390,7 +429,10 @@ class Runtime:
         seeds: list[int],
         max_sigma: float,
     ):
-        raise NotImplementedError
+        if adapter_ptr in self.adapters:
+            adapter = self.adapters[adapter_ptr]
+            if isinstance(adapter, CmaesAdapter):
+                adapter.update(scores, seeds, max_sigma)
 
     # ========================================================================
     # Batch Execution
@@ -470,14 +512,11 @@ class Runtime:
         Returns:
             List of ForwardPassResponse for each request in the batch
         """
-        t_start = time.perf_counter()  
         batch = self.batch_builder.build()
-        t_build = time.perf_counter()
-        device = self.config.device#[self.config.rank]
+        device = self.config.device
 
         # 1. Prepare inputs using batch method
-        inputs = batch.get_model_inputs(device)
-        t_inputs = time.perf_counter()
+        inputs = batch.get_model_inputs(device, self.adapter_at_layer, self.adapters)
 
         # Handle empty batch
         if not inputs["token_ids"]:
@@ -503,18 +542,9 @@ class Runtime:
 
         # Execute step
         sampling_results = self._run_step(inputs, sampling_metadata)
-        
-        t_forward_sample = time.perf_counter() # merged timing for simplicity
 
         # Package responses
         responses = batch.create_responses(sampling_results)
-        t_package = time.perf_counter()
-
-        print(f"Batch execution: {(t_package - t_start) * 1000:.2f} ms")
-        print(f"  - Build: {(t_build - t_start) * 1000:.2f} ms")
-        print(f"  - Inputs: {(t_inputs - t_build) * 1000:.2f} ms")
-        print(f"  - Forward+Sample: {(t_forward_sample - t_inputs) * 1000:.2f} ms")
-        print(f"  - Package: {(t_package - t_forward_sample) * 1000:.2f} ms")
 
         return responses
 

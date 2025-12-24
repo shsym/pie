@@ -39,6 +39,9 @@ class RuntimeConfig:
     max_adapter_rank: int
     gpu_mem_utilization: float
 
+    # Evaluated at runtime
+    max_num_kv_pages: int | None
+
     # Device and dtype config (formerly in model.Config)
     devices: list[torch.device]  # Renamed from device for clarity
     rank: int
@@ -174,6 +177,7 @@ class RuntimeConfig:
             max_num_adapters=max_num_adapters,
             max_adapter_rank=max_adapter_rank,
             gpu_mem_utilization=gpu_mem_utilization,
+            max_num_kv_pages=None,  # Populated by runtime based on memory
             devices=resolved_devices,
             rank=rank,
             activation_dtype=resolved_activation_dtype,

@@ -7,8 +7,7 @@
 # Cannot use list comprehension because some Pylint versions do not support it
 init-hook = 'import sys, os; 
     sys.path.insert(0, os.getcwd()); 
-    sys.path.insert(0, os.path.join(os.getcwd(), "backend/backend-python")); 
-    sys.path.insert(0, os.path.join(os.getcwd(), "backend/common_python"))'
+    sys.path.insert(0, os.path.join(os.getcwd(), "engine/backend-python"))'
 
 [TYPECHECK]
 # Don't complain that flashinfer isn't installed

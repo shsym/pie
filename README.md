@@ -71,9 +71,28 @@ pie-cli submit ./text_completion.wasm -- --prompt "What is the capital of France
 
 #### Prerequisites
 
-- **Configure a Backend:**
-  Navigate to a backend directory and follow its `README.md` for setup:
-    - [Python Backend](engine/backend-python/README.md)
+- **Configure a Backend (Python):**
+  
+  Navigate to `engine/backend-python` and install:
+  ```bash
+  cd engine/backend-python
+  pip install -e .
+  ```
+  
+  For CUDA support:
+  ```bash
+  pip install -e ".[cuda]"
+  ```
+  
+  For Metal (macOS) support:
+  ```bash
+  pip install -e ".[metal]"
+  ```
+
+  To verify the installation and environment compatibility, run:
+  ```bash
+  pie-backend --doctor
+  ```
 
 
 - **Add Wasm Target:**
@@ -115,7 +134,7 @@ Build the **CLIs** and the example inferlets.
 
    Substitute `$REPO` to the actual repository root and run
    ```bash
-   pie config init python $REPO/engine/backend-python/src/pie_backend/server.py
+   pie config init
    ```
 
 2. **Download the model:**

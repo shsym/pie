@@ -1,4 +1,4 @@
-core = "../../inferlet-api/core/wit"
-adapter = "../../inferlet-api/adapter/wit"
-image = "../../inferlet-api/image/wit"
-zo = "../../inferlet-api/zo/wit"
+core = "../../sdk/interfaces/core/wit"
+adapter = "../../sdk/interfaces/adapter/wit"
+image = "../../sdk/interfaces/image/wit"
+zo = "../../sdk/interfaces/zo/wit"

@@ -11,7 +11,12 @@ use std::rc::Rc;
 pub use wasi;
 pub use wstd;
 
+mod zo;
+pub use crate::zo::{Evolve, SetAdapterSeed, SetAdapterSeed as SetSeed};
+
 mod adapter;
+pub use crate::adapter::{Adapter, SetAdapter};
+
 pub mod api;
 pub mod brle;
 pub mod chat;
@@ -22,7 +27,6 @@ mod image;
 mod pool;
 pub mod sampler;
 pub mod stop_condition;
-mod zo;
 
 #[derive(Clone, Debug)]
 pub struct Queue {
