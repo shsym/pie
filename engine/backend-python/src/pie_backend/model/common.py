@@ -81,6 +81,10 @@ def sample_common(
             )
             if sampled.dtype != torch.long:
                 sampled = sampled.to(torch.long)
+
+            # check if sampled exceeds 10000000
+            # if sampled.max() > 10000000:
+            #     print("client-sent token id {} is out of range".format(sampled))
             final_tokens_tensor.scatter_(0, indices_tensor, sampled)
 
     # Stage 5: Combine results

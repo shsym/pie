@@ -86,14 +86,18 @@ class Runtime:
                     config,
                     weights,
                 )
-                
+                # Create adapter cache
+                self.adapter_at_layer = llama3.create_adapter_cache(
+                    self.model_config, config
+                )
+                # Evaluate and store max_num_kv_pages in config
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
                 # Create KV cache
                 self.kv_cache_at_layer = llama3.create_kv_cache(
                     self.model_config, config
                 )
                 
-                # Evaluate and store max_num_kv_pages in config
-                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
+                
 
             case "qwen2":
                 # Create model config
@@ -105,14 +109,19 @@ class Runtime:
                     config,
                     weights,
                 )
-                
+                # Create adapter cache
+                self.adapter_at_layer = qwen2.create_adapter_cache(
+                    self.model_config, config
+                )
+                # Evaluate and store max_num_kv_pages in config
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
                 # Create KV cache
                 self.kv_cache_at_layer = qwen2.create_kv_cache(
                     self.model_config, config
                 )
+                
 
-                # Evaluate and store max_num_kv_pages in config
-                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
+                
             case "qwen3":
                 # Create model config
                 self.model_config = qwen3.ModelConfig.from_dict(normalized_arch)
@@ -123,14 +132,20 @@ class Runtime:
                     config,
                     weights,
                 )
-                
+
+                # Create adapter cache
+                self.adapter_at_layer = qwen3.create_adapter_cache(
+                    self.model_config, config
+                )
+                # Evaluate and store max_num_kv_pages in config
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
                 # Create KV cache
                 self.kv_cache_at_layer = qwen3.create_kv_cache(
                     self.model_config, config
                 )
+                
 
-                # Evaluate and store max_num_kv_pages in config
-                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
+                
             case _:
                 raise ValueError(f"Unsupported architecture type: {self.type}")
 
@@ -140,43 +155,9 @@ class Runtime:
             max_dist_size=config.max_dist_size,
             adapters=self.adapters,
         )
-
-        # Initialize adapter states
-        # Initialize adapter states
-        self._init_adapter_states()
+    
 
 
-    def _init_adapter_states(self) -> None:
-        """Initialize adapter memory tensors."""
-        device = self.config.device
-
-        self.adapter_at_layer = [
-            (
-                torch.zeros(
-                    (
-                        self.config.max_num_adapters,
-                        self.model_config.dim_hidden,
-                        self.config.max_adapter_rank * 3,
-                    ),
-                    dtype=self.config.activation_dtype,
-                    device=device,
-                ),
-                torch.zeros(
-                    (
-                        self.config.max_num_adapters,
-                        self.config.max_adapter_rank,
-                        self.model_config.dim_head
-                        * (
-                            self.model_config.num_q_heads
-                            + self.model_config.num_kv_heads * 2
-                        ),
-                    ),
-                    dtype=self.config.activation_dtype,
-                    device=device,
-                ),
-            )
-            for _ in range(self.model_config.num_layers)
-        ]
 
     # ========================================================================
     # Metadata Accessors

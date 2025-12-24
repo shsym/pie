@@ -531,12 +531,10 @@ def create_kv_cache(model_config: ModelConfig, runtime_config: RuntimeConfig) ->
     """Create KV cache tensors for all layers."""
     local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
     
-    max_num_kv_pages = model_config.eval_max_num_kv_pages(runtime_config)
-    
     return [
         torch.zeros(
             (
-                max_num_kv_pages,
+                runtime_config.max_num_kv_pages,
                 2,
                 runtime_config.kv_page_size,
                 local_num_kv_heads,
@@ -544,6 +542,44 @@ def create_kv_cache(model_config: ModelConfig, runtime_config: RuntimeConfig) ->
             ),
             dtype=runtime_config.activation_dtype,
             device=runtime_config.device,
+        )
+        for _ in range(model_config.num_layers)
+    ]
+
+
+def create_adapter_cache(
+    model_config: ModelConfig, runtime_config: RuntimeConfig
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Create adapter cache tensors for all layers.
+    
+    Returns a list of (down_weights, up_weights) tuples, one per layer.
+    - down_weights: [max_num_adapters, dim_hidden, max_adapter_rank * 3]
+    - up_weights: [max_num_adapters, max_adapter_rank, dim_head * (num_q_heads + num_kv_heads * 2)]
+    """
+    return [
+        (
+            torch.zeros(
+                (
+                    runtime_config.max_num_adapters,
+                    model_config.dim_hidden,
+                    runtime_config.max_adapter_rank * 3,
+                ),
+                dtype=runtime_config.activation_dtype,
+                device=runtime_config.device,
+            ),
+            torch.zeros(
+                (
+                    runtime_config.max_num_adapters,
+                    runtime_config.max_adapter_rank,
+                    model_config.dim_head
+                    * (
+                        model_config.num_q_heads
+                        + model_config.num_kv_heads * 2
+                    ),
+                ),
+                dtype=runtime_config.activation_dtype,
+                device=runtime_config.device,
+            ),
         )
         for _ in range(model_config.num_layers)
     ]

@@ -30,7 +30,8 @@ impl inferlet::core::tokenize::HostTokenizer for InstanceState {
         text: String,
     ) -> anyhow::Result<Vec<u32>> {
         let tokenizer = self.ctx().table.get(&this)?;
-        Ok(tokenizer.inner.encode_with_special_tokens(&text))
+        let out = tokenizer.inner.encode_with_special_tokens(&text);
+        Ok(out)
     }
 
     async fn detokenize(

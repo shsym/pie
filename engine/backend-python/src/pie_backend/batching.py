@@ -193,6 +193,7 @@ class Batch:
                     # Sampling request
                     request_tokens.append(final_tokens_list[i])
 
+
             responses.append(
                 message.ForwardPassResponse(dists=request_dists, tokens=request_tokens)
             )
