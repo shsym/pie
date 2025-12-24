@@ -74,6 +74,7 @@ def sample_common(
                 indices, group_probs, final_dists, sampler_params
             )
         else:
+            #print(sampler_idx, indices, group_probs, sampler_params, device, dtype)
             # Sampling mode
             sampled = _execute_sampler(
                 sampler_idx, indices, group_probs, sampler_params, device, dtype

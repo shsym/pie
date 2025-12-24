@@ -398,7 +398,9 @@ class Runtime:
         # Check if adapter limits are exceeded
         if adapter_ptr >= self.config.max_num_adapters:
              raise ValueError(f"Adapter pointer {adapter_ptr} exceeds max_num_adapters {self.config.max_num_adapters}")
-        
+        # print parameters
+        #print(f"Initializing adapter {adapter_ptr} with rank {rank}, alpha {alpha}, population size {population_size}, mu fraction {mu_fraction}, initial sigma {initial_sigma}")
+        # Initialize adapter
         self.adapters[adapter_ptr] = CmaesAdapter(
             adapter_id=adapter_ptr,
             adapter_at_layer=self.adapter_at_layer,
@@ -484,6 +486,7 @@ class Runtime:
         # 2. Embed inputs
         input_embeds = self.engine.embed_inputs(inputs)
         
+        
         # 3. Run transformer forward pass
         hidden_states = self.engine.transform(
             input_embeds=input_embeds,
@@ -519,26 +522,26 @@ class Runtime:
         inputs = batch.get_model_inputs(device, self.adapter_at_layer, self.adapters)
 
         # Handle empty batch
-        if not inputs["token_ids"]:
-             if self.config.world_size > 1:
-                  dist.broadcast_object_list([None, None], src=0)
-             return []
+        # if not inputs["token_ids"]:
+        #      if self.config.world_size > 1:
+        #           dist.broadcast_object_list([None, None], src=0)
+        #      return []
 
         # Prepare sampling metadata
         sampling_metadata = batch.get_sampling_metadata(device, self.config.activation_dtype)
 
         # Broadcast if needed
-        if self.config.world_size > 1:
-            # Move to CPU for safe pickling/broadcasting
-            cpu_inputs = {
-                k: (v.cpu() if isinstance(v, torch.Tensor) else v)
-                for k, v in inputs.items()
-            }
-            cpu_sampling_metadata = {
-                k: (v.cpu() if isinstance(v, torch.Tensor) else v) 
-                for k, v in sampling_metadata.items()
-            }
-            dist.broadcast_object_list([cpu_inputs, cpu_sampling_metadata], src=0)
+        # if self.config.world_size > 1:
+        #     # Move to CPU for safe pickling/broadcasting
+        #     cpu_inputs = {
+        #         k: (v.cpu() if isinstance(v, torch.Tensor) else v)
+        #         for k, v in inputs.items()
+        #     }
+        #     cpu_sampling_metadata = {
+        #         k: (v.cpu() if isinstance(v, torch.Tensor) else v) 
+        #         for k, v in sampling_metadata.items()
+        #     }
+        #     dist.broadcast_object_list([cpu_inputs, cpu_sampling_metadata], src=0)
 
         # Execute step
         sampling_results = self._run_step(inputs, sampling_metadata)

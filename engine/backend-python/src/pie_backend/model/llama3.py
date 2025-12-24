@@ -360,13 +360,14 @@ class ForwardPass:
 
         # 3. Adapter (if any)
         if adapter_subpass is not None:
-            adapter_subpass.execute(
-                layer_idx,
-                normed_input,  # Adapter needs the (replicated) normed input
-                q_state=q,
-                k_state=k,
-                v_state=v,
-            )
+            ...
+            # adapter_subpass.execute(
+            #     layer_idx,
+            #     normed_input,  # Adapter needs the (replicated) normed input
+            #     q_state=q,
+            #     k_state=k,
+            #     v_state=v,
+            # )
         del normed_input
 
         # 4. Reshape QKV (local shapes) ------------------> input scatter

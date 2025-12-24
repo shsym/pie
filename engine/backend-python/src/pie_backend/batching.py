@@ -81,7 +81,7 @@ class Batch:
         )
 
         return {
-            "token_ids": self.token_ids,
+            "token_ids": torch.as_tensor(self.token_ids, device=device, dtype=torch.long),
             "position_ids": torch.as_tensor(
                 self.position_ids, device=device, dtype=torch.int32
             ),
@@ -137,7 +137,7 @@ class Batch:
             [p["temperature"] for p in self.sampler_params],
             device=device,
             dtype=dtype,
-        ).unsqueeze(1)
+        ).clamp(min=1e-6).unsqueeze(1)
 
         # Group samplers
         sampler_groups: dict[int, list[int]] = {}
