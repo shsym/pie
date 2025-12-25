@@ -19,81 +19,55 @@
 
 ## Getting Started
 
-### Docker Installation
-
-Run Pie server in Docker and connect to it using the `pie-cli` client.
-
-**Prerequisites:**
-- NVIDIA GPU with Docker and NVIDIA Container Toolkit
-- SSH key pair (generate with `ssh-keygen -t ed25519` if needed)
-- `pie-cli` binary ([download from GitHub releases](https://github.com/pie-project/pie/releases))
-
-**Step 1: Start Pie Server**
+Install the Pie directly from PyPI:
 
 ```bash
-docker run --rm --gpus all -p 8080:8080 \
-  --name pie-server \
-  -e PIE_AUTH_USER="$(whoami)" \
-  -e PIE_AUTH_KEY="$(cat ~/.ssh/id_ed25519.pub)" \
-  -v ~/.cache:/root/.cache \
-  pieproject/pie:latest
+# For NVIDIA GPUs
+pip install "pie-server[cuda]"
+
+# For Apple Silicon
+pip install "pie-server[metal]"
 ```
 
-The server will start with the name `pie-server` and authenticate using your SSH public key. Models are cached in `~/.cache/` for persistence.
-
-**Step 2: Configure and Test Connection**
-
-In a new terminal:
+Verify the installation:
 
 ```bash
-# Configure pie-cli (uses localhost:8080 by default)
-pie-cli config init --enable-auth true
-
-# Test connection
-pie-cli ping
+pie doctor
 ```
 
-**Step 3: Run Text Completion**
-
-Copy the example inferlet and run it:
+Quick start:
 
 ```bash
-# Copy inferlet from container (one-time)
-docker cp pie-server:/workspace/sdk/inferlet-examples/text_completion.wasm ./
+# Initialize config and download a model
+pie config init
+pie model add qwen-3-0.6b
 
-# Submit for execution
-pie-cli submit ./text_completion.wasm -- --prompt "What is the capital of France?"
+# Start the engine
+pie serve -i
+
+# In the interactive shell:
+# pie> run ./my_inferlet.wasm -- --prompt "Hello!"
 ```
 
-**Note:** The first run may take a few minutes for model download and kernel compilation. Subsequent runs are much faster thanks to caching.
+See [server/README.md](server/README.md) for full CLI documentation.
+
+---
 
 ### Manual Installation
 
 #### Prerequisites
 
-- **Configure a Backend (Python):**
+- **Install Pie Server:**
   
-  Navigate to `engine/backend-python` and install:
   ```bash
-  cd engine/backend-python
-  pip install -e .
-  ```
-  
-  For CUDA support:
-  ```bash
-  pip install -e ".[cuda]"
+  cd server
+  pip install -e ".[cuda]"   # or [metal] for macOS
   ```
   
-  For Metal (macOS) support:
+  Verify the installation:
   ```bash
-  pip install -e ".[metal]"
+  pie doctor
   ```
-
-  To verify the installation and environment compatibility, run:
-  ```bash
-  pie-backend --doctor
-  ```
-
 
 - **Add Wasm Target:**
   Install the WebAssembly target for Rust:
@@ -104,42 +78,24 @@ pie-cli submit ./text_completion.wasm -- --prompt "What is the capital of France
   This is required to compile Rust-based inferlets in the `sdk/inferlet-examples` directory.
 
 
-#### Step 1: Build
+#### Step 1: Build Inferlets
 
-Build the **CLIs** and the example inferlets.
+Build the example inferlets:
 
-1. **Build the engine `pie` and the client CLI `pie-cli`:**
-
-   From the repository root, run
-
-   ```bash
-   cd runtime && cargo install --path .
-   ```
-
-   Also, from the repository root, run
-   ```bash
-   cd client/cli && cargo install --path .
-   ```
-
-2. **Build the Examples:**
-
-   From the repository root, run
-   ```bash
-   cd sdk/inferlet-examples && cargo build --target wasm32-wasip2 --release
-   ```
+```bash
+cd sdk/inferlet-examples && cargo build --target wasm32-wasip2 --release
+```
 
 #### Step 2: Configure Engine and Backend
 
 1. **Create default configuration file:**
 
-   Substitute `$REPO` to the actual repository root and run
    ```bash
    pie config init
    ```
 
 2. **Download the model:**
 
-   The default config file specifies the expected model. Run the following command to download it.
    ```bash
    pie model add qwen-3-0.6b
    ```
@@ -149,7 +105,7 @@ Build the **CLIs** and the example inferlets.
    Run an inferlet directly with the engine. Due to JIT compilation of FlashInfer kernels, the first run will have **very long** latency.
    ```bash
    pie run \
-       $REPO/sdk/inferlet-examples/target/wasm32-wasip2/release/text_completion.wasm \
+       sdk/inferlet-examples/target/wasm32-wasip2/release/text_completion.wasm \
        -- \
        --prompt "Where is the capital of France?"
    ```
@@ -158,44 +114,64 @@ Build the **CLIs** and the example inferlets.
 
 1. **Create User Public Key:**
 
-   If you don't already have a key pair in `~/.ssh`, generate one with the following command.
-   By default, the private key will be generated in `~/.ssh/id_ed25519` and the public key in `~/.ssh/id_ed25519.pub`.
-   Please make sure the passphrase is *empty*.
+   If you don't already have a key pair in `~/.ssh`, generate one:
    ```bash
-   ssh-keygen
+   ssh-keygen -t ed25519
    ```
-
-   In addition to ED25519, you can also use RSA or ECDSA keys.
 
 2. **Create default user client configuration file:**
 
-   The following command creates a default user client configuration file using the current Unix username and the private key in `~/.ssh`.
    ```bash
    pie-cli config init
    ```
 
 3. **Register the user on the engine:**
 
-   Run the following command to register the current user on the engine.
-   `my-first-key` is the name of the key and can be any string.
-   `cat` reads the public key from `~/.ssh/id_ed25519.pub` and pipes it to `pie auth add`.
    ```bash
    cat ~/.ssh/id_ed25519.pub | pie auth add $(whoami) my-first-key
    ```
 
 4. **Start the Engine:**
 
-   Launch the Pie engine with the default configuration.
    ```bash
    pie serve
    ```
 
 5. **Run an Inferlet:**
 
-   From another terminal window, run
+   From another terminal window:
    ```bash
    pie-cli submit \
-       $REPO/sdk/inferlet-examples/target/wasm32-wasip2/release/text_completion.wasm \
+       sdk/inferlet-examples/target/wasm32-wasip2/release/text_completion.wasm \
        -- \
        --prompt "Where is the capital of France?"
    ```
+
+---
+
+## CLI Reference
+
+| Command | Description |
+|---------|-------------|
+| `pie serve` | Start the Pie engine |
+| `pie run` | Run an inferlet (one-shot) |
+| `pie doctor` | Environment health check |
+| `pie config` | Manage configuration |
+| `pie model` | Manage models |
+| `pie auth` | Manage authenticated users |
+
+For detailed usage, see [server/README.md](server/README.md).
+
+---
+
+## Project Structure
+
+```
+pie/
+├── server/          # Pie Server CLI (Python + Rust bindings)
+├── runtime/         # Core engine (Rust)
+├── client/          # Client libraries (Rust CLI, Python)
+├── engine/          # Backend implementations
+│   └── backend-python/  # Python backend (PyTorch)
+└── sdk/             # Inferlet SDK and examples
+```

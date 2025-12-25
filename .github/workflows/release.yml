@@ -1,0 +1,120 @@
+name: Release to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:  # Manual trigger for testing
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build wheels for Linux (manylinux)
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -m server/pyproject.toml
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}-py${{ matrix.python-version }}
+          path: dist
+
+  # Build wheels for macOS
+  macos:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -m server/pyproject.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}-py${{ matrix.python-version }}
+          path: dist
+
+  # Build wheels for Windows
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target: [x64]
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: ${{ matrix.target }}
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist -m server/pyproject.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.target }}-py${{ matrix.python-version }}
+          path: dist
+
+  # Build source distribution
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist -m server/pyproject.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  # Publish to PyPI
+  publish:
+    name: Publish to PyPI
+    needs: [linux, macos, windows, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # Required for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: List built wheels
+        run: ls -la dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # Uses trusted publishing - no API token needed
+        # Configure at: https://pypi.org/manage/project/pie-server/settings/publishing/

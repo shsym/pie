@@ -8,6 +8,7 @@ import typer
 from . import config, model, auth
 from .serve import serve
 from .run import run
+from .doctor import doctor
 
 app = typer.Typer(
     name="pie-server",
@@ -18,6 +19,7 @@ app = typer.Typer(
 # Register top-level commands
 app.command()(serve)
 app.command()(run)
+app.command()(doctor)
 
 # Register subcommand groups
 app.add_typer(config.app, name="config")
@@ -33,3 +35,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     app()
+

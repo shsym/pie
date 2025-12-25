@@ -4,6 +4,7 @@ This module handles the lifecycle of the Pie engine and backend services,
 mirroring Rust cli/manager.rs functionality.
 """
 
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -61,7 +62,7 @@ def start_engine_and_backend(
     expected_backends = 0
     
     # Launch backend processes
-    backend_processes: list[subprocess.Popen] = []
+    backend_processes: list["multiprocessing.Process | subprocess.Popen"] = []
 
     for backend_config in backend_configs:
         backend_type = backend_config.get("backend_type")
@@ -73,6 +74,26 @@ def start_engine_and_backend(
             # TODO: Call into Rust to start dummy backend
             continue
 
+        if backend_type == "python":
+            # Spawn pie-backend directly using multiprocessing
+            typer.echo("- Spawning Python backend (pie-backend)")
+            try:
+                process = spawn_python_backend(
+                    engine_config, 
+                    backend_config, 
+                    server_handle.internal_token
+                )
+                backend_processes.append(process)
+                expected_backends += 1
+            except Exception as e:
+                typer.echo(f"❌ Failed to spawn backend: {e}", err=True)
+                for p in backend_processes:
+                    p.terminate()
+                server_handle.shutdown()
+                raise typer.Exit(1)
+            continue
+
+        # Fallback: external backend via exec_path (for custom backends)
         exec_path = backend_config.get("exec_path")
         if not exec_path:
             typer.echo(f"⚠️ Backend config missing exec_path: {backend_config}", err=True)
@@ -94,7 +115,7 @@ def start_engine_and_backend(
             else:
                 cmd.extend([f"--{key.replace('_', '-')}", str(value)])
 
-        typer.echo(f"- Spawning backend: {exec_path}")
+        typer.echo(f"- Spawning external backend: {exec_path}")
 
         try:
             process = subprocess.Popen(
@@ -125,6 +146,67 @@ def start_engine_and_backend(
         typer.echo(f"✅ {expected_backends} backend(s) connected")
 
     return server_handle, backend_processes
+
+
+def spawn_python_backend(
+    engine_config: dict,
+    backend_config: dict,
+    internal_token: str,
+) -> multiprocessing.Process:
+    """Spawn a Python backend process directly using multiprocessing.
+
+    This avoids the overhead of subprocess and directly imports pie_backend,
+    which is faster and more reliable than shelling out.
+
+    Args:
+        engine_config: Engine configuration dict (host, port)
+        backend_config: Backend configuration dict
+        internal_token: Internal authentication token
+
+    Returns:
+        multiprocessing.Process object
+    """
+    # Build kwargs for pie_backend.main()
+    backend_kwargs = {
+        "host": engine_config.get("host", "127.0.0.1"),
+        "port": engine_config.get("port", 8080),
+        "internal_auth_token": internal_token,
+        "model": backend_config.get("model"),
+        "device": backend_config.get("device"),
+        "cache_dir": backend_config.get("cache_dir"),
+        "kv_page_size": backend_config.get("kv_page_size", 16),
+        "max_dist_size": backend_config.get("max_dist_size", 64),
+        "max_num_embeds": backend_config.get("max_num_embeds", 128),
+        "max_batch_tokens": backend_config.get("max_batch_tokens", 10240),
+        "max_num_adapters": backend_config.get("max_num_adapters", 48),
+        "max_adapter_rank": backend_config.get("max_adapter_rank", 8),
+        "gpu_mem_utilization": backend_config.get("gpu_mem_utilization", 0.9),
+        "activation_dtype": backend_config.get("activation_dtype", "bfloat16"),
+        "weight_dtype": backend_config.get("weight_dtype"),
+        "enable_profiling": backend_config.get("enable_profiling", False),
+    }
+    
+    # Remove None values
+    backend_kwargs = {k: v for k, v in backend_kwargs.items() if v is not None}
+
+    # Use spawn context for CUDA compatibility
+    ctx = multiprocessing.get_context("spawn")
+    process = ctx.Process(
+        target=_run_backend_process,
+        kwargs=backend_kwargs,
+        daemon=False,  # Allow cleanup
+    )
+    process.start()
+    return process
+
+
+def _run_backend_process(**kwargs):
+    """Target function for the backend process.
+    
+    This runs in a separate process and imports/calls pie_backend.main().
+    """
+    from pie_backend.__main__ import main
+    main(**kwargs)
 
 
 def wait_for_backends(
