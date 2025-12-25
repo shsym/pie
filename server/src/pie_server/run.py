@@ -49,18 +49,20 @@ def run(
 
     typer.echo("🚀 Starting Pie engine...")
 
+    server_handle = None
+    backend_processes = []
+
     try:
         # Start engine and backends
-        internal_token, backend_processes = manager.start_engine_and_backend(
+        server_handle, backend_processes = manager.start_engine_and_backend(
             engine_config, backend_configs
         )
-        typer.echo("✅ Engine started.")
 
         # Run the inferlet
         client_config = {
             "host": engine_config["host"],
             "port": engine_config["port"],
-            "internal_auth_token": internal_token,
+            "internal_auth_token": server_handle.internal_token,
         }
         manager.submit_inferlet_and_wait(
             client_config,
@@ -69,12 +71,15 @@ def run(
         )
 
         # Cleanup
-        manager.terminate_engine_and_backend(backend_processes)
+        manager.terminate_engine_and_backend(server_handle, backend_processes)
         typer.echo("✅ Shutdown complete.")
 
     except KeyboardInterrupt:
         typer.echo("\n⚠️ Interrupted.")
+        manager.terminate_engine_and_backend(server_handle, backend_processes)
         raise typer.Exit(130)
     except Exception as e:
         typer.echo(f"❌ Error: {e}", err=True)
+        manager.terminate_engine_and_backend(server_handle, backend_processes)
         raise typer.Exit(1)
+

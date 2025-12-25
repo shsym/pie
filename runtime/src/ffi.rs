@@ -6,6 +6,7 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
 use crate::auth::AuthorizedUsers;
@@ -79,30 +80,78 @@ impl From<ServerConfig> for EngineConfig {
     }
 }
 
-/// Starts the PIE server and returns the internal auth token.
+/// Handle to a running server, allowing graceful shutdown.
+#[pyclass]
+pub struct ServerHandle {
+    internal_token: String,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+#[pymethods]
+impl ServerHandle {
+    /// Get the internal authentication token.
+    #[getter]
+    fn internal_token(&self) -> String {
+        self.internal_token.clone()
+    }
+
+    /// Gracefully shut down the server.
+    fn shutdown(&self) -> PyResult<()> {
+        let mut guard = self.shutdown_tx.lock().map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to acquire lock: {}", e))
+        })?;
+
+        if let Some(tx) = guard.take() {
+            tx.send(()).map_err(|_| {
+                PyRuntimeError::new_err("Failed to send shutdown signal (server may already be stopped)")
+            })?;
+            Ok(())
+        } else {
+            Err(PyRuntimeError::new_err("Server already shut down"))
+        }
+    }
+
+    /// Check if the server is still running.
+    fn is_running(&self) -> bool {
+        self.shutdown_tx.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Get list of registered model names (backends that have connected).
+    fn registered_models(&self) -> Vec<String> {
+        crate::model::registered_models()
+    }
+
+    fn __repr__(&self) -> String {
+        let running = if self.is_running() { "running" } else { "stopped" };
+        format!("ServerHandle(status={}, token={}...)", running, &self.internal_token[..8])
+    }
+}
+
+/// Starts the PIE server and returns a handle for management.
 ///
-/// This function blocks until the server is ready, then returns the token
-/// that can be used for internal authentication.
+/// This function blocks until the server is ready, then returns a ServerHandle
+/// that can be used for graceful shutdown and status checks.
 ///
 /// Args:
 ///     config: Server configuration
 ///     authorized_users_path: Optional path to authorized_users.toml
 ///
 /// Returns:
-///     The internal authentication token as a string.
+///     A ServerHandle object with the internal token and shutdown capability.
 #[pyfunction]
 #[pyo3(signature = (config, authorized_users_path = None))]
 fn start_server(
     py: Python<'_>,
     config: ServerConfig,
     authorized_users_path: Option<String>,
-) -> PyResult<String> {
+) -> PyResult<ServerHandle> {
     // Allow other Python threads to run while we block
     py.allow_threads(|| {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?;
+        let rt = Arc::new(tokio::runtime::Runtime::new()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?);
 
-        rt.block_on(async {
+        let internal_token = rt.block_on(async {
             let authorized_users = match authorized_users_path {
                 Some(path) => AuthorizedUsers::load(&PathBuf::from(path)).map_err(|e| {
                     PyRuntimeError::new_err(format!("Failed to load authorized users: {}", e))
@@ -116,8 +165,10 @@ fn start_server(
             let engine_config: EngineConfig = config.into();
 
             // Spawn the server in a background task
-            let server_handle = tokio::spawn(async move {
-                engine::run_server(engine_config, authorized_users, ready_tx, shutdown_rx).await
+            tokio::spawn(async move {
+                if let Err(e) = engine::run_server(engine_config, authorized_users, ready_tx, shutdown_rx).await {
+                    eprintln!("[PIE] Server error: {}", e);
+                }
             });
 
             // Wait for server to be ready and get the internal auth token
@@ -125,13 +176,20 @@ fn start_server(
                 PyRuntimeError::new_err(format!("Server failed to start: {}", e))
             })?;
 
-            // Store handles for later cleanup (in a real implementation, you'd want
-            // to return these or store them in a manager object)
-            // For now, we'll let the server run and return the token
-            std::mem::forget(shutdown_tx);
-            std::mem::forget(server_handle);
+            Ok::<(String, oneshot::Sender<()>), PyErr>((internal_token, shutdown_tx))
+        })?;
 
-            Ok(internal_token)
+        let (token, shutdown_tx) = internal_token;
+
+        // Keep the runtime alive by leaking it (it will be cleaned up when the handle is dropped)
+        // We use Arc to share the runtime
+        let runtime_clone = Arc::clone(&rt);
+        std::mem::forget(rt);
+
+        Ok(ServerHandle {
+            internal_token: token,
+            shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+            runtime: runtime_clone,
         })
     })
 }
@@ -140,6 +198,7 @@ fn start_server(
 #[pymodule(name = "pie_server_rs")]
 pub fn pie_server_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ServerConfig>()?;
+    m.add_class::<ServerHandle>()?;
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     Ok(())
 }

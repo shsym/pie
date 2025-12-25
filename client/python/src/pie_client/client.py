@@ -3,10 +3,7 @@ import base64
 import msgpack
 import websockets
 import blake3
-import subprocess
-import tempfile
-from pathlib import Path
-import uuid
+
 from enum import Enum
 from dataclasses import dataclass
 
@@ -535,47 +532,3 @@ class PieClient:
         if not successful:
             raise Exception(f"Failed to terminate instance: {result}")
 
-
-def _compile_rust_sync(rust_code: str, cargo_toml_content: str, package_name: str) -> bytes:
-    """[Internal Synchronous Helper] Compiles rust code in a temporary directory."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        project_path = Path(temp_dir)
-        (project_path / "src").mkdir()
-        (project_path / "Cargo.toml").write_text(cargo_toml_content)
-        (project_path / "src" / "lib.rs").write_text(rust_code)
-        command = ["cargo", "build", "--target", "wasm32-wasip2", "--release"]
-        try:
-            print(f"🚀 Compiling crate '{package_name}'...")
-            subprocess.run(command, cwd=project_path, check=True, capture_output=True, text=True)
-        except FileNotFoundError:
-            raise RuntimeError("Error: `cargo` not found. Is Rust installed? Try: `rustup target add wasm32-wasip2`")
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"❌ Rust compilation failed.\n--- COMPILER OUTPUT ---\n{e.stderr}")
-        wasm_file_name = f"{package_name.replace('-', '_')}.wasm"
-        wasm_path = project_path / "target" / "wasm32-wasip2" / "release" / wasm_file_name
-        if not wasm_path.exists():
-            raise RuntimeError(f"Build succeeded but could not find WASM file at {wasm_path}")
-        print("✅ Compilation successful! Reading WASM binary.")
-        return wasm_path.read_bytes()
-
-
-async def compile_program(source: str | Path, dependencies: list[str]) -> bytes:
-    """Compiles Rust source into a WASM binary and returns the bytes."""
-    if isinstance(source, Path) or (isinstance(source, str) and source.endswith('.rs')):
-        rust_code = Path(source).read_text()
-    else:
-        rust_code = source
-    package_name = f"pie-temp-crate-{uuid.uuid4().hex[:8]}"
-    deps_str = "\n".join(dependencies)
-    cargo_toml_content = f"""
-[package]
-name = "{package_name}"
-version = "0.1.0"
-edition = "2021"
-[lib]
-crate-type = ["cdylib"]
-[dependencies]
-{deps_str}
-"""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _compile_rust_sync, rust_code, cargo_toml_content, package_name)

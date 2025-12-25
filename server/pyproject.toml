@@ -12,6 +12,7 @@ dependencies = [
     "httpx>=0.27",
     "toml>=0.10",
     "rich>=13.0",
+    "pie-client",
 ]
 
 [project.optional-dependencies]

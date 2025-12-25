@@ -91,7 +91,6 @@ def serve(
         raise
 
     # Import here to avoid circular imports and allow module to load without Rust
-    from . import pie_server_rs
     from . import manager
 
     if interactive:
@@ -99,18 +98,20 @@ def serve(
     else:
         typer.echo("🚀 Starting Pie engine...")
 
+    server_handle = None
+    backend_processes = []
+    
     try:
         # Start engine and backends
-        internal_token, backend_processes = manager.start_engine_and_backend(
+        server_handle, backend_processes = manager.start_engine_and_backend(
             engine_config, backend_configs
         )
-        typer.echo("✅ Engine started.")
 
         if interactive:
             typer.echo(
                 "Entering interactive session. Type 'help' for commands or use ↑/↓ for history."
             )
-            manager.run_interactive_shell(engine_config, internal_token)
+            manager.run_interactive_shell(engine_config, server_handle.internal_token)
         else:
             typer.echo("Press Ctrl+C to stop.")
             import signal
@@ -122,11 +123,15 @@ def serve(
 
         # Cleanup
         typer.echo()
-        manager.terminate_engine_and_backend(backend_processes)
+        manager.terminate_engine_and_backend(server_handle, backend_processes)
         typer.echo("✅ Shutdown complete.")
 
     except KeyboardInterrupt:
-        typer.echo("\n✅ Shutdown complete.")
+        typer.echo()
+        manager.terminate_engine_and_backend(server_handle, backend_processes)
+        typer.echo("✅ Shutdown complete.")
     except Exception as e:
         typer.echo(f"❌ Error: {e}", err=True)
+        manager.terminate_engine_and_backend(server_handle, backend_processes)
         raise typer.Exit(1)
+
