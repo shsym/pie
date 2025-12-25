@@ -23,5 +23,6 @@ dependencies = [
 Homepage = "https://github.com/pie-project/pie"
 
 [tool.setuptools]
-packages = ["pie"]
+package-dir = {"" = "src"}
+packages = ["pie_client"]
 license-files = []
