@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "pie-server"
 version = "0.1.0"
-description = "Pie Inference Engine Server CLI"
+description = "Pie CLI"
 requires-python = ">=3.10"
 
 # Base dependencies (without backend GPU-specific packages)

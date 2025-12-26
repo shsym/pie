@@ -49,7 +49,7 @@ pie serve -i
 # pie> run ./my_inferlet.wasm -- --prompt "Hello!"
 ```
 
-See [server/README.md](server/README.md) for full CLI documentation.
+See [control/README.md](control/README.md) for full CLI documentation.
 
 ---
 
@@ -57,10 +57,10 @@ See [server/README.md](server/README.md) for full CLI documentation.
 
 #### Prerequisites
 
-- **Install Pie Server:**
+- **Install Pie Control:**
   
   ```bash
-  cd server
+  cd control
   pip install -e ".[cuda]"   # or [metal] for macOS
   ```
   
@@ -160,7 +160,7 @@ cd sdk/inferlet-examples && cargo build --target wasm32-wasip2 --release
 | `pie model` | Manage models |
 | `pie auth` | Manage authenticated users |
 
-For detailed usage, see [server/README.md](server/README.md).
+For detailed usage, see [control/README.md](control/README.md).
 
 ---
 
@@ -168,7 +168,7 @@ For detailed usage, see [server/README.md](server/README.md).
 
 ```
 pie/
-├── server/          # Pie Server CLI (Python + Rust bindings)
+├── control/         # Pie Control CLI (Python + Rust bindings)
 ├── runtime/         # Core engine (Rust)
 ├── client/          # Client libraries (Rust CLI, Python)
 ├── engine/          # Backend implementations

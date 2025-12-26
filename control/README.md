@@ -1,6 +1,6 @@
-# Pie Server
+# Pie Control
 
-The **Pie Server** (`pie`) is the main CLI for the Pie Inference Engine. It provides commands to manage the engine, models, configuration, and run inferlets.
+The **Pie Control** (`pie`) is the main CLI for the Pie Inference Engine. It provides commands to manage the engine, models, configuration, and run inferlets.
 
 ## Installation
 
@@ -20,7 +20,7 @@ pip install pie-server
 ### From Source
 
 ```bash
-cd server
+cd control
 pip install -e ".[cuda]"   # or [metal]
 ```
 
@@ -331,7 +331,7 @@ activation_dtype = "bfloat16"
 ### Run Tests
 
 ```bash
-cd server
+cd control
 pip install -e ".[test]"
 pytest tests/ -v
 ```
@@ -339,7 +339,7 @@ pytest tests/ -v
 ### Build from Source
 
 ```bash
-cd server
+cd control
 maturin develop  # Debug build
 maturin develop --release  # Release build
 ```
