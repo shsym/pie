@@ -1,4 +1,4 @@
-"""Tests for pie_server.model module."""
+"""Tests for pie_cli.model module."""
 
 import os
 import json
@@ -9,7 +9,7 @@ import pytest
 import toml
 from typer.testing import CliRunner
 
-from pie_server.cli import app
+from pie_cli.cli import app
 
 runner = CliRunner()
 

@@ -1,3 +1,3 @@
-"""pytest configuration for pie_server tests."""
+"""pytest configuration for pie_cli tests."""
 
 import pytest

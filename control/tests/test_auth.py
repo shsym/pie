@@ -1,4 +1,4 @@
-"""Tests for pie_server.auth module."""
+"""Tests for pie_cli.auth module."""
 
 import os
 from pathlib import Path
@@ -8,7 +8,7 @@ import pytest
 import toml
 from typer.testing import CliRunner
 
-from pie_server.cli import app
+from pie_cli.cli import app
 
 runner = CliRunner()
 

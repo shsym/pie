@@ -1,4 +1,4 @@
-"""Tests for pie_server CLI main commands."""
+"""Tests for pie_cli CLI main commands."""
 
 import os
 from pathlib import Path
@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 from typer.testing import CliRunner
 
-from pie_server.cli import app
+from pie_cli.cli import app
 
 runner = CliRunner()
 

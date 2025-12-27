@@ -1,4 +1,4 @@
-"""Tests for pie_server.path module."""
+"""Tests for pie_cli.path module."""
 
 import os
 from pathlib import Path
@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from pie_server import path as pie_path
+from pie_cli import path as pie_path
 
 
 class TestGetPieHome:

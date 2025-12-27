@@ -1,1 +1,1 @@
-"""Tests for pie_server package."""
+"""Tests for pie_cli package."""

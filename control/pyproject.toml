@@ -21,15 +21,11 @@ dependencies = [
 [project.optional-dependencies]
 # CUDA backend (default for NVIDIA GPUs)
 cuda = [
-    "flashinfer-python>=0.3.1",
-    "fbgemm-gpu-genai>=1.4.2",
+    "pie-backend[cuda]",
 ]
 # Metal backend (for Apple Silicon)
 metal = [
-    "pyobjc-core>=10.0,<11.0",
-    "pyobjc-framework-Metal>=10.0,<11.0",
-    "pyobjc-framework-MetalKit>=10.0,<11.0",
-    "pyobjc-framework-Cocoa>=10.0,<11.0",
+    "pie-backend[metal]",
 ]
 # Development/testing
 test = [
@@ -41,10 +37,10 @@ default = [
 ]
 
 [project.scripts]
-pie = "pie_server.cli:app"
+pie = "pie_cli.cli:app"
 
 [tool.maturin]
 python-source = "src"
-module-name = "pie_server.pie_server_rs"
+module-name = "pie_cli.pie_cli_rs"
 manifest-path = "../runtime/Cargo.toml"
 features = ["pyo3/extension-module"]

@@ -17,14 +17,14 @@ import typer
 from . import path as pie_path
 
 if TYPE_CHECKING:
-    from . import pie_server_rs
+    from . import pie_cli_rs
 
 
 def start_engine_and_backend(
     engine_config: dict,
     backend_configs: list[dict],
     timeout: float = 60.0,
-) -> tuple["pie_server_rs.ServerHandle", list[subprocess.Popen]]:
+) -> tuple["pie_cli_rs.ServerHandle", list[subprocess.Popen]]:
     """Start the Pie engine and all configured backend services.
 
     Args:
@@ -35,7 +35,7 @@ def start_engine_and_backend(
     Returns:
         Tuple of (ServerHandle, list of backend processes)
     """
-    from . import pie_server_rs
+    from . import pie_cli_rs
 
     # Load authorized users if auth is enabled
     authorized_users_path = None
@@ -45,7 +45,7 @@ def start_engine_and_backend(
             authorized_users_path = str(auth_path)
 
     # Create server config
-    server_config = pie_server_rs.ServerConfig(
+    server_config = pie_cli_rs.ServerConfig(
         host=engine_config.get("host", "127.0.0.1"),
         port=engine_config.get("port", 8080),
         enable_auth=engine_config.get("enable_auth", True),
@@ -55,7 +55,7 @@ def start_engine_and_backend(
     )
 
     # Start the engine - returns a ServerHandle
-    server_handle = pie_server_rs.start_server(server_config, authorized_users_path)
+    server_handle = pie_cli_rs.start_server(server_config, authorized_users_path)
     typer.echo(f"✅ Engine started (token: {server_handle.internal_token[:8]}...)")
 
     # Count expected backends
@@ -210,7 +210,7 @@ def _run_backend_process(**kwargs):
 
 
 def wait_for_backends(
-    server_handle: "pie_server_rs.ServerHandle",
+    server_handle: "pie_cli_rs.ServerHandle",
     expected_count: int,
     timeout: float,
     backend_processes: list[subprocess.Popen],
@@ -251,7 +251,7 @@ def wait_for_backends(
 
 
 def terminate_engine_and_backend(
-    server_handle: "pie_server_rs.ServerHandle | None",
+    server_handle: "pie_cli_rs.ServerHandle | None",
     backend_processes: list[subprocess.Popen],
 ) -> None:
     """Terminate the engine and backend processes.
