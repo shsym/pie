@@ -10,17 +10,17 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 
 pub fn get_pie_home() -> Result<PathBuf> {
-    if let Ok(path) = env::var("PIE_CLI_HOME") {
+    if let Ok(path) = env::var("PIE_HOME") {
         Ok(PathBuf::from(path))
     } else {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("Failed to find home directory"))?;
-        Ok(home.join(".pie_cli"))
+        Ok(home.join(".pie"))
     }
 }
 
 pub fn get_default_config_path() -> Result<PathBuf> {
     let pie_home = get_pie_home()?;
-    let config_path = pie_home.join("config.toml");
+    let config_path = pie_home.join("cli_config.toml");
     Ok(config_path)
 }
 

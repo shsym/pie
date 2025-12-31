@@ -192,7 +192,7 @@ configure_client() {
     local username=$(whoami)
 
     # Initialize config (will prompt if exists, so check first)
-    if [ ! -f ~/.pie_cli/config.toml ]; then
+    if [ ! -f ~/.pie/cli_config.toml ]; then
         echo "Creating new pie-cli config..."
         pie-cli config init --enable-auth true
     else

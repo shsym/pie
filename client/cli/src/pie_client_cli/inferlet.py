@@ -167,7 +167,7 @@ def info(
 
 @inferlet_app.command("publish")
 def publish(
-    directory: Annotated[Path, typer.Argument(help="Directory containing pie.toml manifest.")] = Path("."),
+    directory: Annotated[Path, typer.Argument(help="Directory containing Pie.toml manifest.")] = Path("."),
 ) -> None:
     """Publish the inferlet in the specified directory.
     
@@ -176,17 +176,17 @@ def publish(
     """
     directory = directory.expanduser().resolve()
     
-    # Check for pie.toml
-    manifest_path = directory / "pie.toml"
+    # Check for Pie.toml
+    manifest_path = directory / "Pie.toml"
     if not manifest_path.exists():
-        typer.echo(f"❌ No pie.toml found in {directory}", err=True)
+        typer.echo(f"❌ No Pie.toml found in {directory}", err=True)
         raise typer.Exit(1)
     
     # Load the manifest
     try:
         manifest = toml.load(manifest_path)
     except toml.TomlDecodeError as e:
-        typer.echo(f"❌ Failed to parse pie.toml: {e}", err=True)
+        typer.echo(f"❌ Failed to parse Pie.toml: {e}", err=True)
         raise typer.Exit(1)
     
     # Extract package info
@@ -196,11 +196,11 @@ def publish(
     description = package.get("description")
     
     if not full_name:
-        typer.echo("❌ Missing 'package.name' in pie.toml", err=True)
+        typer.echo("❌ Missing 'package.name' in Pie.toml", err=True)
         raise typer.Exit(1)
     
     if not version:
-        typer.echo("❌ Missing 'package.version' in pie.toml", err=True)
+        typer.echo("❌ Missing 'package.version' in Pie.toml", err=True)
         raise typer.Exit(1)
     
     # Parse namespace/name
@@ -218,7 +218,7 @@ def publish(
     wasm_path = directory / f"{name}.wasm"
     if not wasm_path.exists():
         # Try common alternatives
-        for pattern in ["*.wasm", "dist/*.wasm", "target/*.wasm"]:
+        for pattern in ["*.wasm", "target/wasm32-wasip2/release/*.wasm", "target/*.wasm"]:
             matches = list(directory.glob(pattern))
             if matches:
                 wasm_path = matches[0]
