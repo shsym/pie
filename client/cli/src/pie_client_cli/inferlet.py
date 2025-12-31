@@ -118,22 +118,43 @@ def info(
             typer.echo()
             typer.echo(f"   Downloads: {_format_downloads(detail.downloads)}")
             typer.echo(f"   Created: {detail.created_at.strftime('%Y-%m-%d')}")
-            typer.echo()
             
             if detail.versions:
+                latest = detail.versions[0]
+                
+                # Show description
+                if latest.description:
+                    typer.echo()
+                    typer.echo(f"   {latest.description}")
+                
+                # Show authors
+                if latest.authors:
+                    typer.echo()
+                    typer.echo("   Authors:")
+                    for author in latest.authors:
+                        typer.echo(f"      • {author}")
+                
+                # Show repository
+                if latest.repository:
+                    typer.echo()
+                    typer.echo(f"   Repository: {latest.repository}")
+                
+                # Show keywords
+                if latest.keywords:
+                    typer.echo()
+                    typer.echo(f"   Keywords: {', '.join(latest.keywords)}")
+                
+                typer.echo()
                 typer.echo("   Versions:")
                 for v in detail.versions[:10]:  # Show latest 10
                     yanked = " (yanked)" if v.yanked else ""
                     size = _format_size(v.size_bytes)
                     typer.echo(f"      {v.num:<12} {size:<10}{yanked}")
-                    if v.description:
-                        typer.echo(f"                     {v.description[:50]}")
                 
                 if len(detail.versions) > 10:
                     typer.echo(f"      ... and {len(detail.versions) - 10} more")
                 
-                # Show interface spec of latest version
-                latest = detail.versions[0]
+                # Show interface spec
                 if latest.interface_spec:
                     typer.echo()
                     typer.echo("   Interface:")
@@ -142,18 +163,37 @@ def info(
                         for inp in latest.interface_spec["inputs"]:
                             inp_name = inp.get("name", "?")
                             inp_type = inp.get("type", "?")
-                            typer.echo(f"         - {inp_name}: {inp_type}")
+                            optional = " (optional)" if inp.get("optional") else ""
+                            desc = inp.get("description", "")
+                            typer.echo(f"         • {inp_name}: {inp_type}{optional}")
+                            if desc:
+                                typer.echo(f"           {desc[:60]}{'...' if len(desc) > 60 else ''}")
                     if "outputs" in latest.interface_spec:
                         typer.echo("      Outputs:")
                         for out in latest.interface_spec["outputs"]:
                             out_name = out.get("name", "?")
                             out_type = out.get("type", "?")
-                            typer.echo(f"         - {out_name}: {out_type}")
+                            desc = out.get("description", "")
+                            typer.echo(f"         • {out_name}: {out_type}")
+                            if desc:
+                                typer.echo(f"           {desc[:60]}{'...' if len(desc) > 60 else ''}")
                 
                 if latest.requires_engine:
                     typer.echo()
                     typer.echo(f"   Requires engine: {latest.requires_engine}")
+                
+                # Show README preview
+                if latest.readme:
+                    typer.echo()
+                    typer.echo("   README:")
+                    # Show first 5 non-empty lines
+                    lines = [l for l in latest.readme.split('\n') if l.strip()][:5]
+                    for line in lines:
+                        typer.echo(f"      {line[:70]}{'...' if len(line) > 70 else ''}")
+                    if len([l for l in latest.readme.split('\n') if l.strip()]) > 5:
+                        typer.echo("      ...")
             else:
+                typer.echo()
                 typer.echo("   No versions published yet")
                 
     except RegistryError as e:
@@ -202,6 +242,23 @@ def publish(
     if not version:
         typer.echo("❌ Missing 'package.version' in Pie.toml", err=True)
         raise typer.Exit(1)
+    
+    # Extract extra metadata
+    authors = package.get("authors")
+    repository = package.get("repository")
+    keywords = package.get("keywords")
+    
+    readme_filename = package.get("readme")
+    readme_content = None
+    if readme_filename:
+        readme_path = directory / readme_filename
+        if readme_path.exists():
+            try:
+                readme_content = readme_path.read_text(encoding="utf-8")
+            except Exception as e:
+                typer.echo(f"⚠️ Failed to read README file '{readme_filename}': {e}", err=True)
+        else:
+            typer.echo(f"⚠️ README file '{readme_filename}' specified in Pie.toml but not found", err=True)
     
     # Parse namespace/name
     namespace, name = resolve_name(full_name)
@@ -274,6 +331,10 @@ def publish(
                 description=description,
                 requires_engine=requires_engine,
                 interface_spec=interface_spec,
+                authors=authors,
+                keywords=keywords,
+                repository=repository,
+                readme=readme_content,
             )
             start_resp = client.start_publish(start_req)
             
@@ -286,6 +347,15 @@ def publish(
                 name=name,
                 version=version,
                 storage_path=start_resp.storage_path,
+                checksum=checksum,
+                size_bytes=size_bytes,
+                description=description,
+                requires_engine=requires_engine,
+                interface_spec=interface_spec,
+                authors=authors,
+                keywords=keywords,
+                repository=repository,
+                readme=readme_content,
             )
             commit_resp = client.commit_publish(commit_req)
             
