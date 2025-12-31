@@ -13,7 +13,9 @@ from . import attach as attach_cmd
 from . import build as build_cmd
 from . import config as config_cmd
 from . import create as create_cmd
+from . import inferlet as inferlet_cmd
 from . import list as list_cmd
+from . import login as login_cmd
 from . import ping as ping_cmd
 from . import submit as submit_cmd
 
@@ -27,6 +29,9 @@ app = typer.Typer(
 # Config subcommand group
 config_app = typer.Typer(help="Manage configuration.")
 app.add_typer(config_app, name="config")
+
+# Inferlet subcommand group (from registry)
+app.add_typer(inferlet_cmd.inferlet_app, name="inferlet")
 
 
 # ============================================================================
@@ -68,6 +73,20 @@ PrivateKeyPathOption = Annotated[
     Optional[Path],
     typer.Option("--private-key-path", help="Path to the private key file for authentication."),
 ]
+
+
+# ============================================================================
+# Login command (Registry authentication)
+# ============================================================================
+
+@app.command()
+def login() -> None:
+    """Authenticate with the Pie Registry using GitHub OAuth."""
+    try:
+        login_cmd.handle_login_command()
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
 
 
 # ============================================================================
