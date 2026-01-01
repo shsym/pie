@@ -16,6 +16,7 @@ import time
 from typing import TYPE_CHECKING
 
 import numpy as np
+from . import utils
 import torch
 import torch.distributed as dist
 
@@ -126,6 +127,7 @@ class Runtime:
                 # Create model config
                 self.model_config = qwen3.ModelConfig.from_dict(normalized_arch)
                 
+                # Create forward pass with weights
                 # Create forward pass with weights
                 self.engine = qwen3.ForwardPass(
                     self.model_config,
@@ -428,32 +430,26 @@ class Runtime:
         
         while True:
             # Wait for inputs
-            print(f"Worker {self.config.rank}: waiting for broadcast...")
-            objects = [None, None]
-            dist.broadcast_object_list(objects, src=0)
-            print(f"Worker {self.config.rank}: received broadcast")
-            inputs, sampling_metadata = objects
+            #print(f"Worker {self.config.rank}: waiting for broadcast...")
             
+            # Use optimized broadcast structure (metadata on CPU, tensors on GPU)
+            inputs = utils.broadcast_struct(None, src=0, device=device)
             if inputs == "STOP":
                 break
                 
+            # If we didn't receive "STOP", we expect the sampling metadata next
+            sampling_metadata = utils.broadcast_struct(None, src=0, device=device)
+            
             if inputs is None:
                 continue
 
-            # Move inputs to device
-            inputs = {
-                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                for k, v in inputs.items()
-            }
-            sampling_metadata = {
-                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                for k, v in sampling_metadata.items()
-            }
+            # No need to move to device manually as broadcast_struct handles it
+            # inputs and sampling_metadata have their tensors on device already
             
             # Execute step
             self._run_step(inputs, sampling_metadata)
             
-        print(f"Worker {self.config.rank} finished")
+        #print(f"Worker {self.config.rank} finished")
 
     def _run_step(self, inputs: dict, sampling_metadata: dict) -> list:
         """
@@ -511,18 +507,11 @@ class Runtime:
 
         # Broadcast if needed
         if self.config.world_size > 1:
-            print(f"Rank 0: Broadcasting inputs to workers...")
-            # Move to CPU for safe pickling/broadcasting
-            cpu_inputs = {
-                k: (v.cpu() if isinstance(v, torch.Tensor) else v)
-                for k, v in inputs.items()
-            }
-            cpu_sampling_metadata = {
-                k: (v.cpu() if isinstance(v, torch.Tensor) else v) 
-                for k, v in sampling_metadata.items()
-            }
-            dist.broadcast_object_list([cpu_inputs, cpu_sampling_metadata], src=0)
-            print(f"Rank 0: Broadcast complete")
+            #print(f"Rank 0: Broadcasting inputs to workers...")
+            # Use optimized broadcast (no CPU roundtrip for tensors)
+            utils.broadcast_struct(inputs, src=0, device=device)
+            utils.broadcast_struct(sampling_metadata, src=0, device=device)
+            #print(f"Rank 0: Broadcast complete")
 
         # Execute step
         sampling_results = self._run_step(inputs, sampling_metadata)
@@ -532,4 +521,13 @@ class Runtime:
 
         return responses
 
+    def shutdown(self):
+        """
+        Cleanup runtime resources.
+        
+        For Rank 0 in multi-GPU setup, this broadcasts the 'STOP' signal to workers.
+        """
+        if self.config.world_size > 1 and self.config.rank == 0:
+            print("Broadcasting STOP signal to workers...")
+            utils.broadcast_struct("STOP", src=0, device=self.config.device)
 

@@ -133,9 +133,14 @@ class Source:
         return source
     
     def shard(self, strategy: str) -> Source:
-        """Set sharding strategy: 'column' or 'row'."""
-        if strategy not in ('column', 'row'):
-            raise ValueError(f"Invalid sharding strategy: {strategy}. Use 'column' or 'row'.")
+        """
+        Set sharding strategy: 'column', 'row', or 'interleaved_column'.
+        
+        'interleaved_column': Shards input tensors individually along dim 0 BEFORE fusion.
+                              Useful for fused weights like QKV where head alignment matters.
+        """
+        if strategy not in ('column', 'row', 'interleaved_column'):
+            raise ValueError(f"Invalid sharding strategy: {strategy}. Use 'column', 'row', or 'interleaved_column'.")
         self._sharding = strategy
         return self
     
@@ -364,8 +369,27 @@ class Schema:
                 tensor = result[output_type]
             else:
                 tensor = result
+        # Apply interleaved sharding BEFORE fusion (if requested)
+        # This is CRITICAL for fused QKV weights where naive chunking breaks head alignment
+        if config.world_size > 1 and source.sharding == 'interleaved_column':
+            # Shard each source source tensor individually along dim=0 (Column Parallel)
+            sharded_tensors = []
+            # print(f"DEBUG: Interleaved sharding for {physical_names}", flush=True)
+            for i, t in enumerate(tensors):
+                if t.shape[0] % config.world_size != 0:
+                     raise ValueError(
+                        f"Cannot interleaved-shard tensor {t.shape}: dim 0 not divisible by world_size={config.world_size}"
+                    )
+                # Ensure we have a clean copy in memory (avoid ztensor/mmap issues with views)
+                t_clone = t.clone()
+                chunk = torch.chunk(t_clone, config.world_size, dim=0)[config.rank]
+                # Check chunk validity
+                # print(f"  Shard {i}: {t.shape} -> {chunk.shape}", flush=True)
+                sharded_tensors.append(chunk)
+            tensors = sharded_tensors
+
         # Fuse if needed (concatenation)
-        elif source.is_fused:
+        if source.is_fused:
             tensor = torch.cat(tensors, dim=source.fuse_dim)
         # Gathered but no transform - just take first tensor (unusual case)
         elif source.is_gathered:
@@ -381,7 +405,8 @@ class Schema:
             tensor = tensor.to(source._dtype)
         
         # Apply sharding (only if world_size > 1)
-        if config.world_size > 1 and source.sharding is not None:
+        # interleaved_column is handled above, so we skip it here
+        if config.world_size > 1 and source.sharding is not None and source.sharding != 'interleaved_column':
             dim = 1 if source.sharding == 'row' else 0
             
             # Validate dimension is divisible by world_size

@@ -4,6 +4,8 @@ import sys
 import traceback
 from pathlib import Path
 import psutil
+from typing import Any
+
 
 import torch
 
@@ -97,3 +99,81 @@ def get_available_memory(devices: list[torch.device], rank: int = 0) -> int:
         total_free_bytes = int(tensor.item())
 
     return total_free_bytes
+
+
+def broadcast_struct(data: Any, src: int = 0, device: torch.device | None = None) -> Any:
+    """
+    Broadcast a structure of data with embedded tensors efficiently.
+    
+    Metadata is broadcast via CPU (pickled), Tensors via GPU (NCCL).
+    """
+    import torch.distributed as dist
+    
+    rank = dist.get_rank()
+    tensors = []
+    
+    def separate(obj):
+        if isinstance(obj, torch.Tensor):
+            tensors.append(obj)
+            return {"__TENSOR__": len(tensors) - 1, "shape": obj.shape, "dtype": obj.dtype}
+        elif isinstance(obj, dict):
+            return {k: separate(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [separate(v) for v in obj]
+        elif isinstance(obj, tuple):
+            return tuple(separate(v) for v in obj)
+        else:
+            return obj
+
+    # 1. Prepare metadata on source
+    metadata = None
+    if rank == src:
+        metadata = separate(data)
+    
+    # 2. Broadcast metadata
+    meta_list = [metadata]
+    dist.broadcast_object_list(meta_list, src=src, device=device)
+    metadata = meta_list[0]
+    
+    # 3. Prepare tensors for broadcast
+    if rank != src:
+        # Receiver: traverse metadata to find tensors and allocate buffers
+        tensor_specs = {} # index -> (shape, dtype)
+        
+        def find_specs(obj):
+            if isinstance(obj, dict) and "__TENSOR__" in obj:
+                tensor_specs[obj["__TENSOR__"]] = (obj["shape"], obj["dtype"])
+            elif isinstance(obj, dict):
+                for v in obj.values(): find_specs(v)
+            elif isinstance(obj, list):
+                for v in obj: find_specs(v)
+            elif isinstance(obj, tuple):
+                for v in obj: find_specs(v)
+        
+        find_specs(metadata)
+        
+        # Allocate empty tensors
+        tensors = [None] * len(tensor_specs)
+        for idx, (shape, dtype) in tensor_specs.items():
+            tensors[idx] = torch.empty(shape, dtype=dtype, device=device)
+            
+    # 4. Broadcast tensors (contiguous for safety)
+    for t in tensors:
+        if rank == src:
+            t = t.contiguous()
+        dist.broadcast(t, src=src)
+        
+    # 5. Reconstruct
+    def reconstruct(obj):
+        if isinstance(obj, dict) and "__TENSOR__" in obj:
+            return tensors[obj["__TENSOR__"]]
+        elif isinstance(obj, dict):
+            return {k: reconstruct(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [reconstruct(v) for v in obj]
+        elif isinstance(obj, tuple):
+            return tuple(reconstruct(v) for v in obj)
+        else:
+            return obj
+            
+    return reconstruct(metadata)

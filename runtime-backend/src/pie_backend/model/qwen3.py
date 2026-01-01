@@ -58,7 +58,8 @@ QWEN3_SCHEMA = (
         "layers.*.k_norm",
         Source("model.layers.*.self_attn.k_norm.weight"),
     )
-    # Fused QKV projection weight (column-parallel, quantized) - no bias in Qwen3
+    # Fused QKV projection weight: fused from [Q, K, V] and sharded INTERLEAVED
+    # This ensures correct head alignment for GQA (Q >> K, V)
     .define(
         "layers.*.proj_qkv",
         Source.fuse(
@@ -69,7 +70,7 @@ QWEN3_SCHEMA = (
             ],
             dim=0,
         )
-        .shard("column")
+        .shard("interleaved_column")
         .quantize(),
     )
     # Output projection (row-parallel, quantized)
@@ -79,7 +80,7 @@ QWEN3_SCHEMA = (
         .shard("row")
         .quantize(),
     )
-    # Fused gate+up projection (column-parallel, quantized)
+    # Fused gate+up projection: fused from [Gate, Up] and sharded INTERLEAVED
     .define(
         "layers.*.proj_gate_up",
         Source.fuse(
@@ -89,7 +90,7 @@ QWEN3_SCHEMA = (
             ],
             dim=0,
         )
-        .shard("column")
+        .shard("interleaved_column")
         .quantize(),
     )
     # Down projection (row-parallel, quantized)

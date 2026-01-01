@@ -47,7 +47,7 @@ LLAMA3_SCHEMA = (
         "layers.*.norm_mlp",
         Source("model.layers.*.post_attention_layernorm.weight"),
     )
-    # Fused QKV projection (column-parallel, quantized)
+    # Fused QKV projection weight: fused from [Q, K, V] and sharded INTERLEAVED
     .define(
         "layers.*.proj_qkv",
         Source.fuse(
@@ -58,7 +58,7 @@ LLAMA3_SCHEMA = (
             ],
             dim=0,
         )
-        .shard("column")
+        .shard("interleaved_column")
         .quantize(),
     )
     # Output projection (row-parallel, quantized)
@@ -68,7 +68,7 @@ LLAMA3_SCHEMA = (
         .shard("row")
         .quantize(),
     )
-    # Fused gate+up projection (column-parallel, quantized)
+    # Fused gate+up projection: fused from [Gate, Up] and sharded INTERLEAVED
     .define(
         "layers.*.proj_gate_up",
         Source.fuse(
@@ -78,7 +78,7 @@ LLAMA3_SCHEMA = (
             ],
             dim=0,
         )
-        .shard("column")
+        .shard("interleaved_column")
         .quantize(),
     )
     # Down projection (row-parallel, quantized)

@@ -45,7 +45,7 @@ QWEN2_SCHEMA = (
         "layers.*.norm_mlp",
         Source("model.layers.*.post_attention_layernorm.weight"),
     )
-    # Fused QKV projection weight (column-parallel, quantized)
+    # Fused QKV projection weight (interleaved column-parallel, quantized)
     .define(
         "layers.*.proj_qkv.weight",
         Source.fuse(
@@ -56,7 +56,7 @@ QWEN2_SCHEMA = (
             ],
             dim=0,
         )
-        .shard("column")
+        .shard("interleaved_column")
         .quantize(),
     )
     # Fused QKV projection bias (column-parallel, no quantization for bias)
@@ -79,7 +79,7 @@ QWEN2_SCHEMA = (
         .shard("row")
         .quantize(),
     )
-    # Fused gate+up projection (column-parallel, quantized)
+    # Fused gate+up projection (interleaved column-parallel, quantized)
     .define(
         "layers.*.proj_gate_up",
         Source.fuse(
@@ -89,7 +89,7 @@ QWEN2_SCHEMA = (
             ],
             dim=0,
         )
-        .shard("column")
+        .shard("interleaved_column")
         .quantize(),
     )
     # Down projection (row-parallel, quantized)

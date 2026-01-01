@@ -72,34 +72,39 @@ def start_server(
     # |  worker_thread   |---+----+
     # +------------------+
 
-    threading.Thread(
+    worker_t = threading.Thread(
         target=worker_thread,
         args=(work_request_queue, response_queue, service, shutdown_event),
         daemon=True,
-    ).start()
+    )
+    worker_t.start()
 
     # Replaces zmq_response_thread and zmq_listen_thread
-    threading.Thread(
+    io_t = threading.Thread(
         target=io_thread,
         args=(endpoint, work_request_queue, response_queue, shutdown_event),
         daemon=True,
-    ).start()
+    )
+    io_t.start()
 
-    threading.Thread(
+    reg_t = threading.Thread(
         target=register_thread,
         args=(host, port, auth_token, endpoint, shutdown_event),
         daemon=True,
-    ).start()
+    )
+    reg_t.start()
 
     # Spawn embedded test client if requested
+    test_t = None
     if run_tests:
         from .test_client import run_embedded_tests
 
-        threading.Thread(
+        test_t = threading.Thread(
             target=run_embedded_tests,
             args=(endpoint,),
             daemon=True,
-        ).start()
+        )
+        test_t.start()
 
     # Setup shutdown flag and signal handlers
     def shutdown_handler(signum, _frame):
@@ -116,7 +121,26 @@ def start_server(
     except KeyboardInterrupt:
         pass
     finally:
-        print("Server shutdown complete.")
+        print("Waiting for background threads to finish...", flush=True)
+        # 1. Stop the worker thread first so it stops processing requests/using NCCL
+        if worker_t.is_alive():
+            worker_t.join(timeout=5.0)
+            
+        # 2. Now that worker is stopped, it's safe for Rank 0 to use NCCL to stop other ranks
+        try:
+            service.shutdown()
+        except Exception as e:
+            print(f"Error during service shutdown: {e}")
+
+        # 3. Stop remaining threads
+        if io_t.is_alive():
+            io_t.join(timeout=2.0)
+        if reg_t.is_alive():
+            reg_t.join(timeout=2.0)
+        if test_t and test_t.is_alive():
+            test_t.join(timeout=2.0)
+            
+        print("Server shutdown complete.", flush=True)
 
 
 def register_thread(

@@ -80,16 +80,34 @@ def main(
     if device_list and len(device_list) > 1:
         world_size = len(device_list)
         import torch.multiprocessing as mp
+        import random
         
         # Use 'spawn' context for CUDA compatibility
         mp.set_start_method("spawn", force=True)
         
+        # Helper: signal
+        import signal
+        
+        # Remove the previous simple ignore if present, or just implement new logic
+        # We need the parent to handle SIGTERM to kill children, but children need to ignore it initially
+        # until Rank 0 tells them to stop (or parent kills them).
+        
+        # ACTUALLY, simpler approach based on plan:
+        # Parent: Catch SIGTERM -> ctx.terminate() -> join()
+        # Children: Ignore SIGTERM. Rank 0 re-enables it.
+        
+        # So in main (parent):
+        # Generate master port BEFORE spawn so all processes use same port
+        master_port = 29500 + random.randint(0, 1000)
+        
         print(f"Spawning {world_size} processes for devices: {device_list}")
-        mp.spawn(
+        
+        ctx = mp.spawn(
             init_process,
             args=(
                 world_size,
                 device_list,
+                master_port,  # Pass port to ensure all processes use same port
                 model,
                 host,
                 port,
@@ -108,8 +126,21 @@ def main(
                 test,
             ),
             nprocs=world_size,
-            join=True,
+            join=False, # We manage join manually
         )
+        
+        def sigterm_handler(signum, frame):
+            # Forward signal to children
+            # iterating ctx.processes is correct for SpawnContext
+            for p in ctx.processes:
+                if p.is_alive():
+                    p.terminate()
+            
+        signal.signal(signal.SIGTERM, sigterm_handler)
+        
+        # Wait for children
+        while not ctx.join():
+             pass
     else:
         # Single process mode (backward compatibility)
         single_device = device_list[0] if device_list else None
@@ -139,6 +170,7 @@ def init_process(
     rank: int,
     world_size: int,
     devices: list[str],
+    master_port: int,  # Port for distributed coordination (shared by all processes)
     model: str,
     host: str,
     port: int,
@@ -161,15 +193,25 @@ def init_process(
     """
     import os
     import torch.distributed as dist
+    import signal
+
+    # Ignore SIGTERM initially so we don't die when parent forwards it.
+    # Rank 0 will re-enable a handler in start_server.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
 
     # Setup distributed environment if world_size > 1
     if world_size > 1:
-        import random
         os.environ["MASTER_ADDR"] = "localhost"
-        # Use a random port in the high range to avoid conflicts
-        os.environ["MASTER_PORT"] = str(29500 + random.randint(0, 1000))
+        os.environ["MASTER_PORT"] = str(master_port)
+        
+        # CRITICAL: Set CUDA device BEFORE init_process_group so NCCL detects correct device
+        local_device = devices[rank] if devices and rank < len(devices) else f"cuda:{rank}"
+        torch.cuda.set_device(local_device)
         
         # Initialize process group
+        # Use NCCL for CUDA, GLOO for CPU
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
         # Use NCCL for CUDA, GLOO for CPU
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(backend, rank=rank, world_size=world_size)
@@ -201,12 +243,19 @@ def init_process(
     if rank == 0:
         config.print()
 
+    print(f"[TRACE rank={rank}] Config devices={config.devices}, my device={config.device}")
+
     # Initialize Runtime
     service = Runtime(config)
 
     if rank == 0:
         # Rank 0 runs the server
+        print(f"Starting server for model {model} on {config.device}...")
         start_server(host=host, port=port, auth_token=internal_auth_token, service=service, run_tests=test)
+        
+        # Shutdown workers
+        # Handled inside start_server -> service.shutdown()
+        
     else:
         # Workers run the worker loop
         service.worker_loop()
