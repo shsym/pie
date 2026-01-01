@@ -164,8 +164,10 @@ def init_process(
 
     # Setup distributed environment if world_size > 1
     if world_size > 1:
+        import random
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(port + 100) # Use a different port for coordination
+        # Use a random port in the high range to avoid conflicts
+        os.environ["MASTER_PORT"] = str(29500 + random.randint(0, 1000))
         
         # Initialize process group
         # Use NCCL for CUDA, GLOO for CPU

@@ -201,24 +201,30 @@ class ForwardPass:
             workspace_buffer, "NHD"
         )
 
-    def embed_inputs(self, batch_metadata: dict[str, Any]) -> torch.Tensor:
+    def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Embed token IDs with Tensor Parallel support (Column Parallel).
+        
+        The embedding weight is column-sharded: [vocab_size, hidden_size/world_size]
+        Each rank computes partial hidden states, then all_gather combines them.
         """
-        Embed input tokens into hidden states.
+        world_size = self.runtime_config.world_size
         
-        Args:
-            batch_metadata: Metadata dictionary from the batch builder/packager.
-            
-        Returns:
-            Tensor of input embeddings.
-        """
-        device = self.runtime_config.device
+        if world_size == 1:
+            return fun.embedding(token_ids, self.weights.get("embed_token"))
+
+        # Column-parallel embedding: each rank has [vocab_size, hidden_size/world_size]
+        # 1. Lookup - each rank gets partial hidden states [seq_len, hidden_size/world_size]
+        local_embeds = fun.embedding(token_ids, self.weights.get("embed_token"))
         
-        # Extract token IDs from metadata
-        token_ids_tensor = torch.as_tensor(
-            batch_metadata["token_ids"], device=device, dtype=torch.int32
-        )
+        # 2. All-gather to combine partial hidden states from all ranks
+        # Output: [seq_len, hidden_size] (full hidden dimension)
+        gathered_list = [torch.empty_like(local_embeds) for _ in range(world_size)]
+        dist.all_gather(gathered_list, local_embeds)
         
-        return self.embed_tokens(token_ids_tensor)
+        # Concatenate along hidden dimension (last dim)
+        full_embeds = torch.cat(gathered_list, dim=-1)
+        
+        return full_embeds
 
     def sample(
         self,
@@ -246,12 +252,40 @@ class ForwardPass:
             dtype=self.runtime_config.activation_dtype,
         )
 
-    def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Embed token IDs into hidden states."""
-        return fun.embedding(token_ids, self.weights.get("embed_token"))
+    def embed_inputs(self, batch_metadata: dict[str, Any]) -> torch.Tensor:
+        """
+        Embed input tokens into hidden states.
+        
+        Args:
+            batch_metadata: Metadata dictionary from the batch builder/packager.
+            
+        Returns:
+            Tensor of input embeddings.
+        """
+        device = self.runtime_config.device
+        
+        # Extract token IDs from metadata
+        token_ids_tensor = torch.as_tensor(
+            batch_metadata["token_ids"], device=device, dtype=torch.int32
+        )
+        
+        return self.embed_tokens(token_ids_tensor)
 
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project hidden states to vocabulary logits (weight-tied with embed_tokens)."""
+        """Project hidden states to vocabulary logits (weight-tied with embed_tokens).
+        
+        The embedding weight is column-sharded: [vocab_size, hidden_size/world_size]
+        For lm_head (linear projection), this is effectively [hidden_size/world_size, vocab_size]
+        when transposed.
+        
+        Column-parallel lm_head:
+        1. Split input hidden_states along hidden dimension
+        2. Each rank computes partial logits with its weight shard
+        3. All-reduce sums the partial logits to get full result
+        """
+        world_size = self.runtime_config.world_size
+        rank = self.runtime_config.rank
+        
         # Apply final layer norm
         normed = fun.rms_norm(
             hidden_states,
@@ -259,17 +293,26 @@ class ForwardPass:
             weight=self.weights.get("norm_last"),
             eps=self.model_config.rms_norm_eps,
         )
-        # Project to vocab (weight-tied with embedding)
-        # Project to vocab (weight-tied with embedding)
-        logits = fun.linear(normed, self.weights.get("embed_token"))
-
-        # ALL-GATHER: Combine partial logits from all ranks (only if TP > 1)
-        if self.runtime_config.world_size > 1:
-            gathered_logits = [torch.empty_like(logits) for _ in range(self.runtime_config.world_size)]
-            dist.all_gather(gathered_logits, logits)
-            logits = torch.cat(gathered_logits, dim=-1)
-
-        return logits
+        
+        if world_size == 1:
+            # Single GPU: simple linear projection
+            return fun.linear(normed, self.weights.get("embed_token"))
+        
+        # Multi-GPU: Column-parallel projection
+        # 1. Split input along hidden dimension - each rank uses its slice
+        hidden_per_rank = self.model_config.dim_hidden // world_size
+        start_idx = rank * hidden_per_rank
+        end_idx = start_idx + hidden_per_rank
+        local_normed = normed[:, start_idx:end_idx]  # [seq, hidden/world_size]
+        
+        # 2. Project with local weight shard: [seq, hidden/world_size] @ [hidden/world_size, vocab]
+        # embed_token has shape [vocab, hidden/world_size], so we use linear which transposes
+        local_logits = fun.linear(local_normed, self.weights.get("embed_token"))  # [seq, vocab]
+        
+        # 3. All-reduce to combine partial logits (sum of partial projections = full projection)
+        dist.all_reduce(local_logits)
+        
+        return local_logits
 
     def mlp(self, hidden_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """

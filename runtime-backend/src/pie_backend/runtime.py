@@ -428,8 +428,10 @@ class Runtime:
         
         while True:
             # Wait for inputs
+            print(f"Worker {self.config.rank}: waiting for broadcast...")
             objects = [None, None]
             dist.broadcast_object_list(objects, src=0)
+            print(f"Worker {self.config.rank}: received broadcast")
             inputs, sampling_metadata = objects
             
             if inputs == "STOP":
@@ -508,17 +510,19 @@ class Runtime:
         sampling_metadata = batch.get_sampling_metadata(device, self.config.activation_dtype)
 
         # Broadcast if needed
-        # if self.config.world_size > 1:
-        #     # Move to CPU for safe pickling/broadcasting
-        #     cpu_inputs = {
-        #         k: (v.cpu() if isinstance(v, torch.Tensor) else v)
-        #         for k, v in inputs.items()
-        #     }
-        #     cpu_sampling_metadata = {
-        #         k: (v.cpu() if isinstance(v, torch.Tensor) else v) 
-        #         for k, v in sampling_metadata.items()
-        #     }
-        #     dist.broadcast_object_list([cpu_inputs, cpu_sampling_metadata], src=0)
+        if self.config.world_size > 1:
+            print(f"Rank 0: Broadcasting inputs to workers...")
+            # Move to CPU for safe pickling/broadcasting
+            cpu_inputs = {
+                k: (v.cpu() if isinstance(v, torch.Tensor) else v)
+                for k, v in inputs.items()
+            }
+            cpu_sampling_metadata = {
+                k: (v.cpu() if isinstance(v, torch.Tensor) else v) 
+                for k, v in sampling_metadata.items()
+            }
+            dist.broadcast_object_list([cpu_inputs, cpu_sampling_metadata], src=0)
+            print(f"Rank 0: Broadcast complete")
 
         # Execute step
         sampling_results = self._run_step(inputs, sampling_metadata)

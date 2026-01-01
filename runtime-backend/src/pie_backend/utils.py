@@ -89,7 +89,10 @@ def get_available_memory(devices: list[torch.device], rank: int = 0) -> int:
         and torch.distributed.is_initialized()
         and len(devices) > 1
     ):
-        tensor = torch.tensor(total_free_bytes, dtype=torch.uint64)
+        tensor = torch.tensor(total_free_bytes, dtype=torch.int64)
+        if is_cuda:
+            tensor = tensor.to(device)
+            
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         total_free_bytes = int(tensor.item())
 

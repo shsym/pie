@@ -325,6 +325,7 @@ impl Session {
                     break;
                 }
             }
+            let _ = ws_writer.close().await;
         });
 
         let cloned_client_cmd_tx = client_cmd_tx.clone();
