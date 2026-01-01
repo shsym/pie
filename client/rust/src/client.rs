@@ -386,7 +386,6 @@ impl Client {
     pub async fn launch_instance(
         &self,
         program_hash: String,
-        cmd_name: String,
         arguments: Vec<String>,
         detached: bool,
     ) -> Result<Instance> {
@@ -394,7 +393,43 @@ impl Client {
         let msg = ClientMessage::LaunchInstance {
             corr_id: *corr_id_guard,
             program_hash,
-            cmd_name,
+            arguments,
+            detached,
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .pending_launch_requests
+            .insert(*corr_id_guard, tx);
+        self.inner
+            .ws_writer_tx
+            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+
+        let (inst_id, event_rx) = rx.await??;
+
+        Ok(Instance {
+            id: inst_id,
+            inner: Arc::clone(&self.inner),
+            event_rx,
+        })
+    }
+
+    /// Launches an instance from an inferlet in the registry.
+    ///
+    /// The `inferlet` parameter can be:
+    /// - Full name with version: `std/text-completion@0.1.0`
+    /// - Without namespace (defaults to `std`): `text-completion@0.1.0`
+    /// - Without version (defaults to `latest`): `std/text-completion` or `text-completion`
+    pub async fn launch_instance_from_registry(
+        &self,
+        inferlet: String,
+        arguments: Vec<String>,
+        detached: bool,
+    ) -> Result<Instance> {
+        let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
+        let msg = ClientMessage::LaunchInstanceFromRegistry {
+            corr_id: *corr_id_guard,
+            inferlet,
             arguments,
             detached,
         };

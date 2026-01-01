@@ -57,7 +57,7 @@ def handle_attach_command(
             print(f"❌ The prefix '{instance_id_prefix}' is ambiguous. Multiple instances match:")
             print()
             for inst in matching:
-                print(f"  {inst.id} ({inst.cmd_name})")
+                print(f"  {inst.id}")
             print()
             print("Please provide a more specific prefix to uniquely identify the instance.")
             raise ValueError("Ambiguous instance ID prefix")
@@ -69,7 +69,7 @@ def handle_attach_command(
         # Attach to the instance
         instance = engine.attach_instance(client, instance_id)
         
-        print(f"✅ Attached to instance {instance_id} ({instance_info.cmd_name})")
+        print(f"✅ Attached to instance {instance_id}")
         
         engine.stream_inferlet_output(instance, client)
     

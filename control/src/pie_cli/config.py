@@ -9,17 +9,23 @@ from typing import Optional
 import toml
 import typer
 
-from . import path as pie_path
+from . import path
 
 app = typer.Typer(help="Manage configuration")
 
 
 def create_default_config_content(backend_type: str = "python") -> str:
     """Create the default configuration file content."""
+    cache_dir = str(path.get_pie_home() / "cache")
+    log_dir = str(path.get_pie_home() / "logs")
     config = {
         "host": "127.0.0.1",
         "port": 8080,
-        "enable_auth": True,
+        "enable_auth": False,
+        "cache_dir": cache_dir,
+        "verbose": False,
+        "log_dir": log_dir,
+        "registry": "https://registry.pie-project.org/",
     }
 
     if backend_type == "dummy":
@@ -30,7 +36,7 @@ def create_default_config_content(backend_type: str = "python") -> str:
                 "backend_type": "python",
                 "exec_path": "pie-backend",
                 "model": "qwen-3-0.6b",
-                "device": "cuda:0",
+                "device": ["cuda:0"],
                 "activation_dtype": "bfloat16",
                 "kv_page_size": 16,
                 "max_batch_tokens": 10240,
@@ -108,45 +114,46 @@ def config_update(
     ),
     cache_dir: Optional[str] = typer.Option(None, "--cache-dir", help="Cache directory path"),
     verbose: Optional[bool] = typer.Option(None, "--verbose", help="Enable verbose logging"),
-    log: Optional[str] = typer.Option(None, "--log", help="Log file path"),
+    log_dir: Optional[str] = typer.Option(None, "--log-dir", help="Log directory path"),
+    registry: Optional[str] = typer.Option(None, "--registry", help="Inferlet registry URL"),
     # Backend configuration options
     backend_type: Optional[str] = typer.Option(None, "--backend-type", help="Backend type"),
     backend_exec_path: Optional[str] = typer.Option(
         None, "--backend-exec-path", help="Backend executable path"
     ),
-    backend_model: Optional[str] = typer.Option(None, "--backend-model", help="Model name"),
-    backend_device: Optional[str] = typer.Option(
-        None, "--backend-device", help="Device (e.g., cuda:0, mps)"
+    backend_model: Optional[str] = typer.Option(None, "--model", help="Model name"),
+    backend_device: Optional[list[str]] = typer.Option(
+        None, "--device", help="Device(s) (e.g., cuda:0 cuda:1)"
     ),
     backend_activation_dtype: Optional[str] = typer.Option(
-        None, "--backend-activation-dtype", help="Activation dtype (e.g., bfloat16)"
+        None, "--activation-dtype", help="Activation dtype (e.g., bfloat16)"
     ),
     backend_weight_dtype: Optional[str] = typer.Option(
-        None, "--backend-weight-dtype", help="Weight dtype (e.g., int4, int8)"
+        None, "--weight-dtype", help="Weight dtype (e.g., int4, int8)"
     ),
     backend_kv_page_size: Optional[int] = typer.Option(
-        None, "--backend-kv-page-size", help="KV page size"
+        None, "--kv-page-size", help="KV page size"
     ),
     backend_max_batch_tokens: Optional[int] = typer.Option(
-        None, "--backend-max-batch-tokens", help="Maximum batch tokens"
+        None, "--max-batch-tokens", help="Maximum batch tokens"
     ),
     backend_max_dist_size: Optional[int] = typer.Option(
-        None, "--backend-max-dist-size", help="Maximum distribution size"
+        None, "--max-dist-size", help="Maximum distribution size"
     ),
     backend_max_num_embeds: Optional[int] = typer.Option(
-        None, "--backend-max-num-embeds", help="Maximum number of embeddings"
+        None, "--max-num-embeds", help="Maximum number of embeddings"
     ),
     backend_max_num_adapters: Optional[int] = typer.Option(
-        None, "--backend-max-num-adapters", help="Maximum number of adapters"
+        None, "--max-num-adapters", help="Maximum number of adapters"
     ),
     backend_max_adapter_rank: Optional[int] = typer.Option(
-        None, "--backend-max-adapter-rank", help="Maximum adapter rank"
+        None, "--max-adapter-rank", help="Maximum adapter rank"
     ),
     backend_gpu_mem_utilization: Optional[float] = typer.Option(
-        None, "--backend-gpu-mem-utilization", help="GPU memory utilization (0.0 to 1.0)"
+        None, "--gpu-mem-utilization", help="GPU memory utilization (0.0 to 1.0)"
     ),
     backend_enable_profiling: Optional[bool] = typer.Option(
-        None, "--backend-enable-profiling", help="Enable profiling"
+        None, "--enable-profiling", help="Enable profiling"
     ),
     path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
@@ -160,7 +167,8 @@ def config_update(
             "enable_auth": enable_auth,
             "cache_dir": cache_dir,
             "verbose": verbose,
-            "log": log,
+            "log_dir": log_dir,
+            "registry": registry,
         }.items()
         if v is not None
     }

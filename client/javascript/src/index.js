@@ -9,7 +9,7 @@
 // If using in a browser with script tags, these would be global.
 // If using in Node.js or with a bundler, import them.
 import msgpack from 'msgpack-lite';
-import {blake3} from 'blake3';
+import { blake3 } from 'blake3';
 
 /**
  * A simple asynchronous queue.
@@ -92,7 +92,7 @@ export class Instance {
             throw new Error("Event queue is not available for this instance.");
         }
         const [event, msg] = await this.eventQueue.get();
-        return {event, msg};
+        return { event, msg };
     }
 
     /**
@@ -191,13 +191,13 @@ export class PieClient {
      * @param {object} message The decoded message object.
      */
     _processServerMessage(message) {
-        const {type, corr_id, instance_id, event, message: msg, successful, result} = message;
+        const { type, corr_id, instance_id, event, message: msg, successful, result } = message;
 
         switch (type) {
             case 'response':
                 if (this.pendingRequests.has(corr_id)) {
                     const promiseControls = this.pendingRequests.get(corr_id);
-                    promiseControls.resolve({successful, result});
+                    promiseControls.resolve({ successful, result });
                     this.pendingRequests.delete(corr_id);
                 }
                 break;
@@ -254,7 +254,7 @@ export class PieClient {
             const corr_id = this._getNextCorrId();
             msg.corr_id = corr_id;
 
-            this.pendingRequests.set(corr_id, {resolve, reject});
+            this.pendingRequests.set(corr_id, { resolve, reject });
 
             try {
                 const encoded = msgpack.encode(msg);
@@ -285,14 +285,14 @@ export class PieClient {
      * @returns {Promise<{successful: boolean, result: string}>}
      */
     async authenticate(token) {
-        const msg = {type: "authenticate", token};
-        const {successful, result} = await this._sendMsgAndWait(msg);
+        const msg = { type: "authenticate", token };
+        const { successful, result } = await this._sendMsgAndWait(msg);
         if (successful) {
             console.log("[PieClient] Authenticated successfully.");
         } else {
             console.error(`[PieClient] Authentication failed: ${result}`);
         }
-        return {successful, result};
+        return { successful, result };
     }
 
     /**
@@ -307,7 +307,7 @@ export class PieClient {
         const corr_id = this._getNextCorrId();
 
         const uploadPromise = new Promise((resolve, reject) => {
-            this.pendingRequests.set(corr_id, {resolve, reject});
+            this.pendingRequests.set(corr_id, { resolve, reject });
         });
 
         for (let i = 0; i < totalChunks; i++) {
@@ -325,7 +325,7 @@ export class PieClient {
             await this._sendMsg(msg);
         }
 
-        const {successful, result} = await uploadPromise;
+        const { successful, result } = await uploadPromise;
         if (successful) {
             console.log(`[PieClient] Program uploaded successfully: ${result}`);
         } else {
@@ -345,7 +345,7 @@ export class PieClient {
             program_hash: programHash,
             arguments: args,
         };
-        const {successful, result} = await this._sendMsgAndWait(msg);
+        const { successful, result } = await this._sendMsgAndWait(msg);
         if (successful) {
             const instanceId = result;
             this.instEventQueues.set(instanceId, new AsyncQueue());
@@ -356,13 +356,43 @@ export class PieClient {
     }
 
     /**
+     * Launches an instance from an inferlet in the registry.
+     * 
+     * The inferlet parameter can be:
+     * - Full name with version: "std/text-completion@0.1.0"
+     * - Without namespace (defaults to "std"): "text-completion@0.1.0"
+     * - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
+     * 
+     * @param {string} inferlet The inferlet name (e.g., "std/text-completion@0.1.0").
+     * @param {string[]} [args=[]] Optional command-line arguments.
+     * @param {boolean} [detached=false] If true, the instance runs in detached mode.
+     * @returns {Promise<Instance>}
+     */
+    async launchInstanceFromRegistry(inferlet, args = [], detached = false) {
+        const msg = {
+            type: "launch_instance_from_registry",
+            inferlet: inferlet,
+            arguments: args,
+            detached: detached,
+        };
+        const { successful, result } = await this._sendMsgAndWait(msg);
+        if (successful) {
+            const instanceId = result;
+            this.instEventQueues.set(instanceId, new AsyncQueue());
+            return new Instance(this, instanceId);
+        } else {
+            throw new Error(`Failed to launch instance from registry: ${result}`);
+        }
+    }
+
+    /**
      * Sends a signal/message to a running instance (fire-and-forget).
      * @param {string} instanceId The ID of the instance.
      * @param {string} message The message to send.
      * @returns {Promise<void>}
      */
     async signalInstance(instanceId, message) {
-        const msg = {type: "signal_instance", instance_id: instanceId, message};
+        const msg = { type: "signal_instance", instance_id: instanceId, message };
         await this._sendMsg(msg);
     }
 
@@ -372,7 +402,7 @@ export class PieClient {
      * @returns {Promise<void>}
      */
     async terminateInstance(instanceId) {
-        const msg = {type: "terminate_instance", instance_id: instanceId};
+        const msg = { type: "terminate_instance", instance_id: instanceId };
         await this._sendMsg(msg);
     }
 }
@@ -405,7 +435,7 @@ async function main() {
 
         // 4. Wait for the instance to finish
         while (true) {
-            const {event, msg} = await instance.recv();
+            const { event, msg } = await instance.recv();
             console.log(`[Example] Received event='${event}', message='${msg}'`);
             if (event === "terminated") {
                 break;

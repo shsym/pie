@@ -14,6 +14,7 @@ use futures::{SinkExt, StreamExt};
 use pie_client::message::{self, ClientMessage, EventCode, ServerMessage, StreamingOutput};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::mem;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -39,8 +40,17 @@ pub fn start_service(
     enable_auth: bool,
     authorized_users: AuthorizedUsers,
     internal_auth_token: String,
+    registry_url: String,
+    cache_dir: PathBuf,
 ) {
-    let server = Server::new(ip_port, enable_auth, authorized_users, internal_auth_token);
+    let server = Server::new(
+        ip_port,
+        enable_auth,
+        authorized_users,
+        internal_auth_token,
+        registry_url,
+        cache_dir,
+    );
     server.start(&COMMAND_DISPATCHER);
 }
 
@@ -115,6 +125,8 @@ struct ServerState {
     enable_auth: bool,
     authorized_users: AuthorizedUsers,
     internal_auth_token: String,
+    registry_url: String,
+    cache_dir: PathBuf,
     client_id_pool: Mutex<IdPool<ClientId>>,
     clients: DashMap<ClientId, JoinHandle<()>>,
     client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
@@ -190,11 +202,15 @@ impl Server {
         enable_auth: bool,
         authorized_users: AuthorizedUsers,
         internal_auth_token: String,
+        registry_url: String,
+        cache_dir: PathBuf,
     ) -> Self {
         let state = Arc::new(ServerState {
             enable_auth,
             authorized_users,
             internal_auth_token,
+            registry_url,
+            cache_dir,
             client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
             clients: DashMap::new(),
             client_cmd_txs: DashMap::new(),
@@ -554,14 +570,26 @@ impl Session {
                 ClientMessage::LaunchInstance {
                     corr_id,
                     program_hash,
-                    cmd_name,
                     arguments,
                     detached,
                 } => {
                     self.handle_launch_instance(
                         corr_id,
                         program_hash,
-                        cmd_name,
+                        arguments,
+                        detached,
+                    )
+                    .await
+                }
+                ClientMessage::LaunchInstanceFromRegistry {
+                    corr_id,
+                    inferlet,
+                    arguments,
+                    detached,
+                } => {
+                    self.handle_launch_instance_from_registry(
+                        corr_id,
+                        inferlet,
                         arguments,
                         detached,
                     )
@@ -577,14 +605,12 @@ impl Session {
                     corr_id,
                     port,
                     program_hash,
-                    cmd_name,
                     arguments,
                 } => {
                     self.handle_launch_server_instance(
                         corr_id,
                         port,
                         program_hash,
-                        cmd_name,
                         arguments,
                     )
                     .await
@@ -873,7 +899,6 @@ impl Session {
         &mut self,
         corr_id: u32,
         program_hash: String,
-        cmd_name: String,
         arguments: Vec<String>,
         detached: bool,
     ) {
@@ -881,7 +906,6 @@ impl Session {
 
         runtime::Command::LaunchInstance {
             program_hash,
-            cmd_name,
             arguments,
             detached,
             event: evt_tx,
@@ -917,6 +941,56 @@ impl Session {
             // The instance failed to launch. Notify the client about the error.
             Err(e) => {
                 self.send_launch_result(corr_id, false, e.to_string()).await;
+            }
+        }
+    }
+
+    /// Handles the LaunchInstanceFromRegistry command.
+    ///
+    /// This downloads an inferlet from the registry (with local caching) and launches it.
+    async fn handle_launch_instance_from_registry(
+        &mut self,
+        corr_id: u32,
+        inferlet: String,
+        arguments: Vec<String>,
+        detached: bool,
+    ) {
+        // Parse the inferlet name into namespace, name, and version
+        let (namespace, name, version) = parse_inferlet_name(&inferlet);
+
+        // Attempt to download/cache the inferlet
+        match download_inferlet_from_registry(
+            &self.state.registry_url,
+            &self.state.cache_dir,
+            &namespace,
+            &name,
+            &version,
+        )
+        .await
+        {
+            Ok((program_hash, program_data)) => {
+                // Upload the program to the runtime (registers it for execution)
+                let (evt_tx, evt_rx) = oneshot::channel();
+                runtime::Command::UploadProgram {
+                    hash: program_hash.clone(),
+                    raw: program_data,
+                    event: evt_tx,
+                }
+                .dispatch();
+
+                if let Err(e) = evt_rx.await.unwrap() {
+                    self.send_launch_result(corr_id, false, format!("Failed to register program: {}", e))
+                        .await;
+                    return;
+                }
+
+                // Now launch the instance using the same flow as handle_launch_instance
+                self.handle_launch_instance(corr_id, program_hash, arguments, detached)
+                    .await;
+            }
+            Err(e) => {
+                self.send_launch_result(corr_id, false, e.to_string())
+                    .await;
             }
         }
     }
@@ -1012,14 +1086,12 @@ impl Session {
         corr_id: u32,
         port: u32,
         program_hash: String,
-        cmd_name: String,
         arguments: Vec<String>,
     ) {
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchServerInstance {
             program_hash,
             port,
-            cmd_name,
             arguments,
             event: evt_tx,
         }
@@ -1273,4 +1345,144 @@ fn stop_backend_heartbeat(tx: oneshot::Sender<()>) {
         model::stop_heartbeat().await;
         tx.send(()).unwrap();
     });
+}
+
+/// Parses an inferlet name into (namespace, name, version).
+///
+/// Supported formats:
+/// - `namespace/name@version` -> (namespace, name, version)
+/// - `namespace/name` -> (namespace, name, "latest")
+/// - `name@version` -> ("std", name, version)
+/// - `name` -> ("std", name, "latest")
+fn parse_inferlet_name(inferlet: &str) -> (String, String, String) {
+    // Split on @ to get name_part and version
+    let (name_part, version) = if let Some((n, v)) = inferlet.split_once('@') {
+        (n, v.to_string())
+    } else {
+        (inferlet, "latest".to_string())
+    };
+
+    // Split on / to get namespace and name
+    let (namespace, name) = if let Some((ns, n)) = name_part.split_once('/') {
+        (ns.to_string(), n.to_string())
+    } else {
+        ("std".to_string(), name_part.to_string())
+    };
+
+    (namespace, name, version)
+}
+
+/// Downloads an inferlet from the registry, with local caching.
+///
+/// Returns (program_hash, program_data) on success.
+async fn download_inferlet_from_registry(
+    registry_url: &str,
+    cache_dir: &std::path::Path,
+    namespace: &str,
+    name: &str,
+    version: &str,
+) -> Result<(String, Vec<u8>)> {
+    // Build the cache path: {cache_dir}/registry/{namespace}/{name}/{version}.wasm
+    let cache_path = cache_dir
+        .join("registry")
+        .join(namespace)
+        .join(name)
+        .join(format!("{}.wasm", version));
+
+    // Check if we have a cached copy
+    if cache_path.exists() {
+        tracing::info!(
+            "Using cached inferlet: {}/{} @ {} from {:?}",
+            namespace,
+            name,
+            version,
+            cache_path
+        );
+        let data = tokio::fs::read(&cache_path).await.map_err(|e| {
+            anyhow!("Failed to read cached inferlet at {:?}: {}", cache_path, e)
+        })?;
+        let hash = blake3::hash(&data).to_hex().to_string();
+        return Ok((hash, data));
+    }
+
+    // Build the download URL
+    let download_url = format!(
+        "{}/api/v1/inferlets/{}/{}/{}/download",
+        registry_url.trim_end_matches('/'),
+        namespace,
+        name,
+        version
+    );
+
+    tracing::info!(
+        "Downloading inferlet: {}/{} @ {} from {}",
+        namespace,
+        name,
+        version,
+        download_url
+    );
+
+    // Create an HTTP client that follows redirects
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
+
+    // Perform the download
+    let response = client
+        .get(&download_url)
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to download inferlet from registry: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "Registry returned error {} for {}/{} @ {}: {}",
+            status,
+            namespace,
+            name,
+            version,
+            body
+        );
+    }
+
+    let data = response
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("Failed to read inferlet data: {}", e))?
+        .to_vec();
+
+    if data.is_empty() {
+        bail!(
+            "Registry returned empty data for {}/{} @ {}",
+            namespace,
+            name,
+            version
+        );
+    }
+
+    let hash = blake3::hash(&data).to_hex().to_string();
+
+    // Cache the downloaded inferlet
+    if let Some(parent) = cache_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            anyhow!("Failed to create cache directory {:?}: {}", parent, e)
+        })?;
+    }
+    tokio::fs::write(&cache_path, &data).await.map_err(|e| {
+        anyhow!("Failed to cache inferlet at {:?}: {}", cache_path, e)
+    })?;
+
+    tracing::info!(
+        "Cached inferlet {}/{} @ {} to {:?} (hash: {})",
+        namespace,
+        name,
+        version,
+        cache_path,
+        hash
+    );
+
+    Ok((hash, data))
 }

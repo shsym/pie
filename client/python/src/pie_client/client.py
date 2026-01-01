@@ -27,7 +27,6 @@ class Event(Enum):
 class InstanceInfo:
     """Information about a running instance."""
     id: str
-    cmd_name: str
     arguments: list[str]
     status: str  # "Attached", "Detached", or "Finished"
 
@@ -186,7 +185,6 @@ class PieClient:
                 instances = [
                     InstanceInfo(
                         id=inst.get("id"),
-                        cmd_name=inst.get("cmd_name"),
                         arguments=inst.get("arguments", []),
                         status=inst.get("status", "Unknown")
                     )
@@ -437,7 +435,6 @@ class PieClient:
         self,
         program_hash: str,
         arguments: list[str] | None = None,
-        cmd_name: str = "default",
         detached: bool = False
     ) -> Instance:
         """Launch an instance of a program."""
@@ -447,7 +444,6 @@ class PieClient:
             "corr_id": corr_id,
             "program_hash": program_hash,
             "arguments": arguments or [],
-            "cmd_name": cmd_name,
             "detached": detached,
         }
         
@@ -461,6 +457,45 @@ class PieClient:
         if successful:
             return Instance(self, instance_id)
         raise Exception(f"Failed to launch instance: {instance_id}")
+
+    async def launch_instance_from_registry(
+        self,
+        inferlet: str,
+        arguments: list[str] | None = None,
+        detached: bool = False
+    ) -> Instance:
+        """
+        Launch an instance of an inferlet from the registry.
+        
+        The inferlet parameter can be:
+        - Full name with version: "std/text-completion@0.1.0"
+        - Without namespace (defaults to "std"): "text-completion@0.1.0"
+        - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
+        
+        :param inferlet: The inferlet name (e.g., "std/text-completion@0.1.0").
+        :param arguments: Command-line arguments to pass to the inferlet.
+        :param detached: If True, the instance runs in detached mode.
+        :return: An Instance object for the launched inferlet.
+        """
+        corr_id = self._get_next_corr_id()
+        msg = {
+            "type": "launch_instance_from_registry",
+            "corr_id": corr_id,
+            "inferlet": inferlet,
+            "arguments": arguments or [],
+            "detached": detached,
+        }
+        
+        future = asyncio.get_event_loop().create_future()
+        self.pending_launch_requests[corr_id] = future
+        encoded = msgpack.packb(msg, use_bin_type=True)
+        await self.ws.send(encoded)
+        
+        successful, instance_id = await future
+        
+        if successful:
+            return Instance(self, instance_id)
+        raise Exception(f"Failed to launch instance from registry: {instance_id}")
 
     async def attach_instance(self, instance_id: str) -> Instance:
         """

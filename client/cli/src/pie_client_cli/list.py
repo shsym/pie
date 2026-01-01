@@ -72,19 +72,18 @@ def handle_list_command(
         # Column widths
         id_width = 36 if full else (8 if long else 4)
         status_width = 8
-        cmd_width = 24
-        args_width = 32 if full else (60 if long else 64)
+        args_width = 60 if full else (80 if long else 84)
         
         # Print header
         print(
             f"{'ID':<{id_width}}  {'STATUS':<{status_width}}  "
-            f"{'COMMAND':<{cmd_width}}  {'ARGUMENTS':<{args_width}}"
+            f"{'ARGUMENTS':<{args_width}}"
         )
         
         # Print separator
         print(
             f"{'-' * id_width}  {'-' * status_width}  "
-            f"{'-' * cmd_width}  {'-' * args_width}"
+            f"{'-' * args_width}"
         )
         
         # Print each instance
@@ -99,13 +98,12 @@ def handle_list_command(
             
             # Format other fields
             status_display = inst.status
-            cmd_display = truncate_with_ellipsis(inst.cmd_name, cmd_width)
             args_str = format_arguments(inst.arguments)
             args_display = truncate_with_ellipsis(args_str, args_width)
             
             print(
                 f"{uuid_display:<{id_width}}  {status_display:<{status_width}}  "
-                f"{cmd_display:<{cmd_width}}  {args_display:<{args_width}}"
+                f"{args_display:<{args_width}}"
             )
     
     finally:

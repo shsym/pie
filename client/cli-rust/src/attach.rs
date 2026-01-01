@@ -86,10 +86,7 @@ pub async fn handle_attach_command(args: AttachArgs) -> Result<()> {
                 .await
                 .context("Failed to attach to instance")?;
 
-            println!(
-                "✅ Attached to instance {} ({})",
-                instance_id, instance_info.cmd_name
-            );
+            println!("✅ Attached to instance {}", instance_id);
 
             engine::stream_inferlet_output(instance, client).await?;
             Ok(())
@@ -101,7 +98,7 @@ pub async fn handle_attach_command(args: AttachArgs) -> Result<()> {
             );
             println!();
             for instance in &matching_instances {
-                println!("  {} ({})", instance.id, instance.cmd_name);
+                println!("  {}", instance.id);
             }
             println!();
             println!("Please provide a more specific prefix to uniquely identify the instance.");

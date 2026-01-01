@@ -49,7 +49,7 @@ asyncio.run(main())
 | `internal_authenticate(token)` | Token-based internal authentication |
 | `upload_program(bytes)` | Upload a WASM program |
 | `program_exists(hash)` | Check if program is uploaded |
-| `launch_instance(hash, args, cmd_name, detached)` | Launch a program instance |
+| `launch_instance(hash, args, detached)` | Launch a program instance |
 | `attach_instance(instance_id)` | Attach to a detached instance |
 | `list_instances()` | List running instances |
 | `terminate_instance(instance_id)` | Terminate an instance |

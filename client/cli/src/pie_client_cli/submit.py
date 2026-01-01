@@ -142,14 +142,10 @@ def handle_submit_command(
         else:
             print("Inferlet already exists on server.")
         
-        # Get command name from inferlet filename
-        cmd_name = inferlet.stem
-        
         # Launch the instance
         instance = engine.launch_instance(
             client,
             program_hash,
-            cmd_name,
             arguments,
             detached,
         )

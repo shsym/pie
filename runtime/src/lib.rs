@@ -21,4 +21,4 @@ pub mod utils;
 mod ffi;
 
 // Re-export the Python module entry point
-pub use ffi::pie_server_rs;
+pub use ffi::pie_rs;

@@ -59,3 +59,4 @@ p256 = { version = "0.13", features = ["pkcs8"] }
 p384 = { version = "0.13", features = ["pkcs8"] }
 chrono = "0.4"
 ringbuffer = "0.15"
+reqwest = { version = "0.12", features = ["rustls-tls"] }

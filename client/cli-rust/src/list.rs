@@ -80,34 +80,30 @@ pub async fn handle_list_command(args: ListArgs) -> Result<()> {
             4
         };
         const STATUS_WIDTH: usize = 8;
-        const CMD_WIDTH: usize = 24;
         let args_width = if args.full {
-            32
+            56
         } else if args.long {
-            60
+            84
         } else {
-            64
+            88
         };
 
         // Print table header
         println!(
-            "{:<id_width$}  {:<status_width$}  {:<cmd_width$}  {:<args_width$}",
+            "{:<id_width$}  {:<status_width$}  {:<args_width$}",
             "ID",
             "STATUS",
-            "COMMAND",
             "ARGUMENTS",
             id_width = id_width,
             status_width = STATUS_WIDTH,
-            cmd_width = CMD_WIDTH,
             args_width = args_width
         );
 
         // Print separator line
         println!(
-            "{}  {}  {}  {}",
+            "{}  {}  {}",
             "-".repeat(id_width),
             "-".repeat(STATUS_WIDTH),
-            "-".repeat(CMD_WIDTH),
             "-".repeat(args_width)
         );
 
@@ -127,21 +123,16 @@ pub async fn handle_list_command(args: ListArgs) -> Result<()> {
 
             // Format arguments with proper quoting to show grouping
             let args_str = format_arguments(&instance.arguments);
-
-            // Truncate command and arguments if too long
-            let cmd_display = truncate_with_ellipsis(instance.cmd_name.clone(), CMD_WIDTH);
             let args_display = truncate_with_ellipsis(args_str, args_width);
 
             // Print row with proper padding
             println!(
-                "{:<id_width$}  {:<status_width$}  {:<cmd_width$}  {:<args_width$}",
+                "{:<id_width$}  {:<status_width$}  {:<args_width$}",
                 uuid_display,
                 status_display,
-                cmd_display,
                 args_display,
                 id_width = id_width,
                 status_width = STATUS_WIDTH,
-                cmd_width = CMD_WIDTH,
                 args_width = args_width
             );
         }

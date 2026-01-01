@@ -27,42 +27,38 @@ pub struct ServerConfig {
     #[pyo3(get, set)]
     pub verbose: bool,
     #[pyo3(get, set)]
-    pub log_path: Option<String>,
+    pub log_dir: Option<String>,
+    #[pyo3(get, set)]
+    pub registry: String,
 }
 
 #[pymethods]
 impl ServerConfig {
     #[new]
-    #[pyo3(signature = (host = String::from("127.0.0.1"), port = 8080, enable_auth = true, cache_dir = None, verbose = false, log_path = None))]
     fn new(
         host: String,
         port: u16,
         enable_auth: bool,
-        cache_dir: Option<String>,
+        cache_dir: String,
         verbose: bool,
-        log_path: Option<String>,
+        log_dir: String,
+        registry: String,
     ) -> Self {
-        let cache_dir = cache_dir.unwrap_or_else(|| {
-            dirs::home_dir()
-                .map(|h| h.join(".pie").join("programs"))
-                .unwrap_or_else(|| PathBuf::from(".pie/programs"))
-                .to_string_lossy()
-                .to_string()
-        });
         ServerConfig {
             host,
             port,
             enable_auth,
             cache_dir,
             verbose,
-            log_path,
+            log_dir: Some(log_dir),
+            registry,
         }
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "ServerConfig(host='{}', port={}, enable_auth={}, cache_dir='{}', verbose={}, log_path={:?})",
-            self.host, self.port, self.enable_auth, self.cache_dir, self.verbose, self.log_path
+            "ServerConfig(host='{}', port={}, enable_auth={}, cache_dir='{}', verbose={}, log_dir={:?}, registry='{}')",
+            self.host, self.port, self.enable_auth, self.cache_dir, self.verbose, self.log_dir, self.registry
         )
     }
 }
@@ -75,7 +71,8 @@ impl From<ServerConfig> for EngineConfig {
             enable_auth: cfg.enable_auth,
             cache_dir: PathBuf::from(cfg.cache_dir),
             verbose: cfg.verbose,
-            log: cfg.log_path.map(PathBuf::from),
+            log_dir: cfg.log_dir.map(PathBuf::from),
+            registry: cfg.registry,
         }
     }
 }
@@ -194,9 +191,9 @@ fn start_server(
     })
 }
 
-/// Python module definition for pie_server_rs
-#[pymodule(name = "pie_server_rs")]
-pub fn pie_server_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+/// Python module definition for pie_rs
+#[pymodule(name = "pie_rs")]
+pub fn pie_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ServerConfig>()?;
     m.add_class::<ServerHandle>()?;
     m.add_function(wrap_pyfunction!(start_server, m)?)?;

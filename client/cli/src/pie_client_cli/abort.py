@@ -54,7 +54,7 @@ def handle_abort_command(
             print(f"❌ The prefix '{instance_id_prefix}' is ambiguous. Multiple instances match:")
             print()
             for inst in matching:
-                print(f"  {inst.id} ({inst.cmd_name})")
+                print(f"  {inst.id}")
             print()
             print("Please provide a more specific prefix to uniquely identify the instance.")
             raise ValueError("Ambiguous instance ID prefix")
@@ -66,7 +66,7 @@ def handle_abort_command(
         # Terminate the instance
         engine.terminate_instance(client, instance_id)
         
-        print(f"✅ Sent termination request for instance {instance_id} ({instance_info.cmd_name})")
+        print(f"✅ Sent termination request for instance {instance_id}")
     
     finally:
         engine.close_client(client)

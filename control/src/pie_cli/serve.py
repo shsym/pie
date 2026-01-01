@@ -45,9 +45,10 @@ def load_config(
         "host": host or config.get("host", "127.0.0.1"),
         "port": port or config.get("port", 8080),
         "enable_auth": False if no_auth else config.get("enable_auth", True),
-        "cache_dir": config.get("cache_dir", str(pie_path.get_pie_home() / "programs")),
+        "cache_dir": config.get("cache_dir", str(pie_path.get_pie_home() / "cache")),
         "verbose": verbose or config.get("verbose", False),
-        "log": str(log) if log else config.get("log"),
+        "log_dir": str(log) if log else config.get("log_dir", str(pie_path.get_pie_home() / "logs")),
+        "registry": config.get("registry", "https://registry.pie-project.org/"),
     }
 
     backend_configs = config.get("backend", [])

@@ -143,15 +143,8 @@ pub async fn handle_submit_command(args: SubmitArgs) -> Result<()> {
         println!("Inferlet already exists on server.");
     }
 
-    let cmd_name = args
-        .inferlet
-        .file_stem()
-        .context("Inferlet path must have a valid file name")?
-        .to_string_lossy()
-        .to_string();
-
     let instance = client
-        .launch_instance(hash, cmd_name, args.arguments, args.detached)
+        .launch_instance(hash, args.arguments, args.detached)
         .await?;
 
     println!("✅ Inferlet launched with ID: {}", instance.id());

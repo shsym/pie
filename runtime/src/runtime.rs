@@ -83,7 +83,6 @@ pub enum Command {
 
     LaunchInstance {
         program_hash: String,
-        cmd_name: String,
         arguments: Vec<String>,
         detached: bool,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
@@ -105,7 +104,6 @@ pub enum Command {
     LaunchServerInstance {
         program_hash: String,
         port: u32,
-        cmd_name: String,
         arguments: Vec<String>,
         event: oneshot::Sender<Result<(), RuntimeError>>,
     },
@@ -222,7 +220,6 @@ pub enum AttachInstanceResult {
 
 struct InstanceHandle {
     program_hash: String,
-    cmd_name: String,
     arguments: Vec<String>,
     output_delivery_ctrl: OutputDeliveryCtrl,
     running_state: InstanceRunningState,
@@ -260,13 +257,12 @@ impl Service for Runtime {
 
             Command::LaunchInstance {
                 program_hash,
-                cmd_name,
                 event,
                 arguments,
                 detached,
             } => {
                 let res = self
-                    .launch_instance(program_hash, cmd_name, arguments, detached)
+                    .launch_instance(program_hash, arguments, detached)
                     .await;
                 event
                     .send(res)
@@ -293,12 +289,11 @@ impl Service for Runtime {
             Command::LaunchServerInstance {
                 program_hash,
                 port,
-                cmd_name,
                 arguments,
                 event,
             } => {
                 let _ = self
-                    .launch_server_instance(program_hash, cmd_name, port, arguments)
+                    .launch_server_instance(program_hash, port, arguments)
                     .await;
                 event.send(Ok(())).unwrap();
             }
@@ -373,7 +368,6 @@ impl Service for Runtime {
                     .chain(self.finished_instances.iter())
                     .map(|item| message::InstanceInfo {
                         id: item.key().to_string(),
-                        cmd_name: item.value().cmd_name.clone(),
                         arguments: item.value().arguments.clone(),
                         status: item.value().running_state.clone().into(),
                     })
@@ -477,7 +471,6 @@ impl Runtime {
     async fn launch_instance(
         &self,
         program_hash: String,
-        cmd_name: String,
         arguments: Vec<String>,
         detached: bool,
     ) -> Result<InstanceId, RuntimeError> {
@@ -516,7 +509,6 @@ impl Runtime {
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             program_hash,
-            cmd_name,
             arguments,
             output_delivery_ctrl,
             running_state,
@@ -579,7 +571,6 @@ impl Runtime {
     async fn launch_server_instance(
         &self,
         program_hash: String,
-        cmd_name: String,
         port: u32,
         arguments: Vec<String>,
     ) -> Result<InstanceId, RuntimeError> {
@@ -610,7 +601,6 @@ impl Runtime {
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             program_hash,
-            cmd_name,
             arguments,
             output_delivery_ctrl,
             running_state: InstanceRunningState::Detached,

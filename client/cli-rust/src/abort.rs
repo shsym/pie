@@ -84,8 +84,8 @@ pub async fn handle_abort_command(args: AbortArgs) -> Result<()> {
                 .context("Failed to send terminate command")?;
 
             println!(
-                "✅ Sent termination request for instance {} ({})",
-                instance_id, instance.cmd_name
+                "✅ Sent termination request for instance {}",
+                instance_id
             );
             Ok(())
         }
@@ -96,7 +96,7 @@ pub async fn handle_abort_command(args: AbortArgs) -> Result<()> {
             );
             println!();
             for instance in &matching_instances {
-                println!("  {} ({})", instance.id, instance.cmd_name,);
+                println!("  {}", instance.id);
             }
             println!();
             println!("Please provide a more specific prefix to uniquely identify the instance.");
