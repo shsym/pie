@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import typer
+
 from pie_client import PieClient, Event, Instance, InstanceInfo
 from pie_client.crypto import ParsedPrivateKey
 
@@ -223,16 +225,16 @@ async def _stream_inferlet_output_async(
             
             # Handle SIGINT (Ctrl-C)
             if sigint_wait in done:
-                print(f"\n[Instance {short_id}] Received Ctrl-C, terminating instance ...")
+                typer.echo(f"\n[Instance {short_id}] Received Ctrl-C, terminating instance ...")
                 try:
                     await client.terminate_instance(instance_id)
                 except Exception as e:
-                    print(f"[Instance {short_id}] Failed to send terminate request: {e}", file=sys.stderr)
+                    typer.echo(f"[Instance {short_id}] Failed to send terminate request: {e}", err=True)
                 return
             
             # Handle EOF (Ctrl-D)
             if eof_wait in done:
-                print(f"\n[Instance {short_id}] Detached from instance ...")
+                typer.echo(f"\n[Instance {short_id}] Detached from instance ...")
                 return
             
             # Handle instance event
@@ -244,14 +246,14 @@ async def _stream_inferlet_output_async(
                     raise
                 
                 if event == Event.Message:
-                    print(f"[Instance {short_id}] Message: {message}")
+                    typer.echo(f"[Instance {short_id}] Message: {message}")
                 
                 elif event == Event.Completed:
-                    print(f"[Instance {short_id}] Completed: {message}")
+                    typer.echo(f"[Instance {short_id}] Completed: {message}")
                     return
                 
                 elif event in (Event.Aborted, Event.Exception, Event.ServerError, Event.OutOfResources):
-                    print(f"[Instance {short_id}] {event.name}: {message}")
+                    typer.echo(f"[Instance {short_id}] {event.name}: {message}")
                     raise RuntimeError(f"inferlet terminated with status {event.name}")
                 
                 elif event == Event.Stdout:

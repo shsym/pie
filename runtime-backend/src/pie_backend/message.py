@@ -53,12 +53,7 @@ class QueryResponse(msgspec.Struct, gc=False):
     value: str
 
 
-class HeartbeatRequest(msgspec.Struct, gc=False):
-    """Request message for keepalive heartbeat."""
 
-
-class HeartbeatResponse(msgspec.Struct, gc=False):
-    """Response message for keepalive heartbeat."""
 
 
 class ForwardPassRequest(msgspec.Struct, gc=False):

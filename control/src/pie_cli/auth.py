@@ -10,9 +10,13 @@ from typing import Optional
 
 import toml
 import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
 from . import path as pie_path
 
+console = Console()
 app = typer.Typer(help="Manage authorized clients")
 
 
@@ -46,20 +50,13 @@ def auth_add(
 
     # Show prompts only in interactive mode
     if sys.stdin.isatty():
-        typer.echo("🔐 Adding authorized user...")
-        typer.echo(f"   Username: {username}")
-        typer.echo(f"   Key name: {key_name}")
-        typer.echo()
-        typer.echo("Enter public key (paste, then press Ctrl-D on a new line):")
-        typer.echo("  Supported algorithms:")
-        typer.echo("  - RSA (2048-8192 bits)")
-        typer.echo("  - ED25519 (256 bits)")
-        typer.echo("  - ECDSA (256, 384 bits)")
-        typer.echo("  Supported formats:")
-        typer.echo("  - OpenSSH (single line)")
-        typer.echo("  - PKCS#8 PEM (multi-line)")
-        typer.echo("  - PKCS#1 PEM (multi-line)")
-        typer.echo("> ", nl=False)
+        console.print()
+        console.print(f"[bold]Adding authorized user:[/bold] {username}")
+        console.print(f"[dim]Key name: {key_name}[/dim]")
+        console.print()
+        console.print("[dim]Enter public key (paste, then Ctrl-D on a new line):[/dim]")
+        console.print("[dim]Supported: RSA, ED25519, ECDSA in OpenSSH/PEM format[/dim]")
+        console.print()
 
     # Read public key from stdin
     public_key = sys.stdin.read().strip()
@@ -74,33 +71,30 @@ def auth_add(
         user_created = True
 
     if not public_key:
-        typer.echo()
-        typer.echo("⚠️ Warning: No public key provided")
+        console.print()
+        console.print("[yellow]![/yellow] No public key provided")
         save_authorized_users(auth_path, users)
         if user_created:
-            typer.echo(f"✅ Created user '{username}' without any keys")
+            console.print(f"[green]✓[/green] Created user '{username}' without keys")
         else:
-            typer.echo(f"📋 User '{username}' already exists")
+            console.print(f"[dim]User '{username}' already exists[/dim]")
         return
 
     # Check if key name already exists
     if key_name in users[username]:
-        typer.echo()
-        typer.echo(
-            f"❌ Key with name '{key_name}' already exists for user '{username}'",
-            err=True,
-        )
+        console.print()
+        console.print(f"[red]✗[/red] Key '{key_name}' already exists for '{username}'")
         raise typer.Exit(1)
 
     # Add the key (store the raw public key string)
     users[username][key_name] = public_key
     save_authorized_users(auth_path, users)
 
-    typer.echo()
+    console.print()
     if user_created:
-        typer.echo(f"✅ Created user '{username}' and added key '{key_name}'")
+        console.print(f"[green]✓[/green] Created user '{username}' with key '{key_name}'")
     else:
-        typer.echo(f"✅ Added key '{key_name}' to user '{username}'")
+        console.print(f"[green]✓[/green] Added key '{key_name}' to '{username}'")
 
 
 @app.command("remove")
@@ -118,41 +112,38 @@ def auth_remove(
     auth_path = pie_path.get_authorized_users_path()
 
     if not auth_path.exists():
-        typer.echo(
-            f"❌ Authorized users file not found at {auth_path}. No users to remove.",
-            err=True,
-        )
+        console.print("[red]✗[/red] No authorized users file")
         raise typer.Exit(1)
 
     users = load_authorized_users(auth_path)
 
     if username not in users:
-        typer.echo(f"❌ User '{username}' not found", err=True)
+        console.print(f"[red]✗[/red] User '{username}' not found")
         raise typer.Exit(1)
 
     if key_name:
         # Remove specific key
         if key_name not in users[username]:
-            typer.echo(f"❌ Key '{key_name}' not found for user '{username}'", err=True)
+            console.print(f"[red]✗[/red] Key '{key_name}' not found for '{username}'")
             raise typer.Exit(1)
 
         del users[username][key_name]
         save_authorized_users(auth_path, users)
-        typer.echo(f"✅ Removed key '{key_name}' from user '{username}'")
+        console.print(f"[green]✓[/green] Removed key '{key_name}' from '{username}'")
     else:
         # Remove entire user - prompt for confirmation in interactive mode
         key_count = len(users[username])
         if sys.stdin.isatty():
             confirm = typer.confirm(
-                f"⚠️ This will remove user '{username}' and all {key_count} key(s). Continue?"
+                f"Remove user '{username}' and {key_count} key(s)?"
             )
             if not confirm:
-                typer.echo("Operation cancelled.")
+                console.print("[dim]Cancelled.[/dim]")
                 raise typer.Exit(1)
 
         del users[username]
         save_authorized_users(auth_path, users)
-        typer.echo(f"✅ Removed user '{username}' and all associated keys")
+        console.print(f"[green]✓[/green] Removed user '{username}' and all keys")
 
 
 @app.command("list")
@@ -161,28 +152,23 @@ def auth_list() -> None:
     auth_path = pie_path.get_authorized_users_path()
 
     if not auth_path.exists():
-        typer.echo("📋 No authorized users found.")
-        typer.echo(f"    (File not found at {auth_path})")
+        console.print(Panel("[dim]No authorized users[/dim]", title="Authorized Users", title_align="left", border_style="dim"))
         return
 
     users = load_authorized_users(auth_path)
 
     if not users:
-        typer.echo("📋 No authorized users found.")
+        console.print(Panel("[dim]No authorized users[/dim]", title="Authorized Users", title_align="left", border_style="dim"))
         return
 
-    typer.echo("📋 Authorized users:")
-    typer.echo(f"    File: {auth_path}")
-    typer.echo()
-
-    for username in sorted(users.keys()):
+    lines = Text()
+    for i, username in enumerate(sorted(users.keys())):
+        if i > 0:
+            lines.append("\n")
         user_keys = users[username]
-        key_count = len(user_keys)
-        key_word = "key" if key_count == 1 else "keys"
-        typer.echo(f"  {username} ({key_count} {key_word}):")
+        key_names = ", ".join(sorted(user_keys.keys())) if user_keys else "no keys"
+        lines.append(f"{username:<20}", style="white")
+        lines.append(f"{len(user_keys)} keys: {key_names}", style="dim")
 
-        for key_name in sorted(user_keys.keys()):
-            typer.echo(f"    - {key_name}")
-
-    typer.echo()
-    typer.echo(f"Total: {len(users)} authorized user(s)")
+    console.print(Panel(lines, title="Authorized Users", title_align="left", border_style="dim"))
+    console.print(f"[dim]{auth_path}[/dim]")

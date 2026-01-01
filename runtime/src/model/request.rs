@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tokio::sync::oneshot;
 
 pub static HANDSHAKE_ID: u32 = 0;
-pub static HEARTBEAT_ID: u32 = 1;
+
 pub static QUERY_ID: u32 = 2;
 pub static FORWARD_PASS_ID: u32 = 3;
 pub static EMBED_IMAGE_ID: u32 = 4;
@@ -19,7 +19,7 @@ pub enum Request {
     Handshake(HandshakeRequest, oneshot::Sender<HandshakeResponse>),
     Query(QueryRequest, oneshot::Sender<QueryResponse>),
     Synchronize(oneshot::Sender<()>),
-    Heartbeat(HeartbeatRequest),
+
     ForwardPass(
         ForwardPassRequest,
         Option<oneshot::Sender<ForwardPassResponse>>,
@@ -60,8 +60,8 @@ impl Request {
         match self {
             Request::Handshake(_, _) => HANDSHAKE_ID,
             Request::Query(_, _) => QUERY_ID,
-            Request::Synchronize(_) => HEARTBEAT_ID,
-            Request::Heartbeat(_) => HEARTBEAT_ID,
+            Request::Synchronize(_) => unreachable!("Synchronize request has no handler ID"),
+
             Request::ForwardPass(_, _) => FORWARD_PASS_ID,
             Request::EmbedImage(_) => EMBED_IMAGE_ID,
             Request::InitializeAdapter(_) => INITIALIZE_ADAPTER_ID,
@@ -76,7 +76,6 @@ impl Request {
             Request::Handshake(req, _) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::Query(req, _) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::Synchronize(_) => bail!("cannot serialize synchronize request"),
-            Request::Heartbeat(req) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::ForwardPass(req, _) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::EmbedImage(req) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::InitializeAdapter(req) => Bytes::from(rmp_serde::to_vec_named(&req)?),
@@ -147,11 +146,7 @@ pub struct QueryResponse {
     pub value: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HeartbeatRequest {}
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HeartbeatResponse {}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ForwardPassRequest {

@@ -273,11 +273,7 @@ class Runtime:
             responses.append(resp)
         return responses
 
-    def heartbeat(
-        self, reqs: list[message.HeartbeatRequest]
-    ) -> list[message.HeartbeatResponse]:
-        """Handle heartbeat keepalive requests."""
-        return [message.HeartbeatResponse() for _ in reqs]
+
 
     def query(
         self, reqs: list[message.QueryRequest]

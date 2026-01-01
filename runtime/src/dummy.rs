@@ -4,13 +4,13 @@
 //! - Connects to the Pie engine via WebSocket
 //! - Authenticates using internal authentication
 //! - Registers as a remote service
-//! - Responds to heartbeats via ZMQ
+
 //! - Returns errors for all other handler requests
 //!
 //! The dummy backend is primarily used for CI testing to verify engine behavior
 //! without requiring a full model backend.
 
-use crate::model::request::{HANDSHAKE_ID, HEARTBEAT_ID, HandshakeRequest, HandshakeResponse};
+use crate::model::request::{HANDSHAKE_ID, HandshakeRequest, HandshakeResponse};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
@@ -159,7 +159,6 @@ pub async fn start_dummy_backend(config: DummyBackendConfig) -> Result<()> {
 /// Runs the ZMQ server loop.
 ///
 /// This function listens for ZMQ messages and responds appropriately:
-/// - Heartbeats: Responds with an empty success message
 /// - All other handlers: Responds with an error message
 async fn run_zmq_server(ready_tx: oneshot::Sender<String>) -> Result<()> {
     const MAX_RETRIES: u32 = 3;
@@ -270,9 +269,7 @@ async fn run_zmq_server(ready_tx: oneshot::Sender<String>) -> Result<()> {
                     continue;
                 }
             }
-        } else if handler_id == HEARTBEAT_ID {
-            // Respond to heartbeat with an empty success response
-            Bytes::from(rmp_serde::to_vec(&serde_json::json!({})).unwrap())
+
         } else {
             // For all other handlers, respond with an error
             let error_msg = format!(

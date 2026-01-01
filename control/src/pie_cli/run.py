@@ -8,8 +8,13 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
 from . import serve as serve_module
+
+console = Console()
 
 
 def run(
@@ -39,16 +44,16 @@ def run(
     """
     # Validate mutually exclusive options
     if inferlet is None and path is None:
-        typer.echo("❌ Error: Must specify either an inferlet name or --path", err=True)
+        console.print("[red]✗[/red] Specify an inferlet name or --path")
         raise typer.Exit(1)
     
     if inferlet is not None and path is not None:
-        typer.echo("❌ Error: Cannot specify both inferlet name and --path", err=True)
+        console.print("[red]✗[/red] Cannot use both inferlet name and --path")
         raise typer.Exit(1)
     
     # Verify inferlet exists if using path
     if path is not None and not path.exists():
-        typer.echo(f"❌ Inferlet file not found: {path}", err=True)
+        console.print(f"[red]✗[/red] File not found: {path}")
         raise typer.Exit(1)
 
     try:
@@ -58,16 +63,31 @@ def run(
 
     from . import manager
 
-    typer.echo("🚀 Starting Pie engine...")
+    console.print()
+    
+    # Show run info
+    inferlet_display = str(path) if path else inferlet
+    lines = Text()
+    lines.append(f"{'Inferlet':<15}", style="white")
+    lines.append(f"{inferlet_display}\n", style="dim")
+    lines.append(f"{'Model':<15}", style="white")
+    lines.append(backend_configs[0].get('model', 'unknown'), style="dim")
+    
+    console.print(Panel(lines, title="Pie Run", title_align="left", border_style="dim"))
+    console.print()
 
     server_handle = None
     backend_processes = []
 
     try:
         # Start engine and backends
-        server_handle, backend_processes = manager.start_engine_and_backend(
-            engine_config, backend_configs
-        )
+        with console.status("[dim]Starting engine...[/dim]"):
+            server_handle, backend_processes = manager.start_engine_and_backend(
+                engine_config, backend_configs
+            )
+        
+        console.print("[green]✓[/green] Engine started")
+        console.print()
 
         # Run the inferlet
         client_config = {
@@ -81,6 +101,8 @@ def run(
                 client_config,
                 path,
                 arguments or [],
+                server_handle,
+                backend_processes
             )
         else:
             # Launch from registry
@@ -88,17 +110,23 @@ def run(
                 client_config,
                 inferlet,
                 arguments or [],
+                server_handle,
+                backend_processes
             )
 
         # Cleanup
-        manager.terminate_engine_and_backend(server_handle, backend_processes)
-        typer.echo("✅ Shutdown complete.")
+        console.print()
+        with console.status("[dim]Shutting down...[/dim]"):
+            manager.terminate_engine_and_backend(server_handle, backend_processes)
+        console.print("[green]✓[/green] Complete")
 
     except KeyboardInterrupt:
-        typer.echo("\n⚠️ Interrupted.")
-        manager.terminate_engine_and_backend(server_handle, backend_processes)
+        console.print()
+        console.print("[yellow]![/yellow] Interrupted")
+        with console.status("[dim]Shutting down...[/dim]"):
+            manager.terminate_engine_and_backend(server_handle, backend_processes)
         raise typer.Exit(130)
     except Exception as e:
-        typer.echo(f"❌ Error: {e}", err=True)
+        console.print(f"[red]✗[/red] Error: {e}")
         manager.terminate_engine_and_backend(server_handle, backend_processes)
         raise typer.Exit(1)

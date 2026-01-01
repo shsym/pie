@@ -8,16 +8,21 @@ from typing import Optional
 
 import toml
 import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.text import Text
 
-from . import path
+from . import path as pie_path
 
+console = Console()
 app = typer.Typer(help="Manage configuration")
 
 
 def create_default_config_content(backend_type: str = "python") -> str:
     """Create the default configuration file content."""
-    cache_dir = str(path.get_pie_home() / "cache")
-    log_dir = str(path.get_pie_home() / "logs")
+    cache_dir = str(pie_path.get_pie_home() / "cache")
+    log_dir = str(pie_path.get_pie_home() / "logs")
     config = {
         "host": "127.0.0.1",
         "port": 8080,
@@ -58,17 +63,15 @@ def config_init(
     path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
     """Create a default config file."""
-    typer.echo("⚙️ Initializing Pie configuration...")
-
     config_path = Path(path) if path else pie_path.get_default_config_path()
 
     # Check if config file already exists
     if config_path.exists():
         overwrite = typer.confirm(
-            f"⚠️ Configuration file already exists at {config_path}. Overwrite?"
+            f"Configuration already exists at {config_path}. Overwrite?"
         )
         if not overwrite:
-            typer.echo("Aborted by user.")
+            console.print("[dim]Aborted.[/dim]")
             return
 
     # Create the directory if it doesn't exist
@@ -79,9 +82,11 @@ def config_init(
     config_content = create_default_config_content(backend_type)
     config_path.write_text(config_content)
 
-    typer.echo(f"✅ Configuration file created at {config_path}")
-    typer.echo("Config file content:")
-    typer.echo(config_content)
+    console.print(f"[green]✓[/green] Created {config_path}")
+    console.print()
+    
+    syntax = Syntax(config_content, "toml", theme="ansi_dark", line_numbers=False)
+    console.print(Panel(syntax, title="Config", title_align="left", border_style="dim"))
 
 
 @app.command("show")
@@ -92,16 +97,13 @@ def config_show(
     config_path = Path(path) if path else pie_path.get_default_config_path()
 
     if not config_path.exists():
-        typer.echo(
-            f"❌ Configuration file not found at {config_path}. "
-            "Run `pie-server config init` first.",
-            err=True,
-        )
+        console.print(f"[red]✗[/red] Configuration not found at {config_path}")
+        console.print("[dim]Run 'pie config init' first.[/dim]")
         raise typer.Exit(1)
 
-    typer.echo(f"📄 Configuration file at {config_path}:")
-    typer.echo()
-    typer.echo(config_path.read_text())
+    config_content = config_path.read_text()
+    syntax = Syntax(config_content, "toml", theme="ansi_dark", line_numbers=False)
+    console.print(Panel(syntax, title=str(config_path), title_align="left", border_style="dim"))
 
 
 @app.command("update")
@@ -196,20 +198,15 @@ def config_update(
     }
 
     if not engine_updates and not backend_updates:
-        typer.echo("⚠️ No configuration options provided to update.")
-        typer.echo("Use `pie-server config update --help` to see available options.")
+        console.print("[yellow]![/yellow] No options provided")
+        console.print("[dim]Run 'pie config update --help' to see available options.[/dim]")
         return
-
-    typer.echo("⚙️ Updating Pie configuration...")
 
     config_path = Path(path) if path else pie_path.get_default_config_path()
 
     if not config_path.exists():
-        typer.echo(
-            f"❌ Configuration file not found at {config_path}. "
-            "Run `pie-server config init` first.",
-            err=True,
-        )
+        console.print(f"[red]✗[/red] Configuration not found at {config_path}")
+        console.print("[dim]Run 'pie config init' first.[/dim]")
         raise typer.Exit(1)
 
     # Read and parse the existing config
@@ -218,22 +215,19 @@ def config_update(
     # Update engine configuration
     for key, value in engine_updates.items():
         config[key] = value
-        typer.echo(f"✅ Updated {key}")
+        console.print(f"[green]✓[/green] {key} = {value}")
 
     # Update backend configuration (first backend entry)
     if backend_updates:
         if not config.get("backend"):
-            typer.echo(
-                "❌ No backend configuration found in config file. "
-                "Cannot update backend settings.",
-                err=True,
-            )
+            console.print("[red]✗[/red] No backend configuration found")
             raise typer.Exit(1)
 
         for key, value in backend_updates.items():
             config["backend"][0][key] = value
-            typer.echo(f"✅ Updated backend {key}")
+            console.print(f"[green]✓[/green] backend.{key} = {value}")
 
     # Write the updated config
     config_path.write_text(toml.dumps(config))
-    typer.echo(f"✅ Configuration file updated at {config_path}")
+    console.print()
+    console.print(f"[dim]Saved to {config_path}[/dim]")

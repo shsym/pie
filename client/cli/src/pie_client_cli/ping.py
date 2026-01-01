@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import typer
+
 from . import engine
 
 
@@ -33,7 +35,7 @@ def handle_ping_command(
     )
     
     url = f"ws://{client_config.host}:{client_config.port}"
-    print(f"🔍 Pinging Pie engine at {url}")
+    typer.echo(f"🔍 Pinging Pie engine at {url}")
     
     client = engine.connect_and_authenticate(client_config)
     
@@ -42,6 +44,6 @@ def handle_ping_command(
         engine.ping(client)
         duration = time.perf_counter() - start_time
         
-        print(f"✅ Pie engine is alive and responsive! (latency: {duration * 1000:.3f}ms)")
+        typer.echo(f"✅ Pie engine is alive and responsive! (latency: {duration * 1000:.3f}ms)")
     finally:
         engine.close_client(client)

@@ -100,9 +100,7 @@ pub enum InternalEvent {
         cur_num_rejected_backends: Option<u32>,
         tx: oneshot::Sender<(u32, u32)>,
     },
-    StopBackendHeartbeat {
-        tx: oneshot::Sender<()>,
-    },
+
 }
 
 impl ServiceCommand for ServerEvent {
@@ -273,9 +271,7 @@ impl Service for Server {
                         tx,
                     );
                 }
-                InternalEvent::StopBackendHeartbeat { tx } => {
-                    stop_backend_heartbeat(tx);
-                }
+
             },
         }
     }
@@ -1340,12 +1336,7 @@ impl Drop for Session {
     }
 }
 
-fn stop_backend_heartbeat(tx: oneshot::Sender<()>) {
-    tokio::spawn(async move {
-        model::stop_heartbeat().await;
-        tx.send(()).unwrap();
-    });
-}
+
 
 /// Parses an inferlet name into (namespace, name, version).
 ///

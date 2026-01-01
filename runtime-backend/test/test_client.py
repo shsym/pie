@@ -18,8 +18,7 @@ import zmq
 from src.message import (
     HandshakeRequest,
     HandshakeResponse,
-    HeartbeatRequest,
-    HeartbeatResponse,
+
     QueryRequest,
     QueryResponse,
     ForwardPassRequest,
@@ -31,7 +30,7 @@ class HandlerId(IntEnum):
     """Handler message types matching server.py."""
 
     HANDSHAKE = 0
-    HEARTBEAT = 1
+
     QUERY = 2
     FORWARD_PASS = 3
     EMBED_IMAGE = 4
@@ -115,17 +114,7 @@ class TestClient:
             print(f"[TestClient] Handshake response: model={resp.model_name}")
         return responses
 
-    def send_heartbeat(self) -> list[HeartbeatResponse]:
-        """Send a heartbeat request."""
-        req = HeartbeatRequest()
-        print("[TestClient] Sending heartbeat")
 
-        raw_responses = self._send_request(HandlerId.HEARTBEAT, [req])
-        decoder = msgspec.msgpack.Decoder(HeartbeatResponse)
-        responses = [decoder.decode(r) for r in raw_responses]
-
-        print(f"[TestClient] Heartbeat response received ({len(responses)} responses)")
-        return responses
 
     def send_query(self, query: str) -> list[QueryResponse]:
         """Send a query request."""
@@ -235,13 +224,7 @@ def run_test_suite(endpoint: str):
         except Exception as e:
             print(f"✗ Handshake failed: {e}")
 
-        # Test 2: Heartbeat
-        print("\n--- Test 2: Heartbeat ---")
-        try:
-            responses = client.send_heartbeat()
-            print(f"✓ Heartbeat successful, got {len(responses)} response(s)")
-        except Exception as e:
-            print(f"✗ Heartbeat failed: {e}")
+
 
         # Test 3: Query
         print("\n--- Test 3: Query ---")
@@ -265,15 +248,7 @@ def run_test_suite(endpoint: str):
         except Exception as e:
             print(f"✗ Forward pass failed: {e}")
 
-        # Test 5: Multiple heartbeats (stress test)
-        print("\n--- Test 5: Heartbeat Stress Test ---")
-        try:
-            for i in range(5):
-                client.send_heartbeat()
-                time.sleep(0.1)
-            print("✓ Heartbeat stress test passed (5 heartbeats)")
-        except Exception as e:
-            print(f"✗ Heartbeat stress test failed: {e}")
+
 
         print("\n" + "=" * 60)
         print("Test Suite Complete")
@@ -294,7 +269,7 @@ def main():
     parser.add_argument(
         "--test",
         type=str,
-        choices=["handshake", "heartbeat", "query", "forward", "all"],
+        choices=["handshake", "query", "forward", "all"],
         default="all",
         help="Which test to run",
     )
@@ -307,8 +282,7 @@ def main():
         try:
             if args.test == "handshake":
                 client.send_handshake()
-            elif args.test == "heartbeat":
-                client.send_heartbeat()
+
             elif args.test == "query":
                 client.send_query("Test query from test client")
             elif args.test == "forward":

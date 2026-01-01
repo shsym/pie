@@ -268,8 +268,11 @@ class PieClient:
 
     async def close(self):
         """Gracefully close the WebSocket connection and shut down background tasks."""
-        if self.ws and not self.ws.closed:
-            await self.ws.close()
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
         if self.listener_task:
             try:
                 self.listener_task.cancel()

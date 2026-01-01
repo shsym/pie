@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import blake3
+import typer
 
 from . import engine
 
@@ -133,14 +134,14 @@ def handle_submit_command(
         
         # Calculate the hash of the final composed blob
         program_hash = blake3.blake3(final_blob).hexdigest()
-        print(f"Final inferlet hash: {program_hash}")
+        typer.echo(f"Final inferlet hash: {program_hash}")
         
         # Upload the composed inferlet to the server
         if not engine.program_exists(client, program_hash):
             engine.upload_program(client, final_blob)
-            print("✅ Inferlet upload successful.")
+            typer.echo("✅ Inferlet upload successful.")
         else:
-            print("Inferlet already exists on server.")
+            typer.echo("Inferlet already exists on server.")
         
         # Launch the instance
         instance = engine.launch_instance(
@@ -150,7 +151,7 @@ def handle_submit_command(
             detached,
         )
         
-        print(f"✅ Inferlet launched with ID: {instance.instance_id}")
+        typer.echo(f"✅ Inferlet launched with ID: {instance.instance_id}")
         
         if not detached:
             engine.stream_inferlet_output(instance, client)

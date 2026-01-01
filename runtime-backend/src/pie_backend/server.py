@@ -19,7 +19,6 @@ from .message import (
     EmbedImageRequest,
     ForwardPassRequest,
     HandshakeRequest,
-    HeartbeatRequest,
     InitializeAdapterRequest,
     QueryRequest,
     UpdateAdapterRequest,
@@ -29,7 +28,7 @@ from .message import (
 from .runtime import Runtime
 from .utils import terminate
 
-HEARTBEAT_TIMEOUT = 15.0  # seconds
+
 
 
 def start_server(
@@ -54,7 +53,6 @@ def start_server(
     endpoint = f"ipc:///tmp/pie-model-service-{unique_id}"
 
     # Queues for internal communication
-    heartbeat_request_queue = queue.Queue()
     work_request_queue = queue.Queue()
     response_queue = queue.Queue()
     
@@ -67,23 +65,12 @@ def start_server(
     # |         io_thread           |  <-- Owns ZMQ socket (Reads & Writes)
     # +-----------------------------+
     #   ^  |                      ^
-    #   |  | (heartbeat req)      | (response queue)
+    #   |  | (work req queue)     | (response queue)
     #   |  v                      |
-    #   | +------------------+    |
-    #   | | heartbeat_thread |----+
-    #   | +------------------+
-    #   |
-    #   | (work req queue)
-    #   v
+    #   v +------------------+    |
+    # +------------------+   |    |
+    # |  worker_thread   |---+----+
     # +------------------+
-    # |  worker_thread   |----> (Optional: sends response)
-    # +------------------+
-
-    threading.Thread(
-        target=heartbeat_thread,
-        args=(heartbeat_request_queue, response_queue, service, shutdown_event),
-        daemon=True,
-    ).start()
 
     threading.Thread(
         target=worker_thread,
@@ -94,7 +81,7 @@ def start_server(
     # Replaces zmq_response_thread and zmq_listen_thread
     threading.Thread(
         target=io_thread,
-        args=(endpoint, heartbeat_request_queue, work_request_queue, response_queue, shutdown_event),
+        args=(endpoint, work_request_queue, response_queue, shutdown_event),
         daemon=True,
     ).start()
 
@@ -195,52 +182,14 @@ def register_thread(
         shutdown_event.set()
 
 
-def heartbeat_thread(
-    heartbeat_request_queue: queue.Queue, 
-    response_queue: queue.Queue, 
-    service: Runtime,
-    shutdown_event: threading.Event
-) -> None:
-    """Heartbeat thread that responds to heartbeat requests to the controller. And if no
-    heartbeat is received for the timeout period, terminates the program."""
 
-    last_heartbeat_time = time.monotonic()
-
-    try:
-        while not shutdown_event.is_set():
-            # Check for timeout before processing queue
-            if time.monotonic() - last_heartbeat_time > HEARTBEAT_TIMEOUT:
-                print(
-                    f"[!] Heartbeat timeout after {HEARTBEAT_TIMEOUT}s, exiting",
-                    file=sys.stderr,
-                )
-                shutdown_event.set()
-                return
-
-            try:
-                # Use timeout to allow checking shutdown_event periodically
-                item = heartbeat_request_queue.get(timeout=1.0)
-                client_identity, corr_id_bytes, handler_id_bytes, reqs = item
-                
-                resps = service.heartbeat(reqs)
-                response_queue.put(
-                    (client_identity, corr_id_bytes, handler_id_bytes, resps)
-                )
-                
-                last_heartbeat_time = time.monotonic()
-            except queue.Empty:
-                continue
-
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        print(f"Unhandled error occurred in the heartbeat thread: {exc}")
-        shutdown_event.set()
 
 
 class HandlerId(enum.Enum):
     """Enumeration of handler message types."""
 
     HANDSHAKE = 0
-    HEARTBEAT = 1
+
     QUERY = 2
     FORWARD_PASS = 3
     EMBED_IMAGE = 4
@@ -286,9 +235,7 @@ def worker_thread(
                     service.upload_adapter(reqs)
                 case HandlerId.DOWNLOAD_HANDLER.value:
                     resps = service.download_adapter(reqs)
-                case HandlerId.HEARTBEAT.value:
-                    # Should be handled by heartbeat thread, but if it slips through:
-                    print("Heartbeat should not be handled by the worker thread", file=sys.stderr)
+
                 case _:
                     print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
 
@@ -304,7 +251,6 @@ def worker_thread(
 
 def io_thread(
     endpoint: str,
-    heartbeat_queue: queue.Queue,
     work_queue: queue.Queue,
     response_queue: queue.Queue,
     shutdown_event: threading.Event
@@ -328,7 +274,7 @@ def io_thread(
 
     decoders = {
         HandlerId.HANDSHAKE.value: msgspec.msgpack.Decoder(HandshakeRequest),
-        HandlerId.HEARTBEAT.value: msgspec.msgpack.Decoder(HeartbeatRequest),
+
         HandlerId.QUERY.value: msgspec.msgpack.Decoder(QueryRequest),
         HandlerId.FORWARD_PASS.value: msgspec.msgpack.Decoder(ForwardPassRequest),
         HandlerId.EMBED_IMAGE.value: msgspec.msgpack.Decoder(EmbedImageRequest),
@@ -393,14 +339,9 @@ def io_thread(
                     continue
 
                 # Dispatch
-                if handler_id == HandlerId.HEARTBEAT.value:
-                    heartbeat_queue.put(
-                        (client_identity, corr_id_bytes, handler_id_bytes, reqs)
-                    )
-                else:
-                    work_queue.put(
-                        (client_identity, corr_id_bytes, handler_id_bytes, handler_id, reqs)
-                    )
+                work_queue.put(
+                    (client_identity, corr_id_bytes, handler_id_bytes, handler_id, reqs)
+                )
 
     except zmq.error.ZMQError as exc:
         if exc.errno in {zmq.ETERM, zmq.ENOTSOCK}:

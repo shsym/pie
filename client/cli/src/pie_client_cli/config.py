@@ -6,12 +6,12 @@ updating, and display of CLI settings.
 
 import getpass
 import os
-import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
 import toml
+import typer
 
 from pie_client.crypto import ParsedPrivateKey
 
@@ -67,8 +67,8 @@ def validate_private_key(key_path: str) -> bool:
     expanded_path = Path(key_path).expanduser()
     
     if not expanded_path.exists():
-        print()
-        print(f"⚠️ Warning: Private key file not found at '{expanded_path}'")
+        typer.echo()
+        typer.echo(f"⚠️ Warning: Private key file not found at '{expanded_path}'")
         return False
     
     # Check permissions on Unix
@@ -76,8 +76,8 @@ def validate_private_key(key_path: str) -> bool:
         try:
             path_utils.check_private_key_permissions(expanded_path)
         except PermissionError as e:
-            print()
-            print(f"⚠️ Warning: {e}")
+            typer.echo()
+            typer.echo(f"⚠️ Warning: {e}")
             return False
     
     try:
@@ -85,14 +85,14 @@ def validate_private_key(key_path: str) -> bool:
         ParsedPrivateKey.parse(key_content)
         return True
     except ValueError as e:
-        print()
-        print(f"⚠️ Warning: Failed to parse private key at '{expanded_path}'")
-        print(f"   Error: {e}")
+        typer.echo()
+        typer.echo(f"⚠️ Warning: Failed to parse private key at '{expanded_path}'")
+        typer.echo(f"   Error: {e}")
         return False
     except IOError as e:
-        print()
-        print(f"⚠️ Warning: Failed to read private key file at '{expanded_path}'")
-        print(f"   Error: {e}")
+        typer.echo()
+        typer.echo(f"⚠️ Warning: Failed to read private key file at '{expanded_path}'")
+        typer.echo(f"   Error: {e}")
         return False
 
 
@@ -120,11 +120,8 @@ def handle_config_init(enable_auth: bool = True, custom_path: Optional[str] = No
     
     # Check if config file already exists
     if config_path.exists():
-        print(f"Configuration file already exists at '{config_path}'. Overwrite? (y/N): ", end="")
-        sys.stdout.flush()
-        response = input().strip().lower()
-        if response != "y":
-            print("Aborting. Configuration file was not overwritten.")
+        if not typer.confirm(f"Configuration file already exists at '{config_path}'. Overwrite?", default=False):
+            typer.echo("Aborting. Configuration file was not overwritten.")
             return
     
     # Create parent directories
@@ -141,28 +138,28 @@ def handle_config_init(enable_auth: bool = True, custom_path: Optional[str] = No
     )
     config_path.write_text(content)
     
-    print(f"✅ Created default configuration file at '{config_path}'")
-    print(content)
+    typer.echo(f"✅ Created default configuration file at '{config_path}'")
+    typer.echo(content)
     
     # Print messages about the private key if authentication is enabled
     if enable_auth:
         if found_key_path:
-            print(f"✅ Using private key found at '{found_key_path}'")
-            print("   You can update the key path in the config file:")
-            print("      `pie-cli config update --private-key-path <path>`")
+            typer.echo(f"✅ Using private key found at '{found_key_path}'")
+            typer.echo("   You can update the key path in the config file:")
+            typer.echo("      `pie-cli config update --private-key-path <path>`")
             
             if not validate_private_key(found_key_path):
-                print(
+                typer.echo(
                     "   The configuration has been saved, but you'll need to "
                     "provide a valid key to connect."
                 )
         else:
-            print()
-            print(f"⚠️ Warning: Private key not found in '~/.ssh', using default path: '{default_key_path}'")
-            print("   Please take either of the following actions when using authentication:")
-            print("   1. Generate an SSH key pair by running `ssh-keygen`")
-            print("   2. Update the key path in the config file:")
-            print("      `pie-cli config update --private-key-path <path>`")
+            typer.echo()
+            typer.echo(f"⚠️ Warning: Private key not found in '~/.ssh', using default path: '{default_key_path}'")
+            typer.echo("   Please take either of the following actions when using authentication:")
+            typer.echo("   1. Generate an SSH key pair by running `ssh-keygen`")
+            typer.echo("   2. Update the key path in the config file:")
+            typer.echo("      `pie-cli config update --private-key-path <path>`")
 
 
 def handle_config_update(
@@ -216,21 +213,21 @@ def handle_config_update(
         config.enable_auth = enable_auth
     
     if not updated:
-        print("⚠️ No fields provided to update.")
+        typer.echo("⚠️ No fields provided to update.")
         return
     
     # Save updated config
     config.save(config_path)
     
-    print(f"✅ Updated configuration file at '{config_path}'")
-    print("   Updated fields:")
+    typer.echo(f"✅ Updated configuration file at '{config_path}'")
+    typer.echo("   Updated fields:")
     for field_update in updated:
-        print(f"   - {field_update}")
+        typer.echo(f"   - {field_update}")
     
     # Validate key if updated
     if updated_key_path is not None:
         if not validate_private_key(updated_key_path):
-            print(
+            typer.echo(
                 "   The configuration has been saved, but you'll need to "
                 "provide a valid key to connect."
             )
@@ -251,5 +248,5 @@ def handle_config_show(custom_path: Optional[str] = None) -> None:
         )
     
     content = config_path.read_text()
-    print(f"📄 Configuration file at '{config_path}':")
-    print(content)
+    typer.echo(f"📄 Configuration file at '{config_path}':")
+    typer.echo(content)

@@ -7,6 +7,8 @@ to a running inferlet instance on a Pie engine and streaming its output.
 from pathlib import Path
 from typing import Optional
 
+import typer
+
 from . import engine
 
 
@@ -54,12 +56,12 @@ def handle_attach_command(
             )
         
         if len(matching) > 1:
-            print(f"❌ The prefix '{instance_id_prefix}' is ambiguous. Multiple instances match:")
-            print()
+            typer.echo(f"❌ The prefix '{instance_id_prefix}' is ambiguous. Multiple instances match:")
+            typer.echo()
             for inst in matching:
-                print(f"  {inst.id}")
-            print()
-            print("Please provide a more specific prefix to uniquely identify the instance.")
+                typer.echo(f"  {inst.id}")
+            typer.echo()
+            typer.echo("Please provide a more specific prefix to uniquely identify the instance.")
             raise ValueError("Ambiguous instance ID prefix")
         
         # Found exactly one match
@@ -69,7 +71,7 @@ def handle_attach_command(
         # Attach to the instance
         instance = engine.attach_instance(client, instance_id)
         
-        print(f"✅ Attached to instance {instance_id}")
+        typer.echo(f"✅ Attached to instance {instance_id}")
         
         engine.stream_inferlet_output(instance, client)
     

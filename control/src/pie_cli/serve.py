@@ -8,8 +8,13 @@ from pathlib import Path
 
 import toml
 import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
 from . import path as pie_path
+
+console = Console()
 
 
 def load_config(
@@ -23,14 +28,9 @@ def load_config(
     # Load config file
     file_path = config_path or pie_path.get_default_config_path()
     if not file_path.exists():
-        raise typer.Exit(
-            typer.echo(
-                f"❌ Configuration file not found at {file_path}. "
-                "Run `pie config init` first.",
-                err=True,
-            )
-            or 1
-        )
+        console.print(f"[red]✗[/red] Configuration not found at {file_path}")
+        console.print("[dim]Run 'pie config init' first.[/dim]")
+        raise typer.Exit(1)
 
     config = toml.loads(file_path.read_text())
 
@@ -47,13 +47,8 @@ def load_config(
 
     backend_configs = config.get("backend", [])
     if not backend_configs:
-        raise typer.Exit(
-            typer.echo(
-                "❌ No backend configurations found in the configuration file.",
-                err=True,
-            )
-            or 1
-        )
+        console.print("[red]✗[/red] No backend configuration found")
+        raise typer.Exit(1)
 
     return engine_config, backend_configs
 
@@ -79,45 +74,74 @@ def serve(
     # Import here to avoid circular imports and allow module to load without Rust
     from . import manager
 
-    if interactive:
-        typer.echo("🚀 Starting Pie engine (interactive mode)...")
-    else:
-        typer.echo("🚀 Starting Pie engine...")
+    console.print()
+    
+    # Show config summary
+    mode = "interactive" if interactive else "server"
+    lines = Text()
+    lines.append(f"{'Host':<15}", style="white")
+    lines.append(f"{engine_config['host']}:{engine_config['port']}\n", style="dim")
+    lines.append(f"{'Model':<15}", style="white")
+    lines.append(f"{backend_configs[0].get('model', 'unknown')}\n", style="dim")
+    lines.append(f"{'Device':<15}", style="white")
+    device = backend_configs[0].get("device", ["unknown"])
+    device_str = ", ".join(device) if isinstance(device, list) else device
+    lines.append(device_str, style="dim")
+    
+    console.print(Panel(lines, title=f"Pie Engine ({mode})", title_align="left", border_style="dim"))
+    console.print()
 
     server_handle = None
     backend_processes = []
     
     try:
         # Start engine and backends
-        server_handle, backend_processes = manager.start_engine_and_backend(
-            engine_config, backend_configs
-        )
+        with console.status("[dim]Starting engine...[/dim]"):
+            server_handle, backend_processes = manager.start_engine_and_backend(
+                engine_config, backend_configs
+            )
+        
+        console.print("[green]✓[/green] Engine started")
 
         if interactive:
-            typer.echo(
-                "Entering interactive session. Type 'help' for commands or use ↑/↓ for history."
-            )
+            console.print("[dim]Type 'help' for commands, ↑/↓ for history[/dim]")
+            console.print()
             manager.run_interactive_shell(engine_config, server_handle.internal_token)
         else:
-            typer.echo("Press Ctrl+C to stop.")
+            console.print("[dim]Press Ctrl+C to stop[/dim]")
             import signal
 
+            import time
+            typer.echo("[dim]Use check_backend_processes loop to monitor...[/dim]")
+
             try:
-                signal.pause()
+                # Keep running while processes are alive
+                while True:
+                    if not manager.check_backend_processes(backend_processes):
+                        typer.echo("[red]A backend process died. Shutting down.[/red]")
+                        break
+                    
+                    if server_handle and hasattr(server_handle, 'is_running'):
+                         if not server_handle.is_running():
+                             typer.echo("[red]Engine process died. Shutting down.[/red]")
+                             break
+
+                    time.sleep(1.0)
             except KeyboardInterrupt:
                 pass
 
         # Cleanup
-        typer.echo()
-        manager.terminate_engine_and_backend(server_handle, backend_processes)
-        typer.echo("✅ Shutdown complete.")
+        console.print()
+        with console.status("[dim]Shutting down...[/dim]"):
+            manager.terminate_engine_and_backend(server_handle, backend_processes)
+        console.print("[green]✓[/green] Shutdown complete")
 
     except KeyboardInterrupt:
-        typer.echo()
-        manager.terminate_engine_and_backend(server_handle, backend_processes)
-        typer.echo("✅ Shutdown complete.")
+        console.print()
+        with console.status("[dim]Shutting down...[/dim]"):
+            manager.terminate_engine_and_backend(server_handle, backend_processes)
+        console.print("[green]✓[/green] Shutdown complete")
     except Exception as e:
-        typer.echo(f"❌ Error: {e}", err=True)
+        console.print(f"[red]✗[/red] Error: {e}")
         manager.terminate_engine_and_backend(server_handle, backend_processes)
         raise typer.Exit(1)
-

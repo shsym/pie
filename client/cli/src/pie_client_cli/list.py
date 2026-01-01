@@ -7,6 +7,8 @@ all running inferlet instances from a Pie engine.
 from pathlib import Path
 from typing import Optional
 
+import typer
+
 from . import engine
 
 
@@ -62,12 +64,12 @@ def handle_list_command(
         instances = engine.list_instances(client)
         
         if not instances:
-            print("✅ No running instances found.")
+            typer.echo("✅ No running instances found.")
             return
         
         plural = "" if len(instances) == 1 else "s"
-        print(f"✅ Found {len(instances)} running instance{plural}:")
-        print()
+        typer.echo(f"✅ Found {len(instances)} running instance{plural}:")
+        typer.echo()
         
         # Column widths
         id_width = 36 if full else (8 if long else 4)
@@ -75,13 +77,13 @@ def handle_list_command(
         args_width = 60 if full else (80 if long else 84)
         
         # Print header
-        print(
+        typer.echo(
             f"{'ID':<{id_width}}  {'STATUS':<{status_width}}  "
             f"{'ARGUMENTS':<{args_width}}"
         )
         
         # Print separator
-        print(
+        typer.echo(
             f"{'-' * id_width}  {'-' * status_width}  "
             f"{'-' * args_width}"
         )
@@ -101,7 +103,7 @@ def handle_list_command(
             args_str = format_arguments(inst.arguments)
             args_display = truncate_with_ellipsis(args_str, args_width)
             
-            print(
+            typer.echo(
                 f"{uuid_display:<{id_width}}  {status_display:<{status_width}}  "
                 f"{args_display:<{args_width}}"
             )

@@ -215,10 +215,7 @@ def test_forward_pass_components():
     print(f"    ✓ model_name: {responses[0].model_name}")
     print(f"    ✓ kv_page_size: {responses[0].kv_page_size}")
     
-    # Test heartbeat
-    print("\n[3] Testing heartbeat...")
-    responses = runtime.heartbeat([message.HeartbeatRequest()])
-    print(f"    ✓ Got {len(responses)} response(s)")
+
     
     # Test query
     print("\n[4] Testing query (ping)...")

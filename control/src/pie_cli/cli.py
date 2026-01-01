@@ -11,8 +11,8 @@ from .run import run
 from .doctor import doctor
 
 app = typer.Typer(
-    name="pie-server",
-    help="Pie Inference Engine Server",
+    name="pie",
+    help="Pie: Programmable Inference Engine",
     add_completion=False,
 )
 
@@ -29,7 +29,7 @@ app.add_typer(auth.app, name="auth")
 
 @app.callback()
 def main() -> None:
-    """Pie Server - CLI for the Pie Inference Engine."""
+    """Pie CLI - CLI for the Pie Inference Engine."""
     pass
 
 
