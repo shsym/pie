@@ -9,16 +9,20 @@ from typing import Optional
 
 import typer
 
-from . import path as pie_path
 from . import serve as serve_module
 
 
 def run(
-    inferlet: Path = typer.Argument(..., help="Path to the .wasm inferlet file"),
+    inferlet: Optional[str] = typer.Argument(
+        None, help="Inferlet name from registry (e.g., 'std/text-completion@0.1.0')"
+    ),
+    path: Optional[Path] = typer.Option(
+        None, "--path", "-p",
+        help="Path to a local .wasm inferlet file"
+    ),
     config: Optional[Path] = typer.Option(
         None, "--config", "-c", help="Path to TOML configuration file"
     ),
-    log: Optional[Path] = typer.Option(None, "--log", help="Log file to write to"),
     arguments: Optional[list[str]] = typer.Argument(
         None, help="Arguments to pass to the inferlet"
     ),
@@ -27,21 +31,28 @@ def run(
 
     This command starts the Pie engine, runs the specified inferlet,
     waits for it to complete, and then shuts down.
+    
+    You can specify an inferlet either by registry name or by path (mutually exclusive):
+    
+    - By registry: pie run std/text-completion@0.1.0
+    - By path: pie run --path ./my_inferlet.wasm
     """
-    # Verify inferlet exists
-    if not inferlet.exists():
-        typer.echo(f"❌ Inferlet file not found: {inferlet}", err=True)
+    # Validate mutually exclusive options
+    if inferlet is None and path is None:
+        typer.echo("❌ Error: Must specify either an inferlet name or --path", err=True)
+        raise typer.Exit(1)
+    
+    if inferlet is not None and path is not None:
+        typer.echo("❌ Error: Cannot specify both inferlet name and --path", err=True)
+        raise typer.Exit(1)
+    
+    # Verify inferlet exists if using path
+    if path is not None and not path.exists():
+        typer.echo(f"❌ Inferlet file not found: {path}", err=True)
         raise typer.Exit(1)
 
     try:
-        engine_config, backend_configs = serve_module.load_config(
-            config,
-            no_auth=False,
-            host=None,
-            port=None,
-            verbose=False,
-            log=log,
-        )
+        engine_config, backend_configs = serve_module.load_config(config)
     except typer.Exit:
         raise
 
@@ -64,11 +75,20 @@ def run(
             "port": engine_config["port"],
             "internal_auth_token": server_handle.internal_token,
         }
-        manager.submit_inferlet_and_wait(
-            client_config,
-            inferlet,
-            arguments or [],
-        )
+        
+        if path is not None:
+            manager.submit_inferlet_and_wait(
+                client_config,
+                path,
+                arguments or [],
+            )
+        else:
+            # Launch from registry
+            manager.submit_inferlet_from_registry_and_wait(
+                client_config,
+                inferlet,
+                arguments or [],
+            )
 
         # Cleanup
         manager.terminate_engine_and_backend(server_handle, backend_processes)
@@ -82,4 +102,3 @@ def run(
         typer.echo(f"❌ Error: {e}", err=True)
         manager.terminate_engine_and_backend(server_handle, backend_processes)
         raise typer.Exit(1)
-

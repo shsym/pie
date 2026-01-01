@@ -10,12 +10,8 @@ import typer
 
 from . import abort as abort_cmd
 from . import attach as attach_cmd
-from . import build as build_cmd
 from . import config as config_cmd
-from . import create as create_cmd
-from . import inferlet as inferlet_cmd
 from . import list as list_cmd
-from . import login as login_cmd
 from . import ping as ping_cmd
 from . import submit as submit_cmd
 
@@ -30,8 +26,7 @@ app = typer.Typer(
 config_app = typer.Typer(help="Manage configuration.")
 app.add_typer(config_app, name="config")
 
-# Inferlet subcommand group (from registry)
-app.add_typer(inferlet_cmd.inferlet_app, name="inferlet")
+
 
 
 # ============================================================================
@@ -75,58 +70,13 @@ PrivateKeyPathOption = Annotated[
 ]
 
 
-# ============================================================================
-# Login command (Registry authentication)
-# ============================================================================
-
-@app.command()
-def login() -> None:
-    """Authenticate with the Pie Registry using GitHub OAuth."""
-    try:
-        login_cmd.handle_login_command()
-    except Exception as e:
-        typer.echo(f"Error: {e}", err=True)
-        raise typer.Exit(1)
 
 
-# ============================================================================
-# Create command
-# ============================================================================
-
-@app.command()
-def create(
-    name: Annotated[str, typer.Argument(help="Name of the inferlet project.")],
-    js: Annotated[bool, typer.Option("--js", help="Use JavaScript instead of TypeScript.")] = False,
-    output: Annotated[Optional[Path], typer.Option("-o", "--output", help="Output directory.")] = None,
-) -> None:
-    """Create a new JavaScript/TypeScript inferlet project."""
-    try:
-        create_cmd.handle_create_command(name=name, js=js, output=output)
-    except Exception as e:
-        typer.echo(f"Error: {e}", err=True)
-        raise typer.Exit(1)
 
 
-# ============================================================================
-# Build command
-# ============================================================================
 
-@app.command()
-def build(
-    input_path: Annotated[Path, typer.Argument(help="Input file (.js, .ts) or directory with package.json.")],
-    output: Annotated[Path, typer.Option("-o", "--output", help="Output .wasm file path.")],
-    debug: Annotated[bool, typer.Option("--debug", help="Enable debug build (include source maps).")] = False,
-) -> None:
-    """Build a JavaScript/TypeScript inferlet into a WebAssembly component."""
-    try:
-        build_cmd.handle_build_command(
-            input_path=expand_path(input_path),
-            output=expand_path(output),
-            debug=debug,
-        )
-    except Exception as e:
-        typer.echo(f"Error: {e}", err=True)
-        raise typer.Exit(1)
+
+
 
 
 # ============================================================================

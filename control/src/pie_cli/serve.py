@@ -5,7 +5,6 @@ Starts the Pie engine and optionally provides an interactive shell session.
 """
 
 from pathlib import Path
-from typing import Optional
 
 import toml
 import typer
@@ -14,12 +13,7 @@ from . import path as pie_path
 
 
 def load_config(
-    config_path: Optional[Path],
-    no_auth: bool,
-    host: Optional[str],
-    port: Optional[int],
-    verbose: bool,
-    log: Optional[Path],
+    config_path: Path | None,
 ) -> tuple[dict, list[dict]]:
     """Load and merge configuration from file and CLI arguments.
 
@@ -32,7 +26,7 @@ def load_config(
         raise typer.Exit(
             typer.echo(
                 f"❌ Configuration file not found at {file_path}. "
-                "Run `pie-server config init` first.",
+                "Run `pie config init` first.",
                 err=True,
             )
             or 1
@@ -42,12 +36,12 @@ def load_config(
 
     # Build engine config with CLI overrides
     engine_config = {
-        "host": host or config.get("host", "127.0.0.1"),
-        "port": port or config.get("port", 8080),
-        "enable_auth": False if no_auth else config.get("enable_auth", True),
+        "host": config.get("host", "127.0.0.1"),
+        "port": config.get("port", 8080),
+        "enable_auth": config.get("enable_auth", True),
         "cache_dir": config.get("cache_dir", str(pie_path.get_pie_home() / "cache")),
-        "verbose": verbose or config.get("verbose", False),
-        "log_dir": str(log) if log else config.get("log_dir", str(pie_path.get_pie_home() / "logs")),
+        "verbose": config.get("verbose", False),
+        "log_dir": config.get("log_dir", str(pie_path.get_pie_home() / "logs")),
         "registry": config.get("registry", "https://registry.pie-project.org/"),
     }
 
@@ -65,15 +59,8 @@ def load_config(
 
 
 def serve(
-    config: Optional[Path] = typer.Option(
+    config: Path | None = typer.Option(
         None, "--config", "-c", help="Path to TOML configuration file"
-    ),
-    host: Optional[str] = typer.Option(None, "--host", help="Network host to bind to"),
-    port: Optional[int] = typer.Option(None, "--port", help="Network port to use"),
-    no_auth: bool = typer.Option(False, "--no-auth", help="Disable authentication"),
-    log: Optional[Path] = typer.Option(None, "--log", help="Log file to write to"),
-    verbose: bool = typer.Option(
-        False, "--verbose", "-v", help="Enable verbose console logging"
     ),
     interactive: bool = typer.Option(
         False, "--interactive", "-i", help="Enable interactive shell mode"
@@ -85,9 +72,7 @@ def serve(
     services. In interactive mode, it provides a shell for running inferlets.
     """
     try:
-        engine_config, backend_configs = load_config(
-            config, no_auth, host, port, verbose, log
-        )
+        engine_config, backend_configs = load_config(config)
     except typer.Exit:
         raise
 

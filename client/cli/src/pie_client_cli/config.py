@@ -26,7 +26,6 @@ class ConfigFile:
     username: Optional[str] = None
     private_key_path: Optional[str] = None
     enable_auth: Optional[bool] = None
-    registry_token: Optional[str] = None
 
     @classmethod
     def load(cls, path: Path) -> "ConfigFile":

@@ -1,6 +1,6 @@
-"""Inferlet subcommand implementation for the Pie CLI.
+"""Inferlet subcommand implementation for Bakery.
 
-This module implements the `pie-client inferlet` subcommand group for
+This module implements the `bakery inferlet` subcommand group for
 searching, querying, and publishing inferlets to the Pie Registry.
 """
 
@@ -11,8 +11,7 @@ from typing import Annotated, Optional
 import toml
 import typer
 
-from .config import ConfigFile
-from . import path as path_utils
+from .config import get_token
 from .registry import (
     REGISTRY_URL,
     RegistryClient,
@@ -29,15 +28,6 @@ inferlet_app = typer.Typer(
     help="Manage inferlet packages from the Pie Registry.",
     no_args_is_help=True,
 )
-
-
-def _get_token() -> Optional[str]:
-    """Load the registry token from config if available."""
-    config_path = path_utils.get_default_config_path()
-    if config_path.exists():
-        config = ConfigFile.load(config_path)
-        return config.registry_token
-    return None
 
 
 def _format_size(size_bytes: int) -> str:
@@ -211,8 +201,8 @@ def publish(
 ) -> None:
     """Publish the inferlet in the specified directory.
     
-    Requires a pie.toml manifest file and a .wasm artifact.
-    You must be logged in with `pie-client login` first.
+    Requires a Pie.toml manifest file and a .wasm artifact.
+    You must be logged in with `bakery login` first.
     """
     directory = directory.expanduser().resolve()
     
@@ -289,10 +279,10 @@ def publish(
     typer.echo(f"   Artifact: {wasm_path.name}")
     
     # Load the token
-    token = _get_token()
+    token = get_token()
     if not token:
         typer.echo()
-        typer.echo("❌ Not authenticated. Run `pie-client login` first.", err=True)
+        typer.echo("❌ Not authenticated. Run `bakery login` first.", err=True)
         raise typer.Exit(1)
     
     # Read and hash the artifact
@@ -368,23 +358,3 @@ def publish(
     except RegistryError as e:
         typer.echo(f"❌ Publish failed: {e.detail}", err=True)
         raise typer.Exit(1)
-
-
-def handle_inferlet_search(
-    query: str = "",
-    page: int = 1,
-    per_page: int = 20,
-    namespace: Optional[str] = None,
-) -> None:
-    """Wrapper for programmatic access to search."""
-    search(query=query, page=page, per_page=per_page, namespace=namespace)
-
-
-def handle_inferlet_info(name: str) -> None:
-    """Wrapper for programmatic access to info."""
-    info(name=name)
-
-
-def handle_inferlet_publish(directory: Path = Path(".")) -> None:
-    """Wrapper for programmatic access to publish."""
-    publish(directory=directory)

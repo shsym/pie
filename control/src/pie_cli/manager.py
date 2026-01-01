@@ -465,3 +465,80 @@ async def _submit_inferlet_async(
             else:
                 typer.echo(f"[Unknown event {event}]: {message}")
 
+
+def submit_inferlet_from_registry_and_wait(
+    client_config: dict,
+    inferlet_name: str,
+    arguments: list[str],
+) -> None:
+    """Submit an inferlet from the registry and wait for it to finish.
+
+    Args:
+        client_config: Client configuration with host, port, internal_auth_token
+        inferlet_name: Inferlet name (e.g., "std/text-completion@0.1.0")
+        arguments: Arguments to pass to the inferlet
+    """
+    import asyncio
+
+    asyncio.run(_submit_inferlet_from_registry_async(client_config, inferlet_name, arguments))
+
+
+async def _submit_inferlet_from_registry_async(
+    client_config: dict,
+    inferlet_name: str,
+    arguments: list[str],
+) -> None:
+    """Async implementation of submit_inferlet_from_registry_and_wait."""
+    from pie_client import PieClient, Event
+
+    # Build the WebSocket URI
+    host = client_config.get("host", "127.0.0.1")
+    port = client_config.get("port", 8080)
+    internal_token = client_config.get("internal_auth_token")
+    server_uri = f"ws://{host}:{port}"
+
+    async with PieClient(server_uri) as client:
+        # Authenticate with internal token
+        await client.internal_authenticate(internal_token)
+
+        # Launch the instance from registry
+        typer.echo(f"Launching {inferlet_name} from registry...")
+        instance = await client.launch_instance_from_registry(
+            inferlet=inferlet_name,
+            arguments=arguments,
+            detached=False,
+        )
+        typer.echo(f"Instance launched: {instance.instance_id}")
+
+        # Stream events until completion
+        while True:
+            event, message = await instance.recv()
+
+            if event == Event.Stdout:
+                # Stream stdout without extra newline
+                print(message, end="", flush=True)
+            elif event == Event.Stderr:
+                # Stream stderr to stderr
+                import sys
+                print(message, end="", file=sys.stderr, flush=True)
+            elif event == Event.Message:
+                typer.echo(f"[Message] {message}")
+            elif event == Event.Completed:
+                typer.echo(f"✅ Instance completed: {message}")
+                break
+            elif event == Event.Aborted:
+                typer.echo(f"⚠️ Instance aborted: {message}")
+                break
+            elif event == Event.Exception:
+                typer.echo(f"❌ Instance exception: {message}", err=True)
+                break
+            elif event == Event.ServerError:
+                typer.echo(f"❌ Server error: {message}", err=True)
+                break
+            elif event == Event.OutOfResources:
+                typer.echo(f"❌ Out of resources: {message}", err=True)
+                break
+            elif event == Event.Blob:
+                typer.echo(f"[Received blob: {len(message)} bytes]")
+            else:
+                typer.echo(f"[Unknown event {event}]: {message}")

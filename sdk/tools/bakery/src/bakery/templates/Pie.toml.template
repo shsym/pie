@@ -1,0 +1,17 @@
+[package]
+name = "$name"
+version = "0.1.0"
+description = "A simple text completion inferlet"
+
+[engine]
+min_version = "^1.0.0"
+
+[interface]
+inputs = [
+    { name = "prompt", type = "string", description = "The user message to complete" },
+    { name = "system", type = "string", optional = true, description = "System prompt to set assistant behavior" },
+    { name = "max_tokens", type = "int", optional = true, description = "Maximum number of tokens to generate (default: 256)" },
+]
+outputs = [
+    { name = "completion", type = "string", description = "The generated text completion" }
+]

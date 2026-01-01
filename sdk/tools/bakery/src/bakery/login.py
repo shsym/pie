@@ -1,11 +1,10 @@
-"""Login command implementation for the Pie CLI.
+"""Login command implementation for Bakery.
 
-This module implements the `pie-client login` command for authenticating
+This module implements the `bakery login` command for authenticating
 with the Pie Registry using GitHub OAuth.
 """
 
 import webbrowser
-from typing import Optional
 from urllib.parse import urlencode
 
 import typer
@@ -22,7 +21,7 @@ OAUTH_CALLBACK_URL = "https://registry.pie-project.org/api/v1/auth/github/callba
 def handle_login_command(
     registry_url: str = REGISTRY_URL,
 ) -> None:
-    """Handle the `pie-client login` command.
+    """Handle the `bakery login` command.
     
     1. Opens browser for GitHub OAuth
     2. User authenticates and gets a token
@@ -81,7 +80,7 @@ def handle_login_command(
         raise typer.Exit(1)
     
     # Save the token to config
-    config_path = path_utils.get_default_config_path()
+    config_path = path_utils.get_config_path()
     
     if config_path.exists():
         config = ConfigFile.load(config_path)
@@ -95,4 +94,4 @@ def handle_login_command(
     typer.echo(f"✅ Token saved to: {config_path}")
     typer.echo()
     typer.echo("You can now publish inferlets with:")
-    typer.echo("   pie-client inferlet publish")
+    typer.echo("   bakery inferlet publish")
