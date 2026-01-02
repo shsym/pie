@@ -63,7 +63,7 @@ class Batch:
     total_tokens: int = 0
     single_token_mode: bool = True
 
-    def get_model_inputs(self, device: torch.device, adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]], adapter_extras: dict) -> dict[str, Any]:
+    def get_model_inputs(self, device: torch.device) -> dict[str, Any]:
         """
         Finalize batch preparation and create input tensors for the model.
         
@@ -101,17 +101,9 @@ class Batch:
                 batched_attention_mask, device=device, dtype=torch.bool
             ),
             "single_token_inference_mode": self.single_token_mode,
-            "adapter_subpass": (
-                AdapterSubpass(
-                    adapter_at_layer=adapter_at_layer,
-                    adapter_indices=self.adapter_indices,
-                    adapter_extras=adapter_extras,
-                    rand_seeds=torch.as_tensor(self.adapter_seeds, device=device, dtype=torch.long),
-                    qo_indptr=self.qo_indptr,
-                )
-                if self.adapter_subpass_needed
-                else None
-            ),
+            "single_token_inference_mode": self.single_token_mode,
+            "adapter_indices": self.adapter_indices if self.adapter_subpass_needed else [],
+            "adapter_seeds": torch.as_tensor(self.adapter_seeds, device=device, dtype=torch.long) if self.adapter_subpass_needed else None,
         }
 
     def get_sampling_metadata(self, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:

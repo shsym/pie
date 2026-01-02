@@ -156,11 +156,16 @@ class ModelConfig(ModelConfigBase):
         )
         usable_bytes = available_bytes * runtime_config.gpu_mem_utilization
         element_size_bytes = torch.empty((), dtype=runtime_config.activation_dtype).element_size()
+        
+        # In multi-GPU mode, KV cache is sharded across GPUs
+        # Each GPU only stores num_kv_heads // world_size heads
+        local_num_kv_heads = self.num_kv_heads // runtime_config.world_size
+        
         total_bytes_per_page = (
             element_size_bytes
-            * 2
+            * 2  # key + value
             * runtime_config.kv_page_size
-            * self.num_kv_heads
+            * local_num_kv_heads  # Use local (sharded) head count
             * self.dim_head
             * self.num_layers
         )
@@ -430,6 +435,8 @@ class ForwardPass:
                 q_state=q,
                 k_state=k,
                 v_state=v,
+                rank=self.runtime_config.rank,
+                world_size=self.runtime_config.world_size,
             )
         del normed_input
 
@@ -520,12 +527,14 @@ class ForwardPass:
     ) -> torch.Tensor:
         """Main transformation pipeline through all layers."""
 
-        
+        # Ensure we're running on the correct CUDA device (critical for Triton kernels)
+        torch.cuda.set_device(self.runtime_config.device)
 
         # --- Calculate local TP sizes ---
         # <-- These are still needed here for planning the wrapper
         local_num_query_heads = self.model_config.num_q_heads // self.runtime_config.world_size
         local_num_key_value_heads = self.model_config.num_kv_heads // self.runtime_config.world_size
+
 
         hidden_states = input_embeds
         n, _ = hidden_states.size()
@@ -537,6 +546,7 @@ class ForwardPass:
             kv_last_page_lens,
             page_size,
         )
+
 
         batch_indices, batch_positions = ops.get_batch_indices_positions(
             append_indptr=qo_indptr,
@@ -626,8 +636,12 @@ def create_adapter_cache(
     
     Returns a list of (down_weights, up_weights) tuples, one per layer.
     - down_weights: [max_num_adapters, dim_hidden, max_adapter_rank * 3]
-    - up_weights: [max_num_adapters, max_adapter_rank, dim_head * (num_q_heads + num_kv_heads * 2)]
+    - up_weights: [max_num_adapters, max_adapter_rank, dim_head * (local_num_q_heads + local_num_kv_heads * 2)]
+      (Sharded: each rank stores only its portion of the up-projection)
     """
+    local_num_q_heads = model_config.num_q_heads // runtime_config.world_size
+    local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
+    
     return [
         (
             torch.zeros(
@@ -645,8 +659,8 @@ def create_adapter_cache(
                     runtime_config.max_adapter_rank,
                     model_config.dim_head
                     * (
-                        model_config.num_q_heads
-                        + model_config.num_kv_heads * 2
+                        local_num_q_heads
+                        + local_num_kv_heads * 2
                     ),
                 ),
                 dtype=runtime_config.activation_dtype,

@@ -347,32 +347,76 @@ class Runtime:
     ) -> None:
         """Initialize adapter functionality."""
         for req in reqs:
-            self._initialize_adapter(
-                adapter_ptr=req.adapter_ptr,
-                rank=req.rank,
-                alpha=req.alpha,
-                population_size=req.population_size,
-                mu_fraction=req.mu_fraction,
-                initial_sigma=req.initial_sigma,
-            )
+            adapter_ptr = req.adapter_ptr
+            # Prepare args for initialization
+            args = {
+                "adapter_ptr": adapter_ptr,
+                "rank": req.rank,
+                "alpha": req.alpha,
+                "population_size": req.population_size,
+                "mu_fraction": req.mu_fraction,
+                "initial_sigma": req.initial_sigma,
+            }
+
+            if self.config.world_size > 1:
+                # Broadcast INIT_ADAPTER command
+                msg = {
+                    "type": "INIT_ADAPTER",
+                    "kwargs": args
+                }
+                utils.broadcast_struct(msg, src=0, device=self.config.device)
+
+            self._initialize_adapter(**args)
 
     def update_adapter(self, reqs: list[message.UpdateAdapterRequest]) -> None:
         """Update adapter parameters."""
         for req in reqs:
-            self._update_adapter(
-                adapter_ptr=req.adapter_ptr,
-                scores=req.scores,
-                seeds=req.seeds,
-                max_sigma=req.max_sigma,
-            )
+            args = {
+                "adapter_ptr": req.adapter_ptr,
+                "scores": req.scores,
+                "seeds": req.seeds,
+                "max_sigma": req.max_sigma,
+            }
+
+            if self.config.world_size > 1:
+                # Broadcast UPDATE_ADAPTER command
+                msg = {
+                    "type": "UPDATE_ADAPTER",
+                    "kwargs": args
+                }
+                utils.broadcast_struct(msg, src=0, device=self.config.device)
+
+            self._update_adapter(**args)
 
     def upload_adapter(self, reqs: list[message.UploadAdapterRequest]) -> None:
         """Upload adapter weights."""
         for req in reqs:
-            if req.adapter_ptr in self.adapters:
-                adapter = self.adapters[req.adapter_ptr]
-                if isinstance(adapter, CmaesAdapter):
-                    adapter.upload(req.name, req.adapter_data)
+            args = {
+                "adapter_ptr": req.adapter_ptr,
+                "name": req.name,
+                "data": req.adapter_data
+            }
+            
+            if self.config.world_size > 1:
+                # Broadcast UPLOAD_ADAPTER command
+                msg = {
+                    "type": "UPLOAD_ADAPTER",
+                    "kwargs": args
+                }
+                utils.broadcast_struct(msg, src=0, device=self.config.device)
+            
+            self._upload_adapter(**args)
+
+    def _upload_adapter(self, adapter_ptr: int, name: str, data: bytes) -> None:
+        if adapter_ptr in self.adapters:
+            adapter = self.adapters[adapter_ptr]
+            if isinstance(adapter, CmaesAdapter):
+                # For multi-GPU, append rank to filename to ensure each rank loads its own shard
+                # Current CmaesAdapter implementation expects rank-specific checkpoints
+                if self.config.world_size > 1:
+                    name = f"{name}_rank{self.config.rank}"
+                
+                adapter.upload(name, data)
 
     def download_adapter(
         self, reqs: list[message.DownloadAdapterRequest]
@@ -380,13 +424,37 @@ class Runtime:
         """Download adapter weights."""
         resps = []
         for req in reqs:
-            if req.adapter_ptr in self.adapters:
-                adapter = self.adapters[req.adapter_ptr]
-                if isinstance(adapter, CmaesAdapter):
-                    data = adapter.download(req.name)
-                    resp = message.DownloadAdapterResponse(adapter_data=data)
-                    resps.append(resp)
+            args = {
+                "adapter_ptr": req.adapter_ptr,
+                "name": req.name
+            }
+            
+            if self.config.world_size > 1:
+                # Broadcast DOWNLOAD_ADAPTER command
+                msg = {
+                    "type": "DOWNLOAD_ADAPTER",
+                    "kwargs": args
+                }
+                utils.broadcast_struct(msg, src=0, device=self.config.device)
+                
+            data = self._download_adapter(**args)
+            
+            # Pack response (only Rank 0 returns data to client)
+            resp = message.DownloadAdapterResponse(adapter_data=data)
+            resps.append(resp)
+            
         return resps
+
+    def _download_adapter(self, adapter_ptr: int, name: str) -> bytes:
+        if adapter_ptr in self.adapters:
+            adapter = self.adapters[adapter_ptr]
+            if isinstance(adapter, CmaesAdapter):
+                # For multi-GPU, append rank to filename to save rank-specific shards
+                if self.config.world_size > 1:
+                    name = f"{name}_rank{self.config.rank}"
+                    
+                return adapter.download(name)
+        return b""
 
     # ========================================================================
     # Internal Adapter Methods
@@ -409,6 +477,20 @@ class Runtime:
              raise ValueError(f"Adapter pointer {adapter_ptr} exceeds max_num_adapters {self.config.max_num_adapters}")
         # print parameters
         #print(f"Initializing adapter {adapter_ptr} with rank {rank}, alpha {alpha}, population size {population_size}, mu fraction {mu_fraction}, initial sigma {initial_sigma}")
+        # Calculate local shard sizes for distributed adapters
+        world_size = self.config.world_size
+        gpu_rank = self.config.rank
+        
+        local_num_q_heads = cfg.num_q_heads // world_size
+        local_num_kv_heads = cfg.num_kv_heads // world_size
+        
+        # Local output features (sharded up-projection)
+        local_out_features = [
+            cfg.dim_head * local_num_q_heads,
+            cfg.dim_head * local_num_kv_heads,
+            cfg.dim_head * local_num_kv_heads
+        ]
+
         # Initialize adapter
         self.adapters[adapter_ptr] = CmaesAdapter(
             adapter_id=adapter_ptr,
@@ -416,11 +498,7 @@ class Runtime:
             rank=rank,
             alpha=alpha,
             in_features=cfg.dim_hidden,
-            out_features=[
-                cfg.dim_head * cfg.num_q_heads,
-                cfg.dim_head * cfg.num_kv_heads,
-                cfg.dim_head * cfg.num_kv_heads
-            ],
+            out_features=local_out_features,
             num_layers=cfg.num_layers,
             population_size=population_size,
             mu_fraction=mu_fraction,
@@ -430,6 +508,8 @@ class Runtime:
             max_var=1e4,
             device=self.config.device,
             dtype=self.config.activation_dtype,
+            gpu_rank=gpu_rank,
+            world_size=world_size,
         )
 
     @torch.inference_mode()
@@ -453,33 +533,73 @@ class Runtime:
     def worker_loop(self):
         """
         Worker loop for ranks > 0.
-        Waits for inputs from rank 0 and executes the model.
+        Waits for control messages from rank 0 and executes commands.
         """
-        print(f"Worker {self.config.rank} started")
+        import torch.distributed as dist
+        import signal
+        
+        # Re-enable SIGTERM handling so this worker can be terminated
+        # by the parent process during shutdown
+        shutdown_requested = False
+        
+        def sigterm_handler(signum, frame):
+            nonlocal shutdown_requested
+            shutdown_requested = True
+        
+        signal.signal(signal.SIGTERM, sigterm_handler)
+        signal.signal(signal.SIGINT, sigterm_handler)
+        
         device = self.config.device
         
-        while True:
-            # Wait for inputs
-            #print(f"Worker {self.config.rank}: waiting for broadcast...")
-            
-            # Use optimized broadcast structure (metadata on CPU, tensors on GPU)
-            inputs = utils.broadcast_struct(None, src=0, device=device)
-            if inputs == "STOP":
+        while not shutdown_requested:
+            # Receive control message
+            try:
+                msg = utils.broadcast_struct(None, src=0, device=device)
+            except Exception:
                 break
                 
-            # If we didn't receive "STOP", we expect the sampling metadata next
-            sampling_metadata = utils.broadcast_struct(None, src=0, device=device)
-            
-            if inputs is None:
-                continue
+            if shutdown_requested:
+                break
+                
+            if msg == "STOP":
+                break
+                
+            if isinstance(msg, dict):
+                msg_type = msg.get("type")
+                
+                if msg_type == "STEP":
+                    # Execute inference step
+                    inputs = msg["inputs"]
+                    sampling_metadata = msg["sampling_metadata"]
+                    try:
+                        self._run_step(inputs, sampling_metadata)
+                    except Exception as e:
+                        # Log error but continue - don't let one error hang the whole system
+                        print(f"Worker {self.config.rank} _run_step error: {e}")
+                        # Sync CUDA to clear any pending operations
+                        torch.cuda.synchronize()
+                    
+                elif msg_type == "INIT_ADAPTER":
+                    # Initialize adapter
+                    kwargs = msg["kwargs"]
+                    self._initialize_adapter(**kwargs)
 
-            # No need to move to device manually as broadcast_struct handles it
-            # inputs and sampling_metadata have their tensors on device already
-            
-            # Execute step
-            self._run_step(inputs, sampling_metadata)
-            
-        #print(f"Worker {self.config.rank} finished")
+                elif msg_type == "UPDATE_ADAPTER":
+                    # Update adapter
+                    kwargs = msg["kwargs"]
+                    self._update_adapter(**kwargs)
+
+                elif msg_type == "UPLOAD_ADAPTER":
+                    # Upload adapter
+                    kwargs = msg["kwargs"]
+                    self._upload_adapter(**kwargs)
+
+                elif msg_type == "DOWNLOAD_ADAPTER":
+                    # Download adapter
+                    kwargs = msg["kwargs"]
+                    self._download_adapter(**kwargs)
+                    
+            # Other message types can be added here
 
     def _run_step(self, inputs: dict, sampling_metadata: dict) -> list:
         """
@@ -488,11 +608,26 @@ class Runtime:
         Returns:
             Sampling results (only valid on Rank 0 usually, but we return whatever comes out)
         """
+        if self.config.world_size > 1:
+            torch.distributed.barrier()
+
+
+
         # 2. Embed inputs
         input_embeds = self.engine.embed_inputs(inputs)
         
-        
-        # 3. Run transformer forward pass
+        # 3. Use raw indices/seeds to create local AdapterSubpass (to avoid device mismatch)
+        adapter_subpass = None
+        if inputs.get("adapter_indices"):
+            adapter_subpass = AdapterSubpass(
+                adapter_at_layer=self.adapter_at_layer,
+                adapter_indices=inputs["adapter_indices"],
+                adapter_extras=self.adapters,
+                rand_seeds=inputs["adapter_seeds"],
+                qo_indptr=inputs["qo_indptr"],
+            )
+
+        # 4. Run transformer forward pass
         hidden_states = self.engine.transform(
             input_embeds=input_embeds,
             position_ids=inputs["position_ids"],
@@ -503,7 +638,7 @@ class Runtime:
             kv_last_page_lens=inputs["kv_last_page_lens"],
             custom_mask=inputs["custom_mask"],
             single_token_inference_mode=inputs["single_token_inference_mode"],
-            adapter_subpass=inputs["adapter_subpass"],
+            adapter_subpass=adapter_subpass,
         )
         
         # 4. Sampling Pass
@@ -516,32 +651,25 @@ class Runtime:
     def _execute_batch(self) -> list[message.ForwardPassResponse]:
         """
         Execute the accumulated batch and return responses.
-        
-        Returns:
-            List of ForwardPassResponse for each request in the batch
         """
         batch = self.batch_builder.build()
         device = self.config.device
-
-        # 1. Prepare inputs using batch method
-        inputs = batch.get_model_inputs(device, self.adapter_at_layer, self.adapters)
-
-        # Handle empty batch
-        # if not inputs["token_ids"]:
-        #      if self.config.world_size > 1:
-        #           dist.broadcast_object_list([None, None], src=0)
-        #      return []
-
-        # Prepare sampling metadata
         sampling_metadata = batch.get_sampling_metadata(device, self.config.activation_dtype)
 
+
+        
+        inputs = batch.get_model_inputs(device)
+        
         # Broadcast if needed
         if self.config.world_size > 1:
-            #print(f"Rank 0: Broadcasting inputs to workers...")
-            # Use optimized broadcast (no CPU roundtrip for tensors)
-            utils.broadcast_struct(inputs, src=0, device=device)
-            utils.broadcast_struct(sampling_metadata, src=0, device=device)
-            #print(f"Rank 0: Broadcast complete")
+            # Broadcast Step command
+            msg = {
+                "type": "STEP",
+                "inputs": inputs,
+                "sampling_metadata": sampling_metadata
+            }
+
+            utils.broadcast_struct(msg, src=0, device=device)
 
         # Execute step
         sampling_results = self._run_step(inputs, sampling_metadata)

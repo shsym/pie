@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from blake3 import blake3
 import numpy as np
-import wandb
+
 from tqdm.auto import tqdm
 
 # Assume pie is an installed library
@@ -29,7 +29,7 @@ from openr1math import OpenR1MathDataset
 class TrainingConfig:
     """Configuration settings for the ES training run."""
     # --- Server and Paths ---
-    SERVER_URIS: List[str] = field(default_factory=lambda: ["ws://127.0.0.1:8080"])
+    SERVER_URIS: List[str] = field(default_factory=lambda: ["ws://127.0.0.1:8082"])
     SCRIPT_DIR: Path = Path(__file__).resolve().parent
     WASM_DIR: Path = SCRIPT_DIR / "inferlets" / "target" / "wasm32-wasip2" / "release"
 
@@ -44,7 +44,7 @@ class TrainingConfig:
     # --- ES Hyperparameters ---
     ADAPTER_NAME: str = "evo-countdown-v1"
     TRAINING_STEPS: int = 10000
-    POPULATION_SIZE: int = 256
+    POPULATION_SIZE: int = 128
     TASKS_PER_SEED: int = 4
     NUM_ROLLOUTS_PER_WORKER: int = 1  # This is now the batch size
     LORA_RANK: int = 8
@@ -67,11 +67,7 @@ class TrainingConfig:
     EVAL_EVERY_N_STEPS: int = 2
     EVAL_TASKS_PER_WORKER: int = 1
 
-    # --- W&B Config ---
-    WANDB_PROJECT: str = os.getenv("WANDB_PROJECT", "pie-es-v6")
-    WANDB_ENTITY: str = os.getenv("WANDB_ENTITY")
-    WANDB_MODE: str = os.getenv("WANDB_MODE")
-    WANDB_TAGS: List[str] = field(default_factory=lambda: ["es", "countdown", "lora"])
+
 
     # --- Logging ---
     VERBOSE_WORKER_LOGS: bool = False
@@ -111,36 +107,12 @@ async def launch_and_get_result(
                     tqdm.write(f"✅ Worker {worker_id}: Instance {instance.instance_id} finished.")
                 break
         elif event in (Event.Aborted, Event.Exception, Event.ServerError, Event.OutOfResources):
+            #tqdm.write(f"⚠️ Worker {worker_id}: Instance {instance.instance_id} failed with event {event}. Msg: {message}")
             break
     return final_payload
 
 
-def _create_eval_wandb_html(generations: List[Dict]) -> wandb.Html:
-    """Formats evaluation examples as an HTML table for wandb."""
-    if not generations:
-        return wandb.Html("<pre>No evaluation predictions to log.</pre>")
-    table_rows = [
-        '<tr><th style="text-align: left;">Prompt</th>'
-        '<th style="text-align: left;">Generation</th>'
-        '<th>Reward</th><th>Success</th></tr>'
-    ]
-    style = 'style="border: 1px solid #ddd; padding: 8px;"'
-    for item in generations:
-        task_content = item['task']
-        if 'problem' in task_content:
-            prompt_html = f"<pre>{html.escape(task_content['problem'])}</pre>"
-        elif 'nums' in task_content and 'target' in task_content:
-            prompt_html = f"<pre>nums = {task_content['nums']}\ntarget = {task_content['target']}</pre>"
-        else:
-            prompt_html = "<pre>N/A</pre>"
-        text_html = f"<pre>{html.escape(item['text'])}</pre>"
-        success_icon = "✅" if item['answer_reward'] == 1.0 else "❌"
-        table_rows.append(
-            f'<tr><td {style}>{prompt_html}</td><td {style}>{text_html}</td>'
-            f'<td {style} align="center">{item["score"]:.3f}</td>'
-            f'<td {style} align="center">{success_icon}</td></tr>'
-        )
-    return wandb.Html(f'<table style="width:100%; border-collapse: collapse;">{"".join(table_rows)}</table>')
+
 
 
 # ==============================================================================
@@ -157,7 +129,7 @@ class ESOrchestrator:
         self.train_dataset = None
         self.eval_dataset = None
         self._exit_stack = AsyncExitStack()
-        self.wandb_run = None
+
         self.train_client_capacities: Dict[str, int] = {}
         self.eval_client_capacities: Dict[str, int] = {}
         self.max_train_capacity_per_client: int = 0
@@ -165,7 +137,7 @@ class ESOrchestrator:
 
     async def setup(self):
         """Initialize resources: W&B, clients, WASM programs, and datasets."""
-        self._initialize_wandb()
+
         tqdm.write("🔌 Connecting to Pie servers...")
         self.clients = []
         for uri in self.config.SERVER_URIS:
@@ -173,7 +145,7 @@ class ESOrchestrator:
             await client.authenticate("main-user")
             self.clients.append(client)
         tqdm.write(f"✅ Connected to {len(self.clients)} Pie server(s).")
-        wandb.config.update({"num_clients": len(self.clients)}, allow_val_change=True)
+
         await self._upload_inferlets()
         await self._initialize_adapter()
         self._load_datasets()
@@ -185,7 +157,7 @@ class ESOrchestrator:
         tqdm.write("=" * 50)
         #tqdm.write("\n🔬 Running initial evaluation before training...")
         #initial_eval_metrics = await self._run_evaluation(step=0)
-        #self.wandb_run.log(initial_eval_metrics, step=0)
+
         #tqdm.write("✅ Initial evaluation complete.")
         for step in range(1, self.config.TRAINING_STEPS + 1):
             start_time = time.time()
@@ -204,30 +176,17 @@ class ESOrchestrator:
             if step % self.config.EVAL_EVERY_N_STEPS == 0 or step == self.config.TRAINING_STEPS:
                 eval_metrics = await self._run_evaluation(step)
                 metrics.update(eval_metrics)
-            self.wandb_run.log(metrics, step=step)
+
         tqdm.write("\n🎉 Training finished!")
-        wandb.summary["final_mean_score"] = metrics["mean_reward"]
+
 
     async def teardown(self):
         """Clean up resources."""
         await self._exit_stack.aclose()
-        if self.wandb_run:
-            self.wandb_run.finish()
+
         tqdm.write("Resources cleaned up.")
 
-    def _initialize_wandb(self):
-        """Sets up the Weights & Biases run."""
-        self.wandb_run = wandb.init(
-            project=self.config.WANDB_PROJECT,
-            entity=self.config.WANDB_ENTITY,
-            name=f"{self.config.ADAPTER_NAME}-{int(time.time())}",
-            tags=self.config.WANDB_TAGS,
-            config=self.config.__dict__,
-            save_code=True,
-            mode=self.config.WANDB_MODE if self.config.WANDB_MODE else None,
-        )
-        wandb.define_metric("step")
-        wandb.define_metric("*", step_metric="step")
+
 
     def _load_datasets(self):
         """Loads the training and evaluation datasets based on config."""
@@ -240,10 +199,7 @@ class ESOrchestrator:
             self.eval_dataset = OpenR1MathDataset("test", self.config.DATASET_TEST_SIZE)
         else:
             raise ValueError(f"Unknown dataset name: {self.config.DATASET_NAME}")
-        wandb.config.update({
-            "dataset_size_train_view": len(self.train_dataset),
-            "dataset_size_eval": len(self.eval_dataset),
-        }, allow_val_change=True)
+
         tqdm.write("✅ Datasets loaded.")
 
     async def _upload_inferlets(self):
@@ -428,23 +384,17 @@ class ESOrchestrator:
         format_rewards = [float(ri.get("format_reward", 0.0)) for ri in reward_infos]
         answer_rewards = [float(ri.get("answer_reward", 0.0)) for ri in reward_infos]
         tqdm.write(f"✅ Eval Complete: mean_reward={np.mean(scores):.4f}")
-        num_to_log = min(10, len(results["texts"]))
-        indices = np.random.choice(len(results["texts"]), size=num_to_log, replace=False)
-        examples = [{
-            "task": results["tasks"][i], "text": results["texts"][i],
-            "score": scores[i], "answer_reward": answer_rewards[i]
-        } for i in indices]
+
         metrics = {
             "eval/mean_reward": np.mean(scores) if scores else 0.0,
             "eval/mean_format_reward": np.mean(format_rewards) if format_rewards else 0.0,
             "eval/mean_answer_reward": np.mean(answer_rewards) if answer_rewards else 0.0,
             "eval/duration_seconds": time.time() - eval_start_time,
-            "eval/examples": _create_eval_wandb_html(examples),
+
             "eval/total_preemptions": results.get("total_preemptions", 0),
             "eval/client_capacities": results.get("client_capacities", {}),
         }
-        if step == self.config.TRAINING_STEPS:
-            wandb.summary["final_eval_mean_reward"] = metrics["eval/mean_reward"]
+
         return metrics
 
     async def _run_batch(self, client, program_hash, seeds, tasks, who):

@@ -62,6 +62,8 @@ class AdapterSubpass:
         q_state: torch.Tensor,
         k_state: torch.Tensor,
         v_state: torch.Tensor,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         i = 0
         for adapter_index, count in self.adapter_indices_rle:
@@ -70,32 +72,42 @@ class AdapterSubpass:
             x_end = self.qo_indptr[i + count]
             x = xs[x_start:x_end]
 
+            # In multi-GPU, xs is replicated (full hidden state), so inputs are consistent.
+            # q_state, k_state, v_state are SHARDED (local output).
+
             rand_seeds = self.rand_seeds[x_start:x_end]
             inject_noise = rand_seeds.any().item()
-            # print(x.shape, rand_seeds.shape)
             assert x.shape[0] == rand_seeds.shape[0], "Batch size must match seeds."
 
-            # DOWN noise uses 3 equal chunks of size `rank` each (Q/K/V).
             Wd = self.adapter_at_layer[layer_idx][0][adapter_index]
-            Wu = self.adapter_at_layer[layer_idx][1][
-                adapter_index
-            ]  # (rank, d_q+d_k+d_v)
+            Wu = self.adapter_at_layer[layer_idx][1][adapter_index]  # (rank, LOCAL_d_q+LOCAL_d_k+LOCAL_d_k)
             adapter_info = self.adapter_extras[adapter_index]
 
-            rank = adapter_info.rank
-            out_indptr = adapter_info.out_features_indptr  # built from [d_q, d_k, d_v]
+            rank_lora = adapter_info.rank  # LoRA rank, not GPU rank
+            
+            # We assume CmaesAdapter was initialized with LOCAL out_features.
+            # So adapter_info.out_features is [local_d_q, local_d_k, local_d_v]
+            out_indptr = adapter_info.out_features_indptr  # [0, local_d_q, ...]
 
+            # Down-projection is replicated on input (x), produces replicated output (low-rank).
+            # This part executes identically on all ranks if X is identical.
             qkv_down = x @ Wd
-            d_q, d_k, d_v = torch.split(qkv_down, [rank, rank, rank], dim=-1)
+            d_q, d_k, d_v = torch.split(qkv_down, [rank_lora, rank_lora, rank_lora], dim=-1)
 
+            # Determine if we should inject noise for this request slice
+            layer_seeds = rand_seeds - layer_idx
+            inject_noise = (layer_seeds != 0).any().item()
+            
             if inject_noise:
-
                 if not isinstance(adapter_info, CmaesAdapter):
                     continue
-
+                
                 Sd = adapter_info.qkv_down_sigma[layer_idx]  # (in_features, 3*rank)
-                Sd_q, Sd_k, Sd_v = torch.split(Sd, [rank, rank, rank], dim=-1)
+                Sd_q, Sd_k, Sd_v = torch.split(Sd, [rank_lora, rank_lora, rank_lora], dim=-1)
 
+                # Noise generation for DOWN projection (input x is replicated, output d_q is replicated)
+                # We want the SAME noise on all ranks to keep d_q consistent.
+                
                 q_noise_down = rand_mv.batched_randn_matmul(
                     x,
                     seeds=rand_seeds + layer_idx,
@@ -119,50 +131,69 @@ class AdapterSubpass:
                 d_k = d_k + k_noise_down
                 d_v = d_v + v_noise_down
 
-            Wu_q = Wu[:, out_indptr[0] : out_indptr[1]]  # (rank, d_q)
-            Wu_k = Wu[:, out_indptr[1] : out_indptr[2]]  # (rank, d_k)
-            Wu_v = Wu[:, out_indptr[2] : out_indptr[3]]  # (rank, d_v)
+            # Up-projection: Input (d_q/k/v) is replicated. Output (u_q/k/v) needs to be SHARDED.
+            # Wu is already LOCAL.
+            
+            Wu_q_local = Wu[:, out_indptr[0]:out_indptr[1]]
+            Wu_k_local = Wu[:, out_indptr[1]:out_indptr[2]]
+            Wu_v_local = Wu[:, out_indptr[2]:out_indptr[3]]
 
-            u_q = d_q @ Wu_q
-            u_k = d_k @ Wu_k
-            u_v = d_v @ Wu_v
+            # Compute local up-projection
+            u_q_local = d_q @ Wu_q_local
+            u_k_local = d_k @ Wu_k_local
+            u_v_local = d_v @ Wu_v_local
 
             if inject_noise:
-                # UP noise uses column slices [d_q, d_k, d_v].
-                Su = adapter_info.qkv_up_sigma[layer_idx]  # (rank, d_q+d_k+d_v)
-                Su_q = Su[:, out_indptr[0] : out_indptr[1]].contiguous()
-                Su_k = Su[:, out_indptr[1] : out_indptr[2]].contiguous()
-                Su_v = Su[:, out_indptr[2] : out_indptr[3]].contiguous()
+                Su = adapter_info.qkv_up_sigma[layer_idx]  # (rank, LOCAL_d_sum)
+                
+                # Slicing LOCAL Sigmas
+                Su_q_local = Su[:, out_indptr[0]:out_indptr[1]]
+                Su_k_local = Su[:, out_indptr[1]:out_indptr[2]]
+                Su_v_local = Su[:, out_indptr[2]:out_indptr[3]]
 
+                # Offsets for noise generation
+                local_d_q = out_indptr[1] - out_indptr[0]
+                local_d_k = out_indptr[2] - out_indptr[1]
+                local_d_v = out_indptr[3] - out_indptr[2]
+                
+                global_d_q = local_d_q * world_size
+                global_d_k = local_d_k * world_size
+                global_d_v = local_d_v * world_size
+                
                 q_noise_up = rand_mv.batched_randn_matmul(
                     d_q,
                     seeds=rand_seeds - layer_idx,
-                    S=Su_q,
+                    S=Su_q_local,
                     out_dtype=x.dtype,
+                    col_offset=rank * local_d_q,
+                    global_cols=global_d_q,
                 )
                 k_noise_up = rand_mv.batched_randn_matmul(
                     d_k,
                     seeds=rand_seeds - (layer_idx + 100),
-                    S=Su_k,
+                    S=Su_k_local,
                     out_dtype=x.dtype,
+                    col_offset=rank * local_d_k,
+                    global_cols=global_d_k,
                 )
                 v_noise_up = rand_mv.batched_randn_matmul(
                     d_v,
                     seeds=rand_seeds - (layer_idx + 200),
-                    S=Su_v,
+                    S=Su_v_local,
                     out_dtype=x.dtype,
+                    col_offset=rank * local_d_v,
+                    global_cols=global_d_v,
                 )
-
-                u_q = u_q + q_noise_up
-                u_k = u_k + k_noise_up
-                u_v = u_v + v_noise_up
+                u_q_local = u_q_local + q_noise_up
+                u_k_local = u_k_local + k_noise_up
+                u_v_local = u_v_local + v_noise_up
 
             # ===== 3) Combine mean + noise =====
-            scaling = adapter_info.alpha / float(rank)
+            scaling = adapter_info.alpha / float(rank_lora)
 
-            q_final = scaling * u_q
-            k_final = scaling * u_k
-            v_final = scaling * u_v
+            q_final = scaling * u_q_local
+            k_final = scaling * u_k_local
+            v_final = scaling * u_v_local
 
             q_state[x_start:x_end].add_(q_final)
             k_state[x_start:x_end].add_(k_final)
@@ -232,6 +263,8 @@ class CmaesAdapter(Adapter):
         max_var: float,
         device: torch.device,
         dtype: torch.dtype,
+        gpu_rank: int = 0,
+        world_size: int = 1,
     ):
         super().__init__(adapter_id, rank, alpha, out_features)
 
@@ -242,6 +275,9 @@ class CmaesAdapter(Adapter):
         self.dtype = dtype
         self.in_features = in_features
         self.sum_out = int(sum(out_features))
+        
+        self.gpu_rank = gpu_rank
+        self.world_size = world_size
 
         # CMA-ES default knobs (can be overridden from outside if desired)
         self.population_size = population_size
@@ -289,8 +325,11 @@ class CmaesAdapter(Adapter):
 
         # ===== Diagonal CMA-ES state (float32 for stability) =====
         f32 = torch.float32
+        
+        # Calculate d_per_layer using GLOBAL parameter count
+        global_sum_out = self.sum_out * self.world_size
         self.d_per_layer = float(
-            in_features * rank * len(out_features) + rank * self.sum_out
+            in_features * rank * len(out_features) + rank * global_sum_out
         )
 
         # Recombination weights
@@ -403,9 +442,11 @@ class CmaesAdapter(Adapter):
         # This ensures the optimizer's internal constants are correct after loading
         # potentially different hyperparameters (e.g., population_size).
         f32 = torch.float32
+        
+        global_sum_out = self.sum_out * self.world_size
         self.d_per_layer = float(
             self.in_features * self.rank * len(self.out_features)
-            + self.rank * sum(self.out_features)
+            + self.rank * global_sum_out
         )
         self.mu = max(1, int(self.population_size * self.mu_fraction))
         ranks = torch.arange(1, self.mu + 1, dtype=f32, device=self.device)
@@ -552,23 +593,40 @@ class CmaesAdapter(Adapter):
             S_up = self.qkv_up_sigma[layer_idx].to(f32)  # (rank, d_q+d_k+d_v)
             S_up_q, S_up_k, S_up_v = torch.split(S_up, [d_q, d_k, d_v], dim=-1)
 
+            # Sharding logic for UP generation
+            # Global dimensions
+            global_d_q = d_q * self.world_size
+            global_d_k = d_k * self.world_size
+            global_d_v = d_v * self.world_size
+            
+            # Local offsets
+            offset_q = self.gpu_rank * d_q
+            offset_k = self.gpu_rank * d_k
+            offset_v = self.gpu_rank * d_v
+
             Wu_q = rand_mv.batched_randn_generate(
                 seeds=top_seeds - layer_idx,
                 S=S_up_q,
                 device=device,
                 dtype=torch.float32,
+                col_offset=offset_q,
+                global_cols=global_d_q,
             )
             Wu_k = rand_mv.batched_randn_generate(
                 seeds=top_seeds - (layer_idx + 100),
                 S=S_up_k,
                 device=device,
                 dtype=torch.float32,
+                col_offset=offset_k,
+                global_cols=global_d_k,
             )
             Wu_v = rand_mv.batched_randn_generate(
                 seeds=top_seeds - (layer_idx + 200),
                 S=S_up_v,
                 device=device,
                 dtype=torch.float32,
+                col_offset=offset_v,
+                global_cols=global_d_v,
             )
             Wu = torch.cat([Wu_q, Wu_k, Wu_v], dim=-1)  # (µ, rank, d_sum)
 
@@ -618,8 +676,18 @@ class CmaesAdapter(Adapter):
                 layer_idx
             ] + c_ps * Cinv_sqrt_step_up
 
-            # Combined norm for step-size adaptation
-            norm_ps = torch.sqrt(ps_down_new.pow(2).sum() + ps_up_new.pow(2).sum())
+            # Combined norm for step-size adaptation (Must be global!)
+            norm_sq_down = ps_down_new.pow(2).sum()
+            norm_sq_up_local = ps_up_new.pow(2).sum()
+            
+            # Aggregate UP norm across ranks (DOWN is replicated, so it's consistent)
+            if self.world_size > 1:
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    dist.all_reduce(norm_sq_up_local, op=dist.ReduceOp.SUM)
+            
+            norm_ps = torch.sqrt(norm_sq_down + norm_sq_up_local)
+            
             sigma_new = sigma_l * torch.exp(
                 (self.cs / self.damps) * (norm_ps / self.chiN - 1.0)
             )

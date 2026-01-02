@@ -153,11 +153,16 @@ class ModelConfig(ModelConfigBase):
         )
         usable_bytes = available_bytes * runtime_config.gpu_mem_utilization
         element_size_bytes = torch.empty((), dtype=runtime_config.activation_dtype).element_size()
+        
+        # In multi-GPU mode, KV cache is sharded across GPUs
+        # Each GPU only stores num_kv_heads // world_size heads
+        local_num_kv_heads = self.num_kv_heads // runtime_config.world_size
+        
         total_bytes_per_page = (
             element_size_bytes
-            * 2
+            * 2  # key + value
             * runtime_config.kv_page_size
-            * self.num_kv_heads
+            * local_num_kv_heads  # Use local (sharded) head count
             * self.dim_head
             * self.num_layers
         )
@@ -483,6 +488,9 @@ class ForwardPass:
         adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
         """Main transformation pipeline through all layers."""
+
+        # Ensure we're running on the correct CUDA device (critical for Triton kernels)
+        torch.cuda.set_device(self.runtime_config.device)
 
         
 

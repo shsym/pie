@@ -85,6 +85,8 @@ def _randn_mm_row_kernel_with_stdev(
     n_rounds: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    col_offset: tl.constexpr,
+    global_cols: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -116,10 +118,10 @@ def _randn_mm_row_kernel_with_stdev(
                 tl.float32
             )
 
-            # Compute offsets for rng: offset = k * O + n
+            # Compute offsets for rng: offset = k * global_cols + (n + col_offset)
             k_offsets = offs_k.to(tl.int32)[:, None]
             n_offsets = offs_n.to(tl.int32)[None, :]
-            offsets = k_offsets * O + n_offsets
+            offsets = k_offsets * global_cols + (n_offsets + col_offset)
 
             # Random normals
             w_tile = tl.randn(seed_i, offsets, n_rounds=n_rounds)  # [BK, BN], f32
@@ -153,6 +155,8 @@ def batched_randn_matmul(
     *,
     n_rounds: int = 10,
     out_dtype: torch.dtype | None = None,
+    col_offset: int = 0,
+    global_cols: int | None = None,
 ) -> torch.Tensor:
     """
     Compute y[b] = x[b] @ (S * N(0,1; seed=seeds[b])) without materializing weights.
@@ -169,6 +173,8 @@ def batched_randn_matmul(
     assert I_S == I, "S.shape[0] must equal x.shape[1]"
     if out_dtype is None:
         out_dtype = x.dtype
+    if global_cols is None:
+        global_cols = O
 
     y = torch.empty((B, O), device=x.device, dtype=torch.float32)  # accumulate in f32
 
@@ -202,6 +208,8 @@ def batched_randn_matmul(
         BLOCK_N=BLOCK_N,
         num_warps=num_warps,
         num_stages=num_stages,
+        col_offset=col_offset,
+        global_cols=global_cols,
     )
 
     return y.to(out_dtype)
@@ -229,6 +237,8 @@ def _randn_generate_kernel_with_stdev(
     n_rounds: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    col_offset: tl.constexpr,
+    global_cols: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
@@ -255,10 +265,10 @@ def _randn_generate_kernel_with_stdev(
         tile = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     else:
         seed_b = seed_val.to(tl.int32)
-        # offsets = i * O + o
+        # offsets = i * global_cols + (o + col_offset)
         i_offsets = offs_i.to(tl.int32)[:, None]
         o_offsets = offs_o.to(tl.int32)[None, :]
-        offsets = i_offsets * O + o_offsets
+        offsets = i_offsets * global_cols + (o_offsets + col_offset)
 
         # Generate normals
         tile = tl.randn(seed_b, offsets, n_rounds=n_rounds)  # f32
@@ -288,6 +298,8 @@ def batched_randn_generate(
     n_rounds: int = 10,
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
+    col_offset: int = 0,
+    global_cols: int | None = None,
 ) -> torch.Tensor:
     """
     Materialize W_batched[b, i, o] = S[i, o] * N(0,1; seed=seeds[b]).
@@ -299,6 +311,9 @@ def batched_randn_generate(
     assert S_dev.dim() == 2
     B = int(seeds_dev.numel())
     I, O = map(int, S_dev.shape)
+
+    if global_cols is None:
+        global_cols = O
 
     y = torch.empty((B, I, O), device=device, dtype=torch.float32)
 
@@ -327,6 +342,8 @@ def batched_randn_generate(
         BLOCK_N=BLOCK_N,
         num_warps=num_warps,
         num_stages=num_stages,
+        col_offset=col_offset,
+        global_cols=global_cols,
     )
 
     return y.to(dtype)
@@ -409,6 +426,27 @@ def run_tests():
             d2 = _max_abs_diff(y1[2], y2[2])
             print(f"  repro rows 0 & 2 unchanged: {d0:.3e}, {d2:.3e}")
             assert d0 < 0.1 and d2 < 0.1
+
+        # ---- Sharding test ----
+        if O % 2 == 0:
+            half = O // 2
+            # Left half
+            S_left = S[:, :half]
+            y_left = batched_randn_matmul(
+                x, seeds, S_left, out_dtype=torch.float32, col_offset=0, global_cols=O
+            )
+            d_left = _max_abs_diff(y_left, y_ref[:, :half])
+
+            # Right half
+            S_right = S[:, half:]
+            y_right = batched_randn_matmul(
+                x, seeds, S_right, out_dtype=torch.float32, col_offset=half, global_cols=O
+            )
+            d_right = _max_abs_diff(y_right, y_ref[:, half:])
+            
+            print(f"  sharding split {O} -> {half}+{half} | left_diff={d_left:.3e}, right_diff={d_right:.3e}")
+            assert d_left < 0.1 and d_right < 0.1, "Sharding mismatch"
+
 
     # Small sanity
     do_case(B=3, I=8, O=8)

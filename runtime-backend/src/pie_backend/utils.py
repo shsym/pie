@@ -10,6 +10,11 @@ from typing import Any
 import torch
 
 
+# Module-level variable for CPU process group (set during multi-GPU init)
+# Used for metadata broadcasts to avoid GPU spin
+_cpu_group = None
+
+
 def is_apple_silicon() -> bool:
     """Check if running on macOS with Apple Silicon (M1/M2/M3/M4).
 
@@ -130,9 +135,10 @@ def broadcast_struct(data: Any, src: int = 0, device: torch.device | None = None
     if rank == src:
         metadata = separate(data)
     
-    # 2. Broadcast metadata
+    # 2. Broadcast metadata via CPU group (gloo) to avoid GPU spin
+    # Falls back to default group if CPU group not initialized
     meta_list = [metadata]
-    dist.broadcast_object_list(meta_list, src=src, device=device)
+    dist.broadcast_object_list(meta_list, src=src, group=_cpu_group)
     metadata = meta_list[0]
     
     # 3. Prepare tensors for broadcast
@@ -150,7 +156,7 @@ def broadcast_struct(data: Any, src: int = 0, device: torch.device | None = None
             elif isinstance(obj, tuple):
                 for v in obj: find_specs(v)
         
-        find_specs(metadata)
+        find_specs(metadata)  # Actually traverse to find tensor specs
         
         # Allocate empty tensors
         tensors = [None] * len(tensor_specs)
