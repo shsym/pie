@@ -371,7 +371,7 @@ class Schema:
                 tensor = result
         # Apply interleaved sharding BEFORE fusion (if requested)
         # This is CRITICAL for fused QKV weights where naive chunking breaks head alignment
-        if config.world_size > 1 and source.sharding == 'interleaved_column':
+        elif config.world_size > 1 and source.sharding == 'interleaved_column':
             # Shard each source source tensor individually along dim=0 (Column Parallel)
             sharded_tensors = []
             # print(f"DEBUG: Interleaved sharding for {physical_names}", flush=True)
@@ -387,9 +387,15 @@ class Schema:
                 # print(f"  Shard {i}: {t.shape} -> {chunk.shape}", flush=True)
                 sharded_tensors.append(chunk)
             tensors = sharded_tensors
+            
+            # After interleaved sharding, we might still need to fuse or it might be single
+            if source.is_fused:
+                tensor = torch.cat(tensors, dim=source.fuse_dim)
+            else:
+                tensor = tensors[0]
 
         # Fuse if needed (concatenation)
-        if source.is_fused:
+        elif source.is_fused:
             tensor = torch.cat(tensors, dim=source.fuse_dim)
         # Gathered but no transform - just take first tensor (unusual case)
         elif source.is_gathered:

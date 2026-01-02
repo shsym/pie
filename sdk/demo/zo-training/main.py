@@ -15,7 +15,7 @@ import wandb
 from tqdm.auto import tqdm
 
 # Assume pie is an installed library
-from pie import PieClient, Instance, Event
+from pie_client import PieClient, Instance, Event
 # Use the refactored dataset imports
 from countdown import CountdownDataset
 from openr1math import OpenR1MathDataset

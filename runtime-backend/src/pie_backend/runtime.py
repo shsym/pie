@@ -11,6 +11,7 @@ by delegating to specialized components:
 from __future__ import annotations
 
 import base64
+import random
 from pathlib import Path
 import time
 from typing import TYPE_CHECKING
@@ -24,7 +25,7 @@ from .config import RuntimeConfig
 from .batching import BatchBuilder, Batch
 from .loader import ModelLoader
 from .adapter import AdapterSubpass, CmaesAdapter
-from .model import llama3, qwen2, qwen3, common
+from .model import llama3, qwen2, qwen3, common, gpt_oss
 from . import message
 
 # Re-export RuntimeConfig for backward compatibility
@@ -64,6 +65,14 @@ class Runtime:
         self.config = config
         self.adapters = {}
         self.batch = None
+
+        # Initialize seeds
+        print(f"Initializing with random seed: {config.random_seed}")
+        random.seed(config.random_seed)
+        np.random.seed(config.random_seed)
+        torch.manual_seed(config.random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(config.random_seed)
 
         # Load model weights using ModelLoader
         loader = ModelLoader(config)
@@ -148,6 +157,27 @@ class Runtime:
                 
 
                 
+            case "gptoss":
+                # Create model config
+                self.model_config = gpt_oss.ModelConfig.from_dict(normalized_arch)
+                
+                # Create forward pass with weights
+                self.engine = gpt_oss.ForwardPass(
+                    self.model_config,
+                    config,
+                    weights,
+                )
+                # Create adapter cache
+                self.adapter_at_layer = gpt_oss.create_adapter_cache(
+                    self.model_config, config
+                )
+                # Evaluate and store max_num_kv_pages in config
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
+                # Create KV cache
+                self.kv_cache_at_layer = gpt_oss.create_kv_cache(
+                    self.model_config, config
+                )
+
             case _:
                 raise ValueError(f"Unsupported architecture type: {self.type}")
 

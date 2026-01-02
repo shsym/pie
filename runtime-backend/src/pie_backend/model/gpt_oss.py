@@ -459,6 +459,25 @@ class ForwardPass:
         
         return cos_sin_cache.to(torch.float32)
 
+    def embed_inputs(self, batch_metadata: dict[str, Any]) -> torch.Tensor:
+        """
+        Embed input tokens into hidden states.
+        
+        Args:
+            batch_metadata: Metadata dictionary from the batch builder/packager.
+            
+        Returns:
+            Tensor of input embeddings.
+        """
+        device = self.runtime_config.device
+        
+        # Extract token IDs from metadata
+        token_ids_tensor = torch.as_tensor(
+            batch_metadata["token_ids"], device=device, dtype=torch.int32
+        )
+        
+        return self.embed_tokens(token_ids_tensor)
+
     def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Embed token IDs into hidden states."""
         return fun.embedding(token_ids, self.weights.get("embed_token"))

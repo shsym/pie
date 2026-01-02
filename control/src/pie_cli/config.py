@@ -51,6 +51,7 @@ def create_default_config_content(backend_type: str = "python") -> str:
                 "max_adapter_rank": 8,
                 "gpu_mem_utilization": 0.9,
                 "enable_profiling": False,
+                "random_seed": 42,
             }
         ]
 
@@ -157,6 +158,9 @@ def config_update(
     backend_enable_profiling: Optional[bool] = typer.Option(
         None, "--enable-profiling", help="Enable profiling"
     ),
+    backend_random_seed: Optional[int] = typer.Option(
+        None, "--backend-random-seed", help="Random seed for backend"
+    ),
     path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
     """Update the entries of the config file."""
@@ -193,6 +197,7 @@ def config_update(
             "max_adapter_rank": backend_max_adapter_rank,
             "gpu_mem_utilization": backend_gpu_mem_utilization,
             "enable_profiling": backend_enable_profiling,
+            "random_seed": backend_random_seed,
         }.items()
         if v is not None
     }

@@ -176,17 +176,19 @@ class ForwardPass:
         self.model_config = model_config
         self.runtime_config = runtime_config
         self.weights = weights
-        
+
         # Create workspace buffer for attention operations
-        workspace_buffer = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
+        self.workspace_buffer = torch.zeros(
+            1024 * 1024 * 1024, dtype=torch.uint8, device=self.runtime_config.device
         )
         self.wrapper_decode = ops.BatchDecodeWithPagedKVCacheWrapper(
-            workspace_buffer, "NHD"
+            self.workspace_buffer, "NHD"
         )
         self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer, "NHD"
+            self.workspace_buffer, "NHD"
         )
+        
+       
 
     def embed_inputs(self, batch_metadata: dict[str, Any]) -> torch.Tensor:
         """
@@ -487,6 +489,8 @@ class ForwardPass:
         # subpasses
         adapter_subpass: Optional[AdapterSubpass],
     ) -> torch.Tensor:
+
+         
 
         # --- Calculate local TP sizes ---
         # <-- These are still needed here for planning the wrapper

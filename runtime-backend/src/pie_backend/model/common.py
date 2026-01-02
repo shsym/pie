@@ -5,6 +5,7 @@ Common modeling components for PIE backend.
 from __future__ import annotations
 
 import torch
+import math
 from typing import Callable, Any
 
 from flashinfer.sampling import (
@@ -14,6 +15,11 @@ from flashinfer.sampling import (
     min_p_sampling_from_probs,
     top_k_top_p_sampling_from_probs,
 )
+
+if torch.cuda.is_available():
+    NUM_SM = torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count
+else:
+    NUM_SM = 108
 
 def sample_common(
     hidden_states: torch.Tensor,
@@ -177,3 +183,115 @@ def _execute_sampler(
 
     else:
         raise ValueError(f"Unknown sampler index: {sampler_idx}")
+
+
+def estimate_flashinfer_workspace_size(
+    # Inputs corresponding to transform() arguments
+    element_size: int,
+    total_qo_len: int,
+    batch_size: int,
+    single_token_inference_mode: bool,
+    # Config objects available in self
+    model_config,     # needs .num_q_heads, .num_kv_heads, .dim_head
+    runtime_config,   # needs .world_size, .device
+) -> int:
+    """
+    Estimates the required workspace buffer size in bytes for FlashInfer operations.
+    Replicates the C++ logic from flashinfer/attention/scheduler.cuh.
+    """
+    
+    # --- 1. Setup Constants & GPU Properties ---
+    local_num_qo_heads = model_config.num_q_heads // runtime_config.world_size
+    local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
+    head_dim = model_config.dim_head
+    
+    # Helper for 16-byte alignment (FlashInfer Requirement)
+    def align16(n):
+        return (n + 15) // 16 * 16
+
+    # Get GPU Multi-Processor Count for Split-KV estimation
+    # FlashInfer uses heuristics based on available SMs to decide splitting.
+    num_sm = NUM_SM
+    
+    # FlashInfer typically limits parallelism to 2 blocks per SM for these kernels
+    max_grid_size = num_sm * 2 
+    gqa_group_size = local_num_qo_heads // local_num_kv_heads
+
+    size = 0
+    id_size = 4  # int32 used for indices
+
+    # --- 2. Decode Path (Single Token) ---
+    if single_token_inference_mode:
+        
+        # Simulate Work Estimation Logic:
+        # If batch is small, FlashInfer splits KV to fill the GPU (Split-KV).
+        # We calculate the "padded" batch size used for allocation.
+        if batch_size * gqa_group_size >= max_grid_size:
+            split_kv = False
+            padded_batch_size = batch_size
+        else:
+            split_kv = True
+            # In worst case (or CUDA graph), it pads to max capacity
+            padded_batch_size = max_grid_size // max(1, gqa_group_size)
+
+        # -- Int Buffer Allocations --
+        size += align16(padded_batch_size * id_size)     # request_indices
+        size += align16(padded_batch_size * id_size)     # kv_tile_indices
+        size += align16((padded_batch_size + 1) * id_size) # o_indptr
+        size += align16(id_size)                         # kv_chunk_size_ptr
+        
+        if split_kv:
+            size += align16(padded_batch_size * 1)       # block_valid_mask (bool)
+
+            # -- Float Buffer Allocations (Temporary Accumulation) --
+            # V Buffer: [num_heads, padded_batch, head_dim] (Output Type)
+            v_size = local_num_qo_heads * padded_batch_size * head_dim * element_size
+            size += align16(v_size)
+            
+            # S Buffer: [num_heads, padded_batch] (Float32)
+            s_size = local_num_qo_heads * padded_batch_size * 4 
+            size += align16(s_size)
+
+    # --- 3. Prefill Path (Append) ---
+    else:
+        # Determine Tile Size (cta_tile_q)
+        # Standard FlashInfer logic: 128 for dim <= 128, else 64
+        cta_tile_q = 128 if head_dim <= 128 else 64
+        
+        # Calculate Padded Batch Size (Total Tiles)
+        # In prefill, "batch" often refers to total number of tiles across all requests
+        packed_total_len = total_qo_len * gqa_group_size
+        total_num_tiles_q = math.ceil(packed_total_len / cta_tile_q) + batch_size
+        
+        # FlashInfer bounds prefill splitting by available SMs to avoid OOM
+        # So allocation size is max(sm_capacity, needed_tiles)
+        padded_batch_size = max(max_grid_size, total_num_tiles_q)
+
+        # -- Int Buffer Allocations --
+        size += align16(padded_batch_size * id_size)     # request_indices
+        size += align16(padded_batch_size * id_size)     # qo_tile_indices
+        size += align16(padded_batch_size * id_size)     # kv_tile_indices
+        size += align16((batch_size + 1) * id_size)      # o_indptr
+        size += align16(id_size)                         # kv_chunk_size_ptr
+        
+        # Merge Indptr (Conservative Estimate for Split-KV)
+        size += align16((total_qo_len + 1) * id_size)
+        size += align16(padded_batch_size * 1)           # block_valid_mask
+
+        # -- Float Buffer Allocations --
+        # FlashInfer allocates float buffers for Split-KV prefill.
+        # Crucially, it bounds this by `max_grid_size` (execution parallelism),
+        # NOT by `total_num_tiles_q` (data length), otherwise long contexts would OOM.
+        
+        alloc_units = max_grid_size
+        
+        # V Buffer: [num_heads, alloc_units, tile_size, head_dim] (Float32)
+        # Note: FlashInfer uses float32 for prefill accumulation
+        v_size = local_num_qo_heads * alloc_units * cta_tile_q * head_dim * 4
+        size += align16(v_size)
+        
+        # S Buffer: [num_heads, alloc_units, tile_size] (Float32)
+        s_size = local_num_qo_heads * alloc_units * cta_tile_q * 4
+        size += align16(s_size)
+
+    return size

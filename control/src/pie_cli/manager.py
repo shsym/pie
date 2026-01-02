@@ -185,6 +185,7 @@ def spawn_python_backend(
         "activation_dtype": backend_config.get("activation_dtype", "bfloat16"),
         "weight_dtype": backend_config.get("weight_dtype"),
         "enable_profiling": backend_config.get("enable_profiling", False),
+        "random_seed": backend_config.get("random_seed", 42),
     }
     
     # Remove None values

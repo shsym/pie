@@ -37,7 +37,10 @@ class RuntimeConfig:
     max_batch_tokens: int | None
     max_num_adapters: int
     max_adapter_rank: int
+    max_num_adapters: int
+    max_adapter_rank: int
     gpu_mem_utilization: float
+    random_seed: int
 
     # Evaluated at runtime
     max_num_kv_pages: int | None
@@ -101,6 +104,7 @@ class RuntimeConfig:
         activation_dtype: str = "bfloat16",
         weight_dtype: str | None = None,
         enable_profiling: bool = False,
+        random_seed: int = 42,
     ) -> "RuntimeConfig":
         """
         Factory method to build a validated and resolved RuntimeConfig.
@@ -177,6 +181,7 @@ class RuntimeConfig:
             max_num_adapters=max_num_adapters,
             max_adapter_rank=max_adapter_rank,
             gpu_mem_utilization=gpu_mem_utilization,
+            random_seed=random_seed,
             max_num_kv_pages=None,  # Populated by runtime based on memory
             devices=resolved_devices,
             rank=rank,

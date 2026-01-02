@@ -25,6 +25,7 @@ def main(
     activation_dtype: str = "bfloat16",
     weight_dtype: str | None = None,
     enable_profiling: bool = False,
+    random_seed: int = 42,
     test: bool = False,
     doctor: bool = False,
 ):
@@ -54,7 +55,6 @@ def main(
         weight_dtype: The data type for weights. If different from activation_dtype,
                       weights will be quantized. Options: 'int4', 'int8', 'float8'.
                       If None, uses activation_dtype (no quantization).
-        enable_profiling: Enable unified profiler (timing + tensor tracking) (default: False).
         enable_profiling: Enable unified profiler (timing + tensor tracking) (default: False).
         test: Run embedded test client after server starts (default: False).
         doctor: Run environment health check and exit (default: False).
@@ -123,6 +123,7 @@ def main(
                 activation_dtype,
                 weight_dtype,
                 enable_profiling,
+                random_seed,
                 test,
             ),
             nprocs=world_size,
@@ -148,6 +149,7 @@ def main(
             0, # rank
             1, # world_size
             [single_device] if single_device else [], # devices (will be resolved in config)
+            0, # master_port (unused in single process mode)
             model,
             host,
             port,
@@ -163,6 +165,7 @@ def main(
             activation_dtype,
             weight_dtype,
             enable_profiling,
+            random_seed,
             test,
         )
 
@@ -186,6 +189,7 @@ def init_process(
     activation_dtype: str,
     weight_dtype: str | None,
     enable_profiling: bool,
+    random_seed: int,
     test: bool,
 ):
     """
@@ -209,9 +213,6 @@ def init_process(
         local_device = devices[rank] if devices and rank < len(devices) else f"cuda:{rank}"
         torch.cuda.set_device(local_device)
         
-        # Initialize process group
-        # Use NCCL for CUDA, GLOO for CPU
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
         # Use NCCL for CUDA, GLOO for CPU
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(backend, rank=rank, world_size=world_size)
@@ -236,6 +237,7 @@ def init_process(
         activation_dtype=activation_dtype,
         weight_dtype=weight_dtype,
         enable_profiling=enable_profiling,
+        random_seed=random_seed,
         rank=rank,
         world_size=world_size,
     )
