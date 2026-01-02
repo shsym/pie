@@ -19,7 +19,7 @@ console = Console()
 app = typer.Typer(help="Manage configuration")
 
 
-def create_default_config_content(backend_type: str = "python") -> str:
+def create_default_config_content() -> str:
     """Create the default configuration file content."""
     cache_dir = str(pie_path.get_pie_home() / "cache")
     log_dir = str(pie_path.get_pie_home() / "logs")
@@ -31,18 +31,12 @@ def create_default_config_content(backend_type: str = "python") -> str:
         "verbose": False,
         "log_dir": log_dir,
         "registry": "https://registry.pie-project.org/",
-    }
-
-    if backend_type == "dummy":
-        config["backend"] = [{"backend_type": "dummy"}]
-    else:
-        config["backend"] = [
+        "model": [
             {
-                "backend_type": "python",
-                "exec_path": "pie-backend",
-                "model": "qwen-3-0.6b",
+                "hf_repo": "Qwen/Qwen3-0.6B",
                 "device": ["cuda:0"],
                 "activation_dtype": "bfloat16",
+                "weight_dtype": "auto",
                 "kv_page_size": 16,
                 "max_batch_tokens": 10240,
                 "max_dist_size": 32,
@@ -53,14 +47,15 @@ def create_default_config_content(backend_type: str = "python") -> str:
                 "enable_profiling": False,
                 "random_seed": 42,
             }
-        ]
+        ],
+    }
 
     return toml.dumps(config)
 
 
+
 @app.command("init")
 def config_init(
-    dummy: bool = typer.Option(False, "--dummy", help="Initialize with dummy backend"),
     path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
     """Create a default config file."""
@@ -79,8 +74,7 @@ def config_init(
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Create the default config file
-    backend_type = "dummy" if dummy else "python"
-    config_content = create_default_config_content(backend_type)
+    config_content = create_default_config_content()
     config_path.write_text(config_content)
 
     console.print(f"[green]✓[/green] Created {config_path}")
@@ -119,47 +113,43 @@ def config_update(
     verbose: Optional[bool] = typer.Option(None, "--verbose", help="Enable verbose logging"),
     log_dir: Optional[str] = typer.Option(None, "--log-dir", help="Log directory path"),
     registry: Optional[str] = typer.Option(None, "--registry", help="Inferlet registry URL"),
-    # Backend configuration options
-    backend_type: Optional[str] = typer.Option(None, "--backend-type", help="Backend type"),
-    backend_exec_path: Optional[str] = typer.Option(
-        None, "--backend-exec-path", help="Backend executable path"
-    ),
-    backend_model: Optional[str] = typer.Option(None, "--model", help="Model name"),
-    backend_device: Optional[list[str]] = typer.Option(
+    # Model configuration options
+    model_hf_repo: Optional[str] = typer.Option(None, "--hf-repo", help="HuggingFace repo (e.g., meta-llama/Llama-3.2-1B-Instruct)"),
+    model_device: Optional[list[str]] = typer.Option(
         None, "--device", help="Device(s) (e.g., cuda:0 cuda:1)"
     ),
-    backend_activation_dtype: Optional[str] = typer.Option(
+    model_activation_dtype: Optional[str] = typer.Option(
         None, "--activation-dtype", help="Activation dtype (e.g., bfloat16)"
     ),
-    backend_weight_dtype: Optional[str] = typer.Option(
-        None, "--weight-dtype", help="Weight dtype (e.g., int4, int8)"
+    model_weight_dtype: Optional[str] = typer.Option(
+        None, "--weight-dtype", help="Weight dtype: auto, float32, float16, bfloat16, int4, int8, float8"
     ),
-    backend_kv_page_size: Optional[int] = typer.Option(
+    model_kv_page_size: Optional[int] = typer.Option(
         None, "--kv-page-size", help="KV page size"
     ),
-    backend_max_batch_tokens: Optional[int] = typer.Option(
+    model_max_batch_tokens: Optional[int] = typer.Option(
         None, "--max-batch-tokens", help="Maximum batch tokens"
     ),
-    backend_max_dist_size: Optional[int] = typer.Option(
+    model_max_dist_size: Optional[int] = typer.Option(
         None, "--max-dist-size", help="Maximum distribution size"
     ),
-    backend_max_num_embeds: Optional[int] = typer.Option(
+    model_max_num_embeds: Optional[int] = typer.Option(
         None, "--max-num-embeds", help="Maximum number of embeddings"
     ),
-    backend_max_num_adapters: Optional[int] = typer.Option(
+    model_max_num_adapters: Optional[int] = typer.Option(
         None, "--max-num-adapters", help="Maximum number of adapters"
     ),
-    backend_max_adapter_rank: Optional[int] = typer.Option(
+    model_max_adapter_rank: Optional[int] = typer.Option(
         None, "--max-adapter-rank", help="Maximum adapter rank"
     ),
-    backend_gpu_mem_utilization: Optional[float] = typer.Option(
+    model_gpu_mem_utilization: Optional[float] = typer.Option(
         None, "--gpu-mem-utilization", help="GPU memory utilization (0.0 to 1.0)"
     ),
-    backend_enable_profiling: Optional[bool] = typer.Option(
+    model_enable_profiling: Optional[bool] = typer.Option(
         None, "--enable-profiling", help="Enable profiling"
     ),
-    backend_random_seed: Optional[int] = typer.Option(
-        None, "--backend-random-seed", help="Random seed for backend"
+    model_random_seed: Optional[int] = typer.Option(
+        None, "--random-seed", help="Random seed for model"
     ),
     path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
@@ -179,30 +169,28 @@ def config_update(
         if v is not None
     }
 
-    # Collect backend updates
-    backend_updates = {
+    # Collect model updates
+    model_updates = {
         k: v
         for k, v in {
-            "backend_type": backend_type,
-            "exec_path": backend_exec_path,
-            "model": backend_model,
-            "device": backend_device,
-            "activation_dtype": backend_activation_dtype,
-            "weight_dtype": backend_weight_dtype,
-            "kv_page_size": backend_kv_page_size,
-            "max_batch_tokens": backend_max_batch_tokens,
-            "max_dist_size": backend_max_dist_size,
-            "max_num_embeds": backend_max_num_embeds,
-            "max_num_adapters": backend_max_num_adapters,
-            "max_adapter_rank": backend_max_adapter_rank,
-            "gpu_mem_utilization": backend_gpu_mem_utilization,
-            "enable_profiling": backend_enable_profiling,
-            "random_seed": backend_random_seed,
+            "hf_repo": model_hf_repo,
+            "device": model_device,
+            "activation_dtype": model_activation_dtype,
+            "weight_dtype": model_weight_dtype,
+            "kv_page_size": model_kv_page_size,
+            "max_batch_tokens": model_max_batch_tokens,
+            "max_dist_size": model_max_dist_size,
+            "max_num_embeds": model_max_num_embeds,
+            "max_num_adapters": model_max_num_adapters,
+            "max_adapter_rank": model_max_adapter_rank,
+            "gpu_mem_utilization": model_gpu_mem_utilization,
+            "enable_profiling": model_enable_profiling,
+            "random_seed": model_random_seed,
         }.items()
         if v is not None
     }
 
-    if not engine_updates and not backend_updates:
+    if not engine_updates and not model_updates:
         console.print("[yellow]![/yellow] No options provided")
         console.print("[dim]Run 'pie config update --help' to see available options.[/dim]")
         return
@@ -222,17 +210,18 @@ def config_update(
         config[key] = value
         console.print(f"[green]✓[/green] {key} = {value}")
 
-    # Update backend configuration (first backend entry)
-    if backend_updates:
-        if not config.get("backend"):
-            console.print("[red]✗[/red] No backend configuration found")
+    # Update model configuration (first model entry)
+    if model_updates:
+        if not config.get("model"):
+            console.print("[red]✗[/red] No model configuration found")
             raise typer.Exit(1)
 
-        for key, value in backend_updates.items():
-            config["backend"][0][key] = value
-            console.print(f"[green]✓[/green] backend.{key} = {value}")
+        for key, value in model_updates.items():
+            config["model"][0][key] = value
+            console.print(f"[green]✓[/green] model.{key} = {value}")
 
     # Write the updated config
     config_path.write_text(toml.dumps(config))
     console.print()
     console.print(f"[dim]Saved to {config_path}[/dim]")
+

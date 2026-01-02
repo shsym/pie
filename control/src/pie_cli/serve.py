@@ -23,7 +23,7 @@ def load_config(
     """Load and merge configuration from file and CLI arguments.
 
     Returns:
-        Tuple of (engine_config, backend_configs)
+        Tuple of (engine_config, model_configs)
     """
     # Load config file
     file_path = config_path or pie_path.get_default_config_path()
@@ -45,12 +45,12 @@ def load_config(
         "registry": config.get("registry", "https://registry.pie-project.org/"),
     }
 
-    backend_configs = config.get("backend", [])
-    if not backend_configs:
-        console.print("[red]✗[/red] No backend configuration found")
+    model_configs = config.get("model", [])
+    if not model_configs:
+        console.print("[red]✗[/red] No model configuration found")
         raise typer.Exit(1)
 
-    return engine_config, backend_configs
+    return engine_config, model_configs
 
 
 def serve(
@@ -67,7 +67,7 @@ def serve(
     services. In interactive mode, it provides a shell for running inferlets.
     """
     try:
-        engine_config, backend_configs = load_config(config)
+        engine_config, model_configs = load_config(config)
     except typer.Exit:
         raise
 
@@ -82,9 +82,9 @@ def serve(
     lines.append(f"{'Host':<15}", style="white")
     lines.append(f"{engine_config['host']}:{engine_config['port']}\n", style="dim")
     lines.append(f"{'Model':<15}", style="white")
-    lines.append(f"{backend_configs[0].get('model', 'unknown')}\n", style="dim")
+    lines.append(f"{model_configs[0].get('hf_repo', 'unknown')}\n", style="dim")
     lines.append(f"{'Device':<15}", style="white")
-    device = backend_configs[0].get("device", ["unknown"])
+    device = model_configs[0].get("device", ["unknown"])
     device_str = ", ".join(device) if isinstance(device, list) else device
     lines.append(device_str, style="dim")
     
@@ -98,7 +98,7 @@ def serve(
         # Start engine and backends
         with console.status("[dim]Starting engine...[/dim]"):
             server_handle, backend_processes = manager.start_engine_and_backend(
-                engine_config, backend_configs
+                engine_config, model_configs
             )
         
         console.print("[green]✓[/green] Engine started")

@@ -36,11 +36,11 @@ from typing import Callable, Any
 
 import torch
 from tqdm import tqdm
-import ztensor
 import safetensors
 
 from .quantization import quantize
 from .config import RuntimeConfig
+from . import hf_utils
 
 
 # =============================================================================
@@ -426,8 +426,11 @@ class Schema:
         
         # Apply quantization (lazy import to avoid dependency issues)
         if source.should_quantize and config.quantization is not None:
-            
             tensor = quantize(tensor, config.quantization)
+        else:
+            # Apply dtype casting for float weight types (including 'auto')
+            # This handles: auto -> activation_dtype, float32/float16/bfloat16 -> specified dtype
+            tensor = tensor.to(config.compute_dtype)
         
         # Move to device
         tensor = tensor.to(config.device)
@@ -442,7 +445,7 @@ class Schema:
 
 class ModelLoader:
     """
-    Handles model loading, TOML parsing, and weight I/O.
+    Handles model loading from HuggingFace cache.
     
     This separates the loading concerns from the runtime orchestration.
     The loader returns a WeightStore and model config - the runtime
@@ -454,10 +457,11 @@ class ModelLoader:
         Initialize the model loader.
         
         Args:
-            config: Runtime configuration
+            config: Runtime configuration with repo_id and arch
         """
         self.config = config
         self.info: dict = {}
+        self.snapshot_dir: Path | None = None
 
     def load(self) -> tuple[WeightStore, dict, dict]:
         """
@@ -466,16 +470,34 @@ class ModelLoader:
         Returns:
             Tuple of (weights, normalized_arch, model_info)
         """
-        # Load model info from TOML
-        self.info = self._load_toml()
-        arch_type = self.info["architecture"]["type"]
-
-        # Normalize architecture fields
-        normalized_arch = self._normalize_arch_fields(self.info["architecture"])
+        # Get HuggingFace snapshot directory
+        self.snapshot_dir = hf_utils.get_hf_snapshot_dir(self.config.hf_repo)
+        
+        # Load config from HuggingFace config.json
+        hf_config = hf_utils.load_hf_config(self.snapshot_dir)
+        
+        # Normalize the HF config to PIE format
+        normalized_arch = hf_utils.normalize_hf_config(hf_config)
+        
+        # Derive architecture from HF model_type
+        hf_model_type = hf_config.get("model_type", "")
+        arch_type = hf_utils.HF_TO_PIE_ARCH.get(hf_model_type)
+        if arch_type is None:
+            raise ValueError(
+                f"Unsupported HuggingFace model_type: '{hf_model_type}'. "
+                f"Supported types: {list(hf_utils.HF_TO_PIE_ARCH.keys())}"
+            )
+        normalized_arch["type"] = arch_type
+        
+        # Store info for later (tokenizer, template, etc.)
+        self.info = {
+            "architecture": normalized_arch,
+            "hf_config": hf_config,
+        }
 
         # Get schema for architecture type
         match arch_type:
-            case "llama3" | "l4ma":
+            case "llama3":
                 from .model import llama3
                 schema = llama3.LLAMA3_SCHEMA
                 num_layers = int(normalized_arch["num_layers"])
@@ -489,12 +511,14 @@ class ModelLoader:
                 from .model import qwen3
                 schema = qwen3.QWEN3_SCHEMA
                 num_layers = int(normalized_arch["num_layers"])
-            case "gpt_oss" | "gptoss":
+                
+            case "gpt_oss":
                 from .model import gpt_oss
                 # GPT-OSS uses a factory function because MoE transforms need dimensions
                 model_config = gpt_oss.ModelConfig.from_dict(normalized_arch)
                 schema = gpt_oss.create_gpt_oss_schema(model_config)
                 num_layers = model_config.num_layers
+                
             case _:
                 raise ValueError(f"Unsupported architecture type: {arch_type}")
 
@@ -505,7 +529,7 @@ class ModelLoader:
 
     def load_weights(self, schema: Schema, num_layers: int) -> WeightStore:
         """
-        Load weights using the provided schema.
+        Load weights using the provided schema from HuggingFace cache.
         
         Args:
             schema: Weight schema defining the tensor mapping
@@ -514,33 +538,29 @@ class ModelLoader:
         Returns:
             WeightStore with all loaded weights
         """
-        # Determine path to model weight files
-        model_dir = Path(self.config.cache_dir) / "models" / self.config.model
-
+        if self.snapshot_dir is None:
+            raise ValueError("snapshot_dir not set - call load() first")
+        
+        # Find all safetensor files in the snapshot
+        safetensor_files = hf_utils.get_safetensor_files(self.snapshot_dir)
+        if not safetensor_files:
+            raise ValueError(f"No safetensor files found in {self.snapshot_dir}")
 
         # Load weights
         with ExitStack() as stack:
             readers: dict[str, object] = {}
 
             # Build tensor name -> reader mapping
-            param_files = self.info.get("parameters", [])
             for param_file in tqdm(
-                param_files, desc="Scanning tensor files", unit="files"
+                safetensor_files, desc="Scanning tensor files", unit="files"
             ):
-                param_path = model_dir / param_file
-
-                if param_path.suffix == ".zt":
-                    f = stack.enter_context(ztensor.Reader(str(param_path)))
-                    names = f.get_tensor_names()
-                elif param_path.suffix == ".safetensors":
-                    f = stack.enter_context(
-                        safetensors.safe_open(
-                            str(param_path), framework="pt", device="cpu"
-                        )
+                param_path = self.snapshot_dir / param_file
+                f = stack.enter_context(
+                    safetensors.safe_open(
+                        str(param_path), framework="pt", device="cpu"
                     )
-                    names = list(f.keys())
-                else:
-                    continue
+                )
+                names = list(f.keys())
 
                 for n in names:
                     readers[n] = f
@@ -552,12 +572,7 @@ class ModelLoader:
                 if f is None:
                     raise KeyError(f"Tensor '{name}' not found")
 
-                # ztensor vs safetensors
-                t = (
-                    f.read_tensor(name, to="torch")  # ztensor
-                    if hasattr(f, "read_tensor")
-                    else f.get_tensor(name)  # safetensors
-                )
+                t = f.get_tensor(name)
 
                 if expected_shape is not None and tuple(t.shape) != tuple(
                     expected_shape
@@ -575,73 +590,3 @@ class ModelLoader:
             )
 
         return weights
-
-    def _load_toml(self) -> dict:
-        """
-        Load model metadata from TOML file.
-        
-        Returns:
-            Parsed TOML dictionary
-        """
-        # Try model subdirectory first
-        model_info_path = (
-            Path(self.config.cache_dir) / "models" / f"{self.config.model}.toml"
-        )
-
-        if not model_info_path.exists():
-            raise ValueError(
-                f'Metadata file for model "{self.config.model}" not found. '
-                f"Expected: {self.config.cache_dir}/models/{self.config.model}.toml"
-            )
-
-        with open(model_info_path, "rb") as f:
-            return tomllib.load(f)
-
-    def _normalize_arch_fields(self, arch: dict) -> dict:
-        """
-        Normalize YAML/TOML field names to match ModelConfig.from_dict expectations.
-        
-        Args:
-            arch: Raw architecture dictionary from TOML
-            
-        Returns:
-            Normalized architecture dictionary
-        """
-        normalized = dict(arch)
-
-        # Map YAML field names -> expected names
-        field_map = {
-            "head_dim": "head_size",
-            "num_heads": "num_query_heads",
-            "num_heads_kv": "num_key_value_heads",
-            "high_freq_factor": "high_frequency_factor",
-            "low_freq_factor": "low_frequency_factor",
-        }
-
-        # Normalize top-level fields
-        for old, new in field_map.items():
-            if old in normalized and new not in normalized:
-                normalized[new] = normalized.pop(old)
-
-        # Normalize rope subfields
-        if "rope" in normalized:
-            rope = dict(normalized["rope"])
-            for old, new in field_map.items():
-                if old in rope and new not in rope:
-                    rope[new] = rope.pop(old)
-            # Add rope.factor default if missing
-            if "factor" not in rope:
-                rope["factor"] = 1.0
-            normalized["rope"] = rope
-
-        # Add missing fields with defaults
-        if "rms_norm_eps" not in normalized:
-            normalized["rms_norm_eps"] = 1e-5
-
-        # Get vocab_size from tokenizer section if not in architecture
-        if "vocab_size" not in normalized and "tokenizer" in self.info:
-            tokenizer = self.info["tokenizer"]
-            if "vocab_size" in tokenizer:
-                normalized["vocab_size"] = tokenizer["vocab_size"]
-
-        return normalized

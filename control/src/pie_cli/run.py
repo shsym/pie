@@ -57,7 +57,7 @@ def run(
         raise typer.Exit(1)
 
     try:
-        engine_config, backend_configs = serve_module.load_config(config)
+        engine_config, model_configs = serve_module.load_config(config)
     except typer.Exit:
         raise
 
@@ -71,7 +71,7 @@ def run(
     lines.append(f"{'Inferlet':<15}", style="white")
     lines.append(f"{inferlet_display}\n", style="dim")
     lines.append(f"{'Model':<15}", style="white")
-    lines.append(backend_configs[0].get('model', 'unknown'), style="dim")
+    lines.append(model_configs[0].get('hf_repo', 'unknown'), style="dim")
     
     console.print(Panel(lines, title="Pie Run", title_align="left", border_style="dim"))
     console.print()
@@ -83,7 +83,7 @@ def run(
         # Start engine and backends
         with console.status("[dim]Starting engine...[/dim]"):
             server_handle, backend_processes = manager.start_engine_and_backend(
-                engine_config, backend_configs
+                engine_config, model_configs
             )
         
         console.print("[green]✓[/green] Engine started")

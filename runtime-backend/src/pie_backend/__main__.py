@@ -6,11 +6,14 @@ import platform
 import importlib.metadata
 import torch
 import time
+import os
+import signal
+import warnings
 
 
 # Main entry point for the server
 def main(
-    model: str | None = None,
+    hf_repo: str | None = None,
     host: str = "localhost",
     port: int = 9123,
     internal_auth_token: str | None = None,
@@ -33,11 +36,9 @@ def main(
     Runs the application with configuration provided as command-line arguments.
 
     Args:
-        model: Name of the model to load (required).
+        hf_repo: HuggingFace repo (e.g., "meta-llama/Llama-3.2-1B-Instruct") (required).
         host: Hostname for the ZMQ service to bind to.
         port: Port for the ZMQ service to bind to.
-        controller_host: Hostname of the controller to register with.
-        controller_port: Port of the controller to register with.
         internal_auth_token: Internal authentication token for connecting to the controller.
         cache_dir: Directory for model cache. Defaults to PIE_HOME env var,
                    then the platform-specific user cache dir.
@@ -59,8 +60,8 @@ def main(
         test: Run embedded test client after server starts (default: False).
     """
 
-    if model is None:
-        raise ValueError("The 'model' argument is required unless --doctor is specified.")
+    if hf_repo is None:
+        raise ValueError("The 'hf_repo' argument is required.")
     # Parse device argument
     if device is None:
         device_list = None
@@ -104,7 +105,7 @@ def main(
                 world_size,
                 device_list,
                 master_port,  # Pass port to ensure all processes use same port
-                model,
+                hf_repo,
                 host,
                 port,
                 internal_auth_token,
@@ -126,32 +127,17 @@ def main(
             join=False, # We manage join manually
         )
         
-        # Cleanup function to kill all children
+        # Cleanup function to kill all children immediately
         def cleanup_children():
-            # First try graceful termination to allow cleanup (destroy_process_group)
             for p in ctx.processes:
                 if p.is_alive():
-                    p.terminate()
-            
-            # Wait a bit for them to finish
-            start = time.time()
-            all_dead = False
-            while time.time() - start < 12:
-                all_dead = True
-                for p in ctx.processes:
-                    if p.is_alive():
-                        all_dead = False
-                if all_dead:
-                    break
-                time.sleep(0.1)
-
-            # Force kill if still alive
-            for p in ctx.processes:
-                if p.is_alive():
-                    p.kill()  # Use SIGKILL to ensure termination
-                    p.join(timeout=2)
+                    try:
+                        os.kill(p.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    p.join(timeout=1.0)
         
-        # Register atexit handler to ensure children die when parent dies
+        # Register atexit handler
         import atexit
         atexit.register(cleanup_children)
         
@@ -177,7 +163,7 @@ def main(
             1, # world_size
             [single_device] if single_device else [], # devices (will be resolved in config)
             0, # master_port (unused in single process mode)
-            model,
+            hf_repo,
             host,
             port,
             internal_auth_token,
@@ -201,7 +187,7 @@ def init_process(
     world_size: int,
     devices: list[str],
     master_port: int,  # Port for distributed coordination (shared by all processes)
-    model: str,
+    hf_repo: str,
     host: str,
     port: int,
     internal_auth_token: str | None,
@@ -265,7 +251,7 @@ def init_process(
 
     # Create configuration
     config = RuntimeConfig.from_args(
-        model=model,
+        hf_repo=hf_repo,
         cache_dir=cache_dir,
         kv_page_size=kv_page_size,
         max_dist_size=max_dist_size,
@@ -298,7 +284,7 @@ def init_process(
 
     if rank == 0:
         # Rank 0 runs the server
-        print(f"Starting server for model {model} on {config.device}...")
+        print(f"Starting server for {hf_repo} on {config.device}...")
         start_server(host=host, port=port, auth_token=internal_auth_token, service=service, run_tests=test)
         
         # Shutdown workers

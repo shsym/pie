@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import io
 import time
 import torch
 import torch.nn as nn
@@ -396,15 +396,22 @@ class CmaesAdapter(Adapter):
         """
         Loads the adapter's state from a file and populates its parameters and state.
 
-        This function loads a state dictionary from f"adapter_{self.adapter_id}.pt".
-        It populates the adapter's weights by copying them into the appropriate
-        slices of `self.adapter_at_layer`. It also restores all hyperparameters and
-        the internal state of the CMA-ES optimizer. The 'data' parameter is ignored.
+        The 'data' parameter, if provided, is treated as a bytes buffer containing the checkpoint.
+        If 'data' is empty, it falls back to loading from f"adapter_{name}.pt".
         """
-        filename = f"adapter_{name}.pt"
-        # print("Loading adapter from", filename)
-        # Load the state dictionary, mapping tensors to the adapter's device.
-        state_dict = torch.load(filename, map_location=self.device)
+        state_dict = None
+        if data:
+            try:
+                # print(f"Loading adapter {name} from memory ({len(data)} bytes)...")
+                buffer = io.BytesIO(data)
+                state_dict = torch.load(buffer, map_location=self.device)
+            except Exception as e:
+                print(f"Failed to load adapter from memory: {e}. Falling back to file.")
+        
+        if state_dict is None:
+            filename = f"adapter_{name}.pt"
+            # print("Loading adapter from", filename)
+            state_dict = torch.load(filename, map_location=self.device)
 
         # --- Verification ---
         # Ensure the loaded checkpoint is compatible with this adapter instance.
@@ -533,8 +540,10 @@ class CmaesAdapter(Adapter):
 
         torch.save(state_dict, filename)
 
-        # As instructed, return an empty bytes object.
-        return b""
+        # Also save to memory to return
+        buffer = io.BytesIO()
+        torch.save(state_dict, buffer)
+        return buffer.getvalue()
 
     @torch.inference_mode()
     def update(self, scores: list[float], seeds: list[int], max_sigma: float) -> None:

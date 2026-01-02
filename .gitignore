@@ -235,3 +235,5 @@ tensor_references
 node_modules/
 package-lock.json
 wandb/
+
+*.pt

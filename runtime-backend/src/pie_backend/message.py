@@ -114,7 +114,7 @@ class UploadAdapterRequest(msgspec.Struct, gc=False):
 
     adapter_ptr: int
     name: str
-    adapter_data: bytes
+    adapter_data: bytes | list[int]
 
 
 class DownloadAdapterRequest(msgspec.Struct, gc=False):

@@ -18,6 +18,10 @@ from torchao.quantization import (
 
 from .utils import resolve_cache_dir
 
+# Valid weight dtype categories
+FLOAT_DTYPES = {"float32", "float16", "bfloat16", "auto"}
+QUANT_DTYPES = {"int4", "int8", "float8"}
+
 
 @dataclass
 class RuntimeConfig:
@@ -29,14 +33,14 @@ class RuntimeConfig:
     configuration used by model forward passes.
     """
 
-    model: str
+    # Model identification
+    hf_repo: str  # HuggingFace repo (e.g., "meta-llama/Llama-3.2-1B-Instruct")
+    
     cache_dir: str
     kv_page_size: int
     max_dist_size: int
     max_num_embeds: int
     max_batch_tokens: int | None
-    max_num_adapters: int
-    max_adapter_rank: int
     max_num_adapters: int
     max_adapter_rank: int
     gpu_mem_utilization: float
@@ -49,7 +53,7 @@ class RuntimeConfig:
     devices: list[torch.device]  # Renamed from device for clarity
     rank: int
     activation_dtype: torch.dtype
-    weight_dtype: str | None  # None means same as activation_dtype (no quantization)
+    weight_dtype: str  # "auto", "float32", "float16", "bfloat16", "int4", "int8", "float8"
 
     # =========================================================================
     # Convenience Properties (formerly in model.Config)
@@ -67,14 +71,26 @@ class RuntimeConfig:
 
     @property
     def needs_quantization(self) -> bool:
-        """True if weight_dtype differs from activation_dtype (quantization needed)."""
-        return self.weight_dtype is not None
+        """True if weight_dtype is a quantization type (int4, int8, float8)."""
+        return self.weight_dtype in QUANT_DTYPES
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        """
+        Get the compute dtype for weights.
+        
+        For float types: returns the specified torch dtype.
+        For 'auto': returns activation_dtype (weights match activations).
+        For quantized types: returns activation_dtype (compute in activation precision).
+        """
+        if self.weight_dtype == "auto" or self.weight_dtype in QUANT_DTYPES:
+            return self.activation_dtype
+        # Float types: float32, float16, bfloat16
+        return getattr(torch, self.weight_dtype)
 
     @property
     def quantization(self) -> Int4WeightOnlyConfig | Int8WeightOnlyConfig | Float8WeightOnlyConfig | None:
-        """Derive quantization config from weight_dtype."""
-        if self.weight_dtype is None:
-            return None
+        """Derive quantization config from weight_dtype (only for quantization types)."""
         match self.weight_dtype:
             case "int4":
                 return Int4WeightOnlyConfig()
@@ -83,12 +99,12 @@ class RuntimeConfig:
             case "float8":
                 return Float8WeightOnlyConfig()
             case _:
-                raise ValueError(f"Unknown weight_dtype: {self.weight_dtype}")
+                return None
 
     @classmethod
     def from_args(
         cls,
-        model: str,
+        hf_repo: str,
         cache_dir: str | None = None,
         kv_page_size: int = 16,
         max_dist_size: int = 64,
@@ -102,7 +118,7 @@ class RuntimeConfig:
         rank: int = 0,
         world_size: int = 1,
         activation_dtype: str = "bfloat16",
-        weight_dtype: str | None = None,
+        weight_dtype: str = "auto",
         enable_profiling: bool = False,
         random_seed: int = 42,
     ) -> "RuntimeConfig":
@@ -110,7 +126,7 @@ class RuntimeConfig:
         Factory method to build a validated and resolved RuntimeConfig.
 
         Args:
-            model: Model name or path
+            hf_repo: HuggingFace repo (e.g., "meta-llama/Llama-3.2-1B-Instruct")
             cache_dir: Directory for model cache (resolved automatically if None)
             kv_page_size: Size of KV cache pages
             max_dist_size: Maximum distribution size for sampling
@@ -124,7 +140,7 @@ class RuntimeConfig:
             rank: Rank of the current process
             world_size: Total number of processes
             activation_dtype: Activation tensor dtype
-            weight_dtype: Weight quantization type ("int4", "int8", "float8", or None)
+            weight_dtype: Weight dtype - "auto", "float32", "float16", "bfloat16", "int4", "int8", "float8"
             enable_profiling: Enable profiling (currently unused)
 
         Returns:
@@ -162,17 +178,17 @@ class RuntimeConfig:
         # Resolve activation dtype
         resolved_activation_dtype = getattr(torch, activation_dtype, torch.bfloat16)
 
-        # Validate weight_dtype if specified
-        valid_weight_dtypes = {"int4", "int8", "float8", None}
-        if weight_dtype is not None and weight_dtype not in valid_weight_dtypes:
+        # Validate weight_dtype
+        valid_weight_dtypes = FLOAT_DTYPES | QUANT_DTYPES
+        if weight_dtype not in valid_weight_dtypes:
             raise ValueError(
                 f"Invalid weight_dtype: '{weight_dtype}'. "
-                f"Expected one of: 'int4', 'int8', 'float8', or None."
+                f"Expected one of: {', '.join(sorted(valid_weight_dtypes))}"
             )
 
         # Create the config instance
         return cls(
-            model=model,
+            hf_repo=hf_repo,
             cache_dir=resolved_cache_dir,
             kv_page_size=kv_page_size,
             max_dist_size=max_dist_size,
