@@ -3,7 +3,7 @@ pub mod request;
 pub mod resource;
 pub mod tokenizer;
 
-use super::model::batching::{BatchPolicySelector, BatchScheduler, ForwardPassPolicy};
+use super::model::batching::{BatchPolicySelector, BatchScheduler, ThresholdPolicy};
 use super::model::request::{
     FORWARD_PASS_ID, HANDSHAKE_ID, HandshakeRequest, HandshakeResponse, Request,
 };
@@ -267,15 +267,10 @@ impl Model {
         let handshake_info = Self::handshake(&mut socket).await?;
 
         let mut batch_triggers = HashMap::new();
-        let forward_pass_trigger = Arc::new(AtomicBool::new(true));
-        let forward_pass_policy = ForwardPassPolicy::new(
-            forward_pass_trigger.clone(),
-            handshake_info.max_batch_tokens,
-            Duration::ZERO,
-        );
+        let forward_pass_policy = ThresholdPolicy::t_only(Duration::from_micros(500)); // Sub-millisecond threshold
         let batch_policy = BatchPolicySelector::new(forward_pass_policy);
 
-        batch_triggers.insert(FORWARD_PASS_ID, forward_pass_trigger);
+        // batch_triggers.insert(FORWARD_PASS_ID, forward_pass_trigger);
 
         let (backend_tx, backend_rx) = mpsc::unbounded_channel();
         let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel();

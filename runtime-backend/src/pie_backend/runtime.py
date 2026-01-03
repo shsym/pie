@@ -20,6 +20,8 @@ import numpy as np
 from . import utils
 import torch
 import torch.distributed as dist
+import queue
+import threading
 
 from .config import RuntimeConfig
 from .batching import BatchBuilder, Batch
@@ -31,6 +33,20 @@ from . import hf_utils
 
 # Re-export RuntimeConfig for backward compatibility
 __all__ = ["Runtime", "RuntimeConfig"]
+
+
+# Helper class for result tracking
+class PendingResult:
+    def __init__(self, total, metadata):
+        self.total = total
+        self.received = 0
+        self.metadata = metadata
+        self.resps = [None] * total
+
+    def add_response(self, idx, resp):
+        self.resps[idx] = resp
+        self.received += 1
+        return self.received == self.total
 
 
 class Runtime:
@@ -69,8 +85,21 @@ class Runtime:
         """
         self.config = config
         self.log_queue = log_queue
+        self.log_queue = log_queue
         self.adapters = {}
         self.batch = None
+        
+        # Async Execution - 2 Stage Pipeline
+        # Stage 1: worker_thread (in server.py) receives requests and enqueues
+        # Stage 2: execution_loop drains queue, builds batch, executes
+        self.request_queue = queue.Queue()
+        self.response_callback = None
+        
+        self.execution_thread = threading.Thread(
+            target=self.execution_loop,
+            daemon=True
+        )
+        self.execution_thread.start()
 
         # Initialize seeds
         msg = f"Initializing with random seed: {config.random_seed}"
@@ -337,6 +366,119 @@ class Runtime:
 
         # Execute the batch and return responses
         return self._execute_batch()
+
+    def set_response_callback(self, callback):
+        """Set callback for sending async responses."""
+        self.response_callback = callback
+
+    def forward_pass_handler_v2(
+        self, reqs: list[message.ForwardPassRequest], metadata: tuple
+    ) -> None:
+        """
+        Async handler for batched forward pass inference requests.
+        Enqueues raw requests for the preparation thread.
+        """
+        self.request_queue.put((reqs, metadata))
+
+
+    @torch.inference_mode()
+    def execution_loop(self):
+        """
+        Unified execution loop: drains request queue, builds batches on GPU, executes.
+        This runs in a single thread to avoid GIL contention.
+        """
+        while True:
+            try:
+                item = self.request_queue.get()
+            except Exception:
+                break
+                
+            if item is None:
+                break
+
+            # Start collecting items to process
+            pending_items = [item]
+            
+            # Drain queue to accumulate more requests for better batching
+            while True:
+                try:
+                    next_item = self.request_queue.get_nowait()
+                    if next_item is None:
+                        break
+                    pending_items.append(next_item)
+                except queue.Empty:
+                    break
+            
+            # Create Result Objects
+            pending_results = []
+            for (reqs, metadata) in pending_items:
+                pending_results.append(PendingResult(len(reqs), metadata))
+
+            # Build and execute batches
+            curr_cursor_per_item = [0] * len(pending_items)
+            
+            while True:
+                batch_mapping = []  # (PendingResult, req_idx)
+                batch_full = False
+                
+                for item_idx, (reqs, _) in enumerate(pending_items):
+                    start_idx = curr_cursor_per_item[item_idx]
+                    if start_idx >= len(reqs):
+                        continue
+                        
+                    for i, req in enumerate(reqs[start_idx:]):
+                        self.batch_builder.add_request(req)
+                        batch_mapping.append((pending_results[item_idx], start_idx + i))
+                        
+                        if (self.batch_builder.current_batch and 
+                            self.batch_builder.current_batch.total_tokens >= (self.config.max_batch_tokens or 10240)):
+                            batch_full = True
+                            break
+                    
+                    items_added = sum(1 for (pr, _) in batch_mapping if pr is pending_results[item_idx] and _ >= start_idx)
+                    curr_cursor_per_item[item_idx] += items_added
+                    
+                    if batch_full:
+                        break
+                
+                if not self.batch_builder.is_empty():
+                    # Execute batch directly (on GPU)
+                    responses = self._execute_batch()
+                    
+                    # Send responses
+                    if self.response_callback:
+                        for resp, (pending_result, req_idx) in zip(responses, batch_mapping):
+                            if pending_result.add_response(req_idx, resp):
+                                self.response_callback(*pending_result.metadata, pending_result.resps)
+                else:
+                    break
+                
+                if not batch_full:
+                    break
+                    
+
+
+    @torch.inference_mode()
+    def _execute_prepared_batch(self, inputs, sampling_metadata, batch) -> list[message.ForwardPassResponse]:
+        """
+        Execute a batch that has already been prepared.
+        """
+        # Broadcast if needed
+        if self.config.world_size > 1:
+            msg = {
+                "type": "STEP",
+                "inputs": inputs,
+                "sampling_metadata": sampling_metadata
+            }
+            utils.broadcast_struct(msg, src=0, device=self.config.device)
+
+        # Execute step
+        sampling_results = self._run_step(inputs, sampling_metadata)
+
+        # Package responses
+        responses = batch.create_responses(sampling_results)
+
+        return responses
 
     def embed_image(self, reqs: list[message.EmbedImageRequest]) -> None:
         """Handle image embedding requests."""

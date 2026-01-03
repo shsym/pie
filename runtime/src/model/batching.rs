@@ -28,12 +28,12 @@ struct QueuedRequest {
 
 #[derive(Debug)]
 pub struct BatchPolicySelector {
-    forward_pass: ForwardPassPolicy,
+    forward_pass: ThresholdPolicy,
     eager: ThresholdPolicy,
 }
 
 impl BatchPolicySelector {
-    pub fn new(forward_pass: ForwardPassPolicy) -> Self {
+    pub fn new(forward_pass: ThresholdPolicy) -> Self {
         let eager = ThresholdPolicy::eager();
         Self {
             forward_pass,

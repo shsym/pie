@@ -280,10 +280,7 @@ def init_process(
     
     # Log trace to queue if available
     trace_msg = f"[TRACE rank={rank}] Config devices={config.devices}, my device={config.device}"
-    if log_queue:
-        log_queue.put({"level": "DEBUG", "message": trace_msg})
-    else:
-        print(trace_msg)
+    log_queue.put({"level": "DEBUG", "message": trace_msg})
 
     # Initialize Runtime
     service = Runtime(config, log_queue=log_queue)
@@ -296,10 +293,7 @@ def init_process(
     if rank == 0:
         # Rank 0 runs the server
         start_msg = f"Starting server for {hf_repo} on {config.device}..."
-        if log_queue:
-            log_queue.put({"level": "INFO", "message": start_msg})
-        else:
-            print(start_msg)
+        print(start_msg)
             
         start_server(
             host=host, 

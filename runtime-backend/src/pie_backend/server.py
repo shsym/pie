@@ -61,6 +61,15 @@ def start_server(
     # Event to signal all threads to stop
     shutdown_event = threading.Event()
 
+    # Define response callback for async handlers
+    def response_callback(client_identity, corr_id_bytes, handler_id_bytes, resps):
+        response_queue.put(
+            (client_identity, corr_id_bytes, handler_id_bytes, resps)
+        )
+    
+    if hasattr(service, "set_response_callback"):
+        service.set_response_callback(response_callback)
+
     # Thread Structure (Refactored for ZMQ Safety):
     #
     # +-----------------------------+
@@ -256,7 +265,11 @@ def worker_thread(
                 case HandlerId.QUERY.value:
                     resps = service.query(reqs)
                 case HandlerId.FORWARD_PASS.value:
-                    resps = service.forward_pass_handler(reqs)
+                    if hasattr(service, "forward_pass_handler_v2"):
+                        # Async handler: returns None, sends response via callback
+                        service.forward_pass_handler_v2(reqs, (client_identity, corr_id_bytes, handler_id_bytes))
+                    else:
+                        resps = service.forward_pass_handler(reqs)
                 case HandlerId.EMBED_IMAGE.value:
                     service.embed_image(reqs)
                     # Original behavior: No response sent for this handler
