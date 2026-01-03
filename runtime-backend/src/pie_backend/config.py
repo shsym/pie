@@ -38,10 +38,12 @@ class RuntimeConfig:
     max_dist_size: int
     max_num_embeds: int
     max_batch_tokens: int | None
+    max_batch_size: int | None
     max_num_adapters: int
     max_adapter_rank: int
     gpu_mem_utilization: float
     random_seed: int
+    use_cuda_graphs: bool
 
     # Evaluated at runtime
     max_num_kv_pages: int | None
@@ -108,6 +110,7 @@ class RuntimeConfig:
         max_dist_size: int = 64,
         max_num_embeds: int = 128,
         max_batch_tokens: int = 10240,
+        max_batch_size: int = 128,
         max_num_adapters: int = 48,
         max_adapter_rank: int = 8,
         gpu_mem_utilization: float = 0.9,
@@ -119,6 +122,7 @@ class RuntimeConfig:
         weight_dtype: str = "auto",
         enable_profiling: bool = False,
         random_seed: int = 42,
+        use_cuda_graphs: bool = True,
     ) -> "RuntimeConfig":
         """
         Factory method to build a validated and resolved RuntimeConfig.
@@ -192,10 +196,12 @@ class RuntimeConfig:
             max_dist_size=max_dist_size,
             max_num_embeds=max_num_embeds,
             max_batch_tokens=max_batch_tokens,
+            max_batch_size=max_batch_size,
             max_num_adapters=max_num_adapters,
             max_adapter_rank=max_adapter_rank,
             gpu_mem_utilization=gpu_mem_utilization,
             random_seed=random_seed,
+            use_cuda_graphs=use_cuda_graphs,
             max_num_kv_pages=None,  # Populated by runtime based on memory
             devices=resolved_devices,
             rank=rank,

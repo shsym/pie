@@ -44,8 +44,10 @@ def create_default_config_content() -> str:
                 "max_num_adapters": 32,
                 "max_adapter_rank": 8,
                 "gpu_mem_utilization": 0.9,
+                "max_batch_size": 128,
                 "enable_profiling": False,
                 "random_seed": 42,
+                "use_cuda_graphs": True,
             }
         ],
     }
@@ -145,11 +147,17 @@ def config_update(
     model_gpu_mem_utilization: Optional[float] = typer.Option(
         None, "--gpu-mem-utilization", help="GPU memory utilization (0.0 to 1.0)"
     ),
+    model_max_batch_size: Optional[int] = typer.Option(
+        None, "--max-batch-size", help="Maximum batch size (requests)"
+    ),
     model_enable_profiling: Optional[bool] = typer.Option(
         None, "--enable-profiling", help="Enable profiling"
     ),
     model_random_seed: Optional[int] = typer.Option(
         None, "--random-seed", help="Random seed for model"
+    ),
+    model_use_cuda_graphs: Optional[bool] = typer.Option(
+        None, "--use-cuda-graphs/--no-use-cuda-graphs", help="Enable/disable CUDA graphs"
     ),
     path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
@@ -184,8 +192,10 @@ def config_update(
             "max_num_adapters": model_max_num_adapters,
             "max_adapter_rank": model_max_adapter_rank,
             "gpu_mem_utilization": model_gpu_mem_utilization,
+            "max_batch_size": model_max_batch_size,
             "enable_profiling": model_enable_profiling,
             "random_seed": model_random_seed,
+            "use_cuda_graphs": model_use_cuda_graphs,
         }.items()
         if v is not None
     }

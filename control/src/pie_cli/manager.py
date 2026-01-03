@@ -158,10 +158,12 @@ def spawn_python_backend(
         "max_num_adapters": model_config.get("max_num_adapters", 48),
         "max_adapter_rank": model_config.get("max_adapter_rank", 8),
         "gpu_mem_utilization": model_config.get("gpu_mem_utilization", 0.9),
+        "max_batch_size": model_config.get("max_batch_size", 128),
         "activation_dtype": model_config.get("activation_dtype", "bfloat16"),
         "weight_dtype": model_config.get("weight_dtype"),
         "enable_profiling": model_config.get("enable_profiling", False),
         "random_seed": model_config.get("random_seed", 42),
+        "use_cuda_graphs": model_config.get("use_cuda_graphs", True),
         "log_queue": log_queue,
     }
     

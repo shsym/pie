@@ -26,6 +26,7 @@ def main(
     max_dist_size: int = 64,
     max_num_embeds: int = 128,
     max_batch_tokens: int = 10240,
+    max_batch_size: int = 128,
     max_num_adapters: int = 48,
     max_adapter_rank: int = 8,
     gpu_mem_utilization: float = 0.9,
@@ -34,6 +35,7 @@ def main(
     weight_dtype: str | None = None,
     enable_profiling: bool = False,
     random_seed: int = 42,
+    use_cuda_graphs: bool = True,
     test: bool = False,
     log_queue: object | None = None,  # multiprocessing.Queue, using object to avoid type issues with fire
 ):
@@ -120,6 +122,7 @@ def main(
                 max_dist_size,
                 max_num_embeds,
                 max_batch_tokens,
+                max_batch_size,
                 max_num_adapters,
                 max_adapter_rank,
                 gpu_mem_utilization,
@@ -127,6 +130,7 @@ def main(
                 weight_dtype,
                 enable_profiling,
                 random_seed,
+                use_cuda_graphs,
                 test,
                 log_queue,
             ),
@@ -179,6 +183,7 @@ def main(
             max_dist_size,
             max_num_embeds,
             max_batch_tokens,
+            max_batch_size,
             max_num_adapters,
             max_adapter_rank,
             gpu_mem_utilization,
@@ -186,6 +191,7 @@ def main(
             weight_dtype,
             enable_profiling,
             random_seed,
+            use_cuda_graphs,
             test,
             log_queue,
         )
@@ -204,6 +210,7 @@ def init_process(
     max_dist_size: int,
     max_num_embeds: int,
     max_batch_tokens: int,
+    max_batch_size: int,
     max_num_adapters: int,
     max_adapter_rank: int,
     gpu_mem_utilization: float,
@@ -211,6 +218,7 @@ def init_process(
     weight_dtype: str | None,
     enable_profiling: bool,
     random_seed: int,
+    use_cuda_graphs: bool,
     test: bool,
     log_queue: object | None,
 ):
@@ -246,7 +254,20 @@ def init_process(
         
         # Use NCCL for CUDA, GLOO for CPU
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend, rank=rank, world_size=world_size)
+        
+        pg_options = None
+        if backend == "nccl":
+            try:
+                from torch.distributed import ProcessGroupNCCL
+                pg_options = ProcessGroupNCCL.Options()
+                pg_options.config.capture_safe = True
+            except (ImportError, AttributeError):
+                pass
+
+        if pg_options:
+             dist.init_process_group(backend, rank=rank, world_size=world_size, pg_options=pg_options)
+        else:
+             dist.init_process_group(backend, rank=rank, world_size=world_size)
         
         # Create a separate GLOO process group for CPU control messages
         # This allows metadata broadcasts without GPU spin
@@ -266,6 +287,7 @@ def init_process(
         max_dist_size=max_dist_size,
         max_num_embeds=max_num_embeds,
         max_batch_tokens=max_batch_tokens,
+        max_batch_size=max_batch_size,
         max_num_adapters=max_num_adapters,
         max_adapter_rank=max_adapter_rank,
         gpu_mem_utilization=gpu_mem_utilization,
@@ -274,6 +296,7 @@ def init_process(
         weight_dtype=weight_dtype,
         enable_profiling=enable_profiling,
         random_seed=random_seed,
+        use_cuda_graphs=use_cuda_graphs,
         rank=rank,
         world_size=world_size,
     )

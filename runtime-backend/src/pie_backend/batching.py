@@ -101,9 +101,9 @@ class Batch:
                 batched_attention_mask, device=device, dtype=torch.bool
             ),
             "single_token_inference_mode": self.single_token_mode,
-            "single_token_inference_mode": self.single_token_mode,
             "adapter_indices": self.adapter_indices if self.adapter_subpass_needed else [],
             "adapter_seeds": torch.as_tensor(self.adapter_seeds, device=device, dtype=torch.long) if self.adapter_subpass_needed else None,
+            "total_pages_cpu": self.kv_page_indptr[-1],
         }
 
     def get_sampling_metadata(self, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
