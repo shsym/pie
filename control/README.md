@@ -39,7 +39,7 @@ This checks Python version, PyTorch, GPU availability, and required dependencies
 pie config init
 
 # 2. Download a model
-pie model add qwen-3-0.6b
+pie model download Qwen/Qwen3-0.6B
 
 # 3. Start the engine
 pie serve
@@ -98,7 +98,11 @@ pie run <INFERLET> [OPTIONS] [-- ARGS...]
 
 **Example:**
 ```bash
-pie run ./text_completion.wasm -- --prompt "Explain quantum computing"
+# Run from local file
+pie run --path ./text_completion.wasm -- --prompt "Explain quantum computing"
+
+# Run from registry
+pie run std/text-completion@0.1.0 -- --prompt "Explain quantum computing"
 ```
 
 ---
@@ -162,21 +166,23 @@ pie config update [OPTIONS]
 | `--enable-auth` | Enable/disable authentication |
 | `--verbose` | Enable verbose logging |
 | `--cache-dir` | Cache directory path |
-| `--log` | Log file path |
+| `--log-dir` | Log directory path |
+| `--registry` | Inferlet registry URL |
 
-**Backend Options:**
+**Model Options:**
 | Option | Description |
 |--------|-------------|
-| `--model` | Model name |
+| `--hf-repo` | HuggingFace repository (e.g., `Qwen/Qwen3-0.6B`) |
 | `--device` | Device (e.g., `cuda:0`, `mps`) |
 | `--kv-page-size` | KV cache page size |
 | `--max-batch-tokens` | Max tokens per batch |
 | `--gpu-mem-utilization` | GPU memory utilization (0.0-1.0) |
 | `--activation-dtype` | Activation dtype (`bfloat16`, `float16`) |
-| `--weight-dtype` | Weight dtype for quantization |
+| `--weight-dtype` | Weight dtype (`auto`, `float32`, `float16`, `bfloat16`, `int4`, `int8`) |
 | `--max-num-adapters` | Max number of adapters |
 | `--max-adapter-rank` | Max adapter rank |
 | `--enable-profiling` | Enable profiling |
+| `--random-seed` | Random seed for model initialization |
 
 ---
 
@@ -192,36 +198,25 @@ List downloaded models.
 pie model list
 ```
 
-#### `pie model add`
+#### `pie model download`
 
-Download a model from the registry.
+Download a model from HuggingFace.
 
 ```bash
-pie model add <MODEL_NAME>
+pie model download <REPO_ID>
+```
+
+Example:
+```bash
+pie model download Qwen/Qwen3-0.6B
 ```
 
 #### `pie model remove`
 
-Remove a downloaded model.
+Remove a locally cached model.
 
 ```bash
-pie model remove <MODEL_NAME>
-```
-
-#### `pie model search`
-
-Search available models in the registry.
-
-```bash
-pie model search [PATTERN]
-```
-
-#### `pie model info`
-
-Show model details.
-
-```bash
-pie model info <MODEL_NAME>
+pie model remove <REPO_ID>
 ```
 
 ---
@@ -272,24 +267,31 @@ Default location: `~/.pie/config.toml`
 [engine]
 host = "127.0.0.1"
 port = 8080
-enable_auth = true
+enable_auth = false
 verbose = false
+cache_dir = "/home/user/.pie/cache"
+log_dir = "/home/user/.pie/logs"
+registry = "https://registry.pie-project.org/"
 
-[[backend]]
-backend_type = "python"
-model = "qwen-3-0.6b"
+[[model]]
+hf_repo = "Qwen/Qwen3-0.6B"
+device = ["cuda:0"]
+activation_dtype = "bfloat16"
+weight_dtype = "auto"
 kv_page_size = 16
 max_batch_tokens = 10240
+max_dist_size = 32
+max_num_embeds = 128
+max_num_adapters = 32
+max_adapter_rank = 8
 gpu_mem_utilization = 0.9
-activation_dtype = "bfloat16"
+enable_profiling = false
+random_seed = 42
 ```
-
-### Backend Types
 
 | Type | Description |
 |------|-------------|
 | `python` | Built-in Python backend (pie-backend) |
-| `dummy` | Dummy backend for testing |
 
 ---
 

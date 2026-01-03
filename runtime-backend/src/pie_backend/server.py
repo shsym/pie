@@ -38,6 +38,7 @@ def start_server(
     service: Runtime,
     *,
     run_tests: bool = False,
+    log_queue: object | None = None,
 ):
     """Spin up the backend service using the provided handler implementation.
 
@@ -47,6 +48,7 @@ def start_server(
         auth_token: Authentication token for controller
         service: Runtime implementation to handle requests
         run_tests: If True, spawn embedded test client after server starts
+        log_queue: Optional queue for logging to controller
     """
 
     unique_id = random.randint(1000000, 9999999)
@@ -89,7 +91,7 @@ def start_server(
 
     reg_t = threading.Thread(
         target=register_thread,
-        args=(host, port, auth_token, endpoint, shutdown_event),
+        args=(host, port, auth_token, endpoint, shutdown_event, log_queue),
         daemon=True,
     )
     reg_t.start()
@@ -109,7 +111,8 @@ def start_server(
     # Setup shutdown flag and signal handlers
     def shutdown_handler(signum, _frame):
         if not shutdown_event.is_set():
-            print(f"\nReceived signal {signum}, shutting down server...")
+            msg = f"\nReceived signal {signum}, shutting down server..."
+            log_queue.put({"level": "DEBUG", "message": msg})
             shutdown_event.set()
 
     signal.signal(signal.SIGTERM, shutdown_handler)
@@ -121,7 +124,9 @@ def start_server(
     except KeyboardInterrupt:
         pass
     finally:
-        print("Waiting for background threads to finish...", flush=True)
+        msg = "Waiting for background threads to finish..."
+        log_queue.put({"level": "DEBUG", "message": msg})
+            
         # 1. Stop the worker thread first so it stops processing requests/using NCCL
         if worker_t.is_alive():
             worker_t.join(timeout=5.0)
@@ -130,7 +135,8 @@ def start_server(
         try:
             service.shutdown()
         except Exception as e:
-            print(f"Error during service shutdown: {e}")
+            err_msg = f"Error during service shutdown: {e}"
+            log_queue.put({"level": "ERROR", "message": err_msg})
 
         # 3. Stop remaining threads
         if io_t.is_alive():
@@ -140,7 +146,8 @@ def start_server(
         if test_t and test_t.is_alive():
             test_t.join(timeout=2.0)
             
-        print("Server shutdown complete.", flush=True)
+        final_msg = "Server shutdown complete."
+        log_queue.put({"level": "DEBUG", "message": final_msg})
 
 
 def register_thread(
@@ -148,7 +155,8 @@ def register_thread(
     port: int, 
     auth_token: str, 
     endpoint: str, 
-    shutdown_event: threading.Event
+    shutdown_event: threading.Event,
+    log_queue: object | None = None,
 ) -> None:
     """Register this service with the controller."""
 
@@ -170,9 +178,8 @@ def register_thread(
 
             auth_response = decoder.decode(websocket.recv())
             if not auth_response.get("successful"):
-                print(
-                    f"Authentication failed: {auth_response.get('result', 'Unknown error')}"
-                )
+                err_msg = f"Authentication failed: {auth_response.get('result', 'Unknown error')}"
+                log_queue.put({"level": "ERROR", "message": err_msg})
                 shutdown_event.set()
                 return
 
@@ -189,20 +196,22 @@ def register_thread(
 
             reg_response = decoder.decode(websocket.recv())
             if not reg_response.get("successful"):
-                print(
-                    f"Controller registration failed: {reg_response.get('result', 'Unknown error')}"
-                )
+                err_msg = f"Controller registration failed: {reg_response.get('result', 'Unknown error')}"
+                log_queue.put({"message": err_msg, "level": "ERROR"})
                 shutdown_event.set()
                 return
 
-            print(f"Registered with controller at {controller_addr}")
+            success_msg = f"Registered with controller at {controller_addr}"
+            log_queue.put({"message": success_msg, "level": "DEBUG"})
 
     except (ConnectionRefusedError, TimeoutError) as exc:
-        print(f"Failed to connect to the controller at {controller_addr}. Error: {exc}")
+        err_msg = f"Failed to connect to the controller at {controller_addr}. Error: {exc}"
+        log_queue.put({"message": err_msg, "level": "ERROR"})
         shutdown_event.set()
 
     except (OSError, ValueError, RuntimeError) as exc:
-        print(f"An unexpected error occurred during registration: {exc}. Terminating.")
+        err_msg = f"An unexpected error occurred during registration: {exc}. Terminating."
+        log_queue.put({"message": err_msg, "level": "ERROR"})
         shutdown_event.set()
 
 

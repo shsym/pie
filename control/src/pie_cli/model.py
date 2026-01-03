@@ -163,9 +163,8 @@ def model_download(
         console.print()
         if compatible:
             console.print(f"[green]✓[/green] Pie compatible (arch: {info})")
-            console.print(f"[dim]Add to config.toml:[/dim]")
-            console.print(f'  repo_id = "{repo_id}"')
-            console.print(f'  arch = "{info}"')
+            console.print("Add to config.toml:")
+            console.print(f'  hf_repo = "{repo_id}"')
         else:
             console.print(f"[yellow]![/yellow] Not Pie compatible ({info})")
             

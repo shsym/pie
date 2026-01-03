@@ -552,7 +552,7 @@ class ModelLoader:
 
             # Build tensor name -> reader mapping
             for param_file in tqdm(
-                safetensor_files, desc="Scanning tensor files", unit="files"
+                safetensor_files, desc="Scanning tensor files", unit="files", disable=True
             ):
                 param_path = self.snapshot_dir / param_file
                 f = stack.enter_context(

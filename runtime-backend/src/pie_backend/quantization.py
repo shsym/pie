@@ -1,38 +1,31 @@
+
+from __future__ import annotations
+from typing import TYPE_CHECKING
 import torch
 
-import torchao
-from torchao.dtypes import AffineQuantizedTensor
-from torchao.quantization import (
-    Int4WeightOnlyConfig,
-    Int8WeightOnlyConfig,
-    Float8WeightOnlyConfig,
-)
-
-from torchao.quantization import (
-    Int4PreshuffledTensor,
-    Int4Tensor,
-    Int4PlainInt32Tensor,
-    Int4MarlinSparseTensor,
-    Int4TilePackedTo4dTensor,
-    Float8Tensor,
-    PerRow,
-)
-from torchao.quantization.quantize_.workflows import (
-    Int4PackingFormat,
-    Int4ChooseQParamsAlgorithm,
-)
+# if TYPE_CHECKING:
+#     import torchao
+#     from torchao.quantization import (
+#         Int4WeightOnlyConfig,
+#         Int8WeightOnlyConfig,
+#         Float8WeightOnlyConfig,
+#     )
 
 
+
+# as requested, using absolute imports with lazy loading
 
 def quantize(
     x: torch.Tensor,
-    config: Int4WeightOnlyConfig | Int8WeightOnlyConfig | Float8WeightOnlyConfig,
+    config: "torchao.quantization.Int4WeightOnlyConfig" | "torchao.quantization.Int8WeightOnlyConfig" | "torchao.quantization.Float8WeightOnlyConfig",
 ) -> torch.Tensor:
-    if isinstance(config, Int4WeightOnlyConfig):
+    import torchao
+
+    if isinstance(config, torchao.quantization.Int4WeightOnlyConfig):
         return quantize_int4(x, config)
-    elif isinstance(config, Int8WeightOnlyConfig):
+    elif isinstance(config, torchao.quantization.Int8WeightOnlyConfig):
         return quantize_int8(x, config)
-    elif isinstance(config, Float8WeightOnlyConfig):
+    elif isinstance(config, torchao.quantization.Float8WeightOnlyConfig):
         return quantize_float8(x, config)
     else:
         raise TypeError(
@@ -42,8 +35,22 @@ def quantize(
 
 def quantize_int4(
     x: torch.Tensor,
-    config: Int4WeightOnlyConfig,
+    config: "torchao.quantization.Int4WeightOnlyConfig",
 ) -> torch.Tensor:
+    import torchao
+    # Essential imports that are too deep or internal to access via top-level easily without being verbose
+    # But user asked to use absolute modules. 
+    # Let's check if we can access them via torchao.quantization... usually workflows are hidden.
+    # We will use the full path for imports if needed, but try to minimize "from ... import ..."
+    
+    # Actually, for these specific internal enums, it's safer to import them locally 
+    # but maybe we can just import the module?
+    from torchao.quantization.quantize_.workflows import (
+        Int4PackingFormat,
+        Int4ChooseQParamsAlgorithm,
+    )
+    # Note: torchao.quantization exports tensor subclasses usually.
+
     if x.shape[-1] % config.group_size != 0:
         raise ValueError(
             f"Cannot int4-quantize weight with shape {x.shape}: "
@@ -64,19 +71,19 @@ def quantize_int4(
 
     match config.int4_packing_format:
         case Int4PackingFormat.PRESHUFFLED:
-            return Int4PreshuffledTensor.from_hp(
+            return torchao.quantization.Int4PreshuffledTensor.from_hp(
                 x,
                 block_size,
                 activation_dtype=torch.bfloat16,
             )
         case Int4PackingFormat.PLAIN:
-            return Int4Tensor.from_hp(x, block_size)
+            return torchao.quantization.Int4Tensor.from_hp(x, block_size)
         case Int4PackingFormat.PLAIN_INT32:
-            return Int4PlainInt32Tensor.from_hp(x, block_size)
+            return torchao.quantization.Int4PlainInt32Tensor.from_hp(x, block_size)
         case Int4PackingFormat.MARLIN_SPARSE:
-            return Int4MarlinSparseTensor.from_hp(x, block_size)
+            return torchao.quantization.Int4MarlinSparseTensor.from_hp(x, block_size)
         case Int4PackingFormat.TILE_PACKED_TO_4D:
-            return Int4TilePackedTo4dTensor.from_hp(
+            return torchao.quantization.Int4TilePackedTo4dTensor.from_hp(
                 x,
                 block_size,
                 int4_choose_qparams_algorithm=config.int4_choose_qparams_algorithm,
@@ -89,9 +96,9 @@ def quantize_int4(
 
 def quantize_int8(
     x: torch.Tensor,
-    config: Int8WeightOnlyConfig,
+    config: "torchao.quantization.Int8WeightOnlyConfig",
 ) -> torch.Tensor:
-
+    import torchao
 
     if config.group_size is None:
         group_size = x.shape[-1]
@@ -100,7 +107,7 @@ def quantize_int8(
 
     block_size = (1,) * (x.dim() - 1) + (group_size,)
 
-    return AffineQuantizedTensor.from_hp_to_intx(
+    return torchao.dtypes.AffineQuantizedTensor.from_hp_to_intx(
         x,
         torchao.quantization.MappingType.SYMMETRIC,
         block_size,
@@ -110,9 +117,11 @@ def quantize_int8(
     )
 
 
-def quantize_float8(x: torch.Tensor, config: Float8WeightOnlyConfig) -> torch.Tensor:
-    return Float8Tensor.from_hp(
+def quantize_float8(x: torch.Tensor, config: "torchao.quantization.Float8WeightOnlyConfig") -> torch.Tensor:
+    import torchao
+    
+    return torchao.quantization.Float8Tensor.from_hp(
         x,
         float8_dtype=x.dtype,
-        granularity=PerRow(),
+        granularity=torchao.quantization.PerRow(),
     )

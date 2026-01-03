@@ -55,20 +55,27 @@ class Runtime:
     # Batch management
     batch_builder: BatchBuilder
     batch: Batch | None
+    
+    # Logging
+    log_queue: object | None
 
-    def __init__(self, config: RuntimeConfig):
+    def __init__(self, config: RuntimeConfig, log_queue: object | None = None):
         """
         Initialize the runtime.
         
         Args:
             config: Runtime configuration
+            log_queue: Optional queue for sending logs back to controller
         """
         self.config = config
+        self.log_queue = log_queue
         self.adapters = {}
         self.batch = None
 
         # Initialize seeds
-        print(f"Initializing with random seed: {config.random_seed}")
+        msg = f"Initializing with random seed: {config.random_seed}"
+        self.log_queue.put({"message": msg, "level": "DEBUG"})
+            
         random.seed(config.random_seed)
         np.random.seed(config.random_seed)
         torch.manual_seed(config.random_seed)
@@ -77,13 +84,17 @@ class Runtime:
 
         # Load model weights using ModelLoader
         loader = ModelLoader(config)
-        print("Loading model weights")
+        
+        msg = "Loading model weights"
+        self.log_queue.put({"message": msg, "level": "DEBUG"})
+            
         weights, normalized_arch, self.info = loader.load()
         
         # Store snapshot_dir for tokenizer loading
         self.snapshot_dir = loader.snapshot_dir
 
-        print("Loaded model weights")
+        msg = "Loaded model weights"
+        self.log_queue.put({"message": msg, "level": "DEBUG"})
 
         # Store architecture type
         self.type = self.info["architecture"]["type"]

@@ -7,14 +7,11 @@ configuration options for the inference runtime.
 
 from __future__ import annotations
 
+
+from typing import TYPE_CHECKING
 from dataclasses import dataclass, asdict
 
 import torch
-from torchao.quantization import (
-    Int4WeightOnlyConfig,
-    Int8WeightOnlyConfig,
-    Float8WeightOnlyConfig,
-)
 
 from .utils import resolve_cache_dir
 
@@ -91,13 +88,14 @@ class RuntimeConfig:
     @property
     def quantization(self) -> Int4WeightOnlyConfig | Int8WeightOnlyConfig | Float8WeightOnlyConfig | None:
         """Derive quantization config from weight_dtype (only for quantization types)."""
+
         match self.weight_dtype:
             case "int4":
-                return Int4WeightOnlyConfig()
+                return torchao.quantization.Int4WeightOnlyConfig()
             case "int8":
-                return Int8WeightOnlyConfig()
+                return torchao.quantization.Int8WeightOnlyConfig()
             case "float8":
-                return Float8WeightOnlyConfig()
+                return torchao.quantization.Float8WeightOnlyConfig()
             case _:
                 return None
 

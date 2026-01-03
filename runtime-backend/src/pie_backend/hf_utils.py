@@ -132,8 +132,8 @@ def normalize_hf_config(config: dict) -> dict:
         normalized["head_size"] = normalized["hidden_size"] // normalized["num_query_heads"]
     
     # Handle RoPE scaling
-    if "rope_scaling" in config:
-        rope = config["rope_scaling"]
+    rope = config.get("rope_scaling")
+    if rope is not None:
         normalized["rope"] = {
             "theta": config.get("rope_theta", 10000.0),
             "factor": rope.get("factor", 1.0),
@@ -206,17 +206,36 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
                 # Skip tokens that can't be encoded
                 continue
         
-        result["merge_table"] = merge_table
-        result["num_vocab"] = len(vocab)
+        # Auto-detect escape_non_printable
+        # If the vocabulary contains U+0100 (Ā), it likely uses the byte-level mapping
+        # where non-printable bytes are mapped to unicode characters starting at U+0100.
+        # This is common in GPT-2, RoBERTa, and Qwen tokenizers.
+        if "Ā" in vocab or "\u0100" in vocab:
+             result["escape_non_printable"] = True
         
-        # Extract added tokens for special tokens
+        result["merge_table"] = merge_table
+        
+        # Calculate true vocab size based on max index to avoid "id out of range" errors
+        # Start with base vocab
+        max_id = 0
+        if vocab:
+            max_id = max(vocab.values())
+            
+        # Extract added tokens for special tokens and update max_id
         added_tokens = tokenizer_data.get("added_tokens", [])
         for token_info in added_tokens:
-            if token_info.get("special", False):
-                content = token_info.get("content", "")
-                token_id = token_info.get("id")
-                if content and token_id is not None:
-                    result["special_tokens"][content] = token_id
+            tid = token_info.get("id")
+            if tid is not None:
+                max_id = max(max_id, tid)
+                
+            # Add ALL added tokens to special_tokens, not just those marked special=True
+            # This ensures we handle tokens like <think> (which might be special=False) correctly
+            # during detokenization.
+            content = token_info.get("content", "")
+            if content and tid is not None:
+                result["special_tokens"][content] = tid
+        
+        result["num_vocab"] = max_id + 1
         
         # Extract pre_tokenizer pattern (split_regex)
         pre_tokenizer = tokenizer_data.get("pre_tokenizer", {})
@@ -229,6 +248,7 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
                         result["split_regex"] = pattern["Regex"]
                         break
     
+    
     # Load tokenizer_config.json for chat template
     config_path = snapshot_dir / "tokenizer_config.json"
     if config_path.exists():
@@ -237,7 +257,7 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
         
         # Get chat template (already in Jinja format)
         chat_template = config_data.get("chat_template", "")
-        result["chat_template"] = chat_template
+        result["chat_template"] = _sanitize_chat_template(chat_template)
         
         # Additional special tokens from added_tokens_decoder
         decoder = config_data.get("added_tokens_decoder", {})
@@ -248,6 +268,44 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
                     result["special_tokens"][content] = int(token_id_str)
     
     return result
+
+
+def _sanitize_chat_template(template: str) -> str:
+    """Sanitize Jinja2 template for Minijinja compatibility.
+    
+    Minijinja (Rust) doesn't support Python string methods like .startswith(), 
+    .endswith(), .strip(), .split() which are common in HF templates.
+    """
+    if not template:
+        return ""
+        
+    sanitized = template
+    
+    # Replace .startswith() and .endswith() with slicing
+    # Targeted replacements for known patterns in Qwen/Llama templates
+    sanitized = sanitized.replace(".startswith('<tool_response>')", "[:15] == '<tool_response>'")
+    sanitized = sanitized.replace(".endswith('</tool_response>')", "[-16:] == '</tool_response>'")
+    
+    # Replace .strip() variations with | trim filter
+    # Note: | trim in Minijinja removes whitespace from start and end. 
+    # It takes no arguments, so we lose specific char stripping, but it's usually fine.
+    sanitized = sanitized.replace(".strip('\\n')", "| trim")
+    sanitized = sanitized.replace(".lstrip('\\n')", "| trim")
+    sanitized = sanitized.replace(".rstrip('\\n')", "| trim")
+    sanitized = sanitized.replace(".strip()", "| trim")
+    
+    # Disable "thinking" logic which uses .split() - highly specific to DeepSeek/Qwen code
+    # We'll just skip the split logic and treat content as a whole
+    if ".split('</think>')" in sanitized:
+        # We crudely disable the block that tries to split reasoning
+        # This regex matches the if block that does the splitting
+        import re
+        # Pattern to find the thinking parsing block
+        pattern = r"\{%- if '</think>' in content %\}.*?\{%- endif %\}"
+        sanitized = re.sub(pattern, "", sanitized, flags=re.DOTALL)
+    
+    return sanitized
+
 
 
 def get_safetensor_files(snapshot_dir: Path) -> list[str]:

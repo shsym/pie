@@ -1,3 +1,7 @@
+import sys
+
+
+
 import fire
 from .server import start_server
 from .runtime import RuntimeConfig, Runtime
@@ -31,6 +35,7 @@ def main(
     enable_profiling: bool = False,
     random_seed: int = 42,
     test: bool = False,
+    log_queue: object | None = None,  # multiprocessing.Queue, using object to avoid type issues with fire
 ):
     """
     Runs the application with configuration provided as command-line arguments.
@@ -58,6 +63,7 @@ def main(
                       If None, uses activation_dtype (no quantization).
         enable_profiling: Enable unified profiler (timing + tensor tracking) (default: False).
         test: Run embedded test client after server starts (default: False).
+        log_queue: Optional multiprocessing.Queue for sending logs back to controller.
     """
 
     if hf_repo is None:
@@ -122,6 +128,7 @@ def main(
                 enable_profiling,
                 random_seed,
                 test,
+                log_queue,
             ),
             nprocs=world_size,
             join=False, # We manage join manually
@@ -180,6 +187,7 @@ def main(
             enable_profiling,
             random_seed,
             test,
+            log_queue,
         )
 
 def init_process(
@@ -204,6 +212,7 @@ def init_process(
     enable_profiling: bool,
     random_seed: int,
     test: bool,
+    log_queue: object | None,
 ):
     """
     Initialize the distributed process and start the runtime.
@@ -269,13 +278,15 @@ def init_process(
         world_size=world_size,
     )
     
-    if rank == 0:
-        config.print()
-
-    print(f"[TRACE rank={rank}] Config devices={config.devices}, my device={config.device}")
+    # Log trace to queue if available
+    trace_msg = f"[TRACE rank={rank}] Config devices={config.devices}, my device={config.device}"
+    if log_queue:
+        log_queue.put({"level": "DEBUG", "message": trace_msg})
+    else:
+        print(trace_msg)
 
     # Initialize Runtime
-    service = Runtime(config)
+    service = Runtime(config, log_queue=log_queue)
 
     # Synchronize all ranks before starting server/worker loop
     # This prevents workers from spinning on NCCL broadcast before rank 0 is ready
@@ -284,8 +295,20 @@ def init_process(
 
     if rank == 0:
         # Rank 0 runs the server
-        print(f"Starting server for {hf_repo} on {config.device}...")
-        start_server(host=host, port=port, auth_token=internal_auth_token, service=service, run_tests=test)
+        start_msg = f"Starting server for {hf_repo} on {config.device}..."
+        if log_queue:
+            log_queue.put({"level": "INFO", "message": start_msg})
+        else:
+            print(start_msg)
+            
+        start_server(
+            host=host, 
+            port=port, 
+            auth_token=internal_auth_token, 
+            service=service, 
+            run_tests=test,
+            log_queue=log_queue
+        )
         
         # Shutdown workers
         # Handled inside start_server -> service.shutdown()

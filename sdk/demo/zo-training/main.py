@@ -29,7 +29,7 @@ from openr1math import OpenR1MathDataset
 class TrainingConfig:
     """Configuration settings for the ES training run."""
     # --- Server and Paths ---
-    SERVER_URIS: List[str] = field(default_factory=lambda: ["ws://127.0.0.1:8082"])
+    SERVER_URIS: List[str] = field(default_factory=lambda: ["ws://127.0.0.1:8080"])
     SCRIPT_DIR: Path = Path(__file__).resolve().parent
     WASM_DIR: Path = SCRIPT_DIR / "inferlets" / "target" / "wasm32-wasip2" / "release"
 
@@ -44,7 +44,7 @@ class TrainingConfig:
     # --- ES Hyperparameters ---
     ADAPTER_NAME: str = "evo-countdown-v1"
     TRAINING_STEPS: int = 10000
-    POPULATION_SIZE: int = 512
+    POPULATION_SIZE: int = 128
     TASKS_PER_SEED: int = 4
     NUM_ROLLOUTS_PER_WORKER: int = 1  # This is now the batch size
     LORA_RANK: int = 8
@@ -59,7 +59,7 @@ class TrainingConfig:
     )
 
     # --- Checkpointing Configuration ---
-    INITIAL_CHECKPOINT_NAME: Optional[str] = "evo-math-v1-step-65"
+    INITIAL_CHECKPOINT_NAME: Optional[str] = None
     CHECKPOINT_EVERY_N_STEPS: int = 5
 
     # --- Evaluation Configuration ---

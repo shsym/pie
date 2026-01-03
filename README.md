@@ -40,13 +40,13 @@ Quick start:
 ```bash
 # Initialize config and download a model
 pie config init
-pie model add qwen-3-0.6b
+pie model download Qwen/Qwen3-0.6B
 
 # Start the engine
 pie serve -i
 
 # In the interactive shell:
-# pie> run ./my_inferlet.wasm -- --prompt "Hello!"
+# pie> run --path ./my_inferlet.wasm -- --prompt "Hello!"
 ```
 
 See [control/README.md](control/README.md) for full CLI documentation.
@@ -83,7 +83,7 @@ See [control/README.md](control/README.md) for full CLI documentation.
 Build the example inferlets:
 
 ```bash
-cd sdk/inferlet-examples && cargo build --target wasm32-wasip2 --release
+cd sdk/examples && cargo build --target wasm32-wasip2 --release
 ```
 
 #### Step 2: Configure Engine and Backend
@@ -97,7 +97,7 @@ cd sdk/inferlet-examples && cargo build --target wasm32-wasip2 --release
 2. **Download the model:**
 
    ```bash
-   pie model add qwen-3-0.6b
+   pie model download Qwen/Qwen3-0.6B
    ```
 
 3. **Test the engine:**
@@ -105,7 +105,7 @@ cd sdk/inferlet-examples && cargo build --target wasm32-wasip2 --release
    Run an inferlet directly with the engine. Due to JIT compilation of FlashInfer kernels, the first run will have **very long** latency.
    ```bash
    pie run \
-       sdk/inferlet-examples/target/wasm32-wasip2/release/text_completion.wasm \
+       --path sdk/examples/target/wasm32-wasip2/release/text_completion.wasm \
        -- \
        --prompt "Where is the capital of France?"
    ```
@@ -142,7 +142,7 @@ cd sdk/inferlet-examples && cargo build --target wasm32-wasip2 --release
    From another terminal window:
    ```bash
    pie-cli submit \
-       sdk/inferlet-examples/target/wasm32-wasip2/release/text_completion.wasm \
+       sdk/examples/target/wasm32-wasip2/release/text_completion.wasm \
        -- \
        --prompt "Where is the capital of France?"
    ```
@@ -171,7 +171,6 @@ pie/
 ├── control/         # Pie Control CLI (Python + Rust bindings)
 ├── runtime/         # Core engine (Rust)
 ├── client/          # Client libraries (Rust CLI, Python)
-├── engine/          # Backend implementations
-│   └── backend-python/  # Python backend (PyTorch)
+├── runtime-backend/ # Python backend (PyTorch)
 └── sdk/             # Inferlet SDK and examples
 ```

@@ -22,8 +22,9 @@ if TYPE_CHECKING:
 
 def start_engine_and_backend(
     engine_config: dict,
-    backend_configs: list[dict],
+    model_configs: list[dict],
     timeout: float = 60.0,
+    console: Optional["typer.rich_utils.Console"] = None,
 ) -> tuple["pie_rs.ServerHandle", list[subprocess.Popen]]:
     """Start the Pie engine and all configured backend services.
 
@@ -36,6 +37,12 @@ def start_engine_and_backend(
         Tuple of (ServerHandle, list of backend processes)
     """
     from . import pie_rs
+    from rich.console import Console
+    from rich.control import Control, ControlType
+
+    # Use passed console or create new one
+    if console is None:
+        console = Console()
 
     # Load authorized users if auth is enabled
     authorized_users_path = None
@@ -57,42 +64,61 @@ def start_engine_and_backend(
 
     # Start the engine - returns a ServerHandle
     server_handle = pie_rs.start_server(server_config, authorized_users_path)
-    typer.echo(f"✅ Engine started (token: {server_handle.internal_token[:8]}...)")
+    # typer.echo(f"✅ Engine started (token: {server_handle.internal_token[:8]}...)") - Removed for minimalism
 
     # Count expected backends
     expected_backends = 0
     
+    # Create log queue for backend communication
+    # We use a multiprocessing Manager Queue to ensure it works across process boundaries reliably
+    manager_obj = multiprocessing.Manager()  # Renamed to avoid shadowing 'manager' module
+    log_queue = manager_obj.Queue()
+
     # Launch backend processes
     backend_processes: list["multiprocessing.Process | subprocess.Popen"] = []
 
-    for model_config in model_configs:
-        # Spawn pie-backend directly using multiprocessing
-        typer.echo("- Spawning Python backend (pie-backend)")
-        try:
-            process = spawn_python_backend(
-                engine_config, 
-                model_config, 
-                server_handle.internal_token
-            )
-            backend_processes.append(process)
-            expected_backends += 1
-        except Exception as e:
-            typer.echo(f"❌ Failed to spawn backend: {e}", err=True)
-            for p in backend_processes:
-                p.terminate()
-            server_handle.shutdown()
-            raise typer.Exit(1)
+    # Start log monitor thread
+    import threading
+    log_monitor_thread = threading.Thread(
+        target=backend_log_monitor,
+        args=(log_queue, console),
+        daemon=True
+    )
+    log_monitor_thread.start()
+    
+    with console.status("Starting engine...", spinner="dots") as status:
+        for model_config in model_configs:
+            # Spawn pie-backend directly using multiprocessing
+            status.update(f"Spawning backend (pie-backend)...")
+            try:
+                process = spawn_python_backend(
+                    engine_config, 
+                    model_config, 
+                    server_handle.internal_token,
+                    log_queue
+                )
+                backend_processes.append(process)
+                expected_backends += 1
+            except Exception as e:
+                console.print(f"❌ Failed to spawn backend: {e}")
+                for p in backend_processes:
+                    p.terminate()
+                server_handle.shutdown()
+                raise typer.Exit(1)
 
-    # Wait for backends to register with the engine
-    if expected_backends > 0:
-        typer.echo(f"⏳ Waiting for {expected_backends} backend(s) to connect...")
-        if not wait_for_backends(server_handle, expected_backends, timeout, backend_processes):
-            typer.echo("❌ Timeout waiting for backends to connect", err=True)
-            for p in backend_processes:
-                p.terminate()
-            server_handle.shutdown()
-            raise typer.Exit(1)
-        typer.echo(f"✅ {expected_backends} backend(s) connected")
+        # Wait for backends to register with the engine
+        if expected_backends > 0:
+            status.update(f"Waiting for {expected_backends} backend(s) to connect...")
+            if not wait_for_backends(server_handle, expected_backends, timeout, backend_processes):
+                console.print("❌ Timeout waiting for backends to connect")
+                for p in backend_processes:
+                    p.terminate()
+                server_handle.shutdown()
+                raise typer.Exit(1)
+            # Backend connected
+            
+    # Final success message
+    console.print("[green]✓[/green] Engine running. [dim]Press Ctrl+C to stop[/dim]")
 
     return server_handle, backend_processes
 
@@ -101,6 +127,7 @@ def spawn_python_backend(
     engine_config: dict,
     model_config: dict,
     internal_token: str,
+    log_queue: multiprocessing.Queue,
 ) -> multiprocessing.Process:
     """Spawn a Python backend process directly using multiprocessing.
 
@@ -111,6 +138,7 @@ def spawn_python_backend(
         engine_config: Engine configuration dict (host, port)
         model_config: Model configuration dict (formerly backend_config)
         internal_token: Internal authentication token
+        log_queue: Queue for sending log messages back to the controller
 
     Returns:
         multiprocessing.Process object
@@ -134,6 +162,7 @@ def spawn_python_backend(
         "weight_dtype": model_config.get("weight_dtype"),
         "enable_profiling": model_config.get("enable_profiling", False),
         "random_seed": model_config.get("random_seed", 42),
+        "log_queue": log_queue,
     }
     
     # Remove None values
@@ -158,6 +187,49 @@ def _run_backend_process(**kwargs):
 
     from pie_backend.__main__ import main
     main(**kwargs)
+
+
+def backend_log_monitor(log_queue: multiprocessing.Queue, console: "Console"):
+    """Monitor loop for backend logs."""
+    import queue
+    
+    while True:
+        try:
+            # Block for a short time to allow check for exit
+            record = log_queue.get(timeout=1.0)
+            
+            level = record.get("level", "INFO")
+            msg = record.get("message", "")
+            
+            if level == "DEBUG":
+                # Suppress DEBUG logs completely for cleaner output
+                # If we really want them, we could add a verbose flag, but for now user wants silence
+                continue
+            elif level == "SUCCESS":
+                 console.print(f"  ✅ {msg}")
+            elif level == "WARNING":
+                 console.print(f"  ⚠️ {msg}")
+            elif level == "ERROR":
+                 # Errors are important, make them visible
+                 console.print(f"  ❌ [bold red][backend: error][/bold red] {msg}")
+            else:
+                 # Standard INFO
+                 level_str = "info"
+            
+            # If msg is "Starting server..." we might want to skip it if it's redundant
+            if "Starting server" in msg:
+                continue
+
+            # Default dimmed formatting
+            console.print(f"[dim]  [backend: {level_str}] {msg}[/dim]")
+                     
+        except queue.Empty:
+            continue
+        except (KeyboardInterrupt, EOFError):
+            break
+        except Exception:
+            # Ignore monitoring errors to avoid crashing main thread
+            pass
 
 
 def wait_for_backends(
@@ -245,7 +317,6 @@ def terminate_engine_and_backend(
     """
     import signal
 
-    typer.echo("🔄 Terminating backend processes...")
 
     for process in backend_processes:
         is_running = False
@@ -257,7 +328,6 @@ def terminate_engine_and_backend(
             is_running = process.is_alive()
 
         if is_running:  # Still running
-            typer.echo(f"🔄 Terminating backend process with PID: {pid}")
             try:
                 if isinstance(process, subprocess.Popen):
                     process.send_signal(signal.SIGTERM)
@@ -277,7 +347,6 @@ def terminate_engine_and_backend(
     if server_handle is not None:
         try:
             if server_handle.is_running():
-                typer.echo("🔄 Shutting down engine...")
                 server_handle.shutdown()
         except Exception as e:
             typer.echo(f"  Error shutting down engine: {e}")

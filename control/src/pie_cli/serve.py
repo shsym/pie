@@ -96,23 +96,22 @@ def serve(
     
     try:
         # Start engine and backends
-        with console.status("[dim]Starting engine...[/dim]"):
-            server_handle, backend_processes = manager.start_engine_and_backend(
-                engine_config, model_configs
-            )
+        # manager.start_engine_and_backend handles the spinner UI
+        server_handle, backend_processes = manager.start_engine_and_backend(
+            engine_config, model_configs, console=console
+        )
         
-        console.print("[green]✓[/green] Engine started")
+        
+        # console.print("[green]✓[/green] Engine running. [dim]Press Ctrl+C to stop[/dim]")
 
         if interactive:
             console.print("[dim]Type 'help' for commands, ↑/↓ for history[/dim]")
             console.print()
             manager.run_interactive_shell(engine_config, server_handle.internal_token)
         else:
-            console.print("[dim]Press Ctrl+C to stop[/dim]")
             import signal
 
             import time
-            typer.echo("[dim]Use check_backend_processes loop to monitor...[/dim]")
 
             try:
                 # Keep running while processes are alive
