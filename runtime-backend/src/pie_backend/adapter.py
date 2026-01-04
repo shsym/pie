@@ -38,6 +38,12 @@ def run_length_encode(data: list[int]) -> list[tuple[int, int]]:
     return encoded
 
 
+
+
+
+
+
+
 class AdapterSubpass:
 
     def __init__(

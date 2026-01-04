@@ -82,6 +82,7 @@ pub enum Command {
     },
 
     LaunchInstance {
+        username: String,
         program_hash: String,
         arguments: Vec<String>,
         detached: bool,
@@ -102,6 +103,7 @@ pub enum Command {
     },
 
     LaunchServerInstance {
+        username: String,
         program_hash: String,
         port: u32,
         arguments: Vec<String>,
@@ -129,6 +131,7 @@ pub enum Command {
     },
 
     ListInstances {
+        username: String,
         event: oneshot::Sender<Vec<message::InstanceInfo>>,
     },
 }
@@ -219,6 +222,7 @@ pub enum AttachInstanceResult {
 }
 
 struct InstanceHandle {
+    username: String,
     program_hash: String,
     arguments: Vec<String>,
     output_delivery_ctrl: OutputDeliveryCtrl,
@@ -256,13 +260,14 @@ impl Service for Runtime {
             }
 
             Command::LaunchInstance {
+                username,
                 program_hash,
                 event,
                 arguments,
                 detached,
             } => {
                 let res = self
-                    .launch_instance(program_hash, arguments, detached)
+                    .launch_instance(username, program_hash, arguments, detached)
                     .await;
                 event
                     .send(res)
@@ -287,13 +292,14 @@ impl Service for Runtime {
             }
 
             Command::LaunchServerInstance {
+                username,
                 program_hash,
                 port,
                 arguments,
                 event,
             } => {
                 let _ = self
-                    .launch_server_instance(program_hash, port, arguments)
+                    .launch_server_instance(username, program_hash, port, arguments)
                     .await;
                 event.send(Ok(())).unwrap();
             }
@@ -361,11 +367,12 @@ impl Service for Runtime {
 
                 event.send(QueryResponse { value: res }).unwrap();
             }
-            Command::ListInstances { event } => {
+            Command::ListInstances { username, event } => {
                 let instances: Vec<message::InstanceInfo> = self
                     .running_instances
                     .iter()
                     .chain(self.finished_instances.iter())
+                    .filter(|item| item.value().username == username)
                     .map(|item| message::InstanceInfo {
                         id: item.key().to_string(),
                         arguments: item.value().arguments.clone(),
@@ -470,6 +477,7 @@ impl Runtime {
     /// Actually start a program instance
     async fn launch_instance(
         &self,
+        username: String,
         program_hash: String,
         arguments: Vec<String>,
         detached: bool,
@@ -488,6 +496,7 @@ impl Runtime {
 
         let join_handle = tokio::spawn(Self::launch(
             instance_id,
+            username.clone(),
             component,
             arguments.clone(),
             detached,
@@ -508,6 +517,7 @@ impl Runtime {
 
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
+            username,
             program_hash,
             arguments,
             output_delivery_ctrl,
@@ -570,6 +580,7 @@ impl Runtime {
     /// Actually start a program instance
     async fn launch_server_instance(
         &self,
+        username: String,
         program_hash: String,
         port: u32,
         arguments: Vec<String>,
@@ -587,6 +598,7 @@ impl Runtime {
 
         let join_handle = tokio::spawn(Self::launch_server(
             addr,
+            username.clone(),
             component,
             arguments.clone(),
             engine,
@@ -595,11 +607,12 @@ impl Runtime {
         ));
 
         // Create a dummy output delivery controller for server instances (not used since each request gets its own instance)
-        let (dummy_state, output_delivery_ctrl) = InstanceState::new(Uuid::new_v4(), vec![]).await;
+        let (dummy_state, output_delivery_ctrl) = InstanceState::new(Uuid::new_v4(), username.clone(), vec![]).await;
         drop(dummy_state); // We don't actually use this
 
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
+            username,
             program_hash,
             arguments,
             output_delivery_ctrl,
@@ -694,12 +707,13 @@ impl Runtime {
     async fn handle_server_request(
         engine: Engine,
         linker: Arc<Linker<InstanceState>>,
+        username: String,
         component: Component,
         arguments: Vec<String>,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
         let inst_id = Uuid::new_v4();
-        let (inst_state, _output_delivery_ctrl) = InstanceState::new(inst_id, arguments).await;
+        let (inst_state, _output_delivery_ctrl) = InstanceState::new(inst_id, username, arguments).await;
 
         let mut store = Store::new(&engine, inst_state);
         let (sender, receiver) = oneshot::channel();
@@ -752,6 +766,7 @@ impl Runtime {
 
     async fn launch_server(
         addr: SocketAddr,
+        username: String,
         component: Component,
         arguments: Vec<String>,
         engine: Engine,
@@ -776,7 +791,8 @@ impl Runtime {
                     let linker_ = linker.clone();
                     let component_ = component.clone();
                     let arguments_ = arguments.clone();
-                    tokio::task::spawn(async {
+                    let username_ = username.clone();
+                    tokio::task::spawn(async move {
                         if let Err(e) = http1::Builder::new()
                             .keep_alive(true)
                             .serve_connection(
@@ -785,6 +801,7 @@ impl Runtime {
                                     Self::handle_server_request(
                                         engine_.clone(),
                                         linker_.clone(),
+                                        username_.clone(),
                                         component_.clone(),
                                         arguments_.clone(),
                                         req,
@@ -807,6 +824,7 @@ impl Runtime {
 
     async fn launch(
         instance_id: InstanceId,
+        username: String,
         component: Component,
         arguments: Vec<String>,
         detached: bool,
@@ -816,7 +834,7 @@ impl Runtime {
         output_delivery_ctrl_tx: oneshot::Sender<OutputDeliveryCtrl>,
     ) {
         // Create the instance state and output delivery controller
-        let (inst_state, output_delivery_ctrl) = InstanceState::new(instance_id, arguments).await;
+        let (inst_state, output_delivery_ctrl) = InstanceState::new(instance_id, username, arguments).await;
 
         let output_delivery = if detached {
             OutputDelivery::Buffered

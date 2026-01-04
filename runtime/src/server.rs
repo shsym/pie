@@ -286,6 +286,7 @@ struct InFlightUpload {
 
 struct Session {
     id: ClientId,
+    username: String,
 
     state: Arc<ServerState>,
 
@@ -359,6 +360,7 @@ impl Session {
 
         let mut session = Self {
             id,
+            username: String::new(),
             state,
             inflight_program_upload: None,
             inflight_blob_uploads: DashMap::new(),
@@ -418,6 +420,7 @@ impl Session {
         // checking if they are in the authorized users file or challenging them.
 
         if !self.state.enable_auth {
+            self.username = username;
             self.send_response(
                 corr_id,
                 true,
@@ -499,14 +502,16 @@ impl Session {
 
         self.send_response(corr_id, true, "Authenticated".to_string())
             .await;
+        self.username = username;
         Ok(())
     }
 
     /// Authenticates a client using an internal token.
     /// This method is used for internal communication between the backend and the engine
     /// as well as between the Pie shell and the engine. This is not used for user authentication.
-    async fn internal_authenticate(&self, corr_id: u32, token: String) -> Result<()> {
+    async fn internal_authenticate(&mut self, corr_id: u32, token: String) -> Result<()> {
         if token == self.state.internal_auth_token {
+            self.username = "internal".to_string();
             self.send_response(corr_id, true, "Authenticated".to_string())
                 .await;
             return Ok(());
@@ -784,7 +789,11 @@ impl Session {
 
     async fn handle_list_instances(&self, corr_id: u32) {
         let (evt_tx, evt_rx) = oneshot::channel();
-        runtime::Command::ListInstances { event: evt_tx }.dispatch();
+        runtime::Command::ListInstances {
+            username: self.username.clone(),
+            event: evt_tx,
+        }
+        .dispatch();
 
         let instances = evt_rx.await.unwrap();
 
@@ -902,6 +911,7 @@ impl Session {
         let (evt_tx, evt_rx) = oneshot::channel();
 
         runtime::Command::LaunchInstance {
+            username: self.username.clone(),
             program_hash,
             arguments,
             detached,
@@ -1087,6 +1097,7 @@ impl Session {
     ) {
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchServerInstance {
+            username: self.username.clone(),
             program_hash,
             port,
             arguments,

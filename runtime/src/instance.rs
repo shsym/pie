@@ -110,6 +110,7 @@ impl ResourceIdMapper {
 pub struct InstanceState {
     // Wasm states
     id: InstanceId,
+    username: String,
     arguments: Vec<String>,
     pub(crate) return_value: Option<String>,
 
@@ -141,7 +142,11 @@ impl WasiHttpView for InstanceState {
 }
 
 impl InstanceState {
-    pub async fn new(id: InstanceId, arguments: Vec<String>) -> (Self, OutputDeliveryCtrl) {
+    pub async fn new(
+        id: InstanceId,
+        username: String,
+        arguments: Vec<String>,
+    ) -> (Self, OutputDeliveryCtrl) {
         let mut builder = WasiCtx::builder();
         builder.inherit_network(); // TODO: Replace with socket_addr_check later.
 
@@ -160,6 +165,7 @@ impl InstanceState {
 
         let state = InstanceState {
             id,
+            username,
             arguments,
             return_value: None,
             wasi_ctx: builder.build(),

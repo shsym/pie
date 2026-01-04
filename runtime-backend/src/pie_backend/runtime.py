@@ -439,8 +439,7 @@ class Runtime:
                         current_batch = self.batch_builder.current_batch
                         if current_batch:
                             # Check 1: Max tokens
-                            limit_tokens = self.config.max_batch_tokens or 10240
-                            is_full_tokens = current_batch.total_tokens >= limit_tokens
+                            is_full_tokens = current_batch.total_tokens >= self.config.max_batch_tokens
                             
                             # Check 2: Max requests (batch size)
                             is_full_size = False
