@@ -267,7 +267,7 @@ impl Model {
         let handshake_info = Self::handshake(&mut socket).await?;
 
         let mut batch_triggers = HashMap::new();
-        let forward_pass_policy = ThresholdPolicy::t_only(Duration::from_micros(500)); // Sub-millisecond threshold
+        let forward_pass_policy = ThresholdPolicy::t_only(Duration::from_micros(100)); // Sub-millisecond threshold
         let batch_policy = BatchPolicySelector::new(forward_pass_policy);
 
         // batch_triggers.insert(FORWARD_PASS_ID, forward_pass_trigger);

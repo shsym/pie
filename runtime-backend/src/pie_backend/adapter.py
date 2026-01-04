@@ -96,7 +96,8 @@ class AdapterSubpass:
 
             # Determine if we should inject noise for this request slice
             layer_seeds = rand_seeds - layer_idx
-            inject_noise = (layer_seeds != 0).any().item()
+            #inject_noise = (layer_seeds != 0).any().item()
+            inject_noise = True
             
             if inject_noise:
                 if not isinstance(adapter_info, CmaesAdapter):
