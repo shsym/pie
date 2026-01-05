@@ -112,7 +112,7 @@ pub struct InstanceState {
     id: InstanceId,
     username: String,
     arguments: Vec<String>,
-    pub(crate) return_value: Option<String>,
+    pub return_value: Option<String>,
 
     // WASI states
     wasi_ctx: WasiCtx,

@@ -1,3 +1,4 @@
+pub mod actor;
 pub mod batching;
 pub mod request;
 pub mod resource;
