@@ -219,6 +219,74 @@ pub enum Command {
         type_id: ResourceTypeId,
         name: String,
     },
+    // Actor Commands
+    ActorContextRef {
+        username: String,
+        uid: String,
+    },
+    ActorContextDestroy {
+        username: String,
+        uid: String,
+    },
+    ActorContextExtend {
+        username: String,
+        uid: String,
+        page_ids: Vec<u32>,
+        last_page_len: u32,
+    },
+    ActorContextTrim {
+        username: String,
+        uid: String,
+        len: u32,
+    },
+    ActorAdapterRef {
+        username: String,
+        uid: String,
+    },
+    ActorAdapterDestroy {
+        username: String,
+        uid: String,
+    },
+    ActorAdapterBlank {
+        username: String,
+        uid: String,
+        rank: u32,
+        alpha: f32,
+    },
+    ActorAdapterLoad {
+        username: String,
+        uid: String,
+        path: String,
+    },
+    ActorOptimizerRef {
+        username: String,
+        uid: String,
+    },
+    ActorOptimizerDestroy {
+        username: String,
+        uid: String,
+    },
+    ActorOptimizerLoad {
+        username: String,
+        uid: String,
+        path: String,
+    },
+    ActorOptimizerSave {
+        username: String,
+        uid: String,
+        path: String,
+    },
+    ActorOptimizerInitialize {
+        username: String,
+        uid: String,
+        adapter_uid: String,
+        params: Vec<u8>,
+    },
+    ActorOptimizerUpdate {
+        username: String,
+        uid: String,
+        params: Vec<u8>,
+    },
 
 }
 
@@ -670,6 +738,50 @@ impl Model {
                 if let Err(e) = self.resource_manager.release_exported(type_id, name) {
                     terminate_instance_with_exception(inst_id, e);
                 }
+            }
+
+            // Actor Command Handlers (Stubs)
+            Command::ActorContextRef { .. } => {
+                println!("[Warn] ActorContextRef not implemented yet");
+            }
+            Command::ActorContextDestroy { .. } => {
+                println!("[Warn] ActorContextDestroy not implemented yet");
+            }
+            Command::ActorContextExtend { .. } => {
+                println!("[Warn] ActorContextExtend not implemented yet");
+            }
+            Command::ActorContextTrim { .. } => {
+                println!("[Warn] ActorContextTrim not implemented yet");
+            }
+            Command::ActorAdapterRef { .. } => {
+                println!("[Warn] ActorAdapterRef not implemented yet");
+            }
+            Command::ActorAdapterDestroy { .. } => {
+                println!("[Warn] ActorAdapterDestroy not implemented yet");
+            }
+            Command::ActorAdapterBlank { .. } => {
+                println!("[Warn] ActorAdapterBlank not implemented yet");
+            }
+            Command::ActorAdapterLoad { .. } => {
+                println!("[Warn] ActorAdapterLoad not implemented yet");
+            }
+            Command::ActorOptimizerRef { .. } => {
+                println!("[Warn] ActorOptimizerRef not implemented yet");
+            }
+            Command::ActorOptimizerDestroy { .. } => {
+                println!("[Warn] ActorOptimizerDestroy not implemented yet");
+            }
+            Command::ActorOptimizerLoad { .. } => {
+                println!("[Warn] ActorOptimizerLoad not implemented yet");
+            }
+            Command::ActorOptimizerSave { .. } => {
+                println!("[Warn] ActorOptimizerSave not implemented yet");
+            }
+            Command::ActorOptimizerInitialize { .. } => {
+                println!("[Warn] ActorOptimizerInitialize not implemented yet");
+            }
+            Command::ActorOptimizerUpdate { .. } => {
+                println!("[Warn] ActorOptimizerUpdate not implemented yet");
             }
 
         }

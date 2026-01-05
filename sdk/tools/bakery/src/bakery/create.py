@@ -10,6 +10,8 @@ from pathlib import Path
 from string import Template
 from typing import Optional
 
+from rich.panel import Panel
+from .console import console
 import typer
 
 
@@ -196,14 +198,18 @@ def handle_create_command(
         generate_rust_cargo_toml(project_dir, project_name)
         generate_pie_toml(project_dir, project_name, language)
         
-        typer.echo(f"✅ Created Rust inferlet project: {project_name}")
-        typer.echo(f"   {project_dir}/src/lib.rs")
-        typer.echo(f"   {project_dir}/Cargo.toml")
-        typer.echo(f"   {project_dir}/Pie.toml")
-        typer.echo()
-        typer.echo("Next steps:")
-        typer.echo(f"   cd {project_dir}")
-        typer.echo("   cargo build --release --target wasm32-wasip2")
+        console.print(Panel(
+            f"Created Rust inferlet project: [bold]{project_name}[/bold]\n\n"
+            f"[blue]{project_dir}/src/lib.rs[/blue]\n"
+            f"[blue]{project_dir}/Cargo.toml[/blue]\n"
+            f"[blue]{project_dir}/Pie.toml[/blue]",
+            title="[green]✅ Project Created[/green]",
+            border_style="green"
+        ))
+        
+        console.print("\n[bold]Next steps:[/bold]")
+        console.print(f"   cd {project_dir}")
+        console.print("   cargo build --release --target wasm32-wasip2")
     else:
         # Generate TypeScript project
         try:
@@ -221,12 +227,16 @@ def handle_create_command(
         generate_tsconfig(project_dir, relative_path)
         generate_pie_toml(project_dir, project_name, language)
         
-        typer.echo(f"✅ Created TypeScript inferlet project: {project_name}")
-        typer.echo(f"   {project_dir}/index.ts")
-        typer.echo(f"   {project_dir}/package.json")
-        typer.echo(f"   {project_dir}/tsconfig.json")
-        typer.echo(f"   {project_dir}/Pie.toml")
-        typer.echo()
-        typer.echo("Next steps:")
-        typer.echo(f"   cd {project_dir}")
-        typer.echo(f"   bakery build . -o {project_name}.wasm")
+        console.print(Panel(
+            f"Created TypeScript inferlet project: [bold]{project_name}[/bold]\n\n"
+            f"[blue]{project_dir}/index.ts[/blue]\n"
+            f"[blue]{project_dir}/package.json[/blue]\n"
+            f"[blue]{project_dir}/tsconfig.json[/blue]\n"
+            f"[blue]{project_dir}/Pie.toml[/blue]",
+            title="[green]✅ Project Created[/green]",
+            border_style="green"
+        ))
+        
+        console.print("\n[bold]Next steps:[/bold]")
+        console.print(f"   cd {project_dir}")
+        console.print(f"   bakery build . -o {project_name}.wasm")

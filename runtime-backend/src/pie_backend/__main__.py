@@ -314,9 +314,6 @@ def init_process(
         dist.barrier()
 
     if rank == 0:
-        # Rank 0 runs the server
-        start_msg = f"Starting server for {hf_repo} on {config.device}..."
-        print(start_msg)
             
         start_server(
             host=host, 

@@ -13,6 +13,8 @@ import tomllib
 from pathlib import Path
 from typing import Optional
 
+from rich.panel import Panel
+from .console import console
 import typer
 
 # Try to import esprima for JS parsing
@@ -72,21 +74,20 @@ def ensure_npm_dependencies(package_dir: Path) -> None:
     if node_modules.exists():
         return
     
-    typer.echo(f"📦 npm dependencies not found in {package_dir}")
+    console.print(f"[yellow]📦 npm dependencies not found in {package_dir}[/yellow]")
     
     if not typer.confirm("   Run 'npm install'?", default=True):
         raise RuntimeError(
             f"npm install cancelled. Please run 'npm install' manually in {package_dir}"
         )
     
-    typer.echo("   Installing...")
-    
-    result = subprocess.run(
-        ["npm", "install", "--ignore-scripts"],
-        cwd=package_dir,
-        capture_output=True,
-        text=True,
-    )
+    with console.status("[bold green]Installing npm dependencies...[/bold green]"):
+        result = subprocess.run(
+            ["npm", "install", "--ignore-scripts"],
+            cwd=package_dir,
+            capture_output=True,
+            text=True,
+        )
     
     if result.returncode != 0:
         raise RuntimeError(f"npm install failed in {package_dir}:\n{result.stderr}")
@@ -203,7 +204,6 @@ def run_esbuild(
     debug: bool,
 ) -> None:
     """Bundle with esbuild, resolving inferlet imports."""
-    typer.echo("📦 Bundling with esbuild...")
     
     # Validate inferlet alias target
     inferlet_entry = inferlet_js_path / "src" / "index.ts"
@@ -257,7 +257,6 @@ def run_componentize_js(
     debug: bool,
 ) -> None:
     """Compile bundled JS to WASM component."""
-    typer.echo("🔧 Compiling to WebAssembly component...")
     
     cmd = [
         "npx", "@bytecodealliance/componentize-js",
@@ -306,10 +305,10 @@ def check_for_nodejs_imports(bundled_js: Path) -> None:
                 break
     
     if warnings:
-        typer.echo("⚠️  Warning: The following Node.js modules were detected and will not work in WASM:")
+        console.print("[yellow]⚠️  Warning: The following Node.js modules were detected and will not work in WASM:[/yellow]")
         for warning in warnings:
-            typer.echo(warning)
-        typer.echo("   Consider using pure JavaScript alternatives or Pie WIT APIs instead.\n")
+            console.print(f"[yellow]{warning}[/yellow]")
+        console.print("[yellow]   Consider using pure JavaScript alternatives or Pie WIT APIs instead.\n[/yellow]")
 
 
 def validate_user_code(bundled_js: Path) -> None:
@@ -319,7 +318,7 @@ def validate_user_code(bundled_js: Path) -> None:
     """
     if not HAS_ESPRIMA:
         # Fall back to basic string search if esprima not available
-        typer.echo("⚠️ esprima not installed, skipping AST validation")
+        console.print("[yellow]⚠️ esprima not installed, skipping AST validation[/yellow]")
         return
     
     content = bundled_js.read_text()
@@ -438,24 +437,24 @@ def handle_rust_build(input_path: Path, output: Path) -> None:
     if not cargo_toml.exists():
         raise ValueError(f"No Cargo.toml found in {input_path}")
     
-    typer.echo("🏗️  Building Rust inferlet...")
-    typer.echo(f"   Input: {input_path}")
-    typer.echo(f"   Output: {output}")
+    console.print(f"[bold]🏗️  Building Rust inferlet...[/bold]")
+    console.print(f"   Input: [blue]{input_path}[/blue]")
+    console.print(f"   Output: [blue]{output}[/blue]")
     
     # Run cargo build
-    typer.echo("🔧 Running cargo build...")
-    cmd = [
-        "cargo", "build",
-        "--target", "wasm32-wasip2",
-        "--release",
-    ]
-    
-    result = subprocess.run(
-        cmd,
-        cwd=input_path,
-        capture_output=True,
-        text=True,
-    )
+    with console.status("[bold green]Running cargo build...[/bold green]"):
+        cmd = [
+            "cargo", "build",
+            "--target", "wasm32-wasip2",
+            "--release",
+        ]
+        
+        result = subprocess.run(
+            cmd,
+            cwd=input_path,
+            capture_output=True,
+            text=True,
+        )
     
     if result.returncode != 0:
         raise RuntimeError(
@@ -482,8 +481,11 @@ def handle_rust_build(input_path: Path, output: Path) -> None:
     
     # Success
     wasm_size = output.stat().st_size if output.exists() else 0
-    typer.echo("✅ Build successful!")
-    typer.echo(f"   Output: {output} ({wasm_size / 1024:.1f} KB)")
+    console.print(Panel(
+        f"Output: [bold]{output}[/bold] ({wasm_size / 1024:.1f} KB)",
+        title="[green]✅ Build successful![/green]",
+        border_style="green"
+    ))
 
 
 def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None:
@@ -509,19 +511,20 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
         raise RuntimeError("npx is required but not found. Please install Node.js (v18+).")
     
     # Resolve paths
-    inferlet_js_path = get_inferlet_js_path()
-    wit_path = get_wit_path()
+    with console.status("[bold green]Resolving paths...[/bold green]"):
+        inferlet_js_path = get_inferlet_js_path()
+        wit_path = get_wit_path()
     
     # Ensure npm dependencies
     ensure_npm_dependencies(inferlet_js_path)
     
-    typer.echo("🏗️  Building JS inferlet...")
-    typer.echo(f"   Input: {input_path}")
-    typer.echo(f"   Output: {output}")
+    console.print("[bold]🏗️  Building JS inferlet...[/bold]")
+    console.print(f"   Input: [blue]{input_path}[/blue]")
+    console.print(f"   Output: [blue]{output}[/blue]")
     
     # Detect input type
     input_type, entry_point = detect_js_input_type(input_path)
-    typer.echo(f"   Type: {'Single file' if input_type == 'file' else 'Package'}")
+    console.print(f"   Type: [dim]{'Single file' if input_type == 'file' else 'Package'}[/dim]")
     
     # Create temp directory
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -530,32 +533,37 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
         wrapper_js = temp_path / "wrapper.js"
         final_bundle = temp_path / "final-bundle.js"
         
-        # Step 1: Bundle user code
-        typer.echo("📦 Bundling user code...")
-        run_esbuild_user_code(entry_point, user_bundle)
-        
-        # Step 2: Check for Node.js imports
-        check_for_nodejs_imports(user_bundle)
-        
-        # Step 3: Validate user code
-        typer.echo("🔍 Validating user code...")
-        validate_user_code(user_bundle)
-        
-        # Step 4: Generate wrapper
-        typer.echo("🔧 Generating WIT wrapper...")
-        generate_wrapper(user_bundle, wrapper_js)
-        
-        # Step 5: Bundle wrapper
-        typer.echo("📦 Bundling final output...")
-        run_esbuild(wrapper_js, final_bundle, inferlet_js_path, debug)
-        
-        # Step 6: Compile to WASM
-        run_componentize_js(final_bundle, output, wit_path, debug)
+        with console.status("[bold green]Building split stages...[/bold green]") as status:
+            # Step 1: Bundle user code
+            status.update("[bold green]📦 Bundling user code...[/bold green]")
+            run_esbuild_user_code(entry_point, user_bundle)
+            
+            # Step 2: Check for Node.js imports
+            check_for_nodejs_imports(user_bundle)
+            
+            # Step 3: Validate user code
+            status.update("[bold green]🔍 Validating user code...[/bold green]")
+            validate_user_code(user_bundle)
+            
+            # Step 4: Generate wrapper
+            status.update("[bold green]🔧 Generating WIT wrapper...[/bold green]")
+            generate_wrapper(user_bundle, wrapper_js)
+            
+            # Step 5: Bundle wrapper
+            status.update("[bold green]📦 Bundling final output...[/bold green]")
+            run_esbuild(wrapper_js, final_bundle, inferlet_js_path, debug)
+            
+            # Step 6: Compile to WASM
+            status.update("[bold green]🔧 Compiling to WebAssembly component...[/bold green]")
+            run_componentize_js(final_bundle, output, wit_path, debug)
     
     # Success
     wasm_size = output.stat().st_size if output.exists() else 0
-    typer.echo("✅ Build successful!")
-    typer.echo(f"   Output: {output} ({wasm_size / 1024:.1f} KB)")
+    console.print(Panel(
+        f"Output: [bold]{output}[/bold] ({wasm_size / 1024:.1f} KB)",
+        title="[green]✅ Build successful![/green]",
+        border_style="green"
+    ))
 
 
 def handle_build_command(

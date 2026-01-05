@@ -16,6 +16,7 @@ pub use crate::api::inferlet::core::runtime;
 pub use crate::api::inferlet::core::tokenize;
 pub use crate::api::inferlet::image;
 pub use crate::api::inferlet::zo;
+pub use crate::api::inferlet::actor;
 
 wit_bindgen::generate!({
     path: "wit",

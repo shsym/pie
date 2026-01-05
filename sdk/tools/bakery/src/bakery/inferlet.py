@@ -8,6 +8,15 @@ import hashlib
 from pathlib import Path
 from typing import Annotated, Optional
 
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich.console import Group
+from rich.padding import Padding
+from rich.columns import Columns
+from rich import box
+from .console import console
+
 import toml
 import typer
 
@@ -49,7 +58,6 @@ def _format_downloads(downloads: int) -> str:
     else:
         return f"{downloads / 1_000_000:.1f}M"
 
-
 @inferlet_app.command("search")
 def search(
     query: Annotated[str, typer.Argument(help="Search query.")] = "",
@@ -60,38 +68,43 @@ def search(
     """Search for inferlets in the registry."""
     try:
         with RegistryClient(base_url=REGISTRY_URL) as client:
-            result = client.search(query=query, page=page, per_page=per_page, namespace=namespace)
+            with console.status("Searching..."):
+                result = client.search(query=query, page=page, per_page=per_page, namespace=namespace)
             
             if result.total == 0:
                 if query:
-                    typer.echo(f"No inferlets found matching '{query}'")
+                    console.print(f"[yellow]No inferlets found matching '{query}'[/yellow]")
                 else:
-                    typer.echo("No inferlets found")
+                    console.print("[yellow]No inferlets found[/yellow]")
                 return
             
-            typer.echo(f"Found {result.total} inferlet(s) (page {result.page}/{result.pages}):")
-            typer.echo()
+            console.print(f"Found [bold]{result.total}[/bold] inferlet(s) (page {result.page}/{result.pages}):")
+            console.print()
             
-            # Print header
-            typer.echo(f"{'NAME':<30} {'VERSION':<10} {'DOWNLOADS':<10} DESCRIPTION")
-            typer.echo("-" * 80)
-            
+            table = Table(box=None, padding=(0, 2))
+            table.add_column("NAME", style="bold cyan")
+            table.add_column("VERSION", style="green")
+            table.add_column("DOWNLOADS", justify="right", style="magenta")
+            table.add_column("DESCRIPTION", style="dim")
+
             for item in result.items:
-                name = item.full_name[:28] + ".." if len(item.full_name) > 30 else item.full_name
+                name = item.full_name
                 version = item.latest_version or "-"
                 downloads = _format_downloads(item.downloads)
-                description = (item.description or "")[:30]
-                if item.description and len(item.description) > 30:
+                description = (item.description or "").split('\n')[0][:60]
+                if item.description and len(item.description) > 60:
                     description += "..."
                 
-                typer.echo(f"{name:<30} {version:<10} {downloads:<10} {description}")
+                table.add_row(name, version, downloads, description)
+            
+            console.print(table)
             
             if result.pages > 1:
-                typer.echo()
-                typer.echo(f"Use --page to see more results (page {result.page}/{result.pages})")
+                console.print()
+                console.print(f"[dim]Use --page to see more results (page {result.page}/{result.pages})[/dim]")
                 
     except RegistryError as e:
-        typer.echo(f"❌ Error: {e.detail}", err=True)
+        console.print(f"[red]❌ Error: {e.detail}[/red]")
         raise typer.Exit(1)
 
 
@@ -102,96 +115,85 @@ def info(
     """Get detailed information about an inferlet."""
     try:
         with RegistryClient(base_url=REGISTRY_URL) as client:
-            detail = client.info(name)
+            with console.status("Fetching info..."):
+                detail = client.info(name)
             
-            typer.echo(f"📦 {detail.full_name}")
-            typer.echo()
-            typer.echo(f"   Downloads: {_format_downloads(detail.downloads)}")
-            typer.echo(f"   Created: {detail.created_at.strftime('%Y-%m-%d')}")
+            latest = detail.versions[0] if detail.versions else None
+
+            # --- Header ---
+            title_str = f"{detail.full_name}"
+            if latest:
+                 title_str += f"@{latest.num}"
+            console.print(f"[bold]{title_str}[/bold]")
+            console.print()
+
+            # --- Info ---
+            if latest and latest.description:
+                console.print(latest.description.strip())
             
-            if detail.versions:
-                latest = detail.versions[0]
-                
-                # Show description
-                if latest.description:
-                    typer.echo()
-                    typer.echo(f"   {latest.description}")
-                
-                # Show authors
-                if latest.authors:
-                    typer.echo()
-                    typer.echo("   Authors:")
-                    for author in latest.authors:
-                        typer.echo(f"      • {author}")
-                
-                # Show repository
+            if latest:
                 if latest.repository:
-                    typer.echo()
-                    typer.echo(f"   Repository: {latest.repository}")
-                
-                # Show keywords
-                if latest.keywords:
-                    typer.echo()
-                    typer.echo(f"   Keywords: {', '.join(latest.keywords)}")
-                
-                typer.echo()
-                typer.echo("   Versions:")
-                for v in detail.versions[:10]:  # Show latest 10
-                    yanked = " (yanked)" if v.yanked else ""
-                    size = _format_size(v.size_bytes)
-                    typer.echo(f"      {v.num:<12} {size:<10}{yanked}")
-                
-                if len(detail.versions) > 10:
-                    typer.echo(f"      ... and {len(detail.versions) - 10} more")
-                
-                # Show interface spec
-                if latest.interface_spec:
-                    typer.echo()
-                    typer.echo("   Interface:")
-                    if "inputs" in latest.interface_spec:
-                        typer.echo("      Inputs:")
-                        for inp in latest.interface_spec["inputs"]:
-                            inp_name = inp.get("name", "?")
-                            inp_type = inp.get("type", "?")
-                            optional = " (optional)" if inp.get("optional") else ""
-                            desc = inp.get("description", "")
-                            typer.echo(f"         • {inp_name}: {inp_type}{optional}")
-                            if desc:
-                                typer.echo(f"           {desc[:60]}{'...' if len(desc) > 60 else ''}")
-                    if "outputs" in latest.interface_spec:
-                        typer.echo("      Outputs:")
-                        for out in latest.interface_spec["outputs"]:
-                            out_name = out.get("name", "?")
-                            out_type = out.get("type", "?")
-                            desc = out.get("description", "")
-                            typer.echo(f"         • {out_name}: {out_type}")
-                            if desc:
-                                typer.echo(f"           {desc[:60]}{'...' if len(desc) > 60 else ''}")
-                
+                    console.print(f"url: [blue link={latest.repository}]{latest.repository}[/blue link]")
                 if latest.requires_engine:
-                    typer.echo()
-                    typer.echo(f"   Requires engine: {latest.requires_engine}")
+                    console.print(f"engine: {latest.requires_engine}")
+            
+            console.print()
+
+            # --- Interface Panels ---
+            if latest and latest.interface_spec:
+                # Helper to create a table style
+                def create_interface_table():
+                    t = Table(show_header=False, box=None, padding=(0, 2), expand=True)
+                    t.add_column("Name", style="cyan", no_wrap=True)
+                    t.add_column("Type", style="green", no_wrap=True)
+                    t.add_column("Description", style="dim", ratio=1)
+                    return t
                 
-                # Show README preview
-                if latest.readme:
-                    typer.echo()
-                    typer.echo("   README:")
-                    # Show first 5 non-empty lines
-                    lines = [l for l in latest.readme.split('\n') if l.strip()][:5]
-                    for line in lines:
-                        typer.echo(f"      {line[:70]}{'...' if len(line) > 70 else ''}")
-                    if len([l for l in latest.readme.split('\n') if l.strip()]) > 5:
-                        typer.echo("      ...")
-            else:
-                typer.echo()
-                typer.echo("   No versions published yet")
+                if "inputs" in latest.interface_spec:
+                    inp_table = create_interface_table()
+                    for inp in latest.interface_spec["inputs"]:
+                        inp_name = inp.get("name", "?")
+                        inp_type = inp.get("type", "?")
+                        optional = " (opt)" if inp.get("optional") else ""
+                        desc = inp.get("description", "")
+                        inp_table.add_row(inp_name, f"{inp_type}{optional}", desc)
+                    
+                    console.print(Panel(
+                        inp_table,
+                        title="Inputs",
+                        title_align="left",
+                        box=box.ROUNDED,
+                        border_style="dim",
+                        expand=True,
+                        padding=(0, 1)
+                    ))
+                    console.print()
+
+                if "outputs" in latest.interface_spec:
+                    out_table = create_interface_table()
+                    for out in latest.interface_spec["outputs"]:
+                        out_name = out.get("name", "?")
+                        out_type = out.get("type", "?")
+                        desc = out.get("description", "")
+                        out_table.add_row(out_name, out_type, desc)
+                    
+                    console.print(Panel(
+                        out_table,
+                        title="Outputs",
+                        title_align="left",
+                        box=box.ROUNDED,
+                        border_style="dim",
+                        expand=True,
+                        padding=(0, 1)
+                    ))
+
                 
     except RegistryError as e:
         if e.status_code == 404:
             namespace, pkg_name = resolve_name(name)
-            typer.echo(f"❌ Inferlet '{namespace}/{pkg_name}' not found", err=True)
+            console.print(f"[red]❌ Inferlet '{namespace}/{pkg_name}' not found[/red]")
         else:
-            typer.echo(f"❌ Error: {e.detail}", err=True)
+            console.print(f"[red]❌ Error: {e.detail}[/red]")
         raise typer.Exit(1)
 
 
@@ -199,24 +201,20 @@ def info(
 def publish(
     directory: Annotated[Path, typer.Argument(help="Directory containing Pie.toml manifest.")] = Path("."),
 ) -> None:
-    """Publish the inferlet in the specified directory.
-    
-    Requires a Pie.toml manifest file and a .wasm artifact.
-    You must be logged in with `bakery login` first.
-    """
+    """Publish the inferlet in the specified directory."""
     directory = directory.expanduser().resolve()
     
     # Check for Pie.toml
     manifest_path = directory / "Pie.toml"
     if not manifest_path.exists():
-        typer.echo(f"❌ No Pie.toml found in {directory}", err=True)
+        console.print(f"[red]❌ No Pie.toml found in {directory}[/red]")
         raise typer.Exit(1)
     
     # Load the manifest
     try:
         manifest = toml.load(manifest_path)
     except toml.TomlDecodeError as e:
-        typer.echo(f"❌ Failed to parse Pie.toml: {e}", err=True)
+        console.print(f"[red]❌ Failed to parse Pie.toml: {e}[/red]")
         raise typer.Exit(1)
     
     # Extract package info
@@ -226,11 +224,11 @@ def publish(
     description = package.get("description")
     
     if not full_name:
-        typer.echo("❌ Missing 'package.name' in Pie.toml", err=True)
+        console.print("[red]❌ Missing 'package.name' in Pie.toml[/red]")
         raise typer.Exit(1)
     
     if not version:
-        typer.echo("❌ Missing 'package.version' in Pie.toml", err=True)
+        console.print("[red]❌ Missing 'package.version' in Pie.toml[/red]")
         raise typer.Exit(1)
     
     # Extract extra metadata
@@ -246,9 +244,9 @@ def publish(
             try:
                 readme_content = readme_path.read_text(encoding="utf-8")
             except Exception as e:
-                typer.echo(f"⚠️ Failed to read README file '{readme_filename}': {e}", err=True)
+                console.print(f"[yellow]⚠️ Failed to read README file '{readme_filename}': {e}[/yellow]")
         else:
-            typer.echo(f"⚠️ README file '{readme_filename}' specified in Pie.toml but not found", err=True)
+            console.print(f"[yellow]⚠️ README file '{readme_filename}' specified in Pie.toml but not found[/yellow]")
     
     # Parse namespace/name
     namespace, name = resolve_name(full_name)
@@ -272,17 +270,17 @@ def publish(
                 break
     
     if not wasm_path.exists():
-        typer.echo(f"❌ No .wasm artifact found. Expected: {name}.wasm", err=True)
+        console.print(f"[red]❌ No .wasm artifact found. Expected: {name}.wasm[/red]")
         raise typer.Exit(1)
     
-    typer.echo(f"📦 Publishing {namespace}/{name}@{version}")
-    typer.echo(f"   Artifact: {wasm_path.name}")
+    console.print(f"📦 Publishing [bold cyan]{namespace}/{name}@{version}[/bold cyan]")
+    console.print(f"   Artifact: [blue]{wasm_path.name}[/blue]")
     
     # Load the token
     token = get_token()
     if not token:
-        typer.echo()
-        typer.echo("❌ Not authenticated. Run `bakery login` first.", err=True)
+        console.print()
+        console.print("[red]❌ Not authenticated. Run `bakery login` first.[/red]")
         raise typer.Exit(1)
     
     # Read and hash the artifact
@@ -290,9 +288,9 @@ def publish(
     checksum = hashlib.sha256(artifact_bytes).hexdigest()
     size_bytes = len(artifact_bytes)
     
-    typer.echo(f"   Size: {_format_size(size_bytes)}")
-    typer.echo(f"   Checksum: {checksum[:16]}...")
-    typer.echo()
+    console.print(f"   Size: {_format_size(size_bytes)}")
+    console.print(f"   Checksum: [dim]{checksum[:16]}...[/dim]")
+    console.print()
     
     try:
         with RegistryClient(token=token, base_url=REGISTRY_URL) as client:
@@ -300,61 +298,64 @@ def publish(
             user = client.get_me()
             
             if namespace != "std" and namespace != user.login:
-                typer.echo(f"❌ Cannot publish to namespace '{namespace}' as user '{user.login}'", err=True)
+                console.print(f"[red]❌ Cannot publish to namespace '{namespace}' as user '{user.login}'[/red]")
                 raise typer.Exit(1)
             
             if namespace == "std" and not user.is_superuser:
-                typer.echo("❌ Only superusers can publish to the 'std' namespace", err=True)
+                console.print("[red]❌ Only superusers can publish to the 'std' namespace[/red]")
                 raise typer.Exit(1)
             
-            typer.echo(f"🔐 Publishing as: {user.login}")
-            typer.echo()
+            console.print(f"🔐 Publishing as: [bold]{user.login}[/bold]")
+            console.print()
             
             # Start the publish process
-            typer.echo("📤 Starting publish...")
-            start_req = PublishStartRequest(
-                namespace=namespace,
-                name=name,
-                version=version,
-                checksum=checksum,
-                size_bytes=size_bytes,
-                description=description,
-                requires_engine=requires_engine,
-                interface_spec=interface_spec,
-                authors=authors,
-                keywords=keywords,
-                repository=repository,
-                readme=readme_content,
-            )
-            start_resp = client.start_publish(start_req)
+            with console.status("[bold green]Publishing...[/bold green]") as status:
+                status.update("[bold green]📤 Starting publish...[/bold green]")
+                start_req = PublishStartRequest(
+                    namespace=namespace,
+                    name=name,
+                    version=version,
+                    checksum=checksum,
+                    size_bytes=size_bytes,
+                    description=description,
+                    requires_engine=requires_engine,
+                    interface_spec=interface_spec,
+                    authors=authors,
+                    keywords=keywords,
+                    repository=repository,
+                    readme=readme_content,
+                )
+                start_resp = client.start_publish(start_req)
+                
+                status.update("[bold green]📤 Uploading artifact...[/bold green]")
+                client.upload_artifact(start_resp.upload_url, artifact_bytes)
+                
+                status.update("[bold green]📤 Finalizing publish...[/bold green]")
+                commit_req = PublishCommitRequest(
+                    namespace=namespace,
+                    name=name,
+                    version=version,
+                    storage_path=start_resp.storage_path,
+                    checksum=checksum,
+                    size_bytes=size_bytes,
+                    description=description,
+                    requires_engine=requires_engine,
+                    interface_spec=interface_spec,
+                    authors=authors,
+                    keywords=keywords,
+                    repository=repository,
+                    readme=readme_content,
+                )
+                commit_resp = client.commit_publish(commit_req)
             
-            typer.echo("📤 Uploading artifact...")
-            client.upload_artifact(start_resp.upload_url, artifact_bytes)
-            
-            typer.echo("📤 Finalizing publish...")
-            commit_req = PublishCommitRequest(
-                namespace=namespace,
-                name=name,
-                version=version,
-                storage_path=start_resp.storage_path,
-                checksum=checksum,
-                size_bytes=size_bytes,
-                description=description,
-                requires_engine=requires_engine,
-                interface_spec=interface_spec,
-                authors=authors,
-                keywords=keywords,
-                repository=repository,
-                readme=readme_content,
-            )
-            commit_resp = client.commit_publish(commit_req)
-            
-            typer.echo()
-            typer.echo(f"✅ Published: {commit_resp.full_name}@{commit_resp.version}")
-            typer.echo()
-            typer.echo("   Install with:")
-            typer.echo(f"      pie run {commit_resp.full_name}")
+            console.print(Panel(
+                f"Published: [bold]{commit_resp.full_name}@{commit_resp.version}[/bold]\n\n"
+                f"Install with:\n"
+                f"   pie run {commit_resp.full_name}",
+                title="[green]✅ Published[/green]",
+                border_style="green"
+            ))
             
     except RegistryError as e:
-        typer.echo(f"❌ Publish failed: {e.detail}", err=True)
+        console.print(f"[red]❌ Publish failed: {e.detail}[/red]")
         raise typer.Exit(1)

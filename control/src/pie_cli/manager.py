@@ -546,7 +546,7 @@ async def _submit_inferlet_async(
                 elif event == Event.Message:
                     typer.echo(f"[Message] {message}")
                 elif event == Event.Completed:
-                    typer.echo(f"✅ Instance completed: {message}")
+                    typer.echo(f"{message}")
                     break
                 elif event == Event.Aborted:
                     typer.echo(f"⚠️ Instance aborted: {message}")
@@ -652,13 +652,13 @@ async def _submit_inferlet_from_registry_async(
             await client.internal_authenticate(internal_token)
 
             # Launch the instance from registry
-            typer.echo(f"Launching {inferlet_name} from registry...")
+            #typer.echo(f"Launching {inferlet_name} from registry...")
             instance = await client.launch_instance_from_registry(
                 inferlet=inferlet_name,
                 arguments=arguments,
                 detached=False,
             )
-            typer.echo(f"Instance launched: {instance.instance_id}")
+            #typer.echo(f"Instance launched: {instance.instance_id}")
 
             # Stream events until completion
             while True:
@@ -691,7 +691,7 @@ async def _submit_inferlet_from_registry_async(
                 elif event == Event.Message:
                     typer.echo(f"[Message] {message}")
                 elif event == Event.Completed:
-                    typer.echo(f"✅ Instance completed: {message}")
+                    typer.echo(f"{message}")
                     break
                 elif event == Event.Aborted:
                     typer.echo(f"⚠️ Instance aborted: {message}")

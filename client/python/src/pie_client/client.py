@@ -103,7 +103,7 @@ class PieClient:
     async def connect(self):
         """Establish a WebSocket connection and start the background listener."""
         self.ws = await websockets.connect(self.server_uri)
-        print(f"[PieClient] Connected to {self.server_uri}")
+
         self.listener_task = asyncio.create_task(self._listen_to_server())
 
     async def _listen_to_server(self):
@@ -114,17 +114,10 @@ class PieClient:
                     try:
                         message = msgpack.unpackb(raw_msg, raw=False)
                         await self._process_server_message(message)
-                    except msgpack.UnpackException as e:
-                        print(f"[PieClient] Failed to decode messagepack: {e}")
-                else:
-                    print(f"[PieClient] Received unexpected non-binary message: {raw_msg}")
-        except websockets.ConnectionClosedOK:
-            print("[PieClient] Connection closed normally.")
-        except websockets.ConnectionClosedError as e:
-            print(f"[PieClient] Connection closed with error: {e}")
-        except Exception as e:
-            print(f"[PieClient] Listener task encountered an unexpected error: {e}")
-
+                    except msgpack.UnpackException:
+                        pass
+        except (websockets.ConnectionClosedOK, websockets.ConnectionClosedError, Exception):
+            pass
     async def _process_server_message(self, message: dict):
         """Route incoming server messages based on their type."""
         msg_type = message.get("type")
@@ -216,10 +209,7 @@ class PieClient:
 
         elif msg_type == "download_blob":
             await self._handle_blob_chunk(message)
-        elif msg_type == "server_event":
-            print(f"[PieClient] Received server event: {message.get('message')}")
-        else:
-            print(f"[PieClient] Received unknown message type: {msg_type}")
+
 
     async def _handle_blob_chunk(self, message: dict):
         """Processes a chunk of a blob sent from the server, ensuring sequential order."""
@@ -234,7 +224,7 @@ class PieClient:
         # Initialize download on the first chunk (index 0)
         if blob_hash not in self.pending_downloads:
             if chunk_index != 0:
-                print(f"[PieClient] Received non-zero first chunk for blob {blob_hash}. Discarding.")
+
                 return
             self.pending_downloads[blob_hash] = {
                 "buffer": bytearray(),
@@ -248,7 +238,7 @@ class PieClient:
         # Validate chunk consistency and order
         if total_chunks != download["total_chunks"] or chunk_index != download["next_chunk_index"] - 1:
             error_msg = "Chunk count mismatch" if total_chunks != download["total_chunks"] else "Out-of-order chunk"
-            print(f"[PieClient] {error_msg} for blob {blob_hash}. Aborting download.")
+
             del self.pending_downloads[blob_hash]
             return
 
@@ -261,8 +251,6 @@ class PieClient:
             computed_hash = blake3.blake3(completed_blob).hexdigest()
             if computed_hash == blob_hash:
                 await self.inst_event_queues[instance_id].put((Event.Blob.value, completed_blob))
-            else:
-                print(f"[PieClient] Blob hash mismatch for instance {instance_id}. Expected {blob_hash}, got {computed_hash}. Discarding.")
 
             del self.pending_downloads[blob_hash]
 
@@ -279,7 +267,7 @@ class PieClient:
                 await self.listener_task
             except asyncio.CancelledError:
                 pass  # Expected on cancellation
-        print("[PieClient] Client has been shut down.")
+
 
     def _get_next_corr_id(self):
         """Generate a unique correlation ID for a request."""
@@ -318,7 +306,7 @@ class PieClient:
         
         # Check if server has disabled authentication
         if result == "Authenticated (Engine disabled authentication)":
-            print("[PieClient] Authenticated successfully (server auth disabled).")
+
             return
         
         # Server returned a challenge - we need to sign it
@@ -341,9 +329,7 @@ class PieClient:
         msg = {"type": "signature", "signature": signature_b64}
         successful, result = await self._send_msg_and_wait(msg)
         
-        if successful:
-            print("[PieClient] Authenticated successfully.")
-        else:
+        if not successful:
             raise Exception(f"Signature verification failed for username '{username}': {result}")
 
     async def internal_authenticate(self, token: str) -> None:
@@ -356,9 +342,7 @@ class PieClient:
         """
         msg = {"type": "internal_authenticate", "token": token}
         successful, result = await self._send_msg_and_wait(msg)
-        if successful:
-            print("[PieClient] Internal authentication successful.")
-        else:
+        if not successful:
             raise Exception(f"Internal authentication failed: {result}")
 
     async def identify(self, username: str) -> tuple[bool, str]:
@@ -368,10 +352,6 @@ class PieClient:
         """
         msg = {"type": "identification", "username": username}
         successful, result = await self._send_msg_and_wait(msg)
-        if successful:
-            print("[PieClient] Identified successfully.")
-        else:
-            print(f"[PieClient] Identification failed: {result}")
         return successful, result
 
     async def query(self, subject: str, record: str) -> tuple[bool, str]:
@@ -419,7 +399,7 @@ class PieClient:
         if not successful:
             raise Exception(f"{upload_type.replace('_', ' ').title()} failed: {result}")
 
-        print(f"[PieClient] {upload_type.replace('_', ' ').title()} successful for hash: {data_hash}")
+
         return result
 
     async def upload_program(self, program_bytes: bytes):
