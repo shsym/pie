@@ -3,6 +3,7 @@ pub mod image;
 
 pub mod adapter;
 pub mod zo;
+pub mod actor;
 
 use wasmtime::component::HasSelf;
 
@@ -22,6 +23,9 @@ wasmtime::component::bindgen!({
         "inferlet:core/forward/forward-pass": core::forward::ForwardPass,
         "inferlet:core/forward/forward-pass-result": core::forward::ForwardPassResult,
         "inferlet:core/tokenize/tokenizer": core::tokenize::Tokenizer,
+        "inferlet:actor/common/context": actor::Context,
+        "inferlet:actor/common/adapter": actor::Adapter,
+        "inferlet:actor/common/optimizer": actor::Optimizer,
     },
     imports: { default: async | trappable },
     exports: { default: async },
@@ -37,7 +41,8 @@ where
         + inferlet::core::message::Host
         + inferlet::adapter::common::Host
         + inferlet::zo::evolve::Host
-        + inferlet::image::image::Host,
+        + inferlet::image::image::Host
+        + inferlet::actor::common::Host,
 {
     inferlet::core::common::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     inferlet::core::forward::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
@@ -48,6 +53,7 @@ where
     inferlet::adapter::common::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     inferlet::zo::evolve::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     inferlet::image::image::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    inferlet::actor::common::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
 
     Ok(())
 }

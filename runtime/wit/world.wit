@@ -5,6 +5,7 @@ world imports {
     include inferlet:image/imports;
     include inferlet:adapter/imports;
     include inferlet:zo/imports;
+    include inferlet:actor/imports;
 }
 
 world exec {
@@ -12,5 +13,6 @@ world exec {
     include inferlet:image/imports;
     include inferlet:adapter/imports;
     include inferlet:zo/imports;
+    include inferlet:actor/imports;
     export inferlet:core/run;
 }
