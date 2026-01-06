@@ -124,18 +124,20 @@ def info(
             title_str = f"{detail.full_name}"
             if latest:
                  title_str += f"@{latest.num}"
+            
+            console.print()
             console.print(f"[bold]{title_str}[/bold]")
             console.print()
 
             # --- Info ---
             if latest and latest.description:
-                console.print(latest.description.strip())
+                console.print(f"[dim]{latest.description.strip()}[/dim]")
             
             if latest:
                 if latest.repository:
-                    console.print(f"url: [blue link={latest.repository}]{latest.repository}[/blue link]")
+                    console.print(f"[dim]url:[/dim] [blue link={latest.repository}]{latest.repository}[/blue link]")
                 if latest.requires_engine:
-                    console.print(f"engine: {latest.requires_engine}")
+                    console.print(f"[dim]engine: {latest.requires_engine}[/dim]")
             
             console.print()
 
@@ -143,8 +145,8 @@ def info(
             if latest and latest.interface_spec:
                 # Helper to create a table style
                 def create_interface_table():
-                    t = Table(show_header=False, box=None, padding=(0, 2), expand=True)
-                    t.add_column("Name", style="cyan", no_wrap=True)
+                    t = Table(show_header=False, box=None, padding=(0, 2), expand=True, pad_edge=False)
+                    t.add_column("Name", style="white", no_wrap=True)
                     t.add_column("Type", style="green", no_wrap=True)
                     t.add_column("Description", style="dim", ratio=1)
                     return t
@@ -167,7 +169,6 @@ def info(
                         expand=True,
                         padding=(0, 1)
                     ))
-                    console.print()
 
                 if "outputs" in latest.interface_spec:
                     out_table = create_interface_table()
