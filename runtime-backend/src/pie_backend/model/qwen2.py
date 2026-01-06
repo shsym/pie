@@ -40,8 +40,7 @@ QWEN2_SCHEMA = (
     .define(
         "layers.*.norm_attn",
         Source("model.layers.*.input_layernorm.weight"),
-    )
-    .define(
+    ).define(
         "layers.*.norm_mlp",
         Source("model.layers.*.post_attention_layernorm.weight"),
     )
@@ -69,15 +68,12 @@ QWEN2_SCHEMA = (
                 "model.layers.*.self_attn.v_proj.bias",
             ],
             dim=0,
-        )
-        .shard("column"),
+        ).shard("column"),
     )
     # Output projection (row-parallel, quantized)
     .define(
         "layers.*.proj_o",
-        Source("model.layers.*.self_attn.o_proj.weight")
-        .shard("row")
-        .quantize(),
+        Source("model.layers.*.self_attn.o_proj.weight").shard("row").quantize(),
     )
     # Fused gate+up projection (interleaved column-parallel, quantized)
     .define(
@@ -95,9 +91,7 @@ QWEN2_SCHEMA = (
     # Down projection (row-parallel, quantized)
     .define(
         "layers.*.proj_down",
-        Source("model.layers.*.mlp.down_proj.weight")
-        .shard("row")
-        .quantize(),
+        Source("model.layers.*.mlp.down_proj.weight").shard("row").quantize(),
     )
     # Final layer norm
     .define(
@@ -111,7 +105,7 @@ QWEN2_SCHEMA = (
 class ModelConfig(ModelConfigBase):
     """
     Qwen2-specific model architecture configuration.
-    
+
     Inherits from the abstract ModelConfig base class and defines
     all architecture-specific parameters for Qwen2 models.
     """
@@ -152,12 +146,14 @@ class ModelConfig(ModelConfigBase):
             rank=runtime_config.rank,
         )
         usable_bytes = available_bytes * runtime_config.gpu_mem_utilization
-        element_size_bytes = torch.empty((), dtype=runtime_config.activation_dtype).element_size()
-        
+        element_size_bytes = torch.empty(
+            (), dtype=runtime_config.activation_dtype
+        ).element_size()
+
         # In multi-GPU mode, KV cache is sharded across GPUs
         # Each GPU only stores num_kv_heads // world_size heads
         local_num_kv_heads = self.num_kv_heads // runtime_config.world_size
-        
+
         total_bytes_per_page = (
             element_size_bytes
             * 2  # key + value
@@ -174,7 +170,7 @@ class ModelConfig(ModelConfigBase):
 class ForwardPass:
     """
     Qwen2 forward pass implementation.
-    
+
     Stores model config, runtime config, and weights internally.
     """
 
@@ -199,29 +195,29 @@ class ForwardPass:
         self.wrapper_append = ops.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
         )
-        
+
         # --- CUDA Graph Setup (Bins + Padding) ---
         self.use_cuda_graphs = runtime_config.use_cuda_graphs
-        
+
         # Dynamic bins: Powers of 2 up to 16, then steps of 16
         limit = runtime_config.max_batch_size or 512
         bins = [1, 2, 4, 8, 16]
         bins = [b for b in bins if b <= limit]
         if limit > 16:
             bins.extend(range(24, limit + 1, 16))
-            if bins[-1] < limit: # Ensure we cover the limit if not multiple of 8
+            if bins[-1] < limit:  # Ensure we cover the limit if not multiple of 8
                 bins.append(limit)
         self.cuda_graph_bins = sorted(list(set(bins)))
         max_bin = self.cuda_graph_bins[-1]
 
         self.cuda_graph_wrappers = {}
         device = runtime_config.device
-        
+
         # Alloc shared static buffers
         self.shared_static_hidden = torch.zeros(
-            (max_bin, model_config.dim_hidden), 
-            dtype=runtime_config.activation_dtype, 
-            device=device
+            (max_bin, model_config.dim_hidden),
+            dtype=runtime_config.activation_dtype,
+            device=device,
         )
         self.shared_static_indptr = torch.zeros(
             max_bin + 1, dtype=torch.int32, device=device
@@ -238,25 +234,25 @@ class ForwardPass:
         self.shared_static_batch_positions = torch.zeros(
             max_bin, dtype=torch.int32, device=device
         )
-        
-        self.cuda_graph_aux_buffers = {} # Maps bin -> (indptr_view, last_len_view)
-        
+
+        self.cuda_graph_aux_buffers = {}  # Maps bin -> (indptr_view, last_len_view)
+
         # Scratch page index for padding (use the extra page we allocated)
         self.scratch_page_idx = runtime_config.max_num_kv_pages
-        
+
         # Initialize wrappers for each bin using VIEWS of shared buffers
         max_num_pages = runtime_config.max_num_kv_pages + 1
         self.shared_kv_indices_buffer = torch.zeros(
             max_num_pages, dtype=torch.int32, device=device
         )
-        
+
         if self.use_cuda_graphs:
             for b in self.cuda_graph_bins:
                 # Create views
-                indptr_view = self.shared_static_indptr[:b+1]
+                indptr_view = self.shared_static_indptr[: b + 1]
                 last_len_view = self.shared_static_last_len[:b]
                 self.cuda_graph_aux_buffers[b] = (indptr_view, last_len_view)
-                
+
                 # Wrapper with usage_cuda_graph=True
                 self.cuda_graph_wrappers[b] = ops.BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace_buffer,
@@ -266,16 +262,14 @@ class ForwardPass:
                     paged_kv_indices_buffer=self.shared_kv_indices_buffer,
                     paged_kv_last_page_len_buffer=last_len_view,
                 )
-            
+
         # CUDA Graph cache for the layer loop: bin_size -> (graph, static_inputs..., static_output)
         self.cuda_graph_img: dict[int, tuple] = {}
-        
+
         # Fallback Decode wrapper
         self.wrapper_decode_fallback = ops.BatchDecodeWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
         )
-        
-        
 
     def warmup_cuda_graphs(self, kv_cache_at_layer: list[torch.Tensor]):
         """
@@ -286,24 +280,29 @@ class ForwardPass:
             return
 
         from tqdm import tqdm
+
         device = self.runtime_config.device
-        
+
         # Local head counts for planning
-        local_num_query_heads = self.model_config.num_q_heads // self.runtime_config.world_size
-        local_num_key_value_heads = self.model_config.num_kv_heads // self.runtime_config.world_size
+        local_num_query_heads = (
+            self.model_config.num_q_heads // self.runtime_config.world_size
+        )
+        local_num_key_value_heads = (
+            self.model_config.num_kv_heads // self.runtime_config.world_size
+        )
         page_size = self.runtime_config.kv_page_size
-        
+
         print(f"Warmup: Capturing CUDA graphs for bins {self.cuda_graph_bins}...")
-        
+
         for b in tqdm(self.cuda_graph_bins, desc="CUDA Graphs"):
             # 1. Get Views of Shared Buffers
             indptr_view, last_len_view = self.cuda_graph_aux_buffers[b]
             hidden_view = self.shared_static_hidden[:b]
-            
+
             # 2. Plan Wrapper
             indptr_view.copy_(torch.arange(b + 1, dtype=torch.int32, device=device))
             last_len_view.fill_(1)
-            
+
             wrapper = self.cuda_graph_wrappers[b]
             wrapper.plan(
                 indptr=indptr_view,
@@ -316,39 +315,41 @@ class ForwardPass:
                 pos_encoding_mode="NONE",
                 q_data_type=self.runtime_config.activation_dtype,
             )
-            
+
             # 3. Create Dummy Inputs for Capture
-            dummy_indices = torch.full((b,), self.scratch_page_idx, device=device, dtype=torch.int32)
+            dummy_indices = torch.full(
+                (b,), self.scratch_page_idx, device=device, dtype=torch.int32
+            )
             self.shared_kv_indices_buffer[:b].copy_(dummy_indices)
-            
+
             # Dummy Position IDs (View)
             pos_view = self.shared_static_position_ids[:b]
             pos_view.zero_()
-            
+
             # Dummy Batch Indices (View)
             batch_indices_view = self.shared_static_batch_indices[:b]
             batch_indices_view.copy_(torch.arange(b, device=device, dtype=torch.int32))
-            
+
             # Dummy Batch Positions (View)
             batch_pos_view = self.shared_static_batch_positions[:b]
             batch_pos_view.zero_()
-            
+
             # 4. Capture
             graph = torch.cuda.CUDAGraph()
             # Run once before capture (warmup caches)
             self._run_layers(
-                 hidden_states=hidden_view,
-                 position_ids=pos_view,
-                 kv_cache_at_layer=kv_cache_at_layer,
-                 kv_page_indices=self.shared_kv_indices_buffer,
-                 kv_page_indptr=indptr_view,
-                 kv_last_page_lens=last_len_view,
-                 batch_indices=batch_indices_view,
-                 batch_positions=batch_pos_view,
-                 adapter_subpass=None,
-                 wrapper=wrapper
+                hidden_states=hidden_view,
+                position_ids=pos_view,
+                kv_cache_at_layer=kv_cache_at_layer,
+                kv_page_indices=self.shared_kv_indices_buffer,
+                kv_page_indptr=indptr_view,
+                kv_last_page_lens=last_len_view,
+                batch_indices=batch_indices_view,
+                batch_positions=batch_pos_view,
+                adapter_subpass=None,
+                wrapper=wrapper,
             )
-            
+
             with torch.cuda.graph(graph):
                 output = self._run_layers(
                     hidden_states=hidden_view,
@@ -360,31 +361,31 @@ class ForwardPass:
                     batch_indices=batch_indices_view,
                     batch_positions=batch_pos_view,
                     adapter_subpass=None,
-                    wrapper=wrapper
+                    wrapper=wrapper,
                 )
-             
+
             self.cuda_graph_img[b] = (graph,)
-        
+
         torch.cuda.synchronize()
         print("Warmup complete.")
 
     def embed_inputs(self, batch_metadata: dict[str, Any]) -> torch.Tensor:
         """
         Embed input tokens into hidden states.
-        
+
         Args:
             batch_metadata: Metadata dictionary from the batch builder/packager.
-            
+
         Returns:
             Tensor of input embeddings.
         """
         device = self.runtime_config.device
-        
+
         # Extract token IDs from metadata
         token_ids_tensor = torch.as_tensor(
             batch_metadata["token_ids"], device=device, dtype=torch.int32
         )
-        
+
         return self.embed_tokens(token_ids_tensor)
 
     def sample(
@@ -394,17 +395,17 @@ class ForwardPass:
     ) -> dict[str, Any]:
         """
         Execute sampling using the model's LM head.
-        
+
         Args:
             hidden_states: Output hidden states.
             sampling_metadata: Metadata for sampling.
-            
+
         Returns:
             Sampling results (tokens, distributions).
         """
         # Define a lambda to call self.lm_head passing parameters correctly
         lm_head_fn = lambda x: self.lm_head(x)
-        
+
         return common.sample_common(
             hidden_states=hidden_states,
             sampling_metadata=sampling_metadata,
@@ -415,7 +416,6 @@ class ForwardPass:
 
     def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
 
-
         if self.runtime_config.world_size == 1:
             return fun.embedding(token_ids, self.weights.get("embed_token"))
 
@@ -424,7 +424,7 @@ class ForwardPass:
         vocab_size = self.model_config.num_vocabs
         world_size = self.runtime_config.world_size
         rank = self.runtime_config.rank
-        
+
         part_size = vocab_size // world_size
         start_idx = rank * part_size
         end_idx = start_idx + part_size
@@ -436,7 +436,9 @@ class ForwardPass:
         local_ids = token_ids - start_idx
         # Zero out indices not in this shard to prevent OOB crash
         # (The embedding output for these will be masked out anyway or irrelevant)
-        safe_ids = torch.where(mask, local_ids, torch.tensor(0, device=token_ids.device))
+        safe_ids = torch.where(
+            mask, local_ids, torch.tensor(0, device=token_ids.device)
+        )
 
         # 3. Lookup
         local_embeds = fun.embedding(safe_ids, self.weights.get("embed_token"))
@@ -466,10 +468,12 @@ class ForwardPass:
 
         # ALL-GATHER: Combine partial logits from all ranks (only if TP > 1)
         if self.runtime_config.world_size > 1:
-            gathered_logits = [torch.empty_like(logits) for _ in range(self.runtime_config.world_size)]
+            gathered_logits = [
+                torch.empty_like(logits) for _ in range(self.runtime_config.world_size)
+            ]
             dist.all_gather(gathered_logits, logits)
             logits = torch.cat(gathered_logits, dim=-1)
-            
+
         return logits
 
     def mlp(self, hidden_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
@@ -536,8 +540,12 @@ class ForwardPass:
         pre-norm and residual connection.
         """
         # --- Calculate local TP sizes ---
-        local_num_query_heads = self.model_config.num_q_heads // self.runtime_config.world_size
-        local_num_key_value_heads = self.model_config.num_kv_heads // self.runtime_config.world_size
+        local_num_query_heads = (
+            self.model_config.num_q_heads // self.runtime_config.world_size
+        )
+        local_num_key_value_heads = (
+            self.model_config.num_kv_heads // self.runtime_config.world_size
+        )
         local_q_size = local_num_query_heads * self.model_config.dim_head
         local_kv_size = local_num_key_value_heads * self.model_config.dim_head
 
@@ -546,7 +554,7 @@ class ForwardPass:
         # Save input for the first residual connection (replicated)
         residual = hidden_states
 
-        # 1. Input RMSNorm (replicated input -> replicated output) 
+        # 1. Input RMSNorm (replicated input -> replicated output)
         normed_input = fun.rms_norm(
             hidden_states,
             normalized_shape=[self.model_config.dim_hidden],
@@ -559,7 +567,11 @@ class ForwardPass:
         qkv_proj = fun.linear(
             normed_input,
             self.weights.get(f"layers.{layer_idx}.proj_qkv.weight"),
-            self.weights.get(f"layers.{layer_idx}.proj_qkv.bias") if self.model_config.use_qkv_bias else None,
+            (
+                self.weights.get(f"layers.{layer_idx}.proj_qkv.bias")
+                if self.model_config.use_qkv_bias
+                else None
+            ),
         )
 
         # q, k, v are all LOCAL shards
@@ -656,7 +668,7 @@ class ForwardPass:
     ) -> torch.Tensor:
         """Main transformation pipeline through all layers."""
         torch.cuda.set_device(self.runtime_config.device)
-        
+
         # Calculate derived inputs
         page_size = int(kv_cache_at_layer[0].shape[2])
         n = input_embeds.shape[0]
@@ -675,8 +687,12 @@ class ForwardPass:
         del seq_lens
 
         # Wrapper Planning
-        local_num_query_heads = self.model_config.num_q_heads // self.runtime_config.world_size
-        local_num_key_value_heads = self.model_config.num_kv_heads // self.runtime_config.world_size
+        local_num_query_heads = (
+            self.model_config.num_q_heads // self.runtime_config.world_size
+        )
+        local_num_key_value_heads = (
+            self.model_config.num_kv_heads // self.runtime_config.world_size
+        )
 
         if single_token_inference_mode:
             if self.use_cuda_graphs:
@@ -791,40 +807,49 @@ class ForwardPass:
         """
         batch_size = hidden_states.shape[0]
         bin_size = self._get_bin(batch_size)
-        
+
         if bin_size is None or bin_size not in self.cuda_graph_img:
-             # Fallback
-             wrapper = self.wrapper_decode_fallback
-             page_size = self.runtime_config.kv_page_size
-             wrapper.plan(
+            # Fallback
+            wrapper = self.wrapper_decode_fallback
+            page_size = self.runtime_config.kv_page_size
+            wrapper.plan(
                 indptr=kv_page_indptr,
                 indices=kv_page_indices,
                 last_page_len=kv_last_page_lens,
-                num_qo_heads=self.model_config.num_q_heads // self.runtime_config.world_size,
-                num_kv_heads=self.model_config.num_kv_heads // self.runtime_config.world_size,
+                num_qo_heads=self.model_config.num_q_heads
+                // self.runtime_config.world_size,
+                num_kv_heads=self.model_config.num_kv_heads
+                // self.runtime_config.world_size,
                 head_dim=self.model_config.dim_head,
                 page_size=page_size,
                 pos_encoding_mode="NONE",
                 q_data_type=hidden_states.dtype,
-             )
-             return self._run_layers(
-                 hidden_states, position_ids, kv_cache_at_layer,
-                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                 batch_indices, batch_positions, None, wrapper
-             )
-        
+            )
+            return self._run_layers(
+                hidden_states,
+                position_ids,
+                kv_cache_at_layer,
+                kv_page_indices,
+                kv_page_indptr,
+                kv_last_page_lens,
+                batch_indices,
+                batch_positions,
+                None,
+                wrapper,
+            )
+
         # 1. Copy data to Shared Static Buffers
         self.shared_static_hidden[:batch_size].copy_(hidden_states)
-        
+
         indptr_view = self.cuda_graph_aux_buffers[bin_size][0]
-        indptr_view[:batch_size+1].copy_(kv_page_indptr)
-        
+        indptr_view[: batch_size + 1].copy_(kv_page_indptr)
+
         last_len_view = self.cuda_graph_aux_buffers[bin_size][1]
         last_len_view[:batch_size].copy_(kv_last_page_lens)
-        
+
         num_indices = kv_page_indices.numel()
         self.shared_kv_indices_buffer[:num_indices].copy_(kv_page_indices)
-        
+
         self.shared_static_position_ids[:batch_size].copy_(position_ids)
         self.shared_static_batch_indices[:batch_size].copy_(batch_indices)
         self.shared_static_batch_positions[:batch_size].copy_(batch_positions)
@@ -833,34 +858,36 @@ class ForwardPass:
         if batch_size < bin_size:
             # Pad Indptr
             remainder = bin_size - batch_size
-            padding = torch.arange(1, remainder + 1, device=self.runtime_config.device, dtype=torch.int32)
+            padding = torch.arange(
+                1, remainder + 1, device=self.runtime_config.device, dtype=torch.int32
+            )
             padding.add_(total_pages_cpu)
-            indptr_view[batch_size+1:].copy_(padding)
-            
+            indptr_view[batch_size + 1 :].copy_(padding)
+
             # Pad Last Len
             last_len_view[batch_size:].fill_(1)
-            
+
             # Pad Position IDs
             self.shared_static_position_ids[batch_size:].zero_()
-            
+
             # Pad Batch Indices / Positions
             self.shared_static_batch_indices[batch_size:].zero_()
             self.shared_static_batch_positions[batch_size:].zero_()
-            
+
         # 3. Replay
         graph = self.cuda_graph_img[bin_size][0]
         graph.replay()
-        
+
         # 4. Return Output Slice
         return self.shared_static_hidden[:batch_size].clone()
 
 
-
-
-def create_kv_cache(model_config: ModelConfig, runtime_config: RuntimeConfig) -> list[torch.Tensor]:
+def create_kv_cache(
+    model_config: ModelConfig, runtime_config: RuntimeConfig
+) -> list[torch.Tensor]:
     """Create KV cache tensors for all layers."""
     local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
-    
+
     return [
         torch.zeros(
             (
@@ -881,7 +908,7 @@ def create_adapter_cache(
     model_config: ModelConfig, runtime_config: RuntimeConfig
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Create adapter cache tensors for all layers.
-    
+
     Returns a list of (down_weights, up_weights) tuples, one per layer.
     - down_weights: [max_num_adapters, dim_hidden, max_adapter_rank * 3]
     - up_weights: [max_num_adapters, max_adapter_rank, dim_head * (num_q_heads + num_kv_heads * 2)]
@@ -902,10 +929,7 @@ def create_adapter_cache(
                     runtime_config.max_num_adapters,
                     runtime_config.max_adapter_rank,
                     model_config.dim_head
-                    * (
-                        model_config.num_q_heads
-                        + model_config.num_kv_heads * 2
-                    ),
+                    * (model_config.num_q_heads + model_config.num_kv_heads * 2),
                 ),
                 dtype=runtime_config.activation_dtype,
                 device=runtime_config.device,

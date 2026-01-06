@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from typing import TYPE_CHECKING
 import torch
@@ -12,12 +11,16 @@ import torch
 #     )
 
 
-
 # as requested, using absolute imports with lazy loading
+
 
 def quantize(
     x: torch.Tensor,
-    config: "torchao.quantization.Int4WeightOnlyConfig" | "torchao.quantization.Int8WeightOnlyConfig" | "torchao.quantization.Float8WeightOnlyConfig",
+    config: (
+        "torchao.quantization.Int4WeightOnlyConfig"
+        | "torchao.quantization.Int8WeightOnlyConfig"
+        | "torchao.quantization.Float8WeightOnlyConfig"
+    ),
 ) -> torch.Tensor:
     import torchao
 
@@ -38,17 +41,19 @@ def quantize_int4(
     config: "torchao.quantization.Int4WeightOnlyConfig",
 ) -> torch.Tensor:
     import torchao
+
     # Essential imports that are too deep or internal to access via top-level easily without being verbose
-    # But user asked to use absolute modules. 
+    # But user asked to use absolute modules.
     # Let's check if we can access them via torchao.quantization... usually workflows are hidden.
     # We will use the full path for imports if needed, but try to minimize "from ... import ..."
-    
-    # Actually, for these specific internal enums, it's safer to import them locally 
+
+    # Actually, for these specific internal enums, it's safer to import them locally
     # but maybe we can just import the module?
     from torchao.quantization.quantize_.workflows import (
         Int4PackingFormat,
         Int4ChooseQParamsAlgorithm,
     )
+
     # Note: torchao.quantization exports tensor subclasses usually.
 
     if x.shape[-1] % config.group_size != 0:
@@ -117,9 +122,11 @@ def quantize_int8(
     )
 
 
-def quantize_float8(x: torch.Tensor, config: "torchao.quantization.Float8WeightOnlyConfig") -> torch.Tensor:
+def quantize_float8(
+    x: torch.Tensor, config: "torchao.quantization.Float8WeightOnlyConfig"
+) -> torch.Tensor:
     import torchao
-    
+
     return torchao.quantization.Float8Tensor.from_hp(
         x,
         float8_dtype=x.dtype,

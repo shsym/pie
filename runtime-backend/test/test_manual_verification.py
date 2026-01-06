@@ -1,8 +1,8 @@
-
 import sys
 import torch
 from pie_backend.runtime import Runtime, RuntimeConfig
 from pie_backend import message
+
 
 def test_manual():
     print("Initializing Runtime...")
@@ -28,21 +28,23 @@ def test_manual():
         kv_page_ptrs=[0],
         kv_page_last_len=1,
         output_token_indices=[0],
-        output_token_samplers=[{"sampler": 3, "top_k": 1, "temperature": 1.0}], # Top-K=1
+        output_token_samplers=[
+            {"sampler": 3, "top_k": 1, "temperature": 1.0}
+        ],  # Top-K=1
         output_embed_ptrs=[],
-        output_embed_indices=[]
+        output_embed_indices=[],
     )
 
     print("Sending ForwardPassRequest...")
     try:
         responses = runtime.forward_pass_handler([req])
         print(f"Received {len(responses)} responses.")
-        
+
         if responses:
             resp = responses[0]
             print(f"Response tokens: {resp.tokens}")
             print(f"Response dists: {resp.dists}")
-            
+
             if resp.tokens and len(resp.tokens) == 1:
                 print("SUCCESS: Generated a token.")
             else:
@@ -53,7 +55,9 @@ def test_manual():
     except Exception as e:
         print(f"Forward pass failed: {e}")
         import traceback
+
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     test_manual()

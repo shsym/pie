@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 class ModelConfig(ABC):
     """
     Abstract base class for model architecture specifications.
-    
+
     Each model (e.g., llama3) should define its own ModelConfig that inherits
     from this class and specifies architecture-specific parameters.
     """
@@ -34,6 +34,7 @@ class ModelConfig(ABC):
 @dataclass
 class Buffer(ABC):
     """Abstract base class for model buffers (e.g., KV cache)."""
+
     model_config: ModelConfig
     runtime_config: "RuntimeConfig"
 

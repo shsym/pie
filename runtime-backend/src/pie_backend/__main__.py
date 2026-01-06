@@ -1,7 +1,6 @@
 import sys
 
 
-
 import fire
 from .server import start_server
 from .runtime import RuntimeConfig, Runtime
@@ -37,7 +36,9 @@ def main(
     random_seed: int = 42,
     use_cuda_graphs: bool = True,
     test: bool = False,
-    log_queue: object | None = None,  # multiprocessing.Queue, using object to avoid type issues with fire
+    log_queue: (
+        object | None
+    ) = None,  # multiprocessing.Queue, using object to avoid type issues with fire
 ):
     """
     Runs the application with configuration provided as command-line arguments.
@@ -75,7 +76,7 @@ def main(
         device_list = None
     elif isinstance(device, list):
         device_list = device
-    else: # str
+    else:  # str
         if "," in device:
             device_list = [d.strip() for d in device.split(",")]
         else:
@@ -86,27 +87,27 @@ def main(
         world_size = len(device_list)
         import torch.multiprocessing as mp
         import random
-        
+
         # Use 'spawn' context for CUDA compatibility
         mp.set_start_method("spawn", force=True)
-        
+
         # Helper: signal
         import signal
-        
+
         # Remove the previous simple ignore if present, or just implement new logic
         # We need the parent to handle SIGTERM to kill children, but children need to ignore it initially
         # until Rank 0 tells them to stop (or parent kills them).
-        
+
         # ACTUALLY, simpler approach based on plan:
         # Parent: Catch SIGTERM -> ctx.terminate() -> join()
         # Children: Ignore SIGTERM. Rank 0 re-enables it.
-        
+
         # So in main (parent):
         # Generate master port BEFORE spawn so all processes use same port
         master_port = 29500 + random.randint(0, 1000)
-        
+
         print(f"Spawning {world_size} processes for devices: {device_list}")
-        
+
         ctx = mp.spawn(
             init_process,
             args=(
@@ -135,9 +136,9 @@ def main(
                 log_queue,
             ),
             nprocs=world_size,
-            join=False, # We manage join manually
+            join=False,  # We manage join manually
         )
-        
+
         # Cleanup function to kill all children immediately
         def cleanup_children():
             for p in ctx.processes:
@@ -147,19 +148,20 @@ def main(
                     except ProcessLookupError:
                         pass
                     p.join(timeout=1.0)
-        
+
         # Register atexit handler
         import atexit
+
         atexit.register(cleanup_children)
-        
+
         def sigterm_handler(signum, frame):
             # Forward signal to children and exit
             cleanup_children()
             sys.exit(0)
-            
+
         signal.signal(signal.SIGTERM, sigterm_handler)
         signal.signal(signal.SIGINT, sigterm_handler)
-        
+
         # Wait for children
         try:
             while not ctx.join():
@@ -170,10 +172,12 @@ def main(
         # Single process mode (backward compatibility)
         single_device = device_list[0] if device_list else None
         init_process(
-            0, # rank
-            1, # world_size
-            [single_device] if single_device else [], # devices (will be resolved in config)
-            0, # master_port (unused in single process mode)
+            0,  # rank
+            1,  # world_size
+            (
+                [single_device] if single_device else []
+            ),  # devices (will be resolved in config)
+            0,  # master_port (unused in single process mode)
             hf_repo,
             host,
             port,
@@ -195,6 +199,7 @@ def main(
             test,
             log_queue,
         )
+
 
 def init_process(
     rank: int,
@@ -233,47 +238,55 @@ def init_process(
     # Rank 0 will re-enable a handler in start_server.
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
-
     # Setup distributed environment if world_size > 1
     if world_size > 1:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
-        
+
         # Set NCCL timeout so operations fail instead of hanging forever
         # This allows recovery when one rank dies mid-operation
         os.environ["NCCL_TIMEOUT"] = "300"  # 5 minutes
         os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
-        
+
         # CRITICAL: Set CUDA device BEFORE init_process_group so NCCL detects correct device
-        local_device = devices[rank] if devices and rank < len(devices) else f"cuda:{rank}"
+        local_device = (
+            devices[rank] if devices and rank < len(devices) else f"cuda:{rank}"
+        )
         torch.cuda.set_device(local_device)
-        
+
         # Suppress harmless barrier() device warning
         import warnings
-        warnings.filterwarnings("ignore", message=".*barrier.*device under current context.*")
-        
+
+        warnings.filterwarnings(
+            "ignore", message=".*barrier.*device under current context.*"
+        )
+
         # Use NCCL for CUDA, GLOO for CPU
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        
+
         pg_options = None
         if backend == "nccl":
             try:
                 from torch.distributed import ProcessGroupNCCL
+
                 pg_options = ProcessGroupNCCL.Options()
                 pg_options.config.capture_safe = True
             except (ImportError, AttributeError):
                 pass
 
         if pg_options:
-             dist.init_process_group(backend, rank=rank, world_size=world_size, pg_options=pg_options)
+            dist.init_process_group(
+                backend, rank=rank, world_size=world_size, pg_options=pg_options
+            )
         else:
-             dist.init_process_group(backend, rank=rank, world_size=world_size)
-        
+            dist.init_process_group(backend, rank=rank, world_size=world_size)
+
         # Create a separate GLOO process group for CPU control messages
         # This allows metadata broadcasts without GPU spin
         import pie_backend.utils as pie_utils
+
         pie_utils._cpu_group = dist.new_group(backend="gloo")
-    
+
     # Determine local device for this rank
     # If devices list is empty (auto-detect), RuntimeConfig will handle it for rank 0
     # For multi-gpu, we expect explicit devices list usually, but let's handle it safely
@@ -300,7 +313,7 @@ def init_process(
         rank=rank,
         world_size=world_size,
     )
-    
+
     # Log trace to queue if available
     trace_msg = f"[TRACE rank={rank}] Config devices={config.devices}, my device={config.device}"
     log_queue.put({"level": "DEBUG", "message": trace_msg})
@@ -314,19 +327,19 @@ def init_process(
         dist.barrier()
 
     if rank == 0:
-            
+
         start_server(
-            host=host, 
-            port=port, 
-            auth_token=internal_auth_token, 
-            service=service, 
+            host=host,
+            port=port,
+            auth_token=internal_auth_token,
+            service=service,
             run_tests=test,
-            log_queue=log_queue
+            log_queue=log_queue,
         )
-        
+
         # Shutdown workers
         # Handled inside start_server -> service.shutdown()
-        
+
     else:
         # Workers run the worker loop
         service.worker_loop()
@@ -334,7 +347,6 @@ def init_process(
     # Cleanup
     if world_size > 1:
         dist.destroy_process_group()
-
 
 
 def entrypoint():

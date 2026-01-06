@@ -21,7 +21,7 @@ def handle_abort_command(
     private_key_path: Optional[Path] = None,
 ) -> None:
     """Handle the `pie-cli abort` command.
-    
+
     1. Creates a client configuration from config file and command-line arguments
     2. Connects to the Pie engine server
     3. Queries for all live instances
@@ -36,39 +36,45 @@ def handle_abort_command(
         username=username,
         private_key_path=private_key_path,
     )
-    
+
     client = engine.connect_and_authenticate(client_config)
-    
+
     try:
         # Query all running instances
         instances = engine.list_instances(client)
-        
+
         # Find matching instances
-        matching = [inst for inst in instances if inst.id.startswith(instance_id_prefix)]
-        
+        matching = [
+            inst for inst in instances if inst.id.startswith(instance_id_prefix)
+        ]
+
         if len(matching) == 0:
             raise ValueError(
                 f"No instance found with ID prefix '{instance_id_prefix}'. "
                 "Use `pie-cli list` to see running instances."
             )
-        
+
         if len(matching) > 1:
-            typer.echo(f"❌ The prefix '{instance_id_prefix}' is ambiguous. Multiple instances match:")
+            typer.echo(
+                f"❌ The prefix '{instance_id_prefix}' is ambiguous. Multiple instances match:"
+            )
             typer.echo()
             for inst in matching:
                 typer.echo(f"  {inst.id}")
             typer.echo()
-            typer.echo("Please provide a more specific prefix to uniquely identify the instance.")
+            typer.echo(
+                "Please provide a more specific prefix to uniquely identify the instance."
+            )
             raise ValueError("Ambiguous instance ID prefix")
-        
+
         # Found exactly one match
         instance_info = matching[0]
         instance_id = instance_info.id
-        
+
         # Terminate the instance
         engine.terminate_instance(client, instance_id)
-        
+
         typer.echo(f"✅ Sent termination request for instance {instance_id}")
-    
+
     finally:
         engine.close_client(client)

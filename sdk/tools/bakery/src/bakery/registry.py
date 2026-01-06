@@ -16,6 +16,7 @@ REGISTRY_URL = "https://registry.pie-project.org/api/v1"
 @dataclass
 class VersionInfo:
     """Information about a specific inferlet version."""
+
     num: str
     checksum: str
     size_bytes: int
@@ -40,7 +41,9 @@ class VersionInfo:
             requires_engine=data.get("requires_engine"),
             interface_spec=data.get("interface_spec"),
             yanked=data.get("yanked", False),
-            created_at=datetime.fromisoformat(data["created_at"].replace("Z", "+00:00")),
+            created_at=datetime.fromisoformat(
+                data["created_at"].replace("Z", "+00:00")
+            ),
             authors=data.get("authors"),
             keywords=data.get("keywords"),
             repository=data.get("repository"),
@@ -51,6 +54,7 @@ class VersionInfo:
 @dataclass
 class InferletListItem:
     """Summary info for an inferlet in search results."""
+
     id: str
     namespace: str
     name: str
@@ -71,13 +75,16 @@ class InferletListItem:
             description=data.get("description"),
             downloads=data.get("downloads", 0),
             latest_version=data.get("latest_version"),
-            created_at=datetime.fromisoformat(data["created_at"].replace("Z", "+00:00")),
+            created_at=datetime.fromisoformat(
+                data["created_at"].replace("Z", "+00:00")
+            ),
         )
 
 
 @dataclass
 class InferletDetail:
     """Detailed information about an inferlet including all versions."""
+
     id: str
     namespace: str
     name: str
@@ -95,7 +102,9 @@ class InferletDetail:
             name=data["name"],
             full_name=data["full_name"],
             downloads=data.get("downloads", 0),
-            created_at=datetime.fromisoformat(data["created_at"].replace("Z", "+00:00")),
+            created_at=datetime.fromisoformat(
+                data["created_at"].replace("Z", "+00:00")
+            ),
             versions=[VersionInfo.from_dict(v) for v in data.get("versions", [])],
         )
 
@@ -103,6 +112,7 @@ class InferletDetail:
 @dataclass
 class SearchResponse:
     """Response from the search API."""
+
     total: int
     page: int
     per_page: int
@@ -124,6 +134,7 @@ class SearchResponse:
 @dataclass
 class PublishStartRequest:
     """Request to start publishing an inferlet."""
+
     namespace: str
     name: str
     version: str
@@ -166,6 +177,7 @@ class PublishStartRequest:
 @dataclass
 class PublishStartResponse:
     """Response from starting a publish operation."""
+
     upload_url: str
     storage_path: str
     expires_in_seconds: int
@@ -183,6 +195,7 @@ class PublishStartResponse:
 @dataclass
 class PublishCommitRequest:
     """Request to finalize a publish operation."""
+
     namespace: str
     name: str
     version: str
@@ -227,6 +240,7 @@ class PublishCommitRequest:
 @dataclass
 class PublishCommitResponse:
     """Response from finalizing a publish operation."""
+
     id: str
     full_name: str
     version: str
@@ -246,6 +260,7 @@ class PublishCommitResponse:
 @dataclass
 class UserInfo:
     """Information about the authenticated user."""
+
     id: str
     login: str
     name: Optional[str]
@@ -266,10 +281,10 @@ class UserInfo:
 
 def resolve_name(name: str) -> tuple[str, str]:
     """Parse an inferlet name into (namespace, name).
-    
+
     If name contains '/', splits on first '/'.
     If name is bare (no '/'), assumes 'std' namespace.
-    
+
     Examples:
         "react" -> ("std", "react")
         "ingim/tree-of-thought" -> ("ingim", "tree-of-thought")
@@ -282,6 +297,7 @@ def resolve_name(name: str) -> tuple[str, str]:
 
 class RegistryError(Exception):
     """Error from the registry API."""
+
     def __init__(self, status_code: int, detail: str):
         self.status_code = status_code
         self.detail = detail
@@ -298,7 +314,7 @@ class RegistryClient:
         timeout: float = 30.0,
     ):
         """Initialize the registry client.
-        
+
         Args:
             token: Optional JWT token for authenticated requests.
             base_url: Base URL for the registry API.
@@ -342,8 +358,7 @@ class RegistryClient:
                 if isinstance(detail, list):
                     # Validation error format
                     detail = "; ".join(
-                        f"{e.get('loc', [])}: {e.get('msg', '')}" 
-                        for e in detail
+                        f"{e.get('loc', [])}: {e.get('msg', '')}" for e in detail
                     )
             except Exception:
                 detail = response.text
@@ -358,29 +373,29 @@ class RegistryClient:
         namespace: Optional[str] = None,
     ) -> SearchResponse:
         """Search for inferlets.
-        
+
         Args:
             query: Search query string.
             page: Page number (1-indexed).
             per_page: Items per page (max 100).
             namespace: Optional namespace filter.
-            
+
         Returns:
             SearchResponse with matching inferlets.
         """
         params = {"q": query, "page": page, "per_page": per_page}
         if namespace:
             params["namespace"] = namespace
-        
+
         response = self._get_client().get("/inferlets", params=params)
         return SearchResponse.from_dict(self._handle_response(response))
 
     def info(self, name: str) -> InferletDetail:
         """Get detailed information about an inferlet.
-        
+
         Args:
             name: Inferlet name (e.g., "react" or "ingim/tree-of-thought").
-            
+
         Returns:
             InferletDetail with full metadata and versions.
         """
@@ -390,10 +405,10 @@ class RegistryClient:
 
     def get_me(self) -> UserInfo:
         """Get information about the authenticated user.
-        
+
         Returns:
             UserInfo for the current user.
-            
+
         Raises:
             RegistryError: If not authenticated or token is invalid.
         """
@@ -402,16 +417,16 @@ class RegistryClient:
 
     def start_publish(self, request: PublishStartRequest) -> PublishStartResponse:
         """Start a publish operation.
-        
+
         Validates permissions and returns a presigned URL for uploading
         the artifact directly to storage.
-        
+
         Args:
             request: Publish request with package metadata.
-            
+
         Returns:
             PublishStartResponse with upload URL.
-            
+
         Raises:
             RegistryError: If authentication fails or namespace not allowed.
         """
@@ -420,25 +435,27 @@ class RegistryClient:
 
     def commit_publish(self, request: PublishCommitRequest) -> PublishCommitResponse:
         """Finalize a publish operation.
-        
+
         Called after the artifact has been uploaded to the presigned URL.
-        
+
         Args:
             request: Commit request with storage path.
-            
+
         Returns:
             PublishCommitResponse with finalized metadata.
         """
-        response = self._get_client().post("/inferlets/new/commit", json=request.to_dict())
+        response = self._get_client().post(
+            "/inferlets/new/commit", json=request.to_dict()
+        )
         return PublishCommitResponse.from_dict(self._handle_response(response))
 
     def upload_artifact(self, upload_url: str, artifact_bytes: bytes) -> None:
         """Upload an artifact to the presigned URL.
-        
+
         Args:
             upload_url: Presigned URL from start_publish.
             artifact_bytes: The artifact binary data.
-            
+
         Raises:
             RegistryError: If upload fails.
         """

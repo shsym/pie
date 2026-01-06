@@ -1,6 +1,7 @@
 """
 Minimal script to debug embedding weight shapes under tensor parallel loading.
 """
+
 import torch
 from pie_backend.runtime import Runtime, RuntimeConfig
 
@@ -19,9 +20,11 @@ runtime1 = Runtime(config1)
 embed_weight = runtime1.engine.weights.get("embed_token")
 print(f"    Config: rank={config1.rank}, world_size={config1.world_size}")
 print(f"    Embed weight shape: {embed_weight.shape}")
-print(f"    Expected full: [vocab_size, hidden_size] = [{runtime1.model_config.num_vocabs}, {runtime1.model_config.dim_hidden}]")
+print(
+    f"    Expected full: [vocab_size, hidden_size] = [{runtime1.model_config.num_vocabs}, {runtime1.model_config.dim_hidden}]"
+)
 
-# Test embedding 
+# Test embedding
 token_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32, device=config1.device)
 embeddings = runtime1.engine.embed_tokens(token_ids)
 print(f"    embed_tokens output shape: {embeddings.shape}")
@@ -33,7 +36,9 @@ torch.cuda.empty_cache()
 # Multi-GPU config simulation (without distributed)
 print("\n[2] Multi-GPU config (rank=0, world_size=2):")
 config2_r0 = RuntimeConfig.from_args(model=MODEL, devices=DEVICES, rank=0)
-print(f"    Config: rank={config2_r0.rank}, world_size={config2_r0.world_size}, device={config2_r0.device}")
+print(
+    f"    Config: rank={config2_r0.rank}, world_size={config2_r0.world_size}, device={config2_r0.device}"
+)
 
 # Load model with this config
 runtime2 = Runtime(config2_r0)
@@ -45,6 +50,7 @@ token_ids2 = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32, device=config2_r0.
 
 # Skip the all_reduce by calling embedding directly
 import torch.nn.functional as fun
+
 raw_embed = fun.embedding(token_ids2, embed_weight2)
 print(f"    Raw embedding from sharded weight: {raw_embed.shape}")
 
@@ -57,7 +63,9 @@ else:
     expected_shard = runtime2.model_config.dim_hidden // config2_r0.world_size
     if embed_weight2.shape[1] == expected_shard:
         print("    ✗ Embedding weight has SHARDED hidden_size (column parallel)")
-        print(f"    -> hidden_size is {embed_weight2.shape[1]} instead of {runtime2.model_config.dim_hidden}")
+        print(
+            f"    -> hidden_size is {embed_weight2.shape[1]} instead of {runtime2.model_config.dim_hidden}"
+        )
         print("    -> Need all_gather after embedding, not all_reduce")
     else:
         print(f"    ? Unexpected shape: {embed_weight2.shape}")

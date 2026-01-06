@@ -17,9 +17,12 @@ from flashinfer.sampling import (
 )
 
 if torch.cuda.is_available():
-    NUM_SM = torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count
+    NUM_SM = torch.cuda.get_device_properties(
+        torch.device("cuda")
+    ).multi_processor_count
 else:
     NUM_SM = 108
+
 
 def sample_common(
     hidden_states: torch.Tensor,
@@ -30,14 +33,14 @@ def sample_common(
 ) -> dict[str, Any]:
     """
     Execute the sampling pass.
-    
+
     Args:
         hidden_states: The output hidden states from the model.
         sampling_metadata: Dictionary containing prepared sampling metadata.
         lm_head_fn: Function to compute logits from hidden states.
         device: Torch device.
         dtype: Torch dtype for intermediate calculations.
-        
+
     Returns:
         Dictionary containing 'tokens' (list[int]) and 'dists' (list[tuple]).
     """
@@ -45,7 +48,7 @@ def sample_common(
         return {"tokens": [], "dists": []}
 
     indices_for_logits = sampling_metadata["indices_for_logits"]
-    
+
     # Stage 1: Compute logits via LM head
     logits_input = hidden_states[indices_for_logits]
     logits = lm_head_fn(logits_input)
@@ -63,7 +66,7 @@ def sample_common(
     final_tokens_tensor = torch.empty(
         num_logit_requests, dtype=torch.long, device=device
     )
-    
+
     sampler_groups = sampling_metadata["sampler_groups"]
     sampler_params = sampling_metadata["sampler_params"]
 
@@ -76,11 +79,9 @@ def sample_common(
 
         if sampler_idx == 0:
             # Distribution mode
-            _process_distributions(
-                indices, group_probs, final_dists, sampler_params
-            )
+            _process_distributions(indices, group_probs, final_dists, sampler_params)
         else:
-            #print(sampler_idx, indices, group_probs, sampler_params, device, dtype)
+            # print(sampler_idx, indices, group_probs, sampler_params, device, dtype)
             # Sampling mode
             sampled = _execute_sampler(
                 sampler_idx, indices, group_probs, sampler_params, device, dtype
@@ -95,11 +96,9 @@ def sample_common(
 
     # Stage 5: Combine results
     final_tokens_list = final_tokens_tensor.tolist()
-    
-    return {
-        "tokens": final_tokens_list,
-        "dists": final_dists 
-    }
+
+    return {"tokens": final_tokens_list, "dists": final_dists}
+
 
 def _process_distributions(
     indices: list[int],
@@ -110,21 +109,22 @@ def _process_distributions(
     """Process distribution requests."""
     # Note: sampler_params is a list corresponding to the WHOLE batch logit requests
     # We need to map `indices` (which are indices into the logit batch) back to param access.
-    
+
     group_top_k = [sampler_params[i]["top_k"] for i in indices]
     max_k = max(group_top_k) if group_top_k else 0
 
     if max_k > 0:
         topk_vals, topk_inds = torch.topk(group_probs, k=max_k, sorted=True)
-        
+
         topk_vals_list = topk_vals.tolist()
         topk_inds_list = topk_inds.tolist()
-        
+
         for i, original_idx in enumerate(indices):
             k = sampler_params[original_idx]["top_k"]
             ids = topk_inds_list[i][:k]
             vals = topk_vals_list[i][:k]
             final_dists[original_idx] = (ids, vals)
+
 
 def _execute_sampler(
     sampler_idx: int,
@@ -135,7 +135,7 @@ def _execute_sampler(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """Execute the appropriate sampling operation."""
-    
+
     # Gather params for this group
     group_params = [sampler_params[i] for i in indices]
 
@@ -192,19 +192,19 @@ def estimate_flashinfer_workspace_size(
     batch_size: int,
     single_token_inference_mode: bool,
     # Config objects available in self
-    model_config,     # needs .num_q_heads, .num_kv_heads, .dim_head
-    runtime_config,   # needs .world_size, .device
+    model_config,  # needs .num_q_heads, .num_kv_heads, .dim_head
+    runtime_config,  # needs .world_size, .device
 ) -> int:
     """
     Estimates the required workspace buffer size in bytes for FlashInfer operations.
     Replicates the C++ logic from flashinfer/attention/scheduler.cuh.
     """
-    
+
     # --- 1. Setup Constants & GPU Properties ---
     local_num_qo_heads = model_config.num_q_heads // runtime_config.world_size
     local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
     head_dim = model_config.dim_head
-    
+
     # Helper for 16-byte alignment (FlashInfer Requirement)
     def align16(n):
         return (n + 15) // 16 * 16
@@ -212,9 +212,9 @@ def estimate_flashinfer_workspace_size(
     # Get GPU Multi-Processor Count for Split-KV estimation
     # FlashInfer uses heuristics based on available SMs to decide splitting.
     num_sm = NUM_SM
-    
+
     # FlashInfer typically limits parallelism to 2 blocks per SM for these kernels
-    max_grid_size = num_sm * 2 
+    max_grid_size = num_sm * 2
     gqa_group_size = local_num_qo_heads // local_num_kv_heads
 
     size = 0
@@ -222,7 +222,7 @@ def estimate_flashinfer_workspace_size(
 
     # --- 2. Decode Path (Single Token) ---
     if single_token_inference_mode:
-        
+
         # Simulate Work Estimation Logic:
         # If batch is small, FlashInfer splits KV to fill the GPU (Split-KV).
         # We calculate the "padded" batch size used for allocation.
@@ -235,21 +235,21 @@ def estimate_flashinfer_workspace_size(
             padded_batch_size = max_grid_size // max(1, gqa_group_size)
 
         # -- Int Buffer Allocations --
-        size += align16(padded_batch_size * id_size)     # request_indices
-        size += align16(padded_batch_size * id_size)     # kv_tile_indices
-        size += align16((padded_batch_size + 1) * id_size) # o_indptr
-        size += align16(id_size)                         # kv_chunk_size_ptr
-        
+        size += align16(padded_batch_size * id_size)  # request_indices
+        size += align16(padded_batch_size * id_size)  # kv_tile_indices
+        size += align16((padded_batch_size + 1) * id_size)  # o_indptr
+        size += align16(id_size)  # kv_chunk_size_ptr
+
         if split_kv:
-            size += align16(padded_batch_size * 1)       # block_valid_mask (bool)
+            size += align16(padded_batch_size * 1)  # block_valid_mask (bool)
 
             # -- Float Buffer Allocations (Temporary Accumulation) --
             # V Buffer: [num_heads, padded_batch, head_dim] (Output Type)
             v_size = local_num_qo_heads * padded_batch_size * head_dim * element_size
             size += align16(v_size)
-            
+
             # S Buffer: [num_heads, padded_batch] (Float32)
-            s_size = local_num_qo_heads * padded_batch_size * 4 
+            s_size = local_num_qo_heads * padded_batch_size * 4
             size += align16(s_size)
 
     # --- 3. Prefill Path (Append) ---
@@ -257,39 +257,39 @@ def estimate_flashinfer_workspace_size(
         # Determine Tile Size (cta_tile_q)
         # Standard FlashInfer logic: 128 for dim <= 128, else 64
         cta_tile_q = 128 if head_dim <= 128 else 64
-        
+
         # Calculate Padded Batch Size (Total Tiles)
         # In prefill, "batch" often refers to total number of tiles across all requests
         packed_total_len = total_qo_len * gqa_group_size
         total_num_tiles_q = math.ceil(packed_total_len / cta_tile_q) + batch_size
-        
+
         # FlashInfer bounds prefill splitting by available SMs to avoid OOM
         # So allocation size is max(sm_capacity, needed_tiles)
         padded_batch_size = max(max_grid_size, total_num_tiles_q)
 
         # -- Int Buffer Allocations --
-        size += align16(padded_batch_size * id_size)     # request_indices
-        size += align16(padded_batch_size * id_size)     # qo_tile_indices
-        size += align16(padded_batch_size * id_size)     # kv_tile_indices
-        size += align16((batch_size + 1) * id_size)      # o_indptr
-        size += align16(id_size)                         # kv_chunk_size_ptr
-        
+        size += align16(padded_batch_size * id_size)  # request_indices
+        size += align16(padded_batch_size * id_size)  # qo_tile_indices
+        size += align16(padded_batch_size * id_size)  # kv_tile_indices
+        size += align16((batch_size + 1) * id_size)  # o_indptr
+        size += align16(id_size)  # kv_chunk_size_ptr
+
         # Merge Indptr (Conservative Estimate for Split-KV)
         size += align16((total_qo_len + 1) * id_size)
-        size += align16(padded_batch_size * 1)           # block_valid_mask
+        size += align16(padded_batch_size * 1)  # block_valid_mask
 
         # -- Float Buffer Allocations --
         # FlashInfer allocates float buffers for Split-KV prefill.
         # Crucially, it bounds this by `max_grid_size` (execution parallelism),
         # NOT by `total_num_tiles_q` (data length), otherwise long contexts would OOM.
-        
+
         alloc_units = max_grid_size
-        
+
         # V Buffer: [num_heads, alloc_units, tile_size, head_dim] (Float32)
         # Note: FlashInfer uses float32 for prefill accumulation
         v_size = local_num_qo_heads * alloc_units * cta_tile_q * head_dim * 4
         size += align16(v_size)
-        
+
         # S Buffer: [num_heads, alloc_units, tile_size] (Float32)
         s_size = local_num_qo_heads * alloc_units * cta_tile_q * 4
         size += align16(s_size)

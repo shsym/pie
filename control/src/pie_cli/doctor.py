@@ -27,7 +27,7 @@ def _format_check(name: str, value: str, status: str, width: int = 20) -> Text:
         line.append("✗ ", style="red")
     else:
         line.append("? ", style="dim")
-    
+
     line.append(f"{name:<{width}}", style="white")
     line.append(value, style="dim")
     return line
@@ -36,14 +36,15 @@ def _format_check(name: str, value: str, status: str, width: int = 20) -> Text:
 def _check_system() -> list[tuple[str, str, str]]:
     """Check system info and GPUs."""
     results = []
-    
+
     # Platform
     info = f"{platform.system()} {platform.release()} ({platform.machine()})"
     results.append(("Platform", info, "pass"))
-    
+
     # GPUs
     try:
         import torch
+
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 name = torch.cuda.get_device_name(i)
@@ -54,39 +55,41 @@ def _check_system() -> list[tuple[str, str, str]]:
             results.append(("GPU", "None (CPU only)", "warn"))
     except ImportError:
         results.append(("GPU", "Unknown (PyTorch not installed)", "fail"))
-    
+
     return results
 
 
 def _check_libraries() -> list[tuple[str, str, str]]:
     """Check library installations."""
     results = []
-    
+
     # pie-backend
     try:
-        ver = importlib.metadata.version('pie-backend')
+        ver = importlib.metadata.version("pie-backend")
         results.append(("pie-backend", ver, "pass"))
     except importlib.metadata.PackageNotFoundError:
         results.append(("pie-backend", "Not installed", "warn"))
 
     # pie-client
     try:
-        ver = importlib.metadata.version('pie-client')
+        ver = importlib.metadata.version("pie-client")
         results.append(("pie-client", ver, "pass"))
     except importlib.metadata.PackageNotFoundError:
         results.append(("pie-client", "Not installed", "warn"))
-    
+
     # PyTorch
     try:
         import torch
+
         results.append(("pytorch", torch.__version__, "pass"))
     except ImportError:
         results.append(("pytorch", "Not installed", "fail"))
-    
+
     # FlashInfer
     try:
         import flashinfer  # noqa: F401
-        ver = importlib.metadata.version('flashinfer-python')
+
+        ver = importlib.metadata.version("flashinfer-python")
         results.append(("flashinfer", ver, "pass"))
     except ImportError:
         results.append(("flashinfer", "Not installed", "warn"))
@@ -104,20 +107,20 @@ def _check_libraries() -> list[tuple[str, str, str]]:
     #         results.append(("fbgemm_gpu", ver, "pass"))
     #     except importlib.metadata.PackageNotFoundError:
     #         results.append(("fbgemm_gpu", "Not installed", "warn"))
-    
+
     return results
 
 
 def doctor() -> None:
     """Run environment health check.
-    
+
     Checks platform, GPU availability, and required dependencies
     to verify the system is ready for running the Pie backend.
     """
     console.print()
-    
+
     has_critical_failure = False
-    
+
     # System checks
     system_checks = _check_system()
     lines = Text()
@@ -126,30 +129,38 @@ def doctor() -> None:
             lines.append("\n")
         lines.append_text(_format_check(name, value, status))
     console.print(Panel(lines, title="System", title_align="left", border_style="dim"))
-    
+
     # Library checks
     lib_checks = _check_libraries()
     if any(s == "fail" for _, _, s in lib_checks):
         has_critical_failure = True
-    
+
     lines = Text()
     for i, (name, value, status) in enumerate(lib_checks):
         if i > 0:
             lines.append("\n")
         lines.append_text(_format_check(name, value, status))
-    console.print(Panel(lines, title="Libraries", title_align="left", border_style="dim"))
-    
+    console.print(
+        Panel(lines, title="Libraries", title_align="left", border_style="dim")
+    )
+
     # Summary
     all_checks = system_checks + lib_checks
     total_pass = sum(1 for _, _, s in all_checks if s == "pass")
     total_warn = sum(1 for _, _, s in all_checks if s == "warn")
-    
+
     console.print()
     if has_critical_failure:
-        console.print("[red]✗ Critical issues found. Please resolve before running Pie.[/red]")
+        console.print(
+            "[red]✗ Critical issues found. Please resolve before running Pie.[/red]"
+        )
         raise typer.Exit(1)
     elif total_warn > 0:
-        console.print(f"[yellow]![/yellow] Ready with warnings [dim]({total_pass} passed, {total_warn} warnings)[/dim]")
+        console.print(
+            f"[yellow]![/yellow] Ready with warnings [dim]({total_pass} passed, {total_warn} warnings)[/dim]"
+        )
     else:
-        console.print(f"[green]✓[/green] All checks passed [dim]({total_pass} checks)[/dim]")
+        console.print(
+            f"[green]✓[/green] All checks passed [dim]({total_pass} checks)[/dim]"
+        )
     console.print()

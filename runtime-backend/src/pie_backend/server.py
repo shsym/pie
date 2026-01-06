@@ -29,8 +29,6 @@ from .runtime import Runtime
 from .utils import terminate
 
 
-
-
 def start_server(
     host: str,
     port: int,
@@ -57,16 +55,14 @@ def start_server(
     # Queues for internal communication
     work_request_queue = queue.Queue()
     response_queue = queue.Queue()
-    
+
     # Event to signal all threads to stop
     shutdown_event = threading.Event()
 
     # Define response callback for async handlers
     def response_callback(client_identity, corr_id_bytes, handler_id_bytes, resps):
-        response_queue.put(
-            (client_identity, corr_id_bytes, handler_id_bytes, resps)
-        )
-    
+        response_queue.put((client_identity, corr_id_bytes, handler_id_bytes, resps))
+
     if hasattr(service, "set_response_callback"):
         service.set_response_callback(response_callback)
 
@@ -135,11 +131,11 @@ def start_server(
     finally:
         msg = "Waiting for background threads to finish..."
         log_queue.put({"level": "DEBUG", "message": msg})
-            
+
         # 1. Stop the worker thread first so it stops processing requests/using NCCL
         if worker_t.is_alive():
             worker_t.join(timeout=5.0)
-            
+
         # 2. Now that worker is stopped, it's safe for Rank 0 to use NCCL to stop other ranks
         try:
             service.shutdown()
@@ -154,16 +150,16 @@ def start_server(
             reg_t.join(timeout=2.0)
         if test_t and test_t.is_alive():
             test_t.join(timeout=2.0)
-            
+
         final_msg = "Server shutdown complete."
         log_queue.put({"level": "DEBUG", "message": final_msg})
 
 
 def register_thread(
-    host: str, 
-    port: int, 
-    auth_token: str, 
-    endpoint: str, 
+    host: str,
+    port: int,
+    auth_token: str,
+    endpoint: str,
     shutdown_event: threading.Event,
     log_queue: object | None = None,
 ) -> None:
@@ -176,11 +172,13 @@ def register_thread(
     controller_addr = f"ws://{host}:{port}"
     try:
         with connect(controller_addr) as websocket:
-            auth_msg = encoder.encode({
+            auth_msg = encoder.encode(
+                {
                     "type": "internal_authenticate",
                     "corr_id": 0,
                     "token": auth_token,
-                })
+                }
+            )
 
             if auth_msg is not None:
                 websocket.send(auth_msg)
@@ -192,14 +190,16 @@ def register_thread(
                 shutdown_event.set()
                 return
 
-            reg_msg = encoder.encode({
+            reg_msg = encoder.encode(
+                {
                     "type": "attach_remote_service",
                     "corr_id": 0,
                     "endpoint": endpoint,
                     "service_name": f"service-{random.randint(1000000, 9999999)}",
                     "service_type": "model",
-                })
-            
+                }
+            )
+
             if reg_msg is not None:
                 websocket.send(reg_msg)
 
@@ -214,17 +214,18 @@ def register_thread(
             log_queue.put({"message": success_msg, "level": "DEBUG"})
 
     except (ConnectionRefusedError, TimeoutError) as exc:
-        err_msg = f"Failed to connect to the controller at {controller_addr}. Error: {exc}"
+        err_msg = (
+            f"Failed to connect to the controller at {controller_addr}. Error: {exc}"
+        )
         log_queue.put({"message": err_msg, "level": "ERROR"})
         shutdown_event.set()
 
     except (OSError, ValueError, RuntimeError) as exc:
-        err_msg = f"An unexpected error occurred during registration: {exc}. Terminating."
+        err_msg = (
+            f"An unexpected error occurred during registration: {exc}. Terminating."
+        )
         log_queue.put({"message": err_msg, "level": "ERROR"})
         shutdown_event.set()
-
-
-
 
 
 class HandlerId(enum.Enum):
@@ -240,12 +241,13 @@ class HandlerId(enum.Enum):
     UPLOAD_HANDLER = 7
     DOWNLOAD_HANDLER = 8
 
+
 @torch.inference_mode()
 def worker_thread(
-    work_request_queue: queue.Queue, 
-    response_queue: queue.Queue, 
+    work_request_queue: queue.Queue,
+    response_queue: queue.Queue,
     service: Runtime,
-    shutdown_event: threading.Event
+    shutdown_event: threading.Event,
 ) -> None:
     """Worker thread that processes incoming requests from the controller."""
 
@@ -267,7 +269,9 @@ def worker_thread(
                 case HandlerId.FORWARD_PASS.value:
                     if hasattr(service, "forward_pass_handler_v2"):
                         # Async handler: returns None, sends response via callback
-                        service.forward_pass_handler_v2(reqs, (client_identity, corr_id_bytes, handler_id_bytes))
+                        service.forward_pass_handler_v2(
+                            reqs, (client_identity, corr_id_bytes, handler_id_bytes)
+                        )
                     else:
                         resps = service.forward_pass_handler(reqs)
                 case HandlerId.EMBED_IMAGE.value:
@@ -299,13 +303,13 @@ def io_thread(
     endpoint: str,
     work_queue: queue.Queue,
     response_queue: queue.Queue,
-    shutdown_event: threading.Event
+    shutdown_event: threading.Event,
 ) -> None:
     """Thread that handles ALL ZMQ I/O (listen and response) to ensure thread safety."""
 
     context = zmq.Context()
     socket = context.socket(zmq.ROUTER)
-    
+
     try:
         socket.bind(endpoint)
     except zmq.ZMQError as e:
@@ -320,7 +324,6 @@ def io_thread(
 
     decoders = {
         HandlerId.HANDSHAKE.value: msgspec.msgpack.Decoder(HandshakeRequest),
-
         HandlerId.QUERY.value: msgspec.msgpack.Decoder(QueryRequest),
         HandlerId.FORWARD_PASS.value: msgspec.msgpack.Decoder(ForwardPassRequest),
         HandlerId.EMBED_IMAGE.value: msgspec.msgpack.Decoder(EmbedImageRequest),
@@ -342,17 +345,19 @@ def io_thread(
                 for _ in range(50):
                     resp_item = response_queue.get_nowait()
                     client_identity, corr_id_bytes, handler_id_bytes, resps = resp_item
-                    
-                    response_msg = [client_identity, corr_id_bytes, handler_id_bytes] + [
-                        msgpack_encoder.encode(r) for r in resps
-                    ]
+
+                    response_msg = [
+                        client_identity,
+                        corr_id_bytes,
+                        handler_id_bytes,
+                    ] + [msgpack_encoder.encode(r) for r in resps]
                     socket.send_multipart(response_msg)
             except queue.Empty:
                 pass
 
             # 2. Process Incoming Requests
             # Poll with timeout to allow checking response_queue and shutdown_event
-            socks = dict(poller.poll(timeout=10)) 
+            socks = dict(poller.poll(timeout=10))
 
             if socket in socks and socks[socket] == zmq.POLLIN:
                 message = socket.recv_multipart()
@@ -366,7 +371,7 @@ def io_thread(
                     # corr_id extracted but not used
                     _ = struct.unpack(">I", corr_id_bytes)[0]
                     handler_id = struct.unpack(">I", handler_id_bytes)[0]
-                    
+
                     if handler_id in decoders:
                         reqs = [decoders[handler_id].decode(m) for m in message[3:]]
                     else:

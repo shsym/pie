@@ -68,10 +68,12 @@ def start_engine_and_backend(
 
     # Count expected backends
     expected_backends = 0
-    
+
     # Create log queue for backend communication
     # We use a multiprocessing Manager Queue to ensure it works across process boundaries reliably
-    manager_obj = multiprocessing.Manager()  # Renamed to avoid shadowing 'manager' module
+    manager_obj = (
+        multiprocessing.Manager()
+    )  # Renamed to avoid shadowing 'manager' module
     log_queue = manager_obj.Queue()
 
     # Launch backend processes
@@ -79,23 +81,19 @@ def start_engine_and_backend(
 
     # Start log monitor thread
     import threading
+
     log_monitor_thread = threading.Thread(
-        target=backend_log_monitor,
-        args=(log_queue, console),
-        daemon=True
+        target=backend_log_monitor, args=(log_queue, console), daemon=True
     )
     log_monitor_thread.start()
-    
+
     with console.status("Starting engine...", spinner="dots") as status:
         for model_config in model_configs:
             # Spawn pie-backend directly using multiprocessing
             status.update(f"Spawning backend (pie-backend)...")
             try:
                 process = spawn_python_backend(
-                    engine_config, 
-                    model_config, 
-                    server_handle.internal_token,
-                    log_queue
+                    engine_config, model_config, server_handle.internal_token, log_queue
                 )
                 backend_processes.append(process)
                 expected_backends += 1
@@ -109,14 +107,16 @@ def start_engine_and_backend(
         # Wait for backends to register with the engine
         if expected_backends > 0:
             status.update(f"Waiting for {expected_backends} backend(s) to connect...")
-            if not wait_for_backends(server_handle, expected_backends, timeout, backend_processes):
+            if not wait_for_backends(
+                server_handle, expected_backends, timeout, backend_processes
+            ):
                 console.print("❌ Timeout waiting for backends to connect")
                 for p in backend_processes:
                     p.terminate()
                 server_handle.shutdown()
                 raise typer.Exit(1)
             # Backend connected
-            
+
     # Final success message
     console.print("[green]✓[/green] Engine running. [dim]Press Ctrl+C to stop[/dim]")
 
@@ -166,7 +166,7 @@ def spawn_python_backend(
         "use_cuda_graphs": model_config.get("use_cuda_graphs", True),
         "log_queue": log_queue,
     }
-    
+
     # Remove None values
     backend_kwargs = {k: v for k, v in backend_kwargs.items() if v is not None}
 
@@ -183,48 +183,49 @@ def spawn_python_backend(
 
 def _run_backend_process(**kwargs):
     """Target function for the backend process.
-    
+
     This runs in a separate process and imports/calls pie_backend.main().
     """
 
     from pie_backend.__main__ import main
+
     main(**kwargs)
 
 
 def backend_log_monitor(log_queue: multiprocessing.Queue, console: "Console"):
     """Monitor loop for backend logs."""
     import queue
-    
+
     while True:
         try:
             # Block for a short time to allow check for exit
             record = log_queue.get(timeout=1.0)
-            
+
             level = record.get("level", "INFO")
             msg = record.get("message", "")
-            
+
             if level == "DEBUG":
                 # Suppress DEBUG logs completely for cleaner output
                 # If we really want them, we could add a verbose flag, but for now user wants silence
                 continue
             elif level == "SUCCESS":
-                 console.print(f"  ✅ {msg}")
+                console.print(f"  ✅ {msg}")
             elif level == "WARNING":
-                 console.print(f"  ⚠️ {msg}")
+                console.print(f"  ⚠️ {msg}")
             elif level == "ERROR":
-                 # Errors are important, make them visible
-                 console.print(f"  ❌ [bold red][backend: error][/bold red] {msg}")
+                # Errors are important, make them visible
+                console.print(f"  ❌ [bold red][backend: error][/bold red] {msg}")
             else:
-                 # Standard INFO
-                 level_str = "info"
-            
+                # Standard INFO
+                level_str = "info"
+
             # If msg is "Starting server..." we might want to skip it if it's redundant
             if "Starting server" in msg:
                 continue
 
             # Default dimmed formatting
             console.print(f"[dim]  [backend: {level_str}] {msg}[/dim]")
-                     
+
         except queue.Empty:
             continue
         except (KeyboardInterrupt, EOFError):
@@ -253,34 +254,33 @@ def wait_for_backends(
     """
     start_time = time.time()
     poll_interval = 0.5  # seconds
-    
+
     while time.time() - start_time < timeout:
         # Check if any backend process has died
         if not check_backend_processes(backend_processes):
             return False
-        
+
         # Check registered models
         models = server_handle.registered_models()
         if len(models) >= expected_count:
             return True
-        
-        time.sleep(poll_interval)
-    
-    return False
 
+        time.sleep(poll_interval)
+
+    return False
 
 
 def check_backend_processes(backend_processes: list) -> bool:
     """Check if all backend processes are still alive.
-    
+
     Args:
         backend_processes: List of backend processes to check
-        
+
     Returns:
         True if all processes are alive, False if any have died
     """
     import subprocess
-    
+
     all_alive = True
     for process in backend_processes:
         is_dead = False
@@ -297,13 +297,16 @@ def check_backend_processes(backend_processes: list) -> bool:
             if not process.is_alive():
                 is_dead = True
                 return_code = process.exitcode
-        
+
         if is_dead:
             all_alive = False
-            typer.echo(f"❌ Backend process exited unexpectedly (exit code {return_code})", err=True)
+            typer.echo(
+                f"❌ Backend process exited unexpectedly (exit code {return_code})",
+                err=True,
+            )
             if stderr:
                 typer.echo(f"   stderr: {stderr[:500]}", err=True)
-            
+
     return all_alive
 
 
@@ -319,11 +322,10 @@ def terminate_engine_and_backend(
     """
     import signal
 
-
     for process in backend_processes:
         is_running = False
         pid = process.pid
-        
+
         if isinstance(process, subprocess.Popen):
             is_running = process.poll() is None
         else:
@@ -427,7 +429,9 @@ def run_interactive_shell(engine_config: dict, internal_token: str) -> None:
         elif command == "stat":
             typer.echo("(stat command not yet implemented)")
         else:
-            typer.echo(f"Unknown command: '{command}'. Type 'help' for a list of commands.")
+            typer.echo(
+                f"Unknown command: '{command}'. Type 'help' for a list of commands."
+            )
 
     # Save history
     try:
@@ -453,13 +457,11 @@ def submit_inferlet_and_wait(
     """
     import asyncio
 
-    asyncio.run(_submit_inferlet_async(
-        client_config, 
-        inferlet_path, 
-        arguments,
-        server_handle,
-        backend_processes
-    ))
+    asyncio.run(
+        _submit_inferlet_async(
+            client_config, inferlet_path, arguments, server_handle, backend_processes
+        )
+    )
 
 
 async def _submit_inferlet_async(
@@ -492,7 +494,9 @@ async def _submit_inferlet_async(
     # Start monitoring task if processes provided
     monitor_task = None
     if backend_processes:
-        monitor_task = asyncio.create_task(_monitor_processes_task(server_handle, backend_processes))
+        monitor_task = asyncio.create_task(
+            _monitor_processes_task(server_handle, backend_processes)
+        )
 
     try:
         async with PieClient(server_uri) as client:
@@ -519,20 +523,19 @@ async def _submit_inferlet_async(
             while True:
                 # Wait for either new message or monitor failure
                 recv_task = asyncio.create_task(instance.recv())
-                
+
                 tasks = [recv_task]
                 if monitor_task:
                     tasks.append(monitor_task)
-                
+
                 done, pending = await asyncio.wait(
-                    tasks, 
-                    return_when=asyncio.FIRST_COMPLETED
+                    tasks, return_when=asyncio.FIRST_COMPLETED
                 )
 
                 if monitor_task in done:
                     # Monitor task finished (meaning it raised exception)
                     monitor_task.result()  # Re-raise exception
-                
+
                 # If we get here, recv_task must be done
                 event, message = recv_task.result()
 
@@ -542,6 +545,7 @@ async def _submit_inferlet_async(
                 elif event == Event.Stderr:
                     # Stream stderr to stderr
                     import sys
+
                     print(message, end="", file=sys.stderr, flush=True)
                 elif event == Event.Message:
                     typer.echo(f"[Message] {message}")
@@ -581,7 +585,7 @@ async def _monitor_processes_task(
 ):
     """Async task to monitor backend processes."""
     import asyncio
-    
+
     if not backend_processes:
         return
 
@@ -589,14 +593,13 @@ async def _monitor_processes_task(
         if not check_backend_processes(backend_processes):
             # If any backend dies, we raise an exception to cancel the run
             raise RuntimeError("Backend process died")
-        
+
         # Also check engine if possible
-        if server_handle and hasattr(server_handle, 'is_running'):
+        if server_handle and hasattr(server_handle, "is_running"):
             if not server_handle.is_running():
                 raise RuntimeError("Engine process died")
 
         await asyncio.sleep(1.0)
-
 
 
 def submit_inferlet_from_registry_and_wait(
@@ -615,13 +618,11 @@ def submit_inferlet_from_registry_and_wait(
     """
     import asyncio
 
-    asyncio.run(_submit_inferlet_from_registry_async(
-        client_config, 
-        inferlet_name, 
-        arguments, 
-        server_handle, 
-        backend_processes
-    ))
+    asyncio.run(
+        _submit_inferlet_from_registry_async(
+            client_config, inferlet_name, arguments, server_handle, backend_processes
+        )
+    )
 
 
 async def _submit_inferlet_from_registry_async(
@@ -644,7 +645,9 @@ async def _submit_inferlet_from_registry_async(
     # Start monitoring task if processes provided
     monitor_task = None
     if backend_processes:
-        monitor_task = asyncio.create_task(_monitor_processes_task(server_handle, backend_processes))
+        monitor_task = asyncio.create_task(
+            _monitor_processes_task(server_handle, backend_processes)
+        )
 
     try:
         async with PieClient(server_uri) as client:
@@ -652,32 +655,31 @@ async def _submit_inferlet_from_registry_async(
             await client.internal_authenticate(internal_token)
 
             # Launch the instance from registry
-            #typer.echo(f"Launching {inferlet_name} from registry...")
+            # typer.echo(f"Launching {inferlet_name} from registry...")
             instance = await client.launch_instance_from_registry(
                 inferlet=inferlet_name,
                 arguments=arguments,
                 detached=False,
             )
-            #typer.echo(f"Instance launched: {instance.instance_id}")
+            # typer.echo(f"Instance launched: {instance.instance_id}")
 
             # Stream events until completion
             while True:
                 # Wait for either new message or monitor failure
                 recv_task = asyncio.create_task(instance.recv())
-                
+
                 tasks = [recv_task]
                 if monitor_task:
                     tasks.append(monitor_task)
-                
+
                 done, pending = await asyncio.wait(
-                    tasks, 
-                    return_when=asyncio.FIRST_COMPLETED
+                    tasks, return_when=asyncio.FIRST_COMPLETED
                 )
 
                 if monitor_task in done:
                     # Monitor task finished (meaning it raised exception)
                     monitor_task.result()  # Re-raise exception
-                
+
                 # If we get here, recv_task must be done
                 event, message = recv_task.result()
 
@@ -687,6 +689,7 @@ async def _submit_inferlet_from_registry_async(
                 elif event == Event.Stderr:
                     # Stream stderr to stderr
                     import sys
+
                     print(message, end="", file=sys.stderr, flush=True)
                 elif event == Event.Message:
                     typer.echo(f"[Message] {message}")

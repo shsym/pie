@@ -12,6 +12,7 @@ from . import path as path_utils
 @dataclass
 class ConfigFile:
     """Bakery configuration file structure."""
+
     registry_token: Optional[str] = None
 
     @classmethod

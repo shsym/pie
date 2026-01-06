@@ -92,7 +92,9 @@ def auth_add(
 
     console.print()
     if user_created:
-        console.print(f"[green]✓[/green] Created user '{username}' with key '{key_name}'")
+        console.print(
+            f"[green]✓[/green] Created user '{username}' with key '{key_name}'"
+        )
     else:
         console.print(f"[green]✓[/green] Added key '{key_name}' to '{username}'")
 
@@ -134,9 +136,7 @@ def auth_remove(
         # Remove entire user - prompt for confirmation in interactive mode
         key_count = len(users[username])
         if sys.stdin.isatty():
-            confirm = typer.confirm(
-                f"Remove user '{username}' and {key_count} key(s)?"
-            )
+            confirm = typer.confirm(f"Remove user '{username}' and {key_count} key(s)?")
             if not confirm:
                 console.print("[dim]Cancelled.[/dim]")
                 raise typer.Exit(1)
@@ -152,13 +152,27 @@ def auth_list() -> None:
     auth_path = pie_path.get_authorized_users_path()
 
     if not auth_path.exists():
-        console.print(Panel("[dim]No authorized users[/dim]", title="Authorized Users", title_align="left", border_style="dim"))
+        console.print(
+            Panel(
+                "[dim]No authorized users[/dim]",
+                title="Authorized Users",
+                title_align="left",
+                border_style="dim",
+            )
+        )
         return
 
     users = load_authorized_users(auth_path)
 
     if not users:
-        console.print(Panel("[dim]No authorized users[/dim]", title="Authorized Users", title_align="left", border_style="dim"))
+        console.print(
+            Panel(
+                "[dim]No authorized users[/dim]",
+                title="Authorized Users",
+                title_align="left",
+                border_style="dim",
+            )
+        )
         return
 
     lines = Text()
@@ -170,5 +184,7 @@ def auth_list() -> None:
         lines.append(f"{username:<20}", style="white")
         lines.append(f"{len(user_keys)} keys: {key_names}", style="dim")
 
-    console.print(Panel(lines, title="Authorized Users", title_align="left", border_style="dim"))
+    console.print(
+        Panel(lines, title="Authorized Users", title_align="left", border_style="dim")
+    )
     console.print(f"[dim]{auth_path}[/dim]")

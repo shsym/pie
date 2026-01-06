@@ -309,20 +309,20 @@ random_seed = 42
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      pie serve                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │            Pie Engine (Rust/Tokio)                  │   │
-│  │  • WebSocket server for clients                     │   │
-│  │  • Instance management                              │   │
-│  │  • Program caching                                  │   │
-│  └─────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │            Pie Engine (Rust/Tokio)                  │    │
+│  │  • WebSocket server for clients                     │    │
+│  │  • Instance management                              │    │
+│  │  • Program caching                                  │    │
+│  └─────────────────────────────────────────────────────┘    │
 │                          │ ZMQ                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │           Python Backend (pie-backend)              │   │
-│  │  • Model loading (Hugging Face)                     │   │
-│  │  • Forward pass / batching                          │   │
-│  │  • KV cache management                              │   │
-│  │  • CUDA/Metal acceleration                          │   │
-│  └─────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │           Python Backend (pie-backend)              │    │
+│  │  • Model loading (Hugging Face)                     │    │
+│  │  • Forward pass / batching                          │    │
+│  │  • KV cache management                              │    │
+│  │  • CUDA/Metal acceleration                          │    │
+│  └─────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 ```
 

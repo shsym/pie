@@ -28,6 +28,7 @@ app.add_typer(inferlet_cmd.inferlet_app, name="inferlet")
 # Path expansion callback for typer
 # ============================================================================
 
+
 def expand_path(path: Optional[Path]) -> Optional[Path]:
     """Expand ~ in paths."""
     if path is None:
@@ -38,6 +39,7 @@ def expand_path(path: Optional[Path]) -> Optional[Path]:
 # ============================================================================
 # Login command (Registry authentication)
 # ============================================================================
+
 
 @app.command()
 def login() -> None:
@@ -53,11 +55,19 @@ def login() -> None:
 # Build command
 # ============================================================================
 
+
 @app.command()
 def build(
-    input_path: Annotated[Path, typer.Argument(help="Input file (.js, .ts) or directory with package.json.")],
-    output: Annotated[Path, typer.Option("-o", "--output", help="Output .wasm file path.")],
-    debug: Annotated[bool, typer.Option("--debug", help="Enable debug build (include source maps).")] = False,
+    input_path: Annotated[
+        Path,
+        typer.Argument(help="Input file (.js, .ts) or directory with package.json."),
+    ],
+    output: Annotated[
+        Path, typer.Option("-o", "--output", help="Output .wasm file path.")
+    ],
+    debug: Annotated[
+        bool, typer.Option("--debug", help="Enable debug build (include source maps).")
+    ] = False,
 ) -> None:
     """Build a JavaScript/TypeScript inferlet into a WebAssembly component."""
     try:
@@ -75,11 +85,17 @@ def build(
 # Create command
 # ============================================================================
 
+
 @app.command()
 def create(
     name: Annotated[str, typer.Argument(help="Name of the inferlet project.")],
-    ts: Annotated[bool, typer.Option("--ts", "-t", help="Create a TypeScript project instead of Rust.")] = False,
-    output: Annotated[Optional[Path], typer.Option("-o", "--output", help="Output directory.")] = None,
+    ts: Annotated[
+        bool,
+        typer.Option("--ts", "-t", help="Create a TypeScript project instead of Rust."),
+    ] = False,
+    output: Annotated[
+        Optional[Path], typer.Option("-o", "--output", help="Output directory.")
+    ] = None,
 ) -> None:
     """Create a new inferlet project (Rust by default, or TypeScript with --ts)."""
     try:
@@ -92,6 +108,7 @@ def create(
 # ============================================================================
 # Entry point
 # ============================================================================
+
 
 def main() -> None:
     """Main entry point for the CLI."""

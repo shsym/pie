@@ -12,6 +12,7 @@ from .crypto import ParsedPrivateKey
 
 class Event(Enum):
     """Enumeration for events received from an instance."""
+
     Message = 0
     Completed = 1
     Aborted = 2
@@ -26,6 +27,7 @@ class Event(Enum):
 @dataclass
 class InstanceInfo:
     """Information about a running instance."""
+
     id: str
     arguments: list[str]
     status: str  # "Attached", "Detached", or "Finished"
@@ -39,7 +41,9 @@ class Instance:
         self.instance_id = instance_id
         self.event_queue = self.client.inst_event_queues.get(instance_id)
         if self.event_queue is None:
-            raise Exception(f"Internal error: No event queue for instance {instance_id}")
+            raise Exception(
+                f"Internal error: No event queue for instance {instance_id}"
+            )
 
     async def send(self, message: str):
         """Send a string message to the instance."""
@@ -116,12 +120,17 @@ class PieClient:
                         await self._process_server_message(message)
                     except msgpack.UnpackException:
                         pass
-        except (websockets.ConnectionClosedOK, websockets.ConnectionClosedError, Exception):
+        except (
+            websockets.ConnectionClosedOK,
+            websockets.ConnectionClosedError,
+            Exception,
+        ):
             pass
+
     async def _process_server_message(self, message: dict):
         """Route incoming server messages based on their type."""
         msg_type = message.get("type")
-        
+
         if msg_type == "response":
             corr_id = message.get("corr_id")
             if corr_id in self.pending_requests:
@@ -179,7 +188,7 @@ class PieClient:
                     InstanceInfo(
                         id=inst.get("id"),
                         arguments=inst.get("arguments", []),
-                        status=inst.get("status", "Unknown")
+                        status=inst.get("status", "Unknown"),
                     )
                     for inst in instances_raw
                 ]
@@ -203,13 +212,16 @@ class PieClient:
             if instance_id in self.inst_event_queues:
                 # output is {"Stdout": text} or {"Stderr": text}
                 if "Stdout" in output:
-                    await self.inst_event_queues[instance_id].put((Event.Stdout.value, output["Stdout"]))
+                    await self.inst_event_queues[instance_id].put(
+                        (Event.Stdout.value, output["Stdout"])
+                    )
                 elif "Stderr" in output:
-                    await self.inst_event_queues[instance_id].put((Event.Stderr.value, output["Stderr"]))
+                    await self.inst_event_queues[instance_id].put(
+                        (Event.Stderr.value, output["Stderr"])
+                    )
 
         elif msg_type == "download_blob":
             await self._handle_blob_chunk(message)
-
 
     async def _handle_blob_chunk(self, message: dict):
         """Processes a chunk of a blob sent from the server, ensuring sequential order."""
@@ -236,8 +248,15 @@ class PieClient:
         download = self.pending_downloads[blob_hash]
 
         # Validate chunk consistency and order
-        if total_chunks != download["total_chunks"] or chunk_index != download["next_chunk_index"] - 1:
-            error_msg = "Chunk count mismatch" if total_chunks != download["total_chunks"] else "Out-of-order chunk"
+        if (
+            total_chunks != download["total_chunks"]
+            or chunk_index != download["next_chunk_index"] - 1
+        ):
+            error_msg = (
+                "Chunk count mismatch"
+                if total_chunks != download["total_chunks"]
+                else "Out-of-order chunk"
+            )
 
             del self.pending_downloads[blob_hash]
             return
@@ -250,7 +269,9 @@ class PieClient:
             completed_blob = bytes(download["buffer"])
             computed_hash = blake3.blake3(completed_blob).hexdigest()
             if computed_hash == blob_hash:
-                await self.inst_event_queues[instance_id].put((Event.Blob.value, completed_blob))
+                await self.inst_event_queues[instance_id].put(
+                    (Event.Blob.value, completed_blob)
+                )
 
             del self.pending_downloads[blob_hash]
 
@@ -268,7 +289,6 @@ class PieClient:
             except asyncio.CancelledError:
                 pass  # Expected on cancellation
 
-
     def _get_next_corr_id(self):
         """Generate a unique correlation ID for a request."""
         self.corr_id_counter += 1
@@ -285,13 +305,11 @@ class PieClient:
         return await future
 
     async def authenticate(
-        self,
-        username: str,
-        private_key: ParsedPrivateKey | None = None
+        self, username: str, private_key: ParsedPrivateKey | None = None
     ) -> None:
         """
         Authenticate the client with the server using public key authentication.
-        
+
         :param username: The username to authenticate as.
         :param private_key: The private key for signing the challenge.
                            Required if the server has authentication enabled.
@@ -300,43 +318,45 @@ class PieClient:
         # Send identification request
         msg = {"type": "identification", "username": username}
         successful, result = await self._send_msg_and_wait(msg)
-        
+
         if not successful:
             raise Exception(f"Username '{username}' rejected by server: {result}")
-        
+
         # Check if server has disabled authentication
         if result == "Authenticated (Engine disabled authentication)":
 
             return
-        
+
         # Server returned a challenge - we need to sign it
         if private_key is None:
             raise Exception(
                 "Server requires public key authentication but no private key provided"
             )
-        
+
         # Decode the base64-encoded challenge
         try:
             challenge = base64.b64decode(result)
         except Exception as e:
             raise Exception(f"Failed to decode challenge from server: {e}")
-        
+
         # Sign the challenge
         signature_bytes = private_key.sign(challenge)
-        signature_b64 = base64.b64encode(signature_bytes).decode('utf-8')
-        
+        signature_b64 = base64.b64encode(signature_bytes).decode("utf-8")
+
         # Send the signature
         msg = {"type": "signature", "signature": signature_b64}
         successful, result = await self._send_msg_and_wait(msg)
-        
+
         if not successful:
-            raise Exception(f"Signature verification failed for username '{username}': {result}")
+            raise Exception(
+                f"Signature verification failed for username '{username}': {result}"
+            )
 
     async def internal_authenticate(self, token: str) -> None:
         """
         Authenticate the client with the server using an internal token.
         This is used for internal communication (backend <-> engine, shell <-> engine).
-        
+
         :param token: The internal authentication token.
         :raises Exception: If authentication fails.
         """
@@ -374,7 +394,9 @@ class PieClient:
         chunk_size = 256 * 1024
         total_size = len(data_bytes)
         # An empty upload is still one chunk of zero bytes
-        total_chunks = (total_size + chunk_size - 1) // chunk_size if total_size > 0 else 1
+        total_chunks = (
+            (total_size + chunk_size - 1) // chunk_size if total_size > 0 else 1
+        )
 
         corr_id = self._get_next_corr_id()
         msg_template["corr_id"] = corr_id
@@ -382,14 +404,16 @@ class PieClient:
 
         if total_size == 0:
             msg = msg_template.copy()
-            msg.update({"chunk_index": 0, "chunk_data": b''})
+            msg.update({"chunk_index": 0, "chunk_data": b""})
             await self.ws.send(msgpack.packb(msg, use_bin_type=True))
         else:
             for chunk_index in range(total_chunks):
                 start = chunk_index * chunk_size
                 end = min(start + chunk_size, total_size)
                 msg = msg_template.copy()
-                msg.update({"chunk_index": chunk_index, "chunk_data": data_bytes[start:end]})
+                msg.update(
+                    {"chunk_index": chunk_index, "chunk_data": data_bytes[start:end]}
+                )
                 await self.ws.send(msgpack.packb(msg, use_bin_type=True))
 
         future = asyncio.get_event_loop().create_future()
@@ -398,7 +422,6 @@ class PieClient:
 
         if not successful:
             raise Exception(f"{upload_type.replace('_', ' ').title()} failed: {result}")
-
 
         return result
 
@@ -411,14 +434,18 @@ class PieClient:
     async def upload_blob(self, instance_id: str, blob_bytes: bytes):
         """Upload a blob of data to a specific instance in chunks."""
         blob_hash = blake3.blake3(blob_bytes).hexdigest()
-        template = {"type": "upload_blob", "instance_id": instance_id, "blob_hash": blob_hash}
+        template = {
+            "type": "upload_blob",
+            "instance_id": instance_id,
+            "blob_hash": blob_hash,
+        }
         await self._upload_chunked(blob_bytes, template)
 
     async def launch_instance(
         self,
         program_hash: str,
         arguments: list[str] | None = None,
-        detached: bool = False
+        detached: bool = False,
     ) -> Instance:
         """Launch an instance of a program."""
         corr_id = self._get_next_corr_id()
@@ -429,32 +456,29 @@ class PieClient:
             "arguments": arguments or [],
             "detached": detached,
         }
-        
+
         future = asyncio.get_event_loop().create_future()
         self.pending_launch_requests[corr_id] = future
         encoded = msgpack.packb(msg, use_bin_type=True)
         await self.ws.send(encoded)
-        
+
         successful, instance_id = await future
-        
+
         if successful:
             return Instance(self, instance_id)
         raise Exception(f"Failed to launch instance: {instance_id}")
 
     async def launch_instance_from_registry(
-        self,
-        inferlet: str,
-        arguments: list[str] | None = None,
-        detached: bool = False
+        self, inferlet: str, arguments: list[str] | None = None, detached: bool = False
     ) -> Instance:
         """
         Launch an instance of an inferlet from the registry.
-        
+
         The inferlet parameter can be:
         - Full name with version: "std/text-completion@0.1.0"
         - Without namespace (defaults to "std"): "text-completion@0.1.0"
         - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
-        
+
         :param inferlet: The inferlet name (e.g., "std/text-completion@0.1.0").
         :param arguments: Command-line arguments to pass to the inferlet.
         :param detached: If True, the instance runs in detached mode.
@@ -468,14 +492,14 @@ class PieClient:
             "arguments": arguments or [],
             "detached": detached,
         }
-        
+
         future = asyncio.get_event_loop().create_future()
         self.pending_launch_requests[corr_id] = future
         encoded = msgpack.packb(msg, use_bin_type=True)
         await self.ws.send(encoded)
-        
+
         successful, instance_id = await future
-        
+
         if successful:
             return Instance(self, instance_id)
         raise Exception(f"Failed to launch instance from registry: {instance_id}")
@@ -483,7 +507,7 @@ class PieClient:
     async def attach_instance(self, instance_id: str) -> Instance:
         """
         Attach to an existing detached instance.
-        
+
         :param instance_id: The UUID of the instance to attach to.
         :return: An Instance object for the attached instance.
         :raises Exception: If attachment fails.
@@ -494,14 +518,14 @@ class PieClient:
             "corr_id": corr_id,
             "instance_id": instance_id,
         }
-        
+
         future = asyncio.get_event_loop().create_future()
         self.pending_attach_requests[corr_id] = (future, instance_id)
         encoded = msgpack.packb(msg, use_bin_type=True)
         await self.ws.send(encoded)
-        
+
         successful, result = await future
-        
+
         if successful:
             return Instance(self, instance_id)
         raise Exception(f"Failed to attach to instance: {result}")
@@ -509,23 +533,23 @@ class PieClient:
     async def list_instances(self) -> list[InstanceInfo]:
         """
         Get a list of all running instances on the server.
-        
+
         :return: List of InstanceInfo objects.
         """
         corr_id = self._get_next_corr_id()
         msg = {"type": "list_instances", "corr_id": corr_id}
-        
+
         future = asyncio.get_event_loop().create_future()
         self.pending_list_requests[corr_id] = future
         encoded = msgpack.packb(msg, use_bin_type=True)
         await self.ws.send(encoded)
-        
+
         return await future
 
     async def ping(self) -> None:
         """
         Ping the server to check connectivity.
-        
+
         :raises Exception: If ping fails.
         """
         msg = {"type": "ping"}
@@ -535,13 +559,17 @@ class PieClient:
 
     async def signal_instance(self, instance_id: str, message: str):
         """Send a signal/message to a running instance (fire-and-forget)."""
-        msg = {"type": "signal_instance", "instance_id": instance_id, "message": message}
+        msg = {
+            "type": "signal_instance",
+            "instance_id": instance_id,
+            "message": message,
+        }
         await self.ws.send(msgpack.packb(msg, use_bin_type=True))
 
     async def terminate_instance(self, instance_id: str) -> None:
         """
         Request the server to terminate a running instance.
-        
+
         :param instance_id: The UUID of the instance to terminate.
         :raises Exception: If termination fails.
         """
@@ -549,4 +577,3 @@ class PieClient:
         successful, result = await self._send_msg_and_wait(msg)
         if not successful:
             raise Exception(f"Failed to terminate instance: {result}")
-

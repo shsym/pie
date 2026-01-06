@@ -27,11 +27,10 @@ config_app = typer.Typer(help="Manage configuration.")
 app.add_typer(config_app, name="config")
 
 
-
-
 # ============================================================================
 # Path expansion callback for typer
 # ============================================================================
+
 
 def expand_path(path: Optional[Path]) -> Optional[Path]:
     """Expand ~ in paths."""
@@ -66,22 +65,16 @@ UsernameOption = Annotated[
 
 PrivateKeyPathOption = Annotated[
     Optional[Path],
-    typer.Option("--private-key-path", help="Path to the private key file for authentication."),
+    typer.Option(
+        "--private-key-path", help="Path to the private key file for authentication."
+    ),
 ]
-
-
-
-
-
-
-
-
-
 
 
 # ============================================================================
 # Submit command
 # ============================================================================
+
 
 @app.command()
 def submit(
@@ -91,9 +84,17 @@ def submit(
     port: PortOption = None,
     username: UsernameOption = None,
     private_key_path: PrivateKeyPathOption = None,
-    detached: Annotated[bool, typer.Option("-d", "--detached", help="Run the inferlet in detached mode.")] = False,
-    link: Annotated[Optional[list[Path]], typer.Option("-l", "--link", help="Paths to .wasm library files to link.")] = None,
-    arguments: Annotated[Optional[list[str]], typer.Argument(help="Arguments to pass to the inferlet.")] = None,
+    detached: Annotated[
+        bool,
+        typer.Option("-d", "--detached", help="Run the inferlet in detached mode."),
+    ] = False,
+    link: Annotated[
+        Optional[list[Path]],
+        typer.Option("-l", "--link", help="Paths to .wasm library files to link."),
+    ] = None,
+    arguments: Annotated[
+        Optional[list[str]], typer.Argument(help="Arguments to pass to the inferlet.")
+    ] = None,
 ) -> None:
     """Submit an inferlet to a running Pie engine."""
     try:
@@ -116,6 +117,7 @@ def submit(
 # ============================================================================
 # Ping command
 # ============================================================================
+
 
 @app.command()
 def ping(
@@ -143,6 +145,7 @@ def ping(
 # List command
 # ============================================================================
 
+
 @app.command("list")
 def list_instances(
     config: ConfigOption = None,
@@ -150,8 +153,12 @@ def list_instances(
     port: PortOption = None,
     username: UsernameOption = None,
     private_key_path: PrivateKeyPathOption = None,
-    full: Annotated[bool, typer.Option("--full", help="Display the full UUID.")] = False,
-    long: Annotated[bool, typer.Option("--long", help="Display the first 8 characters of the UUID.")] = False,
+    full: Annotated[
+        bool, typer.Option("--full", help="Display the full UUID.")
+    ] = False,
+    long: Annotated[
+        bool, typer.Option("--long", help="Display the first 8 characters of the UUID.")
+    ] = False,
 ) -> None:
     """List all running inferlet instances."""
     try:
@@ -173,9 +180,12 @@ def list_instances(
 # Attach command
 # ============================================================================
 
+
 @app.command()
 def attach(
-    instance_id_prefix: Annotated[str, typer.Argument(help="Prefix or full UUID of the instance to attach to.")],
+    instance_id_prefix: Annotated[
+        str, typer.Argument(help="Prefix or full UUID of the instance to attach to.")
+    ],
     config: ConfigOption = None,
     host: HostOption = None,
     port: PortOption = None,
@@ -201,9 +211,12 @@ def attach(
 # Abort command
 # ============================================================================
 
+
 @app.command()
 def abort(
-    instance_id_prefix: Annotated[str, typer.Argument(help="Prefix or full UUID of the instance to terminate.")],
+    instance_id_prefix: Annotated[
+        str, typer.Argument(help="Prefix or full UUID of the instance to terminate.")
+    ],
     config: ConfigOption = None,
     host: HostOption = None,
     port: PortOption = None,
@@ -229,10 +242,16 @@ def abort(
 # Config subcommands
 # ============================================================================
 
+
 @config_app.command("init")
 def config_init(
-    enable_auth: Annotated[bool, typer.Option("--enable-auth/--no-auth", help="Enable authentication.")] = True,
-    path: Annotated[Optional[str], typer.Option("--path", help="Path where the config file should be saved.")] = None,
+    enable_auth: Annotated[
+        bool, typer.Option("--enable-auth/--no-auth", help="Enable authentication.")
+    ] = True,
+    path: Annotated[
+        Optional[str],
+        typer.Option("--path", help="Path where the config file should be saved."),
+    ] = None,
 ) -> None:
     """Create a default config file."""
     try:
@@ -244,12 +263,25 @@ def config_init(
 
 @config_app.command("update")
 def config_update(
-    host: Annotated[Optional[str], typer.Option("--host", help="Host to connect to.")] = None,
-    port: Annotated[Optional[int], typer.Option("--port", help="Port to connect to.")] = None,
-    username: Annotated[Optional[str], typer.Option("--username", help="Username for authentication.")] = None,
-    private_key_path: Annotated[Optional[str], typer.Option("--private-key-path", help="Path to private key file.")] = None,
-    enable_auth: Annotated[Optional[bool], typer.Option("--enable-auth", help="Enable authentication.")] = None,
-    path: Annotated[Optional[str], typer.Option("--path", help="Path to the config file to update.")] = None,
+    host: Annotated[
+        Optional[str], typer.Option("--host", help="Host to connect to.")
+    ] = None,
+    port: Annotated[
+        Optional[int], typer.Option("--port", help="Port to connect to.")
+    ] = None,
+    username: Annotated[
+        Optional[str], typer.Option("--username", help="Username for authentication.")
+    ] = None,
+    private_key_path: Annotated[
+        Optional[str],
+        typer.Option("--private-key-path", help="Path to private key file."),
+    ] = None,
+    enable_auth: Annotated[
+        Optional[bool], typer.Option("--enable-auth", help="Enable authentication.")
+    ] = None,
+    path: Annotated[
+        Optional[str], typer.Option("--path", help="Path to the config file to update.")
+    ] = None,
 ) -> None:
     """Update the entries of the default config file."""
     try:
@@ -268,7 +300,9 @@ def config_update(
 
 @config_app.command("show")
 def config_show(
-    path: Annotated[Optional[str], typer.Option("--path", help="Path to the config file to show.")] = None,
+    path: Annotated[
+        Optional[str], typer.Option("--path", help="Path to the config file to show.")
+    ] = None,
 ) -> None:
     """Show the content of the default config file."""
     try:
@@ -281,6 +315,7 @@ def config_show(
 # ============================================================================
 # Entry point
 # ============================================================================
+
 
 def main() -> None:
     """Main entry point for the CLI."""

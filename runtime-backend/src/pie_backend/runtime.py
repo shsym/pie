@@ -52,33 +52,33 @@ class PendingResult:
 class Runtime:
     """
     Main runtime orchestrator for PIE inference.
-    
+
     This class has been refactored to focus on protocol handling,
     delegating loading to ModelLoader and batch management to BatchBuilder.
     """
 
     config: RuntimeConfig
-    
+
     # Model components (renamed from forward_pass to engine to avoid collision)
     engine: llama3.ForwardPass
     model_config: llama3.ModelConfig
     kv_cache_at_layer: list[torch.Tensor]
-    
+
     # Adapter state
     adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]]
     adapters: dict
-    
+
     # Batch management
     batch_builder: BatchBuilder
     batch: Batch | None
-    
+
     # Logging
     log_queue: object | None
 
     def __init__(self, config: RuntimeConfig, log_queue: object | None = None):
         """
         Initialize the runtime.
-        
+
         Args:
             config: Runtime configuration
             log_queue: Optional queue for sending logs back to controller
@@ -88,23 +88,22 @@ class Runtime:
         self.log_queue = log_queue
         self.adapters = {}
         self.batch = None
-        
+
         # Async Execution - 2 Stage Pipeline
         # Stage 1: worker_thread (in server.py) receives requests and enqueues
         # Stage 2: execution_loop drains queue, builds batch, executes
         self.request_queue = queue.Queue()
         self.response_callback = None
-        
+
         self.execution_thread = threading.Thread(
-            target=self.execution_loop,
-            daemon=True
+            target=self.execution_loop, daemon=True
         )
         self.execution_thread.start()
 
         # Initialize seeds
         msg = f"Initializing with random seed: {config.random_seed}"
         self.log_queue.put({"message": msg, "level": "DEBUG"})
-            
+
         random.seed(config.random_seed)
         np.random.seed(config.random_seed)
         torch.manual_seed(config.random_seed)
@@ -113,12 +112,12 @@ class Runtime:
 
         # Load model weights using ModelLoader
         loader = ModelLoader(config)
-        
+
         msg = "Loading model weights"
         self.log_queue.put({"message": msg, "level": "DEBUG"})
-            
+
         weights, normalized_arch, self.info = loader.load()
-        
+
         # Store snapshot_dir for tokenizer loading
         self.snapshot_dir = loader.snapshot_dir
 
@@ -133,10 +132,12 @@ class Runtime:
             case "llama3" | "l4ma":
                 # Create model config
                 self.model_config = llama3.ModelConfig.from_dict(normalized_arch)
-                
+
                 # Evaluate and store max_num_kv_pages in config FIRST (needed for ForwardPass)
-                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
-                
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(
+                    config
+                )
+
                 # Create forward pass with weights
                 self.engine = llama3.ForwardPass(
                     self.model_config,
@@ -151,19 +152,19 @@ class Runtime:
                 self.kv_cache_at_layer = llama3.create_kv_cache(
                     self.model_config, config
                 )
-                
+
                 # Warmup CUDA graphs
                 self.engine.warmup_cuda_graphs(self.kv_cache_at_layer)
-                
-                
 
             case "qwen2":
                 # Create model config
                 self.model_config = qwen2.ModelConfig.from_dict(normalized_arch)
-                
+
                 # Evaluate and store max_num_kv_pages in config FIRST
-                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
-                
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(
+                    config
+                )
+
                 # Create forward pass with weights
                 self.engine = qwen2.ForwardPass(
                     self.model_config,
@@ -178,16 +179,16 @@ class Runtime:
                 self.kv_cache_at_layer = qwen2.create_kv_cache(
                     self.model_config, config
                 )
-                
 
-                
             case "qwen3":
                 # Create model config
                 self.model_config = qwen3.ModelConfig.from_dict(normalized_arch)
-                
+
                 # Evaluate and store max_num_kv_pages in config FIRST
-                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
-                
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(
+                    config
+                )
+
                 # Create forward pass with weights
                 self.engine = qwen3.ForwardPass(
                     self.model_config,
@@ -203,16 +204,16 @@ class Runtime:
                 self.kv_cache_at_layer = qwen3.create_kv_cache(
                     self.model_config, config
                 )
-                
 
-                
             case "gptoss":
                 # Create model config
                 self.model_config = gpt_oss.ModelConfig.from_dict(normalized_arch)
-                
+
                 # Evaluate and store max_num_kv_pages in config FIRST
-                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(config)
-                
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(
+                    config
+                )
+
                 # Create forward pass with weights
                 self.engine = gpt_oss.ForwardPass(
                     self.model_config,
@@ -237,9 +238,6 @@ class Runtime:
             max_dist_size=config.max_dist_size,
             adapters=self.adapters,
         )
-    
-
-
 
     # ========================================================================
     # Metadata Accessors
@@ -261,11 +259,11 @@ class Runtime:
                 "template_content": "",
                 "stop_tokens": [],
             }
-        
+
         # Load tokenizer info from HuggingFace
         tokenizer_info = hf_utils.load_hf_tokenizer(self.snapshot_dir)
         chat_template = tokenizer_info.get("chat_template", "")
-        
+
         # Determine stop tokens from special tokens
         special_tokens = tokenizer_info.get("special_tokens", {})
         stop_tokens = []
@@ -273,7 +271,7 @@ class Runtime:
         for token_name in ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "</s>"]:
             if token_name in special_tokens:
                 stop_tokens.append(token_name)
-        
+
         return {
             "template_type": "minijinja" if chat_template else "none",
             "template_content": chat_template,
@@ -291,13 +289,15 @@ class Runtime:
                 "special_tokens": {},
                 "escape_non_printable": False,
             }
-        
+
         # Load tokenizer info from HuggingFace
         tokenizer_info = hf_utils.load_hf_tokenizer(self.snapshot_dir)
-        
+
         return {
             "type": tokenizer_info.get("type", "bpe"),
-            "num_vocab": tokenizer_info.get("num_vocab", self.engine.weights.get("embed_token").shape[0]),
+            "num_vocab": tokenizer_info.get(
+                "num_vocab", self.engine.weights.get("embed_token").shape[0]
+            ),
             "merge_table": tokenizer_info.get("merge_table", {}),
             "split_regex": tokenizer_info.get("split_regex", ""),
             "special_tokens": tokenizer_info.get("special_tokens", {}),
@@ -314,7 +314,7 @@ class Runtime:
         metadata = self.get_metadata()
         template = self.get_chat_template()
         tokenizer = self.get_tokenizer()
-        
+
         responses = []
         for _ in reqs:
             resp = message.HandshakeResponse(
@@ -341,11 +341,7 @@ class Runtime:
             responses.append(resp)
         return responses
 
-
-
-    def query(
-        self, reqs: list[message.QueryRequest]
-    ) -> list[message.QueryResponse]:
+    def query(self, reqs: list[message.QueryRequest]) -> list[message.QueryResponse]:
         """Handle query requests."""
         responses = []
         for req in reqs:
@@ -361,7 +357,7 @@ class Runtime:
     ) -> list[message.ForwardPassResponse]:
         """
         Handle batched forward pass inference requests.
-        
+
         Note: This method was renamed from forward_pass to avoid collision
         with the forward_pass property. For backward compatibility, the
         server.py handler should call this method.
@@ -386,7 +382,6 @@ class Runtime:
         """
         self.request_queue.put((reqs, metadata))
 
-
     @torch.inference_mode()
     def execution_loop(self):
         """
@@ -398,13 +393,13 @@ class Runtime:
                 item = self.request_queue.get()
             except Exception:
                 break
-                
+
             if item is None:
                 break
 
             # Start collecting items to process
             pending_items = [item]
-            
+
             # Drain queue to accumulate more requests for better batching
             while True:
                 try:
@@ -414,67 +409,81 @@ class Runtime:
                     pending_items.append(next_item)
                 except queue.Empty:
                     break
-            
+
             # Create Result Objects
             pending_results = []
-            for (reqs, metadata) in pending_items:
+            for reqs, metadata in pending_items:
                 pending_results.append(PendingResult(len(reqs), metadata))
 
             # Build and execute batches
             curr_cursor_per_item = [0] * len(pending_items)
-            
+
             while True:
                 batch_mapping = []  # (PendingResult, req_idx)
                 batch_full = False
-                
+
                 for item_idx, (reqs, _) in enumerate(pending_items):
                     start_idx = curr_cursor_per_item[item_idx]
                     if start_idx >= len(reqs):
                         continue
-                        
+
                     for i, req in enumerate(reqs[start_idx:]):
                         self.batch_builder.add_request(req)
                         batch_mapping.append((pending_results[item_idx], start_idx + i))
-                        
+
                         current_batch = self.batch_builder.current_batch
                         if current_batch:
                             # Check 1: Max tokens
-                            is_full_tokens = current_batch.total_tokens >= self.config.max_batch_tokens
-                            
+                            is_full_tokens = (
+                                current_batch.total_tokens
+                                >= self.config.max_batch_tokens
+                            )
+
                             # Check 2: Max requests (batch size)
                             is_full_size = False
                             if self.config.max_batch_size:
-                                is_full_size = len(current_batch.requests) >= self.config.max_batch_size
-                                
+                                is_full_size = (
+                                    len(current_batch.requests)
+                                    >= self.config.max_batch_size
+                                )
+
                             if is_full_tokens or is_full_size:
                                 batch_full = True
                                 break
-                    
-                    items_added = sum(1 for (pr, _) in batch_mapping if pr is pending_results[item_idx] and _ >= start_idx)
+
+                    items_added = sum(
+                        1
+                        for (pr, _) in batch_mapping
+                        if pr is pending_results[item_idx] and _ >= start_idx
+                    )
                     curr_cursor_per_item[item_idx] += items_added
-                    
+
                     if batch_full:
                         break
-                
+
                 if not self.batch_builder.is_empty():
                     # Execute batch directly (on GPU)
                     responses = self._execute_batch()
-                    
+
                     # Send responses
                     if self.response_callback:
-                        for resp, (pending_result, req_idx) in zip(responses, batch_mapping):
+                        for resp, (pending_result, req_idx) in zip(
+                            responses, batch_mapping
+                        ):
                             if pending_result.add_response(req_idx, resp):
-                                self.response_callback(*pending_result.metadata, pending_result.resps)
+                                self.response_callback(
+                                    *pending_result.metadata, pending_result.resps
+                                )
                 else:
                     break
-                
+
                 if not batch_full:
                     break
-                    
-
 
     @torch.inference_mode()
-    def _execute_prepared_batch(self, inputs, sampling_metadata, batch) -> list[message.ForwardPassResponse]:
+    def _execute_prepared_batch(
+        self, inputs, sampling_metadata, batch
+    ) -> list[message.ForwardPassResponse]:
         """
         Execute a batch that has already been prepared.
         """
@@ -483,7 +492,7 @@ class Runtime:
             msg = {
                 "type": "STEP",
                 "inputs": inputs,
-                "sampling_metadata": sampling_metadata
+                "sampling_metadata": sampling_metadata,
             }
             utils.broadcast_struct(msg, src=0, device=self.config.device)
 
@@ -500,9 +509,7 @@ class Runtime:
         # TODO: implement image embedding
         pass
 
-    def initialize_adapter(
-        self, reqs: list[message.InitializeAdapterRequest]
-    ) -> None:
+    def initialize_adapter(self, reqs: list[message.InitializeAdapterRequest]) -> None:
         """Initialize adapter functionality."""
         for req in reqs:
             adapter_ptr = req.adapter_ptr
@@ -518,10 +525,7 @@ class Runtime:
 
             if self.config.world_size > 1:
                 # Broadcast INIT_ADAPTER command
-                msg = {
-                    "type": "INIT_ADAPTER",
-                    "kwargs": args
-                }
+                msg = {"type": "INIT_ADAPTER", "kwargs": args}
                 utils.broadcast_struct(msg, src=0, device=self.config.device)
 
             self._initialize_adapter(**args)
@@ -538,10 +542,7 @@ class Runtime:
 
             if self.config.world_size > 1:
                 # Broadcast UPDATE_ADAPTER command
-                msg = {
-                    "type": "UPDATE_ADAPTER",
-                    "kwargs": args
-                }
+                msg = {"type": "UPDATE_ADAPTER", "kwargs": args}
                 utils.broadcast_struct(msg, src=0, device=self.config.device)
 
             self._update_adapter(**args)
@@ -553,29 +554,22 @@ class Runtime:
             data = req.adapter_data
             if isinstance(data, list):
                 data = bytes(data)
-            
-            args = {
-                "adapter_ptr": req.adapter_ptr,
-                "name": req.name,
-                "data": data
-            }
-            
+
+            args = {"adapter_ptr": req.adapter_ptr, "name": req.name, "data": data}
+
             if self.config.world_size > 1:
                 # Broadcast UPLOAD_ADAPTER command
                 # We do NOT include the data in the broadcast for now to avoid massive traffic
                 # Each rank must load it? Or rank 0 loads and broadcasts weights?
-                # The CmaesAdapter implementation handles broadcasting/sharding OF THE WEIGHTS 
+                # The CmaesAdapter implementation handles broadcasting/sharding OF THE WEIGHTS
                 # inside .upload() if we wanted, but currently it just loads from file.
                 # However, since we are moving to in-memory, we might need rank 0 to broadcast.
                 # BUT: The current architecture assumes the CLIENT sends the request to the server.
                 # If we are using multi-GPU, we need consistent state.
                 # For now, let's assume we pass the data down.
-                msg = {
-                    "type": "UPLOAD_ADAPTER",
-                    "kwargs": args
-                }
+                msg = {"type": "UPLOAD_ADAPTER", "kwargs": args}
                 utils.broadcast_struct(msg, src=0, device=self.config.device)
-            
+
             self._upload_adapter(**args)
 
     def _upload_adapter(self, adapter_ptr: int, name: str, data: bytes) -> None:
@@ -588,7 +582,7 @@ class Runtime:
                 # Current CmaesAdapter implementation expects rank-specific checkpoints
                 if self.config.world_size > 1:
                     name = f"{name}_rank{self.config.rank}"
-                
+
                 adapter.upload(name, data)
 
     def download_adapter(
@@ -597,25 +591,19 @@ class Runtime:
         """Download adapter weights."""
         resps = []
         for req in reqs:
-            args = {
-                "adapter_ptr": req.adapter_ptr,
-                "name": req.name
-            }
-            
+            args = {"adapter_ptr": req.adapter_ptr, "name": req.name}
+
             if self.config.world_size > 1:
                 # Broadcast DOWNLOAD_ADAPTER command
-                msg = {
-                    "type": "DOWNLOAD_ADAPTER",
-                    "kwargs": args
-                }
+                msg = {"type": "DOWNLOAD_ADAPTER", "kwargs": args}
                 utils.broadcast_struct(msg, src=0, device=self.config.device)
-                
+
             data = self._download_adapter(**args)
-            
+
             # Pack response (only Rank 0 returns data to client)
             resp = message.DownloadAdapterResponse(adapter_data=data)
             resps.append(resp)
-            
+
         return resps
 
     def _download_adapter(self, adapter_ptr: int, name: str) -> bytes:
@@ -625,7 +613,7 @@ class Runtime:
                 # For multi-GPU, append rank to filename to save rank-specific shards
                 if self.config.world_size > 1:
                     name = f"{name}_rank{self.config.rank}"
-                    
+
                 return adapter.download(name)
         return b""
 
@@ -644,24 +632,26 @@ class Runtime:
         initial_sigma: float,
     ):
         cfg = self.model_config
-        
+
         # Check if adapter limits are exceeded
         if adapter_ptr >= self.config.max_num_adapters:
-             raise ValueError(f"Adapter pointer {adapter_ptr} exceeds max_num_adapters {self.config.max_num_adapters}")
+            raise ValueError(
+                f"Adapter pointer {adapter_ptr} exceeds max_num_adapters {self.config.max_num_adapters}"
+            )
         # print parameters
-        #print(f"Initializing adapter {adapter_ptr} with rank {rank}, alpha {alpha}, population size {population_size}, mu fraction {mu_fraction}, initial sigma {initial_sigma}")
+        # print(f"Initializing adapter {adapter_ptr} with rank {rank}, alpha {alpha}, population size {population_size}, mu fraction {mu_fraction}, initial sigma {initial_sigma}")
         # Calculate local shard sizes for distributed adapters
         world_size = self.config.world_size
         gpu_rank = self.config.rank
-        
+
         local_num_q_heads = cfg.num_q_heads // world_size
         local_num_kv_heads = cfg.num_kv_heads // world_size
-        
+
         # Local output features (sharded up-projection)
         local_out_features = [
             cfg.dim_head * local_num_q_heads,
             cfg.dim_head * local_num_kv_heads,
-            cfg.dim_head * local_num_kv_heads
+            cfg.dim_head * local_num_kv_heads,
         ]
 
         # Initialize adapter
@@ -710,36 +700,36 @@ class Runtime:
         """
         import torch.distributed as dist
         import signal
-        
+
         # Re-enable SIGTERM handling so this worker can be terminated
         # by the parent process during shutdown
         shutdown_requested = False
-        
+
         def sigterm_handler(signum, frame):
             nonlocal shutdown_requested
             shutdown_requested = True
-        
+
         signal.signal(signal.SIGTERM, sigterm_handler)
         signal.signal(signal.SIGINT, sigterm_handler)
-        
+
         device = self.config.device
-        
+
         while not shutdown_requested:
             # Receive control message
             try:
                 msg = utils.broadcast_struct(None, src=0, device=device)
             except Exception:
                 break
-                
+
             if shutdown_requested:
                 break
-                
+
             if msg == "STOP":
                 break
-                
+
             if isinstance(msg, dict):
                 msg_type = msg.get("type")
-                
+
                 if msg_type == "STEP":
                     # Execute inference step
                     inputs = msg["inputs"]
@@ -751,7 +741,7 @@ class Runtime:
                         print(f"Worker {self.config.rank} _run_step error: {e}")
                         # Sync CUDA to clear any pending operations
                         torch.cuda.synchronize()
-                    
+
                 elif msg_type == "INIT_ADAPTER":
                     # Initialize adapter
                     kwargs = msg["kwargs"]
@@ -771,24 +761,22 @@ class Runtime:
                     # Download adapter
                     kwargs = msg["kwargs"]
                     self._download_adapter(**kwargs)
-                    
+
             # Other message types can be added here
 
     def _run_step(self, inputs: dict, sampling_metadata: dict) -> list:
         """
         Execute a single inference step (Embed -> Transform -> Sample).
-        
+
         Returns:
             Sampling results (only valid on Rank 0 usually, but we return whatever comes out)
         """
         if self.config.world_size > 1:
             torch.distributed.barrier()
 
-
-
         # 2. Embed inputs
         input_embeds = self.engine.embed_inputs(inputs)
-        
+
         # 3. Use raw indices/seeds to create local AdapterSubpass (to avoid device mismatch)
         adapter_subpass = None
         if inputs.get("adapter_indices"):
@@ -814,11 +802,11 @@ class Runtime:
             adapter_subpass=adapter_subpass,
             total_pages_cpu=inputs.get("total_pages_cpu", 0),
         )
-        
+
         # 4. Sampling Pass
         # Pass hidden_states (replicated or sharded? Transform returns replicated in current llama3.py)
         sampling_results = self.engine.sample(hidden_states, sampling_metadata)
-        
+
         return sampling_results
 
     @torch.inference_mode()
@@ -828,19 +816,19 @@ class Runtime:
         """
         batch = self.batch_builder.build()
         device = self.config.device
-        sampling_metadata = batch.get_sampling_metadata(device, self.config.activation_dtype)
+        sampling_metadata = batch.get_sampling_metadata(
+            device, self.config.activation_dtype
+        )
 
-
-        
         inputs = batch.get_model_inputs(device)
-        
+
         # Broadcast if needed
         if self.config.world_size > 1:
             # Broadcast Step command
             msg = {
                 "type": "STEP",
                 "inputs": inputs,
-                "sampling_metadata": sampling_metadata
+                "sampling_metadata": sampling_metadata,
             }
 
             utils.broadcast_struct(msg, src=0, device=device)
@@ -856,10 +844,9 @@ class Runtime:
     def shutdown(self):
         """
         Cleanup runtime resources.
-        
+
         For Rank 0 in multi-GPU setup, this broadcasts the 'STOP' signal to workers.
         """
         if self.config.world_size > 1 and self.config.rank == 0:
             print("Broadcasting STOP signal to workers...")
             utils.broadcast_struct("STOP", src=0, device=self.config.device)
-

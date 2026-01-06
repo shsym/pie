@@ -13,9 +13,11 @@ from blake3 import blake3
 import numpy as np
 
 from tqdm.auto import tqdm
-os.environ['HF_DATASETS_OFFLINE'] = "1"
+
+os.environ["HF_DATASETS_OFFLINE"] = "1"
 # Assume pie is an installed library
 from pie_client import PieClient, Instance, Event
+
 # Use the refactored dataset imports
 from countdown import CountdownDataset
 from openr1math import OpenR1MathDataset
@@ -25,9 +27,11 @@ from openr1math import OpenR1MathDataset
 # 1. Configuration Class
 # ==============================================================================
 
+
 @dataclass
 class TrainingConfig:
     """Configuration settings for the ES training run."""
+
     # --- Server and Paths ---
     SERVER_URIS: List[str] = field(default_factory=lambda: ["ws://127.0.0.1:8080"])
     SCRIPT_DIR: Path = Path(__file__).resolve().parent
@@ -67,8 +71,6 @@ class TrainingConfig:
     EVAL_EVERY_N_STEPS: int = 2
     EVAL_TASKS_PER_WORKER: int = 1
 
-
-
     # --- Logging ---
     VERBOSE_WORKER_LOGS: bool = False
 
@@ -86,16 +88,19 @@ class TrainingConfig:
 # 2. Utility and Helper Functions
 # ==============================================================================
 
+
 async def launch_and_get_result(
-        client: PieClient,
-        program_hash: str,
-        arguments: List[str],
-        worker_id: Any = 0,
-        verbose: bool = False,
+    client: PieClient,
+    program_hash: str,
+    arguments: List[str],
+    worker_id: Any = 0,
+    verbose: bool = False,
 ) -> Optional[str]:
     """Launches an inferlet and returns the final message."""
     if verbose:
-        tqdm.write(f"🚀 Worker {worker_id}: Launching instance with hash {program_hash[:8]}...")
+        tqdm.write(
+            f"🚀 Worker {worker_id}: Launching instance with hash {program_hash[:8]}..."
+        )
     instance = await client.launch_instance(program_hash, arguments=arguments)
     final_payload = None
     while True:
@@ -104,20 +109,25 @@ async def launch_and_get_result(
             final_payload = message
             if event == Event.Completed:
                 if verbose:
-                    tqdm.write(f"✅ Worker {worker_id}: Instance {instance.instance_id} finished.")
+                    tqdm.write(
+                        f"✅ Worker {worker_id}: Instance {instance.instance_id} finished."
+                    )
                 break
-        elif event in (Event.Aborted, Event.Exception, Event.ServerError, Event.OutOfResources):
-            #tqdm.write(f"⚠️ Worker {worker_id}: Instance {instance.instance_id} failed with event {event}. Msg: {message}")
+        elif event in (
+            Event.Aborted,
+            Event.Exception,
+            Event.ServerError,
+            Event.OutOfResources,
+        ):
+            # tqdm.write(f"⚠️ Worker {worker_id}: Instance {instance.instance_id} failed with event {event}. Msg: {message}")
             break
     return final_payload
-
-
-
 
 
 # ==============================================================================
 # 3. Core Logic: ESOrchestrator Class
 # ==============================================================================
+
 
 class ESOrchestrator:
     """Manages the state and execution of the ES training process."""
@@ -155,15 +165,19 @@ class ESOrchestrator:
         tqdm.write("\n" + "=" * 50)
         tqdm.write(f"🚀 Starting ES Training Loop with {len(self.clients)} client(s)")
         tqdm.write("=" * 50)
-        #tqdm.write("\n🔬 Running initial evaluation before training...")
-        #initial_eval_metrics = await self._run_evaluation(step=0)
+        # tqdm.write("\n🔬 Running initial evaluation before training...")
+        # initial_eval_metrics = await self._run_evaluation(step=0)
 
-        #tqdm.write("✅ Initial evaluation complete.")
+        # tqdm.write("✅ Initial evaluation complete.")
         for step in range(1, self.config.TRAINING_STEPS + 1):
             start_time = time.time()
             tqdm.write(f"\n--- Step {step}/{self.config.TRAINING_STEPS} ---")
-            base_seeds = np.random.randint(-2 ** 63, 2 ** 63 - 1, size=self.config.POPULATION_SIZE, dtype=np.int64)
-            rollout_results = await self._run_distributed_rollouts(base_seeds, self.train_dataset, self.config.NUM_ROLLOUTS_PER_WORKER)
+            base_seeds = np.random.randint(
+                -(2**63), 2**63 - 1, size=self.config.POPULATION_SIZE, dtype=np.int64
+            )
+            rollout_results = await self._run_distributed_rollouts(
+                base_seeds, self.train_dataset, self.config.NUM_ROLLOUTS_PER_WORKER
+            )
             scores, metrics = self._score_and_aggregate(base_seeds, rollout_results)
             await self._run_update_phase(base_seeds, scores, step)
             step_duration = time.time() - start_time
@@ -173,12 +187,14 @@ class ESOrchestrator:
                 f"Step {step}: mean_reward={metrics['mean_reward']:.4f} | "
                 f"episodes={metrics['num_finished_episodes']} | duration={step_duration:.1f}s"
             )
-            if step % self.config.EVAL_EVERY_N_STEPS == 0 or step == self.config.TRAINING_STEPS:
+            if (
+                step % self.config.EVAL_EVERY_N_STEPS == 0
+                or step == self.config.TRAINING_STEPS
+            ):
                 eval_metrics = await self._run_evaluation(step)
                 metrics.update(eval_metrics)
 
         tqdm.write("\n🎉 Training finished!")
-
 
     async def teardown(self):
         """Clean up resources."""
@@ -186,16 +202,20 @@ class ESOrchestrator:
 
         tqdm.write("Resources cleaned up.")
 
-
-
     def _load_datasets(self):
         """Loads the training and evaluation datasets based on config."""
         tqdm.write(f"💿 Loading dataset: {self.config.DATASET_NAME}")
         if self.config.DATASET_NAME == "countdown":
-            self.train_dataset = CountdownDataset(self.config.DATA_PATH, "train", self.config.DATASET_TEST_SIZE)
-            self.eval_dataset = CountdownDataset(self.config.DATA_PATH, "test", self.config.DATASET_TEST_SIZE)
+            self.train_dataset = CountdownDataset(
+                self.config.DATA_PATH, "train", self.config.DATASET_TEST_SIZE
+            )
+            self.eval_dataset = CountdownDataset(
+                self.config.DATA_PATH, "test", self.config.DATASET_TEST_SIZE
+            )
         elif self.config.DATASET_NAME == "math":
-            self.train_dataset = OpenR1MathDataset("train", self.config.DATASET_TEST_SIZE)
+            self.train_dataset = OpenR1MathDataset(
+                "train", self.config.DATASET_TEST_SIZE
+            )
             self.eval_dataset = OpenR1MathDataset("test", self.config.DATASET_TEST_SIZE)
         else:
             raise ValueError(f"Unknown dataset name: {self.config.DATASET_NAME}")
@@ -212,7 +232,8 @@ class ESOrchestrator:
             program_hash = blake3(program_bytes).hexdigest()
             upload_tasks = [
                 client.upload_program(program_bytes)
-                for client in self.clients if not await client.program_exists(program_hash)
+                for client in self.clients
+                if not await client.program_exists(program_hash)
             ]
             if upload_tasks:
                 tqdm.write(f"Uploading {wasm_path.name} ({program_hash[:8]})...")
@@ -224,23 +245,42 @@ class ESOrchestrator:
         """Initializes the ES adapter on all clients."""
         tqdm.write("\n⚙️  Initializing ES Adapter on all clients...")
         init_args = [
-            "--name", self.config.ADAPTER_NAME, "--rank", str(self.config.LORA_RANK),
-            "--alpha", str(self.config.LORA_ALPHA), "--population-size", str(self.config.POPULATION_SIZE),
-            "--mu-fraction", str(self.config.MU_FRACTION), "--initial-sigma", str(self.config.INITIAL_SIGMA),
+            "--name",
+            self.config.ADAPTER_NAME,
+            "--rank",
+            str(self.config.LORA_RANK),
+            "--alpha",
+            str(self.config.LORA_ALPHA),
+            "--population-size",
+            str(self.config.POPULATION_SIZE),
+            "--mu-fraction",
+            str(self.config.MU_FRACTION),
+            "--initial-sigma",
+            str(self.config.INITIAL_SIGMA),
         ]
         if self.config.INITIAL_CHECKPOINT_NAME:
-            tqdm.write(f"📂 Loading initial checkpoint: {self.config.INITIAL_CHECKPOINT_NAME}")
+            tqdm.write(
+                f"📂 Loading initial checkpoint: {self.config.INITIAL_CHECKPOINT_NAME}"
+            )
             init_args.extend(["--upload", self.config.INITIAL_CHECKPOINT_NAME])
         else:
             init_args.extend(["--upload", ""])
         init_tasks = [
-            launch_and_get_result(client, self.program_hashes["es-init"], init_args, f"C{i}-Init", self.config.VERBOSE_WORKER_LOGS)
+            launch_and_get_result(
+                client,
+                self.program_hashes["es-init"],
+                init_args,
+                f"C{i}-Init",
+                self.config.VERBOSE_WORKER_LOGS,
+            )
             for i, client in enumerate(self.clients)
         ]
         await asyncio.gather(*init_tasks)
         tqdm.write("✅ Adapter initialized on all clients.")
 
-    async def _run_distributed_rollouts(self, base_seeds, dataset, batch_size, desc="rollout"):
+    async def _run_distributed_rollouts(
+        self, base_seeds, dataset, batch_size, desc="rollout"
+    ):
         """Manages distributed rollouts with an intelligent, adaptive scheduling strategy."""
         if desc == "evaluation":
             num_tasks = len(dataset)
@@ -248,7 +288,10 @@ class ESOrchestrator:
             seeds_to_run = base_seeds
         else:
             num_tasks = self.config.POPULATION_SIZE * self.config.TASKS_PER_SEED
-            task_indices = np.random.choice(len(dataset), size=(self.config.POPULATION_SIZE, self.config.TASKS_PER_SEED))
+            task_indices = np.random.choice(
+                len(dataset),
+                size=(self.config.POPULATION_SIZE, self.config.TASKS_PER_SEED),
+            )
             all_tasks = [dataset[i] for i in task_indices.flatten()]
             seeds_to_run = np.repeat(base_seeds, self.config.TASKS_PER_SEED)
 
@@ -262,10 +305,18 @@ class ESOrchestrator:
             max_capacity_val = self.max_train_capacity_per_client
 
         if not capacity_dict:
-            initial_tasks_per_worker = np.ceil(num_tasks / len(self.clients)) if self.clients else 0
-            initial_capacity = int(np.ceil(initial_tasks_per_worker / batch_size)) if batch_size > 0 else 1
+            initial_tasks_per_worker = (
+                np.ceil(num_tasks / len(self.clients)) if self.clients else 0
+            )
+            initial_capacity = (
+                int(np.ceil(initial_tasks_per_worker / batch_size))
+                if batch_size > 0
+                else 1
+            )
             initial_capacity = max(1, initial_capacity)
-            tqdm.write(f"🔧 Initializing {desc} client capacity to a max of {initial_capacity} concurrent batches.")
+            tqdm.write(
+                f"🔧 Initializing {desc} client capacity to a max of {initial_capacity} concurrent batches."
+            )
             if desc == "evaluation":
                 self.max_eval_capacity_per_client = initial_capacity
             else:
@@ -276,21 +327,40 @@ class ESOrchestrator:
 
         queue_lock = asyncio.Lock()
         results = {"texts": [], "seeds": [], "tasks": []}
-        pbar = tqdm(total=num_tasks, desc=f"Step {desc}", dynamic_ncols=True, leave=False)
+        pbar = tqdm(
+            total=num_tasks, desc=f"Step {desc}", dynamic_ncols=True, leave=False
+        )
         try:
             client_tasks = []
-            for i, (client, uri) in enumerate(zip(self.clients, self.config.SERVER_URIS)):
+            for i, (client, uri) in enumerate(
+                zip(self.clients, self.config.SERVER_URIS)
+            ):
                 current_capacity = capacity_dict.get(uri, 1)
-                task = asyncio.create_task(self._client_rollout_worker(
-                    client, uri, self.program_hashes["es-rollout"],
-                    work_queue, queue_lock, f"C{i}", pbar, batch_size,
-                    current_capacity
-                ))
+                task = asyncio.create_task(
+                    self._client_rollout_worker(
+                        client,
+                        uri,
+                        self.program_hashes["es-rollout"],
+                        work_queue,
+                        queue_lock,
+                        f"C{i}",
+                        pbar,
+                        batch_size,
+                        current_capacity,
+                    )
+                )
                 client_tasks.append(task)
 
             all_worker_results = await asyncio.gather(*client_tasks)
             total_preemptions = 0
-            for texts_i, seeds_i, tasks_i, uri_i, preemptions_i, peak_concurrency_i in all_worker_results:
+            for (
+                texts_i,
+                seeds_i,
+                tasks_i,
+                uri_i,
+                preemptions_i,
+                peak_concurrency_i,
+            ) in all_worker_results:
                 results["texts"].extend(texts_i)
                 results["seeds"].extend(seeds_i)
                 results["tasks"].extend(tasks_i)
@@ -302,13 +372,17 @@ class ESOrchestrator:
                     # Set the new capacity to this observed value for a much faster adjustment.
                     new_cap = max(1, peak_concurrency_i)
                     if new_cap < old_cap:
-                        tqdm.write(f"📉 Preemption on {uri_i}. Adjusting {desc} capacity based on observed peak: {old_cap} -> {new_cap}")
+                        tqdm.write(
+                            f"📉 Preemption on {uri_i}. Adjusting {desc} capacity based on observed peak: {old_cap} -> {new_cap}"
+                        )
                         capacity_dict[uri_i] = new_cap
                 else:
                     # No preemption, cautiously probe upwards.
                     new_cap = min(max_capacity_val, int(old_cap * 1.3))
                     if new_cap != old_cap:
-                        tqdm.write(f"📈 No preemption on {uri_i}. Probing higher {desc} capacity: {old_cap} -> {new_cap}")
+                        tqdm.write(
+                            f"📈 No preemption on {uri_i}. Probing higher {desc} capacity: {old_cap} -> {new_cap}"
+                        )
                         capacity_dict[uri_i] = new_cap
         finally:
             pbar.close()
@@ -319,7 +393,10 @@ class ESOrchestrator:
 
     def _score_and_aggregate(self, base_seeds, rollout_results):
         """Scores generations and aggregates them by seed using generic verifier."""
-        reward_infos = [task["verifier"](text) for text, task in zip(rollout_results["texts"], rollout_results["tasks"])]
+        reward_infos = [
+            task["verifier"](text)
+            for text, task in zip(rollout_results["texts"], rollout_results["tasks"])
+        ]
         scores = [float(ri.get("reward", 0.0)) for ri in reward_infos]
         format_rewards = [float(ri.get("format_reward", 0.0)) for ri in reward_infos]
         answer_rewards = [float(ri.get("answer_reward", 0.0)) for ri in reward_infos]
@@ -334,17 +411,25 @@ class ESOrchestrator:
             else:
                 aggregated_scores.append(0.0)
                 missing_seeds += 1
-        mu_k = max(1, int(np.ceil(self.config.MU_FRACTION * self.config.POPULATION_SIZE)))
+        mu_k = max(
+            1, int(np.ceil(self.config.MU_FRACTION * self.config.POPULATION_SIZE))
+        )
         out_lens = [len(t.split()) for t in rollout_results["texts"]]
         metrics = {
             "mean_reward": float(np.mean(scores)) if scores else 0.0,
-            "mean_format_reward": float(np.mean(format_rewards)) if format_rewards else 0.0,
-            "mean_answer_reward": float(np.mean(answer_rewards)) if answer_rewards else 0.0,
+            "mean_format_reward": (
+                float(np.mean(format_rewards)) if format_rewards else 0.0
+            ),
+            "mean_answer_reward": (
+                float(np.mean(answer_rewards)) if answer_rewards else 0.0
+            ),
             "std_reward": float(np.std(scores)) if scores else 0.0,
             "num_finished_episodes": len(rollout_results["texts"]),
             "mean_response_len": float(np.mean(out_lens)) if out_lens else 0.0,
             "es/mean_population_score": float(np.mean(aggregated_scores)),
-            "es/mean_fittest_score": float(np.mean(sorted(aggregated_scores, reverse=True)[:mu_k])),
+            "es/mean_fittest_score": float(
+                np.mean(sorted(aggregated_scores, reverse=True)[:mu_k])
+            ),
             "rollout/missing_seeds": missing_seeds,
             "rollout/total_preemptions": rollout_results.get("total_preemptions", 0),
             "rollout/client_capacities": rollout_results.get("client_capacities", {}),
@@ -357,15 +442,27 @@ class ESOrchestrator:
         seeds_str = ",".join(map(str, base_seeds))
         scores_str = ",".join(f"{s:.6f}" for s in aggregated_scores)
         update_args = [
-            "--name", self.config.ADAPTER_NAME, "--seeds", seeds_str, "--scores", scores_str,
-            "--max-sigma", str(self.config.MAX_SIGMA),
+            "--name",
+            self.config.ADAPTER_NAME,
+            "--seeds",
+            seeds_str,
+            "--scores",
+            scores_str,
+            "--max-sigma",
+            str(self.config.MAX_SIGMA),
         ]
         if step > 0 and step % self.config.CHECKPOINT_EVERY_N_STEPS == 0:
             checkpoint_name = f"{self.config.ADAPTER_NAME}-step-{step}"
             tqdm.write(f"💾 Saving checkpoint: {checkpoint_name}")
             update_args.extend(["--download", checkpoint_name])
         update_tasks = [
-            launch_and_get_result(client, self.program_hashes["es-update"], update_args, f"C{i}-Update", self.config.VERBOSE_WORKER_LOGS)
+            launch_and_get_result(
+                client,
+                self.program_hashes["es-update"],
+                update_args,
+                f"C{i}-Update",
+                self.config.VERBOSE_WORKER_LOGS,
+            )
             for i, client in enumerate(self.clients)
         ]
         await asyncio.gather(*update_tasks)
@@ -377,9 +474,15 @@ class ESOrchestrator:
         num_eval_tasks = len(self.eval_dataset)
         eval_seeds = np.zeros(num_eval_tasks, dtype=np.int64)
         results = await self._run_distributed_rollouts(
-            eval_seeds, self.eval_dataset, self.config.EVAL_TASKS_PER_WORKER, desc="evaluation"
+            eval_seeds,
+            self.eval_dataset,
+            self.config.EVAL_TASKS_PER_WORKER,
+            desc="evaluation",
         )
-        reward_infos = [task["verifier"](text) for text, task in zip(results["texts"], results["tasks"])]
+        reward_infos = [
+            task["verifier"](text)
+            for text, task in zip(results["texts"], results["tasks"])
+        ]
         scores = [float(ri.get("reward", 0.0)) for ri in reward_infos]
         format_rewards = [float(ri.get("format_reward", 0.0)) for ri in reward_infos]
         answer_rewards = [float(ri.get("answer_reward", 0.0)) for ri in reward_infos]
@@ -387,10 +490,13 @@ class ESOrchestrator:
 
         metrics = {
             "eval/mean_reward": np.mean(scores) if scores else 0.0,
-            "eval/mean_format_reward": np.mean(format_rewards) if format_rewards else 0.0,
-            "eval/mean_answer_reward": np.mean(answer_rewards) if answer_rewards else 0.0,
+            "eval/mean_format_reward": (
+                np.mean(format_rewards) if format_rewards else 0.0
+            ),
+            "eval/mean_answer_reward": (
+                np.mean(answer_rewards) if answer_rewards else 0.0
+            ),
             "eval/duration_seconds": time.time() - eval_start_time,
-
             "eval/total_preemptions": results.get("total_preemptions", 0),
             "eval/client_capacities": results.get("client_capacities", {}),
         }
@@ -401,18 +507,25 @@ class ESOrchestrator:
         """Helper to run a single batch."""
         rollouts = []
         for seed, task in zip(seeds, tasks):
-            hasher = blake3(str(seed).encode('utf-8'))
-            task_problem_str = task.get('problem', str(task))
-            hasher.update(task_problem_str.encode('utf-8'))
+            hasher = blake3(str(seed).encode("utf-8"))
+            task_problem_str = task.get("problem", str(task))
+            hasher.update(task_problem_str.encode("utf-8"))
             uid = hasher.hexdigest()
             rollouts.append({"uid": uid, "task": task_problem_str, "seed": int(seed)})
         rollouts_json = json.dumps(rollouts)
         args = [
-            "--name", self.config.ADAPTER_NAME, "--rollouts", rollouts_json,
-            "--max-num-outputs", str(self.config.MAX_TOKENS_GEN),
-            "--system-prompt", self.config.SYSTEM_PROMPT,
+            "--name",
+            self.config.ADAPTER_NAME,
+            "--rollouts",
+            rollouts_json,
+            "--max-num-outputs",
+            str(self.config.MAX_TOKENS_GEN),
+            "--system-prompt",
+            self.config.SYSTEM_PROMPT,
         ]
-        res_json = await launch_and_get_result(client, program_hash, args, who, self.config.VERBOSE_WORKER_LOGS)
+        res_json = await launch_and_get_result(
+            client, program_hash, args, who, self.config.VERBOSE_WORKER_LOGS
+        )
         if res_json:
             try:
                 texts = json.loads(res_json)
@@ -424,8 +537,16 @@ class ESOrchestrator:
         return None
 
     async def _client_rollout_worker(
-            self, client, server_uri, program_hash, work_queue, queue_lock, client_id, pbar, batch_size,
-            capacity
+        self,
+        client,
+        server_uri,
+        program_hash,
+        work_queue,
+        queue_lock,
+        client_id,
+        pbar,
+        batch_size,
+        capacity,
     ):
         """
         The core logic for a single client worker. It now also tracks and returns the
@@ -452,14 +573,19 @@ class ESOrchestrator:
 
         async with queue_lock:
             for _ in range(capacity):
-                if not work_queue: break
+                if not work_queue:
+                    break
                 batch_limit = min(batch_size, len(work_queue))
                 new_work = [work_queue.popleft() for _ in range(batch_limit)]
                 if new_work:
                     seeds, tasks = zip(*new_work)
                     who = f"{client_id}-B{batch_num}"
                     batch_num += 1
-                    task = asyncio.create_task(self._run_batch(client, program_hash, list(seeds), list(tasks), who))
+                    task = asyncio.create_task(
+                        self._run_batch(
+                            client, program_hash, list(seeds), list(tasks), who
+                        )
+                    )
                     running_tasks.add(task)
                     task_meta[task] = (list(seeds), list(tasks))
 
@@ -468,7 +594,9 @@ class ESOrchestrator:
             while running_tasks:
                 # --- NEW: Update peak concurrency before waiting ---
 
-                done, pending_tasks = await asyncio.wait(running_tasks, return_when=asyncio.FIRST_COMPLETED)
+                done, pending_tasks = await asyncio.wait(
+                    running_tasks, return_when=asyncio.FIRST_COMPLETED
+                )
                 newly_created_tasks = set()
                 for task in done:
                     async with queue_lock:
@@ -482,14 +610,27 @@ class ESOrchestrator:
                             pbar.update(len(seeds))
                             if work_queue:
                                 batch_limit = min(batch_size, len(work_queue))
-                                new_work = [work_queue.popleft() for _ in range(batch_limit)]
+                                new_work = [
+                                    work_queue.popleft() for _ in range(batch_limit)
+                                ]
                                 if new_work:
                                     new_seeds, new_tasks = zip(*new_work)
                                     who = f"{client_id}-B{batch_num}"
                                     batch_num += 1
-                                    new_task = asyncio.create_task(self._run_batch(client, program_hash, list(new_seeds), list(new_tasks), who))
+                                    new_task = asyncio.create_task(
+                                        self._run_batch(
+                                            client,
+                                            program_hash,
+                                            list(new_seeds),
+                                            list(new_tasks),
+                                            who,
+                                        )
+                                    )
                                     newly_created_tasks.add(new_task)
-                                    task_meta[new_task] = (list(new_seeds), list(new_tasks))
+                                    task_meta[new_task] = (
+                                        list(new_seeds),
+                                        list(new_tasks),
+                                    )
                         else:
                             num_preempted += len(seeds)
                             peak_concurrency = len(running_tasks)
@@ -500,12 +641,20 @@ class ESOrchestrator:
             monitor_task.cancel()
 
         # --- MODIFIED: Return peak_concurrency for intelligent feedback ---
-        return texts_out, seeds_out, tasks_out, server_uri, num_preempted, peak_concurrency
+        return (
+            texts_out,
+            seeds_out,
+            tasks_out,
+            server_uri,
+            num_preempted,
+            peak_concurrency,
+        )
 
 
 # ==============================================================================
 # 4. Main Execution Block
 # ==============================================================================
+
 
 async def main():
     """High-level entry point to configure and run the training orchestrator."""

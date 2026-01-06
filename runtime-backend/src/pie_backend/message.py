@@ -53,9 +53,6 @@ class QueryResponse(msgspec.Struct, gc=False):
     value: str
 
 
-
-
-
 class ForwardPassRequest(msgspec.Struct, gc=False):
     """Request message for forward pass inference."""
 

@@ -40,13 +40,34 @@ class AttentionCompiler(BaseShaderCompiler):
         )
 
         param_replacements = [
-            ("const int num_qo = params.num_qo;", "const int num_qo = (int)params_raw[0];"),
-            ("const int head_dim = params.head_dim;", "const int head_dim = (int)params_raw[1];"),
-            ("const int kv_head_dim = params.kv_head_dim;", "const int kv_head_dim = (int)params_raw[2];"),
-            ("const int head_size = params.head_size;", "const int head_size = (int)params_raw[3];"),
-            ("const int page_size = params.page_size;", "const int page_size = (int)params_raw[4];"),
-            ("const int num_query_heads = params.num_query_heads;", "const int num_query_heads = (int)params_raw[5];"),
-            ("const int num_kv_heads = params.num_kv_heads;", "const int num_kv_heads = (int)params_raw[6];"),
+            (
+                "const int num_qo = params.num_qo;",
+                "const int num_qo = (int)params_raw[0];",
+            ),
+            (
+                "const int head_dim = params.head_dim;",
+                "const int head_dim = (int)params_raw[1];",
+            ),
+            (
+                "const int kv_head_dim = params.kv_head_dim;",
+                "const int kv_head_dim = (int)params_raw[2];",
+            ),
+            (
+                "const int head_size = params.head_size;",
+                "const int head_size = (int)params_raw[3];",
+            ),
+            (
+                "const int page_size = params.page_size;",
+                "const int page_size = (int)params_raw[4];",
+            ),
+            (
+                "const int num_query_heads = params.num_query_heads;",
+                "const int num_query_heads = (int)params_raw[5];",
+            ),
+            (
+                "const int num_kv_heads = params.num_kv_heads;",
+                "const int num_kv_heads = (int)params_raw[6];",
+            ),
             ("const float scale = params.scale;", "const float scale = params_raw[7];"),
         ]
 
@@ -62,8 +83,12 @@ class AttentionCompiler(BaseShaderCompiler):
 
         if self._compile_shader(full_source, "attention"):
             # Warmup prefill kernels
-            self._warmup_kernel("attention", "batch_prefill_attention_unified_fp16_simdgroup_kernel")
-            self._warmup_kernel("attention", "batch_prefill_attention_unified_f32_simdgroup_kernel")
+            self._warmup_kernel(
+                "attention", "batch_prefill_attention_unified_fp16_simdgroup_kernel"
+            )
+            self._warmup_kernel(
+                "attention", "batch_prefill_attention_unified_f32_simdgroup_kernel"
+            )
             # Warmup decode kernels
             for head_dim in [64, 128]:
                 self._warmup_kernel("attention", f"attention_decode_v2_fp16_{head_dim}")
@@ -106,8 +131,13 @@ class AttentionCompiler(BaseShaderCompiler):
         )
 
         result = self._run_full_attention(
-            query, kv_cache, kv_page_indices, kv_page_indptr,
-            kv_last_page_lens, qo_indptr, output
+            query,
+            kv_cache,
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens,
+            qo_indptr,
+            output,
         )
 
         if original_dtype != result.dtype:
@@ -132,9 +162,11 @@ class AttentionCompiler(BaseShaderCompiler):
         _num_pages, _, page_size, num_kv_heads, _ = kv_cache.shape
 
         if head_dim > 128:
-            raise ValueError(f"Head dimension {head_dim} exceeds Metal kernel limit of 128.")
+            raise ValueError(
+                f"Head dimension {head_dim} exceeds Metal kernel limit of 128."
+            )
 
-        scale = 1.0 / (head_dim ** 0.5)
+        scale = 1.0 / (head_dim**0.5)
 
         params_data = [
             num_tokens,
@@ -159,13 +191,20 @@ class AttentionCompiler(BaseShaderCompiler):
             kernel_name = f"attention_decode_v2_{dtype_prefix}_{head_dim}"
 
             if not hasattr(lib, kernel_name):
-                raise RuntimeError(f"Decode kernel {kernel_name} not found. Supported head_dim: 64, 128")
+                raise RuntimeError(
+                    f"Decode kernel {kernel_name} not found. Supported head_dim: 64, 128"
+                )
 
             getattr(lib, kernel_name)(
-                q_input, paged_kv_cache,
-                qo_indptr.to(torch.int32), kv_page_indptr.to(torch.int32),
-                kv_page_indices.to(torch.int32), kv_last_page_lens.to(torch.int32),
-                output, params, debug_out,
+                q_input,
+                paged_kv_cache,
+                qo_indptr.to(torch.int32),
+                kv_page_indptr.to(torch.int32),
+                kv_page_indices.to(torch.int32),
+                kv_last_page_lens.to(torch.int32),
+                output,
+                params,
+                debug_out,
                 threads=(num_heads * 1024, 1, 1),
                 group_size=(1024, 1, 1),
             )
@@ -184,10 +223,15 @@ class AttentionCompiler(BaseShaderCompiler):
             total_threads_y = num_heads
 
             getattr(lib, kernel_name)(
-                q_input, paged_kv_cache,
-                qo_indptr.to(torch.int32), kv_page_indptr.to(torch.int32),
-                kv_page_indices.to(torch.int32), kv_last_page_lens.to(torch.int32),
-                output, params, debug_out,
+                q_input,
+                paged_kv_cache,
+                qo_indptr.to(torch.int32),
+                kv_page_indptr.to(torch.int32),
+                kv_page_indices.to(torch.int32),
+                kv_last_page_lens.to(torch.int32),
+                output,
+                params,
+                debug_out,
                 threads=(total_threads_x, total_threads_y, 1),
                 group_size=(threads_per_threadgroup, 1, 1),
             )

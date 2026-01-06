@@ -22,8 +22,7 @@ def run(
         None, help="Inferlet name from registry (e.g., 'std/text-completion@0.1.0')"
     ),
     path: Optional[Path] = typer.Option(
-        None, "--path", "-p",
-        help="Path to a local .wasm inferlet file"
+        None, "--path", "-p", help="Path to a local .wasm inferlet file"
     ),
     config: Optional[Path] = typer.Option(
         None, "--config", "-c", help="Path to TOML configuration file"
@@ -36,21 +35,24 @@ def run(
 
     This command starts the Pie engine, runs the specified inferlet,
     waits for it to complete, and then shuts down.
-    
+
     You can specify an inferlet either by registry name or by path (mutually exclusive):
-    
+
     - By registry: pie run std/text-completion@0.1.0
     - By path: pie run --path ./my_inferlet.wasm
     """
-    # Validate mutually exclusive options
+    # Validate at least one of inferlet or path is provided
     if inferlet is None and path is None:
         console.print("[red]✗[/red] Specify an inferlet name or --path")
         raise typer.Exit(1)
-    
+
+    # Handle the case where --path is used with -- separator
+    # Positional args after -- get captured as `inferlet` first, so
+    # prepend it to `arguments` instead
     if inferlet is not None and path is not None:
-        console.print("[red]✗[/red] Cannot use both inferlet name and --path")
-        raise typer.Exit(1)
-    
+        arguments = [inferlet] + (arguments or [])
+        inferlet = None
+
     # Verify inferlet exists if using path
     if path is not None and not path.exists():
         console.print(f"[red]✗[/red] File not found: {path}")
@@ -64,15 +66,15 @@ def run(
     from . import manager
 
     console.print()
-    
+
     # Show run info
     inferlet_display = str(path) if path else inferlet
     lines = Text()
     lines.append(f"{'Inferlet':<15}", style="white")
     lines.append(f"{inferlet_display}\n", style="dim")
     lines.append(f"{'Model':<15}", style="white")
-    lines.append(model_configs[0].get('hf_repo', 'unknown'), style="dim")
-    
+    lines.append(model_configs[0].get("hf_repo", "unknown"), style="dim")
+
     console.print(Panel(lines, title="Pie Run", title_align="left", border_style="dim"))
     console.print()
 
@@ -85,7 +87,7 @@ def run(
             server_handle, backend_processes = manager.start_engine_and_backend(
                 engine_config, model_configs
             )
-        
+
         console.print("[green]✓[/green] Engine started")
         console.print()
 
@@ -95,14 +97,10 @@ def run(
             "port": engine_config["port"],
             "internal_auth_token": server_handle.internal_token,
         }
-        
+
         if path is not None:
             manager.submit_inferlet_and_wait(
-                client_config,
-                path,
-                arguments or [],
-                server_handle,
-                backend_processes
+                client_config, path, arguments or [], server_handle, backend_processes
             )
         else:
             # Launch from registry
@@ -111,7 +109,7 @@ def run(
                 inferlet,
                 arguments or [],
                 server_handle,
-                backend_processes
+                backend_processes,
             )
 
         # Cleanup

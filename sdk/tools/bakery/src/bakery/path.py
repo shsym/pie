@@ -6,7 +6,7 @@ from pathlib import Path
 
 def get_bakery_home() -> Path:
     """Get the Bakery home directory.
-    
+
     Returns BAKERY_HOME environment variable if set, otherwise ~/.pie/bakery.
     """
     if bakery_home := os.environ.get("BAKERY_HOME"):

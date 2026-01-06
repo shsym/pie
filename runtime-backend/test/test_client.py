@@ -18,7 +18,6 @@ import zmq
 from src.message import (
     HandshakeRequest,
     HandshakeResponse,
-
     QueryRequest,
     QueryResponse,
     ForwardPassRequest,
@@ -68,9 +67,7 @@ class TestClient:
         self.context.term()
         print("[TestClient] Connection closed")
 
-    def _send_request(
-        self, handler_id: HandlerId, requests: list
-    ) -> list[bytes]:
+    def _send_request(self, handler_id: HandlerId, requests: list) -> list[bytes]:
         """
         Send a request to the server and wait for response.
 
@@ -113,8 +110,6 @@ class TestClient:
         for resp in responses:
             print(f"[TestClient] Handshake response: model={resp.model_name}")
         return responses
-
-
 
     def send_query(self, query: str) -> list[QueryResponse]:
         """Send a query request."""
@@ -199,11 +194,13 @@ def run_embedded_tests(endpoint: str, startup_delay: float = 1.0):
     except Exception as e:
         print(f"\n[TestClient] Test suite failed with error: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 
     print("\n[TestClient] All tests complete. Shutting down...")
     import os
+
     os._exit(0)  # Force exit to terminate all threads
 
 
@@ -223,8 +220,6 @@ def run_test_suite(endpoint: str):
             print(f"✓ Handshake successful, got {len(responses)} response(s)")
         except Exception as e:
             print(f"✗ Handshake failed: {e}")
-
-
 
         # Test 3: Query
         print("\n--- Test 3: Query ---")
@@ -247,8 +242,6 @@ def run_test_suite(endpoint: str):
             print(f"✓ Forward pass successful, got {len(responses)} response(s)")
         except Exception as e:
             print(f"✗ Forward pass failed: {e}")
-
-
 
         print("\n" + "=" * 60)
         print("Test Suite Complete")

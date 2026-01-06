@@ -40,11 +40,14 @@ from flashinfer.attention import BatchAttentionWithAttentionSinkWrapper  # type:
 # GPT-OSS WEIGHT SCHEMA
 # =============================================================================
 
-def _create_moe_gate_up_transform(hidden_size: int, intermediate_size: int, num_experts: int):
+
+def _create_moe_gate_up_transform(
+    hidden_size: int, intermediate_size: int, num_experts: int
+):
     """Create a transform function for MoE gate_up weights with pre-set config."""
     padded_hidden = pad_to_multiple(hidden_size, ALIGNMENT)
     padded_intermediate = pad_to_multiple(intermediate_size, ALIGNMENT)
-    
+
     def transform_fn(tensors: list[torch.Tensor], kwargs: dict) -> dict:
         config = {
             **kwargs,
@@ -55,15 +58,17 @@ def _create_moe_gate_up_transform(hidden_size: int, intermediate_size: int, num_
             "num_experts": num_experts,
         }
         return prepare_gptoss_moe_gate_up(tensors, config)
-    
+
     return transform_fn
 
 
-def _create_moe_down_transform(hidden_size: int, intermediate_size: int, num_experts: int):
+def _create_moe_down_transform(
+    hidden_size: int, intermediate_size: int, num_experts: int
+):
     """Create a transform function for MoE down weights with pre-set config."""
     padded_hidden = pad_to_multiple(hidden_size, ALIGNMENT)
     padded_intermediate = pad_to_multiple(intermediate_size, ALIGNMENT)
-    
+
     def transform_fn(tensors: list[torch.Tensor], kwargs: dict) -> dict:
         config = {
             **kwargs,
@@ -74,27 +79,27 @@ def _create_moe_down_transform(hidden_size: int, intermediate_size: int, num_exp
             "num_experts": num_experts,
         }
         return prepare_gptoss_moe_down(tensors, config)
-    
+
     return transform_fn
 
 
 def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
     """
     Create the weight loading schema for GPT-OSS.
-    
+
     This is a factory function because MoE transforms need model dimensions.
     """
     hidden_size = model_config.dim_hidden
     intermediate_size = model_config.dim_mlp
     num_experts = model_config.num_experts
-    
+
     gate_up_transform = _create_moe_gate_up_transform(
         hidden_size, intermediate_size, num_experts
     )
     down_transform = _create_moe_down_transform(
         hidden_size, intermediate_size, num_experts
     )
-    
+
     schema = (
         Schema("gpt_oss")
         # Embedding (no sharding, no quantization for embeddings)
@@ -227,7 +232,7 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
             Source("model.norm.weight"),
         )
     )
-    
+
     return schema
 
 
@@ -235,11 +240,12 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
 # MODEL CONFIG
 # =============================================================================
 
+
 @dataclass
 class ModelConfig(ModelConfigBase):
     """
     GPT-OSS-specific model architecture configuration.
-    
+
     Inherits from the abstract ModelConfig base class and defines
     all architecture-specific parameters for GPT-OSS models.
     """
@@ -276,7 +282,7 @@ class ModelConfig(ModelConfigBase):
     def from_dict(spec: dict) -> "ModelConfig":
         moe = spec.get("moe", {})
         rope = spec.get("rope", {})
-        
+
         return ModelConfig(
             num_layers=int(spec["num_layers"]),
             num_q_heads=int(spec["num_query_heads"]),
@@ -288,11 +294,17 @@ class ModelConfig(ModelConfigBase):
             rms_norm_eps=float(spec.get("rms_norm_eps", 1e-6)),
             # MoE
             num_experts=int(moe.get("num_experts", spec.get("num_experts", 8))),
-            experts_per_token=int(moe.get("experts_per_token", spec.get("experts_per_token", 2))),
+            experts_per_token=int(
+                moe.get("experts_per_token", spec.get("experts_per_token", 2))
+            ),
             # YaRN RoPE
             rope_theta=float(rope.get("theta", spec.get("rope_theta", 10000.0))),
-            rope_scaling_factor=float(rope.get("scaling_factor", spec.get("rope_scaling_factor", 1.0))),
-            rope_ntk_alpha=float(rope.get("ntk_alpha", spec.get("rope_ntk_alpha", 1.0))),
+            rope_scaling_factor=float(
+                rope.get("scaling_factor", spec.get("rope_scaling_factor", 1.0))
+            ),
+            rope_ntk_alpha=float(
+                rope.get("ntk_alpha", spec.get("rope_ntk_alpha", 1.0))
+            ),
             rope_ntk_beta=float(rope.get("ntk_beta", spec.get("rope_ntk_beta", 32.0))),
             # Model specific
             initial_context_length=int(spec.get("initial_context_length", 4096)),
@@ -309,7 +321,9 @@ class ModelConfig(ModelConfigBase):
             rank=runtime_config.rank,
         )
         usable_bytes = available_bytes * runtime_config.gpu_mem_utilization
-        element_size_bytes = torch.empty((), dtype=runtime_config.activation_dtype).element_size()
+        element_size_bytes = torch.empty(
+            (), dtype=runtime_config.activation_dtype
+        ).element_size()
         total_bytes_per_page = (
             element_size_bytes
             * 2
@@ -327,10 +341,11 @@ class ModelConfig(ModelConfigBase):
 # FORWARD PASS
 # =============================================================================
 
+
 class ForwardPass:
     """
     GPT-OSS forward pass implementation.
-    
+
     Key differences from Llama3/Qwen2:
     - Uses BatchAttentionWithAttentionSinkWrapper for attention
     - Even layers use sliding window, odd layers use full attention
@@ -348,14 +363,14 @@ class ForwardPass:
         self.model_config = model_config
         self.runtime_config = runtime_config
         self.weights = weights
-        
+
         # Compute padded dimensions for MoE
         self.padded_hidden_size = pad_to_multiple(model_config.dim_hidden, ALIGNMENT)
         self.padded_intermediate_size = pad_to_multiple(model_config.dim_mlp, ALIGNMENT)
-        
+
         # Pre-compute YaRN RoPE cos/sin cache
         self._rope_cos_sin_cache = self._compute_rope_cache()
-        
+
         # Create workspace buffers for FlashInfer wrappers
         workspace_window = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
@@ -363,7 +378,7 @@ class ForwardPass:
         workspace_full = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
         )
-        
+
         # Wrapper for even layers (sliding window attention)
         self.wrapper_window = BatchAttentionWithAttentionSinkWrapper(
             float_workspace_buffer=workspace_window,
@@ -374,7 +389,7 @@ class ForwardPass:
             head_dim_qk=model_config.dim_head,
             head_dim_vo=model_config.dim_head,
         )
-        
+
         # Wrapper for odd layers (full attention)
         self.wrapper_full = BatchAttentionWithAttentionSinkWrapper(
             float_workspace_buffer=workspace_full,
@@ -385,22 +400,28 @@ class ForwardPass:
             head_dim_qk=model_config.dim_head,
             head_dim_vo=model_config.dim_head,
         )
-        
+
         # Pre-compute MoE activation parameters
         num_experts = model_config.num_experts
         device = runtime_config.device
-        
+
         self._output1_scale = torch.full((num_experts,), 1.0, device=device)
         self._output1_scale_gate = torch.full((num_experts,), 1.0, device=device)
         self._output2_scale = torch.full((num_experts,), 1.0, device=device)
         self._gemm1_alpha = torch.full(
-            (num_experts,), model_config.swiglu_alpha, device=device, dtype=torch.float32
+            (num_experts,),
+            model_config.swiglu_alpha,
+            device=device,
+            dtype=torch.float32,
         )
         self._gemm1_beta = torch.full(
             (num_experts,), model_config.swiglu_beta, device=device, dtype=torch.float32
         )
         self._gemm1_clamp_limit = torch.full(
-            (num_experts,), model_config.swiglu_limit, device=device, dtype=torch.float32
+            (num_experts,),
+            model_config.swiglu_limit,
+            device=device,
+            dtype=torch.float32,
         )
 
     def _compute_rope_cache(self) -> torch.Tensor:
@@ -409,73 +430,76 @@ class ForwardPass:
         device = self.runtime_config.device
         head_dim = cfg.dim_head
         max_position_id = 131072  # Max sequence length
-        
+
         # Compute base frequencies
         freq = cfg.rope_theta ** (
-            torch.arange(0, head_dim, 2, dtype=torch.float, device=device)
-            / head_dim
+            torch.arange(0, head_dim, 2, dtype=torch.float, device=device) / head_dim
         )
-        
+
         if cfg.rope_scaling_factor > 1.0:
             # YaRN concentration
             concentration = 0.1 * math.log(cfg.rope_scaling_factor) + 1.0
-            
+
             d_half = head_dim / 2
             # NTK by parts
             low = (
                 d_half
-                * math.log(cfg.initial_context_length / (cfg.rope_ntk_beta * 2 * math.pi))
+                * math.log(
+                    cfg.initial_context_length / (cfg.rope_ntk_beta * 2 * math.pi)
+                )
                 / math.log(cfg.rope_theta)
             )
             high = (
                 d_half
-                * math.log(cfg.initial_context_length / (cfg.rope_ntk_alpha * 2 * math.pi))
+                * math.log(
+                    cfg.initial_context_length / (cfg.rope_ntk_alpha * 2 * math.pi)
+                )
                 / math.log(cfg.rope_theta)
             )
-            
+
             interpolation = 1.0 / (cfg.rope_scaling_factor * freq)
             extrapolation = 1.0 / freq
-            
-            ramp = (
-                torch.arange(d_half, dtype=torch.float32, device=device) - low
-            ) / (high - low)
+
+            ramp = (torch.arange(d_half, dtype=torch.float32, device=device) - low) / (
+                high - low
+            )
             mask = 1 - ramp.clamp(0, 1)
-            
+
             inv_freq = interpolation * (1 - mask) + extrapolation * mask
         else:
             concentration = 1.0
             inv_freq = 1.0 / freq
-        
+
         # Compute positions and frequencies
         position_ids = torch.arange(max_position_id, dtype=torch.float32, device=device)
         freqs = torch.einsum("i,j->ij", position_ids, inv_freq)
-        
+
         # Compute cos/sin with concentration scaling
         cos_cache = freqs.cos() * concentration
         sin_cache = freqs.sin() * concentration
-        
+
         # Concatenate for FlashInfer format: [max_pos, head_dim]
         cos_sin_cache = torch.cat([cos_cache, sin_cache], dim=-1)
-        
+
         return cos_sin_cache.to(torch.float32)
 
     def embed_inputs(self, batch_metadata: dict[str, Any]) -> torch.Tensor:
         """
         Embed input tokens into hidden states.
-        
+
         Args:
             batch_metadata: Metadata dictionary from the batch builder/packager.
-            
+
         Returns:
             Tensor of input embeddings.
         """
         device = self.runtime_config.device
-        
+
         # Extract token IDs from metadata
         token_ids_tensor = torch.as_tensor(
             batch_metadata["token_ids"], device=device, dtype=torch.int32
         )
-        
+
         return self.embed_tokens(token_ids_tensor)
 
     def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -511,10 +535,10 @@ class ForwardPass:
         """Execute the attention block for a single layer."""
         cfg = self.model_config
         n = hidden_states.size(0)
-        
+
         # Save for residual
         residual = hidden_states
-        
+
         # 1. Input RMSNorm
         normed = fun.rms_norm(
             hidden_states,
@@ -522,31 +546,29 @@ class ForwardPass:
             weight=self.weights.get(f"layers.{layer_idx}.norm_attn"),
             eps=cfg.rms_norm_eps,
         )
-        
+
         # 2. QKV projection with bias
         qkv_proj = fun.linear(
             normed,
             weight=self.weights.get(f"layers.{layer_idx}.proj_qkv.weight"),
             bias=self.weights.get(f"layers.{layer_idx}.proj_qkv.bias"),
         )
-        
+
         # Split Q, K, V
         q_size = cfg.num_q_heads * cfg.dim_head
         kv_size = cfg.num_kv_heads * cfg.dim_head
         q, k, v = torch.split(qkv_proj, [q_size, kv_size, kv_size], dim=-1)
-        
+
         # Apply adapters if provided
         if adapter_subpass is not None:
-            adapter_subpass.execute(
-                layer_idx, normed, q_state=q, k_state=k, v_state=v
-            )
+            adapter_subpass.execute(layer_idx, normed, q_state=q, k_state=k, v_state=v)
         del normed
-        
+
         # Reshape for attention
         q = q.view(n, cfg.num_q_heads, cfg.dim_head)
         k = k.view(n, cfg.num_kv_heads, cfg.dim_head)
         v = v.view(n, cfg.num_kv_heads, cfg.dim_head)
-        
+
         # Apply YaRN RoPE
         ops.apply_rope_with_cos_sin_cache_inplace(
             positions=position_ids.to(torch.int32),
@@ -556,7 +578,7 @@ class ForwardPass:
             cos_sin_cache=self._rope_cos_sin_cache,
             is_neox=True,
         )
-        
+
         # Append to KV cache
         ops.append_paged_kv_cache(
             append_key=k,
@@ -569,30 +591,30 @@ class ForwardPass:
             kv_last_page_len=kv_last_page_lens,
             kv_layout="NHD",
         )
-        
+
         # Compute attention with sinks
         sinks = self.weights.get(f"layers.{layer_idx}.attn_sinks")
-        scaling = cfg.dim_head ** -0.5
+        scaling = cfg.dim_head**-0.5
         attn_output = wrapper.run(q, kv_cache_layer, sinks, scaling)
         attn_output = attn_output.reshape(n, -1)
-        
+
         # Output projection
         attn_proj = fun.linear(
             attn_output,
             weight=self.weights.get(f"layers.{layer_idx}.proj_o"),
             bias=None,
         )
-        
+
         # Residual
         return residual + attn_proj
 
     def moe(self, hidden_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Execute the MoE MLP block for a single layer."""
         cfg = self.model_config
-        
+
         # Save for residual
         residual = hidden_states
-        
+
         # 1. MLP RMSNorm
         normed = fun.rms_norm(
             hidden_states,
@@ -600,17 +622,17 @@ class ForwardPass:
             weight=self.weights.get(f"layers.{layer_idx}.norm_mlp"),
             eps=cfg.rms_norm_eps,
         )
-        
+
         # 2. Router logits
         router_logits = fun.linear(
             normed.reshape(-1, cfg.dim_hidden),
             weight=self.weights.get(f"layers.{layer_idx}.router.weight"),
             bias=self.weights.get(f"layers.{layer_idx}.router.bias"),
         )
-        
+
         # 3. Prepare input for MoE kernel
         hidden_bf16 = normed.to(torch.bfloat16)
-        
+
         # Pad hidden states if needed
         if cfg.dim_hidden != self.padded_hidden_size:
             num_tokens = hidden_bf16.shape[0]
@@ -619,9 +641,9 @@ class ForwardPass:
                 dtype=hidden_bf16.dtype,
                 device=hidden_bf16.device,
             )
-            padded[:, :cfg.dim_hidden] = hidden_bf16
+            padded[:, : cfg.dim_hidden] = hidden_bf16
             hidden_bf16 = padded
-        
+
         # 4. FlashInfer fused MoE kernel
         output = ops.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits.to(torch.bfloat16),
@@ -629,13 +651,17 @@ class ForwardPass:
             hidden_states=hidden_bf16,
             hidden_states_scale=None,
             gemm1_weights=self.weights.get(f"layers.{layer_idx}.moe.gemm1_weights"),
-            gemm1_weights_scale=self.weights.get(f"layers.{layer_idx}.moe.gemm1_scales"),
+            gemm1_weights_scale=self.weights.get(
+                f"layers.{layer_idx}.moe.gemm1_scales"
+            ),
             gemm1_bias=self.weights.get(f"layers.{layer_idx}.moe.gemm1_bias"),
             gemm1_alpha=self._gemm1_alpha,
             gemm1_beta=self._gemm1_beta,
             gemm1_clamp_limit=self._gemm1_clamp_limit,
             gemm2_weights=self.weights.get(f"layers.{layer_idx}.moe.gemm2_weights"),
-            gemm2_weights_scale=self.weights.get(f"layers.{layer_idx}.moe.gemm2_scales"),
+            gemm2_weights_scale=self.weights.get(
+                f"layers.{layer_idx}.moe.gemm2_scales"
+            ),
             gemm2_bias=self.weights.get(f"layers.{layer_idx}.moe.gemm2_bias"),
             output1_scale_scalar=self._output1_scale,
             output1_scale_gate_scalar=self._output1_scale_gate,
@@ -654,15 +680,15 @@ class ForwardPass:
             do_finalize=True,
             tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
         )
-        
+
         output = output[0]
-        
+
         # Strip padding
         if cfg.dim_hidden != self.padded_hidden_size:
-            output = output[:, :cfg.dim_hidden]
-        
+            output = output[:, : cfg.dim_hidden]
+
         output = output.to(hidden_states.dtype)
-        
+
         # Residual
         return residual + output
 
@@ -682,23 +708,23 @@ class ForwardPass:
     ) -> torch.Tensor:
         """Main transformation pipeline through all layers."""
         cfg = self.model_config
-        
+
         hidden_states = input_embeds
         n, _ = hidden_states.size()
         page_size = int(kv_cache_at_layer[0].shape[2])
-        
+
         seq_lens = ops.get_seq_lens(kv_page_indptr, kv_last_page_lens, page_size)
         batch_indices, batch_positions = ops.get_batch_indices_positions(
             append_indptr=qo_indptr,
             seq_lens=seq_lens,
             nnz=n,
         )
-        
+
         # Plan both wrappers (sliding window and full attention)
         # custom_mask is not used with attention sink wrapper
         _ = custom_mask
         _ = single_token_inference_mode
-        
+
         self.wrapper_window.plan(
             qo_indptr,
             kv_page_indptr,
@@ -714,7 +740,7 @@ class ForwardPass:
             kv_data_type=self.runtime_config.activation_dtype,
             non_blocking=True,
         )
-        
+
         self.wrapper_full.plan(
             qo_indptr,
             kv_page_indptr,
@@ -730,11 +756,11 @@ class ForwardPass:
             kv_data_type=self.runtime_config.activation_dtype,
             non_blocking=True,
         )
-        
+
         for layer_idx in range(cfg.num_layers):
             # Select wrapper: even layers use sliding window, odd use full
             wrapper = self.wrapper_window if layer_idx % 2 == 0 else self.wrapper_full
-            
+
             # 1. Attention block
             hidden_states = self.attention(
                 hidden_states=hidden_states,
@@ -749,16 +775,18 @@ class ForwardPass:
                 adapter_subpass=adapter_subpass,
                 wrapper=wrapper,
             )
-            
+
             # 2. MoE MLP block
             hidden_states = self.moe(hidden_states, layer_idx)
-        
+
         return hidden_states
 
 
-def create_kv_cache(model_config: ModelConfig, runtime_config: RuntimeConfig) -> list[torch.Tensor]:
+def create_kv_cache(
+    model_config: ModelConfig, runtime_config: RuntimeConfig
+) -> list[torch.Tensor]:
     """Create KV cache tensors for all layers."""
-    
+
     return [
         torch.zeros(
             (
@@ -779,7 +807,7 @@ def create_adapter_cache(
     model_config: ModelConfig, runtime_config: RuntimeConfig
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Create adapter cache tensors for all layers.
-    
+
     Returns a list of (down_weights, up_weights) tuples, one per layer.
     - down_weights: [max_num_adapters, dim_hidden, max_adapter_rank * 3]
     - up_weights: [max_num_adapters, max_adapter_rank, dim_head * (num_q_heads + num_kv_heads * 2)]
@@ -800,10 +828,7 @@ def create_adapter_cache(
                     runtime_config.max_num_adapters,
                     runtime_config.max_adapter_rank,
                     model_config.dim_head
-                    * (
-                        model_config.num_q_heads
-                        + model_config.num_kv_heads * 2
-                    ),
+                    * (model_config.num_q_heads + model_config.num_kv_heads * 2),
                 ),
                 dtype=runtime_config.activation_dtype,
                 device=runtime_config.device,

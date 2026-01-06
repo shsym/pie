@@ -17,17 +17,17 @@ from . import engine
 
 def compose_components(program_bytes: bytes, library_paths: list[Path]) -> bytes:
     """Compose a program with multiple libraries using wac CLI.
-    
+
     Uses `wac plug` command to link libraries into the main program.
     Libraries are linked sequentially in the order provided.
-    
+
     Args:
         program_bytes: The main program WASM bytes.
         library_paths: List of paths to library WASM files.
-    
+
     Returns:
         The composed WASM bytes.
-    
+
     Raises:
         RuntimeError: If wac CLI is not available or composition fails.
     """
@@ -44,16 +44,16 @@ def compose_components(program_bytes: bytes, library_paths: list[Path]) -> bytes
         raise RuntimeError(
             "wac CLI is not installed. Install it with: cargo install wac-cli"
         )
-    
+
     socket_bytes = program_bytes
-    
+
     for library_path in library_paths:
         if not library_path.exists():
             raise FileNotFoundError(f"Library file not found: {library_path}")
-        
+
         # Read library bytes
         plug_bytes = library_path.read_bytes()
-        
+
         # Compose using wac plug
         # wac plug --plug <library.wasm> <main.wasm> -o <output.wasm>
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -61,28 +61,31 @@ def compose_components(program_bytes: bytes, library_paths: list[Path]) -> bytes
             socket_file = temp_path / "socket.wasm"
             plug_file = temp_path / "plug.wasm"
             output_file = temp_path / "composed.wasm"
-            
+
             socket_file.write_bytes(socket_bytes)
             plug_file.write_bytes(plug_bytes)
-            
+
             result = subprocess.run(
                 [
-                    "wac", "plug",
-                    "--plug", str(plug_file),
+                    "wac",
+                    "plug",
+                    "--plug",
+                    str(plug_file),
                     str(socket_file),
-                    "-o", str(output_file),
+                    "-o",
+                    str(output_file),
                 ],
                 capture_output=True,
                 text=True,
             )
-            
+
             if result.returncode != 0:
                 raise RuntimeError(
                     f"wac plug failed for {library_path}:\n{result.stderr}"
                 )
-            
+
             socket_bytes = output_file.read_bytes()
-    
+
     return socket_bytes
 
 
@@ -98,7 +101,7 @@ def handle_submit_command(
     arguments: Optional[list[str]] = None,
 ) -> None:
     """Handle the `pie-cli submit` command.
-    
+
     1. Creates a client configuration from config file and command-line arguments
     2. Connects to the Pie engine server
     3. If libraries are specified, composes them with the inferlet using wac
@@ -108,7 +111,7 @@ def handle_submit_command(
     """
     link = link or []
     arguments = arguments or []
-    
+
     client_config = engine.ClientConfig.create(
         config_path=config,
         host=host,
@@ -116,33 +119,33 @@ def handle_submit_command(
         username=username,
         private_key_path=private_key_path,
     )
-    
+
     client = engine.connect_and_authenticate(client_config)
-    
+
     try:
         # Read the main inferlet
         if not inferlet.exists():
             raise FileNotFoundError(f"Inferlet file not found: {inferlet}")
-        
+
         inferlet_blob = inferlet.read_bytes()
-        
+
         # If libraries are specified, compose them with the main inferlet
         if link:
             final_blob = compose_components(inferlet_blob, link)
         else:
             final_blob = inferlet_blob
-        
+
         # Calculate the hash of the final composed blob
         program_hash = blake3.blake3(final_blob).hexdigest()
         typer.echo(f"Final inferlet hash: {program_hash}")
-        
+
         # Upload the composed inferlet to the server
         if not engine.program_exists(client, program_hash):
             engine.upload_program(client, final_blob)
             typer.echo("✅ Inferlet upload successful.")
         else:
             typer.echo("Inferlet already exists on server.")
-        
+
         # Launch the instance
         instance = engine.launch_instance(
             client,
@@ -150,11 +153,11 @@ def handle_submit_command(
             arguments,
             detached,
         )
-        
+
         typer.echo(f"✅ Inferlet launched with ID: {instance.instance_id}")
-        
+
         if not detached:
             engine.stream_inferlet_output(instance, client)
-    
+
     finally:
         engine.close_client(client)

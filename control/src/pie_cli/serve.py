@@ -75,7 +75,7 @@ def serve(
     from . import manager
 
     console.print()
-    
+
     # Show config summary
     mode = "interactive" if interactive else "server"
     lines = Text()
@@ -87,21 +87,24 @@ def serve(
     device = model_configs[0].get("device", ["unknown"])
     device_str = ", ".join(device) if isinstance(device, list) else device
     lines.append(device_str, style="dim")
-    
-    console.print(Panel(lines, title=f"Pie Engine ({mode})", title_align="left", border_style="dim"))
+
+    console.print(
+        Panel(
+            lines, title=f"Pie Engine ({mode})", title_align="left", border_style="dim"
+        )
+    )
     console.print()
 
     server_handle = None
     backend_processes = []
-    
+
     try:
         # Start engine and backends
         # manager.start_engine_and_backend handles the spinner UI
         server_handle, backend_processes = manager.start_engine_and_backend(
             engine_config, model_configs, console=console
         )
-        
-        
+
         # console.print("[green]✓[/green] Engine running. [dim]Press Ctrl+C to stop[/dim]")
 
         if interactive:
@@ -119,11 +122,11 @@ def serve(
                     if not manager.check_backend_processes(backend_processes):
                         typer.echo("[red]A backend process died. Shutting down.[/red]")
                         break
-                    
-                    if server_handle and hasattr(server_handle, 'is_running'):
-                         if not server_handle.is_running():
-                             typer.echo("[red]Engine process died. Shutting down.[/red]")
-                             break
+
+                    if server_handle and hasattr(server_handle, "is_running"):
+                        if not server_handle.is_running():
+                            typer.echo("[red]Engine process died. Shutting down.[/red]")
+                            break
 
                     time.sleep(1.0)
             except KeyboardInterrupt:

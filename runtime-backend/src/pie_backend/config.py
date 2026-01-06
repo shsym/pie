@@ -24,7 +24,7 @@ QUANT_DTYPES = {"int4", "int8", "float8"}
 class RuntimeConfig:
     """
     Configuration for the PIE inference runtime.
-    
+
     This class consolidates the old model.Config and RuntimeConfig,
     providing both runtime settings (model, cache_dir) and device/dtype
     configuration used by model forward passes.
@@ -32,7 +32,7 @@ class RuntimeConfig:
 
     # Model identification
     hf_repo: str  # HuggingFace repo (e.g., "meta-llama/Llama-3.2-1B-Instruct")
-    
+
     cache_dir: str
     kv_page_size: int
     max_dist_size: int
@@ -52,7 +52,9 @@ class RuntimeConfig:
     devices: list[torch.device]  # Renamed from device for clarity
     rank: int
     activation_dtype: torch.dtype
-    weight_dtype: str  # "auto", "float32", "float16", "bfloat16", "int4", "int8", "float8"
+    weight_dtype: (
+        str  # "auto", "float32", "float16", "bfloat16", "int4", "int8", "float8"
+    )
 
     # =========================================================================
     # Convenience Properties (formerly in model.Config)
@@ -77,7 +79,7 @@ class RuntimeConfig:
     def compute_dtype(self) -> torch.dtype:
         """
         Get the compute dtype for weights.
-        
+
         For float types: returns the specified torch dtype.
         For 'auto': returns activation_dtype (weights match activations).
         For quantized types: returns activation_dtype (compute in activation precision).
@@ -88,7 +90,9 @@ class RuntimeConfig:
         return getattr(torch, self.weight_dtype)
 
     @property
-    def quantization(self) -> Int4WeightOnlyConfig | Int8WeightOnlyConfig | Float8WeightOnlyConfig | None:
+    def quantization(
+        self,
+    ) -> Int4WeightOnlyConfig | Int8WeightOnlyConfig | Float8WeightOnlyConfig | None:
         """Derive quantization config from weight_dtype (only for quantization types)."""
 
         match self.weight_dtype:
@@ -153,11 +157,11 @@ class RuntimeConfig:
 
         # Resolve devices
         resolved_devices: list[torch.device] = []
-        
+
         if devices is not None:
-             resolved_devices = [torch.device(d) for d in devices]
+            resolved_devices = [torch.device(d) for d in devices]
         elif device is not None:
-             resolved_devices = [torch.device(device)]
+            resolved_devices = [torch.device(device)]
         else:
             # Auto-detect if no devices provided
             if torch.cuda.is_available():
@@ -166,16 +170,16 @@ class RuntimeConfig:
                 resolved_devices = [torch.device("mps")]
             else:
                 resolved_devices = [torch.device("cpu")]
-        
+
         # Adjust world_size if needed
         if world_size > 1 and len(resolved_devices) != world_size:
-            # If we have a mismatch (e.g. only 1 device passed but world_size=2), 
-            # we should probably trust the devices list if it's explicit, 
+            # If we have a mismatch (e.g. only 1 device passed but world_size=2),
+            # we should probably trust the devices list if it's explicit,
             # or fill with duplicates if it's single?
             # For correctness in get_available_memory, we want distinct devices if possible.
             # But if we assume 1 process per device, init_process will pass the full list.
             # So if len != world_size, it's a potential config error or single-device emulation.
-            pass 
+            pass
 
         # Resolve activation dtype
         resolved_activation_dtype = getattr(torch, activation_dtype, torch.bfloat16)

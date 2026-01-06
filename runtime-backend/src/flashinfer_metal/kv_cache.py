@@ -59,16 +59,25 @@ class AppendKVCacheCompiler(BaseShaderCompiler):
             head_size: Head dimension
             page_size: Page size
         """
-        if not self.can_use_mps_kernels() or "append_kv_cache" not in self.compiled_libraries:
+        if (
+            not self.can_use_mps_kernels()
+            or "append_kv_cache" not in self.compiled_libraries
+        ):
             raise RuntimeError("Append KV cache MPS kernels not available")
 
         k_input = k_input.to("mps") if k_input.device.type != "mps" else k_input
         v_input = v_input.to("mps") if v_input.device.type != "mps" else v_input
-        paged_kv_cache = paged_kv_cache.to("mps") if paged_kv_cache.device.type != "mps" else paged_kv_cache
+        paged_kv_cache = (
+            paged_kv_cache.to("mps")
+            if paged_kv_cache.device.type != "mps"
+            else paged_kv_cache
+        )
 
         num_tokens = k_input.shape[0]
         batch_size = kv_page_indptr.shape[0] - 1
-        max_num_pages = paged_kv_cache.numel() // (2 * page_size * num_kv_heads * head_size)
+        max_num_pages = paged_kv_cache.numel() // (
+            2 * page_size * num_kv_heads * head_size
+        )
 
         params = torch.tensor(
             [
@@ -79,9 +88,9 @@ class AppendKVCacheCompiler(BaseShaderCompiler):
                 max_num_pages,
                 batch_size,
                 num_kv_heads * head_size,  # k_stride_token
-                head_size,                 # k_stride_head
+                head_size,  # k_stride_head
                 num_kv_heads * head_size,  # v_stride_token
-                head_size,                 # v_stride_head
+                head_size,  # v_stride_head
             ],
             dtype=torch.int32,
             device="mps",

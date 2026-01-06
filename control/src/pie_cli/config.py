@@ -55,7 +55,6 @@ def create_default_config_content() -> str:
     return toml.dumps(config)
 
 
-
 @app.command("init")
 def config_init(
     path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
@@ -81,7 +80,7 @@ def config_init(
 
     console.print(f"[green]✓[/green] Created {config_path}")
     console.print()
-    
+
     syntax = Syntax(config_content, "toml", theme="ansi_dark", line_numbers=False)
     console.print(Panel(syntax, title="Config", title_align="left", border_style="dim"))
 
@@ -100,7 +99,9 @@ def config_show(
 
     config_content = config_path.read_text()
     syntax = Syntax(config_content, "toml", theme="ansi_dark", line_numbers=False)
-    console.print(Panel(syntax, title=str(config_path), title_align="left", border_style="dim"))
+    console.print(
+        Panel(syntax, title=str(config_path), title_align="left", border_style="dim")
+    )
 
 
 @app.command("update")
@@ -111,12 +112,22 @@ def config_update(
     enable_auth: Optional[bool] = typer.Option(
         None, "--enable-auth", help="Enable/disable authentication"
     ),
-    cache_dir: Optional[str] = typer.Option(None, "--cache-dir", help="Cache directory path"),
-    verbose: Optional[bool] = typer.Option(None, "--verbose", help="Enable verbose logging"),
+    cache_dir: Optional[str] = typer.Option(
+        None, "--cache-dir", help="Cache directory path"
+    ),
+    verbose: Optional[bool] = typer.Option(
+        None, "--verbose", help="Enable verbose logging"
+    ),
     log_dir: Optional[str] = typer.Option(None, "--log-dir", help="Log directory path"),
-    registry: Optional[str] = typer.Option(None, "--registry", help="Inferlet registry URL"),
+    registry: Optional[str] = typer.Option(
+        None, "--registry", help="Inferlet registry URL"
+    ),
     # Model configuration options
-    model_hf_repo: Optional[str] = typer.Option(None, "--hf-repo", help="HuggingFace repo (e.g., meta-llama/Llama-3.2-1B-Instruct)"),
+    model_hf_repo: Optional[str] = typer.Option(
+        None,
+        "--hf-repo",
+        help="HuggingFace repo (e.g., meta-llama/Llama-3.2-1B-Instruct)",
+    ),
     model_device: Optional[list[str]] = typer.Option(
         None, "--device", help="Device(s) (e.g., cuda:0 cuda:1)"
     ),
@@ -124,7 +135,9 @@ def config_update(
         None, "--activation-dtype", help="Activation dtype (e.g., bfloat16)"
     ),
     model_weight_dtype: Optional[str] = typer.Option(
-        None, "--weight-dtype", help="Weight dtype: auto, float32, float16, bfloat16, int4, int8, float8"
+        None,
+        "--weight-dtype",
+        help="Weight dtype: auto, float32, float16, bfloat16, int4, int8, float8",
     ),
     model_kv_page_size: Optional[int] = typer.Option(
         None, "--kv-page-size", help="KV page size"
@@ -157,7 +170,9 @@ def config_update(
         None, "--random-seed", help="Random seed for model"
     ),
     model_use_cuda_graphs: Optional[bool] = typer.Option(
-        None, "--use-cuda-graphs/--no-use-cuda-graphs", help="Enable/disable CUDA graphs"
+        None,
+        "--use-cuda-graphs/--no-use-cuda-graphs",
+        help="Enable/disable CUDA graphs",
     ),
     path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
@@ -202,7 +217,9 @@ def config_update(
 
     if not engine_updates and not model_updates:
         console.print("[yellow]![/yellow] No options provided")
-        console.print("[dim]Run 'pie config update --help' to see available options.[/dim]")
+        console.print(
+            "[dim]Run 'pie config update --help' to see available options.[/dim]"
+        )
         return
 
     config_path = Path(path) if path else pie_path.get_default_config_path()
@@ -234,4 +251,3 @@ def config_update(
     config_path.write_text(toml.dumps(config))
     console.print()
     console.print(f"[dim]Saved to {config_path}[/dim]")
-

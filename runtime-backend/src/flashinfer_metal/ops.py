@@ -54,27 +54,64 @@ class MPSShaderCompiler:
             or self.append_kv_cache_compiler.can_use_mps_kernels()
         )
 
-    def run_attention_mps(self, query, kv_cache, kv_page_indices, kv_page_indptr,
-                          kv_last_page_lens, qo_indptr, custom_mask=None):
+    def run_attention_mps(
+        self,
+        query,
+        kv_cache,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
+        qo_indptr,
+        custom_mask=None,
+    ):
         return self.attention_compiler.run_attention_mps(
-            query, kv_cache, kv_page_indices, kv_page_indptr,
-            kv_last_page_lens, qo_indptr, custom_mask
+            query,
+            kv_cache,
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens,
+            qo_indptr,
+            custom_mask,
         )
 
-    def run_rope_mps(self, input_qk, position_ids, rope_theta=10000.0,
-                     rope_factor=1.0, interleaved=False):
+    def run_rope_mps(
+        self,
+        input_qk,
+        position_ids,
+        rope_theta=10000.0,
+        rope_factor=1.0,
+        interleaved=False,
+    ):
         self.rope_compiler.run_rope_mps(
             input_qk, position_ids, rope_theta, rope_factor, interleaved
         )
 
-    def run_append_paged_kv_cache_mps(self, k_input, v_input, paged_kv_cache,
-                                       kv_batch_indices, kv_positions, kv_page_indices,
-                                       kv_page_indptr, kv_last_page_lens,
-                                       num_kv_heads, head_size, page_size):
+    def run_append_paged_kv_cache_mps(
+        self,
+        k_input,
+        v_input,
+        paged_kv_cache,
+        kv_batch_indices,
+        kv_positions,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
+        num_kv_heads,
+        head_size,
+        page_size,
+    ):
         self.append_kv_cache_compiler.run_append_paged_kv_cache_mps(
-            k_input, v_input, paged_kv_cache, kv_batch_indices, kv_positions,
-            kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            num_kv_heads, head_size, page_size
+            k_input,
+            v_input,
+            paged_kv_cache,
+            kv_batch_indices,
+            kv_positions,
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens,
+            num_kv_heads,
+            head_size,
+            page_size,
         )
 
 
@@ -259,8 +296,12 @@ def apply_rope_pos_ids_inplace(
     validate_mps_device(pos_ids, "pos_ids")
 
     compiler = get_mps_compiler()
-    compiler.run_rope_mps(q, pos_ids, rope_theta=rope_theta, rope_factor=1.0, interleaved=interleave)
-    compiler.run_rope_mps(k, pos_ids, rope_theta=rope_theta, rope_factor=1.0, interleaved=interleave)
+    compiler.run_rope_mps(
+        q, pos_ids, rope_theta=rope_theta, rope_factor=1.0, interleaved=interleave
+    )
+    compiler.run_rope_mps(
+        k, pos_ids, rope_theta=rope_theta, rope_factor=1.0, interleaved=interleave
+    )
 
 
 def apply_llama31_rope_pos_ids_inplace(
@@ -290,8 +331,20 @@ def apply_llama31_rope_pos_ids_inplace(
     validate_mps_device(pos_ids, "pos_ids")
 
     compiler = get_mps_compiler()
-    compiler.run_rope_mps(q, pos_ids, rope_theta=rope_theta, rope_factor=rope_scale, interleaved=interleave)
-    compiler.run_rope_mps(k, pos_ids, rope_theta=rope_theta, rope_factor=rope_scale, interleaved=interleave)
+    compiler.run_rope_mps(
+        q,
+        pos_ids,
+        rope_theta=rope_theta,
+        rope_factor=rope_scale,
+        interleaved=interleave,
+    )
+    compiler.run_rope_mps(
+        k,
+        pos_ids,
+        rope_theta=rope_theta,
+        rope_factor=rope_scale,
+        interleaved=interleave,
+    )
 
 
 def append_paged_kv_cache(
@@ -323,9 +376,17 @@ def append_paged_kv_cache(
     paged_kv_unified = paged_kv_cache.view(-1)
 
     get_mps_compiler().run_append_paged_kv_cache_mps(
-        k_flat, v_flat, paged_kv_unified, batch_indices, positions,
-        kv_indices, kv_indptr, kv_last_page_len,
-        num_kv_heads, head_dim, page_size
+        k_flat,
+        v_flat,
+        paged_kv_unified,
+        batch_indices,
+        positions,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        num_kv_heads,
+        head_dim,
+        page_size,
     )
 
 
@@ -384,14 +445,18 @@ class sampling:
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     @staticmethod
-    def top_p_sampling_from_probs(probs: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
+    def top_p_sampling_from_probs(
+        probs: torch.Tensor, top_p: torch.Tensor
+    ) -> torch.Tensor:
         sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
         mask = cumulative_probs <= top_p.unsqueeze(-1)
         mask[..., 0] = True
         sorted_probs[~mask] = 0
         sampled_sorted_idx = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
-        return torch.gather(sorted_indices, -1, sampled_sorted_idx.unsqueeze(-1)).squeeze(-1)
+        return torch.gather(
+            sorted_indices, -1, sampled_sorted_idx.unsqueeze(-1)
+        ).squeeze(-1)
 
 
 __all__ = [

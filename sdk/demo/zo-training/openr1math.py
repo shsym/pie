@@ -21,9 +21,13 @@ class OpenR1MathDataset(Dataset):
 
         # Use .select() for proper splitting
         if split == "train":
-            self.data = shuffled_dataset.select(range(len(shuffled_dataset) - test_size))
+            self.data = shuffled_dataset.select(
+                range(len(shuffled_dataset) - test_size)
+            )
         else:
-            self.data = shuffled_dataset.select(range(len(shuffled_dataset) - test_size, len(shuffled_dataset)))
+            self.data = shuffled_dataset.select(
+                range(len(shuffled_dataset) - test_size, len(shuffled_dataset))
+            )
 
     def __len__(self):
         return len(self.data)
@@ -73,7 +77,7 @@ if __name__ == "__main__":
     for i in range(0, 100):
         item = test_dataset[i]
         print(f"\nExample {i + 1}:")
-        #print("Problem:", item["problem"])
+        # print("Problem:", item["problem"])
         print("Answer:", item["answer"])
 
         print(parse(f"${item["answer"]}$"))

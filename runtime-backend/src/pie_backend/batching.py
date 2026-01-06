@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 class Batch:
     """
     Holds the accumulated state for a specific inference step and handles packaging.
-    
+
     This consolidates the state storage (formerly BatchState) and packaging logic
     (formerly ResponsePackager) into a single unified class.
     """
@@ -66,10 +66,10 @@ class Batch:
     def get_model_inputs(self, device: torch.device) -> dict[str, Any]:
         """
         Finalize batch preparation and create input tensors for the model.
-        
+
         Args:
             device: The torch device to create tensors on.
-            
+
         Returns:
             Dictionary containing input tensors for the model engine.
         """
@@ -81,7 +81,9 @@ class Batch:
         )
 
         return {
-            "token_ids": torch.as_tensor(self.token_ids, device=device, dtype=torch.long),
+            "token_ids": torch.as_tensor(
+                self.token_ids, device=device, dtype=torch.long
+            ),
             "position_ids": torch.as_tensor(
                 self.position_ids, device=device, dtype=torch.int32
             ),
@@ -101,35 +103,45 @@ class Batch:
                 batched_attention_mask, device=device, dtype=torch.bool
             ),
             "single_token_inference_mode": self.single_token_mode,
-            "adapter_indices": self.adapter_indices if self.adapter_subpass_needed else [],
-            "adapter_seeds": torch.as_tensor(self.adapter_seeds, device=device, dtype=torch.long) if self.adapter_subpass_needed else None,
+            "adapter_indices": (
+                self.adapter_indices if self.adapter_subpass_needed else []
+            ),
+            "adapter_seeds": (
+                torch.as_tensor(self.adapter_seeds, device=device, dtype=torch.long)
+                if self.adapter_subpass_needed
+                else None
+            ),
             "total_pages_cpu": self.kv_page_indptr[-1],
         }
 
-    def get_sampling_metadata(self, device: torch.device, dtype: torch.dtype) -> dict[str, Any]:
+    def get_sampling_metadata(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> dict[str, Any]:
         """
         Prepare the metadata required for the SamplingPass.
-        
+
         Args:
             device: Torch device.
             dtype: Torch dtype for temperatures.
-            
+
         Returns:
             Dictionary containing sampling metadata.
         """
         # Return empty if no logits needed
         if not self.indices_for_logits:
-            return {
-                "indices_for_logits": None
-            }
+            return {"indices_for_logits": None}
 
         indices_for_logits = self.indices_for_logits
-        
-        temperatures = torch.tensor(
-            [p["temperature"] for p in self.sampler_params],
-            device=device,
-            dtype=dtype,
-        ).clamp(min=1e-6).unsqueeze(1)
+
+        temperatures = (
+            torch.tensor(
+                [p["temperature"] for p in self.sampler_params],
+                device=device,
+                dtype=dtype,
+            )
+            .clamp(min=1e-6)
+            .unsqueeze(1)
+        )
 
         # Group samplers
         sampler_groups: dict[int, list[int]] = {}
@@ -150,23 +162,22 @@ class Batch:
     ) -> list[message.ForwardPassResponse]:
         """
         Package the sampling results into responses for each original request.
-        
+
         Args:
             sampling_results: Dictionary containing 'tokens' and 'dists'.
-            
+
         Returns:
             List of responses in the order of requests.
         """
         # Early return if no logits needed
         if not self.indices_for_logits:
             return [
-                message.ForwardPassResponse(dists=[], tokens=[])
-                for _ in self.requests
+                message.ForwardPassResponse(dists=[], tokens=[]) for _ in self.requests
             ]
 
         final_dists = sampling_results["dists"]
         final_tokens_list = sampling_results["tokens"]
-        
+
         responses = []
         cursor = 0
 
@@ -185,7 +196,6 @@ class Batch:
                     # Sampling request
                     request_tokens.append(final_tokens_list[i])
 
-
             responses.append(
                 message.ForwardPassResponse(dists=request_dists, tokens=request_tokens)
             )
@@ -202,7 +212,7 @@ class BatchBuilder:
     def __init__(self, kv_page_size: int, max_dist_size: int, adapters: dict):
         """
         Initialize the BatchBuilder.
-        
+
         Args:
             kv_page_size: Size of each KV cache page
             max_dist_size: Maximum distribution size for sampling
@@ -220,7 +230,7 @@ class BatchBuilder:
     def add_request(self, req: message.ForwardPassRequest) -> None:
         """
         Process a single request and append to the current batch state.
-        
+
         Args:
             req: Forward pass request to add to the batch
         """
@@ -248,7 +258,9 @@ class BatchBuilder:
                 f"Mismatch between output_embed_indices length ({len(req.output_embed_indices)}) "
                 f"and output_embed_ptrs length ({len(req.output_embed_ptrs)})"
             )
-        for token_idx, storage_ptr in zip(req.output_embed_indices, req.output_embed_ptrs):
+        for token_idx, storage_ptr in zip(
+            req.output_embed_indices, req.output_embed_ptrs
+        ):
             batch.indices_for_embed_storage.append(token_idx + batch.total_tokens)
             batch.embed_storage_pointers.append(storage_ptr)
 
@@ -299,7 +311,7 @@ class BatchBuilder:
     def build(self) -> Batch:
         """
         Return the prepared batch and reset the builder.
-        
+
         Returns:
             The completed Batch ready for inference
         """
@@ -321,14 +333,14 @@ def _generate_mask_for_request(
 ) -> np.ndarray:
     """
     Generate the custom attention mask for a single request.
-    
+
     Args:
         input_tokens: List of input token IDs
         mask: BRLE-encoded attention masks for each token
         kv_page_ptrs: KV cache page pointers
         kv_page_last_len: Length of the last KV cache page
         kv_page_size: Size of each KV cache page
-        
+
     Returns:
         Flattened boolean attention mask array
     """
@@ -374,13 +386,13 @@ def _generate_mask_for_request(
 def _decode_brle(brle_buffer: list[int]) -> np.ndarray:
     """
     Decode a Binary Run-Length Encoded buffer into a boolean numpy array.
-    
+
     The format assumes alternating runs of True and False, starting with True
     (in attention masking, True means attend).
-    
+
     Args:
         brle_buffer: List of run lengths
-        
+
     Returns:
         Decoded boolean array
     """

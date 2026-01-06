@@ -277,7 +277,7 @@ def quantize_into_mxfp4(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FP4 batch quantization function."""
     from flashinfer import fp4_quantize  # type: ignore[import]
-    
+
     num_experts = a.shape[0]
     sf_vec_size = 32  # MXFP4 uses 32-element blocks
 
@@ -315,7 +315,7 @@ def quantize_shuffle_gate_up_weights(
     """
     from flashinfer.fp4_quantization import block_scale_interleave  # type: ignore[import]
     from flashinfer.fused_moe.core import _maybe_get_cached_w3_w1_permute_indices  # type: ignore[import]
-    
+
     epilogue_tile_m = 128
     cache_permute_indices: dict[tuple, torch.Tensor] = {}
 
@@ -404,7 +404,7 @@ def quantize_shuffle_down_weights(
     """
     from flashinfer.fp4_quantization import block_scale_interleave  # type: ignore[import]
     from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache  # type: ignore[import]
-    
+
     epilogue_tile_m = 128
     cache_permute_indices: dict[tuple, torch.Tensor] = {}
 
@@ -493,7 +493,7 @@ def prepare_gptoss_moe_gate_up(
         Dict with 'weights', 'scales', 'bias' keys containing prepared tensors
     """
     blocks, scales, bias = tensors
-    
+
     device = config["device"]
     hidden_size = config["hidden_size"]
     intermediate_size = config["intermediate_size"]
@@ -555,7 +555,7 @@ def prepare_gptoss_moe_down(
         Dict with 'weights', 'scales', 'bias' keys containing prepared tensors
     """
     blocks, scales, bias = tensors
-    
+
     device = config["device"]
     hidden_size = config["hidden_size"]
     intermediate_size = config["intermediate_size"]

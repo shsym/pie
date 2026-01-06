@@ -440,13 +440,19 @@ def run_tests():
             # Right half
             S_right = S[:, half:]
             y_right = batched_randn_matmul(
-                x, seeds, S_right, out_dtype=torch.float32, col_offset=half, global_cols=O
+                x,
+                seeds,
+                S_right,
+                out_dtype=torch.float32,
+                col_offset=half,
+                global_cols=O,
             )
             d_right = _max_abs_diff(y_right, y_ref[:, half:])
-            
-            print(f"  sharding split {O} -> {half}+{half} | left_diff={d_left:.3e}, right_diff={d_right:.3e}")
-            assert d_left < 0.1 and d_right < 0.1, "Sharding mismatch"
 
+            print(
+                f"  sharding split {O} -> {half}+{half} | left_diff={d_left:.3e}, right_diff={d_right:.3e}"
+            )
+            assert d_left < 0.1 and d_right < 0.1, "Sharding mismatch"
 
     # Small sanity
     do_case(B=3, I=8, O=8)
