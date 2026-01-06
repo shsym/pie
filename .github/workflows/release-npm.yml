@@ -1,0 +1,63 @@
+name: Release npm Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package to release'
+        required: true
+        type: choice
+        options:
+          - pie-client (client/javascript/)
+          - inferlet (sdk/javascript/)
+      dry_run:
+        description: 'Dry run (build but do not publish)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      
+      - name: Determine package path
+        id: info
+        run: |
+          case "${{ inputs.package }}" in
+            "pie-client (client/javascript/)")
+              echo "path=client/javascript" >> $GITHUB_OUTPUT
+              ;;
+            "inferlet (sdk/javascript/)")
+              echo "path=sdk/javascript" >> $GITHUB_OUTPUT
+              ;;
+          esac
+      
+      - name: Install dependencies
+        working-directory: ${{ steps.info.outputs.path }}
+        run: npm ci
+      
+      - name: Build
+        working-directory: ${{ steps.info.outputs.path }}
+        run: npm run build
+      
+      - name: Publish to npm
+        if: inputs.dry_run == false
+        working-directory: ${{ steps.info.outputs.path }}
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      
+      - name: Dry run - show package contents
+        if: inputs.dry_run == true
+        working-directory: ${{ steps.info.outputs.path }}
+        run: npm pack --dry-run

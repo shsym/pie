@@ -220,24 +220,31 @@ pub enum Command {
         name: String,
     },
     // Actor Commands
-    ActorContextRef {
+    ActorGlobalContextRef {
         username: String,
         uid: String,
     },
-    ActorContextDestroy {
+    ActorGlobalContextDestroy {
         username: String,
         uid: String,
     },
-    ActorContextExtend {
+    ActorGlobalContextExtend {
         username: String,
         uid: String,
         page_ids: Vec<u32>,
         last_page_len: u32,
     },
-    ActorContextTrim {
+    ActorGlobalContextTrim {
         username: String,
         uid: String,
         len: u32,
+    },
+    ActorGlobalContextRead {
+        username: String,
+        uid: String,
+        num_tokens: u32,
+        offset: u32,
+        response: oneshot::Sender<Vec<u32>>,
     },
     ActorAdapterRef {
         username: String,
@@ -741,17 +748,23 @@ impl Model {
             }
 
             // Actor Command Handlers (Stubs)
-            Command::ActorContextRef { .. } => {
-                println!("[Warn] ActorContextRef not implemented yet");
+            Command::ActorGlobalContextRef { .. } => {
+                println!("[Warn] ActorGlobalContextRef not implemented yet");
             }
-            Command::ActorContextDestroy { .. } => {
-                println!("[Warn] ActorContextDestroy not implemented yet");
+            Command::ActorGlobalContextDestroy { .. } => {
+                println!("[Warn] ActorGlobalContextDestroy not implemented yet");
             }
-            Command::ActorContextExtend { .. } => {
-                println!("[Warn] ActorContextExtend not implemented yet");
+            Command::ActorGlobalContextExtend { .. } => {
+                println!("[Warn] ActorGlobalContextExtend not implemented yet");
             }
-            Command::ActorContextTrim { .. } => {
-                println!("[Warn] ActorContextTrim not implemented yet");
+            Command::ActorGlobalContextTrim { .. } => {
+                println!("[Warn] ActorGlobalContextTrim not implemented yet");
+            }
+            Command::ActorGlobalContextRead { response, .. } => {
+                 println!("[Warn] ActorGlobalContextRead not implemented yet");
+                 if response.send(vec![]).is_err() {
+                     println!("[Warn] ActorGlobalContextRead response channel closed before sending.");
+                 }
             }
             Command::ActorAdapterRef { .. } => {
                 println!("[Warn] ActorAdapterRef not implemented yet");

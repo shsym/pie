@@ -1,10 +1,11 @@
 interface common {
 
-    resource context {
+    resource global-context {
         constructor(uid: string);
         destroy: func();
         extend: func(page-ids: list<u32>, last-page-len: u32);
         trim: func(len: u32);
+        read: func(num-tokens: u32, offset: u32) -> list<u32>;
     }
 
     resource adapter {

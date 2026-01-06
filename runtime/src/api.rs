@@ -23,7 +23,7 @@ wasmtime::component::bindgen!({
         "inferlet:core/forward/forward-pass": core::forward::ForwardPass,
         "inferlet:core/forward/forward-pass-result": core::forward::ForwardPassResult,
         "inferlet:core/tokenize/tokenizer": core::tokenize::Tokenizer,
-        "inferlet:actor/common/context": actor::Context,
+        "inferlet:actor/common/global-context": actor::GlobalContext,
         "inferlet:actor/common/adapter": actor::Adapter,
         "inferlet:actor/common/optimizer": actor::Optimizer,
     },

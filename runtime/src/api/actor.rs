@@ -5,7 +5,7 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
 #[derive(Debug, Clone)]
-pub struct Context {
+pub struct GlobalContext {
     pub uid: String,
 }
 
@@ -21,30 +21,36 @@ pub struct Optimizer {
 
 impl inferlet::actor::common::Host for InstanceState {}
 
-impl inferlet::actor::common::HostContext for InstanceState {
-    async fn new(&mut self, uid: String) -> Result<Resource<Context>> {
-        let ctx = Context { uid };
+impl inferlet::actor::common::HostGlobalContext for InstanceState {
+    async fn new(&mut self, uid: String) -> Result<Resource<GlobalContext>> {
+        let ctx = GlobalContext { uid };
         Ok(self.ctx().table.push(ctx)?)
     }
 
-    async fn destroy(&mut self, this: Resource<Context>) -> Result<()> {
+    async fn destroy(&mut self, this: Resource<GlobalContext>) -> Result<()> {
         let _ = self.ctx().table.delete(this)?;
         Ok(())
     }
 
-    async fn extend(&mut self, this: Resource<Context>, _page_ids: Vec<u32>, _last_page_len: u32) -> Result<()> {
+    async fn extend(&mut self, this: Resource<GlobalContext>, _page_ids: Vec<u32>, _last_page_len: u32) -> Result<()> {
         let _ctx = self.ctx().table.get(&this)?;
         // TODO: Implement actual logic
         Ok(())
     }
 
-    async fn trim(&mut self, this: Resource<Context>, _len: u32) -> Result<()> {
+    async fn trim(&mut self, this: Resource<GlobalContext>, _len: u32) -> Result<()> {
         let _ctx = self.ctx().table.get(&this)?;
         // TODO: Implement actual logic
         Ok(())
     }
 
-     async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
+    async fn read(&mut self, this: Resource<GlobalContext>, _num_tokens: u32, _offset: u32) -> Result<Vec<u32>> {
+        let _ctx = self.ctx().table.get(&this)?;
+        // TODO: Implement actual logic
+        Ok(vec![])
+    }
+
+     async fn drop(&mut self, this: Resource<GlobalContext>) -> Result<()> {
         let _ = self.ctx().table.delete(this)?;
         Ok(())
     }
