@@ -1,6 +1,6 @@
 """Serve command implementation for Pie CLI.
 
-Implements: pie-server serve
+Implements: pie serve
 Starts the Pie engine and optionally provides an interactive shell session.
 """
 
@@ -12,13 +12,22 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from . import path as pie_path
+from pie import path as pie_path
+from pie import manager
 
 console = Console()
 
 
 def load_config(
     config_path: Path | None,
+    host: str | None = None,
+    port: int | None = None,
+    enable_auth: bool | None = None,
+    no_auth: bool = False,
+    verbose: bool = False,
+    cache_dir: str | None = None,
+    log_dir: str | None = None,
+    registry: str | None = None,
 ) -> tuple[dict, list[dict]]:
     """Load and merge configuration from file and CLI arguments.
 
@@ -36,13 +45,24 @@ def load_config(
 
     # Build engine config with CLI overrides
     engine_config = {
-        "host": config.get("host", "127.0.0.1"),
-        "port": config.get("port", 8080),
-        "enable_auth": config.get("enable_auth", True),
-        "cache_dir": config.get("cache_dir", str(pie_path.get_pie_home() / "cache")),
-        "verbose": config.get("verbose", False),
-        "log_dir": config.get("log_dir", str(pie_path.get_pie_home() / "logs")),
-        "registry": config.get("registry", "https://registry.pie-project.org/"),
+        "host": host or config.get("host", "127.0.0.1"),
+        "port": port or config.get("port", 8080),
+        "enable_auth": (
+            False
+            if no_auth
+            else (
+                enable_auth
+                if enable_auth is not None
+                else config.get("enable_auth", True)
+            )
+        ),
+        "cache_dir": cache_dir
+        or config.get("cache_dir", str(pie_path.get_pie_home() / "cache")),
+        "verbose": verbose or config.get("verbose", False),
+        "log_dir": log_dir
+        or config.get("log_dir", str(pie_path.get_pie_home() / "logs")),
+        "registry": registry
+        or config.get("registry", "https://registry.pie-project.org/"),
     }
 
     model_configs = config.get("model", [])
@@ -57,6 +77,16 @@ def serve(
     config: Path | None = typer.Option(
         None, "--config", "-c", help="Path to TOML configuration file"
     ),
+    host: str | None = typer.Option(None, "--host", help="Override host address"),
+    port: int | None = typer.Option(None, "--port", help="Override port"),
+    no_auth: bool = typer.Option(False, "--no-auth", help="Disable authentication"),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Enable verbose logging"
+    ),
+    cache_dir: str | None = typer.Option(
+        None, "--cache-dir", help="Cache directory path"
+    ),
+    log_dir: str | None = typer.Option(None, "--log-dir", help="Log directory path"),
     interactive: bool = typer.Option(
         False, "--interactive", "-i", help="Enable interactive shell mode"
     ),
@@ -67,12 +97,17 @@ def serve(
     services. In interactive mode, it provides a shell for running inferlets.
     """
     try:
-        engine_config, model_configs = load_config(config)
+        engine_config, model_configs = load_config(
+            config,
+            host=host,
+            port=port,
+            no_auth=no_auth,
+            verbose=verbose,
+            cache_dir=cache_dir,
+            log_dir=log_dir,
+        )
     except typer.Exit:
         raise
-
-    # Import here to avoid circular imports and allow module to load without Rust
-    from . import manager
 
     console.print()
 
@@ -100,20 +135,15 @@ def serve(
 
     try:
         # Start engine and backends
-        # manager.start_engine_and_backend handles the spinner UI
         server_handle, backend_processes = manager.start_engine_and_backend(
             engine_config, model_configs, console=console
         )
-
-        # console.print("[green]✓[/green] Engine running. [dim]Press Ctrl+C to stop[/dim]")
 
         if interactive:
             console.print("[dim]Type 'help' for commands, ↑/↓ for history[/dim]")
             console.print()
             manager.run_interactive_shell(engine_config, server_handle.internal_token)
         else:
-            import signal
-
             import time
 
             try:
@@ -143,6 +173,9 @@ def serve(
         with console.status("[dim]Shutting down...[/dim]"):
             manager.terminate_engine_and_backend(server_handle, backend_processes)
         console.print("[green]✓[/green] Shutdown complete")
+    except manager.EngineError as e:
+        console.print(f"[red]✗[/red] {e}")
+        raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]✗[/red] Error: {e}")
         manager.terminate_engine_and_backend(server_handle, backend_processes)

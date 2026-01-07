@@ -1,4 +1,4 @@
-"""Tests for pie_cli.config module."""
+"""Tests for pie.config and pie_cli.config module."""
 
 import os
 from pathlib import Path
@@ -8,7 +8,7 @@ import pytest
 import toml
 from typer.testing import CliRunner
 
-from pie_cli import config
+from pie import config
 from pie_cli.cli import app
 
 runner = CliRunner()
@@ -17,37 +17,26 @@ runner = CliRunner()
 class TestCreateDefaultConfigContent:
     """Tests for create_default_config_content function."""
 
-    def test_python_backend_default(self):
-        """Creates config with Python backend by default."""
+    def test_default_config(self):
+        """Creates config with model configuration."""
         content = config.create_default_config_content()
         parsed = toml.loads(content)
 
         assert parsed["host"] == "127.0.0.1"
         assert parsed["port"] == 8080
         assert parsed["enable_auth"] is True
-        assert len(parsed["backend"]) == 1
-        assert parsed["backend"][0]["backend_type"] == "python"
-        assert parsed["backend"][0]["exec_path"] == "pie-backend"
-        assert parsed["backend"][0]["model"] == "qwen-3-0.6b"
-        assert parsed["backend"][0]["device"] == "cuda:0"
-        assert parsed["backend"][0]["activation_dtype"] == "bfloat16"
-        assert parsed["backend"][0]["kv_page_size"] == 16
-        assert parsed["backend"][0]["max_batch_tokens"] == 10240
-        assert parsed["backend"][0]["max_dist_size"] == 32
-        assert parsed["backend"][0]["max_num_embeds"] == 128
-        assert parsed["backend"][0]["max_num_adapters"] == 32
-        assert parsed["backend"][0]["max_adapter_rank"] == 8
-        assert parsed["backend"][0]["gpu_mem_utilization"] == 0.9
-        assert parsed["backend"][0]["enable_profiling"] is False
-
-    def test_dummy_backend(self):
-        """Creates minimal config with dummy backend."""
-        content = config.create_default_config_content("dummy")
-        parsed = toml.loads(content)
-
-        assert parsed["backend"][0]["backend_type"] == "dummy"
-        # Dummy backend should not have exec_path
-        assert "exec_path" not in parsed["backend"][0]
+        assert len(parsed["model"]) == 1
+        assert parsed["model"][0]["hf_repo"] == "Qwen/Qwen3-0.6B"
+        assert parsed["model"][0]["device"] == ["cuda:0"]
+        assert parsed["model"][0]["activation_dtype"] == "bfloat16"
+        assert parsed["model"][0]["kv_page_size"] == 16
+        assert parsed["model"][0]["max_batch_tokens"] == 10240
+        assert parsed["model"][0]["max_dist_size"] == 32
+        assert parsed["model"][0]["max_num_embeds"] == 128
+        assert parsed["model"][0]["max_num_adapters"] == 32
+        assert parsed["model"][0]["max_adapter_rank"] == 8
+        assert parsed["model"][0]["gpu_mem_utilization"] == 0.9
+        assert parsed["model"][0]["enable_profiling"] is False
 
 
 class TestConfigInit:
@@ -62,18 +51,6 @@ class TestConfigInit:
         assert result.exit_code == 0
         assert config_path.exists()
         assert "Configuration file created" in result.stdout
-
-    def test_init_with_dummy_backend(self, tmp_path):
-        """Creates config with dummy backend when --dummy is specified."""
-        config_path = tmp_path / "config.toml"
-
-        result = runner.invoke(
-            app, ["config", "init", "--dummy", "--path", str(config_path)]
-        )
-
-        assert result.exit_code == 0
-        parsed = toml.loads(config_path.read_text())
-        assert parsed["backend"][0]["backend_type"] == "dummy"
 
 
 class TestConfigShow:
@@ -108,7 +85,7 @@ class TestConfigUpdate:
         """Updates host in config file."""
         config_path = tmp_path / "config.toml"
         config_path.write_text(
-            'host = "127.0.0.1"\nport = 8080\n[[backend]]\nbackend_type = "dummy"\n'
+            'host = "127.0.0.1"\nport = 8080\n[[model]]\nhf_repo = "test/model"\n'
         )
 
         result = runner.invoke(
@@ -123,7 +100,7 @@ class TestConfigUpdate:
         """Updates port in config file."""
         config_path = tmp_path / "config.toml"
         config_path.write_text(
-            'host = "127.0.0.1"\nport = 8080\n[[backend]]\nbackend_type = "dummy"\n'
+            'host = "127.0.0.1"\nport = 8080\n[[model]]\nhf_repo = "test/model"\n'
         )
 
         result = runner.invoke(
@@ -134,11 +111,11 @@ class TestConfigUpdate:
         updated = toml.loads(config_path.read_text())
         assert updated["port"] == 9090
 
-    def test_update_backend_model(self, tmp_path):
-        """Updates backend model in config file."""
+    def test_update_model_hf_repo(self, tmp_path):
+        """Updates model hf_repo in config file."""
         config_path = tmp_path / "config.toml"
         config_path.write_text(
-            'host = "127.0.0.1"\nport = 8080\n[[backend]]\nbackend_type = "python"\nmodel = "old-model"\n'
+            'host = "127.0.0.1"\nport = 8080\n[[model]]\nhf_repo = "old/model"\n'
         )
 
         result = runner.invoke(
@@ -146,8 +123,8 @@ class TestConfigUpdate:
             [
                 "config",
                 "update",
-                "--backend-model",
-                "new-model",
+                "--hf-repo",
+                "new/model",
                 "--path",
                 str(config_path),
             ],
@@ -155,7 +132,7 @@ class TestConfigUpdate:
 
         assert result.exit_code == 0
         updated = toml.loads(config_path.read_text())
-        assert updated["backend"][0]["model"] == "new-model"
+        assert updated["model"][0]["hf_repo"] == "new/model"
 
     def test_update_no_options_warning(self, tmp_path):
         """Shows warning when no options provided."""

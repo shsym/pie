@@ -21,7 +21,7 @@
 
 
 ```bash
-pip install "pie-server"
+pip install pie-server
 ```
 
 Quick start:
@@ -30,7 +30,7 @@ Quick start:
 pie config init
 pie model download Qwen/Qwen3-0.6B
 
-pie run text-completion -- -p "Hello world"
+pie run text-completion -- --prompt "Hello world"
 ```
 
 
@@ -38,7 +38,9 @@ Check out the [https://pie-project.org/docs](https://pie-project.org/) for more 
 
 ## Community
 
-Visit [Discussions](https://github.com/pie-project/pie/discussions) for questions and feedbacks.
+**Issues & Bugs**: Please report bugs on [GitHub Issues](https://github.com/pie-project/pie/issues).
+
+**Discussions**: Have a question or feedback? Join us on [GitHub Discussions](https://github.com/pie-project/pie/discussions).
 
 ## License
 

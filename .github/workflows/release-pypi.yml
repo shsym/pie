@@ -8,7 +8,7 @@ on:
         required: true
         type: choice
         options:
-          - pie-server (control/)
+          - pie-server (server/)
           - pie-client (client/python/)
           - pie-backend (runtime-backend/)
           - pie-bakery (sdk/tools/bakery/)
@@ -24,7 +24,7 @@ permissions:
 env:
   PACKAGE_PATHS: |
     {
-      "pie-server (control/)": "control",
+      "pie-server (server/)": "server",
       "pie-client (client/python/)": "client/python",
       "pie-client-cli (client/cli/)": "client/cli",
       "pie-backend (runtime-backend/)": "runtime-backend",
@@ -43,8 +43,8 @@ jobs:
         id: info
         run: |
           case "${{ inputs.package }}" in
-            "pie-server (control/)")
-              echo "path=control" >> $GITHUB_OUTPUT
+            "pie-server (server/)")
+              echo "path=server" >> $GITHUB_OUTPUT
               echo "is_maturin=true" >> $GITHUB_OUTPUT
               ;;
             "pie-client (client/python/)")

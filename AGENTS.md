@@ -7,7 +7,7 @@ This document provides a concise overview of the key directories and components 
 *   **Path**: `runtime/`
 *   **Language**: Rust
 *   **Description**: This is the core "Engine" of Pie. It implements the high-performance logic including the WASM runtime (based on Wasmtime), request scheduling, and networking (ZeroMQ).
-*   **Integration**: It exposes a Python interface via PyO3, allowing it to be controlled by the `control` layer.
+*   **Integration**: It exposes a Python interface via PyO3, allowing it to be controlled by the `server` layer.
 *   **Key Dependencies**: `wasmtime`, `tokio`, `zeromq`, `pyo3`.
 
 ## `runtime-backend`
@@ -18,9 +18,9 @@ This document provides a concise overview of the key directories and components 
 *   **Execution**: It runs as a separate process launched by the Engine, communicating via ZeroMQ.
 *   **Key Features**: CUDA/Metal support, FlashInfer integration.
 
-## `control`
+## `server`
 **Main Entrypoint and CLI (`pie`).**
-*   **Path**: `control/`
+*   **Path**: `server/`
 *   **Language**: Python (`pie-server`)
 *   **Description**: The primary interface for the user. It wraps the `runtime` (Rust) and orchestrates the `runtime-backend`.
 *   **CLI**: Provides the `pie` command.
@@ -50,9 +50,3 @@ This document provides a concise overview of the key directories and components 
 **Client Libraries.**
 *   **Path**: `client/`
 *   **Description**: Contains client-side libraries for connecting to a serving Pie instance.
-
-### `client/cli`
-**Standalone Client CLI (`pie-client`).**
-*   **Path**: `client/cli/`
-*   **Language**: Python (`pie-client-cli`)
-*   **Description**: A lightweight CLI (`pie-client`) for interacting with a remote Pie server. It allows submitting tasks and streaming results without needing the full server stack installed.

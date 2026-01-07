@@ -2,9 +2,8 @@
 
 import os
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
-import pytest
 from typer.testing import CliRunner
 
 from pie_cli.cli import app
@@ -36,7 +35,6 @@ class TestCliHelp:
         assert "--port" in result.stdout
         assert "--no-auth" in result.stdout
         assert "--verbose" in result.stdout
-        assert "--log" in result.stdout
         assert "--interactive" in result.stdout
 
     def test_run_help(self):
@@ -44,7 +42,8 @@ class TestCliHelp:
         result = runner.invoke(app, ["run", "--help"])
 
         assert result.exit_code == 0
-        assert "INFERLET" in result.stdout.upper()
+        # Check argument name in help (typer converts underscores to uppercase usually)
+        assert "INFERLET" in result.stdout or "inferlet" in result.stdout
         assert "--config" in result.stdout
         assert "--log" in result.stdout
 
@@ -62,11 +61,11 @@ class TestCliHelp:
         result = runner.invoke(app, ["config", "init", "--help"])
 
         assert result.exit_code == 0
-        assert "--dummy" in result.stdout
+        # --dummy was removed
         assert "--path" in result.stdout
 
     def test_config_update_help(self):
-        """Shows config update options - all backend options."""
+        """Shows config update options - updated schema."""
         result = runner.invoke(app, ["config", "update", "--help"])
 
         assert result.exit_code == 0
@@ -74,24 +73,15 @@ class TestCliHelp:
         assert "--host" in result.stdout
         assert "--port" in result.stdout
         assert "--enable-auth" in result.stdout
-        assert "--cache-dir" in result.stdout
         assert "--verbose" in result.stdout
-        assert "--log" in result.stdout
-        # Backend options
-        assert "--backend-type" in result.stdout
-        assert "--backend-exec-path" in result.stdout
-        assert "--backend-model" in result.stdout
-        assert "--backend-device" in result.stdout
-        assert "--backend-activation-dtype" in result.stdout
-        assert "--backend-weight-dtype" in result.stdout
-        assert "--backend-kv-page-size" in result.stdout
-        assert "--backend-max-batch-tokens" in result.stdout
-        assert "--backend-max-dist-size" in result.stdout
-        assert "--backend-max-num-embeds" in result.stdout
-        assert "--backend-max-num-adapters" in result.stdout
-        assert "--backend-max-adapter-rank" in result.stdout
-        assert "--backend-gpu-mem-utilization" in result.stdout
-        assert "--backend-enable-profiling" in result.stdout
+        # Model options (new schema)
+        assert "--hf-repo" in result.stdout
+        assert "--device" in result.stdout
+        assert "--activation-dtype" in result.stdout
+        assert "--weight-dtype" in result.stdout
+        assert "--kv-page-size" in result.stdout
+        # Legacy backend options removed
+        assert "--backend-type" not in result.stdout
 
     def test_model_help(self):
         """Shows model subcommands."""
@@ -99,10 +89,8 @@ class TestCliHelp:
 
         assert result.exit_code == 0
         assert "list" in result.stdout
-        assert "add" in result.stdout
+        assert "download" in result.stdout
         assert "remove" in result.stdout
-        assert "search" in result.stdout
-        assert "info" in result.stdout
 
     def test_auth_help(self):
         """Shows auth subcommands."""
@@ -119,11 +107,13 @@ class TestServeCommand:
 
     def test_serve_missing_config(self, tmp_path):
         """Returns error when config file doesn't exist."""
-        with patch.dict(os.environ, {"PIE_HOME": str(tmp_path / ".pie")}):
-            result = runner.invoke(app, ["serve"])
+        # Need to patch get_default_config_path or provide custom path
+        # If we provide custom non-existent path, it should fail
+        result = runner.invoke(
+            app, ["serve", "--config", str(tmp_path / "missing.toml")]
+        )
 
         assert result.exit_code == 1
-        # Error messages go to stderr, check combined output
         assert "not found" in result.output.lower()
 
 
@@ -131,9 +121,10 @@ class TestRunCommand:
     """Tests for run command."""
 
     def test_run_missing_inferlet(self, tmp_path):
-        """Returns error when inferlet doesn't exist."""
-        result = runner.invoke(app, ["run", str(tmp_path / "nonexistent.wasm")])
+        """Returns error when inferlet path doesn't exist."""
+        result = runner.invoke(
+            app, ["run", "--path", str(tmp_path / "nonexistent.wasm")]
+        )
 
         assert result.exit_code == 1
-        # Error messages go to stderr, check combined output
         assert "not found" in result.output.lower()

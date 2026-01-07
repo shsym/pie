@@ -1,6 +1,6 @@
 """Run command implementation for Pie CLI.
 
-Implements: pie-server run <inferlet> [args]
+Implements: pie run <inferlet> [args]
 Runs an inferlet with a one-shot Pie engine instance.
 """
 
@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
+from pie import manager
 from . import serve as serve_module
 
 console = Console()
@@ -27,6 +28,7 @@ def run(
     config: Optional[Path] = typer.Option(
         None, "--config", "-c", help="Path to TOML configuration file"
     ),
+    log: Optional[Path] = typer.Option(None, "--log", help="Path to log file"),
     arguments: Optional[list[str]] = typer.Argument(
         None, help="Arguments to pass to the inferlet"
     ),
@@ -59,11 +61,11 @@ def run(
         raise typer.Exit(1)
 
     try:
-        engine_config, model_configs = serve_module.load_config(config)
+        engine_config, model_configs = serve_module.load_config(
+            config, log_dir=str(log.parent) if log else None
+        )
     except typer.Exit:
         raise
-
-    from . import manager
 
     console.print()
 
@@ -83,12 +85,10 @@ def run(
 
     try:
         # Start engine and backends
-        with console.status("[dim]Starting engine...[/dim]"):
-            server_handle, backend_processes = manager.start_engine_and_backend(
-                engine_config, model_configs
-            )
+        server_handle, backend_processes = manager.start_engine_and_backend(
+            engine_config, model_configs, console=console
+        )
 
-        console.print("[green]✓[/green] Engine started")
         console.print()
 
         # Run the inferlet
@@ -124,6 +124,10 @@ def run(
         with console.status("[dim]Shutting down...[/dim]"):
             manager.terminate_engine_and_backend(server_handle, backend_processes)
         raise typer.Exit(130)
+    except manager.EngineError as e:
+        console.print(f"[red]✗[/red] {e}")
+        manager.terminate_engine_and_backend(server_handle, backend_processes)
+        raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]✗[/red] Error: {e}")
         manager.terminate_engine_and_backend(server_handle, backend_processes)

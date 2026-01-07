@@ -1,18 +1,14 @@
-"""Engine and backend management for Pie CLI.
+"""Engine and backend management for Pie.
 
-This module handles the lifecycle of the Pie engine and backend services,
-mirroring Rust cli/manager.rs functionality.
+This module handles the lifecycle of the Pie engine and backend services.
 """
 
 import multiprocessing
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
-
-import typer
+from typing import Optional, Any, TYPE_CHECKING
 
 from . import path as pie_path
 
@@ -20,29 +16,50 @@ if TYPE_CHECKING:
     from . import pie_rs
 
 
+class EngineError(Exception):
+    """Exception raised for engine/backend errors."""
+
+    pass
+
+
 def start_engine_and_backend(
     engine_config: dict,
     model_configs: list[dict],
     timeout: float = 60.0,
-    console: Optional["typer.rich_utils.Console"] = None,
-) -> tuple["pie_rs.ServerHandle", list[subprocess.Popen]]:
+    console: Optional[Any] = None,
+    on_status: Optional[callable] = None,
+    on_message: Optional[callable] = None,
+) -> tuple["pie_rs.ServerHandle", list]:
     """Start the Pie engine and all configured backend services.
 
     Args:
         engine_config: Engine configuration dict
         model_configs: List of model configurations (formerly backend_configs)
         timeout: Maximum time to wait for backends to connect (seconds)
+        console: Optional rich.console.Console for output
+        on_status: Optional callback for status updates: (status_message: str) -> None
+        on_message: Optional callback for log messages: (level: str, message: str) -> None
 
     Returns:
         Tuple of (ServerHandle, list of backend processes)
+
+    Raises:
+        EngineError: If engine or backend fails to start
     """
     from . import pie_rs
-    from rich.console import Console
-    from rich.control import Control, ControlType
 
-    # Use passed console or create new one
-    if console is None:
-        console = Console()
+    # Setup console if available
+    use_rich = console is not None
+    if use_rich:
+        from rich.console import Console
+
+    def status_update(msg: str):
+        if on_status:
+            on_status(msg)
+
+    def log_message(level: str, msg: str):
+        if on_message:
+            on_message(level, msg)
 
     # Load authorized users if auth is enabled
     authorized_users_path = None
@@ -64,33 +81,35 @@ def start_engine_and_backend(
 
     # Start the engine - returns a ServerHandle
     server_handle = pie_rs.start_server(server_config, authorized_users_path)
-    # typer.echo(f"✅ Engine started (token: {server_handle.internal_token[:8]}...)") - Removed for minimalism
 
     # Count expected backends
     expected_backends = 0
 
     # Create log queue for backend communication
-    # We use a multiprocessing Manager Queue to ensure it works across process boundaries reliably
-    manager_obj = (
-        multiprocessing.Manager()
-    )  # Renamed to avoid shadowing 'manager' module
+    manager_obj = multiprocessing.Manager()
     log_queue = manager_obj.Queue()
 
     # Launch backend processes
-    backend_processes: list["multiprocessing.Process | subprocess.Popen"] = []
+    backend_processes: list = []
 
-    # Start log monitor thread
-    import threading
+    # Start log monitor thread if console available
+    if console is not None:
+        import threading
 
-    log_monitor_thread = threading.Thread(
-        target=backend_log_monitor, args=(log_queue, console), daemon=True
-    )
-    log_monitor_thread.start()
+        log_monitor_thread = threading.Thread(
+            target=backend_log_monitor, args=(log_queue, console), daemon=True
+        )
+        log_monitor_thread.start()
 
-    with console.status("Starting engine...", spinner="dots") as status:
+    # Context manager for status display
+    status_ctx = None
+    if console is not None:
+        status_ctx = console.status("Starting engine...", spinner="dots")
+        status_ctx.__enter__()
+
+    try:
         for model_config in model_configs:
-            # Spawn pie-backend directly using multiprocessing
-            status.update(f"Spawning backend (pie-backend)...")
+            status_update("Spawning backend (pie-backend)...")
             try:
                 process = spawn_python_backend(
                     engine_config, model_config, server_handle.internal_token, log_queue
@@ -98,27 +117,30 @@ def start_engine_and_backend(
                 backend_processes.append(process)
                 expected_backends += 1
             except Exception as e:
-                console.print(f"❌ Failed to spawn backend: {e}")
                 for p in backend_processes:
                     p.terminate()
                 server_handle.shutdown()
-                raise typer.Exit(1)
+                raise EngineError(f"Failed to spawn backend: {e}") from e
 
         # Wait for backends to register with the engine
         if expected_backends > 0:
-            status.update(f"Waiting for {expected_backends} backend(s) to connect...")
+            status_update(f"Waiting for {expected_backends} backend(s) to connect...")
             if not wait_for_backends(
                 server_handle, expected_backends, timeout, backend_processes
             ):
-                console.print("❌ Timeout waiting for backends to connect")
                 for p in backend_processes:
                     p.terminate()
                 server_handle.shutdown()
-                raise typer.Exit(1)
-            # Backend connected
+                raise EngineError("Timeout waiting for backends to connect")
+    finally:
+        if status_ctx is not None:
+            status_ctx.__exit__(None, None, None)
 
     # Final success message
-    console.print("[green]✓[/green] Engine running. [dim]Press Ctrl+C to stop[/dim]")
+    if console is not None:
+        console.print(
+            "[green]✓[/green] Engine running. [dim]Press Ctrl+C to stop[/dim]"
+        )
 
     return server_handle, backend_processes
 
@@ -186,13 +208,12 @@ def _run_backend_process(**kwargs):
 
     This runs in a separate process and imports/calls pie_backend.main().
     """
-
     from pie_backend.__main__ import main
 
     main(**kwargs)
 
 
-def backend_log_monitor(log_queue: multiprocessing.Queue, console: "Console"):
+def backend_log_monitor(log_queue: multiprocessing.Queue, console: Any):
     """Monitor loop for backend logs."""
     import queue
 
@@ -206,32 +227,24 @@ def backend_log_monitor(log_queue: multiprocessing.Queue, console: "Console"):
 
             if level == "DEBUG":
                 # Suppress DEBUG logs completely for cleaner output
-                # If we really want them, we could add a verbose flag, but for now user wants silence
                 continue
             elif level == "SUCCESS":
                 console.print(f"  ✅ {msg}")
             elif level == "WARNING":
                 console.print(f"  ⚠️ {msg}")
             elif level == "ERROR":
-                # Errors are important, make them visible
                 console.print(f"  ❌ [bold red][backend: error][/bold red] {msg}")
             else:
-                # Standard INFO
                 level_str = "info"
-
-            # If msg is "Starting server..." we might want to skip it if it's redundant
-            if "Starting server" in msg:
-                continue
-
-            # Default dimmed formatting
-            console.print(f"[dim]  [backend: {level_str}] {msg}[/dim]")
+                if "Starting server" in msg:
+                    continue
+                console.print(f"[dim]  [backend: {level_str}] {msg}[/dim]")
 
         except queue.Empty:
             continue
         except (KeyboardInterrupt, EOFError):
             break
         except Exception:
-            # Ignore monitoring errors to avoid crashing main thread
             pass
 
 
@@ -270,17 +283,18 @@ def wait_for_backends(
     return False
 
 
-def check_backend_processes(backend_processes: list) -> bool:
+def check_backend_processes(
+    backend_processes: list, on_error: Optional[callable] = None
+) -> bool:
     """Check if all backend processes are still alive.
 
     Args:
         backend_processes: List of backend processes to check
+        on_error: Optional callback for error messages: (message: str) -> None
 
     Returns:
         True if all processes are alive, False if any have died
     """
-    import subprocess
-
     all_alive = True
     for process in backend_processes:
         is_dead = False
@@ -300,12 +314,13 @@ def check_backend_processes(backend_processes: list) -> bool:
 
         if is_dead:
             all_alive = False
-            typer.echo(
-                f"❌ Backend process exited unexpectedly (exit code {return_code})",
-                err=True,
-            )
+            error_msg = f"Backend process exited unexpectedly (exit code {return_code})"
             if stderr:
-                typer.echo(f"   stderr: {stderr[:500]}", err=True)
+                error_msg += f" stderr: {stderr[:500]}"
+            if on_error:
+                on_error(error_msg)
+            else:
+                print(f"❌ {error_msg}", file=sys.stderr)
 
     return all_alive
 
@@ -313,14 +328,20 @@ def check_backend_processes(backend_processes: list) -> bool:
 def terminate_engine_and_backend(
     server_handle: "pie_rs.ServerHandle | None",
     backend_processes: list,
+    on_message: Optional[callable] = None,
 ) -> None:
     """Terminate the engine and backend processes.
 
     Args:
         server_handle: The server handle (or None if already shut down)
         backend_processes: List of backend subprocess.Popen objects
+        on_message: Optional callback for status messages: (message: str) -> None
     """
     import signal
+
+    def log(msg: str):
+        if on_message:
+            on_message(msg)
 
     for process in backend_processes:
         is_running = False
@@ -331,7 +352,7 @@ def terminate_engine_and_backend(
         else:
             is_running = process.is_alive()
 
-        if is_running:  # Still running
+        if is_running:
             try:
                 if isinstance(process, subprocess.Popen):
                     process.send_signal(signal.SIGTERM)
@@ -342,10 +363,10 @@ def terminate_engine_and_backend(
                     if process.is_alive():
                         raise subprocess.TimeoutExpired(cmd=str(pid), timeout=5)
             except subprocess.TimeoutExpired:
-                typer.echo(f"  Force killing process {pid}")
+                log(f"Force killing process {pid}")
                 process.kill()
             except Exception as e:
-                typer.echo(f"  Error terminating process {pid}: {e}")
+                log(f"Error terminating process {pid}: {e}")
 
     # Gracefully shut down the engine
     if server_handle is not None:
@@ -353,7 +374,7 @@ def terminate_engine_and_backend(
             if server_handle.is_running():
                 server_handle.shutdown()
         except Exception as e:
-            typer.echo(f"  Error shutting down engine: {e}")
+            log(f"Error shutting down engine: {e}")
 
 
 def run_interactive_shell(engine_config: dict, internal_token: str) -> None:
@@ -383,20 +404,20 @@ def run_interactive_shell(engine_config: dict, internal_token: str) -> None:
         "internal_auth_token": internal_token,
     }
 
-    typer.echo("Available commands:")
-    typer.echo("  run <path> [ARGS]... - Run a .wasm inferlet with optional arguments")
-    typer.echo("  stat                 - Query the backend statistics")
-    typer.echo("  exit                 - Exit the Pie session")
-    typer.echo("  help                 - Show this help message")
+    print("Available commands:")
+    print("  run <path> [ARGS]... - Run a .wasm inferlet with optional arguments")
+    print("  stat                 - Query the backend statistics")
+    print("  exit                 - Exit the Pie session")
+    print("  help                 - Show this help message")
 
     while True:
         try:
             line = input("pie> ")
         except EOFError:
-            typer.echo("Exiting...")
+            print("Exiting...")
             break
         except KeyboardInterrupt:
-            typer.echo("\n(To exit, type 'exit' or press Ctrl-D)")
+            print("\n(To exit, type 'exit' or press Ctrl-D)")
             continue
 
         line = line.strip()
@@ -408,30 +429,28 @@ def run_interactive_shell(engine_config: dict, internal_token: str) -> None:
         args = parts[1:]
 
         if command == "exit":
-            typer.echo("Exiting...")
+            print("Exiting...")
             break
         elif command == "help":
-            typer.echo("Available commands:")
-            typer.echo("  run <path> [ARGS]... - Run a .wasm inferlet")
-            typer.echo("  stat                 - Query backend statistics")
-            typer.echo("  exit                 - Exit the session")
-            typer.echo("  help                 - Show this help message")
+            print("Available commands:")
+            print("  run <path> [ARGS]... - Run a .wasm inferlet")
+            print("  stat                 - Query backend statistics")
+            print("  exit                 - Exit the session")
+            print("  help                 - Show this help message")
         elif command == "run":
             if not args:
-                typer.echo("Usage: run <inferlet_path> [ARGS]...")
+                print("Usage: run <inferlet_path> [ARGS]...")
                 continue
             inferlet_path = Path(args[0]).expanduser()
             inferlet_args = args[1:]
             try:
                 submit_inferlet_and_wait(client_config, inferlet_path, inferlet_args)
             except Exception as e:
-                typer.echo(f"Error running inferlet: {e}")
+                print(f"Error running inferlet: {e}")
         elif command == "stat":
-            typer.echo("(stat command not yet implemented)")
+            print("(stat command not yet implemented)")
         else:
-            typer.echo(
-                f"Unknown command: '{command}'. Type 'help' for a list of commands."
-            )
+            print(f"Unknown command: '{command}'. Type 'help' for a list of commands.")
 
     # Save history
     try:
@@ -447,6 +466,7 @@ def submit_inferlet_and_wait(
     arguments: list[str],
     server_handle: "pie_rs.ServerHandle | None" = None,
     backend_processes: list | None = None,
+    on_event: Optional[callable] = None,
 ) -> None:
     """Submit an inferlet to the engine and wait for it to finish.
 
@@ -454,12 +474,20 @@ def submit_inferlet_and_wait(
         client_config: Client configuration with host, port, internal_auth_token
         inferlet_path: Path to the .wasm inferlet file
         arguments: Arguments to pass to the inferlet
+        server_handle: Optional server handle for process monitoring
+        backend_processes: Optional list of backend processes to monitor
+        on_event: Optional callback for events: (event_type: str, message: str) -> None
     """
     import asyncio
 
     asyncio.run(
         _submit_inferlet_async(
-            client_config, inferlet_path, arguments, server_handle, backend_processes
+            client_config,
+            inferlet_path,
+            arguments,
+            server_handle,
+            backend_processes,
+            on_event,
         )
     )
 
@@ -470,11 +498,18 @@ async def _submit_inferlet_async(
     arguments: list[str],
     server_handle: "pie_rs.ServerHandle | None" = None,
     backend_processes: list | None = None,
+    on_event: Optional[callable] = None,
 ) -> None:
     """Async implementation of submit_inferlet_and_wait."""
     import blake3
     import asyncio
     from pie_client import PieClient, Event
+
+    def emit(event_type: str, msg: str):
+        if on_event:
+            on_event(event_type, msg)
+        else:
+            print(msg)
 
     # Check inferlet exists
     if not inferlet_path.exists():
@@ -483,7 +518,7 @@ async def _submit_inferlet_async(
     # Read and hash the inferlet
     inferlet_blob = inferlet_path.read_bytes()
     program_hash = blake3.blake3(inferlet_blob).hexdigest()
-    typer.echo(f"Inferlet hash: {program_hash}")
+    emit("info", f"Inferlet hash: {program_hash}")
 
     # Build the WebSocket URI
     host = client_config.get("host", "127.0.0.1")
@@ -505,25 +540,23 @@ async def _submit_inferlet_async(
 
             # Check if program already exists, upload if not
             if not await client.program_exists(program_hash):
-                typer.echo("Uploading inferlet...")
+                emit("info", "Uploading inferlet...")
                 await client.upload_program(inferlet_blob)
             else:
-                typer.echo("Inferlet already cached on server.")
+                emit("info", "Inferlet already cached on server.")
 
             # Launch the instance
-            typer.echo(f"Launching {inferlet_path.name}...")
+            emit("info", f"Launching {inferlet_path.name}...")
             instance = await client.launch_instance(
                 program_hash=program_hash,
                 arguments=arguments,
                 detached=False,
             )
-            typer.echo(f"Instance launched: {instance.instance_id}")
+            emit("info", f"Instance launched: {instance.instance_id}")
 
             # Stream events until completion
             while True:
-                # Wait for either new message or monitor failure
                 recv_task = asyncio.create_task(instance.recv())
-
                 tasks = [recv_task]
                 if monitor_task:
                     tasks.append(monitor_task)
@@ -533,44 +566,37 @@ async def _submit_inferlet_async(
                 )
 
                 if monitor_task in done:
-                    # Monitor task finished (meaning it raised exception)
-                    monitor_task.result()  # Re-raise exception
+                    monitor_task.result()
 
-                # If we get here, recv_task must be done
                 event, message = recv_task.result()
 
                 if event == Event.Stdout:
-                    # Stream stdout without extra newline
                     print(message, end="", flush=True)
                 elif event == Event.Stderr:
-                    # Stream stderr to stderr
-                    import sys
-
                     print(message, end="", file=sys.stderr, flush=True)
                 elif event == Event.Message:
-                    typer.echo(f"[Message] {message}")
+                    emit("message", f"[Message] {message}")
                 elif event == Event.Completed:
-                    typer.echo(f"{message}")
+                    emit("completed", f"{message}")
                     break
                 elif event == Event.Aborted:
-                    typer.echo(f"⚠️ Instance aborted: {message}")
+                    emit("aborted", f"⚠️ Instance aborted: {message}")
                     break
                 elif event == Event.Exception:
-                    typer.echo(f"❌ Instance exception: {message}", err=True)
+                    emit("exception", f"❌ Instance exception: {message}")
                     break
                 elif event == Event.ServerError:
-                    typer.echo(f"❌ Server error: {message}", err=True)
+                    emit("error", f"❌ Server error: {message}")
                     break
                 elif event == Event.OutOfResources:
-                    typer.echo(f"❌ Out of resources: {message}", err=True)
+                    emit("error", f"❌ Out of resources: {message}")
                     break
                 elif event == Event.Blob:
-                    typer.echo(f"[Received blob: {len(message)} bytes]")
+                    emit("blob", f"[Received blob: {len(message)} bytes]")
                 else:
-                    typer.echo(f"[Unknown event {event}]: {message}")
+                    emit("unknown", f"[Unknown event {event}]: {message}")
 
     finally:
-        # If we have a monitor task, cancel it
         if monitor_task:
             monitor_task.cancel()
             try:
@@ -591,10 +617,8 @@ async def _monitor_processes_task(
 
     while True:
         if not check_backend_processes(backend_processes):
-            # If any backend dies, we raise an exception to cancel the run
             raise RuntimeError("Backend process died")
 
-        # Also check engine if possible
         if server_handle and hasattr(server_handle, "is_running"):
             if not server_handle.is_running():
                 raise RuntimeError("Engine process died")
@@ -608,6 +632,7 @@ def submit_inferlet_from_registry_and_wait(
     arguments: list[str],
     server_handle: "pie_rs.ServerHandle | None" = None,
     backend_processes: list | None = None,
+    on_event: Optional[callable] = None,
 ) -> None:
     """Submit an inferlet from the registry and wait for it to finish.
 
@@ -615,12 +640,20 @@ def submit_inferlet_from_registry_and_wait(
         client_config: Client configuration with host, port, internal_auth_token
         inferlet_name: Inferlet name (e.g., "std/text-completion@0.1.0")
         arguments: Arguments to pass to the inferlet
+        server_handle: Optional server handle for process monitoring
+        backend_processes: Optional list of backend processes to monitor
+        on_event: Optional callback for events: (event_type: str, message: str) -> None
     """
     import asyncio
 
     asyncio.run(
         _submit_inferlet_from_registry_async(
-            client_config, inferlet_name, arguments, server_handle, backend_processes
+            client_config,
+            inferlet_name,
+            arguments,
+            server_handle,
+            backend_processes,
+            on_event,
         )
     )
 
@@ -631,10 +664,17 @@ async def _submit_inferlet_from_registry_async(
     arguments: list[str],
     server_handle: "pie_rs.ServerHandle | None" = None,
     backend_processes: list | None = None,
+    on_event: Optional[callable] = None,
 ) -> None:
     """Async implementation of submit_inferlet_from_registry_and_wait."""
     import asyncio
     from pie_client import PieClient, Event
+
+    def emit(event_type: str, msg: str):
+        if on_event:
+            on_event(event_type, msg)
+        else:
+            print(msg)
 
     # Build the WebSocket URI
     host = client_config.get("host", "127.0.0.1")
@@ -655,19 +695,15 @@ async def _submit_inferlet_from_registry_async(
             await client.internal_authenticate(internal_token)
 
             # Launch the instance from registry
-            # typer.echo(f"Launching {inferlet_name} from registry...")
             instance = await client.launch_instance_from_registry(
                 inferlet=inferlet_name,
                 arguments=arguments,
                 detached=False,
             )
-            # typer.echo(f"Instance launched: {instance.instance_id}")
 
             # Stream events until completion
             while True:
-                # Wait for either new message or monitor failure
                 recv_task = asyncio.create_task(instance.recv())
-
                 tasks = [recv_task]
                 if monitor_task:
                     tasks.append(monitor_task)
@@ -677,41 +713,35 @@ async def _submit_inferlet_from_registry_async(
                 )
 
                 if monitor_task in done:
-                    # Monitor task finished (meaning it raised exception)
-                    monitor_task.result()  # Re-raise exception
+                    monitor_task.result()
 
-                # If we get here, recv_task must be done
                 event, message = recv_task.result()
 
                 if event == Event.Stdout:
-                    # Stream stdout without extra newline
                     print(message, end="", flush=True)
                 elif event == Event.Stderr:
-                    # Stream stderr to stderr
-                    import sys
-
                     print(message, end="", file=sys.stderr, flush=True)
                 elif event == Event.Message:
-                    typer.echo(f"[Message] {message}")
+                    emit("message", f"[Message] {message}")
                 elif event == Event.Completed:
-                    typer.echo(f"{message}")
+                    emit("completed", f"{message}")
                     break
                 elif event == Event.Aborted:
-                    typer.echo(f"⚠️ Instance aborted: {message}")
+                    emit("aborted", f"⚠️ Instance aborted: {message}")
                     break
                 elif event == Event.Exception:
-                    typer.echo(f"❌ Instance exception: {message}", err=True)
+                    emit("exception", f"❌ Instance exception: {message}")
                     break
                 elif event == Event.ServerError:
-                    typer.echo(f"❌ Server error: {message}", err=True)
+                    emit("error", f"❌ Server error: {message}")
                     break
                 elif event == Event.OutOfResources:
-                    typer.echo(f"❌ Out of resources: {message}", err=True)
+                    emit("error", f"❌ Out of resources: {message}")
                     break
                 elif event == Event.Blob:
-                    typer.echo(f"[Received blob: {len(message)} bytes]")
+                    emit("blob", f"[Received blob: {len(message)} bytes]")
                 else:
-                    typer.echo(f"[Unknown event {event}]: {message}")
+                    emit("unknown", f"[Unknown event {event}]: {message}")
     except Exception:
         if monitor_task and not monitor_task.done():
             monitor_task.cancel()

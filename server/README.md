@@ -20,7 +20,7 @@ pip install pie-server
 ### From Source
 
 ```bash
-cd control
+cd server
 pip install -e ".[cuda]"   # or [metal]
 ```
 
@@ -333,7 +333,7 @@ random_seed = 42
 ### Run Tests
 
 ```bash
-cd control
+cd server
 pip install -e ".[test]"
 pytest tests/ -v
 ```
@@ -341,7 +341,7 @@ pytest tests/ -v
 ### Build from Source
 
 ```bash
-cd control
+cd server
 maturin develop  # Debug build
 maturin develop --release  # Release build
 ```

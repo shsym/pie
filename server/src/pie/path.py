@@ -1,4 +1,4 @@
-"""Path utilities for Pie CLI."""
+"""Path utilities for Pie."""
 
 import os
 from pathlib import Path

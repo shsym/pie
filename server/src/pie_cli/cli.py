@@ -1,4 +1,4 @@
-"""Pie Server CLI - Main entrypoint.
+"""Pie CLI - Main entrypoint.
 
 This module defines the main Typer application and registers all subcommands.
 """

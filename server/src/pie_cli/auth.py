@@ -1,6 +1,6 @@
 """Authorization management commands for Pie CLI.
 
-Implements: pie-server auth add|remove|list
+Implements: pie auth add|remove|list
 """
 
 import sys
@@ -8,29 +8,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import toml
 import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from . import path as pie_path
+from pie import path as pie_path
+from pie.auth import load_authorized_users, save_authorized_users
 
 console = Console()
 app = typer.Typer(help="Manage authorized clients")
-
-
-def load_authorized_users(auth_path: Path) -> dict:
-    """Load authorized users from file, or return empty dict if not exists."""
-    if not auth_path.exists():
-        return {}
-    return toml.loads(auth_path.read_text())
-
-
-def save_authorized_users(auth_path: Path, users: dict) -> None:
-    """Save authorized users to file."""
-    auth_path.parent.mkdir(parents=True, exist_ok=True)
-    auth_path.write_text(toml.dumps(users))
 
 
 @app.command("add")

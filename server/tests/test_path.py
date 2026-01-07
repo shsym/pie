@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from pie_cli import path as pie_path
+from pie import path as pie_path
 
 
 class TestGetPieHome:
