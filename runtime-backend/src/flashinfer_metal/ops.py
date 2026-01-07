@@ -148,7 +148,6 @@ def _initialize_mps_backend(page_size: int = 16) -> bool:
     try:
         compiler = get_mps_compiler(page_size=page_size)
         if compiler.can_use_mps_kernels():
-            print("✅ flashinfer_metal initialized")
             return True
     except (RuntimeError, ImportError, AttributeError) as e:
         print(f"❌ MPS shader initialization failed: {e}")
@@ -457,6 +456,60 @@ class sampling:
         return torch.gather(
             sorted_indices, -1, sampled_sorted_idx.unsqueeze(-1)
         ).squeeze(-1)
+
+    @staticmethod
+    def top_k_sampling_from_probs(
+        probs: torch.Tensor, top_k: torch.Tensor
+    ) -> torch.Tensor:
+        """Top-k sampling: sample from the top k tokens."""
+        # Get the maximum k value (handles per-sample k values)
+        k = int(top_k.max().item()) if top_k.numel() > 0 else 50
+        k = min(k, probs.shape[-1])  # Clamp to vocab size
+        
+        topk_probs, topk_indices = torch.topk(probs, k, dim=-1)
+        # Renormalize probabilities
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        # Sample from top-k
+        sampled_indices = torch.multinomial(topk_probs, num_samples=1).squeeze(-1)
+        return topk_indices.gather(-1, sampled_indices.unsqueeze(-1)).squeeze(-1)
+
+    @staticmethod
+    def min_p_sampling_from_probs(
+        probs: torch.Tensor, min_p: torch.Tensor
+    ) -> torch.Tensor:
+        """Min-p sampling: filter tokens below min_p * max_prob."""
+        max_probs = probs.max(dim=-1, keepdim=True).values
+        threshold = min_p.unsqueeze(-1) * max_probs
+        filtered_probs = probs.clone()
+        filtered_probs[probs < threshold] = 0
+        # Renormalize
+        filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        return torch.multinomial(filtered_probs, num_samples=1).squeeze(-1)
+
+    @staticmethod
+    def top_k_top_p_sampling_from_probs(
+        probs: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+    ) -> torch.Tensor:
+        """Combined top-k and top-p sampling."""
+        # First apply top-k
+        k = int(top_k.max().item()) if top_k.numel() > 0 else 50
+        k = min(k, probs.shape[-1])
+        
+        topk_probs, topk_indices = torch.topk(probs, k, dim=-1)
+        
+        # Then apply top-p on the top-k subset
+        sorted_probs, sorted_order = torch.sort(topk_probs, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        mask = cumulative_probs <= top_p.unsqueeze(-1)
+        mask[..., 0] = True
+        sorted_probs[~mask] = 0
+        
+        # Sample from filtered distribution
+        sampled_sorted_idx = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
+        # Map back through the sorting to get top-k indices
+        sampled_topk_idx = sorted_order.gather(-1, sampled_sorted_idx.unsqueeze(-1)).squeeze(-1)
+        # Map back through top-k to get original vocab indices
+        return topk_indices.gather(-1, sampled_topk_idx.unsqueeze(-1)).squeeze(-1)
 
 
 __all__ = [

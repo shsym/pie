@@ -27,7 +27,11 @@ from .config import RuntimeConfig
 from .batching import BatchBuilder, Batch
 from .loader import ModelLoader
 from .adapter import AdapterSubpass, CmaesAdapter
-from .model import llama3, qwen2, qwen3, common, gpt_oss
+from .model import llama3, qwen2, qwen3, common
+
+# gpt_oss requires CUDA-only features, only import on CUDA platforms
+if torch.cuda.is_available():
+    from .model import gpt_oss
 from . import message
 from . import hf_utils
 
@@ -206,6 +210,13 @@ class Runtime:
                 )
 
             case "gptoss":
+                # gpt_oss requires CUDA-only features
+                if not torch.cuda.is_available():
+                    raise ValueError(
+                        "GPT-OSS model requires CUDA. Apple Silicon is not supported. "
+                        "Please use llama3, qwen2, or qwen3 models instead."
+                    )
+
                 # Create model config
                 self.model_config = gpt_oss.ModelConfig.from_dict(normalized_arch)
 

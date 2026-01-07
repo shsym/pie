@@ -14,7 +14,8 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from pie import path as pie_path
-from pie.config import create_default_config_content
+from pie.config import create_default_config_content, DEFAULT_MODEL
+from huggingface_hub import scan_cache_dir
 
 console = Console()
 app = typer.Typer(help="Manage configuration")
@@ -36,6 +37,24 @@ def config_init(
     config_path.write_text(content)
     console.print(f"[green]✓[/green] Configuration file created at {config_path}")
 
+    # Check if default model exists
+    try:
+        cache_info = scan_cache_dir()
+        model_exists = False
+        for repo in cache_info.repos:
+            if repo.repo_id == DEFAULT_MODEL:
+                model_exists = True
+                break
+        
+        if not model_exists:
+            console.print(
+                f"[yellow]![/yellow] Default model '{DEFAULT_MODEL}' not found.\n"
+                f"  Run [bold]pie model download {DEFAULT_MODEL}[/bold] to install."
+            )
+    except Exception:
+        # Don't fail config init if cache scan fails
+        pass
+
 
 @app.command("show")
 def config_show(
@@ -50,8 +69,19 @@ def config_show(
 
     content = config_path.read_text()
     syntax = Syntax(content, "toml", theme="monokai", line_numbers=False)
+    display_path = str(config_path)
+    try:
+        display_path = f"~/{config_path.relative_to(Path.home())}"
+    except ValueError:
+        pass
+
     console.print(
-        Panel(syntax, title="Configuration", title_align="left", border_style="dim")
+        Panel(
+            syntax,
+            title=f"Configuration ({display_path})",
+            title_align="left",
+            border_style="dim",
+        )
     )
 
 

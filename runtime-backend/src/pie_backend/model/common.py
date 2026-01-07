@@ -8,13 +8,23 @@ import torch
 import math
 from typing import Callable, Any
 
-from flashinfer.sampling import (
-    sampling_from_probs,
-    top_p_sampling_from_probs,
-    top_k_sampling_from_probs,
-    min_p_sampling_from_probs,
-    top_k_top_p_sampling_from_probs,
-)
+# Import flashinfer or flashinfer_metal depending on platform
+if torch.backends.mps.is_available():
+    from flashinfer_metal.sampling import (  # type: ignore[import-not-found]
+        sampling_from_probs,
+        top_p_sampling_from_probs,
+        top_k_sampling_from_probs,
+        min_p_sampling_from_probs,
+        top_k_top_p_sampling_from_probs,
+    )
+else:
+    from flashinfer.sampling import (  # type: ignore[import-not-found]
+        sampling_from_probs,
+        top_p_sampling_from_probs,
+        top_k_sampling_from_probs,
+        min_p_sampling_from_probs,
+        top_k_top_p_sampling_from_probs,
+    )
 
 if torch.cuda.is_available():
     NUM_SM = torch.cuda.get_device_properties(

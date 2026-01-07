@@ -28,10 +28,17 @@ from .gpt_oss_utils import (
 )
 from ..config import RuntimeConfig
 from ..adapter import AdapterSubpass
-from ..utils import get_available_memory
+from ..utils import is_apple_silicon, get_available_memory
 from ..loader import Schema, Source, WeightStore
 
-# GPT-OSS requires CUDA-only FlashInfer features
+# GPT-OSS requires CUDA-only FlashInfer features (attention sinks, MoE kernels)
+# These are not available in flashinfer_metal
+if is_apple_silicon():
+    raise ImportError(
+        "GPT-OSS model requires CUDA. Apple Silicon is not supported. "
+        "Please use llama3, qwen2, or qwen3 models instead."
+    )
+
 import flashinfer as ops  # type: ignore[import]
 from flashinfer.attention import BatchAttentionWithAttentionSinkWrapper  # type: ignore[import]
 

@@ -702,7 +702,9 @@ class ForwardPass:
         total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         """Main transformation pipeline through all layers."""
-        torch.cuda.set_device(self.runtime_config.device)
+        # Only set CUDA device for CUDA tensors (not MPS)
+        if self.runtime_config.device.type == "cuda":
+            torch.cuda.set_device(self.runtime_config.device)
 
         # Calculate derived inputs
         page_size = int(kv_cache_at_layer[0].shape[2])

@@ -75,7 +75,11 @@ def run(
     lines.append(f"{'Inferlet':<15}", style="white")
     lines.append(f"{inferlet_display}\n", style="dim")
     lines.append(f"{'Model':<15}", style="white")
-    lines.append(model_configs[0].get("hf_repo", "unknown"), style="dim")
+    lines.append(f"{model_configs[0].get('hf_repo', 'unknown')}\n", style="dim")
+    lines.append(f"{'Device':<15}", style="white")
+    device = model_configs[0].get("device", ["unknown"])
+    device_str = ", ".join(device) if isinstance(device, list) else device
+    lines.append(device_str, style="dim")
 
     console.print(Panel(lines, title="Pie Run", title_align="left", border_style="dim"))
     console.print()

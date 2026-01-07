@@ -4,7 +4,10 @@ import time
 import torch
 import torch.nn as nn
 import math
-from . import rand_mv
+from .rand_mv import RAND_MV_AVAILABLE
+
+if RAND_MV_AVAILABLE:
+    from . import rand_mv
 
 
 def run_length_encode(data: list[int]) -> list[tuple[int, int]]:
@@ -101,7 +104,8 @@ class AdapterSubpass:
             # Determine if we should inject noise for this request slice
             layer_seeds = rand_seeds - layer_idx
             # inject_noise = (layer_seeds != 0).any().item()
-            inject_noise = True
+            # Only inject noise if CUDA/Triton is available (rand_mv requires CUDA)
+            inject_noise = RAND_MV_AVAILABLE
 
             if inject_noise:
                 if not isinstance(adapter_info, CmaesAdapter):
@@ -554,6 +558,12 @@ class CmaesAdapter(Adapter):
 
     @torch.inference_mode()
     def update(self, scores: list[float], seeds: list[int], max_sigma: float) -> None:
+
+        if not RAND_MV_AVAILABLE:
+            raise RuntimeError(
+                "CmaesAdapter.update() requires CUDA for noise generation. "
+                "This function is not available on non-CUDA platforms (e.g., Apple Metal)."
+            )
 
         if len(scores) != self.population_size or len(seeds) != self.population_size:
             raise ValueError(f"Expected {self.population_size} scores and seeds.")

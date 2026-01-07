@@ -87,11 +87,15 @@ class AttentionCompiler(BaseShaderCompiler):
                 "attention", "batch_prefill_attention_unified_fp16_simdgroup_kernel"
             )
             self._warmup_kernel(
+                "attention", "batch_prefill_attention_unified_bf16_simdgroup_kernel"
+            )
+            self._warmup_kernel(
                 "attention", "batch_prefill_attention_unified_f32_simdgroup_kernel"
             )
             # Warmup decode kernels
             for head_dim in [64, 128]:
                 self._warmup_kernel("attention", f"attention_decode_v2_fp16_{head_dim}")
+                self._warmup_kernel("attention", f"attention_decode_v2_bf16_{head_dim}")
                 self._warmup_kernel("attention", f"attention_decode_v2_f32_{head_dim}")
 
     # Metal constant memory limit (64KB)
@@ -117,9 +121,9 @@ class AttentionCompiler(BaseShaderCompiler):
         original_dtype = query.dtype
 
         # Dtype validation
-        if query.dtype not in [torch.float32, torch.float16]:
+        if query.dtype not in [torch.float32, torch.float16, torch.bfloat16]:
             raise ValueError(
-                f"Unsupported dtype {query.dtype}. Supported: float32, float16."
+                f"Unsupported dtype {query.dtype}. Supported: float32, float16, bfloat16."
             )
 
         query = query.to("mps") if query.device.type != "mps" else query
@@ -187,7 +191,13 @@ class AttentionCompiler(BaseShaderCompiler):
         is_decode = num_tokens == 1
 
         if is_decode:
-            dtype_prefix = "f32" if query.dtype == torch.float32 else "fp16"
+            if query.dtype == torch.float32:
+                dtype_prefix = "f32"
+            elif query.dtype == torch.bfloat16:
+                dtype_prefix = "bf16"
+            else:
+                dtype_prefix = "fp16"
+            
             kernel_name = f"attention_decode_v2_{dtype_prefix}_{head_dim}"
 
             if not hasattr(lib, kernel_name):
@@ -213,6 +223,10 @@ class AttentionCompiler(BaseShaderCompiler):
                 kernel_name = "batch_prefill_attention_unified_f32_simdgroup_kernel"
                 bq = 16
                 threads_per_threadgroup = 64
+            elif query.dtype == torch.bfloat16:
+                kernel_name = "batch_prefill_attention_unified_bf16_simdgroup_kernel"
+                bq = 32
+                threads_per_threadgroup = 128
             else:
                 kernel_name = "batch_prefill_attention_unified_fp16_simdgroup_kernel"
                 bq = 32

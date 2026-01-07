@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import pytest
 import toml
@@ -14,11 +14,16 @@ from pie_cli.cli import app
 runner = CliRunner()
 
 
+
 class TestCreateDefaultConfigContent:
     """Tests for create_default_config_content function."""
 
-    def test_default_config(self):
+    @patch("pie.config.torch")
+    def test_default_config(self, mock_torch):
         """Creates config with model configuration."""
+        # Mock CUDA availability
+        mock_torch.cuda.is_available.return_value = True
+
         content = config.create_default_config_content()
         parsed = toml.loads(content)
 
@@ -26,7 +31,7 @@ class TestCreateDefaultConfigContent:
         assert parsed["port"] == 8080
         assert parsed["enable_auth"] is True
         assert len(parsed["model"]) == 1
-        assert parsed["model"][0]["hf_repo"] == "Qwen/Qwen3-0.6B"
+        assert parsed["model"][0]["hf_repo"] == config.DEFAULT_MODEL
         assert parsed["model"][0]["device"] == ["cuda:0"]
         assert parsed["model"][0]["activation_dtype"] == "bfloat16"
         assert parsed["model"][0]["kv_page_size"] == 16
@@ -38,12 +43,29 @@ class TestCreateDefaultConfigContent:
         assert parsed["model"][0]["gpu_mem_utilization"] == 0.9
         assert parsed["model"][0]["enable_profiling"] is False
 
+    @patch("pie.config.torch")
+    def test_default_config_mps(self, mock_torch):
+        """Creates config with MPS device when available."""
+        mock_torch.cuda.is_available.return_value = False
+        mock_torch.backends.mps.is_available.return_value = True
+
+        content = config.create_default_config_content()
+        parsed = toml.loads(content)
+
+        assert parsed["model"][0]["device"] == ["mps"]
+
 
 class TestConfigInit:
     """Tests for config init command."""
 
-    def test_init_creates_config_file(self, tmp_path):
+    @patch("pie_cli.config.scan_cache_dir")
+    def test_init_creates_config_file(self, mock_scan, tmp_path):
         """Creates config file at specified path."""
+        # Mock cache to contain default model
+        mock_repo = MagicMock()
+        mock_repo.repo_id = config.DEFAULT_MODEL
+        mock_scan.return_value.repos = [mock_repo]
+
         config_path = tmp_path / "config.toml"
 
         result = runner.invoke(app, ["config", "init", "--path", str(config_path)])
@@ -51,6 +73,22 @@ class TestConfigInit:
         assert result.exit_code == 0
         assert config_path.exists()
         assert "Configuration file created" in result.stdout
+        assert "Warning" not in result.stdout
+
+    @patch("pie_cli.config.scan_cache_dir")
+    def test_init_warns_missing_model(self, mock_scan, tmp_path):
+        """Warns when default model is missing."""
+        mock_scan.return_value.repos = []
+
+        config_path = tmp_path / "config.toml"
+
+        result = runner.invoke(app, ["config", "init", "--path", str(config_path)])
+
+        assert result.exit_code == 0
+        assert config_path.exists()
+        assert "Default model" in result.stdout
+        assert "not found" in result.stdout
+
 
 
 class TestConfigShow:

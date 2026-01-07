@@ -1,9 +1,27 @@
 """Configuration utilities for Pie."""
 
 
+
+import torch
+
+DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
+
+
+def get_default_device() -> str:
+    """Get the default device based on the platform."""
+    if torch.cuda.is_available():
+        return "cuda:0"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def create_default_config_content() -> str:
     """Create the default configuration file content."""
-    return """\
+    device = get_default_device()
+    formatted_device = f'"{device}"'
+
+    return f"""\
 # Pie Server Configuration
 
 # Network settings
@@ -11,15 +29,15 @@ host = "127.0.0.1"
 port = 8080
 
 # Authentication
-enable_auth = true
+enable_auth = false
 
 # Model configuration (can have multiple [[model]] sections)
 [[model]]
 # HuggingFace model repository
-hf_repo = "Qwen/Qwen3-0.6B"
+hf_repo = "{DEFAULT_MODEL}"
 
 # Device assignment (single GPU or list for tensor parallel)
-device = ["cuda:0"]
+device = [{formatted_device}]
 
 # Precision settings
 activation_dtype = "bfloat16"
