@@ -35,14 +35,12 @@ import typing
 class TqdmProgress:
     """Adapter to map tqdm calls to a global rich Progress instance.
     
-    Aggregates all byte downloads into a single master progress bar.
+    Uses HF's single byte bar for progress display.
     """
 
     _progress: typing.Optional[Progress] = None
-    _master_task_id: typing.Optional[int] = None
-    _total_bytes: int = 0
-    _completed_bytes: int = 0
     _lock: typing.Optional["threading.Lock"] = None
+    _known_total: int = 0  # Set by model_download via dry run
 
     def __init__(
         self,
@@ -60,36 +58,29 @@ class TqdmProgress:
         self.desc = desc
         self.total = total or 0
         self.unit = unit
-        self.task_id = None  # Individual tasks are hidden
+        self.task_id = None
         self._is_byte_task = (unit == "B")
 
-        # We only care about byte tasks (actual file downloads)
-        # Skip "Fetching X files" bar and other non-byte bars
+        # Skip non-byte tasks (like "Fetching X files")
         if not self._is_byte_task:
             return
 
-        # Update master task total
-        if self._progress and TqdmProgress._master_task_id is not None:
-            with self.get_lock():
-                TqdmProgress._total_bytes += int(self.total)
-                self._progress.update(
-                    TqdmProgress._master_task_id,
-                    total=TqdmProgress._total_bytes,
-                )
+        # Create a task for this progress bar
+        if self._progress is not None:
+            # No description needed - header already shows "Downloading: repo_id"
+            total_to_use = TqdmProgress._known_total if TqdmProgress._known_total > 0 else None
+            self.task_id = self._progress.add_task(
+                description="",
+                total=total_to_use,
+            )
 
     def update(self, n: float = 1) -> None:
-        if not self._is_byte_task:
-            return
-        if self._progress and TqdmProgress._master_task_id is not None:
-            with self.get_lock():
-                TqdmProgress._completed_bytes += int(n)
-                self._progress.update(
-                    TqdmProgress._master_task_id,
-                    completed=TqdmProgress._completed_bytes,
-                )
+        if self._progress is not None and self.task_id is not None:
+            self._progress.update(self.task_id, advance=n)
 
     def close(self) -> None:
-        pass  # Master task is closed by the context manager
+        if self._progress is not None and self.task_id is not None:
+            self._progress.update(self.task_id, visible=False)
 
     def __iter__(self):
         if self.iterable:
@@ -113,14 +104,16 @@ class TqdmProgress:
             self._progress.refresh()
 
     def reset(self, total=None):
-        pass  # Not applicable for aggregated progress
+        if self._progress is not None and self.task_id is not None:
+            self._progress.update(self.task_id, total=total, completed=0)
 
     @classmethod
     def write(cls, s, file=None, end="\n", nolock=False):
         console.print(s, end=end)
 
     def set_description(self, desc=None, refresh=True):
-        pass  # Description is fixed for master task
+        # Ignore HF's description updates to keep UI clean
+        pass
 
     def set_postfix(self, ordered_dict=None, refresh=True, **kwargs):
         pass
@@ -234,6 +227,24 @@ def model_download(
     console.print(f"[bold]Downloading:[/bold] {repo_id}")
 
     try:
+        # First, do a dry run to get total download size (silently)
+        from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
+        disable_progress_bars()
+        try:
+            with console.status("[dim]Calculating download size...[/dim]"):
+                dry_run_info = snapshot_download(
+                    repo_id,
+                    local_files_only=False,
+                    dry_run=True,
+                )
+                # Only count files that will actually be downloaded
+                total_size = sum(
+                    f.file_size for f in dry_run_info 
+                    if f.file_size is not None and f.will_download
+                )
+        finally:
+            enable_progress_bars()
+
         # Configuration for the progress bar
         progress = Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -245,27 +256,18 @@ def model_download(
             console=console,
         )
 
-        # Reset aggregation state
         TqdmProgress._progress = progress
-        TqdmProgress._total_bytes = 0
-        TqdmProgress._completed_bytes = 0
+        TqdmProgress._known_total = total_size
 
         with progress:
-            # Create master task for aggregated byte progress
-            TqdmProgress._master_task_id = progress.add_task(
-                description="Downloading...",
-                total=None,  # Unknown until files start downloading
-            )
-
             local_path = snapshot_download(
                 repo_id,
                 local_files_only=False,
                 tqdm_class=TqdmProgress,
             )
 
-        # Cleanup global references
         TqdmProgress._progress = None
-        TqdmProgress._master_task_id = None
+        TqdmProgress._known_total = 0
 
         console.print(f"[green]✓[/green] Downloaded to {local_path}")
 

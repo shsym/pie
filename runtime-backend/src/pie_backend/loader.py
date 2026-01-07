@@ -510,7 +510,7 @@ class ModelLoader:
             case "llama3":
                 from .model import llama3
 
-                schema = llama3.LLAMA3_SCHEMA
+                schema = llama3.create_schema(normalized_arch)
                 num_layers = int(normalized_arch["num_layers"])
 
             case "qwen2":

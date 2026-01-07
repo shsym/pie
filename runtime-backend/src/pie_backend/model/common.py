@@ -34,6 +34,24 @@ else:
     NUM_SM = 108
 
 
+@torch.compile(mode="reduce-overhead")
+def safe_scaled_softmax(logits, temperatures, greedy_threshold=1e-5):
+    """
+    Optimized Approach: Branchless safe_scaled_softmax
+    """
+    greedy_mask = temperatures < greedy_threshold
+    
+    # Branchless logic
+    safe_temps = torch.where(greedy_mask, 1.0, temperatures)
+    scaled_logits = logits / safe_temps
+    probs_sampling = torch.softmax(scaled_logits, dim=-1)
+    
+    greedy_indices = logits.argmax(dim=-1)
+    probs_greedy = torch.nn.functional.one_hot(greedy_indices, num_classes=logits.shape[-1])
+    probs_greedy = probs_greedy.to(dtype=logits.dtype)
+    
+    return torch.where(greedy_mask, probs_greedy, probs_sampling)
+
 def sample_common(
     hidden_states: torch.Tensor,
     sampling_metadata: dict,
@@ -63,14 +81,9 @@ def sample_common(
     logits_input = hidden_states[indices_for_logits]
     logits = lm_head_fn(logits_input)
 
-    # Stage 2: Apply temperature scaling
     temperatures = sampling_metadata["temperatures"]
-    scaled_logits = logits / torch.clamp(temperatures, min=1e-6)
+    probs = safe_scaled_softmax(logits, temperatures)
 
-    # Stage 3: Compute probabilities
-    probs = torch.softmax(scaled_logits, dim=-1)
-
-    # Stage 4: Execute sampling for each group
     num_logit_requests = len(indices_for_logits)
     final_dists = [None] * num_logit_requests
     final_tokens_tensor = torch.empty(

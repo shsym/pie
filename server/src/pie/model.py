@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+from huggingface_hub.constants import HF_HUB_CACHE
+
 
 # Mapping from HuggingFace model_type to Pie architecture
 HF_TO_PIE_ARCH = {
@@ -14,8 +16,12 @@ HF_TO_PIE_ARCH = {
 
 
 def get_hf_cache_dir() -> Path:
-    """Get the HuggingFace cache directory."""
-    return Path.home() / ".cache" / "huggingface" / "hub"
+    """Get the HuggingFace cache directory.
+    
+    Uses huggingface_hub's HF_HUB_CACHE which respects environment
+    variable overrides (e.g., HF_HUB_CACHE, HF_HOME).
+    """
+    return Path(HF_HUB_CACHE)
 
 
 def parse_repo_id_from_dirname(dirname: str) -> str | None:

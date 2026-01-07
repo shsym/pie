@@ -10,6 +10,8 @@ This module provides utilities for:
 import json
 from pathlib import Path
 
+from huggingface_hub.constants import HF_HUB_CACHE
+
 
 # Mapping from HuggingFace model_type to PIE architecture
 HF_TO_PIE_ARCH = {
@@ -21,8 +23,12 @@ HF_TO_PIE_ARCH = {
 
 
 def get_hf_cache_dir() -> Path:
-    """Get the HuggingFace cache directory."""
-    return Path.home() / ".cache" / "huggingface" / "hub"
+    """Get the HuggingFace cache directory.
+    
+    Uses huggingface_hub's HF_HUB_CACHE which respects environment
+    variable overrides (e.g., HF_HUB_CACHE, HF_HOME).
+    """
+    return Path(HF_HUB_CACHE)
 
 
 def get_hf_snapshot_dir(repo_id: str) -> Path:
@@ -158,6 +164,9 @@ def normalize_hf_config(config: dict) -> dict:
 
     # QKV bias (some models have it, some don't)
     normalized["use_qkv_bias"] = config.get("attention_bias", False)
+
+    # Tied embeddings
+    normalized["tie_word_embeddings"] = config.get("tie_word_embeddings", True)
 
     return normalized
 

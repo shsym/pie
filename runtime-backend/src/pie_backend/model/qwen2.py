@@ -911,8 +911,11 @@ def create_adapter_cache(
 
     Returns a list of (down_weights, up_weights) tuples, one per layer.
     - down_weights: [max_num_adapters, dim_hidden, max_adapter_rank * 3]
-    - up_weights: [max_num_adapters, max_adapter_rank, dim_head * (num_q_heads + num_kv_heads * 2)]
+    - up_weights: [max_num_adapters, max_adapter_rank, dim_head * (local_num_q_heads + local_num_kv_heads * 2)]
     """
+    local_num_q_heads = model_config.num_q_heads // runtime_config.world_size
+    local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
+
     return [
         (
             torch.zeros(
@@ -929,7 +932,7 @@ def create_adapter_cache(
                     runtime_config.max_num_adapters,
                     runtime_config.max_adapter_rank,
                     model_config.dim_head
-                    * (model_config.num_q_heads + model_config.num_kv_heads * 2),
+                    * (local_num_q_heads + local_num_kv_heads * 2),
                 ),
                 dtype=runtime_config.activation_dtype,
                 device=runtime_config.device,

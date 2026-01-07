@@ -29,64 +29,91 @@ from . import common
 # Declarative definition of how physical tensor names map to logical names,
 # with fusion, sharding, and quantization applied.
 
-LLAMA3_SCHEMA = (
-    Schema("llama3")
-    # Embedding (row-parallel sharding, no quantization)
-    .define(
-        "embed_token",
-        Source("model.embed_tokens.weight").shard("row"),
-    )
-    # Per-layer weights
-    .define(
-        "layers.*.norm_attn",
-        Source("model.layers.*.input_layernorm.weight"),
-    ).define(
-        "layers.*.norm_mlp",
-        Source("model.layers.*.post_attention_layernorm.weight"),
-    )
-    # Fused QKV projection weight: fused from [Q, K, V] and sharded INTERLEAVED
-    .define(
-        "layers.*.proj_qkv",
-        Source.fuse(
-            [
-                "model.layers.*.self_attn.q_proj.weight",
-                "model.layers.*.self_attn.k_proj.weight",
-                "model.layers.*.self_attn.v_proj.weight",
-            ],
-            dim=0,
+def create_schema(config: dict) -> Schema:
+    schema = (
+        Schema("llama3")
+        # Embedding (row-parallel sharding, no quantization)
+        .define(
+            "embed_token",
+            Source("model.embed_tokens.weight").shard("row"),
         )
-        .shard("interleaved_column")
-        .quantize(),
-    )
-    # Output projection (row-parallel, quantized)
-    .define(
-        "layers.*.proj_o",
-        Source("model.layers.*.self_attn.o_proj.weight").shard("row").quantize(),
-    )
-    # Fused gate+up projection: fused from [Gate, Up] and sharded INTERLEAVED
-    .define(
-        "layers.*.proj_gate_up",
-        Source.fuse(
-            [
-                "model.layers.*.mlp.gate_proj.weight",
-                "model.layers.*.mlp.up_proj.weight",
-            ],
-            dim=0,
+        # Per-layer weights
+        .define(
+            "layers.*.norm_attn",
+            Source("model.layers.*.input_layernorm.weight"),
         )
-        .shard("interleaved_column")
-        .quantize(),
+        .define(
+            "layers.*.norm_mlp",
+            Source("model.layers.*.post_attention_layernorm.weight"),
+        )
+        # Fused QKV projection weight: fused from [Q, K, V] and sharded INTERLEAVED
+        .define(
+            "layers.*.proj_qkv",
+            Source.fuse(
+                [
+                    "model.layers.*.self_attn.q_proj.weight",
+                    "model.layers.*.self_attn.k_proj.weight",
+                    "model.layers.*.self_attn.v_proj.weight",
+                ],
+                dim=0,
+            )
+            .shard("interleaved_column")
+            .quantize(),
+        )
+        # Output projection (row-parallel, quantized)
+        .define(
+            "layers.*.proj_o",
+            Source("model.layers.*.self_attn.o_proj.weight").shard("row").quantize(),
+        )
+        # Fused gate+up projection: fused from [Gate, Up] and sharded INTERLEAVED
+        .define(
+            "layers.*.proj_gate_up",
+            Source.fuse(
+                [
+                    "model.layers.*.mlp.gate_proj.weight",
+                    "model.layers.*.mlp.up_proj.weight",
+                ],
+                dim=0,
+            )
+            .shard("interleaved_column")
+            .quantize(),
+        )
+        # Down projection (row-parallel, quantized)
+        .define(
+            "layers.*.proj_down",
+            Source("model.layers.*.mlp.down_proj.weight").shard("row").quantize(),
+        )
+        # Final layer norm
+        .define(
+            "norm_last",
+            Source("model.norm.weight"),
+        )
     )
-    # Down projection (row-parallel, quantized)
-    .define(
-        "layers.*.proj_down",
-        Source("model.layers.*.mlp.down_proj.weight").shard("row").quantize(),
-    )
-    # Final layer norm
-    .define(
-        "norm_last",
-        Source("model.norm.weight"),
-    )
-)
+
+    # Handle untied embeddings (lm_head separate from embed_token)
+    if not config.get("tie_word_embeddings", True):
+        # LM Head (column-parallel, like embed_token but for output)
+        # Actually in `lm_head` method we treat it as linear: [hidden, vocab]
+        # In column parallel: split hidden? No.
+        # Check `lm_head` method:
+        #   local_logits = fun.linear(local_normed, weight)
+        #   weight shape: [vocab, hidden/world_size]
+        # So we want to shard the weight along dim 1 (hidden dim).
+        # Column sharding usually means sharding dim 0?
+        # Let's check Source.shard:
+        #   dim = 1 if source.sharding == "row" else 0
+        # So 'column' -> dim 0 (vocab dim). 'row' -> dim 1 (hidden dim).
+        # We need `hidden` dim sharded. That corresponds to 'row' sharding for the weight tensor [vocab, hidden].
+        # wait, Weight is [out_features, in_features] for Linear.
+        #   lm_head weight: [vocab, hidden]
+        #   We want to split `hidden` (in_features). That is dim 1.
+        #   So we use .shard("row") which maps to dim 1.
+        schema.define(
+            "lm_head",
+            Source("lm_head.weight").shard("row"),
+        )
+
+    return schema
 
 
 @dataclass
@@ -112,7 +139,9 @@ class ModelConfig(ModelConfigBase):
     rope_factor: float
     rope_high_frequency_factor: float
     rope_low_frequency_factor: float
+    rope_original_max_position_embeddings: int
     rope_theta: float
+    tie_word_embeddings: bool
 
     @staticmethod
     def from_dict(spec: dict) -> "ModelConfig":
@@ -128,7 +157,11 @@ class ModelConfig(ModelConfigBase):
             rope_factor=float(spec["rope"]["factor"]),
             rope_high_frequency_factor=float(spec["rope"]["high_frequency_factor"]),
             rope_low_frequency_factor=float(spec["rope"]["low_frequency_factor"]),
+            rope_original_max_position_embeddings=int(
+                spec["rope"]["original_max_position_embeddings"]
+            ),
             rope_theta=float(spec["rope"]["theta"]),
+            tie_word_embeddings=bool(spec["tie_word_embeddings"]),
         )
 
     def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
@@ -466,7 +499,12 @@ class ForwardPass:
 
         if world_size == 1:
             # Single GPU: simple linear projection
-            return fun.linear(normed, self.weights.get("embed_token"))
+            weight = (
+                self.weights.get("embed_token")
+                if self.model_config.tie_word_embeddings
+                else self.weights.get("lm_head")
+            )
+            return fun.linear(normed, weight)
 
         # Multi-GPU: Column-parallel projection
         # 1. Split input along hidden dimension - each rank uses its slice
@@ -476,9 +514,16 @@ class ForwardPass:
         local_normed = normed[:, start_idx:end_idx]  # [seq, hidden/world_size]
 
         # 2. Project with local weight shard: [seq, hidden/world_size] @ [hidden/world_size, vocab]
-        # embed_token has shape [vocab, hidden/world_size], so we use linear which transposes
+        # embed_token has shape [vocab, hidden/world_size] (row-sharded/dim=1)
+        # lm_head also has [vocab, hidden/world_size] (row-sharded/dim=1)
+        # so we use linear which transposes
+        weight = (
+            self.weights.get("embed_token")
+            if self.model_config.tie_word_embeddings
+            else self.weights.get("lm_head")
+        )
         local_logits = fun.linear(
-            local_normed, self.weights.get("embed_token")
+            local_normed, weight
         )  # [seq, vocab]
 
         # 3. All-reduce to combine partial logits (sum of partial projections = full projection)
@@ -615,6 +660,7 @@ class ForwardPass:
             rope_theta=self.model_config.rope_theta,
             low_freq_factor=self.model_config.rope_low_frequency_factor,
             high_freq_factor=self.model_config.rope_high_frequency_factor,
+            old_context_len=self.model_config.rope_original_max_position_embeddings,
         )
 
         # gather where?
@@ -936,8 +982,11 @@ def create_adapter_cache(
 
     Returns a list of (down_weights, up_weights) tuples, one per layer.
     - down_weights: [max_num_adapters, dim_hidden, max_adapter_rank * 3]
-    - up_weights: [max_num_adapters, max_adapter_rank, dim_head * (num_q_heads + num_kv_heads * 2)]
+    - up_weights: [max_num_adapters, max_adapter_rank, dim_head * (local_num_q_heads + local_num_kv_heads * 2)]
     """
+    local_num_q_heads = model_config.num_q_heads // runtime_config.world_size
+    local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
+
     return [
         (
             torch.zeros(
@@ -954,7 +1003,7 @@ def create_adapter_cache(
                     runtime_config.max_num_adapters,
                     runtime_config.max_adapter_rank,
                     model_config.dim_head
-                    * (model_config.num_q_heads + model_config.num_kv_heads * 2),
+                    * (local_num_q_heads + local_num_kv_heads * 2),
                 ),
                 dtype=runtime_config.activation_dtype,
                 device=runtime_config.device,
