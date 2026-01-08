@@ -119,6 +119,38 @@ export class KvPageManager {
     this._lastPageLen = lastPageLen;
   }
 
+  /**
+   * Remove a page at the specified index.
+   * Used by dropMaskedKvPages to remove fully-masked pages.
+   *
+   * @param index - The index of the page to remove
+   */
+  removePageAt(index: number): void {
+    if (index < 0 || index >= this.pages.length) {
+      throw new Error(`Page index ${index} out of bounds`);
+    }
+    const [removed] = this.pages.splice(index, 1);
+    removed.release();
+
+    // Recalculate last page length
+    const newTotalTokens = this.totalTokens;
+    const lastPageLen = newTotalTokens % this.pageSize;
+    this._lastPageLen =
+      lastPageLen === 0 && newTotalTokens > 0 ? this.pageSize : lastPageLen;
+  }
+
+  /**
+   * Recalculate last page length based on current page count and total tokens.
+   * Used after external modifications to pages array.
+   *
+   * @param totalTokens - The total number of committed tokens
+   */
+  recalculateLastPageLen(totalTokens: number): void {
+    const lastPageLen = totalTokens % this.pageSize;
+    this._lastPageLen =
+      lastPageLen === 0 && totalTokens > 0 ? this.pageSize : lastPageLen;
+  }
+
   private adjust(numTokens: number): void {
     if (numTokens === 0) return;
 

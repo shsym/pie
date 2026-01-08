@@ -11,7 +11,8 @@ HF_TO_PIE_ARCH = {
     "llama": "llama3",
     "qwen2": "qwen2",
     "qwen3": "qwen3",
-    "gptoss": "gpt_oss",
+    "gptoss": "gptoss",
+    "gpt_oss": "gptoss",  # HuggingFace config may use underscore variant
 }
 
 

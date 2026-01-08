@@ -525,7 +525,7 @@ class ModelLoader:
                 schema = qwen3.QWEN3_SCHEMA
                 num_layers = int(normalized_arch["num_layers"])
 
-            case "gpt_oss":
+            case "gptoss":
                 from .model import gpt_oss
 
                 # GPT-OSS uses a factory function because MoE transforms need dimensions

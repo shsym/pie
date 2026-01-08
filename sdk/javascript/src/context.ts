@@ -1,13 +1,14 @@
 // Context class for managing conversation state and generation.
 // Mirrors the Rust Context from inferlet/src/context.rs
 
-import { Model, Queue } from './model.js';
+import { Model, Queue, _bindContextClass } from './model.js';
 import { Tokenizer } from './tokenizer.js';
 import { ChatFormatter } from './chat.js';
 import { Brle } from './brle.js';
 import { KvPage, ForwardPass, type Distribution } from './forward.js';
 import { toSamplerType, type SamplerType, type SamplingConfig } from './sampler.js';
 import { KvPageManager } from './kv-page-manager.js';
+import type { Drafter } from './drafter.js';
 
 
 
@@ -382,6 +383,62 @@ export class Context {
   }
 
   /**
+   * Drops fully masked KV pages to save memory, supporting non-contiguous
+   * dropping for optimizations like attention sink.
+   *
+   * The function iterates through all committed pages and checks if the tokens
+   * corresponding to a page are all masked as `true`. If so, it deallocates
+   * the page and removes the corresponding token ranges from the context's state.
+   *
+   * # Warning
+   *
+   * This operation modifies the token history non-contiguously, which can
+   * break the assumptions of a standard causal attention model. It should
+   * only be used with models and systems (like StreamingLLM) designed to
+   * handle a KV cache with logical gaps.
+   */
+  dropMaskedKvPages(): void {
+    const numCommittedPages = Math.floor(this._tokenIds.length / this.kvPageSize);
+
+    // Iterate backwards to safely remove elements from arrays by index.
+    // We only consider dropping full pages, not the last (potentially partial) page.
+    for (let i = numCommittedPages - 1; i >= 0; i--) {
+      const pageStartTokenIdx = i * this.kvPageSize;
+      const pageEndTokenIdx = (i + 1) * this.kvPageSize;
+
+      if (
+        this.tokenMaskCurrent.isRangeAllValue(
+          pageStartTokenIdx,
+          pageEndTokenIdx,
+          true
+        )
+      ) {
+        // This page is fully masked and can be dropped.
+
+        // 1. Remove the page ID and deallocate the physical page.
+        this.kvPageManager.removePageAt(i);
+
+        // 2. Remove the corresponding token range from the main token list.
+        this._tokenIds.splice(pageStartTokenIdx, this.kvPageSize);
+
+        // 3. Remove the corresponding position IDs.
+        this._positionIds.splice(pageStartTokenIdx, this.kvPageSize);
+
+        // 4. Remove the same range from the current mask.
+        this.tokenMaskCurrent.removeRange(pageStartTokenIdx, pageEndTokenIdx);
+
+        // 5. Remove the range from all historical pending masks.
+        for (const mask of this.tokenMaskPending) {
+          mask.removeRange(pageStartTokenIdx, pageEndTokenIdx);
+        }
+      }
+    }
+
+    // Recalculate the last page length after dropping pages.
+    this.kvPageManager.recalculateLastPageLen(this._tokenIds.length);
+  }
+
+  /**
    * Flush chat messages to tokens
    */
   private flushChatMessages(addGenerationPrompt: boolean): void {
@@ -719,4 +776,112 @@ export class Context {
       beams = nextBeams.slice(0, beamSize);
     }
   }
+
+  /**
+   * Generates text using speculative decoding with a drafter model.
+   *
+   * Speculative decoding accelerates generation by using a small, fast drafter
+   * to propose candidate tokens that are then verified by the main model.
+   *
+   * @param drafter - The drafter that proposes candidate tokens
+   * @param options - Generation options
+   * @returns The generated text
+   *
+   * @example
+   * ```ts
+   * const drafter = new MyDrafter(smallModel);
+   * const result = await ctx.generateWithDrafter(drafter, {
+   *   sampling: { topP: 0.95, temperature: 0.6 },
+   *   stop: { maxTokens: 256, sequences: model.eosTokens }
+   * });
+   * ```
+   */
+  async generateWithDrafter(
+    drafter: Drafter,
+    options: GenerateOptions
+  ): Promise<string> {
+    // Initialize drafter with current context
+    drafter.update([...this._tokenIds, ...this.tokenIdsPending]);
+
+    const samplerType = toSamplerType(options.sampling);
+    const { maxTokens, sequences } = options.stop;
+
+    if (maxTokens === undefined && (sequences === undefined || sequences.length === 0)) {
+      throw new Error('At least one stop condition (maxTokens or sequences) must be specified');
+    }
+
+    const generatedTokenIds: number[] = [];
+
+    while (true) {
+      // Get draft tokens
+      const [draftTokens, draftPosIds] = drafter.draft();
+
+      if (draftTokens.length === 0) {
+        // No drafts - fall back to regular decode
+        const nextTokenId = await this.decodeStep(samplerType);
+        this.fillToken(nextTokenId);
+        generatedTokenIds.push(nextTokenId);
+        drafter.update([nextTokenId]);
+      } else {
+        // Verify drafts with main model
+        const acceptedTokens = await this.verifyDrafts(
+          draftTokens,
+          draftPosIds,
+          samplerType
+        );
+
+        for (const token of acceptedTokens) {
+          this.fillToken(token);
+          generatedTokenIds.push(token);
+        }
+        drafter.update(acceptedTokens);
+      }
+
+      // Check stop conditions
+      if (maxTokens !== undefined && generatedTokenIds.length >= maxTokens) {
+        break;
+      }
+      if (sequences !== undefined && this.endsWithAny(generatedTokenIds, sequences)) {
+        break;
+      }
+    }
+
+    return this.tokenizer.detokenize(new Uint32Array(generatedTokenIds));
+  }
+
+  /**
+   * Verify draft tokens with the main model.
+   * Returns the tokens that were accepted.
+   *
+   * This uses a simple sequential verification strategy where drafts are
+   * verified one by one until a rejection occurs.
+   */
+  private async verifyDrafts(
+    draftTokens: number[],
+    _draftPosIds: number[],
+    _samplerType: SamplerType
+  ): Promise<number[]> {
+    const accepted: number[] = [];
+
+    for (let i = 0; i < draftTokens.length; i++) {
+      const dist = await this.decodeStepDist();
+      const predictedToken = dist.ids[0]; // Most likely token
+
+      if (predictedToken === draftTokens[i]) {
+        // Draft accepted
+        accepted.push(predictedToken);
+        this.fillToken(predictedToken);
+      } else {
+        // Draft rejected - use model's prediction instead
+        accepted.push(predictedToken);
+        this.fillToken(predictedToken);
+        break;
+      }
+    }
+
+    return accepted;
+  }
 }
+
+// Bind Context class to model.js to enable Model.createContext()
+_bindContextClass(Context);

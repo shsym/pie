@@ -18,7 +18,7 @@
     "generate-bindings": "jco types ../inferlet/wit -o src/bindings --world-name exec"
   },
   "dependencies": {
-    "@huggingface/jinja": "^0.3.0"
+    "@huggingface/jinja": "^0.5.3"
   },
   "devDependencies": {
     "@bytecodealliance/jco": "^1.15.4",

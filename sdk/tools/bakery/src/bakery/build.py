@@ -1,7 +1,7 @@
 """Build command implementation for Bakery.
 
 This module implements the `bakery build` subcommand for building
-JavaScript/TypeScript and Rust inferlets into WebAssembly components.
+JavaScript/TypeScript, Python, and Rust inferlets into WebAssembly components.
 """
 
 import json
@@ -17,13 +17,6 @@ from rich.panel import Panel
 from .console import console
 import typer
 
-# Try to import esprima for JS parsing
-try:
-    import esprima
-
-    HAS_ESPRIMA = True
-except ImportError:
-    HAS_ESPRIMA = False
 
 
 def command_exists(cmd: str) -> bool:
@@ -32,13 +25,13 @@ def command_exists(cmd: str) -> bool:
 
 
 def detect_platform(input_path: Path) -> str:
-    """Auto-detect project platform (rust or javascript).
+    """Auto-detect project platform (rust, javascript, or python).
 
     Args:
         input_path: Path to file or directory.
 
     Returns:
-        "rust" or "javascript"
+        "rust", "javascript", or "python"
 
     Raises:
         ValueError: If platform cannot be determined.
@@ -48,9 +41,14 @@ def detect_platform(input_path: Path) -> str:
             return "rust"
         if (input_path / "package.json").exists():
             return "javascript"
+        if (input_path / "pyproject.toml").exists():
+            return "python"
+        # Check for main.py without pyproject.toml (simple Python project)
+        if (input_path / "main.py").exists():
+            return "python"
         raise ValueError(
             f"Cannot detect platform for '{input_path}'. "
-            "Expected Cargo.toml (Rust) or package.json (JavaScript)."
+            "Expected Cargo.toml (Rust), package.json (JavaScript), or pyproject.toml/main.py (Python)."
         )
 
     if input_path.is_file():
@@ -59,7 +57,9 @@ def detect_platform(input_path: Path) -> str:
             return "rust"
         if ext in (".js", ".ts"):
             return "javascript"
-        raise ValueError(f"Unsupported file type: {ext}. Expected .rs, .js, or .ts")
+        if ext == ".py":
+            return "python"
+        raise ValueError(f"Unsupported file type: {ext}. Expected .rs, .js, .ts, or .py")
 
     raise ValueError(f"Input '{input_path}' does not exist")
 
@@ -113,9 +113,14 @@ def get_inferlet_js_path() -> Path:
 
 
 def get_wit_path() -> Path:
-    """Get the path to the WIT directory."""
+    """Get the path to the WIT directory containing the exec world."""
     # Try PIE_SDK environment variable
     if pie_sdk := os.environ.get("PIE_SDK"):
+        # Check for rust/inferlet/wit first (has the exec world)
+        path = Path(pie_sdk) / "rust" / "inferlet" / "wit"
+        if path.exists() and (path / "world.wit").exists():
+            return path
+        # Fallback to interfaces
         path = Path(pie_sdk) / "interfaces"
         if path.exists():
             return path
@@ -123,12 +128,249 @@ def get_wit_path() -> Path:
     # Walk up from current directory
     current_dir = Path.cwd()
     for parent in [current_dir] + list(current_dir.parents):
+        # Check for sdk/rust/inferlet/wit first (has the exec world)
+        wit_path = parent / "sdk" / "rust" / "inferlet" / "wit"
+        if wit_path.exists() and (wit_path / "world.wit").exists():
+            return wit_path
+        # Fallback to sdk/interfaces
         wit_path = parent / "sdk" / "interfaces"
         if wit_path.exists():
             return wit_path
 
     raise FileNotFoundError(
         "Could not find WIT directory. Please set PIE_SDK environment variable."
+    )
+
+
+def get_inferlet_py_path() -> Path:
+    """Get the path to the inferlet-py library."""
+    # Try PIE_SDK environment variable
+    if pie_sdk := os.environ.get("PIE_SDK"):
+        path = Path(pie_sdk) / "python"
+        if path.exists():
+            return path
+
+    # Walk up from current directory
+    current_dir = Path.cwd()
+    for parent in [current_dir] + list(current_dir.parents):
+        inferlet_py_path = parent / "sdk" / "python"
+        if inferlet_py_path.exists() and (inferlet_py_path / "pyproject.toml").exists():
+            return inferlet_py_path
+
+    raise FileNotFoundError(
+        "Could not find inferlet-py library. Please set PIE_SDK environment variable."
+    )
+
+
+def detect_py_input_type(input_path: Path) -> tuple[str, Path]:
+    """Detect whether Python input is a single file or package directory.
+
+    Returns:
+        Tuple of (type, entry_point) where type is "file" or "package".
+    """
+    if input_path.is_file():
+        ext = input_path.suffix.lower()
+        if ext == ".py":
+            return ("file", input_path)
+        raise ValueError(f"Unsupported file type: {ext}. Expected .py")
+
+    if input_path.is_dir():
+        # Look for pyproject.toml or main.py
+        pyproject = input_path / "pyproject.toml"
+        main_py = input_path / "main.py"
+
+        if pyproject.exists():
+            # Package with pyproject.toml - look for main.py or app.py
+            if main_py.exists():
+                return ("package", main_py)
+            app_py = input_path / "app.py"
+            if app_py.exists():
+                return ("package", app_py)
+            raise ValueError(
+                f"Directory '{input_path}' has pyproject.toml but no main.py or app.py entry point"
+            )
+        elif main_py.exists():
+            return ("package", main_py)
+        else:
+            raise ValueError(
+                f"Directory '{input_path}' does not contain pyproject.toml or main.py"
+            )
+
+    raise ValueError(f"Input '{input_path}' does not exist")
+
+
+def generate_py_wrapper(user_module: Path, output_path: Path) -> None:
+    """Generate the WIT wrapper for Python that exports the run interface.
+
+    Args:
+        user_module: Path to the user's main Python file.
+        output_path: Path to write the wrapper file.
+    """
+    # Get the module name without extension
+    module_name = user_module.stem
+
+    # The wrapper imports user code and provides the WIT run export
+    # All modules are bundled in the same directory by componentize-py
+    wrapper_content = f'''# Auto-generated by bakery build --python
+# This wrapper provides the WIT interface for the inferlet
+
+# Import WIT bindings for the run export
+from wit_world import exports
+
+# Import inferlet_py at top level so componentize-py bundles it
+import inferlet_py as _inferlet_py
+
+# Import user module at top level so componentize-py bundles it
+import {module_name} as _user_module
+
+class Run(exports.Run):
+    def run(self) -> None:
+        # Call the user's main function if it exists
+        if hasattr(_user_module, 'main'):
+            _user_module.main()
+        else:
+            # Module execution happens at import time for scripts without main()
+            pass
+        # Signal completion if user code didn't call set_return()
+        if not _inferlet_py.was_return_set():
+            _inferlet_py.set_return("")
+'''
+
+    output_path.write_text(wrapper_content)
+
+
+def copy_dir_recursive(src: Path, dst: Path) -> None:
+    """Recursively copy a directory."""
+    dst.mkdir(parents=True, exist_ok=True)
+
+    for entry in src.iterdir():
+        src_path = entry
+        dst_path = dst / entry.name
+
+        if src_path.is_dir():
+            copy_dir_recursive(src_path, dst_path)
+        else:
+            shutil.copy2(src_path, dst_path)
+
+
+def run_componentize_py(
+    wrapper_py: Path,
+    output_wasm: Path,
+    wit_path: Path,
+    debug: bool,
+) -> None:
+    """Run componentize-py to compile Python code to WASM."""
+    # Get the working directory (where wrapper_py is located)
+    work_dir = wrapper_py.parent.resolve()
+
+    # Get the module name from the wrapper file (without .py extension)
+    module_name = wrapper_py.stem
+
+    # Canonicalize paths for componentize-py
+    wit_path_abs = wit_path.resolve()
+    output_wasm_abs = output_wasm if output_wasm.is_absolute() else Path.cwd() / output_wasm
+
+    cmd = [
+        "componentize-py",
+        "-d", str(wit_path_abs),
+        "-w", "exec",
+        "componentize",
+        module_name,
+        "-o", str(output_wasm_abs),
+    ]
+
+    result = subprocess.run(
+        cmd,
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"componentize-py failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+
+def handle_python_build(input_path: Path, output: Path, debug: bool = False) -> None:
+    """Build a Python inferlet to WASM.
+
+    Build process:
+    1. Check prerequisites (componentize-py)
+    2. Find inferlet-py and WIT paths
+    3. Detect input type (file or package)
+    4. Create temp directory for intermediate files
+    5. Generate WIT wrapper
+    6. Copy user files to temp directory
+    7. Copy inferlet_py library to temp directory
+    8. Run componentize-py to compile to WASM
+    """
+    # Check prerequisites
+    if not command_exists("componentize-py"):
+        raise RuntimeError(
+            "componentize-py is required but not found.\n"
+            "Install with: uv tool install componentize-py"
+        )
+
+    # Resolve paths
+    with console.status("[bold green]Resolving paths...[/bold green]"):
+        inferlet_py_path = get_inferlet_py_path()
+        wit_path = get_wit_path()
+
+    console.print("[bold]🏗️  Building Python inferlet...[/bold]")
+    console.print(f"   Input: [blue]{input_path}[/blue]")
+    console.print(f"   Output: [blue]{output}[/blue]")
+
+    # Detect input type and entry point
+    input_type, entry_point = detect_py_input_type(input_path)
+    console.print(
+        f"   Type: [dim]{'Single file' if input_type == 'file' else 'Package'}[/dim]"
+    )
+
+    # Create temp directory for intermediate files
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        wrapper_py = temp_path / "app.py"
+
+        with console.status("[bold green]Building Python inferlet...[/bold green]") as status:
+            # Step 1: Generate wrapper
+            status.update("[bold green]🔧 Generating WIT wrapper...[/bold green]")
+            generate_py_wrapper(entry_point, wrapper_py)
+
+            # Step 2: Copy user files to temp directory
+            status.update("[bold green]📦 Copying user files...[/bold green]")
+            if input_type == "file":
+                # Single file - just copy it
+                dest = temp_path / entry_point.name
+                shutil.copy2(entry_point, dest)
+            else:
+                # Package - copy all Python files from the input directory
+                input_dir = input_path.resolve()
+                for py_file in input_dir.glob("*.py"):
+                    dest = temp_path / py_file.name
+                    shutil.copy2(py_file, dest)
+
+            # Step 3: Copy inferlet_py library to temp directory so it gets bundled
+            status.update("[bold green]📦 Bundling inferlet_py library...[/bold green]")
+            inferlet_py_src = inferlet_py_path / "src" / "inferlet_py"
+            if inferlet_py_src.exists():
+                inferlet_py_dest = temp_path / "inferlet_py"
+                copy_dir_recursive(inferlet_py_src, inferlet_py_dest)
+
+            # Step 4: Run componentize-py
+            status.update(
+                "[bold green]🔧 Compiling to WebAssembly component with componentize-py...[/bold green]"
+            )
+            run_componentize_py(wrapper_py, output, wit_path, debug)
+
+    # Success
+    wasm_size = output.stat().st_size if output.exists() else 0
+    console.print(
+        Panel(
+            f"Output: [bold]{output}[/bold] ({wasm_size / 1024 / 1024:.1f} MB)",
+            title="[green]✅ Build successful![/green]",
+            border_style="green",
+        )
     )
 
 
@@ -357,94 +599,171 @@ def check_for_nodejs_imports(bundled_js: Path) -> None:
 
 
 def validate_user_code(bundled_js: Path) -> None:
-    """Validate user code for forbidden exports using AST analysis.
+    """Validate user code for forbidden exports using Node.js AST analysis.
 
-    Checks that user code doesn't export 'run' or 'main'.
+    Uses acorn parser via Node.js to properly handle ES2022+ features
+    like top-level await. Checks that user code doesn't export 'run' or 'main'.
     """
-    if not HAS_ESPRIMA:
-        # Fall back to basic string search if esprima not available
-        console.print(
-            "[yellow]⚠️ esprima not installed, skipping AST validation[/yellow]"
-        )
-        return
+    # Node.js script that parses and validates the code using acorn
+    # acorn is included with npm/npx, so it's always available
+    validate_script = '''
+const fs = require("fs");
+const acorn = require("acorn");
 
-    content = bundled_js.read_text()
+const code = fs.readFileSync(process.argv[2], "utf8");
+
+let ast;
+try {
+    ast = acorn.parse(code, {
+        ecmaVersion: 2022,
+        sourceType: "module",
+        allowAwaitOutsideFunction: true
+    });
+} catch (e) {
+    console.error("PARSE_ERROR:" + e.message);
+    process.exit(1);
+}
+
+function getPatternNames(pattern) {
+    const names = [];
+    if (pattern.type === "Identifier") {
+        names.push(pattern.name);
+    } else if (pattern.type === "ObjectPattern") {
+        for (const prop of pattern.properties) {
+            if (prop.type === "Property") {
+                names.push(...getPatternNames(prop.value));
+            } else if (prop.type === "RestElement") {
+                names.push(...getPatternNames(prop.argument));
+            }
+        }
+    } else if (pattern.type === "ArrayPattern") {
+        for (const elem of pattern.elements) {
+            if (elem) names.push(...getPatternNames(elem));
+        }
+    } else if (pattern.type === "RestElement") {
+        names.push(...getPatternNames(pattern.argument));
+    } else if (pattern.type === "AssignmentPattern") {
+        names.push(...getPatternNames(pattern.left));
+    }
+    return names;
+}
+
+for (const node of ast.body) {
+    let exportedNames = [];
+
+    if (node.type === "ExportNamedDeclaration") {
+        if (node.declaration) {
+            const decl = node.declaration;
+            if (decl.type === "FunctionDeclaration") {
+                exportedNames.push(decl.id.name);
+            } else if (decl.type === "VariableDeclaration") {
+                for (const d of decl.declarations) {
+                    exportedNames.push(...getPatternNames(d.id));
+                }
+            } else if (decl.type === "ClassDeclaration") {
+                exportedNames.push(decl.id.name);
+            }
+        }
+        if (node.specifiers) {
+            for (const spec of node.specifiers) {
+                const exported = spec.exported || spec.local;
+                if (exported) exportedNames.push(exported.name);
+            }
+        }
+    } else if (node.type === "ExportDefaultDeclaration") {
+        if (node.declaration && node.declaration.id) {
+            exportedNames.push(node.declaration.id.name);
+        }
+    }
+
+    for (const name of exportedNames) {
+        if (name === "run") {
+            console.error("FORBIDDEN:run");
+            process.exit(1);
+        }
+        if (name === "main") {
+            console.error("FORBIDDEN:main");
+            process.exit(1);
+        }
+    }
+}
+console.log("OK");
+'''
+
+    # Write the validation script to a temp file and run it
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cjs', delete=False) as f:
+        f.write(validate_script)
+        script_path = f.name
 
     try:
-        tree = esprima.parseModule(content)
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse JavaScript: {e}")
+        # Run with NODE_PATH set to inferlet-js node_modules where acorn is available
+        inferlet_js_path = get_inferlet_js_path()
+        node_modules = inferlet_js_path / "node_modules"
+        env = os.environ.copy()
+        env["NODE_PATH"] = str(node_modules)
 
-    forbidden_names = {"run", "main"}
+        result = subprocess.run(
+            ["node", script_path, str(bundled_js)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
 
-    def check_pattern(pattern: dict) -> set[str]:
-        """Recursively check a pattern for identifiers."""
-        names = set()
-        if pattern["type"] == "Identifier":
-            names.add(pattern["name"])
-        elif pattern["type"] == "ObjectPattern":
-            for prop in pattern["properties"]:
-                if prop["type"] == "Property":
-                    names.update(check_pattern(prop["value"]))
-                elif prop["type"] == "RestElement":
-                    names.update(check_pattern(prop["argument"]))
-        elif pattern["type"] == "ArrayPattern":
-            for elem in pattern["elements"]:
-                if elem:
-                    names.update(check_pattern(elem))
-        elif pattern["type"] == "RestElement":
-            names.update(check_pattern(pattern["argument"]))
-        elif pattern["type"] == "AssignmentPattern":
-            names.update(check_pattern(pattern["left"]))
-        return names
+        stderr = result.stderr.strip()
 
-    for node in tree.body:
-        exported_names = set()
-
-        if node["type"] == "ExportNamedDeclaration":
-            if node.get("declaration"):
-                decl = node["declaration"]
-                if decl["type"] == "FunctionDeclaration":
-                    exported_names.add(decl["id"]["name"])
-                elif decl["type"] == "VariableDeclaration":
-                    for var_decl in decl["declarations"]:
-                        exported_names.update(check_pattern(var_decl["id"]))
-                elif decl["type"] == "ClassDeclaration":
-                    exported_names.add(decl["id"]["name"])
-
-            if node.get("specifiers"):
-                for spec in node["specifiers"]:
-                    exported_name = spec.get("exported", spec.get("local"))
-                    if exported_name:
-                        exported_names.add(exported_name["name"])
-
-        elif node["type"] == "ExportDefaultDeclaration":
-            decl = node["declaration"]
-            if decl.get("id"):
-                exported_names.add(decl["id"]["name"])
-
-        # Check for forbidden names
-        for name in exported_names:
-            if name == "run":
+        if result.returncode != 0:
+            if stderr.startswith("PARSE_ERROR:"):
+                raise RuntimeError(f"Failed to parse JavaScript: {stderr[12:]}")
+            elif stderr.startswith("FORBIDDEN:run"):
                 raise RuntimeError(
                     "User code must not export 'run' - it is auto-generated.\n\n"
                     "To fix: Remove the 'export const run = { ... }' block from your code.\n"
                     "The WIT interface is now automatically created by bakery build."
                 )
-            if name == "main":
+            elif stderr.startswith("FORBIDDEN:main"):
                 raise RuntimeError(
                     "User code must not export 'main' - use top-level code instead.\n\n"
                     "To fix: Move your code from inside main() to the top level."
                 )
+            else:
+                raise RuntimeError(f"Validation failed: {stderr}")
+    finally:
+        os.unlink(script_path)
 
 
 def generate_wrapper(user_bundle_path: Path, output_path: Path) -> None:
     """Generate the WIT interface wrapper."""
     user_bundle_name = user_bundle_path.name
 
+    # Intl polyfill for WASM environment (used by @huggingface/jinja for date formatting)
+    intl_polyfill = """
+// Intl polyfill for WASM environment
+// Provides minimal DateTimeFormat support for @huggingface/jinja
+if (typeof globalThis.Intl === 'undefined') {
+  const MONTHS_LONG = ['January', 'February', 'March', 'April', 'May', 'June',
+                       'July', 'August', 'September', 'October', 'November', 'December'];
+  const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                        'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  globalThis.Intl = {
+    DateTimeFormat: function(locale, options) {
+      return {
+        format: function(date) {
+          if (options && options.month === 'long') {
+            return MONTHS_LONG[date.getMonth()];
+          } else if (options && options.month === 'short') {
+            return MONTHS_SHORT[date.getMonth()];
+          }
+          return date.toISOString();
+        }
+      };
+    }
+  };
+}
+"""
+
     wrapper_content = f"""// Auto-generated by bakery build
 // This wrapper provides the WIT interface for the inferlet
-
+{intl_polyfill}
 // WIT interface export (inferlet:core/run)
 export const run = {{
   run: async () => {{
@@ -638,18 +957,20 @@ def handle_build_command(
 ) -> None:
     """Handle the `bakery build` command.
 
-    Auto-detects project platform (Rust or JavaScript) and dispatches
+    Auto-detects project platform (Rust, JavaScript, or Python) and dispatches
     to the appropriate build handler.
 
     Args:
         input_path: Path to the project directory or source file.
         output: Output path for the .wasm file.
-        debug: Enable debug mode (JS only: inline source maps).
+        debug: Enable debug mode (JS/Python: inline source maps).
     """
     # Auto-detect platform
     platform = detect_platform(input_path)
 
     if platform == "rust":
         handle_rust_build(input_path, output)
+    elif platform == "python":
+        handle_python_build(input_path, output, debug)
     else:
         handle_js_build(input_path, output, debug)

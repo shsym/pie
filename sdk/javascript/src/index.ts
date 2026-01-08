@@ -12,11 +12,12 @@ export {
   debugQuery,
 } from './runtime.js';
 
-// Re-export Sampler types (no class, just types for config)
-export { toSamplerType } from './sampler.js';
+// Re-export Sampler presets and types
+export { Sampler, toSamplerType } from './sampler.js';
 export type { SamplerType, SamplingConfig } from './sampler.js';
 
-
+// Re-export Drafter
+export { Drafter, EmptyDrafter } from './drafter.js';
 
 // Re-export Tokenizer
 export { Tokenizer } from './tokenizer.js';

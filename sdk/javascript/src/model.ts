@@ -4,6 +4,8 @@
 import * as runtime from 'inferlet:core/runtime';
 import * as apiCommon from 'inferlet:core/common';
 import * as apiForward from 'inferlet:core/forward';
+import * as apiAdapter from 'inferlet:adapter/common';
+import * as apiZo from 'inferlet:zo/evolve';
 import type {
   Model as ModelResource,
   Queue as QueueResource,
@@ -12,6 +14,8 @@ import type {
 import { Tokenizer } from './tokenizer.js';
 import { ForwardPass, KvPage, Resource, type Forward } from './forward.js';
 import { awaitFuture } from './async-utils.js';
+import { Blob } from './messaging.js';
+import type { Context } from './context.js';
 
 /**
  * Represents a command queue for a specific model instance.
@@ -249,6 +253,120 @@ export class Queue implements Forward {
     this.releaseExportedResources(Resource.Embed, name);
   }
 
+  // Adapter management (Resource.Adapter = 2)
+
+  /**
+   * Allocate a single adapter pointer
+   */
+  allocateAdapter(): number {
+    const ptrs = this.allocateResources(Resource.Adapter, 1);
+    return ptrs[0];
+  }
+
+  /**
+   * Deallocate an adapter pointer
+   */
+  deallocateAdapter(ptr: number): void {
+    this.deallocateResources(Resource.Adapter, [ptr]);
+  }
+
+  /**
+   * Export an adapter for later import
+   */
+  exportAdapter(ptr: number, name: string): void {
+    this.exportResources(Resource.Adapter, [ptr], name);
+  }
+
+  /**
+   * Import an adapter by name
+   */
+  importAdapter(name: string): number {
+    const ptrs = this.importResources(Resource.Adapter, name);
+    return ptrs[0];
+  }
+
+  /**
+   * Get all exported adapter names
+   */
+  getAllExportedAdapters(): string[] {
+    return this.getAllExportedResources(Resource.Adapter).map(([name]) => name);
+  }
+
+  /**
+   * Release an exported adapter by name
+   */
+  releaseExportedAdapter(name: string): void {
+    this.releaseExportedResources(Resource.Adapter, name);
+  }
+
+  /**
+   * Upload adapter weights
+   */
+  uploadAdapter(adapterPtr: number, name: string, blob: Blob): void {
+    apiAdapter.uploadAdapter(this.#inner, adapterPtr, name, blob.getInner());
+  }
+
+  /**
+   * Download adapter weights (async)
+   */
+  async downloadAdapter(adapterPtr: number, name: string): Promise<Blob> {
+    const future = apiAdapter.downloadAdapter(this.#inner, adapterPtr, name);
+    const blobInner = awaitFuture(future, 'downloadAdapter result was undefined');
+    return Blob.fromWit(blobInner);
+  }
+
+  // Zero-Order Evolution methods
+
+  /**
+   * Initialize an adapter for zero-order evolution.
+   * @param adapterPtr - Pointer to the adapter resource
+   * @param rank - LoRA rank
+   * @param alpha - LoRA alpha scaling factor
+   * @param populationSize - Number of candidates per generation
+   * @param muFraction - Fraction of top performers to keep
+   * @param initialSigma - Initial perturbation standard deviation
+   */
+  initializeAdapter(
+    adapterPtr: number,
+    rank: number,
+    alpha: number,
+    populationSize: number,
+    muFraction: number,
+    initialSigma: number
+  ): void {
+    apiZo.initializeAdapter(
+      this.#inner,
+      adapterPtr,
+      rank,
+      alpha,
+      populationSize,
+      muFraction,
+      initialSigma
+    );
+  }
+
+  /**
+   * Update adapter weights based on evolution scores.
+   * @param adapterPtr - Pointer to the adapter resource
+   * @param scores - Fitness scores for each candidate
+   * @param seeds - Random seeds used for each candidate's perturbation
+   * @param maxSigma - Maximum allowed sigma value
+   */
+  updateAdapter(
+    adapterPtr: number,
+    scores: number[],
+    seeds: bigint[],
+    maxSigma: number
+  ): void {
+    apiZo.updateAdapter(
+      this.#inner,
+      adapterPtr,
+      new Float32Array(scores),
+      new BigInt64Array(seeds),
+      maxSigma
+    );
+  }
+
   // ForwardPass creation
 
   /**
@@ -260,17 +378,31 @@ export class Queue implements Forward {
   }
 
   /**
-   * All exported KV pages
+   * Get all exported KV pages (method form, required by Forward interface)
    */
-  get allExportedKvPages(): [string, number][] {
+  getAllExportedKvPages(): [string, number][] {
     return this.getAllExportedResources(Resource.KvPage);
   }
 
   /**
-   * All exported embeddings
+   * All exported KV pages (getter form)
+   */
+  get allExportedKvPages(): [string, number][] {
+    return this.getAllExportedKvPages();
+  }
+
+  /**
+   * Get all exported embeddings (method form, required by Forward interface)
+   */
+  getAllExportedEmbeds(): [string, number][] {
+    return this.getAllExportedResources(Resource.Embed);
+  }
+
+  /**
+   * All exported embeddings (getter form)
    */
   get allExportedEmbeds(): [string, number][] {
-    return this.getAllExportedResources(Resource.Embed);
+    return this.getAllExportedEmbeds();
   }
 
 }
@@ -376,6 +508,36 @@ export class Model {
     return new Queue(queueResource, this.serviceId);
   }
 
+  /**
+   * Create a new context for this model.
+   * This is a convenience method equivalent to `new Context(model)`.
+   *
+   * Note: Uses late binding to resolve circular dependency with Context module.
+   */
+  createContext(): Context {
+    return _createContext(this);
+  }
+
+}
+
+// Late binding for Context to avoid circular dependency at module load time.
+// The actual Context class is bound when createContextBinding() is called from context.ts.
+let _ContextClass: (new (model: Model) => Context) | null = null;
+
+function _createContext(model: Model): Context {
+  if (!_ContextClass) {
+    throw new Error('Context class not bound. Ensure context.js is imported.');
+  }
+  return new _ContextClass(model);
+}
+
+/**
+ * Binds the Context class for late binding.
+ * Called from context.ts to resolve circular dependency.
+ * @internal
+ */
+export function _bindContextClass(ContextClass: new (model: Model) => Context): void {
+  _ContextClass = ContextClass;
 }
 
 /**

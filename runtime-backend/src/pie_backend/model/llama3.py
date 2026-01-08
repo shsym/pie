@@ -724,7 +724,8 @@ class ForwardPass:
     ) -> torch.Tensor:
 
         # Ensure we're running on the correct CUDA device (critical for Triton kernels)
-        torch.cuda.set_device(self.runtime_config.device)
+        if self.runtime_config.device.type == "cuda":
+            torch.cuda.set_device(self.runtime_config.device)
 
         # --- Calculate local TP sizes ---
         # <-- These are still needed here for planning the wrapper

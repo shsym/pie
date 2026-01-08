@@ -7,6 +7,8 @@ import { Brle } from './brle.js';
 // WIT bindings - these will be available at runtime through componentize-js
 import type { ForwardPass as WitForwardPass } from 'inferlet:core/forward';
 import * as forward from 'inferlet:core/forward';
+import * as apiAdapter from 'inferlet:adapter/common';
+import * as apiZo from 'inferlet:zo/evolve';
 
 /**
  * Represents a probability distribution over a set of tokens.
@@ -271,6 +273,22 @@ export class ForwardPass {
    */
   kvCachePtrs(kvPagePtrs: number[], lastKvPageLen: number): void {
     forward.kvCache(this.inner, new Uint32Array(kvPagePtrs), lastKvPageLen);
+  }
+
+  /**
+   * Set the adapter for this forward pass (LoRA inference).
+   * @param adapterPtr - Pointer to the adapter resource
+   */
+  setAdapter(adapterPtr: number): void {
+    apiAdapter.setAdapter(this.inner, adapterPtr);
+  }
+
+  /**
+   * Set the random seed for adapter perturbation (ZO optimization).
+   * @param seed - Random seed for perturbation
+   */
+  setAdapterSeed(seed: number): void {
+    apiZo.setAdapterSeed(this.inner, BigInt(seed));
   }
 }
 
