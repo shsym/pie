@@ -66,18 +66,32 @@ def start_server(
     if hasattr(service, "set_response_callback"):
         service.set_response_callback(response_callback)
 
-    # Thread Structure (Refactored for ZMQ Safety):
+    # Create shared ZMQ context and socket
+    context = zmq.Context()
+    socket = context.socket(zmq.ROUTER)
+    try:
+        socket.bind(endpoint)
+    except zmq.ZMQError as e:
+        print(f"Failed to bind to {endpoint}: {e}")
+        return
+
+    # Thread Structure (Refactored for low latency - no polling):
     #
     # +-----------------------------+
-    # |         io_thread           |  <-- Owns ZMQ socket (Reads & Writes)
+    # |     zmq_listen_thread       |  <-- Blocks on recv (ZMQ socket)
     # +-----------------------------+
-    #   ^  |                      ^
-    #   |  | (work req queue)     | (response queue)
-    #   |  v                      |
-    #   v +------------------+    |
-    # +------------------+   |    |
-    # |  worker_thread   |---+----+
+    #   |
+    #   | (work req queue)
+    #   v
     # +------------------+
+    # |  worker_thread   |
+    # +------------------+
+    #   |
+    #   | (response queue)
+    #   v
+    # +-----------------------------+
+    # |    zmq_response_thread      |  --> Blocks on queue.get (ZMQ socket)
+    # +-----------------------------+
 
     worker_t = threading.Thread(
         target=worker_thread,
@@ -86,13 +100,20 @@ def start_server(
     )
     worker_t.start()
 
-    # Replaces zmq_response_thread and zmq_listen_thread
-    io_t = threading.Thread(
-        target=io_thread,
-        args=(endpoint, work_request_queue, response_queue, shutdown_event),
+    # Separate threads for listen and response (no polling!)
+    listen_t = threading.Thread(
+        target=zmq_listen_thread,
+        args=(work_request_queue, socket, shutdown_event),
         daemon=True,
     )
-    io_t.start()
+    listen_t.start()
+
+    response_t = threading.Thread(
+        target=zmq_response_thread,
+        args=(response_queue, socket, shutdown_event),
+        daemon=True,
+    )
+    response_t.start()
 
     reg_t = threading.Thread(
         target=register_thread,
@@ -144,12 +165,18 @@ def start_server(
             log_queue.put({"level": "ERROR", "message": err_msg})
 
         # 3. Stop remaining threads
-        if io_t.is_alive():
-            io_t.join(timeout=2.0)
+        if listen_t.is_alive():
+            listen_t.join(timeout=2.0)
+        if response_t.is_alive():
+            response_t.join(timeout=2.0)
         if reg_t.is_alive():
             reg_t.join(timeout=2.0)
         if test_t and test_t.is_alive():
             test_t.join(timeout=2.0)
+
+        # 4. Clean up ZMQ
+        socket.close()
+        context.term()
 
         final_msg = "Server shutdown complete."
         log_queue.put({"level": "DEBUG", "message": final_msg})
@@ -299,28 +326,47 @@ def worker_thread(
         shutdown_event.set()
 
 
-def io_thread(
-    endpoint: str,
-    work_queue: queue.Queue,
+def zmq_response_thread(
     response_queue: queue.Queue,
+    socket: zmq.Socket,
     shutdown_event: threading.Event,
 ) -> None:
-    """Thread that handles ALL ZMQ I/O (listen and response) to ensure thread safety."""
-
-    context = zmq.Context()
-    socket = context.socket(zmq.ROUTER)
-
-    try:
-        socket.bind(endpoint)
-    except zmq.ZMQError as e:
-        print(f"Failed to bind to {endpoint}: {e}")
-        shutdown_event.set()
-        return
-
-    poller = zmq.Poller()
-    poller.register(socket, zmq.POLLIN)
+    """Thread that sends responses to the controller. Blocks on queue.get()."""
 
     msgpack_encoder = msgspec.msgpack.Encoder()
+
+    try:
+        while not shutdown_event.is_set():
+            try:
+                resp_item = response_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            client_identity, corr_id_bytes, handler_id_bytes, resps = resp_item
+
+            response_msg = [
+                client_identity,
+                corr_id_bytes,
+                handler_id_bytes,
+            ] + [msgpack_encoder.encode(r) for r in resps]
+            socket.send_multipart(response_msg)
+
+    except zmq.error.ZMQError as exc:
+        if exc.errno in {zmq.ETERM, zmq.ENOTSOCK}:
+            return
+        print(f"Unhandled error occurred in the ZMQ response thread: {exc}")
+        shutdown_event.set()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        print(f"Unhandled error occurred in the response thread: {exc}")
+        shutdown_event.set()
+
+
+def zmq_listen_thread(
+    work_queue: queue.Queue,
+    socket: zmq.Socket,
+    shutdown_event: threading.Event,
+) -> None:
+    """Thread that listens for incoming requests. Blocks on recv_multipart()."""
 
     decoders = {
         HandlerId.HANDSHAKE.value: msgspec.msgpack.Decoder(HandshakeRequest),
@@ -337,71 +383,54 @@ def io_thread(
         ),
     }
 
+    # Set socket timeout to allow checking shutdown_event
+    socket.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout
+
     try:
         while not shutdown_event.is_set():
-            # 1. Process Outgoing Responses
             try:
-                # Drain up to 50 responses at a time to prevent starvation
-                for _ in range(50):
-                    resp_item = response_queue.get_nowait()
-                    client_identity, corr_id_bytes, handler_id_bytes, resps = resp_item
-
-                    response_msg = [
-                        client_identity,
-                        corr_id_bytes,
-                        handler_id_bytes,
-                    ] + [msgpack_encoder.encode(r) for r in resps]
-                    socket.send_multipart(response_msg)
-            except queue.Empty:
-                pass
-
-            # 2. Process Incoming Requests
-            # Poll with timeout to allow checking response_queue and shutdown_event
-            socks = dict(poller.poll(timeout=10))
-
-            if socket in socks and socks[socket] == zmq.POLLIN:
                 message = socket.recv_multipart()
+            except zmq.Again:
+                # Timeout - check shutdown_event and continue
+                continue
 
-                if len(message) < 3:
-                    print(f"[!] Received invalid message: {message}", file=sys.stderr)
+            if len(message) < 3:
+                print(f"[!] Received invalid message: {message}", file=sys.stderr)
+                continue
+
+            client_identity, corr_id_bytes, handler_id_bytes = message[:3]
+            try:
+                # corr_id extracted but not used
+                _ = struct.unpack(">I", corr_id_bytes)[0]
+                handler_id = struct.unpack(">I", handler_id_bytes)[0]
+
+                if handler_id in decoders:
+                    reqs = [decoders[handler_id].decode(m) for m in message[3:]]
+                else:
+                    print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
                     continue
 
-                client_identity, corr_id_bytes, handler_id_bytes = message[:3]
-                try:
-                    # corr_id extracted but not used
-                    _ = struct.unpack(">I", corr_id_bytes)[0]
-                    handler_id = struct.unpack(">I", handler_id_bytes)[0]
-
-                    if handler_id in decoders:
-                        reqs = [decoders[handler_id].decode(m) for m in message[3:]]
-                    else:
-                        print(f"[!] Unknown handler ID: {handler_id}", file=sys.stderr)
-                        continue
-
-                except (struct.error, KeyError, msgspec.DecodeError) as exc:
-                    print(
-                        f"[!] Error decoding request header or payload: {exc}",
-                        file=sys.stderr,
-                    )
-                    continue
-
-                if not reqs:
-                    print("[!] Received empty request body", file=sys.stderr)
-                    continue
-
-                # Dispatch
-                work_queue.put(
-                    (client_identity, corr_id_bytes, handler_id_bytes, handler_id, reqs)
+            except (struct.error, KeyError, msgspec.DecodeError) as exc:
+                print(
+                    f"[!] Error decoding request header or payload: {exc}",
+                    file=sys.stderr,
                 )
+                continue
+
+            if not reqs:
+                print("[!] Received empty request body", file=sys.stderr)
+                continue
+
+            # Dispatch
+            work_queue.put(
+                (client_identity, corr_id_bytes, handler_id_bytes, handler_id, reqs)
+            )
 
     except zmq.error.ZMQError as exc:
         if exc.errno in {zmq.ETERM, zmq.ENOTSOCK}:
             return
-        print(f"Unhandled error occurred in the ZMQ I/O thread: {exc}")
+        print(f"Unhandled error occurred in the ZMQ listen thread: {exc}")
         shutdown_event.set()
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        print(f"Unhandled error occurred in the I/O thread: {exc}")
+        print(f"Unhandled error occurred in the listen thread: {exc}")
         shutdown_event.set()
-    finally:
-        socket.close()
-        context.term()

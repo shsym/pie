@@ -322,7 +322,8 @@ def init_process(
 
     # Log trace to queue if available
     trace_msg = f"[TRACE rank={rank}] Config devices={config.devices}, my device={config.device}"
-    log_queue.put({"level": "DEBUG", "message": trace_msg})
+    if log_queue:
+        log_queue.put({"level": "DEBUG", "message": trace_msg})
 
     # Initialize Runtime
     service = Runtime(config, log_queue=log_queue)
