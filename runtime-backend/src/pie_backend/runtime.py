@@ -28,6 +28,13 @@ from .batching import BatchBuilder, Batch
 from .loader import ModelLoader
 from .adapter import AdapterSubpass, CmaesAdapter
 from .model import llama3, qwen2, qwen3, common
+from .model.chat_templates import (
+    Llama3Template,
+    Qwen2_5Template,
+    Qwen3Template,
+    GPTOSSTemplate,
+    ChatTemplate,
+)
 
 # gpt_oss requires CUDA-only features, only import on CUDA platforms
 if torch.cuda.is_available():
@@ -115,7 +122,7 @@ class Runtime:
             torch.cuda.manual_seed_all(config.random_seed)
 
         # Load model weights using ModelLoader
-        loader = ModelLoader(config)
+        loader = ModelLoader(config, log_queue=log_queue)
 
         msg = "Loading model weights"
         self.log_queue.put({"message": msg, "level": "DEBUG"})
@@ -263,30 +270,29 @@ class Runtime:
         }
 
     def get_chat_template(self) -> dict:
-        """Get chat template configuration from HuggingFace tokenizer_config.json."""
-        if self.snapshot_dir is None:
+        """Get chat template configuration based on model type."""
+        template: ChatTemplate | None = None
+
+        if self.type == "llama3" or self.type == "l4ma":
+            template = Llama3Template
+        elif self.type == "qwen2":
+            template = Qwen2_5Template
+        elif self.type == "qwen3":
+            template = Qwen3Template
+        elif self.type == "gptoss":
+            template = GPTOSSTemplate
+
+        if template:
             return {
-                "template_type": "none",
-                "template_content": "",
-                "stop_tokens": [],
+                "template_type": template.template_type,
+                "template_content": template.template,
+                "stop_tokens": template.stop_tokens,
             }
 
-        # Load tokenizer info from HuggingFace
-        tokenizer_info = hf_utils.load_hf_tokenizer(self.snapshot_dir)
-        chat_template = tokenizer_info.get("chat_template", "")
-
-        # Determine stop tokens from special tokens
-        special_tokens = tokenizer_info.get("special_tokens", {})
-        stop_tokens = []
-        # Common stop tokens across models
-        for token_name in ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "</s>"]:
-            if token_name in special_tokens:
-                stop_tokens.append(token_name)
-
         return {
-            "template_type": "minijinja" if chat_template else "none",
-            "template_content": chat_template,
-            "stop_tokens": stop_tokens,
+            "template_type": "none",
+            "template_content": "",
+            "stop_tokens": [],
         }
 
     def get_tokenizer(self) -> dict:

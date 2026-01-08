@@ -243,6 +243,15 @@ def dequantize_from_mxfp4(
     Returns:
         Converted tensor in the target dtype
     """
+    # CRITICAL FIX: If scales are loaded as float8 (e.g. from safetensors), we must
+    # view them as uint8 to interpret them as raw exponent bits. Converting float8
+    # directly to int32 would convert the *value* (approx 1.0 -> 1), not the bit
+    # representation (e.g., 127), destroying the exponent information.
+    if scales.dtype == torch.float8_e4m3fn:
+        scales = scales.view(torch.uint8)
+
+    # Convert raw exponent bits to int32 and subtract bias
+    # We must do this on the source device to avoid dtype mismatch issues during copy
     scales = scales.to(torch.int32) - 127
 
     assert (
@@ -254,6 +263,7 @@ def dequantize_from_mxfp4(
     *prefix_shape, g, b = blocks.shape
     rows_total = math.prod(prefix_shape) * g
 
+    # Move to target device
     blocks = blocks.reshape(rows_total, b).to(device)
     scales = scales.reshape(rows_total, 1).to(device)
 
@@ -280,13 +290,17 @@ def quantize_into_mxfp4(
 
     num_experts = a.shape[0]
     sf_vec_size = 32  # MXFP4 uses 32-element blocks
+    device = a.device
 
     quant_a = []
     sfs = []
-    a_global_sf = torch.tensor(1.0, dtype=torch.float32).cuda()
+    # Ensure scale factor is on the same device as the input
+    a_global_sf = torch.tensor(1.0, dtype=torch.float32, device=device)
+
     for i in range(num_experts):
+        # Input 'a' is likely already on GPU from dequantize step
         a_fp4, a_sf = fp4_quantize(
-            a[i].cuda(), a_global_sf, sf_vec_size, True, is_sf_swizzled_layout
+            a[i], a_global_sf, sf_vec_size, True, is_sf_swizzled_layout
         )
         quant_a.append(a_fp4)
         sfs.append(a_sf)
@@ -488,6 +502,7 @@ def prepare_gptoss_moe_gate_up(
         tensors: List of [blocks, scales, bias] tensors
         config: Configuration dict with hidden_size, intermediate_size,
                 padded_hidden_size, padded_intermediate_size, num_experts, device
+                Optional: rank, world_size for TP sharding
 
     Returns:
         Dict with 'weights', 'scales', 'bias' keys containing prepared tensors
@@ -500,8 +515,12 @@ def prepare_gptoss_moe_gate_up(
     padded_hidden_size = config["padded_hidden_size"]
     padded_intermediate_size = config["padded_intermediate_size"]
     num_experts = config["num_experts"]
+    
+    # Handle Tensor Parallelism (TP)
+    rank = config.get("rank", 0)
+    world_size = config.get("world_size", 1)
 
-    # Step 1: Dequantize MXFP4 to bfloat16
+    # Step 1: Dequantize MXFP4 to bfloat16 (FULL tensor)
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, intermediate_size * 2, hidden_size]
     weights_bf16 = weights_bf16.reshape(num_experts, intermediate_size * 2, hidden_size)
@@ -509,8 +528,44 @@ def prepare_gptoss_moe_gate_up(
     # Step 2: De-interleave from GPT OSS format to FlashInfer format
     weights_deinterleaved = deinterleave_gate_up_weights(weights_bf16)
     bias_deinterleaved = deinterleave_gate_up_bias(bias.to(device))
+    
+    # Step 3: Apply TP sharding AFTER de-interleaving (on float tensor)
+    if world_size > 1:
+        # After de-interleaving, weights are [num_experts, 2*intermediate, hidden]
+        # First half is linear, second half is gate
+        # We need to slice BOTH halves consistently
+        if intermediate_size % world_size != 0:
+             raise ValueError(f"intermediate_size {intermediate_size} not divisible by world_size {world_size}")
+        
+        local_intermediate = intermediate_size // world_size
+        local_padded_intermediate = padded_intermediate_size // world_size
+        
+        start_idx = rank * local_intermediate
+        end_idx = (rank + 1) * local_intermediate
+        
+        # Slice both linear and gate parts
+        linear_part = weights_deinterleaved[:, :intermediate_size, :]  # [E, I, H]
+        gate_part = weights_deinterleaved[:, intermediate_size:, :]    # [E, I, H]
+        
+        local_linear = linear_part[:, start_idx:end_idx, :].contiguous()
+        local_gate = gate_part[:, start_idx:end_idx, :].contiguous()
+        
+        weights_deinterleaved = torch.cat([local_linear, local_gate], dim=1)
+        
+        # Slice bias similarly
+        linear_bias = bias_deinterleaved[:, :intermediate_size]
+        gate_bias = bias_deinterleaved[:, intermediate_size:]
+        
+        local_linear_bias = linear_bias[:, start_idx:end_idx].contiguous()
+        local_gate_bias = gate_bias[:, start_idx:end_idx].contiguous()
+        
+        bias_deinterleaved = torch.cat([local_linear_bias, local_gate_bias], dim=1)
+        
+        # Update sizes
+        intermediate_size = local_intermediate
+        padded_intermediate_size = local_padded_intermediate
 
-    # Step 3: Pad to alignment
+    # Step 4: Pad to alignment
     weights_padded = pad_gate_up_weights(
         weights_deinterleaved,
         padded_hidden_size,
@@ -521,7 +576,7 @@ def prepare_gptoss_moe_gate_up(
         padded_intermediate_size,
     ).to(torch.float32)
 
-    # Step 4: Quantize and shuffle
+    # Step 5: Quantize and shuffle
     weights_shuffled, scales_shuffled, bias_shuffled = quantize_shuffle_gate_up_weights(
         weights_padded,
         padded_hidden_size,
@@ -550,6 +605,7 @@ def prepare_gptoss_moe_down(
         tensors: List of [blocks, scales, bias] tensors
         config: Configuration dict with hidden_size, intermediate_size,
                 padded_hidden_size, padded_intermediate_size, num_experts, device
+                Optional: rank, world_size for TP sharding
 
     Returns:
         Dict with 'weights', 'scales', 'bias' keys containing prepared tensors
@@ -563,12 +619,39 @@ def prepare_gptoss_moe_down(
     padded_intermediate_size = config["padded_intermediate_size"]
     num_experts = config["num_experts"]
 
-    # Step 1: Dequantize MXFP4 to bfloat16
+    # Handle Tensor Parallelism (TP)
+    rank = config.get("rank", 0)
+    world_size = config.get("world_size", 1)
+
+    # Step 1: Dequantize MXFP4 to bfloat16 (FULL tensor)
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, hidden_size, intermediate_size]
     weights_bf16 = weights_bf16.reshape(num_experts, hidden_size, intermediate_size)
+    
+    # Step 2: Apply TP sharding AFTER dequantization (on float tensor)
+    if world_size > 1:
+        if intermediate_size % world_size != 0:
+             raise ValueError(f"intermediate_size {intermediate_size} not divisible by world_size {world_size}")
 
-    # Step 2: Pad to alignment
+        local_intermediate = intermediate_size // world_size
+        local_padded_intermediate = padded_intermediate_size // world_size
+        
+        start_idx = rank * local_intermediate
+        end_idx = (rank + 1) * local_intermediate
+        
+        # Slice weights along intermediate dimension (dim 2)
+        weights_bf16 = weights_bf16[:, :, start_idx:end_idx].contiguous()
+        
+        # Bias for Down proj is [num_experts, hidden_size] -> Not sharded on that dim
+        # But since each rank produces partial output that gets summed,
+        # we need to divide bias by world_size to avoid over-counting
+        bias = bias / world_size
+        
+        # Update sizes
+        intermediate_size = local_intermediate
+        padded_intermediate_size = local_padded_intermediate
+
+    # Step 3: Pad to alignment
     weights_padded = pad_down_weights(
         weights_bf16,
         padded_hidden_size,
@@ -579,7 +662,7 @@ def prepare_gptoss_moe_down(
         padded_hidden_size,
     ).to(torch.float32)
 
-    # Step 3: Quantize and shuffle
+    # Step 4: Quantize and shuffle
     weights_shuffled, scales_shuffled, bias_shuffled = quantize_shuffle_down_weights(
         weights_padded,
         padded_hidden_size,

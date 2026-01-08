@@ -280,42 +280,6 @@ class KvPageManager:
         for page in self._pages:
             page.ref()
 
-    def remove_page_at(self, index: int) -> None:
-        """
-        Remove a page at the specified index.
-
-        Used by drop_masked_kv_pages to remove fully-masked pages.
-
-        Args:
-            index: The index of the page to remove
-        """
-        if index < 0 or index >= len(self._pages):
-            raise IndexError(f"Page index {index} out of bounds")
-
-        removed = self._pages.pop(index)
-        removed.release()
-
-        # Recalculate last page length
-        new_total_tokens = self.total_tokens
-        last_page_len = new_total_tokens % self._page_size
-        self._last_page_len = (
-            self._page_size if last_page_len == 0 and new_total_tokens > 0 else last_page_len
-        )
-
-    def recalculate_last_page_len(self, total_tokens: int) -> None:
-        """
-        Recalculate last page length based on current page count and total tokens.
-
-        Used after external modifications to pages list.
-
-        Args:
-            total_tokens: The total number of committed tokens
-        """
-        last_page_len = total_tokens % self._page_size
-        self._last_page_len = (
-            self._page_size if last_page_len == 0 and total_tokens > 0 else last_page_len
-        )
-
     def __enter__(self) -> "KvPageManager":
         return self
 

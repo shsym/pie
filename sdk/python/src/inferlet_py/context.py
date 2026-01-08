@@ -358,58 +358,6 @@ class Context:
         """
         self._kv_manager.shrink(num_tokens)
 
-    def drop_masked_kv_pages(self) -> None:
-        """
-        Drops fully masked KV pages to save memory, supporting non-contiguous
-        dropping for optimizations like attention sink.
-
-        The function iterates through all committed pages and checks if the tokens
-        corresponding to a page are all masked as `true`. If so, it deallocates
-        the page and removes the corresponding token ranges from the context's state.
-
-        Warning:
-            This operation modifies the token history non-contiguously, which can
-            break the assumptions of a standard causal attention model. It should
-            only be used with models and systems (like StreamingLLM) designed to
-            handle a KV cache with logical gaps.
-        """
-        kv_page_size = self._model.kv_page_size
-        num_committed_pages = len(self._token_ids) // kv_page_size
-
-        # Iterate backwards to safely remove elements from lists by index.
-        # We only consider dropping full pages, not the last (potentially partial) page.
-        for i in range(num_committed_pages - 1, -1, -1):
-            page_start_token_idx = i * kv_page_size
-            page_end_token_idx = (i + 1) * kv_page_size
-
-            if self._token_mask_current.is_range_all_value(
-                page_start_token_idx,
-                page_end_token_idx,
-                True,
-            ):
-                # This page is fully masked and can be dropped.
-
-                # 1. Remove the page ID and deallocate the physical page.
-                self._kv_manager.remove_page_at(i)
-
-                # 2. Remove the corresponding token range from the main token list.
-                del self._token_ids[page_start_token_idx:page_end_token_idx]
-
-                # 3. Remove the corresponding position IDs.
-                del self._position_ids[page_start_token_idx:page_end_token_idx]
-
-                # 4. Remove the same range from the current mask.
-                self._token_mask_current.remove_range(
-                    page_start_token_idx, page_end_token_idx
-                )
-
-                # 5. Remove the range from all historical pending masks.
-                for mask in self._token_mask_pending:
-                    mask.remove_range(page_start_token_idx, page_end_token_idx)
-
-        # Recalculate the last page length after dropping pages.
-        self._kv_manager.recalculate_last_page_len(len(self._token_ids))
-
     def flush(self) -> None:
         """
         Process all pending tokens to update the model's internal KV cache state.

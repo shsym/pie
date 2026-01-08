@@ -237,3 +237,4 @@ package-lock.json
 wandb/
 
 *.pt
+*.zt

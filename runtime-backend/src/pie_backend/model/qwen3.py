@@ -132,16 +132,22 @@ class ModelConfig(ModelConfigBase):
 
     @staticmethod
     def from_dict(spec: dict) -> "ModelConfig":
+        # Calculate head_dim if not present
+        if "head_dim" in spec:
+            head_dim = int(spec["head_dim"])
+        else:
+            head_dim = int(spec["hidden_size"]) // int(spec["num_attention_heads"])
+
         return ModelConfig(
-            num_layers=int(spec["num_layers"]),
-            num_q_heads=int(spec["num_query_heads"]),
+            num_layers=int(spec["num_hidden_layers"]),
+            num_q_heads=int(spec["num_attention_heads"]),
             num_kv_heads=int(spec["num_key_value_heads"]),
-            dim_head=int(spec["head_size"]),
+            dim_head=head_dim,
             dim_hidden=int(spec["hidden_size"]),
             dim_mlp=int(spec["intermediate_size"]),
             num_vocabs=int(spec["vocab_size"]),
             rms_norm_eps=float(spec["rms_norm_eps"]),
-            rope_theta=float(spec["rope"]["theta"]),
+            rope_theta=float(spec.get("rope_theta", 1000000.0)),
         )
 
     def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:

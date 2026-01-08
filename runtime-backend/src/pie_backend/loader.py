@@ -217,6 +217,10 @@ class Source:
     def should_quantize(self) -> bool:
         return self._should_quantize
 
+    @property
+    def target_dtype(self) -> torch.dtype | None:
+        return self._dtype
+
 
 @dataclass
 class Definition:
@@ -309,6 +313,7 @@ class Schema:
         reader: ReaderFn,
         config: "RuntimeConfig",
         num_layers: int = 0,
+        log_queue: object | None = None,
     ) -> WeightStore:
         """
         Load all weights according to the schema.
@@ -317,29 +322,83 @@ class Schema:
             reader: Function to read tensors by name
             config: Runtime configuration (device, sharding, quantization)
             num_layers: Number of layers (for expanding '*' patterns)
+            log_queue: Optional queue to send progress updates to CLI
 
         Returns:
             WeightStore with all loaded weights
         """
         store = WeightStore()
 
+        # Calculate total number of weight operations for progress tracking
+        total_ops = 0
         for defn in self._definitions:
             if defn.has_layer_pattern():
-                # Expand for each layer
-                for layer_idx in range(num_layers):
-                    logical_name = defn.expand_for_layer(layer_idx)
-                    physical_names = defn.expand_source_for_layer(layer_idx)
-                    tensor = self._load_single(
-                        reader, config, defn.source, physical_names
-                    )
-                    store.put(logical_name, tensor)
+                total_ops += num_layers
             else:
-                # Single tensor (not per-layer)
-                tensor = self._load_single(
-                    reader, config, defn.source, defn.source.patterns
-                )
-                store.put(defn.name, tensor)
-        # print("Loaded", len(store), flush=True)
+                total_ops += 1
+
+        # Only show progress on rank 0
+        show_progress = config.rank == 0
+
+        # If log_queue is provided, send progress to CLI instead of local tqdm
+        use_queue_progress = log_queue is not None and show_progress
+
+        def send_progress(current: int, total: int, desc: str):
+            """Send progress update to CLI via log queue."""
+            if use_queue_progress:
+                log_queue.put({
+                    "level": "PROGRESS",
+                    "current": current,
+                    "total": total,
+                    "description": desc,
+                })
+
+        # Send initial progress
+        if use_queue_progress:
+            send_progress(0, total_ops, "Starting weight loading...")
+
+        # Use local tqdm only if not using queue progress
+        with tqdm(
+            total=total_ops,
+            desc="\033[1;36m Loading weights\033[0m",
+            unit="tensors",
+            disable=use_queue_progress or not show_progress,
+            bar_format="{desc} │{bar:40}│ {percentage:3.0f}% • {n_fmt}/{total_fmt} • {rate_fmt} • ETA: {remaining}",
+            colour="cyan",
+            dynamic_ncols=True,
+        ) as pbar:
+            current_op = 0
+            for defn in self._definitions:
+                if defn.has_layer_pattern():
+                    # Expand for each layer
+                    for layer_idx in range(num_layers):
+                        logical_name = defn.expand_for_layer(layer_idx)
+                        physical_names = defn.expand_source_for_layer(layer_idx)
+                        desc = f"layer {layer_idx + 1}/{num_layers}"
+                        pbar.set_postfix_str(desc, refresh=False)
+                        tensor = self._load_single(
+                            reader, config, defn.source, physical_names
+                        )
+                        store.put(logical_name, tensor)
+                        current_op += 1
+                        pbar.update(1)
+                        send_progress(current_op, total_ops, desc)
+                else:
+                    # Single tensor (not per-layer)
+                    desc = defn.name
+                    pbar.set_postfix_str(desc, refresh=False)
+                    tensor = self._load_single(
+                        reader, config, defn.source, defn.source.patterns
+                    )
+                    store.put(defn.name, tensor)
+                    current_op += 1
+                    pbar.update(1)
+                    send_progress(current_op, total_ops, desc)
+
+        # Send completion
+        if use_queue_progress:
+            log_queue.put({"level": "PROGRESS_DONE", "message": "Weight loading complete"})
+
         return store
 
     def _load_single(
@@ -359,6 +418,9 @@ class Schema:
             # Build kwargs for transform function
             transform_kwargs = dict(source._transform_kwargs or {})
             transform_kwargs["device"] = str(config.device)
+            # Inject distributed info for transforms that need custom sharding (like MoE)
+            transform_kwargs["rank"] = config.rank
+            transform_kwargs["world_size"] = config.world_size
 
             # Call the transform function
             result = source._transform_fn(tensors, transform_kwargs)  # type: ignore[misc]
@@ -437,9 +499,13 @@ class Schema:
         # Apply quantization (lazy import to avoid dependency issues)
         if source.should_quantize and config.quantization is not None:
             tensor = quantize(tensor, config.quantization)
-        else:
+        elif source.target_dtype is not None:
+            # Respect explicit dtype override from source definition
+            tensor = tensor.to(source.target_dtype)
+        elif tensor.dtype not in (torch.uint8, torch.float8_e4m3fn):
             # Apply dtype casting for float weight types (including 'auto')
             # This handles: auto -> activation_dtype, float32/float16/bfloat16 -> specified dtype
+            # Skip casting for uint8/float8_e4m3fn tensors (FP4 packed MoE weights)
             tensor = tensor.to(config.compute_dtype)
 
         # Move to device
@@ -462,23 +528,25 @@ class ModelLoader:
     is responsible for creating the ForwardPass and KV cache.
     """
 
-    def __init__(self, config: "RuntimeConfig"):
+    def __init__(self, config: "RuntimeConfig", log_queue: object | None = None):
         """
         Initialize the model loader.
 
         Args:
             config: Runtime configuration with repo_id and arch
+            log_queue: Optional queue for sending progress updates to CLI
         """
         self.config = config
         self.info: dict = {}
         self.snapshot_dir: Path | None = None
+        self.log_queue = log_queue
 
     def load(self) -> tuple[WeightStore, dict, dict]:
         """
         Load the model weights and return components.
 
         Returns:
-            Tuple of (weights, normalized_arch, model_info)
+            Tuple of (weights, arch, model_info)
         """
         # Get HuggingFace snapshot directory
         self.snapshot_dir = hf_utils.get_hf_snapshot_dir(self.config.hf_repo)
@@ -486,22 +554,29 @@ class ModelLoader:
         # Load config from HuggingFace config.json
         hf_config = hf_utils.load_hf_config(self.snapshot_dir)
 
-        # Normalize the HF config to PIE format
-        normalized_arch = hf_utils.normalize_hf_config(hf_config)
-
         # Derive architecture from HF model_type
         hf_model_type = hf_config.get("model_type", "")
+        # Handle case where model_type might be mapped (e.g. llama -> llama3)
+        # We need hf_utils.HF_TO_PIE_ARCH to map it.
+        # If it's not in the map, check if it's already a valid PIE type (less likely but possible)
         arch_type = hf_utils.HF_TO_PIE_ARCH.get(hf_model_type)
+        
         if arch_type is None:
-            raise ValueError(
-                f"Unsupported HuggingFace model_type: '{hf_model_type}'. "
-                f"Supported types: {list(hf_utils.HF_TO_PIE_ARCH.keys())}"
-            )
-        normalized_arch["type"] = arch_type
+             # Basic fallback or error
+             if hf_model_type in hf_utils.HF_TO_PIE_ARCH.values():
+                 arch_type = hf_model_type
+             else:
+                raise ValueError(
+                    f"Unsupported HuggingFace model_type: '{hf_model_type}'. "
+                    f"Supported types: {list(hf_utils.HF_TO_PIE_ARCH.keys())}"
+                )
+        
+        # Inject PIE type into config for runtime to use
+        hf_config["type"] = arch_type
 
         # Store info for later (tokenizer, template, etc.)
         self.info = {
-            "architecture": normalized_arch,
+            "architecture": hf_config,
             "hf_config": hf_config,
         }
 
@@ -509,27 +584,36 @@ class ModelLoader:
         match arch_type:
             case "llama3":
                 from .model import llama3
-
-                schema = llama3.create_schema(normalized_arch)
-                num_layers = int(normalized_arch["num_layers"])
+                
+                # from_dict now expects raw HF config
+                model_config = llama3.ModelConfig.from_dict(hf_config)
+                schema = llama3.create_schema(model_config)
+                num_layers = model_config.num_layers
 
             case "qwen2":
                 from .model import qwen2
 
+                model_config = qwen2.ModelConfig.from_dict(hf_config)
+                # Qwen2 schema currently uses a static constant QWEN2_SCHEMA, 
+                # but we usually need to pass dimensions for fusion/quantization if they were dynamic.
+                # Looking at qwen2.py, QWEN2_SCHEMA is a global variable.
+                # However, usually schemas might need to know about quantization or specific layer counts?
+                # Actually QWEN2_SCHEMA in the file is defined using "layers.*..." which handles any number of layers.
+                # So we just use it.
                 schema = qwen2.QWEN2_SCHEMA
-                num_layers = int(normalized_arch["num_layers"])
+                num_layers = model_config.num_layers
 
             case "qwen3":
                 from .model import qwen3
 
+                model_config = qwen3.ModelConfig.from_dict(hf_config)
                 schema = qwen3.QWEN3_SCHEMA
-                num_layers = int(normalized_arch["num_layers"])
+                num_layers = model_config.num_layers
 
             case "gptoss":
                 from .model import gpt_oss
 
-                # GPT-OSS uses a factory function because MoE transforms need dimensions
-                model_config = gpt_oss.ModelConfig.from_dict(normalized_arch)
+                model_config = gpt_oss.ModelConfig.from_dict(hf_config)
                 schema = gpt_oss.create_gpt_oss_schema(model_config)
                 num_layers = model_config.num_layers
 
@@ -539,7 +623,7 @@ class ModelLoader:
         # Load weights using schema
         weights = self.load_weights(schema, num_layers)
 
-        return weights, normalized_arch, self.info
+        return weights, hf_config, self.info
 
     def load_weights(self, schema: Schema, num_layers: int) -> WeightStore:
         """
@@ -602,6 +686,7 @@ class ModelLoader:
                 reader=reader,
                 config=self.config,
                 num_layers=num_layers,
+                log_queue=self.log_queue,
             )
 
         return weights

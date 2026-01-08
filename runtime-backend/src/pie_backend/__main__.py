@@ -1,4 +1,5 @@
 import sys
+import os
 
 
 import fire
@@ -9,9 +10,9 @@ import platform
 import importlib.metadata
 import torch
 import time
-import os
 import signal
 import warnings
+
 
 
 # Main entry point for the server
@@ -106,7 +107,9 @@ def main(
         # Generate master port BEFORE spawn so all processes use same port
         master_port = 29500 + random.randint(0, 1000)
 
-        print(f"Spawning {world_size} processes for devices: {device_list}")
+        # Create IPC control channels BEFORE spawn so all processes share the queues
+        from .control_channel import create_control_channels
+        control_queues = create_control_channels(world_size)
 
         ctx = mp.spawn(
             init_process,
@@ -114,6 +117,7 @@ def main(
                 world_size,
                 device_list,
                 master_port,  # Pass port to ensure all processes use same port
+                control_queues,  # IPC control channels
                 hf_repo,
                 host,
                 port,
@@ -178,6 +182,7 @@ def main(
                 [single_device] if single_device else []
             ),  # devices (will be resolved in config)
             0,  # master_port (unused in single process mode)
+            None,  # control_queues (not needed for single process)
             hf_repo,
             host,
             port,
@@ -206,6 +211,7 @@ def init_process(
     world_size: int,
     devices: list[str],
     master_port: int,  # Port for distributed coordination (shared by all processes)
+    control_queues: list | None,  # IPC control channel queues (created by parent)
     hf_repo: str,
     host: str,
     port: int,
@@ -281,11 +287,11 @@ def init_process(
         else:
             dist.init_process_group(backend, rank=rank, world_size=world_size)
 
-        # Create a separate GLOO process group for CPU control messages
-        # This allows metadata broadcasts without GPU spin
+        # Initialize IPC control channel (replaces GLOO for metadata broadcasts)
         import pie_backend.utils as pie_utils
+        from .control_channel import ControlChannel
 
-        pie_utils._cpu_group = dist.new_group(backend="gloo")
+        pie_utils._control_channel = ControlChannel(rank, world_size, control_queues)
 
     # Determine local device for this rank
     # If devices list is empty (auto-detect), RuntimeConfig will handle it for rank 0

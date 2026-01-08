@@ -19,6 +19,7 @@ import torch.nn.functional as fun
 import torch.distributed as dist
 
 from . import ModelConfig as ModelConfigBase
+from . import common
 from .gpt_oss_utils import (
     ALIGNMENT,
     TUNE_MAX_NUM_TOKENS,
@@ -112,12 +113,12 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
         # Embedding (no sharding, no quantization for embeddings)
         .define(
             "embed_token",
-            Source("model.embed_tokens.weight"),
+            Source("model.embed_tokens.weight").shard("row"),
         )
         # LM head (separate, not weight-tied in GPT-OSS)
         .define(
             "lm_head",
-            Source("lm_head.weight"),
+            Source("lm_head.weight").shard("row"),
         )
         # Per-layer layer norms
         .define(
@@ -138,7 +139,8 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
                     "model.layers.*.self_attn.v_proj.weight",
                 ],
                 dim=0,
-            ),
+            )
+            .shard("interleaved_column"),
         )
         # Fused QKV projection biases
         .define(
@@ -150,17 +152,18 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
                     "model.layers.*.self_attn.v_proj.bias",
                 ],
                 dim=0,
-            ),
+            )
+            .shard("interleaved_column"),
         )
         # Output projection
         .define(
             "layers.*.proj_o",
-            Source("model.layers.*.self_attn.o_proj.weight"),
+            Source("model.layers.*.self_attn.o_proj.weight").shard("row"),
         )
         # Attention sinks (converted to float32)
         .define(
             "layers.*.attn_sinks",
-            Source("model.layers.*.self_attn.sinks").dtype(torch.float32),
+            Source("model.layers.*.self_attn.sinks").dtype(torch.float32).shard("column"),
         )
         # Router weights and bias
         .define(
@@ -200,7 +203,7 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
                     "model.layers.*.mlp.experts.gate_up_proj_scales",
                     "model.layers.*.mlp.experts.gate_up_proj_bias",
                 ]
-            ).transform(gate_up_transform, output_type="bias"),
+            ).transform(gate_up_transform, output_type="bias").dtype(torch.float32),
         )
         # MoE down weights (complex transform)
         .define(
@@ -231,7 +234,7 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
                     "model.layers.*.mlp.experts.down_proj_scales",
                     "model.layers.*.mlp.experts.down_proj_bias",
                 ]
-            ).transform(down_transform, output_type="bias"),
+            ).transform(down_transform, output_type="bias").dtype(torch.float32),
         )
         # Final layer norm
         .define(
@@ -287,38 +290,45 @@ class ModelConfig(ModelConfigBase):
 
     @staticmethod
     def from_dict(spec: dict) -> "ModelConfig":
-        moe = spec.get("moe", {})
-        rope = spec.get("rope", {})
+        """
+        Load ModelConfig from a dictionary strict to the provided JSON format.
+        No default values are used; the dictionary must contain all required fields.
+        """
+        # Ensure model_type is gpt_oss
+        if spec.get("model_type") != "gpt_oss":
+             raise ValueError(f"Expected model_type='gpt_oss', got {spec.get('model_type')}")
+        
+        # Extract sub-configs
+        quant_config = spec["quantization_config"]
+        rope_config = spec["rope_scaling"]
 
         return ModelConfig(
-            num_layers=int(spec["num_layers"]),
-            num_q_heads=int(spec["num_query_heads"]),
+            # Base ModelConfig fields
+            num_layers=int(spec["num_hidden_layers"]),
+            num_q_heads=int(spec["num_attention_heads"]),
             num_kv_heads=int(spec["num_key_value_heads"]),
-            dim_head=int(spec["head_size"]),
+            num_vocabs=int(spec["vocab_size"]),
+            dim_head=int(spec["head_dim"]),
             dim_hidden=int(spec["hidden_size"]),
             dim_mlp=int(spec["intermediate_size"]),
-            num_vocabs=int(spec["vocab_size"]),
-            rms_norm_eps=float(spec.get("rms_norm_eps", 1e-6)),
-            # MoE
-            num_experts=int(moe.get("num_experts", spec.get("num_experts", 8))),
-            experts_per_token=int(
-                moe.get("experts_per_token", spec.get("experts_per_token", 2))
-            ),
-            # YaRN RoPE
-            rope_theta=float(rope.get("theta", spec.get("rope_theta", 10000.0))),
-            rope_scaling_factor=float(
-                rope.get("scaling_factor", spec.get("rope_scaling_factor", 1.0))
-            ),
-            rope_ntk_alpha=float(
-                rope.get("ntk_alpha", spec.get("rope_ntk_alpha", 1.0))
-            ),
-            rope_ntk_beta=float(rope.get("ntk_beta", spec.get("rope_ntk_beta", 32.0))),
-            # Model specific
-            initial_context_length=int(spec.get("initial_context_length", 4096)),
-            sliding_window=int(spec.get("sliding_window", 4096)),
-            swiglu_alpha=float(spec.get("swiglu_alpha", 1.0)),
-            swiglu_beta=float(spec.get("swiglu_beta", 1.0)),
-            swiglu_limit=float(spec.get("swiglu_limit", 20.0)),
+            rms_norm_eps=float(spec["rms_norm_eps"]),
+            
+            # MoE configuration
+            num_experts=int(spec["num_local_experts"]),
+            experts_per_token=int(spec["num_experts_per_tok"]),
+            
+            # YaRN RoPE configuration
+            rope_theta=float(spec["rope_theta"]),
+            rope_scaling_factor=float(rope_config["factor"]),
+            rope_ntk_alpha=float(rope_config["beta_slow"]),
+            rope_ntk_beta=float(rope_config["beta_fast"]),
+
+            # Model specific parameters
+            initial_context_length=int(spec["initial_context_length"]),
+            sliding_window=int(spec["sliding_window"]),
+            swiglu_alpha=1.702, 
+            swiglu_beta=1.0, 
+            swiglu_limit=float(spec["swiglu_limit"]),
         )
 
     def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
@@ -331,11 +341,15 @@ class ModelConfig(ModelConfigBase):
         element_size_bytes = torch.empty(
             (), dtype=runtime_config.activation_dtype
         ).element_size()
+        # In multi-GPU mode, KV cache is sharded across GPUs
+        # Each GPU only stores num_kv_heads // world_size heads
+        local_num_kv_heads = self.num_kv_heads // runtime_config.world_size
+        
         total_bytes_per_page = (
             element_size_bytes
             * 2
             * runtime_config.kv_page_size
-            * self.num_kv_heads
+            * local_num_kv_heads
             * self.dim_head
             * self.num_layers
         )
@@ -369,26 +383,33 @@ class ForwardPass:
         """Initialize the forward pass with weights and attention wrappers."""
         self.model_config = model_config
         self.runtime_config = runtime_config
-        self.weights = weights
+        self.weights = weights        
 
-        # Compute padded dimensions for MoE
+        # Pre-compute padded dimensions for MoE
         self.padded_hidden_size = pad_to_multiple(model_config.dim_hidden, ALIGNMENT)
         self.padded_intermediate_size = pad_to_multiple(model_config.dim_mlp, ALIGNMENT)
+        
+        # Adjust dimensions for sharding
+        if runtime_config.world_size > 1:
+            self.padded_intermediate_size = self.padded_intermediate_size // runtime_config.world_size
 
         # Pre-compute YaRN RoPE cos/sin cache
         self._rope_cos_sin_cache = self._compute_rope_cache()
 
-        # Create workspace buffers for FlashInfer wrappers
-        workspace_window = torch.empty(
+        self.workspace_window = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
         )
-        workspace_full = torch.empty(
+        self.workspace_full = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
         )
+        
+        # Calculate local head counts
+        local_num_q_heads = model_config.num_q_heads // runtime_config.world_size
+        local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
 
         # Wrapper for even layers (sliding window attention)
         self.wrapper_window = BatchAttentionWithAttentionSinkWrapper(
-            float_workspace_buffer=workspace_window,
+            float_workspace_buffer=self.workspace_window,  # Pass self.workspace_window
             kv_layout="NHD",
             window_left=model_config.sliding_window - 1,
             q_data_type=runtime_config.activation_dtype,
@@ -399,7 +420,7 @@ class ForwardPass:
 
         # Wrapper for odd layers (full attention)
         self.wrapper_full = BatchAttentionWithAttentionSinkWrapper(
-            float_workspace_buffer=workspace_full,
+            float_workspace_buffer=self.workspace_full,    # Pass self.workspace_full
             kv_layout="NHD",
             window_left=-1,
             q_data_type=runtime_config.activation_dtype,
@@ -429,6 +450,32 @@ class ForwardPass:
             model_config.swiglu_limit,
             device=device,
             dtype=torch.float32,
+        )
+
+    def sample(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Execute sampling using the model's LM head.
+
+        Args:
+            hidden_states: Output hidden states.
+            sampling_metadata: Metadata for sampling.
+
+        Returns:
+            Sampling results (tokens, distributions).
+        """
+        # Define a lambda to call self.lm_head passing parameters correctly
+        lm_head_fn = lambda x: self.lm_head(x)
+
+        return common.sample_common(
+            hidden_states=hidden_states,
+            sampling_metadata=sampling_metadata,
+            lm_head_fn=lm_head_fn,
+            device=self.runtime_config.device,
+            dtype=self.runtime_config.activation_dtype,
         )
 
     def _compute_rope_cache(self) -> torch.Tensor:
@@ -510,11 +557,21 @@ class ForwardPass:
         return self.embed_tokens(token_ids_tensor)
 
     def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Embed token IDs into hidden states."""
-        return fun.embedding(token_ids, self.weights.get("embed_token"))
+        """Embed token IDs into hidden states with TP support."""
+        if self.runtime_config.world_size == 1:
+            return fun.embedding(token_ids, self.weights.get("embed_token"))
+
+        # Column-parallel: each rank computes partial embeddings, then gathered
+        local_embeds = fun.embedding(token_ids, self.weights.get("embed_token"))
+        
+        # All-gather
+        gathered_list = [torch.empty_like(local_embeds) for _ in range(self.runtime_config.world_size)]
+        dist.all_gather(gathered_list, local_embeds)
+        
+        return torch.cat(gathered_list, dim=-1)
 
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project hidden states to vocabulary logits."""
+        """Project hidden states to vocabulary logits with TP support."""
         # Apply final layer norm
         normed = fun.rms_norm(
             hidden_states,
@@ -522,8 +579,24 @@ class ForwardPass:
             weight=self.weights.get("norm_last"),
             eps=self.model_config.rms_norm_eps,
         )
-        # Project to vocab
-        return fun.linear(normed, self.weights.get("lm_head"))
+        
+        if self.runtime_config.world_size == 1:
+            return fun.linear(normed, self.weights.get("lm_head"))
+
+        # Multi-GPU: Column-parallel projection of LM head
+        # 1. Split input along hidden dimension
+        hidden_per_rank = self.model_config.dim_hidden // self.runtime_config.world_size
+        start_idx = self.runtime_config.rank * hidden_per_rank
+        end_idx = start_idx + hidden_per_rank
+        local_normed = normed[:, start_idx:end_idx]
+        
+        # 2. Project local part
+        local_logits = fun.linear(local_normed, self.weights.get("lm_head"))
+        
+        # 3. All-reduce
+        dist.all_reduce(local_logits)
+        
+        return local_logits
 
     def attention(
         self,
@@ -560,21 +633,25 @@ class ForwardPass:
             weight=self.weights.get(f"layers.{layer_idx}.proj_qkv.weight"),
             bias=self.weights.get(f"layers.{layer_idx}.proj_qkv.bias"),
         )
+        
+        # Calculate local dimensions
+        local_num_q_heads = cfg.num_q_heads // self.runtime_config.world_size
+        local_num_kv_heads = cfg.num_kv_heads // self.runtime_config.world_size
+        local_q_size = local_num_q_heads * cfg.dim_head
+        local_kv_size = local_num_kv_heads * cfg.dim_head
 
-        # Split Q, K, V
-        q_size = cfg.num_q_heads * cfg.dim_head
-        kv_size = cfg.num_kv_heads * cfg.dim_head
-        q, k, v = torch.split(qkv_proj, [q_size, kv_size, kv_size], dim=-1)
+        # Split Q, K, V (Local sizes)
+        q, k, v = torch.split(qkv_proj, [local_q_size, local_kv_size, local_kv_size], dim=-1)
 
         # Apply adapters if provided
         if adapter_subpass is not None:
             adapter_subpass.execute(layer_idx, normed, q_state=q, k_state=k, v_state=v)
         del normed
 
-        # Reshape for attention
-        q = q.view(n, cfg.num_q_heads, cfg.dim_head)
-        k = k.view(n, cfg.num_kv_heads, cfg.dim_head)
-        v = v.view(n, cfg.num_kv_heads, cfg.dim_head)
+        # Reshape for matching layout
+        q = q.view(n, local_num_q_heads, cfg.dim_head)
+        k = k.view(n, local_num_kv_heads, cfg.dim_head)
+        v = v.view(n, local_num_kv_heads, cfg.dim_head)
 
         # Apply YaRN RoPE
         ops.apply_rope_with_cos_sin_cache_inplace(
@@ -586,7 +663,7 @@ class ForwardPass:
             is_neox=True,
         )
 
-        # Append to KV cache
+        # Append to KV cache (local)
         ops.append_paged_kv_cache(
             append_key=k,
             append_value=v,
@@ -600,6 +677,7 @@ class ForwardPass:
         )
 
         # Compute attention with sinks
+        # Sinks are sharded (column) so they match local heads
         sinks = self.weights.get(f"layers.{layer_idx}.attn_sinks")
         scaling = cfg.dim_head**-0.5
         attn_output = wrapper.run(q, kv_cache_layer, sinks, scaling)
@@ -611,6 +689,10 @@ class ForwardPass:
             weight=self.weights.get(f"layers.{layer_idx}.proj_o"),
             bias=None,
         )
+        
+        # All-reduce output projection
+        if self.runtime_config.world_size > 1:
+            dist.all_reduce(attn_proj)
 
         # Residual
         return residual + attn_proj
@@ -652,6 +734,7 @@ class ForwardPass:
             hidden_bf16 = padded
 
         # 4. FlashInfer fused MoE kernel
+        # intermediate_size matches local shard size
         output = ops.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits.to(torch.bfloat16),
             routing_bias=None,
@@ -695,6 +778,11 @@ class ForwardPass:
             output = output[:, : cfg.dim_hidden]
 
         output = output.to(hidden_states.dtype)
+        
+        # All-reduce MLP output (must be contiguous for NCCL)
+        if self.runtime_config.world_size > 1:
+            output = output.contiguous()
+            dist.all_reduce(output)
 
         # Residual
         return residual + output
@@ -732,13 +820,17 @@ class ForwardPass:
         _ = custom_mask
         _ = single_token_inference_mode
 
+        # Calculate local head counts for planning
+        local_num_q_heads = cfg.num_q_heads // self.runtime_config.world_size
+        local_num_kv_heads = cfg.num_kv_heads // self.runtime_config.world_size
+
         self.wrapper_window.plan(
             qo_indptr,
             kv_page_indptr,
             kv_page_indices,
             kv_last_page_lens,
-            cfg.num_q_heads,
-            cfg.num_kv_heads,
+            local_num_q_heads,
+            local_num_kv_heads,
             cfg.dim_head,
             page_size,
             causal=True,
@@ -753,8 +845,8 @@ class ForwardPass:
             kv_page_indptr,
             kv_page_indices,
             kv_last_page_lens,
-            cfg.num_q_heads,
-            cfg.num_kv_heads,
+            local_num_q_heads,
+            local_num_kv_heads,
             cfg.dim_head,
             page_size,
             causal=True,
@@ -793,14 +885,14 @@ def create_kv_cache(
     model_config: ModelConfig, runtime_config: RuntimeConfig
 ) -> list[torch.Tensor]:
     """Create KV cache tensors for all layers."""
-
+    local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
     return [
         torch.zeros(
             (
                 runtime_config.max_num_kv_pages,
                 2,
                 runtime_config.kv_page_size,
-                model_config.num_kv_heads,
+                local_num_kv_heads,
                 model_config.dim_head,
             ),
             dtype=runtime_config.activation_dtype,

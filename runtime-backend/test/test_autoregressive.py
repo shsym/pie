@@ -3,10 +3,14 @@ Standalone autoregressive generation test for PIE backend.
 
 This test directly uses the Runtime class with HuggingFace tokenizer
 to verify that autoregressive token generation works correctly.
+
+Supports both standard models (llama3, qwen2, qwen3) and MoE models (gpt_oss).
 """
 
 from __future__ import annotations
 
+import sys
+import queue
 import torch
 from transformers import AutoTokenizer
 
@@ -16,6 +20,9 @@ try:
     HAS_MINIJINJA = True
 except ImportError:
     HAS_MINIJINJA = False
+
+# Add src to path for imports
+sys.path.insert(0, "src")
 
 from pie_backend.runtime import Runtime, RuntimeConfig
 
@@ -39,7 +46,8 @@ def format_chat_prompt(
 
 
 def run_autoregressive_test(
-    model_name: str = "llama-3.2-1b-instruct",
+    model_name: str = "openai/gpt-oss-20b",
+    tokenizer_name: str | None = None,
     prompt: str = "Hello, my name is",
     max_new_tokens: int = 20,
     temperature: float = 0.7,
@@ -49,7 +57,8 @@ def run_autoregressive_test(
     Test autoregressive generation using the Runtime.
 
     Args:
-        model_name: Name of the model to load
+        model_name: Name of the model to load (HuggingFace repo ID or alias)
+        tokenizer_name: Name of tokenizer to use (defaults to model_name)
         prompt: Input prompt to generate from
         max_new_tokens: Maximum number of tokens to generate
         temperature: Sampling temperature
@@ -59,19 +68,25 @@ def run_autoregressive_test(
     print("Autoregressive Generation Test")
     print("=" * 60)
 
+    # Determine tokenizer
+    if tokenizer_name is None:
+        tokenizer_name = model_name
+
     # Load HuggingFace tokenizer
-    print(f"\n[1] Loading HuggingFace tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+    print(f"\n[1] Loading HuggingFace tokenizer: {tokenizer_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     print(f"    Tokenizer loaded: vocab_size={tokenizer.vocab_size}")
 
     # Load Runtime
     print(f"\n[2] Loading Runtime with model={model_name}...")
-    config = RuntimeConfig.from_args(model=model_name)
-    runtime = Runtime(config)
-    print(f"    Runtime loaded: {runtime.model_spec.num_layers} layers")
+    config = RuntimeConfig.from_args(hf_repo=model_name)
+    log_queue = queue.Queue()  # Mock log queue for testing
+    runtime = Runtime(config, log_queue=log_queue)
+    print(f"    Runtime loaded: {runtime.model_config.num_layers} layers")
+    print(f"    Architecture: {runtime.type}")
 
-    device = config.device  # [0]
-    dtype = config.dtype
+    device = config.device
+    dtype = config.activation_dtype
 
     # Format prompt with chat template if requested
     if use_chat_template and "template" in runtime.info:
@@ -110,8 +125,8 @@ def run_autoregressive_test(
         # Current sequence as tensor
         current_ids = torch.tensor(generated_ids, dtype=torch.long, device=device)
 
-        # Get embeddings
-        embeddings = runtime.forward_pass.embed_tokens(runtime.model_param, current_ids)
+        # Get embeddings - use runtime.engine (the forward pass)
+        embeddings = runtime.engine.embed_tokens(current_ids)
 
         # Prepare inputs for transform
         position_ids = torch.arange(len(generated_ids), dtype=torch.long, device=device)
@@ -141,8 +156,7 @@ def run_autoregressive_test(
 
         # Run through transformer layers
         try:
-            hidden_states = runtime.forward_pass.transform(
-                param=runtime.model_param,
+            hidden_states = runtime.engine.transform(
                 input_embeds=input_embeds,
                 position_ids=position_ids,
                 qo_indptr=qo_indptr,
@@ -160,7 +174,7 @@ def run_autoregressive_test(
             hidden_states = input_embeds
 
         # Get logits from lm_head
-        logits = runtime.forward_pass.lm_head(runtime.model_param, hidden_states)
+        logits = runtime.engine.lm_head(hidden_states)
 
         # Get the logits for the last position
         last_logits = logits[-1, :]
@@ -201,49 +215,55 @@ def run_autoregressive_test(
     return generated_text
 
 
-def test_forward_pass_components():
+def test_forward_pass_components(model_name: str = "openai/gpt-oss-20b"):
     """Test individual forward pass components."""
     print("=" * 60)
     print("Forward Pass Component Test")
     print("=" * 60)
 
     # Load Runtime
-    print("\n[1] Loading Runtime...")
-    config = RuntimeConfig.from_args(model="llama-3.2-1b-instruct")
-    runtime = Runtime(config)
-    device = config.device  # [0]
+    print(f"\n[1] Loading Runtime with model={model_name}...")
+    config = RuntimeConfig.from_args(hf_repo=model_name)
+    log_queue = queue.Queue()  # Mock log queue for testing
+    runtime = Runtime(config, log_queue=log_queue)
+    device = config.device
+    print(f"    Runtime loaded: {runtime.model_config.num_layers} layers")
+    print(f"    Architecture: {runtime.type}")
 
     # Test handshake
     print("\n[2] Testing handshake...")
-    from src import message
+    from pie_backend import message
 
     responses = runtime.handshake([message.HandshakeRequest(version="1.0")])
     print(f"    ✓ model_name: {responses[0].model_name}")
     print(f"    ✓ kv_page_size: {responses[0].kv_page_size}")
 
     # Test query
-    print("\n[4] Testing query (ping)...")
+    print("\n[3] Testing query (ping)...")
     responses = runtime.query([message.QueryRequest(query="ping")])
     print(f"    ✓ Response: {responses[0].value}")
 
     # Test embed_tokens
-    print("\n[5] Testing embed_tokens...")
+    print("\n[4] Testing embed_tokens...")
     token_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long, device=device)
-    embeddings = runtime.forward_pass.embed_tokens(runtime.model_param, token_ids)
+    embeddings = runtime.engine.embed_tokens(token_ids)
     print(f"    ✓ Input shape: {token_ids.shape}")
     print(f"    ✓ Output shape: {embeddings.shape}")
 
     # Test lm_head
-    print("\n[6] Testing lm_head...")
-    logits = runtime.forward_pass.lm_head(runtime.model_param, embeddings)
+    print("\n[5] Testing lm_head...")
+    logits = runtime.engine.lm_head(embeddings)
     print(f"    ✓ Input shape: {embeddings.shape}")
     print(f"    ✓ Output shape: {logits.shape}")
 
-    # Test MLP (single layer)
-    print("\n[7] Testing MLP (layer 0)...")
-    mlp_out = runtime.forward_pass.mlp(runtime.model_param, embeddings, layer_idx=0)
-    print(f"    ✓ Input shape: {embeddings.shape}")
-    print(f"    ✓ Output shape: {mlp_out.shape}")
+    # Test MLP (single layer) - only for non-MoE models
+    if runtime.type not in ["gptoss"]:
+        print("\n[6] Testing MLP (layer 0)...")
+        mlp_out = runtime.engine.mlp(embeddings, layer_idx=0)
+        print(f"    ✓ Input shape: {embeddings.shape}")
+        print(f"    ✓ Output shape: {mlp_out.shape}")
+    else:
+        print("\n[6] Skipping MLP test (MoE model uses different API)")
 
     print("\n" + "=" * 60)
     print("All Component Tests Passed!")
@@ -260,6 +280,18 @@ if __name__ == "__main__":
         choices=["generate", "components", "all"],
         default="all",
         help="Which test to run",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="openai/gpt-oss-20b",
+        help="Model name or HuggingFace repo ID",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Tokenizer name (defaults to model name)",
     )
     parser.add_argument(
         "--prompt",
@@ -287,10 +319,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.test in ["components", "all"]:
-        test_forward_pass_components()
+        test_forward_pass_components(model_name=args.model)
 
     if args.test in ["generate", "all"]:
         run_autoregressive_test(
+            model_name=args.model,
+            tokenizer_name=args.tokenizer,
             prompt=args.prompt,
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,

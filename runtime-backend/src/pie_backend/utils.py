@@ -10,8 +10,11 @@ from typing import Any
 import torch
 
 
-# Module-level variable for CPU process group (set during multi-GPU init)
-# Used for metadata broadcasts to avoid GPU spin
+# Module-level variable for IPC control channel (set during multi-GPU init)
+# Used for metadata broadcasts - replaces GLOO for better performance
+_control_channel = None
+
+# Legacy: CPU process group for fallback (deprecated, for compatibility)
 _cpu_group = None
 
 
@@ -141,11 +144,17 @@ def broadcast_struct(
     if rank == src:
         metadata = separate(data)
 
-    # 2. Broadcast metadata via CPU group (gloo) to avoid GPU spin
-    # Falls back to default group if CPU group not initialized
-    meta_list = [metadata]
-    dist.broadcast_object_list(meta_list, src=src, group=_cpu_group)
-    metadata = meta_list[0]
+    # 2. Broadcast metadata via IPC control channel (replaces GLOO)
+    if _control_channel is not None:
+        if rank == src:
+            _control_channel.send(metadata)
+        else:
+            metadata = _control_channel.recv()
+    else:
+        # Fallback to GLOO if control channel not initialized
+        meta_list = [metadata]
+        dist.broadcast_object_list(meta_list, src=src, group=_cpu_group)
+        metadata = meta_list[0]
 
     # 3. Prepare tensors for broadcast
     if rank != src:

@@ -145,23 +145,33 @@ class ModelConfig(ModelConfigBase):
 
     @staticmethod
     def from_dict(spec: dict) -> "ModelConfig":
+        # Handle rope scaling
+        rope = spec.get("rope_scaling") or {}
+        # Llama 3 style rope scaling might look different, check for 'rope_type' or just use params
+        
+        # Calculate head_dim if not present
+        if "head_dim" in spec:
+            head_dim = int(spec["head_dim"])
+        else:
+            head_dim = int(spec["hidden_size"]) // int(spec["num_attention_heads"])
+
         return ModelConfig(
-            num_layers=int(spec["num_layers"]),
-            num_q_heads=int(spec["num_query_heads"]),
+            num_layers=int(spec["num_hidden_layers"]),
+            num_q_heads=int(spec["num_attention_heads"]),
             num_kv_heads=int(spec["num_key_value_heads"]),
-            dim_head=int(spec["head_size"]),
+            dim_head=head_dim,
             dim_hidden=int(spec["hidden_size"]),
             dim_mlp=int(spec["intermediate_size"]),
             num_vocabs=int(spec["vocab_size"]),
             rms_norm_eps=float(spec["rms_norm_eps"]),
-            rope_factor=float(spec["rope"]["factor"]),
-            rope_high_frequency_factor=float(spec["rope"]["high_frequency_factor"]),
-            rope_low_frequency_factor=float(spec["rope"]["low_frequency_factor"]),
+            rope_factor=float(rope.get("factor", 8.0)),
+            rope_high_frequency_factor=float(rope.get("high_freq_factor", 4.0)),
+            rope_low_frequency_factor=float(rope.get("low_freq_factor", 1.0)),
             rope_original_max_position_embeddings=int(
-                spec["rope"]["original_max_position_embeddings"]
+                rope.get("original_max_position_embeddings", 8192)
             ),
-            rope_theta=float(spec["rope"]["theta"]),
-            tie_word_embeddings=bool(spec["tie_word_embeddings"]),
+            rope_theta=float(spec.get("rope_theta", 500000.0)),
+            tie_word_embeddings=bool(spec.get("tie_word_embeddings", False)),
         )
 
     def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:

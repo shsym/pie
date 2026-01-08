@@ -25,7 +25,7 @@ class EngineError(Exception):
 def start_engine_and_backend(
     engine_config: dict,
     model_configs: list[dict],
-    timeout: float = 60.0,
+    timeout: float = 300.0,
     console: Optional[Any] = None,
     on_status: Optional[callable] = None,
     on_message: Optional[callable] = None,
@@ -101,11 +101,9 @@ def start_engine_and_backend(
         )
         log_monitor_thread.start()
 
-    # Context manager for status display
-    status_ctx = None
+    # Print initial status (progress bar will provide loading feedback)
     if console is not None:
-        status_ctx = console.status("Starting engine...", spinner="dots")
-        status_ctx.__enter__()
+        console.print("[dim]Starting engine...[/dim]")
 
     try:
         for model_config in model_configs:
@@ -132,9 +130,8 @@ def start_engine_and_backend(
                     p.terminate()
                 server_handle.shutdown()
                 raise EngineError("Timeout waiting for backends to connect")
-    finally:
-        if status_ctx is not None:
-            status_ctx.__exit__(None, None, None)
+    except Exception:
+        raise
 
     # Final success message
     if console is not None:
@@ -214,8 +211,12 @@ def _run_backend_process(**kwargs):
 
 
 def backend_log_monitor(log_queue: multiprocessing.Queue, console: Any):
-    """Monitor loop for backend logs."""
+    """Monitor loop for backend logs with progress bar support."""
     import queue
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn
+
+    progress_ctx = None
+    progress_task = None
 
     while True:
         try:
@@ -225,7 +226,39 @@ def backend_log_monitor(log_queue: multiprocessing.Queue, console: Any):
             level = record.get("level", "INFO")
             msg = record.get("message", "")
 
-            if level == "DEBUG":
+            if level == "PROGRESS":
+                # Handle progress updates from backend weight loading
+                current = record.get("current", 0)
+                total = record.get("total", 100)
+                desc = record.get("description", "")
+
+                if progress_ctx is None:
+                    # Create progress bar on first PROGRESS message
+                    progress_ctx = Progress(
+                        SpinnerColumn(style="cyan"),
+                        TextColumn("[bold cyan]Loading weights[/bold cyan]"),
+                        BarColumn(bar_width=40, style="cyan", complete_style="bright_cyan"),
+                        TaskProgressColumn(),
+                        TextColumn("•"),
+                        TimeElapsedColumn(),
+                        console=console,
+                        transient=True,
+                    )
+                    progress_ctx.start()
+                    progress_task = progress_ctx.add_task("Loading", total=total)
+
+                # Update progress
+                progress_ctx.update(progress_task, completed=current)
+
+            elif level == "PROGRESS_DONE":
+                # Complete and close progress bar
+                if progress_ctx is not None:
+                    progress_ctx.stop()
+                    progress_ctx = None
+                    progress_task = None
+                console.print("[green]✓[/green] Model weights loaded")
+
+            elif level == "DEBUG":
                 # Suppress DEBUG logs completely for cleaner output
                 continue
             elif level == "SUCCESS":
@@ -243,8 +276,13 @@ def backend_log_monitor(log_queue: multiprocessing.Queue, console: Any):
         except queue.Empty:
             continue
         except (KeyboardInterrupt, EOFError):
+            if progress_ctx is not None:
+                progress_ctx.stop()
             break
         except Exception:
+            if progress_ctx is not None:
+                progress_ctx.stop()
+                progress_ctx = None
             pass
 
 

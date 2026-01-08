@@ -126,17 +126,23 @@ class ModelConfig(ModelConfigBase):
 
     @staticmethod
     def from_dict(spec: dict) -> "ModelConfig":
+        # Calculate head_dim if not present
+        if "head_dim" in spec:
+            head_dim = int(spec["head_dim"])
+        else:
+            head_dim = int(spec["hidden_size"]) // int(spec["num_attention_heads"])
+
         return ModelConfig(
-            num_layers=int(spec["num_layers"]),
-            num_q_heads=int(spec["num_query_heads"]),
+            num_layers=int(spec["num_hidden_layers"]),
+            num_q_heads=int(spec["num_attention_heads"]),
             num_kv_heads=int(spec["num_key_value_heads"]),
-            dim_head=int(spec["head_size"]),
+            dim_head=head_dim,
             dim_hidden=int(spec["hidden_size"]),
             dim_mlp=int(spec["intermediate_size"]),
             num_vocabs=int(spec["vocab_size"]),
             rms_norm_eps=float(spec["rms_norm_eps"]),
-            use_qkv_bias=bool(spec.get("use_qkv_bias", True)),
-            rope_theta=float(spec["rope"]["theta"]),
+            use_qkv_bias=spec.get("attention_bias", spec.get("use_qkv_bias", True)),
+            rope_theta=float(spec.get("rope_theta", 10000.0)),
         )
 
     def eval_max_num_kv_pages(self, runtime_config: RuntimeConfig) -> int:
@@ -415,46 +421,40 @@ class ForwardPass:
         )
 
     def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Embed token IDs with Tensor Parallel support (Column Parallel).
 
-        if self.runtime_config.world_size == 1:
+        The embedding weight is column-sharded: [vocab_size, hidden_size/world_size]
+        Each rank computes partial hidden states, then all_gather combines them.
+        """
+        world_size = self.runtime_config.world_size
+
+        if world_size == 1:
             return fun.embedding(token_ids, self.weights.get("embed_token"))
 
-        """Embed token IDs with Tensor Parallel support."""
-        # 1. Determine local vocab range
-        vocab_size = self.model_config.num_vocabs
+        # Column-parallel embedding: each rank has [vocab_size, hidden_size/world_size]
+        # 1. Lookup - each rank gets partial hidden states [seq_len, hidden_size/world_size]
+        local_embeds = fun.embedding(token_ids, self.weights.get("embed_token"))
+
+        # 2. All-gather to combine partial hidden states from all ranks
+        # Output: [seq_len, hidden_size] (full hidden dimension)
+        gathered_list = [torch.empty_like(local_embeds) for _ in range(world_size)]
+        dist.all_gather(gathered_list, local_embeds)
+
+        # Concatenate along hidden dimension (last dim)
+        full_embeds = torch.cat(gathered_list, dim=-1)
+
+        return full_embeds
+
+    def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project hidden states to vocabulary logits (weight-tied with embed_tokens).
+
+        The embedding weight is column-sharded: [vocab_size, hidden_size/world_size]
+        For lm_head (linear projection), this is effectively [hidden_size/world_size, vocab_size]
+        when transposed.
+        """
         world_size = self.runtime_config.world_size
         rank = self.runtime_config.rank
 
-        part_size = vocab_size // world_size
-        start_idx = rank * part_size
-        end_idx = start_idx + part_size
-
-        # 2. Mask and Shift indices
-        # Create a mask for tokens belonging to this rank
-        mask = (token_ids >= start_idx) & (token_ids < end_idx)
-        # Shift indices to be 0-based for the local shard
-        local_ids = token_ids - start_idx
-        # Zero out indices not in this shard to prevent OOB crash
-        # (The embedding output for these will be masked out anyway or irrelevant)
-        safe_ids = torch.where(
-            mask, local_ids, torch.tensor(0, device=token_ids.device)
-        )
-
-        # 3. Lookup
-        local_embeds = fun.embedding(safe_ids, self.weights.get("embed_token"))
-
-        # 4. Zero out embeddings for tokens not owned by this rank
-        # shape: [batch, seq, hidden]
-        local_embeds = local_embeds * mask.unsqueeze(-1)
-
-        # 5. AllReduce to combine partial embeddings from all ranks
-        if world_size > 1:
-            dist.all_reduce(local_embeds)
-
-        return local_embeds
-
-    def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project hidden states to vocabulary logits (weight-tied with embed_tokens)."""
         # Apply final layer norm
         normed = fun.rms_norm(
             hidden_states,
@@ -462,19 +462,26 @@ class ForwardPass:
             weight=self.weights.get("norm_last"),
             eps=self.model_config.rms_norm_eps,
         )
-        # Project to vocab (weight-tied with embedding)
-        # Project to vocab (weight-tied with embedding)
-        logits = fun.linear(normed, self.weights.get("embed_token"))
 
-        # ALL-GATHER: Combine partial logits from all ranks (only if TP > 1)
-        if self.runtime_config.world_size > 1:
-            gathered_logits = [
-                torch.empty_like(logits) for _ in range(self.runtime_config.world_size)
-            ]
-            dist.all_gather(gathered_logits, logits)
-            logits = torch.cat(gathered_logits, dim=-1)
+        if world_size == 1:
+            return fun.linear(normed, self.weights.get("embed_token"))
 
-        return logits
+        # Multi-GPU: Column-parallel projection
+        # 1. Split input along hidden dimension - each rank uses its slice
+        hidden_per_rank = self.model_config.dim_hidden // world_size
+        start_idx = rank * hidden_per_rank
+        end_idx = start_idx + hidden_per_rank
+        local_normed = normed[:, start_idx:end_idx]
+
+        # 2. Project with local weight shard
+        local_logits = fun.linear(
+            local_normed, self.weights.get("embed_token")
+        )
+
+        # 3. All-reduce to combine partial logits
+        dist.all_reduce(local_logits)
+
+        return local_logits
 
     def mlp(self, hidden_states: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """

@@ -46,10 +46,13 @@ def test_single_gpu_embed_tokens():
 
     # Create single-GPU config
     config = RuntimeConfig.from_args(
-        model=TEST_MODEL,
+        hf_repo=TEST_MODEL,
         device=TEST_DEVICES[0],
     )
-    runtime = Runtime(config)
+    # Create mock log_queue that discards messages
+    from multiprocessing import Queue
+    mock_log_queue = Queue()
+    runtime = Runtime(config, log_queue=mock_log_queue)
     device = config.device
 
     print(f"\n[1] Testing embed_tokens on {device}...")
@@ -78,10 +81,13 @@ def test_single_gpu_embed_inputs():
     print("=" * 60)
 
     config = RuntimeConfig.from_args(
-        model=TEST_MODEL,
+        hf_repo=TEST_MODEL,
         device=TEST_DEVICES[0],
     )
-    runtime = Runtime(config)
+    # Create mock log_queue that discards messages
+    from multiprocessing import Queue
+    mock_log_queue = Queue()
+    runtime = Runtime(config, log_queue=mock_log_queue)
     device = config.device
 
     print(f"\n[1] Testing embed_inputs on {device}...")
@@ -110,10 +116,13 @@ def test_single_gpu_forward_pass():
     print("=" * 60)
 
     config = RuntimeConfig.from_args(
-        model=TEST_MODEL,
+        hf_repo=TEST_MODEL,
         device=TEST_DEVICES[0],
     )
-    runtime = Runtime(config)
+    # Create mock log_queue that discards messages
+    from multiprocessing import Queue
+    mock_log_queue = Queue()
+    runtime = Runtime(config, log_queue=mock_log_queue)
     device = config.device
 
     print(f"\n[1] Testing full forward pass on {device}...")
@@ -153,13 +162,16 @@ def _multi_gpu_worker(rank: int, world_size: int, port: int, test_fn: str):
 
         # Create multi-GPU config
         config = RuntimeConfig.from_args(
-            model=TEST_MODEL,
+            hf_repo=TEST_MODEL,
             devices=TEST_DEVICES[:world_size],
             rank=rank,
         )
 
         # Each rank creates its Runtime (loads model shard)
-        runtime = Runtime(config)
+        # Create a simple mock log_queue that discards messages
+        from multiprocessing import Queue
+        mock_log_queue = Queue()
+        runtime = Runtime(config, log_queue=mock_log_queue)
         device = config.device
 
         if rank == 0:

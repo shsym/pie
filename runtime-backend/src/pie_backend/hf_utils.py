@@ -89,89 +89,6 @@ def load_hf_config(snapshot_dir: Path) -> dict:
     return config
 
 
-def normalize_hf_config(config: dict) -> dict:
-    """Normalize HuggingFace config fields to PIE format.
-
-    Maps HuggingFace field names to PIE's expected field names.
-
-    Args:
-        config: Raw config from config.json
-
-    Returns:
-        Normalized config dictionary
-    """
-    normalized = {}
-
-    # Map HuggingFace -> PIE field names
-    field_map = {
-        # Architecture type
-        "model_type": "type",  # Will be converted via HF_TO_PIE_ARCH
-        # Layer dimensions
-        "num_hidden_layers": "num_layers",
-        "hidden_size": "hidden_size",
-        "intermediate_size": "intermediate_size",
-        "vocab_size": "vocab_size",
-        # Attention heads
-        "num_attention_heads": "num_query_heads",
-        "num_key_value_heads": "num_key_value_heads",
-        "head_dim": "head_size",
-        # Normalization
-        "rms_norm_eps": "rms_norm_eps",
-        # RoPE
-        "rope_theta": "rope_theta",
-    }
-
-    for hf_name, pie_name in field_map.items():
-        if hf_name in config:
-            normalized[pie_name] = config[hf_name]
-
-    # Special handling for model type
-    if "type" in normalized:
-        model_type = normalized["type"]
-        normalized["type"] = HF_TO_PIE_ARCH.get(model_type, model_type)
-
-    # Calculate head_size if not present
-    if (
-        "head_size" not in normalized
-        and "hidden_size" in normalized
-        and "num_query_heads" in normalized
-    ):
-        normalized["head_size"] = (
-            normalized["hidden_size"] // normalized["num_query_heads"]
-        )
-
-    # Handle RoPE scaling
-    rope = config.get("rope_scaling")
-    if rope is not None:
-        normalized["rope"] = {
-            "theta": config.get("rope_theta", 10000.0),
-            "factor": rope.get("factor", 1.0),
-            "high_frequency_factor": rope.get("high_freq_factor", 1.0),
-            "low_frequency_factor": rope.get("low_freq_factor", 1.0),
-            "original_max_position_embeddings": rope.get(
-                "original_max_position_embeddings", 8192
-            ),
-        }
-    else:
-        # Default RoPE config
-        normalized["rope"] = {
-            "theta": config.get("rope_theta", 10000.0),
-            "factor": 1.0,
-        }
-
-    # Add defaults for missing fields
-    if "rms_norm_eps" not in normalized:
-        normalized["rms_norm_eps"] = 1e-5
-
-    # QKV bias (some models have it, some don't)
-    normalized["use_qkv_bias"] = config.get("attention_bias", False)
-
-    # Tied embeddings
-    normalized["tie_word_embeddings"] = config.get("tie_word_embeddings", True)
-
-    return normalized
-
-
 def load_hf_tokenizer(snapshot_dir: Path) -> dict:
     """Load tokenizer from HuggingFace format.
 
@@ -195,7 +112,7 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
         "special_tokens": {},
         "split_regex": "",
         "escape_non_printable": False,
-        "chat_template": "",
+        "escape_non_printable": False,
     }
 
     # Load tokenizer.json for vocabulary
@@ -262,67 +179,9 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
                         result["split_regex"] = pattern["Regex"]
                         break
 
-    # Load tokenizer_config.json for chat template
-    config_path = snapshot_dir / "tokenizer_config.json"
-    if config_path.exists():
-        with open(config_path) as f:
-            config_data = json.load(f)
 
-        # Get chat template (already in Jinja format)
-        chat_template = config_data.get("chat_template", "")
-        result["chat_template"] = _sanitize_chat_template(chat_template)
-
-        # Additional special tokens from added_tokens_decoder
-        decoder = config_data.get("added_tokens_decoder", {})
-        for token_id_str, token_info in decoder.items():
-            if token_info.get("special", False):
-                content = token_info.get("content", "")
-                if content:
-                    result["special_tokens"][content] = int(token_id_str)
-
+    
     return result
-
-
-def _sanitize_chat_template(template: str) -> str:
-    """Sanitize Jinja2 template for Minijinja compatibility.
-
-    Minijinja (Rust) doesn't support Python string methods like .startswith(),
-    .endswith(), .strip(), .split() which are common in HF templates.
-    """
-    if not template:
-        return ""
-
-    sanitized = template
-
-    # Replace .startswith() and .endswith() with slicing
-    # Targeted replacements for known patterns in Qwen/Llama templates
-    sanitized = sanitized.replace(
-        ".startswith('<tool_response>')", "[:15] == '<tool_response>'"
-    )
-    sanitized = sanitized.replace(
-        ".endswith('</tool_response>')", "[-16:] == '</tool_response>'"
-    )
-
-    # Replace .strip() variations with | trim filter
-    # Note: | trim in Minijinja removes whitespace from start and end.
-    # It takes no arguments, so we lose specific char stripping, but it's usually fine.
-    sanitized = sanitized.replace(".strip('\\n')", "| trim")
-    sanitized = sanitized.replace(".lstrip('\\n')", "| trim")
-    sanitized = sanitized.replace(".rstrip('\\n')", "| trim")
-    sanitized = sanitized.replace(".strip()", "| trim")
-
-    # Disable "thinking" logic which uses .split() - highly specific to DeepSeek/Qwen code
-    # We'll just skip the split logic and treat content as a whole
-    if ".split('</think>')" in sanitized:
-        # We crudely disable the block that tries to split reasoning
-        # This regex matches the if block that does the splitting
-        import re
-
-        # Pattern to find the thinking parsing block
-        pattern = r"\{%- if '</think>' in content %\}.*?\{%- endif %\}"
-        sanitized = re.sub(pattern, "", sanitized, flags=re.DOTALL)
-
-    return sanitized
 
 
 def get_safetensor_files(snapshot_dir: Path) -> list[str]:
