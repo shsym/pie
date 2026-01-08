@@ -27,14 +27,13 @@ from pie.model import (
     parse_repo_id_from_dirname,
     get_model_config,
     check_pie_compatibility,
-
 )
 import typing
 
 
 class TqdmProgress:
     """Adapter to map tqdm calls to a global rich Progress instance.
-    
+
     Uses HF's single byte bar for progress display.
     """
 
@@ -54,12 +53,13 @@ class TqdmProgress:
         **kwargs,
     ):
         import threading
+
         self.iterable = iterable
         self.desc = desc
         self.total = total or 0
         self.unit = unit
         self.task_id = None
-        self._is_byte_task = (unit == "B")
+        self._is_byte_task = unit == "B"
 
         # Skip non-byte tasks (like "Fetching X files")
         if not self._is_byte_task:
@@ -68,7 +68,9 @@ class TqdmProgress:
         # Create a task for this progress bar
         if self._progress is not None:
             # No description needed - header already shows "Downloading: repo_id"
-            total_to_use = TqdmProgress._known_total if TqdmProgress._known_total > 0 else None
+            total_to_use = (
+                TqdmProgress._known_total if TqdmProgress._known_total > 0 else None
+            )
             self.task_id = self._progress.add_task(
                 description="",
                 total=total_to_use,
@@ -91,6 +93,7 @@ class TqdmProgress:
     @classmethod
     def get_lock(cls):
         import threading
+
         if cls._lock is None:
             cls._lock = threading.Lock()
         return cls._lock
@@ -129,11 +132,13 @@ class SmartDownloadColumn(ProgressColumn):
         unit = task.fields.get("unit", "it")
         if unit == "B":
             return DownloadColumn().render(task)
-        
+
         if task.total is None:
             return Text(f"{int(task.completed)} {unit}", style="progress.download")
-        
-        return Text(f"{int(task.completed)}/{int(task.total)} {unit}", style="progress.download")
+
+        return Text(
+            f"{int(task.completed)}/{int(task.total)} {unit}", style="progress.download"
+        )
 
 
 class SmartTransferSpeedColumn(ProgressColumn):
@@ -143,14 +148,11 @@ class SmartTransferSpeedColumn(ProgressColumn):
         unit = task.fields.get("unit", "it")
         if unit == "B":
             return TransferSpeedColumn().render(task)
-        
+
         if task.speed is None:
             return Text("?", style="progress.data.speed")
-        
+
         return Text(f"{task.speed:.1f} {unit}/s", style="progress.data.speed")
-
-
-
 
 
 console = Console()
@@ -229,6 +231,7 @@ def model_download(
     try:
         # First, do a dry run to get total download size (silently)
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
+
         disable_progress_bars()
         try:
             with console.status("[dim]Calculating download size...[/dim]"):
@@ -239,7 +242,8 @@ def model_download(
                 )
                 # Only count files that will actually be downloaded
                 total_size = sum(
-                    f.file_size for f in dry_run_info 
+                    f.file_size
+                    for f in dry_run_info
                     if f.file_size is not None and f.will_download
                 )
         finally:

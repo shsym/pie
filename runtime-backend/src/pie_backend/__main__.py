@@ -14,7 +14,6 @@ import signal
 import warnings
 
 
-
 # Main entry point for the server
 def main(
     hf_repo: str | None = None,
@@ -109,6 +108,7 @@ def main(
 
         # Create IPC control channels BEFORE spawn so all processes share the queues
         from .control_channel import create_control_channels
+
         control_queues = create_control_channels(world_size)
 
         ctx = mp.spawn(

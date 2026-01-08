@@ -383,6 +383,62 @@ export class Context {
   }
 
   /**
+   * Drops fully masked KV pages to save memory, supporting non-contiguous
+   * dropping for optimizations like attention sink.
+   *
+   * The function iterates through all committed pages and checks if the tokens
+   * corresponding to a page are all masked as `true`. If so, it deallocates
+   * the page and removes the corresponding token ranges from the context's state.
+   *
+   * # Warning
+   *
+   * This operation modifies the token history non-contiguously, which can
+   * break the assumptions of a standard causal attention model. It should
+   * only be used with models and systems (like StreamingLLM) designed to
+   * handle a KV cache with logical gaps.
+   */
+  dropMaskedKvPages(): void {
+    const numCommittedPages = Math.floor(this._tokenIds.length / this.kvPageSize);
+
+    // Iterate backwards to safely remove elements from arrays by index.
+    // We only consider dropping full pages, not the last (potentially partial) page.
+    for (let i = numCommittedPages - 1; i >= 0; i--) {
+      const pageStartTokenIdx = i * this.kvPageSize;
+      const pageEndTokenIdx = (i + 1) * this.kvPageSize;
+
+      if (
+        this.tokenMaskCurrent.isRangeAllValue(
+          pageStartTokenIdx,
+          pageEndTokenIdx,
+          true
+        )
+      ) {
+        // This page is fully masked and can be dropped.
+
+        // 1. Remove the page ID and deallocate the physical page.
+        this.kvPageManager.removePageAt(i);
+
+        // 2. Remove the corresponding token range from the main token list.
+        this._tokenIds.splice(pageStartTokenIdx, this.kvPageSize);
+
+        // 3. Remove the corresponding position IDs.
+        this._positionIds.splice(pageStartTokenIdx, this.kvPageSize);
+
+        // 4. Remove the same range from the current mask.
+        this.tokenMaskCurrent.removeRange(pageStartTokenIdx, pageEndTokenIdx);
+
+        // 5. Remove the range from all historical pending masks.
+        for (const mask of this.tokenMaskPending) {
+          mask.removeRange(pageStartTokenIdx, pageEndTokenIdx);
+        }
+      }
+    }
+
+    // Recalculate the last page length after dropping pages.
+    this.kvPageManager.recalculateLastPageLen(this._tokenIds.length);
+  }
+
+  /**
    * Flush chat messages to tokens
    */
   private flushChatMessages(addGenerationPrompt: boolean): void {

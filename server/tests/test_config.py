@@ -14,7 +14,6 @@ from pie_cli.cli import app
 runner = CliRunner()
 
 
-
 class TestCreateDefaultConfigContent:
     """Tests for create_default_config_content function."""
 
@@ -88,7 +87,6 @@ class TestConfigInit:
         assert config_path.exists()
         assert "Default model" in result.stdout
         assert "not found" in result.stdout
-
 
 
 class TestConfigShow:

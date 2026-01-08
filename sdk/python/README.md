@@ -1,4 +1,4 @@
-# inferlet-py
+# inferlet
 
 Python SDK for writing Pie inferlets.
 
@@ -8,7 +8,7 @@ From the pie repository root:
 
 ```bash
 # Create and activate venv
-cd inferlet-py
+cd inferlet
 uv venv
 source .venv/bin/activate
 uv pip install -e ".[dev]"
@@ -22,7 +22,7 @@ componentize-py --version
 **Always activate the venv first:**
 
 ```bash
-source /path/to/pie/inferlet-py/.venv/bin/activate
+source /path/to/pie/inferlet/.venv/bin/activate
 ```
 
 Then build:
@@ -47,7 +47,7 @@ pie-cli submit text-completion.wasm -- --prompt "What is Python?"
 Create `main.py`:
 
 ```python
-from inferlet_py import Context, get_auto_model, get_arguments, send
+from inferlet import Context, get_auto_model, get_arguments, send
 
 args = get_arguments()
 prompt = args.get("prompt", "Hello!")
@@ -65,7 +65,7 @@ with Context(model) as ctx:
 ### Beam Search Example
 
 ```python
-from inferlet_py import Context, get_auto_model, get_arguments, set_return
+from inferlet import Context, get_auto_model, get_arguments, set_return
 
 args = get_arguments()
 prompt = args.get("prompt", "Hello!")

@@ -51,6 +51,7 @@ def test_single_gpu_embed_tokens():
     )
     # Create mock log_queue that discards messages
     from multiprocessing import Queue
+
     mock_log_queue = Queue()
     runtime = Runtime(config, log_queue=mock_log_queue)
     device = config.device
@@ -86,6 +87,7 @@ def test_single_gpu_embed_inputs():
     )
     # Create mock log_queue that discards messages
     from multiprocessing import Queue
+
     mock_log_queue = Queue()
     runtime = Runtime(config, log_queue=mock_log_queue)
     device = config.device
@@ -121,6 +123,7 @@ def test_single_gpu_forward_pass():
     )
     # Create mock log_queue that discards messages
     from multiprocessing import Queue
+
     mock_log_queue = Queue()
     runtime = Runtime(config, log_queue=mock_log_queue)
     device = config.device
@@ -170,6 +173,7 @@ def _multi_gpu_worker(rank: int, world_size: int, port: int, test_fn: str):
         # Each rank creates its Runtime (loads model shard)
         # Create a simple mock log_queue that discards messages
         from multiprocessing import Queue
+
         mock_log_queue = Queue()
         runtime = Runtime(config, log_queue=mock_log_queue)
         device = config.device

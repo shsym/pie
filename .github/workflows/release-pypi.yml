@@ -12,6 +12,7 @@ on:
           - pie-client (client/python/)
           - pie-backend (runtime-backend/)
           - pie-bakery (sdk/tools/bakery/)
+          - inferlet (sdk/python/)
       dry_run:
         description: 'Dry run (build but do not publish)'
         required: false
@@ -28,7 +29,8 @@ env:
       "pie-client (client/python/)": "client/python",
       "pie-client-cli (client/cli/)": "client/cli",
       "pie-backend (runtime-backend/)": "runtime-backend",
-      "pie-bakery (sdk/tools/bakery/)": "sdk/tools/bakery"
+      "pie-bakery (sdk/tools/bakery/)": "sdk/tools/bakery",
+      "inferlet (sdk/python/)": "sdk/python"
     }
 
 jobs:
@@ -57,6 +59,10 @@ jobs:
               ;;
             "pie-bakery (sdk/tools/bakery/)")
               echo "path=sdk/tools/bakery" >> $GITHUB_OUTPUT
+              echo "is_maturin=false" >> $GITHUB_OUTPUT
+              ;;
+            "inferlet (sdk/python/)")
+              echo "path=sdk/python" >> $GITHUB_OUTPUT
               echo "is_maturin=false" >> $GITHUB_OUTPUT
               ;;
           esac

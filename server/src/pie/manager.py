@@ -213,7 +213,14 @@ def _run_backend_process(**kwargs):
 def backend_log_monitor(log_queue: multiprocessing.Queue, console: Any):
     """Monitor loop for backend logs with progress bar support."""
     import queue
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TaskProgressColumn,
+        TimeElapsedColumn,
+    )
 
     progress_ctx = None
     progress_task = None
@@ -237,7 +244,9 @@ def backend_log_monitor(log_queue: multiprocessing.Queue, console: Any):
                     progress_ctx = Progress(
                         SpinnerColumn(style="cyan"),
                         TextColumn("[bold cyan]Loading weights[/bold cyan]"),
-                        BarColumn(bar_width=40, style="cyan", complete_style="bright_cyan"),
+                        BarColumn(
+                            bar_width=40, style="cyan", complete_style="bright_cyan"
+                        ),
                         TaskProgressColumn(),
                         TextColumn("•"),
                         TimeElapsedColumn(),

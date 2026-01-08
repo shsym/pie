@@ -18,7 +18,7 @@ HF_TO_PIE_ARCH = {
 
 def get_hf_cache_dir() -> Path:
     """Get the HuggingFace cache directory.
-    
+
     Uses huggingface_hub's HF_HUB_CACHE which respects environment
     variable overrides (e.g., HF_HUB_CACHE, HF_HOME).
     """

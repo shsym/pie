@@ -45,7 +45,7 @@ def config_init(
             if repo.repo_id == DEFAULT_MODEL:
                 model_exists = True
                 break
-        
+
         if not model_exists:
             console.print(
                 f"[yellow]![/yellow] Default model '{DEFAULT_MODEL}' not found.\n"

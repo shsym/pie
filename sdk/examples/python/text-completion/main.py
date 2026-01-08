@@ -1,5 +1,5 @@
 """
-Text completion example using inferlet-py.
+Text completion example using inferlet.
 
 This example demonstrates:
 - Loading models with get_auto_model()
@@ -10,7 +10,7 @@ Note: send() for streaming is currently not working with Python inferlets.
 Use set_return() for non-streaming output instead.
 """
 
-from inferlet_py import Context, get_auto_model, get_arguments, set_return
+from inferlet import Context, get_auto_model, get_arguments, set_return
 
 
 def main() -> None:

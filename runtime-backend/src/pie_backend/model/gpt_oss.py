@@ -139,8 +139,7 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
                     "model.layers.*.self_attn.v_proj.weight",
                 ],
                 dim=0,
-            )
-            .shard("interleaved_column"),
+            ).shard("interleaved_column"),
         )
         # Fused QKV projection biases
         .define(
@@ -152,8 +151,7 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
                     "model.layers.*.self_attn.v_proj.bias",
                 ],
                 dim=0,
-            )
-            .shard("interleaved_column"),
+            ).shard("interleaved_column"),
         )
         # Output projection
         .define(
@@ -163,7 +161,9 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
         # Attention sinks (converted to float32)
         .define(
             "layers.*.attn_sinks",
-            Source("model.layers.*.self_attn.sinks").dtype(torch.float32).shard("column"),
+            Source("model.layers.*.self_attn.sinks")
+            .dtype(torch.float32)
+            .shard("column"),
         )
         # Router weights and bias
         .define(
@@ -203,7 +203,9 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
                     "model.layers.*.mlp.experts.gate_up_proj_scales",
                     "model.layers.*.mlp.experts.gate_up_proj_bias",
                 ]
-            ).transform(gate_up_transform, output_type="bias").dtype(torch.float32),
+            )
+            .transform(gate_up_transform, output_type="bias")
+            .dtype(torch.float32),
         )
         # MoE down weights (complex transform)
         .define(
@@ -234,7 +236,9 @@ def create_gpt_oss_schema(model_config: "ModelConfig") -> Schema:
                     "model.layers.*.mlp.experts.down_proj_scales",
                     "model.layers.*.mlp.experts.down_proj_bias",
                 ]
-            ).transform(down_transform, output_type="bias").dtype(torch.float32),
+            )
+            .transform(down_transform, output_type="bias")
+            .dtype(torch.float32),
         )
         # Final layer norm
         .define(
@@ -296,8 +300,10 @@ class ModelConfig(ModelConfigBase):
         """
         # Ensure model_type is gpt_oss
         if spec.get("model_type") != "gpt_oss":
-             raise ValueError(f"Expected model_type='gpt_oss', got {spec.get('model_type')}")
-        
+            raise ValueError(
+                f"Expected model_type='gpt_oss', got {spec.get('model_type')}"
+            )
+
         # Extract sub-configs
         quant_config = spec["quantization_config"]
         rope_config = spec["rope_scaling"]
@@ -312,22 +318,19 @@ class ModelConfig(ModelConfigBase):
             dim_hidden=int(spec["hidden_size"]),
             dim_mlp=int(spec["intermediate_size"]),
             rms_norm_eps=float(spec["rms_norm_eps"]),
-            
             # MoE configuration
             num_experts=int(spec["num_local_experts"]),
             experts_per_token=int(spec["num_experts_per_tok"]),
-            
             # YaRN RoPE configuration
             rope_theta=float(spec["rope_theta"]),
             rope_scaling_factor=float(rope_config["factor"]),
             rope_ntk_alpha=float(rope_config["beta_slow"]),
             rope_ntk_beta=float(rope_config["beta_fast"]),
-
             # Model specific parameters
             initial_context_length=int(spec["initial_context_length"]),
             sliding_window=int(spec["sliding_window"]),
-            swiglu_alpha=1.702, 
-            swiglu_beta=1.0, 
+            swiglu_alpha=1.702,
+            swiglu_beta=1.0,
             swiglu_limit=float(spec["swiglu_limit"]),
         )
 
@@ -344,7 +347,7 @@ class ModelConfig(ModelConfigBase):
         # In multi-GPU mode, KV cache is sharded across GPUs
         # Each GPU only stores num_kv_heads // world_size heads
         local_num_kv_heads = self.num_kv_heads // runtime_config.world_size
-        
+
         total_bytes_per_page = (
             element_size_bytes
             * 2
@@ -383,15 +386,17 @@ class ForwardPass:
         """Initialize the forward pass with weights and attention wrappers."""
         self.model_config = model_config
         self.runtime_config = runtime_config
-        self.weights = weights        
+        self.weights = weights
 
         # Pre-compute padded dimensions for MoE
         self.padded_hidden_size = pad_to_multiple(model_config.dim_hidden, ALIGNMENT)
         self.padded_intermediate_size = pad_to_multiple(model_config.dim_mlp, ALIGNMENT)
-        
+
         # Adjust dimensions for sharding
         if runtime_config.world_size > 1:
-            self.padded_intermediate_size = self.padded_intermediate_size // runtime_config.world_size
+            self.padded_intermediate_size = (
+                self.padded_intermediate_size // runtime_config.world_size
+            )
 
         # Pre-compute YaRN RoPE cos/sin cache
         self._rope_cos_sin_cache = self._compute_rope_cache()
@@ -402,7 +407,7 @@ class ForwardPass:
         self.workspace_full = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
         )
-        
+
         # Calculate local head counts
         local_num_q_heads = model_config.num_q_heads // runtime_config.world_size
         local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
@@ -420,7 +425,7 @@ class ForwardPass:
 
         # Wrapper for odd layers (full attention)
         self.wrapper_full = BatchAttentionWithAttentionSinkWrapper(
-            float_workspace_buffer=self.workspace_full,    # Pass self.workspace_full
+            float_workspace_buffer=self.workspace_full,  # Pass self.workspace_full
             kv_layout="NHD",
             window_left=-1,
             q_data_type=runtime_config.activation_dtype,
@@ -563,11 +568,14 @@ class ForwardPass:
 
         # Column-parallel: each rank computes partial embeddings, then gathered
         local_embeds = fun.embedding(token_ids, self.weights.get("embed_token"))
-        
+
         # All-gather
-        gathered_list = [torch.empty_like(local_embeds) for _ in range(self.runtime_config.world_size)]
+        gathered_list = [
+            torch.empty_like(local_embeds)
+            for _ in range(self.runtime_config.world_size)
+        ]
         dist.all_gather(gathered_list, local_embeds)
-        
+
         return torch.cat(gathered_list, dim=-1)
 
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -579,7 +587,7 @@ class ForwardPass:
             weight=self.weights.get("norm_last"),
             eps=self.model_config.rms_norm_eps,
         )
-        
+
         if self.runtime_config.world_size == 1:
             return fun.linear(normed, self.weights.get("lm_head"))
 
@@ -589,13 +597,13 @@ class ForwardPass:
         start_idx = self.runtime_config.rank * hidden_per_rank
         end_idx = start_idx + hidden_per_rank
         local_normed = normed[:, start_idx:end_idx]
-        
+
         # 2. Project local part
         local_logits = fun.linear(local_normed, self.weights.get("lm_head"))
-        
+
         # 3. All-reduce
         dist.all_reduce(local_logits)
-        
+
         return local_logits
 
     def attention(
@@ -633,7 +641,7 @@ class ForwardPass:
             weight=self.weights.get(f"layers.{layer_idx}.proj_qkv.weight"),
             bias=self.weights.get(f"layers.{layer_idx}.proj_qkv.bias"),
         )
-        
+
         # Calculate local dimensions
         local_num_q_heads = cfg.num_q_heads // self.runtime_config.world_size
         local_num_kv_heads = cfg.num_kv_heads // self.runtime_config.world_size
@@ -641,7 +649,9 @@ class ForwardPass:
         local_kv_size = local_num_kv_heads * cfg.dim_head
 
         # Split Q, K, V (Local sizes)
-        q, k, v = torch.split(qkv_proj, [local_q_size, local_kv_size, local_kv_size], dim=-1)
+        q, k, v = torch.split(
+            qkv_proj, [local_q_size, local_kv_size, local_kv_size], dim=-1
+        )
 
         # Apply adapters if provided
         if adapter_subpass is not None:
@@ -689,7 +699,7 @@ class ForwardPass:
             weight=self.weights.get(f"layers.{layer_idx}.proj_o"),
             bias=None,
         )
-        
+
         # All-reduce output projection
         if self.runtime_config.world_size > 1:
             dist.all_reduce(attn_proj)
@@ -778,7 +788,7 @@ class ForwardPass:
             output = output[:, : cfg.dim_hidden]
 
         output = output.to(hidden_states.dtype)
-        
+
         # All-reduce MLP output (must be contiguous for NCCL)
         if self.runtime_config.world_size > 1:
             output = output.contiguous()

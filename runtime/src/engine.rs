@@ -3,6 +3,8 @@ use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::auth::AuthorizedUsers;
 use crate::kvs;
@@ -32,6 +34,9 @@ pub async fn run_server(
     ready_tx: oneshot::Sender<String>,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
+    // Initialize tracing with file logging if log_dir is specified
+    init_tracing(&config.log_dir, config.verbose)?;
+
     // Ensure the cache directory exists
     fs::create_dir_all(&config.cache_dir).with_context(|| {
         let err_msg = format!(
@@ -66,3 +71,49 @@ pub async fn run_server(
 
     Ok(())
 }
+
+/// Initialize the tracing subscriber with optional file logging.
+fn init_tracing(log_dir: &Option<PathBuf>, verbose: bool) -> Result<()> {
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::EnvFilter;
+
+    let filter = if verbose {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("debug"))
+    } else {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"))
+    };
+
+    match log_dir {
+        Some(dir) => {
+            // Ensure log directory exists
+            fs::create_dir_all(dir).with_context(|| {
+                format!("Failed to create log directory: {:?}", dir)
+            })?;
+
+            // Create a rolling file appender that rotates daily
+            let file_appender = tracing_appender::rolling::daily(dir, "pie.log");
+            let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+            // Keep the guard alive for the lifetime of the process
+            // by leaking it (this is intentional for logging)
+            std::mem::forget(_guard);
+
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
+                .init();
+        }
+        None => {
+            // Log to stdout if no log directory specified
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(fmt::layer())
+                .init();
+        }
+    }
+
+    Ok(())
+}
+

@@ -197,7 +197,7 @@ class AttentionCompiler(BaseShaderCompiler):
                 dtype_prefix = "bf16"
             else:
                 dtype_prefix = "fp16"
-            
+
             kernel_name = f"attention_decode_v2_{dtype_prefix}_{head_dim}"
 
             if not hasattr(lib, kernel_name):

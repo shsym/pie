@@ -57,7 +57,9 @@ def create_test_payload(include_tensor_refs: bool = True):
     return payload
 
 
-def benchmark_gloo_worker(rank: int, world_size: int, port: int, iterations: int, results_queue: Queue):
+def benchmark_gloo_worker(
+    rank: int, world_size: int, port: int, iterations: int, results_queue: Queue
+):
     """Worker for GLOO benchmark."""
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(port)
@@ -98,7 +100,13 @@ def benchmark_gloo_worker(rank: int, world_size: int, port: int, iterations: int
         results_queue.put(latencies)
 
 
-def benchmark_ipc_worker(rank: int, world_size: int, queues: list[Queue], iterations: int, results_queue: Queue):
+def benchmark_ipc_worker(
+    rank: int,
+    world_size: int,
+    queues: list[Queue],
+    iterations: int,
+    results_queue: Queue,
+):
     """Worker for IPC (Queue) benchmark."""
     payload = create_test_payload()
     latencies = []
@@ -129,6 +137,7 @@ def benchmark_ipc_worker(rank: int, world_size: int, queues: list[Queue], iterat
 def run_gloo_benchmark(world_size: int, iterations: int) -> list[float]:
     """Run GLOO benchmark and return latencies in μs."""
     import random
+
     port = 29500 + random.randint(0, 1000)
     results_queue = Queue()
 
@@ -187,7 +196,9 @@ def main():
 
     parser = argparse.ArgumentParser(description="Benchmark GLOO vs IPC")
     parser.add_argument("--world-size", type=int, default=2, help="Number of processes")
-    parser.add_argument("--iterations", type=int, default=1000, help="Number of iterations")
+    parser.add_argument(
+        "--iterations", type=int, default=1000, help="Number of iterations"
+    )
     args = parser.parse_args()
 
     print("=" * 60)

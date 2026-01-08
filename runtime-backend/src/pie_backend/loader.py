@@ -346,12 +346,14 @@ class Schema:
         def send_progress(current: int, total: int, desc: str):
             """Send progress update to CLI via log queue."""
             if use_queue_progress:
-                log_queue.put({
-                    "level": "PROGRESS",
-                    "current": current,
-                    "total": total,
-                    "description": desc,
-                })
+                log_queue.put(
+                    {
+                        "level": "PROGRESS",
+                        "current": current,
+                        "total": total,
+                        "description": desc,
+                    }
+                )
 
         # Send initial progress
         if use_queue_progress:
@@ -397,7 +399,9 @@ class Schema:
 
         # Send completion
         if use_queue_progress:
-            log_queue.put({"level": "PROGRESS_DONE", "message": "Weight loading complete"})
+            log_queue.put(
+                {"level": "PROGRESS_DONE", "message": "Weight loading complete"}
+            )
 
         return store
 
@@ -560,17 +564,17 @@ class ModelLoader:
         # We need hf_utils.HF_TO_PIE_ARCH to map it.
         # If it's not in the map, check if it's already a valid PIE type (less likely but possible)
         arch_type = hf_utils.HF_TO_PIE_ARCH.get(hf_model_type)
-        
+
         if arch_type is None:
-             # Basic fallback or error
-             if hf_model_type in hf_utils.HF_TO_PIE_ARCH.values():
-                 arch_type = hf_model_type
-             else:
+            # Basic fallback or error
+            if hf_model_type in hf_utils.HF_TO_PIE_ARCH.values():
+                arch_type = hf_model_type
+            else:
                 raise ValueError(
                     f"Unsupported HuggingFace model_type: '{hf_model_type}'. "
                     f"Supported types: {list(hf_utils.HF_TO_PIE_ARCH.keys())}"
                 )
-        
+
         # Inject PIE type into config for runtime to use
         hf_config["type"] = arch_type
 
@@ -584,7 +588,7 @@ class ModelLoader:
         match arch_type:
             case "llama3":
                 from .model import llama3
-                
+
                 # from_dict now expects raw HF config
                 model_config = llama3.ModelConfig.from_dict(hf_config)
                 schema = llama3.create_schema(model_config)
@@ -594,7 +598,7 @@ class ModelLoader:
                 from .model import qwen2
 
                 model_config = qwen2.ModelConfig.from_dict(hf_config)
-                # Qwen2 schema currently uses a static constant QWEN2_SCHEMA, 
+                # Qwen2 schema currently uses a static constant QWEN2_SCHEMA,
                 # but we usually need to pass dimensions for fusion/quantization if they were dynamic.
                 # Looking at qwen2.py, QWEN2_SCHEMA is a global variable.
                 # However, usually schemas might need to know about quantization or specific layer counts?

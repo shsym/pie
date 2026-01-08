@@ -138,9 +138,9 @@ else:
                 mask_k = offs_k < I
 
                 # Load x[b, k] (vector over K)
-                x_tile = tl.load(x_row_ptr + offs_k * stride_xi, mask=mask_k, other=0.0).to(
-                    tl.float32
-                )
+                x_tile = tl.load(
+                    x_row_ptr + offs_k * stride_xi, mask=mask_k, other=0.0
+                ).to(tl.float32)
 
                 # Compute offsets for rng: offset = k * global_cols + (n + col_offset)
                 k_offsets = offs_k.to(tl.int32)[:, None]
@@ -199,7 +199,9 @@ else:
         if global_cols is None:
             global_cols = O
 
-        y = torch.empty((B, O), device=x.device, dtype=torch.float32)  # accumulate in f32
+        y = torch.empty(
+            (B, O), device=x.device, dtype=torch.float32
+        )  # accumulate in f32
 
         # Strides (elements)
         stride_xb, stride_xi = x.stride()
@@ -295,7 +297,9 @@ else:
             tile = tl.randn(seed_b, offsets, n_rounds=n_rounds)  # f32
 
             # Load S[i, o] and scale
-            S_tile_ptr = S_ptr + offs_i[:, None] * stride_Si + offs_o[None, :] * stride_So
+            S_tile_ptr = (
+                S_ptr + offs_i[:, None] * stride_Si + offs_o[None, :] * stride_So
+            )
             S_tile = tl.load(
                 S_tile_ptr, mask=mask_i[:, None] & mask_o[None, :], other=0.0
             ).to(tl.float32)
@@ -450,7 +454,12 @@ else:
                 # Left half
                 S_left = S[:, :half]
                 y_left = batched_randn_matmul(
-                    x, seeds, S_left, out_dtype=torch.float32, col_offset=0, global_cols=O
+                    x,
+                    seeds,
+                    S_left,
+                    out_dtype=torch.float32,
+                    col_offset=0,
+                    global_cols=O,
                 )
                 d_left = _max_abs_diff(y_left, y_ref[:, :half])
 

@@ -1,5 +1,5 @@
 """
-Beam search decoding example using inferlet-py.
+Beam search decoding example using inferlet.
 
 This example demonstrates:
 - Using beam search for text generation
@@ -11,7 +11,7 @@ selecting the most likely overall sequences rather than greedily
 choosing the best token at each position.
 """
 
-from inferlet_py import Context, get_auto_model, get_arguments, set_return
+from inferlet import Context, get_auto_model, get_arguments, set_return
 
 
 def main() -> None:

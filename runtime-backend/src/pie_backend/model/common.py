@@ -39,25 +39,30 @@ def _safe_scaled_softmax_impl(logits, temperatures, greedy_threshold=1e-5):
     Optimized Approach: Branchless safe_scaled_softmax
     """
     greedy_mask = temperatures < greedy_threshold
-    
+
     # Branchless logic
     safe_temps = torch.where(greedy_mask, 1.0, temperatures)
     scaled_logits = logits / safe_temps
     probs_sampling = torch.softmax(scaled_logits, dim=-1)
-    
+
     greedy_indices = logits.argmax(dim=-1)
-    probs_greedy = torch.nn.functional.one_hot(greedy_indices, num_classes=logits.shape[-1])
+    probs_greedy = torch.nn.functional.one_hot(
+        greedy_indices, num_classes=logits.shape[-1]
+    )
     probs_greedy = probs_greedy.to(dtype=logits.dtype)
-    
+
     return torch.where(greedy_mask, probs_greedy, probs_sampling)
 
 
 # torch.compile on MPS has issues with bfloat16 Metal shader generation
 # (type conversion errors in generated Metal code), so only compile on CUDA
 if torch.cuda.is_available():
-    safe_scaled_softmax = torch.compile(_safe_scaled_softmax_impl, mode="reduce-overhead")
+    safe_scaled_softmax = torch.compile(
+        _safe_scaled_softmax_impl, mode="reduce-overhead"
+    )
 else:
     safe_scaled_softmax = _safe_scaled_softmax_impl
+
 
 def sample_common(
     hidden_states: torch.Tensor,

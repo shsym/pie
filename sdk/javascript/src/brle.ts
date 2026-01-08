@@ -176,6 +176,136 @@ export class Brle {
   }
 
   /**
+   * Checks the boolean values at a given set of indices.
+   * Returns whether each index is masked (TRUE = masked/hidden from attention).
+   *
+   * This is optimized to check multiple indices in a single pass over the data.
+   *
+   * @param indices - An array of indices to check. The indices do not need to be sorted.
+   * @returns An array of booleans containing the value at each corresponding index.
+   */
+  isMasked(indices: number[]): boolean[] {
+    if (indices.length === 0) {
+      return [];
+    }
+
+    // Pair indices with their original position for result ordering
+    const indexedIndices: [number, number][] = indices.map((idx, i) => [i, idx]);
+    indexedIndices.sort((a, b) => a[1] - b[1]);
+
+    const results = new Array<boolean>(indices.length).fill(false);
+    const runIterator = this.iterRuns();
+    let currentRun = runIterator.next();
+
+    for (const [originalPos, queryIndex] of indexedIndices) {
+      if (queryIndex >= this.totalSize) {
+        throw new Error(
+          `Index ${queryIndex} is out of bounds for Brle of length ${this.totalSize}`
+        );
+      }
+
+      // Advance through runs until we find the one containing the queryIndex
+      while (!currentRun.done) {
+        const [value, runStart, runEnd] = currentRun.value;
+        if (queryIndex >= runStart && queryIndex < runEnd) {
+          results[originalPos] = value;
+          break;
+        }
+        currentRun = runIterator.next();
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Checks if all boolean values within a specified range [start, end)
+   * are equal to a given expectedValue.
+   *
+   * @param start - The starting index of the range (inclusive).
+   * @param end - The ending index of the range (exclusive).
+   * @param expectedValue - The boolean value to check for.
+   * @returns true if every value in the range is expectedValue, false otherwise.
+   *          Returns true for an empty range (start >= end).
+   */
+  isRangeAllValue(start: number, end: number, expectedValue: boolean): boolean {
+    if (start >= end) {
+      return true;
+    }
+    if (end > this.totalSize) {
+      return false;
+    }
+
+    // Track how much of the target range we've verified
+    let posCovered = start;
+
+    for (const [runValue, runStart, runEnd] of this.iterRuns()) {
+      // Find intersection of current run [runStart, runEnd) and [posCovered, end)
+      const intersectStart = Math.max(runStart, posCovered);
+      const intersectEnd = Math.min(runEnd, end);
+
+      if (intersectStart < intersectEnd) {
+        // There's a valid intersection - check if value matches
+        if (runValue !== expectedValue) {
+          return false;
+        }
+        // Update coverage marker
+        posCovered = intersectEnd;
+
+        // If we've covered the entire target range, we're done
+        if (posCovered >= end) {
+          return true;
+        }
+      }
+
+      // Optimization: if current run extends beyond target, no need to check more
+      if (runEnd >= end) {
+        break;
+      }
+    }
+
+    return posCovered >= end;
+  }
+
+  /**
+   * Extends this Brle with another one by concatenating their sequences.
+   *
+   * @param other - The Brle to append to this one.
+   */
+  extend(other: Brle): void {
+    if (other.isEmpty()) {
+      return;
+    }
+    if (this.isEmpty()) {
+      this.buffer = [...other.buffer];
+      this.totalSize = other.totalSize;
+      return;
+    }
+
+    const selfLastRunIsTrue = (this.buffer.length - 1) % 2 !== 0;
+    const otherFirstRunIsTrue = other.buffer[0] === 0 && other.buffer.length > 1;
+
+    if (selfLastRunIsTrue === otherFirstRunIsTrue) {
+      // Merge the last run of self with the first run of other
+      const otherFirstRunLen = otherFirstRunIsTrue
+        ? other.buffer[1]
+        : other.buffer[0];
+      const otherSliceStart = otherFirstRunIsTrue ? 2 : 1;
+
+      this.buffer[this.buffer.length - 1] += otherFirstRunLen;
+      this.buffer.push(...other.buffer.slice(otherSliceStart));
+    } else {
+      // No merge needed - skip zero-length false run if present
+      if (otherFirstRunIsTrue) {
+        this.buffer.push(...other.buffer.slice(1));
+      } else {
+        this.buffer.push(...other.buffer);
+      }
+    }
+    this.totalSize += other.totalSize;
+  }
+
+  /**
    * Core masking logic for pre-sorted, disjoint ranges.
    */
   private maskInternal(ranges: [number, number][], flag: boolean): void {

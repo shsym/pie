@@ -515,7 +515,7 @@ def prepare_gptoss_moe_gate_up(
     padded_hidden_size = config["padded_hidden_size"]
     padded_intermediate_size = config["padded_intermediate_size"]
     num_experts = config["num_experts"]
-    
+
     # Handle Tensor Parallelism (TP)
     rank = config.get("rank", 0)
     world_size = config.get("world_size", 1)
@@ -528,39 +528,41 @@ def prepare_gptoss_moe_gate_up(
     # Step 2: De-interleave from GPT OSS format to FlashInfer format
     weights_deinterleaved = deinterleave_gate_up_weights(weights_bf16)
     bias_deinterleaved = deinterleave_gate_up_bias(bias.to(device))
-    
+
     # Step 3: Apply TP sharding AFTER de-interleaving (on float tensor)
     if world_size > 1:
         # After de-interleaving, weights are [num_experts, 2*intermediate, hidden]
         # First half is linear, second half is gate
         # We need to slice BOTH halves consistently
         if intermediate_size % world_size != 0:
-             raise ValueError(f"intermediate_size {intermediate_size} not divisible by world_size {world_size}")
-        
+            raise ValueError(
+                f"intermediate_size {intermediate_size} not divisible by world_size {world_size}"
+            )
+
         local_intermediate = intermediate_size // world_size
         local_padded_intermediate = padded_intermediate_size // world_size
-        
+
         start_idx = rank * local_intermediate
         end_idx = (rank + 1) * local_intermediate
-        
+
         # Slice both linear and gate parts
         linear_part = weights_deinterleaved[:, :intermediate_size, :]  # [E, I, H]
-        gate_part = weights_deinterleaved[:, intermediate_size:, :]    # [E, I, H]
-        
+        gate_part = weights_deinterleaved[:, intermediate_size:, :]  # [E, I, H]
+
         local_linear = linear_part[:, start_idx:end_idx, :].contiguous()
         local_gate = gate_part[:, start_idx:end_idx, :].contiguous()
-        
+
         weights_deinterleaved = torch.cat([local_linear, local_gate], dim=1)
-        
+
         # Slice bias similarly
         linear_bias = bias_deinterleaved[:, :intermediate_size]
         gate_bias = bias_deinterleaved[:, intermediate_size:]
-        
+
         local_linear_bias = linear_bias[:, start_idx:end_idx].contiguous()
         local_gate_bias = gate_bias[:, start_idx:end_idx].contiguous()
-        
+
         bias_deinterleaved = torch.cat([local_linear_bias, local_gate_bias], dim=1)
-        
+
         # Update sizes
         intermediate_size = local_intermediate
         padded_intermediate_size = local_padded_intermediate
@@ -627,26 +629,28 @@ def prepare_gptoss_moe_down(
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, hidden_size, intermediate_size]
     weights_bf16 = weights_bf16.reshape(num_experts, hidden_size, intermediate_size)
-    
+
     # Step 2: Apply TP sharding AFTER dequantization (on float tensor)
     if world_size > 1:
         if intermediate_size % world_size != 0:
-             raise ValueError(f"intermediate_size {intermediate_size} not divisible by world_size {world_size}")
+            raise ValueError(
+                f"intermediate_size {intermediate_size} not divisible by world_size {world_size}"
+            )
 
         local_intermediate = intermediate_size // world_size
         local_padded_intermediate = padded_intermediate_size // world_size
-        
+
         start_idx = rank * local_intermediate
         end_idx = (rank + 1) * local_intermediate
-        
+
         # Slice weights along intermediate dimension (dim 2)
         weights_bf16 = weights_bf16[:, :, start_idx:end_idx].contiguous()
-        
+
         # Bias for Down proj is [num_experts, hidden_size] -> Not sharded on that dim
         # But since each rank produces partial output that gets summed,
         # we need to divide bias by world_size to avoid over-counting
         bias = bias / world_size
-        
+
         # Update sizes
         intermediate_size = local_intermediate
         padded_intermediate_size = local_padded_intermediate

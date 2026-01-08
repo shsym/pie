@@ -188,6 +188,7 @@ class Queue:
             blob: Binary blob containing the adapter weights
         """
         from wit_world.imports import inferlet_adapter_common as _adapter
+
         _adapter.upload_adapter(self._inner, adapter_ptr, name, blob._inner)
 
     def download_adapter(self, adapter_ptr: int, name: str) -> "Blob":
@@ -329,8 +330,7 @@ class Model:
         """
         if self._eos_tokens_cache is None:
             self._eos_tokens_cache = [
-                self.tokenizer.encode(stop_token)
-                for stop_token in self.stop_tokens
+                self.tokenizer.encode(stop_token) for stop_token in self.stop_tokens
             ]
         return self._eos_tokens_cache
 

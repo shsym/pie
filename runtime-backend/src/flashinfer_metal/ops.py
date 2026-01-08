@@ -465,7 +465,7 @@ class sampling:
         # Get the maximum k value (handles per-sample k values)
         k = int(top_k.max().item()) if top_k.numel() > 0 else 50
         k = min(k, probs.shape[-1])  # Clamp to vocab size
-        
+
         topk_probs, topk_indices = torch.topk(probs, k, dim=-1)
         # Renormalize probabilities
         topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -483,7 +483,9 @@ class sampling:
         filtered_probs = probs.clone()
         filtered_probs[probs < threshold] = 0
         # Renormalize
-        filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        filtered_probs = filtered_probs / filtered_probs.sum(
+            dim=-1, keepdim=True
+        ).clamp(min=1e-8)
         return torch.multinomial(filtered_probs, num_samples=1).squeeze(-1)
 
     @staticmethod
@@ -494,20 +496,22 @@ class sampling:
         # First apply top-k
         k = int(top_k.max().item()) if top_k.numel() > 0 else 50
         k = min(k, probs.shape[-1])
-        
+
         topk_probs, topk_indices = torch.topk(probs, k, dim=-1)
-        
+
         # Then apply top-p on the top-k subset
         sorted_probs, sorted_order = torch.sort(topk_probs, descending=True, dim=-1)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
         mask = cumulative_probs <= top_p.unsqueeze(-1)
         mask[..., 0] = True
         sorted_probs[~mask] = 0
-        
+
         # Sample from filtered distribution
         sampled_sorted_idx = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
         # Map back through the sorting to get top-k indices
-        sampled_topk_idx = sorted_order.gather(-1, sampled_sorted_idx.unsqueeze(-1)).squeeze(-1)
+        sampled_topk_idx = sorted_order.gather(
+            -1, sampled_sorted_idx.unsqueeze(-1)
+        ).squeeze(-1)
         # Map back through top-k to get original vocab indices
         return topk_indices.gather(-1, sampled_topk_idx.unsqueeze(-1)).squeeze(-1)
 

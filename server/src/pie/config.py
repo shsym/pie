@@ -1,7 +1,5 @@
 """Configuration utilities for Pie."""
 
-
-
 import torch
 
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"

@@ -1,11 +1,13 @@
 from dataclasses import dataclass
 from typing import List
 
+
 @dataclass
 class ChatTemplate:
     template_type: str
     template: str
     stop_tokens: List[str]
+
 
 _R1_TEMPLATE_CONTENT = """{%- if not add_generation_prompt is defined -%}
 	{%- set add_generation_prompt = false -%}
@@ -76,7 +78,7 @@ _R1_TEMPLATE_CONTENT = """{%- if not add_generation_prompt is defined -%}
 R1Template = ChatTemplate(
     template_type="minijinja",
     template=_R1_TEMPLATE_CONTENT,
-    stop_tokens=["<｜end▁of▁sentence｜>", "<|EOT|>"]
+    stop_tokens=["<｜end▁of▁sentence｜>", "<|EOT|>"],
 )
 
 _GPT_OSS_TEMPLATE_CONTENT = """
@@ -157,7 +159,7 @@ _GPT_OSS_TEMPLATE_CONTENT = """
 GPTOSSTemplate = ChatTemplate(
     template_type="ninja",
     template=_GPT_OSS_TEMPLATE_CONTENT,
-    stop_tokens=["<|endoftext|>", "<|return|>", "<|call|>"]
+    stop_tokens=["<|endoftext|>", "<|return|>", "<|call|>"],
 )
 
 _LLAMA_3_TEMPLATE_CONTENT = """
@@ -189,7 +191,7 @@ _LLAMA_3_TEMPLATE_CONTENT = """
 Llama3Template = ChatTemplate(
     template_type="minijinja",
     template=_LLAMA_3_TEMPLATE_CONTENT,
-    stop_tokens=["<|eot_id|>", "<|end_of_text|>"]
+    stop_tokens=["<|eot_id|>", "<|end_of_text|>"],
 )
 
 _QWEN_2_5_TEMPLATE_CONTENT = """{%- if tools %}
@@ -251,7 +253,7 @@ _QWEN_2_5_TEMPLATE_CONTENT = """{%- if tools %}
 Qwen2_5Template = ChatTemplate(
     template_type="minijinja",
     template=_QWEN_2_5_TEMPLATE_CONTENT,
-    stop_tokens=["<|im_end|>", "<|endoftext|>"]
+    stop_tokens=["<|im_end|>", "<|endoftext|>"],
 )
 
 _QWEN_3_TEMPLATE_CONTENT = """
@@ -293,5 +295,5 @@ _QWEN_3_TEMPLATE_CONTENT = """
 Qwen3Template = ChatTemplate(
     template_type="minijinja",
     template=_QWEN_3_TEMPLATE_CONTENT,
-    stop_tokens=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+    stop_tokens=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
 )

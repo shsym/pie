@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Generate WIT bindings for inferlet-py using componentize-py.
+Generate WIT bindings for inferlet using componentize-py.
 
 Usage:
     python scripts/generate_bindings.py
 
-This generates Python bindings in src/inferlet_py/bindings/ that provide
+This generates Python bindings in src/inferlet/bindings/ that provide
 typed interfaces to the WIT imports (inferlet:core/runtime, etc.).
 """
 
@@ -21,7 +21,7 @@ def main() -> int:
     repo_root = project_root.parent
 
     wit_path = repo_root / "inferlet" / "wit"
-    output_path = project_root / "src" / "inferlet_py" / "bindings"
+    output_path = project_root / "src" / "inferlet" / "bindings"
 
     if not wit_path.exists():
         print(f"Error: WIT directory not found at {wit_path}", file=sys.stderr)
@@ -34,8 +34,10 @@ def main() -> int:
     # The world is "exec" as defined in inferlet/wit/world.wit
     cmd = [
         "componentize-py",
-        "-d", str(wit_path),
-        "-w", "exec",
+        "-d",
+        str(wit_path),
+        "-w",
+        "exec",
         "bindings",
         str(output_path),
     ]

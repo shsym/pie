@@ -474,9 +474,7 @@ class ForwardPass:
         local_normed = normed[:, start_idx:end_idx]
 
         # 2. Project with local weight shard
-        local_logits = fun.linear(
-            local_normed, self.weights.get("embed_token")
-        )
+        local_logits = fun.linear(local_normed, self.weights.get("embed_token"))
 
         # 3. All-reduce to combine partial logits
         dist.all_reduce(local_logits)

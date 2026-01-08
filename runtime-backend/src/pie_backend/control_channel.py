@@ -15,7 +15,7 @@ from typing import Any
 class ControlChannel:
     """
     IPC-based control channel for multi-GPU metadata broadcasts.
-    
+
     Replaces GLOO's broadcast_object_list for control messages.
     Rank 0 uses send() to broadcast to all workers.
     Workers use recv() to receive from rank 0.
@@ -77,7 +77,7 @@ class ControlChannel:
 def create_control_channels(world_size: int) -> list[Queue]:
     """
     Create the underlying queues for control channels.
-    
+
     Call this in the parent process BEFORE spawning workers.
     Pass the returned queues to each worker's ControlChannel constructor.
 

@@ -29,6 +29,7 @@ from . import common
 # Declarative definition of how physical tensor names map to logical names,
 # with fusion, sharding, and quantization applied.
 
+
 def create_schema(config: dict) -> Schema:
     schema = (
         Schema("llama3")
@@ -41,8 +42,7 @@ def create_schema(config: dict) -> Schema:
         .define(
             "layers.*.norm_attn",
             Source("model.layers.*.input_layernorm.weight"),
-        )
-        .define(
+        ).define(
             "layers.*.norm_mlp",
             Source("model.layers.*.post_attention_layernorm.weight"),
         )
@@ -91,7 +91,7 @@ def create_schema(config: dict) -> Schema:
     )
 
     # Handle untied embeddings (lm_head separate from embed_token)
-    if not config.get("tie_word_embeddings", True):
+    if not config.tie_word_embeddings:
         # LM Head (column-parallel, like embed_token but for output)
         # Actually in `lm_head` method we treat it as linear: [hidden, vocab]
         # In column parallel: split hidden? No.
@@ -148,7 +148,7 @@ class ModelConfig(ModelConfigBase):
         # Handle rope scaling
         rope = spec.get("rope_scaling") or {}
         # Llama 3 style rope scaling might look different, check for 'rope_type' or just use params
-        
+
         # Calculate head_dim if not present
         if "head_dim" in spec:
             head_dim = int(spec["head_dim"])
@@ -532,9 +532,7 @@ class ForwardPass:
             if self.model_config.tie_word_embeddings
             else self.weights.get("lm_head")
         )
-        local_logits = fun.linear(
-            local_normed, weight
-        )  # [seq, vocab]
+        local_logits = fun.linear(local_normed, weight)  # [seq, vocab]
 
         # 3. All-reduce to combine partial logits (sum of partial projections = full projection)
         dist.all_reduce(local_logits)
