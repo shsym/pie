@@ -165,7 +165,7 @@ pub struct ForwardPassRequest {
     pub output_embed_indices: Vec<u32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardPassResponse {
     pub tokens: Vec<u32>,
     pub dists: Vec<(Vec<u32>, Vec<f32>)>,
@@ -206,4 +206,121 @@ pub struct UploadAdapterRequest {
 pub struct DownloadAdapterRequest {
     pub adapter_ptr: u32,
     pub name: String,
+}
+
+// ============================================================================
+// Batched Request/Response types for pycrust RPC
+// ============================================================================
+
+/// Batched forward pass request sent to Python via pycrust.
+/// Rust performs partial batch formation (concatenating arrays),
+/// while Python handles attention mask decoding and tensor creation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchedForwardPassRequest {
+    // Concatenated arrays from all requests in the batch
+    pub token_ids: Vec<u32>,
+    pub position_ids: Vec<u32>,
+
+    // KV cache layout (concatenated)
+    pub kv_page_indices: Vec<u32>,
+    pub kv_page_indptr: Vec<u32>, // [0, n1, n1+n2, ...] indices into kv_page_indices
+    pub kv_last_page_lens: Vec<u32>, // One per request
+
+    // Query/Output indirection
+    pub qo_indptr: Vec<u32>, // [0, tokens1, tokens1+tokens2, ...]
+
+    // Attention masks (BRLE encoded, per request) - Python decodes these
+    pub masks: Vec<Vec<Vec<u32>>>, // masks[req_idx][token_idx] = BRLE buffer
+
+    // Adapter info (one per request)
+    pub adapter_indices: Vec<Option<u32>>,
+    pub adapter_seeds: Vec<Option<i64>>,
+
+    // Output specifications (per request)
+    pub output_token_indices: Vec<Vec<u32>>,
+    pub output_token_samplers: Vec<Vec<HashMap<String, rmpv::Value>>>,
+    pub output_embed_ptrs: Vec<Vec<u32>>,
+    pub output_embed_indices: Vec<Vec<u32>>,
+
+    // Inference mode hint
+    pub single_token_mode: bool,
+}
+
+impl BatchedForwardPassRequest {
+    /// Create a new empty batched request.
+    pub fn new() -> Self {
+        Self {
+            token_ids: Vec::new(),
+            position_ids: Vec::new(),
+            kv_page_indices: Vec::new(),
+            kv_page_indptr: vec![0],
+            kv_last_page_lens: Vec::new(),
+            qo_indptr: vec![0],
+            masks: Vec::new(),
+            adapter_indices: Vec::new(),
+            adapter_seeds: Vec::new(),
+            output_token_indices: Vec::new(),
+            output_token_samplers: Vec::new(),
+            output_embed_ptrs: Vec::new(),
+            output_embed_indices: Vec::new(),
+            single_token_mode: true,
+        }
+    }
+
+    /// Add a single ForwardPassRequest to the batch.
+    pub fn add_request(&mut self, req: &ForwardPassRequest) {
+        // Concatenate tokens and positions
+        self.token_ids.extend(&req.input_tokens);
+        self.position_ids.extend(&req.input_token_positions);
+
+        // KV cache layout
+        self.kv_page_indices.extend(&req.kv_page_ptrs);
+        self.kv_page_indptr.push(self.kv_page_indices.len() as u32);
+        self.kv_last_page_lens.push(req.kv_page_last_len);
+
+        // Query/output indirection
+        let total_tokens = self.token_ids.len() as u32;
+        self.qo_indptr.push(total_tokens);
+
+        // Masks (pass through BRLE encoded - Python will decode)
+        self.masks.push(req.mask.clone());
+
+        // Adapter info
+        self.adapter_indices.push(req.adapter);
+        self.adapter_seeds.push(req.adapter_seed);
+
+        // Output specifications
+        self.output_token_indices.push(req.output_token_indices.clone());
+        self.output_token_samplers.push(req.output_token_samplers.clone());
+        self.output_embed_ptrs.push(req.output_embed_ptrs.clone());
+        self.output_embed_indices.push(req.output_embed_indices.clone());
+
+        // Update inference mode hint
+        if req.input_tokens.len() > 1 {
+            self.single_token_mode = false;
+        }
+    }
+
+    /// Get the number of requests in this batch.
+    pub fn num_requests(&self) -> usize {
+        self.masks.len()
+    }
+
+    /// Get the total number of tokens in this batch.
+    pub fn total_tokens(&self) -> usize {
+        self.token_ids.len()
+    }
+}
+
+impl Default for BatchedForwardPassRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Batched forward pass response from Python via pycrust.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchedForwardPassResponse {
+    /// Results indexed by request order in the batch.
+    pub results: Vec<ForwardPassResponse>,
 }

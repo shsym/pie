@@ -1161,8 +1161,8 @@ impl Session {
                         self.state.backend_status.increment_rejected_count();
                     }
                 }
-                Err(_) => {
-                    self.send_response(corr_id, false, "Failed to attach to model backend".into())
+                Err(e) => {
+                    self.send_response(corr_id, false, format!("Failed to attach to model backend: {}", e))
                         .await;
                     self.state.backend_status.increment_rejected_count();
                 }

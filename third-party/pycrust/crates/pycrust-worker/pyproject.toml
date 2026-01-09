@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pycrust-worker"
+version = "0.1.0"
+description = "PyCrust RPC Worker Extension"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Pie Team" }]
+
+dependencies = []
+
+[tool.maturin]
+python-source = "../../python/src"
+module-name = "pycrust._worker"
+features = ["pyo3/extension-module"]

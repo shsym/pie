@@ -125,3 +125,51 @@ class DownloadAdapterResponse(msgspec.Struct, gc=False):
     """Response message containing adapter data."""
 
     adapter_data: bytes
+
+
+# ==============================================================================
+# 2. BATCHED REQUEST/RESPONSE TYPES (for pycrust RPC)
+# ==============================================================================
+
+
+class BatchedForwardPassRequest(msgspec.Struct, gc=False):
+    """Batched forward pass request from Rust via pycrust.
+
+    Rust performs partial batch formation (concatenating arrays),
+    while Python handles attention mask decoding and tensor creation.
+    """
+
+    # Concatenated arrays from all requests in the batch
+    token_ids: list[int]
+    position_ids: list[int]
+
+    # KV cache layout (concatenated)
+    kv_page_indices: list[int]
+    kv_page_indptr: list[int]  # [0, n1, n1+n2, ...] indices into kv_page_indices
+    kv_last_page_lens: list[int]  # One per request
+
+    # Query/Output indirection
+    qo_indptr: list[int]  # [0, tokens1, tokens1+tokens2, ...]
+
+    # Attention masks (BRLE encoded, per request) - Python decodes these
+    masks: list[list[list[int]]]  # masks[req_idx][token_idx] = BRLE buffer
+
+    # Adapter info (one per request)
+    adapter_indices: list[Optional[int]]
+    adapter_seeds: list[Optional[int]]
+
+    # Output specifications (per request)
+    output_token_indices: list[list[int]]
+    output_token_samplers: list[list[dict]]
+    output_embed_ptrs: list[list[int]]
+    output_embed_indices: list[list[int]]
+
+    # Inference mode hint
+    single_token_mode: bool
+
+
+class BatchedForwardPassResponse(msgspec.Struct, gc=False):
+    """Batched forward pass response to Rust via pycrust."""
+
+    # Results indexed by request order in the batch
+    results: list[ForwardPassResponse]

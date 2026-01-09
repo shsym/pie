@@ -858,12 +858,248 @@ class Runtime:
 
         return responses
 
+    # ========================================================================
+    # Pycrust RPC Method Wrappers
+    # ========================================================================
+
+    def handshake_rpc(self, **kwargs) -> dict:
+        """Handle handshake via pycrust RPC."""
+        req = message.HandshakeRequest(**kwargs)
+        resps = self.handshake([req])
+        # Convert to dict for MessagePack serialization
+        return {
+            "version": resps[0].version,
+            "model_name": resps[0].model_name,
+            "model_traits": resps[0].model_traits,
+            "model_description": resps[0].model_description,
+            "prompt_template": resps[0].prompt_template,
+            "prompt_template_type": resps[0].prompt_template_type,
+            "prompt_stop_tokens": resps[0].prompt_stop_tokens,
+            "kv_page_size": resps[0].kv_page_size,
+            "max_batch_tokens": resps[0].max_batch_tokens,
+            "resources": resps[0].resources,
+            "tokenizer_num_vocab": resps[0].tokenizer_num_vocab,
+            "tokenizer_merge_table": resps[0].tokenizer_merge_table,
+            "tokenizer_special_tokens": resps[0].tokenizer_special_tokens,
+            "tokenizer_split_regex": resps[0].tokenizer_split_regex,
+            "tokenizer_escape_non_printable": resps[0].tokenizer_escape_non_printable,
+        }
+
+    def query_rpc(self, **kwargs) -> dict:
+        """Handle query via pycrust RPC."""
+        req = message.QueryRequest(**kwargs)
+        resps = self.query([req])
+        return {"value": resps[0].value}
+
+    @torch.inference_mode()
+    def fire_batch(self, **kwargs) -> dict:
+        """
+        Execute a pre-batched forward pass from Rust via pycrust RPC.
+
+        This receives already-batched data from Rust and:
+        1. Decodes attention masks from BRLE
+        2. Creates tensors on GPU
+        3. Executes inference
+        4. Returns results
+
+        Args:
+            **kwargs: BatchedForwardPassRequest fields
+
+        Returns:
+            Dictionary with 'results' list of ForwardPassResponse dicts
+        """
+        from .batching import Batch, _decode_brle
+
+        # Build internal Batch object from pre-batched data
+        batch = self._build_batch_from_request(kwargs)
+
+        # Get model inputs and sampling metadata
+        device = self.config.device
+        inputs = batch.get_model_inputs(device)
+        sampling_metadata = batch.get_sampling_metadata(
+            device, self.config.activation_dtype
+        )
+
+        # Broadcast to workers if multi-GPU
+        if self.config.world_size > 1:
+            msg = {
+                "type": "STEP",
+                "inputs": inputs,
+                "sampling_metadata": sampling_metadata,
+            }
+            utils.broadcast_struct(msg, src=0, device=device)
+
+        # Execute inference
+        sampling_results = self._run_step(inputs, sampling_metadata)
+
+        # Package responses
+        responses = batch.create_responses(sampling_results)
+
+        # Convert to serializable format
+        results = []
+        for resp in responses:
+            results.append(
+                {
+                    "tokens": resp.tokens,
+                    "dists": resp.dists,
+                }
+            )
+
+        return {"results": results}
+
+    def _build_batch_from_request(self, args: dict) -> Batch:
+        """
+        Convert BatchedForwardPassRequest dict to internal Batch object.
+
+        Args:
+            args: Dictionary with batched request fields
+
+        Returns:
+            Batch object ready for inference
+        """
+        from .batching import Batch, _decode_brle
+
+        batch = Batch()
+
+        # Direct assignments (already concatenated by Rust)
+        batch.token_ids = list(args["token_ids"])
+        batch.position_ids = list(args["position_ids"])
+        batch.kv_page_indices = list(args["kv_page_indices"])
+        batch.kv_page_indptr = list(args["kv_page_indptr"])
+        batch.kv_last_page_lens = list(args["kv_last_page_lens"])
+        batch.qo_indptr = list(args["qo_indptr"])
+        batch.single_token_mode = args["single_token_mode"]
+        batch.total_tokens = len(args["token_ids"])
+
+        # Process per-request data
+        masks = args["masks"]
+        adapter_indices = args["adapter_indices"]
+        adapter_seeds = args["adapter_seeds"]
+        output_token_indices = args["output_token_indices"]
+        output_token_samplers = args["output_token_samplers"]
+        output_embed_ptrs = args["output_embed_ptrs"]
+        output_embed_indices = args["output_embed_indices"]
+
+        num_requests = len(masks)
+        token_offset = 0
+
+        for i in range(num_requests):
+            # Calculate tokens for this request
+            req_token_count = args["qo_indptr"][i + 1] - args["qo_indptr"][i]
+
+            # Calculate sequence length from KV pages
+            kv_start = args["kv_page_indptr"][i]
+            kv_end = args["kv_page_indptr"][i + 1]
+            num_pages = kv_end - kv_start
+            kv_last_len = args["kv_last_page_lens"][i]
+
+            if num_pages >= 1:
+                seq_len = self.config.kv_page_size * (num_pages - 1) + kv_last_len
+            else:
+                seq_len = kv_last_len
+
+            context_len = seq_len - req_token_count
+
+            # Decode BRLE masks
+            req_masks = masks[i]
+            attention_mask = np.zeros((req_token_count, seq_len), dtype=np.bool_)
+            for j, brle in enumerate(req_masks):
+                decoded = _decode_brle(brle)
+                expected_len = context_len + j + 1
+                if len(decoded) >= expected_len:
+                    attention_mask[j, :expected_len] = decoded[:expected_len]
+
+            batch.attention_masks.append(attention_mask.flatten())
+
+            # Handle adapters
+            adapter_idx = adapter_indices[i]
+            if adapter_idx is not None and adapter_idx in self.adapters:
+                seed = adapter_seeds[i] if adapter_seeds[i] is not None else 0
+                batch.adapter_seeds.extend([seed] * req_token_count)
+                batch.adapter_indices.append(adapter_idx)
+                batch.adapter_subpass_needed = True
+
+            # Handle output indices (adjust for batch offset)
+            for idx in output_token_indices[i]:
+                batch.indices_for_logits.append(idx + token_offset)
+
+            # Handle samplers
+            for sampler_config in output_token_samplers[i]:
+                params = {}
+                sampler_idx = sampler_config.get("sampler", 1)
+                batch.sampler_types.append(sampler_idx)
+
+                if sampler_idx == 0:
+                    params["top_k"] = min(
+                        sampler_config.get("top_k", self.config.max_dist_size),
+                        self.config.max_dist_size,
+                    )
+                else:
+                    params["top_k"] = sampler_config.get("top_k", 0)
+                    params["top_p"] = sampler_config.get("top_p", 1.0)
+                    params["min_p"] = sampler_config.get("min_p", 0.0)
+
+                params["temperature"] = sampler_config.get("temperature", 1.0)
+                batch.sampler_params.append(params)
+
+            # Handle embed outputs
+            for idx, ptr in zip(output_embed_indices[i], output_embed_ptrs[i]):
+                batch.indices_for_embed_storage.append(idx + token_offset)
+                batch.embed_storage_pointers.append(ptr)
+
+            # Create dummy request for response packaging
+            dummy_req = message.ForwardPassRequest(
+                input_tokens=[],
+                input_token_positions=[],
+                input_embed_ptrs=[],
+                input_embed_positions=[],
+                adapter=adapter_indices[i],
+                adapter_seed=adapter_seeds[i],
+                mask=[],
+                output_token_indices=output_token_indices[i],
+                output_token_samplers=output_token_samplers[i],
+            )
+            batch.requests.append(dummy_req)
+
+            token_offset += req_token_count
+
+        return batch
+
+    def embed_image_rpc(self, **kwargs) -> None:
+        """Handle embed_image via pycrust RPC."""
+        req = message.EmbedImageRequest(**kwargs)
+        self.embed_image([req])
+
+    def initialize_adapter_rpc(self, **kwargs) -> None:
+        """Handle initialize_adapter via pycrust RPC."""
+        req = message.InitializeAdapterRequest(**kwargs)
+        self.initialize_adapter([req])
+
+    def update_adapter_rpc(self, **kwargs) -> None:
+        """Handle update_adapter via pycrust RPC."""
+        req = message.UpdateAdapterRequest(**kwargs)
+        self.update_adapter([req])
+
+    def upload_adapter_rpc(self, **kwargs) -> None:
+        """Handle upload_adapter via pycrust RPC."""
+        req = message.UploadAdapterRequest(**kwargs)
+        self.upload_adapter([req])
+
+    def download_adapter_rpc(self, **kwargs) -> bytes:
+        """Handle download_adapter via pycrust RPC."""
+        req = message.DownloadAdapterRequest(**kwargs)
+        resps = self.download_adapter([req])
+        return resps[0].adapter_data
+
     def shutdown(self):
         """
         Cleanup runtime resources.
 
         For Rank 0 in multi-GPU setup, this broadcasts the 'STOP' signal to workers.
         """
+        # Stop the execution thread
+        self.request_queue.put(None)
+
         if self.config.world_size > 1 and self.config.rank == 0:
             print("Broadcasting STOP signal to workers...")
             utils.broadcast_struct("STOP", src=0, device=self.config.device)

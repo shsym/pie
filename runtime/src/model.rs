@@ -6,7 +6,8 @@ pub mod tokenizer;
 
 use super::model::batching::{BatchPolicySelector, BatchScheduler, ThresholdPolicy};
 use super::model::request::{
-    FORWARD_PASS_ID, HANDSHAKE_ID, HandshakeRequest, HandshakeResponse, Request,
+    BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassRequest, ForwardPassResponse,
+    HandshakeRequest, HandshakeResponse, QueryRequest, QueryResponse, Request,
 };
 use super::model::resource::{ResourceId, ResourceManager, ResourceTypeId};
 use super::model::tokenizer::BytePairEncoder;
@@ -14,21 +15,17 @@ use super::runtime::{self, TerminationCause};
 use super::service::ServiceCommand;
 use crate::instance::InstanceId;
 use anyhow::Result;
-use anyhow::bail;
 use bytes::Bytes;
 use futures::future;
+use pycrust_client::RpcClient;
 use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::{Notify, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio::task::{self, JoinHandle};
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 pub type HandlerId = u32;
-
 pub type CmdQueueId = u32;
 
 static MODEL_DISPATCHER: LazyLock<ModelDispatcher> = LazyLock::new(|| ModelDispatcher {
@@ -47,7 +44,6 @@ struct ModelDispatcher {
 }
 
 pub fn install_model(model_name: String, mut model: Model) -> Option<usize> {
-    // Make sure the name is not already registered
     for (_, (existing_name, _)) in MODEL_DISPATCHER.models.iter() {
         if existing_name == &model_name {
             return None;
@@ -55,11 +51,9 @@ pub fn install_model(model_name: String, mut model: Model) -> Option<usize> {
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-
     MODEL_DISPATCHER.models.push((model_name, tx));
     let model_id = MODEL_DISPATCHER.models.count() - 1;
 
-    // Start the handler task for the model.
     task::spawn(async move {
         while let Some(cmd) = rx.recv().await {
             model.handle(cmd).await;
@@ -91,21 +85,17 @@ pub fn cleanup_instance(inst_id: InstanceId) {
     }
 }
 
-/// Asynchronously collects runtime statistics from all registered models.
 pub async fn runtime_stats() -> HashMap<String, String> {
     let mut aggregated_stats = HashMap::new();
     let mut futures = Vec::new();
 
-    // Dispatch requests to all models concurrently.
     for (model_id, (model_name, _)) in MODEL_DISPATCHER.models.iter() {
         let (tx, rx) = oneshot::channel();
         let cmd = Command::GetRuntimeStats { response: tx };
 
         if cmd.dispatch(model_id).is_ok() {
-            // Store the model name and the future for its response.
             futures.push((model_name.clone(), rx));
         } else {
-            // Handle cases where the service is unavailable immediately.
             aggregated_stats.insert(
                 format!("{}.error", model_name),
                 "failed to dispatch command to service".to_string(),
@@ -113,7 +103,6 @@ pub async fn runtime_stats() -> HashMap<String, String> {
         }
     }
 
-    // Await all responses in parallel.
     let results = future::join_all(
         futures
             .into_iter()
@@ -121,7 +110,6 @@ pub async fn runtime_stats() -> HashMap<String, String> {
     )
     .await;
 
-    // Process the results.
     for (model_name, result) in results {
         match result {
             Ok(model_stats) => {
@@ -130,7 +118,6 @@ pub async fn runtime_stats() -> HashMap<String, String> {
                 }
             }
             Err(e) => {
-                // The service might have crashed or failed to respond.
                 aggregated_stats.insert(
                     format!("{}.error", model_name),
                     format!("failed to receive stats from service: {}", e),
@@ -141,8 +128,6 @@ pub async fn runtime_stats() -> HashMap<String, String> {
 
     aggregated_stats
 }
-
-
 
 pub fn submit_request(
     service_id: usize,
@@ -170,7 +155,6 @@ where
     .dispatch();
 }
 
-/// Defines the set of operations available for the key-value store.
 #[derive(Debug)]
 pub enum Command {
     Submit {
@@ -220,81 +204,21 @@ pub enum Command {
         name: String,
     },
     // Actor Commands
-    ActorGlobalContextRef {
-        username: String,
-        uid: String,
-    },
-    ActorGlobalContextDestroy {
-        username: String,
-        uid: String,
-    },
-    ActorGlobalContextExtend {
-        username: String,
-        uid: String,
-        page_ids: Vec<u32>,
-        last_page_len: u32,
-    },
-    ActorGlobalContextTrim {
-        username: String,
-        uid: String,
-        len: u32,
-    },
-    ActorGlobalContextRead {
-        username: String,
-        uid: String,
-        num_tokens: u32,
-        offset: u32,
-        response: oneshot::Sender<Vec<u32>>,
-    },
-    ActorAdapterRef {
-        username: String,
-        uid: String,
-    },
-    ActorAdapterDestroy {
-        username: String,
-        uid: String,
-    },
-    ActorAdapterBlank {
-        username: String,
-        uid: String,
-        rank: u32,
-        alpha: f32,
-    },
-    ActorAdapterLoad {
-        username: String,
-        uid: String,
-        path: String,
-    },
-    ActorOptimizerRef {
-        username: String,
-        uid: String,
-    },
-    ActorOptimizerDestroy {
-        username: String,
-        uid: String,
-    },
-    ActorOptimizerLoad {
-        username: String,
-        uid: String,
-        path: String,
-    },
-    ActorOptimizerSave {
-        username: String,
-        uid: String,
-        path: String,
-    },
-    ActorOptimizerInitialize {
-        username: String,
-        uid: String,
-        adapter_uid: String,
-        params: Vec<u8>,
-    },
-    ActorOptimizerUpdate {
-        username: String,
-        uid: String,
-        params: Vec<u8>,
-    },
-
+    ActorGlobalContextRef { username: String, uid: String },
+    ActorGlobalContextDestroy { username: String, uid: String },
+    ActorGlobalContextExtend { username: String, uid: String, page_ids: Vec<u32>, last_page_len: u32 },
+    ActorGlobalContextTrim { username: String, uid: String, len: u32 },
+    ActorGlobalContextRead { username: String, uid: String, num_tokens: u32, offset: u32, response: oneshot::Sender<Vec<u32>> },
+    ActorAdapterRef { username: String, uid: String },
+    ActorAdapterDestroy { username: String, uid: String },
+    ActorAdapterBlank { username: String, uid: String, rank: u32, alpha: f32 },
+    ActorAdapterLoad { username: String, uid: String, path: String },
+    ActorOptimizerRef { username: String, uid: String },
+    ActorOptimizerDestroy { username: String, uid: String },
+    ActorOptimizerLoad { username: String, uid: String, path: String },
+    ActorOptimizerSave { username: String, uid: String, path: String },
+    ActorOptimizerInitialize { username: String, uid: String, adapter_uid: String, params: Vec<u8> },
+    ActorOptimizerUpdate { username: String, uid: String, params: Vec<u8> },
 }
 
 impl Command {
@@ -303,9 +227,7 @@ impl Command {
             .models
             .get(model_id)
             .ok_or(ModelDispatchError::InvalidModelIndex(model_id))?;
-
         tx.send(self).unwrap();
-
         Ok(())
     }
 }
@@ -323,52 +245,48 @@ pub struct ModelInfo {
     pub max_batch_tokens: usize,
 }
 
-/// An in-memory key-value store service.
-#[derive(Debug)]
+/// Model service using pycrust RPC for communication with Python backend.
 pub struct Model {
     info: ModelInfo,
     resource_manager: ResourceManager,
     shutdown_tx: broadcast::Sender<()>,
-
-    scheduler_tx: mpsc::UnboundedSender<(CmdQueueId, u32, Request)>,
+    rpc_client: Arc<RpcClient>,
+    /// Channel for forward pass requests (only forward pass is batched)
+    forward_pass_tx: mpsc::UnboundedSender<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>,
     scheduling_worker_handle: Option<JoinHandle<()>>,
     backend_worker_handle: Option<JoinHandle<()>>,
 }
 
 impl Model {
-    pub async fn new(endpoint: &str) -> Result<Self> {
-        let mut socket = DealerSocket::new();
-        socket.connect(endpoint).await?;
+    pub async fn new(service_name: &str) -> Result<Self> {
+        let rpc_client = Arc::new(
+            RpcClient::connect(service_name)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to connect to pycrust service: {}", e))?,
+        );
 
-        let handshake_info = Self::handshake(&mut socket).await?;
+        let handshake_info = Self::handshake(&rpc_client).await?;
 
-        let mut batch_triggers = HashMap::new();
-        let forward_pass_policy = ThresholdPolicy::t_only(Duration::from_micros(50)); // Sub-millisecond threshold
-        
-        
+        let forward_pass_policy = ThresholdPolicy::t_only(Duration::from_micros(50));
         let batch_policy = BatchPolicySelector::new(forward_pass_policy);
 
-        // batch_triggers.insert(FORWARD_PASS_ID, forward_pass_trigger);
-
-        let (backend_tx, backend_rx) = mpsc::unbounded_channel();
-        let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel();
-
+        let (forward_pass_tx, forward_pass_rx) = mpsc::unbounded_channel();
+        let (batch_tx, batch_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-
 
         let scheduler_notify = Arc::new(Notify::new());
 
         let backend_worker_handle = tokio::spawn(Self::backend_worker(
-            socket,
-            backend_rx,
-            batch_triggers,
+            Arc::clone(&rpc_client),
+            batch_rx,
             scheduler_notify.clone(),
             shutdown_rx,
         ));
+
         let scheduling_worker_handle = tokio::spawn(Self::scheduling_worker(
             batch_policy,
-            scheduler_rx,
-            backend_tx,
+            forward_pass_rx,
+            batch_tx,
             scheduler_notify,
             shutdown_tx.subscribe(),
         ));
@@ -398,60 +316,45 @@ impl Model {
         Ok(Model {
             info,
             resource_manager,
-            scheduler_tx,
-
+            rpc_client,
+            forward_pass_tx,
             shutdown_tx,
             scheduling_worker_handle: Some(scheduling_worker_handle),
             backend_worker_handle: Some(backend_worker_handle),
         })
     }
 
-    async fn handshake(socket: &mut DealerSocket) -> Result<HandshakeResponse> {
-        let req = Bytes::from(rmp_serde::to_vec_named(&HandshakeRequest {
-            version: "0.1.0".to_string(),
-        })?);
-
-        Self::send_zmq_message(socket, 0, HANDSHAKE_ID, req).await?;
-        let (corr_id, handler_id, mut frames) = Self::recv_zmq_messages(socket).await?;
-
-        if corr_id != 0 {
-            bail!("[Error] Invalid correlation ID in handshake response.");
-        }
-
-        if handler_id != HANDSHAKE_ID {
-            bail!("[Error] Invalid handler ID in handshake response.");
-        }
-
-        let handshake_frame = frames
-            .pop_front()
-            .ok_or(anyhow::format_err!("Missing handshake frame"))?;
-        let handshake_info = rmp_serde::from_slice::<HandshakeResponse>(&handshake_frame)?;
-
-        Ok(handshake_info)
+    async fn handshake(rpc_client: &RpcClient) -> Result<HandshakeResponse> {
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+        let req = HandshakeRequest { version: "0.1.0".to_string() };
+        let response: HandshakeResponse = rpc_client
+            .call_with_timeout("handshake", &req, HANDSHAKE_TIMEOUT)
+            .await
+            .map_err(|e| anyhow::anyhow!("Handshake failed: {}", e))?;
+        Ok(response)
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
-        println!("[Info] Shutting down model service...");
         self.shutdown_tx.send(())?;
-
         if let Some(handle) = self.scheduling_worker_handle.take() {
             handle.await?;
         }
         if let Some(handle) = self.backend_worker_handle.take() {
             handle.await?;
         }
-        println!("[Info] Model service shut down gracefully.");
         Ok(())
     }
 
+    /// Scheduling worker - batches only ForwardPass requests
     async fn scheduling_worker(
         batch_policy: BatchPolicySelector,
-        mut req_rx: mpsc::UnboundedReceiver<(CmdQueueId, u32, Request)>,
-        backend_tx: mpsc::UnboundedSender<Vec<Request>>,
+        mut req_rx: mpsc::UnboundedReceiver<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>,
+        batch_tx: mpsc::UnboundedSender<Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>>,
         scheduler_notify: Arc<Notify>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
-        let mut sched = BatchScheduler::new(batch_policy);
+        let mut sched: BatchScheduler<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)> =
+            BatchScheduler::new(batch_policy);
         let mut next_poll_duration: Option<Duration> = None;
         const IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -459,21 +362,11 @@ impl Model {
             let sleep_duration = next_poll_duration.unwrap_or(IDLE_TIMEOUT);
 
             tokio::select! {
-                _ = shutdown_rx.recv() => {
-                    println!("[Info] Shutdown signal received, exiting scheduling worker.");
-                    break;
-                },
+                _ = shutdown_rx.recv() => break,
                 maybe_msg = req_rx.recv() => {
-                    if let Some((cmd_queue_id, priority, request )) = maybe_msg {
-                        if request.is_eager() {
-                            if backend_tx.send(vec![request]).is_err() {
-                               eprintln!("[Warn] Backend channel closed, could not send non-batched message.");
-                            }
-                            continue;
-                        }
-                        sched.push(cmd_queue_id, priority, request, Instant::now());
+                    if let Some((req, resp_tx)) = maybe_msg {
+                        sched.push(0, 0, (req, resp_tx), Instant::now());
                     } else {
-                        println!("[Info] Command channel closed, shutting down scheduler handler.");
                         break;
                     }
                 },
@@ -483,224 +376,166 @@ impl Model {
 
             let batches = sched.schedule(Instant::now());
             for batch in batches {
-                if batch.first().unwrap().is_sync_req() {
-                    if let Request::Synchronize(sender) = batch.into_iter().next().unwrap() {
-                        sender.send(()).ok();
-                    }
-                } else {
-                    backend_tx.send(batch).ok();
-                }
+                batch_tx.send(batch).ok();
             }
             next_poll_duration = sched.next_poll_in(Instant::now());
         }
     }
 
+    /// Backend worker - handles only batched ForwardPass requests
     async fn backend_worker(
-        mut socket: DealerSocket,
-        mut batch_rx: mpsc::UnboundedReceiver<Vec<Request>>,
-        batch_triggers: HashMap<HandlerId, Arc<AtomicBool>>,
+        rpc_client: Arc<RpcClient>,
+        mut batch_rx: mpsc::UnboundedReceiver<Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>>,
         scheduler_notify: Arc<Notify>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
-        let mut corr_id: u32 = 0;
-        let mut event_table: HashMap<(u32, usize), (Request, Instant)> = HashMap::new();
         const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
         loop {
-            let sleep_duration = event_table
-                .values()
-                .map(|(_, instant)| {
-                    instant.saturating_duration_since(Instant::now()) + REQUEST_TIMEOUT
-                })
-                .min()
-                .unwrap_or(REQUEST_TIMEOUT);
-
             tokio::select! {
-                _ = shutdown_rx.recv() => {
-                    println!("[Info] Shutdown signal received, exiting backend worker.");
-                    break;
-                },
-
-                maybe_command = batch_rx.recv() => {
-                    if let Some(requests) = maybe_command {
-                        let current_corr_id = corr_id;
-                        let handler_id = requests.first().unwrap().handler_id();
-                        let serialized:Vec<Bytes> = requests.iter().map(|request| request.serialize_req().unwrap()).collect();
-
-                        let res = Self::send_zmq_messages(
-                            &mut socket,
-                            current_corr_id,
-                            handler_id,
-                            serialized
-                        ).await;
-
-                        if let Err(e) = res {
-                            eprintln!("[Error] Socket send failed for corr_id {}: {:?}", current_corr_id, e);
-                            continue;
-                        }
-
-                        for (idx, request) in requests.into_iter().enumerate() {
-                            if request.has_response() {
-                                event_table.insert((current_corr_id, idx), (request, Instant::now()));
-                            }
-                        }
-                        corr_id = corr_id.wrapping_add(1);
+                _ = shutdown_rx.recv() => break,
+                maybe_batch = batch_rx.recv() => {
+                    if let Some(requests) = maybe_batch {
+                        Self::execute_forward_pass_batch(&rpc_client, requests, REQUEST_TIMEOUT).await;
+                        scheduler_notify.notify_one();
                     } else {
-                        println!("[Info] Command channel closed, shutting down backend handler.");
                         break;
                     }
-                },
-                result = Self::recv_zmq_messages(&mut socket) => {
-                    match result {
-                        Ok((received_corr_id, received_handler_id, frames)) => {
-
-
-
-                            for (idx, payload) in frames.into_iter().enumerate() {
-                                let key = (received_corr_id, idx);
-                                if let Some((request, _)) = event_table.remove(&key) {
-                                    let _ = request.deserialize_resp(payload);
-                                }
-                            }
-
-                            if let Some(trigger) = batch_triggers.get(&received_handler_id) {
-                                trigger.store(true, std::sync::atomic::Ordering::SeqCst);
-                                scheduler_notify.notify_one();
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("[Error] Socket receive error: {}. Shutting down.", e);
-                            break;
-                        }
-                    }
-                },
-                _ = tokio::time::sleep(sleep_duration) => {
-                    let now = Instant::now();
-                    event_table.retain(|_key, (_, instant)| {
-                        if now.duration_since(*instant) > REQUEST_TIMEOUT {
-                            eprintln!("[Warn] Request timed out. Dropping sender.");
-                            false
-                        } else {
-                            true
-                        }
-                    });
                 }
             }
         }
     }
 
-    pub fn submit(&self, cmd_queue_id: CmdQueueId, priority: u32, req: Request) {
-        // FIX: Log error if the scheduler channel is closed.
-        if self
-            .scheduler_tx
-            .send((cmd_queue_id, priority, req))
-            .is_err()
-        {
-            eprintln!("[Error] Failed to submit command: Scheduler channel is closed.");
+    /// Execute a batch of forward pass requests via fire_batch RPC
+    async fn execute_forward_pass_batch(
+        rpc_client: &RpcClient,
+        requests: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>,
+        timeout: Duration,
+    ) {
+        let mut batch_req = BatchedForwardPassRequest::new();
+        for (fp_req, _) in &requests {
+            batch_req.add_request(fp_req);
+        }
+
+        let result: Result<BatchedForwardPassResponse, _> = rpc_client
+            .call_with_timeout("fire_batch", &batch_req, timeout)
+            .await;
+
+        match result {
+            Ok(batch_resp) => {
+                let mut resp_iter = batch_resp.results.into_iter();
+                for (_, resp_tx) in requests {
+                    if let Some(tx) = resp_tx {
+                        if let Some(resp) = resp_iter.next() {
+                            tx.send(resp).ok();
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[Error] fire_batch failed: {:?}", e);
+            }
         }
     }
 
-    /// Gathers detailed runtime statistics for this specific model instance.
+    /// Execute eager RPC calls (non-batched)
+    async fn execute_query(rpc_client: &RpcClient, req: QueryRequest) -> Option<QueryResponse> {
+        const TIMEOUT: Duration = Duration::from_secs(30);
+        rpc_client.call_with_timeout("query", &req, TIMEOUT).await.ok()
+    }
+
+    pub fn submit(&self, _cmd_queue_id: CmdQueueId, _priority: u32, req: Request) {
+        match req {
+            Request::ForwardPass(fp_req, resp_tx) => {
+                if self.forward_pass_tx.send((fp_req, resp_tx)).is_err() {
+                    eprintln!("[Error] Forward pass channel closed");
+                }
+            }
+            Request::Query(query_req, resp_tx) => {
+                let rpc_client = Arc::clone(&self.rpc_client);
+                tokio::spawn(async move {
+                    if let Some(resp) = Self::execute_query(&rpc_client, query_req).await {
+                        resp_tx.send(resp).ok();
+                    }
+                });
+            }
+            Request::EmbedImage(req) => {
+                let rpc_client = Arc::clone(&self.rpc_client);
+                tokio::spawn(async move {
+                    let _: Result<(), _> = rpc_client
+                        .call_with_timeout("embed_image", &req, Duration::from_secs(60))
+                        .await;
+                });
+            }
+            Request::InitializeAdapter(req) => {
+                let rpc_client = Arc::clone(&self.rpc_client);
+                tokio::spawn(async move {
+                    let _: Result<(), _> = rpc_client
+                        .call_with_timeout("initialize_adapter", &req, Duration::from_secs(60))
+                        .await;
+                });
+            }
+            Request::UpdateAdapter(req) => {
+                let rpc_client = Arc::clone(&self.rpc_client);
+                tokio::spawn(async move {
+                    let _: Result<(), _> = rpc_client
+                        .call_with_timeout("update_adapter", &req, Duration::from_secs(60))
+                        .await;
+                });
+            }
+            Request::UploadAdapter(req) => {
+                let rpc_client = Arc::clone(&self.rpc_client);
+                tokio::spawn(async move {
+                    let _: Result<(), _> = rpc_client
+                        .call_with_timeout("upload_adapter", &req, Duration::from_secs(60))
+                        .await;
+                });
+            }
+            Request::DownloadAdapter(req, resp_tx) => {
+                let rpc_client = Arc::clone(&self.rpc_client);
+                tokio::spawn(async move {
+                    let result: Result<Vec<u8>, _> = rpc_client
+                        .call_with_timeout("download_adapter", &req, Duration::from_secs(60))
+                        .await;
+                    if let Ok(data) = result {
+                        resp_tx.send(Bytes::from(data)).ok();
+                    }
+                });
+            }
+            Request::Handshake(_, _) => {
+                eprintln!("[Warn] Unexpected handshake request in submit");
+            }
+            Request::Synchronize(tx) => {
+                tx.send(()).ok();
+            }
+        }
+    }
+
     pub fn runtime_stats(&self) -> HashMap<String, String> {
         let mut stats = HashMap::new();
         stats.insert("model.name".to_string(), self.info.name.clone());
-
-        // Collect stats from the ResourceManager.
         self.resource_manager.append_stats_to(&mut stats);
-
         stats
-    }
-
-    async fn send_zmq_message(
-        socket: &mut DealerSocket,
-        corr_id: u32,
-        handler_id: u32,
-        payload: Bytes,
-    ) -> Result<()> {
-        let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(3);
-        frames.push_back(Bytes::copy_from_slice(&corr_id.to_be_bytes()));
-        frames.push_back(Bytes::copy_from_slice(&handler_id.to_be_bytes()));
-        frames.push_back(payload);
-        socket.send(ZmqMessage::try_from(frames).unwrap()).await?;
-        Ok(())
-    }
-
-    async fn send_zmq_messages(
-        socket: &mut DealerSocket,
-        corr_id: u32,
-        handler_id: u32,
-        payloads: Vec<Bytes>,
-    ) -> Result<()> {
-        let mut frames: VecDeque<Bytes> = VecDeque::with_capacity(3);
-        frames.push_back(Bytes::copy_from_slice(&corr_id.to_be_bytes()));
-        frames.push_back(Bytes::copy_from_slice(&handler_id.to_be_bytes()));
-        frames.extend(payloads);
-        socket.send(ZmqMessage::try_from(frames).unwrap()).await?;
-        Ok(())
-    }
-
-    async fn recv_zmq_messages(socket: &mut DealerSocket) -> Result<(u32, u32, VecDeque<Bytes>)> {
-        let zmq_msg = socket.recv().await?;
-
-        let mut frames = zmq_msg.into_vecdeque();
-        let corr_id_bytes = frames
-            .pop_front()
-            .ok_or(anyhow::format_err!("Missing correlation ID frame"))?;
-        let handler_id_bytes = frames
-            .pop_front()
-            .ok_or(anyhow::format_err!("Missing handler ID frame"))?;
-        let corr_id_slice = corr_id_bytes.as_ref().try_into()?;
-        let handler_id_slice = handler_id_bytes.as_ref().try_into()?;
-
-        let received_corr_id = u32::from_be_bytes(corr_id_slice);
-        let received_handler_id = u32::from_be_bytes(handler_id_slice);
-
-        Ok((received_corr_id, received_handler_id, frames))
     }
 
     async fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::Submit {
-                cmd_queue_id,
-                priority,
-                req,
-            } => {
+            Command::Submit { cmd_queue_id, priority, req } => {
                 self.submit(cmd_queue_id, priority, req);
             }
-
             Command::GetInfo { response } => {
-                if response.send(self.info.clone()).is_err() {
-                    println!("[Warn] GetInfo response channel closed before sending.");
-                }
+                response.send(self.info.clone()).ok();
             }
-
             Command::GetRuntimeStats { response } => {
-                if response.send(self.runtime_stats()).is_err() {
-                    println!("[Warn] GetRuntimeStats response channel closed before sending.");
+                response.send(self.runtime_stats()).ok();
+            }
+            Command::Allocate { inst_id, type_id, count, response } => {
+                match self.resource_manager.allocate_with_oom(inst_id, type_id, count) {
+                    Ok(allocated_ids) => { response.send(allocated_ids).ok(); }
+                    Err(e) => terminate_instance_with_exception(inst_id, e),
                 }
             }
-
-            Command::Allocate {
-                inst_id,
-                type_id,
-                count,
-                response,
-            } => match self
-                .resource_manager
-                .allocate_with_oom(inst_id, type_id, count)
-            {
-                Ok(allocated_ids) => {
-                    if response.send(allocated_ids).is_err() {
-                        println!("[Warn] Allocate response channel closed before sending.");
-                    }
-                }
-                Err(e) => terminate_instance_with_exception(inst_id, e),
-            },
-            Command::Deallocate {
-                inst_id,
-                type_id,
-                ptrs,
-            } => {
+            Command::Deallocate { inst_id, type_id, ptrs } => {
                 if let Err(e) = self.resource_manager.deallocate(inst_id, type_id, ptrs) {
                     terminate_instance_with_exception(inst_id, e);
                 }
@@ -711,94 +546,42 @@ impl Model {
                 }
             }
             Command::GetAllExported { type_id, response } => {
-                let list = self.resource_manager.get_all_exported(type_id);
-                if response.send(list).is_err() {
-                    println!("[Warn] GetAllExported response channel closed before sending.");
-                }
+                response.send(self.resource_manager.get_all_exported(type_id)).ok();
             }
-            Command::Export {
-                inst_id,
-                type_id,
-                ptrs,
-                name,
-            } => {
+            Command::Export { inst_id, type_id, ptrs, name } => {
                 if let Err(e) = self.resource_manager.export(inst_id, type_id, ptrs, name) {
                     terminate_instance_with_exception(inst_id, e);
                 }
             }
-            Command::Import {
-                inst_id,
-                type_id,
-                name,
-                response,
-            } => match self.resource_manager.import(type_id, name) {
-                Ok(ptrs) => {
-                    if response.send(ptrs).is_err() {
-                        println!("[Warn] Import response channel closed before sending.");
-                    }
+            Command::Import { inst_id, type_id, name, response } => {
+                match self.resource_manager.import(type_id, name) {
+                    Ok(ptrs) => { response.send(ptrs).ok(); }
+                    Err(e) => terminate_instance_with_exception(inst_id, e),
                 }
-                Err(e) => terminate_instance_with_exception(inst_id, e),
-            },
-            Command::ReleaseExported {
-                inst_id,
-                type_id,
-                name,
-            } => {
+            }
+            Command::ReleaseExported { inst_id, type_id, name } => {
                 if let Err(e) = self.resource_manager.release_exported(type_id, name) {
                     terminate_instance_with_exception(inst_id, e);
                 }
             }
-
-            // Actor Command Handlers (Stubs)
-            Command::ActorGlobalContextRef { .. } => {
-                println!("[Warn] ActorGlobalContextRef not implemented yet");
-            }
-            Command::ActorGlobalContextDestroy { .. } => {
-                println!("[Warn] ActorGlobalContextDestroy not implemented yet");
-            }
-            Command::ActorGlobalContextExtend { .. } => {
-                println!("[Warn] ActorGlobalContextExtend not implemented yet");
-            }
-            Command::ActorGlobalContextTrim { .. } => {
-                println!("[Warn] ActorGlobalContextTrim not implemented yet");
-            }
+            // Actor Commands (stubs)
+            Command::ActorGlobalContextRef { .. } |
+            Command::ActorGlobalContextDestroy { .. } |
+            Command::ActorGlobalContextExtend { .. } |
+            Command::ActorGlobalContextTrim { .. } |
+            Command::ActorAdapterRef { .. } |
+            Command::ActorAdapterDestroy { .. } |
+            Command::ActorAdapterBlank { .. } |
+            Command::ActorAdapterLoad { .. } |
+            Command::ActorOptimizerRef { .. } |
+            Command::ActorOptimizerDestroy { .. } |
+            Command::ActorOptimizerLoad { .. } |
+            Command::ActorOptimizerSave { .. } |
+            Command::ActorOptimizerInitialize { .. } |
+            Command::ActorOptimizerUpdate { .. } => {}
             Command::ActorGlobalContextRead { response, .. } => {
-                 println!("[Warn] ActorGlobalContextRead not implemented yet");
-                 if response.send(vec![]).is_err() {
-                     println!("[Warn] ActorGlobalContextRead response channel closed before sending.");
-                 }
+                response.send(vec![]).ok();
             }
-            Command::ActorAdapterRef { .. } => {
-                println!("[Warn] ActorAdapterRef not implemented yet");
-            }
-            Command::ActorAdapterDestroy { .. } => {
-                println!("[Warn] ActorAdapterDestroy not implemented yet");
-            }
-            Command::ActorAdapterBlank { .. } => {
-                println!("[Warn] ActorAdapterBlank not implemented yet");
-            }
-            Command::ActorAdapterLoad { .. } => {
-                println!("[Warn] ActorAdapterLoad not implemented yet");
-            }
-            Command::ActorOptimizerRef { .. } => {
-                println!("[Warn] ActorOptimizerRef not implemented yet");
-            }
-            Command::ActorOptimizerDestroy { .. } => {
-                println!("[Warn] ActorOptimizerDestroy not implemented yet");
-            }
-            Command::ActorOptimizerLoad { .. } => {
-                println!("[Warn] ActorOptimizerLoad not implemented yet");
-            }
-            Command::ActorOptimizerSave { .. } => {
-                println!("[Warn] ActorOptimizerSave not implemented yet");
-            }
-            Command::ActorOptimizerInitialize { .. } => {
-                println!("[Warn] ActorOptimizerInitialize not implemented yet");
-            }
-            Command::ActorOptimizerUpdate { .. } => {
-                println!("[Warn] ActorOptimizerUpdate not implemented yet");
-            }
-
         }
     }
 }

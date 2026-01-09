@@ -116,7 +116,7 @@ def start_engine_and_backend(
                 expected_backends += 1
             except Exception as e:
                 for p in backend_processes:
-                    p.terminate()
+                    p.kill()
                 server_handle.shutdown()
                 raise EngineError(f"Failed to spawn backend: {e}") from e
 
@@ -126,8 +126,9 @@ def start_engine_and_backend(
             if not wait_for_backends(
                 server_handle, expected_backends, timeout, backend_processes
             ):
+                # Force kill backends immediately on failure (faster cleanup)
                 for p in backend_processes:
-                    p.terminate()
+                    p.kill()
                 server_handle.shutdown()
                 raise EngineError("Timeout waiting for backends to connect")
     except Exception:
@@ -316,6 +317,11 @@ def wait_for_backends(
     poll_interval = 0.5  # seconds
 
     while time.time() - start_time < timeout:
+        # Check if the engine is still running
+        if not server_handle.is_running():
+            print("❌ Engine stopped unexpectedly", file=sys.stderr)
+            return False
+
         # Check if any backend process has died
         if not check_backend_processes(backend_processes):
             return False
