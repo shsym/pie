@@ -16,6 +16,9 @@ use tokio::sync::oneshot;
 /// Maximum message size in bytes (4MB).
 const MAX_MESSAGE_SIZE: usize = 4194304;
 
+/// Maximum buffer size for subscribers (handles concurrent requests).
+const SUBSCRIBER_BUFFER_SIZE: usize = 256;
+
 /// Number of spin iterations per poll cycle.
 /// With ~1ns per spin_loop hint, 100 spins ≈ 100ns of spinning.
 const SPIN_ITERATIONS: u32 = 300;
@@ -146,6 +149,7 @@ fn run_transport_loop(
     let res_service = node
         .service_builder(&res_service_name.as_str().try_into().unwrap())
         .publish_subscribe::<[u8]>()
+        .subscriber_max_buffer_size(SUBSCRIBER_BUFFER_SIZE)
         .open_or_create()
         .map_err(|e| {
             RpcError::ConnectionFailed(format!("Failed to create response service: {}", e))
@@ -153,6 +157,7 @@ fn run_transport_loop(
 
     let res_subscriber: Subscriber<ipc::Service, [u8], ()> = res_service
         .subscriber_builder()
+        .buffer_size(SUBSCRIBER_BUFFER_SIZE)
         .create()
         .map_err(|e| {
             RpcError::ConnectionFailed(format!("Failed to create response subscriber: {}", e))

@@ -129,6 +129,7 @@ pub struct HandshakeResponse {
     pub prompt_stop_tokens: Vec<String>,
     pub kv_page_size: u32,
     pub max_batch_tokens: usize,
+    pub max_batch_size: usize,
     pub resources: HashMap<u32, u32>,
     pub tokenizer_num_vocab: usize,
     pub tokenizer_merge_table: HashMap<u32, Vec<u8>>,

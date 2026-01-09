@@ -354,6 +354,109 @@ async fn benchmark_throughput(client: &RpcClient, duration_secs: f64) -> Benchma
 }
 
 // ==============================================================================
+// Concurrent Benchmarks
+// ==============================================================================
+
+async fn benchmark_concurrent_throughput(
+    client: &std::sync::Arc<RpcClient>,
+    concurrency: usize,
+    duration_secs: f64,
+) -> BenchmarkResult {
+    let start = Instant::now();
+    let end_time = Duration::from_secs_f64(duration_secs);
+    let mut tasks = Vec::with_capacity(concurrency);
+
+    // Spawn concurrent tasks
+    for _ in 0..concurrency {
+        let client = client.clone();
+        let end_time_clone = start + end_time; // Approx end time
+
+        tasks.push(tokio::spawn(async move {
+            let mut local_latencies = Vec::new();
+            let mut local_iterations = 0;
+
+            while Instant::now() < end_time_clone {
+                let call_start = Instant::now();
+                // Use a simple add call for throughput
+                let _: i32 = client
+                    .call("add", &AddRequest { a: 1, b: 2 })
+                    .await
+                    .unwrap();
+                local_latencies.push(call_start.elapsed().as_secs_f64() * 1_000_000.0);
+                local_iterations += 1;
+            }
+            (local_iterations, local_latencies)
+        }));
+    }
+
+    // Collect results
+    let mut total_iterations = 0;
+    let mut all_latencies = Vec::new();
+
+    for task in tasks {
+        let (iters, mut lats) = task.await.unwrap();
+        total_iterations += iters;
+        all_latencies.append(&mut lats);
+    }
+
+    let total_time = start.elapsed();
+    let (mean, median, p99, min, max) = calculate_stats(&mut all_latencies);
+
+    BenchmarkResult {
+        name: format!("concurrent throughput ({} tasks, {:.0}s)", concurrency, duration_secs),
+        iterations: total_iterations,
+        total_time_ms: total_time.as_secs_f64() * 1000.0,
+        mean_latency_us: mean,
+        median_latency_us: median,
+        p99_latency_us: p99,
+        min_latency_us: min,
+        max_latency_us: max,
+        throughput_ops_sec: total_iterations as f64 / total_time.as_secs_f64(),
+    }
+}
+
+async fn benchmark_concurrent_correctness(
+    client: &std::sync::Arc<RpcClient>,
+    concurrency: usize,
+    iterations_per_task: usize,
+) {
+    let mut tasks = Vec::with_capacity(concurrency);
+
+    println!(
+        "  Running correctness check with {} tasks, {} iterations each...",
+        concurrency, iterations_per_task
+    );
+
+    for task_id in 0..concurrency {
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            for i in 0..iterations_per_task {
+                // Use the 'add' function with specific values to verify the result matches THIS request
+                // request: a = task_id, b = i
+                // expected: task_id + i
+                let a = task_id as i32;
+                let b = i as i32;
+                let expected = a + b;
+
+                let result: i32 = client.call("add", &AddRequest { a, b }).await.unwrap();
+
+                if result != expected {
+                    panic!(
+                        "Correctness failure in task {}: add({}, {}) returned {}, expected {}",
+                        task_id, a, b, result, expected
+                    );
+                }
+            }
+        }));
+    }
+
+    for task in tasks {
+        task.await.unwrap();
+    }
+    println!("  PASSED");
+}
+
+// ==============================================================================
 // Main Benchmark Runner
 // ==============================================================================
 
@@ -364,7 +467,7 @@ async fn main() -> anyhow::Result<()> {
     println!("============================================================");
     println!("\nConnecting to benchmark service...");
 
-    let client = RpcClient::connect("benchmark").await?;
+    let client = std::sync::Arc::new(RpcClient::connect("benchmark_v4").await?);
 
     // Verify connection with handshake
     let handshake: HandshakeResponse = client
@@ -381,6 +484,7 @@ async fn main() -> anyhow::Result<()> {
     println!("\n============================================================");
     println!(" Latency Benchmarks (10,000 iterations each)");
     println!("============================================================");
+    println!("(Running sequentially to measure pure latency)");
 
     // Run latency benchmarks
     let iterations = 10000;
@@ -415,11 +519,28 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("\n============================================================");
-    println!(" Throughput Benchmark (5 second sustained load)");
+    println!(" Sequential Throughput (5 second sustained load)");
     println!("============================================================");
 
     let result = benchmark_throughput(&client, 5.0).await;
     print_result(&result);
+
+    println!("\n============================================================");
+    println!(" Concurrent Throughput (3 second sustained load)");
+    println!("============================================================");
+
+    for concurrency in [2, 4, 8, 16, 32, 64, 128] {
+        let result = benchmark_concurrent_throughput(&client, concurrency, 3.0).await;
+        print_result(&result);
+    }
+
+    println!("\n============================================================");
+    println!(" Concurrent Correctness Check");
+    println!("============================================================");
+
+    benchmark_concurrent_correctness(&client, 4, 1000).await;
+    benchmark_concurrent_correctness(&client, 32, 1000).await;
+    benchmark_concurrent_correctness(&client, 128, 500).await;
 
     println!("\n============================================================");
     println!(" Summary");
@@ -428,16 +549,34 @@ async fn main() -> anyhow::Result<()> {
     // Run final measurements for summary
     let noop_result = benchmark_noop(&client, 1000).await;
     let add_result = benchmark_add(&client, 1000).await;
-    let throughput_result = benchmark_throughput(&client, 3.0).await;
+    
+    // Quick re-run of max concurrency for summary
+    let concurrent_result = benchmark_concurrent_throughput(&client, 32, 1.0).await;
 
     println!("\n  Baseline (noop) median latency:  {:.2} us", noop_result.median_latency_us);
     println!("  Simple call median latency:      {:.2} us", add_result.median_latency_us);
-    println!("  Sustained throughput:            {:.0} ops/sec", throughput_result.throughput_ops_sec);
+    println!("  Max Concurrent Throughput:       {:.0} ops/sec", concurrent_result.throughput_ops_sec);
 
     println!("\n============================================================");
     println!(" Benchmark Complete");
     println!("============================================================\n");
 
-    client.close().await;
+    // Arc doesn't have a close method we can call directly since it wraps the inner value.
+    // But RpcClient takes &self for close? No, it takes self.
+    // We can't move out of Arc.
+    // However, we can just drop the Arc. The RpcClient doesn't strictly need explicit close
+    // if the Drop trait handles it or if we don't care about clean shutdown on the very last step.
+    // Let's check RpcClient::close signature.
+    // It is `pub async fn close(mut self)`.
+    // Since we wrapped it in Arc, we can't call a method that takes `self` by value easily unless we are the only owner.
+    // For benchmark purposes, we can try to unwrap or just let it drop (which might just close the socket eventually).
+    // Or we can rely on try_unwrap since we are at end of main.
+    
+    if let Ok(c) = std::sync::Arc::try_unwrap(client) {
+         c.close().await;
+    } else {
+         println!("(Could not unwrap Arc to close client explicitly, dropping instead)");
+    }
+    
     Ok(())
 }

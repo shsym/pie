@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 /// Maximum message size in bytes (4MB).
 const MAX_MESSAGE_SIZE: usize = 4194304;
 
+/// Maximum buffer size for subscribers (handles concurrent requests).
+const SUBSCRIBER_BUFFER_SIZE: usize = 256;
+
 /// Number of spin iterations per idle loop.
 const SPIN_ITERATIONS: u32 = 1000;
 
@@ -40,10 +43,13 @@ pub fn run_worker(py: Python<'_>, service_name: &str, dispatch_callback: PyObjec
     let req_service = node
         .service_builder(&req_service_name.as_str().try_into().unwrap())
         .publish_subscribe::<[u8]>()
+        .subscriber_max_buffer_size(SUBSCRIBER_BUFFER_SIZE)
         .open_or_create()
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to create request service: {}", e)))?;
 
-    let req_subscriber = req_service.subscriber_builder().create()
+    let req_subscriber = req_service.subscriber_builder()
+        .buffer_size(SUBSCRIBER_BUFFER_SIZE)
+        .create()
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to create request subscriber: {}", e)))?;
 
     // Publish to response topic
@@ -51,6 +57,7 @@ pub fn run_worker(py: Python<'_>, service_name: &str, dispatch_callback: PyObjec
     let res_service = node
         .service_builder(&res_service_name.as_str().try_into().unwrap())
         .publish_subscribe::<[u8]>()
+        .subscriber_max_buffer_size(SUBSCRIBER_BUFFER_SIZE)
         .open_or_create()
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to create response service: {}", e)))?;
 

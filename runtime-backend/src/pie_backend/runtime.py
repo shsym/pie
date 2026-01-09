@@ -4,27 +4,20 @@ Runtime orchestrator for PIE backend.
 This module provides the main Runtime class that orchestrates inference
 by delegating to specialized components:
 - config.py: RuntimeConfig
-- batching.py: BatchBuilder, BatchState
+- batching.py: Batch
 - loader.py: ModelLoader
 """
 
 from __future__ import annotations
 
-import base64
 import random
-from pathlib import Path
-import time
-from typing import TYPE_CHECKING
 
 import numpy as np
 from . import utils
 import torch
-import torch.distributed as dist
-import queue
-import threading
 
 from .config import RuntimeConfig
-from .batching import BatchBuilder, Batch
+from .batching import Batch
 from .loader import ModelLoader
 from .adapter import AdapterSubpass, CmaesAdapter
 from .model import llama3, qwen2, qwen3, common
@@ -46,20 +39,6 @@ from . import hf_utils
 __all__ = ["Runtime", "RuntimeConfig"]
 
 
-# Helper class for result tracking
-class PendingResult:
-    def __init__(self, total, metadata):
-        self.total = total
-        self.received = 0
-        self.metadata = metadata
-        self.resps = [None] * total
-
-    def add_response(self, idx, resp):
-        self.resps[idx] = resp
-        self.received += 1
-        return self.received == self.total
-
-
 class Runtime:
     """
     Main runtime orchestrator for PIE inference.
@@ -79,10 +58,6 @@ class Runtime:
     adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]]
     adapters: dict
 
-    # Batch management
-    batch_builder: BatchBuilder
-    batch: Batch | None
-
     # Logging
     log_queue: object | None
 
@@ -96,20 +71,7 @@ class Runtime:
         """
         self.config = config
         self.log_queue = log_queue
-        self.log_queue = log_queue
         self.adapters = {}
-        self.batch = None
-
-        # Async Execution - 2 Stage Pipeline
-        # Stage 1: worker_thread (in server.py) receives requests and enqueues
-        # Stage 2: execution_loop drains queue, builds batch, executes
-        self.request_queue = queue.Queue()
-        self.response_callback = None
-
-        self.execution_thread = threading.Thread(
-            target=self.execution_loop, daemon=True
-        )
-        self.execution_thread.start()
 
         # Initialize seeds
         msg = f"Initializing with random seed: {config.random_seed}"
@@ -250,13 +212,6 @@ class Runtime:
             case _:
                 raise ValueError(f"Unsupported architecture type: {self.type}")
 
-        # Initialize batch builder
-        self.batch_builder = BatchBuilder(
-            kv_page_size=config.kv_page_size,
-            max_dist_size=config.max_dist_size,
-            adapters=self.adapters,
-        )
-
     # ========================================================================
     # Metadata Accessors
     # ========================================================================
@@ -324,270 +279,94 @@ class Runtime:
     # ========================================================================
     # Service Protocol Implementation
     # ========================================================================
-    def handshake(
-        self, reqs: list[message.HandshakeRequest]
-    ) -> list[message.HandshakeResponse]:
-        """Handle handshake requests returning model and tokenizer info."""
+
+    def handshake(self, req: message.HandshakeRequest) -> message.HandshakeResponse:
+        """Handle handshake request returning model and tokenizer info."""
         metadata = self.get_metadata()
         template = self.get_chat_template()
         tokenizer = self.get_tokenizer()
 
-        responses = []
-        for _ in reqs:
-            resp = message.HandshakeResponse(
-                version=metadata.get("version", "1.0.0"),
-                model_name=metadata["name"],
-                model_traits=[],  # TODO: populate traits
-                model_description=metadata.get("description", ""),
-                prompt_template=template["template_content"],
-                prompt_template_type=template["template_type"],
-                prompt_stop_tokens=template["stop_tokens"],
-                kv_page_size=self.config.kv_page_size,
-                max_batch_tokens=self.config.max_batch_tokens or 10240,
-                resources={
-                    0: self.config.max_num_kv_pages or 0,
-                    1: self.config.max_num_embeds,
-                    2: self.config.max_num_adapters,
-                },
-                tokenizer_num_vocab=tokenizer["num_vocab"],
-                tokenizer_merge_table=tokenizer["merge_table"],
-                tokenizer_special_tokens=tokenizer["special_tokens"],
-                tokenizer_split_regex=tokenizer["split_regex"],
-                tokenizer_escape_non_printable=tokenizer["escape_non_printable"],
-            )
-            responses.append(resp)
-        return responses
+        return message.HandshakeResponse(
+            version=metadata.get("version", "1.0.0"),
+            model_name=metadata["name"],
+            model_traits=[],
+            model_description=metadata.get("description", ""),
+            prompt_template=template["template_content"],
+            prompt_template_type=template["template_type"],
+            prompt_stop_tokens=template["stop_tokens"],
+            kv_page_size=self.config.kv_page_size,
+            max_batch_tokens=self.config.max_batch_tokens or 10240,
+            max_batch_size=self.config.max_batch_size or 128,
+            resources={
+                0: self.config.max_num_kv_pages or 0,
+                1: self.config.max_num_embeds,
+                2: self.config.max_num_adapters,
+            },
+            tokenizer_num_vocab=tokenizer["num_vocab"],
+            tokenizer_merge_table=tokenizer["merge_table"],
+            tokenizer_special_tokens=tokenizer["special_tokens"],
+            tokenizer_split_regex=tokenizer["split_regex"],
+            tokenizer_escape_non_printable=tokenizer["escape_non_printable"],
+        )
 
-    def query(self, reqs: list[message.QueryRequest]) -> list[message.QueryResponse]:
-        """Handle query requests."""
-        responses = []
-        for req in reqs:
-            value = "unknown query"
-            match req.query:
-                case "ping":
-                    value = "pong"
-            responses.append(message.QueryResponse(value=value))
-        return responses
+    def query(self, req: message.QueryRequest) -> message.QueryResponse:
+        """Handle query request."""
+        value = "unknown query"
+        match req.query:
+            case "ping":
+                value = "pong"
+        return message.QueryResponse(value=value)
 
-    def forward_pass_handler(
-        self, reqs: list[message.ForwardPassRequest]
-    ) -> list[message.ForwardPassResponse]:
-        """
-        Handle batched forward pass inference requests.
-
-        Note: This method was renamed from forward_pass to avoid collision
-        with the forward_pass property. For backward compatibility, the
-        server.py handler should call this method.
-        """
-        # Accumulate requests into the batch
-        for req in reqs:
-            self.batch_builder.add_request(req)
-
-        # Execute the batch and return responses
-        return self._execute_batch()
-
-    def set_response_callback(self, callback):
-        """Set callback for sending async responses."""
-        self.response_callback = callback
-
-    def forward_pass_handler_v2(
-        self, reqs: list[message.ForwardPassRequest], metadata: tuple
-    ) -> None:
-        """
-        Async handler for batched forward pass inference requests.
-        Enqueues raw requests for the preparation thread.
-        """
-        self.request_queue.put((reqs, metadata))
-
-    @torch.inference_mode()
-    def execution_loop(self):
-        """
-        Unified execution loop: drains request queue, builds batches on GPU, executes.
-        This runs in a single thread to avoid GIL contention.
-        """
-        while True:
-            try:
-                item = self.request_queue.get()
-            except Exception:
-                break
-
-            if item is None:
-                break
-
-            # Start collecting items to process
-            pending_items = [item]
-
-            # Drain queue to accumulate more requests for better batching
-            while True:
-                try:
-                    next_item = self.request_queue.get_nowait()
-                    if next_item is None:
-                        break
-                    pending_items.append(next_item)
-                except queue.Empty:
-                    break
-
-            # Create Result Objects
-            pending_results = []
-            for reqs, metadata in pending_items:
-                pending_results.append(PendingResult(len(reqs), metadata))
-
-            # Build and execute batches
-            curr_cursor_per_item = [0] * len(pending_items)
-
-            while True:
-                batch_mapping = []  # (PendingResult, req_idx)
-                batch_full = False
-
-                for item_idx, (reqs, _) in enumerate(pending_items):
-                    start_idx = curr_cursor_per_item[item_idx]
-                    if start_idx >= len(reqs):
-                        continue
-
-                    for i, req in enumerate(reqs[start_idx:]):
-                        self.batch_builder.add_request(req)
-                        batch_mapping.append((pending_results[item_idx], start_idx + i))
-
-                        current_batch = self.batch_builder.current_batch
-                        if current_batch:
-                            # Check 1: Max tokens
-                            is_full_tokens = (
-                                current_batch.total_tokens
-                                >= self.config.max_batch_tokens
-                            )
-
-                            # Check 2: Max requests (batch size)
-                            is_full_size = False
-                            if self.config.max_batch_size:
-                                is_full_size = (
-                                    len(current_batch.requests)
-                                    >= self.config.max_batch_size
-                                )
-
-                            if is_full_tokens or is_full_size:
-                                batch_full = True
-                                break
-
-                    items_added = sum(
-                        1
-                        for (pr, _) in batch_mapping
-                        if pr is pending_results[item_idx] and _ >= start_idx
-                    )
-                    curr_cursor_per_item[item_idx] += items_added
-
-                    if batch_full:
-                        break
-
-                if not self.batch_builder.is_empty():
-                    # Execute batch directly (on GPU)
-                    responses = self._execute_batch()
-
-                    # Send responses
-                    if self.response_callback:
-                        for resp, (pending_result, req_idx) in zip(
-                            responses, batch_mapping
-                        ):
-                            if pending_result.add_response(req_idx, resp):
-                                self.response_callback(
-                                    *pending_result.metadata, pending_result.resps
-                                )
-                else:
-                    break
-
-                if not batch_full:
-                    break
-
-    @torch.inference_mode()
-    def _execute_prepared_batch(
-        self, inputs, sampling_metadata, batch
-    ) -> list[message.ForwardPassResponse]:
-        """
-        Execute a batch that has already been prepared.
-        """
-        # Broadcast if needed
-        if self.config.world_size > 1:
-            msg = {
-                "type": "STEP",
-                "inputs": inputs,
-                "sampling_metadata": sampling_metadata,
-            }
-            utils.broadcast_struct(msg, src=0, device=self.config.device)
-
-        # Execute step
-        sampling_results = self._run_step(inputs, sampling_metadata)
-
-        # Package responses
-        responses = batch.create_responses(sampling_results)
-
-        return responses
-
-    def embed_image(self, reqs: list[message.EmbedImageRequest]) -> None:
+    def embed_image(self, req: message.EmbedImageRequest) -> None:
         """Handle image embedding requests."""
         # TODO: implement image embedding
         pass
 
-    def initialize_adapter(self, reqs: list[message.InitializeAdapterRequest]) -> None:
+    def initialize_adapter(self, req: message.InitializeAdapterRequest) -> None:
         """Initialize adapter functionality."""
-        for req in reqs:
-            adapter_ptr = req.adapter_ptr
-            # Prepare args for initialization
-            args = {
-                "adapter_ptr": adapter_ptr,
-                "rank": req.rank,
-                "alpha": req.alpha,
-                "population_size": req.population_size,
-                "mu_fraction": req.mu_fraction,
-                "initial_sigma": req.initial_sigma,
-            }
+        args = {
+            "adapter_ptr": req.adapter_ptr,
+            "rank": req.rank,
+            "alpha": req.alpha,
+            "population_size": req.population_size,
+            "mu_fraction": req.mu_fraction,
+            "initial_sigma": req.initial_sigma,
+        }
 
-            if self.config.world_size > 1:
-                # Broadcast INIT_ADAPTER command
-                msg = {"type": "INIT_ADAPTER", "kwargs": args}
-                utils.broadcast_struct(msg, src=0, device=self.config.device)
+        if self.config.world_size > 1:
+            msg = {"type": "INIT_ADAPTER", "kwargs": args}
+            utils.broadcast_struct(msg, src=0, device=self.config.device)
 
-            self._initialize_adapter(**args)
+        self._initialize_adapter(**args)
 
-    def update_adapter(self, reqs: list[message.UpdateAdapterRequest]) -> None:
+    def update_adapter(self, req: message.UpdateAdapterRequest) -> None:
         """Update adapter parameters."""
-        for req in reqs:
-            args = {
-                "adapter_ptr": req.adapter_ptr,
-                "scores": req.scores,
-                "seeds": req.seeds,
-                "max_sigma": req.max_sigma,
-            }
+        args = {
+            "adapter_ptr": req.adapter_ptr,
+            "scores": req.scores,
+            "seeds": req.seeds,
+            "max_sigma": req.max_sigma,
+        }
 
-            if self.config.world_size > 1:
-                # Broadcast UPDATE_ADAPTER command
-                msg = {"type": "UPDATE_ADAPTER", "kwargs": args}
-                utils.broadcast_struct(msg, src=0, device=self.config.device)
+        if self.config.world_size > 1:
+            msg = {"type": "UPDATE_ADAPTER", "kwargs": args}
+            utils.broadcast_struct(msg, src=0, device=self.config.device)
 
-            self._update_adapter(**args)
+        self._update_adapter(**args)
 
-    def upload_adapter(self, reqs: list[message.UploadAdapterRequest]) -> None:
+    def upload_adapter(self, req: message.UploadAdapterRequest) -> None:
         """Upload adapter weights."""
-        for req in reqs:
-            # Convert list[int] to bytes if necessary
-            data = req.adapter_data
-            if isinstance(data, list):
-                data = bytes(data)
+        data = req.adapter_data
+        if isinstance(data, list):
+            data = bytes(data)
 
-            args = {"adapter_ptr": req.adapter_ptr, "name": req.name, "data": data}
+        args = {"adapter_ptr": req.adapter_ptr, "name": req.name, "data": data}
 
-            if self.config.world_size > 1:
-                # Broadcast UPLOAD_ADAPTER command
-                # We do NOT include the data in the broadcast for now to avoid massive traffic
-                # Each rank must load it? Or rank 0 loads and broadcasts weights?
-                # The CmaesAdapter implementation handles broadcasting/sharding OF THE WEIGHTS
-                # inside .upload() if we wanted, but currently it just loads from file.
-                # However, since we are moving to in-memory, we might need rank 0 to broadcast.
-                # BUT: The current architecture assumes the CLIENT sends the request to the server.
-                # If we are using multi-GPU, we need consistent state.
-                # For now, let's assume we pass the data down.
-                msg = {"type": "UPLOAD_ADAPTER", "kwargs": args}
-                utils.broadcast_struct(msg, src=0, device=self.config.device)
+        if self.config.world_size > 1:
+            msg = {"type": "UPLOAD_ADAPTER", "kwargs": args}
+            utils.broadcast_struct(msg, src=0, device=self.config.device)
 
-            self._upload_adapter(**args)
+        self._upload_adapter(**args)
 
     def _upload_adapter(self, adapter_ptr: int, name: str, data: bytes) -> None:
         if adapter_ptr in self.adapters:
@@ -603,25 +382,17 @@ class Runtime:
                 adapter.upload(name, data)
 
     def download_adapter(
-        self, reqs: list[message.DownloadAdapterRequest]
-    ) -> list[message.DownloadAdapterResponse]:
+        self, req: message.DownloadAdapterRequest
+    ) -> message.DownloadAdapterResponse:
         """Download adapter weights."""
-        resps = []
-        for req in reqs:
-            args = {"adapter_ptr": req.adapter_ptr, "name": req.name}
+        args = {"adapter_ptr": req.adapter_ptr, "name": req.name}
 
-            if self.config.world_size > 1:
-                # Broadcast DOWNLOAD_ADAPTER command
-                msg = {"type": "DOWNLOAD_ADAPTER", "kwargs": args}
-                utils.broadcast_struct(msg, src=0, device=self.config.device)
+        if self.config.world_size > 1:
+            msg = {"type": "DOWNLOAD_ADAPTER", "kwargs": args}
+            utils.broadcast_struct(msg, src=0, device=self.config.device)
 
-            data = self._download_adapter(**args)
-
-            # Pack response (only Rank 0 returns data to client)
-            resp = message.DownloadAdapterResponse(adapter_data=data)
-            resps.append(resp)
-
-        return resps
+        data = self._download_adapter(**args)
+        return message.DownloadAdapterResponse(adapter_data=data)
 
     def _download_adapter(self, adapter_ptr: int, name: str) -> bytes:
         if adapter_ptr in self.adapters:
@@ -826,38 +597,6 @@ class Runtime:
 
         return sampling_results
 
-    @torch.inference_mode()
-    def _execute_batch(self) -> list[message.ForwardPassResponse]:
-        """
-        Execute the accumulated batch and return responses.
-        """
-        batch = self.batch_builder.build()
-        device = self.config.device
-        sampling_metadata = batch.get_sampling_metadata(
-            device, self.config.activation_dtype
-        )
-
-        inputs = batch.get_model_inputs(device)
-
-        # Broadcast if needed
-        if self.config.world_size > 1:
-            # Broadcast Step command
-            msg = {
-                "type": "STEP",
-                "inputs": inputs,
-                "sampling_metadata": sampling_metadata,
-            }
-
-            utils.broadcast_struct(msg, src=0, device=device)
-
-        # Execute step
-        sampling_results = self._run_step(inputs, sampling_metadata)
-
-        # Package responses
-        responses = batch.create_responses(sampling_results)
-
-        return responses
-
     # ========================================================================
     # Pycrust RPC Method Wrappers
     # ========================================================================
@@ -865,31 +604,31 @@ class Runtime:
     def handshake_rpc(self, **kwargs) -> dict:
         """Handle handshake via pycrust RPC."""
         req = message.HandshakeRequest(**kwargs)
-        resps = self.handshake([req])
-        # Convert to dict for MessagePack serialization
+        resp = self.handshake(req)
         return {
-            "version": resps[0].version,
-            "model_name": resps[0].model_name,
-            "model_traits": resps[0].model_traits,
-            "model_description": resps[0].model_description,
-            "prompt_template": resps[0].prompt_template,
-            "prompt_template_type": resps[0].prompt_template_type,
-            "prompt_stop_tokens": resps[0].prompt_stop_tokens,
-            "kv_page_size": resps[0].kv_page_size,
-            "max_batch_tokens": resps[0].max_batch_tokens,
-            "resources": resps[0].resources,
-            "tokenizer_num_vocab": resps[0].tokenizer_num_vocab,
-            "tokenizer_merge_table": resps[0].tokenizer_merge_table,
-            "tokenizer_special_tokens": resps[0].tokenizer_special_tokens,
-            "tokenizer_split_regex": resps[0].tokenizer_split_regex,
-            "tokenizer_escape_non_printable": resps[0].tokenizer_escape_non_printable,
+            "version": resp.version,
+            "model_name": resp.model_name,
+            "model_traits": resp.model_traits,
+            "model_description": resp.model_description,
+            "prompt_template": resp.prompt_template,
+            "prompt_template_type": resp.prompt_template_type,
+            "prompt_stop_tokens": resp.prompt_stop_tokens,
+            "kv_page_size": resp.kv_page_size,
+            "max_batch_tokens": resp.max_batch_tokens,
+            "max_batch_size": resp.max_batch_size,
+            "resources": resp.resources,
+            "tokenizer_num_vocab": resp.tokenizer_num_vocab,
+            "tokenizer_merge_table": resp.tokenizer_merge_table,
+            "tokenizer_special_tokens": resp.tokenizer_special_tokens,
+            "tokenizer_split_regex": resp.tokenizer_split_regex,
+            "tokenizer_escape_non_printable": resp.tokenizer_escape_non_printable,
         }
 
     def query_rpc(self, **kwargs) -> dict:
         """Handle query via pycrust RPC."""
         req = message.QueryRequest(**kwargs)
-        resps = self.query([req])
-        return {"value": resps[0].value}
+        resp = self.query(req)
+        return {"value": resp.value}
 
     @torch.inference_mode()
     def fire_batch(self, **kwargs) -> dict:
@@ -1068,28 +807,28 @@ class Runtime:
     def embed_image_rpc(self, **kwargs) -> None:
         """Handle embed_image via pycrust RPC."""
         req = message.EmbedImageRequest(**kwargs)
-        self.embed_image([req])
+        self.embed_image(req)
 
     def initialize_adapter_rpc(self, **kwargs) -> None:
         """Handle initialize_adapter via pycrust RPC."""
         req = message.InitializeAdapterRequest(**kwargs)
-        self.initialize_adapter([req])
+        self.initialize_adapter(req)
 
     def update_adapter_rpc(self, **kwargs) -> None:
         """Handle update_adapter via pycrust RPC."""
         req = message.UpdateAdapterRequest(**kwargs)
-        self.update_adapter([req])
+        self.update_adapter(req)
 
     def upload_adapter_rpc(self, **kwargs) -> None:
         """Handle upload_adapter via pycrust RPC."""
         req = message.UploadAdapterRequest(**kwargs)
-        self.upload_adapter([req])
+        self.upload_adapter(req)
 
     def download_adapter_rpc(self, **kwargs) -> bytes:
         """Handle download_adapter via pycrust RPC."""
         req = message.DownloadAdapterRequest(**kwargs)
-        resps = self.download_adapter([req])
-        return resps[0].adapter_data
+        resp = self.download_adapter(req)
+        return resp.adapter_data
 
     def shutdown(self):
         """
@@ -1097,9 +836,6 @@ class Runtime:
 
         For Rank 0 in multi-GPU setup, this broadcasts the 'STOP' signal to workers.
         """
-        # Stop the execution thread
-        self.request_queue.put(None)
-
         if self.config.world_size > 1 and self.config.rank == 0:
             print("Broadcasting STOP signal to workers...")
             utils.broadcast_struct("STOP", src=0, device=self.config.device)

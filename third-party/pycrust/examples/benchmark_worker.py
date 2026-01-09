@@ -210,7 +210,7 @@ def nested_data(depth: int, width: int) -> dict:
 
 if __name__ == "__main__":
     # Create the RPC endpoint
-    rpc = RpcEndpoint("benchmark")
+    rpc = RpcEndpoint("benchmark_v4")
 
     # Register all benchmark handlers
     rpc.register("noop", noop)
