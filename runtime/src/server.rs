@@ -2,7 +2,6 @@ use crate::auth::{AuthorizedUsers, PublicKey};
 use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
 use crate::messaging::PushPullCommand;
 use crate::model;
-use crate::model::Model;
 use crate::runtime::{self, AttachInstanceResult, TerminationCause};
 use crate::service::{CommandDispatcher, Service, ServiceCommand};
 use crate::utils::IdPool;
@@ -1144,35 +1143,19 @@ impl Session {
     async fn handle_attach_remote_service(
         &mut self,
         corr_id: u32,
-        endpoint: String,
-        service_type: String,
-        service_name: String,
+        _endpoint: String,
+        _service_type: String,
+        _service_name: String,
     ) {
-        match service_type.as_str() {
-            "model" => match Model::new(&endpoint).await {
-                Ok(model_service) => {
-                    if model::install_model(service_name, model_service).is_some() {
-                        self.send_response(corr_id, true, "Model service registered".into())
-                            .await;
-                        self.state.backend_status.increment_attached_count();
-                    } else {
-                        self.send_response(corr_id, false, "Failed to register model".into())
-                            .await;
-                        self.state.backend_status.increment_rejected_count();
-                    }
-                }
-                Err(e) => {
-                    self.send_response(corr_id, false, format!("Failed to attach to model backend: {}", e))
-                        .await;
-                    self.state.backend_status.increment_rejected_count();
-                }
-            },
-            other => {
-                self.send_response(corr_id, false, format!("Unknown service type: {other}"))
-                    .await;
-                self.state.backend_status.increment_rejected_count();
-            }
-        }
+        // IPC-based remote service attachment is no longer supported.
+        // In FFI mode, models are registered directly during server startup.
+        self.send_response(
+            corr_id,
+            false,
+            "Remote service attachment is not supported in FFI mode".into(),
+        )
+        .await;
+        self.state.backend_status.increment_rejected_count();
     }
 
     /// Handles a blob chunk uploaded by the client for a specific instance.

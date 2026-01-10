@@ -129,12 +129,12 @@ class DownloadAdapterResponse(msgspec.Struct, gc=False):
 
 
 # ==============================================================================
-# 2. BATCHED REQUEST/RESPONSE TYPES (for pycrust RPC)
+# 2. BATCHED REQUEST/RESPONSE TYPES (for RPC)
 # ==============================================================================
 
 
 class BatchedForwardPassRequest(msgspec.Struct, gc=False):
-    """Batched forward pass request from Rust via pycrust.
+    """Batched forward pass request from Rust via RPC.
 
     Rust performs partial batch formation (concatenating arrays),
     while Python handles attention mask decoding and tensor creation.
@@ -170,7 +170,7 @@ class BatchedForwardPassRequest(msgspec.Struct, gc=False):
 
 
 class BatchedForwardPassResponse(msgspec.Struct, gc=False):
-    """Batched forward pass response to Rust via pycrust."""
+    """Batched forward pass response to Rust via RPC."""
 
     # Results indexed by request order in the batch
     results: list[ForwardPassResponse]

@@ -63,12 +63,13 @@ def _check_libraries() -> list[tuple[str, str, str]]:
     """Check library installations."""
     results = []
 
-    # pie-backend
+    # pie_worker (merged into pie-server)
     try:
-        ver = importlib.metadata.version("pie-backend")
-        results.append(("pie-backend", ver, "pass"))
-    except importlib.metadata.PackageNotFoundError:
-        results.append(("pie-backend", "Not installed", "warn"))
+        import pie_worker  # noqa: F401
+
+        results.append(("pie_worker", "OK (part of pie-server)", "pass"))
+    except ImportError:
+        results.append(("pie_worker", "Not installed", "warn"))
 
     # pie-client
     try:

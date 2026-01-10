@@ -3,7 +3,7 @@
 //! This module provides a minimal backend that:
 //! - Connects to the Pie engine via WebSocket
 //! - Authenticates using internal authentication
-//! - Registers as a remote service using pycrust RPC
+//! - Registers as a remote service (for testing registration flow)
 //! - Returns minimal/error responses for handler requests
 //!
 //! The dummy backend is primarily used for CI testing to verify engine behavior
@@ -27,8 +27,8 @@ pub struct DummyBackendConfig {
 
 /// Starts the dummy backend.
 ///
-/// This function connects to the engine, authenticates, registers as a service,
-/// and starts listening for pycrust RPC calls. It runs indefinitely until cancelled.
+/// This function connects to the engine, authenticates, and registers as a service.
+/// It runs indefinitely until cancelled.
 pub async fn start_dummy_backend(config: DummyBackendConfig) -> Result<()> {
     println!("[Dummy Backend] Starting...");
 
@@ -74,16 +74,15 @@ pub async fn start_dummy_backend(config: DummyBackendConfig) -> Result<()> {
     }
     println!("[Dummy Backend] Connected to engine at {}", controller_url);
 
-    // Generate unique pycrust service name
+    // Generate unique service name
     let unique_id: u32 = rand::rng().random_range(100000..=999999);
     let service_name = format!("pie-dummy-backend-{}", unique_id);
 
-    // Note: In a real implementation, we would start a pycrust endpoint here.
-    // For testing purposes, we just register the service name.
-    // The actual pycrust endpoint would need to be implemented using the Python pycrust library
-    // or a Rust-based worker (which doesn't exist yet).
+    // Note: In FFI mode (the only mode now), remote service attachment is not supported.
+    // This registration will be rejected by the server, but is useful for testing the
+    // registration flow and error handling.
 
-    // Register with the engine using the pycrust service name
+    // Register with the engine
     let register_msg = ClientMessage::AttachRemoteService {
         corr_id: 0,
         endpoint: service_name.clone(),
@@ -123,9 +122,9 @@ pub async fn start_dummy_backend(config: DummyBackendConfig) -> Result<()> {
     );
 
     // Keep the WebSocket connection alive
-    // Note: The dummy backend cannot actually handle pycrust RPC calls because
-    // pycrust workers are implemented in Python. This is primarily for registration testing.
-    println!("[Dummy Backend] Warning: Dummy backend cannot handle pycrust RPC calls.");
+    // Note: Remote service registration is no longer supported in FFI mode.
+    // The server will reject the registration, but this is useful for testing error handling.
+    println!("[Dummy Backend] Note: Remote service attachment is not supported in FFI mode.");
     println!("[Dummy Backend] This is only useful for registration testing.");
 
     while let Some(result) = ws_read.next().await {

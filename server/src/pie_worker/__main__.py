@@ -288,7 +288,7 @@ def init_process(
             dist.init_process_group(backend, rank=rank, world_size=world_size)
 
         # Initialize IPC control channel (replaces GLOO for metadata broadcasts)
-        import pie_backend.utils as pie_utils
+        from . import utils as pie_utils
         from .control_channel import ControlChannel
 
         pie_utils._control_channel = ControlChannel(rank, world_size, control_queues)

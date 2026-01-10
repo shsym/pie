@@ -20,7 +20,6 @@ use crate::instance::InstanceId;
 use anyhow::Result;
 use bytes::Bytes;
 use futures::future;
-use pycrust_client::RpcClient;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -32,30 +31,23 @@ use tokio::task::{self, JoinHandle};
 // Re-export SchedulerConfig for public API
 pub use batching::SchedulerConfig;
 
-/// Backend abstraction for RPC calls to Python.
-/// Supports both IPC (iceoryx2) and FFI (direct calls) modes.
+/// Backend for RPC calls to Python via FFI.
 #[derive(Clone)]
-pub enum RpcBackend {
-    /// IPC mode using pycrust-client (iceoryx2 shared memory)
-    Ipc(Arc<RpcClient>),
-    /// FFI mode using direct Python calls
-    Ffi(AsyncFfiClient),
-}
+pub struct RpcBackend(AsyncFfiClient);
 
 impl RpcBackend {
+    /// Create a new RpcBackend from an FFI client.
+    pub fn new(client: AsyncFfiClient) -> Self {
+        RpcBackend(client)
+    }
+
     /// Call a remote method with typed arguments and return value.
     pub async fn call<T, R>(&self, method: &str, args: &T) -> Result<R>
     where
         T: Serialize + Send + Sync + Clone + 'static,
         R: DeserializeOwned + Send + 'static,
     {
-        match self {
-            RpcBackend::Ipc(client) => client
-                .call(method, args)
-                .await
-                .map_err(|e| anyhow::anyhow!("IPC call failed: {}", e)),
-            RpcBackend::Ffi(client) => client.call(method, args).await,
-        }
+        self.0.call(method, args).await
     }
 
     /// Call with timeout.
@@ -69,13 +61,7 @@ impl RpcBackend {
         T: Serialize + Send + Sync + Clone + 'static,
         R: DeserializeOwned + Send + 'static,
     {
-        match self {
-            RpcBackend::Ipc(client) => client
-                .call_with_timeout(method, args, timeout)
-                .await
-                .map_err(|e| anyhow::anyhow!("IPC call failed: {}", e)),
-            RpcBackend::Ffi(client) => client.call_with_timeout(method, args, timeout).await,
-        }
+        self.0.call_with_timeout(method, args, timeout).await
     }
 
     /// Fire-and-forget notification.
@@ -83,12 +69,7 @@ impl RpcBackend {
     where
         T: Serialize + Send + Sync + Clone + 'static,
     {
-        match self {
-            RpcBackend::Ipc(client) => client
-                .notify(method, args)
-                .map_err(|e| anyhow::anyhow!("IPC notify failed: {}", e)),
-            RpcBackend::Ffi(client) => client.notify(method, args).await,
-        }
+        self.0.notify(method, args).await
     }
 }
 
@@ -312,7 +293,7 @@ pub struct ModelInfo {
     pub max_batch_tokens: usize,
 }
 
-/// Model service using pycrust RPC for communication with Python backend.
+/// Model service for communication with Python backend via FFI.
 pub struct Model {
     info: ModelInfo,
     resource_manager: ResourceManager,
@@ -334,27 +315,13 @@ impl Model {
         &self.info.name
     }
 
-    pub async fn new(service_name: &str) -> Result<Self> {
-        Self::new_with_config(service_name, SchedulerConfig::default()).await
-    }
-
-    pub async fn new_with_config(service_name: &str, scheduler_config: SchedulerConfig) -> Result<Self> {
-        let rpc_client = Arc::new(
-            RpcClient::connect(service_name)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to connect to pycrust service: {}", e))?,
-        );
-        let backend = RpcBackend::Ipc(rpc_client);
-        Self::new_with_backend(backend, scheduler_config).await
-    }
-
     /// Create a new Model with an FFI backend using a queue.
     ///
     /// The queue should be shared with Python which polls it for requests.
     /// FfiQueue uses internal Arc so cloning shares state.
-    pub async fn new_with_ffi(queue: ffi_queue::FfiQueue, scheduler_config: SchedulerConfig) -> Result<Self> {
+    pub async fn new(queue: ffi_queue::FfiQueue, scheduler_config: SchedulerConfig) -> Result<Self> {
         let ffi_client = AsyncFfiClient::new_with_queue(queue);
-        let backend = RpcBackend::Ffi(ffi_client);
+        let backend = RpcBackend::new(ffi_client);
         Self::new_with_backend(backend, scheduler_config).await
     }
 

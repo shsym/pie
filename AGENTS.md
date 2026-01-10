@@ -10,19 +10,16 @@ This document provides a concise overview of the key directories and components 
 *   **Integration**: It exposes a Python interface via PyO3, allowing it to be controlled by the `server` layer.
 *   **Key Dependencies**: `wasmtime`, `tokio`, `zeromq`, `pyo3`.
 
-## `runtime-backend`
-**Inference Backend (PyTorch/GPU).**
-*   **Path**: `runtime-backend/`
-*   **Language**: Python (`pie-backend`)
-*   **Description**: Runs the actual machine learning models (LLMs). It handles model loading, KV caching, and forward passes using PyTorch.
-*   **Execution**: It runs as a separate process launched by the Engine, communicating via ZeroMQ.
-*   **Key Features**: CUDA/Metal support, FlashInfer integration.
-
 ## `server`
-**Main Entrypoint and CLI (`pie`).**
+**Main Entrypoint and CLI (`pie`) + Inference Backend.**
 *   **Path**: `server/`
-*   **Language**: Python (`pie-server`)
-*   **Description**: The primary interface for the user. It wraps the `runtime` (Rust) and orchestrates the `runtime-backend`.
+*   **Language**: Python (`pie-server`) + Rust (PyO3 extension)
+*   **Description**: The primary interface for the user. It wraps the `runtime` (Rust), includes the inference backend (`pie_worker`), and provides the `pie` CLI.
+*   **Subdirectories**:
+    *   `src/pie/`: Core engine management logic
+    *   `src/pie_cli/`: CLI commands (`pie serve`, `pie run`, etc.)
+    *   `src/pie_worker/`: Inference backend (was `pie-backend`) - handles model loading, KV caching, forward passes
+    *   `src/flashinfer_metal/`: Metal GPU kernels (Apple Silicon)
 *   **CLI**: Provides the `pie` command.
     *   `pie serve`: Starts the full engine and backend.
     *   `pie run`: Executes a one-shot inferlet.

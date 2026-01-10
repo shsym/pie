@@ -600,11 +600,11 @@ class Runtime:
         return sampling_results
 
     # ========================================================================
-    # Pycrust RPC Method Wrappers
+    # RPC Method Wrappers
     # ========================================================================
 
     def handshake_rpc(self, **kwargs) -> dict:
-        """Handle handshake via pycrust RPC."""
+        """Handle handshake RPC."""
         req = message.HandshakeRequest(**kwargs)
         resp = self.handshake(req)
         return {
@@ -627,7 +627,7 @@ class Runtime:
         }
 
     def query_rpc(self, **kwargs) -> dict:
-        """Handle query via pycrust RPC."""
+        """Handle query RPC."""
         req = message.QueryRequest(**kwargs)
         resp = self.query(req)
         return {"value": resp.value}
@@ -635,7 +635,7 @@ class Runtime:
     @torch.inference_mode()
     def fire_batch(self, **kwargs) -> dict:
         """
-        Execute a pre-batched forward pass from Rust via pycrust RPC.
+        Execute a pre-batched forward pass from Rust via RPC.
 
         This receives already-batched data from Rust and:
         1. Decodes attention masks from BRLE
@@ -813,27 +813,27 @@ class Runtime:
         return batch
 
     def embed_image_rpc(self, **kwargs) -> None:
-        """Handle embed_image via pycrust RPC."""
+        """Handle embed_image RPC."""
         req = message.EmbedImageRequest(**kwargs)
         self.embed_image(req)
 
     def initialize_adapter_rpc(self, **kwargs) -> None:
-        """Handle initialize_adapter via pycrust RPC."""
+        """Handle initialize_adapter RPC."""
         req = message.InitializeAdapterRequest(**kwargs)
         self.initialize_adapter(req)
 
     def update_adapter_rpc(self, **kwargs) -> None:
-        """Handle update_adapter via pycrust RPC."""
+        """Handle update_adapter RPC."""
         req = message.UpdateAdapterRequest(**kwargs)
         self.update_adapter(req)
 
     def upload_adapter_rpc(self, **kwargs) -> None:
-        """Handle upload_adapter via pycrust RPC."""
+        """Handle upload_adapter RPC."""
         req = message.UploadAdapterRequest(**kwargs)
         self.upload_adapter(req)
 
     def download_adapter_rpc(self, **kwargs) -> bytes:
-        """Handle download_adapter via pycrust RPC."""
+        """Handle download_adapter RPC."""
         req = message.DownloadAdapterRequest(**kwargs)
         resp = self.download_adapter(req)
         return resp.adapter_data

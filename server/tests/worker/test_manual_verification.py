@@ -1,7 +1,7 @@
 import sys
 import torch
-from pie_backend.runtime import Runtime, RuntimeConfig
-from pie_backend import message
+from pie_worker.runtime import Runtime, RuntimeConfig
+from pie_worker import message
 
 
 def test_manual():
