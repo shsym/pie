@@ -8,7 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [lib]
-name = "pie"
+name = "pie_rs"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
@@ -41,6 +41,7 @@ thiserror = "2.0.11"
 futures = "0.3.31"
 rmp-serde = "1.3.0"
 pycrust-client = { path = "../third-party/pycrust/crates/pycrust-client" }
+pycrust-ffi = { path = "../third-party/pycrust-ffi/crates/pycrust-ffi" }
 hyper = "1.6.0"
 blake3 = "1.8.2"
 tokio-tungstenite = "0.28.0"
@@ -60,3 +61,4 @@ p384 = { version = "0.13", features = ["pkcs8"] }
 chrono = "0.4"
 ringbuffer = "0.15"
 reqwest = { version = "0.12", features = ["rustls-tls"] }
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }

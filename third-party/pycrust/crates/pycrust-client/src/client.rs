@@ -51,71 +51,17 @@ impl RpcClient {
     ///
     /// let result: i32 = client.call("add", &AddArgs { a: 10, b: 20 }).await?;
     /// ```
+    /// Public API: Call without timeout
     pub async fn call<T, R>(&self, method: &str, args: &T) -> Result<R>
     where
         T: Serialize,
         R: DeserializeOwned,
     {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let payload = rmp_serde::to_vec_named(args)?;
-
-        // Validate payload size before sending
-        if payload.len() > MAX_PAYLOAD_SIZE {
-            return Err(RpcError::TransportError(format!(
-                "Payload size {} exceeds maximum {} bytes",
-                payload.len(),
-                MAX_PAYLOAD_SIZE
-            )));
-        }
-
-        let request = RpcRequest {
-            id,
-            method: method.to_string(),
-            payload,
-        };
-
-        // Create oneshot channel for response
-        let (tx, rx) = oneshot::channel();
-
-        // Register pending request - the transport thread will dispatch directly
-        self.transport.shared().pending.insert(id, tx);
-
-        // Send request - cleanup pending on failure
-        if let Err(e) = self.transport.send_request(request) {
-            self.transport.shared().pending.remove(&id);
-            return Err(e);
-        }
-
-        // Wait for response - woken directly by the transport thread
-        let response = match rx.await {
-            Ok(result) => result?,
-            Err(_) => {
-                // Channel was dropped (transport shutdown)
-                self.transport.shared().pending.remove(&id);
-                return Err(RpcError::ChannelClosed);
-            }
-        };
-
-        // Check status
-        if response.status != status::OK {
-            let message: String = rmp_serde::from_slice(&response.payload)
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(RpcError::RemoteError {
-                status: response.status,
-                message,
-            });
-        }
-
-        // Deserialize result
-        let result: R = rmp_serde::from_slice(&response.payload)?;
-        Ok(result)
+        // Use a very long duration effectively acting as "forever"
+        self.invoke_rpc(method, args, None).await
     }
 
-    /// Call a remote method with timeout.
-    ///
-    /// Similar to `call`, but returns an error if the response is not
-    /// received within the specified duration. Properly cleans up pending
-    /// requests on timeout.
+    /// Public API: Call with timeout
     pub async fn call_with_timeout<T, R>(
         &self,
         method: &str,
@@ -126,10 +72,22 @@ impl RpcClient {
         T: Serialize,
         R: DeserializeOwned,
     {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.invoke_rpc(method, args, Some(timeout)).await
+    }
+
+    /// Public API: Fire-and-forget notification.
+    ///
+    /// Sends a request without waiting for a response.
+    /// Useful for logging, metrics, or one-way commands.
+    /// Uses ID = 0 to signal to the worker that no response is needed.
+    pub fn notify<T>(&self, method: &str, args: &T) -> Result<()>
+    where
+        T: Serialize,
+    {
+        // ID 0 is reserved for notifications (no response)
+        let id = 0;
         let payload = rmp_serde::to_vec_named(args)?;
 
-        // Validate payload size before sending
         if payload.len() > MAX_PAYLOAD_SIZE {
             return Err(RpcError::TransportError(format!(
                 "Payload size {} exceeds maximum {} bytes",
@@ -144,46 +102,96 @@ impl RpcClient {
             payload,
         };
 
-        // Create oneshot channel for response
+        // Just send it, don't register pending
+        self.transport.send_request(request)
+    }
+
+    /// Private unified implementation
+    async fn invoke_rpc<T, R>(
+        &self,
+        method: &str,
+        args: &T,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<R>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        // Fetch ID, ensure we never use 0 which is reserved for notifications
+        let mut id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        if id == 0 {
+             id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let payload = rmp_serde::to_vec_named(args)?;
+
+        if payload.len() > MAX_PAYLOAD_SIZE {
+            return Err(RpcError::TransportError(format!(
+                "Payload size {} exceeds maximum {} bytes",
+                payload.len(),
+                MAX_PAYLOAD_SIZE
+            )));
+        }
+
+        // Create the response channel
         let (tx, rx) = oneshot::channel();
 
-        // Register pending request
+        // 1. REGISTER: Insert into pending map
         self.transport.shared().pending.insert(id, tx);
 
-        // Send request - cleanup pending on failure
+        let request = RpcRequest {
+            id,
+            method: method.to_string(),
+            payload,
+        };
+
+        // 2. SEND: Dispatch to transport thread
         if let Err(e) = self.transport.send_request(request) {
+            // Cleanup on send failure
             self.transport.shared().pending.remove(&id);
             return Err(e);
         }
 
-        // Wait for response with timeout
-        let response = match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result?,
-            Ok(Err(_)) => {
-                // Channel was dropped
+        // 3. AWAIT: Wait for response or timeout
+        let response_result = match timeout {
+            Some(duration) => {
+                match tokio::time::timeout(duration, rx).await {
+                    Ok(res) => res, // Inner result from oneshot
+                    Err(_) => {
+                        // TIMEOUT OCCURRED
+                        // Critical: Remove from map so we don't leak memory
+                        self.transport.shared().pending.remove(&id);
+                        return Err(RpcError::Timeout);
+                    }
+                }
+            }
+            None => rx.await,
+        };
+
+        // Handle Channel Errors (Transport closed)
+        let response = match response_result {
+            Ok(res) => res?, // Unwrap Result<RpcResponse>
+            Err(_) => {
+                // Sender dropped without sending (Transport died)
                 self.transport.shared().pending.remove(&id);
                 return Err(RpcError::ChannelClosed);
             }
-            Err(_) => {
-                // Timeout - CRITICAL: clean up pending request to prevent memory leak
-                self.transport.shared().pending.remove(&id);
-                return Err(RpcError::Timeout);
-            }
         };
 
-        // Check status
+        // 4. PROCESS: Check Status
         if response.status != status::OK {
-            let message: String = rmp_serde::from_slice(&response.payload)
-                .unwrap_or_else(|_| "Unknown error".to_string());
+            // Attempt to decode error message
+            let msg: String = rmp_serde::from_slice(&response.payload)
+                .unwrap_or_else(|_| "Unknown remote error".to_string());
             return Err(RpcError::RemoteError {
                 status: response.status,
-                message,
+                message: msg,
             });
         }
 
-        // Deserialize result
-        let result: R = rmp_serde::from_slice(&response.payload)?;
-        Ok(result)
+        // 5. DESERIALIZE: Happy path
+        // Fix: Use correct error variant (DeserializationError) which accepts decode::Error from from_slice
+        rmp_serde::from_slice(&response.payload).map_err(RpcError::DeserializationError)
     }
 
     /// Close the client and cleanup resources.

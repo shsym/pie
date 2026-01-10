@@ -61,6 +61,11 @@ class Runtime:
     # Logging
     log_queue: object | None
 
+    def _log(self, msg: str, level: str = "INFO") -> None:
+        """Log a message to the queue if available."""
+        if self.log_queue is not None:
+            self.log_queue.put({"message": msg, "level": level})
+
     def __init__(self, config: RuntimeConfig, log_queue: object | None = None):
         """
         Initialize the runtime.
@@ -74,8 +79,7 @@ class Runtime:
         self.adapters = {}
 
         # Initialize seeds
-        msg = f"Initializing with random seed: {config.random_seed}"
-        self.log_queue.put({"message": msg, "level": "DEBUG"})
+        self._log(f"Initializing with random seed: {config.random_seed}", "DEBUG")
 
         random.seed(config.random_seed)
         np.random.seed(config.random_seed)
@@ -86,16 +90,14 @@ class Runtime:
         # Load model weights using ModelLoader
         loader = ModelLoader(config, log_queue=log_queue)
 
-        msg = "Loading model weights"
-        self.log_queue.put({"message": msg, "level": "DEBUG"})
+        self._log("Loading model weights", "DEBUG")
 
         weights, normalized_arch, self.info = loader.load()
 
         # Store snapshot_dir for tokenizer loading
         self.snapshot_dir = loader.snapshot_dir
 
-        msg = "Loaded model weights"
-        self.log_queue.put({"message": msg, "level": "DEBUG"})
+        self._log("Loaded model weights", "DEBUG")
 
         # Store architecture type
         self.type = self.info["architecture"]["type"]

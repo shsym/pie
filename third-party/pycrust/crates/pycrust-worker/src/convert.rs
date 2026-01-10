@@ -6,7 +6,7 @@ use pythonize::{depythonize, pythonize};
 /// Convert MessagePack bytes to a Python object.
 ///
 /// Uses rmpv for MessagePack deserialization and pythonize for conversion to Python.
-pub fn msgpack_to_pyobject(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
+pub fn msgpack_to_pyobject(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyAny>> {
     // First deserialize MessagePack to rmpv::Value
     // We use rmp_serde::from_slice directly to Value which implements Serialize,
     // allowing us to pipe it straight into pythonize.

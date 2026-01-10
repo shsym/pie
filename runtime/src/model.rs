@@ -1,8 +1,13 @@
 pub mod actor;
+pub mod batching;
+pub mod ffi_bridge;
+pub mod ffi_queue;
 pub mod request;
 pub mod resource;
 pub mod tokenizer;
 
+use super::model::batching::{AdaptiveScheduler, SharedScheduler};
+use super::model::ffi_bridge::AsyncFfiClient;
 use super::model::request::{
     BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassRequest, ForwardPassResponse,
     HandshakeRequest, HandshakeResponse, QueryRequest, QueryResponse, Request,
@@ -16,6 +21,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures::future;
 use pycrust_client::RpcClient;
+use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -23,256 +29,68 @@ use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{self, JoinHandle};
 
-// =============================================================================
-// Adaptive Batch Scheduling Components
-// =============================================================================
+// Re-export SchedulerConfig for public API
+pub use batching::SchedulerConfig;
 
-/// Configuration for adaptive batch scheduling.
-#[derive(Debug, Clone)]
-pub struct SchedulerConfig {
-    /// EMA decay factor for arrival rate estimation (0 < alpha < 1).
-    /// Higher values weight recent observations more heavily.
-    pub arrival_rate_ema_alpha: f64,
-    /// EMA decay factor for latency estimation.
-    pub latency_ema_alpha: f64,
-    /// Minimum batch size before considering throughput optimization.
-    pub min_batch_for_optimization: usize,
-    /// Maximum wait time before forcing a batch fire (safety limit).
-    pub max_wait_time: Duration,
+/// Backend abstraction for RPC calls to Python.
+/// Supports both IPC (iceoryx2) and FFI (direct calls) modes.
+#[derive(Clone)]
+pub enum RpcBackend {
+    /// IPC mode using pycrust-client (iceoryx2 shared memory)
+    Ipc(Arc<RpcClient>),
+    /// FFI mode using direct Python calls
+    Ffi(AsyncFfiClient),
 }
 
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            arrival_rate_ema_alpha: 0.3,
-            latency_ema_alpha: 0.2,
-            min_batch_for_optimization: 8,
-            max_wait_time: Duration::from_millis(50),
-        }
-    }
-}
-
-/// EMA-based arrival rate estimator modeling request arrivals as Poisson process.
-struct ArrivalRateEstimator {
-    /// Last request arrival time.
-    last_arrival: Option<Instant>,
-    /// EMA of inter-arrival time (seconds).
-    ema_inter_arrival: f64,
-    /// EMA alpha factor.
-    alpha: f64,
-}
-
-impl ArrivalRateEstimator {
-    fn new(alpha: f64) -> Self {
-        Self {
-            last_arrival: None,
-            ema_inter_arrival: 0.0,
-            alpha,
+impl RpcBackend {
+    /// Call a remote method with typed arguments and return value.
+    pub async fn call<T, R>(&self, method: &str, args: &T) -> Result<R>
+    where
+        T: Serialize + Send + Sync + Clone + 'static,
+        R: DeserializeOwned + Send + 'static,
+    {
+        match self {
+            RpcBackend::Ipc(client) => client
+                .call(method, args)
+                .await
+                .map_err(|e| anyhow::anyhow!("IPC call failed: {}", e)),
+            RpcBackend::Ffi(client) => client.call(method, args).await,
         }
     }
 
-    /// Record a new request arrival and update the EMA.
-    fn record_arrival(&mut self) {
-        let now = Instant::now();
-        if let Some(last) = self.last_arrival {
-            let delta = now.duration_since(last).as_secs_f64();
-            if self.ema_inter_arrival == 0.0 {
-                self.ema_inter_arrival = delta;
-            } else {
-                self.ema_inter_arrival =
-                    self.alpha * delta + (1.0 - self.alpha) * self.ema_inter_arrival;
-            }
-        }
-        self.last_arrival = Some(now);
-    }
-
-    /// Get estimated arrival rate (requests per second).
-    /// Returns None if insufficient data.
-    fn arrival_rate(&self) -> Option<f64> {
-        if self.ema_inter_arrival > 0.0 {
-            Some(1.0 / self.ema_inter_arrival)
-        } else {
-            None
-        }
-    }
-
-    /// Estimate expected wait time for next request (1/λ).
-    fn expected_wait_time(&self) -> Option<Duration> {
-        self.arrival_rate()
-            .map(|rate| Duration::from_secs_f64(1.0 / rate))
-    }
-}
-
-/// Table-based latency model with leaky ReLU-like interpolation.
-/// Maps batch_size -> latency_seconds.
-struct LatencyModel {
-    /// Latency table: index is batch_size, value is EMA latency.
-    table: Vec<f64>,
-    /// EMA alpha for updating latency estimates.
-    alpha: f64,
-    /// Base latency (constant overhead).
-    base_latency: f64,
-    /// Per-token latency coefficient.
-    per_token_latency: f64,
-}
-
-impl LatencyModel {
-    fn new(alpha: f64, max_batch_size: usize) -> Self {
-        Self {
-            table: vec![0.0; max_batch_size + 1],
-            alpha,
-            base_latency: 0.01,       // 10ms base overhead
-            per_token_latency: 0.001, // 1ms per token (initial estimate)
-        }
-    }
-
-    /// Record an observed latency for a batch.
-    fn record_latency(&mut self, batch_size: usize, total_tokens: usize, latency: Duration) {
-        let latency_secs = latency.as_secs_f64();
-
-        // Update table entry with EMA
-        if batch_size < self.table.len() {
-            if self.table[batch_size] == 0.0 {
-                self.table[batch_size] = latency_secs;
-            } else {
-                self.table[batch_size] =
-                    self.alpha * latency_secs + (1.0 - self.alpha) * self.table[batch_size];
-            }
-        }
-
-        // Also update linear model coefficients (simple online update)
-        // This helps with interpolation for unseen batch sizes
-        if total_tokens > 0 && latency_secs > 0.0 {
-            // Estimate per_token_latency: (latency - base) / tokens
-            let estimated_per_token = (latency_secs - self.base_latency).max(0.0) / total_tokens as f64;
-            self.per_token_latency =
-                self.alpha * estimated_per_token + (1.0 - self.alpha) * self.per_token_latency;
-        }
-    }
-
-    /// Estimate latency for a given batch size and total tokens.
-    /// Uses table lookup if available, otherwise linear interpolation.
-    fn estimate_latency(&self, batch_size: usize, total_tokens: usize) -> f64 {
-        // First try exact table lookup
-        if batch_size < self.table.len() && self.table[batch_size] > 0.0 {
-            return self.table[batch_size];
-        }
-
-        // Fallback: leaky ReLU-like linear model
-        // latency = base + per_token * tokens (with floor at base)
-        (self.base_latency + self.per_token_latency * total_tokens as f64).max(self.base_latency)
-    }
-}
-
-/// Adaptive scheduler that decides when to fire batches.
-struct AdaptiveScheduler {
-    arrival_estimator: ArrivalRateEstimator,
-    latency_model: LatencyModel,
-    config: SchedulerConfig,
-    /// Time when current batch started accumulating.
-    batch_start_time: Option<Instant>,
-}
-
-impl AdaptiveScheduler {
-    fn new(config: SchedulerConfig, max_batch_size: usize) -> Self {
-        Self {
-            arrival_estimator: ArrivalRateEstimator::new(config.arrival_rate_ema_alpha),
-            latency_model: LatencyModel::new(config.latency_ema_alpha, max_batch_size),
-            config,
-            batch_start_time: None,
-        }
-    }
-
-    /// Record a request arrival.
-    fn on_request_arrival(&mut self) {
-        self.arrival_estimator.record_arrival();
-        if self.batch_start_time.is_none() {
-            self.batch_start_time = Some(Instant::now());
-        }
-    }
-
-    /// Record completed batch latency.
-    fn on_batch_complete(&mut self, batch_size: usize, total_tokens: usize, latency: Duration) {
-        self.latency_model.record_latency(batch_size, total_tokens, latency);
-    }
-
-    /// Reset batch timing after firing.
-    fn on_batch_fired(&mut self) {
-        self.batch_start_time = None;
-    }
-
-    /// Decide whether to fire now or wait for more requests.
-    /// Returns true if we should fire immediately.
-    ///
-    /// Optimizes for throughput: throughput = batch_size / latency
-    /// Uses arrival rate estimation to predict if waiting will improve throughput.
-    fn should_fire(
+    /// Call with timeout.
+    pub async fn call_with_timeout<T, R>(
         &self,
-        current_batch_size: usize,
-        current_total_tokens: usize,
-        max_batch_size: usize,
-        max_batch_tokens: usize,
-        in_flight_batches: usize,
-    ) -> bool {
-        // Always fire if at capacity
-        if current_batch_size >= max_batch_size || current_total_tokens >= max_batch_tokens {
-            return true;
+        method: &str,
+        args: &T,
+        timeout: Duration,
+    ) -> Result<R>
+    where
+        T: Serialize + Send + Sync + Clone + 'static,
+        R: DeserializeOwned + Send + 'static,
+    {
+        match self {
+            RpcBackend::Ipc(client) => client
+                .call_with_timeout(method, args, timeout)
+                .await
+                .map_err(|e| anyhow::anyhow!("IPC call failed: {}", e)),
+            RpcBackend::Ffi(client) => client.call_with_timeout(method, args, timeout).await,
         }
+    }
 
-        // Safety: fire if we've waited too long
-        if let Some(start) = self.batch_start_time {
-            if start.elapsed() >= self.config.max_wait_time {
-                return true;
-            }
+    /// Fire-and-forget notification.
+    pub async fn notify<T>(&self, method: &str, args: &T) -> Result<()>
+    where
+        T: Serialize + Send + Sync + Clone + 'static,
+    {
+        match self {
+            RpcBackend::Ipc(client) => client
+                .notify(method, args)
+                .map_err(|e| anyhow::anyhow!("IPC notify failed: {}", e)),
+            RpcBackend::Ffi(client) => client.notify(method, args).await,
         }
-
-        // If no batches are in flight, we should fire to keep GPU busy
-        // (pipeline is empty - need to start it)
-        if in_flight_batches == 0 {
-            return true;
-        }
-
-        // Skip optimization for small batches when pipeline is full
-        if current_batch_size < self.config.min_batch_for_optimization {
-            // But don't fire if we have batches in flight - wait for more requests
-            return false;
-        }
-
-        // Throughput optimization: compare firing now vs waiting for one more request
-        // Current throughput if we fire now: batch_size / estimated_latency
-        let current_latency = self.latency_model.estimate_latency(current_batch_size, current_total_tokens);
-        let current_throughput = current_batch_size as f64 / current_latency;
-
-        // Expected throughput if we wait for one more request:
-        // (batch_size + 1) / (estimated_latency + expected_wait_time)
-        if let Some(expected_wait) = self.arrival_estimator.expected_wait_time() {
-            let wait_secs = expected_wait.as_secs_f64();
-            // Estimate tokens for next request (use average: total_tokens / batch_size)
-            let avg_tokens_per_request = if current_batch_size > 0 {
-                current_total_tokens as f64 / current_batch_size as f64
-            } else {
-                1.0
-            };
-            let future_tokens = current_total_tokens + avg_tokens_per_request as usize;
-            let future_latency = self.latency_model.estimate_latency(current_batch_size + 1, future_tokens);
-            let future_throughput = (current_batch_size + 1) as f64 / (future_latency + wait_secs);
-
-            // Fire if waiting would decrease throughput
-            if current_throughput >= future_throughput {
-                return true;
-            }
-        } else {
-            // No arrival rate data yet - be conservative and fire
-            return true;
-        }
-
-        // Wait for more requests
-        false
     }
 }
-
-/// Shared scheduler state wrapped in Arc<Mutex> for thread-safe access.
-type SharedScheduler = Arc<Mutex<AdaptiveScheduler>>;
 
 pub type HandlerId = u32;
 pub type CmdQueueId = u32;
@@ -499,7 +317,7 @@ pub struct Model {
     info: ModelInfo,
     resource_manager: ResourceManager,
     shutdown_tx: broadcast::Sender<()>,
-    rpc_client: Arc<RpcClient>,
+    backend: RpcBackend,
     /// Batch limits from handshake
     max_batch_tokens: usize,
     max_batch_size: usize,
@@ -511,6 +329,11 @@ pub struct Model {
 }
 
 impl Model {
+    /// Get the model name.
+    pub fn name(&self) -> &str {
+        &self.info.name
+    }
+
     pub async fn new(service_name: &str) -> Result<Self> {
         Self::new_with_config(service_name, SchedulerConfig::default()).await
     }
@@ -521,8 +344,23 @@ impl Model {
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to connect to pycrust service: {}", e))?,
         );
+        let backend = RpcBackend::Ipc(rpc_client);
+        Self::new_with_backend(backend, scheduler_config).await
+    }
 
-        let handshake_info = Self::handshake(&rpc_client).await?;
+    /// Create a new Model with an FFI backend using a queue.
+    ///
+    /// The queue should be shared with Python which polls it for requests.
+    /// FfiQueue uses internal Arc so cloning shares state.
+    pub async fn new_with_ffi(queue: ffi_queue::FfiQueue, scheduler_config: SchedulerConfig) -> Result<Self> {
+        let ffi_client = AsyncFfiClient::new_with_queue(queue);
+        let backend = RpcBackend::Ffi(ffi_client);
+        Self::new_with_backend(backend, scheduler_config).await
+    }
+
+    /// Internal constructor that works with any backend.
+    async fn new_with_backend(backend: RpcBackend, scheduler_config: SchedulerConfig) -> Result<Self> {
+        let handshake_info = Self::handshake(&backend).await?;
 
         let (forward_pass_tx, forward_pass_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
@@ -537,12 +375,13 @@ impl Model {
         )));
 
         let worker_handle = tokio::spawn(Self::inference_worker(
-            Arc::clone(&rpc_client),
+            backend.clone(),
             forward_pass_rx,
             shutdown_rx,
             max_batch_tokens,
             max_batch_size,
             Arc::clone(&scheduler),
+            scheduler_config.max_in_flight_batches,
         ));
 
         let tokenizer = Arc::new(BytePairEncoder::new(
@@ -570,7 +409,7 @@ impl Model {
         Ok(Model {
             info,
             resource_manager,
-            rpc_client,
+            backend,
             max_batch_tokens,
             max_batch_size,
             forward_pass_tx,
@@ -580,13 +419,12 @@ impl Model {
         })
     }
 
-    async fn handshake(rpc_client: &RpcClient) -> Result<HandshakeResponse> {
+    async fn handshake(backend: &RpcBackend) -> Result<HandshakeResponse> {
         const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
         let req = HandshakeRequest { version: "0.1.0".to_string() };
-        let response: HandshakeResponse = rpc_client
+        let response: HandshakeResponse = backend
             .call_with_timeout("handshake", &req, HANDSHAKE_TIMEOUT)
-            .await
-            .map_err(|e| anyhow::anyhow!("Handshake failed: {}", e))?;
+            .await?;
         Ok(response)
     }
 
@@ -606,16 +444,16 @@ impl Model {
     /// - Scheduler tracks arrival rate and latency to make optimal decisions
     /// - Overlaps batch accumulation with GPU inference for maximum utilization
     async fn inference_worker(
-        rpc_client: Arc<RpcClient>,
+        backend: RpcBackend,
         mut req_rx: mpsc::UnboundedReceiver<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>,
         mut shutdown_rx: broadcast::Receiver<()>,
         max_batch_tokens: usize,
         max_batch_size: usize,
         scheduler: SharedScheduler,
+        max_in_flight_batches: usize,
     ) {
         const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
         const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_millis(1);
-        const MAX_IN_FLIGHT_BATCHES: usize = 3; // Limit concurrent batches to avoid memory pressure
 
         let mut batch: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)> = Vec::new();
         let mut total_tokens = 0usize;
@@ -647,7 +485,8 @@ impl Model {
                 // Record arrival and add to batch
                 {
                     let mut sched = scheduler.lock().unwrap();
-                    sched.on_request_arrival();
+                    let arrival_time = first_request.0.arrival_time.unwrap_or_else(Instant::now);
+                    sched.on_request_arrival(arrival_time);
                 }
                 total_tokens = first_request.0.input_tokens.len();
                 batch.push(first_request);
@@ -659,7 +498,8 @@ impl Model {
                     Ok(req) => {
                         {
                             let mut sched = scheduler.lock().unwrap();
-                            sched.on_request_arrival();
+                            let arrival_time = req.0.arrival_time.unwrap_or_else(Instant::now);
+                            sched.on_request_arrival(arrival_time);
                         }
                         total_tokens += req.0.input_tokens.len();
                         batch.push(req);
@@ -682,7 +522,7 @@ impl Model {
             };
 
             // Also check if we're at in-flight limit - if so, must wait for completion
-            if should_fire && in_flight < MAX_IN_FLIGHT_BATCHES {
+            if should_fire && in_flight < max_in_flight_batches {
                 // Fire the batch concurrently (non-blocking)
                 let batch_to_fire = std::mem::take(&mut batch);
                 let batch_size = batch_to_fire.len();
@@ -697,16 +537,16 @@ impl Model {
                 in_flight_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 // Spawn batch execution as a background task (concurrent pipelining)
-                let rpc_client_clone = Arc::clone(&rpc_client);
+                let backend_clone = backend.clone();
                 let completion_tx_clone = completion_tx.clone();
                 tokio::spawn(async move {
                     let start_time = Instant::now();
-                    Self::execute_forward_pass_batch(&rpc_client_clone, batch_to_fire, REQUEST_TIMEOUT).await;
+                    Self::execute_forward_pass_batch(&backend_clone, batch_to_fire, REQUEST_TIMEOUT).await;
                     let latency = start_time.elapsed();
                     // Report completion for scheduler feedback
                     completion_tx_clone.send((batch_size, tokens_in_batch, latency)).ok();
                 });
-            } else if in_flight >= MAX_IN_FLIGHT_BATCHES {
+            } else if in_flight >= max_in_flight_batches {
                 // At in-flight limit - wait for a batch to complete before continuing
                 tokio::select! {
                     _ = shutdown_rx.recv() => break,
@@ -728,7 +568,8 @@ impl Model {
                             Some(req) => {
                                 {
                                     let mut sched = scheduler.lock().unwrap();
-                                    sched.on_request_arrival();
+                                    let arrival_time = req.0.arrival_time.unwrap_or_else(Instant::now);
+                                    sched.on_request_arrival(arrival_time);
                                 }
                                 total_tokens += req.0.input_tokens.len();
                                 batch.push(req);
@@ -742,7 +583,7 @@ impl Model {
 
         // On shutdown, fire any remaining batch and wait for in-flight batches
         if !batch.is_empty() {
-            Self::execute_forward_pass_batch(&rpc_client, batch, REQUEST_TIMEOUT).await;
+            Self::execute_forward_pass_batch(&backend, batch, REQUEST_TIMEOUT).await;
         }
 
         // Wait for all in-flight batches to complete
@@ -757,7 +598,7 @@ impl Model {
 
     /// Execute a batch of forward pass requests via fire_batch RPC
     async fn execute_forward_pass_batch(
-        rpc_client: &RpcClient,
+        backend: &RpcBackend,
         requests: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>,
         timeout: Duration,
     ) {
@@ -766,7 +607,7 @@ impl Model {
             batch_req.add_request(fp_req);
         }
 
-        let result: Result<BatchedForwardPassResponse, _> = rpc_client
+        let result: Result<BatchedForwardPassResponse, _> = backend
             .call_with_timeout("fire_batch", &batch_req, timeout)
             .await;
 
@@ -788,62 +629,65 @@ impl Model {
     }
 
     /// Execute eager RPC calls (non-batched)
-    async fn execute_query(rpc_client: &RpcClient, req: QueryRequest) -> Option<QueryResponse> {
+    async fn execute_query(backend: &RpcBackend, req: QueryRequest) -> Option<QueryResponse> {
         const TIMEOUT: Duration = Duration::from_secs(30);
-        rpc_client.call_with_timeout("query", &req, TIMEOUT).await.ok()
+        backend.call_with_timeout("query", &req, TIMEOUT).await.ok()
     }
 
     pub fn submit(&self, _cmd_queue_id: CmdQueueId, _priority: u32, req: Request) {
         match req {
-            Request::ForwardPass(fp_req, resp_tx) => {
+            Request::ForwardPass(mut fp_req, resp_tx) => {
+                // Capture arrival time before queuing to avoid measurement distortion
+                // when requests pile up behind the in-flight limit.
+                fp_req.arrival_time = Some(Instant::now());
                 if self.forward_pass_tx.send((fp_req, resp_tx)).is_err() {
                     eprintln!("[Error] Forward pass channel closed");
                 }
             }
             Request::Query(query_req, resp_tx) => {
-                let rpc_client = Arc::clone(&self.rpc_client);
+                let backend_clone = self.backend.clone();
                 tokio::spawn(async move {
-                    if let Some(resp) = Self::execute_query(&rpc_client, query_req).await {
+                    if let Some(resp) = Self::execute_query(&backend_clone, query_req).await {
                         resp_tx.send(resp).ok();
                     }
                 });
             }
             Request::EmbedImage(req) => {
-                let rpc_client = Arc::clone(&self.rpc_client);
+                let backend = self.backend.clone();
                 tokio::spawn(async move {
-                    let _: Result<(), _> = rpc_client
-                        .call_with_timeout("embed_image", &req, Duration::from_secs(60))
-                        .await;
+                    if let Err(e) = backend.notify("embed_image", &req).await {
+                        eprintln!("[Error] embed_image failed: {:?}", e);
+                    }
                 });
             }
             Request::InitializeAdapter(req) => {
-                let rpc_client = Arc::clone(&self.rpc_client);
+                let backend = self.backend.clone();
                 tokio::spawn(async move {
-                    let _: Result<(), _> = rpc_client
-                        .call_with_timeout("initialize_adapter", &req, Duration::from_secs(60))
-                        .await;
+                    if let Err(e) = backend.notify("initialize_adapter", &req).await {
+                        eprintln!("[Error] initialize_adapter failed: {:?}", e);
+                    }
                 });
             }
             Request::UpdateAdapter(req) => {
-                let rpc_client = Arc::clone(&self.rpc_client);
+                let backend = self.backend.clone();
                 tokio::spawn(async move {
-                    let _: Result<(), _> = rpc_client
-                        .call_with_timeout("update_adapter", &req, Duration::from_secs(60))
-                        .await;
+                    if let Err(e) = backend.notify("update_adapter", &req).await {
+                        eprintln!("[Error] update_adapter failed: {:?}", e);
+                    }
                 });
             }
             Request::UploadAdapter(req) => {
-                let rpc_client = Arc::clone(&self.rpc_client);
+                let backend = self.backend.clone();
                 tokio::spawn(async move {
-                    let _: Result<(), _> = rpc_client
-                        .call_with_timeout("upload_adapter", &req, Duration::from_secs(60))
-                        .await;
+                    if let Err(e) = backend.notify("upload_adapter", &req).await {
+                        eprintln!("[Error] upload_adapter failed: {:?}", e);
+                    }
                 });
             }
             Request::DownloadAdapter(req, resp_tx) => {
-                let rpc_client = Arc::clone(&self.rpc_client);
+                let backend = self.backend.clone();
                 tokio::spawn(async move {
-                    let result: Result<Vec<u8>, _> = rpc_client
+                    let result: Result<Vec<u8>, _> = backend
                         .call_with_timeout("download_adapter", &req, Duration::from_secs(60))
                         .await;
                     if let Ok(data) = result {

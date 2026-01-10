@@ -29,6 +29,7 @@ def start_engine_and_backend(
     console: Optional[Any] = None,
     on_status: Optional[callable] = None,
     on_message: Optional[callable] = None,
+    use_ffi: bool = True,  # FFI mode: ~15x lower latency, in-process Python
 ) -> tuple["pie_rs.ServerHandle", list]:
     """Start the Pie engine and all configured backend services.
 
@@ -39,9 +40,11 @@ def start_engine_and_backend(
         console: Optional rich.console.Console for output
         on_status: Optional callback for status updates: (status_message: str) -> None
         on_message: Optional callback for log messages: (level: str, message: str) -> None
+        use_ffi: If True (default), use direct FFI calls for ~15x lower latency.
+                 If False, use IPC via multiprocessing (legacy mode with process isolation).
 
     Returns:
-        Tuple of (ServerHandle, list of backend processes)
+        Tuple of (ServerHandle, list of backend processes/runtimes)
 
     Raises:
         EngineError: If engine or backend fails to start
@@ -79,68 +82,187 @@ def start_engine_and_backend(
         registry=engine_config.get("registry", "https://registry.pie-project.org/"),
     )
 
-    # Start the engine - returns a ServerHandle
-    server_handle = pie_rs.start_server(server_config, authorized_users_path)
+    if use_ffi:
+        # =================================================================
+        # FFI MODE: Queue-based communication for high throughput
+        # Uses lock-free Rust queue polled by Python worker thread
+        # =================================================================
 
-    # Count expected backends
-    expected_backends = 0
+        if console is not None:
+            console.print("[dim]Starting engine (FFI mode)...[/dim]")
 
-    # Create log queue for backend communication
-    manager_obj = multiprocessing.Manager()
-    log_queue = manager_obj.Queue()
-
-    # Launch backend processes
-    backend_processes: list = []
-
-    # Start log monitor thread if console available
-    if console is not None:
-        import threading
-
-        log_monitor_thread = threading.Thread(
-            target=backend_log_monitor, args=(log_queue, console), daemon=True
-        )
-        log_monitor_thread.start()
-
-    # Print initial status (progress bar will provide loading feedback)
-    if console is not None:
-        console.print("[dim]Starting engine...[/dim]")
-
-    try:
-        for model_config in model_configs:
-            status_update("Spawning backend (pie-backend)...")
-            try:
-                process = spawn_python_backend(
-                    engine_config, model_config, server_handle.internal_token, log_queue
+        try:
+            # In FFI mode, we process each model config and create a combined server
+            # For now, we support single-model FFI mode
+            if len(model_configs) > 1:
+                raise EngineError(
+                    "FFI mode currently supports only single-model configurations"
                 )
-                backend_processes.append(process)
-                expected_backends += 1
-            except Exception as e:
-                for p in backend_processes:
-                    p.kill()
-                server_handle.shutdown()
-                raise EngineError(f"Failed to spawn backend: {e}") from e
 
-        # Wait for backends to register with the engine
-        if expected_backends > 0:
-            status_update(f"Waiting for {expected_backends} backend(s) to connect...")
-            if not wait_for_backends(
-                server_handle, expected_backends, timeout, backend_processes
-            ):
-                # Force kill backends immediately on failure (faster cleanup)
-                for p in backend_processes:
-                    p.kill()
-                server_handle.shutdown()
-                raise EngineError("Timeout waiting for backends to connect")
-    except Exception:
-        raise
+            model_config = model_configs[0]
+            status_update("Initializing backend in-process (FFI)...")
 
-    # Final success message
-    if console is not None:
-        console.print(
-            "[green]✓[/green] Engine running. [dim]Press Ctrl+C to stop[/dim]"
-        )
+            # Build the full config for pie_backend
+            full_config = _build_backend_config(
+                engine_config, model_config, authorized_users_path
+            )
 
-    return server_handle, backend_processes
+            # Initialize Python backend - returns Runtime
+            from pie_backend.server import start_ffi_worker
+
+            runtime = pie_rs.initialize_backend(full_config)
+
+            # Create the FfiQueue FIRST via Python
+            ffi_queue = pie_rs.FfiQueue()
+
+            # Start the Python worker thread BEFORE starting server
+            # This allows the worker to respond to handshake during Model::new_with_ffi
+            _ffi_worker = start_ffi_worker(ffi_queue, runtime)
+
+            # Now start server with FFI mode - the worker is ready to handle requests
+            server_handle = pie_rs.start_server_with_ffi(
+                server_config,
+                authorized_users_path,
+                ffi_queue,  # Pass the queue created by Python
+            )
+
+        except Exception as e:
+            raise EngineError(f"Failed to initialize FFI backend: {e}") from e
+
+        # Final success message
+        if console is not None:
+            console.print(
+                "[green]✓[/green] Engine running (FFI mode). [dim]Press Ctrl+C to stop[/dim]"
+            )
+
+        # In FFI mode, we return an empty list for backend_processes (no separate processes)
+        return server_handle, []
+
+    else:
+        # =================================================================
+        # IPC MODE: Legacy multiprocessing with process isolation
+        # =================================================================
+
+        # Start the engine first - returns a ServerHandle
+        server_handle = pie_rs.start_server(server_config, authorized_users_path)
+
+        # Count expected backends
+        expected_backends = 0
+
+        # Create log queue for backend communication
+        manager_obj = multiprocessing.Manager()
+        log_queue = manager_obj.Queue()
+
+        # Launch backend processes
+        backend_processes: list = []
+
+        # Start log monitor thread if console available
+        if console is not None:
+            import threading
+
+            log_monitor_thread = threading.Thread(
+                target=backend_log_monitor, args=(log_queue, console), daemon=True
+            )
+            log_monitor_thread.start()
+
+        # Print initial status (progress bar will provide loading feedback)
+        if console is not None:
+            console.print("[dim]Starting engine (IPC mode)...[/dim]")
+
+        try:
+            for model_config in model_configs:
+                status_update("Spawning backend (pie-backend)...")
+                try:
+                    process = spawn_python_backend(
+                        engine_config,
+                        model_config,
+                        server_handle.internal_token,
+                        log_queue,
+                    )
+                    backend_processes.append(process)
+                    expected_backends += 1
+                except Exception as e:
+                    for p in backend_processes:
+                        p.kill()
+                    server_handle.shutdown()
+                    raise EngineError(f"Failed to spawn backend: {e}") from e
+
+            # Wait for backends to register with the engine
+            if expected_backends > 0:
+                status_update(
+                    f"Waiting for {expected_backends} backend(s) to connect..."
+                )
+                if not wait_for_backends(
+                    server_handle, expected_backends, timeout, backend_processes
+                ):
+                    # Force kill backends immediately on failure (faster cleanup)
+                    for p in backend_processes:
+                        p.kill()
+                    server_handle.shutdown()
+                    raise EngineError("Timeout waiting for backends to connect")
+        except Exception:
+            raise
+
+        # Final success message
+        if console is not None:
+            console.print(
+                "[green]✓[/green] Engine running (IPC mode). [dim]Press Ctrl+C to stop[/dim]"
+            )
+
+        return server_handle, backend_processes
+
+
+def _build_backend_config(
+    engine_config: dict, model_config: dict, internal_token: str
+) -> dict:
+    """Build the configuration dict for RuntimeConfig.from_args().
+
+    Args:
+        engine_config: Engine configuration dict (host, port) - not used for RuntimeConfig
+        model_config: Model configuration dict
+        internal_token: Internal authentication token - not used for RuntimeConfig
+
+    Returns:
+        Configuration dict suitable for RuntimeConfig.from_args(**kwargs)
+    """
+    # Note: host, port, internal_auth_token are for pycrust server registration,
+    # not RuntimeConfig. They're excluded here because in FFI mode we don't
+    # need to register with the engine - we call Python directly.
+
+    # Handle device field - can be string or list
+    # RuntimeConfig.from_args expects: device (str) OR devices (list[str])
+    device_value = model_config.get("device")
+    device_key = None
+    if device_value is not None:
+        if isinstance(device_value, list):
+            device_key = "devices"
+        else:
+            device_key = "device"
+
+    config = {
+        "hf_repo": model_config.get("hf_repo"),
+        "cache_dir": model_config.get("cache_dir"),
+        "kv_page_size": model_config.get("kv_page_size", 16),
+        "max_dist_size": model_config.get("max_dist_size", 64),
+        "max_num_embeds": model_config.get("max_num_embeds", 128),
+        "max_batch_tokens": model_config.get("max_batch_tokens", 10240),
+        "max_num_adapters": model_config.get("max_num_adapters", 48),
+        "max_adapter_rank": model_config.get("max_adapter_rank", 8),
+        "gpu_mem_utilization": model_config.get("gpu_mem_utilization", 0.9),
+        "max_batch_size": model_config.get("max_batch_size", 128),
+        "activation_dtype": model_config.get("activation_dtype", "bfloat16"),
+        "weight_dtype": model_config.get("weight_dtype"),
+        "enable_profiling": model_config.get("enable_profiling", False),
+        "random_seed": model_config.get("random_seed", 42),
+        "use_cuda_graphs": model_config.get("use_cuda_graphs", True),
+    }
+
+    # Add device with correct key
+    if device_key is not None:
+        config[device_key] = device_value
+
+    # Remove None values to use from_args() defaults
+    return {k: v for k, v in config.items() if v is not None}
 
 
 def spawn_python_backend(
@@ -350,6 +472,11 @@ def check_backend_processes(
     """
     all_alive = True
     for process in backend_processes:
+        # In FFI mode, backend_processes may contain dispatcher functions (not processes)
+        # Skip anything that's not a process
+        if not hasattr(process, "pid") or not hasattr(process, "is_alive"):
+            continue
+
         is_dead = False
         return_code = None
         stderr = ""
@@ -397,6 +524,11 @@ def terminate_engine_and_backend(
             on_message(msg)
 
     for process in backend_processes:
+        # In FFI mode, backend_processes may contain dispatcher functions (not processes)
+        # Skip anything that's not a process
+        if not hasattr(process, "pid"):
+            continue
+
         is_running = False
         pid = process.pid
 

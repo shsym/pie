@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Instant;
 use tokio::sync::oneshot;
 
 pub static HANDSHAKE_ID: u32 = 0;
@@ -113,7 +114,7 @@ impl Request {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeRequest {
     pub version: String,
 }
@@ -138,7 +139,7 @@ pub struct HandshakeResponse {
     pub tokenizer_escape_non_printable: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRequest {
     pub query: String,
 }
@@ -164,6 +165,9 @@ pub struct ForwardPassRequest {
     pub output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     pub output_embed_ptrs: Vec<u32>,
     pub output_embed_indices: Vec<u32>,
+    /// Arrival time for scheduler estimation (not serialized).
+    #[serde(skip)]
+    pub arrival_time: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,14 +176,14 @@ pub struct ForwardPassResponse {
     pub dists: Vec<(Vec<u32>, Vec<f32>)>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbedImageRequest {
     pub embed_ptrs: Vec<u32>,
     pub image_blob: Vec<u8>,
     pub position_offset: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializeAdapterRequest {
     pub adapter_ptr: u32,
     pub rank: u32,
@@ -189,21 +193,21 @@ pub struct InitializeAdapterRequest {
     pub initial_sigma: f32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateAdapterRequest {
     pub adapter_ptr: u32,
     pub scores: Vec<f32>,
     pub seeds: Vec<i64>,
     pub max_sigma: f32,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadAdapterRequest {
     pub adapter_ptr: u32,
     pub name: String,
     pub adapter_data: Vec<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadAdapterRequest {
     pub adapter_ptr: u32,
     pub name: String,

@@ -28,6 +28,9 @@ pub enum RpcError {
 
     #[error("Service not available: {0}")]
     ServiceNotAvailable(String),
+
+    #[error("Protocol error: {0}")]
+    ProtocolError(String),
 }
 
 /// Result type alias for RPC operations.

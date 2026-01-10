@@ -456,6 +456,32 @@ async fn benchmark_concurrent_correctness(
     println!("  PASSED");
 }
 
+async fn benchmark_notify(client: &RpcClient, iterations: usize) -> BenchmarkResult {
+    let mut latencies = Vec::with_capacity(iterations);
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let call_start = Instant::now();
+        client.notify("noop", &Empty {}).unwrap();
+        latencies.push(call_start.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+    let total_time = start.elapsed();
+
+    let (mean, median, p99, min, max) = calculate_stats(&mut latencies);
+
+    BenchmarkResult {
+        name: "notify (fire-and-forget)".to_string(),
+        iterations,
+        total_time_ms: total_time.as_secs_f64() * 1000.0,
+        mean_latency_us: mean,
+        median_latency_us: median,
+        p99_latency_us: p99,
+        min_latency_us: min,
+        max_latency_us: max,
+        throughput_ops_sec: iterations as f64 / total_time.as_secs_f64(),
+    }
+}
+
 // ==============================================================================
 // Main Benchmark Runner
 // ==============================================================================
@@ -467,7 +493,7 @@ async fn main() -> anyhow::Result<()> {
     println!("============================================================");
     println!("\nConnecting to benchmark service...");
 
-    let client = std::sync::Arc::new(RpcClient::connect("benchmark_v4").await?);
+    let client = std::sync::Arc::new(RpcClient::connect("benchmark_v5").await?);
 
     // Verify connection with handshake
     let handshake: HandshakeResponse = client
@@ -490,6 +516,9 @@ async fn main() -> anyhow::Result<()> {
     let iterations = 10000;
 
     let result = benchmark_noop(&client, iterations).await;
+    print_result(&result);
+
+    let result = benchmark_notify(&client, iterations).await;
     print_result(&result);
 
     let result = benchmark_add(&client, iterations).await;
@@ -548,12 +577,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Run final measurements for summary
     let noop_result = benchmark_noop(&client, 1000).await;
+    let notify_result = benchmark_notify(&client, 1000).await;
     let add_result = benchmark_add(&client, 1000).await;
     
     // Quick re-run of max concurrency for summary
     let concurrent_result = benchmark_concurrent_throughput(&client, 32, 1.0).await;
 
     println!("\n  Baseline (noop) median latency:  {:.2} us", noop_result.median_latency_us);
+    println!("  Notify (fire-forget) latency:    {:.2} us (client side only)", notify_result.median_latency_us);
     println!("  Simple call median latency:      {:.2} us", add_result.median_latency_us);
     println!("  Max Concurrent Throughput:       {:.0} ops/sec", concurrent_result.throughput_ops_sec);
 
@@ -561,17 +592,6 @@ async fn main() -> anyhow::Result<()> {
     println!(" Benchmark Complete");
     println!("============================================================\n");
 
-    // Arc doesn't have a close method we can call directly since it wraps the inner value.
-    // But RpcClient takes &self for close? No, it takes self.
-    // We can't move out of Arc.
-    // However, we can just drop the Arc. The RpcClient doesn't strictly need explicit close
-    // if the Drop trait handles it or if we don't care about clean shutdown on the very last step.
-    // Let's check RpcClient::close signature.
-    // It is `pub async fn close(mut self)`.
-    // Since we wrapped it in Arc, we can't call a method that takes `self` by value easily unless we are the only owner.
-    // For benchmark purposes, we can try to unwrap or just let it drop (which might just close the socket eventually).
-    // Or we can rely on try_unwrap since we are at end of main.
-    
     if let Ok(c) = std::sync::Arc::try_unwrap(client) {
          c.close().await;
     } else {
