@@ -81,25 +81,25 @@ class Batch:
         return {
             "token_ids": torch.as_tensor(
                 self.token_ids, device=device, dtype=torch.long
-            ),
+            ).contiguous(),
             "position_ids": torch.as_tensor(
                 self.position_ids, device=device, dtype=torch.int32
-            ),
+            ).contiguous(),
             "qo_indptr": torch.as_tensor(
                 self.qo_indptr, device=device, dtype=torch.int32
-            ),
+            ).contiguous(),
             "kv_page_indices": torch.as_tensor(
                 self.kv_page_indices, device=device, dtype=torch.int32
-            ),
+            ).contiguous(),
             "kv_page_indptr": torch.as_tensor(
                 self.kv_page_indptr, device=device, dtype=torch.int32
-            ),
+            ).contiguous(),
             "kv_last_page_lens": torch.as_tensor(
                 self.kv_last_page_lens, device=device, dtype=torch.int32
-            ),
+            ).contiguous(),
             "custom_mask": torch.as_tensor(
                 batched_attention_mask, device=device, dtype=torch.bool
-            ),
+            ).contiguous(),
             "single_token_inference_mode": self.single_token_mode,
             "adapter_indices": (
                 self.adapter_indices if self.adapter_subpass_needed else []
@@ -202,7 +202,7 @@ class Batch:
         return responses
 
 
-def _decode_brle(brle_buffer: list[int]) -> np.ndarray:
+def _decode_brle(brle_buffer) -> np.ndarray:
     """
     Decode a Binary Run-Length Encoded buffer into a boolean numpy array.
 
@@ -210,11 +210,15 @@ def _decode_brle(brle_buffer: list[int]) -> np.ndarray:
     (in attention masking, True means attend).
 
     Args:
-        brle_buffer: List of run lengths
+        brle_buffer: List of run lengths or bytes (u32 little-endian encoded)
 
     Returns:
         Decoded boolean array
     """
+    # Handle bytes input (from FFI - u32 little-endian encoded)
+    if isinstance(brle_buffer, bytes):
+        brle_buffer = np.frombuffer(brle_buffer, dtype=np.uint32).tolist()
+
     if not brle_buffer:
         return np.array([], dtype=bool)
 

@@ -308,9 +308,9 @@ fn start_server_with_ffi(
     })
 }
 
-/// Python module definition for pie_rs
+/// Python module definition for _pie
 #[pymodule]
-pub fn pie_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn _pie(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ServerConfig>()?;
     m.add_class::<ServerHandle>()?;
     m.add_class::<crate::model::ffi_queue::FfiQueue>()?;

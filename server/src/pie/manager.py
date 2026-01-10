@@ -13,7 +13,7 @@ from typing import Optional, Any, TYPE_CHECKING
 from . import path as pie_path
 
 if TYPE_CHECKING:
-    from . import pie_rs
+    from . import _pie
 
 
 class EngineError(Exception):
@@ -30,7 +30,7 @@ def start_engine_and_backend(
     on_status: Optional[callable] = None,
     on_message: Optional[callable] = None,
     use_ffi: bool = True,  # FFI mode: ~15x lower latency, in-process Python
-) -> tuple["pie_rs.ServerHandle", list]:
+) -> tuple["_pie.ServerHandle", list]:
     """Start the Pie engine and all configured backend services.
 
     Args:
@@ -49,7 +49,7 @@ def start_engine_and_backend(
     Raises:
         EngineError: If engine or backend fails to start
     """
-    from . import pie_rs
+    from . import _pie
 
     # Setup console if available
     use_rich = console is not None
@@ -72,7 +72,7 @@ def start_engine_and_backend(
             authorized_users_path = str(auth_path)
 
     # Create server config
-    server_config = pie_rs.ServerConfig(
+    server_config = _pie.ServerConfig(
         host=engine_config.get("host", "127.0.0.1"),
         port=engine_config.get("port", 8080),
         enable_auth=engine_config.get("enable_auth", True),
@@ -110,17 +110,17 @@ def start_engine_and_backend(
             # Initialize Python backend - returns Runtime
             from pie_backend.server import start_ffi_worker
 
-            runtime = pie_rs.initialize_backend(full_config)
+            runtime = _pie.initialize_backend(full_config)
 
             # Create the FfiQueue FIRST via Python
-            ffi_queue = pie_rs.FfiQueue()
+            ffi_queue = _pie.FfiQueue()
 
             # Start the Python worker thread BEFORE starting server
             # This allows the worker to respond to handshake during Model::new_with_ffi
             _ffi_worker = start_ffi_worker(ffi_queue, runtime)
 
             # Now start server with FFI mode - the worker is ready to handle requests
-            server_handle = pie_rs.start_server_with_ffi(
+            server_handle = _pie.start_server_with_ffi(
                 server_config,
                 authorized_users_path,
                 ffi_queue,  # Pass the queue created by Python
@@ -144,7 +144,7 @@ def start_engine_and_backend(
         # =================================================================
 
         # Start the engine first - returns a ServerHandle
-        server_handle = pie_rs.start_server(server_config, authorized_users_path)
+        server_handle = _pie.start_server(server_config, authorized_users_path)
 
         # Count expected backends
         expected_backends = 0
@@ -419,7 +419,7 @@ def backend_log_monitor(log_queue: multiprocessing.Queue, console: Any):
 
 
 def wait_for_backends(
-    server_handle: "pie_rs.ServerHandle",
+    server_handle: "_pie.ServerHandle",
     expected_count: int,
     timeout: float,
     backend_processes: list,
@@ -506,7 +506,7 @@ def check_backend_processes(
 
 
 def terminate_engine_and_backend(
-    server_handle: "pie_rs.ServerHandle | None",
+    server_handle: "_pie.ServerHandle | None",
     backend_processes: list,
     on_message: Optional[callable] = None,
 ) -> None:
@@ -649,7 +649,7 @@ def submit_inferlet_and_wait(
     client_config: dict,
     inferlet_path: Path,
     arguments: list[str],
-    server_handle: "pie_rs.ServerHandle | None" = None,
+    server_handle: "_pie.ServerHandle | None" = None,
     backend_processes: list | None = None,
     on_event: Optional[callable] = None,
 ) -> None:
@@ -681,7 +681,7 @@ async def _submit_inferlet_async(
     client_config: dict,
     inferlet_path: Path,
     arguments: list[str],
-    server_handle: "pie_rs.ServerHandle | None" = None,
+    server_handle: "_pie.ServerHandle | None" = None,
     backend_processes: list | None = None,
     on_event: Optional[callable] = None,
 ) -> None:
@@ -791,7 +791,7 @@ async def _submit_inferlet_async(
 
 
 async def _monitor_processes_task(
-    server_handle: "pie_rs.ServerHandle | None",
+    server_handle: "_pie.ServerHandle | None",
     backend_processes: list | None,
 ):
     """Async task to monitor backend processes."""
@@ -815,7 +815,7 @@ def submit_inferlet_from_registry_and_wait(
     client_config: dict,
     inferlet_name: str,
     arguments: list[str],
-    server_handle: "pie_rs.ServerHandle | None" = None,
+    server_handle: "_pie.ServerHandle | None" = None,
     backend_processes: list | None = None,
     on_event: Optional[callable] = None,
 ) -> None:
@@ -847,7 +847,7 @@ async def _submit_inferlet_from_registry_async(
     client_config: dict,
     inferlet_name: str,
     arguments: list[str],
-    server_handle: "pie_rs.ServerHandle | None" = None,
+    server_handle: "_pie.ServerHandle | None" = None,
     backend_processes: list | None = None,
     on_event: Optional[callable] = None,
 ) -> None:

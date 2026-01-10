@@ -2,11 +2,11 @@
 
 __version__ = "0.1.0"
 
-# pie_rs is the compiled Rust extension module (built by maturin)
+# _pie is the compiled Rust extension module (built by maturin)
 try:
-    import pie_rs
+    from . import _pie
 
-    __all__ = ["pie_rs"]
+    __all__ = ["_pie"]
 except ImportError:
-    # pie_rs not built yet - this is fine for pure Python usage
+    # _pie not built yet - this is fine for pure Python usage
     __all__ = []

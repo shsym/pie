@@ -136,6 +136,10 @@ class ThreadedDispatcher:
                             )
 
                 except Exception as e:
+                    import traceback
+
+                    tb = traceback.format_exc()
+                    print(f"[FFI Worker Error] {method}: {e}\n{tb}")
                     result_holder["status"] = STATUS_INTERNAL_ERROR
                     result_holder["response"] = msgpack.packb(str(e))
                     result_holder["event"].set()
@@ -223,7 +227,7 @@ def poll_ffi_queue(ffi_queue, service: Runtime, poll_timeout_ms: int = 100) -> N
     Python thread that owns all CUDA state.
 
     Args:
-        ffi_queue: pie_rs.FfiQueue instance from start_server_with_ffi
+        ffi_queue: _pie.FfiQueue instance from start_server_with_ffi
         service: Runtime instance to dispatch calls to
         poll_timeout_ms: How long to block waiting for requests (ms)
     """
@@ -271,6 +275,10 @@ def poll_ffi_queue(ffi_queue, service: Runtime, poll_timeout_ms: int = 100) -> N
             ffi_queue.respond(request_id, response)
 
         except Exception as e:
+            import traceback
+
+            tb = traceback.format_exc()
+            print(f"[FFI Queue Error] {method}: {e}\n{tb}")
             response = msgpack.packb(str(e))
             ffi_queue.respond(request_id, response)
 

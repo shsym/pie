@@ -42,6 +42,7 @@ pie = "pie_cli.cli:app"
 
 [tool.maturin]
 python-source = "src"
-module-name = "pie.pie_rs"
+module-name = "pie._pie"
 manifest-path = "../runtime/Cargo.toml"
 features = ["pyo3/extension-module"]
+

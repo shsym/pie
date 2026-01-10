@@ -702,15 +702,21 @@ class Runtime:
 
         batch = Batch()
 
-        # Direct assignments (already concatenated by Rust)
-        batch.token_ids = list(args["token_ids"])
-        batch.position_ids = list(args["position_ids"])
-        batch.kv_page_indices = list(args["kv_page_indices"])
-        batch.kv_page_indptr = list(args["kv_page_indptr"])
-        batch.kv_last_page_lens = list(args["kv_last_page_lens"])
-        batch.qo_indptr = list(args["qo_indptr"])
+        # Helper to decode bytes as u32 array or pass through lists
+        def _decode_u32(data) -> list[int]:
+            if isinstance(data, bytes):
+                return np.frombuffer(data, dtype=np.uint32).tolist()
+            return list(data)
+
+        # Direct assignments - decode bytes as u32 arrays
+        batch.token_ids = _decode_u32(args["token_ids"])
+        batch.position_ids = _decode_u32(args["position_ids"])
+        batch.kv_page_indices = _decode_u32(args["kv_page_indices"])
+        batch.kv_page_indptr = _decode_u32(args["kv_page_indptr"])
+        batch.kv_last_page_lens = _decode_u32(args["kv_last_page_lens"])
+        batch.qo_indptr = _decode_u32(args["qo_indptr"])
         batch.single_token_mode = args["single_token_mode"]
-        batch.total_tokens = len(args["token_ids"])
+        batch.total_tokens = len(batch.token_ids)
 
         # Process per-request data
         masks = args["masks"]
@@ -725,14 +731,14 @@ class Runtime:
         token_offset = 0
 
         for i in range(num_requests):
-            # Calculate tokens for this request
-            req_token_count = args["qo_indptr"][i + 1] - args["qo_indptr"][i]
+            # Calculate tokens for this request from decoded batch data
+            req_token_count = batch.qo_indptr[i + 1] - batch.qo_indptr[i]
 
-            # Calculate sequence length from KV pages
-            kv_start = args["kv_page_indptr"][i]
-            kv_end = args["kv_page_indptr"][i + 1]
+            # Calculate sequence length from KV pages (using decoded batch data)
+            kv_start = batch.kv_page_indptr[i]
+            kv_end = batch.kv_page_indptr[i + 1]
             num_pages = kv_end - kv_start
-            kv_last_len = args["kv_last_page_lens"][i]
+            kv_last_len = batch.kv_last_page_lens[i]
 
             if num_pages >= 1:
                 seq_len = self.config.kv_page_size * (num_pages - 1) + kv_last_len
