@@ -45,6 +45,11 @@ class RuntimeConfig:
     random_seed: int
     use_cuda_graphs: bool
 
+    # Telemetry settings
+    telemetry_enabled: bool
+    telemetry_endpoint: str
+    telemetry_service_name: str
+
     # Evaluated at runtime
     max_num_kv_pages: int | None
 
@@ -124,7 +129,9 @@ class RuntimeConfig:
         world_size: int = 1,
         activation_dtype: str = "bfloat16",
         weight_dtype: str = "auto",
-        enable_profiling: bool = False,
+        telemetry_enabled: bool = False,
+        telemetry_endpoint: str = "http://localhost:4317",
+        telemetry_service_name: str = "pie",
         random_seed: int = 42,
         use_cuda_graphs: bool = True,
     ) -> "RuntimeConfig":
@@ -147,7 +154,9 @@ class RuntimeConfig:
             world_size: Total number of processes
             activation_dtype: Activation tensor dtype
             weight_dtype: Weight dtype - "auto", "float32", "float16", "bfloat16", "int4", "int8", "float8"
-            enable_profiling: Enable profiling (currently unused)
+            telemetry_enabled: Enable telemetry/tracing
+            telemetry_endpoint: OTLP endpoint for traces
+            telemetry_service_name: Service name in traces
 
         Returns:
             Configured RuntimeConfig instance
@@ -206,6 +215,9 @@ class RuntimeConfig:
             gpu_mem_utilization=gpu_mem_utilization,
             random_seed=random_seed,
             use_cuda_graphs=use_cuda_graphs,
+            telemetry_enabled=telemetry_enabled,
+            telemetry_endpoint=telemetry_endpoint,
+            telemetry_service_name=telemetry_service_name,
             max_num_kv_pages=None,  # Populated by runtime based on memory
             devices=resolved_devices,
             rank=rank,

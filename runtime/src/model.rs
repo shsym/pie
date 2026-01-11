@@ -564,6 +564,11 @@ impl Model {
     }
 
     /// Execute a batch of forward pass requests via fire_batch RPC
+    #[tracing::instrument(
+        name = "rust.fire_batch",
+        skip(backend, requests),
+        fields(batch_size = requests.len())
+    )]
     async fn execute_forward_pass_batch(
         backend: &RpcBackend,
         requests: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>,
@@ -572,6 +577,25 @@ impl Model {
         let mut batch_req = BatchedForwardPassRequest::new();
         for (fp_req, _) in &requests {
             batch_req.add_request(fp_req);
+        }
+
+        // Inject trace context for cross-language propagation
+        // Uses tracing-opentelemetry to get current span context
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let current_span = tracing::Span::current();
+        let context = current_span.context();
+        use opentelemetry::trace::TraceContextExt;
+        let otel_span = context.span();
+        let span_context = otel_span.span_context();
+        if span_context.is_valid() {
+            // Format as W3C traceparent: version-trace_id-span_id-flags
+            let traceparent = format!(
+                "00-{}-{}-{:02x}",
+                span_context.trace_id(),
+                span_context.span_id(),
+                span_context.trace_flags().to_u8()
+            );
+            batch_req.set_trace_context(traceparent);
         }
 
         let result: Result<BatchedForwardPassResponse, _> = backend

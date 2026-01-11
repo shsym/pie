@@ -313,7 +313,7 @@ class Schema:
         reader: ReaderFn,
         config: "RuntimeConfig",
         num_layers: int = 0,
-        log_queue: object | None = None,
+        log_queue: object,
     ) -> WeightStore:
         """
         Load all weights according to the schema.
@@ -532,7 +532,7 @@ class ModelLoader:
     is responsible for creating the ForwardPass and KV cache.
     """
 
-    def __init__(self, config: "RuntimeConfig", log_queue: object | None = None):
+    def __init__(self, config: "RuntimeConfig", log_queue: object):
         """
         Initialize the model loader.
 

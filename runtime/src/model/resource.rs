@@ -1,6 +1,7 @@
 use crate::instance::InstanceId;
 use crate::runtime::{self, TerminationCause};
 use crate::service::ServiceCommand;
+use crate::telemetry;
 use crate::utils::IdPool;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::time::Instant;
@@ -77,13 +78,48 @@ impl ResourceManager {
         type_id: ResourceTypeId,
         count: usize,
     ) -> Result<Vec<ResourceId>, ResourceError> {
-        if self.available(type_id)? < count {
+        let available = self.available(type_id)?;
+        
+        if available < count {
+            tracing::debug!(
+                target: "resource.oom",
+                type_id = type_id,
+                requested = count,
+                available = available,
+                "OOM triggered, starting victim selection"
+            );
             // Not enough memory, trigger the OOM killer.
             self.oom_kill(type_id, count, inst_id)?;
         }
 
         // A successful oom_kill guarantees enough space.
-        self.allocate(inst_id, type_id, count)
+        let result = self.allocate(inst_id, type_id, count)?;
+        
+        // Log allocation metrics
+        let new_available = self.available(type_id).unwrap_or(0);
+        tracing::trace!(
+            target: "resource.metrics",
+            type_id = type_id,
+            allocated = count,
+            available_after = new_available,
+            inst_id = ?inst_id,
+            "Resource allocation"
+        );
+        
+        // Record OTel metrics for KV pages (type_id 0)
+        if type_id == KV_PAGE_TYPE_ID {
+            if let Some(m) = telemetry::metrics() {
+                let pool = self.res_pool.get(&type_id);
+                if let Some(pool) = pool {
+                    let capacity = pool.capacity() as usize;
+                    let available = pool.available();
+                    m.kv_pages_allocated.record((capacity - available) as u64, &[]);
+                    m.kv_pages_available.record(available as u64, &[]);
+                }
+            }
+        }
+        
+        Ok(result)
     }
 
     fn available(&self, type_id: ResourceTypeId) -> Result<usize, ResourceError> {
@@ -175,6 +211,18 @@ impl ResourceManager {
                 .map(|(id, _)| *id);
 
             if let Some(victim_id) = victim_id {
+                tracing::warn!(
+                    target: "resource.oom",
+                    victim_id = ?victim_id,
+                    type_id = type_id,
+                    "OOM killer terminating instance"
+                );
+                
+                // Record OOM kill metric
+                if let Some(m) = telemetry::metrics() {
+                    m.kv_pages_oom_kills.add(1, &[]);
+                }
+                
                 self.cleanup(victim_id)?;
                 runtime::Command::TerminateInstance {
                     inst_id: victim_id,

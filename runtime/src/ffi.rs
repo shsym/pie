@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 
 use crate::auth::AuthorizedUsers;
 use crate::engine::{self, Config as EngineConfig};
+use crate::telemetry::TelemetryConfig;
 
 /// Configuration for the PIE server, exposed to Python.
 #[pyclass]
@@ -30,11 +31,19 @@ pub struct ServerConfig {
     pub log_dir: Option<String>,
     #[pyo3(get, set)]
     pub registry: String,
+    // Telemetry configuration
+    #[pyo3(get, set)]
+    pub telemetry_enabled: bool,
+    #[pyo3(get, set)]
+    pub telemetry_endpoint: String,
+    #[pyo3(get, set)]
+    pub telemetry_service_name: String,
 }
 
 #[pymethods]
 impl ServerConfig {
     #[new]
+    #[pyo3(signature = (host, port, enable_auth, cache_dir, verbose, log_dir, registry, telemetry_enabled=false, telemetry_endpoint="http://localhost:4317".to_string(), telemetry_service_name="pie-runtime".to_string()))]
     fn new(
         host: String,
         port: u16,
@@ -43,6 +52,9 @@ impl ServerConfig {
         verbose: bool,
         log_dir: String,
         registry: String,
+        telemetry_enabled: bool,
+        telemetry_endpoint: String,
+        telemetry_service_name: String,
     ) -> Self {
         ServerConfig {
             host,
@@ -52,13 +64,16 @@ impl ServerConfig {
             verbose,
             log_dir: Some(log_dir),
             registry,
+            telemetry_enabled,
+            telemetry_endpoint,
+            telemetry_service_name,
         }
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "ServerConfig(host='{}', port={}, enable_auth={}, cache_dir='{}', verbose={}, log_dir={:?}, registry='{}')",
-            self.host, self.port, self.enable_auth, self.cache_dir, self.verbose, self.log_dir, self.registry
+            "ServerConfig(host='{}', port={}, enable_auth={}, cache_dir='{}', verbose={}, log_dir={:?}, registry='{}', telemetry_enabled={})",
+            self.host, self.port, self.enable_auth, self.cache_dir, self.verbose, self.log_dir, self.registry, self.telemetry_enabled
         )
     }
 }
@@ -73,6 +88,11 @@ impl From<ServerConfig> for EngineConfig {
             verbose: cfg.verbose,
             log_dir: cfg.log_dir.map(PathBuf::from),
             registry: cfg.registry,
+            telemetry: TelemetryConfig {
+                enabled: cfg.telemetry_enabled,
+                endpoint: cfg.telemetry_endpoint,
+                service_name: cfg.telemetry_service_name,
+            },
         }
     }
 }

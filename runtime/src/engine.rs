@@ -11,6 +11,7 @@ use crate::kvs;
 use crate::messaging;
 use crate::runtime;
 use crate::server;
+use crate::telemetry::{self, TelemetryConfig};
 
 /// Configuration for the PIE engine.
 #[derive(Debug)]
@@ -22,6 +23,7 @@ pub struct Config {
     pub verbose: bool,
     pub log_dir: Option<PathBuf>,
     pub registry: String,
+    pub telemetry: TelemetryConfig,
 }
 
 /// Runs the PIE server logic within an existing Tokio runtime.
@@ -34,8 +36,31 @@ pub async fn run_server(
     ready_tx: oneshot::Sender<String>,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
+    // Install panic hook to exit process on any Rust panic.
+    // This ensures Python parent process is notified when Rust crashes.
+    std::panic::set_hook(Box::new(|panic_info| {
+        // Log the panic with location if available
+        let location = panic_info.location().map(|loc| {
+            format!("{}:{}:{}", loc.file(), loc.line(), loc.column())
+        }).unwrap_or_else(|| "unknown location".to_string());
+        
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+        
+        eprintln!("\n[FATAL] Rust runtime panic at {}: {}", location, message);
+        eprintln!("[FATAL] Terminating process to signal Python shutdown.");
+        
+        // Exit with non-zero code to signal failure to Python
+        std::process::exit(1);
+    }));
+
     // Initialize tracing with file logging if log_dir is specified
-    init_tracing(&config.log_dir, config.verbose)?;
+    init_tracing(&config.log_dir, config.verbose, &config.telemetry)?;
 
     // Ensure the cache directory exists
     fs::create_dir_all(&config.cache_dir).with_context(|| {
@@ -72,10 +97,17 @@ pub async fn run_server(
     Ok(())
 }
 
-/// Initialize the tracing subscriber with optional file logging.
-fn init_tracing(log_dir: &Option<PathBuf>, verbose: bool) -> Result<()> {
+/// Initialize the tracing subscriber with optional file logging and OTLP export.
+fn init_tracing(
+    log_dir: &Option<PathBuf>,
+    verbose: bool,
+    telemetry_config: &TelemetryConfig,
+) -> Result<()> {
     use tracing_subscriber::fmt;
     use tracing_subscriber::EnvFilter;
+
+    eprintln!("[init_tracing] log_dir={:?}, telemetry_enabled={}, endpoint={}", 
+              log_dir, telemetry_config.enabled, telemetry_config.endpoint);
 
     let filter = if verbose {
         EnvFilter::try_from_default_env()
@@ -85,32 +117,61 @@ fn init_tracing(log_dir: &Option<PathBuf>, verbose: bool) -> Result<()> {
             .unwrap_or_else(|_| EnvFilter::new("info"))
     };
 
-    match log_dir {
-        Some(dir) => {
-            // Ensure log directory exists
+    // Build the base registry with filter
+    let registry = tracing_subscriber::registry().with(filter);
+
+    match (log_dir, telemetry_config.enabled) {
+        // File logging + OTLP
+        (Some(dir), true) => {
             fs::create_dir_all(dir).with_context(|| {
                 format!("Failed to create log directory: {:?}", dir)
             })?;
 
-            // Create a rolling file appender that rotates daily
             let file_appender = tracing_appender::rolling::daily(dir, "pie.log");
             let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
-            // Keep the guard alive for the lifetime of the process
-            // by leaking it (this is intentional for logging)
             std::mem::forget(_guard);
 
-            tracing_subscriber::registry()
-                .with(filter)
+            if let Some(otel_layer) = telemetry::init_otel_layer(telemetry_config) {
+                registry
+                    .with(otel_layer)
+                    .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
+                    .init();
+            } else {
+                // OTLP creation failed, just use file logging
+                registry
+                    .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
+                    .init();
+            }
+        }
+        // File logging only
+        (Some(dir), false) => {
+            fs::create_dir_all(dir).with_context(|| {
+                format!("Failed to create log directory: {:?}", dir)
+            })?;
+
+            let file_appender = tracing_appender::rolling::daily(dir, "pie.log");
+            let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+            std::mem::forget(_guard);
+
+            registry
                 .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
                 .init();
         }
-        None => {
-            // Log to stdout if no log directory specified
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt::layer())
-                .init();
+        // Stdout + OTLP
+        (None, true) => {
+            if let Some(otel_layer) = telemetry::init_otel_layer(telemetry_config) {
+                registry
+                    .with(otel_layer)
+                    .with(fmt::layer())
+                    .init();
+            } else {
+                // OTLP creation failed, just use stdout
+                registry.with(fmt::layer()).init();
+            }
+        }
+        // Stdout only
+        (None, false) => {
+            registry.with(fmt::layer()).init();
         }
     }
 

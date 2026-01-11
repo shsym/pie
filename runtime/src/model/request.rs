@@ -213,95 +213,189 @@ pub struct DownloadAdapterRequest {
     pub name: String,
 }
 
-// ============================================================================
-// Batched Request/Response types for pycrust RPC
-// ============================================================================
+/// Wrapper for Vec<u32> that serializes as raw bytes for zero-copy Python deserialization.
+/// Python can then use `np.frombuffer(data, dtype=np.uint32)` for O(1) deserialization.
+#[derive(Debug, Clone, Default)]
+pub struct ByteVec(pub Vec<u32>);
+
+impl serde::Serialize for ByteVec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes: &[u8] = bytemuck::cast_slice(&self.0);
+        serializer.serialize_bytes(bytes)
+    }
+}
+
+/// Wrapper for Vec<f32> that serializes as raw bytes for zero-copy Python deserialization.
+/// Python can then use `np.frombuffer(data, dtype=np.float32)` for O(1) deserialization.
+#[derive(Debug, Clone, Default)]
+pub struct ByteVecF32(pub Vec<f32>);
+
+impl serde::Serialize for ByteVecF32 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bytes: &[u8] = bytemuck::cast_slice(&self.0);
+        serializer.serialize_bytes(bytes)
+    }
+}
 
 /// Batched forward pass request sent to Python via pycrust.
 /// Rust performs partial batch formation (concatenating arrays),
 /// while Python handles attention mask decoding and tensor creation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Numerical arrays use ByteVec/ByteVecF32 for zero-copy deserialization in Python.
+#[derive(Debug, Clone, Serialize)]
 pub struct BatchedForwardPassRequest {
-    // Concatenated arrays from all requests in the batch
-    pub token_ids: Vec<u32>,
-    pub position_ids: Vec<u32>,
+    // Concatenated arrays from all requests in the batch (as raw bytes)
+    pub token_ids: ByteVec,
+    pub position_ids: ByteVec,
 
-    // KV cache layout (concatenated)
-    pub kv_page_indices: Vec<u32>,
-    pub kv_page_indptr: Vec<u32>, // [0, n1, n1+n2, ...] indices into kv_page_indices
-    pub kv_last_page_lens: Vec<u32>, // One per request
+    // KV cache layout (concatenated, as raw bytes)
+    pub kv_page_indices: ByteVec,
+    pub kv_page_indptr: ByteVec, // [0, n1, n1+n2, ...] indices into kv_page_indices
+    pub kv_last_page_lens: ByteVec, // One per request
 
-    // Query/Output indirection
-    pub qo_indptr: Vec<u32>, // [0, tokens1, tokens1+tokens2, ...]
+    // Query/Output indirection (as raw bytes)
+    pub qo_indptr: ByteVec, // [0, tokens1, tokens1+tokens2, ...]
 
-    // Attention masks (BRLE encoded, flattened)
-    pub flattened_masks: Vec<u32>, // Concatenation of all BRLE buffers
-    pub mask_indptr: Vec<u32>,     // Pointers into flattened_masks for each token
+    // Attention masks (BRLE encoded, flattened, as raw bytes)
+    pub flattened_masks: ByteVec, // Concatenation of all BRLE buffers
+    pub mask_indptr: ByteVec,     // Pointers into flattened_masks for each token
 
-    // Adapter info (one per request)
+    // Adapter info (one per request) - keep as Vec since these are small
     pub adapter_indices: Vec<Option<u32>>,
     pub adapter_seeds: Vec<Option<i64>>,
 
-    // Output specifications (per request)
-    pub output_token_indices: Vec<Vec<u32>>,
-    pub output_token_samplers: Vec<Vec<HashMap<String, rmpv::Value>>>,
+    // === SoA Sampler Parameters (flattened) ===
+    // Each sampler across all requests is flattened into these arrays
+    pub sampler_temperatures: ByteVecF32, // f32 array, one per sampler
+    pub sampler_top_k: ByteVec,           // u32 array (will cast to i32 in Python)
+    pub sampler_top_p: ByteVecF32,        // f32 array
+    pub sampler_min_p: ByteVecF32,        // f32 array
+    pub sampler_types: ByteVec,           // u32 array (0=dist, 1/2/3=sampler types)
+    pub request_num_samplers: ByteVec,    // u32 array, num samplers per request
+
+    // Output token indices (flattened with indptr)
+    pub flat_output_token_indices: ByteVec, // Concatenated indices
+    pub output_token_indptr: ByteVec,       // [0, n1, n1+n2, ...] per request
+
+    // Embed outputs (keep nested since usually empty/small)
     pub output_embed_ptrs: Vec<Vec<u32>>,
     pub output_embed_indices: Vec<Vec<u32>>,
 
     // Inference mode hint
     pub single_token_mode: bool,
+
+    // Trace context for cross-language propagation (W3C traceparent)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_context: Option<String>,
 }
 
 impl BatchedForwardPassRequest {
     /// Create a new empty batched request.
     pub fn new() -> Self {
         Self {
-            token_ids: Vec::new(),
-            position_ids: Vec::new(),
-            kv_page_indices: Vec::new(),
-            kv_page_indptr: vec![0],
-            kv_last_page_lens: Vec::new(),
-            qo_indptr: vec![0],
-            flattened_masks: Vec::new(),
-            mask_indptr: vec![0],
+            token_ids: ByteVec(Vec::new()),
+            position_ids: ByteVec(Vec::new()),
+            kv_page_indices: ByteVec(Vec::new()),
+            kv_page_indptr: ByteVec(vec![0]),
+            kv_last_page_lens: ByteVec(Vec::new()),
+            qo_indptr: ByteVec(vec![0]),
+            flattened_masks: ByteVec(Vec::new()),
+            mask_indptr: ByteVec(vec![0]),
             adapter_indices: Vec::new(),
             adapter_seeds: Vec::new(),
-            output_token_indices: Vec::new(),
-            output_token_samplers: Vec::new(),
+            // SoA sampler fields
+            sampler_temperatures: ByteVecF32(Vec::new()),
+            sampler_top_k: ByteVec(Vec::new()),
+            sampler_top_p: ByteVecF32(Vec::new()),
+            sampler_min_p: ByteVecF32(Vec::new()),
+            sampler_types: ByteVec(Vec::new()),
+            request_num_samplers: ByteVec(Vec::new()),
+            flat_output_token_indices: ByteVec(Vec::new()),
+            output_token_indptr: ByteVec(vec![0]),
             output_embed_ptrs: Vec::new(),
             output_embed_indices: Vec::new(),
             single_token_mode: true,
+            trace_context: None,
         }
     }
 
     /// Add a single ForwardPassRequest to the batch.
     pub fn add_request(&mut self, req: &ForwardPassRequest) {
         // Concatenate tokens and positions
-        self.token_ids.extend(&req.input_tokens);
-        self.position_ids.extend(&req.input_token_positions);
+        self.token_ids.0.extend(&req.input_tokens);
+        self.position_ids.0.extend(&req.input_token_positions);
 
         // KV cache layout
-        self.kv_page_indices.extend(&req.kv_page_ptrs);
-        self.kv_page_indptr.push(self.kv_page_indices.len() as u32);
-        self.kv_last_page_lens.push(req.kv_page_last_len);
+        self.kv_page_indices.0.extend(&req.kv_page_ptrs);
+        self.kv_page_indptr.0.push(self.kv_page_indices.0.len() as u32);
+        self.kv_last_page_lens.0.push(req.kv_page_last_len);
 
         // Query/output indirection
-        let total_tokens = self.token_ids.len() as u32;
-        self.qo_indptr.push(total_tokens);
+        let total_tokens = self.token_ids.0.len() as u32;
+        self.qo_indptr.0.push(total_tokens);
 
         // Masks (flatten nested structure)
         for token_mask in &req.mask {
-            self.flattened_masks.extend(token_mask);
-            self.mask_indptr.push(self.flattened_masks.len() as u32);
+            self.flattened_masks.0.extend(token_mask);
+            self.mask_indptr.0.push(self.flattened_masks.0.len() as u32);
         }
 
         // Adapter info
         self.adapter_indices.push(req.adapter);
         self.adapter_seeds.push(req.adapter_seed);
 
-        // Output specifications
-        self.output_token_indices.push(req.output_token_indices.clone());
-        self.output_token_samplers.push(req.output_token_samplers.clone());
+        // Output token indices (flatten with indptr)
+        self.flat_output_token_indices.0.extend(&req.output_token_indices);
+        self.output_token_indptr.0.push(self.flat_output_token_indices.0.len() as u32);
+
+        // Extract sampler parameters (SoA flattening)
+        let num_samplers = req.output_token_samplers.len() as u32;
+        self.request_num_samplers.0.push(num_samplers);
+
+        for sampler_cfg in &req.output_token_samplers {
+            // Extract sampler type (default: 1 = standard sampling)
+            let sampler_type = sampler_cfg
+                .get("sampler")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+            self.sampler_types.0.push(sampler_type);
+
+            // Extract temperature (default: 1.0)
+            let temperature = sampler_cfg
+                .get("temperature")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32;
+            self.sampler_temperatures.0.push(temperature);
+
+            // Extract top_k (default: 0 = disabled)
+            let top_k = sampler_cfg
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            self.sampler_top_k.0.push(top_k);
+
+            // Extract top_p (default: 1.0 = disabled)
+            let top_p = sampler_cfg
+                .get("top_p")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32;
+            self.sampler_top_p.0.push(top_p);
+
+            // Extract min_p (default: 0.0 = disabled)
+            let min_p = sampler_cfg
+                .get("min_p")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32;
+            self.sampler_min_p.0.push(min_p);
+        }
+
+        // Embed outputs
         self.output_embed_ptrs.push(req.output_embed_ptrs.clone());
         self.output_embed_indices.push(req.output_embed_indices.clone());
 
@@ -318,7 +412,13 @@ impl BatchedForwardPassRequest {
 
     /// Get the total number of tokens in this batch.
     pub fn total_tokens(&self) -> usize {
-        self.token_ids.len()
+        self.token_ids.0.len()
+    }
+
+    /// Set trace context for cross-language propagation.
+    /// The trace_context should be a W3C traceparent string.
+    pub fn set_trace_context(&mut self, trace_context: String) {
+        self.trace_context = Some(trace_context);
     }
 }
 

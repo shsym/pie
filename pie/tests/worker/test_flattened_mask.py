@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from pie_worker.batching import Batch, _decode_brle
+from pie_worker.batching import Batch
 from pie_worker.runtime import Runtime, RuntimeConfig
 from unittest.mock import MagicMock
 
@@ -45,73 +45,47 @@ class TestFlattenedMasks(unittest.TestCase):
         kv_page_indptr = [0, 2, 3]
         kv_last_page_lens = [16, 16]
 
-        # Construct args dictionary (simulating msgpack payload)
+        # Construct args dictionary (simulating msgpack payload with SoA format)
         args = {
             "token_ids": [1, 2, 3],  # dummy
-            "position_ids": [32, 33, 16],  # dummy
+            "position_ids": [31, 31, 15],  # Use valid positions (0-indexed, < seq_len)
             "kv_page_indices": [0, 1, 2],  # dummy
             "kv_page_indptr": kv_page_indptr,
             "kv_last_page_lens": kv_last_page_lens,
             "qo_indptr": qo_indptr,
-            "flattened_masks": flattened_masks,
+            "flattened_masks": [32, 32, 16],  # Full masks
             "mask_indptr": mask_indptr,
             "single_token_mode": False,
             "adapter_indices": [None, None],
             "adapter_seeds": [None, None],
-            "output_token_indices": [[], []],
-            "output_token_samplers": [[], []],
+            # SoA sampler fields (empty since no samplers in this test)
+            "sampler_temperatures": [],
+            "sampler_top_k": [],
+            "sampler_top_p": [],
+            "sampler_min_p": [],
+            "sampler_types": [],
+            "request_num_samplers": [0, 0],  # No samplers per request
+            "flat_output_token_indices": [],
+            "output_token_indptr": [0, 0, 0],  # No output indices per request
             "output_embed_ptrs": [[], []],
             "output_embed_indices": [[], []],
         }
 
-        # 3. Execut _build_batch_from_request
-        batch, timing = runtime._build_batch_from_request(args)
+        # 3. Execute Batch constructor
+        batch = Batch(args, kv_page_size=16, max_dist_size=32000, adapters={})
 
         # 4. Verify attention masks
-        # Expected:
-        # Req 1: 2 rows. Row 0 has 33 ones. Row 1 has 34 ones.
-        # Req 2: 1 row. Row 0 has 17 ones.
+        # Expected: Flattened mask of size 80 (32+32+16)
+        # Token 1 (Pos 30, valid 31): 31 True, 1 False (causal masking)
+        # Token 2 (Pos 31, valid 32): 32 True
+        # Token 3 (Pos 15, valid 16): 16 True
+        # Total True: 31 + 32 + 16 = 79
 
-        self.assertEqual(len(batch.attention_masks), 2)
-
-        # Verify Req 1
-        req1_mask_flat = batch.attention_masks[0]
-        # Shape should be (2 tokens) * (seq_len)
-        # Seq len for Req 1 = 16 * (2-1) + 16 = 32 (context) + 2 (new) = 34? No wait.
-        # Logic in runtime:
-        # num_pages = 2.
-        # seq_len = 16 * (2-1) + 16 = 32.
-        # But this seq_len includes the NEW tokens if they were in the KV cache?
-        # Actually runtime logic: seq_len = kv_page_size * (num_pages - 1) + kv_last_len
-        # If the new tokens are NOT in KV cache yet (which they aren't during prefill/decode usually?),
-        # let's trace:
-        # Runtime: context_len = seq_len - req_token_count (2) = 30?
-        # If we assume 2 pages represents the state *including* the new tokens (which is how pie works often),
-        # then total seq len is 32.
-        # Context len = 32 - 2 = 30.
-        # Then valid lengths: 30 + 0 + 1 = 31, 30 + 1 + 1 = 32.
-
-        # Adjust input test data to match this logic if needed or verifying the mask content matches "decoded"
-        # The runtime just calls _decode_brle and places it.
-        # _decode_brle([33]) -> [True]*33.
-        # _decode_brle([34]) -> [True]*34.
-
-        # Req 1 mask is flattened.
-        # Row 1 (first token): Should have first 33 elts True (or whatever decoded gave).
-        # Wait, runtime logic: checks if decoded len >= expected len.
-
-        # Let's simple check that the flattened mask contains the right number of True values roughly
-        # equivalent to what we put in.
-
-        # Req 1 Mask:
-        # Row 0: 33 Trues -> Truncated to expected_len 31 (context 30 + 1)
-        # Row 1: 34 Trues -> Truncated to expected_len 32 (context 30 + 2)
-        # Total Trues = 31 + 32 = 63.
-        self.assertEqual(np.sum(req1_mask_flat), 63)
-
-        # Req 2 Mask:
-        # Row 0: 17 Trues -> Truncated to expected_len 16 (context 15 + 1)
-        self.assertEqual(np.sum(batch.attention_masks[1]), 16)
+        self.assertEqual(batch.attention_masks.size, 80)
+        self.assertEqual(np.sum(batch.attention_masks), 79)
+        self.assertFalse(
+            batch.attention_masks[31], "Token 1 should not attend to Token 2"
+        )
 
         print(
             "Verification Successful: Batched masks reconstructed correctly from flattened inputs."

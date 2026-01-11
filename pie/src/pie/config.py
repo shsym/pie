@@ -63,6 +63,9 @@ gpu_mem_utilization = 0.9
 # CUDA graphs (experimental)
 use_cuda_graphs = false
 
-# Debug options
-enable_profiling = false
+# Telemetry configuration
+[telemetry]
+enabled = false
+endpoint = "http://localhost:4317"
+service_name = "pie"
 """

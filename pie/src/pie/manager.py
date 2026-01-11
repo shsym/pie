@@ -67,6 +67,8 @@ def start_engine_and_backend(
             authorized_users_path = str(auth_path)
 
     # Create server config
+    # Get telemetry config from engine_config (loaded from [telemetry] section)
+    telemetry_config = engine_config.get("telemetry", {})
     server_config = _pie.ServerConfig(
         host=engine_config.get("host", "127.0.0.1"),
         port=engine_config.get("port", 8080),
@@ -75,6 +77,9 @@ def start_engine_and_backend(
         verbose=engine_config.get("verbose", False),
         log_dir=engine_config.get("log_dir"),
         registry=engine_config.get("registry", "https://registry.pie-project.org/"),
+        telemetry_enabled=telemetry_config.get("enabled", False),
+        telemetry_endpoint=telemetry_config.get("endpoint", "http://localhost:4317"),
+        telemetry_service_name=telemetry_config.get("service_name", "pie-runtime"),
     )
 
     # FFI MODE: Queue-based communication for high throughput
@@ -168,7 +173,13 @@ def _build_backend_config(
         "max_batch_size": model_config.get("max_batch_size", 128),
         "activation_dtype": model_config.get("activation_dtype", "bfloat16"),
         "weight_dtype": model_config.get("weight_dtype"),
-        "enable_profiling": model_config.get("enable_profiling", False),
+        "telemetry_enabled": engine_config.get("telemetry", {}).get("enabled", False),
+        "telemetry_endpoint": engine_config.get("telemetry", {}).get(
+            "endpoint", "http://localhost:4317"
+        ),
+        "telemetry_service_name": engine_config.get("telemetry", {}).get(
+            "service_name", "pie"
+        ),
         "random_seed": model_config.get("random_seed", 42),
         "use_cuda_graphs": model_config.get("use_cuda_graphs", True),
     }

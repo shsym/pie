@@ -32,7 +32,9 @@ def main(
     device: list[str] | str | None = None,
     activation_dtype: str = "bfloat16",
     weight_dtype: str | None = None,
-    enable_profiling: bool = False,
+    telemetry_enabled: bool = False,
+    telemetry_endpoint: str = "http://localhost:4317",
+    telemetry_service_name: str = "pie",
     random_seed: int = 42,
     use_cuda_graphs: bool = True,
     test: bool = False,
@@ -64,7 +66,9 @@ def main(
         weight_dtype: The data type for weights. If different from activation_dtype,
                       weights will be quantized. Options: 'int4', 'int8', 'float8'.
                       If None, uses activation_dtype (no quantization).
-        enable_profiling: Enable unified profiler (timing + tensor tracking) (default: False).
+        telemetry_enabled: Enable OpenTelemetry tracing (default: False).
+        telemetry_endpoint: OTLP endpoint for traces (default: http://localhost:4317).
+        telemetry_service_name: Service name in traces (default: pie).
         test: Run embedded test client after server starts (default: False).
         log_queue: Optional multiprocessing.Queue for sending logs back to controller.
     """
@@ -133,7 +137,9 @@ def main(
                 gpu_mem_utilization,
                 activation_dtype,
                 weight_dtype,
-                enable_profiling,
+                telemetry_enabled,
+                telemetry_endpoint,
+                telemetry_service_name,
                 random_seed,
                 use_cuda_graphs,
                 test,
@@ -198,7 +204,9 @@ def main(
             gpu_mem_utilization,
             activation_dtype,
             weight_dtype,
-            enable_profiling,
+            telemetry_enabled,
+            telemetry_endpoint,
+            telemetry_service_name,
             random_seed,
             use_cuda_graphs,
             test,
@@ -227,11 +235,13 @@ def init_process(
     gpu_mem_utilization: float,
     activation_dtype: str,
     weight_dtype: str | None,
-    enable_profiling: bool,
+    telemetry_enabled: bool,
+    telemetry_endpoint: str,
+    telemetry_service_name: str,
     random_seed: int,
     use_cuda_graphs: bool,
     test: bool,
-    log_queue: object | None,
+    log_queue: object,
 ):
     """
     Initialize the distributed process and start the runtime.
@@ -313,7 +323,9 @@ def init_process(
         devices=devices,
         activation_dtype=activation_dtype,
         weight_dtype=weight_dtype,
-        enable_profiling=enable_profiling,
+        telemetry_enabled=telemetry_enabled,
+        telemetry_endpoint=telemetry_endpoint,
+        telemetry_service_name=telemetry_service_name,
         random_seed=random_seed,
         use_cuda_graphs=use_cuda_graphs,
         rank=rank,

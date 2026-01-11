@@ -63,6 +63,8 @@ def load_config(
         or config.get("log_dir", str(pie_path.get_pie_home() / "logs")),
         "registry": registry
         or config.get("registry", "https://registry.pie-project.org/"),
+        # Include telemetry configuration from [telemetry] section
+        "telemetry": config.get("telemetry", {}),
     }
 
     model_configs = config.get("model", [])

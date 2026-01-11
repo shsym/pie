@@ -143,10 +143,13 @@ def config_update(
     gpu_mem_utilization: Optional[float] = typer.Option(
         None, "--gpu-mem-utilization", help="GPU memory utilization (0.0-1.0)"
     ),
-    enable_profiling: Optional[bool] = typer.Option(
+    telemetry_enabled: Optional[bool] = typer.Option(
         None,
-        "--enable-profiling/--disable-profiling",
-        help="Enable/disable profiling",
+        "--telemetry/--no-telemetry",
+        help="Enable/disable OpenTelemetry tracing",
+    ),
+    telemetry_endpoint: Optional[str] = typer.Option(
+        None, "--telemetry-endpoint", help="OTLP endpoint for traces"
     ),
     use_cuda_graphs: Optional[bool] = typer.Option(
         None,
@@ -195,7 +198,6 @@ def config_update(
         "max_num_adapters": max_num_adapters,
         "max_adapter_rank": max_adapter_rank,
         "gpu_mem_utilization": gpu_mem_utilization,
-        "enable_profiling": enable_profiling,
         "use_cuda_graphs": use_cuda_graphs,
     }
 
@@ -210,6 +212,17 @@ def config_update(
             config["model"][0][key] = value
             updates.append(f"model.{key}={value}")
             model_updated = True
+
+    # Telemetry section options
+    if telemetry_enabled is not None or telemetry_endpoint is not None:
+        if "telemetry" not in config:
+            config["telemetry"] = {}
+        if telemetry_enabled is not None:
+            config["telemetry"]["enabled"] = telemetry_enabled
+            updates.append(f"telemetry.enabled={telemetry_enabled}")
+        if telemetry_endpoint is not None:
+            config["telemetry"]["endpoint"] = telemetry_endpoint
+            updates.append(f"telemetry.endpoint={telemetry_endpoint}")
 
     if not updates:
         console.print("[yellow]![/yellow] No configuration options provided")

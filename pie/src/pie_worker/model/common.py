@@ -103,7 +103,10 @@ def sample_common(
     )
 
     sampler_groups = sampling_metadata["sampler_groups"]
-    sampler_params = sampling_metadata["sampler_params"]
+    # Pre-built tensors for sampler params (no per-group dict extraction)
+    top_k_all = sampling_metadata["top_k"]
+    top_p_all = sampling_metadata["top_p"]
+    min_p_all = sampling_metadata["min_p"]
 
     for sampler_idx, indices in sampler_groups.items():
         if not indices:
@@ -113,20 +116,21 @@ def sample_common(
         group_probs = probs.index_select(0, indices_tensor)
 
         if sampler_idx == 0:
-            # Distribution mode
-            _process_distributions(indices, group_probs, final_dists, sampler_params)
+            # Distribution mode - need top_k for each index
+            group_top_k = top_k_all[indices_tensor]
+            _process_distributions(indices, group_probs, final_dists, group_top_k)
         else:
-            # print(sampler_idx, indices, group_probs, sampler_params, device, dtype)
-            # Sampling mode
+            # Sampling mode - index into pre-built tensors
+            group_top_k = top_k_all[indices_tensor]
+            group_top_p = top_p_all[indices_tensor]
+            group_min_p = min_p_all[indices_tensor]
+
             sampled = _execute_sampler(
-                sampler_idx, indices, group_probs, sampler_params, device, dtype
+                sampler_idx, group_probs, group_top_k, group_top_p, group_min_p
             )
             if sampled.dtype != torch.long:
                 sampled = sampled.to(torch.long)
 
-            # check if sampled exceeds 10000000
-            # if sampled.max() > 10000000:
-            #     print("client-sent token id {} is out of range".format(sampled))
             final_tokens_tensor.scatter_(0, indices_tensor, sampled)
 
     # Stage 5: Combine results
@@ -139,14 +143,12 @@ def _process_distributions(
     indices: list[int],
     group_probs: torch.Tensor,
     final_dists: list[tuple[list[int], list[float]] | None],
-    sampler_params: list[dict],
+    group_top_k: torch.Tensor,
 ) -> None:
     """Process distribution requests."""
-    # Note: sampler_params is a list corresponding to the WHOLE batch logit requests
-    # We need to map `indices` (which are indices into the logit batch) back to param access.
-
-    group_top_k = [sampler_params[i]["top_k"] for i in indices]
-    max_k = max(group_top_k) if group_top_k else 0
+    # group_top_k is already indexed for this group
+    top_k_list = group_top_k.tolist()
+    max_k = max(top_k_list) if top_k_list else 0
 
     if max_k > 0:
         topk_vals, topk_inds = torch.topk(group_probs, k=max_k, sorted=True)
@@ -155,7 +157,7 @@ def _process_distributions(
         topk_inds_list = topk_inds.tolist()
 
         for i, original_idx in enumerate(indices):
-            k = sampler_params[original_idx]["top_k"]
+            k = top_k_list[i]
             ids = topk_inds_list[i][:k]
             vals = topk_vals_list[i][:k]
             final_dists[original_idx] = (ids, vals)
@@ -163,58 +165,37 @@ def _process_distributions(
 
 def _execute_sampler(
     sampler_idx: int,
-    indices: list[int],
     group_probs: torch.Tensor,
-    sampler_params: list[dict],
-    device: torch.device,
-    dtype: torch.dtype,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    min_p: torch.Tensor,
 ) -> torch.Tensor:
-    """Execute the appropriate sampling operation."""
+    """Execute the appropriate sampling operation.
 
-    # Gather params for this group
-    group_params = [sampler_params[i] for i in indices]
+    Args:
+        sampler_idx: Sampler type (1=uniform, 2=top_p, 3=top_k, 4=min_p, 5=top_k_top_p)
+        group_probs: Probability tensor for this group
+        top_k: Pre-indexed top_k tensor for this group
+        top_p: Pre-indexed top_p tensor for this group
+        min_p: Pre-indexed min_p tensor for this group
 
+    Returns:
+        Sampled token indices
+    """
     if sampler_idx == 1:
         return sampling_from_probs(group_probs)
 
     elif sampler_idx == 2:
-        top_p_vals = torch.tensor(
-            [p["top_p"] for p in group_params],
-            device=device,
-            dtype=dtype,
-        )
-        return top_p_sampling_from_probs(group_probs, top_p=top_p_vals)
+        return top_p_sampling_from_probs(group_probs, top_p=top_p)
 
     elif sampler_idx == 3:
-        top_k_vals = torch.tensor(
-            [p["top_k"] for p in group_params],
-            device=device,
-            dtype=torch.long,
-        )
-        return top_k_sampling_from_probs(group_probs, top_k=top_k_vals)
+        return top_k_sampling_from_probs(group_probs, top_k=top_k)
 
     elif sampler_idx == 4:
-        min_p_vals = torch.tensor(
-            [p["min_p"] for p in group_params],
-            device=device,
-            dtype=dtype,
-        )
-        return min_p_sampling_from_probs(group_probs, min_p=min_p_vals)
+        return min_p_sampling_from_probs(group_probs, min_p=min_p)
 
     elif sampler_idx == 5:
-        top_k_vals = torch.tensor(
-            [p["top_k"] for p in group_params],
-            device=device,
-            dtype=torch.long,
-        )
-        top_p_vals = torch.tensor(
-            [p["top_p"] for p in group_params],
-            device=device,
-            dtype=dtype,
-        )
-        return top_k_top_p_sampling_from_probs(
-            group_probs, top_k=top_k_vals, top_p=top_p_vals
-        )
+        return top_k_top_p_sampling_from_probs(group_probs, top_k=top_k, top_p=top_p)
 
     else:
         raise ValueError(f"Unknown sampler index: {sampler_idx}")

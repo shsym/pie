@@ -3,6 +3,7 @@
 //! This module provides a throughput-optimizing scheduler that decides when to fire
 //! batches based on arrival rate estimation and latency modeling.
 
+use crate::telemetry;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -198,6 +199,11 @@ impl AdaptiveScheduler {
     }
 
     /// Record completed batch latency.
+    #[tracing::instrument(
+        name = "rust.batch_complete",
+        skip(self),
+        fields(batch_size = batch_size, total_tokens = total_tokens, latency_ms = latency.as_millis() as u64)
+    )]
     pub fn on_batch_complete(&mut self, batch_size: usize, total_tokens: usize, latency: Duration) {
         self.latency_model.record_latency(batch_size, total_tokens, latency);
     }
@@ -222,12 +228,27 @@ impl AdaptiveScheduler {
     ) -> bool {
         // Always fire if at capacity
         if current_batch_size >= max_batch_size || current_total_tokens >= max_batch_tokens {
+            tracing::trace!(
+                target: "scheduler.decision",
+                decision = "fire_capacity",
+                batch_size = current_batch_size,
+                total_tokens = current_total_tokens,
+                "Firing: at capacity"
+            );
             return true;
         }
 
         // Safety: fire if we've waited too long
         if let Some(start) = self.batch_start_time {
+            let wait_ms = start.elapsed().as_millis() as u64;
             if start.elapsed() >= self.config.max_wait_time {
+                tracing::trace!(
+                    target: "scheduler.decision",
+                    decision = "fire_timeout",
+                    batch_size = current_batch_size,
+                    wait_ms = wait_ms,
+                    "Firing: max wait time exceeded"
+                );
                 return true;
             }
         }
@@ -235,12 +256,25 @@ impl AdaptiveScheduler {
         // If no batches are in flight, we should fire to keep GPU busy
         // (pipeline is empty - need to start it)
         if in_flight_batches == 0 {
+            tracing::trace!(
+                target: "scheduler.decision",
+                decision = "fire_pipeline_empty",
+                batch_size = current_batch_size,
+                "Firing: pipeline empty"
+            );
             return true;
         }
 
         // Skip optimization for small batches when pipeline is full
         if current_batch_size < self.config.min_batch_for_optimization {
             // But don't fire if we have batches in flight - wait for more requests
+            tracing::trace!(
+                target: "scheduler.decision",
+                decision = "wait_small_batch",
+                batch_size = current_batch_size,
+                in_flight = in_flight_batches,
+                "Waiting: batch too small"
+            );
             return false;
         }
 
@@ -248,6 +282,26 @@ impl AdaptiveScheduler {
         // Current throughput if we fire now: batch_size / estimated_latency
         let current_latency = self.latency_model.estimate_latency(current_batch_size, current_total_tokens);
         let current_throughput = current_batch_size as f64 / current_latency;
+
+        // Log scheduler state for observability
+        let arrival_rate = self.arrival_estimator.arrival_rate();
+        tracing::trace!(
+            target: "scheduler.metrics",
+            arrival_rate_rps = ?arrival_rate,
+            estimated_latency_ms = (current_latency * 1000.0) as u64,
+            current_throughput = current_throughput,
+            batch_size = current_batch_size,
+            in_flight = in_flight_batches,
+            "Scheduler metrics"
+        );
+        
+        // Record OTel metrics
+        if let Some(m) = telemetry::metrics() {
+            if let Some(rate) = arrival_rate {
+                m.scheduler_arrival_rate.record(rate, &[]);
+            }
+            m.scheduler_estimated_latency_ms.record(current_latency * 1000.0, &[]);
+        }
 
         // Expected throughput if we wait for one more request:
         // (batch_size + 1) / (estimated_latency + expected_wait_time)
@@ -265,14 +319,33 @@ impl AdaptiveScheduler {
 
             // Fire if waiting would decrease throughput
             if current_throughput >= future_throughput {
+                tracing::trace!(
+                    target: "scheduler.decision",
+                    decision = "fire_throughput",
+                    current_throughput = current_throughput,
+                    future_throughput = future_throughput,
+                    "Firing: better throughput now"
+                );
                 return true;
             }
         } else {
             // No arrival rate data yet - be conservative and fire
+            tracing::trace!(
+                target: "scheduler.decision",
+                decision = "fire_no_data",
+                batch_size = current_batch_size,
+                "Firing: no arrival rate data"
+            );
             return true;
         }
 
         // Wait for more requests
+        tracing::trace!(
+            target: "scheduler.decision",
+            decision = "wait_better_throughput",
+            batch_size = current_batch_size,
+            "Waiting: better throughput expected"
+        );
         false
     }
 }

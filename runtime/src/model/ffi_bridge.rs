@@ -54,6 +54,11 @@ impl AsyncFfiClient {
     ///
     /// This serializes the args, pushes to the queue (lock-free),
     /// and awaits the response from Python.
+    #[tracing::instrument(
+        name = "rust.ffi_call",
+        skip(self, args),
+        fields(rpc_method = %method)
+    )]
     pub async fn call<T, R>(&self, method: &str, args: &T) -> Result<R>
     where
         T: Serialize,

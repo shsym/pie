@@ -15,6 +15,7 @@ pub mod model;
 pub mod runtime;
 pub mod server;
 pub mod service;
+pub mod telemetry;
 pub mod utils;
 
 // FFI module for PyO3 bindings
