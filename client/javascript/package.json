@@ -20,11 +20,13 @@
     "test": "jest"
   },
   "dependencies": {
-    "blake3": "^2.1.7",
+    "blake3": "^3.0.0",
     "msgpack-lite": "^0.1.26"
   },
   "devDependencies": {
-    "rollup": "^2.0.0",
+    "rollup": "^4.55.1",
     "jest": "^29.0.0"
+    "rollup": "^2.0.0",
+    "jest": "^30.2.0"
   }
 }

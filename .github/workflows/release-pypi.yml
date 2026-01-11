@@ -62,27 +62,51 @@ jobs:
           esac
 
   # Build maturin wheels for multiple platforms (only for pie-server)
-  build-maturin-linux:
+  build-maturin-linux-x86_64:
     needs: setup
     if: needs.setup.outputs.is_maturin == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.10'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
-          args: --release --out dist -m ${{ needs.setup.outputs.package_path }}/pyproject.toml
+          target: x86_64
+          args: --release --out dist -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+          working-directory: ${{ needs.setup.outputs.package_path }}
           manylinux: auto
-      - uses: actions/upload-artifact@v4
+          before-script-linux: |
+            yum install -y openssl-devel pkgconfig perl-IPC-Cmd || apt-get update && apt-get install -y libssl-dev pkg-config
+      - uses: actions/upload-artifact@v6
         with:
-          name: wheels-linux-${{ matrix.target }}
+          name: wheels-linux-x86_64
+          path: dist
+
+  # aarch64 Linux uses native ARM runner to avoid ring cross-compilation issues
+  build-maturin-linux-aarch64:
+    needs: setup
+    if: needs.setup.outputs.is_maturin == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64
+          args: --release --out dist -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+          working-directory: ${{ needs.setup.outputs.package_path }}
+          manylinux: auto
+          before-script-linux: |
+            yum install -y openssl-devel pkgconfig perl-IPC-Cmd || apt-get update && apt-get install -y libssl-dev pkg-config
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-linux-aarch64
           path: dist
 
   build-maturin-macos:
@@ -93,16 +117,17 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.10'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}-apple-darwin
-          args: --release --out dist -m ${{ needs.setup.outputs.package_path }}/pyproject.toml
-      - uses: actions/upload-artifact@v4
+          args: --release --out dist
+          working-directory: ${{ needs.setup.outputs.package_path }}
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-macos-${{ matrix.target }}
           path: dist
@@ -112,15 +137,16 @@ jobs:
     if: needs.setup.outputs.is_maturin == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.10'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          args: --release --out dist -m ${{ needs.setup.outputs.package_path }}/pyproject.toml
-      - uses: actions/upload-artifact@v4
+          args: --release --out dist
+          working-directory: ${{ needs.setup.outputs.package_path }}
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-windows
           path: dist
@@ -130,13 +156,14 @@ jobs:
     if: needs.setup.outputs.is_maturin == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          args: --out dist -m ${{ needs.setup.outputs.package_path }}/pyproject.toml
-      - uses: actions/upload-artifact@v4
+          args: --out dist
+          working-directory: ${{ needs.setup.outputs.package_path }}
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-sdist
           path: dist
@@ -147,15 +174,15 @@ jobs:
     if: needs.setup.outputs.is_maturin == 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.10'
       - name: Install build tools
         run: pip install build
       - name: Build package
         run: python -m build ${{ needs.setup.outputs.package_path }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-python
           path: ${{ needs.setup.outputs.package_path }}/dist
@@ -164,11 +191,11 @@ jobs:
   publish-maturin:
     name: Publish to PyPI (maturin)
     runs-on: ubuntu-latest
-    needs: [setup, build-maturin-linux, build-maturin-macos, build-maturin-windows, build-maturin-sdist]
+    needs: [setup, build-maturin-linux-x86_64, build-maturin-linux-aarch64, build-maturin-macos, build-maturin-windows, build-maturin-sdist]
     if: needs.setup.outputs.is_maturin == 'true' && inputs.dry_run == false
     environment: pypi
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: wheels-*
           merge-multiple: true
@@ -186,7 +213,7 @@ jobs:
     if: needs.setup.outputs.is_maturin == 'false' && inputs.dry_run == false
     environment: pypi
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: wheels-python
           path: dist
