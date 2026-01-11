@@ -789,8 +789,8 @@ class ForwardPass:
                 paged_kv_indptr=kv_page_indptr,
                 paged_kv_indices=kv_page_indices,
                 paged_kv_last_page_len=kv_last_page_lens,
-                num_qo_heads=local_num_query_heads,  # Use local head count
-                num_kv_heads=local_num_key_value_heads,  # Use local head count
+                num_qo_heads=local_num_query_heads,
+                num_kv_heads=local_num_key_value_heads,
                 head_dim_qk=self.model_config.dim_head,
                 page_size=page_size,
                 custom_mask=custom_mask,

@@ -234,8 +234,9 @@ pub struct BatchedForwardPassRequest {
     // Query/Output indirection
     pub qo_indptr: Vec<u32>, // [0, tokens1, tokens1+tokens2, ...]
 
-    // Attention masks (BRLE encoded, per request) - Python decodes these
-    pub masks: Vec<Vec<Vec<u32>>>, // masks[req_idx][token_idx] = BRLE buffer
+    // Attention masks (BRLE encoded, flattened)
+    pub flattened_masks: Vec<u32>, // Concatenation of all BRLE buffers
+    pub mask_indptr: Vec<u32>,     // Pointers into flattened_masks for each token
 
     // Adapter info (one per request)
     pub adapter_indices: Vec<Option<u32>>,
@@ -261,7 +262,8 @@ impl BatchedForwardPassRequest {
             kv_page_indptr: vec![0],
             kv_last_page_lens: Vec::new(),
             qo_indptr: vec![0],
-            masks: Vec::new(),
+            flattened_masks: Vec::new(),
+            mask_indptr: vec![0],
             adapter_indices: Vec::new(),
             adapter_seeds: Vec::new(),
             output_token_indices: Vec::new(),
@@ -287,8 +289,11 @@ impl BatchedForwardPassRequest {
         let total_tokens = self.token_ids.len() as u32;
         self.qo_indptr.push(total_tokens);
 
-        // Masks (pass through BRLE encoded - Python will decode)
-        self.masks.push(req.mask.clone());
+        // Masks (flatten nested structure)
+        for token_mask in &req.mask {
+            self.flattened_masks.extend(token_mask);
+            self.mask_indptr.push(self.flattened_masks.len() as u32);
+        }
 
         // Adapter info
         self.adapter_indices.push(req.adapter);
@@ -308,7 +313,7 @@ impl BatchedForwardPassRequest {
 
     /// Get the number of requests in this batch.
     pub fn num_requests(&self) -> usize {
-        self.masks.len()
+        self.adapter_indices.len()
     }
 
     /// Get the total number of tokens in this batch.

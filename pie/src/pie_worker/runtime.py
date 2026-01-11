@@ -35,8 +35,78 @@ if torch.cuda.is_available():
 from . import message
 from . import hf_utils
 
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import NamedTuple
+
 # Re-export RuntimeConfig for backward compatibility
 __all__ = ["Runtime", "RuntimeConfig"]
+
+
+class StepTiming(NamedTuple):
+    """Timing data for a single fire_batch step."""
+
+    # Top-level stages
+    build_batch: float
+    get_inputs: float
+    get_sampling_meta: float
+    broadcast: float
+    inference: float
+    create_responses: float
+    total: float
+    # build_batch breakdown
+    decode_u32: float
+    mask_loop: float
+    brle_decode: float
+    adapter_loop: float
+    sampler_loop: float
+    embed_loop: float
+
+
+@dataclass
+class LatencyStats:
+    """Tracks latency statistics for fire_batch stages using a rolling window."""
+
+    print_interval: int = 10
+    step_count: int = 0
+    history: deque = field(default_factory=lambda: deque(maxlen=10))
+
+    def __post_init__(self):
+        self.history = deque(maxlen=self.print_interval)
+
+    def record(self, timing: StepTiming):
+        """Record timing for one step."""
+        self.history.append(timing)
+        self.step_count += 1
+
+        if self.step_count % self.print_interval == 0:
+            self._print_stats()
+
+    def _print_stats(self):
+        """Print statistics for the last N steps."""
+        n = len(self.history)
+        if n == 0:
+            return
+
+        # Compute averages
+        def avg(field_idx: int) -> float:
+            return sum(t[field_idx] for t in self.history) / n * 1000
+
+        print(f"\n=== fire_batch Latency (last {n} steps, step {self.step_count}) ===")
+        print(f"  build_batch:       {avg(0):.3f} ms")
+        print(f"    decode_u32:      {avg(7):.3f} ms")
+        print(f"    mask_loop:       {avg(8):.3f} ms (brle={avg(9):.3f} ms)")
+        print(f"    adapter_loop:    {avg(10):.3f} ms")
+        print(f"    sampler_loop:    {avg(11):.3f} ms")
+        print(f"    embed_loop:      {avg(12):.3f} ms")
+        print(f"  get_model_inputs:  {avg(1):.3f} ms")
+        print(f"  get_sampling_meta: {avg(2):.3f} ms")
+        print(f"  broadcast:         {avg(3):.3f} ms")
+        print(f"  inference:         {avg(4):.3f} ms")
+        print(f"  create_responses:  {avg(5):.3f} ms")
+        print(f"  total:             {avg(6):.3f} ms")
+        print("=" * 60)
 
 
 class Runtime:
@@ -77,6 +147,7 @@ class Runtime:
         self.config = config
         self.log_queue = log_queue
         self.adapters = {}
+        self._latency_stats = LatencyStats(print_interval=10)
 
         # Initialize seeds
         self._log(f"Initializing with random seed: {config.random_seed}", "DEBUG")
@@ -651,17 +722,27 @@ class Runtime:
         """
         from .batching import Batch, _decode_brle
 
+        t_start = time.perf_counter()
+
         # Build internal Batch object from pre-batched data
-        batch = self._build_batch_from_request(kwargs)
+        t0 = time.perf_counter()
+        batch, build_timing = self._build_batch_from_request(kwargs)
+        t_build_batch = time.perf_counter() - t0
 
         # Get model inputs and sampling metadata
         device = self.config.device
+        t0 = time.perf_counter()
         inputs = batch.get_model_inputs(device)
+        t_get_inputs = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         sampling_metadata = batch.get_sampling_metadata(
             device, self.config.activation_dtype
         )
+        t_get_sampling_meta = time.perf_counter() - t0
 
         # Broadcast to workers if multi-GPU
+        t0 = time.perf_counter()
         if self.config.world_size > 1:
             msg = {
                 "type": "STEP",
@@ -669,11 +750,15 @@ class Runtime:
                 "sampling_metadata": sampling_metadata,
             }
             utils.broadcast_struct(msg, src=0, device=device)
+        t_broadcast = time.perf_counter() - t0
 
         # Execute inference
+        t0 = time.perf_counter()
         sampling_results = self._run_step(inputs, sampling_metadata)
+        t_inference = time.perf_counter() - t0
 
         # Package responses
+        t0 = time.perf_counter()
         responses = batch.create_responses(sampling_results)
 
         # Convert to serializable format
@@ -685,10 +770,32 @@ class Runtime:
                     "dists": resp.dists,
                 }
             )
+        t_create_responses = time.perf_counter() - t0
+
+        t_total = time.perf_counter() - t_start
+
+        # Record latency stats
+        self._latency_stats.record(
+            StepTiming(
+                build_batch=t_build_batch,
+                get_inputs=t_get_inputs,
+                get_sampling_meta=t_get_sampling_meta,
+                broadcast=t_broadcast,
+                inference=t_inference,
+                create_responses=t_create_responses,
+                total=t_total,
+                decode_u32=build_timing["decode_u32"],
+                mask_loop=build_timing["mask_loop"],
+                brle_decode=build_timing["brle_decode"],
+                adapter_loop=build_timing["adapter_loop"],
+                sampler_loop=build_timing["sampler_loop"],
+                embed_loop=build_timing["embed_loop"],
+            )
+        )
 
         return {"results": results}
 
-    def _build_batch_from_request(self, args: dict) -> Batch:
+    def _build_batch_from_request(self, args: dict) -> tuple:
         """
         Convert BatchedForwardPassRequest dict to internal Batch object.
 
@@ -696,9 +803,18 @@ class Runtime:
             args: Dictionary with batched request fields
 
         Returns:
-            Batch object ready for inference
+            Tuple of (Batch object ready for inference, timing dict)
         """
         from .batching import Batch, _decode_brle
+
+        timing = {
+            "decode_u32": 0.0,
+            "mask_loop": 0.0,
+            "brle_decode": 0.0,
+            "adapter_loop": 0.0,
+            "sampler_loop": 0.0,
+            "embed_loop": 0.0,
+        }
 
         batch = Batch()
 
@@ -709,6 +825,7 @@ class Runtime:
             return list(data)
 
         # Direct assignments - decode bytes as u32 arrays
+        t0 = time.perf_counter()
         batch.token_ids = _decode_u32(args["token_ids"])
         batch.position_ids = _decode_u32(args["position_ids"])
         batch.kv_page_indices = _decode_u32(args["kv_page_indices"])
@@ -717,9 +834,12 @@ class Runtime:
         batch.qo_indptr = _decode_u32(args["qo_indptr"])
         batch.single_token_mode = args["single_token_mode"]
         batch.total_tokens = len(batch.token_ids)
+        timing["decode_u32"] = time.perf_counter() - t0
 
         # Process per-request data
-        masks = args["masks"]
+        flattened_masks_u32 = _decode_u32(args["flattened_masks"])
+        mask_indptr = _decode_u32(args["mask_indptr"])
+
         adapter_indices = args["adapter_indices"]
         adapter_seeds = args["adapter_seeds"]
         output_token_indices = args["output_token_indices"]
@@ -727,14 +847,22 @@ class Runtime:
         output_embed_ptrs = args["output_embed_ptrs"]
         output_embed_indices = args["output_embed_indices"]
 
-        num_requests = len(masks)
-        token_offset = 0
+        num_requests = len(adapter_indices)
 
+        # ===== BATCH BRLE DECODING (once for all tokens) =====
+        t0 = time.perf_counter()
+        from .batching import decode_brle_batch
+
+        # First pass: compute per-token metadata (seq_len, context_len, position_id)
+        all_seq_lens = []  # seq_len for each token
+        all_position_ids = []  # position_id for each token
+        request_token_ranges = []  # (start_token, end_token, seq_len) per request
+
+        token_cursor = 0
         for i in range(num_requests):
-            # Calculate tokens for this request from decoded batch data
             req_token_count = batch.qo_indptr[i + 1] - batch.qo_indptr[i]
 
-            # Calculate sequence length from KV pages (using decoded batch data)
+            # Calculate sequence length from KV pages
             kv_start = batch.kv_page_indptr[i]
             kv_end = batch.kv_page_indptr[i + 1]
             num_pages = kv_end - kv_start
@@ -747,18 +875,46 @@ class Runtime:
 
             context_len = seq_len - req_token_count
 
-            # Decode BRLE masks
-            req_masks = masks[i]
-            attention_mask = np.zeros((req_token_count, seq_len), dtype=np.bool_)
-            for j, brle in enumerate(req_masks):
-                decoded = _decode_brle(brle)
-                expected_len = context_len + j + 1
-                if len(decoded) >= expected_len:
-                    attention_mask[j, :expected_len] = decoded[:expected_len]
+            request_token_ranges.append(
+                (token_cursor, token_cursor + req_token_count, seq_len)
+            )
 
-            batch.attention_masks.append(attention_mask.flatten())
+            for j in range(req_token_count):
+                all_seq_lens.append(seq_len)
+                all_position_ids.append(context_len + j)
+
+            token_cursor += req_token_count
+
+        # Compute token_acc_seq_lens (cumulative bit offsets)
+        token_acc_seq_lens = [0]
+        for sl in all_seq_lens:
+            token_acc_seq_lens.append(token_acc_seq_lens[-1] + sl)
+
+        # Prepare arrays for batch decoder
+        flattened_np = np.array(flattened_masks_u32, dtype=np.int32)
+        mask_indptr_np = np.array(mask_indptr, dtype=np.int32)
+        position_ids_np = np.array(all_position_ids, dtype=np.int32)
+        token_acc_seq_lens_np = np.array(token_acc_seq_lens, dtype=np.int32)
+
+        # Call batch decoder ONCE for all tokens
+        t_brle = time.perf_counter()
+        batch.attention_masks = decode_brle_batch(
+            flattened_np, mask_indptr_np, position_ids_np, token_acc_seq_lens_np
+        )
+        timing["brle_decode"] = time.perf_counter() - t_brle
+
+        # Unpack all bits
+        timing["mask_loop"] = time.perf_counter() - t0
+
+        # ===== PER-REQUEST LOOP (slicing pre-decoded masks) =====
+        token_offset = 0
+
+        for i in range(num_requests):
+            start_token, end_token, seq_len = request_token_ranges[i]
+            req_token_count = end_token - start_token
 
             # Handle adapters
+            t0 = time.perf_counter()
             adapter_idx = adapter_indices[i]
             if adapter_idx is not None and adapter_idx in self.adapters:
                 seed = adapter_seeds[i] if adapter_seeds[i] is not None else 0
@@ -769,8 +925,10 @@ class Runtime:
             # Handle output indices (adjust for batch offset)
             for idx in output_token_indices[i]:
                 batch.indices_for_logits.append(idx + token_offset)
+            timing["adapter_loop"] += time.perf_counter() - t0
 
             # Handle samplers
+            t0 = time.perf_counter()
             for sampler_config in output_token_samplers[i]:
                 params = {}
                 sampler_idx = sampler_config.get("sampler", 1)
@@ -788,11 +946,13 @@ class Runtime:
 
                 params["temperature"] = sampler_config.get("temperature", 1.0)
                 batch.sampler_params.append(params)
+            timing["sampler_loop"] += time.perf_counter() - t0
 
             # Handle embed outputs
-            for idx, ptr in zip(output_embed_indices[i], output_embed_ptrs[i]):
-                batch.indices_for_embed_storage.append(idx + token_offset)
-                batch.embed_storage_pointers.append(ptr)
+            t0 = time.perf_counter()
+            # for idx, ptr in zip(output_embed_indices[i], output_embed_ptrs[i]):
+            #     batch.indices_for_embed_storage.append(idx + token_offset)
+            #     batch.embed_storage_pointers.append(ptr)
 
             # Create dummy request for response packaging
             dummy_req = message.ForwardPassRequest(
@@ -807,10 +967,11 @@ class Runtime:
                 output_token_samplers=output_token_samplers[i],
             )
             batch.requests.append(dummy_req)
+            timing["embed_loop"] += time.perf_counter() - t0
 
             token_offset += req_token_count
 
-        return batch
+        return batch, timing
 
     def embed_image_rpc(self, **kwargs) -> None:
         """Handle embed_image RPC."""

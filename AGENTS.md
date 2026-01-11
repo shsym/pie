@@ -10,9 +10,9 @@ This document provides a concise overview of the key directories and components 
 *   **Integration**: It exposes a Python interface via PyO3, allowing it to be controlled by the `server` layer.
 *   **Key Dependencies**: `wasmtime`, `tokio`, `zeromq`, `pyo3`.
 
-## `server`
+## `pie`
 **Main Entrypoint and CLI (`pie`) + Inference Backend.**
-*   **Path**: `server/`
+*   **Path**: `pie/`
 *   **Language**: Python (`pie-server`) + Rust (PyO3 extension)
 *   **Description**: The primary interface for the user. It wraps the `runtime` (Rust), includes the inference backend (`pie_worker`), and provides the `pie` CLI.
 *   **Subdirectories**:

@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from numba import njit, prange
 
 from . import message
 
@@ -38,7 +39,9 @@ class Batch:
     qo_indptr: list[int] = field(default_factory=lambda: [0])
 
     # Attention masks (one per request, flattened later)
-    attention_masks: list[np.ndarray] = field(default_factory=list)
+    attention_masks: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.bool_)
+    )
 
     # Adapters
     adapter_indices: list[int] = field(default_factory=list)
@@ -71,35 +74,29 @@ class Batch:
         """
 
         self.adapter_subpass_needed = False
-        # Create batched attention mask
-        batched_attention_mask = (
-            np.concatenate(self.attention_masks)
-            if self.attention_masks
-            else np.array([], dtype=np.bool_)
-        )
 
         return {
             "token_ids": torch.as_tensor(
                 self.token_ids, device=device, dtype=torch.long
-            ).contiguous(),
+            ),
             "position_ids": torch.as_tensor(
                 self.position_ids, device=device, dtype=torch.int32
-            ).contiguous(),
+            ),
             "qo_indptr": torch.as_tensor(
                 self.qo_indptr, device=device, dtype=torch.int32
-            ).contiguous(),
+            ),
             "kv_page_indices": torch.as_tensor(
                 self.kv_page_indices, device=device, dtype=torch.int32
-            ).contiguous(),
+            ),
             "kv_page_indptr": torch.as_tensor(
                 self.kv_page_indptr, device=device, dtype=torch.int32
-            ).contiguous(),
+            ),
             "kv_last_page_lens": torch.as_tensor(
                 self.kv_last_page_lens, device=device, dtype=torch.int32
-            ).contiguous(),
+            ),
             "custom_mask": torch.as_tensor(
-                batched_attention_mask, device=device, dtype=torch.bool
-            ).contiguous(),
+                self.attention_masks, device=device, dtype=torch.bool
+            ),
             "single_token_inference_mode": self.single_token_mode,
             "adapter_indices": (
                 self.adapter_indices if self.adapter_subpass_needed else []
@@ -240,3 +237,55 @@ def _decode_brle(brle_buffer) -> np.ndarray:
         pattern[::2] = True
         pattern[1::2] = False
         return np.repeat(pattern, brle_buffer)
+
+
+@njit(parallel=False, cache=False)
+def decode_brle_batch(
+    flattened_masks: np.ndarray,
+    mask_indptr: np.ndarray,
+    position_ids: np.ndarray,
+    token_acc_seq_lens: np.ndarray,
+) -> np.ndarray:
+    """
+    Decode BRLE masks for an entire batch using Numba JIT.
+
+    Args:
+        flattened_masks: Concatenated BRLE run lengths (int32)
+        mask_indptr: Pointers to BRLE ranges per token (int32)
+        position_ids: Position of each token, defines valid_len (int32)
+        token_acc_seq_lens: Cumulative bit offsets per token (int32)
+
+    Returns:
+        Flat boolean array with all mask values
+    """
+    num_tokens = len(position_ids)
+    total_bits = token_acc_seq_lens[-1]
+    result = np.zeros(total_bits, dtype=np.bool_)
+
+    for k in range(num_tokens):
+        rle_start = mask_indptr[k]
+        rle_end = mask_indptr[k + 1]
+        global_bit_start = token_acc_seq_lens[k]
+        valid_len = position_ids[k] + 1
+
+        curr_bit_pos = global_bit_start
+        bits_consumed = 0
+        is_true_run = True
+
+        for run_idx in range(rle_start, rle_end):
+            if bits_consumed >= valid_len:
+                break
+
+            run_len = flattened_masks[run_idx]
+            remaining = valid_len - bits_consumed
+            eff_len = min(run_len, remaining)
+
+            if is_true_run and eff_len > 0:
+                for bit_off in range(eff_len):
+                    result[curr_bit_pos + bit_off] = True
+
+            bits_consumed += eff_len
+            curr_bit_pos += eff_len
+            is_true_run = not is_true_run
+
+    return result
