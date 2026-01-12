@@ -73,6 +73,18 @@ class ControlChannel:
         queue_idx = self.rank - 1
         return self.queues[queue_idx].get(timeout=timeout)
 
+    def cleanup(self) -> None:
+        """
+        Close all queues to prevent 'leaked semaphore' warnings.
+
+        Should be called by rank 0 during shutdown.
+        """
+        for q in self.queues:
+            # cancel_join_thread prevents the process from hanging if the
+            # background thread that feeds the queue is still alive
+            q.cancel_join_thread()
+            q.close()
+
 
 def create_control_channels(world_size: int) -> list[Queue]:
     """

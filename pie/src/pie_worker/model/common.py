@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 import math
+
 from typing import Callable, Any
 
 # Import flashinfer or flashinfer_metal depending on platform
@@ -34,10 +35,14 @@ else:
     NUM_SM = 108
 
 
-def _safe_scaled_softmax_impl(logits, temperatures, greedy_threshold=1e-5):
+def _safe_scaled_softmax_impl_torch(logits, temperatures, greedy_threshold=1e-5):
     """
-    Optimized Approach: Branchless safe_scaled_softmax
+    Optimized Approach: Branchless safe_scaled_softmax (PyTorch Fallback)
     """
+    # Ensure temperatures broadcasts correctly for where
+    if temperatures.ndim == 1:
+        temperatures = temperatures.unsqueeze(1)
+
     greedy_mask = temperatures < greedy_threshold
 
     # Branchless logic
@@ -54,14 +59,132 @@ def _safe_scaled_softmax_impl(logits, temperatures, greedy_threshold=1e-5):
     return torch.where(greedy_mask, probs_greedy, probs_sampling)
 
 
-# torch.compile on MPS has issues with bfloat16 Metal shader generation
-# (type conversion errors in generated Metal code), so only compile on CUDA
-if torch.cuda.is_available():
-    safe_scaled_softmax = torch.compile(
-        _safe_scaled_softmax_impl, mode="reduce-overhead"
-    )
+if torch.backends.mps.is_available():
+    safe_scaled_softmax = _safe_scaled_softmax_impl_torch
 else:
-    safe_scaled_softmax = _safe_scaled_softmax_impl
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _safe_softmax_kernel(
+        output_ptr,
+        logits_ptr,
+        temps_ptr,
+        stride_logits_row,
+        stride_logits_col,
+        stride_temps_row,
+        stride_out_row,
+        stride_out_col,
+        n_cols,
+        greedy_threshold,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        # Row index this program instance is processing
+        row_idx = tl.program_id(0)
+
+        # Calculate pointers for the specific row
+        logits_row_ptr = logits_ptr + row_idx * stride_logits_row
+        temps_ptr_loc = temps_ptr + row_idx * stride_temps_row
+        out_row_ptr = output_ptr + row_idx * stride_out_row
+
+        # Load temperature for this row
+        # We assume temps is shape (Batch, 1) or (Batch,)
+        T = tl.load(temps_ptr_loc)
+
+        # Create offsets for column loading
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+
+        # Load logits with -inf padding for safety in max/argmax operations
+        row_logits = tl.load(
+            logits_row_ptr + col_offsets * stride_logits_col,
+            mask=mask,
+            other=-float("inf"),
+        )
+
+        # -----------------------------------------------------------
+        # Optimization: Uniform Control Flow
+        # Since T is constant for the whole row, all threads in the
+        # warp/block take the same branch.
+        # -----------------------------------------------------------
+        if T < greedy_threshold:
+            # --- GREEDY PATH (Argmax) ---
+            # 1. Find the index of the max value
+            max_idx = tl.argmax(row_logits, axis=0)
+
+            # 2. Create One-Hot encoding
+            # Compare every offset to the max_idx
+            result = tl.where(col_offsets == max_idx, 1.0, 0.0)
+
+        else:
+            # --- SAMPLING PATH (Softmax) ---
+            # 1. Apply temperature scaling
+            scaled_logits = row_logits / T
+
+            # 2. Subtract max for numerical stability (standard softmax trick)
+            max_val = tl.max(scaled_logits, axis=0)
+            logits_minus_max = scaled_logits - max_val
+
+            # 3. Exponentiate
+            numerator = tl.exp(logits_minus_max)
+
+            # 4. Sum (normalization factor)
+            denominator = tl.sum(numerator, axis=0)
+
+            # 5. Divide
+            result = numerator / denominator
+
+        # Store result
+        tl.store(out_row_ptr + col_offsets * stride_out_col, result, mask=mask)
+
+    def safe_scaled_softmax_triton(logits, temperatures, greedy_threshold=1e-5):
+        """
+        Triton wrapper for safe scaled softmax.
+        """
+        # Input handling
+        n_rows, n_cols = logits.shape
+
+        # Ensure temperatures broadcasts correctly.
+        # If 1D (Batch,), reshape to (Batch, 1) for consistent striding logic
+        if temperatures.ndim == 1:
+            temperatures = temperatures.unsqueeze(1)
+
+        # Output allocation
+        output = torch.empty_like(logits)
+
+        # Heuristics for Block Size and Warps
+        # Next power of 2 to fit the row in SRAM
+        BLOCK_SIZE = triton.next_power_of_2(n_cols)
+
+        # Manage maximum block size (hardware limit is usually 128KB, so ~32k float32s)
+        # If n_cols is massive, we would need a tiled implementation, but this covers most cases.
+        num_warps = 4
+        if BLOCK_SIZE >= 2048:
+            num_warps = 8
+        if BLOCK_SIZE >= 4096:
+            num_warps = 16
+
+        # Launch Kernel
+        grid = (n_rows,)
+
+        _safe_softmax_kernel[grid](
+            output,
+            logits,
+            temperatures,
+            logits.stride(0),
+            logits.stride(1),
+            temperatures.stride(0),
+            output.stride(0),
+            output.stride(1),
+            n_cols,
+            greedy_threshold,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+
+        return output
+
+    safe_scaled_softmax = safe_scaled_softmax_triton
 
 
 def sample_common(

@@ -152,7 +152,7 @@ where
 {
     if !config.enabled {
         TELEMETRY_ENABLED.store(false, Ordering::SeqCst);
-        eprintln!("[Telemetry] Disabled in config");
+        //eprintln!("[Telemetry] Disabled in config");
         return None;
     }
 

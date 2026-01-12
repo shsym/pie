@@ -366,11 +366,3 @@ def init_process(
     # Cleanup
     if world_size > 1:
         dist.destroy_process_group()
-
-
-def entrypoint():
-    fire.Fire(main)
-
-
-if __name__ == "__main__":
-    entrypoint()

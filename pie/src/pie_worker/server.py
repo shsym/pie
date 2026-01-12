@@ -212,7 +212,9 @@ def create_dispatcher(service: Runtime) -> ThreadedDispatcher:
     return ThreadedDispatcher(service)
 
 
-def poll_ffi_queue(ffi_queue, service: Runtime, poll_timeout_ms: int = 100) -> None:
+def poll_ffi_queue(
+    ffi_queue, service: Runtime, stop_event: threading.Event, poll_timeout_ms: int = 100
+) -> None:
     """Poll the Rust FfiQueue and process requests.
 
     This is the new high-performance worker loop that polls a Rust queue
@@ -222,6 +224,7 @@ def poll_ffi_queue(ffi_queue, service: Runtime, poll_timeout_ms: int = 100) -> N
     Args:
         ffi_queue: _pie.FfiQueue instance from start_server_with_ffi
         service: Runtime instance to dispatch calls to
+        stop_event: Event to signal shutdown
         poll_timeout_ms: How long to block waiting for requests (ms)
     """
     # Method dispatch table
@@ -236,7 +239,7 @@ def poll_ffi_queue(ffi_queue, service: Runtime, poll_timeout_ms: int = 100) -> N
         "download_adapter": service.download_adapter_rpc,
     }
 
-    while True:
+    while not stop_event.is_set():
         # Poll the Rust queue (releases GIL while waiting)
         request = ffi_queue.poll_blocking(poll_timeout_ms)
         if request is None:
@@ -276,15 +279,19 @@ def poll_ffi_queue(ffi_queue, service: Runtime, poll_timeout_ms: int = 100) -> N
             ffi_queue.respond(request_id, response)
 
 
-def start_ffi_worker(ffi_queue, service: Runtime) -> threading.Thread:
+def start_ffi_worker(
+    ffi_queue, service: Runtime
+) -> tuple[threading.Thread, threading.Event]:
     """Start the FFI worker thread that polls the Rust queue.
 
-    Returns the worker thread (already started).
+    Returns:
+        tuple (thread, stop_event) where thread is already started.
     """
+    stop_event = threading.Event()
 
     def worker():
-        poll_ffi_queue(ffi_queue, service)
+        poll_ffi_queue(ffi_queue, service, stop_event)
 
     thread = threading.Thread(target=worker, name="pie-ffi-worker", daemon=True)
     thread.start()
-    return thread
+    return thread, stop_event

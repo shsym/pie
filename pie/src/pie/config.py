@@ -58,7 +58,7 @@ max_num_adapters = 32
 max_adapter_rank = 8
 
 # Memory management
-gpu_mem_utilization = 0.9
+gpu_mem_utilization = 0.8
 
 # CUDA graphs (experimental)
 use_cuda_graphs = false

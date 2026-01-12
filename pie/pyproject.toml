@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pie-server"
-version = "0.2.0"
+version = "0.2.5"
 description = "Programmable Inference Engine"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -14,7 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
+] 
 
 # Base dependencies (CPU compatible / PyPI available)
 dependencies = [
@@ -43,7 +43,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# --- CUDA Variants ---
+
+cuda = [
+    "torch>=2.7.1",
+    "torchao>=0.14.1",  
+    "flashinfer-python>=0.6.0",
+    "flashinfer-cubin>=0.6.0",
+]
+
+# for uv only
 cu126 = [
     "torch>=2.7.1",
     "torchao>=0.14.1",  
@@ -51,6 +59,7 @@ cu126 = [
     "flashinfer-cubin>=0.6.0",
 ]
 
+# for uv only
 cu128 = [
     "torch>=2.7.1",
     "torchao>=0.14.1",  
@@ -59,6 +68,7 @@ cu128 = [
     "flashinfer-jit-cache>=0.6.0",
 ]
 
+# for uv only
 cu130 = [
     "torch>=2.7.1",
     "torchao>=0.14.1",  
@@ -76,9 +86,6 @@ metal = [
     "pyobjc-framework-MetalKit>=10.0,<11.0",
     "pyobjc-framework-Cocoa>=10.0,<11.0",
 ]
-
-# --- Dev/Test ---
-test = ["pytest>=8.0"]
 
 [project.scripts]
 pie = "pie_cli.cli:app"
@@ -127,6 +134,7 @@ flashinfer-jit-cache = [
 
 [tool.maturin] 
 python-source = "src"
+python-packages = ["pie", "pie_cli", "pie_worker", "flashinfer_metal"]
 module-name = "pie._pie"
 manifest-path = "../runtime/Cargo.toml"
 features = ["pyo3/extension-module"]
@@ -136,7 +144,7 @@ cache-keys = [{file = "pyproject.toml"}, {file = "../runtime/Cargo.toml"}, {file
 
 # Declare CUDA/Metal extras as mutually exclusive
 conflicts = [
-    [
+    [ 
         { extra = "cu126" },
         { extra = "cu128" },
         { extra = "cu130" },

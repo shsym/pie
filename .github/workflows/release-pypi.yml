@@ -21,18 +21,7 @@ on:
 permissions:
   contents: read
 
-env:
-  PACKAGE_PATHS: |
-    {
-      "pie-server (pie/)": "pie",
-      "pie-client (client/python/)": "client/python",
-      "pie-client-cli (client/cli/)": "client/cli",
-      "pie-bakery (sdk/tools/bakery/)": "sdk/tools/bakery",
-      "inferlet (sdk/python/)": "sdk/python"
-    }
-
 jobs:
-  # Determine package path and type
   setup:
     runs-on: ubuntu-latest
     outputs:
@@ -61,7 +50,10 @@ jobs:
               ;;
           esac
 
-  # Build maturin wheels for multiple platforms (only for pie-server)
+  # ============================================================================
+  # Maturin builds (pie-server with Rust extension)
+  # ============================================================================
+
   build-maturin-linux-x86_64:
     needs: setup
     if: needs.setup.outputs.is_maturin == 'true'
@@ -79,13 +71,12 @@ jobs:
           working-directory: ${{ needs.setup.outputs.package_path }}
           manylinux: auto
           before-script-linux: |
-            yum install -y openssl-devel pkgconfig perl-IPC-Cmd || apt-get update && apt-get install -y libssl-dev pkg-config
+            if command -v yum &> /dev/null; then yum install -y openssl-devel pkgconfig perl-IPC-Cmd; else apt-get update && apt-get install -y libssl-dev pkg-config; fi
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-linux-x86_64
-          path: dist
+          path: ${{ needs.setup.outputs.package_path }}/dist
 
-  # aarch64 Linux uses native ARM runner to avoid ring cross-compilation issues
   build-maturin-linux-aarch64:
     needs: setup
     if: needs.setup.outputs.is_maturin == 'true'
@@ -103,19 +94,16 @@ jobs:
           working-directory: ${{ needs.setup.outputs.package_path }}
           manylinux: auto
           before-script-linux: |
-            yum install -y openssl-devel pkgconfig perl-IPC-Cmd || apt-get update && apt-get install -y libssl-dev pkg-config
+            if command -v yum &> /dev/null; then yum install -y openssl-devel pkgconfig perl-IPC-Cmd; else apt-get update && apt-get install -y libssl-dev pkg-config; fi
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-linux-aarch64
-          path: dist
+          path: ${{ needs.setup.outputs.package_path }}/dist
 
   build-maturin-macos:
     needs: setup
     if: needs.setup.outputs.is_maturin == 'true'
     runs-on: macos-latest
-    strategy:
-      matrix:
-        target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -124,13 +112,13 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}-apple-darwin
+          target: aarch64-apple-darwin
           args: --release --out dist
           working-directory: ${{ needs.setup.outputs.package_path }}
       - uses: actions/upload-artifact@v6
         with:
-          name: wheels-macos-${{ matrix.target }}
-          path: dist
+          name: wheels-macos-aarch64
+          path: ${{ needs.setup.outputs.package_path }}/dist
 
   build-maturin-windows:
     needs: setup
@@ -149,7 +137,7 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-windows
-          path: dist
+          path: ${{ needs.setup.outputs.package_path }}/dist
 
   build-maturin-sdist:
     needs: setup
@@ -166,9 +154,12 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-sdist
-          path: dist
+          path: ${{ needs.setup.outputs.package_path }}/dist
 
-  # Build pure Python packages
+  # ============================================================================
+  # Pure Python builds
+  # ============================================================================
+
   build-python:
     needs: setup
     if: needs.setup.outputs.is_maturin == 'false'
@@ -187,7 +178,10 @@ jobs:
           name: wheels-python
           path: ${{ needs.setup.outputs.package_path }}/dist
 
-  # Publish maturin package
+  # ============================================================================
+  # Publish
+  # ============================================================================
+
   publish-maturin:
     name: Publish to PyPI (maturin)
     runs-on: ubuntu-latest
@@ -205,7 +199,6 @@ jobs:
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
 
-  # Publish pure Python package
   publish-python:
     name: Publish to PyPI (pure Python)
     runs-on: ubuntu-latest

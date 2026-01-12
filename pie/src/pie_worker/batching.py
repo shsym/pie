@@ -203,9 +203,7 @@ class Batch:
         Returns:
             Dictionary containing input tensors for the model engine.
         """
-
-        self.adapter_subpass_needed = False
-
+        self.adapter_subpass_needed = False  # disable ZO for testing
         return {
             "token_ids": torch.as_tensor(
                 self.token_ids, device=device, dtype=torch.long
@@ -261,17 +259,15 @@ class Batch:
 
         # Vectorized tensor creation from NumPy arrays (no list comprehension)
         temperatures = (
-            torch.as_tensor(self.temperatures, device=device, dtype=dtype)
+            torch.tensor(self.temperatures, device=device, dtype=dtype)
             .clamp(min=1e-6)
             .unsqueeze(1)
         )
 
         # Pre-build sampler param tensors (avoid per-group construction)
-        top_k_tensor = torch.as_tensor(
-            self.top_k_values, device=device, dtype=torch.long
-        )
-        top_p_tensor = torch.as_tensor(self.top_p_values, device=device, dtype=dtype)
-        min_p_tensor = torch.as_tensor(self.min_p_values, device=device, dtype=dtype)
+        top_k_tensor = torch.tensor(self.top_k_values, device=device, dtype=torch.long)
+        top_p_tensor = torch.tensor(self.top_p_values, device=device, dtype=dtype)
+        min_p_tensor = torch.tensor(self.min_p_values, device=device, dtype=dtype)
 
         # Group samplers
         sampler_groups: dict[int, list[int]] = {}

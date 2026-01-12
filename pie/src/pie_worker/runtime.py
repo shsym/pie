@@ -131,9 +131,10 @@ class Runtime:
 
     def _log(self, msg: str, level: str = "INFO") -> None:
         """Log a message to the queue if available."""
-        self.log_queue.put({"message": msg, "level": level})
+        if self.log_queue is not None:
+            self.log_queue.put({"message": msg, "level": level})
 
-    def __init__(self, config: RuntimeConfig, log_queue: object):
+    def __init__(self, config: RuntimeConfig, log_queue: object = None):
         """
         Initialize the runtime.
 

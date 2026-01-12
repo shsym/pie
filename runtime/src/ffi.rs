@@ -226,15 +226,10 @@ fn start_server(
 
         let (token, shutdown_tx) = internal_token;
 
-        // Keep the runtime alive by leaking it (it will be cleaned up when the handle is dropped)
-        // We use Arc to share the runtime
-        let runtime_clone = Arc::clone(&rt);
-        std::mem::forget(rt);
-
         Ok(ServerHandle {
             internal_token: token,
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
-            runtime: runtime_clone,
+            runtime: rt,
         })
     })
 }
@@ -291,7 +286,7 @@ fn start_server_with_ffi(
             // Wait for server to be ready and get the internal auth token
             let internal_token = ready_rx.await.map_err(|e| {
                 PyRuntimeError::new_err(format!("Server failed to start: {}", e))
-            })?;
+            })?; 
 
             // Create Model with FFI backend using the queue from Python
             let scheduler_config = SchedulerConfig::default();
@@ -314,14 +309,10 @@ fn start_server_with_ffi(
 
         let (token, shutdown_tx) = result;
 
-        // Keep the runtime alive
-        let runtime_clone = Arc::clone(&rt);
-        std::mem::forget(rt);
-
         Ok(ServerHandle {
             internal_token: token,
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
-            runtime: runtime_clone,
+            runtime: rt,
         })
     })
 }

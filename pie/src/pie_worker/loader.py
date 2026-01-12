@@ -313,7 +313,7 @@ class Schema:
         reader: ReaderFn,
         config: "RuntimeConfig",
         num_layers: int = 0,
-        log_queue: object,
+        log_queue: object | None = None,
     ) -> WeightStore:
         """
         Load all weights according to the schema.

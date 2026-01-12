@@ -106,8 +106,6 @@ fn init_tracing(
     use tracing_subscriber::fmt;
     use tracing_subscriber::EnvFilter;
 
-    eprintln!("[init_tracing] log_dir={:?}, telemetry_enabled={}, endpoint={}", 
-              log_dir, telemetry_config.enabled, telemetry_config.endpoint);
 
     let filter = if verbose {
         EnvFilter::try_from_default_env()

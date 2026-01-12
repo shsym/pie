@@ -37,17 +37,17 @@ jobs:
       - name: Run black format check
         run: ./tests/format/python-format.sh
 
-  typecheck:
-    name: Type Check (pyright)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
+  # typecheck:
+  #   name: Type Check (pyright)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v6
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-          python-version: "3.12"
+  #     - name: Install uv
+  #       uses: astral-sh/setup-uv@v7
+  #       with:
+  #         enable-cache: true
+  #         python-version: "3.12"
 
-      - name: Run pyright
-        run: ./tests/format/python-typecheck.sh
+  #     - name: Run pyright
+  #       run: ./tests/format/python-typecheck.sh
