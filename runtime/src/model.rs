@@ -18,7 +18,7 @@ use super::runtime::{self, TerminationCause};
 use super::service::ServiceCommand;
 use crate::instance::InstanceId;
 use anyhow::Result;
-use bytes::Bytes;
+
 use futures::future;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
@@ -675,14 +675,11 @@ impl Model {
                     }
                 });
             }
-            Request::DownloadAdapter(req, resp_tx) => {
+            Request::DownloadAdapter(req) => {
                 let backend = self.backend.clone();
                 tokio::spawn(async move {
-                    let result: Result<Vec<u8>, _> = backend
-                        .call_with_timeout("download_adapter", &req, Duration::from_secs(60))
-                        .await;
-                    if let Ok(data) = result {
-                        resp_tx.send(Bytes::from(data)).ok();
+                    if let Err(e) = backend.notify("download_adapter", &req).await {
+                        eprintln!("[Error] download_adapter failed: {:?}", e);
                     }
                 });
             }

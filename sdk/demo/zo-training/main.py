@@ -34,16 +34,19 @@ class TrainingConfig:
 
     # --- Server and Paths ---
     SERVER_URIS: List[str] = field(default_factory=lambda: ["ws://127.0.0.1:8080"])
-    SCRIPT_DIR: Path = Path(__file__).resolve().parent
-    WASM_DIR: Path = SCRIPT_DIR / "inferlets" / "target" / "wasm32-wasip2" / "release"
+    # --- Registry Inferlet Names ---
+    INFERLET_NAMES: Dict[str, str] = field(
+        default_factory=lambda: {
+            "es-init": "ingim/es-init",
+            "es-rollout": "ingim/es-rollout",
+            "es-update": "ingim/es-update",
+        }
+    )
 
     # --- Dataset Configuration ---
     DATASET_NAME: str = "math"  # "countdown" or "math"
     # Path for file-based datasets like Countdown
     DATA_PATH: str = "./Countdown-Tasks-3to4"
-
-    # --- Inferlet WASM Paths ---
-    INFERLET_WASM_PATHS: Dict[str, Path] = field(default_factory=dict)
 
     # --- ES Hyperparameters ---
     ADAPTER_NAME: str = "evo-countdown-v1"
@@ -62,10 +65,6 @@ class TrainingConfig:
         "You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>"
     )
 
-    # --- Checkpointing Configuration ---
-    INITIAL_CHECKPOINT_NAME: Optional[str] = None
-    CHECKPOINT_EVERY_N_STEPS: int = 5
-
     # --- Evaluation Configuration ---
     DATASET_TEST_SIZE: int = 100
     EVAL_EVERY_N_STEPS: int = 2
@@ -75,12 +74,6 @@ class TrainingConfig:
     VERBOSE_WORKER_LOGS: bool = False
 
     def __post_init__(self):
-        """Set up dynamic paths and dictionaries after initialization."""
-        self.INFERLET_WASM_PATHS = {
-            "es-init": self.WASM_DIR / "es_init.wasm",
-            "es-rollout": self.WASM_DIR / "es_rollout.wasm",
-            "es-update": self.WASM_DIR / "es_update.wasm",
-        }
         self.ADAPTER_NAME = f"evo-{self.DATASET_NAME}-v1"
 
 
@@ -91,17 +84,17 @@ class TrainingConfig:
 
 async def launch_and_get_result(
     client: PieClient,
-    program_hash: str,
+    inferlet_name: str,
     arguments: List[str],
     worker_id: Any = 0,
     verbose: bool = False,
 ) -> Optional[str]:
     """Launches an inferlet and returns the final message."""
     if verbose:
-        tqdm.write(
-            f"🚀 Worker {worker_id}: Launching instance with hash {program_hash[:8]}..."
-        )
-    instance = await client.launch_instance(program_hash, arguments=arguments)
+        tqdm.write(f"🚀 Worker {worker_id}: Launching {inferlet_name}...")
+    instance = await client.launch_instance_from_registry(
+        inferlet_name, arguments=arguments
+    )
     final_payload = None
     while True:
         event, message = await instance.recv()
@@ -135,7 +128,6 @@ class ESOrchestrator:
     def __init__(self, config: TrainingConfig):
         self.config = config
         self.clients = []
-        self.program_hashes = {}
         self.train_dataset = None
         self.eval_dataset = None
         self._exit_stack = AsyncExitStack()
@@ -156,7 +148,6 @@ class ESOrchestrator:
             self.clients.append(client)
         tqdm.write(f"✅ Connected to {len(self.clients)} Pie server(s).")
 
-        await self._upload_inferlets()
         await self._initialize_adapter()
         self._load_datasets()
 
@@ -222,25 +213,6 @@ class ESOrchestrator:
 
         tqdm.write("✅ Datasets loaded.")
 
-    async def _upload_inferlets(self):
-        """Loads and uploads WASM binaries to all clients."""
-        tqdm.write("\n📦 Loading and uploading inferlet WASM binaries...")
-        for name, wasm_path in self.config.INFERLET_WASM_PATHS.items():
-            if not wasm_path.exists():
-                raise FileNotFoundError(f"WASM binary not found: {wasm_path}")
-            program_bytes = wasm_path.read_bytes()
-            program_hash = blake3(program_bytes).hexdigest()
-            upload_tasks = [
-                client.upload_program(program_bytes)
-                for client in self.clients
-                if not await client.program_exists(program_hash)
-            ]
-            if upload_tasks:
-                tqdm.write(f"Uploading {wasm_path.name} ({program_hash[:8]})...")
-                await asyncio.gather(*upload_tasks)
-            self.program_hashes[name] = program_hash
-        tqdm.write("✅ All inferlets are available on clients.")
-
     async def _initialize_adapter(self):
         """Initializes the ES adapter on all clients."""
         tqdm.write("\n⚙️  Initializing ES Adapter on all clients...")
@@ -258,17 +230,11 @@ class ESOrchestrator:
             "--initial-sigma",
             str(self.config.INITIAL_SIGMA),
         ]
-        if self.config.INITIAL_CHECKPOINT_NAME:
-            tqdm.write(
-                f"📂 Loading initial checkpoint: {self.config.INITIAL_CHECKPOINT_NAME}"
-            )
-            init_args.extend(["--upload", self.config.INITIAL_CHECKPOINT_NAME])
-        else:
-            init_args.extend(["--upload", ""])
+        init_args.extend(["--upload", ""])
         init_tasks = [
             launch_and_get_result(
                 client,
-                self.program_hashes["es-init"],
+                self.config.INFERLET_NAMES["es-init"],
                 init_args,
                 f"C{i}-Init",
                 self.config.VERBOSE_WORKER_LOGS,
@@ -340,7 +306,7 @@ class ESOrchestrator:
                     self._client_rollout_worker(
                         client,
                         uri,
-                        self.program_hashes["es-rollout"],
+                        self.config.INFERLET_NAMES["es-rollout"],
                         work_queue,
                         queue_lock,
                         f"C{i}",
@@ -451,14 +417,14 @@ class ESOrchestrator:
             "--max-sigma",
             str(self.config.MAX_SIGMA),
         ]
-        if step > 0 and step % self.config.CHECKPOINT_EVERY_N_STEPS == 0:
-            checkpoint_name = f"{self.config.ADAPTER_NAME}-step-{step}"
-            tqdm.write(f"💾 Saving checkpoint: {checkpoint_name}")
-            update_args.extend(["--download", checkpoint_name])
+        # if step > 0 and step % self.config.CHECKPOINT_EVERY_N_STEPS == 0:
+        #     checkpoint_name = f"{self.config.ADAPTER_NAME}-step-{step}"
+        #     tqdm.write(f"💾 Saving checkpoint: {checkpoint_name}")
+        #     update_args.extend(["--download", checkpoint_name])
         update_tasks = [
             launch_and_get_result(
                 client,
-                self.program_hashes["es-update"],
+                self.config.INFERLET_NAMES["es-update"],
                 update_args,
                 f"C{i}-Update",
                 self.config.VERBOSE_WORKER_LOGS,
@@ -503,7 +469,7 @@ class ESOrchestrator:
 
         return metrics
 
-    async def _run_batch(self, client, program_hash, seeds, tasks, who):
+    async def _run_batch(self, client, inferlet_name, seeds, tasks, who):
         """Helper to run a single batch."""
         rollouts = []
         for seed, task in zip(seeds, tasks):
@@ -524,7 +490,7 @@ class ESOrchestrator:
             self.config.SYSTEM_PROMPT,
         ]
         res_json = await launch_and_get_result(
-            client, program_hash, args, who, self.config.VERBOSE_WORKER_LOGS
+            client, inferlet_name, args, who, self.config.VERBOSE_WORKER_LOGS
         )
         if res_json:
             try:
@@ -540,7 +506,7 @@ class ESOrchestrator:
         self,
         client,
         server_uri,
-        program_hash,
+        inferlet_name,
         work_queue,
         queue_lock,
         client_id,
@@ -583,7 +549,7 @@ class ESOrchestrator:
                     batch_num += 1
                     task = asyncio.create_task(
                         self._run_batch(
-                            client, program_hash, list(seeds), list(tasks), who
+                            client, inferlet_name, list(seeds), list(tasks), who
                         )
                     )
                     running_tasks.add(task)
@@ -620,7 +586,7 @@ class ESOrchestrator:
                                     new_task = asyncio.create_task(
                                         self._run_batch(
                                             client,
-                                            program_hash,
+                                            inferlet_name,
                                             list(new_seeds),
                                             list(new_tasks),
                                             who,

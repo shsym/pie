@@ -45,12 +45,6 @@ async fn main(mut args: Args) -> Result<String> {
         ctx.fill_system(&system_prompt);
         ctx.fill_user(&rollout.task);
 
-        // check if the task has preempted copies in the past
-        // if let Some(prev_tokens) = store_get(&rollout.uid) {
-        //     let prev_tokens: Vec<u32> = serde_json::from_str(&prev_tokens)?;
-        //     ctx.fill_tokens(prev_tokens);
-        // }
-
         let generation_future = async move {
             let mut generated_token_ids = Vec::new();
 
@@ -62,16 +56,6 @@ async fn main(mut args: Args) -> Result<String> {
                     break;
                 }
 
-                if next_token_id > 1000000 {
-                    println!("⚠️ Warning: Generated token ID {} is unusually high. Stopping generation to prevent potential issues.", next_token_id);
-                    println!("generated_token_ids: {:?}", generated_token_ids);
-                }
-
-                // cache the tokens in case it gets preemptived
-                // store_set(
-                //     &rollout.uid,
-                //     &serde_json::to_string(&generated_token_ids).unwrap(),
-                // );
             }
 
             // clear up the cache
@@ -89,5 +73,5 @@ async fn main(mut args: Args) -> Result<String> {
     // Serialize the collected text outputs into a JSON string array.
     let response_json = serde_json::to_string(&results)?;
 
-    Ok(response_json)
+    Ok(response_json)   
 }

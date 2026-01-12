@@ -461,9 +461,7 @@ class Runtime:
 
                 adapter.upload(name, data)
 
-    def download_adapter(
-        self, req: message.DownloadAdapterRequest
-    ) -> message.DownloadAdapterResponse:
+    def download_adapter(self, req: message.DownloadAdapterRequest) -> None:
         """Download adapter weights."""
         args = {"adapter_ptr": req.adapter_ptr, "name": req.name}
 
@@ -471,8 +469,7 @@ class Runtime:
             msg = {"type": "DOWNLOAD_ADAPTER", "kwargs": args}
             utils.broadcast_struct(msg, src=0, device=self.config.device)
 
-        data = self._download_adapter(**args)
-        return message.DownloadAdapterResponse(adapter_data=data)
+        self._download_adapter(**args)
 
     def _download_adapter(self, adapter_ptr: int, name: str) -> bytes:
         if adapter_ptr in self.adapters:

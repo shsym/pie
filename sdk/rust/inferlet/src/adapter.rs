@@ -1,7 +1,6 @@
 use crate::api;
 use crate::forward::ForwardPass;
 use crate::{Blob, Queue, Resource};
-use wstd::io::AsyncPollable;
 
 pub trait Adapter {
     fn allocate_adapter(&self) -> u32;
@@ -12,7 +11,7 @@ pub trait Adapter {
     fn release_exported_adapter(&self, name: &str);
 
     fn upload_adapter(&self, adapter_ptr: u32, name: &str, adapter_data: Blob);
-    async fn download_adapter(&self, adapter_ptr: u32, name: &str) -> Blob;
+    fn download_adapter(&self, adapter_ptr: u32, name: &str);
 }
 
 pub trait SetAdapter {
@@ -57,13 +56,8 @@ impl Adapter for Queue {
         api::adapter::common::upload_adapter(&self.inner, adapter_ptr, name, blob.inner);
     }
 
-    async fn download_adapter(&self, adapter_ptr: u32, name: &str) -> Blob {
-        let future = api::adapter::common::download_adapter(&self.inner, adapter_ptr, name);
-        let pollable = future.pollable();
-        AsyncPollable::new(pollable).wait_for().await;
-        let blob = future.get().unwrap();
-
-        Blob { inner: blob }
+    fn download_adapter(&self, adapter_ptr: u32, name: &str) {
+        let _ = api::adapter::common::download_adapter(&self.inner, adapter_ptr, name);
     }
 }
 

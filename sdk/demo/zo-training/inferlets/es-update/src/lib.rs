@@ -56,7 +56,7 @@ async fn main(mut args: Args) -> Result<()> {
                 "📥 Downloading adapter '{}' to '{}'...",
                 name, download_path
             );
-            let _ = queue.download_adapter(es_adapter, download_path).await;
+            queue.download_adapter(es_adapter, download_path);
         }
     }
 

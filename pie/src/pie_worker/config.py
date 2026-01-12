@@ -97,8 +97,14 @@ class RuntimeConfig:
     @property
     def quantization(
         self,
-    ) -> Int4WeightOnlyConfig | Int8WeightOnlyConfig | Float8WeightOnlyConfig | None:
+    ) -> (
+        "torchao.quantization.Int4WeightOnlyConfig"
+        | "torchao.quantization.Int8WeightOnlyConfig"
+        | "torchao.quantization.Float8WeightOnlyConfig"
+        | None
+    ):
         """Derive quantization config from weight_dtype (only for quantization types)."""
+        import torchao
 
         match self.weight_dtype:
             case "int4":

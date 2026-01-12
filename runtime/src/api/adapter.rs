@@ -1,12 +1,11 @@
 use crate::api::core::forward::ForwardPass;
-use crate::api::core::{Blob, BlobResult, Queue};
+use crate::api::core::{Blob, Queue};
 use crate::api::inferlet;
 use crate::instance::InstanceState;
 use crate::model::request::{DownloadAdapterRequest, Request, UploadAdapterRequest};
 use crate::model::resource::{ADAPTER_TYPE_ID, ResourceId};
 use crate::model::submit_request;
 use anyhow::Result;
-use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -30,24 +29,16 @@ impl inferlet::adapter::common::Host for InstanceState {
         queue: Resource<Queue>,
         mut adapter_ptr: ResourceId,
         name: String,
-    ) -> Result<Resource<BlobResult>> {
+    ) -> Result<()> {
         let (svc_id, queue_id, priority) = self.read_queue(&queue)?;
 
         adapter_ptr = self.translate_resource_ptr(svc_id, ADAPTER_TYPE_ID, adapter_ptr)?;
 
-        let (tx, rx) = oneshot::channel();
-
-        let req = Request::DownloadAdapter(DownloadAdapterRequest { adapter_ptr, name }, tx);
+        let req = Request::DownloadAdapter(DownloadAdapterRequest { adapter_ptr, name });
 
         submit_request(svc_id, queue_id, priority, req)?;
 
-        let res = BlobResult {
-            receiver: rx,
-            result: None,
-            done: false,
-        };
-
-        Ok(self.ctx().table.push(res)?)
+        Ok(())
     }
 
     async fn upload_adapter(

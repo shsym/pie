@@ -29,7 +29,7 @@ pub enum Request {
     InitializeAdapter(InitializeAdapterRequest),
     UpdateAdapter(UpdateAdapterRequest),
     UploadAdapter(UploadAdapterRequest),
-    DownloadAdapter(DownloadAdapterRequest, oneshot::Sender<Bytes>),
+    DownloadAdapter(DownloadAdapterRequest),
 }
 
 impl Request {
@@ -52,7 +52,6 @@ impl Request {
             Request::Handshake(_, _) => true,
             Request::Query(_, _) => true,
             Request::ForwardPass(_, r) => r.is_some(),
-            Request::DownloadAdapter(_, _) => true,
             _ => false,
         }
     }
@@ -68,7 +67,7 @@ impl Request {
             Request::InitializeAdapter(_) => INITIALIZE_ADAPTER_ID,
             Request::UpdateAdapter(_) => UPDATE_ADAPTER_ID,
             Request::UploadAdapter(_) => UPLOAD_ADAPTER_ID,
-            Request::DownloadAdapter(_, _) => DOWNLOAD_ADAPTER_ID,
+            Request::DownloadAdapter(_) => DOWNLOAD_ADAPTER_ID,
         }
     }
 
@@ -82,7 +81,7 @@ impl Request {
             Request::InitializeAdapter(req) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::UpdateAdapter(req) => Bytes::from(rmp_serde::to_vec_named(&req)?),
             Request::UploadAdapter(req) => Bytes::from(rmp_serde::to_vec_named(&req)?),
-            Request::DownloadAdapter(req, _) => Bytes::from(rmp_serde::to_vec_named(&req)?),
+            Request::DownloadAdapter(req) => Bytes::from(rmp_serde::to_vec_named(&req)?),
         };
         Ok(b)
     }
@@ -102,9 +101,6 @@ impl Request {
                 if let Some(tx) = resp {
                     tx.send(r).ok();
                 }
-            }
-            Request::DownloadAdapter(_, resp) => {
-                resp.send(b).ok();
             }
             _ => {
                 bail!("cannot deserialize response for request {:?}", self);

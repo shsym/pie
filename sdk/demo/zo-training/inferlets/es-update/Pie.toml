@@ -1,0 +1,21 @@
+[package]
+name = "ingim/es-update"
+version = "0.1.0"
+description = "Update an Evolution Strategies adapter"
+authors = ["In Gim <in.gim@yale.edu>"]
+repository = "https://github.com/pie-project/pie"
+readme = "README.md"
+keywords = ["evolution-strategies", "update", "adapter"]
+
+[engine]
+min_version = "^1.0.0"
+
+[interface]
+inputs = [
+    { name = "name", type = "string", description = "Name of the adapter to update" },
+    { name = "seeds", type = "string", description = "Comma-separated list of seeds" },
+    { name = "scores", type = "string", description = "Comma-separated list of scores" },
+    { name = "max_sigma", type = "float", description = "Maximum sigma value" },
+    { name = "download", type = "string", optional = true, description = "Optional filename to download updated weights to" },
+]
+outputs = []
