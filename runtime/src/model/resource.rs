@@ -8,6 +8,7 @@ use std::time::Instant;
 use thiserror::Error;
 pub type ResourceId = u32;
 pub type ResourceTypeId = u32;
+pub type GroupId = usize;
 
 pub static KV_PAGE_TYPE_ID: ResourceTypeId = 0;
 pub static EMBED_TYPE_ID: ResourceTypeId = 1;
@@ -16,17 +17,26 @@ pub static ADAPTER_TYPE_ID: ResourceTypeId = 2;
 // ---- Custom ResourceError enum ----
 #[derive(Debug, Error)]
 pub enum ResourceError {
-    #[error("Resource pool for type {type_id:?} does not exist")]
-    PoolNotFound { type_id: ResourceTypeId },
+    #[error("Resource pool for type {type_id:?} in group {group_id:?} does not exist")]
+    PoolNotFound {
+        type_id: ResourceTypeId,
+        group_id: GroupId,
+    },
 
-    #[error("Out of memory for resource type {type_id:?}")]
-    OutOfMemory { type_id: ResourceTypeId },
+    #[error("Out of memory for resource type {type_id:?} in group {group_id:?}")]
+    OutOfMemory {
+        type_id: ResourceTypeId,
+        group_id: GroupId,
+    },
 
     #[error("Instance {inst_id:?} has no allocated resources of type {type_id:?}")]
     InstanceNotAllocated {
         inst_id: InstanceId,
         type_id: ResourceTypeId,
     },
+
+    #[error("Instance {inst_id:?} is not assigned to any device group")]
+    InstanceGroupNotFound { inst_id: InstanceId },
 
     #[error("Pointer {ptr:?} is not allocated to instance {inst_id:?}")]
     PointerNotAllocated {
@@ -47,28 +57,54 @@ pub enum ResourceError {
     IdPoolError(String),
 }
 
-/// Manages the state of all resources, instances, and exports.
+/// Manages the state of all resources, instances, and exports across multiple device groups.
 #[derive(Debug)]
 pub struct ResourceManager {
-    res_pool: HashMap<ResourceTypeId, IdPool<u32>>,
-    res_exported: HashMap<ResourceTypeId, HashMap<String, Vec<ResourceId>>>,
+    /// Pools are sharded by GroupId.
+    res_pool: HashMap<(GroupId, ResourceTypeId), IdPool<u32>>,
+    /// Exports are global (name-based) but point to resources in a specific group.
+    /// Value is (GroupId, Vec<ResourceId>)
+    res_exported: HashMap<ResourceTypeId, HashMap<String, (GroupId, Vec<ResourceId>)>>,
+    /// Allocated resources per instance.
     res_allocated: HashMap<(ResourceTypeId, InstanceId), HashSet<ResourceId>>,
+    /// Map instance to its assigned device group.
+    instance_groups: HashMap<InstanceId, GroupId>,
     inst_start_time: HashMap<InstanceId, Instant>,
+    /// Round-robin counter for distributing instances across groups
+    next_group_rr: std::cell::Cell<usize>,
+    /// Total number of groups for round-robin
+    num_groups: usize,
 }
 
 impl ResourceManager {
-    pub fn new(resources: HashMap<ResourceTypeId, u32>) -> Self {
+    pub fn new(resources: HashMap<ResourceTypeId, u32>, num_groups: usize) -> Self {
         let mut res_pool = HashMap::new();
-        for (res_id, capacity) in resources {
-            res_pool.insert(res_id, IdPool::new(capacity));
+        // Create independent pools for each group
+        for group_id in 0..num_groups {
+            for (res_id, capacity) in &resources {
+                res_pool.insert((group_id, *res_id), IdPool::new(*capacity));
+            }
         }
 
         Self {
             res_pool,
             res_exported: HashMap::new(),
             res_allocated: HashMap::new(),
+            instance_groups: HashMap::new(),
             inst_start_time: HashMap::new(),
+            next_group_rr: std::cell::Cell::new(0),
+            num_groups,
         }
+    }
+
+    /// Assign an instance to a specific device group.
+    /// Must be called before allocating resources for the instance.
+    pub fn assign_group(&mut self, inst_id: InstanceId, group_id: GroupId) {
+        self.instance_groups.insert(inst_id, group_id);
+    }
+
+    pub fn get_group(&self, inst_id: &InstanceId) -> Option<GroupId> {
+        self.instance_groups.get(inst_id).copied()
     }
 
     /// A new combined allocation method that handles the OOM logic internally.
@@ -78,55 +114,69 @@ impl ResourceManager {
         type_id: ResourceTypeId,
         count: usize,
     ) -> Result<Vec<ResourceId>, ResourceError> {
-        let available = self.available(type_id)?;
-        
+        // Round-robin assignment across groups if not already assigned
+        let group_id = *self
+            .instance_groups
+            .entry(inst_id)
+            .or_insert_with(|| {
+                let group = self.next_group_rr.get();
+                self.next_group_rr.set((group + 1) % self.num_groups);
+                // eprintln!("[DEBUG] Round-robin assigning instance {:?} to group {}", inst_id, group);
+                group
+            });
+
+        let available = self.available(group_id, type_id)?;
+
         if available < count {
             tracing::debug!(
                 target: "resource.oom",
+                group_id = group_id,
                 type_id = type_id,
                 requested = count,
                 available = available,
                 "OOM triggered, starting victim selection"
             );
             // Not enough memory, trigger the OOM killer.
-            self.oom_kill(type_id, count, inst_id)?;
+            self.oom_kill(group_id, type_id, count, inst_id)?;
         }
 
         // A successful oom_kill guarantees enough space.
         let result = self.allocate(inst_id, type_id, count)?;
-        
+
         // Log allocation metrics
-        let new_available = self.available(type_id).unwrap_or(0);
+        let new_available = self.available(group_id, type_id).unwrap_or(0);
         tracing::trace!(
             target: "resource.metrics",
+            group_id = group_id,
             type_id = type_id,
             allocated = count,
             available_after = new_available,
             inst_id = ?inst_id,
             "Resource allocation"
         );
-        
+
         // Record OTel metrics for KV pages (type_id 0)
         if type_id == KV_PAGE_TYPE_ID {
             if let Some(m) = telemetry::metrics() {
-                let pool = self.res_pool.get(&type_id);
+                let pool = self.res_pool.get(&(group_id, type_id));
                 if let Some(pool) = pool {
                     let capacity = pool.capacity() as usize;
                     let available = pool.available();
+                    // We might want to tag metrics with group_id in the future
                     m.kv_pages_allocated.record((capacity - available) as u64, &[]);
                     m.kv_pages_available.record(available as u64, &[]);
                 }
             }
         }
-        
+
         Ok(result)
     }
 
-    fn available(&self, type_id: ResourceTypeId) -> Result<usize, ResourceError> {
+    fn available(&self, group_id: GroupId, type_id: ResourceTypeId) -> Result<usize, ResourceError> {
         let pool = self
             .res_pool
-            .get(&type_id)
-            .ok_or(ResourceError::PoolNotFound { type_id })?;
+            .get(&(group_id, type_id))
+            .ok_or(ResourceError::PoolNotFound { type_id, group_id })?;
         Ok(pool.available())
     }
 
@@ -136,13 +186,19 @@ impl ResourceManager {
         type_id: ResourceTypeId,
         count: usize,
     ) -> Result<Vec<ResourceId>, ResourceError> {
+        let group_id = self
+            .instance_groups
+            .get(&inst_id)
+            .copied()
+            .ok_or(ResourceError::InstanceGroupNotFound { inst_id })?;
+
         let pool = self
             .res_pool
-            .get_mut(&type_id)
-            .ok_or(ResourceError::PoolNotFound { type_id })?;
+            .get_mut(&(group_id, type_id))
+            .ok_or(ResourceError::PoolNotFound { type_id, group_id })?;
 
         if pool.available() < count {
-            return Err(ResourceError::OutOfMemory { type_id });
+            return Err(ResourceError::OutOfMemory { type_id, group_id });
         }
 
         let allocated = pool.acquire_many(count).unwrap();
@@ -163,6 +219,12 @@ impl ResourceManager {
         type_id: ResourceTypeId,
         ptrs: Vec<ResourceId>,
     ) -> Result<(), ResourceError> {
+        let group_id = self
+            .instance_groups
+            .get(&inst_id)
+            .copied()
+            .ok_or(ResourceError::InstanceGroupNotFound { inst_id })?;
+
         let allocated = self
             .res_allocated
             .get_mut(&(type_id, inst_id))
@@ -170,8 +232,8 @@ impl ResourceManager {
 
         let pool = self
             .res_pool
-            .get_mut(&type_id)
-            .ok_or(ResourceError::PoolNotFound { type_id })?;
+            .get_mut(&(group_id, type_id))
+            .ok_or(ResourceError::PoolNotFound { type_id, group_id })?;
 
         for ptr in ptrs {
             if allocated.remove(&ptr) {
@@ -184,6 +246,7 @@ impl ResourceManager {
 
     fn oom_kill(
         &mut self,
+        group_id: GroupId,
         type_id: ResourceTypeId,
         size: usize,
         inst_id_to_exclude: InstanceId,
@@ -199,14 +262,19 @@ impl ResourceManager {
             })?;
 
         loop {
-            if self.available(type_id)? >= size {
+            if self.available(group_id, type_id)? >= size {
                 break;
             }
 
+            // Find victim ONLY in the same group
             let victim_id = self
                 .inst_start_time
                 .iter()
-                .filter(|(id, time)| **id != inst_id_to_exclude && **time > requester_start_time)
+                .filter(|(id, time)| {
+                    **id != inst_id_to_exclude
+                        && self.instance_groups.get(id) == Some(&group_id)
+                        && **time > requester_start_time
+                })
                 .max_by_key(|(_, time)| **time)
                 .map(|(id, _)| *id);
 
@@ -214,15 +282,16 @@ impl ResourceManager {
                 tracing::warn!(
                     target: "resource.oom",
                     victim_id = ?victim_id,
+                    group_id = group_id,
                     type_id = type_id,
                     "OOM killer terminating instance"
                 );
-                
+
                 // Record OOM kill metric
                 if let Some(m) = telemetry::metrics() {
                     m.kv_pages_oom_kills.add(1, &[]);
                 }
-                
+
                 self.cleanup(victim_id)?;
                 runtime::Command::TerminateInstance {
                     inst_id: victim_id,
@@ -241,6 +310,15 @@ impl ResourceManager {
     }
 
     pub fn cleanup(&mut self, inst_id: InstanceId) -> Result<(), ResourceError> {
+        // If instance was never assigned a group, just clean up start time and return
+        let group_id = match self.instance_groups.get(&inst_id) {
+            Some(g) => *g,
+            None => {
+                self.inst_start_time.remove(&inst_id);
+                return Ok(());
+            }
+        };
+
         let mut to_release_by_type: HashMap<ResourceTypeId, Vec<ResourceId>> = HashMap::new();
         self.res_allocated.retain(|(ty, id), ptrs| {
             if *id == inst_id {
@@ -257,13 +335,14 @@ impl ResourceManager {
         for (ty, ptrs) in to_release_by_type {
             let pool = self
                 .res_pool
-                .get_mut(&ty)
-                .ok_or(ResourceError::PoolNotFound { type_id: ty })?;
+                .get_mut(&(group_id, ty))
+                .ok_or(ResourceError::PoolNotFound { type_id: ty, group_id })?;
             for ptr in ptrs {
                 pool.release(ptr).unwrap();
             }
         }
         self.inst_start_time.remove(&inst_id);
+        self.instance_groups.remove(&inst_id);
         Ok(())
     }
 
@@ -276,6 +355,12 @@ impl ResourceManager {
         ptrs: Vec<ResourceId>,
         name: String,
     ) -> Result<(), ResourceError> {
+        let group_id = self
+            .instance_groups
+            .get(&inst_id)
+            .copied()
+            .ok_or(ResourceError::InstanceGroupNotFound { inst_id })?;
+
         let allocated = self
             .res_allocated
             .get_mut(&(type_id, inst_id))
@@ -296,7 +381,7 @@ impl ResourceManager {
                 ptrs.iter().for_each(|ptr| {
                     allocated.remove(ptr);
                 });
-                entry.insert(ptrs);
+                entry.insert((group_id, ptrs));
                 Ok(())
             }
         }
@@ -310,8 +395,26 @@ impl ResourceManager {
         self.res_exported
             .get(&type_id)
             .and_then(|exports| exports.get(&name))
-            .cloned()
+            .map(|(_, ptrs)| ptrs.clone())
             .ok_or(ResourceError::ExportNotFound { name })
+    }
+
+    /// Import with group info (useful for ensuring we don't mix resources across groups,
+    /// though currently exports are global and transfer ownership...)
+    /// Actually, if we import, we might need to know which group it belongs to so the
+    /// importing instance can be verified to be in the same group?
+    /// For now, we assume exports act as a bridge or are only valid within same group.
+    /// TODO: Enforce group safety if needed.
+    pub fn import_with_group(
+        &self,
+        type_id: ResourceTypeId,
+        name: &str,
+    ) -> Result<(GroupId, Vec<ResourceId>), ResourceError> {
+        self.res_exported
+            .get(&type_id)
+            .and_then(|exports| exports.get(name))
+            .cloned()
+            .ok_or(ResourceError::ExportNotFound { name: name.to_string() })
     }
 
     pub fn release_exported(
@@ -322,13 +425,13 @@ impl ResourceManager {
         let type_exports = self
             .res_exported
             .get_mut(&type_id)
-            .ok_or(ResourceError::PoolNotFound { type_id })?;
+            .ok_or(ResourceError::PoolNotFound { type_id, group_id: 0 })?; // Error type slightly misused here, but ok
 
-        if let Some(ptrs_to_release) = type_exports.remove(&name) {
+        if let Some((group_id, ptrs_to_release)) = type_exports.remove(&name) {
             let pool = self
                 .res_pool
-                .get_mut(&type_id)
-                .ok_or(ResourceError::PoolNotFound { type_id })?;
+                .get_mut(&(group_id, type_id))
+                .ok_or(ResourceError::PoolNotFound { type_id, group_id })?;
             for ptr in ptrs_to_release {
                 pool.release(ptr).unwrap();
             }
@@ -344,7 +447,7 @@ impl ResourceManager {
             .map(|exports| {
                 exports
                     .iter()
-                    .map(|(name, ptrs)| (name.clone(), ptrs.clone()))
+                    .map(|(name, (_, ptrs))| (name.clone(), ptrs.clone()))
                     .collect()
             })
             .unwrap_or_default()
@@ -353,20 +456,20 @@ impl ResourceManager {
     /// Appends detailed statistics about the resource manager's state to a given HashMap.
     pub fn append_stats_to(&self, stats: &mut HashMap<String, String>) {
         // Report on each resource pool
-        for (type_id, pool) in &self.res_pool {
+        for ((group_id, type_id), pool) in &self.res_pool {
             let capacity = pool.capacity() as usize;
             let available = pool.available();
             let used = capacity - available;
 
             stats.insert(
-                format!("resource.{}.capacity", type_id),
+                format!("resource.g{}.{}.capacity", group_id, type_id),
                 capacity.to_string(),
             );
             stats.insert(
-                format!("resource.{}.available", type_id),
+                format!("resource.g{}.{}.available", group_id, type_id),
                 available.to_string(),
             );
-            stats.insert(format!("resource.{}.used", type_id), used.to_string());
+            stats.insert(format!("resource.g{}.{}.used", group_id, type_id), used.to_string());
         }
 
         // Report on active instances

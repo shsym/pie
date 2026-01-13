@@ -380,6 +380,7 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
                 output_embed_ptrs: take(&mut pass.output_embed_ptrs),
                 output_embed_indices: take(&mut pass.output_embed_indices),
                 arrival_time: None, // Set in Model::submit() before queuing
+                inst_id: Some(self.id()),
             };
 
             (request, svc_id, queue_id, priority)

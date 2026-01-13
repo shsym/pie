@@ -162,8 +162,8 @@ class ModelConfig(ModelConfigBase):
         ).element_size()
 
         # In multi-GPU mode, KV cache is sharded across GPUs
-        # Each GPU only stores num_kv_heads // world_size heads
-        local_num_kv_heads = self.num_kv_heads // runtime_config.world_size
+        # Each GPU only stores num_kv_heads // tp_size heads
+        local_num_kv_heads = self.num_kv_heads // runtime_config.tensor_parallel_size
 
         total_bytes_per_page = (
             element_size_bytes
@@ -194,11 +194,15 @@ class ForwardPass:
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
+        compute_process_group: dist.ProcessGroup | None = None,
     ):
         """Initialize the forward pass with weights and attention wrappers."""
         self.model_config = model_config
         self.runtime_config = runtime_config
         self.weights = weights
+        self.compute_process_group = compute_process_group
+        self.tp_size = runtime_config.tensor_parallel_size
+        self.tp_rank = runtime_config.rank % self.tp_size
 
         # Create workspace buffer for attention operations
         self.workspace_buffer = torch.zeros(
@@ -299,12 +303,8 @@ class ForwardPass:
         device = self.runtime_config.device
 
         # Local head counts for planning
-        local_num_query_heads = (
-            self.model_config.num_q_heads // self.runtime_config.world_size
-        )
-        local_num_key_value_heads = (
-            self.model_config.num_kv_heads // self.runtime_config.world_size
-        )
+        local_num_query_heads = self.model_config.num_q_heads // self.tp_size
+        local_num_key_value_heads = self.model_config.num_kv_heads // self.tp_size
         page_size = self.runtime_config.kv_page_size
 
         print(f"Warmup: Capturing CUDA graphs for bins {self.cuda_graph_bins}...")
@@ -392,17 +392,17 @@ class ForwardPass:
         """
         world_size = self.runtime_config.world_size
 
-        if world_size == 1:
+        if self.tp_size == 1:
             return fun.embedding(token_ids, self.weights.get("embed_token"))
 
-        # Column-parallel embedding: each rank has [vocab_size, hidden_size/world_size]
-        # 1. Lookup - each rank gets partial hidden states [seq_len, hidden_size/world_size]
+        # Column-parallel embedding: each rank has [vocab_size, hidden_size/tp_size]
+        # 1. Lookup - each rank gets partial hidden states [seq_len, hidden_size/tp_size]
         local_embeds = fun.embedding(token_ids, self.weights.get("embed_token"))
 
         # 2. All-gather to combine partial hidden states from all ranks
         # Output: [seq_len, hidden_size] (full hidden dimension)
-        gathered_list = [torch.empty_like(local_embeds) for _ in range(world_size)]
-        dist.all_gather(gathered_list, local_embeds)
+        gathered_list = [torch.empty_like(local_embeds) for _ in range(self.tp_size)]
+        dist.all_gather(gathered_list, local_embeds, group=self.compute_process_group)
 
         # Concatenate along hidden dimension (last dim)
         full_embeds = torch.cat(gathered_list, dim=-1)
@@ -466,8 +466,8 @@ class ForwardPass:
         2. Each rank computes partial logits with its weight shard
         3. All-reduce sums the partial logits to get full result
         """
-        world_size = self.runtime_config.world_size
-        rank = self.runtime_config.rank
+        # world_size = self.runtime_config.world_size
+        # rank = self.runtime_config.rank
 
         # Apply final layer norm
         normed = fun.rms_norm(
@@ -477,14 +477,14 @@ class ForwardPass:
             eps=self.model_config.rms_norm_eps,
         )
 
-        if world_size == 1:
+        if self.tp_size == 1:
             # Single GPU: simple linear projection
             return fun.linear(normed, self.weights.get("embed_token"))
 
         # Multi-GPU: Column-parallel projection
         # 1. Split input along hidden dimension - each rank uses its slice
-        hidden_per_rank = self.model_config.dim_hidden // world_size
-        start_idx = rank * hidden_per_rank
+        hidden_per_rank = self.model_config.dim_hidden // self.tp_size
+        start_idx = self.tp_rank * hidden_per_rank
         end_idx = start_idx + hidden_per_rank
         local_normed = normed[:, start_idx:end_idx]  # [seq, hidden/world_size]
 
@@ -495,7 +495,7 @@ class ForwardPass:
         )  # [seq, vocab]
 
         # 3. All-reduce to combine partial logits (sum of partial projections = full projection)
-        dist.all_reduce(local_logits)
+        dist.all_reduce(local_logits, group=self.compute_process_group)
 
         return local_logits
 
@@ -505,7 +505,7 @@ class ForwardPass:
         pre-norm and residual connection.
         """
         # --- Calculate local TP sizes ---
-        local_mlp_size = self.model_config.dim_mlp // self.runtime_config.world_size
+        local_mlp_size = self.model_config.dim_mlp // self.tp_size
 
         # Save input for residual connection
         residual = hidden_states
@@ -540,8 +540,8 @@ class ForwardPass:
         del hidden, gate, up, gate_up
 
         # ALL-REDUCE: Sum partial outputs from all ranks (only if TP > 1)
-        if self.runtime_config.world_size > 1:
-            dist.all_reduce(down)
+        if self.tp_size > 1:
+            dist.all_reduce(down, group=self.compute_process_group)
 
         # 5. Residual Connection
         return residual + down
@@ -567,12 +567,8 @@ class ForwardPass:
         Qwen3-specific: Applies QK normalization before RoPE.
         """
         # --- Calculate local TP sizes ---
-        local_num_query_heads = (
-            self.model_config.num_q_heads // self.runtime_config.world_size
-        )
-        local_num_key_value_heads = (
-            self.model_config.num_kv_heads // self.runtime_config.world_size
-        )
+        local_num_query_heads = self.model_config.num_q_heads // self.tp_size
+        local_num_key_value_heads = self.model_config.num_kv_heads // self.tp_size
         local_q_size = local_num_query_heads * self.model_config.dim_head
         local_kv_size = local_num_key_value_heads * self.model_config.dim_head
 
@@ -682,8 +678,8 @@ class ForwardPass:
         del attn_output
 
         # ALL-REDUCE: Sum partial outputs from all ranks (only if TP > 1)
-        if self.runtime_config.world_size > 1:
-            dist.all_reduce(attn_proj)
+        if self.tp_size > 1:
+            dist.all_reduce(attn_proj, group=self.compute_process_group)
 
         # 10. First Residual Connection
         # residual (replicated) + attn_proj (now replicated)
@@ -730,12 +726,8 @@ class ForwardPass:
         del seq_lens
 
         # Wrapper Planning
-        local_num_query_heads = (
-            self.model_config.num_q_heads // self.runtime_config.world_size
-        )
-        local_num_key_value_heads = (
-            self.model_config.num_kv_heads // self.runtime_config.world_size
-        )
+        local_num_query_heads = self.model_config.num_q_heads // self.tp_size
+        local_num_key_value_heads = self.model_config.num_kv_heads // self.tp_size
 
         if single_token_inference_mode:
             if self.use_cuda_graphs:
@@ -929,7 +921,9 @@ def create_kv_cache(
     model_config: ModelConfig, runtime_config: RuntimeConfig
 ) -> list[torch.Tensor]:
     """Create KV cache tensors for all layers."""
-    local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
+    local_num_kv_heads = (
+        model_config.num_kv_heads // runtime_config.tensor_parallel_size
+    )
 
     return [
         torch.zeros(

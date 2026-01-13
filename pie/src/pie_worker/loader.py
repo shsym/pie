@@ -423,8 +423,8 @@ class Schema:
             transform_kwargs = dict(source._transform_kwargs or {})
             transform_kwargs["device"] = str(config.device)
             # Inject distributed info for transforms that need custom sharding (like MoE)
-            transform_kwargs["rank"] = config.rank
-            transform_kwargs["world_size"] = config.world_size
+            transform_kwargs["rank"] = config.rank % config.tensor_parallel_size
+            transform_kwargs["world_size"] = config.tensor_parallel_size
 
             # Call the transform function
             result = source._transform_fn(tensors, transform_kwargs)  # type: ignore[misc]
@@ -441,18 +441,22 @@ class Schema:
                 tensor = result
         # Apply interleaved sharding BEFORE fusion (if requested)
         # This is CRITICAL for fused QKV weights where naive chunking breaks head alignment
-        elif config.world_size > 1 and source.sharding == "interleaved_column":
+        elif (
+            config.tensor_parallel_size > 1 and source.sharding == "interleaved_column"
+        ):
             # Shard each source source tensor individually along dim=0 (Column Parallel)
             sharded_tensors = []
             # print(f"DEBUG: Interleaved sharding for {physical_names}", flush=True)
             for i, t in enumerate(tensors):
-                if t.shape[0] % config.world_size != 0:
+                if t.shape[0] % config.tensor_parallel_size != 0:
                     raise ValueError(
-                        f"Cannot interleaved-shard tensor {t.shape}: dim 0 not divisible by world_size={config.world_size}"
+                        f"Cannot interleaved-shard tensor {t.shape}: dim 0 not divisible by tp_size={config.tensor_parallel_size}"
                     )
                 # Ensure we have a clean copy in memory (avoid ztensor/mmap issues with views)
                 t_clone = t.clone()
-                chunk = torch.chunk(t_clone, config.world_size, dim=0)[config.rank]
+                chunk = torch.chunk(t_clone, config.tensor_parallel_size, dim=0)[
+                    config.rank % config.tensor_parallel_size
+                ]
                 # Check chunk validity
                 # print(f"  Shard {i}: {t.shape} -> {chunk.shape}", flush=True)
                 sharded_tensors.append(chunk)
@@ -480,25 +484,25 @@ class Schema:
         if source._dtype is not None:
             tensor = tensor.to(source._dtype)
 
-        # Apply sharding (only if world_size > 1)
+        # Apply sharding (only if tp_size > 1)
         # interleaved_column is handled above, so we skip it here
         if (
-            config.world_size > 1
+            config.tensor_parallel_size > 1
             and source.sharding is not None
             and source.sharding != "interleaved_column"
         ):
             dim = 1 if source.sharding == "row" else 0
 
-            # Validate dimension is divisible by world_size
-            if tensor.shape[dim] % config.world_size != 0:
+            # Validate dimension is divisible by tp_size
+            if tensor.shape[dim] % config.tensor_parallel_size != 0:
                 raise ValueError(
                     f"Cannot shard tensor of shape {tuple(tensor.shape)} along dim={dim}: "
-                    f"dimension size {tensor.shape[dim]} is not divisible by world_size={config.world_size}"
+                    f"dimension size {tensor.shape[dim]} is not divisible by tp_size={config.tensor_parallel_size}"
                 )
 
-            tensor = torch.chunk(tensor.contiguous(), config.world_size, dim=dim)[
-                config.rank
-            ]
+            tensor = torch.chunk(
+                tensor.contiguous(), config.tensor_parallel_size, dim=dim
+            )[config.rank % config.tensor_parallel_size]
 
         # Apply quantization (lazy import to avoid dependency issues)
         if source.should_quantize and config.quantization is not None:

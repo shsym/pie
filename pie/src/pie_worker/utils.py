@@ -110,7 +110,11 @@ def get_available_memory(devices: list[torch.device], rank: int = 0) -> int:
 
 
 def broadcast_struct(
-    data: Any, src: int = 0, device: torch.device | None = None
+    data: Any,
+    src: int = 0,
+    device: torch.device | None = None,
+    group: "torch.distributed.ProcessGroup | None" = None,
+    group_id: int | None = None,
 ) -> Any:
     """
     Broadcast a structure of data with embedded tensors efficiently.
@@ -147,13 +151,18 @@ def broadcast_struct(
     # 2. Broadcast metadata via IPC control channel (replaces GLOO)
     if _control_channel is not None:
         if rank == src:
-            _control_channel.send(metadata)
+            # print(
+            #     f"[DEBUG] Rank {rank}: Sending metadata via control channel to group {group_id}"
+            # )
+            _control_channel.send(metadata, destination_group=group_id)
         else:
+            # print(f"[DEBUG] Rank {rank}: Waiting for metadata from control channel")
             metadata = _control_channel.recv()
+            # print(f"[DEBUG] Rank {rank}: Received metadata")
     else:
         # Fallback to GLOO if control channel not initialized
         meta_list = [metadata]
-        dist.broadcast_object_list(meta_list, src=src, group=_cpu_group)
+        dist.broadcast_object_list(meta_list, src=src, group=group or _cpu_group)
         metadata = meta_list[0]
 
     # 3. Prepare tensors for broadcast
@@ -182,10 +191,13 @@ def broadcast_struct(
             tensors[idx] = torch.empty(shape, dtype=dtype, device=device)
 
     # 4. Broadcast tensors (contiguous for safety)
-    for t in tensors:
+    # print(f"[DEBUG] Rank {rank}: Broadcasting {len(tensors)} tensors")
+    for i, t in enumerate(tensors):
         if rank == src:
             t = t.contiguous()
-        dist.broadcast(t, src=src)
+        # print(f"[DEBUG] Rank {rank}: Broadcasting tensor {i}")
+        dist.broadcast(t, src=src, group=group)
+        # print(f"[DEBUG] Rank {rank}: Tensor {i} broadcast complete")
 
     # 5. Reconstruct
     def reconstruct(obj):

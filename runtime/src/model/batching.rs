@@ -220,6 +220,7 @@ impl AdaptiveScheduler {
     /// Uses arrival rate estimation to predict if waiting will improve throughput.
     pub fn should_fire(
         &self,
+        group_id: usize,
         current_batch_size: usize,
         current_total_tokens: usize,
         max_batch_size: usize,
@@ -230,6 +231,7 @@ impl AdaptiveScheduler {
         if current_batch_size >= max_batch_size || current_total_tokens >= max_batch_tokens {
             tracing::trace!(
                 target: "scheduler.decision",
+                group_id = group_id,
                 decision = "fire_capacity",
                 batch_size = current_batch_size,
                 total_tokens = current_total_tokens,
@@ -244,6 +246,7 @@ impl AdaptiveScheduler {
             if start.elapsed() >= self.config.max_wait_time {
                 tracing::trace!(
                     target: "scheduler.decision",
+                    group_id = group_id,
                     decision = "fire_timeout",
                     batch_size = current_batch_size,
                     wait_ms = wait_ms,
@@ -258,6 +261,7 @@ impl AdaptiveScheduler {
         if in_flight_batches == 0 {
             tracing::trace!(
                 target: "scheduler.decision",
+                group_id = group_id,
                 decision = "fire_pipeline_empty",
                 batch_size = current_batch_size,
                 "Firing: pipeline empty"
@@ -270,6 +274,7 @@ impl AdaptiveScheduler {
             // But don't fire if we have batches in flight - wait for more requests
             tracing::trace!(
                 target: "scheduler.decision",
+                group_id = group_id,
                 decision = "wait_small_batch",
                 batch_size = current_batch_size,
                 in_flight = in_flight_batches,
@@ -287,6 +292,7 @@ impl AdaptiveScheduler {
         let arrival_rate = self.arrival_estimator.arrival_rate();
         tracing::trace!(
             target: "scheduler.metrics",
+            group_id = group_id,
             arrival_rate_rps = ?arrival_rate,
             estimated_latency_ms = (current_latency * 1000.0) as u64,
             current_throughput = current_throughput,
@@ -297,6 +303,7 @@ impl AdaptiveScheduler {
         
         // Record OTel metrics
         if let Some(m) = telemetry::metrics() {
+            // TODO: Add group_id label when we have the right import
             if let Some(rate) = arrival_rate {
                 m.scheduler_arrival_rate.record(rate, &[]);
             }
@@ -321,6 +328,7 @@ impl AdaptiveScheduler {
             if current_throughput >= future_throughput {
                 tracing::trace!(
                     target: "scheduler.decision",
+                    group_id = group_id,
                     decision = "fire_throughput",
                     current_throughput = current_throughput,
                     future_throughput = future_throughput,
@@ -332,6 +340,7 @@ impl AdaptiveScheduler {
             // No arrival rate data yet - be conservative and fire
             tracing::trace!(
                 target: "scheduler.decision",
+                group_id = group_id,
                 decision = "fire_no_data",
                 batch_size = current_batch_size,
                 "Firing: no arrival rate data"
@@ -342,6 +351,7 @@ impl AdaptiveScheduler {
         // Wait for more requests
         tracing::trace!(
             target: "scheduler.decision",
+            group_id = group_id,
             decision = "wait_better_throughput",
             batch_size = current_batch_size,
             "Waiting: better throughput expected"
@@ -350,5 +360,73 @@ impl AdaptiveScheduler {
     }
 }
 
+use std::collections::HashMap;
+
+/// Multi-group scheduler managing independent adaptive schedulers for each device group.
+pub struct MultiGroupScheduler {
+    schedulers: HashMap<usize, AdaptiveScheduler>,
+    config: SchedulerConfig,
+    max_batch_size: usize,
+}
+
+impl MultiGroupScheduler {
+    pub fn new(config: SchedulerConfig, max_batch_size: usize, num_groups: usize) -> Self {
+        let mut schedulers = HashMap::new();
+        for i in 0..num_groups {
+            schedulers.insert(i, AdaptiveScheduler::new(config.clone(), max_batch_size));
+        }
+        
+        Self {
+            schedulers,
+            config,
+            max_batch_size,
+        }
+    }
+
+    pub fn on_request_arrival(&mut self, group_id: usize, arrival_time: Instant) {
+        if let Some(sched) = self.schedulers.get_mut(&group_id) {
+            sched.on_request_arrival(arrival_time);
+        }
+    }
+
+    pub fn on_batch_complete(&mut self, group_id: usize, batch_size: usize, total_tokens: usize, latency: Duration) {
+        if let Some(sched) = self.schedulers.get_mut(&group_id) {
+            sched.on_batch_complete(batch_size, total_tokens, latency);
+        }
+    }
+
+    pub fn on_batch_fired(&mut self, group_id: usize) {
+        if let Some(sched) = self.schedulers.get_mut(&group_id) {
+            sched.on_batch_fired();
+        }
+    }
+
+    pub fn should_fire(
+        &mut self,
+        group_id: usize,
+        current_batch_size: usize,
+        current_total_tokens: usize,
+        max_batch_size: usize,
+        max_batch_tokens: usize,
+        in_flight_batches: usize,
+    ) -> bool {
+        if let Some(sched) = self.schedulers.get_mut(&group_id) {
+            sched.should_fire(
+                group_id,
+                current_batch_size,
+                current_total_tokens,
+                max_batch_size,
+                max_batch_tokens,
+                in_flight_batches
+            )
+        } else {
+            // If group doesn't exist, default to safe behavior (don't fire, or error?)
+            // For now, assume if we are asking, we want to know. But returning false is safe.
+            false
+        }
+    }
+}
+
 /// Shared scheduler state wrapped in Arc<Mutex> for thread-safe access.
-pub type SharedScheduler = Arc<Mutex<AdaptiveScheduler>>;
+pub type SharedScheduler = Arc<Mutex<MultiGroupScheduler>>;
+

@@ -248,12 +248,13 @@ fn start_server(
 /// Returns:
 ///     ServerHandle with shutdown capability.
 #[pyfunction]
-#[pyo3(signature = (config, authorized_users_path, queue))]
+#[pyo3(signature = (config, authorized_users_path, queue, num_groups=1))]
 fn start_server_with_ffi(
     py: Python<'_>,
     config: ServerConfig,
     authorized_users_path: Option<String>,
     queue: crate::model::ffi_queue::FfiQueue,
+    num_groups: usize,
 ) -> PyResult<ServerHandle> {
     use crate::model::{self, Model, SchedulerConfig};
     
@@ -290,7 +291,8 @@ fn start_server_with_ffi(
 
             // Create Model with FFI backend using the queue from Python
             let scheduler_config = SchedulerConfig::default();
-            let model = Model::new(queue, scheduler_config).await
+            // Pass num_groups to Model::new
+            let model = Model::new(queue, scheduler_config, num_groups).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create FFI model: {}", e)))?;
             
             // Get model name before registering

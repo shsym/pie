@@ -37,6 +37,12 @@ hf_repo = "{DEFAULT_MODEL}"
 # Device assignment (single GPU or list for tensor parallel)
 device = [{formatted_device}]
 
+# Tensor Parallelism degree (splits model across GPUs within a group)
+# Set to 1 for Data Parallelism only (each GPU runs full model independently)
+# Set to len(device) for Tensor Parallelism only (all GPUs share one model)
+# Example: 4 GPUs with tensor_parallel_size=2 → 2 DP groups of 2 TP GPUs
+tensor_parallel_size = 1
+
 # Precision settings
 activation_dtype = "bfloat16"
 weight_dtype = "bfloat16"

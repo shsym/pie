@@ -56,7 +56,7 @@ pub async fn run_server(
         eprintln!("[FATAL] Terminating process to signal Python shutdown.");
         
         // Exit with non-zero code to signal failure to Python
-        std::process::exit(1);
+        //std::process::exit(1);
     }));
 
     // Initialize tracing with file logging if log_dir is specified

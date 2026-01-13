@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 pub static HANDSHAKE_ID: u32 = 0;
 
@@ -152,6 +153,7 @@ pub struct ForwardPassRequest {
     pub input_token_positions: Vec<u32>,
     pub input_embed_ptrs: Vec<u32>,
     pub input_embed_positions: Vec<u32>,
+    pub inst_id: Option<Uuid>,
     pub adapter: Option<u32>,
     pub adapter_seed: Option<i64>,
     pub mask: Vec<Vec<u32>>,
@@ -289,6 +291,9 @@ pub struct BatchedForwardPassRequest {
     // Trace context for cross-language propagation (W3C traceparent)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_context: Option<String>,
+
+    // Target group ID for Data Parallelism routing
+    pub group_id: Option<usize>,
 }
 
 impl BatchedForwardPassRequest {
@@ -318,6 +323,7 @@ impl BatchedForwardPassRequest {
             output_embed_indices: Vec::new(),
             single_token_mode: true,
             trace_context: None,
+            group_id: None,
         }
     }
 

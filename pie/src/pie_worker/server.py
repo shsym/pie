@@ -48,44 +48,49 @@ def poll_ffi_queue(
         "download_adapter": service.download_adapter_rpc,
     }
 
-    while not stop_event.is_set():
-        # Poll the Rust queue (releases GIL while waiting)
-        request = ffi_queue.poll_blocking(poll_timeout_ms)
-        if request is None:
-            continue  # Timeout, try again
+    try:
+        while not stop_event.is_set():
+            # Poll the Rust queue (releases GIL while waiting)
+            request = ffi_queue.poll_blocking(poll_timeout_ms)
+            if request is None:
+                continue  # Timeout, try again
 
-        request_id, method, payload = request
+            request_id, method, payload = request
 
-        try:
-            # Unpack args
-            args = msgpack.unpackb(payload)
+            try:
+                # Unpack args
+                args = msgpack.unpackb(payload)
 
-            # Get handler
-            fn = methods.get(method)
-            if fn is None:
-                response = msgpack.packb(f"Method not found: {method}")
+                # Get handler
+                fn = methods.get(method)
+                if fn is None:
+                    response = msgpack.packb(f"Method not found: {method}")
+                    ffi_queue.respond(request_id, response)
+                    continue
+
+                # Call handler
+                if isinstance(args, dict):
+                    result = fn(**args)
+                elif isinstance(args, (list, tuple)):
+                    result = fn(*args)
+                else:
+                    result = fn(args)
+
+                # Pack and respond
+                response = msgpack.packb(result)
                 ffi_queue.respond(request_id, response)
-                continue
 
-            # Call handler
-            if isinstance(args, dict):
-                result = fn(**args)
-            elif isinstance(args, (list, tuple)):
-                result = fn(*args)
-            else:
-                result = fn(args)
+            except Exception as e:
+                import traceback
 
-            # Pack and respond
-            response = msgpack.packb(result)
-            ffi_queue.respond(request_id, response)
-
-        except Exception as e:
-            import traceback
-
-            tb = traceback.format_exc()
-            print(f"[FFI Queue Error] {method}: {e}\n{tb}")
-            response = msgpack.packb(str(e))
-            ffi_queue.respond(request_id, response)
+                tb = traceback.format_exc()
+                print(f"[FFI Queue Error] {method}: {e}\n{tb}")
+                response = msgpack.packb(str(e))
+                ffi_queue.respond(request_id, response)
+    finally:
+        # Ensure cleanup when thread stops
+        print("[FFI Worker] Shutting down Runtime...")
+        service.shutdown()
 
 
 def start_ffi_worker(

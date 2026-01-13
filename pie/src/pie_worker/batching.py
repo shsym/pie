@@ -203,7 +203,7 @@ class Batch:
         Returns:
             Dictionary containing input tensors for the model engine.
         """
-        # self.adapter_subpass_needed = False  # disable ZO for testing
+        self.adapter_subpass_needed = False  # disable ZO for testing
         return {
             "token_ids": torch.as_tensor(
                 self.token_ids, device=device, dtype=torch.long
