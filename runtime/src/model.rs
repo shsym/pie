@@ -298,7 +298,10 @@ pub struct Model {
     info: ModelInfo,
     resource_manager: ResourceManager,
     shutdown_tx: broadcast::Sender<()>,
-    backend: RpcBackend,
+    /// Per-group backends for parallel dispatch
+    backends: Vec<RpcBackend>,
+    /// Primary backend (backends[0]) for global operations
+    primary_backend: RpcBackend,
     /// Batch limits from handshake
     max_batch_tokens: usize,
     max_batch_size: usize,
@@ -315,19 +318,25 @@ impl Model {
         &self.info.name
     }
 
-    /// Create a new Model with an FFI backend using a queue.
+    /// Create a new Model with FFI backends using per-group queues.
     ///
-    /// The queue should be shared with Python which polls it for requests.
+    /// Each queue should be polled by its own Python worker thread.
     /// FfiQueue uses internal Arc so cloning shares state.
-    pub async fn new(queue: ffi_queue::FfiQueue, scheduler_config: SchedulerConfig, num_groups: usize) -> Result<Self> {
-        let ffi_client = AsyncFfiClient::new_with_queue(queue);
-        let backend = RpcBackend::new(ffi_client);
-        Self::new_with_backend(backend, scheduler_config, num_groups).await
+    pub async fn new(queues: Vec<ffi_queue::FfiQueue>, scheduler_config: SchedulerConfig) -> Result<Self> {
+        let backends: Vec<RpcBackend> = queues
+            .into_iter()
+            .map(|q| RpcBackend::new(AsyncFfiClient::new_with_queue(q)))
+            .collect();
+        Self::new_with_backends(backends, scheduler_config).await
     }
 
-    /// Internal constructor that works with any backend.
-    async fn new_with_backend(backend: RpcBackend, scheduler_config: SchedulerConfig, num_groups: usize) -> Result<Self> {
-        let handshake_info = Self::handshake(&backend).await?;
+    /// Internal constructor that works with per-group backends.
+    async fn new_with_backends(backends: Vec<RpcBackend>, scheduler_config: SchedulerConfig) -> Result<Self> {
+        let num_groups = backends.len();
+        let primary_backend = backends[0].clone();
+        
+        // Handshake via primary backend
+        let handshake_info = Self::handshake(&primary_backend).await?;
 
         let (forward_pass_tx, forward_pass_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
@@ -344,7 +353,7 @@ impl Model {
         )));
 
         let worker_handle = tokio::spawn(Self::inference_worker(
-            backend.clone(),
+            backends.clone(),
             forward_pass_rx,
             shutdown_rx,
             max_batch_tokens,
@@ -379,7 +388,8 @@ impl Model {
         Ok(Model {
             info,
             resource_manager,
-            backend,
+            backends,
+            primary_backend,
             max_batch_tokens,
             max_batch_size,
             forward_pass_tx,
@@ -413,9 +423,9 @@ impl Model {
     /// - Multiple batches execute concurrently via spawned tasks (pipelining)
     /// - Scheduler tracks arrival rate and latency to make optimal decisions
     /// - Overlaps batch accumulation with GPU inference for maximum utilization
-    /// Adaptive inference worker with concurrent batch execution per group.
+    /// - Uses per-group backends for parallel DP execution
     async fn inference_worker(
-        backend: RpcBackend,
+        backends: Vec<RpcBackend>,
         mut req_rx: mpsc::UnboundedReceiver<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>,
         mut shutdown_rx: broadcast::Receiver<()>,
         max_batch_tokens: usize,
@@ -526,8 +536,8 @@ impl Model {
                         sched.on_batch_fired(group_id);
                     }
 
-                    // Spawn batch execution
-                    let backend_clone = backend.clone();
+                    // Spawn batch execution using group-specific backend
+                    let backend_clone = backends[group_id].clone();
                     let completion_tx_clone = completion_tx.clone();
                     let batch_size = batch_len;
                     let tokens_in_batch = total_tok;
@@ -587,11 +597,11 @@ impl Model {
             }
         }
 
-        // Shutdown cleanup: Fire remaining batches
+        // Shutdown cleanup: Fire remaining batches using group-specific backend
         for group_id in 0..num_groups {
             if !batches[group_id].is_empty() {
                 let batch = std::mem::take(&mut batches[group_id]);
-                Self::execute_forward_pass_batch(&backend, batch, group_id, REQUEST_TIMEOUT).await;
+                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT).await;
             }
         }
 
@@ -690,7 +700,7 @@ impl Model {
                 }
             }
             Request::Query(query_req, resp_tx) => {
-                let backend_clone = self.backend.clone();
+                let backend_clone = self.primary_backend.clone();
                 tokio::spawn(async move {
                     if let Some(resp) = Self::execute_query(&backend_clone, query_req).await {
                         resp_tx.send(resp).ok();
@@ -698,7 +708,7 @@ impl Model {
                 });
             }
             Request::EmbedImage(req) => {
-                let backend = self.backend.clone();
+                let backend = self.primary_backend.clone();
                 tokio::spawn(async move {
                     if let Err(e) = backend.notify("embed_image", &req).await {
                         eprintln!("[Error] embed_image failed: {:?}", e);
@@ -706,7 +716,7 @@ impl Model {
                 });
             }
             Request::InitializeAdapter(req) => {
-                let backend = self.backend.clone();
+                let backend = self.primary_backend.clone();
                 tokio::spawn(async move {
                     if let Err(e) = backend.notify("initialize_adapter", &req).await {
                         eprintln!("[Error] initialize_adapter failed: {:?}", e);
@@ -714,7 +724,7 @@ impl Model {
                 });
             }
             Request::UpdateAdapter(req) => {
-                let backend = self.backend.clone();
+                let backend = self.primary_backend.clone();
                 tokio::spawn(async move {
                     if let Err(e) = backend.notify("update_adapter", &req).await {
                         eprintln!("[Error] update_adapter failed: {:?}", e);
@@ -722,7 +732,7 @@ impl Model {
                 });
             }
             Request::UploadAdapter(req) => {
-                let backend = self.backend.clone();
+                let backend = self.primary_backend.clone();
                 tokio::spawn(async move {
                     if let Err(e) = backend.notify("upload_adapter", &req).await {
                         eprintln!("[Error] upload_adapter failed: {:?}", e);
@@ -730,7 +740,7 @@ impl Model {
                 });
             }
             Request::DownloadAdapter(req) => {
-                let backend = self.backend.clone();
+                let backend = self.primary_backend.clone();
                 tokio::spawn(async move {
                     if let Err(e) = backend.notify("download_adapter", &req).await {
                         eprintln!("[Error] download_adapter failed: {:?}", e);

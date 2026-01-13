@@ -510,18 +510,22 @@ def _start_multi_gpu_ffi_backend(
     # Sync with workers then start server
     dist.barrier()
 
-    ffi_queue = _pie.FfiQueue()
-    # Note: Rank 0's FFI worker needs access to ALL result queues to poll them?
-    # Actually, the Runtime on Rank 0 will handle polling/aggregating if configured as coordinator.
-    # But start_ffi_worker starts a THREAD. We need to pass the runtime which now has the queues.
-    _ffi_worker, stop_event = start_ffi_worker(ffi_queue, runtime)
+    # Create one FfiQueue per DP group for parallel dispatch
+    ffi_queues = [_pie.FfiQueue() for _ in range(num_groups)]
 
+    # Start one FFI worker thread per queue (all share same Runtime)
+    ffi_workers = []
+    for i, q in enumerate(ffi_queues):
+        thread, stop = start_ffi_worker(q, runtime, thread_name=f"ffi-group-{i}")
+        ffi_workers.append(FfiWorkerHandle(thread, stop))
+
+    # Pass all queues to Rust - it will route fire_batch to group-specific queues
     server_handle = _pie.start_server_with_ffi(
-        server_config, authorized_users_path, ffi_queue, num_groups
+        server_config, authorized_users_path, ffi_queues
     )
 
     # Return the context objects (ctx) instead of raw processes so we can join gracefully
-    return [server_handle, ctx, FfiWorkerHandle(_ffi_worker, stop_event)]
+    return [server_handle, ctx] + ffi_workers
 
 
 def _calculate_topology(world_size: int, tp_degree: int) -> list[list[int]]:

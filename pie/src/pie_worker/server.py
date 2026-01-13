@@ -94,9 +94,14 @@ def poll_ffi_queue(
 
 
 def start_ffi_worker(
-    ffi_queue, service: Runtime
+    ffi_queue, service: Runtime, thread_name: str = "pie-ffi-worker"
 ) -> tuple[threading.Thread, threading.Event]:
     """Start the FFI worker thread that polls the Rust queue.
+
+    Args:
+        ffi_queue: _pie.FfiQueue instance
+        service: Runtime instance to dispatch calls to
+        thread_name: Name for the worker thread (for debugging)
 
     Returns:
         tuple (thread, stop_event) where thread is already started.
@@ -106,6 +111,6 @@ def start_ffi_worker(
     def worker():
         poll_ffi_queue(ffi_queue, service, stop_event)
 
-    thread = threading.Thread(target=worker, name="pie-ffi-worker", daemon=True)
+    thread = threading.Thread(target=worker, name=thread_name, daemon=True)
     thread.start()
     return thread, stop_event

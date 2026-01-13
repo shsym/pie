@@ -237,29 +237,32 @@ fn start_server(
 
 /// Starts the PIE server with an FFI backend using a queue-based approach.
 ///
-/// Python must create the FfiQueue and start a worker thread BEFORE calling this,
-/// so the worker can respond to the handshake.
+/// Python must create the FfiQueues and start worker threads BEFORE calling this,
+/// so each worker can respond to requests on its queue.
 ///
 /// Args:
 ///     config: Server configuration
 ///     authorized_users_path: Optional path to authorized_users.toml
-///     queue: FfiQueue instance (Python creates this and starts worker first)
+///     queues: Vec of FfiQueue instances (one per DP group, Python creates and starts workers first)
 ///
 /// Returns:
 ///     ServerHandle with shutdown capability.
 #[pyfunction]
-#[pyo3(signature = (config, authorized_users_path, queue, num_groups=1))]
+#[pyo3(signature = (config, authorized_users_path, queues))]
 fn start_server_with_ffi(
     py: Python<'_>,
     config: ServerConfig,
     authorized_users_path: Option<String>,
-    queue: crate::model::ffi_queue::FfiQueue,
-    num_groups: usize,
+    queues: Vec<crate::model::ffi_queue::FfiQueue>,
 ) -> PyResult<ServerHandle> {
     use crate::model::{self, Model, SchedulerConfig};
     
+    if queues.is_empty() {
+        return Err(PyRuntimeError::new_err("At least one FfiQueue is required"));
+    }
+    
     // Allow other Python threads to run while we block
-    // IMPORTANT: Worker thread must already be polling the queue!
+    // IMPORTANT: Worker threads must already be polling the queues!
     py.allow_threads(|| {
         let rt = Arc::new(tokio::runtime::Runtime::new()
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?);
@@ -289,10 +292,10 @@ fn start_server_with_ffi(
                 PyRuntimeError::new_err(format!("Server failed to start: {}", e))
             })?; 
 
-            // Create Model with FFI backend using the queue from Python
+            // Create Model with FFI backend using the queues from Python
             let scheduler_config = SchedulerConfig::default();
-            // Pass num_groups to Model::new
-            let model = Model::new(queue, scheduler_config, num_groups).await
+            // Pass queues vector to Model::new
+            let model = Model::new(queues, scheduler_config).await
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create FFI model: {}", e)))?;
             
             // Get model name before registering
@@ -318,6 +321,7 @@ fn start_server_with_ffi(
         })
     })
 }
+
 
 /// Python module definition for _pie
 #[pymodule]
