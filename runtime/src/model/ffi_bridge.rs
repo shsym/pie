@@ -116,3 +116,95 @@ pub struct FfiTiming {
     pub deserialize_us: u64,
     pub total_us: u64,
 }
+
+/// Unified backend client trait for both FFI (in-process) and IPC (cross-process) communication.
+#[async_trait::async_trait]
+pub trait BackendClient: Send + Sync {
+    /// Call a method with serialized payload and receive serialized response.
+    async fn call_raw(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>>;
+    
+    /// Call a method with timeout.
+    async fn call_raw_with_timeout(
+        &self,
+        method: &str,
+        payload: Vec<u8>,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<u8>> {
+        tokio::time::timeout(timeout, self.call_raw(method, payload))
+            .await
+            .map_err(|_| anyhow::anyhow!("Backend call timed out"))?
+    }
+}
+
+#[async_trait::async_trait]
+impl BackendClient for AsyncFfiClient {
+    async fn call_raw(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
+        let (_id, rx) = self.queue.send_request(method.to_string(), payload);
+        rx.await.map_err(|_| anyhow::anyhow!("Response channel closed"))
+    }
+}
+
+/// Async IPC client for cross-process communication.
+///
+/// Uses ipc-channel to communicate with Python processes in other PIDs.
+#[derive(Clone)]
+pub struct AsyncIpcClient {
+    backend: std::sync::Arc<crate::model::ffi_ipc::FfiIpcBackend>,
+}
+
+impl AsyncIpcClient {
+    /// Create a new IPC client from an FfiIpcBackend.
+    pub fn new(backend: std::sync::Arc<crate::model::ffi_ipc::FfiIpcBackend>) -> Self {
+        Self { backend }
+    }
+    
+    /// Call a Python method asynchronously via IPC.
+    pub async fn call<T, R>(&self, method: &str, args: &T) -> Result<R>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        // Serialize arguments
+        let payload = rmp_serde::to_vec_named(args)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize args: {}", e))?;
+        
+        // Send via IPC
+        let response = self.backend.call(method, payload).await?;
+        
+        // Deserialize response
+        rmp_serde::from_slice(&response)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize response: {}", e))
+    }
+    
+    /// Fire-and-forget notification.
+    pub async fn notify<T>(&self, method: &str, args: &T) -> Result<()>
+    where
+        T: Serialize,
+    {
+        let _: () = self.call(method, args).await?;
+        Ok(())
+    }
+    
+    /// Call with timeout.
+    pub async fn call_with_timeout<T, R>(
+        &self,
+        method: &str,
+        args: &T,
+        timeout: std::time::Duration,
+    ) -> Result<R>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        tokio::time::timeout(timeout, self.call(method, args))
+            .await
+            .map_err(|_| anyhow::anyhow!("IPC call timed out"))?
+    }
+}
+
+#[async_trait::async_trait]
+impl BackendClient for AsyncIpcClient {
+    async fn call_raw(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
+        self.backend.call(method, payload).await
+    }
+}

@@ -626,9 +626,13 @@ class Runtime:
         while not shutdown_requested:
             # Receive control message
             try:
-                # Use my local process group
-                my_pg = self.process_groups.get(self.group_id)
-                msg = utils.broadcast_struct(None, src=0, device=device, group=my_pg)
+                # Use compute_process_groups for TP-only broadcast
+                # src must be the leader's GLOBAL rank, not group-local rank
+                my_pg = self.compute_process_groups.get(self.group_id)
+                leader_global_rank = self.group_topology[self.group_id][0]
+                msg = utils.broadcast_struct(
+                    None, src=leader_global_rank, device=device, group=my_pg
+                )
             except Exception:
                 break
 
@@ -642,7 +646,7 @@ class Runtime:
                 msg_type = msg.get("type")
 
                 if msg_type == "STEP":
-                    # Execute inference step
+                    # Execute inference step (tensors already broadcast from Rank 0)
                     inputs = msg["inputs"]
                     sampling_metadata = msg["sampling_metadata"]
                     try:
@@ -667,6 +671,50 @@ class Runtime:
                             and self.group_id > 0
                             and self.result_queue is not None
                         ):
+                            self.result_queue.put(None)
+
+                elif msg_type == "STEP_RAW":
+                    # FAST PATH for DP: Receive raw kwargs, build tensors locally
+                    # This avoids synchronous dist.broadcast() AND Batch building on Rank 0
+                    from .batching import Batch
+
+                    kwargs = msg["kwargs"]
+                    try:
+                        # Build batch and tensors locally
+                        batch = Batch(
+                            kwargs,
+                            self.config.kv_page_size,
+                            self.config.max_dist_size,
+                            self.adapters,
+                        )
+                        device = self.config.device
+                        inputs = batch.get_model_inputs(device)
+                        sampling_metadata = batch.get_sampling_metadata(
+                            device, self.config.activation_dtype
+                        )
+
+                        # Execute inference
+                        sampling_results = self._run_step(inputs, sampling_metadata)
+
+                        # Package responses locally (critical: moves this work to worker)
+                        responses = batch.create_responses(sampling_results)
+                        results = [
+                            {"tokens": resp.tokens, "dists": resp.dists}
+                            for resp in responses
+                        ]
+
+                        # Return fully packaged response dict
+                        if self.result_queue is not None:
+                            self.result_queue.put(
+                                {
+                                    "results": results,
+                                    "batch_size": len(responses),
+                                }
+                            )
+                    except Exception as e:
+                        print(f"Worker {self.config.rank} STEP_RAW error: {e}")
+                        torch.cuda.synchronize()
+                        if self.result_queue is not None:
                             self.result_queue.put(None)
 
                 elif msg_type == "INIT_ADAPTER":
@@ -799,82 +847,209 @@ class Runtime:
 
         t_start = time.perf_counter()
 
-        # Build internal Batch object from pre-batched data
-        t0 = time.perf_counter()
-        batch = Batch(
-            kwargs,
-            self.config.kv_page_size,
-            self.config.max_dist_size,
-            self.adapters,
-        )
-        build_timing = batch.timing
-        t_build_batch = time.perf_counter() - t0
-
-        # Get model inputs and sampling metadata
-        device = self.config.device
-        t0 = time.perf_counter()
-        inputs = batch.get_model_inputs(device)
-        t_get_inputs = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        sampling_metadata = batch.get_sampling_metadata(
-            device, self.config.activation_dtype
-        )
-        t_get_sampling_meta = time.perf_counter() - t0
-
-        # Broadcast to workers if multi-GPU
-        t0 = time.perf_counter()
         # Use group_id from kwargs if present (from Rust), else default to local
         target_group_id = kwargs.get("group_id", self.group_id)
 
-        if self.config.world_size > 1:
-            msg = {
-                "type": "STEP",
-                "inputs": inputs,
-                "sampling_metadata": sampling_metadata,
+        # Check if this is a remote DP group (only relevant for central coordinator mode)
+        # In symmetric IPC mode, each group leader handles its own group, so this is always False
+        is_remote_dp_group = (
+            target_group_id != 0
+            and self.group_topology
+            and target_group_id < len(self.group_topology)
+            and 0 not in self.group_topology[target_group_id]
+        )
+
+        # SYMMETRIC IPC MODE: If target_group_id == self.group_id, we ARE the group leader
+        # and should execute locally. The Rust server already routed the request to us.
+        # This check supersedes the rank != 0 check for the symmetric architecture.
+        if target_group_id == self.group_id:
+            is_remote_dp_group = False
+
+        # PROFILING: Track request distribution and timings
+        if not hasattr(self, "_dp_stats"):
+            self._dp_stats = {
+                "group_counts": {},
+                "step_raw_times": [],
+                "local_times": [],
+                "last_report": time.perf_counter(),
             }
-            target_pg = self.process_groups.get(target_group_id)
+        stats = self._dp_stats
+        stats["group_counts"][target_group_id] = (
+            stats["group_counts"].get(target_group_id, 0) + 1
+        )
 
-            utils.broadcast_struct(
-                msg,
-                src=0,
-                device=device,
-                group=target_pg,
-                group_id=target_group_id,
-            )
-        t_broadcast = time.perf_counter() - t0
+        if is_remote_dp_group and self.config.world_size > 1:
+            # FAST PATH: Send raw kwargs to group leader, let them build tensors AND package responses
+            # This eliminates ALL Batch processing on Rank 0 for remote DP groups
+            t0 = time.perf_counter()
+            msg = {"type": "STEP_RAW", "kwargs": kwargs}
+            utils._control_channel.send(msg, destination_group=target_group_id)
+            t_broadcast = time.perf_counter() - t0
 
-        # Execute inference - either locally (Group 0) or wait for result (secondary groups)
-        t0 = time.perf_counter()
-        if target_group_id == 0 or target_group_id == self.group_id:
-            # Group 0 or my own group: Execute locally
-            sampling_results = self._run_step(inputs, sampling_metadata)
-        else:
-            # Secondary group: Wait for result from that group's leader
+            # Wait for fully packaged result from worker
+            t0 = time.perf_counter()
+            packaged_result = None
             if self.result_queues and target_group_id < len(self.result_queues):
                 try:
-                    # Wait with timeout to avoid infinite hang
-                    sampling_results = self.result_queues[target_group_id].get(
+                    packaged_result = self.result_queues[target_group_id].get(
                         timeout=300
                     )
-                    if sampling_results is None:
-                        # Error occurred in worker, return empty results
+                    if packaged_result is None:
                         print(
                             f"[Warning] Group {target_group_id} returned error result"
                         )
-                        sampling_results = []
                 except Exception as e:
                     print(
                         f"[Error] Timeout waiting for group {target_group_id} result: {e}"
                     )
-                    sampling_results = []
+            t_inference = time.perf_counter() - t0
+
+            # Use pre-packaged results directly (no Batch building!)
+            if (
+                packaged_result
+                and isinstance(packaged_result, dict)
+                and "results" in packaged_result
+            ):
+                results = packaged_result["results"]
             else:
-                # Fallback: Execute locally (should not happen in proper DP setup)
-                print(
-                    f"[Warning] No result_queue for group {target_group_id}, executing locally"
+                results = []
+
+            # Dummy timing values (no local batch processing happened)
+            t_build_batch = 0.0
+            t_get_inputs = 0.0
+            t_get_sampling_meta = 0.0
+            t_create_responses = 0.0
+            build_timing = {
+                "decode_u32": 0.0,
+                "mask_loop": 0.0,
+                "brle_decode": 0.0,
+                "sampler_loop": 0.0,
+            }
+
+            t_total = time.perf_counter() - t_start
+
+            # PROFILING: Track timing per path and report periodically
+            stats["step_raw_times"].append(t_total)
+
+            # Report every 10 seconds
+            now = time.perf_counter()
+            if now - stats["last_report"] > 10.0:
+                stats["last_report"] = now
+                total_reqs = sum(stats["group_counts"].values())
+                avg_raw = sum(stats["step_raw_times"]) / max(
+                    len(stats["step_raw_times"]), 1
                 )
+                avg_local = sum(stats["local_times"]) / max(
+                    len(stats["local_times"]), 1
+                )
+                print(
+                    f"[PROFILING] Groups: {stats['group_counts']} | "
+                    f"Total: {total_reqs} | "
+                    f"STEP_RAW avg: {avg_raw*1000:.1f}ms ({len(stats['step_raw_times'])}) | "
+                    f"Local avg: {avg_local*1000:.1f}ms ({len(stats['local_times'])})"
+                )
+                # Reset for next window
+                stats["step_raw_times"] = []
+                stats["local_times"] = []
+
+            # Record latency stats
+            self._latency_stats.record_span(
+                StepTiming(
+                    build_batch=t_build_batch,
+                    get_inputs=t_get_inputs,
+                    get_sampling_meta=t_get_sampling_meta,
+                    broadcast=t_broadcast,
+                    inference=t_inference,
+                    create_responses=t_create_responses,
+                    total=t_total,
+                    decode_u32=build_timing["decode_u32"],
+                    mask_loop=build_timing["mask_loop"],
+                    brle_decode=build_timing["brle_decode"],
+                    sampler_loop=build_timing["sampler_loop"],
+                ),
+            )
+
+            return {"results": results}
+
+        else:
+            # LOCAL PATH: Build tensors and execute (or broadcast for TP groups)
+            t0 = time.perf_counter()
+            batch = Batch(
+                kwargs,
+                self.config.kv_page_size,
+                self.config.max_dist_size,
+                self.adapters,
+            )
+            build_timing = batch.timing
+            t_build_batch = time.perf_counter() - t0
+
+            device = self.config.device
+            t0 = time.perf_counter()
+            inputs = batch.get_model_inputs(device)
+            t_get_inputs = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            sampling_metadata = batch.get_sampling_metadata(
+                device, self.config.activation_dtype
+            )
+            t_get_sampling_meta = time.perf_counter() - t0
+
+            # Broadcast to workers if multi-GPU TP group
+            # Skip broadcast if:
+            # - Single process mode (world_size == 1)
+            # - IPC mode (rank != 0) - we're already the group leader processing locally
+            t0 = time.perf_counter()
+            should_broadcast = (
+                self.config.world_size > 1
+                and self.config.rank == 0  # Only group leader (tp_rank 0) broadcasts
+                and target_group_id == self.group_id  # Only for MY TP group
+            )
+            if should_broadcast:
+                msg = {
+                    "type": "STEP",
+                    "inputs": inputs,
+                    "sampling_metadata": sampling_metadata,
+                }
+                # Use compute_process_groups for TP-only broadcast
+                # src must be the leader's GLOBAL rank, not group-local rank
+                target_pg = self.compute_process_groups.get(target_group_id)
+                leader_global_rank = self.group_topology[target_group_id][0]
+                utils.broadcast_struct(
+                    msg,
+                    src=leader_global_rank,
+                    device=device,
+                    group=target_pg,
+                    group_id=target_group_id,
+                )
+            t_broadcast = time.perf_counter() - t0
+
+            # Execute inference locally
+            t0 = time.perf_counter()
+            if target_group_id == self.group_id:
                 sampling_results = self._run_step(inputs, sampling_metadata)
-        t_inference = time.perf_counter() - t0
+            else:
+                # TP group with Rank 0: wait for result
+                if self.result_queues and target_group_id < len(self.result_queues):
+                    try:
+                        sampling_results = self.result_queues[target_group_id].get(
+                            timeout=300
+                        )
+                        if sampling_results is None:
+                            print(
+                                f"[Warning] Group {target_group_id} returned error result"
+                            )
+                            sampling_results = []
+                    except Exception as e:
+                        print(
+                            f"[Error] Timeout waiting for group {target_group_id} result: {e}"
+                        )
+                        sampling_results = []
+                else:
+                    print(
+                        f"[Warning] No result_queue for group {target_group_id}, executing locally"
+                    )
+                    sampling_results = self._run_step(inputs, sampling_metadata)
+            t_inference = time.perf_counter() - t0
 
         # Package responses
         t0 = time.perf_counter()
@@ -892,6 +1067,31 @@ class Runtime:
         t_create_responses = time.perf_counter() - t0
 
         t_total = time.perf_counter() - t_start
+
+        # PROFILING: Track timing per path and report periodically
+        if is_remote_dp_group:
+            stats["step_raw_times"].append(t_total)
+        else:
+            stats["local_times"].append(t_total)
+
+        # Report every 10 seconds
+        now = time.perf_counter()
+        if now - stats["last_report"] > 10.0:
+            stats["last_report"] = now
+            total_reqs = sum(stats["group_counts"].values())
+            avg_raw = sum(stats["step_raw_times"]) / max(
+                len(stats["step_raw_times"]), 1
+            )
+            avg_local = sum(stats["local_times"]) / max(len(stats["local_times"]), 1)
+            print(
+                f"[PROFILING] Groups: {stats['group_counts']} | "
+                f"Total: {total_reqs} | "
+                f"STEP_RAW avg: {avg_raw*1000:.1f}ms ({len(stats['step_raw_times'])}) | "
+                f"Local avg: {avg_local*1000:.1f}ms ({len(stats['local_times'])})"
+            )
+            # Reset for next window
+            stats["step_raw_times"] = []
+            stats["local_times"] = []
 
         # Record latency stats
         self._latency_stats.record_span(

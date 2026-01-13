@@ -68,6 +68,9 @@ def load_config(
     }
 
     model_configs = config.get("model", [])
+    # Handle both [model] (dict) and [[model]] (list) formats
+    if isinstance(model_configs, dict):
+        model_configs = [model_configs]
     if not model_configs:
         console.print("[red]✗[/red] No model configuration found")
         raise typer.Exit(1)

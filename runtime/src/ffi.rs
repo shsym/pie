@@ -323,14 +323,284 @@ fn start_server_with_ffi(
 }
 
 
+/// Starts the PIE server with a hybrid FFI/IPC backend architecture.
+///
+/// Group 0 uses an in-process FFI queue (fast, same process).
+/// Groups 1+ use IPC channels for cross-process communication (GIL isolation).
+///
+/// Args:
+///     config: Server configuration
+///     authorized_users_path: Optional path to authorized_users.toml
+///     local_queue: FfiQueue for Group 0 (must be polled by a local worker thread)
+///     num_ipc_groups: Number of remote groups (creates FfiIpcBackend for each)
+///
+/// Returns:
+///     Tuple of (ServerHandle, Vec<String>) where strings are IPC server names for remote groups.
+#[pyfunction]
+#[pyo3(signature = (config, authorized_users_path, local_queue, num_ipc_groups))]
+fn start_server_with_ipc(
+    py: Python<'_>,
+    config: ServerConfig,
+    authorized_users_path: Option<String>,
+    local_queue: crate::model::ffi_queue::FfiQueue,
+    num_ipc_groups: usize,
+) -> PyResult<(ServerHandle, Vec<String>)> {
+    use crate::model::{self, Model, SchedulerConfig, RpcBackend};
+    use crate::model::ffi_bridge::AsyncIpcClient;
+    use crate::model::ffi_ipc::FfiIpcBackend;
+    
+    // Allow other Python threads to run while we block
+    py.allow_threads(|| {
+        let rt = Arc::new(tokio::runtime::Runtime::new()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?);
+
+        let result = rt.block_on(async {
+            let authorized_users = match authorized_users_path {
+                Some(path) => AuthorizedUsers::load(&PathBuf::from(path)).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to load authorized users: {}", e))
+                })?,
+                None => AuthorizedUsers::default(),
+            };
+
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+            let engine_config: EngineConfig = config.into();
+
+            // Spawn the server in a background task
+            tokio::spawn(async move {
+                if let Err(e) = engine::run_server(engine_config, authorized_users, ready_tx, shutdown_rx).await {
+                    eprintln!("[PIE] Server error: {}", e);
+                }
+            });
+
+            // Wait for server to be ready
+            let internal_token = ready_rx.await.map_err(|e| {
+                PyRuntimeError::new_err(format!("Server failed to start: {}", e))
+            })?;
+
+            // Create backends: Group 0 = FFI, Groups 1+ = IPC
+            let mut backends = Vec::with_capacity(1 + num_ipc_groups);
+            let mut ipc_server_names = Vec::with_capacity(num_ipc_groups);
+            
+            // Group 0: In-process FFI
+            let ffi_client = crate::model::ffi_bridge::AsyncFfiClient::new_with_queue(local_queue);
+            backends.push(RpcBackend::new(ffi_client));
+            
+            // Groups 1+: Cross-process IPC
+            for group_id in 1..=num_ipc_groups {
+                let (ipc_backend, server_name) = FfiIpcBackend::new_with_handshake(group_id)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create IPC backend for group {}: {}", group_id, e)))?;
+                
+                let ipc_client = AsyncIpcClient::new(std::sync::Arc::new(ipc_backend));
+                backends.push(RpcBackend::new_ipc(ipc_client));
+                ipc_server_names.push(server_name);
+            }
+            
+            // Create Model with mixed backends
+            let scheduler_config = SchedulerConfig::default();
+            let model = Model::new_with_backends(backends, scheduler_config).await
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to create model: {}", e)))?;
+            
+            // Get model name before registering
+            let model_name = model.name().to_string();
+            
+            // Register the model with the engine
+            let model_id = model::install_model(model_name.clone(), model);
+            if model_id.is_none() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "Failed to register model '{}': already exists", model_name
+                )));
+            }
+
+            Ok::<(String, oneshot::Sender<()>, Vec<String>), PyErr>((internal_token, shutdown_tx, ipc_server_names))
+        })?;
+
+        let (token, shutdown_tx, server_names) = result;
+
+        let handle = ServerHandle {
+            internal_token: token,
+            shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+            runtime: rt,
+        };
+        
+        Ok((handle, server_names))
+    })
+}
+
+/// Partial handle for two-phase server initialization.
+///
+/// Phase 1 creates IPC backends and returns this handle + server names.
+/// Python spawns worker threads and connects to the IPC servers.
+/// Phase 2 calls `complete()` to perform handshake and register the model.
+#[pyclass]
+pub struct PartialServerHandle {
+    internal_token: String,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    /// IPC backends (not yet handshaked)
+    backends: Arc<Mutex<Option<Vec<crate::model::RpcBackend>>>>,
+    /// Scheduler config for model creation
+    scheduler_config: crate::model::SchedulerConfig,
+}
+
+#[pymethods]
+impl PartialServerHandle {
+    /// Complete initialization by performing handshake and registering the model.
+    ///
+    /// This should be called after Python IPC workers have connected.
+    /// Blocks until handshake completes successfully.
+    fn complete(&self, py: Python<'_>) -> PyResult<ServerHandle> {
+        use crate::model::{self, Model};
+        
+        py.allow_threads(|| {
+            let backends = {
+                let mut guard = self.backends.lock().map_err(|e| {
+                    PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
+                })?;
+                guard.take().ok_or_else(|| {
+                    PyRuntimeError::new_err("complete() already called")
+                })?
+            };
+            
+            let scheduler_config = self.scheduler_config.clone();
+            
+            self.runtime.block_on(async {
+                // Now Python workers are connected, handshake will succeed
+                let model = Model::new_with_backends(backends, scheduler_config).await
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create model: {}", e)))?;
+                
+                let model_name = model.name().to_string();
+                
+                // Register the model with the engine
+                let model_id = model::install_model(model_name.clone(), model);
+                if model_id.is_none() {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "Failed to register model '{}': already exists", model_name
+                    )));
+                }
+                
+                Ok::<(), PyErr>(())
+            })?;
+            
+            Ok(ServerHandle {
+                internal_token: self.internal_token.clone(),
+                shutdown_tx: Arc::clone(&self.shutdown_tx),
+                runtime: Arc::clone(&self.runtime),
+            })
+        })
+    }
+    
+    /// Get the internal authentication token.
+    #[getter]
+    fn internal_token(&self) -> String {
+        self.internal_token.clone()
+    }
+    
+    fn __repr__(&self) -> String {
+        format!("PartialServerHandle(token={}...)", &self.internal_token[..8])
+    }
+}
+
+/// Phase 1: Start the Pie server and create IPC backends WITHOUT handshaking.
+///
+/// This returns immediately after creating IPC backends, allowing Python to
+/// spawn worker threads and connect to the IPC servers before Phase 2.
+///
+/// Args:
+///     config: ServerConfig with host/port settings
+///     authorized_users_path: Optional path to authorized users file
+///     num_groups: Total number of groups (all will use IPC)
+///
+/// Returns:
+///     Tuple of (PartialServerHandle, list of IPC server names for all groups)
+#[pyfunction]
+#[pyo3(signature = (config, authorized_users_path, num_groups))]
+fn start_server_phase1(
+    py: Python<'_>,
+    config: ServerConfig,
+    authorized_users_path: Option<String>,
+    num_groups: usize,
+) -> PyResult<(PartialServerHandle, Vec<String>)> {
+    use crate::model::{SchedulerConfig, RpcBackend};
+    use crate::model::ffi_bridge::AsyncIpcClient;
+    use crate::model::ffi_ipc::FfiIpcBackend;
+    
+    // Allow other Python threads to run while we block
+    py.allow_threads(|| {
+        let rt = Arc::new(tokio::runtime::Runtime::new()
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?);
+
+        let result = rt.block_on(async {
+            let authorized_users = match authorized_users_path {
+                Some(path) => AuthorizedUsers::load(&PathBuf::from(path)).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to load authorized users: {}", e))
+                })?,
+                None => AuthorizedUsers::default(),
+            };
+
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+            let engine_config: EngineConfig = config.into();
+
+            // Spawn the server in a background task
+            tokio::spawn(async move {
+                if let Err(e) = engine::run_server(engine_config, authorized_users, ready_tx, shutdown_rx).await {
+                    eprintln!("[PIE] Server error: {}", e);
+                }
+            });
+
+            // Wait for server to be ready
+            let internal_token = ready_rx.await.map_err(|e| {
+                PyRuntimeError::new_err(format!("Server failed to start: {}", e))
+            })?;
+
+            // Create IPC backends for ALL groups (no handshake yet - just channel setup)
+            let mut backends = Vec::with_capacity(num_groups);
+            let mut ipc_server_names = Vec::with_capacity(num_groups);
+            
+            for group_id in 0..num_groups {
+                let (ipc_backend, server_name) = FfiIpcBackend::new_with_handshake(group_id)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create IPC backend for group {}: {}", group_id, e)))?;
+                
+                let ipc_client = AsyncIpcClient::new(std::sync::Arc::new(ipc_backend));
+                backends.push(RpcBackend::new_ipc(ipc_client));
+                ipc_server_names.push(server_name);
+            }
+
+            Ok::<(String, oneshot::Sender<()>, Vec<RpcBackend>, Vec<String>), PyErr>(
+                (internal_token, shutdown_tx, backends, ipc_server_names)
+            )
+        })?;
+
+        let (token, shutdown_tx, backends, server_names) = result;
+
+        let handle = PartialServerHandle {
+            internal_token: token,
+            shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+            runtime: rt,
+            backends: Arc::new(Mutex::new(Some(backends))),
+            scheduler_config: SchedulerConfig::default(),
+        };
+        
+        Ok((handle, server_names))
+    })
+}
+
+
 /// Python module definition for _pie
 #[pymodule]
 pub fn _pie(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ServerConfig>()?;
     m.add_class::<ServerHandle>()?;
+    m.add_class::<PartialServerHandle>()?;
     m.add_class::<crate::model::ffi_queue::FfiQueue>()?;
+    m.add_class::<crate::model::ffi_ipc::FfiIpcQueue>()?;
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     m.add_function(wrap_pyfunction!(start_server_with_ffi, m)?)?;
+    m.add_function(wrap_pyfunction!(start_server_with_ipc, m)?)?;
+    m.add_function(wrap_pyfunction!(start_server_phase1, m)?)?;
     m.add_function(wrap_pyfunction!(initialize_backend, m)?)?;
     Ok(())
 }

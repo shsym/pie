@@ -9,7 +9,7 @@ multiprocessing.Queue for cross-process communication.
 from __future__ import annotations
 
 import torch.multiprocessing as mp
-from multiprocessing import Queue
+from multiprocessing import Queue  # Type hint only; actual queues use mp.get_context()
 from typing import Any
 
 
@@ -64,7 +64,10 @@ class ControlChannel:
         if destination_group is None:
             # Broadcast to all workers
             for q in self.queues:
-                q.put(data)
+                try:
+                    q.put_nowait(data)
+                except Exception:
+                    q.put(data)
         else:
             # Send only to workers in specific group
             if destination_group >= len(self.group_topology):
@@ -78,7 +81,11 @@ class ControlChannel:
                 # Worker queue index is rank - 1
                 q_idx = r - 1
                 if 0 <= q_idx < len(self.queues):
-                    self.queues[q_idx].put(data)
+                    try:
+                        self.queues[q_idx].put_nowait(data)
+                    except Exception:
+                        # Queue full, fall back to blocking put
+                        self.queues[q_idx].put(data)
 
     def recv(self, timeout: float | None = None) -> Any:
         """

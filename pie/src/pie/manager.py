@@ -423,18 +423,18 @@ def _start_multi_gpu_ffi_backend(
     console,
     status_update: callable,
 ) -> list:
-    """Start multi-GPU FFI backend with worker processes.
+    """Start multi-GPU backend with Coordinator + All Workers architecture.
 
-    Spawns worker processes for ranks 1..world_size-1, then initializes rank 0
-    in-process with torch.distributed and the FFI queue.
+    Main Process (Coordinator):
+        - Only runs the Rust server
+        - Does NOT participate in torch.distributed
+        - Does NOT load any model
 
-    Returns:
-        List where first element is ServerHandle, rest are worker processes
-    """
-    """Start multi-GPU FFI backend with worker processes.
-
-    Spawns worker processes for ranks 1..world_size-1, then initializes rank 0
-    in-process with torch.distributed and the FFI queue.
+    Worker Processes (0..world_size-1):
+        - All run identical code
+        - Each participates in torch.distributed
+        - Each loads model on its assigned GPU
+        - Each connects to IPC server
 
     Returns:
         List where first element is ServerHandle, rest are worker processes
@@ -445,9 +445,8 @@ def _start_multi_gpu_ffi_backend(
     # Use 'spawn' context for CUDA compatibility
     mp.set_start_method("spawn", force=True)
 
-    # Generate master port and create control channels
+    # Generate master port
     master_port = 29500 + random.randint(0, 1000)
-    control_queues = create_control_channels(world_size)
 
     # Build config dict for all ranks
     full_config = _build_backend_config(
@@ -455,7 +454,6 @@ def _start_multi_gpu_ffi_backend(
     )
 
     # Determine Tensor Parallel degree and topology
-    # Default to TP=1 (Max DP) if not specified
     tp_degree = model_config.get(
         "tensor_parallel_size", engine_config.get("tensor_parallel_size", 1)
     )
@@ -464,68 +462,45 @@ def _start_multi_gpu_ffi_backend(
 
     status_update(f"  Topology: {num_groups} groups (TP={tp_degree})")
 
-    # Create result queues (one per group)
-    # Rank 0 uses these to receive results from other groups
-    result_queues = [mp.get_context("spawn").Queue() for _ in range(num_groups)]
+    # Phase 1: Start server and get IPC server names for ALL groups
+    # Server starts immediately, workers will connect later
+    partial_handle, ipc_server_names = _pie.start_server_phase1(
+        server_config, authorized_users_path, num_groups
+    )
 
-    # Spawn worker processes for ranks 1..world_size-1
+    # Create ready queue for workers to signal when they've connected to IPC
+    spawn_ctx = mp.get_context("spawn")
+    ready_queue = spawn_ctx.Queue()
+
+    # Spawn ALL worker processes (ranks 0..world_size-1)
+    # All workers run identical code - just with different rank/device
     ctx = mp.spawn(
-        _ffi_worker_process,
+        _ipc_worker_process,
         args=(
             world_size,
             devices,
             master_port,
-            control_queues,
             full_config,
             group_topology,
-            result_queues,
+            ipc_server_names,
+            ready_queue,
         ),
-        nprocs=world_size - 1,
+        nprocs=world_size,
         join=False,
         start_method="spawn",
     )
-    worker_processes = list(ctx.processes)
 
-    # Initialize rank 0 in this process
-    # Initialize rank 0 in this process
-    _init_distributed(0, world_size, master_port, devices[0])
-    # print("[DEBUG R0] _setup_control_channel...")
-    _setup_control_channel(0, world_size, control_queues, group_topology)
-    # print("[DEBUG R0] _setup_process_groups...")
-    pg_map = _setup_process_groups(0, group_topology)
-    compute_pg_map = _setup_compute_process_groups(0, group_topology)
-    # print("[DEBUG R0] _create_runtime...")
+    # Wait for ALL workers to signal they've connected to IPC
+    # Each worker sends its rank when ready
+    for _ in range(world_size):
+        rank = ready_queue.get(timeout=120)  # 2 minute timeout for model loading
 
-    runtime = _create_runtime(
-        full_config,
-        devices,
-        0,
-        world_size,
-        group_topology,
-        result_queue=result_queues[0],
-        result_queues=result_queues,  # Pass all queues to Rank 0
-        pg_map=pg_map,
-        compute_pg_map=compute_pg_map,
-    )
-    # Sync with workers then start server
-    dist.barrier()
+    # Phase 2: Complete initialization (blocks until handshake succeeds)
+    # All workers are now connected via IPC
+    server_handle = partial_handle.complete()
 
-    # Create one FfiQueue per DP group for parallel dispatch
-    ffi_queues = [_pie.FfiQueue() for _ in range(num_groups)]
-
-    # Start one FFI worker thread per queue (all share same Runtime)
-    ffi_workers = []
-    for i, q in enumerate(ffi_queues):
-        thread, stop = start_ffi_worker(q, runtime, thread_name=f"ffi-group-{i}")
-        ffi_workers.append(FfiWorkerHandle(thread, stop))
-
-    # Pass all queues to Rust - it will route fire_batch to group-specific queues
-    server_handle = _pie.start_server_with_ffi(
-        server_config, authorized_users_path, ffi_queues
-    )
-
-    # Return the context objects (ctx) instead of raw processes so we can join gracefully
-    return [server_handle, ctx] + ffi_workers
+    # Return server handle and worker context
+    return [server_handle, ctx]
 
 
 def _calculate_topology(world_size: int, tp_degree: int) -> list[list[int]]:
@@ -547,6 +522,237 @@ def _calculate_topology(world_size: int, tp_degree: int) -> list[list[int]]:
         topology.append(group_ranks)
 
     return topology
+
+
+def _ipc_worker_process(
+    local_rank: int,  # mp.spawn passes 0-indexed local rank (= actual rank for us)
+    world_size: int,
+    devices: list[str],
+    master_port: int,
+    config_dict: dict,
+    group_topology: list[list[int]],
+    ipc_server_names: list[str],
+    ready_queue,  # Queue to signal when connected
+):
+    """Worker process for Coordinator + All Workers architecture.
+
+    All workers run this identical code path. Each worker:
+    1. Initializes torch.distributed
+    2. Loads model on its assigned GPU
+    3. Connects to the IPC server for its group
+    4. Signals ready via ready_queue
+    5. Runs the IPC worker loop
+
+    Args:
+        local_rank: Rank of this worker (0 to world_size-1)
+        world_size: Total number of workers
+        devices: List of device strings
+        master_port: Port for torch.distributed rendezvous
+        config_dict: Runtime configuration
+        group_topology: List of groups, each containing ranks
+        ipc_server_names: IPC server names for each group
+        ready_queue: Queue to signal when ready
+    """
+    from pie import _pie
+    from pie_worker.runtime import Runtime
+    from pie_worker.config import RuntimeConfig
+
+    rank = local_rank  # With nprocs=world_size, local_rank IS the actual rank
+
+    # Determine my group and TP rank within it
+    my_group_id = 0
+    tp_rank = 0
+    for i, group in enumerate(group_topology):
+        if rank in group:
+            my_group_id = i
+            tp_rank = group.index(rank)  # My position within the TP group
+            break
+
+    tp_degree = len(group_topology[my_group_id])  # Number of GPUs in my TP group
+
+    # Initialize distributed
+    _init_distributed(rank, world_size, master_port, devices[rank])
+
+    # Setup process groups (collective ops - all ranks must participate)
+    # Capture the mappings to pass to Runtime
+    pg_map = _setup_process_groups(rank, group_topology)
+    compute_pg_map = _setup_compute_process_groups(rank, group_topology)
+
+    # Create runtime config
+    # For TP>1: each worker needs ALL devices in its TP group so devices[tp_rank] works
+    # Get the device list for this TP group (e.g., ["cuda:0", "cuda:1"] for group 0)
+    my_group_ranks = group_topology[my_group_id]
+    group_devices = [devices[r] for r in my_group_ranks]
+
+    filtered_config = {
+        k: v for k, v in config_dict.items() if k not in ("device", "devices")
+    }
+    config = RuntimeConfig.from_args(
+        **filtered_config,
+        devices=group_devices,  # All devices in this TP group
+        rank=tp_rank,  # Position within TP group
+        world_size=tp_degree,  # Size of TP group
+    )
+
+    # Create runtime (loads model on this GPU)
+    # Pass process groups for TP communication
+    runtime = Runtime(
+        config,
+        group_id=my_group_id,
+        process_groups=pg_map,
+        compute_process_groups=compute_pg_map,
+        group_topology=group_topology,
+    )
+
+    # Sync all workers before connecting to server
+    dist.barrier()
+
+    # Check if I'm a group leader (first rank in my TP group)
+    is_group_leader = tp_rank == 0
+
+    if is_group_leader:
+        # Group leader: connect to IPC and handle requests
+        server_name = ipc_server_names[my_group_id]
+        ipc_queue = _pie.FfiIpcQueue.connect(server_name, my_group_id)
+
+        # Signal that we're connected and ready
+        ready_queue.put(rank)
+
+        # Run IPC worker loop (handles requests from Rust server)
+        _run_ipc_worker_loop(ipc_queue, runtime)
+    else:
+        # Non-leader: signal ready, then run worker loop waiting for commands from leader
+        ready_queue.put(rank)
+        runtime.worker_loop()
+
+    # Cleanup
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _run_ipc_worker_loop(ipc_queue, runtime):
+    """Run the IPC worker loop for a group leader.
+
+    This is similar to the FFI worker loop in server.py, but uses IPC for
+    cross-process communication. This allows each group leader to have its
+    own Python GIL, eliminating GIL contention between groups.
+
+    Args:
+        ipc_queue: FfiIpcQueue instance connected to Rust
+        runtime: Runtime instance to dispatch calls to
+    """
+    import msgpack
+    from pie_worker.server import (
+        STATUS_OK,
+        STATUS_METHOD_NOT_FOUND,
+        STATUS_INTERNAL_ERROR,
+    )
+
+    # Method dispatch table
+    methods = {
+        "handshake": runtime.handshake_rpc,
+        "query": runtime.query_rpc,
+        "fire_batch": runtime.fire_batch,
+        "embed_image": runtime.embed_image_rpc,
+        "initialize_adapter": runtime.initialize_adapter_rpc,
+        "update_adapter": runtime.update_adapter_rpc,
+        "upload_adapter": runtime.upload_adapter_rpc,
+        "download_adapter": runtime.download_adapter_rpc,
+    }
+
+    shutdown_requested = False
+    poll_timeout_ms = 100
+
+    try:
+        while not shutdown_requested:
+            # Poll the IPC queue (releases GIL while waiting)
+            request = ipc_queue.poll_blocking(poll_timeout_ms)
+            if request is None:
+                continue  # Timeout, try again
+
+            request_id, method, payload = request
+
+            try:
+                # Unpack args
+                args = msgpack.unpackb(payload)
+
+                # Check for shutdown
+                if method == "shutdown":
+                    shutdown_requested = True
+                    response = msgpack.packb(None)
+                    ipc_queue.respond(request_id, response)
+                    continue
+
+                # Get handler
+                fn = methods.get(method)
+                if fn is None:
+                    response = msgpack.packb(f"Method not found: {method}")
+                    ipc_queue.respond(request_id, response)
+                    continue
+
+                # Call handler
+                if isinstance(args, dict):
+                    result = fn(**args)
+                elif isinstance(args, (list, tuple)):
+                    result = fn(*args)
+                else:
+                    result = fn(args)
+
+                # Pack and respond
+                response = msgpack.packb(result)
+                ipc_queue.respond(request_id, response)
+
+            except Exception as e:
+                import traceback
+
+                tb = traceback.format_exc()
+                print(f"[IPC Worker Error] {method}: {e}\n{tb}")
+                response = msgpack.packb(str(e))
+                ipc_queue.respond(request_id, response)
+    finally:
+        # Ensure cleanup when loop stops
+        runtime.shutdown()
+
+
+def _ipc_group_worker(
+    server_name: str,
+    group_id: int,
+    config_dict: dict,
+    device: str,
+):
+    """IPC worker process for symmetric all-IPC architecture.
+
+    This runs in a separate subprocess with its own GIL.
+    It loads the model on the specified device and connects to the IPC server.
+
+    Args:
+        server_name: IPC server name to connect to
+        group_id: Group ID for this worker
+        config_dict: Runtime configuration
+        device: Device string (e.g., "cuda:0")
+    """
+    from pie import _pie
+    from pie_worker.runtime import Runtime
+    from pie_worker.config import RuntimeConfig
+
+    # Create runtime config for this group
+    filtered_config = {
+        k: v for k, v in config_dict.items() if k not in ("device", "devices")
+    }
+
+    config = RuntimeConfig.from_args(
+        **filtered_config,
+        devices=[device],
+        rank=0,  # Local rank in this process
+        world_size=1,  # Single GPU in this process
+    )
+
+    # Create runtime (loads model on this GPU)
+    runtime = Runtime(config, group_id=group_id)
+
+    # Connect to IPC and run worker loop
+    ipc_queue = _pie.FfiIpcQueue.connect(server_name, group_id)
+    _run_ipc_worker_loop(ipc_queue, runtime)
 
 
 def _ffi_worker_process(
@@ -582,8 +788,6 @@ def _ffi_worker_process(
     my_result_queue = result_queues[my_group_id]
 
     # Initialize distributed, control channel, and runtime
-    # print(f"[DEBUG R{rank}] _init_distributed...")
-    # Initialize distributed process group
     _init_distributed(rank, world_size, master_port, devices[rank])
     _setup_control_channel(rank, world_size, control_queues, group_topology)
     pg_map = _setup_process_groups(rank, group_topology)
@@ -601,9 +805,33 @@ def _ffi_worker_process(
         compute_pg_map=compute_pg_map,
     )
 
-    # Sync with rank 0 then run worker loop
+    # Sync with rank 0 then start working
     dist.barrier()
-    runtime.worker_loop()
+
+    # Check if I'm a group leader for a remote group (group_id > 0)
+    # Group leader = first rank in the group
+    is_group_leader = (my_group_id > 0) and (rank == group_topology[my_group_id][0])
+
+    if is_group_leader:
+        # Wait for IPC server name from Rank 0
+        msg = pie_utils._control_channel.recv(timeout=30.0)
+
+        if msg and msg.get("type") == "IPC_SERVER_NAME":
+            server_name = msg["server_name"]
+            group_id = msg["group_id"]
+
+            # Connect to IPC queue and poll it directly
+            # This gives us our own GIL - no contention with other groups!
+            ipc_queue = _pie.FfiIpcQueue.connect(server_name, group_id)
+
+            # Run IPC worker loop (similar to FFI worker but via IPC)
+            _run_ipc_worker_loop(ipc_queue, runtime)
+        else:
+            # Fallback to regular worker loop if no IPC setup
+            runtime.worker_loop()
+    else:
+        # Non-leader ranks use the regular control channel worker loop
+        runtime.worker_loop()
 
     # Clean exit without running Python finalizers that might hang
     if dist.is_initialized():
