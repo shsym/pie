@@ -1074,21 +1074,10 @@ class Runtime:
         else:
             stats["local_times"].append(t_total)
 
-        # Report every 10 seconds
+        # Report every 10 seconds (simple summary only)
         now = time.perf_counter()
         if now - stats["last_report"] > 10.0:
             stats["last_report"] = now
-            total_reqs = sum(stats["group_counts"].values())
-            avg_raw = sum(stats["step_raw_times"]) / max(
-                len(stats["step_raw_times"]), 1
-            )
-            avg_local = sum(stats["local_times"]) / max(len(stats["local_times"]), 1)
-            print(
-                f"[PROFILING] Groups: {stats['group_counts']} | "
-                f"Total: {total_reqs} | "
-                f"STEP_RAW avg: {avg_raw*1000:.1f}ms ({len(stats['step_raw_times'])}) | "
-                f"Local avg: {avg_local*1000:.1f}ms ({len(stats['local_times'])})"
-            )
             # Reset for next window
             stats["step_raw_times"] = []
             stats["local_times"] = []

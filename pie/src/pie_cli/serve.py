@@ -43,26 +43,36 @@ def load_config(
 
     config = toml.loads(file_path.read_text())
 
+    # Extract engine config from [engine] section
+    engine_section = config.get("engine", {})
+
     # Build engine config with CLI overrides
     engine_config = {
-        "host": host or config.get("host", "127.0.0.1"),
-        "port": port or config.get("port", 8080),
+        "host": host or engine_section.get("host", config.get("host", "127.0.0.1")),
+        "port": port or engine_section.get("port", config.get("port", 8080)),
         "enable_auth": (
             False
             if no_auth
             else (
                 enable_auth
                 if enable_auth is not None
-                else config.get("enable_auth", True)
+                else engine_section.get("enable_auth", config.get("enable_auth", True))
             )
         ),
         "cache_dir": cache_dir
-        or config.get("cache_dir", str(pie_path.get_pie_home() / "cache")),
-        "verbose": verbose or config.get("verbose", False),
+        or engine_section.get(
+            "cache_dir", config.get("cache_dir", str(pie_path.get_pie_home() / "cache"))
+        ),
+        "verbose": verbose
+        or engine_section.get("verbose", config.get("verbose", False)),
         "log_dir": log_dir
-        or config.get("log_dir", str(pie_path.get_pie_home() / "logs")),
+        or engine_section.get(
+            "log_dir", config.get("log_dir", str(pie_path.get_pie_home() / "logs"))
+        ),
         "registry": registry
-        or config.get("registry", "https://registry.pie-project.org/"),
+        or engine_section.get(
+            "registry", config.get("registry", "https://registry.pie-project.org/")
+        ),
         # Include telemetry configuration from [telemetry] section
         "telemetry": config.get("telemetry", {}),
     }

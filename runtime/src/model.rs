@@ -2,13 +2,11 @@ pub mod actor;
 pub mod batching;
 pub mod ffi_bridge;
 pub mod ffi_ipc;
-pub mod ffi_queue;
 pub mod request;
 pub mod resource;
 pub mod tokenizer;
 
-use super::model::batching::{AdaptiveScheduler, SharedScheduler};
-use super::model::ffi_bridge::AsyncFfiClient;
+use super::model::batching::SharedScheduler;
 use super::model::request::{
     BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassRequest, ForwardPassResponse,
     HandshakeRequest, HandshakeResponse, QueryRequest, QueryResponse, Request,
@@ -32,26 +30,18 @@ use tokio::task::{self, JoinHandle};
 // Re-export SchedulerConfig for public API
 pub use batching::SchedulerConfig;
 
-/// Backend for RPC calls to Python via FFI or IPC.
+/// Backend for RPC calls to Python via IPC.
 /// 
-/// Supports both in-process FFI (for Group 0) and cross-process IPC (for remote groups).
+/// Uses cross-process IPC for GIL isolation in the symmetric worker architecture.
 #[derive(Clone)]
-pub enum RpcBackend {
-    /// In-process FFI using crossbeam channels (fast, same GIL)
-    Ffi(AsyncFfiClient),
-    /// Cross-process IPC using ipc-channel (for GIL isolation)
-    Ipc(ffi_bridge::AsyncIpcClient),
+pub struct RpcBackend {
+    client: ffi_bridge::AsyncIpcClient,
 }
 
 impl RpcBackend {
-    /// Create a new RpcBackend from an FFI client.
-    pub fn new(client: AsyncFfiClient) -> Self {
-        RpcBackend::Ffi(client)
-    }
-    
     /// Create a new RpcBackend from an IPC client.
     pub fn new_ipc(client: ffi_bridge::AsyncIpcClient) -> Self {
-        RpcBackend::Ipc(client)
+        Self { client }
     }
 
     /// Call a remote method with typed arguments and return value.
@@ -60,10 +50,7 @@ impl RpcBackend {
         T: Serialize + Send + Sync + Clone + 'static,
         R: DeserializeOwned + Send + 'static,
     {
-        match self {
-            RpcBackend::Ffi(client) => client.call(method, args).await,
-            RpcBackend::Ipc(client) => client.call(method, args).await,
-        }
+        self.client.call(method, args).await
     }
 
     /// Call with timeout.
@@ -77,10 +64,7 @@ impl RpcBackend {
         T: Serialize + Send + Sync + Clone + 'static,
         R: DeserializeOwned + Send + 'static,
     {
-        match self {
-            RpcBackend::Ffi(client) => client.call_with_timeout(method, args, timeout).await,
-            RpcBackend::Ipc(client) => client.call_with_timeout(method, args, timeout).await,
-        }
+        self.client.call_with_timeout(method, args, timeout).await
     }
 
     /// Fire-and-forget notification.
@@ -88,10 +72,7 @@ impl RpcBackend {
     where
         T: Serialize + Send + Sync + Clone + 'static,
     {
-        match self {
-            RpcBackend::Ffi(client) => client.notify(method, args).await,
-            RpcBackend::Ipc(client) => client.notify(method, args).await,
-        }
+        self.client.notify(method, args).await
     }
 }
 
@@ -340,19 +321,7 @@ impl Model {
         &self.info.name
     }
 
-    /// Create a new Model with FFI backends using per-group queues.
-    ///
-    /// Each queue should be polled by its own Python worker thread.
-    /// FfiQueue uses internal Arc so cloning shares state.
-    pub async fn new(queues: Vec<ffi_queue::FfiQueue>, scheduler_config: SchedulerConfig) -> Result<Self> {
-        let backends: Vec<RpcBackend> = queues
-            .into_iter()
-            .map(|q| RpcBackend::new(AsyncFfiClient::new_with_queue(q)))
-            .collect();
-        Self::new_with_backends(backends, scheduler_config).await
-    }
-
-    /// Constructor that works with per-group backends (FFI, IPC, or mixed).
+    /// Constructor that works with per-group IPC backends.
     pub async fn new_with_backends(backends: Vec<RpcBackend>, scheduler_config: SchedulerConfig) -> Result<Self> {
         let num_groups = backends.len();
         let primary_backend = backends[0].clone();

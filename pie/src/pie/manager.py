@@ -12,6 +12,15 @@ import random
 import asyncio
 import warnings
 from pathlib import Path
+
+# Suppress semaphore leak warnings from multiprocessing resource_tracker
+# These occur when workers are forcefully terminated during shutdown and are cosmetic
+# Set env var so it propagates to child processes (resource_tracker)
+os.environ.setdefault(
+    "PYTHONWARNINGS",
+    "ignore::UserWarning:multiprocessing.resource_tracker",
+)
+warnings.filterwarnings("ignore", message=".*leaked semaphore.*", category=UserWarning)
 from typing import Optional, Any
 import queue  # For Queue type hint logic if needed, but Queue is from MP
 
@@ -29,7 +38,6 @@ from . import path as pie_path
 from . import _pie
 
 from pie_worker import utils as pie_utils
-from pie_worker.control_channel import ControlChannel, create_control_channels
 from pie_worker.server import start_ffi_worker
 from pie_worker.config import RuntimeConfig
 from pie_worker.runtime import Runtime
@@ -155,6 +163,22 @@ def start_engine_and_backend(
         device_value = model_config.get("device")
         world_size = len(device_value) if isinstance(device_value, list) else 1
 
+        # Validate that all configured devices are accessible
+        devices_to_validate = (
+            device_value if isinstance(device_value, list) else [device_value]
+        )
+        available_gpus = torch.cuda.device_count()
+
+        for device in devices_to_validate:
+            if device and device.startswith("cuda:"):
+                device_idx = int(device.split(":")[1])
+                if device_idx >= available_gpus:
+                    raise EngineError(
+                        f"Device '{device}' is not accessible. "
+                        f"Only {available_gpus} GPU(s) are visible (cuda:0 to cuda:{available_gpus - 1}). "
+                        f"Check CUDA_VISIBLE_DEVICES environment variable."
+                    )
+
         if world_size > 1:
             # Multi-GPU FFI mode: spawn worker processes
             backend_processes = _start_multi_gpu_ffi_backend(
@@ -169,34 +193,21 @@ def start_engine_and_backend(
             )
             server_handle = backend_processes.pop(0)  # First element is server_handle
         else:
-            # Single-GPU FFI mode: existing in-process path
-            status_update("Initializing backend in-process...")
+            # Single-GPU mode: use same IPC architecture as multi-GPU with world_size=1
+            status_update("Initializing single-GPU backend...")
 
-            # Build the full config for pie_backend
-            full_config = _build_backend_config(
-                engine_config, model_config, authorized_users_path
-            )
-
-            # Initialize Python backend - returns Runtime
-            runtime = _pie.initialize_backend(full_config)
-
-            # Create the FfiQueue FIRST via Python
-            ffi_queue = _pie.FfiQueue()
-
-            # Start the Python worker thread BEFORE starting server
-            # This allows the worker to respond to handshake during Model::new
-            _ffi_worker, stop_event = start_ffi_worker(ffi_queue, runtime)
-
-            # Now start server with FFI mode - the worker is ready to handle requests
-            server_handle = _pie.start_server_with_ffi(
+            # Treat as multi-GPU with 1 device for unified code path
+            backend_processes = _start_multi_gpu_ffi_backend(
+                engine_config,
+                model_config,
                 server_config,
                 authorized_users_path,
-                ffi_queue,
-                1,  # num_groups for single-GPU is always 1
+                [device_value] if isinstance(device_value, str) else device_value,
+                1,  # world_size = 1
+                console,
+                status_update,
             )
-
-            # Wrap worker thread for cleanup
-            backend_processes = [FfiWorkerHandle(_ffi_worker, stop_event)]
+            server_handle = backend_processes.pop(0)  # First element is server_handle
 
     except Exception as e:
         raise EngineError(f"Failed to initialize backend: {e}") from e
@@ -277,13 +288,9 @@ def _build_backend_config(
 def _init_distributed(rank: int, world_size: int, master_port: int, device: str):
     """Initialize torch.distributed for a given rank.
 
-    Sets up environment variables, CUDA device, and process group.
+    Sets up CUDA device and process group using FileStore for rendezvous.
     """
-    # Environment setup
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(master_port)
-    os.environ["NCCL_TIMEOUT"] = "300"
-    os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+    import datetime
 
     # Set CUDA device
     torch.cuda.set_device(device)
@@ -293,40 +300,26 @@ def _init_distributed(rank: int, world_size: int, master_port: int, device: str)
         "ignore", message=".*barrier.*device under current context.*"
     )
 
-    # Initialize process group with NCCL options if available
+    # Use FileStore for more robust rendezvous (avoids port conflicts)
+    store_path = f"/tmp/pie_dist_store_{master_port}"
+    store = dist.FileStore(store_path, world_size)
+    timeout = datetime.timedelta(seconds=300)
+
+    # Initialize process group with NCCL
     backend = "nccl" if torch.cuda.is_available() else "gloo"
-    pg_options = None
 
-    if backend == "nccl":
-        try:
-            from torch.distributed import ProcessGroupNCCL
+    # Extract device index for device_id parameter
+    device_id = None
+    if device.startswith("cuda:"):
+        device_id = torch.device(device)
 
-            pg_options = ProcessGroupNCCL.Options()
-            pg_options.config.capture_safe = True
-        except (ImportError, AttributeError):
-            pass
-
-    if pg_options:
-        dist.init_process_group(
-            backend, rank=rank, world_size=world_size, pg_options=pg_options
-        )
-    else:
-        dist.init_process_group(backend, rank=rank, world_size=world_size)
-
-
-def _setup_control_channel(rank: int, world_size: int, control_queues: list):
-    """Set up the IPC control channel for this rank."""
-
-
-def _setup_control_channel(
-    rank: int,
-    world_size: int,
-    control_queues: list,
-    group_topology: list[list[int]] | None = None,
-):
-    """Set up the IPC control channel for this rank."""
-    pie_utils._control_channel = ControlChannel(
-        rank, world_size, control_queues, group_topology
+    dist.init_process_group(
+        backend,
+        store=store,
+        rank=rank,
+        world_size=world_size,
+        timeout=timeout,
+        device_id=device_id,
     )
 
 
@@ -488,12 +481,17 @@ def _start_multi_gpu_ffi_backend(
         nprocs=world_size,
         join=False,
         start_method="spawn",
+        daemon=True,  # Workers die automatically when main process exits
     )
 
     # Wait for ALL workers to signal they've connected to IPC
     # Each worker sends its rank when ready
     for _ in range(world_size):
         rank = ready_queue.get(timeout=120)  # 2 minute timeout for model loading
+
+    # Clean up the ready_queue to prevent semaphore leak
+    ready_queue.close()
+    ready_queue.join_thread()
 
     # Phase 2: Complete initialization (blocks until handshake succeeds)
     # All workers are now connected via IPC
@@ -610,24 +608,25 @@ def _ipc_worker_process(
     # Check if I'm a group leader (first rank in my TP group)
     is_group_leader = tp_rank == 0
 
-    if is_group_leader:
-        # Group leader: connect to IPC and handle requests
-        server_name = ipc_server_names[my_group_id]
-        ipc_queue = _pie.FfiIpcQueue.connect(server_name, my_group_id)
+    try:
+        if is_group_leader:
+            # Group leader: connect to IPC and handle requests
+            server_name = ipc_server_names[my_group_id]
+            ipc_queue = _pie.FfiIpcQueue.connect(server_name, my_group_id)
 
-        # Signal that we're connected and ready
-        ready_queue.put(rank)
+            # Signal that we're connected and ready
+            ready_queue.put(rank)
 
-        # Run IPC worker loop (handles requests from Rust server)
-        _run_ipc_worker_loop(ipc_queue, runtime)
-    else:
-        # Non-leader: signal ready, then run worker loop waiting for commands from leader
-        ready_queue.put(rank)
-        runtime.worker_loop()
-
-    # Cleanup
-    if dist.is_initialized():
-        dist.destroy_process_group()
+            # Run IPC worker loop (handles requests from Rust server)
+            _run_ipc_worker_loop(ipc_queue, runtime)
+        else:
+            # Non-leader: signal ready, then run worker loop waiting for commands from leader
+            ready_queue.put(rank)
+            runtime.worker_loop()
+    finally:
+        # Cleanup - ensure process group is destroyed even on termination
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _run_ipc_worker_loop(ipc_queue, runtime):
@@ -662,13 +661,29 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
 
     shutdown_requested = False
     poll_timeout_ms = 100
+    parent_pid = os.getppid()
+    check_parent_every = 10  # Check parent alive every N poll cycles
+    poll_count = 0
 
     try:
         while not shutdown_requested:
-            # Poll the IPC queue (releases GIL while waiting)
-            request = ipc_queue.poll_blocking(poll_timeout_ms)
-            if request is None:
-                continue  # Timeout, try again
+            # Check if parent process is still alive periodically
+            poll_count += 1
+            if poll_count % check_parent_every == 0:
+                try:
+                    os.kill(parent_pid, 0)  # Doesn't kill, just checks existence
+                except OSError:
+                    # Parent process has exited, we should exit too
+                    break
+
+            try:
+                # Poll the IPC queue (releases GIL while waiting)
+                request = ipc_queue.poll_blocking(poll_timeout_ms)
+                if request is None:
+                    continue  # Timeout, try again
+            except Exception:
+                # IPC queue may be closed when server shuts down
+                break
 
             request_id, method, payload = request
 
@@ -753,107 +768,6 @@ def _ipc_group_worker(
     # Connect to IPC and run worker loop
     ipc_queue = _pie.FfiIpcQueue.connect(server_name, group_id)
     _run_ipc_worker_loop(ipc_queue, runtime)
-
-
-def _ffi_worker_process(
-    local_rank: int,  # mp.spawn passes 0-indexed local rank
-    world_size: int,
-    devices: list[str],
-    master_port: int,
-    control_queues: list,
-    config_dict: dict,
-    group_topology: list[list[int]],
-    result_queues: list,
-):
-    """Worker process for multi-GPU FFI mode.
-
-    Note: mp.spawn passes local_rank starting at 0, so actual rank = local_rank + 1.
-    """
-    """Worker process for multi-GPU FFI mode.
-
-    Note: mp.spawn passes local_rank starting at 0, so actual rank = local_rank + 1.
-    """
-    rank = local_rank + 1
-
-    # Ignore SIGTERM initially (parent handles shutdown)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-
-    # Determine my group to find my result queue
-    my_group_id = 0
-    for i, group in enumerate(group_topology):
-        if rank in group:
-            my_group_id = i
-            break
-
-    my_result_queue = result_queues[my_group_id]
-
-    # Initialize distributed, control channel, and runtime
-    _init_distributed(rank, world_size, master_port, devices[rank])
-    _setup_control_channel(rank, world_size, control_queues, group_topology)
-    pg_map = _setup_process_groups(rank, group_topology)
-    compute_pg_map = _setup_compute_process_groups(rank, group_topology)
-
-    runtime = _create_runtime(
-        config_dict,
-        devices,
-        rank,
-        world_size,
-        group_topology,
-        result_queue=my_result_queue,
-        result_queues=None,  # Workers don't need all queues
-        pg_map=pg_map,
-        compute_pg_map=compute_pg_map,
-    )
-
-    # Sync with rank 0 then start working
-    dist.barrier()
-
-    # Check if I'm a group leader for a remote group (group_id > 0)
-    # Group leader = first rank in the group
-    is_group_leader = (my_group_id > 0) and (rank == group_topology[my_group_id][0])
-
-    if is_group_leader:
-        # Wait for IPC server name from Rank 0
-        msg = pie_utils._control_channel.recv(timeout=30.0)
-
-        if msg and msg.get("type") == "IPC_SERVER_NAME":
-            server_name = msg["server_name"]
-            group_id = msg["group_id"]
-
-            # Connect to IPC queue and poll it directly
-            # This gives us our own GIL - no contention with other groups!
-            ipc_queue = _pie.FfiIpcQueue.connect(server_name, group_id)
-
-            # Run IPC worker loop (similar to FFI worker but via IPC)
-            _run_ipc_worker_loop(ipc_queue, runtime)
-        else:
-            # Fallback to regular worker loop if no IPC setup
-            runtime.worker_loop()
-    else:
-        # Non-leader ranks use the regular control channel worker loop
-        runtime.worker_loop()
-
-    # Clean exit without running Python finalizers that might hang
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-    # Cleanup control channel resources
-    if pie_utils._control_channel is not None:
-        pie_utils._control_channel.cleanup()
-        pie_utils._control_channel = None
-
-    # Clear local references
-    control_queues = None
-
-    # Force GC to cleanup Queues and other resources
-    # time imported globally
-
-    # Give background threads a moment to exit
-    time.sleep(0.1)
-
-    gc.collect()
-
-    return
 
 
 def wait_for_backends(
@@ -961,6 +875,10 @@ def terminate_engine_and_backend(
         backend_processes: List of backend subprocess.Popen objects
         on_message: Optional callback for status messages: (message: str) -> None
     """
+    # Suppress semaphore leak warning during shutdown (cosmetic, happens when workers are killed)
+    warnings.filterwarnings(
+        "ignore", message=".*leaked semaphore.*", category=UserWarning
+    )
 
     def log(msg: str):
         if on_message:
@@ -970,12 +888,21 @@ def terminate_engine_and_backend(
             pass
             # print(f"[Manager] {msg}", file=sys.stderr)
 
-    # 1. Broadcast STOP signal to workers
+    # 1. Shut down the server FIRST - this sends shutdown signal to workers via IPC
+    if server_handle is not None:
+        try:
+            if server_handle.is_running():
+                server_handle.shutdown()
+        except Exception as e:
+            log(f"Error shutting down engine: {e}")
+
+    # 2. Give workers time to shut down gracefully after receiving IPC shutdown
+    time.sleep(1.0)
+
+    # 3. Broadcast STOP signal via control channel (legacy, may not be in use)
     try:
         if pie_utils._control_channel is not None:
-            # log("Debug: Sending STOP signal to workers")
             pie_utils._control_channel.send("STOP")
-            # Give workers time to receive the signal and exit voluntarily
             time.sleep(0.5)
     except ImportError:
         pass
@@ -987,11 +914,19 @@ def terminate_engine_and_backend(
         # It doesn't have a pid attribute directly, but has .processes and .join
         if hasattr(process, "join") and hasattr(process, "processes"):
             try:
-                # log("Debug: Joining SpawnContext")
-                process.join(timeout=5)
-                # log("Debug: SpawnContext joined successfully")
+                # Terminate all worker processes in the spawn context
+                for p in process.processes:
+                    if p.is_alive():
+                        p.terminate()
+                # Wait briefly for termination
+                for p in process.processes:
+                    p.join(timeout=2)
+                    if p.is_alive():
+                        p.kill()  # Force kill if still alive
+                # Finally join the context itself
+                process.join(timeout=1)
             except Exception as e:
-                log(f"Error joining SpawnContext: {e}")
+                log(f"Error terminating SpawnContext: {e}")
             continue
 
         # In FFI mode, backend_processes may contain dispatcher functions (not processes)
@@ -1022,14 +957,6 @@ def terminate_engine_and_backend(
                 process.kill()
             except Exception as e:
                 log(f"Error terminating process {pid}: {e}")
-
-    # Gracefully shut down the engine
-    if server_handle is not None:
-        try:
-            if server_handle.is_running():
-                server_handle.shutdown()
-        except Exception as e:
-            log(f"Error shutting down engine: {e}")
 
     # Finalize control channel queues if they exist
     # This prevents "leaked semaphore" warnings from multiprocessing.resource_tracker

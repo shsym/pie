@@ -323,6 +323,26 @@ impl FfiIpcBackend {
     pub fn group_id(&self) -> usize {
         self.group_id
     }
+    
+    /// Broadcast shutdown message to Python worker.
+    ///
+    /// This sends a "shutdown" method call to the Python worker, causing its
+    /// IPC poll loop to exit gracefully.
+    pub fn broadcast_shutdown(&self) -> Result<()> {
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        
+        let request = IpcRequest {
+            request_id,
+            method: "shutdown".to_string(),
+            payload: vec![],
+        };
+        
+        // Send request - don't wait for response
+        let tx = self.request_tx.lock().unwrap();
+        tx.send(request)?;
+        
+        Ok(())
+    }
 }
 
 /// Client-side IPC queue (used by Python worker processes via PyO3).
@@ -336,6 +356,8 @@ pub struct FfiIpcQueue {
     response_tx: Mutex<IpcSender<IpcResponse>>,
     /// Group ID
     group_id: usize,
+    /// Flag to signal that the queue is closed and poll should exit
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[pymethods]
@@ -366,22 +388,41 @@ impl FfiIpcQueue {
             request_rx: Arc::new(Mutex::new(channels.request_rx)),
             response_tx: Mutex::new(channels.response_tx),
             group_id,
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
     
     /// Poll for the next request from Rust (blocking with timeout).
     ///
     /// Returns `(request_id, method_name, payload_bytes)` or `None` on timeout.
+    /// Raises `PyIOError` with "Queue closed" if `close()` was called.
     fn poll_blocking(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Option<(u64, String, Py<PyBytes>)>> {
+        // Check if closed before polling
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(pyo3::exceptions::PyIOError::new_err("Queue closed"));
+        }
+
         let request_rx = Arc::clone(&self.request_rx);
+        let closed = Arc::clone(&self.closed);
         let timeout = std::time::Duration::from_millis(timeout_ms);
         
         // Release GIL while waiting
         let result = py.allow_threads(move || {
+            // Check again after acquiring potential lock
+            if closed.load(Ordering::SeqCst) {
+                return Err("Queue closed".to_string());
+            }
             let rx = request_rx.lock().unwrap();
             match rx.try_recv_timeout(timeout) {
                 Ok(request) => Ok(Some(request)),
-                Err(ipc_channel::ipc::TryRecvError::Empty) => Ok(None),
+                Err(ipc_channel::ipc::TryRecvError::Empty) => {
+                    // Check if closed during wait
+                    if closed.load(Ordering::SeqCst) {
+                        Err("Queue closed".to_string())
+                    } else {
+                        Ok(None)
+                    }
+                }
                 Err(ipc_channel::ipc::TryRecvError::IpcError(e)) => {
                     Err(format!("IPC error: {:?}", e))
                 }
@@ -396,6 +437,18 @@ impl FfiIpcQueue {
             Ok(None) => Ok(None),
             Err(e) => Err(pyo3::exceptions::PyIOError::new_err(e)),
         }
+    }
+    
+    /// Close the queue, causing any pending or future poll_blocking calls to return error.
+    ///
+    /// This should be called during shutdown to signal workers to exit.
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+    
+    /// Check if the queue is closed.
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
     
     /// Send a response back to Rust for the given request ID.
