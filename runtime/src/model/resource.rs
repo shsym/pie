@@ -180,6 +180,15 @@ impl ResourceManager {
         Ok(pool.available())
     }
 
+    /// Get the number of KV pages allocated to a specific instance.
+    pub fn get_kv_pages_count(&self, inst_id: InstanceId) -> u32 {
+        self.res_allocated
+            .get(&(KV_PAGE_TYPE_ID, inst_id))
+            .map(|set| set.len() as u32)
+            .unwrap_or(0)
+    }
+
+
     fn allocate(
         &mut self,
         inst_id: InstanceId,
@@ -478,7 +487,18 @@ impl ResourceManager {
             self.inst_start_time.len().to_string(),
         );
 
+        // Report per-instance KV pages
+        for ((type_id, inst_id), ptrs) in &self.res_allocated {
+            if *type_id == KV_PAGE_TYPE_ID {
+                stats.insert(
+                    format!("instance.{:?}.kv_pages", inst_id),
+                    ptrs.len().to_string(),
+                );
+            }
+        }
+
         // Report on exported resources
+
         for (type_id, exports) in &self.res_exported {
             stats.insert(
                 format!("resource.{}.exported_count", type_id),

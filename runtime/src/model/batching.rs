@@ -177,6 +177,11 @@ pub struct AdaptiveScheduler {
     config: SchedulerConfig,
     /// Time when current batch started accumulating.
     batch_start_time: Option<Instant>,
+    /// Aggregate metrics for monitoring
+    total_tokens_processed: u64,
+    total_batches_completed: u64,
+    total_latency_ms: u64,
+    metrics_window_start: Instant,
 }
 
 impl AdaptiveScheduler {
@@ -187,6 +192,10 @@ impl AdaptiveScheduler {
             latency_model: LatencyModel::new(config.latency_ema_alpha, max_batch_size),
             config,
             batch_start_time: None,
+            total_tokens_processed: 0,
+            total_batches_completed: 0,
+            total_latency_ms: 0,
+            metrics_window_start: Instant::now(),
         }
     }
 
@@ -206,6 +215,22 @@ impl AdaptiveScheduler {
     )]
     pub fn on_batch_complete(&mut self, batch_size: usize, total_tokens: usize, latency: Duration) {
         self.latency_model.record_latency(batch_size, total_tokens, latency);
+        // Track aggregate metrics
+        self.total_tokens_processed += total_tokens as u64;
+        self.total_batches_completed += 1;
+        self.total_latency_ms += latency.as_millis() as u64;
+    }
+    
+    /// Get aggregate metrics for monitoring. Returns (tokens_per_second, avg_latency_ms).
+    pub fn get_aggregate_metrics(&self) -> (f64, f64) {
+        let elapsed_secs = self.metrics_window_start.elapsed().as_secs_f64();
+        let tokens_per_sec = if elapsed_secs > 0.0 {
+            self.total_tokens_processed as f64 / elapsed_secs
+        } else { 0.0 };
+        let avg_latency_ms = if self.total_batches_completed > 0 {
+            self.total_latency_ms as f64 / self.total_batches_completed as f64
+        } else { 0.0 };
+        (tokens_per_sec, avg_latency_ms)
     }
 
     /// Reset batch timing after firing.
@@ -420,13 +445,27 @@ impl MultiGroupScheduler {
                 in_flight_batches
             )
         } else {
-            // If group doesn't exist, default to safe behavior (don't fire, or error?)
-            // For now, assume if we are asking, we want to know. But returning false is safe.
             false
         }
+    }
+    
+    /// Get aggregate metrics across all groups. Returns (tokens_per_second, avg_latency_ms).
+    pub fn get_aggregate_metrics(&self) -> (f64, f64) {
+        let mut total_tps = 0.0;
+        let mut total_lat = 0.0;
+        let mut count = 0;
+        for sched in self.schedulers.values() {
+            let (tps, lat) = sched.get_aggregate_metrics();
+            total_tps += tps;
+            if lat > 0.0 {
+                total_lat += lat;
+                count += 1;
+            }
+        }
+        let avg_lat = if count > 0 { total_lat / count as f64 } else { 0.0 };
+        (total_tps, avg_lat)
     }
 }
 
 /// Shared scheduler state wrapped in Arc<Mutex> for thread-safe access.
 pub type SharedScheduler = Arc<Mutex<MultiGroupScheduler>>;
-

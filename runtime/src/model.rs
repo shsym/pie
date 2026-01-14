@@ -313,6 +313,8 @@ pub struct Model {
     worker_handle: Option<JoinHandle<()>>,
     /// Scheduler configuration
     scheduler_config: SchedulerConfig,
+    /// Shared scheduler for metrics tracking
+    scheduler: SharedScheduler,
 }
 
 impl Model {
@@ -387,6 +389,7 @@ impl Model {
             shutdown_tx,
             worker_handle: Some(worker_handle),
             scheduler_config,
+            scheduler,
         })
     }
 
@@ -773,6 +776,12 @@ impl Model {
         let mut stats = HashMap::new();
         stats.insert("model.name".to_string(), self.info.name.clone());
         self.resource_manager.append_stats_to(&mut stats);
+        // Add throughput and latency from scheduler
+        if let Ok(sched) = self.scheduler.lock() {
+            let (tps, avg_lat) = sched.get_aggregate_metrics();
+            stats.insert("model.throughput.tokens_per_second".to_string(), format!("{:.1}", tps));
+            stats.insert("model.latency.avg_ms".to_string(), format!("{:.1}", avg_lat));
+        }
         stats
     }
 

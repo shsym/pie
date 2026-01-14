@@ -29,21 +29,27 @@ impl EventCode {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InstanceStatus {
     Attached,
     Detached,
     Finished,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceInfo {
     pub id: String,
     pub arguments: Vec<String>,
     pub status: InstanceStatus,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub elapsed_secs: u64,
+    #[serde(default)]
+    pub kv_pages_used: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamingOutput {
     Stdout(String),
     Stderr(String),

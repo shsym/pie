@@ -7,7 +7,7 @@ name = "pie-server"
 version = "0.2.5"
 description = "Programmable Inference Engine"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.13"
 license = "Apache-2.0"
 authors = [{ name = "In Gim", email = "in.gim@yale.edu" }]
 classifiers = [
@@ -40,6 +40,7 @@ dependencies = [
     "typer>=0.12",
     "websockets>=15.0",
     "ztensor>=0.1.4",
+    "textual>=7.2.0",
 ]
 
 [project.optional-dependencies]

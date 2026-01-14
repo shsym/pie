@@ -31,6 +31,9 @@ class InstanceInfo:
     id: str
     arguments: list[str]
     status: str  # "Attached", "Detached", or "Finished"
+    username: str = ""
+    elapsed_secs: int = 0
+    kv_pages_used: int = 0
 
 
 class Instance:
@@ -189,6 +192,9 @@ class PieClient:
                         id=inst.get("id"),
                         arguments=inst.get("arguments", []),
                         status=inst.get("status", "Unknown"),
+                        username=inst.get("username", ""),
+                        elapsed_secs=inst.get("elapsed_secs", 0),
+                        kv_pages_used=inst.get("kv_pages_used", 0),
                     )
                     for inst in instances_raw
                 ]
