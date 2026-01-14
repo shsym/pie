@@ -14,7 +14,7 @@ import numpy as np
 
 from tqdm.auto import tqdm
 
-os.environ["HF_DATASETS_OFFLINE"] = "1"
+#os.environ["HF_DATASETS_OFFLINE"] = "1"
 # Assume pie is an installed library
 from pie_client import PieClient, Instance, Event
 

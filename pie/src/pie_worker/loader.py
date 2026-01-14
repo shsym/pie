@@ -453,8 +453,12 @@ class Schema:
                         f"Cannot interleaved-shard tensor {t.shape}: dim 0 not divisible by tp_size={config.tensor_parallel_size}"
                     )
                 # Ensure we have a clean copy in memory (avoid ztensor/mmap issues with views)
-                t_clone = t.clone()
-                chunk = torch.chunk(t_clone, config.tensor_parallel_size, dim=0)[
+                # chunk = torch.chunk(t, config.tensor_parallel_size, dim=0)[
+                #    config.rank % config.tensor_parallel_size
+                # ]
+                # Actually, simply remove t.clone() and use t.
+                # Use t directly (even if it's mmapped, slicing is fine)
+                chunk = torch.chunk(t, config.tensor_parallel_size, dim=0)[
                     config.rank % config.tensor_parallel_size
                 ]
                 # Check chunk validity
@@ -504,20 +508,27 @@ class Schema:
                 tensor.contiguous(), config.tensor_parallel_size, dim=dim
             )[config.rank % config.tensor_parallel_size]
 
-        # Apply quantization (lazy import to avoid dependency issues)
+        # Determine final dtype and device, then apply in single fused call
+        # This avoids multiple intermediate tensor allocations
+        final_dtype = None
+        
         if source.should_quantize and config.quantization is not None:
+            # Quantization is applied separately (returns different tensor structure)
             tensor = quantize(tensor, config.quantization)
+            # Quantized tensors go directly to device without dtype change
+            return tensor.to(config.device)
         elif source.target_dtype is not None:
-            # Respect explicit dtype override from source definition
-            tensor = tensor.to(source.target_dtype)
+            # Explicit dtype override from source definition
+            final_dtype = source.target_dtype
         elif tensor.dtype not in (torch.uint8, torch.float8_e4m3fn):
-            # Apply dtype casting for float weight types (including 'auto')
-            # This handles: auto -> activation_dtype, float32/float16/bfloat16 -> specified dtype
-            # Skip casting for uint8/float8_e4m3fn tensors (FP4 packed MoE weights)
-            tensor = tensor.to(config.compute_dtype)
-
-        # Move to device
-        tensor = tensor.to(config.device)
+            # Apply dtype casting for float weight types
+            final_dtype = config.compute_dtype
+        
+        # Fused device + dtype transfer
+        if final_dtype is not None:
+            tensor = tensor.to(device=config.device, dtype=final_dtype)
+        else:
+            tensor = tensor.to(config.device)
 
         return tensor
 
@@ -602,13 +613,7 @@ class ModelLoader:
                 from .model import qwen2
 
                 model_config = qwen2.ModelConfig.from_dict(hf_config)
-                # Qwen2 schema currently uses a static constant QWEN2_SCHEMA,
-                # but we usually need to pass dimensions for fusion/quantization if they were dynamic.
-                # Looking at qwen2.py, QWEN2_SCHEMA is a global variable.
-                # However, usually schemas might need to know about quantization or specific layer counts?
-                # Actually QWEN2_SCHEMA in the file is defined using "layers.*..." which handles any number of layers.
-                # So we just use it.
-                schema = qwen2.QWEN2_SCHEMA
+                schema = qwen2.create_schema(model_config)
                 num_layers = model_config.num_layers
 
             case "qwen3":

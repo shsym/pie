@@ -261,9 +261,9 @@ class Runtime:
                     self.model_config,
                     config,
                     weights,
-                    # qwen2 not updated yet, leaving as is or assuming it handles extra kwargs?
-                    # Actually I didn't update qwen2.py. Only qwen3.py.
-                    # Use unmodified qwen2 for now.
+                    compute_process_group=self.compute_process_groups.get(
+                        self.group_id
+                    ),
                 )
                 # Create adapter cache
                 self.adapter_at_layer = qwen2.create_adapter_cache(
@@ -323,6 +323,7 @@ class Runtime:
                     self.model_config,
                     config,
                     weights,
+                    compute_process_group=compute_process_group,
                 )
                 # Create adapter cache
                 self.adapter_at_layer = gpt_oss.create_adapter_cache(
@@ -459,7 +460,9 @@ class Runtime:
 
         if self.config.world_size > 1:
             msg = {"type": "INIT_ADAPTER", "kwargs": args}
-            utils.broadcast_struct(msg, src=0, device=self.config.device)
+            my_pg = self.compute_process_groups.get(self.group_id)
+            leader_global_rank = self.group_topology[self.group_id][0] if self.group_topology else 0
+            utils.broadcast_struct(msg, src=leader_global_rank, device=self.config.device, group=my_pg)
 
         self._initialize_adapter(**args)
 
@@ -474,7 +477,9 @@ class Runtime:
 
         if self.config.world_size > 1:
             msg = {"type": "UPDATE_ADAPTER", "kwargs": args}
-            utils.broadcast_struct(msg, src=0, device=self.config.device)
+            my_pg = self.compute_process_groups.get(self.group_id)
+            leader_global_rank = self.group_topology[self.group_id][0] if self.group_topology else 0
+            utils.broadcast_struct(msg, src=leader_global_rank, device=self.config.device, group=my_pg)
 
         self._update_adapter(**args)
 
@@ -488,7 +493,9 @@ class Runtime:
 
         if self.config.world_size > 1:
             msg = {"type": "UPLOAD_ADAPTER", "kwargs": args}
-            utils.broadcast_struct(msg, src=0, device=self.config.device)
+            my_pg = self.compute_process_groups.get(self.group_id)
+            leader_global_rank = self.group_topology[self.group_id][0] if self.group_topology else 0
+            utils.broadcast_struct(msg, src=leader_global_rank, device=self.config.device, group=my_pg)
 
         self._upload_adapter(**args)
 
@@ -511,7 +518,9 @@ class Runtime:
 
         if self.config.world_size > 1:
             msg = {"type": "DOWNLOAD_ADAPTER", "kwargs": args}
-            utils.broadcast_struct(msg, src=0, device=self.config.device)
+            my_pg = self.compute_process_groups.get(self.group_id)
+            leader_global_rank = self.group_topology[self.group_id][0] if self.group_topology else 0
+            utils.broadcast_struct(msg, src=leader_global_rank, device=self.config.device, group=my_pg)
 
         self._download_adapter(**args)
 

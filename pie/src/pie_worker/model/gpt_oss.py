@@ -345,8 +345,8 @@ class ModelConfig(ModelConfigBase):
             (), dtype=runtime_config.activation_dtype
         ).element_size()
         # In multi-GPU mode, KV cache is sharded across GPUs
-        # Each GPU only stores num_kv_heads // world_size heads
-        local_num_kv_heads = self.num_kv_heads // runtime_config.world_size
+        # Each GPU only stores num_kv_heads // tensor_parallel_size heads
+        local_num_kv_heads = self.num_kv_heads // runtime_config.tensor_parallel_size
 
         total_bytes_per_page = (
             element_size_bytes
@@ -382,20 +382,24 @@ class ForwardPass:
         model_config: ModelConfig,
         runtime_config: RuntimeConfig,
         weights: WeightStore,
+        compute_process_group: dist.ProcessGroup | None = None,
     ):
         """Initialize the forward pass with weights and attention wrappers."""
         self.model_config = model_config
         self.runtime_config = runtime_config
         self.weights = weights
+        self.compute_process_group = compute_process_group
+        self.tp_size = runtime_config.tensor_parallel_size
+        self.tp_rank = runtime_config.rank % self.tp_size
 
         # Pre-compute padded dimensions for MoE
         self.padded_hidden_size = pad_to_multiple(model_config.dim_hidden, ALIGNMENT)
         self.padded_intermediate_size = pad_to_multiple(model_config.dim_mlp, ALIGNMENT)
 
         # Adjust dimensions for sharding
-        if runtime_config.world_size > 1:
+        if self.tp_size > 1:
             self.padded_intermediate_size = (
-                self.padded_intermediate_size // runtime_config.world_size
+                self.padded_intermediate_size // self.tp_size
             )
 
         # Pre-compute YaRN RoPE cos/sin cache
@@ -409,8 +413,8 @@ class ForwardPass:
         )
 
         # Calculate local head counts
-        local_num_q_heads = model_config.num_q_heads // runtime_config.world_size
-        local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
+        local_num_q_heads = model_config.num_q_heads // self.tp_size
+        local_num_kv_heads = model_config.num_kv_heads // self.tp_size
 
         # Wrapper for even layers (sliding window attention)
         self.wrapper_window = BatchAttentionWithAttentionSinkWrapper(
@@ -563,7 +567,7 @@ class ForwardPass:
 
     def embed_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Embed token IDs into hidden states with TP support."""
-        if self.runtime_config.world_size == 1:
+        if self.tp_size == 1:
             return fun.embedding(token_ids, self.weights.get("embed_token"))
 
         # Column-parallel: each rank computes partial embeddings, then gathered
@@ -572,9 +576,9 @@ class ForwardPass:
         # All-gather
         gathered_list = [
             torch.empty_like(local_embeds)
-            for _ in range(self.runtime_config.world_size)
+            for _ in range(self.tp_size)
         ]
-        dist.all_gather(gathered_list, local_embeds)
+        dist.all_gather(gathered_list, local_embeds, group=self.compute_process_group)
 
         return torch.cat(gathered_list, dim=-1)
 
@@ -588,13 +592,13 @@ class ForwardPass:
             eps=self.model_config.rms_norm_eps,
         )
 
-        if self.runtime_config.world_size == 1:
+        if self.tp_size == 1:
             return fun.linear(normed, self.weights.get("lm_head"))
 
         # Multi-GPU: Column-parallel projection of LM head
         # 1. Split input along hidden dimension
-        hidden_per_rank = self.model_config.dim_hidden // self.runtime_config.world_size
-        start_idx = self.runtime_config.rank * hidden_per_rank
+        hidden_per_rank = self.model_config.dim_hidden // self.tp_size
+        start_idx = self.tp_rank * hidden_per_rank
         end_idx = start_idx + hidden_per_rank
         local_normed = normed[:, start_idx:end_idx]
 
@@ -602,7 +606,7 @@ class ForwardPass:
         local_logits = fun.linear(local_normed, self.weights.get("lm_head"))
 
         # 3. All-reduce
-        dist.all_reduce(local_logits)
+        dist.all_reduce(local_logits, group=self.compute_process_group)
 
         return local_logits
 
@@ -643,8 +647,8 @@ class ForwardPass:
         )
 
         # Calculate local dimensions
-        local_num_q_heads = cfg.num_q_heads // self.runtime_config.world_size
-        local_num_kv_heads = cfg.num_kv_heads // self.runtime_config.world_size
+        local_num_q_heads = cfg.num_q_heads // self.tp_size
+        local_num_kv_heads = cfg.num_kv_heads // self.tp_size
         local_q_size = local_num_q_heads * cfg.dim_head
         local_kv_size = local_num_kv_heads * cfg.dim_head
 
@@ -701,8 +705,8 @@ class ForwardPass:
         )
 
         # All-reduce output projection
-        if self.runtime_config.world_size > 1:
-            dist.all_reduce(attn_proj)
+        if self.tp_size > 1:
+            dist.all_reduce(attn_proj, group=self.compute_process_group)
 
         # Residual
         return residual + attn_proj
@@ -774,6 +778,7 @@ class ForwardPass:
             local_expert_offset=0,
             local_num_experts=cfg.num_experts,
             routed_scaling_factor=None,
+            tile_tokens_dim=None,
             routing_method_type=1,  # Renormalize (TopK -> Softmax)
             gated_act_type=0,  # SwiGlu
             do_finalize=True,
@@ -789,9 +794,9 @@ class ForwardPass:
         output = output.to(hidden_states.dtype)
 
         # All-reduce MLP output (must be contiguous for NCCL)
-        if self.runtime_config.world_size > 1:
+        if self.tp_size > 1:
             output = output.contiguous()
-            dist.all_reduce(output)
+            dist.all_reduce(output, group=self.compute_process_group)
 
         # Residual
         return residual + output
@@ -830,8 +835,8 @@ class ForwardPass:
         _ = single_token_inference_mode
 
         # Calculate local head counts for planning
-        local_num_q_heads = cfg.num_q_heads // self.runtime_config.world_size
-        local_num_kv_heads = cfg.num_kv_heads // self.runtime_config.world_size
+        local_num_q_heads = cfg.num_q_heads // self.tp_size
+        local_num_kv_heads = cfg.num_kv_heads // self.tp_size
 
         self.wrapper_window.plan(
             qo_indptr,
@@ -894,7 +899,8 @@ def create_kv_cache(
     model_config: ModelConfig, runtime_config: RuntimeConfig
 ) -> list[torch.Tensor]:
     """Create KV cache tensors for all layers."""
-    local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
+    tensor_parallel_size = runtime_config.tensor_parallel_size
+    local_num_kv_heads = model_config.num_kv_heads // tensor_parallel_size
     return [
         torch.zeros(
             (
@@ -920,8 +926,9 @@ def create_adapter_cache(
     - down_weights: [max_num_adapters, dim_hidden, max_adapter_rank * 3]
     - up_weights: [max_num_adapters, max_adapter_rank, dim_head * (local_num_q_heads + local_num_kv_heads * 2)]
     """
-    local_num_q_heads = model_config.num_q_heads // runtime_config.world_size
-    local_num_kv_heads = model_config.num_kv_heads // runtime_config.world_size
+    tensor_parallel_size = runtime_config.tensor_parallel_size
+    local_num_q_heads = model_config.num_q_heads // tensor_parallel_size
+    local_num_kv_heads = model_config.num_kv_heads // tensor_parallel_size
 
     return [
         (

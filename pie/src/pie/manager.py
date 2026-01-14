@@ -190,6 +190,7 @@ def start_engine_and_backend(
                 world_size,
                 console,
                 status_update,
+                timeout,
             )
             server_handle = backend_processes.pop(0)  # First element is server_handle
         else:
@@ -206,6 +207,7 @@ def start_engine_and_backend(
                 1,  # world_size = 1
                 console,
                 status_update,
+                timeout,
             )
             server_handle = backend_processes.pop(0)  # First element is server_handle
 
@@ -415,6 +417,7 @@ def _start_multi_gpu_ffi_backend(
     world_size: int,
     console,
     status_update: callable,
+    timeout: float,
 ) -> list:
     """Start multi-GPU backend with Coordinator + All Workers architecture.
 
@@ -448,8 +451,17 @@ def _start_multi_gpu_ffi_backend(
 
     # Determine Tensor Parallel degree and topology
     tp_degree = model_config.get(
-        "tensor_parallel_size", engine_config.get("tensor_parallel_size", 1)
+        "tensor_parallel_size", engine_config.get("tensor_parallel_size")
     )
+    if tp_degree is None:
+        # Default to world_size (TP across all devices) to avoid OOM by default
+        # If users want DP, they should explicitly set tensor_parallel_size=1
+        tp_degree = world_size
+        if console:
+            console.print(
+                f"[yellow]![/yellow] tensor_parallel_size not set, defaulting to {tp_degree} (use all GPUs)"
+            )
+
     group_topology = _calculate_topology(world_size, tp_degree)
     num_groups = len(group_topology)
 
@@ -486,8 +498,36 @@ def _start_multi_gpu_ffi_backend(
 
     # Wait for ALL workers to signal they've connected to IPC
     # Each worker sends its rank when ready
-    for _ in range(world_size):
-        rank = ready_queue.get(timeout=240)  # 2 minute timeout for model loading
+    # Wait for ALL workers to signal they've connected to IPC
+    # Monitor processes while waiting to catch early exits (e.g. OOM)
+    connected_ranks = set()
+    start_wait = time.time()
+    
+    # We need to wait for world_size ranks
+    while len(connected_ranks) < world_size:
+        # 1. Check if processes are alive to catch early exits (e.g. OOM)
+        for p in ctx.processes:
+            if not p.is_alive():
+                exitcode = p.exitcode
+                if exitcode != 0:
+                     raise RuntimeError(f"Worker process {p.pid} died unexpectedly with exit code {exitcode}")
+
+        # 2. Check for timeout
+        if time.time() - start_wait > timeout:
+             # Clean up
+             ready_queue.close()
+             ready_queue.join_thread()
+             raise TimeoutError(f"Timed out waiting for {world_size} workers to connect")
+
+        # 3. Try access queue
+        try:
+             # Use non-blocking get
+             rank = ready_queue.get(timeout=0.2)
+             connected_ranks.add(rank)
+             if console:
+                 status_update(f"  Worker {rank} ready ({len(connected_ranks)}/{world_size})")
+        except queue.Empty:
+             continue
 
     # Clean up the ready_queue to prevent semaphore leak
     ready_queue.close()
@@ -590,6 +630,7 @@ def _ipc_worker_process(
         devices=group_devices,  # All devices in this TP group
         rank=tp_rank,  # Position within TP group
         world_size=tp_degree,  # Size of TP group
+        tensor_parallel_size=tp_degree,  # Ensure sharding is enabled!
     )
 
     # Create runtime (loads model on this GPU)
