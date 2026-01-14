@@ -51,6 +51,22 @@ def resolve_cache_dir(cache_dir: str | None) -> str:
         return str(home / ".cache" / "pie")
 
 
+def resolve_adapter_path(adapter_path: str | None) -> str:
+    """Resolve the adapter storage path using CLI arg > env var > default.
+
+    Default path is ~/.pie/adapters/
+    """
+    if adapter_path:
+        return os.path.expanduser(adapter_path)
+
+    if "PIE_ADAPTER_PATH" in os.environ:
+        return os.path.expanduser(os.environ["PIE_ADAPTER_PATH"])
+
+    # Default: ~/.pie/adapters/
+    home = Path.home()
+    return str(home / ".pie" / "adapters")
+
+
 def terminate(msg: str) -> None:
     """Terminate the program with a message."""
     print(f"\n[!!!] {msg} Terminating.", file=sys.stderr)

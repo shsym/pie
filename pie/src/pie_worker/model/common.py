@@ -121,17 +121,27 @@ else:
             # 1. Apply temperature scaling
             scaled_logits = row_logits / T
 
-            # 2. Subtract max for numerical stability (standard softmax trick)
+            # 2. Clamp to prevent overflow (prevents inf - inf = nan in step 3)
+            # log(FLT_MAX) ≈ 88.7 for float32, but we use a conservative limit
+            MAX_LOGIT = 64.0
+            scaled_logits = tl.where(
+                scaled_logits > MAX_LOGIT, MAX_LOGIT, scaled_logits
+            )
+            scaled_logits = tl.where(
+                scaled_logits < -MAX_LOGIT, -MAX_LOGIT, scaled_logits
+            )
+
+            # 3. Subtract max for numerical stability (standard softmax trick)
             max_val = tl.max(scaled_logits, axis=0)
             logits_minus_max = scaled_logits - max_val
 
-            # 3. Exponentiate
+            # 4. Exponentiate
             numerator = tl.exp(logits_minus_max)
 
-            # 4. Sum (normalization factor)
+            # 5. Sum (normalization factor)
             denominator = tl.sum(numerator, axis=0)
 
-            # 5. Divide
+            # 6. Divide
             result = numerator / denominator
 
         # Store result

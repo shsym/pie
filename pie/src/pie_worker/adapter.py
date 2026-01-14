@@ -1,5 +1,6 @@
 from __future__ import annotations
 import io
+import os
 import time
 import torch
 import torch.nn as nn
@@ -276,6 +277,7 @@ class CmaesAdapter(Adapter):
         dtype: torch.dtype,
         gpu_rank: int = 0,
         world_size: int = 1,
+        adapter_path: str = "~/.pie/adapters/",
     ):
         super().__init__(adapter_id, rank, alpha, out_features)
 
@@ -289,6 +291,7 @@ class CmaesAdapter(Adapter):
 
         self.gpu_rank = gpu_rank
         self.world_size = world_size
+        self.adapter_path = os.path.expanduser(adapter_path)
 
         # CMA-ES default knobs (can be overridden from outside if desired)
         self.population_size = population_size
@@ -411,16 +414,16 @@ class CmaesAdapter(Adapter):
         If 'data' is empty, it falls back to loading from f"adapter_{name}.pt".
         """
         state_dict = None
-        if data:
-            try:
-                # print(f"Loading adapter {name} from memory ({len(data)} bytes)...")
-                buffer = io.BytesIO(data)
-                state_dict = torch.load(buffer, map_location=self.device)
-            except Exception as e:
-                print(f"Failed to load adapter from memory: {e}. Falling back to file.")
+        # if data:
+        #     try:
+        #         # print(f"Loading adapter {name} from memory ({len(data)} bytes)...")
+        #         buffer = io.BytesIO(data)
+        #         state_dict = torch.load(buffer, map_location=self.device)
+        #     except Exception as e:
+        #         print(f"Failed to load adapter from memory: {e}. Falling back to file.")
 
         if state_dict is None:
-            filename = f"adapter_{name}.pt"
+            filename = os.path.join(self.adapter_path, f"adapter_{name}.pt")
             # print("Loading adapter from", filename)
             state_dict = torch.load(filename, map_location=self.device)
 
@@ -505,7 +508,8 @@ class CmaesAdapter(Adapter):
         per the instructions.
         """
 
-        filename = f"adapter_{name}.pt"
+        filename = os.path.join(self.adapter_path, f"adapter_{name}.pt")
+        os.makedirs(self.adapter_path, exist_ok=True)
         # print("Saving adapter to", filename)
         # Extract the weight tensors for this specific adapter.
         # We use .clone().cpu() for safe, device-independent saving.

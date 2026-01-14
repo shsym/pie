@@ -70,6 +70,9 @@ class TrainingConfig:
     EVAL_EVERY_N_STEPS: int = 2
     EVAL_TASKS_PER_WORKER: int = 1
 
+    # --- Checkpointing ---
+    CHECKPOINT_EVERY_N_STEPS: int = 5
+
     # --- Logging ---
     VERBOSE_WORKER_LOGS: bool = False
 
@@ -417,10 +420,10 @@ class ESOrchestrator:
             "--max-sigma",
             str(self.config.MAX_SIGMA),
         ]
-        # if step > 0 and step % self.config.CHECKPOINT_EVERY_N_STEPS == 0:
-        #     checkpoint_name = f"{self.config.ADAPTER_NAME}-step-{step}"
-        #     tqdm.write(f"💾 Saving checkpoint: {checkpoint_name}")
-        #     update_args.extend(["--download", checkpoint_name])
+        if step > 0 and step % self.config.CHECKPOINT_EVERY_N_STEPS == 0:
+            checkpoint_name = f"{self.config.ADAPTER_NAME}-step-{step}"
+            tqdm.write(f"💾 Saving checkpoint: {checkpoint_name}")
+            update_args.extend(["--download", checkpoint_name])
         update_tasks = [
             launch_and_get_result(
                 client,

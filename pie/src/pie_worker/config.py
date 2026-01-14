@@ -13,7 +13,7 @@ from dataclasses import dataclass, asdict
 
 import torch
 
-from .utils import resolve_cache_dir
+from .utils import resolve_cache_dir, resolve_adapter_path
 
 # Valid weight dtype categories
 FLOAT_DTYPES = {"float32", "float16", "bfloat16", "auto"}
@@ -50,6 +50,9 @@ class RuntimeConfig:
     telemetry_enabled: bool
     telemetry_endpoint: str
     telemetry_service_name: str
+
+    # Adapter storage path
+    adapter_path: str
 
     # Evaluated at runtime
     max_num_kv_pages: int | None
@@ -147,6 +150,7 @@ class RuntimeConfig:
         random_seed: int = 42,
         use_cuda_graphs: bool = True,
         tensor_parallel_size: int = 1,
+        adapter_path: str | None = None,
     ) -> "RuntimeConfig":
         """
         Factory method to build a validated and resolved RuntimeConfig.
@@ -176,6 +180,7 @@ class RuntimeConfig:
         """
         # Resolution
         resolved_cache_dir = resolve_cache_dir(cache_dir)
+        resolved_adapter_path = resolve_adapter_path(adapter_path)
 
         # Resolve devices
         resolved_devices: list[torch.device] = []
@@ -237,6 +242,7 @@ class RuntimeConfig:
             activation_dtype=resolved_activation_dtype,
             weight_dtype=weight_dtype,
             tensor_parallel_size=tensor_parallel_size,
+            adapter_path=resolved_adapter_path,
         )
 
     def print(self) -> None:

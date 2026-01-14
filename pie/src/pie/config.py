@@ -62,6 +62,7 @@ max_num_embeds = 128
 # Adapter (LoRA) settings
 max_num_adapters = 32
 max_adapter_rank = 8
+adapter_path = "~/.pie/adapters/"
 
 # Memory management
 gpu_mem_utilization = 0.8

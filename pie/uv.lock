@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11, <3.13"
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -305,41 +305,41 @@ wheels = [
 
 [[package]]
 name = "flashinfer-cubin"
-version = "0.6.0"
+version = "0.6.1"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d3/3e/48e1e9f7f4a5f9601db7c7cf37748859928e21447fef330b52c803c72178/flashinfer_cubin-0.6.0-py3-none-any.whl", hash = "sha256:ab4b2979796784be99c87e6960ce8f4533b00dc3b2fc87d60ab44a277cef0755", size = 149162344, upload-time = "2026-01-08T02:57:07.536Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/79/7325af801aa7a4704d5e35be7324d117d17739167e2fd1241c2e1d73499a/flashinfer_cubin-0.6.1-py3-none-any.whl", hash = "sha256:4fc4290169ba397e5b481d4d6daee1ec231743280e9232c8a92ec19dbce9c90b", size = 149162342, upload-time = "2026-01-14T05:40:33.568Z" },
 ]
 
 [[package]]
 name = "flashinfer-jit-cache"
-version = "0.6.0+cu128"
+version = "0.6.1+cu128"
 source = { registry = "https://flashinfer.ai/whl/cu128" }
 resolution-markers = [
     "python_full_version >= '3.12'",
     "python_full_version < '3.12'",
 ]
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.0/flashinfer_jit_cache-0.6.0+cu128-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:9013bf09739f81277edeaf7816f0b6e7e7734701a2f25b156158b53acbaeb88c" },
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.0/flashinfer_jit_cache-0.6.0+cu128-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:f523594229d4c51dfcd1a33e5c398983d7954c4b281336059aef6c6127f4071c" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.1/flashinfer_jit_cache-0.6.1+cu128-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:7820777e855a9d278868b33cf07f81d3f588370cdb984fd064a942af04317194" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.1/flashinfer_jit_cache-0.6.1+cu128-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:d7109198b4f7b8013230d1e2f1dc8eb1978d3157be2a49db68e8473716c35dd2" },
 ]
 
 [[package]]
 name = "flashinfer-jit-cache"
-version = "0.6.0+cu130"
+version = "0.6.1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
 resolution-markers = [
     "python_full_version >= '3.12'",
     "python_full_version < '3.12'",
 ]
 wheels = [
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.0/flashinfer_jit_cache-0.6.0+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:6b8b50588a98a2745ed4ae3f6b2d705de75bf62d5a1c7b4d8410456c12bbb1fa" },
-    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.0/flashinfer_jit_cache-0.6.0+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:2eb81fb0be8ad1efaa45a63de640d2c9670854f4f620c2021e379700ded46a39" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.1/flashinfer_jit_cache-0.6.1+cu130-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:6a28097e0eeb1f57a7c71170b9eb13e862a70631854cdd7a5c1bbbecedd413ca" },
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.1/flashinfer_jit_cache-0.6.1+cu130-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:6c0b24587a91c81fd85532fdc46d573a49c2d98e46aa91b0faa354c7e3aef687" },
 ]
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.0"
+version = "0.6.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -358,9 +358,9 @@ dependencies = [
     { name = "torch", version = "2.10.0.dev20251211+cu130", source = { registry = "https://download.pytorch.org/whl/nightly/cu130" }, marker = "extra == 'extra-10-pie-server-cu130' or (extra == 'extra-10-pie-server-cu126' and extra == 'extra-10-pie-server-cu128') or (extra == 'extra-10-pie-server-cu128' and extra == 'extra-10-pie-server-metal') or (extra == 'extra-10-pie-server-cu126' and extra != 'extra-10-pie-server-cu130' and extra == 'extra-10-pie-server-metal')" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ad/8d/c7330f27f09b9110af2f6c44c6f68d7b536f525f8ac539210073bfcdb965/flashinfer_python-0.6.0.tar.gz", hash = "sha256:3c2cd7d734933b4116cda00e7be03cb59d827b086f508f986e0867a5e01a8c81", size = 5114758, upload-time = "2026-01-08T02:57:03.298Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/68/81/5a84e14df7358d2c2903b18c6f2779bd4b4a6739076d01a847d4c18fb102/flashinfer_python-0.6.1.tar.gz", hash = "sha256:8dc2fc5dc187fc70151d5f39ef560fde8a38117a4f6cf40dce0ddb09cbd4f0bf", size = 5141191, upload-time = "2026-01-14T05:40:27.825Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/33/90/5834597488f5ea62b1cc874338125c79ce21c11d777ac6f7b47f12cf2bb3/flashinfer_python-0.6.0-py3-none-any.whl", hash = "sha256:e8be4fd2f9229a7faef411579439eebc6c6dc54893d62bd50498f374cd04cc16", size = 7544491, upload-time = "2026-01-08T02:57:01.703Z" },
+    { url = "https://files.pythonhosted.org/packages/76/d5/bca632bb5781689415186421bbee2ad39ae8a39b0996d579c76901e5c66f/flashinfer_python-0.6.1-py3-none-any.whl", hash = "sha256:610dd4ac15e7a0874b79e7577d027cb35133e8dc31dc3137c2f2d6497fe46f18", size = 7580432, upload-time = "2026-01-14T05:40:25.636Z" },
 ]
 
 [[package]]
@@ -1355,14 +1355,14 @@ cu126 = [
 ]
 cu128 = [
     { name = "flashinfer-cubin" },
-    { name = "flashinfer-jit-cache", version = "0.6.0+cu128", source = { registry = "https://flashinfer.ai/whl/cu128" } },
+    { name = "flashinfer-jit-cache", version = "0.6.1+cu128", source = { registry = "https://flashinfer.ai/whl/cu128" } },
     { name = "flashinfer-python" },
     { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" } },
     { name = "torchao" },
 ]
 cu130 = [
     { name = "flashinfer-cubin" },
-    { name = "flashinfer-jit-cache", version = "0.6.0+cu130", source = { registry = "https://flashinfer.ai/whl/cu130" } },
+    { name = "flashinfer-jit-cache", version = "0.6.1+cu130", source = { registry = "https://flashinfer.ai/whl/cu130" } },
     { name = "flashinfer-python" },
     { name = "torch", version = "2.10.0.dev20251211+cu130", source = { registry = "https://download.pytorch.org/whl/nightly/cu130" } },
     { name = "torchao" },
@@ -1387,16 +1387,16 @@ metal = [
 requires-dist = [
     { name = "einops", specifier = ">=0.8.1" },
     { name = "fire", specifier = ">=0.6" },
-    { name = "flashinfer-cubin", marker = "extra == 'cu126'", specifier = ">=0.6.0" },
-    { name = "flashinfer-cubin", marker = "extra == 'cu128'", specifier = ">=0.6.0" },
-    { name = "flashinfer-cubin", marker = "extra == 'cu130'", specifier = ">=0.6.0" },
-    { name = "flashinfer-cubin", marker = "extra == 'cuda'", specifier = ">=0.6.0" },
-    { name = "flashinfer-jit-cache", marker = "extra == 'cu128'", specifier = ">=0.6.0", index = "https://flashinfer.ai/whl/cu128", conflict = { package = "pie-server", extra = "cu128" } },
-    { name = "flashinfer-jit-cache", marker = "extra == 'cu130'", specifier = ">=0.6.0", index = "https://flashinfer.ai/whl/cu130", conflict = { package = "pie-server", extra = "cu130" } },
-    { name = "flashinfer-python", marker = "extra == 'cu126'", specifier = ">=0.6.0" },
-    { name = "flashinfer-python", marker = "extra == 'cu128'", specifier = ">=0.6.0" },
-    { name = "flashinfer-python", marker = "extra == 'cu130'", specifier = ">=0.6.0" },
-    { name = "flashinfer-python", marker = "extra == 'cuda'", specifier = ">=0.6.0" },
+    { name = "flashinfer-cubin", marker = "extra == 'cu126'", specifier = ">=0.6.1" },
+    { name = "flashinfer-cubin", marker = "extra == 'cu128'", specifier = ">=0.6.1" },
+    { name = "flashinfer-cubin", marker = "extra == 'cu130'", specifier = ">=0.6.1" },
+    { name = "flashinfer-cubin", marker = "extra == 'cuda'", specifier = ">=0.6.1" },
+    { name = "flashinfer-jit-cache", marker = "extra == 'cu128'", specifier = ">=0.6.1", index = "https://flashinfer.ai/whl/cu128", conflict = { package = "pie-server", extra = "cu128" } },
+    { name = "flashinfer-jit-cache", marker = "extra == 'cu130'", specifier = ">=0.6.1", index = "https://flashinfer.ai/whl/cu130", conflict = { package = "pie-server", extra = "cu130" } },
+    { name = "flashinfer-python", marker = "extra == 'cu126'", specifier = ">=0.6.1" },
+    { name = "flashinfer-python", marker = "extra == 'cu128'", specifier = ">=0.6.1" },
+    { name = "flashinfer-python", marker = "extra == 'cu130'", specifier = ">=0.6.1" },
+    { name = "flashinfer-python", marker = "extra == 'cuda'", specifier = ">=0.6.1" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=1.2.4" },
     { name = "msgpack", specifier = ">=0.5" },

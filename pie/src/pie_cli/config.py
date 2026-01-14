@@ -140,6 +140,9 @@ def config_update(
     max_adapter_rank: Optional[int] = typer.Option(
         None, "--max-adapter-rank", help="Maximum adapter rank"
     ),
+    adapter_path: Optional[str] = typer.Option(
+        None, "--adapter-path", help="Adapter storage path (absolute path)"
+    ),
     gpu_mem_utilization: Optional[float] = typer.Option(
         None, "--gpu-mem-utilization", help="GPU memory utilization (0.0-1.0)"
     ),
@@ -199,6 +202,7 @@ def config_update(
         "max_adapter_rank": max_adapter_rank,
         "gpu_mem_utilization": gpu_mem_utilization,
         "use_cuda_graphs": use_cuda_graphs,
+        "adapter_path": adapter_path,
     }
 
     model_updated = False

@@ -524,10 +524,15 @@ def prepare_gptoss_moe_gate_up(
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, intermediate_size * 2, hidden_size]
     weights_bf16 = weights_bf16.reshape(num_experts, intermediate_size * 2, hidden_size)
+    
+    # Free input tensors early to reduce memory pressure
+    del blocks, scales
 
     # Step 2: De-interleave from GPT OSS format to FlashInfer format
     weights_deinterleaved = deinterleave_gate_up_weights(weights_bf16)
+    del weights_bf16  # Free intermediate tensor
     bias_deinterleaved = deinterleave_gate_up_bias(bias.to(device))
+    del bias  # Free input bias
 
     # Step 3: Apply TP sharding AFTER de-interleaving (on float tensor)
     if world_size > 1:
@@ -579,6 +584,7 @@ def prepare_gptoss_moe_gate_up(
     ).to(torch.float32)
 
     # Step 5: Quantize and shuffle
+    del weights_deinterleaved  # Free before final transform
     weights_shuffled, scales_shuffled, bias_shuffled = quantize_shuffle_gate_up_weights(
         weights_padded,
         padded_hidden_size,
@@ -586,6 +592,11 @@ def prepare_gptoss_moe_gate_up(
         num_experts,
         gate_up_bias=bias_padded,
     )
+    del weights_padded, bias_padded  # Free after quantization
+    
+    # Force CUDA memory cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return {
         "weights": weights_shuffled,
@@ -629,6 +640,9 @@ def prepare_gptoss_moe_down(
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, hidden_size, intermediate_size]
     weights_bf16 = weights_bf16.reshape(num_experts, hidden_size, intermediate_size)
+    
+    # Free input tensors early to reduce memory pressure
+    del blocks, scales
 
     # Step 2: Apply TP sharding AFTER dequantization (on float tensor)
     if world_size > 1:
@@ -661,10 +675,12 @@ def prepare_gptoss_moe_down(
         padded_hidden_size,
         padded_intermediate_size,
     )
+    del weights_bf16  # Free intermediate tensor
     bias_padded = pad_down_bias(
         bias.to(device),
         padded_hidden_size,
     ).to(torch.float32)
+    del bias  # Free input bias
 
     # Step 4: Quantize and shuffle
     weights_shuffled, scales_shuffled, bias_shuffled = quantize_shuffle_down_weights(
@@ -674,6 +690,11 @@ def prepare_gptoss_moe_down(
         num_experts,
         down_bias=bias_padded,
     )
+    del weights_padded, bias_padded  # Free after quantization
+    
+    # Force CUDA memory cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return {
         "weights": weights_shuffled,

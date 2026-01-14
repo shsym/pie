@@ -259,6 +259,7 @@ def _build_backend_config(
         "max_batch_tokens": model_config.get("max_batch_tokens", 10240),
         "max_num_adapters": model_config.get("max_num_adapters", 48),
         "max_adapter_rank": model_config.get("max_adapter_rank", 8),
+        "adapter_path": model_config.get("adapter_path"),
         "gpu_mem_utilization": model_config.get("gpu_mem_utilization", 0.9),
         "max_batch_size": model_config.get("max_batch_size", 128),
         "activation_dtype": model_config.get("activation_dtype", "bfloat16"),
@@ -271,7 +272,7 @@ def _build_backend_config(
             "service_name", "pie"
         ),
         "random_seed": model_config.get("random_seed", 42),
-        "use_cuda_graphs": model_config.get("use_cuda_graphs", True),
+        "use_cuda_graphs": model_config.get("use_cuda_graphs", False),
     }
 
     # Add device with correct key
@@ -502,7 +503,7 @@ def _start_multi_gpu_ffi_backend(
     # Monitor processes while waiting to catch early exits (e.g. OOM)
     connected_ranks = set()
     start_wait = time.time()
-    
+
     # We need to wait for world_size ranks
     while len(connected_ranks) < world_size:
         # 1. Check if processes are alive to catch early exits (e.g. OOM)
@@ -510,24 +511,28 @@ def _start_multi_gpu_ffi_backend(
             if not p.is_alive():
                 exitcode = p.exitcode
                 if exitcode != 0:
-                     raise RuntimeError(f"Worker process {p.pid} died unexpectedly with exit code {exitcode}")
+                    raise RuntimeError(
+                        f"Worker process {p.pid} died unexpectedly with exit code {exitcode}"
+                    )
 
         # 2. Check for timeout
         if time.time() - start_wait > timeout:
-             # Clean up
-             ready_queue.close()
-             ready_queue.join_thread()
-             raise TimeoutError(f"Timed out waiting for {world_size} workers to connect")
+            # Clean up
+            ready_queue.close()
+            ready_queue.join_thread()
+            raise TimeoutError(f"Timed out waiting for {world_size} workers to connect")
 
         # 3. Try access queue
         try:
-             # Use non-blocking get
-             rank = ready_queue.get(timeout=0.2)
-             connected_ranks.add(rank)
-             if console:
-                 status_update(f"  Worker {rank} ready ({len(connected_ranks)}/{world_size})")
+            # Use non-blocking get
+            rank = ready_queue.get(timeout=0.2)
+            connected_ranks.add(rank)
+            if console:
+                status_update(
+                    f"  Worker {rank} ready ({len(connected_ranks)}/{world_size})"
+                )
         except queue.Empty:
-             continue
+            continue
 
     # Clean up the ready_queue to prevent semaphore leak
     ready_queue.close()
