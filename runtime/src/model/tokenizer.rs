@@ -8,6 +8,15 @@ pub type Rank = u32;
 // https://github.com/openai/tiktoken/blob/main/src/lib.rs
 
 fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize, Rank)> {
+    // Guard: empty pieces should not reach here, but handle gracefully
+    if piece.is_empty() {
+        return vec![];
+    }
+    // Guard: single-byte pieces don't need merging
+    if piece.len() == 1 {
+        return vec![(0, Rank::MAX), (1, Rank::MAX)];
+    }
+    
     let mut parts = Vec::with_capacity(piece.len() + 1);
 
     let mut min_rank: (Rank, usize) = (Rank::MAX, usize::MAX);
@@ -53,6 +62,10 @@ fn _byte_pair_merge(ranks: &HashMap<Vec<u8>, Rank>, piece: &[u8]) -> Vec<(usize,
 }
 
 pub fn byte_pair_encode(piece: &[u8], ranks: &HashMap<Vec<u8>, Rank>) -> Vec<Rank> {
+    // Guard: empty pieces should return empty
+    if piece.is_empty() {
+        return vec![];
+    }
     if piece.len() == 1 {
         return vec![ranks[piece]];
     }
