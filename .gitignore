@@ -217,7 +217,7 @@ logs
 *.log
 .plan
 *profiling_result.json
-docs/
+/docs/
 
 # No MCP files
 .memory-bank
@@ -233,8 +233,15 @@ tensor_references
 
 # Node.js
 node_modules/
-package-lock.json
+/package-lock.json
+!website/package-lock.json
 wandb/
+
+# Website (Docusaurus)
+website/build/
+website/.docusaurus/
+website/.cache-loader/
+website/src/data/models.json
 
 *.pt
 *.zt

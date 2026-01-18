@@ -1,0 +1,120 @@
+---
+title: Overview
+description: Understanding Pie's programmable LLM serving architecture
+sidebar_position: 1
+---
+
+# Overview
+
+**Pie** is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
+
+## Why Pie?
+
+Traditional LLM serving systems use a rigid, monolithic loop that limits what you can do:
+
+- **Fixed request/response patterns** — No control over generation flow
+- **External tool integration** — Round-trip latency for every tool call
+- **One-size-fits-all optimization** — Can't tune for your specific use case
+
+Pie takes a different approach: **serve programs, not prompts**.
+
+## Key Concepts
+
+### Engine
+
+The **Engine** is the core server that:
+- Manages WebSocket connections from clients
+- Schedules and runs inferlets
+- Handles authentication and resource allocation
+
+Start it with:
+```bash
+pie serve
+```
+
+### Backends
+
+**Backends** are GPU workers that:
+- Load and run LLM models
+- Handle tokenization and sampling
+- Manage KV cache and memory
+
+Pie automatically starts backends based on your `config.toml`.
+
+### Inferlets
+
+**Inferlets** are lightweight WebAssembly programs that define inference logic:
+- Written in Rust, Go, or other Wasm-compatible languages
+- Run sandboxed inside the engine
+- Have fine-grained control over generation
+
+```
+┌─────────────────────────────────────────────────┐
+│                   Pie Engine                    │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐   │
+│  │ Inferlet  │  │ Inferlet  │  │ Inferlet  │   │
+│  │  (Wasm)   │  │  (Wasm)   │  │  (Wasm)   │   │
+│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘   │
+│        │              │              │          │
+│        └──────────────┼──────────────┘          │
+│                       ▼                         │
+│              ┌─────────────────┐                │
+│              │  Backend (GPU)  │                │
+│              │   LLM Model     │                │
+│              └─────────────────┘                │
+└─────────────────────────────────────────────────┘
+```
+
+## Architecture
+
+Pie separates concerns into distinct layers:
+
+| Layer | Responsibility |
+|-------|----------------|
+| **Client** | Connects to engine, launches inferlets, sends/receives messages |
+| **Engine** | Routes messages, schedules inferlets, manages resources |
+| **Inferlet** | Custom inference logic (sampling, tool calls, branching) |
+| **Backend** | GPU compute, model execution, KV cache |
+
+This separation enables:
+- **Custom decoding** — Implement speculative decoding, beam search, or novel algorithms
+- **In-engine tool calls** — Execute tools without leaving the generation loop
+- **Fine-grained KV control** — Reuse, fork, or prune cache based on your needs
+
+## How It Works
+
+1. **Client connects** to the engine via WebSocket
+2. **Client uploads** an inferlet (Wasm binary) or uses one from the registry
+3. **Engine launches** the inferlet in a sandbox
+4. **Inferlet runs** and calls engine APIs for tokenization, sampling, etc.
+5. **Client receives** streaming output or final results
+
+## Client Libraries
+
+Pie provides client libraries for:
+- **Python** — `pip install pie-client`
+- **JavaScript** — `npm install @pie-project/client`
+- **Rust** — `cargo add pie-client`
+
+See the [Client API](/docs/client-api/python) documentation for details.
+
+## Standard Inferlets
+
+Pie includes standard inferlets for common use cases:
+
+| Inferlet | Description |
+|----------|-------------|
+| `std/text-completion` | Simple text completion |
+| `std/chat` | Multi-turn chat with system prompts |
+
+Run them directly:
+```bash
+pie run text-completion -- --prompt "Once upon a time"
+pie run chat
+```
+
+## Next Steps
+
+- Follow the [Tutorial](/docs/tutorial/quickstart) to build your first app
+- Explore the [CLI Reference](/docs/cli) for all commands
+- Read the [Client API](/docs/client-api/python) docs
