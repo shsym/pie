@@ -13,37 +13,9 @@ import asyncio
 import warnings
 from pathlib import Path
 
-# Suppress semaphore leak warnings from multiprocessing resource_tracker
-# These occur when workers are forcefully terminated during shutdown and are cosmetic
-# Set env var so it propagates to child processes (resource_tracker)
-os.environ.setdefault(
-    "PYTHONWARNINGS",
-    "ignore::UserWarning:multiprocessing.resource_tracker",
-)
-warnings.filterwarnings("ignore", message=".*leaked semaphore.*", category=UserWarning)
+
 from typing import Optional, Any
 import queue  # For Queue type hint logic if needed, but Queue is from MP
-
-import torch
-import torch.multiprocessing as mp
-import torch.distributed as dist
-
-
-import blake3
-
-
-from rich.console import Console
-
-from . import path as pie_path
-from . import _pie
-
-from pie_worker import utils as pie_utils
-from pie_worker.server import start_ffi_worker
-from pie_worker.config import RuntimeConfig
-from pie_worker.runtime import Runtime
-
-
-from pie_client import PieClient, Event
 
 
 class EngineError(Exception):
@@ -122,6 +94,10 @@ def start_engine_and_backend(
     def log_message(level: str, msg: str):
         if on_message:
             on_message(level, msg)
+
+    from . import path as pie_path
+    from . import _pie
+    import torch
 
     # Load authorized users if auth is enabled
     authorized_users_path = None
@@ -294,6 +270,8 @@ def _init_distributed(rank: int, world_size: int, master_port: int, device: str)
     Sets up CUDA device and process group using FileStore for rendezvous.
     """
     import datetime
+    import torch
+    import torch.distributed as dist
 
     # Set CUDA device
     torch.cuda.set_device(device)
@@ -328,6 +306,8 @@ def _init_distributed(rank: int, world_size: int, master_port: int, device: str)
 
 def _setup_process_groups(rank: int, group_topology: list[list[int]]) -> dict:
     """Create ProcessGroups for each execution group (Rank 0 + Group Workers)."""
+    import torch.distributed as dist
+
     pg_map = {}
     for i, group_ranks in enumerate(group_topology):
         # Comm group includes Rank 0 (Controller) + Group Workers
@@ -345,6 +325,8 @@ def _setup_process_groups(rank: int, group_topology: list[list[int]]) -> dict:
 
 def _setup_compute_process_groups(rank: int, group_topology: list[list[int]]) -> dict:
     """Create ProcessGroups for Tensor Parallel computation (TP ranks only)."""
+    import torch.distributed as dist
+
     pg_map = {}
     for i, group_ranks in enumerate(group_topology):
         # Compute group includes ONLY the TP workers for this group
@@ -371,6 +353,9 @@ def _create_runtime(
     compute_pg_map: dict | None = None,
 ):
     """Create a Runtime instance for the given rank."""
+
+    from pie_worker.config import RuntimeConfig
+    from pie_worker.runtime import Runtime
 
     # Remove device/devices from config to avoid duplicate argument
     filtered_config = {
@@ -438,6 +423,10 @@ def _start_multi_gpu_ffi_backend(
     """
 
     status_update(f"Initializing multi-GPU backend ({world_size} devices)...")
+
+    import torch.multiprocessing as mp
+    from . import _pie
+    from . import path as pie_path
 
     # Use 'spawn' context for CUDA compatibility
     mp.set_start_method("spawn", force=True)
@@ -599,6 +588,7 @@ def _ipc_worker_process(
     from pie import _pie
     from pie_worker.runtime import Runtime
     from pie_worker.config import RuntimeConfig
+    import torch.distributed as dist
 
     rank = local_rank  # With nprocs=world_size, local_rank IS the actual rank
 
@@ -926,6 +916,8 @@ def terminate_engine_and_backend(
         "ignore", message=".*leaked semaphore.*", category=UserWarning
     )
 
+    from pie_worker import utils as pie_utils
+
     def log(msg: str):
         if on_message:
             on_message(msg)
@@ -1029,6 +1021,8 @@ def run_interactive_shell(engine_config: dict, internal_token: str) -> None:
         import readline
     except ImportError:
         pass  # readline not available on all platforms
+
+    from . import path as pie_path
 
     # Load history
     history_path = pie_path.get_shell_history_path()
@@ -1138,6 +1132,9 @@ async def _submit_inferlet_async(
     on_event: Optional[callable] = None,
 ) -> None:
     """Async implementation of submit_inferlet_and_wait."""
+
+    import blake3
+    from pie_client import PieClient, Event
 
     def emit(event_type: str, msg: str):
         if on_event:

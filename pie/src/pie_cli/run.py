@@ -12,7 +12,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from pie import manager
 from . import serve as serve_module
 
 console = Console()
@@ -89,6 +88,8 @@ def run(
 
     try:
         # Start engine and backends
+        from pie import manager
+
         server_handle, backend_processes = manager.start_engine_and_backend(
             engine_config, model_configs, console=console
         )
@@ -128,10 +129,13 @@ def run(
         with console.status("[dim]Shutting down...[/dim]"):
             manager.terminate_engine_and_backend(server_handle, backend_processes)
         raise typer.Exit(130)
-    except manager.EngineError as e:
-        console.print(f"[red]✗[/red] {e}")
-        manager.terminate_engine_and_backend(server_handle, backend_processes)
-        raise typer.Exit(1)
+    except Exception as e:
+        from pie import manager
+
+        if isinstance(e, manager.EngineError):
+            console.print(f"[red]✗[/red] {e}")
+            manager.terminate_engine_and_backend(server_handle, backend_processes)
+            raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]✗[/red] Error: {e}")
         manager.terminate_engine_and_backend(server_handle, backend_processes)

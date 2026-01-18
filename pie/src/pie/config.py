@@ -1,11 +1,11 @@
 """Configuration utilities for Pie."""
 
-import torch
-
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 
 
 def get_default_device() -> str:
+    import torch
+
     """Get the default device based on the platform."""
     if torch.cuda.is_available():
         return "cuda:0"

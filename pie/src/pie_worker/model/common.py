@@ -118,30 +118,21 @@ else:
 
         else:
             # --- SAMPLING PATH (Softmax) ---
+            # --- SAMPLING PATH (Softmax) ---
             # 1. Apply temperature scaling
             scaled_logits = row_logits / T
 
-            # 2. Clamp to prevent overflow (prevents inf - inf = nan in step 3)
-            # log(FLT_MAX) ≈ 88.7 for float32, but we use a conservative limit
-            MAX_LOGIT = 64.0
-            scaled_logits = tl.where(
-                scaled_logits > MAX_LOGIT, MAX_LOGIT, scaled_logits
-            )
-            scaled_logits = tl.where(
-                scaled_logits < -MAX_LOGIT, -MAX_LOGIT, scaled_logits
-            )
-
-            # 3. Subtract max for numerical stability (standard softmax trick)
+            # 2. Subtract max for numerical stability (standard softmax trick)
             max_val = tl.max(scaled_logits, axis=0)
             logits_minus_max = scaled_logits - max_val
 
-            # 4. Exponentiate
+            # 3. Exponentiate
             numerator = tl.exp(logits_minus_max)
 
-            # 5. Sum (normalization factor)
+            # 4. Sum (normalization factor)
             denominator = tl.sum(numerator, axis=0)
 
-            # 6. Divide
+            # 5. Divide
             result = numerator / denominator
 
         # Store result
@@ -224,8 +215,23 @@ def sample_common(
 
     # Stage 1: Compute logits via LM head
     logits_input = hidden_states[indices_for_logits]
+
+    # TODO: NaN check.
+    # TODO: NaN check.
+    # TODO: NaN check.
+    nan_indices = []
+    if torch.isnan(logits_input).any():
+        nan_mask = torch.isnan(logits_input).any(dim=-1)
+        nan_local_indices = torch.nonzero(nan_mask, as_tuple=True)[0]
+        nan_indices = [indices_for_logits[i] for i in nan_local_indices.tolist()]
+        print(f"Warning: NaNs detected in logits_input for indices: {nan_indices}")
+
+    logits_input = torch.nan_to_num(logits_input)
+
+    # Apply lm_head_fn
     logits = lm_head_fn(logits_input)
 
+    # Apply safe_scaled_softmax
     temperatures = sampling_metadata["temperatures"]
     probs = safe_scaled_softmax(logits, temperatures)
 
@@ -269,7 +275,11 @@ def sample_common(
     # Stage 5: Combine results
     final_tokens_list = final_tokens_tensor.tolist()
 
-    return {"tokens": final_tokens_list, "dists": final_dists}
+    return {
+        "tokens": final_tokens_list,
+        "dists": final_dists,
+        "nan_indices": nan_indices,
+    }
 
 
 def _process_distributions(

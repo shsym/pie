@@ -5,10 +5,9 @@ Uses HuggingFace Hub as the source for models.
 """
 
 import typer
-from huggingface_hub import scan_cache_dir, snapshot_download
+import typing
 from rich.console import Console
 from rich.panel import Panel
-
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -21,14 +20,6 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 from rich.text import Text
-
-from pie.model import (
-    get_hf_cache_dir,
-    parse_repo_id_from_dirname,
-    get_model_config,
-    check_pie_compatibility,
-)
-import typing
 
 
 class TqdmProgress:
@@ -162,6 +153,13 @@ app = typer.Typer(help="Manage models from HuggingFace")
 @app.command("list")
 def model_list() -> None:
     """List locally cached HuggingFace models."""
+    from pie.model import (
+        get_hf_cache_dir,
+        parse_repo_id_from_dirname,
+        get_model_config,
+        check_pie_compatibility,
+    )
+
     cache_dir = get_hf_cache_dir()
 
     if not cache_dir.exists():
@@ -230,6 +228,7 @@ def model_download(
 
     try:
         # First, do a dry run to get total download size (silently)
+        from huggingface_hub import snapshot_download
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
         disable_progress_bars()
@@ -276,6 +275,12 @@ def model_download(
         console.print(f"[green]✓[/green] Downloaded to {local_path}")
 
         # Check compatibility
+        from pie.model import (
+            get_hf_cache_dir,
+            get_model_config,
+            check_pie_compatibility,
+        )
+
         cache_dir = get_hf_cache_dir()
         config = get_model_config(cache_dir, repo_id)
         compatible, info = check_pie_compatibility(config)
@@ -298,7 +303,10 @@ def model_remove(
     repo_id: str = typer.Argument(..., help="HuggingFace repo ID to remove")
 ) -> None:
     """Remove a locally cached model."""
+    """Remove a locally cached model."""
     try:
+        from huggingface_hub import scan_cache_dir
+
         cache_info = scan_cache_dir()
     except Exception as e:
         console.print(f"[red]✗[/red] Failed to scan cache: {e}")
