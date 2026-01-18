@@ -21,6 +21,7 @@ HF_TO_PIE_ARCH = {
     "gptoss": "gptoss",
     "gpt_oss": "gptoss",  # HuggingFace config may use underscore variant
     "gemma2": "gemma2",
+    "gemma3_text": "gemma3",
 }
 
 
@@ -113,7 +114,7 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
         "special_tokens": {},
         "split_regex": "",
         "escape_non_printable": False,
-        "escape_non_printable": False,
+        "sentencepiece_space": False,
     }
 
     # Load tokenizer.json for vocabulary
@@ -148,6 +149,12 @@ def load_hf_tokenizer(snapshot_dir: Path) -> dict:
         A_macron_id = vocab.get("\u0100")  # U+0100 = Ā
         if A_macron_id is not None and A_macron_id < 256:
             result["escape_non_printable"] = True
+
+        # Auto-detect SentencePiece tokenizers
+        # SentencePiece uses ▁ (U+2581) to encode spaces at word boundaries.
+        # Check if any of the first 1000 tokens contain this character.
+        sentencepiece_detected = any("▁" in tok for tok in list(vocab.keys())[:1000])
+        result["sentencepiece_space"] = sentencepiece_detected
 
         result["merge_table"] = merge_table
 

@@ -119,6 +119,7 @@ pub struct BytePairEncoder {
     regex: Regex,
     special_regex: Regex,
     escape_non_printable: bool,
+    sentencepiece_space: bool,
 }
 
 impl BytePairEncoder {
@@ -135,7 +136,16 @@ impl BytePairEncoder {
         // Then, convert the bytes to a UTF-8 string.
         // Using `from_utf8_lossy` would silently replace invalid sequences with
         // the Unicode replacement character
-        Ok(String::from_utf8_lossy(&*decoded_bytes).to_string())
+        let mut text = String::from_utf8_lossy(&*decoded_bytes).to_string();
+        
+        // Handle SentencePiece space encoding: replace ▁ (U+2581) with space
+        if self.sentencepiece_space {
+            text = text.replace('▁', " ");
+            // Trim leading space that results from initial ▁
+            text = text.trim_start().to_string();
+        }
+        
+        Ok(text)
     }
 
     fn decode_bytes(&self, tokens: &[Rank]) -> Result<Vec<u8>, DecodeKeyError> {
@@ -220,6 +230,7 @@ impl BytePairEncoder {
         special_tokens_encoder: HashMap<String, Rank>,
         pattern: &str,
         escape_non_printable: bool,
+        sentencepiece_space: bool,
     ) -> Self {
         let regex = Regex::new(pattern).unwrap();
 
@@ -256,6 +267,7 @@ impl BytePairEncoder {
             regex,
             special_regex,
             escape_non_printable,
+            sentencepiece_space,
         }
     }
 

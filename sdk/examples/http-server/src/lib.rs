@@ -45,6 +45,7 @@ async fn main(req: Request<IncomingBody>, res: Responder) -> Finished {
         "/echo" => echo(req, res).await,
         "/echo-headers" => echo_headers(req, res).await,
         "/info" => info(req, res).await,
+        "/sse" => sse_test(req, res).await,
         _ => not_found(req, res).await,
     }
 }
@@ -138,4 +139,42 @@ async fn not_found(_req: Request<IncomingBody>, responder: Responder) -> Finishe
         .unwrap();
 
     responder.respond(response).await
+}
+
+/// SSE streaming test - sends events with flush after each one
+async fn sse_test(_req: Request<IncomingBody>, res: Responder) -> Finished {
+    use wstd::time::Duration;
+
+    // Start SSE response
+    let sse_response = Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .body(BodyForthcoming)
+        .unwrap();
+
+    let mut body = res.start_response(sse_response);
+
+    // Send 5 SSE events with delays
+    for i in 1..=5 {
+        let event = format!("event: message\ndata: {{\"count\": {}}}\n\n", i);
+
+        // Write the event
+        if let Err(e) = body.write_all(event.as_bytes()).await {
+            return Finished::finish(body, Err(e), None);
+        }
+
+        // CRITICAL: Flush to push data to client immediately
+        if let Err(e) = body.flush().await {
+            return Finished::finish(body, Err(e), None);
+        }
+
+        // Small delay between events
+        wstd::task::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Send done event
+    let done = "data: [DONE]\n\n";
+    let result = body.write_all(done.as_bytes()).await;
+
+    Finished::finish(body, result, None)
 }

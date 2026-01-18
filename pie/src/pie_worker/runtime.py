@@ -21,13 +21,14 @@ from .config import RuntimeConfig
 from .batching import Batch
 from .loader import ModelLoader
 from .adapter import AdapterSubpass, CmaesAdapter
-from .model import llama3, qwen2, qwen3, gemma2, common
+from .model import llama3, qwen2, qwen3, gemma2, gemma3, common
 from .model.chat_templates import (
     Llama3Template,
     Qwen2_5Template,
     Qwen3Template,
     GPTOSSTemplate,
     Gemma2Template,
+    Gemma3Template,
     ChatTemplate,
 )
 
@@ -367,6 +368,33 @@ class Runtime:
                     self.model_config, config
                 )
 
+            case "gemma3":
+                # Create model config
+                self.model_config = gemma3.ModelConfig.from_dict(normalized_arch)
+
+                # Evaluate and store max_num_kv_pages in config FIRST
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(
+                    config
+                )
+
+                # Create forward pass with weights
+                self.engine = gemma3.ForwardPass(
+                    self.model_config,
+                    config,
+                    weights,
+                    compute_process_group=self.compute_process_groups.get(
+                        self.group_id
+                    ),
+                )
+                # Create adapter cache
+                self.adapter_at_layer = gemma3.create_adapter_cache(
+                    self.model_config, config
+                )
+                # Create KV cache
+                self.kv_cache_at_layer = gemma3.create_kv_cache(
+                    self.model_config, config
+                )
+
             case _:
                 raise ValueError(f"Unsupported architecture type: {self.type}")
 
@@ -440,6 +468,8 @@ class Runtime:
             template = GPTOSSTemplate
         elif self.type == "gemma2":
             template = Gemma2Template
+        elif self.type == "gemma3":
+            template = Gemma3Template
 
         if template:
             return {
@@ -464,6 +494,7 @@ class Runtime:
                 "split_regex": "",
                 "special_tokens": {},
                 "escape_non_printable": False,
+                "sentencepiece_space": False,
             }
 
         # Load tokenizer info from HuggingFace
@@ -478,6 +509,7 @@ class Runtime:
             "split_regex": tokenizer_info.get("split_regex", ""),
             "special_tokens": tokenizer_info.get("special_tokens", {}),
             "escape_non_printable": tokenizer_info.get("escape_non_printable", False),
+            "sentencepiece_space": tokenizer_info.get("sentencepiece_space", False),
         }
 
     # ========================================================================
@@ -511,6 +543,7 @@ class Runtime:
             tokenizer_special_tokens=tokenizer["special_tokens"],
             tokenizer_split_regex=tokenizer["split_regex"],
             tokenizer_escape_non_printable=tokenizer["escape_non_printable"],
+            tokenizer_sentencepiece_space=tokenizer["sentencepiece_space"],
         )
 
     def query(self, req: message.QueryRequest) -> message.QueryResponse:
@@ -932,6 +965,7 @@ class Runtime:
             "tokenizer_special_tokens": resp.tokenizer_special_tokens,
             "tokenizer_split_regex": resp.tokenizer_split_regex,
             "tokenizer_escape_non_printable": resp.tokenizer_escape_non_printable,
+            "tokenizer_sentencepiece_space": resp.tokenizer_sentencepiece_space,
         }
 
     def query_rpc(self, **kwargs) -> dict:

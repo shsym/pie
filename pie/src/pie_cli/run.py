@@ -27,6 +27,7 @@ def run(
     config: Optional[Path] = typer.Option(
         None, "--config", "-c", help="Path to TOML configuration file"
     ),
+    port: Optional[int] = typer.Option(None, "--port", help="Override port"),
     log: Optional[Path] = typer.Option(None, "--log", help="Path to log file"),
     dummy: bool = typer.Option(
         False, "--dummy", help="Enable dummy mode (skip GPU weight loading, return random tokens)"
@@ -64,7 +65,10 @@ def run(
 
     try:
         engine_config, model_configs = serve_module.load_config(
-            config, log_dir=str(log.parent) if log else None, dummy_mode=dummy
+            config,
+            port=port,
+            log_dir=str(log.parent) if log else None,
+            dummy_mode=dummy,
         )
     except typer.Exit:
         raise

@@ -637,6 +637,13 @@ class ModelLoader:
                 schema = gemma2.create_schema(model_config)
                 num_layers = model_config.num_layers
 
+            case "gemma3":
+                from .model import gemma3
+
+                model_config = gemma3.ModelConfig.from_dict(hf_config)
+                schema = gemma3.create_schema(model_config)
+                num_layers = model_config.num_layers
+
             case _:
                 raise ValueError(f"Unsupported architecture type: {arch_type}")
 

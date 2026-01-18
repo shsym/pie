@@ -334,3 +334,11 @@ Gemma2Template = ChatTemplate(
     template=_GEMMA_2_TEMPLATE_CONTENT,
     stop_tokens=["<end_of_turn>", "<eos>"],
 )
+
+# Gemma 3 chat template
+# Same format as Gemma 2 - uses the same template structure
+Gemma3Template = ChatTemplate(
+    template_type="minijinja",
+    template=_GEMMA_2_TEMPLATE_CONTENT,  # Same template as Gemma 2
+    stop_tokens=["<end_of_turn>", "<eos>"],
+)
