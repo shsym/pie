@@ -18,11 +18,13 @@ HF_TO_PIE_ARCH = {
     "llama": "llama3",
     "qwen2": "qwen2",
     "qwen3": "qwen3",
+    "olmo3": "olmo3",
     "gptoss": "gptoss",
     "gpt_oss": "gptoss",  # HuggingFace config may use underscore variant
     "gemma2": "gemma2",
     "gemma3_text": "gemma3",
 }
+
 
 
 def get_hf_cache_dir() -> Path:

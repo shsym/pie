@@ -21,7 +21,7 @@ from .config import RuntimeConfig
 from .batching import Batch
 from .loader import ModelLoader
 from .adapter import AdapterSubpass, CmaesAdapter
-from .model import llama3, qwen2, qwen3, gemma2, gemma3, common
+from .model import llama3, qwen2, qwen3, olmo3, gemma2, gemma3, common
 from .model.chat_templates import (
     Llama3Template,
     Qwen2_5Template,
@@ -29,6 +29,7 @@ from .model.chat_templates import (
     GPTOSSTemplate,
     Gemma2Template,
     Gemma3Template,
+    Olmo3Template,
     ChatTemplate,
 )
 
@@ -395,6 +396,33 @@ class Runtime:
                     self.model_config, config
                 )
 
+            case "olmo3":
+                # Create model config
+                self.model_config = olmo3.ModelConfig.from_dict(normalized_arch)
+
+                # Evaluate and store max_num_kv_pages in config FIRST
+                config.max_num_kv_pages = self.model_config.eval_max_num_kv_pages(
+                    config
+                )
+
+                # Create forward pass with weights
+                self.engine = olmo3.ForwardPass(
+                    self.model_config,
+                    config,
+                    weights,
+                    compute_process_group=self.compute_process_groups.get(
+                        self.group_id
+                    ),
+                )
+                # Create adapter cache
+                self.adapter_at_layer = olmo3.create_adapter_cache(
+                    self.model_config, config
+                )
+                # Create KV cache
+                self.kv_cache_at_layer = olmo3.create_kv_cache(
+                    self.model_config, config
+                )
+
             case _:
                 raise ValueError(f"Unsupported architecture type: {self.type}")
 
@@ -470,6 +498,8 @@ class Runtime:
             template = Gemma2Template
         elif self.type == "gemma3":
             template = Gemma3Template
+        elif self.type == "olmo3":
+            template = Olmo3Template
 
         if template:
             return {

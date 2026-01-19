@@ -590,27 +590,52 @@ def _ipc_worker_process(
     from pie_worker.runtime import Runtime
     from pie_worker.config import RuntimeConfig
     import torch.distributed as dist
+    import torch
 
     rank = local_rank  # With nprocs=world_size, local_rank IS the actual rank
 
-    # Determine my group and TP rank within it
-    my_group_id = 0
-    tp_rank = 0
-    for i, group in enumerate(group_topology):
-        if rank in group:
-            my_group_id = i
-            tp_rank = group.index(rank)  # My position within the TP group
-            break
+    try:
+        # Determine my group and TP rank within it
+        my_group_id = 0
+        tp_rank = 0
+        for i, group in enumerate(group_topology):
+            if rank in group:
+                my_group_id = i
+                tp_rank = group.index(rank)  # My position within the TP group
+                break
+        
+        tp_degree = len(group_topology[my_group_id])
+    except Exception as e:
+        with open("/tmp/worker_startup_error.log", "w") as f:
+            import traceback
+            f.write(f"Worker startup failed before dist init: {e}\n{traceback.format_exc()}")
+        raise
 
-    tp_degree = len(group_topology[my_group_id])  # Number of GPUs in my TP group
+    try:
+        # Initialize distributed
+        if world_size > 1:
+             _init_distributed(rank, world_size, master_port, devices[rank])
+        else:
+             # Skip distributed for single device to avoid NCCL/socket issues
+             torch.cuda.set_device(devices[rank])
+             pass
 
-    # Initialize distributed
-    _init_distributed(rank, world_size, master_port, devices[rank])
+        # Setup process groups (collective ops - all ranks must participate)
+        # Capture the mappings to pass to Runtime
+        if world_size > 1:
+            pg_map = _setup_process_groups(rank, group_topology)
+            compute_pg_map = _setup_compute_process_groups(rank, group_topology)
+        else:
+            pg_map = {}
+            compute_pg_map = {}
+            
+    except Exception as e:
+        with open("/tmp/worker_startup_error.log", "w") as f:
+            import traceback
+            f.write(f"Worker startup failed during dist init: {e}\n{traceback.format_exc()}")
+        raise
 
-    # Setup process groups (collective ops - all ranks must participate)
-    # Capture the mappings to pass to Runtime
-    pg_map = _setup_process_groups(rank, group_topology)
-    compute_pg_map = _setup_compute_process_groups(rank, group_topology)
+
 
     # Create runtime config
     # For TP>1: each worker needs ALL devices in its TP group so devices[tp_rank] works
@@ -640,8 +665,9 @@ def _ipc_worker_process(
     )
 
     # Sync all workers before connecting to server
-    dist.barrier()
-
+    if dist.is_initialized():
+        dist.barrier()
+    
     # Check if I'm a group leader (first rank in my TP group)
     is_group_leader = tp_rank == 0
 

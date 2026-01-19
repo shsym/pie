@@ -342,3 +342,30 @@ Gemma3Template = ChatTemplate(
     template=_GEMMA_2_TEMPLATE_CONTENT,  # Same template as Gemma 2
     stop_tokens=["<end_of_turn>", "<eos>"],
 )
+
+
+# Olmo3 chat template
+# FIXED: Uses ChatML format matching HuggingFace reference
+_OLMO3_TEMPLATE_CONTENT = """
+{% for m in messages %}
+{% if m.role == "system" %}<|im_start|>system
+{{ m.content }}<|im_end|>
+{% elif m.role == "user" %}<|im_start|>user
+{{ m.content }}<|im_end|>
+{% elif m.role == "assistant" %}<|im_start|>assistant
+{% if m.reasoning_content %}<think>
+{{ m.reasoning_content | trim }}
+</think>
+{% endif -%}
+{{ m.content }}<|im_end|>
+{% endif %}
+{% endfor %}
+{% if add_generation_prompt %}<|im_start|>assistant
+{% endif %}
+"""
+
+Olmo3Template = ChatTemplate(
+    template_type="minijinja",
+    template=_OLMO3_TEMPLATE_CONTENT,
+    stop_tokens=["<|im_end|>"],
+)

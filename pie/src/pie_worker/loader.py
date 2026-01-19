@@ -644,6 +644,13 @@ class ModelLoader:
                 schema = gemma3.create_schema(model_config)
                 num_layers = model_config.num_layers
 
+            case "olmo3":
+                from .model import olmo3
+
+                model_config = olmo3.ModelConfig.from_dict(hf_config)
+                schema = olmo3.OLMO3_SCHEMA
+                num_layers = model_config.num_layers
+
             case _:
                 raise ValueError(f"Unsupported architecture type: {arch_type}")
 
