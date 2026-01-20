@@ -228,7 +228,7 @@ class ForwardPass:
 
         # Create workspace buffer for attention operations
         self.workspace_buffer = torch.zeros(
-            1024 * 1024 * 1024, dtype=torch.uint8, device=device
+            128 * 1024 * 1024, dtype=torch.uint8, device=device
         )
 
         # --- CUDA Graph Setup (Bins + Padding) ---
