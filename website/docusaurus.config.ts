@@ -71,6 +71,7 @@ const config: Config = {
       logo: {
         alt: 'Pie Logo',
         src: 'img/logo.svg',
+        href: '/docs/welcome',
       },
       items: [
         {
@@ -113,6 +114,20 @@ const config: Config = {
       darkTheme: prismThemes.dracula,
     },
   } satisfies Preset.ThemeConfig,
+
+  plugins: [
+    [
+      '@docusaurus/plugin-client-redirects',
+      {
+        redirects: [
+          {
+            from: '/',
+            to: '/docs/welcome',
+          },
+        ],
+      },
+    ],
+  ],
 };
 
 export default config;
