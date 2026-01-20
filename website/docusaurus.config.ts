@@ -71,7 +71,7 @@ const config: Config = {
       logo: {
         alt: 'Pie Logo',
         src: 'img/logo.svg',
-        href: '/docs/welcome',
+        href: '/',
       },
       items: [
         {
@@ -115,19 +115,7 @@ const config: Config = {
     },
   } satisfies Preset.ThemeConfig,
 
-  plugins: [
-    [
-      '@docusaurus/plugin-client-redirects',
-      {
-        redirects: [
-          {
-            from: '/',
-            to: '/docs/welcome',
-          },
-        ],
-      },
-    ],
-  ],
+  plugins: [],
 };
 
 export default config;

@@ -4,32 +4,70 @@ This module implements the `pie-cli submit` subcommand for submitting inferlets
 to an existing running Pie engine instance.
 """
 
+import shutil
 import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Optional
 
-import blake3
 import typer
 
 from . import engine
 
 
-def compose_components(program_bytes: bytes, library_paths: list[Path]) -> bytes:
+def parse_manifest(manifest_content: str) -> tuple[str, str, str]:
+    """Parse the manifest to extract namespace, name, and version.
+
+    Args:
+        manifest_content: The TOML manifest content as a string.
+
+    Returns:
+        A tuple of (namespace, name, version).
+
+    Raises:
+        ValueError: If the manifest is missing required fields or has invalid format.
+    """
+    manifest = tomllib.loads(manifest_content)
+
+    package = manifest.get("package")
+    if package is None:
+        raise ValueError("Manifest missing [package] section")
+
+    full_name = package.get("name")
+    if full_name is None:
+        raise ValueError("Manifest missing package.name field")
+
+    version = package.get("version")
+    if version is None:
+        raise ValueError("Manifest missing package.version field")
+
+    # Parse "namespace/name" format
+    parts = full_name.split("/", 1)
+    if len(parts) != 2:
+        raise ValueError(
+            f"Invalid package.name format '{full_name}': expected 'namespace/name'"
+        )
+
+    return parts[0], parts[1], version
+
+
+def compose_components(
+    program_path: Path, library_paths: list[Path], output_path: Path
+) -> None:
     """Compose a program with multiple libraries using wac CLI.
 
     Uses `wac plug` command to link libraries into the main program.
     Libraries are linked sequentially in the order provided.
 
     Args:
-        program_bytes: The main program WASM bytes.
+        program_path: Path to the main program WASM file.
         library_paths: List of paths to library WASM files.
-
-    Returns:
-        The composed WASM bytes.
+        output_path: Path where the composed WASM binary will be written.
 
     Raises:
         RuntimeError: If wac CLI is not available or composition fails.
+        FileNotFoundError: If program or library files are not found.
     """
     # Check if wac is available
     try:
@@ -45,35 +83,31 @@ def compose_components(program_bytes: bytes, library_paths: list[Path]) -> bytes
             "wac CLI is not installed. Install it with: cargo install wac-cli"
         )
 
-    socket_bytes = program_bytes
+    if not program_path.exists():
+        raise FileNotFoundError(f"Program file not found: {program_path}")
+
+    # Start with the main program
+    current_wasm = program_path
 
     for library_path in library_paths:
         if not library_path.exists():
             raise FileNotFoundError(f"Library file not found: {library_path}")
 
-        # Read library bytes
-        plug_bytes = library_path.read_bytes()
-
         # Compose using wac plug
         # wac plug --plug <library.wasm> <main.wasm> -o <output.wasm>
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            socket_file = temp_path / "socket.wasm"
-            plug_file = temp_path / "plug.wasm"
-            output_file = temp_path / "composed.wasm"
+        with tempfile.NamedTemporaryFile(suffix=".wasm", delete=False) as tmp:
+            tmp_output = Path(tmp.name)
 
-            socket_file.write_bytes(socket_bytes)
-            plug_file.write_bytes(plug_bytes)
-
+        try:
             result = subprocess.run(
                 [
                     "wac",
                     "plug",
                     "--plug",
-                    str(plug_file),
-                    str(socket_file),
+                    str(library_path),
+                    str(current_wasm),
                     "-o",
-                    str(output_file),
+                    str(tmp_output),
                 ],
                 capture_output=True,
                 text=True,
@@ -84,14 +118,27 @@ def compose_components(program_bytes: bytes, library_paths: list[Path]) -> bytes
                     f"wac plug failed for {library_path}:\n{result.stderr}"
                 )
 
-            socket_bytes = output_file.read_bytes()
+            # Clean up previous temp file if it's not the original program
+            if current_wasm != program_path:
+                current_wasm.unlink()
 
-    return socket_bytes
+            current_wasm = tmp_output
+        except Exception:
+            tmp_output.unlink(missing_ok=True)
+            raise
+
+    # Move the final composed binary to the output path
+    if current_wasm != program_path:
+        current_wasm.rename(output_path)
+    else:
+        # No libraries were linked, just copy the original
+        shutil.copy(program_path, output_path)
 
 
 def handle_submit_command(
     inferlet: Optional[str] = None,
     path: Optional[Path] = None,
+    manifest: Optional[Path] = None,
     config: Optional[Path] = None,
     host: Optional[str] = None,
     port: Optional[int] = None,
@@ -106,7 +153,7 @@ def handle_submit_command(
     You can specify an inferlet either by registry name or by path (mutually exclusive):
 
     - By registry: pie-client submit std/text-completion@0.1.0
-    - By path: pie-client submit --path ./my_inferlet.wasm
+    - By path: pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml
 
     Steps:
     1. Creates a client configuration from config file and command-line arguments
@@ -128,6 +175,11 @@ def handle_submit_command(
         arguments = [inferlet] + (arguments or [])
         inferlet = None
 
+    # Validate manifest is provided when using --path
+    if path is not None and manifest is None:
+        typer.echo("Error: --manifest is required when using --path", err=True)
+        raise typer.Exit(1)
+
     link = link or []
     arguments = arguments or []
 
@@ -147,29 +199,39 @@ def handle_submit_command(
             if not path.exists():
                 raise FileNotFoundError(f"Inferlet file not found: {path}")
 
-            inferlet_blob = path.read_bytes()
+            if not manifest.exists():
+                raise FileNotFoundError(f"Manifest file not found: {manifest}")
 
-            # If libraries are specified, compose them with the main inferlet
+            manifest_content = manifest.read_text()
+
+            # Parse the manifest to extract namespace, name, and version
+            namespace, name, version = parse_manifest(manifest_content)
+            inferlet_name = f"{namespace}/{name}@{version}"
+
+            typer.echo(f"Inferlet: {inferlet_name}")
+
+            # If libraries are specified, compose them and always upload
             if link:
-                final_blob = compose_components(inferlet_blob, link)
+                with tempfile.NamedTemporaryFile(suffix=".wasm", delete=False) as tmp:
+                    composed_path = Path(tmp.name)
+                    try:
+                        compose_components(path, link, composed_path)
+                        engine.install_program(client, composed_path, manifest)
+                    finally:
+                        composed_path.unlink(missing_ok=True)
+                typer.echo("✅ Inferlet installed successfully.")
+            # No composition - check if program already exists before installing
             else:
-                final_blob = inferlet_blob
-
-            # Calculate the hash of the final composed blob
-            program_hash = blake3.blake3(final_blob).hexdigest()
-            typer.echo(f"Final inferlet hash: {program_hash}")
-
-            # Upload the composed inferlet to the server
-            if not engine.program_exists(client, program_hash):
-                engine.upload_program(client, final_blob)
-                typer.echo("✅ Inferlet upload successful.")
-            else:
-                typer.echo("Inferlet already exists on server.")
+                if not engine.program_exists(client, inferlet_name, path, manifest):
+                    engine.install_program(client, path, manifest)
+                    typer.echo("✅ Inferlet installed successfully.")
+                else:
+                    typer.echo("Inferlet already exists on server.")
 
             # Launch the instance
             instance = engine.launch_instance(
                 client,
-                program_hash,
+                inferlet_name,
                 arguments,
                 detached,
             )
