@@ -17,8 +17,6 @@ import useBaseUrl from '@docusaurus/useBaseUrl';
 
 # Roadmap
 
-_Last updated: **October 6, 2025**_
-
 :::note
 This roadmap is **directional**. Priorities may evolve based on user feedback and research findings.
 :::
@@ -33,48 +31,40 @@ This roadmap is **directional**. Priorities may evolve based on user feedback an
 
 ---
 
-## In progress
+## Released in 0.2.0 (2026-01-20)
 
-- **Apple Metal backend** <span className="r-tag r-runtime">runtime</span>  
+- **Apple Metal support** <span className="r-tag r-runtime">runtime</span>  
   Enable GPU execution on Apple silicon via Metal for laptop development and demos.
 
-- **Native C++ inference backend** <span className="r-tag r-runtime">runtime</span>  
-  Lean, low‑latency server core; smaller footprint vs. polyglot runtimes.
+- **Multi-GPU support with mixed DP and TP** <span className="r-tag r-perf">performance</span>  
+  Scale model size and throughput across devices using Data Parallelism and Tensor Parallelism.
+
+- **Quantization support (float8/int8/float4)** <span className="r-tag r-perf">performance</span>  
+  Reduce VRAM while preserving quality; per‑layer policies.
+
+- **New model support** <span className="r-tag r-runtime">runtime</span>  
+  Support for gpt-oss, ministral3, gemma2, gemma3, olmo3.
+
+---
+
+## In progress
 
 - **PEFT adapters API (e.g., LoRA)** <span className="r-tag r-api">api</span>  
   Hot‑swap adapters per request/session with safe isolation.
 
-- **Multi‑GPU (tensor & pipeline parallelism)** <span className="r-tag r-perf">performance</span>  
-  Scale model size and throughput across devices.
-
-- **4‑/8‑bit quantization** <span className="r-tag r-perf">performance</span>  
-  Reduce VRAM while preserving quality; per‑layer policies.
-
 - **KV‑cache quantization** <span className="r-tag r-perf">performance</span>  
   Larger batches and longer contexts via cache compression.
 
-- **WASI Preview 3 migration** <span className="r-tag r-runtime">runtime</span>  
-  Better asynchronous I/O, networking support.
-
-- **Preemptive inferlet scheduling** <span className="r-tag r-runtime">runtime</span>  
-  Fairness and SLOs under load; pause/resume primitives.
-
-- **Expanded model support** <span className="r-tag r-runtime">runtime</span>  
-  Broader LLM coverage across families and sizes.
-
-- **Inferlet standard libraries (Go / C++ / Python / JS)** <span className="r-tag r-tooling">tooling</span>  
+- **Inferlet standard libraries (Python / JS)** <span className="r-tag r-tooling">tooling</span>  
   Ergonomic helpers for common patterns; batteries included.
 
-We welcome proposals—open a GitHub issue with your use case or RFC.
-
----
-
-## Planned / exploratory
 
 - **Inferlet package manager** <span className="r-tag r-tooling">tooling</span>  
   Discover, version, and share inferlets and libraries.
 
 ---
+
+We welcome proposals—open a GitHub issue with your use case or RFC.
 
 
 **Feature ideas / RFCs:** please file a GitHub issue describing the problem, constraints, and expected API shape.  

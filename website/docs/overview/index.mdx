@@ -6,88 +6,93 @@ sidebar_position: 1
 
 # Overview
 
-**Pie** is a high-performance, programmable LLM serving system that empowers you to design and deploy custom inference logic and optimization strategies.
+**Pie** is a **programmable system for LLM serving**. Pie lets you *program* the serving loop itself, not just send a prompt and wait. That shift makes today's agentic apps and complex reasoning strategies both **easier** to build and **faster** to serve.
 
-## Why Pie?
+---
 
-Traditional LLM serving systems use a rigid, monolithic loop that limits what you can do:
+## Accelerate your AI apps with Pie
 
-- **Fixed request/response patterns** — No control over generation flow
-- **External tool integration** — Round-trip latency for every tool call
-- **One-size-fits-all optimization** — Can't tune for your specific use case
+**Fast.** Cut end‑to‑end latency and boost throughput by using application‑aware optimization with integrated I/O and fine‑grained KV‑cache control. (*Measured on Llama 3.2 1B using L40 GPU*)
 
-Pie takes a different approach: **serve programs, not prompts**.
+![Agentic workflows](./agent_latency_tput.svg)
 
-## Key Concepts
+**Flexible.** Compose APIs to implement custom decoding, resource policies, and per‑request optimizations—without patching or forking your serving stack.
 
-### Engine
+![Benchmarks](./bench_latency_tput.svg)
 
-The **Engine** is the core server that:
-- Manages WebSocket connections from clients
-- Schedules and runs inferlets
-- Handles authentication and resource allocation
+---
 
-Start it with:
-```bash
-pie serve
+## What is programmable serving?
+
+Existing LLM serving systems run a **single monolithic decode loop** with global policies (e.g., cache management, speculative decoding). **Pie** splits this into **fine‑grained handlers**—embed, forward, sample, KV‑page alloc/free, etc.—and lets your **inferlets** define custom decoding logic and application‑specific resource management.
+
+![Pie architecture diagram](./pie-arch.svg)
+
+Inferlets compile to **WebAssembly**, so you can write them in **Rust**, **C++**, **Go**, and more.
+
+---
+
+## Why programmable serving?
+
+Modern LLM apps demand LLM usage beyond simple text completion. They're interactive, non-linear, and tool-heavy. Current LLM serving systems struggle with three limitations:
+
+- **Inference inefficiency** from missing application-level optimizations
+- **Integration friction** with the external data and tools
+- **Implementation challenges** for the custom generation workflows
+
+**Pie** addresses all three:
+
+1. **Application-specific KV control.** Keep, reuse, split, or drop KV cache pages *based on your workflow* (trees/graphs of thought, multi-step plans, map–reduce summaries).
+2. **Integrated computation & I/O.** Call APIs or run code, **without** extra round-trips and re-prefills.
+3. **Custom generation processes.** Mix speculative/assisted decoding, MCTS, grammar constraints, safety filters, watermarking at the user level, without modifying the serving system.
+
+---
+
+## How Pie works
+
+**1) Write inferlets** with Pie APIs to control LLM resources (KV, embeddings), run inference (embed, forward, sample), and do lightweight I/O (HTTP, message bus).
+
+```rust
+use inferlet::stop_condition::{StopCondition, ends_with_any, max_len};
+use inferlet::{Args, Result, Sampler, get_auto_model};
+
+#[inferlet::main]
+async fn main(mut args: Args) -> Result<String> {
+
+    let model = get_auto_model();
+    let mut ctx = model.create_context();
+
+    ctx.fill_system("You are a helpful, respectful and honest assistant.");
+    ctx.fill_user("How are you?");
+
+    let sampler = Sampler::top_p(0.6, 0.95);
+    let stop_cond = max_len(max_num_outputs).or(ends_with_any(model.eos_tokens()));
+
+    let final_text = ctx.generate(sampler, stop_cond).await;
+
+    Ok(final_text)
+}
 ```
 
-### Backends
+**2) Compile to Wasm.** Inferlets build into reusable **Wasm** binaries.
 
-**Backends** are GPU workers that:
-- Load and run LLM models
-- Handle tokenization and sampling
-- Manage KV cache and memory
+**3) Submit to the Pie server.** The server hosts and runs inferlets in a sandboxed Wasm runtime. Submit binaries via Python/JavaScript APIs or CLI, with custom args as needed. You can also interactively communicate with running inferlets.
 
-Pie automatically starts backends based on your `config.toml`.
+---
 
-### Inferlets
+## System Architecture
 
-**Inferlets** are lightweight WebAssembly programs that define inference logic:
-- Written in Rust, Go, or other Wasm-compatible languages
-- Run sandboxed inside the engine
-- Have fine-grained control over generation
+Pie is a three-layered system where each layer separates concerns.
 
-```
-┌─────────────────────────────────────────────────┐
-│                   Pie Engine                    │
-│  ┌───────────┐  ┌───────────┐  ┌───────────┐   │
-│  │ Inferlet  │  │ Inferlet  │  │ Inferlet  │   │
-│  │  (Wasm)   │  │  (Wasm)   │  │  (Wasm)   │   │
-│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘   │
-│        │              │              │          │
-│        └──────────────┼──────────────┘          │
-│                       ▼                         │
-│              ┌─────────────────┐                │
-│              │  Backend (GPU)  │                │
-│              │   LLM Model     │                │
-│              └─────────────────┘                │
-└─────────────────────────────────────────────────┘
-```
-
-## Architecture
-
-Pie separates concerns into distinct layers:
+![Pie system diagram](./system.svg)
 
 | Layer | Responsibility |
 |-------|----------------|
-| **Client** | Connects to engine, launches inferlets, sends/receives messages |
-| **Engine** | Routes messages, schedules inferlets, manages resources |
-| **Inferlet** | Custom inference logic (sampling, tool calls, branching) |
-| **Backend** | GPU compute, model execution, KV cache |
+| **Application** | Your inferlet runs in sandboxed Wasm runtime |
+| **Control** | Virtualizes resources (KV cache page, embeddings), manages batch scheduler |
+| **Inference** | Executes batched API calls on GPUs |
 
-This separation enables:
-- **Custom decoding** — Implement speculative decoding, beam search, or novel algorithms
-- **In-engine tool calls** — Execute tools without leaving the generation loop
-- **Fine-grained KV control** — Reuse, fork, or prune cache based on your needs
-
-## How It Works
-
-1. **Client connects** to the engine via WebSocket
-2. **Client uploads** an inferlet (Wasm binary) or uses one from the registry
-3. **Engine launches** the inferlet in a sandbox
-4. **Inferlet runs** and calls engine APIs for tokenization, sampling, etc.
-5. **Client receives** streaming output or final results
+---
 
 ## Client Libraries
 
@@ -97,6 +102,8 @@ Pie provides client libraries for:
 - **Rust** — `cargo add pie-client`
 
 See the [Client API](/docs/client-api/python) documentation for details.
+
+---
 
 ## Standard Inferlets
 
@@ -112,6 +119,13 @@ Run them directly:
 pie run text-completion -- --prompt "Once upon a time"
 pie run chat
 ```
+
+---
+
+## Further Reading
+
+- Our [HotOS 2025 paper](https://ingim.org/papers/gim2025serve.pdf) motivates the vision that LLM serving systems are operating systems.
+- Our [SOSP 2025 paper](https://ingim.org/papers/gim2025pie.pdf) details the design and implementation of Pie.
 
 ## Next Steps
 
