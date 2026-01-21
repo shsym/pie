@@ -1,17 +1,16 @@
 # Text Completion Example
 
-A simple text completion Python inferlet.
+A simple text completion inferlet using inferlet-py.
 
 ## Setup (One-Time)
 
 From the pie repository root:
 
 ```bash
-cd sdk/python
+cd inferlet-py
 uv venv
 source .venv/bin/activate
 uv pip install -e ".[dev]"
-uv pip install -e ../tools/bakery
 ```
 
 ## Build
@@ -19,9 +18,8 @@ uv pip install -e ../tools/bakery
 From the pie repository root (with venv activated):
 
 ```bash
-# Build
-bakery build "$PWD/sdk/examples/python/text-completion" \
-	-o "$PWD/text-completion.wasm"
+source inferlet-py/.venv/bin/activate
+pie-cli build --python example-apps-py/text-completion -o text-completion.wasm
 ```
 
 ## Run
@@ -29,6 +27,9 @@ bakery build "$PWD/sdk/examples/python/text-completion" \
 Requires a running Pie engine:
 
 ```bash
+# Check engine is running
+pie-cli ping
+
 # Submit inferlet (arguments go after --)
 pie-cli submit text-completion.wasm -- --prompt "What is Python?"
 ```

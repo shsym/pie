@@ -13,7 +13,7 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 use wasmtime::component::Resource;
-use wasmtime::{Engine, Store, component::Component, component::Linker};
+use wasmtime::{Config, Engine, Store, component::Component, component::Linker};
 use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::bindings::exports::wasi::http::incoming_handler::{
     IncomingRequest, ResponseOutparam,
@@ -30,8 +30,11 @@ static COMMAND_DISPATCHER: OnceLock<CommandDispatcher<Command>> = OnceLock::new(
 
 /// Starts the runtime service. A daemon task will be spawned to handle the
 /// commands dispatched from other services.
-pub fn start_service(engine: Engine) {
-    let runtime = Runtime::new(engine);
+pub fn start_service<P: AsRef<std::path::Path>>(cache_dir: P) {
+    let runtime = Runtime::new(cache_dir);
+
+    // Loading existing programs should not fail.
+    runtime.load_existing_programs().unwrap();
     runtime.start(&COMMAND_DISPATCHER);
 }
 
@@ -45,9 +48,9 @@ pub enum RuntimeError {
     #[error("Wasmtime error occurred: {0}")]
     Wasmtime(#[from] wasmtime::Error),
 
-    /// No program found for the given hashes
-    #[error("No such program with wasm_hash={0}, manifest_hash={1}")]
-    MissingProgram(String, String),
+    /// No program found for a given hash
+    #[error("No such program with hash={0}")]
+    MissingProgram(String),
 
     /// Failed to compile a WASM component from disk
     #[error("Failed to compile program at path {path:?}: {source}")]
@@ -67,23 +70,20 @@ pub enum Command {
         event: oneshot::Sender<String>,
     },
 
-    LoadProgram {
-        wasm_hash: String,
-        manifest_hash: String,
-        component: Component,
-        event: oneshot::Sender<()>,
+    ProgramExists {
+        hash: String,
+        event: oneshot::Sender<bool>,
     },
 
-    ProgramLoaded {
-        wasm_hash: String,
-        manifest_hash: String,
-        event: oneshot::Sender<bool>,
+    UploadProgram {
+        hash: String,
+        raw: Vec<u8>,
+        event: oneshot::Sender<Result<String, RuntimeError>>,
     },
 
     LaunchInstance {
         username: String,
-        wasm_hash: String,
-        manifest_hash: String,
+        program_hash: String,
         arguments: Vec<String>,
         detached: bool,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
@@ -104,8 +104,7 @@ pub enum Command {
 
     LaunchServerInstance {
         username: String,
-        wasm_hash: String,
-        manifest_hash: String,
+        program_hash: String,
         port: u32,
         arguments: Vec<String>,
         event: oneshot::Sender<Result<(), RuntimeError>>,
@@ -148,8 +147,13 @@ struct Runtime {
     engine: Engine,
     linker: Arc<Linker<InstanceState>>,
 
-    /// Pre-compiled WASM components, keyed by (wasm_hash, manifest_hash)
-    compiled_programs: DashMap<(String, String), Component>,
+    cache_dir: std::path::PathBuf,
+
+    /// Pre-compiled WASM components, keyed by BLAKE3 hex string
+    programs_in_memory: DashMap<String, Component>,
+
+    /// Paths to compiled modules on disk
+    programs_in_disk: DashMap<String, std::path::PathBuf>,
 
     /// Running instances
     running_instances: DashMap<InstanceId, InstanceHandle>,
@@ -219,8 +223,7 @@ pub enum AttachInstanceResult {
 
 struct InstanceHandle {
     username: String,
-    wasm_hash: String,
-    manifest_hash: String,
+    program_hash: String,
     arguments: Vec<String>,
     start_time: std::time::Instant,
     output_delivery_ctrl: OutputDeliveryCtrl,
@@ -228,44 +231,45 @@ struct InstanceHandle {
     join_handle: tokio::task::JoinHandle<()>,
 }
 
+
 impl Service for Runtime {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
         match cmd {
-            Command::LoadProgram {
-                wasm_hash,
-                manifest_hash,
-                component,
-                event,
-            } => {
-                // Store the pre-compiled component keyed by (wasm_hash, manifest_hash)
-                self.compiled_programs
-                    .insert((wasm_hash, manifest_hash), component);
-                event.send(()).unwrap();
+            Command::ProgramExists { hash, event } => {
+                let exists = self.programs_in_memory.contains_key(&hash)
+                    || self.programs_in_disk.contains_key(&hash);
+                event.send(exists).unwrap();
             }
 
-            Command::ProgramLoaded {
-                wasm_hash,
-                manifest_hash,
-                event,
-            } => {
-                let is_loaded = self
-                    .compiled_programs
-                    .contains_key(&(wasm_hash, manifest_hash));
-                event.send(is_loaded).unwrap();
+            Command::UploadProgram { hash, raw, event } => {
+                if self.programs_in_memory.contains_key(&hash) {
+                    event.send(Ok(hash)).unwrap();
+                } else if let Ok(component) = Component::from_binary(&self.engine, raw.as_slice()) {
+                    self.programs_in_memory.insert(hash.to_string(), component);
+
+                    // Write to disk
+                    let file_path = std::path::Path::new(&self.cache_dir).join(&hash);
+                    std::fs::write(&file_path, &raw).unwrap();
+                    self.programs_in_disk.insert(hash.clone(), file_path);
+                    event.send(Ok(hash)).unwrap();
+                } else {
+                    event
+                        .send(Err(RuntimeError::Other("Failed to compile".into())))
+                        .unwrap();
+                }
             }
 
             Command::LaunchInstance {
                 username,
-                wasm_hash,
-                manifest_hash,
+                program_hash,
                 event,
                 arguments,
                 detached,
             } => {
                 let res = self
-                    .launch_instance(username, wasm_hash, manifest_hash, arguments, detached)
+                    .launch_instance(username, program_hash, arguments, detached)
                     .await;
                 event
                     .send(res)
@@ -291,14 +295,13 @@ impl Service for Runtime {
 
             Command::LaunchServerInstance {
                 username,
-                wasm_hash,
-                manifest_hash,
+                program_hash,
                 port,
                 arguments,
                 event,
             } => {
                 let _ = self
-                    .launch_server_instance(username, wasm_hash, manifest_hash, port, arguments)
+                    .launch_server_instance(username, program_hash, port, arguments)
                     .await;
                 event.send(Ok(())).unwrap();
             }
@@ -339,12 +342,10 @@ impl Service for Runtime {
                             .running_instances
                             .iter()
                             .map(|item| {
-                                let handle = item.value();
                                 format!(
-                                    "Instance ID: {}, wasm_hash: {}, manifest_hash: {}",
+                                    "Instance ID: {}, Program Hash: {}",
                                     item.key(),
-                                    handle.wasm_hash,
-                                    handle.manifest_hash
+                                    item.value().program_hash
                                 )
                             })
                             .collect();
@@ -352,19 +353,13 @@ impl Service for Runtime {
                         format!("{}", instances.join("\n"))
                     }
                     "list_in_memory_programs" => {
-                        let programs: Vec<String> = self
-                            .compiled_programs
+                        let keys: Vec<String> = self
+                            .programs_in_memory
                             .iter()
-                            .map(|item| {
-                                let (wasm_hash, manifest_hash) = item.key();
-                                format!(
-                                    "wasm_hash: {}, manifest_hash: {}",
-                                    wasm_hash, manifest_hash
-                                )
-                            })
+                            .map(|item| item.key().clone())
                             .collect();
 
-                        format!("{}", programs.join("\n"))
+                        format!("{}", keys.join("\n"))
                     }
 
                     _ => {
@@ -391,19 +386,30 @@ impl Service for Runtime {
                         kv_pages_used: 0, // TODO: query from resource_manager
                     })
                     .collect();
-
+                
                 // Sort by elapsed time (most recent first) and limit to 50 for performance
                 instances.sort_by(|a, b| a.elapsed_secs.cmp(&b.elapsed_secs));
                 instances.truncate(50);
 
                 event.send(instances).unwrap();
             }
+
         }
     }
 }
 
 impl Runtime {
-    fn new(engine: Engine) -> Self {
+    fn new<P: AsRef<std::path::Path>>(cache_dir: P) -> Self {
+        // Configure Wasmtime engine
+        let mut config = Config::default();
+        config.async_support(true);
+
+        // TODO: Adjust settings later: https://docs.wasmtime.dev/api/wasmtime/struct.PoolingAllocationConfig.html
+        // let mut pooling_config = PoolingAllocationConfig::default();
+        //config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
+
+        let engine = Engine::new(&config).unwrap();
+
         let mut linker = Linker::<InstanceState>::new(&engine);
 
         // Add to linker
@@ -416,42 +422,79 @@ impl Runtime {
 
         api::add_to_linker(&mut linker).unwrap();
 
+        let cache_dir = cache_dir.as_ref().join("programs");
+        // Ensure the cache directory exists
+        std::fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
+
         Self {
             engine,
             linker: Arc::new(linker),
-            compiled_programs: DashMap::new(),
+            cache_dir,
+            programs_in_memory: DashMap::new(),
+            programs_in_disk: DashMap::new(),
             running_instances: DashMap::new(),
             finished_instances: DashMap::new(),
             running_server_instances: DashMap::new(),
         }
     }
 
-    fn get_component(
-        &self,
-        wasm_hash: &str,
-        manifest_hash: &str,
-    ) -> Result<Component, RuntimeError> {
-        // Get the component from memory by (wasm_hash, manifest_hash)
-        let key = (wasm_hash.to_string(), manifest_hash.to_string());
-        match self.compiled_programs.get(&key) {
-            Some(entry) => Ok(entry.value().clone()),
-            None => Err(RuntimeError::MissingProgram(
-                wasm_hash.to_string(),
-                manifest_hash.to_string(),
-            )),
+    fn load_existing_programs(&self) -> Result<(), RuntimeError> {
+        let entries = std::fs::read_dir(&self.cache_dir)?; // Will map to RuntimeError::Io automatically
+        for entry in entries {
+            let entry = entry?; // same here, auto-converted to RuntimeError::Io
+            if entry.file_type()?.is_file() {
+                let path = entry.path();
+                let data = std::fs::read(&path)?; // also auto Io
+                let hash = blake3::hash(&data).to_hex().to_string();
+                self.programs_in_disk.insert(hash, path);
+            }
         }
+        Ok(())
+    }
+
+    fn get_component(&self, hash: &str) -> Result<Component, RuntimeError> {
+        // 1) Make sure the `Component` is loaded in memory
+        if self.programs_in_memory.get(hash).is_none() {
+            // load from disk if possible
+            if let Some(path_entry) = self.programs_in_disk.get(hash) {
+                // Use a custom error variant for compile errors
+
+                let component =
+                    Component::from_file(&self.engine, path_entry.value()).map_err(|err| {
+                        RuntimeError::CompileWasm {
+                            path: path_entry.value().to_path_buf(),
+                            source: err,
+                        }
+                    })?;
+                self.programs_in_memory.insert(hash.to_string(), component);
+            } else {
+                // If not on disk either, return a custom error
+                return Err(RuntimeError::MissingProgram(hash.to_string()));
+            }
+        }
+
+        // 2) Now we have a compiled component
+        let component = match self.programs_in_memory.get(hash) {
+            Some(c) => c.clone(),
+            None => {
+                return Err(RuntimeError::Other(
+                    "Failed to get component from memory".into(),
+                ));
+            }
+        };
+
+        Ok(component)
     }
 
     /// Actually start a program instance
     async fn launch_instance(
         &self,
         username: String,
-        wasm_hash: String,
-        manifest_hash: String,
+        program_hash: String,
         arguments: Vec<String>,
         detached: bool,
     ) -> Result<InstanceId, RuntimeError> {
-        let component = self.get_component(&wasm_hash, &manifest_hash)?;
+        let component = self.get_component(&program_hash)?;
         let instance_id = Uuid::new_v4();
 
         // Instantiate and run in a task
@@ -487,8 +530,7 @@ impl Runtime {
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             username,
-            wasm_hash,
-            manifest_hash,
+            program_hash,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -552,13 +594,12 @@ impl Runtime {
     async fn launch_server_instance(
         &self,
         username: String,
-        wasm_hash: String,
-        manifest_hash: String,
+        program_hash: String,
         port: u32,
         arguments: Vec<String>,
     ) -> Result<InstanceId, RuntimeError> {
         let instance_id = Uuid::new_v4();
-        let component = self.get_component(&wasm_hash, &manifest_hash)?;
+        let component = self.get_component(&program_hash)?;
 
         // Instantiate and run in a task
         let engine = self.engine.clone();
@@ -579,15 +620,13 @@ impl Runtime {
         ));
 
         // Create a dummy output delivery controller for server instances (not used since each request gets its own instance)
-        let (dummy_state, output_delivery_ctrl) =
-            InstanceState::new(Uuid::new_v4(), username.clone(), vec![]).await;
+        let (dummy_state, output_delivery_ctrl) = InstanceState::new(Uuid::new_v4(), username.clone(), vec![]).await;
         drop(dummy_state); // We don't actually use this
 
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             username,
-            wasm_hash,
-            manifest_hash,
+            program_hash,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -688,8 +727,7 @@ impl Runtime {
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
         let inst_id = Uuid::new_v4();
-        let (inst_state, _output_delivery_ctrl) =
-            InstanceState::new(inst_id, username, arguments).await;
+        let (inst_state, _output_delivery_ctrl) = InstanceState::new(inst_id, username, arguments).await;
 
         let mut store = Store::new(&engine, inst_state);
         let (sender, receiver) = oneshot::channel();
@@ -810,8 +848,7 @@ impl Runtime {
         output_delivery_ctrl_tx: oneshot::Sender<OutputDeliveryCtrl>,
     ) {
         // Create the instance state and output delivery controller
-        let (inst_state, output_delivery_ctrl) =
-            InstanceState::new(instance_id, username, arguments).await;
+        let (inst_state, output_delivery_ctrl) = InstanceState::new(instance_id, username, arguments).await;
 
         let output_delivery = if detached {
             OutputDelivery::Buffered
