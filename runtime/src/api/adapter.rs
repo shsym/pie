@@ -1,65 +1,61 @@
-use crate::api::core::forward::ForwardPass;
-use crate::api::core::{Blob, Queue};
-use crate::api::inferlet;
+//! pie:core/adapter - Adapter resource for LoRA/fine-tuning weights
+
+use crate::api::pie;
+use crate::api::types::{Queue, FutureBool};
 use crate::instance::InstanceState;
-use crate::model::request::{DownloadAdapterRequest, Request, UploadAdapterRequest};
-use crate::model::resource::{ADAPTER_TYPE_ID, ResourceId};
-use crate::model::submit_request;
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
-impl inferlet::adapter::common::Host for InstanceState {
-    async fn set_adapter(
-        &mut self,
-        pass: Resource<ForwardPass>,
-        mut adapter_ptr: ResourceId,
-    ) -> Result<()> {
-        let svc_id = self.ctx().table.get(&pass)?.queue.service_id;
-        adapter_ptr = self.translate_resource_ptr(svc_id, ADAPTER_TYPE_ID, adapter_ptr)?;
+#[derive(Debug)]
+pub struct Adapter {
+    pub name: String,
+    pub ptr: u32,
+}
 
-        let pass = self.ctx().table.get_mut(&pass)?;
-        pass.adapter = Some(adapter_ptr);
+impl pie::core::adapter::Host for InstanceState {}
 
+impl pie::core::adapter::HostAdapter for InstanceState {
+    async fn new(&mut self, name: String) -> Result<Resource<Adapter>> {
+        // TODO: Allocate adapter resource
+        let adapter = Adapter { name, ptr: 0 };
+        Ok(self.ctx().table.push(adapter)?)
+    }
+
+    async fn get(&mut self, _name: String) -> Result<Option<Resource<Adapter>>> {
+        // TODO: Look up existing adapter by name
+        Ok(None)
+    }
+
+    async fn clone(&mut self, this: Resource<Adapter>, name: String) -> Result<Resource<Adapter>> {
+        let _original = self.ctx().table.get(&this)?;
+        // TODO: Clone adapter
+        let adapter = Adapter { name, ptr: 0 };
+        Ok(self.ctx().table.push(adapter)?)
+    }
+
+    async fn drop(&mut self, this: Resource<Adapter>) -> Result<()> {
+        self.ctx().table.delete(this)?;
         Ok(())
     }
 
-    async fn download_adapter(
-        &mut self,
-        queue: Resource<Queue>,
-        mut adapter_ptr: ResourceId,
-        name: String,
-    ) -> Result<()> {
-        let (svc_id, queue_id, priority) = self.read_queue(&queue)?;
+    async fn lock(&mut self, _this: Resource<Adapter>) -> Result<Resource<FutureBool>> {
+        // TODO: Implement locking
+        anyhow::bail!("Adapter::lock not yet implemented")
+    }
 
-        adapter_ptr = self.translate_resource_ptr(svc_id, ADAPTER_TYPE_ID, adapter_ptr)?;
-
-        let req = Request::DownloadAdapter(DownloadAdapterRequest { adapter_ptr, name });
-
-        submit_request(svc_id, queue_id, priority, req)?;
-
+    async fn unlock(&mut self, _this: Resource<Adapter>) -> Result<()> {
+        // TODO: Implement unlocking
         Ok(())
     }
 
-    async fn upload_adapter(
-        &mut self,
-        queue: Resource<Queue>,
-        mut adapter_ptr: ResourceId,
-        name: String,
-        blob: Resource<Blob>,
-    ) -> Result<()> {
-        let (svc_id, queue_id, priority) = self.read_queue(&queue)?;
+    async fn load(&mut self, _this: Resource<Adapter>, _queue: Resource<Queue>, _path: String) -> Result<()> {
+        // TODO: Load adapter weights from path
+        Ok(())
+    }
 
-        adapter_ptr = self.translate_resource_ptr(svc_id, ADAPTER_TYPE_ID, adapter_ptr)?;
-        let blob = self.ctx().table.get(&blob)?;
-        let req = Request::UploadAdapter(UploadAdapterRequest {
-            adapter_ptr,
-            name,
-            adapter_data: blob.data.to_vec(),
-        });
-
-        submit_request(svc_id, queue_id, priority, req)?;
-
+    async fn save(&mut self, _this: Resource<Adapter>, _queue: Resource<Queue>, _path: String) -> Result<()> {
+        // TODO: Save adapter weights to path
         Ok(())
     }
 }
