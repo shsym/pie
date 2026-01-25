@@ -1,10 +1,21 @@
-interface context {
+interface forward {
 
     use wasi:io/poll@0.2.4.{pollable};
     use common.{queue, pointer};
 
-    resource context {
-        execute: func() -> option<context-result>;
+    resource forward-pass {
+        execute: func() -> option<forward-pass-result>;
+    }
+
+    resource forward-pass-result {
+        // Returns a pollable object to check when the result is ready
+        pollable: func() -> pollable;
+
+        // Retrieves the result if ready; None if still pending
+        // Each tuple: (token IDs, associated probabilities)
+        get-distributions: func() -> option<list<tuple<list<u32>, list<f32>>>>;
+
+        get-tokens: func() -> option<list<u32>>;
     }
 
     create-forward-pass: func(
@@ -15,11 +26,6 @@ interface context {
     attention-mask: func(
         pass: borrow<forward-pass>,
         mask: list<list<u32>>,
-    );
-
-    sampling-mask: func(
-        pass: borrow<forward-pass>,
-        mask: list<u32>,
     );
 
     kv-cache: func(

@@ -28,11 +28,6 @@ interface forward {
         mask: list<list<u32>>,
     );
 
-    sampling-mask: func(
-        pass: borrow<forward-pass>,
-        mask: list<u32>,
-    );
-
     kv-cache: func(
         pass: borrow<forward-pass>,
         kv-page-ptrs: list<pointer>,

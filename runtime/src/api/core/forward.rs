@@ -24,7 +24,6 @@ pub struct ForwardPass {
     pub adapter: Option<u32>,
     pub adapter_seed: Option<i64>,
     mask: Vec<Vec<u32>>,
-    sampling_mask: Option<Vec<u32>>,
     kv_page_ptrs: Vec<u32>,
     kv_page_last_len: u32,
     output_token_indices: Vec<u32>,
@@ -82,7 +81,6 @@ impl inferlet::core::forward::Host for InstanceState {
             adapter: None,
             adapter_seed: None,
             mask: vec![],
-            sampling_mask: None,
             kv_page_ptrs: vec![],
             kv_page_last_len: 0,
             output_token_indices: vec![],
@@ -100,16 +98,6 @@ impl inferlet::core::forward::Host for InstanceState {
     ) -> Result<()> {
         let pass = self.ctx().table.get_mut(&pass)?;
         pass.mask = mask;
-        Ok(())
-    }
-
-    async fn sampling_mask(
-        &mut self,
-        pass: Resource<ForwardPass>,
-        mask: Vec<u32>,
-    ) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&pass)?;
-        pass.sampling_mask = Some(mask);
         Ok(())
     }
 
@@ -385,7 +373,6 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
                 adapter: pass.adapter,
                 adapter_seed: pass.adapter_seed,
                 mask: take(&mut pass.mask),
-                sampling_mask: take(&mut pass.sampling_mask),
                 kv_page_ptrs: take(&mut pass.kv_page_ptrs),
                 kv_page_last_len: pass.kv_page_last_len,
                 output_token_indices: take(&mut pass.output_token_indices),
