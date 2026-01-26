@@ -16,9 +16,14 @@ pub struct Context {
 impl pie::core::context::Host for InstanceState {}
 
 impl pie::core::context::HostContext for InstanceState {
-    async fn new(&mut self, name: String) -> Result<Resource<Context>> {
+    async fn create(&mut self, name: String) -> Result<Result<Resource<Context>, String>> {
         let ctx = Context { name };
-        Ok(self.ctx().table.push(ctx)?)
+        Ok(Ok(self.ctx().table.push(ctx)?))
+    }
+
+    async fn destroy(&mut self, this: Resource<Context>) -> Result<Result<(), String>> {
+        self.ctx().table.delete(this)?;
+        Ok(Ok(()))
     }
 
     async fn get(&mut self, _name: String) -> Result<Option<Resource<Context>>> {
@@ -26,16 +31,16 @@ impl pie::core::context::HostContext for InstanceState {
         Ok(None)
     }
 
-    async fn fork(&mut self, this: Resource<Context>, new_name: String) -> Result<Resource<Context>> {
+    async fn fork(&mut self, this: Resource<Context>, new_name: String) -> Result<Result<Resource<Context>, String>> {
         let _parent = self.ctx().table.get(&this)?;
         // TODO: Fork KV cache pages
         let forked = Context { name: new_name };
-        Ok(self.ctx().table.push(forked)?)
+        Ok(Ok(self.ctx().table.push(forked)?))
     }
 
-    async fn join(&mut self, _this: Resource<Context>, _other: Resource<Context>) -> Result<()> {
+    async fn join(&mut self, _this: Resource<Context>, _other: Resource<Context>) -> Result<Result<(), String>> {
         // TODO: Merge contexts
-        Ok(())
+        Ok(Ok(()))
     }
 
     async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
@@ -48,18 +53,18 @@ impl pie::core::context::HostContext for InstanceState {
         anyhow::bail!("Context::lock not yet implemented")
     }
 
-    async fn unlock(&mut self, _this: Resource<Context>) -> Result<()> {
+    async fn unlock(&mut self, _this: Resource<Context>) -> Result<Result<(), String>> {
         // TODO: Implement unlocking
-        Ok(())
+        Ok(Ok(()))
     }
 
-    async fn grow(&mut self, _this: Resource<Context>, _size: u32) -> Result<()> {
+    async fn grow(&mut self, _this: Resource<Context>, _size: u32) -> Result<Result<(), String>> {
         // TODO: Grow context capacity
-        Ok(())
+        Ok(Ok(()))
     }
 
-    async fn shrink(&mut self, _this: Resource<Context>, _size: u32) -> Result<()> {
+    async fn shrink(&mut self, _this: Resource<Context>, _size: u32) -> Result<Result<(), String>> {
         // TODO: Shrink context capacity
-        Ok(())
+        Ok(Ok(()))
     }
 }
