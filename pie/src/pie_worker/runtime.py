@@ -893,11 +893,6 @@ class Runtime:
                             self.config.kv_page_size,
                             self.config.max_dist_size,
                             self.adapters,
-                            vocab_size=getattr(
-                                self.model_config,
-                                "num_vocabs",
-                                getattr(self.model_config, "vocab_size", 128000),
-                            ),
                         )
                         device = self.config.device
                         inputs = batch.get_model_inputs(device)
@@ -1192,11 +1187,6 @@ class Runtime:
                 self.config.kv_page_size,
                 self.config.max_dist_size,
                 self.adapters,
-                vocab_size=getattr(
-                    self.model_config,
-                    "num_vocabs",
-                    getattr(self.model_config, "vocab_size", 128000),
-                ),
             )
             build_timing = batch.timing
             t_build_batch = time.perf_counter() - t0
