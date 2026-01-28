@@ -322,9 +322,17 @@ def attach_instance(client: PieClient, instance_id: str) -> Instance:
     )
 
 
-def upload_program(client: PieClient, program_bytes: bytes) -> None:
-    """Upload a program (sync wrapper)."""
-    asyncio.get_event_loop().run_until_complete(client.upload_program(program_bytes))
+def upload_program(client: PieClient, program_bytes: bytes, manifest: str) -> None:
+    """Upload a program (sync wrapper).
+
+    Args:
+        client: The PieClient instance.
+        program_bytes: The WASM binary data.
+        manifest: The manifest TOML content as a string.
+    """
+    asyncio.get_event_loop().run_until_complete(
+        client.upload_program(program_bytes, manifest)
+    )
 
 
 def program_exists(client: PieClient, program_hash: str) -> bool:

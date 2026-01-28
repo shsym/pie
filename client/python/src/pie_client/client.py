@@ -431,10 +431,19 @@ class PieClient:
 
         return result
 
-    async def upload_program(self, program_bytes: bytes):
-        """Upload a program to the server in chunks."""
+    async def upload_program(self, program_bytes: bytes, manifest: str):
+        """Upload a program to the server in chunks.
+
+        Args:
+            program_bytes: The WASM binary data.
+            manifest: The manifest TOML content as a string.
+        """
         program_hash = blake3.blake3(program_bytes).hexdigest()
-        template = {"type": "upload_program", "program_hash": program_hash}
+        template = {
+            "type": "upload_program",
+            "program_hash": program_hash,
+            "manifest": manifest,
+        }
         await self._upload_chunked(program_bytes, template)
 
     async def upload_blob(self, instance_id: str, blob_bytes: bytes):
@@ -611,4 +620,3 @@ class PieClient:
         successful, result = await self._send_msg_and_wait(msg)
         if not successful:
             raise Exception(f"Failed to launch server instance: {result}")
-

@@ -78,6 +78,7 @@ pub enum Command {
     UploadProgram {
         hash: String,
         raw: Vec<u8>,
+        manifest: String,
         event: oneshot::Sender<Result<String, RuntimeError>>,
     },
 
@@ -231,7 +232,6 @@ struct InstanceHandle {
     join_handle: tokio::task::JoinHandle<()>,
 }
 
-
 impl Service for Runtime {
     type Command = Command;
 
@@ -243,16 +243,41 @@ impl Service for Runtime {
                 event.send(exists).unwrap();
             }
 
-            Command::UploadProgram { hash, raw, event } => {
+            Command::UploadProgram {
+                hash,
+                raw,
+                manifest,
+                event,
+            } => {
                 if self.programs_in_memory.contains_key(&hash) {
                     event.send(Ok(hash)).unwrap();
                 } else if let Ok(component) = Component::from_binary(&self.engine, raw.as_slice()) {
+                    // Parse the manifest to extract namespace, name, and version
+                    let (namespace, name, version) = match parse_manifest(&manifest) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            event.send(Err(e)).unwrap();
+                            return;
+                        }
+                    };
+
                     self.programs_in_memory.insert(hash.to_string(), component);
 
-                    // Write to disk
-                    let file_path = std::path::Path::new(&self.cache_dir).join(&hash);
-                    std::fs::write(&file_path, &raw).unwrap();
-                    self.programs_in_disk.insert(hash.clone(), file_path);
+                    // Write to disk: {cache_dir}/{namespace}/{name}/{version}.wasm
+                    let dir_path = std::path::Path::new(&self.cache_dir)
+                        .join(&namespace)
+                        .join(&name);
+                    if let Err(e) = std::fs::create_dir_all(&dir_path) {
+                        tracing::error!("Failed to create directory {:?}: {}", dir_path, e);
+                    }
+
+                    let wasm_file_path = dir_path.join(format!("{}.wasm", version));
+                    let manifest_file_path = dir_path.join(format!("{}.toml", version));
+
+                    std::fs::write(&wasm_file_path, &raw).unwrap();
+                    std::fs::write(&manifest_file_path, &manifest).unwrap();
+
+                    self.programs_in_disk.insert(hash.clone(), wasm_file_path);
                     event.send(Ok(hash)).unwrap();
                 } else {
                     event
@@ -386,14 +411,13 @@ impl Service for Runtime {
                         kv_pages_used: 0, // TODO: query from resource_manager
                     })
                     .collect();
-                
+
                 // Sort by elapsed time (most recent first) and limit to 50 for performance
                 instances.sort_by(|a, b| a.elapsed_secs.cmp(&b.elapsed_secs));
                 instances.truncate(50);
 
                 event.send(instances).unwrap();
             }
-
         }
     }
 }
@@ -439,14 +463,36 @@ impl Runtime {
     }
 
     fn load_existing_programs(&self) -> Result<(), RuntimeError> {
-        let entries = std::fs::read_dir(&self.cache_dir)?; // Will map to RuntimeError::Io automatically
-        for entry in entries {
-            let entry = entry?; // same here, auto-converted to RuntimeError::Io
-            if entry.file_type()?.is_file() {
-                let path = entry.path();
-                let data = std::fs::read(&path)?; // also auto Io
-                let hash = blake3::hash(&data).to_hex().to_string();
-                self.programs_in_disk.insert(hash, path);
+        // Load all .wasm files from the cache directory
+        // Structure: {cache_dir}/{namespace}/{name}/{version}.wasm
+        let cache_dir = std::path::Path::new(&self.cache_dir);
+        if !cache_dir.exists() {
+            return Ok(());
+        }
+
+        // Iterate through namespace directories
+        for ns_entry in std::fs::read_dir(cache_dir)? {
+            let ns_path = ns_entry?.path();
+            if !ns_path.is_dir() {
+                continue;
+            }
+
+            // Iterate through name directories
+            for name_entry in std::fs::read_dir(&ns_path)? {
+                let name_path = name_entry?.path();
+                if !name_path.is_dir() {
+                    continue;
+                }
+
+                // Iterate through version files
+                for file_entry in std::fs::read_dir(&name_path)? {
+                    let file_path = file_entry?.path();
+                    if file_path.extension().is_some_and(|ext| ext == "wasm") {
+                        let data = std::fs::read(&file_path)?;
+                        let hash = blake3::hash(&data).to_hex().to_string();
+                        self.programs_in_disk.insert(hash, file_path);
+                    }
+                }
             }
         }
         Ok(())
@@ -620,7 +666,8 @@ impl Runtime {
         ));
 
         // Create a dummy output delivery controller for server instances (not used since each request gets its own instance)
-        let (dummy_state, output_delivery_ctrl) = InstanceState::new(Uuid::new_v4(), username.clone(), vec![]).await;
+        let (dummy_state, output_delivery_ctrl) =
+            InstanceState::new(Uuid::new_v4(), username.clone(), vec![]).await;
         drop(dummy_state); // We don't actually use this
 
         // Record in the "running_instances" so we can manage it later
@@ -727,7 +774,8 @@ impl Runtime {
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
         let inst_id = Uuid::new_v4();
-        let (inst_state, _output_delivery_ctrl) = InstanceState::new(inst_id, username, arguments).await;
+        let (inst_state, _output_delivery_ctrl) =
+            InstanceState::new(inst_id, username, arguments).await;
 
         let mut store = Store::new(&engine, inst_state);
         let (sender, receiver) = oneshot::channel();
@@ -848,7 +896,8 @@ impl Runtime {
         output_delivery_ctrl_tx: oneshot::Sender<OutputDeliveryCtrl>,
     ) {
         // Create the instance state and output delivery controller
-        let (inst_state, output_delivery_ctrl) = InstanceState::new(instance_id, username, arguments).await;
+        let (inst_state, output_delivery_ctrl) =
+            InstanceState::new(instance_id, username, arguments).await;
 
         let output_delivery = if detached {
             OutputDelivery::Buffered
@@ -927,4 +976,45 @@ impl Runtime {
             }
         }
     }
+}
+
+/// Parses a manifest TOML string and extracts the namespace, name, and version.
+///
+/// The manifest must have a `[package]` section with `name` and `version` fields.
+/// The `name` field must be in the format "namespace/name".
+///
+/// Returns `(namespace, name, version)` on success.
+fn parse_manifest(manifest: &str) -> Result<(String, String, String), RuntimeError> {
+    let table: toml::Table = toml::from_str(manifest)
+        .map_err(|e| RuntimeError::Other(format!("Failed to parse manifest TOML: {}", e)))?;
+
+    let package = table
+        .get("package")
+        .and_then(|p| p.as_table())
+        .ok_or_else(|| RuntimeError::Other("Manifest missing [package] section".into()))?;
+
+    let full_name = package
+        .get("name")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| RuntimeError::Other("Manifest missing package.name field".into()))?;
+
+    let version = package
+        .get("version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RuntimeError::Other("Manifest missing package.version field".into()))?;
+
+    // Parse "namespace/name" format
+    let parts: Vec<&str> = full_name.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(RuntimeError::Other(format!(
+            "Invalid package.name format '{}': expected 'namespace/name'",
+            full_name
+        )));
+    }
+
+    Ok((
+        parts[0].to_string(),
+        parts[1].to_string(),
+        version.to_string(),
+    ))
 }

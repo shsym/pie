@@ -346,7 +346,7 @@ impl Client {
             .map(|r| r == "true")
     }
 
-    pub async fn upload_program(&self, blob: &[u8]) -> Result<()> {
+    pub async fn upload_program(&self, blob: &[u8], manifest: &str) -> Result<()> {
         let program_hash = hash_blob(blob);
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let (tx, rx) = oneshot::channel();
@@ -365,6 +365,7 @@ impl Client {
             let msg = ClientMessage::UploadProgram {
                 corr_id: *corr_id_guard,
                 program_hash: program_hash.clone(),
+                manifest: manifest.to_string(),
                 chunk_index,
                 total_chunks,
                 chunk_data: blob[start..end].to_vec(),

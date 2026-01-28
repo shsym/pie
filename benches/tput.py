@@ -20,6 +20,8 @@ async def run_benchmark(args):
         / "release"
         / "text_completion.wasm"
     )
+    # Manifest path
+    manifest_path = script_dir.parent / "std" / "text-completion" / "Pie.toml"
 
     if not wasm_path.exists():
         print(f"Error: WASM binary not found at {wasm_path}")
@@ -28,8 +30,14 @@ async def run_benchmark(args):
         )
         sys.exit(1)
 
+    if not manifest_path.exists():
+        print(f"Error: Manifest not found at {manifest_path}")
+        sys.exit(1)
+
     print(f"Using WASM: {wasm_path}")
+    print(f"Using Manifest: {manifest_path}")
     program_bytes = wasm_path.read_bytes()
+    manifest_content = manifest_path.read_text()
     program_hash = blake3(program_bytes).hexdigest()
 
     # 2. Connect to server
@@ -40,7 +48,7 @@ async def run_benchmark(args):
         # 3. Upload program
         if not await client.program_exists(program_hash):
             print("Uploading program...")
-            await client.upload_program(program_bytes)
+            await client.upload_program(program_bytes, manifest_content)
         else:
             print("Program already exists on server.")
 

@@ -76,6 +76,7 @@ pub enum ClientMessage {
     UploadProgram {
         corr_id: u32,
         program_hash: String,
+        manifest: String,
         chunk_index: usize,
         total_chunks: usize,
         #[serde(with = "serde_bytes")]
