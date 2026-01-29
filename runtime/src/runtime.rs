@@ -71,19 +71,25 @@ pub enum Command {
     },
 
     ProgramExists {
-        hash: String,
+        namespace: String,
+        name: String,
+        version: String,
+        hash: Option<String>,
         event: oneshot::Sender<bool>,
     },
 
     UploadProgram {
         hash: String,
         raw: Vec<u8>,
+        manifest: String,
         event: oneshot::Sender<Result<String, RuntimeError>>,
     },
 
     LaunchInstance {
         username: String,
-        program_hash: String,
+        namespace: String,
+        name: String,
+        version: String,
         arguments: Vec<String>,
         detached: bool,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
@@ -104,7 +110,9 @@ pub enum Command {
 
     LaunchServerInstance {
         username: String,
-        program_hash: String,
+        namespace: String,
+        name: String,
+        version: String,
         port: u32,
         arguments: Vec<String>,
         event: oneshot::Sender<Result<(), RuntimeError>>,
@@ -149,11 +157,11 @@ struct Runtime {
 
     cache_dir: std::path::PathBuf,
 
-    /// Pre-compiled WASM components, keyed by BLAKE3 hex string
-    programs_in_memory: DashMap<String, Component>,
+    /// Pre-compiled WASM components, keyed by (namespace, name, version)
+    programs_in_memory: DashMap<(String, String, String), Component>,
 
-    /// Paths to compiled modules on disk
-    programs_in_disk: DashMap<String, std::path::PathBuf>,
+    /// Paths to compiled modules on disk, keyed by (namespace, name, version)
+    programs_in_disk: DashMap<(String, String, String), std::path::PathBuf>,
 
     /// Running instances
     running_instances: DashMap<InstanceId, InstanceHandle>,
@@ -223,7 +231,9 @@ pub enum AttachInstanceResult {
 
 struct InstanceHandle {
     username: String,
-    program_hash: String,
+    program_namespace: String,
+    program_name: String,
+    program_version: String,
     arguments: Vec<String>,
     start_time: std::time::Instant,
     output_delivery_ctrl: OutputDeliveryCtrl,
@@ -231,28 +241,83 @@ struct InstanceHandle {
     join_handle: tokio::task::JoinHandle<()>,
 }
 
-
 impl Service for Runtime {
     type Command = Command;
 
     async fn handle(&mut self, cmd: Self::Command) {
         match cmd {
-            Command::ProgramExists { hash, event } => {
-                let exists = self.programs_in_memory.contains_key(&hash)
-                    || self.programs_in_disk.contains_key(&hash);
-                event.send(exists).unwrap();
+            Command::ProgramExists {
+                namespace,
+                name,
+                version,
+                hash,
+                event,
+            } => {
+                let key = (namespace.clone(), name.clone(), version.clone());
+                let program_exists = self.programs_in_memory.contains_key(&key)
+                    || self.programs_in_disk.contains_key(&key);
+
+                // If hash is provided, also verify that the hash matches
+                let result = if program_exists && hash.is_some() {
+                    let expected_hash = hash.unwrap();
+                    // Read the stored hash from the .hash file
+                    let hash_file_path = std::path::Path::new(&self.cache_dir)
+                        .join(&namespace)
+                        .join(&name)
+                        .join(format!("{}.hash", version));
+
+                    if let Ok(stored_hash) = std::fs::read_to_string(&hash_file_path) {
+                        stored_hash.trim() == expected_hash
+                    } else {
+                        // If we can't read the hash file, consider it a mismatch
+                        false
+                    }
+                } else {
+                    program_exists
+                };
+                event.send(result).unwrap();
             }
 
-            Command::UploadProgram { hash, raw, event } => {
-                if self.programs_in_memory.contains_key(&hash) {
+            Command::UploadProgram {
+                hash,
+                raw,
+                manifest,
+                event,
+            } => {
+                // Parse the manifest to extract namespace, name, and version
+                let (namespace, name, version) = match parse_manifest(&manifest) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        event.send(Err(e)).unwrap();
+                        return;
+                    }
+                };
+
+                let program_key = (namespace.clone(), name.clone(), version.clone());
+
+                if self.programs_in_memory.contains_key(&program_key) {
                     event.send(Ok(hash)).unwrap();
                 } else if let Ok(component) = Component::from_binary(&self.engine, raw.as_slice()) {
-                    self.programs_in_memory.insert(hash.to_string(), component);
+                    self.programs_in_memory
+                        .insert(program_key.clone(), component);
 
-                    // Write to disk
-                    let file_path = std::path::Path::new(&self.cache_dir).join(&hash);
-                    std::fs::write(&file_path, &raw).unwrap();
-                    self.programs_in_disk.insert(hash.clone(), file_path);
+                    // Write to disk: {cache_dir}/{namespace}/{name}/{version}.{wasm,toml,hash}
+                    let dir_path = std::path::Path::new(&self.cache_dir)
+                        .join(&namespace)
+                        .join(&name);
+                    if let Err(e) = std::fs::create_dir_all(&dir_path) {
+                        tracing::error!("Failed to create directory {:?}: {}", dir_path, e);
+                    }
+
+                    let wasm_file_path = dir_path.join(format!("{}.wasm", version));
+                    let manifest_file_path = dir_path.join(format!("{}.toml", version));
+                    let hash_file_path = dir_path.join(format!("{}.hash", version));
+
+                    std::fs::write(&wasm_file_path, &raw).unwrap();
+                    std::fs::write(&manifest_file_path, &manifest).unwrap();
+                    std::fs::write(&hash_file_path, &hash).unwrap();
+
+                    self.programs_in_disk.insert(program_key, wasm_file_path);
                     event.send(Ok(hash)).unwrap();
                 } else {
                     event
@@ -263,13 +328,15 @@ impl Service for Runtime {
 
             Command::LaunchInstance {
                 username,
-                program_hash,
+                namespace,
+                name,
+                version,
                 event,
                 arguments,
                 detached,
             } => {
                 let res = self
-                    .launch_instance(username, program_hash, arguments, detached)
+                    .launch_instance(username, namespace, name, version, arguments, detached)
                     .await;
                 event
                     .send(res)
@@ -295,13 +362,15 @@ impl Service for Runtime {
 
             Command::LaunchServerInstance {
                 username,
-                program_hash,
+                namespace,
+                name,
+                version,
                 port,
                 arguments,
                 event,
             } => {
                 let _ = self
-                    .launch_server_instance(username, program_hash, port, arguments)
+                    .launch_server_instance(username, namespace, name, version, port, arguments)
                     .await;
                 event.send(Ok(())).unwrap();
             }
@@ -342,10 +411,13 @@ impl Service for Runtime {
                             .running_instances
                             .iter()
                             .map(|item| {
+                                let handle = item.value();
                                 format!(
-                                    "Instance ID: {}, Program Hash: {}",
+                                    "Instance ID: {}, Program: {}/{}@{}",
                                     item.key(),
-                                    item.value().program_hash
+                                    handle.program_namespace,
+                                    handle.program_name,
+                                    handle.program_version
                                 )
                             })
                             .collect();
@@ -356,7 +428,10 @@ impl Service for Runtime {
                         let keys: Vec<String> = self
                             .programs_in_memory
                             .iter()
-                            .map(|item| item.key().clone())
+                            .map(|item| {
+                                let (ns, name, ver) = item.key();
+                                format!("{}/{}@{}", ns, name, ver)
+                            })
                             .collect();
 
                         format!("{}", keys.join("\n"))
@@ -386,14 +461,13 @@ impl Service for Runtime {
                         kv_pages_used: 0, // TODO: query from resource_manager
                     })
                     .collect();
-                
+
                 // Sort by elapsed time (most recent first) and limit to 50 for performance
                 instances.sort_by(|a, b| a.elapsed_secs.cmp(&b.elapsed_secs));
                 instances.truncate(50);
 
                 event.send(instances).unwrap();
             }
-
         }
     }
 }
@@ -439,24 +513,66 @@ impl Runtime {
     }
 
     fn load_existing_programs(&self) -> Result<(), RuntimeError> {
-        let entries = std::fs::read_dir(&self.cache_dir)?; // Will map to RuntimeError::Io automatically
-        for entry in entries {
-            let entry = entry?; // same here, auto-converted to RuntimeError::Io
-            if entry.file_type()?.is_file() {
-                let path = entry.path();
-                let data = std::fs::read(&path)?; // also auto Io
-                let hash = blake3::hash(&data).to_hex().to_string();
-                self.programs_in_disk.insert(hash, path);
+        // Load all .wasm files from the cache directory
+        // Structure: {cache_dir}/{namespace}/{name}/{version}.wasm
+        let cache_dir = std::path::Path::new(&self.cache_dir);
+        if !cache_dir.exists() {
+            return Ok(());
+        }
+
+        // Iterate through namespace directories
+        for ns_entry in std::fs::read_dir(cache_dir)? {
+            let ns_path = ns_entry?.path();
+            if !ns_path.is_dir() {
+                continue;
+            }
+            let namespace = match ns_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // Iterate through name directories
+            for name_entry in std::fs::read_dir(&ns_path)? {
+                let name_path = name_entry?.path();
+                if !name_path.is_dir() {
+                    continue;
+                }
+                let name = match name_path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+
+                // Iterate through version files
+                for file_entry in std::fs::read_dir(&name_path)? {
+                    let file_path = file_entry?.path();
+                    if file_path.extension().is_some_and(|ext| ext == "wasm") {
+                        // Extract version from filename (e.g., "0.1.0.wasm" -> "0.1.0")
+                        let version = match file_path.file_stem().and_then(|s| s.to_str()) {
+                            Some(v) => v.to_string(),
+                            None => continue,
+                        };
+
+                        let key = (namespace.clone(), name.clone(), version);
+                        self.programs_in_disk.insert(key, file_path);
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    fn get_component(&self, hash: &str) -> Result<Component, RuntimeError> {
+    fn get_component(
+        &self,
+        namespace: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<Component, RuntimeError> {
+        let key = (namespace.to_string(), name.to_string(), version.to_string());
+
         // 1) Make sure the `Component` is loaded in memory
-        if self.programs_in_memory.get(hash).is_none() {
+        if self.programs_in_memory.get(&key).is_none() {
             // load from disk if possible
-            if let Some(path_entry) = self.programs_in_disk.get(hash) {
+            if let Some(path_entry) = self.programs_in_disk.get(&key) {
                 // Use a custom error variant for compile errors
 
                 let component =
@@ -466,15 +582,18 @@ impl Runtime {
                             source: err,
                         }
                     })?;
-                self.programs_in_memory.insert(hash.to_string(), component);
+                self.programs_in_memory.insert(key.clone(), component);
             } else {
                 // If not on disk either, return a custom error
-                return Err(RuntimeError::MissingProgram(hash.to_string()));
+                return Err(RuntimeError::MissingProgram(format!(
+                    "{}/{} @ {}",
+                    namespace, name, version
+                )));
             }
         }
 
         // 2) Now we have a compiled component
-        let component = match self.programs_in_memory.get(hash) {
+        let component = match self.programs_in_memory.get(&key) {
             Some(c) => c.clone(),
             None => {
                 return Err(RuntimeError::Other(
@@ -490,11 +609,13 @@ impl Runtime {
     async fn launch_instance(
         &self,
         username: String,
-        program_hash: String,
+        namespace: String,
+        name: String,
+        version: String,
         arguments: Vec<String>,
         detached: bool,
     ) -> Result<InstanceId, RuntimeError> {
-        let component = self.get_component(&program_hash)?;
+        let component = self.get_component(&namespace, &name, &version)?;
         let instance_id = Uuid::new_v4();
 
         // Instantiate and run in a task
@@ -530,7 +651,9 @@ impl Runtime {
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             username,
-            program_hash,
+            program_namespace: namespace,
+            program_name: name,
+            program_version: version,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -594,12 +717,14 @@ impl Runtime {
     async fn launch_server_instance(
         &self,
         username: String,
-        program_hash: String,
+        namespace: String,
+        name: String,
+        version: String,
         port: u32,
         arguments: Vec<String>,
     ) -> Result<InstanceId, RuntimeError> {
         let instance_id = Uuid::new_v4();
-        let component = self.get_component(&program_hash)?;
+        let component = self.get_component(&namespace, &name, &version)?;
 
         // Instantiate and run in a task
         let engine = self.engine.clone();
@@ -620,13 +745,16 @@ impl Runtime {
         ));
 
         // Create a dummy output delivery controller for server instances (not used since each request gets its own instance)
-        let (dummy_state, output_delivery_ctrl) = InstanceState::new(Uuid::new_v4(), username.clone(), vec![]).await;
+        let (dummy_state, output_delivery_ctrl) =
+            InstanceState::new(Uuid::new_v4(), username.clone(), vec![]).await;
         drop(dummy_state); // We don't actually use this
 
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             username,
-            program_hash,
+            program_namespace: namespace,
+            program_name: name,
+            program_version: version,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -727,7 +855,8 @@ impl Runtime {
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
         let inst_id = Uuid::new_v4();
-        let (inst_state, _output_delivery_ctrl) = InstanceState::new(inst_id, username, arguments).await;
+        let (inst_state, _output_delivery_ctrl) =
+            InstanceState::new(inst_id, username, arguments).await;
 
         let mut store = Store::new(&engine, inst_state);
         let (sender, receiver) = oneshot::channel();
@@ -848,7 +977,8 @@ impl Runtime {
         output_delivery_ctrl_tx: oneshot::Sender<OutputDeliveryCtrl>,
     ) {
         // Create the instance state and output delivery controller
-        let (inst_state, output_delivery_ctrl) = InstanceState::new(instance_id, username, arguments).await;
+        let (inst_state, output_delivery_ctrl) =
+            InstanceState::new(instance_id, username, arguments).await;
 
         let output_delivery = if detached {
             OutputDelivery::Buffered
@@ -927,4 +1057,45 @@ impl Runtime {
             }
         }
     }
+}
+
+/// Parses a manifest TOML string and extracts the namespace, name, and version.
+///
+/// The manifest must have a `[package]` section with `name` and `version` fields.
+/// The `name` field must be in the format "namespace/name".
+///
+/// Returns `(namespace, name, version)` on success.
+fn parse_manifest(manifest: &str) -> Result<(String, String, String), RuntimeError> {
+    let table: toml::Table = toml::from_str(manifest)
+        .map_err(|e| RuntimeError::Other(format!("Failed to parse manifest TOML: {}", e)))?;
+
+    let package = table
+        .get("package")
+        .and_then(|p| p.as_table())
+        .ok_or_else(|| RuntimeError::Other("Manifest missing [package] section".into()))?;
+
+    let full_name = package
+        .get("name")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| RuntimeError::Other("Manifest missing package.name field".into()))?;
+
+    let version = package
+        .get("version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RuntimeError::Other("Manifest missing package.version field".into()))?;
+
+    // Parse "namespace/name" format
+    let parts: Vec<&str> = full_name.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(RuntimeError::Other(format!(
+            "Invalid package.name format '{}': expected 'namespace/name'",
+            full_name
+        )));
+    }
+
+    Ok((
+        parts[0].to_string(),
+        parts[1].to_string(),
+        version.to_string(),
+    ))
 }
