@@ -92,7 +92,6 @@ def compose_components(program_bytes: bytes, library_paths: list[Path]) -> bytes
 def handle_submit_command(
     inferlet: Optional[str] = None,
     path: Optional[Path] = None,
-    manifest: Optional[Path] = None,
     config: Optional[Path] = None,
     host: Optional[str] = None,
     port: Optional[int] = None,
@@ -107,7 +106,7 @@ def handle_submit_command(
     You can specify an inferlet either by registry name or by path (mutually exclusive):
 
     - By registry: pie-client submit std/text-completion@0.1.0
-    - By path: pie-client submit --path ./my_inferlet.wasm --manifest ./Pie.toml
+    - By path: pie-client submit --path ./my_inferlet.wasm
 
     Steps:
     1. Creates a client configuration from config file and command-line arguments
@@ -129,11 +128,6 @@ def handle_submit_command(
         arguments = [inferlet] + (arguments or [])
         inferlet = None
 
-    # Validate manifest is provided when using --path
-    if path is not None and manifest is None:
-        typer.echo("Error: --manifest is required when using --path", err=True)
-        raise typer.Exit(1)
-
     link = link or []
     arguments = arguments or []
 
@@ -153,11 +147,7 @@ def handle_submit_command(
             if not path.exists():
                 raise FileNotFoundError(f"Inferlet file not found: {path}")
 
-            if not manifest.exists():
-                raise FileNotFoundError(f"Manifest file not found: {manifest}")
-
             inferlet_blob = path.read_bytes()
-            manifest_content = manifest.read_text()
 
             # If libraries are specified, compose them with the main inferlet
             if link:
@@ -171,7 +161,7 @@ def handle_submit_command(
 
             # Upload the composed inferlet to the server
             if not engine.program_exists(client, program_hash):
-                engine.upload_program(client, final_blob, manifest_content)
+                engine.upload_program(client, final_blob)
                 typer.echo("✅ Inferlet upload successful.")
             else:
                 typer.echo("Inferlet already exists on server.")

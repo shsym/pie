@@ -99,6 +99,7 @@ pub enum InternalEvent {
         cur_num_rejected_backends: Option<u32>,
         tx: oneshot::Sender<(u32, u32)>,
     },
+
 }
 
 impl ServiceCommand for ServerEvent {
@@ -269,6 +270,7 @@ impl Service for Server {
                         tx,
                     );
                 }
+
             },
         }
     }
@@ -279,7 +281,6 @@ struct InFlightUpload {
     total_chunks: usize,
     buffer: Vec<u8>,
     next_chunk_index: usize,
-    manifest: String,
 }
 
 struct Session {
@@ -554,7 +555,6 @@ impl Session {
                 ClientMessage::UploadProgram {
                     corr_id,
                     program_hash,
-                    manifest,
                     chunk_index,
                     total_chunks,
                     chunk_data,
@@ -562,7 +562,6 @@ impl Session {
                     self.handle_upload_program(
                         corr_id,
                         program_hash,
-                        manifest,
                         chunk_index,
                         total_chunks,
                         chunk_data,
@@ -575,8 +574,13 @@ impl Session {
                     arguments,
                     detached,
                 } => {
-                    self.handle_launch_instance(corr_id, program_hash, arguments, detached)
-                        .await
+                    self.handle_launch_instance(
+                        corr_id,
+                        program_hash,
+                        arguments,
+                        detached,
+                    )
+                    .await
                 }
                 ClientMessage::LaunchInstanceFromRegistry {
                     corr_id,
@@ -585,7 +589,10 @@ impl Session {
                     detached,
                 } => {
                     self.handle_launch_instance_from_registry(
-                        corr_id, inferlet, arguments, detached,
+                        corr_id,
+                        inferlet,
+                        arguments,
+                        detached,
                     )
                     .await
                 }
@@ -601,8 +608,13 @@ impl Session {
                     program_hash,
                     arguments,
                 } => {
-                    self.handle_launch_server_instance(corr_id, port, program_hash, arguments)
-                        .await
+                    self.handle_launch_server_instance(
+                        corr_id,
+                        port,
+                        program_hash,
+                        arguments,
+                    )
+                    .await
                 }
                 ClientMessage::SignalInstance {
                     instance_id,
@@ -792,7 +804,6 @@ impl Session {
         &mut self,
         corr_id: u32,
         program_hash: String,
-        manifest: String,
         chunk_index: usize,
         total_chunks: usize,
         mut chunk_data: Vec<u8>,
@@ -823,7 +834,6 @@ impl Session {
                 total_chunks,
                 buffer: Vec::new(),
                 next_chunk_index: 0,
-                manifest: manifest.clone(),
             });
         }
 
@@ -880,7 +890,6 @@ impl Session {
                 runtime::Command::UploadProgram {
                     hash: final_hash.clone(),
                     raw: mem::take(&mut inflight.buffer),
-                    manifest: mem::take(&mut inflight.manifest),
                     event: evt_tx,
                 }
                 .dispatch();
@@ -965,24 +974,19 @@ impl Session {
         )
         .await
         {
-            Ok((program_hash, program_data, manifest)) => {
+            Ok((program_hash, program_data)) => {
                 // Upload the program to the runtime (registers it for execution)
                 let (evt_tx, evt_rx) = oneshot::channel();
                 runtime::Command::UploadProgram {
                     hash: program_hash.clone(),
                     raw: program_data,
-                    manifest,
                     event: evt_tx,
                 }
                 .dispatch();
 
                 if let Err(e) = evt_rx.await.unwrap() {
-                    self.send_launch_result(
-                        corr_id,
-                        false,
-                        format!("Failed to register program: {}", e),
-                    )
-                    .await;
+                    self.send_launch_result(corr_id, false, format!("Failed to register program: {}", e))
+                        .await;
                     return;
                 }
 
@@ -991,7 +995,8 @@ impl Session {
                     .await;
             }
             Err(e) => {
-                self.send_launch_result(corr_id, false, e.to_string()).await;
+                self.send_launch_result(corr_id, false, e.to_string())
+                    .await;
             }
         }
     }
@@ -1198,7 +1203,6 @@ impl Session {
                     total_chunks,
                     buffer: Vec::with_capacity(total_chunks * message::CHUNK_SIZE_BYTES),
                     next_chunk_index: 0,
-                    manifest: String::new(), // Not used for blob uploads
                 },
             );
         }
@@ -1327,6 +1331,8 @@ impl Drop for Session {
     }
 }
 
+
+
 /// Parses an inferlet name into (namespace, name, version).
 ///
 /// Supported formats:
@@ -1354,59 +1360,44 @@ fn parse_inferlet_name(inferlet: &str) -> (String, String, String) {
 
 /// Downloads an inferlet from the registry, with local caching.
 ///
-/// Returns (program_hash, program_data, manifest) on success.
+/// Returns (program_hash, program_data) on success.
 async fn download_inferlet_from_registry(
     registry_url: &str,
     cache_dir: &std::path::Path,
     namespace: &str,
     name: &str,
     version: &str,
-) -> Result<(String, Vec<u8>, String)> {
-    // Build the cache paths:
-    // - Wasm binary: {cache_dir}/registry/{namespace}/{name}/{version}.wasm
-    // - Manifest: {cache_dir}/registry/{namespace}/{name}/{version}.toml
-    let cache_base = cache_dir.join("registry").join(namespace).join(name);
-    let wasm_cache_path = cache_base.join(format!("{}.wasm", version));
-    let manifest_cache_path = cache_base.join(format!("{}.toml", version));
+) -> Result<(String, Vec<u8>)> {
+    // Build the cache path: {cache_dir}/registry/{namespace}/{name}/{version}.wasm
+    let cache_path = cache_dir
+        .join("registry")
+        .join(namespace)
+        .join(name)
+        .join(format!("{}.wasm", version));
 
-    // Check if we have both cached files
-    if wasm_cache_path.exists() && manifest_cache_path.exists() {
+    // Check if we have a cached copy
+    if cache_path.exists() {
         tracing::info!(
             "Using cached inferlet: {}/{} @ {} from {:?}",
             namespace,
             name,
             version,
-            wasm_cache_path
+            cache_path
         );
-        let wasm_data = tokio::fs::read(&wasm_cache_path).await.map_err(|e| {
-            anyhow!(
-                "Failed to read cached inferlet at {:?}: {}",
-                wasm_cache_path,
-                e
-            )
+        let data = tokio::fs::read(&cache_path).await.map_err(|e| {
+            anyhow!("Failed to read cached inferlet at {:?}: {}", cache_path, e)
         })?;
-        let manifest_data = tokio::fs::read_to_string(&manifest_cache_path)
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to read cached manifest at {:?}: {}",
-                    manifest_cache_path,
-                    e
-                )
-            })?;
-        let hash = blake3::hash(&wasm_data).to_hex().to_string();
-        return Ok((hash, wasm_data, manifest_data));
+        let hash = blake3::hash(&data).to_hex().to_string();
+        return Ok((hash, data));
     }
 
-    // Build the download URLs
-    let base_url = registry_url.trim_end_matches('/');
-    let wasm_download_url = format!(
+    // Build the download URL
+    let download_url = format!(
         "{}/api/v1/inferlets/{}/{}/{}/download",
-        base_url, namespace, name, version
-    );
-    let manifest_download_url = format!(
-        "{}/api/v1/inferlets/{}/{}/{}/manifest",
-        base_url, namespace, name, version
+        registry_url.trim_end_matches('/'),
+        namespace,
+        name,
+        version
     );
 
     tracing::info!(
@@ -1414,7 +1405,7 @@ async fn download_inferlet_from_registry(
         namespace,
         name,
         version,
-        wasm_download_url
+        download_url
     );
 
     // Create an HTTP client that follows redirects
@@ -1423,16 +1414,16 @@ async fn download_inferlet_from_registry(
         .build()
         .map_err(|e| anyhow!("Failed to create HTTP client: {}", e))?;
 
-    // Download the wasm binary
-    let wasm_response = client
-        .get(&wasm_download_url)
+    // Perform the download
+    let response = client
+        .get(&download_url)
         .send()
         .await
         .map_err(|e| anyhow!("Failed to download inferlet from registry: {}", e))?;
 
-    if !wasm_response.status().is_success() {
-        let status = wasm_response.status();
-        let body = wasm_response.text().await.unwrap_or_default();
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
         bail!(
             "Registry returned error {} for {}/{} @ {}: {}",
             status,
@@ -1443,13 +1434,13 @@ async fn download_inferlet_from_registry(
         );
     }
 
-    let wasm_data = wasm_response
+    let data = response
         .bytes()
         .await
         .map_err(|e| anyhow!("Failed to read inferlet data: {}", e))?
         .to_vec();
 
-    if wasm_data.is_empty() {
+    if data.is_empty() {
         bail!(
             "Registry returned empty data for {}/{} @ {}",
             namespace,
@@ -1458,68 +1449,26 @@ async fn download_inferlet_from_registry(
         );
     }
 
-    // Download the manifest
-    tracing::info!(
-        "Downloading manifest for {}/{} @ {} from {}",
-        namespace,
-        name,
-        version,
-        manifest_download_url
-    );
+    let hash = blake3::hash(&data).to_hex().to_string();
 
-    let manifest_response = client
-        .get(&manifest_download_url)
-        .send()
-        .await
-        .map_err(|e| anyhow!("Failed to download manifest from registry: {}", e))?;
-
-    if !manifest_response.status().is_success() {
-        let status = manifest_response.status();
-        let body = manifest_response.text().await.unwrap_or_default();
-        bail!(
-            "Registry returned error {} for manifest {}/{} @ {}: {}",
-            status,
-            namespace,
-            name,
-            version,
-            body
-        );
-    }
-
-    let manifest_data = manifest_response
-        .text()
-        .await
-        .map_err(|e| anyhow!("Failed to read manifest data: {}", e))?;
-
-    let hash = blake3::hash(&wasm_data).to_hex().to_string();
-
-    // Cache the downloaded files
-    tokio::fs::create_dir_all(&cache_base)
-        .await
-        .map_err(|e| anyhow!("Failed to create cache directory {:?}: {}", cache_base, e))?;
-
-    tokio::fs::write(&wasm_cache_path, &wasm_data)
-        .await
-        .map_err(|e| anyhow!("Failed to cache inferlet at {:?}: {}", wasm_cache_path, e))?;
-
-    tokio::fs::write(&manifest_cache_path, &manifest_data)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to cache manifest at {:?}: {}",
-                manifest_cache_path,
-                e
-            )
+    // Cache the downloaded inferlet
+    if let Some(parent) = cache_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            anyhow!("Failed to create cache directory {:?}: {}", parent, e)
         })?;
+    }
+    tokio::fs::write(&cache_path, &data).await.map_err(|e| {
+        anyhow!("Failed to cache inferlet at {:?}: {}", cache_path, e)
+    })?;
 
     tracing::info!(
         "Cached inferlet {}/{} @ {} to {:?} (hash: {})",
         namespace,
         name,
         version,
-        wasm_cache_path,
+        cache_path,
         hash
     );
 
-    Ok((hash, wasm_data, manifest_data))
+    Ok((hash, data))
 }
