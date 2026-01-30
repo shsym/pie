@@ -322,52 +322,27 @@ def attach_instance(client: PieClient, instance_id: str) -> Instance:
     )
 
 
-def upload_program(client: PieClient, program_bytes: bytes, manifest: str) -> None:
-    """Upload a program (sync wrapper).
-
-    Args:
-        client: The PieClient instance.
-        program_bytes: The WASM binary data.
-        manifest: The manifest TOML content as a string.
-    """
-    asyncio.get_event_loop().run_until_complete(
-        client.upload_program(program_bytes, manifest)
-    )
+def upload_program(client: PieClient, program_bytes: bytes) -> None:
+    """Upload a program (sync wrapper)."""
+    asyncio.get_event_loop().run_until_complete(client.upload_program(program_bytes))
 
 
-def program_exists(client: PieClient, inferlet: str, hash: str | None = None) -> bool:
-    """Check if a program exists (sync wrapper).
-
-    The inferlet parameter can be:
-    - Full name with version: "std/text-completion@0.1.0"
-    - Without namespace (defaults to "std"): "text-completion@0.1.0"
-    - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
-
-    Args:
-        client: The Pie client.
-        inferlet: The inferlet name (e.g., "std/text-completion@0.1.0").
-        hash: Optional hash to verify. If provided, also checks that the stored hash matches.
-    """
+def program_exists(client: PieClient, program_hash: str) -> bool:
+    """Check if a program exists (sync wrapper)."""
     return asyncio.get_event_loop().run_until_complete(
-        client.program_exists(inferlet, hash)
+        client.program_exists(program_hash)
     )
 
 
 def launch_instance(
     client: PieClient,
-    inferlet: str,
+    program_hash: str,
     arguments: list[str],
     detached: bool = False,
 ) -> Instance:
-    """Launch an instance (sync wrapper).
-
-    The inferlet parameter can be:
-    - Full name with version: "std/text-completion@0.1.0"
-    - Without namespace (defaults to "std"): "text-completion@0.1.0"
-    - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
-    """
+    """Launch an instance (sync wrapper)."""
     return asyncio.get_event_loop().run_until_complete(
-        client.launch_instance(inferlet, arguments, detached)
+        client.launch_instance(program_hash, arguments, detached)
     )
 
 

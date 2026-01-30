@@ -340,26 +340,13 @@ impl Client {
         }
     }
 
-    /// Check if a program exists by its inferlet name.
-    /// Optionally verifies that the stored hash matches the provided hash.
-    ///
-    /// The `inferlet` parameter can be:
-    /// - Full name with version: `std/text-completion@0.1.0`
-    /// - Without namespace (defaults to `std`): `text-completion@0.1.0`
-    /// - Without version (defaults to `latest`): `std/text-completion` or `text-completion`
-    ///
-    /// If `hash` is provided, also checks that the stored hash matches.
-    pub async fn program_exists(&self, inferlet: &str, hash: Option<&str>) -> Result<bool> {
-        let query = match hash {
-            Some(h) => format!("{}#{}", inferlet, h),
-            None => inferlet.to_string(),
-        };
-        self.query(QUERY_PROGRAM_EXISTS, query)
+    pub async fn program_exists(&self, program_hash: &str) -> Result<bool> {
+        self.query(QUERY_PROGRAM_EXISTS, program_hash.to_string())
             .await
             .map(|r| r == "true")
     }
 
-    pub async fn upload_program(&self, blob: &[u8], manifest: &str) -> Result<()> {
+    pub async fn upload_program(&self, blob: &[u8]) -> Result<()> {
         let program_hash = hash_blob(blob);
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let (tx, rx) = oneshot::channel();
@@ -378,7 +365,6 @@ impl Client {
             let msg = ClientMessage::UploadProgram {
                 corr_id: *corr_id_guard,
                 program_hash: program_hash.clone(),
-                manifest: manifest.to_string(),
                 chunk_index,
                 total_chunks,
                 chunk_data: blob[start..end].to_vec(),
@@ -397,22 +383,16 @@ impl Client {
         }
     }
 
-    /// Launches an instance of a program.
-    ///
-    /// The `inferlet` parameter can be:
-    /// - Full name with version: `std/text-completion@0.1.0`
-    /// - Without namespace (defaults to `std`): `text-completion@0.1.0`
-    /// - Without version (defaults to `latest`): `std/text-completion` or `text-completion`
     pub async fn launch_instance(
         &self,
-        inferlet: &str,
+        program_hash: String,
         arguments: Vec<String>,
         detached: bool,
     ) -> Result<Instance> {
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
         let msg = ClientMessage::LaunchInstance {
             corr_id: *corr_id_guard,
-            inferlet: inferlet.to_string(),
+            program_hash,
             arguments,
             detached,
         };

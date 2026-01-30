@@ -1,11 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 // use ring::rand::{SecureRandom, SystemRandom};
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use wasmtime::{Config as WasmConfig, Engine as WasmEngine};
 
 use crate::auth::AuthorizedUsers;
 use crate::kvs;
@@ -79,17 +78,7 @@ pub async fn run_server(
     // Generate a random 64-character string for internal client connection authentication.
     let internal_auth_token = crate::auth::generate_internal_auth_token()?;
 
-    // Create the Wasmtime engine (shared between runtime and server)
-    let mut wasm_config = WasmConfig::default();
-    wasm_config.async_support(true);
-
-    // TODO: Adjust settings later: https://docs.wasmtime.dev/api/wasmtime/struct.PoolingAllocationConfig.html
-    // let mut pooling_config = PoolingAllocationConfig::default();
-    // wasm_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
-    
-    let wasm_engine = WasmEngine::new(&wasm_config).unwrap();
-
-    runtime::start_service(wasm_engine.clone());
+    runtime::start_service(&config.cache_dir);
     server::start_service(
         &server_url,
         config.enable_auth,
@@ -97,7 +86,6 @@ pub async fn run_server(
         internal_auth_token.clone(),
         config.registry.clone(),
         config.cache_dir.clone(),
-        wasm_engine,
     );
     kvs::start_service();
     messaging::start_service();
@@ -187,3 +175,4 @@ fn init_tracing(
 
     Ok(())
 }
+

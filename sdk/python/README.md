@@ -7,42 +7,38 @@ Python SDK for writing Pie inferlets.
 From the pie repository root:
 
 ```bash
-cd sdk/python
+# Create and activate venv
+cd inferlet
 uv venv
 source .venv/bin/activate
 uv pip install -e ".[dev]"
-uv pip install -e ../tools/bakery
 
 # Verify
 componentize-py --version
-bakery --help
 ```
 
 ## Building Python Inferlets
 
-Activate the venv, then use Bakery to build inferlets:
+**Always activate the venv first:**
 
 ```bash
-# If needed, activate Python venv (e.g., sdk/python/.venv)
-# source .venv/bin/activate
+source /path/to/pie/inferlet/.venv/bin/activate
+```
 
-# Build inferlet
-bakery build "$PWD/<input>" -o "$PWD/<output.wasm>"
+Then build:
+
+```bash
+pie-cli build --python <input> -o <output.wasm>
 ```
 
 ### Example
 
 ```bash
-# From pie root
-bakery build "$PWD/sdk/examples/python/text-completion" \
-    -o "$PWD/text-completion.wasm"
-```
+# From pie root, with venv activated
+pie-cli build --python example-apps-py/text-completion -o text-completion.wasm
 
-## Run (Requires Pie Engine)
-
-When a Pie engine is running, submit the built inferlet:
-
-```bash
+# Run it (requires running Pie engine; check the README in the repo root)
+pie-cli ping    # Check engine is up
 pie-cli submit text-completion.wasm -- --prompt "What is Python?"
 ```
 
@@ -121,6 +117,5 @@ Python inferlets run in WASM. These are **not available**:
 Check compatibility:
 
 ```bash
-# With venv activated
 python scripts/validate_imports.py <your-app>/
 ```

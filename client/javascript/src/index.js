@@ -298,10 +298,9 @@ export class PieClient {
     /**
      * Uploads a program to the server in chunks.
      * @param {Uint8Array} programBytes The program content as a byte array.
-     * @param {string} manifest The manifest TOML content as a string.
      * @returns {Promise<void>}
      */
-    async uploadProgram(programBytes, manifest) {
+    async uploadProgram(programBytes) {
         const programHash = blake3(programBytes).toString('hex');
         const chunkSize = 256 * 1024; // 256 KiB, must match server
         const totalChunks = Math.ceil(programBytes.length / chunkSize);
@@ -319,7 +318,6 @@ export class PieClient {
                 type: "upload_program",
                 corr_id: corr_id,
                 program_hash: programHash,
-                manifest: manifest,
                 chunk_index: i,
                 total_chunks: totalChunks,
                 chunk_data: chunkData,
@@ -341,25 +339,11 @@ export class PieClient {
      * @param {string[]} [args=[]] Optional command-line arguments.
      * @returns {Promise<Instance>}
      */
-    /**
-     * Launches an instance of a program.
-     *
-     * The inferlet parameter can be:
-     * - Full name with version: "std/text-completion@0.1.0"
-     * - Without namespace (defaults to "std"): "text-completion@0.1.0"
-     * - Without version (defaults to "latest"): "std/text-completion" or "text-completion"
-     *
-     * @param {string} inferlet The inferlet name (e.g., "std/text-completion@0.1.0").
-     * @param {string[]} [args=[]] Optional command-line arguments.
-     * @param {boolean} [detached=false] If true, the instance runs in detached mode.
-     * @returns {Promise<Instance>}
-     */
-    async launchInstance(inferlet, args = [], detached = false) {
+    async launchInstance(programHash, args = []) {
         const msg = {
             type: "launch_instance",
-            inferlet: inferlet,
+            program_hash: programHash,
             arguments: args,
-            detached: detached,
         };
         const { successful, result } = await this._sendMsgAndWait(msg);
         if (successful) {
@@ -438,18 +422,15 @@ async function main() {
         // 1. Authenticate (if needed)
         // await client.authenticate("your-super-secret-jwt-token");
 
-        // 2. Upload a simple program with manifest
+        // 2. Upload a simple program
         const programCode = new TextEncoder().encode('print("Hello from JavaScript instance!")');
-        const manifest = `[package]
-name = "example/hello-world"
-version = "0.1.0"
-`;
-        await client.uploadProgram(programCode, manifest);
-        console.log(`[Example] Uploaded program: example/hello-world@0.1.0`);
+        await client.uploadProgram(programCode);
+        const programHash = blake3(programCode).toString('hex');
+        console.log(`[Example] Program hash: ${programHash}`);
 
-        // 3. Launch the instance using inferlet name
+        // 3. Launch the instance
         console.log("[Example] Launching instance...");
-        const instance = await client.launchInstance("example/hello-world@0.1.0");
+        const instance = await client.launchInstance(programHash);
         console.log(`[Example] Launched instance with ID: ${instance.instanceId}`);
 
         // 4. Wait for the instance to finish
