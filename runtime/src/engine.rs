@@ -1,14 +1,16 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 // use ring::rand::{SecureRandom, SystemRandom};
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use wasmtime::{Config as WasmConfig, Engine as WasmEngine};
 
 use crate::auth::AuthorizedUsers;
-use crate::kvs;
+use crate::legacy_kvs;
 use crate::messaging;
+use crate::legacy_messaging;
 use crate::runtime;
 use crate::server;
 use crate::telemetry::{self, TelemetryConfig};
@@ -78,17 +80,28 @@ pub async fn run_server(
     // Generate a random 64-character string for internal client connection authentication.
     let internal_auth_token = crate::auth::generate_internal_auth_token()?;
 
-    runtime::start_service(&config.cache_dir);
-    server::start_service(
-        &server_url,
-        config.enable_auth,
+    // Create the Wasmtime engine (shared between runtime and server)
+    let mut wasm_config = WasmConfig::default();
+    wasm_config.async_support(true);
+
+    // TODO: Adjust settings later: https://docs.wasmtime.dev/api/wasmtime/struct.PoolingAllocationConfig.html
+    // let mut pooling_config = PoolingAllocationConfig::default();
+    // wasm_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
+    
+    let wasm_engine = WasmEngine::new(&wasm_config).unwrap();
+
+    runtime::spawn(wasm_engine.clone());
+    server::spawn(server::ServerConfig {
+        ip_port: server_url,
+        enable_auth: config.enable_auth,
         authorized_users,
-        internal_auth_token.clone(),
-        config.registry.clone(),
-        config.cache_dir.clone(),
-    );
-    kvs::start_service();
-    messaging::start_service();
+        internal_auth_token: internal_auth_token.clone(),
+        registry_url: config.registry.clone(),
+        cache_dir: config.cache_dir.clone(),
+        wasm_engine,
+    });
+    legacy_kvs::start_service();
+    legacy_messaging::start_service();
 
     ready_tx.send(internal_auth_token).unwrap();
 
@@ -175,4 +188,3 @@ fn init_tracing(
 
     Ok(())
 }
-

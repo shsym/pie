@@ -1,22 +1,42 @@
-//! IPC bridge for cross-process Python communication.
+//! RPC backend for Python IPC communication.
 //!
 //! This module provides an async wrapper for IPC-based communication with
-//! Python worker processes in the symmetric worker architecture.
+//! Python worker processes.
 
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Backend for the IPC communication layer.
+/// This is a placeholder - will be connected to actual IPC implementation.
+#[derive(Clone, Debug)]
+pub struct IpcBackend {
+    // TODO: Connect to actual IPC implementation
+}
+
+impl IpcBackend {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub async fn call(&self, _method: &str, _payload: Vec<u8>) -> Result<Vec<u8>> {
+        // Placeholder - will be implemented with actual IPC
+        Ok(Vec::new())
+    }
+}
 
 /// Async IPC client for cross-process communication.
 ///
-/// Uses ipc-channel to communicate with Python processes in other PIDs.
-#[derive(Clone)]
-pub struct AsyncIpcClient {
-    backend: std::sync::Arc<crate::model::ffi_ipc::FfiIpcBackend>,
+/// Uses IPC to communicate with Python processes.
+#[derive(Clone, Debug)]
+pub struct RpcClient {
+    backend: Arc<IpcBackend>,
 }
 
-impl AsyncIpcClient {
-    /// Create a new IPC client from an FfiIpcBackend.
-    pub fn new(backend: std::sync::Arc<crate::model::ffi_ipc::FfiIpcBackend>) -> Self {
+impl RpcClient {
+    /// Create a new RPC client from an IPC backend.
+    pub fn new(backend: Arc<IpcBackend>) -> Self {
         Self { backend }
     }
     
@@ -52,7 +72,7 @@ impl AsyncIpcClient {
         &self,
         method: &str,
         args: &T,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> Result<R>
     where
         T: Serialize,
@@ -60,6 +80,6 @@ impl AsyncIpcClient {
     {
         tokio::time::timeout(timeout, self.call(method, args))
             .await
-            .map_err(|_| anyhow::anyhow!("IPC call timed out"))?
+            .map_err(|_| anyhow::anyhow!("RPC call timed out"))?
     }
 }

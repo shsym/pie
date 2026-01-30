@@ -5,7 +5,7 @@
 
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;
 use anyhow::Result;
@@ -215,7 +215,7 @@ impl Context {
 /// This is the core business logic, separate from the actor message handling.
 #[derive(Debug)]
 pub struct ContextService {
-    pub page_store: PageStore,
+    pub page_store: Arc<RwLock<PageStore>>,
     contexts: DashMap<ContextId, Context>,
     name_to_id: DashMap<(u32, String), ContextId>,
     next_id: AtomicU64,
@@ -223,9 +223,9 @@ pub struct ContextService {
 }
 
 impl ContextService {
-    pub fn new(page_size: usize) -> Self {
+    pub fn new(page_store: Arc<RwLock<PageStore>>, page_size: usize) -> Self {
         ContextService {
-            page_store: PageStore::new(page_size),
+            page_store,
             contexts: DashMap::new(),
             name_to_id: DashMap::new(),
             next_id: AtomicU64::new(1),
@@ -252,15 +252,17 @@ impl ContextService {
                 mask: Vec::new(),
             });
 
+            let mut page_store = self.page_store.write().unwrap();
+            
             // Lookup existing cached pages (longest prefix match)
-            let matched_pages = self.page_store.lookup(&tokens);
+            let matched_pages = page_store.lookup(&tokens);
             
             if let Some(pages) = matched_pages {
                 // Calculate how many tokens are covered by matched pages
-                let tokens_matched = pages.len() * self.page_store.page_size();
+                let tokens_matched = pages.len() * page_store.page_size();
                 
                 // Acquire refcount for matched pages
-                self.page_store.acquire(&pages);
+                page_store.acquire(&pages);
                 
                 // Place matched pages in pages_committed
                 ctx.pages_committed = pages.clone();
@@ -271,12 +273,12 @@ impl ContextService {
                 // Remaining tokens become tokens_uncommitted
                 if tokens_matched < tokens.len() {
                     let remaining_tokens = tokens.len() - tokens_matched;
-                    let page_size = self.page_store.page_size();
+                    let page_size = page_store.page_size();
                     let pages_needed = (remaining_tokens + page_size - 1) / page_size;
                     
                     // Allocate uncommitted pages
                     let affinity = pages.first().copied();
-                    ctx.pages_uncommitted = self.page_store.allocate(pages_needed, affinity)?;
+                    ctx.pages_uncommitted = page_store.allocate(pages_needed, affinity)?;
                     
                     ctx.tokens_uncommitted = tokens[tokens_matched..]
                         .iter()
@@ -290,12 +292,12 @@ impl ContextService {
                 }
             } else {
                 // No match: all tokens become tokens_uncommitted
-                let page_size = self.page_store.page_size();
+                let page_size = page_store.page_size();
                 let pages_needed = (tokens.len() + page_size - 1) / page_size;
                 
                 // Allocate uncommitted pages (no affinity)
                 if pages_needed > 0 {
-                    ctx.pages_uncommitted = self.page_store.allocate(pages_needed, None)?;
+                    ctx.pages_uncommitted = page_store.allocate(pages_needed, None)?;
                 }
                 
                 ctx.tokens_uncommitted = tokens
@@ -354,18 +356,20 @@ impl ContextService {
         
         drop(source_ctx); // Release the borrow
 
+        let mut page_store = self.page_store.write().unwrap();
+        
         // Increase refcount for committed pages
-        self.page_store.acquire(&pages_committed);
+        page_store.acquire(&pages_committed);
 
         // Allocate new uncommitted pages
         let new_uncommitted = if num_uncommitted > 0 {
-            self.page_store.allocate(num_uncommitted, affinity)?
+            page_store.allocate(num_uncommitted, affinity)?
         } else {
             Vec::new()
         };
 
         // Calculate pointer
-        let pointer = pages_committed.len() * self.page_store.page_size();
+        let pointer = pages_committed.len() * page_store.page_size();
 
         // Create the new context
         let new_id = self.next_id();
@@ -455,9 +459,27 @@ impl ContextService {
         }
     }
 
-    pub fn get_physical_page_ids(&self, _id: ContextId) -> HashMap<NodeId, Vec<PhysicalPageId>> {
-        // TODO: Implement physical page ID retrieval from PageStore
-        HashMap::new()
+    pub fn get_physical_page_ids(&self, id: ContextId) -> HashMap<NodeId, Vec<PhysicalPageId>> {
+        let mut result: HashMap<NodeId, Vec<PhysicalPageId>> = HashMap::new();
+        
+        if let Some(ctx) = self.contexts.get(&id) {
+            let page_store = self.page_store.read().unwrap();
+            
+            // Get all committed pages and collect their physical mappings
+            for &page_id in &ctx.pages_committed {
+                for (node_id, phys_id) in page_store.get_physical_mappings(page_id) {
+                    result.entry(node_id).or_default().push(phys_id);
+                }
+            }
+            // Also include uncommitted pages
+            for &page_id in &ctx.pages_uncommitted {
+                for (node_id, phys_id) in page_store.get_physical_mappings(page_id) {
+                    result.entry(node_id).or_default().push(phys_id);
+                }
+            }
+        }
+        
+        result
     }
 
     // ==================== Page Management ====================
@@ -479,7 +501,7 @@ impl ContextService {
         drop(ctx);
         
         // Allocate pages from page store
-        let new_pages = self.page_store.allocate(num_pages as usize, affinity)?;
+        let new_pages = self.page_store.write().unwrap().allocate(num_pages as usize, affinity)?;
         
         // Add to uncommitted pages
         let mut ctx = self.contexts.get_mut(&id)
@@ -521,13 +543,13 @@ impl ContextService {
         drop(ctx);
         
         // Release pages back to page store
-        self.page_store.release(&pages_to_free);
+        self.page_store.write().unwrap().release(&pages_to_free);
         
         Ok(())
     }
 
     pub fn commit_pages(&mut self, id: ContextId, lock_id: LockId, indices: Vec<u32>) -> Result<()> {
-        let page_size = self.page_store.page_size();
+        let page_size = self.page_size;
         
         let mut ctx = self.contexts.get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
@@ -635,7 +657,7 @@ impl ContextService {
         drop(ctx); // Release borrow for page_store access
 
         // Commit to page store
-        let (final_page_ids, final_hash) = self.page_store.commit(
+        let (final_page_ids, final_hash) = self.page_store.write().unwrap().commit(
             &pages_to_commit,
             &tokens_to_commit,
             &positions_to_commit,
@@ -688,85 +710,87 @@ impl ContextService {
 /// The context actor wraps ContextService for async message handling.
 #[derive(Debug)]
 struct ContextActor {
-    manager: ContextService,
+    service: ContextService,
 }
 
 impl Handle for ContextActor {
     type Message = Message;
 
     fn new() -> Self {
+        let page_size = 64; // Default page size
+        let page_store = Arc::new(RwLock::new(PageStore::new(page_size)));
         ContextActor {
-            manager: ContextService::new(64), // Default page size
+            service: ContextService::new(page_store, page_size),
         }
     }
 
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::Create { user_id, name, fill, response } => {
-                let result = self.manager.create(user_id, name, fill);
+                let result = self.service.create(user_id, name, fill);
                 let _ = response.send(result);
             }
             Message::Destroy { id, lock_id, response } => {
-                let result = self.manager.destroy(id, lock_id);
+                let result = self.service.destroy(id, lock_id);
                 let _ = response.send(result);
             }
             Message::Get { user_id, name, response } => {
-                let id = self.manager.get(user_id, name);
+                let id = self.service.get(user_id, name);
                 let _ = response.send(id);
             }
             Message::Fork { id, user_id, new_name, response } => {
-                let result = self.manager.fork(id, user_id, new_name);
+                let result = self.service.fork(id, user_id, new_name);
                 let _ = response.send(result);
             }
             Message::Lock { id, response } => {
-                let lock_id = self.manager.lock(id);
+                let lock_id = self.service.lock(id);
                 let _ = response.send(lock_id);
             }
             Message::Unlock { id, lock_id } => {
-                self.manager.unlock(id, lock_id);
+                self.service.unlock(id, lock_id);
             }
             Message::PageSize { id: _, response } => {
-                let size = self.manager.page_size();
+                let size = self.service.page_size();
                 let _ = response.send(size);
             }
             Message::NumTotalPages { id, response } => {
-                let count = self.manager.num_total_pages(id);
+                let count = self.service.num_total_pages(id);
                 let _ = response.send(count);
             }
             Message::NumTotalTokens { id, lock_id: _, response } => {
-                let count = self.manager.num_total_tokens(id);
+                let count = self.service.num_total_tokens(id);
                 let _ = response.send(count);
             }
             Message::CommitPages { id, lock_id, indices, response } => {
-                let result = self.manager.commit_pages(id, lock_id, indices);
+                let result = self.service.commit_pages(id, lock_id, indices);
                 let _ = response.send(result);
             }
             Message::AllocatePages { id, lock_id, num_pages, response } => {
-                let result = self.manager.allocate_pages(id, lock_id, num_pages);
+                let result = self.service.allocate_pages(id, lock_id, num_pages);
                 let _ = response.send(result);
             }
             Message::FreePages { id, lock_id, num_pages, response } => {
-                let result = self.manager.free_pages(id, lock_id, num_pages);
+                let result = self.service.free_pages(id, lock_id, num_pages);
                 let _ = response.send(result);
             }
             Message::GetPointer { id, lock_id: _, response } => {
-                let pointer = self.manager.get_pointer(id);
+                let pointer = self.service.get_pointer(id);
                 let _ = response.send(pointer);
             }
             Message::SetPointer { id, lock_id: _, pointer, response } => {
-                let result = self.manager.set_pointer(id, pointer);
+                let result = self.service.set_pointer(id, pointer);
                 let _ = response.send(result);
             }
             Message::GetUncommittedTokens { id, lock_id: _, response } => {
-                let tokens = self.manager.get_uncommitted_tokens(id);
+                let tokens = self.service.get_uncommitted_tokens(id);
                 let _ = response.send(tokens);
             }
             Message::SetUncommittedTokens { id, lock_id: _, tokens, response } => {
-                let result = self.manager.set_uncommitted_tokens(id, tokens);
+                let result = self.service.set_uncommitted_tokens(id, tokens);
                 let _ = response.send(result);
             }
             Message::GetPhysicalPageIds { id, lock_id: _, response } => {
-                let page_ids = self.manager.get_physical_page_ids(id);
+                let page_ids = self.service.get_physical_page_ids(id);
                 let _ = response.send(page_ids);
             }
         }
