@@ -361,6 +361,10 @@ def launch_instance(
 ) -> Instance:
     """Launch an instance (sync wrapper).
 
+    This function performs a two-level search for the inferlet:
+    1. First, it searches for the program among client-uploaded programs.
+    2. If not found, it falls back to searching the registry.
+
     The inferlet parameter can be:
     - Full name with version: "std/text-completion@0.1.0"
     - Without namespace (defaults to "std"): "text-completion@0.1.0"
@@ -377,7 +381,11 @@ def launch_instance_from_registry(
     arguments: list[str],
     detached: bool = False,
 ) -> Instance:
-    """Launch an instance from the registry (sync wrapper).
+    """Launch an instance from the registry only (sync wrapper).
+
+    Unlike `launch_instance`, this function searches only the registry and does not
+    check client-uploaded programs. Use this when you explicitly want to launch
+    an inferlet from the registry.
 
     The inferlet parameter can be:
     - Full name with version: "std/text-completion@0.1.0"

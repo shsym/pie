@@ -344,6 +344,10 @@ export class PieClient {
     /**
      * Launches an instance of a program.
      *
+     * This method performs a two-level search for the inferlet:
+     * 1. First, it searches for the program among client-uploaded programs.
+     * 2. If not found, it falls back to searching the registry.
+     *
      * The inferlet parameter can be:
      * - Full name with version: "std/text-completion@0.1.0"
      * - Without namespace (defaults to "std"): "text-completion@0.1.0"
@@ -372,7 +376,11 @@ export class PieClient {
     }
 
     /**
-     * Launches an instance from an inferlet in the registry.
+     * Launches an instance from an inferlet in the registry only.
+     *
+     * Unlike `launchInstance`, this method searches only the registry and does not
+     * check client-uploaded programs. Use this when you explicitly want to launch
+     * an inferlet from the registry.
      * 
      * The inferlet parameter can be:
      * - Full name with version: "std/text-completion@0.1.0"
