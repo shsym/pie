@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use pie_client::message::{self, ClientMessage, EventCode, ServerMessage, StreamingOutput};
 use ring::rand::{SecureRandom, SystemRandom};
+use std::collections::HashSet;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -166,7 +167,9 @@ struct ProgramMetadata {
     /// Path to the WASM binary file
     wasm_path: PathBuf,
     /// Blake3 hash of the WASM binary
-    hash: String,
+    wasm_hash: String,
+    /// Blake3 hash of the TOML manifest
+    toml_hash: String,
     /// Dependencies of this inferlet
     dependencies: Vec<ProgramName>,
 }
@@ -826,8 +829,8 @@ impl Session {
     async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
         match subject.as_str() {
             message::QUERY_PROGRAM_EXISTS => {
-                // Parse the record as "namespace/name@version" or "namespace/name@version#hash"
-                let (inferlet_part, hash) = if let Some(idx) = record.find('#') {
+                // Parse the record as "namespace/name@version" or "namespace/name@version#wasm_hash+toml_hash"
+                let (inferlet_part, hashes) = if let Some(idx) = record.find('#') {
                     let (inferlet, hash_part) = record.split_at(idx);
                     (inferlet.to_string(), Some(hash_part[1..].to_string()))
                 } else {
@@ -835,34 +838,29 @@ impl Session {
                 };
                 let program_name = ProgramName::parse(&inferlet_part);
 
-                // Check only uploaded programs (not registry programs)
-                let program_exists = self
+                // Check only uploaded programs (not registry programs) and get metadata
+                let program_metadata = self
                     .state
                     .uploaded_programs_in_disk
-                    .contains_key(&program_name);
+                    .get(&program_name)
+                    .map(|entry| entry.value().clone());
 
-                // If hash is provided, verify it matches
-                let result = if program_exists && hash.is_some() {
-                    let expected_hash = hash.unwrap();
-                    // Read the stored hash from the .hash file (uploads location only)
-                    let hash_file_path = self
-                        .state
-                        .cache_dir
-                        .join("programs")
-                        .join(&program_name.namespace)
-                        .join(&program_name.name)
-                        .join(format!("{}.hash", program_name.version));
-
-                    let stored_hash = tokio::fs::read_to_string(&hash_file_path).await;
-
-                    if let Ok(hash_content) = stored_hash {
-                        hash_content.trim() == expected_hash
-                    } else {
-                        // If we can't read the hash file, consider it a mismatch
-                        false
+                // If hashes are provided, verify they match (format: "wasm_hash+toml_hash")
+                let result = match (&program_metadata, hashes) {
+                    (Some(metadata), Some(hash_str)) => {
+                        // Parse the hash string as "wasm_hash+toml_hash"
+                        if let Some(plus_idx) = hash_str.find('+') {
+                            let (expected_wasm_hash, toml_part) = hash_str.split_at(plus_idx);
+                            let expected_toml_hash = &toml_part[1..];
+                            metadata.wasm_hash == expected_wasm_hash
+                                && metadata.toml_hash == expected_toml_hash
+                        } else {
+                            // Invalid format: '+' separator required
+                            false
+                        }
                     }
-                } else {
-                    program_exists
+                    (Some(_), None) => true, // Program exists, no hash verification needed
+                    (None, _) => false,      // Program doesn't exist
                 };
 
                 self.send_response(corr_id, true, result.to_string()).await;
@@ -1029,9 +1027,13 @@ impl Session {
 
             let wasm_file_path = dir_path.join(format!("{}.wasm", program_name.version));
             let manifest_file_path = dir_path.join(format!("{}.toml", program_name.version));
-            let hash_file_path = dir_path.join(format!("{}.hash", program_name.version));
+            let wasm_hash_file_path = dir_path.join(format!("{}.wasm_hash", program_name.version));
+            let toml_hash_file_path = dir_path.join(format!("{}.toml_hash", program_name.version));
 
             let raw_bytes = mem::take(&mut inflight.buffer);
+            let toml_hash = blake3::hash(manifest_content.as_bytes())
+                .to_hex()
+                .to_string();
 
             if let Err(e) = tokio::fs::write(&wasm_file_path, &raw_bytes).await {
                 self.send_response(corr_id, false, format!("Failed to write WASM file: {}", e))
@@ -1049,9 +1051,23 @@ impl Session {
                 self.inflight_program_upload = None;
                 return;
             }
-            if let Err(e) = tokio::fs::write(&hash_file_path, &final_hash).await {
-                self.send_response(corr_id, false, format!("Failed to write hash file: {}", e))
-                    .await;
+            if let Err(e) = tokio::fs::write(&wasm_hash_file_path, &final_hash).await {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!("Failed to write WASM hash file: {}", e),
+                )
+                .await;
+                self.inflight_program_upload = None;
+                return;
+            }
+            if let Err(e) = tokio::fs::write(&toml_hash_file_path, &toml_hash).await {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!("Failed to write TOML hash file: {}", e),
+                )
+                .await;
                 self.inflight_program_upload = None;
                 return;
             }
@@ -1061,7 +1077,8 @@ impl Session {
                 program_name,
                 ProgramMetadata {
                     wasm_path: wasm_file_path.clone(),
-                    hash: final_hash.clone(),
+                    wasm_hash: final_hash.clone(),
+                    toml_hash,
                     dependencies,
                 },
             );
@@ -1089,6 +1106,7 @@ impl Session {
             if let Err(e) = ensure_program_loaded_with_dependencies(
                 &self.state.wasm_engine,
                 &program_metadata,
+                &program_name,
                 &self.state.uploaded_programs_in_disk,
                 &self.state.registry_programs_in_disk,
                 &self.state.registry_url,
@@ -1103,7 +1121,8 @@ impl Session {
             // Launch the instance
             self.launch_instance_from_loaded_program(
                 corr_id,
-                program_metadata.hash,
+                program_metadata.wasm_hash,
+                program_metadata.toml_hash,
                 arguments,
                 detached,
             )
@@ -1155,6 +1174,7 @@ impl Session {
         if let Err(e) = ensure_program_loaded_with_dependencies(
             &self.state.wasm_engine,
             &program_metadata,
+            &program_name,
             &self.state.uploaded_programs_in_disk,
             &self.state.registry_programs_in_disk,
             &self.state.registry_url,
@@ -1169,7 +1189,8 @@ impl Session {
         // Launch the instance
         self.launch_instance_from_loaded_program(
             corr_id,
-            program_metadata.hash,
+            program_metadata.wasm_hash,
+            program_metadata.toml_hash,
             arguments,
             detached,
         )
@@ -1180,14 +1201,16 @@ impl Session {
     async fn launch_instance_from_loaded_program(
         &mut self,
         corr_id: u32,
-        hash: String,
+        wasm_hash: String,
+        toml_hash: String,
         arguments: Vec<String>,
         detached: bool,
     ) {
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchInstance {
             username: self.username.clone(),
-            hash,
+            wasm_hash,
+            toml_hash,
             arguments,
             detached,
             event: evt_tx,
@@ -1338,6 +1361,7 @@ impl Session {
             if let Err(e) = ensure_program_loaded_with_dependencies(
                 &self.state.wasm_engine,
                 &program_metadata,
+                &program_name,
                 &self.state.uploaded_programs_in_disk,
                 &self.state.registry_programs_in_disk,
                 &self.state.registry_url,
@@ -1352,7 +1376,8 @@ impl Session {
             let (evt_tx, evt_rx) = oneshot::channel();
             runtime::Command::LaunchServerInstance {
                 username: self.username.clone(),
-                hash: program_metadata.hash,
+                wasm_hash: program_metadata.wasm_hash,
+                toml_hash: program_metadata.toml_hash,
                 port,
                 arguments,
                 event: evt_tx,
@@ -1642,11 +1667,18 @@ fn load_programs_from_dir(dir: &Path, programs_in_disk: &DashMap<ProgramName, Pr
                         None => continue,
                     };
 
-                    // Read the hash from the corresponding .hash file
-                    let hash_path = file_path.with_extension("hash");
-                    let hash = match std::fs::read_to_string(&hash_path) {
+                    // Read the hash from the corresponding .wasm_hash file
+                    let wasm_hash_path = file_path.with_extension("wasm_hash");
+                    let wasm_hash = match std::fs::read_to_string(&wasm_hash_path) {
                         Ok(h) => h.trim().to_string(),
-                        Err(_) => continue, // Skip programs without a hash file
+                        Err(_) => continue, // Skip programs without a WASM hash file
+                    };
+
+                    // Read the hash from the corresponding .toml_hash file
+                    let toml_hash_path = file_path.with_extension("toml_hash");
+                    let toml_hash = match std::fs::read_to_string(&toml_hash_path) {
+                        Ok(h) => h.trim().to_string(),
+                        Err(_) => continue, // Skip programs without a TOML hash file
                     };
 
                     // Read and parse the manifest to extract dependencies
@@ -1667,7 +1699,8 @@ fn load_programs_from_dir(dir: &Path, programs_in_disk: &DashMap<ProgramName, Pr
                         program_name,
                         ProgramMetadata {
                             wasm_path: file_path,
-                            hash,
+                            wasm_hash,
+                            toml_hash,
                             dependencies,
                         },
                     );
@@ -1772,88 +1805,135 @@ async fn compile_wasm_component(engine: &WasmEngine, wasm_bytes: Vec<u8>) -> Res
 async fn ensure_program_loaded_with_dependencies(
     wasm_engine: &WasmEngine,
     program_metadata: &ProgramMetadata,
+    program_name: &ProgramName,
     uploaded_programs: &DashMap<ProgramName, ProgramMetadata>,
     registry_programs: &DashMap<ProgramName, ProgramMetadata>,
     registry_url: &str,
     cache_dir: &Path,
 ) -> Result<(), String> {
-    // Check if the program is already loaded in memory
-    let (loaded_tx, loaded_rx) = oneshot::channel();
-    runtime::Command::ProgramLoaded {
-        hash: program_metadata.hash.clone(),
-        event: loaded_tx,
-    }
-    .dispatch();
+    let mut visited = HashSet::new();
+    return recur_ensure_program_loaded_with_dependencies(
+        wasm_engine,
+        program_metadata,
+        program_name,
+        uploaded_programs,
+        registry_programs,
+        registry_url,
+        cache_dir,
+        &mut visited,
+    )
+    .await;
 
-    let is_loaded = loaded_rx.await.unwrap();
+    // Inner recursive helper function.
+    // The `visited` set is used to detect dependency cycles. It tracks which programs are currently
+    // being processed in the call stack. If a program is encountered that's already in the visited set,
+    // a cycle has been detected.
+    async fn recur_ensure_program_loaded_with_dependencies(
+        wasm_engine: &WasmEngine,
+        program_metadata: &ProgramMetadata,
+        program_name: &ProgramName,
+        uploaded_programs: &DashMap<ProgramName, ProgramMetadata>,
+        registry_programs: &DashMap<ProgramName, ProgramMetadata>,
+        registry_url: &str,
+        cache_dir: &Path,
+        visited: &mut HashSet<ProgramName>,
+    ) -> Result<(), String> {
+        // Check for dependency cycle
+        if visited.contains(program_name) {
+            return Err(format!(
+                "Dependency cycle detected: {}/{}@{}",
+                program_name.namespace, program_name.name, program_name.version
+            ));
+        }
 
-    // If already loaded, dependencies are guaranteed to be loaded (invariant)
-    if is_loaded {
-        return Ok(());
-    }
+        // Check if the program is already loaded in memory
+        let (loaded_tx, loaded_rx) = oneshot::channel();
+        runtime::Command::ProgramLoaded {
+            wasm_hash: program_metadata.wasm_hash.clone(),
+            toml_hash: program_metadata.toml_hash.clone(),
+            event: loaded_tx,
+        }
+        .dispatch();
 
-    // First, recursively ensure all dependencies are loaded
-    for dep_name in &program_metadata.dependencies {
-        // Look up the dependency in uploaded programs first, then registry programs,
-        // and download from registry if not found
-        let dep_metadata = if let Some(entry) = uploaded_programs.get(dep_name) {
-            entry.value().clone()
-        } else if let Some(entry) = registry_programs.get(dep_name) {
-            entry.value().clone()
-        } else {
-            // Download from registry
-            try_download_inferlet_from_registry(
+        let is_loaded = loaded_rx.await.unwrap();
+
+        // If already loaded, dependencies are guaranteed to be loaded (invariant)
+        if is_loaded {
+            return Ok(());
+        }
+
+        // Mark this program as being visited (in the current recursion stack)
+        visited.insert(program_name.clone());
+
+        // First, recursively ensure all dependencies are loaded
+        for dep_name in &program_metadata.dependencies {
+            // Look up the dependency in uploaded programs first, then registry programs,
+            // and download from registry if not found
+            let dep_metadata = if let Some(entry) = uploaded_programs.get(dep_name) {
+                entry.value().clone()
+            } else if let Some(entry) = registry_programs.get(dep_name) {
+                entry.value().clone()
+            } else {
+                // Download from registry
+                try_download_inferlet_from_registry(
+                    registry_url,
+                    cache_dir,
+                    dep_name,
+                    registry_programs,
+                )
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to resolve dependency {}/{}@{}. It was not uploaded nor found in the registry ({})",
+                        dep_name.namespace, dep_name.name, dep_name.version, e
+                    )
+                })?
+            };
+
+            // Recursively ensure the dependency and its dependencies are loaded
+            Box::pin(recur_ensure_program_loaded_with_dependencies(
+                wasm_engine,
+                &dep_metadata,
+                dep_name,
+                uploaded_programs,
+                registry_programs,
                 registry_url,
                 cache_dir,
-                dep_name,
-                registry_programs,
-            )
+                visited,
+            ))
+            .await?;
+        }
+
+        // Remove from visited set after processing dependencies (no longer in current recursion path)
+        visited.remove(program_name);
+
+        // Now load the current program (dependencies are already loaded)
+        let raw_bytes = tokio::fs::read(&program_metadata.wasm_path)
             .await
             .map_err(|e| {
                 format!(
-                    "Failed to resolve dependency {}/{}@{}. It was not uploaded nor found in the registry ({})",
-                    dep_name.namespace, dep_name.name, dep_name.version, e
+                    "Failed to read program from disk at {:?}: {}",
+                    program_metadata.wasm_path, e
                 )
-            })?
-        };
+            })?;
 
-        // Recursively ensure the dependency and its dependencies are loaded
-        Box::pin(ensure_program_loaded_with_dependencies(
-            wasm_engine,
-            &dep_metadata,
-            uploaded_programs,
-            registry_programs,
-            registry_url,
-            cache_dir,
-        ))
-        .await?;
+        let component = compile_wasm_component(wasm_engine, raw_bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let (load_tx, load_rx) = oneshot::channel();
+        runtime::Command::LoadProgram {
+            wasm_hash: program_metadata.wasm_hash.clone(),
+            toml_hash: program_metadata.toml_hash.clone(),
+            component,
+            event: load_tx,
+        }
+        .dispatch();
+
+        load_rx.await.unwrap();
+
+        Ok(())
     }
-
-    // Now load the current program (dependencies are already loaded)
-    let raw_bytes = tokio::fs::read(&program_metadata.wasm_path)
-        .await
-        .map_err(|e| {
-            format!(
-                "Failed to read program from disk at {:?}: {}",
-                program_metadata.wasm_path, e
-            )
-        })?;
-
-    let component = compile_wasm_component(wasm_engine, raw_bytes)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let (load_tx, load_rx) = oneshot::channel();
-    runtime::Command::LoadProgram {
-        hash: program_metadata.hash.clone(),
-        component,
-        event: load_tx,
-    }
-    .dispatch();
-
-    load_rx.await.unwrap();
-
-    Ok(())
 }
 
 /// Downloads an inferlet from the registry, with local caching.
@@ -1876,11 +1956,13 @@ async fn try_download_inferlet_from_registry(
     // Build the cache paths:
     // - Wasm binary: {cache_dir}/registry/{namespace}/{name}/{version}.wasm
     // - Manifest: {cache_dir}/registry/{namespace}/{name}/{version}.toml
-    // - Hash: {cache_dir}/registry/{namespace}/{name}/{version}.hash
+    // - Wasm hash: {cache_dir}/registry/{namespace}/{name}/{version}.wasm_hash
+    // - Toml hash: {cache_dir}/registry/{namespace}/{name}/{version}.toml_hash
     let cache_base = cache_dir.join("registry").join(namespace).join(name);
     let wasm_path = cache_base.join(format!("{}.wasm", version));
     let manifest_path = cache_base.join(format!("{}.toml", version));
-    let hash_path = cache_base.join(format!("{}.hash", version));
+    let wasm_hash_path = cache_base.join(format!("{}.wasm_hash", version));
+    let toml_hash_path = cache_base.join(format!("{}.toml_hash", version));
 
     // Build the download URLs
     let base_url = registry_url.trim_end_matches('/');
@@ -1975,7 +2057,8 @@ async fn try_download_inferlet_from_registry(
         .await
         .map_err(|e| anyhow!("Failed to read manifest data: {}", e))?;
 
-    let hash = blake3::hash(&wasm_data).to_hex().to_string();
+    let wasm_hash = blake3::hash(&wasm_data).to_hex().to_string();
+    let toml_hash = blake3::hash(manifest_data.as_bytes()).to_hex().to_string();
 
     // Cache the downloaded files
     tokio::fs::create_dir_all(&cache_base)
@@ -1990,9 +2073,13 @@ async fn try_download_inferlet_from_registry(
         .await
         .map_err(|e| anyhow!("Failed to cache manifest at {:?}: {}", manifest_path, e))?;
 
-    tokio::fs::write(&hash_path, &hash)
+    tokio::fs::write(&wasm_hash_path, &wasm_hash)
         .await
-        .map_err(|e| anyhow!("Failed to cache hash at {:?}: {}", hash_path, e))?;
+        .map_err(|e| anyhow!("Failed to cache WASM hash at {:?}: {}", wasm_hash_path, e))?;
+
+    tokio::fs::write(&toml_hash_path, &toml_hash)
+        .await
+        .map_err(|e| anyhow!("Failed to cache TOML hash at {:?}: {}", toml_hash_path, e))?;
 
     tracing::info!(
         "Cached inferlet {}/{} @ {} to {:?} (hash: {})",
@@ -2000,14 +2087,15 @@ async fn try_download_inferlet_from_registry(
         name,
         version,
         wasm_path,
-        hash
+        wasm_hash
     );
 
     // Parse dependencies and create metadata
     let dependencies = parse_program_dependencies_from_manifest(&manifest_data);
     let metadata = ProgramMetadata {
         wasm_path,
-        hash,
+        wasm_hash,
+        toml_hash,
         dependencies,
     };
     registry_programs_in_disk.insert(program_name.clone(), metadata.clone());
