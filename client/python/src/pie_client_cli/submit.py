@@ -206,13 +206,12 @@ def handle_submit_command(
             else:
                 final_blob = inferlet_blob
 
-            # Calculate the hashes of the WASM blob and TOML manifest
-            wasm_hash = blake3.blake3(final_blob).hexdigest()
-            toml_hash = blake3.blake3(manifest_content.encode()).hexdigest()
+            # Calculate the hash of the final blob
+            program_hash = blake3.blake3(final_blob).hexdigest()
             inferlet_name = f"{namespace}/{name}@{version}"
 
-            # Upload the composed inferlet to the server (check both name and hashes match)
-            if not engine.program_exists(client, inferlet_name, wasm_hash, toml_hash):
+            # Upload the composed inferlet to the server (check both name and hash match)
+            if not engine.program_exists(client, inferlet_name, program_hash):
                 engine.upload_program(client, final_blob, manifest_content)
                 typer.echo("✅ Inferlet upload successful.")
             else:

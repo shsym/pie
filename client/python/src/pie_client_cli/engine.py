@@ -335,12 +335,7 @@ def upload_program(client: PieClient, program_bytes: bytes, manifest: str) -> No
     )
 
 
-def program_exists(
-    client: PieClient,
-    inferlet: str,
-    wasm_hash: str | None = None,
-    toml_hash: str | None = None,
-) -> bool:
+def program_exists(client: PieClient, inferlet: str, hash: str | None = None) -> bool:
     """Check if a program exists (sync wrapper).
 
     The inferlet parameter can be:
@@ -351,12 +346,10 @@ def program_exists(
     Args:
         client: The Pie client.
         inferlet: The inferlet name (e.g., "std/text-completion@0.1.0").
-        wasm_hash: Optional WASM binary hash to verify.
-        toml_hash: Optional TOML manifest hash to verify.
-            If hashes are provided, both must be specified together.
+        hash: Optional hash to verify. If provided, also checks that the stored hash matches.
     """
     return asyncio.get_event_loop().run_until_complete(
-        client.program_exists(inferlet, wasm_hash, toml_hash)
+        client.program_exists(inferlet, hash)
     )
 
 
