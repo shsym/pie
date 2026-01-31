@@ -2,29 +2,19 @@
 //!
 //! This crate provides the core runtime for the Pie inference engine.
 //! It exposes functionality via PyO3 bindings for integration with Python.
+
 // Public modules (core engine logic)
-pub mod actor;
-pub mod legacy_service;
-pub mod adapter;
 pub mod api;
-pub mod legacy_api;
 pub mod auth;
-pub mod brle;
-pub mod context;
 pub mod dummy;
 pub mod engine;
-pub mod inference;
 pub mod instance;
-pub mod kvcache;
-pub mod legacy_kvs;
+pub mod kvs;
 pub mod messaging;
-pub mod legacy_messaging;
-pub mod legacy_model;
 pub mod model;
 pub mod runtime;
-pub mod legacy_runtime;
 pub mod server;
-pub mod legacy_server;
+pub mod service;
 pub mod telemetry;
 pub mod utils;
 
