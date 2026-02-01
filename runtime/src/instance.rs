@@ -1,4 +1,6 @@
+use super::api::core::Queue;
 use super::utils;
+use crate::model::resource::{ResourceId, ResourceTypeId};
 use crate::server::InstanceEvent;
 use anyhow::{Result, format_err};
 use bytes::Bytes;
@@ -12,7 +14,7 @@ use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 use tokio::sync::Notify;
 use uuid::Uuid;
-use wasmtime::component::ResourceTable;
+use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::async_trait;
 use wasmtime_wasi::cli::IsTerminal;
 use wasmtime_wasi::cli::StdoutStream;
@@ -21,11 +23,6 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 pub type InstanceId = Uuid;
-
-/// Resource identifier (typically a u32 handle)
-pub type ResourceId = u32;
-/// Resource type identifier for categorizing resources
-pub type ResourceTypeId = u32;
 
 /// Controller for controlling the output delivery mode of a running instance
 #[derive(Clone)]
@@ -184,10 +181,6 @@ impl InstanceState {
         self.id
     }
 
-    pub fn get_username(&self) -> String {
-        self.username.clone()
-    }
-
     pub fn arguments(&self) -> &[String] {
         &self.arguments
     }
@@ -196,6 +189,10 @@ impl InstanceState {
         self.return_value.clone()
     }
 
+    pub fn read_queue(&self, queue: &Resource<Queue>) -> Result<(usize, u32, u32)> {
+        let q = self.resource_table.get(&queue)?;
+        Ok((q.service_id, q.uid, q.priority))
+    }
     pub fn map_resources(
         &mut self,
         service_id: usize,

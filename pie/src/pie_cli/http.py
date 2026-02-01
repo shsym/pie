@@ -177,10 +177,10 @@ def _launch_server_inferlet(
             program_bytes = path.read_bytes()
             program_hash = blake3.blake3(program_bytes).hexdigest()
 
-            # Upload if needed
+            # Install if needed
             if not await client.program_exists(program_hash):
-                console.print(f"[dim]Uploading {path.name}...[/dim]")
-                await client.upload_program(program_bytes)
+                console.print(f"[dim]Installing {path.name}...[/dim]")
+                await client.install_program(program_bytes)
 
             # Launch as server instance
             console.print(f"[dim]Starting server on port {port}...[/dim]")
