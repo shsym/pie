@@ -365,8 +365,8 @@ impl Client {
                 let manifest_content = fs::read_to_string(manifest_p)
                     .with_context(|| format!("Failed to read manifest file: {:?}", manifest_p))?;
                 let wasm_hash = hash_blob(&wasm_bytes);
-                let toml_hash = hash_blob(manifest_content.as_bytes());
-                format!("{}#{}+{}", inferlet, wasm_hash, toml_hash)
+                let manifest_hash = hash_blob(manifest_content.as_bytes());
+                format!("{}#{}+{}", inferlet, wasm_hash, manifest_hash)
             }
             (None, None) => inferlet.to_string(),
             _ => anyhow::bail!("wasm_path and manifest_path must both be provided or both be None"),

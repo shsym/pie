@@ -413,8 +413,8 @@ class PieClient:
             wasm_bytes = Path(wasm_path).read_bytes()
             manifest_content = Path(manifest_path).read_text()
             wasm_hash = blake3.blake3(wasm_bytes).hexdigest()
-            toml_hash = blake3.blake3(manifest_content.encode()).hexdigest()
-            query = f"{inferlet}#{wasm_hash}+{toml_hash}"
+            manifest_hash = blake3.blake3(manifest_content.encode()).hexdigest()
+            query = f"{inferlet}#{wasm_hash}+{manifest_hash}"
         else:
             query = inferlet
         successful, result = await self.query("program_exists", query)

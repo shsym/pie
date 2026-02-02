@@ -2,7 +2,7 @@ use crate::auth::{AuthorizedUsers, PublicKey};
 use crate::instance::{InstanceId, OutputChannel, OutputDelivery};
 use crate::messaging::PushPullCommand;
 use crate::model;
-use crate::runtime::{self, AttachInstanceResult, TerminationCause};
+use crate::runtime::{self, AttachInstanceResult, ProgramHash, TerminationCause};
 use crate::service::{CommandDispatcher, Service, ServiceCommand};
 use crate::utils::IdPool;
 use anyhow::{Result, anyhow, bail};
@@ -1207,11 +1207,12 @@ impl Session {
         arguments: Vec<String>,
         detached: bool,
     ) {
+        let program_hash = ProgramHash::new(wasm_hash, manifest_hash);
+
         let (evt_tx, evt_rx) = oneshot::channel();
         runtime::Command::LaunchInstance {
             username: self.username.clone(),
-            wasm_hash,
-            manifest_hash,
+            program_hash,
             arguments,
             detached,
             event: evt_tx,
@@ -1377,8 +1378,10 @@ impl Session {
             let (evt_tx, evt_rx) = oneshot::channel();
             runtime::Command::LaunchServerInstance {
                 username: self.username.clone(),
-                wasm_hash: program_metadata.wasm_hash,
-                manifest_hash: program_metadata.manifest_hash,
+                program_hash: ProgramHash::new(
+                    program_metadata.wasm_hash,
+                    program_metadata.manifest_hash,
+                ),
                 port,
                 arguments,
                 event: evt_tx,
@@ -1850,8 +1853,10 @@ async fn ensure_program_loaded_with_dependencies(
         // Check if the program is already loaded in memory
         let (loaded_tx, loaded_rx) = oneshot::channel();
         runtime::Command::ProgramLoaded {
-            wasm_hash: program_metadata.wasm_hash.clone(),
-            manifest_hash: program_metadata.manifest_hash.clone(),
+            program_hash: ProgramHash::new(
+                program_metadata.wasm_hash.clone(),
+                program_metadata.manifest_hash.clone(),
+            ),
             event: loaded_tx,
         }
         .dispatch();
@@ -1922,11 +1927,30 @@ async fn ensure_program_loaded_with_dependencies(
             .await
             .map_err(|e| e.to_string())?;
 
+        // Build the dependencies list as ProgramHash instances
+        // All dependencies are guaranteed to be in one of the maps at this point
+        let dependencies: Vec<ProgramHash> = program_metadata
+            .dependencies
+            .iter()
+            .filter_map(|dep_name| {
+                uploaded_programs
+                    .get(dep_name)
+                    .or_else(|| registry_programs.get(dep_name))
+                    .map(|entry| {
+                        let meta = entry.value();
+                        ProgramHash::new(meta.wasm_hash.clone(), meta.manifest_hash.clone())
+                    })
+            })
+            .collect();
+
         let (load_tx, load_rx) = oneshot::channel();
         runtime::Command::LoadProgram {
-            wasm_hash: program_metadata.wasm_hash.clone(),
-            manifest_hash: program_metadata.manifest_hash.clone(),
+            program_hash: ProgramHash::new(
+                program_metadata.wasm_hash.clone(),
+                program_metadata.manifest_hash.clone(),
+            ),
             component,
+            dependencies,
             event: load_tx,
         }
         .dispatch();

@@ -7,8 +7,9 @@ use crate::service::ServiceCommand;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
 use pie_client::message;
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -21,6 +22,8 @@ use wasmtime_wasi_http::bindings::exports::wasi::http::incoming_handler::{
 use wasmtime_wasi_http::bindings::http::types::Scheme;
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
+
+mod dynamic_linking;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -68,22 +71,20 @@ pub enum Command {
     },
 
     LoadProgram {
-        wasm_hash: String,
-        manifest_hash: String,
+        program_hash: ProgramHash,
         component: Component,
+        dependencies: Vec<ProgramHash>,
         event: oneshot::Sender<()>,
     },
 
     ProgramLoaded {
-        wasm_hash: String,
-        manifest_hash: String,
+        program_hash: ProgramHash,
         event: oneshot::Sender<bool>,
     },
 
     LaunchInstance {
         username: String,
-        wasm_hash: String,
-        manifest_hash: String,
+        program_hash: ProgramHash,
         arguments: Vec<String>,
         detached: bool,
         event: oneshot::Sender<Result<InstanceId, RuntimeError>>,
@@ -104,8 +105,7 @@ pub enum Command {
 
     LaunchServerInstance {
         username: String,
-        wasm_hash: String,
-        manifest_hash: String,
+        program_hash: ProgramHash,
         port: u32,
         arguments: Vec<String>,
         event: oneshot::Sender<Result<(), RuntimeError>>,
@@ -141,15 +141,39 @@ impl ServiceCommand for Command {
     const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &COMMAND_DISPATCHER;
 }
 
+/// A key identifying a compiled program by its WASM and manifest hashes.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct ProgramHash {
+    wasm_hash: String,
+    manifest_hash: String,
+}
+
+impl ProgramHash {
+    pub fn new(wasm_hash: String, manifest_hash: String) -> Self {
+        Self {
+            wasm_hash,
+            manifest_hash,
+        }
+    }
+}
+
+/// A compiled program with its component and dependency information.
+#[derive(Clone)]
+struct CompiledProgram {
+    /// The compiled WASM component
+    component: Component,
+    /// Dependencies of this program, each specified by their hashes
+    dependencies: Vec<ProgramHash>,
+}
+
 /// Holds the “global” or “runtime” data that the controller needs to manage
 /// instances, compiled programs, etc.
 struct Runtime {
     /// The Wasmtime engine (global)
     engine: Engine,
-    linker: Arc<Linker<InstanceState>>,
 
-    /// Pre-compiled WASM components, keyed by (wasm_hash, manifest_hash)
-    compiled_programs: DashMap<(String, String), Component>,
+    /// Pre-compiled WASM components, keyed by ProgramHash
+    compiled_programs: DashMap<ProgramHash, CompiledProgram>,
 
     /// Running instances
     running_instances: DashMap<InstanceId, InstanceHandle>,
@@ -219,8 +243,7 @@ pub enum AttachInstanceResult {
 
 struct InstanceHandle {
     username: String,
-    wasm_hash: String,
-    manifest_hash: String,
+    program_hash: ProgramHash,
     arguments: Vec<String>,
     start_time: std::time::Instant,
     output_delivery_ctrl: OutputDeliveryCtrl,
@@ -234,38 +257,38 @@ impl Service for Runtime {
     async fn handle(&mut self, cmd: Self::Command) {
         match cmd {
             Command::LoadProgram {
-                wasm_hash,
-                manifest_hash,
+                program_hash,
                 component,
+                dependencies,
                 event,
             } => {
-                // Store the pre-compiled component keyed by (wasm_hash, manifest_hash)
+                // Store the pre-compiled component with dependencies keyed by ProgramHash
+                let compiled_program = CompiledProgram {
+                    component,
+                    dependencies,
+                };
                 self.compiled_programs
-                    .insert((wasm_hash, manifest_hash), component);
+                    .insert(program_hash, compiled_program);
                 event.send(()).unwrap();
             }
 
             Command::ProgramLoaded {
-                wasm_hash,
-                manifest_hash,
+                program_hash,
                 event,
             } => {
-                let is_loaded = self
-                    .compiled_programs
-                    .contains_key(&(wasm_hash, manifest_hash));
+                let is_loaded = self.compiled_programs.contains_key(&program_hash);
                 event.send(is_loaded).unwrap();
             }
 
             Command::LaunchInstance {
                 username,
-                wasm_hash,
-                manifest_hash,
+                program_hash,
                 event,
                 arguments,
                 detached,
             } => {
                 let res = self
-                    .launch_instance(username, wasm_hash, manifest_hash, arguments, detached)
+                    .launch_instance(username, program_hash, arguments, detached)
                     .await;
                 event
                     .send(res)
@@ -291,14 +314,13 @@ impl Service for Runtime {
 
             Command::LaunchServerInstance {
                 username,
-                wasm_hash,
-                manifest_hash,
+                program_hash,
                 port,
                 arguments,
                 event,
             } => {
                 let _ = self
-                    .launch_server_instance(username, wasm_hash, manifest_hash, port, arguments)
+                    .launch_server_instance(username, program_hash, port, arguments)
                     .await;
                 event.send(Ok(())).unwrap();
             }
@@ -343,8 +365,8 @@ impl Service for Runtime {
                                 format!(
                                     "Instance ID: {}, wasm_hash: {}, manifest_hash: {}",
                                     item.key(),
-                                    handle.wasm_hash,
-                                    handle.manifest_hash
+                                    handle.program_hash.wasm_hash,
+                                    handle.program_hash.manifest_hash
                                 )
                             })
                             .collect();
@@ -356,10 +378,10 @@ impl Service for Runtime {
                             .compiled_programs
                             .iter()
                             .map(|item| {
-                                let (wasm_hash, manifest_hash) = item.key();
+                                let key = item.key();
                                 format!(
                                     "wasm_hash: {}, manifest_hash: {}",
-                                    wasm_hash, manifest_hash
+                                    key.wasm_hash, key.manifest_hash
                                 )
                             })
                             .collect();
@@ -402,23 +424,28 @@ impl Service for Runtime {
     }
 }
 
+/// Creates a new linker with WASI and API bindings configured.
+fn create_linker(engine: &Engine) -> Linker<InstanceState> {
+    let mut linker = Linker::<InstanceState>::new(engine);
+
+    // Add WASI and HTTP bindings
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|e| RuntimeError::Other(format!("Failed to link WASI: {e}")))
+        .unwrap();
+    wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
+        .map_err(|e| RuntimeError::Other(format!("Failed to link WASI: {e}")))
+        .unwrap();
+
+    // Add custom API bindings
+    api::add_to_linker(&mut linker).unwrap();
+
+    linker
+}
+
 impl Runtime {
     fn new(engine: Engine) -> Self {
-        let mut linker = Linker::<InstanceState>::new(&engine);
-
-        // Add to linker
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-            .map_err(|e| RuntimeError::Other(format!("Failed to link WASI: {e}")))
-            .unwrap();
-        wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
-            .map_err(|e| RuntimeError::Other(format!("Failed to link WASI: {e}")))
-            .unwrap();
-
-        api::add_to_linker(&mut linker).unwrap();
-
         Self {
             engine,
-            linker: Arc::new(linker),
             compiled_programs: DashMap::new(),
             running_instances: DashMap::new(),
             finished_instances: DashMap::new(),
@@ -426,37 +453,76 @@ impl Runtime {
         }
     }
 
-    fn get_component(
-        &self,
-        wasm_hash: &str,
-        manifest_hash: &str,
-    ) -> Result<Component, RuntimeError> {
-        // Get the component from memory by (wasm_hash, manifest_hash)
-        let key = (wasm_hash.to_string(), manifest_hash.to_string());
-        match self.compiled_programs.get(&key) {
-            Some(entry) => Ok(entry.value().clone()),
+    fn get_component(&self, program_hash: &ProgramHash) -> Result<Component, RuntimeError> {
+        // Get the component from memory by ProgramHash
+        match self.compiled_programs.get(program_hash) {
+            Some(entry) => Ok(entry.value().component.clone()),
             None => Err(RuntimeError::MissingProgram(
-                wasm_hash.to_string(),
-                manifest_hash.to_string(),
+                program_hash.wasm_hash.clone(),
+                program_hash.manifest_hash.clone(),
             )),
         }
+    }
+
+    /// Collect all dependencies of a program in topological order (dependencies before dependents).
+    /// This handles deduplication when a dependency appears multiple times in the dependency graph.
+    fn collect_dependencies_topo_order(&self, program_hash: &ProgramHash) -> Vec<Component> {
+        /// Recursively collect a dependency and all its transitive dependencies.
+        /// Uses post-order DFS to ensure dependencies come before dependents.
+        fn collect_recursive(
+            compiled_programs: &DashMap<ProgramHash, CompiledProgram>,
+            dep_hash: &ProgramHash,
+            visited: &mut HashSet<ProgramHash>,
+            result: &mut Vec<Component>,
+        ) {
+            // Skip if already visited (deduplication)
+            if visited.contains(dep_hash) {
+                return;
+            }
+            visited.insert(dep_hash.clone());
+
+            if let Some(entry) = compiled_programs.get(dep_hash) {
+                let compiled_program = entry.value();
+
+                // First, recursively process all transitive dependencies (post-order DFS)
+                for child_dep_hash in &compiled_program.dependencies {
+                    collect_recursive(compiled_programs, child_dep_hash, visited, result);
+                }
+
+                // Then add this component (after all its dependencies are added)
+                result.push(compiled_program.component.clone());
+            }
+        }
+
+        let mut visited = HashSet::new();
+        let mut result = Vec::new();
+
+        // Get the direct dependencies of the main program and recursively collect them
+        if let Some(entry) = self.compiled_programs.get(program_hash) {
+            for dep_hash in &entry.value().dependencies {
+                collect_recursive(&self.compiled_programs, dep_hash, &mut visited, &mut result);
+            }
+        }
+
+        result
     }
 
     /// Actually start a program instance
     async fn launch_instance(
         &self,
         username: String,
-        wasm_hash: String,
-        manifest_hash: String,
+        program_hash: ProgramHash,
         arguments: Vec<String>,
         detached: bool,
     ) -> Result<InstanceId, RuntimeError> {
-        let component = self.get_component(&wasm_hash, &manifest_hash)?;
+        let component = self.get_component(&program_hash)?;
         let instance_id = Uuid::new_v4();
+
+        // Collect dependencies in topological order (deduplication handled inside)
+        let dependency_components = self.collect_dependencies_topo_order(&program_hash);
 
         // Instantiate and run in a task
         let engine = self.engine.clone();
-        let linker = self.linker.clone();
 
         // Create a oneshot channel to signal when the task can start
         let (start_tx, start_rx) = oneshot::channel();
@@ -467,10 +533,10 @@ impl Runtime {
             instance_id,
             username.clone(),
             component,
+            dependency_components,
             arguments.clone(),
             detached,
             engine,
-            linker,
             start_rx,
             output_delivery_ctrl_tx,
         ));
@@ -487,8 +553,7 @@ impl Runtime {
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             username,
-            wasm_hash,
-            manifest_hash,
+            program_hash,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -552,17 +617,18 @@ impl Runtime {
     async fn launch_server_instance(
         &self,
         username: String,
-        wasm_hash: String,
-        manifest_hash: String,
+        program_hash: ProgramHash,
         port: u32,
         arguments: Vec<String>,
     ) -> Result<InstanceId, RuntimeError> {
         let instance_id = Uuid::new_v4();
-        let component = self.get_component(&wasm_hash, &manifest_hash)?;
+        let component = self.get_component(&program_hash)?;
+
+        // Collect dependencies in topological order (deduplication handled inside)
+        let dependency_components = self.collect_dependencies_topo_order(&program_hash);
 
         // Instantiate and run in a task
         let engine = self.engine.clone();
-        let linker = self.linker.clone();
         let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
 
         // Create a oneshot channel to signal when the task can start
@@ -572,9 +638,9 @@ impl Runtime {
             addr,
             username.clone(),
             component,
+            dependency_components,
             arguments.clone(),
             engine,
-            linker,
             start_rx,
         ));
 
@@ -586,8 +652,7 @@ impl Runtime {
         // Record in the "running_instances" so we can manage it later
         let instance_handle = InstanceHandle {
             username,
-            wasm_hash,
-            manifest_hash,
+            program_hash,
             arguments,
             start_time: std::time::Instant::now(),
             output_delivery_ctrl,
@@ -681,9 +746,9 @@ impl Runtime {
 
     async fn handle_server_request(
         engine: Engine,
-        linker: Arc<Linker<InstanceState>>,
         username: String,
         component: Component,
+        dependency_components: Vec<Component>,
         arguments: Vec<String>,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
@@ -696,6 +761,18 @@ impl Runtime {
 
         let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
         let out = store.data_mut().new_response_outparam(sender)?;
+
+        let mut linker = create_linker(&engine);
+
+        // Instantiate dependencies and register their exports in the linker
+        dynamic_linking::instantiate_libraries(
+            &engine,
+            &mut linker,
+            &mut store,
+            dependency_components,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to instantiate dependencies: {e}"))?;
 
         let instance = linker
             .instantiate_async(&mut store, &component)
@@ -744,9 +821,9 @@ impl Runtime {
         addr: SocketAddr,
         username: String,
         component: Component,
+        dependency_components: Vec<Component>,
         arguments: Vec<String>,
         engine: Engine,
-        linker: Arc<Linker<InstanceState>>,
         start_rx: oneshot::Receiver<()>,
     ) {
         // Wait for the signal to start
@@ -758,14 +835,13 @@ impl Runtime {
             socket.bind(addr)?;
             let listener = socket.listen(100)?;
             eprintln!("Serving HTTP on http://{}/", listener.local_addr()?);
-            //store.data_mut().w
             tokio::task::spawn(async move {
                 loop {
                     let (stream, _) = listener.accept().await.unwrap();
                     let stream = TokioIo::new(stream);
                     let engine_ = engine.clone();
-                    let linker_ = linker.clone();
                     let component_ = component.clone();
+                    let dependency_components_ = dependency_components.clone();
                     let arguments_ = arguments.clone();
                     let username_ = username.clone();
                     tokio::task::spawn(async move {
@@ -776,9 +852,9 @@ impl Runtime {
                                 hyper::service::service_fn(move |req| {
                                     Self::handle_server_request(
                                         engine_.clone(),
-                                        linker_.clone(),
                                         username_.clone(),
                                         component_.clone(),
+                                        dependency_components_.clone(),
                                         arguments_.clone(),
                                         req,
                                     )
@@ -802,10 +878,10 @@ impl Runtime {
         instance_id: InstanceId,
         username: String,
         component: Component,
+        dependency_components: Vec<Component>,
         arguments: Vec<String>,
         detached: bool,
         engine: Engine,
-        linker: Arc<Linker<InstanceState>>,
         start_rx: oneshot::Receiver<()>,
         output_delivery_ctrl_tx: oneshot::Sender<OutputDeliveryCtrl>,
     ) {
@@ -835,6 +911,17 @@ impl Runtime {
         // so we can capture errors more systematically if desired:
         let result = async {
             let mut store = Store::new(&engine, inst_state);
+
+            let mut linker = create_linker(&engine);
+
+            // Instantiate dependencies and register their exports in the linker
+            dynamic_linking::instantiate_libraries(
+                &engine,
+                &mut linker,
+                &mut store,
+                dependency_components,
+            )
+            .await?;
 
             let instance = linker
                 .instantiate_async(&mut store, &component)
