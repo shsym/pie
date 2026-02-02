@@ -1,3 +1,5 @@
-core = "../../../../runtime/wit/core/wit"
-zo = "../../../../runtime/wit/zo/wit"
-mcp = "../../../../runtime/wit/mcp/wit"
+core = "../../../interfaces/core/wit"
+adapter = "../../../interfaces/adapter/wit"
+image = "../../../interfaces/image/wit"
+zo = "../../../interfaces/zo/wit"
+actor = "../../../interfaces/actor/wit"

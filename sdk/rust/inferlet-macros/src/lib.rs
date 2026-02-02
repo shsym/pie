@@ -1,25 +1,7 @@
-//! Procedural macros for the inferlet library.
-//!
-//! Provides the `#[inferlet::main]` attribute macro for defining inferlet entry points.
-
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{ItemFn, parse_macro_input};
 
-/// Marks an async function as the inferlet entry point.
-///
-/// The function should have the signature:
-/// ```ignore
-/// async fn main(args: Vec<String>) -> Result<String, anyhow::Error>
-/// ```
-///
-/// # Example
-/// ```ignore
-/// #[inferlet::main]
-/// async fn main(args: Vec<String>) -> anyhow::Result<String> {
-///     Ok("Hello, world!".to_string())
-/// }
-/// ```
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the input tokens into a syntax tree
@@ -33,33 +15,58 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
             input_fn.sig.ident,
             "The #[inferlet::main] attribute can only be used on async functions",
         )
-        .to_compile_error()
-        .into();
+            .to_compile_error()
+            .into();
     }
 
     // Rename the user's function so that we can call it from our generated code.
     input_fn.sig.ident = inner_fn_name.clone();
 
-    // Generate a wrapper type that implements the Run trait.
-    // The new WIT signature: run(args: list<string>) -> result<string, error>
+    // Generate a wrapper type that implements `inferlet::Run`.
+    // It calls the inner async function and maps the error to String.
     let expanded = quote! {
         #input_fn
 
         struct __PieMain;
 
-        impl inferlet::exports::pie::core::run::Guest for __PieMain {
-            fn run(args: Vec<String>) -> Result<String, String> {
+        impl inferlet::api::Guest for __PieMain {
+            fn run() -> Result<(), String> {
+                let args = inferlet::Args::from_vec(
+                    inferlet::get_arguments()
+                        .into_iter()
+                        .map(std::ffi::OsString::from)
+                        .collect(),
+                );
+
                 let result = inferlet::wstd::runtime::block_on(async { #inner_fn_name(args).await });
 
                 match result {
-                    Ok(output) => Ok(output),
-                    Err(e) => Err(format!("{:?}", e)),
+                    Ok(r) => {
+                        // This block contains the new logic.
+                        use std::any::Any;
+                        let r_any: &dyn Any = &r;
+                        let output = if let Some(s) = r_any.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = r_any.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            // Fallback for all other types
+                            format!("{:?}", r)
+                        };
+
+                        inferlet::set_return(&output);
+                        Ok(())
+                    },
+                    Err(e) => {
+                        Err(format!("{:?}", e))
+                    }
                 }
             }
         }
 
-        inferlet::export!(__PieMain with_types_in inferlet);
+        inferlet::api::export!(__PieMain with_types_in inferlet::api);
     };
 
     expanded.into()
 }
+
