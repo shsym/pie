@@ -8,8 +8,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use wasmtime::{Config as WasmConfig, Engine as WasmEngine};
 
 use crate::auth::AuthorizedUsers;
-use crate::kvs;
-use crate::messaging;
+use crate::program;
 use crate::runtime;
 use crate::server;
 use crate::telemetry::{self, TelemetryConfig};
@@ -89,18 +88,20 @@ pub async fn run_server(
     
     let wasm_engine = WasmEngine::new(&wasm_config).unwrap();
 
-    runtime::start_service(wasm_engine.clone());
-    server::start_service(
-        &server_url,
-        config.enable_auth,
+    // Spawn the program manager (owns program state: cache, registry downloads)
+    program::spawn(program::ProgramManagerConfig {
+        wasm_engine: wasm_engine.clone(),
+        registry_url: config.registry.clone(),
+        cache_dir: config.cache_dir.clone(),
+    });
+
+    runtime::spawn(wasm_engine);
+    server::spawn(server::ServerConfig {
+        ip_port: server_url,
+        enable_auth: config.enable_auth,
         authorized_users,
-        internal_auth_token.clone(),
-        config.registry.clone(),
-        config.cache_dir.clone(),
-        wasm_engine,
-    );
-    kvs::start_service();
-    messaging::start_service();
+        internal_auth_token: internal_auth_token.clone(),
+    });
 
     ready_tx.send(internal_auth_token).unwrap();
 

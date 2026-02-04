@@ -1,6 +1,4 @@
-use super::api::core::Queue;
 use super::utils;
-use crate::model::resource::{ResourceId, ResourceTypeId};
 use crate::server::InstanceEvent;
 use anyhow::{Result, format_err};
 use bytes::Bytes;
@@ -14,7 +12,7 @@ use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 use tokio::sync::Notify;
 use uuid::Uuid;
-use wasmtime::component::{Resource, ResourceAny, ResourceTable};
+use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::async_trait;
 use wasmtime_wasi::cli::IsTerminal;
 use wasmtime_wasi::cli::StdoutStream;
@@ -23,6 +21,11 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 pub type InstanceId = Uuid;
+
+/// Resource identifier (typically a u32 handle)
+pub type ResourceId = u32;
+/// Resource type identifier for categorizing resources
+pub type ResourceTypeId = u32;
 
 /// Controller for controlling the output delivery mode of a running instance
 #[derive(Clone)]
@@ -121,12 +124,12 @@ pub struct InstanceState {
     // virtual resources
     resources: HashMap<(usize, ResourceTypeId), ResourceIdMapper>,
 
-    // Dynamic linking state: maps host rep -> guest's ResourceAny
+    // Dynamic linking support for proxy resources
+    /// Maps host rep → guest ResourceAny for dynamic linking
     dynamic_resource_map: HashMap<u32, ResourceAny>,
-    // Reverse map: guest ResourceAny -> host rep (for identity preservation)
-    // ResourceAny doesn't implement Hash, so we use a Vec for linear scan
+    /// Maps guest ResourceAny → host rep (for identity preservation)
     guest_resource_map: Vec<(ResourceAny, u32)>,
-    // Counter for generating unique dynamic resource reps
+    /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
 }
 
@@ -180,6 +183,7 @@ impl InstanceState {
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
             resources: HashMap::new(),
+            // Dynamic linking support
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
@@ -188,48 +192,12 @@ impl InstanceState {
         (state, streaming_ctrl)
     }
 
-    /// Allocate a unique rep for dynamic resource mapping
-    pub fn alloc_dynamic_rep(&mut self) -> u32 {
-        let rep = self.next_dynamic_rep;
-        self.next_dynamic_rep = self.next_dynamic_rep.checked_add(1).unwrap();
-        rep
-    }
-
-    /// Get the guest resource for a given host rep
-    pub fn get_dynamic_resource(&self, rep: u32) -> Option<ResourceAny> {
-        self.dynamic_resource_map.get(&rep).copied()
-    }
-
-    /// Look up host rep for an existing guest resource (for identity preservation)
-    pub fn rep_for_guest_resource(&self, resource: ResourceAny) -> Option<u32> {
-        self.guest_resource_map
-            .iter()
-            .find(|(r, _)| *r == resource)
-            .map(|(_, rep)| *rep)
-    }
-
-    /// Insert a bidirectional mapping between host rep and guest resource
-    pub fn insert_dynamic_resource_mapping(&mut self, rep: u32, resource: ResourceAny) {
-        self.dynamic_resource_map.insert(rep, resource);
-        // Only add to reverse map if not already present
-        if self.rep_for_guest_resource(resource).is_none() {
-            self.guest_resource_map.push((resource, rep));
-        }
-    }
-
-    /// Remove a resource mapping by host rep (returns the guest resource if found)
-    pub fn remove_dynamic_resource_mapping(&mut self, rep: u32) -> Option<ResourceAny> {
-        let resource = self.dynamic_resource_map.remove(&rep);
-        if let Some(resource) = resource {
-            self.guest_resource_map.retain(|(r, _)| *r != resource);
-            Some(resource)
-        } else {
-            None
-        }
-    }
-
     pub fn id(&self) -> InstanceId {
         self.id
+    }
+
+    pub fn get_username(&self) -> String {
+        self.username.clone()
     }
 
     pub fn arguments(&self) -> &[String] {
@@ -240,10 +208,6 @@ impl InstanceState {
         self.return_value.clone()
     }
 
-    pub fn read_queue(&self, queue: &Resource<Queue>) -> Result<(usize, u32, u32)> {
-        let q = self.resource_table.get(&queue)?;
-        Ok((q.service_id, q.uid, q.priority))
-    }
     pub fn map_resources(
         &mut self,
         service_id: usize,
@@ -288,6 +252,49 @@ impl InstanceState {
             m.virtual_to_physical
         ))?;
         Ok(phys_id)
+    }
+
+    // ========================================================================
+    // Dynamic Linking Support Methods
+    // ========================================================================
+
+    /// Allocates a new host rep for dynamic resource mapping.
+    pub fn alloc_dynamic_rep(&mut self) -> u32 {
+        let rep = self.next_dynamic_rep;
+        self.next_dynamic_rep = self.next_dynamic_rep.checked_add(1).unwrap();
+        rep
+    }
+
+    /// Gets the guest ResourceAny for a given host rep.
+    pub fn get_dynamic_resource(&self, rep: u32) -> Option<ResourceAny> {
+        self.dynamic_resource_map.get(&rep).copied()
+    }
+
+    /// Gets the host rep for a given guest ResourceAny (for identity preservation).
+    pub fn rep_for_guest_resource(&self, resource: ResourceAny) -> Option<u32> {
+        self.guest_resource_map
+            .iter()
+            .find(|(r, _)| *r == resource)
+            .map(|(_, rep)| *rep)
+    }
+
+    /// Inserts a mapping between host rep and guest ResourceAny.
+    pub fn insert_dynamic_resource_mapping(&mut self, rep: u32, resource: ResourceAny) {
+        self.dynamic_resource_map.insert(rep, resource);
+        // Only insert the reverse mapping if not already present
+        if self.rep_for_guest_resource(resource).is_none() {
+            self.guest_resource_map.push((resource, rep));
+        }
+    }
+
+    /// Removes the mapping for a host rep and returns the guest ResourceAny.
+    pub fn remove_dynamic_resource_mapping(&mut self, rep: u32) -> Option<ResourceAny> {
+        if let Some(resource) = self.dynamic_resource_map.remove(&rep) {
+            self.guest_resource_map.retain(|(r, _)| *r != resource);
+            Some(resource)
+        } else {
+            None
+        }
     }
 }
 
