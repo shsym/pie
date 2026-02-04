@@ -15,6 +15,7 @@ from typing import Optional
 
 from rich.panel import Panel
 from .console import console
+from . import path as path_utils
 import typer
 
 
@@ -93,74 +94,6 @@ def ensure_npm_dependencies(package_dir: Path) -> None:
         raise RuntimeError(f"npm install failed in {package_dir}:\n{result.stderr}")
 
 
-def get_inferlet_js_path() -> Path:
-    """Get the path to the inferlet-js library."""
-    # Try PIE_SDK environment variable
-    if pie_sdk := os.environ.get("PIE_SDK"):
-        path = Path(pie_sdk) / "javascript"
-        if path.exists():
-            return path
-
-    # Walk up from current directory
-    current_dir = Path.cwd()
-    for parent in [current_dir] + list(current_dir.parents):
-        inferlet_js_path = parent / "sdk" / "javascript"
-        if inferlet_js_path.exists() and (inferlet_js_path / "package.json").exists():
-            return inferlet_js_path
-
-    raise FileNotFoundError(
-        "Could not find inferlet-js library. Please set PIE_SDK environment variable."
-    )
-
-
-def get_wit_path() -> Path:
-    """Get the path to the WIT directory containing the exec world."""
-    # Try PIE_SDK environment variable
-    if pie_sdk := os.environ.get("PIE_SDK"):
-        # Check for rust/inferlet/wit first (has the exec world)
-        path = Path(pie_sdk) / "rust" / "inferlet" / "wit"
-        if path.exists() and (path / "world.wit").exists():
-            return path
-        # Fallback to interfaces
-        path = Path(pie_sdk) / "interfaces"
-        if path.exists():
-            return path
-
-    # Walk up from current directory
-    current_dir = Path.cwd()
-    for parent in [current_dir] + list(current_dir.parents):
-        # Check for sdk/rust/inferlet/wit first (has the exec world)
-        wit_path = parent / "sdk" / "rust" / "inferlet" / "wit"
-        if wit_path.exists() and (wit_path / "world.wit").exists():
-            return wit_path
-        # Fallback to sdk/interfaces
-        wit_path = parent / "sdk" / "interfaces"
-        if wit_path.exists():
-            return wit_path
-
-    raise FileNotFoundError(
-        "Could not find WIT directory. Please set PIE_SDK environment variable."
-    )
-
-
-def get_inferlet_path() -> Path:
-    """Get the path to the inferlet library."""
-    # Try PIE_SDK environment variable
-    if pie_sdk := os.environ.get("PIE_SDK"):
-        path = Path(pie_sdk) / "python"
-        if path.exists():
-            return path
-
-    # Walk up from current directory
-    current_dir = Path.cwd()
-    for parent in [current_dir] + list(current_dir.parents):
-        inferlet_path = parent / "sdk" / "python"
-        if inferlet_path.exists() and (inferlet_path / "pyproject.toml").exists():
-            return inferlet_path
-
-    raise FileNotFoundError(
-        "Could not find inferlet library. Please set PIE_SDK environment variable."
-    )
 
 
 def detect_py_input_type(input_path: Path) -> tuple[str, Path]:
@@ -320,8 +253,8 @@ def handle_python_build(input_path: Path, output: Path, debug: bool = False) -> 
 
     # Resolve paths
     with console.status("[bold green]Resolving paths...[/bold green]"):
-        inferlet_path = get_inferlet_path()
-        wit_path = get_wit_path()
+        inferlet_path = path_utils.get_inferlet_py_path()
+        wit_path = path_utils.get_wit_path()
 
     console.print("[bold]🏗️  Building Python inferlet...[/bold]")
     console.print(f"   Input: [blue]{input_path}[/blue]")
@@ -705,7 +638,7 @@ console.log("OK");
 
     try:
         # Run with NODE_PATH set to inferlet-js node_modules where acorn is available
-        inferlet_js_path = get_inferlet_js_path()
+        inferlet_js_path = path_utils.get_inferlet_js_path()
         node_modules = inferlet_js_path / "node_modules"
         env = os.environ.copy()
         env["NODE_PATH"] = str(node_modules)
@@ -896,8 +829,8 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
 
     # Resolve paths
     with console.status("[bold green]Resolving paths...[/bold green]"):
-        inferlet_js_path = get_inferlet_js_path()
-        wit_path = get_wit_path()
+        inferlet_js_path = path_utils.get_inferlet_js_path()
+        wit_path = path_utils.get_wit_path()
 
     # Ensure npm dependencies
     ensure_npm_dependencies(inferlet_js_path)

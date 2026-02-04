@@ -1,14 +1,18 @@
-package pie:inferlet;
+package inferlet:exec;
 
 world imports {
-    include pie:core/imports;
-    include pie:mcp/imports;
-    include pie:zo/imports;
+    include inferlet:core/imports;
+    include inferlet:image/imports;
+    include inferlet:adapter/imports;
+    include inferlet:zo/imports;
+    include inferlet:actor/imports;
 }
 
-world inferlet {
-    include pie:core/imports;
-    include pie:mcp/imports;
-    include pie:zo/imports;
-    export pie:core/run;
+world exec {
+    include inferlet:core/imports;
+    include inferlet:image/imports;
+    include inferlet:adapter/imports;
+    include inferlet:zo/imports;
+    include inferlet:actor/imports;
+    export inferlet:core/run;
 }

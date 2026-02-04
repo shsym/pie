@@ -1,6 +1,3 @@
 interface run {
-
-    use types.{error};
-
-    run: func(args: list<string>) -> result<string, error>;
+  run: func() -> result<_, string>;
 }
