@@ -28,14 +28,14 @@ use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use crate::actor::{Actor, Handle, SendError};
+use crate::service::{Service, ServiceHandler};
 
 // =============================================================================
 // Actor Setup (Singleton)
 // =============================================================================
 
 /// Global singleton Auth actor.
-static ACTOR: LazyLock<Actor<Message>> = LazyLock::new(Actor::new);
+static ACTOR: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Spawns the Auth actor with configuration.
 pub fn spawn(config: AuthConfig) {
@@ -149,9 +149,48 @@ pub enum Message {
 
 impl Message {
     /// Sends this message to the Auth actor.
-    pub fn send(self) -> Result<(), SendError> {
+    pub fn send(self) -> anyhow::Result<()> {
         ACTOR.send(self)
     }
+}
+
+// =============================================================================
+// Convenience Wrappers
+// =============================================================================
+
+/// Check if authentication is enabled.
+pub async fn is_auth_enabled() -> Result<bool> {
+    let (tx, rx) = oneshot::channel();
+    Message::IsAuthEnabled { response: tx }.send()?;
+    Ok(rx.await?)
+}
+
+/// Get public keys for a user (for challenge-response auth).
+pub async fn get_user_keys(username: String) -> Result<Option<Vec<PublicKey>>> {
+    let (tx, rx) = oneshot::channel();
+    Message::GetUserKeys { username, response: tx }.send()?;
+    Ok(rx.await?)
+}
+
+/// Generate a new challenge for authentication.
+pub async fn generate_challenge() -> Result<Vec<u8>> {
+    let (tx, rx) = oneshot::channel();
+    Message::GenerateChallenge { response: tx }.send()?;
+    rx.await?
+}
+
+/// Verify a signature against all user keys.
+pub async fn verify_signature(username: String, challenge: Vec<u8>, signature: Vec<u8>) -> Result<bool> {
+    let (tx, rx) = oneshot::channel();
+    Message::VerifySignature { username, challenge, signature, response: tx }.send()?;
+    Ok(rx.await?)
+}
+
+/// Verify internal auth token.
+pub async fn verify_internal_token(token: String) -> Result<bool> {
+    let (tx, rx) = oneshot::channel();
+    Message::VerifyInternalToken { token, response: tx }.send()?;
+    Ok(rx.await?)
 }
 
 // =============================================================================
@@ -315,12 +354,8 @@ impl AuthActor {
     }
 }
 
-impl Handle for AuthActor {
+impl ServiceHandler for AuthActor {
     type Message = Message;
-
-    fn new() -> Self {
-        panic!("AuthActor requires config; use spawn() instead")
-    }
 
     async fn handle(&mut self, msg: Message) {
         match msg {

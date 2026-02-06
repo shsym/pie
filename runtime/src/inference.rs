@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::actor::{Actors, Handle, SendError};
+use crate::service::{ServiceArray, ServiceHandler};
 use crate::kvcache::{NodeId, PageId, PageStore, PhysicalPageId};
 
 use batching::{MultiNodeScheduler, SchedulerConfig, SharedScheduler};
@@ -33,7 +33,7 @@ use rpc::RpcClient;
 pub use request::{ForwardPassOutput as Output, Sampler};
 
 /// Global registry for inference actors.
-static ACTOR: std::sync::LazyLock<Actors<Message>> = std::sync::LazyLock::new(Actors::new);
+static ACTOR: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLock::new(ServiceArray::new);
 
 /// Spawns a new inference actor.
 pub(crate) fn spawn() -> usize {
@@ -52,7 +52,7 @@ pub enum Message {
 
 impl Message {
     /// Sends this message to the inference actor for the given model.
-    pub fn send(self, model_idx: usize) -> Result<(), SendError> {
+    pub fn send(self, model_idx: usize) -> anyhow::Result<()> {
         ACTOR.send(model_idx, self)
     }
 }
@@ -443,10 +443,8 @@ impl std::fmt::Debug for InferenceActor {
     }
 }
 
-impl Handle for InferenceActor {
-    type Message = Message;
-
-    fn new() -> Self {
+impl Default for InferenceActor {
+    fn default() -> Self {
         // Create shared page store
         let page_store = Arc::new(RwLock::new(PageStore::new(64)));
         let service = Arc::new(InferenceService::new(page_store));
@@ -483,6 +481,10 @@ impl Handle for InferenceActor {
             shutdown_tx,
         }
     }
+}
+
+impl ServiceHandler for InferenceActor {
+    type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
         match msg {

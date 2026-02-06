@@ -1,215 +1,164 @@
-//! Server Service - Client connection and request handling
+//! # Server Module
 //!
-//! This module provides actors for server management using the
-//! modern actor model (Handle trait). It handles WebSocket connections,
-//! authentication, program management, and instance lifecycle.
+//! Manages TCP connections and routes messages between clients and instances.
+//!
+//! ## Architecture
+//!
+//! The Server follows the Superactor pattern:
+//! - **Server** (singleton) - Manages the TCP listener and instance→client mappings
+//! - **Session** (per-client) - Handles WebSocket framing and client requests
+//!
+//! Sessions register in a global registry and receive messages via Direct Addressing,
+//! bypassing the Server actor for high-throughput communication.
 
 mod session;
-mod blob;
 mod handler;
+mod upload;
 
-pub use session::{Session, SessionEvent};
-pub use blob::InFlightUpload;
+pub use session::Session;
+pub use upload::InFlightUpload;
 
+/// Re-export session helper functions for convenience.
+pub mod sessions {
+    pub use super::session::{send_msg, send_blob, terminate, streaming_output, exists};
+}
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use bytes::Bytes;
+use anyhow::Result;
 use dashmap::DashMap;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::oneshot;
 use tokio::task::{self, JoinHandle};
 
-use crate::actor::{Actor, Handle, SendError};
+use crate::service::{Service, ServiceHandler};
+use crate::instance::InstanceId;
 
-use crate::instance::{InstanceId, OutputChannel};
-use crate::runtime::TerminationCause;
-use crate::utils::IdPool;
-
-type ClientId = u32;
+/// Unique identifier for a connected client.
+pub type ClientId = u32;
 
 // =============================================================================
-// Server Actor
+// Public API
 // =============================================================================
 
-/// Global singleton Server actor.
-static ACTOR: LazyLock<Actor<Message>> = LazyLock::new(Actor::new);
+static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
-/// Spawns the Server actor with configuration.
-pub fn spawn(config: ServerConfig) {
-    ACTOR.spawn_with::<ServerActor, _>(|| ServerActor::with_config(config));
+/// Starts the server on the given address.
+pub fn spawn(addr: String) {
+    SERVICE.spawn::<Server, _>(|| Server::new(addr)).expect("Server already spawned");
 }
 
-/// Sends a message to the Server actor.
-pub fn send(msg: Message) -> Result<(), SendError> {
-    ACTOR.send(msg)
+/// Looks up which client owns an instance.
+pub async fn get_client_id(inst_id: InstanceId) -> Result<Option<ClientId>> {
+    let (tx, rx) = oneshot::channel();
+    SERVICE.send(Message::GetClientId { inst_id, response: tx })?;
+    Ok(rx.await.ok().flatten())
 }
 
-/// Check if the server actor is spawned.
-pub fn is_spawned() -> bool {
-    ACTOR.is_spawned()
+/// Associates an instance with a client (called when instance is launched).
+pub fn register_instance(inst_id: InstanceId, client_id: ClientId) -> Result<()> {
+    SERVICE.send(Message::RegisterInstance { inst_id, client_id })
+}
+
+/// Removes an instance→client mapping (called when instance terminates).
+pub fn unregister_instance(inst_id: InstanceId) -> Result<()> {
+    SERVICE.send(Message::UnregisterInstance { inst_id })
+}
+
+/// Cleans up after a client disconnects.
+pub fn session_terminated(client_id: ClientId) -> Result<()> {
+    SERVICE.send(Message::SessionTerminated { client_id })
 }
 
 // =============================================================================
-// Configuration
+// Shared State
 // =============================================================================
 
-/// Server configuration.
-#[derive(Debug)]
-pub struct ServerConfig {
-    pub ip_port: String,
+/// State shared between the Server and all Sessions.
+pub struct ServerState {
+    /// Counter for generating unique client IDs.
+    next_client_id: AtomicU32,
+    /// Active client sessions (for graceful shutdown).
+    pub clients: DashMap<ClientId, JoinHandle<()>>,
+}
+
+// =============================================================================
+// Server Implementation
+// =============================================================================
+
+/// The Server actor manages the TCP listener and instance routing.
+struct Server {
+    state: Arc<ServerState>,
+    /// Maps instances to their owning clients for message routing.
+    inst_to_client: HashMap<InstanceId, ClientId>,
+}
+
+impl Server {
+    fn new(addr: String) -> Self {
+        let state = Arc::new(ServerState {
+            next_client_id: AtomicU32::new(1),
+            clients: DashMap::new(),
+        });
+
+        task::spawn(Self::listener_loop(addr, state.clone()));
+        
+        Server {
+            state,
+            inst_to_client: HashMap::new(),
+        }
+    }
+
+    /// Accepts incoming connections and spawns session actors.
+    async fn listener_loop(addr: String, state: Arc<ServerState>) {
+        let listener = TcpListener::bind(addr).await.unwrap();
+        while let Ok((stream, _addr)) = listener.accept().await {
+            let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
+
+            match Session::spawn(id, stream, state.clone()).await {
+                Ok(()) => tracing::info!("Client {} connected", id),
+                Err(e) => tracing::error!("Failed to create session for client {}: {}", id, e),
+            }
+        }
+    }
 }
 
 // =============================================================================
 // Messages
 // =============================================================================
 
-/// Messages for the Server actor.
+/// Messages handled by the Server actor.
 #[derive(Debug)]
-pub enum Message {
-    /// Instance event from runtime
-    InstanceEvent(InstanceEvent),
+enum Message {
+    /// Associate an instance with a client.
+    RegisterInstance { inst_id: InstanceId, client_id: ClientId },
+    /// Remove an instance mapping.
+    UnregisterInstance { inst_id: InstanceId },
+    /// Query which client owns an instance.
+    GetClientId { inst_id: InstanceId, response: oneshot::Sender<Option<ClientId>> },
+    /// Clean up after a client disconnects.
+    SessionTerminated { client_id: ClientId },
 }
 
-/// Events from instances to be forwarded to clients.
-#[derive(Debug)]
-pub enum InstanceEvent {
-    SendMsgToClient {
-        inst_id: InstanceId,
-        message: String,
-    },
-    SendBlobToClient {
-        inst_id: InstanceId,
-        data: Bytes,
-    },
-    Terminate {
-        inst_id: InstanceId,
-        cause: TerminationCause,
-    },
-    StreamingOutput {
-        inst_id: InstanceId,
-        output_type: OutputChannel,
-        content: String,
-    },
-}
-
-impl From<InstanceEvent> for Message {
-    fn from(event: InstanceEvent) -> Self {
-        Message::InstanceEvent(event)
-    }
-}
-
-impl Message {
-    pub fn send(self) -> Result<(), SendError> {
-        ACTOR.send(self)
-    }
-}
-
-impl InstanceEvent {
-    pub fn dispatch(self) {
-        let _ = Message::from(self).send();
-    }
-}
-
-/// Server status information.
-#[derive(Debug, Clone)]
-pub struct ServerStatus {
-    pub active_connections: usize,
-    pub total_requests: u64,
-}
-
-// =============================================================================
-// Server State
-// =============================================================================
-
-pub struct ServerState {
-    pub client_id_pool: Mutex<IdPool<ClientId>>,
-    pub clients: DashMap<ClientId, JoinHandle<()>>,
-    pub client_cmd_txs: DashMap<InstanceId, mpsc::Sender<SessionEvent>>,
-}
-
-// =============================================================================
-// Server
-// =============================================================================
-
-struct Server {
-    state: Arc<ServerState>,
-}
-
-impl Server {
-    fn new(config: ServerConfig) -> Self {
-        let ip_port = config.ip_port.clone();
-        let state = Arc::new(ServerState {
-            client_id_pool: Mutex::new(IdPool::new(ClientId::MAX)),
-            clients: DashMap::new(),
-            client_cmd_txs: DashMap::new(),
-        });
-
-        let _listener = task::spawn(Self::listener_loop(ip_port, state.clone()));
-        Server { state }
-    }
-
-    async fn listener_loop(ip_port: String, state: Arc<ServerState>) {
-        let listener = TcpListener::bind(ip_port).await.unwrap();
-        while let Ok((stream, _addr)) = listener.accept().await {
-            let id = {
-                let mut id_pool = state.client_id_pool.lock().await;
-                id_pool.acquire().unwrap()
-            };
-
-            match Session::spawn(id, stream, state.clone()).await {
-                Ok(session_handle) => {
-                    state.clients.insert(id, session_handle);
-                }
-                Err(e) => {
-                    eprintln!("Error creating session for client {}: {}", id, e);
-                    state.client_id_pool.lock().await.release(id).ok();
-                }
-            }
-        }
-    }
-
-    async fn handle_instance_event(&mut self, event: InstanceEvent) {
-        let inst_id = match &event {
-            InstanceEvent::SendMsgToClient { inst_id, .. }
-            | InstanceEvent::Terminate { inst_id, .. }
-            | InstanceEvent::SendBlobToClient { inst_id, .. }
-            | InstanceEvent::StreamingOutput { inst_id, .. } => *inst_id,
-        };
-
-        if let Some(chan) = self.state.client_cmd_txs.get(&inst_id) {
-            chan.send(SessionEvent::InstanceEvent(event)).await.ok();
-        }
-    }
-
-
-}
-
-// =============================================================================
-// ServerActor
-// =============================================================================
-
-struct ServerActor {
-    server: Server,
-}
-
-impl ServerActor {
-    fn with_config(config: ServerConfig) -> Self {
-        ServerActor {
-            server: Server::new(config),
-        }
-    }
-}
-
-impl Handle for ServerActor {
+impl ServiceHandler for Server {
     type Message = Message;
-
-    fn new() -> Self {
-        panic!("ServerActor requires config; use spawn() instead")
-    }
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::InstanceEvent(event) => self.server.handle_instance_event(event).await,
+            Message::RegisterInstance { inst_id, client_id } => {
+                self.inst_to_client.insert(inst_id, client_id);
+            }
+            Message::UnregisterInstance { inst_id } => {
+                self.inst_to_client.remove(&inst_id);
+            }
+            Message::GetClientId { inst_id, response } => {
+                let _ = response.send(self.inst_to_client.get(&inst_id).copied());
+            }
+            Message::SessionTerminated { client_id } => {
+                self.inst_to_client.retain(|_, &mut cid| cid != client_id);
+                tracing::info!("Client {} disconnected", client_id);
+            }
         }
     }
 }

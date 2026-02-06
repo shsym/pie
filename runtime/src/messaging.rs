@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use crate::actor::{Actor, Actors, Handle, SendError};
+use crate::service::{Service, ServiceArray, ServiceHandler};
 use crate::utils::IdPool;
 
 type ListenerId = usize;
@@ -21,7 +21,7 @@ type ListenerId = usize;
 // =============================================================================
 
 /// Global singleton PubSub actor.
-static PUBSUB_ACTOR: LazyLock<Actor<PubSubMessage>> = LazyLock::new(Actor::new);
+static PUBSUB_ACTOR: LazyLock<Service<PubSubMessage>> = LazyLock::new(Service::new);
 
 /// Spawns the PubSub actor.
 pub fn spawn_pubsub() {
@@ -29,7 +29,7 @@ pub fn spawn_pubsub() {
 }
 
 /// Sends a message to the PubSub actor.
-pub fn pubsub_send(msg: PubSubMessage) -> Result<(), SendError> {
+pub fn pubsub_send(msg: PubSubMessage) -> anyhow::Result<()> {
     PUBSUB_ACTOR.send(msg)
 }
 
@@ -56,10 +56,8 @@ struct PubSubActor {
     sub_id_pool: IdPool<ListenerId>,
 }
 
-impl Handle for PubSubActor {
-    type Message = PubSubMessage;
-
-    fn new() -> Self {
+impl Default for PubSubActor {
+    fn default() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let subscribers_by_topic = Arc::new(DashMap::new());
         let _event_loop_handle =
@@ -72,6 +70,10 @@ impl Handle for PubSubActor {
             sub_id_pool: IdPool::new(ListenerId::MAX),
         }
     }
+}
+
+impl ServiceHandler for PubSubActor {
+    type Message = PubSubMessage;
 
     async fn handle(&mut self, msg: PubSubMessage) {
         match msg {
@@ -131,7 +133,7 @@ impl PubSubActor {
 // =============================================================================
 
 /// Global singleton PushPull actor.
-static PUSHPULL_ACTOR: LazyLock<Actor<PushPullMessage>> = LazyLock::new(Actor::new);
+static PUSHPULL_ACTOR: LazyLock<Service<PushPullMessage>> = LazyLock::new(Service::new);
 
 /// Spawns the PushPull actor.
 pub fn spawn_pushpull() {
@@ -139,7 +141,7 @@ pub fn spawn_pushpull() {
 }
 
 /// Sends a message to the PushPull actor.
-pub fn pushpull_send(msg: PushPullMessage) -> Result<(), SendError> {
+pub fn pushpull_send(msg: PushPullMessage) -> anyhow::Result<()> {
     PUSHPULL_ACTOR.send(msg)
 }
 
@@ -175,10 +177,8 @@ struct PushPullActor {
     blob_queue_by_topic: Arc<DashMap<String, PushPullBlobQueue>>,
 }
 
-impl Handle for PushPullActor {
-    type Message = PushPullMessage;
-
-    fn new() -> Self {
+impl Default for PushPullActor {
+    fn default() -> Self {
         let (tx_string, rx_string) = mpsc::unbounded_channel();
         let string_queue_by_topic = Arc::new(DashMap::new());
         let _event_loop_handle_string = tokio::spawn(Self::event_loop_string(
@@ -202,6 +202,10 @@ impl Handle for PushPullActor {
             blob_queue_by_topic,
         }
     }
+}
+
+impl ServiceHandler for PushPullActor {
+    type Message = PushPullMessage;
 
     async fn handle(&mut self, msg: PushPullMessage) {
         match msg {
