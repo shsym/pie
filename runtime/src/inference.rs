@@ -32,21 +32,38 @@ pub use request::{ForwardPassOutput as Output, Sampler};
 // Public API
 // =============================================================================
 
-static SERVICE_ARRAY: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLock::new(ServiceArray::new);
+static SERVICES: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLock::new(ServiceArray::new);
 
 /// Spawns a new inference service for a model.
-pub fn spawn(
+pub async fn spawn(
     page_store: PageStore,
-    scheduler_config: &crate::bootstrap::SchedulerConfig,
+    max_in_flight_batches: usize,
+    request_timeout_secs: u64,
+    max_wait_ms: u64,
+    min_batch_for_optimization: usize,
 ) -> usize {
-    let scheduler_config = scheduler_config.clone();
-    SERVICE_ARRAY.spawn(move || InferenceService::new(page_store, &scheduler_config)).expect("Failed to spawn inference service")
+    // Fetch device info before entering the sync closure.
+    let mut device_batch_limits = Vec::with_capacity(page_store.devices().len());
+    for &device_idx in page_store.devices() {
+        let info = crate::device::get_spec(device_idx).await
+            .unwrap_or_else(|e| panic!("Failed to get device info for index {device_idx}: {e}"));
+        device_batch_limits.push((info.max_batch_size, info.max_batch_tokens));
+    }
+
+    SERVICES.spawn(move || InferenceService::new(
+        page_store,
+        device_batch_limits,
+        max_in_flight_batches,
+        request_timeout_secs,
+        max_wait_ms,
+        min_batch_for_optimization,
+    )).expect("Failed to spawn inference service")
 }
 
 /// Executes a forward pass and returns the output.
 pub async fn forward_pass(model_idx: usize, request: ForwardPassRequest) -> Result<ForwardPassOutput> {
     let (tx, rx) = oneshot::channel();
-    SERVICE_ARRAY.send(model_idx, Message::ForwardPass { request, response: tx })?;
+    SERVICES.send(model_idx, Message::ForwardPass { request, response: tx })?;
     Ok(rx.await?)
 }
 
@@ -71,12 +88,27 @@ impl std::fmt::Debug for InferenceService {
 
 impl InferenceService {
 
-    pub fn new(
+    fn new(
         page_store: PageStore,
-        scheduler_config: &crate::bootstrap::SchedulerConfig,
+        device_batch_limits: Vec<(usize, usize)>,
+        max_in_flight_batches: usize,
+        request_timeout_secs: u64,
+        max_wait_ms: u64,
+        min_batch_for_optimization: usize,
     ) -> Self {
-        // TODO: schedulers should be created per device index
-        let schedulers = Vec::new();
+        let schedulers = page_store.devices().iter().enumerate().map(|(device_idx, &device_id)| {
+            let (max_batch_size, max_batch_tokens) = device_batch_limits[device_idx];
+            BatchScheduler::new(
+                device_id as DeviceId,
+                device_idx,
+                max_batch_size,
+                max_batch_tokens,
+                max_in_flight_batches,
+                request_timeout_secs,
+                max_wait_ms,
+                min_batch_for_optimization,
+            )
+        }).collect();
 
         InferenceService {
             page_store,
@@ -137,7 +169,7 @@ impl InferenceService {
 
 /// Messages handled by InferenceService.
 #[derive(Debug)]
-pub(crate) enum Message {
+enum Message {
     ForwardPass { request: ForwardPassRequest, response: oneshot::Sender<ForwardPassOutput> },
 }
 

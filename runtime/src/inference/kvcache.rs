@@ -104,6 +104,8 @@ pub struct PageStore {
 struct Inner {
     /// Tokens per page (immutable after construction).
     page_size: usize,
+    /// Device indices (immutable after construction).
+    devices: Vec<usize>,
     /// Logical page metadata (pages, index, free list, LRU).
     page_table: RwLock<PageTable>,
     /// Per-device physical page storage.
@@ -159,13 +161,14 @@ impl PageStore {
     pub async fn new(page_size: usize, device_indices: &[usize]) -> Self {
         let phys_page_tables = boxcar::Vec::new();
         for &idx in device_indices {
-            let info = crate::device::get_info(idx).await
+            let info = crate::device::get_spec(idx).await
                 .unwrap_or_else(|e| panic!("Failed to get device info for index {idx}: {e}"));
             phys_page_tables.push(Mutex::new(PhysicalPageStore::new(info.num_kv_pages)));
         }
         PageStore {
             inner: Arc::new(Inner {
                 page_size,
+                devices: device_indices.to_vec(),
                 page_table: RwLock::new(PageTable {
                     pages: Vec::new(),
                     index: FxHashMap::default(),
@@ -175,6 +178,10 @@ impl PageStore {
                 phys_page_tables,
             }),
         }
+    }
+
+    pub fn devices(&self) -> &[usize] {
+        &self.inner.devices
     }
 
     /// Get the page size (number of tokens per page).
