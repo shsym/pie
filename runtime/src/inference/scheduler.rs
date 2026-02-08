@@ -11,15 +11,15 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-use crate::kvcache::{DeviceId, PhysicalPageId};
+use crate::bootstrap::SchedulerConfig;
+use crate::inference::kvcache::{DeviceId, PhysicalPageId};
 
-use super::Device;
+use crate::device::{self, Device};
 
 use super::adaptive_policy::AdaptiveThroughputPolicy;
 use super::request::{
     BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassOutput, ForwardPassRequest,
 };
-use super::rpc::RpcClient;
 
 // =============================================================================
 // Scheduling Policy Trait
@@ -151,17 +151,25 @@ pub(crate) struct BatchScheduler {
 impl BatchScheduler {
     /// Spawn a new batch scheduler for a single device.
     ///
-    /// Connects to the device's RPC server synchronously. Returns an error
-    /// if the connection fails — the device will not accept requests.
-    pub fn new(device: Device) -> Result<Self> {
-        // Connect to the device's RPC server (blocking, so done here
-        // rather than inside the async task).
-        let rpc_client = RpcClient::connect(&device.hostname)?;
+    /// The RPC connection is owned by the device service; the scheduler
+    /// only stores the device index for routing calls.
+    pub fn new(
+        device_id: DeviceId,
+        config: &crate::bootstrap::DeviceConfig,
+        scheduler_config: &SchedulerConfig,
+        device_idx: usize,
+    ) -> Self {
+        let device = Device {
+            hostname: config.hostname.clone(),
+            num_kv_pages: config.total_pages,
+            max_batch_size: config.max_batch_size,
+            max_batch_tokens: config.max_batch_tokens,
+        };
 
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(Self::run(device, rpc_client, rx));
+        tokio::spawn(Self::run(device, device_id, scheduler_config.clone(), device_idx, rx));
 
-        Ok(Self { tx })
+        Self { tx }
     }
 
     /// Submit a pre-translated forward pass request.
@@ -186,18 +194,23 @@ impl BatchScheduler {
     /// Main scheduling loop for a single device.
     async fn run(
         device: Device,
-        rpc_client: RpcClient,
+        device_id: DeviceId,
+        sched: SchedulerConfig,
+        device_idx: usize,
         mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
     ) {
+        let max_wait_time = Duration::from_millis(sched.max_wait_ms);
+        let request_timeout = Duration::from_secs(sched.request_timeout_secs);
+
         // Per-device state
         let mut batch = BatchAccumulator::new(device.max_batch_size, device.max_batch_tokens);
         let mut policy: Box<dyn SchedulingPolicy> =
             Box::new(AdaptiveThroughputPolicy::new(
                 device.max_batch_size,
-                device.max_wait_time,
-                device.min_batch_for_optimization,
+                max_wait_time,
+                sched.min_batch_for_optimization,
             ));
-        let in_flight = Arc::new(Semaphore::new(device.max_in_flight_batches));
+        let in_flight = Arc::new(Semaphore::new(sched.max_in_flight_batches));
 
         // Channel for batch completion stats (latency feedback only)
         let (stats_tx, mut stats_rx) = mpsc::unbounded_channel::<BatchStats>();
@@ -228,7 +241,7 @@ impl BatchScheduler {
 
             // Ask the policy what to do
             let in_flight_count =
-                device.max_in_flight_batches - in_flight.available_permits();
+                sched.max_in_flight_batches - in_flight.available_permits();
 
             match policy.decide(batch.len(), batch.total_tokens(), in_flight_count) {
                 Decision::Fire => {
@@ -245,15 +258,13 @@ impl BatchScheduler {
                     policy.on_fired();
 
                     // Spawn batch execution
-                    let rpc_client_clone = rpc_client.clone();
                     let stats_tx_clone = stats_tx.clone();
-                    let device_id = device.id;
-                    let timeout = device.request_timeout;
+                    let timeout = request_timeout;
 
                     tokio::spawn(async move {
                         let start = Instant::now();
                         Self::execute_batch(
-                            &rpc_client_clone,
+                            device_idx,
                             requests_to_fire,
                             device_id,
                             timeout,
@@ -297,18 +308,18 @@ impl BatchScheduler {
         if !batch.is_empty() {
             let requests = batch.take();
             Self::execute_batch(
-                &rpc_client,
+                device_idx,
                 requests,
-                device.id,
-                device.request_timeout,
+                device_id,
+                request_timeout,
             )
             .await;
         }
     }
 
-    /// Execute a batch of forward pass requests via RPC.
+    /// Execute a batch of forward pass requests via the device service.
     async fn execute_batch(
-        rpc_client: &RpcClient,
+        device_idx: usize,
         requests: Vec<PendingRequest>,
         device_id: DeviceId,
         timeout: Duration,
@@ -325,9 +336,10 @@ impl BatchScheduler {
             );
         }
 
-        // Send RPC
-        let result: Result<BatchedForwardPassResponse, _> =
-            rpc_client.call_with_timeout("fire_batch", &batch_req, timeout).await;
+        // Send via device service (typed call handles serialization + timeout)
+        let result = device::call_with_timeout::<_, BatchedForwardPassResponse>(
+            device_idx, "fire_batch", &batch_req, timeout,
+        ).await;
 
         match result {
             Ok(batch_resp) => {

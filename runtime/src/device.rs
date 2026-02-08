@@ -1,25 +1,178 @@
-//! RPC infrastructure for cross-process IPC communication.
+//! # Device Module
 //!
-//! Provides both server and client types for IPC-based RPC:
+//! Device abstraction and RPC communication for inference backends.
 //!
-//! - **`RpcServer`**: Creates an `IpcOneShotServer`, accepts a client
-//!   connection, and exposes `poll()` / `respond()` for request handling.
-//!
-//! - **`RpcClient`**: Connects to an existing `IpcOneShotServer` and
-//!   exposes async `call()` / `notify()` for sending requests.
-//!
-//! In the inference pattern, Python wraps `RpcServer` (via `PyRpcServer`)
-//! and Rust connects via `RpcClient`.
+//! Each physical device is a service that owns its RPC connection.
+//! Other services communicate with devices via [`call()`], [`notify()`],
+//! and [`get_info()`].
 
+use std::sync::LazyLock;
+use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use dashmap::DashMap;
-use ipc_channel::ipc::{self, IpcOneShotServer, IpcReceiver, IpcSender};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use ipc_channel::ipc::{self, IpcOneShotServer, IpcReceiver, IpcSender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::oneshot;
+use crate::inference::kvcache::DeviceId;
+use crate::service::{ServiceArray, ServiceHandler};
 
+// =============================================================================
+// Device Configuration
+// =============================================================================
+
+/// Device configuration.
+///
+/// Derived from `bootstrap::DeviceConfig`.
+#[derive(Debug, Clone)]
+pub struct Device {
+    pub hostname: String,
+    pub num_kv_pages: usize,
+    pub max_batch_size: usize,
+    pub max_batch_tokens: usize,
+}
+
+// =============================================================================
+// Device Service
+// =============================================================================
+
+static DEVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
+
+/// Messages handled by the device service.
+#[derive(Debug)]
+pub(crate) enum Message {
+    /// RPC call (request-response).
+    Call {
+        method: String,
+        payload: Vec<u8>,
+        response: oneshot::Sender<Result<Vec<u8>>>,
+    },
+    /// Fire-and-forget RPC notification.
+    Notify {
+        method: String,
+        payload: Vec<u8>,
+    },
+    /// Query device configuration.
+    GetInfo {
+        response: oneshot::Sender<Device>,
+    },
+}
+
+/// Per-device service that owns the RPC connection.
+struct DeviceService {
+    config: Device,
+    rpc: RpcClient,
+}
+
+impl ServiceHandler for DeviceService {
+    type Message = Message;
+
+    async fn handle(&mut self, msg: Message) {
+        match msg {
+            Message::Call { method, payload, response } => {
+                let result = self.rpc.call(&method, payload).await;
+                let _ = response.send(result);
+            }
+            Message::Notify { method, payload } => {
+                if let Err(e) = self.rpc.notify(&method, payload) {
+                    tracing::error!("Device notify '{}' failed: {e}", method);
+                }
+            }
+            Message::GetInfo { response } => {
+                let _ = response.send(self.config.clone());
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Public API
+// =============================================================================
+
+/// Spawn a device service. Returns the device index in the global array.
+pub fn spawn(
+    hostname: &str,
+    num_kv_pages: usize,
+    max_batch_size: usize,
+    max_batch_tokens: usize,
+) -> usize {
+    DEVICES.spawn(move || {
+        let device = Device {
+            hostname: hostname.to_string(),
+            num_kv_pages,
+            max_batch_size,
+            max_batch_tokens,
+        };
+        let rpc = RpcClient::connect(hostname)
+            .unwrap_or_else(|e| panic!("Failed to connect to device {hostname}: {e}"));
+        DeviceService { config: device, rpc }
+    }).expect("Failed to spawn device service")
+}
+
+/// Call a remote method, serializing args and deserializing the response.
+pub async fn call<T: Serialize, R: DeserializeOwned>(
+    device_idx: usize,
+    method: &str,
+    args: &T,
+) -> Result<R> {
+    let payload = rmp_serde::to_vec_named(args)
+        .map_err(|e| anyhow!("Failed to serialize args: {e}"))?;
+    let (tx, rx) = oneshot::channel();
+    DEVICES.send(device_idx, Message::Call {
+        method: method.to_string(),
+        payload,
+        response: tx,
+    })?;
+    let response = rx.await
+        .map_err(|_| anyhow!("Device service channel closed"))??;
+    rmp_serde::from_slice(&response)
+        .map_err(|e| anyhow!("Failed to deserialize response: {e}"))
+}
+
+/// Call a remote method with a timeout.
+pub async fn call_with_timeout<T: Serialize, R: DeserializeOwned>(
+    device_idx: usize,
+    method: &str,
+    args: &T,
+    timeout: Duration,
+) -> Result<R> {
+    tokio::time::timeout(timeout, call(device_idx, method, args))
+        .await
+        .map_err(|_| anyhow!("Device call '{method}' timed out"))?
+}
+
+/// Fire-and-forget notification, serializing args.
+pub fn notify<T: Serialize>(device_idx: usize, method: &str, args: &T) -> Result<()> {
+    let payload = rmp_serde::to_vec_named(args)
+        .map_err(|e| anyhow!("Failed to serialize args: {e}"))?;
+    DEVICES.send(device_idx, Message::Notify {
+        method: method.to_string(),
+        payload,
+    })
+}
+
+/// Query a device's configuration.
+pub async fn get_info(device_idx: usize) -> Result<Device> {
+    let (tx, rx) = oneshot::channel();
+    DEVICES.send(device_idx, Message::GetInfo { response: tx })?;
+    rx.await.map_err(|_| anyhow!("Device service channel closed"))
+}
+
+// =============================================================================
+// RPC infrastructure for cross-process IPC communication.
+//
+// Provides both server and client types for IPC-based RPC:
+//
+// - `RpcServer`: Creates an `IpcOneShotServer`, accepts a client
+//   connection, and exposes `poll()` / `respond()` for request handling.
+//
+// - `RpcClient`: Connects to an existing `IpcOneShotServer` and
+//   exposes async `call()` / `notify()` for sending requests.
+//
+// In the inference pattern, Python wraps `RpcServer` (via `PyRpcServer`)
+// and Rust connects via `RpcClient`.
+// =============================================================================
 // =============================================================================
 // Wire Types
 // =============================================================================
@@ -233,8 +386,8 @@ impl RpcClient {
         })
     }
 
-    /// Send a raw request and await the response.
-    async fn raw_call(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
+    /// Send a request and await the response.
+    pub async fn call(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let request = IpcRequest {
@@ -262,29 +415,8 @@ impl RpcClient {
             .map_err(|_| anyhow!("Response channel closed"))
     }
 
-    /// Call a remote method, serializing args and deserializing the response.
-    pub async fn call<T, R>(&self, method: &str, args: &T) -> Result<R>
-    where
-        T: Serialize,
-        R: DeserializeOwned,
-    {
-        let payload = rmp_serde::to_vec_named(args)
-            .map_err(|e| anyhow!("Failed to serialize args: {}", e))?;
-
-        let response = self.raw_call(method, payload).await?;
-
-        rmp_serde::from_slice(&response)
-            .map_err(|e| anyhow!("Failed to deserialize response: {}", e))
-    }
-
     /// Fire-and-forget notification (no response expected).
-    pub fn notify<T>(&self, method: &str, args: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
-        let payload = rmp_serde::to_vec_named(args)
-            .map_err(|e| anyhow!("Failed to serialize args: {}", e))?;
-
+    pub fn notify(&self, method: &str, payload: Vec<u8>) -> Result<()> {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = IpcRequest {
             request_id,
@@ -297,28 +429,4 @@ impl RpcClient {
         Ok(())
     }
 
-    /// Call with a timeout.
-    pub async fn call_with_timeout<T, R>(
-        &self,
-        method: &str,
-        args: &T,
-        timeout: Duration,
-    ) -> Result<R>
-    where
-        T: Serialize,
-        R: DeserializeOwned,
-    {
-        tokio::time::timeout(timeout, self.call(method, args))
-            .await
-            .map_err(|_| anyhow!("RPC call timed out"))?
-    }
-
-}
-
-impl std::fmt::Debug for RpcClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RpcClient")
-            .field("pending_requests", &self.pending.len())
-            .finish()
-    }
 }
