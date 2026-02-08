@@ -4,22 +4,29 @@
 //! It exposes functionality via PyO3 bindings for integration with Python.
 
 // Public modules (core engine logic)
+pub mod service;
+pub mod adapter;
 pub mod api;
 pub mod auth;
+pub mod context;
 pub mod dummy;
-pub mod engine;
-pub mod instance;
-pub mod kvs;
+pub mod bootstrap;
+pub mod inference;
+pub mod kvcache;
 pub mod messaging;
 pub mod model;
+pub mod program;
 pub mod runtime;
 pub mod server;
-pub mod service;
+
+// Re-export instance and output types from runtime
+pub use runtime::instance;
+pub use runtime::output;
 pub mod telemetry;
 pub mod utils;
 
-// FFI module for PyO3 bindings
-mod ffi;
+// FFI module for PyO3 bindings, IPC, and format types
+pub mod ffi;
 
 // Re-export the Python module entry point
 pub use ffi::_pie;
