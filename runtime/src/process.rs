@@ -26,7 +26,7 @@ pub type ProcessId = usize;
 
 /// Reason a process was terminated.
 #[derive(Debug, Clone)]
-pub enum TerminationCause {
+pub enum ProcessEvent {
     Normal(String),
     Signal,
     Exception(String),
@@ -197,7 +197,7 @@ impl Process {
     /// Deliver output to the attached client, or buffer it if capturing.
     fn deliver_output(&mut self, content: String) {
         if let Some(client_id) = self.client_id {
-            if server::sessions::streaming_output(client_id, self.process_id, content.clone()).is_err() {
+            if server::send_output_to_client(client_id, self.process_id, content.clone()).is_err() {
                 // Client gone — detach and fall back to buffering
                 self.client_id = None;
                 self.buffer_output(content);
@@ -213,6 +213,19 @@ impl Process {
             self.output_buffer.pop_front();
         }
         self.output_buffer.push_back(content);
+    }
+
+    /// Flush buffered output to the attached client.
+    /// On failure, detaches the client and retains undelivered entries.
+    fn flush_output_buffer(&mut self) {
+        let Some(client_id) = self.client_id else { return };
+        while let Some(buffered) = self.output_buffer.pop_front() {
+            if server::send_output_to_client(client_id, self.process_id, buffered.clone()).is_err() {
+                self.client_id = None;
+                self.output_buffer.push_front(buffered);
+                break;
+            }
+        }
     }
 
     /// Runs the WASM component: instantiate, find the `run` export, and call it.
@@ -279,11 +292,11 @@ impl Process {
         if let Some(client_id) = self.client_id.take() {
             let process_id = self.process_id;
             let cause = match exception {
-                Some(msg) => TerminationCause::Exception(msg),
-                None => TerminationCause::Normal(String::new()),
+                Some(msg) => ProcessEvent::Exception(msg),
+                None => ProcessEvent::Normal(String::new()),
             };
-            let _ = server::sessions::terminate(client_id, process_id, cause);
-            let _ = server::unregister_instance(process_id);
+            let _ = server::send_process_event_to_client(client_id, process_id, cause);
+            let _ = server::unregister_process(process_id);
         }
 
         SERVICES.remove(&self.process_id);
@@ -296,18 +309,13 @@ impl ServiceHandler for Process {
     async fn handle(&mut self, msg: Message) {
         match msg {
             Message::AttachClient { client_id, response } => {
-                self.client_id = Some(client_id);
-
-                // Flush buffered output to the newly attached client
-                while let Some(buffered) = self.output_buffer.pop_front() {
-                    if server::sessions::streaming_output(client_id, self.process_id, buffered.clone()).is_err() {
-                        self.client_id = None;
-                        self.output_buffer.push_front(buffered);
-                        break;
-                    }
+                if self.client_id.is_some() {
+                    let _ = response.send(Err(anyhow!("already attached")));
+                } else {
+                    self.client_id = Some(client_id);
+                    self.flush_output_buffer();
+                    let _ = response.send(Ok(()));
                 }
-
-                let _ = response.send(Ok(()));
             }
 
             Message::DetachClient => {

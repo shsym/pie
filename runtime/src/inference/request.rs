@@ -132,6 +132,20 @@ impl Serialize for ByteVec {
     }
 }
 
+impl<'de> Deserialize<'de> for ByteVec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+        let values: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect();
+        Ok(ByteVec(values))
+    }
+}
+
 /// Wrapper for Vec<f32> that serializes as raw bytes.
 #[derive(Debug, Clone, Default)]
 pub struct ByteVecF32(pub Vec<f32>);
@@ -146,8 +160,22 @@ impl Serialize for ByteVecF32 {
     }
 }
 
+impl<'de> Deserialize<'de> for ByteVecF32 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+        let values: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect();
+        Ok(ByteVecF32(values))
+    }
+}
+
 /// Batched forward pass request sent to Python.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchedForwardPassRequest {
     /// Token IDs (concatenated).
     pub token_ids: ByteVec,
@@ -262,4 +290,40 @@ impl BatchedForwardPassRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchedForwardPassResponse {
     pub results: Vec<ForwardPassResponse>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytevec_u32_serde_roundtrip() {
+        let original = ByteVec(vec![0, 1, u32::MAX, 42, 0xDEAD_BEEF]);
+        let packed = rmp_serde::to_vec(&original).expect("serialize");
+        let decoded: ByteVec = rmp_serde::from_slice(&packed).expect("deserialize");
+        assert_eq!(original.0, decoded.0);
+    }
+
+    #[test]
+    fn bytevec_f32_serde_roundtrip() {
+        let original = ByteVecF32(vec![0.0, 1.0, -1.5, f32::INFINITY, f32::NAN]);
+        let packed = rmp_serde::to_vec(&original).expect("serialize");
+        let decoded: ByteVecF32 = rmp_serde::from_slice(&packed).expect("deserialize");
+        // NaN != NaN, so compare element-by-element
+        for (a, b) in original.0.iter().zip(decoded.0.iter()) {
+            if a.is_nan() {
+                assert!(b.is_nan(), "expected NaN, got {b}");
+            } else {
+                assert_eq!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn bytevec_empty_roundtrip() {
+        let original = ByteVec(vec![]);
+        let packed = rmp_serde::to_vec(&original).expect("serialize");
+        let decoded: ByteVec = rmp_serde::from_slice(&packed).expect("deserialize");
+        assert!(decoded.0.is_empty());
+    }
 }

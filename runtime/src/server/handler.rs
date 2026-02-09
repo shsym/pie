@@ -8,10 +8,10 @@ use pie_client::message::{self, ServerMessage};
 
 use crate::daemon;
 use crate::messaging;
-use crate::process::{self, TerminationCause};
+use crate::process::{self, ProcessEvent};
 use crate::program::{self, Manifest, ProgramName};
 
-use super::session::Session;
+use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
 
 type ProcessId = usize;
@@ -21,7 +21,7 @@ type ProcessId = usize;
 // =============================================================================
 
 impl Session {
-    pub async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
+    pub(super) async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
         match subject.as_str() {
             message::QUERY_PROGRAM_EXISTS => {
                 // Parse the record as "name@version"
@@ -57,7 +57,7 @@ impl Session {
         }
     }
 
-    pub async fn handle_list_instances(&self, corr_id: u32) {
+    pub(super) async fn handle_list_processes(&self, corr_id: u32) {
         let instances = process::list()
             .into_iter()
             .map(|id| message::InstanceInfo {
@@ -69,7 +69,7 @@ impl Session {
                 kv_pages_used: 0,
             })
             .collect();
-        self.send(ServerMessage::LiveInstances { corr_id, instances })
+        self.send(ServerMessage::LiveProcesses { corr_id, instances })
             .await;
     }
 }
@@ -79,7 +79,7 @@ impl Session {
 // =============================================================================
 
 impl Session {
-    pub async fn handle_add_program(
+    pub(super) async fn handle_add_program(
         &mut self,
         corr_id: u32,
         program_hash: String,
@@ -148,7 +148,7 @@ impl Session {
 // =============================================================================
 
 impl Session {
-    pub async fn handle_launch_instance(
+    pub(super) async fn handle_launch_process(
         &mut self,
         corr_id: u32,
         inferlet: String,
@@ -159,7 +159,7 @@ impl Session {
 
         // Install program and dependencies (handles both uploaded and registry)
         if let Err(e) = program::install(&program_name).await {
-            self.send_launch_result(corr_id, false, e.to_string()).await;
+            self.send_process_launch_result(corr_id, false, e.to_string()).await;
             return;
         }
 
@@ -176,21 +176,21 @@ impl Session {
             Ok(process_id) => {
                 if capture_outputs {
                     // Register process -> client mapping with Server
-                    super::register_instance(process_id, self.id)
+                    super::register_process(process_id, self.id)
                     .ok();
                     self.attached_instances.push(process_id);
                 }
 
-                self.send_launch_result(corr_id, true, process_id.to_string())
+                self.send_process_launch_result(corr_id, true, process_id.to_string())
                     .await;
             }
             Err(e) => {
-                self.send_launch_result(corr_id, false, e.to_string()).await;
+                self.send_process_launch_result(corr_id, false, e.to_string()).await;
             }
         }
     }
 
-    pub async fn handle_launch_server_instance(
+    pub(super) async fn handle_launch_daemon(
         &mut self,
         corr_id: u32,
         port: u32,
@@ -227,11 +227,11 @@ impl Session {
 // =============================================================================
 
 impl Session {
-    pub async fn handle_attach_instance(&mut self, corr_id: u32, instance_id: String) {
+    pub(super) async fn handle_attach_process(&mut self, corr_id: u32, instance_id: String) {
         let process_id: ProcessId = match instance_id.parse() {
             Ok(id) => id,
             Err(_) => {
-                self.send_attach_result(corr_id, false, "Invalid instance_id".to_string())
+                self.send_process_attach_result(corr_id, false, "Invalid instance_id".to_string())
                     .await;
                 return;
             }
@@ -239,22 +239,22 @@ impl Session {
 
         match process::attach(process_id, self.id).await {
             Ok(()) => {
-                self.send_attach_result(corr_id, true, "Instance attached".to_string())
+                self.send_process_attach_result(corr_id, true, "Instance attached".to_string())
                     .await;
 
                 // Register process → client mapping with Server
-                super::register_instance(process_id, self.id)
+                super::register_process(process_id, self.id)
                 .ok();
                 self.attached_instances.push(process_id);
             }
             Err(_) => {
-                self.send_attach_result(corr_id, false, "Instance not found".to_string())
+                self.send_process_attach_result(corr_id, false, "Instance not found".to_string())
                     .await;
             }
         }
     }
 
-    pub async fn handle_signal_instance(&mut self, instance_id: String, message: String) {
+    pub(super) async fn handle_signal_process(&mut self, instance_id: String, message: String) {
         if let Ok(process_id) = instance_id.parse::<ProcessId>() {
             if self.attached_instances.contains(&process_id) {
                 messaging::push(process_id.to_string(), message).unwrap();
@@ -262,7 +262,7 @@ impl Session {
         }
     }
 
-    pub async fn handle_terminate_instance(&mut self, corr_id: u32, instance_id: String) {
+    pub(super) async fn handle_terminate_process(&mut self, corr_id: u32, instance_id: String) {
         if let Ok(process_id) = instance_id.parse::<ProcessId>() {
             process::terminate(process_id, Some("Signal".to_string()));
             self.send_response(corr_id, true, "Instance terminated".to_string())
@@ -281,7 +281,7 @@ impl Session {
 // =============================================================================
 
 impl Session {
-    pub async fn handle_upload_blob(
+    pub(super) async fn handle_upload_blob(
         &mut self,
         corr_id: u32,
         instance_id: String,
@@ -358,7 +358,7 @@ impl Session {
         }
     }
 
-    pub async fn handle_send_blob(&mut self, process_id: ProcessId, data: Bytes) {
+    pub(super) async fn handle_send_blob(&mut self, process_id: ProcessId, data: Bytes) {
         let blob_hash = blake3::hash(&data).to_hex().to_string();
         let total_chunks = (data.len() + message::CHUNK_SIZE_BYTES - 1) / message::CHUNK_SIZE_BYTES;
 
