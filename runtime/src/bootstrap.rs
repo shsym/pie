@@ -12,10 +12,10 @@ use crate::context;
 use crate::device;
 use crate::inference;
 use crate::inference::kvcache::PageStore;
+use crate::linker;
 use crate::messaging;
 use crate::model;
 use crate::program;
-use crate::runtime;
 use crate::server;
 use crate::telemetry;
 
@@ -87,12 +87,12 @@ pub async fn bootstrap(
     );
 
     program::spawn(
-        wasm_engine.clone(),
+        &wasm_engine,
         config.registry_url.clone(),
         config.cache_dir.clone(),
     );
 
-    runtime::spawn(wasm_engine);
+    linker::spawn(&wasm_engine);
     server::spawn(&config.host, config.port);
     messaging::spawn();
 
