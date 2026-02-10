@@ -80,7 +80,6 @@ def run(
         engine_config, model_configs = serve_module.load_config(
             config,
             port=port,
-            log_dir=str(log.parent) if log else None,
             dummy_mode=dummy,
         )
     except typer.Exit:
@@ -110,7 +109,7 @@ def run(
         # Start engine and backends
         from pie_runtime import manager
 
-        server_handle, backend_processes = manager.start_engine_and_backend(
+        server_handle, backend_processes = manager.start(
             engine_config, model_configs, console=console
         )
 
@@ -124,12 +123,15 @@ def run(
         }
 
         if path is not None:
-            manager.submit_inferlet_and_wait(
+            from pie_runtime import inferlet as inferlet_mod
+
+            inferlet_mod.submit_and_wait(
                 client_config, path, manifest, arguments or [], server_handle, backend_processes
             )
         else:
-            # Launch from registry
-            manager.submit_inferlet_from_registry_and_wait(
+            from pie_runtime import inferlet as inferlet_mod
+
+            inferlet_mod.submit_from_registry_and_wait(
                 client_config,
                 inferlet,
                 arguments or [],
@@ -140,23 +142,23 @@ def run(
         # Cleanup
         console.print()
         with console.status("[dim]Shutting down...[/dim]"):
-            manager.terminate_engine_and_backend(server_handle, backend_processes)
+            manager.terminate(server_handle, backend_processes)
         console.print("[green]✓[/green] Complete")
 
     except KeyboardInterrupt:
         console.print()
         console.print("[yellow]![/yellow] Interrupted")
         with console.status("[dim]Shutting down...[/dim]"):
-            manager.terminate_engine_and_backend(server_handle, backend_processes)
+            manager.terminate(server_handle, backend_processes)
         raise typer.Exit(130)
     except Exception as e:
         from pie_runtime import manager
 
         if isinstance(e, manager.EngineError):
             console.print(f"[red]✗[/red] {e}")
-            manager.terminate_engine_and_backend(server_handle, backend_processes)
+            manager.terminate(server_handle, backend_processes)
             raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]✗[/red] Error: {e}")
-        manager.terminate_engine_and_backend(server_handle, backend_processes)
+        manager.terminate(server_handle, backend_processes)
         raise typer.Exit(1)
