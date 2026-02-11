@@ -12,8 +12,6 @@ from rich.progress import (
     BarColumn,
     DownloadColumn,
     Progress,
-    ProgressColumn,
-    SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
     TimeRemainingColumn,
@@ -116,35 +114,6 @@ class TqdmProgress:
         pass
 
 
-class SmartDownloadColumn(ProgressColumn):
-    """Renders file size if unit is 'B', otherwise 'completed/total unit'."""
-
-    def render(self, task: "Task") -> Text:
-        unit = task.fields.get("unit", "it")
-        if unit == "B":
-            return DownloadColumn().render(task)
-
-        if task.total is None:
-            return Text(f"{int(task.completed)} {unit}", style="progress.download")
-
-        return Text(
-            f"{int(task.completed)}/{int(task.total)} {unit}", style="progress.download"
-        )
-
-
-class SmartTransferSpeedColumn(ProgressColumn):
-    """Renders transfer speed if unit is 'B', otherwise 'speed unit/s'."""
-
-    def render(self, task: "Task") -> Text:
-        unit = task.fields.get("unit", "it")
-        if unit == "B":
-            return TransferSpeedColumn().render(task)
-
-        if task.speed is None:
-            return Text("?", style="progress.data.speed")
-
-        return Text(f"{task.speed:.1f} {unit}/s", style="progress.data.speed")
-
 
 console = Console()
 app = typer.Typer(help="Manage models from HuggingFace")
@@ -153,10 +122,11 @@ app = typer.Typer(help="Manage models from HuggingFace")
 @app.command("list")
 def model_list() -> None:
     """List locally cached HuggingFace models."""
-    from pie_cli.model_utils import (
+    from pie_backend.hf_utils import (
         get_hf_cache_dir,
+        get_hf_snapshot_dir,
+        load_hf_config,
         parse_repo_id_from_dirname,
-        get_model_config,
         check_pie_compatibility,
     )
 
@@ -183,7 +153,11 @@ def model_list() -> None:
         if repo_id is None:
             continue
 
-        config = get_model_config(cache_dir, repo_id)
+        try:
+            snapshot = get_hf_snapshot_dir(repo_id)
+            config = load_hf_config(snapshot)
+        except (ValueError, OSError):
+            config = None
         compatible, info = check_pie_compatibility(config)
         models.append((repo_id, compatible, info))
 
@@ -275,14 +249,17 @@ def model_download(
         console.print(f"[green]✓[/green] Downloaded to {local_path}")
 
         # Check compatibility
-        from pie_cli.model_utils import (
-            get_hf_cache_dir,
-            get_model_config,
+        from pie_backend.hf_utils import (
+            get_hf_snapshot_dir,
+            load_hf_config,
             check_pie_compatibility,
         )
 
-        cache_dir = get_hf_cache_dir()
-        config = get_model_config(cache_dir, repo_id)
+        try:
+            snapshot = get_hf_snapshot_dir(repo_id)
+            config = load_hf_config(snapshot)
+        except (ValueError, OSError):
+            config = None
         compatible, info = check_pie_compatibility(config)
 
         console.print()
@@ -302,7 +279,6 @@ def model_download(
 def model_remove(
     repo_id: str = typer.Argument(..., help="HuggingFace repo ID to remove")
 ) -> None:
-    """Remove a locally cached model."""
     """Remove a locally cached model."""
     try:
         from huggingface_hub import scan_cache_dir
