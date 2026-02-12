@@ -31,7 +31,7 @@ opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
 opentelemetry-semantic-conventions = "0.27"
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 wasmtime = { version = "38.0.0", features = ["pooling-allocator", "component-model-async"] }
 wasmtime-wasi = "38.0.0"
 wasmtime-wasi-http = "38.0.0"
@@ -70,6 +70,7 @@ aho-corasick = "1"
 memchr = "2"
 unicode-normalization = "0.1"
 smallvec = "1"
+lru = "0.16.3"
 
 [dev-dependencies]
 tempfile = "3"
@@ -79,3 +80,7 @@ tokenizers = "0.21"
 [[bench]]
 name = "inferlet_bench"
 harness = false
+
+#[profile.release]
+#lto = "fat"
+#codegen-units = 1

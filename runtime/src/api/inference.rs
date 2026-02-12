@@ -5,11 +5,15 @@ use crate::api::context::Context;
 use crate::api::model::Model;
 use crate::api::adapter::Adapter;
 use crate::linker::InstanceState;
-use crate::inference::brle::Brle;
+use crate::brle::Brle;
+use crate::inference::request::{ForwardPassRequest, ForwardPassOutput};
+use crate::{context, inference};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::iter;
 use std::mem::take;
+use std::time::Instant;
+use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 use wasmtime_wasi::async_trait;
@@ -18,7 +22,7 @@ use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 #[derive(Debug)]
 pub struct ForwardPass {
     pub model_id: usize,
-    pub queue_uid: u32,
+    context_id: Option<crate::context::ContextId>,
     input_tokens: Vec<u32>,
     input_token_positions: Vec<u32>,
     speculative_tokens: Vec<u32>,
@@ -34,22 +38,91 @@ pub struct ForwardPass {
 #[derive(Debug)]
 pub struct FutureOutput {
     result: Option<pie::core::inference::Output>,
+    rx: Option<oneshot::Receiver<ForwardPassOutput>>,
     done: bool,
 }
 
 #[async_trait]
 impl Pollable for FutureOutput {
     async fn ready(&mut self) {
-        // Immediately ready since we're stubbed out
-        self.done = true;
+        if self.done {
+            return;
+        }
+        if let Some(rx) = self.rx.take() {
+            match rx.await {
+                Ok(output) => {
+                    self.result = Some(convert_output(output));
+                    self.done = true;
+                }
+                Err(_) => {
+                    self.result = Some(pie::core::inference::Output::None);
+                    self.done = true;
+                }
+            }
+        } else {
+            self.done = true;
+        }
+    }
+}
+
+/// Convert internal ForwardPassOutput to WIT Output variant.
+fn convert_output(output: ForwardPassOutput) -> pie::core::inference::Output {
+    match output {
+        ForwardPassOutput::None => pie::core::inference::Output::None,
+        ForwardPassOutput::Tokens(tokens) => pie::core::inference::Output::Tokens(tokens),
+        ForwardPassOutput::TokensWithSpeculation(accepted, spec_tokens, spec_positions) => {
+            pie::core::inference::Output::TokensWithSpeculation((accepted, spec_tokens, spec_positions))
+        }
+        ForwardPassOutput::Embeddings(embeddings) => pie::core::inference::Output::Embeddings(embeddings),
+        ForwardPassOutput::Distributions(dists) => pie::core::inference::Output::Distributions(dists),
+    }
+}
+
+/// Convert a sampler HashMap to a request::Sampler enum.
+fn convert_sampler(map: &HashMap<String, rmpv::Value>) -> inference::Sampler {
+    let sampler_type = map.get("sampler")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+    let temperature = map.get("temperature")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0) as f32;
+
+    match sampler_type {
+        0 => {
+            let num_tokens = map.get("top_k").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+            inference::Sampler::Dist { temperature, num_tokens }
+        }
+        1 => {
+            let seed = map.get("seed").and_then(|v| v.as_u64()).map(|s| s as u32);
+            inference::Sampler::Multinomial { temperature, seed }
+        }
+        2 => {
+            let k = map.get("top_k").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+            inference::Sampler::TopK { temperature, k }
+        }
+        3 => {
+            let p = map.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            inference::Sampler::TopP { temperature, p }
+        }
+        4 => {
+            let p = map.get("min_p").and_then(|v| v.as_f64()).unwrap_or(0.05) as f32;
+            inference::Sampler::MinP { temperature, p }
+        }
+        5 => {
+            let k = map.get("top_k").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+            let p = map.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            inference::Sampler::TopKTopP { temperature, k, p }
+        }
+        6 => inference::Sampler::Embedding,
+        _ => inference::Sampler::Multinomial { temperature, seed: None },
     }
 }
 
 enum SamplerType {
     Distribution = 0,
     Multinomial = 1,
-    TopP = 2,
-    TopK = 3,
+    TopK = 2,
+    TopP = 3,
     MinP = 4,
     TopKTopP = 5,
     Embedding = 6,
@@ -62,7 +135,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let model = self.ctx().table.get(&model)?;
         let pass = ForwardPass {
             model_id: model.model_id,
-            queue_uid: 0, // Will be set when execute is called
+            context_id: None,
             input_tokens: vec![],
             input_token_positions: vec![],
             speculative_tokens: vec![],
@@ -77,8 +150,11 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         Ok(self.ctx().table.push(pass)?)
     }
 
-    async fn context(&mut self, _this: Resource<ForwardPass>, _context: Resource<Context>) -> Result<()> {
-        // TODO: Set context for KV cache
+    async fn context(&mut self, this: Resource<ForwardPass>, context: Resource<Context>) -> Result<()> {
+        let ctx = self.ctx().table.get(&context)?;
+        let context_id = ctx.context_id;
+        let pass = self.ctx().table.get_mut(&this)?;
+        pass.context_id = Some(context_id);
         Ok(())
     }
 
@@ -152,9 +228,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let mut sampler_map = HashMap::new();
         
         match sampler {
-            pie::core::inference::Sampler::Multinomial((temp, _seed)) => {
+            pie::core::inference::Sampler::Multinomial((temp, seed)) => {
                 sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Multinomial as u32));
                 sampler_map.insert("temperature".to_string(), rmpv::Value::from(temp));
+                sampler_map.insert("seed".to_string(), rmpv::Value::from(seed));
             }
             pie::core::inference::Sampler::TopK((temp, k)) => {
                 sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::TopK as u32));
@@ -204,24 +281,56 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         &mut self,
         this: Resource<ForwardPass>,
     ) -> Result<Result<Resource<FutureOutput>, String>> {
-        // Clear the pass state (no-op since we're not sending to backend anymore)
         let pass = self.ctx().table.get_mut(&this)?;
-        let _ = take(&mut pass.input_tokens);
-        let _ = take(&mut pass.input_token_positions);
-        let _ = take(&mut pass.mask);
-        let _ = take(&mut pass.logit_mask);
-        let _ = take(&mut pass.output_token_indices);
-        let _ = take(&mut pass.output_token_samplers);
 
-        // Return a stub FutureOutput that immediately returns None
-        // TODO: Implement proper inference through the new model architecture
-        tracing::warn!("ForwardPass::execute is stubbed out - legacy inference backend removed");
-        
-        let future_output = FutureOutput {
-            result: Some(pie::core::inference::Output::None),
-            done: true,
+        // Extract accumulated state
+        let model_id = pass.model_id;
+        let context_id = pass.context_id;
+        let tokens = take(&mut pass.input_tokens);
+        let positions = take(&mut pass.input_token_positions);
+        let speculative_tokens = take(&mut pass.speculative_tokens);
+        let speculative_positions = take(&mut pass.speculative_positions);
+        let output_speculative_tokens = pass.output_speculative_tokens;
+        let masks = take(&mut pass.mask);
+        let logit_mask = pass.logit_mask.take();
+        let sampling_indices = take(&mut pass.output_token_indices);
+        let sampler_maps = take(&mut pass.output_token_samplers);
+        let adapter_id = pass.adapter.map(|id| id as u64);
+
+        // Convert sampler maps to request::Sampler enums
+        let samplers: Vec<inference::Sampler> = sampler_maps.iter()
+            .map(convert_sampler)
+            .collect();
+
+        // Build the forward pass request
+        let request = ForwardPassRequest {
+            context_id,
+            tokens,
+            positions,
+            speculative_tokens,
+            speculative_positions,
+            output_speculative_tokens,
+            masks,
+            logit_mask,
+            sampling_indices,
+            samplers,
+            adapter_id,
+            adapter_seed: None,
+            arrival_time: Some(Instant::now()),
         };
-        Ok(Ok(self.ctx().table.push(future_output)?))
+
+        // Submit to inference service
+        match inference::forward_pass(model_id, request).await {
+            Ok(output) => {
+                let future_output = FutureOutput {
+                    result: Some(convert_output(output)),
+                    rx: None,
+                    done: true,
+                };
+                Ok(Ok(self.ctx().table.push(future_output)?))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {
@@ -249,3 +358,4 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
         Ok(())
     }
 }
+

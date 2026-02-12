@@ -50,6 +50,8 @@ class ForwardPassResponse(msgspec.Struct, gc=False):
 
     tokens: list[int]
     dists: list[tuple[list[int], list[float]]]
+    spec_tokens: list[int] = msgspec.field(default_factory=list)
+    spec_positions: list[int] = msgspec.field(default_factory=list)
 
 
 class EmbedImageRequest(msgspec.Struct, gc=False):
@@ -80,23 +82,23 @@ class UpdateAdapterRequest(msgspec.Struct, gc=False):
     max_sigma: float
 
 
-class UploadAdapterRequest(msgspec.Struct, gc=False):
-    """Request message for adapter upload."""
+class LoadAdapterRequest(msgspec.Struct, gc=False):
+    """Request message for loading adapter weights from file."""
 
     adapter_ptr: int
     name: str
     adapter_data: bytes | list[int]
 
 
-class DownloadAdapterRequest(msgspec.Struct, gc=False):
-    """Request message for adapter download."""
+class SaveAdapterRequest(msgspec.Struct, gc=False):
+    """Request message for saving adapter weights to file."""
 
     adapter_ptr: int
     name: str
 
 
-class DownloadAdapterResponse(msgspec.Struct, gc=False):
-    """Response message containing adapter data."""
+class SaveAdapterResponse(msgspec.Struct, gc=False):
+    """Response message containing saved adapter data."""
 
     adapter_data: bytes
 
