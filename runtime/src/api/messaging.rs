@@ -1,10 +1,9 @@
-//! pie:core/messaging - Messaging interface for send/receive and pub/sub
+//! pie:core/messaging - Process-to-process messaging (push/pull and pub/sub)
 
 use crate::api::pie;
 use crate::api::types::FutureString;
 use crate::linker::InstanceState;
 use crate::messaging;
-use crate::server;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::mem;
@@ -38,17 +37,15 @@ impl Pollable for Subscription {
 }
 
 impl pie::core::messaging::Host for InstanceState {
-    async fn send(&mut self, message: String) -> Result<()> {
-        let inst_id = self.id();
-        if let Some(client_id) = server::get_client_id(inst_id) {
-            server::send_event(client_id, inst_id, "message", message).ok();
-        }
+    async fn push(&mut self, topic: String, message: String) -> Result<()> {
+        let topic = format!("{}:{}", self.get_username(), topic);
+        messaging::push(topic, message)?;
         Ok(())
     }
 
-    async fn receive(&mut self) -> Result<Resource<FutureString>> {
+    async fn pull(&mut self, topic: String) -> Result<Resource<FutureString>> {
+        let topic = format!("{}:{}", self.get_username(), topic);
         let (tx, rx) = oneshot::channel();
-        let topic = self.id().to_string();
         tokio::spawn(async move {
             if let Ok(msg) = messaging::pull(topic).await {
                 let _ = tx.send(msg);
@@ -59,11 +56,13 @@ impl pie::core::messaging::Host for InstanceState {
     }
 
     async fn broadcast(&mut self, topic: String, message: String) -> Result<()> {
+        let topic = format!("{}:{}", self.get_username(), topic);
         messaging::publish(topic, message)?;
         Ok(())
     }
 
     async fn subscribe(&mut self, topic: String) -> Result<Resource<Subscription>> {
+        let topic = format!("{}:{}", self.get_username(), topic);
         let (tx, rx) = mpsc::channel(64);
         let sub_id = messaging::subscribe(topic.clone(), tx).await?;
         let sub = Subscription {
@@ -74,24 +73,6 @@ impl pie::core::messaging::Host for InstanceState {
             done: false,
         };
         Ok(self.ctx().table.push(sub)?)
-    }
-
-    async fn transfer_file(&mut self, data: Vec<u8>) -> Result<()> {
-        let topic = format!("blob:{}", self.id());
-        messaging::push_blob(topic, data.into())?;
-        Ok(())
-    }
-
-    async fn receive_file(&mut self) -> Result<Resource<crate::api::types::FutureBlob>> {
-        let (tx, rx) = oneshot::channel::<Vec<u8>>();
-        let topic = format!("blob:{}", self.id());
-        tokio::spawn(async move {
-            if let Ok(data) = messaging::pull_blob(topic).await {
-                let _ = tx.send(data.to_vec());
-            }
-        });
-        let future_blob = crate::api::types::FutureBlob::new(rx);
-        Ok(self.ctx().table.push(future_blob)?)
     }
 }
 

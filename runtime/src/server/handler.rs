@@ -32,7 +32,13 @@ impl Session {
             Some(v) => format!("{}@{}", name, v),
             None => name,
         };
-        let program_name = ProgramName::parse(&full_name);
+        let program_name = match ProgramName::parse(&full_name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+        };
         let exists = program::is_registered(&program_name).await;
         self.send_response(corr_id, true, exists.to_string()).await;
     }
@@ -68,14 +74,17 @@ impl Session {
     }
 
     pub(super) async fn handle_list_processes(&self, corr_id: u32) {
-        let processes: Vec<String> = process::list()
-            .into_iter()
-            .map(|id| {
-                super::get_uuid(id)
-                    .map(|u| u.to_string())
-                    .unwrap_or_else(|| id.to_string())
-            })
-            .collect();
+        let mut processes = Vec::new();
+        for id in process::list() {
+            if let Ok(owner) = process::get_username(id).await {
+                if owner == self.username {
+                    let label = super::get_uuid(id)
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| id.to_string());
+                    processes.push(label);
+                }
+            }
+        }
         let json = serde_json::to_string(&processes).unwrap();
         self.send_response(corr_id, true, json).await;
     }
@@ -162,7 +171,13 @@ impl Session {
         arguments: Vec<String>,
         capture_outputs: bool,
     ) {
-        let program_name = ProgramName::parse(&inferlet);
+        let program_name = match ProgramName::parse(&inferlet) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+        };
 
         // Install program and dependencies (handles both uploaded and registry)
         if let Err(e) = program::install(&program_name).await {
@@ -204,7 +219,13 @@ impl Session {
         inferlet: String,
         arguments: Vec<String>,
     ) {
-        let program_name = ProgramName::parse(&inferlet);
+        let program_name = match ProgramName::parse(&inferlet) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+        };
 
         // Install program and dependencies (handles both uploaded and registry)
         if let Err(e) = program::install(&program_name).await {
@@ -250,6 +271,21 @@ impl Session {
             }
         };
 
+        // Authorization: only the same user can attach
+        match process::get_username(process_id).await {
+            Ok(owner) if owner != self.username => {
+                self.send_response(corr_id, false, "Permission denied".to_string())
+                    .await;
+                return;
+            }
+            Err(_) => {
+                self.send_response(corr_id, false, "Process not found".to_string())
+                    .await;
+                return;
+            }
+            _ => {}
+        }
+
         match process::attach(process_id, self.id).await {
             Ok(()) => {
                 // Register process → client mapping with Server
@@ -274,14 +310,33 @@ impl Session {
     }
 
     pub(super) async fn handle_terminate_process(&mut self, corr_id: u32, process_id_str: String) {
-        if let Some(process_id) = self.resolve_process_id(&process_id_str) {
-            process::terminate(process_id, Some("Signal".to_string()));
-            self.send_response(corr_id, true, "Process terminated".to_string())
-                .await;
-        } else {
-            self.send_response(corr_id, false, "Invalid process ID".to_string())
-                .await;
+        let process_id = match self.resolve_process_id(&process_id_str) {
+            Some(id) => id,
+            None => {
+                self.send_response(corr_id, false, "Invalid process ID".to_string())
+                    .await;
+                return;
+            }
+        };
+
+        // Authorization: only the same user can terminate
+        match process::get_username(process_id).await {
+            Ok(owner) if owner != self.username => {
+                self.send_response(corr_id, false, "Permission denied".to_string())
+                    .await;
+                return;
+            }
+            Err(_) => {
+                self.send_response(corr_id, false, "Process not found".to_string())
+                    .await;
+                return;
+            }
+            _ => {}
         }
+
+        process::terminate(process_id, Some("Signal".to_string()));
+        self.send_response(corr_id, true, "Process terminated".to_string())
+            .await;
     }
 }
 
@@ -344,8 +399,12 @@ impl Session {
                     return;
                 }
 
-                // Send to process
-                messaging::push_blob(process_id.to_string(), Bytes::from(buffer)).unwrap();
+                // Deliver to waiting process
+                if let Some(sender) = self.file_waiters.remove(&process_id) {
+                    let _ = sender.send(Bytes::from(buffer));
+                } else {
+                    tracing::warn!("TransferFile: no waiter for process {}", process_id);
+                }
             }
         }
     }
