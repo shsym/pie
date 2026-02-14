@@ -4,10 +4,10 @@
 
 use std::sync::Arc;
 
-use pie::structured::grammar::Grammar;
-use pie::structured::json_schema::{builtin_json_grammar, json_schema_to_grammar, JsonSchemaOptions};
-use pie::structured::matcher::GrammarMatcher;
-use pie::tokenizer::Tokenizer;
+use pie::inference::structured::grammar::Grammar;
+use pie::inference::structured::json_schema::{builtin_json_grammar, json_schema_to_grammar, JsonSchemaOptions};
+use pie::inference::structured::matcher::GrammarMatcher;
+use pie::model::tokenizer::Tokenizer;
 
 fn is_grammar_accept_string_g(grammar: &Grammar, input: &str) -> bool {
     let vocab: Vec<String> = vec!["dummy".into()];

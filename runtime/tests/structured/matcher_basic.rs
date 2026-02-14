@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use pie::structured::bitmask;
-use pie::structured::grammar::Grammar;
-use pie::structured::matcher::GrammarMatcher;
-use pie::tokenizer::Tokenizer;
+use pie::inference::structured::bitmask;
+use pie::inference::structured::grammar::Grammar;
+use pie::inference::structured::matcher::GrammarMatcher;
+use pie::model::tokenizer::Tokenizer;
 
 /// Build a matcher with a given vocabulary.
 fn make_matcher(ebnf: &str, root: &str, vocab: &[&str]) -> GrammarMatcher {

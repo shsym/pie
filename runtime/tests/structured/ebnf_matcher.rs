@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
-use pie::structured::grammar::Grammar;
-use pie::structured::matcher::GrammarMatcher;
-use pie::tokenizer::Tokenizer;
+use pie::inference::structured::grammar::Grammar;
+use pie::inference::structured::matcher::GrammarMatcher;
+use pie::model::tokenizer::Tokenizer;
 
 /// Helper: does the grammar accept the given string?
 /// Mirrors xgrammar's `_is_grammar_accept_string`.
