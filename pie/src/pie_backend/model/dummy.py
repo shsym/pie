@@ -148,16 +148,23 @@ class DummyForwardPass:
         sampling_metadata: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Return random tokens instead of actual sampling.
+        Return random tokens and, when requested, random distributions.
+
+        Mirrors the interface of sample_common: returns a dict with
+        'tokens' (list[int]), 'dists' (list[tuple | None]), 'nan_indices'.
+
+        For distribution requests (sampler_type 0), produces random
+        (token_ids, probabilities) tuples so that inferlets using
+        Sampler::Dist (e.g. watermarking) work correctly in dummy mode.
 
         Args:
             hidden_states: Output hidden states (ignored)
             sampling_metadata: Metadata for sampling
 
         Returns:
-            Dictionary with random tokens and empty distributions
+            Dictionary with random tokens and distributions
         """
-        indices_for_logits = sampling_metadata.get("indices_for_logits", [])
+        indices_for_logits = sampling_metadata.get("indices_for_logits") or []
         num_samples = len(indices_for_logits)
 
         if num_samples == 0:
@@ -168,9 +175,32 @@ class DummyForwardPass:
             0, self.vocab_size, (num_samples,), device=self.device
         ).tolist()
 
+        # Build distributions: None for token-sampling, (ids, probs) for dist requests
+        dists: list[tuple[list[int], list[float]] | None] = [None] * num_samples
+
+        sampler_groups = sampling_metadata.get("sampler_groups", {})
+        dist_indices = sampler_groups.get(0, [])  # sampler_type 0 = distribution
+
+        if dist_indices:
+            top_k_tensor = sampling_metadata.get("top_k")
+            for idx in dist_indices:
+                # Determine k (number of top tokens to return)
+                k = 128  # default
+                if top_k_tensor is not None and idx < len(top_k_tensor):
+                    k = int(top_k_tensor[idx].item())
+                    if k <= 0:
+                        k = 128
+                k = min(k, self.vocab_size)
+
+                # Generate random token IDs and a random probability distribution
+                ids = torch.randint(0, self.vocab_size, (k,), device=self.device).tolist()
+                raw = torch.rand(k, device=self.device)
+                probs = (raw / raw.sum()).tolist()
+                dists[idx] = (ids, probs)
+
         return {
             "tokens": random_tokens,
-            "dists": [None] * num_samples,
+            "dists": dists,
             "nan_indices": [],
         }
 
@@ -230,19 +260,20 @@ def create_kv_cache(
     dtype = runtime_config.activation_dtype
     num_layers = model_config.num_layers
 
-    # Create minimal KV cache - just enough to satisfy the interface
-    # Real KV cache would be much larger based on max_num_kv_pages
+    # Allocate KV cache with the same page count the Rust scheduler manages.
+    # Use CPU tensors to avoid wasting GPU memory — dummy transform is a no-op.
+    num_pages = (runtime_config.max_num_kv_pages or 0) + 1
     kv_cache_at_layer = []
     for _ in range(num_layers):
-        # Minimal 1-page cache per layer
-        # Shape: [num_pages, 2, num_kv_heads, page_size, head_dim]
+        # Shape must match real models: [num_pages, 2, page_size, kv_heads, dim_head]
+        # engine.py reads shape[2] as page_size for bounds checks.
         cache = torch.zeros(
-            1,  # 1 page
+            num_pages,
             2,  # K and V
-            model_config.num_kv_heads,
             runtime_config.kv_page_size,
+            model_config.num_kv_heads,
             model_config.dim_head,
-            device=device,
+            device="cpu",
             dtype=dtype,
         )
         kv_cache_at_layer.append(cache)

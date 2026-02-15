@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 pub const CHUNK_SIZE_BYTES: usize = 256 * 1024; // 256 KiB
 pub const QUERY_MODEL_STATUS: &str = "model_status";
-pub const QUERY_BACKEND_STATS: &str = "backend_stats";
 
 /// Messages from client -> server
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,8 +50,10 @@ pub enum ClientMessage {
     LaunchProcess {
         corr_id: u32,
         inferlet: String,
-        arguments: Vec<String>,
+        input: String,
         capture_outputs: bool,
+        #[serde(default)]
+        token_budget: Option<usize>,
     },
 
     #[serde(rename = "launch_daemon")]
@@ -60,7 +61,7 @@ pub enum ClientMessage {
         corr_id: u32,
         port: u32,
         inferlet: String,
-        arguments: Vec<String>,
+        input: String,
     },
 
     #[serde(rename = "attach_process")]
@@ -110,6 +111,24 @@ pub enum ClientMessage {
         ok: bool,
         result: String,
     },
+
+    #[serde(rename = "submit_workflow")]
+    SubmitWorkflow {
+        corr_id: u32,
+        json: String,
+    },
+
+    #[serde(rename = "cancel_workflow")]
+    CancelWorkflow {
+        corr_id: u32,
+        workflow_id: String,
+    },
+
+    #[serde(rename = "attach_workflow")]
+    AttachWorkflow { corr_id: u32, workflow_id: String },
+
+    #[serde(rename = "detach_workflow")]
+    DetachWorkflow { corr_id: u32, workflow_id: String },
 }
 
 /// Messages from server -> client

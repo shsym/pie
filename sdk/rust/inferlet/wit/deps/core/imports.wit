@@ -5,7 +5,9 @@ world imports {
     import adapter;
     import context;
     import messaging;
+    import session;
     import model;
     import runtime;
     import inference;
+    import scheduling;
 }

@@ -48,18 +48,19 @@ fn program_name(name: &str) -> ProgramName {
 fn spawn_and_wait(
     s: &TestState,
     name: &str,
-    args: Vec<String>,
+    input: String,
 ) -> bool {
     let pid = s.rt.block_on(async {
         inferlets::add_and_install(name).await;
         process::spawn(
             "test-user".into(),
             program_name(name),
-            args,
-            None,
+            input,
             None,
             false,
             None,
+            None, // no workflow
+            None, // token_budget
         )
         .expect("spawn")
     });
@@ -87,7 +88,7 @@ fn spawn_and_wait(
 fn echo_runs_to_completion() {
     let s = state();
     assert!(
-        spawn_and_wait(s, "echo", vec!["hello".into(), "world".into()]),
+        spawn_and_wait(s, "echo", r#"{"message":"hello world"}"#.into()),
         "echo inferlet should complete within timeout"
     );
 }
@@ -96,7 +97,7 @@ fn echo_runs_to_completion() {
 fn error_inferlet_exits() {
     let s = state();
     assert!(
-        spawn_and_wait(s, "error", vec![]),
+        spawn_and_wait(s, "error", "{}".into()),
         "error inferlet should complete even on error"
     );
 }
@@ -105,7 +106,7 @@ fn error_inferlet_exits() {
 fn context_inferlet_exercises_host_apis() {
     let s = state();
     assert!(
-        spawn_and_wait(s, "context", vec![]),
+        spawn_and_wait(s, "context", "{}".into()),
         "context inferlet should complete (exercises model, tokenizer, context host APIs)"
     );
 }
@@ -114,7 +115,7 @@ fn context_inferlet_exercises_host_apis() {
 fn generate_inferlet_exercises_forward_pass() {
     let s = state();
     assert!(
-        spawn_and_wait(s, "generate", vec![]),
+        spawn_and_wait(s, "generate", "{}".into()),
         "generate inferlet should complete (exercises flush + generate pipeline)"
     );
 }
@@ -135,11 +136,12 @@ fn concurrent_spawns() {
                 let pid = process::spawn(
                     "stress-user".into(),
                     program_name("echo"),
-                    vec![format!("batch-{i}")],
-                    None,
+                    format!(r#"{{"batch":"{i}"}}"#),
                     None,
                     false,
                     None,
+                    None, // no workflow
+            None, // token_budget
                 )
                 .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"));
                 pid
@@ -172,11 +174,12 @@ fn rapid_sequential_spawns() {
             let pid = process::spawn(
                 "seq-user".into(),
                 program_name("echo"),
-                vec![format!("seq-{i}")],
-                None,
+                format!(r#"{{"seq":"{i}"}}"#),
                 None,
                 false,
                 None,
+                None, // no workflow
+            None, // token_budget
             )
             .unwrap_or_else(|e| panic!("sequential spawn {i} failed: {e}"));
 
@@ -208,19 +211,20 @@ fn mixed_success_and_error() {
 
         let mut pids = Vec::new();
         for i in 0..10 {
-            let (name, args) = if i % 2 == 0 {
-                ("echo", vec![format!("ok-{i}")])
+            let (name, input) = if i % 2 == 0 {
+                ("echo", format!(r#"{{"msg":"ok-{i}"}}"#))
             } else {
-                ("error", vec![])
+                ("error", "{}".to_string())
             };
             let pid = process::spawn(
                 "mixed-user".into(),
                 program_name(name),
-                args,
-                None,
+                input,
                 None,
                 false,
                 None,
+                None, // no workflow
+            None, // token_budget
             )
             .unwrap_or_else(|e| panic!("mixed spawn {i} ({name}) failed: {e}"));
             pids.push((i, name, pid));
@@ -252,15 +256,16 @@ fn spawn_after_termination() {
         let pid1 = process::spawn(
             "term-user".into(),
             program_name("echo"),
-            vec!["will-be-terminated".into()],
-            None,
+            r#"{"msg":"will-be-terminated"}"#.into(),
             None,
             false,
             None,
+            None, // no workflow
+            None, // token_budget
         )
         .expect("spawn for termination");
 
-        process::terminate(pid1, Some("test termination".into()));
+        process::terminate(pid1, Err("test termination".into()));
 
         let completed = tokio::time::timeout(PROCESS_TIMEOUT, async {
             loop {
@@ -278,11 +283,12 @@ fn spawn_after_termination() {
         let pid2 = process::spawn(
             "term-user".into(),
             program_name("echo"),
-            vec!["after-termination".into()],
-            None,
+            r#"{"msg":"after-termination"}"#.into(),
             None,
             false,
             None,
+            None, // no workflow
+            None, // token_budget
         )
         .expect("spawn after termination");
 

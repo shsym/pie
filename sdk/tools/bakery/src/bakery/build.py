@@ -207,8 +207,11 @@ def generate_py_wrapper(
 # This wrapper provides the WIT interface for the inferlet
 # Package: {package_name}
 
+import asyncio
+
 # Import WIT bindings for the run export
 from wit_world import exports
+from wit_world.imports.poll import poll as _wasi_poll
 
 # Import inferlet at top level so componentize-py bundles it
 import inferlet as _inferlet
@@ -216,17 +219,131 @@ import inferlet as _inferlet
 # Import user module at top level so componentize-py bundles it
 import {module_name} as _user_module
 
+
+# Minimal PollLoop — custom asyncio event loop backed by wasi:io/poll.
+class _PollLoop(asyncio.AbstractEventLoop):
+    def __init__(self):
+        self.wakers = []
+        self.running = False
+        self.handles = []
+        self.exception = None
+
+    def get_debug(self):
+        return False
+
+    def run_until_complete(self, future):
+        future = asyncio.ensure_future(future, loop=self)
+        self.running = True
+        asyncio.events._set_running_loop(self)
+        while self.running and not future.done():
+            handles = self.handles
+            self.handles = []
+            for handle in handles:
+                if not handle._cancelled:
+                    handle._run()
+            if self.wakers:
+                [pollables, wakers] = list(map(list, zip(*self.wakers)))
+                new_wakers = []
+                ready = [False] * len(pollables)
+                for index in _wasi_poll(pollables):
+                    ready[index] = True
+                for (r, p), w in zip(zip(ready, pollables), wakers):
+                    if r:
+                        p.__exit__(None, None, None)
+                        w.set_result(None)
+                    else:
+                        new_wakers.append((p, w))
+                self.wakers = new_wakers
+            if self.exception is not None:
+                raise self.exception
+        return future.result()
+
+    def is_running(self):
+        return self.running
+
+    def is_closed(self):
+        return not self.running
+
+    def stop(self):
+        self.running = False
+
+    def close(self):
+        self.running = False
+
+    def shutdown_asyncgens(self):
+        pass
+
+    def call_exception_handler(self, context):
+        self.exception = context.get("exception", None)
+
+    def call_soon(self, callback, *args, context=None):
+        handle = asyncio.Handle(callback, args, self, context)
+        self.handles.append(handle)
+        return handle
+
+    def create_task(self, coroutine):
+        return asyncio.Task(coroutine, loop=self)
+
+    def create_future(self):
+        return asyncio.Future(loop=self)
+
+    def run_forever(self):
+        raise NotImplementedError
+
+    async def shutdown_default_executor(self):
+        raise NotImplementedError
+
+    def _timer_handle_cancelled(self, handle):
+        raise NotImplementedError
+
+    def call_later(self, delay, callback, *args, context=None):
+        raise NotImplementedError
+
+    def call_at(self, when, callback, *args, context=None):
+        raise NotImplementedError
+
+    def time(self):
+        raise NotImplementedError
+
+    def call_soon_threadsafe(self, callback, *args, context=None):
+        raise NotImplementedError
+
+    def run_in_executor(self, executor, func, *args):
+        raise NotImplementedError
+
+    def set_default_executor(self, executor):
+        raise NotImplementedError
+
+
 class Run(exports.Run):
-    def run(self) -> None:
-        # Call the user's main function if it exists
+    def run(self, input: str) -> str:
+        # Install PollLoop as the asyncio event loop (drives wasi:io/poll)
+        loop = _PollLoop()
+        asyncio.set_event_loop(loop)
+
+        import json
+        # Parse JSON input into a dict for the user's main()
+        try:
+            input_data = json.loads(input) if input else {{}}
+        except json.JSONDecodeError:
+            input_data = {{"input": input}}
+
+        # Call the user's main function, passing parsed input
         if hasattr(_user_module, 'main'):
-            _user_module.main()
+            result = _user_module.main(input_data)
+            # Support both sync and async main()
+            if asyncio.iscoroutine(result):
+                result = loop.run_until_complete(result)
+            # Serialize structured output to JSON
+            if isinstance(result, dict):
+                return json.dumps(result)
+            if isinstance(result, str):
+                return result
         else:
             # Module execution happens at import time for scripts without main()
             pass
-        # Signal completion if user code didn't call set_return()
-        if not _inferlet.was_return_set():
-            _inferlet.set_return("")
+        
+        return _inferlet.get_return_value() or ""
 """
 
     output_path.write_text(wrapper_content)
@@ -289,7 +406,7 @@ def generate_dynamic_wit(
 
 // Dynamic run interface for this inferlet
 interface run {{
-    run: func() -> result<_, string>;
+    run: func(input: string) -> result<string, string>;
 }}
 
 // Exec world with imports and dynamic export
@@ -512,6 +629,7 @@ def run_esbuild_user_code(entry_point: Path, output_file: Path) -> None:
     """Bundle user code with esbuild (keeps inferlet imports external)."""
     cmd = [
         "npx",
+        "-y",
         "esbuild",
         str(entry_point),
         "--bundle",
@@ -573,6 +691,7 @@ def run_esbuild(
 
     cmd = [
         "npx",
+        "-y",
         "esbuild",
         str(entry_point),
         "--bundle",
@@ -590,7 +709,7 @@ def run_esbuild(
         cmd.append("--minify")
 
     # External WIT imports
-    cmd.extend(["--external:wasi:*", "--external:inferlet:*"])
+    cmd.extend(["--external:wasi:*", "--external:inferlet:*", "--external:pie:*"])
 
     # External Node.js built-ins
     nodejs_builtins = [
@@ -629,6 +748,7 @@ def run_componentize_js(
 
     cmd = [
         "npx",
+        "-y",
         "@bytecodealliance/componentize-js",
         str(input_js),
         "-o",
@@ -783,10 +903,6 @@ for (const node of ast.body) {
             console.error("FORBIDDEN:run");
             process.exit(1);
         }
-        if (name === "main") {
-            console.error("FORBIDDEN:main");
-            process.exit(1);
-        }
     }
 }
 console.log("OK");
@@ -822,11 +938,7 @@ console.log("OK");
                     "To fix: Remove the 'export const run = { ... }' block from your code.\n"
                     "The WIT interface is now automatically created by bakery build."
                 )
-            elif stderr.startswith("FORBIDDEN:main"):
-                raise RuntimeError(
-                    "User code must not export 'main' - use top-level code instead.\n\n"
-                    "To fix: Move your code from inside main() to the top level."
-                )
+
             else:
                 raise RuntimeError(f"Validation failed: {stderr}")
     finally:
@@ -866,17 +978,17 @@ if (typeof globalThis.Intl === 'undefined') {
     wrapper_content = f"""// Auto-generated by bakery build
 // This wrapper provides the WIT interface for the inferlet
 {intl_polyfill}
+// Import user's main function
+import {{ main as userMain }} from './{user_bundle_name}';
+
 // WIT interface export (inferlet:core/run)
 export const run = {{
-  run: async () => {{
-    try {{
-      await import('./{user_bundle_name}');
-      return {{ tag: 'ok' }};
-    }} catch (e) {{
-      const msg = e instanceof Error ? `${{e.message}}\\n${{e.stack}}` : String(e);
-      console.log(`\\nERROR: ${{msg}}\\n`);
-      return {{ tag: 'err', val: msg }};
+  async run(args) {{
+    if (typeof userMain === 'function') {{
+      const result = await userMain(args);
+      return typeof result === 'string' ? result : '';
     }}
+    return '';
   }},
 }};
 """
@@ -988,10 +1100,14 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
             "npx is required but not found. Please install Node.js (v18+)."
         )
 
+    # Read package name from Pie.toml
+    project_dir = input_path if input_path.is_dir() else input_path.parent
+    package_name = read_package_name(project_dir)
+
     # Resolve paths
     with console.status("[bold green]Resolving paths...[/bold green]"):
         inferlet_js_path = path_utils.get_inferlet_js_path()
-        wit_path = path_utils.get_wit_path()
+        wit_path = get_inferlet_wit_path()
 
     # Ensure npm dependencies
     ensure_npm_dependencies(inferlet_js_path)
@@ -1035,11 +1151,18 @@ def handle_js_build(input_path: Path, output: Path, debug: bool = False) -> None
             status.update("[bold green]📦 Bundling final output...[/bold green]")
             run_esbuild(wrapper_js, final_bundle, inferlet_js_path, debug)
 
-            # Step 6: Compile to WASM
+            # Step 6: Generate dynamic WIT directory with exec world
+            status.update(
+                "[bold green]🔧 Generating dynamic WIT...[/bold green]"
+            )
+            temp_wit_dir = temp_path / "wit"
+            generate_dynamic_wit(wit_path, temp_wit_dir, package_name)
+
+            # Step 7: Compile to WASM
             status.update(
                 "[bold green]🔧 Compiling to WebAssembly component...[/bold green]"
             )
-            run_componentize_js(final_bundle, output, wit_path, debug)
+            run_componentize_js(final_bundle, output, temp_wit_dir, debug)
 
     # Success
     wasm_size = output.stat().st_size if output.exists() else 0

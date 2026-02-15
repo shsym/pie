@@ -19,15 +19,27 @@ mod adaptive_policy;
 
 use tokio::sync::oneshot;
 
-use crate::context;
 use crate::service::{ServiceArray, ServiceHandler};
+use crate::context::pagestore::PhysicalPageId;
 use crate::device::DeviceId;
 use anyhow::Result;
 use request::{ForwardPassOutput, ForwardPassRequest};
 use scheduler::BatchScheduler;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 
 // Re-export public types
 pub use request::{ForwardPassOutput as Output, Sampler};
+pub use scheduler::SchedulerStats;
+
+/// Aggregated inference stats for a single model (across all devices).
+#[derive(Debug, Default, serde::Serialize)]
+pub struct InferenceStats {
+    pub total_batches: u64,
+    pub total_tokens_processed: u64,
+    pub last_batch_latency_us: u64,
+    pub avg_batch_latency_us: u64,
+}
 
 // =============================================================================
 // Public API
@@ -38,7 +50,6 @@ static SERVICES: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLoc
 /// Spawns a new inference service for a model.
 pub async fn spawn(
     device_indices: &[usize],
-    max_in_flight_batches: usize,
     request_timeout_secs: u64,
     max_wait_ms: u64,
     min_batch_for_optimization: usize,
@@ -57,18 +68,38 @@ pub async fn spawn(
         model_idx,
         device_ids,
         device_batch_limits,
-        max_in_flight_batches,
         request_timeout_secs,
         max_wait_ms,
         min_batch_for_optimization,
     )).expect("Failed to spawn inference service")
 }
 
-/// Executes a forward pass and returns the output.
-pub async fn forward_pass(model_idx: usize, request: ForwardPassRequest) -> Result<ForwardPassOutput> {
+/// Submits a pre-resolved forward pass to the appropriate device scheduler.
+///
+/// All context operations (ensure_resident, page resolution) must be done
+/// by the caller BEFORE calling this. The inference actor just dispatches
+/// to the batch scheduler — it never blocks on context operations.
+pub async fn submit(
+    model_idx: usize,
+    request: ForwardPassRequest,
+    device_idx: usize,
+    physical_page_ids: Vec<PhysicalPageId>,
+    last_page_len: u32,
+) -> Result<ForwardPassOutput> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::ForwardPass { request, response: tx })?;
-    Ok(rx.await?)
+    SERVICES.send(model_idx, Message::Submit {
+        request, device_idx, physical_page_ids, last_page_len, response: tx,
+    })?;
+    Ok(rx.await.map_err(|_| anyhow::anyhow!(
+        "inference submit: scheduler dropped response channel"
+    ))?)
+}
+
+/// Returns aggregated inference stats for a model (lock-free, non-blocking).
+pub async fn get_stats(model_idx: usize) -> InferenceStats {
+    let (tx, rx) = oneshot::channel();
+    let _ = SERVICES.send(model_idx, Message::GetStats { response: tx });
+    rx.await.unwrap_or_default()
 }
 
 // =============================================================================
@@ -83,6 +114,7 @@ struct InferenceService {
     model_idx: usize,
     num_devices: usize,
     schedulers: Vec<BatchScheduler>,
+    scheduler_stats: Vec<Arc<SchedulerStats>>,
 }
 
 impl std::fmt::Debug for InferenceService {
@@ -97,76 +129,62 @@ impl InferenceService {
         model_idx: usize,
         device_ids: Vec<DeviceId>,
         device_batch_limits: Vec<(usize, usize)>,
-        max_in_flight_batches: usize,
         request_timeout_secs: u64,
         max_wait_ms: u64,
         min_batch_for_optimization: usize,
     ) -> Self {
         let num_devices = device_ids.len();
-        let schedulers = device_ids.iter().enumerate().map(|(device_idx, &device_id)| {
+        let schedulers: Vec<BatchScheduler> = device_ids.iter().enumerate().map(|(device_idx, &device_id)| {
             let (max_batch_size, max_batch_tokens) = device_batch_limits[device_idx];
             BatchScheduler::new(
                 device_id,
                 device_idx,
                 max_batch_size,
                 max_batch_tokens,
-                max_in_flight_batches,
                 request_timeout_secs,
                 max_wait_ms,
                 min_batch_for_optimization,
             )
         }).collect();
 
+        let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
+
         InferenceService {
             model_idx,
             num_devices,
             schedulers,
+            scheduler_stats,
         }
     }
 
-    /// Resolves physical pages from context and queues the forward pass.
-    async fn forward_pass(&self, mut request: ForwardPassRequest, response_tx: oneshot::Sender<ForwardPassOutput>) -> Result<()> {
-        // Resolve physical page IDs and existing KV length from context
-        let (pages_by_device, kv_len) = if let Some(ctx_id) = request.context_id {
-            context::get_physical_page_ids(self.model_idx, ctx_id).await?
-        } else {
-            (Default::default(), 0)
-        };
+    /// Aggregate stats from all per-device schedulers.
+    fn aggregate_stats(&self) -> InferenceStats {
+        let mut total_batches = 0u64;
+        let mut total_tokens = 0u64;
+        let mut last_latency = 0u64;
+        let mut cumulative_latency = 0u64;
 
-        // Context parallelism not yet supported — pages must reside on a single device
-        if pages_by_device.len() > 1 {
-            anyhow::bail!(
-                "Context pages span {} devices; context parallelism is not yet supported",
-                pages_by_device.len()
-            );
+        for s in &self.scheduler_stats {
+            total_batches += s.total_batches.load(Relaxed);
+            total_tokens += s.total_tokens_processed.load(Relaxed);
+            last_latency = last_latency.max(s.last_batch_latency_us.load(Relaxed));
+            cumulative_latency += s.cumulative_latency_us.load(Relaxed);
         }
 
-        // Extract the single device entry, or default to device 0
-        let (device_id, physical_page_ids) = pages_by_device
-            .into_iter()
-            .next()
-            .unwrap_or((0, vec![]));
-
-        // Compute FlashInfer's last_page_len: number of tokens in the last page
-        // AFTER writing the current input tokens.
-        // FlashInfer equation: seq_len = (num_pages - 1) * page_size + last_page_len
-        let num_pages = physical_page_ids.len() as u32;
-        let num_input_tokens = request.tokens.len() as u32;
-        let total_kv = kv_len + num_input_tokens;
-        let last_page_len = if num_pages == 0 {
+        let avg_latency = if total_batches > 0 {
+            cumulative_latency / total_batches
+        } else {
             0
-        } else {
-            let remainder = total_kv - (num_pages - 1) * context::tokens_per_page(
-                self.model_idx,
-                request.context_id.unwrap_or(0),
-            );
-            remainder
         };
 
-        // Route to the appropriate BatchScheduler
-        let device_idx = device_id.min(self.num_devices.saturating_sub(1));
-        self.schedulers[device_idx].submit(request, response_tx, physical_page_ids, last_page_len)
+        InferenceStats {
+            total_batches,
+            total_tokens_processed: total_tokens,
+            last_batch_latency_us: last_latency,
+            avg_batch_latency_us: avg_latency,
+        }
     }
+
 }
 
 // =============================================================================
@@ -176,7 +194,16 @@ impl InferenceService {
 /// Messages handled by InferenceService.
 #[derive(Debug)]
 enum Message {
-    ForwardPass { request: ForwardPassRequest, response: oneshot::Sender<ForwardPassOutput> },
+    /// Submit a pre-resolved forward pass to the scheduler.
+    /// All context operations must be done by the caller before sending this.
+    Submit {
+        request: ForwardPassRequest,
+        device_idx: usize,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+        response: oneshot::Sender<ForwardPassOutput>,
+    },
+    GetStats { response: oneshot::Sender<InferenceStats> },
 }
 
 
@@ -185,10 +212,16 @@ impl ServiceHandler for InferenceService {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::ForwardPass { request, response } => {
-                if let Err(e) = self.forward_pass(request, response).await {
-                    tracing::error!("Failed to queue forward pass: {}", e);
+            Message::Submit { request, device_idx, physical_page_ids, last_page_len, response } => {
+                let idx = device_idx.min(self.num_devices.saturating_sub(1));
+                if let Err(e) = self.schedulers[idx].submit(
+                    request, response, physical_page_ids, last_page_len,
+                ) {
+                    tracing::error!("Failed to submit to scheduler: {}", e);
                 }
+            }
+            Message::GetStats { response } => {
+                let _ = response.send(self.aggregate_stats());
             }
         }
     }

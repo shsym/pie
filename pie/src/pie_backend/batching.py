@@ -262,10 +262,10 @@ class Batch:
             ),
             "kv_page_indices": torch.as_tensor(
                 self.kv_page_indices, device=device, dtype=torch.int32
-            ),
+            ).contiguous(),
             "kv_page_indptr": torch.as_tensor(
                 self.kv_page_indptr, device=device, dtype=torch.int32
-            ),
+            ).contiguous(),
             "kv_last_page_lens": torch.as_tensor(
                 self.kv_last_page_lens, device=device, dtype=torch.int32
             ),

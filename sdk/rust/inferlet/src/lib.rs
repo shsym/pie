@@ -12,6 +12,11 @@ pub use wstd;
 // Re-export wit_bindgen so the macro-generated inline WIT can reference it
 pub use wit_bindgen;
 
+// Re-export serde and serde_json so the macro-generated JSON bridge can use them
+pub use serde;
+pub use serde_json;
+pub use schemars;
+
 // Re-export the main attribute macro
 pub use inferlet_macros::main;
 
@@ -21,7 +26,7 @@ wit_bindgen::generate!({
     world: "inferlet",
     pub_export_macro: true,
     with: {
-         "wasi:io/poll@0.2.4": wasi::io::poll,
+         "wasi:io/poll@0.2.4": ::wasi::io::poll,
     },
     generate_all,
 });
@@ -32,23 +37,44 @@ pub use pie::mcp;
 pub use pie::zo;
 
 // =============================================================================
-// Re-exports from raw bindings
+// Context (new wrapper module)
 // =============================================================================
 
-pub mod context {
-    pub use crate::pie::core::context::Context;
-}
+mod context;
+
+pub use context::{
+    Context, RawContext,
+    TokenStream, EventStream,
+    Speculate, Speculation, Constrain,
+    GrammarConstraint,
+};
+
+// =============================================================================
+// Adapter
+// =============================================================================
 
 pub mod adapter {
     pub use crate::pie::core::adapter::Adapter;
 }
 
+// =============================================================================
+// Model
+// =============================================================================
+
 pub mod model {
     pub use crate::pie::core::model::{Model, Tokenizer};
 }
 
+// =============================================================================
+// Other re-exports
+// =============================================================================
+
 pub mod runtime {
     pub use crate::pie::core::runtime::*;
+}
+
+pub mod scheduling {
+    pub use crate::pie::core::scheduling::*;
 }
 
 pub mod messaging {
@@ -76,21 +102,6 @@ pub mod instruct {
 // =============================================================================
 
 use wstd::io::AsyncPollable;
-
-/// Extension trait for async adapter operations.
-pub trait AdapterExt {
-    /// Acquires a lock on the adapter asynchronously.
-    fn acquire_lock_async(&self) -> impl std::future::Future<Output = bool>;
-}
-
-impl AdapterExt for adapter::Adapter {
-    async fn acquire_lock_async(&self) -> bool {
-        let future = self.acquire_lock();
-        let pollable = future.pollable();
-        AsyncPollable::new(pollable).wait_for().await;
-        future.get().unwrap_or(false)
-    }
-}
 
 /// Extension trait for async forward pass operations.
 pub trait ForwardPassExt {
@@ -136,32 +147,16 @@ impl FutureStringExt for types::FutureString {
 }
 
 // =============================================================================
-// Context Extension Trait (Consolidated)
+// Decoder (Unified) — re-exported from context module
 // =============================================================================
 
-mod context_ext;
-
-pub use context_ext::{
-    // ContextExt trait (has Fill + Generate + async operations)
-    ContextExt,
-    // Supporting types
-    TokenStream, EventStream, Speculate, Speculation, Constrain,
-};
-
-// =============================================================================
-// Instruct Extension Trait
-// =============================================================================
-
-mod instruct_ext;
-
-pub use instruct_ext::{
-    InstructExt,
-    // Unified decoder
+pub use context::{
     Decoder, Event,
     // Re-exported WIT decoder / event types
     ChatDecoder, ChatEvent,
     ToolDecoder, ToolEvent,
     ReasoningDecoder, ReasoningEvent,
+    Matcher,
 };
 
 // =============================================================================
@@ -202,18 +197,15 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::main;
-    pub use crate::context::Context;
+    pub use crate::Context;
     pub use crate::inference::{ForwardPass, Output, Sampler};
     pub use crate::model::Model;
     pub use crate::runtime;
     pub use crate::messaging;
     pub use crate::adapter::Adapter;
-    
+
     // Extension traits
-    pub use crate::ContextExt;
-    pub use crate::InstructExt;
     pub use crate::ModelExt;
-    pub use crate::AdapterExt;
     pub use crate::ForwardPassExt;
     pub use crate::SubscriptionExt;
     pub use crate::FutureStringExt;

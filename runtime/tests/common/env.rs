@@ -70,6 +70,7 @@ pub fn create_mock_env(
         .map(|name| DeviceConfig {
             hostname: name.clone(),
             total_pages: num_pages,
+            cpu_pages: 0,
             max_batch_size: 32,
             max_batch_tokens: 4096,
         })
@@ -98,13 +99,15 @@ pub fn create_mock_env(
             tokenizer_path,
             devices,
             scheduler: SchedulerConfig {
-                max_in_flight_batches: 4,
                 request_timeout_secs: 30,
                 max_wait_ms: 10,
                 min_batch_for_optimization: 1,
             },
+            default_token_budget: 4096,
         }],
         skip_tracing: true,
+        allow_filesystem: false,
+        max_concurrent_processes: None,
     };
 
     MockEnv {

@@ -8,7 +8,7 @@ use inferlet::{
 };
 
 #[inferlet::main]
-async fn main(_args: Vec<String>) -> Result<String> {
+async fn main(_input: String) -> Result<String> {
     // Load the first available model
     let models = runtime::models();
     let model = Model::load(&models[0])?;
@@ -18,7 +18,7 @@ async fn main(_args: Vec<String>) -> Result<String> {
     let encoded = tokenizer.encode("hello world");
 
     // Create a context
-    let ctx = Context::create(&model, "test-ctx", None)?;
+    let ctx = Context::create(&model)?;
 
     // Stage some buffered tokens
     ctx.set_buffered_tokens(&encoded);

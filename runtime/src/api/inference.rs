@@ -39,6 +39,7 @@ pub struct ForwardPass {
     output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     output_speculative_tokens: bool,
     adapter: Option<u32>,
+    pub adapter_seed: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -152,6 +153,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             output_token_samplers: vec![],
             output_speculative_tokens: true, // enabled by default
             adapter: None,
+            adapter_seed: None,
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -280,7 +282,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
         // Extract accumulated state
         let model_id = pass.model_id;
-        let context_id = pass.context_id;
         let tokens = take(&mut pass.input_tokens);
         let positions = take(&mut pass.input_token_positions);
         let speculative_tokens = take(&mut pass.speculative_tokens);
@@ -298,18 +299,73 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let sampling_indices = take(&mut pass.output_token_indices);
         let sampler_maps = take(&mut pass.output_token_samplers);
         let adapter_id = pass.adapter.map(|id| id as u64);
+        let adapter_seed = pass.adapter_seed;
 
         // Convert sampler maps to request::Sampler enums
         let samplers: Vec<inference::Sampler> = sampler_maps.iter()
             .map(convert_sampler)
             .collect();
 
-        // Save data needed for context::fill() before moving into request
+        // Save data needed for context::append_working_page_tokens() before moving into request
         let num_input_tokens = tokens.len();
+        let fill_tokens = tokens.clone();
         let fill_positions = positions.clone();
         let fill_masks = masks.clone();
 
-        // Build the forward pass request
+        let context_id = pass.context_id
+            .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
+
+        // =====================================================================
+        // Context preparation — runs in THIS process's tokio task, not the
+        // inference actor. This is critical: blocking here only stalls this
+        // one process, not the entire inference pipeline.
+        //
+        // STATE MACHINE (new 3-state context module):
+        //
+        //   reserve_working_pages: blocks if process is suspended — actor handles
+        //     restoration via drain_queues, process resumes automatically.
+        //   pin: Active → Pinned (non-evictable).
+        //   unpin: Pinned → Active (evictable again).
+        //
+        // The process calls unpin after fill, which is the ONLY
+        // transition Pinned → Active. Eviction of Pinned contexts is
+        // deferred via pending_suspend flag.
+        // =====================================================================
+
+        // Step 1: Resolve physical page IDs. Atomically pins the context
+        // (Active → Pinned) so pages cannot be evicted during the forward pass.
+        let pinned = match context::pin(model_id, context_id, num_input_tokens as u32).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("pin failed for ctx {context_id}: {e:#}");
+                return Ok(Err(e.to_string()));
+            }
+        };
+        let kv_len = pinned.kv_len;
+        let last_page_len = pinned.last_page_len;
+        let device_id = pinned.device;
+        let physical_page_ids = pinned.pages;
+
+        let num_pages = physical_page_ids.len() as u32;
+        let page_size = context::tokens_per_page(model_id);
+        let total_kv = kv_len + num_input_tokens as u32;
+
+        // INVARIANT: total_kv must fit within the allocated pages.
+        // Violation means working pages were lost between reserve_working_pages
+        // and execute — see swap lifecycle diagnostics.
+        let page_capacity = num_pages * page_size;
+        if total_kv > page_capacity || num_pages == 0 {
+            let msg = format!(
+                "KV_INVARIANT_VIOLATION ctx={context_id} total_kv={total_kv} \
+                 page_capacity={page_capacity} num_pages={num_pages} \
+                 kv_len={kv_len} num_input={num_input_tokens} page_size={page_size} \
+                 phys_ids={physical_page_ids:?}"
+            );
+            eprintln!("{msg}");
+            context::unpin(model_id, context_id);
+            return Ok(Err(msg));
+        }
+
         let request = ForwardPassRequest {
             context_id,
             tokens,
@@ -322,34 +378,60 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             sampling_indices,
             samplers,
             adapter_id,
-            adapter_seed: None,
+            adapter_seed,
             arrival_time: Some(Instant::now()),
         };
 
-        // Submit to inference service
-    match inference::forward_pass(model_id, request).await {
-        Ok(output) => {
-            // Mark input tokens as forwarded in the context
-            if let Some(ctx_id) = context_id {
+        // Step 5: Submit to inference service (inference actor just dispatches — never blocks)
+        let device_idx = device_id as usize;
+        match inference::submit(model_id, request, device_idx, physical_page_ids.clone(), last_page_len).await {
+            Ok(output) => {
+                // Diagnostic: log prefill metadata to trace corruption
+                // if num_input_tokens > 1 {
+                //     eprintln!(
+                //         "PREFILL_RESULT ctx={context_id} kv={kv_len} np={num_pages} \
+                //          inp={num_input_tokens} lpl={last_page_len} pages={physical_page_ids:?}"
+                //     );
+                // }
+                // Diagnostic: log first decode step metadata
+                // if num_input_tokens == 1 && kv_len < 45 {
+                //     eprintln!(
+                //         "DECODE_STEP ctx={context_id} kv={kv_len} np={num_pages} \
+                //          lpl={last_page_len} pos={:?} pages={physical_page_ids:?}",
+                //         fill_positions,
+                //     );
+                // }
+                // Step 3: Mark input tokens as forwarded WHILE still Pinned
+                // (non-evictable).  This ensures working_page_tokens + lineage are consistent
+                // before the context becomes Active (evictable).
                 if num_input_tokens > 0 {
-                    context::fill(
-                        model_id, ctx_id, num_input_tokens,
-                        fill_positions, fill_masks, adapter_id,
-                    )?;
+                    if let Err(e) = context::append_working_page_tokens(
+                        model_id, context_id, fill_tokens,
+                        fill_positions, fill_masks, adapter_id, adapter_seed,
+                    ).await {
+                        context::unpin(model_id, context_id);
+                        tracing::warn!("context::fill failed for ctx {context_id}: {e:#}");
+                        return Ok(Err(e.to_string()));
+                    }
                 }
-            }
 
-            let future_output = FutureOutput {
-                result: Some(convert_output(output)),
-                rx: None,
-                done: true,
-            };
-            Ok(Ok(self.ctx().table.push(future_output)?))
+                // Unpin — forward pass completed and tokens recorded in lineage.
+                // Context is now safe to evict: lineage is consistent with working_page_tokens.
+                context::unpin(model_id, context_id);
+
+                let future_output = FutureOutput {
+                    result: Some(convert_output(output)),
+                    rx: None,
+                    done: true,
+                };
+                Ok(Ok(self.ctx().table.push(future_output)?))
+            }
+            Err(e) => {
+                context::unpin(model_id, context_id);
+                tracing::warn!("inference::submit failed for ctx {context_id}: {e:#}");
+                return Ok(Err(e.to_string()));
+            },
         }
-        Err(e) => {
-            Ok(Err(e.to_string()))
-        },
-    }
     }
 
     async fn drop(&mut self, this: Resource<ForwardPass>) -> Result<()> {

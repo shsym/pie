@@ -7,10 +7,14 @@ use bytes::Bytes;
 use pie_client::message::ServerMessage;
 
 
+use crate::context;
 use crate::daemon;
+use crate::inference;
 use crate::messaging;
+use crate::model;
 use crate::process::{self, ProcessId};
 use crate::program::{self, Manifest, ProgramName};
+use crate::workflow::WorkflowId;
 
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
@@ -38,31 +42,32 @@ impl Session {
         self.send_response(corr_id, true, exists.to_string()).await;
     }
 
-    pub(super) async fn handle_query(&mut self, corr_id: u32, subject: String, record: String) {
+    pub(super) async fn handle_query(&mut self, corr_id: u32, subject: String, _record: String) {
         match subject.as_str() {
             pie_client::message::QUERY_MODEL_STATUS => {
-                // Model stats stubbed - the new model architecture uses per-actor stats
-                let runtime_stats: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
+                let mut stats = serde_json::Map::new();
+
+                for (model_idx, model_name) in model::models().iter().enumerate() {
+                    // KV page pool stats
+                    let kv = context::get_stats(model_idx).await;
+                    let (used, total) = kv.iter().fold((0u64, 0u64), |(u, t), &(a, b)| (u + a as u64, t + b as u64));
+                    stats.insert(format!("{}.kv_pages_used", model_name), serde_json::Value::from(used));
+                    stats.insert(format!("{}.kv_pages_total", model_name), serde_json::Value::from(total));
+
+                    // Inference stats (throughput, latency, batch count)
+                    let inf = inference::get_stats(model_idx).await;
+                    stats.insert(format!("{}.total_batches", model_name), serde_json::Value::from(inf.total_batches));
+                    stats.insert(format!("{}.total_tokens_processed", model_name), serde_json::Value::from(inf.total_tokens_processed));
+                    stats.insert(format!("{}.last_batch_latency_us", model_name), serde_json::Value::from(inf.last_batch_latency_us));
+                    stats.insert(format!("{}.avg_batch_latency_us", model_name), serde_json::Value::from(inf.avg_batch_latency_us));
+                }
+
                 self.send_response(
                     corr_id,
                     true,
-                    serde_json::to_string(&runtime_stats).unwrap(),
+                    serde_json::Value::Object(stats).to_string(),
                 )
                 .await;
-            }
-            pie_client::message::QUERY_BACKEND_STATS => {
-                // Backend stats stubbed - the new model architecture uses per-actor stats
-                let runtime_stats: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                let mut sorted_stats: Vec<_> = runtime_stats.iter().collect();
-                sorted_stats.sort_by_key(|(k, _)| *k);
-
-                let mut stats_str = String::new();
-                for (key, value) in sorted_stats {
-                    stats_str.push_str(&format!("{:<40} | {}\n", key, value));
-                }
-                self.send_response(corr_id, true, stats_str).await;
             }
             _ => println!("Unknown query subject: {}", subject),
         }
@@ -71,9 +76,9 @@ impl Session {
     pub(super) async fn handle_list_processes(&self, corr_id: u32) {
         let mut processes = Vec::new();
         for id in process::list() {
-            if let Ok(owner) = process::get_username(id).await {
-                if owner == self.username {
-                    processes.push(id.to_string());
+            if let Ok(stats) = process::get_stats(id).await {
+                if stats.username == self.username {
+                    processes.push(stats);
                 }
             }
         }
@@ -160,8 +165,9 @@ impl Session {
         &mut self,
         corr_id: u32,
         inferlet: String,
-        arguments: Vec<String>,
+        input: String,
         capture_outputs: bool,
+        token_budget: Option<usize>,
     ) {
         let program_name = match ProgramName::parse(&inferlet) {
             Ok(p) => p,
@@ -182,11 +188,12 @@ impl Session {
         match process::spawn(
             self.username.clone(),
             program_name,
-            arguments,
+            input,
             client_id,
-            None,
             capture_outputs,
             None,
+            None, // no workflow
+            token_budget,
         ) {
             Ok(process_id) => {
                 if capture_outputs {
@@ -208,7 +215,7 @@ impl Session {
         corr_id: u32,
         port: u32,
         inferlet: String,
-        arguments: Vec<String>,
+        input: String,
     ) {
         let program_name = match ProgramName::parse(&inferlet) {
             Ok(p) => p,
@@ -228,7 +235,7 @@ impl Session {
             self.username.clone(),
             program_name,
             port as u16,
-            arguments,
+            input,
         ) {
             Ok(_daemon_id) => {
                 self.send_response(corr_id, true, "server launched".to_string())
@@ -321,7 +328,7 @@ impl Session {
             _ => {}
         }
 
-        process::terminate(process_id, Some("Signal".to_string()));
+        process::terminate(process_id, Err("Signal".to_string()));
         self.send_response(corr_id, true, "Process terminated".to_string())
             .await;
     }
@@ -413,5 +420,91 @@ impl Session {
             })
             .await;
         }
+    }
+}
+
+// =============================================================================
+// Workflow Handlers
+// =============================================================================
+
+impl Session {
+    pub(super) async fn handle_submit_workflow(&mut self, corr_id: u32, json: String) {
+        match crate::workflow::submit(&self.username, &json, Some(self.id)).await {
+            Ok((workflow_id, result_rx)) => {
+                // Drop the result receiver — clients receive events via attach.
+                // The workflow actor stores the result internally.
+                drop(result_rx);
+                self.attached_workflows.push(workflow_id);
+                self.send_response(corr_id, true, workflow_id.to_string()).await;
+            }
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+            }
+        }
+    }
+
+    pub(super) async fn handle_cancel_workflow(&mut self, corr_id: u32, workflow_id: String) {
+        let wf_id = match workflow_id.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                self.send_response(corr_id, false, "Invalid workflow ID".to_string()).await;
+                return;
+            }
+        };
+        match crate::workflow::cancel(&wf_id) {
+            Ok(()) => {
+                self.send_response(corr_id, true, "Workflow cancelled".to_string()).await;
+            }
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+            }
+        }
+    }
+
+    pub(super) async fn handle_attach_workflow(&mut self, corr_id: u32, workflow_id: String) {
+        let wf_id: WorkflowId = match workflow_id.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                self.send_response(corr_id, false, "Invalid workflow ID".to_string()).await;
+                return;
+            }
+        };
+
+        // Authorization: only the same user can attach
+        match crate::workflow::get_username(&wf_id).await {
+            Ok(owner) if owner != self.username => {
+                self.send_response(corr_id, false, "Permission denied".to_string()).await;
+                return;
+            }
+            Err(_) => {
+                self.send_response(corr_id, false, "Workflow not found".to_string()).await;
+                return;
+            }
+            _ => {}
+        }
+
+        match crate::workflow::attach(&wf_id, self.id).await {
+            Ok(()) => {
+                self.attached_workflows.push(wf_id);
+                self.send_response(corr_id, true, "Workflow attached".to_string()).await;
+            }
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+            }
+        }
+    }
+
+    pub(super) async fn handle_detach_workflow(&mut self, corr_id: u32, workflow_id: String) {
+        let wf_id: WorkflowId = match workflow_id.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                self.send_response(corr_id, false, "Invalid workflow ID".to_string()).await;
+                return;
+            }
+        };
+
+        crate::workflow::detach(&wf_id);
+        self.attached_workflows.retain(|id| id != &wf_id);
+        self.send_response(corr_id, true, "Workflow detached".to_string()).await;
     }
 }

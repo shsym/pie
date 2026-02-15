@@ -77,6 +77,8 @@ pub async fn call_with_timeout<T: Serialize, R: DeserializeOwned>(
         .map_err(|_| anyhow!("Device call '{method}' timed out"))?
 }
 
+
+
 /// Sends a fire-and-forget notification, serializing `args`.
 pub fn notify<T: Serialize>(device_idx: usize, method: &str, args: &T) -> Result<()> {
     let payload = rmp_serde::to_vec_named(args)
@@ -84,6 +86,66 @@ pub fn notify<T: Serialize>(device_idx: usize, method: &str, args: &T) -> Result
     SERVICES.send(device_idx, Message::Notify {
         method: method.to_string(),
         payload,
+    })
+}
+
+// =============================================================================
+// Convenience Wrappers
+// =============================================================================
+
+/// Fires a batched forward pass on the given device (30 s timeout).
+pub async fn fire_batch(
+    device_idx: usize,
+    batch: &crate::inference::request::BatchedForwardPassRequest,
+) -> Result<crate::inference::request::BatchedForwardPassResponse> {
+    call_with_timeout(device_idx, "fire_batch", batch, Duration::from_secs(30)).await
+}
+
+/// GPU → CPU page copy (fire-and-forget).
+/// `gpu_phys_ids`: source GPU physical page IDs.
+/// `cpu_pages`: destination CPU swap pool page IDs.
+pub fn copy_d2h(device_idx: DeviceId, gpu_phys_ids: &[u32], cpu_pages: &[u32]) -> Result<()> {
+    #[derive(Serialize)]
+    struct Req { phys_ids: Vec<u32>, slots: Vec<u32> }
+    notify(device_idx, "copy_d2h", &Req {
+        phys_ids: gpu_phys_ids.to_vec(),
+        slots: cpu_pages.to_vec(),
+    })
+}
+
+/// CPU → GPU page copy (fire-and-forget).
+/// `gpu_phys_ids`: destination GPU physical page IDs.
+/// `cpu_pages`: source CPU swap pool page IDs.
+pub fn copy_h2d(device_idx: DeviceId, gpu_phys_ids: &[u32], cpu_pages: &[u32]) -> Result<()> {
+    #[derive(Serialize)]
+    struct Req { phys_ids: Vec<u32>, slots: Vec<u32> }
+    notify(device_idx, "copy_h2d", &Req {
+        phys_ids: gpu_phys_ids.to_vec(),
+        slots: cpu_pages.to_vec(),
+    })
+}
+
+/// GPU → GPU page copy (fire-and-forget).
+/// `src_phys_ids`: source GPU physical page IDs.
+/// `dst_phys_ids`: destination GPU physical page IDs.
+pub fn copy_d2d(device_idx: DeviceId, src_phys_ids: &[u32], dst_phys_ids: &[u32]) -> Result<()> {
+    #[derive(Serialize)]
+    struct Req { src_phys_ids: Vec<u32>, dst_phys_ids: Vec<u32> }
+    notify(device_idx, "copy_d2d", &Req {
+        src_phys_ids: src_phys_ids.to_vec(),
+        dst_phys_ids: dst_phys_ids.to_vec(),
+    })
+}
+
+/// CPU → CPU page copy (fire-and-forget).
+/// `src_slots`: source CPU swap pool page IDs.
+/// `dst_slots`: destination CPU swap pool page IDs.
+pub fn copy_h2h(device_idx: DeviceId, src_slots: &[u32], dst_slots: &[u32]) -> Result<()> {
+    #[derive(Serialize)]
+    struct Req { src_slots: Vec<u32>, dst_slots: Vec<u32> }
+    notify(device_idx, "copy_h2h", &Req {
+        src_slots: src_slots.to_vec(),
+        dst_slots: dst_slots.to_vec(),
     })
 }
 

@@ -28,9 +28,9 @@ use crate::process::ProcessId;
 static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
 
 /// Spawns the linker service with the given engine.
-pub fn spawn(engine: &Engine) {
+pub fn spawn(engine: &Engine, allow_filesystem: bool) {
     SERVICE
-        .spawn(|| Linker::new(engine))
+        .spawn(|| Linker::new(engine, allow_filesystem))
         .expect("linker already spawned");
 }
 
@@ -42,6 +42,7 @@ pub async fn instantiate(
     username: String,
     program_name: &ProgramName,
     capture_outputs: bool,
+    token_budget: Option<usize>,
 ) -> Result<(Store<InstanceState>, WasmInstance)> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Instantiate {
@@ -49,6 +50,7 @@ pub async fn instantiate(
         username,
         program_name: program_name.clone(),
         capture_outputs,
+        token_budget,
         response: tx,
     })?;
     rx.await?
@@ -58,11 +60,12 @@ pub async fn instantiate(
 
 struct Linker {
     engine: Engine,
+    allow_filesystem: bool,
 }
 
 impl Linker {
-    fn new(engine: &Engine) -> Self {
-        Linker { engine: engine.clone() }
+    fn new(engine: &Engine, allow_filesystem: bool) -> Self {
+        Linker { engine: engine.clone(), allow_filesystem }
     }
 
     async fn instantiate(
@@ -71,6 +74,7 @@ impl Linker {
         username: String,
         program_name: &ProgramName,
         capture_outputs: bool,
+        token_budget: Option<usize>,
     ) -> Result<(Store<InstanceState>, WasmInstance)> {
         // 1. Get the main component
         let component = program::get_wasm_component(program_name)
@@ -81,7 +85,7 @@ impl Linker {
         let dependency_components = self.resolve_dependency_components(program_name).await?;
 
         // 3. Create instance state and store
-        let inst_state = InstanceState::new(process_id, username, capture_outputs);
+        let inst_state = InstanceState::new(process_id, username, capture_outputs, self.allow_filesystem, token_budget);
         let mut store = Store::new(&self.engine, inst_state);
 
         // 4. Create and configure linker
@@ -145,6 +149,7 @@ enum Message {
         username: String,
         program_name: ProgramName,
         capture_outputs: bool,
+        token_budget: Option<usize>,
         response: oneshot::Sender<Result<(Store<InstanceState>, WasmInstance)>>,
     },
 }
@@ -154,9 +159,9 @@ impl ServiceHandler for Linker {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Instantiate { process_id, username, program_name, capture_outputs, response } => {
+            Message::Instantiate { process_id, username, program_name, capture_outputs, token_budget, response } => {
                 let _ = response.send(
-                    self.instantiate(process_id, username, &program_name, capture_outputs).await
+                    self.instantiate(process_id, username, &program_name, capture_outputs, token_budget).await
                 );
             }
         }

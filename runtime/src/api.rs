@@ -6,6 +6,7 @@ pub mod messaging;
 pub mod session;
 pub mod adapter;
 pub mod runtime;
+pub mod scheduling;
 
 pub mod mcp;
 pub mod zo;
@@ -18,8 +19,14 @@ wasmtime::component::bindgen!({
     world: "inferlet",
     with: {
         "wasi:io/poll": wasmtime_wasi::p2::bindings::io::poll,
+        "wasi:filesystem/types": wasmtime_wasi::p2::bindings::filesystem::types,
+        "wasi:filesystem/preopens": wasmtime_wasi::p2::bindings::filesystem::preopens,
+        "wasi:clocks/wall-clock": wasmtime_wasi::p2::bindings::clocks::wall_clock,
+        "wasi:io/streams": wasmtime_wasi::p2::bindings::io::streams,
+        "wasi:random/random": wasmtime_wasi::p2::bindings::random::random,
+        "wasi:random/insecure": wasmtime_wasi::p2::bindings::random::insecure,
+        "wasi:random/insecure-seed": wasmtime_wasi::p2::bindings::random::insecure_seed,
         // pie:core/types
-        "pie:core/types/future-bool": types::FutureBool,
         "pie:core/types/future-string": types::FutureString,
         "pie:core/types/future-blob": types::FutureBlob,
         // pie:core/context
@@ -57,6 +64,7 @@ where
         + pie::core::session::Host
         + pie::core::adapter::Host
         + pie::core::runtime::Host
+        + pie::core::scheduling::Host
         + pie::mcp::types::Host
         + pie::mcp::client::Host
         + pie::zo::zo::Host
@@ -72,6 +80,7 @@ where
     pie::core::session::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::adapter::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::runtime::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::scheduling::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::client::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::zo::zo::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;

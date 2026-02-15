@@ -4,9 +4,6 @@
 //! Delegates to the model's `Instruct` implementation.
 
 use crate::api::pie;
-use crate::api::context::Context;
-use crate::context;
-use crate::model;
 use crate::linker::InstanceState;
 use crate::model::instruct::{ToolDecoder, ToolEvent};
 use crate::inference::structured::grammar::Grammar as InternalGrammar;
@@ -31,27 +28,22 @@ impl std::fmt::Debug for Decoder {
 impl pie::instruct::tool_use::Host for InstanceState {
     async fn equip(
         &mut self,
-        ctx: Resource<Context>,
+        model: Resource<crate::api::model::Model>,
         tools: Vec<String>,
-    ) -> Result<Result<(), pie::core::types::Error>> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
-        let tokens = model.instruct().equip(&tools);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
-        Ok(Ok(()))
+    ) -> Result<Result<Vec<u32>, pie::core::types::Error>> {
+        let model = self.ctx().table.get(&model)?;
+        let tokens = model.model.instruct().equip(&tools);
+        Ok(Ok(tokens))
     }
 
     async fn answer(
         &mut self,
-        ctx: Resource<Context>,
+        model: Resource<crate::api::model::Model>,
         name: String,
         value: String,
-    ) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
-        let tokens = model.instruct().answer(&name, &value);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
-        Ok(())
+    ) -> Result<Vec<u32>> {
+        let model = self.ctx().table.get(&model)?;
+        Ok(model.model.instruct().answer(&name, &value))
     }
 
     async fn create_decoder(

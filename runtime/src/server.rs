@@ -38,7 +38,8 @@ use tungstenite::Message as WsMessage;
 
 use crate::auth;
 use crate::service::{Service, ServiceHandler, ServiceMap};
-use crate::process::{self, ProcessId};
+use crate::process::{self, ProcessId, ProcessEvent};
+use crate::workflow::{self, WorkflowId};
 
 /// Unique identifier for a connected client.
 pub type ClientId = u32;
@@ -61,14 +62,15 @@ pub fn spawn(host: &str, port: u16) {
 
 static CLIENT_SERVICES: LazyLock<ServiceMap<ClientId, SessionMessage>> = LazyLock::new(ServiceMap::new);
 
-/// Sends a text event (stdout, stderr, message, return, error) to a client.
-pub fn send_event(client_id: ClientId, process_id: ProcessId, event: &str, value: String) -> Result<()> {
+/// Sends a typed process event to a client.
+pub fn send_event(client_id: ClientId, process_id: ProcessId, event: &ProcessEvent) -> Result<()> {
     CLIENT_SERVICES.send(&client_id, SessionMessage::Event {
         process_id,
-        event: event.to_string(),
-        value,
+        event: event.name().to_string(),
+        value: event.value().to_string(),
     })
 }
+
 
 /// Sends a binary file to a client for a specific process.
 pub fn send_file(client_id: ClientId, process_id: ProcessId, data: Bytes) -> Result<()> {
@@ -262,6 +264,7 @@ struct Session {
     state: Arc<ServerState>,
     pub(super) inflight_uploads: DashMap<String, InFlightUpload>,
     pub(super) attached_processes: Vec<ProcessId>,
+    pub(super) attached_workflows: Vec<WorkflowId>,
     /// Per-process file delivery waiters (client → process).
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
     ws_msg_tx: mpsc::Sender<WsMessage>,
@@ -333,6 +336,7 @@ impl Session {
             state,
             inflight_uploads: DashMap::new(),
             attached_processes: Vec::new(),
+            attached_workflows: Vec::new(),
             file_waiters: HashMap::new(),
             ws_msg_tx,
             send_pump,
@@ -349,6 +353,9 @@ impl Session {
     fn cleanup(&mut self) {
         for process_id in self.attached_processes.drain(..) {
             process::detach(process_id);
+        }
+        for wf_id in self.attached_workflows.drain(..) {
+            workflow::detach(&wf_id);
         }
 
         self.recv_pump.abort();
@@ -614,10 +621,11 @@ impl Session {
             ClientMessage::LaunchProcess {
                 corr_id,
                 inferlet,
-                arguments,
+                input,
                 capture_outputs,
+                token_budget,
             } => {
-                self.handle_launch_process(corr_id, inferlet, arguments, capture_outputs)
+                self.handle_launch_process(corr_id, inferlet, input, capture_outputs, token_budget)
                     .await
             }
 
@@ -625,9 +633,9 @@ impl Session {
                 corr_id,
                 port,
                 inferlet,
-                arguments,
+                input,
             } => {
-                self.handle_launch_daemon(corr_id, port, inferlet, arguments)
+                self.handle_launch_daemon(corr_id, port, inferlet, input)
                     .await
             }
 
@@ -699,6 +707,31 @@ impl Session {
                 } else {
                     tracing::warn!("MCP response for unknown corr_id {}", corr_id);
                 }
+            }
+
+            ClientMessage::SubmitWorkflow { corr_id, json } => {
+                self.handle_submit_workflow(corr_id, json).await;
+            }
+
+            ClientMessage::CancelWorkflow {
+                corr_id,
+                workflow_id,
+            } => {
+                self.handle_cancel_workflow(corr_id, workflow_id).await;
+            }
+
+            ClientMessage::AttachWorkflow {
+                corr_id,
+                workflow_id,
+            } => {
+                self.handle_attach_workflow(corr_id, workflow_id).await;
+            }
+
+            ClientMessage::DetachWorkflow {
+                corr_id,
+                workflow_id,
+            } => {
+                self.handle_detach_workflow(corr_id, workflow_id).await;
             }
         }
     }

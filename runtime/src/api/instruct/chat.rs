@@ -4,9 +4,6 @@
 //! Delegates to the model's `Instruct` implementation.
 
 use crate::api::pie;
-use crate::api::context::Context;
-use crate::context;
-use crate::model;
 use crate::linker::InstanceState;
 use crate::model::instruct::{ChatDecoder, ChatEvent};
 use anyhow::Result;
@@ -25,48 +22,33 @@ impl std::fmt::Debug for Decoder {
 }
 
 impl pie::instruct::chat::Host for InstanceState {
-    async fn system(&mut self, ctx: Resource<Context>, message: String) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
-        let tokens = model.instruct().system(&message);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
-        Ok(())
+    async fn system(&mut self, model: Resource<crate::api::model::Model>, message: String) -> Result<Vec<u32>> {
+        let model = self.ctx().table.get(&model)?;
+        Ok(model.model.instruct().system(&message))
     }
 
-    async fn user(&mut self, ctx: Resource<Context>, message: String) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
-        let tokens = model.instruct().user(&message);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
-        Ok(())
+    async fn user(&mut self, model: Resource<crate::api::model::Model>, message: String) -> Result<Vec<u32>> {
+        let model = self.ctx().table.get(&model)?;
+        Ok(model.model.instruct().user(&message))
     }
 
-    async fn assistant(&mut self, ctx: Resource<Context>, message: String) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
-        let tokens = model.instruct().assistant(&message);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
-        Ok(())
+    async fn assistant(&mut self, model: Resource<crate::api::model::Model>, message: String) -> Result<Vec<u32>> {
+        let model = self.ctx().table.get(&model)?;
+        Ok(model.model.instruct().assistant(&message))
     }
 
-    async fn cue(&mut self, ctx: Resource<Context>) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
-        let tokens = model.instruct().cue();
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
-        Ok(())
+    async fn cue(&mut self, model: Resource<crate::api::model::Model>) -> Result<Vec<u32>> {
+        let model = self.ctx().table.get(&model)?;
+        Ok(model.model.instruct().cue())
     }
 
-    async fn seal(&mut self, ctx: Resource<Context>) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
-        let tokens = model.instruct().seal();
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, ctx.lock_id.unwrap_or(0), tokens)?;
-        Ok(())
+    async fn seal(&mut self, model: Resource<crate::api::model::Model>) -> Result<Vec<u32>> {
+        let model = self.ctx().table.get(&model)?;
+        Ok(model.model.instruct().seal())
     }
 
-    async fn stop_tokens(&mut self, model_res: Resource<crate::api::model::Model>) -> Result<Vec<u32>> {
-        let model = self.ctx().table.get(&model_res)?;
+    async fn stop_tokens(&mut self, model: Resource<crate::api::model::Model>) -> Result<Vec<u32>> {
+        let model = self.ctx().table.get(&model)?;
         Ok(model.model.instruct().seal())
     }
 

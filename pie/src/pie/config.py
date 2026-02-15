@@ -48,9 +48,12 @@ class ModelConfig:
     max_num_adapters: int = 32
     max_adapter_rank: int = 8
     gpu_mem_utilization: float = 0.8
+    cpu_mem_budget_in_gb: int = 0
     use_cuda_graphs: bool = False
     random_seed: int = 42
     dummy_mode: bool = False
+    default_token_budget: int = 1024
+    max_batch_size: int = 512
 
     # Name derived from hf_repo if not explicitly set
     name: str = ""
@@ -58,6 +61,11 @@ class ModelConfig:
     def __post_init__(self):
         if not self.name:
             self.name = self.hf_repo
+        if self.default_token_budget is None or self.default_token_budget <= 0:
+            raise ValueError(
+                f"Model {self.name or self.hf_repo!r}: default_token_budget must be > 0 "
+                f"(got {self.default_token_budget!r})"
+            )
 
 
 @dataclass
@@ -76,6 +84,8 @@ class Config:
     auth: AuthConfig = field(default_factory=AuthConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     models: list[ModelConfig] = field(default_factory=list)
+    allow_filesystem: bool = False
+    max_concurrent_processes: int | None = None
 
     @property
     def primary_model(self) -> ModelConfig:
@@ -112,6 +122,9 @@ port = 8080
 verbose = false
 registry = "https://registry.pie-project.org/"
 
+# Max concurrent processes (comment out or remove for no limit)
+# max_concurrent_processes = 64
+
 [auth]
 enabled = false
 
@@ -123,6 +136,10 @@ service_name = "pie"
 # Model configuration (can have multiple [[model]] sections)
 [[model]]
 hf_repo = "{DEFAULT_MODEL}"
+
+# Default token budget per process (required, must be > 0).
+# Determines the credit endowment (= ceil(budget / page_size)).
+default_token_budget = 1024
 
 # Device assignment (single GPU or list for tensor parallel)
 device = [{formatted_device}]
@@ -152,6 +169,9 @@ max_adapter_rank = 8
 
 # Memory management
 gpu_mem_utilization = 0.8
+
+# CPU memory budget for KV cache swap (GB), 0 = disabled
+cpu_mem_budget_in_gb = 0
 
 # CUDA graphs (experimental)
 use_cuda_graphs = false
@@ -232,9 +252,11 @@ def load_config(
             max_num_adapters=mc.get("max_num_adapters", 32),
             max_adapter_rank=mc.get("max_adapter_rank", 8),
             gpu_mem_utilization=mc.get("gpu_mem_utilization", 0.8),
+            cpu_mem_budget_in_gb=mc.get("cpu_mem_budget_in_gb", 0),
             use_cuda_graphs=mc.get("use_cuda_graphs", False),
             random_seed=mc.get("random_seed", 42),
             dummy_mode=dummy_mode or mc.get("dummy_mode", False),
+            default_token_budget=mc.get("default_token_budget", 1024),
             name=mc.get("name", ""),
         )
         models.append(m)
@@ -251,4 +273,6 @@ def load_config(
             service_name=telemetry_section.get("service_name", "pie"),
         ),
         models=models,
+        allow_filesystem=raw.get("allow_filesystem", False),
+        max_concurrent_processes=raw.get("max_concurrent_processes"),
     )
