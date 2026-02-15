@@ -8,10 +8,10 @@ use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
 
-pub mod chat_templates;
+pub mod instruct;
 pub mod tokenizer;
 
-use chat_templates::ChatTemplate;
+use instruct::Instruct;
 use tokenizer::Tokenizer;
 
 /// Global cache for models (keyed by ModelId).
@@ -38,21 +38,11 @@ pub fn register(
     tokenizer_path: PathBuf,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
-
-    let chat_template = chat_templates::lookup(arch_name)
-        .unwrap_or_else(|| chat_templates::lookup("dummy").unwrap());
-
-    // Convert stop token strings to IDs using the tokenizer's vocabulary.
-    let stop_tokens: Vec<u32> = chat_template
-        .stop_tokens
-        .iter()
-        .filter_map(|s| tokenizer.token_to_id(s))
-        .collect();
+    let instruct = instruct::create(arch_name, tokenizer.clone());
 
     let model = Arc::new(Model {
         name,
-        chat_template,
-        stop_tokens,
+        instruct,
         kv_page_size,
         tokenizer,
     });
@@ -76,8 +66,7 @@ pub fn get_model(model_id: ModelId) -> Option<&'static Arc<Model>> {
 
 pub struct Model {
     name: String,
-    chat_template: &'static ChatTemplate,
-    stop_tokens: Vec<u32>,
+    instruct: Arc<dyn Instruct>,
     kv_page_size: u32,
     tokenizer: Arc<Tokenizer>,
 }
@@ -96,9 +85,9 @@ impl Model {
         &self.name
     }
 
-    /// Gets the chat template.
-    pub fn chat_template(&self) -> &'static ChatTemplate {
-        self.chat_template
+    /// Gets the instruct implementation for this model.
+    pub fn instruct(&self) -> &dyn Instruct {
+        &*self.instruct
     }
 
     /// Gets the tokenizer.
@@ -138,11 +127,6 @@ impl Model {
     /// Gets the special tokens.
     pub fn get_special_tokens(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
         self.tokenizer.get_special_tokens()
-    }
-
-    /// Gets the stop tokens.
-    pub fn stop_tokens(&self) -> &[u32] {
-        &self.stop_tokens
     }
 
     /// Gets the KV page size.
