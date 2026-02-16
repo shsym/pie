@@ -9,6 +9,7 @@ use inferlet::{
     context::Context, inference::Sampler, model::Model,
     runtime, ContextExt, InstructExt, Result,
 };
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 const HELP: &str = "\
@@ -36,6 +37,11 @@ const REFLECT_PROMPT: &str = "\
 Okay. Now, evaluate your own solution and give it a score on a scale of 1 to 5. \
 Please rigorously check the correctness of the calculations and the final answer.";
 
+static FORK_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn next_fork_name() -> String {
+    format!("fork-{}", FORK_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
 
 #[inferlet::main]
 async fn main(args: Vec<String>) -> Result<String> {
@@ -74,7 +80,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     // Build and execute tree in parallel
     let level1_futures = (0..num_branches)
         .map(|_| {
-            let propose_ctx = ctx_root.fork()?;
+            let propose_ctx = ctx_root.fork(&next_fork_name())?;
             let question_ = question.clone();
             Ok(async move {
                 // Level 1: Propose Plan
@@ -94,7 +100,7 @@ async fn main(args: Vec<String>) -> Result<String> {
 
                 let level2_futures = (0..num_branches)
                     .map(|_| {
-                        let execute_ctx = propose_ctx.fork()?;
+                        let execute_ctx = propose_ctx.fork(&next_fork_name())?;
                         Ok(async move {
                             execute_ctx.cue();
                             execute_ctx
@@ -109,7 +115,7 @@ async fn main(args: Vec<String>) -> Result<String> {
 
                             let level3_futures = (0..num_branches)
                                 .map(|_| {
-                                    let reflect_ctx = execute_ctx.fork()?;
+                                    let reflect_ctx = execute_ctx.fork(&next_fork_name())?;
                                     Ok(async move {
                                         reflect_ctx.cue();
                                         reflect_ctx

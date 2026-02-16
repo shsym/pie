@@ -35,10 +35,6 @@ class Engine:
     model_config: object  # e.g., llama3.ModelConfig
     kv_cache_at_layer: list[torch.Tensor]
 
-    # CPU swap pool (pinned host memory, mirrors GPU KV cache layout)
-    kv_cache_at_layer_host: list[torch.Tensor]  # [pool_size, 2, page_size, kv_heads, dim_head] per layer
-    swap_pool_size: int  # total host slots (Rust manages allocation)
-
     # Adapter state
     adapter_at_layer: list[tuple[torch.Tensor, torch.Tensor]]
     adapters: dict
@@ -58,15 +54,11 @@ class Engine:
         arch_type: str,
         info: dict,
         snapshot_dir: str | None = None,
-        kv_cache_at_layer_host: list | None = None,
-        swap_pool_size: int = 0,
     ):
         self.config = config
         self.model_config = model_config
         self.forward_pass = forward_pass
         self.kv_cache_at_layer = kv_cache_at_layer
-        self.kv_cache_at_layer_host = kv_cache_at_layer_host or []
-        self.swap_pool_size = swap_pool_size
         self.adapter_at_layer = adapter_at_layer
         self.arch_type = arch_type
         self.info = info
@@ -133,29 +125,12 @@ class Engine:
             weights,
             compute_process_group=compute_process_group,
         )
-
         adapter_at_layer = mod.create_adapter_cache(model_config, config)
         kv_cache_at_layer = mod.create_kv_cache(model_config, config)
-
-        # Compact weight memory layout for GPU locality (MPS TLB optimization).
-        # Must run AFTER KV cache allocation: the CPU roundtrip inside
-        # compact_weights() frees all GPU weights and re-uploads them into
-        # the address space above the KV cache, giving contiguous layout.
-        if hasattr(forward_pass, "compact_weights"):
-            forward_pass.compact_weights()
 
         # Warmup CUDA graphs if supported
         if hasattr(forward_pass, "warmup_cuda_graphs"):
             forward_pass.warmup_cuda_graphs(kv_cache_at_layer)
-
-        # Compact weight memory layout for GPU locality (MPS TLB optimization)
-        if hasattr(forward_pass, "compact_weights"):
-            forward_pass.compact_weights()
-
-        # Allocate CPU swap pool (pinned host memory)
-        host_kv, pool_size = cls._create_host_kv_cache(
-            kv_cache_at_layer, config.swap_budget_bytes,
-        )
 
         return cls(
             config=config,
@@ -166,8 +141,6 @@ class Engine:
             arch_type=arch_type,
             info=info,
             snapshot_dir=snapshot_dir,
-            kv_cache_at_layer_host=host_kv,
-            swap_pool_size=pool_size,
         )
 
     @classmethod
@@ -208,10 +181,6 @@ class Engine:
 
         _log("Dummy mode initialization complete", "INFO")
 
-        host_kv, pool_size = cls._create_host_kv_cache(
-            kv_cache_at_layer, config.swap_budget_bytes,
-        )
-
         return cls(
             config=config,
             model_config=model_config,
@@ -221,54 +190,7 @@ class Engine:
             arch_type="dummy",
             info=info,
             snapshot_dir=snapshot_dir,
-            kv_cache_at_layer_host=host_kv,
-            swap_pool_size=pool_size,
         )
-
-    # ========================================================================
-    # CPU Swap Pool
-    # ========================================================================
-
-    @staticmethod
-    def _create_host_kv_cache(
-        gpu_kv: list[torch.Tensor],
-        swap_budget_bytes: int,
-    ) -> tuple[list[torch.Tensor], int]:
-        """Allocate pinned CPU tensors mirroring GPU KV cache layout.
-
-        Returns (host_tensors, pool_size). If budget is 0 or there are no
-        GPU KV layers, returns ([], 0).
-        """
-        if swap_budget_bytes <= 0 or not gpu_kv:
-            return [], 0
-
-        # gpu_kv[layer] shape: [max_pages+1, 2, page_size, kv_heads, dim_head]
-        num_layers = len(gpu_kv)
-        _, two, page_size, kv_heads, dim_head = gpu_kv[0].shape
-        dtype = gpu_kv[0].dtype
-        bytes_per_element = gpu_kv[0].element_size()
-
-        # Per-page bytes across ALL layers
-        per_page_bytes = num_layers * two * page_size * kv_heads * dim_head * bytes_per_element
-        pool_size = swap_budget_bytes // per_page_bytes
-
-        if pool_size == 0:
-            return [], 0
-
-        # pin_memory() is CUDA-only; on MPS we use regular CPU tensors
-        use_pinned = torch.cuda.is_available()
-        host_kv = []
-        for _ in range(num_layers):
-            t = torch.zeros(
-                (pool_size, two, page_size, kv_heads, dim_head),
-                dtype=dtype,
-                device="cpu",
-            )
-            if use_pinned:
-                t = t.pin_memory()
-            host_kv.append(t)
-
-        return host_kv, pool_size
 
     # ========================================================================
     # Inference
@@ -301,40 +223,6 @@ class Engine:
                 rand_seeds=inputs["adapter_seeds"],
                 qo_indptr=inputs["qo_indptr"],
             )
-
-        # Bounds-check kv_page_indices before they hit the GPU kernel
-        kv_idx = inputs["kv_page_indices"]
-        max_pages = self.kv_cache_at_layer[0].shape[0]
-        page_size = self.kv_cache_at_layer[0].shape[2]
-        if kv_idx.numel() > 0:
-            kv_max = kv_idx.max().item()
-            kv_min = kv_idx.min().item()
-            if kv_max >= max_pages or kv_min < 0:
-                raise ValueError(
-                    f"fire_batch: kv_page_indices out of bounds: "
-                    f"min={kv_min} max={kv_max} max_pages={max_pages}"
-                )
-
-        # Validate kv_page_indptr: last value must not exceed kv_page_indices length
-        kv_indptr = inputs["kv_page_indptr"]
-        if kv_indptr.numel() > 0:
-            indptr_max = kv_indptr[-1].item()
-            if indptr_max > kv_idx.numel():
-                raise ValueError(
-                    f"fire_batch: kv_page_indptr last={indptr_max} exceeds "
-                    f"kv_page_indices length={kv_idx.numel()}"
-                )
-
-        # Validate kv_last_page_lens: values must be in [1, page_size]
-        kv_last = inputs["kv_last_page_lens"]
-        if kv_last.numel() > 0:
-            last_max = kv_last.max().item()
-            last_min = kv_last.min().item()
-            if last_max > page_size or last_min < 1:
-                raise ValueError(
-                    f"fire_batch: kv_last_page_lens out of range: "
-                    f"min={last_min} max={last_max} page_size={page_size}"
-                )
 
         # Run transformer forward pass
         hidden_states = self.forward_pass.transform(

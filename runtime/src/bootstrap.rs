@@ -14,7 +14,6 @@ use crate::inference;
 use crate::linker;
 use crate::messaging;
 use crate::model;
-use crate::process;
 use crate::program;
 use crate::server;
 use crate::telemetry;
@@ -30,13 +29,8 @@ pub struct Config {
     pub registry_url: String,
     pub telemetry: TelemetryConfig,
     pub models: Vec<ModelConfig>,
-    /// Allow inferlets to access a sandboxed scratch filesystem.
-    pub allow_filesystem: bool,
     /// Skip tracing initialization (for tests — can only init once per process).
     pub skip_tracing: bool,
-    /// Hard cap on the number of concurrent processes.
-    /// `None` means no limit; `Some(n)` caps admission to `n`.
-    pub max_concurrent_processes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,22 +41,19 @@ pub struct ModelConfig {
     pub tokenizer_path: PathBuf,
     pub devices: Vec<DeviceConfig>,
     pub scheduler: SchedulerConfig,
-    /// Default token budget per process. Determines the credit endowment
-    /// (= ⌈budget / page_size⌉) and max concurrency (= ⌊total_pages / credit⌋).
-    pub default_token_budget: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct DeviceConfig {
     pub hostname: String,
     pub total_pages: usize,
-    pub cpu_pages: usize,
     pub max_batch_tokens: usize,
     pub max_batch_size: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
+    pub max_in_flight_batches: usize,
     pub request_timeout_secs: u64,
     pub max_wait_ms: u64,
     pub min_batch_for_optimization: usize,
@@ -103,11 +94,10 @@ pub async fn bootstrap(
         config.cache_dir.clone(),
     );
 
-    linker::spawn(&wasm_engine, config.allow_filesystem);
+    linker::spawn(&wasm_engine);
     server::spawn(&config.host, config.port);
     messaging::spawn();
-    process::init_admission(config.max_concurrent_processes);
-    
+
     for cfg in config.models.iter() {
 
         model::register(
@@ -121,16 +111,12 @@ pub async fn bootstrap(
             device::spawn(&d.hostname, d.total_pages, d.max_batch_size, d.max_batch_tokens)
         }).collect();
 
-        let num_gpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.total_pages).collect();
-        let num_cpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.cpu_pages).collect();
+        let num_kv_pages: Vec<usize> = cfg.devices.iter().map(|d| d.total_pages).collect();
 
-        // Derive credit endowment from token budget.
-        // default_credit = ⌈default_token_budget / page_size⌉  (pages per process)
-        let default_credit = cfg.default_token_budget.div_ceil(cfg.kv_page_size).max(1);
-
-        context::spawn(cfg.kv_page_size, num_gpu_pages, num_cpu_pages, default_credit);
+        context::spawn(cfg.kv_page_size, num_kv_pages);
         inference::spawn(
             &devices,
+            cfg.scheduler.max_in_flight_batches,
             cfg.scheduler.request_timeout_secs,
             cfg.scheduler.max_wait_ms,
             cfg.scheduler.min_batch_for_optimization,
@@ -138,7 +124,14 @@ pub async fn bootstrap(
         adapter::spawn(&devices);
     }
 
-
+    // Force-shutdown on CTRL+C
+    // Removed to allow Python to handle signals and proper cleanup
+    // tokio::spawn(async {
+    //     tokio::signal::ctrl_c().await.ok();
+    //     eprintln!("[BOOTSTRAP] ctrl_c received! Calling std::process::exit(0)");
+    //     tracing::info!("Shutdown signal received, exiting");
+    //     std::process::exit(0);
+    // });
 
     Ok(auth::get_internal_auth_token().await?)
 }
@@ -167,10 +160,6 @@ fn verify_config(config: &Config) -> Result<()> {
             model.tokenizer_path.exists(),
             "Model {:?}: tokenizer not found at {:?}", model.name, model.tokenizer_path
         );
-        ensure!(
-            model.default_token_budget > 0,
-            "Model {:?}: default_token_budget must be > 0", model.name
-        );
 
         for (i, dev) in model.devices.iter().enumerate() {
             ensure!(dev.total_pages > 0, "Model {:?} device {i}: total_pages must be > 0", model.name);
@@ -179,6 +168,7 @@ fn verify_config(config: &Config) -> Result<()> {
         }
 
         let sched = &model.scheduler;
+        ensure!(sched.max_in_flight_batches > 0, "Model {:?}: max_in_flight_batches must be > 0", model.name);
         ensure!(sched.request_timeout_secs > 0, "Model {:?}: request_timeout_secs must be > 0", model.name);
     }
 

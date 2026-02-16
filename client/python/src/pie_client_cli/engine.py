@@ -354,16 +354,15 @@ def check_program(
 def launch_process(
     client: PieClient,
     inferlet: str,
-    input: dict,
+    arguments: list[str],
     capture_outputs: bool = True,
-    token_budget: int | None = None,
 ) -> Process:
     """Launch a process (sync wrapper).
 
     The inferlet must be in name@version format (e.g., "text-completion@0.1.0").
     """
     return asyncio.get_event_loop().run_until_complete(
-        client.launch_process(inferlet, input, capture_outputs, token_budget=token_budget)
+        client.launch_process(inferlet, arguments, capture_outputs)
     )
 
 def close_client(client: PieClient) -> None:

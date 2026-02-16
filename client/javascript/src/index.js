@@ -438,22 +438,17 @@ export class PieClient {
     /**
      * Launches a process. Returns a Process object for interaction.
      * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
-     * @param {Object} [input={}] Input parameters object, serialized to JSON.
+     * @param {string[]} [args=[]] Command-line arguments.
      * @param {boolean} [captureOutputs=true] Stream outputs to client.
-     * @param {Object} [options={}] Additional launch options.
-     * @param {number|null} [options.tokenBudget=null] Token budget for this process.
      * @returns {Promise<Process>}
      */
-    async launchProcess(inferlet, input = {}, captureOutputs = true, { tokenBudget = null } = {}) {
+    async launchProcess(inferlet, args = [], captureOutputs = true) {
         const msg = {
             type: "launch_process",
             inferlet,
-            input: JSON.stringify(input),
+            arguments: args,
             capture_outputs: captureOutputs,
         };
-        if (tokenBudget != null) {
-            msg.token_budget = tokenBudget;
-        }
         const { ok, result } = await this._sendMsgAndWait(msg);
         if (!ok) {
             throw new Error(`Failed to launch process: ${result}`);
@@ -474,8 +469,8 @@ export class PieClient {
     }
 
     // Backward compatibility alias
-    async launchInstance(inferlet, input = {}, captureOutputs = true) {
-        return await this.launchProcess(inferlet, input, captureOutputs);
+    async launchInstance(inferlet, args = [], captureOutputs = true) {
+        return await this.launchProcess(inferlet, args, captureOutputs);
     }
 
     /**
@@ -559,14 +554,14 @@ export class PieClient {
      * Launches a daemon inferlet on a specific port.
      * @param {string} inferlet The inferlet name.
      * @param {number} port The TCP port.
-     * @param {Object} [input={}] Input parameters object, serialized to JSON.
+     * @param {string[]} [args=[]] Command-line arguments.
      */
-    async launchDaemon(inferlet, port, input = {}) {
+    async launchDaemon(inferlet, port, args = []) {
         const msg = {
             type: "launch_daemon",
             port,
             inferlet,
-            input: JSON.stringify(input),
+            arguments: args,
         };
         const { ok, result } = await this._sendMsgAndWait(msg);
         if (!ok) {

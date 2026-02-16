@@ -434,26 +434,22 @@ class PieClient:
     async def launch_process(
         self,
         inferlet: str,
-        input: dict | None = None,
+        arguments: list[str] | None = None,
         capture_outputs: bool = True,
-        token_budget: int | None = None,
     ) -> Process:
         """Launch a process. Returns a Process object for interaction.
 
         :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
-        :param input: A dict of input parameters, serialized to JSON.
+        :param arguments: Command-line arguments to pass to the inferlet.
         :param capture_outputs: If True, process outputs are streamed to the client.
-        :param token_budget: Optional token budget for this process (None = use model default).
         :return: A Process object for the launched inferlet.
         """
         msg = {
             "type": "launch_process",
             "inferlet": inferlet,
-            "input": json.dumps(input or {}),
+            "arguments": arguments or [],
             "capture_outputs": capture_outputs,
         }
-        if token_budget is not None:
-            msg["token_budget"] = token_budget
         ok, result = await self._send_msg_and_wait(msg)
 
         if not ok:
@@ -492,15 +488,15 @@ class PieClient:
 
         return Process(self, process_id)
 
-    async def list_processes(self) -> list[dict]:
-        """Get a list of running process stats (dicts with id, username, program, arguments, elapsed_secs)."""
+    async def list_processes(self) -> list[str]:
+        """Get a list of running process UUID strings."""
         msg = {"type": "list_processes"}
         ok, result = await self._send_msg_and_wait(msg)
         if ok:
             try:
                 return json.loads(result)
             except (json.JSONDecodeError, TypeError):
-                return []
+                return [result] if result else []
         raise Exception(f"List processes failed: {result}")
 
     async def ping(self) -> None:
@@ -530,14 +526,14 @@ class PieClient:
         self,
         inferlet: str,
         port: int,
-        input: dict | None = None,
+        arguments: list[str] | None = None,
     ) -> None:
         """Launch a daemon inferlet that listens on a specific port."""
         msg = {
             "type": "launch_daemon",
             "port": port,
             "inferlet": inferlet,
-            "input": json.dumps(input or {}),
+            "arguments": arguments or [],
         }
         ok, result = await self._send_msg_and_wait(msg)
         if not ok:

@@ -57,7 +57,7 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
 async def run_inferlet(
     client,
     name: str,
-    extra_args: dict | None = None,
+    extra_args: list[str] | None = None,
     *,
     timeout: int = 120,
 ) -> str:
@@ -67,7 +67,7 @@ async def run_inferlet(
     Raises ``RuntimeError`` on error or timeout, ``FileNotFoundError`` if the
     WASM binary or manifest is missing.
     """
-    extra_args = extra_args or {}
+    extra_args = extra_args or []
     wasm_name = name.replace("-", "_")
     wasm_path = INFERLETS_DIR / name / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm"
     manifest_path = INFERLETS_DIR / name / "Pie.toml"
@@ -83,7 +83,7 @@ async def run_inferlet(
     inferlet_id = f"{pkg_name}@{version}"
 
     await client.install_program(wasm_path, manifest_path)
-    process = await client.launch_process(inferlet_id, input=extra_args)
+    process = await client.launch_process(inferlet_id, arguments=extra_args)
 
     output_parts: list[str] = []
     start = time.time()
@@ -113,7 +113,6 @@ TestFn = Callable[..., Coroutine]
 
 async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     from pie.server import Server
-    from pie.config import Config, ModelConfig, AuthConfig
 
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else args.device
 
@@ -122,17 +121,7 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     print(f"Dummy:  {args.dummy}")
     print()
 
-    cfg = Config(
-        port=0,
-        auth=AuthConfig(enabled=False),
-        models=[ModelConfig(
-            hf_repo=args.model,
-            device=[device] if isinstance(device, str) else device,
-            dummy_mode=args.dummy,
-        )],
-    )
-    async with Server(cfg) as server:
-        client = await server.connect()
+    async with Server(model=args.model, device=device, dummy=args.dummy) as client:
         results: list[tuple[str, str, str]] = []
 
         for test_fn in tests:

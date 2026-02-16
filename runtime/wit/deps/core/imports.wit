@@ -9,5 +9,4 @@ world imports {
     import model;
     import runtime;
     import inference;
-    import scheduling;
 }

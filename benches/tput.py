@@ -22,7 +22,6 @@ from pie_client import Event
 
 async def run_benchmark(args):
     from pie.server import Server
-    from pie.config import Config, ModelConfig, AuthConfig
 
     # -- Resolve paths --------------------------------------------------------
 
@@ -55,47 +54,39 @@ async def run_benchmark(args):
 
     # -- Parse device list ----------------------------------------------------
 
-    device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
+    device = [d.strip() for d in args.device.split(",")] if "," in args.device else args.device
 
     # -- Start server ---------------------------------------------------------
 
     print(f"Model:       {args.model}")
     print(f"Device:      {device}")
     print(f"Requests:    {args.num_requests}")
+    print(f"Concurrency: {args.concurrency}")
     print(f"Max Tokens:  {args.max_tokens}")
-    print(f"GPU Mem:     {args.gpu_mem_util}")
     print(f"Prompt:      {args.prompt!r}")
     print()
 
-    cfg = Config(
-        port=0,
-        auth=AuthConfig(enabled=False),
-        models=[ModelConfig(
-            hf_repo=args.model, device=device,
-            dummy_mode=args.dummy,
-            gpu_mem_utilization=args.gpu_mem_util,
-            cpu_mem_budget_in_gb=args.cpu_mem_budget,
-            default_token_budget=args.default_token_budget,
-            max_batch_size=args.max_batch_size,
-        )],
-        max_concurrent_processes=args.max_concurrent_processes,
-    )
-    async with Server(cfg) as server:
-        client = await server.connect()
+    async with Server(
+        model=args.model,
+        device=device,
+        dummy=args.dummy,
+    ) as client:
         # -- Install program --------------------------------------------------
 
-        # Always install to pick up latest build
-        print("Installing program...")
-        await client.install_program(wasm_path, manifest_path, force_overwrite=True)
+        if not await client.check_program(inferlet_name, wasm_path, manifest_path):
+            print("Installing program...")
+            await client.install_program(wasm_path, manifest_path)
+        else:
+            print("Program already installed.")
 
         # -- Build workload ---------------------------------------------------
 
-        inferlet_input = {
-            "prompt": args.prompt,
-            "max_tokens": args.max_tokens,
-            "temperature": args.temperature,
-            "system": "You are a helpful benchmarking assistant.",
-        }
+        inferlet_args = [
+            "--prompt", args.prompt,
+            "--max-tokens", str(args.max_tokens),
+            "--temperature", str(args.temperature),
+            "--system", "You are a helpful benchmarking assistant.",
+        ]
 
         queue = asyncio.Queue()
         for i in range(args.num_requests):
@@ -104,8 +95,6 @@ async def run_benchmark(args):
         completed = 0
         total_chars = 0
         total_tokens_est = 0
-        output_samples = []  # Collect (req_id, text) tuples
-        output_lock = asyncio.Lock()
 
         # -- Workers ----------------------------------------------------------
 
@@ -118,30 +107,19 @@ async def run_benchmark(args):
                     break
 
                 try:
-                    req_input = inferlet_input
-                    if getattr(args, 'unique_prompts', False):
-                        req_input = {**inferlet_input, "prompt": f"{inferlet_input['prompt']} (Request #{req_id})"}
                     process = await client.launch_process(
-                        inferlet_name, input=req_input,
+                        inferlet_name, arguments=inferlet_args,
                     )
                     req_chars = 0
-                    req_text = []
                     while True:
                         event, msg = await process.recv()
                         if event == Event.Stdout:
                             req_chars += len(msg)
-                            req_text.append(msg)
-                        elif event == Event.Stderr:
-                            req_chars += len(msg)
                         elif event == Event.Return:
                             req_chars += len(msg)
-                            req_text.append(msg)
                             total_chars += req_chars
                             total_tokens_est += req_chars / 4.0
                             completed += 1
-                            # Save output
-                            async with output_lock:
-                                output_samples.append((req_id, "".join(req_text)))
                             print(".", end="", flush=True)
                             break
                         elif event == Event.Error:
@@ -157,7 +135,7 @@ async def run_benchmark(args):
         print("Running", end="", flush=True)
         start = time.time()
 
-        workers = [asyncio.create_task(worker(i)) for i in range(args.num_requests)]
+        workers = [asyncio.create_task(worker(i)) for i in range(args.concurrency)]
         await asyncio.wait(workers)
 
         duration = time.time() - start
@@ -173,35 +151,17 @@ async def run_benchmark(args):
         print(f"{'Est. Tokens/sec:':<25} {total_tokens_est / duration:.2f}")
         print(f"{'─' * 40}")
 
-        # -- Save output samples ----------------------------------------------
-
-        if args.save_outputs and output_samples:
-            out_path = Path(args.save_outputs)
-            with open(out_path, "w") as f:
-                for req_id, text in sorted(output_samples):
-                    f.write(f"=== Request {req_id} ===\n")
-                    f.write(text)
-                    f.write("\n\n")
-            print(f"Saved {len(output_samples)} output samples to {out_path}")
-
 
 def main():
     parser = argparse.ArgumentParser(description="Pie Throughput Benchmark")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
     parser.add_argument("--device", default="cuda:0", help="Device(s), comma-separated (e.g. cuda:0,cuda:1)")
-    parser.add_argument("--num-requests", type=int, default=64, help="Total number of concurrent requests")
+    parser.add_argument("--num-requests", type=int, default=64, help="Total number of requests")
+    parser.add_argument("--concurrency", type=int, default=64, help="Concurrent requests")
     parser.add_argument("--prompt", default="Write a short story about a robot.", help="Prompt")
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens per request")
     parser.add_argument("--temperature", type=float, default=0.6, help="Temperature")
     parser.add_argument("--dummy", action="store_true", help="Use dummy mode (no GPU)")
-    parser.add_argument("--gpu-mem-util", type=float, default=0.8, help="GPU memory utilization for KV cache (lower = fewer pages = more contention)")
-    parser.add_argument("--cpu-mem-budget", type=int, default=0, help="CPU memory budget in GB for working page swap (0 = disabled)")
-    parser.add_argument("--save-outputs", type=str, default=None, help="Save output samples to this file path")
-    parser.add_argument("--num-samples", type=int, default=10, help="Number of output samples to save (default: 10)")
-    parser.add_argument("--unique-prompts", action="store_true", help="Make each request's prompt unique (append request #N)")
-    parser.add_argument("--default-token-budget", type=int, required=True, help="Default token budget per process (required)")
-    parser.add_argument("--max-concurrent-processes", type=int, default=None, help="Maximum number of concurrent processes (default: None)")
-    parser.add_argument("--max-batch-size", type=int, default=512, help="Maximum batch size for inference (default: 512)")
 
     args = parser.parse_args()
 

@@ -3,6 +3,7 @@
 import * as _msg from 'pie:core/messaging';
 import type { Subscription as _Subscription } from 'pie:core/messaging';
 import { awaitFuture } from './_async.js';
+import { pollLoop } from './_poll_loop.js';
 
 /** Pushes a message onto a topic queue. */
 export function push(topic: string, message: string): void {
@@ -42,9 +43,7 @@ export class Subscription implements AsyncIterable<string>, Disposable {
   /** Waits until a message arrives, then returns it. */
   async next(): Promise<string | undefined> {
     const pollable = this._handle.pollable();
-    while (!pollable.ready()) {
-      pollable.block();
-    }
+    await pollLoop.register(pollable);
     return this._handle.get();
   }
 

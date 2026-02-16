@@ -6,7 +6,6 @@
 //! scheduling decisions.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -14,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 
 
 use crate::device::DeviceId;
-use crate::context::pagestore::PhysicalPageId;
+use crate::context::kvcache::PhysicalPageId;
 
 use crate::device;
 
@@ -47,6 +46,7 @@ pub(super) trait SchedulingPolicy: Send {
         &self,
         current_batch_size: usize,
         current_total_tokens: usize,
+        in_flight_batches: usize,
     ) -> Decision;
 }
 
@@ -71,20 +71,6 @@ pub(super) struct BatchStats {
     pub batch_size: usize,
     pub total_tokens: usize,
     pub latency: Duration,
-}
-
-// =============================================================================
-// SchedulerStats (lock-free snapshot for monitoring)
-// =============================================================================
-
-/// Cumulative stats exposed for monitoring. Updated atomically after each batch.
-#[derive(Debug, Default)]
-pub struct SchedulerStats {
-    pub total_batches: AtomicU64,
-    pub total_tokens_processed: AtomicU64,
-    pub last_batch_latency_us: AtomicU64,
-    pub cumulative_latency_us: AtomicU64,
-
 }
 
 // =============================================================================
@@ -162,7 +148,6 @@ impl BatchAccumulator {
 /// runs the batch accumulation and firing loop.
 pub(crate) struct BatchScheduler {
     tx: mpsc::UnboundedSender<PendingRequest>,
-    stats: Arc<SchedulerStats>,
 }
 
 impl BatchScheduler {
@@ -175,25 +160,19 @@ impl BatchScheduler {
         device_idx: usize,
         max_batch_size: usize,
         max_batch_tokens: usize,
+        max_in_flight_batches: usize,
         request_timeout_secs: u64,
         max_wait_ms: u64,
         min_batch_for_optimization: usize,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let stats = Arc::new(SchedulerStats::default());
         tokio::spawn(Self::run(
             device_id, device_idx, rx,
             max_batch_size, max_batch_tokens,
-            request_timeout_secs, max_wait_ms, min_batch_for_optimization,
-            stats.clone(),
+            max_in_flight_batches, request_timeout_secs, max_wait_ms, min_batch_for_optimization,
         ));
 
-        Self { tx, stats }
-    }
-
-    /// Get a handle to the cumulative scheduler stats (lock-free).
-    pub fn stats(&self) -> &Arc<SchedulerStats> {
-        &self.stats
+        Self { tx }
     }
 
     /// Submit a pre-translated forward pass request.
@@ -224,10 +203,10 @@ impl BatchScheduler {
         mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
         max_batch_size: usize,
         max_batch_tokens: usize,
+        max_in_flight_batches: usize,
         request_timeout_secs: u64,
         max_wait_ms: u64,
         min_batch_for_optimization: usize,
-        stats: Arc<SchedulerStats>,
     ) {
         let max_wait_time = Duration::from_millis(max_wait_ms);
         let request_timeout = Duration::from_secs(request_timeout_secs);
@@ -240,8 +219,7 @@ impl BatchScheduler {
                 max_wait_time,
                 min_batch_for_optimization,
             ));
-        // Only one in-flight batch at a time to prevent pipelined KV cache corruption.
-        let in_flight = Arc::new(Semaphore::new(1));
+        let in_flight = Arc::new(Semaphore::new(max_in_flight_batches));
 
         // Channel for batch completion stats (latency feedback only)
         let (stats_tx, mut stats_rx) = mpsc::unbounded_channel::<BatchStats>();
@@ -271,12 +249,12 @@ impl BatchScheduler {
             }
 
             // Ask the policy what to do
-            match policy.decide(batch.len(), batch.total_tokens()) {
+            let in_flight_count =
+                max_in_flight_batches - in_flight.available_permits();
+
+            match policy.decide(batch.len(), batch.total_tokens(), in_flight_count) {
                 Decision::Fire => {
                     // Acquire a permit (may wait if at in-flight limit)
-                    // if in_flight.available_permits() == 0 {
-                    //     eprintln!("[SCHED dev={device_idx}] semaphore full, waiting for in-flight batch to complete");
-                    // }
                     let permit = in_flight
                         .clone()
                         .acquire_owned()
@@ -288,17 +266,9 @@ impl BatchScheduler {
                     let requests_to_fire = batch.take();
                     policy.on_fired();
 
-                    // Collect batch context IDs for accurate rent charging.
-                    let batch_ctx_ids: Vec<u64> = requests_to_fire.iter()
-                        .map(|r| r.request.context_id)
-                        .collect();
-
                     // Spawn batch execution
                     let stats_tx_clone = stats_tx.clone();
-                    let stats_clone = stats.clone();
                     let timeout = request_timeout;
-
-
 
                     tokio::spawn(async move {
                         let start = Instant::now();
@@ -310,20 +280,6 @@ impl BatchScheduler {
                         )
                         .await;
                         let latency = start.elapsed();
-
-                        // Advance market clock for this device: prices, rent, dividends.
-                        // Pass batch context IDs so tick only charges contexts
-                        // that were in this batch (not stale pinned contexts).
-                        crate::context::tick(device_idx, latency.as_secs_f64(), batch_ctx_ids);
-
-                        // Update cumulative atomic counters
-                        stats_clone.total_batches.fetch_add(1, Relaxed);
-                        stats_clone.total_tokens_processed.fetch_add(total_tokens as u64, Relaxed);
-                        stats_clone.last_batch_latency_us.store(latency.as_micros() as u64, Relaxed);
-                        stats_clone.cumulative_latency_us.fetch_add(latency.as_micros() as u64, Relaxed);
-
-
-
                         stats_tx_clone
                             .send(BatchStats {
                                 batch_size,
@@ -391,7 +347,9 @@ impl BatchScheduler {
         }
 
         // Send via device service (typed call handles serialization + timeout)
-        let result = device::fire_batch(device_idx, &batch_req).await;
+        let result = device::call_with_timeout::<_, BatchedForwardPassResponse>(
+            device_idx, "fire_batch", &batch_req, timeout,
+        ).await;
 
         match result {
             Ok(batch_resp) => {
@@ -420,16 +378,6 @@ impl BatchScheduler {
                         } else if !resp.dists.is_empty() {
                             ForwardPassOutput::Distributions(resp.dists)
                         } else {
-                            if !req.request.sampling_indices.is_empty() {
-                                eprintln!(
-                                    "FP_NONE_FOR_DECODE ctx={} samplers={} tokens={} pages={} lpl={}",
-                                    req.request.context_id,
-                                    req.request.sampling_indices.len(),
-                                    req.request.tokens.len(),
-                                    req.physical_page_ids.len(),
-                                    req.last_page_len,
-                                );
-                            }
                             ForwardPassOutput::None
                         };
                         req.response_tx.send(output).ok();

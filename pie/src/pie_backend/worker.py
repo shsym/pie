@@ -190,14 +190,10 @@ def worker_main(
     group_devices = [devices[r] for r in group_topology[my_group_id]]
 
     # Pass model_config directly — RuntimeConfig.from_args() owns all defaults.
-    # Filter to only keys that from_args() accepts (ModelConfig may have
-    # extra keys like default_token_budget that only the Rust runtime uses).
-    import inspect
-    valid_keys = set(inspect.signature(RuntimeConfig.from_args).parameters.keys())
+    # Filter out device/devices keys since we pass them explicitly.
     filtered_config = {
         k: v for k, v in model_config.items()
-        if k in valid_keys
-        and k not in ("device", "devices", "tensor_parallel_size")
+        if k not in ("device", "devices", "scheduler", "tensor_parallel_size")
         and v is not None
     }
 
@@ -231,7 +227,6 @@ def worker_main(
                 "max_batch_size": getattr(config, "max_batch_size", 128),
                 "arch_name": engine.arch_type,
                 "snapshot_dir": str(engine.snapshot_dir) if engine.snapshot_dir else "",
-                "swap_pool_size": engine.swap_pool_size,
             }
 
             ready_queue.put((rank, server_name, metadata))
@@ -473,100 +468,6 @@ def _leader_loop(
 
         return {"results": results}
 
-    def _handle_copy_d2h(**kwargs) -> None:
-        """D2H: copy GPU KV pages to pinned CPU buffers (vectorized per layer).
-
-        NOTE: tensor[idx].copy_(src) with advanced (fancy) indexing is a NO-OP
-        in PyTorch — it creates a temporary copy and .copy_() writes to the
-        temporary, which is then discarded. We use index_copy_ instead, which
-        correctly scatter-writes to the original tensor.
-        """
-        import torch
-        gpu_kv = engine.kv_cache_at_layer
-        host_kv = engine.kv_cache_at_layer_host
-        phys_ids = kwargs["phys_ids"]
-        slots = kwargs["slots"]
-        max_gpu = gpu_kv[0].shape[0]
-        max_cpu = host_kv[0].shape[0] if host_kv else 0
-        for p in phys_ids:
-            if p < 0 or p >= max_gpu:
-                raise ValueError(f"swap_out: GPU phys_id {p} out of bounds [0, {max_gpu})")
-        for s in slots:
-            if s < 0 or s >= max_cpu:
-                raise ValueError(f"swap_out: CPU slot {s} out of bounds [0, {max_cpu})")
-        src = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
-        dst = torch.tensor(slots, dtype=torch.long)
-        for layer_idx in range(len(gpu_kv)):
-            host_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src].cpu())
-        #torch.cuda.synchronize() -> we don't need this
-
-    def _handle_copy_h2d(**kwargs) -> None:
-        """H2D: copy pinned CPU buffers back to GPU KV pages (vectorized per layer).
-
-        NOTE: Same as swap_out — must use index_copy_ to avoid the fancy
-        indexing no-op bug with tensor[idx].copy_().
-        """
-        import torch
-        gpu_kv = engine.kv_cache_at_layer
-        host_kv = engine.kv_cache_at_layer_host
-        phys_ids = kwargs["phys_ids"]
-        slots = kwargs["slots"]
-        max_gpu = gpu_kv[0].shape[0]
-        max_cpu = host_kv[0].shape[0] if host_kv else 0
-        for p in phys_ids:
-            if p < 0 or p >= max_gpu:
-                raise ValueError(f"swap_in: GPU phys_id {p} out of bounds [0, {max_gpu})")
-        for s in slots:
-            if s < 0 or s >= max_cpu:
-                raise ValueError(f"swap_in: CPU slot {s} out of bounds [0, {max_cpu})")
-        dst = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
-        src = torch.tensor(slots, dtype=torch.long)
-        for layer_idx in range(len(gpu_kv)):
-            gpu_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src].to(gpu_kv[layer_idx].device))
-        #torch.cuda.synchronize() -> we don't need this
-
-    def _handle_copy_d2d(**kwargs) -> None:
-        """D2D: copy GPU KV pages to other GPU KV pages.
-
-        Args (via kwargs):
-            src_phys_ids: list[int] — source GPU physical page IDs
-            dst_phys_ids: list[int] — destination GPU physical page IDs
-        """
-        import torch
-        gpu_kv = engine.kv_cache_at_layer
-        src_ids = kwargs["src_phys_ids"]
-        dst_ids = kwargs["dst_phys_ids"]
-        max_gpu = gpu_kv[0].shape[0]
-        for p in src_ids:
-            if p < 0 or p >= max_gpu:
-                raise ValueError(f"copy_d2d: src phys_id {p} out of bounds [0, {max_gpu})")
-        for p in dst_ids:
-            if p < 0 or p >= max_gpu:
-                raise ValueError(f"copy_d2d: dst phys_id {p} out of bounds [0, {max_gpu})")
-        src = torch.tensor(src_ids, dtype=torch.long, device=gpu_kv[0].device)
-        dst = torch.tensor(dst_ids, dtype=torch.long, device=gpu_kv[0].device)
-        for layer_idx in range(len(gpu_kv)):
-            gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
-        #torch.cuda.synchronize() -> we don't need this
-
-    def _handle_copy_h2h(**kwargs) -> None:
-        """H2H: copy pinned CPU pages to other CPU pages (no GPU involved)."""
-        import torch
-        host_kv = engine.kv_cache_at_layer_host
-        src_ids = kwargs["src_slots"]
-        dst_ids = kwargs["dst_slots"]
-        max_cpu = host_kv[0].shape[0] if host_kv else 0
-        for s in src_ids:
-            if s < 0 or s >= max_cpu:
-                raise ValueError(f"copy_h2h: src slot {s} out of bounds [0, {max_cpu})")
-        for s in dst_ids:
-            if s < 0 or s >= max_cpu:
-                raise ValueError(f"copy_h2h: dst slot {s} out of bounds [0, {max_cpu})")
-        src = torch.tensor(src_ids, dtype=torch.long)
-        dst = torch.tensor(dst_ids, dtype=torch.long)
-        for layer_idx in range(len(host_kv)):
-            host_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src])
-
     # Method dispatch table
     methods = {
         "query": _handle_query,
@@ -576,12 +477,6 @@ def _leader_loop(
         "update_adapter": _handle_update_adapter,
         "load_adapter": _handle_load_adapter,
         "save_adapter": _handle_save_adapter,
-        "swap_out_pages": _handle_copy_d2h,
-        "swap_in_pages": _handle_copy_h2d,
-        "copy_d2h": _handle_copy_d2h,
-        "copy_h2d": _handle_copy_h2d,
-        "copy_d2d": _handle_copy_d2d,
-        "copy_h2h": _handle_copy_h2h,
     }
 
     try:

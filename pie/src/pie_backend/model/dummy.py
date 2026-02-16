@@ -260,20 +260,19 @@ def create_kv_cache(
     dtype = runtime_config.activation_dtype
     num_layers = model_config.num_layers
 
-    # Allocate KV cache with the same page count the Rust scheduler manages.
-    # Use CPU tensors to avoid wasting GPU memory — dummy transform is a no-op.
-    num_pages = (runtime_config.max_num_kv_pages or 0) + 1
+    # Create minimal KV cache - just enough to satisfy the interface
+    # Real KV cache would be much larger based on max_num_kv_pages
     kv_cache_at_layer = []
     for _ in range(num_layers):
-        # Shape must match real models: [num_pages, 2, page_size, kv_heads, dim_head]
-        # engine.py reads shape[2] as page_size for bounds checks.
+        # Minimal 1-page cache per layer
+        # Shape: [num_pages, 2, num_kv_heads, page_size, head_dim]
         cache = torch.zeros(
-            num_pages,
+            1,  # 1 page
             2,  # K and V
-            runtime_config.kv_page_size,
             model_config.num_kv_heads,
+            runtime_config.kv_page_size,
             model_config.dim_head,
-            device="cpu",
+            device=device,
             dtype=dtype,
         )
         kv_cache_at_layer.append(cache)

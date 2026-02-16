@@ -198,8 +198,6 @@ impl Client {
             | ClientMessage::TerminateProcess { corr_id, .. }
             | ClientMessage::Query { corr_id, .. }
             | ClientMessage::AddProgram { corr_id, .. }
-            | ClientMessage::LaunchProcess { corr_id, .. }
-            | ClientMessage::LaunchDaemon { corr_id, .. }
             | ClientMessage::ListProcesses { corr_id }
             | ClientMessage::RegisterMcpServer { corr_id, .. }
             | ClientMessage::Ping { corr_id } => corr_id,
@@ -404,16 +402,14 @@ impl Client {
     pub async fn launch_process(
         &self,
         inferlet: String,
-        input: String,
+        arguments: Vec<String>,
         capture_outputs: bool,
-        token_budget: Option<usize>,
     ) -> Result<Process> {
         let msg = ClientMessage::LaunchProcess {
             corr_id: 0,
             inferlet,
-            input,
+            arguments,
             capture_outputs,
-            token_budget,
         };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
 

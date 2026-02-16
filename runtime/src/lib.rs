@@ -17,4 +17,3 @@ pub mod process;
 pub mod daemon;
 pub mod telemetry;
 pub mod ffi;
-pub mod workflow;

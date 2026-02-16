@@ -1,8 +1,8 @@
-//! Echo test inferlet — returns input as output.
+//! Echo test inferlet — returns args joined as output.
 
 use inferlet::Result;
 
 #[inferlet::main]
-async fn main(input: String) -> Result<String> {
-    Ok(input)
+async fn main(args: Vec<String>) -> Result<String> {
+    Ok(args.join(" "))
 }

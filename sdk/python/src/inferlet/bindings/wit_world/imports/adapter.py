@@ -22,9 +22,9 @@ class Adapter:
     def destroy(self) -> None:
         raise NotImplementedError
     @classmethod
-    def open(cls, model: model.Model, name: str) -> Optional[Self]:
+    def lookup(cls, model: model.Model, name: str) -> Optional[Self]:
         raise NotImplementedError
-    def fork(self, name: str) -> Self:
+    def clone(self, name: str) -> Self:
         raise NotImplementedError
     def acquire_lock(self) -> pie_core_types.FutureBool:
         raise NotImplementedError
