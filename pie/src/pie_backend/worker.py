@@ -142,12 +142,18 @@ def worker_main(
     """
     rank = local_rank
 
+    # Workers only need thread-safety for tqdm, not the default
+    # multiprocessing.RLock which creates a POSIX semaphore that leaks
+    # when the worker is terminated.
+    import threading
+    from tqdm import tqdm
+    tqdm.set_lock(threading.RLock())
+
 
     import torch
-    import pie_runtime
+    from pie import _runtime as pie_runtime
     from pie_backend.engine import Engine
     from pie_backend.config import RuntimeConfig
-    from pie_backend.model import get_chat_template
     import torch.distributed as dist
     import threading
 
