@@ -4,12 +4,14 @@
 //! including WASI context and dynamic linking support.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use wasmtime::component::{ResourceAny, ResourceTable};
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 use super::output::LogStream;
 
+use crate::context::{self, ContextId};
 use crate::process::ProcessId;
 
 pub struct InstanceState {
@@ -22,6 +24,9 @@ pub struct InstanceState {
     resource_table: ResourceTable,
     http_ctx: WasiHttpCtx,
 
+    /// Per-instance scratch directory, deleted on Drop.
+    scratch_dir: PathBuf,
+
     // Dynamic linking support for proxy resources
     /// Maps host rep → guest ResourceAny for dynamic linking
     dynamic_resource_map: HashMap<u32, ResourceAny>,
@@ -29,6 +34,21 @@ pub struct InstanceState {
     guest_resource_map: Vec<(ResourceAny, u32)>,
     /// Counter for allocating unique host reps
     next_dynamic_rep: u32,
+
+    /// Anonymous contexts owned by this instance, auto-destroyed on Drop.
+    owned_contexts: Vec<(usize, ContextId)>,
+}
+
+impl Drop for InstanceState {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.scratch_dir);
+        // Auto-destroy all anonymous contexts owned by this instance
+        for (model_idx, context_id) in self.owned_contexts.drain(..) {
+            tokio::spawn(async move {
+                let _ = context::destroy(model_idx, context_id, 0, true).await;
+            });
+        }
+    }
 }
 
 impl WasiView for InstanceState {
@@ -55,6 +75,7 @@ impl InstanceState {
         id: ProcessId,
         username: String,
         capture_outputs: bool,
+        allow_filesystem: bool,
     ) -> Self {
         let mut builder = WasiCtx::builder();
         builder.inherit_network(); // TODO: Replace with socket_addr_check later.
@@ -64,16 +85,36 @@ impl InstanceState {
             builder.stderr(LogStream::new_stderr(id));
         }
 
+        // Cross-platform temp dir: /tmp on Linux, %TEMP% on Windows, etc.
+        let scratch_dir = std::env::temp_dir()
+            .join("pie")
+            .join(id.to_string());
+
+        if allow_filesystem {
+            std::fs::create_dir_all(&scratch_dir)
+                .expect("failed to create scratch dir");
+
+            builder.preopened_dir(
+                &scratch_dir,
+                "/scratch",
+                DirPerms::all(),
+                FilePerms::all(),
+            ).expect("failed to preopen scratch dir");
+        }
+
         InstanceState {
             id,
             username,
             wasi_ctx: builder.build(),
             resource_table: ResourceTable::new(),
             http_ctx: WasiHttpCtx::new(),
+            scratch_dir,
             // Dynamic linking support
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
+            // Context lifecycle tracking
+            owned_contexts: Vec::new(),
         }
     }
 
@@ -126,5 +167,22 @@ impl InstanceState {
         } else {
             None
         }
+    }
+
+    // ========================================================================
+    // Context Lifecycle Tracking
+    // ========================================================================
+
+    /// Track an anonymous context for auto-cleanup on instance drop.
+    pub fn track_context(&mut self, model_idx: usize, context_id: ContextId) {
+        self.owned_contexts.push((model_idx, context_id));
+    }
+
+    /// Stop tracking a context (e.g. after save or explicit destroy).
+    /// Returns true if the context was tracked (i.e., was anonymous).
+    pub fn untrack_context(&mut self, model_idx: usize, context_id: ContextId) -> bool {
+        let before = self.owned_contexts.len();
+        self.owned_contexts.retain(|&(m, c)| !(m == model_idx && c == context_id));
+        self.owned_contexts.len() < before
     }
 }
