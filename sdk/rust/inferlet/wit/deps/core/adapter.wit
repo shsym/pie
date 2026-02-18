@@ -10,9 +10,9 @@ interface adapter {
 
         destroy: func();
 
-        open: static func(model: borrow<model>, name:string) -> option<adapter>;
+        lookup: static func(model: borrow<model>, name:string) -> option<adapter>;
 
-        fork: func(name:string) -> adapter;
+        clone: func(name:string) -> adapter;
 
         acquire-lock: func() -> future-bool;
 

@@ -37,7 +37,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let model = Model::load(&model_name)?;
 
     println!("🔧 Updating adapter '{}'...", &name);
-    let adapter = Adapter::open(&model, &name)
+    let adapter = Adapter::lookup(&model, &name)
         .ok_or_else(|| format!("Adapter '{}' not found", name))?;
 
     // Perform the ES update.
