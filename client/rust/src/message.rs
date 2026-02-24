@@ -1,31 +1,69 @@
 use serde::{Deserialize, Serialize};
 
 pub const CHUNK_SIZE_BYTES: usize = 256 * 1024; // 256 KiB
+pub const QUERY_PROGRAM_EXISTS: &str = "program_exists";
 pub const QUERY_MODEL_STATUS: &str = "model_status";
+pub const QUERY_BACKEND_STATS: &str = "backend_stats";
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum EventCode {
+    Message = 0,
+    Completed = 1,
+    Aborted = 2,
+    Exception = 3,
+    ServerError = 4,
+    OutOfResources = 5,
+}
+
+impl EventCode {
+    pub fn from_u32(code: u32) -> Option<EventCode> {
+        match code {
+            0 => Some(EventCode::Message),
+            1 => Some(EventCode::Completed),
+            2 => Some(EventCode::Aborted),
+            3 => Some(EventCode::Exception),
+            4 => Some(EventCode::ServerError),
+            5 => Some(EventCode::OutOfResources),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InstanceStatus {
+    Attached,
+    Detached,
+    Finished,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceInfo {
+    pub id: String,
+    pub arguments: Vec<String>,
+    pub status: InstanceStatus,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub elapsed_secs: u64,
+    #[serde(default)]
+    pub kv_pages_used: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StreamingOutput {
+    Stdout(String),
+    Stderr(String),
+}
 
 /// Messages from client -> server
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    #[serde(rename = "auth_identify")]
-    AuthIdentify { corr_id: u32, username: String },
+    #[serde(rename = "identification")]
+    Identification { corr_id: u32, username: String },
 
-    #[serde(rename = "auth_prove")]
-    AuthProve { corr_id: u32, signature: String },
-
-    #[serde(rename = "auth_by_token")]
-    AuthByToken { corr_id: u32, token: String },
-
-    #[serde(rename = "check_program")]
-    CheckProgram {
-        corr_id: u32,
-        name: String,
-        version: String,
-        #[serde(default)]
-        wasm_hash: Option<String>,
-        #[serde(default)]
-        manifest_hash: Option<String>,
-    },
+    #[serde(rename = "signature")]
+    Signature { corr_id: u32, signature: String },
 
     #[serde(rename = "query")]
     Query {
@@ -34,81 +72,80 @@ pub enum ClientMessage {
         record: String,
     },
 
-    #[serde(rename = "add_program")]
-    AddProgram {
+    #[serde(rename = "install_program")]
+    InstallProgram {
         corr_id: u32,
         program_hash: String,
         manifest: String,
-        force_overwrite: bool,
         chunk_index: usize,
         total_chunks: usize,
         #[serde(with = "serde_bytes")]
         chunk_data: Vec<u8>,
     },
 
-    #[serde(rename = "launch_process")]
-    LaunchProcess {
+    #[serde(rename = "launch_instance")]
+    LaunchInstance {
         corr_id: u32,
         inferlet: String,
         arguments: Vec<String>,
-        capture_outputs: bool,
+        detached: bool,
     },
 
-    #[serde(rename = "launch_daemon")]
-    LaunchDaemon {
+    #[serde(rename = "launch_instance_from_registry")]
+    LaunchInstanceFromRegistry {
+        corr_id: u32,
+        inferlet: String,
+        arguments: Vec<String>,
+        detached: bool,
+    },
+
+    #[serde(rename = "attach_instance")]
+    AttachInstance { corr_id: u32, instance_id: String },
+
+    #[serde(rename = "launch_server_instance")]
+    LaunchServerInstance {
         corr_id: u32,
         port: u32,
         inferlet: String,
         arguments: Vec<String>,
     },
 
-    #[serde(rename = "attach_process")]
-    AttachProcess { corr_id: u32, process_id: String },
-
-    #[serde(rename = "terminate_process")]
-    TerminateProcess { corr_id: u32, process_id: String },
-
-    #[serde(rename = "signal_process")]
-    SignalProcess {
-        process_id: String,
+    #[serde(rename = "signal_instance")]
+    SignalInstance {
+        instance_id: String,
         message: String,
     },
 
-    #[serde(rename = "transfer_file")]
-    TransferFile {
-        process_id: String,
-        file_hash: String,
+    #[serde(rename = "upload_blob")]
+    UploadBlob {
+        corr_id: u32,
+        instance_id: String,
+        blob_hash: String,
         chunk_index: usize,
         total_chunks: usize,
         #[serde(with = "serde_bytes")]
         chunk_data: Vec<u8>,
     },
 
-    #[serde(rename = "list_processes")]
-    ListProcesses { corr_id: u32 },
+    #[serde(rename = "terminate_instance")]
+    TerminateInstance { corr_id: u32, instance_id: String },
+
+    #[serde(rename = "attach_remote_service")]
+    AttachRemoteService {
+        corr_id: u32,
+        endpoint: String,
+        service_type: String,
+        service_name: String,
+    },
+
+    #[serde(rename = "internal_authenticate")]
+    InternalAuthenticate { corr_id: u32, token: String },
 
     #[serde(rename = "ping")]
     Ping { corr_id: u32 },
 
-    #[serde(rename = "register_mcp_server")]
-    RegisterMcpServer {
-        corr_id: u32,
-        name: String,
-        transport: String,
-        #[serde(default)]
-        command: Option<String>,
-        #[serde(default)]
-        args: Option<Vec<String>>,
-        #[serde(default)]
-        url: Option<String>,
-    },
-
-    #[serde(rename = "mcp_response")]
-    McpResponse {
-        corr_id: u32,
-        ok: bool,
-        result: String,
-    },
+    #[serde(rename = "list_instances")]
+    ListInstances { corr_id: u32 },
 }
 
 /// Messages from server -> client
@@ -118,33 +155,57 @@ pub enum ServerMessage {
     #[serde(rename = "response")]
     Response {
         corr_id: u32,
-        ok: bool,
+        successful: bool,
         result: String,
     },
 
-    #[serde(rename = "process_event")]
-    ProcessEvent {
-        process_id: String,
-        event: String,
-        value: String,
+    #[serde(rename = "instance_launch_result")]
+    InstanceLaunchResult {
+        corr_id: u32,
+        successful: bool,
+        message: String,
     },
 
-    #[serde(rename = "file")]
-    File {
-        process_id: String,
-        file_hash: String,
+    #[serde(rename = "instance_attach_result")]
+    InstanceAttachResult {
+        corr_id: u32,
+        successful: bool,
+        message: String,
+    },
+
+    #[serde(rename = "instance_event")]
+    InstanceEvent {
+        instance_id: String,
+        event: u32,
+        message: String,
+    },
+
+    #[serde(rename = "download_blob")]
+    DownloadBlob {
+        corr_id: u32,
+        instance_id: String,
+        blob_hash: String,
         chunk_index: usize,
         total_chunks: usize,
         #[serde(with = "serde_bytes")]
         chunk_data: Vec<u8>,
     },
 
-    #[serde(rename = "mcp_request")]
-    McpRequest {
+    #[serde(rename = "server_event")]
+    ServerEvent { message: String },
+
+    #[serde(rename = "challenge")]
+    Challenge { corr_id: u32, challenge: String },
+
+    #[serde(rename = "live_instances")]
+    LiveInstances {
         corr_id: u32,
-        process_id: String,
-        server_name: String,
-        method: String,
-        params: String,
+        instances: Vec<InstanceInfo>,
+    },
+
+    #[serde(rename = "streaming_output")]
+    StreamingOutput {
+        instance_id: String,
+        output: StreamingOutput,
     },
 }

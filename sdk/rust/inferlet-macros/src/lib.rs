@@ -1,7 +1,3 @@
-//! Procedural macros for the inferlet library.
-//!
-//! Provides the `#[inferlet::main]` attribute macro for defining inferlet entry points.
-
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
@@ -33,22 +29,6 @@ fn to_rust_ident(name: &str) -> syn::Ident {
     syn::Ident::new(&sanitized, Span::call_site())
 }
 
-/// Marks an async function as the inferlet entry point.
-///
-/// The function should have the signature:
-/// ```ignore
-/// async fn main(args: Vec<String>) -> inferlet::Result<String>
-/// ```
-///
-/// # Example
-/// ```ignore
-/// use inferlet::Result;
-///
-/// #[inferlet::main]
-/// async fn main(args: Vec<String>) -> Result<String> {
-///     Ok("Hello, world!".to_string())
-/// }
-/// ```
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the input tokens into a syntax tree
@@ -77,14 +57,15 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let package_ident = to_rust_ident(&package_name);
 
-    // Generate inline WIT for the export interface.
-    // Each inferlet exports: pie:{package_name}/run
+    // Generate inline WIT for the export interface
+    // The WIT package will be "pie:{package_name}" with interface "run"
+    // Export interface: pie:{package_name}/run
     let export_wit = format!(
         r#"
 package pie:{package_name};
 
 interface run {{
-    run: func(args: list<string>) -> result<string, string>;
+    run: func() -> result<_, string>;
 }}
 
 world inferlet {{
@@ -113,11 +94,35 @@ world inferlet {{
         struct __PieMain;
 
         impl __pie_export::exports::pie::#package_ident::run::Guest for __PieMain {
-            fn run(args: Vec<String>) -> std::result::Result<String, String> {
+            fn run() -> Result<(), String> {
+                let args = inferlet::Args::from_vec(
+                    inferlet::get_arguments()
+                        .into_iter()
+                        .map(std::ffi::OsString::from)
+                        .collect(),
+                );
+
                 let result = inferlet::wstd::runtime::block_on(async { #inner_fn_name(args).await });
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-                result
+
+                match result {
+                    Ok(r) => {
+                        use std::any::Any;
+                        let r_any: &dyn Any = &r;
+                        let output = if let Some(s) = r_any.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = r_any.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            format!("{:?}", r)
+                        };
+
+                        inferlet::set_return(&output);
+                        Ok(())
+                    },
+                    Err(e) => {
+                        Err(format!("{:?}", e))
+                    }
+                }
             }
         }
 

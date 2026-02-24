@@ -1,64 +1,69 @@
-use inferlet::prelude::*;
-use inferlet::{adapter::Adapter, parse_args, runtime, Result};
 use inferlet::wstd::time::Duration;
+use inferlet::{self, Adapter, Args, Evolve, Result, bail};
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = parse_args(args);
-    let name: String = args.value_from_str("--name").map_err(|e| e.to_string())?;
+async fn main(mut args: Args) -> Result<()> {
+    // Parse required arguments.
+    let name: String = args.value_from_str("--name")?;
     let seeds: Vec<i64> = args.value_from_fn("--seeds", |s| {
         s.split(',')
             .map(|v| v.parse::<i64>())
-            .collect::<std::result::Result<Vec<_>, _>>()
-    }).map_err(|e| e.to_string())?;
+            .collect::<Result<Vec<_>, _>>()
+    })?;
     let scores: Vec<f32> = args.value_from_fn("--scores", |s| {
         s.split(',')
             .map(|v| v.parse::<f32>())
-            .collect::<std::result::Result<Vec<_>, _>>()
-    }).map_err(|e| e.to_string())?;
-    let max_sigma: f32 = args.value_from_str("--max-sigma").map_err(|e| e.to_string())?;
-    let download: Option<String> = args.opt_value_from_str("--download").map_err(|e| e.to_string())?;
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let max_sigma: f32 = args.value_from_str("--max-sigma")?;
+    let download: Option<String> = args.opt_value_from_str("--download")?;
 
-    // Input validation.
+    // --- 2. Input Validation ---
     if seeds.is_empty() {
-        return Err("At least one seed and score must be provided.".to_string());
+        bail!("At least one seed and score must be provided.");
     }
     if seeds.len() != scores.len() {
-        return Err(format!(
+        bail!(
             "The number of seeds ({}) must match the number of scores ({}).",
             seeds.len(),
             scores.len()
-        ));
+        );
     }
 
-    // Load the model and look up the adapter.
-    let model_name = runtime::models().into_iter().next()
-        .ok_or_else(|| "No models available".to_string())?;
-    let model = Model::load(&model_name)?;
+    // --- 3. Adapter Update ---
+    println!(
+        "🔧 Initializing model and queue to update adapter '{}'...",
+        &name
+    );
+    let model = inferlet::get_auto_model();
+    let queue = model.create_queue();
 
-    println!("🔧 Updating adapter '{}'...", &name);
-    let adapter = Adapter::open(&model, &name)
-        .ok_or_else(|| format!("Adapter '{}' not found", name))?;
-
-    // Perform the ES update.
     println!(
         "Updating adapter '{}' with {} scores (max_sigma = {})...",
         &name,
         scores.len(),
         max_sigma
     );
-    inferlet::zo::zo::update(&adapter, &scores, &seeds, max_sigma)?;
+    let es_adapter = queue.import_adapter(&name);
 
-    // If a download path was provided, save the adapter weights.
-    if let Some(path) = &download {
-        if !path.is_empty() {
-            println!("📥 Saving adapter '{}' to '{}'...", name, path);
-            adapter.save(path)?;
+    // Perform the update operation with max_sigma.
+    queue.update_adapter(es_adapter, scores, seeds, max_sigma);
+
+    // If a download path was provided, download the adapter.
+    if let Some(download_path) = &download {
+        if !download_path.is_empty() {
+            println!(
+                "📥 Downloading adapter '{}' to '{}'...",
+                name, download_path
+            );
+            queue.download_adapter(es_adapter, download_path);
         }
     }
 
+    // sleep for 100ms
     inferlet::wstd::task::sleep(Duration::from_millis(100)).await;
+
     println!("✅ Adapter '{}' updated successfully.", name);
 
-    Ok(format!("Adapter '{}' updated", name))
+    Ok(())
 }

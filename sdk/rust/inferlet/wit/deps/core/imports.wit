@@ -1,12 +1,10 @@
-package pie:core;
+package inferlet:core;
 
 world imports {
-    import types;
-    import adapter;
-    import context;
-    import messaging;
-    import session;
-    import model;
+    import common;
     import runtime;
-    import inference;
+    import forward;
+    import tokenize;
+    import kvs;
+    import message;
 }
