@@ -137,9 +137,10 @@ def handle_submit_command(
     port: Optional[int] = None,
     username: Optional[str] = None,
     private_key_path: Optional[Path] = None,
-    detached: bool = False,
+    capture_outputs: bool = True,
     link: Optional[list[Path]] = None,
     arguments: Optional[list[str]] = None,
+    force_overwrite: bool = False,
 ) -> None:
     """Handle the `pie-cli submit` command.
 
@@ -154,7 +155,7 @@ def handle_submit_command(
     3. If using path and libraries are specified, composes them with the inferlet using wac
     4. Uploads the composed inferlet if not already on server (path mode only)
     5. Launches the inferlet with the provided arguments
-    6. In non-detached mode, streams the inferlet output with signal handling
+    6. When capturing outputs, streams the inferlet output with signal handling
     """
     # Validate at least one of inferlet or path is provided
     if inferlet is None and path is None:
@@ -209,24 +210,24 @@ def handle_submit_command(
                     composed_path = Path(tmp.name)
                     try:
                         compose_components(path, link, composed_path)
-                        engine.install_program(client, composed_path, manifest)
+                        engine.install_program(client, composed_path, manifest, force_overwrite=force_overwrite)
                     finally:
                         composed_path.unlink(missing_ok=True)
                 typer.echo("✅ Inferlet installed successfully.")
             # No composition - check if program already exists before installing
             else:
-                if not engine.program_exists(client, inferlet_name, path, manifest):
-                    engine.install_program(client, path, manifest)
+                if not engine.check_program(client, inferlet_name, path, manifest):
+                    engine.install_program(client, path, manifest, force_overwrite=force_overwrite)
                     typer.echo("✅ Inferlet installed successfully.")
                 else:
                     typer.echo("Inferlet already exists on server.")
 
             # Launch the instance
-            instance = engine.launch_instance(
+            instance = engine.launch_process(
                 client,
                 inferlet_name,
                 arguments,
-                detached,
+                capture_outputs,
             )
         else:
             # Launch from registry
@@ -238,16 +239,16 @@ def handle_submit_command(
 
             typer.echo(f"Launching from registry: {inferlet}")
 
-            instance = engine.launch_instance_from_registry(
+            instance = engine.launch_process(
                 client,
                 inferlet,
                 arguments,
-                detached,
+                capture_outputs,
             )
 
-        typer.echo(f"✅ Inferlet launched with ID: {instance.instance_id}")
+        typer.echo(f"✅ Inferlet launched with ID: {instance.process_id}")
 
-        if not detached:
+        if capture_outputs:
             engine.stream_inferlet_output(instance, client)
 
     finally:
