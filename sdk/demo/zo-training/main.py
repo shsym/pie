@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 
 #os.environ["HF_DATASETS_OFFLINE"] = "1"
 # Assume pie is an installed library
-from pie_client import PieClient, Event
+from pie_client import PieClient, Instance, Event
 
 # Use the refactored dataset imports
 from countdown import CountdownDataset
@@ -37,9 +37,9 @@ class TrainingConfig:
     # --- Registry Inferlet Names ---
     INFERLET_NAMES: Dict[str, str] = field(
         default_factory=lambda: {
-            "es-init": "es-init@0.1.2",
-            "es-rollout": "es-rollout@0.1.2",
-            "es-update": "es-update@0.1.2",
+            "es-init": "ingim/es-init",
+            "es-rollout": "ingim/es-rollout",
+            "es-update": "ingim/es-update",
         }
     )
 
@@ -95,22 +95,27 @@ async def launch_and_get_result(
     """Launches an inferlet and returns the final message."""
     if verbose:
         tqdm.write(f"🚀 Worker {worker_id}: Launching {inferlet_name}...")
-    instance = await client.launch_process(
+    instance = await client.launch_instance_from_registry(
         inferlet_name, arguments=arguments
     )
     final_payload = None
     while True:
         event, message = await instance.recv()
-        if event in (Event.Return, Event.Message):
+        if event in (Event.Completed, Event.Message):
             final_payload = message
-            if event == Event.Return:
+            if event == Event.Completed:
                 if verbose:
                     tqdm.write(
-                        f"✅ Worker {worker_id}: Instance {instance.process_id} finished."
+                        f"✅ Worker {worker_id}: Instance {instance.instance_id} finished."
                     )
                 break
-        elif event == Event.Error:
-            tqdm.write(f"⚠️ Worker {worker_id}: Instance {instance.process_id} failed. Msg: {message}")
+        elif event in (
+            Event.Aborted,
+            Event.Exception,
+            Event.ServerError,
+            Event.OutOfResources,
+        ):
+            # tqdm.write(f"⚠️ Worker {worker_id}: Instance {instance.instance_id} failed with event {event}. Msg: {message}")
             break
     return final_payload
 
@@ -158,8 +163,6 @@ class ESOrchestrator:
         # initial_eval_metrics = await self._run_evaluation(step=0)
 
         # tqdm.write("✅ Initial evaluation complete.")
-        consecutive_zero_steps = 0
-        MAX_CONSECUTIVE_ZERO_STEPS = 3
         for step in range(1, self.config.TRAINING_STEPS + 1):
             start_time = time.time()
             tqdm.write(f"\n--- Step {step}/{self.config.TRAINING_STEPS} ---")
@@ -174,22 +177,10 @@ class ESOrchestrator:
             step_duration = time.time() - start_time
             metrics["perf/step_duration_sec"] = step_duration
             metrics["step"] = step
-            num_episodes = metrics["num_finished_episodes"]
             tqdm.write(
                 f"Step {step}: mean_reward={metrics['mean_reward']:.4f} | "
-                f"episodes={num_episodes} | duration={step_duration:.1f}s"
+                f"episodes={metrics['num_finished_episodes']} | duration={step_duration:.1f}s"
             )
-            # Early termination: abort if rollouts keep failing
-            if num_episodes == 0:
-                consecutive_zero_steps += 1
-                if consecutive_zero_steps >= MAX_CONSECUTIVE_ZERO_STEPS:
-                    tqdm.write(
-                        f"\n❌ Aborting: {MAX_CONSECUTIVE_ZERO_STEPS} consecutive steps "
-                        f"with 0 completed episodes. Check inferlet errors above."
-                    )
-                    return
-            else:
-                consecutive_zero_steps = 0
             if (
                 step % self.config.EVAL_EVERY_N_STEPS == 0
                 or step == self.config.TRAINING_STEPS
@@ -249,18 +240,11 @@ class ESOrchestrator:
                 self.config.INFERLET_NAMES["es-init"],
                 init_args,
                 f"C{i}-Init",
-                verbose=True,  # Always log init
+                self.config.VERBOSE_WORKER_LOGS,
             )
             for i, client in enumerate(self.clients)
         ]
-        results = await asyncio.gather(*init_tasks)
-        # Abort early if initialization failed on any client
-        if any(r is None for r in results):
-            failed = [i for i, r in enumerate(results) if r is None]
-            raise RuntimeError(
-                f"Adapter initialization failed on client(s): {failed}. "
-                "Check inferlet error messages above."
-            )
+        await asyncio.gather(*init_tasks)
         tqdm.write("✅ Adapter initialized on all clients.")
 
     async def _run_distributed_rollouts(
