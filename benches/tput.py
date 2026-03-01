@@ -1,90 +1,111 @@
-import asyncio
+"""Pie throughput benchmark.
+
+Spins up a local Pie server using the ``Server`` API, installs the
+text-completion inferlet, then fires concurrent requests and reports
+throughput.
+
+Usage::
+
+    uv run python benches/tput.py
+    uv run python benches/tput.py --num-requests 128 --concurrency 32
+    uv run python benches/tput.py --model meta-llama/Llama-3.2-1B-Instruct --device cuda:0,cuda:1
+"""
+
 import argparse
-import time
+import asyncio
 import sys
-import tomllib
+import time
 from pathlib import Path
-from pie_client import PieClient, Event
+
+from pie_client import Event
 
 
 async def run_benchmark(args):
-    # 1. Setup paths
+    from pie.server import Server
+    from pie.config import Config, ModelConfig, AuthConfig
+
+    # -- Resolve paths --------------------------------------------------------
+
     script_dir = Path(__file__).parent.resolve()
-    # Default WASM path assuming standard layout
     wasm_path = (
         script_dir.parent
-        / "std"
+        / "inferlets"
         / "text-completion"
         / "target"
         / "wasm32-wasip2"
         / "release"
         / "text_completion.wasm"
     )
-    # Manifest path
-    manifest_path = script_dir.parent / "std" / "text-completion" / "Pie.toml"
+    manifest_path = script_dir.parent / "inferlets" / "text-completion" / "Pie.toml"
 
     if not wasm_path.exists():
         print(f"Error: WASM binary not found at {wasm_path}")
-        print(
-            "Please run `cargo build --target wasm32-wasip2 --release` in `text-completion` first."
-        )
+        print("Run `cargo build --target wasm32-wasip2 --release` in text-completion first.")
         sys.exit(1)
-
     if not manifest_path.exists():
         print(f"Error: Manifest not found at {manifest_path}")
         sys.exit(1)
 
-    print(f"Using WASM: {wasm_path}")
-    print(f"Using Manifest: {manifest_path}")
+    import tomllib
+
     manifest = tomllib.loads(manifest_path.read_text())
-    namespace, name = manifest["package"]["name"].split("/", 1)
+    pkg_name = manifest["package"]["name"]
     version = manifest["package"]["version"]
-    inferlet_name = f"{namespace}/{name}@{version}"
-    print(f"Inferlet: {inferlet_name}")
+    inferlet_name = f"{pkg_name}@{version}"
 
-    # 2. Connect to server
-    print(f"Connecting to {args.server}...")
-    async with PieClient(args.server) as client:
-        await client.authenticate("benchmark-user")
+    # -- Parse device list ----------------------------------------------------
 
-        # 3. Install program (check both name and hashes match)
-        if not await client.program_exists(inferlet_name, wasm_path, manifest_path):
-            print("Installing program...")
-            await client.install_program(wasm_path, manifest_path)
-        else:
-            print("Program already exists on server.")
+    device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
 
-        # 4. Prepare workload
-        print(
-            f"Starting benchmark: {args.num_requests} requests, concurrency {args.concurrency}"
-        )
-        print(f"Prompt: {args.prompt}")
-        print(f"Max Tokens: {args.max_tokens}")
+    # -- Start server ---------------------------------------------------------
 
-        inferlet_args = [
-            "--prompt",
-            args.prompt,
-            "--max-tokens",
-            str(args.max_tokens),
-            "--temperature",
-            str(args.temperature),
-            "--system",
-            "You are a helpful benchmarking assistant.",
-        ]
+    print(f"Model:       {args.model}")
+    print(f"Device:      {device}")
+    print(f"Requests:    {args.num_requests}")
+    print(f"Concurrency: {args.concurrency}")
+    print(f"Max Tokens:  {args.max_tokens}")
+    print(f"GPU Mem:     {args.gpu_mem_util}")
+    print(f"Prompt:      {args.prompt!r}")
+    print()
 
-        # 5. Execution Loop
-        start_time = time.time()
+    cfg = Config(
+        port=0,
+        auth=AuthConfig(enabled=False),
+        models=[ModelConfig(
+            hf_repo=args.model, device=device,
+            dummy_mode=args.dummy,
+            gpu_mem_utilization=args.gpu_mem_util,
+            cpu_mem_budget_in_gb=args.cpu_mem_budget,
+        )],
+    )
+    async with Server(cfg) as server:
+        client = await server.connect()
+        # -- Install program --------------------------------------------------
 
-        tasks = []
-        completed = 0
-        total_chars = 0
-        total_tokens_est = 0
+        # Always install to pick up latest build
+        print("Installing program...")
+        await client.install_program(wasm_path, manifest_path, force_overwrite=True)
+
+        # -- Build workload ---------------------------------------------------
+
+        inferlet_input = {
+            "prompt": args.prompt,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "system": "You are a helpful benchmarking assistant.",
+        }
 
         queue = asyncio.Queue()
         for i in range(args.num_requests):
             queue.put_nowait(i)
 
-        async def worker(worker_id):
+        completed = 0
+        total_chars = 0
+        total_tokens_est = 0
+
+        # -- Workers ----------------------------------------------------------
+
+        async def worker(worker_id: int):
             nonlocal completed, total_chars, total_tokens_est
             while not queue.empty():
                 try:
@@ -92,73 +113,66 @@ async def run_benchmark(args):
                 except asyncio.QueueEmpty:
                     break
 
-                # Launch instance
                 try:
-                    inferlet_name = f"{namespace}/{name}@{version}"
-                    instance = await client.launch_instance(
-                        inferlet_name, arguments=inferlet_args
+                    process = await client.launch_process(
+                        inferlet_name, input=inferlet_input,
                     )
+                    req_chars = 0
                     while True:
-                        event, msg = await instance.recv()
-                        if event == Event.Completed:
-                            text = msg
-                            chars = len(text)
-                            tokens = chars / 4.0
-
-                            total_chars += chars
-                            total_tokens_est += tokens
+                        event, msg = await process.recv()
+                        if event == Event.Stdout:
+                            req_chars += len(msg)
+                        elif event == Event.Stderr:
+                            req_chars += len(msg)
+                        elif event == Event.Return:
+                            req_chars += len(msg)
+                            total_chars += req_chars
+                            total_tokens_est += req_chars / 4.0
                             completed += 1
                             print(".", end="", flush=True)
                             break
-                        elif event == Event.Exception:
-                            print(f"[{worker_id}] Req {req_id} failed: {msg}")
-                            break
-                        # Handle other potential closing events
-                        elif event in (
-                            Event.Aborted,
-                            Event.ServerError,
-                            Event.OutOfResources,
-                        ):
-                            print(
-                                f"[{worker_id}] Req {req_id} aborted/failed: {event} {msg}"
-                            )
+                        elif event == Event.Error:
+                            print(f"\n[{worker_id}] Req {req_id} failed: {msg}")
                             break
                 except Exception as e:
-                    print(f"[{worker_id}] Error: {e}")
+                    print(f"\n[{worker_id}] Error: {e}")
                 finally:
                     queue.task_done()
 
-        # Creates workers
+        # -- Run --------------------------------------------------------------
+
+        print("Running", end="", flush=True)
+        start = time.time()
+
         workers = [asyncio.create_task(worker(i)) for i in range(args.concurrency)]
         await asyncio.wait(workers)
 
-        duration = time.time() - start_time
+        duration = time.time() - start
 
-        print("\n--- Benchmark Results ---")
-        print(f"Total Time: {duration:.2f} s")
-        print(f"Total Requests: {completed}/{args.num_requests}")
-        print(f"Total Chars: {total_chars}")
-        print(f"Est. Total Tokens: {total_tokens_est:.0f}")
-        print(f"Throughput (Requests/sec): {completed / duration:.2f}")
-        print(f"Throughput (Est. Tokens/sec): {total_tokens_est / duration:.2f}")
+        # -- Report -----------------------------------------------------------
+
+        print(f"\n\n{'─' * 40}")
+        print(f"{'Total Time:':<25} {duration:.2f} s")
+        print(f"{'Completed:':<25} {completed}/{args.num_requests}")
+        print(f"{'Total Chars:':<25} {total_chars}")
+        print(f"{'Est. Total Tokens:':<25} {total_tokens_est:.0f}")
+        print(f"{'Requests/sec:':<25} {completed / duration:.2f}")
+        print(f"{'Est. Tokens/sec:':<25} {total_tokens_est / duration:.2f}")
+        print(f"{'─' * 40}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Pie Throughput Benchmark")
-    parser.add_argument("--server", default="ws://127.0.0.1:8080", help="Server URI")
-    parser.add_argument(
-        "--num-requests", type=int, default=64, help="Total number of requests"
-    )
-    parser.add_argument(
-        "--concurrency", type=int, default=64, help="Concurrent requests"
-    )
-    parser.add_argument(
-        "--prompt", default="Write a short story about a robot.", help="Prompt to use"
-    )
-    parser.add_argument(
-        "--max-tokens", type=int, default=100, help="Max tokens to generate per request"
-    )
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
+    parser.add_argument("--device", default="cuda:0", help="Device(s), comma-separated (e.g. cuda:0,cuda:1)")
+    parser.add_argument("--num-requests", type=int, default=64, help="Total number of requests")
+    parser.add_argument("--concurrency", type=int, default=64, help="Concurrent requests")
+    parser.add_argument("--prompt", default="Write a short story about a robot.", help="Prompt")
+    parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens per request")
     parser.add_argument("--temperature", type=float, default=0.6, help="Temperature")
+    parser.add_argument("--dummy", action="store_true", help="Use dummy mode (no GPU)")
+    parser.add_argument("--gpu-mem-util", type=float, default=0.8, help="GPU memory utilization for KV cache (lower = fewer pages = more contention)")
+    parser.add_argument("--cpu-mem-budget", type=int, default=0, help="CPU memory budget in GB for working page swap (0 = disabled)")
 
     args = parser.parse_args()
 

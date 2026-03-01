@@ -1,0 +1,32 @@
+/// Shared MCP data types.
+interface types {
+
+    /// Opaque JSON carried as a string.
+    type json = string;
+
+    /// MCP error, mirrors JSON-RPC error shape.
+    record error {
+        code: s32,
+        message: string,
+        data: option<json>,
+    }
+
+    /// The fundamental unit of content in MCP responses.
+    variant content {
+        text(string),
+        image(image-content),
+        embedded-resource(resource-content),
+    }
+
+    record image-content {
+        mime-type: string,
+        data: list<u8>,
+    }
+
+    record resource-content {
+        uri: string,
+        mime-type: option<string>,
+        text: option<string>,
+        blob: option<list<u8>>,
+    }
+}
