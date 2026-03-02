@@ -121,9 +121,6 @@ def attention_with_sinks(
     page_indptr_cpu = kv_page_indptr.cpu().tolist()
     last_page_lens_cpu = kv_last_page_lens.cpu().tolist()
 
-    # Expand sinks for GQA: [local_kv_heads] -> [local_q_heads]
-    sinks_expanded = sinks.repeat_interleave(gqa) if gqa > 1 else sinks
-
     attn_parts = []
     t_off = 0
     for b in range(batch_sz):
@@ -162,7 +159,8 @@ def attention_with_sinks(
         # Add sink as virtual token (no value, just absorbs weight).
         # Sink acts as a "dummy KV position" that absorbs probability mass
         # in softmax, matching FlashInfer's BatchAttentionWithAttentionSinkWrapper.
-        sk = sinks_expanded[None, :, None, None].expand(1, -1, nt, 1).float()
+        # sinks is already [local_q_heads] (column-sharded per Q head).
+        sk = sinks[None, :, None, None].expand(1, -1, nt, 1).float()
         sc_s = torch.cat([sc, sk], dim=-1)
         pr = torch.softmax(sc_s, dim=-1)[:, :, :, :-1]
 
