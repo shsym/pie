@@ -26,7 +26,7 @@ from .gpt_oss_utils import (
     pad_to_multiple,
     prepare_gptoss_moe_gate_up,
     prepare_gptoss_moe_down,
-    _use_torch_moe,
+    _is_sm110_fallback,
 )
 from . import gpt_oss_sm110 as sm110
 from ..config import RuntimeConfig
@@ -407,7 +407,7 @@ class ForwardPass:
         # Pre-compute YaRN RoPE cos/sin cache
         self._rope_cos_sin_cache = self._compute_rope_cache()
 
-        if not _use_torch_moe():
+        if not _is_sm110_fallback():
             # FlashInfer attention wrappers (all broken on SM110)
             self.workspace_window = torch.empty(
                 128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
@@ -463,10 +463,8 @@ class ForwardPass:
         )
 
         # SM110 (Jetson Thor): CUTLASS BF16/BF16 MoE + torch attention
-        self._use_torch_moe = _use_torch_moe()
-        if self._use_torch_moe:
-            self._dequant_pH = self.padded_hidden_size
-            self._dequant_pI = self.padded_intermediate_size
+        self._is_sm110_fallback = _is_sm110_fallback()
+        if self._is_sm110_fallback:
             self._w1_bf16, self._w2_bf16 = sm110.init_dequant_buffers(
                 num_experts, self.padded_hidden_size,
                 self.padded_intermediate_size, device,
@@ -678,7 +676,7 @@ class ForwardPass:
         k = k.view(n, local_num_kv_heads, cfg.dim_head)
         v = v.view(n, local_num_kv_heads, cfg.dim_head)
 
-        if self._use_torch_moe:
+        if self._is_sm110_fallback:
             # SM110: torch RoPE + KV append + attention (FlashInfer broken)
             sm110.apply_rope_and_append_kv(
                 q, k, v, position_ids, self._rope_cos_sin_cache,
@@ -690,7 +688,7 @@ class ForwardPass:
                 q, kv_cache_layer, sinks, layer_idx, cfg.dim_head,
                 cfg.num_q_heads, cfg.num_kv_heads, self.tp_size,
                 cfg.sliding_window, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, batch_indices,
+                kv_last_page_lens, self._qo_indptr,
             )
         else:
             # FlashInfer attention path (SM100 datacenter Blackwell)
@@ -771,11 +769,12 @@ class ForwardPass:
             hidden_bf16 = padded
 
         # 4. MoE kernel
-        if self._use_torch_moe:
+        if self._is_sm110_fallback:
             # SM110: selective FP4→BF16 dequant + CUTLASS BF16/BF16 kernel
             output = sm110.moe_forward(
                 hidden_bf16, router_logits, layer_idx, self.weights.get,
-                cfg.experts_per_token, self._dequant_pI, self._dequant_pH,
+                cfg.experts_per_token,
+                self.padded_intermediate_size, self.padded_hidden_size,
                 self._w1_bf16, self._w2_bf16,
                 self._gemm1_alpha, self._gemm1_beta, self._gemm1_clamp_limit,
             )
@@ -867,6 +866,10 @@ class ForwardPass:
             nnz=n,
         )
 
+        # Store qo_indptr for SM110 attention path (used by attention_with_sinks)
+        if self._is_sm110_fallback:
+            self._qo_indptr = qo_indptr
+
         # Plan both wrappers (sliding window and full attention)
         # custom_mask is not used with attention sink wrapper
         _ = custom_mask
@@ -876,7 +879,7 @@ class ForwardPass:
         local_num_q_heads = cfg.num_q_heads // self.tp_size
         local_num_kv_heads = cfg.num_kv_heads // self.tp_size
 
-        if not self._use_torch_moe:
+        if not self._is_sm110_fallback:
             self.wrapper_window.plan(
                 qo_indptr,
                 kv_page_indptr,
@@ -911,7 +914,7 @@ class ForwardPass:
 
         for layer_idx in range(cfg.num_layers):
             # Select wrapper: even layers use sliding window, odd use full
-            wrapper = None if self._use_torch_moe else (self.wrapper_window if layer_idx % 2 == 0 else self.wrapper_full)
+            wrapper = None if self._is_sm110_fallback else (self.wrapper_window if layer_idx % 2 == 0 else self.wrapper_full)
 
             # 1. Attention block
             hidden_states = self.attention(

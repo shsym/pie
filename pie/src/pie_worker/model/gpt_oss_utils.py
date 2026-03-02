@@ -8,10 +8,13 @@ Ported from backend-python-legacy/model/gptoss_utils.py
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import Any
 
 import torch
+
+from ..utils import get_device_sm
 
 # Note: These imports require FlashInfer (CUDA only)
 # Import lazily in functions that need them to allow module loading on CPU
@@ -37,19 +40,42 @@ FP4_VALUES = (
     -6.0,
 )
 
-import functools
+# SM architectures where FlashInfer CUDA kernels are broken and we fall back
+# to torch attention + CUTLASS BF16/BF16 MoE. When FlashInfer adds support
+# for an SM, remove it from this set.
+_FLASHINFER_BROKEN_SMS = frozenset({110})
 
 
 @functools.lru_cache(maxsize=1)
-def _use_torch_moe():
-    """Detect SM110+ (Jetson Thor) which needs CUTLASS MoE + torch attention."""
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 11
+def _is_sm110_fallback() -> bool:
+    """Return True on SMs where FlashInfer kernels are broken (Jetson Thor).
+
+    Uses get_device_sm() from utils.py (single source of truth for SM detection).
+    Assumes homogeneous GPU architecture across all TP ranks.
+    """
+    return get_device_sm() in _FLASHINFER_BROKEN_SMS
 
 
-def dequant_mxfp4_to_bf16(weights_fp4, scales_fp4, N, K, buf, expert_ids=None):
+_fp4_lut_cache: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_fp4_lut(device: torch.device) -> torch.Tensor:
+    """Return cached FP4 E2M1 lookup table (16 bf16 values) for *device*."""
+    lut = _fp4_lut_cache.get(device)
+    if lut is None:
+        lut = torch.tensor(FP4_VALUES, dtype=torch.bfloat16, device=device)
+        _fp4_lut_cache[device] = lut
+    return lut
+
+
+def dequant_mxfp4_to_bf16(
+    weights_fp4: torch.Tensor,
+    scales_fp4: torch.Tensor,
+    N: int,
+    K: int,
+    buf: torch.Tensor,
+    expert_ids: torch.Tensor | None = None,
+) -> None:
     """Dequant linear MXFP4 weights to BF16, writing into pre-allocated buffer.
 
     Args:
@@ -60,33 +86,27 @@ def dequant_mxfp4_to_bf16(weights_fp4, scales_fp4, N, K, buf, expert_ids=None):
         buf: [E, N, K] bfloat16 — pre-allocated output buffer
         expert_ids: optional 1D tensor of expert indices to dequant (selective mode)
     """
-    device = weights_fp4.device
-
-    # FP4 E2M1 lookup: 4-bit index → float value
-    lut = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-         0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-        dtype=torch.bfloat16, device=device,
-    )
+    lut = _get_fp4_lut(weights_fp4.device)
 
     if expert_ids is not None:
-        # Selective: only dequant the specified experts (top-k routing)
-        for eid in expert_ids:
-            e = eid.item()
-            w = weights_fp4[e:e+1].view(torch.uint8)
-            lo = (w & 0x0F).to(torch.int32)
-            hi = (w >> 4).to(torch.int32)
-            unpacked = torch.stack([lo, hi], dim=-1).reshape(1, N, K)
-            values = lut[unpacked]
-            del unpacked, lo, hi, w
-            sb = scales_fp4[e:e+1].view(torch.uint8).to(torch.int32)
-            sv = torch.exp2(sb.float() - 127.0).to(torch.bfloat16)
-            se = sv.repeat_interleave(32, dim=-1)[:, :, :K]
-            del sb, sv
-            buf[e] = (values * se).squeeze(0)
-            del values, se
+        # Selective: batch all selected experts at once (no Python loop)
+        c = expert_ids.shape[0]
+        w = weights_fp4[expert_ids].view(torch.uint8)           # [c, N, K//2]
+        lo = (w & 0x0F).to(torch.int32)
+        hi = (w >> 4).to(torch.int32)
+        unpacked = torch.stack([lo, hi], dim=-1).reshape(c, N, K)
+        values = lut[unpacked]
+        del unpacked, lo, hi, w
+
+        sb = scales_fp4[expert_ids].view(torch.uint8).to(torch.int32)
+        sv = torch.exp2(sb.float() - 127.0).to(torch.bfloat16)
+        se = sv.repeat_interleave(32, dim=-1)[:, :, :K]
+        del sb, sv
+
+        buf[expert_ids] = values * se
+        del values, se
     else:
-        # Full dequant (all experts)
+        # Full dequant (all experts, chunked for memory)
         E = weights_fp4.shape[0]
         CHUNK = 8
         for start in range(0, E, CHUNK):
@@ -409,7 +429,7 @@ def quantize_shuffle_gate_up_weights(
 
     # SM110: linear layout for both weights and scales (easy dequant at runtime)
     # SM100: swizzled weights + linear scales (for CUTLASS tile layout)
-    if _use_torch_moe():
+    if _is_sm110_fallback():
         weights_quant, scales_linear = quantize_into_mxfp4(gate_up_weights, False)
     else:
         weights_quant, _ = quantize_into_mxfp4(gate_up_weights, True)
@@ -423,45 +443,47 @@ def quantize_shuffle_gate_up_weights(
         num_experts, 2 * padded_intermediate_size, padded_hidden_size // 32
     )
 
-    # SM110: skip shuffle — CUTLASS BF16/BF16 kernel uses linear layout
-    _skip_shuffle = _use_torch_moe()
+    # SM110: CUTLASS BF16/BF16 kernel uses linear layout — no shuffle needed
+    if _is_sm110_fallback():
+        scales_out = (
+            scales_linear_fp4.contiguous()
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, 2 * padded_intermediate_size, padded_hidden_size // 32)
+        )
+        bias_out = gate_up_bias.contiguous() if gate_up_bias is not None else None
+        return weights_fp4.contiguous(), scales_out, bias_out
 
+    # SM100: shuffle weights/scales for transposed MMA output
     weights_fp4_shuffled = []
     scales_fp4_shuffled = []
     bias_shuffled_list = []
 
     for i in range(num_experts):
-        if _skip_shuffle:
-            weights_fp4_shuffled.append(weights_fp4[i].contiguous())
-            if gate_up_bias is not None:
-                bias_shuffled_list.append(gate_up_bias[i].contiguous())
-            scales_fp4_shuffled.append(scales_linear_fp4[i].contiguous())
-        else:
-            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
-                cache_permute_indices,
-                weights_fp4[i].view(torch.uint8),
-                epilogue_tile_m,
+        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            cache_permute_indices,
+            weights_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+        )
+        weights_fp4_shuffled.append(
+            weights_fp4[i][permute_indices.to(weights_fp4.device)].contiguous()
+        )
+        if gate_up_bias is not None:
+            bias_shuffled_list.append(
+                gate_up_bias[i][permute_indices.to(gate_up_bias.device)].contiguous()
             )
-            weights_fp4_shuffled.append(
-                weights_fp4[i][permute_indices.to(weights_fp4.device)].contiguous()
+        permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+            cache_permute_indices,
+            scales_linear_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+        scales_fp4_shuffled.append(
+            block_scale_interleave(
+                scales_linear_fp4[i][
+                    permute_sf_indices.to(scales_linear_fp4.device)
+                ].contiguous()
             )
-            if gate_up_bias is not None:
-                bias_shuffled_list.append(
-                    gate_up_bias[i][permute_indices.to(gate_up_bias.device)].contiguous()
-                )
-            permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
-                cache_permute_indices,
-                scales_linear_fp4[i].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            scales_fp4_shuffled.append(
-                block_scale_interleave(
-                    scales_linear_fp4[i][
-                        permute_sf_indices.to(scales_linear_fp4.device)
-                    ].contiguous()
-                )
-            )
+        )
 
     # Stack weights for all experts
     weights_shuffled = torch.stack(weights_fp4_shuffled)
@@ -501,7 +523,7 @@ def quantize_shuffle_down_weights(
     epilogue_tile_m = 128
     cache_permute_indices: dict[tuple, torch.Tensor] = {}
 
-    if _use_torch_moe():
+    if _is_sm110_fallback():
         weights_quant, scales_linear = quantize_into_mxfp4(down_weights, False)
     else:
         weights_quant, _ = quantize_into_mxfp4(down_weights, True)
@@ -515,44 +537,47 @@ def quantize_shuffle_down_weights(
         num_experts, padded_hidden_size, padded_intermediate_size // 32
     )
 
-    _skip_shuffle = _use_torch_moe()
+    # SM110: CUTLASS BF16/BF16 kernel uses linear layout — no shuffle needed
+    if _is_sm110_fallback():
+        scales_out = (
+            scales_linear_fp4.contiguous()
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, padded_hidden_size, padded_intermediate_size // 32)
+        )
+        bias_out = down_bias.contiguous() if down_bias is not None else None
+        return weights_fp4.contiguous(), scales_out, bias_out
 
+    # SM100: shuffle weights/scales for transposed MMA output
     weights_fp4_shuffled = []
     scales_fp4_shuffled = []
     bias_shuffled_list = []
 
     for i in range(num_experts):
-        if _skip_shuffle:
-            weights_fp4_shuffled.append(weights_fp4[i].contiguous())
-            if down_bias is not None:
-                bias_shuffled_list.append(down_bias[i].contiguous())
-            scales_fp4_shuffled.append(scales_linear_fp4[i].contiguous())
-        else:
-            permute_indices = get_w2_permute_indices_with_cache(
-                cache_permute_indices,
-                weights_fp4[i],
-                epilogue_tile_m,
+        permute_indices = get_w2_permute_indices_with_cache(
+            cache_permute_indices,
+            weights_fp4[i],
+            epilogue_tile_m,
+        )
+        weights_fp4_shuffled.append(
+            weights_fp4[i][permute_indices.to(weights_fp4.device)].contiguous()
+        )
+        if down_bias is not None:
+            bias_shuffled_list.append(
+                down_bias[i][permute_indices.to(down_bias.device)].contiguous()
             )
-            weights_fp4_shuffled.append(
-                weights_fp4[i][permute_indices.to(weights_fp4.device)].contiguous()
+        permute_sf_indices = get_w2_permute_indices_with_cache(
+            cache_permute_indices,
+            scales_linear_fp4[i],
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+        scales_fp4_shuffled.append(
+            block_scale_interleave(
+                scales_linear_fp4[i][
+                    permute_sf_indices.to(scales_linear_fp4.device)
+                ].contiguous()
             )
-            if down_bias is not None:
-                bias_shuffled_list.append(
-                    down_bias[i][permute_indices.to(down_bias.device)].contiguous()
-                )
-            permute_sf_indices = get_w2_permute_indices_with_cache(
-                cache_permute_indices,
-                scales_linear_fp4[i],
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            scales_fp4_shuffled.append(
-                block_scale_interleave(
-                    scales_linear_fp4[i][
-                        permute_sf_indices.to(scales_linear_fp4.device)
-                    ].contiguous()
-                )
-            )
+        )
 
     # Stack weights for all experts
     weights_shuffled = torch.stack(weights_fp4_shuffled)

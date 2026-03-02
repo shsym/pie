@@ -6,7 +6,7 @@ replacements for attention/RoPE/KV and uses FlashInfer's cutlass_fused_moe in
 BF16/BF16 mode with per-layer FP4→BF16 weight dequantization.
 
 SM100 (datacenter Blackwell) code paths are unaffected — these functions are
-only called when ``_use_torch_moe()`` returns True (SM major >= 11).
+only called when ``_is_sm110_fallback()`` returns True.
 """
 
 from __future__ import annotations
@@ -76,16 +76,13 @@ def apply_rope_and_append_kv(
     k[..., half:] = (k2 * cos + k1 * sin).to(k.dtype)
     del q1, q2, k1, k2, cos, sin
 
-    # --- Append to paged KV cache ---
+    # --- Append to paged KV cache (vectorized, zero GPU-CPU syncs) ---
     page_size = kv_cache_layer.shape[2]
-    for i in range(n):
-        pos = batch_positions[i].item()
-        bid = batch_indices[i].item()
-        pg_off = kv_page_indptr[bid].item()
-        page = kv_page_indices[pg_off + pos // page_size].item()
-        slot = pos % page_size
-        kv_cache_layer[page, 0, slot] = k[i]
-        kv_cache_layer[page, 1, slot] = v[i]
+    pg_offsets = kv_page_indptr[batch_indices]
+    pages = kv_page_indices[pg_offsets + batch_positions // page_size]
+    slots = batch_positions % page_size
+    kv_cache_layer[pages, 0, slots] = k
+    kv_cache_layer[pages, 1, slots] = v
 
 
 def attention_with_sinks(
@@ -101,9 +98,9 @@ def attention_with_sinks(
     kv_page_indices: torch.Tensor,
     kv_page_indptr: torch.Tensor,
     kv_last_page_lens: torch.Tensor,
-    batch_indices: torch.Tensor,
+    qo_indptr: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute attention with sinks using torch SDPA.
+    """Compute attention with sinks using torch ops.
 
     Replaces FlashInfer's ``BatchAttentionWithAttentionSinkWrapper.run``
     which crashes on SM110.
@@ -119,23 +116,34 @@ def attention_with_sinks(
     win = sliding_window - 1 if is_swa else -1
     batch_sz = kv_page_indptr.size(0) - 1
 
+    # Pre-compute batch metadata on CPU (single bulk transfer, no per-iter syncs)
+    token_counts_cpu = (qo_indptr[1:] - qo_indptr[:-1]).cpu().tolist()
+    page_indptr_cpu = kv_page_indptr.cpu().tolist()
+    last_page_lens_cpu = kv_last_page_lens.cpu().tolist()
+
+    # Expand sinks for GQA: [local_kv_heads] -> [local_q_heads]
+    sinks_expanded = sinks.repeat_interleave(gqa) if gqa > 1 else sinks
+
     attn_parts = []
     t_off = 0
     for b in range(batch_sz):
-        nt = (batch_indices == b).sum().item()
+        nt = token_counts_cpu[b]
         q_b = q[t_off:t_off + nt]
 
-        # Gather KV from pages
-        pg_s = kv_page_indptr[b].item()
-        pg_e = kv_page_indptr[b + 1].item()
+        # Gather KV from pages (using pre-computed CPU metadata)
+        pg_s = page_indptr_cpu[b]
+        pg_e = page_indptr_cpu[b + 1]
         pgs = kv_page_indices[pg_s:pg_e]
-        sl = (pg_e - pg_s - 1) * page_size + kv_last_page_lens[b].item()
+        sl = (pg_e - pg_s - 1) * page_size + last_page_lens_cpu[b]
         k_s = kv_cache_layer[pgs, 0].reshape(-1, local_kv_heads, dim_head)[:sl]
         v_s = kv_cache_layer[pgs, 1].reshape(-1, local_kv_heads, dim_head)[:sl]
 
-        # GQA expand
-        k_e = k_s.repeat_interleave(gqa, dim=1)
-        v_e = v_s.repeat_interleave(gqa, dim=1)
+        # GQA expand via view (zero-copy where possible)
+        if gqa > 1:
+            k_e = k_s.unsqueeze(2).expand(-1, -1, gqa, -1).reshape(sl, local_q_heads, dim_head)
+            v_e = v_s.unsqueeze(2).expand(-1, -1, gqa, -1).reshape(sl, local_q_heads, dim_head)
+        else:
+            k_e, v_e = k_s, v_s
 
         # Attention scores (float32 for precision)
         Q = q_b.unsqueeze(0).transpose(1, 2).float()
@@ -151,8 +159,10 @@ def attention_with_sinks(
             cm = cm | (kvp[None, :] < (qp[:, None] - win))
         sc.masked_fill_(cm[None, None], float('-inf'))
 
-        # Add sink as virtual token (no value, just absorbs weight)
-        sk = sinks[None, :, None, None].expand(1, -1, nt, 1).float()
+        # Add sink as virtual token (no value, just absorbs weight).
+        # Sink acts as a "dummy KV position" that absorbs probability mass
+        # in softmax, matching FlashInfer's BatchAttentionWithAttentionSinkWrapper.
+        sk = sinks_expanded[None, :, None, None].expand(1, -1, nt, 1).float()
         sc_s = torch.cat([sc, sk], dim=-1)
         pr = torch.softmax(sc_s, dim=-1)[:, :, :, :-1]
 
@@ -205,6 +215,8 @@ def moe_forward(
         w2_bf16, expert_ids=_selected,
     )
 
+    # FlashInfer cutlass_fused_moe: BF16/BF16 fused MoE with SwiGLU activation.
+    # Returns Tensor or tuple depending on FlashInfer version; guard handles both.
     output = ops.cutlass_fused_moe(
         input=hidden_bf16,
         token_selected_experts=topk_ids.to(torch.int32),
