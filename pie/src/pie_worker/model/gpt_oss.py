@@ -26,7 +26,9 @@ from .gpt_oss_utils import (
     pad_to_multiple,
     prepare_gptoss_moe_gate_up,
     prepare_gptoss_moe_down,
+    _use_torch_moe,
 )
+from . import gpt_oss_sm110 as sm110
 from ..config import RuntimeConfig
 from ..adapter import AdapterSubpass
 from ..utils import is_apple_silicon, get_available_memory
@@ -405,38 +407,37 @@ class ForwardPass:
         # Pre-compute YaRN RoPE cos/sin cache
         self._rope_cos_sin_cache = self._compute_rope_cache()
 
-        self.workspace_window = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
-        )
-        self.workspace_full = torch.empty(
-            128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
-        )
+        if not _use_torch_moe():
+            # FlashInfer attention wrappers (all broken on SM110)
+            self.workspace_window = torch.empty(
+                128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
+            )
+            self.workspace_full = torch.empty(
+                128 * 1024 * 1024, dtype=torch.uint8, device=runtime_config.device
+            )
 
-        # Calculate local head counts
-        local_num_q_heads = model_config.num_q_heads // self.tp_size
-        local_num_kv_heads = model_config.num_kv_heads // self.tp_size
+            local_num_q_heads = model_config.num_q_heads // self.tp_size
+            local_num_kv_heads = model_config.num_kv_heads // self.tp_size
 
-        # Wrapper for even layers (sliding window attention)
-        self.wrapper_window = BatchAttentionWithAttentionSinkWrapper(
-            float_workspace_buffer=self.workspace_window,  # Pass self.workspace_window
-            kv_layout="NHD",
-            window_left=model_config.sliding_window - 1,
-            q_data_type=runtime_config.activation_dtype,
-            kv_data_type=runtime_config.activation_dtype,
-            head_dim_qk=model_config.dim_head,
-            head_dim_vo=model_config.dim_head,
-        )
+            self.wrapper_window = BatchAttentionWithAttentionSinkWrapper(
+                float_workspace_buffer=self.workspace_window,
+                kv_layout="NHD",
+                window_left=model_config.sliding_window - 1,
+                q_data_type=runtime_config.activation_dtype,
+                kv_data_type=runtime_config.activation_dtype,
+                head_dim_qk=model_config.dim_head,
+                head_dim_vo=model_config.dim_head,
+            )
 
-        # Wrapper for odd layers (full attention)
-        self.wrapper_full = BatchAttentionWithAttentionSinkWrapper(
-            float_workspace_buffer=self.workspace_full,  # Pass self.workspace_full
-            kv_layout="NHD",
-            window_left=-1,
-            q_data_type=runtime_config.activation_dtype,
-            kv_data_type=runtime_config.activation_dtype,
-            head_dim_qk=model_config.dim_head,
-            head_dim_vo=model_config.dim_head,
-        )
+            self.wrapper_full = BatchAttentionWithAttentionSinkWrapper(
+                float_workspace_buffer=self.workspace_full,
+                kv_layout="NHD",
+                window_left=-1,
+                q_data_type=runtime_config.activation_dtype,
+                kv_data_type=runtime_config.activation_dtype,
+                head_dim_qk=model_config.dim_head,
+                head_dim_vo=model_config.dim_head,
+            )
 
         # Pre-compute MoE activation parameters
         num_experts = model_config.num_experts
@@ -460,6 +461,16 @@ class ForwardPass:
             device=device,
             dtype=torch.float32,
         )
+
+        # SM110 (Jetson Thor): CUTLASS BF16/BF16 MoE + torch attention
+        self._use_torch_moe = _use_torch_moe()
+        if self._use_torch_moe:
+            self._dequant_pH = self.padded_hidden_size
+            self._dequant_pI = self.padded_intermediate_size
+            self._w1_bf16, self._w2_bf16 = sm110.init_dequant_buffers(
+                num_experts, self.padded_hidden_size,
+                self.padded_intermediate_size, device,
+            )
 
     def sample(
         self,
@@ -667,35 +678,47 @@ class ForwardPass:
         k = k.view(n, local_num_kv_heads, cfg.dim_head)
         v = v.view(n, local_num_kv_heads, cfg.dim_head)
 
-        # Apply YaRN RoPE
-        ops.apply_rope_with_cos_sin_cache_inplace(
-            positions=position_ids.to(torch.int32),
-            query=q,
-            key=k,
-            head_size=cfg.dim_head,
-            cos_sin_cache=self._rope_cos_sin_cache,
-            is_neox=True,
-        )
+        if self._use_torch_moe:
+            # SM110: torch RoPE + KV append + attention (FlashInfer broken)
+            sm110.apply_rope_and_append_kv(
+                q, k, v, position_ids, self._rope_cos_sin_cache,
+                cfg.dim_head, kv_cache_layer, kv_page_indices,
+                kv_page_indptr, batch_indices, batch_positions,
+            )
+            sinks = self.weights.get(f"layers.{layer_idx}.attn_sinks")
+            attn_output = sm110.attention_with_sinks(
+                q, kv_cache_layer, sinks, layer_idx, cfg.dim_head,
+                cfg.num_q_heads, cfg.num_kv_heads, self.tp_size,
+                cfg.sliding_window, kv_page_indices, kv_page_indptr,
+                kv_last_page_lens, batch_indices,
+            )
+        else:
+            # FlashInfer attention path (SM100 datacenter Blackwell)
+            ops.apply_rope_with_cos_sin_cache_inplace(
+                positions=position_ids.to(torch.int32),
+                query=q,
+                key=k,
+                head_size=cfg.dim_head,
+                cos_sin_cache=self._rope_cos_sin_cache,
+                is_neox=True,
+            )
 
-        # Append to KV cache (local)
-        ops.append_paged_kv_cache(
-            append_key=k,
-            append_value=v,
-            batch_indices=batch_indices,
-            positions=batch_positions,
-            paged_kv_cache=kv_cache_layer,
-            kv_indices=kv_page_indices,
-            kv_indptr=kv_page_indptr,
-            kv_last_page_len=kv_last_page_lens,
-            kv_layout="NHD",
-        )
+            ops.append_paged_kv_cache(
+                append_key=k,
+                append_value=v,
+                batch_indices=batch_indices,
+                positions=batch_positions,
+                paged_kv_cache=kv_cache_layer,
+                kv_indices=kv_page_indices,
+                kv_indptr=kv_page_indptr,
+                kv_last_page_len=kv_last_page_lens,
+                kv_layout="NHD",
+            )
 
-        # Compute attention with sinks
-        # Sinks are sharded (column) so they match local heads
-        sinks = self.weights.get(f"layers.{layer_idx}.attn_sinks")
-        scaling = cfg.dim_head**-0.5
-        attn_output = wrapper.run(q, kv_cache_layer, sinks, scaling)
-        attn_output = attn_output.reshape(n, -1)
+            sinks = self.weights.get(f"layers.{layer_idx}.attn_sinks")
+            scaling = cfg.dim_head**-0.5
+            attn_output = wrapper.run(q, kv_cache_layer, sinks, scaling)
+            attn_output = attn_output.reshape(n, -1)
 
         # Output projection
         attn_proj = fun.linear(
@@ -747,44 +770,60 @@ class ForwardPass:
             padded[:, : cfg.dim_hidden] = hidden_bf16
             hidden_bf16 = padded
 
-        # 4. FlashInfer fused MoE kernel
-        # intermediate_size matches local shard size
-        output = ops.trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits.to(torch.bfloat16),
-            routing_bias=None,
-            hidden_states=hidden_bf16,
-            hidden_states_scale=None,
-            gemm1_weights=self.weights.get(f"layers.{layer_idx}.moe.gemm1_weights"),
-            gemm1_weights_scale=self.weights.get(
-                f"layers.{layer_idx}.moe.gemm1_scales"
-            ),
-            gemm1_bias=self.weights.get(f"layers.{layer_idx}.moe.gemm1_bias"),
-            gemm1_alpha=self._gemm1_alpha,
-            gemm1_beta=self._gemm1_beta,
-            gemm1_clamp_limit=self._gemm1_clamp_limit,
-            gemm2_weights=self.weights.get(f"layers.{layer_idx}.moe.gemm2_weights"),
-            gemm2_weights_scale=self.weights.get(
-                f"layers.{layer_idx}.moe.gemm2_scales"
-            ),
-            gemm2_bias=self.weights.get(f"layers.{layer_idx}.moe.gemm2_bias"),
-            output1_scale_scalar=self._output1_scale,
-            output1_scale_gate_scalar=self._output1_scale_gate,
-            output2_scale_scalar=self._output2_scale,
-            num_experts=cfg.num_experts,
-            top_k=cfg.experts_per_token,
-            n_group=None,
-            topk_group=None,
-            intermediate_size=self.padded_intermediate_size,
-            local_expert_offset=0,
-            local_num_experts=cfg.num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=1,  # Renormalize (TopK -> Softmax)
-            gated_act_type=0,  # SwiGlu
-            do_finalize=True,
-            tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
-        )
-
-        output = output[0]
+        # 4. MoE kernel
+        if self._use_torch_moe:
+            # SM110: selective FP4→BF16 dequant + CUTLASS BF16/BF16 kernel
+            output = sm110.moe_forward(
+                hidden_bf16, router_logits, layer_idx, self.weights.get,
+                cfg.experts_per_token, self._dequant_pI, self._dequant_pH,
+                self._w1_bf16, self._w2_bf16,
+                self._gemm1_alpha, self._gemm1_beta, self._gemm1_clamp_limit,
+            )
+        else:
+            # SM100: TRT-LLM backend
+            output = ops.trtllm_fp4_block_scale_moe(
+                routing_logits=router_logits.to(torch.bfloat16),
+                routing_bias=None,
+                hidden_states=hidden_bf16,
+                hidden_states_scale=None,
+                gemm1_weights=self.weights.get(
+                    f"layers.{layer_idx}.moe.gemm1_weights"
+                ),
+                gemm1_weights_scale=self.weights.get(
+                    f"layers.{layer_idx}.moe.gemm1_scales"
+                ),
+                gemm1_bias=self.weights.get(
+                    f"layers.{layer_idx}.moe.gemm1_bias"
+                ),
+                gemm1_alpha=self._gemm1_alpha,
+                gemm1_beta=self._gemm1_beta,
+                gemm1_clamp_limit=self._gemm1_clamp_limit,
+                gemm2_weights=self.weights.get(
+                    f"layers.{layer_idx}.moe.gemm2_weights"
+                ),
+                gemm2_weights_scale=self.weights.get(
+                    f"layers.{layer_idx}.moe.gemm2_scales"
+                ),
+                gemm2_bias=self.weights.get(
+                    f"layers.{layer_idx}.moe.gemm2_bias"
+                ),
+                output1_scale_scalar=self._output1_scale,
+                output1_scale_gate_scalar=self._output1_scale_gate,
+                output2_scale_scalar=self._output2_scale,
+                num_experts=cfg.num_experts,
+                top_k=cfg.experts_per_token,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=self.padded_intermediate_size,
+                local_expert_offset=0,
+                local_num_experts=cfg.num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=1,  # Renormalize (TopK -> Softmax)
+                gated_act_type=0,  # SwiGlu
+                do_finalize=True,
+                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+            )
+            output = output[0]
 
         # Strip padding
         if cfg.dim_hidden != self.padded_hidden_size:
@@ -837,41 +876,42 @@ class ForwardPass:
         local_num_q_heads = cfg.num_q_heads // self.tp_size
         local_num_kv_heads = cfg.num_kv_heads // self.tp_size
 
-        self.wrapper_window.plan(
-            qo_indptr,
-            kv_page_indptr,
-            kv_page_indices,
-            kv_last_page_lens,
-            local_num_q_heads,
-            local_num_kv_heads,
-            cfg.dim_head,
-            page_size,
-            causal=True,
-            window_left=cfg.sliding_window - 1,
-            q_data_type=self.runtime_config.activation_dtype,
-            kv_data_type=self.runtime_config.activation_dtype,
-            non_blocking=True,
-        )
+        if not self._use_torch_moe:
+            self.wrapper_window.plan(
+                qo_indptr,
+                kv_page_indptr,
+                kv_page_indices,
+                kv_last_page_lens,
+                local_num_q_heads,
+                local_num_kv_heads,
+                cfg.dim_head,
+                page_size,
+                causal=True,
+                window_left=cfg.sliding_window - 1,
+                q_data_type=self.runtime_config.activation_dtype,
+                kv_data_type=self.runtime_config.activation_dtype,
+                non_blocking=True,
+            )
 
-        self.wrapper_full.plan(
-            qo_indptr,
-            kv_page_indptr,
-            kv_page_indices,
-            kv_last_page_lens,
-            local_num_q_heads,
-            local_num_kv_heads,
-            cfg.dim_head,
-            page_size,
-            causal=True,
-            window_left=-1,
-            q_data_type=self.runtime_config.activation_dtype,
-            kv_data_type=self.runtime_config.activation_dtype,
-            non_blocking=True,
-        )
+            self.wrapper_full.plan(
+                qo_indptr,
+                kv_page_indptr,
+                kv_page_indices,
+                kv_last_page_lens,
+                local_num_q_heads,
+                local_num_kv_heads,
+                cfg.dim_head,
+                page_size,
+                causal=True,
+                window_left=-1,
+                q_data_type=self.runtime_config.activation_dtype,
+                kv_data_type=self.runtime_config.activation_dtype,
+                non_blocking=True,
+            )
 
         for layer_idx in range(cfg.num_layers):
             # Select wrapper: even layers use sliding window, odd use full
-            wrapper = self.wrapper_window if layer_idx % 2 == 0 else self.wrapper_full
+            wrapper = None if self._use_torch_moe else (self.wrapper_window if layer_idx % 2 == 0 else self.wrapper_full)
 
             # 1. Attention block
             hidden_states = self.attention(
