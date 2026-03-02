@@ -37,6 +37,80 @@ FP4_VALUES = (
     -6.0,
 )
 
+import functools
+
+
+@functools.lru_cache(maxsize=1)
+def _use_torch_moe():
+    """Detect SM110+ (Jetson Thor) which needs CUTLASS MoE + torch attention."""
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 11
+
+
+def dequant_mxfp4_to_bf16(weights_fp4, scales_fp4, N, K, buf, expert_ids=None):
+    """Dequant linear MXFP4 weights to BF16, writing into pre-allocated buffer.
+
+    Args:
+        weights_fp4: [E, N, K//2] uint8 — packed FP4 (2 values per byte)
+        scales_fp4: [E, N, K//32] — E8M0 block scales (1 per 32 elements)
+        N: number of rows per expert
+        K: number of columns per expert (unpacked)
+        buf: [E, N, K] bfloat16 — pre-allocated output buffer
+        expert_ids: optional 1D tensor of expert indices to dequant (selective mode)
+    """
+    device = weights_fp4.device
+
+    # FP4 E2M1 lookup: 4-bit index → float value
+    lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        dtype=torch.bfloat16, device=device,
+    )
+
+    if expert_ids is not None:
+        # Selective: only dequant the specified experts (top-k routing)
+        for eid in expert_ids:
+            e = eid.item()
+            w = weights_fp4[e:e+1].view(torch.uint8)
+            lo = (w & 0x0F).to(torch.int32)
+            hi = (w >> 4).to(torch.int32)
+            unpacked = torch.stack([lo, hi], dim=-1).reshape(1, N, K)
+            values = lut[unpacked]
+            del unpacked, lo, hi, w
+            sb = scales_fp4[e:e+1].view(torch.uint8).to(torch.int32)
+            sv = torch.exp2(sb.float() - 127.0).to(torch.bfloat16)
+            se = sv.repeat_interleave(32, dim=-1)[:, :, :K]
+            del sb, sv
+            buf[e] = (values * se).squeeze(0)
+            del values, se
+    else:
+        # Full dequant (all experts)
+        E = weights_fp4.shape[0]
+        CHUNK = 8
+        for start in range(0, E, CHUNK):
+            end = min(start + CHUNK, E)
+            c = end - start
+
+            # Unpack nibbles: each uint8 byte → 2 FP4 values
+            w = weights_fp4[start:end].view(torch.uint8)        # [c, N, K//2]
+            lo = (w & 0x0F).to(torch.int32)                     # low nibble
+            hi = (w >> 4).to(torch.int32)                       # high nibble
+            unpacked = torch.stack([lo, hi], dim=-1).reshape(c, N, K)
+            values = lut[unpacked]                               # [c, N, K] bf16
+            del unpacked, lo, hi, w
+
+            # E8M0 block scales: value = 2^(byte - 127)
+            sb = scales_fp4[start:end].view(torch.uint8).to(torch.int32)
+            sv = torch.exp2(sb.float() - 127.0).to(torch.bfloat16)
+            se = sv.repeat_interleave(32, dim=-1)[:, :, :K]     # [c, N, K]
+            del sb, sv
+
+            buf[start:end] = values * se
+            del values, se
+
+
 # Alignment requirement for `trtllm_fp4_block_scale_moe`
 ALIGNMENT = 256
 
@@ -333,11 +407,13 @@ def quantize_shuffle_gate_up_weights(
     epilogue_tile_m = 128
     cache_permute_indices: dict[tuple, torch.Tensor] = {}
 
-    # Quantize weights with swizzled layout
-    weights_quant, _ = quantize_into_mxfp4(gate_up_weights, True)
-
-    # Quantize weights with linear layout for scales
-    _, scales_linear = quantize_into_mxfp4(gate_up_weights, False)
+    # SM110: linear layout for both weights and scales (easy dequant at runtime)
+    # SM100: swizzled weights + linear scales (for CUTLASS tile layout)
+    if _use_torch_moe():
+        weights_quant, scales_linear = quantize_into_mxfp4(gate_up_weights, False)
+    else:
+        weights_quant, _ = quantize_into_mxfp4(gate_up_weights, True)
+        _, scales_linear = quantize_into_mxfp4(gate_up_weights, False)
 
     # Convert quantized weights to proper shapes
     weights_fp4 = weights_quant.view(torch.uint8).reshape(
@@ -347,42 +423,45 @@ def quantize_shuffle_gate_up_weights(
         num_experts, 2 * padded_intermediate_size, padded_hidden_size // 32
     )
 
-    # Shuffle weights and scales for each expert
+    # SM110: skip shuffle — CUTLASS BF16/BF16 kernel uses linear layout
+    _skip_shuffle = _use_torch_moe()
+
     weights_fp4_shuffled = []
     scales_fp4_shuffled = []
     bias_shuffled_list = []
 
     for i in range(num_experts):
-        # Shuffle weights
-        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
-            cache_permute_indices,
-            weights_fp4[i].view(torch.uint8),
-            epilogue_tile_m,
-        )
-        weights_fp4_shuffled.append(
-            weights_fp4[i][permute_indices.to(weights_fp4.device)].contiguous()
-        )
-
-        # Shuffle bias using row permutation derived from weight permutation
-        if gate_up_bias is not None:
-            bias_shuffled_list.append(
-                gate_up_bias[i][permute_indices.to(gate_up_bias.device)].contiguous()
+        if _skip_shuffle:
+            weights_fp4_shuffled.append(weights_fp4[i].contiguous())
+            if gate_up_bias is not None:
+                bias_shuffled_list.append(gate_up_bias[i].contiguous())
+            scales_fp4_shuffled.append(scales_linear_fp4[i].contiguous())
+        else:
+            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                cache_permute_indices,
+                weights_fp4[i].view(torch.uint8),
+                epilogue_tile_m,
             )
-
-        # Shuffle scales
-        permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
-            cache_permute_indices,
-            scales_linear_fp4[i].view(torch.uint8),
-            epilogue_tile_m,
-            num_elts_per_sf=16,
-        )
-        scales_fp4_shuffled.append(
-            block_scale_interleave(
-                scales_linear_fp4[i][
-                    permute_sf_indices.to(scales_linear_fp4.device)
-                ].contiguous()
+            weights_fp4_shuffled.append(
+                weights_fp4[i][permute_indices.to(weights_fp4.device)].contiguous()
             )
-        )
+            if gate_up_bias is not None:
+                bias_shuffled_list.append(
+                    gate_up_bias[i][permute_indices.to(gate_up_bias.device)].contiguous()
+                )
+            permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+                cache_permute_indices,
+                scales_linear_fp4[i].view(torch.uint8),
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+            )
+            scales_fp4_shuffled.append(
+                block_scale_interleave(
+                    scales_linear_fp4[i][
+                        permute_sf_indices.to(scales_linear_fp4.device)
+                    ].contiguous()
+                )
+            )
 
     # Stack weights for all experts
     weights_shuffled = torch.stack(weights_fp4_shuffled)
@@ -422,11 +501,11 @@ def quantize_shuffle_down_weights(
     epilogue_tile_m = 128
     cache_permute_indices: dict[tuple, torch.Tensor] = {}
 
-    # Quantize weights with swizzled layout
-    weights_quant, _ = quantize_into_mxfp4(down_weights, True)
-
-    # Quantize weights with linear layout for scales
-    _, scales_linear = quantize_into_mxfp4(down_weights, False)
+    if _use_torch_moe():
+        weights_quant, scales_linear = quantize_into_mxfp4(down_weights, False)
+    else:
+        weights_quant, _ = quantize_into_mxfp4(down_weights, True)
+        _, scales_linear = quantize_into_mxfp4(down_weights, False)
 
     # Convert quantized weights to proper shapes
     weights_fp4 = weights_quant.view(torch.uint8).reshape(
@@ -436,42 +515,44 @@ def quantize_shuffle_down_weights(
         num_experts, padded_hidden_size, padded_intermediate_size // 32
     )
 
-    # Shuffle weights and scales for each expert
+    _skip_shuffle = _use_torch_moe()
+
     weights_fp4_shuffled = []
     scales_fp4_shuffled = []
     bias_shuffled_list = []
 
     for i in range(num_experts):
-        # Shuffle weights
-        permute_indices = get_w2_permute_indices_with_cache(
-            cache_permute_indices,
-            weights_fp4[i],
-            epilogue_tile_m,
-        )
-        weights_fp4_shuffled.append(
-            weights_fp4[i][permute_indices.to(weights_fp4.device)].contiguous()
-        )
-
-        # Shuffle bias using row permutation derived from weight permutation
-        if down_bias is not None:
-            bias_shuffled_list.append(
-                down_bias[i][permute_indices.to(down_bias.device)].contiguous()
+        if _skip_shuffle:
+            weights_fp4_shuffled.append(weights_fp4[i].contiguous())
+            if down_bias is not None:
+                bias_shuffled_list.append(down_bias[i].contiguous())
+            scales_fp4_shuffled.append(scales_linear_fp4[i].contiguous())
+        else:
+            permute_indices = get_w2_permute_indices_with_cache(
+                cache_permute_indices,
+                weights_fp4[i],
+                epilogue_tile_m,
             )
-
-        # Shuffle scales
-        permute_sf_indices = get_w2_permute_indices_with_cache(
-            cache_permute_indices,
-            scales_linear_fp4[i],
-            epilogue_tile_m,
-            num_elts_per_sf=16,
-        )
-        scales_fp4_shuffled.append(
-            block_scale_interleave(
-                scales_linear_fp4[i][
-                    permute_sf_indices.to(scales_linear_fp4.device)
-                ].contiguous()
+            weights_fp4_shuffled.append(
+                weights_fp4[i][permute_indices.to(weights_fp4.device)].contiguous()
             )
-        )
+            if down_bias is not None:
+                bias_shuffled_list.append(
+                    down_bias[i][permute_indices.to(down_bias.device)].contiguous()
+                )
+            permute_sf_indices = get_w2_permute_indices_with_cache(
+                cache_permute_indices,
+                scales_linear_fp4[i],
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+            )
+            scales_fp4_shuffled.append(
+                block_scale_interleave(
+                    scales_linear_fp4[i][
+                        permute_sf_indices.to(scales_linear_fp4.device)
+                    ].contiguous()
+                )
+            )
 
     # Stack weights for all experts
     weights_shuffled = torch.stack(weights_fp4_shuffled)
@@ -524,7 +605,7 @@ def prepare_gptoss_moe_gate_up(
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, intermediate_size * 2, hidden_size]
     weights_bf16 = weights_bf16.reshape(num_experts, intermediate_size * 2, hidden_size)
-    
+
     # Free input tensors early to reduce memory pressure
     del blocks, scales
 
@@ -593,7 +674,7 @@ def prepare_gptoss_moe_gate_up(
         gate_up_bias=bias_padded,
     )
     del weights_padded, bias_padded  # Free after quantization
-    
+
     # Force CUDA memory cleanup
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -640,7 +721,7 @@ def prepare_gptoss_moe_down(
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, hidden_size, intermediate_size]
     weights_bf16 = weights_bf16.reshape(num_experts, hidden_size, intermediate_size)
-    
+
     # Free input tensors early to reduce memory pressure
     del blocks, scales
 
@@ -691,7 +772,7 @@ def prepare_gptoss_moe_down(
         down_bias=bias_padded,
     )
     del weights_padded, bias_padded  # Free after quantization
-    
+
     # Force CUDA memory cleanup
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
