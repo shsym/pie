@@ -27,8 +27,8 @@ from .gpt_oss_utils import (
     prepare_gptoss_moe_gate_up,
     prepare_gptoss_moe_down,
     _use_torch_moe,
-    dequant_mxfp4_to_bf16,
 )
+from . import gpt_oss_sm110 as sm110
 from ..config import RuntimeConfig
 from ..adapter import AdapterSubpass
 from ..utils import is_apple_silicon, get_available_memory
@@ -465,18 +465,11 @@ class ForwardPass:
         # SM110 (Jetson Thor): CUTLASS BF16/BF16 MoE + torch attention
         self._use_torch_moe = _use_torch_moe()
         if self._use_torch_moe:
-            # Pre-allocate BF16 buffers for per-layer FP4→BF16 dequant
-            _pH = self.padded_hidden_size
-            _pI = self.padded_intermediate_size
-            self._dequant_pH = _pH
-            self._dequant_pI = _pI
-            self._w1_bf16 = torch.empty(
-                num_experts, 2 * _pI, _pH,
-                dtype=torch.bfloat16, device=device,
-            )
-            self._w2_bf16 = torch.empty(
-                num_experts, _pH, _pI,
-                dtype=torch.bfloat16, device=device,
+            self._dequant_pH = self.padded_hidden_size
+            self._dequant_pI = self.padded_intermediate_size
+            self._w1_bf16, self._w2_bf16 = sm110.init_dequant_buffers(
+                num_experts, self.padded_hidden_size,
+                self.padded_intermediate_size, device,
             )
 
     def sample(
@@ -686,85 +679,19 @@ class ForwardPass:
         v = v.view(n, local_num_kv_heads, cfg.dim_head)
 
         if self._use_torch_moe:
-            # SM110: torch attention path (all FlashInfer CUDA broken)
-
-            # --- RoPE (NeoX style) ---
-            half = cfg.dim_head // 2
-            pos_ids = position_ids.to(torch.int64)
-            cos = self._rope_cos_sin_cache[pos_ids, :half].unsqueeze(1)
-            sin = self._rope_cos_sin_cache[pos_ids, half:].unsqueeze(1)
-            q1, q2 = q[..., :half].float(), q[..., half:].float()
-            q[..., :half] = (q1 * cos - q2 * sin).to(q.dtype)
-            q[..., half:] = (q2 * cos + q1 * sin).to(q.dtype)
-            k1, k2 = k[..., :half].float(), k[..., half:].float()
-            k[..., :half] = (k1 * cos - k2 * sin).to(k.dtype)
-            k[..., half:] = (k2 * cos + k1 * sin).to(k.dtype)
-            del q1, q2, k1, k2, cos, sin
-
-            # --- Append to paged KV cache ---
-            page_size = kv_cache_layer.shape[2]
-            for i in range(n):
-                pos = batch_positions[i].item()
-                bid = batch_indices[i].item()
-                pg_off = kv_page_indptr[bid].item()
-                page = kv_page_indices[pg_off + pos // page_size].item()
-                slot = pos % page_size
-                kv_cache_layer[page, 0, slot] = k[i]
-                kv_cache_layer[page, 1, slot] = v[i]
-
-            # --- Attention with sinks ---
+            # SM110: torch RoPE + KV append + attention (FlashInfer broken)
+            sm110.apply_rope_and_append_kv(
+                q, k, v, position_ids, self._rope_cos_sin_cache,
+                cfg.dim_head, kv_cache_layer, kv_page_indices,
+                kv_page_indptr, batch_indices, batch_positions,
+            )
             sinks = self.weights.get(f"layers.{layer_idx}.attn_sinks")
-            local_q_heads = cfg.num_q_heads // self.tp_size
-            local_kv_heads = cfg.num_kv_heads // self.tp_size
-            gqa = local_q_heads // local_kv_heads
-            scale = cfg.dim_head ** -0.5
-            is_swa = (layer_idx % 2 == 0)
-            win = cfg.sliding_window - 1 if is_swa else -1
-            batch_sz = kv_page_indptr.size(0) - 1
-
-            attn_parts = []
-            t_off = 0
-            for b in range(batch_sz):
-                nt = (batch_indices == b).sum().item()
-                q_b = q[t_off:t_off + nt]
-
-                # Gather KV from pages
-                pg_s = kv_page_indptr[b].item()
-                pg_e = kv_page_indptr[b + 1].item()
-                pgs = kv_page_indices[pg_s:pg_e]
-                sl = (pg_e - pg_s - 1) * page_size + kv_last_page_lens[b].item()
-                k_s = kv_cache_layer[pgs, 0].reshape(-1, local_kv_heads, cfg.dim_head)[:sl]
-                v_s = kv_cache_layer[pgs, 1].reshape(-1, local_kv_heads, cfg.dim_head)[:sl]
-
-                # GQA expand
-                k_e = k_s.repeat_interleave(gqa, dim=1)
-                v_e = v_s.repeat_interleave(gqa, dim=1)
-
-                # Attention scores (float32 for precision)
-                Q = q_b.unsqueeze(0).transpose(1, 2).float()
-                K = k_e.unsqueeze(0).transpose(1, 2).float()
-                V = v_e.unsqueeze(0).transpose(1, 2)
-                sc = torch.matmul(Q, K.transpose(-2, -1)) * scale
-
-                # Causal mask (+ sliding window for even layers)
-                qp = torch.arange(sl - nt, sl, device=q.device)
-                kvp = torch.arange(sl, device=q.device)
-                cm = kvp[None, :] > qp[:, None]
-                if win >= 0:
-                    cm = cm | (kvp[None, :] < (qp[:, None] - win))
-                sc.masked_fill_(cm[None, None], float('-inf'))
-
-                # Add sink as virtual token (no value, just absorbs weight)
-                sk = sinks[None, :, None, None].expand(1, -1, nt, 1).float()
-                sc_s = torch.cat([sc, sk], dim=-1)
-                pr = torch.softmax(sc_s, dim=-1)[:, :, :, :-1]
-
-                o = torch.matmul(pr.to(V.dtype), V)
-                attn_parts.append(o.squeeze(0).transpose(0, 1))
-                t_off += nt
-
-            attn_output = torch.cat(attn_parts, dim=0)
-            attn_output = attn_output.reshape(n, -1)
+            attn_output = sm110.attention_with_sinks(
+                q, kv_cache_layer, sinks, layer_idx, cfg.dim_head,
+                cfg.num_q_heads, cfg.num_kv_heads, self.tp_size,
+                cfg.sliding_window, kv_page_indices, kv_page_indptr,
+                kv_last_page_lens, batch_indices,
+            )
         else:
             # FlashInfer attention path (SM100 datacenter Blackwell)
             ops.apply_rope_with_cos_sin_cache_inplace(
@@ -845,51 +772,13 @@ class ForwardPass:
 
         # 4. MoE kernel
         if self._use_torch_moe:
-            # SM110: CUTLASS BF16/BF16 fused MoE
-            # Per-layer: selective dequant (top-k only) + CUTLASS same-type kernel
-            topk_weights, topk_ids = torch.topk(
-                router_logits.float(), k=cfg.experts_per_token, dim=-1
+            # SM110: selective FP4→BF16 dequant + CUTLASS BF16/BF16 kernel
+            output = sm110.moe_forward(
+                hidden_bf16, router_logits, layer_idx, self.weights.get,
+                cfg.experts_per_token, self._dequant_pI, self._dequant_pH,
+                self._w1_bf16, self._w2_bf16,
+                self._gemm1_alpha, self._gemm1_beta, self._gemm1_clamp_limit,
             )
-            topk_weights = torch.softmax(topk_weights, dim=-1)
-
-            # Only dequant the experts actually selected by routing
-            _selected = topk_ids.view(-1).unique()
-            _w1_fp4 = self.weights.get(f"layers.{layer_idx}.moe.gemm1_weights")
-            _s1_fp4 = self.weights.get(f"layers.{layer_idx}.moe.gemm1_scales")
-            _w2_fp4 = self.weights.get(f"layers.{layer_idx}.moe.gemm2_weights")
-            _s2_fp4 = self.weights.get(f"layers.{layer_idx}.moe.gemm2_scales")
-            dequant_mxfp4_to_bf16(
-                _w1_fp4, _s1_fp4,
-                2 * self._dequant_pI, self._dequant_pH,
-                self._w1_bf16, expert_ids=_selected,
-            )
-            dequant_mxfp4_to_bf16(
-                _w2_fp4, _s2_fp4,
-                self._dequant_pH, self._dequant_pI,
-                self._w2_bf16, expert_ids=_selected,
-            )
-
-            output = ops.cutlass_fused_moe(
-                input=hidden_bf16,
-                token_selected_experts=topk_ids.to(torch.int32),
-                token_final_scales=topk_weights.to(torch.float32),
-                fc1_expert_weights=self._w1_bf16,
-                fc2_expert_weights=self._w2_bf16,
-                output_dtype=torch.bfloat16,
-                quant_scales=[],
-                fc1_expert_biases=self.weights.get(
-                    f"layers.{layer_idx}.moe.gemm1_bias"
-                ).to(torch.bfloat16),
-                fc2_expert_biases=self.weights.get(
-                    f"layers.{layer_idx}.moe.gemm2_bias"
-                ).to(torch.bfloat16),
-                swiglu_alpha=self._gemm1_alpha,
-                swiglu_beta=self._gemm1_beta,
-                swiglu_limit=self._gemm1_clamp_limit,
-                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
-            )
-            if isinstance(output, (list, tuple)):
-                output = output[0]
         else:
             # SM100: TRT-LLM backend
             output = ops.trtllm_fp4_block_scale_moe(
