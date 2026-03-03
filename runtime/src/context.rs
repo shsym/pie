@@ -379,8 +379,14 @@ impl Context {
     fn num_uncommitted(&self) -> usize { self.working_pages.len() }
 
     fn has_gpu_pages(&self) -> bool {
+        // Suspended contexts with working_pages also hold GPU pages
+        // (e.g. from a failed restore that couldn't roll back to CPU).
+        // They must be visible to the eviction system.
+        if !self.working_pages.is_empty() {
+            return true;
+        }
         matches!(self.state, ContextState::Active | ContextState::InFlight)
-            && (!self.working_pages.is_empty() || self.committed_tip.is_some())
+            && self.committed_tip.is_some()
     }
 
     fn fill(&mut self, n: usize, positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>) -> Result<()> {
@@ -436,6 +442,40 @@ impl ServiceHandler for ContextManager {
 
     async fn handle(&mut self, msg: Message) {
         self.msg_counter += 1;
+
+        // Periodic state dump for deadlock diagnosis
+        if self.msg_counter % 200 == 0 {
+            let mut active = 0u32;
+            let mut in_flight = 0u32;
+            let mut suspended = 0u32;
+            let mut restoring = 0u32;
+            let mut total_working = 0usize;
+            let mut total_committed = 0usize;
+            for entry in CONTEXTS.iter() {
+                let &(model_idx, _) = entry.key();
+                if model_idx != self.model_idx { continue; }
+                let ctx = entry.value();
+                match ctx.state {
+                    ContextState::Active => active += 1,
+                    ContextState::InFlight => in_flight += 1,
+                    ContextState::Suspended => suspended += 1,
+                    ContextState::Restoring => restoring += 1,
+                }
+                total_working += ctx.working_pages.len();
+                total_committed += ctx.committed_len;
+            }
+            let queue_sizes: Vec<usize> = self.wait_queues.iter().map(|q| q.len()).collect();
+            let avail: Vec<usize> = self.devices.iter().map(|d| d.available_gpu_pages()).collect();
+            let stats: Vec<(usize, usize)> = self.devices.iter().map(|d| d.stats()).collect();
+            let breakdowns: Vec<_> = self.devices.iter().map(|d| d.page_breakdown()).collect();
+            eprintln!(
+                "[STATE msg={}] active={active} inflight={in_flight} suspended={suspended} \
+                 restoring={restoring} working_pages={total_working} committed_pages={total_committed} \
+                 queues={queue_sizes:?} avail={avail:?} gpu_stats={stats:?} breakdown={breakdowns:?}",
+                self.msg_counter,
+            );
+        }
+
         match msg {
             Message::Open { username, name, response } => {
                 let result = match self.name_to_id.get(&(username, name)) {

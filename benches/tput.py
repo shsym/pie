@@ -102,6 +102,8 @@ async def run_benchmark(args):
         completed = 0
         total_chars = 0
         total_tokens_est = 0
+        output_samples = []  # Collect (req_id, text) tuples
+        output_lock = asyncio.Lock()
 
         # -- Workers ----------------------------------------------------------
 
@@ -118,17 +120,24 @@ async def run_benchmark(args):
                         inferlet_name, input=inferlet_input,
                     )
                     req_chars = 0
+                    req_text = []
                     while True:
                         event, msg = await process.recv()
                         if event == Event.Stdout:
                             req_chars += len(msg)
+                            req_text.append(msg)
                         elif event == Event.Stderr:
                             req_chars += len(msg)
                         elif event == Event.Return:
                             req_chars += len(msg)
+                            req_text.append(msg)
                             total_chars += req_chars
                             total_tokens_est += req_chars / 4.0
                             completed += 1
+                            # Save sample outputs
+                            async with output_lock:
+                                if len(output_samples) < args.num_samples:
+                                    output_samples.append((req_id, "".join(req_text)))
                             print(".", end="", flush=True)
                             break
                         elif event == Event.Error:
@@ -160,6 +169,17 @@ async def run_benchmark(args):
         print(f"{'Est. Tokens/sec:':<25} {total_tokens_est / duration:.2f}")
         print(f"{'─' * 40}")
 
+        # -- Save output samples ----------------------------------------------
+
+        if args.save_outputs and output_samples:
+            out_path = Path(args.save_outputs)
+            with open(out_path, "w") as f:
+                for req_id, text in sorted(output_samples):
+                    f.write(f"=== Request {req_id} ===\n")
+                    f.write(text)
+                    f.write("\n\n")
+            print(f"Saved {len(output_samples)} output samples to {out_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Pie Throughput Benchmark")
@@ -173,6 +193,8 @@ def main():
     parser.add_argument("--dummy", action="store_true", help="Use dummy mode (no GPU)")
     parser.add_argument("--gpu-mem-util", type=float, default=0.8, help="GPU memory utilization for KV cache (lower = fewer pages = more contention)")
     parser.add_argument("--cpu-mem-budget", type=int, default=0, help="CPU memory budget in GB for working page swap (0 = disabled)")
+    parser.add_argument("--save-outputs", type=str, default=None, help="Save output samples to this file path")
+    parser.add_argument("--num-samples", type=int, default=10, help="Number of output samples to save (default: 10)")
 
     args = parser.parse_args()
 
