@@ -63,7 +63,13 @@ impl ContextManager {
             let &(model_idx, ctx_id) = entry.key();
             if model_idx != self.model_idx { continue; }
             let ctx = entry.value();
-            if ctx.state != ContextState::Active { continue; }
+            if ctx.state != ContextState::Active {
+            // Also consider Suspended contexts that still hold working pages.
+            // These occur when a failed restore couldn't swap back to CPU.
+            if !(ctx.state == ContextState::Suspended && !ctx.working_pages.is_empty()) {
+                continue;
+            }
+        }
             if !ctx.has_gpu_pages() { continue; }
             if ctx.device != Some(dev_idx as DeviceId) { continue; }
             // Skip contexts with in-flight working pages when CPU swap
@@ -236,6 +242,14 @@ impl ContextManager {
         }
 
         // Phase 1: Swap working pages from CPU back to GPU
+        //
+        // Track the working page count *before* Phase 1 so we can roll back
+        // if Phase 2 fails.  restore_working_pages sets ctx.working_pages to
+        // the newly-swapped pages, so anything beyond pre_phase1_len was
+        // added by Phase 1.
+        let pre_phase1_len = CONTEXTS.get(&(self.model_idx, id))
+            .map(|c| c.working_pages.len()).unwrap_or(0);
+
         if !working_cpu.is_empty() {
             self.restore_working_pages(id, dev_idx, &working_cpu, owner).await?;
         }
@@ -266,29 +280,40 @@ impl ContextManager {
             }
 
             if let Some((plan, prefix_hashes)) = self.build_replay_plan(id, dev_idx) {
-                // execute_replay is self-cleaning: on failure it frees
-                // partially-allocated working pages and resets to Suspended.
-                let chunks = self.execute_replay(id, dev_idx, plan, owner).await?;
+                // execute_replay is self-cleaning for pages allocated during
+                // replay.  But if Phase 1 added working pages, those are NOT
+                // cleaned up by rollback_replay — we handle that here.
+                match self.execute_replay(id, dev_idx, plan, owner).await {
+                    Ok(chunks) => {
+                        // Replay succeeded — commit the restore atomically:
+                        // acquire refcounts for the prefix-matched pages and
+                        // restore arbiter accounting.
+                        if !prefix_hashes.is_empty() {
+                            self.devices[dev_idx].longest_prefix_match(&prefix_hashes);
+                        }
+                        if let Some(pid) = owner {
+                            let matched_committed = CONTEXTS.get(&(self.model_idx, id))
+                                .map(|c| c.committed_len).unwrap_or(0);
+                            self.arbiter.restore(pid, dev_idx, matched_committed, 0);
+                        }
 
-                // Replay succeeded — now commit the restore atomically:
-                // acquire refcounts for the prefix-matched pages and
-                // restore arbiter accounting.
-                if !prefix_hashes.is_empty() {
-                    self.devices[dev_idx].longest_prefix_match(&prefix_hashes);
-                }
-                if let Some(pid) = owner {
-                    let matched_committed = CONTEXTS.get(&(self.model_idx, id))
-                        .map(|c| c.committed_len).unwrap_or(0);
-                    self.arbiter.restore(pid, dev_idx, matched_committed, 0);
-                }
-
-                if chunks.is_empty() {
-                    if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
-                        ctx.state = ContextState::Active;
+                        if chunks.is_empty() {
+                            if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                                ctx.state = ContextState::Active;
+                            }
+                            return Ok(None);
+                        }
+                        return Ok(Some(chunks));
                     }
-                    return Ok(None);
+                    Err(e) => {
+                        // Phase 2 failed — rollback_replay already freed pages
+                        // added during replay and set state=Suspended.
+                        // Swap Phase 1's working pages back to CPU so the
+                        // context can be restored again later.
+                        self.rollback_phase1_to_cpu(id, dev_idx, owner, pre_phase1_len).await;
+                        return Err(e);
+                    }
                 }
-                return Ok(Some(chunks));
             }
 
             // All pages prefix-matched, no replay needed. (Bug 3 fix)
@@ -335,6 +360,7 @@ impl ContextManager {
             };
             let _: () = device::call(dev_idx as DeviceId, "swap_in_pages", &request).await
                 .map_err(|e| anyhow::anyhow!("swap_in_pages RPC failed: {e}"))?;
+
 
             let new_working: Vec<_> = swap_ops.iter().map(|op| op.gpu_phys).collect();
             let swapped_count = new_working.len();
@@ -541,6 +567,66 @@ impl ContextManager {
         self.devices[dev_idx].free_working(&to_free);
         if let Some(pid) = owner {
             self.arbiter.remove_working(pid, dev_idx, arbiter_pages);
+        }
+    }
+
+    /// Rollback Phase 1 (restore_working_pages) when Phase 2 fails.
+    ///
+    /// After `rollback_replay` has cleaned up Phase 2's allocations, this
+    /// swaps Phase 1's working pages back from GPU to CPU, preserving the
+    /// data for a future restore attempt.  If the CPU swap fails (no CPU
+    /// slots), the pages are discarded — the context will need full replay.
+    async fn rollback_phase1_to_cpu(
+        &mut self, id: ContextId, dev_idx: usize,
+        owner: Option<ProcessId>, pre_phase1_len: usize,
+    ) {
+        let phase1_pages = {
+            let mut ctx = match CONTEXTS.get_mut(&(self.model_idx, id)) {
+                Some(ctx) => ctx,
+                None => return,
+            };
+            let current_len = ctx.working_pages.len();
+            if current_len <= pre_phase1_len {
+                return;
+            }
+            ctx.working_pages.drain(pre_phase1_len..).collect::<Vec<_>>()
+        };
+
+        let n = phase1_pages.len();
+
+        // Try to swap the pages back to CPU (allocates new CPU slots, frees GPU).
+        let swap_ops = match self.devices[dev_idx].swap_out_working(&phase1_pages) {
+            Ok(ops) => ops,
+            Err(_) => {
+                // No CPU pages available — discard (will need full replay).
+                self.devices[dev_idx].free_working(&phase1_pages);
+                if let Some(pid) = owner {
+                    self.arbiter.remove_working(pid, dev_idx, n);
+                }
+                return;
+            }
+        };
+
+        // Fire D2H copy RPC (fire-and-forget, same pattern as suspend_context).
+        if !swap_ops.is_empty() {
+            #[derive(Serialize)]
+            struct SwapOutRequest { phys_ids: Vec<u32>, slots: Vec<PhysicalPageId> }
+            let request = SwapOutRequest {
+                phys_ids: swap_ops.iter().map(|op| op.gpu_phys).collect(),
+                slots: swap_ops.iter().map(|op| op.cpu_slot).collect(),
+            };
+            let dev = dev_idx as DeviceId;
+            tokio::spawn(async move {
+                let _: Result<(), _> = device::call(dev, "swap_out_pages", &request).await;
+            });
+        }
+
+        // Store new CPU slots so the context can be restored again later.
+        if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+            ctx.working_cpu_slots = swap_ops.iter().map(|op| op.cpu_slot).collect();
+        }
+        if let Some(pid) = owner {
+            self.arbiter.remove_working(pid, dev_idx, n);
         }
     }
 

@@ -151,6 +151,16 @@ impl ContextManager {
             None => (0..self.wait_queues.len()).collect(),
         };
         for dev in devs {
+            let queue_len = self.wait_queues[dev].len();
+            let avail = self.devices[dev].available_gpu_pages();
+
+            if queue_len > 0 {
+                tracing::debug!(
+                    "try_serve_waiters dev={dev}: queue_len={queue_len}, available_gpu_pages={avail}"
+                );
+            }
+
+            let mut served = 0u64;
             loop {
                 // Quick check: any free pages at all?
                 if self.devices[dev].available_gpu_pages() == 0 {
@@ -163,6 +173,11 @@ impl ContextManager {
                 };
                 match waiter {
                     PageWaiter::Allocate { context_id, device, num_pages, requester, enqueued_at, response, .. } => {
+                        // Skip waiters whose context was destroyed while queued.
+                        if !CONTEXTS.contains_key(&(self.model_idx, context_id)) {
+                            let _ = response.send(Err(anyhow::anyhow!("context destroyed while waiting")));
+                            continue;
+                        }
                         // Direct allocation: free pool + LRU eviction of
                         // unreferenced committed pages. No context eviction.
                         match self.devices[dev].allocate_working(num_pages) {
@@ -170,10 +185,14 @@ impl ContextManager {
                                 if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, context_id)) {
                                     ctx.working_pages.extend(&new_pages);
                                     ctx.device = Some(dev as DeviceId);
+                                } else {
+                                    // Context vanished after allocation — free the pages.
+                                    self.devices[dev].free_working(&new_pages);
                                 }
                                 if let Some(pid) = requester {
                                     self.arbiter.add_working(pid, dev, num_pages);
                                 }
+                                served += 1;
                                 let _ = response.send(Ok(()));
                                 continue;
                             }
@@ -200,7 +219,12 @@ impl ContextManager {
                                 } else {
                                     HashMap::new()
                                 };
-                                let _ = response.send(Ok(ResidentResult { replay_chunks, pages }));
+                                served += 1;
+                                if response.send(Ok(ResidentResult { replay_chunks, pages })).is_err() {
+                                    // Process died while waiting — context is now InFlight
+                                    // but orphaned. Pages will be freed when it's eventually
+                                    // evicted or destroyed.
+                                }
                                 continue;
                             }
                             Err(WaitNeeded::NeedPages) => {
@@ -218,6 +242,13 @@ impl ContextManager {
                         }
                     }
                 }
+            }
+
+            if queue_len > 0 {
+                tracing::debug!(
+                    "try_serve_waiters dev={dev}: done, served={served}, remaining={}",
+                    self.wait_queues[dev].len()
+                );
             }
         }
     }

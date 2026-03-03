@@ -295,16 +295,39 @@ impl ContextManager {
             return Ok(pages);
         }
 
+        let requester_pages = requester
+            .map(|pid| self.arbiter.node_pages(&pid, dev_idx))
+            .unwrap_or(0);
+        tracing::debug!(
+            "allocate_working_with_suspension: dev={dev_idx} need={num_pages} \
+             requester_pages={requester_pages} avail={}",
+            self.devices[dev_idx].available_gpu_pages()
+        );
+
+        let mut evictions = 0u32;
         loop {
             let requester_floor = self.requester_floor(requester, dev_idx, num_pages);
             match self.find_cheapest_victim(dev_idx, requester_floor, requester) {
                 Some(vid) => {
+                    tracing::debug!(
+                        "allocate_working_with_suspension: evicting ctx {vid} \
+                         (requester_floor={requester_floor:.1})"
+                    );
                     self.suspend_context(vid).await;
+                    evictions += 1;
                     if let Ok(pages) = self.devices[dev_idx].allocate_working(num_pages) {
                         return Ok(pages);
                     }
                 }
-                None => break,
+                None => {
+                    tracing::debug!(
+                        "allocate_working_with_suspension: no victim found, \
+                         floor={requester_floor:.1}, evictions_tried={evictions}, \
+                         avail={}",
+                        self.devices[dev_idx].available_gpu_pages()
+                    );
+                    break;
+                },
             }
         }
 

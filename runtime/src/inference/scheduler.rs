@@ -279,6 +279,9 @@ impl BatchScheduler {
             match policy.decide(batch.len(), batch.total_tokens(), in_flight_count) {
                 Decision::Fire => {
                     // Acquire a permit (may wait if at in-flight limit)
+                    if in_flight.available_permits() == 0 {
+                        eprintln!("[SCHED dev={device_idx}] semaphore full, waiting for in-flight batch to complete");
+                    }
                     let permit = in_flight
                         .clone()
                         .acquire_owned()
@@ -296,6 +299,9 @@ impl BatchScheduler {
                     let timeout = request_timeout;
 
                     stats_clone.in_flight_batches.fetch_add(1, Relaxed);
+                    eprintln!(
+                        "[SCHED dev={device_idx}] FIRING batch_size={batch_size} tokens={total_tokens}"
+                    );
                     tokio::spawn(async move {
                         let start = Instant::now();
                         Self::execute_batch(
@@ -313,6 +319,10 @@ impl BatchScheduler {
                         stats_clone.last_batch_latency_us.store(latency.as_micros() as u64, Relaxed);
                         stats_clone.cumulative_latency_us.fetch_add(latency.as_micros() as u64, Relaxed);
                         stats_clone.in_flight_batches.fetch_sub(1, Relaxed);
+                        eprintln!(
+                            "[SCHED dev={device_idx}] COMPLETE batch_size={batch_size} latency={}ms",
+                            latency.as_millis()
+                        );
 
                         stats_tx_clone
                             .send(BatchStats {

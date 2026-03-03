@@ -147,6 +147,14 @@ impl DevicePageCache {
         self.gpu.available() + self.evictable_count()
     }
 
+    /// Detailed breakdown: (free_pool, committed_referenced, committed_evictable, total)
+    pub fn page_breakdown(&self) -> (usize, usize, usize, usize) {
+        let free = self.gpu.available();
+        let evictable = self.evictable_count();
+        let committed_ref = self.pages.len() - evictable;
+        (free, committed_ref, evictable, self.gpu.total)
+    }
+
     // =========================================================================
     // Hash computation
     // =========================================================================
@@ -393,15 +401,27 @@ impl DevicePageCache {
     /// Swap working pages from GPU to CPU.
     /// Returns swap operations for the RPC layer.
     pub fn swap_out_working(&mut self, gpu_pages: &[PhysicalPageId]) -> Result<Vec<SwapOp>> {
-        let mut ops = Vec::with_capacity(gpu_pages.len());
-
-        for &gpu_phys in gpu_pages {
-            let cpu_slot = self.cpu.alloc()
-                .ok_or_else(|| anyhow::anyhow!("No free CPU pages for working swap-out"))?;
-
-            ops.push(SwapOp { gpu_phys, cpu_slot });
-            self.gpu.free(gpu_phys);
+        // Phase 1: Allocate all CPU slots. Roll back on partial failure.
+        let mut cpu_slots = Vec::with_capacity(gpu_pages.len());
+        for _ in 0..gpu_pages.len() {
+            match self.cpu.alloc() {
+                Some(s) => cpu_slots.push(s),
+                None => {
+                    for &s in &cpu_slots {
+                        self.cpu.free(s);
+                    }
+                    anyhow::bail!("No free CPU pages for working swap-out");
+                }
+            }
         }
+
+        // Phase 2: All CPU slots secured — free GPU pages and build ops.
+        let ops: Vec<SwapOp> = gpu_pages.iter().zip(cpu_slots.into_iter())
+            .map(|(&gpu_phys, cpu_slot)| {
+                self.gpu.free(gpu_phys);
+                SwapOp { gpu_phys, cpu_slot }
+            })
+            .collect();
 
         Ok(ops)
     }
@@ -409,15 +429,28 @@ impl DevicePageCache {
     /// Swap working pages from CPU back to GPU.
     /// Returns swap operations for the RPC layer.
     pub fn swap_in_working(&mut self, cpu_slots: &[PhysicalPageId]) -> Result<Vec<SwapOp>> {
-        let mut ops = Vec::with_capacity(cpu_slots.len());
-
-        for &cpu_slot in cpu_slots {
-            let gpu_phys = self.gpu.alloc()
-                .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working swap-in"))?;
-
-            ops.push(SwapOp { gpu_phys, cpu_slot });
-            self.cpu.free(cpu_slot);
+        // Phase 1: Allocate all GPU pages. Roll back on partial failure.
+        let mut gpu_pages = Vec::with_capacity(cpu_slots.len());
+        for _ in 0..cpu_slots.len() {
+            match self.gpu.alloc() {
+                Some(p) => gpu_pages.push(p),
+                None => {
+                    // Roll back already-allocated GPU pages.
+                    for &p in &gpu_pages {
+                        self.gpu.free(p);
+                    }
+                    anyhow::bail!("No free GPU pages for working swap-in");
+                }
+            }
         }
+
+        // Phase 2: All GPU pages secured — build ops and free CPU slots.
+        let ops: Vec<SwapOp> = gpu_pages.into_iter().zip(cpu_slots.iter())
+            .map(|(gpu_phys, &cpu_slot)| {
+                self.cpu.free(cpu_slot);
+                SwapOp { gpu_phys, cpu_slot }
+            })
+            .collect();
 
         Ok(ops)
     }

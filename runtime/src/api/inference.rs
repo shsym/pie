@@ -346,7 +346,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // finish_restore + get_physical_page_ids (replay).
         let pages_by_device = if let Some(replay_chunks) = resident.replay_chunks {
             // Replay path: context is Restoring (non-evictable)
-            for chunk in replay_chunks {
+            for (ci, chunk) in replay_chunks.into_iter().enumerate() {
                 let commit_tokens = chunk.tokens.clone();
                 let commit_positions = chunk.positions.clone();
                 let commit_masks = chunk.masks.clone();
@@ -387,17 +387,15 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 }
             }
 
-            // finish_restore: Restoring → InFlight (fire-and-forget, actor-side).
-            // The context is InFlight by the time get_physical_page_ids runs.
             if let Err(e) = context::finish_restore(model_id, context_id) {
                 tracing::warn!("finish_restore failed for ctx {context_id}: {e:#}");
                 return Ok(Err(e.to_string()));
             }
 
-            // Resolve pages — context is InFlight (set by finish_restore above),
-            // so it cannot be evicted between here and inference::submit.
             match context::get_physical_page_ids(model_id, context_id).await {
-                Ok(pages) => pages,
+                Ok(pages) => {
+                    pages
+                },
                 Err(e) => {
                     context::clear_in_flight(model_id, context_id);
                     tracing::warn!("get_physical_page_ids failed for ctx {context_id}: {e:#}");
