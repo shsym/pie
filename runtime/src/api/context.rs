@@ -2,7 +2,7 @@
 
 use crate::api::model::Model;
 use crate::api::pie;
-use crate::context::{self, ContextId};
+use crate::context_legacy::{self as context, ContextId};
 use crate::linker::InstanceState;
 use crate::model::ModelId;
 use anyhow::Result;

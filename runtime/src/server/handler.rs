@@ -7,7 +7,7 @@ use bytes::Bytes;
 use pie_client::message::ServerMessage;
 
 
-use crate::context;
+use crate::context_legacy as context;
 use crate::daemon;
 use crate::inference;
 use crate::messaging;

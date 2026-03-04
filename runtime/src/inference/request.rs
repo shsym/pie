@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 use crate::adapter::AdapterId;
-use crate::context::ContextId;
+use crate::context_legacy::ContextId;
 use crate::inference::brle::Brle;
 use crate::device::DeviceId;
 

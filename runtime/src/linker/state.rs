@@ -11,7 +11,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 use super::output::LogStream;
 
-use crate::context::{self, ContextId};
+use crate::context_legacy::{self as context, ContextId};
 use crate::process::ProcessId;
 
 pub struct InstanceState {
