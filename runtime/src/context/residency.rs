@@ -13,7 +13,7 @@ use crate::process::ProcessId;
 use crate::device::{self, DeviceId};
 use crate::inference::brle::Brle;
 
-use super::{CONTEXTS, Context, ContextId, ContextState, Record, ReplayFill};
+use super::{CONTEXTS, Context, ContextId, ContextState, Record, ReplayFill, TokenInfo};
 use super::kvcache::{self, PhysicalPageId, PageHash};
 use super::manager::ContextManager;
 use super::waitqueue::WaitNeeded;
@@ -136,13 +136,16 @@ impl ContextManager {
             let ctx = match CONTEXTS.get(&(self.model_idx, id)) {
                 Some(ctx) => ctx, None => return,
             };
-            // Skip if context transitioned to InFlight between victim selection and now.
-            if ctx.state == ContextState::InFlight { return; }
+            // Skip if context transitioned to InFlight between victim selection and now,
+            // or is mid-replay (Restoring).  Restoring contexts have in-flight replay
+            // forward passes that reference their GPU pages — eviction would cause
+            // use-after-free on the GPU.
+            if ctx.state == ContextState::InFlight || ctx.state == ContextState::Restoring { return; }
             if !ctx.has_gpu_pages() { return; }
             (ctx.working_pages.clone(), ctx.committed_tip, ctx.device.unwrap_or(0) as usize)
         };
 
-        // Phase 1: Swap working pages to CPU (or discard if unavailable)
+        // Phase 1: Prepare swap — allocate CPU slots (does NOT free GPU pages yet)
         let swap_ops = if !working.is_empty() {
             match self.devices[dev_idx].swap_out_working(&working) {
                 Ok(ops) => ops,
@@ -156,8 +159,9 @@ impl ContextManager {
             Vec::new()
         };
 
-        // Phase 2: Fire-and-forget D2H copy RPC — actor doesn't block.
-        // If the copy fails, restore will fall back to replay.
+        // Phase 2: Execute D2H copy, then free GPU pages.
+        // GPU pages must remain allocated during the copy to prevent
+        // use-after-free corruption from page reallocation.
         if !swap_ops.is_empty() {
             #[derive(Serialize)]
             struct SwapOutRequest { phys_ids: Vec<u32>, slots: Vec<PhysicalPageId> }
@@ -165,10 +169,10 @@ impl ContextManager {
                 phys_ids: swap_ops.iter().map(|op| op.gpu_phys).collect(),
                 slots: swap_ops.iter().map(|op| op.cpu_slot).collect(),
             };
-            let dev = dev_idx as DeviceId;
-            tokio::spawn(async move {
-                let _: Result<(), _> = device::call(dev, "swap_out_pages", &request).await;
-            });
+            let _: Result<(), _> = device::call(dev_idx as DeviceId, "swap_out_pages", &request).await;
+            // Now safe to free GPU pages — D2H copy is complete.
+            let gpu_pages: Vec<PhysicalPageId> = swap_ops.iter().map(|op| op.gpu_phys).collect();
+            self.devices[dev_idx].free_working(&gpu_pages);
         }
 
         // Phase 3: Release committed chain refcounts
@@ -205,16 +209,49 @@ impl ContextManager {
     pub(crate) fn get_physical_page_ids(&mut self, id: ContextId) -> Result<HashMap<DeviceId, Vec<PhysicalPageId>>> {
         let ctx = self.ctx(id)?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let mut phys = if let Some(tip) = ctx.committed_tip {
+        let committed_len = ctx.committed_len;
+        let working_len = ctx.working_pages.len();
+        let tokens_filled_len = ctx.tokens_filled.len();
+        let tip = ctx.committed_tip;
+        let mut phys = if let Some(t) = tip {
             drop(ctx);
-            self.devices[dev_idx].resolve_physical(tip)
+            self.devices[dev_idx].resolve_physical(t)
         } else {
             drop(ctx);
             Vec::new()
         };
 
+        let committed_resolved = phys.len();
+
+        // Sanity check: resolved committed pages must match committed_len
+        if committed_resolved != committed_len {
+            let chain_info = self.devices[dev_idx].debug_chain_info(tip.unwrap_or(0));
+            eprintln!(
+                "PAGE_COUNT_MISMATCH ctx={id} resolved={committed_resolved} committed_len={committed_len} \
+                 working={working_len} tokens_filled={tokens_filled_len} tip={tip:?} chain=[{chain_info}]",
+            );
+        }
+
+        let committed_phys_len = phys.len();
         if let Some(ctx) = CONTEXTS.get(&(self.model_idx, id)) {
+            let wp = ctx.working_pages.len();
             phys.extend_from_slice(&ctx.working_pages);
+            if wp != working_len {
+                eprintln!(
+                    "WORKING_PAGES_CHANGED ctx={id} initial={working_len} now={wp} \
+                     committed_phys={committed_phys_len} final_phys={}", phys.len(),
+                );
+            }
+        }
+
+        let final_len = phys.len();
+        // Log whenever working pages claim to exist but phys count doesn't match
+        if working_len > 0 && final_len != committed_len + working_len {
+            eprintln!(
+                "PHYS_WORKING_MISMATCH ctx={id} committed_len={committed_len} \
+                 committed_resolved={committed_resolved} working_len={working_len} \
+                 final_phys={final_len} tip={tip:?}",
+            );
         }
 
         let mut result = HashMap::new();
@@ -241,6 +278,12 @@ impl ContextManager {
             return Ok(None);
         }
 
+        eprintln!(
+            "ENSURE_RESIDENT_SLOW ctx={id} was_suspended={was_suspended} \
+             working_cpu={} tip={tip:?}",
+            working_cpu.len(),
+        );
+
         // Phase 1: Swap working pages from CPU back to GPU
         //
         // Track the working page count *before* Phase 1 so we can roll back
@@ -250,6 +293,7 @@ impl ContextManager {
         let pre_phase1_len = CONTEXTS.get(&(self.model_idx, id))
             .map(|c| c.working_pages.len()).unwrap_or(0);
 
+        // Phase 1: restore working pages from CPU → GPU
         if !working_cpu.is_empty() {
             self.restore_working_pages(id, dev_idx, &working_cpu, owner).await?;
         }
@@ -261,11 +305,40 @@ impl ContextManager {
             if discarded.is_empty() {
                 if was_suspended {
                     self.devices[dev_idx].acquire_chain(tip_hash);
-                    // Restore arbiter accounting for committed pages (Bug 2 fix).
+                    // Rebuild index_cache entry that was removed by
+                    // suspend_context → remove_index_cache. Without this,
+                    // the next commit_pages → update_index_cache falls back
+                    // to rebuild_page_table which filter_maps evicted pages,
+                    // permanently undersizing the cache entry.
+                    let _ = self.devices[dev_idx].resolve_physical(tip_hash);
                     if let Some(pid) = owner {
                         let committed_len = CONTEXTS.get(&(self.model_idx, id))
                             .map(|c| c.committed_len).unwrap_or(0);
                         self.arbiter.restore(pid, dev_idx, committed_len, 0);
+                    }
+                    // Safety clamp: if working pages are gone (swap failure
+                    // during suspension freed them instead of swapping to CPU),
+                    // tokens_filled references KV data that no longer exists.
+                    // Clear to prevent kv_len inflation / FlashInfer OOB reads.
+                    if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                        if ctx.working_pages.is_empty() && !ctx.tokens_filled.is_empty() {
+                            eprintln!(
+                                "CLAMP_TOKENS_FILLED ctx={id} \
+                                 committed_len={} tokens_filled={} \
+                                 (swap failure: working pages gone)",
+                                ctx.committed_len, ctx.tokens_filled.len(),
+                            );
+                            ctx.tokens_filled.clear();
+                        }
+                    }
+                    // Debug: log context state at no-replay restore
+                    if let Some(ctx) = CONTEXTS.get(&(self.model_idx, id)) {
+                        eprintln!(
+                            "NO_REPLAY_RESTORE ctx={id} committed_len={} \
+                             tokens_filled={} working_pages={} working_cpu={}",
+                            ctx.committed_len, ctx.tokens_filled.len(),
+                            ctx.working_pages.len(), ctx.working_cpu_slots.len(),
+                        );
                     }
                 }
                 if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
@@ -275,26 +348,45 @@ impl ContextManager {
                 return Ok(None);
             }
 
+            // Committed chain discarded — replay needed.
             if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
                 ctx.state = ContextState::Restoring;
             }
 
+            // Save committed metadata BEFORE build_replay_plan destructively
+            // modifies it. If execute_replay fails (OOM), we must restore these
+            // so the context doesn't permanently lose its committed state.
+            let saved_committed_tip = CONTEXTS.get(&(self.model_idx, id))
+                .and_then(|c| c.committed_tip);
+            let saved_committed_len = CONTEXTS.get(&(self.model_idx, id))
+                .map(|c| c.committed_len).unwrap_or(0);
+            let saved_max_committed_position = CONTEXTS.get(&(self.model_idx, id))
+                .and_then(|c| c.max_committed_position);
+            let saved_tokens_filled: Vec<TokenInfo> = CONTEXTS.get(&(self.model_idx, id))
+                .map(|c| c.tokens_filled.clone()).unwrap_or_default();
+
             if let Some((plan, prefix_hashes)) = self.build_replay_plan(id, dev_idx) {
-                // execute_replay is self-cleaning for pages allocated during
-                // replay.  But if Phase 1 added working pages, those are NOT
-                // cleaned up by rollback_replay — we handle that here.
+                // Acquire refcounts for the prefix-matched pages BEFORE replay.
+                if !prefix_hashes.is_empty() {
+                    self.devices[dev_idx].longest_prefix_match(&prefix_hashes);
+                }
+
                 match self.execute_replay(id, dev_idx, plan, owner).await {
                     Ok(chunks) => {
-                        // Replay succeeded — commit the restore atomically:
-                        // acquire refcounts for the prefix-matched pages and
-                        // restore arbiter accounting.
-                        if !prefix_hashes.is_empty() {
-                            self.devices[dev_idx].longest_prefix_match(&prefix_hashes);
-                        }
+                        // Replay succeeded — restore arbiter accounting.
                         if let Some(pid) = owner {
                             let matched_committed = CONTEXTS.get(&(self.model_idx, id))
                                 .map(|c| c.committed_len).unwrap_or(0);
                             self.arbiter.restore(pid, dev_idx, matched_committed, 0);
+                        }
+
+                        // Restore partial page data (tokens_filled) that was
+                        // cleared by build_replay_plan. The lineage only contains
+                        // committed tokens, so replay doesn't cover the partial
+                        // page. The working page KV data is still valid (restored
+                        // by Phase 1), so these tokens still map to correct KV.
+                        if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                            ctx.tokens_filled = saved_tokens_filled;
                         }
 
                         if chunks.is_empty() {
@@ -306,23 +398,55 @@ impl ContextManager {
                         return Ok(Some(chunks));
                     }
                     Err(e) => {
-                        // Phase 2 failed — rollback_replay already freed pages
-                        // added during replay and set state=Suspended.
-                        // Swap Phase 1's working pages back to CPU so the
-                        // context can be restored again later.
-                        self.rollback_phase1_to_cpu(id, dev_idx, owner, pre_phase1_len).await;
+                        // Phase 2 failed — rollback prefix refcounts we just acquired.
+                        if !prefix_hashes.is_empty() {
+                            self.devices[dev_idx].release_chain(
+                                *prefix_hashes.last().unwrap()
+                            );
+                        }
+                        // Restore committed metadata that build_replay_plan
+                        // destructively modified. Without this, the context
+                        // permanently loses its committed state on OOM.
+                        if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                            ctx.committed_tip = saved_committed_tip;
+                            ctx.committed_len = saved_committed_len;
+                            ctx.max_committed_position = saved_max_committed_position;
+                            ctx.tokens_filled = saved_tokens_filled;
+                        }
+                        // rollback_replay already freed replay-allocated pages.
+                        // Swap Phase 1's working pages back to CPU.
+                        if let Err(oom) = self.rollback_phase1_to_cpu(id, dev_idx, owner, pre_phase1_len).await {
+                            tracing::error!("rollback_phase1_to_cpu OOM for ctx {id}: {oom:#}");
+                        }
                         return Err(e);
                     }
                 }
             }
 
-            // All pages prefix-matched, no replay needed. (Bug 3 fix)
+            // All pages prefix-matched, no replay needed.
+            // CRITICAL: acquire refcounts on the committed chain.
+            // build_replay_plan → longest_prefix_length is read-only — it
+            // does NOT acquire refcounts.  Without this, the dedup-shared
+            // pages can be evicted by another context while this context's
+            // forward pass reads them → use-after-free KV corruption.
+            self.devices[dev_idx].acquire_chain(tip_hash);
             if let Some(pid) = owner {
                 let committed_len = CONTEXTS.get(&(self.model_idx, id))
                     .map(|c| c.committed_len).unwrap_or(0);
                 self.arbiter.restore(pid, dev_idx, committed_len, 0);
             }
+            // Safety clamp: same as NRR path — if working pages are gone
+            // (swap failure), clear stale tokens_filled.
             if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                if ctx.working_pages.is_empty() && !ctx.tokens_filled.is_empty() {
+                    eprintln!(
+                        "CLAMP_TOKENS_FILLED ctx={id} \
+                         committed_len={} tokens_filled={} \
+                         (replay all-matched, swap failure)",
+                        ctx.committed_len, ctx.tokens_filled.len(),
+                    );
+                    ctx.tokens_filled.clear();
+                }
                 ctx.state = ContextState::InFlight;
             }
             return Ok(None);
@@ -361,6 +485,11 @@ impl ContextManager {
             let _: () = device::call(dev_idx as DeviceId, "swap_in_pages", &request).await
                 .map_err(|e| anyhow::anyhow!("swap_in_pages RPC failed: {e}"))?;
 
+            // Free CPU slots AFTER the H2D copy completes. Before this point,
+            // the CPU buffer data must remain intact — freeing earlier allows
+            // another context's suspension to overwrite the slot via D2H copy.
+            let cpu_slots: Vec<_> = swap_ops.iter().map(|op| op.cpu_slot).collect();
+            self.devices[dev_idx].free_cpu_slots(&cpu_slots);
 
             let new_working: Vec<_> = swap_ops.iter().map(|op| op.gpu_phys).collect();
             let swapped_count = new_working.len();
@@ -435,17 +564,29 @@ impl ContextManager {
                 // Without this, replay's commit_pages rejects positions that are
                 // <= the pre-eviction max_committed_position.
                 ctx.max_committed_position = all_positions[..matched_tokens].iter().copied().max();
+                // NOTE: tokens_filled is NOT cleared here. If all committed
+                // tokens matched (no replay needed), tokens_filled still
+                // references valid KV data in working pages restored by Phase 1.
+                // It is cleared below only when replay IS needed.
             }
         } else {
             if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
                 ctx.committed_tip = None;
                 ctx.committed_len = 0;
                 ctx.max_committed_position = None;
+                ctx.tokens_filled.clear();
             }
         }
 
         if matched_tokens >= all_tokens.len() {
             return None;
+        }
+
+        // Replay IS needed: clear stale tokens_filled. These reference KV
+        // from working pages that were freed during eviction. The replay
+        // forward pass will recompute the KV data for these tokens.
+        if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+            ctx.tokens_filled.clear();
         }
 
         Some((ReplayPlan { all_tokens, all_positions, all_masks, adapters, matched_tokens, kv_so_far }, prefix_hashes))
@@ -467,6 +608,13 @@ impl ContextManager {
         let initial_working_len = CONTEXTS.get(&(self.model_idx, id))
             .map(|c| c.working_pages.len()).unwrap_or(0);
 
+        // When Phase 1 restored working pages from CPU but committed pages
+        // are discarded, those Phase 1 pages hold stale KV data.  Rather
+        // than freeing them NOW (which causes CUDA errors from pool churn
+        // at extreme contention), we keep them in ctx.working_pages but
+        // exclude them from phys_ids.  After building all replay chunks we
+        // drain them.
+
         let mut chunks = Vec::new();
         let mut offset = matched_tokens;
         let mut pages_added_to_arbiter = 0;
@@ -486,8 +634,14 @@ impl ContextManager {
             let chunk_positions = &all_positions[offset..chunk_end];
             let chunk_masks = &all_masks[offset..chunk_end];
 
-            let num_pages = (chunk_tokens.len() + self.page_size - 1) / self.page_size;
-            let new_pages = match self.allocate_working_with_suspension(dev_idx, num_pages, owner).await {
+            // Allocate pages for ALL tokens (including partial page) — the
+            // model needs to write KV data for all of them.
+            let total_pages = (chunk_tokens.len() + self.page_size - 1) / self.page_size;
+            // But only FULL pages get committed. The partial page stays as a
+            // working page with its KV data preserved in tokens_filled.
+            let full_pages = chunk_tokens.len() / self.page_size;
+
+            let new_pages = match self.allocate_working_with_suspension(dev_idx, total_pages, owner).await {
                 Ok(pages) => pages,
                 Err(e) => {
                     // Rollback: free working pages we allocated in THIS call.
@@ -505,25 +659,27 @@ impl ContextManager {
                 // in-flight operation. Replay data goes directly into ReplayFill.
             }
             if let Some(pid) = owner {
-                self.arbiter.add_working(pid, dev_idx, num_pages);
+                self.arbiter.add_working(pid, dev_idx, total_pages);
             }
-            pages_added_to_arbiter += num_pages;
+            pages_added_to_arbiter += total_pages;
 
+            // Build phys_ids EXCLUDING stale Phase 1 pages — only use
+            // replay-allocated pages (those after initial_working_len).
             let phys_ids = {
                 let mut all = if let Some(tip) = CONTEXTS.get(&(self.model_idx, id))
                     .and_then(|c| c.committed_tip) {
                     self.devices[dev_idx].resolve_physical(tip)
                 } else { Vec::new() };
                 if let Some(ctx) = CONTEXTS.get(&(self.model_idx, id)) {
-                    all.extend_from_slice(&ctx.working_pages);
+                    all.extend_from_slice(&ctx.working_pages[initial_working_len..]);
                 }
                 all
             };
 
             let num_input = chunk_tokens.len() as u32;
             let total_kv = kv_so_far + num_input;
-            let total_pages = phys_ids.len() as u32;
-            let last_page_len = kvcache::compute_last_page_len(total_kv, total_pages, self.page_size as u32);
+            let total_pages_for_fwd = phys_ids.len() as u32;
+            let last_page_len = kvcache::compute_last_page_len(total_kv, total_pages_for_fwd, self.page_size as u32);
 
             chunks.push(ReplayFill {
                 tokens: chunk_tokens.to_vec(),
@@ -534,10 +690,73 @@ impl ContextManager {
                 device_id: dev_idx as DeviceId,
                 kv_len: kv_so_far,
                 last_page_len,
-                num_pages: num_pages as u32,
+                num_pages: full_pages as u32,
             });
             kv_so_far += num_input;
             offset = chunk_end;
+        }
+
+        // All chunks built. Now drain stale Phase 1 pages from the front
+        // of ctx.working_pages so that commit_replay_chunk (which indexes
+        // from position 0) sees only the replay-allocated pages.
+        //
+        // CRITICAL: also clear tokens_filled.  Those tokens reference KV data
+        // from the freed Phase 1 working pages.  If left in tokens_filled,
+        // kv_len (= committed_len * page_size + tokens_filled.len()) is
+        // inflated by the stale count → wrong last_page_len and position IDs
+        // → model reads past actual KV data → corruption.
+        if initial_working_len > 0 {
+            let stale_pages: Vec<PhysicalPageId> = {
+                let mut ctx = CONTEXTS.get_mut(&(self.model_idx, id))
+                    .ok_or_else(|| anyhow::anyhow!("Context lost during replay drain"))?;
+                // Clear tokens_filled: these reference KV data from
+                // the stale Phase 1 working pages being freed below.
+                ctx.tokens_filled.clear();
+                ctx.working_pages.drain(..initial_working_len).collect()
+            };
+            self.devices[dev_idx].free_working(&stale_pages);
+            if let Some(pid) = owner {
+                self.arbiter.remove_working(pid, dev_idx, initial_working_len);
+            }
+        }
+
+        // Repopulate tokens_filled with the partial page remainder.
+        //
+        // The replay forward pass wrote KV data for ALL lineage tokens
+        // (including the partial last page). commit_replay_chunk only
+        // commits FULL pages. The remainder tokens beyond the last full
+        // page boundary exist as KV data in a working page but are not
+        // tracked by committed_len. We must record them in tokens_filled
+        // so that kv_len = committed_len * page_size + tokens_filled.len()
+        // accurately reflects the total KV entries.
+        let total_committed_tokens: usize = matched_tokens
+            + chunks.iter().map(|c| c.num_pages as usize * self.page_size).sum::<usize>();
+        if total_committed_tokens < all_tokens.len() {
+            let remainder = all_tokens.len() - total_committed_tokens;
+            eprintln!(
+                "REPOPULATE ctx={id} matched={matched_tokens} replay_committed={} \
+                 total_committed={total_committed_tokens} all_tokens={} remainder={remainder}",
+                chunks.iter().map(|c| c.num_pages as usize * self.page_size).sum::<usize>(),
+                all_tokens.len(),
+            );
+            if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                // tokens_filled was already cleared above (or by build_replay_plan).
+                // Repopulate with the partial page remainder.
+                for i in total_committed_tokens..all_tokens.len() {
+                    ctx.tokens_filled.push(TokenInfo {
+                        token: all_tokens[i],
+                        position: all_positions[i],
+                        mask: all_masks[i].clone(),
+                        adapter: adapters.iter().rev()
+                            .find(|(start, _)| *start <= i)
+                            .and_then(|(_, a)| *a),
+                    });
+                }
+                eprintln!(
+                    "REPOPULATE_DONE ctx={id} tokens_filled_len={}",
+                    ctx.tokens_filled.len(),
+                );
+            }
         }
 
         Ok(chunks)
@@ -575,39 +794,40 @@ impl ContextManager {
     /// After `rollback_replay` has cleaned up Phase 2's allocations, this
     /// swaps Phase 1's working pages back from GPU to CPU, preserving the
     /// data for a future restore attempt.  If the CPU swap fails (no CPU
-    /// slots), the pages are discarded — the context will need full replay.
+    /// slots), returns an error — this is a true OOM and the owning process
+    /// should be failed.
     async fn rollback_phase1_to_cpu(
         &mut self, id: ContextId, dev_idx: usize,
         owner: Option<ProcessId>, pre_phase1_len: usize,
-    ) {
+    ) -> Result<(), anyhow::Error> {
         let phase1_pages = {
             let mut ctx = match CONTEXTS.get_mut(&(self.model_idx, id)) {
                 Some(ctx) => ctx,
-                None => return,
+                None => return Ok(()),
             };
             let current_len = ctx.working_pages.len();
             if current_len <= pre_phase1_len {
-                return;
+                return Ok(());
             }
             ctx.working_pages.drain(pre_phase1_len..).collect::<Vec<_>>()
         };
 
         let n = phase1_pages.len();
 
-        // Try to swap the pages back to CPU (allocates new CPU slots, frees GPU).
+        // Try to swap the pages back to CPU (allocates CPU slots, does NOT free GPU).
         let swap_ops = match self.devices[dev_idx].swap_out_working(&phase1_pages) {
             Ok(ops) => ops,
             Err(_) => {
-                // No CPU pages available — discard (will need full replay).
+                // No CPU slots — true OOM. Free the GPU pages and propagate error.
                 self.devices[dev_idx].free_working(&phase1_pages);
                 if let Some(pid) = owner {
                     self.arbiter.remove_working(pid, dev_idx, n);
                 }
-                return;
+                anyhow::bail!("CPU page pool exhausted during rollback (OOM)");
             }
         };
 
-        // Fire D2H copy RPC (fire-and-forget, same pattern as suspend_context).
+        // Await D2H copy, then free GPU pages (same correctness pattern as suspend_context).
         if !swap_ops.is_empty() {
             #[derive(Serialize)]
             struct SwapOutRequest { phys_ids: Vec<u32>, slots: Vec<PhysicalPageId> }
@@ -615,10 +835,10 @@ impl ContextManager {
                 phys_ids: swap_ops.iter().map(|op| op.gpu_phys).collect(),
                 slots: swap_ops.iter().map(|op| op.cpu_slot).collect(),
             };
-            let dev = dev_idx as DeviceId;
-            tokio::spawn(async move {
-                let _: Result<(), _> = device::call(dev, "swap_out_pages", &request).await;
-            });
+            let _: Result<(), _> = device::call(dev_idx as DeviceId, "swap_out_pages", &request).await;
+            // Now safe to free GPU pages.
+            let gpu_pages: Vec<PhysicalPageId> = swap_ops.iter().map(|op| op.gpu_phys).collect();
+            self.devices[dev_idx].free_working(&gpu_pages);
         }
 
         // Store new CPU slots so the context can be restored again later.
@@ -628,6 +848,7 @@ impl ContextManager {
         if let Some(pid) = owner {
             self.arbiter.remove_working(pid, dev_idx, n);
         }
+        Ok(())
     }
 
     /// Commit a replay chunk using provided data directly, without touching tokens_filled.

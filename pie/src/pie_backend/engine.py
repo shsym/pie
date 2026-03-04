@@ -298,6 +298,40 @@ class Engine:
                 qo_indptr=inputs["qo_indptr"],
             )
 
+        # Bounds-check kv_page_indices before they hit the GPU kernel
+        kv_idx = inputs["kv_page_indices"]
+        max_pages = self.kv_cache_at_layer[0].shape[0]
+        page_size = self.kv_cache_at_layer[0].shape[2]
+        if kv_idx.numel() > 0:
+            kv_max = kv_idx.max().item()
+            kv_min = kv_idx.min().item()
+            if kv_max >= max_pages or kv_min < 0:
+                raise ValueError(
+                    f"fire_batch: kv_page_indices out of bounds: "
+                    f"min={kv_min} max={kv_max} max_pages={max_pages}"
+                )
+
+        # Validate kv_page_indptr: last value must not exceed kv_page_indices length
+        kv_indptr = inputs["kv_page_indptr"]
+        if kv_indptr.numel() > 0:
+            indptr_max = kv_indptr[-1].item()
+            if indptr_max > kv_idx.numel():
+                raise ValueError(
+                    f"fire_batch: kv_page_indptr last={indptr_max} exceeds "
+                    f"kv_page_indices length={kv_idx.numel()}"
+                )
+
+        # Validate kv_last_page_lens: values must be in [1, page_size]
+        kv_last = inputs["kv_last_page_lens"]
+        if kv_last.numel() > 0:
+            last_max = kv_last.max().item()
+            last_min = kv_last.min().item()
+            if last_max > page_size or last_min < 1:
+                raise ValueError(
+                    f"fire_batch: kv_last_page_lens out of range: "
+                    f"min={last_min} max={last_max} page_size={page_size}"
+                )
+
         # Run transformer forward pass
         hidden_states = self.forward_pass.transform(
             input_embeds=input_embeds,

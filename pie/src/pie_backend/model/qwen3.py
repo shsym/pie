@@ -900,6 +900,10 @@ class ForwardPass:
             padding.add_(total_pages_cpu)
             indptr_view[batch_size + 1 :].copy_(padding)
 
+            # Pad KV Page Indices — stale entries would cause FlashInfer
+            # to write KV data to real pages belonging to other contexts.
+            self.shared_kv_indices_buffer[num_indices:].fill_(self.scratch_page_idx)
+
             # Pad Last Len
             last_len_view[batch_size:].fill_(1)
 

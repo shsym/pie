@@ -138,6 +138,11 @@ pub async fn get_physical_page_ids(model_idx: usize, id: ContextId) -> Result<Ha
 pub struct ResidentResult {
     pub replay_chunks: Option<Vec<ReplayFill>>,
     pub pages: HashMap<DeviceId, Vec<PhysicalPageId>>,
+    /// KV length at the time of page resolution — must be used instead of
+    /// context::kv_len() to avoid non-atomic read races.
+    pub kv_len: u32,
+    /// Debug: context state at the time of page resolution (atomic).
+    pub debug_state: String,
 }
 
 pub async fn ensure_resident(model_idx: usize, id: ContextId) -> Result<ResidentResult> {
@@ -200,6 +205,18 @@ pub fn kv_len(model_idx: usize, id: ContextId) -> u32 {
         .unwrap_or(0)
 }
 
+/// Debug: return context state string for diagnostics
+pub fn debug_context_state(model_idx: usize, id: ContextId) -> String {
+    CONTEXTS.get(&(model_idx, id))
+        .map(|ctx| format!(
+            "committed_len={} tokens_filled={} working_pages={} working_cpu={} state={:?}",
+            ctx.committed_len, ctx.tokens_filled.len(),
+            ctx.working_pages.len(), ctx.working_cpu_slots.len(),
+            ctx.state,
+        ))
+        .unwrap_or_else(|| "MISSING".to_string())
+}
+
 pub fn get_cursor(model_idx: usize, id: ContextId) -> u32 {
     CONTEXTS.get(&(model_idx, id)).map(|ctx| ctx.cursor()).unwrap_or(0)
 }
@@ -229,7 +246,13 @@ pub fn clear_in_flight(model_idx: usize, id: ContextId) {
 pub fn set_cursor(model_idx: usize, id: ContextId, cursor: u32) -> Result<()> {
     let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
         .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-    ctx.set_cursor(cursor)
+    let before = ctx.tokens_filled.len();
+    let result = ctx.set_cursor(cursor);
+    let after = ctx.tokens_filled.len();
+    if after < before {
+        eprintln!("SET_CURSOR ctx={id} cursor={cursor} tf_before={before} tf_after={after}");
+    }
+    result
 }
 
 pub fn last_position(model_idx: usize, id: ContextId) -> Option<u32> {
@@ -260,7 +283,13 @@ pub fn fill(
 ) -> Result<()> {
     let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
         .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-    ctx.fill(n, positions, masks, adapter)
+    let before = ctx.tokens_filled.len();
+    let result = ctx.fill(n, positions, masks, adapter);
+    let after = ctx.tokens_filled.len();
+    if after < 50 {
+        eprintln!("FILL ctx={id} n={n} tf_before={before} tf_after={after}");
+    }
+    result
 }
 
 // =============================================================================
@@ -518,7 +547,12 @@ impl ServiceHandler for ContextManager {
                 // update lineage and metadata without GPU page operations.
                 // Equivalent to restore → commit → suspend, but free.
                 if !matches!(state, ContextState::Active | ContextState::InFlight) {
-                    tracing::info!("CommitPages: ctx {id} suspended, performing logical commit");
+                    let tf_before = CONTEXTS.get(&(self.model_idx, id))
+                        .map(|c| c.tokens_filled.len()).unwrap_or(0);
+                    eprintln!(
+                        "LOGICAL_COMMIT ctx={id} state={state:?} \
+                         tokens_filled={tf_before} pages={page_indices:?}"
+                    );
                     let _ = response.send(self.commit_pages_logical(id, page_indices));
                     return;
                 }
@@ -607,18 +641,35 @@ impl ServiceHandler for ContextManager {
                             // Fast path: no replay needed — atomically resolve
                             // pages + pin InFlight in this same actor message.
                             // No eviction can happen between these operations.
-                            let pages = if replay_chunks.is_none() {
+                            let (pages, kv_len, debug_state) = if replay_chunks.is_none() {
                                 let pages = self.get_physical_page_ids(id).unwrap_or_default();
+                                let phys_len = pages.values().map(|v| v.len()).sum::<usize>();
+                                // Compute kv_len and debug state atomically with page resolution
+                                let (kv_len, debug_state) = {
+                                    let page_size = PAGE_SIZES.get(self.model_idx).copied().unwrap_or(0);
+                                    CONTEXTS.get(&(self.model_idx, id))
+                                        .map(|ctx| {
+                                            let kv = (ctx.committed_len * page_size + ctx.tokens_filled.len()) as u32;
+                                            let state = format!(
+                                                "committed_len={} tokens_filled={} working_pages={} working_cpu={} state={:?} phys_len={}",
+                                                ctx.committed_len, ctx.tokens_filled.len(),
+                                                ctx.working_pages.len(), ctx.working_cpu_slots.len(),
+                                                ctx.state, phys_len,
+                                            );
+                                            (kv, state)
+                                        })
+                                        .unwrap_or((0, "MISSING".to_string()))
+                                };
                                 // Pin InFlight: context is never Active while a
                                 // process holds resolved page IDs.
                                 if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
                                     ctx.state = ContextState::InFlight;
                                 }
-                                pages
+                                (pages, kv_len, debug_state)
                             } else {
-                                HashMap::new()
+                                (HashMap::new(), 0, "replay".to_string())
                             };
-                            let _ = response.send(Ok(ResidentResult { replay_chunks, pages }));
+                            let _ = response.send(Ok(ResidentResult { replay_chunks, pages, kv_len, debug_state }));
                         }
                         Err(WaitNeeded::NeedPages) => {
                             tracing::info!("Enqueuing EnsureResident waiter for ctx {id} on dev {dev_idx} (floor={floor:.1})");

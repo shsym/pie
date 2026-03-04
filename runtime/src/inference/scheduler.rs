@@ -422,6 +422,16 @@ impl BatchScheduler {
                         } else if !resp.dists.is_empty() {
                             ForwardPassOutput::Distributions(resp.dists)
                         } else {
+                            if !req.request.sampling_indices.is_empty() {
+                                eprintln!(
+                                    "FP_NONE_FOR_DECODE ctx={} samplers={} tokens={} pages={} lpl={}",
+                                    req.request.context_id,
+                                    req.request.sampling_indices.len(),
+                                    req.request.tokens.len(),
+                                    req.physical_page_ids.len(),
+                                    req.last_page_len,
+                                );
+                            }
                             ForwardPassOutput::None
                         };
                         req.response_tx.send(output).ok();

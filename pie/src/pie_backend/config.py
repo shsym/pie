@@ -171,7 +171,7 @@ class RuntimeConfig:
         telemetry_endpoint: str = "http://localhost:4317",
         telemetry_service_name: str = "pie",
         random_seed: int = 42,
-        use_cuda_graphs: bool = True,
+        use_cuda_graphs: bool = False,
         tensor_parallel_size: int = 1,
         dummy_mode: bool = False,
         cpu_mem_budget_in_gb: int = 0,

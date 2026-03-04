@@ -120,7 +120,7 @@ pub async fn bootstrap(
         context::spawn(cfg.kv_page_size, num_gpu_pages, num_cpu_pages);
         inference::spawn(
             &devices,
-            cfg.scheduler.max_in_flight_batches,
+            1, // HARDCODED TO 1 TO PREVENT PIPELINED KV CACHE CORRUPTION
             cfg.scheduler.request_timeout_secs,
             cfg.scheduler.max_wait_ms,
             cfg.scheduler.min_batch_for_optimization,
@@ -172,7 +172,6 @@ fn verify_config(config: &Config) -> Result<()> {
         }
 
         let sched = &model.scheduler;
-        ensure!(sched.max_in_flight_batches > 0, "Model {:?}: max_in_flight_batches must be > 0", model.name);
         ensure!(sched.request_timeout_secs > 0, "Model {:?}: request_timeout_secs must be > 0", model.name);
     }
 
