@@ -243,19 +243,44 @@ impl DevicePageCache {
         old_tip: Option<PageHash>,
         new_phys_pages: &[PhysicalPageId],
     ) {
+        // When all committed pages hit dedup, new_tip == old_tip.
+        // The index_cache entry is already correct — skip the update.
+        // Without this guard, the entry would be doubled:
+        //   remove([P0,P1]) + extend([P0,P1]) = [P0,P1,P0,P1]
+        // which inflates num_pages and causes FlashInfer to read
+        // garbage KV past the actual data.
+        if old_tip == Some(new_tip) {
+            return;
+        }
+
         // Try to reuse old tip's cached page table
         let mut page_table = match old_tip {
             Some(old) => self.index_cache.remove(&old).unwrap_or_default(),
             None => Vec::new(),
         };
 
-        // If empty (cache miss or first commit), rebuild from chain
+        // If empty (cache miss — entry stolen by another context's commit
+        // for the same shared hash, or first commit), rebuild from chain.
         if page_table.is_empty() && old_tip.is_some() {
-            page_table = self.rebuild_page_table(old_tip.unwrap());
+            page_table = self.resolve_physical(old_tip.unwrap());
         }
 
         page_table.extend_from_slice(new_phys_pages);
-        self.index_cache.insert(new_tip, page_table);
+
+        // Validate: the page table length must equal the full chain length
+        // for the new tip. If it's undersized (due to evicted pages in the
+        // old chain), do NOT cache — a stale entry would permanently corrupt
+        // subsequent commits that build on it.
+        let chain_len = self.walk_chain(new_tip).len();
+        if page_table.len() == chain_len {
+            self.index_cache.insert(new_tip, page_table);
+        } else {
+            eprintln!(
+                "UPDATE_INDEX_CACHE_SKIP new_tip={new_tip} chain_len={chain_len} \
+                 page_table_len={} (undersized, not caching)",
+                page_table.len(),
+            );
+        }
     }
 
     /// Remove an index_cache entry (e.g., when context is destroyed or suspended).
@@ -320,6 +345,30 @@ impl DevicePageCache {
         self.refcount.get(&hash).copied().unwrap_or(0)
     }
 
+    /// Insert a chain link (hash → prev_hash) without creating a page or refcount entry.
+    /// Used by commit_pages_logical for metadata-only commits where no GPU page exists.
+    pub fn insert_chain_link(&mut self, hash: PageHash, prev_hash: PageHash) {
+        self.chain.insert(hash, prev_hash);
+    }
+
+    /// Return the length of the index_cache entry for a tip (None if not cached).
+    pub fn index_cache_len(&self, tip: PageHash) -> Option<usize> {
+        self.index_cache.get(&tip).map(|v| v.len())
+    }
+
+    /// Debug: walk chain from tip and return per-hash info (refcount + residency).
+    pub fn debug_chain_info(&self, tip: PageHash) -> String {
+        let chain = self.walk_chain(tip);
+        chain.iter()
+            .map(|h| {
+                let rc = self.refcount.get(h).copied().unwrap_or(0);
+                let resident = self.pages.contains_key(h);
+                format!("rc={rc},res={resident}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     // =========================================================================
     // Physical page resolution
     // =========================================================================
@@ -328,10 +377,38 @@ impl DevicePageCache {
     /// O(1) if the tip is in index_cache; otherwise rebuilds from chain + pages.
     pub fn resolve_physical(&mut self, tip: PageHash) -> Vec<PhysicalPageId> {
         if let Some(cached) = self.index_cache.get(&tip) {
-            return cached.clone();
+            // Validate: cache must have exactly as many entries as the chain.
+            // Inter-context cache key collisions (shared dedup PageHash as key)
+            // can cause another context's commit to steal/corrupt this entry.
+            let chain_len = self.walk_chain(tip).len();
+            if cached.len() == chain_len {
+                return cached.clone();
+            }
+            // Stale: remove and fall through to rebuild
+            self.index_cache.remove(&tip);
         }
-        let table = self.rebuild_page_table(tip);
-        // Cache it for future lookups
+        let chain = self.walk_chain(tip);
+        let chain_len = chain.len();
+        let table: Vec<PhysicalPageId> = chain.iter()
+            .filter_map(|h| self.pages.get(h).copied())
+            .collect();
+        if table.len() != chain_len {
+            // Log details for first few missing hashes
+            let missing: Vec<_> = chain.iter()
+                .filter(|h| !self.pages.contains_key(h))
+                .take(3)
+                .map(|h| format!("h={h} rc={}", self.refcount.get(h).copied().unwrap_or(0)))
+                .collect();
+            eprintln!(
+                "RESOLVE_REBUILD_MISMATCH tip={tip} chain_len={chain_len} \
+                 resolved={} missing={} details=[{}]",
+                table.len(), chain_len - table.len(), missing.join(", "),
+            );
+            // Do NOT cache: undersized result would permanently corrupt
+            // subsequent update_index_cache calls that build on this base.
+            return table;
+        }
+        // Cache only complete results
         self.index_cache.insert(tip, table.clone());
         table
     }
@@ -339,9 +416,17 @@ impl DevicePageCache {
     /// Rebuild a page table from chain links + per-hash physical pages.
     fn rebuild_page_table(&self, tip: PageHash) -> Vec<PhysicalPageId> {
         let chain = self.walk_chain(tip);
-        chain.iter()
+        let table: Vec<PhysicalPageId> = chain.iter()
             .filter_map(|h| self.pages.get(h).copied())
-            .collect()
+            .collect();
+        if table.len() != chain.len() {
+            tracing::warn!(
+                "rebuild_page_table: chain has {} hashes but only {} are GPU-resident \
+                 (skipped {} evicted pages!) tip={tip}",
+                chain.len(), table.len(), chain.len() - table.len()
+            );
+        }
+        table
     }
 
     /// Check if a specific hash has a GPU-resident physical page.
@@ -383,7 +468,6 @@ impl DevicePageCache {
 
         Ok(allocated)
     }
-
     /// Free working pages back to the GPU pool.
     pub fn free_working(&mut self, pages: &[PhysicalPageId]) {
         for &p in pages {
@@ -392,6 +476,10 @@ impl DevicePageCache {
     }
 
     /// Free CPU slots back to the CPU pool (for suspended working pages).
+    ///
+    /// Must be called AFTER the async swap-in RPC completes. Freeing
+    /// before the H2D copy finishes allows another context's D2H copy
+    /// to overwrite the buffer → corrupted KV data.
     pub fn free_cpu_slots(&mut self, slots: &[PhysicalPageId]) {
         for &s in slots {
             self.cpu.free(s);
@@ -400,6 +488,9 @@ impl DevicePageCache {
 
     /// Swap working pages from GPU to CPU.
     /// Returns swap operations for the RPC layer.
+    ///
+    /// **Does NOT free GPU pages.** The caller must free them AFTER the
+    /// D2H copy completes to prevent use-after-free corruption.
     pub fn swap_out_working(&mut self, gpu_pages: &[PhysicalPageId]) -> Result<Vec<SwapOp>> {
         // Phase 1: Allocate all CPU slots. Roll back on partial failure.
         let mut cpu_slots = Vec::with_capacity(gpu_pages.len());
@@ -415,10 +506,10 @@ impl DevicePageCache {
             }
         }
 
-        // Phase 2: All CPU slots secured — free GPU pages and build ops.
+        // Phase 2: Build ops. GPU pages are NOT freed here — the caller
+        // must free them after the D2H copy completes.
         let ops: Vec<SwapOp> = gpu_pages.iter().zip(cpu_slots.into_iter())
             .map(|(&gpu_phys, cpu_slot)| {
-                self.gpu.free(gpu_phys);
                 SwapOp { gpu_phys, cpu_slot }
             })
             .collect();
@@ -444,10 +535,11 @@ impl DevicePageCache {
             }
         }
 
-        // Phase 2: All GPU pages secured — build ops and free CPU slots.
+        // Phase 2: Build swap ops. Do NOT free CPU slots here — they must
+        // remain allocated until the H2D copy completes. The caller
+        // (restore_working_pages) frees them after the RPC finishes.
         let ops: Vec<SwapOp> = gpu_pages.into_iter().zip(cpu_slots.iter())
             .map(|(gpu_phys, &cpu_slot)| {
-                self.cpu.free(cpu_slot);
                 SwapOp { gpu_phys, cpu_slot }
             })
             .collect();

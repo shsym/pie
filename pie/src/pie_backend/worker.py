@@ -470,25 +470,55 @@ def _leader_loop(
         return {"results": results}
 
     def _handle_swap_out_pages(**kwargs) -> None:
-        """D2H: copy GPU KV pages to pinned CPU buffers (vectorized per layer)."""
+        """D2H: copy GPU KV pages to pinned CPU buffers (vectorized per layer).
+
+        NOTE: tensor[idx].copy_(src) with advanced (fancy) indexing is a NO-OP
+        in PyTorch — it creates a temporary copy and .copy_() writes to the
+        temporary, which is then discarded. We use index_copy_ instead, which
+        correctly scatter-writes to the original tensor.
+        """
         import torch
         gpu_kv = engine.kv_cache_at_layer
         host_kv = engine.kv_cache_at_layer_host
-        src = torch.tensor(kwargs["phys_ids"], dtype=torch.long, device=gpu_kv[0].device)
-        dst = torch.tensor(kwargs["slots"], dtype=torch.long)
+        phys_ids = kwargs["phys_ids"]
+        slots = kwargs["slots"]
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for p in phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"swap_out: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"swap_out: CPU slot {s} out of bounds [0, {max_cpu})")
+        src = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(slots, dtype=torch.long)
         for layer_idx in range(len(gpu_kv)):
-            host_kv[layer_idx][dst].copy_(gpu_kv[layer_idx][src], non_blocking=True)
+            host_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src].cpu())
         torch.cuda.synchronize()
 
     def _handle_swap_in_pages(**kwargs) -> None:
-        """H2D: copy pinned CPU buffers back to GPU KV pages (vectorized per layer)."""
+        """H2D: copy pinned CPU buffers back to GPU KV pages (vectorized per layer).
+
+        NOTE: Same as swap_out — must use index_copy_ to avoid the fancy
+        indexing no-op bug with tensor[idx].copy_().
+        """
         import torch
         gpu_kv = engine.kv_cache_at_layer
         host_kv = engine.kv_cache_at_layer_host
-        dst = torch.tensor(kwargs["phys_ids"], dtype=torch.long, device=gpu_kv[0].device)
-        src = torch.tensor(kwargs["slots"], dtype=torch.long)
+        phys_ids = kwargs["phys_ids"]
+        slots = kwargs["slots"]
+        max_gpu = gpu_kv[0].shape[0]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for p in phys_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"swap_in: GPU phys_id {p} out of bounds [0, {max_gpu})")
+        for s in slots:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"swap_in: CPU slot {s} out of bounds [0, {max_cpu})")
+        dst = torch.tensor(phys_ids, dtype=torch.long, device=gpu_kv[0].device)
+        src = torch.tensor(slots, dtype=torch.long)
         for layer_idx in range(len(gpu_kv)):
-            gpu_kv[layer_idx][dst].copy_(host_kv[layer_idx][src], non_blocking=True)
+            gpu_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src].to(gpu_kv[layer_idx].device))
         torch.cuda.synchronize()
 
     # Method dispatch table

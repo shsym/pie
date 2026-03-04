@@ -270,7 +270,7 @@ def _bootstrap(
         tokenizer_path=str(Path(group0_meta.get("snapshot_dir", "")) / "tokenizer.json"),
         devices=py_devices,
         scheduler=pie_runtime.SchedulerConfig(
-            max_in_flight_batches=4,
+            max_in_flight_batches=1,
             request_timeout_secs=120,
             max_wait_ms=50,
             min_batch_for_optimization=8,

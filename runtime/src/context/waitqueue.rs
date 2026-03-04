@@ -9,7 +9,7 @@ use anyhow::Result;
 use crate::process::ProcessId;
 use crate::device::DeviceId;
 
-use super::{CONTEXTS, ContextId, ContextState, ResidentResult};
+use super::{CONTEXTS, ContextId, ContextState, PAGE_SIZES, ResidentResult};
 use super::manager::ContextManager;
 use std::collections::HashMap;
 
@@ -210,17 +210,32 @@ impl ContextManager {
                         match self.ensure_resident(context_id).await {
                             Ok(replay_chunks) => {
                                 // Fast path: atomically resolve pages + pin InFlight
-                                let pages = if replay_chunks.is_none() {
+                                let (pages, kv_len, debug_state) = if replay_chunks.is_none() {
                                     let pages = self.get_physical_page_ids(context_id).unwrap_or_default();
+                                    let (kv_len, debug_state) = {
+                                        let page_size = PAGE_SIZES.get(self.model_idx).copied().unwrap_or(0);
+                                        CONTEXTS.get(&(self.model_idx, context_id))
+                                            .map(|ctx| {
+                                                let kv = (ctx.committed_len * page_size + ctx.tokens_filled.len()) as u32;
+                                                let state = format!(
+                                                    "committed_len={} tokens_filled={} working_pages={} working_cpu={} state={:?}",
+                                                    ctx.committed_len, ctx.tokens_filled.len(),
+                                                    ctx.working_pages.len(), ctx.working_cpu_slots.len(),
+                                                    ctx.state,
+                                                );
+                                                (kv, state)
+                                            })
+                                            .unwrap_or((0, "MISSING".to_string()))
+                                    };
                                     if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, context_id)) {
                                         ctx.state = ContextState::InFlight;
                                     }
-                                    pages
+                                    (pages, kv_len, debug_state)
                                 } else {
-                                    HashMap::new()
+                                    (HashMap::new(), 0, "replay".to_string())
                                 };
                                 served += 1;
-                                if response.send(Ok(ResidentResult { replay_chunks, pages })).is_err() {
+                                if response.send(Ok(ResidentResult { replay_chunks, pages, kv_len, debug_state })).is_err() {
                                     // Process died while waiting — context is now InFlight
                                     // but orphaned. Pages will be freed when it's eventually
                                     // evicted or destroyed.

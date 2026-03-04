@@ -117,7 +117,7 @@ pub struct SchedulerConfig {
 impl SchedulerConfig {
     #[new]
     #[pyo3(signature = (
-        max_in_flight_batches = 4,
+        max_in_flight_batches = 1,
         request_timeout_secs = 120,
         max_wait_ms = 50,
         min_batch_for_optimization = 8,
@@ -129,7 +129,7 @@ impl SchedulerConfig {
         min_batch_for_optimization: usize,
     ) -> Self {
         SchedulerConfig {
-            max_in_flight_batches,
+            max_in_flight_batches: 1, // HARDCODED TO 1 TO PREVENT PIPELINED KV CACHE CORRUPTION
             request_timeout_secs,
             max_wait_ms,
             min_batch_for_optimization,
@@ -214,7 +214,7 @@ impl ModelConfig {
             kv_page_size,
             tokenizer_path,
             devices,
-            scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(4, 120, 50, 8)),
+            scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(1, 120, 50, 8)),
         }
     }
 }

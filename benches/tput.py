@@ -116,8 +116,11 @@ async def run_benchmark(args):
                     break
 
                 try:
+                    req_input = inferlet_input
+                    if getattr(args, 'unique_prompts', False):
+                        req_input = {**inferlet_input, "prompt": f"{inferlet_input['prompt']} (Request #{req_id})"}
                     process = await client.launch_process(
-                        inferlet_name, input=inferlet_input,
+                        inferlet_name, input=req_input,
                     )
                     req_chars = 0
                     req_text = []
@@ -134,10 +137,9 @@ async def run_benchmark(args):
                             total_chars += req_chars
                             total_tokens_est += req_chars / 4.0
                             completed += 1
-                            # Save sample outputs
+                            # Save output
                             async with output_lock:
-                                if len(output_samples) < args.num_samples:
-                                    output_samples.append((req_id, "".join(req_text)))
+                                output_samples.append((req_id, "".join(req_text)))
                             print(".", end="", flush=True)
                             break
                         elif event == Event.Error:
@@ -195,6 +197,7 @@ def main():
     parser.add_argument("--cpu-mem-budget", type=int, default=0, help="CPU memory budget in GB for working page swap (0 = disabled)")
     parser.add_argument("--save-outputs", type=str, default=None, help="Save output samples to this file path")
     parser.add_argument("--num-samples", type=int, default=10, help="Number of output samples to save (default: 10)")
+    parser.add_argument("--unique-prompts", action="store_true", help="Make each request's prompt unique (append request #N)")
 
     args = parser.parse_args()
 

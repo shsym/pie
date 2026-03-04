@@ -167,7 +167,16 @@ impl ContextManager {
         let working = ctx.working_pages.clone();
         let working_cpu = ctx.working_cpu_slots.clone();
         let working_len = ctx.working_pages.len();
+        let was_suspended = ctx.state == ContextState::Suspended;
+        let chain_already_released = ctx.state == ContextState::Suspended
+            || ctx.state == ContextState::Restoring;
+        let state = ctx.state;
         drop(ctx);
+
+        eprintln!(
+            "DESTROY ctx={id} state={state:?} tip={:?} committed_len={} working={working_len} was_suspended={was_suspended}",
+            pin.tip, pin.committed_len,
+        );
 
         CONTEXTS.remove(&(self.model_idx, id));
 
@@ -177,9 +186,17 @@ impl ContextManager {
             self.arbiter.remove_working(pid, pin.dev_idx, working_len);
         }
 
+        // Only release the chain if it hasn't already been released.
+        // Suspended contexts had release_chain called by suspend_context.
+        // Restoring contexts were originally Suspended (chain released),
+        // then partially restored — release_chain(modified_tip) would walk
+        // past the prefix into pre-prefix pages that were never re-acquired,
+        // causing unmatched decrements on shared pages.
         if let Some(tip_hash) = pin.tip {
             if let Some(dev) = self.devices.get_mut(pin.dev_idx) {
-                dev.release_chain(tip_hash);
+                if !chain_already_released {
+                    dev.release_chain(tip_hash);
+                }
                 dev.remove_index_cache(tip_hash);
             }
         }
@@ -364,6 +381,14 @@ impl ContextManager {
         let page_size = self.page_size;
         let ctx = self.ctx(id)?;
 
+        // If the context was evicted between clear_in_flight and commit_pages,
+        // its working_pages are empty. Fall back to logical commit which
+        // handles the commit purely via metadata without needing GPU pages.
+        if ctx.working_pages.is_empty() && !indices.is_empty() {
+            drop(ctx);
+            return self.commit_pages_logical(id, indices);
+        }
+
         for &idx in &indices {
             if idx as usize >= ctx.working_pages.len() {
                 anyhow::bail!("Invalid page index: {}", idx);
@@ -508,8 +533,22 @@ impl ContextManager {
         drop(ctx);
 
         let hashes = self.devices[dev_idx].compute_page_hashes(&tokens, &positions, &masks, prev_hash);
+
         let new_tip = *hashes.last()
             .ok_or_else(|| anyhow::anyhow!("No page hashes computed during logical commit"))?;
+
+        // Insert chain links so walk_chain(new_tip) can traverse the full
+        // committed chain. These pages have no GPU-resident physical data
+        // (no self.pages entry, no refcount) — they'll be classified as
+        // "discarded" by classify_chain, triggering replay when needed.
+        {
+            let dev = &mut self.devices[dev_idx];
+            let mut running_prev = prev_hash;
+            for &hash in &hashes {
+                dev.insert_chain_link(hash, running_prev);
+                running_prev = hash;
+            }
+        }
 
         // Update metadata only — no physical page operations
         let owner = {
