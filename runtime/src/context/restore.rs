@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use super::{
     ContextId, ContextManager, ContextState, ProcessState,
     Record, ReplayFill, ResidentResult,
-    CONTEXTS, PAGE_SIZES,
+    BUFFERS, PAGE_SIZES,
 };
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
 use crate::device::DeviceId;
@@ -34,11 +34,11 @@ impl ContextManager {
 
         // Restore all contexts for this process
         for &ctx_id in &ctx_ids {
-            if let Some(ctx) = CONTEXTS.get(&(self.model_idx, ctx_id)) {
-                if ctx.state == ContextState::Suspended {
-                    drop(ctx);
-                    self.restore_context(ctx_id)?;
-                }
+            let is_suspended = self.contexts.get(&ctx_id)
+                .map(|c| c.state == ContextState::Suspended)
+                .unwrap_or(false);
+            if is_suspended {
+                self.restore_context(ctx_id)?;
             }
         }
 
@@ -51,24 +51,15 @@ impl ContextManager {
         let pages = self.get_physical_page_ids_impl(requesting_ctx_id)?;
         let phys_len: usize = pages.values().map(|v| v.len()).sum();
 
-        let (kv_len, debug_state) = {
-            let page_size = PAGE_SIZES.get(self.model_idx).copied().unwrap_or(0);
-            CONTEXTS.get(&(self.model_idx, requesting_ctx_id))
-                .map(|ctx| {
-                    let kv = (ctx.committed_len * page_size + ctx.tokens_filled.len()) as u32;
-                    let state = format!(
-                        "committed_len={} tokens_filled={} working_pages={} working_cpu={} state={:?} phys_len={}",
-                        ctx.committed_len, ctx.tokens_filled.len(),
-                        ctx.working_pages.len(), ctx.working_cpu_slots.len(),
-                        ctx.state, phys_len,
-                    );
-                    (kv, state)
-                })
-                .unwrap_or((0, "MISSING".to_string()))
-        };
+        let page_size = PAGE_SIZES.get(self.model_idx).copied().unwrap_or(0);
+        let kv_len = BUFFERS.get(&(self.model_idx, requesting_ctx_id))
+            .map(|b| (b.committed_len * page_size + b.tokens_filled.len()) as u32)
+            .unwrap_or(0);
+
+        let debug_state = self.build_debug_state(requesting_ctx_id);
 
         // Pin context as non-evictable
-        if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, requesting_ctx_id)) {
+        if let Some(ctx) = self.contexts.get_mut(&requesting_ctx_id) {
             ctx.state = ContextState::Pinned;
         }
 
@@ -96,16 +87,16 @@ impl ContextManager {
     /// Phase 1: Swap-in working pages from CPU → GPU
     /// Phase 2: Rebuild committed chain via prefix match + acquire
     pub(crate) fn restore_context(&mut self, ctx_id: ContextId) -> anyhow::Result<()> {
-        let ctx = self.ctx(ctx_id)?;
+        let ctx = self.contexts.get(&ctx_id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         if ctx.state != ContextState::Suspended {
             return Ok(()); // Already active
         }
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let cpu_slots = ctx.working_cpu_slots.clone();
+        let cpu_slots = ctx.working_pages_cpu.clone();
         let tip = ctx.committed_tip;
         let owner = ctx.owner;
-        drop(ctx);
 
         // Phase 1: Swap-in working pages from CPU → GPU
         if !cpu_slots.is_empty() {
@@ -114,9 +105,9 @@ impl ContextManager {
 
             let new_gpu_pages: Vec<PhysicalPageId> = swap_ops.iter().map(|op| op.gpu_phys).collect();
 
-            if let Ok(mut ctx) = self.ctx_mut(ctx_id) {
+            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                 ctx.working_pages = new_gpu_pages.clone();
-                ctx.working_cpu_slots.clear();
+                ctx.working_pages_cpu.clear();
             }
 
             if let Some(pid) = owner {
@@ -132,7 +123,6 @@ impl ContextManager {
 
             // Acquire refcounts for prefix-matched pages
             if prefix_len > 0 {
-                // Walk chain to the prefix tip and acquire
                 let prefix_tip = chain[prefix_len - 1];
                 dev.acquire_chain(prefix_tip);
             }
@@ -146,7 +136,7 @@ impl ContextManager {
         }
 
         // Phase 3: Mark context as Active
-        if let Ok(mut ctx) = self.ctx_mut(ctx_id) {
+        if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
             ctx.state = ContextState::Active;
             ctx.pending_suspend = false;
         }
@@ -157,12 +147,11 @@ impl ContextManager {
     /// Build replay chunks for pages that need to be re-computed after restore.
     /// Returns empty vec if no replay is needed (full prefix match).
     fn build_replay_chunks(&mut self, ctx_id: ContextId) -> anyhow::Result<Vec<ReplayFill>> {
-        let ctx = self.ctx(ctx_id)?;
+        let ctx = self.contexts.get(&ctx_id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let tip = ctx.committed_tip;
         let lineage = ctx.lineage.clone();
-        let committed_len = ctx.committed_len;
-        drop(ctx);
 
         let tip_hash = match tip {
             Some(h) => h,
@@ -178,7 +167,6 @@ impl ContextManager {
         }
 
         // Compute how many tokens need replay
-        let pages_to_replay = chain.len() - prefix_len;
         let page_size = self.page_size;
         let skip_tokens = prefix_len * page_size;
 
@@ -200,8 +188,6 @@ impl ContextManager {
 
                     let start_in_record = skip_tokens.saturating_sub(lineage_offset);
                     let chunk_tokens = &tokens[start_in_record..];
-                    let chunk_positions = &positions[start_in_record..];
-                    let chunk_masks = &mask[start_in_record..];
 
                     // Split into page-aligned chunks
                     for (i, page_tokens) in chunk_tokens.chunks(page_size).enumerate() {
@@ -246,19 +232,19 @@ impl ContextManager {
     pub(crate) fn commit_replay_chunk_impl(
         &mut self,
         id: ContextId,
-        num_pages: u32,
+        _num_pages: u32,
         tokens: Vec<u32>,
         positions: Vec<u32>,
         masks: Vec<crate::inference::brle::Brle>,
-        adapter: Option<crate::adapter::AdapterId>,
+        _adapter: Option<crate::adapter::AdapterId>,
     ) -> anyhow::Result<()> {
-        let ctx = self.ctx(id)?;
+        let ctx = self.contexts.get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let prev_hash = ctx.committed_tip.unwrap_or(0);
         let old_tip = ctx.committed_tip;
         let working_phys = ctx.working_pages.clone();
         let owner = ctx.owner;
-        drop(ctx);
 
         let dev = &mut self.devices[dev_idx];
         let hashes = dev.compute_page_hashes(&tokens, &positions, &masks, prev_hash);
@@ -277,12 +263,17 @@ impl ContextManager {
             .ok_or_else(|| anyhow::anyhow!("No hashes computed during replay commit"))?;
         dev.update_index_cache(new_tip, old_tip, &new_phys);
 
-        {
-            let mut ctx = self.ctx_mut(id)?;
+        // Update Context (local)
+        if let Some(ctx) = self.contexts.get_mut(&id) {
             ctx.committed_tip = Some(new_tip);
             // Drain the working pages that were committed during replay
             let to_remove = new_phys.len().min(ctx.working_pages.len());
             ctx.working_pages.drain(..to_remove);
+        }
+
+        // Update ContextBuffer (DashMap) — increment committed_len
+        if let Some(mut buf) = self.buf_mut(id) {
+            buf.committed_len += new_phys.len();
         }
 
         if let Some(pid) = owner {
@@ -294,7 +285,7 @@ impl ContextManager {
 
     /// Finish restoration: transition context from replay to fully active.
     pub(crate) fn finish_restore_impl(&mut self, id: ContextId) {
-        if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+        if let Some(ctx) = self.contexts.get_mut(&id) {
             ctx.state = ContextState::Pinned;
         }
     }

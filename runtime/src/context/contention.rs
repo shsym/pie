@@ -19,7 +19,7 @@ use crate::process::ProcessId;
 
 use super::{
     ContextId, ContextManager, ContextState, ProcessState,
-    CONTEXTS, PAGE_SIZES, ResidentResult,
+    BUFFERS, PAGE_SIZES, ResidentResult,
 };
 use super::pagestore::PhysicalPageId;
 
@@ -101,14 +101,13 @@ impl ContextManager {
             return;
         }
 
-        let ctx = match self.ctx(id) {
-            Ok(c) => c,
-            Err(e) => { let _ = response.send(Err(e)); return; }
+        let ctx = match self.contexts.get(&id) {
+            Some(c) => c,
+            None => { let _ = response.send(Err(anyhow::anyhow!("Context not found"))); return; }
         };
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let owner = ctx.owner;
         let current_working = ctx.working_pages.len();
-        drop(ctx);
 
         let additional = (num_pages as usize).saturating_sub(current_working);
         if additional == 0 {
@@ -169,7 +168,7 @@ impl ContextManager {
         owner: Option<ProcessId>,
     ) {
         let n = pages.len();
-        if let Ok(mut ctx) = self.ctx_mut(id) {
+        if let Some(ctx) = self.contexts.get_mut(&id) {
             ctx.working_pages.extend(pages);
             ctx.device = Some(dev_idx as DeviceId);
         }
@@ -231,27 +230,29 @@ impl ContextManager {
 
         let mut all_suspended = true;
 
-        for ctx_id in &ctx_ids {
-            if let Some(ctx) = CONTEXTS.get(&(self.model_idx, *ctx_id)) {
-                let dev = ctx.device.unwrap_or(0) as usize;
-                if dev != dev_idx { continue; }
+        for &ctx_id in &ctx_ids {
+            let state = match self.contexts.get(&ctx_id) {
+                Some(ctx) => {
+                    let dev = ctx.device.unwrap_or(0) as usize;
+                    if dev != dev_idx { continue; }
+                    ctx.state
+                }
+                None => continue,
+            };
 
-                match ctx.state {
-                    ContextState::Active => {
-                        drop(ctx);
-                        self.suspend_context(*ctx_id);
+            match state {
+                ContextState::Active => {
+                    self.suspend_context(ctx_id);
+                }
+                ContextState::Pinned => {
+                    // Deferred suspension
+                    if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                        ctx.pending_suspend = true;
                     }
-                    ContextState::Pinned => {
-                        drop(ctx);
-                        // Deferred suspension
-                        if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, *ctx_id)) {
-                            ctx.pending_suspend = true;
-                        }
-                        all_suspended = false;
-                    }
-                    ContextState::Suspended => {
-                        // Already suspended, nothing to do
-                    }
+                    all_suspended = false;
+                }
+                ContextState::Suspended => {
+                    // Already suspended, nothing to do
                 }
             }
         }
@@ -269,16 +270,12 @@ impl ContextManager {
 
     /// Suspend a single Active context: swap working pages GPU→CPU, release chain.
     pub(crate) fn suspend_context(&mut self, ctx_id: ContextId) {
-        let ctx = match self.ctx(ctx_id) {
-            Ok(c) => c,
-            Err(_) => return,
+        let (dev_idx, working, tip) = match self.contexts.get(&ctx_id) {
+            Some(ctx) if ctx.state == ContextState::Active => {
+                (ctx.device.unwrap_or(0) as usize, ctx.working_pages.clone(), ctx.committed_tip)
+            }
+            _ => return,
         };
-        if ctx.state != ContextState::Active { return; }
-
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let working = ctx.working_pages.clone();
-        let tip = ctx.committed_tip;
-        drop(ctx);
 
         // Phase 1: Swap working pages to CPU
         if !working.is_empty() {
@@ -286,16 +283,15 @@ impl ContextManager {
             match dev.swap_out(&working) {
                 Ok(swap_ops) => {
                     let cpu_slots: Vec<PhysicalPageId> = swap_ops.iter().map(|op| op.cpu_slot).collect();
-                    if let Ok(mut ctx) = self.ctx_mut(ctx_id) {
+                    if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                         ctx.working_pages.clear();
-                        ctx.working_cpu_slots = cpu_slots;
+                        ctx.working_pages_cpu = cpu_slots;
                     }
                 }
                 Err(e) => {
                     eprintln!("SUSPEND_SWAP_FAIL ctx={ctx_id} err={e}");
                     // Continue with suspension anyway — lose working pages
-                    // Extract working pages before borrowing devices
-                    let pages_to_free: Vec<PhysicalPageId> = if let Ok(mut ctx) = self.ctx_mut(ctx_id) {
+                    let pages_to_free = if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                         let pages = ctx.working_pages.clone();
                         ctx.working_pages.clear();
                         pages
@@ -316,7 +312,7 @@ impl ContextManager {
         }
 
         // Phase 3: Mark suspended
-        if let Ok(mut ctx) = self.ctx_mut(ctx_id) {
+        if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
             ctx.state = ContextState::Suspended;
             ctx.pending_suspend = false;
         }
@@ -329,33 +325,25 @@ impl ContextManager {
 
     /// Handle ClearPinned message: Pinned → Active, then check deferred suspension.
     pub(crate) fn handle_clear_pinned(&mut self, id: ContextId) {
-        let pending = if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
-            if ctx.state == ContextState::Pinned {
+        let pending = match self.contexts.get_mut(&id) {
+            Some(ctx) if ctx.state == ContextState::Pinned => {
                 let pending = ctx.pending_suspend;
-                if pending {
-                    // Deferred suspension: Pinned → Active → Suspended
-                    ctx.state = ContextState::Active;
-                    ctx.pending_suspend = false;
-                } else {
-                    ctx.state = ContextState::Active;
-                }
+                ctx.state = ContextState::Active;
+                ctx.pending_suspend = false;
                 pending
-            } else {
-                false
             }
-        } else {
-            return;
+            _ => return,
         };
 
         if pending {
             self.suspend_context(id);
 
             // Check if the owning process should transition to Pending
-            let owner = CONTEXTS.get(&(self.model_idx, id)).and_then(|c| c.owner);
+            let owner = self.contexts.get(&id).and_then(|c| c.owner);
             if let Some(pid) = owner {
                 let all_suspended = self.processes.get(&pid)
                     .map(|p| p.context_ids.iter().all(|&cid| {
-                        CONTEXTS.get(&(self.model_idx, cid))
+                        self.contexts.get(&cid)
                             .map(|c| c.state == ContextState::Suspended)
                             .unwrap_or(true)
                     }))
@@ -418,12 +406,11 @@ impl ContextManager {
 
     /// Handle EnsureResident: check if context is resident, restore if needed.
     pub(crate) fn handle_ensure_resident(&mut self, id: ContextId) -> anyhow::Result<ResidentResult> {
-        let ctx = self.ctx(id)?;
+        let ctx = self.contexts.get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let state = ctx.state;
         let owner = ctx.owner;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let has_cpu_working = !ctx.working_cpu_slots.is_empty();
-        drop(ctx);
 
         match state {
             ContextState::Active | ContextState::Pinned => {
@@ -431,24 +418,16 @@ impl ContextManager {
                 let pages = self.get_physical_page_ids_impl(id)?;
                 let phys_len: usize = pages.values().map(|v| v.len()).sum();
 
-                let (kv_len, debug_state) = {
-                    let page_size = PAGE_SIZES.get(self.model_idx).copied().unwrap_or(0);
-                    CONTEXTS.get(&(self.model_idx, id))
-                        .map(|ctx| {
-                            let kv = (ctx.committed_len * page_size + ctx.tokens_filled.len()) as u32;
-                            let state = format!(
-                                "committed_len={} tokens_filled={} working_pages={} working_cpu={} state={:?} phys_len={}",
-                                ctx.committed_len, ctx.tokens_filled.len(),
-                                ctx.working_pages.len(), ctx.working_cpu_slots.len(),
-                                ctx.state, phys_len,
-                            );
-                            (kv, state)
-                        })
-                        .unwrap_or((0, "MISSING".to_string()))
-                };
+                let page_size = PAGE_SIZES.get(self.model_idx).copied().unwrap_or(0);
+                let buf = BUFFERS.get(&(self.model_idx, id));
+                let kv_len = buf.as_ref()
+                    .map(|b| (b.committed_len * page_size + b.tokens_filled.len()) as u32)
+                    .unwrap_or(0);
+
+                let debug_state = self.build_debug_state(id);
 
                 // Pin as non-evictable
-                if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                if let Some(ctx) = self.contexts.get_mut(&id) {
                     ctx.state = ContextState::Pinned;
                 }
 
@@ -460,14 +439,11 @@ impl ContextManager {
                 })
             }
             ContextState::Suspended => {
-                // Need restoration — enqueue in try_restore or attempt immediately
+                // Need restoration — attempt immediately
                 if let Some(pid) = owner {
-                    let floor = self.arbiter.priority_at(&pid, self.arbiter.pages_on(&pid, dev_idx) + 1);
-
                     match self.try_restore_process(pid, id) {
                         Ok(result) => Ok(result),
                         Err(_) => {
-                            // Not enough pages — this will be communicated back to caller
                             anyhow::bail!("Insufficient pages for restoration")
                         }
                     }
