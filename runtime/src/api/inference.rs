@@ -12,7 +12,7 @@ use crate::inference::structured::json_schema::{builtin_json_grammar, json_schem
 use crate::inference::structured::regex::regex_to_grammar;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::matcher::GrammarMatcher;
-use crate::{context, inference};
+use crate::{context_legacy as context, inference};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::iter;
@@ -28,7 +28,7 @@ use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 #[derive(Debug)]
 pub struct ForwardPass {
     pub model_id: usize,
-    context_id: Option<crate::context::ContextId>,
+    context_id: Option<crate::context_legacy::ContextId>,
     input_tokens: Vec<u32>,
     input_token_positions: Vec<u32>,
     speculative_tokens: Vec<u32>,

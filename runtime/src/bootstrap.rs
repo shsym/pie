@@ -8,7 +8,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::adapter;
 use crate::auth;
-use crate::context;
+use crate::context_legacy as context;
 use crate::device;
 use crate::inference;
 use crate::linker;
