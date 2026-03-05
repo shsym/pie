@@ -16,6 +16,8 @@ pub struct Context {
     pub context_id: ContextId,
     /// The model ID (for routing to the correct ContextManager).
     pub model_id: ModelId,
+    /// Process-local buffered tokens (staged for the next forward pass).
+    pub buffered_tokens: Vec<u32>,
 }
 
 impl pie::core::context::Host for InstanceState {}
@@ -29,10 +31,10 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = model.model_id;
         let process_id = self.id();
 
-        match context::create_owned(model_id, Some(process_id)).await {
+        match context::create(model_id, Some(process_id)).await {
             Ok(context_id) => {
                 self.track_context(model_id, context_id);
-                let ctx = Context { context_id, model_id };
+                let ctx = Context { context_id, model_id, buffered_tokens: Vec::new() };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -52,7 +54,26 @@ impl pie::core::context::HostContext for InstanceState {
             Ok(context_id) => {
                 // Opened (forked-from-snapshot) contexts are tracked for auto-cleanup
                 self.track_context(model_id, context_id);
-                let ctx = Context { context_id, model_id };
+                let ctx = Context { context_id, model_id, buffered_tokens: Vec::new() };
+                Ok(Ok(self.ctx().table.push(ctx)?))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn take(
+        &mut self,
+        model: Resource<Model>,
+        name: String,
+    ) -> Result<Result<Resource<Context>, String>> {
+        let model = self.ctx().table.get(&model)?;
+        let model_id = model.model_id;
+        let username = self.get_username();
+
+        match context::take(model_id, username, name).await {
+            Ok(context_id) => {
+                self.track_context(model_id, context_id);
+                let ctx = Context { context_id, model_id, buffered_tokens: Vec::new() };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -85,7 +106,7 @@ impl pie::core::context::HostContext for InstanceState {
         match context::fork(model_id, context_id).await {
             Ok(new_context_id) => {
                 self.track_context(model_id, new_context_id);
-                let new_ctx = Context { context_id: new_context_id, model_id };
+                let new_ctx = Context { context_id: new_context_id, model_id, buffered_tokens: Vec::new() };
                 Ok(Ok(self.ctx().table.push(new_ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -102,8 +123,8 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = ctx.model_id;
         let username = self.get_username();
 
-        match context::save(model_id, context_id, username, name).await {
-            Ok(()) => Ok(Ok(())),
+        match context::save(model_id, context_id, username, Some(name)).await {
+            Ok(_) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
     }
@@ -117,8 +138,9 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = ctx.model_id;
         let username = self.get_username();
 
-        match context::snapshot(model_id, context_id, username).await {
-            Ok(name) => Ok(Ok(name)),
+        match context::save(model_id, context_id, username, None).await {
+            Ok(Some(name)) => Ok(Ok(name)),
+            Ok(None) => Ok(Err("snapshot returned no name".into())),
             Err(e) => Ok(Err(e.to_string())),
         }
     }
@@ -149,7 +171,7 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn tokens_per_page(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::tokens_per_page(ctx.model_id, ctx.context_id))
+        Ok(context::tokens_per_page(ctx.model_id))
     }
 
     async fn model(&mut self, this: Resource<Context>) -> Result<Resource<Model>> {
@@ -171,9 +193,9 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn uncommitted_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        let tokens = context::get_buffered_tokens(ctx.model_id, ctx.context_id);
-        let page_size = context::tokens_per_page(ctx.model_id, ctx.context_id);
-        Ok((tokens.len() as u32 + page_size - 1) / page_size)
+        let page_size = context::tokens_per_page(ctx.model_id);
+        let n = ctx.buffered_tokens.len() as u32;
+        Ok((n + page_size - 1) / page_size)
     }
 
     async fn commit_pages(
@@ -219,18 +241,18 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn buffered_tokens(&mut self, this: Resource<Context>) -> Result<Vec<u32>> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::get_buffered_tokens(ctx.model_id, ctx.context_id))
+        Ok(ctx.buffered_tokens.clone())
     }
 
     async fn set_buffered_tokens(&mut self, this: Resource<Context>, tokens: Vec<u32>) -> Result<()> {
-        let ctx = self.ctx().table.get(&this)?;
-        context::set_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
+        let ctx = self.ctx().table.get_mut(&this)?;
+        ctx.buffered_tokens = tokens;
         Ok(())
     }
 
     async fn append_buffered_tokens(&mut self, this: Resource<Context>, tokens: Vec<u32>) -> Result<()> {
-        let ctx = self.ctx().table.get(&this)?;
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
+        let ctx = self.ctx().table.get_mut(&this)?;
+        ctx.buffered_tokens.extend(tokens);
         Ok(())
     }
 

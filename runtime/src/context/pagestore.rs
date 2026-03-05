@@ -24,12 +24,6 @@ pub type PageHash = u64;
 /// Physical page index in GPU or CPU memory.
 pub type PhysicalPageId = u32;
 
-/// Copy coordinates for GPU↔CPU swap, used by the RPC layer.
-#[derive(Debug, Clone)]
-pub struct SwapOp {
-    pub gpu_phys: PhysicalPageId,
-    pub cpu_slot: PhysicalPageId,
-}
 
 // =============================================================================
 // PagePool
@@ -125,10 +119,7 @@ impl PageStore {
         (self.gpu.used(), self.gpu.total)
     }
 
-    /// Whether the CPU swap pool can accommodate `n` working pages.
-    pub fn can_swap_working(&self, n: usize) -> bool {
-        self.cpu.available() >= n
-    }
+
 
     /// Number of free GPU pages in the pool.
     pub fn free_gpu_pages(&self) -> usize {
@@ -318,69 +309,6 @@ impl PageStore {
         freed
     }
 
-    // =========================================================================
-    // Swap (GPU ↔ CPU, for working pages only)
-    // =========================================================================
-
-    /// Swap working pages from GPU to CPU.
-    /// Allocates CPU slots and frees GPU pages.
-    /// Returns swap operations for the RPC layer.
-    ///
-    /// If the CPU pool is full, returns Err (OOM the process).
-    pub fn swap_out(&mut self, gpu_pages: &[PhysicalPageId]) -> Result<Vec<SwapOp>> {
-        // Phase 1: Allocate all CPU slots. Roll back on partial failure.
-        let mut cpu_slots = Vec::with_capacity(gpu_pages.len());
-        for _ in 0..gpu_pages.len() {
-            match self.cpu.alloc() {
-                Some(s) => cpu_slots.push(s),
-                None => {
-                    for &s in &cpu_slots {
-                        self.cpu.free(s);
-                    }
-                    anyhow::bail!("No free CPU pages for working swap-out");
-                }
-            }
-        }
-
-        // Phase 2: Build ops and free GPU pages.
-        let ops: Vec<SwapOp> = gpu_pages.iter().zip(cpu_slots.into_iter())
-            .map(|(&gpu_phys, cpu_slot)| {
-                self.gpu.free(gpu_phys);
-                SwapOp { gpu_phys, cpu_slot }
-            })
-            .collect();
-
-        Ok(ops)
-    }
-
-    /// Swap working pages from CPU back to GPU.
-    /// Allocates GPU pages and frees CPU slots.
-    /// Returns swap operations for the RPC layer.
-    pub fn swap_in(&mut self, cpu_slots: &[PhysicalPageId]) -> Result<Vec<SwapOp>> {
-        // Phase 1: Allocate all GPU pages. Roll back on partial failure.
-        let mut gpu_pages = Vec::with_capacity(cpu_slots.len());
-        for _ in 0..cpu_slots.len() {
-            match self.gpu.alloc() {
-                Some(p) => gpu_pages.push(p),
-                None => {
-                    for &p in &gpu_pages {
-                        self.gpu.free(p);
-                    }
-                    anyhow::bail!("No free GPU pages for working swap-in");
-                }
-            }
-        }
-
-        // Phase 2: Build swap ops and free CPU slots.
-        let ops: Vec<SwapOp> = gpu_pages.into_iter().zip(cpu_slots.iter())
-            .map(|(gpu_phys, &cpu_slot)| {
-                self.cpu.free(cpu_slot);
-                SwapOp { gpu_phys, cpu_slot }
-            })
-            .collect();
-
-        Ok(ops)
-    }
 
     // =========================================================================
     // Prefix lookup (for restore from lineage)
@@ -455,11 +383,24 @@ impl PageStore {
         self.index_cache.remove(&tip);
     }
 
-    /// Free CPU slots back to the CPU pool.
+    /// Allocate `n` CPU pages from the swap pool.
+    /// Returns None if not enough free pages. Does NOT touch GPU pages.
+    pub fn alloc_cpu_pages(&mut self, n: usize) -> Option<Vec<PhysicalPageId>> {
+        if self.cpu.available() < n {
+            return None;
+        }
+        let mut pages = Vec::with_capacity(n);
+        for _ in 0..n {
+            pages.push(self.cpu.alloc().unwrap());
+        }
+        Some(pages)
+    }
+
+    /// Free CPU pages back to the CPU pool.
     /// Used when destroying a suspended context that holds working pages on CPU.
-    pub fn free_cpu_slots(&mut self, slots: &[PhysicalPageId]) {
-        for &slot in slots {
-            self.cpu.free(slot);
+    pub fn free_cpu_pages(&mut self, pages: &[PhysicalPageId]) {
+        for &p in pages {
+            self.cpu.free(p);
         }
     }
 

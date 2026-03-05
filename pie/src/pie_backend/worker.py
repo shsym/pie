@@ -469,7 +469,7 @@ def _leader_loop(
 
         return {"results": results}
 
-    def _handle_swap_out_pages(**kwargs) -> None:
+    def _handle_copy_d2h(**kwargs) -> None:
         """D2H: copy GPU KV pages to pinned CPU buffers (vectorized per layer).
 
         NOTE: tensor[idx].copy_(src) with advanced (fancy) indexing is a NO-OP
@@ -494,9 +494,9 @@ def _leader_loop(
         dst = torch.tensor(slots, dtype=torch.long)
         for layer_idx in range(len(gpu_kv)):
             host_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src].cpu())
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize() -> we don't need this
 
-    def _handle_swap_in_pages(**kwargs) -> None:
+    def _handle_copy_h2d(**kwargs) -> None:
         """H2D: copy pinned CPU buffers back to GPU KV pages (vectorized per layer).
 
         NOTE: Same as swap_out — must use index_copy_ to avoid the fancy
@@ -519,7 +519,31 @@ def _leader_loop(
         src = torch.tensor(slots, dtype=torch.long)
         for layer_idx in range(len(gpu_kv)):
             gpu_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src].to(gpu_kv[layer_idx].device))
-        torch.cuda.synchronize()
+        #torch.cuda.synchronize() -> we don't need this
+
+    def _handle_copy_d2d(**kwargs) -> None:
+        """D2D: copy GPU KV pages to other GPU KV pages.
+
+        Args (via kwargs):
+            src_phys_ids: list[int] — source GPU physical page IDs
+            dst_phys_ids: list[int] — destination GPU physical page IDs
+        """
+        import torch
+        gpu_kv = engine.kv_cache_at_layer
+        src_ids = kwargs["src_phys_ids"]
+        dst_ids = kwargs["dst_phys_ids"]
+        max_gpu = gpu_kv[0].shape[0]
+        for p in src_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d: src phys_id {p} out of bounds [0, {max_gpu})")
+        for p in dst_ids:
+            if p < 0 or p >= max_gpu:
+                raise ValueError(f"copy_d2d: dst phys_id {p} out of bounds [0, {max_gpu})")
+        src = torch.tensor(src_ids, dtype=torch.long, device=gpu_kv[0].device)
+        dst = torch.tensor(dst_ids, dtype=torch.long, device=gpu_kv[0].device)
+        for layer_idx in range(len(gpu_kv)):
+            gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
+        #torch.cuda.synchronize() -> we don't need this
 
     # Method dispatch table
     methods = {
@@ -530,8 +554,11 @@ def _leader_loop(
         "update_adapter": _handle_update_adapter,
         "load_adapter": _handle_load_adapter,
         "save_adapter": _handle_save_adapter,
-        "swap_out_pages": _handle_swap_out_pages,
-        "swap_in_pages": _handle_swap_in_pages,
+        "swap_out_pages": _handle_copy_d2h,
+        "swap_in_pages": _handle_copy_h2d,
+        "copy_d2h": _handle_copy_d2h,
+        "copy_h2d": _handle_copy_h2d,
+        "copy_d2d": _handle_copy_d2d,
     }
 
     try:

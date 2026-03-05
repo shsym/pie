@@ -11,19 +11,22 @@ interface context {
         // Creates a fresh empty context
         create: static func(model: borrow<model>) -> result<context, error>;
 
-        // Opens a snapshot (implicit fork — snapshot stays immutable)
+        // Opens a snapshot (implicit fork — snapshot stays immutable, working pages are copied)
         open: static func(model: borrow<model>, name: string) -> result<context, error>;
+
+        // Takes ownership of a snapshot (snapshot is deleted, GPU pages transfer without copy)
+        take: static func(model: borrow<model>, name: string) -> result<context, error>;
 
         // Deletes a saved snapshot by name
         delete: static func(model: borrow<model>, name: string) -> result<_, error>;
 
-        // Forks into a new anonymous context
+        // Forks into a new anonymous context (working pages are copied via GPU D2D or CPU H2D)
         fork: func() -> result<context, error>;
 
-        // Named save — snapshots committed chain + token metadata under a user-chosen name
+        // Named save — snapshots committed chain + working pages under a user-chosen name
         save: func(name: string) -> result<_, error>;
 
-        // Anonymous save — snapshots committed chain + token metadata, returns runtime-generated name
+        // Anonymous save — snapshots committed chain + working pages, returns runtime-generated name
         snapshot: func() -> result<string, error>;
 
         // Force-destroys immediately
@@ -37,28 +40,34 @@ interface context {
         // Number of committed KV pages in the context
         committed-page-count: func() -> u32;
 
-        // Number of uncommitted KV pages in the context
+        // Number of uncommitted KV pages (based on buffered tokens in the resource handle)
         uncommitted-page-count: func() -> u32;
 
         // Commit the KV pages to the context
         commit-pages: func(page-indices: list<u32>) -> result<_, error>;
 
-        // Reserve KV pages for the context
+        // Reserve working GPU pages for the context
         reserve-pages: func(num-pages: u32) -> result<_, error>;
 
-        // Release KV pages from the context
+        // Release working GPU pages from the context
         release-pages: func(num-pages: u32);
 
+        // Cursor position (= number of filled tokens not yet committed)
         cursor: func() -> u32;
 
+        // Truncate filled tokens to this cursor position
         set-cursor: func(cursor: u32);
 
+        // Buffered tokens waiting to be forwarded (managed on the resource handle)
         buffered-tokens: func() -> list<u32>;
 
+        // Replace buffered tokens
         set-buffered-tokens: func(tokens: list<u32>);
 
+        // Append to buffered tokens
         append-buffered-tokens: func(tokens: list<u32>);
 
+        // Last position in the KV cache (max of committed + filled positions)
         last-position: func() -> option<u32>;
 
     }

@@ -169,7 +169,7 @@ impl ContextManager {
                 phys_ids: swap_ops.iter().map(|op| op.gpu_phys).collect(),
                 slots: swap_ops.iter().map(|op| op.cpu_slot).collect(),
             };
-            let _: Result<(), _> = device::call(dev_idx as DeviceId, "swap_out_pages", &request).await;
+            let _: Result<(), _> = device::call(dev_idx as DeviceId, "copy_d2h", &request).await;
             // Now safe to free GPU pages — D2H copy is complete.
             let gpu_pages: Vec<PhysicalPageId> = swap_ops.iter().map(|op| op.gpu_phys).collect();
             self.devices[dev_idx].free_working(&gpu_pages);
@@ -482,8 +482,8 @@ impl ContextManager {
                 phys_ids: swap_ops.iter().map(|op| op.gpu_phys).collect(),
                 slots: swap_ops.iter().map(|op| op.cpu_slot).collect(),
             };
-            let _: () = device::call(dev_idx as DeviceId, "swap_in_pages", &request).await
-                .map_err(|e| anyhow::anyhow!("swap_in_pages RPC failed: {e}"))?;
+            let _: () = device::call(dev_idx as DeviceId, "copy_h2d", &request).await
+                .map_err(|e| anyhow::anyhow!("copy_h2d RPC failed: {e}"))?;
 
             // Free CPU slots AFTER the H2D copy completes. Before this point,
             // the CPU buffer data must remain intact — freeing earlier allows
@@ -835,7 +835,7 @@ impl ContextManager {
                 phys_ids: swap_ops.iter().map(|op| op.gpu_phys).collect(),
                 slots: swap_ops.iter().map(|op| op.cpu_slot).collect(),
             };
-            let _: Result<(), _> = device::call(dev_idx as DeviceId, "swap_out_pages", &request).await;
+            let _: Result<(), _> = device::call(dev_idx as DeviceId, "copy_d2h", &request).await;
             // Now safe to free GPU pages.
             let gpu_pages: Vec<PhysicalPageId> = swap_ops.iter().map(|op| op.gpu_phys).collect();
             self.devices[dev_idx].free_working(&gpu_pages);
