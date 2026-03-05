@@ -10,10 +10,32 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::TracerProvider;
 use opentelemetry_sdk::{runtime, Resource};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+
+/// Whether telemetry is enabled (runtime toggle)
+static TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Global metrics holder
 static METRICS: OnceLock<Metrics> = OnceLock::new();
+
+/// Configuration for telemetry
+#[derive(Debug, Clone)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub service_name: String,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "http://localhost:4317".to_string(),
+            service_name: "pie-runtime".to_string(),
+        }
+    }
+}
 
 /// All metric instruments for the Pie runtime
 pub struct Metrics {
@@ -110,34 +132,43 @@ impl Metrics {
 }
 
 /// Get a reference to the global metrics.
-/// Returns None if metrics have not been initialized.
+/// Returns None if telemetry is disabled.
 pub fn metrics() -> Option<&'static Metrics> {
+    if !is_enabled() {
+        return None;
+    }
     METRICS.get()
 }
 
 /// Initialize OpenTelemetry OTLP tracing and metrics.
 ///
 /// Returns an optional tracing-opentelemetry layer that can be added to the subscriber.
-/// Caller is responsible for only calling this when telemetry is enabled.
+/// If telemetry is disabled, returns None.
 pub fn init_otel_layer<S>(
-    endpoint: &str,
-    service_name: &str,
+    config: &TelemetryConfig,
 ) -> Option<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
-    eprintln!("[Telemetry] Initializing OTLP export to: {endpoint}");
+    if !config.enabled {
+        TELEMETRY_ENABLED.store(false, Ordering::SeqCst);
+        //eprintln!("[Telemetry] Disabled in config");
+        return None;
+    }
+
+    TELEMETRY_ENABLED.store(true, Ordering::SeqCst);
+    eprintln!("[Telemetry] Initializing OTLP export to: {}", config.endpoint);
 
     // Build resource with service name
     let resource = Resource::new(vec![KeyValue::new(
         "service.name",
-        service_name.to_string(),
+        config.service_name.clone(),
     )]);
 
     // === Initialize Metrics ===
     let metrics_exporter = match opentelemetry_otlp::MetricExporter::builder()
         .with_tonic()
-        .with_endpoint(endpoint)
+        .with_endpoint(&config.endpoint)
         .build()
     {
         Ok(e) => e,
@@ -147,7 +178,7 @@ where
                 err
             );
             // Continue without metrics
-            return init_tracing_only(endpoint, resource);
+            return init_tracing_only(config, resource);
         }
     };
 
@@ -168,7 +199,7 @@ where
     // === Initialize Tracing ===
     let span_exporter = match opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
-        .with_endpoint(endpoint)
+        .with_endpoint(&config.endpoint)
         .build()
     {
         Ok(e) => e,
@@ -177,6 +208,7 @@ where
                 "Failed to create OTLP span exporter: {}, tracing disabled",
                 err
             );
+            TELEMETRY_ENABLED.store(false, Ordering::SeqCst);
             return None;
         }
     };
@@ -196,7 +228,7 @@ where
 
 /// Initialize tracing only (when metrics fails to init)
 fn init_tracing_only<S>(
-    endpoint: &str,
+    config: &TelemetryConfig,
     resource: Resource,
 ) -> Option<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>
 where
@@ -204,7 +236,7 @@ where
 {
     let span_exporter = match opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
-        .with_endpoint(endpoint)
+        .with_endpoint(&config.endpoint)
         .build()
     {
         Ok(e) => e,
@@ -213,6 +245,7 @@ where
                 "Failed to create OTLP span exporter: {}, telemetry disabled",
                 err
             );
+            TELEMETRY_ENABLED.store(false, Ordering::SeqCst);
             return None;
         }
     };
@@ -228,9 +261,14 @@ where
     Some(tracing_opentelemetry::layer().with_tracer(tracer))
 }
 
+/// Check if telemetry is enabled at runtime.
+pub fn is_enabled() -> bool {
+    TELEMETRY_ENABLED.load(Ordering::SeqCst)
+}
+
 /// Shutdown OpenTelemetry, flushing any pending spans and metrics.
 pub fn shutdown() {
-    if METRICS.get().is_some() {
+    if TELEMETRY_ENABLED.load(Ordering::SeqCst) {
         opentelemetry::global::shutdown_tracer_provider();
         // Note: Meter provider shutdown happens automatically on drop
     }

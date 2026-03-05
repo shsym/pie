@@ -101,9 +101,9 @@ def submit(
     port: PortOption = None,
     username: UsernameOption = None,
     private_key_path: PrivateKeyPathOption = None,
-    no_output: Annotated[
+    detached: Annotated[
         bool,
-        typer.Option("-d", "--no-output", help="Don't capture the inferlet outputs."),
+        typer.Option("-d", "--detached", help="Run the inferlet in detached mode."),
     ] = False,
     link: Annotated[
         Optional[list[Path]],
@@ -130,7 +130,7 @@ def submit(
             port=port,
             username=username,
             private_key_path=expand_path(private_key_path),
-            capture_outputs=not no_output,
+            detached=detached,
             link=[expand_path(p) for p in link] if link else None,
             arguments=arguments,
         )
@@ -172,7 +172,7 @@ def ping(
 
 
 @app.command("list")
-def list_processes(
+def list_instances(
     config: ConfigOption = None,
     host: HostOption = None,
     port: PortOption = None,
