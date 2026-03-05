@@ -1,6 +1,6 @@
 //! Context management integration tests.
 //!
-//! Tests context CRUD, saving, opening, forking, locking, cursor, and buffered tokens.
+//! Tests context CRUD, saving, opening, forking, locking, cursor, and filled tokens.
 
 use std::sync::{Arc, OnceLock};
 mod common;
@@ -33,7 +33,7 @@ const USER: &str = "test-user";
 fn create_and_save_and_open() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL)
+        let id = pie::context::create(MODEL, None)
             .await
             .unwrap();
 
@@ -42,7 +42,7 @@ fn create_and_save_and_open() {
         assert!(found.is_err());
 
         // Save it with a name
-        pie::context::save(MODEL, id, USER.to_string(), "test-ctx".into()).await.unwrap();
+        pie::context::save(MODEL, id, USER.to_string(), Some("test-ctx".into())).await.unwrap();
 
         // Now it should be findable (open returns a fork, so different id)
         let found = pie::context::open(MODEL, USER.to_string(), "test-ctx".into()).await;
@@ -54,7 +54,7 @@ fn create_and_save_and_open() {
 fn destroy_removes_context() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL)
+        let id = pie::context::create(MODEL, None)
             .await
             .unwrap();
 
@@ -70,7 +70,7 @@ fn destroy_removes_context() {
 fn force_destroy() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL)
+        let id = pie::context::create(MODEL, None)
             .await
             .unwrap();
 
@@ -83,14 +83,13 @@ fn force_destroy() {
 fn cursor_ops() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL)
+        let id = pie::context::create(MODEL, None)
             .await
             .unwrap();
 
-        // Buffer some tokens and mark them forwarded so cursor advances
-        pie::context::set_buffered_tokens(MODEL, id, vec![1, 2, 3, 4, 5]).unwrap();
-        pie::context::fill(
-            MODEL, id, 5,
+        // Mark tokens as filled so cursor advances
+        pie::context::append_filled_tokens(
+            MODEL, id, vec![1, 2, 3, 4, 5],
             vec![0, 1, 2, 3, 4],
             vec![],
             None,
@@ -111,30 +110,10 @@ fn cursor_ops() {
 }
 
 #[test]
-fn buffered_token_lifecycle() {
-    let s = state();
-    s.rt.block_on(async {
-        let id = pie::context::create(MODEL)
-            .await
-            .unwrap();
-
-        // Set initial tokens
-        pie::context::set_buffered_tokens(MODEL, id, vec![1, 2, 3]).unwrap();
-
-        // Append more
-        pie::context::append_buffered_tokens(MODEL, id, vec![4, 5]).unwrap();
-
-        // Read back
-        let tokens = pie::context::get_buffered_tokens(MODEL, id);
-        assert_eq!(tokens, vec![1, 2, 3, 4, 5]);
-    });
-}
-
-#[test]
 fn fork_context() {
     let s = state();
     s.rt.block_on(async {
-        let parent_id = pie::context::create(MODEL)
+        let parent_id = pie::context::create(MODEL, None)
             .await
             .unwrap();
 
@@ -149,35 +128,27 @@ fn fork_context() {
 /// Comprehensive test simulating a realistic multi-turn inference lifecycle.
 ///
 /// Timeline:
-///   1. Create anonymous context, buffer 32 tokens
-///   2. Mark forwarded → promotes buffered to filled
-///   3. Commit first page → verify cursor, position, buffer drainage
-///   4. Commit second page → verify fully committed state
-///   5. Append generation tokens, mark forwarded
-///   6. Cursor truncation
-///   7. Fork → verify child inherits state
+///   1. Create anonymous context, fill 32 tokens
+///   2. Commit first page → verify cursor, position
+///   3. Commit second page → verify fully committed state
+///   4. Append generation tokens via fill
+///   5. Cursor truncation
+///   6. Fork → verify child inherits state
 #[test]
 fn full_page_lifecycle() {
     let s = state();
     s.rt.block_on(async {
         const PAGE_SIZE: u32 = 16;
 
-        // ── Phase 1: Create anonymous context and buffer prompt tokens ──
+        // ── Phase 1: Create anonymous context and fill prompt tokens ──
         let prompt: Vec<u32> = (1000..1032).collect(); // 32 tokens
-        let id = pie::context::create(MODEL).await.unwrap();
+        let id = pie::context::create(MODEL, None).await.unwrap();
 
         // Tokens per page should match the model config
         assert_eq!(
-            pie::context::tokens_per_page(MODEL, id), PAGE_SIZE,
+            pie::context::tokens_per_page(MODEL), PAGE_SIZE,
             "tokens_per_page should be 16"
         );
-
-        // Buffer the prompt tokens manually
-        pie::context::set_buffered_tokens(MODEL, id, prompt.clone()).unwrap();
-
-        let buf = pie::context::get_buffered_tokens(MODEL, id);
-        assert_eq!(buf.len(), 32, "all 32 tokens should be buffered");
-        assert_eq!(buf, prompt);
 
         assert_eq!(pie::context::committed_page_count(MODEL, id), 0);
         assert_eq!(pie::context::get_cursor(MODEL, id), 0, "cursor starts at 0 (no filled tokens)");
@@ -187,12 +158,10 @@ fn full_page_lifecycle() {
 
         // ── Phase 2: Mark all 32 tokens as forwarded ──
         let positions: Vec<u32> = (0..32).collect();
-        pie::context::fill(MODEL, id, 32, positions, vec![], None).unwrap();
+        pie::context::append_filled_tokens(MODEL, id, prompt.clone(), positions, vec![], None).unwrap();
 
         // Cursor = tokens_filled.len() = 32
         assert_eq!(pie::context::get_cursor(MODEL, id), 32);
-        // Buffered should be empty now
-        assert!(pie::context::get_buffered_tokens(MODEL, id).is_empty());
         // last_position = max filled position = 31
         assert_eq!(pie::context::last_position(MODEL, id), Some(31));
 
@@ -216,29 +185,18 @@ fn full_page_lifecycle() {
         // position = max_committed = 31
         assert_eq!(pie::context::last_position(MODEL, id), Some(31));
 
-        // ── Phase 5: Simulate generation — append new tokens, mark forwarded ──
-        pie::context::append_buffered_tokens(MODEL, id, vec![2000, 2001, 2002]).unwrap();
-
-        let buf = pie::context::get_buffered_tokens(MODEL, id);
-        assert_eq!(buf, vec![2000, 2001, 2002], "generation tokens buffered");
-
-        // No filled tokens, so last_position = max_committed = 31
-        assert_eq!(pie::context::last_position(MODEL, id), Some(31));
-
+        // ── Phase 5: Simulate generation — fill new tokens ──
         // Mark generation tokens forwarded with positions 32, 33, 34
-        pie::context::fill(MODEL, id, 3, vec![32, 33, 34], vec![], None).unwrap();
+        pie::context::append_filled_tokens(MODEL, id, vec![2000, 2001, 2002], vec![32, 33, 34], vec![], None).unwrap();
         assert_eq!(pie::context::get_cursor(MODEL, id), 3);
         assert_eq!(pie::context::last_position(MODEL, id), Some(34), "filled position dominates");
 
-        // ── Phase 6: Prepare state with filled + buffered tokens, then fork ──
+        // ── Phase 6: Prepare state with filled tokens, then fork ──
         // Clear filled tokens from Phase 5
         pie::context::set_cursor(MODEL, id, 0).unwrap();
-        // Buffer tokens and mark first 2 forwarded with positions sequential from max_committed (31)
-        pie::context::set_buffered_tokens(MODEL, id, vec![3000, 3001, 3002, 3003]).unwrap();
-        pie::context::fill(MODEL, id, 2, vec![32, 33], vec![], None).unwrap();
+        // Fill 2 tokens with positions sequential from max_committed (31)
+        pie::context::append_filled_tokens(MODEL, id, vec![3000, 3001], vec![32, 33], vec![], None).unwrap();
         assert_eq!(pie::context::get_cursor(MODEL, id), 2);
-        // Remaining buffered: [3002, 3003]
-        assert_eq!(pie::context::get_buffered_tokens(MODEL, id), vec![3002, 3003]);
 
         let child_id = pie::context::fork(MODEL, id).await.unwrap();
 
@@ -250,29 +208,14 @@ fn full_page_lifecycle() {
             "child inherits committed pages"
         );
 
-        // Fork demotes filled → buffered: child gets [3000, 3001, 3002, 3003]
-        let child_buf = pie::context::get_buffered_tokens(MODEL, child_id);
+        // Fork preserves tokens_filled — child inherits them
         assert_eq!(
-            child_buf, vec![3000, 3001, 3002, 3003],
-            "child: filled tokens demoted to buffered + existing buffered"
-        );
-
-        // Child cursor = 0 (no filled tokens after fork)
-        assert_eq!(
-            pie::context::get_cursor(MODEL, child_id), 0,
-            "child cursor = 0 (filled demoted to buffered)"
+            pie::context::get_cursor(MODEL, child_id), 2,
+            "child inherits filled tokens"
         );
 
         // Child inherits max_committed_position
         let child_pos = pie::context::last_position(MODEL, child_id);
-        assert_eq!(child_pos, Some(31), "child inherits max_committed_position = 31");
-
-        // Mutating child buffer doesn't affect parent
-        pie::context::append_buffered_tokens(MODEL, child_id, vec![9999]).unwrap();
-        let parent_buf = pie::context::get_buffered_tokens(MODEL, id);
-        assert_eq!(parent_buf, vec![3002, 3003], "parent buffer unchanged after child mutation");
-
-        let child_buf = pie::context::get_buffered_tokens(MODEL, child_id);
-        assert_eq!(child_buf, vec![3000, 3001, 3002, 3003, 9999], "child buffer has the appended token");
+        assert_eq!(child_pos, Some(33), "child inherits last_position from filled tokens");
     });
 }

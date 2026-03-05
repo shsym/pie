@@ -87,6 +87,46 @@ pub fn notify<T: Serialize>(device_idx: usize, method: &str, args: &T) -> Result
     })
 }
 
+// =============================================================================
+// KV Page Copy Convenience Wrappers
+// =============================================================================
+
+/// GPU → CPU page copy (fire-and-forget).
+/// `gpu_phys_ids`: source GPU physical page IDs.
+/// `cpu_pages`: destination CPU swap pool page IDs.
+pub fn copy_d2h(device_idx: DeviceId, gpu_phys_ids: &[u32], cpu_pages: &[u32]) -> Result<()> {
+    #[derive(Serialize)]
+    struct Req { phys_ids: Vec<u32>, slots: Vec<u32> }
+    notify(device_idx, "copy_d2h", &Req {
+        phys_ids: gpu_phys_ids.to_vec(),
+        slots: cpu_pages.to_vec(),
+    })
+}
+
+/// CPU → GPU page copy (fire-and-forget).
+/// `gpu_phys_ids`: destination GPU physical page IDs.
+/// `cpu_pages`: source CPU swap pool page IDs.
+pub fn copy_h2d(device_idx: DeviceId, gpu_phys_ids: &[u32], cpu_pages: &[u32]) -> Result<()> {
+    #[derive(Serialize)]
+    struct Req { phys_ids: Vec<u32>, slots: Vec<u32> }
+    notify(device_idx, "copy_h2d", &Req {
+        phys_ids: gpu_phys_ids.to_vec(),
+        slots: cpu_pages.to_vec(),
+    })
+}
+
+/// GPU → GPU page copy (fire-and-forget).
+/// `src_phys_ids`: source GPU physical page IDs.
+/// `dst_phys_ids`: destination GPU physical page IDs.
+pub fn copy_d2d(device_idx: DeviceId, src_phys_ids: &[u32], dst_phys_ids: &[u32]) -> Result<()> {
+    #[derive(Serialize)]
+    struct Req { src_phys_ids: Vec<u32>, dst_phys_ids: Vec<u32> }
+    notify(device_idx, "copy_d2d", &Req {
+        src_phys_ids: src_phys_ids.to_vec(),
+        dst_phys_ids: dst_phys_ids.to_vec(),
+    })
+}
+
 /// Returns the device's static configuration.
 pub async fn get_spec(device_idx: usize) -> Result<DeviceSpec> {
     let (tx, rx) = oneshot::channel();

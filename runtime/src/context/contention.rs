@@ -13,7 +13,7 @@
 use std::cmp::Ordering;
 use std::time::Instant;
 use tokio::sync::oneshot;
-use serde::Serialize;
+
 
 use crate::device;
 use crate::process::ProcessId;
@@ -372,27 +372,19 @@ impl ContextManager {
         // Phase 1: Swap working pages to CPU
         if !working.is_empty() {
             let dev = &mut self.devices[dev_idx];
-            match dev.swap_out(&working) {
-                Ok(swap_ops) => {
-                    // Fire D2H copy RPC (fire-and-forget)
-                    if !swap_ops.is_empty() {
-                        #[derive(Serialize)]
-                        struct SwapOutRequest { phys_ids: Vec<u32>, slots: Vec<PhysicalPageId> }
-                        let request = SwapOutRequest {
-                            phys_ids: swap_ops.iter().map(|op| op.gpu_phys).collect(),
-                            slots: swap_ops.iter().map(|op| op.cpu_slot).collect(),
-                        };
-                        let _ = device::call::<_, ()>(dev_idx, "swap_out_pages", &request);
-                    }
+            match dev.alloc_cpu_pages(working.len()) {
+                Some(cpu_pages) => {
+                    // Copy GPU → CPU, then free GPU pages
+                    let _ = device::copy_d2h(dev_idx, &working, &cpu_pages);
+                    self.devices[dev_idx].free_working(&working);
 
-                    let cpu_slots: Vec<PhysicalPageId> = swap_ops.iter().map(|op| op.cpu_slot).collect();
                     if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                         ctx.working_pages.clear();
-                        ctx.working_pages_cpu = cpu_slots;
+                        ctx.working_pages_cpu = cpu_pages;
                     }
                 }
-                Err(e) => {
-                    eprintln!("SUSPEND_SWAP_FAIL ctx={ctx_id} err={e}");
+                None => {
+                    eprintln!("SUSPEND_SWAP_FAIL ctx={ctx_id} err=No free CPU pages");
                     // Continue with suspension anyway — lose working pages
                     let pages_to_free = if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                         let pages = ctx.working_pages.clone();

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Serialize;
+
 
 use super::{
     ContextId, ContextManager, ContextState, ProcessState,
@@ -134,36 +134,28 @@ impl ContextManager {
         }
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let cpu_slots = ctx.working_pages_cpu.clone();
+        let cpu_pages = ctx.working_pages_cpu.clone();
         let tip = ctx.committed_tip;
         let owner = ctx.owner;
 
         // Phase 1: Swap-in working pages from CPU → GPU
-        if !cpu_slots.is_empty() {
+        if !cpu_pages.is_empty() {
             let dev = &mut self.devices[dev_idx];
-            let swap_ops = dev.swap_in(&cpu_slots)?;
+            let gpu_pages = dev.alloc_working(cpu_pages.len())
+                .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working swap-in"))?;
 
-            // Fire H2D copy RPC (fire-and-forget)
-            if !swap_ops.is_empty() {
-                #[derive(Serialize)]
-                struct SwapInRequest { phys_ids: Vec<u32>, slots: Vec<PhysicalPageId> }
-                let request = SwapInRequest {
-                    phys_ids: swap_ops.iter().map(|op| op.gpu_phys).collect(),
-                    slots: swap_ops.iter().map(|op| op.cpu_slot).collect(),
-                };
-                let _ = device::call::<_, ()>(dev_idx, "swap_in_pages", &request);
-            }
-
-            let new_gpu_pages: Vec<PhysicalPageId> = swap_ops.iter().map(|op| op.gpu_phys).collect();
+            // Copy CPU → GPU, then free CPU pages
+            let _ = device::copy_h2d(dev_idx, &gpu_pages, &cpu_pages);
+            self.devices[dev_idx].free_cpu_pages(&cpu_pages);
 
             if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                ctx.working_pages = new_gpu_pages.clone();
+                ctx.working_pages = gpu_pages.clone();
                 ctx.working_pages_cpu.clear();
             }
 
             // Track swap-in as working pages in arbiter
             if let Some(pid) = owner {
-                self.arbiter.add_working(pid, dev_idx, new_gpu_pages.len());
+                self.arbiter.add_working(pid, dev_idx, gpu_pages.len());
             }
         }
 
@@ -192,7 +184,7 @@ impl ContextManager {
                 }
             }
 
-            // Update ContextBuffer committed_len and max_committed_position
+            // Update ContextTokens committed_len and max_committed_position
             // to match the truncated prefix. Recompute max_committed_position
             // from the lineage to avoid stale values rejecting valid commits.
             if let Some(mut buf) = self.buf_mut(ctx_id) {
@@ -457,7 +449,7 @@ impl ContextManager {
             ctx.working_pages.drain(..to_remove);
         }
 
-        // Update ContextBuffer (DashMap) — increment committed_len
+        // Update ContextTokens (DashMap) — increment committed_len
         if let Some(mut buf) = self.buf_mut(id) {
             buf.committed_len += new_phys.len();
         }

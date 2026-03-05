@@ -308,6 +308,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
         // Save data needed for context::append_filled_tokens() before moving into request
         let num_input_tokens = tokens.len();
+        let fill_tokens = tokens.clone();
         let fill_positions = positions.clone();
         let fill_masks = masks.clone();
 
@@ -418,7 +419,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 // before the context becomes Active (evictable).
                 if num_input_tokens > 0 {
                     if let Err(e) = context::append_filled_tokens(
-                        model_id, context_id, num_input_tokens,
+                        model_id, context_id, fill_tokens,
                         fill_positions, fill_masks, adapter_id,
                     ) {
                         context::unpin(model_id, context_id);

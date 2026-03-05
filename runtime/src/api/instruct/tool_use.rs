@@ -5,7 +5,6 @@
 
 use crate::api::pie;
 use crate::api::context::Context;
-use crate::context;
 use crate::model;
 use crate::linker::InstanceState;
 use crate::model::instruct::{ToolDecoder, ToolEvent};
@@ -34,10 +33,10 @@ impl pie::instruct::tool_use::Host for InstanceState {
         ctx: Resource<Context>,
         tools: Vec<String>,
     ) -> Result<Result<(), pie::core::types::Error>> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
+        let model_id = self.ctx().table.get(&ctx)?.model_id;
+        let model = model::get_model(model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().equip(&tools);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
+        self.ctx().table.get_mut(&ctx)?.buffered_tokens.extend(tokens);
         Ok(Ok(()))
     }
 
@@ -47,10 +46,10 @@ impl pie::instruct::tool_use::Host for InstanceState {
         name: String,
         value: String,
     ) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
+        let model_id = self.ctx().table.get(&ctx)?.model_id;
+        let model = model::get_model(model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().answer(&name, &value);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
+        self.ctx().table.get_mut(&ctx)?.buffered_tokens.extend(tokens);
         Ok(())
     }
 

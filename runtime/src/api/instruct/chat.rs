@@ -5,7 +5,6 @@
 
 use crate::api::pie;
 use crate::api::context::Context;
-use crate::context;
 use crate::model;
 use crate::linker::InstanceState;
 use crate::model::instruct::{ChatDecoder, ChatEvent};
@@ -26,42 +25,42 @@ impl std::fmt::Debug for Decoder {
 
 impl pie::instruct::chat::Host for InstanceState {
     async fn system(&mut self, ctx: Resource<Context>, message: String) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
+        let model_id = self.ctx().table.get(&ctx)?.model_id;
+        let model = model::get_model(model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().system(&message);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
+        self.ctx().table.get_mut(&ctx)?.buffered_tokens.extend(tokens);
         Ok(())
     }
 
     async fn user(&mut self, ctx: Resource<Context>, message: String) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
+        let model_id = self.ctx().table.get(&ctx)?.model_id;
+        let model = model::get_model(model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().user(&message);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
+        self.ctx().table.get_mut(&ctx)?.buffered_tokens.extend(tokens);
         Ok(())
     }
 
     async fn assistant(&mut self, ctx: Resource<Context>, message: String) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
+        let model_id = self.ctx().table.get(&ctx)?.model_id;
+        let model = model::get_model(model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().assistant(&message);
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
+        self.ctx().table.get_mut(&ctx)?.buffered_tokens.extend(tokens);
         Ok(())
     }
 
     async fn cue(&mut self, ctx: Resource<Context>) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
+        let model_id = self.ctx().table.get(&ctx)?.model_id;
+        let model = model::get_model(model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().cue();
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
+        self.ctx().table.get_mut(&ctx)?.buffered_tokens.extend(tokens);
         Ok(())
     }
 
     async fn seal(&mut self, ctx: Resource<Context>) -> Result<()> {
-        let ctx = self.ctx().table.get(&ctx)?;
-        let model = model::get_model(ctx.model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
+        let model_id = self.ctx().table.get(&ctx)?.model_id;
+        let model = model::get_model(model_id).ok_or_else(|| anyhow::anyhow!("model not found"))?;
         let tokens = model.instruct().seal();
-        context::append_buffered_tokens(ctx.model_id, ctx.context_id, tokens)?;
+        self.ctx().table.get_mut(&ctx)?.buffered_tokens.extend(tokens);
         Ok(())
     }
 
