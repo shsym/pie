@@ -300,7 +300,7 @@ struct RestoreWaiter {
 ```
 
 Ordering: `effective_priority = priority_floor + AGING_RATE × wait_seconds`
-AGING_RATE = 1.0 — starvation freedom.
+AGING_RATE = 0.01 — starvation freedom.
 
 After `restore_process` completes, pending allocs are re-attempted. If allocation
 succeeds, the response channel fires Ok. The process unblocks and resumes.

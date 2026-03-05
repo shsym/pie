@@ -13,12 +13,14 @@
 use std::cmp::Ordering;
 use std::time::Instant;
 use tokio::sync::oneshot;
+use serde::Serialize;
 
-use crate::device::DeviceId;
+use crate::device;
 use crate::process::ProcessId;
 
 use super::{
     ContextId, ContextManager, ContextState, ProcessState,
+    ReplayFill,
 };
 use super::pagestore::PhysicalPageId;
 
@@ -30,7 +32,7 @@ use super::pagestore::PhysicalPageId;
 #[derive(Debug)]
 pub(crate) struct AllocWaiter {
     pub context_id: ContextId,
-    pub device: DeviceId,
+    pub device: usize,
     pub num_pages: usize,
     pub response: oneshot::Sender<anyhow::Result<()>>,
 }
@@ -115,7 +117,7 @@ impl ContextManager {
         if let Some(pid) = owner {
             if self.processes.get(&pid).map(|p| p.state == ProcessState::Pending).unwrap_or(false) {
                 self.pending_allocs_map.entry(pid).or_default().push(AllocWaiter {
-                    context_id: id, device: dev_idx as DeviceId,
+                    context_id: id, device: dev_idx,
                     num_pages: additional, response,
                 });
                 return;
@@ -125,7 +127,7 @@ impl ContextManager {
         // Step 1: FIFO GATE — if try_alloc has pending requests, enqueue behind them.
         if !self.try_alloc.is_empty() {
             self.try_alloc.push_back(AllocWaiter {
-                context_id: id, device: dev_idx as DeviceId,
+                context_id: id, device: dev_idx,
                 num_pages: additional, response,
             });
             return;
@@ -142,10 +144,10 @@ impl ContextManager {
                 let top_ready = self.pending_pinned_counts.get(&top_pid).copied().unwrap_or(0) == 0;
                 if top_ready && requester_floor < top.effective_priority() {
                     // Requester loses priority gate → suspend and enqueue in try_restore.
-                    let (pinned_count, _) = self.suspend_process(pid, dev_idx);
+                    let (pinned_count, _) = self.suspend_process(pid);
                     self.enqueue_restore(pid, requester_floor, pinned_count);
                     self.pending_allocs_map.entry(pid).or_default().push(AllocWaiter {
-                        context_id: id, device: dev_idx as DeviceId,
+                        context_id: id, device: dev_idx,
                         num_pages: additional, response,
                     });
                     return;
@@ -174,7 +176,7 @@ impl ContextManager {
             match self.find_eviction_victim(dev_idx, requester_floor, owner) {
                 Some(victim_pid) => {
                     let victim_floor = self.arbiter.priority(&victim_pid, dev_idx);
-                    let (pinned_count, active_count) = self.suspend_process(victim_pid, dev_idx);
+                    let (pinned_count, active_count) = self.suspend_process(victim_pid);
                     self.enqueue_restore(victim_pid, victim_floor, pinned_count);
 
                     // Step 5c: If ALL of victim's contexts were Pinned (none
@@ -206,21 +208,21 @@ impl ContextManager {
         if all_pinned_break {
             // Step 5c target: enqueue in try_alloc (requester stays Running).
             self.try_alloc.push_back(AllocWaiter {
-                context_id: id, device: dev_idx as DeviceId,
+                context_id: id, device: dev_idx,
                 num_pages: additional, response,
             });
         } else if let Some(pid) = owner {
             // Step 6: NO VICTIM / PINNED VICTIM — requester self-suspends.
-            let (pinned_count, _) = self.suspend_process(pid, dev_idx);
+            let (pinned_count, _) = self.suspend_process(pid);
             self.enqueue_restore(pid, requester_floor, pinned_count);
             self.pending_allocs_map.entry(pid).or_default().push(AllocWaiter {
-                context_id: id, device: dev_idx as DeviceId,
+                context_id: id, device: dev_idx,
                 num_pages: additional, response,
             });
         } else {
             // Owner-less context: enqueue in try_alloc FIFO.
             self.try_alloc.push_back(AllocWaiter {
-                context_id: id, device: dev_idx as DeviceId,
+                context_id: id, device: dev_idx,
                 num_pages: additional, response,
             });
         }
@@ -237,7 +239,7 @@ impl ContextManager {
         let n = pages.len();
         if let Some(ctx) = self.contexts.get_mut(&id) {
             ctx.working_pages.extend(pages);
-            ctx.device = Some(dev_idx as DeviceId);
+            ctx.device = Some(dev_idx);
         }
         if let Some(pid) = owner {
             self.arbiter.add_working(pid, dev_idx, n);
@@ -299,30 +301,31 @@ impl ContextManager {
         });
     }
 
-    /// Suspend all contexts of a process on a device (cooperative suspension).
+    /// Suspend all contexts of a process across ALL devices (cooperative suspension).
     /// - Active contexts: immediately suspend (working→CPU, chain released)
     /// - Pinned contexts: set `pending_suspend` flag (deferred)
     ///
     /// Always marks the process as Pending. Returns `(pinned_count, active_count)`:
     /// - `pinned_count`: Pinned contexts deferred (for `pending_pinned_counts`)
     /// - `active_count`: Active contexts immediately suspended (pages freed now)
-    pub(crate) fn suspend_process(&mut self, pid: ProcessId, dev_idx: usize) -> (usize, usize) {
+    pub(crate) fn suspend_process(&mut self, pid: ProcessId) -> (usize, usize) {
         let ctx_ids: Vec<ContextId> = self.processes.get(&pid)
             .map(|p| p.context_ids.clone())
             .unwrap_or_default();
 
         let mut pinned_count: usize = 0;
         let mut active_count: usize = 0;
+        let mut devices_touched: Vec<usize> = Vec::new();
 
         for &ctx_id in &ctx_ids {
-            let state = match self.contexts.get(&ctx_id) {
-                Some(ctx) => {
-                    let dev = ctx.device.unwrap_or(0) as usize;
-                    if dev != dev_idx { continue; }
-                    ctx.state
-                }
+            let (state, dev) = match self.contexts.get(&ctx_id) {
+                Some(ctx) => (ctx.state, ctx.device.unwrap_or(0) as usize),
                 None => continue,
             };
+
+            if !devices_touched.contains(&dev) {
+                devices_touched.push(dev);
+            }
 
             match state {
                 ContextState::Active => {
@@ -348,8 +351,10 @@ impl ContextManager {
             proc.state = ProcessState::Pending;
         }
 
-        // Zero out arbiter accounting for this device
-        self.arbiter.zero_device(pid, dev_idx);
+        // Zero out arbiter accounting for ALL devices the process has contexts on
+        for &dev in &devices_touched {
+            self.arbiter.zero_device(pid, dev);
+        }
 
         (pinned_count, active_count)
     }
@@ -368,6 +373,17 @@ impl ContextManager {
             let dev = &mut self.devices[dev_idx];
             match dev.swap_out(&working) {
                 Ok(swap_ops) => {
+                    // Fire D2H copy RPC (fire-and-forget)
+                    if !swap_ops.is_empty() {
+                        #[derive(Serialize)]
+                        struct SwapOutRequest { phys_ids: Vec<u32>, slots: Vec<PhysicalPageId> }
+                        let request = SwapOutRequest {
+                            phys_ids: swap_ops.iter().map(|op| op.gpu_phys).collect(),
+                            slots: swap_ops.iter().map(|op| op.cpu_slot).collect(),
+                        };
+                        let _ = device::call::<_, ()>(dev_idx, "swap_out_pages", &request);
+                    }
+
                     let cpu_slots: Vec<PhysicalPageId> = swap_ops.iter().map(|op| op.cpu_slot).collect();
                     if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                         ctx.working_pages.clear();
@@ -414,7 +430,8 @@ impl ContextManager {
     /// Handle ClearPinned message: Pinned → Active, then check deferred suspension.
     /// If `pending_suspend` was set, executes the deferred suspension and
     /// decrements the `pending_pinned_counts` side-map.
-    pub(crate) fn handle_clear_pinned(&mut self, id: ContextId) {
+    /// Returns replay chunks from drain_queues (if deferred suspension freed pages).
+    pub(crate) fn handle_clear_pinned(&mut self, id: ContextId) -> Vec<ReplayFill> {
         let pending = match self.contexts.get_mut(&id) {
             Some(ctx) if ctx.state == ContextState::Pinned => {
                 let pending = ctx.pending_suspend;
@@ -422,7 +439,7 @@ impl ContextManager {
                 ctx.pending_suspend = false;
                 pending
             }
-            _ => return,
+            _ => return Vec::new(),
         };
 
         if pending {
@@ -440,8 +457,10 @@ impl ContextManager {
             }
 
             // Deferred suspension may have freed pages — drain queues.
-            self.drain_queues();
+            return self.drain_queues();
         }
+
+        Vec::new()
     }
 
     // ==================== drain_queues ====================
@@ -451,12 +470,14 @@ impl ContextManager {
     /// Phase 1: try_alloc (FIFO) — serve front-of-queue allocations.
     /// Phase 2: try_restore (priority heap) — restore highest-priority Pending
     ///          process, then replay its pending_allocs.
-    pub(crate) fn drain_queues(&mut self) {
+    pub(crate) fn drain_queues(&mut self) -> Vec<ReplayFill> {
         // Phase 1: try_alloc FIFO (head-of-line blocking)
         while let Some(front) = self.try_alloc.front() {
             let dev_idx = front.device as usize;
             let n = front.num_pages;
 
+            // Evict unreferenced committed pages (rc=0) before attempting alloc
+            self.devices[dev_idx].evict_unreferenced();
             if let Some(pages) = self.devices[dev_idx].alloc_working(n) {
                 let waiter = self.try_alloc.pop_front().unwrap();
                 let owner = self.contexts.get(&waiter.context_id).and_then(|c| c.owner);
@@ -467,9 +488,11 @@ impl ContextManager {
             }
         }
 
+        let mut all_replay_chunks = Vec::new();
+
         // Phase 2: try_restore (priority heap)
         // Only proceed if try_alloc is empty (allocs have strict priority).
-        if !self.try_alloc.is_empty() { return; }
+        if !self.try_alloc.is_empty() { return all_replay_chunks; }
 
         while let Some(top) = self.try_restore.peek() {
             let pid = top.process_id;
@@ -485,8 +508,11 @@ impl ContextManager {
             }
 
             let waiter = self.try_restore.pop().unwrap();
-            self.restore_and_replay(waiter.process_id);
+            let chunks = self.restore_and_replay(waiter.process_id);
+            all_replay_chunks.extend(chunks);
         }
+
+        all_replay_chunks
     }
 }
 

@@ -32,10 +32,11 @@ use anyhow::{Result, Context as _};
 use crate::service::{ServiceArray, ServiceHandler};
 use crate::adapter::AdapterId;
 use crate::inference::brle::Brle;
+use crate::inference::request::{ForwardPassRequest, BatchedForwardPassRequest};
 use crate::process::ProcessId;
+use crate::device::{self, DeviceId};
 
 use pagestore::{PhysicalPageId, PageHash, PageStore};
-use crate::device::DeviceId;
 use arbiter::Arbiter;
 use contention::{AllocWaiter, RestoreWaiter};
 
@@ -313,6 +314,7 @@ pub(crate) enum Record {
 
 #[derive(Debug, Clone)]
 pub struct ReplayFill {
+    pub context_id: ContextId,
     pub tokens: Vec<u32>,
     pub positions: Vec<u32>,
     pub masks: Vec<Brle>,
@@ -936,6 +938,71 @@ pub(crate) enum Message {
     SetDagWeights { weight: f64, pid_values: HashMap<ProcessId, f64> },
 }
 
+impl ContextManager {
+    /// Dispatch replay forward passes for KV cache recomputation.
+    ///
+    /// Each ReplayFill contains tokens that need to be run through the model
+    /// to regenerate KV data for committed pages lost during eviction.
+    /// After the forward pass, the working pages are committed.
+    async fn dispatch_replay_chunks(&mut self, chunks: Vec<ReplayFill>) {
+        if chunks.is_empty() { return; }
+
+        let mut ctx_ids_needing_finish: Vec<ContextId> = Vec::new();
+
+        for chunk in chunks {
+            let ctx_id = chunk.context_id;
+
+            // Build a minimal forward pass request (no sampling — just KV fill)
+            let fwd_req = ForwardPassRequest {
+                context_id: 0, // unused — page IDs provided directly
+                tokens: chunk.tokens.clone(),
+                positions: chunk.positions.clone(),
+                speculative_tokens: Vec::new(),
+                speculative_positions: Vec::new(),
+                output_speculative_tokens: false,
+                masks: chunk.masks.clone(),
+                logit_mask: None,
+                sampling_indices: Vec::new(),
+                samplers: Vec::new(),
+                adapter_id: chunk.adapter,
+                adapter_seed: None,
+                arrival_time: None,
+            };
+
+            let phys_ids: Vec<u32> = chunk.physical_page_ids.iter().map(|&p| p as u32).collect();
+            let mut batch = BatchedForwardPassRequest::new(chunk.device_id);
+            batch.add_request(&fwd_req, &phys_ids, chunk.last_page_len);
+
+            let result = device::call_with_timeout::<_, crate::inference::request::BatchedForwardPassResponse>(
+                chunk.device_id, "fire_batch", &batch,
+                std::time::Duration::from_secs(30),
+            ).await;
+
+            if let Err(e) = result {
+                eprintln!("REPLAY_FWD_FAIL ctx={ctx_id} device={} err={e:#}", chunk.device_id);
+                // RPC failed — still finish restore to avoid permanently Pinned state.
+                // The context will have a truncated committed chain but can still serve.
+                if !ctx_ids_needing_finish.contains(&ctx_id) {
+                    ctx_ids_needing_finish.push(ctx_id);
+                }
+                continue;
+            }
+
+            let _ = self.commit_replay_chunk_impl(
+                ctx_id, chunk.num_pages,
+                chunk.tokens, chunk.positions, chunk.masks, chunk.adapter,
+            );
+            if !ctx_ids_needing_finish.contains(&ctx_id) {
+                ctx_ids_needing_finish.push(ctx_id);
+            }
+        }
+
+        for id in ctx_ids_needing_finish {
+            self.finish_restore_impl(id);
+        }
+    }
+}
+
 impl ServiceHandler for ContextManager {
     type Message = Message;
 
@@ -962,19 +1029,22 @@ impl ServiceHandler for ContextManager {
             }
             Message::Destroy { id, force: _, response } => {
                 let _ = response.send(self.destroy_context(id));
-                self.drain_queues();
+                let chunks = self.drain_queues();
+                self.dispatch_replay_chunks(chunks).await;
             }
             Message::Fork { id, response } => { let _ = response.send(self.fork(id)); }
             Message::CommitPages { id, page_indices, response } => {
                 let _ = response.send(self.commit_pages_impl(id, page_indices));
-                self.drain_queues();
+                let chunks = self.drain_queues();
+                self.dispatch_replay_chunks(chunks).await;
             }
             Message::ReservePages { id, num_pages, response } => {
                 self.handle_reserve_pages(id, num_pages, response);
             }
             Message::ReleasePages { id, num_pages } => {
                 let _ = self.free_pages(id, num_pages);
-                self.drain_queues();
+                let chunks = self.drain_queues();
+                self.dispatch_replay_chunks(chunks).await;
             }
             Message::GetPhysicalPageIds { id, response } => {
                 let _ = response.send(self.get_physical_page_ids_impl(id));
@@ -984,10 +1054,12 @@ impl ServiceHandler for ContextManager {
             }
             Message::FinishRestore { id } => {
                 self.finish_restore_impl(id);
-                self.drain_queues();
+                let chunks = self.drain_queues();
+                self.dispatch_replay_chunks(chunks).await;
             }
             Message::ClearPinned { id } => {
-                self.handle_clear_pinned(id);
+                let chunks = self.handle_clear_pinned(id);
+                self.dispatch_replay_chunks(chunks).await;
             }
             Message::GetStats { response } => {
                 let stats: Vec<_> = self.devices.iter().map(|d| d.stats()).collect();
@@ -1006,7 +1078,8 @@ impl ServiceHandler for ContextManager {
                 for (pid, value) in pid_values {
                     self.arbiter.set_weight(pid, weight * value);
                 }
-                self.drain_queues();
+                let chunks = self.drain_queues();
+                self.dispatch_replay_chunks(chunks).await;
             }
         }
     }

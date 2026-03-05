@@ -1,0 +1,723 @@
+//! # Context Module
+//!
+//! Manages named execution contexts with KV cache state for model inference.
+//!
+//! Each model gets a dedicated ContextManager actor that handles:
+//! - Context creation, destruction, and forking
+//! - Lock acquisition for exclusive access
+//! - Page management (commit, reserve, release)
+//! - Token buffering and cursor tracking
+//!
+//! Contexts are stored per-model via a ServiceArray, accessed by model index.
+pub mod kvcache;
+mod arbiter;
+mod manager;
+mod waitqueue;
+mod residency;
+
+use dashmap::DashMap;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::time::Instant;
+use tokio::sync::oneshot;
+use anyhow::{Result, Context as _};
+use serde::Serialize;
+
+use crate::service::{ServiceArray, ServiceHandler};
+use crate::adapter::AdapterId;
+use crate::inference::brle::Brle;
+use crate::process::ProcessId;
+
+use kvcache::{PhysicalPageId, PageHash};
+use crate::device::DeviceId;
+use manager::ContextManager;
+use waitqueue::{PageWaiter, WaitNeeded};
+
+
+
+// =============================================================================
+// Public Types
+// =============================================================================
+
+pub type ContextId = u64;
+
+// =============================================================================
+// Globals
+// =============================================================================
+
+static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
+static CONTEXTS: LazyLock<DashMap<(usize, ContextId), Context>> = LazyLock::new(DashMap::new);
+static PAGE_SIZES: LazyLock<boxcar::Vec<usize>> = LazyLock::new(boxcar::Vec::new);
+
+// =============================================================================
+// Public API
+// =============================================================================
+
+/// Spawns a new context manager for a model.
+pub fn spawn(page_size: usize, num_gpu_pages: Vec<usize>, num_cpu_pages: Vec<usize>) -> usize {
+    PAGE_SIZES.push(page_size);
+    SERVICES.spawn(move || manager::ContextManager::new(
+        SERVICES.len().saturating_sub(1), page_size, &num_gpu_pages, &num_cpu_pages,
+    )).expect("Failed to spawn context manager")
+}
+
+// ---------- Actor-routed (needs DevicePageCache) ----------
+
+pub async fn open(model_idx: usize, username: String, name: String) -> Result<ContextId> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Open { username, name, response: tx })?;
+    rx.await.context("context::open: actor dropped response")?
+}
+
+pub async fn create(model_idx: usize) -> Result<ContextId> {
+    create_owned(model_idx, None).await
+}
+
+pub async fn create_owned(model_idx: usize, owner: Option<ProcessId>) -> Result<ContextId> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Create { owner, response: tx })?;
+    rx.await.context("context::create_owned: actor dropped response")?
+}
+
+pub async fn save(model_idx: usize, id: ContextId, username: String, name: String) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Save { id, username, name, response: tx })?;
+    rx.await.context("context::save: actor dropped response")?
+}
+
+pub async fn snapshot(model_idx: usize, id: ContextId, username: String) -> Result<String> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Snapshot { id, username, response: tx })?;
+    rx.await.context("context::snapshot: actor dropped response")?
+}
+
+pub async fn delete(model_idx: usize, username: String, name: String) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Delete { username, name, response: tx })?;
+    rx.await.context("context::delete: actor dropped response")?
+}
+
+pub async fn destroy(model_idx: usize, id: ContextId, force: bool) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Destroy { id, force, response: tx })?;
+    rx.await.context("context::destroy: actor dropped response")?
+}
+
+pub async fn fork(model_idx: usize, id: ContextId) -> Result<ContextId> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Fork { id, response: tx })?;
+    rx.await.context("context::fork: actor dropped response")?
+}
+
+pub async fn commit_pages(model_idx: usize, id: ContextId, page_indices: Vec<u32>) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::CommitPages { id, page_indices, response: tx })?;
+    rx.await.context("context::commit_pages: actor dropped response")?
+}
+
+pub async fn reserve_pages(model_idx: usize, id: ContextId, num_pages: u32) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::ReservePages { id, num_pages, response: tx })?;
+    rx.await.context("context::reserve_pages: actor dropped response")?
+}
+
+pub fn release_pages(model_idx: usize, id: ContextId, num_pages: u32) -> Result<()> {
+    SERVICES.send(model_idx, Message::ReleasePages { id, num_pages })
+}
+
+pub async fn get_physical_page_ids(model_idx: usize, id: ContextId) -> Result<HashMap<DeviceId, Vec<PhysicalPageId>>> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::GetPhysicalPageIds { id, response: tx })?;
+    rx.await.context("context::get_physical_page_ids: actor dropped response")?
+}
+
+/// Result of ensure_resident: replay chunks (if any) + physical page IDs.
+/// On the fast path (no replay), pages are resolved atomically with InFlight.
+/// On the replay path, pages are empty — they come from finish_restore.
+#[derive(Debug)]
+pub struct ResidentResult {
+    pub replay_chunks: Option<Vec<ReplayFill>>,
+    pub pages: HashMap<DeviceId, Vec<PhysicalPageId>>,
+    /// KV length at the time of page resolution — must be used instead of
+    /// context::kv_len() to avoid non-atomic read races.
+    pub kv_len: u32,
+    /// Debug: context state at the time of page resolution (atomic).
+    pub debug_state: String,
+}
+
+pub async fn ensure_resident(model_idx: usize, id: ContextId) -> Result<ResidentResult> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::EnsureResident { id, response: tx })?;
+    rx.await.context("context::ensure_resident: actor dropped response")?
+}
+
+pub async fn commit_replay_chunk(
+    model_idx: usize, id: ContextId, num_pages: u32,
+    tokens: Vec<u32>, positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
+) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::CommitReplayFill {
+        id, num_pages, tokens, positions, masks, adapter, response: tx,
+    })?;
+    rx.await.context("context::commit_replay_chunk: actor dropped response")?
+}
+
+pub fn finish_restore(model_idx: usize, id: ContextId) -> Result<()> {
+    SERVICES.send(model_idx, Message::FinishRestore { id })
+}
+
+pub async fn get_stats(model_idx: usize) -> Vec<(usize, usize)> {
+    let (tx, rx) = oneshot::channel();
+    let _ = SERVICES.send(model_idx, Message::GetStats { response: tx });
+    rx.await.unwrap_or_default()
+}
+
+// ---------- Arbiter policy (broadcast to all models) ----------
+
+/// Set DAG-derived weights for processes in all model arbiters.
+/// Called by the workflow actor when DAG topology changes.
+pub fn set_dag_weights(
+    weight: f64,
+    pid_values: HashMap<ProcessId, f64>,
+) {
+    for model_idx in 0..SERVICES.len() {
+        let _ = SERVICES.send(model_idx, Message::SetDagWeights {
+            weight,
+            pid_values: pid_values.clone(),
+        });
+    }
+}
+
+// ---------- Direct (no actor, uses global CONTEXTS DashMap) ----------
+
+pub fn tokens_per_page(model_idx: usize, _id: ContextId) -> u32 {
+    PAGE_SIZES.get(model_idx).map(|v| *v as u32).unwrap_or(0)
+}
+
+pub fn committed_page_count(model_idx: usize, id: ContextId) -> u32 {
+    CONTEXTS.get(&(model_idx, id)).map(|ctx| ctx.committed_len as u32).unwrap_or(0)
+}
+
+pub fn kv_len(model_idx: usize, id: ContextId) -> u32 {
+    let page_size = PAGE_SIZES.get(model_idx).copied().unwrap_or(0);
+    CONTEXTS.get(&(model_idx, id))
+        .map(|ctx| (ctx.committed_len * page_size + ctx.tokens_filled.len()) as u32)
+        .unwrap_or(0)
+}
+
+/// Debug: return context state string for diagnostics
+pub fn debug_context_state(model_idx: usize, id: ContextId) -> String {
+    CONTEXTS.get(&(model_idx, id))
+        .map(|ctx| format!(
+            "committed_len={} tokens_filled={} working_pages={} working_cpu={} state={:?}",
+            ctx.committed_len, ctx.tokens_filled.len(),
+            ctx.working_pages.len(), ctx.working_cpu_slots.len(),
+            ctx.state,
+        ))
+        .unwrap_or_else(|| "MISSING".to_string())
+}
+
+pub fn get_cursor(model_idx: usize, id: ContextId) -> u32 {
+    CONTEXTS.get(&(model_idx, id)).map(|ctx| ctx.cursor()).unwrap_or(0)
+}
+
+pub fn is_active(model_idx: usize, id: ContextId) -> bool {
+    CONTEXTS.get(&(model_idx, id)).map(|ctx| matches!(ctx.state, ContextState::Active | ContextState::InFlight)).unwrap_or(false)
+}
+
+/// Try to pin context as InFlight (non-evictable). Returns true on success.
+/// Returns false if the context was evicted (Suspended) between page resolution
+/// and this call — meaning the resolved pages are stale.
+pub fn set_in_flight(model_idx: usize, id: ContextId) -> bool {
+    if let Some(mut ctx) = CONTEXTS.get_mut(&(model_idx, id)) {
+        if ctx.state == ContextState::Active {
+            ctx.state = ContextState::InFlight;
+            return true;
+        }
+    }
+    false
+}
+
+/// Clear in-flight state (fire-and-forget actor message).
+/// Transitions InFlight → Active and triggers waiter processing.
+pub fn clear_in_flight(model_idx: usize, id: ContextId) {
+    let _ = SERVICES.send(model_idx, Message::ClearInFlight { id });
+}
+pub fn set_cursor(model_idx: usize, id: ContextId, cursor: u32) -> Result<()> {
+    let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
+        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+    let before = ctx.tokens_filled.len();
+    let result = ctx.set_cursor(cursor);
+    let after = ctx.tokens_filled.len();
+    if after < before {
+        eprintln!("SET_CURSOR ctx={id} cursor={cursor} tf_before={before} tf_after={after}");
+    }
+    result
+}
+
+pub fn last_position(model_idx: usize, id: ContextId) -> Option<u32> {
+    CONTEXTS.get(&(model_idx, id)).and_then(|ctx| ctx.last_position())
+}
+
+pub fn get_buffered_tokens(model_idx: usize, id: ContextId) -> Vec<u32> {
+    CONTEXTS.get(&(model_idx, id)).map(|ctx| ctx.tokens_buffered.clone()).unwrap_or_default()
+}
+
+pub fn set_buffered_tokens(model_idx: usize, id: ContextId, tokens: Vec<u32>) -> Result<()> {
+    let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
+        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+    ctx.tokens_buffered = tokens;
+    Ok(())
+}
+
+pub fn append_buffered_tokens(model_idx: usize, id: ContextId, tokens: Vec<u32>) -> Result<()> {
+    let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
+        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+    ctx.tokens_buffered.extend(tokens);
+    Ok(())
+}
+
+pub fn fill(
+    model_idx: usize, id: ContextId, n: usize,
+    positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
+) -> Result<()> {
+    let mut ctx = CONTEXTS.get_mut(&(model_idx, id))
+        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+    let before = ctx.tokens_filled.len();
+    let result = ctx.fill(n, positions, masks, adapter);
+    let after = ctx.tokens_filled.len();
+    if after < 50 {
+        eprintln!("FILL ctx={id} n={n} tf_before={before} tf_after={after}");
+    }
+    result
+}
+
+// =============================================================================
+// Internal Types
+// =============================================================================
+
+#[derive(Debug, Clone)]
+enum Record {
+    Fill {
+        tokens: Vec<u32>,
+        positions: Vec<u32>,
+        mask: Vec<Brle>,
+        adapter: Option<AdapterId>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplayFill {
+    pub tokens: Vec<u32>,
+    pub positions: Vec<u32>,
+    pub masks: Vec<Brle>,
+    pub adapter: Option<AdapterId>,
+    pub physical_page_ids: Vec<PhysicalPageId>,
+    pub device_id: DeviceId,
+    pub kv_len: u32,
+    pub last_page_len: u32,
+    pub num_pages: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenInfo {
+    pub token: u32,
+    pub position: u32,
+    pub mask: Brle,
+    pub adapter: Option<AdapterId>,
+}
+
+// =============================================================================
+// Context
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextState {
+    /// Active on GPU, ready for inference.
+    Active,
+    /// Active on GPU, forward pass in progress — not evictable.
+    /// Prevents TOCTOU race between get_physical_page_ids and inference::submit.
+    InFlight,
+    /// Committed chain refcounts released, working pages on CPU.
+    Suspended,
+    /// Being restored — replay in progress.
+    Restoring,
+}
+
+#[derive(Debug, Clone)]
+struct Context {
+    /// Process that owns this context (None for named snapshots).
+    owner: Option<ProcessId>,
+    /// Device this context is on (None if fully evicted).
+    device: Option<DeviceId>,
+    /// Physical page IDs for uncommitted (working) pages on GPU.
+    working_pages: Vec<PhysicalPageId>,
+    /// CPU slots for working pages when suspended.
+    working_cpu_slots: Vec<PhysicalPageId>,
+    /// Tip of the committed hash chain (None if no commits yet).
+    committed_tip: Option<PageHash>,
+    /// Number of committed pages.
+    committed_len: usize,
+
+    // Token state
+    tokens_filled: Vec<TokenInfo>,
+    tokens_buffered: Vec<u32>,
+    lineage: Vec<Record>,
+
+    // Scheduling
+    max_committed_position: Option<u32>,
+    state: ContextState,
+    last_access: Instant,
+}
+
+impl Context {
+    fn new(owner: Option<ProcessId>) -> Self {
+        Context {
+            owner,
+            device: None,
+            working_pages: Vec::new(),
+            working_cpu_slots: Vec::new(),
+            committed_tip: None,
+            committed_len: 0,
+            tokens_filled: Vec::new(),
+            tokens_buffered: Vec::new(),
+            lineage: Vec::new(),
+            max_committed_position: None,
+            state: ContextState::Active,
+            last_access: Instant::now(),
+        }
+    }
+
+    fn cursor(&self) -> u32 { self.tokens_filled.len() as u32 }
+
+    fn set_cursor(&mut self, cursor: u32) -> Result<()> {
+        let max = self.tokens_filled.len();
+        if cursor as usize > max { anyhow::bail!("cursor {} out of range 0..={}", cursor, max); }
+        self.tokens_filled.truncate(cursor as usize);
+        Ok(())
+    }
+
+    fn last_position(&self) -> Option<u32> {
+        let max_filled = self.tokens_filled.iter().map(|t| t.position).max();
+        match (self.max_committed_position, max_filled) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn num_uncommitted(&self) -> usize { self.working_pages.len() }
+
+    fn has_gpu_pages(&self) -> bool {
+        // Suspended contexts with working_pages also hold GPU pages
+        // (e.g. from a failed restore that couldn't roll back to CPU).
+        // They must be visible to the eviction system.
+        if !self.working_pages.is_empty() {
+            return true;
+        }
+        matches!(self.state, ContextState::Active | ContextState::InFlight)
+            && self.committed_tip.is_some()
+    }
+
+    fn fill(&mut self, n: usize, positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>) -> Result<()> {
+        if n > self.tokens_buffered.len() {
+            anyhow::bail!("fill: n ({}) > tokens_buffered ({})", n, self.tokens_buffered.len());
+        }
+        if positions.len() != n { anyhow::bail!("positions length {} != n {}", positions.len(), n); }
+        if !masks.is_empty() && masks.len() != n { anyhow::bail!("masks length {} != n {}", masks.len(), n); }
+
+        let tokens: Vec<u32> = self.tokens_buffered.drain(..n).collect();
+        for (i, token) in tokens.into_iter().enumerate() {
+            self.tokens_filled.push(TokenInfo {
+                token, position: positions[i],
+                mask: if masks.is_empty() { Brle::new(0) } else { masks[i].clone() },
+                adapter,
+            });
+        }
+        Ok(())
+    }
+}
+
+// =============================================================================
+// Message & ServiceHandler
+// =============================================================================
+
+#[derive(Debug)]
+pub(crate) enum Message {
+    Open { username: String, name: String, response: oneshot::Sender<Result<ContextId>> },
+    Create { owner: Option<ProcessId>, response: oneshot::Sender<Result<ContextId>> },
+    Save { id: ContextId, username: String, name: String, response: oneshot::Sender<Result<()>> },
+    Snapshot { id: ContextId, username: String, response: oneshot::Sender<Result<String>> },
+    Delete { username: String, name: String, response: oneshot::Sender<Result<()>> },
+    Destroy { id: ContextId, force: bool, response: oneshot::Sender<Result<()>> },
+    Fork { id: ContextId, response: oneshot::Sender<Result<ContextId>> },
+    CommitPages { id: ContextId, page_indices: Vec<u32>, response: oneshot::Sender<Result<()>> },
+    ReservePages { id: ContextId, num_pages: u32, response: oneshot::Sender<Result<()>> },
+    ReleasePages { id: ContextId, num_pages: u32 },
+    GetPhysicalPageIds { id: ContextId, response: oneshot::Sender<Result<HashMap<DeviceId, Vec<PhysicalPageId>>>> },
+    EnsureResident { id: ContextId, response: oneshot::Sender<Result<ResidentResult>> },
+    CommitReplayFill {
+        id: ContextId, num_pages: u32,
+        tokens: Vec<u32>, positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
+        response: oneshot::Sender<Result<()>>,
+    },
+    FinishRestore { id: ContextId },
+    ClearInFlight { id: ContextId },
+    GetStats { response: oneshot::Sender<Vec<(usize, usize)>> },
+    SetDagWeights { weight: f64, pid_values: HashMap<ProcessId, f64> },
+}
+
+impl ServiceHandler for ContextManager {
+    type Message = Message;
+
+    async fn handle(&mut self, msg: Message) {
+        self.msg_counter += 1;
+
+        // Periodic state dump for deadlock diagnosis
+        if self.msg_counter % 200 == 0 {
+            let mut active = 0u32;
+            let mut in_flight = 0u32;
+            let mut suspended = 0u32;
+            let mut restoring = 0u32;
+            let mut total_working = 0usize;
+            let mut total_committed = 0usize;
+            for entry in CONTEXTS.iter() {
+                let &(model_idx, _) = entry.key();
+                if model_idx != self.model_idx { continue; }
+                let ctx = entry.value();
+                match ctx.state {
+                    ContextState::Active => active += 1,
+                    ContextState::InFlight => in_flight += 1,
+                    ContextState::Suspended => suspended += 1,
+                    ContextState::Restoring => restoring += 1,
+                }
+                total_working += ctx.working_pages.len();
+                total_committed += ctx.committed_len;
+            }
+            let queue_sizes: Vec<usize> = self.wait_queues.iter().map(|q| q.len()).collect();
+            let avail: Vec<usize> = self.devices.iter().map(|d| d.available_gpu_pages()).collect();
+            let stats: Vec<(usize, usize)> = self.devices.iter().map(|d| d.stats()).collect();
+            let breakdowns: Vec<_> = self.devices.iter().map(|d| d.page_breakdown()).collect();
+            eprintln!(
+                "[STATE msg={}] active={active} inflight={in_flight} suspended={suspended} \
+                 restoring={restoring} working_pages={total_working} committed_pages={total_committed} \
+                 queues={queue_sizes:?} avail={avail:?} gpu_stats={stats:?} breakdown={breakdowns:?}",
+                self.msg_counter,
+            );
+        }
+
+        match msg {
+            Message::Open { username, name, response } => {
+                let result = match self.name_to_id.get(&(username, name)) {
+                    Some(&snapshot_id) => self.fork(snapshot_id),
+                    None => Err(anyhow::anyhow!("Snapshot not found")),
+                };
+                let _ = response.send(result);
+            }
+            Message::Create { owner, response } => { let _ = response.send(self.create(owner)); }
+            Message::Save { id, username, name, response } => {
+                let _ = response.send(self.save(id, username, name));
+            }
+            Message::Snapshot { id, username, response } => {
+                let _ = response.send(self.snapshot(id, username));
+            }
+            Message::Delete { username, name, response } => {
+                let _ = response.send(self.delete(username, name));
+            }
+            Message::Destroy { id, force, response } => {
+                let dev = CONTEXTS.get(&(self.model_idx, id))
+                    .map(|c| c.device.unwrap_or(0) as usize);
+                let _ = response.send(self.destroy(id, force));
+                if let Some(d) = dev {
+                    self.try_serve_waiters(Some(d)).await;
+                }
+            }
+            Message::Fork { id, response } => { let _ = response.send(self.fork(id)); }
+            Message::CommitPages { id, page_indices, response } => {
+                let ctx = CONTEXTS.get(&(self.model_idx, id));
+                let (dev_idx, state, owner) = match ctx.as_ref() {
+                    Some(c) => (c.device.unwrap_or(0) as usize, c.state, c.owner),
+                    None => {
+                        let _ = response.send(Err(anyhow::anyhow!("Context not found")));
+                        return;
+                    }
+                };
+                drop(ctx);
+
+                // If context was suspended (evicted), do a logical commit —
+                // update lineage and metadata without GPU page operations.
+                // Equivalent to restore → commit → suspend, but free.
+                if !matches!(state, ContextState::Active | ContextState::InFlight) {
+                    let tf_before = CONTEXTS.get(&(self.model_idx, id))
+                        .map(|c| c.tokens_filled.len()).unwrap_or(0);
+                    eprintln!(
+                        "LOGICAL_COMMIT ctx={id} state={state:?} \
+                         tokens_filled={tf_before} pages={page_indices:?}"
+                    );
+                    let _ = response.send(self.commit_pages_logical(id, page_indices));
+                    return;
+                }
+
+                let _ = response.send(self.commit_pages(id, page_indices));
+                self.try_serve_waiters(Some(dev_idx)).await;
+            }
+            Message::ReservePages { id, num_pages, response } => {
+                let ctx = CONTEXTS.get(&(self.model_idx, id));
+                let (dev, owner, has_committed) = ctx.as_ref()
+                    .map(|c| (c.device.unwrap_or(0), c.owner, c.committed_len > 0))
+                    .unwrap_or((0, None, false));
+                drop(ctx);
+                let dev_idx = dev as usize;
+                let floor = self.requester_floor(owner, dev_idx, num_pages as usize);
+
+                // Contexts with committed pages have invested GPU resources
+                // and must complete to free them — never delay behind waiters.
+                let should_queue = !has_committed && self.wait_queues[dev_idx].peek()
+                    .is_some_and(|top| floor < top.effective_floor());
+
+                if should_queue {
+                    tracing::info!("Enqueuing ReservePages waiter for ctx {id} on dev {dev_idx} behind queue (floor={floor:.1})");
+                    self.wait_queues[dev_idx].push(PageWaiter::Allocate {
+                        context_id: id, device: dev,
+                        num_pages: num_pages as usize, requester: owner,
+                        priority_floor: floor, enqueued_at: Instant::now(), response,
+                    });
+                } else {
+                    match self.reserve_pages(id, num_pages).await {
+                        Ok(()) => { let _ = response.send(Ok(())); }
+                        Err(WaitNeeded::NeedPages) => {
+                            tracing::info!("Enqueuing ReservePages waiter for ctx {id} on dev {dev_idx} (floor={floor:.1})");
+                            self.wait_queues[dev_idx].push(PageWaiter::Allocate {
+                                context_id: id, device: dev,
+                                num_pages: num_pages as usize, requester: owner,
+                                priority_floor: floor, enqueued_at: Instant::now(), response,
+                            });
+                        }
+                        Err(WaitNeeded::Fatal(e)) => { let _ = response.send(Err(e)); }
+                    }
+                }
+            }
+            Message::ReleasePages { id, num_pages } => {
+                let dev = CONTEXTS.get(&(self.model_idx, id))
+                    .map(|c| c.device.unwrap_or(0) as usize);
+                let _ = self.free_pages(id, num_pages);
+                if let Some(d) = dev {
+                    self.try_serve_waiters(Some(d)).await;
+                }
+            }
+            Message::GetPhysicalPageIds { id, response } => {
+                let _ = response.send(self.get_physical_page_ids(id));
+            }
+            Message::EnsureResident { id, response } => {
+                let ctx = CONTEXTS.get(&(self.model_idx, id));
+                let (dev, owner, has_committed, is_suspended, has_cpu_working) = ctx.as_ref()
+                    .map(|c| (
+                        c.device.unwrap_or(0), c.owner, c.committed_len > 0,
+                        c.state == ContextState::Suspended,
+                        !c.working_cpu_slots.is_empty(),
+                    ))
+                    .unwrap_or((0, None, false, false, false));
+                drop(ctx);
+                let dev_idx = dev as usize;
+                let floor = self.requester_floor(owner, dev_idx, 1);
+
+                // Skip queueing when ensure_resident won't need pages:
+                //   - Committed contexts must complete (invested GPU resources)
+                //   - Non-suspended contexts without CPU working pages get the
+                //     fast path in ensure_resident (no pages needed at all)
+                let needs_pages = is_suspended || has_cpu_working;
+                let should_queue = !has_committed && needs_pages && self.wait_queues[dev_idx].peek()
+                    .is_some_and(|top| floor < top.effective_floor());
+
+                if should_queue {
+                    tracing::info!("Enqueuing EnsureResident waiter for ctx {id} on dev {dev_idx} behind queue (floor={floor:.1})");
+                    self.wait_queues[dev_idx].push(PageWaiter::Restore {
+                        context_id: id, device: dev,
+                        requester: owner, priority_floor: floor,
+                        enqueued_at: Instant::now(), response,
+                    });
+                } else {
+                    match self.ensure_resident(id).await {
+                        Ok(replay_chunks) => {
+                            // Fast path: no replay needed — atomically resolve
+                            // pages + pin InFlight in this same actor message.
+                            // No eviction can happen between these operations.
+                            let (pages, kv_len, debug_state) = if replay_chunks.is_none() {
+                                let pages = self.get_physical_page_ids(id).unwrap_or_default();
+                                let phys_len = pages.values().map(|v| v.len()).sum::<usize>();
+                                // Compute kv_len and debug state atomically with page resolution
+                                let (kv_len, debug_state) = {
+                                    let page_size = PAGE_SIZES.get(self.model_idx).copied().unwrap_or(0);
+                                    CONTEXTS.get(&(self.model_idx, id))
+                                        .map(|ctx| {
+                                            let kv = (ctx.committed_len * page_size + ctx.tokens_filled.len()) as u32;
+                                            let state = format!(
+                                                "committed_len={} tokens_filled={} working_pages={} working_cpu={} state={:?} phys_len={}",
+                                                ctx.committed_len, ctx.tokens_filled.len(),
+                                                ctx.working_pages.len(), ctx.working_cpu_slots.len(),
+                                                ctx.state, phys_len,
+                                            );
+                                            (kv, state)
+                                        })
+                                        .unwrap_or((0, "MISSING".to_string()))
+                                };
+                                // Pin InFlight: context is never Active while a
+                                // process holds resolved page IDs.
+                                if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                                    ctx.state = ContextState::InFlight;
+                                }
+                                (pages, kv_len, debug_state)
+                            } else {
+                                (HashMap::new(), 0, "replay".to_string())
+                            };
+                            let _ = response.send(Ok(ResidentResult { replay_chunks, pages, kv_len, debug_state }));
+                        }
+                        Err(WaitNeeded::NeedPages) => {
+                            tracing::info!("Enqueuing EnsureResident waiter for ctx {id} on dev {dev_idx} (floor={floor:.1})");
+                            self.wait_queues[dev_idx].push(PageWaiter::Restore {
+                                context_id: id, device: dev,
+                                requester: owner, priority_floor: floor,
+                                enqueued_at: Instant::now(), response,
+                            });
+                        }
+                        Err(WaitNeeded::Fatal(e)) => { let _ = response.send(Err(e)); }
+                    }
+                }
+            }
+            Message::CommitReplayFill { id, num_pages, tokens, positions, masks, adapter, response } => {
+                let _ = response.send(self.commit_replay_chunk(id, num_pages, tokens, positions, masks, adapter));
+            }
+            Message::FinishRestore { id } => {
+                let dev = CONTEXTS.get(&(self.model_idx, id))
+                    .map(|c| c.device.unwrap_or(0) as usize);
+                // finish_restore sets InFlight (Restoring → InFlight)
+                self.finish_restore(id);
+                if let Some(d) = dev {
+                    self.try_serve_waiters(Some(d)).await;
+                }
+            }
+            Message::ClearInFlight { id } => {
+                let dev = CONTEXTS.get(&(self.model_idx, id))
+                    .map(|c| c.device.unwrap_or(0) as usize);
+                // InFlight → Active: forward pass completed, context is evictable again
+                if let Some(mut ctx) = CONTEXTS.get_mut(&(self.model_idx, id)) {
+                    if ctx.state == ContextState::InFlight {
+                        ctx.state = ContextState::Active;
+                    }
+                }
+                if let Some(d) = dev {
+                    self.try_serve_waiters(Some(d)).await;
+                }
+            }
+            Message::GetStats { response } => {
+                let stats: Vec<_> = self.devices.iter().map(|d| d.stats()).collect();
+                let _ = response.send(stats);
+            }
+            Message::SetDagWeights { weight, pid_values } => {
+                for (pid, value) in pid_values {
+                    self.arbiter.set_node_weight(pid, weight * value);
+                }
+                self.try_serve_waiters(None).await;
+            }
+        }
+    }
+}
