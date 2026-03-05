@@ -5,7 +5,6 @@ pub mod adapter;
 pub mod api;
 pub mod auth;
 pub mod context;
-pub mod context_legacy;
 pub mod device;
 pub mod bootstrap;
 pub mod inference;

@@ -1,15 +1,8 @@
-//! Restore — Process and Context Restoration Logic.
-//!
-//! Handles the CPU→GPU migration path for suspended contexts:
-//! 1. Swap-in working pages from CPU
-//! 2. Rebuild committed chain via longest prefix match + replay
-//! 3. Transition context Active, process Running
-
 use std::collections::HashMap;
 
 use super::{
     ContextId, ContextManager, ContextState, ProcessState,
-    Record, ReplayFill, ResidentResult,
+    Record, ReplayFill,
     BUFFERS, PAGE_SIZES,
 };
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
@@ -21,24 +14,63 @@ use crate::process::ProcessId;
 // =============================================================================
 
 impl ContextManager {
-    /// Attempt to restore a complete process. Returns Ok(ResidentResult) if
-    /// successful, Err if insufficient GPU pages.
-    pub(crate) fn try_restore_process(
-        &mut self,
-        pid: ProcessId,
-        requesting_ctx_id: ContextId,
-    ) -> anyhow::Result<ResidentResult> {
+    /// Admission check: can this process be fully restored?
+    /// Checks that all devices have enough free GPU pages for the process's
+    /// working pages (on CPU) plus pending_alloc requirements.
+    pub(crate) fn can_restore_process(&self, pid: ProcessId) -> bool {
+        let ctx_ids = match self.processes.get(&pid) {
+            Some(p) => &p.context_ids,
+            None => return false,
+        };
+
+        // Compute required pages per device
+        let mut required: HashMap<usize, usize> = HashMap::new();
+
+        for &ctx_id in ctx_ids {
+            if let Some(ctx) = self.contexts.get(&ctx_id) {
+                if ctx.state != ContextState::Suspended { continue; }
+                let dev_idx = ctx.device.unwrap_or(0) as usize;
+                // Working pages on CPU that need GPU allocation for swap-in
+                *required.entry(dev_idx).or_insert(0) += ctx.working_pages_cpu.len();
+                // TODO: Add pages_needing_replay estimate here.
+                // Currently replay is not executed during restore_context, so
+                // this is 0. When replay is wired up, we'll need to walk the
+                // lineage + prefix match to compute the replay page count.
+            }
+        }
+
+        // Add pending_alloc requirements
+        if let Some(allocs) = self.pending_allocs_map.get(&pid) {
+            for alloc in allocs {
+                let dev_idx = alloc.device as usize;
+                *required.entry(dev_idx).or_insert(0) += alloc.num_pages;
+            }
+        }
+
+        // Check availability on all devices
+        for (&dev_idx, &needed) in &required {
+            if self.devices[dev_idx].free_gpu_pages() < needed {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Restore a process and replay its pending_allocs.
+    /// Called by drain_queues after admission check passes.
+    pub(crate) fn restore_and_replay(&mut self, pid: ProcessId) {
         let ctx_ids: Vec<ContextId> = self.processes.get(&pid)
             .map(|p| p.context_ids.clone())
             .unwrap_or_default();
 
-        // Restore all contexts for this process
+        // Restore all suspended contexts
         for &ctx_id in &ctx_ids {
             let is_suspended = self.contexts.get(&ctx_id)
                 .map(|c| c.state == ContextState::Suspended)
                 .unwrap_or(false);
             if is_suspended {
-                self.restore_context(ctx_id)?;
+                let _ = self.restore_context(ctx_id);
             }
         }
 
@@ -47,40 +79,23 @@ impl ContextManager {
             proc.state = ProcessState::Running;
         }
 
-        // Build result for the requesting context
-        let pages = self.get_physical_page_ids_impl(requesting_ctx_id)?;
-        let phys_len: usize = pages.values().map(|v| v.len()).sum();
-
-        let page_size = PAGE_SIZES.get(self.model_idx).copied().unwrap_or(0);
-        let kv_len = BUFFERS.get(&(self.model_idx, requesting_ctx_id))
-            .map(|b| (b.committed_len * page_size + b.tokens_filled.len()) as u32)
-            .unwrap_or(0);
-
-        let debug_state = self.build_debug_state(requesting_ctx_id);
-
-        // Pin context as non-evictable
-        if let Some(ctx) = self.contexts.get_mut(&requesting_ctx_id) {
-            ctx.state = ContextState::Pinned;
-        }
-
-        // Check if we need replay chunks
-        let replay_chunks = self.build_replay_chunks(requesting_ctx_id)?;
-        if replay_chunks.is_empty() {
-            Ok(ResidentResult {
-                replay_chunks: None,
-                pages,
-                kv_len,
-                debug_state,
-            })
-        } else {
-            Ok(ResidentResult {
-                replay_chunks: Some(replay_chunks),
-                pages: HashMap::new(),
-                kv_len: 0,
-                debug_state: "replay".to_string(),
-            })
+        // Replay pending_allocs: allocate pages and fire response channels
+        if let Some(allocs) = self.pending_allocs_map.remove(&pid) {
+            for alloc in allocs {
+                let dev_idx = alloc.device as usize;
+                if let Some(pages) = self.devices[dev_idx].alloc_working(alloc.num_pages) {
+                    self.apply_alloc(alloc.context_id, dev_idx, pages, Some(pid));
+                    let _ = alloc.response.send(Ok(()));
+                } else {
+                    // Shouldn't happen — admission check verified availability.
+                    let _ = alloc.response.send(Err(anyhow::anyhow!(
+                        "Insufficient pages during restore replay (should not happen)"
+                    )));
+                }
+            }
         }
     }
+
 
     /// Restore a single suspended context.
     ///
@@ -110,6 +125,7 @@ impl ContextManager {
                 ctx.working_pages_cpu.clear();
             }
 
+            // Track swap-in as working pages in arbiter
             if let Some(pid) = owner {
                 self.arbiter.add_working(pid, dev_idx, new_gpu_pages.len());
             }
@@ -125,13 +141,31 @@ impl ContextManager {
             if prefix_len > 0 {
                 let prefix_tip = chain[prefix_len - 1];
                 dev.acquire_chain(prefix_tip);
+
+                // Truncate committed_tip to the prefix tip.
+                // Pages beyond the prefix are not GPU-resident — stale references.
+                if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                    ctx.committed_tip = Some(prefix_tip);
+                }
+            } else {
+                // No prefix match at all — clear committed_tip.
+                if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                    ctx.committed_tip = None;
+                }
             }
 
+            // Update arbiter: move prefix_len pages from working to committed.
+            // (add_working was already called in Phase 1; commit() subtracts
+            // from working and adds to committed, which is correct even for
+            // multi-context processes since both ops are additive.)
             if let Some(pid) = owner {
-                self.arbiter.set_device(pid, dev_idx,
-                    prefix_len + self.arbiter.pages_on(&pid, dev_idx).saturating_sub(cpu_slots.len()),
-                    cpu_slots.len(),
-                );
+                if prefix_len > 0 {
+                    // We don't actually have prefix_len working pages to "commit" —
+                    // these are directly acquired committed pages. Add them as
+                    // working first then commit to get the correct accounting.
+                    self.arbiter.add_working(pid, dev_idx, prefix_len);
+                    self.arbiter.commit(pid, dev_idx, prefix_len);
+                }
             }
         }
 

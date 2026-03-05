@@ -17,6 +17,7 @@
 //!   exclusively within the actor: working_pages, committed_tip, lineage, state,
 //!   device, etc.
 pub mod pagestore;
+pub use pagestore::compute_last_page_len;
 pub(crate) mod arbiter;
 mod contention;
 mod restore;
@@ -134,21 +135,6 @@ pub async fn get_physical_page_ids(model_idx: usize, id: ContextId) -> Result<Ha
     rx.await.context("context::get_physical_page_ids: actor dropped response")?
 }
 
-/// Result of ensure_resident: replay chunks (if any) + physical page IDs.
-/// Context is atomically pinned (non-evictable) on success.
-#[derive(Debug)]
-pub struct ResidentResult {
-    pub replay_chunks: Option<Vec<ReplayFill>>,
-    pub pages: HashMap<DeviceId, Vec<PhysicalPageId>>,
-    pub kv_len: u32,
-    pub debug_state: String,
-}
-
-pub async fn ensure_resident(model_idx: usize, id: ContextId) -> Result<ResidentResult> {
-    let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::EnsureResident { id, response: tx })?;
-    rx.await.context("context::ensure_resident: actor dropped response")?
-}
 
 pub async fn commit_replay_chunk(
     model_idx: usize, id: ContextId, num_pages: u32,
@@ -175,6 +161,12 @@ pub async fn get_stats(model_idx: usize) -> Vec<(usize, usize)> {
     let (tx, rx) = oneshot::channel();
     let _ = SERVICES.send(model_idx, Message::GetStats { response: tx });
     rx.await.unwrap_or_default()
+}
+
+pub async fn is_active(model_idx: usize, id: ContextId) -> bool {
+    let (tx, rx) = oneshot::channel();
+    let _ = SERVICES.send(model_idx, Message::IsActive { id, response: tx });
+    rx.await.unwrap_or(false)
 }
 
 pub async fn debug_context_state(model_idx: usize, id: ContextId) -> String {
@@ -422,6 +414,12 @@ pub(crate) struct ContextManager {
     pub(crate) try_restore: BinaryHeap<RestoreWaiter>,
     /// Per-process state tracking.
     pub(crate) processes: HashMap<ProcessId, ProcessInfo>,
+    /// Side-map: number of Pinned contexts still awaiting clear_pinned per process.
+    /// Restore is blocked until this reaches 0. Avoids BinaryHeap interior mutation.
+    pub(crate) pending_pinned_counts: HashMap<ProcessId, usize>,
+    /// Side-map: pending alloc requests per Pending process.
+    /// Replayed after restoration completes.
+    pub(crate) pending_allocs_map: HashMap<ProcessId, Vec<AllocWaiter>>,
     pub(crate) msg_counter: u64,
 }
 
@@ -438,6 +436,8 @@ impl ContextManager {
             try_alloc: VecDeque::new(),
             try_restore: BinaryHeap::new(),
             processes: HashMap::new(),
+            pending_pinned_counts: HashMap::new(),
+            pending_allocs_map: HashMap::new(),
             msg_counter: 0,
         }
     }
@@ -859,10 +859,16 @@ impl ContextManager {
     }
 
     pub(crate) fn get_physical_page_ids_impl(&mut self, id: ContextId) -> Result<HashMap<DeviceId, Vec<PhysicalPageId>>> {
-        let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+        let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let tip = ctx.committed_tip;
         let working = ctx.working_pages.clone();
+
+        // Transition Active → Pinned: prevents eviction while process holds page IDs.
+        // Eviction of Pinned contexts is deferred via `pending_suspend` flag.
+        if ctx.state == ContextState::Active {
+            ctx.state = ContextState::Pinned;
+        }
 
         let mut pages = Vec::new();
 
@@ -917,7 +923,6 @@ pub(crate) enum Message {
     ReservePages { id: ContextId, num_pages: u32, response: oneshot::Sender<Result<()>> },
     ReleasePages { id: ContextId, num_pages: u32 },
     GetPhysicalPageIds { id: ContextId, response: oneshot::Sender<Result<HashMap<DeviceId, Vec<PhysicalPageId>>>> },
-    EnsureResident { id: ContextId, response: oneshot::Sender<Result<ResidentResult>> },
     CommitReplayFill {
         id: ContextId, num_pages: u32,
         tokens: Vec<u32>, positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
@@ -926,6 +931,7 @@ pub(crate) enum Message {
     FinishRestore { id: ContextId },
     ClearPinned { id: ContextId },
     GetStats { response: oneshot::Sender<Vec<(usize, usize)>> },
+    IsActive { id: ContextId, response: oneshot::Sender<bool> },
     DebugState { id: ContextId, response: oneshot::Sender<String> },
     SetDagWeights { weight: f64, pid_values: HashMap<ProcessId, f64> },
 }
@@ -973,13 +979,6 @@ impl ServiceHandler for ContextManager {
             Message::GetPhysicalPageIds { id, response } => {
                 let _ = response.send(self.get_physical_page_ids_impl(id));
             }
-            Message::EnsureResident { id, response } => {
-                let result = self.handle_ensure_resident(id);
-                match result {
-                    Ok(resident) => { let _ = response.send(Ok(resident)); }
-                    Err(e) => { let _ = response.send(Err(e)); }
-                }
-            }
             Message::CommitReplayFill { id, num_pages, tokens, positions, masks, adapter, response } => {
                 let _ = response.send(self.commit_replay_chunk_impl(id, num_pages, tokens, positions, masks, adapter));
             }
@@ -993,6 +992,12 @@ impl ServiceHandler for ContextManager {
             Message::GetStats { response } => {
                 let stats: Vec<_> = self.devices.iter().map(|d| d.stats()).collect();
                 let _ = response.send(stats);
+            }
+            Message::IsActive { id, response } => {
+                let active = self.contexts.get(&id)
+                    .map(|ctx| matches!(ctx.state, ContextState::Active | ContextState::Pinned))
+                    .unwrap_or(false);
+                let _ = response.send(active);
             }
             Message::DebugState { id, response } => {
                 let _ = response.send(self.build_debug_state(id));

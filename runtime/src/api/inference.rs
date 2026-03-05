@@ -12,7 +12,7 @@ use crate::inference::structured::json_schema::{builtin_json_grammar, json_schem
 use crate::inference::structured::regex::regex_to_grammar;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::matcher::GrammarMatcher;
-use crate::{context_legacy as context, inference};
+use crate::{context, inference};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::iter;
@@ -28,7 +28,7 @@ use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 #[derive(Debug)]
 pub struct ForwardPass {
     pub model_id: usize,
-    context_id: Option<crate::context_legacy::ContextId>,
+    context_id: Option<crate::context::ContextId>,
     input_tokens: Vec<u32>,
     input_token_positions: Vec<u32>,
     speculative_tokens: Vec<u32>,
@@ -319,128 +319,32 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // inference actor. This is critical: blocking here only stalls this
         // one process, not the entire inference pipeline.
         //
-        // STATE MACHINE — a context is NEVER Active while a process holds its
-        // page IDs. All transitions to InFlight happen inside the actor:
+        // STATE MACHINE (new 3-state context module):
         //
-        //   Fast path:  Active → InFlight  (EnsureResident handler, atomically
-        //                                   resolves pages + pins InFlight)
-        //   Replay path: Restoring → InFlight  (finish_restore, fire-and-forget)
+        //   reserve_pages: blocks if process is suspended — actor handles
+        //     restoration via drain_queues, process resumes automatically.
+        //   get_physical_page_ids: Active → Pinned (non-evictable).
+        //   clear_pinned: Pinned → Active (evictable again).
         //
-        // The process calls clear_in_flight after inference::submit, which is
-        // the ONLY transition InFlight → Active. find_cheapest_victim only
-        // targets Active contexts, so pages can never be freed while a process
-        // holds them.
+        // The process calls clear_pinned after fill, which is the ONLY
+        // transition Pinned → Active. Eviction of Pinned contexts is
+        // deferred via pending_suspend flag.
         // =====================================================================
 
-        // Step 1: Ensure all pages are GPU-resident.
-        // Fast path returns pages + InFlight. Replay path returns chunks.
-        let resident = match context::ensure_resident(model_id, context_id).await {
-            Ok(r) => r,
+        // Step 1: Resolve physical page IDs. Atomically pins the context
+        // (Active → Pinned) so pages cannot be evicted during the forward pass.
+        let pages_by_device = match context::get_physical_page_ids(model_id, context_id).await {
+            Ok(pages) => pages,
             Err(e) => {
-                tracing::warn!("ensure_resident failed for ctx {context_id}: {e:#}");
+                tracing::warn!("get_physical_page_ids failed for ctx {context_id}: {e:#}");
                 return Ok(Err(e.to_string()));
             }
         };
-
-        // Step 2: Resolve pages — either from ensure_resident (fast) or
-        // finish_restore + get_physical_page_ids (replay).
-        let atomic_debug_state = resident.debug_state.clone();
-        let (pages_by_device, kv_len) = if let Some(replay_chunks) = resident.replay_chunks {
-            for (ci, chunk) in replay_chunks.into_iter().enumerate() {
-                let commit_tokens = chunk.tokens.clone();
-                let commit_positions = chunk.positions.clone();
-                let commit_masks = chunk.masks.clone();
-                let commit_adapter = chunk.adapter;
-                let commit_num_pages = chunk.num_pages;
-
-                let replay_fwd = inference::request::ForwardPassRequest {
-                    context_id,
-                    tokens: chunk.tokens,
-                    positions: chunk.positions,
-                    masks: chunk.masks,
-                    speculative_tokens: vec![],
-                    speculative_positions: vec![],
-                    output_speculative_tokens: false,
-                    logit_mask: None,
-                    sampling_indices: vec![],
-                    samplers: vec![],
-                    adapter_id: chunk.adapter,
-                    adapter_seed: None,
-                    arrival_time: None,
-                };
-
-                let device_idx = chunk.device_id as usize;
-                if let Err(e) = inference::submit(
-                    model_id, replay_fwd, device_idx,
-                    chunk.physical_page_ids, chunk.last_page_len,
-                ).await {
-                    tracing::warn!("Replay forward pass failed for ctx {context_id}: {e:#}");
-                    return Ok(Err(e.to_string()));
-                }
-
-                if let Err(e) = context::commit_replay_chunk(
-                    model_id, context_id, commit_num_pages,
-                    commit_tokens, commit_positions, commit_masks, commit_adapter,
-                ).await {
-                    tracing::warn!("commit_replay_chunk failed for ctx {context_id}: {e:#}");
-                    return Ok(Err(e.to_string()));
-                }
-            }
-
-            if let Err(e) = context::finish_restore(model_id, context_id) {
-                tracing::warn!("finish_restore failed for ctx {context_id}: {e:#}");
-                return Ok(Err(e.to_string()));
-            }
-
-            match context::get_physical_page_ids(model_id, context_id).await {
-                Ok(pages) => {
-                    // After replay + finish_restore, context is InFlight so
-                    // kv_len won't change until clear_in_flight.
-                    let kv_len = context::kv_len(model_id, context_id);
-                    let page_size = context::tokens_per_page(model_id, context_id);
-                    let total_kv = kv_len + num_input_tokens as u32;
-                    let num_pages = pages.values().map(|v| v.len()).sum::<usize>() as u32;
-                    let needed_pages = if page_size > 0 { (total_kv + page_size - 1) / page_size } else { 0 };
-
-                    if needed_pages > num_pages {
-                        // Replay freed the SDK's working pages (stale KV data).
-                        // Re-allocate to honor the SDK's original reserve_pages.
-                        let working_needed = needed_pages - num_pages;
-                        context::clear_in_flight(model_id, context_id);
-                        match context::reserve_pages(model_id, context_id, working_needed).await {
-                            Ok(()) => {},
-                            Err(e) => {
-                                tracing::warn!("post-replay reserve_pages failed for ctx {context_id}: {e:#}");
-                                return Ok(Err(e.to_string()));
-                            }
-                        }
-                        // Re-resolve pages with the newly allocated working pages
-                        let resident2 = match context::ensure_resident(model_id, context_id).await {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::warn!("post-replay ensure_resident failed for ctx {context_id}: {e:#}");
-                                return Ok(Err(e.to_string()));
-                            }
-                        };
-                        let kv_len2 = resident2.kv_len;
-                        (resident2.pages, kv_len2)
-                    } else {
-                        (pages, kv_len)
-                    }
-                },
-                Err(e) => {
-                    context::clear_in_flight(model_id, context_id);
-                    tracing::warn!("get_physical_page_ids failed for ctx {context_id}: {e:#}");
-                    return Ok(Err(e.to_string()));
-                }
-            }
-        } else {
-            // Fast path: pages + kv_len resolved atomically by ensure_resident
-            (resident.pages, resident.kv_len)
-        };
+        // Read kv_len while Pinned — context cannot be evicted so this is consistent.
+        let kv_len = context::kv_len(model_id, context_id);
 
         if pages_by_device.len() > 1 {
-            context::clear_in_flight(model_id, context_id);
+            context::clear_pinned(model_id, context_id);
             return Ok(Err(format!(
                 "Context pages span {} devices; context parallelism is not yet supported",
                 pages_by_device.len(),
@@ -456,7 +360,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let num_pages = physical_page_ids.len() as u32;
         let page_size = context::tokens_per_page(model_id, context_id);
         let total_kv = kv_len + num_input_tokens as u32;
-        let last_page_len = context::kvcache::compute_last_page_len(total_kv, num_pages, page_size);
+        let last_page_len = context::compute_last_page_len(total_kv, num_pages, page_size);
 
         // INVARIANT: total_kv must fit within the allocated pages.
         // Violation means working pages were lost between reserve_pages
@@ -467,11 +371,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 "KV_INVARIANT_VIOLATION ctx={context_id} total_kv={total_kv} \
                  page_capacity={page_capacity} num_pages={num_pages} \
                  kv_len={kv_len} num_input={num_input_tokens} page_size={page_size} \
-                 phys_ids={physical_page_ids:?} \
-                 atomic_state=\"{atomic_debug_state}\""
+                 phys_ids={physical_page_ids:?}"
             );
             eprintln!("{msg}");
-            context::clear_in_flight(model_id, context_id);
+            context::clear_pinned(model_id, context_id);
             return Ok(Err(msg));
         }
 
@@ -510,7 +413,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                         fill_positions,
                     );
                 }
-                // Step 6: Mark input tokens as forwarded WHILE still InFlight
+                // Step 3: Mark input tokens as forwarded WHILE still Pinned
                 // (non-evictable).  This ensures tokens_filled + lineage are consistent
                 // before the context becomes Active (evictable).
                 if num_input_tokens > 0 {
@@ -518,7 +421,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                         model_id, context_id, num_input_tokens,
                         fill_positions, fill_masks, adapter_id,
                     ) {
-                        context::clear_in_flight(model_id, context_id);
+                        context::clear_pinned(model_id, context_id);
                         tracing::warn!("context::fill failed for ctx {context_id}: {e:#}");
                         return Ok(Err(e.to_string()));
                     }
@@ -526,7 +429,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
                 // Unpin — forward pass completed and tokens recorded in lineage.
                 // Context is now safe to evict: lineage is consistent with tokens_filled.
-                context::clear_in_flight(model_id, context_id);
+                context::clear_pinned(model_id, context_id);
 
                 let future_output = FutureOutput {
                     result: Some(convert_output(output)),
@@ -536,7 +439,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 Ok(Ok(self.ctx().table.push(future_output)?))
             }
             Err(e) => {
-                context::clear_in_flight(model_id, context_id);
+                context::clear_pinned(model_id, context_id);
                 tracing::warn!("inference::submit failed for ctx {context_id}: {e:#}");
                 return Ok(Err(e.to_string()));
             },

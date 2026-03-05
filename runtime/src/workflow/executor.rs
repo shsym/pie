@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::context_legacy as context;
+use crate::context;
 use crate::process::{self, ProcessId};
 use crate::program::{self, ProgramName};
 
