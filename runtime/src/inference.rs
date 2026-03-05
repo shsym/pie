@@ -20,7 +20,7 @@ mod adaptive_policy;
 use tokio::sync::oneshot;
 
 use crate::service::{ServiceArray, ServiceHandler};
-use crate::context_legacy::kvcache::PhysicalPageId;
+use crate::context::pagestore::PhysicalPageId;
 use crate::device::DeviceId;
 use anyhow::Result;
 use request::{ForwardPassOutput, ForwardPassRequest};

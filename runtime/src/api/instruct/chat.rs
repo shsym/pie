@@ -5,7 +5,7 @@
 
 use crate::api::pie;
 use crate::api::context::Context;
-use crate::context_legacy as context;
+use crate::context;
 use crate::model;
 use crate::linker::InstanceState;
 use crate::model::instruct::{ChatDecoder, ChatEvent};

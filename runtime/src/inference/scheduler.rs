@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 
 
 use crate::device::DeviceId;
-use crate::context_legacy::kvcache::PhysicalPageId;
+use crate::context::pagestore::PhysicalPageId;
 
 use crate::device;
 

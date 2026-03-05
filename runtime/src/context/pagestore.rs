@@ -455,6 +455,14 @@ impl PageStore {
         self.index_cache.remove(&tip);
     }
 
+    /// Free CPU slots back to the CPU pool.
+    /// Used when destroying a suspended context that holds working pages on CPU.
+    pub fn free_cpu_slots(&mut self, slots: &[PhysicalPageId]) {
+        for &slot in slots {
+            self.cpu.free(slot);
+        }
+    }
+
     /// Count committed pages cached on this device (GPU-resident) in a chain.
     pub fn chain_resident_count(&self, tip: PageHash) -> usize {
         let chain = self.walk_chain(tip);
