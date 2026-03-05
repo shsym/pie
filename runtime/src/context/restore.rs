@@ -19,7 +19,7 @@ impl ContextManager {
     /// Admission check: can this process be fully restored?
     /// Checks that all devices have enough free GPU pages for the process's
     /// working pages (on CPU) plus replay pages plus pending_alloc requirements.
-    pub(crate) fn can_restore_process(&self, pid: ProcessId) -> bool {
+    pub(crate) fn can_restore_process(&mut self, pid: ProcessId) -> bool {
         let ctx_ids = match self.processes.get(&pid) {
             Some(p) => &p.context_ids,
             None => return false,
@@ -51,6 +51,11 @@ impl ContextManager {
                 let dev_idx = alloc.device as usize;
                 *required.entry(dev_idx).or_insert(0) += alloc.num_pages;
             }
+        }
+
+        // Evict unreferenced committed pages (rc=0) before checking (fix #6)
+        for &dev_idx in required.keys() {
+            self.devices[dev_idx].evict_unreferenced();
         }
 
         // Check availability on all devices

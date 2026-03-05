@@ -29,7 +29,7 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = model.model_id;
         let process_id = self.id();
 
-        match context::create_owned(model_id, Some(process_id)).await {
+        match context::create(model_id, Some(process_id)).await {
             Ok(context_id) => {
                 self.track_context(model_id, context_id);
                 let ctx = Context { context_id, model_id };
@@ -102,8 +102,8 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = ctx.model_id;
         let username = self.get_username();
 
-        match context::save(model_id, context_id, username, name).await {
-            Ok(()) => Ok(Ok(())),
+        match context::save(model_id, context_id, username, Some(name)).await {
+            Ok(_) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
     }
@@ -117,8 +117,9 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = ctx.model_id;
         let username = self.get_username();
 
-        match context::snapshot(model_id, context_id, username).await {
-            Ok(name) => Ok(Ok(name)),
+        match context::save(model_id, context_id, username, None).await {
+            Ok(Some(name)) => Ok(Ok(name)),
+            Ok(None) => Ok(Err("snapshot returned no name".into())),
             Err(e) => Ok(Err(e.to_string())),
         }
     }
@@ -149,7 +150,7 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn tokens_per_page(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::tokens_per_page(ctx.model_id, ctx.context_id))
+        Ok(context::tokens_per_page(ctx.model_id))
     }
 
     async fn model(&mut self, this: Resource<Context>) -> Result<Resource<Model>> {
@@ -172,7 +173,7 @@ impl pie::core::context::HostContext for InstanceState {
     async fn uncommitted_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
         let tokens = context::get_buffered_tokens(ctx.model_id, ctx.context_id);
-        let page_size = context::tokens_per_page(ctx.model_id, ctx.context_id);
+        let page_size = context::tokens_per_page(ctx.model_id);
         Ok((tokens.len() as u32 + page_size - 1) / page_size)
     }
 
