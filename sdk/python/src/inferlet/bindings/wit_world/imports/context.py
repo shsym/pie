@@ -60,41 +60,39 @@ class Context:
         Number of committed KV pages in the context
         """
         raise NotImplementedError
-    def uncommitted_page_count(self) -> int:
+    def working_page_count(self) -> int:
         """
-        Number of uncommitted KV pages in the context
+        Number of working KV pages in the context
         """
         raise NotImplementedError
-    def commit_pages(self, page_indices: List[int]) -> None:
+    def commit_working_pages(self, num_pages: int) -> None:
         """
         Commit the KV pages to the context
         
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def reserve_pages(self, num_pages: int) -> None:
+    def reserve_working_pages(self, num_pages: int) -> None:
         """
         Reserve KV pages for the context
         
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def release_pages(self, num_pages: int) -> None:
+    def release_working_pages(self, num_pages: int) -> None:
         """
         Release KV pages from the context
         """
         raise NotImplementedError
-    def cursor(self) -> int:
+    def working_page_token_count(self) -> int:
+        """
+        Number of tokens in working pages (filled but not committed)
+        """
         raise NotImplementedError
-    def set_cursor(self, cursor: int) -> None:
-        raise NotImplementedError
-    def buffered_tokens(self) -> List[int]:
-        raise NotImplementedError
-    def set_buffered_tokens(self, tokens: List[int]) -> None:
-        raise NotImplementedError
-    def append_buffered_tokens(self, tokens: List[int]) -> None:
-        raise NotImplementedError
-    def last_position(self) -> Optional[int]:
+    def pop_working_page_tokens(self, num_tokens: int) -> None:
+        """
+        Remove the last N tokens from working pages
+        """
         raise NotImplementedError
     def __enter__(self) -> Self:
         """Returns self"""

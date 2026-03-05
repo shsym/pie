@@ -50,10 +50,11 @@ async fn main(args: Vec<String>) -> Result<String> {
     let ctx = Context::create(&model)?;
     let page_size = ctx.tokens_per_page();
 
-    ctx.system("You are a helpful assistant.");
-    ctx.user(&prompt);
-    ctx.cue();
-    ctx.flush().await?;
+    let mut pending_tokens: Vec<u32> = Vec::new();
+    pending_tokens.extend(ctx.system("You are a helpful assistant."));
+    pending_tokens.extend(ctx.user(&prompt));
+    pending_tokens.extend(ctx.cue());
+    ctx.flush(&pending_tokens).await?;
 
     println!(
         "--- Jacobi Decoding (window_size={}, page_size={}) ---",
@@ -63,38 +64,37 @@ async fn main(args: Vec<String>) -> Result<String> {
     let mut all_generated: Vec<u32> = Vec::new();
     let sampler = Sampler::TopP((0.0, 1.0));
 
-    // Initialize: the anchor is the last buffered token after flush()
-    let initial_buffered = ctx.buffered_tokens();
-    if initial_buffered.is_empty() {
-        return Err("No initial buffered tokens".to_string());
-    }
-    let anchor = initial_buffered[initial_buffered.len() - 1];
+    // Bootstrap: sample the first token from the flushed KV cache
+    let bootstrap_pass = ForwardPass::new(&model);
+    bootstrap_pass.context(&ctx);
+    bootstrap_pass.sampler(&[0], sampler.clone());
+    let bootstrap_output = bootstrap_pass.execute_async().await
+        .map_err(|e| format!("Bootstrap forward pass failed: {}", e))?;
+    let mut anchor = match bootstrap_output {
+        Output::Tokens(t) if !t.is_empty() => t[0],
+        _ => return Err("Bootstrap sampling produced no token".to_string()),
+    };
+    all_generated.push(anchor);
 
     // Speculative guesses initialized to copies of the anchor
     let mut window: Vec<u32> = vec![anchor; window_size];
-    let mut total_accepted = 0;
+    let mut total_accepted = 1; // anchor already counted
 
     while total_accepted < max_tokens {
-        let seq_len = ctx.last_position().map(|p| p + 1).unwrap_or(0);
-        let cursor = ctx.cursor();
+        let wpt = ctx.working_page_token_count();
+        let seq_len = ctx.committed_page_count() * page_size + wpt;
 
         // Build the full token list: [anchor] + [window guesses]
-        // We need to make sure set_buffered_tokens includes all tokens
-        // that we plan to send as input_tokens, because fill() checks:
-        //   n <= tokens_buffered.len()
+        let mut input_all = vec![anchor];
+        input_all.extend_from_slice(&window);
 
-        // Set all tokens as buffered BEFORE the forward pass
-        let mut buffered_all = vec![anchor];
-        buffered_all.extend_from_slice(&window);
-        ctx.set_buffered_tokens(&buffered_all);
-
-        let input_count = buffered_all.len();
+        let input_count = input_all.len();
 
         // Reserve pages
-        let total_tokens_after = cursor + input_count as u32;
+        let total_tokens_after = wpt + input_count as u32;
         let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
         if total_pages_needed > 0 {
-            ctx.reserve_pages(total_pages_needed)
+            ctx.reserve_working_pages(total_pages_needed)
                 .map_err(|e| format!("Failed to reserve pages: {}", e))?;
         }
 
@@ -103,7 +103,7 @@ async fn main(args: Vec<String>) -> Result<String> {
 
         // All tokens go as regular input (so they're all embedded and processed)
         let positions: Vec<u32> = (seq_len..seq_len + input_count as u32).collect();
-        pass.input_tokens(&buffered_all, &positions);
+        pass.input_tokens(&input_all, &positions);
 
         // Request sampling at all positions
         let sample_indices: Vec<u32> = (0..input_count as u32).collect();
@@ -122,15 +122,6 @@ async fn main(args: Vec<String>) -> Result<String> {
         }
 
         // Jacobi verification: find the longest converged prefix.
-        //
-        // predicted_tokens[0] = prediction after anchor = the "next token"
-        // predicted_tokens[i] = prediction after all_input_tokens[i]
-        //
-        // We accept predicted_tokens[0] unconditionally.
-        // For i >= 1: if predicted_tokens[i-1] == window[i-1], it means
-        // the model's prediction at position i-1 matches our guess at
-        // position i, so position i was correctly speculated.
-
         let mut accepted_count = 1; // Always accept the first prediction
         for i in 1..predicted_tokens.len().min(window.len() + 1) {
             let i_window = i - 1;
@@ -157,18 +148,20 @@ async fn main(args: Vec<String>) -> Result<String> {
         all_generated.extend_from_slice(final_accepted);
         total_accepted += final_accepted.len();
 
-        // Commit pages for accepted tokens only
-        // The fill() already moved all input_count tokens to tokens_filled.
-        // We commit pages covering anchor + accepted tokens.
-        let commit_count = 1 + final_accepted.len(); // anchor + accepted predictions
-        let new_cursor_abs = cursor + commit_count as u32;
-        let pages_to_commit = new_cursor_abs / page_size;
+        // Commit pages for accepted tokens only: anchor + accepted
+        let commit_count = 1 + final_accepted.len();
+        let new_wpt = wpt + commit_count as u32;
+        let pages_to_commit = new_wpt / page_size;
         if pages_to_commit > 0 {
-            let page_indices: Vec<u32> = (0..pages_to_commit).collect();
-            ctx.commit_pages(&page_indices)
+            ctx.commit_working_pages(pages_to_commit)
                 .map_err(|e| format!("Failed to commit pages: {}", e))?;
         }
-        ctx.set_cursor(new_cursor_abs % page_size);
+
+        // Pop un-accepted speculative tokens from working pages
+        let speculative_count = input_count as u32 - commit_count as u32;
+        if speculative_count > 0 {
+            ctx.pop_working_page_tokens(speculative_count);
+        }
 
         if stop_at < newly_accepted.len() || total_accepted >= max_tokens {
             break;
@@ -176,9 +169,7 @@ async fn main(args: Vec<String>) -> Result<String> {
 
         // Prepare for next iteration
         let last_accepted = *final_accepted.last().unwrap();
-
-        // The last accepted token becomes the anchor for the next iteration
-        ctx.set_buffered_tokens(&[last_accepted]);
+        anchor = last_accepted;
 
         // Build next window of guesses
         window = if accepted_count < predicted_tokens.len() {

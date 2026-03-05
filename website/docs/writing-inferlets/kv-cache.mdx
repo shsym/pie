@@ -24,7 +24,7 @@ The KV cache is organized into fixed-size **pages**, each holding `tokens_per_pa
 let page_size = ctx.tokens_per_page();       // Tokens per page
 let cursor = ctx.cursor();                    // Position within active page
 let committed = ctx.committed_page_count();   // Number of committed pages
-let uncommitted = ctx.uncommitted_page_count(); // Pages not yet committed
+let working = ctx.working_page_count();          // Working (not yet committed) pages
 ```
 
 ## Page Operations
@@ -35,7 +35,7 @@ Allocate pages before filling them:
 
 ```rust
 let pages_needed = (total_tokens + page_size - 1) / page_size;
-ctx.reserve_pages(pages_needed)?;
+ctx.reserve_working_pages(pages_needed)?;
 ```
 
 ### Commit
@@ -43,8 +43,7 @@ ctx.reserve_pages(pages_needed)?;
 Mark pages as finalized — their KV data can now be shared and reused:
 
 ```rust
-let page_indices: Vec<u32> = (0..num_full_pages).collect();
-ctx.commit_pages(&page_indices)?;
+ctx.commit_working_pages(num_full_pages)?;
 ```
 
 ### Release
@@ -53,7 +52,7 @@ Free pages you no longer need:
 
 ```rust
 // Release the last N pages
-ctx.release_pages(num_pages);
+ctx.release_working_pages(num_pages);
 ```
 
 ## Forking

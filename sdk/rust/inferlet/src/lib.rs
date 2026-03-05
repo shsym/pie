@@ -36,20 +36,36 @@ pub use pie::mcp;
 pub use pie::zo;
 
 // =============================================================================
-// Re-exports from raw bindings
+// Context (new wrapper module)
 // =============================================================================
 
-pub mod context {
-    pub use crate::pie::core::context::Context;
-}
+mod context;
+
+pub use context::{
+    Context, RawContext,
+    TokenStream, EventStream,
+    Speculate, Speculation, Constrain,
+};
+
+// =============================================================================
+// Adapter
+// =============================================================================
 
 pub mod adapter {
     pub use crate::pie::core::adapter::Adapter;
 }
 
+// =============================================================================
+// Model
+// =============================================================================
+
 pub mod model {
     pub use crate::pie::core::model::{Model, Tokenizer};
 }
+
+// =============================================================================
+// Other re-exports
+// =============================================================================
 
 pub mod runtime {
     pub use crate::pie::core::runtime::*;
@@ -125,32 +141,16 @@ impl FutureStringExt for types::FutureString {
 }
 
 // =============================================================================
-// Context Extension Trait (Consolidated)
+// Decoder (Unified) — re-exported from context module
 // =============================================================================
 
-mod context_ext;
-
-pub use context_ext::{
-    // ContextExt trait (has Fill + Generate + async operations)
-    ContextExt,
-    // Supporting types
-    TokenStream, EventStream, Speculate, Speculation, Constrain,
-};
-
-// =============================================================================
-// Instruct Extension Trait
-// =============================================================================
-
-mod instruct_ext;
-
-pub use instruct_ext::{
-    InstructExt,
-    // Unified decoder
+pub use context::{
     Decoder, Event,
     // Re-exported WIT decoder / event types
     ChatDecoder, ChatEvent,
     ToolDecoder, ToolEvent,
     ReasoningDecoder, ReasoningEvent,
+    Matcher,
 };
 
 // =============================================================================
@@ -191,16 +191,14 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::main;
-    pub use crate::context::Context;
+    pub use crate::Context;
     pub use crate::inference::{ForwardPass, Output, Sampler};
     pub use crate::model::Model;
     pub use crate::runtime;
     pub use crate::messaging;
     pub use crate::adapter::Adapter;
-    
+
     // Extension traits
-    pub use crate::ContextExt;
-    pub use crate::InstructExt;
     pub use crate::ModelExt;
     pub use crate::ForwardPassExt;
     pub use crate::SubscriptionExt;

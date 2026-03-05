@@ -68,7 +68,7 @@ class TestContext:
         m = Model.load("test-model")
         ctx = Context(m)
         ctx.fill_tokens([1, 2, 3])
-        assert ctx._handle.buffered_tokens() == [1, 2, 3]
+        assert ctx._pending_tokens == [1, 2, 3]
 
     def test_system_user_cue_no_return(self):
         """Mutators return None, not self."""
@@ -86,9 +86,9 @@ class TestContext:
         m = Model.load("test-model")
         ctx = Context(m)
         ctx.fill_tokens([1, 2, 3])
-        forked = ctx.fork("forked-ctx")
+        forked = ctx.fork()
         assert forked._handle is not None
-        assert forked._handle.buffered_tokens() == [1, 2, 3]
+        assert forked._pending_tokens == []
 
     def test_context_manager(self):
         from inferlet.model import Model
@@ -96,7 +96,7 @@ class TestContext:
         m = Model.load("test-model")
         with Context(m) as ctx:
             ctx.fill_tokens([42])
-            assert ctx._handle.buffered_tokens() == [42]
+            assert ctx._pending_tokens == [42]
 
     def test_equip_tools_no_return(self):
         from inferlet.model import Model

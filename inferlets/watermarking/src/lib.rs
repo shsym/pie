@@ -155,51 +155,49 @@ async fn main(args: Vec<String>) -> Result<String> {
 
     let ctx = Context::create(&model)?;
 
-    ctx.system("You are a helpful, respectful and honest assistant.");
-    ctx.user(&prompt);
-    ctx.cue();
+    let mut pending_tokens: Vec<u32> = Vec::new();
+    pending_tokens.extend(ctx.system("You are a helpful, respectful and honest assistant."));
+    pending_tokens.extend(ctx.user(&prompt));
+    pending_tokens.extend(ctx.cue());
 
     // Manual decode loop with watermark sampling
     let mut watermark = WatermarkState::new(0.5, 2.0);
     let mut generated_tokens = Vec::new();
 
     for step in 0..max_num_outputs {
-        let seq_len = ctx.last_position().map(|p| p + 1).unwrap_or(0);
-        let buffered = ctx.buffered_tokens();
-        if buffered.is_empty() {
+        if pending_tokens.is_empty() {
             break;
         }
 
         let page_size = ctx.tokens_per_page();
-        let cursor = ctx.cursor();
-        let total_tokens_after = cursor + buffered.len() as u32;
+        let wpt = ctx.working_page_token_count();
+        let seq_len = ctx.committed_page_count() * page_size + wpt;
+        let total_tokens_after = wpt + pending_tokens.len() as u32;
         let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
         if total_pages_needed > 0 {
-            ctx.reserve_pages(total_pages_needed)
+            ctx.reserve_working_pages(total_pages_needed)
                 .map_err(|e| format!("Failed to reserve pages at step {}: {}", step, e))?;
         }
 
         let pass = ForwardPass::new(&model);
         pass.context(&ctx);
-        let positions: Vec<u32> = (seq_len..seq_len + buffered.len() as u32).collect();
-        pass.input_tokens(&buffered, &positions);
+        let positions: Vec<u32> = (seq_len..seq_len + pending_tokens.len() as u32).collect();
+        pass.input_tokens(&pending_tokens, &positions);
 
         // Use Dist sampler to get the probability distribution
-        let last_idx = (buffered.len() - 1) as u32;
+        let last_idx = (pending_tokens.len() - 1) as u32;
         pass.sampler(&[last_idx], Sampler::Dist((0.0, 0)));
 
         let output = pass.execute_async().await
             .map_err(|e| format!("Forward pass failed at step {}: {}", step, e))?;
 
-        // Commit pages and update cursor
-        let new_cursor_abs = cursor + buffered.len() as u32;
-        let pages_to_commit = new_cursor_abs / page_size;
+        // Commit pages
+        let new_wpt = wpt + pending_tokens.len() as u32;
+        let pages_to_commit = new_wpt / page_size;
         if pages_to_commit > 0 {
-            let page_indices: Vec<u32> = (0..pages_to_commit).collect();
-            ctx.commit_pages(&page_indices)
+            ctx.commit_working_pages(pages_to_commit)
                 .map_err(|e| format!("Failed to commit pages: {}", e))?;
         }
-        ctx.set_cursor(new_cursor_abs % page_size);
 
         // Extract distribution and apply watermark sampling
         let chosen_token = match output {
@@ -219,7 +217,7 @@ async fn main(args: Vec<String>) -> Result<String> {
         }
 
         generated_tokens.push(chosen_token);
-        ctx.set_buffered_tokens(&[chosen_token]);
+        pending_tokens = vec![chosen_token];
     }
 
     let text = tokenizer.decode(&generated_tokens)?;

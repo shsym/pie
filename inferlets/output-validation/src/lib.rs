@@ -36,47 +36,44 @@ pub async fn validate_outputs(
 
         let candidate_tokens = tokenizer.encode(candidate);
         let mut current_log_prob = 0.0f32;
+        let mut pending = vec![*tokenizer.encode("").last().unwrap_or(&0)];
 
         // Calculate the cumulative log probability for the candidate token sequence
         for &token_id in &candidate_tokens {
-            // Use ForwardPass with Dist sampler to get probability distributions
-            let seq_len = candidate_ctx.last_position().map(|p| p + 1).unwrap_or(0);
-            let buffered = candidate_ctx.buffered_tokens();
-            if buffered.is_empty() {
+            if pending.is_empty() {
                 current_log_prob = -1000.0;
                 break;
             }
 
             let page_size = candidate_ctx.tokens_per_page();
-            let cursor = candidate_ctx.cursor();
-            let total_tokens_after = cursor + buffered.len() as u32;
+            let wpt = candidate_ctx.working_page_token_count();
+            let seq_len = candidate_ctx.committed_page_count() * page_size + wpt;
+            let total_tokens_after = wpt + pending.len() as u32;
             let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
             if total_pages_needed > 0 {
-                candidate_ctx.reserve_pages(total_pages_needed)
+                candidate_ctx.reserve_working_pages(total_pages_needed)
                     .map_err(|e| format!("Failed to reserve pages: {}", e))?;
             }
 
             let pass = ForwardPass::new(model);
             pass.context(&candidate_ctx);
-            let positions: Vec<u32> = (seq_len..seq_len + buffered.len() as u32).collect();
-            pass.input_tokens(&buffered, &positions);
+            let positions: Vec<u32> = (seq_len..seq_len + pending.len() as u32).collect();
+            pass.input_tokens(&pending, &positions);
 
             // Sample distributions at the last token position
-            let last_idx = (buffered.len() - 1) as u32;
+            let last_idx = (pending.len() - 1) as u32;
             pass.sampler(&[last_idx], Sampler::Dist((0.0, 0)));
 
             let output = pass.execute_async().await
                 .map_err(|e| format!("Forward pass failed: {}", e))?;
 
-            // Commit pages and update cursor
-            let new_cursor_abs = cursor + buffered.len() as u32;
-            let pages_to_commit = new_cursor_abs / page_size;
+            // Commit pages
+            let new_wpt = wpt + pending.len() as u32;
+            let pages_to_commit = new_wpt / page_size;
             if pages_to_commit > 0 {
-                let page_indices: Vec<u32> = (0..pages_to_commit).collect();
-                candidate_ctx.commit_pages(&page_indices)
+                candidate_ctx.commit_working_pages(pages_to_commit)
                     .map_err(|e| format!("Failed to commit pages: {}", e))?;
             }
-            candidate_ctx.set_cursor(new_cursor_abs % page_size);
 
             // Extract distribution and find the probability of the target token
             if let Output::Distributions(dists) = output {
@@ -97,7 +94,7 @@ pub async fn validate_outputs(
             }
 
             // Feed the current token for the next step
-            candidate_ctx.set_buffered_tokens(&[token_id]);
+            pending = vec![token_id];
         }
         log_probs.push(current_log_prob);
     }
@@ -145,17 +142,17 @@ async fn main(args: Vec<String>) -> Result<String> {
 
     let ctx = Context::create(&model)?;
 
-    // Set up the initial context using InstructExt
-    ctx.system("You are an expert at information extraction.");
-    ctx.user(
+    let mut pending_tokens: Vec<u32> = Vec::new();
+    pending_tokens.extend(ctx.system("You are an expert at information extraction."));
+    pending_tokens.extend(ctx.user(
         "From the sentence \"The financial report was prepared by David Chen.\", \
         extract the person's name.",
-    );
-    ctx.cue();
+    ));
+    pending_tokens.extend(ctx.cue());
 
     let prompt = "The name of the person in the report is ";
-    ctx.fill_tokens(&model.tokenizer().encode(prompt));
-    ctx.flush().await?;
+    pending_tokens.extend(model.tokenizer().encode(prompt));
+    ctx.flush(&pending_tokens).await?;
 
     // Define the list of candidate outputs to validate
     let candidates = vec![

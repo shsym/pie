@@ -595,20 +595,31 @@ mod tests {
     }
 
     #[test]
-    fn test_working_pages_swap() {
+    fn test_cpu_pages_alloc_free() {
         let mut store = PageStore::new(4, 10, 5);
 
-        let pages = store.alloc_working(2).unwrap();
-        let swap_ops = store.swap_out(&pages).unwrap();
-        assert_eq!(swap_ops.len(), 2);
-        assert_eq!(store.gpu.used(), 0); // GPU freed by swap_out
+        // Allocate GPU working pages
+        let gpu_pages = store.alloc_working(2).unwrap();
+        assert_eq!(store.gpu.used(), 2);
+
+        // Allocate CPU pages (simulating D2H copy target)
+        let cpu_pages = store.alloc_cpu_pages(2).unwrap();
+        assert_eq!(cpu_pages.len(), 2);
         assert_eq!(store.cpu.used(), 2);
 
-        let cpu_slots: Vec<_> = swap_ops.iter().map(|op| op.cpu_slot).collect();
-        let swap_in_ops = store.swap_in(&cpu_slots).unwrap();
-        assert_eq!(swap_in_ops.len(), 2);
+        // Free GPU pages (simulating post-D2H swap-out)
+        store.free_working(&gpu_pages);
+        assert_eq!(store.gpu.used(), 0);
+
+        // Re-allocate GPU pages (simulating H2D swap-in target)
+        let new_gpu = store.alloc_working(2).unwrap();
         assert_eq!(store.gpu.used(), 2);
-        assert_eq!(store.cpu.used(), 0); // CPU freed by swap_in
+
+        // Free CPU pages (simulating post-H2D swap-in)
+        store.free_cpu_pages(&cpu_pages);
+        assert_eq!(store.cpu.used(), 0);
+
+        store.free_working(&new_gpu);
     }
 
     #[test]

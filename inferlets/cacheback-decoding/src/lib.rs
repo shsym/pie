@@ -32,6 +32,7 @@ struct GreedyDrafter {
     draft_ctx: Context,
     draft_length: usize,
     page_size: u32,
+    pending_tokens: Vec<u32>,
 }
 
 impl GreedyDrafter {
@@ -43,6 +44,7 @@ impl GreedyDrafter {
             draft_ctx,
             draft_length,
             page_size,
+            pending_tokens: Vec::new(),
         })
     }
 }
@@ -53,22 +55,20 @@ impl Speculate for GreedyDrafter {
         let mut tokens = Vec::new();
         let mut positions = Vec::new();
 
-        // Copy the current buffered tokens from the main context
-        let buffered = self.draft_ctx.buffered_tokens();
-        if buffered.is_empty() {
+        if self.pending_tokens.is_empty() {
             return (tokens, positions);
         }
 
-        let mut current_tokens = buffered.clone();
+        let mut current_tokens = self.pending_tokens.clone();
 
-        for i in 0..self.draft_length {
-            let seq_len = self.draft_ctx.last_position().map(|p| p + 1).unwrap_or(0) + i as u32;
+        for _i in 0..self.draft_length {
+            let wpt = self.draft_ctx.working_page_token_count();
+            let seq_len = self.draft_ctx.committed_page_count() * self.page_size + wpt;
 
-            let cursor = self.draft_ctx.cursor();
-            let total_tokens_after = cursor + current_tokens.len() as u32;
+            let total_tokens_after = wpt + current_tokens.len() as u32;
             let total_pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
             if total_pages_needed > 0 {
-                if self.draft_ctx.reserve_pages(total_pages_needed).is_err() {
+                if self.draft_ctx.reserve_working_pages(total_pages_needed).is_err() {
                     break;
                 }
             }
@@ -100,17 +100,14 @@ impl Speculate for GreedyDrafter {
                 tokens.push(token);
                 positions.push(seq_len + current_tokens.len() as u32);
 
-                // Update cursor
-                let new_cursor_abs = cursor + current_tokens.len() as u32;
-                let pages_to_commit = new_cursor_abs / self.page_size;
+                // Commit pages
+                let new_wpt = wpt + current_tokens.len() as u32;
+                let pages_to_commit = new_wpt / self.page_size;
                 if pages_to_commit > 0 {
-                    let page_indices: Vec<u32> = (0..pages_to_commit).collect();
-                    let _ = self.draft_ctx.commit_pages(&page_indices);
+                    let _ = self.draft_ctx.commit_working_pages(pages_to_commit);
                 }
-                self.draft_ctx.set_cursor(new_cursor_abs % self.page_size);
 
                 current_tokens = vec![token];
-                self.draft_ctx.set_buffered_tokens(&[token]);
             } else {
                 break;
             }
@@ -122,13 +119,13 @@ impl Speculate for GreedyDrafter {
     fn accept(&mut self, accepted_tokens: &[u32]) {
         // Update the draft context to match the accepted state
         if let Some(&last) = accepted_tokens.last() {
-            self.draft_ctx.set_buffered_tokens(&[last]);
+            self.pending_tokens = vec![last];
         }
     }
 
     fn reset(&mut self) {
         // Reset the draft context
-        self.draft_ctx.set_buffered_tokens(&[]);
+        self.pending_tokens.clear();
     }
 
     fn rollback(&mut self, _num_tokens: usize) {
@@ -158,10 +155,11 @@ async fn main(args: Vec<String>) -> Result<String> {
 
     let ctx = Context::create(&model)?;
 
-    ctx.system("You are a helpful assistant.");
-    ctx.user(&prompt);
-    ctx.cue();
-    ctx.flush().await?;
+    let mut pending_tokens: Vec<u32> = Vec::new();
+    pending_tokens.extend(ctx.system("You are a helpful assistant."));
+    pending_tokens.extend(ctx.user(&prompt));
+    pending_tokens.extend(ctx.cue());
+    ctx.flush(&pending_tokens).await?;
 
     // Create the drafter
     let drafter = GreedyDrafter::new(&model, &ctx, draft_length)?;

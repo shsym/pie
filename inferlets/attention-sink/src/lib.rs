@@ -5,7 +5,7 @@
 //! a per-step attention mask, preventing the model from attending to them.
 //!
 //! NOTE: Full KV cache eviction is not yet supported by the runtime. The runtime's
-//! `release_pages` API only frees *uncommitted* pages; committed pages persist.
+//! `release_working_pages` API only frees *uncommitted* pages; committed pages persist.
 //! This implementation uses `ForwardPass::attention_mask` to apply per-step masking,
 //! so the model ignores masked tokens, but the KV memory is not freed.
 
@@ -73,11 +73,12 @@ async fn main(args: Vec<String>) -> Result<String> {
     let page_size = ctx.tokens_per_page();
     let stop_tokens = Context::stop_tokens(&model);
 
-    // Fill the prompt
-    ctx.system("You are a helpful assistant.");
-    ctx.user(&prompt);
-    ctx.cue();
-    ctx.flush().await?;
+    let mut pending_tokens: Vec<u32> = Vec::new();
+    pending_tokens.extend(ctx.system("You are a helpful assistant."));
+    pending_tokens.extend(ctx.user(&prompt));
+    pending_tokens.extend(ctx.cue());
+    ctx.flush(&pending_tokens).await?;
+    pending_tokens.clear();
 
     println!(
         "--- Attention Sink (sink={}, window={}, page_size={}) ---",
@@ -91,41 +92,57 @@ async fn main(args: Vec<String>) -> Result<String> {
     let mut generated_tokens: Vec<u32> = Vec::new();
     let sampler = Sampler::TopP((0.0, 1.0));
 
-    for _step in 0..max_tokens {
-        let buffered = ctx.buffered_tokens();
-        if buffered.is_empty() {
+    // Bootstrap: sample the first token from the flushed KV cache
+    let bootstrap_pass = ForwardPass::new(&model);
+    bootstrap_pass.context(&ctx);
+    bootstrap_pass.sampler(&[0], sampler.clone());
+    let bootstrap_output = bootstrap_pass.execute_async().await?;
+    match bootstrap_output {
+        Output::Tokens(t) if !t.is_empty() => {
+            if stop_tokens.contains(&t[0]) {
+                // First token is stop — nothing to generate
+            } else {
+                generated_tokens.push(t[0]);
+                pending_tokens = vec![t[0]];
+            }
+        }
+        _ => {}
+    }
+
+    for _step in 1..max_tokens {
+        if pending_tokens.is_empty() {
             break;
         }
 
-        let seq_len = ctx.last_position().map(|p| p + 1).unwrap_or(0);
-        let cursor = ctx.cursor();
+        let wpt = ctx.working_page_token_count();
+        let seq_len = ctx.committed_page_count() * page_size + wpt;
 
         // Reserve pages for the new token(s)
-        let total_tokens_after = cursor + buffered.len() as u32;
+        let total_tokens_after = wpt + pending_tokens.len() as u32;
         let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
         if total_pages_needed > 0 {
-            ctx.reserve_pages(total_pages_needed)
+            ctx.reserve_working_pages(total_pages_needed)
                 .map_err(|e| format!("Failed to reserve pages: {}", e))?;
         }
 
         let pass = ForwardPass::new(&model);
         pass.context(&ctx);
 
-        let positions: Vec<u32> = (seq_len..seq_len + buffered.len() as u32).collect();
-        pass.input_tokens(&buffered, &positions);
+        let positions: Vec<u32> = (seq_len..seq_len + pending_tokens.len() as u32).collect();
+        pass.input_tokens(&pending_tokens, &positions);
 
         // Apply attention sink mask
-        let total_seq_len = seq_len + buffered.len() as u32;
+        let total_seq_len = seq_len + pending_tokens.len() as u32;
         let total_kept = sink_size + window_size;
         if total_seq_len > total_kept {
             let mask = build_sink_mask(total_seq_len, sink_size, window_size);
-            let masks: Vec<Vec<u32>> = (0..buffered.len())
+            let masks: Vec<Vec<u32>> = (0..pending_tokens.len())
                 .map(|_| mask.clone())
                 .collect();
             pass.attention_mask(&masks);
         }
 
-        let last_token_idx = (buffered.len() - 1) as u32;
+        let last_token_idx = (pending_tokens.len() - 1) as u32;
         pass.sampler(&[last_token_idx], sampler.clone());
 
         let output = pass.execute_async().await?;
@@ -139,17 +156,14 @@ async fn main(args: Vec<String>) -> Result<String> {
             break;
         }
 
-        // Page management: commit pages and update cursor
-        let new_cursor = cursor + buffered.len() as u32;
-        let pages_to_commit = new_cursor / page_size;
+        // Page management: commit pages
+        let new_wpt = wpt + pending_tokens.len() as u32;
+        let pages_to_commit = new_wpt / page_size;
 
         if pages_to_commit > 0 {
-            let page_indices: Vec<u32> = (0..pages_to_commit).collect();
-            ctx.commit_pages(&page_indices)
+            ctx.commit_working_pages(pages_to_commit)
                 .map_err(|e| format!("Failed to commit pages: {}", e))?;
         }
-
-        ctx.set_cursor(new_cursor % page_size);
 
         // Check for stop tokens
         let token = new_tokens[0];
@@ -160,7 +174,7 @@ async fn main(args: Vec<String>) -> Result<String> {
         generated_tokens.push(token);
 
         // Buffer the accepted token for the next step
-        ctx.set_buffered_tokens(&[token]);
+        pending_tokens = vec![token];
     }
 
     let tokenizer = model.tokenizer();

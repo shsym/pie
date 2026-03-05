@@ -187,24 +187,24 @@ async def _reserve_and_run(
     ctx_handle,
     model_handle,
     tokens: list[int],
-    seq_start: int,
-    cursor: int,
     page_size: int,
     sampler_variant=None,
     logit_mask: list[int] | None = None,
 ):
-    """Reserve pages, run a forward pass, commit pages, update cursor.
+    """Reserve pages, run a forward pass, commit pages.
 
-    If ``sampler_variant`` is provided, sampling is applied at the last
-    position.  Returns the Output (or None if no sampler was given).
+    Uses ``working_page_token_count`` and ``committed_page_count`` to derive
+    sequence positions.  Returns the Output (or None if no sampler was given).
     """
     num_tokens = len(tokens)
+    wpt = ctx_handle.working_page_token_count()
+    seq_start = ctx_handle.committed_page_count() * page_size + wpt
 
     # Reserve pages
-    total_tokens = cursor + num_tokens
+    total_tokens = wpt + num_tokens
     pages_needed = (total_tokens + page_size - 1) // page_size
     if pages_needed > 0:
-        ctx_handle.reserve_pages(pages_needed)
+        ctx_handle.reserve_working_pages(pages_needed)
 
     # Build forward pass
     fwd = _inf.ForwardPass(model_handle)
@@ -221,13 +221,11 @@ async def _reserve_and_run(
     future = fwd.execute()
     output = await await_future(future, "Forward pass failed")
 
-    # Commit pages and update cursor
-    new_cursor_abs = cursor + num_tokens
-    pages_to_commit = new_cursor_abs // page_size
+    # Commit pages
+    new_wpt = wpt + num_tokens
+    pages_to_commit = new_wpt // page_size
     if pages_to_commit > 0:
-        ctx_handle.commit_pages(list(range(pages_to_commit)))
-
-    ctx_handle.set_cursor(new_cursor_abs % page_size)
+        ctx_handle.commit_working_pages(pages_to_commit)
 
     return output
 
@@ -260,6 +258,7 @@ class TokenStream:
         "_done",
         "_max_tokens",
         "_tokens_generated",
+        "_pending_tokens",
     )
 
     def __init__(
@@ -269,6 +268,7 @@ class TokenStream:
         *,
         max_tokens: int | None = None,
         logit_mask: list[int] | None = None,
+        pending_tokens: list[int] | None = None,
     ) -> None:
         self._ctx = ctx
         self._model_handle = ctx._handle.model()
@@ -279,37 +279,38 @@ class TokenStream:
         self._done = False
         self._max_tokens = max_tokens
         self._tokens_generated = 0
+        self._pending_tokens: list[int] = pending_tokens or []
 
     # --- Generation ---
 
     async def _step(self) -> list[int]:
         """One generation step: forward pass → sample → commit."""
-        raw = self._ctx._handle
-        buffered = raw.buffered_tokens()
-        if not buffered:
-            raise RuntimeError("generate requires at least one buffered token")
-
-        last_pos = raw.last_position()
-        seq_start = (last_pos + 1) if last_pos is not None else 0
-
-        output = await _reserve_and_run(
-            raw,
-            self._model_handle,
-            buffered,
-            seq_start,
-            raw.cursor(),
-            self._page_size,
-            sampler_variant=self._sampler._variant,
-            logit_mask=self._logit_mask,
-        )
+        if self._pending_tokens:
+            output = await _reserve_and_run(
+                self._ctx._handle,
+                self._model_handle,
+                self._pending_tokens,
+                self._page_size,
+                sampler_variant=self._sampler._variant,
+                logit_mask=self._logit_mask,
+            )
+        else:
+            # Bootstrap: sample from the last cached KV position (after flush)
+            fwd = _inf.ForwardPass(self._model_handle)
+            fwd.context(self._ctx._handle)
+            fwd.sampler([0], self._sampler._variant)
+            if self._logit_mask is not None:
+                fwd.logit_mask(self._logit_mask)
+            future = fwd.execute()
+            output = await await_future(future, "Bootstrap forward pass failed")
 
         # Extract tokens from output
         new_tokens = self._extract_tokens(output)
         if not new_tokens:
             return []
 
-        # Set the last generated token as the next input
-        raw.set_buffered_tokens([new_tokens[-1]])
+        # Seed pending_tokens with the last generated token for the next step
+        self._pending_tokens = [new_tokens[-1]]
 
         return new_tokens
 
@@ -436,7 +437,7 @@ class Context:
             ...
     """
 
-    __slots__ = ("_handle", "_model")
+    __slots__ = ("_handle", "_model", "_pending_tokens")
 
     def __init__(
         self,
@@ -449,6 +450,7 @@ class Context:
         """
         self._handle = _ctx.Context.create(model._handle)
         self._model = model
+        self._pending_tokens: list[int] = []
 
     @classmethod
     def open(cls, model: Model, name: str) -> Context | None:
@@ -459,6 +461,7 @@ class Context:
         obj = object.__new__(cls)
         obj._handle = raw
         obj._model = model
+        obj._pending_tokens = []
         return obj
 
     @classmethod
@@ -472,60 +475,51 @@ class Context:
         """Fill the context buffer with text (encodes to tokens)."""
         tokenizer = self._model.tokenizer()
         tokens = tokenizer.encode(text)
-        self._handle.append_buffered_tokens(tokens)
+        self._pending_tokens.extend(tokens)
 
     def fill_tokens(self, tokens: list[int]) -> None:
         """Fill the context buffer with raw token IDs."""
-        self._handle.append_buffered_tokens(tokens)
+        self._pending_tokens.extend(tokens)
 
     async def flush(self) -> None:
-        """Flush buffered tokens: run forward pass and commit pages.
+        """Flush pending tokens: run forward pass and commit pages.
 
-        Processes all buffered tokens except the last one (which stays
-        as the seed for the next generation step).
+        Processes all pending tokens through the forward pass and commits
+        full pages.  After flush, ``_pending_tokens`` is empty.
         """
-        buffered = self._handle.buffered_tokens()
-        if len(buffered) <= 1:
+        if not self._pending_tokens:
             return
-
-        tokens_to_flush = buffered[:-1]
-        last_token = buffered[-1]
-
-        last_pos = self._handle.last_position()
-        seq_start = (last_pos + 1) if last_pos is not None else 0
 
         await _reserve_and_run(
             self._handle,
             self._model._handle,
-            tokens_to_flush,
-            seq_start,
-            self._handle.cursor(),
+            self._pending_tokens,
             self._handle.tokens_per_page(),
         )
 
-        self._handle.set_buffered_tokens([last_token])
+        self._pending_tokens = []
 
     # --- Instruct (pie:instruct/chat) ---
 
     def system(self, message: str) -> None:
         """Fill a system message."""
-        _chat.system(self._handle, message)
+        self._pending_tokens.extend(_chat.system(self._handle, message))
 
     def user(self, message: str) -> None:
         """Fill a user message."""
-        _chat.user(self._handle, message)
+        self._pending_tokens.extend(_chat.user(self._handle, message))
 
     def assistant(self, message: str) -> None:
         """Fill a (previous) assistant message."""
-        _chat.assistant(self._handle, message)
+        self._pending_tokens.extend(_chat.assistant(self._handle, message))
 
     def cue(self) -> None:
         """Cue the model to generate (fills the generation header)."""
-        _chat.cue(self._handle)
+        self._pending_tokens.extend(_chat.cue(self._handle))
 
     def seal(self) -> None:
         """Seal the current turn (inserts stop token)."""
-        _chat.seal(self._handle)
+        self._pending_tokens.extend(_chat.seal(self._handle))
 
     def stop_tokens(self) -> list[int]:
         """Get the stop token IDs for this model."""
@@ -535,11 +529,11 @@ class Context:
 
     def equip_tools(self, tools: list[str]) -> None:
         """Register available tools (list of JSON schema strings)."""
-        _tool.equip(self._handle, tools)
+        self._pending_tokens.extend(_tool.equip(self._handle, tools))
 
     def answer_tool(self, name: str, value: str) -> None:
         """Provide a tool call result."""
-        _tool.answer(self._handle, name, value)
+        self._pending_tokens.extend(_tool.answer(self._handle, name, value))
 
     # --- Generate (ContextExt) ---
 
@@ -575,7 +569,8 @@ class Context:
             self.cue()
             await self.flush()
 
-        stream = TokenStream(self, sampler, max_tokens=max_tokens, logit_mask=logit_mask)
+        stream = TokenStream(self, sampler, max_tokens=max_tokens, logit_mask=logit_mask, pending_tokens=self._pending_tokens)
+        self._pending_tokens = []
 
         if decode or reasoning or tool_use:
             return EventStream(stream, reasoning=reasoning, tool_use=tool_use)
@@ -620,6 +615,7 @@ class Context:
         obj = object.__new__(Context)
         obj._handle = raw
         obj._model = self._model
+        obj._pending_tokens = []
         return obj
 
     def save(self, name: str) -> None:

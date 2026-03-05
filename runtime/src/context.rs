@@ -11,7 +11,7 @@
 //!
 //! - `ContextTokens` (global DashMap) — token-level data accessed by WIT host
 //!   functions without going through the actor: tokens_filled,
-//!   committed_len, max_committed_position.
+//!   committed_len.
 //!
 //! - `Context` (local HashMap on ContextManager) — all KV/page state accessed
 //!   exclusively within the actor: working_pages, committed_tip, lineage, state,
@@ -113,9 +113,9 @@ pub async fn fork(model_idx: usize, id: ContextId) -> Result<ContextId> {
     rx.await.context("context::fork: actor dropped response")?
 }
 
-pub async fn commit_pages(model_idx: usize, id: ContextId, page_indices: Vec<u32>) -> Result<()> {
+pub async fn commit_pages(model_idx: usize, id: ContextId, num_pages: u32) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::CommitPages { id, page_indices, response: tx })?;
+    SERVICES.send(model_idx, Message::CommitPages { id, num_pages, response: tx })?;
     rx.await.context("context::commit_pages: actor dropped response")?
 }
 
@@ -142,8 +142,6 @@ pub async fn pin(model_idx: usize, id: ContextId) -> Result<HashMap<DeviceId, Ve
 pub fn unpin(model_idx: usize, id: ContextId) {
     let _ = SERVICES.send(model_idx, Message::Unpin { id });
 }
-
-
 
 pub async fn get_stats(model_idx: usize) -> Vec<(usize, usize)> {
     let (tx, rx) = oneshot::channel();
@@ -184,18 +182,14 @@ pub fn kv_len(model_idx: usize, id: ContextId) -> u32 {
         .unwrap_or(0)
 }
 
-pub fn get_cursor(model_idx: usize, id: ContextId) -> u32 {
-    BUFFERS.get(&(model_idx, id)).map(|b| b.cursor()).unwrap_or(0)
+pub fn working_page_token_count(model_idx: usize, id: ContextId) -> u32 {
+    BUFFERS.get(&(model_idx, id)).map(|b| b.filled_token_count()).unwrap_or(0)
 }
 
-pub fn set_cursor(model_idx: usize, id: ContextId, cursor: u32) -> Result<()> {
+pub fn truncate_filled_tokens(model_idx: usize, id: ContextId, count: u32) -> Result<()> {
     let mut buf = BUFFERS.get_mut(&(model_idx, id))
         .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-    buf.set_cursor(cursor)
-}
-
-pub fn last_position(model_idx: usize, id: ContextId) -> Option<u32> {
-    BUFFERS.get(&(model_idx, id)).and_then(|b| b.last_position())
+    buf.truncate_filled(count)
 }
 
 pub fn append_filled_tokens(
@@ -235,23 +229,15 @@ impl ContextTokens {
         self.committed_len * page_size + self.tokens_filled.len()
     }
 
-    fn cursor(&self) -> u32 {
+    fn filled_token_count(&self) -> u32 {
         self.tokens_filled.len() as u32
     }
 
-    fn set_cursor(&mut self, cursor: u32) -> Result<()> {
+    fn truncate_filled(&mut self, count: u32) -> Result<()> {
         let max = self.tokens_filled.len();
-        if cursor as usize > max { anyhow::bail!("cursor {} out of range 0..={}", cursor, max); }
-        self.tokens_filled.truncate(cursor as usize);
+        if count as usize > max { anyhow::bail!("truncate count {} out of range 0..={}", count, max); }
+        self.tokens_filled.truncate(count as usize);
         Ok(())
-    }
-
-    fn last_position(&self) -> Option<u32> {
-        let max_filled = self.tokens_filled.iter().map(|t| t.position).max();
-        match (self.max_committed_position, max_filled) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        }
     }
 
     fn append_filled_tokens(
@@ -348,7 +334,7 @@ pub(crate) struct Context {
     pub device: Option<DeviceId>,
     /// Physical page IDs for uncommitted (working) pages on GPU.
     pub working_pages: Vec<PhysicalPageId>,
-    /// CPU slots for working pages when suspended.
+    /// CPU pages for working pages when suspended.
     pub working_pages_cpu: Vec<PhysicalPageId>,
     /// Tip of the committed hash chain (None if no commits yet).
     pub committed_tip: Option<PageHash>,
@@ -730,11 +716,11 @@ impl ContextManager {
             let n = snap.working_pages_cpu.len();
             if let Some(gpu_pages) = self.devices[dev_idx].alloc_working(n) {
                 let _ = device::copy_h2d(dev_idx as DeviceId, &gpu_pages, &snap.working_pages_cpu);
-                // Free CPU slots after H2D copy is issued
+                // Free CPU pages after H2D copy is issued
                 self.devices[dev_idx].free_cpu_pages(&snap.working_pages_cpu);
                 gpu_pages
             } else {
-                // GPU OOM — can't restore, free the orphaned CPU slots
+                // GPU OOM — can't restore, free the orphaned CPU pages
                 self.devices[dev_idx].free_cpu_pages(&snap.working_pages_cpu);
                 Vec::new()
             }
@@ -789,26 +775,25 @@ impl ContextManager {
         Ok(())
     }
 
-    pub(crate) fn commit_pages_impl(&mut self, id: ContextId, indices: Vec<u32>) -> Result<()> {
+    pub(crate) fn commit_pages_impl(&mut self, id: ContextId, num_pages: u32) -> Result<()> {
         let page_size = self.page_size;
         let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
 
+        if num_pages == 0 { return Ok(()); }
+
         // Suspended context → logical commit
-        if ctx.working_pages.is_empty() && !indices.is_empty() {
-            return self.commit_pages_logical(id, indices);
+        if ctx.working_pages.is_empty() {
+            return self.commit_pages_logical(id, num_pages);
         }
 
-        for &idx in &indices {
-            if idx as usize >= ctx.working_pages.len() {
-                anyhow::bail!("Invalid page index: {}", idx);
-            }
+        let n = num_pages as usize;
+        if n > ctx.working_pages.len() {
+            anyhow::bail!("Cannot commit {} pages, only {} working pages available", n, ctx.working_pages.len());
         }
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let old_tip = ctx.committed_tip;
         let prev_hash = ctx.committed_tip.unwrap_or(0);
-        let working_phys: Vec<PhysicalPageId> = indices.iter()
-            .map(|&idx| ctx.working_pages[idx as usize])
-            .collect();
+        let working_phys: Vec<PhysicalPageId> = ctx.working_pages[..n].to_vec();
         let owner = ctx.owner;
 
         // Read token data from the ContextTokens
@@ -818,20 +803,17 @@ impl ContextManager {
         let mut masks = Vec::new();
         let mut all_positions = Vec::new();
 
-        for &idx in &indices {
-            let start = idx as usize * page_size;
-            let end = start + page_size;
-            if end > buf.tokens_filled.len() {
-                anyhow::bail!("Page {} not fully filled: need {} tokens but only have {}",
-                    idx, end, buf.tokens_filled.len());
-            }
-            for i in start..end {
-                let info = &buf.tokens_filled[i];
-                tokens.push(info.token);
-                positions.push(info.position);
-                masks.push(info.mask.clone());
-                all_positions.push(info.position);
-            }
+        let total_needed = n * page_size;
+        if total_needed > buf.tokens_filled.len() {
+            anyhow::bail!("Cannot commit {} pages: need {} tokens but only have {}",
+                n, total_needed, buf.tokens_filled.len());
+        }
+        for i in 0..total_needed {
+            let info = &buf.tokens_filled[i];
+            tokens.push(info.token);
+            positions.push(info.position);
+            masks.push(info.mask.clone());
+            all_positions.push(info.position);
         }
 
         if let Some(max_committed) = buf.max_committed_position {
@@ -863,11 +845,7 @@ impl ContextManager {
         // Update Context (local)
         let ctx = self.contexts.get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context lost during commit"))?;
-        let mut sorted_indices: Vec<usize> = indices.iter().map(|&i| i as usize).collect();
-        sorted_indices.sort_unstable();
-        for &idx in sorted_indices.iter().rev() {
-            ctx.working_pages.remove(idx);
-        }
+        ctx.working_pages.drain(..n);
         ctx.committed_tip = Some(new_tip);
 
         // Append to lineage
@@ -885,24 +863,20 @@ impl ContextManager {
 
         // Update ContextTokens (DashMap)
         if let Some(mut buf) = self.buf_mut(id) {
-            for &idx in sorted_indices.iter().rev() {
-                let start = idx * page_size;
-                let end = ((idx + 1) * page_size).min(buf.tokens_filled.len());
-                buf.tokens_filled.drain(start..end);
-            }
-            buf.committed_len += indices.len();
+            buf.tokens_filled.drain(..total_needed);
+            buf.committed_len += n;
             buf.max_committed_position = all_positions.iter().copied().max()
                 .or(buf.max_committed_position);
         }
 
         if let Some(pid) = owner {
-            self.arbiter.commit(pid, dev_idx, indices.len());
+            self.arbiter.commit(pid, dev_idx, n);
         }
 
         Ok(())
     }
 
-    fn commit_pages_logical(&mut self, id: ContextId, indices: Vec<u32>) -> Result<()> {
+    fn commit_pages_logical(&mut self, id: ContextId, num_pages: u32) -> Result<()> {
         let page_size = self.page_size;
         let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
@@ -914,18 +888,17 @@ impl ContextManager {
         let mut positions = Vec::new();
         let mut masks = Vec::new();
 
-        for &idx in &indices {
-            let start = idx as usize * page_size;
-            let end = start + page_size;
-            if end > buf.tokens_filled.len() {
-                anyhow::bail!("Page {} not fully filled: need {} tokens but only have {}", idx, end, buf.tokens_filled.len());
-            }
-            for i in start..end {
-                let info = &buf.tokens_filled[i];
-                tokens.push(info.token);
-                positions.push(info.position);
-                masks.push(info.mask.clone());
-            }
+        let n = num_pages as usize;
+        let total_needed = n * page_size;
+        if total_needed > buf.tokens_filled.len() {
+            anyhow::bail!("Cannot commit {} pages: need {} tokens but only have {}",
+                n, total_needed, buf.tokens_filled.len());
+        }
+        for i in 0..total_needed {
+            let info = &buf.tokens_filled[i];
+            tokens.push(info.token);
+            positions.push(info.position);
+            masks.push(info.mask.clone());
         }
 
         if let Some(max_committed) = buf.max_committed_position {
@@ -971,14 +944,8 @@ impl ContextManager {
 
         // Update ContextTokens (DashMap)
         if let Some(mut buf) = self.buf_mut(id) {
-            let mut sorted_indices: Vec<usize> = indices.iter().map(|&i| i as usize).collect();
-            sorted_indices.sort_unstable();
-            for &idx in sorted_indices.iter().rev() {
-                let start = idx * page_size;
-                let end = ((idx + 1) * page_size).min(buf.tokens_filled.len());
-                buf.tokens_filled.drain(start..end);
-            }
-            buf.committed_len += indices.len();
+            buf.tokens_filled.drain(..total_needed);
+            buf.committed_len += n;
             buf.max_committed_position = max_position
                 .or(buf.max_committed_position);
         }
@@ -1051,7 +1018,7 @@ pub(crate) enum Message {
     Destroy { id: ContextId, force: bool, response: oneshot::Sender<Result<()>> },
     Fork { id: ContextId, response: oneshot::Sender<Result<ContextId>> },
     Take { username: String, name: String, response: oneshot::Sender<Result<ContextId>> },
-    CommitPages { id: ContextId, page_indices: Vec<u32>, response: oneshot::Sender<Result<()>> },
+    CommitPages { id: ContextId, num_pages: u32, response: oneshot::Sender<Result<()>> },
     ReservePages { id: ContextId, num_pages: u32, response: oneshot::Sender<Result<()>> },
     ReleasePages { id: ContextId, num_pages: u32 },
     Pin { id: ContextId, response: oneshot::Sender<Result<HashMap<DeviceId, Vec<PhysicalPageId>>>> },
@@ -1157,8 +1124,8 @@ impl ServiceHandler for ContextManager {
                 self.dispatch_replay_chunks(chunks).await;
             }
             Message::Fork { id, response } => { let _ = response.send(self.fork(id)); }
-            Message::CommitPages { id, page_indices, response } => {
-                let _ = response.send(self.commit_pages_impl(id, page_indices));
+            Message::CommitPages { id, num_pages, response } => {
+                let _ = response.send(self.commit_pages_impl(id, num_pages));
                 let chunks = self.drain_queues();
                 self.dispatch_replay_chunks(chunks).await;
             }

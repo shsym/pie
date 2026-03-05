@@ -94,17 +94,13 @@ class FakeModel:
 
 class FakeContext:
     def __init__(self):
-        self._buffered_tokens: list[int] = []
         self._cursor: int = 0
-        self._last_position: Optional[int] = None
         self._committed_pages: int = 0
         self._tokens_per_page_val: int = 64
 
     @classmethod
-    def create(cls, model, name, fill=None):
+    def create(cls, model):
         ctx = cls()
-        if fill:
-            ctx._buffered_tokens = list(fill)
         return ctx
 
     def destroy(self):
@@ -114,12 +110,10 @@ class FakeContext:
     def lookup(cls, model, name):
         return None
 
-    def fork(self, new_name):
+    def fork(self):
         new = FakeContext()
         new._cursor = self._cursor
-        new._last_position = self._last_position
         new._committed_pages = self._committed_pages
-        new._buffered_tokens = list(self._buffered_tokens)
         return new
 
     def acquire_lock(self):
@@ -137,35 +131,23 @@ class FakeContext:
     def committed_page_count(self):
         return self._committed_pages
 
-    def uncommitted_page_count(self):
+    def working_page_count(self):
         return 0
 
-    def commit_pages(self, page_indices):
-        self._committed_pages += len(page_indices)
+    def commit_working_pages(self, num_pages):
+        self._committed_pages += num_pages
 
-    def reserve_pages(self, n):
+    def reserve_working_pages(self, n):
         pass
 
-    def release_pages(self, n):
+    def release_working_pages(self, n):
         pass
 
-    def cursor(self):
+    def working_page_token_count(self):
         return self._cursor
 
-    def set_cursor(self, cursor):
-        self._cursor = cursor
-
-    def buffered_tokens(self):
-        return list(self._buffered_tokens)
-
-    def set_buffered_tokens(self, tokens):
-        self._buffered_tokens = list(tokens)
-
-    def append_buffered_tokens(self, tokens):
-        self._buffered_tokens.extend(tokens)
-
-    def last_position(self):
-        return self._last_position
+    def pop_working_page_tokens(self, num_tokens):
+        self._cursor = max(0, self._cursor - num_tokens)
 
     def __enter__(self):
         return self
@@ -461,11 +443,11 @@ def _build_mock_modules():
     chat_mod.Event_Interrupt = ChatEvent_Interrupt
     chat_mod.Event_Done = ChatEvent_Done
     chat_mod.Decoder = FakeChatDecoder
-    chat_mod.system = lambda ctx, msg: ctx.append_buffered_tokens([])
-    chat_mod.user = lambda ctx, msg: ctx.append_buffered_tokens([])
-    chat_mod.assistant = lambda ctx, msg: ctx.append_buffered_tokens([])
-    chat_mod.cue = lambda ctx: ctx.append_buffered_tokens([65])
-    chat_mod.seal = lambda ctx: None
+    chat_mod.system = lambda ctx, msg: []
+    chat_mod.user = lambda ctx, msg: []
+    chat_mod.assistant = lambda ctx, msg: []
+    chat_mod.cue = lambda ctx: [65]
+    chat_mod.seal = lambda ctx: []
     chat_mod.stop_tokens = lambda model: [2]
     chat_mod.create_decoder = lambda model: FakeChatDecoder()
 
@@ -482,8 +464,8 @@ def _build_mock_modules():
     tool_mod.Event_Start = ToolEvent_Start
     tool_mod.Event_Call = ToolEvent_Call
     tool_mod.Decoder = FakeToolDecoder
-    tool_mod.equip = lambda ctx, tools: None
-    tool_mod.answer = lambda ctx, name, value: None
+    tool_mod.equip = lambda ctx, tools: []
+    tool_mod.answer = lambda ctx, name, value: []
     tool_mod.create_decoder = lambda model: FakeToolDecoder()
     tool_mod.create_matcher = lambda model, tools: FakeMatcher(None, None)
 

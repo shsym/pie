@@ -1,5 +1,4 @@
 interface chat {
-    use pie:core/context.{context};
     use pie:core/model.{model};
     use pie:core/types.{error};
 
@@ -13,15 +12,15 @@ interface chat {
     }
 
     /// Fill roles for history replay
-    system: func(ctx: borrow<context>, message: string);
-    user: func(ctx: borrow<context>, message: string);
-    assistant: func(ctx: borrow<context>, message: string);
+    system: func(model: borrow<model>, message: string) -> list<u32>;
+    user: func(model: borrow<model>, message: string) -> list<u32>;
+    assistant: func(model: borrow<model>, message: string) -> list<u32>;
 
     /// Cue the model to generate (fills generation header)
-    cue: func(ctx: borrow<context>);
+    cue: func(model: borrow<model>) -> list<u32>;
 
     /// Seal the current turn (insert stop token)
-    seal: func(ctx: borrow<context>);
+    seal: func(model: borrow<model>) -> list<u32>;
 
     /// Returns the stop token IDs for the model
     stop-tokens: func(model: borrow<model>) -> list<u32>;

@@ -155,14 +155,11 @@ export class Decoder {
   }
 }
 
-// ─── Reserve-and-run helper ─────────────────────────────────────────────
-
 /**
- * Reserve pages, run a forward pass, commit pages, and update cursor.
+ * Reserve pages, run a forward pass, and commit pages.
  *
- * If `sampler` is provided, sampling is applied at the last position.
- * Returns the Output (or undefined if no sampler was given and the
- * output is not tokens).
+ * Uses `workingPageTokenCount()` and `committedPageCount()` to derive
+ * sequence positions.
  *
  * @internal
  */
@@ -175,21 +172,20 @@ async function _reserveAndRun(
 ): Promise<Output> {
   const numTokens = tokens.length;
   const pageSize = ctxHandle.tokensPerPage();
-  const cursor = ctxHandle.cursor();
+  const wpt = ctxHandle.workingPageTokenCount();
+  const seqStart = ctxHandle.committedPageCount() * pageSize + wpt;
 
-  // Reserve pages (runtime deduplicates against existing uncommitted)
-  const totalTokens = cursor + numTokens;
+  // Reserve pages
+  const totalTokens = wpt + numTokens;
   const pagesNeeded = Math.ceil(totalTokens / pageSize);
   if (pagesNeeded > 0) {
-    ctxHandle.reservePages(pagesNeeded);
+    ctxHandle.reserveWorkingPages(pagesNeeded);
   }
 
   // Build forward pass
   const pass = new _ForwardPass(ctxHandle.model());
   pass.context(ctxHandle);
 
-  const lastPos = ctxHandle.lastPosition();
-  const seqStart = lastPos !== undefined ? lastPos + 1 : 0;
   const positions = new Uint32Array(numTokens);
   for (let i = 0; i < numTokens; i++) {
     positions[i] = seqStart + i;
@@ -209,17 +205,12 @@ async function _reserveAndRun(
   // Execute
   const output = await awaitFuture(pass.execute(), 'Forward pass failed');
 
-  // Commit pages and update cursor
-  const newCursorAbs = cursor + numTokens;
-  const pagesToCommit = Math.floor(newCursorAbs / pageSize);
+  // Commit pages
+  const newWpt = wpt + numTokens;
+  const pagesToCommit = Math.floor(newWpt / pageSize);
   if (pagesToCommit > 0) {
-    const indices = new Uint32Array(pagesToCommit);
-    for (let i = 0; i < pagesToCommit; i++) {
-      indices[i] = i;
-    }
-    ctxHandle.commitPages(indices);
+    ctxHandle.commitWorkingPages(pagesToCommit);
   }
-  ctxHandle.setCursor(newCursorAbs % pageSize);
 
   return output;
 }
@@ -262,14 +253,16 @@ export class TokenStream implements AsyncIterable<Uint32Array> {
   private readonly _logitMask?: Brle;
   private _generated: number = 0;
   private _done: boolean = false;
+  private _pendingTokens: Uint32Array;
 
   /** @internal */
-  constructor(ctx: Context, options: GenerateOptions) {
+  constructor(ctx: Context, options: GenerateOptions, pendingTokens?: Uint32Array) {
     this._ctx = ctx;
     this._sampler = options.sampler;
     this._maxTokens = options.maxTokens;
     this._adapter = options.adapter?._handle;
     this._logitMask = options.logitMask;
+    this._pendingTokens = pendingTokens ?? new Uint32Array();
 
     // Auto-detect stop tokens from model if not provided
     if (options.stopTokens !== undefined) {
@@ -286,16 +279,14 @@ export class TokenStream implements AsyncIterable<Uint32Array> {
       return undefined;
     }
 
-    const ctxHandle = this._ctx._handle;
-    const buffered = ctxHandle.bufferedTokens();
-    if (buffered.length === 0) {
+    if (this._pendingTokens.length === 0) {
       this._done = true;
       return undefined;
     }
 
     const output = await _reserveAndRun(
-      ctxHandle,
-      buffered,
+      this._ctx._handle,
+      this._pendingTokens,
       this._sampler,
       this._logitMask,
       this._adapter,
@@ -321,8 +312,8 @@ export class TokenStream implements AsyncIterable<Uint32Array> {
 
       this._generated += tokens.length;
 
-      // Seed the next step with only the LAST generated token
-      ctxHandle.setBufferedTokens(new Uint32Array([tokens[tokens.length - 1]]));
+      // Seed pending_tokens with only the LAST generated token
+      this._pendingTokens = new Uint32Array([tokens[tokens.length - 1]]);
       return tokens;
     }
 
@@ -459,6 +450,8 @@ export class EventStream implements AsyncIterable<Event> {
 export class Context implements Disposable {
   /** @internal */
   readonly _handle: _Context;
+  /** SDK-local pending tokens */
+  private _pendingTokens: Uint32Array = new Uint32Array();
 
   private constructor(handle: _Context) {
     this._handle = handle;
@@ -506,39 +499,39 @@ export class Context implements Disposable {
   fill(text: string): void {
     const tokenizer = this._handle.model().tokenizer();
     const tokens = tokenizer.encode(text);
-    this._handle.appendBufferedTokens(tokens);
+    this._appendPending(tokens);
   }
 
   /** Fill the context buffer with raw token IDs. */
   fillTokens(tokens: Uint32Array): void {
-    this._handle.appendBufferedTokens(tokens);
+    this._appendPending(tokens);
   }
 
   // ── Chat formatting (pie:instruct/chat) ──
 
   /** Fill a system message. */
   system(message: string): void {
-    _chat.system(this._handle, message);
+    this._appendPending(_chat.system(this._handle, message));
   }
 
   /** Fill a user message. */
   user(message: string): void {
-    _chat.user(this._handle, message);
+    this._appendPending(_chat.user(this._handle, message));
   }
 
   /** Fill an assistant message (for history replay). */
   assistant(message: string): void {
-    _chat.assistant(this._handle, message);
+    this._appendPending(_chat.assistant(this._handle, message));
   }
 
   /** Cue the model to generate (fills generation header). */
   cue(): void {
-    _chat.cue(this._handle);
+    this._appendPending(_chat.cue(this._handle));
   }
 
   /** Seal the current turn (inserts stop token). */
   seal(): void {
-    _chat.seal(this._handle);
+    this._appendPending(_chat.seal(this._handle));
   }
 
   /** Returns the stop token IDs for this context's model. */
@@ -550,12 +543,12 @@ export class Context implements Disposable {
 
   /** Register available tools (list of JSON schema strings). */
   equipTools(tools: string[]): void {
-    _toolUse.equip(this._handle, tools);
+    this._appendPending(_toolUse.equip(this._handle, tools));
   }
 
   /** Provide a tool result after a tool call. */
   answerTool(name: string, value: string): void {
-    _toolUse.answer(this._handle, name, value);
+    this._appendPending(_toolUse.answer(this._handle, name, value));
   }
 
   // ── Low-level context operations ──
@@ -570,40 +563,19 @@ export class Context implements Disposable {
     return this._handle.model();
   }
 
-  /** Get the buffered (pending) token IDs. */
-  bufferedTokens(): Uint32Array {
-    return this._handle.bufferedTokens();
-  }
-
-  /** Set the buffered token IDs. */
-  setBufferedTokens(tokens: Uint32Array): void {
-    this._handle.setBufferedTokens(tokens);
-  }
-
-  /** Append tokens to the buffer. */
-  appendBufferedTokens(tokens: Uint32Array): void {
-    this._handle.appendBufferedTokens(tokens);
-  }
-
-  /** Get the last committed position, or undefined if empty. */
-  lastPosition(): number | undefined {
-    return this._handle.lastPosition();
-  }
-
-  /** Flush buffered tokens by executing a fill forward pass (no sampling).
+  /** Flush pending tokens by executing a fill forward pass (no sampling).
    *  Keeps the last token as seed for the next generation step. */
   async flush(): Promise<void> {
-    const buffered = this._handle.bufferedTokens();
-    if (buffered.length <= 1) return;
+    if (this._pendingTokens.length <= 1) return;
 
     // Flush all but the last token
-    const tokensToFlush = buffered.slice(0, -1);
-    const lastToken = buffered[buffered.length - 1];
+    const tokensToFlush = this._pendingTokens.slice(0, -1);
+    const lastToken = this._pendingTokens[this._pendingTokens.length - 1];
 
     await _reserveAndRun(this._handle, tokensToFlush);
 
     // Keep last token as seed
-    this._handle.setBufferedTokens(new Uint32Array([lastToken]));
+    this._pendingTokens = new Uint32Array([lastToken]);
   }
 
   // ── Generation ──
@@ -620,7 +592,8 @@ export class Context implements Disposable {
     await this.flush();
     this.cue();
 
-    const stream = new TokenStream(this, options);
+    const stream = new TokenStream(this, options, this._pendingTokens);
+    this._pendingTokens = new Uint32Array();
 
     if (options.decode) {
       const decoder = new Decoder(this._handle.model(), options.decode);
@@ -644,5 +617,14 @@ export class Context implements Disposable {
    */
   async generateText(options: Omit<GenerateOptions, 'decode'>): Promise<string> {
     return (await this.generate(options)).text();
+  }
+
+  /** @internal Append tokens to the pending buffer. */
+  private _appendPending(tokens: Uint32Array): void {
+    if (tokens.length === 0) return;
+    const merged = new Uint32Array(this._pendingTokens.length + tokens.length);
+    merged.set(this._pendingTokens);
+    merged.set(tokens, this._pendingTokens.length);
+    this._pendingTokens = merged;
   }
 }
