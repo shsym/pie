@@ -1,41 +1,78 @@
-"""Configuration CLI commands for Pie.
+"""Configuration management commands for Pie CLI.
 
-Implements: pie config init|show|set
-
-Re-exports from pie.config for backward compatibility:
-    Config, AuthConfig, TelemetryConfig, ModelConfig,
-    load_config, DEFAULT_MODEL, create_default_config_content
+Implements: pie config init|update|show
 """
 
+import lzma
+import tarfile
+from io import BytesIO
 from pathlib import Path
+from typing import Optional
 
+import httpx
 import toml
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TextColumn,
+    TransferSpeedColumn,
+)
 from rich.syntax import Syntax
+from rich.text import Text
 
 from pie import path as pie_path
-from pie.config import (  # noqa: F401
-    AuthConfig,
-    TelemetryConfig,
-    ModelConfig,
-    Config,
-    load_config,
-    DEFAULT_MODEL,
-    create_default_config_content,
-)
+from pie.config import create_default_config_content, DEFAULT_MODEL
+from huggingface_hub import scan_cache_dir
 
 console = Console()
 app = typer.Typer(help="Manage configuration")
 
+PYTHON_RUNTIME_URL = (
+    "https://registry.pie-project.org/api/v1/runtimes/python3.14/0.1.0/download"
+)
+
+
+def _download_python_runtime(dest_dir: Path) -> None:
+    """Download and extract the Python 3.14 runtime into dest_dir."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    with httpx.stream("GET", PYTHON_RUNTIME_URL, follow_redirects=True) as resp:
+        resp.raise_for_status()
+        total = int(resp.headers.get("content-length", 0))
+
+        progress = Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+        )
+        with progress:
+            task = progress.add_task(
+                "Downloading Python 3.14 runtime for Python inferlets",
+                total=total if total else None,
+            )
+            chunks = bytearray()
+            for chunk in resp.iter_bytes():
+                chunks.extend(chunk)
+                progress.update(task, advance=len(chunk))
+
+    console.print("[dim]Extracting runtime…[/dim]")
+    decompressed = lzma.decompress(bytes(chunks))
+    with tarfile.open(fileobj=BytesIO(decompressed), mode="r:") as tar:
+        tar.extractall(path=dest_dir)
+
 
 @app.command("init")
 def config_init(
-    path: str | None = typer.Option(None, "--path", help="Custom config path"),
+    path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
     """Create a default config file."""
     config_path = Path(path) if path else pie_path.get_default_config_path()
+    pie_home = pie_path.get_pie_home()
 
     # Create parent directory if needed
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -46,9 +83,18 @@ def config_init(
     config_path.write_text(content)
     console.print(f"[green]✓[/green] Configuration file created at {config_path}")
 
+    # Download and install the Python 3.14 runtime
+    try:
+        _download_python_runtime(pie_home)
+        console.print("[green]✓[/green] Python 3.14 runtime installed")
+    except Exception as exc:
+        console.print(
+            f"[red]✗[/red] Failed to download Python runtime: {exc}\n"
+            "  You can retry with [bold]pie config init[/bold]."
+        )
+
     # Check if default model exists
     try:
-        from huggingface_hub import scan_cache_dir
         cache_info = scan_cache_dir()
         model_exists = False
         for repo in cache_info.repos:
@@ -68,7 +114,7 @@ def config_init(
 
 @app.command("show")
 def config_show(
-    path: str | None = typer.Option(None, "--path", help="Custom config path"),
+    path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
     """Show the content of the config file."""
     config_path = Path(path) if path else pie_path.get_default_config_path()
@@ -95,24 +141,83 @@ def config_show(
     )
 
 
-@app.command("set")
-def config_set(
-    key: str = typer.Argument(..., help="Dot-path key (e.g., 'host', 'port', 'auth.enabled', 'model.0.hf_repo')"),
-    value: str = typer.Argument(..., help="Value to set"),
-    path: str | None = typer.Option(None, "--path", help="Custom config path"),
+@app.command("update")
+def config_update(
+    # Engine configuration options
+    host: Optional[str] = typer.Option(None, "--host", help="Network host to bind to"),
+    port: Optional[int] = typer.Option(None, "--port", help="Network port to bind to"),
+    enable_auth: Optional[bool] = typer.Option(
+        None,
+        "--enable-auth/--disable-auth",
+        help="Enable/disable authentication",
+    ),
+    verbose: Optional[bool] = typer.Option(
+        None,
+        "--verbose/--no-verbose",
+        help="Enable/disable verbose logging",
+    ),
+    cache_dir: Optional[str] = typer.Option(
+        None, "--cache-dir", help="Cache directory path"
+    ),
+    log_dir: Optional[str] = typer.Option(None, "--log-dir", help="Log directory path"),
+    registry: Optional[str] = typer.Option(
+        None, "--registry", help="Inferlet registry URL"
+    ),
+    # Model configuration options (first model in array)
+    hf_repo: Optional[str] = typer.Option(
+        None, "--hf-repo", help="HuggingFace model repository"
+    ),
+    device: Optional[str] = typer.Option(
+        None, "--device", help="Device assignment (e.g., 'cuda:0' or 'cuda:0,cuda:1')"
+    ),
+    activation_dtype: Optional[str] = typer.Option(
+        None,
+        "--activation-dtype",
+        help="Activation dtype (e.g., 'bfloat16', 'float16')",
+    ),
+    weight_dtype: Optional[str] = typer.Option(
+        None, "--weight-dtype", help="Weight dtype (e.g., 'bfloat16', 'float16')"
+    ),
+    kv_page_size: Optional[int] = typer.Option(
+        None, "--kv-page-size", help="KV cache page size"
+    ),
+    max_batch_tokens: Optional[int] = typer.Option(
+        None, "--max-batch-tokens", help="Maximum batch tokens"
+    ),
+    max_dist_size: Optional[int] = typer.Option(
+        None, "--max-dist-size", help="Maximum distribution size"
+    ),
+    max_num_embeds: Optional[int] = typer.Option(
+        None, "--max-num-embeds", help="Maximum number of embeddings"
+    ),
+    max_num_adapters: Optional[int] = typer.Option(
+        None, "--max-num-adapters", help="Maximum number of adapters"
+    ),
+    max_adapter_rank: Optional[int] = typer.Option(
+        None, "--max-adapter-rank", help="Maximum adapter rank"
+    ),
+    adapter_path: Optional[str] = typer.Option(
+        None, "--adapter-path", help="Adapter storage path (absolute path)"
+    ),
+    gpu_mem_utilization: Optional[float] = typer.Option(
+        None, "--gpu-mem-utilization", help="GPU memory utilization (0.0-1.0)"
+    ),
+    telemetry_enabled: Optional[bool] = typer.Option(
+        None,
+        "--telemetry/--no-telemetry",
+        help="Enable/disable OpenTelemetry tracing",
+    ),
+    telemetry_endpoint: Optional[str] = typer.Option(
+        None, "--telemetry-endpoint", help="OTLP endpoint for traces"
+    ),
+    use_cuda_graphs: Optional[bool] = typer.Option(
+        None,
+        "--use-cuda-graphs/--no-use-cuda-graphs",
+        help="Enable/disable CUDA graphs",
+    ),
+    path: Optional[str] = typer.Option(None, "--path", help="Custom config path"),
 ) -> None:
-    """Set a config value by dot-path.
-
-    Examples:
-
-    \\b
-        pie config set host 0.0.0.0
-        pie config set port 9090
-        pie config set auth.enabled true
-        pie config set model.0.hf_repo meta-llama/Llama-3.2-1B
-        pie config set model.0.device "cuda:0,cuda:1"
-        pie config set telemetry.enabled true
-    """
+    """Update the entries of the config file."""
     config_path = Path(path) if path else pie_path.get_default_config_path()
 
     if not config_path.exists():
@@ -121,76 +226,69 @@ def config_set(
 
     config = toml.loads(config_path.read_text())
 
-    # Parse the value into the appropriate type
-    parsed_value = _parse_value(value)
+    # Track updates
+    updates = []
 
-    # Navigate dot-path and set value
-    _set_nested(config, key, parsed_value)
+    # Engine-level options
+    engine_options = {
+        "host": host,
+        "port": port,
+        "enable_auth": enable_auth,
+        "verbose": verbose,
+        "cache_dir": cache_dir,
+        "log_dir": log_dir,
+        "registry": registry,
+    }
+    for key, value in engine_options.items():
+        if value is not None:
+            config[key] = value
+            updates.append(f"{key}={value}")
+
+    # Model-level options (update first model)
+    model_options = {
+        "hf_repo": hf_repo,
+        "device": device.split(",") if device else None,
+        "activation_dtype": activation_dtype,
+        "weight_dtype": weight_dtype,
+        "kv_page_size": kv_page_size,
+        "max_batch_tokens": max_batch_tokens,
+        "max_dist_size": max_dist_size,
+        "max_num_embeds": max_num_embeds,
+        "max_num_adapters": max_num_adapters,
+        "max_adapter_rank": max_adapter_rank,
+        "gpu_mem_utilization": gpu_mem_utilization,
+        "use_cuda_graphs": use_cuda_graphs,
+        "adapter_path": adapter_path,
+    }
+
+    model_updated = False
+    for key, value in model_options.items():
+        if value is not None:
+            # Ensure model array exists
+            if "model" not in config:
+                config["model"] = [{}]
+            elif not config["model"]:
+                config["model"] = [{}]
+            config["model"][0][key] = value
+            updates.append(f"model.{key}={value}")
+            model_updated = True
+
+    # Telemetry section options
+    if telemetry_enabled is not None or telemetry_endpoint is not None:
+        if "telemetry" not in config:
+            config["telemetry"] = {}
+        if telemetry_enabled is not None:
+            config["telemetry"]["enabled"] = telemetry_enabled
+            updates.append(f"telemetry.enabled={telemetry_enabled}")
+        if telemetry_endpoint is not None:
+            config["telemetry"]["endpoint"] = telemetry_endpoint
+            updates.append(f"telemetry.endpoint={telemetry_endpoint}")
+
+    if not updates:
+        console.print("[yellow]![/yellow] No configuration options provided")
+        return
 
     config_path.write_text(toml.dumps(config))
-    console.print(f"[green]✓[/green] Set {key} = {parsed_value}")
-
-
-def _parse_value(value: str):
-    """Parse a string value into the appropriate Python type."""
-    # Booleans
-    if value.lower() == "true":
-        return True
-    if value.lower() == "false":
-        return False
-
-    # Integers
-    try:
-        return int(value)
-    except ValueError:
-        pass
-
-    # Floats
-    try:
-        return float(value)
-    except ValueError:
-        pass
-
-    # Comma-separated list (for device lists like "cuda:0,cuda:1")
-    if "," in value:
-        return [v.strip() for v in value.split(",")]
-
-    # String
-    return value
-
-
-def _set_nested(config: dict, key: str, value) -> None:
-    """Set a value in a nested dict using dot-path notation.
-
-    Handles TOML array-of-tables (e.g., model.0.hf_repo) by treating
-    numeric path segments as list indices.
-    """
-    parts = key.split(".")
-    obj = config
-
-    for i, part in enumerate(parts[:-1]):
-        # Check if this part is a list index
-        try:
-            idx = int(part)
-            if isinstance(obj, list) and idx < len(obj):
-                obj = obj[idx]
-            else:
-                console.print(f"[red]✗[/red] Index {idx} out of range for '{'.'.join(parts[:i])}'")
-                raise typer.Exit(1)
-        except ValueError:
-            # Regular dict key
-            if part not in obj:
-                obj[part] = {}
-            obj = obj[part]
-
-    # Set the final value
-    final_key = parts[-1]
-    try:
-        idx = int(final_key)
-        if isinstance(obj, list) and idx < len(obj):
-            obj[idx] = value
-        else:
-            console.print(f"[red]✗[/red] Index {idx} out of range")
-            raise typer.Exit(1)
-    except ValueError:
-        obj[final_key] = value
+    console.print(f"[green]✓[/green] Updated {len(updates)} option(s)")
+    for update in updates:
+        console.print(f"  [dim]{update}[/dim]")

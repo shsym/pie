@@ -35,6 +35,7 @@ class TestCliHelp:
         assert "--port" in result.stdout
         assert "--no-auth" in result.stdout
         assert "--verbose" in result.stdout
+        assert "--interactive" in result.stdout
 
     def test_run_help(self):
         """Shows run command options."""
@@ -53,7 +54,7 @@ class TestCliHelp:
         assert result.exit_code == 0
         assert "init" in result.stdout
         assert "show" in result.stdout
-        assert "set" in result.stdout
+        assert "update" in result.stdout
 
     def test_config_init_help(self):
         """Shows config init options."""
@@ -63,14 +64,24 @@ class TestCliHelp:
         # --dummy was removed
         assert "--path" in result.stdout
 
-    def test_config_set_help(self):
-        """Shows config set options."""
-        result = runner.invoke(app, ["config", "set", "--help"])
+    def test_config_update_help(self):
+        """Shows config update options - updated schema."""
+        result = runner.invoke(app, ["config", "update", "--help"])
 
         assert result.exit_code == 0
-        assert "KEY" in result.stdout
-        assert "VALUE" in result.stdout
-        assert "--path" in result.stdout
+        # Engine options
+        assert "--host" in result.stdout
+        assert "--port" in result.stdout
+        assert "--enable-auth" in result.stdout
+        assert "--verbose" in result.stdout
+        # Model options (new schema)
+        assert "--hf-repo" in result.stdout
+        assert "--device" in result.stdout
+        assert "--activation-dtype" in result.stdout
+        assert "--weight-dtype" in result.stdout
+        assert "--kv-page-size" in result.stdout
+        # Legacy backend options removed
+        assert "--backend-type" not in result.stdout
 
     def test_model_help(self):
         """Shows model subcommands."""
