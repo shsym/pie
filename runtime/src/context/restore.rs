@@ -3,19 +3,102 @@ use std::collections::HashMap;
 
 
 use super::{
-    ContextId, ContextManager, ContextState, ProcessState,
-    Record, ReplayFill,
-    BUFFERS,
+    ContextId, ContextManager, ContextState,
+    Record,
 };
+use super::sched::ProcessState;
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
+use crate::adapter::AdapterId;
 use crate::device::{self, DeviceId};
+use crate::inference::brle::Brle;
+use crate::inference::request::{ForwardPassRequest, BatchedForwardPassRequest};
 use crate::process::ProcessId;
+
+// =============================================================================
+// ReplayFill
+// =============================================================================
+
+#[derive(Debug, Clone)]
+pub struct ReplayFill {
+    pub context_id: ContextId,
+    pub tokens: Vec<u32>,
+    pub positions: Vec<u32>,
+    pub masks: Vec<Brle>,
+    pub adapter: Option<AdapterId>,
+    pub physical_page_ids: Vec<PhysicalPageId>,
+    pub device_id: DeviceId,
+    pub kv_len: u32,
+    pub last_page_len: u32,
+    pub num_pages: u32,
+}
 
 // =============================================================================
 // Restore methods on ContextManager
 // =============================================================================
 
+
 impl ContextManager {
+
+    /// Dispatch replay forward passes for KV cache recomputation.
+    ///
+    /// Each ReplayFill contains tokens that need to be run through the model
+    /// to regenerate KV data for committed pages lost during eviction.
+    /// After the forward pass, the working pages are committed.
+    pub(crate) async fn dispatch_replays(&mut self, chunks: Vec<ReplayFill>) {
+        if chunks.is_empty() { return; }
+
+        let mut ctx_ids_needing_finish: Vec<ContextId> = Vec::new();
+
+        for chunk in chunks {
+            let ctx_id = chunk.context_id;
+
+            // Build a minimal forward pass request (no sampling — just KV fill)
+            let fwd_req = ForwardPassRequest {
+                context_id: 0, // unused — page IDs provided directly
+                tokens: chunk.tokens.clone(),
+                positions: chunk.positions.clone(),
+                speculative_tokens: Vec::new(),
+                speculative_positions: Vec::new(),
+                output_speculative_tokens: false,
+                masks: chunk.masks.clone(),
+                logit_mask: None,
+                sampling_indices: Vec::new(),
+                samplers: Vec::new(),
+                adapter_id: chunk.adapter,
+                adapter_seed: None,
+                arrival_time: None,
+            };
+
+            let phys_ids: Vec<u32> = chunk.physical_page_ids.iter().map(|&p| p as u32).collect();
+            let mut batch = BatchedForwardPassRequest::new(chunk.device_id);
+            batch.add_request(&fwd_req, &phys_ids, chunk.last_page_len);
+
+            let result = device::fire_batch(chunk.device_id, &batch).await;
+
+            if let Err(e) = result {
+                eprintln!("REPLAY_FWD_FAIL ctx={ctx_id} device={} err={e:#}", chunk.device_id);
+                // RPC failed — still finish restore to avoid permanently Pinned state.
+                // The context will have a truncated committed chain but can still serve.
+                if !ctx_ids_needing_finish.contains(&ctx_id) {
+                    ctx_ids_needing_finish.push(ctx_id);
+                }
+                continue;
+            }
+
+            let _ = self.commit_replay_chunk(
+                ctx_id, chunk.num_pages,
+                chunk.tokens, chunk.positions, chunk.masks, chunk.adapter,
+            );
+            if !ctx_ids_needing_finish.contains(&ctx_id) {
+                ctx_ids_needing_finish.push(ctx_id);
+            }
+        }
+
+        for id in ctx_ids_needing_finish {
+            self.finish_restore(id);
+        }
+    }
+
     /// Admission check: can this process be fully restored?
     /// Checks that all devices have enough free GPU pages for the process's
     /// working pages (on CPU) plus replay pages plus pending_alloc requirements.
@@ -153,9 +236,9 @@ impl ContextManager {
                 ctx.working_pages_cpu.clear();
             }
 
-            // Track swap-in as working pages in arbiter
+            // Track swap-in as working pages in scheduler
             if let Some(pid) = owner {
-                self.arbiter.add_working(pid, dev_idx, gpu_pages.len());
+                self.sched_add_working(pid, dev_idx, gpu_pages.len());
             }
         }
 
@@ -184,44 +267,40 @@ impl ContextManager {
                 }
             }
 
-            // Update ContextTokens committed_len and max_committed_position
+            // Update committed_len and max_committed_position on Context
             // to match the truncated prefix. Recompute max_committed_position
             // from the lineage to avoid stale values rejecting valid commits.
-            if let Some(mut buf) = self.buf_mut(ctx_id) {
-                buf.committed_len = prefix_len;
+            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                ctx.committed_len = prefix_len;
                 if prefix_len == 0 {
-                    buf.max_committed_position = None;
+                    ctx.max_committed_position = None;
                 } else {
                     // Recompute from lineage: max position in the first
                     // prefix_len * page_size tokens.
                     let prefix_tokens = prefix_len * self.page_size;
-                    let ctx = self.contexts.get(&ctx_id);
-                    let max_pos = ctx.and_then(|c| {
-                        let mut count = 0usize;
-                        let mut max_p: Option<u32> = None;
-                        for record in &c.lineage {
-                            match record {
-                                Record::Fill { positions, .. } => {
-                                    for &pos in positions {
-                                        if count >= prefix_tokens { break; }
-                                        max_p = Some(max_p.map_or(pos, |m: u32| m.max(pos)));
-                                        count += 1;
-                                    }
+                    let mut count = 0usize;
+                    let mut max_p: Option<u32> = None;
+                    for record in &ctx.lineage {
+                        match record {
+                            Record::Fill { positions, .. } => {
+                                for &pos in positions {
+                                    if count >= prefix_tokens { break; }
+                                    max_p = Some(max_p.map_or(pos, |m: u32| m.max(pos)));
+                                    count += 1;
                                 }
                             }
-                            if count >= prefix_tokens { break; }
                         }
-                        max_p
-                    });
-                    buf.max_committed_position = max_pos;
+                        if count >= prefix_tokens { break; }
+                    }
+                    ctx.max_committed_position = max_p;
                 }
             }
 
-            // Update arbiter accounting for prefix-matched committed pages
+            // Update scheduler accounting for prefix-matched committed pages
             if let Some(pid) = owner {
                 if prefix_len > 0 {
-                    self.arbiter.add_working(pid, dev_idx, prefix_len);
-                    self.arbiter.commit(pid, dev_idx, prefix_len);
+                    self.sched_add_working(pid, dev_idx, prefix_len);
+                    self.sched_commit(pid, dev_idx, prefix_len);
                 }
             }
 
@@ -242,7 +321,7 @@ impl ContextManager {
         } else {
             // Replay needed — mark as Pinned to prevent eviction while
             // KV recovery forward passes are in-flight. Transitions to
-            // Active after finish_restore_impl is called.
+            // Active after finish_restore is called.
             if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                 ctx.state = ContextState::Pinned;
                 ctx.pending_suspend = false;
@@ -339,12 +418,12 @@ impl ContextManager {
                 None => anyhow::bail!("No GPU pages for replay (should not happen: admission check passed)"),
             };
 
-            // Track in context and arbiter
+            // Track in context and scheduler
             if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                 ctx.working_pages.extend(&new_pages);
             }
             if let Some(pid) = owner {
-                self.arbiter.add_working(pid, dev_idx, full_pages);
+                self.sched_add_working(pid, dev_idx, full_pages);
             }
 
             // Build physical page IDs: committed prefix + all working pages after initial
@@ -386,9 +465,9 @@ impl ContextManager {
 
         // Drain stale Phase 1 working pages (they hold old KV data)
         if initial_working_len > 0 && !chunks.is_empty() {
-            // Clear tokens_filled first (separate borrow scope)
-            if let Some(mut buf) = self.buf_mut(ctx_id) {
-                buf.tokens_filled.clear();
+            // Clear working_page_tokens first (separate borrow scope)
+            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                ctx.working_page_tokens.clear();
             }
             let stale_pages: Vec<PhysicalPageId> = {
                 if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
@@ -399,7 +478,7 @@ impl ContextManager {
             };
             self.devices[dev_idx].free_working(&stale_pages);
             if let Some(pid) = owner {
-                self.arbiter.remove_working(pid, dev_idx, initial_working_len);
+                self.sched_remove_working(pid, dev_idx, initial_working_len);
             }
         }
 
@@ -407,7 +486,7 @@ impl ContextManager {
     }
 
     /// Commit a replay chunk (called during restore, after forward pass).
-    pub(crate) fn commit_replay_chunk_impl(
+    pub(crate) fn commit_replay_chunk(
         &mut self,
         id: ContextId,
         _num_pages: u32,
@@ -449,20 +528,20 @@ impl ContextManager {
             ctx.working_pages.drain(..to_remove);
         }
 
-        // Update ContextTokens (DashMap) — increment committed_len
-        if let Some(mut buf) = self.buf_mut(id) {
-            buf.committed_len += new_phys.len();
+        // Update committed_len on Context
+        if let Some(ctx) = self.contexts.get_mut(&id) {
+            ctx.committed_len += new_phys.len();
         }
 
         if let Some(pid) = owner {
-            self.arbiter.commit(pid, dev_idx, new_phys.len());
+            self.sched_commit(pid, dev_idx, new_phys.len());
         }
 
         Ok(())
     }
 
     /// Finish restoration: transition context from replay to fully active.
-    pub(crate) fn finish_restore_impl(&mut self, id: ContextId) {
+    pub(crate) fn finish_restore(&mut self, id: ContextId) {
         if let Some(ctx) = self.contexts.get_mut(&id) {
             ctx.state = ContextState::Active;
         }

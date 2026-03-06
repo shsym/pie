@@ -1,6 +1,6 @@
 //! Context management integration tests.
 //!
-//! Tests context CRUD, saving, opening, forking, locking, cursor, and filled tokens.
+//! Tests context CRUD, saving, opening, forking, and the full page lifecycle.
 
 use std::sync::{Arc, OnceLock};
 mod common;
@@ -80,32 +80,32 @@ fn force_destroy() {
 }
 
 #[test]
-fn cursor_ops() {
+fn working_page_token_ops() {
     let s = state();
     s.rt.block_on(async {
         let id = pie::context::create(MODEL, None)
             .await
             .unwrap();
 
-        // Mark tokens as filled so cursor advances
-        pie::context::append_filled_tokens(
+        // Append tokens
+        pie::context::append_working_page_tokens(
             MODEL, id, vec![1, 2, 3, 4, 5],
             vec![0, 1, 2, 3, 4],
             vec![],
             None,
-        ).unwrap();
+        ).await.unwrap();
 
-        // Cursor = tokens_filled.len() = 5
-        let cursor = pie::context::get_cursor(MODEL, id);
-        assert_eq!(cursor, 5);
+        // working_page_token_count = 5
+        let count = pie::context::working_page_token_count(MODEL, id).await.unwrap();
+        assert_eq!(count, 5);
 
-        // set_cursor truncates filled tokens
-        pie::context::set_cursor(MODEL, id, 3).unwrap();
-        assert_eq!(pie::context::get_cursor(MODEL, id), 3);
+        // Truncate to 3 tokens
+        pie::context::truncate_working_page_tokens(MODEL, id, 3).await.unwrap();
+        assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 3);
 
-        // set_cursor out of range should fail
-        let err = pie::context::set_cursor(MODEL, id, 10);
-        assert!(err.is_err(), "set_cursor beyond filled tokens should error");
+        // Truncate out of range should fail
+        let err = pie::context::truncate_working_page_tokens(MODEL, id, 10).await;
+        assert!(err.is_err(), "truncate beyond token count should error");
     });
 }
 
@@ -129,10 +129,10 @@ fn fork_context() {
 ///
 /// Timeline:
 ///   1. Create anonymous context, fill 32 tokens
-///   2. Commit first page → verify cursor, position
+///   2. Commit first page → verify page counts
 ///   3. Commit second page → verify fully committed state
 ///   4. Append generation tokens via fill
-///   5. Cursor truncation
+///   5. Token truncation
 ///   6. Fork → verify child inherits state
 #[test]
 fn full_page_lifecycle() {
@@ -150,53 +150,57 @@ fn full_page_lifecycle() {
             "tokens_per_page should be 16"
         );
 
-        assert_eq!(pie::context::committed_page_count(MODEL, id), 0);
-        assert_eq!(pie::context::get_cursor(MODEL, id), 0, "cursor starts at 0 (no filled tokens)");
-
-        // last_position = None (no filled or committed tokens)
-        assert_eq!(pie::context::last_position(MODEL, id), None);
+        assert_eq!(pie::context::committed_page_count(MODEL, id).await.unwrap(), 0);
+        assert_eq!(
+            pie::context::working_page_token_count(MODEL, id).await.unwrap(), 0,
+            "tokens start at 0"
+        );
 
         // ── Phase 2: Mark all 32 tokens as forwarded ──
         let positions: Vec<u32> = (0..32).collect();
-        pie::context::append_filled_tokens(MODEL, id, prompt.clone(), positions, vec![], None).unwrap();
+        pie::context::append_working_page_tokens(MODEL, id, prompt.clone(), positions, vec![], None).await.unwrap();
 
-        // Cursor = tokens_filled.len() = 32
-        assert_eq!(pie::context::get_cursor(MODEL, id), 32);
-        // last_position = max filled position = 31
-        assert_eq!(pie::context::last_position(MODEL, id), Some(31));
+        assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 32);
 
         // Reserve 2 pages (32 tokens / 16 per page) before committing
         pie::context::reserve_pages(MODEL, id, 2).await.unwrap();
 
-        // ── Phase 3: Commit first page (positions 0..15) ──
-        pie::context::commit_pages(MODEL, id, vec![0]).await.unwrap();
+        // Working page count should be 2 (actual allocated pages)
+        assert_eq!(pie::context::working_page_count(MODEL, id).await.unwrap(), 2);
 
-        assert_eq!(pie::context::committed_page_count(MODEL, id), 1);
+        // ── Phase 3: Commit first page (positions 0..15) ──
+        pie::context::commit_pages(MODEL, id, 1).await.unwrap();
+
+        assert_eq!(pie::context::committed_page_count(MODEL, id).await.unwrap(), 1);
         // 16 filled tokens remain (second page's worth)
-        assert_eq!(pie::context::get_cursor(MODEL, id), 16, "cursor = remaining filled count");
-        // last_position = max(committed=15, filled_max=31) = 31
-        assert_eq!(pie::context::last_position(MODEL, id), Some(31));
+        assert_eq!(
+            pie::context::working_page_token_count(MODEL, id).await.unwrap(), 16,
+            "16 tokens remain after first commit"
+        );
 
         // ── Phase 4: Commit second page (positions 16..31) ──
-        pie::context::commit_pages(MODEL, id, vec![0]).await.unwrap();
+        pie::context::commit_pages(MODEL, id, 1).await.unwrap();
 
-        assert_eq!(pie::context::committed_page_count(MODEL, id), 2);
-        assert_eq!(pie::context::get_cursor(MODEL, id), 0, "cursor is 0 after full commit");
-        // position = max_committed = 31
-        assert_eq!(pie::context::last_position(MODEL, id), Some(31));
+        assert_eq!(pie::context::committed_page_count(MODEL, id).await.unwrap(), 2);
+        assert_eq!(
+            pie::context::working_page_token_count(MODEL, id).await.unwrap(), 0,
+            "0 tokens after full commit"
+        );
 
         // ── Phase 5: Simulate generation — fill new tokens ──
-        // Mark generation tokens forwarded with positions 32, 33, 34
-        pie::context::append_filled_tokens(MODEL, id, vec![2000, 2001, 2002], vec![32, 33, 34], vec![], None).unwrap();
-        assert_eq!(pie::context::get_cursor(MODEL, id), 3);
-        assert_eq!(pie::context::last_position(MODEL, id), Some(34), "filled position dominates");
+        pie::context::append_working_page_tokens(
+            MODEL, id, vec![2000, 2001, 2002], vec![32, 33, 34], vec![], None,
+        ).await.unwrap();
+        assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 3);
 
         // ── Phase 6: Prepare state with filled tokens, then fork ──
-        // Clear filled tokens from Phase 5
-        pie::context::set_cursor(MODEL, id, 0).unwrap();
+        // Clear working page tokens from Phase 5
+        pie::context::truncate_working_page_tokens(MODEL, id, 0).await.unwrap();
         // Fill 2 tokens with positions sequential from max_committed (31)
-        pie::context::append_filled_tokens(MODEL, id, vec![3000, 3001], vec![32, 33], vec![], None).unwrap();
-        assert_eq!(pie::context::get_cursor(MODEL, id), 2);
+        pie::context::append_working_page_tokens(
+            MODEL, id, vec![3000, 3001], vec![32, 33], vec![], None,
+        ).await.unwrap();
+        assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 2);
 
         let child_id = pie::context::fork(MODEL, id).await.unwrap();
 
@@ -204,18 +208,14 @@ fn full_page_lifecycle() {
 
         // Verify child state
         assert_eq!(
-            pie::context::committed_page_count(MODEL, child_id), 2,
+            pie::context::committed_page_count(MODEL, child_id).await.unwrap(), 2,
             "child inherits committed pages"
         );
 
-        // Fork preserves tokens_filled — child inherits them
+        // Fork preserves working_page_tokens — child inherits them
         assert_eq!(
-            pie::context::get_cursor(MODEL, child_id), 2,
+            pie::context::working_page_token_count(MODEL, child_id).await.unwrap(), 2,
             "child inherits filled tokens"
         );
-
-        // Child inherits max_committed_position
-        let child_pos = pie::context::last_position(MODEL, child_id);
-        assert_eq!(child_pos, Some(33), "child inherits last_position from filled tokens");
     });
 }

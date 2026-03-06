@@ -186,14 +186,12 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn committed_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::committed_page_count(ctx.model_id, ctx.context_id))
+        Ok(context::committed_page_count(ctx.model_id, ctx.context_id).await?)
     }
 
     async fn working_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        let filled = context::working_page_token_count(ctx.model_id, ctx.context_id);
-        let page_size = context::tokens_per_page(ctx.model_id);
-        Ok(if page_size == 0 { 0 } else { (filled + page_size - 1) / page_size })
+        Ok(context::working_page_count(ctx.model_id, ctx.context_id).await?)
     }
 
     async fn commit_working_pages(
@@ -228,14 +226,14 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn working_page_token_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::working_page_token_count(ctx.model_id, ctx.context_id))
+        Ok(context::working_page_token_count(ctx.model_id, ctx.context_id).await?)
     }
 
-    async fn pop_working_page_tokens(&mut self, this: Resource<Context>, num_tokens: u32) -> Result<()> {
+    async fn truncate_working_page_tokens(&mut self, this: Resource<Context>, num_tokens: u32) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
-        let current = context::working_page_token_count(ctx.model_id, ctx.context_id);
+        let current = context::working_page_token_count(ctx.model_id, ctx.context_id).await?;
         let new_count = current.saturating_sub(num_tokens);
-        context::truncate_filled_tokens(ctx.model_id, ctx.context_id, new_count)?;
+        context::truncate_working_page_tokens(ctx.model_id, ctx.context_id, new_count).await?;
         Ok(())
     }
 }

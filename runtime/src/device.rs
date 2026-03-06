@@ -77,6 +77,8 @@ pub async fn call_with_timeout<T: Serialize, R: DeserializeOwned>(
         .map_err(|_| anyhow!("Device call '{method}' timed out"))?
 }
 
+
+
 /// Sends a fire-and-forget notification, serializing `args`.
 pub fn notify<T: Serialize>(device_idx: usize, method: &str, args: &T) -> Result<()> {
     let payload = rmp_serde::to_vec_named(args)
@@ -88,8 +90,16 @@ pub fn notify<T: Serialize>(device_idx: usize, method: &str, args: &T) -> Result
 }
 
 // =============================================================================
-// KV Page Copy Convenience Wrappers
+// Convenience Wrappers
 // =============================================================================
+
+/// Fires a batched forward pass on the given device (30 s timeout).
+pub async fn fire_batch(
+    device_idx: usize,
+    batch: &crate::inference::request::BatchedForwardPassRequest,
+) -> Result<crate::inference::request::BatchedForwardPassResponse> {
+    call_with_timeout(device_idx, "fire_batch", batch, Duration::from_secs(30)).await
+}
 
 /// GPU → CPU page copy (fire-and-forget).
 /// `gpu_phys_ids`: source GPU physical page IDs.

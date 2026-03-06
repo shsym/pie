@@ -391,9 +391,7 @@ impl BatchScheduler {
         }
 
         // Send via device service (typed call handles serialization + timeout)
-        let result = device::call_with_timeout::<_, BatchedForwardPassResponse>(
-            device_idx, "fire_batch", &batch_req, timeout,
-        ).await;
+        let result = device::fire_batch(device_idx, &batch_req).await;
 
         match result {
             Ok(batch_resp) => {

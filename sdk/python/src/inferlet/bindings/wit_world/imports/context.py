@@ -89,7 +89,7 @@ class Context:
         Number of tokens in working pages (filled but not committed)
         """
         raise NotImplementedError
-    def pop_working_page_tokens(self, num_tokens: int) -> None:
+    def truncate_working_page_tokens(self, num_tokens: int) -> None:
         """
         Remove the last N tokens from working pages
         """

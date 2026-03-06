@@ -15,6 +15,7 @@ pub use wit_bindgen;
 // Re-export serde and serde_json so the macro-generated JSON bridge can use them
 pub use serde;
 pub use serde_json;
+pub use schemars;
 
 // Re-export the main attribute macro
 pub use inferlet_macros::main;
@@ -45,6 +46,7 @@ pub use context::{
     Context, RawContext,
     TokenStream, EventStream,
     Speculate, Speculation, Constrain,
+    GrammarConstraint,
 };
 
 // =============================================================================

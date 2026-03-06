@@ -1,28 +1,20 @@
 //! # Context Module
 //!
 //! Manages named execution contexts with KV cache state for model inference.
+//! All context state (token data, page management, scheduling) lives in the
+//! actor-local `Context` struct, accessed exclusively through the `ContextManager`
+//! actor via typed `Message` variants.
 //!
 //! Each model gets a dedicated ContextManager actor that handles:
 //! - Context creation, destruction, and forking
 //! - Page management (commit, reserve, release)
 //! - Contention resolution via dual-queue protocol
-//!
-//! ## Storage Split
-//!
-//! - `ContextTokens` (global DashMap) — token-level data accessed by WIT host
-//!   functions without going through the actor: tokens_filled,
-//!   committed_len.
-//!
-//! - `Context` (local HashMap on ContextManager) — all KV/page state accessed
-//!   exclusively within the actor: working_pages, committed_tip, lineage, state,
-//!   device, etc.
 pub mod pagestore;
-pub use pagestore::compute_last_page_len;
-pub(crate) mod arbiter;
-mod contention;
+pub(crate) mod sched;
+mod suspend;
+mod snapshot;
 mod restore;
 
-use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque, BinaryHeap};
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -33,13 +25,13 @@ use anyhow::{Result, Context as _};
 use crate::service::{ServiceArray, ServiceHandler};
 use crate::adapter::AdapterId;
 use crate::inference::brle::Brle;
-use crate::inference::request::{ForwardPassRequest, BatchedForwardPassRequest};
 use crate::process::ProcessId;
 use crate::device::{self, DeviceId};
 
 use pagestore::{PhysicalPageId, PageHash, PageStore};
-use arbiter::Arbiter;
-use contention::{AllocWaiter, RestoreWaiter};
+use sched::{ProcessInfo, ProcessEntry};
+use restore::ReplayFill;
+use suspend::{AllocWaiter, RestoreWaiter};
 
 // =============================================================================
 // Public Types
@@ -52,7 +44,6 @@ pub type ContextId = u64;
 // =============================================================================
 
 static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
-static BUFFERS: LazyLock<DashMap<(usize, ContextId), ContextTokens>> = LazyLock::new(DashMap::new);
 static PAGE_SIZES: LazyLock<boxcar::Vec<usize>> = LazyLock::new(boxcar::Vec::new);
 
 // =============================================================================
@@ -130,10 +121,11 @@ pub fn release_pages(model_idx: usize, id: ContextId, num_pages: u32) -> Result<
 }
 
 /// Pin context for a forward pass: Active → Pinned.
-/// Returns physical page IDs per device. The context is non-evictable until `unpin`.
-pub async fn pin(model_idx: usize, id: ContextId) -> Result<HashMap<DeviceId, Vec<PhysicalPageId>>> {
+/// Returns a PinnedContext with physical page IDs, kv_len, and last_page_len.
+/// The context is non-evictable until `unpin`.
+pub async fn pin(model_idx: usize, id: ContextId, num_input_tokens: u32) -> Result<PinnedContext> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Pin { id, response: tx })?;
+    SERVICES.send(model_idx, Message::Pin { id, num_input_tokens, response: tx })?;
     rx.await.context("context::pin: actor dropped response")?
 }
 
@@ -155,108 +147,69 @@ pub async fn debug_context_state(model_idx: usize, id: ContextId) -> String {
     rx.await.unwrap_or_else(|_| "MISSING".to_string())
 }
 
-// ---------- Arbiter policy (broadcast to all models) ----------
+// ---------- Scheduling policy (broadcast to all models) ----------
 
-pub fn set_dag_weights(weight: f64, pid_values: HashMap<ProcessId, f64>) {
+pub fn set_priority(weight: f64, pid_values: HashMap<ProcessId, f64>) {
     for model_idx in 0..SERVICES.len() {
-        let _ = SERVICES.send(model_idx, Message::SetDagWeights {
+        let _ = SERVICES.send(model_idx, Message::SetPriority {
             weight, pid_values: pid_values.clone(),
         });
     }
 }
 
-// ---------- Direct (no actor, uses global BUFFERS DashMap) ----------
+// ---------- Direct (no actor) ----------
 
 pub fn tokens_per_page(model_idx: usize) -> u32 {
     PAGE_SIZES.get(model_idx).map(|v| *v as u32).unwrap_or(0)
 }
 
-pub fn committed_page_count(model_idx: usize, id: ContextId) -> u32 {
-    BUFFERS.get(&(model_idx, id)).map(|b| b.committed_page_count()).unwrap_or(0)
+// ---------- Actor-routed read/write APIs ----------
+
+pub async fn committed_page_count(model_idx: usize, id: ContextId) -> Result<u32> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::CommittedPageCount { id, response: tx })?;
+    rx.await.context("context::committed_page_count: actor dropped response")
 }
 
-pub fn kv_len(model_idx: usize, id: ContextId) -> u32 {
-    let page_size = PAGE_SIZES.get(model_idx).copied().unwrap_or(0);
-    BUFFERS.get(&(model_idx, id))
-        .map(|b| b.kv_len(page_size) as u32)
-        .unwrap_or(0)
+pub async fn working_page_count(model_idx: usize, id: ContextId) -> Result<u32> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::WorkingPageCount { id, response: tx })?;
+    rx.await.context("context::working_page_count: actor dropped response")
 }
 
-pub fn working_page_token_count(model_idx: usize, id: ContextId) -> u32 {
-    BUFFERS.get(&(model_idx, id)).map(|b| b.filled_token_count()).unwrap_or(0)
+pub async fn working_page_token_count(model_idx: usize, id: ContextId) -> Result<u32> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::WorkingPageTokenCount { id, response: tx })?;
+    rx.await.context("context::working_page_token_count: actor dropped response")
 }
 
-pub fn truncate_filled_tokens(model_idx: usize, id: ContextId, count: u32) -> Result<()> {
-    let mut buf = BUFFERS.get_mut(&(model_idx, id))
-        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-    buf.truncate_filled(count)
+pub async fn truncate_working_page_tokens(model_idx: usize, id: ContextId, count: u32) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::TruncateWorkingPageTokens { id, count, response: tx })?;
+    rx.await.context("context::truncate_working_page_tokens: actor dropped response")?
 }
 
-pub fn append_filled_tokens(
+pub async fn append_working_page_tokens(
     model_idx: usize, id: ContextId, tokens: Vec<u32>,
     positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
 ) -> Result<()> {
-    let mut buf = BUFFERS.get_mut(&(model_idx, id))
-        .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-    buf.append_filled_tokens(tokens, positions, masks, adapter)
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::AppendWorkingPageTokens {
+        id, tokens, positions, masks, adapter, response: tx,
+    })?;
+    rx.await.context("context::append_working_page_tokens: actor dropped response")?
 }
 
 // =============================================================================
-// ContextTokens — lives in global DashMap (WIT direct access)
+// PinnedContext — returned by pin()
 // =============================================================================
 
-#[derive(Debug, Clone)]
-pub(crate) struct ContextTokens {
-    pub tokens_filled: Vec<TokenInfo>,
-    pub committed_len: usize,
-    pub max_committed_position: Option<u32>,
-}
-
-impl ContextTokens {
-    fn new() -> Self {
-        ContextTokens {
-            tokens_filled: Vec::new(),
-            committed_len: 0,
-            max_committed_position: None,
-        }
-    }
-
-    fn committed_page_count(&self) -> u32 {
-        self.committed_len as u32
-    }
-
-    fn kv_len(&self, page_size: usize) -> usize {
-        self.committed_len * page_size + self.tokens_filled.len()
-    }
-
-    fn filled_token_count(&self) -> u32 {
-        self.tokens_filled.len() as u32
-    }
-
-    fn truncate_filled(&mut self, count: u32) -> Result<()> {
-        let max = self.tokens_filled.len();
-        if count as usize > max { anyhow::bail!("truncate count {} out of range 0..={}", count, max); }
-        self.tokens_filled.truncate(count as usize);
-        Ok(())
-    }
-
-    fn append_filled_tokens(
-        &mut self, tokens: Vec<u32>,
-        positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
-    ) -> Result<()> {
-        let n = tokens.len();
-        if positions.len() != n { anyhow::bail!("positions length {} != n {}", positions.len(), n); }
-        if !masks.is_empty() && masks.len() != n { anyhow::bail!("masks length {} != n {}", masks.len(), n); }
-
-        for (i, token) in tokens.into_iter().enumerate() {
-            self.tokens_filled.push(TokenInfo {
-                token, position: positions[i],
-                mask: if masks.is_empty() { Brle::new(0) } else { masks[i].clone() },
-                adapter,
-            });
-        }
-        Ok(())
-    }
+#[derive(Debug)]
+pub struct PinnedContext {
+    pub device: DeviceId,
+    pub pages: Vec<PhysicalPageId>,
+    pub kv_len: u32,
+    pub last_page_len: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -281,35 +234,6 @@ pub(crate) enum Record {
     },
 }
 
-#[derive(Debug, Clone)]
-pub struct ReplayFill {
-    pub context_id: ContextId,
-    pub tokens: Vec<u32>,
-    pub positions: Vec<u32>,
-    pub masks: Vec<Brle>,
-    pub adapter: Option<AdapterId>,
-    pub physical_page_ids: Vec<PhysicalPageId>,
-    pub device_id: DeviceId,
-    pub kv_len: u32,
-    pub last_page_len: u32,
-    pub num_pages: u32,
-}
-
-// =============================================================================
-// Process State
-// =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProcessState {
-    Running,
-    Pending,
-}
-
-#[derive(Debug)]
-pub(crate) struct ProcessInfo {
-    pub state: ProcessState,
-    pub context_ids: Vec<ContextId>,
-}
 
 // =============================================================================
 // Context — lives in local HashMap on ContextManager (actor-only)
@@ -338,8 +262,17 @@ pub(crate) struct Context {
     pub working_pages_cpu: Vec<PhysicalPageId>,
     /// Tip of the committed hash chain (None if no commits yet).
     pub committed_tip: Option<PageHash>,
+    /// Number of committed pages.
+    pub committed_len: usize,
     /// Full token lineage for replay after eviction.
     pub lineage: Vec<Record>,
+
+    // Token-level data (previously in ContextTokens / BUFFERS DashMap)
+    /// Tokens that have been forwarded but not yet committed to a page.
+    pub working_page_tokens: Vec<TokenInfo>,
+
+    /// Maximum position value across all committed tokens. Need to check the validity of committed tokens
+    pub max_committed_position: Option<u32>,
 
     // Scheduling
     pub state: ContextState,
@@ -358,6 +291,9 @@ impl Context {
             working_pages_cpu: Vec::new(),
             committed_tip: None,
             lineage: Vec::new(),
+            working_page_tokens: Vec::new(),
+            committed_len: 0,
+            max_committed_position: None,
             state: ContextState::Active,
             pending_suspend: false,
             last_access: Instant::now(),
@@ -376,7 +312,7 @@ pub(crate) struct ContextManager {
     pub(crate) model_idx: usize,
     pub(crate) name_to_id: HashMap<(String, String), ContextId>,
     next_id: u64,
-    pub(crate) arbiter: Arbiter,
+    pub(crate) sched_entries: HashMap<ProcessId, ProcessEntry>,
     /// Actor-local context state (page management, device, lineage, etc.)
     pub(crate) contexts: HashMap<ContextId, Context>,
     /// FIFO queue: deferred allocation requests from Running processes.
@@ -391,7 +327,9 @@ pub(crate) struct ContextManager {
     /// Side-map: pending alloc requests per Pending process.
     /// Replayed after restoration completes.
     pub(crate) pending_allocs_map: HashMap<ProcessId, Vec<AllocWaiter>>,
-    pub(crate) msg_counter: u64,
+    /// Accumulated replay chunks from the current message handler.
+    /// Flushed via `dispatch_replays` at the end of each `handle()` call.
+    pub(crate) pending_replays: Vec<ReplayFill>,
 }
 
 impl ContextManager {
@@ -402,14 +340,14 @@ impl ContextManager {
         ContextManager {
             devices, page_size, model_idx,
             name_to_id: HashMap::new(), next_id: 1,
-            arbiter: Arbiter::new(),
+            sched_entries: HashMap::new(),
             contexts: HashMap::new(),
             try_alloc: VecDeque::new(),
             try_restore: BinaryHeap::new(),
             processes: HashMap::new(),
             pending_pinned_counts: HashMap::new(),
             pending_allocs_map: HashMap::new(),
-            msg_counter: 0,
+            pending_replays: Vec::new(),
         }
     }
 
@@ -427,22 +365,9 @@ impl ContextManager {
             .map(|(i, _)| i).unwrap_or(0)
     }
 
-    /// Get or register a process, returning mutable reference to its info.
-    pub(crate) fn ensure_process(&mut self, pid: ProcessId) -> &mut ProcessInfo {
-        self.processes.entry(pid).or_insert_with(|| ProcessInfo {
-            state: ProcessState::Running,
-            context_ids: Vec::new(),
-        })
-    }
 
-    /// Read a ContextTokens field from the DashMap.
-    fn buf(&self, id: ContextId) -> Option<dashmap::mapref::one::Ref<'_, (usize, ContextId), ContextTokens>> {
-        BUFFERS.get(&(self.model_idx, id))
-    }
 
-    fn buf_mut(&self, id: ContextId) -> Option<dashmap::mapref::one::RefMut<'_, (usize, ContextId), ContextTokens>> {
-        BUFFERS.get_mut(&(self.model_idx, id))
-    }
+
 
     // ==================== Core Operations ====================
 
@@ -453,7 +378,6 @@ impl ContextManager {
         ctx.device = Some(dev as DeviceId);
 
         self.contexts.insert(id, ctx);
-        BUFFERS.insert((self.model_idx, id), ContextTokens::new());
 
         if let Some(pid) = owner {
             let proc = self.ensure_process(pid);
@@ -463,112 +387,24 @@ impl ContextManager {
         Ok(id)
     }
 
-    /// Save/snapshot a context. If `name` is None, auto-generates a snapshot name.
-    /// Returns the name used (Some only when auto-generated).
-    pub(crate) fn save_impl(&mut self, id: ContextId, username: String, name: Option<String>) -> Result<Option<String>> {
-        let (name, auto_generated) = match name {
-            Some(n) => (n, false),
-            None => (format!("__snapshot_{}", self.next_id()), true),
-        };
-
-        if self.name_to_id.contains_key(&(username.clone(), name.clone())) {
-            anyhow::bail!("Snapshot name already exists: {}", name);
-        }
-
-        let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let tip = ctx.committed_tip;
-        let lineage = ctx.lineage.clone();
-        let src_working = ctx.working_pages.clone();
-
-        let buf = self.buf(id).ok_or_else(|| anyhow::anyhow!("Buffer not found"))?;
-        let committed_len = buf.committed_len;
-        let max_pos = buf.max_committed_position;
-        let snapshot_filled = buf.tokens_filled.clone();
-        drop(buf);
-
-        if let Some(tip_hash) = tip {
-            self.devices[dev_idx].acquire_chain(tip_hash);
-        }
-
-        // Snapshot working pages: try GPU-first, fall back to CPU swap pool.
-        let (snapshot_working_gpu, snapshot_working_cpu) = if !src_working.is_empty() {
-            let n = src_working.len();
-            if let Some(dst_pages) = self.devices[dev_idx].alloc_working(n) {
-                // GPU → GPU copy
-                let _ = device::copy_d2d(dev_idx as DeviceId, &src_working, &dst_pages);
-                (dst_pages, Vec::new())
-            } else if let Some(cpu_pages) = self.devices[dev_idx].alloc_cpu_pages(n) {
-                // Fallback: GPU → CPU copy (source GPU pages stay intact)
-                let _ = device::copy_d2h(dev_idx as DeviceId, &src_working, &cpu_pages);
-                (Vec::new(), cpu_pages)
-            } else {
-                eprintln!("SNAPSHOT_PAGE_COPY_FAIL ctx={id}: no GPU or CPU pages available");
-                (Vec::new(), Vec::new())
-            }
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
-        let snapshot_id = self.next_id();
-        self.contexts.insert(snapshot_id, Context {
-            owner: None,
-            device: Some(dev_idx as DeviceId),
-            working_pages: snapshot_working_gpu,
-            working_pages_cpu: snapshot_working_cpu,
-            committed_tip: tip,
-            lineage,
-            state: ContextState::Active,
-            pending_suspend: false,
-            last_access: Instant::now(),
-        });
-        BUFFERS.insert((self.model_idx, snapshot_id), ContextTokens {
-            tokens_filled: snapshot_filled,
-            committed_len,
-            max_committed_position: max_pos,
-        });
-        self.name_to_id.insert((username, name.clone()), snapshot_id);
-        Ok(if auto_generated { Some(name) } else { None })
-    }
-
-    pub(crate) fn delete(&mut self, username: String, name: String) -> Result<()> {
-        let snapshot_id = self.name_to_id.remove(&(username, name))
-            .ok_or_else(|| anyhow::anyhow!("Snapshot not found"))?;
-
-        if let Some(ctx) = self.contexts.remove(&snapshot_id) {
-            let dev_idx = ctx.device.unwrap_or(0) as usize;
-            if let Some(tip_hash) = ctx.committed_tip {
-                self.devices[dev_idx].release_chain(tip_hash);
-                self.devices[dev_idx].remove_index_cache(tip_hash);
-            }
-            // Free snapshot working pages
-            self.devices[dev_idx].free_working(&ctx.working_pages);
-            self.devices[dev_idx].free_cpu_pages(&ctx.working_pages_cpu);
-        }
-        BUFFERS.remove(&(self.model_idx, snapshot_id));
-        Ok(())
-    }
-
-    pub(crate) fn destroy_context(&mut self, id: ContextId) -> Result<()> {
+    pub(crate) fn destroy(&mut self, id: ContextId) -> Result<()> {
         let ctx = self.contexts.remove(&id)
-            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-
-        let buf = BUFFERS.remove(&(self.model_idx, id)).map(|(_, b)| b);
-        let committed_len = buf.as_ref().map(|b| b.committed_len).unwrap_or(0);
+            .ok_or_else(|| anyhow::anyhow!("Context {id} not found"))?;
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
+        let committed_len = ctx.committed_len;
 
         if let Some(pid) = ctx.owner {
             if let Some(proc) = self.processes.get_mut(&pid) {
                 proc.context_ids.retain(|&c| c != id);
             }
-            self.arbiter.uncommit(pid, dev_idx, committed_len);
-            self.arbiter.remove_working(pid, dev_idx, ctx.working_pages.len());
+            self.sched_uncommit(pid, dev_idx, committed_len);
+            self.sched_remove_working(pid, dev_idx, ctx.working_pages.len());
 
             // Clean up empty process entries (fix #3)
             if self.processes.get(&pid).map(|p| p.context_ids.is_empty()).unwrap_or(false) {
                 self.processes.remove(&pid);
-                self.arbiter.remove_entry(&pid);
+                self.sched_remove_entry(&pid);
                 self.pending_pinned_counts.remove(&pid);
                 if let Some(allocs) = self.pending_allocs_map.remove(&pid) {
                     for alloc in allocs {
@@ -604,6 +440,8 @@ impl ContextManager {
         self.devices[dev_idx].free_cpu_pages(&ctx.working_pages_cpu);
 
         self.name_to_id.retain(|_, v| *v != id);
+
+        self.drain_queues();
         Ok(())
     }
 
@@ -616,11 +454,9 @@ impl ContextManager {
         let src_working_gpu = ctx.working_pages.clone();
         let src_working_cpu = ctx.working_pages_cpu.clone();
 
-        let buf = self.buf(id).ok_or_else(|| anyhow::anyhow!("Buffer not found"))?;
-        let committed_len = buf.committed_len;
-        let max_pos = buf.max_committed_position;
-        let forked_filled = buf.tokens_filled.clone();
-        drop(buf);
+        let committed_len = ctx.committed_len;
+        let max_pos = ctx.max_committed_position;
+        let forked_filled = ctx.working_page_tokens.clone();
 
         if let Some(tip_hash) = tip {
             self.devices[dev_idx].acquire_chain(tip_hash);
@@ -657,97 +493,35 @@ impl ContextManager {
             working_pages_cpu: Vec::new(),
             committed_tip: tip,
             lineage,
+            working_page_tokens: forked_filled,
+            committed_len,
+            max_committed_position: max_pos,
             state: ContextState::Active,
             pending_suspend: false,
             last_access: Instant::now(),
-        });
-        BUFFERS.insert((self.model_idx, new_id), ContextTokens {
-            tokens_filled: forked_filled,
-            committed_len,
-            max_committed_position: max_pos,
         });
 
         if let Some(pid) = owner {
             let proc = self.ensure_process(pid);
             proc.context_ids.push(new_id);
-            // Track forked context's working pages in arbiter
+            // Track forked context's working pages in scheduler
             let n_working = self.contexts.get(&new_id).map(|c| c.working_pages.len()).unwrap_or(0);
             if n_working > 0 {
-                self.arbiter.add_working(pid, dev_idx, n_working);
+                self.sched_add_working(pid, dev_idx, n_working);
             }
-            // Update arbiter for forked context's committed pages (fix #4)
+            // Update scheduler for forked context's committed pages (fix #4)
             if committed_len > 0 {
-                self.arbiter.add_working(pid, dev_idx, committed_len);
-                self.arbiter.commit(pid, dev_idx, committed_len);
+                self.sched_add_working(pid, dev_idx, committed_len);
+                self.sched_commit(pid, dev_idx, committed_len);
             }
         }
 
         Ok(new_id)
     }
 
-    /// Take ownership of a saved snapshot. The snapshot is deleted and its
-    /// resources are transferred to the new context. GPU working pages are
-    /// moved directly (no D2D copy needed). CPU working pages are restored
-    /// via H2D copy. Committed pages are ref-bumped (shared via CAS).
-    pub(crate) fn take_impl(&mut self, username: String, name: String) -> Result<ContextId> {
-        let key = (username, name);
-        let snapshot_id = *self.name_to_id.get(&key)
-            .ok_or_else(|| anyhow::anyhow!("Snapshot not found"))?;
-
-        let snap = self.contexts.remove(&snapshot_id)
-            .ok_or_else(|| anyhow::anyhow!("Snapshot context missing"))?;
-        let snap_buf = BUFFERS.remove(&(self.model_idx, snapshot_id))
-            .map(|(_, b)| b)
-            .ok_or_else(|| anyhow::anyhow!("Snapshot buffer missing"))?;
-        self.name_to_id.remove(&key);
-
-        let dev_idx = snap.device.unwrap_or(0) as usize;
-
-        // Committed chain: the snapshot held one acquire_chain reference.
-        // By consuming the snapshot (removing it from contexts), we transfer
-        // that reference to the new context — no extra acquire/release needed.
-
-        // Working pages: GPU pages transfer directly, CPU pages need H2D copy
-        let new_working = if !snap.working_pages.is_empty() {
-            // GPU → new context: direct ownership transfer (zero-copy)
-            snap.working_pages.clone()
-        } else if !snap.working_pages_cpu.is_empty() {
-            // CPU → GPU: allocate GPU pages and copy
-            let n = snap.working_pages_cpu.len();
-            if let Some(gpu_pages) = self.devices[dev_idx].alloc_working(n) {
-                let _ = device::copy_h2d(dev_idx as DeviceId, &gpu_pages, &snap.working_pages_cpu);
-                // Free CPU pages after H2D copy is issued
-                self.devices[dev_idx].free_cpu_pages(&snap.working_pages_cpu);
-                gpu_pages
-            } else {
-                // GPU OOM — can't restore, free the orphaned CPU pages
-                self.devices[dev_idx].free_cpu_pages(&snap.working_pages_cpu);
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        let new_id = self.next_id();
-        self.contexts.insert(new_id, Context {
-            owner: None,
-            device: Some(dev_idx as DeviceId),
-            working_pages: new_working,
-            working_pages_cpu: Vec::new(),
-            committed_tip: snap.committed_tip,
-            lineage: snap.lineage,
-            state: ContextState::Active,
-            pending_suspend: false,
-            last_access: Instant::now(),
-        });
-        BUFFERS.insert((self.model_idx, new_id), snap_buf);
-
-        Ok(new_id)
-    }
-
     // ==================== Page Management ====================
 
-    pub(crate) fn free_pages(&mut self, id: ContextId, num_pages: u32) -> Result<()> {
+    pub(crate) fn release_pages(&mut self, id: ContextId, num_pages: u32) -> Result<()> {
         let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
 
         let n = (num_pages as usize).min(ctx.working_pages.len());
@@ -758,32 +532,32 @@ impl ContextManager {
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let owner = ctx.owner;
 
-        // Truncate filled tokens in the buffer
+        // Truncate working page tokens
         let tokens_to_remove = n * self.page_size;
         if tokens_to_remove > 0 {
-            if let Some(mut buf) = self.buf_mut(id) {
-                let len = buf.tokens_filled.len();
-                buf.tokens_filled.truncate(len.saturating_sub(tokens_to_remove));
-            }
+            let len = ctx.working_page_tokens.len();
+            ctx.working_page_tokens.truncate(len.saturating_sub(tokens_to_remove));
         }
 
         self.devices[dev_idx].free_working(&to_free);
 
         if let Some(pid) = owner {
-            self.arbiter.remove_working(pid, dev_idx, n);
+            self.sched_remove_working(pid, dev_idx, n);
         }
+        self.drain_queues();
         Ok(())
     }
 
-    pub(crate) fn commit_pages_impl(&mut self, id: ContextId, num_pages: u32) -> Result<()> {
+    pub(crate) fn commit_pages(&mut self, id: ContextId, num_pages: u32) -> Result<()> {
         let page_size = self.page_size;
         let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
 
         if num_pages == 0 { return Ok(()); }
 
-        // Suspended context → logical commit
+        // Suspended contexts cannot receive commits — the owning process is
+        // blocked on reserve_pages and cannot make any other WIT calls.
         if ctx.working_pages.is_empty() {
-            return self.commit_pages_logical(id, num_pages);
+            anyhow::bail!("Cannot commit: context has no working pages (suspended?)");
         }
 
         let n = num_pages as usize;
@@ -796,35 +570,33 @@ impl ContextManager {
         let working_phys: Vec<PhysicalPageId> = ctx.working_pages[..n].to_vec();
         let owner = ctx.owner;
 
-        // Read token data from the ContextTokens
-        let buf = self.buf(id).ok_or_else(|| anyhow::anyhow!("Buffer not found"))?;
+        // Read token data from the Context
         let mut tokens = Vec::new();
         let mut positions = Vec::new();
         let mut masks = Vec::new();
         let mut all_positions = Vec::new();
 
         let total_needed = n * page_size;
-        if total_needed > buf.tokens_filled.len() {
+        if total_needed > ctx.working_page_tokens.len() {
             anyhow::bail!("Cannot commit {} pages: need {} tokens but only have {}",
-                n, total_needed, buf.tokens_filled.len());
+                n, total_needed, ctx.working_page_tokens.len());
         }
         for i in 0..total_needed {
-            let info = &buf.tokens_filled[i];
+            let info = &ctx.working_page_tokens[i];
             tokens.push(info.token);
             positions.push(info.position);
             masks.push(info.mask.clone());
             all_positions.push(info.position);
         }
 
-        if let Some(max_committed) = buf.max_committed_position {
+        if let Some(max_committed) = ctx.max_committed_position {
             for &pos in &all_positions {
                 if pos <= max_committed {
                     anyhow::bail!("Position {} must be > max committed position {}", pos, max_committed);
                 }
             }
         }
-        let lineage_adapter = buf.tokens_filled.first().and_then(|t| t.adapter);
-        drop(buf);
+        let lineage_adapter = ctx.working_page_tokens.first().and_then(|t| t.adapter);
 
         // Compute hashes and commit pages
         let dev = &mut self.devices[dev_idx];
@@ -861,107 +633,26 @@ impl ContextManager {
             ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter });
         }
 
-        // Update ContextTokens (DashMap)
-        if let Some(mut buf) = self.buf_mut(id) {
-            buf.tokens_filled.drain(..total_needed);
-            buf.committed_len += n;
-            buf.max_committed_position = all_positions.iter().copied().max()
-                .or(buf.max_committed_position);
-        }
+        // Update token data on Context
+        ctx.working_page_tokens.drain(..total_needed);
+        ctx.committed_len += n;
+        ctx.max_committed_position = all_positions.iter().copied().max()
+            .or(ctx.max_committed_position);
 
         if let Some(pid) = owner {
-            self.arbiter.commit(pid, dev_idx, n);
+            self.sched_commit(pid, dev_idx, n);
         }
 
+        self.drain_queues();
         Ok(())
     }
 
-    fn commit_pages_logical(&mut self, id: ContextId, num_pages: u32) -> Result<()> {
-        let page_size = self.page_size;
-        let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let prev_hash = ctx.committed_tip.unwrap_or(0);
-        let owner = ctx.owner;
-
-        let buf = self.buf(id).ok_or_else(|| anyhow::anyhow!("Buffer not found"))?;
-        let mut tokens = Vec::new();
-        let mut positions = Vec::new();
-        let mut masks = Vec::new();
-
-        let n = num_pages as usize;
-        let total_needed = n * page_size;
-        if total_needed > buf.tokens_filled.len() {
-            anyhow::bail!("Cannot commit {} pages: need {} tokens but only have {}",
-                n, total_needed, buf.tokens_filled.len());
-        }
-        for i in 0..total_needed {
-            let info = &buf.tokens_filled[i];
-            tokens.push(info.token);
-            positions.push(info.position);
-            masks.push(info.mask.clone());
-        }
-
-        if let Some(max_committed) = buf.max_committed_position {
-            for &pos in &positions {
-                if pos <= max_committed {
-                    anyhow::bail!("Position {} must be > max committed position {}", pos, max_committed);
-                }
-            }
-        }
-        let lineage_adapter = buf.tokens_filled.first().and_then(|t| t.adapter);
-        drop(buf);
-
-        let max_position = positions.iter().copied().max();
-        let hashes = self.devices[dev_idx].compute_page_hashes(&tokens, &positions, &masks, prev_hash);
-        let new_tip = *hashes.last()
-            .ok_or_else(|| anyhow::anyhow!("No page hashes computed during logical commit"))?;
-
-        {
-            let dev = &mut self.devices[dev_idx];
-            let mut running_prev = prev_hash;
-            for &hash in &hashes {
-                dev.insert_chain_link(hash, running_prev);
-                running_prev = hash;
-            }
-        }
-
-        // Update Context (local)
-        let ctx = self.contexts.get_mut(&id)
-            .ok_or_else(|| anyhow::anyhow!("Context lost during logical commit"))?;
-        ctx.committed_tip = Some(new_tip);
-
-        if let Some(Record::Fill { tokens: t, positions: p, mask: m, adapter: a }) = ctx.lineage.last_mut() {
-            if *a == lineage_adapter {
-                t.extend_from_slice(&tokens);
-                p.extend_from_slice(&positions);
-                m.extend_from_slice(&masks);
-            } else {
-                ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter });
-            }
-        } else {
-            ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter });
-        }
-
-        // Update ContextTokens (DashMap)
-        if let Some(mut buf) = self.buf_mut(id) {
-            buf.tokens_filled.drain(..total_needed);
-            buf.committed_len += n;
-            buf.max_committed_position = max_position
-                .or(buf.max_committed_position);
-        }
-
-        if let Some(pid) = owner {
-            self.arbiter.commit(pid, dev_idx, indices.len());
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn pin_impl(&mut self, id: ContextId) -> Result<HashMap<DeviceId, Vec<PhysicalPageId>>> {
+    pub(crate) fn pin(&mut self, id: ContextId, num_input_tokens: u32) -> Result<PinnedContext> {
         let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let tip = ctx.committed_tip;
         let working = ctx.working_pages.clone();
+        let kv_len = (ctx.committed_len * self.page_size + ctx.working_page_tokens.len()) as u32;
 
         // Transition Active → Pinned: prevents eviction while process holds page IDs.
         // Eviction of Pinned contexts is deferred via `pending_suspend` flag.
@@ -969,39 +660,106 @@ impl ContextManager {
             ctx.state = ContextState::Pinned;
         }
 
-        let mut pages = Vec::new();
+        let mut page_ids = Vec::new();
 
         // Committed pages
         if let Some(tip_hash) = tip {
             let dev = &mut self.devices[dev_idx];
-            pages.extend(dev.resolve_physical(tip_hash));
+            page_ids.extend(dev.resolve_physical(tip_hash));
         }
 
         // Working pages (appended after committed)
-        pages.extend(&working);
+        page_ids.extend(&working);
 
-        let mut result = HashMap::new();
-        result.insert(dev_idx as DeviceId, pages);
-        Ok(result)
+        let num_pages = page_ids.len() as u32;
+        let page_size = self.page_size as u32;
+        let total_kv = kv_len + num_input_tokens;
+        let last_page_len = pagestore::compute_last_page_len(total_kv, num_pages, page_size);
+
+        Ok(PinnedContext { device: dev_idx as DeviceId, pages: page_ids, kv_len, last_page_len })
     }
 
-    fn build_debug_state(&self, id: ContextId) -> String {
-        let ctx_info = self.contexts.get(&id).map(|ctx| {
-            format!(
-                "state={:?} working_pages={} working_pages_cpu={} tip={:?}",
-                ctx.state, ctx.working_pages.len(), ctx.working_pages_cpu.len(),
-                ctx.committed_tip,
-            )
-        }).unwrap_or_else(|| "CTX_MISSING".to_string());
+    // ==================== Extracted handle() helpers ====================
 
-        let buf_info = BUFFERS.get(&(self.model_idx, id)).map(|b| {
-            format!(
-                "committed_len={} tokens_filled={}",
-                b.committed_len, b.tokens_filled.len(),
-            )
-        }).unwrap_or_else(|| "BUF_MISSING".to_string());
+    pub(crate) fn open(&mut self, username: String, name: String) -> Result<ContextId> {
+        match self.name_to_id.get(&(username, name)) {
+            Some(&snapshot_id) => self.fork(snapshot_id),
+            None => Err(anyhow::anyhow!("Snapshot not found")),
+        }
+    }
 
-        format!("{} {}", ctx_info, buf_info)
+    pub(crate) fn unpin(&mut self, id: ContextId) {
+        self.handle_clear_pinned(id);
+    }
+
+    pub(crate) fn stats(&self) -> Vec<(usize, usize)> {
+        self.devices.iter().map(|d| d.stats()).collect()
+    }
+
+    pub(crate) fn set_priority_internal(&mut self, weight: f64, pid_values: HashMap<ProcessId, f64>) {
+        for (pid, value) in pid_values {
+            self.sched_set_priority(pid, weight * value);
+        }
+        self.drain_queues();
+    }
+
+    pub(crate) fn working_page_count(&self, id: ContextId) -> u32 {
+        self.contexts.get(&id)
+            .map(|c| c.working_pages.len() as u32)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn committed_page_count(&self, id: ContextId) -> u32 {
+        self.contexts.get(&id)
+            .map(|c| c.committed_len as u32)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn working_page_token_count(&self, id: ContextId) -> u32 {
+        self.contexts.get(&id)
+            .map(|c| c.working_page_tokens.len() as u32)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn truncate_working_page_tokens(&mut self, id: ContextId, count: u32) -> Result<()> {
+        let ctx = self.contexts.get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+        let max = ctx.working_page_tokens.len();
+        if count as usize > max {
+            anyhow::bail!("truncate count {} out of range 0..={}", count, max);
+        }
+        ctx.working_page_tokens.truncate(count as usize);
+        Ok(())
+    }
+
+    pub(crate) fn append_working_page_tokens(
+        &mut self, id: ContextId, tokens: Vec<u32>, positions: Vec<u32>,
+        masks: Vec<Brle>, adapter: Option<AdapterId>,
+    ) -> Result<()> {
+        let n = tokens.len();
+        if positions.len() != n {
+            anyhow::bail!("positions length {} != n {}", positions.len(), n);
+        }
+        if !masks.is_empty() && masks.len() != n {
+            anyhow::bail!("masks length {} != n {}", masks.len(), n);
+        }
+        let ctx = self.contexts.get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+        for (i, token) in tokens.into_iter().enumerate() {
+            ctx.working_page_tokens.push(TokenInfo {
+                token, position: positions[i],
+                mask: if masks.is_empty() { Brle::new(0) } else { masks[i].clone() },
+                adapter,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn debug_state(&self, id: ContextId) -> String {
+        match self.contexts.get(&id) {
+            Some(ctx) => format!("{ctx:?}"),
+            None => "NOT_FOUND".to_string(),
+        }
     }
 }
 
@@ -1021,144 +779,93 @@ pub(crate) enum Message {
     CommitPages { id: ContextId, num_pages: u32, response: oneshot::Sender<Result<()>> },
     ReservePages { id: ContextId, num_pages: u32, response: oneshot::Sender<Result<()>> },
     ReleasePages { id: ContextId, num_pages: u32 },
-    Pin { id: ContextId, response: oneshot::Sender<Result<HashMap<DeviceId, Vec<PhysicalPageId>>>> },
+    Pin { id: ContextId, num_input_tokens: u32, response: oneshot::Sender<Result<PinnedContext>> },
     Unpin { id: ContextId },
     GetStats { response: oneshot::Sender<Vec<(usize, usize)>> },
 
+    // Actor-routed read/write APIs (previously DashMap-based)
+    WorkingPageCount { id: ContextId, response: oneshot::Sender<u32> },
+    CommittedPageCount { id: ContextId, response: oneshot::Sender<u32> },
+    WorkingPageTokenCount { id: ContextId, response: oneshot::Sender<u32> },
+    TruncateWorkingPageTokens { id: ContextId, count: u32, response: oneshot::Sender<Result<()>> },
+    AppendWorkingPageTokens {
+        id: ContextId, tokens: Vec<u32>, positions: Vec<u32>,
+        masks: Vec<Brle>, adapter: Option<AdapterId>,
+        response: oneshot::Sender<Result<()>>,
+    },
+
     DebugState { id: ContextId, response: oneshot::Sender<String> },
-    SetDagWeights { weight: f64, pid_values: HashMap<ProcessId, f64> },
-}
-
-impl ContextManager {
-    /// Dispatch replay forward passes for KV cache recomputation.
-    ///
-    /// Each ReplayFill contains tokens that need to be run through the model
-    /// to regenerate KV data for committed pages lost during eviction.
-    /// After the forward pass, the working pages are committed.
-    async fn dispatch_replay_chunks(&mut self, chunks: Vec<ReplayFill>) {
-        if chunks.is_empty() { return; }
-
-        let mut ctx_ids_needing_finish: Vec<ContextId> = Vec::new();
-
-        for chunk in chunks {
-            let ctx_id = chunk.context_id;
-
-            // Build a minimal forward pass request (no sampling — just KV fill)
-            let fwd_req = ForwardPassRequest {
-                context_id: 0, // unused — page IDs provided directly
-                tokens: chunk.tokens.clone(),
-                positions: chunk.positions.clone(),
-                speculative_tokens: Vec::new(),
-                speculative_positions: Vec::new(),
-                output_speculative_tokens: false,
-                masks: chunk.masks.clone(),
-                logit_mask: None,
-                sampling_indices: Vec::new(),
-                samplers: Vec::new(),
-                adapter_id: chunk.adapter,
-                adapter_seed: None,
-                arrival_time: None,
-            };
-
-            let phys_ids: Vec<u32> = chunk.physical_page_ids.iter().map(|&p| p as u32).collect();
-            let mut batch = BatchedForwardPassRequest::new(chunk.device_id);
-            batch.add_request(&fwd_req, &phys_ids, chunk.last_page_len);
-
-            let result = device::call_with_timeout::<_, crate::inference::request::BatchedForwardPassResponse>(
-                chunk.device_id, "fire_batch", &batch,
-                std::time::Duration::from_secs(30),
-            ).await;
-
-            if let Err(e) = result {
-                eprintln!("REPLAY_FWD_FAIL ctx={ctx_id} device={} err={e:#}", chunk.device_id);
-                // RPC failed — still finish restore to avoid permanently Pinned state.
-                // The context will have a truncated committed chain but can still serve.
-                if !ctx_ids_needing_finish.contains(&ctx_id) {
-                    ctx_ids_needing_finish.push(ctx_id);
-                }
-                continue;
-            }
-
-            let _ = self.commit_replay_chunk_impl(
-                ctx_id, chunk.num_pages,
-                chunk.tokens, chunk.positions, chunk.masks, chunk.adapter,
-            );
-            if !ctx_ids_needing_finish.contains(&ctx_id) {
-                ctx_ids_needing_finish.push(ctx_id);
-            }
-        }
-
-        for id in ctx_ids_needing_finish {
-            self.finish_restore_impl(id);
-        }
-    }
+    SetPriority { weight: f64, pid_values: HashMap<ProcessId, f64> },
 }
 
 impl ServiceHandler for ContextManager {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
-        self.msg_counter += 1;
-
         match msg {
             Message::Open { username, name, response } => {
-                let result = match self.name_to_id.get(&(username, name)) {
-                    Some(&snapshot_id) => self.fork(snapshot_id),
-                    None => Err(anyhow::anyhow!("Snapshot not found")),
-                };
-                let _ = response.send(result);
+                let _ = response.send(self.open(username, name));
             }
             Message::Take { username, name, response } => {
-                let _ = response.send(self.take_impl(username, name));
+                let _ = response.send(self.take(username, name));
             }
-            Message::Create { owner, response } => { let _ = response.send(self.create(owner)); }
+            Message::Create { owner, response } => {
+                let _ = response.send(self.create(owner));
+            }
             Message::Save { id, username, name, response } => {
-                let _ = response.send(self.save_impl(id, username, name));
+                let _ = response.send(self.save(id, username, name));
             }
             Message::Delete { username, name, response } => {
                 let _ = response.send(self.delete(username, name));
             }
             Message::Destroy { id, force: _, response } => {
-                let _ = response.send(self.destroy_context(id));
-                let chunks = self.drain_queues();
-                self.dispatch_replay_chunks(chunks).await;
+                let _ = response.send(self.destroy(id));
             }
-            Message::Fork { id, response } => { let _ = response.send(self.fork(id)); }
+            Message::Fork { id, response } => {
+                let _ = response.send(self.fork(id));
+            }
             Message::CommitPages { id, num_pages, response } => {
-                let _ = response.send(self.commit_pages_impl(id, num_pages));
-                let chunks = self.drain_queues();
-                self.dispatch_replay_chunks(chunks).await;
+                let _ = response.send(self.commit_pages(id, num_pages));
             }
             Message::ReservePages { id, num_pages, response } => {
-                let chunks = self.handle_reserve_pages(id, num_pages, response);
-                self.dispatch_replay_chunks(chunks).await;
+                self.handle_reserve_pages(id, num_pages, response);
             }
             Message::ReleasePages { id, num_pages } => {
-                let _ = self.free_pages(id, num_pages);
-                let chunks = self.drain_queues();
-                self.dispatch_replay_chunks(chunks).await;
+                let _ = self.release_pages(id, num_pages);
             }
-            Message::Pin { id, response } => {
-                let _ = response.send(self.pin_impl(id));
+            Message::Pin { id, num_input_tokens, response } => {
+                let _ = response.send(self.pin(id, num_input_tokens));
             }
             Message::Unpin { id } => {
-                let chunks = self.handle_clear_pinned(id);
-                self.dispatch_replay_chunks(chunks).await;
+                self.unpin(id);
             }
             Message::GetStats { response } => {
-                let stats: Vec<_> = self.devices.iter().map(|d| d.stats()).collect();
-                let _ = response.send(stats);
+                let _ = response.send(self.stats());
+            }
+            Message::SetPriority { weight, pid_values } => {
+                self.set_priority_internal(weight, pid_values);
+            }
+            Message::WorkingPageCount { id, response } => {
+                let _ = response.send(self.working_page_count(id));
+            }
+            Message::CommittedPageCount { id, response } => {
+                let _ = response.send(self.committed_page_count(id));
+            }
+            Message::WorkingPageTokenCount { id, response } => {
+                let _ = response.send(self.working_page_token_count(id));
+            }
+            Message::TruncateWorkingPageTokens { id, count, response } => {
+                let _ = response.send(self.truncate_working_page_tokens(id, count));
+            }
+            Message::AppendWorkingPageTokens { id, tokens, positions, masks, adapter, response } => {
+                let _ = response.send(self.append_working_page_tokens(id, tokens, positions, masks, adapter));
             }
             Message::DebugState { id, response } => {
-                let _ = response.send(self.build_debug_state(id));
-            }
-            Message::SetDagWeights { weight, pid_values } => {
-                for (pid, value) in pid_values {
-                    self.arbiter.set_weight(pid, weight * value);
-                }
-                let chunks = self.drain_queues();
-                self.dispatch_replay_chunks(chunks).await;
+                let _ = response.send(self.debug_state(id));
             }
         }
+        // Single flush: dispatch all replay chunks accumulated during this message.
+        let replays = std::mem::take(&mut self.pending_replays);
+        self.dispatch_replays(replays).await;
     }
 }

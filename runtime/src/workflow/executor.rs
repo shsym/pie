@@ -438,7 +438,7 @@ impl Executor {
             .map(|&pid| (pid, 1.0))
             .collect();
 
-        context::set_dag_weights(weight, pid_values);
+        context::set_priority(weight, pid_values);
     }
 }
 

@@ -306,7 +306,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             .map(convert_sampler)
             .collect();
 
-        // Save data needed for context::append_filled_tokens() before moving into request
+        // Save data needed for context::append_working_page_tokens() before moving into request
         let num_input_tokens = tokens.len();
         let fill_tokens = tokens.clone();
         let fill_positions = positions.clone();
@@ -334,34 +334,21 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
         // Step 1: Resolve physical page IDs. Atomically pins the context
         // (Active → Pinned) so pages cannot be evicted during the forward pass.
-        let pages_by_device = match context::pin(model_id, context_id).await {
-            Ok(pages) => pages,
+        let pinned = match context::pin(model_id, context_id, num_input_tokens as u32).await {
+            Ok(p) => p,
             Err(e) => {
                 tracing::warn!("pin failed for ctx {context_id}: {e:#}");
                 return Ok(Err(e.to_string()));
             }
         };
-        // Read kv_len while Pinned — context cannot be evicted so this is consistent.
-        let kv_len = context::kv_len(model_id, context_id);
+        let kv_len = pinned.kv_len;
+        let last_page_len = pinned.last_page_len;
+        let device_id = pinned.device;
+        let physical_page_ids = pinned.pages;
 
-        if pages_by_device.len() > 1 {
-            context::unpin(model_id, context_id);
-            return Ok(Err(format!(
-                "Context pages span {} devices; context parallelism is not yet supported",
-                pages_by_device.len(),
-            )));
-        }
-
-        let (device_id, physical_page_ids) = pages_by_device
-            .into_iter()
-            .next()
-            .unwrap_or((0, vec![]));
-
-        // Step 3: Compute FlashInfer's last_page_len
         let num_pages = physical_page_ids.len() as u32;
         let page_size = context::tokens_per_page(model_id);
         let total_kv = kv_len + num_input_tokens as u32;
-        let last_page_len = context::compute_last_page_len(total_kv, num_pages, page_size);
 
         // INVARIANT: total_kv must fit within the allocated pages.
         // Violation means working pages were lost between reserve_pages
@@ -415,13 +402,13 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                     );
                 }
                 // Step 3: Mark input tokens as forwarded WHILE still Pinned
-                // (non-evictable).  This ensures tokens_filled + lineage are consistent
+                // (non-evictable).  This ensures working_page_tokens + lineage are consistent
                 // before the context becomes Active (evictable).
                 if num_input_tokens > 0 {
-                    if let Err(e) = context::append_filled_tokens(
+                    if let Err(e) = context::append_working_page_tokens(
                         model_id, context_id, fill_tokens,
                         fill_positions, fill_masks, adapter_id,
-                    ) {
+                    ).await {
                         context::unpin(model_id, context_id);
                         tracing::warn!("context::fill failed for ctx {context_id}: {e:#}");
                         return Ok(Err(e.to_string()));
@@ -429,7 +416,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 }
 
                 // Unpin — forward pass completed and tokens recorded in lineage.
-                // Context is now safe to evict: lineage is consistent with tokens_filled.
+                // Context is now safe to evict: lineage is consistent with working_page_tokens.
                 context::unpin(model_id, context_id);
 
                 let future_output = FutureOutput {

@@ -1,4 +1,4 @@
-//! Contention — Dual-Queue Contention Resolution Protocol.
+//! Suspension — Dual-Queue Contention Resolution Protocol.
 //!
 //! Implements the two-queue model from DESIGN.md:
 //! - `try_alloc` (FIFO): deferred allocation requests from Running processes
@@ -19,9 +19,9 @@ use crate::device;
 use crate::process::ProcessId;
 
 use super::{
-    ContextId, ContextManager, ContextState, ProcessState,
-    ReplayFill,
+    ContextId, ContextManager, ContextState,
 };
+use super::sched::ProcessState;
 use super::pagestore::PhysicalPageId;
 
 // =============================================================================
@@ -79,7 +79,7 @@ impl Ord for RestoreWaiter {
 }
 
 // =============================================================================
-// Contention methods on ContextManager
+// Suspension methods on ContextManager
 // =============================================================================
 
 impl ContextManager {
@@ -87,21 +87,20 @@ impl ContextManager {
     // ==================== reserve_pages flow ====================
 
     /// Handle a ReservePages message per DESIGN.md §4 (steps 0–6).
-    /// Returns replay chunks from drain_queues (if eviction triggers restoration).
     pub(crate) fn handle_reserve_pages(
         &mut self,
         id: ContextId,
         num_pages: u32,
         response: oneshot::Sender<anyhow::Result<()>>,
-    ) -> Vec<ReplayFill> {
+    ) {
         if num_pages == 0 {
             let _ = response.send(Ok(()));
-            return Vec::new();
+            return;
         }
 
         let ctx = match self.contexts.get(&id) {
             Some(c) => c,
-            None => { let _ = response.send(Err(anyhow::anyhow!("Context not found"))); return Vec::new(); }
+            None => { let _ = response.send(Err(anyhow::anyhow!("Context not found"))); return; }
         };
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let owner = ctx.owner;
@@ -110,7 +109,7 @@ impl ContextManager {
         let additional = (num_pages as usize).saturating_sub(current_working);
         if additional == 0 {
             let _ = response.send(Ok(()));
-            return Vec::new();
+            return;
         }
 
         // Step 0: SUSPENSION CHECK
@@ -121,7 +120,7 @@ impl ContextManager {
                     context_id: id, device: dev_idx,
                     num_pages: additional, response,
                 });
-                return Vec::new();
+                return;
             }
         }
 
@@ -131,12 +130,12 @@ impl ContextManager {
                 context_id: id, device: dev_idx,
                 num_pages: additional, response,
             });
-            return Vec::new();
+            return;
         }
 
         // Step 2: PRIORITY GATE — compare requester floor vs try_restore head.
         let requester_floor = owner
-            .map(|pid| self.arbiter.priority_at(&pid, self.arbiter.pages_on(&pid, dev_idx) + additional))
+            .map(|pid| self.sched_priority_at(&pid, self.sched_pages_on(&pid, dev_idx) + additional))
             .unwrap_or(0.0);
 
         if let Some(pid) = owner {
@@ -151,7 +150,7 @@ impl ContextManager {
                         context_id: id, device: dev_idx,
                         num_pages: additional, response,
                     });
-                    return Vec::new();
+                    return;
                 }
             }
         }
@@ -160,7 +159,7 @@ impl ContextManager {
         if let Some(pages) = self.devices[dev_idx].alloc_working(additional) {
             self.apply_alloc(id, dev_idx, pages, owner);
             let _ = response.send(Ok(()));
-            return Vec::new();
+            return;
         }
 
         // Step 4: EVICT unreferenced committed pages (rc=0) and retry.
@@ -168,7 +167,7 @@ impl ContextManager {
         if let Some(pages) = self.devices[dev_idx].alloc_working(additional) {
             self.apply_alloc(id, dev_idx, pages, owner);
             let _ = response.send(Ok(()));
-            return Vec::new();
+            return;
         }
 
         // Step 5: EVICTION LOOP
@@ -176,7 +175,7 @@ impl ContextManager {
         loop {
             match self.find_eviction_victim(dev_idx, requester_floor, owner) {
                 Some(victim_pid) => {
-                    let victim_floor = self.arbiter.priority(&victim_pid, dev_idx);
+                    let victim_floor = self.sched_priority(&victim_pid, dev_idx);
                     let (pinned_count, active_count) = self.suspend_process(victim_pid);
                     self.enqueue_restore(victim_pid, victim_floor, pinned_count);
 
@@ -191,7 +190,8 @@ impl ContextManager {
                     if let Some(pages) = self.devices[dev_idx].alloc_working(additional) {
                         self.apply_alloc(id, dev_idx, pages, owner);
                         let _ = response.send(Ok(()));
-                        return self.drain_queues();
+                        self.drain_queues();
+                        return;
                     }
 
                     // If any Pinned contexts, stop looping — deferred pages
@@ -226,7 +226,6 @@ impl ContextManager {
                 num_pages: additional, response,
             });
         }
-        Vec::new()
     }
 
     /// Apply an allocation to a context (after successful alloc_working).
@@ -243,7 +242,7 @@ impl ContextManager {
             ctx.device = Some(dev_idx);
         }
         if let Some(pid) = owner {
-            self.arbiter.add_working(pid, dev_idx, n);
+            self.sched_add_working(pid, dev_idx, n);
         }
     }
 
@@ -266,16 +265,16 @@ impl ContextManager {
             // Only evict Running processes (Pending already suspended)
             if proc.state != ProcessState::Running { continue; }
             // Must have pages on this device
-            let pages = self.arbiter.pages_on(&pid, dev_idx);
+            let pages = self.sched_pages_on(&pid, dev_idx);
             if pages == 0 { continue; }
 
-            let priority = self.arbiter.priority(&pid, dev_idx);
+            let priority = self.sched_priority(&pid, dev_idx);
 
             // Anti-thrashing: only evict if victim's invested importance
             // is strictly less than requester's post-allocation floor.
             if priority >= requester_floor { continue; }
 
-            let created = self.arbiter.created_at(&pid).unwrap_or_else(Instant::now);
+            let created = self.sched_created_at(&pid).unwrap_or_else(Instant::now);
             match cheapest {
                 None => cheapest = Some((pid, priority, created)),
                 Some((_, best_pri, best_time)) => {
@@ -352,9 +351,9 @@ impl ContextManager {
             proc.state = ProcessState::Pending;
         }
 
-        // Zero out arbiter accounting for ALL devices the process has contexts on
+        // Zero out scheduler accounting for ALL devices the process has contexts on
         for &dev in &devices_touched {
-            self.arbiter.zero_device(pid, dev);
+            self.sched_zero_device(pid, dev);
         }
 
         (pinned_count, active_count)
@@ -423,14 +422,13 @@ impl ContextManager {
     /// Handle ClearPinned message: Pinned → Active, then check deferred suspension.
     /// If `pending_suspend` was set, executes the deferred suspension and
     /// decrements the `pending_pinned_counts` side-map.
-    /// Returns replay chunks from drain_queues (if deferred suspension freed pages).
-    pub(crate) fn handle_clear_pinned(&mut self, id: ContextId) -> Vec<ReplayFill> {
+    pub(crate) fn handle_clear_pinned(&mut self, id: ContextId) {
         let (is_pinned, pending) = match self.contexts.get(&id) {
             Some(ctx) if ctx.state == ContextState::Pinned => (true, ctx.pending_suspend),
-            _ => return Vec::new(),
+            _ => return,
         };
 
-        if !is_pinned { return Vec::new(); }
+        if !is_pinned { return; }
 
         if pending {
             // Deferred suspension: context stays Pinned until suspend_context
@@ -449,15 +447,14 @@ impl ContextManager {
             }
 
             // Deferred suspension may have freed pages — drain queues.
-            return self.drain_queues();
+            self.drain_queues();
+            return;
         }
 
         // No deferred suspension — normal Pinned → Active transition.
         if let Some(ctx) = self.contexts.get_mut(&id) {
             ctx.state = ContextState::Active;
         }
-
-        Vec::new()
     }
 
     // ==================== drain_queues ====================
@@ -467,7 +464,7 @@ impl ContextManager {
     /// Phase 1: try_alloc (FIFO) — serve front-of-queue allocations.
     /// Phase 2: try_restore (priority heap) — restore highest-priority Pending
     ///          process, then replay its pending_allocs.
-    pub(crate) fn drain_queues(&mut self) -> Vec<ReplayFill> {
+    pub(crate) fn drain_queues(&mut self) {
         // Phase 1: try_alloc FIFO (head-of-line blocking)
         while let Some(front) = self.try_alloc.front() {
             let dev_idx = front.device as usize;
@@ -485,11 +482,9 @@ impl ContextManager {
             }
         }
 
-        let mut all_replay_chunks = Vec::new();
-
         // Phase 2: try_restore (priority heap)
         // Only proceed if try_alloc is empty (allocs have strict priority).
-        if !self.try_alloc.is_empty() { return all_replay_chunks; }
+        if !self.try_alloc.is_empty() { return; }
 
         while let Some(top) = self.try_restore.peek() {
             let pid = top.process_id;
@@ -506,10 +501,7 @@ impl ContextManager {
 
             let waiter = self.try_restore.pop().unwrap();
             let chunks = self.restore_and_replay(waiter.process_id);
-            all_replay_chunks.extend(chunks);
+            self.pending_replays.extend(chunks);
         }
-
-        all_replay_chunks
     }
 }
-

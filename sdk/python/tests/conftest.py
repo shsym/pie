@@ -146,7 +146,7 @@ class FakeContext:
     def working_page_token_count(self):
         return self._cursor
 
-    def pop_working_page_tokens(self, num_tokens):
+    def truncate_working_page_tokens(self, num_tokens):
         self._cursor = max(0, self._cursor - num_tokens)
 
     def __enter__(self):

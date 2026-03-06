@@ -56,7 +56,7 @@ interface context {
         working-page-token-count: func() -> u32;
 
         // Remove the last N tokens from working pages (for rollback, e.g. speculative rejection)
-        pop-working-page-tokens: func(num-tokens: u32);
+        truncate-working-page-tokens: func(num-tokens: u32);
 
     }
 
