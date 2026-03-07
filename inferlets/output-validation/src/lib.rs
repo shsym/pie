@@ -45,13 +45,15 @@ pub async fn validate_outputs(
                 break;
             }
 
+            let current_working_pages = candidate_ctx.working_page_count();
             let page_size = candidate_ctx.tokens_per_page();
             let wpt = candidate_ctx.working_page_token_count();
             let seq_len = candidate_ctx.committed_page_count() * page_size + wpt;
             let total_tokens_after = wpt + pending.len() as u32;
             let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
-            if total_pages_needed > 0 {
-                candidate_ctx.reserve_working_pages(total_pages_needed)
+            let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
+            if additional_pages > 0 {
+                candidate_ctx.reserve_working_pages(additional_pages)
                     .map_err(|e| format!("Failed to reserve pages: {}", e))?;
             }
 

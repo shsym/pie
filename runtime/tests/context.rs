@@ -142,7 +142,8 @@ fn full_page_lifecycle() {
 
         // ── Phase 1: Create anonymous context and fill prompt tokens ──
         let prompt: Vec<u32> = (1000..1032).collect(); // 32 tokens
-        let id = pie::context::create(MODEL, None).await.unwrap();
+        let pid = uuid::Uuid::new_v4();
+        let id = pie::context::create(MODEL, Some(pid)).await.unwrap();
 
         // Tokens per page should match the model config
         assert_eq!(

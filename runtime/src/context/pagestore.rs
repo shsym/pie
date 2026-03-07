@@ -81,7 +81,7 @@ pub struct PageStore {
 
     /// hash → (GPU physical page ID, refcount).
     /// Present for every GPU-resident committed page.
-    pages: FxHashMap<PageHash, (PhysicalPageId, usize)>,
+    pub(crate) pages: FxHashMap<PageHash, (PhysicalPageId, usize)>,
 
     /// hash → prev_hash for backward chain traversal. 0 = root (no predecessor).
     chain: FxHashMap<PageHash, PageHash>,
@@ -153,29 +153,6 @@ impl PageStore {
     // =========================================================================
     // Commit
     // =========================================================================
-
-    /// Promote a working page to a committed page.
-    ///
-    /// Reuses the working page's physical ID (the forward pass wrote KV data there).
-    /// If the hash is a dedup hit, the working page is freed back to the pool
-    /// since the existing physical page already has the correct data.
-    ///
-    /// Returns `(physical_page_id, working_page_freed)`.
-    pub fn promote_page(&mut self, hash: PageHash, prev_hash: PageHash, working_phys: PhysicalPageId) -> (PhysicalPageId, bool) {
-        // Dedup: page already exists on GPU
-        if let Some((phys, rc)) = self.pages.get_mut(&hash) {
-            *rc += 1;
-            let existing = *phys;
-            self.gpu.free(working_phys);
-            return (existing, true);
-        }
-
-        // Promote: register the working page's physical ID as the committed page
-        self.pages.insert(hash, (working_phys, 1));
-        self.chain.insert(hash, prev_hash);
-
-        (working_phys, false)
-    }
 
     // =========================================================================
     // Chain traversal & refcounting
@@ -456,11 +433,19 @@ mod tests {
         (0..n).map(|_| Brle::new(0)).collect()
     }
 
-    /// Test helper: allocate a working page, then promote it via promote_page.
+    /// Test helper: allocate a working page, then commit it.
     fn alloc_and_commit(store: &mut PageStore, hash: PageHash, prev: PageHash) -> PhysicalPageId {
         let working = store.alloc_gpu_pages(1).unwrap()[0];
-        let (phys, _freed) = store.promote_page(hash, prev, working);
-        phys
+        if let Some((existing, rc)) = store.pages.get_mut(&hash) {
+            *rc += 1;
+            let p = *existing;
+            store.free_gpu_pages(&[working]);
+            p
+        } else {
+            store.pages.insert(hash, (working, 1));
+            store.insert_chain_link(hash, prev);
+            working
+        }
     }
 
     #[test]
@@ -497,7 +482,17 @@ mod tests {
         assert_eq!(store.refcount(hashes[0]), 1);
 
         let working2 = store.alloc_gpu_pages(1).unwrap()[0];
-        let (phys2, freed) = store.promote_page(hashes[0], 0, working2);
+        // Dedup: same hash already exists
+        let (phys2, freed) = if let Some((existing, rc)) = store.pages.get_mut(&hashes[0]) {
+            *rc += 1;
+            let p = *existing;
+            store.free_gpu_pages(&[working2]);
+            (p, true)
+        } else {
+            store.pages.insert(hashes[0], (working2, 1));
+            store.insert_chain_link(hashes[0], 0);
+            (working2, false)
+        };
         assert!(freed);
         assert_eq!(phys1, phys2);
         assert_eq!(store.refcount(hashes[0]), 2);

@@ -206,15 +206,16 @@ impl<'a> TokenStream<'a> {
             return Ok(vec![]);
         }
 
-        // Reserve pages for pending input + speculative draft tokens.
+        // Reserve additional pages for pending input + speculative draft tokens.
         let n_total_input = n_pending + n_drafted;
         let total_tokens_after = self.ctx.working_tokens + n_total_input;
         let pages_needed =
             (total_tokens_after + self.ctx.page_size - 1) / self.ctx.page_size;
-        if pages_needed > self.ctx.working_pages {
+        let additional = pages_needed.saturating_sub(self.ctx.working_pages);
+        if additional > 0 {
             self.ctx
                 .inner
-                .reserve_working_pages(pages_needed)
+                .reserve_working_pages(additional)
                 .map_err(|e| format!("Failed to reserve pages: {}", e))?;
             self.ctx.working_pages = pages_needed;
         }

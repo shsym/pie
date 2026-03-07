@@ -239,12 +239,13 @@ impl Context {
         let tokens = std::mem::take(&mut self.buffer);
         let num_tokens = tokens.len() as u32;
 
-        // Reserve pages if we need more than currently allocated.
+        // Reserve additional pages if we need more than currently allocated.
         let total_tokens_after = self.working_tokens + num_tokens;
         let pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
-        if pages_needed > self.working_pages {
+        let additional = pages_needed.saturating_sub(self.working_pages);
+        if additional > 0 {
             self.inner
-                .reserve_working_pages(pages_needed)
+                .reserve_working_pages(additional)
                 .map_err(|e| format!("Failed to reserve pages: {}", e))?;
             self.working_pages = pages_needed;
         }

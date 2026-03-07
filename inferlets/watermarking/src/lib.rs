@@ -172,10 +172,12 @@ async fn main(args: Vec<String>) -> Result<String> {
         let page_size = ctx.tokens_per_page();
         let wpt = ctx.working_page_token_count();
         let seq_len = ctx.committed_page_count() * page_size + wpt;
+        let current_working_pages = ctx.working_page_count();
         let total_tokens_after = wpt + pending_tokens.len() as u32;
         let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
-        if total_pages_needed > 0 {
-            ctx.reserve_working_pages(total_pages_needed)
+        let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
+        if additional_pages > 0 {
+            ctx.reserve_working_pages(additional_pages)
                 .map_err(|e| format!("Failed to reserve pages at step {}: {}", step, e))?;
         }
 

@@ -46,7 +46,7 @@ interface context {
         // Commit the KV pages to the context
         commit-working-pages: func(num-pages: u32) -> result<_, error>;
 
-        // Reserve working GPU pages for the context
+        // Reserve additional working GPU pages for the context
         reserve-working-pages: func(num-pages: u32) -> result<_, error>;
 
         // Release working GPU pages from the context
