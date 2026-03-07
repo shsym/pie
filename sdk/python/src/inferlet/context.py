@@ -200,11 +200,13 @@ async def _reserve_and_run(
     wpt = ctx_handle.working_page_token_count()
     seq_start = ctx_handle.committed_page_count() * page_size + wpt
 
-    # Reserve pages
+    # Reserve additional pages
+    current_working = ctx_handle.working_page_count()
     total_tokens = wpt + num_tokens
     pages_needed = (total_tokens + page_size - 1) // page_size
-    if pages_needed > 0:
-        ctx_handle.reserve_working_pages(pages_needed)
+    additional = max(0, pages_needed - current_working)
+    if additional > 0:
+        ctx_handle.reserve_working_pages(additional)
 
     # Build forward pass
     fwd = _inf.ForwardPass(model_handle)

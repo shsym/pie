@@ -65,10 +65,12 @@ impl Speculate for GreedyDrafter {
             let wpt = self.draft_ctx.working_page_token_count();
             let seq_len = self.draft_ctx.committed_page_count() * self.page_size + wpt;
 
+            let current_working_pages = self.draft_ctx.working_page_count();
             let total_tokens_after = wpt + current_tokens.len() as u32;
             let total_pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
-            if total_pages_needed > 0 {
-                if self.draft_ctx.reserve_working_pages(total_pages_needed).is_err() {
+            let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
+            if additional_pages > 0 {
+                if self.draft_ctx.reserve_working_pages(additional_pages).is_err() {
                     break;
                 }
             }

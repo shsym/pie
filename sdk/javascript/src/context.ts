@@ -175,11 +175,13 @@ async function _reserveAndRun(
   const wpt = ctxHandle.workingPageTokenCount();
   const seqStart = ctxHandle.committedPageCount() * pageSize + wpt;
 
-  // Reserve pages
+  // Reserve additional pages
+  const currentWorking = ctxHandle.workingPageCount();
   const totalTokens = wpt + numTokens;
   const pagesNeeded = Math.ceil(totalTokens / pageSize);
-  if (pagesNeeded > 0) {
-    ctxHandle.reserveWorkingPages(pagesNeeded);
+  const additional = Math.max(0, pagesNeeded - currentWorking);
+  if (additional > 0) {
+    ctxHandle.reserveWorkingPages(additional);
   }
 
   // Build forward pass

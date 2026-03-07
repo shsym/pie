@@ -229,6 +229,8 @@ impl ContextManager {
         // Phase 1: Swap-in working pages from CPU → GPU
         if !cpu_pages.is_empty() {
             let dev = &mut self.devices[dev_idx];
+
+            // This should never fail because of the admission check
             let gpu_pages = dev.alloc_gpu_pages(cpu_pages.len())
                 .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working swap-in"))?;
 
@@ -236,14 +238,15 @@ impl ContextManager {
             let _ = device::copy_h2d(dev_idx, &gpu_pages, &cpu_pages);
             self.devices[dev_idx].free_cpu_pages(&cpu_pages);
 
-            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                ctx.working_pages = gpu_pages.clone();
-            }
-
             // Track swap-in as working pages in scheduler
             if let Some(pid) = owner {
                 self.process_entry(pid).device_mut(dev_idx).working += gpu_pages.len();
             }
+
+            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                ctx.working_pages = gpu_pages;
+            }
+            
         }
 
         // Phase 2: Rebuild committed chain via longest prefix match

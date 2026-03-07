@@ -537,13 +537,9 @@ impl ContextManager {
         };
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let owner = ctx.owner;
-        let current_working = ctx.working_pages.len();
 
-        let additional = num_pages.saturating_sub(current_working);
-        if additional == 0 {
-            let _ = response.send(Ok(()));
-            return;
-        }
+        // num_pages is the additional number of pages to allocate.
+        let additional = num_pages;
 
         // Alloc is only possible through an owning process.
         let pid = match owner {
