@@ -322,7 +322,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         //
         // STATE MACHINE (new 3-state context module):
         //
-        //   reserve_pages: blocks if process is suspended — actor handles
+        //   reserve_working_pages: blocks if process is suspended — actor handles
         //     restoration via drain_queues, process resumes automatically.
         //   pin: Active → Pinned (non-evictable).
         //   unpin: Pinned → Active (evictable again).
@@ -351,7 +351,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let total_kv = kv_len + num_input_tokens as u32;
 
         // INVARIANT: total_kv must fit within the allocated pages.
-        // Violation means working pages were lost between reserve_pages
+        // Violation means working pages were lost between reserve_working_pages
         // and execute — see swap lifecycle diagnostics.
         let page_capacity = num_pages * page_size;
         if total_kv > page_capacity || num_pages == 0 {

@@ -20,7 +20,7 @@ impl ContextManager {
             None => (format!("__snapshot_{}", self.next_id()), true),
         };
 
-        if self.name_to_id.contains_key(&(username.clone(), name.clone())) {
+        if self.snapshots.contains_key(&(username.clone(), name.clone())) {
             anyhow::bail!("Snapshot name already exists: {}", name);
         }
 
@@ -41,7 +41,7 @@ impl ContextManager {
         // Snapshot working pages: try GPU-first, fall back to CPU swap pool.
         let (snapshot_working_gpu, snapshot_working_cpu) = if !src_working.is_empty() {
             let n = src_working.len();
-            if let Some(dst_pages) = self.devices[dev_idx].alloc_working(n) {
+            if let Some(dst_pages) = self.devices[dev_idx].alloc_gpu_pages(n) {
                 // GPU → GPU copy
                 let _ = device::copy_d2d(dev_idx as DeviceId, &src_working, &dst_pages);
                 (dst_pages, Vec::new())
@@ -72,12 +72,12 @@ impl ContextManager {
             pending_suspend: false,
             last_access: Instant::now(),
         });
-        self.name_to_id.insert((username, name.clone()), snapshot_id);
+        self.snapshots.insert((username, name.clone()), snapshot_id);
         Ok(if auto_generated { Some(name) } else { None })
     }
 
     pub(crate) fn delete(&mut self, username: String, name: String) -> Result<()> {
-        let snapshot_id = self.name_to_id.remove(&(username, name))
+        let snapshot_id = self.snapshots.remove(&(username, name))
             .ok_or_else(|| anyhow::anyhow!("Snapshot not found"))?;
 
         if let Some(ctx) = self.contexts.remove(&snapshot_id) {
@@ -87,7 +87,7 @@ impl ContextManager {
                 self.devices[dev_idx].remove_index_cache(tip_hash);
             }
             // Free snapshot working pages
-            self.devices[dev_idx].free_working(&ctx.working_pages);
+            self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
             self.devices[dev_idx].free_cpu_pages(&ctx.working_pages_cpu);
         }
 
@@ -100,13 +100,13 @@ impl ContextManager {
     /// via H2D copy. Committed pages are ref-bumped (shared via CAS).
     pub(crate) fn take(&mut self, username: String, name: String) -> Result<ContextId> {
         let key = (username, name);
-        let snapshot_id = *self.name_to_id.get(&key)
+        let snapshot_id = *self.snapshots.get(&key)
             .ok_or_else(|| anyhow::anyhow!("Snapshot not found"))?;
 
         let snap = self.contexts.remove(&snapshot_id)
             .ok_or_else(|| anyhow::anyhow!("Snapshot context missing"))?;
 
-        self.name_to_id.remove(&key);
+        self.snapshots.remove(&key);
 
         let dev_idx = snap.device.unwrap_or(0) as usize;
 
@@ -121,7 +121,7 @@ impl ContextManager {
         } else if !snap.working_pages_cpu.is_empty() {
             // CPU → GPU: allocate GPU pages and copy
             let n = snap.working_pages_cpu.len();
-            if let Some(gpu_pages) = self.devices[dev_idx].alloc_working(n) {
+            if let Some(gpu_pages) = self.devices[dev_idx].alloc_gpu_pages(n) {
                 let _ = device::copy_h2d(dev_idx as DeviceId, &gpu_pages, &snap.working_pages_cpu);
                 // Free CPU pages after H2D copy is issued
                 self.devices[dev_idx].free_cpu_pages(&snap.working_pages_cpu);

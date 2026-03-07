@@ -137,6 +137,18 @@ pub fn copy_d2d(device_idx: DeviceId, src_phys_ids: &[u32], dst_phys_ids: &[u32]
     })
 }
 
+/// CPU → CPU page copy (fire-and-forget).
+/// `src_slots`: source CPU swap pool page IDs.
+/// `dst_slots`: destination CPU swap pool page IDs.
+pub fn copy_h2h(device_idx: DeviceId, src_slots: &[u32], dst_slots: &[u32]) -> Result<()> {
+    #[derive(Serialize)]
+    struct Req { src_slots: Vec<u32>, dst_slots: Vec<u32> }
+    notify(device_idx, "copy_h2h", &Req {
+        src_slots: src_slots.to_vec(),
+        dst_slots: dst_slots.to_vec(),
+    })
+}
+
 /// Returns the device's static configuration.
 pub async fn get_spec(device_idx: usize) -> Result<DeviceSpec> {
     let (tx, rx) = oneshot::channel();
