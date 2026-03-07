@@ -110,8 +110,8 @@ pub struct PageStore {
 Key operations:
 | Method | Description |
 |--------|-------------|
-| `alloc_working(n)` | Alloc n GPU pages from free pool |
-| `free_working(pages)` | Return GPU pages to free pool |
+| `alloc_gpu_pages(n)` | Alloc n GPU pages from free pool |
+| `free_gpu_pages(pages)` | Return GPU pages to free pool |
 | `commit_working(hash, prev, phys)` | Promote working → committed (dedup-aware) |
 | `acquire_chain(tip)` | Increment refcounts root→tip |
 | `release_chain(tip)` | Decrement refcounts, return rc=0 hashes |

@@ -10,8 +10,9 @@ use super::sched::ProcessState;
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
 use crate::adapter::AdapterId;
 use crate::device::{self, DeviceId};
+use crate::inference;
 use crate::inference::brle::Brle;
-use crate::inference::request::{ForwardPassRequest, BatchedForwardPassRequest};
+use crate::inference::request::ForwardPassRequest;
 use crate::process::ProcessId;
 
 // =============================================================================
@@ -69,11 +70,11 @@ impl ContextManager {
                 arrival_time: None,
             };
 
-            let phys_ids: Vec<u32> = chunk.physical_page_ids.iter().map(|&p| p as u32).collect();
-            let mut batch = BatchedForwardPassRequest::new(chunk.device_id);
-            batch.add_request(&fwd_req, &phys_ids, chunk.last_page_len);
-
-            let result = device::fire_batch(chunk.device_id, &batch).await;
+            let result = inference::submit(
+                self.model_idx, fwd_req,
+                chunk.device_id as usize, chunk.physical_page_ids.clone(),
+                chunk.last_page_len,
+            ).await;
 
             if let Err(e) = result {
                 eprintln!("REPLAY_FWD_FAIL ctx={ctx_id} device={} err={e:#}", chunk.device_id);
@@ -129,8 +130,8 @@ impl ContextManager {
         }
 
         // Add pending_alloc requirements
-        if let Some(allocs) = self.pending_allocs_map.get(&pid) {
-            for alloc in allocs {
+        if let Some(proc) = self.processes.get(&pid) {
+            for alloc in &proc.pending_allocs {
                 let dev_idx = alloc.device as usize;
                 *required.entry(dev_idx).or_insert(0) += alloc.num_pages;
             }
@@ -143,7 +144,7 @@ impl ContextManager {
 
         // Check availability on all devices
         for (&dev_idx, &needed) in &required {
-            if self.devices[dev_idx].free_gpu_pages() < needed {
+            if self.devices[dev_idx].available_gpu_pages() < needed {
                 return false;
             }
         }
@@ -182,18 +183,19 @@ impl ContextManager {
         }
 
         // Replay pending_allocs: allocate pages and fire response channels
-        if let Some(allocs) = self.pending_allocs_map.remove(&pid) {
-            for alloc in allocs {
-                let dev_idx = alloc.device as usize;
-                if let Some(pages) = self.devices[dev_idx].alloc_working(alloc.num_pages) {
-                    self.apply_alloc(alloc.context_id, dev_idx, pages, Some(pid));
-                    let _ = alloc.response.send(Ok(()));
-                } else {
-                    // Shouldn't happen — admission check verified availability.
-                    let _ = alloc.response.send(Err(anyhow::anyhow!(
-                        "Insufficient pages during restore replay (should not happen)"
-                    )));
-                }
+        let allocs = self.processes.get_mut(&pid)
+            .map(|p| std::mem::take(&mut p.pending_allocs))
+            .unwrap_or_default();
+        for alloc in allocs {
+            let dev_idx = alloc.device as usize;
+            if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(alloc.num_pages) {
+                self.apply_alloc(alloc.context_id, dev_idx, pages, Some(pid));
+                let _ = alloc.response.send(Ok(()));
+            } else {
+                // Shouldn't happen — admission check verified availability.
+                let _ = alloc.response.send(Err(anyhow::anyhow!(
+                    "Insufficient pages during restore replay (should not happen)"
+                )));
             }
         }
 
@@ -224,7 +226,7 @@ impl ContextManager {
         // Phase 1: Swap-in working pages from CPU → GPU
         if !cpu_pages.is_empty() {
             let dev = &mut self.devices[dev_idx];
-            let gpu_pages = dev.alloc_working(cpu_pages.len())
+            let gpu_pages = dev.alloc_gpu_pages(cpu_pages.len())
                 .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working swap-in"))?;
 
             // Copy CPU → GPU, then free CPU pages
@@ -238,7 +240,7 @@ impl ContextManager {
 
             // Track swap-in as working pages in scheduler
             if let Some(pid) = owner {
-                self.sched_add_working(pid, dev_idx, gpu_pages.len());
+                self.process_entry(pid).device_mut(dev_idx).working += gpu_pages.len();
             }
         }
 
@@ -299,8 +301,7 @@ impl ContextManager {
             // Update scheduler accounting for prefix-matched committed pages
             if let Some(pid) = owner {
                 if prefix_len > 0 {
-                    self.sched_add_working(pid, dev_idx, prefix_len);
-                    self.sched_commit(pid, dev_idx, prefix_len);
+                    self.process_entry(pid).device_mut(dev_idx).committed += prefix_len;
                 }
             }
 
@@ -413,7 +414,7 @@ impl ContextManager {
             let aligned_len = full_pages * page_size;
 
             // Allocate working pages for replay
-            let new_pages = match self.devices[dev_idx].alloc_working(full_pages) {
+            let new_pages = match self.devices[dev_idx].alloc_gpu_pages(full_pages) {
                 Some(p) => p,
                 None => anyhow::bail!("No GPU pages for replay (should not happen: admission check passed)"),
             };
@@ -423,7 +424,7 @@ impl ContextManager {
                 ctx.working_pages.extend(&new_pages);
             }
             if let Some(pid) = owner {
-                self.sched_add_working(pid, dev_idx, full_pages);
+                self.process_entry(pid).device_mut(dev_idx).working += full_pages;
             }
 
             // Build physical page IDs: committed prefix + all working pages after initial
@@ -476,9 +477,10 @@ impl ContextManager {
                     Vec::new()
                 }
             };
-            self.devices[dev_idx].free_working(&stale_pages);
+            self.devices[dev_idx].free_gpu_pages(&stale_pages);
             if let Some(pid) = owner {
-                self.sched_remove_working(pid, dev_idx, initial_working_len);
+                let d = self.process_entry(pid).device_mut(dev_idx);
+                d.working -= initial_working_len;
             }
         }
 
@@ -534,7 +536,9 @@ impl ContextManager {
         }
 
         if let Some(pid) = owner {
-            self.sched_commit(pid, dev_idx, new_phys.len());
+            let d = self.process_entry(pid).device_mut(dev_idx);
+            d.committed += new_phys.len();
+            d.working -= new_phys.len();
         }
 
         Ok(())

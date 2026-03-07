@@ -545,6 +545,24 @@ def _leader_loop(
             gpu_kv[layer_idx].index_copy_(0, dst, gpu_kv[layer_idx][src])
         #torch.cuda.synchronize() -> we don't need this
 
+    def _handle_copy_h2h(**kwargs) -> None:
+        """H2H: copy pinned CPU pages to other CPU pages (no GPU involved)."""
+        import torch
+        host_kv = engine.kv_cache_at_layer_host
+        src_ids = kwargs["src_slots"]
+        dst_ids = kwargs["dst_slots"]
+        max_cpu = host_kv[0].shape[0] if host_kv else 0
+        for s in src_ids:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2h: src slot {s} out of bounds [0, {max_cpu})")
+        for s in dst_ids:
+            if s < 0 or s >= max_cpu:
+                raise ValueError(f"copy_h2h: dst slot {s} out of bounds [0, {max_cpu})")
+        src = torch.tensor(src_ids, dtype=torch.long)
+        dst = torch.tensor(dst_ids, dtype=torch.long)
+        for layer_idx in range(len(host_kv)):
+            host_kv[layer_idx].index_copy_(0, dst, host_kv[layer_idx][src])
+
     # Method dispatch table
     methods = {
         "query": _handle_query,
@@ -559,6 +577,7 @@ def _leader_loop(
         "copy_d2h": _handle_copy_d2h,
         "copy_h2d": _handle_copy_h2d,
         "copy_d2d": _handle_copy_d2d,
+        "copy_h2h": _handle_copy_h2h,
     }
 
     try:

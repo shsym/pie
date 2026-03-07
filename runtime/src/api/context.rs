@@ -200,7 +200,7 @@ impl pie::core::context::HostContext for InstanceState {
         num_pages: u32,
     ) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
-        match context::commit_pages(ctx.model_id, ctx.context_id, num_pages).await {
+        match context::commit_working_pages(ctx.model_id, ctx.context_id, num_pages as usize).await {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
@@ -212,7 +212,7 @@ impl pie::core::context::HostContext for InstanceState {
         num_pages: u32,
     ) -> Result<Result<(), String>> {
         let ctx = self.ctx().table.get(&this)?;
-        match context::reserve_pages(ctx.model_id, ctx.context_id, num_pages).await {
+        match context::reserve_working_pages(ctx.model_id, ctx.context_id, num_pages as usize).await {
             Ok(()) => Ok(Ok(())),
             Err(e) => Ok(Err(e.to_string())),
         }
@@ -220,7 +220,7 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn release_working_pages(&mut self, this: Resource<Context>, num_pages: u32) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
-        context::release_pages(ctx.model_id, ctx.context_id, num_pages)?;
+        context::release_working_pages(ctx.model_id, ctx.context_id, num_pages as usize)?;
         Ok(())
     }
 

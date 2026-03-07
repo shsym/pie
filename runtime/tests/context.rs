@@ -163,13 +163,13 @@ fn full_page_lifecycle() {
         assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 32);
 
         // Reserve 2 pages (32 tokens / 16 per page) before committing
-        pie::context::reserve_pages(MODEL, id, 2).await.unwrap();
+        pie::context::reserve_working_pages(MODEL, id, 2).await.unwrap();
 
         // Working page count should be 2 (actual allocated pages)
         assert_eq!(pie::context::working_page_count(MODEL, id).await.unwrap(), 2);
 
         // ── Phase 3: Commit first page (positions 0..15) ──
-        pie::context::commit_pages(MODEL, id, 1).await.unwrap();
+        pie::context::commit_working_pages(MODEL, id, 1).await.unwrap();
 
         assert_eq!(pie::context::committed_page_count(MODEL, id).await.unwrap(), 1);
         // 16 filled tokens remain (second page's worth)
@@ -179,7 +179,7 @@ fn full_page_lifecycle() {
         );
 
         // ── Phase 4: Commit second page (positions 16..31) ──
-        pie::context::commit_pages(MODEL, id, 1).await.unwrap();
+        pie::context::commit_working_pages(MODEL, id, 1).await.unwrap();
 
         assert_eq!(pie::context::committed_page_count(MODEL, id).await.unwrap(), 2);
         assert_eq!(

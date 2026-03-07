@@ -122,7 +122,7 @@ impl PageStore {
 
 
     /// Number of free GPU pages in the pool.
-    pub fn free_gpu_pages(&self) -> usize {
+    pub fn available_gpu_pages(&self) -> usize {
         self.gpu.available()
     }
 
@@ -173,7 +173,7 @@ impl PageStore {
     /// Allocate `n` mutable GPU pages from the free pool only.
     /// Does NOT evict — eviction is the caller's responsibility.
     /// Returns None if not enough free pages.
-    pub fn alloc_working(&mut self, n: usize) -> Option<Vec<PhysicalPageId>> {
+    pub fn alloc_gpu_pages(&mut self, n: usize) -> Option<Vec<PhysicalPageId>> {
         if self.gpu.available() < n {
             return None;
         }
@@ -185,7 +185,7 @@ impl PageStore {
     }
 
     /// Free working pages back to the GPU pool.
-    pub fn free_working(&mut self, pages: &[PhysicalPageId]) {
+    pub fn free_gpu_pages(&mut self, pages: &[PhysicalPageId]) {
         for &p in pages {
             self.gpu.free(p);
         }
@@ -454,7 +454,7 @@ mod tests {
 
     /// Test helper: allocate a working page, then promote it via commit_working.
     fn alloc_and_commit(store: &mut PageStore, hash: PageHash, prev: PageHash) -> PhysicalPageId {
-        let working = store.alloc_working(1).unwrap()[0];
+        let working = store.alloc_gpu_pages(1).unwrap()[0];
         let (phys, _freed) = store.commit_working(hash, prev, working);
         phys
     }
@@ -492,7 +492,7 @@ mod tests {
         let phys1 = alloc_and_commit(&mut store, hashes[0], 0);
         assert_eq!(store.refcount(hashes[0]), 1);
 
-        let working2 = store.alloc_working(1).unwrap()[0];
+        let working2 = store.alloc_gpu_pages(1).unwrap()[0];
         let (phys2, freed) = store.commit_working(hashes[0], 0, working2);
         assert!(freed);
         assert_eq!(phys1, phys2);
@@ -572,26 +572,26 @@ mod tests {
     fn test_working_pages_alloc_free() {
         let mut store = PageStore::new(4, 10, 5);
 
-        let pages = store.alloc_working(3).unwrap();
+        let pages = store.alloc_gpu_pages(3).unwrap();
         assert_eq!(pages.len(), 3);
         assert_eq!(store.gpu.used(), 3);
 
-        store.free_working(&pages);
+        store.free_gpu_pages(&pages);
         assert_eq!(store.gpu.used(), 0);
     }
 
     #[test]
-    fn test_alloc_working_returns_none_when_full() {
+    fn test_alloc_gpu_pages_returns_none_when_full() {
         let mut store = PageStore::new(4, 3, 5);
 
-        let pages = store.alloc_working(3).unwrap();
+        let pages = store.alloc_gpu_pages(3).unwrap();
         assert_eq!(pages.len(), 3);
 
         // No more pages available
-        assert!(store.alloc_working(1).is_none());
+        assert!(store.alloc_gpu_pages(1).is_none());
 
-        store.free_working(&pages);
-        assert!(store.alloc_working(1).is_some());
+        store.free_gpu_pages(&pages);
+        assert!(store.alloc_gpu_pages(1).is_some());
     }
 
     #[test]
@@ -599,7 +599,7 @@ mod tests {
         let mut store = PageStore::new(4, 10, 5);
 
         // Allocate GPU working pages
-        let gpu_pages = store.alloc_working(2).unwrap();
+        let gpu_pages = store.alloc_gpu_pages(2).unwrap();
         assert_eq!(store.gpu.used(), 2);
 
         // Allocate CPU pages (simulating D2H copy target)
@@ -608,18 +608,18 @@ mod tests {
         assert_eq!(store.cpu.used(), 2);
 
         // Free GPU pages (simulating post-D2H swap-out)
-        store.free_working(&gpu_pages);
+        store.free_gpu_pages(&gpu_pages);
         assert_eq!(store.gpu.used(), 0);
 
         // Re-allocate GPU pages (simulating H2D swap-in target)
-        let new_gpu = store.alloc_working(2).unwrap();
+        let new_gpu = store.alloc_gpu_pages(2).unwrap();
         assert_eq!(store.gpu.used(), 2);
 
         // Free CPU pages (simulating post-H2D swap-in)
         store.free_cpu_pages(&cpu_pages);
         assert_eq!(store.cpu.used(), 0);
 
-        store.free_working(&new_gpu);
+        store.free_gpu_pages(&new_gpu);
     }
 
     #[test]
