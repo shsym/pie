@@ -7,7 +7,8 @@ use super::{
     Record,
 };
 use super::sched::ProcessState;
-use super::pagestore::{PhysicalPageId, compute_last_page_len};
+use super::suspend::DeferredOp;
+use super::pagestore::{PhysicalPageId, compute_last_page_len, compute_page_hashes};
 use crate::adapter::AdapterId;
 use crate::device::{self, DeviceId};
 use crate::inference;
@@ -102,7 +103,7 @@ impl ContextManager {
 
     /// Admission check: can this process be fully restored?
     /// Checks that all devices have enough free GPU pages for the process's
-    /// working pages (on CPU) plus replay pages plus pending_alloc requirements.
+    /// working pages (on CPU) plus replay pages plus deferred alloc requirements.
     pub(crate) fn can_restore_process(&mut self, pid: ProcessId) -> bool {
         let ctx_ids = match self.processes.get(&pid) {
             Some(p) => &p.context_ids,
@@ -114,10 +115,10 @@ impl ContextManager {
 
         for &ctx_id in ctx_ids {
             if let Some(ctx) = self.contexts.get(&ctx_id) {
-                if ctx.state != ContextState::Suspended { continue; }
+                if !ctx.is_suspended() { continue; }
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 // Working pages on CPU that need GPU allocation for swap-in
-                *required.entry(dev_idx).or_insert(0) += ctx.working_pages_cpu.len();
+                *required.entry(dev_idx).or_insert(0) += ctx.working_pages.len();
                 // Pages needing replay: walk chain, compute prefix match, count missing suffix
                 if let Some(tip_hash) = ctx.committed_tip {
                     let dev = &self.devices[dev_idx];
@@ -129,18 +130,14 @@ impl ContextManager {
             }
         }
 
-        // Add pending_alloc requirements
+        // Add deferred alloc requirements (Pin doesn't need extra pages)
         if let Some(proc) = self.processes.get(&pid) {
-            for alloc in &proc.pending_allocs {
+            if let Some(DeferredOp::Alloc(ref alloc)) = proc.deferred_op {
                 let dev_idx = alloc.device as usize;
                 *required.entry(dev_idx).or_insert(0) += alloc.num_pages;
             }
         }
 
-        // Evict unreferenced committed pages (rc=0) before checking (fix #6)
-        for &dev_idx in required.keys() {
-            self.devices[dev_idx].evict_unreferenced();
-        }
 
         // Check availability on all devices
         for (&dev_idx, &needed) in &required {
@@ -152,7 +149,7 @@ impl ContextManager {
         true
     }
 
-    /// Restore a process and replay its pending_allocs.
+    /// Restore a process and replay its deferred_op.
     /// Called by drain_queues after admission check passes.
     /// Returns replay chunks that need forward passes dispatched by the caller.
     pub(crate) fn restore_and_replay(&mut self, pid: ProcessId) -> Vec<ReplayFill> {
@@ -165,7 +162,7 @@ impl ContextManager {
         // Restore all suspended contexts
         for &ctx_id in &ctx_ids {
             let is_suspended = self.contexts.get(&ctx_id)
-                .map(|c| c.state == ContextState::Suspended)
+                .map(|c| c.is_suspended())
                 .unwrap_or(false);
             if is_suspended {
                 match self.restore_context(ctx_id) {
@@ -182,20 +179,26 @@ impl ContextManager {
             proc.state = ProcessState::Running;
         }
 
-        // Replay pending_allocs: allocate pages and fire response channels
-        let allocs = self.processes.get_mut(&pid)
-            .map(|p| std::mem::take(&mut p.pending_allocs))
-            .unwrap_or_default();
-        for alloc in allocs {
-            let dev_idx = alloc.device as usize;
-            if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(alloc.num_pages) {
-                self.apply_alloc(alloc.context_id, dev_idx, pages, Some(pid));
-                let _ = alloc.response.send(Ok(()));
-            } else {
-                // Shouldn't happen — admission check verified availability.
-                let _ = alloc.response.send(Err(anyhow::anyhow!(
-                    "Insufficient pages during restore replay (should not happen)"
-                )));
+        // Replay deferred operation: allocate pages / pin and fire response channel
+        let deferred = self.processes.get_mut(&pid)
+            .and_then(|p| p.deferred_op.take());
+        if let Some(op) = deferred {
+            match op {
+                DeferredOp::Alloc(alloc) => {
+                    let dev_idx = alloc.device as usize;
+                    if self.reserve_working_pages(alloc.context_id, dev_idx, alloc.num_pages, Some(pid)).is_ok() {
+                        let _ = alloc.response.send(Ok(()));
+                    } else {
+                        // Shouldn't happen — admission check verified availability.
+                        let _ = alloc.response.send(Err(anyhow::anyhow!(
+                            "Insufficient pages during restore replay (should not happen)"
+                        )));
+                    }
+                }
+                DeferredOp::Pin { context_id, num_input_tokens, response } => {
+                    let result = self.pin(context_id, num_input_tokens);
+                    let _ = response.send(result);
+                }
             }
         }
 
@@ -214,12 +217,12 @@ impl ContextManager {
     pub(crate) fn restore_context(&mut self, ctx_id: ContextId) -> anyhow::Result<Vec<ReplayFill>> {
         let ctx = self.contexts.get(&ctx_id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        if ctx.state != ContextState::Suspended {
+        if !ctx.is_suspended() {
             return Ok(Vec::new()); // Already active
         }
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let cpu_pages = ctx.working_pages_cpu.clone();
+        let cpu_pages = ctx.working_pages.clone();
         let tip = ctx.committed_tip;
         let owner = ctx.owner;
 
@@ -235,7 +238,6 @@ impl ContextManager {
 
             if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                 ctx.working_pages = gpu_pages.clone();
-                ctx.working_pages_cpu.clear();
             }
 
             // Track swap-in as working pages in scheduler
@@ -505,14 +507,14 @@ impl ContextManager {
         let working_phys = ctx.working_pages.clone();
         let owner = ctx.owner;
 
+        let hashes = compute_page_hashes(self.page_size, &tokens, &positions, &masks, prev_hash);
         let dev = &mut self.devices[dev_idx];
-        let hashes = dev.compute_page_hashes(&tokens, &positions, &masks, prev_hash);
 
         let mut new_phys = Vec::new();
         let mut running_prev = prev_hash;
         for (i, &hash) in hashes.iter().enumerate() {
             if i < working_phys.len() {
-                let (phys, _) = dev.commit_working(hash, running_prev, working_phys[i]);
+                let (phys, _) = dev.promote_page(hash, running_prev, working_phys[i]);
                 new_phys.push(phys);
             }
             running_prev = hash;

@@ -13,7 +13,7 @@ pub mod pagestore;
 pub(crate) mod sched;
 mod suspend;
 mod snapshot;
-mod restore;
+mod replay;
 
 use std::collections::{HashMap, VecDeque, BinaryHeap};
 use std::sync::LazyLock;
@@ -30,8 +30,8 @@ use crate::device::{self, DeviceId};
 
 use pagestore::{PhysicalPageId, PageHash, PageStore};
 use sched::ProcessEntry;
-use restore::ReplayFill;
-use suspend::{AllocWaiter, RestoreWaiter};
+use replay::ReplayFill;
+use suspend::{AllocWaiter, DeferredOp, RestoreWaiter};
 
 // =============================================================================
 // Public Types
@@ -256,10 +256,9 @@ pub(crate) struct Context {
     pub owner: Option<ProcessId>,
     /// Device this context is on (None if fully evicted).
     pub device: Option<DeviceId>,
-    /// Physical page IDs for uncommitted (working) pages on GPU.
+    /// Physical page IDs for uncommitted (working) pages.
+    /// On GPU when Active/Pinned, on CPU when Suspended.
     pub working_pages: Vec<PhysicalPageId>,
-    /// CPU pages for working pages when suspended.
-    pub working_pages_cpu: Vec<PhysicalPageId>,
     /// Tip of the committed hash chain (None if no commits yet).
     pub committed_tip: Option<PageHash>,
     /// Number of committed pages.
@@ -288,7 +287,6 @@ impl Context {
             owner,
             device: None,
             working_pages: Vec::new(),
-            working_pages_cpu: Vec::new(),
             committed_tip: None,
             lineage: Vec::new(),
             working_page_tokens: Vec::new(),
@@ -299,6 +297,10 @@ impl Context {
             last_access: Instant::now(),
         }
     }
+
+    pub fn is_active(&self) -> bool { self.state == ContextState::Active }
+    pub fn is_suspended(&self) -> bool { self.state == ContextState::Suspended }
+    pub fn is_pinned(&self) -> bool { self.state == ContextState::Pinned }
 }
 
 // =============================================================================
@@ -386,13 +388,23 @@ impl ContextManager {
             d.committed -= committed_len;
             d.working -= ctx.working_pages.len();
 
-            // Clean up empty process entries
-            if self.processes.get(&pid).map(|p| p.context_ids.is_empty()).unwrap_or(false) {
-                if let Some(entry) = self.processes.remove(&pid) {
-                    for alloc in entry.pending_allocs {
-                        let _ = alloc.response.send(Err(anyhow::anyhow!("Context destroyed")));
-                    }
+            // Cancel deferred_op if it references the destroyed context.
+            let cancel_deferred = match &proc.deferred_op {
+                Some(DeferredOp::Alloc(a)) => a.context_id == id,
+                Some(DeferredOp::Pin { context_id, .. }) => *context_id == id,
+                None => false,
+            };
+            if cancel_deferred {
+                match proc.deferred_op.take() {
+                    Some(DeferredOp::Alloc(a)) => { let _ = a.response.send(Err(anyhow::anyhow!("Context destroyed"))); }
+                    Some(DeferredOp::Pin { response, .. }) => { let _ = response.send(Err(anyhow::anyhow!("Context destroyed"))); }
+                    None => {}
                 }
+            }
+
+            // Clean up empty process entries
+            if proc.context_ids.is_empty() {
+                self.processes.remove(&pid);
             }
         }
 
@@ -410,16 +422,18 @@ impl ContextManager {
         // Release committed chain (skip if already released during suspension)
         if let Some(tip_hash) = ctx.committed_tip {
             let dev = &mut self.devices[dev_idx];
-            if ctx.state != ContextState::Suspended {
+            if !ctx.is_suspended() {
                 dev.release_chain(tip_hash);
             }
             dev.remove_index_cache(tip_hash);
         }
 
-        // Free GPU working pages
-        self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
-        // Free CPU working pages
-        self.devices[dev_idx].free_cpu_pages(&ctx.working_pages_cpu);
+        // Free working pages (GPU or CPU depending on state)
+        if ctx.is_suspended() {
+            self.devices[dev_idx].free_cpu_pages(&ctx.working_pages);
+        } else {
+            self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
+        }
 
         self.snapshots.retain(|_, v| *v != id);
 
@@ -432,62 +446,54 @@ impl ContextManager {
         let owner = ctx.owner;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let device = dev_idx as DeviceId;
+        let src_on_gpu = !ctx.is_suspended();
 
-        // Snapshot source state (borrows released before &mut self calls).
+        // Snapshot source state.
         let tip = ctx.committed_tip;
         let committed_len = ctx.committed_len;
         let max_pos = ctx.max_committed_position;
         let lineage = ctx.lineage.clone();
         let forked_tokens = ctx.working_page_tokens.clone();
 
-        // Determine source working pages: GPU-resident if active, CPU if suspended.
-        let (src, on_gpu) = if !ctx.working_pages.is_empty() {
-            (ctx.working_pages.clone(), true)
-        } else if !ctx.working_pages_cpu.is_empty() {
-            (ctx.working_pages_cpu.clone(), false)
-        } else {
-            (Vec::new(), true) // no working pages at all
-        };
+        //// REVIEW: I feel like clone here is not needed
+        let src = ctx.working_pages.clone();
 
-        // Share the committed chain with the fork.
         if let Some(h) = tip {
             self.devices[dev_idx].acquire_chain(h);
         }
 
-        // Clone working pages: try GPU first, fall back to CPU (→ suspended).
+        // Allocate destination pages: prefer GPU, fall back to CPU.
         let dev = &mut self.devices[dev_idx];
-        let (fork_gpu, fork_cpu, suspended) = if src.is_empty() {
-            (Vec::new(), Vec::new(), false)
-        } else if let Some(dst) = dev.alloc_gpu_pages(src.len()) {
-            let _ = if on_gpu {
-                device::copy_d2d(device, &src, &dst)
-            } else {
-                device::copy_h2d(device, &dst, &src)
-            };
-            (dst, Vec::new(), false)
-        } else if let Some(cpu) = dev.alloc_cpu_pages(src.len()) {
-            let _ = if on_gpu {
-                device::copy_d2h(device, &src, &cpu)
-            } else {
-                device::copy_h2h(device, &src, &cpu)
-            };
-            (Vec::new(), cpu, true)
+        let (dst, dst_on_gpu) = if src.is_empty() {
+            (Vec::new(), true)
+        } else if let Some(p) = dev.alloc_gpu_pages(src.len()) {
+            (p, true)
+        } else if let Some(p) = dev.alloc_cpu_pages(src.len()) {
+            (p, false)
         } else {
             anyhow::bail!("Out of memory")
         };
 
-        // Suspended fork can't use the committed chain — release it.
+        // Copy source → destination.
+        if !src.is_empty() {
+            let _ = match (src_on_gpu, dst_on_gpu) {
+                (true,  true)  => device::copy_d2d(device, &src, &dst),
+                (true,  false) => device::copy_d2h(device, &src, &dst),
+                (false, true)  => device::copy_h2d(device, &dst, &src),
+                (false, false) => device::copy_h2h(device, &src, &dst),
+            };
+        }
+
+        let suspended = !dst_on_gpu;
         if suspended {
             if let Some(h) = tip { self.devices[dev_idx].release_chain(h); }
         }
 
-        let n_working = fork_gpu.len();
         let new_id = self.next_id();
         self.contexts.insert(new_id, Context {
             owner,
             device: Some(device),
-            working_pages: fork_gpu,
-            working_pages_cpu: fork_cpu,
+            working_pages: dst,
             committed_tip: tip,
             committed_len,
             max_committed_position: max_pos,
@@ -503,7 +509,7 @@ impl ContextManager {
             proc.context_ids.push(new_id);
             if !suspended {
                 let d = proc.device_mut(dev_idx);
-                d.working += n_working;
+                d.working += src.len();
                 d.committed += committed_len;
             }
         }
@@ -513,49 +519,195 @@ impl ContextManager {
 
     // ==================== Page Management ====================
 
+    /// Handle a ReserveWorkingPages message per DESIGN.md §4 (steps 0–6).
+    pub(crate) fn request_reserve_working_pages(
+        &mut self,
+        id: ContextId,
+        num_pages: usize,
+        response: oneshot::Sender<anyhow::Result<()>>,
+    ) {
+        if num_pages == 0 {
+            let _ = response.send(Ok(()));
+            return;
+        }
+
+        let ctx = match self.contexts.get(&id) {
+            Some(c) => c,
+            None => { let _ = response.send(Err(anyhow::anyhow!("Context not found"))); return; }
+        };
+        let dev_idx = ctx.device.unwrap_or(0) as usize;
+        let owner = ctx.owner;
+        let current_working = ctx.working_pages.len();
+
+        let additional = num_pages.saturating_sub(current_working);
+        if additional == 0 {
+            let _ = response.send(Ok(()));
+            return;
+        }
+
+        // Alloc is only possible through an owning process.
+        let pid = match owner {
+            Some(pid) => pid,
+            None => { let _ = response.send(Err(anyhow::anyhow!("Context has no owning process"))); return; }
+        };
+
+        // Step 0: SUSPENSION CHECK
+        // If the owning process is Pending, store as deferred_op.
+        let proc = self.process_entry(pid);
+        if proc.state == sched::ProcessState::Pending {
+            proc.deferred_op = Some(DeferredOp::Alloc(AllocWaiter {
+                context_id: id, device: dev_idx,
+                num_pages: additional, response,
+            }));
+            return;
+        }
+
+        // Step 1: FIFO GATE — if try_alloc has pending requests, enqueue behind them.
+        if !self.try_alloc.is_empty() {
+            self.try_alloc.push_back(suspend::AllocWaiter {
+                context_id: id, device: dev_idx,
+                num_pages: additional, response,
+            });
+            return;
+        }
+
+        // Step 2: PRIORITY GATE — compare requester floor vs try_restore head.
+        let requester_floor = {
+            let proc = self.process_entry(pid);
+            let pages = proc.pages_on(dev_idx);
+            proc.weight * (pages + additional) as f64
+        };
+
+        if let Some(top) = self.try_restore.peek() {
+            let top_pid = top.process_id;
+            let top_ready = self.processes.get(&top_pid).map(|p| p.pending_pinned == 0).unwrap_or(true);
+            if top_ready && requester_floor < top.effective_priority() {
+                // Requester loses priority gate → suspend and enqueue in try_restore.
+                let (pinned, _) = self.suspend_process(pid);
+                self.enqueue_restore(pid, requester_floor, pinned);
+                self.process_entry(pid).deferred_op = Some(DeferredOp::Alloc(AllocWaiter {
+                    context_id: id, device: dev_idx,
+                    num_pages: additional, response,
+                }));
+                return;
+            }
+        }
+
+        // Step 3: TRY ALLOCATE from free pool.
+        if self.reserve_working_pages(id, dev_idx, additional, Some(pid)).is_ok() {
+            let _ = response.send(Ok(()));
+            return;
+        }
+
+
+        // Step 4: EVICTION LOOP — with deferred page tracking.
+        // Instead of breaking on first Pinned encounter, we continue evicting
+        // and track how many pages will eventually be freed when Pinned contexts
+        // clear. We stop once free + deferred >= needed.
+        let mut deferred_pages: usize = 0;
+        let mut has_deferred = false;
+
+        loop {
+            match self.find_eviction_victim(dev_idx, requester_floor, Some(pid)) {
+                Some(victim_pid) => {
+                    let victim_floor = self.processes.get(&victim_pid)
+                        .map(|e| e.priority_on(dev_idx)).unwrap_or(0.0);
+                    let estimate = self.estimate_suspend(victim_pid, dev_idx);
+                    let (pinned, _) = self.suspend_process(victim_pid);
+                    self.enqueue_restore(victim_pid, victim_floor, pinned);
+
+                    // Accumulate deferred page count from Pinned contexts.
+                    if estimate.pinned_count > 0 {
+                        deferred_pages += estimate.total_deferred();
+                        has_deferred = true;
+                    }
+
+                    // Retry alloc after victim suspension freed pages.
+                    if self.reserve_working_pages(id, dev_idx, additional, Some(pid)).is_ok() {
+                        let _ = response.send(Ok(()));
+                        self.drain_queues();
+                        return;
+                    }
+
+                    // Check: will deferred pages close the gap?
+                    if has_deferred {
+                        let free_now = self.devices[dev_idx].available_gpu_pages();
+                        if free_now + deferred_pages >= additional {
+                            break; // Deferred pages will cover it
+                        }
+                    }
+                    // Not enough even with deferred — keep looking for victims.
+                }
+                None => break,
+            }
+        }
+
+        if has_deferred {
+            // Deferred pages from Pinned contexts will cover the gap.
+            // Enqueue in try_alloc (requester stays Running).
+            self.try_alloc.push_back(suspend::AllocWaiter {
+                context_id: id, device: dev_idx,
+                num_pages: additional, response,
+            });
+        } else {
+            // Step 5: NO VICTIM — requester self-suspends.
+            let (pinned, _) = self.suspend_process(pid);
+            self.enqueue_restore(pid, requester_floor, pinned);
+            self.process_entry(pid).deferred_op = Some(DeferredOp::Alloc(AllocWaiter {
+                context_id: id, device: dev_idx,
+                num_pages: additional, response,
+            }));
+        }
+    }
+
+    /// Try to allocate GPU working pages for a context.
+    pub(crate) fn reserve_working_pages(
+        &mut self,
+        id: ContextId,
+        dev_idx: usize,
+        num_pages: usize,
+        owner: Option<ProcessId>,
+    ) -> Result<()> {
+        let pages = self.devices[dev_idx].alloc_gpu_pages(num_pages)
+            .ok_or_else(|| anyhow::anyhow!("Insufficient GPU pages (need {num_pages})"))?;
+        let n = pages.len();
+        if let Some(ctx) = self.contexts.get_mut(&id) {
+            ctx.working_pages.extend(pages);
+            ctx.device = Some(dev_idx);
+        }
+        if let Some(pid) = owner {
+            self.process_entry(pid).device_mut(dev_idx).working += n;
+        }
+        Ok(())
+    }
+
+    
+
     pub(crate) fn release_working_pages(&mut self, id: ContextId, num_pages: usize) -> Result<()> {
         let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         if num_pages == 0 { return Ok(()); }
+        if num_pages > ctx.working_pages.len() {
+            anyhow::bail!("release: requested {num_pages}, have {}", ctx.working_pages.len());
+        }
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let owner = ctx.owner;
-        let suspended = ctx.state == ContextState::Suspended;
+        let suspended = ctx.is_suspended();
 
-        // Determine source: GPU working pages (Active/Pinned) or CPU pages (Suspended)
-        let (to_free, on_cpu) = if !ctx.working_pages.is_empty() {
-            if num_pages > ctx.working_pages.len() {
-                anyhow::bail!("release: requested {num_pages}, have {}", ctx.working_pages.len());
-            }
-            let start = ctx.working_pages.len() - num_pages;
-            (ctx.working_pages.drain(start..).collect::<Vec<_>>(), false)
-        } else if !ctx.working_pages_cpu.is_empty() {
-            if num_pages > ctx.working_pages_cpu.len() {
-                anyhow::bail!("release: requested {num_pages}, have {}", ctx.working_pages_cpu.len());
-            }
-            let start = ctx.working_pages_cpu.len() - num_pages;
-            (ctx.working_pages_cpu.drain(start..).collect::<Vec<_>>(), true)
-        } else {
-            anyhow::bail!("release: no working pages");
-        };
+        let start = ctx.working_pages.len() - num_pages;
+        let to_free: Vec<_> = ctx.working_pages.drain(start..).collect();
 
         // Truncate working page tokens
         let tokens_to_remove = num_pages * self.page_size;
-        if tokens_to_remove > 0 {
-            let len = ctx.working_page_tokens.len();
-            ctx.working_page_tokens.truncate(len.saturating_sub(tokens_to_remove));
-        }
+        let len = ctx.working_page_tokens.len();
+        ctx.working_page_tokens.truncate(len.saturating_sub(tokens_to_remove));
 
-        if on_cpu {
+        if suspended {
             self.devices[dev_idx].free_cpu_pages(&to_free);
         } else {
             self.devices[dev_idx].free_gpu_pages(&to_free);
-        }
-
-        // Scheduler accounting: skip for Suspended (already zeroed during suspension)
-        if !suspended {
             if let Some(pid) = owner {
-                let d = self.process_entry(pid).device_mut(dev_idx);
-                d.working -= num_pages;
+                self.process_entry(pid).device_mut(dev_idx).working -= num_pages;
             }
         }
         self.drain_queues();
@@ -565,55 +717,36 @@ impl ContextManager {
     pub(crate) fn commit_working_pages(&mut self, id: ContextId, num_pages: usize) -> Result<()> {
         let page_size = self.page_size;
         let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-
         if num_pages == 0 { return Ok(()); }
-
-        // Determine source: GPU working pages (Active/Pinned) or CPU pages (Suspended)
-        let suspended = ctx.state == ContextState::Suspended;
-        let source_len = if !ctx.working_pages.is_empty() {
-            ctx.working_pages.len()
-        } else if !ctx.working_pages_cpu.is_empty() {
-            ctx.working_pages_cpu.len()
-        } else {
-            anyhow::bail!("Cannot commit: context has no working pages");
-        };
-
-        if num_pages > source_len {
-            anyhow::bail!("Cannot commit {} pages, only {} working pages available", num_pages, source_len);
+        if num_pages > ctx.working_pages.len() {
+            anyhow::bail!("commit: requested {num_pages}, have {}", ctx.working_pages.len());
         }
+
+        let total_tokens = num_pages * page_size;
+        if total_tokens > ctx.working_page_tokens.len() {
+            anyhow::bail!("commit: need {total_tokens} tokens, have {}", ctx.working_page_tokens.len());
+        }
+
+        let suspended = ctx.is_suspended();
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let old_tip = ctx.committed_tip;
-        let prev_hash = ctx.committed_tip.unwrap_or(0);
-        let working_phys: Vec<PhysicalPageId> = ctx.working_pages.get(..num_pages)
-            .map(|s| s.to_vec()).unwrap_or_default();
-        let working_cpu: Vec<PhysicalPageId> = if suspended {
-            ctx.working_pages_cpu.get(..num_pages).map(|s| s.to_vec()).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let prev_hash = old_tip.unwrap_or(0);
         let owner = ctx.owner;
+        let pages = ctx.working_pages[..num_pages].to_vec();
 
-        // Read token data from the Context
-        let mut tokens = Vec::new();
-        let mut positions = Vec::new();
-        let mut masks = Vec::new();
-        let mut all_positions = Vec::new();
-
-        let total_needed = num_pages * page_size;
-        if total_needed > ctx.working_page_tokens.len() {
-            anyhow::bail!("Cannot commit {} pages: need {} tokens but only have {}",
-                num_pages, total_needed, ctx.working_page_tokens.len());
-        }
-        for i in 0..total_needed {
-            let info = &ctx.working_page_tokens[i];
+        // Extract token data for the pages being committed.
+        let mut tokens = Vec::with_capacity(total_tokens);
+        let mut positions = Vec::with_capacity(total_tokens);
+        let mut masks = Vec::with_capacity(total_tokens);
+        for info in &ctx.working_page_tokens[..total_tokens] {
             tokens.push(info.token);
             positions.push(info.position);
             masks.push(info.mask.clone());
-            all_positions.push(info.position);
         }
 
+        // Validate positions are strictly after any previously committed position.
         if let Some(max_committed) = ctx.max_committed_position {
-            for &pos in &all_positions {
+            for &pos in &positions {
                 if pos <= max_committed {
                     anyhow::bail!("Position {} must be > max committed position {}", pos, max_committed);
                 }
@@ -621,47 +754,42 @@ impl ContextManager {
         }
         let lineage_adapter = ctx.working_page_tokens.first().and_then(|t| t.adapter);
 
-        // Compute hashes (content-only, no physical page IDs needed)
+        // Compute content-based hashes (no physical page IDs needed).
+        let hashes = pagestore::compute_page_hashes(page_size, &tokens, &positions, &masks, prev_hash);
         let dev = &mut self.devices[dev_idx];
-        let hashes = dev.compute_page_hashes(&tokens, &positions, &masks, prev_hash);
-
         let new_tip = *hashes.last()
-            .ok_or_else(|| anyhow::anyhow!("No page hashes computed during commit"))?;
+            .ok_or_else(|| anyhow::anyhow!("No page hashes computed"))?;
 
+        // Commit: physical (GPU promotion + dedup) or logical (chain metadata only).
         if suspended {
-            // Logical commit: register chain links only (no GPU page entries).
-            // The restore path will detect these as non-resident and replay them.
-            let mut running_prev = prev_hash;
+            let mut prev = prev_hash;
             for &hash in &hashes {
-                dev.insert_chain_link(hash, running_prev);
-                running_prev = hash;
+                dev.insert_chain_link(hash, prev);
+                prev = hash;
             }
-            // Free CPU pages that held the working data
-            dev.free_cpu_pages(&working_cpu);
-            // No index_cache update — no GPU physical pages to cache.
+            dev.free_cpu_pages(&pages);
         } else {
-            // Physical commit: promote GPU working pages via commit_working (dedup).
-            let mut new_phys = Vec::new();
-            let mut running_prev = prev_hash;
+            let mut new_phys = Vec::with_capacity(num_pages);
+            let mut prev = prev_hash;
             for (i, &hash) in hashes.iter().enumerate() {
-                let (phys, _freed) = dev.commit_working(hash, running_prev, working_phys[i]);
+                let (phys, _) = dev.promote_page(hash, prev, pages[i]);
                 new_phys.push(phys);
-                running_prev = hash;
+                prev = hash;
             }
             dev.update_index_cache(new_tip, old_tip, &new_phys);
         }
 
-        // Update Context (local)
+        // Update context state.
         let ctx = self.contexts.get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context lost during commit"))?;
-        if suspended {
-            ctx.working_pages_cpu.drain(..num_pages);
-        } else {
-            ctx.working_pages.drain(..num_pages);
-        }
+        ctx.working_pages.drain(..num_pages);
+        ctx.working_page_tokens.drain(..total_tokens);
         ctx.committed_tip = Some(new_tip);
+        ctx.committed_len += num_pages;
+        ctx.max_committed_position = positions.iter().copied().max()
+            .or(ctx.max_committed_position);
 
-        // Append to lineage
+        // Append to lineage (merge with last record if same adapter).
         if let Some(Record::Fill { tokens: t, positions: p, mask: m, adapter: a }) = ctx.lineage.last_mut() {
             if *a == lineage_adapter {
                 t.extend_from_slice(&tokens);
@@ -674,13 +802,7 @@ impl ContextManager {
             ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter });
         }
 
-        // Update token data on Context
-        ctx.working_page_tokens.drain(..total_needed);
-        ctx.committed_len += num_pages;
-        ctx.max_committed_position = all_positions.iter().copied().max()
-            .or(ctx.max_committed_position);
-
-        // Scheduler accounting: skip for Suspended (already zeroed during suspension)
+        // Scheduler accounting (skip for Suspended — already zeroed).
         if !suspended {
             if let Some(pid) = owner {
                 let d = self.process_entry(pid).device_mut(dev_idx);
@@ -693,6 +815,53 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Try to pin a context for a forward pass.
+    ///
+    /// If the context is Active, transitions to Pinned and sends the result
+    /// immediately. If the owning process is Pending (suspended), the pin is
+    /// deferred as a `DeferredOp::Pin` — the caller awaits the oneshot and
+    /// resumes automatically after restoration.
+    pub(crate) fn request_pin(
+        &mut self,
+        id: ContextId,
+        num_input_tokens: u32,
+        response: oneshot::Sender<Result<PinnedContext>>,
+    ) {
+        let ctx = match self.contexts.get(&id) {
+            Some(c) => c,
+            None => { let _ = response.send(Err(anyhow::anyhow!("Context not found"))); return; }
+        };
+
+        // Extract what we need before dropping the immutable borrow.
+        let is_active = ctx.is_active();
+        let owner = ctx.owner;
+        let state = ctx.state;
+
+        // If context is not Active, check if the process is Pending → defer.
+        if !is_active {
+            if let Some(pid) = owner {
+                let proc = self.process_entry(pid);
+                if proc.state == sched::ProcessState::Pending {
+                    proc.deferred_op = Some(DeferredOp::Pin {
+                        context_id: id,
+                        num_input_tokens,
+                        response,
+                    });
+                    return;
+                }
+            }
+            let _ = response.send(Err(anyhow::anyhow!("request_pin: context not active (state={:?})", state)));
+            return;
+        }
+
+        let result = self.pin(id, num_input_tokens);
+        let _ = response.send(result);
+    }
+
+    /// Core pin logic: resolve physical pages, transition to Pinned.
+    /// Accepts Active or Pinned contexts (Pinned for deferred pins replayed
+    /// while restore replay is still in-flight).
+    /// Called by `request_pin()` directly and by `restore_and_replay()` for deferred pins.
     pub(crate) fn pin(&mut self, id: ContextId, num_input_tokens: u32) -> Result<PinnedContext> {
         let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
@@ -700,11 +869,10 @@ impl ContextManager {
         let working = ctx.working_pages.clone();
         let kv_len = (ctx.committed_len * self.page_size + ctx.working_page_tokens.len()) as u32;
 
-        // Transition Active → Pinned: prevents eviction while process holds page IDs.
-        // Eviction of Pinned contexts is deferred via `pending_suspend` flag.
-        if ctx.state == ContextState::Active {
-            ctx.state = ContextState::Pinned;
+        if ctx.is_suspended() {
+            anyhow::bail!("pin: context is suspended (cannot pin)");
         }
+        ctx.state = ContextState::Pinned;
 
         let mut page_ids = Vec::new();
 
@@ -725,18 +893,89 @@ impl ContextManager {
         Ok(PinnedContext { device: dev_idx as DeviceId, pages: page_ids, kv_len, last_page_len })
     }
 
-    // ==================== Extracted handle() helpers ====================
+    /// Handle ClearPinned message: Pinned → Active, then check deferred suspension.
+    /// If `pending_suspend` was set, executes the deferred suspension and
+    /// decrements `ProcessEntry.pending_pinned`.
+    pub(crate) fn unpin(&mut self, id: ContextId) {
+        let (is_pinned, pending) = match self.contexts.get(&id) {
+            Some(ctx) if ctx.is_pinned() => (true, ctx.pending_suspend),
+            _ => return,
+        };
 
-    pub(crate) fn open(&mut self, username: String, name: String) -> Result<ContextId> {
-        match self.snapshots.get(&(username, name)) {
-            Some(&snapshot_id) => self.fork(snapshot_id),
-            None => Err(anyhow::anyhow!("Snapshot not found")),
+        if !is_pinned { return; }
+
+        if pending {
+            // Deferred suspension: context stays Pinned until suspend_context
+            // transitions it to Suspended.
+            let owner = self.contexts.get(&id).and_then(|c| c.owner);
+            self.suspend_context(id);
+
+            // Decrement pending_pinned_count for the owning process.
+            if let Some(pid) = owner {
+                if let Some(proc) = self.processes.get_mut(&pid) {
+                    proc.pending_pinned = proc.pending_pinned.saturating_sub(1);
+                }
+            }
+
+            // Deferred suspension may have freed pages — drain queues.
+            self.drain_queues();
+            return;
+        }
+
+        // No deferred suspension — normal Pinned → Active transition.
+        if let Some(ctx) = self.contexts.get_mut(&id) {
+            ctx.state = ContextState::Active;
         }
     }
 
-    pub(crate) fn unpin(&mut self, id: ContextId) {
-        self.handle_clear_pinned(id);
+    /// Central queue drain: called after any event that frees GPU pages.
+    ///
+    /// Phase 1: try_alloc (FIFO) — serve front-of-queue allocations.
+    /// Phase 2: try_restore (priority heap) — restore highest-priority Pending
+    ///          process, then replay its deferred_op.
+    pub(crate) fn drain_queues(&mut self) {
+        // Phase 1: try_alloc FIFO (head-of-line blocking)
+        while let Some(front) = self.try_alloc.front() {
+            let dev_idx = front.device as usize;
+            let n = front.num_pages;
+            let ctx_id = front.context_id;
+            // End borrow of `front` before accessing self.contexts / &mut self.
+            let _ = front;
+
+            let owner = self.contexts.get(&ctx_id).and_then(|c| c.owner);
+            if self.reserve_working_pages(ctx_id, dev_idx, n, owner).is_ok() {
+                let waiter = self.try_alloc.pop_front().unwrap();
+                let _ = waiter.response.send(Ok(()));
+            } else {
+                break; // Not enough pages for front of queue
+            }
+        }
+
+        // Phase 2: try_restore (priority heap)
+        // Only proceed if try_alloc is empty (allocs have strict priority).
+        if !self.try_alloc.is_empty() { return; }
+
+        while let Some(top) = self.try_restore.peek() {
+            let pid = top.process_id;
+
+            // Block if still has Pinned contexts clearing.
+            if self.processes.get(&pid).map(|p| p.pending_pinned).unwrap_or(0) > 0 {
+                break;
+            }
+
+            // Admission check: enough pages on all devices?
+            if !self.can_restore_process(pid) {
+                break;
+            }
+
+            let waiter = self.try_restore.pop().unwrap();
+            let chunks = self.restore_and_replay(waiter.process_id);
+            self.pending_replays.extend(chunks);
+        }
     }
+
+    // ==================== Extracted handle() helpers ====================
+
 
     pub(crate) fn stats(&self) -> Vec<(usize, usize)> {
         self.devices.iter().map(|d| d.stats()).collect()
@@ -874,13 +1113,13 @@ impl ServiceHandler for ContextManager {
                 let _ = response.send(self.commit_working_pages(id, num_pages));
             }
             Message::ReserveWorkingPages { id, num_pages, response } => {
-                self.handle_reserve_working_pages(id, num_pages, response);
+                self.request_reserve_working_pages(id, num_pages, response);
             }
             Message::ReleaseWorkingPages { id, num_pages } => {
                 let _ = self.release_working_pages(id, num_pages);
             }
             Message::Pin { id, num_input_tokens, response } => {
-                let _ = response.send(self.pin(id, num_input_tokens));
+                self.request_pin(id, num_input_tokens, response);
             }
             Message::Unpin { id } => {
                 self.unpin(id);
