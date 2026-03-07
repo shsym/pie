@@ -24,7 +24,7 @@ use crate::device::DeviceId;
 use crate::process::ProcessId;
 
 use super::{ContextId, ContextManager};
-use super::suspend::AllocWaiter;
+use super::suspend::DeferredOp;
 
 // =============================================================================
 // DevicePages (per-device accounting)
@@ -68,9 +68,9 @@ pub(crate) struct ProcessEntry {
     /// Number of Pinned contexts still awaiting clear_pinned.
     /// Restore is blocked until this reaches 0.
     pub pending_pinned: usize,
-    /// Pending alloc requests accumulated while Pending.
+    /// Deferred operation held while Pending (at most one — WASM guest is single-threaded).
     /// Replayed after restoration completes.
-    pub pending_allocs: Vec<AllocWaiter>,
+    pub deferred_op: Option<DeferredOp>,
 }
 
 impl ProcessEntry {
@@ -82,7 +82,7 @@ impl ProcessEntry {
             state: ProcessState::Running,
             context_ids: Vec::new(),
             pending_pinned: 0,
-            pending_allocs: Vec::new(),
+            deferred_op: None,
         }
     }
 

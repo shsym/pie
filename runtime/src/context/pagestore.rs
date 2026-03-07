@@ -9,7 +9,6 @@
 
 use std::hash::{Hash, Hasher};
 
-use anyhow::Result;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::inference::brle::Brle;
@@ -197,15 +196,21 @@ impl PageStore {
     }
 
     /// Decrement refcount for every page reachable from `tip`.
-    /// Returns hashes that hit refcount=0 (candidates for eviction).
-    pub fn release_chain(&mut self, tip: PageHash) -> Vec<PageHash> {
-        let mut evictable = Vec::new();
+    /// Pages that hit rc=0 are eagerly evicted: removed from `self.pages`
+    /// and their GPU physical page freed back to the pool.
+    /// Chain links (`self.chain`) are preserved for restore-path traversal.
+    /// Returns the number of GPU pages freed.
+    pub fn release_chain(&mut self, tip: PageHash) -> usize {
+        let mut freed = 0;
         let mut h = tip;
         loop {
             if let Some((_, rc)) = self.pages.get_mut(&h) {
                 *rc = rc.saturating_sub(1);
                 if *rc == 0 {
-                    evictable.push(h);
+                    if let Some((gpu_phys, _)) = self.pages.remove(&h) {
+                        self.gpu.free(gpu_phys);
+                        freed += 1;
+                    }
                 }
             }
             match self.chain.get(&h) {
@@ -213,11 +218,11 @@ impl PageStore {
                 _ => break,
             }
         }
-        evictable
+        freed
     }
 
-    /// Estimate how many GPU-resident pages would become evictable (rc→0)
-    /// if `release_chain(tip)` were called followed by `evict_unreferenced()`.
+    /// Estimate how many GPU-resident pages would be freed (rc→0)
+    /// if `release_chain(tip)` were called.
     /// Read-only: does not modify refcounts.
     pub fn estimate_chain_release(&self, tip: PageHash) -> usize {
         let mut count = 0;
@@ -270,22 +275,7 @@ impl PageStore {
     // Eviction
     // =========================================================================
 
-    /// Evict all unreferenced committed pages (rc=0) from GPU.
-    /// Returns the number of GPU pages freed.
-    pub fn evict_unreferenced(&mut self) -> usize {
-        let victims: Vec<PageHash> = self.pages.iter()
-            .filter(|(_, (_, rc))| *rc == 0)
-            .map(|(&h, _)| h)
-            .collect();
 
-        let freed = victims.len();
-        for hash in victims {
-            if let Some((gpu_phys, _)) = self.pages.remove(&hash) {
-                self.gpu.free(gpu_phys);
-            }
-        }
-        freed
-    }
 
 
     // =========================================================================
@@ -532,15 +522,15 @@ mod tests {
         assert_eq!(store.refcount(hashes[0]), 2);
         assert_eq!(store.refcount(hashes[1]), 2);
 
-        let evictable = store.release_chain(hashes[1]);
-        assert!(evictable.is_empty());
+        let freed = store.release_chain(hashes[1]);
+        assert_eq!(freed, 0);
         assert_eq!(store.refcount(hashes[0]), 1);
         assert_eq!(store.refcount(hashes[1]), 1);
 
-        let evictable = store.release_chain(hashes[1]);
-        assert_eq!(evictable.len(), 2);
-        assert_eq!(store.refcount(hashes[0]), 0);
-        assert_eq!(store.refcount(hashes[1]), 0);
+        let freed = store.release_chain(hashes[1]);
+        assert_eq!(freed, 2);
+        assert!(!store.is_gpu_resident(hashes[0]));
+        assert!(!store.is_gpu_resident(hashes[1]));
     }
 
     #[test]
@@ -570,9 +560,10 @@ mod tests {
         // Estimate from shared tip: hashes[0]:rc=2, hashes[1]:rc=2 → 0 evictable
         assert_eq!(store.estimate_chain_release(hashes[1]), 0);
 
-        // Verify estimate matches actual release
-        let actual = store.release_chain(hashes[2]);
-        assert_eq!(actual.len(), 1); // Only hashes[2] hit rc=0
+        // Verify release matches estimate: only hashes[2] hit rc=0
+        let freed = store.release_chain(hashes[2]);
+        assert_eq!(freed, 1);
+        assert!(!store.is_gpu_resident(hashes[2]));
     }
 
     #[test]
@@ -590,14 +581,13 @@ mod tests {
         store.acquire_chain(hashes[1]);
         store.release_chain(hashes[1]);
 
-        let freed = store.evict_unreferenced();
-        assert_eq!(freed, 0);
+        // Shared pages (rc=1) survive — not freed by release_chain
         assert!(store.is_gpu_resident(hashes[0]));
         assert!(store.is_gpu_resident(hashes[1]));
     }
 
     #[test]
-    fn test_evict_unreferenced() {
+    fn test_release_chain_frees_unreferenced() {
         let mut store = PageStore::new(4, 10, 5);
 
         let tokens: Vec<u32> = (0..4).collect();
@@ -607,9 +597,7 @@ mod tests {
 
         alloc_and_commit(&mut store, hashes[0], 0);
 
-        store.release_chain(hashes[0]);
-
-        let freed = store.evict_unreferenced();
+        let freed = store.release_chain(hashes[0]);
         assert_eq!(freed, 1);
         assert!(!store.is_gpu_resident(hashes[0]));
     }

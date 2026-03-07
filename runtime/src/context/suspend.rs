@@ -37,6 +37,21 @@ pub(crate) struct AllocWaiter {
     pub response: oneshot::Sender<anyhow::Result<()>>,
 }
 
+/// A deferred operation held while a process is Pending (suspended).
+/// At most one can be active per process — the WASM guest is single-threaded
+/// and blocked on the response channel.
+#[derive(Debug)]
+pub(crate) enum DeferredOp {
+    /// Deferred page allocation (from `reserve_working_pages`).
+    Alloc(AllocWaiter),
+    /// Deferred pin (from `pin` on a non-active context).
+    Pin {
+        context_id: ContextId,
+        num_input_tokens: u32,
+        response: oneshot::Sender<anyhow::Result<super::PinnedContext>>,
+    },
+}
+
 /// A deferred process restoration request (try_restore queue).
 #[derive(Debug)]
 pub(crate) struct RestoreWaiter {
@@ -317,10 +332,5 @@ impl ContextManager {
             ctx.state = ContextState::Suspended;
             ctx.pending_suspend = false;
         }
-
-        // NOTE: evict_unreferenced is NOT called here per DESIGN.md §4:
-        // "it does not clean up unreferenced (rc=0) pages. It's the role of reserve_working_pages."
-        // This ensures separation: suspend_context only releases refcounts,
-        // reserve_working_pages (step 4) handles the actual eviction.
     }
 }

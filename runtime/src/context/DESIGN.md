@@ -114,8 +114,8 @@ Key operations:
 | `free_gpu_pages(pages)` | Return GPU pages to free pool |
 | `commit_working(hash, prev, phys)` | Promote working → committed (dedup-aware) |
 | `acquire_chain(tip)` | Increment refcounts root→tip |
-| `release_chain(tip)` | Decrement refcounts, return rc=0 hashes |
-| `evict_unreferenced()` | Free GPU pages for rc=0 committed pages |
+| `release_chain(tip)` | Decrement refcounts, eagerly free rc=0 pages |
+
 | `swap_out(gpu_pages)` | Alloc CPU slots, build D2H SwapOps |
 | `swap_in(cpu_slots)` | Alloc GPU pages, build H2D SwapOps |
 | `longest_prefix_length(hashes)` | Read-only prefix match (for restore planning) |
@@ -158,7 +158,7 @@ Tie-breaking (cheapest first):
 ```
 0. SUSPENSION CHECK: If ctx.state == Suspended
    → find RestoreWaiter for this process in try_restore
-   → add this alloc request to RestoreWaiter.pending_allocs (hold response channel)
+   → store this request as DeferredOp::Alloc on ProcessEntry.deferred_op (hold response channel)
    → return
 
 1. FIFO GATE: If try_alloc is non-empty
@@ -170,16 +170,13 @@ Tie-breaking (cheapest first):
    → suspend ALL of requester's contexts (Active immediately, Pinned deferred)
    → set requester state = Pending
    → Create RestoreWaiter and enqueue in try_restore
-     (with pending_allocs = this request, pending_pinned_count = number of Pinned contexts)
+     (with deferred_op = DeferredOp::Alloc for this request, pending_pinned_count = number of Pinned contexts)
    → return
 
 3. TRY ALLOCATE from free pool
    → success: return pages
 
-4. EVICT unreferenced committed pages (rc=0)
-   → retry alloc, if success: return pages
-
-5. EVICTION LOOP — with deferred page tracking
+4. EVICTION LOOP — with deferred page tracking
    deferred_pages = 0   // pages that will free when Pinned contexts clear
    loop:
      a. SELECT VICTIM via Arbiter floor rule
@@ -200,10 +197,10 @@ Tie-breaking (cheapest first):
    If deferred_pages > 0:
      → enqueue in try_alloc (FIFO), return (pages will free on clear_pinned)
 
-6. NO VICTIM, REQUESTER LOSES
+5. NO VICTIM, REQUESTER LOSES
    Suspend ALL of requester's contexts (Active immediately, Pinned deferred)
    Set requester state = Pending
-   Enqueue in try_restore (with pending_allocs, pending_pinned_count = number of Pinned contexts)
+   Enqueue in try_restore (with deferred_op, pending_pinned_count = number of Pinned contexts)
    Return
 ```
 
@@ -218,8 +215,7 @@ Phase 1: Swap working pages GPU → CPU
    If CPU pool full → OOM the owning process
 
 Phase 2: Release committed chain
-   release_chain(committed_tip) → decrement refcounts
-   * it does not clean up unreferenced (rc=0) pages. It's the role of reserve_pages.
+   release_chain(committed_tip) → decrement refcounts, free rc=0 pages
    Remove committed_tip
 
 Phase 3: Update state
@@ -265,7 +261,7 @@ drain_queues():
         can_restore = for ALL devices d that process has contexts on:
             required[d] = working_cpu_count[d]
                         + pages_needing_replay[d]
-                        + pending_alloc_pages[d]  // from RestoreWaiter.pending_allocs
+                        + deferred_alloc_pages[d]  // from ProcessEntry.deferred_op (Alloc variant)
             available[d] >= required[d]
         if can_restore:
             pop top → restore_process(top)
@@ -288,17 +284,20 @@ Only processes that passed the priority gate AND won eviction comparison can ent
 Pre-approved — no re-prioritization needed.
 
 ### try_restore Queue (Priority Heap + Aging)
+## ProcessEntry fields (on ContextManager.processes)
 ```rust
-struct RestoreWaiter {
-    process_id: ProcessId,
-    priority_floor: f64,
-    enqueued_at: Instant,
-    /// Number of Pinned contexts still awaiting clear_pinned.
-    /// Restore is blocked until this reaches 0.
-    pending_pinned_count: usize,
-    /// Pending alloc requests to replay after restoration.
-    /// Response channels are held here — the process is blocked awaiting them.
-    pending_allocs: Vec<AllocWaiter>,
+pub struct ProcessEntry {
+    // ...
+    pending_pinned: usize,
+    /// At most one deferred operation — process is single-threaded (WASM).
+    deferred_op: Option<DeferredOp>,
+}
+
+enum DeferredOp {
+    /// Deferred `reserve_working_pages` alloc.
+    Alloc(AllocWaiter),
+    /// Deferred `pin` on a non-active context.
+    Pin { context_id, num_input_tokens, response },
 }
 // BinaryHeap<RestoreWaiter> — global (checks all devices on drain)
 ```
@@ -318,7 +317,7 @@ succeeds, the response channel fires Ok. The process unblocks and resumes.
 for each context in process:
     restore_context(ctx)
 set process state = Running
-replay pending_allocs from RestoreWaiter (allocate + send response)
+replay deferred_op from ProcessEntry (allocate + send response, or pin + send result)
 ```
 
 ### restore_context(ctx)
