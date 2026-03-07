@@ -61,7 +61,7 @@ Actual suspension deferred until `clear_pinned`.
 
 ### Working Pages
 - `working_pages: Vec<PhysicalPageId>` — GPU pages, exclusive to one context.
-- On suspend: D2H copy to CPU. Stored in `working_pages_cpu: Vec<PhysicalPageId>`.
+- On suspend: D2H copy to CPU. Stored in `working_pages: Vec<PhysicalPageId>`.
 - On restore: H2D copy back. CPU slots freed.
 - **If CPU swap pool full → OOM the process.** Working pages are NOT replayable.
 - Developer contract: commit pages eagerly once full.
@@ -179,24 +179,28 @@ Tie-breaking (cheapest first):
 4. EVICT unreferenced committed pages (rc=0)
    → retry alloc, if success: return pages
 
-5. EVICTION LOOP
+5. EVICTION LOOP — with deferred page tracking
+   deferred_pages = 0   // pages that will free when Pinned contexts clear
    loop:
      a. SELECT VICTIM via Arbiter floor rule
-        → no victim found: break → goto step 6
+        → no victim found: break
      b. SUSPEND VICTIM
         For each of victim's contexts:
-          Active → suspend immediately (swap working→CPU, release chain + evict_unreferenced)
+          Active → suspend immediately (swap working→CPU, release chain)
           Pinned → set pending_suspend = true (deferred)
         Set victim process state = Pending
-        Enqueue victim in try_restore (empty pending_allocs, pending_pinned_count = number of Pinned contexts)
-     c. If ALL of victim's contexts were Pinned:
-          // No pages actually freed immediately. Stop looping to avoid
-          // cascading suspensions that free nothing.
-          break → enqueue in try_alloc (FIFO), return
+        Enqueue victim in try_restore
+     c. If victim had Pinned contexts:
+          deferred_pages += working_deferred + committed_deferred
+          (committed_deferred = estimate_chain_release for Pinned tips)
      d. Retry alloc → if success: return pages
-     // else: loop again only if there were no Pinned contexts in this eviction, try another victim
+     e. Check deferred: if free_pages + deferred_pages >= needed: break
+     // else: keep looking for more victims
 
-6. NO VICTIM / ALL PINNED, REQUESTER LOSES
+   If deferred_pages > 0:
+     → enqueue in try_alloc (FIFO), return (pages will free on clear_pinned)
+
+6. NO VICTIM, REQUESTER LOSES
    Suspend ALL of requester's contexts (Active immediately, Pinned deferred)
    Set requester state = Pending
    Enqueue in try_restore (with pending_allocs, pending_pinned_count = number of Pinned contexts)
@@ -209,7 +213,7 @@ Phase 1: Swap working pages GPU → CPU
    swap_out(working_pages) → CPU slots + SwapOps
    fire D2H copy RPC (fire-and-forget)
    free GPU pages
-   ctx.working_pages_cpu = new CPU slots
+   ctx.working_pages = new CPU slots
    ctx.working_pages.clear()
    If CPU pool full → OOM the owning process
 
@@ -320,11 +324,11 @@ replay pending_allocs from RestoreWaiter (allocate + send response)
 ### restore_context(ctx)
 ```
 Phase 1: Swap in working pages
-    alloc GPU pages (exact count = working_pages_cpu.len())
+    alloc GPU pages (exact count = working_pages.len())
     H2D copy from CPU (fire and forget)
     free CPU slots
     ctx.working_pages = new GPU pages
-    ctx.working_pages_cpu.clear()
+    ctx.working_pages.clear()
 
 Phase 2: Rebuild committed chain
     walk lineage → compute page hashes

@@ -127,46 +127,6 @@ impl PageStore {
     }
 
     // =========================================================================
-    // Hash computation
-    // =========================================================================
-
-    /// Compute chained hashes for a sequence of page-aligned token chunks.
-    /// Each hash depends on (tokens, positions, masks, prev_hash).
-    pub fn compute_page_hashes(
-        &self,
-        tokens: &[u32],
-        positions: &[u32],
-        masks: &[Brle],
-        prev_hash: PageHash,
-    ) -> Vec<PageHash> {
-        let mut hashes = Vec::new();
-        let mut running = prev_hash;
-
-        for (chunk_idx, chunk) in tokens.chunks(self.page_size).enumerate() {
-            let start = chunk_idx * self.page_size;
-            let end = start + chunk.len();
-            let chunk_pos = &positions[start..end];
-            let chunk_masks = &masks[start..end];
-
-            let mut hasher = FxHasher::default();
-            chunk.hash(&mut hasher);
-            for pos in chunk_pos { pos.hash(&mut hasher); }
-            for mask in chunk_masks { mask.hash(&mut hasher); }
-            let content_hash = hasher.finish();
-
-            let mut chain_hasher = FxHasher::default();
-            content_hash.hash(&mut chain_hasher);
-            running.hash(&mut chain_hasher);
-            let page_hash = chain_hasher.finish();
-
-            hashes.push(page_hash);
-            running = page_hash;
-        }
-
-        hashes
-    }
-
-    // =========================================================================
     // Working pages (uncommitted, mutable, exclusive to one context)
     // =========================================================================
 
@@ -202,7 +162,7 @@ impl PageStore {
     /// since the existing physical page already has the correct data.
     ///
     /// Returns `(physical_page_id, working_page_freed)`.
-    pub fn commit_working(&mut self, hash: PageHash, prev_hash: PageHash, working_phys: PhysicalPageId) -> (PhysicalPageId, bool) {
+    pub fn promote_page(&mut self, hash: PageHash, prev_hash: PageHash, working_phys: PhysicalPageId) -> (PhysicalPageId, bool) {
         // Dedup: page already exists on GPU
         if let Some((phys, rc)) = self.pages.get_mut(&hash) {
             *rc += 1;
@@ -254,6 +214,24 @@ impl PageStore {
             }
         }
         evictable
+    }
+
+    /// Estimate how many GPU-resident pages would become evictable (rc→0)
+    /// if `release_chain(tip)` were called followed by `evict_unreferenced()`.
+    /// Read-only: does not modify refcounts.
+    pub fn estimate_chain_release(&self, tip: PageHash) -> usize {
+        let mut count = 0;
+        let mut h = tip;
+        loop {
+            if let Some((_, rc)) = self.pages.get(&h) {
+                if *rc <= 1 { count += 1; }
+            }
+            match self.chain.get(&h) {
+                Some(&prev) if prev != 0 => h = prev,
+                _ => break,
+            }
+        }
+        count
     }
 
     /// Walk the hash chain backward from `tip` to root, returning hashes in
@@ -440,6 +418,42 @@ pub fn compute_last_page_len(total_kv: u32, num_pages: u32, page_size: u32) -> u
     }
 }
 
+/// Compute chained hashes for a sequence of page-aligned token chunks.
+/// Each hash depends on (tokens, positions, masks, prev_hash).
+pub fn compute_page_hashes(
+    page_size: usize,
+    tokens: &[u32],
+    positions: &[u32],
+    masks: &[Brle],
+    prev_hash: PageHash,
+) -> Vec<PageHash> {
+    let mut hashes = Vec::new();
+    let mut running = prev_hash;
+
+    for (chunk_idx, chunk) in tokens.chunks(page_size).enumerate() {
+        let start = chunk_idx * page_size;
+        let end = start + chunk.len();
+        let chunk_pos = &positions[start..end];
+        let chunk_masks = &masks[start..end];
+
+        let mut hasher = FxHasher::default();
+        chunk.hash(&mut hasher);
+        for pos in chunk_pos { pos.hash(&mut hasher); }
+        for mask in chunk_masks { mask.hash(&mut hasher); }
+        let content_hash = hasher.finish();
+
+        let mut chain_hasher = FxHasher::default();
+        content_hash.hash(&mut chain_hasher);
+        running.hash(&mut chain_hasher);
+        let page_hash = chain_hasher.finish();
+
+        hashes.push(page_hash);
+        running = page_hash;
+    }
+
+    hashes
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -452,10 +466,10 @@ mod tests {
         (0..n).map(|_| Brle::new(0)).collect()
     }
 
-    /// Test helper: allocate a working page, then promote it via commit_working.
+    /// Test helper: allocate a working page, then promote it via promote_page.
     fn alloc_and_commit(store: &mut PageStore, hash: PageHash, prev: PageHash) -> PhysicalPageId {
         let working = store.alloc_gpu_pages(1).unwrap()[0];
-        let (phys, _freed) = store.commit_working(hash, prev, working);
+        let (phys, _freed) = store.promote_page(hash, prev, working);
         phys
     }
 
@@ -466,7 +480,7 @@ mod tests {
         let tokens: Vec<u32> = (0..8).collect();
         let positions: Vec<u32> = (0..8).collect();
         let masks = make_brle(8);
-        let hashes = store.compute_page_hashes(&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
         assert_eq!(hashes.len(), 2);
 
         let phys1 = alloc_and_commit(&mut store, hashes[0], 0);
@@ -487,13 +501,13 @@ mod tests {
         let tokens: Vec<u32> = (0..4).collect();
         let positions: Vec<u32> = (0..4).collect();
         let masks = make_brle(4);
-        let hashes = store.compute_page_hashes(&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
 
         let phys1 = alloc_and_commit(&mut store, hashes[0], 0);
         assert_eq!(store.refcount(hashes[0]), 1);
 
         let working2 = store.alloc_gpu_pages(1).unwrap()[0];
-        let (phys2, freed) = store.commit_working(hashes[0], 0, working2);
+        let (phys2, freed) = store.promote_page(hashes[0], 0, working2);
         assert!(freed);
         assert_eq!(phys1, phys2);
         assert_eq!(store.refcount(hashes[0]), 2);
@@ -506,7 +520,7 @@ mod tests {
         let tokens: Vec<u32> = (0..8).collect();
         let positions: Vec<u32> = (0..8).collect();
         let masks = make_brle(8);
-        let hashes = store.compute_page_hashes(&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
 
         alloc_and_commit(&mut store, hashes[0], 0);
         alloc_and_commit(&mut store, hashes[1], hashes[0]);
@@ -530,13 +544,45 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_chain_release() {
+        let mut store = PageStore::new(4, 100, 10);
+
+        let tokens: Vec<u32> = (0..12).collect();
+        let positions: Vec<u32> = (0..12).collect();
+        let masks = make_brle(12);
+        let hashes = compute_page_hashes(store.page_size, &tokens, &positions, &masks, 0);
+        assert_eq!(hashes.len(), 3);
+
+        // Commit 3 pages with rc=1 each
+        alloc_and_commit(&mut store, hashes[0], 0);
+        alloc_and_commit(&mut store, hashes[1], hashes[0]);
+        alloc_and_commit(&mut store, hashes[2], hashes[1]);
+
+        // All rc=1 → all would become evictable
+        assert_eq!(store.estimate_chain_release(hashes[2]), 3);
+
+        // Acquire chain (simulating a second context sharing the prefix)
+        store.acquire_chain(hashes[1]); // hashes[0]:rc=2, hashes[1]:rc=2
+
+        // Only hashes[2] has rc=1 now
+        assert_eq!(store.estimate_chain_release(hashes[2]), 1);
+
+        // Estimate from shared tip: hashes[0]:rc=2, hashes[1]:rc=2 → 0 evictable
+        assert_eq!(store.estimate_chain_release(hashes[1]), 0);
+
+        // Verify estimate matches actual release
+        let actual = store.release_chain(hashes[2]);
+        assert_eq!(actual.len(), 1); // Only hashes[2] hit rc=0
+    }
+
+    #[test]
     fn test_shared_pages_survive_eviction() {
         let mut store = PageStore::new(4, 10, 5);
 
         let tokens: Vec<u32> = (0..8).collect();
         let positions: Vec<u32> = (0..8).collect();
         let masks = make_brle(8);
-        let hashes = store.compute_page_hashes(&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
 
         alloc_and_commit(&mut store, hashes[0], 0);
         alloc_and_commit(&mut store, hashes[1], hashes[0]);
@@ -557,7 +603,7 @@ mod tests {
         let tokens: Vec<u32> = (0..4).collect();
         let positions: Vec<u32> = (0..4).collect();
         let masks = make_brle(4);
-        let hashes = store.compute_page_hashes(&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
 
         alloc_and_commit(&mut store, hashes[0], 0);
 
@@ -629,7 +675,7 @@ mod tests {
         let tokens: Vec<u32> = (0..12).collect();
         let positions: Vec<u32> = (0..12).collect();
         let masks = make_brle(12);
-        let hashes = store.compute_page_hashes(&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
         assert_eq!(hashes.len(), 3);
 
         alloc_and_commit(&mut store, hashes[0], 0);
@@ -646,7 +692,7 @@ mod tests {
         let tokens: Vec<u32> = (0..8).collect();
         let positions: Vec<u32> = (0..8).collect();
         let masks = make_brle(8);
-        let hashes = store.compute_page_hashes(&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size, &tokens, &positions, &masks, 0);
 
         let phys1 = alloc_and_commit(&mut store, hashes[0], 0);
         store.update_index_cache(hashes[0], None, &[phys1]);

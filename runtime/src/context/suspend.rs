@@ -22,7 +22,7 @@ use super::{
     ContextId, ContextManager, ContextState,
 };
 use super::sched::ProcessState;
-use super::pagestore::PhysicalPageId;
+
 
 // =============================================================================
 // Queue Items
@@ -48,7 +48,7 @@ pub(crate) struct RestoreWaiter {
 const AGING_RATE: f64 = 0.01;
 
 impl RestoreWaiter {
-    fn effective_priority(&self) -> f64 {
+    pub(crate) fn effective_priority(&self) -> f64 {
         let wait_secs = self.enqueued_at.elapsed().as_secs_f64();
         self.priority_floor + AGING_RATE * wait_secs
     }
@@ -76,192 +76,41 @@ impl Ord for RestoreWaiter {
     }
 }
 
+/// Result of suspending a process, with page-level accounting for a target device.
+pub(crate) struct SuspendResult {
+    pub pinned_count: usize,
+    pub active_count: usize,
+    /// GPU working pages freed immediately (from Active contexts on target device).
+    pub working_freed: usize,
+    /// GPU working pages deferred (from Pinned contexts on target device).
+    pub working_deferred: usize,
+    /// Committed pages that became unreferenced on target device (rc→0, from Active contexts).
+    pub committed_freed: usize,
+    /// Committed pages estimated to become unreferenced on target device
+    /// once Pinned contexts clear (from Pinned contexts).
+    pub committed_deferred: usize,
+}
+
+impl SuspendResult {
+    /// Total GPU pages that will eventually be reclaimable on the target device.
+    pub fn total_deferred(&self) -> usize {
+        self.working_deferred + self.committed_deferred
+    }
+}
+
 // =============================================================================
 // Suspension methods on ContextManager
 // =============================================================================
 
 impl ContextManager {
 
-    // ==================== reserve_working_pages flow ====================
-
-    /// Handle a ReserveWorkingPages message per DESIGN.md §4 (steps 0–6).
-    pub(crate) fn handle_reserve_working_pages(
-        &mut self,
-        id: ContextId,
-        num_pages: usize,
-        response: oneshot::Sender<anyhow::Result<()>>,
-    ) {
-        if num_pages == 0 {
-            let _ = response.send(Ok(()));
-            return;
-        }
-
-        let ctx = match self.contexts.get(&id) {
-            Some(c) => c,
-            None => { let _ = response.send(Err(anyhow::anyhow!("Context not found"))); return; }
-        };
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let owner = ctx.owner;
-        let current_working = ctx.working_pages.len();
-
-        let additional = num_pages.saturating_sub(current_working);
-        if additional == 0 {
-            let _ = response.send(Ok(()));
-            return;
-        }
-
-        // Step 0: SUSPENSION CHECK
-        // If the owning process is Pending, attach alloc to its pending_allocs.
-        if let Some(pid) = owner {
-            if let Some(proc) = self.processes.get_mut(&pid) {
-                if proc.state == ProcessState::Pending {
-                    proc.pending_allocs.push(AllocWaiter {
-                        context_id: id, device: dev_idx,
-                        num_pages: additional, response,
-                    });
-                    return;
-                }
-            }
-        }
-
-        // Step 1: FIFO GATE — if try_alloc has pending requests, enqueue behind them.
-        if !self.try_alloc.is_empty() {
-            self.try_alloc.push_back(AllocWaiter {
-                context_id: id, device: dev_idx,
-                num_pages: additional, response,
-            });
-            return;
-        }
-
-        // Step 2: PRIORITY GATE — compare requester floor vs try_restore head.
-        let requester_floor = owner
-            .map(|pid| {
-                let proc = self.processes.get(&pid);
-                let pages = proc.map(|e| e.pages_on(dev_idx)).unwrap_or(0);
-                let weight = proc.map(|e| e.weight).unwrap_or(1.0);
-                weight * (pages + additional) as f64
-            })
-            .unwrap_or(0.0);
-
-        if let Some(pid) = owner {
-            if let Some(top) = self.try_restore.peek() {
-                let top_pid = top.process_id;
-                let top_ready = self.processes.get(&top_pid).map(|p| p.pending_pinned == 0).unwrap_or(true);
-                if top_ready && requester_floor < top.effective_priority() {
-                    // Requester loses priority gate → suspend and enqueue in try_restore.
-                    let (pinned_count, _) = self.suspend_process(pid);
-                    self.enqueue_restore(pid, requester_floor, pinned_count);
-                    if let Some(proc) = self.processes.get_mut(&pid) {
-                        proc.pending_allocs.push(AllocWaiter {
-                            context_id: id, device: dev_idx,
-                            num_pages: additional, response,
-                        });
-                    }
-                    return;
-                }
-            }
-        }
-
-        // Step 3: TRY ALLOCATE from free pool.
-        if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(additional) {
-            self.apply_alloc(id, dev_idx, pages, owner);
-            let _ = response.send(Ok(()));
-            return;
-        }
-
-        // Step 4: EVICT unreferenced committed pages (rc=0) and retry.
-        self.devices[dev_idx].evict_unreferenced();
-        if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(additional) {
-            self.apply_alloc(id, dev_idx, pages, owner);
-            let _ = response.send(Ok(()));
-            return;
-        }
-
-        // Step 5: EVICTION LOOP
-        let mut all_pinned_break = false;
-        loop {
-            match self.find_eviction_victim(dev_idx, requester_floor, owner) {
-                Some(victim_pid) => {
-                    let victim_floor = self.processes.get(&victim_pid)
-                        .map(|e| e.priority_on(dev_idx)).unwrap_or(0.0);
-                    let (pinned_count, active_count) = self.suspend_process(victim_pid);
-                    self.enqueue_restore(victim_pid, victim_floor, pinned_count);
-
-                    // Step 5c: If ALL of victim's contexts were Pinned (none
-                    // Active), no pages freed immediately. Break → try_alloc.
-                    if active_count == 0 && pinned_count > 0 {
-                        all_pinned_break = true;
-                        break;
-                    }
-
-                    // Step 5d: Retry alloc after eviction freed pages.
-                    if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(additional) {
-                        self.apply_alloc(id, dev_idx, pages, owner);
-                        let _ = response.send(Ok(()));
-                        self.drain_queues();
-                        return;
-                    }
-
-                    // If any Pinned contexts, stop looping — deferred pages
-                    // won't free until clear_pinned. Fall through to step 6.
-                    if pinned_count > 0 {
-                        break;
-                    }
-                    // No Pinned: loop to find another victim.
-                }
-                None => break,
-            }
-        }
-
-        if all_pinned_break {
-            // Step 5c target: enqueue in try_alloc (requester stays Running).
-            self.try_alloc.push_back(AllocWaiter {
-                context_id: id, device: dev_idx,
-                num_pages: additional, response,
-            });
-        } else if let Some(pid) = owner {
-            // Step 6: NO VICTIM / PINNED VICTIM — requester self-suspends.
-            let (pinned_count, _) = self.suspend_process(pid);
-            self.enqueue_restore(pid, requester_floor, pinned_count);
-            if let Some(proc) = self.processes.get_mut(&pid) {
-                proc.pending_allocs.push(AllocWaiter {
-                    context_id: id, device: dev_idx,
-                    num_pages: additional, response,
-                });
-            }
-        } else {
-            // Owner-less context: enqueue in try_alloc FIFO.
-            self.try_alloc.push_back(AllocWaiter {
-                context_id: id, device: dev_idx,
-                num_pages: additional, response,
-            });
-        }
-    }
-
-    /// Apply an allocation to a context (after successful alloc_gpu_pages).
-    pub(crate) fn apply_alloc(
-        &mut self,
-        id: ContextId,
-        dev_idx: usize,
-        pages: Vec<PhysicalPageId>,
-        owner: Option<ProcessId>,
-    ) {
-        let n = pages.len();
-        if let Some(ctx) = self.contexts.get_mut(&id) {
-            ctx.working_pages.extend(pages);
-            ctx.device = Some(dev_idx);
-        }
-        if let Some(pid) = owner {
-            self.process_entry(pid).device_mut(dev_idx).working += n;
-        }
-    }
-
     // ==================== Eviction ====================
+
 
     /// Find the cheapest eviction victim on a device.
     /// Returns the ProcessId of the victim, or None if no evictable process
     /// has lower priority than `requester_floor`.
-    fn find_eviction_victim(
+    pub(crate) fn find_eviction_victim(
         &self,
         dev_idx: usize,
         requester_floor: f64,
@@ -300,7 +149,7 @@ impl ContextManager {
     }
 
     /// Helper: enqueue a RestoreWaiter for a suspended process.
-    fn enqueue_restore(&mut self, pid: ProcessId, priority_floor: f64, pinned_count: usize) {
+    pub(crate) fn enqueue_restore(&mut self, pid: ProcessId, priority_floor: f64, pinned_count: usize) {
         if pinned_count > 0 {
             if let Some(proc) = self.processes.get_mut(&pid) {
                 proc.pending_pinned += pinned_count;
@@ -317,9 +166,7 @@ impl ContextManager {
     /// - Active contexts: immediately suspend (working→CPU, chain released)
     /// - Pinned contexts: set `pending_suspend` flag (deferred)
     ///
-    /// Always marks the process as Pending. Returns `(pinned_count, active_count)`:
-    /// - `pinned_count`: Pinned contexts deferred (tracked in `ProcessEntry.pending_pinned`)
-    /// - `active_count`: Active contexts immediately suspended (pages freed now)
+    /// Always marks the process as Pending. Returns `(pinned_count, active_count)`.
     pub(crate) fn suspend_process(&mut self, pid: ProcessId) -> (usize, usize) {
         let ctx_ids: Vec<ContextId> = self.processes.get(&pid)
             .map(|p| p.context_ids.clone())
@@ -345,26 +192,17 @@ impl ContextManager {
                     active_count += 1;
                 }
                 ContextState::Pinned => {
-                    // Deferred suspension
                     if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                         ctx.pending_suspend = true;
                     }
                     pinned_count += 1;
                 }
-                ContextState::Suspended => {
-                    // Already suspended, nothing to do
-                }
+                ContextState::Suspended => {}
             }
         }
 
-        // Always transition to Pending — the process is conceptually suspended
-        // even if some contexts have deferred suspension.
         if let Some(proc) = self.processes.get_mut(&pid) {
             proc.state = ProcessState::Pending;
-        }
-
-        // Zero out scheduler accounting for ALL devices the process has contexts on
-        if let Some(proc) = self.processes.get_mut(&pid) {
             for &dev in &devices_touched {
                 proc.zero_device(dev);
             }
@@ -373,10 +211,66 @@ impl ContextManager {
         (pinned_count, active_count)
     }
 
+    /// Estimate per-device page reclamation if `suspend_process(pid)` were called.
+    /// Read-only: does not modify any state. Call BEFORE `suspend_process`.
+    pub(crate) fn estimate_suspend(&self, pid: ProcessId, dev_idx: usize) -> SuspendResult {
+        let ctx_ids = match self.processes.get(&pid) {
+            Some(p) => &p.context_ids,
+            None => return SuspendResult {
+                pinned_count: 0, active_count: 0,
+                working_freed: 0, working_deferred: 0,
+                committed_freed: 0, committed_deferred: 0,
+            },
+        };
+
+        let mut pinned_count: usize = 0;
+        let mut active_count: usize = 0;
+        let mut working_freed: usize = 0;
+        let mut working_deferred: usize = 0;
+        let mut committed_freed: usize = 0;
+        let mut committed_deferred: usize = 0;
+
+        for &ctx_id in ctx_ids {
+            let ctx = match self.contexts.get(&ctx_id) {
+                Some(c) => c,
+                None => continue,
+            };
+            let dev = ctx.device.unwrap_or(0) as usize;
+
+            match ctx.state {
+                ContextState::Active => {
+                    active_count += 1;
+                    if dev == dev_idx {
+                        working_freed += ctx.working_pages.len();
+                        committed_freed += ctx.committed_tip
+                            .map(|t| self.devices[dev].estimate_chain_release(t))
+                            .unwrap_or(0);
+                    }
+                }
+                ContextState::Pinned => {
+                    pinned_count += 1;
+                    if dev == dev_idx {
+                        working_deferred += ctx.working_pages.len();
+                        committed_deferred += ctx.committed_tip
+                            .map(|t| self.devices[dev].estimate_chain_release(t))
+                            .unwrap_or(0);
+                    }
+                }
+                ContextState::Suspended => {}
+            }
+        }
+
+        SuspendResult {
+            pinned_count, active_count,
+            working_freed, working_deferred,
+            committed_freed, committed_deferred,
+        }
+    }
+
     /// Suspend a single Active context: swap working pages GPU→CPU, release chain.
     pub(crate) fn suspend_context(&mut self, ctx_id: ContextId) {
         let (dev_idx, working, tip) = match self.contexts.get(&ctx_id) {
-            Some(ctx) if ctx.state == ContextState::Active || ctx.state == ContextState::Pinned => {
+            Some(ctx) if ctx.is_active() || ctx.is_pinned() => {
                 (ctx.device.unwrap_or(0) as usize, ctx.working_pages.clone(), ctx.committed_tip)
             }
             _ => return,
@@ -392,8 +286,7 @@ impl ContextManager {
                     self.devices[dev_idx].free_gpu_pages(&working);
 
                     if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                        ctx.working_pages.clear();
-                        ctx.working_pages_cpu = cpu_pages;
+                        ctx.working_pages = cpu_pages;
                     }
                 }
                 None => {
@@ -429,90 +322,5 @@ impl ContextManager {
         // "it does not clean up unreferenced (rc=0) pages. It's the role of reserve_working_pages."
         // This ensures separation: suspend_context only releases refcounts,
         // reserve_working_pages (step 4) handles the actual eviction.
-    }
-
-    // ==================== clear_pinned ====================
-
-    /// Handle ClearPinned message: Pinned → Active, then check deferred suspension.
-    /// If `pending_suspend` was set, executes the deferred suspension and
-    /// decrements `ProcessEntry.pending_pinned`.
-    pub(crate) fn handle_clear_pinned(&mut self, id: ContextId) {
-        let (is_pinned, pending) = match self.contexts.get(&id) {
-            Some(ctx) if ctx.state == ContextState::Pinned => (true, ctx.pending_suspend),
-            _ => return,
-        };
-
-        if !is_pinned { return; }
-
-        if pending {
-            // Deferred suspension: context stays Pinned until suspend_context
-            // transitions it to Suspended.
-            let owner = self.contexts.get(&id).and_then(|c| c.owner);
-            self.suspend_context(id);
-
-            // Decrement pending_pinned_count for the owning process.
-            if let Some(pid) = owner {
-                if let Some(proc) = self.processes.get_mut(&pid) {
-                    proc.pending_pinned = proc.pending_pinned.saturating_sub(1);
-                }
-            }
-
-            // Deferred suspension may have freed pages — drain queues.
-            self.drain_queues();
-            return;
-        }
-
-        // No deferred suspension — normal Pinned → Active transition.
-        if let Some(ctx) = self.contexts.get_mut(&id) {
-            ctx.state = ContextState::Active;
-        }
-    }
-
-    // ==================== drain_queues ====================
-
-    /// Central queue drain: called after any event that frees GPU pages.
-    ///
-    /// Phase 1: try_alloc (FIFO) — serve front-of-queue allocations.
-    /// Phase 2: try_restore (priority heap) — restore highest-priority Pending
-    ///          process, then replay its pending_allocs.
-    pub(crate) fn drain_queues(&mut self) {
-        // Phase 1: try_alloc FIFO (head-of-line blocking)
-        while let Some(front) = self.try_alloc.front() {
-            let dev_idx = front.device as usize;
-            let n = front.num_pages;
-
-            // Evict unreferenced committed pages (rc=0) before attempting alloc
-            self.devices[dev_idx].evict_unreferenced();
-            if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(n) {
-                let waiter = self.try_alloc.pop_front().unwrap();
-                let owner = self.contexts.get(&waiter.context_id).and_then(|c| c.owner);
-                self.apply_alloc(waiter.context_id, dev_idx, pages, owner);
-                let _ = waiter.response.send(Ok(()));
-            } else {
-                break; // Not enough pages for front of queue
-            }
-        }
-
-        // Phase 2: try_restore (priority heap)
-        // Only proceed if try_alloc is empty (allocs have strict priority).
-        if !self.try_alloc.is_empty() { return; }
-
-        while let Some(top) = self.try_restore.peek() {
-            let pid = top.process_id;
-
-            // Block if still has Pinned contexts clearing.
-            if self.processes.get(&pid).map(|p| p.pending_pinned).unwrap_or(0) > 0 {
-                break;
-            }
-
-            // Admission check: enough pages on all devices?
-            if !self.can_restore_process(pid) {
-                break;
-            }
-
-            let waiter = self.try_restore.pop().unwrap();
-            let chunks = self.restore_and_replay(waiter.process_id);
-            self.pending_replays.extend(chunks);
-        }
     }
 }

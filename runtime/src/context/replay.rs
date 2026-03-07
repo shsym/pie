@@ -7,7 +7,7 @@ use super::{
     Record,
 };
 use super::sched::ProcessState;
-use super::pagestore::{PhysicalPageId, compute_last_page_len};
+use super::pagestore::{PhysicalPageId, compute_last_page_len, compute_page_hashes};
 use crate::adapter::AdapterId;
 use crate::device::{self, DeviceId};
 use crate::inference;
@@ -114,10 +114,10 @@ impl ContextManager {
 
         for &ctx_id in ctx_ids {
             if let Some(ctx) = self.contexts.get(&ctx_id) {
-                if ctx.state != ContextState::Suspended { continue; }
+                if !ctx.is_suspended() { continue; }
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 // Working pages on CPU that need GPU allocation for swap-in
-                *required.entry(dev_idx).or_insert(0) += ctx.working_pages_cpu.len();
+                *required.entry(dev_idx).or_insert(0) += ctx.working_pages.len();
                 // Pages needing replay: walk chain, compute prefix match, count missing suffix
                 if let Some(tip_hash) = ctx.committed_tip {
                     let dev = &self.devices[dev_idx];
@@ -165,7 +165,7 @@ impl ContextManager {
         // Restore all suspended contexts
         for &ctx_id in &ctx_ids {
             let is_suspended = self.contexts.get(&ctx_id)
-                .map(|c| c.state == ContextState::Suspended)
+                .map(|c| c.is_suspended())
                 .unwrap_or(false);
             if is_suspended {
                 match self.restore_context(ctx_id) {
@@ -214,12 +214,12 @@ impl ContextManager {
     pub(crate) fn restore_context(&mut self, ctx_id: ContextId) -> anyhow::Result<Vec<ReplayFill>> {
         let ctx = self.contexts.get(&ctx_id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        if ctx.state != ContextState::Suspended {
+        if !ctx.is_suspended() {
             return Ok(Vec::new()); // Already active
         }
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let cpu_pages = ctx.working_pages_cpu.clone();
+        let cpu_pages = ctx.working_pages.clone();
         let tip = ctx.committed_tip;
         let owner = ctx.owner;
 
@@ -235,7 +235,6 @@ impl ContextManager {
 
             if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                 ctx.working_pages = gpu_pages.clone();
-                ctx.working_pages_cpu.clear();
             }
 
             // Track swap-in as working pages in scheduler
@@ -505,14 +504,14 @@ impl ContextManager {
         let working_phys = ctx.working_pages.clone();
         let owner = ctx.owner;
 
+        let hashes = compute_page_hashes(self.page_size, &tokens, &positions, &masks, prev_hash);
         let dev = &mut self.devices[dev_idx];
-        let hashes = dev.compute_page_hashes(&tokens, &positions, &masks, prev_hash);
 
         let mut new_phys = Vec::new();
         let mut running_prev = prev_hash;
         for (i, &hash) in hashes.iter().enumerate() {
             if i < working_phys.len() {
-                let (phys, _) = dev.commit_working(hash, running_prev, working_phys[i]);
+                let (phys, _) = dev.promote_page(hash, running_prev, working_phys[i]);
                 new_phys.push(phys);
             }
             running_prev = hash;
