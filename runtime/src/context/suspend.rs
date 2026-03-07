@@ -218,6 +218,7 @@ impl ContextManager {
 
         if let Some(proc) = self.processes.get_mut(&pid) {
             proc.state = ProcessState::Pending;
+            proc.pending_replay_count = 0;
             for &dev in &devices_touched {
                 proc.zero_device(dev);
             }

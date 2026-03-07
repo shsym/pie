@@ -3,36 +3,18 @@ use std::collections::HashMap;
 
 
 use super::{
-    ContextId, ContextManager, ContextState,
+    ContextId, ContextManager, ContextState, SERVICES,
     Record,
 };
 use super::sched::ProcessState;
 use super::suspend::DeferredOp;
-use super::pagestore::{PhysicalPageId, compute_last_page_len, compute_page_hashes};
+use super::pagestore::{PhysicalPageId, compute_last_page_len};
 use crate::adapter::AdapterId;
-use crate::device::{self, DeviceId};
+use crate::device::DeviceId;
 use crate::inference;
 use crate::inference::brle::Brle;
 use crate::inference::request::ForwardPassRequest;
 use crate::process::ProcessId;
-
-// =============================================================================
-// ReplayFill
-// =============================================================================
-
-#[derive(Debug, Clone)]
-pub struct ReplayFill {
-    pub context_id: ContextId,
-    pub tokens: Vec<u32>,
-    pub positions: Vec<u32>,
-    pub masks: Vec<Brle>,
-    pub adapter: Option<AdapterId>,
-    pub physical_page_ids: Vec<PhysicalPageId>,
-    pub device_id: DeviceId,
-    pub kv_len: u32,
-    pub last_page_len: u32,
-    pub num_pages: u32,
-}
 
 // =============================================================================
 // Restore methods on ContextManager
@@ -40,66 +22,6 @@ pub struct ReplayFill {
 
 
 impl ContextManager {
-
-    /// Dispatch replay forward passes for KV cache recomputation.
-    ///
-    /// Each ReplayFill contains tokens that need to be run through the model
-    /// to regenerate KV data for committed pages lost during eviction.
-    /// After the forward pass, the working pages are committed.
-    pub(crate) async fn dispatch_replays(&mut self, chunks: Vec<ReplayFill>) {
-        if chunks.is_empty() { return; }
-
-        let mut ctx_ids_needing_finish: Vec<ContextId> = Vec::new();
-
-        for chunk in chunks {
-            let ctx_id = chunk.context_id;
-
-            // Build a minimal forward pass request (no sampling — just KV fill)
-            let fwd_req = ForwardPassRequest {
-                context_id: 0, // unused — page IDs provided directly
-                tokens: chunk.tokens.clone(),
-                positions: chunk.positions.clone(),
-                speculative_tokens: Vec::new(),
-                speculative_positions: Vec::new(),
-                output_speculative_tokens: false,
-                masks: chunk.masks.clone(),
-                logit_mask: None,
-                sampling_indices: Vec::new(),
-                samplers: Vec::new(),
-                adapter_id: chunk.adapter,
-                adapter_seed: None,
-                arrival_time: None,
-            };
-
-            let result = inference::submit(
-                self.model_idx, fwd_req,
-                chunk.device_id as usize, chunk.physical_page_ids.clone(),
-                chunk.last_page_len,
-            ).await;
-
-            if let Err(e) = result {
-                eprintln!("REPLAY_FWD_FAIL ctx={ctx_id} device={} err={e:#}", chunk.device_id);
-                // RPC failed — still finish restore to avoid permanently Pinned state.
-                // The context will have a truncated committed chain but can still serve.
-                if !ctx_ids_needing_finish.contains(&ctx_id) {
-                    ctx_ids_needing_finish.push(ctx_id);
-                }
-                continue;
-            }
-
-            let _ = self.commit_replay_chunk(
-                ctx_id, chunk.num_pages,
-                chunk.tokens, chunk.positions, chunk.masks, chunk.adapter,
-            );
-            if !ctx_ids_needing_finish.contains(&ctx_id) {
-                ctx_ids_needing_finish.push(ctx_id);
-            }
-        }
-
-        for id in ctx_ids_needing_finish {
-            self.finish_restore(id);
-        }
-    }
 
     /// Admission check: can this process be fully restored?
     /// Checks that all devices have enough free GPU pages for the process's
@@ -138,7 +60,6 @@ impl ContextManager {
             }
         }
 
-
         // Check availability on all devices
         for (&dev_idx, &needed) in &required {
             if self.devices[dev_idx].available_gpu_pages() < needed {
@@ -149,37 +70,267 @@ impl ContextManager {
         true
     }
 
-    /// Restore a process and replay its deferred_op.
+    /// Restore a process and prepare replay forward passes.
     /// Called by drain_queues after admission check passes.
-    /// Returns replay chunks that need forward passes dispatched by the caller.
-    pub(crate) fn restore_and_replay(&mut self, pid: ProcessId) -> Vec<ReplayFill> {
+    ///
+    /// Deferred ops fire only after all replay forward passes complete
+    /// (in `finish_restore`). If no replays are needed, deferred ops
+    /// fire immediately here.
+    pub(crate) fn restore_process(&mut self, pid: ProcessId) -> anyhow::Result<()> {
         let ctx_ids: Vec<ContextId> = self.processes.get(&pid)
             .map(|p| p.context_ids.clone())
-            .unwrap_or_default();
+            .ok_or_else(|| anyhow::anyhow!("Process not found"))?;
 
-        let mut all_replay_chunks = Vec::new();
+        let mut replay_count: usize = 0;
 
         // Restore all suspended contexts
         for &ctx_id in &ctx_ids {
-            let is_suspended = self.contexts.get(&ctx_id)
-                .map(|c| c.is_suspended())
-                .unwrap_or(false);
-            if is_suspended {
-                match self.restore_context(ctx_id) {
-                    Ok(chunks) => all_replay_chunks.extend(chunks),
-                    Err(e) => {
-                        eprintln!("RESTORE_CONTEXT_FAIL ctx={ctx_id} err={e:#}");
-                    }
-                }
-            }
+            let has_replay = self.restore_context(ctx_id)?;
+            if has_replay { replay_count += 1; }
+        }
+
+        // Set scheduler accounting from actual context state.
+        // suspend_process zeroed all devices; now set exact counts from restored contexts.
+        for &ctx_id in &ctx_ids {
+            let ctx = self.contexts.get(&ctx_id).unwrap();
+            let dev_idx = ctx.device.unwrap_or(0) as usize;
+            let committed_len = ctx.committed_len;
+            let working_len = ctx.working_pages.len();
+            let d = self.process_entry(pid).device_mut(dev_idx);
+            d.committed += committed_len;
+            d.working += working_len;
         }
 
         // Transition process to Running
         if let Some(proc) = self.processes.get_mut(&pid) {
             proc.state = ProcessState::Running;
+            proc.pending_replay_count = replay_count;
         }
 
-        // Replay deferred operation: allocate pages / pin and fire response channel
+        // If no replays needed, fire deferred ops immediately (no FinishRestore coming)
+        if replay_count == 0 {
+            self.fire_deferred_op(pid);
+        }
+
+        Ok(())
+    }
+
+
+    /// Restore a single suspended context.
+    ///
+    /// Phase 1: Swap-in working pages from CPU → GPU
+    /// Phase 2: Acquire refcounts for GPU-resident committed prefix
+    /// Phase 3: Eagerly promote suffix pages and spawn replay forward passes
+    ///
+    /// After this function returns, the context is fully restored from the
+    /// metadata perspective. Forward passes fill KV data in the background
+    /// while the context is Pinned.
+    ///
+    /// Returns `true` if replay forward passes were spawned, `false` if
+    /// full prefix match (no replay needed).
+    pub(crate) fn restore_context(&mut self, ctx_id: ContextId) -> anyhow::Result<bool> {
+        let ctx = self.contexts.get(&ctx_id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+
+        let dev_idx = ctx.device.unwrap_or(0) as usize;
+        let cpu_pages = ctx.working_pages.clone();
+        let tip = ctx.committed_tip;
+
+        // Phase 1: Swap-in working pages from CPU → GPU
+        if !cpu_pages.is_empty() {
+            let dev = &mut self.devices[dev_idx];
+            let gpu_pages = dev.alloc_gpu_pages(cpu_pages.len())
+                .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working swap-in"))?;
+            let _ = crate::device::copy_h2d(dev_idx, &gpu_pages, &cpu_pages);
+            self.devices[dev_idx].free_cpu_pages(&cpu_pages);
+            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                ctx.working_pages = gpu_pages;
+            }
+        }
+
+        // Phase 2: Acquire refcounts for GPU-resident committed prefix.
+        let prefix_len = if let Some(tip_hash) = tip {
+            let dev = &mut self.devices[dev_idx];
+            let chain = dev.walk_chain(tip_hash);
+            let prefix_len = dev.longest_prefix_length(&chain);
+            if prefix_len > 0 {
+                let prefix_tip = chain[prefix_len - 1];
+                dev.acquire_chain(prefix_tip);
+            }
+            prefix_len
+        } else {
+            0
+        };
+
+        // Phase 3: Eagerly promote suffix pages and spawn replay forward passes.
+        let has_replay = self.spawn_replay_passes(ctx_id, dev_idx, prefix_len)?;
+
+        // Pinned while forward passes fill KV data; Active if full prefix match.
+        if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+            ctx.state = if has_replay { ContextState::Pinned } else { ContextState::Active };
+        }
+
+        Ok(has_replay)
+    }
+
+    /// Promote suffix pages, build forward pass requests, and spawn a
+    /// tokio task that submits them sequentially to fill KV data.
+    ///
+    /// Eagerly allocates GPU pages and promotes them into the page store for the
+    /// suffix (pages not GPU-resident). Returns `true` if any passes were spawned.
+    ///
+    /// Uses the chain hashes (preserved from before suspension) directly,
+    /// avoiding recomputation from the lineage.
+    fn spawn_replay_passes(
+        &mut self,
+        ctx_id: ContextId,
+        dev_idx: usize,
+        prefix_len: usize,
+    ) -> anyhow::Result<bool> {
+        let ctx = self.contexts.get(&ctx_id)
+            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+        let lineage = ctx.lineage.clone();
+        let committed_len = ctx.committed_len;
+        let tip = ctx.committed_tip;
+        let page_size = self.page_size;
+
+        if prefix_len >= committed_len {
+            return Ok(false);
+        }
+
+        // Walk the chain to get all hashes (root-to-tip order).
+        let chain = match tip {
+            Some(tip_hash) => self.devices[dev_idx].walk_chain(tip_hash),
+            None => return Ok(false),
+        };
+
+        // Eagerly allocate GPU pages for the suffix and register chain links.
+        // The forward pass will fill KV data; until then the context is Pinned.
+        let suffix_count = committed_len - prefix_len;
+        let suffix_phys = self.devices[dev_idx].alloc_gpu_pages(suffix_count)
+            .ok_or_else(|| anyhow::anyhow!("No GPU pages for replay but admission check passed"))?;
+
+        let mut prev = if prefix_len > 0 { chain[prefix_len - 1] } else { 0 };
+        for i in prefix_len..committed_len {
+            let hash = chain[i];
+            self.devices[dev_idx].insert_chain_link(hash, prev);
+            prev = hash;
+        }
+
+        // Update index_cache to include the suffix physical pages.
+        if let Some(tip_hash) = tip {
+            let prefix_tip = if prefix_len > 0 { Some(chain[prefix_len - 1]) } else { None };
+            self.devices[dev_idx].update_index_cache(tip_hash, prefix_tip, &suffix_phys);
+        }
+
+        // Build forward pass requests from the lineage (for tokens/positions/masks).
+        let prefix_tokens = prefix_len * page_size;
+        let committed_tokens = committed_len * page_size;
+        let mut kv_so_far = prefix_tokens as u32;
+
+        // Resolve the full physical page table (prefix + suffix).
+        let full_phys = if let Some(tip_hash) = tip {
+            self.devices[dev_idx].resolve_physical(tip_hash)
+        } else {
+            Vec::new()
+        };
+
+        let mut requests: Vec<(ForwardPassRequest, Vec<PhysicalPageId>, u32)> = Vec::new();
+        let mut token_offset = 0usize;
+        let mut pages_emitted = prefix_len;
+
+        for record in &lineage {
+            match record {
+                Record::Fill { tokens, positions, mask, adapter } => {
+                    let record_end = token_offset + tokens.len();
+
+                    if record_end <= prefix_tokens {
+                        token_offset = record_end;
+                        continue;
+                    }
+                    if token_offset >= committed_tokens {
+                        break;
+                    }
+
+                    let start_in_record = prefix_tokens.saturating_sub(token_offset);
+                    let end_in_record = (committed_tokens - token_offset).min(tokens.len());
+                    let suffix_tokens = &tokens[start_in_record..end_in_record];
+                    let suffix_positions = &positions[start_in_record..end_in_record];
+                    let suffix_masks = &mask[start_in_record..end_in_record];
+
+                    let num_pages = suffix_tokens.len() / page_size;
+                    if num_pages == 0 {
+                        token_offset = record_end;
+                        continue;
+                    }
+
+                    let aligned_len = num_pages * page_size;
+                    pages_emitted += num_pages;
+
+                    // Page table for this chunk: all pages up to current position
+                    let phys_ids = full_phys[..pages_emitted].to_vec();
+
+                    let num_input = aligned_len as u32;
+                    let total_kv = kv_so_far + num_input;
+                    let total_pages_for_fwd = phys_ids.len() as u32;
+                    let last_page_len = compute_last_page_len(total_kv, total_pages_for_fwd, page_size as u32);
+
+                    let fwd_req = ForwardPassRequest {
+                        context_id: 0,
+                        tokens: suffix_tokens[..aligned_len].to_vec(),
+                        positions: suffix_positions[..aligned_len].to_vec(),
+                        speculative_tokens: Vec::new(),
+                        speculative_positions: Vec::new(),
+                        output_speculative_tokens: false,
+                        masks: suffix_masks[..aligned_len].to_vec(),
+                        logit_mask: None,
+                        sampling_indices: Vec::new(),
+                        samplers: Vec::new(),
+                        adapter_id: *adapter,
+                        adapter_seed: None,
+                        arrival_time: None,
+                    };
+
+                    requests.push((fwd_req, phys_ids, last_page_len));
+                    kv_so_far += num_input;
+                    token_offset = record_end;
+                }
+            }
+        }
+
+        if requests.is_empty() {
+            return Ok(false);
+        }
+
+        // Spawn a task that submits forward passes sequentially, then
+        // sends FinishRestore to unpin the context.
+        let model_idx = self.model_idx;
+        let device_id = dev_idx;
+
+        tokio::spawn(async move {
+            for (fwd_req, phys_ids, last_page_len) in requests {
+                let result = inference::submit(
+                    model_idx, fwd_req,
+                    device_id, phys_ids,
+                    last_page_len,
+                ).await;
+
+                if let Err(e) = result {
+                    eprintln!("REPLAY_FWD_FAIL ctx={ctx_id} device={device_id} err={e:#}");
+                    break; // Later chunks depend on this one's KV data
+                }
+            }
+
+            // Unpin after all chunks complete (or first failure)
+            let _ = SERVICES.send(model_idx, super::Message::FinishRestore { id: ctx_id });
+        });
+
+        Ok(true)
+    }
+
+    /// Fire a process's deferred operation (Alloc or Pin).
+    /// Called when all replay forward passes have completed.
+    fn fire_deferred_op(&mut self, pid: ProcessId) {
         let deferred = self.processes.get_mut(&pid)
             .and_then(|p| p.deferred_op.take());
         if let Some(op) = deferred {
@@ -189,7 +340,6 @@ impl ContextManager {
                     if self.reserve_working_pages(alloc.context_id, dev_idx, alloc.num_pages, Some(pid)).is_ok() {
                         let _ = alloc.response.send(Ok(()));
                     } else {
-                        // Shouldn't happen — admission check verified availability.
                         let _ = alloc.response.send(Err(anyhow::anyhow!(
                             "Insufficient pages during restore replay (should not happen)"
                         )));
@@ -201,358 +351,55 @@ impl ContextManager {
                 }
             }
         }
-
-        all_replay_chunks
     }
 
-
-    /// Restore a single suspended context.
+    /// Finish restoration: transition context out of Pinned, then fire
+    /// deferred ops when all replay forward passes for the owning process
+    /// have completed.
     ///
-    /// Phase 1: Swap-in working pages from CPU → GPU
-    /// Phase 2: Rebuild committed chain via prefix match + acquire
-    /// Phase 3: Build replay chunks for suffix pages (not GPU-resident)
+    /// Called by the actor when a FinishRestore message arrives after
+    /// a replay forward pass completes.
     ///
-    /// Returns ReplayFill chunks that need forward passes to recompute KV data.
-    /// Empty vec means full prefix match (no replay needed).
-    pub(crate) fn restore_context(&mut self, ctx_id: ContextId) -> anyhow::Result<Vec<ReplayFill>> {
-        let ctx = self.contexts.get(&ctx_id)
-            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        if !ctx.is_suspended() {
-            return Ok(Vec::new()); // Already active
-        }
-
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let cpu_pages = ctx.working_pages.clone();
-        let tip = ctx.committed_tip;
-        let owner = ctx.owner;
-
-        // Phase 1: Swap-in working pages from CPU → GPU
-        if !cpu_pages.is_empty() {
-            let dev = &mut self.devices[dev_idx];
-
-            // This should never fail because of the admission check
-            let gpu_pages = dev.alloc_gpu_pages(cpu_pages.len())
-                .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working swap-in"))?;
-
-            // Copy CPU → GPU, then free CPU pages
-            let _ = device::copy_h2d(dev_idx, &gpu_pages, &cpu_pages);
-            self.devices[dev_idx].free_cpu_pages(&cpu_pages);
-
-            // Track swap-in as working pages in scheduler
-            if let Some(pid) = owner {
-                self.process_entry(pid).device_mut(dev_idx).working += gpu_pages.len();
-            }
-
-            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                ctx.working_pages = gpu_pages;
-            }
-            
-        }
-
-        // Phase 2: Rebuild committed chain via longest prefix match
-        let prefix_len = if let Some(tip_hash) = tip {
-            let dev = &mut self.devices[dev_idx];
-            let chain = dev.walk_chain(tip_hash);
-            let prefix_len = dev.longest_prefix_length(&chain);
-
-            // Acquire refcounts for prefix-matched pages
-            if prefix_len > 0 {
-                let prefix_tip = chain[prefix_len - 1];
-                dev.acquire_chain(prefix_tip);
-
-                // Rebuild index_cache for the prefix tip
-                let _ = dev.resolve_physical(prefix_tip);
-
-                // Truncate committed_tip to the prefix tip.
-                if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                    ctx.committed_tip = Some(prefix_tip);
-                }
-            } else {
-                // No prefix match at all — clear committed_tip.
-                if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                    ctx.committed_tip = None;
-                }
-            }
-
-            // Update committed_len and max_committed_position on Context
-            // to match the truncated prefix. Recompute max_committed_position
-            // from the lineage to avoid stale values rejecting valid commits.
-            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                ctx.committed_len = prefix_len;
-                if prefix_len == 0 {
-                    ctx.max_committed_position = None;
-                } else {
-                    // Recompute from lineage: max position in the first
-                    // prefix_len * page_size tokens.
-                    let prefix_tokens = prefix_len * self.page_size;
-                    let mut count = 0usize;
-                    let mut max_p: Option<u32> = None;
-                    for record in &ctx.lineage {
-                        match record {
-                            Record::Fill { positions, .. } => {
-                                for &pos in positions {
-                                    if count >= prefix_tokens { break; }
-                                    max_p = Some(max_p.map_or(pos, |m: u32| m.max(pos)));
-                                    count += 1;
-                                }
-                            }
-                        }
-                        if count >= prefix_tokens { break; }
-                    }
-                    ctx.max_committed_position = max_p;
-                }
-            }
-
-            // Update scheduler accounting for prefix-matched committed pages
-            if let Some(pid) = owner {
-                if prefix_len > 0 {
-                    self.process_entry(pid).device_mut(dev_idx).committed += prefix_len;
-                }
-            }
-
-            prefix_len
-        } else {
-            0
+    /// NOTE: We intentionally do NOT reuse `unpin()` here because `unpin`
+    /// calls `drain_queues`, which can re-restore this same process via
+    /// `restore_process` — overwriting `pending_replay_count` before
+    /// we get to decrement it (reentrancy corruption).
+    pub(crate) fn finish_restore(&mut self, id: ContextId) {
+        let (owner, pending) = match self.contexts.get(&id) {
+            Some(ctx) if ctx.is_pinned() => (ctx.owner, ctx.pending_suspend),
+            _ => return,
         };
 
-        // Phase 3: Build replay chunks for pages beyond the prefix
-        let replay_chunks = self.build_replay_chunks(ctx_id, dev_idx, prefix_len)?;
-
-        if replay_chunks.is_empty() {
-            // No replay needed — full prefix match. Mark Active immediately.
-            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                ctx.state = ContextState::Active;
-                ctx.pending_suspend = false;
-            }
-        } else {
-            // Replay needed — mark as Pinned to prevent eviction while
-            // KV recovery forward passes are in-flight. Transitions to
-            // Active after finish_restore is called.
-            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                ctx.state = ContextState::Pinned;
-                ctx.pending_suspend = false;
-            }
-        }
-
-        Ok(replay_chunks)
-    }
-
-    /// Build replay chunks for committed pages beyond the prefix match.
-    ///
-    /// Flattens the lineage, computes page hashes, allocates working pages
-    /// for the suffix (pages not GPU-resident), and builds ReplayFill structs
-    /// with full page tables for forward pass dispatch.
-    fn build_replay_chunks(
-        &mut self,
-        ctx_id: ContextId,
-        dev_idx: usize,
-        prefix_len: usize,
-    ) -> anyhow::Result<Vec<ReplayFill>> {
-        let ctx = self.contexts.get(&ctx_id)
-            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        let lineage = ctx.lineage.clone();
-        let owner = ctx.owner;
-        let page_size = self.page_size;
-
-        // Flatten lineage into contiguous arrays
-        let mut all_tokens = Vec::new();
-        let mut all_positions = Vec::new();
-        let mut all_masks = Vec::new();
-        let mut adapters: Vec<(usize, Option<crate::adapter::AdapterId>)> = Vec::new();
-
-        for record in &lineage {
-            match record {
-                Record::Fill { tokens, positions, mask, adapter } => {
-                    adapters.push((all_tokens.len(), *adapter));
-                    all_tokens.extend_from_slice(tokens);
-                    all_positions.extend_from_slice(positions);
-                    all_masks.extend_from_slice(mask);
-                }
-            }
-        }
-
-        // Only full pages are committable
-        let page_aligned = (all_tokens.len() / page_size) * page_size;
-        let total_committed_pages = page_aligned / page_size;
-
-        // All committed pages are prefix-matched — no replay needed
-        if prefix_len >= total_committed_pages {
-            return Ok(Vec::new());
-        }
-
-        let matched_tokens = prefix_len * page_size;
-        let mut kv_so_far = matched_tokens as u32;
-
-        // Phase 1 working pages are stale (they reference old KV data from
-        // before suspension). We keep track of them to drain after replay.
-        let initial_working_len = self.contexts.get(&ctx_id)
-            .map(|c| c.working_pages.len()).unwrap_or(0);
-
-        let mut chunks = Vec::new();
-        let mut offset = matched_tokens;
-
-        while offset < page_aligned {
-            // Find the adapter for this position
-            let adapter = adapters.iter().rev()
-                .find(|(start, _)| *start <= offset)
-                .and_then(|(_, a)| *a);
-
-            // Find the next adapter boundary
-            let next_adapter_start = adapters.iter()
-                .find(|(start, _)| *start > offset)
-                .map(|(start, _)| *start)
-                .unwrap_or(page_aligned);
-
-            let chunk_end = next_adapter_start.min(page_aligned);
-            let chunk_tokens = &all_tokens[offset..chunk_end];
-            let chunk_positions = &all_positions[offset..chunk_end];
-            let chunk_masks = &all_masks[offset..chunk_end];
-
-            // Number of full pages in this chunk
-            let full_pages = chunk_tokens.len() / page_size;
-            if full_pages == 0 {
-                offset = chunk_end;
-                continue;
-            }
-
-            // Only take page-aligned tokens for the replay chunk
-            let aligned_len = full_pages * page_size;
-
-            // Allocate working pages for replay
-            let new_pages = match self.devices[dev_idx].alloc_gpu_pages(full_pages) {
-                Some(p) => p,
-                None => anyhow::bail!("No GPU pages for replay (should not happen: admission check passed)"),
-            };
-
-            // Track in context and scheduler
-            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                ctx.working_pages.extend(&new_pages);
-            }
+        if pending {
+            // Re-suspension was requested while replay was in-flight.
+            self.suspend_context(id);
             if let Some(pid) = owner {
-                self.process_entry(pid).device_mut(dev_idx).working += full_pages;
-            }
-
-            // Build physical page IDs: committed prefix + all working pages after initial
-            let phys_ids = {
-                let mut all_phys = if let Some(tip) = self.contexts.get(&ctx_id)
-                    .and_then(|c| c.committed_tip)
-                {
-                    self.devices[dev_idx].resolve_physical(tip)
-                } else {
-                    Vec::new()
-                };
-                // Extend with working pages allocated for replay (skip stale Phase 1 pages)
-                if let Some(ctx) = self.contexts.get(&ctx_id) {
-                    all_phys.extend_from_slice(&ctx.working_pages[initial_working_len..]);
+                if let Some(proc) = self.processes.get_mut(&pid) {
+                    proc.pending_pinned = proc.pending_pinned.saturating_sub(1);
+                    proc.pending_replay_count = proc.pending_replay_count.saturating_sub(1);
                 }
-                all_phys
-            };
-
-            let num_input = aligned_len as u32;
-            let total_kv = kv_so_far + num_input;
-            let total_pages_for_fwd = phys_ids.len() as u32;
-            let last_page_len = compute_last_page_len(total_kv, total_pages_for_fwd, page_size as u32);
-
-            chunks.push(ReplayFill {
-                context_id: ctx_id,
-                tokens: chunk_tokens[..aligned_len].to_vec(),
-                positions: chunk_positions[..aligned_len].to_vec(),
-                masks: chunk_masks[..aligned_len].to_vec(),
-                adapter,
-                physical_page_ids: phys_ids,
-                device_id: dev_idx as DeviceId,
-                kv_len: kv_so_far,
-                last_page_len,
-                num_pages: full_pages as u32,
-            });
-            kv_so_far += num_input;
-            offset += aligned_len;
+            }
+            // Don't fire deferred op — process was re-suspended.
+            // Don't drain_queues here — the suspended pages will be
+            // reclaimed when the last pending_pinned clears via unpin.
+            return;
         }
 
-        // Drain stale Phase 1 working pages (they hold old KV data)
-        if initial_working_len > 0 && !chunks.is_empty() {
-            // Clear working_page_tokens first (separate borrow scope)
-            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                ctx.working_page_tokens.clear();
-            }
-            let stale_pages: Vec<PhysicalPageId> = {
-                if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                    ctx.working_pages.drain(..initial_working_len).collect()
-                } else {
-                    Vec::new()
-                }
-            };
-            self.devices[dev_idx].free_gpu_pages(&stale_pages);
-            if let Some(pid) = owner {
-                let d = self.process_entry(pid).device_mut(dev_idx);
-                d.working -= initial_working_len;
-            }
-        }
-
-        Ok(chunks)
-    }
-
-    /// Commit a replay chunk (called during restore, after forward pass).
-    pub(crate) fn commit_replay_chunk(
-        &mut self,
-        id: ContextId,
-        _num_pages: u32,
-        tokens: Vec<u32>,
-        positions: Vec<u32>,
-        masks: Vec<crate::inference::brle::Brle>,
-        _adapter: Option<crate::adapter::AdapterId>,
-    ) -> anyhow::Result<()> {
-        let ctx = self.contexts.get(&id)
-            .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let prev_hash = ctx.committed_tip.unwrap_or(0);
-        let old_tip = ctx.committed_tip;
-        let working_phys = ctx.working_pages.clone();
-        let owner = ctx.owner;
-
-        let hashes = compute_page_hashes(self.page_size, &tokens, &positions, &masks, prev_hash);
-        let dev = &mut self.devices[dev_idx];
-
-        let mut new_phys = Vec::new();
-        let mut running_prev = prev_hash;
-        for (i, &hash) in hashes.iter().enumerate() {
-            if i < working_phys.len() {
-                let (phys, _) = dev.promote_page(hash, running_prev, working_phys[i]);
-                new_phys.push(phys);
-            }
-            running_prev = hash;
-        }
-
-        let new_tip = *hashes.last()
-            .ok_or_else(|| anyhow::anyhow!("No hashes computed during replay commit"))?;
-        dev.update_index_cache(new_tip, old_tip, &new_phys);
-
-        // Update Context (local)
+        // Normal path: Pinned → Active
         if let Some(ctx) = self.contexts.get_mut(&id) {
-            ctx.committed_tip = Some(new_tip);
-            // Drain the working pages that were committed during replay
-            let to_remove = new_phys.len().min(ctx.working_pages.len());
-            ctx.working_pages.drain(..to_remove);
-        }
-
-        // Update committed_len on Context
-        if let Some(ctx) = self.contexts.get_mut(&id) {
-            ctx.committed_len += new_phys.len();
+            ctx.state = ContextState::Active;
         }
 
         if let Some(pid) = owner {
-            let d = self.process_entry(pid).device_mut(dev_idx);
-            d.committed += new_phys.len();
-            d.working -= new_phys.len();
-        }
-
-        Ok(())
-    }
-
-    /// Finish restoration: transition context from replay to fully active.
-    pub(crate) fn finish_restore(&mut self, id: ContextId) {
-        if let Some(ctx) = self.contexts.get_mut(&id) {
-            ctx.state = ContextState::Active;
+            let should_fire = if let Some(proc) = self.processes.get_mut(&pid) {
+                proc.pending_replay_count = proc.pending_replay_count.saturating_sub(1);
+                proc.pending_replay_count == 0 && proc.state == ProcessState::Running
+            } else {
+                false
+            };
+            if should_fire {
+                self.fire_deferred_op(pid);
+            }
         }
     }
 }

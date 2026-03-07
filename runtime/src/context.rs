@@ -30,7 +30,7 @@ use crate::device::{self, DeviceId};
 
 use pagestore::{PhysicalPageId, PageHash, PageStore};
 use sched::ProcessEntry;
-use replay::ReplayFill;
+
 use suspend::{AllocWaiter, DeferredOp, RestoreWaiter};
 
 // =============================================================================
@@ -43,7 +43,7 @@ pub type ContextId = u64;
 // Globals
 // =============================================================================
 
-static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
+pub(crate) static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 static PAGE_SIZES: LazyLock<boxcar::Vec<usize>> = LazyLock::new(boxcar::Vec::new);
 
 // =============================================================================
@@ -322,9 +322,6 @@ pub(crate) struct ContextManager {
     pub(crate) try_alloc: VecDeque<AllocWaiter>,
     /// Priority heap: Pending processes waiting for restoration.
     pub(crate) try_restore: BinaryHeap<RestoreWaiter>,
-    /// Accumulated replay chunks from the current message handler.
-    /// Flushed via `dispatch_replays` at the end of each `handle()` call.
-    pub(crate) pending_replays: Vec<ReplayFill>,
 }
 
 impl ContextManager {
@@ -339,7 +336,6 @@ impl ContextManager {
             contexts: HashMap::new(),
             try_alloc: VecDeque::new(),
             try_restore: BinaryHeap::new(),
-            pending_replays: Vec::new(),
         }
     }
 
@@ -768,7 +764,17 @@ impl ContextManager {
             let mut new_phys = Vec::with_capacity(num_pages);
             let mut prev = prev_hash;
             for (i, &hash) in hashes.iter().enumerate() {
-                let (phys, _) = dev.promote_page(hash, prev, pages[i]);
+
+                // Dedup: page already exists on GPU
+                let phys = if let Some((existing, rc)) = dev.pages.get_mut(&hash) {
+                    *rc += 1;
+                    let p = *existing;
+                    dev.free_gpu_pages(&[pages[i]]);
+                    p
+                } else {
+                    dev.insert_chain_link(hash, prev);
+                    pages[i]
+                };
                 new_phys.push(phys);
                 prev = hash;
             }
@@ -857,7 +863,7 @@ impl ContextManager {
     /// Core pin logic: resolve physical pages, transition to Pinned.
     /// Accepts Active or Pinned contexts (Pinned for deferred pins replayed
     /// while restore replay is still in-flight).
-    /// Called by `request_pin()` directly and by `restore_and_replay()` for deferred pins.
+    /// Called by `request_pin()` directly and by `restore_process()` for deferred pins.
     pub(crate) fn pin(&mut self, id: ContextId, num_input_tokens: u32) -> Result<PinnedContext> {
         let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
@@ -965,8 +971,9 @@ impl ContextManager {
             }
 
             let waiter = self.try_restore.pop().unwrap();
-            let chunks = self.restore_and_replay(waiter.process_id);
-            self.pending_replays.extend(chunks);
+            if let Err(e) = self.restore_process(waiter.process_id) {
+                eprintln!("RESTORE_PROCESS_FAIL pid={} err={e:#}", waiter.process_id);
+            }
         }
     }
 
@@ -1062,6 +1069,7 @@ pub(crate) enum Message {
     ReleaseWorkingPages { id: ContextId, num_pages: usize },
     Pin { id: ContextId, num_input_tokens: u32, response: oneshot::Sender<Result<PinnedContext>> },
     Unpin { id: ContextId },
+    FinishRestore { id: ContextId },
     GetStats { response: oneshot::Sender<Vec<(usize, usize)>> },
 
     // Actor-routed read/write APIs (previously DashMap-based)
@@ -1120,6 +1128,9 @@ impl ServiceHandler for ContextManager {
             Message::Unpin { id } => {
                 self.unpin(id);
             }
+            Message::FinishRestore { id } => {
+                self.finish_restore(id);
+            }
             Message::GetStats { response } => {
                 let _ = response.send(self.stats());
             }
@@ -1145,8 +1156,5 @@ impl ServiceHandler for ContextManager {
                 let _ = response.send(self.debug_state(id));
             }
         }
-        // Single flush: dispatch all replay chunks accumulated during this message.
-        let replays = std::mem::take(&mut self.pending_replays);
-        self.dispatch_replays(replays).await;
     }
 }
