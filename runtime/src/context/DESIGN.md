@@ -262,7 +262,7 @@ drain_queues():
                         + deferred_alloc_pages[d]  // from ProcessEntry.deferred_op (Alloc variant)
             available[d] >= required[d]
         if can_restore:
-            pop top → restore_process(top)
+            pop top → restore_all(top)
         else:
             break
 ```
@@ -303,22 +303,22 @@ enum DeferredOp {
 Ordering: `effective_priority = priority_floor + AGING_RATE × wait_seconds`
 AGING_RATE = 0.01 — starvation freedom.
 
-After `restore_process` completes, pending allocs are re-attempted. If allocation
+After `restore_all` completes, pending allocs are re-attempted. If allocation
 succeeds, the response channel fires Ok. The process unblocks and resumes.
 
 ---
 
 ## 6. Restoration
 
-### restore_process(pid)
+### restore_all(pid)
 ```
 for each context in process:
-    restore_context(ctx)
+    restore(ctx)
 set process state = Running
 replay deferred_op from ProcessEntry (allocate + send response, or pin + send result)
 ```
 
-### restore_context(ctx)
+### restore(ctx)
 ```
 Phase 1: Swap in working pages
     alloc GPU pages (exact count = working_pages.len())

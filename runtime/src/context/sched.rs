@@ -67,13 +67,13 @@ pub(crate) struct ProcessEntry {
     /// Number of Pinned contexts still awaiting clear_pinned.
     /// Restore is blocked until this reaches 0.
     pub pending_pinned: usize,
-    /// Number of contexts still being replayed (awaiting FinishRestore).
+    /// Number of contexts still being replayed (awaiting ReplayComplete).
     /// Deferred op fires when this reaches 0.
     pub pending_replay_count: usize,
     /// Deferred operations held while Pending.
     /// Multiple may be active if the WASM guest has concurrent tasks.
     /// All are replayed after restoration completes.
-    pub deferred_ops: Vec<super::suspend::PendingAlloc>,
+    pub deferred_ops: Vec<super::contention::PendingAlloc>,
 }
 
 impl ProcessEntry {
