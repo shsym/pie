@@ -5,7 +5,6 @@ use super::{
     Record,
 };
 use super::sched::ProcessState;
-use super::Message;
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
 use crate::inference;
 use crate::inference::request::ForwardPassRequest;
@@ -46,36 +45,11 @@ impl ContextManager {
             }
         }
 
-        // Add deferred op requirements (iterate all deferred ops)
+        // Add deferred op requirements
         if let Some(proc) = self.processes.get(&pid) {
             for op in &proc.deferred_ops {
-                match op {
-                    Message::ReserveWorkingPages { id, num_pages, .. } => {
-                        if let Some(ctx) = self.contexts.get(id) {
-                            let dev_idx = ctx.device.unwrap_or(0) as usize;
-                            *required.entry(dev_idx).or_insert(0) += num_pages;
-                        }
-                    }
-                    Message::Fork { id, .. } => {
-                        // Fork needs GPU pages for working page copy
-                        if let Some(src) = self.contexts.get(id) {
-                            let dev_idx = src.device.unwrap_or(0) as usize;
-                            *required.entry(dev_idx).or_insert(0) += src.working_pages.len();
-                        }
-                    }
-                    Message::Take { username, name, .. } => {
-                        // Take needs GPU pages only if snapshot is Suspended (H2D swap-in)
-                        let key = (username.clone(), name.clone());
-                        if let Some(&snap_id) = self.snapshots.get(&key) {
-                            if let Some(snap) = self.contexts.get(&snap_id) {
-                                if snap.is_suspended() && !snap.working_pages.is_empty() {
-                                    let dev_idx = snap.device.unwrap_or(0) as usize;
-                                    *required.entry(dev_idx).or_insert(0) += snap.working_pages.len();
-                                }
-                            }
-                        }
-                    }
-                    _ => {} // Pin and others don't need extra GPU pages
+                if op.num_pages > 0 {
+                    *required.entry(op.device).or_insert(0) += op.num_pages;
                 }
             }
         }
@@ -180,8 +154,15 @@ impl ContextManager {
             0
         };
 
-        // Phase 3: Eagerly promote suffix pages and spawn replay forward passes.
-        let has_replay = self.spawn_replay_passes(ctx_id, dev_idx, prefix_len)?;
+        // Phase 3: Allocate suffix GPU pages and spawn replay forward passes.
+        let suffix_count = committed_hashes.len().saturating_sub(prefix_len);
+        let suffix_pages = if suffix_count > 0 {
+            self.devices[dev_idx].alloc_gpu_pages(suffix_count)
+                .ok_or_else(|| anyhow::anyhow!("No GPU pages for replay but admission check passed"))?
+        } else {
+            Vec::new()
+        };
+        let has_replay = self.spawn_replay_passes(ctx_id, dev_idx, prefix_len, suffix_pages)?;
 
         // Pinned while forward passes fill KV data; Active if full prefix match.
         if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
@@ -191,19 +172,19 @@ impl ContextManager {
         Ok(has_replay)
     }
 
-    /// Promote suffix pages, build forward pass requests, and spawn a
-    /// tokio task that submits them sequentially to fill KV data.
+    /// Promote pre-allocated suffix pages and spawn replay forward passes.
     ///
-    /// Eagerly allocates GPU pages and promotes them into the page store for the
-    /// suffix (pages not GPU-resident). Returns `true` if any passes were spawned.
+    /// Registers the provided `suffix_pages` in the page store for the suffix
+    /// (pages not GPU-resident), then spawns a tokio task to fill KV data.
+    /// Returns `true` if any passes were spawned.
     ///
-    /// Uses the chain hashes (preserved from before suspension) directly,
-    /// avoiding recomputation from the lineage.
-    fn spawn_replay_passes(
+    /// All GPU page allocation must be done by the caller.
+    pub(crate) fn spawn_replay_passes(
         &mut self,
         ctx_id: ContextId,
         dev_idx: usize,
         prefix_len: usize,
+        suffix_pages: Vec<PhysicalPageId>,
     ) -> anyhow::Result<bool> {
         let ctx = self.contexts.get(&ctx_id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
@@ -220,12 +201,13 @@ impl ContextManager {
             return Ok(false);
         }
 
-        // Eagerly allocate GPU pages for the suffix and register in the pages map.
+        // Register pre-allocated suffix pages in the page store.
         // The forward pass will fill KV data; until then the context is Pinned.
         let suffix_count = committed_len - prefix_len;
         let suffix_hashes = &committed_hashes[prefix_len..];
-        let suffix_phys = self.devices[dev_idx].alloc_gpu_pages(suffix_count)
-            .ok_or_else(|| anyhow::anyhow!("No GPU pages for replay but admission check passed"))?;
+        anyhow::ensure!(suffix_pages.len() == suffix_count,
+            "suffix page count mismatch: got {}, need {suffix_count}", suffix_pages.len());
+        let suffix_phys = suffix_pages;
 
         // Register suffix pages in PageStore
         for (i, &hash) in suffix_hashes.iter().enumerate() {
@@ -336,37 +318,16 @@ impl ContextManager {
     /// Fire all of a process's deferred operations.
     /// Called when all replay forward passes have completed.
     fn fire_deferred_ops(&mut self, pid: ProcessId) {
-        let ops: Vec<Message> = self.processes.get_mut(&pid)
+        let ops = self.processes.get_mut(&pid)
             .map(|p| std::mem::take(&mut p.deferred_ops))
             .unwrap_or_default();
         for op in ops {
-            match op {
-                Message::ReserveWorkingPages { id, num_pages, response } => {
-                    let dev_idx = self.contexts.get(&id)
-                        .map(|c| c.device.unwrap_or(0) as usize)
-                        .unwrap_or(0);
-                    if self.reserve_working_pages(id, dev_idx, num_pages, Some(pid)).is_ok() {
-                        let _ = response.send(Ok(()));
-                    } else {
-                        let _ = response.send(Err(anyhow::anyhow!(
-                            "Insufficient pages during restore replay (should not happen)"
-                        )));
-                    }
-                }
-                Message::Pin { id, num_input_tokens, response } => {
-                    let result = self.pin(id, num_input_tokens);
-                    let _ = response.send(result);
-                }
-                Message::Fork { id, owner, response } => {
-                    let result = self.fork(id, owner);
-                    let _ = response.send(result);
-                }
-                Message::Take { username, name, owner, response } => {
-                    let result = self.take(username, name, owner);
-                    let _ = response.send(result);
-                }
-                _ => {} // Non-deferrable messages should never appear here
-            }
+            let pages = if op.num_pages > 0 {
+                self.devices[op.device].alloc_gpu_pages(op.num_pages).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (op.on_alloc)(self, pages);
         }
     }
 
@@ -418,6 +379,5 @@ impl ContextManager {
                 self.fire_deferred_ops(pid);
             }
         }
-
     }
 }
