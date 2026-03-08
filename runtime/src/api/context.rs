@@ -48,7 +48,11 @@ impl pie::core::context::HostContext for InstanceState {
         let username = self.get_username();
         let process_id = self.id();
 
-        match context::open(model_id, username, name, process_id).await {
+        let snapshot_id = match context::lookup_snapshot(model_id, username, name).await {
+            Ok(id) => id,
+            Err(e) => return Ok(Err(e.to_string())),
+        };
+        match context::fork(model_id, snapshot_id, process_id).await {
             Ok(context_id) => {
                 let ctx = Context { context_id, model_id };
                 Ok(Ok(self.ctx().table.push(ctx)?))
@@ -152,7 +156,7 @@ impl pie::core::context::HostContext for InstanceState {
     }
 
     async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
-        // Context cleanup is handled by DestroyProcess on instance drop.
+        // Context cleanup is handled by DestroyAll on instance drop.
         // Individual handle drops just remove the resource table entry.
         self.ctx().table.delete(this)?;
         Ok(())

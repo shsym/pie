@@ -1,18 +1,19 @@
 //! Suspension — Dual-Queue Contention Resolution Protocol.
 //!
 //! Implements the two-queue model from DESIGN.md:
-//! - `try_alloc` (FIFO): deferred allocation requests from Running processes
-//! - `try_restore` (Priority Heap): Pending processes awaiting full restoration
+//! - `alloc_queue` (FIFO): deferred GPU page requests from Running processes
+//! - `restore_queue` (Priority Heap): Pending processes awaiting full restoration
 //!
 //! ## Core Flows
 //!
-//! `reserve_working_pages` → attempt alloc → eviction loop → self-suspend to try_alloc
-//! `drain_queues`  → Phase 1 (try_alloc FIFO) → Phase 2 (try_restore heap)
+//! `with_gpu_pages` → FIFO gate → priority gate → alloc → eviction loop → self-suspend
+//! `drain_queues`  → Phase 1 (alloc_queue FIFO) → Phase 2 (restore_queue heap)
 //! `clear_pinned`  → check pending_suspend flag → execute deferred suspension
 
 use std::cmp::Ordering;
+use std::fmt;
 use std::time::Instant;
-use tokio::sync::oneshot;
+
 
 
 use crate::device;
@@ -21,6 +22,7 @@ use crate::process::ProcessId;
 use super::{
     ContextId, ContextManager, ContextState,
 };
+use super::pagestore::PhysicalPageId;
 use super::sched::ProcessState;
 
 
@@ -28,19 +30,37 @@ use super::sched::ProcessState;
 // Queue Items
 // =============================================================================
 
-/// A deferred page allocation request (try_alloc queue).
-#[derive(Debug)]
-pub(crate) struct AllocWaiter {
-    pub context_id: ContextId,
+/// A deferred GPU page operation.
+///
+/// Used in both `alloc_queue` (FIFO for contention) and `deferred_ops`
+/// (process-level deferral during suspension). On success, `on_alloc` is
+/// called with pre-allocated pages. On deferral, the entire struct is stashed.
+/// On cancellation (destroy), the struct is dropped — dropping the closure
+/// drops the captured `oneshot::Sender`, closing the channel.
+pub(crate) struct PendingAlloc {
     pub device: usize,
     pub num_pages: usize,
-    pub response: oneshot::Sender<anyhow::Result<()>>,
+    /// Context this operation belongs to (for destroy filtering). None for Take.
+    pub context_id: Option<ContextId>,
+    /// Callback invoked with allocated pages on success.
+    pub on_alloc: Box<dyn FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send>,
+}
+
+impl fmt::Debug for PendingAlloc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingAlloc")
+            .field("device", &self.device)
+            .field("num_pages", &self.num_pages)
+            .field("context_id", &self.context_id)
+            .field("on_alloc", &"<closure>")
+            .finish()
+    }
 }
 
 
-/// A deferred process restoration request (try_restore queue).
+/// A deferred process restoration request (restore_queue queue).
 #[derive(Debug)]
-pub(crate) struct RestoreWaiter {
+pub(crate) struct PendingRestore {
     pub process_id: ProcessId,
     pub priority_floor: f64,
     pub enqueued_at: Instant,
@@ -48,27 +68,27 @@ pub(crate) struct RestoreWaiter {
 
 const AGING_RATE: f64 = 0.01;
 
-impl RestoreWaiter {
+impl PendingRestore {
     pub(crate) fn effective_priority(&self) -> f64 {
         let wait_secs = self.enqueued_at.elapsed().as_secs_f64();
         self.priority_floor + AGING_RATE * wait_secs
     }
 }
 
-impl PartialEq for RestoreWaiter {
+impl PartialEq for PendingRestore {
     fn eq(&self, other: &Self) -> bool {
         self.process_id == other.process_id
     }
 }
-impl Eq for RestoreWaiter {}
+impl Eq for PendingRestore {}
 
-impl PartialOrd for RestoreWaiter {
+impl PartialOrd for PendingRestore {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for RestoreWaiter {
+impl Ord for PendingRestore {
     fn cmp(&self, other: &Self) -> Ordering {
         // BinaryHeap is a max-heap — highest effective priority pops first.
         self.effective_priority()
@@ -104,6 +124,147 @@ impl SuspendResult {
 // =============================================================================
 
 impl ContextManager {
+
+    // ==================== GPU Page Contention ====================
+
+    /// Pending-aware operation helper (no pages needed).
+    ///
+    /// If the process is Pending, defers `on_ready` as a zero-page `PendingAlloc`.
+    /// Otherwise calls `on_ready` immediately. Used for operations like `pin`
+    /// that don't need page allocation but must respect process suspension.
+    pub(crate) fn with_gpu(
+        &mut self,
+        pid: ProcessId,
+        context_id: Option<ContextId>,
+        on_ready: impl FnOnce(&mut ContextManager) + Send + 'static,
+    ) {
+        self.with_gpu_pages(pid, 0, 0, context_id, move |mgr, _pages| on_ready(mgr));
+    }
+
+    /// Universal GPU page contention primitive.
+    ///
+    /// Attempts to allocate `num_pages` GPU pages on `dev_idx` for process `pid`.
+    /// Goes through: Pending check → num_pages==0 fast-path → FIFO gate →
+    /// priority gate → free pool → eviction loop → self-suspend.
+    ///
+    /// On success, invokes `on_alloc` with the allocated pages.
+    /// On deferral, the operation is stashed (in `alloc_queue` or `deferred_ops`)
+    /// and will be replayed when pages become available.
+    pub(crate) fn with_gpu_pages(
+        &mut self,
+        pid: ProcessId,
+        dev_idx: usize,
+        num_pages: usize,
+        context_id: Option<ContextId>,
+        on_alloc: impl FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send + 'static,
+    ) {
+        let pending = PendingAlloc {
+            device: dev_idx, num_pages, context_id,
+            on_alloc: Box::new(on_alloc),
+        };
+
+        // SUSPENSION CHECK: If the owning process is Pending, store as deferred op.
+        {
+            let proc = self.process_entry(pid);
+            if proc.state == ProcessState::Pending {
+                proc.deferred_ops.push(pending);
+                return;
+            }
+        }
+
+        // Short-circuit: no pages needed.
+        if num_pages == 0 {
+            (pending.on_alloc)(self, Vec::new());
+            return;
+        }
+
+        // Step 1: FIFO GATE — if alloc_queue has pending requests, enqueue behind them.
+        if !self.alloc_queue.is_empty() {
+            self.alloc_queue.push_back(pending);
+            return;
+        }
+
+        // Step 2: PRIORITY GATE — compare requester floor vs restore_queue head.
+        let requester_floor = {
+            let proc = self.process_entry(pid);
+            let pages = proc.pages_on(dev_idx);
+            proc.weight * (pages + num_pages) as f64
+        };
+
+        if let Some(top) = self.restore_queue.peek() {
+            let top_pid = top.process_id;
+            let top_ready = self.processes.get(&top_pid)
+                .map(|p| p.pending_pinned == 0).unwrap_or(true);
+            if top_ready && requester_floor < top.effective_priority() {
+                // Requester loses priority gate → suspend and enqueue in restore_queue.
+                let (pinned, _) = self.suspend_process(pid);
+                self.enqueue_restore(pid, requester_floor, pinned);
+                self.process_entry(pid).deferred_ops.push(pending);
+                return;
+            }
+        }
+
+        // Step 3: TRY ALLOCATE from free pool.
+        if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(num_pages) {
+            (pending.on_alloc)(self, pages);
+            return;
+        }
+
+        // Step 4: EVICTION LOOP — with deferred page tracking.
+        // Structured to break with `alloc_result` to avoid conditional moves of `pending`.
+        let mut deferred_pages: usize = 0;
+        let mut has_deferred = false;
+        let mut alloc_result: Option<Vec<PhysicalPageId>> = None;
+
+        loop {
+            match self.find_eviction_victim(dev_idx, requester_floor, Some(pid)) {
+                Some(victim_pid) => {
+                    let victim_floor = self.processes.get(&victim_pid)
+                        .map(|e| e.priority_on(dev_idx)).unwrap_or(0.0);
+                    let estimate = self.estimate_suspend(victim_pid, dev_idx);
+                    let (pinned, _) = self.suspend_process(victim_pid);
+                    self.enqueue_restore(victim_pid, victim_floor, pinned);
+
+                    if estimate.pinned_count > 0 {
+                        deferred_pages += estimate.total_deferred();
+                        has_deferred = true;
+                    }
+
+                    // Retry alloc after victim suspension freed pages.
+                    if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(num_pages) {
+                        alloc_result = Some(pages);
+                        break;
+                    }
+
+                    if has_deferred {
+                        let free_now = self.devices[dev_idx].available_gpu_pages();
+                        if free_now + deferred_pages >= num_pages {
+                            break;
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+
+        // Post-loop: handle eviction results.
+        if let Some(pages) = alloc_result {
+            self.drain_queues();
+            (pending.on_alloc)(self, pages);
+            return;
+        }
+
+        if has_deferred {
+            // Step 5: Deferred pages from Pinned contexts will cover the gap.
+            self.alloc_queue.push_back(pending);
+            return;
+        }
+
+        // Step 6: NO VICTIM — requester self-suspends.
+        let (pinned, _) = self.suspend_process(pid);
+        self.enqueue_restore(pid, requester_floor, pinned);
+        self.process_entry(pid).deferred_ops.push(pending);
+    }
 
     // ==================== Eviction ====================
 
@@ -149,14 +310,14 @@ impl ContextManager {
         cheapest.map(|(pid, _, _)| pid)
     }
 
-    /// Helper: enqueue a RestoreWaiter for a suspended process.
+    /// Helper: enqueue a PendingRestore for a suspended process.
     pub(crate) fn enqueue_restore(&mut self, pid: ProcessId, priority_floor: f64, pinned_count: usize) {
         if pinned_count > 0 {
             if let Some(proc) = self.processes.get_mut(&pid) {
                 proc.pending_pinned += pinned_count;
             }
         }
-        self.try_restore.push(RestoreWaiter {
+        self.restore_queue.push(PendingRestore {
             process_id: pid,
             priority_floor,
             enqueued_at: Instant::now(),

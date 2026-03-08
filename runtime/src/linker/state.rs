@@ -40,7 +40,7 @@ impl Drop for InstanceState {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
         // Destroy all contexts owned by this process across all models.
-        context::destroy_process(self.id);
+        context::destroy_all(self.id);
     }
 }
 
