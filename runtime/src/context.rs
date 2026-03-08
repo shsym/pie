@@ -906,7 +906,7 @@ impl ServiceHandler for ContextManager {
                 self.unpin(id);
             }
             Message::ReplayComplete { id } => {
-                self.finish_restore(id);
+                self.replay_complete(id);
             }
             Message::GetStats { response } => {
                 let _ = response.send(self.stats());

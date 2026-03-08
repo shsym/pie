@@ -11,6 +11,7 @@
 //! `clear_pinned`  → check pending_suspend flag → execute deferred suspension
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::Instant;
 
@@ -370,6 +371,19 @@ impl ContextManager {
                 proc.zero_device(dev);
             }
         }
+
+        // Drain alloc_queue entries belonging to this process's contexts
+        // and stash them as deferred_ops so they fire correctly on restore.
+        let ctx_set: std::collections::HashSet<ContextId> = ctx_ids.iter().copied().collect();
+        let mut kept = VecDeque::new();
+        while let Some(entry) = self.alloc_queue.pop_front() {
+            if entry.context_id.map_or(false, |cid| ctx_set.contains(&cid)) {
+                self.processes.get_mut(&pid).unwrap().deferred_ops.push(entry);
+            } else {
+                kept.push_back(entry);
+            }
+        }
+        self.alloc_queue = kept;
 
         (pinned_count, active_count)
     }

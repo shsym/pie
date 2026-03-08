@@ -68,7 +68,7 @@ impl ContextManager {
     /// Called by drain_queues after admission check passes.
     ///
     /// Deferred ops fire only after all replay forward passes complete
-    /// (in `finish_restore`). If no replays are needed, deferred ops
+    /// (in `replay_complete`). If no replays are needed, deferred ops
     /// fire immediately here.
     pub(crate) fn restore_all(&mut self, pid: ProcessId) -> anyhow::Result<()> {
         let ctx_ids: Vec<ContextId> = self.processes.get(&pid)
@@ -318,27 +318,28 @@ impl ContextManager {
             .map(|p| std::mem::take(&mut p.deferred_ops))
             .unwrap_or_default();
         for op in ops {
-            let pages = if op.num_pages > 0 {
-                self.devices[op.device].alloc_gpu_pages(op.num_pages).unwrap_or_default()
+            if op.num_pages == 0 {
+                (op.on_alloc)(self, Vec::new());
+            } else if let Some(pages) = self.devices[op.device].alloc_gpu_pages(op.num_pages) {
+                (op.on_alloc)(self, pages);
             } else {
-                Vec::new()
-            };
-            (op.on_alloc)(self, pages);
+                // Pages no longer available — re-enter contention via alloc_queue.
+                self.alloc_queue.push_back(op);
+            }
         }
     }
 
-    /// Finish restoration: transition context out of Pinned, then fire
-    /// deferred ops when all replay forward passes for the owning process
-    /// have completed.
+    /// Handle a completed replay forward pass: transition context out of
+    /// Pinned, then fire deferred ops when all replay forward passes for
+    /// the owning process have completed.
     ///
-    /// Called by the actor when a ReplayComplete message arrives after
-    /// a replay forward pass completes.
+    /// Called by the actor when a ReplayComplete message arrives.
     ///
     /// NOTE: We intentionally do NOT reuse `unpin()` here because `unpin`
     /// calls `drain_queues`, which can re-restore this same process via
     /// `restore_all` — overwriting `pending_replay_count` before
     /// we get to decrement it (reentrancy corruption).
-    pub(crate) fn finish_restore(&mut self, id: ContextId) {
+    pub(crate) fn replay_complete(&mut self, id: ContextId) {
         let (owner, pending) = match self.contexts.get(&id) {
             Some(ctx) if ctx.is_pinned() => (ctx.owner, ctx.pending_suspend),
             _ => return,

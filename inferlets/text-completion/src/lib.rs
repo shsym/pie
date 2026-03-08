@@ -1,14 +1,13 @@
 //! Simple text completion inferlet.
 //!
 //! Demonstrates chat-style generation using typed JSON input/output
-//! with the `InstructExt` + `EventStream` high-level API.
+//! with the `EventStream` high-level API.
 
 use inferlet::{
-    context::Context,
+    Context, Event,
     inference::Sampler,
     model::Model,
     runtime,
-    ContextExt, Event, InstructExt,
     Result,
 };
 use serde::{Deserialize, Serialize};
@@ -56,7 +55,7 @@ async fn main(input: Input) -> Result<Output> {
     let model = Model::load(model_name)?;
 
     // Create context and fill with instruct messages
-    let ctx = Context::new(&model)?;
+    let mut ctx = Context::new(&model)?;
     ctx.system(&input.system);
     ctx.user(&input.prompt);
     ctx.cue();
