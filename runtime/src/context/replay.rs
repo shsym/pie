@@ -5,7 +5,7 @@ use super::{
     Record,
 };
 use super::sched::ProcessState;
-use super::suspend::DeferredOp;
+use super::Message;
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
 use crate::inference;
 use crate::inference::request::ForwardPassRequest;
@@ -46,11 +46,37 @@ impl ContextManager {
             }
         }
 
-        // Add deferred alloc requirements (Pin doesn't need extra pages)
+        // Add deferred op requirements (iterate all deferred ops)
         if let Some(proc) = self.processes.get(&pid) {
-            if let Some(DeferredOp::Alloc(ref alloc)) = proc.deferred_op {
-                let dev_idx = alloc.device as usize;
-                *required.entry(dev_idx).or_insert(0) += alloc.num_pages;
+            for op in &proc.deferred_ops {
+                match op {
+                    Message::ReserveWorkingPages { id, num_pages, .. } => {
+                        if let Some(ctx) = self.contexts.get(id) {
+                            let dev_idx = ctx.device.unwrap_or(0) as usize;
+                            *required.entry(dev_idx).or_insert(0) += num_pages;
+                        }
+                    }
+                    Message::Fork { id, .. } => {
+                        // Fork needs GPU pages for working page copy
+                        if let Some(src) = self.contexts.get(id) {
+                            let dev_idx = src.device.unwrap_or(0) as usize;
+                            *required.entry(dev_idx).or_insert(0) += src.working_pages.len();
+                        }
+                    }
+                    Message::Take { username, name, .. } => {
+                        // Take needs GPU pages only if snapshot is Suspended (H2D swap-in)
+                        let key = (username.clone(), name.clone());
+                        if let Some(&snap_id) = self.snapshots.get(&key) {
+                            if let Some(snap) = self.contexts.get(&snap_id) {
+                                if snap.is_suspended() && !snap.working_pages.is_empty() {
+                                    let dev_idx = snap.device.unwrap_or(0) as usize;
+                                    *required.entry(dev_idx).or_insert(0) += snap.working_pages.len();
+                                }
+                            }
+                        }
+                    }
+                    _ => {} // Pin and others don't need extra GPU pages
+                }
             }
         }
 
@@ -103,7 +129,7 @@ impl ContextManager {
 
         // If no replays needed, fire deferred ops immediately (no FinishRestore coming)
         if replay_count == 0 {
-            self.fire_deferred_op(pid);
+            self.fire_deferred_ops(pid);
         }
 
         Ok(())
@@ -307,27 +333,39 @@ impl ContextManager {
         Ok(true)
     }
 
-    /// Fire a process's deferred operation (Alloc or Pin).
+    /// Fire all of a process's deferred operations.
     /// Called when all replay forward passes have completed.
-    fn fire_deferred_op(&mut self, pid: ProcessId) {
-        let deferred = self.processes.get_mut(&pid)
-            .and_then(|p| p.deferred_op.take());
-        if let Some(op) = deferred {
+    fn fire_deferred_ops(&mut self, pid: ProcessId) {
+        let ops: Vec<Message> = self.processes.get_mut(&pid)
+            .map(|p| std::mem::take(&mut p.deferred_ops))
+            .unwrap_or_default();
+        for op in ops {
             match op {
-                DeferredOp::Alloc(alloc) => {
-                    let dev_idx = alloc.device as usize;
-                    if self.reserve_working_pages(alloc.context_id, dev_idx, alloc.num_pages, Some(pid)).is_ok() {
-                        let _ = alloc.response.send(Ok(()));
+                Message::ReserveWorkingPages { id, num_pages, response } => {
+                    let dev_idx = self.contexts.get(&id)
+                        .map(|c| c.device.unwrap_or(0) as usize)
+                        .unwrap_or(0);
+                    if self.reserve_working_pages(id, dev_idx, num_pages, Some(pid)).is_ok() {
+                        let _ = response.send(Ok(()));
                     } else {
-                        let _ = alloc.response.send(Err(anyhow::anyhow!(
+                        let _ = response.send(Err(anyhow::anyhow!(
                             "Insufficient pages during restore replay (should not happen)"
                         )));
                     }
                 }
-                DeferredOp::Pin { context_id, num_input_tokens, response } => {
-                    let result = self.pin(context_id, num_input_tokens);
+                Message::Pin { id, num_input_tokens, response } => {
+                    let result = self.pin(id, num_input_tokens);
                     let _ = response.send(result);
                 }
+                Message::Fork { id, owner, response } => {
+                    let result = self.fork(id, owner);
+                    let _ = response.send(result);
+                }
+                Message::Take { username, name, owner, response } => {
+                    let result = self.take(username, name, owner);
+                    let _ = response.send(result);
+                }
+                _ => {} // Non-deferrable messages should never appear here
             }
         }
     }
@@ -358,7 +396,7 @@ impl ContextManager {
                     proc.pending_replay_count = proc.pending_replay_count.saturating_sub(1);
                 }
             }
-            // Don't fire deferred op — process was re-suspended.
+            // Don't fire deferred ops — process was re-suspended.
             // Don't drain_queues here — the suspended pages will be
             // reclaimed when the last pending_pinned clears via unpin.
             return;
@@ -377,8 +415,9 @@ impl ContextManager {
                 false
             };
             if should_fire {
-                self.fire_deferred_op(pid);
+                self.fire_deferred_ops(pid);
             }
         }
+
     }
 }

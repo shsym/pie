@@ -37,20 +37,6 @@ pub(crate) struct AllocWaiter {
     pub response: oneshot::Sender<anyhow::Result<()>>,
 }
 
-/// A deferred operation held while a process is Pending (suspended).
-/// At most one can be active per process — the WASM guest is single-threaded
-/// and blocked on the response channel.
-#[derive(Debug)]
-pub(crate) enum DeferredOp {
-    /// Deferred page allocation (from `reserve_working_pages`).
-    Alloc(AllocWaiter),
-    /// Deferred pin (from `pin` on a non-active context).
-    Pin {
-        context_id: ContextId,
-        num_input_tokens: u32,
-        response: oneshot::Sender<anyhow::Result<super::PinnedContext>>,
-    },
-}
 
 /// A deferred process restoration request (try_restore queue).
 #[derive(Debug)]

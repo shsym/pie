@@ -29,23 +29,27 @@ fn state() -> &'static TestState {
 const MODEL: usize = 0;
 const USER: &str = "test-user";
 
+fn test_pid() -> uuid::Uuid {
+    uuid::Uuid::new_v4()
+}
+
 #[test]
 fn create_and_save_and_open() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, None)
+        let id = pie::context::create(MODEL, test_pid())
             .await
             .unwrap();
 
         // Anonymous context is not findable by name
-        let found = pie::context::open(MODEL, USER.to_string(), "test-ctx".into()).await;
+        let found = pie::context::open(MODEL, USER.to_string(), "test-ctx".into(), test_pid()).await;
         assert!(found.is_err());
 
         // Save it with a name
         pie::context::save(MODEL, id, USER.to_string(), Some("test-ctx".into())).await.unwrap();
 
         // Now it should be findable (open returns a fork, so different id)
-        let found = pie::context::open(MODEL, USER.to_string(), "test-ctx".into()).await;
+        let found = pie::context::open(MODEL, USER.to_string(), "test-ctx".into(), test_pid()).await;
         assert!(found.is_ok());
     });
 }
@@ -54,14 +58,14 @@ fn create_and_save_and_open() {
 fn destroy_removes_context() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, None)
+        let id = pie::context::create(MODEL, test_pid())
             .await
             .unwrap();
 
-        pie::context::destroy(MODEL, id, false).await.unwrap();
+        pie::context::destroy(MODEL, id).await.unwrap();
 
         // Fork from destroyed context should fail
-        let fork_result = pie::context::fork(MODEL, id).await;
+        let fork_result = pie::context::fork(MODEL, id, test_pid()).await;
         assert!(fork_result.is_err(), "fork from destroyed context should fail");
     });
 }
@@ -70,12 +74,12 @@ fn destroy_removes_context() {
 fn force_destroy() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, None)
+        let id = pie::context::create(MODEL, test_pid())
             .await
             .unwrap();
 
-        // Force destroy should succeed even on a fresh context
-        pie::context::destroy(MODEL, id, true).await.unwrap();
+        // Destroy should succeed on a fresh context
+        pie::context::destroy(MODEL, id).await.unwrap();
     });
 }
 
@@ -83,7 +87,7 @@ fn force_destroy() {
 fn working_page_token_ops() {
     let s = state();
     s.rt.block_on(async {
-        let id = pie::context::create(MODEL, None)
+        let id = pie::context::create(MODEL, test_pid())
             .await
             .unwrap();
 
@@ -113,11 +117,11 @@ fn working_page_token_ops() {
 fn fork_context() {
     let s = state();
     s.rt.block_on(async {
-        let parent_id = pie::context::create(MODEL, None)
+        let parent_id = pie::context::create(MODEL, test_pid())
             .await
             .unwrap();
 
-        let child_id = pie::context::fork(MODEL, parent_id)
+        let child_id = pie::context::fork(MODEL, parent_id, test_pid())
             .await
             .unwrap();
 
@@ -143,7 +147,7 @@ fn full_page_lifecycle() {
         // ── Phase 1: Create anonymous context and fill prompt tokens ──
         let prompt: Vec<u32> = (1000..1032).collect(); // 32 tokens
         let pid = uuid::Uuid::new_v4();
-        let id = pie::context::create(MODEL, Some(pid)).await.unwrap();
+        let id = pie::context::create(MODEL, pid).await.unwrap();
 
         // Tokens per page should match the model config
         assert_eq!(
@@ -203,7 +207,7 @@ fn full_page_lifecycle() {
         ).await.unwrap();
         assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 2);
 
-        let child_id = pie::context::fork(MODEL, id).await.unwrap();
+        let child_id = pie::context::fork(MODEL, id, test_pid()).await.unwrap();
 
         assert_ne!(id, child_id);
 

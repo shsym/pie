@@ -31,7 +31,7 @@ use crate::device::{self, DeviceId};
 use pagestore::{PhysicalPageId, PageHash, PageStore};
 use sched::ProcessEntry;
 
-use suspend::{AllocWaiter, DeferredOp, RestoreWaiter};
+use suspend::{AllocWaiter, RestoreWaiter};
 
 // =============================================================================
 // Public Types
@@ -60,19 +60,19 @@ pub fn spawn(page_size: usize, num_gpu_pages: Vec<usize>, num_cpu_pages: Vec<usi
 
 // ---------- Actor-routed ----------
 
-pub async fn open(model_idx: usize, username: String, name: String) -> Result<ContextId> {
+pub async fn open(model_idx: usize, username: String, name: String, owner: ProcessId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Open { username, name, response: tx })?;
+    SERVICES.send(model_idx, Message::Open { username, name, owner, response: tx })?;
     rx.await.context("context::open: actor dropped response")?
 }
 
-pub async fn take(model_idx: usize, username: String, name: String) -> Result<ContextId> {
+pub async fn take(model_idx: usize, username: String, name: String, owner: ProcessId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Take { username, name, response: tx })?;
+    SERVICES.send(model_idx, Message::Take { username, name, owner, response: tx })?;
     rx.await.context("context::take: actor dropped response")?
 }
 
-pub async fn create(model_idx: usize, owner: Option<ProcessId>) -> Result<ContextId> {
+pub async fn create(model_idx: usize, owner: ProcessId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Create { owner, response: tx })?;
     rx.await.context("context::create: actor dropped response")?
@@ -92,15 +92,23 @@ pub async fn delete(model_idx: usize, username: String, name: String) -> Result<
     rx.await.context("context::delete: actor dropped response")?
 }
 
-pub async fn destroy(model_idx: usize, id: ContextId, force: bool) -> Result<()> {
+pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Destroy { id, force, response: tx })?;
+    SERVICES.send(model_idx, Message::Destroy { id, response: tx })?;
     rx.await.context("context::destroy: actor dropped response")?
 }
 
-pub async fn fork(model_idx: usize, id: ContextId) -> Result<ContextId> {
+/// Destroy all contexts owned by a process across all models.
+/// Called on WASM instance drop for automatic cleanup.
+pub fn destroy_process(pid: ProcessId) {
+    for model_idx in 0..SERVICES.len() {
+        let _ = SERVICES.send(model_idx, Message::DestroyProcess { pid });
+    }
+}
+
+pub async fn fork(model_idx: usize, id: ContextId, owner: ProcessId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Fork { id, response: tx })?;
+    SERVICES.send(model_idx, Message::Fork { id, owner, response: tx })?;
     rx.await.context("context::fork: actor dropped response")?
 }
 
@@ -357,17 +365,15 @@ impl ContextManager {
 
     // ==================== Core Operations ====================
 
-    pub(crate) fn create(&mut self, owner: Option<ProcessId>) -> Result<ContextId> {
+    pub(crate) fn create(&mut self, owner: ProcessId) -> Result<ContextId> {
         let id = self.next_id();
-        let mut ctx = Context::new(owner);
+        let mut ctx = Context::new(Some(owner));
         ctx.device = Some(self.least_loaded_device());
 
         self.contexts.insert(id, ctx);
 
-        if let Some(pid) = owner {
-            let proc = self.process_entry(pid);
-            proc.context_ids.push(id);
-        }
+        let proc = self.process_entry(owner);
+        proc.context_ids.push(id);
 
         Ok(id)
     }
@@ -382,21 +388,33 @@ impl ContextManager {
         if let Some(pid) = ctx.owner {
             let proc = self.process_entry(pid);
             proc.context_ids.retain(|&c| c != id);
-            let d = proc.device_mut(dev_idx);
-            d.committed -= committed_len;
-            d.working -= ctx.working_pages.len();
 
-            // Cancel deferred_op if it references the destroyed context.
-            let cancel_deferred = match &proc.deferred_op {
-                Some(DeferredOp::Alloc(a)) => a.context_id == id,
-                Some(DeferredOp::Pin { context_id, .. }) => *context_id == id,
-                None => false,
+            // Only decrement accounting if context was not Suspended
+            // (suspend_process already zeroed device pages).
+            if !ctx.is_suspended() {
+                let d = proc.device_mut(dev_idx);
+                d.committed -= committed_len;
+                d.working -= ctx.working_pages.len();
+            }
+
+            // Cancel deferred ops that reference the destroyed context.
+            let cancelled: Vec<Message> = {
+                let ops = std::mem::take(&mut proc.deferred_ops);
+                let (cancel, keep): (Vec<_>, Vec<_>) = ops.into_iter().partition(|op| match op {
+                    Message::ReserveWorkingPages { id: cid, .. } => *cid == id,
+                    Message::Pin { id: cid, .. } => *cid == id,
+                    Message::Fork { id: cid, .. } => *cid == id,
+                    _ => false,
+                });
+                proc.deferred_ops = keep;
+                cancel
             };
-            if cancel_deferred {
-                match proc.deferred_op.take() {
-                    Some(DeferredOp::Alloc(a)) => { let _ = a.response.send(Err(anyhow::anyhow!("Context destroyed"))); }
-                    Some(DeferredOp::Pin { response, .. }) => { let _ = response.send(Err(anyhow::anyhow!("Context destroyed"))); }
-                    None => {}
+            for op in cancelled {
+                match op {
+                    Message::ReserveWorkingPages { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Context destroyed"))); }
+                    Message::Pin { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Context destroyed"))); }
+                    Message::Fork { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Context destroyed"))); }
+                    _ => {}
                 }
             }
 
@@ -435,9 +453,94 @@ impl ContextManager {
         Ok(())
     }
 
-    pub(crate) fn fork(&mut self, id: ContextId) -> Result<ContextId> {
+    /// Destroy all contexts owned by a process.
+    /// Cancels all deferred ops, frees all resources, removes the process entry.
+    pub(crate) fn destroy_process(&mut self, pid: ProcessId) {
+        let proc = match self.processes.remove(&pid) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Cancel all deferred ops
+        for op in proc.deferred_ops {
+            match op {
+                Message::ReserveWorkingPages { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Process destroyed"))); }
+                Message::Pin { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Process destroyed"))); }
+                Message::Fork { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Process destroyed"))); }
+                Message::Take { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Process destroyed"))); }
+                _ => {}
+            }
+        }
+
+        // Clean stale AllocWaiter entries from try_alloc for this process's contexts
+        let ctx_ids: std::collections::HashSet<ContextId> = proc.context_ids.iter().copied().collect();
+        let mut i = 0;
+        while i < self.try_alloc.len() {
+            if ctx_ids.contains(&self.try_alloc[i].context_id) {
+                let waiter = self.try_alloc.remove(i).unwrap();
+                let _ = waiter.response.send(Err(anyhow::anyhow!("Process destroyed")));
+            } else {
+                i += 1;
+            }
+        }
+
+        // Remove from try_restore queue
+        self.try_restore.retain(|w| w.process_id != pid);
+
+        // Destroy all owned contexts
+        for ctx_id in proc.context_ids {
+            if let Some(ctx) = self.contexts.remove(&ctx_id) {
+                let dev_idx = ctx.device.unwrap_or(0) as usize;
+                if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
+                    self.devices[dev_idx].release(&ctx.committed_hashes);
+                }
+                if ctx.is_suspended() {
+                    self.devices[dev_idx].free_cpu_pages(&ctx.working_pages);
+                } else {
+                    self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
+                }
+                self.snapshots.retain(|_, v| *v != ctx_id);
+            }
+        }
+
+        self.drain_queues();
+    }
+    /// Contention-aware fork: checks Pending state and defers if needed.
+    pub(crate) fn request_fork(
+        &mut self,
+        id: ContextId,
+        owner: ProcessId,
+        response: oneshot::Sender<Result<ContextId>>,
+    ) {
+        // If the owning process is Pending, defer the fork.
+        let proc = self.process_entry(owner);
+        if proc.state == sched::ProcessState::Pending {
+            proc.deferred_ops.push(Message::Fork {
+                id,
+                owner,
+                response,
+            });
+            return;
+        }
+
+        let result = self.fork(id, owner);
+        let _ = response.send(result);
+    }
+
+    /// Contention-aware take: checks Pending state and defers if needed.
+    pub(crate) fn request_take(
+        &mut self,
+        username: String,
+        name: String,
+        owner: ProcessId,
+        response: oneshot::Sender<Result<ContextId>>,
+    ) {
+        let result = self.take(username, name, owner);
+        let _ = response.send(result);
+    }
+
+    pub(crate) fn fork(&mut self, id: ContextId, owner: ProcessId) -> Result<ContextId> {
         let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        let owner = ctx.owner;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let device = dev_idx as DeviceId;
         let src_on_gpu = !ctx.is_suspended();
@@ -486,7 +589,7 @@ impl ContextManager {
 
         let new_id = self.next_id();
         self.contexts.insert(new_id, Context {
-            owner,
+            owner: Some(owner),
             device: Some(device),
             working_pages: dst,
             committed_hashes: committed_hashes.clone(),
@@ -498,8 +601,8 @@ impl ContextManager {
             last_access: Instant::now(),
         });
 
-        if let Some(pid) = owner {
-            let proc = self.process_entry(pid);
+        {
+            let proc = self.process_entry(owner);
             proc.context_ids.push(new_id);
             if !suspended {
                 let d = proc.device_mut(dev_idx);
@@ -542,13 +645,12 @@ impl ContextManager {
         };
 
         // Step 0: SUSPENSION CHECK
-        // If the owning process is Pending, store as deferred_op.
+        // If the owning process is Pending, store as deferred op.
         let proc = self.process_entry(pid);
         if proc.state == sched::ProcessState::Pending {
-            proc.deferred_op = Some(DeferredOp::Alloc(AllocWaiter {
-                context_id: id, device: dev_idx,
-                num_pages: additional, response,
-            }));
+            proc.deferred_ops.push(Message::ReserveWorkingPages {
+                id, num_pages: additional, response,
+            });
             return;
         }
 
@@ -575,10 +677,9 @@ impl ContextManager {
                 // Requester loses priority gate → suspend and enqueue in try_restore.
                 let (pinned, _) = self.suspend_process(pid);
                 self.enqueue_restore(pid, requester_floor, pinned);
-                self.process_entry(pid).deferred_op = Some(DeferredOp::Alloc(AllocWaiter {
-                    context_id: id, device: dev_idx,
-                    num_pages: additional, response,
-                }));
+                self.process_entry(pid).deferred_ops.push(Message::ReserveWorkingPages {
+                    id, num_pages: additional, response,
+                });
                 return;
             }
         }
@@ -643,10 +744,9 @@ impl ContextManager {
             // Step 5: NO VICTIM — requester self-suspends.
             let (pinned, _) = self.suspend_process(pid);
             self.enqueue_restore(pid, requester_floor, pinned);
-            self.process_entry(pid).deferred_op = Some(DeferredOp::Alloc(AllocWaiter {
-                context_id: id, device: dev_idx,
-                num_pages: additional, response,
-            }));
+            self.process_entry(pid).deferred_ops.push(Message::ReserveWorkingPages {
+                id, num_pages: additional, response,
+            });
         }
     }
 
@@ -670,8 +770,6 @@ impl ContextManager {
         }
         Ok(())
     }
-
-    
 
     pub(crate) fn release_working_pages(&mut self, id: ContextId, num_pages: usize) -> Result<()> {
         let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
@@ -819,8 +917,8 @@ impl ContextManager {
             if let Some(pid) = owner {
                 let proc = self.process_entry(pid);
                 if proc.state == sched::ProcessState::Pending {
-                    proc.deferred_op = Some(DeferredOp::Pin {
-                        context_id: id,
+                    proc.deferred_ops.push(Message::Pin {
+                        id,
                         num_input_tokens,
                         response,
                     });
@@ -874,12 +972,10 @@ impl ContextManager {
     /// If `pending_suspend` was set, executes the deferred suspension and
     /// decrements `ProcessEntry.pending_pinned`.
     pub(crate) fn unpin(&mut self, id: ContextId) {
-        let (is_pinned, pending) = match self.contexts.get(&id) {
-            Some(ctx) if ctx.is_pinned() => (true, ctx.pending_suspend),
+        let pending = match self.contexts.get(&id) {
+            Some(ctx) if ctx.is_pinned() => ctx.pending_suspend,
             _ => return,
         };
-
-        if !is_pinned { return; }
 
         if pending {
             // Deferred suspension: context stays Pinned until suspend_context
@@ -1032,13 +1128,13 @@ impl ContextManager {
 
 #[derive(Debug)]
 pub(crate) enum Message {
-    Open { username: String, name: String, response: oneshot::Sender<Result<ContextId>> },
-    Create { owner: Option<ProcessId>, response: oneshot::Sender<Result<ContextId>> },
+    Open { username: String, name: String, owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
+    Create { owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
     Save { id: ContextId, username: String, name: Option<String>, response: oneshot::Sender<Result<Option<String>>> },
     Delete { username: String, name: String, response: oneshot::Sender<Result<()>> },
-    Destroy { id: ContextId, force: bool, response: oneshot::Sender<Result<()>> },
-    Fork { id: ContextId, response: oneshot::Sender<Result<ContextId>> },
-    Take { username: String, name: String, response: oneshot::Sender<Result<ContextId>> },
+    Destroy { id: ContextId, response: oneshot::Sender<Result<()>> },
+    Fork { id: ContextId, owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
+    Take { username: String, name: String, owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
     CommitWorkingPages { id: ContextId, num_pages: usize, response: oneshot::Sender<Result<()>> },
     ReserveWorkingPages { id: ContextId, num_pages: usize, response: oneshot::Sender<Result<()>> },
     ReleaseWorkingPages { id: ContextId, num_pages: usize },
@@ -1060,6 +1156,7 @@ pub(crate) enum Message {
 
     DebugState { id: ContextId, response: oneshot::Sender<String> },
     SetPriority { weight: f64, pid_values: HashMap<ProcessId, f64> },
+    DestroyProcess { pid: ProcessId },
 }
 
 impl ServiceHandler for ContextManager {
@@ -1067,11 +1164,11 @@ impl ServiceHandler for ContextManager {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Open { username, name, response } => {
-                let _ = response.send(self.open(username, name));
+            Message::Open { username, name, owner, response } => {
+                let _ = response.send(self.open(username, name, owner));
             }
-            Message::Take { username, name, response } => {
-                let _ = response.send(self.take(username, name));
+            Message::Take { username, name, owner, response } => {
+                self.request_take(username, name, owner, response);
             }
             Message::Create { owner, response } => {
                 let _ = response.send(self.create(owner));
@@ -1082,11 +1179,11 @@ impl ServiceHandler for ContextManager {
             Message::Delete { username, name, response } => {
                 let _ = response.send(self.delete(username, name));
             }
-            Message::Destroy { id, force: _, response } => {
+            Message::Destroy { id, response } => {
                 let _ = response.send(self.destroy(id));
             }
-            Message::Fork { id, response } => {
-                let _ = response.send(self.fork(id));
+            Message::Fork { id, owner, response } => {
+                self.request_fork(id, owner, response);
             }
             Message::CommitWorkingPages { id, num_pages, response } => {
                 let _ = response.send(self.commit_working_pages(id, num_pages));
@@ -1129,6 +1226,9 @@ impl ServiceHandler for ContextManager {
             }
             Message::DebugState { id, response } => {
                 let _ = response.send(self.debug_state(id));
+            }
+            Message::DestroyProcess { pid } => {
+                self.destroy_process(pid);
             }
         }
     }

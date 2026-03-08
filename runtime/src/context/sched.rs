@@ -24,7 +24,6 @@ use crate::device::DeviceId;
 use crate::process::ProcessId;
 
 use super::{ContextId, ContextManager};
-use super::suspend::DeferredOp;
 
 // =============================================================================
 // DevicePages (per-device accounting)
@@ -71,9 +70,10 @@ pub(crate) struct ProcessEntry {
     /// Number of contexts still being replayed (awaiting FinishRestore).
     /// Deferred op fires when this reaches 0.
     pub pending_replay_count: usize,
-    /// Deferred operation held while Pending (at most one — WASM guest is single-threaded).
-    /// Replayed after restoration completes.
-    pub deferred_op: Option<DeferredOp>,
+    /// Deferred messages held while Pending.
+    /// Multiple may be active if the WASM guest has concurrent tasks.
+    /// All are replayed after restoration completes.
+    pub deferred_ops: Vec<super::Message>,
 }
 
 impl ProcessEntry {
@@ -86,7 +86,7 @@ impl ProcessEntry {
             context_ids: Vec::new(),
             pending_pinned: 0,
             pending_replay_count: 0,
-            deferred_op: None,
+            deferred_ops: Vec::new(),
         }
     }
 

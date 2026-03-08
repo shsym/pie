@@ -6,6 +6,7 @@ use super::{
     Context, ContextId, ContextManager, ContextState,
 };
 use crate::device::{self, DeviceId};
+use crate::process::ProcessId;
 
 // =============================================================================
 // Persistence methods on ContextManager
@@ -13,9 +14,9 @@ use crate::device::{self, DeviceId};
 
 impl ContextManager {
 
-    pub(crate) fn open(&mut self, username: String, name: String) -> Result<ContextId> {
+    pub(crate) fn open(&mut self, username: String, name: String, owner: ProcessId) -> Result<ContextId> {
         match self.snapshots.get(&(username, name)) {
-            Some(&snapshot_id) => self.fork(snapshot_id),
+            Some(&snapshot_id) => self.fork(snapshot_id, owner),
             None => Err(anyhow::anyhow!("Snapshot not found")),
         }
     }
@@ -113,7 +114,7 @@ impl ContextManager {
     /// resources are transferred to the new context. GPU working pages are
     /// moved directly (no D2D copy needed). CPU working pages are restored
     /// via H2D copy. Committed pages are ref-bumped (shared via CAS).
-    pub(crate) fn take(&mut self, username: String, name: String) -> Result<ContextId> {
+    pub(crate) fn take(&mut self, username: String, name: String, owner: ProcessId) -> Result<ContextId> {
         let key = (username, name);
         let snapshot_id = *self.snapshots.get(&key)
             .ok_or_else(|| anyhow::anyhow!("Snapshot not found"))?;
@@ -124,45 +125,61 @@ impl ContextManager {
         self.snapshots.remove(&key);
 
         let dev_idx = snap.device.unwrap_or(0) as usize;
-
-        // Committed chain: the snapshot held one acquire_chain reference.
-        // By consuming the snapshot (removing it from contexts), we transfer
-        // that reference to the new context — no extra acquire/release needed.
+        let was_suspended = snap.is_suspended();
 
         // Working pages: GPU pages transfer directly, CPU pages need H2D copy
-        let (new_working, new_state) = if snap.working_pages.is_empty() {
-            (Vec::new(), ContextState::Active)
-        } else if snap.is_suspended() {
+        let new_working = if snap.working_pages.is_empty() {
+            Vec::new()
+        } else if was_suspended {
             // CPU → GPU: allocate GPU pages and copy
             let n = snap.working_pages.len();
             if let Some(gpu_pages) = self.devices[dev_idx].alloc_gpu_pages(n) {
                 let _ = device::copy_h2d(dev_idx as DeviceId, &gpu_pages, &snap.working_pages);
                 // Free CPU pages after H2D copy is issued
                 self.devices[dev_idx].free_cpu_pages(&snap.working_pages);
-                (gpu_pages, ContextState::Active)
+                gpu_pages
             } else {
-                // GPU OOM — can't restore, free the orphaned CPU pages
+                // GPU OOM — can't restore working pages. Bail to avoid page/token desync.
                 self.devices[dev_idx].free_cpu_pages(&snap.working_pages);
-                (Vec::new(), ContextState::Active)
+                anyhow::bail!("take: no GPU pages for working page swap-in");
             }
         } else {
-            // GPU → new context: direct ownership transfer (zero-copy)
-            (snap.working_pages.clone(), ContextState::Active)
+            // GPU → new context: direct ownership transfer (zero-copy, snap is already consumed)
+            snap.working_pages
         };
+
+        // Committed chain: if snapshot was Suspended, refcounts were released during save.
+        // We need to re-acquire them for the new Active context.
+        // If snapshot was Active, refcounts transfer directly (snapshot consumed).
+        if was_suspended && !snap.committed_hashes.is_empty() {
+            self.devices[dev_idx].retain(&snap.committed_hashes);
+        }
+
+        let committed_len = snap.committed_hashes.len();
+        let working_len = new_working.len();
 
         let new_id = self.next_id();
         self.contexts.insert(new_id, Context {
-            owner: None,
+            owner: Some(owner),
             device: Some(dev_idx as DeviceId),
             working_pages: new_working,
             committed_hashes: snap.committed_hashes,
             lineage: snap.lineage,
             working_page_tokens: snap.working_page_tokens,
             max_committed_position: snap.max_committed_position,
-            state: new_state,
+            state: ContextState::Active,
             pending_suspend: false,
             last_access: Instant::now(),
         });
+
+        // Register with owning process
+        {
+            let proc = self.process_entry(owner);
+            proc.context_ids.push(new_id);
+            let d = proc.device_mut(dev_idx);
+            d.committed += committed_len;
+            d.working += working_len;
+        }
 
         Ok(new_id)
     }
