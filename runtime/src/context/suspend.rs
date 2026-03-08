@@ -258,18 +258,14 @@ impl ContextManager {
                     active_count += 1;
                     if dev == dev_idx {
                         working_freed += ctx.working_pages.len();
-                        committed_freed += ctx.committed_tip
-                            .map(|t| self.devices[dev].estimate_chain_release(t))
-                            .unwrap_or(0);
+                        committed_freed += self.devices[dev].count_reclaimable(&ctx.committed_hashes);
                     }
                 }
                 ContextState::Pinned => {
                     pinned_count += 1;
                     if dev == dev_idx {
                         working_deferred += ctx.working_pages.len();
-                        committed_deferred += ctx.committed_tip
-                            .map(|t| self.devices[dev].estimate_chain_release(t))
-                            .unwrap_or(0);
+                        committed_deferred += self.devices[dev].count_reclaimable(&ctx.committed_hashes);
                     }
                 }
                 ContextState::Suspended => {}
@@ -285,9 +281,9 @@ impl ContextManager {
 
     /// Suspend a single Active context: swap working pages GPU→CPU, release chain.
     pub(crate) fn suspend_context(&mut self, ctx_id: ContextId) {
-        let (dev_idx, working, tip) = match self.contexts.get(&ctx_id) {
+        let (dev_idx, working, committed_hashes) = match self.contexts.get(&ctx_id) {
             Some(ctx) if ctx.is_active() || ctx.is_pinned() => {
-                (ctx.device.unwrap_or(0) as usize, ctx.working_pages.clone(), ctx.committed_tip)
+                (ctx.device.unwrap_or(0) as usize, ctx.working_pages.clone(), ctx.committed_hashes.clone())
             }
             _ => return,
         };
@@ -321,10 +317,9 @@ impl ContextManager {
         }
 
         // Phase 2: Release committed chain refcounts
-        if let Some(tip_hash) = tip {
+        if !committed_hashes.is_empty() {
             if let Some(dev) = self.devices.get_mut(dev_idx) {
-                dev.release_chain(tip_hash);
-                dev.remove_index_cache(tip_hash);
+                dev.release(&committed_hashes);
             }
         }
 

@@ -34,16 +34,15 @@ impl ContextManager {
 
         let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let tip = ctx.committed_tip;
+        let committed_hashes = ctx.committed_hashes.clone();
         let lineage = ctx.lineage.clone();
         let src_working = ctx.working_pages.clone();
 
-        let committed_len = ctx.committed_len;
         let max_pos = ctx.max_committed_position;
         let snapshot_filled = ctx.working_page_tokens.clone();
 
-        if let Some(tip_hash) = tip {
-            self.devices[dev_idx].acquire_chain(tip_hash);
+        if !committed_hashes.is_empty() {
+            self.devices[dev_idx].retain(&committed_hashes);
         }
 
         // Snapshot working pages: try GPU-first, fall back to CPU swap pool.
@@ -70,16 +69,23 @@ impl ContextManager {
             owner: None,
             device: Some(dev_idx as DeviceId),
             working_pages: snapshot_working,
-            committed_tip: tip,
+            committed_hashes: committed_hashes.clone(),
             lineage,
             working_page_tokens: snapshot_filled,
-            committed_len,
             max_committed_position: max_pos,
             state: snapshot_state,
             pending_suspend: false,
             last_access: Instant::now(),
         });
         self.snapshots.insert((username, name.clone()), snapshot_id);
+
+        // If snapshot ended up Suspended (CPU fallback for working pages),
+        // release the refcounts we acquired. Suspended invariant: no held refcounts.
+        // On open/fork, retain will be called to re-acquire.
+        if snapshot_state == ContextState::Suspended && !committed_hashes.is_empty() {
+            self.devices[dev_idx].release(&committed_hashes);
+        }
+
         Ok(if auto_generated { Some(name) } else { None })
     }
 
@@ -89,9 +95,8 @@ impl ContextManager {
 
         if let Some(ctx) = self.contexts.remove(&snapshot_id) {
             let dev_idx = ctx.device.unwrap_or(0) as usize;
-            if let Some(tip_hash) = ctx.committed_tip {
-                self.devices[dev_idx].release_chain(tip_hash);
-                self.devices[dev_idx].remove_index_cache(tip_hash);
+            if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
+                self.devices[dev_idx].release(&ctx.committed_hashes);
             }
             // Free snapshot working pages (GPU or CPU depending on state)
             if ctx.is_suspended() {
@@ -150,10 +155,9 @@ impl ContextManager {
             owner: None,
             device: Some(dev_idx as DeviceId),
             working_pages: new_working,
-            committed_tip: snap.committed_tip,
+            committed_hashes: snap.committed_hashes,
             lineage: snap.lineage,
             working_page_tokens: snap.working_page_tokens,
-            committed_len: snap.committed_len,
             max_committed_position: snap.max_committed_position,
             state: new_state,
             pending_suspend: false,

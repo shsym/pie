@@ -259,10 +259,8 @@ pub(crate) struct Context {
     /// Physical page IDs for uncommitted (working) pages.
     /// On GPU when Active/Pinned, on CPU when Suspended.
     pub working_pages: Vec<PhysicalPageId>,
-    /// Tip of the committed hash chain (None if no commits yet).
-    pub committed_tip: Option<PageHash>,
-    /// Number of committed pages.
-    pub committed_len: usize,
+    /// Ordered committed page hashes (root-to-tip). Replaces committed_tip + committed_len.
+    pub committed_hashes: Vec<PageHash>,
     /// Full token lineage for replay after eviction.
     pub lineage: Vec<Record>,
 
@@ -287,10 +285,9 @@ impl Context {
             owner,
             device: None,
             working_pages: Vec::new(),
-            committed_tip: None,
+            committed_hashes: Vec::new(),
             lineage: Vec::new(),
             working_page_tokens: Vec::new(),
-            committed_len: 0,
             max_committed_position: None,
             state: ContextState::Active,
             pending_suspend: false,
@@ -301,6 +298,11 @@ impl Context {
     pub fn is_active(&self) -> bool { self.state == ContextState::Active }
     pub fn is_suspended(&self) -> bool { self.state == ContextState::Suspended }
     pub fn is_pinned(&self) -> bool { self.state == ContextState::Pinned }
+
+    /// Tip of the committed hash chain (last element), or None if empty.
+    pub fn committed_tip(&self) -> Option<PageHash> { self.committed_hashes.last().copied() }
+    /// Number of committed pages.
+    pub fn committed_len(&self) -> usize { self.committed_hashes.len() }
 }
 
 // =============================================================================
@@ -375,7 +377,7 @@ impl ContextManager {
             .ok_or_else(|| anyhow::anyhow!("Context {id} not found"))?;
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let committed_len = ctx.committed_len;
+        let committed_len = ctx.committed_len();
 
         if let Some(pid) = ctx.owner {
             let proc = self.process_entry(pid);
@@ -416,12 +418,8 @@ impl ContextManager {
         }
 
         // Release committed chain (skip if already released during suspension)
-        if let Some(tip_hash) = ctx.committed_tip {
-            let dev = &mut self.devices[dev_idx];
-            if !ctx.is_suspended() {
-                dev.release_chain(tip_hash);
-            }
-            dev.remove_index_cache(tip_hash);
+        if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
+            self.devices[dev_idx].release(&ctx.committed_hashes);
         }
 
         // Free working pages (GPU or CPU depending on state)
@@ -445,8 +443,7 @@ impl ContextManager {
         let src_on_gpu = !ctx.is_suspended();
 
         // Snapshot source state.
-        let tip = ctx.committed_tip;
-        let committed_len = ctx.committed_len;
+        let committed_hashes = ctx.committed_hashes.clone();
         let max_pos = ctx.max_committed_position;
         let lineage = ctx.lineage.clone();
         let forked_tokens = ctx.working_page_tokens.clone();
@@ -454,8 +451,8 @@ impl ContextManager {
         //// REVIEW: I feel like clone here is not needed
         let src = ctx.working_pages.clone();
 
-        if let Some(h) = tip {
-            self.devices[dev_idx].acquire_chain(h);
+        if !committed_hashes.is_empty() {
+            self.devices[dev_idx].retain(&committed_hashes);
         }
 
         // Allocate destination pages: prefer GPU, fall back to CPU.
@@ -482,7 +479,9 @@ impl ContextManager {
 
         let suspended = !dst_on_gpu;
         if suspended {
-            if let Some(h) = tip { self.devices[dev_idx].release_chain(h); }
+            if !committed_hashes.is_empty() {
+                self.devices[dev_idx].release(&committed_hashes);
+            }
         }
 
         let new_id = self.next_id();
@@ -490,8 +489,7 @@ impl ContextManager {
             owner,
             device: Some(device),
             working_pages: dst,
-            committed_tip: tip,
-            committed_len,
+            committed_hashes: committed_hashes.clone(),
             max_committed_position: max_pos,
             lineage,
             working_page_tokens: forked_tokens,
@@ -506,7 +504,7 @@ impl ContextManager {
             if !suspended {
                 let d = proc.device_mut(dev_idx);
                 d.working += src.len();
-                d.committed += committed_len;
+                d.committed += committed_hashes.len();
             }
         }
 
@@ -721,8 +719,7 @@ impl ContextManager {
 
         let suspended = ctx.is_suspended();
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let old_tip = ctx.committed_tip;
-        let prev_hash = old_tip.unwrap_or(0);
+        let prev_hash = ctx.committed_tip().unwrap_or(0);
         let owner = ctx.owner;
         let pages = ctx.working_pages[..num_pages].to_vec();
 
@@ -749,36 +746,15 @@ impl ContextManager {
         // Compute content-based hashes (no physical page IDs needed).
         let hashes = pagestore::compute_page_hashes(page_size, &tokens, &positions, &masks, prev_hash);
         let dev = &mut self.devices[dev_idx];
-        let new_tip = *hashes.last()
-            .ok_or_else(|| anyhow::anyhow!("No page hashes computed"))?;
 
-        // Commit: physical (GPU promotion + dedup) or logical (chain metadata only).
+        // Commit: physical (GPU promotion + dedup) or logical (metadata only).
         if suspended {
-            let mut prev = prev_hash;
-            for &hash in &hashes {
-                dev.insert_chain_link(hash, prev);
-                prev = hash;
-            }
+            // Suspended: no GPU pages, just free the CPU working pages.
             dev.free_cpu_pages(&pages);
         } else {
-            let mut new_phys = Vec::with_capacity(num_pages);
-            let mut prev = prev_hash;
             for (i, &hash) in hashes.iter().enumerate() {
-
-                // Dedup: page already exists on GPU
-                let phys = if let Some((existing, rc)) = dev.pages.get_mut(&hash) {
-                    *rc += 1;
-                    let p = *existing;
-                    dev.free_gpu_pages(&[pages[i]]);
-                    p
-                } else {
-                    dev.insert_chain_link(hash, prev);
-                    pages[i]
-                };
-                new_phys.push(phys);
-                prev = hash;
+                dev.commit(hash, pages[i]);
             }
-            dev.update_index_cache(new_tip, old_tip, &new_phys);
         }
 
         // Update context state.
@@ -786,8 +762,7 @@ impl ContextManager {
             .ok_or_else(|| anyhow::anyhow!("Context lost during commit"))?;
         ctx.working_pages.drain(..num_pages);
         ctx.working_page_tokens.drain(..total_tokens);
-        ctx.committed_tip = Some(new_tip);
-        ctx.committed_len += num_pages;
+        ctx.committed_hashes.extend_from_slice(&hashes);
         ctx.max_committed_position = positions.iter().copied().max()
             .or(ctx.max_committed_position);
 
@@ -867,9 +842,9 @@ impl ContextManager {
     pub(crate) fn pin(&mut self, id: ContextId, num_input_tokens: u32) -> Result<PinnedContext> {
         let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let tip = ctx.committed_tip;
+        let committed_hashes = ctx.committed_hashes.clone();
         let working = ctx.working_pages.clone();
-        let kv_len = (ctx.committed_len * self.page_size + ctx.working_page_tokens.len()) as u32;
+        let kv_len = (ctx.committed_len() * self.page_size + ctx.working_page_tokens.len()) as u32;
 
         if ctx.is_suspended() {
             anyhow::bail!("pin: context is suspended (cannot pin)");
@@ -879,9 +854,9 @@ impl ContextManager {
         let mut page_ids = Vec::new();
 
         // Committed pages
-        if let Some(tip_hash) = tip {
-            let dev = &mut self.devices[dev_idx];
-            page_ids.extend(dev.resolve_physical(tip_hash));
+        if !committed_hashes.is_empty() {
+            let dev = &self.devices[dev_idx];
+            page_ids.extend(dev.physical_ids(&committed_hashes));
         }
 
         // Working pages (appended after committed)
@@ -999,7 +974,7 @@ impl ContextManager {
 
     pub(crate) fn committed_page_count(&self, id: ContextId) -> u32 {
         self.contexts.get(&id)
-            .map(|c| c.committed_len as u32)
+            .map(|c| c.committed_len() as u32)
             .unwrap_or(0)
     }
 

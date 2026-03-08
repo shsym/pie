@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-
-
 use super::{
     ContextId, ContextManager, ContextState, SERVICES,
     Record,
@@ -9,10 +7,7 @@ use super::{
 use super::sched::ProcessState;
 use super::suspend::DeferredOp;
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
-use crate::adapter::AdapterId;
-use crate::device::DeviceId;
 use crate::inference;
-use crate::inference::brle::Brle;
 use crate::inference::request::ForwardPassRequest;
 use crate::process::ProcessId;
 
@@ -41,12 +36,11 @@ impl ContextManager {
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 // Working pages on CPU that need GPU allocation for swap-in
                 *required.entry(dev_idx).or_insert(0) += ctx.working_pages.len();
-                // Pages needing replay: walk chain, compute prefix match, count missing suffix
-                if let Some(tip_hash) = ctx.committed_tip {
+                // Pages needing replay: check prefix match, count missing suffix
+                if !ctx.committed_hashes.is_empty() {
                     let dev = &self.devices[dev_idx];
-                    let chain = dev.walk_chain(tip_hash);
-                    let prefix_len = dev.longest_prefix_length(&chain);
-                    let replay_pages = chain.len().saturating_sub(prefix_len);
+                    let prefix_len = dev.prefix_len(&ctx.committed_hashes);
+                    let replay_pages = ctx.committed_hashes.len().saturating_sub(prefix_len);
                     *required.entry(dev_idx).or_insert(0) += replay_pages;
                 }
             }
@@ -94,7 +88,7 @@ impl ContextManager {
         for &ctx_id in &ctx_ids {
             let ctx = self.contexts.get(&ctx_id).unwrap();
             let dev_idx = ctx.device.unwrap_or(0) as usize;
-            let committed_len = ctx.committed_len;
+            let committed_len = ctx.committed_len();
             let working_len = ctx.working_pages.len();
             let d = self.process_entry(pid).device_mut(dev_idx);
             d.committed += committed_len;
@@ -134,7 +128,7 @@ impl ContextManager {
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let cpu_pages = ctx.working_pages.clone();
-        let tip = ctx.committed_tip;
+        let committed_hashes = ctx.committed_hashes.clone();
 
         // Phase 1: Swap-in working pages from CPU → GPU
         if !cpu_pages.is_empty() {
@@ -149,13 +143,11 @@ impl ContextManager {
         }
 
         // Phase 2: Acquire refcounts for GPU-resident committed prefix.
-        let prefix_len = if let Some(tip_hash) = tip {
+        let prefix_len = if !committed_hashes.is_empty() {
             let dev = &mut self.devices[dev_idx];
-            let chain = dev.walk_chain(tip_hash);
-            let prefix_len = dev.longest_prefix_length(&chain);
+            let prefix_len = dev.prefix_len(&committed_hashes);
             if prefix_len > 0 {
-                let prefix_tip = chain[prefix_len - 1];
-                dev.acquire_chain(prefix_tip);
+                dev.retain(&committed_hashes[..prefix_len]);
             }
             prefix_len
         } else {
@@ -190,50 +182,37 @@ impl ContextManager {
         let ctx = self.contexts.get(&ctx_id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let lineage = ctx.lineage.clone();
-        let committed_len = ctx.committed_len;
-        let tip = ctx.committed_tip;
+        let committed_hashes = ctx.committed_hashes.clone();
+        let committed_len = committed_hashes.len();
         let page_size = self.page_size;
 
         if prefix_len >= committed_len {
             return Ok(false);
         }
 
-        // Walk the chain to get all hashes (root-to-tip order).
-        let chain = match tip {
-            Some(tip_hash) => self.devices[dev_idx].walk_chain(tip_hash),
-            None => return Ok(false),
-        };
+        if committed_hashes.is_empty() {
+            return Ok(false);
+        }
 
-        // Eagerly allocate GPU pages for the suffix and register chain links.
+        // Eagerly allocate GPU pages for the suffix and register in the pages map.
         // The forward pass will fill KV data; until then the context is Pinned.
         let suffix_count = committed_len - prefix_len;
+        let suffix_hashes = &committed_hashes[prefix_len..];
         let suffix_phys = self.devices[dev_idx].alloc_gpu_pages(suffix_count)
             .ok_or_else(|| anyhow::anyhow!("No GPU pages for replay but admission check passed"))?;
 
-        let mut prev = if prefix_len > 0 { chain[prefix_len - 1] } else { 0 };
-        for i in prefix_len..committed_len {
-            let hash = chain[i];
-            self.devices[dev_idx].insert_chain_link(hash, prev);
-            prev = hash;
+        // Register suffix pages in PageStore
+        for (i, &hash) in suffix_hashes.iter().enumerate() {
+            self.devices[dev_idx].commit(hash, suffix_phys[i]);
         }
 
-        // Update index_cache to include the suffix physical pages.
-        if let Some(tip_hash) = tip {
-            let prefix_tip = if prefix_len > 0 { Some(chain[prefix_len - 1]) } else { None };
-            self.devices[dev_idx].update_index_cache(tip_hash, prefix_tip, &suffix_phys);
-        }
+        // Build the full physical page table (prefix + suffix).
+        let full_phys = self.devices[dev_idx].physical_ids(&committed_hashes);
 
         // Build forward pass requests from the lineage (for tokens/positions/masks).
         let prefix_tokens = prefix_len * page_size;
         let committed_tokens = committed_len * page_size;
         let mut kv_so_far = prefix_tokens as u32;
-
-        // Resolve the full physical page table (prefix + suffix).
-        let full_phys = if let Some(tip_hash) = tip {
-            self.devices[dev_idx].resolve_physical(tip_hash)
-        } else {
-            Vec::new()
-        };
 
         let mut requests: Vec<(ForwardPassRequest, Vec<PhysicalPageId>, u32)> = Vec::new();
         let mut token_offset = 0usize;
