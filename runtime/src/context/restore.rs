@@ -20,7 +20,7 @@ impl ContextManager {
     /// Admission check: can this process be fully restored?
     /// Checks that all devices have enough free GPU pages for the process's
     /// working pages (on CPU) plus replay pages plus deferred alloc requirements.
-    pub(crate) fn can_restore_process(&mut self, pid: ProcessId) -> bool {
+    pub(crate) fn can_restore_all(&mut self, pid: ProcessId) -> bool {
         let ctx_ids = match self.processes.get(&pid) {
             Some(p) => &p.context_ids,
             None => return false,
@@ -70,7 +70,7 @@ impl ContextManager {
     /// Deferred ops fire only after all replay forward passes complete
     /// (in `finish_restore`). If no replays are needed, deferred ops
     /// fire immediately here.
-    pub(crate) fn restore_process(&mut self, pid: ProcessId) -> anyhow::Result<()> {
+    pub(crate) fn restore_all(&mut self, pid: ProcessId) -> anyhow::Result<()> {
         let ctx_ids: Vec<ContextId> = self.processes.get(&pid)
             .map(|p| p.context_ids.clone())
             .ok_or_else(|| anyhow::anyhow!("Process not found"))?;
@@ -79,7 +79,7 @@ impl ContextManager {
 
         // Restore all suspended contexts
         for &ctx_id in &ctx_ids {
-            let has_replay = self.restore_context(ctx_id)?;
+            let has_replay = self.restore(ctx_id)?;
             if has_replay { replay_count += 1; }
         }
 
@@ -101,7 +101,7 @@ impl ContextManager {
             proc.pending_replay_count = replay_count;
         }
 
-        // If no replays needed, fire deferred ops immediately (no FinishRestore coming)
+        // If no replays needed, fire deferred ops immediately (no ReplayComplete coming)
         if replay_count == 0 {
             self.fire_deferred_ops(pid);
         }
@@ -122,7 +122,7 @@ impl ContextManager {
     ///
     /// Returns `true` if replay forward passes were spawned, `false` if
     /// full prefix match (no replay needed).
-    pub(crate) fn restore_context(&mut self, ctx_id: ContextId) -> anyhow::Result<bool> {
+    pub(crate) fn restore(&mut self, ctx_id: ContextId) -> anyhow::Result<bool> {
         let ctx = self.contexts.get(&ctx_id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
 
@@ -194,10 +194,6 @@ impl ContextManager {
         let page_size = self.page_size;
 
         if prefix_len >= committed_len {
-            return Ok(false);
-        }
-
-        if committed_hashes.is_empty() {
             return Ok(false);
         }
 
@@ -290,7 +286,7 @@ impl ContextManager {
         }
 
         // Spawn a task that submits forward passes sequentially, then
-        // sends FinishRestore to unpin the context.
+        // sends ReplayComplete to unpin the context.
         let model_idx = self.model_idx;
         let device_id = dev_idx;
 
@@ -309,7 +305,7 @@ impl ContextManager {
             }
 
             // Unpin after all chunks complete (or first failure)
-            let _ = SERVICES.send(model_idx, super::Message::FinishRestore { id: ctx_id });
+            let _ = SERVICES.send(model_idx, super::Message::ReplayComplete { id: ctx_id });
         });
 
         Ok(true)
@@ -335,12 +331,12 @@ impl ContextManager {
     /// deferred ops when all replay forward passes for the owning process
     /// have completed.
     ///
-    /// Called by the actor when a FinishRestore message arrives after
+    /// Called by the actor when a ReplayComplete message arrives after
     /// a replay forward pass completes.
     ///
     /// NOTE: We intentionally do NOT reuse `unpin()` here because `unpin`
     /// calls `drain_queues`, which can re-restore this same process via
-    /// `restore_process` — overwriting `pending_replay_count` before
+    /// `restore_all` — overwriting `pending_replay_count` before
     /// we get to decrement it (reentrancy corruption).
     pub(crate) fn finish_restore(&mut self, id: ContextId) {
         let (owner, pending) = match self.contexts.get(&id) {

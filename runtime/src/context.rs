@@ -11,9 +11,9 @@
 //! - Contention resolution via dual-queue protocol
 pub mod pagestore;
 pub(crate) mod sched;
-mod suspend;
+mod contention;
 mod snapshot;
-mod replay;
+mod restore;
 
 use std::collections::{HashMap, VecDeque, BinaryHeap};
 use std::sync::LazyLock;
@@ -31,7 +31,7 @@ use crate::device::{self, DeviceId};
 use pagestore::{PhysicalPageId, PageHash, PageStore};
 use sched::ProcessEntry;
 
-use suspend::{PendingAlloc, PendingRestore};
+use contention::{PendingAlloc, PendingRestore};
 
 // =============================================================================
 // Public Types
@@ -739,13 +739,13 @@ impl ContextManager {
             }
 
             // Admission check: enough pages on all devices?
-            if !self.can_restore_process(pid) {
+            if !self.can_restore_all(pid) {
                 break;
             }
 
             let waiter = self.restore_queue.pop().unwrap();
-            if let Err(e) = self.restore_process(waiter.process_id) {
-                eprintln!("RESTORE_PROCESS_FAIL pid={} err={e:#}", waiter.process_id);
+            if let Err(e) = self.restore_all(waiter.process_id) {
+                eprintln!("RESTORE_ALL_FAIL pid={} err={e:#}", waiter.process_id);
             }
         }
     }
@@ -757,7 +757,7 @@ impl ContextManager {
         self.devices.iter().map(|d| d.stats()).collect()
     }
 
-    pub(crate) fn set_priority_internal(&mut self, weight: f64, pid_values: HashMap<ProcessId, f64>) {
+    pub(crate) fn set_priority(&mut self, weight: f64, pid_values: HashMap<ProcessId, f64>) {
         for (pid, value) in pid_values {
             self.process_entry(pid).weight = weight * value;
         }
@@ -842,7 +842,7 @@ pub(crate) enum Message {
     ReleaseWorkingPages { id: ContextId, num_pages: usize },
     Pin { id: ContextId, num_input_tokens: u32, response: oneshot::Sender<Result<PinnedContext>> },
     Unpin { id: ContextId },
-    FinishRestore { id: ContextId },
+    ReplayComplete { id: ContextId },
     GetStats { response: oneshot::Sender<Vec<(usize, usize)>> },
 
     // Actor-routed read/write APIs (previously DashMap-based)
@@ -905,14 +905,14 @@ impl ServiceHandler for ContextManager {
             Message::Unpin { id } => {
                 self.unpin(id);
             }
-            Message::FinishRestore { id } => {
+            Message::ReplayComplete { id } => {
                 self.finish_restore(id);
             }
             Message::GetStats { response } => {
                 let _ = response.send(self.stats());
             }
             Message::SetPriority { weight, pid_values } => {
-                self.set_priority_internal(weight, pid_values);
+                self.set_priority(weight, pid_values);
             }
             Message::WorkingPageCount { id, response } => {
                 let _ = response.send(self.working_page_count(id));
