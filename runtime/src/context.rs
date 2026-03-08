@@ -31,7 +31,7 @@ use crate::device::{self, DeviceId};
 use pagestore::{PhysicalPageId, PageHash, PageStore};
 use sched::ProcessEntry;
 
-use suspend::{AllocWaiter, DeferredOp, RestoreWaiter};
+use suspend::{AllocWaiter, RestoreWaiter};
 
 // =============================================================================
 // Public Types
@@ -60,19 +60,19 @@ pub fn spawn(page_size: usize, num_gpu_pages: Vec<usize>, num_cpu_pages: Vec<usi
 
 // ---------- Actor-routed ----------
 
-pub async fn open(model_idx: usize, username: String, name: String) -> Result<ContextId> {
+pub async fn open(model_idx: usize, username: String, name: String, owner: ProcessId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Open { username, name, response: tx })?;
+    SERVICES.send(model_idx, Message::Open { username, name, owner, response: tx })?;
     rx.await.context("context::open: actor dropped response")?
 }
 
-pub async fn take(model_idx: usize, username: String, name: String) -> Result<ContextId> {
+pub async fn take(model_idx: usize, username: String, name: String, owner: ProcessId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Take { username, name, response: tx })?;
+    SERVICES.send(model_idx, Message::Take { username, name, owner, response: tx })?;
     rx.await.context("context::take: actor dropped response")?
 }
 
-pub async fn create(model_idx: usize, owner: Option<ProcessId>) -> Result<ContextId> {
+pub async fn create(model_idx: usize, owner: ProcessId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::Create { owner, response: tx })?;
     rx.await.context("context::create: actor dropped response")?
@@ -92,15 +92,23 @@ pub async fn delete(model_idx: usize, username: String, name: String) -> Result<
     rx.await.context("context::delete: actor dropped response")?
 }
 
-pub async fn destroy(model_idx: usize, id: ContextId, force: bool) -> Result<()> {
+pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Destroy { id, force, response: tx })?;
+    SERVICES.send(model_idx, Message::Destroy { id, response: tx })?;
     rx.await.context("context::destroy: actor dropped response")?
 }
 
-pub async fn fork(model_idx: usize, id: ContextId) -> Result<ContextId> {
+/// Destroy all contexts owned by a process across all models.
+/// Called on WASM instance drop for automatic cleanup.
+pub fn destroy_process(pid: ProcessId) {
+    for model_idx in 0..SERVICES.len() {
+        let _ = SERVICES.send(model_idx, Message::DestroyProcess { pid });
+    }
+}
+
+pub async fn fork(model_idx: usize, id: ContextId, owner: ProcessId) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::Fork { id, response: tx })?;
+    SERVICES.send(model_idx, Message::Fork { id, owner, response: tx })?;
     rx.await.context("context::fork: actor dropped response")?
 }
 
@@ -259,10 +267,8 @@ pub(crate) struct Context {
     /// Physical page IDs for uncommitted (working) pages.
     /// On GPU when Active/Pinned, on CPU when Suspended.
     pub working_pages: Vec<PhysicalPageId>,
-    /// Tip of the committed hash chain (None if no commits yet).
-    pub committed_tip: Option<PageHash>,
-    /// Number of committed pages.
-    pub committed_len: usize,
+    /// Ordered committed page hashes (root-to-tip). Replaces committed_tip + committed_len.
+    pub committed_hashes: Vec<PageHash>,
     /// Full token lineage for replay after eviction.
     pub lineage: Vec<Record>,
 
@@ -287,10 +293,9 @@ impl Context {
             owner,
             device: None,
             working_pages: Vec::new(),
-            committed_tip: None,
+            committed_hashes: Vec::new(),
             lineage: Vec::new(),
             working_page_tokens: Vec::new(),
-            committed_len: 0,
             max_committed_position: None,
             state: ContextState::Active,
             pending_suspend: false,
@@ -301,6 +306,11 @@ impl Context {
     pub fn is_active(&self) -> bool { self.state == ContextState::Active }
     pub fn is_suspended(&self) -> bool { self.state == ContextState::Suspended }
     pub fn is_pinned(&self) -> bool { self.state == ContextState::Pinned }
+
+    /// Tip of the committed hash chain (last element), or None if empty.
+    pub fn committed_tip(&self) -> Option<PageHash> { self.committed_hashes.last().copied() }
+    /// Number of committed pages.
+    pub fn committed_len(&self) -> usize { self.committed_hashes.len() }
 }
 
 // =============================================================================
@@ -355,17 +365,15 @@ impl ContextManager {
 
     // ==================== Core Operations ====================
 
-    pub(crate) fn create(&mut self, owner: Option<ProcessId>) -> Result<ContextId> {
+    pub(crate) fn create(&mut self, owner: ProcessId) -> Result<ContextId> {
         let id = self.next_id();
-        let mut ctx = Context::new(owner);
+        let mut ctx = Context::new(Some(owner));
         ctx.device = Some(self.least_loaded_device());
 
         self.contexts.insert(id, ctx);
 
-        if let Some(pid) = owner {
-            let proc = self.process_entry(pid);
-            proc.context_ids.push(id);
-        }
+        let proc = self.process_entry(owner);
+        proc.context_ids.push(id);
 
         Ok(id)
     }
@@ -375,26 +383,38 @@ impl ContextManager {
             .ok_or_else(|| anyhow::anyhow!("Context {id} not found"))?;
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let committed_len = ctx.committed_len;
+        let committed_len = ctx.committed_len();
 
         if let Some(pid) = ctx.owner {
             let proc = self.process_entry(pid);
             proc.context_ids.retain(|&c| c != id);
-            let d = proc.device_mut(dev_idx);
-            d.committed -= committed_len;
-            d.working -= ctx.working_pages.len();
 
-            // Cancel deferred_op if it references the destroyed context.
-            let cancel_deferred = match &proc.deferred_op {
-                Some(DeferredOp::Alloc(a)) => a.context_id == id,
-                Some(DeferredOp::Pin { context_id, .. }) => *context_id == id,
-                None => false,
+            // Only decrement accounting if context was not Suspended
+            // (suspend_process already zeroed device pages).
+            if !ctx.is_suspended() {
+                let d = proc.device_mut(dev_idx);
+                d.committed -= committed_len;
+                d.working -= ctx.working_pages.len();
+            }
+
+            // Cancel deferred ops that reference the destroyed context.
+            let cancelled: Vec<Message> = {
+                let ops = std::mem::take(&mut proc.deferred_ops);
+                let (cancel, keep): (Vec<_>, Vec<_>) = ops.into_iter().partition(|op| match op {
+                    Message::ReserveWorkingPages { id: cid, .. } => *cid == id,
+                    Message::Pin { id: cid, .. } => *cid == id,
+                    Message::Fork { id: cid, .. } => *cid == id,
+                    _ => false,
+                });
+                proc.deferred_ops = keep;
+                cancel
             };
-            if cancel_deferred {
-                match proc.deferred_op.take() {
-                    Some(DeferredOp::Alloc(a)) => { let _ = a.response.send(Err(anyhow::anyhow!("Context destroyed"))); }
-                    Some(DeferredOp::Pin { response, .. }) => { let _ = response.send(Err(anyhow::anyhow!("Context destroyed"))); }
-                    None => {}
+            for op in cancelled {
+                match op {
+                    Message::ReserveWorkingPages { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Context destroyed"))); }
+                    Message::Pin { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Context destroyed"))); }
+                    Message::Fork { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Context destroyed"))); }
+                    _ => {}
                 }
             }
 
@@ -416,12 +436,8 @@ impl ContextManager {
         }
 
         // Release committed chain (skip if already released during suspension)
-        if let Some(tip_hash) = ctx.committed_tip {
-            let dev = &mut self.devices[dev_idx];
-            if !ctx.is_suspended() {
-                dev.release_chain(tip_hash);
-            }
-            dev.remove_index_cache(tip_hash);
+        if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
+            self.devices[dev_idx].release(&ctx.committed_hashes);
         }
 
         // Free working pages (GPU or CPU depending on state)
@@ -437,16 +453,100 @@ impl ContextManager {
         Ok(())
     }
 
-    pub(crate) fn fork(&mut self, id: ContextId) -> Result<ContextId> {
+    /// Destroy all contexts owned by a process.
+    /// Cancels all deferred ops, frees all resources, removes the process entry.
+    pub(crate) fn destroy_process(&mut self, pid: ProcessId) {
+        let proc = match self.processes.remove(&pid) {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Cancel all deferred ops
+        for op in proc.deferred_ops {
+            match op {
+                Message::ReserveWorkingPages { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Process destroyed"))); }
+                Message::Pin { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Process destroyed"))); }
+                Message::Fork { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Process destroyed"))); }
+                Message::Take { response, .. } => { let _ = response.send(Err(anyhow::anyhow!("Process destroyed"))); }
+                _ => {}
+            }
+        }
+
+        // Clean stale AllocWaiter entries from try_alloc for this process's contexts
+        let ctx_ids: std::collections::HashSet<ContextId> = proc.context_ids.iter().copied().collect();
+        let mut i = 0;
+        while i < self.try_alloc.len() {
+            if ctx_ids.contains(&self.try_alloc[i].context_id) {
+                let waiter = self.try_alloc.remove(i).unwrap();
+                let _ = waiter.response.send(Err(anyhow::anyhow!("Process destroyed")));
+            } else {
+                i += 1;
+            }
+        }
+
+        // Remove from try_restore queue
+        self.try_restore.retain(|w| w.process_id != pid);
+
+        // Destroy all owned contexts
+        for ctx_id in proc.context_ids {
+            if let Some(ctx) = self.contexts.remove(&ctx_id) {
+                let dev_idx = ctx.device.unwrap_or(0) as usize;
+                if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
+                    self.devices[dev_idx].release(&ctx.committed_hashes);
+                }
+                if ctx.is_suspended() {
+                    self.devices[dev_idx].free_cpu_pages(&ctx.working_pages);
+                } else {
+                    self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
+                }
+                self.snapshots.retain(|_, v| *v != ctx_id);
+            }
+        }
+
+        self.drain_queues();
+    }
+    /// Contention-aware fork: checks Pending state and defers if needed.
+    pub(crate) fn request_fork(
+        &mut self,
+        id: ContextId,
+        owner: ProcessId,
+        response: oneshot::Sender<Result<ContextId>>,
+    ) {
+        // If the owning process is Pending, defer the fork.
+        let proc = self.process_entry(owner);
+        if proc.state == sched::ProcessState::Pending {
+            proc.deferred_ops.push(Message::Fork {
+                id,
+                owner,
+                response,
+            });
+            return;
+        }
+
+        let result = self.fork(id, owner);
+        let _ = response.send(result);
+    }
+
+    /// Contention-aware take: checks Pending state and defers if needed.
+    pub(crate) fn request_take(
+        &mut self,
+        username: String,
+        name: String,
+        owner: ProcessId,
+        response: oneshot::Sender<Result<ContextId>>,
+    ) {
+        let result = self.take(username, name, owner);
+        let _ = response.send(result);
+    }
+
+    pub(crate) fn fork(&mut self, id: ContextId, owner: ProcessId) -> Result<ContextId> {
         let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-        let owner = ctx.owner;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let device = dev_idx as DeviceId;
         let src_on_gpu = !ctx.is_suspended();
 
         // Snapshot source state.
-        let tip = ctx.committed_tip;
-        let committed_len = ctx.committed_len;
+        let committed_hashes = ctx.committed_hashes.clone();
         let max_pos = ctx.max_committed_position;
         let lineage = ctx.lineage.clone();
         let forked_tokens = ctx.working_page_tokens.clone();
@@ -454,8 +554,8 @@ impl ContextManager {
         //// REVIEW: I feel like clone here is not needed
         let src = ctx.working_pages.clone();
 
-        if let Some(h) = tip {
-            self.devices[dev_idx].acquire_chain(h);
+        if !committed_hashes.is_empty() {
+            self.devices[dev_idx].retain(&committed_hashes);
         }
 
         // Allocate destination pages: prefer GPU, fall back to CPU.
@@ -482,16 +582,17 @@ impl ContextManager {
 
         let suspended = !dst_on_gpu;
         if suspended {
-            if let Some(h) = tip { self.devices[dev_idx].release_chain(h); }
+            if !committed_hashes.is_empty() {
+                self.devices[dev_idx].release(&committed_hashes);
+            }
         }
 
         let new_id = self.next_id();
         self.contexts.insert(new_id, Context {
-            owner,
+            owner: Some(owner),
             device: Some(device),
             working_pages: dst,
-            committed_tip: tip,
-            committed_len,
+            committed_hashes: committed_hashes.clone(),
             max_committed_position: max_pos,
             lineage,
             working_page_tokens: forked_tokens,
@@ -500,13 +601,13 @@ impl ContextManager {
             last_access: Instant::now(),
         });
 
-        if let Some(pid) = owner {
-            let proc = self.process_entry(pid);
+        {
+            let proc = self.process_entry(owner);
             proc.context_ids.push(new_id);
             if !suspended {
                 let d = proc.device_mut(dev_idx);
                 d.working += src.len();
-                d.committed += committed_len;
+                d.committed += committed_hashes.len();
             }
         }
 
@@ -544,13 +645,12 @@ impl ContextManager {
         };
 
         // Step 0: SUSPENSION CHECK
-        // If the owning process is Pending, store as deferred_op.
+        // If the owning process is Pending, store as deferred op.
         let proc = self.process_entry(pid);
         if proc.state == sched::ProcessState::Pending {
-            proc.deferred_op = Some(DeferredOp::Alloc(AllocWaiter {
-                context_id: id, device: dev_idx,
-                num_pages: additional, response,
-            }));
+            proc.deferred_ops.push(Message::ReserveWorkingPages {
+                id, num_pages: additional, response,
+            });
             return;
         }
 
@@ -577,10 +677,9 @@ impl ContextManager {
                 // Requester loses priority gate → suspend and enqueue in try_restore.
                 let (pinned, _) = self.suspend_process(pid);
                 self.enqueue_restore(pid, requester_floor, pinned);
-                self.process_entry(pid).deferred_op = Some(DeferredOp::Alloc(AllocWaiter {
-                    context_id: id, device: dev_idx,
-                    num_pages: additional, response,
-                }));
+                self.process_entry(pid).deferred_ops.push(Message::ReserveWorkingPages {
+                    id, num_pages: additional, response,
+                });
                 return;
             }
         }
@@ -645,10 +744,9 @@ impl ContextManager {
             // Step 5: NO VICTIM — requester self-suspends.
             let (pinned, _) = self.suspend_process(pid);
             self.enqueue_restore(pid, requester_floor, pinned);
-            self.process_entry(pid).deferred_op = Some(DeferredOp::Alloc(AllocWaiter {
-                context_id: id, device: dev_idx,
-                num_pages: additional, response,
-            }));
+            self.process_entry(pid).deferred_ops.push(Message::ReserveWorkingPages {
+                id, num_pages: additional, response,
+            });
         }
     }
 
@@ -672,8 +770,6 @@ impl ContextManager {
         }
         Ok(())
     }
-
-    
 
     pub(crate) fn release_working_pages(&mut self, id: ContextId, num_pages: usize) -> Result<()> {
         let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
@@ -721,8 +817,7 @@ impl ContextManager {
 
         let suspended = ctx.is_suspended();
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let old_tip = ctx.committed_tip;
-        let prev_hash = old_tip.unwrap_or(0);
+        let prev_hash = ctx.committed_tip().unwrap_or(0);
         let owner = ctx.owner;
         let pages = ctx.working_pages[..num_pages].to_vec();
 
@@ -749,36 +844,15 @@ impl ContextManager {
         // Compute content-based hashes (no physical page IDs needed).
         let hashes = pagestore::compute_page_hashes(page_size, &tokens, &positions, &masks, prev_hash);
         let dev = &mut self.devices[dev_idx];
-        let new_tip = *hashes.last()
-            .ok_or_else(|| anyhow::anyhow!("No page hashes computed"))?;
 
-        // Commit: physical (GPU promotion + dedup) or logical (chain metadata only).
+        // Commit: physical (GPU promotion + dedup) or logical (metadata only).
         if suspended {
-            let mut prev = prev_hash;
-            for &hash in &hashes {
-                dev.insert_chain_link(hash, prev);
-                prev = hash;
-            }
+            // Suspended: no GPU pages, just free the CPU working pages.
             dev.free_cpu_pages(&pages);
         } else {
-            let mut new_phys = Vec::with_capacity(num_pages);
-            let mut prev = prev_hash;
             for (i, &hash) in hashes.iter().enumerate() {
-
-                // Dedup: page already exists on GPU
-                let phys = if let Some((existing, rc)) = dev.pages.get_mut(&hash) {
-                    *rc += 1;
-                    let p = *existing;
-                    dev.free_gpu_pages(&[pages[i]]);
-                    p
-                } else {
-                    dev.insert_chain_link(hash, prev);
-                    pages[i]
-                };
-                new_phys.push(phys);
-                prev = hash;
+                dev.commit(hash, pages[i]);
             }
-            dev.update_index_cache(new_tip, old_tip, &new_phys);
         }
 
         // Update context state.
@@ -786,8 +860,7 @@ impl ContextManager {
             .ok_or_else(|| anyhow::anyhow!("Context lost during commit"))?;
         ctx.working_pages.drain(..num_pages);
         ctx.working_page_tokens.drain(..total_tokens);
-        ctx.committed_tip = Some(new_tip);
-        ctx.committed_len += num_pages;
+        ctx.committed_hashes.extend_from_slice(&hashes);
         ctx.max_committed_position = positions.iter().copied().max()
             .or(ctx.max_committed_position);
 
@@ -844,8 +917,8 @@ impl ContextManager {
             if let Some(pid) = owner {
                 let proc = self.process_entry(pid);
                 if proc.state == sched::ProcessState::Pending {
-                    proc.deferred_op = Some(DeferredOp::Pin {
-                        context_id: id,
+                    proc.deferred_ops.push(Message::Pin {
+                        id,
                         num_input_tokens,
                         response,
                     });
@@ -867,9 +940,9 @@ impl ContextManager {
     pub(crate) fn pin(&mut self, id: ContextId, num_input_tokens: u32) -> Result<PinnedContext> {
         let ctx = self.contexts.get_mut(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let tip = ctx.committed_tip;
+        let committed_hashes = ctx.committed_hashes.clone();
         let working = ctx.working_pages.clone();
-        let kv_len = (ctx.committed_len * self.page_size + ctx.working_page_tokens.len()) as u32;
+        let kv_len = (ctx.committed_len() * self.page_size + ctx.working_page_tokens.len()) as u32;
 
         if ctx.is_suspended() {
             anyhow::bail!("pin: context is suspended (cannot pin)");
@@ -879,9 +952,9 @@ impl ContextManager {
         let mut page_ids = Vec::new();
 
         // Committed pages
-        if let Some(tip_hash) = tip {
-            let dev = &mut self.devices[dev_idx];
-            page_ids.extend(dev.resolve_physical(tip_hash));
+        if !committed_hashes.is_empty() {
+            let dev = &self.devices[dev_idx];
+            page_ids.extend(dev.physical_ids(&committed_hashes));
         }
 
         // Working pages (appended after committed)
@@ -899,12 +972,10 @@ impl ContextManager {
     /// If `pending_suspend` was set, executes the deferred suspension and
     /// decrements `ProcessEntry.pending_pinned`.
     pub(crate) fn unpin(&mut self, id: ContextId) {
-        let (is_pinned, pending) = match self.contexts.get(&id) {
-            Some(ctx) if ctx.is_pinned() => (true, ctx.pending_suspend),
+        let pending = match self.contexts.get(&id) {
+            Some(ctx) if ctx.is_pinned() => ctx.pending_suspend,
             _ => return,
         };
-
-        if !is_pinned { return; }
 
         if pending {
             // Deferred suspension: context stays Pinned until suspend_context
@@ -999,7 +1070,7 @@ impl ContextManager {
 
     pub(crate) fn committed_page_count(&self, id: ContextId) -> u32 {
         self.contexts.get(&id)
-            .map(|c| c.committed_len as u32)
+            .map(|c| c.committed_len() as u32)
             .unwrap_or(0)
     }
 
@@ -1057,13 +1128,13 @@ impl ContextManager {
 
 #[derive(Debug)]
 pub(crate) enum Message {
-    Open { username: String, name: String, response: oneshot::Sender<Result<ContextId>> },
-    Create { owner: Option<ProcessId>, response: oneshot::Sender<Result<ContextId>> },
+    Open { username: String, name: String, owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
+    Create { owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
     Save { id: ContextId, username: String, name: Option<String>, response: oneshot::Sender<Result<Option<String>>> },
     Delete { username: String, name: String, response: oneshot::Sender<Result<()>> },
-    Destroy { id: ContextId, force: bool, response: oneshot::Sender<Result<()>> },
-    Fork { id: ContextId, response: oneshot::Sender<Result<ContextId>> },
-    Take { username: String, name: String, response: oneshot::Sender<Result<ContextId>> },
+    Destroy { id: ContextId, response: oneshot::Sender<Result<()>> },
+    Fork { id: ContextId, owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
+    Take { username: String, name: String, owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
     CommitWorkingPages { id: ContextId, num_pages: usize, response: oneshot::Sender<Result<()>> },
     ReserveWorkingPages { id: ContextId, num_pages: usize, response: oneshot::Sender<Result<()>> },
     ReleaseWorkingPages { id: ContextId, num_pages: usize },
@@ -1085,6 +1156,7 @@ pub(crate) enum Message {
 
     DebugState { id: ContextId, response: oneshot::Sender<String> },
     SetPriority { weight: f64, pid_values: HashMap<ProcessId, f64> },
+    DestroyProcess { pid: ProcessId },
 }
 
 impl ServiceHandler for ContextManager {
@@ -1092,11 +1164,11 @@ impl ServiceHandler for ContextManager {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Open { username, name, response } => {
-                let _ = response.send(self.open(username, name));
+            Message::Open { username, name, owner, response } => {
+                let _ = response.send(self.open(username, name, owner));
             }
-            Message::Take { username, name, response } => {
-                let _ = response.send(self.take(username, name));
+            Message::Take { username, name, owner, response } => {
+                self.request_take(username, name, owner, response);
             }
             Message::Create { owner, response } => {
                 let _ = response.send(self.create(owner));
@@ -1107,11 +1179,11 @@ impl ServiceHandler for ContextManager {
             Message::Delete { username, name, response } => {
                 let _ = response.send(self.delete(username, name));
             }
-            Message::Destroy { id, force: _, response } => {
+            Message::Destroy { id, response } => {
                 let _ = response.send(self.destroy(id));
             }
-            Message::Fork { id, response } => {
-                let _ = response.send(self.fork(id));
+            Message::Fork { id, owner, response } => {
+                self.request_fork(id, owner, response);
             }
             Message::CommitWorkingPages { id, num_pages, response } => {
                 let _ = response.send(self.commit_working_pages(id, num_pages));
@@ -1154,6 +1226,9 @@ impl ServiceHandler for ContextManager {
             }
             Message::DebugState { id, response } => {
                 let _ = response.send(self.debug_state(id));
+            }
+            Message::DestroyProcess { pid } => {
+                self.destroy_process(pid);
             }
         }
     }

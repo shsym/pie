@@ -29,10 +29,9 @@ impl pie::core::context::HostContext for InstanceState {
         let model_id = model.model_id;
         let process_id = self.id();
 
-        match context::create(model_id, Some(process_id)).await {
+        match context::create(model_id, process_id).await {
             Ok(context_id) => {
-                self.track_context(model_id, context_id);
-                let ctx = Context { context_id, model_id,  };
+                let ctx = Context { context_id, model_id };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -47,12 +46,11 @@ impl pie::core::context::HostContext for InstanceState {
         let model = self.ctx().table.get(&model)?;
         let model_id = model.model_id;
         let username = self.get_username();
+        let process_id = self.id();
 
-        match context::open(model_id, username, name).await {
+        match context::open(model_id, username, name, process_id).await {
             Ok(context_id) => {
-                // Opened (forked-from-snapshot) contexts are tracked for auto-cleanup
-                self.track_context(model_id, context_id);
-                let ctx = Context { context_id, model_id,  };
+                let ctx = Context { context_id, model_id };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -67,11 +65,11 @@ impl pie::core::context::HostContext for InstanceState {
         let model = self.ctx().table.get(&model)?;
         let model_id = model.model_id;
         let username = self.get_username();
+        let process_id = self.id();
 
-        match context::take(model_id, username, name).await {
+        match context::take(model_id, username, name, process_id).await {
             Ok(context_id) => {
-                self.track_context(model_id, context_id);
-                let ctx = Context { context_id, model_id,  };
+                let ctx = Context { context_id, model_id };
                 Ok(Ok(self.ctx().table.push(ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -100,11 +98,11 @@ impl pie::core::context::HostContext for InstanceState {
         let ctx = self.ctx().table.get(&this)?;
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
+        let process_id = self.id();
 
-        match context::fork(model_id, context_id).await {
+        match context::fork(model_id, context_id, process_id).await {
             Ok(new_context_id) => {
-                self.track_context(model_id, new_context_id);
-                let new_ctx = Context { context_id: new_context_id, model_id,  };
+                let new_ctx = Context { context_id: new_context_id, model_id };
                 Ok(Ok(self.ctx().table.push(new_ctx)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -148,21 +146,14 @@ impl pie::core::context::HostContext for InstanceState {
         let context_id = ctx.context_id;
         let model_id = ctx.model_id;
 
-        self.untrack_context(model_id, context_id);
-        let _ = context::destroy(model_id, context_id, false).await;
+        let _ = context::destroy(model_id, context_id).await;
         self.ctx().table.delete(this)?;
         Ok(())
     }
 
     async fn drop(&mut self, this: Resource<Context>) -> Result<()> {
-        let ctx = self.ctx().table.get(&this)?;
-        let context_id = ctx.context_id;
-        let model_id = ctx.model_id;
-        // Only destroy anonymous contexts (ones still tracked).
-        // Named/saved contexts survive handle drop.
-        if self.untrack_context(model_id, context_id) {
-            let _ = context::destroy(model_id, context_id, true).await;
-        }
+        // Context cleanup is handled by DestroyProcess on instance drop.
+        // Individual handle drops just remove the resource table entry.
         self.ctx().table.delete(this)?;
         Ok(())
     }

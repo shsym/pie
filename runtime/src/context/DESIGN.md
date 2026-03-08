@@ -46,11 +46,11 @@ Active ──(get_physical_page_ids)──► Pinned ──(clear_pinned)──�
 Suspended                           Suspended (on clear_pinned)
 ```
 
-| State         | Working Pages | Committed Chain | Evictable |
+| State         | Working Pages | Committed Hashes | Evictable |
 |---------------|--------------|-----------------|-----------|
 | **Active**    | On GPU       | Refcounted      | Yes       |
 | **Pinned**    | On GPU       | Refcounted      | Deferred only (flag) |
-| **Suspended** | On CPU       | Released         | Nothing to evict |
+| **Suspended** | On CPU       | Released (metadata only) | Nothing to evict |
 
 **`pending_suspend: bool`** — Set on Pinned contexts when selected as victim.
 Actual suspension deferred until `clear_pinned`.
@@ -69,8 +69,9 @@ Actual suspension deferred until `clear_pinned`.
 ### Committed Pages
 - Content-addressed via chained `PageHash` (BLAKE3).
 - Shared across contexts via refcount in PageStore.
-- `committed_tip: Option<PageHash>` — tip of the hash chain.
+- `committed_hashes: Vec<PageHash>` — ordered committed page hashes (root-to-tip).
 - On suspend: refcounts decremented. Pages with `rc=0` become evictable.
+  Hashes remain on Context as metadata for restore.
 - On restore: longest prefix match → replay missing suffix.
 
 ---
@@ -98,8 +99,6 @@ pub struct PageStore {
 
     // Content-addressed storage: hash → (gpu_phys, refcount)
     pages: FxHashMap<PageHash, (PhysicalPageId, usize)>,
-    // Backward chain links: hash → prev_hash (0 = root)
-    chain: FxHashMap<PageHash, PageHash>,
 
     // Physical pools
     gpu: PagePool,    // GPU free list
@@ -107,19 +106,18 @@ pub struct PageStore {
 }
 ```
 
+Chain topology (hash ordering) is owned by `Context.committed_hashes`.
+
 Key operations:
 | Method | Description |
 |--------|-------------|
 | `alloc_gpu_pages(n)` | Alloc n GPU pages from free pool |
 | `free_gpu_pages(pages)` | Return GPU pages to free pool |
-| `commit_working(hash, prev, phys)` | Promote working → committed (dedup-aware) |
-| `acquire_chain(tip)` | Increment refcounts root→tip |
-| `release_chain(tip)` | Decrement refcounts, eagerly free rc=0 pages |
-
-| `swap_out(gpu_pages)` | Alloc CPU slots, build D2H SwapOps |
-| `swap_in(cpu_slots)` | Alloc GPU pages, build H2D SwapOps |
-| `longest_prefix_length(hashes)` | Read-only prefix match (for restore planning) |
-| `compute_page_hashes(tokens, pos, masks, prev)` | Chained content hashing |
+| `retain(hashes)` | Increment refcounts for each hash |
+| `release(hashes)` | Decrement refcounts, eagerly free rc=0 pages |
+| `count_reclaimable(hashes)` | Count pages that would free (rc≤1) |
+| `prefix_len(hashes)` | Read-only prefix match (for restore planning) |
+| `physical_ids(hashes)` | Get GPU physical IDs for resident hashes |
 
 ### arbiter.rs — DAG-Aware Scheduling
 
@@ -215,8 +213,8 @@ Phase 1: Swap working pages GPU → CPU
    If CPU pool full → OOM the owning process
 
 Phase 2: Release committed chain
-   release_chain(committed_tip) → decrement refcounts, free rc=0 pages
-   Remove committed_tip
+   release(committed_hashes) → decrement refcounts, free rc=0 pages
+   (committed_hashes remain on Context as metadata)
 
 Phase 3: Update state
    ctx.state = Suspended
@@ -331,7 +329,7 @@ Phase 1: Swap in working pages
 
 Phase 2: Rebuild committed chain
     walk lineage → compute page hashes
-    longest_prefix_length(hashes) → prefix_len
+    prefix_len(hashes) → prefix_len
     acquire refcounts for prefix hashes
     if prefix_len == total → done (no replay needed)
     build replay plan for hashes[prefix_len..]

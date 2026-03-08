@@ -1,18 +1,13 @@
 use std::collections::HashMap;
 
-
-
 use super::{
     ContextId, ContextManager, ContextState, SERVICES,
     Record,
 };
 use super::sched::ProcessState;
-use super::suspend::DeferredOp;
+use super::Message;
 use super::pagestore::{PhysicalPageId, compute_last_page_len};
-use crate::adapter::AdapterId;
-use crate::device::DeviceId;
 use crate::inference;
-use crate::inference::brle::Brle;
 use crate::inference::request::ForwardPassRequest;
 use crate::process::ProcessId;
 
@@ -41,22 +36,47 @@ impl ContextManager {
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 // Working pages on CPU that need GPU allocation for swap-in
                 *required.entry(dev_idx).or_insert(0) += ctx.working_pages.len();
-                // Pages needing replay: walk chain, compute prefix match, count missing suffix
-                if let Some(tip_hash) = ctx.committed_tip {
+                // Pages needing replay: check prefix match, count missing suffix
+                if !ctx.committed_hashes.is_empty() {
                     let dev = &self.devices[dev_idx];
-                    let chain = dev.walk_chain(tip_hash);
-                    let prefix_len = dev.longest_prefix_length(&chain);
-                    let replay_pages = chain.len().saturating_sub(prefix_len);
+                    let prefix_len = dev.prefix_len(&ctx.committed_hashes);
+                    let replay_pages = ctx.committed_hashes.len().saturating_sub(prefix_len);
                     *required.entry(dev_idx).or_insert(0) += replay_pages;
                 }
             }
         }
 
-        // Add deferred alloc requirements (Pin doesn't need extra pages)
+        // Add deferred op requirements (iterate all deferred ops)
         if let Some(proc) = self.processes.get(&pid) {
-            if let Some(DeferredOp::Alloc(ref alloc)) = proc.deferred_op {
-                let dev_idx = alloc.device as usize;
-                *required.entry(dev_idx).or_insert(0) += alloc.num_pages;
+            for op in &proc.deferred_ops {
+                match op {
+                    Message::ReserveWorkingPages { id, num_pages, .. } => {
+                        if let Some(ctx) = self.contexts.get(id) {
+                            let dev_idx = ctx.device.unwrap_or(0) as usize;
+                            *required.entry(dev_idx).or_insert(0) += num_pages;
+                        }
+                    }
+                    Message::Fork { id, .. } => {
+                        // Fork needs GPU pages for working page copy
+                        if let Some(src) = self.contexts.get(id) {
+                            let dev_idx = src.device.unwrap_or(0) as usize;
+                            *required.entry(dev_idx).or_insert(0) += src.working_pages.len();
+                        }
+                    }
+                    Message::Take { username, name, .. } => {
+                        // Take needs GPU pages only if snapshot is Suspended (H2D swap-in)
+                        let key = (username.clone(), name.clone());
+                        if let Some(&snap_id) = self.snapshots.get(&key) {
+                            if let Some(snap) = self.contexts.get(&snap_id) {
+                                if snap.is_suspended() && !snap.working_pages.is_empty() {
+                                    let dev_idx = snap.device.unwrap_or(0) as usize;
+                                    *required.entry(dev_idx).or_insert(0) += snap.working_pages.len();
+                                }
+                            }
+                        }
+                    }
+                    _ => {} // Pin and others don't need extra GPU pages
+                }
             }
         }
 
@@ -94,7 +114,7 @@ impl ContextManager {
         for &ctx_id in &ctx_ids {
             let ctx = self.contexts.get(&ctx_id).unwrap();
             let dev_idx = ctx.device.unwrap_or(0) as usize;
-            let committed_len = ctx.committed_len;
+            let committed_len = ctx.committed_len();
             let working_len = ctx.working_pages.len();
             let d = self.process_entry(pid).device_mut(dev_idx);
             d.committed += committed_len;
@@ -109,7 +129,7 @@ impl ContextManager {
 
         // If no replays needed, fire deferred ops immediately (no FinishRestore coming)
         if replay_count == 0 {
-            self.fire_deferred_op(pid);
+            self.fire_deferred_ops(pid);
         }
 
         Ok(())
@@ -134,7 +154,7 @@ impl ContextManager {
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let cpu_pages = ctx.working_pages.clone();
-        let tip = ctx.committed_tip;
+        let committed_hashes = ctx.committed_hashes.clone();
 
         // Phase 1: Swap-in working pages from CPU → GPU
         if !cpu_pages.is_empty() {
@@ -149,13 +169,11 @@ impl ContextManager {
         }
 
         // Phase 2: Acquire refcounts for GPU-resident committed prefix.
-        let prefix_len = if let Some(tip_hash) = tip {
+        let prefix_len = if !committed_hashes.is_empty() {
             let dev = &mut self.devices[dev_idx];
-            let chain = dev.walk_chain(tip_hash);
-            let prefix_len = dev.longest_prefix_length(&chain);
+            let prefix_len = dev.prefix_len(&committed_hashes);
             if prefix_len > 0 {
-                let prefix_tip = chain[prefix_len - 1];
-                dev.acquire_chain(prefix_tip);
+                dev.retain(&committed_hashes[..prefix_len]);
             }
             prefix_len
         } else {
@@ -190,50 +208,37 @@ impl ContextManager {
         let ctx = self.contexts.get(&ctx_id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         let lineage = ctx.lineage.clone();
-        let committed_len = ctx.committed_len;
-        let tip = ctx.committed_tip;
+        let committed_hashes = ctx.committed_hashes.clone();
+        let committed_len = committed_hashes.len();
         let page_size = self.page_size;
 
         if prefix_len >= committed_len {
             return Ok(false);
         }
 
-        // Walk the chain to get all hashes (root-to-tip order).
-        let chain = match tip {
-            Some(tip_hash) => self.devices[dev_idx].walk_chain(tip_hash),
-            None => return Ok(false),
-        };
+        if committed_hashes.is_empty() {
+            return Ok(false);
+        }
 
-        // Eagerly allocate GPU pages for the suffix and register chain links.
+        // Eagerly allocate GPU pages for the suffix and register in the pages map.
         // The forward pass will fill KV data; until then the context is Pinned.
         let suffix_count = committed_len - prefix_len;
+        let suffix_hashes = &committed_hashes[prefix_len..];
         let suffix_phys = self.devices[dev_idx].alloc_gpu_pages(suffix_count)
             .ok_or_else(|| anyhow::anyhow!("No GPU pages for replay but admission check passed"))?;
 
-        let mut prev = if prefix_len > 0 { chain[prefix_len - 1] } else { 0 };
-        for i in prefix_len..committed_len {
-            let hash = chain[i];
-            self.devices[dev_idx].insert_chain_link(hash, prev);
-            prev = hash;
+        // Register suffix pages in PageStore
+        for (i, &hash) in suffix_hashes.iter().enumerate() {
+            self.devices[dev_idx].commit(hash, suffix_phys[i]);
         }
 
-        // Update index_cache to include the suffix physical pages.
-        if let Some(tip_hash) = tip {
-            let prefix_tip = if prefix_len > 0 { Some(chain[prefix_len - 1]) } else { None };
-            self.devices[dev_idx].update_index_cache(tip_hash, prefix_tip, &suffix_phys);
-        }
+        // Build the full physical page table (prefix + suffix).
+        let full_phys = self.devices[dev_idx].physical_ids(&committed_hashes);
 
         // Build forward pass requests from the lineage (for tokens/positions/masks).
         let prefix_tokens = prefix_len * page_size;
         let committed_tokens = committed_len * page_size;
         let mut kv_so_far = prefix_tokens as u32;
-
-        // Resolve the full physical page table (prefix + suffix).
-        let full_phys = if let Some(tip_hash) = tip {
-            self.devices[dev_idx].resolve_physical(tip_hash)
-        } else {
-            Vec::new()
-        };
 
         let mut requests: Vec<(ForwardPassRequest, Vec<PhysicalPageId>, u32)> = Vec::new();
         let mut token_offset = 0usize;
@@ -328,27 +333,39 @@ impl ContextManager {
         Ok(true)
     }
 
-    /// Fire a process's deferred operation (Alloc or Pin).
+    /// Fire all of a process's deferred operations.
     /// Called when all replay forward passes have completed.
-    fn fire_deferred_op(&mut self, pid: ProcessId) {
-        let deferred = self.processes.get_mut(&pid)
-            .and_then(|p| p.deferred_op.take());
-        if let Some(op) = deferred {
+    fn fire_deferred_ops(&mut self, pid: ProcessId) {
+        let ops: Vec<Message> = self.processes.get_mut(&pid)
+            .map(|p| std::mem::take(&mut p.deferred_ops))
+            .unwrap_or_default();
+        for op in ops {
             match op {
-                DeferredOp::Alloc(alloc) => {
-                    let dev_idx = alloc.device as usize;
-                    if self.reserve_working_pages(alloc.context_id, dev_idx, alloc.num_pages, Some(pid)).is_ok() {
-                        let _ = alloc.response.send(Ok(()));
+                Message::ReserveWorkingPages { id, num_pages, response } => {
+                    let dev_idx = self.contexts.get(&id)
+                        .map(|c| c.device.unwrap_or(0) as usize)
+                        .unwrap_or(0);
+                    if self.reserve_working_pages(id, dev_idx, num_pages, Some(pid)).is_ok() {
+                        let _ = response.send(Ok(()));
                     } else {
-                        let _ = alloc.response.send(Err(anyhow::anyhow!(
+                        let _ = response.send(Err(anyhow::anyhow!(
                             "Insufficient pages during restore replay (should not happen)"
                         )));
                     }
                 }
-                DeferredOp::Pin { context_id, num_input_tokens, response } => {
-                    let result = self.pin(context_id, num_input_tokens);
+                Message::Pin { id, num_input_tokens, response } => {
+                    let result = self.pin(id, num_input_tokens);
                     let _ = response.send(result);
                 }
+                Message::Fork { id, owner, response } => {
+                    let result = self.fork(id, owner);
+                    let _ = response.send(result);
+                }
+                Message::Take { username, name, owner, response } => {
+                    let result = self.take(username, name, owner);
+                    let _ = response.send(result);
+                }
+                _ => {} // Non-deferrable messages should never appear here
             }
         }
     }
@@ -379,7 +396,7 @@ impl ContextManager {
                     proc.pending_replay_count = proc.pending_replay_count.saturating_sub(1);
                 }
             }
-            // Don't fire deferred op — process was re-suspended.
+            // Don't fire deferred ops — process was re-suspended.
             // Don't drain_queues here — the suspended pages will be
             // reclaimed when the last pending_pinned clears via unpin.
             return;
@@ -398,8 +415,9 @@ impl ContextManager {
                 false
             };
             if should_fire {
-                self.fire_deferred_op(pid);
+                self.fire_deferred_ops(pid);
             }
         }
+
     }
 }

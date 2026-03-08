@@ -67,11 +67,9 @@ impl PagePool {
 /// Per-device page cache. Manages the content-addressed KV cache for one GPU.
 ///
 /// Data structures:
-/// - `pages`:       hash → (GPU physical page, refcount)
-/// - `chain`:       hash → prev_hash (backward links for traversal, 0 = root)
-/// - `index_cache`: tip_hash → flattened `Vec<PhysicalPageId>` from root to tip
-///                  Sparse: only cached for active `committed_tip`s.
+/// - `pages`: hash → (GPU physical page, refcount)
 ///
+/// Chain topology (hash ordering) is owned by `Context.committed_hashes`.
 /// Committed pages that are evicted from GPU are simply discarded. They can be
 /// replayed from lineage when the context needs to be restored. CPU memory is
 /// used exclusively for working page swap (uncommitted pages during suspension).
@@ -81,14 +79,7 @@ pub struct PageStore {
 
     /// hash → (GPU physical page ID, refcount).
     /// Present for every GPU-resident committed page.
-    pub(crate) pages: FxHashMap<PageHash, (PhysicalPageId, usize)>,
-
-    /// hash → prev_hash for backward chain traversal. 0 = root (no predecessor).
-    chain: FxHashMap<PageHash, PageHash>,
-
-    /// Traversal cache: tip_hash → ordered physical page IDs from root to tip.
-    /// Sparse: only maintained for hashes that are an active context's `committed_tip`.
-    index_cache: FxHashMap<PageHash, Vec<PhysicalPageId>>,
+    committed_gpu_pages: FxHashMap<PageHash, (PhysicalPageId, usize)>,
 
     /// GPU physical page pool.
     gpu: PagePool,
@@ -101,9 +92,7 @@ impl PageStore {
     pub fn new(page_size: usize, num_gpu_pages: usize, num_cpu_pages: usize) -> Self {
         PageStore {
             page_size,
-            pages: FxHashMap::default(),
-            chain: FxHashMap::default(),
-            index_cache: FxHashMap::default(),
+            committed_gpu_pages: FxHashMap::default(),
             gpu: PagePool::new(num_gpu_pages),
             cpu: PagePool::new(num_cpu_pages),
         }
@@ -154,178 +143,86 @@ impl PageStore {
     // Commit
     // =========================================================================
 
+    /// Commit a page to the GPU cache (dedup-aware).
+    /// If hash already exists, bumps rc and frees the duplicate `phys` page
+    /// back to the GPU pool. If new, inserts with rc=1.
+    pub fn commit(&mut self, hash: PageHash, phys: PhysicalPageId) {
+        if let Some((_, rc)) = self.committed_gpu_pages.get_mut(&hash) {
+            *rc += 1;
+            self.gpu.free(phys);
+        } else {
+            self.committed_gpu_pages.insert(hash, (phys, 1));
+        }
+    }
+
     // =========================================================================
-    // Chain traversal & refcounting
+    // Refcounting (slice-based)
     // =========================================================================
 
-    /// Increment refcount for every page reachable from `tip`.
-    pub fn acquire_chain(&mut self, tip: PageHash) {
-        let mut h = tip;
-        loop {
-            if let Some((_, rc)) = self.pages.get_mut(&h) {
+    /// Increment refcount for every hash in the slice.
+    pub fn retain(&mut self, hashes: &[PageHash]) {
+        for &h in hashes {
+            if let Some((_, rc)) = self.committed_gpu_pages.get_mut(&h) {
                 *rc += 1;
-            }
-            match self.chain.get(&h) {
-                Some(&prev) if prev != 0 => h = prev,
-                _ => break,
             }
         }
     }
 
-    /// Decrement refcount for every page reachable from `tip`.
-    /// Pages that hit rc=0 are eagerly evicted: removed from `self.pages`
+    /// Decrement refcount for every hash in the slice.
+    /// Pages that hit rc=0 are eagerly evicted: removed from `self.committed_gpu_pages`
     /// and their GPU physical page freed back to the pool.
-    /// Chain links (`self.chain`) are preserved for restore-path traversal.
     /// Returns the number of GPU pages freed.
-    pub fn release_chain(&mut self, tip: PageHash) -> usize {
+    pub fn release(&mut self, hashes: &[PageHash]) -> usize {
         let mut freed = 0;
-        let mut h = tip;
-        loop {
-            if let Some((_, rc)) = self.pages.get_mut(&h) {
+        for &h in hashes {
+            if let Some((_, rc)) = self.committed_gpu_pages.get_mut(&h) {
                 *rc = rc.saturating_sub(1);
                 if *rc == 0 {
-                    if let Some((gpu_phys, _)) = self.pages.remove(&h) {
+                    if let Some((gpu_phys, _)) = self.committed_gpu_pages.remove(&h) {
                         self.gpu.free(gpu_phys);
                         freed += 1;
                     }
                 }
-            }
-            match self.chain.get(&h) {
-                Some(&prev) if prev != 0 => h = prev,
-                _ => break,
             }
         }
         freed
     }
 
     /// Estimate how many GPU-resident pages would be freed (rc→0)
-    /// if `release_chain(tip)` were called.
+    /// if `release(hashes)` were called.
     /// Read-only: does not modify refcounts.
-    pub fn estimate_chain_release(&self, tip: PageHash) -> usize {
-        let mut count = 0;
-        let mut h = tip;
-        loop {
-            if let Some((_, rc)) = self.pages.get(&h) {
-                if *rc <= 1 { count += 1; }
-            }
-            match self.chain.get(&h) {
-                Some(&prev) if prev != 0 => h = prev,
-                _ => break,
-            }
-        }
-        count
-    }
-
-    /// Walk the hash chain backward from `tip` to root, returning hashes in
-    /// root-to-tip order.
-    pub fn walk_chain(&self, tip: PageHash) -> Vec<PageHash> {
-        let mut hashes = Vec::new();
-        let mut h = tip;
-        loop {
-            hashes.push(h);
-            match self.chain.get(&h) {
-                Some(&prev) if prev != 0 => h = prev,
-                _ => break,
-            }
-        }
-        hashes.reverse();
-        hashes
+    pub fn count_reclaimable(&self, hashes: &[PageHash]) -> usize {
+        hashes.iter().filter(|h| {
+            self.committed_gpu_pages.get(h).map(|(_, rc)| *rc <= 1).unwrap_or(false)
+        }).count()
     }
 
     /// Get the refcount for a specific hash.
     pub fn refcount(&self, hash: PageHash) -> usize {
-        self.pages.get(&hash).map(|(_, rc)| *rc).unwrap_or(0)
-    }
-
-    /// Insert a chain link (hash → prev_hash) without creating a page or refcount entry.
-    /// Used by commit_pages_logical for metadata-only commits where no GPU page exists.
-    pub fn insert_chain_link(&mut self, hash: PageHash, prev_hash: PageHash) {
-        self.chain.insert(hash, prev_hash);
+        self.committed_gpu_pages.get(&hash).map(|(_, rc)| *rc).unwrap_or(0)
     }
 
     /// Check if a specific hash has a GPU-resident physical page.
-    pub fn is_gpu_resident(&self, hash: PageHash) -> bool {
-        self.pages.contains_key(&hash)
+    pub fn contains(&self, hash: PageHash) -> bool {
+        self.committed_gpu_pages.contains_key(&hash)
     }
-
-    // =========================================================================
-    // Eviction
-    // =========================================================================
-
-
-
 
     // =========================================================================
     // Prefix lookup (for restore from lineage)
     // =========================================================================
 
     /// Count the longest prefix of `hashes` present on GPU (read-only).
-    /// Does NOT modify refcounts — use `acquire_chain` after successful restore.
-    pub fn longest_prefix_length(&self, hashes: &[PageHash]) -> usize {
-        hashes.iter().take_while(|h| self.pages.contains_key(h)).count()
+    /// Does NOT modify refcounts — use `retain` after successful restore.
+    pub fn prefix_len(&self, hashes: &[PageHash]) -> usize {
+        hashes.iter().take_while(|h| self.committed_gpu_pages.contains_key(h)).count()
     }
 
-    // =========================================================================
-    // Physical page resolution
-    // =========================================================================
-
-    /// Resolve the ordered list of GPU physical page IDs for a chain tip.
-    /// O(1) if the tip is in index_cache; otherwise rebuilds from chain + pages.
-    pub fn resolve_physical(&mut self, tip: PageHash) -> Vec<PhysicalPageId> {
-        if let Some(cached) = self.index_cache.get(&tip) {
-            let chain_len = self.walk_chain(tip).len();
-            if cached.len() == chain_len {
-                return cached.clone();
-            }
-            self.index_cache.remove(&tip);
-        }
-        let chain = self.walk_chain(tip);
-        let chain_len = chain.len();
-        let table: Vec<PhysicalPageId> = chain.iter()
-            .filter_map(|h| self.pages.get(h).map(|(phys, _)| *phys))
-            .collect();
-        if table.len() == chain_len {
-            self.index_cache.insert(tip, table.clone());
-        }
-        table
-    }
-
-    /// Update the index_cache for a context's new committed_tip.
-    ///
-    /// Move semantics: if `old_tip` is provided and has an index_cache entry,
-    /// take it, append the new physical pages, and store under `new_tip`.
-    /// Otherwise rebuild from chain + pages.
-    pub fn update_index_cache(
-        &mut self,
-        new_tip: PageHash,
-        old_tip: Option<PageHash>,
-        new_phys_pages: &[PhysicalPageId],
-    ) {
-        // All committed pages hit dedup → tip unchanged, cache is correct.
-        if old_tip == Some(new_tip) {
-            return;
-        }
-
-        let mut page_table = match old_tip {
-            Some(old) => self.index_cache.remove(&old).unwrap_or_default(),
-            None => Vec::new(),
-        };
-
-        if page_table.is_empty() && old_tip.is_some() {
-            page_table = self.resolve_physical(old_tip.unwrap());
-        }
-
-        page_table.extend_from_slice(new_phys_pages);
-
-        let chain_len = self.walk_chain(new_tip).len();
-        if page_table.len() == chain_len {
-            self.index_cache.insert(new_tip, page_table);
-        }
-    }
-
-    /// Remove an index_cache entry (e.g., when context is destroyed or suspended).
-    pub fn remove_index_cache(&mut self, tip: PageHash) {
-        self.index_cache.remove(&tip);
+    /// Resolve physical page IDs for a list of hashes.
+    /// Returns a Vec of the GPU physical page IDs for each hash that is resident.
+    pub fn physical_ids(&self, hashes: &[PageHash]) -> Vec<PhysicalPageId> {
+        hashes.iter()
+            .filter_map(|h| self.committed_gpu_pages.get(h).map(|(phys, _)| *phys))
+            .collect()
     }
 
     /// Allocate `n` CPU pages from the swap pool.
@@ -349,19 +246,17 @@ impl PageStore {
         }
     }
 
-    /// Count committed pages cached on this device (GPU-resident) in a chain.
-    pub fn chain_resident_count(&self, tip: PageHash) -> usize {
-        let chain = self.walk_chain(tip);
-        chain.iter().filter(|h| self.pages.contains_key(h)).count()
+    /// Count committed pages cached on this device (GPU-resident).
+    pub fn cached_count(&self, hashes: &[PageHash]) -> usize {
+        hashes.iter().filter(|h| self.committed_gpu_pages.contains_key(h)).count()
     }
 
-    /// Debug: walk chain from tip and return per-hash info (refcount + residency).
-    pub fn debug_chain_info(&self, tip: PageHash) -> String {
-        let chain = self.walk_chain(tip);
-        chain.iter()
+    /// Debug: return per-hash info (refcount + residency).
+    pub fn debug_info(&self, hashes: &[PageHash]) -> String {
+        hashes.iter()
             .map(|h| {
-                let rc = self.pages.get(h).map(|(_, rc)| *rc).unwrap_or(0);
-                let resident = self.pages.contains_key(h);
+                let rc = self.committed_gpu_pages.get(h).map(|(_, rc)| *rc).unwrap_or(0);
+                let resident = self.committed_gpu_pages.contains_key(h);
                 format!("rc={rc},res={resident}")
             })
             .collect::<Vec<_>>()
@@ -433,19 +328,11 @@ mod tests {
         (0..n).map(|_| Brle::new(0)).collect()
     }
 
-    /// Test helper: allocate a working page, then commit it.
-    fn alloc_and_commit(store: &mut PageStore, hash: PageHash, prev: PageHash) -> PhysicalPageId {
+    /// Test helper: allocate a working page, then commit it (dedup-aware).
+    fn alloc_and_commit(store: &mut PageStore, hash: PageHash) -> PhysicalPageId {
         let working = store.alloc_gpu_pages(1).unwrap()[0];
-        if let Some((existing, rc)) = store.pages.get_mut(&hash) {
-            *rc += 1;
-            let p = *existing;
-            store.free_gpu_pages(&[working]);
-            p
-        } else {
-            store.pages.insert(hash, (working, 1));
-            store.insert_chain_link(hash, prev);
-            working
-        }
+        store.commit(hash, working);
+        store.physical_ids(&[hash])[0]
     }
 
     #[test]
@@ -455,17 +342,15 @@ mod tests {
         let tokens: Vec<u32> = (0..8).collect();
         let positions: Vec<u32> = (0..8).collect();
         let masks = make_brle(8);
-        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size, &tokens, &positions, &masks, 0);
         assert_eq!(hashes.len(), 2);
 
-        let phys1 = alloc_and_commit(&mut store, hashes[0], 0);
-        assert!(store.is_gpu_resident(hashes[0]));
+        let phys1 = alloc_and_commit(&mut store, hashes[0]);
+        assert!(store.contains(hashes[0]));
 
-        let phys2 = alloc_and_commit(&mut store, hashes[1], hashes[0]);
+        let phys2 = alloc_and_commit(&mut store, hashes[1]);
 
-        store.update_index_cache(hashes[1], None, &[phys1, phys2]);
-
-        let resolved = store.resolve_physical(hashes[1]);
+        let resolved = store.physical_ids(&hashes);
         assert_eq!(resolved, vec![phys1, phys2]);
     }
 
@@ -476,60 +361,51 @@ mod tests {
         let tokens: Vec<u32> = (0..4).collect();
         let positions: Vec<u32> = (0..4).collect();
         let masks = make_brle(4);
-        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size, &tokens, &positions, &masks, 0);
 
-        let phys1 = alloc_and_commit(&mut store, hashes[0], 0);
+        let phys1 = alloc_and_commit(&mut store, hashes[0]);
         assert_eq!(store.refcount(hashes[0]), 1);
 
         let working2 = store.alloc_gpu_pages(1).unwrap()[0];
-        // Dedup: same hash already exists
-        let (phys2, freed) = if let Some((existing, rc)) = store.pages.get_mut(&hashes[0]) {
-            *rc += 1;
-            let p = *existing;
-            store.free_gpu_pages(&[working2]);
-            (p, true)
-        } else {
-            store.pages.insert(hashes[0], (working2, 1));
-            store.insert_chain_link(hashes[0], 0);
-            (working2, false)
-        };
-        assert!(freed);
+        // Dedup: same hash already exists — commit auto-frees working2
+        store.commit(hashes[0], working2);
+        let phys2 = store.physical_ids(&[hashes[0]])[0];
         assert_eq!(phys1, phys2);
         assert_eq!(store.refcount(hashes[0]), 2);
     }
 
     #[test]
-    fn test_acquire_release_chain() {
+    fn test_retain_release() {
         let mut store = PageStore::new(4, 100, 10);
 
         let tokens: Vec<u32> = (0..8).collect();
         let positions: Vec<u32> = (0..8).collect();
         let masks = make_brle(8);
-        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size, &tokens, &positions, &masks, 0);
 
-        alloc_and_commit(&mut store, hashes[0], 0);
-        alloc_and_commit(&mut store, hashes[1], hashes[0]);
+        alloc_and_commit(&mut store, hashes[0]);
+        alloc_and_commit(&mut store, hashes[1]);
 
         assert_eq!(store.refcount(hashes[0]), 1);
         assert_eq!(store.refcount(hashes[1]), 1);
 
-        store.acquire_chain(hashes[1]);
+        store.retain(&hashes);
         assert_eq!(store.refcount(hashes[0]), 2);
         assert_eq!(store.refcount(hashes[1]), 2);
 
-        let freed = store.release_chain(hashes[1]);
+        let freed = store.release(&hashes);
         assert_eq!(freed, 0);
         assert_eq!(store.refcount(hashes[0]), 1);
         assert_eq!(store.refcount(hashes[1]), 1);
 
-        let freed = store.release_chain(hashes[1]);
+        let freed = store.release(&hashes);
         assert_eq!(freed, 2);
-        assert!(!store.is_gpu_resident(hashes[0]));
-        assert!(!store.is_gpu_resident(hashes[1]));
+        assert!(!store.contains(hashes[0]));
+        assert!(!store.contains(hashes[1]));
     }
 
     #[test]
-    fn test_estimate_chain_release() {
+    fn test_count_reclaimable() {
         let mut store = PageStore::new(4, 100, 10);
 
         let tokens: Vec<u32> = (0..12).collect();
@@ -539,62 +415,62 @@ mod tests {
         assert_eq!(hashes.len(), 3);
 
         // Commit 3 pages with rc=1 each
-        alloc_and_commit(&mut store, hashes[0], 0);
-        alloc_and_commit(&mut store, hashes[1], hashes[0]);
-        alloc_and_commit(&mut store, hashes[2], hashes[1]);
+        alloc_and_commit(&mut store, hashes[0]);
+        alloc_and_commit(&mut store, hashes[1]);
+        alloc_and_commit(&mut store, hashes[2]);
 
         // All rc=1 → all would become evictable
-        assert_eq!(store.estimate_chain_release(hashes[2]), 3);
+        assert_eq!(store.count_reclaimable(&hashes), 3);
 
-        // Acquire chain (simulating a second context sharing the prefix)
-        store.acquire_chain(hashes[1]); // hashes[0]:rc=2, hashes[1]:rc=2
+        // Acquire prefix (simulating a second context sharing the prefix)
+        store.retain(&hashes[..2]); // hashes[0]:rc=2, hashes[1]:rc=2
 
         // Only hashes[2] has rc=1 now
-        assert_eq!(store.estimate_chain_release(hashes[2]), 1);
+        assert_eq!(store.count_reclaimable(&hashes), 1);
 
-        // Estimate from shared tip: hashes[0]:rc=2, hashes[1]:rc=2 → 0 evictable
-        assert_eq!(store.estimate_chain_release(hashes[1]), 0);
+        // Estimate from shared prefix only: hashes[0]:rc=2, hashes[1]:rc=2 → 0 evictable
+        assert_eq!(store.count_reclaimable(&hashes[..2]), 0);
 
         // Verify release matches estimate: only hashes[2] hit rc=0
-        let freed = store.release_chain(hashes[2]);
+        let freed = store.release(&hashes);
         assert_eq!(freed, 1);
-        assert!(!store.is_gpu_resident(hashes[2]));
+        assert!(!store.contains(hashes[2]));
     }
 
     #[test]
-    fn test_shared_pages_survive_eviction() {
+    fn test_shared_pages_survive_release() {
         let mut store = PageStore::new(4, 10, 5);
 
         let tokens: Vec<u32> = (0..8).collect();
         let positions: Vec<u32> = (0..8).collect();
         let masks = make_brle(8);
-        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size, &tokens, &positions, &masks, 0);
 
-        alloc_and_commit(&mut store, hashes[0], 0);
-        alloc_and_commit(&mut store, hashes[1], hashes[0]);
+        alloc_and_commit(&mut store, hashes[0]);
+        alloc_and_commit(&mut store, hashes[1]);
 
-        store.acquire_chain(hashes[1]);
-        store.release_chain(hashes[1]);
+        store.retain(&hashes);
+        store.release(&hashes);
 
-        // Shared pages (rc=1) survive — not freed by release_chain
-        assert!(store.is_gpu_resident(hashes[0]));
-        assert!(store.is_gpu_resident(hashes[1]));
+        // Shared pages (rc=1) survive
+        assert!(store.contains(hashes[0]));
+        assert!(store.contains(hashes[1]));
     }
 
     #[test]
-    fn test_release_chain_frees_unreferenced() {
+    fn test_release_frees_unreferenced() {
         let mut store = PageStore::new(4, 10, 5);
 
         let tokens: Vec<u32> = (0..4).collect();
         let positions: Vec<u32> = (0..4).collect();
         let masks = make_brle(4);
-        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size, &tokens, &positions, &masks, 0);
 
-        alloc_and_commit(&mut store, hashes[0], 0);
+        alloc_and_commit(&mut store, hashes[0]);
 
-        let freed = store.release_chain(hashes[0]);
+        let freed = store.release(&hashes[..1]);
         assert_eq!(freed, 1);
-        assert!(!store.is_gpu_resident(hashes[0]));
+        assert!(!store.contains(hashes[0]));
     }
 
     #[test]
@@ -652,24 +528,24 @@ mod tests {
     }
 
     #[test]
-    fn test_longest_prefix_length() {
+    fn test_prefix_len() {
         let mut store = PageStore::new(4, 100, 10);
 
         let tokens: Vec<u32> = (0..12).collect();
         let positions: Vec<u32> = (0..12).collect();
         let masks = make_brle(12);
-        let hashes = compute_page_hashes(store.page_size,&tokens, &positions, &masks, 0);
+        let hashes = compute_page_hashes(store.page_size, &tokens, &positions, &masks, 0);
         assert_eq!(hashes.len(), 3);
 
-        alloc_and_commit(&mut store, hashes[0], 0);
-        alloc_and_commit(&mut store, hashes[1], hashes[0]);
+        alloc_and_commit(&mut store, hashes[0]);
+        alloc_and_commit(&mut store, hashes[1]);
 
-        let matched = store.longest_prefix_length(&hashes);
+        let matched = store.prefix_len(&hashes);
         assert_eq!(matched, 2);
     }
 
     #[test]
-    fn test_index_cache_move_on_commit() {
+    fn test_physical_ids() {
         let mut store = PageStore::new(4, 100, 10);
 
         let tokens: Vec<u32> = (0..8).collect();
@@ -677,14 +553,10 @@ mod tests {
         let masks = make_brle(8);
         let hashes = compute_page_hashes(store.page_size, &tokens, &positions, &masks, 0);
 
-        let phys1 = alloc_and_commit(&mut store, hashes[0], 0);
-        store.update_index_cache(hashes[0], None, &[phys1]);
+        let phys1 = alloc_and_commit(&mut store, hashes[0]);
+        let phys2 = alloc_and_commit(&mut store, hashes[1]);
 
-        let phys2 = alloc_and_commit(&mut store, hashes[1], hashes[0]);
-        store.update_index_cache(hashes[1], Some(hashes[0]), &[phys2]);
-
-        assert!(!store.index_cache.contains_key(&hashes[0]));
-        let resolved = store.resolve_physical(hashes[1]);
+        let resolved = store.physical_ids(&hashes);
         assert_eq!(resolved, vec![phys1, phys2]);
     }
 }
