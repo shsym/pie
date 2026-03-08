@@ -1,3 +1,36 @@
+//! Restoration — Process Recovery and Replay Planning.
+//!
+//! When a Pending process wins the `restore_queue`, this module brings it
+//! back to Running state.
+//!
+//! ## `restore_all(pid)` — Full Process Recovery
+//!
+//! 1. Call `restore(ctx)` for each Suspended context.
+//! 2. Re-set scheduler accounting from actual context state.
+//! 3. Transition process to Running.
+//! 4. Fire deferred ops (or wait for replay completion).
+//!
+//! ## `restore(ctx)` — Single Context Recovery
+//!
+//! Three phases:
+//! 1. **Swap-in**: alloc GPU pages, H2D copy from CPU, free CPU slots.
+//! 2. **Prefix match**: `prefix_len(committed_hashes)` → acquire refcounts
+//!    for GPU-resident prefix via `retain`.
+//! 3. **Replay suffix**: alloc fresh GPU pages for missing suffix, register
+//!    in PageStore via `commit_batch`, spawn replay forward passes. Context
+//!    stays Pinned until all replay passes complete (`replay_complete`).
+//!
+//! **Invariant**: restoration never evicts. The admission check in
+//! `can_restore_all` guarantees sufficient pages on all devices before
+//! `restore_all` is called.
+//!
+//! ## `replay_complete(ctx_id)` — Post-Replay Transition
+//!
+//! Pinned → Active. When all replay passes for a process finish
+//! (`pending_replay_count` → 0), deferred ops fire. If the process was
+//! re-suspended mid-replay (`pending_suspend`), the context is re-suspended
+//! instead.
+
 use std::collections::HashMap;
 
 use super::{
@@ -206,9 +239,7 @@ impl ContextManager {
         let suffix_phys = suffix_pages;
 
         // Register suffix pages in PageStore
-        for (i, &hash) in suffix_hashes.iter().enumerate() {
-            self.devices[dev_idx].commit(hash, suffix_phys[i]);
-        }
+        self.devices[dev_idx].commit_batch(suffix_hashes, &suffix_phys);
 
         // Build the full physical page table (prefix + suffix).
         let full_phys = self.devices[dev_idx].physical_ids(&committed_hashes);

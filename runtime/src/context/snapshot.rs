@@ -1,3 +1,14 @@
+//! Snapshots — Named Context Save, Load, Fork, Take.
+//!
+//! Provides named persistence points for contexts. Snapshots are namespace-scoped
+//! by `(username, name)` and stored as context IDs in `ContextManager.snapshots`.
+//!
+//! Key operations:
+//! - **save**: clone a context's committed chain + lineage into a new snapshot.
+//! - **fork**: create a new context sharing the snapshot's committed pages (retain).
+//! - **take**: fork + delete in one step (transfers ownership).
+//! - **delete**: release committed chain refcounts and remove the snapshot.
+
 use std::time::Instant;
 
 use anyhow::Result;
