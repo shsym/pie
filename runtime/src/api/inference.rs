@@ -407,7 +407,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 if num_input_tokens > 0 {
                     if let Err(e) = context::append_working_page_tokens(
                         model_id, context_id, fill_tokens,
-                        fill_positions, fill_masks, adapter_id,
+                        fill_positions, fill_masks, adapter_id, adapter_seed,
                     ).await {
                         context::unpin(model_id, context_id);
                         tracing::warn!("context::fill failed for ctx {context_id}: {e:#}");

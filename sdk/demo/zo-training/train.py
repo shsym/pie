@@ -64,9 +64,9 @@ class TrainingConfig:
     # --- Inferlet names (from registry) ---
     inferlet_names: dict[str, str] = field(
         default_factory=lambda: {
-            "es-init": "es-init@0.1.2",
-            "es-rollout": "es-rollout@0.1.2",
-            "es-update": "es-update@0.1.2",
+            "es-init": "es-init@0.1.5",
+            "es-rollout": "es-rollout@0.1.5",
+            "es-update": "es-update@0.1.5",
         }
     )
 

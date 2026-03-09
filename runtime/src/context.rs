@@ -266,10 +266,11 @@ pub async fn truncate_working_page_tokens(model_idx: usize, id: ContextId, count
 pub async fn append_working_page_tokens(
     model_idx: usize, id: ContextId, tokens: Vec<u32>,
     positions: Vec<u32>, masks: Vec<Brle>, adapter: Option<AdapterId>,
+    adapter_seed: Option<i64>,
 ) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(model_idx, Message::AppendWorkingPageTokens {
-        id, tokens, positions, masks, adapter, response: tx,
+        id, tokens, positions, masks, adapter, adapter_seed, response: tx,
     })?;
     rx.await.context("context::append_working_page_tokens: actor dropped response")?
 }
@@ -292,6 +293,7 @@ pub(crate) struct TokenInfo {
     pub position: u32,
     pub mask: Brle,
     pub adapter: Option<AdapterId>,
+    pub adapter_seed: Option<i64>,
 }
 
 // =============================================================================
@@ -305,6 +307,7 @@ pub(crate) enum Record {
         positions: Vec<u32>,
         mask: Vec<Brle>,
         adapter: Option<AdapterId>,
+        adapter_seed: Option<i64>,
     },
 }
 
@@ -636,9 +639,11 @@ impl ContextManager {
             }
         }
         let lineage_adapter = ctx.working_page_tokens.first().and_then(|t| t.adapter);
+        let lineage_adapter_seed = ctx.working_page_tokens.first().and_then(|t| t.adapter_seed);
 
-        // Compute content-based hashes (no physical page IDs needed).
-        let hashes = pagestore::compute_page_hashes(page_size, &tokens, &positions, &masks, prev_hash);
+        // Compute content-based hashes (includes adapter_seed so ZO-perturbed
+        // pages are not shared with unperturbed or differently-seeded pages).
+        let hashes = pagestore::compute_page_hashes(page_size, &tokens, &positions, &masks, prev_hash, lineage_adapter_seed);
         let existing_prefix = ctx.committed_hashes.clone();
         let dev = &mut self.devices[dev_idx];
 
@@ -661,17 +666,17 @@ impl ContextManager {
         ctx.max_committed_position = positions.iter().copied().max()
             .or(ctx.max_committed_position);
 
-        // Append to lineage (merge with last record if same adapter).
-        if let Some(Record::Fill { tokens: t, positions: p, mask: m, adapter: a }) = ctx.lineage.last_mut() {
-            if *a == lineage_adapter {
+        // Append to lineage (merge with last record if same adapter AND seed).
+        if let Some(Record::Fill { tokens: t, positions: p, mask: m, adapter: a, adapter_seed: s }) = ctx.lineage.last_mut() {
+            if *a == lineage_adapter && *s == lineage_adapter_seed {
                 t.extend_from_slice(&tokens);
                 p.extend_from_slice(&positions);
                 m.extend_from_slice(&masks);
             } else {
-                ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter });
+                ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter, adapter_seed: lineage_adapter_seed });
             }
         } else {
-            ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter });
+            ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter, adapter_seed: lineage_adapter_seed });
         }
 
         // Scheduler accounting (skip for Suspended — already zeroed).
@@ -862,7 +867,7 @@ impl ContextManager {
 
     pub(crate) fn append_working_page_tokens(
         &mut self, id: ContextId, tokens: Vec<u32>, positions: Vec<u32>,
-        masks: Vec<Brle>, adapter: Option<AdapterId>,
+        masks: Vec<Brle>, adapter: Option<AdapterId>, adapter_seed: Option<i64>,
     ) -> Result<()> {
         let n = tokens.len();
         if positions.len() != n {
@@ -878,6 +883,7 @@ impl ContextManager {
                 token, position: positions[i],
                 mask: if masks.is_empty() { Brle::new(0) } else { masks[i].clone() },
                 adapter,
+                adapter_seed,
             });
         }
         Ok(())
@@ -919,7 +925,7 @@ pub(crate) enum Message {
     TruncateWorkingPageTokens { id: ContextId, count: u32, response: oneshot::Sender<Result<()>> },
     AppendWorkingPageTokens {
         id: ContextId, tokens: Vec<u32>, positions: Vec<u32>,
-        masks: Vec<Brle>, adapter: Option<AdapterId>,
+        masks: Vec<Brle>, adapter: Option<AdapterId>, adapter_seed: Option<i64>,
         response: oneshot::Sender<Result<()>>,
     },
 
@@ -993,8 +999,8 @@ impl ServiceHandler for ContextManager {
             Message::TruncateWorkingPageTokens { id, count, response } => {
                 let _ = response.send(self.truncate_working_page_tokens(id, count));
             }
-            Message::AppendWorkingPageTokens { id, tokens, positions, masks, adapter, response } => {
-                let _ = response.send(self.append_working_page_tokens(id, tokens, positions, masks, adapter));
+            Message::AppendWorkingPageTokens { id, tokens, positions, masks, adapter, adapter_seed, response } => {
+                let _ = response.send(self.append_working_page_tokens(id, tokens, positions, masks, adapter, adapter_seed));
             }
             Message::DebugState { id, response } => {
                 let _ = response.send(self.debug_state(id));
