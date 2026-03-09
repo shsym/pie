@@ -97,7 +97,7 @@ fn working_page_token_ops() {
             MODEL, id, vec![1, 2, 3, 4, 5],
             vec![0, 1, 2, 3, 4],
             vec![],
-            None,
+            None, None,
         ).await.unwrap();
 
         // working_page_token_count = 5
@@ -164,7 +164,7 @@ fn full_page_lifecycle() {
 
         // ── Phase 2: Mark all 32 tokens as forwarded ──
         let positions: Vec<u32> = (0..32).collect();
-        pie::context::append_working_page_tokens(MODEL, id, prompt.clone(), positions, vec![], None).await.unwrap();
+        pie::context::append_working_page_tokens(MODEL, id, prompt.clone(), positions, vec![], None, None).await.unwrap();
 
         assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 32);
 
@@ -195,7 +195,7 @@ fn full_page_lifecycle() {
 
         // ── Phase 5: Simulate generation — fill new tokens ──
         pie::context::append_working_page_tokens(
-            MODEL, id, vec![2000, 2001, 2002], vec![32, 33, 34], vec![], None,
+            MODEL, id, vec![2000, 2001, 2002], vec![32, 33, 34], vec![], None, None,
         ).await.unwrap();
         assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 3);
 
@@ -204,7 +204,7 @@ fn full_page_lifecycle() {
         pie::context::truncate_working_page_tokens(MODEL, id, 0).await.unwrap();
         // Fill 2 tokens with positions sequential from max_committed (31)
         pie::context::append_working_page_tokens(
-            MODEL, id, vec![3000, 3001], vec![32, 33], vec![], None,
+            MODEL, id, vec![3000, 3001], vec![32, 33], vec![], None, None,
         ).await.unwrap();
         assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 2);
 

@@ -343,14 +343,17 @@ impl Process {
 
             let run_func = instance
                 .get_typed_func::<(&str,), (Result<String, String>,)>(&mut store, &run_func_export)
-                .map_err(|e| format!("Failed to get 'run' function: {e}"))?;
+                .map_err(|e| format!("Failed to get 'run' function: {e:?}"))?;
 
+            eprintln!("WASM_RUN process={process_id} calling run_func");
             match run_func.call_async(&mut store, (&input,)).await {
                 Ok((Ok(output),)) => Ok(output),
                 Ok((Err(runtime_err),)) => Err(runtime_err),
                 Err(call_err) => Err(format!("Call error: {call_err}")),
             }
         }.await;
+
+        eprintln!("WASM_DONE process={process_id} ok={}", result.is_ok());
 
         if let Err(ref err) = result {
             tracing::info!("Process {process_id} failed: {err}");

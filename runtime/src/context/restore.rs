@@ -260,7 +260,7 @@ impl ContextManager {
 
         for record in &lineage {
             match record {
-                Record::Fill { tokens, positions, mask, adapter } => {
+                Record::Fill { tokens, positions, mask, adapter, adapter_seed } => {
                     let record_end = token_offset + tokens.len();
 
                     if record_end <= prefix_tokens {
@@ -306,7 +306,7 @@ impl ContextManager {
                         sampling_indices: Vec::new(),
                         samplers: Vec::new(),
                         adapter_id: *adapter,
-                        adapter_seed: None,
+                        adapter_seed: *adapter_seed,
                         arrival_time: None,
                     };
 

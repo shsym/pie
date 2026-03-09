@@ -570,6 +570,7 @@ pub fn compute_page_hashes(
     positions: &[u32],
     masks: &[Brle],
     prev_hash: PageHash,
+    adapter_seed: Option<i64>,
 ) -> Vec<PageHash> {
     let mut hashes = Vec::new();
     let mut running = prev_hash;
@@ -584,6 +585,9 @@ pub fn compute_page_hashes(
         chunk.hash(&mut hasher);
         for pos in chunk_pos { pos.hash(&mut hasher); }
         for mask in chunk_masks { mask.hash(&mut hasher); }
+        // Include adapter_seed so ZO-perturbed pages with different seeds
+        // produce different hashes and are not incorrectly shared via dedup.
+        adapter_seed.hash(&mut hasher);
         let content_hash = hasher.finish();
 
         let mut chain_hasher = AHasher::default();
