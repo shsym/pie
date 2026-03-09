@@ -238,8 +238,13 @@ impl ContextManager {
             "suffix page count mismatch: got {}, need {suffix_count}", suffix_pages.len());
         let suffix_phys = suffix_pages;
 
-        // Register suffix pages in PageStore
-        self.devices[dev_idx].commit_batch(suffix_hashes, &suffix_phys);
+        // Register suffix pages in PageStore — navigate through the retained
+        // prefix so the trie correctly chains the suffix as children.
+        self.devices[dev_idx].commit_append(
+            &committed_hashes[..prefix_len],
+            suffix_hashes,
+            &suffix_phys,
+        );
 
         // Build the full physical page table (prefix + suffix).
         let full_phys = self.devices[dev_idx].physical_ids(&committed_hashes);

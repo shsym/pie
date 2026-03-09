@@ -156,6 +156,14 @@ impl PageStore {
         }
     }
 
+    /// Commit multiple pages at once (dedup-aware per-hash).
+    pub fn commit_batch(&mut self, hashes: &[PageHash], phys: &[PhysicalPageId]) {
+        debug_assert_eq!(hashes.len(), phys.len());
+        for (&h, &p) in hashes.iter().zip(phys.iter()) {
+            self.commit(h, p);
+        }
+    }
+
     // =========================================================================
     // Refcounting (slice-based)
     // =========================================================================

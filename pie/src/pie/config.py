@@ -78,6 +78,7 @@ class Config:
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     models: list[ModelConfig] = field(default_factory=list)
     allow_filesystem: bool = False
+    max_concurrent_processes: int | None = None
 
     @property
     def primary_model(self) -> ModelConfig:

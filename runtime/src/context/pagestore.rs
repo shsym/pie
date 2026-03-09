@@ -459,6 +459,40 @@ impl PageStore {
         self.hash_set.extend(hashes);
     }
 
+    /// Append new pages to an existing committed chain.
+    ///
+    /// Navigates the trie using `prefix` (the already-committed portion)
+    /// then inserts `new_hashes`/`new_phys` as children of the prefix's
+    /// tip node. This is required because the trie stores chains as
+    /// paths — inserting `[H2]` at the root level creates a separate
+    /// entry instead of extending the existing `[H1]` chain.
+    ///
+    /// The prefix hashes use placeholder physical page IDs (0) during
+    /// the trie traversal since those nodes already exist with correct
+    /// physical pages from prior commits.
+    pub fn commit_append(
+        &mut self,
+        prefix: &[PageHash],
+        new_hashes: &[PageHash],
+        new_phys: &[PhysicalPageId],
+    ) {
+        debug_assert_eq!(new_hashes.len(), new_phys.len());
+        if new_hashes.is_empty() { return; }
+        if prefix.is_empty() {
+            // No existing prefix — just a regular insert.
+            self.root.insert(new_hashes, new_phys);
+        } else {
+            // Build the full chain with placeholder phys for the prefix.
+            let mut full_hashes = Vec::with_capacity(prefix.len() + new_hashes.len());
+            full_hashes.extend_from_slice(prefix);
+            full_hashes.extend_from_slice(new_hashes);
+            let mut full_phys = vec![0u32; prefix.len()];
+            full_phys.extend_from_slice(new_phys);
+            self.root.insert(&full_hashes, &full_phys);
+        }
+        self.hash_set.extend(new_hashes);
+    }
+
     pub fn commit(&mut self, hash: PageHash, phys: PhysicalPageId) {
         self.commit_batch(&[hash], &[phys]);
     }

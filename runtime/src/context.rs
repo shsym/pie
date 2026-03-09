@@ -73,7 +73,14 @@
 //! when `reserve_pages` gets enqueued, the process blocks on `.await`.
 //! When the actor serves the request (from alloc_queue or after restore),
 //! it sends Ok and the process resumes, already Running.
+// Radix Trie v2 with path-inclusive refcounting — handles incremental
+// commits and dedup correctly, all operations O(depth).
+#[path = "context/pagestore_new.rs"]
 pub mod pagestore;
+// Legacy implementations kept for reference.
+#[path = "context/pagestore.rs"]
+pub mod pagestore_trie;
+#[path = "context/pagestore_flat.rs"]
 pub mod pagestore_flat;
 pub(crate) mod sched;
 mod contention;
@@ -638,6 +645,7 @@ impl ContextManager {
 
         // Compute content-based hashes (no physical page IDs needed).
         let hashes = pagestore::compute_page_hashes(page_size, &tokens, &positions, &masks, prev_hash);
+        let existing_prefix = ctx.committed_hashes.clone();
         let dev = &mut self.devices[dev_idx];
 
         // Commit: physical (GPU promotion + dedup) or logical (metadata only).
@@ -645,7 +653,9 @@ impl ContextManager {
             // Suspended: no GPU pages, just free the CPU working pages.
             dev.free_cpu_pages(&pages);
         } else {
-            dev.commit_batch(&hashes, &pages);
+            // Use commit_append to navigate the trie through the existing
+            // committed chain before inserting new pages as children.
+            dev.commit_append(&existing_prefix, &hashes, &pages);
         }
 
         // Update context state.

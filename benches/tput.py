@@ -77,6 +77,7 @@ async def run_benchmark(args):
             gpu_mem_utilization=args.gpu_mem_util,
             cpu_mem_budget_in_gb=args.cpu_mem_budget,
         )],
+        max_concurrent_processes=args.max_concurrent_processes,
     )
     async with Server(cfg) as server:
         client = await server.connect()
@@ -198,6 +199,7 @@ def main():
     parser.add_argument("--save-outputs", type=str, default=None, help="Save output samples to this file path")
     parser.add_argument("--num-samples", type=int, default=10, help="Number of output samples to save (default: 10)")
     parser.add_argument("--unique-prompts", action="store_true", help="Make each request's prompt unique (append request #N)")
+    parser.add_argument("--max-concurrent-processes", type=int, default=None, help="Max concurrent WASM processes (default: unlimited)")
 
     args = parser.parse_args()
 

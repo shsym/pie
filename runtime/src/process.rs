@@ -5,12 +5,12 @@
 //! Direct Addressing.
 
 use std::collections::VecDeque;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use uuid::Uuid;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::linker;
@@ -72,9 +72,22 @@ pub type ProcessId = Uuid;
 static SERVICES: LazyLock<ServiceMap<ProcessId, Message>> =
     LazyLock::new(ServiceMap::new);
 
+/// Admission semaphore. `None` = unlimited concurrency (no gating).
+static ADMISSION: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+
 // =============================================================================
 // Public API
 // =============================================================================
+
+/// Initialize the admission controller. Called once during bootstrap.
+/// `None` = unlimited concurrency; `Some(n)` = at most `n` concurrent processes.
+/// `Some(0)` is treated as unlimited (a zero-permit semaphore would deadlock).
+pub fn init_admission(max_concurrent: Option<usize>) {
+    let sem = max_concurrent
+        .filter(|&n| n > 0)
+        .map(|n| Arc::new(Semaphore::new(n)));
+    ADMISSION.set(sem).expect("admission controller already initialized");
+}
 
 /// Spawn a new process and register it in the global registry.
 pub fn spawn(
@@ -305,6 +318,13 @@ impl Process {
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<Result<String, String>>>,
     ) {
+        // Admission control: wait for a permit before instantiating.
+        // The permit is held for the entire WASM execution lifetime
+        // and auto-released on completion, error, or task abort.
+        let _permit = match ADMISSION.get().and_then(|s| s.as_ref()) {
+            Some(sem) => Some(sem.acquire().await.expect("admission semaphore closed")),
+            None => None,
+        };
 
         let result: Result<String, String> = async {
             let (mut store, instance) = linker::instantiate(process_id, username, &program, capture_outputs)
