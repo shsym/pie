@@ -240,7 +240,7 @@ impl ContextManager {
 
         // Register suffix pages in PageStore — navigate through the retained
         // prefix so the trie correctly chains the suffix as children.
-        self.devices[dev_idx].commit_append(
+        self.devices[dev_idx].extend(
             &committed_hashes[..prefix_len],
             suffix_hashes,
             &suffix_phys,

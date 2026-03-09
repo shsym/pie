@@ -73,19 +73,15 @@
 //! when `reserve_pages` gets enqueued, the process blocks on `.await`.
 //! When the actor serves the request (from alloc_queue or after restore),
 //! it sends Ok and the process resumes, already Running.
-// Radix Trie v2 with path-inclusive refcounting — handles incremental
+// Radix Trie with path-inclusive refcounting — handles incremental
 // commits and dedup correctly, all operations O(depth).
-#[path = "context/pagestore_new.rs"]
 pub mod pagestore;
-// Legacy implementations kept for reference.
-#[path = "context/pagestore.rs"]
-pub mod pagestore_trie;
-#[path = "context/pagestore_flat.rs"]
-pub mod pagestore_flat;
 pub(crate) mod sched;
 mod contention;
 mod snapshot;
 mod restore;
+#[cfg(test)]
+mod bench_pagestore;
 
 use std::collections::{HashMap, VecDeque, BinaryHeap};
 use std::sync::LazyLock;
@@ -653,9 +649,9 @@ impl ContextManager {
             // Suspended: no GPU pages, just free the CPU working pages.
             dev.free_cpu_pages(&pages);
         } else {
-            // Use commit_append to navigate the trie through the existing
+            // Use extend to navigate the trie through the existing
             // committed chain before inserting new pages as children.
-            dev.commit_append(&existing_prefix, &hashes, &pages);
+            dev.extend(&existing_prefix, &hashes, &pages);
         }
 
         // Update context state.
