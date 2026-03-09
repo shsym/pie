@@ -1,15 +1,87 @@
-//! # Context Module
+//! # Context Module — KV Cache Management
 //!
-//! Manages named execution contexts with KV cache state for model inference.
-//! All context state (token data, page management, scheduling) lives in the
-//! actor-local `Context` struct, accessed exclusively through the `ContextManager`
-//! actor via typed `Message` variants.
+//! Manages execution contexts with KV cache state for model inference.
+//! Each model gets a dedicated `ContextManager` actor. All state lives
+//! actor-locally — no interior mutability, no cross-actor locks.
 //!
-//! Each model gets a dedicated ContextManager actor that handles:
-//! - Context creation, destruction, and forking
-//! - Page management (commit, reserve, release)
-//! - Contention resolution via dual-queue protocol
+//! ## Architecture
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │                 Context Actor (per model)                     │
+//! │                                                              │
+//! │  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐ │
+//! │  │PageStore  │  │ ProcessEntry│  │alloc_queue│  │restore_queue│
+//! │  │(per device)│  │(scheduling)│  │  (FIFO)   │  │(pri heap) │ │
+//! │  └──────────┘  └───────────┘  └───────────┘  └───────────┘ │
+//! └──────────────────────────────────────────────────────────────┘
+//!         ▲                                      │
+//!         │  reserve / commit / destroy          │ suspend / restore
+//!         │  pin / unpin                         ▼
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │  Process (inferlet)                                          │
+//! │  Single-threaded WASM — blocked on response channel when     │
+//! │  enqueued. Cannot make other WIT calls until response.       │
+//! └──────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## State Model
+//!
+//! **Process** (2 states):
+//! - **Running** — all contexts Active, inferlet executing.
+//! - **Pending** — contexts Suspended, blocked on restore_queue.
+//!
+//! **Context** (3 states):
+//!
+//! | State         | Working Pages | Committed Chain      | Evictable?           |
+//! |---------------|---------------|----------------------|----------------------|
+//! | **Active**    | On GPU        | Refcounted in trie   | Yes                  |
+//! | **Pinned**    | On GPU        | Refcounted in trie   | Deferred (`pending_suspend`) |
+//! | **Suspended** | On CPU (swap) | Released (metadata)  | Nothing to evict     |
+//!
+//! ## Page Types
+//!
+//! **Working pages** (`working_pages: Vec<PhysicalPageId>`):
+//! - GPU-exclusive, mutable, owned by one context.
+//! - On suspend: D2H copy to CPU swap pool. On restore: H2D back.
+//! - If CPU swap pool full: OOM. Working pages are NOT replayable.
+//!
+//! **Committed pages** (content-addressed via chained `PageHash`):
+//! - Shared across contexts via refcount in PageStore (Radix Trie).
+//! - `committed_hashes: Vec<PageHash>` — ordered root-to-tip chain.
+//! - On suspend: refcounts decremented; hashes kept as metadata for restore.
+//! - On restore: longest prefix match → replay missing suffix.
+//!
+//! ## Module Structure
+//!
+//! - `context.rs` — Public API, `Message` enum, `ServiceHandler`, core ops.
+//! - `pagestore.rs` — `PageStore`: Radix Trie CAS cache + physical page pools.
+//! - `sched.rs` — `ProcessEntry`, invested-importance scheduling (π = w·p).
+//! - `contention.rs` — Eviction, suspension, `alloc_queue`, `with_gpu_pages`.
+//! - `restore.rs` — Restoration, replay planning, `restore_queue`.
+//! - `snapshot.rs` — Named snapshot save/load/fork/take.
+//!
+//! ## WIT Host Function Pattern
+//!
+//! Every WIT function that touches pages goes through the actor:
+//! ```text
+//! async fn wit_reserve_pages(pid, ctx_id, n) -> Result<()> {
+//!     context::reserve_pages(model_idx, ctx_id, n).await
+//! }
+//! ```
+//! No `wait_if_pending` needed. The process is single-threaded WASM —
+//! when `reserve_pages` gets enqueued, the process blocks on `.await`.
+//! When the actor serves the request (from alloc_queue or after restore),
+//! it sends Ok and the process resumes, already Running.
+// Radix Trie v2 with path-inclusive refcounting — handles incremental
+// commits and dedup correctly, all operations O(depth).
+#[path = "context/pagestore_new.rs"]
 pub mod pagestore;
+// Legacy implementations kept for reference.
+#[path = "context/pagestore.rs"]
+pub mod pagestore_trie;
+#[path = "context/pagestore_flat.rs"]
+pub mod pagestore_flat;
 pub(crate) mod sched;
 mod contention;
 mod snapshot;
@@ -573,6 +645,7 @@ impl ContextManager {
 
         // Compute content-based hashes (no physical page IDs needed).
         let hashes = pagestore::compute_page_hashes(page_size, &tokens, &positions, &masks, prev_hash);
+        let existing_prefix = ctx.committed_hashes.clone();
         let dev = &mut self.devices[dev_idx];
 
         // Commit: physical (GPU promotion + dedup) or logical (metadata only).
@@ -580,9 +653,9 @@ impl ContextManager {
             // Suspended: no GPU pages, just free the CPU working pages.
             dev.free_cpu_pages(&pages);
         } else {
-            for (i, &hash) in hashes.iter().enumerate() {
-                dev.commit(hash, pages[i]);
-            }
+            // Use commit_append to navigate the trie through the existing
+            // committed chain before inserting new pages as children.
+            dev.commit_append(&existing_prefix, &hashes, &pages);
         }
 
         // Update context state.

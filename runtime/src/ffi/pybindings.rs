@@ -256,6 +256,9 @@ pub struct Config {
     // WASI capabilities
     #[pyo3(get, set)]
     pub allow_filesystem: bool,
+    // Admission control
+    #[pyo3(get, set)]
+    pub max_concurrent_processes: Option<usize>,
 }
 
 #[pymethods]
@@ -275,6 +278,7 @@ impl Config {
         telemetry_service_name = "pie".to_string(),
         models = vec![],
         allow_filesystem = false,
+        max_concurrent_processes = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -291,6 +295,7 @@ impl Config {
         telemetry_service_name: String,
         models: Vec<ModelConfig>,
         allow_filesystem: bool,
+        max_concurrent_processes: Option<usize>,
     ) -> Self {
         Config {
             host,
@@ -306,6 +311,7 @@ impl Config {
             telemetry_service_name,
             models,
             allow_filesystem,
+            max_concurrent_processes,
         }
     }
 
@@ -371,6 +377,7 @@ impl From<Config> for BootstrapConfig {
                 .collect(),
             skip_tracing: false,
             allow_filesystem: cfg.allow_filesystem,
+            max_concurrent_processes: cfg.max_concurrent_processes,
         }
     }
 }

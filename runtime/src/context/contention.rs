@@ -1,14 +1,54 @@
-//! Suspension — Dual-Queue Contention Resolution Protocol.
+//! Contention — Dual-Queue GPU Page Resolution Protocol.
 //!
-//! Implements the two-queue model from DESIGN.md:
-//! - `alloc_queue` (FIFO): deferred GPU page requests from Running processes
-//! - `restore_queue` (Priority Heap): Pending processes awaiting full restoration
+//! When GPU pages are scarce, this module decides who waits, who yields,
+//! and in what order pages are reclaimed.
 //!
-//! ## Core Flows
+//! ## Two Queues
 //!
-//! `with_gpu_pages` → FIFO gate → priority gate → alloc → eviction loop → self-suspend
-//! `drain_queues`  → Phase 1 (alloc_queue FIFO) → Phase 2 (restore_queue heap)
-//! `clear_pinned`  → check pending_suspend flag → execute deferred suspension
+//! - **`alloc_queue`** (FIFO): deferred GPU page requests from Running
+//!   processes that won the priority gate but found no free pages. Head-of-line
+//!   blocking — served in arrival order as pages free up.
+//!
+//! - **`restore_queue`** (Priority Heap): Pending processes awaiting full
+//!   restoration. Ordered by `effective_priority = floor + AGING_RATE × wait_s`.
+//!   AGING_RATE = 0.01 provides starvation freedom.
+//!
+//! ## `with_gpu_pages` — Full Contention Flow
+//!
+//! ```text
+//! 0. SUSPENSION CHECK: process Pending → stash as deferred_op, return
+//! 1. FIFO GATE: alloc_queue non-empty → enqueue at tail, return
+//! 2. PRIORITY GATE: requester_floor < restore_queue.peek() → self-suspend
+//! 3. TRY ALLOCATE from free pool → success: invoke callback
+//! 4. EVICTION LOOP:
+//!    a. find_eviction_victim (lowest π, requester_floor check)
+//!    b. suspend_process(victim) → Active: immediate, Pinned: deferred
+//!    c. track deferred_pages from Pinned contexts
+//!    d. retry alloc → success: done
+//!    e. free + deferred ≥ needed → enqueue in alloc_queue
+//! 5. NO VICTIM → requester self-suspends
+//! ```
+//!
+//! ## `drain_queues` — Called on Every Page-Free Event
+//!
+//! Phase 1 (alloc_queue FIFO): serve head if pages available, else stop.
+//! Phase 2 (restore_queue heap): if alloc_queue empty, pop highest-priority
+//! Pending process if all devices have enough pages, then `restore_all`.
+//!
+//! Triggers: `unpin` with `pending_suspend`, context destruction, commit dedup.
+//!
+//! ## `suspend_context` — Three Phases
+//!
+//! 1. **Swap working pages** GPU → CPU (D2H copy, free GPU slots).
+//! 2. **Release committed chain** refcounts (rc→0 pages become evictable).
+//! 3. **Mark Suspended** (`pending_suspend = false`).
+//!
+//! ## Anti-Thrashing Guarantee
+//!
+//! After process A evicts process B:
+//! - `π_A = w_A · (p_A + n)` (A holds more pages now)
+//! - B's restore floor = `w_B · n_B ≤ w_A · (p_A + n)` (A won)
+//! - B cannot evict A back. **Eviction is monotonically forward-progressing.**
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;

@@ -291,6 +291,7 @@ def _bootstrap(
         telemetry_service_name=config.telemetry.service_name,
         models=[py_model],
         allow_filesystem=config.allow_filesystem,
+        max_concurrent_processes=config.max_concurrent_processes,
     )
 
     runtime_handle = pie_runtime.bootstrap(rust_config)

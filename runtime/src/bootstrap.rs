@@ -14,6 +14,7 @@ use crate::inference;
 use crate::linker;
 use crate::messaging;
 use crate::model;
+use crate::process;
 use crate::program;
 use crate::server;
 use crate::telemetry;
@@ -31,6 +32,8 @@ pub struct Config {
     pub models: Vec<ModelConfig>,
     /// Allow inferlets to access a sandboxed scratch filesystem.
     pub allow_filesystem: bool,
+    /// Maximum number of concurrent WASM processes. `None` = unlimited.
+    pub max_concurrent_processes: Option<usize>,
     /// Skip tracing initialization (for tests — can only init once per process).
     pub skip_tracing: bool,
 }
@@ -100,6 +103,7 @@ pub async fn bootstrap(
     linker::spawn(&wasm_engine, config.allow_filesystem);
     server::spawn(&config.host, config.port);
     messaging::spawn();
+    process::init_admission(config.max_concurrent_processes);
 
     for cfg in config.models.iter() {
 
