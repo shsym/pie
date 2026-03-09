@@ -8,6 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 inferlet = { path = "../../../../rust/inferlet" }
-inferlet-macros = { path = "../../../../rust/inferlet-macros" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0", features = ["derive"] }

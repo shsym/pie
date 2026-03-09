@@ -1,10 +1,11 @@
 //! PageStore benchmark (Radix Trie)
 //!
-//! Run: cargo test --release --lib -- bench_pagestore --nocapture
+//! Usage:
+//!   cargo bench --bench pagestore_bench
 
 use std::time::Instant;
 
-use crate::context::pagestore as trie;
+use pie::context::pagestore as trie;
 
 fn make_chain(n: usize) -> Vec<u64> { (1..=n as u64).collect() }
 fn make_phys(n: usize) -> Vec<u32> { (0..n as u32).collect() }
@@ -30,8 +31,7 @@ fn trie_incremental(n: usize) -> (trie::PageStore, Vec<u64>) {
     (store, h)
 }
 
-#[test]
-fn bench_pagestore() {
+fn main() {
     let sizes = [64, 256, 1024, 4096, 10240];
     let iters = 100;
 
@@ -86,7 +86,7 @@ fn bench_pagestore() {
                 store.extend(&prefix[..i], &prefix[i..i+1], &p);
             }
             for ctx in 1..num_contexts {
-                store.retain(&prefix);
+                store.fork(&prefix);
                 let mut chain = prefix.clone();
                 for j in 0..suffix_len {
                     let h = (ctx * 100000 + j + 1) as u64;
@@ -105,7 +105,7 @@ fn bench_pagestore() {
         ts.commit_batch(&prefix, &p0);
         let mut tc: Vec<Vec<u64>> = vec![prefix.clone()];
         for ctx in 1..num_contexts {
-            ts.retain(&prefix);
+            ts.fork(&prefix);
             let mut c = prefix.clone();
             for j in 0..suffix_len {
                 let h = (ctx * 100000 + j + 1) as u64;
@@ -123,7 +123,7 @@ fn bench_pagestore() {
         let t = time_ns(iters, || { for c in &tc { let _ = ts.prefix_len(c); } });
         println!("  {:<22} {:>6}  {:>10}", "prefix_len(all 32)", label, fmt_time(t));
 
-        let t = time_ns(iters, || { ts.retain(&prefix); });
-        println!("  {:<22} {:>6}  {:>10}", "retain(prefix)", label, fmt_time(t));
+        let t = time_ns(iters, || { ts.fork(&prefix); });
+        println!("  {:<22} {:>6}  {:>10}", "fork(prefix)", label, fmt_time(t));
     }
 }

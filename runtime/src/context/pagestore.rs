@@ -3,9 +3,8 @@
 //! Content-addressed storage for KV cache pages using a compressed Radix
 //! Trie (Patricia Trie) with **path-inclusive refcounting**.
 //!
-//! Unlike the tip-only trie (`pagestore.rs`), `refcount` on each node
-//! means "how many contexts include this node in their committed chain."
-//! This correctly handles:
+//! `refcount` on each node means "how many contexts include this node in
+//! their committed chain." This correctly handles:
 //! - **Incremental commits**: `extend(prefix, suffix, phys)` navigates
 //!   the trie through the existing prefix before inserting new suffix pages.
 //! - **Dedup**: when two contexts commit the same chain, rc is bumped on all
@@ -94,6 +93,36 @@ impl TrieNode {
     }
 
     // =========================================================================
+    // Core helpers
+    // =========================================================================
+
+    /// Match `hashes` against this node's prefix_hashes, comparing actual values.
+    /// Returns the number of leading hashes that match. Used by queries,
+    /// release, and fork where correctness requires hash verification.
+    #[inline]
+    fn match_len(&self, hashes: &[PageHash]) -> usize {
+        common_prefix_len(&self.prefix_hashes, hashes)
+    }
+
+    /// Split this node at `index`, keeping `0..index` in `self` and moving
+    /// `index..` into a new child node with the same rc and all children.
+    /// Returns the key (first hash) of the split-off child.
+    fn split_at(&mut self, index: usize) -> PageHash {
+        debug_assert!(index < self.prefix_hashes.len());
+        let tail_hashes = self.prefix_hashes.split_off(index);
+        let tail_phys = self.prefix.split_off(index);
+        let key = tail_hashes[0];
+        let tail = TrieNode {
+            prefix_hashes: tail_hashes,
+            prefix: tail_phys,
+            refcount: self.refcount,
+            children: std::mem::take(&mut self.children),
+        };
+        self.children.insert(key, tail);
+        key
+    }
+
+    // =========================================================================
     // Extend: navigate prefix WITHOUT rc bump, insert suffix, eager merge
     // =========================================================================
     //
@@ -101,25 +130,6 @@ impl TrieNode {
     // commit or fork). No new reference is created, so rc is NOT bumped.
     // After insert, `try_merge_child` compresses single-child nodes when
     // parent.rc == child.rc (which fires correctly because rc is not inflated).
-    //
-    // Hash-based matching: after merge compresses nodes from different chains,
-    // we must compare actual hash values, not just lengths.
-
-    /// Match `hashes` against this node's prefix_hashes, comparing actual values.
-    /// Returns the number of leading hashes that match. Used by queries,
-    /// release, and retain where correctness requires hash verification.
-    #[inline]
-    fn match_len(&self, hashes: &[PageHash]) -> usize {
-        common_prefix_len(&self.prefix_hashes, hashes)
-    }
-
-    /// Fast length-based match for internal navigation (navigate_and_extend).
-    /// Safe because insert_suffix already does hash comparison via common_prefix_len.
-    #[inline]
-    fn nav_len(&self, hashes: &[PageHash]) -> usize {
-        let node_len = self.prefix_hashes.len();
-        if hashes.len() <= node_len { hashes.len() } else { node_len }
-    }
 
     /// Navigate prefix (no rc bump), insert suffix, merge if possible.
     fn navigate_and_extend(
@@ -127,58 +137,41 @@ impl TrieNode {
         prefix: &[PageHash],
         suffix: &[PageHash],
         phys: &[PhysicalPageId],
-        freed: &mut Vec<PhysicalPageId>,
+        reclaimed_pages: &mut Vec<PhysicalPageId>,
     ) {
         if suffix.is_empty() { return; }
 
         if prefix.is_empty() {
-            self.insert_suffix(suffix, phys, freed);
+            self.insert_suffix(suffix, phys, reclaimed_pages);
             return;
         }
 
         let first = prefix[0];
         if let Some(child) = self.children.get_mut(&first) {
-            let nav = child.nav_len(prefix);
             let node_len = child.prefix_hashes.len();
+            let nav = prefix.len().min(node_len);
 
             if nav < node_len {
                 // Prefix ends inside this node — split, then insert suffix.
-                let split_at = nav;
-                let old_s_hashes = child.prefix_hashes.split_off(split_at);
-                let old_s_phys = child.prefix.split_off(split_at);
-                let old_s_first = old_s_hashes[0];
-                let old_suffix = TrieNode {
-                    prefix_hashes: old_s_hashes,
-                    prefix: old_s_phys,
-                    refcount: child.refcount,
-                    children: std::mem::take(&mut child.children),
-                };
+                child.split_at(nav);
                 // NO rc bump — structural split for navigation.
-                child.children.insert(old_s_first, old_suffix);
-                child.insert_suffix(suffix, phys, freed);
+                child.insert_suffix(suffix, phys, reclaimed_pages);
             } else if prefix.len() == node_len {
-                // Prefix exactly matches this node (all hashes verified).
-                child.insert_suffix(suffix, phys, freed);
+                // Prefix exactly matches this node.
+                child.insert_suffix(suffix, phys, reclaimed_pages);
                 self.try_merge_child(first);
             } else {
                 // Prefix extends beyond this node — recurse with remaining.
-                child.navigate_and_extend(&prefix[node_len..], suffix, phys, freed);
+                child.navigate_and_extend(&prefix[node_len..], suffix, phys, reclaimed_pages);
                 self.try_merge_child(first);
             }
         } else {
-            // Prefix not in trie — fallback: create combined node.
-            // This shouldn't happen in normal operation.
-            let mut all_hashes = Vec::with_capacity(prefix.len() + suffix.len());
-            all_hashes.extend_from_slice(prefix);
-            all_hashes.extend_from_slice(suffix);
-            let mut all_phys = vec![0u32; prefix.len()];
-            all_phys.extend_from_slice(phys);
-            self.children.insert(first, TrieNode {
-                prefix_hashes: all_hashes,
-                prefix: all_phys,
-                refcount: 1,
-                children: FxHashMap::default(),
-            });
+            // Prefix not in trie — broken invariant. The caller claims to own
+            // this prefix, but it doesn't exist. Log and bail in release,
+            // panic in debug.
+            debug_assert!(false,
+                "navigate_and_extend: prefix not in trie (first hash={first})");
+            eprintln!("BUG: navigate_and_extend called with prefix not in trie");
         }
     }
 
@@ -188,7 +181,7 @@ impl TrieNode {
         &mut self,
         suffix: &[PageHash],
         phys: &[PhysicalPageId],
-        freed: &mut Vec<PhysicalPageId>,
+        reclaimed_pages: &mut Vec<PhysicalPageId>,
     ) {
         debug_assert!(!suffix.is_empty());
         debug_assert_eq!(suffix.len(), phys.len());
@@ -199,17 +192,8 @@ impl TrieNode {
 
             if common < child.prefix_hashes.len() {
                 // Partial match — split and insert divergent suffix.
-                let old_s_hashes = child.prefix_hashes.split_off(common);
-                let old_s_phys = child.prefix.split_off(common);
-                let old_s_first = old_s_hashes[0];
-                let old_suffix = TrieNode {
-                    prefix_hashes: old_s_hashes,
-                    prefix: old_s_phys,
-                    refcount: child.refcount,
-                    children: std::mem::take(&mut child.children),
-                };
+                child.split_at(common);
                 child.refcount += 1;
-                child.children.insert(old_s_first, old_suffix);
                 if common < suffix.len() {
                     child.children.insert(suffix[common], TrieNode {
                         prefix_hashes: suffix[common..].to_vec(),
@@ -220,11 +204,11 @@ impl TrieNode {
                 }
             } else if common < suffix.len() {
                 child.refcount += 1;
-                child.insert_suffix(&suffix[common..], &phys[common..], freed);
+                child.insert_suffix(&suffix[common..], &phys[common..], reclaimed_pages);
             } else {
                 // Exact match — dedup.
                 child.refcount += 1;
-                freed.extend_from_slice(phys);
+                reclaimed_pages.extend_from_slice(phys);
             }
         } else {
             self.children.insert(first, TrieNode {
@@ -242,9 +226,9 @@ impl TrieNode {
             Some(c) if c.children.len() == 1 => c,
             _ => return,
         };
-        let gc_rc_matches = child.children.values().next()
-            .map_or(false, |gc| gc.refcount == child.refcount);
-        if !gc_rc_matches { return; }
+        // Safety: we just checked children.len() == 1.
+        let sole_gc = child.children.values().next().unwrap();
+        if sole_gc.refcount != child.refcount { return; }
         let (_, sole) = child.children.drain().next().unwrap();
         child.prefix_hashes.extend(sole.prefix_hashes);
         child.prefix.extend(sole.prefix);
@@ -375,9 +359,8 @@ impl TrieNode {
         if hashes.is_empty() { return 0; }
         match self.children.get(&hashes[0]) {
             Some(child) => {
-                let nav = child.nav_len(hashes);
                 let node_len = child.prefix_hashes.len();
-                if nav < node_len {
+                if hashes.len() < node_len {
                     0
                 } else if hashes.len() > node_len {
                     let deeper = child.count_reclaimable_path(&hashes[node_len..]);
@@ -398,8 +381,8 @@ impl TrieNode {
         }
     }
 
-    /// Bump rc along the path. Split-on-retain for partial matches.
-    fn retain_path(&mut self, hashes: &[PageHash]) {
+    /// Bump rc along the path (fork). Split-on-fork for partial hash matches.
+    fn fork_path(&mut self, hashes: &[PageHash]) {
         if hashes.is_empty() { return; }
         if let Some(child) = self.children.get_mut(&hashes[0]) {
             let matched = child.match_len(hashes);
@@ -407,22 +390,12 @@ impl TrieNode {
 
             if matched < node_len {
                 // Hash mismatch or partial match — split at the divergence point.
-                let split_at = matched;
-                let old_s_hashes = child.prefix_hashes.split_off(split_at);
-                let old_s_phys = child.prefix.split_off(split_at);
-                let old_s_first = old_s_hashes[0];
-                let old_suffix = TrieNode {
-                    prefix_hashes: old_s_hashes,
-                    prefix: old_s_phys,
-                    refcount: child.refcount,
-                    children: std::mem::take(&mut child.children),
-                };
+                child.split_at(matched);
                 child.refcount += 1;
-                child.children.insert(old_s_first, old_suffix);
             } else {
                 child.refcount += 1;
                 if hashes.len() > node_len {
-                    child.retain_path(&hashes[node_len..]);
+                    child.fork_path(&hashes[node_len..]);
                 }
             }
         }
@@ -511,11 +484,11 @@ impl PageStore {
         debug_assert_eq!(new_hashes.len(), new_phys.len());
         if new_hashes.is_empty() { return; }
 
-        let mut freed = Vec::new();
-        self.root.navigate_and_extend(prefix, new_hashes, new_phys, &mut freed);
+        let mut reclaimed_pages = Vec::new();
+        self.root.navigate_and_extend(prefix, new_hashes, new_phys, &mut reclaimed_pages);
 
-        if !freed.is_empty() {
-            self.gpu.free_batch(&freed);
+        if !reclaimed_pages.is_empty() {
+            self.gpu.free_batch(&reclaimed_pages);
         }
     }
 
@@ -538,12 +511,7 @@ impl PageStore {
     /// This is the ONLY operation that increases rc on existing nodes.
     pub fn fork(&mut self, hashes: &[PageHash]) {
         if hashes.is_empty() { return; }
-        self.root.retain_path(hashes);
-    }
-
-    /// Alias for backwards compatibility.
-    pub fn retain(&mut self, hashes: &[PageHash]) {
-        self.fork(hashes);
+        self.root.fork_path(hashes);
     }
 
     /// Decrement refcount along the entire path. Evict nodes that reach rc=0
@@ -814,7 +782,7 @@ mod tests {
         let mut store = PageStore::new(16, 100, 0);
         store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
         // Retain prefix [H1, H2]
-        store.retain(&[h(1), h(2)]);
+        store.fork(&[h(1), h(2)]);
 
         // Release full chain — H3 evicted, but H1,H2 survive (retain holds them)
         let freed = store.release(&[h(1), h(2), h(3)]);
@@ -857,7 +825,7 @@ mod tests {
         assert_eq!(prefix, 2);
 
         // Retain prefix + commit suffix
-        store.retain(&[h(1), h(2)]);
+        store.fork(&[h(1), h(2)]);
         let suffix_phys = store.alloc_gpu_pages(1).unwrap();
         store.extend(&[h(1), h(2)], &[h(3)], &suffix_phys);
 
@@ -1051,7 +1019,7 @@ mod tests {
         assert_eq!(store.physical_ids(&full_chain_a).len(), 5);
 
         // SUSPEND A: retain prefix, release full chain
-        store.retain(&prompt);  // fork the prefix
+        store.fork(&prompt);  // fork the prefix
         store.release(&full_chain_a);
 
         // B should still be alive
@@ -1059,7 +1027,7 @@ mod tests {
             "Context B should survive after A suspended");
 
         // RESTORE A: retain prefix again (re-join), extend with suffix
-        store.retain(&prompt);
+        store.fork(&prompt);
         let suffix_pages = store.alloc_gpu_pages(3).unwrap();
         store.extend(&prompt, &[h(10)], &suffix_pages[..1]);
         let chain_r1 = [h(1), h(2), h(10)];
@@ -1152,7 +1120,7 @@ mod tests {
 
         // Suspend first 4 contexts: retain prefix + release full chain
         for ctx in 0..4 {
-            store.retain(&prompt);
+            store.fork(&prompt);
             store.release(&chains[ctx]);
         }
 
@@ -1166,7 +1134,7 @@ mod tests {
 
         // Restore the first 4: retain prefix + extend with new pages
         for ctx in 0..4 {
-            store.retain(&prompt);
+            store.fork(&prompt);
             let suffix = &chains[ctx][2..]; // original suffix hashes
             let mut prefix = prompt.to_vec();
             for &hash in suffix {

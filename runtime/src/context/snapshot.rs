@@ -114,7 +114,7 @@ impl ContextManager {
                 // Retain committed prefix. For Active sources, retain the full chain.
                 // For Suspended sources, retain only the GPU-resident prefix.
                 if prefix_len > 0 {
-                    mgr.devices[dev_idx].retain(&committed_hashes[..prefix_len]);
+                    mgr.devices[dev_idx].fork(&committed_hashes[..prefix_len]);
                 }
 
                 // Create the child context (state set below after replay check).
@@ -187,7 +187,7 @@ impl ContextManager {
         let snapshot_filled = ctx.working_page_tokens.clone();
 
         if !committed_hashes.is_empty() {
-            self.devices[dev_idx].retain(&committed_hashes);
+            self.devices[dev_idx].fork(&committed_hashes);
         }
 
         // Snapshot working pages: try GPU-first, fall back to CPU swap pool.
@@ -362,7 +362,7 @@ impl ContextManager {
                 //   transfer to the new context (ownership transfer, no retain/release).
                 // - Suspended: save() released. Re-acquire prefix for the new context.
                 if was_suspended && prefix_len > 0 {
-                    mgr.devices[dev_idx].retain(&snap.committed_hashes[..prefix_len]);
+                    mgr.devices[dev_idx].fork(&snap.committed_hashes[..prefix_len]);
                 }
 
                 let committed_len = snap.committed_hashes.len();

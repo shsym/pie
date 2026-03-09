@@ -80,8 +80,6 @@ pub(crate) mod sched;
 mod contention;
 mod snapshot;
 mod restore;
-#[cfg(test)]
-mod bench_pagestore;
 
 use std::collections::{HashMap, VecDeque, BinaryHeap};
 use std::sync::LazyLock;

@@ -1,7 +1,30 @@
-use inferlet::prelude::*;
-use inferlet::{adapter::Adapter, parse_args, runtime, ContextExt, InstructExt, Result};
-use inferlet::inference::Sampler;
+//! Perform ES rollouts — generate text with a perturbed adapter.
+//!
+//! Accepts a list of rollout tasks (each with a uid, problem, and ZO seed),
+//! generates text for each using the adapter with the given seed perturbation,
+//! and returns the generated texts as a JSON array.
+
+use inferlet::{
+    Context,
+    adapter::Adapter,
+    inference::Sampler,
+    model::Model,
+    runtime,
+    Result,
+};
 use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Input {
+    /// Adapter name.
+    name: String,
+    /// System prompt for generation.
+    system_prompt: String,
+    /// Maximum tokens to generate per rollout.
+    max_num_outputs: usize,
+    /// Rollout tasks.
+    rollouts: Vec<Rollout>,
+}
 
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
@@ -12,44 +35,32 @@ struct Rollout {
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = parse_args(args);
-    let name: String = args.value_from_str("--name").map_err(|e| e.to_string())?;
-    let system_prompt: String = args.value_from_str("--system-prompt").map_err(|e| e.to_string())?;
-    let max_num_outputs: usize = args.value_from_str("--max-num-outputs").map_err(|e| e.to_string())?;
-    let rollouts_str: String = args.value_from_str("--rollouts").map_err(|e| e.to_string())?;
-    let rollouts: Vec<Rollout> = serde_json::from_str(&rollouts_str)
-        .map_err(|e| e.to_string())?;
-
-    // Load model and adapter.
+async fn main(input: Input) -> Result<Vec<String>> {
     let model_name = runtime::models().into_iter().next()
-        .ok_or_else(|| "No models available".to_string())?;
+        .ok_or("No models available")?;
     let model = Model::load(&model_name)?;
-    let adapter = Adapter::open(&model, &name)
-        .ok_or_else(|| format!("Adapter '{}' not found", name))?;
+
+    let adapter = Adapter::open(&model, &input.name)
+        .ok_or_else(|| format!("Adapter '{}' not found", input.name))?;
 
     let sampler = Sampler::TopP((0.6, 0.95));
+    let mut results: Vec<String> = Vec::with_capacity(input.rollouts.len());
 
-    // Run rollouts and collect results.
-    // Each rollout creates a context, fills chat template, and generates.
-    let mut results: Vec<String> = Vec::with_capacity(rollouts.len());
-
-    for rollout in &rollouts {
-        let ctx = <Context as ContextExt>::new(&model)?;
-        ctx.system(&system_prompt);
+    for rollout in &input.rollouts {
+        let mut ctx = Context::new(&model)?;
+        ctx.system(&input.system_prompt);
         ctx.user(&rollout.task);
         ctx.cue();
 
-        let tokens = ctx.generate(sampler.clone())
+        let text = ctx.generate(sampler.clone())
             .with_adapter(&adapter)
             .with_zo_seed(rollout.seed)
-            .with_max_tokens(max_num_outputs)
-            .collect_tokens()
+            .with_max_tokens(input.max_num_outputs)
+            .collect_text()
             .await?;
 
-        let text = model.tokenizer().decode(&tokens)?;
         results.push(text);
     }
 
-    serde_json::to_string(&results).map_err(|e| e.to_string())
+    Ok(results)
 }
