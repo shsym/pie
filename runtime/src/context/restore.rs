@@ -180,7 +180,7 @@ impl ContextManager {
             let dev = &mut self.devices[dev_idx];
             let prefix_len = dev.prefix_len(&committed_hashes);
             if prefix_len > 0 {
-                dev.retain(&committed_hashes[..prefix_len]);
+                dev.fork(&committed_hashes[..prefix_len]);
             }
             prefix_len
         } else {
@@ -240,7 +240,7 @@ impl ContextManager {
 
         // Register suffix pages in PageStore — navigate through the retained
         // prefix so the trie correctly chains the suffix as children.
-        self.devices[dev_idx].commit_append(
+        self.devices[dev_idx].extend(
             &committed_hashes[..prefix_len],
             suffix_hashes,
             &suffix_phys,

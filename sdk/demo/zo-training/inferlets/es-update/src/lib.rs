@@ -1,64 +1,64 @@
-use inferlet::prelude::*;
-use inferlet::{adapter::Adapter, parse_args, runtime, Result};
-use inferlet::wstd::time::Duration;
+//! Update an Evolution Strategies adapter.
+//!
+//! Receives population seeds + scores, performs the ES parameter update
+//! (via `zo::update`), and optionally saves a checkpoint.
+
+use inferlet::{
+    adapter::Adapter,
+    model::Model,
+    runtime,
+    Result,
+};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Input {
+    /// Adapter name.
+    name: String,
+    /// Population seeds.
+    seeds: Vec<i64>,
+    /// Fitness scores (one per seed).
+    scores: Vec<f32>,
+    /// Maximum sigma for adaptive noise scaling.
+    max_sigma: f32,
+    /// Optional checkpoint name to save the updated adapter.
+    #[serde(default)]
+    download: Option<String>,
+}
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = parse_args(args);
-    let name: String = args.value_from_str("--name").map_err(|e| e.to_string())?;
-    let seeds: Vec<i64> = args.value_from_fn("--seeds", |s| {
-        s.split(',')
-            .map(|v| v.parse::<i64>())
-            .collect::<std::result::Result<Vec<_>, _>>()
-    }).map_err(|e| e.to_string())?;
-    let scores: Vec<f32> = args.value_from_fn("--scores", |s| {
-        s.split(',')
-            .map(|v| v.parse::<f32>())
-            .collect::<std::result::Result<Vec<_>, _>>()
-    }).map_err(|e| e.to_string())?;
-    let max_sigma: f32 = args.value_from_str("--max-sigma").map_err(|e| e.to_string())?;
-    let download: Option<String> = args.opt_value_from_str("--download").map_err(|e| e.to_string())?;
-
-    // Input validation.
-    if seeds.is_empty() {
-        return Err("At least one seed and score must be provided.".to_string());
+async fn main(input: Input) -> Result<String> {
+    if input.seeds.is_empty() {
+        return Err("At least one seed and score must be provided.".into());
     }
-    if seeds.len() != scores.len() {
+    if input.seeds.len() != input.scores.len() {
         return Err(format!(
-            "The number of seeds ({}) must match the number of scores ({}).",
-            seeds.len(),
-            scores.len()
+            "Seed count ({}) must match score count ({}).",
+            input.seeds.len(), input.scores.len(),
         ));
     }
 
-    // Load the model and look up the adapter.
     let model_name = runtime::models().into_iter().next()
-        .ok_or_else(|| "No models available".to_string())?;
+        .ok_or("No models available")?;
     let model = Model::load(&model_name)?;
 
-    println!("🔧 Updating adapter '{}'...", &name);
-    let adapter = Adapter::open(&model, &name)
-        .ok_or_else(|| format!("Adapter '{}' not found", name))?;
+    let adapter = Adapter::open(&model, &input.name)
+        .ok_or_else(|| format!("Adapter '{}' not found", input.name))?;
 
-    // Perform the ES update.
     println!(
-        "Updating adapter '{}' with {} scores (max_sigma = {})...",
-        &name,
-        scores.len(),
-        max_sigma
+        "🔧 Updating adapter '{}' ({} scores, max_sigma={})...",
+        input.name, input.scores.len(), input.max_sigma,
     );
-    inferlet::zo::zo::update(&adapter, &scores, &seeds, max_sigma)?;
+    inferlet::zo::zo::update(&adapter, &input.scores, &input.seeds, input.max_sigma)?;
 
-    // If a download path was provided, save the adapter weights.
-    if let Some(path) = &download {
+    // Optionally save a checkpoint.
+    if let Some(path) = &input.download {
         if !path.is_empty() {
-            println!("📥 Saving adapter '{}' to '{}'...", name, path);
+            println!("💾 Saving checkpoint to '{}'...", path);
             adapter.save(path)?;
         }
     }
 
-    inferlet::wstd::task::sleep(Duration::from_millis(100)).await;
-    println!("✅ Adapter '{}' updated successfully.", name);
-
-    Ok(format!("Adapter '{}' updated", name))
+    println!("✅ Adapter '{}' updated.", input.name);
+    Ok(format!("Adapter '{}' updated", input.name))
 }
