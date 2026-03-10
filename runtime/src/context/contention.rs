@@ -83,6 +83,8 @@ pub(crate) struct PendingAlloc {
     pub num_pages: usize,
     /// Context this operation belongs to (for destroy filtering). None for Take.
     pub context_id: Option<ContextId>,
+    /// Requester's priority floor at the time of enqueue (weight × post-alloc pages).
+    pub priority_floor: f64,
     /// Callback invoked with allocated pages on success.
     pub on_alloc: Box<dyn FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send>,
 }
@@ -93,6 +95,7 @@ impl fmt::Debug for PendingAlloc {
             .field("device", &self.device)
             .field("num_pages", &self.num_pages)
             .field("context_id", &self.context_id)
+            .field("priority_floor", &self.priority_floor)
             .field("on_alloc", &"<closure>")
             .finish()
     }
@@ -185,7 +188,7 @@ impl ContextManager {
     /// Universal GPU page contention primitive.
     ///
     /// Attempts to allocate `num_pages` GPU pages on `dev_idx` for process `pid`.
-    /// Goes through: Pending check → num_pages==0 fast-path → FIFO gate →
+    /// Goes through: Pending check → num_pages==0 fast-path →
     /// priority gate → free pool → eviction loop → self-suspend.
     ///
     /// On success, invokes `on_alloc` with the allocated pages.
@@ -199,15 +202,14 @@ impl ContextManager {
         context_id: Option<ContextId>,
         on_alloc: impl FnOnce(&mut ContextManager, Vec<PhysicalPageId>) + Send + 'static,
     ) {
-        let pending = PendingAlloc {
-            device: dev_idx, num_pages, context_id,
-            on_alloc: Box::new(on_alloc),
-        };
-
         // SUSPENSION CHECK: If the owning process is Pending, store as deferred op.
         {
             let proc = self.process_entry(pid);
             if proc.state == ProcessState::Pending {
+                let pending = PendingAlloc {
+                    device: dev_idx, num_pages, context_id, priority_floor: 0.0,
+                    on_alloc: Box::new(on_alloc),
+                };
                 proc.deferred_ops.push(pending);
                 return;
             }
@@ -215,29 +217,28 @@ impl ContextManager {
 
         // Short-circuit: no pages needed.
         if num_pages == 0 {
-            (pending.on_alloc)(self, Vec::new());
+            (on_alloc)(self, Vec::new());
             return;
         }
 
-        // Step 1: FIFO GATE — if alloc_queue has pending requests, enqueue behind them.
-        if !self.alloc_queue.is_empty() {
-            self.alloc_queue.push_back(pending);
-            return;
-        }
-
-        // Step 2: PRIORITY GATE — compare requester floor vs restore_queue head.
+        // Compute requester's priority floor (for priority gate and eviction).
         let requester_floor = {
             let proc = self.process_entry(pid);
             let pages = proc.pages_on(dev_idx);
             proc.weight * (pages + num_pages) as f64
         };
 
+        // Step 1: PRIORITY GATE — compare requester floor vs restore_queue head.
         if let Some(top) = self.restore_queue.peek() {
             let top_pid = top.process_id;
             let top_ready = self.processes.get(&top_pid)
                 .map(|p| p.pending_pinned == 0).unwrap_or(true);
             if top_ready && requester_floor < top.effective_priority() {
                 // Requester loses priority gate → suspend and enqueue in restore_queue.
+                let pending = PendingAlloc {
+                    device: dev_idx, num_pages, context_id, priority_floor: requester_floor,
+                    on_alloc: Box::new(on_alloc),
+                };
                 let (pinned, _) = self.suspend_process(pid);
                 self.enqueue_restore(pid, requester_floor, pinned);
                 self.process_entry(pid).deferred_ops.push(pending);
@@ -245,14 +246,14 @@ impl ContextManager {
             }
         }
 
-        // Step 3: TRY ALLOCATE from free pool.
+        // Step 2: TRY ALLOCATE from free pool.
         if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(num_pages) {
-            (pending.on_alloc)(self, pages);
+            (on_alloc)(self, pages);
             return;
         }
 
-        // Step 4: EVICTION LOOP — with deferred page tracking.
-        // Structured to break with `alloc_result` to avoid conditional moves of `pending`.
+        // Step 3: EVICTION LOOP — with deferred page tracking.
+        // Structured to break with `alloc_result` to avoid conditional moves of `on_alloc`.
         let mut deferred_pages: usize = 0;
         let mut has_deferred = false;
         let mut alloc_result: Option<Vec<PhysicalPageId>> = None;
@@ -291,17 +292,22 @@ impl ContextManager {
         // Post-loop: handle eviction results.
         if let Some(pages) = alloc_result {
             self.drain_queues();
-            (pending.on_alloc)(self, pages);
+            (on_alloc)(self, pages);
             return;
         }
 
+        let pending = PendingAlloc {
+            device: dev_idx, num_pages, context_id, priority_floor: requester_floor,
+            on_alloc: Box::new(on_alloc),
+        };
+
         if has_deferred {
-            // Step 5: Deferred pages from Pinned contexts will cover the gap.
+            // Step 4: Deferred pages from Pinned contexts will cover the gap.
             self.alloc_queue.push_back(pending);
             return;
         }
 
-        // Step 6: NO VICTIM — requester self-suspends.
+        // Step 5: NO VICTIM — requester self-suspends.
         let (pinned, _) = self.suspend_process(pid);
         self.enqueue_restore(pid, requester_floor, pinned);
         self.process_entry(pid).deferred_ops.push(pending);
@@ -503,7 +509,7 @@ impl ContextManager {
                     }
                 }
                 None => {
-                    eprintln!("SUSPEND_SWAP_FAIL ctx={ctx_id} err=No free CPU pages");
+                    tracing::error!(ctx = ctx_id, "suspend swap failed: no free CPU pages");
                     // Continue with suspension anyway — lose working pages
                     let pages_to_free = if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                         let pages = ctx.working_pages.clone();

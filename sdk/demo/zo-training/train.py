@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 import time
+import sys
 from collections import defaultdict
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -56,7 +57,7 @@ class TrainingConfig:
     model: str = "Qwen/Qwen3-0.6B"
     device: str = "cuda:0"
     gpu_mem_util: float = 0.8
-    cpu_mem_budget: int = 0
+    cpu_mem_budget: int = 8
 
     # --- Server (distributed mode) ---
     servers: list[str] = field(default_factory=lambda: ["ws://127.0.0.1:8080"])
@@ -189,50 +190,33 @@ async def run_rollouts(
         config.max_tokens_gen, config.system_prompt,
     )
 
-    # Round-robin partition across clients
-    per_client: list[list[tuple[int, dict, np.int64, dict]]] = [
-        [] for _ in clients
-    ]
-    for i, (inp, seed, task) in enumerate(zip(inputs, seeds, tasks)):
-        per_client[i % len(clients)].append((i, inp, seed, task))
-
     texts_out, seeds_out, tasks_out = [], [], []
-    pbar = tqdm(total=len(inputs), desc=desc, dynamic_ncols=True, leave=False)
+    pbar = tqdm(total=len(inputs), desc=desc, dynamic_ncols=True, leave=False, file=sys.stdout)
 
-    async def client_worker(client, work_items):
-        """Submit all items for this client and collect results."""
-        coros = []
-        metadata = []
-        for _, inp, seed, task in work_items:
-            coros.append(launch_and_collect(client, inferlet, inp))
-            metadata.append((seed, task))
+    async def _tracked(client, inp, seed, task):
+        """Launch one process and update the progress bar on completion."""
+        res_json = await launch_and_collect(client, inferlet, inp)
+        pbar.update(1)
+        return seed, task, res_json
 
-        results = await asyncio.gather(*coros)
-        collected_texts, collected_seeds, collected_tasks = [], [], []
-        for (seed, task), res_json in zip(metadata, results):
-            if res_json:
-                try:
-                    texts = json.loads(res_json)
-                    if isinstance(texts, list):
-                        collected_texts.extend(texts)
-                        collected_seeds.extend([seed] * len(texts))
-                        collected_tasks.extend([task] * len(texts))
-                        pbar.update(len(texts))
-                except (json.JSONDecodeError, TypeError):
-                    pbar.update(1)
-            else:
-                pbar.update(1)
-        return collected_texts, collected_seeds, collected_tasks
+    coros = []
+    for i, (inp, seed, task) in enumerate(zip(inputs, seeds, tasks)):
+        client = clients[i % len(clients)]
+        coros.append(_tracked(client, inp, seed, task))
 
-    worker_results = await asyncio.gather(
-        *(client_worker(c, items) for c, items in zip(clients, per_client))
-    )
+    results = await asyncio.gather(*coros)
     pbar.close()
 
-    for texts, seeds_list, tasks_list in worker_results:
-        texts_out.extend(texts)
-        seeds_out.extend(seeds_list)
-        tasks_out.extend(tasks_list)
+    for seed, task, res_json in results:
+        if res_json:
+            try:
+                texts = json.loads(res_json)
+                if isinstance(texts, list):
+                    texts_out.extend(texts)
+                    seeds_out.extend([seed] * len(texts))
+                    tasks_out.extend([task] * len(texts))
+            except (json.JSONDecodeError, TypeError):
+                pass
 
     return {"texts": texts_out, "seeds": seeds_out, "tasks": tasks_out}
 
@@ -513,7 +497,7 @@ def parse_args() -> TrainingConfig:
     p.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
     p.add_argument("--device", default="cuda:0", help="Device(s), comma-separated")
     p.add_argument("--gpu-mem-util", type=float, default=0.8)
-    p.add_argument("--cpu-mem-budget", type=int, default=0)
+    p.add_argument("--cpu-mem-budget", type=int, default=8)
 
     # Dataset
     p.add_argument("--dataset", default="math", choices=["math", "countdown"])

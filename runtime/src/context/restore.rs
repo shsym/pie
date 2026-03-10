@@ -335,7 +335,7 @@ impl ContextManager {
                 ).await;
 
                 if let Err(e) = result {
-                    eprintln!("REPLAY_FWD_FAIL ctx={ctx_id} device={device_id} err={e:#}");
+                    tracing::error!(ctx = ctx_id, device = device_id, "replay forward pass failed: {e:#}");
                     break; // Later chunks depend on this one's KV data
                 }
             }
@@ -349,18 +349,28 @@ impl ContextManager {
 
     /// Fire all of a process's deferred operations.
     /// Called when all replay forward passes have completed.
+    ///
+    /// Ordering is critical: if any operation fails to allocate and re-enters
+    /// the alloc_queue, all subsequent operations must also be deferred to
+    /// preserve causal ordering (e.g., `pin` must not fire before
+    /// `reserve_working_pages` allocates its pages).
     fn fire_deferred_ops(&mut self, pid: ProcessId) {
         let ops = self.processes.get_mut(&pid)
             .map(|p| std::mem::take(&mut p.deferred_ops))
             .unwrap_or_default();
+        let mut stalled = false;
         for op in ops {
-            if op.num_pages == 0 {
+            if stalled {
+                // A prior op didn't get its pages — queue everything after it.
+                self.alloc_queue.push_back(op);
+            } else if op.num_pages == 0 {
                 (op.on_alloc)(self, Vec::new());
             } else if let Some(pages) = self.devices[op.device].alloc_gpu_pages(op.num_pages) {
                 (op.on_alloc)(self, pages);
             } else {
-                // Pages no longer available — re-enter contention via alloc_queue.
+                // Pages no longer available — this and all remaining ops re-enter contention.
                 self.alloc_queue.push_back(op);
+                stalled = true;
             }
         }
     }

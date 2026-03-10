@@ -787,7 +787,10 @@ impl ContextManager {
     /// Phase 2: restore_queue (priority heap) — restore highest-priority Pending
     ///          process, then replay its deferred_op.
     pub(crate) fn drain_queues(&mut self) {
-        // Phase 1: alloc_queue FIFO (head-of-line blocking)
+        // Phase 1: alloc_queue FIFO (head-of-line blocking).
+        // Only entries that were deferred due to Pinned context pages or
+        // fire_deferred_ops stalling end up here. Self-suspend in with_gpu_pages
+        // ensures the requester's pages are freed, so the queue naturally drains.
         while let Some(front) = self.alloc_queue.front() {
             let (dev_idx, n) = (front.device, front.num_pages);
             if self.devices[dev_idx].available_gpu_pages() < n {
@@ -800,12 +803,18 @@ impl ContextManager {
 
         // Phase 2: restore_queue (priority heap)
         // Only proceed if alloc_queue is empty (allocs have strict priority).
-        if !self.alloc_queue.is_empty() { return; }
+        if !self.alloc_queue.is_empty() {
+            return;
+        }
 
         while let Some(top) = self.restore_queue.peek() {
             let pid = top.process_id;
 
-            // Block if still has Pinned contexts clearing.
+            // Wait if the process still has Pinned contexts mid-forward-pass.
+            // Pinned contexts clear quickly (one forward pass ≈ 500ms), and
+            // drain_queues is re-invoked on unpin. Breaking preserves priority
+            // ordering and avoids thrashing from restoring lower-priority
+            // processes that would immediately be evicted.
             if self.processes.get(&pid).map(|p| p.pending_pinned).unwrap_or(0) > 0 {
                 break;
             }
@@ -817,7 +826,7 @@ impl ContextManager {
 
             let waiter = self.restore_queue.pop().unwrap();
             if let Err(e) = self.restore_all(waiter.process_id) {
-                eprintln!("RESTORE_ALL_FAIL pid={} err={e:#}", waiter.process_id);
+                tracing::error!(pid = %waiter.process_id, "restore_all failed: {e:#}");
             }
         }
     }
