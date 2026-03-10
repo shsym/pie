@@ -34,7 +34,7 @@ pip install "pie-server[metal]"  # macOS
 ```bash
 git clone https://github.com/pie-project/pie.git && cd pie/pie
 
-# Recommended: use uv to sync (options: cu126, cu128, metal)
+# Recommended: use uv to sync (options: cu126, cu128, cu130, metal)
 uv sync --extra cu128
 ```
 
@@ -44,7 +44,6 @@ Run a test prompt (you will be prompted for configuration and model download if 
 
 ```bash
 pie run text-completion -- --prompt "Hello world!"
-pie run beam-search -- --prompt "What is the capital of France?" --beam-size 2
 ```
 
 > **Note:** The first run may take longer due to JIT compilation.
