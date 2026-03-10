@@ -1,171 +1,367 @@
-//! Message Queue Service
-//!
-//! Unified pub/sub and push/pull messaging over a single actor.
-//! All state is owned by the actor — no background tasks, no shared maps.
-
-use std::collections::{HashMap, VecDeque};
-use std::sync::LazyLock;
-
-use tokio::sync::mpsc;
+use super::service::{CommandDispatcher, Service, ServiceCommand};
+use super::utils::IdPool;
+use bytes::Bytes;
+use dashmap::DashMap;
+use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use crate::service::{Service, ServiceHandler};
+/// The senders of the command channels, which are used to send commands to the
+/// handler tasks.
+static PUBSUB_COMMAND_DISPATCHER: OnceLock<CommandDispatcher<PubSubCommand>> = OnceLock::new();
+static PUSHPULL_COMMAND_DISPATCHER: OnceLock<CommandDispatcher<PushPullCommand>> = OnceLock::new();
+
+/// Starts the messaging service. Two daemon tasks will be spawned to handle the
+/// commands dispatched from other services.
+pub fn start_service() {
+    let pubsub = PubSub::new();
+    let pushpull = PushPull::new();
+
+    pubsub.start(&PUBSUB_COMMAND_DISPATCHER);
+    pushpull.start(&PUSHPULL_COMMAND_DISPATCHER);
+}
 
 type ListenerId = usize;
 
-// ---- Singleton Actor --------------------------------------------------------
-
-static SERVICE: LazyLock<Service<Message>> = LazyLock::new(Service::new);
-
-/// Spawns the message-queue actor.
-pub fn spawn() {
-    SERVICE.spawn(|| MessageQueue::default()).expect("messaging already spawned");
-}
-
-// ---- Public API -------------------------------------------------------------
-
-/// Pushes a message onto a topic queue (point-to-point).
-pub fn push(topic: String, message: String) -> anyhow::Result<()> {
-    SERVICE.send(Message::Push { topic, message })
-}
-
-/// Pulls the next message from a topic queue (blocks until available).
-pub async fn pull(topic: String) -> anyhow::Result<String> {
-    let (tx, rx) = oneshot::channel();
-    SERVICE.send(Message::Pull { topic, response: tx })?;
-    Ok(rx.await?)
-}
-
-/// Broadcasts a message to all subscribers of a topic (fan-out).
-pub fn publish(topic: String, message: String) -> anyhow::Result<()> {
-    SERVICE.send(Message::Publish { topic, message })
-}
-
-/// Subscribes to a topic. Returns a listener ID.
-pub async fn subscribe(
-    topic: String,
-    sender: mpsc::Sender<String>,
-) -> anyhow::Result<ListenerId> {
-    let (tx, rx) = oneshot::channel();
-    SERVICE.send(Message::Subscribe { topic, sender, response: tx })?;
-    Ok(rx.await?)
-}
-
-/// Unsubscribes from a topic using a previously returned listener ID.
-pub fn unsubscribe(topic: String, sub_id: ListenerId) -> anyhow::Result<()> {
-    SERVICE.send(Message::Unsubscribe { topic, sub_id })
-}
-
-// ---- Messages ---------------------------------------------------------------
-
 #[derive(Debug)]
-enum Message {
-    Push { topic: String, message: String },
-    Pull { topic: String, response: oneshot::Sender<String> },
+pub enum PubSubCommand {
+    // Send {
+    //     inst_id: InstanceId,
+    //     message: String,
+    // },
+    //
+    // Receive {
+    //     inst_id: InstanceId,
+    // },
+    /// Broadcast a message to all subscribers of a topic.
     Publish { topic: String, message: String },
+    /// Subscribe to a topic using a sender; returns a subscription id via the oneshot.
     Subscribe {
         topic: String,
         sender: mpsc::Sender<String>,
-        response: oneshot::Sender<ListenerId>,
+        sub_id: oneshot::Sender<ListenerId>,
     },
+    /// Unsubscribe from a topic using the subscription id.
     Unsubscribe { topic: String, sub_id: ListenerId },
 }
 
-// ---- State ------------------------------------------------------------------
-
-/// Point-to-point queue: either buffered messages or waiting consumers.
-enum Queue {
-    Messages(VecDeque<String>),
-    Waiters(VecDeque<oneshot::Sender<String>>),
+impl ServiceCommand for PubSubCommand {
+    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &PUBSUB_COMMAND_DISPATCHER;
 }
 
-struct MessageQueue {
-    queues: HashMap<String, Queue>,
-    subscribers: HashMap<String, Vec<(ListenerId, mpsc::Sender<String>)>>,
-    next_sub_id: ListenerId,
+#[derive(Debug)]
+pub enum PushPullCommand {
+    Push {
+        topic: String,
+        message: String,
+    },
+
+    Pull {
+        topic: String,
+        message: oneshot::Sender<String>,
+    },
+
+    PushBlob {
+        topic: String,
+        message: Bytes,
+    },
+
+    PullBlob {
+        topic: String,
+        message: oneshot::Sender<Bytes>,
+    },
 }
 
-impl Default for MessageQueue {
-    fn default() -> Self {
-        MessageQueue {
-            queues: HashMap::new(),
-            subscribers: HashMap::new(),
-            next_sub_id: 0,
+impl ServiceCommand for PushPullCommand {
+    const DISPATCHER: &'static OnceLock<CommandDispatcher<Self>> = &PUSHPULL_COMMAND_DISPATCHER;
+}
+
+#[derive(Debug)]
+pub struct PubSub {
+    tx: UnboundedSender<(String, String)>,
+    event_loop_handle: tokio::task::JoinHandle<()>,
+    subscribers_by_topic: Arc<DashMap<String, Vec<(ListenerId, mpsc::Sender<String>)>>>,
+    sub_id_pool: IdPool<ListenerId>,
+}
+
+impl PubSub {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let subscribers_by_topic = Arc::new(DashMap::new());
+        let event_loop_handle =
+            tokio::spawn(Self::event_loop(rx, Arc::clone(&subscribers_by_topic)));
+
+        PubSub {
+            tx,
+            event_loop_handle,
+            subscribers_by_topic,
+            sub_id_pool: IdPool::new(ListenerId::MAX),
+        }
+    }
+
+    /// The event loop that listens for broadcast messages and dispatches them to subscribers.
+    async fn event_loop(
+        mut rx: UnboundedReceiver<(String, String)>,
+        subscribers_by_topic: Arc<DashMap<String, Vec<(ListenerId, mpsc::Sender<String>)>>>,
+    ) {
+        while let Some((topic, message)) = rx.recv().await {
+            //println!("subscriptions: {:?}", subscriptions.len());
+
+            let remove_topic = if let Some(mut subscribers) = subscribers_by_topic.get_mut(&topic) {
+                //println!("Received message: {:?}, {:?}", topic, message);
+
+                // Retain only the subscribers that can receive the message.
+                subscribers.retain(|(_, sender)| {
+                    match sender.try_send(message.clone()) {
+                        Ok(_) => true,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // The subscriber's channel is full; keep the subscription.
+                            true
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // The subscriber's channel is closed; remove the subscription.
+                            false
+                        }
+                    }
+                });
+
+                // Remove the topic if no subscribers remain.
+                subscribers.is_empty()
+            } else {
+                false
+            };
+
+            if remove_topic {
+                subscribers_by_topic.remove(&topic);
+            }
+        }
+    }
+}
+//#[async_trait]
+impl Service for PubSub {
+    type Command = PubSubCommand;
+
+    async fn handle(&mut self, cmd: Self::Command) {
+        match cmd {
+            // Command::Send { inst_id, message } => {}
+            // Command::Receive { inst_id } => {}
+            PubSubCommand::Publish { topic, message } => {
+                // Broadcast the message.
+                self.tx.send((topic, message)).unwrap();
+            }
+            PubSubCommand::Subscribe {
+                topic,
+                sender,
+                sub_id,
+            } => {
+                // Acquire a new subscription id.
+                let id = self.sub_id_pool.acquire().unwrap();
+
+                // Insert the new subscriber into the map.
+                self.subscribers_by_topic
+                    .entry(topic)
+                    .or_insert_with(Vec::new)
+                    .push((id, sender));
+
+                // Send back the subscription id.
+                let _ = sub_id.send(id).ok();
+            }
+            PubSubCommand::Unsubscribe { topic, sub_id } => {
+                if let Some(mut subscribers) = self.subscribers_by_topic.get_mut(&topic) {
+                    // Remove the subscriber with the matching id.
+                    subscribers.retain(|(s, _)| *s != sub_id);
+
+                    // Remove the topic entirely if there are no more subscribers.
+                    if subscribers.is_empty() {
+                        self.subscribers_by_topic.remove(&topic);
+                    }
+                }
+                // Release the subscription id back to the pool.
+                self.sub_id_pool.release(sub_id).unwrap();
+            }
         }
     }
 }
 
-// ---- Handler ----------------------------------------------------------------
+/// A queue for a given topic, holding either waiting messages or pending pull requests.
+enum PushPullStringQueue {
+    Messages(VecDeque<String>),
+    PendingPulls(VecDeque<oneshot::Sender<String>>),
+}
 
-impl ServiceHandler for MessageQueue {
-    type Message = Message;
+/// A queue for a given topic, holding either waiting blobs or pending pull requests for blobs.
+enum PushPullBlobQueue {
+    Messages(VecDeque<Bytes>),
+    PendingPulls(VecDeque<oneshot::Sender<Bytes>>),
+}
 
-    async fn handle(&mut self, msg: Message) {
-        match msg {
-            Message::Push { topic, message } => {
-                match self.queues.get_mut(&topic) {
-                    Some(Queue::Waiters(w)) => {
-                        if let Some(tx) = w.pop_front() {
-                            let _ = tx.send(message);
-                        }
-                        if w.is_empty() {
-                            self.queues.remove(&topic);
-                        }
+pub struct PushPull {
+    // Fields for String-based messages
+    tx_string: UnboundedSender<(String, String)>,
+    _event_loop_handle_string: tokio::task::JoinHandle<()>,
+    string_queue_by_topic: Arc<DashMap<String, PushPullStringQueue>>,
+
+    // Fields for Blob-based messages (Vec<u8>)
+    tx_blob: UnboundedSender<(String, Bytes)>,
+    _event_loop_handle_blob: tokio::task::JoinHandle<()>,
+    blob_queue_by_topic: Arc<DashMap<String, PushPullBlobQueue>>,
+}
+
+impl PushPull {
+    pub fn new() -> Self {
+        // --- Setup for String messages ---
+        let (tx_string, rx_string) = mpsc::unbounded_channel();
+        let string_queue_by_topic = Arc::new(DashMap::new());
+        let _event_loop_handle_string = tokio::spawn(Self::event_loop_string(
+            rx_string,
+            Arc::clone(&string_queue_by_topic),
+        ));
+
+        // --- Setup for Blob messages ---
+        let (tx_blob, rx_blob) = mpsc::unbounded_channel();
+        let blob_queue_by_topic = Arc::new(DashMap::new());
+        let _event_loop_handle_blob = tokio::spawn(Self::event_loop_blob(
+            rx_blob,
+            Arc::clone(&blob_queue_by_topic),
+        ));
+
+        PushPull {
+            tx_string,
+            _event_loop_handle_string,
+            string_queue_by_topic,
+            tx_blob,
+            _event_loop_handle_blob,
+            blob_queue_by_topic,
+        }
+    }
+
+    /// The event loop that listens for pushed string messages and matches them with pulls.
+    async fn event_loop_string(
+        mut rx: UnboundedReceiver<(String, String)>,
+        queue_by_topic: Arc<DashMap<String, PushPullStringQueue>>,
+    ) {
+        while let Some((topic, message)) = rx.recv().await {
+            let mut queue = queue_by_topic
+                .entry(topic.clone())
+                .or_insert(PushPullStringQueue::Messages(VecDeque::new()));
+
+            let remove_queue = match queue.value_mut() {
+                PushPullStringQueue::Messages(q) => {
+                    q.push_back(message);
+                    false
+                }
+                PushPullStringQueue::PendingPulls(q) => {
+                    if let Some(waiting_pull) = q.pop_front() {
+                        let _ = waiting_pull.send(message);
                     }
-                    Some(Queue::Messages(q)) => {
+                    q.is_empty()
+                }
+            };
+
+            // Drop the lock on the queue entry before potentially removing the topic.
+            drop(queue);
+
+            if remove_queue {
+                queue_by_topic.remove(&topic);
+            }
+        }
+    }
+
+    /// The event loop that listens for pushed blob messages and matches them with pulls.
+    async fn event_loop_blob(
+        mut rx: UnboundedReceiver<(String, Bytes)>,
+        queue_by_topic: Arc<DashMap<String, PushPullBlobQueue>>,
+    ) {
+        while let Some((topic, message)) = rx.recv().await {
+            let mut queue = queue_by_topic
+                .entry(topic.clone())
+                .or_insert(PushPullBlobQueue::Messages(VecDeque::new()));
+
+            let remove_queue = match queue.value_mut() {
+                PushPullBlobQueue::Messages(q) => {
+                    q.push_back(message);
+                    false
+                }
+                PushPullBlobQueue::PendingPulls(q) => {
+                    if let Some(waiting_pull) = q.pop_front() {
+                        let _ = waiting_pull.send(message);
+                    }
+                    q.is_empty()
+                }
+            };
+
+            // Drop the lock on the queue entry before potentially removing the topic.
+            drop(queue);
+
+            if remove_queue {
+                queue_by_topic.remove(&topic);
+            }
+        }
+    }
+}
+
+impl Service for PushPull {
+    type Command = PushPullCommand;
+
+    async fn handle(&mut self, cmd: Self::Command) {
+        match cmd {
+            PushPullCommand::Push { topic, message } => {
+                self.tx_string.send((topic, message)).unwrap();
+            }
+            PushPullCommand::Pull { topic, message } => {
+                let mut queue = self
+                    .string_queue_by_topic
+                    .entry(topic.clone())
+                    .or_insert(PushPullStringQueue::PendingPulls(VecDeque::new()));
+
+                let remove_queue = match queue.value_mut() {
+                    PushPullStringQueue::Messages(q) => {
+                        if let Some(sent_msg) = q.pop_front() {
+                            let _ = message.send(sent_msg);
+                        }
+                        q.is_empty()
+                    }
+                    PushPullStringQueue::PendingPulls(q) => {
                         q.push_back(message);
+                        false
                     }
-                    None => {
-                        self.queues.insert(topic, Queue::Messages(VecDeque::from([message])));
-                    }
+                };
+
+                // To avoid DashMap deadlock.
+                drop(queue);
+
+                if remove_queue {
+                    self.string_queue_by_topic.remove(&topic);
                 }
             }
+            PushPullCommand::PushBlob { topic, message } => {
+                self.tx_blob.send((topic, message)).unwrap();
+            }
+            PushPullCommand::PullBlob { topic, message } => {
+                let mut queue = self
+                    .blob_queue_by_topic
+                    .entry(topic.clone())
+                    .or_insert(PushPullBlobQueue::PendingPulls(VecDeque::new()));
 
-            Message::Pull { topic, response } => {
-                match self.queues.get_mut(&topic) {
-                    Some(Queue::Messages(q)) => {
-                        if let Some(msg) = q.pop_front() {
-                            let _ = response.send(msg);
+                let remove_queue = match queue.value_mut() {
+                    PushPullBlobQueue::Messages(q) => {
+                        if let Some(sent_msg) = q.pop_front() {
+                            let _ = message.send(sent_msg);
                         }
-                        if q.is_empty() {
-                            self.queues.remove(&topic);
-                        }
+                        q.is_empty()
                     }
-                    Some(Queue::Waiters(w)) => {
-                        w.push_back(response);
+                    PushPullBlobQueue::PendingPulls(q) => {
+                        q.push_back(message);
+                        false
                     }
-                    None => {
-                        self.queues.insert(topic, Queue::Waiters(VecDeque::from([response])));
-                    }
-                }
-            }
+                };
 
-            Message::Publish { topic, message } => {
-                if let Some(subs) = self.subscribers.get_mut(&topic) {
-                    subs.retain(|(_, tx)| match tx.try_send(message.clone()) {
-                        Ok(_) => true,
-                        Err(mpsc::error::TrySendError::Full(_)) => true,
-                        Err(mpsc::error::TrySendError::Closed(_)) => false,
-                    });
-                    if subs.is_empty() {
-                        self.subscribers.remove(&topic);
-                    }
-                }
-            }
+                // To avoid DashMap deadlock.
+                drop(queue);
 
-            Message::Subscribe { topic, sender, response } => {
-                let id = self.next_sub_id;
-                self.next_sub_id += 1;
-                self.subscribers.entry(topic).or_default().push((id, sender));
-                let _ = response.send(id);
-            }
-
-            Message::Unsubscribe { topic, sub_id } => {
-                if let Some(subs) = self.subscribers.get_mut(&topic) {
-                    subs.retain(|(id, _)| *id != sub_id);
-                    if subs.is_empty() {
-                        self.subscribers.remove(&topic);
-                    }
+                if remove_queue {
+                    self.blob_queue_by_topic.remove(&topic);
                 }
             }
         }
