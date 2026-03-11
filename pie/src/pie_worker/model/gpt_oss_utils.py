@@ -8,10 +8,13 @@ Ported from backend-python-legacy/model/gptoss_utils.py
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import Any
 
 import torch
+
+from ..utils import get_device_sm
 
 # Note: These imports require FlashInfer (CUDA only)
 # Import lazily in functions that need them to allow module loading on CPU
@@ -36,6 +39,97 @@ FP4_VALUES = (
     -4.0,
     -6.0,
 )
+
+# SM architectures where FlashInfer CUDA kernels are broken and we fall back
+# to torch attention + CUTLASS BF16/BF16 MoE. When FlashInfer adds support
+# for an SM, remove it from this set.
+_FLASHINFER_BROKEN_SMS = frozenset({110})
+
+
+@functools.lru_cache(maxsize=1)
+def _is_sm110_fallback() -> bool:
+    """Return True on SMs where FlashInfer kernels are broken (Jetson Thor).
+
+    Uses get_device_sm() from utils.py (single source of truth for SM detection).
+    Assumes homogeneous GPU architecture across all TP ranks.
+    """
+    return get_device_sm() in _FLASHINFER_BROKEN_SMS
+
+
+_fp4_lut_cache: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_fp4_lut(device: torch.device) -> torch.Tensor:
+    """Return cached FP4 E2M1 lookup table (16 bf16 values) for *device*."""
+    lut = _fp4_lut_cache.get(device)
+    if lut is None:
+        lut = torch.tensor(FP4_VALUES, dtype=torch.bfloat16, device=device)
+        _fp4_lut_cache[device] = lut
+    return lut
+
+
+def dequant_mxfp4_to_bf16(
+    weights_fp4: torch.Tensor,
+    scales_fp4: torch.Tensor,
+    N: int,
+    K: int,
+    buf: torch.Tensor,
+    expert_ids: torch.Tensor | None = None,
+) -> None:
+    """Dequant linear MXFP4 weights to BF16, writing into pre-allocated buffer.
+
+    Args:
+        weights_fp4: [E, N, K//2] uint8 — packed FP4 (2 values per byte)
+        scales_fp4: [E, N, K//32] — E8M0 block scales (1 per 32 elements)
+        N: number of rows per expert
+        K: number of columns per expert (unpacked)
+        buf: [E, N, K] bfloat16 — pre-allocated output buffer
+        expert_ids: optional 1D tensor of expert indices to dequant (selective mode)
+    """
+    lut = _get_fp4_lut(weights_fp4.device)
+
+    if expert_ids is not None:
+        # Selective: batch all selected experts at once (no Python loop)
+        c = expert_ids.shape[0]
+        w = weights_fp4[expert_ids].view(torch.uint8)           # [c, N, K//2]
+        lo = (w & 0x0F).to(torch.int32)
+        hi = (w >> 4).to(torch.int32)
+        unpacked = torch.stack([lo, hi], dim=-1).reshape(c, N, K)
+        values = lut[unpacked]
+        del unpacked, lo, hi, w
+
+        sb = scales_fp4[expert_ids].view(torch.uint8).to(torch.int32)
+        sv = torch.exp2(sb.float() - 127.0).to(torch.bfloat16)
+        se = sv.repeat_interleave(32, dim=-1)[:, :, :K]
+        del sb, sv
+
+        buf[expert_ids] = values * se
+        del values, se
+    else:
+        # Full dequant (all experts, chunked for memory)
+        E = weights_fp4.shape[0]
+        CHUNK = 8
+        for start in range(0, E, CHUNK):
+            end = min(start + CHUNK, E)
+            c = end - start
+
+            # Unpack nibbles: each uint8 byte → 2 FP4 values
+            w = weights_fp4[start:end].view(torch.uint8)        # [c, N, K//2]
+            lo = (w & 0x0F).to(torch.int32)                     # low nibble
+            hi = (w >> 4).to(torch.int32)                       # high nibble
+            unpacked = torch.stack([lo, hi], dim=-1).reshape(c, N, K)
+            values = lut[unpacked]                               # [c, N, K] bf16
+            del unpacked, lo, hi, w
+
+            # E8M0 block scales: value = 2^(byte - 127)
+            sb = scales_fp4[start:end].view(torch.uint8).to(torch.int32)
+            sv = torch.exp2(sb.float() - 127.0).to(torch.bfloat16)
+            se = sv.repeat_interleave(32, dim=-1)[:, :, :K]     # [c, N, K]
+            del sb, sv
+
+            buf[start:end] = values * se
+            del values, se
+
 
 # Alignment requirement for `trtllm_fp4_block_scale_moe`
 ALIGNMENT = 256
@@ -333,11 +427,13 @@ def quantize_shuffle_gate_up_weights(
     epilogue_tile_m = 128
     cache_permute_indices: dict[tuple, torch.Tensor] = {}
 
-    # Quantize weights with swizzled layout
-    weights_quant, _ = quantize_into_mxfp4(gate_up_weights, True)
-
-    # Quantize weights with linear layout for scales
-    _, scales_linear = quantize_into_mxfp4(gate_up_weights, False)
+    # SM110: linear layout for both weights and scales (easy dequant at runtime)
+    # SM100: swizzled weights + linear scales (for CUTLASS tile layout)
+    if _is_sm110_fallback():
+        weights_quant, scales_linear = quantize_into_mxfp4(gate_up_weights, False)
+    else:
+        weights_quant, _ = quantize_into_mxfp4(gate_up_weights, True)
+        _, scales_linear = quantize_into_mxfp4(gate_up_weights, False)
 
     # Convert quantized weights to proper shapes
     weights_fp4 = weights_quant.view(torch.uint8).reshape(
@@ -347,13 +443,22 @@ def quantize_shuffle_gate_up_weights(
         num_experts, 2 * padded_intermediate_size, padded_hidden_size // 32
     )
 
-    # Shuffle weights and scales for each expert
+    # SM110: CUTLASS BF16/BF16 kernel uses linear layout — no shuffle needed
+    if _is_sm110_fallback():
+        scales_out = (
+            scales_linear_fp4.contiguous()
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, 2 * padded_intermediate_size, padded_hidden_size // 32)
+        )
+        bias_out = gate_up_bias.contiguous() if gate_up_bias is not None else None
+        return weights_fp4.contiguous(), scales_out, bias_out
+
+    # SM100: shuffle weights/scales for transposed MMA output
     weights_fp4_shuffled = []
     scales_fp4_shuffled = []
     bias_shuffled_list = []
 
     for i in range(num_experts):
-        # Shuffle weights
         permute_indices = _maybe_get_cached_w3_w1_permute_indices(
             cache_permute_indices,
             weights_fp4[i].view(torch.uint8),
@@ -362,14 +467,10 @@ def quantize_shuffle_gate_up_weights(
         weights_fp4_shuffled.append(
             weights_fp4[i][permute_indices.to(weights_fp4.device)].contiguous()
         )
-
-        # Shuffle bias using row permutation derived from weight permutation
         if gate_up_bias is not None:
             bias_shuffled_list.append(
                 gate_up_bias[i][permute_indices.to(gate_up_bias.device)].contiguous()
             )
-
-        # Shuffle scales
         permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
             cache_permute_indices,
             scales_linear_fp4[i].view(torch.uint8),
@@ -422,11 +523,11 @@ def quantize_shuffle_down_weights(
     epilogue_tile_m = 128
     cache_permute_indices: dict[tuple, torch.Tensor] = {}
 
-    # Quantize weights with swizzled layout
-    weights_quant, _ = quantize_into_mxfp4(down_weights, True)
-
-    # Quantize weights with linear layout for scales
-    _, scales_linear = quantize_into_mxfp4(down_weights, False)
+    if _is_sm110_fallback():
+        weights_quant, scales_linear = quantize_into_mxfp4(down_weights, False)
+    else:
+        weights_quant, _ = quantize_into_mxfp4(down_weights, True)
+        _, scales_linear = quantize_into_mxfp4(down_weights, False)
 
     # Convert quantized weights to proper shapes
     weights_fp4 = weights_quant.view(torch.uint8).reshape(
@@ -436,13 +537,22 @@ def quantize_shuffle_down_weights(
         num_experts, padded_hidden_size, padded_intermediate_size // 32
     )
 
-    # Shuffle weights and scales for each expert
+    # SM110: CUTLASS BF16/BF16 kernel uses linear layout — no shuffle needed
+    if _is_sm110_fallback():
+        scales_out = (
+            scales_linear_fp4.contiguous()
+            .view(torch.float8_e4m3fn)
+            .reshape(num_experts, padded_hidden_size, padded_intermediate_size // 32)
+        )
+        bias_out = down_bias.contiguous() if down_bias is not None else None
+        return weights_fp4.contiguous(), scales_out, bias_out
+
+    # SM100: shuffle weights/scales for transposed MMA output
     weights_fp4_shuffled = []
     scales_fp4_shuffled = []
     bias_shuffled_list = []
 
     for i in range(num_experts):
-        # Shuffle weights
         permute_indices = get_w2_permute_indices_with_cache(
             cache_permute_indices,
             weights_fp4[i],
@@ -451,14 +561,10 @@ def quantize_shuffle_down_weights(
         weights_fp4_shuffled.append(
             weights_fp4[i][permute_indices.to(weights_fp4.device)].contiguous()
         )
-
-        # Shuffle bias using row permutation derived from weight permutation
         if down_bias is not None:
             bias_shuffled_list.append(
                 down_bias[i][permute_indices.to(down_bias.device)].contiguous()
             )
-
-        # Shuffle scales
         permute_sf_indices = get_w2_permute_indices_with_cache(
             cache_permute_indices,
             scales_linear_fp4[i],
@@ -524,7 +630,7 @@ def prepare_gptoss_moe_gate_up(
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, intermediate_size * 2, hidden_size]
     weights_bf16 = weights_bf16.reshape(num_experts, intermediate_size * 2, hidden_size)
-    
+
     # Free input tensors early to reduce memory pressure
     del blocks, scales
 
@@ -593,7 +699,7 @@ def prepare_gptoss_moe_gate_up(
         gate_up_bias=bias_padded,
     )
     del weights_padded, bias_padded  # Free after quantization
-    
+
     # Force CUDA memory cleanup
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -640,7 +746,7 @@ def prepare_gptoss_moe_down(
     weights_bf16 = dequantize_from_mxfp4(blocks, scales, device, torch.bfloat16)
     # Reshape to [num_experts, hidden_size, intermediate_size]
     weights_bf16 = weights_bf16.reshape(num_experts, hidden_size, intermediate_size)
-    
+
     # Free input tensors early to reduce memory pressure
     del blocks, scales
 
@@ -691,7 +797,7 @@ def prepare_gptoss_moe_down(
         down_bias=bias_padded,
     )
     del weights_padded, bias_padded  # Free after quantization
-    
+
     # Force CUDA memory cleanup
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
