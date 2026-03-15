@@ -35,27 +35,77 @@ pub type PhysicalPageId = u32;
 // PagePool (bulk alloc via split_off)
 // =============================================================================
 
+use rustc_hash::FxHashSet;
+
 #[derive(Debug)]
 struct PagePool {
     total: usize,
     free: Vec<PhysicalPageId>,
+    alloc_total: usize,
+    free_total: usize,
+    free_set: FxHashSet<PhysicalPageId>,
+    // Per-tag counters
+    free_reclaim: usize,
+    free_release: usize,
+    free_working: usize,
+    over_logged: bool,
 }
 
 impl PagePool {
     fn new(total: usize) -> Self {
-        PagePool { total, free: (0..total as PhysicalPageId).collect() }
+        PagePool {
+            total,
+            free: (0..total as PhysicalPageId).collect(),
+            alloc_total: 0,
+            free_total: 0,
+            free_set: (0..total as PhysicalPageId).collect(),
+            free_reclaim: 0,
+            free_release: 0,
+            free_working: 0,
+            over_logged: false,
+        }
     }
 
     fn alloc_n(&mut self, n: usize) -> Option<Vec<PhysicalPageId>> {
         if self.free.len() < n { return None; }
         let start = self.free.len() - n;
-        Some(self.free.split_off(start))
+        self.alloc_total += n;
+        let pages = self.free.split_off(start);
+        for &p in &pages { self.free_set.remove(&p); }
+        Some(pages)
     }
 
-    fn free(&mut self, id: PhysicalPageId) { self.free.push(id); }
-    fn free_batch(&mut self, ids: &[PhysicalPageId]) { self.free.extend_from_slice(ids); }
+    fn free_tagged(&mut self, ids: &[PhysicalPageId], tag: &str) {
+        self.free_total += ids.len();
+        // Track per-tag
+        match tag {
+            "reclaim" => self.free_reclaim += ids.len(),
+            "free_gpu_pages" => self.free_working += ids.len(),
+            _ if tag.starts_with("release_") => self.free_release += ids.len(),
+            _ => {}
+        }
+        for &id in ids {
+            if !self.free_set.insert(id) {
+                tracing::error!("[DOUBLE_FREE] page={} tag={} free.len={} total={}",
+                    id, tag, self.free.len(), self.total);
+            }
+            self.free.push(id);
+        }
+        // Log the first time free pool exceeds total
+        if !self.over_logged && self.free.len() > self.total {
+            self.over_logged = true;
+            let last_ids: Vec<_> = ids.iter().take(5).collect();
+            tracing::error!("[FIRST_OVER] tag={} free.len={} total={} ids={:?} | reclaim={} release={} working={} alloc={}",
+                tag, self.free.len(), self.total, last_ids,
+                self.free_reclaim, self.free_release, self.free_working, self.alloc_total);
+        }
+    }
+    fn free(&mut self, id: PhysicalPageId) { self.free_tagged(&[id], "single"); }
+    fn free_batch(&mut self, ids: &[PhysicalPageId]) { self.free_tagged(ids, "batch"); }
     fn used(&self) -> usize { self.total - self.free.len() }
     fn available(&self) -> usize { self.free.len() }
+    fn pool_stats(&self) -> (usize, usize) { (self.alloc_total, self.free_total) }
+    fn tag_stats(&self) -> (usize, usize, usize) { (self.free_reclaim, self.free_release, self.free_working) }
 }
 
 // =============================================================================
@@ -90,6 +140,22 @@ impl TrieNode {
             refcount: 0,
             children: FxHashMap::default(),
         }
+    }
+
+    /// Recursive trie statistics: (total_pages, total_rc_sum, node_count, rc0_with_children)
+    fn trie_stats(&self) -> (usize, usize, usize, usize) {
+        let mut pages = self.prefix.len();
+        let mut rc_sum = self.refcount;
+        let mut nodes = if self.prefix_hashes.is_empty() { 0 } else { 1 };
+        let mut rc0_interior = if self.refcount == 0 && !self.children.is_empty() && !self.prefix_hashes.is_empty() { 1 } else { 0 };
+        for child in self.children.values() {
+            let (p, r, n, z) = child.trie_stats();
+            pages += p;
+            rc_sum += r;
+            nodes += n;
+            rc0_interior += z;
+        }
+        (pages, rc_sum, nodes, rc0_interior)
     }
 
     // =========================================================================
@@ -171,7 +237,7 @@ impl TrieNode {
             // panic in debug.
             debug_assert!(false,
                 "navigate_and_extend: prefix not in trie (first hash={first})");
-            eprintln!("BUG: navigate_and_extend called with prefix not in trie");
+            tracing::error!("BUG: navigate_and_extend called with prefix not in trie");
         }
     }
 
@@ -194,6 +260,9 @@ impl TrieNode {
                 // Partial match — split and insert divergent suffix.
                 child.split_at(common);
                 child.refcount += 1;
+                // The common-prefix physical pages are duplicates of what's
+                // already in the trie — reclaim them.
+                reclaimed_pages.extend_from_slice(&phys[..common]);
                 if common < suffix.len() {
                     child.children.insert(suffix[common], TrieNode {
                         prefix_hashes: suffix[common..].to_vec(),
@@ -203,7 +272,10 @@ impl TrieNode {
                     });
                 }
             } else if common < suffix.len() {
+                // Full prefix match — the common portion's physical pages are
+                // duplicates already stored in the trie node; reclaim them.
                 child.refcount += 1;
+                reclaimed_pages.extend_from_slice(&phys[..common]);
                 child.insert_suffix(&suffix[common..], &phys[common..], reclaimed_pages);
             } else {
                 // Exact match — dedup.
@@ -268,7 +340,7 @@ impl TrieNode {
                     );
                     let evictable = child.refcount == 0 && child.children.is_empty();
                     let freed = if evictable {
-                        pool.free_batch(&child.prefix);
+                        pool.free_tagged(&child.prefix, "release_child_evict");
                         child.prefix.len() + deeper_freed
                     } else {
                         deeper_freed
@@ -279,7 +351,7 @@ impl TrieNode {
                     child.refcount = child.refcount.saturating_sub(1);
                     let evictable = child.refcount == 0 && child.children.is_empty();
                     let freed = if evictable {
-                        pool.free_batch(&child.prefix);
+                        pool.free_tagged(&child.prefix, "release_tip_evict");
                         child.prefix.len()
                     } else {
                         0
@@ -307,14 +379,13 @@ impl TrieNode {
             && self.children.is_empty()
             && !self.prefix_hashes.is_empty();
 
-        let total_freed = if remove_self {
-            pool.free_batch(&self.prefix);
-            child_freed + self.prefix.len()
-        } else {
-            child_freed
-        };
+        // NOTE: Do NOT free self.prefix here even if remove_self is true.
+        // The CALLER is responsible for freeing our pages (via the
+        // release_child_evict / release_tip_evict path). Freeing here would
+        // cause a double-free because the caller also frees child.prefix when
+        // it sees evictable=true.
 
-        (total_freed, remove_self)
+        (child_freed, remove_self)
     }
 
     // =========================================================================
@@ -400,6 +471,15 @@ impl TrieNode {
             }
         }
     }
+
+    fn collect_phys_with_info(&self, out: &mut Vec<(PhysicalPageId, usize, usize, usize)>, depth: usize) {
+        for &page in &self.prefix {
+            out.push((page, self.refcount, self.prefix.len(), depth));
+        }
+        for child in self.children.values() {
+            child.collect_phys_with_info(out, depth + 1);
+        }
+    }
 }
 
 /// Count how many leading elements of `a` and `b` are equal.
@@ -444,6 +524,33 @@ impl PageStore {
 
     pub fn available_gpu_pages(&self) -> usize { self.gpu.available() }
 
+    /// Returns (total_pages_in_trie, total_rc_sum, node_count, rc0_interior_nodes)
+    pub fn trie_stats(&self) -> (usize, usize, usize, usize) {
+        self.root.trie_stats()
+    }
+
+    pub fn total_gpu_pages(&self) -> usize { self.gpu.total }
+    pub fn pool_stats(&self) -> (usize, usize) { self.gpu.pool_stats() }
+    pub fn tag_stats(&self) -> (usize, usize, usize) { self.gpu.tag_stats() }
+
+    /// Audit: count pages that exist in both trie AND the free set.
+    /// These are phantom pages — they've been freed to the pool but still appear
+    /// in trie nodes (double-counted). Returns (phantom_count, first_few_ids).
+    pub fn phantom_audit(&self) -> (usize, String) {
+        let mut all_pages = Vec::new();
+        self.root.collect_phys_with_info(&mut all_pages, 0);
+        let mut phantoms = Vec::new();
+        for &(page, rc, prefix_len, depth) in &all_pages {
+            if self.gpu.free_set.contains(&page) {
+                phantoms.push((page, rc, prefix_len, depth));
+            }
+        }
+        let desc: Vec<String> = phantoms.iter().take(10)
+            .map(|(p, rc, plen, d)| format!("{}(rc={},n={},d={})", p, rc, plen, d))
+            .collect();
+        (phantoms.len(), desc.join(" "))
+    }
+
     // =========================================================================
     // Working pages (bulk alloc via split_off)
     // =========================================================================
@@ -453,7 +560,7 @@ impl PageStore {
     }
 
     pub fn free_gpu_pages(&mut self, pages: &[PhysicalPageId]) {
-        self.gpu.free_batch(pages);
+        self.gpu.free_tagged(pages, "free_gpu_pages");
     }
 
     pub fn alloc_cpu_pages(&mut self, n: usize) -> Option<Vec<PhysicalPageId>> {
@@ -488,7 +595,7 @@ impl PageStore {
         self.root.navigate_and_extend(prefix, new_hashes, new_phys, &mut reclaimed_pages);
 
         if !reclaimed_pages.is_empty() {
-            self.gpu.free_batch(&reclaimed_pages);
+            self.gpu.free_tagged(&reclaimed_pages, "reclaim");
         }
     }
 

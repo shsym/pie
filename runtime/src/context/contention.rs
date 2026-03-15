@@ -235,6 +235,10 @@ impl ContextManager {
                 .map(|p| p.pending_pinned == 0).unwrap_or(true);
             if top_ready && requester_floor < top.effective_priority() {
                 // Requester loses priority gate → suspend and enqueue in restore_queue.
+                // tracing::warn!("[CONTENTION] PRIORITY_GATE: pid={} floor={:.2} < top={:.2} (top_pid={}) → self-suspend | free={} rq={} aq={}",
+                //     &pid.to_string()[..8], requester_floor, top.effective_priority(), &top_pid.to_string()[..8],
+                //     self.devices[dev_idx].available_gpu_pages(),
+                //     self.restore_queue.len(), self.alloc_queue.len());
                 let pending = PendingAlloc {
                     device: dev_idx, num_pages, context_id, priority_floor: requester_floor,
                     on_alloc: Box::new(on_alloc),
@@ -274,6 +278,8 @@ impl ContextManager {
 
                     // Retry alloc after victim suspension freed pages.
                     if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(num_pages) {
+                        // tracing::warn!("[CONTENTION] EVICT_OK: pid={} got {} pages after {} rounds | free_after={}",
+                        //     &pid.to_string()[..8], num_pages, eviction_rounds, free_after);
                         alloc_result = Some(pages);
                         break;
                     }
@@ -281,11 +287,15 @@ impl ContextManager {
                     if has_deferred {
                         let free_now = self.devices[dev_idx].available_gpu_pages();
                         if free_now + deferred_pages >= num_pages {
+                            // tracing::warn!("[CONTENTION] EVICT_DEFER: pid={} wait for deferred ({} free + {} deferred >= {} needed) after {} rounds",
+                            //     &pid.to_string()[..8], free_now, deferred_pages, num_pages, eviction_rounds);
                             break;
                         }
                     }
                 }
-                None => break,
+                None => {
+                    break;
+                },
             }
         }
 
@@ -303,11 +313,17 @@ impl ContextManager {
 
         if has_deferred {
             // Step 4: Deferred pages from Pinned contexts will cover the gap.
+            // tracing::warn!("[CONTENTION] ALLOC_Q: pid={} enqueued in alloc_queue (need={}) | aq_len={}",
+            //     &pid.to_string()[..8], num_pages, self.alloc_queue.len() + 1);
             self.alloc_queue.push_back(pending);
             return;
         }
 
         // Step 5: NO VICTIM — requester self-suspends.
+        // tracing::warn!("[CONTENTION] SELF_SUSPEND: pid={} (floor={:.2}) no victim, self-suspending | free={} rq={} procs={}",
+        //     &pid.to_string()[..8], requester_floor,
+        //     self.devices[dev_idx].available_gpu_pages(),
+        //     self.restore_queue.len(), self.processes.len());
         let (pinned, _) = self.suspend_process(pid);
         self.enqueue_restore(pid, requester_floor, pinned);
         self.process_entry(pid).deferred_ops.push(pending);
@@ -430,6 +446,10 @@ impl ContextManager {
             }
         }
         self.alloc_queue = kept;
+
+        // tracing::warn!("[CONTENTION] SUSPEND: pid={} active={} pinned={} ctxs={} | deferred_ops={}",
+        //     &pid.to_string()[..8], active_count, pinned_count, ctx_ids.len(),
+        //     self.processes.get(&pid).map(|p| p.deferred_ops.len()).unwrap_or(0));
 
         (pinned_count, active_count)
     }

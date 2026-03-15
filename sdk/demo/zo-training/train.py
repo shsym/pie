@@ -25,7 +25,9 @@ Usage::
 
 import argparse
 import asyncio
+import csv
 import json
+import os
 import time
 import sys
 from collections import defaultdict
@@ -54,10 +56,11 @@ class TrainingConfig:
 
     # --- Mode ---
     local: bool = False
-    model: str = "Qwen/Qwen3-0.6B"
+    model: str = "meta-llama/Llama-3.2-1B-Instruct"
     device: str = "cuda:0"
     gpu_mem_util: float = 0.8
-    cpu_mem_budget: int = 8
+    cpu_mem_budget: int = 12
+    max_concurrent_processes: int = 256
 
     # --- Server (distributed mode) ---
     servers: list[str] = field(default_factory=lambda: ["ws://127.0.0.1:8080"])
@@ -78,7 +81,7 @@ class TrainingConfig:
     # --- ES Hyperparameters ---
     adapter_name: str = ""
     training_steps: int = 10000
-    population_size: int = 512
+    population_size: int = 2048
     tasks_per_seed: int = 4
     lora_rank: int = 8
     lora_alpha: float = 16.0
@@ -103,7 +106,7 @@ class TrainingConfig:
 
     def __post_init__(self):
         if not self.adapter_name:
-            self.adapter_name = f"evo-{self.dataset}-v1"
+            self.adapter_name = f"evo-{self.dataset}-v2"
 
 
 # =============================================================================
@@ -191,11 +194,24 @@ async def run_rollouts(
     )
 
     texts_out, seeds_out, tasks_out = [], [], []
+    latencies = []
+    output_lens = []
     pbar = tqdm(total=len(inputs), desc=desc, dynamic_ncols=True, leave=False, file=sys.stdout)
 
     async def _tracked(client, inp, seed, task):
         """Launch one process and update the progress bar on completion."""
+        t0 = time.time()
         res_json = await launch_and_collect(client, inferlet, inp)
+        elapsed = time.time() - t0
+        latencies.append(elapsed)
+        if res_json:
+            try:
+                texts = json.loads(res_json)
+                if isinstance(texts, list):
+                    for t in texts:
+                        output_lens.append(len(t))
+            except (json.JSONDecodeError, TypeError):
+                pass
         pbar.update(1)
         return seed, task, res_json
 
@@ -206,6 +222,26 @@ async def run_rollouts(
 
     results = await asyncio.gather(*coros)
     pbar.close()
+
+    # Write diagnostic summary
+    if latencies:
+        arr = np.array(latencies)
+        diag = (
+            f"[{desc}] n={len(arr)} | "
+            f"lat min={np.min(arr):.1f} P50={np.percentile(arr,50):.1f} "
+            f"P90={np.percentile(arr,90):.1f} P99={np.percentile(arr,99):.1f} "
+            f"max={np.max(arr):.1f}s"
+        )
+        if output_lens:
+            olen = np.array(output_lens)
+            diag += (
+                f" | out_chars mean={np.mean(olen):.0f} "
+                f"P90={np.percentile(olen,90):.0f} max={np.max(olen)}"
+            )
+        diag += "\n"
+        with open("/tmp/train_diag.log", "a") as f:
+            f.write(diag)
+        tqdm.write(diag.strip())
 
     for seed, task, res_json in results:
         if res_json:
@@ -268,6 +304,7 @@ class ESTrainer:
         cfg = Config(
             port=0,
             auth=AuthConfig(enabled=False),
+            max_concurrent_processes=self.config.max_concurrent_processes,
             models=[ModelConfig(
                 hf_repo=self.config.model,
                 device=device,
@@ -365,7 +402,7 @@ class ESTrainer:
             )
 
             # Score and aggregate
-            scores, metrics = self._score(base_seeds, results)
+            scores, metrics = self._score(base_seeds, results, step)
 
             # Update phase
             await self._update(base_seeds, scores, step)
@@ -394,7 +431,7 @@ class ESTrainer:
 
     # -- Scoring --------------------------------------------------------------
 
-    def _score(self, base_seeds, rollout_results) -> tuple[list[float], dict]:
+    def _score(self, base_seeds, rollout_results, step: int = 0) -> tuple[list[float], dict]:
         """Score generations and aggregate by seed."""
         reward_infos = [
             task["verifier"](text)
@@ -403,6 +440,11 @@ class ESTrainer:
         scores = [float(ri.get("reward", 0.0)) for ri in reward_infos]
         format_rewards = [float(ri.get("format_reward", 0.0)) for ri in reward_infos]
         answer_rewards = [float(ri.get("answer_reward", 0.0)) for ri in reward_infos]
+
+        # Save input-output pairs to CSV
+        self._save_rollout_csv(
+            step, rollout_results, scores, format_rewards, answer_rewards,
+        )
 
         by_seed = defaultdict(list)
         for s, sc in zip(rollout_results["seeds"], scores):
@@ -433,6 +475,32 @@ class ESTrainer:
             "rollout/missing_seeds": missing,
         }
         return aggregated, metrics
+
+    def _save_rollout_csv(
+        self, step: int, rollout_results: dict,
+        scores: list[float], format_rewards: list[float], answer_rewards: list[float],
+    ) -> None:
+        """Save input-output response pairs to a CSV for debugging."""
+        log_dir = "rollout_logs"
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, f"rollouts_step_{step}.csv")
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "seed", "problem", "response", "reward",
+                "format_reward", "answer_reward", "response_len",
+            ])
+            for i, (text, task, seed) in enumerate(
+                zip(rollout_results["texts"], rollout_results["tasks"], rollout_results["seeds"])
+            ):
+                problem = task.get("problem", str(task))
+                writer.writerow([
+                    int(seed), problem, text, scores[i],
+                    format_rewards[i], answer_rewards[i], len(text.split()),
+                ])
+
+        tqdm.write(f"📝 Saved {len(scores)} rollouts → {path}")
 
     # -- Update ---------------------------------------------------------------
 
@@ -494,17 +562,18 @@ def parse_args() -> TrainingConfig:
                    help="Remote server URIs (distributed mode)")
 
     # Model / device (local mode)
-    p.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
+    p.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct", help="HuggingFace model ID")
     p.add_argument("--device", default="cuda:0", help="Device(s), comma-separated")
     p.add_argument("--gpu-mem-util", type=float, default=0.8)
-    p.add_argument("--cpu-mem-budget", type=int, default=8)
+    p.add_argument("--cpu-mem-budget", type=int, default=12)
+    p.add_argument("--max-concurrent-processes", type=int, default=256)
 
     # Dataset
     p.add_argument("--dataset", default="math", choices=["math", "countdown"])
     p.add_argument("--data-path", default="./Countdown-Tasks-3to4")
 
     # ES hyperparameters
-    p.add_argument("--population-size", type=int, default=512)
+    p.add_argument("--population-size", type=int, default=2048)
     p.add_argument("--tasks-per-seed", type=int, default=4)
     p.add_argument("--training-steps", type=int, default=10000)
     p.add_argument("--lora-rank", type=int, default=8)
@@ -512,7 +581,7 @@ def parse_args() -> TrainingConfig:
     p.add_argument("--initial-sigma", type=float, default=0.005)
     p.add_argument("--max-sigma", type=float, default=0.014)
     p.add_argument("--mu-fraction", type=float, default=0.5)
-    p.add_argument("--max-tokens", type=int, default=1024)
+    p.add_argument("--max-tokens", type=int, default=512)
 
     # Evaluation
     p.add_argument("--test-size", type=int, default=100)
@@ -527,6 +596,7 @@ def parse_args() -> TrainingConfig:
         device=args.device,
         gpu_mem_util=args.gpu_mem_util,
         cpu_mem_budget=args.cpu_mem_budget,
+        max_concurrent_processes=args.max_concurrent_processes,
         servers=args.servers,
         dataset=args.dataset,
         data_path=args.data_path,

@@ -108,6 +108,9 @@ impl ContextManager {
             .map(|p| p.context_ids.clone())
             .ok_or_else(|| anyhow::anyhow!("Process not found"))?;
 
+        let _deferred_count = self.processes.get(&pid)
+            .map(|p| p.deferred_ops.len()).unwrap_or(0);
+
         let mut replay_count: usize = 0;
 
         // Restore all suspended contexts
@@ -133,6 +136,10 @@ impl ContextManager {
             proc.state = ProcessState::Running;
             proc.pending_replay_count = replay_count;
         }
+
+        // tracing::debug!("[LIFECYCLE] RESTORE_ALL: pid={} ctxs={} replays={} deferred={} | free={:?}",
+        //     &pid.to_string()[..8], ctx_ids.len(), replay_count, deferred_count,
+        //     self.devices.iter().map(|d| d.available_gpu_pages()).collect::<Vec<_>>());
 
         // If no replays needed, fire deferred ops immediately (no ReplayComplete coming)
         if replay_count == 0 {
