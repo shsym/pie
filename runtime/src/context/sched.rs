@@ -56,6 +56,9 @@ pub(crate) struct ProcessEntry {
     /// SRPT weight: `total_steps / remaining_steps` for the owning workflow.
     /// Higher = workflow closer to completion = harder to evict. Default 1.0.
     pub weight: f64,
+    /// Credit balance (global, usable on any device).
+    /// Set at admission; debited by rent, credited by interest.
+    pub balance: f64,
     /// Per-device page accounting.
     pub devices: HashMap<DeviceId, DevicePages>,
     /// Birth timestamp — used as FCFS tiebreaker at equal invested importance.
@@ -80,6 +83,7 @@ impl ProcessEntry {
     fn new() -> Self {
         ProcessEntry {
             weight: 1.0,
+            balance: 0.0,
             devices: HashMap::new(),
             created_at: Instant::now(),
             state: ProcessState::Running,

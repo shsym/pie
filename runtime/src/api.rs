@@ -6,6 +6,7 @@ pub mod messaging;
 pub mod session;
 pub mod adapter;
 pub mod runtime;
+pub mod scheduling;
 
 pub mod mcp;
 pub mod zo;
@@ -63,6 +64,7 @@ where
         + pie::core::session::Host
         + pie::core::adapter::Host
         + pie::core::runtime::Host
+        + pie::core::scheduling::Host
         + pie::mcp::types::Host
         + pie::mcp::client::Host
         + pie::zo::zo::Host
@@ -78,6 +80,7 @@ where
     pie::core::session::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::adapter::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::runtime::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
+    pie::core::scheduling::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::client::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::zo::zo::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
