@@ -1,7 +1,6 @@
 from __future__ import annotations
 import io
 import os
-import time
 import torch
 import torch.nn as nn
 import math
@@ -102,9 +101,6 @@ class AdapterSubpass:
                 qkv_down, [rank_lora, rank_lora, rank_lora], dim=-1
             )
 
-            # Determine if we should inject noise for this request slice
-            layer_seeds = rand_seeds - layer_idx
-            # inject_noise = (layer_seeds != 0).any().item()
             # Only inject noise if CUDA/Triton is available (rand_mv requires CUDA)
             inject_noise = RAND_MV_AVAILABLE
 
@@ -252,8 +248,6 @@ class CmaesAdapter(Adapter):
     min_var: float
     max_var: float
 
-    # qkv_down_weight: list[torch.Tensor]
-    # qkv_up_weight: list[torch.Tensor]
     qkv_down_sigma: list[torch.Tensor]
     qkv_up_sigma: list[torch.Tensor]
 
@@ -296,6 +290,7 @@ class CmaesAdapter(Adapter):
         # CMA-ES default knobs (can be overridden from outside if desired)
         self.population_size = population_size
         self.mu_fraction = mu_fraction
+
         self.initial_sigma = initial_sigma
         self.min_sigma = min_sigma
         self.min_var = min_var
@@ -332,8 +327,6 @@ class CmaesAdapter(Adapter):
             self.adapter_at_layer[i][0][self.adapter_id].copy_(qkv_down_weight)
             self.adapter_at_layer[i][1][self.adapter_id].copy_(qkv_up_weight)
 
-            # self.qkv_down_weight.append(qkv_down_weight)
-            # self.qkv_up_weight.append(qkv_up_weight)
             self.qkv_down_sigma.append(qkv_down_sigma)
             self.qkv_up_sigma.append(qkv_up_sigma)
 
@@ -407,25 +400,9 @@ class CmaesAdapter(Adapter):
         ]
 
     def upload(self, name: str, data: bytes) -> None:
-        """
-        Loads the adapter's state from a file and populates its parameters and state.
-
-        The 'data' parameter, if provided, is treated as a bytes buffer containing the checkpoint.
-        If 'data' is empty, it falls back to loading from f"adapter_{name}.pt".
-        """
-        state_dict = None
-        # if data:
-        #     try:
-        #         # print(f"Loading adapter {name} from memory ({len(data)} bytes)...")
-        #         buffer = io.BytesIO(data)
-        #         state_dict = torch.load(buffer, map_location=self.device)
-        #     except Exception as e:
-        #         print(f"Failed to load adapter from memory: {e}. Falling back to file.")
-
-        if state_dict is None:
-            filename = os.path.join(self.adapter_path, f"adapter_{name}.pt")
-            # print("Loading adapter from", filename)
-            state_dict = torch.load(filename, map_location=self.device)
+        """Load the adapter's state from ``adapter_{name}.pt``."""
+        filename = os.path.join(self.adapter_path, f"adapter_{name}.pt")
+        state_dict = torch.load(filename, map_location=self.device)
 
         # --- Verification ---
         # Ensure the loaded checkpoint is compatible with this adapter instance.
@@ -510,7 +487,7 @@ class CmaesAdapter(Adapter):
 
         filename = os.path.join(self.adapter_path, f"adapter_{name}.pt")
         os.makedirs(self.adapter_path, exist_ok=True)
-        # print("Saving adapter to", filename)
+
         # Extract the weight tensors for this specific adapter.
         # We use .clone().cpu() for safe, device-independent saving.
         qkv_down_weight = [
@@ -663,10 +640,10 @@ class CmaesAdapter(Adapter):
             # ===== Recombine means (parents = mean + noise) =====
             mean_down_old = self.adapter_at_layer[layer_idx][0][self.adapter_id].to(
                 f32
-            )  # self.qkv_down_weight[layer_idx].to(f32)  # (I, 3*rank)
+            )  # (I, 3*rank)
             mean_up_old = self.adapter_at_layer[layer_idx][1][self.adapter_id].to(
                 f32
-            )  # self.qkv_up_weight[layer_idx].to(f32)  # (rank, d_sum)
+            )  # (rank, d_sum)
 
             parents_down = mean_down_old.unsqueeze(0) + Wd  # (µ, I, 3*rank)
             parents_up = mean_up_old.unsqueeze(0) + Wu  # (µ, rank, d_sum)

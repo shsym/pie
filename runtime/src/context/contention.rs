@@ -56,8 +56,6 @@ use std::fmt;
 use std::time::Instant;
 
 
-
-use crate::device;
 use crate::process::ProcessId;
 
 use super::{
@@ -235,6 +233,10 @@ impl ContextManager {
                 .map(|p| p.pending_pinned == 0).unwrap_or(true);
             if top_ready && requester_floor < top.effective_priority() {
                 // Requester loses priority gate → suspend and enqueue in restore_queue.
+                // tracing::warn!("[CONTENTION] PRIORITY_GATE: pid={} floor={:.2} < top={:.2} (top_pid={}) → self-suspend | free={} rq={} aq={}",
+                //     &pid.to_string()[..8], requester_floor, top.effective_priority(), &top_pid.to_string()[..8],
+                //     self.devices[dev_idx].available_gpu_pages(),
+                //     self.restore_queue.len(), self.alloc_queue.len());
                 let pending = PendingAlloc {
                     device: dev_idx, num_pages, context_id, priority_floor: requester_floor,
                     on_alloc: Box::new(on_alloc),
@@ -274,6 +276,8 @@ impl ContextManager {
 
                     // Retry alloc after victim suspension freed pages.
                     if let Some(pages) = self.devices[dev_idx].alloc_gpu_pages(num_pages) {
+                        // tracing::warn!("[CONTENTION] EVICT_OK: pid={} got {} pages after {} rounds | free_after={}",
+                        //     &pid.to_string()[..8], num_pages, eviction_rounds, free_after);
                         alloc_result = Some(pages);
                         break;
                     }
@@ -281,11 +285,15 @@ impl ContextManager {
                     if has_deferred {
                         let free_now = self.devices[dev_idx].available_gpu_pages();
                         if free_now + deferred_pages >= num_pages {
+                            // tracing::warn!("[CONTENTION] EVICT_DEFER: pid={} wait for deferred ({} free + {} deferred >= {} needed) after {} rounds",
+                            //     &pid.to_string()[..8], free_now, deferred_pages, num_pages, eviction_rounds);
                             break;
                         }
                     }
                 }
-                None => break,
+                None => {
+                    break;
+                },
             }
         }
 
@@ -303,11 +311,17 @@ impl ContextManager {
 
         if has_deferred {
             // Step 4: Deferred pages from Pinned contexts will cover the gap.
+            // tracing::warn!("[CONTENTION] ALLOC_Q: pid={} enqueued in alloc_queue (need={}) | aq_len={}",
+            //     &pid.to_string()[..8], num_pages, self.alloc_queue.len() + 1);
             self.alloc_queue.push_back(pending);
             return;
         }
 
         // Step 5: NO VICTIM — requester self-suspends.
+        // tracing::warn!("[CONTENTION] SELF_SUSPEND: pid={} (floor={:.2}) no victim, self-suspending | free={} rq={} procs={}",
+        //     &pid.to_string()[..8], requester_floor,
+        //     self.devices[dev_idx].available_gpu_pages(),
+        //     self.restore_queue.len(), self.processes.len());
         let (pinned, _) = self.suspend_process(pid);
         self.enqueue_restore(pid, requester_floor, pinned);
         self.process_entry(pid).deferred_ops.push(pending);
@@ -431,6 +445,10 @@ impl ContextManager {
         }
         self.alloc_queue = kept;
 
+        // tracing::warn!("[CONTENTION] SUSPEND: pid={} active={} pinned={} ctxs={} | deferred_ops={}",
+        //     &pid.to_string()[..8], active_count, pinned_count, ctx_ids.len(),
+        //     self.processes.get(&pid).map(|p| p.deferred_ops.len()).unwrap_or(0));
+
         (pinned_count, active_count)
     }
 
@@ -486,7 +504,11 @@ impl ContextManager {
         }
     }
 
-    /// Suspend a single Active context: swap working pages GPU→CPU, release chain.
+    /// Suspend a single Active context: free working pages, release chain.
+    ///
+    /// Working pages are recomputable from `working_page_tokens` on restore,
+    /// so we just free them from GPU (no D2H stash to CPU needed).
+    /// `suspended_working_count` records how many pages to re-allocate.
     pub(crate) fn suspend_context(&mut self, ctx_id: ContextId) {
         let (dev_idx, working, committed_hashes) = match self.contexts.get(&ctx_id) {
             Some(ctx) if ctx.is_active() || ctx.is_pinned() => {
@@ -495,32 +517,14 @@ impl ContextManager {
             _ => return,
         };
 
-        // Phase 1: Swap working pages to CPU
+        // Phase 1: Free working pages from GPU.
+        // KV data will be recomputed from working_page_tokens on restore.
         if !working.is_empty() {
-            let dev = &mut self.devices[dev_idx];
-            match dev.alloc_cpu_pages(working.len()) {
-                Some(cpu_pages) => {
-                    // Copy GPU → CPU, then free GPU pages
-                    let _ = device::copy_d2h(dev_idx, &working, &cpu_pages);
-                    self.devices[dev_idx].free_gpu_pages(&working);
-
-                    if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                        ctx.working_pages = cpu_pages;
-                    }
-                }
-                None => {
-                    tracing::error!(ctx = ctx_id, "suspend swap failed: no free CPU pages");
-                    // Continue with suspension anyway — lose working pages
-                    let pages_to_free = if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                        let pages = ctx.working_pages.clone();
-                        ctx.working_pages.clear();
-                        pages
-                    } else {
-                        Vec::new()
-                    };
-                    self.devices[dev_idx].free_gpu_pages(&pages_to_free);
-                }
+            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                ctx.suspended_working_count = ctx.working_pages.len();
+                ctx.working_pages.clear();
             }
+            self.devices[dev_idx].free_gpu_pages(&working);
         }
 
         // Phase 2: Release committed chain refcounts

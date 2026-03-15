@@ -387,20 +387,20 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         match inference::submit(model_id, request, device_idx, physical_page_ids.clone(), last_page_len).await {
             Ok(output) => {
                 // Diagnostic: log prefill metadata to trace corruption
-                if num_input_tokens > 1 {
-                    eprintln!(
-                        "PREFILL_RESULT ctx={context_id} kv={kv_len} np={num_pages} \
-                         inp={num_input_tokens} lpl={last_page_len} pages={physical_page_ids:?}"
-                    );
-                }
+                // if num_input_tokens > 1 {
+                //     eprintln!(
+                //         "PREFILL_RESULT ctx={context_id} kv={kv_len} np={num_pages} \
+                //          inp={num_input_tokens} lpl={last_page_len} pages={physical_page_ids:?}"
+                //     );
+                // }
                 // Diagnostic: log first decode step metadata
-                if num_input_tokens == 1 && kv_len < 45 {
-                    eprintln!(
-                        "DECODE_STEP ctx={context_id} kv={kv_len} np={num_pages} \
-                         lpl={last_page_len} pos={:?} pages={physical_page_ids:?}",
-                        fill_positions,
-                    );
-                }
+                // if num_input_tokens == 1 && kv_len < 45 {
+                //     eprintln!(
+                //         "DECODE_STEP ctx={context_id} kv={kv_len} np={num_pages} \
+                //          lpl={last_page_len} pos={:?} pages={physical_page_ids:?}",
+                //         fill_positions,
+                //     );
+                // }
                 // Step 3: Mark input tokens as forwarded WHILE still Pinned
                 // (non-evictable).  This ensures working_page_tokens + lineage are consistent
                 // before the context becomes Active (evictable).

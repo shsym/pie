@@ -43,8 +43,10 @@
 //!
 //! **Working pages** (`working_pages: Vec<PhysicalPageId>`):
 //! - GPU-exclusive, mutable, owned by one context.
-//! - On suspend: D2H copy to CPU swap pool. On restore: H2D back.
-//! - If CPU swap pool full: OOM. Working pages are NOT replayable.
+//! - On suspend: freed from GPU. On restore: recomputed via replay
+//!   using `working_page_tokens` (the token metadata survives suspension).
+//! - Pages with no corresponding tokens are empty capacity reservations
+//!   and are simply re-allocated fresh on restore.
 //!
 //! **Committed pages** (content-addressed via chained `PageHash`):
 //! - Shared across contexts via refcount in PageStore (Radix Trie).
@@ -95,7 +97,7 @@ use crate::process::ProcessId;
 use crate::device::{self, DeviceId};
 
 use pagestore::{PhysicalPageId, PageHash, PageStore};
-use sched::ProcessEntry;
+use sched::{ProcessEntry, ProcessState};
 
 use contention::{PendingAlloc, PendingRestore};
 
@@ -334,8 +336,12 @@ pub(crate) struct Context {
     /// Device this context is on (None if fully evicted).
     pub device: Option<DeviceId>,
     /// Physical page IDs for uncommitted (working) pages.
-    /// On GPU when Active/Pinned, on CPU when Suspended.
+    /// On GPU when Active/Pinned, empty when Suspended.
     pub working_pages: Vec<PhysicalPageId>,
+    /// Number of working pages at suspension time. Used during restore
+    /// to re-allocate the right number of fresh GPU pages (since
+    /// `working_pages` is cleared on suspend instead of swapped to CPU).
+    pub suspended_working_count: usize,
     /// Ordered committed page hashes (root-to-tip). Replaces committed_tip + committed_len.
     pub committed_hashes: Vec<PageHash>,
     /// Full token lineage for replay after eviction.
@@ -362,6 +368,7 @@ impl Context {
             owner,
             device: None,
             working_pages: Vec::new(),
+            suspended_working_count: 0,
             committed_hashes: Vec::new(),
             lineage: Vec::new(),
             working_page_tokens: Vec::new(),
@@ -380,6 +387,14 @@ impl Context {
     pub fn committed_tip(&self) -> Option<PageHash> { self.committed_hashes.last().copied() }
     /// Number of committed pages.
     pub fn committed_len(&self) -> usize { self.committed_hashes.len() }
+
+    /// Number of working pages whose KV data can be recomputed from
+    /// `working_page_tokens` via a replay forward pass.
+    /// Remaining pages (if any) are empty capacity reservations.
+    pub fn recomputable_working_pages(&self, page_size: usize) -> usize {
+        if page_size == 0 { return 0; }
+        (self.working_page_tokens.len() + page_size - 1) / page_size
+    }
 }
 
 // =============================================================================
@@ -404,6 +419,11 @@ pub(crate) struct ContextManager {
 }
 
 impl ContextManager {
+    /// Maximum GPU page utilization before `drain_queues` stops restoring
+    /// suspended processes. Keeps a headroom buffer (1 - cap) so running
+    /// processes can allocate pages without triggering eviction cascades.
+    const RESTORE_UTILIZATION_CAP: f64 = 0.99;
+
     pub(crate) fn new(model_idx: usize, page_size: usize, num_gpu_pages: &[usize], num_cpu_pages: &[usize]) -> Self {
         let devices: Vec<_> = num_gpu_pages.iter().zip(num_cpu_pages.iter())
             .map(|(&gpu, &cpu)| PageStore::new(page_size, gpu, cpu))
@@ -415,6 +435,78 @@ impl ContextManager {
             contexts: HashMap::new(),
             alloc_queue: VecDeque::new(),
             restore_queue: BinaryHeap::new(),
+        }
+    }
+
+    /// Comprehensive GPU page audit: accounts for every allocated page.
+    /// free + trie_pages + working_active + working_pinned = total (if balanced).
+    /// Any gap = leaked pages.
+    #[allow(dead_code, unused_variables)]
+    pub(crate) fn page_audit(&self) {
+        for (dev_idx, dev) in self.devices.iter().enumerate() {
+            let free = dev.available_gpu_pages();
+            let total = dev.total_gpu_pages();
+            let (trie_pages, trie_rc, trie_nodes, rc0_interior) = dev.trie_stats();
+
+            let mut working_active = 0usize;
+            let mut working_pinned = 0usize;
+            let mut working_suspended = 0usize; // should be 0 (suspended = CPU)
+            let mut committed_active = 0usize;  // committed hashes held by active contexts
+            let mut committed_pinned = 0usize;
+            let mut n_active = 0usize;
+            let mut n_pinned = 0usize;
+            let mut n_suspended = 0usize;
+
+            for ctx in self.contexts.values() {
+                let ctx_dev = ctx.device.unwrap_or(0) as usize;
+                if ctx_dev != dev_idx { continue; }
+                match ctx.state {
+                    ContextState::Active => {
+                        working_active += ctx.working_pages.len();
+                        committed_active += ctx.committed_hashes.len();
+                        n_active += 1;
+                    }
+                    ContextState::Pinned => {
+                        working_pinned += ctx.working_pages.len();
+                        committed_pinned += ctx.committed_hashes.len();
+                        n_pinned += 1;
+                    }
+                    ContextState::Suspended => {
+                        working_suspended += ctx.working_pages.len();
+                        n_suspended += 1;
+                    }
+                }
+            }
+
+            let accounted = free + trie_pages + working_active + working_pinned;
+            let leaked = if total > accounted { total - accounted } else { 0 };
+            let over = if accounted > total { accounted - total } else { 0 };
+            let (alloc_tot, free_tot) = dev.pool_stats();
+            let (f_reclaim, f_release, f_working) = dev.tag_stats();
+
+            // tracing::debug!(
+            //     "[PAGE_AUDIT] dev={} total={} | free={} trie={} work_active={} work_pinned={} | accounted={} LEAKED={} OVER={} | \\
+            //      pool: alloc={} free={} net={} | tags: reclaim={} release={} working={} | \\
+            //      ctxs: active={} pinned={} suspended={} | commit_active={} commit_pinned={} | \\
+            //      trie: rc={} nodes={} rc0_int={} | rq={} aq={}",
+            //     dev_idx, total, free, trie_pages, working_active, working_pinned,
+            //     accounted, leaked, over,
+            //     alloc_tot, free_tot, alloc_tot as isize - free_tot as isize,
+            //     f_reclaim, f_release, f_working,
+            //     n_active, n_pinned, n_suspended,
+            //     committed_active, committed_pinned,
+            //     trie_rc, trie_nodes, rc0_interior,
+            //     self.restore_queue.len(), self.alloc_queue.len(),
+            // );
+
+            // When overcounting is detected, identify phantom pages
+            if over > 0 {
+                let (phantom_count, phantom_desc) = dev.phantom_audit();
+                if phantom_count > 0 {
+                    tracing::error!("[PHANTOM_AUDIT] dev={} phantom_count={} pages=[{}]",
+                        dev_idx, phantom_count, phantom_desc);
+                }
+            }
         }
     }
 
@@ -486,10 +578,8 @@ impl ContextManager {
             self.devices[dev_idx].release(&ctx.committed_hashes);
         }
 
-        // Free working pages (GPU or CPU depending on state)
-        if ctx.is_suspended() {
-            self.devices[dev_idx].free_cpu_pages(&ctx.working_pages);
-        } else {
+        // Free working pages (GPU when Active/Pinned; empty when Suspended).
+        if !ctx.working_pages.is_empty() {
             self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
         }
 
@@ -507,6 +597,10 @@ impl ContextManager {
             None => return,
         };
 
+        let _num_ctxs = proc.context_ids.len();
+        let _num_deferred = proc.deferred_ops.len();
+        let _was_pending = proc.state == ProcessState::Pending;
+
         // Drop stale PendingAlloc entries from alloc_queue for this process's contexts.
         let ctx_ids: std::collections::HashSet<ContextId> = proc.context_ids.iter().copied().collect();
         self.alloc_queue.retain(|pa| {
@@ -517,20 +611,27 @@ impl ContextManager {
         self.restore_queue.retain(|w| w.process_id != pid);
 
         // Destroy all owned contexts
+        let mut _pages_freed = 0usize;
         for ctx_id in proc.context_ids {
             if let Some(ctx) = self.contexts.remove(&ctx_id) {
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
-                    self.devices[dev_idx].release(&ctx.committed_hashes);
+                    _pages_freed += self.devices[dev_idx].release(&ctx.committed_hashes);
                 }
-                if ctx.is_suspended() {
-                    self.devices[dev_idx].free_cpu_pages(&ctx.working_pages);
-                } else {
+                if !ctx.working_pages.is_empty() {
+                    _pages_freed += ctx.working_pages.len();
                     self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
                 }
                 self.snapshots.retain(|_, v| *v != ctx_id);
             }
         }
+
+        // tracing::debug!("[LIFECYCLE] DESTROY_ALL: pid={} ctxs={} deferred={} was_pending={} pages_freed={} | rq={} aq={} procs={} free={:?}",
+        //     &pid.to_string()[..8], num_ctxs, num_deferred, was_pending, pages_freed,
+        //     self.restore_queue.len(), self.alloc_queue.len(), self.processes.len(),
+        //     self.devices.iter().map(|d| d.available_gpu_pages()).collect::<Vec<_>>());
+
+        // self.page_audit();
 
         self.drain_queues();
     }
@@ -592,7 +693,7 @@ impl ContextManager {
         ctx.working_page_tokens.truncate(len.saturating_sub(tokens_to_remove));
 
         if ctx.is_suspended() {
-            self.devices[dev_idx].free_cpu_pages(&to_free);
+            // Suspended contexts have empty working_pages — nothing to free.
         } else {
             self.devices[dev_idx].free_gpu_pages(&to_free);
             if let Some(pid) = ctx.owner {
@@ -607,8 +708,16 @@ impl ContextManager {
         let page_size = self.page_size;
         let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         if num_pages == 0 { return Ok(()); }
-        if num_pages > ctx.working_pages.len() {
-            anyhow::bail!("commit: requested {num_pages}, have {}", ctx.working_pages.len());
+
+        // Suspended contexts have empty working_pages but track the count
+        // in suspended_working_count (working pages are recomputed on restore).
+        let available_pages = if ctx.is_suspended() {
+            ctx.suspended_working_count
+        } else {
+            ctx.working_pages.len()
+        };
+        if num_pages > available_pages {
+            anyhow::bail!("commit: requested {num_pages}, have {}", available_pages);
         }
 
         let total_tokens = num_pages * page_size;
@@ -618,7 +727,7 @@ impl ContextManager {
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let prev_hash = ctx.committed_tip().unwrap_or(0);
-        let pages = ctx.working_pages[..num_pages].to_vec();
+        let pages = ctx.working_pages.get(..num_pages).map(|s| s.to_vec()).unwrap_or_default();
 
         // Extract token data for the pages being committed.
         let mut tokens = Vec::with_capacity(total_tokens);
@@ -649,8 +758,9 @@ impl ContextManager {
 
         // Commit: physical (GPU promotion + dedup) or logical (metadata only).
         if ctx.is_suspended() {
-            // Suspended: no GPU pages, just free the CPU working pages.
-            dev.free_cpu_pages(&pages);
+            // Suspended: no physical pages to promote (working pages were freed
+            // on suspend). Metadata-only commit — on restore, the committed chain
+            // replay will regenerate these pages.
         } else {
             // Use extend to navigate the trie through the existing
             // committed chain before inserting new pages as children.
@@ -660,7 +770,11 @@ impl ContextManager {
         // Update context state.
         let ctx = self.contexts.get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context lost during commit"))?;
-        ctx.working_pages.drain(..num_pages);
+        if ctx.is_suspended() {
+            ctx.suspended_working_count = ctx.suspended_working_count.saturating_sub(num_pages);
+        } else {
+            ctx.working_pages.drain(..num_pages);
+        }
         ctx.working_page_tokens.drain(..total_tokens);
         ctx.committed_hashes.extend_from_slice(&hashes);
         ctx.max_committed_position = positions.iter().copied().max()
@@ -788,9 +902,6 @@ impl ContextManager {
     ///          process, then replay its deferred_op.
     pub(crate) fn drain_queues(&mut self) {
         // Phase 1: alloc_queue FIFO (head-of-line blocking).
-        // Only entries that were deferred due to Pinned context pages or
-        // fire_deferred_ops stalling end up here. Self-suspend in with_gpu_pages
-        // ensures the requester's pages are freed, so the queue naturally drains.
         while let Some(front) = self.alloc_queue.front() {
             let (dev_idx, n) = (front.device, front.num_pages);
             if self.devices[dev_idx].available_gpu_pages() < n {
@@ -811,11 +922,21 @@ impl ContextManager {
             let pid = top.process_id;
 
             // Wait if the process still has Pinned contexts mid-forward-pass.
-            // Pinned contexts clear quickly (one forward pass ≈ 500ms), and
-            // drain_queues is re-invoked on unpin. Breaking preserves priority
-            // ordering and avoids thrashing from restoring lower-priority
-            // processes that would immediately be evicted.
             if self.processes.get(&pid).map(|p| p.pending_pinned).unwrap_or(0) > 0 {
+                break;
+            }
+
+            // Hard admission control: don't restore when any device is near
+            // page capacity. This prevents over-admission that causes the
+            // thrashing cascade (evict→restore→re-evict cycle). Processes
+            // wait here until running processes complete and free pages,
+            // naturally dropping utilization below the threshold.
+            let over_capacity = self.devices.iter().any(|d| {
+                let (used, total) = d.stats();
+                let utilization = used as f64 / total.max(1) as f64;
+                utilization > Self::RESTORE_UTILIZATION_CAP
+            });
+            if over_capacity {
                 break;
             }
 

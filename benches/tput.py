@@ -62,7 +62,6 @@ async def run_benchmark(args):
     print(f"Model:       {args.model}")
     print(f"Device:      {device}")
     print(f"Requests:    {args.num_requests}")
-    print(f"Concurrency: {args.concurrency}")
     print(f"Max Tokens:  {args.max_tokens}")
     print(f"GPU Mem:     {args.gpu_mem_util}")
     print(f"Prompt:      {args.prompt!r}")
@@ -156,7 +155,7 @@ async def run_benchmark(args):
         print("Running", end="", flush=True)
         start = time.time()
 
-        workers = [asyncio.create_task(worker(i)) for i in range(args.concurrency)]
+        workers = [asyncio.create_task(worker(i)) for i in range(args.num_requests)]
         await asyncio.wait(workers)
 
         duration = time.time() - start
@@ -188,8 +187,7 @@ def main():
     parser = argparse.ArgumentParser(description="Pie Throughput Benchmark")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
     parser.add_argument("--device", default="cuda:0", help="Device(s), comma-separated (e.g. cuda:0,cuda:1)")
-    parser.add_argument("--num-requests", type=int, default=64, help="Total number of requests")
-    parser.add_argument("--concurrency", type=int, default=64, help="Concurrent requests")
+    parser.add_argument("--num-requests", type=int, default=64, help="Total number of concurrent requests")
     parser.add_argument("--prompt", default="Write a short story about a robot.", help="Prompt")
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens per request")
     parser.add_argument("--temperature", type=float, default=0.6, help="Temperature")
