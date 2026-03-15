@@ -231,4 +231,21 @@ impl pie::core::context::HostContext for InstanceState {
         context::truncate_working_page_tokens(ctx.model_id, ctx.context_id, new_count).await?;
         Ok(())
     }
+
+    async fn suspend(
+        &mut self,
+        this: Resource<Context>,
+    ) -> Result<Result<(), String>> {
+        let ctx = self.ctx().table.get(&this)?;
+        match context::suspend(ctx.model_id, ctx.context_id).await {
+            Ok(()) => Ok(Ok(())),
+            Err(e) => Ok(Err(e.to_string())),
+        }
+    }
+
+    async fn bid(&mut self, this: Resource<Context>, value: f64) -> Result<()> {
+        let ctx = self.ctx().table.get(&this)?;
+        let _ = context::set_bid(ctx.model_id, ctx.context_id, value).await;
+        Ok(())
+    }
 }

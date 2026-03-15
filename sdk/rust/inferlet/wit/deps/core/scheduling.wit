@@ -1,0 +1,25 @@
+interface scheduling {
+
+    // ── Market prices ──────────────────────────────────────────────
+
+    /// Cost per page per step to hold cache on given device + tier.
+    /// Zero at zero load, rises convexly with scarcity.
+    /// `tier` is "gpu" or "cpu".
+    keep: func(device: u32, tier: string) -> f64;
+
+    /// Cost to produce one token of KV cache on a device.
+    /// Floor at c_min when idle, diverges near full utilization.
+    make: func(device: u32) -> f64;
+
+    /// Global interest rate: total_rent_pool / total_idle_credits.
+    interest: func() -> f64;
+
+    /// Number of available devices.
+    list-devices: func() -> u32;
+
+    // ── Account ────────────────────────────────────────────────────
+
+    /// Current credit balance (global, usable on any device).
+    balance: func() -> f64;
+
+}

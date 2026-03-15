@@ -79,6 +79,7 @@
 // commits and dedup correctly, all operations O(depth).
 pub mod pagestore;
 pub(crate) mod sched;
+pub(crate) mod pricing;
 mod contention;
 mod snapshot;
 mod restore;
@@ -98,6 +99,7 @@ use crate::device::{self, DeviceId};
 
 use pagestore::{PhysicalPageId, PageHash, PageStore};
 use sched::{ProcessEntry, ProcessState};
+use pricing::MarketState;
 
 use contention::{PendingAlloc, PendingRestore};
 
@@ -233,6 +235,44 @@ pub fn set_priority(weight: f64, pid_values: HashMap<ProcessId, f64>) {
     }
 }
 
+// ---------- Market (broadcast to all models) ----------
+
+/// Execute one market tick on all models.
+/// Called per batch step from the inference scheduler.
+pub fn tick() {
+    for model_idx in 0..SERVICES.len() {
+        let _ = SERVICES.send(model_idx, Message::Tick);
+    }
+}
+
+/// Get market state from a specific model's context manager.
+pub async fn get_market_state(model_idx: usize) -> pricing::MarketState {
+    let (tx, rx) = oneshot::channel();
+    let _ = SERVICES.send(model_idx, Message::GetMarketState { response: tx });
+    rx.await.unwrap_or_else(|_| pricing::MarketState::new(0))
+}
+
+/// Get a process's credit balance.
+pub async fn get_balance(model_idx: usize, pid: ProcessId) -> f64 {
+    let (tx, rx) = oneshot::channel();
+    let _ = SERVICES.send(model_idx, Message::GetBalance { pid, response: tx });
+    rx.await.unwrap_or(0.0)
+}
+
+/// Set a context's bid (willingness to pay per token per step).
+pub async fn set_bid(model_idx: usize, id: ContextId, bid: f64) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::SetBid { id, bid, response: tx })?;
+    rx.await.context("context::set_bid: actor dropped response")?
+}
+
+/// Suspend a context (program-initiated).
+pub async fn suspend(model_idx: usize, id: ContextId) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    SERVICES.send(model_idx, Message::Suspend { id, response: tx })?;
+    rx.await.context("context::suspend: actor dropped response")?
+}
+
 // ---------- Direct (no actor) ----------
 
 pub fn tokens_per_page(model_idx: usize) -> u32 {
@@ -360,6 +400,9 @@ pub(crate) struct Context {
     /// Actual suspension happens on clear_pinned.
     pub pending_suspend: bool,
     pub last_access: Instant,
+    /// Program-declared bid (willingness to pay per token per step).
+    /// 0.0 = no explicit bid; uses legacy weight-based scheduling.
+    pub bid: f64,
 }
 
 impl Context {
@@ -376,6 +419,7 @@ impl Context {
             state: ContextState::Active,
             pending_suspend: false,
             last_access: Instant::now(),
+            bid: 0.0,
         }
     }
 
@@ -416,6 +460,8 @@ pub(crate) struct ContextManager {
     pub(crate) alloc_queue: VecDeque<PendingAlloc>,
     /// Priority heap: Pending processes waiting for restoration.
     pub(crate) restore_queue: BinaryHeap<PendingRestore>,
+    /// Market state: per-device prices, interest rate.
+    pub(crate) market: MarketState,
 }
 
 impl ContextManager {
@@ -435,6 +481,7 @@ impl ContextManager {
             contexts: HashMap::new(),
             alloc_queue: VecDeque::new(),
             restore_queue: BinaryHeap::new(),
+            market: MarketState::new(num_gpu_pages.len()),
         }
     }
 
@@ -1062,6 +1109,18 @@ pub(crate) enum Message {
     DebugState { id: ContextId, response: oneshot::Sender<String> },
     SetPriority { weight: f64, pid_values: HashMap<ProcessId, f64> },
     DestroyAll { pid: ProcessId },
+
+    // ── Market messages ────────────────────────────────────────
+    /// Execute one market tick: compute prices, collect rent, distribute interest.
+    Tick,
+    /// Read current market state (prices, interest rate).
+    GetMarketState { response: oneshot::Sender<MarketState> },
+    /// Read a process's credit balance.
+    GetBalance { pid: ProcessId, response: oneshot::Sender<f64> },
+    /// Set a context's bid.
+    SetBid { id: ContextId, bid: f64, response: oneshot::Sender<Result<()>> },
+    /// Suspend a context (program-initiated).
+    Suspend { id: ContextId, response: oneshot::Sender<Result<()>> },
 }
 
 impl ServiceHandler for ContextManager {
@@ -1137,6 +1196,61 @@ impl ServiceHandler for ContextManager {
             }
             Message::DestroyAll { pid } => {
                 self.destroy_all(pid);
+            }
+
+            // ── Market handlers ────────────────────────────────────
+            Message::Tick => {
+                pricing::tick(&self.devices, &mut self.processes, &mut self.market);
+            }
+            Message::GetMarketState { response } => {
+                let _ = response.send(self.market.clone());
+            }
+            Message::GetBalance { pid, response } => {
+                let balance = self.processes.get(&pid)
+                    .map(|p| p.balance)
+                    .unwrap_or(0.0);
+                let _ = response.send(balance);
+            }
+            Message::SetBid { id, bid, response } => {
+                let result = match self.contexts.get_mut(&id) {
+                    Some(ctx) => { ctx.bid = bid; Ok(()) }
+                    None => Err(anyhow::anyhow!("Context {id} not found")),
+                };
+                let _ = response.send(result);
+            }
+            Message::Suspend { id, response } => {
+                let result = match self.contexts.get(&id) {
+                    Some(ctx) if ctx.is_active() => {
+                        let pid = ctx.owner;
+                        self.suspend_context(id);
+                        // If the process has all contexts suspended,
+                        // transition to Pending and enqueue for restoration.
+                        if let Some(pid) = pid {
+                            let all_suspended = self.processes.get(&pid)
+                                .map(|p| p.context_ids.iter().all(|&cid| {
+                                    self.contexts.get(&cid)
+                                        .map(|c| c.is_suspended())
+                                        .unwrap_or(true)
+                                }))
+                                .unwrap_or(true);
+                            if all_suspended {
+                                if let Some(proc) = self.processes.get_mut(&pid) {
+                                    proc.state = ProcessState::Pending;
+                                }
+                                let floor = self.processes.get(&pid)
+                                    .map(|p| p.weight)
+                                    .unwrap_or(0.0);
+                                self.enqueue_restore(pid, floor, 0);
+                            }
+                        }
+                        self.drain_queues();
+                        Ok(())
+                    }
+                    Some(ctx) if ctx.is_suspended() => Ok(()), // already suspended
+                    Some(_) => Err(anyhow::anyhow!("Context {id} is pinned, cannot voluntarily suspend")),
+                    None => Err(anyhow::anyhow!("Context {id} not found")),
+                };
+                let _ = response.send(result);
             }
         }
     }

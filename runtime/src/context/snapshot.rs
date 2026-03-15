@@ -131,6 +131,7 @@ impl ContextManager {
                     state: ContextState::Active, // may become Pinned below
                     pending_suspend: false,
                     last_access: Instant::now(),
+                    bid: 0.0,
                 });
 
                 // Spawn replay for committed suffix if needed.
@@ -223,6 +224,7 @@ impl ContextManager {
             state: snapshot_state,
             pending_suspend: false,
             last_access: Instant::now(),
+            bid: 0.0,
         });
         self.snapshots.insert((username, name.clone()), snapshot_id);
 
@@ -383,6 +385,7 @@ impl ContextManager {
                     state: ContextState::Active, // may become Pinned below
                     pending_suspend: false,
                     last_access: Instant::now(),
+                    bid: 0.0,
                 });
 
                 // Spawn replay for committed suffix if needed.

@@ -58,6 +58,18 @@ interface context {
         // Remove the last N tokens from working pages (for rollback, e.g. speculative rejection)
         truncate-working-page-tokens: func(num-tokens: u32);
 
+        // ── Market operations ──────────────────────────────────────
+
+        // Suspend this context (release pages, stop rent).
+        // Restoration is system-driven: highest-bid suspended contexts
+        // are restored when memory frees up.
+        suspend: func() -> result<_, error>;
+
+        // Set bid: willingness to pay per token per step.
+        // Drives suspension priority, restoration priority, and compute priority.
+        // 0.0 = use default (truthful) bidding.
+        bid: func(value: f64);
+
     }
 
 }
