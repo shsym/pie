@@ -52,7 +52,7 @@ impl ContextManager {
 
     /// Admission check: can this process be fully restored?
     /// Checks that all devices have enough free GPU pages for the process's
-    /// working pages (on CPU) plus replay pages plus deferred alloc requirements.
+    /// working pages (recomputed) plus replay pages plus deferred alloc requirements.
     pub(crate) fn can_restore_all(&mut self, pid: ProcessId) -> bool {
         let ctx_ids = match self.processes.get(&pid) {
             Some(p) => &p.context_ids,
@@ -66,8 +66,8 @@ impl ContextManager {
             if let Some(ctx) = self.contexts.get(&ctx_id) {
                 if !ctx.is_suspended() { continue; }
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
-                // Working pages on CPU that need GPU allocation for swap-in
-                *required.entry(dev_idx).or_insert(0) += ctx.working_pages.len();
+                // Working pages to re-allocate (recomputed via replay)
+                *required.entry(dev_idx).or_insert(0) += ctx.suspended_working_count;
                 // Pages needing replay: check prefix match, count missing suffix
                 if !ctx.committed_hashes.is_empty() {
                     let dev = &self.devices[dev_idx];
@@ -152,33 +152,34 @@ impl ContextManager {
 
     /// Restore a single suspended context.
     ///
-    /// Phase 1: Swap-in working pages from CPU → GPU
+    /// Phase 1: Allocate fresh GPU pages for working data (recomputed via replay)
     /// Phase 2: Acquire refcounts for GPU-resident committed prefix
     /// Phase 3: Eagerly promote suffix pages and spawn replay forward passes
+    ///          (includes working token replay after committed suffix)
     ///
     /// After this function returns, the context is fully restored from the
     /// metadata perspective. Forward passes fill KV data in the background
     /// while the context is Pinned.
     ///
     /// Returns `true` if replay forward passes were spawned, `false` if
-    /// full prefix match (no replay needed).
+    /// full prefix match (no replay needed) and no working tokens to recompute.
     pub(crate) fn restore(&mut self, ctx_id: ContextId) -> anyhow::Result<bool> {
         let ctx = self.contexts.get(&ctx_id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let cpu_pages = ctx.working_pages.clone();
+        let working_count = ctx.suspended_working_count;
         let committed_hashes = ctx.committed_hashes.clone();
 
-        // Phase 1: Swap-in working pages from CPU → GPU
-        if !cpu_pages.is_empty() {
+        // Phase 1: Allocate fresh GPU pages for working data.
+        // KV will be recomputed via replay using working_page_tokens.
+        if working_count > 0 {
             let dev = &mut self.devices[dev_idx];
-            let gpu_pages = dev.alloc_gpu_pages(cpu_pages.len())
-                .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working swap-in"))?;
-            let _ = crate::device::copy_h2d(dev_idx, &gpu_pages, &cpu_pages);
-            self.devices[dev_idx].free_cpu_pages(&cpu_pages);
+            let gpu_pages = dev.alloc_gpu_pages(working_count)
+                .ok_or_else(|| anyhow::anyhow!("No free GPU pages for working re-alloc"))?;
             if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
                 ctx.working_pages = gpu_pages;
+                ctx.suspended_working_count = 0;
             }
         }
 
@@ -216,6 +217,7 @@ impl ContextManager {
     ///
     /// Registers the provided `suffix_pages` in the page store for the suffix
     /// (pages not GPU-resident), then spawns a tokio task to fill KV data.
+    /// Also includes a final replay chunk for working page tokens if present.
     /// Returns `true` if any passes were spawned.
     ///
     /// All GPU page allocation must be done by the caller.
@@ -231,30 +233,34 @@ impl ContextManager {
         let lineage = ctx.lineage.clone();
         let committed_hashes = ctx.committed_hashes.clone();
         let committed_len = committed_hashes.len();
+        let working_page_tokens = ctx.working_page_tokens.clone();
+        let working_pages = ctx.working_pages.clone();
         let page_size = self.page_size;
 
-        if prefix_len >= committed_len {
+        if prefix_len >= committed_len && working_page_tokens.is_empty() {
             return Ok(false);
         }
 
         // Register pre-allocated suffix pages in the page store.
         // The forward pass will fill KV data; until then the context is Pinned.
         let suffix_count = committed_len - prefix_len;
-        let suffix_hashes = &committed_hashes[prefix_len..];
-        anyhow::ensure!(suffix_pages.len() == suffix_count,
-            "suffix page count mismatch: got {}, need {suffix_count}", suffix_pages.len());
-        let suffix_phys = suffix_pages;
+        if suffix_count > 0 {
+            let suffix_hashes = &committed_hashes[prefix_len..];
+            anyhow::ensure!(suffix_pages.len() == suffix_count,
+                "suffix page count mismatch: got {}, need {suffix_count}", suffix_pages.len());
+            let suffix_phys = suffix_pages;
 
-        // Register suffix pages in PageStore — navigate through the retained
-        // prefix so the trie correctly chains the suffix as children.
-        self.devices[dev_idx].extend(
-            &committed_hashes[..prefix_len],
-            suffix_hashes,
-            &suffix_phys,
-        );
+            // Register suffix pages in PageStore — navigate through the retained
+            // prefix so the trie correctly chains the suffix as children.
+            self.devices[dev_idx].extend(
+                &committed_hashes[..prefix_len],
+                suffix_hashes,
+                &suffix_phys,
+            );
+        }
 
         // Build the full physical page table (prefix + suffix).
-        let full_phys = self.devices[dev_idx].physical_ids(&committed_hashes);
+        let full_committed_phys = self.devices[dev_idx].physical_ids(&committed_hashes);
 
         // Build forward pass requests from the lineage (for tokens/positions/masks).
         let prefix_tokens = prefix_len * page_size;
@@ -294,7 +300,7 @@ impl ContextManager {
                     pages_emitted += num_pages;
 
                     // Page table for this chunk: all pages up to current position
-                    let phys_ids = full_phys[..pages_emitted].to_vec();
+                    let phys_ids = full_committed_phys[..pages_emitted].to_vec();
 
                     let num_input = aligned_len as u32;
                     let total_kv = kv_so_far + num_input;
@@ -320,6 +326,83 @@ impl ContextManager {
                     requests.push((fwd_req, phys_ids, last_page_len));
                     kv_so_far += num_input;
                     token_offset = record_end;
+                }
+            }
+        }
+
+        // Append working page tokens to the replay.
+        // Try to merge into the last request if adapter matches; otherwise
+        // create a separate forward pass request.
+        if !working_page_tokens.is_empty() && !working_pages.is_empty() {
+            let recomputable = (working_page_tokens.len() + page_size - 1) / page_size;
+            let num_replay_pages = recomputable.min(working_pages.len());
+            let num_replay_tokens = working_page_tokens.len().min(num_replay_pages * page_size);
+
+            if num_replay_tokens > 0 {
+                let mut tokens = Vec::with_capacity(num_replay_tokens);
+                let mut positions = Vec::with_capacity(num_replay_tokens);
+                let mut masks = Vec::with_capacity(num_replay_tokens);
+                let adapter = working_page_tokens[0].adapter;
+                let adapter_seed = working_page_tokens[0].adapter_seed;
+
+                for info in &working_page_tokens[..num_replay_tokens] {
+                    tokens.push(info.token);
+                    positions.push(info.position);
+                    masks.push(info.mask.clone());
+                }
+
+                // Try to merge into the last committed suffix request.
+                let merged = if let Some((last_req, last_phys, _last_page_len)) = requests.last_mut() {
+                    if last_req.adapter_id == adapter && last_req.adapter_seed == adapter_seed {
+                        // Extend the last request's tokens/positions/masks.
+                        last_req.tokens.extend_from_slice(&tokens);
+                        last_req.positions.extend_from_slice(&positions);
+                        last_req.masks.extend_from_slice(&masks);
+
+                        // Extend the page table with working pages.
+                        last_phys.extend_from_slice(&working_pages[..num_replay_pages]);
+
+                        // Recompute last_page_len for the merged request.
+                        let num_input = num_replay_tokens as u32;
+                        kv_so_far += num_input;
+                        let total_pages_for_fwd = last_phys.len() as u32;
+                        *_last_page_len = compute_last_page_len(kv_so_far, total_pages_for_fwd, page_size as u32);
+
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !merged {
+                    // Different adapter or no prior requests — separate forward pass.
+                    let mut phys_ids = full_committed_phys.clone();
+                    phys_ids.extend_from_slice(&working_pages[..num_replay_pages]);
+
+                    let num_input = num_replay_tokens as u32;
+                    let total_kv = kv_so_far + num_input;
+                    let total_pages_for_fwd = phys_ids.len() as u32;
+                    let last_page_len = compute_last_page_len(total_kv, total_pages_for_fwd, page_size as u32);
+
+                    let fwd_req = ForwardPassRequest {
+                        context_id: 0,
+                        tokens,
+                        positions,
+                        speculative_tokens: Vec::new(),
+                        speculative_positions: Vec::new(),
+                        output_speculative_tokens: false,
+                        masks,
+                        logit_mask: None,
+                        sampling_indices: Vec::new(),
+                        samplers: Vec::new(),
+                        adapter_id: adapter,
+                        adapter_seed,
+                        arrival_time: None,
+                    };
+
+                    requests.push((fwd_req, phys_ids, last_page_len));
                 }
             }
         }

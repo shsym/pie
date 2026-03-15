@@ -43,8 +43,10 @@
 //!
 //! **Working pages** (`working_pages: Vec<PhysicalPageId>`):
 //! - GPU-exclusive, mutable, owned by one context.
-//! - On suspend: D2H copy to CPU swap pool. On restore: H2D back.
-//! - If CPU swap pool full: OOM. Working pages are NOT replayable.
+//! - On suspend: freed from GPU. On restore: recomputed via replay
+//!   using `working_page_tokens` (the token metadata survives suspension).
+//! - Pages with no corresponding tokens are empty capacity reservations
+//!   and are simply re-allocated fresh on restore.
 //!
 //! **Committed pages** (content-addressed via chained `PageHash`):
 //! - Shared across contexts via refcount in PageStore (Radix Trie).
@@ -334,8 +336,12 @@ pub(crate) struct Context {
     /// Device this context is on (None if fully evicted).
     pub device: Option<DeviceId>,
     /// Physical page IDs for uncommitted (working) pages.
-    /// On GPU when Active/Pinned, on CPU when Suspended.
+    /// On GPU when Active/Pinned, empty when Suspended.
     pub working_pages: Vec<PhysicalPageId>,
+    /// Number of working pages at suspension time. Used during restore
+    /// to re-allocate the right number of fresh GPU pages (since
+    /// `working_pages` is cleared on suspend instead of swapped to CPU).
+    pub suspended_working_count: usize,
     /// Ordered committed page hashes (root-to-tip). Replaces committed_tip + committed_len.
     pub committed_hashes: Vec<PageHash>,
     /// Full token lineage for replay after eviction.
@@ -362,6 +368,7 @@ impl Context {
             owner,
             device: None,
             working_pages: Vec::new(),
+            suspended_working_count: 0,
             committed_hashes: Vec::new(),
             lineage: Vec::new(),
             working_page_tokens: Vec::new(),
@@ -380,6 +387,14 @@ impl Context {
     pub fn committed_tip(&self) -> Option<PageHash> { self.committed_hashes.last().copied() }
     /// Number of committed pages.
     pub fn committed_len(&self) -> usize { self.committed_hashes.len() }
+
+    /// Number of working pages whose KV data can be recomputed from
+    /// `working_page_tokens` via a replay forward pass.
+    /// Remaining pages (if any) are empty capacity reservations.
+    pub fn recomputable_working_pages(&self, page_size: usize) -> usize {
+        if page_size == 0 { return 0; }
+        (self.working_page_tokens.len() + page_size - 1) / page_size
+    }
 }
 
 // =============================================================================
@@ -563,10 +578,8 @@ impl ContextManager {
             self.devices[dev_idx].release(&ctx.committed_hashes);
         }
 
-        // Free working pages (GPU or CPU depending on state)
-        if ctx.is_suspended() {
-            self.devices[dev_idx].free_cpu_pages(&ctx.working_pages);
-        } else {
+        // Free working pages (GPU when Active/Pinned; empty when Suspended).
+        if !ctx.working_pages.is_empty() {
             self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
         }
 
@@ -605,9 +618,7 @@ impl ContextManager {
                 if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
                     _pages_freed += self.devices[dev_idx].release(&ctx.committed_hashes);
                 }
-                if ctx.is_suspended() {
-                    self.devices[dev_idx].free_cpu_pages(&ctx.working_pages);
-                } else {
+                if !ctx.working_pages.is_empty() {
                     _pages_freed += ctx.working_pages.len();
                     self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
                 }
@@ -682,7 +693,7 @@ impl ContextManager {
         ctx.working_page_tokens.truncate(len.saturating_sub(tokens_to_remove));
 
         if ctx.is_suspended() {
-            self.devices[dev_idx].free_cpu_pages(&to_free);
+            // Suspended contexts have empty working_pages — nothing to free.
         } else {
             self.devices[dev_idx].free_gpu_pages(&to_free);
             if let Some(pid) = ctx.owner {
@@ -697,8 +708,16 @@ impl ContextManager {
         let page_size = self.page_size;
         let ctx = self.contexts.get(&id).ok_or_else(|| anyhow::anyhow!("Context not found"))?;
         if num_pages == 0 { return Ok(()); }
-        if num_pages > ctx.working_pages.len() {
-            anyhow::bail!("commit: requested {num_pages}, have {}", ctx.working_pages.len());
+
+        // Suspended contexts have empty working_pages but track the count
+        // in suspended_working_count (working pages are recomputed on restore).
+        let available_pages = if ctx.is_suspended() {
+            ctx.suspended_working_count
+        } else {
+            ctx.working_pages.len()
+        };
+        if num_pages > available_pages {
+            anyhow::bail!("commit: requested {num_pages}, have {}", available_pages);
         }
 
         let total_tokens = num_pages * page_size;
@@ -708,7 +727,7 @@ impl ContextManager {
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
         let prev_hash = ctx.committed_tip().unwrap_or(0);
-        let pages = ctx.working_pages[..num_pages].to_vec();
+        let pages = ctx.working_pages.get(..num_pages).map(|s| s.to_vec()).unwrap_or_default();
 
         // Extract token data for the pages being committed.
         let mut tokens = Vec::with_capacity(total_tokens);
@@ -739,8 +758,9 @@ impl ContextManager {
 
         // Commit: physical (GPU promotion + dedup) or logical (metadata only).
         if ctx.is_suspended() {
-            // Suspended: no GPU pages, just free the CPU working pages.
-            dev.free_cpu_pages(&pages);
+            // Suspended: no physical pages to promote (working pages were freed
+            // on suspend). Metadata-only commit — on restore, the committed chain
+            // replay will regenerate these pages.
         } else {
             // Use extend to navigate the trie through the existing
             // committed chain before inserting new pages as children.
@@ -750,7 +770,11 @@ impl ContextManager {
         // Update context state.
         let ctx = self.contexts.get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context lost during commit"))?;
-        ctx.working_pages.drain(..num_pages);
+        if ctx.is_suspended() {
+            ctx.suspended_working_count = ctx.suspended_working_count.saturating_sub(num_pages);
+        } else {
+            ctx.working_pages.drain(..num_pages);
+        }
         ctx.working_page_tokens.drain(..total_tokens);
         ctx.committed_hashes.extend_from_slice(&hashes);
         ctx.max_committed_position = positions.iter().copied().max()

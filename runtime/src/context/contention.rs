@@ -56,8 +56,6 @@ use std::fmt;
 use std::time::Instant;
 
 
-
-use crate::device;
 use crate::process::ProcessId;
 
 use super::{
@@ -506,7 +504,11 @@ impl ContextManager {
         }
     }
 
-    /// Suspend a single Active context: swap working pages GPU→CPU, release chain.
+    /// Suspend a single Active context: free working pages, release chain.
+    ///
+    /// Working pages are recomputable from `working_page_tokens` on restore,
+    /// so we just free them from GPU (no D2H stash to CPU needed).
+    /// `suspended_working_count` records how many pages to re-allocate.
     pub(crate) fn suspend_context(&mut self, ctx_id: ContextId) {
         let (dev_idx, working, committed_hashes) = match self.contexts.get(&ctx_id) {
             Some(ctx) if ctx.is_active() || ctx.is_pinned() => {
@@ -515,32 +517,14 @@ impl ContextManager {
             _ => return,
         };
 
-        // Phase 1: Swap working pages to CPU
+        // Phase 1: Free working pages from GPU.
+        // KV data will be recomputed from working_page_tokens on restore.
         if !working.is_empty() {
-            let dev = &mut self.devices[dev_idx];
-            match dev.alloc_cpu_pages(working.len()) {
-                Some(cpu_pages) => {
-                    // Copy GPU → CPU, then free GPU pages
-                    let _ = device::copy_d2h(dev_idx, &working, &cpu_pages);
-                    self.devices[dev_idx].free_gpu_pages(&working);
-
-                    if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                        ctx.working_pages = cpu_pages;
-                    }
-                }
-                None => {
-                    tracing::error!(ctx = ctx_id, "suspend swap failed: no free CPU pages");
-                    // Continue with suspension anyway — lose working pages
-                    let pages_to_free = if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                        let pages = ctx.working_pages.clone();
-                        ctx.working_pages.clear();
-                        pages
-                    } else {
-                        Vec::new()
-                    };
-                    self.devices[dev_idx].free_gpu_pages(&pages_to_free);
-                }
+            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                ctx.suspended_working_count = ctx.working_pages.len();
+                ctx.working_pages.clear();
             }
+            self.devices[dev_idx].free_gpu_pages(&working);
         }
 
         // Phase 2: Release committed chain refcounts
