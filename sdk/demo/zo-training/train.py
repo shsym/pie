@@ -11,22 +11,25 @@ Supports two modes:
   - **Distributed** (default): Connects to remote server(s) via
     ``--servers`` URIs.  Inferlets are fetched from the registry.
 
+All TrainingConfig fields can be passed as CLI flags (uses python-fire).
+
 Usage::
 
     # Local mode (single server, in-process)
-    uv run python train.py --local --model meta-llama/Llama-3.2-1B-Instruct
+    python train.py --local --model meta-llama/Llama-3.2-1B-Instruct
 
-    # Distributed mode (one or more remote servers)
-    uv run python train.py --servers ws://gpu1:8080 ws://gpu2:8080
+    # Resume from checkpoint
+    python train.py --local --resume_from evo-math-v2-step-255
 
     # Override ES hyperparameters
-    uv run python train.py --local --population-size 256 --tasks-per-seed 8
+    python train.py --local --population_size 256 --tasks_per_seed 8
 """
 
-import argparse
+import fire
 import asyncio
 import csv
 import json
+import re
 import os
 import time
 import sys
@@ -60,7 +63,7 @@ class TrainingConfig:
     device: str = "cuda:0"
     gpu_mem_util: float = 0.8
     cpu_mem_budget: int = 12
-    max_concurrent_processes: int = 256
+    max_concurrent_processes: int = 512
 
     # --- Server (distributed mode) ---
     servers: list[str] = field(default_factory=lambda: ["ws://127.0.0.1:8080"])
@@ -103,6 +106,7 @@ class TrainingConfig:
 
     # --- Checkpointing ---
     checkpoint_every: int = 5
+    resume_from: str = ""  # checkpoint name to resume from, e.g. "evo-math-v2-step-255"
 
     def __post_init__(self):
         if not self.adapter_name:
@@ -150,30 +154,6 @@ async def run_on_all_clients(
 # =============================================================================
 
 
-def build_rollout_batches(
-    seeds: np.ndarray,
-    tasks: list[dict],
-    adapter_name: str,
-    max_tokens: int,
-    system_prompt: str,
-) -> list[dict]:
-    """Build one rollout input dict per (seed, task) pair."""
-    inputs = []
-    for seed, task in zip(seeds, tasks):
-        hasher = blake3(str(seed).encode())
-        problem = task.get("problem", str(task))
-        hasher.update(problem.encode())
-        uid = hasher.hexdigest()
-
-        inputs.append({
-            "name": adapter_name,
-            "rollouts": [{"uid": uid, "task": problem, "seed": int(seed)}],
-            "max_num_outputs": max_tokens,
-            "system_prompt": system_prompt,
-        })
-    return inputs
-
-
 async def run_rollouts(
     clients: list[PieClient],
     inferlet: str,
@@ -188,42 +168,48 @@ async def run_rollouts(
     receives all of its requests upfront — the runtime's contention
     management handles queuing and scheduling internally.
     """
-    inputs = build_rollout_batches(
-        seeds, tasks, config.adapter_name,
-        config.max_tokens_gen, config.system_prompt,
-    )
-
     texts_out, seeds_out, tasks_out = [], [], []
     latencies = []
     output_lens = []
-    pbar = tqdm(total=len(inputs), desc=desc, dynamic_ncols=True, leave=False, file=sys.stdout)
+    n = len(seeds)
+    pbar = tqdm(total=n, desc=desc, dynamic_ncols=True, leave=False, file=sys.stdout)
 
-    async def _tracked(client, inp, seed, task):
-        """Launch one process and update the progress bar on completion."""
+    async def _tracked(client, seed, task):
+        """Build input, launch one process, parse result, update progress bar."""
+        problem = task.get("problem", str(task))
+        uid = blake3(f"{seed}:{problem}".encode()).hexdigest()
+        inp = {
+            "name": config.adapter_name,
+            "rollouts": [{"uid": uid, "task": problem, "seed": int(seed)}],
+            "max_num_outputs": config.max_tokens_gen,
+            "system_prompt": config.system_prompt,
+        }
         t0 = time.time()
         res_json = await launch_and_collect(client, inferlet, inp)
-        elapsed = time.time() - t0
-        latencies.append(elapsed)
+        latencies.append(time.time() - t0)
+
+        # Parse once — return texts directly
+        texts = None
         if res_json:
             try:
-                texts = json.loads(res_json)
-                if isinstance(texts, list):
+                parsed = json.loads(res_json)
+                if isinstance(parsed, list):
+                    texts = parsed
                     for t in texts:
                         output_lens.append(len(t))
             except (json.JSONDecodeError, TypeError):
                 pass
         pbar.update(1)
-        return seed, task, res_json
+        return seed, task, texts
 
-    coros = []
-    for i, (inp, seed, task) in enumerate(zip(inputs, seeds, tasks)):
-        client = clients[i % len(clients)]
-        coros.append(_tracked(client, inp, seed, task))
-
+    coros = [
+        _tracked(clients[i % len(clients)], seed, task)
+        for i, (seed, task) in enumerate(zip(seeds, tasks))
+    ]
     results = await asyncio.gather(*coros)
     pbar.close()
 
-    # Write diagnostic summary
+    # Diagnostic summary
     if latencies:
         arr = np.array(latencies)
         diag = (
@@ -238,21 +224,13 @@ async def run_rollouts(
                 f" | out_chars mean={np.mean(olen):.0f} "
                 f"P90={np.percentile(olen,90):.0f} max={np.max(olen)}"
             )
-        diag += "\n"
-        with open("/tmp/train_diag.log", "a") as f:
-            f.write(diag)
-        tqdm.write(diag.strip())
+        tqdm.write(diag)
 
-    for seed, task, res_json in results:
-        if res_json:
-            try:
-                texts = json.loads(res_json)
-                if isinstance(texts, list):
-                    texts_out.extend(texts)
-                    seeds_out.extend([seed] * len(texts))
-                    tasks_out.extend([task] * len(texts))
-            except (json.JSONDecodeError, TypeError):
-                pass
+    for seed, task, texts in results:
+        if texts:
+            texts_out.extend(texts)
+            seeds_out.extend([seed] * len(texts))
+            tasks_out.extend([task] * len(texts))
 
     return {"texts": texts_out, "seeds": seeds_out, "tasks": tasks_out}
 
@@ -356,7 +334,7 @@ class ESTrainer:
             "population_size": self.config.population_size,
             "mu_fraction": self.config.mu_fraction,
             "initial_sigma": self.config.initial_sigma,
-            "upload": "",
+            "upload": self.config.resume_from,
         }
         results = await run_on_all_clients(
             self.clients, self.config.inferlet_names["es-init"], init_input,
@@ -377,7 +355,13 @@ class ESTrainer:
         consecutive_failures = 0
         MAX_FAILURES = 3
 
-        for step in range(1, self.config.training_steps + 1):
+        start_step = 1
+        if self.config.resume_from:
+            m = re.search(r'step-(\d+)', self.config.resume_from)
+            if m:
+                start_step = int(m.group(1)) + 1
+                tqdm.write(f"🔄 Resuming from step {start_step} (checkpoint: {self.config.resume_from})")
+        for step in range(start_step, self.config.training_steps + 1):
             t0 = time.time()
             tqdm.write(f"\n--- Step {step}/{self.config.training_steps} ---")
 
@@ -441,10 +425,11 @@ class ESTrainer:
         format_rewards = [float(ri.get("format_reward", 0.0)) for ri in reward_infos]
         answer_rewards = [float(ri.get("answer_reward", 0.0)) for ri in reward_infos]
 
-        # Save input-output pairs to CSV
-        self._save_rollout_csv(
-            step, rollout_results, scores, format_rewards, answer_rewards,
-        )
+        # Save input-output pairs to CSV on checkpoint steps
+        if step > 0 and step % self.config.checkpoint_every == 0:
+            self._save_rollout_csv(
+                step, rollout_results, scores, format_rewards, answer_rewards,
+            )
 
         by_seed = defaultdict(list)
         for s, sc in zip(rollout_results["seeds"], scores):
@@ -540,12 +525,8 @@ class ESTrainer:
             desc="eval",
         )
 
-        reward_infos = [
-            task["verifier"](text)
-            for text, task in zip(results["texts"], results["tasks"])
-        ]
-        scores = [float(ri.get("reward", 0.0)) for ri in reward_infos]
-        tqdm.write(f"✅ Eval: mean_reward={np.mean(scores):.4f} ({time.time()-t0:.1f}s)")
+        _, metrics = self._score(eval_seeds, results, step)
+        tqdm.write(f"✅ Eval: mean_reward={metrics['mean_reward']:.4f} ({time.time()-t0:.1f}s)")
 
 
 # =============================================================================
@@ -553,83 +534,33 @@ class ESTrainer:
 # =============================================================================
 
 
-def parse_args() -> TrainingConfig:
-    p = argparse.ArgumentParser(description="Simplified ES Training on Pie")
+def train(**kwargs):
+    """Launch ES training. All TrainingConfig fields can be passed as CLI flags.
 
-    # Mode
-    p.add_argument("--local", action="store_true", help="Run with in-process Pie server")
-    p.add_argument("--servers", nargs="+", default=["ws://127.0.0.1:8080"],
-                   help="Remote server URIs (distributed mode)")
+    Examples::
 
-    # Model / device (local mode)
-    p.add_argument("--model", default="meta-llama/Llama-3.2-1B-Instruct", help="HuggingFace model ID")
-    p.add_argument("--device", default="cuda:0", help="Device(s), comma-separated")
-    p.add_argument("--gpu-mem-util", type=float, default=0.8)
-    p.add_argument("--cpu-mem-budget", type=int, default=12)
-    p.add_argument("--max-concurrent-processes", type=int, default=256)
+        python train.py --local --training_steps 1000
+        python train.py --local --resume_from evo-math-v2-step-255
+        python train.py --servers ws://gpu1:8080 ws://gpu2:8080
+    """
+    config = TrainingConfig(**kwargs)
 
-    # Dataset
-    p.add_argument("--dataset", default="math", choices=["math", "countdown"])
-    p.add_argument("--data-path", default="./Countdown-Tasks-3to4")
+    async def _run():
+        trainer = ESTrainer(config)
+        try:
+            await trainer.setup()
+            await trainer.train()
+        except Exception as e:
+            tqdm.write(f"\n❌ Error: {e}")
+            raise
+        finally:
+            await trainer.teardown()
 
-    # ES hyperparameters
-    p.add_argument("--population-size", type=int, default=2048)
-    p.add_argument("--tasks-per-seed", type=int, default=4)
-    p.add_argument("--training-steps", type=int, default=10000)
-    p.add_argument("--lora-rank", type=int, default=8)
-    p.add_argument("--lora-alpha", type=float, default=16.0)
-    p.add_argument("--initial-sigma", type=float, default=0.005)
-    p.add_argument("--max-sigma", type=float, default=0.014)
-    p.add_argument("--mu-fraction", type=float, default=0.5)
-    p.add_argument("--max-tokens", type=int, default=512)
-
-    # Evaluation
-    p.add_argument("--test-size", type=int, default=100)
-    p.add_argument("--eval-every", type=int, default=2)
-    p.add_argument("--checkpoint-every", type=int, default=5)
-
-    args = p.parse_args()
-
-    return TrainingConfig(
-        local=args.local,
-        model=args.model,
-        device=args.device,
-        gpu_mem_util=args.gpu_mem_util,
-        cpu_mem_budget=args.cpu_mem_budget,
-        max_concurrent_processes=args.max_concurrent_processes,
-        servers=args.servers,
-        dataset=args.dataset,
-        data_path=args.data_path,
-        population_size=args.population_size,
-        tasks_per_seed=args.tasks_per_seed,
-        training_steps=args.training_steps,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        initial_sigma=args.initial_sigma,
-        max_sigma=args.max_sigma,
-        mu_fraction=args.mu_fraction,
-        max_tokens_gen=args.max_tokens,
-        test_size=args.test_size,
-        eval_every=args.eval_every,
-        checkpoint_every=args.checkpoint_every,
-    )
-
-
-async def main():
-    config = parse_args()
-    trainer = ESTrainer(config)
     try:
-        await trainer.setup()
-        await trainer.train()
-    except Exception as e:
-        tqdm.write(f"\n❌ Error: {e}")
-        raise
-    finally:
-        await trainer.teardown()
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        tqdm.write("\nTraining interrupted.")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        tqdm.write("\nTraining interrupted.")
+    fire.Fire(train)

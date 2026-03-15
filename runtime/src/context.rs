@@ -422,7 +422,7 @@ impl ContextManager {
     /// Maximum GPU page utilization before `drain_queues` stops restoring
     /// suspended processes. Keeps a headroom buffer (1 - cap) so running
     /// processes can allocate pages without triggering eviction cascades.
-    const RESTORE_UTILIZATION_CAP: f64 = 0.99;
+    const RESTORE_UTILIZATION_CAP: f64 = 0.85;
 
     pub(crate) fn new(model_idx: usize, page_size: usize, num_gpu_pages: &[usize], num_cpu_pages: &[usize]) -> Self {
         let devices: Vec<_> = num_gpu_pages.iter().zip(num_cpu_pages.iter())
