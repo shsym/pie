@@ -623,8 +623,9 @@ impl Session {
                 inferlet,
                 input,
                 capture_outputs,
+                token_budget,
             } => {
-                self.handle_launch_process(corr_id, inferlet, input, capture_outputs)
+                self.handle_launch_process(corr_id, inferlet, input, capture_outputs, token_budget)
                     .await
             }
 

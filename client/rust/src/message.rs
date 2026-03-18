@@ -52,6 +52,8 @@ pub enum ClientMessage {
         inferlet: String,
         input: String,
         capture_outputs: bool,
+        #[serde(default)]
+        token_budget: Option<usize>,
     },
 
     #[serde(rename = "launch_daemon")]

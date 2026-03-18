@@ -406,12 +406,14 @@ impl Client {
         inferlet: String,
         input: String,
         capture_outputs: bool,
+        token_budget: Option<usize>,
     ) -> Result<Process> {
         let msg = ClientMessage::LaunchProcess {
             corr_id: 0,
             inferlet,
             input,
             capture_outputs,
+            token_budget,
         };
         let (ok, result) = self.send_msg_and_wait(msg).await?;
 

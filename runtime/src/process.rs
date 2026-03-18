@@ -13,6 +13,7 @@ use uuid::Uuid;
 use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 
+use crate::context;
 use crate::linker;
 use crate::program::ProgramName;
 use crate::server::{self, ClientId};
@@ -98,8 +99,9 @@ pub fn spawn(
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
     workflow_id: Option<WorkflowId>,
+    token_budget: Option<usize>,
 ) -> Result<ProcessId> {
-    let process = Process::new(username, program_name, input, client_id, capture_outputs, result_tx, workflow_id);
+    let process = Process::new(username, program_name, input, client_id, capture_outputs, result_tx, workflow_id, token_budget);
     let id = process.process_id;
 
     SERVICES.spawn(id, || process)?;
@@ -156,6 +158,7 @@ pub async fn get_stats(process_id: ProcessId) -> Result<ProcessStats> {
     SERVICES.send(&process_id, Message::GetStats { response: tx })?;
     rx.await?
 }
+
 
 /// List all registered process IDs.
 pub fn list() -> Vec<ProcessId> {
@@ -244,6 +247,7 @@ impl Process {
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<Result<String, String>>>,
         workflow_id: Option<WorkflowId>,
+        token_budget: Option<usize>,
     ) -> Self {
         let process_id = Uuid::new_v4();
 
@@ -254,6 +258,7 @@ impl Process {
             input.clone(),
             capture_outputs,
             result_tx,
+            token_budget,
         ));
 
         Process {
@@ -317,6 +322,7 @@ impl Process {
         input: String,
         capture_outputs: bool,
         result_tx: Option<oneshot::Sender<Result<String, String>>>,
+        token_budget: Option<usize>,
     ) {
         // Admission control: wait for a permit before instantiating.
         // The permit is held for the entire WASM execution lifetime
@@ -327,7 +333,7 @@ impl Process {
         };
 
         let result: Result<String, String> = async {
-            let (mut store, instance) = linker::instantiate(process_id, username, &program, capture_outputs)
+            let (mut store, instance) = linker::instantiate(process_id, username, &program, capture_outputs, token_budget)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -423,6 +429,7 @@ impl ServiceHandler for Process {
                     elapsed_secs: self.start_time.elapsed().as_secs(),
                 }));
             }
+
         }
     }
 }

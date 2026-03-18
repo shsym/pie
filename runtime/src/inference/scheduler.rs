@@ -176,7 +176,6 @@ impl BatchScheduler {
         device_idx: usize,
         max_batch_size: usize,
         max_batch_tokens: usize,
-        max_in_flight_batches: usize,
         request_timeout_secs: u64,
         max_wait_ms: u64,
         min_batch_for_optimization: usize,
@@ -186,7 +185,7 @@ impl BatchScheduler {
         tokio::spawn(Self::run(
             device_id, device_idx, rx,
             max_batch_size, max_batch_tokens,
-            max_in_flight_batches, request_timeout_secs, max_wait_ms, min_batch_for_optimization,
+            request_timeout_secs, max_wait_ms, min_batch_for_optimization,
             stats.clone(),
         ));
 
@@ -226,7 +225,6 @@ impl BatchScheduler {
         mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
         max_batch_size: usize,
         max_batch_tokens: usize,
-        max_in_flight_batches: usize,
         request_timeout_secs: u64,
         max_wait_ms: u64,
         min_batch_for_optimization: usize,
@@ -243,7 +241,8 @@ impl BatchScheduler {
                 max_wait_time,
                 min_batch_for_optimization,
             ));
-        let in_flight = Arc::new(Semaphore::new(max_in_flight_batches));
+        // Only one in-flight batch at a time to prevent pipelined KV cache corruption.
+        let in_flight = Arc::new(Semaphore::new(1));
 
         // Channel for batch completion stats (latency feedback only)
         let (stats_tx, mut stats_rx) = mpsc::unbounded_channel::<BatchStats>();
@@ -273,8 +272,7 @@ impl BatchScheduler {
             }
 
             // Ask the policy what to do
-            let in_flight_count =
-                max_in_flight_batches - in_flight.available_permits();
+            let in_flight_count = 1 - in_flight.available_permits();
 
             match policy.decide(batch.len(), batch.total_tokens(), in_flight_count) {
                 Decision::Fire => {
@@ -312,6 +310,9 @@ impl BatchScheduler {
                         )
                         .await;
                         let latency = start.elapsed();
+
+                        // Advance market clock for this device: prices, rent, dividends.
+                        crate::context::tick(device_idx, latency.as_secs_f64());
 
                         // Update cumulative atomic counters
                         stats_clone.total_batches.fetch_add(1, Relaxed);

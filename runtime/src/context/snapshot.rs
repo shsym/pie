@@ -15,7 +15,7 @@ use anyhow::Result;
 use tokio::sync::oneshot;
 
 use super::{
-    Context, ContextId, ContextManager, ContextState,
+    Context, ContextId, ContextManager, State,
 };
 
 use crate::device::{self, DeviceId};
@@ -28,7 +28,7 @@ use crate::process::ProcessId;
 impl ContextManager {
 
     /// Contention-aware fork: estimates GPU page requirement and delegates
-    /// to `with_gpu_pages` for Pending deferral and contention resolution.
+    /// to `when_allocated` for Pending deferral and contention resolution.
     ///
     /// Clones the committed chain (refcount bump), copies working pages using
     /// pre-allocated GPU pages, and creates a new Active context.
@@ -47,7 +47,7 @@ impl ContextManager {
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 let working = ctx.working_pages.len();
                 let suffix = if ctx.is_suspended() && !ctx.committed_hashes.is_empty() {
-                    let prefix = self.devices[dev_idx].prefix_len(&ctx.committed_hashes);
+                    let prefix = self.gpu_stores[dev_idx].prefix_len(&ctx.committed_hashes);
                     ctx.committed_hashes.len() - prefix
                 } else {
                     0
@@ -60,7 +60,10 @@ impl ContextManager {
             }
         };
 
-        self.with_gpu_pages(owner, dev_idx, needed, Some(id), move |mgr, gpu_pages| {
+        // Create a temporary context ID for the fork operation.
+        // We use the source context for contention — the fork inherits
+        // the source's scheduling state.
+        self.when_allocated(id, dev_idx, needed, move |mgr, gpu_pages| {
             let result = (|| -> Result<ContextId> {
                 let ctx = mgr.contexts.get(&id)
                     .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
@@ -78,7 +81,7 @@ impl ContextManager {
 
                 // Determine committed chain restoration needs.
                 let (prefix_len, suffix_count) = if !committed_hashes.is_empty() && !src_on_gpu {
-                    let prefix = mgr.devices[dev_idx].prefix_len(&committed_hashes);
+                    let prefix = mgr.gpu_stores[dev_idx].prefix_len(&committed_hashes);
                     (prefix, committed_hashes.len() - prefix)
                 } else {
                     (committed_hashes.len(), 0)
@@ -87,7 +90,7 @@ impl ContextManager {
                 // Validate pre-allocated page count against actual needs.
                 let total_needed = working_count + suffix_count;
                 if gpu_pages.len() < total_needed {
-                    mgr.devices[dev_idx].free_gpu_pages(&gpu_pages);
+                    mgr.gpu_stores[dev_idx].free(&gpu_pages);
                     anyhow::bail!(
                         "fork: insufficient GPU pages (got {}, need {total_needed})",
                         gpu_pages.len()
@@ -99,7 +102,7 @@ impl ContextManager {
                 let suffix_pages = gpu_pages[working_count..total_needed].to_vec();
                 let surplus = gpu_pages[total_needed..].to_vec();
                 if !surplus.is_empty() {
-                    mgr.devices[dev_idx].free_gpu_pages(&surplus);
+                    mgr.gpu_stores[dev_idx].free(&surplus);
                 }
 
                 // Copy source working → child working using pre-allocated pages.
@@ -114,7 +117,7 @@ impl ContextManager {
                 // Retain committed prefix. For Active sources, retain the full chain.
                 // For Suspended sources, retain only the GPU-resident prefix.
                 if prefix_len > 0 {
-                    mgr.devices[dev_idx].fork(&committed_hashes[..prefix_len]);
+                    mgr.gpu_stores[dev_idx].fork(&committed_hashes[..prefix_len]);
                 }
 
                 // Create the child context (state set below after replay check).
@@ -128,10 +131,14 @@ impl ContextManager {
                     max_committed_position: max_pos,
                     lineage,
                     working_page_tokens: forked_tokens,
-                    state: ContextState::Active, // may become Pinned below
+                    state: State::Active, // may become Pinned below
                     pending_suspend: false,
                     last_access: Instant::now(),
                     bid: 0.0,
+                    cpu_working_pages: Vec::new(),
+                    deferred_ops: Vec::new(),
+                    pending_replay: false,
+                    defaulted: false,
                 });
 
                 // Spawn replay for committed suffix if needed.
@@ -143,20 +150,13 @@ impl ContextManager {
 
                 if has_replay {
                     if let Some(ctx) = mgr.contexts.get_mut(&new_id) {
-                        ctx.state = ContextState::Pinned;
+                        ctx.state = State::Pinned;
+                        ctx.pending_replay = true;
                     }
                 }
 
-                {
-                    let proc = mgr.process_entry(owner);
-                    proc.context_ids.push(new_id);
-                    if has_replay {
-                        proc.pending_replay_count += 1;
-                    }
-                    let d = proc.device_mut(dev_idx);
-                    d.working += working_count;
-                    d.committed += committed_hashes.len();
-                }
+                mgr.process_entry(owner).context_ids.push(new_id);
+                mgr.publish_context_counts(new_id);
 
                 Ok(new_id)
             })();
@@ -189,26 +189,26 @@ impl ContextManager {
         let snapshot_filled = ctx.working_page_tokens.clone();
 
         if !committed_hashes.is_empty() {
-            self.devices[dev_idx].fork(&committed_hashes);
+            self.gpu_stores[dev_idx].fork(&committed_hashes);
         }
 
         // Snapshot working pages: try GPU-first, fall back to CPU swap pool.
         let (snapshot_working, snapshot_state) = if !src_working.is_empty() {
             let n = src_working.len();
-            if let Some(dst_pages) = self.devices[dev_idx].alloc_gpu_pages(n) {
+            if let Some(dst_pages) = self.gpu_stores[dev_idx].alloc(n) {
                 // GPU → GPU copy
                 let _ = device::copy_d2d(dev_idx as DeviceId, &src_working, &dst_pages);
-                (dst_pages, ContextState::Active)
-            } else if let Some(cpu_pages) = self.devices[dev_idx].alloc_cpu_pages(n) {
+                (dst_pages, State::Active)
+            } else if let Some(cpu_pages) = self.cpu_stores[dev_idx].alloc(n) {
                 // Fallback: GPU → CPU copy (source GPU pages stay intact)
                 let _ = device::copy_d2h(dev_idx as DeviceId, &src_working, &cpu_pages);
-                (cpu_pages, ContextState::Suspended)
+                (cpu_pages, State::Suspended)
             } else {
                 eprintln!("SNAPSHOT_PAGE_COPY_FAIL ctx={id}: no GPU or CPU pages available");
-                (Vec::new(), ContextState::Active)
+                (Vec::new(), State::Active)
             }
         } else {
-            (Vec::new(), ContextState::Active)
+            (Vec::new(), State::Active)
         };
 
         let snapshot_id = self.next_id();
@@ -225,14 +225,18 @@ impl ContextManager {
             pending_suspend: false,
             last_access: Instant::now(),
             bid: 0.0,
+            cpu_working_pages: Vec::new(),
+            deferred_ops: Vec::new(),
+            pending_replay: false,
+            defaulted: false,
         });
         self.snapshots.insert((username, name.clone()), snapshot_id);
 
         // If snapshot ended up Suspended (CPU fallback for working pages),
         // release the refcounts we acquired. Suspended invariant: no held refcounts.
         // On open/fork, retain will be called to re-acquire.
-        if snapshot_state == ContextState::Suspended && !committed_hashes.is_empty() {
-            self.devices[dev_idx].release(&committed_hashes);
+        if snapshot_state == State::Suspended && !committed_hashes.is_empty() {
+            self.gpu_stores[dev_idx].release(&committed_hashes);
         }
 
         Ok(if auto_generated { Some(name) } else { None })
@@ -245,13 +249,13 @@ impl ContextManager {
         if let Some(ctx) = self.contexts.remove(&snapshot_id) {
             let dev_idx = ctx.device.unwrap_or(0) as usize;
             if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
-                self.devices[dev_idx].release(&ctx.committed_hashes);
+                self.gpu_stores[dev_idx].release(&ctx.committed_hashes);
             }
             // Free snapshot working pages (GPU or CPU depending on state)
             if ctx.is_suspended() {
-                self.devices[dev_idx].free_cpu_pages(&ctx.working_pages);
+                self.cpu_stores[dev_idx].free(&ctx.working_pages);
             } else {
-                self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
+                self.gpu_stores[dev_idx].free(&ctx.working_pages);
             }
         }
 
@@ -260,7 +264,7 @@ impl ContextManager {
 
 
     /// Contention-aware take: estimates GPU page requirement and delegates
-    /// to `with_gpu_pages` for Pending deferral and contention resolution.
+    /// to `when_allocated` for Pending deferral and contention resolution.
     ///
     /// Takes ownership of a saved snapshot. The snapshot is deleted and its
     /// resources are transferred to the new context. GPU working pages are
@@ -279,142 +283,172 @@ impl ContextManager {
     ) {
         // Estimate pages needed: working swap-in + committed suffix restoration.
         let key = (username.clone(), name.clone());
-        let (needed, dev_idx) = match self.snapshots.get(&key).and_then(|&id| self.contexts.get(&id)) {
-            Some(snap) if snap.is_suspended() => {
-                let dev_idx = snap.device.unwrap_or(0) as usize;
-                let working = snap.working_pages.len();
-                let suffix = if !snap.committed_hashes.is_empty() {
-                    let prefix = self.devices[dev_idx].prefix_len(&snap.committed_hashes);
-                    snap.committed_hashes.len() - prefix
-                } else {
-                    0
-                };
-                (working + suffix, dev_idx)
-            }
-            Some(snap) => (0, snap.device.unwrap_or(0) as usize),
+        let (needed, dev_idx, snap_ctx_id) = match self.snapshots.get(&key) {
+            Some(&snap_id) => match self.contexts.get(&snap_id) {
+                Some(snap) if snap.is_suspended() => {
+                    let dev_idx = snap.device.unwrap_or(0) as usize;
+                    let working = snap.working_pages.len();
+                    let suffix = if !snap.committed_hashes.is_empty() {
+                        let prefix = self.gpu_stores[dev_idx].prefix_len(&snap.committed_hashes);
+                        snap.committed_hashes.len() - prefix
+                    } else {
+                        0
+                    };
+                    (working + suffix, dev_idx, snap_id)
+                }
+                Some(snap) => (0, snap.device.unwrap_or(0) as usize, snap_id),
+                None => {
+                    let _ = response.send(Err(anyhow::anyhow!("Snapshot context missing")));
+                    return;
+                }
+            },
             None => {
                 let _ = response.send(Err(anyhow::anyhow!("Snapshot not found")));
                 return;
             }
         };
 
-        self.with_gpu_pages(owner, dev_idx, needed, None, move |mgr, gpu_pages| {
-            let result = (|| -> Result<ContextId> {
-                let key = (username, name);
-                let snapshot_id = *mgr.snapshots.get(&key)
-                    .ok_or_else(|| anyhow::anyhow!("Snapshot not found"))?;
-
-                let snap = mgr.contexts.get(&snapshot_id)
-                    .ok_or_else(|| anyhow::anyhow!("Snapshot context missing"))?;
-
-                let dev_idx = snap.device.unwrap_or(0) as usize;
-                let was_suspended = snap.is_suspended();
-
-                // Determine committed chain restoration needs.
-                let (prefix_len, suffix_count) = if was_suspended && !snap.committed_hashes.is_empty() {
-                    let prefix = mgr.devices[dev_idx].prefix_len(&snap.committed_hashes);
-                    (prefix, snap.committed_hashes.len() - prefix)
-                } else {
-                    (snap.committed_hashes.len(), 0)
-                };
-
-                let working_count = snap.working_pages.len();
-                let total_needed = working_count + suffix_count;
-
-                // Validate pre-allocated page count against actual needs.
-                if gpu_pages.len() < total_needed {
-                    // Not enough pages (prefix shrank since estimation).
-                    // Snapshot stays intact — don't remove it.
-                    mgr.devices[dev_idx].free_gpu_pages(&gpu_pages);
-                    anyhow::bail!(
-                        "take: insufficient GPU pages (got {}, need {total_needed})",
-                        gpu_pages.len()
-                    );
-                }
-
-                // Validation passed — consume the snapshot (point of no return).
-                let snap = mgr.contexts.remove(&snapshot_id).unwrap();
-                mgr.snapshots.remove(&key);
-
-                // Split pre-allocated pages: working | suffix | surplus.
-                let (working_gpu, rest) = gpu_pages.split_at(working_count);
-                let suffix_pages = rest[..suffix_count].to_vec();
-                let surplus = rest[suffix_count..].to_vec();
-                let working_gpu = working_gpu.to_vec();
-                if !surplus.is_empty() {
-                    mgr.devices[dev_idx].free_gpu_pages(&surplus);
-                }
-
-                // Working pages: GPU pages transfer directly, CPU pages use pre-allocated pages.
-                let new_working = if snap.working_pages.is_empty() {
-                    Vec::new()
-                } else if was_suspended {
-                    let _ = device::copy_h2d(dev_idx as DeviceId, &working_gpu, &snap.working_pages);
-                    mgr.devices[dev_idx].free_cpu_pages(&snap.working_pages);
-                    working_gpu
-                } else {
-                    // GPU → new context: direct ownership transfer (zero-copy).
-                    // Return pre-allocated pages (unused for non-suspended).
-                    if !working_gpu.is_empty() {
-                        mgr.devices[dev_idx].free_gpu_pages(&working_gpu);
-                    }
-                    snap.working_pages
-                };
-
-                // Committed chain refcount handling:
-                // - Non-suspended: save() retained for the snapshot. Those refcounts
-                //   transfer to the new context (ownership transfer, no retain/release).
-                // - Suspended: save() released. Re-acquire prefix for the new context.
-                if was_suspended && prefix_len > 0 {
-                    mgr.devices[dev_idx].fork(&snap.committed_hashes[..prefix_len]);
-                }
-
-                let committed_len = snap.committed_hashes.len();
-                let working_len = new_working.len();
-
-                let new_id = mgr.next_id();
-                mgr.contexts.insert(new_id, Context {
-                    owner: Some(owner),
-                    device: Some(dev_idx as DeviceId),
-                    working_pages: new_working,
-                    suspended_working_count: 0,
-                    committed_hashes: snap.committed_hashes,
-                    lineage: snap.lineage,
-                    working_page_tokens: snap.working_page_tokens,
-                    max_committed_position: snap.max_committed_position,
-                    state: ContextState::Active, // may become Pinned below
-                    pending_suspend: false,
-                    last_access: Instant::now(),
-                    bid: 0.0,
-                });
-
-                // Spawn replay for committed suffix if needed.
-                let has_replay = if suffix_count > 0 {
-                    mgr.spawn_replay_passes(new_id, dev_idx, prefix_len, suffix_pages)?
-                } else {
-                    false
-                };
-
-                if has_replay {
-                    if let Some(ctx) = mgr.contexts.get_mut(&new_id) {
-                        ctx.state = ContextState::Pinned;
-                    }
-                }
-
-                {
-                    let proc = mgr.process_entry(owner);
-                    proc.context_ids.push(new_id);
-                    if has_replay {
-                        proc.pending_replay_count += 1;
-                    }
-                    let d = proc.device_mut(dev_idx);
-                    d.committed += committed_len;
-                    d.working += working_len;
-                }
-
-                Ok(new_id)
-            })();
+        // For Take, we need pages but the snapshot context doesn't participate
+        // in scheduling (no owner). We create the new context first and use it
+        // for contention. But since we need to allocate before creating, we
+        // use the snapshot context ID. If pages == 0, allocation is a no-op.
+        if needed == 0 {
+            // No GPU pages needed — do the take directly.
+            let result = self.take_inner(username, name, owner, Vec::new());
             let _ = response.send(result);
+            return;
+        }
+
+        // Allocate directly (no contention for Take — it's always a new context).
+        if let Some(pages) = self.gpu_stores[dev_idx].alloc(needed) {
+            let result = self.take_inner(username, name, owner, pages);
+            let _ = response.send(result);
+            return;
+        }
+
+        // Not enough free pages — defer on the snapshot context.
+        let pending = super::sched::PendingAlloc {
+            device: dev_idx,
+            num_pages: needed,
+            on_alloc: Box::new(move |mgr, pages| {
+                let result = mgr.take_inner(username, name, owner, pages);
+                let _ = response.send(result);
+            }),
+        };
+        if let Some(ctx) = self.contexts.get_mut(&snap_ctx_id) {
+            ctx.deferred_ops.push(pending);
+        }
+        self.alloc_queue.push_back(snap_ctx_id);
+    }
+
+    /// Inner take implementation, called with pre-allocated GPU pages.
+    fn take_inner(
+        &mut self,
+        username: String,
+        name: String,
+        owner: ProcessId,
+        gpu_pages: Vec<super::pagestore::PhysicalPageId>,
+    ) -> Result<ContextId> {
+        let key = (username, name);
+        let snapshot_id = *self.snapshots.get(&key)
+            .ok_or_else(|| anyhow::anyhow!("Snapshot not found"))?;
+
+        let snap = self.contexts.get(&snapshot_id)
+            .ok_or_else(|| anyhow::anyhow!("Snapshot context missing"))?;
+
+        let dev_idx = snap.device.unwrap_or(0) as usize;
+        let was_suspended = snap.is_suspended();
+
+        // Determine committed chain restoration needs.
+        let (prefix_len, suffix_count) = if was_suspended && !snap.committed_hashes.is_empty() {
+            let prefix = self.gpu_stores[dev_idx].prefix_len(&snap.committed_hashes);
+            (prefix, snap.committed_hashes.len() - prefix)
+        } else {
+            (snap.committed_hashes.len(), 0)
+        };
+
+        let working_count = snap.working_pages.len();
+        let total_needed = working_count + suffix_count;
+
+        // Validate pre-allocated page count against actual needs.
+        if gpu_pages.len() < total_needed {
+            self.gpu_stores[dev_idx].free(&gpu_pages);
+            anyhow::bail!(
+                "take: insufficient GPU pages (got {}, need {total_needed})",
+                gpu_pages.len()
+            );
+        }
+
+        // Validation passed — consume the snapshot (point of no return).
+        let snap = self.contexts.remove(&snapshot_id).unwrap();
+        self.snapshots.remove(&key);
+
+        // Split pre-allocated pages: working | suffix | surplus.
+        let (working_gpu, rest) = gpu_pages.split_at(working_count);
+        let suffix_pages = rest[..suffix_count].to_vec();
+        let surplus = rest[suffix_count..].to_vec();
+        let working_gpu = working_gpu.to_vec();
+        if !surplus.is_empty() {
+            self.gpu_stores[dev_idx].free(&surplus);
+        }
+
+        // Working pages: GPU pages transfer directly, CPU pages use pre-allocated pages.
+        let new_working = if snap.working_pages.is_empty() {
+            Vec::new()
+        } else if was_suspended {
+            let _ = device::copy_h2d(dev_idx as DeviceId, &working_gpu, &snap.working_pages);
+            self.cpu_stores[dev_idx].free(&snap.working_pages);
+            working_gpu
+        } else {
+            // GPU → new context: direct ownership transfer (zero-copy).
+            if !working_gpu.is_empty() {
+                self.gpu_stores[dev_idx].free(&working_gpu);
+            }
+            snap.working_pages
+        };
+
+        // Committed chain refcount handling.
+        if was_suspended && prefix_len > 0 {
+            self.gpu_stores[dev_idx].fork(&snap.committed_hashes[..prefix_len]);
+        }
+
+        let new_id = self.next_id();
+        self.contexts.insert(new_id, Context {
+            owner: Some(owner),
+            device: Some(dev_idx as DeviceId),
+            working_pages: new_working,
+            suspended_working_count: 0,
+            committed_hashes: snap.committed_hashes,
+            lineage: snap.lineage,
+            working_page_tokens: snap.working_page_tokens,
+            max_committed_position: snap.max_committed_position,
+            state: State::Active,
+            pending_suspend: false,
+            last_access: Instant::now(),
+            bid: 0.0,
+            cpu_working_pages: Vec::new(),
+            deferred_ops: Vec::new(),
+            pending_replay: false,
+            defaulted: false,
         });
+
+        // Spawn replay for committed suffix if needed.
+        let has_replay = if suffix_count > 0 {
+            self.spawn_replay_passes(new_id, dev_idx, prefix_len, suffix_pages)?
+        } else {
+            false
+        };
+
+        if has_replay {
+            if let Some(ctx) = self.contexts.get_mut(&new_id) {
+                ctx.state = State::Pinned;
+                ctx.pending_replay = true;
+            }
+        }
+
+        self.process_entry(owner).context_ids.push(new_id);
+        self.publish_context_counts(new_id);
+
+        Ok(new_id)
     }
 }

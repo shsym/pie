@@ -1,51 +1,60 @@
 //! pie:core/scheduling - Market prices and program account queries
 
 use crate::api::pie;
+use crate::api::model::Model;
+use crate::api::context::Context;
 use crate::context;
 use crate::linker::InstanceState;
 
 use anyhow::Result;
+use wasmtime::component::Resource;
+use wasmtime_wasi::WasiView;
 
 impl pie::core::scheduling::Host for InstanceState {
-    // ── Market prices ──────────────────────────────────────────────
+    // ── Market ──────────────────────────────────────────────────────
 
-    async fn keep(&mut self, device: u32, tier: String) -> Result<f64> {
-        let market = context::get_market_state(0).await;
-        let dev = device as usize;
-        if dev >= market.device_prices.len() {
-            return Ok(0.0);
-        }
-        let price = &market.device_prices[dev];
-        match tier.as_str() {
-            "gpu" => Ok(price.keep_gpu),
-            "cpu" => Ok(price.keep_cpu),
-            _ => Ok(price.keep_gpu),
-        }
+    /// Make cost: constant price to produce one new KV page.
+    async fn price(&mut self) -> Result<f64> {
+        Ok(1.0)
     }
 
-    async fn make(&mut self, device: u32) -> Result<f64> {
-        let market = context::get_market_state(0).await;
-        let dev = device as usize;
-        if dev >= market.device_prices.len() {
-            return Ok(0.0);
-        }
-        Ok(market.device_prices[dev].make)
+    /// Rent (clearing price) on this context's device, last step.
+    async fn rent(&mut self, ctx: Resource<Context>) -> Result<f64> {
+        let ctx = self.ctx().table.get(&ctx)?;
+        let model_idx = ctx.model_id;
+        let context_id = ctx.context_id;
+
+        let device = context::get_device(model_idx, context_id);
+        Ok(context::get_clearing_price(model_idx, device))
     }
 
-    async fn interest(&mut self) -> Result<f64> {
-        let market = context::get_market_state(0).await;
-        Ok(market.interest_rate)
+    /// Dividend this process received last step.
+    /// = dividend_per_endowment × process_endowment  (§3.4)
+    async fn dividend(&mut self, model: Resource<Model>) -> Result<f64> {
+        let model_idx = self.ctx().table.get(&model)?.model_id;
+        let pid = self.id();
+        let dividend_rate = context::get_dividend_rate(model_idx);
+        let endowment = context::get_endowment(model_idx, pid);
+        Ok(dividend_rate * endowment)
     }
 
-    async fn list_devices(&mut self) -> Result<u32> {
-        let market = context::get_market_state(0).await;
-        Ok(market.device_prices.len() as u32)
+    // ── Device ──────────────────────────────────────────────────────
+
+    /// Per-tick latency of this context's device (seconds), updated each tick.
+    async fn latency(&mut self, ctx: Resource<Context>) -> Result<f64> {
+        let ctx = self.ctx().table.get(&ctx)?;
+        let model_idx = ctx.model_id;
+        let context_id = ctx.context_id;
+
+        let device = context::get_device(model_idx, context_id);
+        Ok(context::get_tick_latency(model_idx, device))
     }
 
     // ── Account ────────────────────────────────────────────────────
 
-    async fn balance(&mut self) -> Result<f64> {
+    async fn balance(&mut self, model: Resource<Model>) -> Result<f64> {
+        let model_idx = self.ctx().table.get(&model)?.model_id;
         let pid = self.id();
-        Ok(context::get_balance(0, pid).await)
+        Ok(context::get_balance(model_idx, pid))
     }
 }

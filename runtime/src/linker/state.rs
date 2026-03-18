@@ -39,8 +39,8 @@ pub struct InstanceState {
 impl Drop for InstanceState {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.scratch_dir);
-        // Destroy all contexts owned by this process across all models.
-        context::destroy_all(self.id);
+        // Unregister the process: destroy all contexts and remove process entries.
+        context::unregister_process(self.id);
     }
 }
 
@@ -69,7 +69,13 @@ impl InstanceState {
         username: String,
         capture_outputs: bool,
         allow_filesystem: bool,
+        token_budget: Option<usize>,
     ) -> Self {
+        // Register the process with all model context managers.
+        // This creates the ProcessEntry with the correct token budget endowment
+        // before any context operations. Symmetric with unregister_process in Drop.
+        context::register_process(id, token_budget);
+
         let mut builder = WasiCtx::builder();
         builder.inherit_network(); // TODO: Replace with socket_addr_check later.
 

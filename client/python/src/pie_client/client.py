@@ -436,12 +436,14 @@ class PieClient:
         inferlet: str,
         input: dict | None = None,
         capture_outputs: bool = True,
+        token_budget: int | None = None,
     ) -> Process:
         """Launch a process. Returns a Process object for interaction.
 
         :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
         :param input: A dict of input parameters, serialized to JSON.
         :param capture_outputs: If True, process outputs are streamed to the client.
+        :param token_budget: Optional token budget for this process (None = use model default).
         :return: A Process object for the launched inferlet.
         """
         msg = {
@@ -450,6 +452,8 @@ class PieClient:
             "input": json.dumps(input or {}),
             "capture_outputs": capture_outputs,
         }
+        if token_budget is not None:
+            msg["token_budget"] = token_budget
         ok, result = await self._send_msg_and_wait(msg)
 
         if not ok:

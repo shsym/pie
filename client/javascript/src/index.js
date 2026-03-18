@@ -440,15 +440,20 @@ export class PieClient {
      * @param {string} inferlet The inferlet name (e.g., "text-completion@0.1.0").
      * @param {Object} [input={}] Input parameters object, serialized to JSON.
      * @param {boolean} [captureOutputs=true] Stream outputs to client.
+     * @param {Object} [options={}] Additional launch options.
+     * @param {number|null} [options.tokenBudget=null] Token budget for this process.
      * @returns {Promise<Process>}
      */
-    async launchProcess(inferlet, input = {}, captureOutputs = true) {
+    async launchProcess(inferlet, input = {}, captureOutputs = true, { tokenBudget = null } = {}) {
         const msg = {
             type: "launch_process",
             inferlet,
             input: JSON.stringify(input),
             capture_outputs: captureOutputs,
         };
+        if (tokenBudget != null) {
+            msg.token_budget = tokenBudget;
+        }
         const { ok, result } = await this._sendMsgAndWait(msg);
         if (!ok) {
             throw new Error(`Failed to launch process: ${result}`);

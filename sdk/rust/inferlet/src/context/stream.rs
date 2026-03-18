@@ -8,6 +8,8 @@ use crate::pie::instruct::chat;
 
 use super::{Context, Decoder, Event, Speculation, Constrain, GrammarConstraint};
 
+
+
 // =============================================================================
 // TokenStream
 // =============================================================================
@@ -28,12 +30,24 @@ pub struct TokenStream<'a> {
     tokens_generated: usize,
     adapter: Option<&'a crate::adapter::Adapter>,
     zo_seed: Option<i64>,
+    /// Expected output length for bid planning. Falls back to
+    /// `max_tokens`, then 4096 if unset.
+    horizon: Option<usize>,
+
 }
 
 impl<'a> TokenStream<'a> {
     /// Creates a new token stream.
     pub(super) fn new(ctx: &'a mut Context, sampler: Sampler) -> Self {
         let stop_tokens = chat::stop_tokens(&ctx.model);
+
+        // Set initial bid: spread balance across expected horizon, normalized by pages.
+        let balance = crate::scheduling::balance(&ctx.model);
+        let dividend = crate::scheduling::dividend(&ctx.model);
+        let pages = (ctx.committed_pages + ctx.working_pages).max(1) as f64;
+        let mvc = balance / 4096.0 - dividend;
+        ctx.bid(if pages > 0.0 { mvc / pages } else { mvc });  // Default horizon; updated per-step
+
         Self {
             ctx,
             sampler,
@@ -45,6 +59,7 @@ impl<'a> TokenStream<'a> {
             tokens_generated: 0,
             adapter: None,
             zo_seed: None,
+            horizon: None,
         }
     }
 
@@ -94,6 +109,24 @@ impl<'a> TokenStream<'a> {
         self.zo_seed = Some(seed);
         self
     }
+
+    /// Sets the expected output length for budget planning.
+    ///
+    /// The bid is spread across `horizon` steps. Programs that know
+    /// their expected output length should set this for tighter bidding.
+    /// Falls back to `max_tokens`, then 4096.
+    pub fn with_horizon(mut self, horizon: usize) -> Self {
+        self.horizon = Some(horizon);
+        // Re-compute initial bid with the tighter horizon, normalized by pages.
+        let balance = crate::scheduling::balance(&self.ctx.model);
+        let dividend = crate::scheduling::dividend(&self.ctx.model);
+        let pages = (self.ctx.committed_pages + self.ctx.working_pages).max(1) as f64;
+        let mvc = balance / (horizon.max(1) as f64) - dividend;
+        self.ctx.bid(if pages > 0.0 { mvc / pages } else { mvc });
+        self
+    }
+
+
 
     /// Gets the next batch of generated tokens.
     ///
@@ -192,6 +225,29 @@ impl<'a> TokenStream<'a> {
     }
 
     async fn step(&mut self) -> Result<Vec<u32>> {
+        // ── Market: truthful bid ────────────────────────────────────────
+        // The bid tells the runtime how much we value staying resident.
+        // bid = (balance/horizon - dividend) / pages
+        // When dividend > balance/horizon, bid goes negative → prefer exclusion.
+        // The compute-or-wait decision is embedded in the bid.
+        {
+            let balance = crate::scheduling::balance(&self.ctx.model);
+            let dividend = crate::scheduling::dividend(&self.ctx.model);
+            let pages = (self.ctx.committed_pages + self.ctx.working_pages) as f64;
+
+            // Horizon chain: explicit horizon → max_tokens → 4096.
+            let total_horizon = self.horizon
+                .or(self.max_tokens)
+                .unwrap_or(4096);
+            let remaining = (total_horizon - self.tokens_generated).max(1) as f64;
+
+            // Truthful bid: per-step value minus opportunity cost of forgoing dividend.
+            let mvc = balance / remaining - dividend;
+            let bid = if pages > 0.0 { mvc / pages } else { mvc };
+
+            self.ctx.bid(bid);
+        }
+
         // Drain ctx.buffer as pending input tokens for this step.
         let pending = std::mem::take(&mut self.ctx.buffer);
         let n_pending = pending.len() as u32;

@@ -104,8 +104,6 @@ impl RpcServer {
 #[derive(Clone)]
 pub struct SchedulerConfig {
     #[pyo3(get, set)]
-    pub max_in_flight_batches: usize,
-    #[pyo3(get, set)]
     pub request_timeout_secs: u64,
     #[pyo3(get, set)]
     pub max_wait_ms: u64,
@@ -117,19 +115,16 @@ pub struct SchedulerConfig {
 impl SchedulerConfig {
     #[new]
     #[pyo3(signature = (
-        max_in_flight_batches = 1,
         request_timeout_secs = 120,
         max_wait_ms = 50,
         min_batch_for_optimization = 8,
     ))]
     fn new(
-        max_in_flight_batches: usize,
         request_timeout_secs: u64,
         max_wait_ms: u64,
         min_batch_for_optimization: usize,
     ) -> Self {
         SchedulerConfig {
-            max_in_flight_batches: 1, // HARDCODED TO 1 TO PREVENT PIPELINED KV CACHE CORRUPTION
             request_timeout_secs,
             max_wait_ms,
             min_batch_for_optimization,
@@ -187,6 +182,8 @@ pub struct ModelConfig {
     pub devices: Vec<DeviceConfig>,
     #[pyo3(get, set)]
     pub scheduler: SchedulerConfig,
+    #[pyo3(get, set)]
+    pub default_token_budget: usize,
 }
 
 #[pymethods]
@@ -198,6 +195,7 @@ impl ModelConfig {
         kv_page_size,
         tokenizer_path,
         devices,
+        default_token_budget,
         scheduler = None,
     ))]
     fn new(
@@ -206,6 +204,7 @@ impl ModelConfig {
         kv_page_size: usize,
         tokenizer_path: String,
         devices: Vec<DeviceConfig>,
+        default_token_budget: usize,
         scheduler: Option<SchedulerConfig>,
     ) -> Self {
         ModelConfig {
@@ -214,7 +213,8 @@ impl ModelConfig {
             kv_page_size,
             tokenizer_path,
             devices,
-            scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(1, 120, 50, 8)),
+            scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(120, 50, 8)),
+            default_token_budget,
         }
     }
 }
@@ -256,7 +256,7 @@ pub struct Config {
     // WASI capabilities
     #[pyo3(get, set)]
     pub allow_filesystem: bool,
-    // Admission control
+    /// Hard cap on concurrent processes. None = no limit.
     #[pyo3(get, set)]
     pub max_concurrent_processes: Option<usize>,
 }
@@ -368,11 +368,11 @@ impl From<Config> for BootstrapConfig {
                         })
                         .collect(),
                     scheduler: BootstrapSchedulerConfig {
-                        max_in_flight_batches: m.scheduler.max_in_flight_batches,
                         request_timeout_secs: m.scheduler.request_timeout_secs,
                         max_wait_ms: m.scheduler.max_wait_ms,
                         min_batch_for_optimization: m.scheduler.min_batch_for_optimization,
                     },
+                    default_token_budget: m.default_token_budget,
                 })
                 .collect(),
             skip_tracing: false,

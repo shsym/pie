@@ -168,6 +168,7 @@ impl Session {
         inferlet: String,
         input: String,
         capture_outputs: bool,
+        token_budget: Option<usize>,
     ) {
         let program_name = match ProgramName::parse(&inferlet) {
             Ok(p) => p,
@@ -193,6 +194,7 @@ impl Session {
             capture_outputs,
             None,
             None, // no workflow
+            token_budget,
         ) {
             Ok(process_id) => {
                 if capture_outputs {

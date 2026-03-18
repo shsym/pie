@@ -60,6 +60,7 @@ fn spawn_and_wait(
             false,
             None,
             None, // no workflow
+            None, // token_budget
         )
         .expect("spawn")
     });
@@ -140,6 +141,7 @@ fn concurrent_spawns() {
                     false,
                     None,
                     None, // no workflow
+            None, // token_budget
                 )
                 .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"));
                 pid
@@ -177,6 +179,7 @@ fn rapid_sequential_spawns() {
                 false,
                 None,
                 None, // no workflow
+            None, // token_budget
             )
             .unwrap_or_else(|e| panic!("sequential spawn {i} failed: {e}"));
 
@@ -221,6 +224,7 @@ fn mixed_success_and_error() {
                 false,
                 None,
                 None, // no workflow
+            None, // token_budget
             )
             .unwrap_or_else(|e| panic!("mixed spawn {i} ({name}) failed: {e}"));
             pids.push((i, name, pid));
@@ -257,6 +261,7 @@ fn spawn_after_termination() {
             false,
             None,
             None, // no workflow
+            None, // token_budget
         )
         .expect("spawn for termination");
 
@@ -283,6 +288,7 @@ fn spawn_after_termination() {
             false,
             None,
             None, // no workflow
+            None, // token_budget
         )
         .expect("spawn after termination");
 

@@ -101,12 +101,12 @@ fn working_page_token_ops() {
         ).await.unwrap();
 
         // working_page_token_count = 5
-        let count = pie::context::working_page_token_count(MODEL, id).await.unwrap();
+        let count = pie::context::working_page_token_count(MODEL, id);
         assert_eq!(count, 5);
 
         // Truncate to 3 tokens
         pie::context::truncate_working_page_tokens(MODEL, id, 3).await.unwrap();
-        assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 3);
+        assert_eq!(pie::context::working_page_token_count(MODEL, id), 3);
 
         // Truncate out of range should fail
         let err = pie::context::truncate_working_page_tokens(MODEL, id, 10).await;
@@ -156,9 +156,9 @@ fn full_page_lifecycle() {
             "tokens_per_page should be 16"
         );
 
-        assert_eq!(pie::context::committed_page_count(MODEL, id).await.unwrap(), 0);
+        assert_eq!(pie::context::committed_page_count(MODEL, id), 0);
         assert_eq!(
-            pie::context::working_page_token_count(MODEL, id).await.unwrap(), 0,
+            pie::context::working_page_token_count(MODEL, id), 0,
             "tokens start at 0"
         );
 
@@ -166,30 +166,30 @@ fn full_page_lifecycle() {
         let positions: Vec<u32> = (0..32).collect();
         pie::context::append_working_page_tokens(MODEL, id, prompt.clone(), positions, vec![], None, None).await.unwrap();
 
-        assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 32);
+        assert_eq!(pie::context::working_page_token_count(MODEL, id), 32);
 
         // Reserve 2 pages (32 tokens / 16 per page) before committing
         pie::context::reserve_working_pages(MODEL, id, 2).await.unwrap();
 
         // Working page count should be 2 (actual allocated pages)
-        assert_eq!(pie::context::working_page_count(MODEL, id).await.unwrap(), 2);
+        assert_eq!(pie::context::working_page_count(MODEL, id), 2);
 
         // ── Phase 3: Commit first page (positions 0..15) ──
         pie::context::commit_working_pages(MODEL, id, 1).await.unwrap();
 
-        assert_eq!(pie::context::committed_page_count(MODEL, id).await.unwrap(), 1);
+        assert_eq!(pie::context::committed_page_count(MODEL, id), 1);
         // 16 filled tokens remain (second page's worth)
         assert_eq!(
-            pie::context::working_page_token_count(MODEL, id).await.unwrap(), 16,
+            pie::context::working_page_token_count(MODEL, id), 16,
             "16 tokens remain after first commit"
         );
 
         // ── Phase 4: Commit second page (positions 16..31) ──
         pie::context::commit_working_pages(MODEL, id, 1).await.unwrap();
 
-        assert_eq!(pie::context::committed_page_count(MODEL, id).await.unwrap(), 2);
+        assert_eq!(pie::context::committed_page_count(MODEL, id), 2);
         assert_eq!(
-            pie::context::working_page_token_count(MODEL, id).await.unwrap(), 0,
+            pie::context::working_page_token_count(MODEL, id), 0,
             "0 tokens after full commit"
         );
 
@@ -197,7 +197,7 @@ fn full_page_lifecycle() {
         pie::context::append_working_page_tokens(
             MODEL, id, vec![2000, 2001, 2002], vec![32, 33, 34], vec![], None, None,
         ).await.unwrap();
-        assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 3);
+        assert_eq!(pie::context::working_page_token_count(MODEL, id), 3);
 
         // ── Phase 6: Prepare state with filled tokens, then fork ──
         // Clear working page tokens from Phase 5
@@ -206,7 +206,7 @@ fn full_page_lifecycle() {
         pie::context::append_working_page_tokens(
             MODEL, id, vec![3000, 3001], vec![32, 33], vec![], None, None,
         ).await.unwrap();
-        assert_eq!(pie::context::working_page_token_count(MODEL, id).await.unwrap(), 2);
+        assert_eq!(pie::context::working_page_token_count(MODEL, id), 2);
 
         let child_id = pie::context::fork(MODEL, id, test_pid()).await.unwrap();
 
@@ -214,13 +214,13 @@ fn full_page_lifecycle() {
 
         // Verify child state
         assert_eq!(
-            pie::context::committed_page_count(MODEL, child_id).await.unwrap(), 2,
+            pie::context::committed_page_count(MODEL, child_id), 2,
             "child inherits committed pages"
         );
 
         // Fork preserves working_page_tokens — child inherits them
         assert_eq!(
-            pie::context::working_page_token_count(MODEL, child_id).await.unwrap(), 2,
+            pie::context::working_page_token_count(MODEL, child_id), 2,
             "child inherits filled tokens"
         );
     });

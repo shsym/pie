@@ -42,6 +42,7 @@ pub async fn instantiate(
     username: String,
     program_name: &ProgramName,
     capture_outputs: bool,
+    token_budget: Option<usize>,
 ) -> Result<(Store<InstanceState>, WasmInstance)> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::Instantiate {
@@ -49,6 +50,7 @@ pub async fn instantiate(
         username,
         program_name: program_name.clone(),
         capture_outputs,
+        token_budget,
         response: tx,
     })?;
     rx.await?
@@ -72,6 +74,7 @@ impl Linker {
         username: String,
         program_name: &ProgramName,
         capture_outputs: bool,
+        token_budget: Option<usize>,
     ) -> Result<(Store<InstanceState>, WasmInstance)> {
         // 1. Get the main component
         let component = program::get_wasm_component(program_name)
@@ -82,7 +85,7 @@ impl Linker {
         let dependency_components = self.resolve_dependency_components(program_name).await?;
 
         // 3. Create instance state and store
-        let inst_state = InstanceState::new(process_id, username, capture_outputs, self.allow_filesystem);
+        let inst_state = InstanceState::new(process_id, username, capture_outputs, self.allow_filesystem, token_budget);
         let mut store = Store::new(&self.engine, inst_state);
 
         // 4. Create and configure linker
@@ -146,6 +149,7 @@ enum Message {
         username: String,
         program_name: ProgramName,
         capture_outputs: bool,
+        token_budget: Option<usize>,
         response: oneshot::Sender<Result<(Store<InstanceState>, WasmInstance)>>,
     },
 }
@@ -155,9 +159,9 @@ impl ServiceHandler for Linker {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::Instantiate { process_id, username, program_name, capture_outputs, response } => {
+            Message::Instantiate { process_id, username, program_name, capture_outputs, token_budget, response } => {
                 let _ = response.send(
-                    self.instantiate(process_id, username, &program_name, capture_outputs).await
+                    self.instantiate(process_id, username, &program_name, capture_outputs, token_budget).await
                 );
             }
         }

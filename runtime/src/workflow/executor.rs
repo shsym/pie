@@ -15,7 +15,6 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::context;
 use crate::process::{self, ProcessId};
 use crate::program::{self, ProgramName};
 
@@ -175,10 +174,10 @@ impl Executor {
             true,
             Some(result_tx),
             Some(self.id),
+            None, // token_budget: use default
         ).map_err(|e| e.to_string())?;
 
         self.running.lock().unwrap().insert(pid);
-        self.push_weights();
 
         let result = tokio::select! {
             r = result_rx => r.unwrap_or(Err("process channel dropped".into())),
@@ -190,7 +189,6 @@ impl Executor {
 
         self.running.lock().unwrap().remove(&pid);
         self.completed.fetch_add(1, Ordering::Relaxed);
-        self.push_weights();
 
         match result {
             Ok(output) => Ok(parse_output(&output)),
@@ -415,31 +413,6 @@ impl Executor {
         val.ok_or_else(|| "iterate: no iterations".into())
     }
 
-    // =========================================================================
-    // Urgency
-    // =========================================================================
-
-    /// Push SRPT-based weight to all model arbiters.
-    fn push_weights(&self) {
-        let total = self.total.load(Ordering::Relaxed);
-        let completed = self.completed.load(Ordering::Relaxed);
-        let remaining = total.saturating_sub(completed);
-
-        let weight = if remaining > 0 {
-            (total as f64 / remaining as f64).max(1.0)
-        } else {
-            1.0
-        };
-
-        let pid_values: HashMap<ProcessId, f64> = self.running
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|&pid| (pid, 1.0))
-            .collect();
-
-        context::set_priority(weight, pid_values);
-    }
 }
 
 // =============================================================================

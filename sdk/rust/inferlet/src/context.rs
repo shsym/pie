@@ -136,6 +136,78 @@ impl Context {
         self.inner.destroy()
     }
 
+    // ── Market operations ────────────────────────────────────────────
+
+    /// Suspend this context (release pages, stop rent).
+    /// Restoration is system-driven based on bid priority.
+    pub fn suspend(&self) -> Result<()> {
+        self.inner.suspend()
+    }
+
+    /// Set bid (willingness to pay per page per step).
+    /// Higher bid = harder to evict, restored first.
+    pub fn bid(&self, value: f64) {
+        self.inner.bid(value);
+    }
+
+    /// Yield priority for the duration of an external wait.
+    ///
+    /// Under critical-value (Vickrey) payments, the process pays the
+    /// clearing price regardless of its bid. Bidding above clearing price
+    /// costs the same — only eviction risk changes. The rational strategy:
+    ///
+    /// - **Hold** (keep generation bid): costs `rent × pages` per step,
+    ///   but ensures instant resumption.
+    /// - **Fold** (bid zero): costs nothing, but risks restore-queue delay.
+    ///
+    /// The process can afford to hold for `W` idle steps iff the surplus
+    /// covers the idle rent. From the bid formula:
+    ///
+    /// ```text
+    /// W / remaining  <  (bid − rent) / rent
+    /// ```
+    ///
+    /// Processes well above the clearing price absorb long waits (large
+    /// surplus). Marginal processes fold immediately (no surplus). The
+    /// threshold is endogenous — no tuning parameter required.
+    ///
+    /// Returns a [`BidGuard`] that restores the generation bid on drop.
+    ///
+    /// ```ignore
+    /// let _guard = ctx.yield_bid(Duration::from_millis(200));
+    /// let result = tool_call().await;
+    /// // guard dropped → bid restored
+    /// ```
+    pub fn yield_bid(&self, expected_wait: core::time::Duration) -> BidGuard<'_> {
+        let balance = crate::scheduling::balance(&self.model);
+        let rent = crate::scheduling::rent(&self.inner);
+        let dividend = crate::scheduling::dividend(&self.model);
+        let latency = crate::scheduling::latency(&self.inner);
+        let pages = (self.committed_pages + self.working_pages) as f64;
+
+        // Truthful generation bid (§5.1).
+        let remaining = 4096.0; // conservative default; overridden by horizon if known
+        let generation_bid = if pages > 0.0 {
+            (balance / remaining - dividend) / pages
+        } else { 0.0 };
+
+        let step_secs = latency.max(0.001);
+        let wait_steps = expected_wait.as_secs_f64() / step_secs;
+
+        // Hold if surplus covers the idle rent (§7):
+        //   W / remaining  <  (bid − rent) / rent
+        // Equivalently: rent-free or bid well above clearing price.
+        let hold = rent == 0.0
+            || (generation_bid > rent
+                && wait_steps < remaining * (generation_bid - rent) / rent);
+
+        if !hold {
+            self.inner.bid(0.0);
+        }
+
+        BidGuard { ctx: self, saved_bid: generation_bid }
+    }
+
     // ── Accessors (no WIT calls) ────────────────────────────────────
 
     /// The model this context was created with.
@@ -290,3 +362,24 @@ impl Context {
         TokenStream::new(self, sampler)
     }
 }
+
+// =============================================================================
+// BidGuard — RAII bid restoration
+// =============================================================================
+
+/// Restores the generation bid when dropped.
+///
+/// Created by [`Context::yield_bid()`]. During the wait, the bid is
+/// either held (surplus covers idle rent) or set to zero (fold).
+/// On drop, the truthful generation bid is restored.
+pub struct BidGuard<'a> {
+    ctx: &'a Context,
+    saved_bid: f64,
+}
+
+impl<'a> Drop for BidGuard<'a> {
+    fn drop(&mut self) {
+        self.ctx.bid(self.saved_bid);
+    }
+}
+

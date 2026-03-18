@@ -1,25 +1,27 @@
 interface scheduling {
 
-    // ── Market prices ──────────────────────────────────────────────
+    use model.{model};
+    use context.{context};
 
-    /// Cost per page per step to hold cache on given device + tier.
-    /// Zero at zero load, rises convexly with scarcity.
-    /// `tier` is "gpu" or "cpu".
-    keep: func(device: u32, tier: string) -> f64;
+    // ── Market ─────────────────────────────────────────────────────
 
-    /// Cost to produce one token of KV cache on a device.
-    /// Floor at c_min when idle, diverges near full utilization.
-    make: func(device: u32) -> f64;
+    /// Cost to produce one new KV page (constant = 1 credit).
+    price: func() -> f64;
 
-    /// Global interest rate: total_rent_pool / total_idle_credits.
-    interest: func() -> f64;
+    /// Rent: clearing price from the last knapsack auction on this context's device.
+    rent: func(ctx: borrow<context>) -> f64;
 
-    /// Number of available devices.
-    list-devices: func() -> u32;
+    /// Dividend received last step (endowment-proportional share of revenue).
+    dividend: func(model: borrow<model>) -> f64;
+
+    // ── Device ─────────────────────────────────────────────────────
+
+    /// Per-tick latency of this context's device (seconds), updated each tick.
+    latency: func(ctx: borrow<context>) -> f64;
 
     // ── Account ────────────────────────────────────────────────────
 
     /// Current credit balance (global, usable on any device).
-    balance: func() -> f64;
+    balance: func(model: borrow<model>) -> f64;
 
 }

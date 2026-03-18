@@ -32,10 +32,11 @@ pub struct Config {
     pub models: Vec<ModelConfig>,
     /// Allow inferlets to access a sandboxed scratch filesystem.
     pub allow_filesystem: bool,
-    /// Maximum number of concurrent WASM processes. `None` = unlimited.
-    pub max_concurrent_processes: Option<usize>,
     /// Skip tracing initialization (for tests — can only init once per process).
     pub skip_tracing: bool,
+    /// Hard cap on the number of concurrent processes.
+    /// `None` means no limit; `Some(n)` caps admission to `n`.
+    pub max_concurrent_processes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,9 @@ pub struct ModelConfig {
     pub tokenizer_path: PathBuf,
     pub devices: Vec<DeviceConfig>,
     pub scheduler: SchedulerConfig,
+    /// Default token budget per process. Determines the credit endowment
+    /// (= ⌈budget / page_size⌉) and max concurrency (= ⌊total_pages / credit⌋).
+    pub default_token_budget: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +63,6 @@ pub struct DeviceConfig {
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    pub max_in_flight_batches: usize,
     pub request_timeout_secs: u64,
     pub max_wait_ms: u64,
     pub min_batch_for_optimization: usize,
@@ -104,7 +107,7 @@ pub async fn bootstrap(
     server::spawn(&config.host, config.port);
     messaging::spawn();
     process::init_admission(config.max_concurrent_processes);
-
+    
     for cfg in config.models.iter() {
 
         model::register(
@@ -121,10 +124,13 @@ pub async fn bootstrap(
         let num_gpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.total_pages).collect();
         let num_cpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.cpu_pages).collect();
 
-        context::spawn(cfg.kv_page_size, num_gpu_pages, num_cpu_pages);
+        // Derive credit endowment from token budget.
+        // default_credit = ⌈default_token_budget / page_size⌉  (pages per process)
+        let default_credit = cfg.default_token_budget.div_ceil(cfg.kv_page_size).max(1);
+
+        context::spawn(cfg.kv_page_size, num_gpu_pages, num_cpu_pages, default_credit);
         inference::spawn(
             &devices,
-            1, // HARDCODED TO 1 TO PREVENT PIPELINED KV CACHE CORRUPTION
             cfg.scheduler.request_timeout_secs,
             cfg.scheduler.max_wait_ms,
             cfg.scheduler.min_batch_for_optimization,
@@ -132,14 +138,7 @@ pub async fn bootstrap(
         adapter::spawn(&devices);
     }
 
-    // Force-shutdown on CTRL+C
-    // Removed to allow Python to handle signals and proper cleanup
-    // tokio::spawn(async {
-    //     tokio::signal::ctrl_c().await.ok();
-    //     eprintln!("[BOOTSTRAP] ctrl_c received! Calling std::process::exit(0)");
-    //     tracing::info!("Shutdown signal received, exiting");
-    //     std::process::exit(0);
-    // });
+
 
     Ok(auth::get_internal_auth_token().await?)
 }
@@ -167,6 +166,10 @@ fn verify_config(config: &Config) -> Result<()> {
         ensure!(
             model.tokenizer_path.exists(),
             "Model {:?}: tokenizer not found at {:?}", model.name, model.tokenizer_path
+        );
+        ensure!(
+            model.default_token_budget > 0,
+            "Model {:?}: default_token_budget must be > 0", model.name
         );
 
         for (i, dev) in model.devices.iter().enumerate() {

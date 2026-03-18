@@ -75,6 +75,7 @@ async def run_benchmark(args):
             dummy_mode=args.dummy,
             gpu_mem_utilization=args.gpu_mem_util,
             cpu_mem_budget_in_gb=args.cpu_mem_budget,
+            default_token_budget=args.default_token_budget,
         )],
         max_concurrent_processes=args.max_concurrent_processes,
     )
@@ -197,7 +198,8 @@ def main():
     parser.add_argument("--save-outputs", type=str, default=None, help="Save output samples to this file path")
     parser.add_argument("--num-samples", type=int, default=10, help="Number of output samples to save (default: 10)")
     parser.add_argument("--unique-prompts", action="store_true", help="Make each request's prompt unique (append request #N)")
-    parser.add_argument("--max-concurrent-processes", type=int, default=None, help="Max concurrent WASM processes (default: unlimited)")
+    parser.add_argument("--default-token-budget", type=int, required=True, help="Default token budget per process (required)")
+    parser.add_argument("--max-concurrent-processes", type=int, default=None, help="Maximum number of concurrent processes (default: None)")
 
     args = parser.parse_args()
 

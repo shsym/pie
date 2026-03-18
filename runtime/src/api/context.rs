@@ -48,7 +48,7 @@ impl pie::core::context::HostContext for InstanceState {
         let username = self.get_username();
         let process_id = self.id();
 
-        let snapshot_id = match context::lookup_snapshot(model_id, username, name).await {
+        let snapshot_id = match context::lookup(model_id, username, name).await {
             Ok(id) => id,
             Err(e) => return Ok(Err(e.to_string())),
         };
@@ -181,12 +181,12 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn committed_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::committed_page_count(ctx.model_id, ctx.context_id).await?)
+        Ok(context::committed_page_count(ctx.model_id, ctx.context_id))
     }
 
     async fn working_page_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::working_page_count(ctx.model_id, ctx.context_id).await?)
+        Ok(context::working_page_count(ctx.model_id, ctx.context_id))
     }
 
     async fn commit_working_pages(
@@ -221,12 +221,12 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn working_page_token_count(&mut self, this: Resource<Context>) -> Result<u32> {
         let ctx = self.ctx().table.get(&this)?;
-        Ok(context::working_page_token_count(ctx.model_id, ctx.context_id).await?)
+        Ok(context::working_page_token_count(ctx.model_id, ctx.context_id))
     }
 
     async fn truncate_working_page_tokens(&mut self, this: Resource<Context>, num_tokens: u32) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
-        let current = context::working_page_token_count(ctx.model_id, ctx.context_id).await?;
+        let current = context::working_page_token_count(ctx.model_id, ctx.context_id);
         let new_count = current.saturating_sub(num_tokens);
         context::truncate_working_page_tokens(ctx.model_id, ctx.context_id, new_count).await?;
         Ok(())
@@ -245,7 +245,7 @@ impl pie::core::context::HostContext for InstanceState {
 
     async fn bid(&mut self, this: Resource<Context>, value: f64) -> Result<()> {
         let ctx = self.ctx().table.get(&this)?;
-        let _ = context::set_bid(ctx.model_id, ctx.context_id, value).await;
+        let _ = context::bid(ctx.model_id, ctx.context_id, value).await;
         Ok(())
     }
 }

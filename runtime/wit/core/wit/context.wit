@@ -65,7 +65,7 @@ interface context {
         // are restored when memory frees up.
         suspend: func() -> result<_, error>;
 
-        // Set bid: willingness to pay per token per step.
+        // Set bid: willingness to pay per page per step.
         // Drives suspension priority, restoration priority, and compute priority.
         // 0.0 = use default (truthful) bidding.
         bid: func(value: f64);

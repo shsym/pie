@@ -73,6 +73,10 @@ pub mod runtime {
     pub use crate::pie::core::runtime::*;
 }
 
+pub mod scheduling {
+    pub use crate::pie::core::scheduling::*;
+}
+
 pub mod messaging {
     pub use crate::pie::core::messaging::*;
 }

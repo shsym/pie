@@ -58,8 +58,7 @@
 //!
 //! - `context.rs` — Public API, `Message` enum, `ServiceHandler`, core ops.
 //! - `pagestore.rs` — `PageStore`: Radix Trie CAS cache + physical page pools.
-//! - `sched.rs` — `ProcessEntry`, invested-importance scheduling (π = w·p).
-//! - `contention.rs` — Eviction, suspension, `alloc_queue`, `with_gpu_pages`.
+//! - `sched.rs` — Scheduling economics, eviction, suspension, contention.
 //! - `restore.rs` — Restoration, replay planning, `restore_queue`.
 //! - `snapshot.rs` — Named snapshot save/load/fork/take.
 //!
@@ -79,14 +78,13 @@
 // commits and dedup correctly, all operations O(depth).
 pub mod pagestore;
 pub(crate) mod sched;
-pub(crate) mod pricing;
-mod contention;
 mod snapshot;
 mod restore;
 
-use std::collections::{HashMap, VecDeque, BinaryHeap};
+use std::collections::{HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::time::Instant;
+use dashmap::DashMap;
 use tokio::sync::oneshot;
 use anyhow::{Result, Context as _};
 
@@ -97,11 +95,8 @@ use crate::inference::brle::Brle;
 use crate::process::ProcessId;
 use crate::device::{self, DeviceId};
 
-use pagestore::{PhysicalPageId, PageHash, PageStore};
-use sched::{ProcessEntry, ProcessState};
-use pricing::MarketState;
-
-use contention::{PendingAlloc, PendingRestore};
+use pagestore::{PhysicalPageId, PageHash, PageStore, FlatPageStore};
+use sched::{AuctionResult, ProcessEntry, PendingAlloc};
 
 // =============================================================================
 // Public Types
@@ -116,24 +111,84 @@ pub type ContextId = u64;
 pub(crate) static SERVICES: LazyLock<ServiceArray<Message>> = LazyLock::new(ServiceArray::new);
 static PAGE_SIZES: LazyLock<boxcar::Vec<usize>> = LazyLock::new(boxcar::Vec::new);
 
+// ---------------------------------------------------------------------------
+// Lock-free read caches — written by the actor, read directly by callers.
+// ---------------------------------------------------------------------------
+
+/// Per-context snapshot: device + page counts.  Single DashMap lookup
+/// instead of four separate maps.
+pub(crate) static CACHED_CONTEXT_INFO: LazyLock<DashMap<(usize, ContextId), CachedContextInfo>> =
+    LazyLock::new(DashMap::new);
+
+/// Per-model market data: clearing prices, dividend rate, balances.
+/// Indexed by `model_idx` (the spawn order).
+pub(crate) static MARKET: LazyLock<boxcar::Vec<Market>> =
+    LazyLock::new(boxcar::Vec::new);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CachedContextInfo {
+    pub device: usize,
+    pub working_pages: u32,
+    pub committed_pages: u32,
+    pub working_tokens: u32,
+}
+
+pub(crate) struct Market {
+    /// Per-device clearing prices.  Key = device ordinal.
+    pub clearing_prices: DashMap<usize, f64>,
+    /// Per-device tick latency EWA (seconds, α=0.1).  Key = device ordinal.
+    pub tick_latency_ewa: DashMap<usize, f64>,
+    /// Sum of `dividend_per_endowment` across all devices.
+    pub dividend_rate: std::sync::atomic::AtomicU64,  // f64 bits via to/from_bits
+    /// Per-process credit balances.
+    pub balances: DashMap<ProcessId, f64>,
+    /// Per-process endowments (fixed at creation).
+    pub endowments: DashMap<ProcessId, f64>,
+    /// Default credit endowment (pages) for new processes.
+    pub default_credit: usize,
+}
+
+impl Market {
+    pub(crate) fn new(default_credit: usize) -> Self {
+        Market {
+            clearing_prices: DashMap::new(),
+            tick_latency_ewa: DashMap::new(),
+            dividend_rate: std::sync::atomic::AtomicU64::new(0),
+            balances: DashMap::new(),
+            endowments: DashMap::new(),
+            default_credit,
+        }
+    }
+
+    pub(crate) fn get_dividend_rate(&self) -> f64 {
+        f64::from_bits(self.dividend_rate.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_dividend_rate(&self, rate: f64) {
+        self.dividend_rate.store(rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+
 // =============================================================================
 // Public API
 // =============================================================================
 
 /// Spawns a new context manager for a model.
-pub fn spawn(page_size: usize, num_gpu_pages: Vec<usize>, num_cpu_pages: Vec<usize>) -> usize {
+pub fn spawn(page_size: usize, num_gpu_pages: Vec<usize>, num_cpu_pages: Vec<usize>, default_credit: usize) -> usize {
     PAGE_SIZES.push(page_size);
+    MARKET.push(Market::new(default_credit));
     SERVICES.spawn(move || ContextManager::new(
-        SERVICES.len().saturating_sub(1), page_size, &num_gpu_pages, &num_cpu_pages,
+        SERVICES.len().saturating_sub(1), page_size, &num_gpu_pages, &num_cpu_pages, default_credit,
     )).expect("Failed to spawn context manager")
 }
 
 // ---------- Actor-routed ----------
 
-pub async fn lookup_snapshot(model_idx: usize, username: String, name: String) -> Result<ContextId> {
+pub async fn lookup(model_idx: usize, username: String, name: String) -> Result<ContextId> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::LookupSnapshot { username, name, response: tx })?;
-    rx.await.context("context::lookup_snapshot: actor dropped response")?
+    SERVICES.send(model_idx, Message::Lookup { username, name, response: tx })?;
+    rx.await.context("context::lookup: actor dropped response")?
 }
 
 pub async fn take(model_idx: usize, username: String, name: String, owner: ProcessId) -> Result<ContextId> {
@@ -168,11 +223,19 @@ pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
     rx.await.context("context::destroy: actor dropped response")?
 }
 
-/// Destroy all contexts owned by a process across all models.
-/// Called on WASM instance drop for automatic cleanup.
-pub fn destroy_all(pid: ProcessId) {
+/// Register a process across all models.
+/// Called from `InstanceState::new` before any context operations.
+pub fn register_process(pid: ProcessId, token_budget: Option<usize>) {
     for model_idx in 0..SERVICES.len() {
-        let _ = SERVICES.send(model_idx, Message::DestroyAll { pid });
+        let _ = SERVICES.send(model_idx, Message::RegisterProcess { pid, token_budget });
+    }
+}
+
+/// Unregister a process: destroy all contexts and remove the process entry.
+/// Called on WASM instance drop for automatic cleanup.
+pub fn unregister_process(pid: ProcessId) {
+    for model_idx in 0..SERVICES.len() {
+        let _ = SERVICES.send(model_idx, Message::UnregisterProcess { pid });
     }
 }
 
@@ -225,45 +288,64 @@ pub async fn debug_context_state(model_idx: usize, id: ContextId) -> String {
     rx.await.unwrap_or_else(|_| "MISSING".to_string())
 }
 
-// ---------- Scheduling policy (broadcast to all models) ----------
-
-pub fn set_priority(weight: f64, pid_values: HashMap<ProcessId, f64>) {
-    for model_idx in 0..SERVICES.len() {
-        let _ = SERVICES.send(model_idx, Message::SetPriority {
-            weight, pid_values: pid_values.clone(),
-        });
-    }
-}
 
 // ---------- Market (broadcast to all models) ----------
 
-/// Execute one market tick on all models.
-/// Called per batch step from the inference scheduler.
-pub fn tick() {
+/// Execute one market tick on all models for a specific device.
+/// Called per batch completion from the inference scheduler.
+pub fn tick(device: usize, latency_secs: f64) {
     for model_idx in 0..SERVICES.len() {
-        let _ = SERVICES.send(model_idx, Message::Tick);
+        let _ = SERVICES.send(model_idx, Message::Tick { device, latency_secs });
     }
 }
 
-/// Get market state from a specific model's context manager.
-pub async fn get_market_state(model_idx: usize) -> pricing::MarketState {
-    let (tx, rx) = oneshot::channel();
-    let _ = SERVICES.send(model_idx, Message::GetMarketState { response: tx });
-    rx.await.unwrap_or_else(|_| pricing::MarketState::new(0))
+/// Get clearing price for a device from a specific model's context manager.
+/// Reads directly from the lock-free cache (zero actor overhead).
+pub fn get_clearing_price(model_idx: usize, device: usize) -> f64 {
+    MARKET.get(model_idx)
+        .and_then(|m| m.clearing_prices.get(&device).map(|v| *v))
+        .unwrap_or(0.0)
+}
+
+/// Get EWA-smoothed tick latency (seconds, α=0.1) for a device.
+/// Reads directly from the lock-free cache (zero actor overhead).
+pub fn get_tick_latency(model_idx: usize, device: usize) -> f64 {
+    MARKET.get(model_idx)
+        .and_then(|m| m.tick_latency_ewa.get(&device).map(|v| *v))
+        .unwrap_or(0.0)
+}
+
+/// Get dividend rate from a specific model's context manager.
+pub fn get_dividend_rate(model_idx: usize) -> f64 {
+    MARKET.get(model_idx)
+        .map(|m| m.get_dividend_rate())
+        .unwrap_or(0.0)
 }
 
 /// Get a process's credit balance.
-pub async fn get_balance(model_idx: usize, pid: ProcessId) -> f64 {
-    let (tx, rx) = oneshot::channel();
-    let _ = SERVICES.send(model_idx, Message::GetBalance { pid, response: tx });
-    rx.await.unwrap_or(0.0)
+pub fn get_balance(model_idx: usize, pid: ProcessId) -> f64 {
+    MARKET.get(model_idx)
+        .and_then(|m| m.balances.get(&pid).map(|v| *v))
+        .unwrap_or(0.0)
 }
 
-/// Set a context's bid (willingness to pay per token per step).
-pub async fn set_bid(model_idx: usize, id: ContextId, bid: f64) -> Result<()> {
+/// Get a process's endowment (fixed at creation, used for dividend weighting).
+pub fn get_endowment(model_idx: usize, pid: ProcessId) -> f64 {
+    MARKET.get(model_idx)
+        .and_then(|m| m.endowments.get(&pid).map(|v| *v))
+        .unwrap_or(0.0)
+}
+
+/// Get the device index assigned to a specific context.
+pub fn get_device(model_idx: usize, id: ContextId) -> usize {
+    CACHED_CONTEXT_INFO.get(&(model_idx, id)).map(|v| v.device).unwrap_or(0)
+}
+
+/// Set a context's bid (willingness to pay per page per step).
+pub async fn bid(model_idx: usize, id: ContextId, bid: f64) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::SetBid { id, bid, response: tx })?;
-    rx.await.context("context::set_bid: actor dropped response")?
+    SERVICES.send(model_idx, Message::Bid { id, bid, response: tx })?;
+    rx.await.context("context::bid: actor dropped response")?
 }
 
 /// Suspend a context (program-initiated).
@@ -279,24 +361,23 @@ pub fn tokens_per_page(model_idx: usize) -> u32 {
     PAGE_SIZES.get(model_idx).map(|v| *v as u32).unwrap_or(0)
 }
 
-// ---------- Actor-routed read/write APIs ----------
-
-pub async fn committed_page_count(model_idx: usize, id: ContextId) -> Result<u32> {
-    let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::CommittedPageCount { id, response: tx })?;
-    rx.await.context("context::committed_page_count: actor dropped response")
+/// Default endowment (in pages) for new processes on a model.
+pub fn default_endowment(model_idx: usize) -> f64 {
+    MARKET.get(model_idx).map(|m| m.default_credit as f64).unwrap_or(0.0)
 }
 
-pub async fn working_page_count(model_idx: usize, id: ContextId) -> Result<u32> {
-    let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::WorkingPageCount { id, response: tx })?;
-    rx.await.context("context::working_page_count: actor dropped response")
+// ---------- DashMap-cached reads (zero actor overhead) ----------
+
+pub fn committed_page_count(model_idx: usize, id: ContextId) -> u32 {
+    CACHED_CONTEXT_INFO.get(&(model_idx, id)).map(|v| v.committed_pages).unwrap_or(0)
 }
 
-pub async fn working_page_token_count(model_idx: usize, id: ContextId) -> Result<u32> {
-    let (tx, rx) = oneshot::channel();
-    SERVICES.send(model_idx, Message::WorkingPageTokenCount { id, response: tx })?;
-    rx.await.context("context::working_page_token_count: actor dropped response")
+pub fn working_page_count(model_idx: usize, id: ContextId) -> u32 {
+    CACHED_CONTEXT_INFO.get(&(model_idx, id)).map(|v| v.working_pages).unwrap_or(0)
+}
+
+pub fn working_page_token_count(model_idx: usize, id: ContextId) -> u32 {
+    CACHED_CONTEXT_INFO.get(&(model_idx, id)).map(|v| v.working_tokens).unwrap_or(0)
 }
 
 pub async fn truncate_working_page_tokens(model_idx: usize, id: ContextId, count: u32) -> Result<()> {
@@ -359,7 +440,7 @@ pub(crate) enum Record {
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextState {
+pub(crate) enum State {
     /// Active on GPU, ready for inference. Evictable.
     Active,
     /// Active on GPU, forward pass in progress — NOT immediately evictable.
@@ -369,7 +450,7 @@ pub(crate) enum ContextState {
     Suspended,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Context {
     /// Process that owns this context (None for named snapshots).
     pub owner: Option<ProcessId>,
@@ -395,14 +476,25 @@ pub(crate) struct Context {
     pub max_committed_position: Option<u32>,
 
     // Scheduling
-    pub state: ContextState,
+    pub state: State,
     /// Deferred suspension flag: set when context is Pinned and selected as victim.
     /// Actual suspension happens on clear_pinned.
     pub pending_suspend: bool,
     pub last_access: Instant,
-    /// Program-declared bid (willingness to pay per token per step).
-    /// 0.0 = no explicit bid; uses legacy weight-based scheduling.
+    /// Program-declared bid (willingness to pay per page per step).
     pub bid: f64,
+    /// CPU page IDs holding stashed working pages (exclusive, not in FlatPageStore).
+    /// Committed pages are tracked by the FlatPageStore FlatMap, not here.
+    pub cpu_working_pages: Vec<PhysicalPageId>,
+    /// Operations deferred while this context is Suspended.
+    /// Replayed after restoration completes.
+    pub deferred_ops: Vec<PendingAlloc>,
+    /// True while replay forward passes are in-flight after restoration.
+    pub pending_replay: bool,
+    /// True when the owning process couldn't afford full rent last tick.
+    /// Defaulted contexts are evicted first regardless of bid.
+    /// Recomputed each tick — not sticky.
+    pub defaulted: bool,
 }
 
 impl Context {
@@ -416,16 +508,20 @@ impl Context {
             lineage: Vec::new(),
             working_page_tokens: Vec::new(),
             max_committed_position: None,
-            state: ContextState::Active,
+            state: State::Active,
             pending_suspend: false,
             last_access: Instant::now(),
             bid: 0.0,
+            cpu_working_pages: Vec::new(),
+            deferred_ops: Vec::new(),
+            pending_replay: false,
+            defaulted: false,
         }
     }
 
-    pub fn is_active(&self) -> bool { self.state == ContextState::Active }
-    pub fn is_suspended(&self) -> bool { self.state == ContextState::Suspended }
-    pub fn is_pinned(&self) -> bool { self.state == ContextState::Pinned }
+    pub fn is_active(&self) -> bool { self.state == State::Active }
+    pub fn is_suspended(&self) -> bool { self.state == State::Suspended }
+    pub fn is_pinned(&self) -> bool { self.state == State::Pinned }
 
     /// Tip of the committed hash chain (last element), or None if empty.
     pub fn committed_tip(&self) -> Option<PageHash> { self.committed_hashes.last().copied() }
@@ -447,41 +543,51 @@ impl Context {
 
 #[derive(Debug)]
 pub(crate) struct ContextManager {
-    pub(crate) devices: Vec<PageStore>,
+    /// Per-device GPU page stores (radix trie). Indexed by device ordinal.
+    /// Manages committed KV-cache pages with refcounted prefix sharing.
+    pub(crate) gpu_stores: Vec<PageStore>,
+    /// Per-device CPU page stores (flat map). Indexed by device ordinal.
+    /// Holds stashed pages for suspended contexts (D2H copies).
+    pub(crate) cpu_stores: Vec<FlatPageStore>,
+    /// Tokens per KV-cache page. Used to convert token budgets to credit endowments.
     pub(crate) page_size: usize,
+    /// Index of the model this manager serves. Used for routing messages.
     pub(crate) model_idx: usize,
+    /// Named snapshots: (username, name) → snapshot context ID.
     pub(crate) snapshots: HashMap<(String, String), ContextId>,
+    /// Monotonically increasing context ID generator.
     next_id: u64,
-    /// Per-process scheduling, ownership, and transient suspension state.
+    /// Per-process state: credit balance, endowment, owned context IDs.
     pub(crate) processes: HashMap<ProcessId, ProcessEntry>,
-    /// Actor-local context state (page management, device, lineage, etc.)
+    /// Per-context state: pages, device, bid, lineage, suspension info.
     pub(crate) contexts: HashMap<ContextId, Context>,
-    /// FIFO queue: deferred GPU page requests from Running processes.
-    pub(crate) alloc_queue: VecDeque<PendingAlloc>,
-    /// Priority heap: Pending processes waiting for restoration.
-    pub(crate) restore_queue: BinaryHeap<PendingRestore>,
-    /// Market state: per-device prices, interest rate.
-    pub(crate) market: MarketState,
+    /// FIFO queue: contexts with pending deferred allocs waiting for free GPU pages.
+    pub(crate) alloc_queue: VecDeque<ContextId>,
+    /// Restore queue: suspended contexts waiting for restoration, served by highest bid.
+    pub(crate) restore_queue: Vec<ContextId>,
+    /// Per-device auction results from the last tick (clearing price, revenue, dividend rate).
+    pub(crate) auction_results: Vec<AuctionResult>,
+    /// Default credit endowment for new processes without an explicit token budget.
+    pub(crate) default_endowment: f64,
 }
 
 impl ContextManager {
-    /// Maximum GPU page utilization before `drain_queues` stops restoring
-    /// suspended processes. Keeps a headroom buffer (1 - cap) so running
-    /// processes can allocate pages without triggering eviction cascades.
-    const RESTORE_UTILIZATION_CAP: f64 = 0.85;
-
-    pub(crate) fn new(model_idx: usize, page_size: usize, num_gpu_pages: &[usize], num_cpu_pages: &[usize]) -> Self {
-        let devices: Vec<_> = num_gpu_pages.iter().zip(num_cpu_pages.iter())
-            .map(|(&gpu, &cpu)| PageStore::new(page_size, gpu, cpu))
+    pub(crate) fn new(model_idx: usize, page_size: usize, num_gpu_pages: &[usize], num_cpu_pages: &[usize], default_credit: usize) -> Self {
+        let gpu_stores: Vec<_> = num_gpu_pages.iter()
+            .map(|&n| PageStore::new(page_size, n))
+            .collect();
+        let cpu_stores: Vec<_> = num_cpu_pages.iter()
+            .map(|&n| FlatPageStore::new(n))
             .collect();
         ContextManager {
-            devices, page_size, model_idx,
+            gpu_stores, cpu_stores, page_size, model_idx,
             snapshots: HashMap::new(), next_id: 1,
             processes: HashMap::new(),
             contexts: HashMap::new(),
             alloc_queue: VecDeque::new(),
-            restore_queue: BinaryHeap::new(),
-            market: MarketState::new(num_gpu_pages.len()),
+            restore_queue: Vec::new(),
+            auction_results: vec![AuctionResult::default(); num_gpu_pages.len()],
+            default_endowment: default_credit as f64,
         }
     }
 
@@ -490,9 +596,9 @@ impl ContextManager {
     /// Any gap = leaked pages.
     #[allow(dead_code, unused_variables)]
     pub(crate) fn page_audit(&self) {
-        for (dev_idx, dev) in self.devices.iter().enumerate() {
-            let free = dev.available_gpu_pages();
-            let total = dev.total_gpu_pages();
+        for (dev_idx, dev) in self.gpu_stores.iter().enumerate() {
+            let free = dev.available();
+            let total = dev.total_pages();
             let (trie_pages, trie_rc, trie_nodes, rc0_interior) = dev.trie_stats();
 
             let mut working_active = 0usize;
@@ -508,17 +614,17 @@ impl ContextManager {
                 let ctx_dev = ctx.device.unwrap_or(0) as usize;
                 if ctx_dev != dev_idx { continue; }
                 match ctx.state {
-                    ContextState::Active => {
+                    State::Active => {
                         working_active += ctx.working_pages.len();
                         committed_active += ctx.committed_hashes.len();
                         n_active += 1;
                     }
-                    ContextState::Pinned => {
+                    State::Pinned => {
                         working_pinned += ctx.working_pages.len();
                         committed_pinned += ctx.committed_hashes.len();
                         n_pinned += 1;
                     }
-                    ContextState::Suspended => {
+                    State::Suspended => {
                         working_suspended += ctx.working_pages.len();
                         n_suspended += 1;
                     }
@@ -562,8 +668,8 @@ impl ContextManager {
     }
 
     fn least_loaded_device(&self) -> usize {
-        self.devices.iter().enumerate()
-            .max_by_key(|(_, d)| d.available_gpu_pages())
+        self.gpu_stores.iter().enumerate()
+            .max_by_key(|(_, d)| d.available())
             .map(|(i, _)| i).unwrap_or(0)
     }
 
@@ -579,6 +685,7 @@ impl ContextManager {
         let proc = self.process_entry(owner);
         proc.context_ids.push(id);
 
+        self.publish_context_counts(id);
         Ok(id)
     }
 
@@ -587,107 +694,55 @@ impl ContextManager {
             .ok_or_else(|| anyhow::anyhow!("Context {id} not found"))?;
 
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let committed_len = ctx.committed_len();
 
         if let Some(pid) = ctx.owner {
-            let proc = self.process_entry(pid);
-            proc.context_ids.retain(|&c| c != id);
-
-            // Pinned context with deferred suspension: decrement pending_pinned
-            // so drain_queues doesn't block on a context that no longer exists.
-            if ctx.is_pinned() && ctx.pending_suspend {
-                proc.pending_pinned = proc.pending_pinned.saturating_sub(1);
-            }
-
-            // Only decrement accounting if context was not Suspended
-            // (suspend_process already zeroed device pages).
-            if !ctx.is_suspended() {
-                let d = proc.device_mut(dev_idx);
-                d.committed -= committed_len;
-                d.working -= ctx.working_pages.len();
-            }
-
-            // Drop deferred ops that reference the destroyed context.
-            // Dropping the closure drops the captured Sender, closing the channel.
-            proc.deferred_ops.retain(|op| op.context_id != Some(id));
-
-            // Clean up empty process entries
-            if proc.context_ids.is_empty() {
-                self.processes.remove(&pid);
+            if let Some(proc) = self.processes.get_mut(&pid) {
+                proc.context_ids.retain(|&c| c != id);
             }
         }
 
-        // Drop stale PendingAlloc entries from alloc_queue for this context.
-        self.alloc_queue.retain(|pa| pa.context_id != Some(id));
+        // Drop this context from alloc_queue.
+        self.alloc_queue.retain(|&ctx_id| ctx_id != id);
+
+        // Remove from restore_queue
+        self.restore_queue.retain(|&ctx_id| ctx_id != id);
 
         // Release committed chain (skip if already released during suspension)
         if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
-            self.devices[dev_idx].release(&ctx.committed_hashes);
+            self.gpu_stores[dev_idx].release(&ctx.committed_hashes);
         }
 
         // Free working pages (GPU when Active/Pinned; empty when Suspended).
         if !ctx.working_pages.is_empty() {
-            self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
+            self.gpu_stores[dev_idx].free(&ctx.working_pages);
+        }
+
+        // Free CPU working pages stash (if suspended with CPU stash).
+        if !ctx.cpu_working_pages.is_empty() {
+            self.cpu_stores[dev_idx].free(&ctx.cpu_working_pages);
+        }
+
+        // Release CPU-resident committed pages (suspended contexts may have
+        // had their committed pages stashed to CPU via would_free + cpu.insert).
+        if ctx.is_suspended() && !ctx.committed_hashes.is_empty() {
+            self.cpu_stores[dev_idx].release(&ctx.committed_hashes);
         }
 
         self.snapshots.retain(|_, v| *v != id);
 
+        self.remove_context_caches(id);
         self.drain_queues();
         Ok(())
     }
 
-    /// Destroy all contexts owned by a process.
-    /// Drops all deferred ops (closing channels), frees all resources, removes the process entry.
-    pub(crate) fn destroy_all(&mut self, pid: ProcessId) {
-        let proc = match self.processes.remove(&pid) {
-            Some(p) => p,
-            None => return,
-        };
+    
 
-        let _num_ctxs = proc.context_ids.len();
-        let _num_deferred = proc.deferred_ops.len();
-        let _was_pending = proc.state == ProcessState::Pending;
-
-        // Drop stale PendingAlloc entries from alloc_queue for this process's contexts.
-        let ctx_ids: std::collections::HashSet<ContextId> = proc.context_ids.iter().copied().collect();
-        self.alloc_queue.retain(|pa| {
-            !pa.context_id.map_or(false, |cid| ctx_ids.contains(&cid))
-        });
-
-        // Remove from restore_queue
-        self.restore_queue.retain(|w| w.process_id != pid);
-
-        // Destroy all owned contexts
-        let mut _pages_freed = 0usize;
-        for ctx_id in proc.context_ids {
-            if let Some(ctx) = self.contexts.remove(&ctx_id) {
-                let dev_idx = ctx.device.unwrap_or(0) as usize;
-                if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
-                    _pages_freed += self.devices[dev_idx].release(&ctx.committed_hashes);
-                }
-                if !ctx.working_pages.is_empty() {
-                    _pages_freed += ctx.working_pages.len();
-                    self.devices[dev_idx].free_gpu_pages(&ctx.working_pages);
-                }
-                self.snapshots.retain(|_, v| *v != ctx_id);
-            }
-        }
-
-        // tracing::debug!("[LIFECYCLE] DESTROY_ALL: pid={} ctxs={} deferred={} was_pending={} pages_freed={} | rq={} aq={} procs={} free={:?}",
-        //     &pid.to_string()[..8], num_ctxs, num_deferred, was_pending, pages_freed,
-        //     self.restore_queue.len(), self.alloc_queue.len(), self.processes.len(),
-        //     self.devices.iter().map(|d| d.available_gpu_pages()).collect::<Vec<_>>());
-
-        // self.page_audit();
-
-        self.drain_queues();
-    }
     
 
     // ==================== Page Management ====================
 
     /// Handle a ReserveWorkingPages message per DESIGN.md §4.
-    /// Delegates to the universal `with_gpu_pages` contention primitive.
+    /// Delegates to the universal `when_allocated` contention primitive.
     pub(crate) fn reserve_working_pages(
         &mut self,
         id: ContextId,
@@ -704,21 +759,13 @@ impl ContextManager {
             None => { let _ = response.send(Err(anyhow::anyhow!("Context not found"))); return; }
         };
         let dev_idx = ctx.device.unwrap_or(0) as usize;
-        let owner = ctx.owner;
 
-        // Alloc is only possible through an owning process.
-        let pid = match owner {
-            Some(pid) => pid,
-            None => { let _ = response.send(Err(anyhow::anyhow!("Context has no owning process"))); return; }
-        };
-
-        self.with_gpu_pages(pid, dev_idx, num_pages, Some(id), move |mgr, pages| {
-            let n = pages.len();
+        self.when_allocated(id, dev_idx, num_pages, move |mgr, pages| {
             if let Some(ctx) = mgr.contexts.get_mut(&id) {
                 ctx.working_pages.extend_from_slice(&pages);
                 ctx.device = Some(dev_idx);
             }
-            mgr.process_entry(pid).device_mut(dev_idx).working += n;
+            mgr.publish_context_counts(id);
             let _ = response.send(Ok(()));
         });
     }
@@ -739,14 +786,10 @@ impl ContextManager {
         let len = ctx.working_page_tokens.len();
         ctx.working_page_tokens.truncate(len.saturating_sub(tokens_to_remove));
 
-        if ctx.is_suspended() {
-            // Suspended contexts have empty working_pages — nothing to free.
-        } else {
-            self.devices[dev_idx].free_gpu_pages(&to_free);
-            if let Some(pid) = ctx.owner {
-                self.process_entry(pid).device_mut(dev_idx).working -= num_pages;
-            }
+        if !ctx.is_suspended() {
+            self.gpu_stores[dev_idx].free(&to_free);
         }
+        self.publish_context_counts(id);
         self.drain_queues();
         Ok(())
     }
@@ -801,7 +844,7 @@ impl ContextManager {
         // pages are not shared with unperturbed or differently-seeded pages).
         let hashes = pagestore::compute_page_hashes(page_size, &tokens, &positions, &masks, prev_hash, lineage_adapter_seed);
         let existing_prefix = ctx.committed_hashes.clone();
-        let dev = &mut self.devices[dev_idx];
+        let dev = &mut self.gpu_stores[dev_idx];
 
         // Commit: physical (GPU promotion + dedup) or logical (metadata only).
         if ctx.is_suspended() {
@@ -840,16 +883,8 @@ impl ContextManager {
             ctx.lineage.push(Record::Fill { tokens, positions, mask: masks, adapter: lineage_adapter, adapter_seed: lineage_adapter_seed });
         }
 
-        // Scheduler accounting (skip for Suspended — already zeroed).
-        if !ctx.is_suspended() {
-            if let Some(pid) = ctx.owner {
-                let d = self.process_entry(pid).device_mut(dev_idx);
-                d.committed += num_pages;
-                d.working -= num_pages;
-            }
-        }
-
         self.drain_queues();
+        self.publish_context_counts(id);
         Ok(())
     }
 
@@ -857,24 +892,14 @@ impl ContextManager {
     ///
     /// Resolves physical page IDs for committed + working pages, computes
     /// `last_page_len`, and returns `PinnedContext` for the inference forward pass.
-    /// If the owning process is Pending, defers the operation until restoration.
+    /// If the context is Suspended, defers the operation until restoration.
     pub(crate) fn pin(
         &mut self,
         id: ContextId,
         num_input_tokens: u32,
         response: oneshot::Sender<Result<PinnedContext>>,
     ) {
-        let ctx = match self.contexts.get(&id) {
-            Some(c) => c,
-            None => { let _ = response.send(Err(anyhow::anyhow!("Context not found"))); return; }
-        };
-
-        let pid = match ctx.owner {
-            Some(pid) => pid,
-            None => { let _ = response.send(Err(anyhow::anyhow!("Context has no owning process"))); return; }
-        };
-
-        self.with_gpu(pid, Some(id), move |mgr| {
+        self.when_active(id, move |mgr| {
             let result = (|| -> Result<PinnedContext> {
                 let ctx = mgr.contexts.get_mut(&id)
                     .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
@@ -886,11 +911,11 @@ impl ContextManager {
                 let working = ctx.working_pages.clone();
                 let kv_len = (ctx.committed_len() * mgr.page_size
                     + ctx.working_page_tokens.len()) as u32;
-                ctx.state = ContextState::Pinned;
+                ctx.state = State::Pinned;
 
                 let mut page_ids = Vec::new();
                 if !committed_hashes.is_empty() {
-                    page_ids.extend(mgr.devices[dev_idx].physical_ids(&committed_hashes));
+                    page_ids.extend(mgr.gpu_stores[dev_idx].physical_ids(&committed_hashes));
                 }
                 page_ids.extend(&working);
 
@@ -909,27 +934,24 @@ impl ContextManager {
         });
     }
 
-    /// Handle ClearPinned message: Pinned → Active, then check deferred suspension.
-    /// If `pending_suspend` was set, executes the deferred suspension and
-    /// decrements `ProcessEntry.pending_pinned`.
+    /// Handle Unpin message: Pinned → Active, then check deferred suspension.
+    /// If `pending_suspend` was set (and this isn't a replay context),
+    /// executes the deferred suspension and enqueues for restoration.
     pub(crate) fn unpin(&mut self, id: ContextId) {
-        let pending = match self.contexts.get(&id) {
-            Some(ctx) if ctx.is_pinned() => ctx.pending_suspend,
+        let (pending, replay) = match self.contexts.get(&id) {
+            Some(ctx) if ctx.is_pinned() => (ctx.pending_suspend, ctx.pending_replay),
             _ => return,
         };
 
-        if pending {
-            // Deferred suspension: context stays Pinned until suspend_context
-            // transitions it to Suspended.
-            let owner = self.contexts.get(&id).and_then(|c| c.owner);
-            self.suspend_context(id);
+        // If this is a replay context, replay_complete handles the transition.
+        if replay {
+            return;
+        }
 
-            // Decrement pending_pinned_count for the owning process.
-            if let Some(pid) = owner {
-                if let Some(proc) = self.processes.get_mut(&pid) {
-                    proc.pending_pinned = proc.pending_pinned.saturating_sub(1);
-                }
-            }
+        if pending {
+            // Deferred suspension: suspend the context and enqueue for restoration.
+            self.suspend(id);
+            self.enqueue_restore(id);
 
             // Deferred suspension may have freed pages — drain queues.
             self.drain_queues();
@@ -938,63 +960,79 @@ impl ContextManager {
 
         // No deferred suspension — normal Pinned → Active transition.
         if let Some(ctx) = self.contexts.get_mut(&id) {
-            ctx.state = ContextState::Active;
+            ctx.state = State::Active;
         }
     }
+
 
     /// Central queue drain: called after any event that frees GPU pages.
     ///
     /// Phase 1: alloc_queue (FIFO) — invoke deferred GPU operation callbacks.
-    /// Phase 2: restore_queue (priority heap) — restore highest-priority Pending
-    ///          process, then replay its deferred_op.
+    /// Phase 2: restore_queue (priority heap) — restore highest-bid Suspended
+    ///          context, with per-restore placement evaluation (§4.3).
     pub(crate) fn drain_queues(&mut self) {
-        // Phase 1: alloc_queue FIFO (head-of-line blocking).
-        while let Some(front) = self.alloc_queue.front() {
-            let (dev_idx, n) = (front.device, front.num_pages);
-            if self.devices[dev_idx].available_gpu_pages() < n {
+        // Phase 1: alloc_queue FIFO — serve deferred ops for head context.
+        while let Some(&front_ctx_id) = self.alloc_queue.front() {
+            // Skip stale entries (destroyed contexts or empty deferred_ops).
+            let front_op = match self.contexts.get(&front_ctx_id)
+                .and_then(|c| c.deferred_ops.first())
+            {
+                Some(op) => op,
+                None => { self.alloc_queue.pop_front(); continue; }
+            };
+            let (dev_idx, n) = (front_op.device, front_op.num_pages);
+            if n > 0 && self.gpu_stores[dev_idx].available() < n {
                 break;
             }
-            let waiter = self.alloc_queue.pop_front().unwrap();
-            let pages = self.devices[dev_idx].alloc_gpu_pages(n).unwrap();
-            (waiter.on_alloc)(self, pages);
+            let ctx_id = self.alloc_queue.pop_front().unwrap();
+            self.fire_deferred_ops(ctx_id);
         }
 
-        // Phase 2: restore_queue (priority heap)
+        // Phase 2: restore_queue — find and restore highest-bid Suspended context.
         // Only proceed if alloc_queue is empty (allocs have strict priority).
         if !self.alloc_queue.is_empty() {
             return;
         }
 
-        while let Some(top) = self.restore_queue.peek() {
-            let pid = top.process_id;
+        let num_devices = self.gpu_stores.len();
+        let max_attempts = self.restore_queue.len();
+        let mut attempts = 0;
+        while let Some(ctx_id) = self.highest_bid_in_restore_queue() {
+            // Remove this entry from the queue.
+            self.restore_queue.retain(|&id| id != ctx_id);
 
-            // Wait if the process still has Pinned contexts mid-forward-pass.
-            if self.processes.get(&pid).map(|p| p.pending_pinned).unwrap_or(0) > 0 {
-                break;
+            // Skip stale entries (context was destroyed or already restored).
+            let is_suspended = self.contexts.get(&ctx_id)
+                .map(|c| c.is_suspended()).unwrap_or(false);
+            if !is_suspended {
+                continue;
             }
 
-            // Hard admission control: don't restore when any device is near
-            // page capacity. This prevents over-admission that causes the
-            // thrashing cascade (evict→restore→re-evict cycle). Processes
-            // wait here until running processes complete and free pages,
-            // naturally dropping utilization below the threshold.
-            let over_capacity = self.devices.iter().any(|d| {
-                let (used, total) = d.stats();
-                let utilization = used as f64 / total.max(1) as f64;
-                utilization > Self::RESTORE_UTILIZATION_CAP
-            });
-            if over_capacity {
-                break;
+            // Per-restore placement evaluation (§4.3): check if a different
+            // device would be cheaper before restoring.
+            if num_devices > 1 {
+                if let Some(ctx) = self.contexts.get(&ctx_id) {
+                    let best = self.best_device_for(ctx);
+                    if best != ctx.device.unwrap_or(0) as usize {
+                        if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                            ctx.device = Some(best);
+                        }
+                    }
+                }
             }
 
-            // Admission check: enough pages on all devices?
-            if !self.can_restore_all(pid) {
-                break;
+            // Admission check: enough free pages for this context?
+            if !self.can_restore(ctx_id) {
+                self.enqueue_restore(ctx_id);
+                attempts += 1;
+                if attempts >= max_attempts {
+                    break;
+                }
+                continue;
             }
 
-            let waiter = self.restore_queue.pop().unwrap();
-            if let Err(e) = self.restore_all(waiter.process_id) {
-                tracing::error!(pid = %waiter.process_id, "restore_all failed: {e:#}");
+            if let Err(e) = self.restore(ctx_id) {
+                tracing::error!(ctx = ctx_id, "restore failed: {e:#}");
             }
         }
     }
@@ -1003,32 +1041,26 @@ impl ContextManager {
 
 
     pub(crate) fn stats(&self) -> Vec<(usize, usize)> {
-        self.devices.iter().map(|d| d.stats()).collect()
+        self.gpu_stores.iter().map(|d| d.stats()).collect()
     }
 
-    pub(crate) fn set_priority(&mut self, weight: f64, pid_values: HashMap<ProcessId, f64>) {
-        for (pid, value) in pid_values {
-            self.process_entry(pid).weight = weight * value;
+    /// Publish the per-context counts + device to the global cache.
+    /// Called after any mutation that changes working pages, committed pages,
+    /// working page tokens, or device assignment.
+    pub(crate) fn publish_context_counts(&self, id: ContextId) {
+        if let Some(ctx) = self.contexts.get(&id) {
+            CACHED_CONTEXT_INFO.insert((self.model_idx, id), CachedContextInfo {
+                device: ctx.device.unwrap_or(0) as usize,
+                working_pages: ctx.working_pages.len() as u32,
+                committed_pages: ctx.committed_len() as u32,
+                working_tokens: ctx.working_page_tokens.len() as u32,
+            });
         }
-        self.drain_queues();
     }
 
-    pub(crate) fn working_page_count(&self, id: ContextId) -> u32 {
-        self.contexts.get(&id)
-            .map(|c| c.working_pages.len() as u32)
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn committed_page_count(&self, id: ContextId) -> u32 {
-        self.contexts.get(&id)
-            .map(|c| c.committed_len() as u32)
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn working_page_token_count(&self, id: ContextId) -> u32 {
-        self.contexts.get(&id)
-            .map(|c| c.working_page_tokens.len() as u32)
-            .unwrap_or(0)
+    /// Remove cached entry for a context (on destroy).
+    pub(crate) fn remove_context_caches(&self, id: ContextId) {
+        CACHED_CONTEXT_INFO.remove(&(self.model_idx, id));
     }
 
     pub(crate) fn truncate_working_page_tokens(&mut self, id: ContextId, count: u32) -> Result<()> {
@@ -1080,7 +1112,7 @@ impl ContextManager {
 
 #[derive(Debug)]
 pub(crate) enum Message {
-    LookupSnapshot { username: String, name: String, response: oneshot::Sender<Result<ContextId>> },
+    Lookup { username: String, name: String, response: oneshot::Sender<Result<ContextId>> },
     Create { owner: ProcessId, response: oneshot::Sender<Result<ContextId>> },
     Save { id: ContextId, username: String, name: Option<String>, response: oneshot::Sender<Result<Option<String>>> },
     Delete { username: String, name: String, response: oneshot::Sender<Result<()>> },
@@ -1095,10 +1127,7 @@ pub(crate) enum Message {
     ReplayComplete { id: ContextId },
     GetStats { response: oneshot::Sender<Vec<(usize, usize)>> },
 
-    // Actor-routed read/write APIs (previously DashMap-based)
-    WorkingPageCount { id: ContextId, response: oneshot::Sender<u32> },
-    CommittedPageCount { id: ContextId, response: oneshot::Sender<u32> },
-    WorkingPageTokenCount { id: ContextId, response: oneshot::Sender<u32> },
+    // Actor-routed write APIs
     TruncateWorkingPageTokens { id: ContextId, count: u32, response: oneshot::Sender<Result<()>> },
     AppendWorkingPageTokens {
         id: ContextId, tokens: Vec<u32>, positions: Vec<u32>,
@@ -1107,18 +1136,15 @@ pub(crate) enum Message {
     },
 
     DebugState { id: ContextId, response: oneshot::Sender<String> },
-    SetPriority { weight: f64, pid_values: HashMap<ProcessId, f64> },
-    DestroyAll { pid: ProcessId },
+
+    RegisterProcess { pid: ProcessId, token_budget: Option<usize> },
+    UnregisterProcess { pid: ProcessId },
 
     // ── Market messages ────────────────────────────────────────
-    /// Execute one market tick: compute prices, collect rent, distribute interest.
-    Tick,
-    /// Read current market state (prices, interest rate).
-    GetMarketState { response: oneshot::Sender<MarketState> },
-    /// Read a process's credit balance.
-    GetBalance { pid: ProcessId, response: oneshot::Sender<f64> },
-    /// Set a context's bid.
-    SetBid { id: ContextId, bid: f64, response: oneshot::Sender<Result<()>> },
+    /// Execute one market tick for a single device.
+    Tick { device: usize, latency_secs: f64 },
+    /// Set a context's bid (willingness to pay per page per step).
+    Bid { id: ContextId, bid: f64, response: oneshot::Sender<Result<()>> },
     /// Suspend a context (program-initiated).
     Suspend { id: ContextId, response: oneshot::Sender<Result<()>> },
 }
@@ -1128,7 +1154,7 @@ impl ServiceHandler for ContextManager {
 
     async fn handle(&mut self, msg: Message) {
         match msg {
-            Message::LookupSnapshot { username, name, response } => {
+            Message::Lookup { username, name, response } => {
                 let result = self.snapshots.get(&(username, name))
                     .copied()
                     .ok_or_else(|| anyhow::anyhow!("Snapshot not found"));
@@ -1173,84 +1199,33 @@ impl ServiceHandler for ContextManager {
             Message::GetStats { response } => {
                 let _ = response.send(self.stats());
             }
-            Message::SetPriority { weight, pid_values } => {
-                self.set_priority(weight, pid_values);
-            }
-            Message::WorkingPageCount { id, response } => {
-                let _ = response.send(self.working_page_count(id));
-            }
-            Message::CommittedPageCount { id, response } => {
-                let _ = response.send(self.committed_page_count(id));
-            }
-            Message::WorkingPageTokenCount { id, response } => {
-                let _ = response.send(self.working_page_token_count(id));
-            }
             Message::TruncateWorkingPageTokens { id, count, response } => {
                 let _ = response.send(self.truncate_working_page_tokens(id, count));
+                self.publish_context_counts(id);
             }
             Message::AppendWorkingPageTokens { id, tokens, positions, masks, adapter, adapter_seed, response } => {
                 let _ = response.send(self.append_working_page_tokens(id, tokens, positions, masks, adapter, adapter_seed));
+                self.publish_context_counts(id);
             }
             Message::DebugState { id, response } => {
                 let _ = response.send(self.debug_state(id));
             }
-            Message::DestroyAll { pid } => {
-                self.destroy_all(pid);
+            Message::RegisterProcess { pid, token_budget } => {
+                self.register_process(pid, token_budget);
+            }
+            Message::UnregisterProcess { pid } => {
+                self.unregister_process(pid);
             }
 
             // ── Market handlers ────────────────────────────────────
-            Message::Tick => {
-                pricing::tick(&self.devices, &mut self.processes, &mut self.market);
+            Message::Tick { device, latency_secs } => {
+                self.tick(device, latency_secs);
             }
-            Message::GetMarketState { response } => {
-                let _ = response.send(self.market.clone());
-            }
-            Message::GetBalance { pid, response } => {
-                let balance = self.processes.get(&pid)
-                    .map(|p| p.balance)
-                    .unwrap_or(0.0);
-                let _ = response.send(balance);
-            }
-            Message::SetBid { id, bid, response } => {
-                let result = match self.contexts.get_mut(&id) {
-                    Some(ctx) => { ctx.bid = bid; Ok(()) }
-                    None => Err(anyhow::anyhow!("Context {id} not found")),
-                };
-                let _ = response.send(result);
+            Message::Bid { id, bid, response } => {
+                let _ = response.send(self.bid(id, bid));
             }
             Message::Suspend { id, response } => {
-                let result = match self.contexts.get(&id) {
-                    Some(ctx) if ctx.is_active() => {
-                        let pid = ctx.owner;
-                        self.suspend_context(id);
-                        // If the process has all contexts suspended,
-                        // transition to Pending and enqueue for restoration.
-                        if let Some(pid) = pid {
-                            let all_suspended = self.processes.get(&pid)
-                                .map(|p| p.context_ids.iter().all(|&cid| {
-                                    self.contexts.get(&cid)
-                                        .map(|c| c.is_suspended())
-                                        .unwrap_or(true)
-                                }))
-                                .unwrap_or(true);
-                            if all_suspended {
-                                if let Some(proc) = self.processes.get_mut(&pid) {
-                                    proc.state = ProcessState::Pending;
-                                }
-                                let floor = self.processes.get(&pid)
-                                    .map(|p| p.weight)
-                                    .unwrap_or(0.0);
-                                self.enqueue_restore(pid, floor, 0);
-                            }
-                        }
-                        self.drain_queues();
-                        Ok(())
-                    }
-                    Some(ctx) if ctx.is_suspended() => Ok(()), // already suspended
-                    Some(_) => Err(anyhow::anyhow!("Context {id} is pinned, cannot voluntarily suspend")),
-                    None => Err(anyhow::anyhow!("Context {id} not found")),
-                };
-                let _ = response.send(result);
+                let _ = response.send(self.voluntary_suspend(id));
             }
         }
     }

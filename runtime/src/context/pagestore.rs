@@ -452,6 +452,65 @@ impl TrieNode {
         }
     }
 
+    /// Like `count_reclaimable_path`, but returns the actual hashes that would
+    /// be freed (those with rc=1 that will reach rc=0 on release).
+    /// Returns `true` if this subtree is fully reclaimable (node + all children
+    /// along the path would be freed), so parent nodes can include themselves.
+    fn would_free_hashes(&self, hashes: &[PageHash], out: &mut Vec<PageHash>) -> bool {
+        if hashes.is_empty() { return true; }
+        if let Some(child) = self.children.get(&hashes[0]) {
+            let node_len = child.prefix_hashes.len();
+            if hashes.len() < node_len {
+                // Partial match — would not free.
+                return false;
+            }
+            // Recurse into deeper nodes.
+            let subtree_reclaimable = if hashes.len() > node_len {
+                child.would_free_hashes(&hashes[node_len..], out)
+            } else {
+                true // Exact match at this node — no deeper children on this path.
+            };
+            // This node is reclaimable if rc=1 AND either:
+            //   - it's a leaf (no children), OR
+            //   - it has children but the child along our path is fully reclaimable
+            //     AND it has no other children (so it becomes childless after release).
+            let reclaimable = child.refcount <= 1
+                && (child.children.is_empty()
+                    || (subtree_reclaimable && child.children.len() == 1));
+            if reclaimable {
+                out.extend_from_slice(&child.prefix_hashes);
+            }
+            reclaimable
+        } else {
+            false // Hash not found in trie.
+        }
+    }
+
+    /// Shapley effective pages along a chain: sum of `prefix.len() / refcount`
+    /// per trie node touched by the path.
+    fn effective_pages_path(&self, hashes: &[PageHash]) -> f64 {
+        if hashes.is_empty() { return 0.0; }
+        match self.children.get(&hashes[0]) {
+            Some(child) => {
+                let matched = child.match_len(hashes);
+                let node_len = child.prefix_hashes.len();
+                let rc = child.refcount.max(1) as f64;
+
+                if matched < node_len {
+                    // Partial match — only the matched portion counts.
+                    matched as f64 / rc
+                } else if hashes.len() > node_len {
+                    // Full match — this node's cost + recurse.
+                    (node_len as f64 / rc) + child.effective_pages_path(&hashes[node_len..])
+                } else {
+                    // Exact match (tip).
+                    node_len as f64 / rc
+                }
+            }
+            None => 0.0,
+        }
+    }
+
     /// Bump rc along the path (fork). Split-on-fork for partial hash matches.
     fn fork_path(&mut self, hashes: &[PageHash]) {
         if hashes.is_empty() { return; }
@@ -498,40 +557,41 @@ fn common_prefix_len(a: &[PageHash], b: &[PageHash]) -> usize {
 // =============================================================================
 
 /// Per-device page cache backed by a Radix Trie with path-inclusive refcounting.
+///
+/// Manages a single physical page pool (GPU or CPU — the PageStore is tier-agnostic)
+/// and a CAS trie for content-addressed committed page sharing.
 #[derive(Debug)]
 pub struct PageStore {
     page_size: usize,
     root: TrieNode,
-    gpu: PagePool,
-    cpu: PagePool,
+    pool: PagePool,
 }
 
 impl PageStore {
-    pub fn new(page_size: usize, num_gpu_pages: usize, num_cpu_pages: usize) -> Self {
+    pub fn new(page_size: usize, num_pages: usize) -> Self {
         PageStore {
             page_size,
             root: TrieNode::new_root(),
-            gpu: PagePool::new(num_gpu_pages),
-            cpu: PagePool::new(num_cpu_pages),
+            pool: PagePool::new(num_pages),
         }
     }
 
     pub fn page_size(&self) -> usize { self.page_size }
 
     pub fn stats(&self) -> (usize, usize) {
-        (self.gpu.used(), self.gpu.total)
+        (self.pool.used(), self.pool.total)
     }
 
-    pub fn available_gpu_pages(&self) -> usize { self.gpu.available() }
+    pub fn available(&self) -> usize { self.pool.available() }
 
     /// Returns (total_pages_in_trie, total_rc_sum, node_count, rc0_interior_nodes)
     pub fn trie_stats(&self) -> (usize, usize, usize, usize) {
         self.root.trie_stats()
     }
 
-    pub fn total_gpu_pages(&self) -> usize { self.gpu.total }
-    pub fn pool_stats(&self) -> (usize, usize) { self.gpu.pool_stats() }
-    pub fn tag_stats(&self) -> (usize, usize, usize) { self.gpu.tag_stats() }
+    pub fn total_pages(&self) -> usize { self.pool.total }
+    pub fn pool_stats(&self) -> (usize, usize) { self.pool.pool_stats() }
+    pub fn tag_stats(&self) -> (usize, usize, usize) { self.pool.tag_stats() }
 
     /// Audit: count pages that exist in both trie AND the free set.
     /// These are phantom pages — they've been freed to the pool but still appear
@@ -541,7 +601,7 @@ impl PageStore {
         self.root.collect_phys_with_info(&mut all_pages, 0);
         let mut phantoms = Vec::new();
         for &(page, rc, prefix_len, depth) in &all_pages {
-            if self.gpu.free_set.contains(&page) {
+            if self.pool.free_set.contains(&page) {
                 phantoms.push((page, rc, prefix_len, depth));
             }
         }
@@ -552,23 +612,15 @@ impl PageStore {
     }
 
     // =========================================================================
-    // Working pages (bulk alloc via split_off)
+    // Page allocation (bulk alloc via split_off)
     // =========================================================================
 
-    pub fn alloc_gpu_pages(&mut self, n: usize) -> Option<Vec<PhysicalPageId>> {
-        self.gpu.alloc_n(n)
+    pub fn alloc(&mut self, n: usize) -> Option<Vec<PhysicalPageId>> {
+        self.pool.alloc_n(n)
     }
 
-    pub fn free_gpu_pages(&mut self, pages: &[PhysicalPageId]) {
-        self.gpu.free_tagged(pages, "free_gpu_pages");
-    }
-
-    pub fn alloc_cpu_pages(&mut self, n: usize) -> Option<Vec<PhysicalPageId>> {
-        self.cpu.alloc_n(n)
-    }
-
-    pub fn free_cpu_pages(&mut self, pages: &[PhysicalPageId]) {
-        self.cpu.free_batch(pages);
+    pub fn free(&mut self, pages: &[PhysicalPageId]) {
+        self.pool.free_tagged(pages, "free_pages");
     }
 
     // =========================================================================
@@ -595,7 +647,7 @@ impl PageStore {
         self.root.navigate_and_extend(prefix, new_hashes, new_phys, &mut reclaimed_pages);
 
         if !reclaimed_pages.is_empty() {
-            self.gpu.free_tagged(&reclaimed_pages, "reclaim");
+            self.pool.free_tagged(&reclaimed_pages, "reclaim");
         }
     }
 
@@ -625,7 +677,7 @@ impl PageStore {
     /// and have no children. Returns the number of GPU pages freed.
     pub fn release(&mut self, hashes: &[PageHash]) -> usize {
         if hashes.is_empty() { return 0; }
-        let (freed, _) = self.root.release_path(hashes, &mut self.gpu);
+        let (freed, _) = self.root.release_path(hashes, &mut self.pool);
         freed
     }
 
@@ -633,6 +685,18 @@ impl PageStore {
     pub fn count_reclaimable(&self, hashes: &[PageHash]) -> usize {
         if hashes.is_empty() { return 0; }
         self.root.count_reclaimable_path(hashes)
+    }
+
+    /// Return the hashes that would be freed by `release(hashes)` — i.e., pages
+    /// with rc=1 and no children (will reach rc=0 on release).
+    ///
+    /// Read-only, O(depth). Used to identify which pages to D2H copy to CPU
+    /// before calling `release()`, solving the D2H-before-release ordering problem.
+    pub fn would_free(&self, hashes: &[PageHash]) -> Vec<PageHash> {
+        if hashes.is_empty() { return Vec::new(); }
+        let mut out = Vec::new();
+        self.root.would_free_hashes(hashes, &mut out);
+        out
     }
 
     // =========================================================================
@@ -656,6 +720,143 @@ impl PageStore {
     pub fn debug_info(&self, hashes: &[PageHash]) -> String {
         let prefix = self.prefix_len(hashes);
         format!("trie_v2: prefix_len={prefix}/{}", hashes.len())
+    }
+
+    /// Shapley cost-sharing: effective page count for a context's committed chain.
+    ///
+    /// Walks the path through the trie matching `hashes` and sums
+    /// `node.pages / node.refcount` per node. Shared prefix segments are split
+    /// equally among all contexts sharing them (the Shapley value for additive
+    /// cost games). Unique suffix segments count at full cost.
+    ///
+    /// Returns the fractional effective page count.
+    pub fn effective_pages(&self, hashes: &[PageHash]) -> f64 {
+        if hashes.is_empty() { return 0.0; }
+        self.root.effective_pages_path(hashes)
+    }
+}
+
+// =============================================================================
+// FlatPageStore — FlatMap-based CPU tier storage
+// =============================================================================
+
+/// CPU-tier page store using a flat hash map with refcounting.
+///
+/// Unlike the GPU `PageStore` (CAS Trie), this supports out-of-order insertion:
+/// a suffix can be stashed before its prefix, which is the normal case when
+/// contexts are suspended at different times but share a prefix.
+///
+/// The pool is shared across committed page stash, working page stash, and
+/// snapshot swap storage.
+#[derive(Debug)]
+pub struct FlatPageStore {
+    /// Hash → (physical CPU page ID, refcount).
+    map: FxHashMap<PageHash, (PhysicalPageId, usize)>,
+    /// Physical CPU page allocation pool.
+    pub(crate) pool: PagePool,
+}
+
+impl FlatPageStore {
+    pub fn new(num_pages: usize) -> Self {
+        FlatPageStore {
+            map: FxHashMap::default(),
+            pool: PagePool::new(num_pages),
+        }
+    }
+
+    /// Insert pages into the CPU store. On dedup hit (hash already present),
+    /// bumps refcount and frees the duplicate physical page back to the pool.
+    pub fn insert(&mut self, hashes: &[PageHash], phys_ids: &[PhysicalPageId]) {
+        debug_assert_eq!(hashes.len(), phys_ids.len());
+        for (&hash, &phys) in hashes.iter().zip(phys_ids.iter()) {
+            match self.map.get_mut(&hash) {
+                Some(entry) => {
+                    // Dedup hit: bump rc, free the duplicate page.
+                    entry.1 += 1;
+                    self.pool.free(phys);
+                }
+                None => {
+                    self.map.insert(hash, (phys, 1));
+                }
+            }
+        }
+    }
+
+    /// Decrement refcount for each hash. Free pages reaching rc=0.
+    /// Returns the number of pages freed.
+    pub fn release(&mut self, hashes: &[PageHash]) -> usize {
+        let mut freed = 0;
+        for hash in hashes {
+            if let Some(entry) = self.map.get_mut(hash) {
+                entry.1 = entry.1.saturating_sub(1);
+                if entry.1 == 0 {
+                    let (phys, _) = self.map.remove(hash).unwrap();
+                    self.pool.free(phys);
+                    freed += 1;
+                }
+            }
+        }
+        freed
+    }
+
+    /// Look up physical page IDs for hashes present in the store.
+    /// Returns a vec of page IDs for hashes that are found; missing hashes are skipped.
+    pub fn physical_ids(&self, hashes: &[PageHash]) -> Vec<PhysicalPageId> {
+        hashes.iter().filter_map(|h| self.map.get(h).map(|&(p, _)| p)).collect()
+    }
+
+    /// Count consecutive hashes (from the start) present in the CPU store.
+    pub fn prefix_len(&self, hashes: &[PageHash]) -> usize {
+        for (i, h) in hashes.iter().enumerate() {
+            if !self.map.contains_key(h) { return i; }
+        }
+        hashes.len()
+    }
+
+    /// Shapley effective pages: sum of `1/rc` for each hash present in the map.
+    pub fn effective_pages(&self, hashes: &[PageHash]) -> f64 {
+        let mut eff = 0.0;
+        for h in hashes {
+            if let Some(&(_, rc)) = self.map.get(h) {
+                eff += 1.0 / rc.max(1) as f64;
+            }
+        }
+        eff
+    }
+
+    /// Check if a specific hash is present on CPU.
+    pub fn contains(&self, hash: &PageHash) -> bool {
+        self.map.contains_key(hash)
+    }
+
+    /// Allocate CPU pages from the shared pool.
+    pub fn alloc(&mut self, n: usize) -> Option<Vec<PhysicalPageId>> {
+        self.pool.alloc_n(n)
+    }
+
+    /// Free CPU pages back to the shared pool.
+    pub fn free(&mut self, pages: &[PhysicalPageId]) {
+        self.pool.free_batch(pages);
+    }
+
+    /// Available pages in the CPU pool.
+    pub fn available(&self) -> usize {
+        self.pool.available()
+    }
+
+    /// Total pages in the CPU pool.
+    pub fn total(&self) -> usize {
+        self.pool.total
+    }
+
+    /// Number of entries (unique hashes) in the map.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Pool stats (alloc_total, free_total).
+    pub fn pool_stats(&self) -> (usize, usize) {
+        self.pool.pool_stats()
     }
 }
 
@@ -747,7 +948,7 @@ mod tests {
 
     #[test]
     fn commit_and_lookup_single() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         store.commit(h(1), 10);
         assert_eq!(store.prefix_len(&[h(1)]), 1);
         assert_eq!(store.physical_ids(&[h(1)]), vec![10]);
@@ -755,7 +956,7 @@ mod tests {
 
     #[test]
     fn commit_batch_and_lookup() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
         assert_eq!(store.prefix_len(&[h(1), h(2), h(3)]), 3);
         assert_eq!(store.physical_ids(&[h(1), h(2), h(3)]), vec![10, 20, 30]);
@@ -767,7 +968,7 @@ mod tests {
 
     #[test]
     fn incremental_commit_via_append() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         // First commit: [H1, H2]
         store.commit_batch(&[h(1), h(2)], &[10, 20]);
         // Incremental commit: append H3 after existing [H1, H2]
@@ -780,7 +981,7 @@ mod tests {
 
     #[test]
     fn multiple_incremental_commits() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         store.commit_batch(&[h(1)], &[10]);
         store.extend(&[h(1)], &[h(2)], &[20]);
         store.extend(&[h(1), h(2)], &[h(3)], &[30]);
@@ -795,11 +996,11 @@ mod tests {
 
     #[test]
     fn dedup_survives_one_release() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         // Context A commits [H1, H2]
         store.commit_batch(&[h(1), h(2)], &[10, 20]);
         // Context B commits same chain — dedup hit
-        let phys_b = store.alloc_gpu_pages(2).unwrap();
+        let phys_b = store.alloc(2).unwrap();
         store.commit_batch(&[h(1), h(2)], &phys_b);
 
         // B's pages should be freed back (dedup)
@@ -819,19 +1020,19 @@ mod tests {
 
     #[test]
     fn dedup_frees_duplicate_pages() {
-        let mut store = PageStore::new(16, 10, 0);
-        assert_eq!(store.available_gpu_pages(), 10);
+        let mut store = PageStore::new(16, 10);
+        assert_eq!(store.available(), 10);
 
         // Commit 2 pages (properly allocated from pool)
-        let first_pages = store.alloc_gpu_pages(2).unwrap();
-        assert_eq!(store.available_gpu_pages(), 8);
+        let first_pages = store.alloc(2).unwrap();
+        assert_eq!(store.available(), 8);
         store.commit_batch(&[h(1), h(2)], &first_pages);
 
         // Commit same chain with new pages — should free the duplicates
-        let dup_pages = store.alloc_gpu_pages(2).unwrap();
-        assert_eq!(store.available_gpu_pages(), 6);
+        let dup_pages = store.alloc(2).unwrap();
+        assert_eq!(store.available(), 6);
         store.commit_batch(&[h(1), h(2)], &dup_pages);
-        assert_eq!(store.available_gpu_pages(), 8); // 6 + 2 freed
+        assert_eq!(store.available(), 8); // 6 + 2 freed
     }
 
     // =========================================================================
@@ -840,7 +1041,7 @@ mod tests {
 
     #[test]
     fn release_decrements_entire_path() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
         // Extend with divergent suffix
         store.extend(&[h(1), h(2)], &[h(4)], &[40]);
@@ -864,7 +1065,7 @@ mod tests {
 
     #[test]
     fn split_preserves_existing_rc() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         // A commits [H1, H2, H3]
         store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
         // B commits [H1, H2, H4] — causes split at H2
@@ -890,7 +1091,7 @@ mod tests {
 
     #[test]
     fn retain_bumps_rc_along_path() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
         // Retain prefix [H1, H2]
         store.fork(&[h(1), h(2)]);
@@ -907,7 +1108,7 @@ mod tests {
 
     #[test]
     fn restore_protocol() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         // Initial commit
         store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
 
@@ -916,14 +1117,14 @@ mod tests {
         assert_eq!(store.prefix_len(&[h(1), h(2), h(3)]), 0);
 
         // Simulate restore: prefix_len=0, so alloc + commit full chain
-        let new_phys = store.alloc_gpu_pages(3).unwrap();
+        let new_phys = store.alloc(3).unwrap();
         store.commit_batch(&[h(1), h(2), h(3)], &new_phys);
         assert_eq!(store.prefix_len(&[h(1), h(2), h(3)]), 3);
     }
 
     #[test]
     fn restore_with_shared_prefix() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         // A and B both commit [H1, H2] (different suffixes)
         store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
         store.commit_batch(&[h(1), h(2), h(4)], &[10, 20, 40]);
@@ -937,7 +1138,7 @@ mod tests {
 
         // Retain prefix + commit suffix
         store.fork(&[h(1), h(2)]);
-        let suffix_phys = store.alloc_gpu_pages(1).unwrap();
+        let suffix_phys = store.alloc(1).unwrap();
         store.extend(&[h(1), h(2)], &[h(3)], &suffix_phys);
 
         // Full chain accessible again
@@ -950,12 +1151,12 @@ mod tests {
 
     #[test]
     fn eviction_returns_pages_to_pool() {
-        let mut store = PageStore::new(16, 10, 0);
-        let phys = store.alloc_gpu_pages(3).unwrap();
-        assert_eq!(store.available_gpu_pages(), 7);
+        let mut store = PageStore::new(16, 10);
+        let phys = store.alloc(3).unwrap();
+        assert_eq!(store.available(), 7);
         store.commit_batch(&[h(1), h(2), h(3)], &phys);
         store.release(&[h(1), h(2), h(3)]);
-        assert_eq!(store.available_gpu_pages(), 10);
+        assert_eq!(store.available(), 10);
     }
 
     // =========================================================================
@@ -964,7 +1165,7 @@ mod tests {
 
     #[test]
     fn count_reclaimable_single_holder() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
         // Single holder — all pages reclaimable
         assert_eq!(store.count_reclaimable(&[h(1), h(2), h(3)]), 3);
@@ -972,7 +1173,7 @@ mod tests {
 
     #[test]
     fn count_reclaimable_shared_prefix() {
-        let mut store = PageStore::new(16, 100, 0);
+        let mut store = PageStore::new(16, 100);
         store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
         store.commit_batch(&[h(1), h(2), h(4)], &[10, 20, 40]);
         // Shared prefix — only the leaf is reclaimable
@@ -988,24 +1189,24 @@ mod tests {
     /// must return valid page IDs for every page.
     #[test]
     fn kv_invariant_shared_prefix_incremental() {
-        let mut store = PageStore::new(16, 200, 0);
+        let mut store = PageStore::new(16, 200);
         let prompt = [h(1), h(2)]; // shared prompt prefix (2 pages)
 
         // Context A: commit prompt incrementally
-        let pa = store.alloc_gpu_pages(2).unwrap();
+        let pa = store.alloc(2).unwrap();
         store.commit_batch(&prompt[..1], &pa[..1]);
         store.extend(&prompt[..1], &prompt[1..2], &pa[1..2]);
 
         // Context B: commit same prompt (dedup)
-        let pb = store.alloc_gpu_pages(2).unwrap();
+        let pb = store.alloc(2).unwrap();
         store.commit_batch(&prompt, &pb);
 
         // Context A extends with unique output
-        let pa3 = store.alloc_gpu_pages(1).unwrap();
+        let pa3 = store.alloc(1).unwrap();
         store.extend(&prompt, &[h(100)], &pa3);
 
         // Context B extends with different output
-        let pb3 = store.alloc_gpu_pages(1).unwrap();
+        let pb3 = store.alloc(1).unwrap();
         store.extend(&prompt, &[h(200)], &pb3);
 
         // Verify physical_ids — NO placeholder 0s allowed
@@ -1032,10 +1233,10 @@ mod tests {
     /// physical_ids returns correct count (catches the merge-corruption bug).
     #[test]
     fn kv_invariant_incremental_then_lookup() {
-        let mut store = PageStore::new(16, 200, 0);
+        let mut store = PageStore::new(16, 200);
 
         // Build a chain of 10 pages incrementally
-        let pages = store.alloc_gpu_pages(10).unwrap();
+        let pages = store.alloc(10).unwrap();
         let hashes: Vec<u64> = (1..=10).map(h).collect();
 
         store.commit_batch(&hashes[..1], &pages[..1]);
@@ -1063,13 +1264,13 @@ mod tests {
     /// Verifies physical_ids correctness for every context at every step.
     #[test]
     fn stress_shared_prefix_many_contexts() {
-        let mut store = PageStore::new(16, 500, 0);
+        let mut store = PageStore::new(16, 500);
         let n_contexts = 16;
         let prompt = [h(1), h(2)];
 
         // All contexts commit the same prompt (dedup)
         for _ in 0..n_contexts {
-            let pages = store.alloc_gpu_pages(2).unwrap();
+            let pages = store.alloc(2).unwrap();
             store.commit_batch(&prompt, &pages);
         }
 
@@ -1080,7 +1281,7 @@ mod tests {
             let mut phys_chain = store.physical_ids(&prompt);
             for tok in 0..3 {
                 let hash = h(1000 + ctx * 100 + tok);
-                let page = store.alloc_gpu_pages(1).unwrap();
+                let page = store.alloc(1).unwrap();
                 store.extend(&chain, &[hash], &page);
                 chain.push(hash);
                 phys_chain.push(page[0]);
@@ -1106,11 +1307,11 @@ mod tests {
     /// then retain + extend for restore. Verifies no pages are lost.
     #[test]
     fn stress_suspend_restore_cycle() {
-        let mut store = PageStore::new(16, 500, 0);
+        let mut store = PageStore::new(16, 500);
         let prompt = [h(1), h(2)];
 
         // Context A: commit prompt + 3 output tokens
-        let pa = store.alloc_gpu_pages(5).unwrap();
+        let pa = store.alloc(5).unwrap();
         store.commit_batch(&prompt, &pa[..2]);
         store.extend(&prompt, &[h(10)], &pa[2..3]);
         let chain_a1 = [h(1), h(2), h(10)];
@@ -1120,9 +1321,9 @@ mod tests {
         let full_chain_a = vec![h(1), h(2), h(10), h(11), h(12)];
 
         // Context B: shares prompt
-        let pb = store.alloc_gpu_pages(2).unwrap();
+        let pb = store.alloc(2).unwrap();
         store.commit_batch(&prompt, &pb);
-        let pb_ext = store.alloc_gpu_pages(1).unwrap();
+        let pb_ext = store.alloc(1).unwrap();
         store.extend(&prompt, &[h(20)], &pb_ext);
         let chain_b = vec![h(1), h(2), h(20)];
 
@@ -1139,7 +1340,7 @@ mod tests {
 
         // RESTORE A: retain prefix again (re-join), extend with suffix
         store.fork(&prompt);
-        let suffix_pages = store.alloc_gpu_pages(3).unwrap();
+        let suffix_pages = store.alloc(3).unwrap();
         store.extend(&prompt, &[h(10)], &suffix_pages[..1]);
         let chain_r1 = [h(1), h(2), h(10)];
         store.extend(&chain_r1, &[h(11)], &suffix_pages[1..2]);
@@ -1157,27 +1358,27 @@ mod tests {
     /// then extend from another context and verify physical_ids.
     #[test]
     fn stress_release_merge_then_extend() {
-        let mut store = PageStore::new(16, 500, 0);
+        let mut store = PageStore::new(16, 500);
         let prompt = [h(1), h(2)];
 
         // A and B share prompt
-        let pa = store.alloc_gpu_pages(2).unwrap();
+        let pa = store.alloc(2).unwrap();
         store.commit_batch(&prompt, &pa);
-        let pb = store.alloc_gpu_pages(2).unwrap();
+        let pb = store.alloc(2).unwrap();
         store.commit_batch(&prompt, &pb);
 
         // A extends
-        let pa3 = store.alloc_gpu_pages(1).unwrap();
+        let pa3 = store.alloc(1).unwrap();
         store.extend(&prompt, &[h(10)], &pa3);
 
         // B extends
-        let pb3 = store.alloc_gpu_pages(1).unwrap();
+        let pb3 = store.alloc(1).unwrap();
         store.extend(&prompt, &[h(20)], &pb3);
 
         // A extends further
-        let pa4 = store.alloc_gpu_pages(1).unwrap();
+        let pa4 = store.alloc(1).unwrap();
         store.extend(&[h(1), h(2), h(10)], &[h(11)], &pa4);
-        let pa5 = store.alloc_gpu_pages(1).unwrap();
+        let pa5 = store.alloc(1).unwrap();
         store.extend(&[h(1), h(2), h(10), h(11)], &[h(12)], &pa5);
 
         // Release A — this should evict A's suffix, leave B intact
@@ -1185,9 +1386,9 @@ mod tests {
         store.release(&chain_a);
 
         // B extends further
-        let pb4 = store.alloc_gpu_pages(1).unwrap();
+        let pb4 = store.alloc(1).unwrap();
         store.extend(&[h(1), h(2), h(20)], &[h(21)], &pb4);
-        let pb5 = store.alloc_gpu_pages(1).unwrap();
+        let pb5 = store.alloc(1).unwrap();
         store.extend(&[h(1), h(2), h(20), h(21)], &[h(22)], &pb5);
 
         // Verify B's full chain
@@ -1201,12 +1402,12 @@ mod tests {
     /// Simulate many suspend/restore cycles on overlapping contexts.
     #[test]
     fn stress_many_suspend_restore() {
-        let mut store = PageStore::new(16, 1000, 0);
+        let mut store = PageStore::new(16, 1000);
         let prompt = [h(1), h(2)];
 
         // Create 8 contexts sharing prompt
         for _ in 0..8 {
-            let p = store.alloc_gpu_pages(2).unwrap();
+            let p = store.alloc(2).unwrap();
             store.commit_batch(&prompt, &p);
         }
 
@@ -1216,7 +1417,7 @@ mod tests {
             let mut chain = prompt.to_vec();
             for tok in 0..5 {
                 let hash = h(100 * ctx + tok + 1);
-                let page = store.alloc_gpu_pages(1).unwrap();
+                let page = store.alloc(1).unwrap();
                 store.extend(&chain, &[hash], &page);
                 chain.push(hash);
             }
@@ -1249,7 +1450,7 @@ mod tests {
             let suffix = &chains[ctx][2..]; // original suffix hashes
             let mut prefix = prompt.to_vec();
             for &hash in suffix {
-                let page = store.alloc_gpu_pages(1).unwrap();
+                let page = store.alloc(1).unwrap();
                 store.extend(&prefix, &[hash], &page);
                 prefix.push(hash);
             }
@@ -1270,24 +1471,24 @@ mod tests {
     /// context releasing [H1, H_OTHER] must NOT decrement rc on [H1,H2].
     #[test]
     fn hash_mismatch_after_merge_release() {
-        let mut store = PageStore::new(16, 200, 0);
+        let mut store = PageStore::new(16, 200);
 
         // Context A: commit [H1], extend to [H1, H2]
-        let pa = store.alloc_gpu_pages(1).unwrap();
+        let pa = store.alloc(1).unwrap();
         store.commit_batch(&[h(1)], &pa);
-        let pa2 = store.alloc_gpu_pages(1).unwrap();
+        let pa2 = store.alloc(1).unwrap();
         store.extend(&[h(1)], &[h(2)], &pa2);
         // After this, try_merge_child merges: [H1,H2] rc=1
 
         // Context B: commit [H1] (dedup → rc=2), extend to [H1, H99]
-        let pb = store.alloc_gpu_pages(1).unwrap();
+        let pb = store.alloc(1).unwrap();
         store.commit_batch(&[h(1)], &pb);
         // Now: insert_suffix sees existing [H1,H2] rc=1, H1 matches.
         // common_prefix_len([H1,H2], [H1]) = 1 < node_len=2 → split.
         // Result: [H1] rc=2, children: {[H2] rc=1, ...}
 
         // B extends with different hash
-        let pb2 = store.alloc_gpu_pages(1).unwrap();
+        let pb2 = store.alloc(1).unwrap();
         store.extend(&[h(1)], &[h(99)], &pb2);
         // Now: [H1] rc=2, children: {[H2] rc=1, [H99] rc=1}
 
@@ -1316,24 +1517,24 @@ mod tests {
     /// mid-path should not corrupt the trie.
     #[test]
     fn hash_mismatch_deep_merge_release() {
-        let mut store = PageStore::new(16, 200, 0);
+        let mut store = PageStore::new(16, 200);
 
         // Context A: single chain [H1] → [H1,H2] → [H1,H2,H3] (all merged, rc=1)
-        let pa = store.alloc_gpu_pages(1).unwrap();
+        let pa = store.alloc(1).unwrap();
         store.commit_batch(&[h(1)], &pa);
-        let pa2 = store.alloc_gpu_pages(1).unwrap();
+        let pa2 = store.alloc(1).unwrap();
         store.extend(&[h(1)], &[h(2)], &pa2);
-        let pa3 = store.alloc_gpu_pages(1).unwrap();
+        let pa3 = store.alloc(1).unwrap();
         store.extend(&[h(1), h(2)], &[h(3)], &pa3);
         // Merged: [H1,H2,H3] rc=1
 
         // Context C: commit [H1] (dedup, splits merged node)
         // Then extend [H1, H50, H60] — completely different branch
-        let pc = store.alloc_gpu_pages(1).unwrap();
+        let pc = store.alloc(1).unwrap();
         store.commit_batch(&[h(1)], &pc);
-        let pc2 = store.alloc_gpu_pages(1).unwrap();
+        let pc2 = store.alloc(1).unwrap();
         store.extend(&[h(1)], &[h(50)], &pc2);
-        let pc3 = store.alloc_gpu_pages(1).unwrap();
+        let pc3 = store.alloc(1).unwrap();
         store.extend(&[h(1), h(50)], &[h(60)], &pc3);
 
         // Verify both chains
@@ -1352,14 +1553,14 @@ mod tests {
     /// REGRESSION: prefix_match_len should stop at hash divergence.
     #[test]
     fn prefix_match_len_stops_at_divergence() {
-        let mut store = PageStore::new(16, 200, 0);
+        let mut store = PageStore::new(16, 200);
 
         // Build merged node [H1, H2, H3] rc=1
-        let p = store.alloc_gpu_pages(1).unwrap();
+        let p = store.alloc(1).unwrap();
         store.commit_batch(&[h(1)], &p);
-        let p2 = store.alloc_gpu_pages(1).unwrap();
+        let p2 = store.alloc(1).unwrap();
         store.extend(&[h(1)], &[h(2)], &p2);
-        let p3 = store.alloc_gpu_pages(1).unwrap();
+        let p3 = store.alloc(1).unwrap();
         store.extend(&[h(1), h(2)], &[h(3)], &p3);
 
         // Query with different second hash: [H1, H99, ...]
@@ -1373,5 +1574,151 @@ mod tests {
         // Partial match, same prefix then diverge
         assert_eq!(store.prefix_len(&[h(1), h(2), h(99)]), 2,
             "prefix_len should stop at H99 divergence after matching H1,H2");
+    }
+
+    // =========================================================================
+    // would_free
+    // =========================================================================
+
+    #[test]
+    fn would_free_returns_rc1_only() {
+        let mut store = PageStore::new(16, 100);
+        store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
+        // All rc=1, leaf → everything would be freed.
+        let wf = store.would_free(&[h(1), h(2), h(3)]);
+        assert_eq!(wf.len(), 3, "all 3 hashes should be would-free");
+    }
+
+    #[test]
+    fn would_free_empty_on_shared() {
+        let mut store = PageStore::new(16, 100);
+        // A and B share [H1, H2]
+        store.commit_batch(&[h(1), h(2)], &[10, 20]);
+        store.commit_batch(&[h(1), h(2)], &[30, 40]); // dedup, rc=2
+        // All rc=2 → nothing would be freed.
+        let wf = store.would_free(&[h(1), h(2)]);
+        assert!(wf.is_empty(), "shared pages should not be in would_free");
+    }
+
+    #[test]
+    fn would_free_partial_shared() {
+        let mut store = PageStore::new(16, 100);
+        // A commits [H1, H2, H3], B commits [H1, H2, H4]
+        store.commit_batch(&[h(1), h(2), h(3)], &[10, 20, 30]);
+        store.commit_batch(&[h(1), h(2), h(4)], &[10, 20, 40]);
+        // For chain A: [H1, H2] shared (rc=2), [H3] unique (rc=1, leaf)
+        let wf = store.would_free(&[h(1), h(2), h(3)]);
+        assert_eq!(wf, vec![h(3)], "only H3 should be in would_free");
+    }
+
+    #[test]
+    fn would_free_interior_nodes() {
+        let mut store = PageStore::new(16, 100);
+        // Build chain incrementally: [H1,H2] then extend → [H1,H2,H3]
+        // This creates interior node [H1,H2](rc=1) → child [H3](rc=1, leaf).
+        store.commit_batch(&[h(1), h(2)], &[10, 20]);
+        store.extend(&[h(1), h(2)], &[h(3)], &[30]);
+        // Sole holder → all 3 pages should be would-free, including interior [H1,H2].
+        let wf = store.would_free(&[h(1), h(2), h(3)]);
+        assert_eq!(wf.len(), 3, "interior + leaf should both be would-free: got {:?}", wf);
+        assert!(wf.contains(&h(3)), "leaf H3 must be present");
+        assert!(wf.contains(&h(1)), "interior H1 must be present");
+        assert!(wf.contains(&h(2)), "interior H2 must be present");
+    }
+
+    // =========================================================================
+    // FlatPageStore
+    // =========================================================================
+
+    #[test]
+    fn cpu_store_insert_and_lookup() {
+        let mut cpu = FlatPageStore::new(100);
+        cpu.insert(&[h(1), h(2), h(3)], &[10, 20, 30]);
+        assert_eq!(cpu.physical_ids(&[h(1), h(2), h(3)]), vec![10, 20, 30]);
+        assert_eq!(cpu.prefix_len(&[h(1), h(2), h(3)]), 3);
+        assert_eq!(cpu.len(), 3);
+    }
+
+    #[test]
+    fn cpu_store_dedup_bumps_rc() {
+        let mut cpu = FlatPageStore::new(100);
+        let p1 = cpu.alloc(3).unwrap();
+        cpu.insert(&[h(1), h(2), h(3)], &p1);
+        assert_eq!(cpu.available(), 97);
+        // Insert same hashes again with new pages → dedup, frees new pages.
+        let p2 = cpu.alloc(3).unwrap();
+        assert_eq!(cpu.available(), 94);
+        cpu.insert(&[h(1), h(2), h(3)], &p2);
+        // Dedup freed the 3 duplicate pages back.
+        assert_eq!(cpu.available(), 97);
+        // Release once — rc drops to 1, pages stay.
+        let freed = cpu.release(&[h(1), h(2), h(3)]);
+        assert_eq!(freed, 0);
+        // Release again — rc drops to 0, pages freed.
+        let freed = cpu.release(&[h(1), h(2), h(3)]);
+        assert_eq!(freed, 3);
+        assert_eq!(cpu.available(), 100);
+    }
+
+    #[test]
+    fn cpu_store_release_frees_at_zero() {
+        let mut cpu = FlatPageStore::new(10);
+        let p = cpu.alloc(2).unwrap();
+        cpu.insert(&[h(1), h(2)], &p);
+        assert_eq!(cpu.available(), 8);
+        let freed = cpu.release(&[h(1), h(2)]);
+        assert_eq!(freed, 2);
+        assert_eq!(cpu.available(), 10);
+        assert_eq!(cpu.prefix_len(&[h(1), h(2)]), 0);
+    }
+
+    #[test]
+    fn cpu_store_out_of_order_insert() {
+        let mut cpu = FlatPageStore::new(100);
+        // Insert suffix first [H50..H99], then prefix [H0..H49].
+        // This is the key scenario from the design discussion.
+        let suffix: Vec<PageHash> = (50..100).map(|i| h(i)).collect();
+        let suffix_phys: Vec<PhysicalPageId> = (50..100).map(|i| i as u32).collect();
+        cpu.insert(&suffix, &suffix_phys);
+
+        let prefix: Vec<PageHash> = (0..50).map(|i| h(i)).collect();
+        let prefix_phys: Vec<PhysicalPageId> = (0..50).map(|i| i as u32).collect();
+        cpu.insert(&prefix, &prefix_phys);
+
+        // Full chain [H0..H99] should be findable.
+        let full_chain: Vec<PageHash> = (0..100).map(|i| h(i)).collect();
+        assert_eq!(cpu.prefix_len(&full_chain), 100);
+        assert_eq!(cpu.physical_ids(&full_chain).len(), 100);
+    }
+
+    #[test]
+    fn cpu_store_effective_pages() {
+        let mut cpu = FlatPageStore::new(100);
+        // A inserts [H1, H2, H3], all rc=1
+        let p = cpu.alloc(3).unwrap();
+        cpu.insert(&[h(1), h(2), h(3)], &p);
+        assert!((cpu.effective_pages(&[h(1), h(2), h(3)]) - 3.0).abs() < 0.001);
+
+        // B inserts same → rc=2 each
+        let p2 = cpu.alloc(3).unwrap();
+        cpu.insert(&[h(1), h(2), h(3)], &p2);
+        assert!((cpu.effective_pages(&[h(1), h(2), h(3)]) - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn cpu_store_prefix_len_gap() {
+        let mut cpu = FlatPageStore::new(100);
+        // Insert H1 and H3 but not H2 — prefix_len should be 1.
+        cpu.insert(&[h(1)], &[10]);
+        cpu.insert(&[h(3)], &[30]);
+        assert_eq!(cpu.prefix_len(&[h(1), h(2), h(3)]), 1);
+    }
+
+    #[test]
+    fn cpu_store_contains() {
+        let mut cpu = FlatPageStore::new(100);
+        cpu.insert(&[h(42)], &[10]);
+        assert!(cpu.contains(&h(42)));
+        assert!(!cpu.contains(&h(99)));
     }
 }
