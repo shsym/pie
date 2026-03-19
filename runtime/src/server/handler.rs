@@ -60,7 +60,6 @@ impl Session {
                     stats.insert(format!("{}.total_tokens_processed", model_name), serde_json::Value::from(inf.total_tokens_processed));
                     stats.insert(format!("{}.last_batch_latency_us", model_name), serde_json::Value::from(inf.last_batch_latency_us));
                     stats.insert(format!("{}.avg_batch_latency_us", model_name), serde_json::Value::from(inf.avg_batch_latency_us));
-                    stats.insert(format!("{}.in_flight_batches", model_name), serde_json::Value::from(inf.in_flight_batches));
                 }
 
                 self.send_response(

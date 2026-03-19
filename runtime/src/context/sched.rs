@@ -32,7 +32,7 @@ use crate::device::{self, DeviceId};
 use crate::process::ProcessId;
 
 use super::pagestore::PhysicalPageId;
-use super::{Context, ContextId, ContextManager, State, MARKET};
+use super::{Context, ContextId, ContextManager, RestoreEntry, State, MARKET};
 
 // =============================================================================
 // ProcessEntry — Wallet + Ownership
@@ -160,6 +160,7 @@ impl ContextManager {
     /// Unregister a process: destroy all owned contexts and remove the process entry.
     /// Called on WASM instance drop for automatic cleanup.
     pub(crate) fn unregister_process(&mut self, pid: ProcessId) {
+        let t_start = Instant::now();
         let proc = match self.processes.remove(&pid) {
             Some(p) => p,
             None => return,
@@ -169,12 +170,13 @@ impl ContextManager {
         let ctx_ids: std::collections::HashSet<ContextId> = proc.context_ids.iter().copied().collect();
         self.alloc_queue.retain(|ctx_id| !ctx_ids.contains(ctx_id));
 
-        // Remove from restore_queue
-        self.restore_queue.retain(|ctx_id| !ctx_ids.contains(ctx_id));
+        // restore_queue: lazy deletion — stale entries filtered on pop in drain_queues.
+
+        let t_queues = t_start.elapsed();
 
         // Destroy all owned contexts
-        for ctx_id in proc.context_ids {
-            if let Some(ctx) = self.contexts.remove(&ctx_id) {
+        for ctx_id in &proc.context_ids {
+            if let Some(ctx) = self.contexts.remove(ctx_id) {
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {
                     self.gpu_stores[dev_idx].release(&ctx.committed_hashes);
@@ -188,16 +190,30 @@ impl ContextManager {
                 if ctx.is_off_gpu() && !ctx.committed_hashes.is_empty() {
                     self.cpu_stores[dev_idx].release(&ctx.committed_hashes);
                 }
-                self.snapshots.retain(|_, v| *v != ctx_id);
-                self.remove_context_caches(ctx_id);
+                self.remove_context_caches(*ctx_id);
             }
         }
+
+        // Single pass: remove all snapshot entries pointing to this process's contexts.
+        self.snapshots.retain(|_, v| !ctx_ids.contains(v));
+
+        let t_destroy = t_start.elapsed();
 
         if let Some(market) = MARKET.get(self.model_idx) {
             market.balances.remove(&pid);
             market.endowments.remove(&pid);
         }
-        self.drain_queues();
+
+        let t_pre_drain = t_start.elapsed();
+        // Early-exit: skip drain_queues if both queues are empty.
+        if !self.restore_queue.is_empty() || !self.alloc_queue.is_empty() {
+            self.drain_queues();
+        }
+        let t_total = t_start.elapsed();
+
+        self.sched_counters.unreg_queues_us += t_queues.as_micros() as u64;
+        self.sched_counters.unreg_destroy_us += (t_destroy - t_queues).as_micros() as u64;
+        self.sched_counters.unreg_drain_us += (t_total - t_pre_drain).as_micros() as u64;
     }
 
     /// Get a mutable reference to a registered process's entry.
@@ -276,47 +292,66 @@ impl ContextManager {
     ///
     /// No eviction or page movement — those are handled by `when_allocated`
     /// and `drain_queues`.
-    pub(crate) fn tick(&mut self, dev_idx: usize, latency_secs: f64) {
+    pub(crate) fn tick(&mut self, dev_idx: usize, latency_secs: f64, batch_ctx_ids: &[ContextId]) {
+        let t_start = Instant::now();
+
         // Ensure auction_results vec is large enough.
         if self.auction_results.len() <= dev_idx {
             self.auction_results.resize(dev_idx + 1, AuctionResult::default());
         }
 
+        // Build set of in-batch context IDs for O(1) lookup.
+        let batch_set: std::collections::HashSet<ContextId> =
+            batch_ctx_ids.iter().copied().collect();
+
         // All contexts on this device are admitted by construction (the
         // contention/eviction system enforces physical capacity).
-        // Clearing price = smallest bid on the device.
+        // Clearing price = smallest bid on the device (all GPU-resident contexts).
         let mut clearing_price = f64::MAX;
+        let mut n_active = 0usize;
+        let mut n_pinned = 0usize;
 
-        // Pass 1: find clearing price (min bid).
+        // Pass 1: find clearing price (min bid) across all GPU-resident contexts.
         for ctx in self.contexts.values() {
             if ctx.owner.is_none() { continue; }
             if ctx.device.unwrap_or(0) as usize != dev_idx { continue; }
             if ctx.is_off_gpu() { continue; }
             clearing_price = clearing_price.min(ctx.bid);
+            if ctx.is_pinned() { n_pinned += 1; }
+            else if ctx.is_active() { n_active += 1; }
         }
         if clearing_price == f64::MAX { clearing_price = 0.0; }
 
-        // Pass 2: compute Shapley effective pages, accumulate per-context rent.
+        let t_pass1 = t_start.elapsed();
+
+        // Pass 2: compute rent for IN-BATCH contexts only.
+        // Only contexts that participated in the just-completed batch pay rent.
+        // This ensures 1:1 tick:step correspondence assumed by the bid formula.
+        // Contexts that are Pinned but NOT in the batch (stale unpins, new pins)
+        // are not charged — they didn't consume compute this tick.
         let mut ctx_payments: Vec<(ContextId, ProcessId, f64)> = Vec::new();
         let mut device_revenue = 0.0f64;
+        let mut n_charged = 0usize;
 
         for (&ctx_id, ctx) in &self.contexts {
+            if !batch_set.contains(&ctx_id) { continue; }  // Only charge in-batch
             if ctx.owner.is_none() { continue; }
-            if ctx.device.unwrap_or(0) as usize != dev_idx { continue; }
-            if ctx.is_off_gpu() { continue; }
 
             let raw_pages = ctx.committed_hashes.len() + ctx.working_pages.len();
             if raw_pages == 0 { continue; }
 
-            let eff = self.gpu_stores[dev_idx].effective_pages(&ctx.committed_hashes)
+            let eff = ctx.cached_effective_pages
                 + ctx.working_pages.len() as f64;
 
             let payment = clearing_price * eff;
             device_revenue += payment;
+            n_charged += 1;
             if let Some(pid) = ctx.owner {
                 ctx_payments.push((ctx_id, pid, payment));
             }
         }
+
+        let t_pass2 = t_start.elapsed();
 
         // Endowment-proportional dividends from this device's revenue.
         let total_endowment: f64 = self.processes.values().map(|p| p.endowment).sum();
@@ -337,6 +372,9 @@ impl ContextManager {
                 let actual = payment.min(proc.balance);
                 proc.balance -= actual;
                 if let Some(ctx) = self.contexts.get_mut(ctx_id) {
+                    if defaulted && !ctx.defaulted {
+                        self.sched_counters.defaults_flagged += 1;
+                    }
                     ctx.defaulted = defaulted;
                 }
             }
@@ -347,20 +385,39 @@ impl ContextManager {
             proc.balance += dividend_rate * proc.endowment;
         }
 
+        let t_pass3 = t_start.elapsed();
+
         // Publish market data + balances to lock-free cache.
+        // Only publish every 5 ticks to reduce DashMap insert overhead.
         if let Some(market) = MARKET.get(self.model_idx) {
-            market.clearing_prices.insert(dev_idx, clearing_price);
-            // EWA-smooth the tick latency (α = 0.1).
-            let alpha = 0.1;
-            let prev = market.tick_latency_ewa.get(&dev_idx).map(|v| *v).unwrap_or(latency_secs);
-            market.tick_latency_ewa.insert(dev_idx, alpha * latency_secs + (1.0 - alpha) * prev);
-            let rate_sum: f64 = self.auction_results.iter()
-                .map(|a| a.dividend_per_endowment).sum();
-            market.set_dividend_rate(rate_sum);
-            for (&pid, proc) in &self.processes {
-                market.balances.insert(pid, proc.balance);
+            // Active/pinned/charged counts: always publish (cheap, 3 inserts).
+            market.gpu_active.insert(dev_idx, n_active);
+            market.gpu_pinned.insert(dev_idx, n_pinned);
+            market.gpu_charged.insert(dev_idx, n_charged);
+
+            let should_publish = self.sched_counters.ticks % 5 == 0;
+            if should_publish {
+                market.clearing_prices.insert(dev_idx, clearing_price);
+                // EWA-smooth the tick latency (α = 0.1).
+                let alpha = 0.1;
+                let prev = market.tick_latency_ewa.get(&dev_idx).map(|v| *v).unwrap_or(latency_secs);
+                market.tick_latency_ewa.insert(dev_idx, alpha * latency_secs + (1.0 - alpha) * prev);
+                let rate_sum: f64 = self.auction_results.iter()
+                    .map(|a| a.dividend_per_endowment).sum();
+                market.set_dividend_rate(rate_sum);
+                for (&pid, proc) in &self.processes {
+                    market.balances.insert(pid, proc.balance);
+                }
             }
         }
+
+        let t_publish = t_start.elapsed();
+
+        // Accumulate sub-timing for periodic dump.
+        self.sched_counters.tick_pass1_us += t_pass1.as_micros() as u64;
+        self.sched_counters.tick_pass2_us += (t_pass2 - t_pass1).as_micros() as u64;
+        self.sched_counters.tick_pass3_us += (t_pass3 - t_pass2).as_micros() as u64;
+        self.sched_counters.tick_publish_us += (t_publish - t_pass3).as_micros() as u64;
     }
 
     /// Set a context's bid (willingness to pay per page per step).
@@ -461,6 +518,7 @@ impl ContextManager {
 
         // CREDIT CHECK: if process can't afford make cost, self-suspend.
         if !self.can_afford(ctx_id, num_pages) {
+            self.sched_counters.credit_suspends += 1;
             let pending = PendingAlloc {
                 device: dev_idx, num_pages,
                 on_alloc: Box::new(on_alloc),
@@ -480,6 +538,7 @@ impl ContextManager {
         if let Some(top_id) = self.highest_bid_in_restore_queue() {
             let top_bid = self.contexts[&top_id].bid;
             if requester_bid < top_bid {
+                self.sched_counters.priority_gate_suspends += 1;
                 let pending = PendingAlloc {
                     device: dev_idx, num_pages,
                     on_alloc: Box::new(on_alloc),
@@ -507,6 +566,7 @@ impl ContextManager {
         loop {
             match self.find_eviction_victim(dev_idx, requester_bid, Some(ctx_id)) {
                 Some(victim_ctx_id) => {
+                    self.sched_counters.eviction_suspends += 1;
                     let victim = self.contexts.get(&victim_ctx_id).unwrap();
 
                     if victim.is_pinned() {
@@ -557,6 +617,7 @@ impl ContextManager {
                 self.alloc_queue.push_back(ctx_id);
             } else {
                 // Step 6: NO VICTIM — requester self-suspends.
+                self.sched_counters.no_victim_suspends += 1;
                 self.suspend(ctx_id);
                 self.enqueue_restore(ctx_id);
                 self.drain_queues();
@@ -623,22 +684,17 @@ impl ContextManager {
 
     /// Helper: enqueue a context for restoration.
     pub(crate) fn enqueue_restore(&mut self, ctx_id: ContextId) {
-        self.restore_queue.push(ctx_id);
+        let (bid, defaulted) = self.contexts.get(&ctx_id)
+            .map(|c| (c.bid, c.defaulted))
+            .unwrap_or((0.0, true));
+        self.restore_queue.push(RestoreEntry { ctx_id, bid, defaulted });
     }
 
-    /// Find the best context to restore from the queue.
-    /// Non-defaulted contexts are preferred (by highest bid).
-    /// Defaulted contexts are deprioritized — only restored when no
-    /// non-defaulted candidates remain.
+    /// Peek at the highest-bid context in the restore queue.
+    /// Returns None if the queue is empty.
+    /// O(1) with BinaryHeap vs previous O(N) scan.
     pub(crate) fn highest_bid_in_restore_queue(&self) -> Option<ContextId> {
-        self.restore_queue.iter()
-            .filter_map(|&id| self.contexts.get(&id).map(|c| (id, c.defaulted, c.bid)))
-            .max_by(|a, b| {
-                // Non-defaulted (false) before defaulted (true), then highest bid.
-                b.1.cmp(&a.1)
-                    .then(a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal))
-            })
-            .map(|(id, _, _)| id)
+        self.restore_queue.peek().map(|e| e.ctx_id)
     }
 
     // =========================================================================

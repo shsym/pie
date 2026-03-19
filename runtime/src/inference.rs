@@ -39,7 +39,6 @@ pub struct InferenceStats {
     pub total_tokens_processed: u64,
     pub last_batch_latency_us: u64,
     pub avg_batch_latency_us: u64,
-    pub in_flight_batches: u64,
 }
 
 // =============================================================================
@@ -164,14 +163,12 @@ impl InferenceService {
         let mut total_tokens = 0u64;
         let mut last_latency = 0u64;
         let mut cumulative_latency = 0u64;
-        let mut in_flight = 0u64;
 
         for s in &self.scheduler_stats {
             total_batches += s.total_batches.load(Relaxed);
             total_tokens += s.total_tokens_processed.load(Relaxed);
             last_latency = last_latency.max(s.last_batch_latency_us.load(Relaxed));
             cumulative_latency += s.cumulative_latency_us.load(Relaxed);
-            in_flight += s.in_flight_batches.load(Relaxed);
         }
 
         let avg_latency = if total_batches > 0 {
@@ -185,7 +182,6 @@ impl InferenceService {
             total_tokens_processed: total_tokens,
             last_batch_latency_us: last_latency,
             avg_batch_latency_us: avg_latency,
-            in_flight_batches: in_flight,
         }
     }
 

@@ -139,6 +139,7 @@ impl ContextManager {
                     deferred_ops: Vec::new(),
                     pending_replay: false,
                     defaulted: false,
+                    cached_effective_pages: 0.0,
                 });
 
                 // Spawn replay for committed suffix if needed.
@@ -229,6 +230,7 @@ impl ContextManager {
             deferred_ops: Vec::new(),
             pending_replay: false,
             defaulted: false,
+            cached_effective_pages: 0.0,
         });
         self.snapshots.insert((username, name.clone()), snapshot_id);
 
@@ -430,6 +432,7 @@ impl ContextManager {
             deferred_ops: Vec::new(),
             pending_replay: false,
             defaulted: false,
+            cached_effective_pages: 0.0,
         });
 
         // Spawn replay for committed suffix if needed.

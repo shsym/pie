@@ -187,7 +187,6 @@ class PieMetricsProvider:
         # Parse server stats (new flat key format: "model_name.kv_pages_used", etc.)
         kv_pages_used = 0
         kv_pages_total = 0
-        in_flight_batches = 0
         total_tokens = 0
         last_latency_us = 0
         avg_latency_us = 0
@@ -199,8 +198,6 @@ class PieMetricsProvider:
                         kv_pages_used += int(value)
                     elif key.endswith(".kv_pages_total"):
                         kv_pages_total += int(value)
-                    elif key.endswith(".in_flight_batches"):
-                        in_flight_batches += int(value)
                     elif key.endswith(".total_tokens_processed"):
                         total_tokens += int(value)
                     elif key.endswith(".last_batch_latency_us"):
@@ -217,7 +214,7 @@ class PieMetricsProvider:
 
         if dt > 0 and total_tokens > prev_tokens:
             self._estimated_tput = (total_tokens - prev_tokens) / dt
-        elif in_flight_batches == 0:
+        elif total_tokens == prev_tokens:
             self._estimated_tput = 0.0
 
         self._last_poll_time = now
@@ -226,7 +223,7 @@ class PieMetricsProvider:
         # Latency: use avg_batch_latency_us converted to ms
         if avg_latency_us > 0:
             self._estimated_latency = avg_latency_us / 1000.0
-        elif in_flight_batches == 0:
+        elif total_tokens == prev_tokens:
             self._estimated_latency = 0.0
 
         # KV cache usage
@@ -281,7 +278,7 @@ class PieMetricsProvider:
         self.kv_cache_history.append(kv_cache_usage)
         self.token_tput_history.append(self._estimated_tput)
         self.latency_history.append(self._estimated_latency)
-        self.batch_history.append(float(in_flight_batches))
+        self.batch_history.append(0.0)
 
         # Trim history
         if len(self.kv_cache_history) > self._max_history:
@@ -296,7 +293,7 @@ class PieMetricsProvider:
             kv_pages_total=kv_pages_total if kv_pages_total > 0 else 600,
             token_throughput=self._estimated_tput,
             latency_ms=self._estimated_latency,
-            active_batches=in_flight_batches,
+            active_batches=0,
             tp_groups=tp_groups,
             inferlets=inferlets,
         )

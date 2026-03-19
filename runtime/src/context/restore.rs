@@ -73,23 +73,6 @@ impl ContextManager {
             return false;
         }
 
-        // Rent affordability: verify the process can pay at least one step
-        // of rent at the current clearing price. Without this, a bankrupt
-        // context would restore → tick → default → evict (thrashing).
-        let clearing_price = self.auction_results
-            .get(dev_idx).map(|a| a.clearing_price).unwrap_or(0.0);
-        if clearing_price > 0.0 {
-            let estimated_eff = (ctx.committed_hashes.len() + ctx.suspended_working_count) as f64;
-            let rent_one_step = clearing_price * estimated_eff;
-            let balance = ctx.owner
-                .and_then(|pid| self.processes.get(&pid))
-                .map(|p| p.balance)
-                .unwrap_or(0.0);
-            if balance < rent_one_step {
-                return false;
-            }
-        }
-
         true
     }
 
@@ -204,6 +187,8 @@ impl ContextManager {
             } else {
                 ctx.state = State::Active;
             }
+            // Refresh cached effective_pages now that committed chain is on GPU.
+            ctx.cached_effective_pages = self.gpu_stores[dev_idx].effective_pages(&ctx.committed_hashes);
         }
 
         // If no replays needed, fire deferred ops immediately.

@@ -212,35 +212,90 @@ Revenue is pooled globally across all devices. A context's dividend is `(E_i / �
 
 ## 5. Optimal Bid
 
-### 5.1 Derivation
+### 5.1 Total Rent Exposure
 
-A context's choice each step is binary: be admitted (compute, pay rent, forgo dividend net of payment) or be excluded (idle, earn dividend). The indifference bid — the value at which a context is indifferent — is:
+The bid is for rent — per page per step. A context generating tokens accumulates pages over time. If admitted continuously for `n` remaining steps with current page count `p` and page growth rate `g = 1/page_size` (one token per step), the **total future page-steps** (cumulative rent exposure) is:
 
 ```
-bid_i = (balance_i / horizon_i − dividend_i) / effective_pages_i
+S = Σ_{k=0}^{n-1} (p + g·k) = p·n + n(n−1) / (2·page_size)
 ```
 
-where `horizon_i` is the expected remaining steps.
+This is quadratic in `n`. The naïve formula `p·n` ignores the triangular accumulation: each new page created at step `k` incurs rent for the remaining `n−k` steps.
 
-**Interpretation:** `balance_i / horizon_i` is the per-step value of computing (budget spread over remaining lifetime). `dividend_i` is the opportunity cost of computing (forgoing the dividend difference between being excluded and admitted). The difference, normalized by pages, is the net value per page.
+### 5.2 Budget-Exhausting Bid
 
-### 5.2 Properties
+The bid should be the **maximum sustainable rent per page per step** — the flat rate that exactly exhausts the budget at the end of the horizon.
 
-- When `dividend ≈ 0` (low load), this reduces to `balance / (horizon × pages)` — matching the original system's bid formula.
-- When `dividend > balance/horizon` (heavy load), the bid goes negative. The context prefers exclusion. **The compute-or-wait decision is embedded in the bid**, not computed separately.
-- Truthful reporting of this value is a dominant strategy under critical-value payments.
+Over `n` steps while admitted, the balance evolves as:
 
-### 5.3 Horizon Estimation
+```
+B_final = B + n·d − r·S − n·g = 0
+              ↑       ↑    ↑
+           dividends  rent  make costs
+```
 
-The bid quality depends on `horizon_i`. The SDK provides defaults:
+where `d` is the per-step dividend (received regardless of admission status) and `g = 1/page_size` is the make cost rate. Solving for `r`:
 
-| Source | Horizon |
-|--------|---------|
-| Explicit `with_horizon(n)` | `n` steps |
-| `max_tokens` set | `max_tokens − tokens_generated` |
-| Neither | 4096 (conservative default) |
+```
+bid = (B + n·d − n/page_size) / (p·n + n(n−1) / (2·page_size))
+```
 
-Programs with better information can override. The mechanism is truthful given the declared value — horizon error is an information problem, not a mechanism failure.
+Factoring out `n`:
+
+```
+bid = (B/n + d − 1/page_size) / (p + (n−1) / (2·page_size))
+```
+
+**Key differences from the prior formula `(B/n − d) / p`:**
+
+1. **Denominator** includes `(n−1)/(2·page_size)` — the quadratic rent exposure. For large `n` this dominates, preventing overbidding.
+2. **Dividend is added**, not subtracted. Dividends are status-independent (§3.4): a context earns the same dividend whether admitted or excluded. They replenish the budget, increasing affordable rent. There is no opportunity cost to subtract.
+3. **Make cost is subtracted** (`1/page_size` per step for producing new pages).
+
+### 5.3 Stochastic Horizon
+
+The remaining step count `n` is typically unknown. If `n` is a random variable with mean `μ` and variance `σ²`, take the expectation of the budget constraint. The only nonlinear term is `S`:
+
+```
+E[S] = p·μ + E[n(n−1)] / (2·page_size)
+     = p·μ + (μ² + σ² − μ) / (2·page_size)
+     ≈ p·μ + μ²(1 + cv²) / (2·page_size)
+```
+
+where `cv² = σ²/μ²` is the squared coefficient of variation. The bid becomes:
+
+```
+bid = (B/μ + d − 1/page_size) / (p + μ(1 + cv²) / (2·page_size))
+```
+
+The `(1 + cv²)` multiplier captures uncertainty. Higher variance → more weight on expensive long-tail outcomes (quadratic rent growth) → more conservative bid.
+
+| Distribution | cv² | Effect |
+|---|---|---|
+| Deterministic (`n` known) | 0 | Exact budget planning |
+| Geometric (memoryless) | 1 | 2× more conservative (maximum entropy) |
+| Heavy-tailed | ≫ 1 | Very conservative |
+
+The **geometric distribution** (cv² = 1) is the maximum-entropy prior for positive integers with a given mean — making the fewest assumptions about the stopping time. It is minimax optimal: it minimizes worst-case regret against any true distribution.
+
+### 5.4 Horizon Estimation
+
+The bid is recomputed every step with the current balance, providing natural feedback: overbidding drains the balance and reduces future bids; underbidding accumulates dividend and raises future bids.
+
+| Information available | μ | cv² | Rationale |
+|---|---|---|---|
+| `with_horizon(n)` | `n − generated` | 0 | Deterministic — program knows its output length |
+| `with_max_tokens(n)` | `n − generated` | 1 | Hard cap known, stopping point within it unknown |
+| Neither | `max(generated, 64)` | 1 | Lindy heuristic: E[remaining \| survived t] ≈ t |
+
+The Lindy heuristic uses only observables with no tuning parameters. The floor of 64 prevents `μ = 0` at the start; after ~64 steps the estimate is driven by elapsed time.
+
+### 5.5 Properties
+
+- When `dividend ≈ 0` and `n ≪ p·page_size` (low load, small horizon), reduces to `B / (n·p)` — matching the original formula.
+- When `B/μ + d < 1/page_size`, the bid goes negative: the context cannot cover make costs. It prefers exclusion. **The compute-or-wait decision is embedded in the bid.**
+- The balance feedback loop makes the strategy self-correcting regardless of horizon error.
+- Truthful reporting of this value is a dominant strategy under critical-value payments (§10, Theorem 2).
 
 ---
 
@@ -341,7 +396,7 @@ A new process arrives with token budget `T`. The system creates a wallet with en
 │  BATCH STEP                                         │
 │                                                     │
 │  1. Contexts submit bids                            │
-│     SDK default: (balance/horizon − dividend) / pages │
+│     SDK default: (B/μ + d − 1/s) / (p + μ(1+cv²)/(2s))  │
 │     or: program overrides with custom bid            │
 │                                                     │
 │  2. Placement check (every K steps)                 │

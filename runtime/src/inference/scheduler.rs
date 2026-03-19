@@ -47,7 +47,6 @@ pub(super) trait SchedulingPolicy: Send {
         &self,
         current_batch_size: usize,
         current_total_tokens: usize,
-        in_flight_batches: usize,
     ) -> Decision;
 }
 
@@ -85,7 +84,7 @@ pub struct SchedulerStats {
     pub total_tokens_processed: AtomicU64,
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
-    pub in_flight_batches: AtomicU64,
+
 }
 
 // =============================================================================
@@ -272,9 +271,7 @@ impl BatchScheduler {
             }
 
             // Ask the policy what to do
-            let in_flight_count = 1 - in_flight.available_permits();
-
-            match policy.decide(batch.len(), batch.total_tokens(), in_flight_count) {
+            match policy.decide(batch.len(), batch.total_tokens()) {
                 Decision::Fire => {
                     // Acquire a permit (may wait if at in-flight limit)
                     // if in_flight.available_permits() == 0 {
@@ -291,15 +288,18 @@ impl BatchScheduler {
                     let requests_to_fire = batch.take();
                     policy.on_fired();
 
+                    // Collect batch context IDs for accurate rent charging.
+                    let batch_ctx_ids: Vec<u64> = requests_to_fire.iter()
+                        .map(|r| r.request.context_id)
+                        .collect();
+
                     // Spawn batch execution
                     let stats_tx_clone = stats_tx.clone();
                     let stats_clone = stats.clone();
                     let timeout = request_timeout;
 
-                    stats_clone.in_flight_batches.fetch_add(1, Relaxed);
-                    // eprintln!(
-                    //     "[SCHED dev={device_idx}] FIRING batch_size={batch_size} tokens={total_tokens}"
-                    // );
+
+
                     tokio::spawn(async move {
                         let start = Instant::now();
                         Self::execute_batch(
@@ -312,18 +312,17 @@ impl BatchScheduler {
                         let latency = start.elapsed();
 
                         // Advance market clock for this device: prices, rent, dividends.
-                        crate::context::tick(device_idx, latency.as_secs_f64());
+                        // Pass batch context IDs so tick only charges contexts
+                        // that were in this batch (not stale pinned contexts).
+                        crate::context::tick(device_idx, latency.as_secs_f64(), batch_ctx_ids);
 
                         // Update cumulative atomic counters
                         stats_clone.total_batches.fetch_add(1, Relaxed);
                         stats_clone.total_tokens_processed.fetch_add(total_tokens as u64, Relaxed);
                         stats_clone.last_batch_latency_us.store(latency.as_micros() as u64, Relaxed);
                         stats_clone.cumulative_latency_us.fetch_add(latency.as_micros() as u64, Relaxed);
-                        stats_clone.in_flight_batches.fetch_sub(1, Relaxed);
-                        // eprintln!(
-                        //     "[SCHED dev={device_idx}] COMPLETE batch_size={batch_size} latency={}ms",
-                        //     latency.as_millis()
-                        // );
+
+
 
                         stats_tx_clone
                             .send(BatchStats {

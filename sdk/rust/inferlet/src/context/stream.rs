@@ -8,6 +8,22 @@ use crate::pie::instruct::chat;
 
 use super::{Context, Decoder, Event, Speculation, Constrain, GrammarConstraint};
 
+/// Budget-exhausting bid: maximum sustainable rent per page per step.
+///
+/// Formula (§5 of SCHED.md):
+///   bid = (B/μ + d − 1/s) / (p + μ(1 + cv²) / (2s))
+///
+/// where B = balance, μ = expected remaining steps, d = dividend per step,
+/// s = page_size, p = current pages, cv² = squared coefficient of variation
+/// of the remaining-steps distribution.
+fn compute_bid(balance: f64, pages: f64, mu: f64, cv2: f64, page_size: f64, dividend: f64) -> f64 {
+    let mu = mu.max(1.0);
+    let g = 1.0 / page_size;  // make cost rate (pages per step)
+    let numerator = balance / mu + dividend - g;
+    let denominator = pages + mu * (1.0 + cv2) / (2.0 * page_size);
+    if denominator > 0.0 { numerator / denominator } else { numerator }
+}
+
 
 
 // =============================================================================
@@ -41,12 +57,12 @@ impl<'a> TokenStream<'a> {
     pub(super) fn new(ctx: &'a mut Context, sampler: Sampler) -> Self {
         let stop_tokens = chat::stop_tokens(&ctx.model);
 
-        // Set initial bid: spread balance across expected horizon, normalized by pages.
+        // Set initial bid: budget-exhausting rate with geometric prior (cv²=1).
         let balance = crate::scheduling::balance(&ctx.model);
         let dividend = crate::scheduling::dividend(&ctx.model);
         let pages = (ctx.committed_pages + ctx.working_pages).max(1) as f64;
-        let mvc = balance / 4096.0 - dividend;
-        ctx.bid(if pages > 0.0 { mvc / pages } else { mvc });  // Default horizon; updated per-step
+        let page_size = ctx.page_size as f64;
+        ctx.bid(compute_bid(balance, pages, 4096.0, 1.0, page_size, dividend));
 
         Self {
             ctx,
@@ -95,7 +111,13 @@ impl<'a> TokenStream<'a> {
     /// Sets the maximum number of tokens to generate.
     pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
         self.max_tokens = Some(max_tokens);
-        self
+        // Use max_tokens as horizon if no explicit horizon was set,
+        // so the bid formula reflects the actual generation length.
+        if self.horizon.is_none() {
+            self.with_horizon(max_tokens)
+        } else {
+            self
+        }
     }
 
     /// Sets an adapter to apply on every forward pass.
@@ -117,12 +139,13 @@ impl<'a> TokenStream<'a> {
     /// Falls back to `max_tokens`, then 4096.
     pub fn with_horizon(mut self, horizon: usize) -> Self {
         self.horizon = Some(horizon);
-        // Re-compute initial bid with the tighter horizon, normalized by pages.
+        // Re-compute bid with tight horizon (deterministic, cv²=0).
         let balance = crate::scheduling::balance(&self.ctx.model);
         let dividend = crate::scheduling::dividend(&self.ctx.model);
         let pages = (self.ctx.committed_pages + self.ctx.working_pages).max(1) as f64;
-        let mvc = balance / (horizon.max(1) as f64) - dividend;
-        self.ctx.bid(if pages > 0.0 { mvc / pages } else { mvc });
+        let page_size = self.ctx.page_size as f64;
+        let mu = (horizon - self.tokens_generated).max(1) as f64;
+        self.ctx.bid(compute_bid(balance, pages, mu, 0.0, page_size, dividend));
         self
     }
 
@@ -225,27 +248,28 @@ impl<'a> TokenStream<'a> {
     }
 
     async fn step(&mut self) -> Result<Vec<u32>> {
-        // ── Market: truthful bid ────────────────────────────────────────
-        // The bid tells the runtime how much we value staying resident.
-        // bid = (balance/horizon - dividend) / pages
-        // When dividend > balance/horizon, bid goes negative → prefer exclusion.
-        // The compute-or-wait decision is embedded in the bid.
+        // ── Market: budget-exhausting bid (§5 of SCHED.md) ───────────────
+        // bid = (B/μ + d − 1/s) / (p + μ(1+cv²)/(2s))
+        // When B/μ + d < 1/s, bid goes negative → prefer exclusion.
         {
             let balance = crate::scheduling::balance(&self.ctx.model);
             let dividend = crate::scheduling::dividend(&self.ctx.model);
             let pages = (self.ctx.committed_pages + self.ctx.working_pages) as f64;
+            let page_size = self.ctx.page_size as f64;
 
-            // Horizon chain: explicit horizon → max_tokens → 4096.
-            let total_horizon = self.horizon
-                .or(self.max_tokens)
-                .unwrap_or(4096);
-            let remaining = (total_horizon - self.tokens_generated).max(1) as f64;
+            // Horizon cascade: explicit → max_tokens → Lindy.
+            let (mu, cv2) = if let Some(h) = self.horizon {
+                // Deterministic: program declared its output length.
+                ((h - self.tokens_generated).max(1) as f64, 0.0)
+            } else if let Some(m) = self.max_tokens {
+                // Hard cap known, stopping point unknown → geometric prior.
+                ((m - self.tokens_generated).max(1) as f64, 1.0)
+            } else {
+                // Fully online: Lindy heuristic (μ = elapsed, floor 64).
+                (self.tokens_generated.max(64) as f64, 1.0)
+            };
 
-            // Truthful bid: per-step value minus opportunity cost of forgoing dividend.
-            let mvc = balance / remaining - dividend;
-            let bid = if pages > 0.0 { mvc / pages } else { mvc };
-
-            self.ctx.bid(bid);
+            self.ctx.bid(compute_bid(balance, pages, mu, cv2, page_size, dividend));
         }
 
         // Drain ctx.buffer as pending input tokens for this step.

@@ -157,7 +157,7 @@ class RuntimeConfig:
         max_dist_size: int = 64,
         max_num_embeds: int = 128,
         max_batch_tokens: int = 10240,
-        max_batch_size: int = 128,
+        max_batch_size: int = 512,
         max_num_adapters: int = 48,
         max_adapter_rank: int = 8,
         gpu_mem_utilization: float = 0.9,

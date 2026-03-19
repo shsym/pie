@@ -76,6 +76,7 @@ async def run_benchmark(args):
             gpu_mem_utilization=args.gpu_mem_util,
             cpu_mem_budget_in_gb=args.cpu_mem_budget,
             default_token_budget=args.default_token_budget,
+            max_batch_size=args.max_batch_size,
         )],
         max_concurrent_processes=args.max_concurrent_processes,
     )
@@ -200,6 +201,7 @@ def main():
     parser.add_argument("--unique-prompts", action="store_true", help="Make each request's prompt unique (append request #N)")
     parser.add_argument("--default-token-budget", type=int, required=True, help="Default token budget per process (required)")
     parser.add_argument("--max-concurrent-processes", type=int, default=None, help="Maximum number of concurrent processes (default: None)")
+    parser.add_argument("--max-batch-size", type=int, default=512, help="Maximum batch size for inference (default: 512)")
 
     args = parser.parse_args()
 

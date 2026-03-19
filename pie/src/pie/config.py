@@ -53,6 +53,7 @@ class ModelConfig:
     random_seed: int = 42
     dummy_mode: bool = False
     default_token_budget: int = 1024
+    max_batch_size: int = 512
 
     # Name derived from hf_repo if not explicitly set
     name: str = ""
@@ -60,9 +61,10 @@ class ModelConfig:
     def __post_init__(self):
         if not self.name:
             self.name = self.hf_repo
-        if self.default_token_budget <= 0:
+        if self.default_token_budget is None or self.default_token_budget <= 0:
             raise ValueError(
-                f"Model {self.name or self.hf_repo!r}: default_token_budget must be > 0"
+                f"Model {self.name or self.hf_repo!r}: default_token_budget must be > 0 "
+                f"(got {self.default_token_budget!r})"
             )
 
 

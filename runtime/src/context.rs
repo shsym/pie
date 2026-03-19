@@ -81,7 +81,7 @@ pub(crate) mod sched;
 mod snapshot;
 mod restore;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, BinaryHeap};
 use std::sync::LazyLock;
 use std::time::Instant;
 use dashmap::DashMap;
@@ -104,6 +104,42 @@ use sched::{AuctionResult, ProcessEntry, PendingAlloc};
 
 pub type ContextId = u64;
 
+/// Entry in the restore priority queue (BinaryHeap).
+///
+/// Ordering: non-defaulted before defaulted, then highest bid first.
+/// Uses snapshot of `bid` and `defaulted` at enqueue time. The heap
+/// provides O(log N) push/pop vs the previous O(N) full scan.
+/// Stale entries (context already restored/destroyed) are lazily
+/// filtered on pop.
+#[derive(Debug, Clone)]
+pub struct RestoreEntry {
+    pub(crate) ctx_id: ContextId,
+    pub(crate) bid: f64,
+    pub(crate) defaulted: bool,
+}
+
+impl PartialEq for RestoreEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.ctx_id == other.ctx_id
+    }
+}
+impl Eq for RestoreEntry {}
+
+impl PartialOrd for RestoreEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RestoreEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Non-defaulted (false=0) sorts HIGHER than defaulted (true=1).
+        // In a max-heap, we want non-defaulted first.
+        other.defaulted.cmp(&self.defaulted)
+            .then_with(|| self.bid.partial_cmp(&other.bid).unwrap_or(std::cmp::Ordering::Equal))
+    }
+}
+
 // =============================================================================
 // Globals
 // =============================================================================
@@ -124,6 +160,15 @@ pub(crate) static CACHED_CONTEXT_INFO: LazyLock<DashMap<(usize, ContextId), Cach
 /// Indexed by `model_idx` (the spawn order).
 pub(crate) static MARKET: LazyLock<boxcar::Vec<Market>> =
     LazyLock::new(boxcar::Vec::new);
+
+/// Real-time pinned context count per device (max 8 devices).
+/// Updated atomically on every pin/unpin — readable without actor overhead.
+static PINNED_COUNTS: [std::sync::atomic::AtomicUsize; 8] = [
+    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0),
+];
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CachedContextInfo {
@@ -146,6 +191,12 @@ pub(crate) struct Market {
     pub endowments: DashMap<ProcessId, f64>,
     /// Default credit endowment (pages) for new processes.
     pub default_credit: usize,
+    /// Per-device GPU-resident Active context count (updated each tick).
+    pub gpu_active: DashMap<usize, usize>,
+    /// Per-device GPU-resident Pinned context count (updated each tick).
+    pub gpu_pinned: DashMap<usize, usize>,
+    /// Per-device count of contexts charged rent this tick (= batch size).
+    pub gpu_charged: DashMap<usize, usize>,
 }
 
 impl Market {
@@ -157,6 +208,9 @@ impl Market {
             balances: DashMap::new(),
             endowments: DashMap::new(),
             default_credit,
+            gpu_active: DashMap::new(),
+            gpu_pinned: DashMap::new(),
+            gpu_charged: DashMap::new(),
         }
     }
 
@@ -293,9 +347,36 @@ pub async fn debug_context_state(model_idx: usize, id: ContextId) -> String {
 
 /// Execute one market tick on all models for a specific device.
 /// Called per batch completion from the inference scheduler.
-pub fn tick(device: usize, latency_secs: f64) {
+/// `batch_ctx_ids` lists the context IDs that were in the just-completed batch;
+/// only these contexts are charged rent (prevents stale-unpin overcollection).
+pub fn tick(device: usize, latency_secs: f64, batch_ctx_ids: Vec<ContextId>) {
     for model_idx in 0..SERVICES.len() {
-        let _ = SERVICES.send(model_idx, Message::Tick { device, latency_secs });
+        let _ = SERVICES.send(model_idx, Message::Tick { device, latency_secs, batch_ctx_ids: batch_ctx_ids.clone() });
+    }
+}
+
+/// Count GPU-resident contexts on a device: (active, pinned).
+/// Reads from `MARKET` cache published each tick — lock-free, O(1).
+pub fn resident_count(device: usize) -> (usize, usize) {
+    // Sum across all models (usually just one).
+    let mut active = 0usize;
+    let mut pinned = 0usize;
+    for model_idx in 0..MARKET.count() {
+        if let Some(market) = MARKET.get(model_idx) {
+            active += market.gpu_active.get(&device).map(|v| *v).unwrap_or(0);
+            pinned += market.gpu_pinned.get(&device).map(|v| *v).unwrap_or(0);
+        }
+    }
+    (active, pinned)
+}
+
+/// Real-time pinned context count for a device.
+/// Updated atomically on every pin/unpin — no actor overhead.
+pub fn pinned_count(device: usize) -> usize {
+    if device < PINNED_COUNTS.len() {
+        PINNED_COUNTS[device].load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        0
     }
 }
 
@@ -497,6 +578,10 @@ pub(crate) struct Context {
     /// Defaulted contexts are evicted first regardless of bid.
     /// Recomputed each tick — not sticky.
     pub defaulted: bool,
+    /// Cached Shapley effective page count for committed pages.
+    /// Updated on commit_working_pages and restore. Read by tick.pass2
+    /// to avoid per-tick trie traversal.
+    pub cached_effective_pages: f64,
 }
 
 impl Context {
@@ -518,6 +603,7 @@ impl Context {
             deferred_ops: Vec::new(),
             pending_replay: false,
             defaulted: false,
+            cached_effective_pages: 0.0,
         }
     }
 
@@ -546,6 +632,71 @@ impl Context {
 // ContextManager
 // =============================================================================
 
+/// Lightweight diagnostic counters for scheduler health monitoring.
+/// Reset after each summary dump.
+#[derive(Debug, Default)]
+pub(crate) struct SchedCounters {
+    /// Number of tick() calls since last dump.
+    pub ticks: u64,
+    /// Contexts suspended due to contention (eviction victims).
+    pub eviction_suspends: u64,
+    /// Contexts self-suspended due to credit bankruptcy in when_allocated.
+    pub credit_suspends: u64,
+    /// Contexts self-suspended due to priority gate (lower bid than restore_queue head).
+    pub priority_gate_suspends: u64,
+    /// Contexts self-suspended because no eviction victim found.
+    pub no_victim_suspends: u64,
+    /// Contexts successfully restored from restore_queue.
+    pub restores: u64,
+    /// Contexts rejected from restore by can_restore (insufficient pages or credit).
+    pub restore_rejections: u64,
+    /// Contexts flagged as defaulted (can't pay rent) in a tick.
+    pub defaults_flagged: u64,
+    /// Total eviction victim searches.
+    pub eviction_searches: u64,
+
+    // --- Per-message-type cumulative timing (microseconds) ---
+    pub tick_us: u64,
+    pub tick_count: u64,
+    pub pin_us: u64,
+    pub pin_count: u64,
+    pub unpin_us: u64,
+    pub unpin_count: u64,
+    pub reserve_us: u64,
+    pub reserve_count: u64,
+    pub release_us: u64,
+    pub release_count: u64,
+    pub commit_us: u64,
+    pub commit_count: u64,
+    pub bid_us: u64,
+    pub bid_count: u64,
+    pub replay_us: u64,
+    pub replay_count: u64,
+    pub register_us: u64,
+    pub register_count: u64,
+    pub unregister_us: u64,
+    pub unregister_count: u64,
+    pub destroy_us: u64,
+    pub destroy_count: u64,
+    pub append_us: u64,
+    pub append_count: u64,
+
+    // --- tick() sub-operation timing ---
+    pub tick_pass1_us: u64,
+    pub tick_pass2_us: u64,
+    pub tick_pass3_us: u64,
+    pub tick_publish_us: u64,
+
+    // --- unregister_process() sub-operation timing ---
+    pub unreg_queues_us: u64,
+    pub unreg_destroy_us: u64,
+    pub unreg_drain_us: u64,
+
+    // --- drain_queues timing ---
+    pub drain_queues_us: u64,
+    pub drain_queues_count: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct ContextManager {
     /// Per-device GPU page stores (radix trie). Indexed by device ordinal.
@@ -569,14 +720,22 @@ pub(crate) struct ContextManager {
     /// FIFO queue: contexts with pending deferred allocs waiting for free GPU pages.
     pub(crate) alloc_queue: VecDeque<ContextId>,
     /// Restore queue: suspended contexts waiting for restoration, served by highest bid.
-    pub(crate) restore_queue: Vec<ContextId>,
+    /// Uses a max-heap with lazy deletion — stale entries filtered on pop.
+    pub(crate) restore_queue: BinaryHeap<RestoreEntry>,
     /// Per-device auction results from the last tick (clearing price, revenue, dividend rate).
     pub(crate) auction_results: Vec<AuctionResult>,
     /// Default credit endowment for new processes without an explicit token budget.
     pub(crate) default_endowment: f64,
+    /// Diagnostic counters for scheduler health.
+    pub(crate) sched_counters: SchedCounters,
 }
 
 impl ContextManager {
+    /// Hard admission control threshold: don't restore when any device
+    /// exceeds this page utilization fraction. Prevents the
+    /// evict→restore→re-evict thrashing cascade.
+    const RESTORE_UTILIZATION_CAP: f64 = 0.85;
+
     pub(crate) fn new(model_idx: usize, page_size: usize, num_gpu_pages: &[usize], num_cpu_pages: &[usize], default_credit: usize) -> Self {
         let gpu_stores: Vec<_> = num_gpu_pages.iter()
             .map(|&n| PageStore::new(page_size, n))
@@ -590,9 +749,10 @@ impl ContextManager {
             processes: HashMap::new(),
             contexts: HashMap::new(),
             alloc_queue: VecDeque::new(),
-            restore_queue: Vec::new(),
+            restore_queue: BinaryHeap::new(),
             auction_results: vec![AuctionResult::default(); num_gpu_pages.len()],
             default_endowment: default_credit as f64,
+            sched_counters: SchedCounters::default(),
         }
     }
 
@@ -709,8 +869,7 @@ impl ContextManager {
         // Drop this context from alloc_queue.
         self.alloc_queue.retain(|&ctx_id| ctx_id != id);
 
-        // Remove from restore_queue
-        self.restore_queue.retain(|&ctx_id| ctx_id != id);
+        // restore_queue: lazy deletion — stale entries filtered on pop in drain_queues.
 
         // Release committed chain (skip if already released during suspension)
         if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {
@@ -875,6 +1034,11 @@ impl ContextManager {
         ctx.max_committed_position = positions.iter().copied().max()
             .or(ctx.max_committed_position);
 
+        // Refresh cached effective_pages after chain extension.
+        if !ctx.is_off_gpu() {
+            ctx.cached_effective_pages = self.gpu_stores[dev_idx].effective_pages(&ctx.committed_hashes);
+        }
+
         // Append to lineage (merge with last record if same adapter AND seed).
         if let Some(Record::Fill { tokens: t, positions: p, mask: m, adapter: a, adapter_seed: s }) = ctx.lineage.last_mut() {
             if *a == lineage_adapter && *s == lineage_adapter_seed {
@@ -917,6 +1081,7 @@ impl ContextManager {
                 let kv_len = (ctx.committed_len() * mgr.page_size
                     + ctx.working_page_tokens.len()) as u32;
                 ctx.state = State::Pinned;
+                PINNED_COUNTS[dev_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 let mut page_ids = Vec::new();
                 if !committed_hashes.is_empty() {
@@ -943,10 +1108,15 @@ impl ContextManager {
     /// If `pending_suspend` was set (and this isn't a replay context),
     /// executes the deferred suspension and enqueues for restoration.
     pub(crate) fn unpin(&mut self, id: ContextId) {
-        let (pending, replay) = match self.contexts.get(&id) {
-            Some(ctx) if ctx.is_pinned() => (ctx.pending_suspend, ctx.pending_replay),
+        let (pending, replay, dev) = match self.contexts.get(&id) {
+            Some(ctx) if ctx.is_pinned() => (ctx.pending_suspend, ctx.pending_replay, ctx.device.unwrap_or(0) as usize),
             _ => return,
         };
+
+        // Decrement real-time pinned counter (all paths leaving Pinned).
+        if dev < PINNED_COUNTS.len() {
+            PINNED_COUNTS[dev].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // If this is a replay context, replay_complete handles the transition.
         if replay {
@@ -976,6 +1146,7 @@ impl ContextManager {
     /// Phase 2: restore_queue (priority heap) — restore highest-bid Suspended
     ///          context, with per-restore placement evaluation (§4.3).
     pub(crate) fn drain_queues(&mut self) {
+        let t0 = Instant::now();
         // Phase 1: alloc_queue FIFO — serve deferred ops for head context.
         while let Some(&front_ctx_id) = self.alloc_queue.front() {
             // Skip stale entries (destroyed contexts or empty deferred_ops).
@@ -993,20 +1164,35 @@ impl ContextManager {
             self.fire_deferred_ops(ctx_id);
         }
 
-        // Phase 2: restore_queue — find and restore highest-bid Suspended context.
+        // Phase 2: restore_queue — pop highest-bid Suspended context from heap.
         // Only proceed if alloc_queue is empty (allocs have strict priority).
         if !self.alloc_queue.is_empty() {
             return;
         }
 
-        let num_devices = self.gpu_stores.len();
-        let max_attempts = self.restore_queue.len();
-        let mut attempts = 0;
-        while let Some(ctx_id) = self.highest_bid_in_restore_queue() {
-            // Remove this entry from the queue.
-            self.restore_queue.retain(|&id| id != ctx_id);
+        // Hard admission control: don't restore when any device is near
+        // page capacity. This prevents over-admission that causes the
+        // thrashing cascade (evict→restore→re-evict cycle). Processes
+        // wait here until running processes complete and free pages,
+        // naturally dropping utilization below the threshold.
+        let over_capacity = self.gpu_stores.iter().any(|d| {
+            let (used, total) = d.stats();
+            let utilization = used as f64 / total.max(1) as f64;
+            utilization > Self::RESTORE_UTILIZATION_CAP
+        });
+        if over_capacity {
+            return;
+        }
 
-            // Skip stale entries (context was destroyed or already restored).
+        let num_devices = self.gpu_stores.len();
+        let max_rejections = self.restore_queue.len();
+        let mut rejections = 0;
+        let mut re_enqueue = Vec::new();
+
+        while let Some(entry) = self.restore_queue.pop() {
+            let ctx_id = entry.ctx_id;
+
+            // Lazy deletion: skip stale entries (destroyed or already restored).
             let is_off_gpu = self.contexts.get(&ctx_id)
                 .map(|c| c.is_off_gpu()).unwrap_or(false);
             if !is_off_gpu {
@@ -1028,18 +1214,28 @@ impl ContextManager {
 
             // Admission check: enough free pages for this context?
             if !self.can_restore(ctx_id) {
-                self.enqueue_restore(ctx_id);
-                attempts += 1;
-                if attempts >= max_attempts {
+                self.sched_counters.restore_rejections += 1;
+                re_enqueue.push(ctx_id);
+                rejections += 1;
+                if rejections >= max_rejections {
                     break;
                 }
                 continue;
             }
 
+            self.sched_counters.restores += 1;
             if let Err(e) = self.restore(ctx_id) {
                 tracing::error!(ctx = ctx_id, "restore failed: {e:#}");
             }
         }
+
+        // Re-enqueue rejected contexts.
+        for ctx_id in re_enqueue {
+            self.enqueue_restore(ctx_id);
+        }
+
+        self.sched_counters.drain_queues_us += t0.elapsed().as_micros() as u64;
+        self.sched_counters.drain_queues_count += 1;
     }
 
     // ==================== Extracted handle() helpers ====================
@@ -1147,7 +1343,8 @@ pub(crate) enum Message {
 
     // ── Market messages ────────────────────────────────────────
     /// Execute one market tick for a single device.
-    Tick { device: usize, latency_secs: f64 },
+    /// `batch_ctx_ids` = context IDs from the just-completed batch.
+    Tick { device: usize, latency_secs: f64, batch_ctx_ids: Vec<ContextId> },
     /// Set a context's bid (willingness to pay per page per step).
     Bid { id: ContextId, bid: f64, response: oneshot::Sender<Result<()>> },
     /// Suspend a context (program-initiated).
@@ -1158,6 +1355,7 @@ impl ServiceHandler for ContextManager {
     type Message = Message;
 
     async fn handle(&mut self, msg: Message) {
+        let _t = Instant::now();
         match msg {
             Message::Lookup { username, name, response } => {
                 let result = self.snapshots.get(&(username, name))
@@ -1178,28 +1376,49 @@ impl ServiceHandler for ContextManager {
                 let _ = response.send(self.delete(username, name));
             }
             Message::Destroy { id, response } => {
+                let t0 = Instant::now();
                 let _ = response.send(self.destroy(id));
+                self.sched_counters.destroy_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.destroy_count += 1;
             }
             Message::Fork { id, owner, response } => {
                 self.fork(id, owner, response);
             }
             Message::CommitWorkingPages { id, num_pages, response } => {
+                let t0 = Instant::now();
                 let _ = response.send(self.commit_working_pages(id, num_pages));
+                self.sched_counters.commit_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.commit_count += 1;
             }
             Message::ReserveWorkingPages { id, num_pages, response } => {
+                let t0 = Instant::now();
                 self.reserve_working_pages(id, num_pages, response);
+                self.sched_counters.reserve_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.reserve_count += 1;
             }
             Message::ReleaseWorkingPages { id, num_pages } => {
+                let t0 = Instant::now();
                 let _ = self.release_working_pages(id, num_pages);
+                self.sched_counters.release_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.release_count += 1;
             }
             Message::Pin { id, num_input_tokens, response } => {
+                let t0 = Instant::now();
                 self.pin(id, num_input_tokens, response);
+                self.sched_counters.pin_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.pin_count += 1;
             }
             Message::Unpin { id } => {
+                let t0 = Instant::now();
                 self.unpin(id);
+                self.sched_counters.unpin_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.unpin_count += 1;
             }
             Message::ReplayComplete { id } => {
+                let t0 = Instant::now();
                 self.replay_complete(id);
+                self.sched_counters.replay_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.replay_count += 1;
             }
             Message::GetStats { response } => {
                 let _ = response.send(self.stats());
@@ -1209,25 +1428,91 @@ impl ServiceHandler for ContextManager {
                 self.publish_context_counts(id);
             }
             Message::AppendWorkingPageTokens { id, tokens, positions, masks, adapter, adapter_seed, response } => {
+                let t0 = Instant::now();
                 let _ = response.send(self.append_working_page_tokens(id, tokens, positions, masks, adapter, adapter_seed));
                 self.publish_context_counts(id);
+                self.sched_counters.append_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.append_count += 1;
             }
             Message::DebugState { id, response } => {
                 let _ = response.send(self.debug_state(id));
             }
             Message::RegisterProcess { pid, token_budget } => {
+                let t0 = Instant::now();
                 self.register_process(pid, token_budget);
+                self.sched_counters.register_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.register_count += 1;
             }
             Message::UnregisterProcess { pid } => {
+                let t0 = Instant::now();
                 self.unregister_process(pid);
+                self.sched_counters.unregister_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.unregister_count += 1;
             }
 
             // ── Market handlers ────────────────────────────────────
-            Message::Tick { device, latency_secs } => {
-                self.tick(device, latency_secs);
+            Message::Tick { device, latency_secs, batch_ctx_ids } => {
+                let t0 = Instant::now();
+                self.tick(device, latency_secs, &batch_ctx_ids);
+                self.sched_counters.tick_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.tick_count += 1;
+                self.sched_counters.ticks += 1;
+                if self.sched_counters.ticks % 1000 == 0 {
+                    let c = &self.sched_counters;
+                    let n_active = self.contexts.values().filter(|c| c.is_active()).count();
+                    let n_pinned = self.contexts.values().filter(|c| c.is_pinned()).count();
+                    let n_off_gpu = self.contexts.values().filter(|c| c.is_off_gpu()).count();
+                    let n_defaulted = self.contexts.values().filter(|c| c.defaulted).count();
+                    let avg_bal: f64 = if !self.processes.is_empty() {
+                        self.processes.values().map(|p| p.balance).sum::<f64>() / self.processes.len() as f64
+                    } else { 0.0 };
+                    let min_bal: f64 = self.processes.values().map(|p| p.balance).fold(f64::MAX, f64::min);
+                    let clearing = self.auction_results.get(device).map(|a| a.clearing_price).unwrap_or(0.0);
+                    let gpu_util: Vec<String> = self.gpu_stores.iter().enumerate().map(|(i, s)| {
+                        let (used, total) = s.stats();
+                        format!("dev{}={}/{}", i, used, total)
+                    }).collect();
+                    eprintln!(
+                        "[SCHED_DIAG] ticks={} | evict={} credit_susp={} prigate={} novictim={} | \
+                         restores={} rej={} defaults={} | \
+                         active={} pinned={} off_gpu={} defaulted={} | \
+                         rq={} aq={} | clearing={:.3} avg_bal={:.1} min_bal={:.1} | kv={}",
+                        c.ticks, c.eviction_suspends, c.credit_suspends,
+                        c.priority_gate_suspends, c.no_victim_suspends,
+                        c.restores, c.restore_rejections, c.defaults_flagged,
+                        n_active, n_pinned, n_off_gpu, n_defaulted,
+                        self.restore_queue.len(), self.alloc_queue.len(),
+                        clearing, avg_bal, min_bal,
+                        gpu_util.join(","),
+                    );
+                    eprintln!(
+                        "[SCHED_PROF] tick={}us/{} pin={}us/{} unpin={}us/{} reserve={}us/{} release={}us/{} \
+                         commit={}us/{} bid={}us/{} replay={}us/{} destroy={}us/{} unreg={}us/{} append={}us/{} drain={}us/{}",
+                        c.tick_us, c.tick_count,
+                        c.pin_us, c.pin_count,
+                        c.unpin_us, c.unpin_count,
+                        c.reserve_us, c.reserve_count,
+                        c.release_us, c.release_count,
+                        c.commit_us, c.commit_count,
+                        c.bid_us, c.bid_count,
+                        c.replay_us, c.replay_count,
+                        c.destroy_us, c.destroy_count,
+                        c.unregister_us, c.unregister_count,
+                        c.append_us, c.append_count,
+                        c.drain_queues_us, c.drain_queues_count,
+                    );
+                    eprintln!(
+                        "[SCHED_SUB] tick: p1={}us p2={}us p3={}us pub={}us | unreg: q={}us dest={}us drain={}us",
+                        c.tick_pass1_us, c.tick_pass2_us, c.tick_pass3_us, c.tick_publish_us,
+                        c.unreg_queues_us, c.unreg_destroy_us, c.unreg_drain_us,
+                    );
+                }
             }
             Message::Bid { id, bid, response } => {
+                let t0 = Instant::now();
                 let _ = response.send(self.bid(id, bid));
+                self.sched_counters.bid_us += t0.elapsed().as_micros() as u64;
+                self.sched_counters.bid_count += 1;
             }
             Message::Suspend { id, response } => {
                 let _ = response.send(self.voluntary_suspend(id));

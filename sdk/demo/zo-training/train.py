@@ -63,8 +63,9 @@ class TrainingConfig:
     device: str = "cuda:0"
     gpu_mem_util: float = 0.8
     cpu_mem_budget: int = 12
-    max_concurrent_processes: int = 512
-    default_token_budget: int | None = None
+    max_concurrent_processes: int = 256
+    default_token_budget: int = 4096
+    max_batch_size: int = 512
 
     # --- Server (distributed mode) ---
     servers: list[str] = field(default_factory=lambda: ["ws://127.0.0.1:8080"])
@@ -290,6 +291,7 @@ class ESTrainer:
                 gpu_mem_utilization=self.config.gpu_mem_util,
                 cpu_mem_budget_in_gb=self.config.cpu_mem_budget,
                 default_token_budget=self.config.default_token_budget,
+                max_batch_size=self.config.max_batch_size,
             )],
         )
 

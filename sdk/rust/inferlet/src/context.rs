@@ -185,10 +185,16 @@ impl Context {
         let latency = crate::scheduling::latency(&self.inner);
         let pages = (self.committed_pages + self.working_pages) as f64;
 
-        // Truthful generation bid (§5.1).
-        let remaining = 4096.0; // conservative default; overridden by horizon if known
+        // Budget-exhausting bid (§5 of SCHED.md) with geometric prior (cv²=1).
+        // bid = (B/μ + d − 1/s) / (p + μ/s)
+        // Conservative default: μ = 4096 (no horizon info in yield_bid).
+        let mu = 4096.0_f64;
+        let page_size = self.page_size as f64;
+        let g = 1.0 / page_size;
         let generation_bid = if pages > 0.0 {
-            (balance / remaining - dividend) / pages
+            let numerator = balance / mu + dividend - g;
+            let denominator = pages + mu / page_size;  // (1+cv²)/2 = 1 for cv²=1
+            numerator / denominator
         } else { 0.0 };
 
         let step_secs = latency.max(0.001);
@@ -199,7 +205,7 @@ impl Context {
         // Equivalently: rent-free or bid well above clearing price.
         let hold = rent == 0.0
             || (generation_bid > rent
-                && wait_steps < remaining * (generation_bid - rent) / rent);
+                && wait_steps < mu * (generation_bid - rent) / rent);
 
         if !hold {
             self.inner.bid(0.0);
