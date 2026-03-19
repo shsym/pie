@@ -1457,56 +1457,8 @@ impl ServiceHandler for ContextManager {
                 self.sched_counters.tick_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.tick_count += 1;
                 self.sched_counters.ticks += 1;
-                if self.sched_counters.ticks % 1000 == 0 {
-                    let c = &self.sched_counters;
-                    let n_active = self.contexts.values().filter(|c| c.is_active()).count();
-                    let n_pinned = self.contexts.values().filter(|c| c.is_pinned()).count();
-                    let n_off_gpu = self.contexts.values().filter(|c| c.is_off_gpu()).count();
-                    let n_defaulted = self.contexts.values().filter(|c| c.defaulted).count();
-                    let avg_bal: f64 = if !self.processes.is_empty() {
-                        self.processes.values().map(|p| p.balance).sum::<f64>() / self.processes.len() as f64
-                    } else { 0.0 };
-                    let min_bal: f64 = self.processes.values().map(|p| p.balance).fold(f64::MAX, f64::min);
-                    let clearing = self.auction_results.get(device).map(|a| a.clearing_price).unwrap_or(0.0);
-                    let gpu_util: Vec<String> = self.gpu_stores.iter().enumerate().map(|(i, s)| {
-                        let (used, total) = s.stats();
-                        format!("dev{}={}/{}", i, used, total)
-                    }).collect();
-                    eprintln!(
-                        "[SCHED_DIAG] ticks={} | evict={} credit_susp={} prigate={} novictim={} | \
-                         restores={} rej={} defaults={} | \
-                         active={} pinned={} off_gpu={} defaulted={} | \
-                         rq={} aq={} | clearing={:.3} avg_bal={:.1} min_bal={:.1} | kv={}",
-                        c.ticks, c.eviction_suspends, c.credit_suspends,
-                        c.priority_gate_suspends, c.no_victim_suspends,
-                        c.restores, c.restore_rejections, c.defaults_flagged,
-                        n_active, n_pinned, n_off_gpu, n_defaulted,
-                        self.restore_queue.len(), self.alloc_queue.len(),
-                        clearing, avg_bal, min_bal,
-                        gpu_util.join(","),
-                    );
-                    eprintln!(
-                        "[SCHED_PROF] tick={}us/{} pin={}us/{} unpin={}us/{} reserve={}us/{} release={}us/{} \
-                         commit={}us/{} bid={}us/{} replay={}us/{} destroy={}us/{} unreg={}us/{} append={}us/{} drain={}us/{}",
-                        c.tick_us, c.tick_count,
-                        c.pin_us, c.pin_count,
-                        c.unpin_us, c.unpin_count,
-                        c.reserve_us, c.reserve_count,
-                        c.release_us, c.release_count,
-                        c.commit_us, c.commit_count,
-                        c.bid_us, c.bid_count,
-                        c.replay_us, c.replay_count,
-                        c.destroy_us, c.destroy_count,
-                        c.unregister_us, c.unregister_count,
-                        c.append_us, c.append_count,
-                        c.drain_queues_us, c.drain_queues_count,
-                    );
-                    eprintln!(
-                        "[SCHED_SUB] tick: p1={}us p2={}us p3={}us pub={}us | unreg: q={}us dest={}us drain={}us",
-                        c.tick_pass1_us, c.tick_pass2_us, c.tick_pass3_us, c.tick_publish_us,
-                        c.unreg_queues_us, c.unreg_destroy_us, c.unreg_drain_us,
-                    );
-                }
+                // Diagnostic logging (uncomment for debugging):
+                // if self.sched_counters.ticks % 1000 == 0 { ... }
             }
             Message::Bid { id, bid, response } => {
                 let t0 = Instant::now();
