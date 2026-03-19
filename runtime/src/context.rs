@@ -446,7 +446,9 @@ pub(crate) enum State {
     /// Active on GPU, forward pass in progress — NOT immediately evictable.
     /// Eviction is deferred via `pending_suspend` flag.
     Pinned,
-    /// Committed chain refcounts released, working pages on CPU.
+    /// Off GPU, pages cached on CPU. Warm restore via H2D copy.
+    Stashed,
+    /// Off GPU, no pages anywhere. Cold restore via full recompute.
     Suspended,
 }
 
@@ -521,7 +523,10 @@ impl Context {
 
     pub fn is_active(&self) -> bool { self.state == State::Active }
     pub fn is_suspended(&self) -> bool { self.state == State::Suspended }
+    pub fn is_stashed(&self) -> bool { self.state == State::Stashed }
     pub fn is_pinned(&self) -> bool { self.state == State::Pinned }
+    /// True when the context is off GPU (Stashed or Suspended).
+    pub fn is_off_gpu(&self) -> bool { matches!(self.state, State::Stashed | State::Suspended) }
 
     /// Tip of the committed hash chain (last element), or None if empty.
     pub fn committed_tip(&self) -> Option<PageHash> { self.committed_hashes.last().copied() }
@@ -624,7 +629,7 @@ impl ContextManager {
                         committed_pinned += ctx.committed_hashes.len();
                         n_pinned += 1;
                     }
-                    State::Suspended => {
+                    State::Suspended | State::Stashed => {
                         working_suspended += ctx.working_pages.len();
                         n_suspended += 1;
                     }
@@ -708,7 +713,7 @@ impl ContextManager {
         self.restore_queue.retain(|&ctx_id| ctx_id != id);
 
         // Release committed chain (skip if already released during suspension)
-        if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
+        if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {
             self.gpu_stores[dev_idx].release(&ctx.committed_hashes);
         }
 
@@ -724,7 +729,7 @@ impl ContextManager {
 
         // Release CPU-resident committed pages (suspended contexts may have
         // had their committed pages stashed to CPU via would_free + cpu.insert).
-        if ctx.is_suspended() && !ctx.committed_hashes.is_empty() {
+        if ctx.is_off_gpu() && !ctx.committed_hashes.is_empty() {
             self.cpu_stores[dev_idx].release(&ctx.committed_hashes);
         }
 
@@ -786,7 +791,7 @@ impl ContextManager {
         let len = ctx.working_page_tokens.len();
         ctx.working_page_tokens.truncate(len.saturating_sub(tokens_to_remove));
 
-        if !ctx.is_suspended() {
+        if !ctx.is_off_gpu() {
             self.gpu_stores[dev_idx].free(&to_free);
         }
         self.publish_context_counts(id);
@@ -801,7 +806,7 @@ impl ContextManager {
 
         // Suspended contexts have empty working_pages but track the count
         // in suspended_working_count (working pages are recomputed on restore).
-        let available_pages = if ctx.is_suspended() {
+        let available_pages = if ctx.is_off_gpu() {
             ctx.suspended_working_count
         } else {
             ctx.working_pages.len()
@@ -847,7 +852,7 @@ impl ContextManager {
         let dev = &mut self.gpu_stores[dev_idx];
 
         // Commit: physical (GPU promotion + dedup) or logical (metadata only).
-        if ctx.is_suspended() {
+        if ctx.is_off_gpu() {
             // Suspended: no physical pages to promote (working pages were freed
             // on suspend). Metadata-only commit — on restore, the committed chain
             // replay will regenerate these pages.
@@ -860,7 +865,7 @@ impl ContextManager {
         // Update context state.
         let ctx = self.contexts.get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context lost during commit"))?;
-        if ctx.is_suspended() {
+        if ctx.is_off_gpu() {
             ctx.suspended_working_count = ctx.suspended_working_count.saturating_sub(num_pages);
         } else {
             ctx.working_pages.drain(..num_pages);
@@ -903,7 +908,7 @@ impl ContextManager {
             let result = (|| -> Result<PinnedContext> {
                 let ctx = mgr.contexts.get_mut(&id)
                     .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
-                if ctx.is_suspended() {
+                if ctx.is_off_gpu() {
                     anyhow::bail!("pin: context is suspended (cannot pin)");
                 }
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
@@ -1002,9 +1007,9 @@ impl ContextManager {
             self.restore_queue.retain(|&id| id != ctx_id);
 
             // Skip stale entries (context was destroyed or already restored).
-            let is_suspended = self.contexts.get(&ctx_id)
-                .map(|c| c.is_suspended()).unwrap_or(false);
-            if !is_suspended {
+            let is_off_gpu = self.contexts.get(&ctx_id)
+                .map(|c| c.is_off_gpu()).unwrap_or(false);
+            if !is_off_gpu {
                 continue;
             }
 

@@ -620,7 +620,7 @@ impl PageStore {
     }
 
     pub fn free(&mut self, pages: &[PhysicalPageId]) {
-        self.pool.free_tagged(pages, "free_pages");
+        self.pool.free_tagged(pages, "free_gpu_pages");
     }
 
     // =========================================================================
@@ -713,9 +713,7 @@ impl PageStore {
         out
     }
 
-    pub fn cached_count(&self, hashes: &[PageHash]) -> usize {
-        self.root.prefix_match_len(hashes)
-    }
+
 
     pub fn debug_info(&self, hashes: &[PageHash]) -> String {
         let prefix = self.prefix_len(hashes);

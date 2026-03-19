@@ -43,7 +43,7 @@ impl ContextManager {
     /// working pages (recomputed) plus replay pages plus deferred alloc requirements.
     pub(crate) fn can_restore(&mut self, ctx_id: ContextId) -> bool {
         let ctx = match self.contexts.get(&ctx_id) {
-            Some(c) if c.is_suspended() => c,
+            Some(c) if c.is_off_gpu() => c,
             _ => return false,
         };
 
@@ -109,7 +109,7 @@ impl ContextManager {
         let ctx = self.contexts.get(&ctx_id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
 
-        if !ctx.is_suspended() {
+        if !ctx.is_off_gpu() {
             return Ok(());
         }
 

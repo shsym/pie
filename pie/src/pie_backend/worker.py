@@ -190,10 +190,14 @@ def worker_main(
     group_devices = [devices[r] for r in group_topology[my_group_id]]
 
     # Pass model_config directly — RuntimeConfig.from_args() owns all defaults.
-    # Filter out device/devices keys since we pass them explicitly.
+    # Filter to only keys that from_args() accepts (ModelConfig may have
+    # extra keys like default_token_budget that only the Rust runtime uses).
+    import inspect
+    valid_keys = set(inspect.signature(RuntimeConfig.from_args).parameters.keys())
     filtered_config = {
         k: v for k, v in model_config.items()
-        if k not in ("device", "devices", "scheduler", "tensor_parallel_size")
+        if k in valid_keys
+        and k not in ("device", "devices", "tensor_parallel_size")
         and v is not None
     }
 

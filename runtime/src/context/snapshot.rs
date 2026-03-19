@@ -46,7 +46,7 @@ impl ContextManager {
             Some(ctx) => {
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 let working = ctx.working_pages.len();
-                let suffix = if ctx.is_suspended() && !ctx.committed_hashes.is_empty() {
+                let suffix = if ctx.is_off_gpu() && !ctx.committed_hashes.is_empty() {
                     let prefix = self.gpu_stores[dev_idx].prefix_len(&ctx.committed_hashes);
                     ctx.committed_hashes.len() - prefix
                 } else {
@@ -69,7 +69,7 @@ impl ContextManager {
                     .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
                 let device = dev_idx as DeviceId;
-                let src_on_gpu = !ctx.is_suspended();
+                let src_on_gpu = !ctx.is_off_gpu();
 
                 // Snapshot source state.
                 let committed_hashes = ctx.committed_hashes.clone();
@@ -202,7 +202,7 @@ impl ContextManager {
             } else if let Some(cpu_pages) = self.cpu_stores[dev_idx].alloc(n) {
                 // Fallback: GPU → CPU copy (source GPU pages stay intact)
                 let _ = device::copy_d2h(dev_idx as DeviceId, &src_working, &cpu_pages);
-                (cpu_pages, State::Suspended)
+                (cpu_pages, State::Stashed)
             } else {
                 eprintln!("SNAPSHOT_PAGE_COPY_FAIL ctx={id}: no GPU or CPU pages available");
                 (Vec::new(), State::Active)
@@ -235,7 +235,7 @@ impl ContextManager {
         // If snapshot ended up Suspended (CPU fallback for working pages),
         // release the refcounts we acquired. Suspended invariant: no held refcounts.
         // On open/fork, retain will be called to re-acquire.
-        if snapshot_state == State::Suspended && !committed_hashes.is_empty() {
+        if snapshot_state == State::Stashed && !committed_hashes.is_empty() {
             self.gpu_stores[dev_idx].release(&committed_hashes);
         }
 
@@ -248,11 +248,11 @@ impl ContextManager {
 
         if let Some(ctx) = self.contexts.remove(&snapshot_id) {
             let dev_idx = ctx.device.unwrap_or(0) as usize;
-            if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
+            if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {
                 self.gpu_stores[dev_idx].release(&ctx.committed_hashes);
             }
             // Free snapshot working pages (GPU or CPU depending on state)
-            if ctx.is_suspended() {
+            if ctx.is_stashed() {
                 self.cpu_stores[dev_idx].free(&ctx.working_pages);
             } else {
                 self.gpu_stores[dev_idx].free(&ctx.working_pages);
@@ -285,7 +285,7 @@ impl ContextManager {
         let key = (username.clone(), name.clone());
         let (needed, dev_idx, snap_ctx_id) = match self.snapshots.get(&key) {
             Some(&snap_id) => match self.contexts.get(&snap_id) {
-                Some(snap) if snap.is_suspended() => {
+                Some(snap) if snap.is_off_gpu() => {
                     let dev_idx = snap.device.unwrap_or(0) as usize;
                     let working = snap.working_pages.len();
                     let suffix = if !snap.committed_hashes.is_empty() {
@@ -357,10 +357,10 @@ impl ContextManager {
             .ok_or_else(|| anyhow::anyhow!("Snapshot context missing"))?;
 
         let dev_idx = snap.device.unwrap_or(0) as usize;
-        let was_suspended = snap.is_suspended();
+        let was_off_gpu = snap.is_off_gpu();
 
         // Determine committed chain restoration needs.
-        let (prefix_len, suffix_count) = if was_suspended && !snap.committed_hashes.is_empty() {
+        let (prefix_len, suffix_count) = if was_off_gpu && !snap.committed_hashes.is_empty() {
             let prefix = self.gpu_stores[dev_idx].prefix_len(&snap.committed_hashes);
             (prefix, snap.committed_hashes.len() - prefix)
         } else {
@@ -395,7 +395,7 @@ impl ContextManager {
         // Working pages: GPU pages transfer directly, CPU pages use pre-allocated pages.
         let new_working = if snap.working_pages.is_empty() {
             Vec::new()
-        } else if was_suspended {
+        } else if was_off_gpu {
             let _ = device::copy_h2d(dev_idx as DeviceId, &working_gpu, &snap.working_pages);
             self.cpu_stores[dev_idx].free(&snap.working_pages);
             working_gpu
@@ -408,7 +408,7 @@ impl ContextManager {
         };
 
         // Committed chain refcount handling.
-        if was_suspended && prefix_len > 0 {
+        if was_off_gpu && prefix_len > 0 {
             self.gpu_stores[dev_idx].fork(&snap.committed_hashes[..prefix_len]);
         }
 

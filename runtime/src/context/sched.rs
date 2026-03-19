@@ -176,7 +176,7 @@ impl ContextManager {
         for ctx_id in proc.context_ids {
             if let Some(ctx) = self.contexts.remove(&ctx_id) {
                 let dev_idx = ctx.device.unwrap_or(0) as usize;
-                if !ctx.committed_hashes.is_empty() && !ctx.is_suspended() {
+                if !ctx.committed_hashes.is_empty() && !ctx.is_off_gpu() {
                     self.gpu_stores[dev_idx].release(&ctx.committed_hashes);
                 }
                 if !ctx.working_pages.is_empty() {
@@ -185,7 +185,7 @@ impl ContextManager {
                 if !ctx.cpu_working_pages.is_empty() {
                     self.cpu_stores[dev_idx].free(&ctx.cpu_working_pages);
                 }
-                if ctx.is_suspended() && !ctx.committed_hashes.is_empty() {
+                if ctx.is_off_gpu() && !ctx.committed_hashes.is_empty() {
                     self.cpu_stores[dev_idx].release(&ctx.committed_hashes);
                 }
                 self.snapshots.retain(|_, v| *v != ctx_id);
@@ -226,7 +226,7 @@ impl ContextManager {
         let hashes = &ctx.committed_hashes;
         if hashes.is_empty() { return current_dev; }
 
-        let working_count = if ctx.is_suspended() {
+        let working_count = if ctx.is_off_gpu() {
             ctx.suspended_working_count as f64
         } else {
             ctx.working_pages.len() as f64
@@ -291,7 +291,7 @@ impl ContextManager {
         for ctx in self.contexts.values() {
             if ctx.owner.is_none() { continue; }
             if ctx.device.unwrap_or(0) as usize != dev_idx { continue; }
-            if ctx.is_suspended() { continue; }
+            if ctx.is_off_gpu() { continue; }
             clearing_price = clearing_price.min(ctx.bid);
         }
         if clearing_price == f64::MAX { clearing_price = 0.0; }
@@ -303,7 +303,7 @@ impl ContextManager {
         for (&ctx_id, ctx) in &self.contexts {
             if ctx.owner.is_none() { continue; }
             if ctx.device.unwrap_or(0) as usize != dev_idx { continue; }
-            if ctx.is_suspended() { continue; }
+            if ctx.is_off_gpu() { continue; }
 
             let raw_pages = ctx.committed_hashes.len() + ctx.working_pages.len();
             if raw_pages == 0 { continue; }
@@ -440,7 +440,7 @@ impl ContextManager {
     ) {
         // SUSPENSION CHECK: If the context is Suspended, store as deferred op.
         if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-            if ctx.is_suspended() {
+            if ctx.is_off_gpu() {
                 let pending = PendingAlloc {
                     device: dev_idx, num_pages,
                     on_alloc: Box::new(on_alloc),
@@ -449,7 +449,8 @@ impl ContextManager {
                 return;
             }
         } else {
-            panic!("when_allocated: context not found: {}", ctx_id);
+            tracing::error!("when_allocated: context not found: {}", ctx_id);
+            return;
         }
 
         // Short-circuit: no pages needed.
@@ -586,7 +587,7 @@ impl ContextManager {
 
         for (&ctx_id, ctx) in &self.contexts {
             if requester == Some(ctx_id) { continue; }
-            if ctx.is_suspended() { continue; }
+            if ctx.is_off_gpu() { continue; }
             let ctx_dev = ctx.device.unwrap_or(0) as usize;
             if ctx_dev != dev_idx { continue; }
             let pages = ctx.committed_hashes.len() + ctx.working_pages.len();
@@ -641,6 +642,96 @@ impl ContextManager {
     }
 
     // =========================================================================
+    // CPU Eviction — tier-boundary contention (STORAGE.md §4.1b)
+    // =========================================================================
+
+    /// Find the best CPU eviction victim on a device.
+    ///
+    /// Iterates all **Stashed** contexts (CPU-resident pages) on the device.
+    /// Returns the context with the lowest bid, using FCFS (latest spawn
+    /// time first) as tiebreaker.
+    ///
+    /// The requester is excluded. Only victims with bid ≤ `requester_bid`
+    /// are eligible (a higher-bid context should not be evicted to make
+    /// room for a lower-bid one).
+    fn find_cpu_eviction_victim(
+        &self,
+        dev_idx: usize,
+        requester_bid: f64,
+        requester: Option<ContextId>,
+    ) -> Option<ContextId> {
+        let mut best: Option<(f64, Instant, ContextId)> = None;
+
+        for (&ctx_id, ctx) in &self.contexts {
+            if requester == Some(ctx_id) { continue; }
+            if !ctx.is_stashed() { continue; }
+            let ctx_dev = ctx.device.unwrap_or(0) as usize;
+            if ctx_dev != dev_idx { continue; }
+
+            // Must have CPU-resident pages (working stash or committed stash).
+            let has_cpu_working = !ctx.cpu_working_pages.is_empty();
+            let has_cpu_committed = !ctx.committed_hashes.is_empty()
+                && self.cpu_stores[dev_idx].prefix_len(&ctx.committed_hashes) > 0;
+            if !has_cpu_working && !has_cpu_committed { continue; }
+
+            // Only evict contexts with bid ≤ requester's bid.
+            if ctx.bid > requester_bid { continue; }
+
+            let spawn_time = ctx.owner
+                .and_then(|pid| self.processes.get(&pid))
+                .map(|p| p.created_at)
+                .unwrap_or_else(Instant::now);
+
+            let dominated = if let Some((best_bid, best_time, _)) = best {
+                ctx.bid < best_bid
+                || (ctx.bid == best_bid && spawn_time > best_time)
+            } else {
+                true
+            };
+            if dominated {
+                best = Some((ctx.bid, spawn_time, ctx_id));
+            }
+        }
+
+        best.map(|(_, _, ctx_id)| ctx_id)
+    }
+
+    /// Evict a Stashed context's pages from CPU to recompute.
+    ///
+    /// Releases committed pages from the CPU FlatPageStore (rc--, free at
+    /// rc=0) and frees working page stash from the CPU pool. Transitions
+    /// the context from Stashed to Suspended (no CPU cache, full recompute
+    /// on restore).
+    fn evict_from_cpu(&mut self, ctx_id: ContextId) {
+        let (dev_idx, committed_hashes, cpu_working) = match self.contexts.get(&ctx_id) {
+            Some(ctx) if ctx.is_stashed() => (
+                ctx.device.unwrap_or(0) as usize,
+                ctx.committed_hashes.clone(),
+                ctx.cpu_working_pages.clone(),
+            ),
+            _ => return,
+        };
+
+        // Release committed pages from CPU store.
+        if !committed_hashes.is_empty() {
+            self.cpu_stores[dev_idx].release(&committed_hashes);
+        }
+
+        // Free working page stash from CPU pool.
+        if !cpu_working.is_empty() {
+            self.cpu_stores[dev_idx].free(&cpu_working);
+            if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                ctx.cpu_working_pages.clear();
+            }
+        }
+
+        // Transition Stashed → Suspended (no longer has CPU pages).
+        if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+            ctx.state = State::Suspended;
+        }
+    }
+
+    // =========================================================================
     // Suspension
     // =========================================================================
 
@@ -650,8 +741,9 @@ impl ContextManager {
     /// on release, and stashes only those to CPU via FlatPageStore. Shared
     /// prefix pages (rc > 1) stay on GPU.
     ///
-    /// CPU stashing is attempted unconditionally when capacity is available
-    /// (point-of-use allocation, no pre-computed cpu_cached flag).
+    /// When the CPU pool is full, runs an eviction loop to free CPU pages
+    /// from the lowest-bid suspended context before falling through to
+    /// recompute (STORAGE.md §4.1b).
     pub(crate) fn suspend(&mut self, ctx_id: ContextId) {
         let (dev_idx, working, committed_hashes) = match self.contexts.get(&ctx_id) {
             Some(ctx) if ctx.is_active() || ctx.is_pinned() => {
@@ -660,17 +752,48 @@ impl ContextManager {
             _ => return,
         };
 
-        // Phase 1: Stash working pages to CPU (if space).
+        // Compute total CPU pages needed upfront for a single eviction pass.
+        let requester_bid = self.contexts.get(&ctx_id).map(|c| c.bid).unwrap_or(0.0);
+        let working_cpu_needed = working.len();
+        let evictable_hashes = if !committed_hashes.is_empty() {
+            self.gpu_stores[dev_idx].would_free(&committed_hashes)
+        } else {
+            Vec::new()
+        };
+        let committed_cpu_needed = evictable_hashes.len();
+        let total_cpu_needed = working_cpu_needed + committed_cpu_needed;
+
+        // Single eviction pass: free enough CPU pages for both phases.
+        if total_cpu_needed > 0 && self.cpu_stores[dev_idx].available() < total_cpu_needed {
+            while self.cpu_stores[dev_idx].available() < total_cpu_needed {
+                match self.find_cpu_eviction_victim(dev_idx, requester_bid, Some(ctx_id)) {
+                    Some(victim_id) => {
+                        self.evict_from_cpu(victim_id);
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        // All-or-nothing: only stash to CPU if enough space for the full
+        // request. Partial stashing (working on CPU, committed dropped) would
+        // waste CPU capacity on a context that still needs full recompute.
+        let cpu_offload = total_cpu_needed > 0
+            && self.cpu_stores[dev_idx].available() >= total_cpu_needed;
+
+        // Phase 1: Stash working pages to CPU.
         // Working pages are exclusive — just D2H copy to CPU pool.
         if !working.is_empty() {
             let ctx = self.contexts.get_mut(&ctx_id).unwrap();
             ctx.suspended_working_count = ctx.working_pages.len();
             ctx.working_pages.clear();
 
-            // Always attempt CPU stash — point-of-use allocation.
-            if let Some(cpu_pages) = self.cpu_stores[dev_idx].alloc(working.len()) {
-                let _ = device::copy_d2h(dev_idx as DeviceId, &working, &cpu_pages);
-                ctx.cpu_working_pages = cpu_pages;
+            if cpu_offload {
+                if let Some(cpu_pages) = self.cpu_stores[dev_idx].alloc(working.len()) {
+                    let _ = device::copy_d2h(dev_idx as DeviceId, &working, &cpu_pages);
+                    let ctx = self.contexts.get_mut(&ctx_id).unwrap();
+                    ctx.cpu_working_pages = cpu_pages;
+                }
             }
 
             self.gpu_stores[dev_idx].free(&working);
@@ -679,14 +802,11 @@ impl ContextManager {
         // Phase 2: Stash evictable committed pages to CPU.
         // Only pages with rc=1 (will reach rc=0 on release) need stashing.
         // Shared prefix pages (rc > 1) stay on GPU for other contexts.
-        if !committed_hashes.is_empty() {
-            let evictable_hashes = self.gpu_stores[dev_idx].would_free(&committed_hashes);
-            if !evictable_hashes.is_empty() {
-                let gpu_phys = self.gpu_stores[dev_idx].physical_ids(&evictable_hashes);
-                if let Some(cpu_pages) = self.cpu_stores[dev_idx].alloc(gpu_phys.len()) {
-                    let _ = device::copy_d2h(dev_idx as DeviceId, &gpu_phys, &cpu_pages);
-                    self.cpu_stores[dev_idx].insert(&evictable_hashes, &cpu_pages);
-                }
+        if cpu_offload && !evictable_hashes.is_empty() {
+            let gpu_phys = self.gpu_stores[dev_idx].physical_ids(&evictable_hashes);
+            if let Some(cpu_pages) = self.cpu_stores[dev_idx].alloc(gpu_phys.len()) {
+                let _ = device::copy_d2h(dev_idx as DeviceId, &gpu_phys, &cpu_pages);
+                self.cpu_stores[dev_idx].insert(&evictable_hashes, &cpu_pages);
             }
         }
 
@@ -697,9 +817,9 @@ impl ContextManager {
             }
         }
 
-        // Phase 4: Mark suspended.
+        // Phase 4: Mark stashed or suspended.
         let ctx = self.contexts.get_mut(&ctx_id).unwrap();
-        ctx.state = State::Suspended;
+        ctx.state = if cpu_offload { State::Stashed } else { State::Suspended };
         ctx.pending_suspend = false;
 
         // Remove this context from alloc_queue (can't serve while suspended;
@@ -716,7 +836,7 @@ impl ContextManager {
                 self.drain_queues();
                 Ok(())
             }
-            Some(ctx) if ctx.is_suspended() => Ok(()), // already suspended
+            Some(ctx) if ctx.is_off_gpu() => Ok(()), // already off GPU
             Some(_) => Err(anyhow::anyhow!("Context {id} is pinned, cannot voluntarily suspend")),
             None => Err(anyhow::anyhow!("Context {id} not found")),
         }
