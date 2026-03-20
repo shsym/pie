@@ -55,7 +55,7 @@ future::join(
 ).await;
 ```
 
-See also: [parallel generation](/docs/examples/parallel-generation) and [tree-of-thought](/docs/examples/tree-of-thought) examples.
+See also: [parallel generation](./examples#parallel-generation) and [tree-of-thought](./examples#tree-of-thought) examples.
 
 ## KV Cache Control
 
@@ -105,7 +105,7 @@ if committed_len > sink_size + window_size {
 - `drop_masked_kv_pages()` — frees memory for fully-masked KV pages.
 - Together, these enable bounded-memory generation for arbitrarily long sequences.
 
-See also: [prefix caching](/docs/examples/prefix-caching) and [attention sink](/docs/examples/attention-sink) examples.
+See also: [prefix caching](./examples#prefix-caching) and [attention sink](./examples#attention-sink) examples.
 
 ## Custom Sampling & Decoding
 
@@ -176,4 +176,4 @@ impl Drafter for MyDrafter {
 let output = ctx.generate_with_drafter(&mut drafter, &mut sampler, &mut stop, None).await;
 ```
 
-See also: [constrained decoding](/docs/examples/constrained-decoding), [cacheback decoding](/docs/examples/cacheback-decoding), and [output validation](/docs/examples/output-validation) examples.
+See also: [constrained decoding](./examples#constrained-decoding), [cacheback decoding](./examples#cacheback-decoding), and [output validation](./examples#output-validation) examples.
