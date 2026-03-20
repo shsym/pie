@@ -27,17 +27,24 @@ use inferlet::{Args, Result, Sampler, get_auto_model};
 use inferlet::stop_condition::{self, StopCondition};
 
 #[inferlet::main]
-async fn main(mut args: Args) -> Result<String> {
+async fn main(mut args: Args) -> Result<()> {
+    // Load whatever model the server has configured
     let model = get_auto_model();
+    // Create a generation context (manages tokens, KV cache, attention)
     let mut ctx = model.create_context();
 
+    // Build the conversation
     ctx.fill_system("You are a helpful assistant.");
     ctx.fill_user("How are you?");
 
+    // Stop after 256 tokens or when the model emits an end-of-sequence token
     let stop = stop_condition::max_len(256)
         .or(stop_condition::ends_with_any(model.eos_tokens()));
 
-    Ok(ctx.generate(Sampler::top_p(0.6, 0.95), stop).await)
+    // Generate with nucleus sampling (temperature=0.6, top_p=0.95)
+    let output = ctx.generate(Sampler::top_p(0.6, 0.95), stop).await;
+    println!("{}", output);
+    Ok(())
 }
 ```
 
@@ -49,7 +56,7 @@ Inferlets compile to WebAssembly. Write them in **Rust** (recommended), **Python
 
 <Link to="./getting-started" style={{textDecoration: 'none'}}>
 <div style={{border: '1px solid var(--ifm-color-emphasis-300)', borderRadius: '8px', padding: '1.2rem'}}>
-<h3 style={{margin: 0}}>Getting Started</h3>
+<h3 style={{margin: 0}}>Your First Inferlet</h3>
 <p style={{margin: '0.5rem 0 0', color: 'var(--ifm-color-emphasis-700)'}}>Create, build, and run your first custom inferlet in 5 minutes.</p>
 </div>
 </Link>
