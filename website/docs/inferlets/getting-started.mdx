@@ -1,5 +1,5 @@
 ---
-title: Getting Started
+title: Your First Inferlet
 description: Create, build, and run your first custom inferlet in Rust, Python, or JavaScript.
 sidebar_position: 1
 ---
@@ -7,14 +7,14 @@ sidebar_position: 1
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-# Getting Started
+# Your First Inferlet
 
 This guide walks you through writing, building, and running your first inferlet — a lightweight WebAssembly program that controls inference logic inside Pie.
 
 ## Prerequisites
 
-- **Pie** installed and a model downloaded (`pie pull`)
-- **Bakery** installed (the inferlet build tool)
+- **Pie** installed and a model downloaded (see [Installation](../installation/index.mdx))
+- **Bakery** installed (the inferlet build tool): `pip install -e sdk/tools/bakery`
 
 <Tabs>
   <TabItem value="rust" label="Rust" default>
@@ -38,7 +38,7 @@ This guide walks you through writing, building, and running your first inferlet 
 
 ## Project Structure
 
-Create a new directory for your inferlet. The layout depends on your language:
+You can scaffold a new project with `bakery create` (supports Rust and TypeScript), or create the files manually. The layout depends on your language:
 
 <Tabs>
   <TabItem value="rust" label="Rust" default>
@@ -62,6 +62,7 @@ Create a new directory for your inferlet. The layout depends on your language:
 
   [runtime]
   core = "^0.2.0"
+  mcp = "^0.2.0"
   ```
 
   **Cargo.toml** — standard Rust crate config:
@@ -80,12 +81,21 @@ Create a new directory for your inferlet. The layout depends on your language:
   inferlet-macros.workspace = true
   ```
 
+  :::note
+  `inferlet.workspace = true` works when building inside the Pie repository. For standalone projects, use path dependencies or published crate versions instead.
+  :::
+
   </TabItem>
   <TabItem value="python" label="Python">
+
+  :::note
+  `bakery create` does not yet support Python. Create the files manually.
+  :::
 
   ```
   my-inferlet/
   ├── Pie.toml
+  ├── pyproject.toml
   └── main.py
   ```
 
@@ -100,7 +110,18 @@ Create a new directory for your inferlet. The layout depends on your language:
 
   [runtime]
   core = "^0.2.0"
+  mcp = "^0.2.0"
   python-runtime = "^0.2.0"
+  ```
+
+  **pyproject.toml** — standard Python project config:
+
+  ```toml
+  [project]
+  name = "my-inferlet"
+  version = "0.1.0"
+  description = "My first inferlet"
+  requires-python = ">=3.10"
   ```
 
   </TabItem>
@@ -124,6 +145,7 @@ Create a new directory for your inferlet. The layout depends on your language:
 
   [runtime]
   core = "^0.2.0"
+  mcp = "^0.2.0"
   ```
 
   </TabItem>
@@ -142,21 +164,26 @@ The code below creates a simple text-completion inferlet. It reads a prompt from
 
   #[inferlet::main]
   async fn main(mut args: Args) -> Result<()> {
+      // Parse command-line arguments with defaults
       let prompt: String = args
           .value_from_str(["-p", "--prompt"])
           .unwrap_or("Hello, world!".to_string());
       let max_tokens: usize = args.value_from_str(["-n", "--max-tokens"]).unwrap_or(256);
 
+      // Load the model and create a generation context
       let model = inferlet::get_auto_model();
       let mut ctx = model.create_context();
 
+      // Build the conversation (tokens are buffered, not yet processed)
       ctx.fill_system("You are a helpful, respectful and honest assistant.");
       ctx.fill_user(&prompt);
 
+      // Configure when to stop: max tokens or end-of-sequence
       let stop = stop_condition::max_len(max_tokens)
           .or(stop_condition::ends_with_any(model.eos_tokens()));
-      let output = ctx.generate(Sampler::top_p(0.6, 0.95), stop).await;
 
+      // Generate with nucleus sampling and print the result
+      let output = ctx.generate(Sampler::top_p(0.6, 0.95), stop).await;
       println!("{}", output);
       Ok(())
   }
@@ -169,16 +196,21 @@ The code below creates a simple text-completion inferlet. It reads a prompt from
   from inferlet import Context, get_auto_model, get_arguments, set_return
 
   def main() -> None:
+      # Parse arguments passed via `pie run ... -- --prompt "..."`
       args = get_arguments()
       prompt = args.get("prompt", "Hello, world!")
       max_tokens = int(args.get("max_tokens", 256))
 
+      # Load the model configured on the server
       model = get_auto_model()
 
+      # Context manager handles resource cleanup automatically
       with Context(model) as ctx:
+          # Build the conversation
           ctx.system("You are a helpful assistant.")
           ctx.user(prompt)
 
+          # Generate and return the result to the client
           result = ctx.generate(max_tokens=max_tokens, stream=False)
           set_return(result.text)
 
@@ -192,16 +224,20 @@ The code below creates a simple text-completion inferlet. It reads a prompt from
   ```typescript title="index.ts"
   import { Context, getAutoModel, getArguments, send } from 'inferlet';
 
+  // Parse arguments passed via `pie run ... -- --prompt "..."`
   const args = getArguments();
   const prompt = (args.prompt as string) ?? 'Hello, world!';
   const maxTokens = Number(args.maxTokens ?? 256);
 
+  // Load model and create a generation context
   const model = getAutoModel();
   const ctx = new Context(model);
 
+  // Build the conversation
   ctx.fillSystem('You are a helpful, respectful and honest assistant.');
   ctx.fillUser(prompt);
 
+  // Generate with nucleus sampling and send the result to the client
   const result = await ctx.generate({
     sampling: { topP: 0.95, temperature: 0.6 },
     stop: { maxTokens, sequences: model.eosTokens }
@@ -228,7 +264,7 @@ Bakery detects the language from your project structure and produces a single `.
 Launch your inferlet on a running Pie engine:
 
 ```bash
-pie run my-inferlet.wasm -- --prompt "What is the capital of France?"
+pie run --path ./my-inferlet.wasm -- --prompt "What is the capital of France?"
 ```
 
 You should see the model's response printed to stdout.
