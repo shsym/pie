@@ -25,7 +25,7 @@ let output = ctx.generate(sampler, stop).await;  // Decode loop
 ```
 
 :::note
-`generate()` implicitly calls `flush()` before decoding, so an explicit `flush()` is only needed when you want to commit tokens before forking or exporting KV state.
+`generate()` processes any pending tokens as part of its decode loop, so you don't need to call `flush()` before `generate()`. However, an explicit `flush()` is needed when you want to commit tokens to the KV cache before **forking** or **exporting KV state**.
 :::
 
 ## Forking (Copy-on-Write Contexts)
@@ -118,7 +118,7 @@ Sampler::greedy()                          // Always pick highest probability
 Sampler::top_p(temperature, top_p)         // Nucleus sampling
 Sampler::top_k(temperature, top_k)         // Top-K sampling
 Sampler::min_p(temperature, min_p)         // Min-P sampling
-Sampler::top_k_top_p(temperature, k, p)    // Combined Top-K + Top-P
+Sampler::top_k_top_p(temperature, top_k, top_p)  // Combined Top-K + Top-P
 Sampler::reasoning()                       // Preset: top_k_top_p(0.6, 20, 0.95)
 ```
 
