@@ -6,7 +6,7 @@ sidebar_position: 3
 
 # Examples
 
-These examples are real, runnable inferlets from the [`sdk/examples`](https://github.com/pie-project/pie/tree/main/sdk/examples) directory. Each one demonstrates a distinct capability that Pie's architecture enables — from KV cache manipulation to multi-agent coordination. Build and run any of them with `pie-cli build` and `pie-cli run`.
+These examples are real, runnable inferlets from the [`sdk/examples`](https://github.com/pie-project/pie/tree/main/sdk/examples) directory. Each one demonstrates a distinct capability that Pie's architecture enables — from KV cache manipulation to multi-agent coordination. Build any of them with `bakery build` and run with `pie run`.
 
 ## KV Cache Patterns
 
@@ -292,7 +292,7 @@ impl<...> Drafter for CacheDrafter<N_PREV, N_NEXT, N_ROW, N_COLUMN> {
 // Usage: plug the drafter into generate_with_drafter
 let mut drafter = CacheDrafter::<1, 2, 256, 4>::new();
 let output = ctx
-    .generate_with_drafter(&mut drafter, &mut sampler, &mut stop_condition, Some(&mut stats))
+    .generate_with_drafter(&mut drafter, &mut sampler, &mut stop_condition, Some(&mut num_tokens_per_step))
     .await;
 ```
 
@@ -383,3 +383,67 @@ if let Some(next_topic) = config.next_topic {
 Four agent roles form a pipeline: idea_generator, plot_developer, character_creator, and dialogue_writer. Each is deployed as a separate inferlet instance. Agents use `inferlet::subscribe(topic)` to block until the previous stage publishes its output, and `inferlet::broadcast(topic, message)` to forward the accumulated result. The `group_id` parameter allows multiple independent pipelines to run in parallel without interference. This pattern generalizes to any DAG-shaped multi-agent workflow.
 
 > Full source: [sdk/examples/agent-swarm](https://github.com/pie-project/pie/tree/main/sdk/examples/agent-swarm)
+
+## Putting It Together: Optimizing an Agentic Workflow
+
+The examples above each demonstrate a single Pie capability. The real power emerges when you **stack multiple optimizations** on the same workflow, exploiting application-specific knowledge that generic serving systems cannot leverage.
+
+Consider a typical agentic workflow — a ReAct-style agent that calls external APIs based on a user query. Suppose this application has three characteristics:
+
+1. Certain API docs are referenced more frequently than others.
+2. Most API calls are fire-and-forget (the agent doesn't need to wait for one before issuing the next).
+3. Some API docs are only used once during the workflow.
+
+A generic serving system like vLLM treats all of this opaquely. Pie lets you exploit each characteristic with a targeted optimization:
+
+### Optimization 1: Cache the system prompt
+
+The system prompt (including API documentation) is the same across requests. Use `export_kv_pages` to persist its KV state and `import_kv_pages` to skip re-prefill on subsequent runs.
+
+```rust
+// First request: compute and cache
+ctx.fill_system(&system_prompt_with_api_docs);
+ctx.flush().await;
+ctx.queue().export_kv_pages(&ctx.kv_pages, "system-prefix");
+inferlet::store_set("cached", "true");
+
+// Later requests: restore instantly
+let pages = queue.import_kv_pages("system-prefix");
+let mut ctx = Context::from_imported_state(&model, pages, token_ids, last_len);
+```
+
+### Optimization 2: Concurrent tool calls
+
+When the agent generates multiple tool calls, don't wait sequentially. Fire them all concurrently since they're independent:
+
+```rust
+// Collect tool call futures as they're detected
+let mut futures = Vec::new();
+for tool_call in detected_calls {
+    futures.push(execute_tool(tool_call));
+}
+
+// Wait for all to complete in parallel
+let results = join_all(futures).await;
+
+// Feed all observations back into the context
+for result in results {
+    ctx.fill_user(&format!("Observation: {}", result));
+}
+```
+
+### Optimization 3: Drop one-shot KV cache
+
+After the agent is done with a set of API docs (e.g., WebSearch docs), mask and evict their KV pages to free memory for the rest of the workflow:
+
+```rust
+// After WebSearch phase is complete, drop its doc tokens from KV cache
+ctx.mask_token_range(web_search_doc_start, web_search_doc_end, true);
+ctx.drop_masked_kv_pages();  // Free memory
+```
+
+### Result
+
+In the [Pie SOSP '25 paper](https://doi.org/10.1145/3731569.3764814), stacking these three optimizations on a ReAct-style agentic workflow yielded **3.5x higher throughput** compared to a baseline vLLM implementation. Each optimization builds on the last — caching avoids redundant prefill, concurrency overlaps I/O with generation, and cache dropping frees memory for higher batch sizes.
+
+This composability is Pie's core advantage: optimizations that would each require invasive modifications to a monolithic serving system can be expressed as a few lines of inferlet code, composed freely, and deployed without changing the engine.
