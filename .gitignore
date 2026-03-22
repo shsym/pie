@@ -245,7 +245,3 @@ website/src/data/models.json
 
 *.pt
 *.zt
-
-PIEX.md
-pie/rollout_logs/
-*.out

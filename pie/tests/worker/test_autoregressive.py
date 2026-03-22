@@ -24,8 +24,7 @@ except ImportError:
 # Add src to path for imports
 sys.path.insert(0, "src")
 
-from pie_backend.engine import Engine
-from pie_backend.config import RuntimeConfig
+from pie_worker.runtime import Runtime, RuntimeConfig
 
 
 def format_chat_prompt(
@@ -81,16 +80,17 @@ def run_autoregressive_test(
     # Load Runtime
     print(f"\n[2] Loading Runtime with model={model_name}...")
     config = RuntimeConfig.from_args(hf_repo=model_name)
-    engine = Engine.load(config)
-    print(f"    Engine loaded: {engine.model_config.num_layers} layers")
-    print(f"    Architecture: {engine.arch_type}")
+    log_queue = queue.Queue()  # Mock log queue for testing
+    runtime = Runtime(config, log_queue=log_queue)
+    print(f"    Runtime loaded: {runtime.model_config.num_layers} layers")
+    print(f"    Architecture: {runtime.type}")
 
     device = config.device
     dtype = config.activation_dtype
 
     # Format prompt with chat template if requested
-    if use_chat_template and "template" in engine.info:
-        template = engine.info["template"]
+    if use_chat_template and "template" in runtime.info:
+        template = runtime.info["template"]
         if template.get("type") == "minijinja":
             messages = [{"role": "user", "content": prompt}]
             prompt = format_chat_prompt(
@@ -126,7 +126,7 @@ def run_autoregressive_test(
         current_ids = torch.tensor(generated_ids, dtype=torch.long, device=device)
 
         # Get embeddings - use runtime.engine (the forward pass)
-        embeddings = engine.forward_pass.embed_tokens(current_ids)
+        embeddings = runtime.engine.embed_tokens(current_ids)
 
         # Prepare inputs for transform
         position_ids = torch.arange(len(generated_ids), dtype=torch.long, device=device)
@@ -156,11 +156,11 @@ def run_autoregressive_test(
 
         # Run through transformer layers
         try:
-            hidden_states = engine.forward_pass.transform(
+            hidden_states = runtime.engine.transform(
                 input_embeds=input_embeds,
                 position_ids=position_ids,
                 qo_indptr=qo_indptr,
-                kv_cache_at_layer=engine.kv_cache_at_layer,
+                kv_cache_at_layer=runtime.kv_cache_at_layer,
                 kv_page_indices=kv_page_indices,
                 kv_page_indptr=kv_page_indptr,
                 kv_last_page_lens=kv_last_page_lens,
@@ -174,7 +174,7 @@ def run_autoregressive_test(
             hidden_states = input_embeds
 
         # Get logits from lm_head
-        logits = engine.forward_pass.lm_head(hidden_states)
+        logits = runtime.engine.lm_head(hidden_states)
 
         # Get the logits for the last position
         last_logits = logits[-1, :]
@@ -224,34 +224,42 @@ def test_forward_pass_components(model_name: str = "openai/gpt-oss-20b"):
     # Load Runtime
     print(f"\n[1] Loading Runtime with model={model_name}...")
     config = RuntimeConfig.from_args(hf_repo=model_name)
-    engine = Engine.load(config)
+    log_queue = queue.Queue()  # Mock log queue for testing
+    runtime = Runtime(config, log_queue=log_queue)
     device = config.device
-    print(f"    Engine loaded: {engine.model_config.num_layers} layers")
-    print(f"    Architecture: {engine.arch_type}")
+    print(f"    Runtime loaded: {runtime.model_config.num_layers} layers")
+    print(f"    Architecture: {runtime.type}")
+
+    # Test handshake
+    print("\n[2] Testing handshake...")
+    from pie_worker import message
+
+    responses = runtime.handshake([message.HandshakeRequest(version="1.0")])
+    print(f"    ✓ model_name: {responses[0].model_name}")
+    print(f"    ✓ kv_page_size: {responses[0].kv_page_size}")
 
     # Test query
-    print("\n[2] Testing query (ping)...")
-    from pie_backend import message
-    value = engine.query("ping")
-    print(f"    ✓ Response: {value}")
+    print("\n[3] Testing query (ping)...")
+    responses = runtime.query([message.QueryRequest(query="ping")])
+    print(f"    ✓ Response: {responses[0].value}")
 
     # Test embed_tokens
     print("\n[4] Testing embed_tokens...")
     token_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long, device=device)
-    embeddings = engine.forward_pass.embed_tokens(token_ids)
+    embeddings = runtime.engine.embed_tokens(token_ids)
     print(f"    ✓ Input shape: {token_ids.shape}")
     print(f"    ✓ Output shape: {embeddings.shape}")
 
     # Test lm_head
     print("\n[5] Testing lm_head...")
-    logits = engine.forward_pass.lm_head(embeddings)
+    logits = runtime.engine.lm_head(embeddings)
     print(f"    ✓ Input shape: {embeddings.shape}")
     print(f"    ✓ Output shape: {logits.shape}")
 
     # Test MLP (single layer) - only for non-MoE models
-    if engine.arch_type not in ["gptoss"]:
+    if runtime.type not in ["gptoss"]:
         print("\n[6] Testing MLP (layer 0)...")
-        mlp_out = engine.forward_pass.mlp(embeddings, layer_idx=0)
+        mlp_out = runtime.engine.mlp(embeddings, layer_idx=0)
         print(f"    ✓ Input shape: {embeddings.shape}")
         print(f"    ✓ Output shape: {mlp_out.shape}")
     else:

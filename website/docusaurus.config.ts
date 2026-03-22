@@ -63,8 +63,8 @@ const config: Config = {
     // image: 'img/docusaurus-social-card.jpg',
     colorMode: {
       defaultMode: 'light',
-      disableSwitch: false,
-      respectPrefersColorScheme: true,
+      disableSwitch: true,
+      respectPrefersColorScheme: false,
     },
     navbar: {
       title: 'Pie',
@@ -112,7 +112,6 @@ const config: Config = {
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
-      additionalLanguages: ['rust'],
     },
   } satisfies Preset.ThemeConfig,
 
