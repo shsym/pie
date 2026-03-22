@@ -25,7 +25,6 @@ pub struct Config {
     pub log_dir: Option<PathBuf>,
     pub registry: String,
     pub telemetry: TelemetryConfig,
-    pub python_snapshot: bool,
 }
 
 /// Runs the PIE server logic within an existing Tokio runtime.
@@ -90,7 +89,7 @@ pub async fn run_server(
     
     let wasm_engine = WasmEngine::new(&wasm_config).unwrap();
 
-    runtime::start_service(wasm_engine.clone(), config.python_snapshot);
+    runtime::start_service(wasm_engine.clone());
     server::start_service(
         &server_url,
         config.enable_auth,

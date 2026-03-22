@@ -38,14 +38,12 @@ pub struct ServerConfig {
     pub telemetry_endpoint: String,
     #[pyo3(get, set)]
     pub telemetry_service_name: String,
-    #[pyo3(get, set)]
-    pub python_snapshot: bool,
 }
 
 #[pymethods]
 impl ServerConfig {
     #[new]
-    #[pyo3(signature = (host, port, enable_auth, cache_dir, verbose, log_dir, registry, telemetry_enabled=false, telemetry_endpoint="http://localhost:4317".to_string(), telemetry_service_name="pie-runtime".to_string(), python_snapshot=true))]
+    #[pyo3(signature = (host, port, enable_auth, cache_dir, verbose, log_dir, registry, telemetry_enabled=false, telemetry_endpoint="http://localhost:4317".to_string(), telemetry_service_name="pie-runtime".to_string()))]
     fn new(
         host: String,
         port: u16,
@@ -57,7 +55,6 @@ impl ServerConfig {
         telemetry_enabled: bool,
         telemetry_endpoint: String,
         telemetry_service_name: String,
-        python_snapshot: bool,
     ) -> Self {
         ServerConfig {
             host,
@@ -70,7 +67,6 @@ impl ServerConfig {
             telemetry_enabled,
             telemetry_endpoint,
             telemetry_service_name,
-            python_snapshot,
         }
     }
 
@@ -97,7 +93,6 @@ impl From<ServerConfig> for EngineConfig {
                 endpoint: cfg.telemetry_endpoint,
                 service_name: cfg.telemetry_service_name,
             },
-            python_snapshot: cfg.python_snapshot,
         }
     }
 }
