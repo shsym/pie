@@ -15,8 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from pie_backend.engine import Engine
-from pie_backend.config import RuntimeConfig
+from pie_worker.runtime import Runtime, RuntimeConfig
 
 
 # Default test model - use a small model for faster testing
@@ -54,21 +53,21 @@ def test_single_gpu_embed_tokens():
     from multiprocessing import Queue
 
     mock_log_queue = Queue()
-    engine = Engine.load(config)
+    runtime = Runtime(config, log_queue=mock_log_queue)
     device = config.device
 
     print(f"\n[1] Testing embed_tokens on {device}...")
     token_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32, device=device)
-    embeddings = engine.forward_pass.embed_tokens(token_ids)
+    embeddings = runtime.engine.embed_tokens(token_ids)
 
     print(f"    Input shape: {token_ids.shape}")
     print(f"    Output shape: {embeddings.shape}")
-    print(f"    Expected hidden_size: {engine.model_config.dim_hidden}")
+    print(f"    Expected hidden_size: {runtime.model_config.dim_hidden}")
 
     # Verify hidden size is correct
     assert embeddings.shape[0] == 5, f"Expected 5 tokens, got {embeddings.shape[0]}"
-    assert embeddings.shape[1] == engine.model_config.dim_hidden, (
-        f"Hidden size mismatch: expected {engine.model_config.dim_hidden}, "
+    assert embeddings.shape[1] == runtime.model_config.dim_hidden, (
+        f"Hidden size mismatch: expected {runtime.model_config.dim_hidden}, "
         f"got {embeddings.shape[1]}"
     )
 
@@ -90,7 +89,7 @@ def test_single_gpu_embed_inputs():
     from multiprocessing import Queue
 
     mock_log_queue = Queue()
-    engine = Engine.load(config)
+    runtime = Runtime(config, log_queue=mock_log_queue)
     device = config.device
 
     print(f"\n[1] Testing embed_inputs on {device}...")
@@ -100,13 +99,13 @@ def test_single_gpu_embed_inputs():
         "token_ids": [1, 2, 3, 4, 5],
     }
 
-    embeddings = engine.forward_pass.embed_inputs(batch_metadata)
+    embeddings = runtime.engine.embed_inputs(batch_metadata)
 
     print(f"    Input tokens: {batch_metadata['token_ids']}")
     print(f"    Output shape: {embeddings.shape}")
 
     assert embeddings.shape[0] == 5
-    assert embeddings.shape[1] == engine.model_config.dim_hidden
+    assert embeddings.shape[1] == runtime.model_config.dim_hidden
 
     print("    ✓ Single GPU embed_inputs passed!")
     return True
@@ -126,22 +125,22 @@ def test_single_gpu_forward_pass():
     from multiprocessing import Queue
 
     mock_log_queue = Queue()
-    engine = Engine.load(config)
+    runtime = Runtime(config, log_queue=mock_log_queue)
     device = config.device
 
     print(f"\n[1] Testing full forward pass on {device}...")
 
     # Test embed_tokens
     token_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32, device=device)
-    embeddings = engine.forward_pass.embed_tokens(token_ids)
+    embeddings = runtime.engine.embed_tokens(token_ids)
     print(f"    Embeddings shape: {embeddings.shape}")
 
     # Test lm_head (final projection)
-    logits = engine.forward_pass.lm_head(embeddings)
+    logits = runtime.engine.lm_head(embeddings)
     print(f"    Logits shape: {logits.shape}")
 
     # Verify logits have vocab_size dimension
-    expected_vocab_size = engine.model_config.num_vocabs
+    expected_vocab_size = runtime.model_config.num_vocabs
     assert (
         logits.shape[-1] == expected_vocab_size
     ), f"Logits vocab size mismatch: expected {expected_vocab_size}, got {logits.shape[-1]}"
@@ -176,7 +175,7 @@ def _multi_gpu_worker(rank: int, world_size: int, port: int, test_fn: str):
         from multiprocessing import Queue
 
         mock_log_queue = Queue()
-        engine = Engine.load(config)
+        runtime = Runtime(config, log_queue=mock_log_queue)
         device = config.device
 
         if rank == 0:
@@ -188,19 +187,19 @@ def _multi_gpu_worker(rank: int, world_size: int, port: int, test_fn: str):
         if test_fn == "embed":
             # Test embed_tokens - should preserve hidden_size with all_reduce
             token_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32, device=device)
-            embeddings = engine.forward_pass.embed_tokens(token_ids)
+            embeddings = runtime.engine.embed_tokens(token_ids)
 
             if rank == 0:
                 print(f"    Embeddings shape: {embeddings.shape}")
-                print(f"    Expected hidden_size: {engine.model_config.dim_hidden}")
+                print(f"    Expected hidden_size: {runtime.model_config.dim_hidden}")
 
                 # Debug: print embedding weight shape
-                embed_weight = engine.forward_pass.weights.get("embed_token")
+                embed_weight = runtime.engine.weights.get("embed_token")
                 print(f"    Embed weight shape: {embed_weight.shape}")
 
                 # The key test: hidden_size should NOT be halved
-                assert embeddings.shape[1] == engine.model_config.dim_hidden, (
-                    f"FAIL: Hidden size mismatch! Expected {engine.model_config.dim_hidden}, "
+                assert embeddings.shape[1] == runtime.model_config.dim_hidden, (
+                    f"FAIL: Hidden size mismatch! Expected {runtime.model_config.dim_hidden}, "
                     f"got {embeddings.shape[1]}. Embeddings were incorrectly sharded."
                 )
                 print("    ✓ Multi-GPU embed_tokens preserves hidden_size!")
@@ -209,27 +208,27 @@ def _multi_gpu_worker(rank: int, world_size: int, port: int, test_fn: str):
             # Test forward pass: embed_tokens -> lm_head
             # This tests the critical distributed operations (all_gather in both)
             token_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32, device=device)
-            embeddings = engine.forward_pass.embed_tokens(token_ids)
+            embeddings = runtime.engine.embed_tokens(token_ids)
 
             if rank == 0:
                 print(f"    Embeddings shape: {embeddings.shape}")
 
                 # Verify embeddings shape is correct (full hidden_size)
-                assert embeddings.shape[1] == engine.model_config.dim_hidden, (
-                    f"FAIL: Embeddings hidden size mismatch! Expected {engine.model_config.dim_hidden}, "
+                assert embeddings.shape[1] == runtime.model_config.dim_hidden, (
+                    f"FAIL: Embeddings hidden size mismatch! Expected {runtime.model_config.dim_hidden}, "
                     f"got {embeddings.shape[1]}"
                 )
                 print("    ✓ Multi-GPU embed_tokens produces correct hidden_size!")
 
             # Test lm_head (has all_gather for column-parallel weights)
-            logits = engine.forward_pass.lm_head(embeddings)
+            logits = runtime.engine.lm_head(embeddings)
 
             if rank == 0:
                 print(f"    Logits shape: {logits.shape}")
 
                 # Verify logits shape is correct (full vocab_size)
-                assert logits.shape[-1] == engine.model_config.num_vocabs, (
-                    f"FAIL: Logits vocab_size mismatch! Expected {engine.model_config.num_vocabs}, "
+                assert logits.shape[-1] == runtime.model_config.num_vocabs, (
+                    f"FAIL: Logits vocab_size mismatch! Expected {runtime.model_config.num_vocabs}, "
                     f"got {logits.shape[-1]}"
                 )
                 print("    ✓ Multi-GPU lm_head produces correct vocab_size!")

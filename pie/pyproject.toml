@@ -4,12 +4,12 @@ build-backend = "maturin"
 
 [project]
 name = "pie-server"
-version = "0.3.0"
+version = "0.2.5"
 description = "Programmable Inference Engine"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "Apache-2.0"
-authors = [{ name = "In Gim", email = "in.gim@icloud.com" }]
+authors = [{ name = "In Gim", email = "in.gim@yale.edu" }]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
@@ -45,7 +45,14 @@ dependencies = [
 
 [project.optional-dependencies]
 
-# --- CUDA ---
+cuda = [
+    "torch>=2.7.1",
+    "torchao>=0.14.1",
+    "flashinfer-python>=0.6.1",
+    "flashinfer-cubin>=0.6.1",
+]
+
+# for uv only
 cu126 = [
     "torch>=2.7.1",
     "torchao>=0.14.1",
@@ -53,6 +60,7 @@ cu126 = [
     "flashinfer-cubin>=0.6.1",
 ]
 
+# for uv only
 cu128 = [
     "torch>=2.7.1",
     "torchao>=0.14.1",
@@ -60,6 +68,7 @@ cu128 = [
     "flashinfer-cubin>=0.6.1",
     "flashinfer-jit-cache>=0.6.1",
 ]
+
 
 # --- Metal (macOS) ---
 metal = [
@@ -81,36 +90,38 @@ name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
+
 [[tool.uv.index]]
 name = "flashinfer-cu128"
 url = "https://flashinfer.ai/whl/cu128"
-explicit = true
 
+# 2. Source Pinning
 [tool.uv.sources]
 
 # Local workspace member
 pie-client = { path = "../client/python", editable = true }
 
-# Torch: use PyTorch index for cu126 (cu128 resolves from PyPI)
+# --- Torch Sources ---
 torch = [
     { index = "pytorch-cu126", extra = "cu126" },
 ]
 
-# FlashInfer JIT Cache: custom index for cu128
+# --- FlashInfer JIT Cache Sources (only this package uses custom indexes) ---
 flashinfer-jit-cache = [
     { index = "flashinfer-cu128", extra = "cu128" },
 ]
 
 [tool.maturin]
 python-source = "src"
-python-packages = ["pie", "pie_cli", "pie_backend", "flashinfer_metal"]
-module-name = "pie._runtime"
+python-packages = ["pie", "pie_cli", "pie_worker", "flashinfer_metal"]
+module-name = "pie._pie"
 manifest-path = "../runtime/Cargo.toml"
 features = ["pyo3/extension-module"]
 
 [tool.uv]
 cache-keys = [{file = "pyproject.toml"}, {file = "../runtime/Cargo.toml"}, {file = "../runtime/**/*.rs"}]
 
+# Declare CUDA/Metal extras as mutually exclusive
 conflicts = [
     [
         { extra = "cu126" },
