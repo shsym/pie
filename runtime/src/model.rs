@@ -511,6 +511,43 @@ impl Model {
                 }
             }
 
+            // Coalesce window: when pipeline is empty and batch is small,
+            // wait briefly for more requests before firing. This prevents
+            // batch fragmentation when WASM inferlets resume with slight stagger.
+            {
+                let needs_coalesce = (0..num_groups).any(|gid| {
+                    let batch_len = batches[gid].len();
+                    let in_flight = in_flight_counts[gid];
+                    batch_len > 0 && in_flight == 0 && batch_len < max_batch_size
+                });
+
+                if needs_coalesce {
+                    const COALESCE_WINDOW: Duration = Duration::from_millis(2);
+                    let coalesce_start = Instant::now();
+                    while coalesce_start.elapsed() < COALESCE_WINDOW {
+                        match req_rx.try_recv() {
+                            Ok((req, tx, group_id)) => {
+                                let group_id = std::cmp::min(group_id, num_groups - 1);
+                                {
+                                    let mut sched = scheduler.lock().unwrap();
+                                    let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
+                                    sched.on_request_arrival(group_id, arrival_time);
+                                }
+                                group_tokens[group_id] += req.input_tokens.len();
+                                batches[group_id].push((req, tx));
+                                prof_requests_received[group_id] += 1;
+                                if batches[group_id].len() >= max_batch_size {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                }
+            }
+
             // Check all groups for firing
             let mut fired_any = false;
             for group_id in 0..num_groups {
