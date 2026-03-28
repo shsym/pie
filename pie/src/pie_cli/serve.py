@@ -117,7 +117,12 @@ def serve(
         False, "--monitor", "-m", help="Launch real-time TUI monitor"
     ),
     dummy: bool = typer.Option(
-        False, "--dummy", help="Enable dummy mode (skip GPU weight loading, return random tokens)"
+        False,
+        "--dummy",
+        help="Enable dummy mode (skip GPU weight loading, return random tokens)",
+    ),
+    no_snapshot: bool = typer.Option(
+        False, "--no-snapshot", help="Disable Python snapshot optimization"
     ),
 ) -> None:
     """Start the Pie engine and enter an interactive session.
@@ -138,6 +143,9 @@ def serve(
         )
     except typer.Exit:
         raise
+
+    if no_snapshot:
+        engine_config["python_snapshot"] = False
 
     console.print()
 
