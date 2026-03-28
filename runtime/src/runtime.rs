@@ -345,10 +345,10 @@ impl Service for Runtime {
                 arguments,
                 event,
             } => {
-                let _ = self
+                let res = self
                     .launch_server_instance(username, program_hash, port, arguments)
                     .await;
-                event.send(Ok(())).unwrap();
+                event.send(res.map(|_| ())).unwrap();
             }
 
             Command::TerminateInstance {
@@ -543,6 +543,64 @@ fn create_linker(engine: &Engine, shared_modules: &[(String, Module)]) -> Linker
     linker
 }
 
+/// Recursively collect a dependency and all its transitive dependencies.
+/// Uses post-order DFS to ensure dependencies come before dependents.
+fn collect_deps_recursive(
+    compiled_programs: &DashMap<ProgramHash, CompiledProgram>,
+    dep_hash: &ProgramHash,
+    visited: &mut HashSet<ProgramHash>,
+    result: &mut Vec<Component>,
+    python_runtime: &mut Option<String>,
+    any_python_snapshotted: &mut bool,
+    any_python_not_snapshotted: &mut bool,
+) -> Result<(), RuntimeError> {
+    if visited.contains(dep_hash) {
+        return Ok(());
+    }
+    visited.insert(dep_hash.clone());
+
+    if let Some(entry) = compiled_programs.get(dep_hash) {
+        let compiled_program = entry.value();
+
+        if let Some(dep_py_rt) = &compiled_program.python_runtime {
+            match python_runtime {
+                Some(existing) if existing.as_str() != dep_py_rt => {
+                    return Err(RuntimeError::Other(format!(
+                        "Conflicting python-runtime versions among dependencies: \
+                         '{}' vs '{}'",
+                        existing, dep_py_rt
+                    )));
+                }
+                None => {
+                    *python_runtime = Some(dep_py_rt.clone());
+                }
+                _ => {}
+            }
+
+            if compiled_program.snapshotted {
+                *any_python_snapshotted = true;
+            } else {
+                *any_python_not_snapshotted = true;
+            }
+        }
+
+        for child_dep_hash in &compiled_program.dependencies {
+            collect_deps_recursive(
+                compiled_programs,
+                child_dep_hash,
+                visited,
+                result,
+                python_runtime,
+                any_python_snapshotted,
+                any_python_not_snapshotted,
+            )?;
+        }
+
+        result.push(compiled_program.component.clone());
+    }
+    Ok(())
+}
+
 impl Runtime {
     fn new(engine: Engine, python_snapshot: bool) -> Self {
         let py_runtime_dir = {
@@ -595,13 +653,6 @@ impl Runtime {
         }
     }
 
-    fn is_program_snapshotted(&self, program_hash: &ProgramHash) -> bool {
-        self.compiled_programs
-            .get(program_hash)
-            .map(|entry| entry.value().snapshotted)
-            .unwrap_or(false)
-    }
-
     async fn load_program(
         &self,
         program_hash: ProgramHash,
@@ -652,16 +703,48 @@ impl Runtime {
         let engine = self.engine.clone();
         let py_runtime_dir = self.py_runtime_dir.clone();
 
-        let mut linker = create_linker(&engine, &self.shared_modules);
+        let mut visited = HashSet::new();
+        let mut dependency_components = Vec::new();
+        let mut dep_python_runtime: Option<String> = None;
+        let mut any_dep_snapshotted = false;
+        let mut any_dep_not_snapshotted = false;
 
-        let dependency_components: Vec<Component> = dependencies
-            .iter()
-            .filter_map(|dep_hash| {
-                self.compiled_programs
-                    .get(dep_hash)
-                    .map(|entry| entry.component.clone())
-            })
-            .collect();
+        for dep_hash in dependencies {
+            collect_deps_recursive(
+                &self.compiled_programs,
+                dep_hash,
+                &mut visited,
+                &mut dependency_components,
+                &mut dep_python_runtime,
+                &mut any_dep_snapshotted,
+                &mut any_dep_not_snapshotted,
+            )?;
+        }
+
+        if any_dep_snapshotted && any_dep_not_snapshotted {
+            return Err(RuntimeError::Other(
+                "Inconsistent snapshot status among dependencies: some Python components \
+                 are snapshotted while others are not."
+                    .to_string(),
+            ));
+        }
+
+        if any_dep_not_snapshotted {
+            return Err(RuntimeError::Other(
+                "Cannot snapshot: Python dependencies are not snapshotted. \
+                 All Python components in a dependency tree must share the same \
+                 snapshot status."
+                    .to_string(),
+            ));
+        }
+
+        let shared_modules = if any_dep_snapshotted {
+            &self.stripped_shared_modules
+        } else {
+            &self.shared_modules
+        };
+
+        let mut linker = create_linker(&engine, shared_modules);
 
         let (inst_state, _output_delivery_ctrl) = InstanceState::new(
             Uuid::new_v4(),
@@ -698,84 +781,54 @@ impl Runtime {
     /// Collect all dependencies of a program in topological order (dependencies before dependents).
     /// This handles deduplication when a dependency appears multiple times in the dependency graph.
     ///
-    /// Returns the dependency components and the unified `python_runtime` version, if any
-    /// dependency declares one. Returns an error if multiple dependencies declare conflicting
-    /// python runtime versions.
+    /// Returns the dependency components, the unified `python_runtime` version (if any
+    /// dependency declares one), and whether Python components are snapshotted.
+    /// Returns an error if multiple dependencies declare conflicting python runtime
+    /// versions, or if Python components have inconsistent snapshot status (some
+    /// snapshotted and some not).
     fn collect_dependencies_topo_order(
         &self,
         program_hash: &ProgramHash,
-    ) -> Result<(Vec<Component>, Option<String>), RuntimeError> {
-        /// Recursively collect a dependency and all its transitive dependencies.
-        /// Uses post-order DFS to ensure dependencies come before dependents.
-        fn collect_recursive(
-            compiled_programs: &DashMap<ProgramHash, CompiledProgram>,
-            dep_hash: &ProgramHash,
-            visited: &mut HashSet<ProgramHash>,
-            result: &mut Vec<Component>,
-            python_runtime: &mut Option<String>,
-        ) -> Result<(), RuntimeError> {
-            if visited.contains(dep_hash) {
-                return Ok(());
-            }
-            visited.insert(dep_hash.clone());
-
-            if let Some(entry) = compiled_programs.get(dep_hash) {
-                let compiled_program = entry.value();
-
-                // Check python_runtime consistency
-                if let Some(dep_py_rt) = &compiled_program.python_runtime {
-                    match python_runtime {
-                        Some(existing) if existing.as_str() != dep_py_rt => {
-                            return Err(RuntimeError::Other(format!(
-                                "Conflicting python-runtime versions among dependencies: \
-                                 '{}' vs '{}'",
-                                existing, dep_py_rt
-                            )));
-                        }
-                        None => {
-                            *python_runtime = Some(dep_py_rt.clone());
-                        }
-                        _ => {}
-                    }
-                }
-
-                for child_dep_hash in &compiled_program.dependencies {
-                    collect_recursive(
-                        compiled_programs,
-                        child_dep_hash,
-                        visited,
-                        result,
-                        python_runtime,
-                    )?;
-                }
-
-                result.push(compiled_program.component.clone());
-            }
-            Ok(())
-        }
-
+    ) -> Result<(Vec<Component>, Option<String>, bool), RuntimeError> {
         let mut visited = HashSet::new();
         let mut result = Vec::new();
         let mut python_runtime: Option<String> = None;
+        let mut any_python_snapshotted = false;
+        let mut any_python_not_snapshotted = false;
 
         if let Some(entry) = self.compiled_programs.get(program_hash) {
-            // Also check the main program's python_runtime
             if let Some(ref py_rt) = entry.value().python_runtime {
                 python_runtime = Some(py_rt.clone());
+                if entry.value().snapshotted {
+                    any_python_snapshotted = true;
+                } else {
+                    any_python_not_snapshotted = true;
+                }
             }
 
             for dep_hash in &entry.value().dependencies {
-                collect_recursive(
+                collect_deps_recursive(
                     &self.compiled_programs,
                     dep_hash,
                     &mut visited,
                     &mut result,
                     &mut python_runtime,
+                    &mut any_python_snapshotted,
+                    &mut any_python_not_snapshotted,
                 )?;
             }
         }
 
-        Ok((result, python_runtime))
+        if any_python_snapshotted && any_python_not_snapshotted {
+            return Err(RuntimeError::Other(
+                "Inconsistent snapshot status: some Python components are snapshotted \
+                 while others are not. All Python components in a dependency tree must \
+                 share the same shared modules and therefore the same snapshot status."
+                    .to_string(),
+            ));
+        }
+
+        Ok((result, python_runtime, any_python_snapshotted))
     }
 
     /// Actually start a program instance
@@ -791,15 +844,15 @@ impl Runtime {
         let instance_id = Uuid::new_v4();
 
         // Collect dependencies in topological order (deduplication handled inside)
-        let (dependency_components, python_runtime) =
+        let (dependency_components, python_runtime, any_snapshotted) =
             self.collect_dependencies_topo_order(&program_hash)?;
 
-        // Use stripped shared modules only if the program was actually snapshotted.
-        // If snapshot failed and we fell back to the original component, we need
-        // full shared modules (with data segments and start sections).
-        let snapshotted = self.is_program_snapshotted(&program_hash);
+        // Use stripped shared modules if any Python component (the application
+        // or any dependency) was snapshotted.  All Python components in a
+        // dependency tree share the same shared modules, so they must all
+        // agree on stripped vs full.
         let (shared_modules, py_runtime_dir) = if python_runtime.is_some() {
-            let modules = if snapshotted {
+            let modules = if any_snapshotted {
                 self.stripped_shared_modules.clone()
             } else {
                 self.shared_modules.clone()
@@ -916,12 +969,11 @@ impl Runtime {
         let component = self.get_component(&program_hash)?;
 
         // Collect dependencies in topological order (deduplication handled inside)
-        let (dependency_components, python_runtime) =
+        let (dependency_components, python_runtime, any_snapshotted) =
             self.collect_dependencies_topo_order(&program_hash)?;
 
-        let snapshotted = self.is_program_snapshotted(&program_hash);
         let (shared_modules, py_runtime_dir) = if python_runtime.is_some() {
-            let modules = if snapshotted {
+            let modules = if any_snapshotted {
                 self.stripped_shared_modules.clone()
             } else {
                 self.shared_modules.clone()
