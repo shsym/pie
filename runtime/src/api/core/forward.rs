@@ -71,6 +71,10 @@ pub struct ForwardPass {
     output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     output_embed_ptrs: Vec<u32>,
     output_embed_indices: Vec<u32>,
+    /// Max sequential decode steps per execute() call (default 1).
+    max_decode_steps: u32,
+    /// Return distributions alongside tokens for each step.
+    return_distributions: bool,
 }
 
 #[derive(Debug)]
@@ -134,6 +138,8 @@ impl inferlet::core::forward::Host for InstanceState {
             output_token_samplers: vec![],
             output_embed_ptrs: vec![],
             output_embed_indices: vec![],
+            max_decode_steps: 1,
+            return_distributions: false,
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -386,6 +392,17 @@ impl inferlet::core::forward::Host for InstanceState {
 
         Ok(())
     }
+
+    async fn set_max_decode_steps(
+        &mut self,
+        pass: Resource<ForwardPass>,
+        max_steps: u32,
+    ) -> Result<()> {
+        let pass = self.ctx().table.get_mut(&pass)?;
+        pass.max_decode_steps = max_steps.max(1);
+        Ok(())
+    }
+
 }
 
 impl inferlet::core::forward::HostForwardPass for InstanceState {
@@ -423,6 +440,10 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
                 output_token_samplers: take(&mut pass.output_token_samplers),
                 output_embed_ptrs: take(&mut pass.output_embed_ptrs),
                 output_embed_indices: take(&mut pass.output_embed_indices),
+                max_decode_steps: pass.max_decode_steps,
+                return_distributions: pass.return_distributions,
+                multi_step_tokens: Vec::new(),
+                kv_page_size: pass.queue.info.kv_page_size,
                 arrival_time: None, // Set in Model::submit() before queuing
                 inst_id: Some(self.id()),
             };

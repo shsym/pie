@@ -356,6 +356,7 @@ impl Model {
             num_groups,
         )));
 
+        let re_enqueue_tx = forward_pass_tx.clone();
         let worker_handle = tokio::spawn(Self::inference_worker(
             backends.clone(),
             forward_pass_rx,
@@ -365,6 +366,7 @@ impl Model {
             Arc::clone(&scheduler),
             scheduler_config.max_in_flight_batches,
             num_groups,
+            re_enqueue_tx,
         ));
 
         let tokenizer = Arc::new(BytePairEncoder::new(
@@ -461,6 +463,7 @@ impl Model {
         scheduler: SharedScheduler,
         max_in_flight_batches: usize,
         num_groups: usize,
+        re_enqueue_tx: mpsc::UnboundedSender<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>,
     ) {
         const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
         const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -615,12 +618,13 @@ impl Model {
                     // Spawn batch execution using group-specific backend
                     let backend_clone = backends[group_id].clone();
                     let completion_tx_clone = completion_tx.clone();
+                    let re_enqueue_tx_clone = re_enqueue_tx.clone();
                     let batch_size = batch_len;
                     let tokens_in_batch = total_tok;
-                    
+
                     tokio::spawn(async move {
                          let start_time = Instant::now();
-                         Self::execute_forward_pass_batch(&backend_clone, batch_to_fire, group_id, REQUEST_TIMEOUT).await;
+                         Self::execute_forward_pass_batch(&backend_clone, batch_to_fire, group_id, REQUEST_TIMEOUT, &re_enqueue_tx_clone).await;
                          let latency = start_time.elapsed();
                          completion_tx_clone.send((batch_size, tokens_in_batch, latency, group_id)).ok();
                     });
@@ -691,7 +695,7 @@ impl Model {
         for group_id in 0..num_groups {
             if !batches[group_id].is_empty() {
                 let batch = std::mem::take(&mut batches[group_id]);
-                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT).await;
+                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, &re_enqueue_tx).await;
             }
         }
 
@@ -710,7 +714,7 @@ impl Model {
     /// Execute a batch of forward pass requests via fire_batch RPC
     #[tracing::instrument(
         name = "rust.fire_batch",
-        skip(backend, requests),
+        skip(backend, requests, re_enqueue_tx),
         fields(batch_size = requests.len())
     )]
     async fn execute_forward_pass_batch(
@@ -718,8 +722,8 @@ impl Model {
         requests: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>,
         group_id: usize,
         timeout: Duration,
+        re_enqueue_tx: &mpsc::UnboundedSender<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>,
     ) {
-        // println!("[DEBUG Rust] Firing batch for group {}", group_id);
         let mut batch_req = BatchedForwardPassRequest::new();
         batch_req.group_id = Some(group_id);
         for (fp_req, _) in &requests {
@@ -727,7 +731,6 @@ impl Model {
         }
 
         // Inject trace context for cross-language propagation
-        // Uses tracing-opentelemetry to get current span context
         use tracing_opentelemetry::OpenTelemetrySpanExt;
         let current_span = tracing::Span::current();
         let context = current_span.context();
@@ -735,7 +738,6 @@ impl Model {
         let otel_span = context.span();
         let span_context = otel_span.span_context();
         if span_context.is_valid() {
-            // Format as W3C traceparent: version-trace_id-span_id-flags
             let traceparent = format!(
                 "00-{}-{}-{:02x}",
                 span_context.trace_id(),
@@ -752,17 +754,54 @@ impl Model {
         match result {
             Ok(batch_resp) => {
                 let mut resp_iter = batch_resp.results.into_iter();
-                for (_, resp_tx) in requests {
+                for (mut fp_req, resp_tx) in requests {
                     // Always advance the iterator to stay aligned with the
                     // Python-side response array, which contains one entry per
                     // request regardless of whether the request expects output.
-                    // Flush requests (resp_tx = None) still produce a response
-                    // in the batch; skipping them here would shift all
-                    // subsequent responses by one.
                     let resp = resp_iter.next();
-                    if let Some(tx) = resp_tx {
-                        if let Some(r) = resp {
-                            tx.send(r).ok();
+
+                    if fp_req.max_decode_steps > 1 {
+                        // --- Multi-step: accumulate token, re-enqueue ---
+                        if let Some(ref r) = resp {
+                            if let Some(&token) = r.tokens.first() {
+                                fp_req.multi_step_tokens.push(token);
+                                fp_req.max_decode_steps -= 1;
+
+                                if fp_req.max_decode_steps > 0 {
+                                    // Update KV page state (one more token stored)
+                                    fp_req.kv_page_last_len += 1;
+                                    if fp_req.kv_page_size > 0 && fp_req.kv_page_last_len > fp_req.kv_page_size {
+                                        fp_req.kv_page_last_len = 1;
+                                    }
+                                    // Compute next position and context length
+                                    let next_pos = fp_req.input_token_positions.last()
+                                        .map(|&p| p + 1).unwrap_or(0);
+                                    let ctx_len: u32 = fp_req.mask.last()
+                                        .map(|m| m.iter().copied().sum()).unwrap_or(0);
+                                    // Set up next single-token decode step
+                                    fp_req.input_tokens = vec![token];
+                                    fp_req.input_token_positions = vec![next_pos];
+                                    fp_req.mask = vec![vec![ctx_len + 1]]; // BRLE [N] = causal
+                                    fp_req.output_token_indices = vec![0];
+                                    // Re-enqueue for next batch
+                                    re_enqueue_tx.send((fp_req, resp_tx, group_id)).ok();
+                                    continue; // Don't send response yet
+                                }
+                            }
+                        }
+                        // Done: all steps complete or no token produced
+                        if let Some(tx) = resp_tx {
+                            tx.send(ForwardPassResponse {
+                                tokens: fp_req.multi_step_tokens,
+                                dists: vec![],
+                            }).ok();
+                        }
+                    } else {
+                        // --- Single-step: send response immediately ---
+                        if let Some(tx) = resp_tx {
+                            if let Some(r) = resp {
+                                tx.send(r).ok();
+                            }
                         }
                     }
                 }

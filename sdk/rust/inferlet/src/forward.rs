@@ -273,4 +273,12 @@ impl ForwardPass {
     pub fn kv_cache_ptrs(&self, kv_page_ptrs: &[u32], last_kv_page_len: usize) {
         api::forward::kv_cache(&self.inner, kv_page_ptrs, last_kv_page_len as u32);
     }
+
+    /// Set maximum number of sequential decode steps per execute() call.
+    /// Default is 1 (single step, current behavior). When >1, the host runs
+    /// N autoregressive steps before returning, amortizing async overhead.
+    pub fn set_max_decode_steps(&self, max_steps: u32) {
+        api::forward::set_max_decode_steps(&self.inner, max_steps);
+    }
+
 }

@@ -179,9 +179,33 @@ pub struct ForwardPassRequest {
     pub output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     pub output_embed_ptrs: Vec<u32>,
     pub output_embed_indices: Vec<u32>,
+    /// Maximum number of sequential decode steps to run before returning.
+    /// Default 1 (current behavior). When >1, the host runs N autoregressive
+    /// steps internally, feeding each sampled token back as input for the next.
+    /// Requires engine-side sampling (output_tokens variants). Incompatible
+    /// with output_distributions (Custom sampler).
+    #[serde(default = "default_one")]
+    pub max_decode_steps: u32,
+    /// When true, capture and return probability distributions alongside
+    /// sampled tokens for each step. Only valid with output_tokens variants.
+    #[serde(default)]
+    pub return_distributions: bool,
+    /// Accumulated tokens from previous multi-step iterations.
+    /// The scheduler appends each step's sampled token here and re-enqueues.
+    /// Not serialized (scheduler-only state).
+    #[serde(skip)]
+    pub multi_step_tokens: Vec<u32>,
+    /// KV page size for multi-step KV state tracking.
+    /// Not serialized (scheduler-only state).
+    #[serde(skip)]
+    pub kv_page_size: u32,
     /// Arrival time for scheduler estimation (not serialized).
     #[serde(skip)]
     pub arrival_time: Option<Instant>,
+}
+
+fn default_one() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

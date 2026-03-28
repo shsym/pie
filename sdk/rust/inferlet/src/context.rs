@@ -1,7 +1,7 @@
 use crate::adapter::SetAdapter;
 use crate::brle::Brle;
 use crate::drafter::Drafter;
-use crate::forward::{Distribution, Forward, KvPage};
+use crate::forward::{Distribution, Forward, ForwardPass, KvPage};
 use crate::sampler::Sample;
 use crate::stop_condition::StopCondition;
 use crate::zo::SetAdapterSeed;
@@ -255,6 +255,7 @@ impl Context {
         self.begin_of_sequence = false;
     }
 
+
     pub fn fill_system(&mut self, text: &str) {
         self.formatter.system(text);
         self.flush_chat_messages2(false);
@@ -481,6 +482,107 @@ impl Context {
     /// A `Result` containing the `Distribution` over the next possible tokens,
     /// or an error if the generation step could not be performed.
     pub async fn decode_step(&mut self, sampler: &Sampler) -> u32 {
+        let (p, pending_token_ids, position_ids) = self.prepare_forward_pass(sampler, 0);
+
+        let res = p.execute().await;
+
+        let sampled = match sampler {
+            Sampler::Custom {
+                temperature: _temperature,
+                sampler,
+            } => {
+                let dist = res.distributions.unwrap().into_iter().next().unwrap();
+                sampler.sample(&dist.ids, &dist.probs)
+            }
+            _ => res.tokens.unwrap().into_iter().next().unwrap(),
+        };
+
+        self.token_ids.extend(pending_token_ids);
+        self.position_ids.extend(position_ids);
+
+        sampled
+    }
+
+    /// Decode up to N tokens in one async yield, amortizing wasmtime async
+    /// overhead (~5.4ms) over N tokens instead of paying it per-token.
+    ///
+    /// Returns 1..=max_steps sampled tokens. The last token is NOT committed
+    /// to context state — the caller must call `fill_token(last_token)` to
+    /// set it up as the seed for the next decode call. This preserves the
+    /// same contract as `decode_step` + `fill_token`.
+    ///
+    /// Requires engine-side sampling (not Custom sampler). Panics if
+    /// max_steps > 1 with a Custom sampler.
+    pub async fn decode_n(&mut self, sampler: &Sampler, max_steps: u32) -> Vec<u32> {
+        // Fallback: if max_steps <= 1, just do a normal decode_step
+        if max_steps <= 1 {
+            let token = self.decode_step(sampler).await;
+            return vec![token];
+        }
+
+        // Validate: Custom sampler incompatible with multi-step
+        if let Sampler::Custom { .. } = sampler {
+            panic!(
+                "decode_n with max_steps > 1 requires engine-side sampling, \
+                 not Custom sampler. Use decode_step for Custom sampling."
+            );
+        }
+
+        let (p, pending_token_ids, position_ids) =
+            self.prepare_forward_pass(sampler, max_steps as usize - 1);
+
+        p.set_max_decode_steps(max_steps);
+
+        let res = p.execute().await; // ONE async yield for up to N tokens
+        let tokens = res.tokens.unwrap_or_default();
+
+        let last_pos_id = position_ids.first().copied().unwrap_or(0);
+
+        // Commit pending tokens to context (same as decode_step)
+        self.token_ids.extend(&pending_token_ids);
+        self.position_ids.extend(&position_ids);
+
+        // Commit all generated tokens EXCEPT the last one.
+        // The last token is left for the caller to fill_token(), preserving
+        // the same contract as decode_step: caller seeds the next step.
+        let commit_count = tokens.len().saturating_sub(1);
+        for (i, &token) in tokens[..commit_count].iter().enumerate() {
+            self.token_ids.push(token);
+            self.position_ids
+                .push(last_pos_id + pending_token_ids.len() as u32 + i as u32);
+        }
+
+        // Update mask for committed tokens (pending + intermediates).
+        // The last generated token is NOT included — fill_token handles it.
+        // This mirrors what fill_tokens + fill_token would do for these tokens.
+        for _ in 0..(pending_token_ids.len() + commit_count) {
+            self.token_mask_current.append(false);
+        }
+
+        // Shrink over-allocated KV pages.
+        // We pre-allocated for (pending + max_steps-1) tokens.
+        // Actually used: pending + commit_count (excluding the last token
+        // which will be committed when the caller calls fill_token → next
+        // decode → grow_kv_pages(1)).
+        let over_allocated = (max_steps as usize - 1).saturating_sub(commit_count);
+        if over_allocated > 0 {
+            self.shrink_kv_pages(over_allocated);
+        }
+
+        tokens
+    }
+
+    /// Shared forward-pass setup for decode_step and decode_n.
+    /// Consumes pending tokens, grows KV pages, builds mask, configures
+    /// adapter and sampler on the forward pass.
+    ///
+    /// `extra_kv_tokens`: additional KV pages to pre-allocate beyond pending
+    /// (used by decode_n for multi-step).
+    fn prepare_forward_pass(
+        &mut self,
+        sampler: &Sampler,
+        extra_kv_tokens: usize,
+    ) -> (ForwardPass, Vec<u32>, Vec<u32>) {
         assert!(
             !self.token_ids_pending.is_empty(),
             "Must have at least one seed token"
@@ -491,14 +593,7 @@ impl Context {
         let position_ids =
             (last_pos_id..(last_pos_id + pending_token_ids.len() as u32)).collect::<Vec<u32>>();
 
-        self.grow_kv_pages(pending_token_ids.len());
-
-        // println!("next token id: {}", next_token_id);
-        // println!("next pos id: {}", next_pos_id);
-        // println!("kv page last len: {}", self.kv_page_last_len);
-        // println!("kv page ids: {:?}", &self.kv_page_ids);
-        // println!("token ids: {:?}", &self.token_ids);
-        // println!("token ids pending: {:?}", &self.token_ids_pending);
+        self.grow_kv_pages(pending_token_ids.len() + extra_kv_tokens);
 
         let mask = mem::take(&mut self.token_mask_pending)
             .into_iter()
@@ -509,7 +604,6 @@ impl Context {
 
         if let Some(adapter_ptr) = self.adapter_ptr {
             p.set_adapter(adapter_ptr);
-
             if let Some(adapter_random_seed) = self.adapter_random_seed {
                 p.set_adapter_seed(adapter_random_seed);
             }
@@ -548,27 +642,7 @@ impl Context {
             }
         }
 
-        let res = p.execute().await;
-
-        let sampled = match sampler {
-            Sampler::Custom {
-                temperature: _temperature,
-                sampler,
-            } => {
-                let dist = res.distributions.unwrap().into_iter().next().unwrap();
-                let sampled = sampler.sample(&dist.ids, &dist.probs);
-                sampled
-            }
-            _ => {
-                let sampled = res.tokens.unwrap().into_iter().next().unwrap();
-                sampled
-            }
-        };
-
-        self.token_ids.extend(pending_token_ids);
-        self.position_ids.extend(position_ids);
-
-        sampled
+        (p, pending_token_ids, position_ids)
     }
 
     /// Performs a single, atomic autoregressive decoding step.
