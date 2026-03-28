@@ -8,11 +8,52 @@ use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::iter;
 use std::mem::take;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 use wasmtime_wasi::async_trait;
 use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
+
+/// Accumulator for per-step WIT overhead timing (PIE_WIT_TIMING=1).
+static WIT_TIMING_COUNT: AtomicU64 = AtomicU64::new(0);
+static WIT_TIMING_SUM_NS: AtomicU64 = AtomicU64::new(0);
+static WIT_EXECUTE_SUM_NS: AtomicU64 = AtomicU64::new(0);
+static WIT_READY_SUM_NS: AtomicU64 = AtomicU64::new(0);
+static WIT_RESULT_SUM_NS: AtomicU64 = AtomicU64::new(0);
+
+fn wit_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PIE_WIT_TIMING").is_ok())
+}
+
+fn mono_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+/// Print and reset WIT timing accumulators every N steps.
+fn wit_timing_maybe_report() {
+    let count = WIT_TIMING_COUNT.load(AtomicOrdering::Relaxed);
+    if count > 0 && count % 100 == 0 {
+        let total = WIT_TIMING_SUM_NS.swap(0, AtomicOrdering::Relaxed);
+        let execute = WIT_EXECUTE_SUM_NS.swap(0, AtomicOrdering::Relaxed);
+        let ready = WIT_READY_SUM_NS.swap(0, AtomicOrdering::Relaxed);
+        let result = WIT_RESULT_SUM_NS.swap(0, AtomicOrdering::Relaxed);
+        let n = WIT_TIMING_COUNT.swap(0, AtomicOrdering::Relaxed);
+        if n > 0 {
+            eprintln!(
+                "[WIT-TIMING] n={} avg: execute_build={:.0}us ready_wait={:.0}us result_extract={:.0}us pre+post={:.0}us",
+                n,
+                execute as f64 / n as f64 / 1000.0,
+                ready as f64 / n as f64 / 1000.0,
+                result as f64 / n as f64 / 1000.0,
+                (total - execute - ready - result) as f64 / n as f64 / 1000.0,
+            );
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ForwardPass {
@@ -56,9 +97,15 @@ impl Pollable for ForwardPassResult {
             return;
         }
 
+        let t0 = if wit_timing_enabled() { Some(mono_ns()) } else { None };
+
         if let Ok(res) = (&mut self.receiver).await {
             self.distributions = res.dists;
             self.tokens = res.tokens;
+        }
+
+        if let Some(t0) = t0 {
+            WIT_READY_SUM_NS.fetch_add(mono_ns() - t0, AtomicOrdering::Relaxed);
         }
 
         self.done = true;
@@ -346,6 +393,8 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
         &mut self,
         this: Resource<ForwardPass>,
     ) -> Result<Option<Resource<ForwardPassResult>>> {
+        let t_execute_start = if wit_timing_enabled() { Some(mono_ns()) } else { None };
+
         // 1) Check whether we need output (immutable borrow)
         let returns_output = {
             let pass = self.ctx().table.get(&this)?;
@@ -396,6 +445,10 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
         let req = Request::ForwardPass(request, Some(tx));
         submit_request(svc_id, queue_id, priority, req)?;
 
+        if let Some(t0) = t_execute_start {
+            WIT_EXECUTE_SUM_NS.fetch_add(mono_ns() - t0, AtomicOrdering::Relaxed);
+        }
+
         let res = ForwardPassResult {
             receiver: rx,
             distributions: vec![],
@@ -433,13 +486,21 @@ impl inferlet::core::forward::HostForwardPassResult for InstanceState {
     }
 
     async fn get_tokens(&mut self, this: Resource<ForwardPassResult>) -> Result<Option<Vec<u32>>> {
+        let t0 = if wit_timing_enabled() { Some(mono_ns()) } else { None };
         let result = self.ctx().table.get_mut(&this)?;
 
-        if result.done {
+        let ret = if result.done {
             Ok(Some(take(&mut result.tokens)))
         } else {
             Ok(None)
+        };
+        if let Some(t0) = t0 {
+            let elapsed = mono_ns() - t0;
+            WIT_RESULT_SUM_NS.fetch_add(elapsed, AtomicOrdering::Relaxed);
+            WIT_TIMING_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            wit_timing_maybe_report();
         }
+        ret
     }
 
     async fn drop(&mut self, this: Resource<ForwardPassResult>) -> Result<()> {
