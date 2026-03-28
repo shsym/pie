@@ -41,6 +41,7 @@ def poll_ffi_queue(
         "handshake": service.handshake_rpc,
         "query": service.query_rpc,
         "fire_batch": service.fire_batch,
+        "format_chat": service.format_chat_rpc,
         "embed_image": service.embed_image_rpc,
         "initialize_adapter": service.initialize_adapter_rpc,
         "update_adapter": service.update_adapter_rpc,

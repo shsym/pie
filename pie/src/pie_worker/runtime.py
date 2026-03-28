@@ -1029,6 +1029,8 @@ class Runtime:
             "tokenizer_split_regex": resp.tokenizer_split_regex,
             "tokenizer_escape_non_printable": resp.tokenizer_escape_non_printable,
             "tokenizer_sentencepiece_space": resp.tokenizer_sentencepiece_space,
+            # Raw chat template — Rust runtime validates minijinja compat at startup.
+            "chat_template": resp.prompt_template,
         }
 
     def query_rpc(self, **kwargs) -> dict:
