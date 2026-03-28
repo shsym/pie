@@ -47,6 +47,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
+/// Get nanoseconds from CLOCK_MONOTONIC (same clock as Python's time.clock_gettime_ns).
+fn clock_monotonic_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
 /// Request message sent from Rust to Python
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcRequest {
@@ -293,25 +300,57 @@ impl FfiIpcBackend {
     /// Send a request to Python and await response (async)
     pub async fn call(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        
+        let ipc_timing = std::env::var("PIE_IPC_TIMING").is_ok();
+
         let request = IpcRequest {
             request_id,
             method: method.to_string(),
             payload,
         };
-        
+
         // Create response channel
         let (response_tx, response_rx) = oneshot::channel();
         self.pending.insert(request_id, response_tx);
-        
+
+        // T_send: just before pipe write
+        let t_before_send = if ipc_timing {
+            Some(clock_monotonic_ns())
+        } else {
+            None
+        };
+
         // Send request (scope ensures lock is dropped before await)
         {
             let tx = self.request_tx.lock().unwrap();
             tx.send(request)?;
         }
-        
+
+        let t_after_send = if ipc_timing {
+            Some(clock_monotonic_ns())
+        } else {
+            None
+        };
+
         // Await response
-        response_rx.await.map_err(|_| anyhow::anyhow!("Response channel closed"))
+        let result = response_rx.await.map_err(|_| anyhow::anyhow!("Response channel closed"))?;
+
+        // T_recv: just after response received
+        if ipc_timing {
+            let t_recv = clock_monotonic_ns();
+            if let (Some(t_bs), Some(t_as)) = (t_before_send, t_after_send) {
+                let send_us = (t_as - t_bs) / 1000;
+                let wait_us = (t_recv - t_as) / 1000;
+                let total_us = (t_recv - t_bs) / 1000;
+                if method == "fire_batch" {
+                    eprintln!(
+                        "[IPC-RUST] method={} send={}us wait={}us total={}us t_send={} t_recv={}",
+                        method, send_us, wait_us, total_us, t_bs, t_recv
+                    );
+                }
+            }
+        }
+
+        Ok(result)
     }
     
     /// Get server name for Python to connect

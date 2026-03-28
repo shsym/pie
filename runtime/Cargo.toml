@@ -14,6 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 pie-client = { path = "../client/rust" }
+libc = "0.2"
 
 # PyO3 bindings
 pyo3 = { version = "0.23", features = ["extension-module"] }

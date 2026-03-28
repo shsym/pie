@@ -7,7 +7,9 @@ using direct FFI calls via PyO3.
 
 from __future__ import annotations
 
+import os
 import queue
+import sys
 import threading
 
 import msgpack
@@ -49,6 +51,9 @@ def poll_ffi_queue(
         "download_adapter": service.download_adapter_rpc,
     }
 
+    import time as _time
+    _ipc_timing = os.environ.get("PIE_IPC_TIMING", "")
+
     try:
         while not stop_event.is_set():
             # Poll the Rust queue (releases GIL while waiting)
@@ -56,11 +61,19 @@ def poll_ffi_queue(
             if request is None:
                 continue  # Timeout, try again
 
+            # T3: request received from IPC
+            if _ipc_timing:
+                t_received_ns = _time.clock_gettime_ns(_time.CLOCK_MONOTONIC)
+
             request_id, method, payload = request
 
             try:
                 # Unpack args
                 args = msgpack.unpackb(payload)
+
+                # T4: dispatch start (after unpack)
+                if _ipc_timing:
+                    t_dispatch_ns = _time.clock_gettime_ns(_time.CLOCK_MONOTONIC)
 
                 # Get handler
                 fn = methods.get(method)
@@ -77,9 +90,30 @@ def poll_ffi_queue(
                 else:
                     result = fn(args)
 
+                # T5: handler done
+                if _ipc_timing:
+                    t_handler_done_ns = _time.clock_gettime_ns(_time.CLOCK_MONOTONIC)
+
                 # Pack and respond
                 response = msgpack.packb(result)
                 ffi_queue.respond(request_id, response)
+
+                # T6: response sent
+                if _ipc_timing and method == "fire_batch":
+                    t_responded_ns = _time.clock_gettime_ns(_time.CLOCK_MONOTONIC)
+                    unpack_us = (t_dispatch_ns - t_received_ns) / 1000
+                    handler_ms = (t_handler_done_ns - t_dispatch_ns) / 1e6
+                    pack_us = (t_responded_ns - t_handler_done_ns) / 1000
+                    total_ms = (t_responded_ns - t_received_ns) / 1e6
+                    print(
+                        f"[IPC-TIMING] method={method} "
+                        f"total={total_ms:.2f}ms "
+                        f"unpack={unpack_us:.0f}us "
+                        f"handler={handler_ms:.2f}ms "
+                        f"pack_respond={pack_us:.0f}us "
+                        f"t_recv={t_received_ns} t_respond={t_responded_ns}",
+                        file=sys.stderr, flush=True,
+                    )
 
             except Exception as e:
                 import traceback
