@@ -144,6 +144,12 @@ pub struct HandshakeResponse {
     pub tokenizer_split_regex: String,
     pub tokenizer_escape_non_printable: bool,
     pub tokenizer_sentencepiece_space: bool,
+    /// Raw HF chat template string for in-process minijinja rendering.
+    #[serde(default)]
+    pub chat_template: String,
+    /// Whether the chat template is minijinja-compatible (no Python-only Jinja2 features).
+    #[serde(default)]
+    pub template_minijinja_compatible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

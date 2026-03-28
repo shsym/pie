@@ -73,3 +73,4 @@ crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 bytemuck = { version = "1.21", features = ["derive"] }
 smallvec = "1.13"
 ipc-channel = "0.19"
+minijinja = { version = "2.12.0", features = ["loader", "builtins"] }

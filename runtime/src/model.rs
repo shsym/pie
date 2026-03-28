@@ -1,5 +1,6 @@
 pub mod actor;
 pub mod batching;
+pub mod chat_template;
 pub mod ffi_bridge;
 pub mod ffi_ipc;
 pub mod request;
@@ -284,6 +285,9 @@ impl Command {
     }
 }
 
+/// Number of format_chat requests to validate (both paths) before trusting the fast path.
+pub const FORMAT_CHAT_VALIDATION_COUNT: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub name: String,
@@ -295,6 +299,12 @@ pub struct ModelInfo {
     pub tokenizer: Arc<BytePairEncoder>,
     pub kv_page_size: u32,
     pub max_batch_tokens: usize,
+    /// Raw HF chat template for in-process minijinja rendering.
+    pub chat_template: String,
+    /// Whether to use the minijinja fast path for format_chat.
+    /// Decided once at startup by rendering a synthetic message through both
+    /// minijinja and Python RPC and comparing token IDs.
+    pub use_minijinja_fast_path: bool,
 }
 
 /// Model service for communication with Python backend via FFI.
@@ -366,6 +376,26 @@ impl Model {
             handshake_info.tokenizer_sentencepiece_space,
         ));
 
+        let chat_template = handshake_info.chat_template.clone();
+
+        // Validate minijinja fast path at startup: render a synthetic message
+        // through both minijinja and Python RPC, compare token IDs.
+        let use_minijinja_fast_path = if chat_template.is_empty() {
+            false
+        } else {
+            Self::validate_minijinja_fast_path(
+                &chat_template,
+                &tokenizer,
+                &primary_backend,
+            ).await
+        };
+
+        if use_minijinja_fast_path {
+            eprintln!("[INFO] Chat template minijinja fast path ENABLED (validated at startup)");
+        } else if !chat_template.is_empty() {
+            eprintln!("[INFO] Chat template minijinja fast path DISABLED; using Python RPC");
+        }
+
         let info = ModelInfo {
             name: handshake_info.model_name,
             traits: handshake_info.model_traits,
@@ -376,6 +406,8 @@ impl Model {
             tokenizer,
             kv_page_size: handshake_info.kv_page_size,
             max_batch_tokens: handshake_info.max_batch_tokens,
+            chat_template,
+            use_minijinja_fast_path,
         };
 
         let resource_manager = ResourceManager::new(handshake_info.resources, num_groups);
@@ -513,11 +545,15 @@ impl Model {
 
             // Coalesce window: when pipeline is empty and batch is small,
             // wait briefly for more requests before firing. This prevents
-            // batch fragmentation when WASM inferlets resume with slight stagger.
+            // batch fragmentation when WASM inferlets resume with slight stagger
+            // after a batch completes (measured: avg batch drops to 50% of concurrency
+            // without this, because fire_pipeline_empty fires the first arrival).
             {
                 let needs_coalesce = (0..num_groups).any(|gid| {
                     let batch_len = batches[gid].len();
                     let in_flight = in_flight_counts[gid];
+                    // Coalesce when: we have some requests, pipeline is empty,
+                    // and batch is clearly incomplete (< recent average or < capacity)
                     batch_len > 0 && in_flight == 0 && batch_len < max_batch_size
                 });
 
@@ -536,11 +572,13 @@ impl Model {
                                 group_tokens[group_id] += req.input_tokens.len();
                                 batches[group_id].push((req, tx));
                                 prof_requests_received[group_id] += 1;
+                                // If any group is now at capacity, stop coalescing
                                 if batches[group_id].len() >= max_batch_size {
                                     break;
                                 }
                             }
                             Err(_) => {
+                                // No request immediately available; yield briefly
                                 std::thread::yield_now();
                             }
                         }
@@ -742,6 +780,69 @@ impl Model {
     async fn execute_query(backend: &RpcBackend, req: QueryRequest) -> Option<QueryResponse> {
         const TIMEOUT: Duration = Duration::from_secs(30);
         backend.call_with_timeout("query", &req, TIMEOUT).await.ok()
+    }
+
+    /// Validate minijinja fast path at startup by rendering a synthetic message
+    /// through both minijinja (in-process) and Python RPC, comparing token IDs.
+    async fn validate_minijinja_fast_path(
+        chat_template: &str,
+        tokenizer: &Arc<BytePairEncoder>,
+        backend: &RpcBackend,
+    ) -> bool {
+        // Synthetic test message for validation.
+        let test_messages_json = r#"{"messages":[{"role":"user","content":"Hello"}]}"#;
+
+        // Step 1: Try minijinja rendering.
+        let mj_result = chat_template::render_and_tokenize(
+            chat_template,
+            test_messages_json,
+            None, // no tools
+            true, // add_generation_prompt
+            tokenizer,
+        );
+        let mj_tokens = match mj_result {
+            Ok(tokens) => tokens,
+            Err(reason) => {
+                eprintln!("[INFO] minijinja startup validation: render failed: {}", reason);
+                return false;
+            }
+        };
+
+        // Step 2: Send same message through Python RPC.
+        let rpc_req = FormatChatRequest {
+            messages_json: test_messages_json.to_string(),
+            tools_json: None,
+            add_generation_prompt: true,
+        };
+        let rpc_result = Self::execute_format_chat(backend, rpc_req).await;
+        let rpc_tokens = match rpc_result {
+            Some(resp) => resp.token_ids,
+            None => {
+                eprintln!("[WARN] minijinja startup validation: Python RPC failed");
+                return false;
+            }
+        };
+
+        // Step 3: Compare.
+        if mj_tokens == rpc_tokens {
+            eprintln!(
+                "[INFO] minijinja startup validation: tokens match ({} tokens)",
+                mj_tokens.len()
+            );
+            true
+        } else {
+            eprintln!(
+                "[WARN] minijinja startup validation: token MISMATCH! \
+                 minijinja={} tokens, rpc={} tokens. \
+                 First divergence at position {}. Using Python RPC.",
+                mj_tokens.len(),
+                rpc_tokens.len(),
+                mj_tokens.iter().zip(rpc_tokens.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(mj_tokens.len().min(rpc_tokens.len())),
+            );
+            false
+        }
     }
 
     async fn execute_format_chat(backend: &RpcBackend, req: FormatChatRequest) -> Option<FormatChatResponse> {

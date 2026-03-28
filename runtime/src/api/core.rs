@@ -52,7 +52,7 @@ pub struct DebugQueryResult {
 
 #[derive(Debug)]
 pub struct FormatChatResult {
-    receiver: oneshot::Receiver<FormatChatResponse>,
+    receiver: Option<oneshot::Receiver<FormatChatResponse>>,
     result: Option<Vec<u32>>,
     done: bool,
 }
@@ -89,7 +89,8 @@ impl Pollable for FormatChatResult {
         if self.done {
             return;
         }
-        let res = (&mut self.receiver).await.unwrap();
+        let receiver = self.receiver.as_mut().expect("FormatChatResult: no receiver and not done");
+        let res = receiver.await.unwrap();
         self.result = Some(res.token_ids);
         self.done = true;
     }
@@ -368,7 +369,36 @@ impl inferlet::core::common::HostQueue for InstanceState {
         tools_json: Option<String>,
         add_generation_prompt: bool,
     ) -> Result<Resource<FormatChatResult>> {
-        let (svc_id, queue_id, priority) = self.read_queue(&this)?;
+        let queue = self.ctx().table.get(&this)?;
+        let info = queue.info.clone();
+        let svc_id = queue.service_id;
+        let queue_id = queue.uid;
+        let priority = queue.priority;
+
+        // Fast path: render + tokenize in-process (validated at startup).
+        if info.use_minijinja_fast_path {
+            match model::chat_template::render_and_tokenize(
+                &info.chat_template,
+                &messages_json,
+                tools_json.as_deref(),
+                add_generation_prompt,
+                &info.tokenizer,
+            ) {
+                Ok(token_ids) => {
+                    let res = FormatChatResult {
+                        receiver: None,
+                        result: Some(token_ids),
+                        done: true,
+                    };
+                    return Ok(self.ctx().table.push(res)?);
+                }
+                Err(reason) => {
+                    eprintln!("[WARN] minijinja fast path failed, falling back to RPC: {}", reason);
+                }
+            }
+        }
+
+        // Fallback: Python RPC path.
         let (tx, rx) = oneshot::channel();
         let req = Request::FormatChat(
             FormatChatRequest { messages_json, tools_json, add_generation_prompt },
@@ -377,7 +407,7 @@ impl inferlet::core::common::HostQueue for InstanceState {
         submit_request(svc_id, queue_id, priority, req)?;
 
         let res = FormatChatResult {
-            receiver: rx,
+            receiver: Some(rx),
             result: None,
             done: false,
         };
