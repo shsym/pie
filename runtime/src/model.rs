@@ -463,16 +463,16 @@ impl Model {
         num_groups: usize,
     ) {
         const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
-        const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
         // State per group
-        let mut batches: Vec<Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>> = 
+        let mut batches: Vec<Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>> =
             (0..num_groups).map(|_| Vec::new()).collect();
         let mut group_tokens: Vec<usize> = vec![0; num_groups];
         let mut in_flight_counts: Vec<usize> = vec![0; num_groups];
 
         // Channel for batch completions (batch_size, tokens, latency, group_id)
         let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<(usize, usize, Duration, usize)>();
+
 
         // PROFILING: Track request rates and batch firing
         let mut prof_requests_received: Vec<usize> = vec![0; num_groups];
@@ -485,6 +485,13 @@ impl Model {
                 if group_id < num_groups {
                     if in_flight_counts[group_id] > 0 {
                         in_flight_counts[group_id] -= 1;
+                    }
+                    if Self::sched_tracing_enabled() {
+                        eprintln!(
+                            "[SCHED-COMPLETE] t={} group={} reqs={} latency={:.1}ms in_flight={}",
+                            Self::mono_ns(), group_id, batch_size,
+                            latency.as_secs_f64() * 1000.0, in_flight_counts[group_id],
+                        );
                     }
                     let mut sched = scheduler.lock().unwrap();
                     sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
@@ -618,9 +625,20 @@ impl Model {
                     let batch_size = batch_len;
                     let tokens_in_batch = total_tok;
 
+                    if Self::sched_tracing_enabled() {
+                        eprintln!(
+                            "[SCHED-FIRE] t={} group={} reqs={} toks={} in_flight={}",
+                            Self::mono_ns(), group_id, batch_size, tokens_in_batch,
+                            in_flight_counts[group_id],
+                        );
+                    }
+
                     tokio::spawn(async move {
                          let start_time = Instant::now();
-                         Self::execute_forward_pass_batch(&backend_clone, batch_to_fire, group_id, REQUEST_TIMEOUT).await;
+                         Self::execute_forward_pass_batch(
+                             &backend_clone, batch_to_fire, group_id,
+                             REQUEST_TIMEOUT,
+                         ).await;
                          let latency = start_time.elapsed();
                          completion_tx_clone.send((batch_size, tokens_in_batch, latency, group_id)).ok();
                     });
@@ -641,48 +659,51 @@ impl Model {
                 prof_last_report = Instant::now();
             }
 
-            // Wait logic
+            // Wait logic: select on all event sources to minimize latency.
             if !fired_any {
-                 // If any group is at in-flight limit, we must wait for completion
+                 if Self::sched_tracing_enabled() {
+                     let any_pending = batches.iter().any(|b| !b.is_empty());
+                     eprintln!("[SCHED-WAIT] t={} any_pending={} in_flight={:?}",
+                         Self::mono_ns(), any_pending, &in_flight_counts);
+                 }
                  let any_at_limit = in_flight_counts.iter().any(|&c| c >= max_in_flight_batches);
-                 
-                 if any_at_limit {
-                     // Wait for completion (limiting factors) OR shutdown
-                     tokio::select! {
-                        _ = shutdown_rx.recv() => break,
-                        maybe_completion = completion_rx.recv() => {
-                            if let Some((batch_size, tokens_in_batch, latency, group_id)) = maybe_completion {
-                                if group_id < num_groups {
-                                    if in_flight_counts[group_id] > 0 {
-                                        in_flight_counts[group_id] -= 1;
-                                    }
-                                    let mut sched = scheduler.lock().unwrap();
-                                    sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
+
+                 tokio::select! {
+                    biased;  // check in order: shutdown, completion, continuation, request
+                    _ = shutdown_rx.recv() => break,
+                    maybe_completion = completion_rx.recv() => {
+                        if let Some((batch_size, tokens_in_batch, latency, group_id)) = maybe_completion {
+                            if group_id < num_groups {
+                                if in_flight_counts[group_id] > 0 {
+                                    in_flight_counts[group_id] -= 1;
                                 }
+                                if Self::sched_tracing_enabled() {
+                                    eprintln!(
+                                        "[SCHED-COMPLETE] t={} group={} reqs={} latency={:.1}ms in_flight={}",
+                                        Self::mono_ns(), group_id, batch_size,
+                                        latency.as_secs_f64() * 1000.0, in_flight_counts[group_id],
+                                    );
+                                }
+                                let mut sched = scheduler.lock().unwrap();
+                                sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
                             }
                         }
                     }
-                 } else {
-                     // Just wait briefly for more requests
-                     tokio::select! {
-                        _ = shutdown_rx.recv() => break,
-                        _ = tokio::time::sleep(SCHEDULER_POLL_INTERVAL) => {}
-                        maybe_req = req_rx.recv() => {
-                             match maybe_req {
-                                Some((req, tx, group_id)) => {
-                                    let group_id = std::cmp::min(group_id, num_groups - 1);
-                                    {
-                                        let mut sched = scheduler.lock().unwrap();
-                                        let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
-                                        sched.on_request_arrival(group_id, arrival_time);
-                                    }
-                                    group_tokens[group_id] += req.input_tokens.len();
-                                    batches[group_id].push((req, tx));
+                    maybe_req = req_rx.recv(), if !any_at_limit => {
+                        match maybe_req {
+                            Some((req, tx, group_id)) => {
+                                let group_id = std::cmp::min(group_id, num_groups - 1);
+                                {
+                                    let mut sched = scheduler.lock().unwrap();
+                                    let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
+                                    sched.on_request_arrival(group_id, arrival_time);
                                 }
-                                None => break,
+                                group_tokens[group_id] += req.input_tokens.len();
+                                batches[group_id].push((req, tx));
                             }
-                         }
-                     }
+                            None => break,
+                        }
+                    }
                  }
             }
         }
@@ -707,7 +728,18 @@ impl Model {
         }
     }
 
-    /// Execute a batch of forward pass requests via fire_batch RPC
+    /// Get CLOCK_MONOTONIC nanoseconds for cross-process trace correlation.
+    fn mono_ns() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+    }
+
+    fn sched_tracing_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("PIE_SCHED_TIMING").is_ok())
+    }
+
     #[tracing::instrument(
         name = "rust.fire_batch",
         skip(backend, requests),
@@ -719,13 +751,17 @@ impl Model {
         group_id: usize,
         timeout: Duration,
     ) {
+        let _t_entry = if Self::sched_tracing_enabled() { Some(Self::mono_ns()) } else { None };
+
+        let batch_size = requests.len();
         let mut batch_req = BatchedForwardPassRequest::new();
         batch_req.group_id = Some(group_id);
         for (fp_req, _) in &requests {
             batch_req.add_request(fp_req);
         }
+        let batch_tokens = batch_req.total_tokens();
 
-        // Inject trace context for cross-language propagation
+        // Inject trace context
         use tracing_opentelemetry::OpenTelemetrySpanExt;
         let current_span = tracing::Span::current();
         let context = current_span.context();
@@ -742,17 +778,22 @@ impl Model {
             batch_req.set_trace_context(traceparent);
         }
 
+        let _t_pre_rpc = if Self::sched_tracing_enabled() { Some(Self::mono_ns()) } else { None };
+
         let result: Result<BatchedForwardPassResponse, _> = backend
             .call_with_timeout("fire_batch", &batch_req, timeout)
             .await;
 
+        let _t_post_rpc = if Self::sched_tracing_enabled() { Some(Self::mono_ns()) } else { None };
+
         match result {
             Ok(batch_resp) => {
-                // Multi-step decode is handled by the Python backend.
-                // Response tokens may contain 1..N tokens per request.
                 let mut resp_iter = batch_resp.results.into_iter();
-                for (_, resp_tx) in requests {
+                for (mut fp_req, resp_tx) in requests {
                     let resp = resp_iter.next();
+
+                    // Multi-step is handled by the Python backend loop.
+                    // Just pass through the response (may contain 1..N tokens).
                     if let Some(tx) = resp_tx {
                         if let Some(r) = resp {
                             tx.send(r).ok();
@@ -763,6 +804,19 @@ impl Model {
             Err(e) => {
                 eprintln!("[Error] fire_batch failed: {:?}", e);
             }
+        }
+
+        if let (Some(t_entry), Some(t_pre_rpc), Some(t_post_rpc)) = (_t_entry, _t_pre_rpc, _t_post_rpc) {
+            let t_exit = Self::mono_ns();
+            eprintln!(
+                "[SCHED-TRACE] batch_form={:.2}ms rpc={:.1}ms dispatch={:.2}ms total={:.1}ms reqs={} toks={} entry={} exit={}",
+                (t_pre_rpc - t_entry) as f64 / 1e6,
+                (t_post_rpc - t_pre_rpc) as f64 / 1e6,
+                (t_exit - t_post_rpc) as f64 / 1e6,
+                (t_exit - t_entry) as f64 / 1e6,
+                batch_size, batch_tokens,
+                t_entry, t_exit,
+            );
         }
     }
 

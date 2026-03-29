@@ -294,16 +294,23 @@ impl AdaptiveScheduler {
             return true;
         }
 
-        // Skip optimization for small batches when pipeline is full
+        // When in_flight > 0, fire immediately to keep GPU pipeline full.
+        // Don't wait for more requests — smaller overlapping batches give
+        // higher GPU utilization than larger serialized batches. This is
+        // critical for multi-step continuations which arrive one at a time.
+        if in_flight_batches > 0 {
+            return true;
+        }
+
+        // Pipeline empty: wait for a minimum batch size before firing.
         if current_batch_size < self.config.min_batch_for_optimization {
-            // But don't fire if we have batches in flight - wait for more requests
             tracing::trace!(
                 target: "scheduler.decision",
                 group_id = group_id,
                 decision = "wait_small_batch",
                 batch_size = current_batch_size,
                 in_flight = in_flight_batches,
-                "Waiting: batch too small"
+                "Waiting: batch too small and pipeline empty"
             );
             return false;
         }

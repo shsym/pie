@@ -190,6 +190,12 @@ pub struct ForwardPassRequest {
     /// sampled tokens for each step. Only valid with output_tokens variants.
     #[serde(default)]
     pub return_distributions: bool,
+    /// Accumulated tokens across multi-step re-enqueue cycles (scheduler-only).
+    #[serde(skip)]
+    pub multi_step_tokens: Vec<u32>,
+    /// KV page size for multi-step KV state tracking (scheduler-only).
+    #[serde(skip)]
+    pub kv_page_size: u32,
     /// Arrival time for scheduler estimation (not serialized).
     #[serde(skip)]
     pub arrival_time: Option<Instant>,
