@@ -294,15 +294,9 @@ impl AdaptiveScheduler {
             return true;
         }
 
-        // When in_flight > 0, fire immediately to keep GPU pipeline full.
-        // Don't wait for more requests — smaller overlapping batches give
-        // higher GPU utilization than larger serialized batches. This is
-        // critical for multi-step continuations which arrive one at a time.
-        if in_flight_batches > 0 {
-            return true;
-        }
-
-        // Pipeline empty: wait for a minimum batch size before firing.
+        // Small batch with pipeline empty: wait for more requests.
+        // With pipeline active (in_flight > 0), the coalesce window already
+        // collected what's available — fire now to keep GPU busy.
         if current_batch_size < self.config.min_batch_for_optimization {
             tracing::trace!(
                 target: "scheduler.decision",
@@ -313,6 +307,14 @@ impl AdaptiveScheduler {
                 "Waiting: batch too small and pipeline empty"
             );
             return false;
+        }
+
+        // When pipeline has work in-flight, fire immediately after coalesce.
+        // The coalesce window already collected available requests.
+        // Don't second-guess with throughput estimation — keeping GPU fed
+        // is more important than optimizing batch size.
+        if in_flight_batches > 0 {
+            return true;
         }
 
         // Throughput optimization: compare firing now vs waiting for one more request

@@ -473,6 +473,11 @@ impl Model {
         // Channel for batch completions (batch_size, tokens, latency, group_id)
         let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<(usize, usize, Duration, usize)>();
 
+        // Channel for multi-step continuations: re-enqueued requests bypass
+        // WASM and coalesce, going directly back into the batch queue.
+        let (continuation_tx, mut continuation_rx) =
+            mpsc::unbounded_channel::<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>();
+
 
         // PROFILING: Track request rates and batch firing
         let mut prof_requests_received: Vec<usize> = vec![0; num_groups];
@@ -498,33 +503,66 @@ impl Model {
                 }
             }
 
-            // Check if we have any pending requests in any batch or should wait
+            // Drain multi-step continuations into batch queues (bypasses WASM).
+            {
+                let mut cont_count = 0u32;
+                while let Ok((req, tx, group_id)) = continuation_rx.try_recv() {
+                    let group_id = std::cmp::min(group_id, num_groups - 1);
+                    group_tokens[group_id] += req.input_tokens.len();
+                    batches[group_id].push((req, tx));
+                    cont_count += 1;
+                }
+                if cont_count > 0 {
+                    if Self::sched_tracing_enabled() {
+                        eprintln!("[SCHED-CONT-DRAIN] t={} drained={}", Self::mono_ns(), cont_count);
+                    }
+                }
+            }
+
             let all_batches_empty = batches.iter().all(|b| b.is_empty());
 
             if all_batches_empty {
-                let first_request = tokio::select! {
+                // Wait for any event: new request, completion, or continuation.
+                tokio::select! {
+                    biased;
                     _ = shutdown_rx.recv() => break,
+                    maybe_completion = completion_rx.recv() => {
+                        if let Some((batch_size, tokens_in_batch, latency, group_id)) = maybe_completion {
+                            if group_id < num_groups {
+                                if in_flight_counts[group_id] > 0 {
+                                    in_flight_counts[group_id] -= 1;
+                                }
+                                let mut sched = scheduler.lock().unwrap();
+                                sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
+                            }
+                        }
+                        continue; // re-check — continuation drain at top of loop
+                    }
+                    maybe_cont = continuation_rx.recv() => {
+                        if let Some((req, tx, group_id)) = maybe_cont {
+                            let group_id = std::cmp::min(group_id, num_groups - 1);
+                            group_tokens[group_id] += req.input_tokens.len();
+                            batches[group_id].push((req, tx));
+                        }
+                        continue; // skip the req_rx add below
+                    }
                     maybe_req = req_rx.recv() => {
                         match maybe_req {
-                            Some(req) => req,
+                            Some((req, tx, group_id)) => {
+                                let group_id = std::cmp::min(group_id, num_groups - 1);
+                                {
+                                    let mut sched = scheduler.lock().unwrap();
+                                    let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
+                                    sched.on_request_arrival(group_id, arrival_time);
+                                }
+                                group_tokens[group_id] += req.input_tokens.len();
+                                batches[group_id].push((req, tx));
+                                prof_requests_received[group_id] += 1;
+                            }
                             None => break,
                         }
                     }
                 };
-
-                // Add to appropriate group batch
-                let (req, tx, group_id) = first_request;
-                // Safety: clamp group_id
-                let group_id = std::cmp::min(group_id, num_groups - 1);
-
-                {
-                    let mut sched = scheduler.lock().unwrap();
-                    let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
-                    sched.on_request_arrival(group_id, arrival_time);
-                }
-                group_tokens[group_id] += req.input_tokens.len();
-                batches[group_id].push((req, tx));
-                prof_requests_received[group_id] += 1;
             }
 
             // Drain channel into batches, with optional coalesce window.
@@ -539,17 +577,21 @@ impl Model {
             {
                 const COALESCE_WINDOW: Duration = Duration::from_millis(2);
 
-                // Compute the latest coalesce deadline across groups that need it.
-                // Groups at capacity or with in-flight batches don't participate.
-                let deadline = (0..num_groups)
-                    .filter(|&gid| {
-                        batches[gid].len() > 0
-                            && in_flight_counts[gid] == 0
-                            && batches[gid].len() < max_batch_size
-                            && group_tokens[gid] < max_batch_tokens
-                    })
-                    .next()
-                    .map(|_| Instant::now() + COALESCE_WINDOW);
+                // Compute coalesce deadline. Skip coalesce when a group has
+                // in-flight batches (pipeline active) — fire immediately to
+                // keep GPU busy. When pipeline is empty, coalesce to batch
+                // multiple continuations together (important at c>1).
+                let deadline = {
+                    (0..num_groups)
+                        .filter(|&gid| {
+                            batches[gid].len() > 0
+                                && in_flight_counts[gid] == 0
+                                && batches[gid].len() < max_batch_size
+                                && group_tokens[gid] < max_batch_tokens
+                        })
+                        .next()
+                    .map(|_| Instant::now() + COALESCE_WINDOW)
+                };
 
                 loop {
                     let maybe_req = if let Some(dl) = deadline {
@@ -622,6 +664,7 @@ impl Model {
                     // Spawn batch execution using group-specific backend
                     let backend_clone = backends[group_id].clone();
                     let completion_tx_clone = completion_tx.clone();
+                    let continuation_tx_clone = continuation_tx.clone();
                     let batch_size = batch_len;
                     let tokens_in_batch = total_tok;
 
@@ -637,7 +680,7 @@ impl Model {
                          let start_time = Instant::now();
                          Self::execute_forward_pass_batch(
                              &backend_clone, batch_to_fire, group_id,
-                             REQUEST_TIMEOUT,
+                             REQUEST_TIMEOUT, &continuation_tx_clone,
                          ).await;
                          let latency = start_time.elapsed();
                          completion_tx_clone.send((batch_size, tokens_in_batch, latency, group_id)).ok();
@@ -669,7 +712,7 @@ impl Model {
                  let any_at_limit = in_flight_counts.iter().any(|&c| c >= max_in_flight_batches);
 
                  tokio::select! {
-                    biased;  // check in order: shutdown, completion, continuation, request
+                    biased;
                     _ = shutdown_rx.recv() => break,
                     maybe_completion = completion_rx.recv() => {
                         if let Some((batch_size, tokens_in_batch, latency, group_id)) = maybe_completion {
@@ -687,6 +730,13 @@ impl Model {
                                 let mut sched = scheduler.lock().unwrap();
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
                             }
+                        }
+                    }
+                    maybe_cont = continuation_rx.recv() => {
+                        if let Some((req, tx, group_id)) = maybe_cont {
+                            let group_id = std::cmp::min(group_id, num_groups - 1);
+                            group_tokens[group_id] += req.input_tokens.len();
+                            batches[group_id].push((req, tx));
                         }
                     }
                     maybe_req = req_rx.recv(), if !any_at_limit => {
@@ -712,7 +762,7 @@ impl Model {
         for group_id in 0..num_groups {
             if !batches[group_id].is_empty() {
                 let batch = std::mem::take(&mut batches[group_id]);
-                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT).await;
+                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, &continuation_tx).await;
             }
         }
 
@@ -742,7 +792,7 @@ impl Model {
 
     #[tracing::instrument(
         name = "rust.fire_batch",
-        skip(backend, requests),
+        skip(backend, requests, continuation_tx),
         fields(batch_size = requests.len())
     )]
     async fn execute_forward_pass_batch(
@@ -750,6 +800,7 @@ impl Model {
         requests: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>)>,
         group_id: usize,
         timeout: Duration,
+        continuation_tx: &mpsc::UnboundedSender<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>,
     ) {
         let _t_entry = if Self::sched_tracing_enabled() { Some(Self::mono_ns()) } else { None };
 
@@ -792,11 +843,52 @@ impl Model {
                 for (mut fp_req, resp_tx) in requests {
                     let resp = resp_iter.next();
 
-                    // Multi-step is handled by the Python backend loop.
-                    // Just pass through the response (may contain 1..N tokens).
-                    if let Some(tx) = resp_tx {
-                        if let Some(r) = resp {
-                            tx.send(r).ok();
+                    if fp_req.max_decode_steps > 1 || !fp_req.multi_step_tokens.is_empty() {
+                        // Multi-step: accumulate token, re-enqueue or finish.
+                        if let Some(ref r) = resp {
+                            if let Some(&token) = r.tokens.first() {
+                                fp_req.multi_step_tokens.push(token);
+                                fp_req.max_decode_steps -= 1;
+
+                                if fp_req.max_decode_steps > 0 {
+                                    // Update KV page state
+                                    fp_req.kv_page_last_len += 1;
+                                    if fp_req.kv_page_size > 0
+                                        && fp_req.kv_page_last_len > fp_req.kv_page_size
+                                    {
+                                        fp_req.kv_page_last_len = 1;
+                                    }
+                                    let next_pos = fp_req.input_token_positions.last()
+                                        .map(|&p| p + 1).unwrap_or(0);
+                                    let ctx_len: u32 = fp_req.mask.last()
+                                        .map(|m| m.iter().copied().sum()).unwrap_or(0);
+                                    fp_req.input_tokens = vec![token];
+                                    fp_req.input_token_positions = vec![next_pos];
+                                    fp_req.mask = vec![vec![ctx_len + 1]];
+                                    fp_req.output_token_indices = vec![0];
+                                    if Self::sched_tracing_enabled() {
+                                        eprintln!("[MS-REQUEUE] t={} step={} remaining={} token={}",
+                                            Self::mono_ns(), fp_req.multi_step_tokens.len(),
+                                            fp_req.max_decode_steps, token);
+                                    }
+                                    continuation_tx.send((fp_req, resp_tx, group_id)).ok();
+                                    continue;
+                                }
+                            }
+                        }
+                        // Done: send accumulated tokens
+                        if let Some(tx) = resp_tx {
+                            tx.send(ForwardPassResponse {
+                                tokens: fp_req.multi_step_tokens,
+                                dists: vec![],
+                            }).ok();
+                        }
+                    } else {
+                        // Single-step: pass through
+                        if let Some(tx) = resp_tx {
+                            if let Some(r) = resp {
+                                tx.send(r).ok();
+                            }
                         }
                     }
                 }
