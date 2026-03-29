@@ -442,8 +442,6 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
                 output_embed_indices: take(&mut pass.output_embed_indices),
                 max_decode_steps: pass.max_decode_steps,
                 return_distributions: pass.return_distributions,
-                multi_step_tokens: Vec::new(),
-                kv_page_size: pass.queue.info.kv_page_size,
                 arrival_time: None, // Set in Model::submit() before queuing
                 inst_id: Some(self.id()),
             };

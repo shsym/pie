@@ -190,15 +190,6 @@ pub struct ForwardPassRequest {
     /// sampled tokens for each step. Only valid with output_tokens variants.
     #[serde(default)]
     pub return_distributions: bool,
-    /// Accumulated tokens from previous multi-step iterations.
-    /// The scheduler appends each step's sampled token here and re-enqueues.
-    /// Not serialized (scheduler-only state).
-    #[serde(skip)]
-    pub multi_step_tokens: Vec<u32>,
-    /// KV page size for multi-step KV state tracking.
-    /// Not serialized (scheduler-only state).
-    #[serde(skip)]
-    pub kv_page_size: u32,
     /// Arrival time for scheduler estimation (not serialized).
     #[serde(skip)]
     pub arrival_time: Option<Instant>,
@@ -346,6 +337,11 @@ pub struct BatchedForwardPassRequest {
 
     // Target group ID for Data Parallelism routing
     pub group_id: Option<usize>,
+
+    // Maximum sequential decode steps for multi-step decode.
+    // When >1, the Python backend loops internally.
+    #[serde(default = "default_one")]
+    pub max_decode_steps: u32,
 }
 
 impl BatchedForwardPassRequest {
@@ -376,6 +372,7 @@ impl BatchedForwardPassRequest {
             single_token_mode: true,
             trace_context: None,
             group_id: None,
+            max_decode_steps: 1,
         }
     }
 
@@ -456,6 +453,11 @@ impl BatchedForwardPassRequest {
         // Update inference mode hint
         if req.input_tokens.len() > 1 {
             self.single_token_mode = false;
+        }
+
+        // Propagate max_decode_steps (use max across batch)
+        if req.max_decode_steps > self.max_decode_steps {
+            self.max_decode_steps = req.max_decode_steps;
         }
     }
 
