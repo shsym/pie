@@ -136,6 +136,9 @@ def start_engine_and_backend(
 
         model_config = model_configs[0]
 
+        # Detect backend
+        backend = model_config.get("backend", "native")
+
         # Detect multi-GPU configuration
         device_value = model_config.get("device")
         world_size = len(device_value) if isinstance(device_value, list) else 1
@@ -156,9 +159,15 @@ def start_engine_and_backend(
                         f"Check CUDA_VISIBLE_DEVICES environment variable."
                     )
 
+        # Select the spawn function based on backend
+        _start_backend = (
+            _start_vllm_ffi_backend if backend == "vllm"
+            else _start_multi_gpu_ffi_backend
+        )
+
         if world_size > 1:
             # Multi-GPU FFI mode: spawn worker processes
-            backend_processes = _start_multi_gpu_ffi_backend(
+            backend_processes = _start_backend(
                 engine_config,
                 model_config,
                 server_config,
@@ -175,7 +184,7 @@ def start_engine_and_backend(
             status_update("Initializing single-GPU backend...")
 
             # Treat as multi-GPU with 1 device for unified code path
-            backend_processes = _start_multi_gpu_ffi_backend(
+            backend_processes = _start_backend(
                 engine_config,
                 model_config,
                 server_config,
@@ -238,6 +247,7 @@ def _build_backend_config(
         "max_adapter_rank": model_config.get("max_adapter_rank", 8),
         "adapter_path": model_config.get("adapter_path"),
         "gpu_mem_utilization": model_config.get("gpu_mem_utilization", 0.9),
+        "max_model_len": model_config.get("max_model_len"),
         "max_batch_size": model_config.get("max_batch_size", 128),
         "activation_dtype": model_config.get("activation_dtype", "bfloat16"),
         "weight_dtype": model_config.get("weight_dtype"),
@@ -251,6 +261,8 @@ def _build_backend_config(
         "random_seed": model_config.get("random_seed", 42),
         "use_cuda_graphs": model_config.get("use_cuda_graphs", False),
         "dummy_mode": model_config.get("dummy_mode", False),
+        "backend": model_config.get("backend", "native"),
+        "trust_remote_code": model_config.get("trust_remote_code", False),
     }
 
     # Add device with correct key
@@ -726,29 +738,309 @@ def _ipc_worker_body(
             dist.destroy_process_group()
 
 
-def _run_ipc_worker_loop(ipc_queue, runtime):
-    """Run the IPC worker loop for a group leader.
+def _start_vllm_ffi_backend(
+    engine_config: dict,
+    model_config: dict,
+    server_config,
+    authorized_users_path: str | None,
+    devices: list[str],
+    world_size: int,
+    console,
+    status_update: callable,
+    timeout: float,
+) -> list:
+    """Start vLLM-backed backend using Pie's IPC architecture.
 
-    This is similar to the FFI worker loop in server.py, but uses IPC for
-    cross-process communication. This allows each group leader to have its
-    own Python GIL, eliminating GIL contention between groups.
+    Same process topology as _start_multi_gpu_ffi_backend but spawns
+    PieVllmRuntime instead of native Runtime.
+
+    Args:
+        engine_config: Engine configuration dict
+        model_config: Model configuration dict
+        server_config: Rust server config
+        authorized_users_path: Path to authorized users file
+        devices: List of device strings
+        world_size: Total number of workers
+        console: Optional rich console
+        status_update: Status callback
+        timeout: Maximum time to wait for workers
+
+    Returns:
+        List where first element is ServerHandle, rest are worker processes
+    """
+    status_update(f"Initializing vLLM backend ({world_size} device(s))...")
+
+    import torch.multiprocessing as mp
+    from . import _pie
+
+    mp.set_start_method("spawn", force=True)
+
+    master_port = 29500 + random.randint(0, 1000)
+
+    full_config = _build_backend_config(
+        engine_config, model_config, authorized_users_path
+    )
+
+    # Determine Tensor Parallel degree and topology
+    tp_degree = model_config.get(
+        "tensor_parallel_size", engine_config.get("tensor_parallel_size")
+    )
+    if tp_degree is None:
+        tp_degree = world_size
+        if console:
+            console.print(
+                f"[yellow]![/yellow] tensor_parallel_size not set, defaulting to {tp_degree} (use all GPUs)"
+            )
+
+    group_topology = _calculate_topology(world_size, tp_degree)
+    num_groups = len(group_topology)
+
+    status_update(f"  Topology: {num_groups} group(s) (TP={tp_degree})")
+
+    # Phase 1: Start server and get IPC server names for ALL groups
+    partial_handle, ipc_server_names = _pie.start_server_phase1(
+        server_config, authorized_users_path, num_groups
+    )
+
+    # Create ready queue for workers to signal when they've connected to IPC
+    spawn_ctx = mp.get_context("spawn")
+    ready_queue = spawn_ctx.Queue()
+
+    # Create per-group TP queues for leader→follower signaling.
+    # Uses mp.Queue instead of NCCL broadcast_object_list to avoid the
+    # 600s NCCL idle timeout that kills both workers when the engine is idle.
+    tp_queues = None
+    if tp_degree > 1:
+        tp_queues = {
+            group_id: spawn_ctx.Queue()
+            for group_id in range(num_groups)
+        }
+
+    # Spawn ALL worker processes (ranks 0..world_size-1)
+    ctx = mp.spawn(
+        _vllm_worker_process,
+        args=(
+            world_size,
+            devices,
+            master_port,
+            full_config,
+            group_topology,
+            ipc_server_names,
+            ready_queue,
+            tp_queues,
+        ),
+        nprocs=world_size,
+        join=False,
+        start_method="spawn",
+        daemon=True,
+    )
+
+    # Wait for ALL workers to signal they've connected to IPC
+    connected_ranks = set()
+    start_wait = time.time()
+
+    while len(connected_ranks) < world_size:
+        # Check if processes are alive to catch early exits (e.g. OOM)
+        for p in ctx.processes:
+            if not p.is_alive():
+                exitcode = p.exitcode
+                if exitcode != 0:
+                    raise RuntimeError(
+                        f"vLLM worker process {p.pid} died unexpectedly with exit code {exitcode}"
+                    )
+
+        if time.time() - start_wait > timeout:
+            ready_queue.close()
+            ready_queue.join_thread()
+            raise TimeoutError(f"Timed out waiting for {world_size} vLLM workers to connect")
+
+        try:
+            rank = ready_queue.get(timeout=0.2)
+            connected_ranks.add(rank)
+            if console:
+                status_update(
+                    f"  vLLM worker {rank} ready ({len(connected_ranks)}/{world_size})"
+                )
+        except queue.Empty:
+            continue
+
+    # Clean up the ready_queue to prevent semaphore leak
+    ready_queue.close()
+    ready_queue.join_thread()
+
+    # Phase 2: Complete initialization (blocks until handshake succeeds)
+    server_handle = partial_handle.complete()
+
+    return [server_handle, ctx]
+
+
+def _vllm_worker_process(
+    local_rank: int,
+    world_size: int,
+    devices: list[str],
+    master_port: int,
+    config_dict: dict,
+    group_topology: list[list[int]],
+    ipc_server_names: list[str],
+    ready_queue,
+    tp_queues=None,
+):
+    """Worker process that creates PieVllmRuntime instead of native Runtime.
+
+    Same structure as _ipc_worker_process, but imports and instantiates
+    PieVllmRuntime for vLLM-backed inference.
+
+    Args:
+        local_rank: Rank of this worker (0 to world_size-1)
+        world_size: Total number of workers
+        devices: List of device strings
+        master_port: Port for torch.distributed rendezvous
+        config_dict: Runtime configuration
+        group_topology: List of groups, each containing ranks
+        ipc_server_names: IPC server names for each group
+        ready_queue: Queue to signal when ready
+        tp_queues: Per-group queues for TP leader→follower signaling
+    """
+    from pie import _pie
+    from pie_worker.vllm_runtime import PieVllmRuntime
+    from pie_worker.config import RuntimeConfig
+    import torch.distributed as dist
+    import torch
+
+    rank = local_rank
+
+    try:
+        # Determine my group and TP rank within it
+        my_group_id = 0
+        tp_rank = 0
+        for i, group in enumerate(group_topology):
+            if rank in group:
+                my_group_id = i
+                tp_rank = group.index(rank)
+                break
+
+        tp_degree = len(group_topology[my_group_id])
+    except Exception as e:
+        with open("/tmp/vllm_worker_startup_error.log", "w") as f:
+            import traceback
+            f.write(f"vLLM worker startup failed before dist init: {e}\n{traceback.format_exc()}")
+        raise
+
+    try:
+        # Skip PIE's distributed init for vLLM backend — vLLM handles its own
+        # NCCL init internally via Worker.init_device()
+        # Just set the CUDA device for this rank.
+        torch.cuda.set_device(devices[rank])
+
+        # vLLM manages its own process groups — skip PIE's setup
+        pg_map = {}
+        compute_pg_map = {}
+
+    except Exception as e:
+        with open("/tmp/vllm_worker_startup_error.log", "w") as f:
+            import traceback
+            f.write(f"vLLM worker startup failed during dist init: {e}\n{traceback.format_exc()}")
+        raise
+
+    try:
+        # Create runtime config
+        my_group_ranks = group_topology[my_group_id]
+        group_devices = [devices[r] for r in my_group_ranks]
+
+        filtered_config = {
+            k: v for k, v in config_dict.items() if k not in ("device", "devices")
+        }
+        config = RuntimeConfig.from_args(
+            **filtered_config,
+            devices=group_devices,
+            rank=tp_rank,
+            world_size=tp_degree,
+            tensor_parallel_size=tp_degree,
+            master_port=master_port,
+        )
+
+        # Resolve the TP queue for this group (if available).
+        tp_queue = tp_queues.get(my_group_id) if tp_queues else None
+
+        # Create vLLM runtime (loads model via vLLM's GPUWorker)
+        runtime = PieVllmRuntime(
+            config,
+            group_id=my_group_id,
+            process_groups=pg_map,
+            compute_process_groups=compute_pg_map,
+            group_topology=group_topology,
+            tp_queue=tp_queue,
+        )
+
+        # Sync all workers before connecting to server
+        if dist.is_initialized():
+            dist.barrier()
+    except Exception as e:
+        import traceback
+        msg = f"vLLM worker rank {rank} failed during runtime init: {e}\n{traceback.format_exc()}"
+        print(msg, file=sys.stderr, flush=True)
+        with open(f"/tmp/vllm_worker_rank{rank}_error.log", "w") as f:
+            f.write(msg)
+        raise
+
+    # Check if I'm a group leader (first rank in my TP group)
+    is_group_leader = tp_rank == 0
+
+    try:
+        if is_group_leader:
+            # Group leader: connect to IPC and handle requests
+            server_name = ipc_server_names[my_group_id]
+            ipc_queue = _pie.FfiIpcQueue.connect(server_name, my_group_id)
+
+            # Signal that we're connected and ready
+            ready_queue.put(rank)
+
+            # Run IPC worker loop (handles requests from Rust server)
+            _run_ipc_worker_loop(ipc_queue, runtime)
+        else:
+            # Non-leader: signal ready, then run worker loop waiting for commands from leader
+            ready_queue.put(rank)
+            runtime.worker_loop()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_ipc_worker_loop(ipc_queue, runtime):
+    """Step-level GPU scheduler with Python-side continuations.
+
+    Replaces the synchronous poll→fire_batch→respond loop with a step-level
+    scheduler that:
+      1. Drains the IPC queue between every GPU step
+      2. Merges new fire_batch arrivals with ongoing continuations
+      3. Executes one GPU step via ThreadPoolExecutor
+      4. Responds only when all N steps complete for a request group
+
+    For multi-step requests (max_decode_steps > 1), Python loops internally
+    instead of round-tripping through Rust for each step.  This eliminates
+    the batch fragmentation at c=16 where 16 requests split into 2 groups
+    of 8 that alternate on the GPU.
 
     Args:
         ipc_queue: FfiIpcQueue instance connected to Rust
-        runtime: Runtime instance to dispatch calls to
+        runtime: Runtime instance (PieVllmRuntime) to dispatch calls to
     """
     import msgpack
-    from pie_worker.server import (
-        STATUS_OK,
-        STATUS_METHOD_NOT_FOUND,
-        STATUS_INTERNAL_ERROR,
-    )
+    import time as _time
+    from dataclasses import dataclass, field
+    from concurrent.futures import ThreadPoolExecutor
 
-    # Method dispatch table
+    import numpy as np
+
+    from pie_worker.vllm_runtime import PieVllmRuntime, DecodedBatchArrays
+    from pie_worker.vllm_batch_translator import PieVllmBatchTranslator
+    from pie_worker.batch_merger import compute_batch_generate_counts
+
+    # Non-fire_batch RPC dispatch
     methods = {
         "handshake": runtime.handshake_rpc,
         "query": runtime.query_rpc,
-        "fire_batch": runtime.fire_batch,
+        "format_chat": runtime.format_chat_rpc,
         "embed_image": runtime.embed_image_rpc,
         "initialize_adapter": runtime.initialize_adapter_rpc,
         "update_adapter": runtime.update_adapter_rpc,
@@ -756,73 +1048,561 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
         "download_adapter": runtime.download_adapter_rpc,
     }
 
+    _ipc_timing = os.environ.get("PIE_IPC_TIMING", "")
+    _batching_debug = os.environ.get("PIE_BATCH_DEBUG", "")
+
+    # --- Data structures for continuation tracking ---
+
+    @dataclass
+    class PendingRequest:
+        """A fire_batch RPC waiting to be processed."""
+        pycrust_request_id: int
+        kwargs: dict
+        num_requests: int
+        max_decode_steps: int
+        generate_count: int  # non-flush requests
+
+    @dataclass
+    class ActiveGroup:
+        """A group of requests being stepped through the continuation loop."""
+        # Mutable per-step arrays
+        token_ids: np.ndarray          # current step's input tokens
+        kv_last_page_lens: np.ndarray  # KV page fill levels
+        seq_lens: np.ndarray           # total sequence lengths
+        # Immutable across steps (shared references)
+        kv_page_indices: np.ndarray
+        kv_page_indptr: np.ndarray
+        sampling_params_list: list
+        adapter_indices: list
+        kwargs: dict                   # original kwargs (for sampler_types etc.)
+        # Accumulation state
+        accumulated_tokens: list       # [list[int]] per request
+        accumulated_dists: list        # [list] per request
+        remaining_steps: int
+        # Back-reference for response routing
+        pending: PendingRequest
+
+    # --- State ---
     shutdown_requested = False
     poll_timeout_ms = 100
     parent_pid = os.getppid()
-    check_parent_every = 10  # Check parent alive every N poll cycles
-    poll_count = 0
+    check_parent_every = 100
+    loop_count = 0
 
-    try:
-        while not shutdown_requested:
-            # Check if parent process is still alive periodically
-            poll_count += 1
-            if poll_count % check_parent_every == 0:
-                try:
-                    os.kill(parent_pid, 0)  # Doesn't kill, just checks existence
-                except OSError:
-                    # Parent process has exited, we should exit too
-                    break
+    pending_new: list[PendingRequest] = []
+    active_groups: list[ActiveGroup] = []
+    gpu_future = None
+    current_slices = None  # [(group_ref, start_idx, count)] from last merge
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pie-gpu")
 
+    def _drain_queue():
+        """Non-blocking drain of all pending IPC requests."""
+        nonlocal shutdown_requested
+        while True:
             try:
-                # Poll the IPC queue (releases GIL while waiting)
-                request = ipc_queue.poll_blocking(poll_timeout_ms)
-                if request is None:
-                    continue  # Timeout, try again
+                request = ipc_queue.poll_blocking(0)
             except Exception:
-                # IPC queue may be closed when server shuts down
-                break
-
+                shutdown_requested = True
+                return
+            if request is None:
+                return
             request_id, method, payload = request
-
             try:
-                # Unpack args
                 args = msgpack.unpackb(payload)
-
-                # Check for shutdown
                 if method == "shutdown":
                     shutdown_requested = True
-                    response = msgpack.packb(None)
-                    ipc_queue.respond(request_id, response)
+                    ipc_queue.respond(request_id, msgpack.packb(None))
+                    return
+                if method == "fire_batch":
+                    num_reqs = len(PieVllmBatchTranslator.decode_binary_array(
+                        args["qo_indptr"], np.uint32)) - 1
+                    mds = args.get("max_decode_steps", 1)
+                    gc = compute_batch_generate_counts([args])[0]
+                    pending_new.append(PendingRequest(
+                        pycrust_request_id=request_id,
+                        kwargs=args,
+                        num_requests=num_reqs,
+                        max_decode_steps=mds,
+                        generate_count=gc,
+                    ))
+                    if _batching_debug:
+                        print(f"[BATCH-ACC] req_id={request_id} reqs={num_reqs} "
+                              f"mds={mds} pending_new={len(pending_new)} "
+                              f"active={len(active_groups)}",
+                              file=sys.stderr, flush=True)
                     continue
-
-                # Get handler
+                # Non-fire_batch: handle immediately
                 fn = methods.get(method)
                 if fn is None:
-                    response = msgpack.packb(f"Method not found: {method}")
-                    ipc_queue.respond(request_id, response)
+                    ipc_queue.respond(request_id, msgpack.packb(f"Method not found: {method}"))
                     continue
-
-                # Call handler
                 if isinstance(args, dict):
                     result = fn(**args)
                 elif isinstance(args, (list, tuple)):
                     result = fn(*args)
                 else:
                     result = fn(args)
-
-                # Pack and respond
-                response = msgpack.packb(result)
-                ipc_queue.respond(request_id, response)
-
+                ipc_queue.respond(request_id, msgpack.packb(result))
             except Exception as e:
                 import traceback
+                print(f"[IPC Worker Error] {method}: {e}\n{traceback.format_exc()}")
+                ipc_queue.respond(request_id, msgpack.packb(str(e)))
 
-                tb = traceback.format_exc()
-                print(f"[IPC Worker Error] {method}: {e}\n{tb}")
-                response = msgpack.packb(str(e))
-                ipc_queue.respond(request_id, response)
+    def _build_merged_arrays():
+        """Merge active continuations + new arrivals into one batch.
+
+        Returns (merged_arrays: DecodedBatchArrays, merged_kwargs: dict,
+                 slices: list[(ref, start, count)]).
+        """
+        all_token_ids = []
+        all_kv_page_indices = []
+        all_kv_page_indptr_diffs = []
+        all_kv_last_page_lens = []
+        all_sampling_params = []
+        all_adapter_indices = []
+        slices = []
+        idx = 0
+
+        # Active continuations (already decoded numpy arrays)
+        for grp in active_groups:
+            n = grp.pending.num_requests
+            all_token_ids.append(grp.token_ids)
+            all_kv_page_indices.append(grp.kv_page_indices)
+            all_kv_page_indptr_diffs.append(np.diff(grp.kv_page_indptr))
+            all_kv_last_page_lens.append(grp.kv_last_page_lens)
+            all_sampling_params.extend(grp.sampling_params_list)
+            all_adapter_indices.extend(grp.adapter_indices)
+            slices.append((grp, idx, n))
+            idx += n
+
+        # New arrivals (need decoding)
+        for pend in pending_new:
+            arrays = PieVllmRuntime.decode_batch_arrays(pend.kwargs, runtime.kv_page_size)
+            n = arrays.num_requests
+            all_token_ids.append(arrays.token_ids)
+            all_kv_page_indices.append(arrays.kv_page_indices)
+            all_kv_page_indptr_diffs.append(np.diff(arrays.kv_page_indptr))
+            all_kv_last_page_lens.append(arrays.kv_last_page_lens)
+            all_sampling_params.extend(arrays.sampling_params_list)
+            all_adapter_indices.extend(arrays.adapter_indices)
+            slices.append((pend, idx, n))
+            idx += n
+
+        # Build merged arrays
+        merged_token_ids = np.concatenate(all_token_ids)
+        merged_kv_page_indices = np.concatenate(all_kv_page_indices)
+        merged_kv_last_page_lens = np.concatenate(all_kv_last_page_lens)
+
+        kv_diffs = np.concatenate(all_kv_page_indptr_diffs)
+        merged_kv_page_indptr = np.empty(len(kv_diffs) + 1, dtype=np.int32)
+        merged_kv_page_indptr[0] = 0
+        np.cumsum(kv_diffs, out=merged_kv_page_indptr[1:])
+
+        # For decode steps: 1 token per request
+        merged_qo_indptr = np.arange(idx + 1, dtype=np.int32)
+
+        tokens_per_req = [1] * idx
+        blocks_per_req = PieVllmBatchTranslator.pages_to_blocks(
+            merged_kv_page_indices, merged_kv_page_indptr
+        )
+        seq_lens = PieVllmBatchTranslator.compute_seq_lens(
+            merged_kv_page_indptr, merged_kv_last_page_lens, runtime.kv_page_size
+        )
+
+        merged_arrays = DecodedBatchArrays(
+            token_ids=merged_token_ids,
+            qo_indptr=merged_qo_indptr,
+            kv_page_indices=merged_kv_page_indices,
+            kv_page_indptr=merged_kv_page_indptr,
+            kv_last_page_lens=merged_kv_last_page_lens,
+            num_requests=idx,
+            tokens_per_req=tokens_per_req,
+            blocks_per_req=blocks_per_req,
+            seq_lens=seq_lens,
+            sampling_params_list=all_sampling_params,
+            adapter_indices=all_adapter_indices,
+        )
+
+        # Build merged kwargs for prepare_step (needs sampler_types, masks, etc.)
+        # Use first available kwargs as base, override arrays
+        base_kwargs = (active_groups[0].kwargs if active_groups
+                       else pending_new[0].kwargs)
+        merged_kwargs = dict(base_kwargs)
+        merged_kwargs["single_token_mode"] = True
+        merged_kwargs["flattened_masks"] = b""
+        merged_kwargs["mask_indptr"] = b""
+        # Rebuild sampler SoA arrays from merged sampling_params
+        # (prepare_step reads these from kwargs for multi-position logits)
+        rns_parts = []
+        st_parts = []
+        for grp in active_groups:
+            rns_parts.append(PieVllmBatchTranslator.decode_binary_array(
+                grp.kwargs.get("request_num_samplers", b""), np.uint32))
+            st_parts.append(PieVllmBatchTranslator.decode_binary_array(
+                grp.kwargs.get("sampler_types", b""), np.uint32))
+        for pend in pending_new:
+            rns_parts.append(PieVllmBatchTranslator.decode_binary_array(
+                pend.kwargs.get("request_num_samplers", b""), np.uint32))
+            st_parts.append(PieVllmBatchTranslator.decode_binary_array(
+                pend.kwargs.get("sampler_types", b""), np.uint32))
+        if rns_parts:
+            merged_kwargs["request_num_samplers"] = np.concatenate(rns_parts).tobytes()
+        if st_parts:
+            merged_kwargs["sampler_types"] = np.concatenate(st_parts).tobytes()
+        # Concatenate sampler parameter arrays
+        for key in ("sampler_temperatures", "sampler_top_k", "sampler_top_p", "sampler_min_p"):
+            parts = []
+            for grp in active_groups:
+                parts.append(PieVllmBatchTranslator.decode_binary_array(
+                    grp.kwargs.get(key, b""), np.float32 if "temperature" in key or "top_p" in key or "min_p" in key else np.uint32))
+            for pend in pending_new:
+                parts.append(PieVllmBatchTranslator.decode_binary_array(
+                    pend.kwargs.get(key, b""), np.float32 if "temperature" in key or "top_p" in key or "min_p" in key else np.uint32))
+            if parts:
+                merged_kwargs[key] = np.concatenate(parts).tobytes()
+
+        return merged_arrays, merged_kwargs, slices
+
+    def _collect_and_advance(model_output):
+        """After GPU step: extract tokens, advance continuations, retire finished."""
+        nonlocal active_groups, current_slices
+
+        sampled_tokens = runtime.extract_sampled_tokens(model_output)
+
+        # Check if any group needs distribution capture
+        has_dists = False
+        for ref, start, count in current_slices:
+            kw = ref.kwargs if isinstance(ref, ActiveGroup) else ref.kwargs
+            st = PieVllmBatchTranslator.decode_binary_array(
+                kw.get("sampler_types", b""), np.uint32)
+            if len(st) > 0 and np.any(st == 0):
+                has_dists = True
+                break
+
+        # If distributions needed, run full packaging for this step
+        step_results = None
+        if has_dists:
+            # Build kwargs for _package_response from the merged batch
+            total_reqs = sum(count for _, _, count in current_slices)
+            merged_kwargs = active_groups[0].kwargs if active_groups else pending_new[0].kwargs
+            step_results = runtime._package_response(
+                model_output, merged_kwargs, total_reqs)
+
+        continuing = []
+        retired = []
+
+        for ref, start, count in current_slices:
+            group_tokens = sampled_tokens[start:start + count]
+
+            if isinstance(ref, ActiveGroup):
+                # Existing continuation
+                grp = ref
+                for i, token in enumerate(group_tokens):
+                    grp.accumulated_tokens[i].append(token)
+                if has_dists and step_results:
+                    for i in range(count):
+                        if start + i < len(step_results):
+                            grp.accumulated_dists[i].extend(step_results[start + i].get("dists", []))
+                grp.remaining_steps -= 1
+            else:
+                # New arrival's first step — create ActiveGroup
+                pend = ref
+                arrays = PieVllmRuntime.decode_batch_arrays(pend.kwargs, runtime.kv_page_size)
+                grp = ActiveGroup(
+                    token_ids=arrays.token_ids,  # will be updated below
+                    kv_last_page_lens=arrays.kv_last_page_lens.copy(),
+                    seq_lens=arrays.seq_lens.copy(),
+                    kv_page_indices=arrays.kv_page_indices,
+                    kv_page_indptr=arrays.kv_page_indptr,
+                    sampling_params_list=arrays.sampling_params_list,
+                    adapter_indices=arrays.adapter_indices,
+                    kwargs=pend.kwargs,
+                    accumulated_tokens=[[t] for t in group_tokens],
+                    accumulated_dists=[[] for _ in range(count)],
+                    remaining_steps=pend.max_decode_steps - 1,
+                    pending=pend,
+                )
+                if has_dists and step_results:
+                    for i in range(count):
+                        if start + i < len(step_results):
+                            grp.accumulated_dists[i].extend(step_results[start + i].get("dists", []))
+
+            if grp.remaining_steps <= 0:
+                retired.append(grp)
+            else:
+                # Update arrays for next step (replicates model.rs:855-868)
+                grp.token_ids = np.array(group_tokens, dtype=np.int64)
+                grp.kv_last_page_lens = grp.kv_last_page_lens + 1
+                overflow = grp.kv_last_page_lens > runtime.kv_page_size
+                grp.kv_last_page_lens[overflow] = 1
+                grp.seq_lens = grp.seq_lens + 1
+                continuing.append(grp)
+
+        active_groups = continuing
+        return retired
+
+    def _respond_retired(retired_groups):
+        """Send accumulated multi-token responses for finished groups."""
+        for grp in retired_groups:
+            results = []
+            for i in range(grp.pending.num_requests):
+                # Only include results for generate (non-flush) requests
+                rns = PieVllmBatchTranslator.decode_binary_array(
+                    grp.kwargs.get("request_num_samplers", b""), np.uint32)
+                if i < len(rns) and rns[i] == 0:
+                    continue  # flush request — skip
+                tokens = grp.accumulated_tokens[i] if i < len(grp.accumulated_tokens) else []
+                dists = grp.accumulated_dists[i] if i < len(grp.accumulated_dists) else []
+                results.append({"tokens": tokens, "dists": dists})
+
+            response = {"results": results, "metrics": {
+                "batch_size": grp.pending.num_requests,
+                "continuation_steps": len(grp.accumulated_tokens[0]) if grp.accumulated_tokens else 0,
+            }}
+
+            if _batching_debug:
+                print(f"[BATCH-RETIRE] req_id={grp.pending.pycrust_request_id} "
+                      f"reqs={grp.pending.num_requests} "
+                      f"tokens_per_req={len(grp.accumulated_tokens[0]) if grp.accumulated_tokens else 0}",
+                      file=sys.stderr, flush=True)
+
+            ipc_queue.respond(grp.pending.pycrust_request_id,
+                              msgpack.packb(response))
+
+    def _fire_step():
+        """Merge active + pending into one batch and submit to GPU."""
+        nonlocal active_groups, pending_new, gpu_future, current_slices
+
+        # Check if all requests are single-step (fast path)
+        all_single = (not active_groups and
+                      all(p.max_decode_steps <= 1 for p in pending_new))
+
+        if all_single and len(pending_new) == 1:
+            # Single fire_batch, single step — use original fire_batch directly
+            pend = pending_new.pop()
+            current_slices = [(pend, 0, pend.num_requests)]
+
+            def _run():
+                return runtime.fire_batch(**pend.kwargs)
+
+            gpu_future = executor.submit(_run)
+            return
+
+        if all_single and len(pending_new) > 1:
+            # Multiple single-step fire_batches — merge kwargs and fire_batch
+            from pie_worker.batch_merger import merge_fire_batch_kwargs
+            kwargs_list = [p.kwargs for p in pending_new]
+            merged = merge_fire_batch_kwargs(kwargs_list)
+            current_slices = []
+            idx = 0
+            for p in pending_new:
+                current_slices.append((p, idx, p.num_requests))
+                idx += p.num_requests
+            pending_new = []
+
+            def _run():
+                return runtime.fire_batch(**merged)
+
+            gpu_future = executor.submit(_run)
+            return
+
+        # Multi-step path: build merged arrays and run one GPU step
+        merged_arrays, merged_kwargs, current_slices = _build_merged_arrays()
+        active_groups = []
+        pending_new = []
+
+        total_reqs = merged_arrays.num_requests
+        if _batching_debug:
+            n_active = sum(1 for ref, _, _ in current_slices if isinstance(ref, ActiveGroup))
+            n_new = sum(1 for ref, _, _ in current_slices if isinstance(ref, PendingRequest))
+            print(f"[BATCH-STEP] reqs={total_reqs} active_groups={n_active} "
+                  f"new_groups={n_new}",
+                  file=sys.stderr, flush=True)
+
+        import torch
+
+        @torch.inference_mode()
+        def _run_step():
+            scheduler_output = runtime.prepare_step(merged_arrays, merged_kwargs)
+            model_output = runtime.execute_step(scheduler_output)
+            return model_output
+
+        gpu_future = executor.submit(_run_step)
+
+    def _handle_single_step_completion():
+        """Handle completion of single-step fire_batch (fast path)."""
+        nonlocal gpu_future, current_slices
+
+        try:
+            result = gpu_future.result()
+        except Exception as e:
+            import traceback
+            print(f"[BATCH-ERROR] fire_batch failed: {e}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
+            for ref, _, _ in current_slices:
+                if isinstance(ref, PendingRequest):
+                    ipc_queue.respond(ref.pycrust_request_id,
+                                      msgpack.packb(str(e)))
+            gpu_future = None
+            current_slices = None
+            return
+
+        # Single-step results — respond immediately
+        if len(current_slices) == 1:
+            ref, _, _ = current_slices[0]
+            ipc_queue.respond(ref.pycrust_request_id, msgpack.packb(result))
+        else:
+            # Multiple merged single-step batches — split results
+            from pie_worker.batch_merger import split_fire_batch_results
+            gen_counts = [ref.generate_count for ref, _, _ in current_slices]
+            responses = split_fire_batch_results(result, gen_counts)
+            for (ref, _, _), resp in zip(current_slices, responses):
+                ipc_queue.respond(ref.pycrust_request_id, msgpack.packb(resp))
+
+        gpu_future = None
+        current_slices = None
+
+    def _handle_multistep_completion():
+        """Handle completion of a multi-step GPU step."""
+        nonlocal gpu_future, current_slices
+
+        try:
+            model_output = gpu_future.result()
+        except Exception as e:
+            import traceback
+            print(f"[BATCH-ERROR] execute_step failed: {e}\n{traceback.format_exc()}",
+                  file=sys.stderr, flush=True)
+            # Respond with error to all groups
+            for ref, _, _ in current_slices:
+                pend = ref.pending if isinstance(ref, ActiveGroup) else ref
+                ipc_queue.respond(pend.pycrust_request_id,
+                                  msgpack.packb(str(e)))
+            gpu_future = None
+            current_slices = None
+            active_groups.clear()
+            return
+
+        retired = _collect_and_advance(model_output)
+        _respond_retired(retired)
+
+        gpu_future = None
+        # current_slices consumed by _collect_and_advance
+
+    def _is_multistep_batch():
+        """Check if current batch is a multi-step batch (vs single-step fast path)."""
+        if current_slices is None:
+            return False
+        return any(isinstance(ref, ActiveGroup) for ref, _, _ in current_slices) or \
+               any(isinstance(ref, PendingRequest) and ref.max_decode_steps > 1
+                   for ref, _, _ in current_slices)
+
+    # --- Main loop ---
+    try:
+        while not shutdown_requested:
+            loop_count += 1
+            if loop_count % check_parent_every == 0:
+                try:
+                    os.kill(parent_pid, 0)
+                except OSError:
+                    break
+
+            # 1. DRAIN
+            _drain_queue()
+            if shutdown_requested:
+                break
+
+            # 2. COLLECT — GPU done?
+            if gpu_future is not None and gpu_future.done():
+                if _is_multistep_batch():
+                    _handle_multistep_completion()
+                else:
+                    _handle_single_step_completion()
+
+            # 3. MERGE + FIRE — if GPU idle and work pending
+            if gpu_future is None and (active_groups or pending_new):
+                _fire_step()
+                continue  # drain again immediately
+
+            # 4. WAIT
+            if gpu_future is not None:
+                try:
+                    request = ipc_queue.poll_blocking(1)
+                except Exception:
+                    break
+                if request is not None:
+                    # Re-inject into drain
+                    request_id, method, payload = request
+                    try:
+                        args = msgpack.unpackb(payload)
+                        if method == "fire_batch":
+                            num_reqs = len(PieVllmBatchTranslator.decode_binary_array(
+                                args["qo_indptr"], np.uint32)) - 1
+                            mds = args.get("max_decode_steps", 1)
+                            gc = compute_batch_generate_counts([args])[0]
+                            pending_new.append(PendingRequest(
+                                pycrust_request_id=request_id,
+                                kwargs=args,
+                                num_requests=num_reqs,
+                                max_decode_steps=mds,
+                                generate_count=gc,
+                            ))
+                        elif method == "shutdown":
+                            shutdown_requested = True
+                            ipc_queue.respond(request_id, msgpack.packb(None))
+                        else:
+                            fn = methods.get(method)
+                            if fn:
+                                if isinstance(args, dict):
+                                    result = fn(**args)
+                                elif isinstance(args, (list, tuple)):
+                                    result = fn(*args)
+                                else:
+                                    result = fn(args)
+                                ipc_queue.respond(request_id, msgpack.packb(result))
+                    except Exception as e:
+                        import traceback
+                        print(f"[IPC Worker Error] {method}: {e}\n{traceback.format_exc()}")
+                        ipc_queue.respond(request_id, msgpack.packb(str(e)))
+            elif not pending_new and not active_groups:
+                try:
+                    request = ipc_queue.poll_blocking(poll_timeout_ms)
+                except Exception:
+                    break
+                if request is not None:
+                    request_id, method, payload = request
+                    try:
+                        args = msgpack.unpackb(payload)
+                        if method == "fire_batch":
+                            num_reqs = len(PieVllmBatchTranslator.decode_binary_array(
+                                args["qo_indptr"], np.uint32)) - 1
+                            mds = args.get("max_decode_steps", 1)
+                            gc = compute_batch_generate_counts([args])[0]
+                            pending_new.append(PendingRequest(
+                                pycrust_request_id=request_id,
+                                kwargs=args,
+                                num_requests=num_reqs,
+                                max_decode_steps=mds,
+                                generate_count=gc,
+                            ))
+                        elif method == "shutdown":
+                            shutdown_requested = True
+                            ipc_queue.respond(request_id, msgpack.packb(None))
+                        else:
+                            fn = methods.get(method)
+                            if fn:
+                                if isinstance(args, dict):
+                                    result = fn(**args)
+                                elif isinstance(args, (list, tuple)):
+                                    result = fn(*args)
+                                else:
+                                    result = fn(args)
+                                ipc_queue.respond(request_id, msgpack.packb(result))
+                    except Exception as e:
+                        import traceback
+                        print(f"[IPC Worker Error] {method}: {e}\n{traceback.format_exc()}")
+                        ipc_queue.respond(request_id, msgpack.packb(str(e)))
     finally:
-        # Ensure cleanup when loop stops
+        executor.shutdown(wait=False)
         runtime.shutdown()
 
 
