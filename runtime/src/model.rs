@@ -656,7 +656,14 @@ impl Model {
                     sched.should_fire(group_id, batch_len, total_tok, max_batch_size, max_batch_tokens, in_flight)
                 };
 
-                if should_fire && in_flight < max_in_flight_batches {
+                // Always forward batches with new requests (Python merges them
+                // into the current GPU step). Only limit in-flight for
+                // continuation-only batches to avoid redundant RPCs.
+                let can_fire = should_fire && (
+                    group_has_new_requests[group_id] || in_flight < max_in_flight_batches
+                );
+
+                if can_fire {
                     // Fire!
                     let batch_to_fire = std::mem::take(&mut batches[group_id]);
                     group_tokens[group_id] = 0;
