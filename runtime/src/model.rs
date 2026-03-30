@@ -844,9 +844,17 @@ impl Model {
                     let resp = resp_iter.next();
 
                     if fp_req.max_decode_steps > 1 || !fp_req.multi_step_tokens.is_empty() {
-                        // Multi-step: accumulate token, re-enqueue or finish.
+                        // Multi-step: accumulate token(s), re-enqueue or finish.
                         if let Some(ref r) = resp {
-                            if let Some(&token) = r.tokens.first() {
+                            if r.tokens.len() > 1 {
+                                // Python handled all steps — bulk-accept all tokens.
+                                // Python-side continuations return N tokens per request
+                                // when it loops execute_model internally.
+                                fp_req.multi_step_tokens.extend(&r.tokens);
+                                fp_req.max_decode_steps = 0;
+                                // Fall through to Done path below
+                            } else if let Some(&token) = r.tokens.first() {
+                                // Single token — original Rust-side continuation path.
                                 fp_req.multi_step_tokens.push(token);
                                 fp_req.max_decode_steps -= 1;
 
@@ -876,11 +884,13 @@ impl Model {
                                 }
                             }
                         }
-                        // Done: send accumulated tokens
+                        // Done: send accumulated tokens + distributions.
+                        // Pass through dists from Python (may contain per-step
+                        // distributions when return_distributions is true).
                         if let Some(tx) = resp_tx {
                             tx.send(ForwardPassResponse {
                                 tokens: fp_req.multi_step_tokens,
-                                dists: vec![],
+                                dists: resp.map(|r| r.dists).unwrap_or_default(),
                             }).ok();
                         }
                     } else {
