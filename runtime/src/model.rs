@@ -484,6 +484,11 @@ impl Model {
         let mut prof_batches_fired: Vec<usize> = vec![0; num_groups];
         let mut prof_last_report = Instant::now();
 
+        // Track whether each group's pending batch contains new (non-continuation) requests.
+        // When a batch has ONLY continuations, skip the coalesce window since there's
+        // no benefit in waiting for more arrivals — the continuations are already ready.
+        let mut group_has_new_requests: Vec<bool> = vec![false; num_groups];
+
         loop {
             // Process any completed batches (non-blocking) - from any group
             while let Ok((batch_size, tokens_in_batch, latency, group_id)) = completion_rx.try_recv() {
@@ -557,6 +562,7 @@ impl Model {
                                 }
                                 group_tokens[group_id] += req.input_tokens.len();
                                 batches[group_id].push((req, tx));
+                                group_has_new_requests[group_id] = true;
                                 prof_requests_received[group_id] += 1;
                             }
                             None => break,
@@ -577,15 +583,17 @@ impl Model {
             {
                 const COALESCE_WINDOW: Duration = Duration::from_millis(2);
 
-                // Compute coalesce deadline. Skip coalesce when a group has
-                // in-flight batches (pipeline active) — fire immediately to
-                // keep GPU busy. When pipeline is empty, coalesce to batch
-                // multiple continuations together (important at c>1).
+                // Compute coalesce deadline. Skip coalesce when:
+                // - A group has in-flight batches (pipeline active)
+                // - A group's batch has ONLY continuations (no new requests to wait for)
+                // When pipeline is empty AND new requests are pending, coalesce to
+                // batch multiple arrivals together.
                 let deadline = {
                     (0..num_groups)
                         .filter(|&gid| {
                             batches[gid].len() > 0
                                 && in_flight_counts[gid] == 0
+                                && group_has_new_requests[gid]
                                 && batches[gid].len() < max_batch_size
                                 && group_tokens[gid] < max_batch_tokens
                         })
@@ -652,6 +660,7 @@ impl Model {
                     // Fire!
                     let batch_to_fire = std::mem::take(&mut batches[group_id]);
                     group_tokens[group_id] = 0;
+                    group_has_new_requests[group_id] = false;
                     in_flight_counts[group_id] += 1;
                     fired_any = true;
                     prof_batches_fired[group_id] += 1;
