@@ -1028,8 +1028,6 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
     import msgpack
     import time as _time
     from dataclasses import dataclass, field
-    from concurrent.futures import ThreadPoolExecutor
-
     import numpy as np
 
     from pie_worker.vllm_runtime import PieVllmRuntime, DecodedBatchArrays
@@ -1091,9 +1089,12 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
 
     pending_new: list[PendingRequest] = []
     active_groups: list[ActiveGroup] = []
-    gpu_future = None
+    # GPU step result: None means idle, _SENTINEL means error was handled,
+    # otherwise holds the result from the last fire_batch/execute_step.
+    # Runs synchronously on the main thread to avoid CUDA thread-safety issues.
+    gpu_result = None
+    gpu_error = None  # Exception from last step, if any
     current_slices = None  # [(group_ref, start_idx, count)] from last merge
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pie-gpu")
 
     def _drain_queue():
         """Non-blocking drain of all pending IPC requests."""
@@ -1370,8 +1371,15 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                               msgpack.packb(response))
 
     def _fire_step():
-        """Merge active + pending into one batch and submit to GPU."""
-        nonlocal active_groups, pending_new, gpu_future, current_slices
+        """Merge active + pending into one batch and run on GPU (main thread).
+
+        Runs synchronously on the main thread to ensure CUDA context safety.
+        vLLM's model runner initializes CUDA on the main thread, and GPU ops
+        from other threads cause segfaults.
+        """
+        nonlocal active_groups, pending_new, gpu_result, gpu_error, current_slices
+
+        gpu_error = None
 
         # Check if all requests are single-step (fast path)
         all_single = (not active_groups and
@@ -1381,11 +1389,10 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
             # Single fire_batch, single step — use original fire_batch directly
             pend = pending_new.pop()
             current_slices = [(pend, 0, pend.num_requests)]
-
-            def _run():
-                return runtime.fire_batch(**pend.kwargs)
-
-            gpu_future = executor.submit(_run)
+            try:
+                gpu_result = runtime.fire_batch(**pend.kwargs)
+            except Exception as e:
+                gpu_error = e
             return
 
         if all_single and len(pending_new) > 1:
@@ -1399,11 +1406,10 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                 current_slices.append((p, idx, p.num_requests))
                 idx += p.num_requests
             pending_new = []
-
-            def _run():
-                return runtime.fire_batch(**merged)
-
-            gpu_future = executor.submit(_run)
+            try:
+                gpu_result = runtime.fire_batch(**merged)
+            except Exception as e:
+                gpu_error = e
             return
 
         # Multi-step path: build merged arrays and run one GPU step
@@ -1420,32 +1426,31 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                   file=sys.stderr, flush=True)
 
         import torch
-
-        @torch.inference_mode()
-        def _run_step():
-            scheduler_output = runtime.prepare_step(merged_arrays, merged_kwargs)
-            model_output = runtime.execute_step(scheduler_output)
-            return model_output
-
-        gpu_future = executor.submit(_run_step)
+        try:
+            with torch.inference_mode():
+                scheduler_output = runtime.prepare_step(merged_arrays, merged_kwargs)
+                gpu_result = runtime.execute_step(scheduler_output)
+        except Exception as e:
+            gpu_error = e
 
     def _handle_single_step_completion():
         """Handle completion of single-step fire_batch (fast path)."""
-        nonlocal gpu_future, current_slices
+        nonlocal gpu_result, gpu_error, current_slices
 
-        try:
-            result = gpu_future.result()
-        except Exception as e:
+        if gpu_error is not None:
             import traceback
-            print(f"[BATCH-ERROR] fire_batch failed: {e}\n{traceback.format_exc()}",
+            print(f"[BATCH-ERROR] fire_batch failed: {gpu_error}\n{traceback.format_exc()}",
                   file=sys.stderr, flush=True)
             for ref, _, _ in current_slices:
                 if isinstance(ref, PendingRequest):
                     ipc_queue.respond(ref.pycrust_request_id,
-                                      msgpack.packb(str(e)))
-            gpu_future = None
+                                      msgpack.packb(str(gpu_error)))
+            gpu_result = None
+            gpu_error = None
             current_slices = None
             return
+
+        result = gpu_result
 
         # Single-step results — respond immediately
         if len(current_slices) == 1:
@@ -1459,33 +1464,32 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
             for (ref, _, _), resp in zip(current_slices, responses):
                 ipc_queue.respond(ref.pycrust_request_id, msgpack.packb(resp))
 
-        gpu_future = None
+        gpu_result = None
         current_slices = None
 
     def _handle_multistep_completion():
         """Handle completion of a multi-step GPU step."""
-        nonlocal gpu_future, current_slices
+        nonlocal gpu_result, gpu_error, current_slices
 
-        try:
-            model_output = gpu_future.result()
-        except Exception as e:
+        if gpu_error is not None:
             import traceback
-            print(f"[BATCH-ERROR] execute_step failed: {e}\n{traceback.format_exc()}",
+            print(f"[BATCH-ERROR] execute_step failed: {gpu_error}\n{traceback.format_exc()}",
                   file=sys.stderr, flush=True)
             # Respond with error to all groups
             for ref, _, _ in current_slices:
                 pend = ref.pending if isinstance(ref, ActiveGroup) else ref
                 ipc_queue.respond(pend.pycrust_request_id,
-                                  msgpack.packb(str(e)))
-            gpu_future = None
+                                  msgpack.packb(str(gpu_error)))
+            gpu_result = None
+            gpu_error = None
             current_slices = None
             active_groups.clear()
             return
 
-        retired = _collect_and_advance(model_output)
+        retired = _collect_and_advance(gpu_result)
         _respond_retired(retired)
 
-        gpu_future = None
+        gpu_result = None
         # current_slices consumed by _collect_and_advance
 
     def _is_multistep_batch():
@@ -1497,6 +1501,11 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                    for ref, _, _ in current_slices)
 
     # --- Main loop ---
+    # With synchronous GPU execution on the main thread, the loop is:
+    #   1. DRAIN IPC queue (non-blocking)
+    #   2. FIRE step if work pending (runs GPU synchronously)
+    #   3. COLLECT results and respond
+    #   4. WAIT for next IPC request if idle
     try:
         while not shutdown_requested:
             loop_count += 1
@@ -1511,59 +1520,18 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
             if shutdown_requested:
                 break
 
-            # 2. COLLECT — GPU done?
-            if gpu_future is not None and gpu_future.done():
+            # 2. FIRE + COLLECT — GPU runs synchronously, result is immediate
+            if (active_groups or pending_new):
+                _fire_step()
+                # Result is available immediately after _fire_step returns
                 if _is_multistep_batch():
                     _handle_multistep_completion()
                 else:
                     _handle_single_step_completion()
+                continue  # drain again immediately (new IPC may have arrived during GPU)
 
-            # 3. MERGE + FIRE — if GPU idle and work pending
-            if gpu_future is None and (active_groups or pending_new):
-                _fire_step()
-                continue  # drain again immediately
-
-            # 4. WAIT
-            if gpu_future is not None:
-                try:
-                    request = ipc_queue.poll_blocking(1)
-                except Exception:
-                    break
-                if request is not None:
-                    # Re-inject into drain
-                    request_id, method, payload = request
-                    try:
-                        args = msgpack.unpackb(payload)
-                        if method == "fire_batch":
-                            num_reqs = len(PieVllmBatchTranslator.decode_binary_array(
-                                args["qo_indptr"], np.uint32)) - 1
-                            mds = args.get("max_decode_steps", 1)
-                            gc = compute_batch_generate_counts([args])[0]
-                            pending_new.append(PendingRequest(
-                                pycrust_request_id=request_id,
-                                kwargs=args,
-                                num_requests=num_reqs,
-                                max_decode_steps=mds,
-                                generate_count=gc,
-                            ))
-                        elif method == "shutdown":
-                            shutdown_requested = True
-                            ipc_queue.respond(request_id, msgpack.packb(None))
-                        else:
-                            fn = methods.get(method)
-                            if fn:
-                                if isinstance(args, dict):
-                                    result = fn(**args)
-                                elif isinstance(args, (list, tuple)):
-                                    result = fn(*args)
-                                else:
-                                    result = fn(args)
-                                ipc_queue.respond(request_id, msgpack.packb(result))
-                    except Exception as e:
-                        import traceback
-                        print(f"[IPC Worker Error] {method}: {e}\n{traceback.format_exc()}")
-                        ipc_queue.respond(request_id, msgpack.packb(str(e)))
-            elif not pending_new and not active_groups:
+            # 3. WAIT — no work pending, block for next IPC request
+            if not pending_new and not active_groups:
                 try:
                     request = ipc_queue.poll_blocking(poll_timeout_ms)
                 except Exception:
@@ -1602,7 +1570,6 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                         print(f"[IPC Worker Error] {method}: {e}\n{traceback.format_exc()}")
                         ipc_queue.respond(request_id, msgpack.packb(str(e)))
     finally:
-        executor.shutdown(wait=False)
         runtime.shutdown()
 
 

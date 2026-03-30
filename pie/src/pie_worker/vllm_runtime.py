@@ -897,6 +897,8 @@ class PieVllmRuntime:
 
         Returns tokens in the order of _last_batch_req_ids (set by
         prepare_step → _build_scheduler_output).
+
+        Handles both scalar (single-step) and list (multi-step) sampled values.
         """
         sampled = model_output.sampled_token_ids
         req_id_to_idx = model_output.req_id_to_index
@@ -904,7 +906,13 @@ class PieVllmRuntime:
         for req_id in self._last_batch_req_ids:
             idx = req_id_to_idx.get(req_id)
             if idx is not None:
-                tokens.append(int(sampled[idx]))
+                val = sampled[idx]
+                # vLLM may return a list per request (e.g., multi-step);
+                # take the last token (most recent decode step).
+                if isinstance(val, (list, tuple)):
+                    tokens.append(int(val[-1]) if val else 0)
+                else:
+                    tokens.append(int(val))
             else:
                 tokens.append(0)  # flush request — no token
         return tokens
