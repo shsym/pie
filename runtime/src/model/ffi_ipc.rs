@@ -394,6 +394,12 @@ impl FfiIpcBackend {
         });
     }
     
+    /// Check if PIE_TRACE is enabled (cached).
+    fn trace_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("PIE_TRACE").is_ok())
+    }
+
     /// Maximum payload size for fire_batch response frames (10MB).
     const MAX_FRAME_PAYLOAD: usize = 10 * 1024 * 1024;
 
@@ -425,6 +431,11 @@ impl FfiIpcBackend {
             if reader.read_exact(&mut payload).is_err() {
                 eprintln!("[FIRE-BATCH-SOCK] Reader: incomplete payload");
                 break;
+            }
+
+            // Trace: response received from Python
+            if Self::trace_enabled() {
+                eprintln!("[PIE-TRACE] {} rs.resp_recv {}", clock_monotonic_ns(), request_id);
             }
 
             // Resolve the pending oneshot
@@ -462,6 +473,10 @@ impl FfiIpcBackend {
             frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             frame.extend_from_slice(&payload);
             (&*writer).write_all(&frame)?;
+        }
+
+        if Self::trace_enabled() {
+            eprintln!("[PIE-TRACE] {} rs.sock_write {}", clock_monotonic_ns(), request_id);
         }
 
         let t_after_send = if ipc_timing { Some(clock_monotonic_ns()) } else { None };

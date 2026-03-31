@@ -493,6 +493,10 @@ impl Model {
             // Process any completed batches (non-blocking) - from any group
             while let Ok((batch_size, tokens_in_batch, latency, group_id)) = completion_rx.try_recv() {
                 if group_id < num_groups {
+                    if Self::trace_enabled() {
+                        Self::trace("rs.complete_enter", prof_batches_fired[group_id],
+                            &format!("reqs={}", batch_size));
+                    }
                     if in_flight_counts[group_id] > 0 {
                         in_flight_counts[group_id] -= 1;
                     }
@@ -518,6 +522,10 @@ impl Model {
                     cont_count += 1;
                 }
                 if cont_count > 0 {
+                    if Self::trace_enabled() {
+                        Self::trace("rs.cont_drain_done", prof_batches_fired[0],
+                            &format!("n={}", cont_count));
+                    }
                     if Self::sched_tracing_enabled() {
                         eprintln!("[SCHED-CONT-DRAIN] t={} drained={}", Self::mono_ns(), cont_count);
                     }
@@ -541,9 +549,6 @@ impl Model {
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
                             }
                         }
-                        // Yield so continuation-sending tasks can run before
-                        // the drain at the top of the loop catches them.
-                        tokio::task::yield_now().await;
                         continue; // re-check — continuation drain at top of loop
                     }
                     maybe_cont = continuation_rx.recv() => {
@@ -552,8 +557,6 @@ impl Model {
                             group_tokens[group_id] += req.input_tokens.len();
                             batches[group_id].push((req, tx));
                         }
-                        // Yield so sibling continuation sends land before drain.
-                        tokio::task::yield_now().await;
                         continue; // skip the req_rx add below
                     }
                     maybe_req = req_rx.recv() => {
@@ -588,17 +591,24 @@ impl Model {
             {
                 const COALESCE_WINDOW: Duration = Duration::from_millis(2);
 
-                // Compute coalesce deadline. Skip coalesce when:
-                // - A group has in-flight batches (pipeline active)
-                // - A group's batch has ONLY continuations (no new requests to wait for)
-                // When pipeline is empty AND new requests are pending, coalesce to
-                // batch multiple arrivals together.
+                if Self::trace_enabled() {
+                    let total_pending: usize = batches.iter().map(|b| b.len()).sum();
+                    Self::trace("rs.coalesce_enter", prof_batches_fired[0],
+                        &format!("pending={}", total_pending));
+                }
+                // Compute coalesce deadline. Coalesce when:
+                // - A group has pending requests (new OR continuations)
+                // - Pipeline is empty (in_flight == 0)
+                // - Batch is below capacity
+                // This prevents batch fragmentation for BOTH new request
+                // ramp-up AND continuation re-queuing after batch completion.
+                // With max_in_flight=1, the GPU is idle during coalesce,
+                // so the 2ms window costs at most 2ms per batch formation.
                 let deadline = {
                     (0..num_groups)
                         .filter(|&gid| {
                             batches[gid].len() > 0
                                 && in_flight_counts[gid] == 0
-                                && group_has_new_requests[gid]
                                 && batches[gid].len() < max_batch_size
                                 && group_tokens[gid] < max_batch_tokens
                         })
@@ -607,43 +617,64 @@ impl Model {
                 };
 
                 loop {
-                    let maybe_req = if let Some(dl) = deadline {
+                    // During coalesce, drain BOTH new requests AND continuations.
+                    // This ensures continuation re-queuing (after batch completion)
+                    // accumulates into the next batch rather than firing individually.
+                    let maybe_event = if let Some(dl) = deadline {
                         let remaining = dl.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
                             break;
                         }
-                        match tokio::time::timeout(remaining, req_rx.recv()).await {
-                            Ok(Some(req)) => Some(req),
-                            _ => break, // timeout or channel closed
+                        tokio::select! {
+                            biased;
+                            maybe_cont = continuation_rx.recv() => {
+                                maybe_cont.map(|c| (c, false))
+                            }
+                            maybe_req = req_rx.recv() => {
+                                maybe_req.map(|r| (r, true))
+                            }
+                            _ = tokio::time::sleep(remaining) => None,
                         }
                     } else {
-                        // No coalesce needed — just drain what's immediately available
-                        match req_rx.try_recv() {
-                            Ok(req) => Some(req),
-                            Err(_) => break,
+                        // No coalesce — just drain what's immediately available
+                        if let Ok(cont) = continuation_rx.try_recv() {
+                            Some((cont, false))
+                        } else if let Ok(req) = req_rx.try_recv() {
+                            Some((req, true))
+                        } else {
+                            break;
                         }
                     };
 
-                    if let Some((req, tx, group_id)) = maybe_req {
-                        let group_id = std::cmp::min(group_id, num_groups - 1);
-                        {
-                            let mut sched = scheduler.lock().unwrap();
-                            let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
-                            sched.on_request_arrival(group_id, arrival_time);
-                        }
-                        group_tokens[group_id] += req.input_tokens.len();
-                        batches[group_id].push((req, tx));
-                        group_has_new_requests[group_id] = true;
-                        prof_requests_received[group_id] += 1;
+                    match maybe_event {
+                        Some(((req, tx, group_id), is_new)) => {
+                            let group_id = std::cmp::min(group_id, num_groups - 1);
+                            if is_new {
+                                let mut sched = scheduler.lock().unwrap();
+                                let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
+                                sched.on_request_arrival(group_id, arrival_time);
+                                group_has_new_requests[group_id] = true;
+                                prof_requests_received[group_id] += 1;
+                            }
+                            group_tokens[group_id] += req.input_tokens.len();
+                            batches[group_id].push((req, tx));
 
-                        // If this group hit capacity, stop draining
-                        if batches[group_id].len() >= max_batch_size
-                            || group_tokens[group_id] >= max_batch_tokens
-                        {
-                            break;
+                            // If this group hit capacity, stop draining
+                            if batches[group_id].len() >= max_batch_size
+                                || group_tokens[group_id] >= max_batch_tokens
+                            {
+                                break;
+                            }
                         }
+                        None => break,
                     }
                 }
+            }
+
+            if Self::trace_enabled() {
+                let total_pending: usize = batches.iter().map(|b| b.len()).sum();
+                Self::trace("rs.coalesce_exit", prof_batches_fired[0],
+                    &format!("pending={}", total_pending));
             }
 
             // Check all groups for firing
@@ -677,6 +708,11 @@ impl Model {
                     in_flight_counts[group_id] += 1;
                     fired_any = true;
                     prof_batches_fired[group_id] += 1;
+
+                    if Self::trace_enabled() {
+                        Self::trace("rs.fire", prof_batches_fired[group_id],
+                            &format!("reqs={} toks={}", batch_len, total_tok));
+                    }
 
                      {
                         let mut sched = scheduler.lock().unwrap();
@@ -753,9 +789,7 @@ impl Model {
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
                             }
                         }
-                        // Yield so continuation-sending tasks can run; the
-                        // drain at the top of the next iteration collects them.
-                        tokio::task::yield_now().await;
+                        // (continuation drain at top of next iteration collects the rest)
                     }
                     maybe_cont = continuation_rx.recv() => {
                         if let Some((req, tx, group_id)) = maybe_cont {
@@ -763,8 +797,7 @@ impl Model {
                             group_tokens[group_id] += req.input_tokens.len();
                             batches[group_id].push((req, tx));
                         }
-                        // Yield so sibling continuation sends land before drain.
-                        tokio::task::yield_now().await;
+                        // (continuation drain at top of next iteration collects the rest)
                     }
                     maybe_req = req_rx.recv(), if !any_at_limit => {
                         match maybe_req {
@@ -815,6 +848,15 @@ impl Model {
     fn sched_tracing_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("PIE_SCHED_TIMING").is_ok())
+    }
+
+    fn trace_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("PIE_TRACE").is_ok())
+    }
+
+    fn trace(phase: &str, batch_id: usize, extra: &str) {
+        eprintln!("[PIE-TRACE] {} {} {} {}", Self::mono_ns(), phase, batch_id, extra);
     }
 
     #[tracing::instrument(
