@@ -579,105 +579,27 @@ impl Model {
                 };
             }
 
-            // Drain channel into batches, with optional coalesce window.
-            //
-            // Coalesce: when a group's pipeline is empty and batch is incomplete,
-            // wait up to 2ms for more requests before firing. This prevents batch
-            // fragmentation when WASM inferlets resume with slight stagger after
-            // a batch completes.
-            //
-            // The deadline is per-group: groups already at capacity or with
-            // in-flight batches fire immediately without waiting for others.
+            // Drain new requests (non-blocking). Continuations already
+            // drained above. No coalesce window — fire immediately with
+            // whatever is available. Python merges via side-channel if
+            // multiple batches overlap.
             {
-                const COALESCE_WINDOW: Duration = Duration::from_millis(2);
-
-                if Self::trace_enabled() {
-                    let total_pending: usize = batches.iter().map(|b| b.len()).sum();
-                    Self::trace("rs.coalesce_enter", prof_batches_fired[0],
-                        &format!("pending={}", total_pending));
-                }
-                // Compute coalesce deadline. Coalesce when:
-                // - A group has pending requests (new OR continuations)
-                // - Pipeline is empty (in_flight == 0)
-                // - Batch is below capacity
-                // This prevents batch fragmentation for BOTH new request
-                // ramp-up AND continuation re-queuing after batch completion.
-                // With max_in_flight=1, the GPU is idle during coalesce,
-                // so the 2ms window costs at most 2ms per batch formation.
-                let deadline = {
-                    (0..num_groups)
-                        .filter(|&gid| {
-                            batches[gid].len() > 0
-                                && in_flight_counts[gid] == 0
-                                && batches[gid].len() < max_batch_size
-                                && group_tokens[gid] < max_batch_tokens
-                        })
-                        .next()
-                    .map(|_| Instant::now() + COALESCE_WINDOW)
-                };
-
-                loop {
-                    // During coalesce, drain BOTH new requests AND continuations.
-                    // This ensures continuation re-queuing (after batch completion)
-                    // accumulates into the next batch rather than firing individually.
-                    let maybe_event = if let Some(dl) = deadline {
-                        let remaining = dl.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            break;
-                        }
-                        tokio::select! {
-                            biased;
-                            maybe_cont = continuation_rx.recv() => {
-                                maybe_cont.map(|c| (c, false))
-                            }
-                            maybe_req = req_rx.recv() => {
-                                maybe_req.map(|r| (r, true))
-                            }
-                            _ = tokio::time::sleep(remaining) => None,
-                        }
-                    } else {
-                        // No coalesce — just drain what's immediately available
-                        if let Ok(cont) = continuation_rx.try_recv() {
-                            Some((cont, false))
-                        } else if let Ok(req) = req_rx.try_recv() {
-                            Some((req, true))
-                        } else {
-                            break;
-                        }
-                    };
-
-                    match maybe_event {
-                        Some(((req, tx, group_id), is_new)) => {
-                            let group_id = std::cmp::min(group_id, num_groups - 1);
-                            if is_new {
-                                let mut sched = scheduler.lock().unwrap();
-                                let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
-                                sched.on_request_arrival(group_id, arrival_time);
-                                group_has_new_requests[group_id] = true;
-                                prof_requests_received[group_id] += 1;
-                            }
-                            group_tokens[group_id] += req.input_tokens.len();
-                            batches[group_id].push((req, tx));
-
-                            // If this group hit capacity, stop draining
-                            if batches[group_id].len() >= max_batch_size
-                                || group_tokens[group_id] >= max_batch_tokens
-                            {
-                                break;
-                            }
-                        }
-                        None => break,
+                while let Ok((req, tx, group_id)) = req_rx.try_recv() {
+                    let group_id = std::cmp::min(group_id, num_groups - 1);
+                    {
+                        let mut sched = scheduler.lock().unwrap();
+                        let arrival_time = req.arrival_time.unwrap_or_else(Instant::now);
+                        sched.on_request_arrival(group_id, arrival_time);
                     }
+                    group_tokens[group_id] += req.input_tokens.len();
+                    batches[group_id].push((req, tx));
+                    group_has_new_requests[group_id] = true;
+                    prof_requests_received[group_id] += 1;
                 }
             }
 
-            if Self::trace_enabled() {
-                let total_pending: usize = batches.iter().map(|b| b.len()).sum();
-                Self::trace("rs.coalesce_exit", prof_batches_fired[0],
-                    &format!("pending={}", total_pending));
-            }
-
-            // Check all groups for firing
+            // Fire non-empty groups immediately — no should_fire heuristic,
+            // no coalesce. Only gate: max_in_flight (1 = Python controls GPU).
             let mut fired_any = false;
             for group_id in 0..num_groups {
                 let batch_len = batches[group_id].len();
@@ -685,22 +607,17 @@ impl Model {
                     continue;
                 }
 
+                // Only gate: don't exceed max in-flight batches.
+                // With max_in_flight=1, this ensures one batch at a time —
+                // Python finishes GPU, responds, Rust gets completion,
+                // drains all continuations, fires next batch.
+                if in_flight_counts[group_id] >= max_in_flight_batches {
+                    continue;
+                }
+
                 let total_tok = group_tokens[group_id];
-                let in_flight = in_flight_counts[group_id];
 
-                let should_fire = {
-                    let mut sched = scheduler.lock().unwrap();
-                    sched.should_fire(group_id, batch_len, total_tok, max_batch_size, max_batch_tokens, in_flight)
-                };
-
-                // Always forward batches with new requests (Python merges them
-                // into the current GPU step). Only limit in-flight for
-                // continuation-only batches to avoid redundant RPCs.
-                let can_fire = should_fire && (
-                    group_has_new_requests[group_id] || in_flight < max_in_flight_batches
-                );
-
-                if can_fire {
+                {
                     // Fire!
                     let batch_to_fire = std::mem::take(&mut batches[group_id]);
                     group_tokens[group_id] = 0;
@@ -767,8 +684,8 @@ impl Model {
                      eprintln!("[SCHED-WAIT] t={} any_pending={} in_flight={:?}",
                          Self::mono_ns(), any_pending, &in_flight_counts);
                  }
-                 let any_at_limit = in_flight_counts.iter().any(|&c| c >= max_in_flight_batches);
-
+                 // No in-flight limit — always accept new requests.
+                 // Python controls GPU timing via side-channel.
                  tokio::select! {
                     biased;
                     _ = shutdown_rx.recv() => break,
@@ -789,7 +706,6 @@ impl Model {
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
                             }
                         }
-                        // (continuation drain at top of next iteration collects the rest)
                     }
                     maybe_cont = continuation_rx.recv() => {
                         if let Some((req, tx, group_id)) = maybe_cont {
@@ -797,9 +713,8 @@ impl Model {
                             group_tokens[group_id] += req.input_tokens.len();
                             batches[group_id].push((req, tx));
                         }
-                        // (continuation drain at top of next iteration collects the rest)
                     }
-                    maybe_req = req_rx.recv(), if !any_at_limit => {
+                    maybe_req = req_rx.recv() => {
                         match maybe_req {
                             Some((req, tx, group_id)) => {
                                 let group_id = std::cmp::min(group_id, num_groups - 1);
@@ -908,6 +823,12 @@ impl Model {
 
         match result {
             Ok(batch_resp) => {
+                // Collect all continuations FIRST, then send them in bulk.
+                // This prevents tokio from interleaving the scheduler loop
+                // between individual sends, which causes batch fragmentation
+                // (scheduler fires reqs=1 before all continuations arrive).
+                let mut pending_continuations: Vec<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)> = Vec::new();
+
                 let mut resp_iter = batch_resp.results.into_iter();
                 for (mut fp_req, resp_tx) in requests {
                     let resp = resp_iter.next();
@@ -916,19 +837,13 @@ impl Model {
                         // Multi-step: accumulate token(s), re-enqueue or finish.
                         if let Some(ref r) = resp {
                             if r.tokens.len() > 1 {
-                                // Python handled all steps — bulk-accept all tokens.
-                                // Python-side continuations return N tokens per request
-                                // when it loops execute_model internally.
                                 fp_req.multi_step_tokens.extend(&r.tokens);
                                 fp_req.max_decode_steps = 0;
-                                // Fall through to Done path below
                             } else if let Some(&token) = r.tokens.first() {
-                                // Single token — original Rust-side continuation path.
                                 fp_req.multi_step_tokens.push(token);
                                 fp_req.max_decode_steps -= 1;
 
                                 if fp_req.max_decode_steps > 0 {
-                                    // Update KV page state
                                     fp_req.kv_page_last_len += 1;
                                     if fp_req.kv_page_size > 0
                                         && fp_req.kv_page_last_len > fp_req.kv_page_size
@@ -948,14 +863,11 @@ impl Model {
                                             Self::mono_ns(), fp_req.multi_step_tokens.len(),
                                             fp_req.max_decode_steps, token);
                                     }
-                                    continuation_tx.send((fp_req, resp_tx, group_id)).ok();
+                                    pending_continuations.push((fp_req, resp_tx, group_id));
                                     continue;
                                 }
                             }
                         }
-                        // Done: send accumulated tokens + distributions.
-                        // Pass through dists from Python (may contain per-step
-                        // distributions when return_distributions is true).
                         if let Some(tx) = resp_tx {
                             tx.send(ForwardPassResponse {
                                 tokens: fp_req.multi_step_tokens,
@@ -963,13 +875,17 @@ impl Model {
                             }).ok();
                         }
                     } else {
-                        // Single-step: pass through
                         if let Some(tx) = resp_tx {
                             if let Some(r) = resp {
                                 tx.send(r).ok();
                             }
                         }
                     }
+                }
+
+                // Send all continuations in bulk — no tokio yield points between sends.
+                for cont in pending_continuations {
+                    continuation_tx.send(cont).ok();
                 }
             }
             Err(e) => {
