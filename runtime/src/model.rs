@@ -541,6 +541,9 @@ impl Model {
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
                             }
                         }
+                        // Yield so continuation-sending tasks can run before
+                        // the drain at the top of the loop catches them.
+                        tokio::task::yield_now().await;
                         continue; // re-check — continuation drain at top of loop
                     }
                     maybe_cont = continuation_rx.recv() => {
@@ -549,6 +552,8 @@ impl Model {
                             group_tokens[group_id] += req.input_tokens.len();
                             batches[group_id].push((req, tx));
                         }
+                        // Yield so sibling continuation sends land before drain.
+                        tokio::task::yield_now().await;
                         continue; // skip the req_rx add below
                     }
                     maybe_req = req_rx.recv() => {
@@ -628,6 +633,7 @@ impl Model {
                         }
                         group_tokens[group_id] += req.input_tokens.len();
                         batches[group_id].push((req, tx));
+                        group_has_new_requests[group_id] = true;
                         prof_requests_received[group_id] += 1;
 
                         // If this group hit capacity, stop draining
@@ -747,6 +753,9 @@ impl Model {
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
                             }
                         }
+                        // Yield so continuation-sending tasks can run; the
+                        // drain at the top of the next iteration collects them.
+                        tokio::task::yield_now().await;
                     }
                     maybe_cont = continuation_rx.recv() => {
                         if let Some((req, tx, group_id)) = maybe_cont {
@@ -754,6 +763,8 @@ impl Model {
                             group_tokens[group_id] += req.input_tokens.len();
                             batches[group_id].push((req, tx));
                         }
+                        // Yield so sibling continuation sends land before drain.
+                        tokio::task::yield_now().await;
                     }
                     maybe_req = req_rx.recv(), if !any_at_limit => {
                         match maybe_req {
