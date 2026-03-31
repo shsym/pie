@@ -43,6 +43,8 @@ use ipc_channel::ipc::{self, IpcOneShotServer, IpcReceiver, IpcSender};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde::{Deserialize, Serialize};
+use std::io::{Read as _, Write as _};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -84,7 +86,7 @@ pub struct IpcChannels {
 pub struct FfiIpcBackend {
     /// Sender for Rust → Python requests (wrapped in Mutex for Sync safety)
     request_tx: Mutex<IpcSender<IpcRequest>>,
-    /// Receiver for Python → Rust responses  
+    /// Receiver for Python → Rust responses
     response_rx: Arc<Mutex<IpcReceiver<IpcResponse>>>,
     /// Pending response channels
     pending: Arc<dashmap::DashMap<u64, oneshot::Sender<Vec<u8>>>>,
@@ -96,6 +98,18 @@ pub struct FfiIpcBackend {
     group_id: usize,
     /// Whether connection is established
     connected: Arc<std::sync::atomic::AtomicBool>,
+
+    // --- fire_batch side-channel (Unix socket) ---
+    /// Writer half of the Unix socket for sending fire_batch requests.
+    /// Set to Some once Python connects to the socket.
+    fire_batch_writer: Arc<Mutex<Option<UnixStream>>>,
+    /// Fast flag for checking side-channel connectivity without acquiring the mutex.
+    /// Once set to true, stays true for the lifetime of the backend.
+    fire_batch_connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Pending responses for fire_batch calls via side-channel.
+    fire_batch_pending: Arc<dashmap::DashMap<u64, oneshot::Sender<Vec<u8>>>>,
+    /// Path to the fire_batch Unix socket.
+    fire_batch_socket_path: Option<String>,
 }
 
 impl FfiIpcBackend {
@@ -179,17 +193,15 @@ impl FfiIpcBackend {
             server_name: server_name.clone(),
             group_id,
             connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fire_batch_writer: Arc::new(Mutex::new(None)),
+            fire_batch_connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fire_batch_pending: Arc::new(dashmap::DashMap::new()),
+            fire_batch_socket_path: None,
         };
-        
-        // We need a way to send `channels` to Python. Let's use a second channel.
-        // Actually we can store it and let Python fetch via a different mechanism.
-        //
-        // For now, let me just serialize the channels to a file that Python can read.
-        // This is a hacky but simple approach.
-        
+
         Ok((backend, server_name))
     }
-    
+
     /// Create a new IPC backend with proper channel exchange.
     ///
     /// This uses a two-stage handshake:
@@ -243,6 +255,87 @@ impl FfiIpcBackend {
             }
         });
         
+        // --- fire_batch side-channel setup ---
+        let socket_path = format!("/tmp/pie-fb-{}-{}.sock", group_id, std::process::id());
+        let _ = std::fs::remove_file(&socket_path); // Remove stale socket
+        let listener = UnixListener::bind(&socket_path)
+            .map_err(|e| anyhow::anyhow!("Failed to bind fire_batch socket at {}: {}", socket_path, e))?;
+
+        // Set env var so Python workers can discover the socket path
+        // (workers inherit env from parent process)
+        unsafe {
+            std::env::set_var(
+                format!("PIE_FIRE_BATCH_SOCK_{}", group_id),
+                &socket_path,
+            );
+        }
+
+        let fire_batch_writer: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        let fire_batch_writer_clone = Arc::clone(&fire_batch_writer);
+        let fire_batch_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fire_batch_connected_clone = Arc::clone(&fire_batch_connected);
+        let fire_batch_pending: Arc<dashmap::DashMap<u64, oneshot::Sender<Vec<u8>>>> =
+            Arc::new(dashmap::DashMap::new());
+        let fire_batch_pending_clone = Arc::clone(&fire_batch_pending);
+
+        // Spawn thread to accept Python's connection and read responses
+        let socket_path_for_log = socket_path.clone();
+        std::thread::Builder::new()
+            .name(format!("pie-fb-sock-{}", group_id))
+            .spawn(move || {
+                eprintln!("[FIRE-BATCH-SOCK] Waiting for Python connection on {}", socket_path_for_log);
+                let (stream, _) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[FIRE-BATCH-SOCK] Accept failed: {}", e);
+                        return;
+                    }
+                };
+                eprintln!("[FIRE-BATCH-SOCK] Python connected");
+
+                // Increase socket buffer to 2MB to allow multiple fire_batch frames in-flight
+                // without blocking the Rust writer while Python is doing GPU work.
+                let buf_size = 2 * 1024 * 1024; // 2MB
+                let _ = stream.set_nonblocking(false);
+                unsafe {
+                    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        &buf_size as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                    );
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVBUF,
+                        &buf_size as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                    );
+                }
+
+                // Clone stream: one half for writing (stored in backend), one for reading (this thread)
+                let reader = match stream.try_clone() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[FIRE-BATCH-SOCK] Clone failed: {}", e);
+                        return;
+                    }
+                };
+
+                // Store writer half for call_via_side_channel
+                {
+                    let mut w = fire_batch_writer_clone.lock().unwrap();
+                    *w = Some(stream);
+                }
+                // Set connected flag AFTER writer is stored (release-acquire ordering)
+                fire_batch_connected_clone.store(true, Ordering::Release);
+
+                // Read response frames: [8B request_id][4B length][payload]
+                Self::fire_batch_response_reader(reader, fire_batch_pending_clone);
+            })?;
+
         let backend = Self {
             request_tx: Mutex::new(request_tx),
             response_rx: response_rx_for_handler,
@@ -251,8 +344,12 @@ impl FfiIpcBackend {
             server_name: server_name.clone(),
             group_id,
             connected,
+            fire_batch_writer,
+            fire_batch_connected,
+            fire_batch_pending,
+            fire_batch_socket_path: Some(socket_path),
         };
-        
+
         Ok((backend, server_name))
     }
     
@@ -297,8 +394,107 @@ impl FfiIpcBackend {
         });
     }
     
-    /// Send a request to Python and await response (async)
+    /// Maximum payload size for fire_batch response frames (10MB).
+    const MAX_FRAME_PAYLOAD: usize = 10 * 1024 * 1024;
+
+    /// Read response frames from the fire_batch socket and resolve pending oneshots.
+    fn fire_batch_response_reader(
+        mut reader: UnixStream,
+        pending: Arc<dashmap::DashMap<u64, oneshot::Sender<Vec<u8>>>>,
+    ) {
+        let mut header = [0u8; 12];
+        loop {
+            // Read frame header: [8B request_id][4B length]
+            if reader.read_exact(&mut header).is_err() {
+                eprintln!("[FIRE-BATCH-SOCK] Reader: connection closed");
+                break;
+            }
+            let request_id = u64::from_le_bytes(header[0..8].try_into().unwrap());
+            let length = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+
+            if length > Self::MAX_FRAME_PAYLOAD {
+                eprintln!(
+                    "[FIRE-BATCH-SOCK] Reader: payload too large ({}B > {}B limit)",
+                    length, Self::MAX_FRAME_PAYLOAD
+                );
+                break;
+            }
+
+            // Read payload
+            let mut payload = vec![0u8; length];
+            if reader.read_exact(&mut payload).is_err() {
+                eprintln!("[FIRE-BATCH-SOCK] Reader: incomplete payload");
+                break;
+            }
+
+            // Resolve the pending oneshot
+            if let Some((_, tx)) = pending.remove(&request_id) {
+                let _ = tx.send(payload);
+            }
+        }
+
+        // Drain all remaining pending requests with error
+        let count = pending.len();
+        if count > 0 {
+            eprintln!("[FIRE-BATCH-SOCK] Reader exiting, failing {} pending requests", count);
+            pending.retain(|_, _| false); // Drop all senders → receivers get RecvError
+        }
+    }
+
+    /// Send a fire_batch request via the Unix socket side-channel.
+    async fn call_via_side_channel(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let ipc_timing = std::env::var("PIE_IPC_TIMING").is_ok();
+        let t_before = if ipc_timing { Some(clock_monotonic_ns()) } else { None };
+
+        // Register pending response
+        let (response_tx, response_rx) = oneshot::channel();
+        self.fire_batch_pending.insert(request_id, response_tx);
+
+        // Write frame: [8B request_id][4B length][payload]
+        {
+            let guard = self.fire_batch_writer.lock().unwrap();
+            let writer = guard.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("fire_batch side-channel not connected"))?;
+            // Use a single write for the entire frame to minimize syscalls
+            let mut frame = Vec::with_capacity(12 + payload.len());
+            frame.extend_from_slice(&request_id.to_le_bytes());
+            frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&payload);
+            (&*writer).write_all(&frame)?;
+        }
+
+        let t_after_send = if ipc_timing { Some(clock_monotonic_ns()) } else { None };
+
+        // Await response
+        let result = response_rx.await
+            .map_err(|_| anyhow::anyhow!("fire_batch side-channel response closed"))?;
+
+        if ipc_timing {
+            let t_recv = clock_monotonic_ns();
+            if let (Some(t_bs), Some(t_as)) = (t_before, t_after_send) {
+                let send_us = (t_as - t_bs) / 1000;
+                let wait_us = (t_recv - t_as) / 1000;
+                eprintln!(
+                    "[IPC-RUST-SC] fire_batch send={}us wait={}us total={}us",
+                    send_us, wait_us, (t_recv - t_bs) / 1000
+                );
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Send a request to Python and await response (async).
+    ///
+    /// Routes `fire_batch` through the Unix socket side-channel when available,
+    /// falling back to pycrust IPC otherwise.
     pub async fn call(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
+        // Route fire_batch through side-channel if connected (lock-free check)
+        if method == "fire_batch" && self.fire_batch_connected.load(Ordering::Acquire) {
+            return self.call_via_side_channel(payload).await;
+        }
+
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let ipc_timing = std::env::var("PIE_IPC_TIMING").is_ok();
 
@@ -363,6 +559,11 @@ impl FfiIpcBackend {
         self.group_id
     }
     
+    /// Get the fire_batch side-channel socket path (if available).
+    pub fn fire_batch_socket_path(&self) -> Option<&str> {
+        self.fire_batch_socket_path.as_deref()
+    }
+
     /// Broadcast shutdown message to Python worker.
     ///
     /// This sends a "shutdown" method call to the Python worker, causing its
