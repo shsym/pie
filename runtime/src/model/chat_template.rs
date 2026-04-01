@@ -122,6 +122,14 @@ fn render_template(
 ) -> Result<String, String> {
     let processed = preprocess_template(template_str);
     let mut env = minijinja::Environment::new();
+
+    // Register tojson filter — used by Qwen2.5 and other chat templates
+    // for serializing tool definitions: {{ tools | tojson }}
+    env.add_filter("tojson", |value: minijinja::Value| -> String {
+        // Serialize the minijinja Value to JSON via serde
+        serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
+    });
+
     env.add_template("chat", &processed)
         .map_err(|e| format!("minijinja template parse error: {}", e))?;
 
