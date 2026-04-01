@@ -490,6 +490,12 @@ impl Model {
         let mut group_has_new_requests: Vec<bool> = vec![false; num_groups];
 
         loop {
+            if Self::trace_enabled() {
+                let pending: usize = batches.iter().map(|b| b.len()).sum();
+                Self::trace("rs.loop_top", prof_batches_fired[0],
+                    &format!("inf={} pending={}", in_flight_counts.iter().sum::<usize>(), pending));
+            }
+
             // Process any completed batches (non-blocking) - from any group
             while let Ok((batch_size, tokens_in_batch, latency, group_id)) = completion_rx.try_recv() {
                 if group_id < num_groups {
@@ -535,6 +541,10 @@ impl Model {
             let all_batches_empty = batches.iter().all(|b| b.is_empty());
 
             if all_batches_empty {
+                if Self::trace_enabled() {
+                    Self::trace("rs.select_enter", prof_batches_fired[0],
+                        &format!("inf={}", in_flight_counts.iter().sum::<usize>()));
+                }
                 // Wait for any event: new request, completion, or continuation.
                 tokio::select! {
                     biased;
@@ -549,6 +559,9 @@ impl Model {
                                 sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
                             }
                         }
+                        if Self::trace_enabled() {
+                            Self::trace("rs.select_wake", prof_batches_fired[0], "src=completion");
+                        }
                         continue; // re-check — continuation drain at top of loop
                     }
                     maybe_cont = continuation_rx.recv() => {
@@ -556,6 +569,9 @@ impl Model {
                             let group_id = std::cmp::min(group_id, num_groups - 1);
                             group_tokens[group_id] += req.input_tokens.len();
                             batches[group_id].push((req, tx));
+                        }
+                        if Self::trace_enabled() {
+                            Self::trace("rs.select_wake", prof_batches_fired[0], "src=continuation");
                         }
                         continue; // skip the req_rx add below
                     }
@@ -612,6 +628,10 @@ impl Model {
                 // Python finishes GPU, responds, Rust gets completion,
                 // drains all continuations, fires next batch.
                 if in_flight_counts[group_id] >= max_in_flight_batches {
+                    if Self::trace_enabled() {
+                        Self::trace("rs.fire_blocked", prof_batches_fired[group_id],
+                            &format!("inf={} pending={}", in_flight_counts[group_id], batch_len));
+                    }
                     continue;
                 }
 
@@ -642,6 +662,8 @@ impl Model {
                     let continuation_tx_clone = continuation_tx.clone();
                     let batch_size = batch_len;
                     let tokens_in_batch = total_tok;
+                    // Python's _batch_counter is 0-based; prof_batches_fired is post-increment
+                    let trace_batch_id = prof_batches_fired[group_id].saturating_sub(1);
 
                     if Self::sched_tracing_enabled() {
                         eprintln!(
@@ -656,9 +678,18 @@ impl Model {
                          Self::execute_forward_pass_batch(
                              &backend_clone, batch_to_fire, group_id,
                              REQUEST_TIMEOUT, &continuation_tx_clone,
+                             trace_batch_id,
                          ).await;
+                         if Self::trace_enabled() {
+                             Self::trace("rs.pre_completion", trace_batch_id,
+                                 &format!("reqs={}", batch_size));
+                         }
                          let latency = start_time.elapsed();
                          completion_tx_clone.send((batch_size, tokens_in_batch, latency, group_id)).ok();
+                         if Self::trace_enabled() {
+                             Self::trace("rs.post_completion", trace_batch_id,
+                                 &format!("reqs={}", batch_size));
+                         }
                     });
                 }
             }
@@ -737,7 +768,7 @@ impl Model {
         for group_id in 0..num_groups {
             if !batches[group_id].is_empty() {
                 let batch = std::mem::take(&mut batches[group_id]);
-                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, &continuation_tx).await;
+                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, &continuation_tx, 0).await;
             }
         }
 
@@ -785,6 +816,7 @@ impl Model {
         group_id: usize,
         timeout: Duration,
         continuation_tx: &mpsc::UnboundedSender<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>,
+        trace_batch_id: usize,
     ) {
         let _t_entry = if Self::sched_tracing_enabled() { Some(Self::mono_ns()) } else { None };
 
@@ -820,6 +852,9 @@ impl Model {
             .await;
 
         let _t_post_rpc = if Self::sched_tracing_enabled() { Some(Self::mono_ns()) } else { None };
+        if Self::trace_enabled() {
+            Self::trace("rs.rpc_done", trace_batch_id, &format!("reqs={}", batch_size));
+        }
 
         match result {
             Ok(batch_resp) => {
@@ -883,9 +918,16 @@ impl Model {
                     }
                 }
 
+                if Self::trace_enabled() {
+                    Self::trace("rs.dispatch_done", trace_batch_id, &format!("reqs={} conts={}", batch_size, pending_continuations.len()));
+                }
+
                 // Send all continuations in bulk — no tokio yield points between sends.
                 for cont in pending_continuations {
                     continuation_tx.send(cont).ok();
+                }
+                if Self::trace_enabled() {
+                    Self::trace("rs.conts_sent", trace_batch_id, &format!("reqs={}", batch_size));
                 }
             }
             Err(e) => {
