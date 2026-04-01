@@ -1006,39 +1006,118 @@ def _vllm_worker_process(
             dist.destroy_process_group()
 
 
+class _FireBatchSideChannel:
+    """Unix socket side-channel for async fire_batch IPC.
+
+    Allows Rust to send multiple fire_batch requests without waiting for
+    the previous response. Python drains all pending requests, merges them
+    into a single GPU batch, then sends individual responses.
+
+    Frame format (both directions): [8B LE request_id][4B LE length][payload]
+    """
+
+    def __init__(self, sock):
+        self._sock = sock
+        self._buf = bytearray()
+
+    @classmethod
+    def connect(cls, group_id: int):
+        """Connect to the fire_batch side-channel socket for this group.
+
+        Returns None if no socket path is configured (fallback to pycrust).
+        """
+        import socket as _socket
+
+        path = os.environ.get(f"PIE_FIRE_BATCH_SOCK_{group_id}")
+        if not path:
+            return None
+
+        try:
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.connect(path)
+            print(
+                f"[FIRE-BATCH-SOCK] Connected to side-channel: {path}",
+                file=sys.stderr, flush=True,
+            )
+            return cls(sock)
+        except OSError as e:
+            print(
+                f"[FIRE-BATCH-SOCK] Failed to connect to {path}: {e}",
+                file=sys.stderr, flush=True,
+            )
+            return None
+
+    def drain_requests(self):
+        """Read all complete fire_batch request frames available without blocking.
+
+        Returns list of (request_id, msgpack_payload_bytes).
+        """
+        # Read whatever is available (non-blocking)
+        self._sock.setblocking(False)
+        try:
+            while True:
+                chunk = self._sock.recv(262144)  # 256KB chunks
+                if not chunk:
+                    break
+                self._buf.extend(chunk)
+        except BlockingIOError:
+            pass
+        finally:
+            self._sock.setblocking(True)
+
+        # Parse complete frames
+        frames = []
+        while len(self._buf) >= 12:
+            length = int.from_bytes(self._buf[8:12], "little")
+            total = 12 + length
+            if len(self._buf) < total:
+                break  # Incomplete frame, wait for more data
+            request_id = int.from_bytes(self._buf[0:8], "little")
+            payload = bytes(self._buf[12:total])
+            del self._buf[:total]
+            frames.append((request_id, payload))
+
+        return frames
+
+    def send_response(self, request_id: int, payload: bytes):
+        """Send a response frame back to Rust."""
+        header = request_id.to_bytes(8, "little") + len(payload).to_bytes(4, "little")
+        self._sock.sendall(header + payload)
+
+    def close(self):
+        """Close the socket."""
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
 def _run_ipc_worker_loop(ipc_queue, runtime):
-    """Step-level GPU scheduler with Python-side continuations.
+    """Run the IPC worker loop for a group leader.
 
-    Replaces the synchronous poll→fire_batch→respond loop with a step-level
-    scheduler that:
-      1. Drains the IPC queue between every GPU step
-      2. Merges new fire_batch arrivals with ongoing continuations
-      3. Executes one GPU step via ThreadPoolExecutor
-      4. Responds only when all N steps complete for a request group
-
-    For multi-step requests (max_decode_steps > 1), Python loops internally
-    instead of round-tripping through Rust for each step.  This eliminates
-    the batch fragmentation at c=16 where 16 requests split into 2 groups
-    of 8 that alternate on the GPU.
+    This is similar to the FFI worker loop in server.py, but uses IPC for
+    cross-process communication. When a fire_batch side-channel socket is
+    available (set by Rust via env var), fire_batch requests are received
+    through the Unix socket instead of pycrust. Multiple in-flight fire_batch
+    RPCs are merged into a single GPU batch.
 
     Args:
         ipc_queue: FfiIpcQueue instance connected to Rust
-        runtime: Runtime instance (PieVllmRuntime) to dispatch calls to
+        runtime: Runtime instance to dispatch calls to
     """
     import msgpack
-    import time as _time
-    from dataclasses import dataclass, field
-    import numpy as np
+    from pie_worker.server import (
+        STATUS_OK,
+        STATUS_METHOD_NOT_FOUND,
+        STATUS_INTERNAL_ERROR,
+    )
 
-    from pie_worker.vllm_runtime import PieVllmRuntime, DecodedBatchArrays
-    from pie_worker.vllm_batch_translator import PieVllmBatchTranslator
-    from pie_worker.batch_merger import compute_batch_generate_counts
-
-    # Non-fire_batch RPC dispatch
+    # Method dispatch table (fire_batch handled separately when side-channel active)
     methods = {
         "handshake": runtime.handshake_rpc,
         "query": runtime.query_rpc,
         "format_chat": runtime.format_chat_rpc,
+        "fire_batch": runtime.fire_batch,
         "embed_image": runtime.embed_image_rpc,
         "initialize_adapter": runtime.initialize_adapter_rpc,
         "update_adapter": runtime.update_adapter_rpc,
@@ -1046,530 +1125,296 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
         "download_adapter": runtime.download_adapter_rpc,
     }
 
-    _ipc_timing = os.environ.get("PIE_IPC_TIMING", "")
-    _batching_debug = os.environ.get("PIE_BATCH_DEBUG", "")
+    # Connect to fire_batch side-channel (if available)
+    group_id = ipc_queue.group_id()
+    side_channel = _FireBatchSideChannel.connect(group_id)
 
-    # --- Data structures for continuation tracking ---
+    # When side-channel is active, skip pycrust poll entirely during
+    # active decode — Python controls batch timing, not Rust. Pycrust
+    # is only needed for non-fire_batch RPCs (handshake, format_chat)
+    # which only occur during setup, not the decode hot path.
+    # Poll pycrust every N iterations to handle shutdown signals.
+    poll_timeout_ms = 100 if not side_channel else 1
+    _pycrust_poll_interval = 100  # check pycrust every N fire_batch steps
 
-    @dataclass
-    class PendingRequest:
-        """A fire_batch RPC waiting to be processed."""
-        pycrust_request_id: int
-        kwargs: dict
-        num_requests: int
-        max_decode_steps: int
-        generate_count: int  # non-flush requests
+    # --- Multi-step decode helpers ---
+    def _build_continuation_kwargs(prev_kwargs, sampled_tokens):
+        """Build kwargs for a continuation step from previous step's output.
 
-    @dataclass
-    class ActiveGroup:
-        """A group of requests being stepped through the continuation loop."""
-        # Mutable per-step arrays
-        token_ids: np.ndarray          # current step's input tokens
-        kv_last_page_lens: np.ndarray  # KV page fill levels
-        seq_lens: np.ndarray           # total sequence lengths
-        # Immutable across steps (shared references)
-        kv_page_indices: np.ndarray
-        kv_page_indptr: np.ndarray
-        sampling_params_list: list
-        adapter_indices: list
-        kwargs: dict                   # original kwargs (for sampler_types etc.)
-        # Accumulation state
-        accumulated_tokens: list       # [list[int]] per request
-        accumulated_dists: list        # [list] per request
-        remaining_steps: int
-        # Back-reference for response routing
-        pending: PendingRequest
+        Must update ALL fields that differ between prefill and decode:
+        - token_ids: sampled tokens (1 per request)
+        - qo_indptr: [0, 1, 2, ..., n] (1 token per request)
+        - kv_last_page_lens: increment by 1
+        - flat_output_token_indices: [0, 0, ..., 0] (logits at position 0)
+        - output_token_indptr: [0, 1, 2, ..., n] (1 output per request)
+        - single_token_mode: True
+        - masks: cleared (causal for single-token)
+        """
+        import numpy as np
+        num_reqs = len(sampled_tokens)
+        token_ids = np.array(sampled_tokens, dtype=np.uint32).tobytes()
+        qo_indptr = np.arange(num_reqs + 1, dtype=np.uint32).tobytes()
+        prev_lens = np.frombuffer(prev_kwargs["kv_last_page_lens"], dtype=np.uint32).copy()
+        prev_lens += 1
+        kv_last_page_lens = prev_lens.astype(np.uint32).tobytes()
+        # Output indices: each request outputs logits at index 0 (the only token)
+        flat_output_token_indices = np.zeros(num_reqs, dtype=np.uint32).tobytes()
+        output_token_indptr = np.arange(num_reqs + 1, dtype=np.uint32).tobytes()
+        next_kw = dict(prev_kwargs)
+        next_kw["token_ids"] = token_ids
+        next_kw["qo_indptr"] = qo_indptr
+        next_kw["kv_last_page_lens"] = kv_last_page_lens
+        next_kw["flat_output_token_indices"] = flat_output_token_indices
+        next_kw["output_token_indptr"] = output_token_indptr
+        next_kw["single_token_mode"] = True
+        next_kw["max_decode_steps"] = 1
+        next_kw["flattened_masks"] = b""
+        next_kw["mask_indptr"] = np.zeros(num_reqs + 1, dtype=np.uint32).tobytes()
+        return next_kw
 
-    # --- State ---
+    def _combine_multistep_results(step_results):
+        """Accumulate tokens across steps into one response."""
+        if len(step_results) == 1:
+            return step_results[0]
+        num_reqs = len(step_results[0]["results"])
+        combined = []
+        for req_idx in range(num_reqs):
+            all_tokens, all_dists = [], []
+            for sr in step_results:
+                if req_idx < len(sr["results"]):
+                    r = sr["results"][req_idx]
+                    all_tokens.extend(r.get("tokens", []))
+                    all_dists.extend(r.get("dists", []))
+            combined.append({"tokens": all_tokens, "dists": all_dists})
+        return {"results": combined, "metrics": step_results[-1]["metrics"]}
+
+    def _can_continue_step(kwargs, kv_page_size):
+        """Check if ALL requests can do one more step without needing a new KV page."""
+        if kv_page_size <= 0:
+            return True
+        import numpy as np
+        lens = np.frombuffer(kwargs["kv_last_page_lens"], dtype=np.uint32)
+        # After incrementing by 1, would any request reach kv_page_size?
+        # If so, a new page would be needed — stop.
+        return not np.any(lens + 1 > kv_page_size)
+
     shutdown_requested = False
-    poll_timeout_ms = 100
     parent_pid = os.getppid()
-    check_parent_every = 100
-    loop_count = 0
+    check_parent_every = 100 if side_channel else 10
+    poll_count = 0
 
-    pending_new: list[PendingRequest] = []
-    active_groups: list[ActiveGroup] = []
-    # GPU step result: None means idle, _SENTINEL means error was handled,
-    # otherwise holds the result from the last fire_batch/execute_step.
-    # Runs synchronously on the main thread to avoid CUDA thread-safety issues.
-    gpu_result = None
-    gpu_error = None  # Exception from last step, if any
-    current_slices = None  # [(group_ref, start_idx, count)] from last merge
-
-    def _drain_queue():
-        """Non-blocking drain of all pending IPC requests."""
-        nonlocal shutdown_requested
-        while True:
-            try:
-                request = ipc_queue.poll_blocking(0)
-            except Exception:
-                shutdown_requested = True
-                return
-            if request is None:
-                return
-            request_id, method, payload = request
-            try:
-                args = msgpack.unpackb(payload)
-                if method == "shutdown":
-                    shutdown_requested = True
-                    ipc_queue.respond(request_id, msgpack.packb(None))
-                    return
-                if method == "fire_batch":
-                    num_reqs = len(PieVllmBatchTranslator.decode_binary_array(
-                        args["qo_indptr"], np.uint32)) - 1
-                    mds = args.get("max_decode_steps", 1)
-                    gc = compute_batch_generate_counts([args])[0]
-                    pending_new.append(PendingRequest(
-                        pycrust_request_id=request_id,
-                        kwargs=args,
-                        num_requests=num_reqs,
-                        max_decode_steps=mds,
-                        generate_count=gc,
-                    ))
-                    if _batching_debug:
-                        print(f"[BATCH-ACC] req_id={request_id} reqs={num_reqs} "
-                              f"mds={mds} pending_new={len(pending_new)} "
-                              f"active={len(active_groups)}",
-                              file=sys.stderr, flush=True)
-                    continue
-                # Non-fire_batch: handle immediately
-                fn = methods.get(method)
-                if fn is None:
-                    ipc_queue.respond(request_id, msgpack.packb(f"Method not found: {method}"))
-                    continue
-                if isinstance(args, dict):
-                    result = fn(**args)
-                elif isinstance(args, (list, tuple)):
-                    result = fn(*args)
-                else:
-                    result = fn(args)
-                ipc_queue.respond(request_id, msgpack.packb(result))
-            except Exception as e:
-                import traceback
-                print(f"[IPC Worker Error] {method}: {e}\n{traceback.format_exc()}")
-                ipc_queue.respond(request_id, msgpack.packb(str(e)))
-
-    def _build_merged_arrays():
-        """Merge active continuations + new arrivals into one batch.
-
-        Returns (merged_arrays: DecodedBatchArrays, merged_kwargs: dict,
-                 slices: list[(ref, start, count)]).
-        """
-        all_token_ids = []
-        all_kv_page_indices = []
-        all_kv_page_indptr_diffs = []
-        all_kv_last_page_lens = []
-        all_sampling_params = []
-        all_adapter_indices = []
-        slices = []
-        idx = 0
-
-        # Active continuations (already decoded numpy arrays)
-        for grp in active_groups:
-            n = grp.pending.num_requests
-            all_token_ids.append(grp.token_ids)
-            all_kv_page_indices.append(grp.kv_page_indices)
-            all_kv_page_indptr_diffs.append(np.diff(grp.kv_page_indptr))
-            all_kv_last_page_lens.append(grp.kv_last_page_lens)
-            all_sampling_params.extend(grp.sampling_params_list)
-            all_adapter_indices.extend(grp.adapter_indices)
-            slices.append((grp, idx, n))
-            idx += n
-
-        # New arrivals (need decoding)
-        for pend in pending_new:
-            arrays = PieVllmRuntime.decode_batch_arrays(pend.kwargs, runtime.kv_page_size)
-            n = arrays.num_requests
-            all_token_ids.append(arrays.token_ids)
-            all_kv_page_indices.append(arrays.kv_page_indices)
-            all_kv_page_indptr_diffs.append(np.diff(arrays.kv_page_indptr))
-            all_kv_last_page_lens.append(arrays.kv_last_page_lens)
-            all_sampling_params.extend(arrays.sampling_params_list)
-            all_adapter_indices.extend(arrays.adapter_indices)
-            slices.append((pend, idx, n))
-            idx += n
-
-        # Build merged arrays
-        merged_token_ids = np.concatenate(all_token_ids)
-        merged_kv_page_indices = np.concatenate(all_kv_page_indices)
-        merged_kv_last_page_lens = np.concatenate(all_kv_last_page_lens)
-
-        kv_diffs = np.concatenate(all_kv_page_indptr_diffs)
-        merged_kv_page_indptr = np.empty(len(kv_diffs) + 1, dtype=np.int32)
-        merged_kv_page_indptr[0] = 0
-        np.cumsum(kv_diffs, out=merged_kv_page_indptr[1:])
-
-        # For decode steps: 1 token per request
-        merged_qo_indptr = np.arange(idx + 1, dtype=np.int32)
-
-        tokens_per_req = [1] * idx
-        blocks_per_req = PieVllmBatchTranslator.pages_to_blocks(
-            merged_kv_page_indices, merged_kv_page_indptr
-        )
-        seq_lens = PieVllmBatchTranslator.compute_seq_lens(
-            merged_kv_page_indptr, merged_kv_last_page_lens, runtime.kv_page_size
-        )
-
-        merged_arrays = DecodedBatchArrays(
-            token_ids=merged_token_ids,
-            qo_indptr=merged_qo_indptr,
-            kv_page_indices=merged_kv_page_indices,
-            kv_page_indptr=merged_kv_page_indptr,
-            kv_last_page_lens=merged_kv_last_page_lens,
-            num_requests=idx,
-            tokens_per_req=tokens_per_req,
-            blocks_per_req=blocks_per_req,
-            seq_lens=seq_lens,
-            sampling_params_list=all_sampling_params,
-            adapter_indices=all_adapter_indices,
-        )
-
-        # Build merged kwargs for prepare_step (needs sampler_types, masks, etc.)
-        # Use first available kwargs as base, override arrays
-        base_kwargs = (active_groups[0].kwargs if active_groups
-                       else pending_new[0].kwargs)
-        merged_kwargs = dict(base_kwargs)
-        merged_kwargs["single_token_mode"] = True
-        merged_kwargs["flattened_masks"] = b""
-        merged_kwargs["mask_indptr"] = b""
-        # Rebuild sampler SoA arrays from merged sampling_params
-        # (prepare_step reads these from kwargs for multi-position logits)
-        rns_parts = []
-        st_parts = []
-        for grp in active_groups:
-            rns_parts.append(PieVllmBatchTranslator.decode_binary_array(
-                grp.kwargs.get("request_num_samplers", b""), np.uint32))
-            st_parts.append(PieVllmBatchTranslator.decode_binary_array(
-                grp.kwargs.get("sampler_types", b""), np.uint32))
-        for pend in pending_new:
-            rns_parts.append(PieVllmBatchTranslator.decode_binary_array(
-                pend.kwargs.get("request_num_samplers", b""), np.uint32))
-            st_parts.append(PieVllmBatchTranslator.decode_binary_array(
-                pend.kwargs.get("sampler_types", b""), np.uint32))
-        if rns_parts:
-            merged_kwargs["request_num_samplers"] = np.concatenate(rns_parts).tobytes()
-        if st_parts:
-            merged_kwargs["sampler_types"] = np.concatenate(st_parts).tobytes()
-        # Concatenate sampler parameter arrays
-        for key in ("sampler_temperatures", "sampler_top_k", "sampler_top_p", "sampler_min_p"):
-            parts = []
-            for grp in active_groups:
-                parts.append(PieVllmBatchTranslator.decode_binary_array(
-                    grp.kwargs.get(key, b""), np.float32 if "temperature" in key or "top_p" in key or "min_p" in key else np.uint32))
-            for pend in pending_new:
-                parts.append(PieVllmBatchTranslator.decode_binary_array(
-                    pend.kwargs.get(key, b""), np.float32 if "temperature" in key or "top_p" in key or "min_p" in key else np.uint32))
-            if parts:
-                merged_kwargs[key] = np.concatenate(parts).tobytes()
-
-        return merged_arrays, merged_kwargs, slices
-
-    def _collect_and_advance(model_output):
-        """After GPU step: extract tokens, advance continuations, retire finished."""
-        nonlocal active_groups, current_slices
-
-        sampled_tokens = runtime.extract_sampled_tokens(model_output)
-
-        # Check if any group needs distribution capture
-        has_dists = False
-        for ref, start, count in current_slices:
-            kw = ref.kwargs if isinstance(ref, ActiveGroup) else ref.kwargs
-            st = PieVllmBatchTranslator.decode_binary_array(
-                kw.get("sampler_types", b""), np.uint32)
-            if len(st) > 0 and np.any(st == 0):
-                has_dists = True
-                break
-
-        # If distributions needed, run full packaging for this step
-        step_results = None
-        if has_dists:
-            # Build kwargs for _package_response from the merged batch
-            total_reqs = sum(count for _, _, count in current_slices)
-            merged_kwargs = active_groups[0].kwargs if active_groups else pending_new[0].kwargs
-            step_results = runtime._package_response(
-                model_output, merged_kwargs, total_reqs)
-
-        continuing = []
-        retired = []
-
-        for ref, start, count in current_slices:
-            group_tokens = sampled_tokens[start:start + count]
-
-            if isinstance(ref, ActiveGroup):
-                # Existing continuation
-                grp = ref
-                for i, token in enumerate(group_tokens):
-                    grp.accumulated_tokens[i].append(token)
-                if has_dists and step_results:
-                    for i in range(count):
-                        if start + i < len(step_results):
-                            grp.accumulated_dists[i].extend(step_results[start + i].get("dists", []))
-                grp.remaining_steps -= 1
-            else:
-                # New arrival's first step — create ActiveGroup
-                pend = ref
-                arrays = PieVllmRuntime.decode_batch_arrays(pend.kwargs, runtime.kv_page_size)
-                grp = ActiveGroup(
-                    token_ids=arrays.token_ids,  # will be updated below
-                    kv_last_page_lens=arrays.kv_last_page_lens.copy(),
-                    seq_lens=arrays.seq_lens.copy(),
-                    kv_page_indices=arrays.kv_page_indices,
-                    kv_page_indptr=arrays.kv_page_indptr,
-                    sampling_params_list=arrays.sampling_params_list,
-                    adapter_indices=arrays.adapter_indices,
-                    kwargs=pend.kwargs,
-                    accumulated_tokens=[[t] for t in group_tokens],
-                    accumulated_dists=[[] for _ in range(count)],
-                    remaining_steps=pend.max_decode_steps - 1,
-                    pending=pend,
-                )
-                if has_dists and step_results:
-                    for i in range(count):
-                        if start + i < len(step_results):
-                            grp.accumulated_dists[i].extend(step_results[start + i].get("dists", []))
-
-            if grp.remaining_steps <= 0:
-                retired.append(grp)
-            else:
-                # Update arrays for next step (replicates model.rs:855-868)
-                grp.token_ids = np.array(group_tokens, dtype=np.int64)
-                grp.kv_last_page_lens = grp.kv_last_page_lens + 1
-                overflow = grp.kv_last_page_lens > runtime.kv_page_size
-                grp.kv_last_page_lens[overflow] = 1
-                grp.seq_lens = grp.seq_lens + 1
-                continuing.append(grp)
-
-        active_groups = continuing
-        return retired
-
-    def _respond_retired(retired_groups):
-        """Send accumulated multi-token responses for finished groups."""
-        for grp in retired_groups:
-            results = []
-            for i in range(grp.pending.num_requests):
-                # Only include results for generate (non-flush) requests
-                rns = PieVllmBatchTranslator.decode_binary_array(
-                    grp.kwargs.get("request_num_samplers", b""), np.uint32)
-                if i < len(rns) and rns[i] == 0:
-                    continue  # flush request — skip
-                tokens = grp.accumulated_tokens[i] if i < len(grp.accumulated_tokens) else []
-                dists = grp.accumulated_dists[i] if i < len(grp.accumulated_dists) else []
-                results.append({"tokens": tokens, "dists": dists})
-
-            response = {"results": results, "metrics": {
-                "batch_size": grp.pending.num_requests,
-                "continuation_steps": len(grp.accumulated_tokens[0]) if grp.accumulated_tokens else 0,
-            }}
-
-            if _batching_debug:
-                print(f"[BATCH-RETIRE] req_id={grp.pending.pycrust_request_id} "
-                      f"reqs={grp.pending.num_requests} "
-                      f"tokens_per_req={len(grp.accumulated_tokens[0]) if grp.accumulated_tokens else 0}",
-                      file=sys.stderr, flush=True)
-
-            ipc_queue.respond(grp.pending.pycrust_request_id,
-                              msgpack.packb(response))
-
-    def _fire_step():
-        """Merge active + pending into one batch and run on GPU (main thread).
-
-        Runs synchronously on the main thread to ensure CUDA context safety.
-        vLLM's model runner initializes CUDA on the main thread, and GPU ops
-        from other threads cause segfaults.
-        """
-        nonlocal active_groups, pending_new, gpu_result, gpu_error, current_slices
-
-        gpu_error = None
-
-        # Check if all requests are single-step (fast path)
-        all_single = (not active_groups and
-                      all(p.max_decode_steps <= 1 for p in pending_new))
-
-        if all_single and len(pending_new) == 1:
-            # Single fire_batch, single step — use original fire_batch directly
-            pend = pending_new.pop()
-            current_slices = [(pend, 0, pend.num_requests)]
-            try:
-                gpu_result = runtime.fire_batch(**pend.kwargs)
-            except Exception as e:
-                gpu_error = e
-            return
-
-        if all_single and len(pending_new) > 1:
-            # Multiple single-step fire_batches — merge kwargs and fire_batch
-            from pie_worker.batch_merger import merge_fire_batch_kwargs
-            kwargs_list = [p.kwargs for p in pending_new]
-            merged = merge_fire_batch_kwargs(kwargs_list)
-            current_slices = []
-            idx = 0
-            for p in pending_new:
-                current_slices.append((p, idx, p.num_requests))
-                idx += p.num_requests
-            pending_new = []
-            try:
-                gpu_result = runtime.fire_batch(**merged)
-            except Exception as e:
-                gpu_error = e
-            return
-
-        # Multi-step path: build merged arrays and run one GPU step
-        merged_arrays, merged_kwargs, current_slices = _build_merged_arrays()
-        active_groups = []
-        pending_new = []
-
-        total_reqs = merged_arrays.num_requests
-        if _batching_debug:
-            n_active = sum(1 for ref, _, _ in current_slices if isinstance(ref, ActiveGroup))
-            n_new = sum(1 for ref, _, _ in current_slices if isinstance(ref, PendingRequest))
-            print(f"[BATCH-STEP] reqs={total_reqs} active_groups={n_active} "
-                  f"new_groups={n_new}",
-                  file=sys.stderr, flush=True)
-
-        import torch
+    # Batch merger imports (only when side-channel is active)
+    merge_fn = None
+    counts_fn = None
+    split_fn = None
+    if side_channel:
         try:
-            with torch.inference_mode():
-                scheduler_output = runtime.prepare_step(merged_arrays, merged_kwargs)
-                gpu_result = runtime.execute_step(scheduler_output)
-        except Exception as e:
-            gpu_error = e
+            from pie_worker.batch_merger import (
+                merge_fire_batch_kwargs,
+                compute_batch_generate_counts,
+                split_fire_batch_results,
+            )
+            merge_fn = merge_fire_batch_kwargs
+            counts_fn = compute_batch_generate_counts
+            split_fn = split_fire_batch_results
+        except ImportError as e:
+            print(
+                f"[FIRE-BATCH-SOCK] batch_merger not available, "
+                f"side-channel disabled: {e}",
+                file=sys.stderr, flush=True,
+            )
+            side_channel.close()
+            side_channel = None
+            poll_timeout_ms = 100
+            check_parent_every = 10
 
-    def _handle_single_step_completion():
-        """Handle completion of single-step fire_batch (fast path)."""
-        nonlocal gpu_result, gpu_error, current_slices
+    _batch_debug = os.environ.get("PIE_BATCH_DEBUG", "")
 
-        if gpu_error is not None:
-            import traceback
-            print(f"[BATCH-ERROR] fire_batch failed: {gpu_error}\n{traceback.format_exc()}",
-                  file=sys.stderr, flush=True)
-            for ref, _, _ in current_slices:
-                if isinstance(ref, PendingRequest):
-                    ipc_queue.respond(ref.pycrust_request_id,
-                                      msgpack.packb(str(gpu_error)))
-            gpu_result = None
-            gpu_error = None
-            current_slices = None
-            return
+    # PIE_TRACE: per-step timestamp tracing (single CLOCK_MONOTONIC ns per event)
+    import time as _time
+    _mono_clock = _time.CLOCK_MONOTONIC
+    _mono = _time.clock_gettime_ns
+    _trace = os.environ.get("PIE_TRACE", "")
+    _trace_fd = sys.stderr if _trace else None
+    _batch_counter = 0
 
-        result = gpu_result
+    def _t(phase, batch_id, **kv):
+        """Emit a single trace event with one timestamp."""
+        extra = " ".join(f"{k}={v}" for k, v in kv.items()) if kv else ""
+        print(f"[PIE-TRACE] {_mono(_mono_clock)} {phase} {batch_id} {extra}",
+              file=_trace_fd, flush=True)
 
-        # Single-step results — respond immediately
-        if len(current_slices) == 1:
-            ref, _, _ = current_slices[0]
-            ipc_queue.respond(ref.pycrust_request_id, msgpack.packb(result))
-        else:
-            # Multiple merged single-step batches — split results
-            from pie_worker.batch_merger import split_fire_batch_results
-            gen_counts = [ref.generate_count for ref, _, _ in current_slices]
-            responses = split_fire_batch_results(result, gen_counts)
-            for (ref, _, _), resp in zip(current_slices, responses):
-                ipc_queue.respond(ref.pycrust_request_id, msgpack.packb(resp))
-
-        gpu_result = None
-        current_slices = None
-
-    def _handle_multistep_completion():
-        """Handle completion of a multi-step GPU step."""
-        nonlocal gpu_result, gpu_error, current_slices
-
-        if gpu_error is not None:
-            import traceback
-            print(f"[BATCH-ERROR] execute_step failed: {gpu_error}\n{traceback.format_exc()}",
-                  file=sys.stderr, flush=True)
-            # Respond with error to all groups
-            for ref, _, _ in current_slices:
-                pend = ref.pending if isinstance(ref, ActiveGroup) else ref
-                ipc_queue.respond(pend.pycrust_request_id,
-                                  msgpack.packb(str(gpu_error)))
-            gpu_result = None
-            gpu_error = None
-            current_slices = None
-            active_groups.clear()
-            return
-
-        retired = _collect_and_advance(gpu_result)
-        _respond_retired(retired)
-
-        gpu_result = None
-        # current_slices consumed by _collect_and_advance
-
-    def _is_multistep_batch():
-        """Check if current batch is a multi-step batch (vs single-step fast path)."""
-        if current_slices is None:
-            return False
-        return any(isinstance(ref, ActiveGroup) for ref, _, _ in current_slices) or \
-               any(isinstance(ref, PendingRequest) and ref.max_decode_steps > 1
-                   for ref, _, _ in current_slices)
-
-    # --- Main loop ---
-    # With synchronous GPU execution on the main thread, the loop is:
-    #   1. DRAIN IPC queue (non-blocking)
-    #   2. FIRE step if work pending (runs GPU synchronously)
-    #   3. COLLECT results and respond
-    #   4. WAIT for next IPC request if idle
     try:
         while not shutdown_requested:
-            loop_count += 1
-            if loop_count % check_parent_every == 0:
+            # Check if parent process is still alive periodically
+            poll_count += 1
+            if poll_count % check_parent_every == 0:
                 try:
                     os.kill(parent_pid, 0)
                 except OSError:
                     break
 
-            # 1. DRAIN
-            _drain_queue()
-            if shutdown_requested:
-                break
+            _bid = _batch_counter  # batch ID for trace correlation
 
-            # 2. FIRE + COLLECT — GPU runs synchronously, result is immediate
-            if (active_groups or pending_new):
-                _fire_step()
-                # Result is available immediately after _fire_step returns
-                if _is_multistep_batch():
-                    _handle_multistep_completion()
-                else:
-                    _handle_single_step_completion()
-                continue  # drain again immediately (new IPC may have arrived during GPU)
+            # Capture timestamps eagerly; emit only if non-idle
+            if _trace:
+                _ts_loop_start = _mono(_mono_clock)
 
-            # 3. WAIT — no work pending, block for next IPC request
-            if not pending_new and not active_groups:
+            # --- 1. Poll pycrust for non-fire_batch RPCs ---
+            _skip_pycrust = (
+                side_channel is not None
+                and poll_count % _pycrust_poll_interval != 0
+            )
+            if _skip_pycrust:
+                request = None
+            else:
                 try:
                     request = ipc_queue.poll_blocking(poll_timeout_ms)
                 except Exception:
                     break
-                if request is not None:
-                    request_id, method, payload = request
+
+            if _trace:
+                _ts_poll_done = _mono(_mono_clock)
+
+            if request is not None:
+                request_id, method, payload = request
+                try:
+                    args = msgpack.unpackb(payload)
+                    if method == "shutdown":
+                        shutdown_requested = True
+                        ipc_queue.respond(request_id, msgpack.packb(None))
+                        continue
+                    fn = methods.get(method)
+                    if fn is None:
+                        ipc_queue.respond(request_id, msgpack.packb(f"Method not found: {method}"))
+                        continue
+                    if isinstance(args, dict):
+                        result = fn(**args)
+                    elif isinstance(args, (list, tuple)):
+                        result = fn(*args)
+                    else:
+                        result = fn(args)
+                    ipc_queue.respond(request_id, msgpack.packb(result))
+                except Exception as e:
+                    import traceback
+                    print(f"[IPC Worker Error] {method}: {e}\n{traceback.format_exc()}")
+                    ipc_queue.respond(request_id, msgpack.packb(str(e)))
+
+            # --- 2. Drain fire_batch from side-channel ---
+            if side_channel is None:
+                continue
+
+            pending = side_channel.drain_requests()
+
+            if _trace:
+                _ts_drain_done = _mono(_mono_clock)
+
+            if not pending:
+                continue
+
+            # Emit deferred timestamps (only for non-idle steps)
+            if _trace:
+                _tfd = _trace_fd
+                print(f"[PIE-TRACE] {_ts_loop_start} py.loop_start {_bid} ", file=_tfd, flush=True)
+                print(f"[PIE-TRACE] {_ts_poll_done} py.poll_done {_bid} ", file=_tfd, flush=True)
+                print(f"[PIE-TRACE] {_ts_drain_done} py.drain_done {_bid} n={len(pending)}", file=_tfd, flush=True)
+
+            # Decode all pending batches
+            batch_items = []
+            for req_id, raw_payload in pending:
+                kwargs = msgpack.unpackb(raw_payload)
+                batch_items.append((req_id, kwargs))
+
+            # Merge
+            if len(batch_items) == 1:
+                req_ids = [batch_items[0][0]]
+                fire_kwargs = batch_items[0][1]
+                counts = None
+            else:
+                batches_list = [kw for _, kw in batch_items]
+                req_ids = [rid for rid, _ in batch_items]
+                counts = counts_fn(batches_list)
+                fire_kwargs = merge_fn(batches_list)
+
+            # Count total requests in merged batch
+            import numpy as np
+            _n_reqs = len(np.frombuffer(
+                fire_kwargs.get("qo_indptr", b"\x00\x00\x00\x00"), dtype=np.uint32
+            )) - 1
+
+            if _trace:
+                _t("py.unpack_done", _bid, reqs=_n_reqs, drained=len(batch_items))
+
+            _batch_counter += 1
+
+            try:
+                if _trace:
+                    _t("py.fb_enter", _bid, reqs=_n_reqs)
+
+                result = runtime.fire_batch(**fire_kwargs)
+
+                if _trace:
+                    _t("py.fb_exit", _bid)
+
+                # --- Python-side multi-step decode ---
+                # When max_decode_steps > 1, loop internally to eliminate
+                # Rust IPC round-trips and yield-boundary stalls.
+                _max_steps = fire_kwargs.get("max_decode_steps", 1)
+                _kv_page_size = getattr(runtime, 'kv_page_size', 0)
+                if _max_steps > 1 and _can_continue_step(fire_kwargs, _kv_page_size):
+                    _step_results = [result]
+                    _cur_kwargs = fire_kwargs
+                    for _step in range(1, _max_steps):
+                        # Extract sampled tokens
+                        _prev_tokens = [r["tokens"][0] for r in result["results"]
+                                        if r.get("tokens")]
+                        if not _prev_tokens:
+                            break
+                        # Check if next step fits in current KV page
+                        if not _can_continue_step(_cur_kwargs, _kv_page_size):
+                            break
+                        _cur_kwargs = _build_continuation_kwargs(_cur_kwargs, _prev_tokens)
+                        if _trace:
+                            _t("py.ms_step", _bid, step=_step, reqs=len(_prev_tokens))
+                        try:
+                            result = runtime.fire_batch(**_cur_kwargs)
+                        except Exception as _e:
+                            print(f"[MS-ERROR] step {_step}: {_e}", file=sys.stderr, flush=True)
+                            break
+                        _step_results.append(result)
+                    result = _combine_multistep_results(_step_results)
+                    if _trace:
+                        _t("py.ms_done", _bid, steps=len(_step_results))
+
+                # Pack and respond
+                if counts is None:
+                    resp_bytes = msgpack.packb(result)
+                    if _trace:
+                        _t("py.pack_done", _bid)
+                    side_channel.send_response(req_ids[0], resp_bytes)
+                else:
+                    parts = split_fn(result, counts)
+                    for rid, part in zip(req_ids, parts):
+                        side_channel.send_response(rid, msgpack.packb(part))
+                    if _trace:
+                        _t("py.pack_done", _bid)
+
+                if _trace:
+                    _t("py.respond_done", _bid)
+
+            except Exception as e:
+                import traceback
+                print(f"[FIRE-BATCH-SOCK Error] {e}\n{traceback.format_exc()}",
+                      file=sys.stderr, flush=True)
+                err_resp = msgpack.packb({"error": str(e), "results": []})
+                for req_id, _ in batch_items:
                     try:
-                        args = msgpack.unpackb(payload)
-                        if method == "fire_batch":
-                            num_reqs = len(PieVllmBatchTranslator.decode_binary_array(
-                                args["qo_indptr"], np.uint32)) - 1
-                            mds = args.get("max_decode_steps", 1)
-                            gc = compute_batch_generate_counts([args])[0]
-                            pending_new.append(PendingRequest(
-                                pycrust_request_id=request_id,
-                                kwargs=args,
-                                num_requests=num_reqs,
-                                max_decode_steps=mds,
-                                generate_count=gc,
-                            ))
-                        elif method == "shutdown":
-                            shutdown_requested = True
-                            ipc_queue.respond(request_id, msgpack.packb(None))
-                        else:
-                            fn = methods.get(method)
-                            if fn:
-                                if isinstance(args, dict):
-                                    result = fn(**args)
-                                elif isinstance(args, (list, tuple)):
-                                    result = fn(*args)
-                                else:
-                                    result = fn(args)
-                                ipc_queue.respond(request_id, msgpack.packb(result))
-                    except Exception as e:
-                        import traceback
-                        print(f"[IPC Worker Error] {method}: {e}\n{traceback.format_exc()}")
-                        ipc_queue.respond(request_id, msgpack.packb(str(e)))
+                        side_channel.send_response(req_id, err_resp)
+                    except OSError:
+                        pass
     finally:
+        if side_channel:
+            side_channel.close()
         runtime.shutdown()
 
 
