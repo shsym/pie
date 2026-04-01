@@ -1137,67 +1137,6 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
     poll_timeout_ms = 100 if not side_channel else 1
     _pycrust_poll_interval = 100  # check pycrust every N fire_batch steps
 
-    # --- Multi-step decode helpers ---
-    def _build_continuation_kwargs(prev_kwargs, sampled_tokens):
-        """Build kwargs for a continuation step from previous step's output.
-
-        Must update ALL fields that differ between prefill and decode:
-        - token_ids: sampled tokens (1 per request)
-        - qo_indptr: [0, 1, 2, ..., n] (1 token per request)
-        - kv_last_page_lens: increment by 1
-        - flat_output_token_indices: [0, 0, ..., 0] (logits at position 0)
-        - output_token_indptr: [0, 1, 2, ..., n] (1 output per request)
-        - single_token_mode: True
-        - masks: cleared (causal for single-token)
-        """
-        import numpy as np
-        num_reqs = len(sampled_tokens)
-        token_ids = np.array(sampled_tokens, dtype=np.uint32).tobytes()
-        qo_indptr = np.arange(num_reqs + 1, dtype=np.uint32).tobytes()
-        prev_lens = np.frombuffer(prev_kwargs["kv_last_page_lens"], dtype=np.uint32).copy()
-        prev_lens += 1
-        kv_last_page_lens = prev_lens.astype(np.uint32).tobytes()
-        # Output indices: each request outputs logits at index 0 (the only token)
-        flat_output_token_indices = np.zeros(num_reqs, dtype=np.uint32).tobytes()
-        output_token_indptr = np.arange(num_reqs + 1, dtype=np.uint32).tobytes()
-        next_kw = dict(prev_kwargs)
-        next_kw["token_ids"] = token_ids
-        next_kw["qo_indptr"] = qo_indptr
-        next_kw["kv_last_page_lens"] = kv_last_page_lens
-        next_kw["flat_output_token_indices"] = flat_output_token_indices
-        next_kw["output_token_indptr"] = output_token_indptr
-        next_kw["single_token_mode"] = True
-        next_kw["max_decode_steps"] = 1
-        next_kw["flattened_masks"] = b""
-        next_kw["mask_indptr"] = np.zeros(num_reqs + 1, dtype=np.uint32).tobytes()
-        return next_kw
-
-    def _combine_multistep_results(step_results):
-        """Accumulate tokens across steps into one response."""
-        if len(step_results) == 1:
-            return step_results[0]
-        num_reqs = len(step_results[0]["results"])
-        combined = []
-        for req_idx in range(num_reqs):
-            all_tokens, all_dists = [], []
-            for sr in step_results:
-                if req_idx < len(sr["results"]):
-                    r = sr["results"][req_idx]
-                    all_tokens.extend(r.get("tokens", []))
-                    all_dists.extend(r.get("dists", []))
-            combined.append({"tokens": all_tokens, "dists": all_dists})
-        return {"results": combined, "metrics": step_results[-1]["metrics"]}
-
-    def _can_continue_step(kwargs, kv_page_size):
-        """Check if ALL requests can do one more step without needing a new KV page."""
-        if kv_page_size <= 0:
-            return True
-        import numpy as np
-        lens = np.frombuffer(kwargs["kv_last_page_lens"], dtype=np.uint32)
-        # After incrementing by 1, would any request reach kv_page_size?
-        # If so, a new page would be needed — stop.
-        return not np.any(lens + 1 > kv_page_size)
-
     shutdown_requested = False
     parent_pid = os.getppid()
     check_parent_every = 100 if side_channel else 10
@@ -1356,35 +1295,9 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                 if _trace:
                     _t("py.fb_exit", _bid)
 
-                # --- Python-side multi-step decode ---
-                # When max_decode_steps > 1, loop internally to eliminate
-                # Rust IPC round-trips and yield-boundary stalls.
-                _max_steps = fire_kwargs.get("max_decode_steps", 1)
-                _kv_page_size = getattr(runtime, 'kv_page_size', 0)
-                if _max_steps > 1 and _can_continue_step(fire_kwargs, _kv_page_size):
-                    _step_results = [result]
-                    _cur_kwargs = fire_kwargs
-                    for _step in range(1, _max_steps):
-                        # Extract sampled tokens
-                        _prev_tokens = [r["tokens"][0] for r in result["results"]
-                                        if r.get("tokens")]
-                        if not _prev_tokens:
-                            break
-                        # Check if next step fits in current KV page
-                        if not _can_continue_step(_cur_kwargs, _kv_page_size):
-                            break
-                        _cur_kwargs = _build_continuation_kwargs(_cur_kwargs, _prev_tokens)
-                        if _trace:
-                            _t("py.ms_step", _bid, step=_step, reqs=len(_prev_tokens))
-                        try:
-                            result = runtime.fire_batch(**_cur_kwargs)
-                        except Exception as _e:
-                            print(f"[MS-ERROR] step {_step}: {_e}", file=sys.stderr, flush=True)
-                            break
-                        _step_results.append(result)
-                    result = _combine_multistep_results(_step_results)
-                    if _trace:
-                        _t("py.ms_done", _bid, steps=len(_step_results))
+                # Multi-step decode is now handled inside fire_batch() in
+                # vllm_runtime.py — it loops internally using prepare_step +
+                # execute_step with proper SequenceTracker state management.
 
                 # Pack and respond
                 if counts is None:

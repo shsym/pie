@@ -918,8 +918,21 @@ class PieVllmRuntime:
         return tokens
 
     @torch.inference_mode()
-    def fire_batch(self, **kwargs: Any) -> dict:
+    def fire_batch(self, _drain_fn=None, _merge_fn=None, _counts_fn=None,
+                   **kwargs: Any) -> dict:
         """Execute a batched forward pass via vLLM's Worker.
+
+        When max_decode_steps > 1, loops internally for multi-step decode.
+        Between steps, calls _drain_fn to get new requests from the
+        side-channel, merges them via _merge_fn, and processes the combined
+        batch. This enables continuous batching at the Python level.
+
+        Args:
+            _drain_fn: Callable returning list[(req_id, msgpack_bytes)] of
+                new fire_batch requests from the side-channel. None to disable.
+            _merge_fn: merge_fire_batch_kwargs from batch_merger.
+            _counts_fn: compute_batch_generate_counts from batch_merger.
+            **kwargs: Batch fields from Rust IPC (msgpack-decoded).
 
         This is the critical path:
           1. Decode batch arrays from msgpack bytes
@@ -993,6 +1006,120 @@ class PieVllmRuntime:
             )
         self._captured_sample_hidden_states = None
         self._captured_full_hidden_states = None
+
+        # --- Multi-step decode loop ---
+        # When max_decode_steps > 1, loop internally to eliminate Rust IPC
+        # round-trips and yield-boundary stalls. Between steps, build
+        # continuation arrays from sampled tokens and let SequenceTracker
+        # handle all state (history, num_output_tokens, block deltas).
+        max_steps = kwargs.get("max_decode_steps", 1)
+        if max_steps > 1:
+            all_step_results = [results]  # results from step 0
+            for step_i in range(1, max_steps):
+                # Extract sampled tokens from previous step
+                prev_tokens = []
+                for r in results:
+                    toks = r.get("tokens", [])
+                    if len(toks) > 0:
+                        prev_tokens.append(toks[0])
+                if not prev_tokens:
+                    break  # no tokens (all flush or EOS)
+
+                # Build continuation arrays: just update token_ids, qo_indptr,
+                # kv_last_page_lens. SequenceTracker handles everything else.
+                cont_token_ids = np.array(prev_tokens, dtype=np.int64)
+                cont_qo_indptr = np.arange(len(prev_tokens) + 1, dtype=np.int32)
+                new_kv_lens = arrays.kv_last_page_lens.copy()
+                new_kv_lens += 1
+                if self.kv_page_size > 0:
+                    new_kv_lens[new_kv_lens > self.kv_page_size] = 1
+                cont_seq_lens = PieVllmBatchTranslator.compute_seq_lens(
+                    arrays.kv_page_indptr, new_kv_lens, self.kv_page_size
+                )
+                arrays = DecodedBatchArrays(
+                    token_ids=cont_token_ids,
+                    qo_indptr=cont_qo_indptr,
+                    kv_page_indices=arrays.kv_page_indices,
+                    kv_page_indptr=arrays.kv_page_indptr,
+                    kv_last_page_lens=new_kv_lens,
+                    num_requests=len(prev_tokens),
+                    tokens_per_req=[1] * len(prev_tokens),
+                    blocks_per_req=arrays.blocks_per_req,
+                    seq_lens=cont_seq_lens,
+                    sampling_params_list=arrays.sampling_params_list,
+                    adapter_indices=arrays.adapter_indices,
+                )
+                # Update kwargs for prepare_step (masks, output indices, single_token_mode)
+                kwargs["single_token_mode"] = True
+                kwargs["flattened_masks"] = b""
+                kwargs["mask_indptr"] = np.zeros(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
+                kwargs["flat_output_token_indices"] = np.zeros(len(prev_tokens), dtype=np.uint32).tobytes()
+                kwargs["output_token_indptr"] = np.arange(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
+                kwargs["kv_last_page_lens"] = new_kv_lens.astype(np.uint32).tobytes()
+                kwargs["qo_indptr"] = cont_qo_indptr.astype(np.uint32).tobytes()
+                kwargs["token_ids"] = cont_token_ids.astype(np.uint32).tobytes()
+
+                # Between steps: drain side-channel for new requests and merge
+                _merged_req_ids = None
+                _merged_counts = None
+                if _drain_fn and _merge_fn:
+                    import msgpack as _msgpack
+                    _new_pending = _drain_fn()
+                    if _new_pending:
+                        _new_items = [(_rid, _msgpack.unpackb(_raw))
+                                      for _rid, _raw in _new_pending]
+                        _new_batches = [_kw for _, _kw in _new_items]
+                        _merged_req_ids = [_rid for _rid, _ in _new_items]
+                        if _counts_fn:
+                            _merged_counts = _counts_fn(_new_batches)
+                        # Merge continuation kwargs with new request kwargs
+                        _all_batches = [kwargs] + _new_batches
+                        kwargs = _merge_fn(_all_batches)
+                        # Re-decode merged arrays
+                        arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
+                        num_requests = arrays.num_requests
+                        if os.environ.get("PIE_TRACE"):
+                            print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_merge {self._batch_counter} step={step_i} new_reqs={len(_new_pending)}",
+                                  file=sys.stderr, flush=True)
+
+                if os.environ.get("PIE_TRACE"):
+                    print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_step {self._batch_counter} step={step_i} reqs={arrays.num_requests}",
+                          file=sys.stderr, flush=True)
+
+                try:
+                    scheduler_output = self.prepare_step(arrays, kwargs)
+                    result = self.execute_step(scheduler_output)
+                    logits_expanded = self._expand_logits_for_multi_position(
+                        kwargs, arrays.qo_indptr, arrays.num_requests
+                    )
+                    results = self._package_response(
+                        result, kwargs, arrays.num_requests,
+                        logits_expanded=logits_expanded,
+                    )
+                except Exception as e:
+                    print(f"[MS-ERROR] step {step_i}: {e}", file=sys.stderr, flush=True)
+                    break
+
+                self._captured_sample_hidden_states = None
+                self._captured_full_hidden_states = None
+                all_step_results.append(results)
+
+            # Combine all steps: accumulate tokens per request
+            if len(all_step_results) > 1:
+                num_reqs = len(all_step_results[0])
+                combined = []
+                for req_idx in range(num_reqs):
+                    all_tokens, all_dists = [], []
+                    for sr in all_step_results:
+                        if req_idx < len(sr):
+                            all_tokens.extend(sr[req_idx].get("tokens", []))
+                            all_dists.extend(sr[req_idx].get("dists", []))
+                    combined.append({"tokens": all_tokens, "dists": all_dists})
+                results = combined
+
+                if os.environ.get("PIE_TRACE"):
+                    print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_done {self._batch_counter} steps={len(all_step_results)}",
+                          file=sys.stderr, flush=True)
 
         t_end = time.perf_counter()
 
