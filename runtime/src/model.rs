@@ -872,13 +872,26 @@ impl Model {
                         // Multi-step: accumulate token(s), re-enqueue or finish.
                         if let Some(ref r) = resp {
                             if r.tokens.len() > 1 {
+                                // Stream all tokens at once if Python returned multiple
+                                if let Some(ref tx) = fp_req.token_stream_tx {
+                                    for &t in &r.tokens {
+                                        if tx.send(t).is_err() { break; }
+                                    }
+                                }
                                 fp_req.multi_step_tokens.extend(&r.tokens);
                                 fp_req.max_decode_steps = 0;
                             } else if let Some(&token) = r.tokens.first() {
+                                // Stream this token immediately to WASM
+                                let cancelled = if let Some(ref tx) = fp_req.token_stream_tx {
+                                    tx.send(token).is_err() // WASM dropped receiver = cancel
+                                } else {
+                                    false
+                                };
+
                                 fp_req.multi_step_tokens.push(token);
                                 fp_req.max_decode_steps -= 1;
 
-                                if fp_req.max_decode_steps > 0 {
+                                if !cancelled && fp_req.max_decode_steps > 0 {
                                     fp_req.kv_page_last_len += 1;
                                     if fp_req.kv_page_size > 0
                                         && fp_req.kv_page_last_len > fp_req.kv_page_size
@@ -903,6 +916,9 @@ impl Model {
                                 }
                             }
                         }
+                        // Drop the streaming sender before sending final oneshot.
+                        // This closes the mpsc channel, signaling WASM that streaming is done.
+                        drop(fp_req.token_stream_tx.take());
                         if let Some(tx) = resp_tx {
                             tx.send(ForwardPassResponse {
                                 tokens: fp_req.multi_step_tokens,

@@ -3,7 +3,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 pub static HANDSHAKE_ID: u32 = 0;
@@ -199,6 +199,12 @@ pub struct ForwardPassRequest {
     /// Arrival time for scheduler estimation (not serialized).
     #[serde(skip)]
     pub arrival_time: Option<Instant>,
+    /// Per-token streaming channel (scheduler-only, not serialized).
+    /// When set, each multi-step continuation sends its token immediately
+    /// instead of only accumulating in multi_step_tokens. Enables the
+    /// WASM inferlet to process tokens while the next GPU step runs.
+    #[serde(skip)]
+    pub token_stream_tx: Option<mpsc::UnboundedSender<u32>>,
 }
 
 fn default_one() -> u32 {

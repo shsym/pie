@@ -80,6 +80,9 @@ pub struct ForwardPass {
 #[derive(Debug)]
 pub struct ForwardPassResult {
     pub receiver: oneshot::Receiver<ForwardPassResponse>,
+    /// Per-token streaming channel. Present when max_decode_steps > 1.
+    /// Each continuation step sends its token here immediately.
+    pub token_rx: Option<tokio::sync::mpsc::UnboundedReceiver<u32>>,
     pub distributions: Vec<(Vec<u32>, Vec<f32>)>,
     pub tokens: Vec<u32>,
     pub done: bool,
@@ -103,16 +106,45 @@ impl Pollable for ForwardPassResult {
 
         let t0 = if wit_timing_enabled() { Some(mono_ns()) } else { None };
 
-        if let Ok(res) = (&mut self.receiver).await {
-            self.distributions = res.dists;
-            self.tokens = res.tokens;
+        if let Some(ref mut token_rx) = self.token_rx {
+            // Streaming mode: wait for next token OR oneshot completion.
+            tokio::select! {
+                biased;
+                token = token_rx.recv() => {
+                    match token {
+                        Some(t) => self.tokens.push(t),
+                        None => {
+                            // Token channel closed — all tokens streamed.
+                            // Wait for oneshot to get distributions and signal done.
+                            if let Ok(res) = (&mut self.receiver).await {
+                                self.distributions = res.dists;
+                                self.tokens.extend(res.tokens);
+                            }
+                            self.done = true;
+                        }
+                    }
+                }
+                res = &mut self.receiver => {
+                    // Oneshot fired (final response with distributions).
+                    if let Ok(r) = res {
+                        self.distributions = r.dists;
+                        self.tokens.extend(r.tokens);
+                    }
+                    self.done = true;
+                }
+            }
+        } else {
+            // Non-streaming (single-step): wait for oneshot as before.
+            if let Ok(res) = (&mut self.receiver).await {
+                self.distributions = res.dists;
+                self.tokens = res.tokens;
+            }
+            self.done = true;
         }
 
         if let Some(t0) = t0 {
             WIT_READY_SUM_NS.fetch_add(mono_ns() - t0, AtomicOrdering::Relaxed);
         }
-
-        self.done = true;
     }
 }
 
@@ -419,7 +451,7 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
         };
 
         // 2) Build the request by MOVING data out of the pass (mutable borrow)
-        let (request, svc_id, queue_id, priority) = {
+        let (mut request, svc_id, queue_id, priority) = {
             let pass = self.ctx().table.get_mut(&this)?;
 
             let svc_id = pass.queue.service_id;
@@ -446,22 +478,25 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
                 kv_page_size: pass.queue.info.kv_page_size,
                 arrival_time: None, // Set in Model::submit() before queuing
                 inst_id: Some(self.id()),
+                token_stream_tx: None, // set below for multi-step
             };
 
             (request, svc_id, queue_id, priority)
         };
 
+        // For multi-step decode, create a per-token streaming channel.
+        // Tokens are sent one at a time as each continuation step completes,
+        // allowing the WASM inferlet to process them while the next GPU step runs.
+        let token_rx = if request.max_decode_steps > 1 {
+            let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel();
+            request.token_stream_tx = Some(token_tx);
+            Some(token_rx)
+        } else {
+            None
+        };
+
         // Always create a response channel so every request participates in
-        // the batch response protocol.  Without this, flush (no output) and
-        // decode (with output) in the same batch cause response misalignment:
-        // Python returns N responses for N requests, but the old code only
-        // advanced the response iterator for requests with a sender, shifting
-        // all subsequent responses by one.
-        //
-        // For flush requests (returns_output=false), the SDK still gets a
-        // pollable ForwardPassResult.  The inferlet awaits it, which ensures
-        // the batch's GPU forward pass completes before fork() proceeds —
-        // preventing KV write races with forked contexts.
+        // the batch response protocol.
         let (tx, rx) = oneshot::channel();
         let req = Request::ForwardPass(request, Some(tx));
         submit_request(svc_id, queue_id, priority, req)?;
@@ -472,6 +507,7 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
 
         let res = ForwardPassResult {
             receiver: rx,
+            token_rx,
             distributions: vec![],
             tokens: vec![],
             done: false,
@@ -510,10 +546,16 @@ impl inferlet::core::forward::HostForwardPassResult for InstanceState {
         let t0 = if wit_timing_enabled() { Some(mono_ns()) } else { None };
         let result = self.ctx().table.get_mut(&this)?;
 
-        let ret = if result.done {
+        let ret = if !result.tokens.is_empty() {
+            // Streaming or final: return buffered tokens, clear buffer.
             Ok(Some(take(&mut result.tokens)))
-        } else {
+        } else if result.done {
+            // Done and no more tokens — signal completion.
             Ok(None)
+        } else {
+            // Not done but no tokens yet (shouldn't happen after ready()).
+            // Return empty vec to distinguish from None (done).
+            Ok(Some(vec![]))
         };
         if let Some(t0) = t0 {
             let elapsed = mono_ns() - t0;
