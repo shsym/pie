@@ -1290,14 +1290,23 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                 if _trace:
                     _t("py.fb_enter", _bid, reqs=_n_reqs)
 
-                result = runtime.fire_batch(**fire_kwargs)
+                result = runtime.fire_batch(
+                    _drain_fn=side_channel.drain_requests if side_channel else None,
+                    _merge_fn=merge_fn,
+                    _counts_fn=counts_fn,
+                    **fire_kwargs,
+                )
 
                 if _trace:
                     _t("py.fb_exit", _bid)
 
-                # Multi-step decode is now handled inside fire_batch() in
-                # vllm_runtime.py — it loops internally using prepare_step +
-                # execute_step with proper SequenceTracker state management.
+                # Send responses for requests that were merged during
+                # fire_batch's multi-step loop (between-step drain).
+                _merged = result.get("_merged_responses", [])
+                for _mr in _merged:
+                    _mr_rid = _mr["req_id"]
+                    _mr_resp = msgpack.packb(_mr["result"])
+                    side_channel.send_response(_mr_rid, _mr_resp)
 
                 # Pack and respond
                 if counts is None:
