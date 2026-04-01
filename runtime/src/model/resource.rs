@@ -408,6 +408,25 @@ impl ResourceManager {
             .ok_or(ResourceError::ExportNotFound { name })
     }
 
+    /// Register imported resource pointers in the importing instance's
+    /// allocation table. This allows the instance to later re-export
+    /// these resources (e.g., session KV pages imported from a previous
+    /// turn that need to be re-exported after generation extends them).
+    pub fn register_imported(
+        &mut self,
+        inst_id: InstanceId,
+        type_id: ResourceTypeId,
+        ptrs: &[ResourceId],
+    ) {
+        let allocated = self
+            .res_allocated
+            .entry((type_id, inst_id))
+            .or_default();
+        for &ptr in ptrs {
+            allocated.insert(ptr);
+        }
+    }
+
     /// Import with group info (useful for ensuring we don't mix resources across groups,
     /// though currently exports are global and transfer ownership...)
     /// Actually, if we import, we might need to know which group it belongs to so the
