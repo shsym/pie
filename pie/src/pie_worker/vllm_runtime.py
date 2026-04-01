@@ -1063,26 +1063,35 @@ class PieVllmRuntime:
                 kwargs["token_ids"] = cont_token_ids.astype(np.uint32).tobytes()
 
                 # Between steps: drain side-channel for new requests and merge
+                # into the current batch. This enables continuous batching —
+                # new requests are processed in parallel with ongoing decode.
                 if _drain_fn and _merge_fn:
-                    import msgpack as _msgpack
                     _new_pending = _drain_fn()
                     if _new_pending:
-                        _new_items = [(_rid, _msgpack.unpackb(_raw))
-                                      for _rid, _raw in _new_pending]
-                        _new_batches = [_kw for _, _kw in _new_items]
-                        _new_rids = [_rid for _rid, _ in _new_items]
-                        _new_counts = _counts_fn(_new_batches) if _counts_fn else [1] * len(_new_batches)
-                        _all_merged_req_ids.extend(_new_rids)
-                        _all_merged_counts.extend(_new_counts)
-                        # Merge continuation kwargs with new request kwargs
-                        _all_batches = [kwargs] + _new_batches
-                        kwargs = _merge_fn(_all_batches)
-                        # Re-decode merged arrays
-                        arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
-                        num_requests = arrays.num_requests
-                        if os.environ.get("PIE_TRACE"):
-                            print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_merge {self._batch_counter} step={step_i} new_reqs={len(_new_pending)} total_reqs={num_requests}",
+                        try:
+                            import msgpack as _msgpack
+                            _new_items = [(_rid, _msgpack.unpackb(_raw))
+                                          for _rid, _raw in _new_pending]
+                            _new_batches = [_kw for _, _kw in _new_items]
+                            _new_rids = [_rid for _rid, _ in _new_items]
+                            _new_counts = _counts_fn(_new_batches) if _counts_fn else [1] * len(_new_batches)
+                            _all_merged_req_ids.extend(_new_rids)
+                            _all_merged_counts.extend(_new_counts)
+                            _all_batches = [kwargs] + _new_batches
+                            kwargs = _merge_fn(_all_batches)
+                            arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
+                            num_requests = arrays.num_requests
+                            if os.environ.get("PIE_TRACE"):
+                                print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_merge {self._batch_counter} step={step_i} new_reqs={len(_new_pending)} total_reqs={num_requests}",
+                                      file=sys.stderr, flush=True)
+                        except Exception as _merge_err:
+                            # Merge failed — log error, skip merge, process new
+                            # requests after the loop instead
+                            import traceback
+                            print(f"[MS-MERGE-ERROR] step {step_i}: {_merge_err}\n{traceback.format_exc()}",
                                   file=sys.stderr, flush=True)
+                            # Put back as raw tuples for manager.py to process later
+                            _all_merged_req_ids.extend(_new_pending)
 
                 if os.environ.get("PIE_TRACE"):
                     print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_step {self._batch_counter} step={step_i} reqs={arrays.num_requests}",
@@ -1119,26 +1128,6 @@ class PieVllmRuntime:
                             all_dists.extend(sr[req_idx].get("dists", []))
                     combined.append({"tokens": all_tokens, "dists": all_dists})
                 results = combined
-
-                # Merged requests: collect tokens from steps after merge.
-                # They appear at indices >= _orig_num_reqs in step results.
-                if _all_merged_req_ids:
-                    _merged_results = []
-                    _offset = _orig_num_reqs
-                    for _mr_idx in range(len(_all_merged_req_ids)):
-                        _mr_count = _all_merged_counts[_mr_idx] if _mr_idx < len(_all_merged_counts) else 1
-                        _mr_tokens = []
-                        _mr_dists = []
-                        for sr in all_step_results:
-                            for _ri in range(_offset, _offset + _mr_count):
-                                if _ri < len(sr):
-                                    _mr_tokens.extend(sr[_ri].get("tokens", []))
-                                    _mr_dists.extend(sr[_ri].get("dists", []))
-                        _merged_results.append({
-                            "req_id": _all_merged_req_ids[_mr_idx],
-                            "result": {"results": [{"tokens": _mr_tokens, "dists": _mr_dists}], "metrics": {}},
-                        })
-                        _offset += _mr_count
 
                 if os.environ.get("PIE_TRACE"):
                     print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_done {self._batch_counter} steps={len(all_step_results)} merged={len(_all_merged_req_ids)}",
@@ -1180,9 +1169,38 @@ class PieVllmRuntime:
                   file=sys.stderr, flush=True)
 
         ret = {"results": results, "metrics": metrics}
-        # Include merged request responses for manager.py to send back
+        # If requests were merged during multi-step, split their responses.
+        # If merge failed, return raw tuples for manager.py to re-process.
         if max_steps > 1 and '_all_merged_req_ids' in dir() and _all_merged_req_ids:
-            ret["_merged_responses"] = _merged_results
+            # Check if items are merged (str req_ids) or raw (tuple)
+            _merged_resps = []
+            _queued_raw = []
+            for item in _all_merged_req_ids:
+                if isinstance(item, str):
+                    _merged_resps.append(item)
+                else:
+                    _queued_raw.append(item)
+            # For successfully merged requests: their results are in the
+            # combined results at indices >= _orig_num_reqs
+            if _merged_resps:
+                _split_results = []
+                _offset = _orig_num_reqs
+                for _mr_idx, _rid in enumerate(_merged_resps):
+                    _cnt = _all_merged_counts[_mr_idx] if _mr_idx < len(_all_merged_counts) else 1
+                    _mr_tokens, _mr_dists = [], []
+                    for sr in all_step_results:
+                        for _ri in range(_offset, _offset + _cnt):
+                            if _ri < len(sr):
+                                _mr_tokens.extend(sr[_ri].get("tokens", []))
+                                _mr_dists.extend(sr[_ri].get("dists", []))
+                    _split_results.append({
+                        "req_id": _rid,
+                        "result": {"results": [{"tokens": _mr_tokens, "dists": _mr_dists}], "metrics": {}},
+                    })
+                    _offset += _cnt
+                ret["_merged_responses"] = _split_results
+            if _queued_raw:
+                ret["_queued_requests"] = _queued_raw
         return ret
 
     def _store_output_embeddings(
