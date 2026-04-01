@@ -572,6 +572,66 @@ impl Context {
         tokens
     }
 
+    /// Decode tokens with per-token streaming. Each token is delivered to the
+    /// callback as soon as the GPU produces it, while the next step is already
+    /// in flight. Eliminates the yield-boundary stall of decode_n.
+    ///
+    /// The callback receives each token and returns `true` to continue or
+    /// `false` to cancel generation (e.g., on stop token / EOS).
+    ///
+    /// Returns all generated tokens. The last token is NOT committed to context
+    /// — the caller must call `fill_token(last_token)`, same as decode_n.
+    pub async fn decode_stream<F: FnMut(u32) -> bool>(
+        &mut self,
+        sampler: &Sampler,
+        max_steps: u32,
+        mut on_token: F,
+    ) -> Vec<u32> {
+        if max_steps <= 1 {
+            let token = self.decode_step(sampler).await;
+            on_token(token);
+            return vec![token];
+        }
+
+        if let Sampler::Custom { .. } = sampler {
+            panic!("decode_stream requires engine-side sampling, not Custom sampler.");
+        }
+
+        let (p, pending_token_ids, position_ids) =
+            self.prepare_forward_pass(sampler, max_steps as usize - 1);
+        p.set_max_decode_steps(max_steps);
+
+        let mut all_tokens = Vec::new();
+        p.execute_stream(|token| {
+            all_tokens.push(token);
+            on_token(token)
+        })
+        .await;
+
+        // Commit to context state (same as decode_n)
+        let last_pos_id = position_ids.first().copied().unwrap_or(0);
+        self.token_ids.extend(&pending_token_ids);
+        self.position_ids.extend(&position_ids);
+
+        let commit_count = all_tokens.len().saturating_sub(1);
+        for (i, &token) in all_tokens[..commit_count].iter().enumerate() {
+            self.token_ids.push(token);
+            self.position_ids
+                .push(last_pos_id + pending_token_ids.len() as u32 + i as u32);
+        }
+
+        for _ in 0..(pending_token_ids.len() + commit_count) {
+            self.token_mask_current.append(false);
+        }
+
+        let over_allocated = (max_steps as usize - 1).saturating_sub(commit_count);
+        if over_allocated > 0 {
+            self.shrink_kv_pages(over_allocated);
+        }
+
+        all_tokens
+    }
+
     /// Shared forward-pass setup for decode_step and decode_n.
     /// Consumes pending tokens, grows KV pages, builds mask, configures
     /// adapter and sampler on the forward pass.

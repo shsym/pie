@@ -194,10 +194,67 @@ impl Forward for Queue {
 }
 
 impl ForwardPass {
+    /// Execute and stream tokens one at a time via callback.
+    /// The callback receives each token as soon as it's produced by the GPU.
+    /// Returns the final ForwardPassResult (with distributions if requested).
+    /// The callback can return `false` to cancel generation early.
+    pub async fn execute_stream<F: FnMut(u32) -> bool>(&self, mut on_token: F) -> ForwardPassResult {
+        if let Some(future) = self.inner.execute() {
+            loop {
+                let pollable = future.pollable();
+                AsyncPollable::new(pollable).wait_for().await;
+
+                match future.get_tokens() {
+                    Some(tokens) if !tokens.is_empty() => {
+                        for &t in &tokens {
+                            if !on_token(t) {
+                                // Caller requested cancellation — drop future to signal Rust
+                                return ForwardPassResult {
+                                    distributions: None,
+                                    tokens: Some(tokens),
+                                };
+                            }
+                        }
+                    }
+                    Some(_) => {} // empty batch, keep waiting
+                    None => {
+                        // Done — extract distributions
+                        let mut dists = Vec::new();
+                        if let Some(distributions) = future.get_distributions() {
+                            for (ids, probs) in distributions {
+                                dists.push(Distribution { ids, probs });
+                            }
+                        }
+                        let distributions = if dists.is_empty() { None } else { Some(dists) };
+                        return ForwardPassResult {
+                            distributions,
+                            tokens: None, // already streamed via callback
+                        };
+                    }
+                }
+            }
+        } else {
+            ForwardPassResult {
+                distributions: None,
+                tokens: None,
+            }
+        }
+    }
+
     pub async fn execute(&self) -> ForwardPassResult {
         if let Some(future) = self.inner.execute() {
-            let pollable = future.pollable();
-            AsyncPollable::new(pollable).wait_for().await;
+            // Loop on ready() + get_tokens() to collect all tokens.
+            // For single-step (max_decode_steps=1): one iteration, done=true.
+            // For multi-step streaming: one token per iteration until done.
+            let mut all_tokens = Vec::new();
+            loop {
+                let pollable = future.pollable();
+                AsyncPollable::new(pollable).wait_for().await;
+                match future.get_tokens() {
+                    Some(tokens) => all_tokens.extend(tokens),
+                    None => break, // done
+                }
+            }
 
             let mut dists = Vec::new();
             if let Some(distributions) = future.get_distributions() {
@@ -209,7 +266,7 @@ impl ForwardPass {
 
             ForwardPassResult {
                 distributions,
-                tokens: future.get_tokens(),
+                tokens: if all_tokens.is_empty() { None } else { Some(all_tokens) },
             }
         } else {
             ForwardPassResult {
