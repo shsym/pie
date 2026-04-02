@@ -528,11 +528,9 @@ impl Context {
             );
         }
 
-        // Don't pre-allocate extra KV pages. The Rust scheduler handles
-        // page allocation for each continuation step. Pre-allocating caused
-        // seq_lens inflation: Python computed seq_lens from total allocated
-        // pages (including empty ones), making vLLM attend to uninitialized
-        // KV cache memory → garbage output.
+        // No extra KV pre-allocation: empty pages in block_ids cause vLLM
+        // attention to read uninitialized memory. Python multi-step stops
+        // early at page boundaries to avoid writing beyond allocated pages.
         let (p, pending_token_ids, position_ids) =
             self.prepare_forward_pass(sampler, 0);
 
