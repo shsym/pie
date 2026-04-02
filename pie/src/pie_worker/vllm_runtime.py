@@ -875,6 +875,12 @@ class PieVllmRuntime:
         """
         from vllm.config import set_current_vllm_config
 
+        # Wireshark-mode capture: dump SchedulerOutput before execute_model
+        _cap = os.environ.get("PIE_CAPTURE")
+        if _cap:
+            from pie_worker.vllm_capture import capture_scheduler_output
+            capture_scheduler_output(scheduler_output, f"batch-{self._batch_counter-1}", _cap)
+
         try:
             with set_current_vllm_config(self.vllm_config):
                 result = self.vllm_worker.execute_model(scheduler_output)
@@ -886,6 +892,11 @@ class PieVllmRuntime:
                     result = self.vllm_worker.sample_tokens(None)
                 if hasattr(result, 'get_output'):
                     result = result.get_output()
+
+                if _cap:
+                    from pie_worker.vllm_capture import capture_model_output
+                    capture_model_output(result, self._seq_tracker.last_batch_req_ids,
+                                        f"batch-{self._batch_counter-1}", _cap)
 
         except Exception as e:
             import traceback
@@ -968,6 +979,21 @@ class PieVllmRuntime:
         # --- 2-3. Build SchedulerOutput + configure model runner ---
         try:
             scheduler_output = self.prepare_step(arrays, kwargs)
+            if os.environ.get("PIE_MS_DEBUG"):
+                _so = scheduler_output
+                _nr = _so.scheduled_new_reqs
+                _cr = _so.scheduled_cached_reqs
+                print(f"[MS-DEBUG] step=0 new_reqs={len(_nr)} "
+                      f"cached_req_ids={getattr(_cr, 'req_ids', [])} "
+                      f"finished={_so.finished_req_ids} "
+                      f"num_sched_tokens={_so.num_scheduled_tokens}",
+                      file=sys.stderr, flush=True)
+                for _nri, _nrd in enumerate(_nr):
+                    print(f"  NEW[{_nri}] req_id={_nrd.req_id} "
+                          f"prompt_len={len(_nrd.prompt_token_ids)} "
+                          f"num_computed={_nrd.num_computed_tokens} "
+                          f"blocks={[b[:5] for b in _nrd.block_ids]}...",
+                          file=sys.stderr, flush=True)
         except Exception as e:
             import traceback
             print(f"[ERROR] prepare_step failed: {e}",
@@ -1015,13 +1041,7 @@ class PieVllmRuntime:
         self._captured_full_hidden_states = None
 
         # --- Multi-step decode loop ---
-        # Python multi-step disabled: vLLM's attention reads ALL block_ids
-        # including pre-allocated empty blocks, causing garbage output.
-        # Without pre-allocation, the loop is limited to remaining page
-        # space (often < 8 steps). The Rust continuation loop handles
-        # decode_n(N) correctly with 1 IPC round-trip per step (~1ms/tok
-        # overhead, measured).
-        max_steps = 1
+        max_steps = kwargs.get("max_decode_steps", 1)
         if os.environ.get("PIE_TRACE") and max_steps > 1:
             print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.fb_multistep {self._batch_counter} max_decode_steps={max_steps}",
                   file=sys.stderr, flush=True)
@@ -1099,6 +1119,29 @@ class PieVllmRuntime:
 
                 try:
                     scheduler_output = self.prepare_step(arrays, kwargs)
+                    # Dump SchedulerOutput details for debugging
+                    if os.environ.get("PIE_MS_DEBUG"):
+                        _so = scheduler_output
+                        _nr = _so.scheduled_new_reqs
+                        _cr = _so.scheduled_cached_reqs
+                        _fi = _so.finished_req_ids
+                        _ns = _so.num_scheduled_tokens
+                        print(f"[MS-DEBUG] step={step_i} new_reqs={len(_nr)} "
+                              f"cached_req_ids={getattr(_cr, 'req_ids', [])} "
+                              f"finished={_fi} num_sched_tokens={_ns}",
+                              file=sys.stderr, flush=True)
+                        if _nr:
+                            for _nri, _nrd in enumerate(_nr):
+                                print(f"  NEW[{_nri}] req_id={_nrd.req_id} "
+                                      f"prompt_len={len(_nrd.prompt_token_ids)} "
+                                      f"num_computed={_nrd.num_computed_tokens} "
+                                      f"blocks={[b[:3] for b in _nrd.block_ids]}...",
+                                      file=sys.stderr, flush=True)
+                        if hasattr(_cr, 'req_ids') and _cr.req_ids:
+                            print(f"  CACHED req_ids={_cr.req_ids} "
+                                  f"num_computed={_cr.num_computed_tokens} "
+                                  f"num_output={_cr.num_output_tokens}",
+                                  file=sys.stderr, flush=True)
                     result = self.execute_step(scheduler_output)
                     logits_expanded = self._expand_logits_for_multi_position(
                         kwargs, arrays.qo_indptr, arrays.num_requests
@@ -1107,8 +1150,12 @@ class PieVllmRuntime:
                         result, kwargs, arrays.num_requests,
                         logits_expanded=logits_expanded,
                     )
+                    if os.environ.get("PIE_MS_DEBUG"):
+                        print(f"[MS-DEBUG] step={step_i} results={[{k: v for k, v in r.items() if k == 'tokens'} for r in results]}",
+                              file=sys.stderr, flush=True)
                 except Exception as e:
                     print(f"[MS-ERROR] step {step_i}: {e}", file=sys.stderr, flush=True)
+                    import traceback; traceback.print_exc(file=sys.stderr)
                     break
 
                 self._captured_sample_hidden_states = None
