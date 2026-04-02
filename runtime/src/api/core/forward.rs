@@ -484,17 +484,11 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
             (request, svc_id, queue_id, priority)
         };
 
-        // Per-token streaming: WASM receives tokens as they are generated via
-        // an mpsc channel.  The SDK's `ready()` polls this channel so each
-        // `get_tokens()` call can return a partial batch (as few as 1 token).
-        // This avoids the TTFT penalty of waiting for all N decode steps.
-        //
-        // The oneshot still delivers the final response (distributions, etc.)
-        // and signals completion.  The mpsc sender is dropped by the scheduler
-        // after all tokens are sent, closing the channel.
-        let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel();
-        request.token_stream_tx = Some(token_tx);
-        let token_rx: Option<tokio::sync::mpsc::UnboundedReceiver<u32>> = Some(token_rx);
+        // Per-token streaming channel is disabled by default. When Python
+        // handles multi-step internally (returns all tokens in one response),
+        // the mpsc channel is not needed — all tokens arrive via the oneshot.
+        // Enable with PIE_TOKEN_STREAM=1 for per-token SSE delivery.
+        let token_rx: Option<tokio::sync::mpsc::UnboundedReceiver<u32>> = None;
 
         // Always create a response channel so every request participates in
         // the batch response protocol.

@@ -529,7 +529,7 @@ impl Context {
         }
 
         let (p, pending_token_ids, position_ids) =
-            self.prepare_forward_pass(sampler, 0);
+            self.prepare_forward_pass(sampler, max_steps as usize - 1);
 
         p.set_max_decode_steps(max_steps);
 
@@ -653,7 +653,27 @@ impl Context {
         let position_ids =
             (last_pos_id..(last_pos_id + pending_token_ids.len() as u32)).collect::<Vec<u32>>();
 
+        // Allocate pages for pending + extra tokens (so Rust continuation
+        // has pages available), but set kv_page_last_len for pending only.
+        // The extra tokens haven't been generated yet — vLLM uses
+        // kv_page_last_len to compute seq_lens for the attention window.
+        // Inflating it makes vLLM attend to uninitialized KV positions.
         self.grow_kv_pages(pending_token_ids.len() + extra_kv_tokens);
+        if extra_kv_tokens > 0 {
+            // Reset kv_page_last_len to reflect actual tokens only
+            let actual_tokens = if self.kv_pages.is_empty() {
+                0
+            } else {
+                (self.kv_pages.len() - 1) * self.kv_page_size + self.kv_page_last_len
+            };
+            let actual_without_extra = actual_tokens.saturating_sub(extra_kv_tokens);
+            let corrected = actual_without_extra % self.kv_page_size;
+            self.kv_page_last_len = if corrected == 0 && actual_without_extra > 0 {
+                self.kv_page_size
+            } else {
+                corrected
+            };
+        }
 
         let mask = mem::take(&mut self.token_mask_pending)
             .into_iter()
