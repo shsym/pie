@@ -484,12 +484,17 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
             (request, svc_id, queue_id, priority)
         };
 
-        // Per-token streaming channel is disabled when the Python backend
-        // handles multi-step internally (returns all tokens in one response).
-        // The mpsc streaming was causing "channel closed" errors at high
-        // concurrency because the channel closes before the SDK reads all tokens.
-        // With Python multi-step, Rust gets all tokens via the oneshot directly.
-        let token_rx: Option<tokio::sync::mpsc::UnboundedReceiver<u32>> = None;
+        // Per-token streaming: WASM receives tokens as they are generated via
+        // an mpsc channel.  The SDK's `ready()` polls this channel so each
+        // `get_tokens()` call can return a partial batch (as few as 1 token).
+        // This avoids the TTFT penalty of waiting for all N decode steps.
+        //
+        // The oneshot still delivers the final response (distributions, etc.)
+        // and signals completion.  The mpsc sender is dropped by the scheduler
+        // after all tokens are sent, closing the channel.
+        let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel();
+        request.token_stream_tx = Some(token_tx);
+        let token_rx: Option<tokio::sync::mpsc::UnboundedReceiver<u32>> = Some(token_rx);
 
         // Always create a response channel so every request participates in
         // the batch response protocol.
