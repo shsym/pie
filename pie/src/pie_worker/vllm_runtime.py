@@ -1019,7 +1019,17 @@ class PieVllmRuntime:
         # round-trips and yield-boundary stalls. Between steps, build
         # continuation arrays from sampled tokens and let SequenceTracker
         # handle all state (history, num_output_tokens, block deltas).
-        max_steps = kwargs.get("max_decode_steps", 1)
+        # Python multi-step loop is DISABLED. Continuous batching is achieved
+        # at the Rust scheduler level instead: unlimited max_in_flight + 1ms
+        # coalesce window batches all continuations + new requests together.
+        # Each fire_batch call gets FRESH kwargs from Rust (no stale state).
+        # The Rust continuation loop handles decode_n(N) by looping N times
+        # with correct KV metadata at each step.
+        #
+        # Why not Python multi-step: continuation steps 1-7 reuse stale
+        # blocks_per_req/kv_page_indices from step 0, causing SequenceTracker
+        # state divergence and degenerate output ("You you you..." repeated).
+        max_steps = 1
         if os.environ.get("PIE_TRACE") and max_steps > 1:
             print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.fb_multistep {self._batch_counter} max_decode_steps={max_steps}",
                   file=sys.stderr, flush=True)

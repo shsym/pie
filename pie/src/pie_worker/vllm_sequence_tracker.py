@@ -106,6 +106,12 @@ class SequenceTracker:
 
         self._num_kv_cache_groups: int = num_kv_cache_groups
 
+        # Absence counter for partial_batch GC. Tracks how many consecutive
+        # batches each active request has been absent from. Requests absent
+        # for >= _ABSENT_THRESHOLD batches are considered finished.
+        self._absent_count: dict[int, int] = {}  # seq_key -> consecutive absent count
+        _ABSENT_THRESHOLD = 3  # finish after 3 consecutive absences
+
     # -- Public properties -------------------------------------------------
 
     @property
@@ -433,40 +439,51 @@ class SequenceTracker:
             num_scheduled_tokens[req_id] = num_new_tokens
             total += num_new_tokens
 
-        # Identify finished sequences (no longer in this batch).
-        # Skip this when partial_batch=True (max_in_flight > 1) because
-        # absent requests may be in a different in-flight batch, not finished.
+        # Identify finished sequences using absence counting.
+        # With partial_batch=True (unlimited max_in_flight), a request
+        # absent from ONE batch might just be in a different in-flight
+        # batch. We track consecutive absences and only finish after
+        # _ABSENT_THRESHOLD consecutive misses.
         # Note: finished_req_ids is initialised before the loop and may
         # already contain fork-evicted requests.
-        if not partial_batch:
-            finished_keys = set(self._active_requests.keys()) - current_last_blocks
-            for fk in finished_keys:
-                # Keep negative sentinel keys (within-batch forks) alive
-                # only if their underlying last_block is still present.
-                if fk < 0:
-                    continue  # sentinel keys are ephemeral
+        _ABSENT_THRESHOLD = 1 if not partial_batch else 3
+        absent_keys = set(self._active_requests.keys()) - current_last_blocks
+        for fk in absent_keys:
+            if fk < 0:
+                continue  # sentinel keys are ephemeral
+            self._absent_count[fk] = self._absent_count.get(fk, 0) + 1
+            if self._absent_count[fk] >= _ABSENT_THRESHOLD:
                 finished_req_ids.add(self._active_requests[fk].req_id)
                 del self._active_requests[fk]
+                self._absent_count.pop(fk, None)
 
-            # Clean up token history for finished sequences
-            finished_history_keys = set(self._token_history.keys()) - current_last_blocks
-            for fk in finished_history_keys:
-                if fk < 0:
-                    del self._token_history[fk]
-                elif fk not in self._active_requests:
-                    del self._token_history[fk]
+        # Reset absence counter for present requests
+        for lb in current_last_blocks:
+            self._absent_count.pop(lb, None)
 
-        # Safety net: ensure any previously-issued request ID that is NOT
-        # in the current batch is explicitly finished.  This prevents
-        # stale entries in vLLM's input_batch from causing KeyError in
-        # execute_model when a request lifecycle race occurs (e.g. during
-        # aggressive multi-fork operations like prefix-tree).
-        # Also skip when partial_batch — absent requests are still active.
+        # Clean up token history for finished sequences
+        finished_history_keys = set(self._token_history.keys()) - current_last_blocks
+        for fk in finished_history_keys:
+            if fk < 0:
+                del self._token_history[fk]
+            elif fk not in self._active_requests:
+                del self._token_history[fk]
+
+        # Clean up absent counts for sequences no longer tracked
+        stale_absent = set(self._absent_count.keys()) - set(self._active_requests.keys())
+        for k in stale_absent:
+            del self._absent_count[k]
+
+        # Safety net: finish stale req_ids in vLLM's input_batch.
+        # Only finish req_ids whose sequences were already removed from
+        # _active_requests (by the absence threshold above). This prevents
+        # prematurely finishing in-flight requests that are in other batches.
         current_req_ids = set(num_scheduled_tokens.keys())
-        if not partial_batch:
-            stale_req_ids = self._all_issued_req_ids - current_req_ids
-            finished_req_ids |= stale_req_ids
-        self._all_issued_req_ids |= current_req_ids
+        # Collect req_ids of still-active sequences (haven't passed threshold)
+        still_active_req_ids = {ar.req_id for ar in self._active_requests.values()}
+        stale_req_ids = self._all_issued_req_ids - current_req_ids - still_active_req_ids
+        finished_req_ids |= stale_req_ids
+        self._all_issued_req_ids = current_req_ids | still_active_req_ids
 
         # Build CachedRequestData
         if cached_req_ids:
