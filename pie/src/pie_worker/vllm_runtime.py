@@ -1015,20 +1015,12 @@ class PieVllmRuntime:
         self._captured_full_hidden_states = None
 
         # --- Multi-step decode loop ---
-        # When max_decode_steps > 1, loop internally to eliminate Rust IPC
-        # round-trips and yield-boundary stalls. Between steps, build
-        # continuation arrays from sampled tokens and let SequenceTracker
-        # handle all state (history, num_output_tokens, block deltas).
-        # Python multi-step loop is DISABLED. Continuous batching is achieved
-        # at the Rust scheduler level instead: unlimited max_in_flight + 1ms
-        # coalesce window batches all continuations + new requests together.
-        # Each fire_batch call gets FRESH kwargs from Rust (no stale state).
-        # The Rust continuation loop handles decode_n(N) by looping N times
-        # with correct KV metadata at each step.
-        #
-        # Why not Python multi-step: continuation steps 1-7 reuse stale
-        # blocks_per_req/kv_page_indices from step 0, causing SequenceTracker
-        # state divergence and degenerate output ("You you you..." repeated).
+        # Python multi-step disabled: vLLM's attention reads ALL block_ids
+        # including pre-allocated empty blocks, causing garbage output.
+        # Without pre-allocation, the loop is limited to remaining page
+        # space (often < 8 steps). The Rust continuation loop handles
+        # decode_n(N) correctly with 1 IPC round-trip per step (~1ms/tok
+        # overhead, measured).
         max_steps = 1
         if os.environ.get("PIE_TRACE") and max_steps > 1:
             print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.fb_multistep {self._batch_counter} max_decode_steps={max_steps}",
@@ -1048,39 +1040,24 @@ class PieVllmRuntime:
                 if not prev_tokens:
                     break  # no tokens (all flush or EOS)
 
-                # Build continuation arrays: just update token_ids, qo_indptr,
-                # kv_last_page_lens. SequenceTracker handles everything else.
-                cont_token_ids = np.array(prev_tokens, dtype=np.int64)
-                cont_qo_indptr = np.arange(len(prev_tokens) + 1, dtype=np.int32)
+                # Build continuation by updating kwargs and re-decoding.
+                # This uses the SAME path as a fresh fire_batch, ensuring
+                # arrays are built identically to what Rust would provide.
                 new_kv_lens = arrays.kv_last_page_lens.copy()
                 new_kv_lens += 1
-                if self.kv_page_size > 0:
-                    new_kv_lens[new_kv_lens > self.kv_page_size] = 1
-                cont_seq_lens = PieVllmBatchTranslator.compute_seq_lens(
-                    arrays.kv_page_indptr, new_kv_lens, self.kv_page_size
-                )
-                arrays = DecodedBatchArrays(
-                    token_ids=cont_token_ids,
-                    qo_indptr=cont_qo_indptr,
-                    kv_page_indices=arrays.kv_page_indices,
-                    kv_page_indptr=arrays.kv_page_indptr,
-                    kv_last_page_lens=new_kv_lens,
-                    num_requests=len(prev_tokens),
-                    tokens_per_req=[1] * len(prev_tokens),
-                    blocks_per_req=arrays.blocks_per_req,
-                    seq_lens=cont_seq_lens,
-                    sampling_params_list=arrays.sampling_params_list,
-                    adapter_indices=arrays.adapter_indices,
-                )
-                # Update kwargs for prepare_step (masks, output indices, single_token_mode)
+                # Stop before crossing a page boundary (no pre-allocated pages)
+                if self.kv_page_size > 0 and np.any(new_kv_lens > self.kv_page_size):
+                    break
+                kwargs["token_ids"] = np.array(prev_tokens, dtype=np.uint32).tobytes()
+                kwargs["qo_indptr"] = np.arange(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
+                kwargs["kv_last_page_lens"] = new_kv_lens.astype(np.uint32).tobytes()
                 kwargs["single_token_mode"] = True
                 kwargs["flattened_masks"] = b""
                 kwargs["mask_indptr"] = np.zeros(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
-                kwargs["flat_output_token_indices"] = np.zeros(len(prev_tokens), dtype=np.uint32).tobytes()
                 kwargs["output_token_indptr"] = np.arange(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
-                kwargs["kv_last_page_lens"] = new_kv_lens.astype(np.uint32).tobytes()
-                kwargs["qo_indptr"] = cont_qo_indptr.astype(np.uint32).tobytes()
-                kwargs["token_ids"] = cont_token_ids.astype(np.uint32).tobytes()
+                # Re-decode kwargs through the standard path
+                arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
+                num_requests = arrays.num_requests
 
                 # Between steps: drain side-channel for new requests and merge
                 # into the current batch. This enables continuous batching —

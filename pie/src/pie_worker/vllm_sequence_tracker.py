@@ -156,6 +156,7 @@ class SequenceTracker:
         adapter_indices: list[int | None] | None = None,
         adapter_registry: dict[int, tuple[str, str]] | None = None,
         partial_batch: bool = False,
+        kv_page_size: int = 0,
     ):
         """Build a vLLM SchedulerOutput from translated Pie batch data.
 
@@ -280,6 +281,11 @@ class SequenceTracker:
             # When a sequence grows new blocks, its last_block changes.
             # We also check the _prev_last_to_current mapping.
             existing_len = len(self._token_history.get(seq_key, []))
+
+            # Cap at what we've actually tracked. Pre-allocated KV pages
+            # (from decode_n's extra_kv_tokens) inflate kv_len beyond the
+            # real token count. token_history is the ground truth.
+            effective_cached = min(effective_cached, existing_len)
 
             if existing_len > effective_cached:
                 # Fork or KV eviction: fewer tokens are cached than we
