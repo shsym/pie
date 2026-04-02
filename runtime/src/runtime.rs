@@ -1112,6 +1112,9 @@ impl Runtime {
         py_runtime_dir: Option<PathBuf>,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
+        let ttft_trace = std::env::var("PIE_TTFT_TRACE").is_ok();
+        let t0 = std::time::Instant::now();
+
         // Collect the full request body before passing to the WASM handler.
         // hyper's Incoming body uses a zero-capacity channel that requires
         // sender and receiver to poll in the same task. Since the WASM handler
@@ -1121,23 +1124,29 @@ impl Runtime {
         let collected = http_body_util::BodyExt::collect(body)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read request body: {e}"))?;
+        let body_bytes = collected.to_bytes();
+        let body_len = body_bytes.len();
         let buffered_body = http_body_util::BodyExt::map_err(
-            http_body_util::Full::new(collected.to_bytes()),
+            http_body_util::Full::new(body_bytes),
             |never: std::convert::Infallible| -> hyper::Error { match never {} },
         );
         let req = hyper::Request::from_parts(parts, buffered_body);
+        let t_body = t0.elapsed();
 
         let inst_id = Uuid::new_v4();
         let (inst_state, _output_delivery_ctrl) =
             InstanceState::new(inst_id, username, arguments, py_runtime_dir.as_deref()).await;
+        let t_instance_state = t0.elapsed();
 
         let mut store = Store::new(&engine, inst_state);
         let (sender, receiver) = oneshot::channel();
 
         let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
         let out = store.data_mut().new_response_outparam(sender)?;
+        let t_store = t0.elapsed();
 
         let mut linker = create_linker(&engine, &shared_modules);
+        let t_linker = t0.elapsed();
 
         // Instantiate dependencies and register their exports in the linker
         dynamic_linking::instantiate_libraries(
@@ -1148,11 +1157,13 @@ impl Runtime {
         )
         .await
         .map_err(|e| anyhow::anyhow!("Failed to instantiate dependencies: {e}"))?;
+        let t_deps = t0.elapsed();
 
         let instance = linker
             .instantiate_async(&mut store, &component)
             .await
             .map_err(|e| RuntimeError::Other(format!("Instantiation error: {e}")))?;
+        let t_instantiate = t0.elapsed();
 
         let (_, serve_export) = instance
             .get_export(&mut store, None, "wasi:http/incoming-handler@0.2.4")
@@ -1168,6 +1179,22 @@ impl Runtime {
                 &handle_func_export,
             )
             .map_err(|e| RuntimeError::Other(format!("Failed to get 'handle' function: {e}")))?;
+        let t_resolve = t0.elapsed();
+
+        if ttft_trace {
+            eprintln!(
+                "[TTFT-TRACE] body={:.2}ms inst_state={:.2}ms store={:.2}ms linker={:.2}ms deps={:.2}ms instantiate={:.2}ms resolve={:.2}ms total_pre_handle={:.2}ms body_bytes={}",
+                t_body.as_secs_f64() * 1000.0,
+                (t_instance_state - t_body).as_secs_f64() * 1000.0,
+                (t_store - t_instance_state).as_secs_f64() * 1000.0,
+                (t_linker - t_store).as_secs_f64() * 1000.0,
+                (t_deps - t_linker).as_secs_f64() * 1000.0,
+                (t_instantiate - t_deps).as_secs_f64() * 1000.0,
+                (t_resolve - t_instantiate).as_secs_f64() * 1000.0,
+                t_resolve.as_secs_f64() * 1000.0,
+                body_len,
+            );
+        }
 
         let task = tokio::task::spawn(async move {
             if let Err(e) = handle_func.call_async(&mut store, (req, out)).await {
@@ -1213,8 +1240,12 @@ impl Runtime {
             let listener = socket.listen(100)?;
             eprintln!("Serving HTTP on http://{}/", listener.local_addr()?);
             tokio::task::spawn(async move {
+                let ttft_trace = std::env::var("PIE_TTFT_TRACE").is_ok();
                 loop {
-                    let (stream, _) = listener.accept().await.unwrap();
+                    let (stream, peer) = listener.accept().await.unwrap();
+                    if ttft_trace {
+                        eprintln!("[TTFT-TRACE] tcp_accept from {peer}");
+                    }
                     let stream = TokioIo::new(stream);
                     let engine_ = engine.clone();
                     let component_ = component.clone();
