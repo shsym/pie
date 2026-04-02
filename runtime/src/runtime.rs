@@ -1196,6 +1196,7 @@ impl Runtime {
             );
         }
 
+        let t_spawn = t0.elapsed();
         let task = tokio::task::spawn(async move {
             if let Err(e) = handle_func.call_async(&mut store, (req, out)).await {
                 eprintln!("error: {e:?}");
@@ -1205,7 +1206,17 @@ impl Runtime {
         });
 
         match receiver.await {
-            Ok(Ok(resp)) => Ok(resp),
+            Ok(Ok(resp)) => {
+                if ttft_trace {
+                    let t_response = t0.elapsed();
+                    eprintln!(
+                        "[TTFT-TRACE] response_received={:.2}ms (spawn_to_response={:.2}ms) — WASM set response-outparam",
+                        t_response.as_secs_f64() * 1000.0,
+                        (t_response - t_spawn).as_secs_f64() * 1000.0,
+                    );
+                }
+                Ok(resp)
+            }
             Ok(Err(e)) => Err(e.into()),
             Err(_) => {
                 let e = match task.await {
