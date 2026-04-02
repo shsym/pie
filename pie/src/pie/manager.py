@@ -1286,6 +1286,16 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
 
             _batch_counter += 1
 
+            # When max_in_flight > 1, batches may not contain ALL active
+            # requests.  Tell the SequenceTracker not to finish absent
+            # requests (they may be in a different in-flight batch).
+            # The side-channel's existence implies max_in_flight >= 1;
+            # we always set partial_batch=True when using the side-channel
+            # because with max_in_flight=2 the scheduler fires overlapping
+            # single-request batches for continuations.
+            if side_channel is not None:
+                fire_kwargs["_partial_batch"] = True
+
             try:
                 if _trace:
                     _t("py.fb_enter", _bid, reqs=_n_reqs)

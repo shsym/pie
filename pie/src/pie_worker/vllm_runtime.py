@@ -440,6 +440,7 @@ class PieVllmRuntime:
         seq_lens: np.ndarray,
         sampling_params_list: list[dict[str, Any]],
         adapter_indices: list[int | None] | None = None,
+        partial_batch: bool = False,
     ):
         """Delegate to SequenceTracker.build_scheduler_output()."""
         return self._seq_tracker.build_scheduler_output(
@@ -452,6 +453,7 @@ class PieVllmRuntime:
             sampling_params_list=sampling_params_list,
             adapter_indices=adapter_indices,
             adapter_registry=self._adapter_registry,
+            partial_batch=partial_batch,
         )
 
     # ------------------------------------------------------------------
@@ -816,6 +818,10 @@ class PieVllmRuntime:
                   f"seq_lens={arrays.seq_lens.tolist()[:10]}",
                   file=sys.stderr, flush=True)
 
+        # partial_batch: True when other batches may be in-flight (max_in_flight > 1).
+        # Tells SequenceTracker not to finish absent requests.
+        partial_batch = kwargs.get("_partial_batch", False)
+
         scheduler_output = self._build_scheduler_output(
             batch_id=batch_id,
             token_ids=arrays.token_ids,
@@ -825,6 +831,7 @@ class PieVllmRuntime:
             seq_lens=arrays.seq_lens,
             sampling_params_list=arrays.sampling_params_list,
             adapter_indices=arrays.adapter_indices,
+            partial_batch=partial_batch,
         )
 
         # BRLE masks (only for multi-token prefill steps)
@@ -1013,6 +1020,9 @@ class PieVllmRuntime:
         # continuation arrays from sampled tokens and let SequenceTracker
         # handle all state (history, num_output_tokens, block deltas).
         max_steps = kwargs.get("max_decode_steps", 1)
+        if os.environ.get("PIE_TRACE") and max_steps > 1:
+            print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.fb_multistep {self._batch_counter} max_decode_steps={max_steps}",
+                  file=sys.stderr, flush=True)
         if max_steps > 1:
             all_step_results = [results]  # results from step 0
             _orig_num_reqs = len(results)  # track original request count
@@ -1172,11 +1182,13 @@ class PieVllmRuntime:
         # If requests were merged during multi-step, split their responses.
         # If merge failed, return raw tuples for manager.py to re-process.
         if max_steps > 1 and '_all_merged_req_ids' in dir() and _all_merged_req_ids:
-            # Check if items are merged (str req_ids) or raw (tuple)
+            # Check if items are merged (int req_ids from side-channel) or
+            # raw (tuple from failed merge).  Side-channel request IDs are
+            # integers (int.from_bytes), NOT strings.
             _merged_resps = []
             _queued_raw = []
             for item in _all_merged_req_ids:
-                if isinstance(item, str):
+                if isinstance(item, int):
                     _merged_resps.append(item)
                 else:
                     _queued_raw.append(item)
@@ -1187,15 +1199,19 @@ class PieVllmRuntime:
                 _offset = _orig_num_reqs
                 for _mr_idx, _rid in enumerate(_merged_resps):
                     _cnt = _all_merged_counts[_mr_idx] if _mr_idx < len(_all_merged_counts) else 1
-                    _mr_tokens, _mr_dists = [], []
-                    for sr in all_step_results:
-                        for _ri in range(_offset, _offset + _cnt):
+                    # Build per-request result entries (Rust expects one per
+                    # generate request in the batch).
+                    _mr_results = []
+                    for _ri in range(_offset, _offset + _cnt):
+                        _ri_tokens, _ri_dists = [], []
+                        for sr in all_step_results:
                             if _ri < len(sr):
-                                _mr_tokens.extend(sr[_ri].get("tokens", []))
-                                _mr_dists.extend(sr[_ri].get("dists", []))
+                                _ri_tokens.extend(sr[_ri].get("tokens", []))
+                                _ri_dists.extend(sr[_ri].get("dists", []))
+                        _mr_results.append({"tokens": _ri_tokens, "dists": _ri_dists})
                     _split_results.append({
                         "req_id": _rid,
-                        "result": {"results": [{"tokens": _mr_tokens, "dists": _mr_dists}], "metrics": {}},
+                        "result": {"results": _mr_results, "metrics": {}},
                     })
                     _offset += _cnt
                 ret["_merged_responses"] = _split_results
