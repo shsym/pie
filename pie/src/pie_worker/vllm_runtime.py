@@ -1077,6 +1077,9 @@ class PieVllmRuntime:
                 # new requests are processed in parallel with ongoing decode.
                 if _drain_fn and _merge_fn:
                     _new_pending = _drain_fn()
+                    if os.environ.get("PIE_TRACE"):
+                        print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_drain {self._batch_counter} step={step_i} found={len(_new_pending) if _new_pending else 0}",
+                              file=sys.stderr, flush=True)
                     if _new_pending:
                         try:
                             import msgpack as _msgpack
