@@ -595,43 +595,9 @@ impl Model {
                 };
             }
 
-            // Coalesce window: after waking from select (first request/
-            // continuation arrived), wait briefly for more to accumulate.
-            // This is critical for continuous batching — without it, each
-            // request fires individually despite unlimited max_in_flight.
-            // 1ms is enough to collect re-submissions from the same batch
-            // while adding negligible latency.
-            if !batches.iter().all(|b| b.is_empty()) {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-
-            // Re-drain completions that arrived during coalesce window.
-            while let Ok((batch_size, tokens_in_batch, latency, group_id)) = completion_rx.try_recv() {
-                if group_id < num_groups {
-                    if in_flight_counts[group_id] > 0 {
-                        in_flight_counts[group_id] -= 1;
-                    }
-                    let mut sched = scheduler.lock().unwrap();
-                    sched.on_batch_complete(group_id, batch_size, tokens_in_batch, latency);
-                }
-            }
-
-            // Re-drain continuations that arrived during coalesce window.
-            {
-                let mut cont_count = 0u32;
-                while let Ok((req, tx, group_id)) = continuation_rx.try_recv() {
-                    let group_id = std::cmp::min(group_id, num_groups - 1);
-                    group_tokens[group_id] += req.input_tokens.len();
-                    batches[group_id].push((req, tx));
-                    cont_count += 1;
-                }
-                if cont_count > 0 && Self::trace_enabled() {
-                    Self::trace("rs.coalesce_cont", prof_batches_fired[0],
-                        &format!("n={}", cont_count));
-                }
-            }
-
-            // Drain new requests (non-blocking) including those from coalesce.
+            // Drain new requests (non-blocking). With max_in_flight=1,
+            // the GPU step (~30ms) provides a natural coalesce window:
+            // all continuations + new requests accumulate while busy.
             {
                 while let Ok((req, tx, group_id)) = req_rx.try_recv() {
                     let group_id = std::cmp::min(group_id, num_groups - 1);
