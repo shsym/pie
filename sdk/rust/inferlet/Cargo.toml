@@ -11,7 +11,7 @@ categories = ["wasm"]
 include = ["src", "Cargo.toml", "wit"]
 
 [dependencies]
-wit-bindgen = "0.46.0"
+wit-bindgen = "0.51.0"
 wstd = "0.5.6"
 trait-variant = "0.1.2"
 wasi = "0.14.7"

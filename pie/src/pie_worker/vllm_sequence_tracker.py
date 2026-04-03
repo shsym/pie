@@ -467,6 +467,16 @@ class SequenceTracker:
         for lb in current_last_blocks:
             self._absent_count.pop(lb, None)
 
+        # GC trace: track state sizes for debugging
+        import os as _os
+        if _os.environ.get("PIE_GC_TRACE") and (self._batch_counter % 50 == 0):
+            print(f"[GC] batch={self._batch_counter} active={len(self._active_requests)} "
+                  f"history={len(self._token_history)} issued={len(self._all_issued_req_ids)} "
+                  f"absent_tracking={len(self._absent_count)} "
+                  f"current_batch={len(current_last_blocks)} "
+                  f"finished_this_batch={len(finished_req_ids)}",
+                  file=__import__('sys').stderr, flush=True)
+
         # Clean up token history for finished sequences
         finished_history_keys = set(self._token_history.keys()) - current_last_blocks
         for fk in finished_history_keys:

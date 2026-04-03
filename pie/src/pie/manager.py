@@ -1294,6 +1294,7 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                     _drain_fn=side_channel.drain_requests if side_channel else None,
                     _merge_fn=merge_fn,
                     _counts_fn=counts_fn,
+                    _partial_batch=True,  # max_in_flight>1: batches may be partial
                     **fire_kwargs,
                 )
 
