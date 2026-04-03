@@ -377,6 +377,7 @@ impl inferlet::core::common::HostQueue for InstanceState {
 
         // Fast path: render + tokenize in-process (validated at startup).
         if info.use_minijinja_fast_path {
+            let t_fc = std::time::Instant::now();
             match model::chat_template::render_and_tokenize(
                 &info.chat_template,
                 &messages_json,
@@ -385,6 +386,13 @@ impl inferlet::core::common::HostQueue for InstanceState {
                 &info.tokenizer,
             ) {
                 Ok(token_ids) => {
+                    if std::env::var("PIE_TTFT_TRACE").is_ok() {
+                        eprintln!(
+                            "[FORMAT-CHAT-TRACE] wit_handler_total={:.2}ms tokens={}",
+                            t_fc.elapsed().as_secs_f64() * 1000.0,
+                            token_ids.len(),
+                        );
+                    }
                     let res = FormatChatResult {
                         receiver: None,
                         result: Some(token_ids),

@@ -35,6 +35,8 @@ pub fn render_and_tokenize(
     add_generation_prompt: bool,
     tokenizer: &BytePairEncoder,
 ) -> Result<Vec<u32>, String> {
+    let t0 = std::time::Instant::now();
+
     // Parse the messages payload (may be wrapped with chat_template_kwargs).
     let raw: Value = serde_json::from_str(messages_json)
         .map_err(|e| format!("failed to parse messages_json: {}", e))?;
@@ -55,6 +57,7 @@ pub fn render_and_tokenize(
     } else {
         return Err("messages_json is neither an object nor an array".to_string());
     };
+    let t_parse = t0.elapsed();
 
     // Parse tools if present.
     let tools: Option<Vec<Value>> = match tools_json {
@@ -68,9 +71,28 @@ pub fn render_and_tokenize(
 
     // Build minijinja render context.
     let rendered = render_template(chat_template, &messages, add_generation_prompt, &tools, &kwargs)?;
+    let t_render = t0.elapsed();
+    let rendered_len = rendered.len();
 
     // Tokenize the rendered string using BytePairEncoder.
     let token_ids = tokenizer.encode_with_special_tokens(&rendered);
+    let t_tokenize = t0.elapsed();
+
+    if std::env::var("PIE_TTFT_TRACE").is_ok() {
+        let tail: Vec<_> = token_ids.iter().rev().take(10).rev().collect();
+        eprintln!(
+            "[FORMAT-CHAT-TRACE] json_parse={:.2}ms render={:.2}ms tokenize={:.2}ms total={:.2}ms chars={} tokens={} json_bytes={} gen_prompt={} tail={:?}",
+            t_parse.as_secs_f64() * 1000.0,
+            (t_render - t_parse).as_secs_f64() * 1000.0,
+            (t_tokenize - t_render).as_secs_f64() * 1000.0,
+            t_tokenize.as_secs_f64() * 1000.0,
+            rendered_len,
+            token_ids.len(),
+            messages_json.len(),
+            add_generation_prompt,
+            tail,
+        );
+    }
 
     Ok(token_ids)
 }
