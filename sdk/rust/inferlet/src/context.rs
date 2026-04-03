@@ -653,27 +653,23 @@ impl Context {
         let position_ids =
             (last_pos_id..(last_pos_id + pending_token_ids.len() as u32)).collect::<Vec<u32>>();
 
-        // Allocate pages for pending + extra tokens (so Rust continuation
-        // has pages available), but set kv_page_last_len for pending only.
-        // The extra tokens haven't been generated yet — vLLM uses
-        // kv_page_last_len to compute seq_lens for the attention window.
-        // Inflating it makes vLLM attend to uninitialized KV positions.
+        // Pre-allocate pages for extra_kv_tokens but only pass ACTUAL
+        // pages to the ForwardPass. The extra pages stay in self.kv_pages
+        // for the Rust continuation loop to use later.
+        let actual_total_before = if self.kv_pages.is_empty() {
+            0
+        } else {
+            (self.kv_pages.len() - 1) * self.kv_page_size + self.kv_page_last_len
+        };
         self.grow_kv_pages(pending_token_ids.len() + extra_kv_tokens);
-        if extra_kv_tokens > 0 {
-            // Reset kv_page_last_len to reflect actual tokens only
-            let actual_tokens = if self.kv_pages.is_empty() {
-                0
-            } else {
-                (self.kv_pages.len() - 1) * self.kv_page_size + self.kv_page_last_len
-            };
-            let actual_without_extra = actual_tokens.saturating_sub(extra_kv_tokens);
-            let corrected = actual_without_extra % self.kv_page_size;
-            self.kv_page_last_len = if corrected == 0 && actual_without_extra > 0 {
-                self.kv_page_size
-            } else {
-                corrected
-            };
-        }
+        let actual_total = actual_total_before + pending_token_ids.len();
+        let actual_pages = actual_total.div_ceil(self.kv_page_size);
+        let actual_last_len = actual_total % self.kv_page_size;
+        let actual_last_len = if actual_last_len == 0 && actual_total > 0 {
+            self.kv_page_size
+        } else {
+            actual_last_len
+        };
 
         let mask = mem::take(&mut self.token_mask_pending)
             .into_iter()
@@ -690,7 +686,9 @@ impl Context {
         }
 
         p.input_tokens(&pending_token_ids, &position_ids);
-        p.kv_cache(&self.kv_pages, self.kv_page_last_len);
+        // Pass only actual pages (not pre-allocated extras) to avoid
+        // vLLM attending to uninitialized KV positions.
+        p.kv_cache(&self.kv_pages[..actual_pages], actual_last_len);
         p.attention_mask(&mask);
 
         let output_idx = pending_token_ids.len() as u32 - 1;
