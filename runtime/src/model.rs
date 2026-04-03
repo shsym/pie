@@ -326,6 +326,8 @@ pub struct Model {
     scheduler_config: SchedulerConfig,
     /// Shared scheduler for metrics tracking
     scheduler: SharedScheduler,
+    /// Channel to send freed KV page IDs to inference_worker for Python signaling
+    freed_kv_tx: mpsc::UnboundedSender<Vec<ResourceId>>,
 }
 
 impl Model {
@@ -356,6 +358,9 @@ impl Model {
             num_groups,
         )));
 
+        // Channel for freed KV page IDs: Model command loop → inference_worker → Python
+        let (freed_kv_tx, freed_kv_rx) = mpsc::unbounded_channel::<Vec<ResourceId>>();
+
         let worker_handle = tokio::spawn(Self::inference_worker(
             backends.clone(),
             forward_pass_rx,
@@ -365,6 +370,7 @@ impl Model {
             Arc::clone(&scheduler),
             scheduler_config.max_in_flight_batches,
             num_groups,
+            freed_kv_rx,
         ));
 
         let tokenizer = Arc::new(BytePairEncoder::new(
@@ -424,6 +430,7 @@ impl Model {
             worker_handle: Some(worker_handle),
             scheduler_config,
             scheduler,
+            freed_kv_tx,
         })
     }
 
@@ -461,6 +468,7 @@ impl Model {
         scheduler: SharedScheduler,
         max_in_flight_batches: usize,
         num_groups: usize,
+        mut freed_kv_rx: mpsc::UnboundedReceiver<Vec<ResourceId>>,
     ) {
         const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -613,6 +621,12 @@ impl Model {
                 }
             }
 
+            // Drain freed KV page IDs (non-blocking) for Python SequenceTracker cleanup
+            let mut freed_block_ids: Vec<u32> = Vec::new();
+            while let Ok(ids) = freed_kv_rx.try_recv() {
+                freed_block_ids.extend(ids);
+            }
+
             // Fire non-empty groups immediately — no should_fire heuristic,
             // no coalesce. Only gate: max_in_flight (1 = Python controls GPU).
             let mut fired_any = false;
@@ -664,11 +678,14 @@ impl Model {
                     // Python's _batch_counter is 0-based; prof_batches_fired is post-increment
                     let trace_batch_id = prof_batches_fired[group_id].saturating_sub(1);
 
+                    // Move freed_block_ids into the first batch fired this iteration
+                    let batch_freed = std::mem::take(&mut freed_block_ids);
+
                     if Self::sched_tracing_enabled() {
                         eprintln!(
-                            "[SCHED-FIRE] t={} group={} reqs={} toks={} in_flight={}",
+                            "[SCHED-FIRE] t={} group={} reqs={} toks={} in_flight={} freed_kv={}",
                             Self::mono_ns(), group_id, batch_size, tokens_in_batch,
-                            in_flight_counts[group_id],
+                            in_flight_counts[group_id], batch_freed.len(),
                         );
                     }
 
@@ -677,7 +694,7 @@ impl Model {
                          Self::execute_forward_pass_batch(
                              &backend_clone, batch_to_fire, group_id,
                              REQUEST_TIMEOUT, &continuation_tx_clone,
-                             trace_batch_id,
+                             trace_batch_id, batch_freed,
                          ).await;
                          if Self::trace_enabled() {
                              Self::trace("rs.pre_completion", trace_batch_id,
@@ -767,7 +784,7 @@ impl Model {
         for group_id in 0..num_groups {
             if !batches[group_id].is_empty() {
                 let batch = std::mem::take(&mut batches[group_id]);
-                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, &continuation_tx, 0).await;
+                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, &continuation_tx, 0, Vec::new()).await;
             }
         }
 
@@ -806,7 +823,7 @@ impl Model {
 
     #[tracing::instrument(
         name = "rust.fire_batch",
-        skip(backend, requests, continuation_tx),
+        skip(backend, requests, continuation_tx, freed_block_ids),
         fields(batch_size = requests.len())
     )]
     async fn execute_forward_pass_batch(
@@ -816,12 +833,17 @@ impl Model {
         timeout: Duration,
         continuation_tx: &mpsc::UnboundedSender<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>,
         trace_batch_id: usize,
+        freed_block_ids: Vec<u32>,
     ) {
         let _t_entry = if Self::sched_tracing_enabled() { Some(Self::mono_ns()) } else { None };
 
         let batch_size = requests.len();
         let mut batch_req = BatchedForwardPassRequest::new();
         batch_req.group_id = Some(group_id);
+        // Attach freed KV page IDs for Python SequenceTracker cleanup
+        if !freed_block_ids.is_empty() {
+            batch_req.freed_block_ids = request::ByteVec(freed_block_ids);
+        }
         for (fp_req, _) in &requests {
             batch_req.add_request(fp_req);
         }
@@ -1151,31 +1173,42 @@ impl Model {
                 }
             }
             Command::Deallocate { inst_id, type_id, ptrs } => {
+                // Capture KV page IDs before deallocate for Python signaling
+                let freed_kv = if type_id == resource::KV_PAGE_TYPE_ID {
+                    Some(ptrs.clone())
+                } else {
+                    None
+                };
                 if let Err(e) = self.resource_manager.deallocate(inst_id, type_id, ptrs) {
                     terminate_instance_with_exception(inst_id, e);
+                } else if let Some(ids) = freed_kv {
+                    let _ = self.freed_kv_tx.send(ids);
                 }
             }
             Command::Cleanup { inst_id } => {
-                if let Err(e) = self.resource_manager.cleanup(inst_id) {
-                    terminate_instance_with_exception(inst_id, e);
+                match self.resource_manager.cleanup_with_freed_kv(inst_id) {
+                    Ok(freed_kv_ids) => {
+                        if !freed_kv_ids.is_empty() {
+                            let _ = self.freed_kv_tx.send(freed_kv_ids);
+                        }
+                    }
+                    Err(e) => terminate_instance_with_exception(inst_id, e),
                 }
             }
             Command::GetAllExported { type_id, response } => {
                 response.send(self.resource_manager.get_all_exported(type_id)).ok();
             }
             Command::Export { inst_id, type_id, ptrs, name } => {
+                eprintln!("[RESOURCE-DEBUG] Export type={} name={:?} ptrs={} inst={}", type_id, name, ptrs.len(), inst_id);
                 if let Err(e) = self.resource_manager.export(inst_id, type_id, ptrs, name) {
+                    eprintln!("[RESOURCE-DEBUG] Export FAILED: {:?}", e);
                     terminate_instance_with_exception(inst_id, e);
                 }
             }
             Command::Import { inst_id, type_id, name, response } => {
                 match self.resource_manager.import(type_id, name) {
-                    Ok(ptrs) => {
-                        // Register imported pointers in the importing instance's
-                        // allocation table so they can be re-exported later.
-                        // Without this, export() fails with PointerNotAllocated
-                        // because imported pages aren't tracked in res_allocated.
-                        self.resource_manager.register_imported(inst_id, type_id, &ptrs);
+                    Ok((group_id, ptrs)) => {
+                        self.resource_manager.register_imported(inst_id, type_id, group_id, &ptrs);
                         response.send(ptrs).ok();
                     }
                     Err(e) => terminate_instance_with_exception(inst_id, e),

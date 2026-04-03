@@ -1258,10 +1258,15 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                 print(f"[PIE-TRACE] {_ts_poll_done} py.poll_done {_bid} ", file=_tfd, flush=True)
                 print(f"[PIE-TRACE] {_ts_drain_done} py.drain_done {_bid} n={len(pending)}", file=_tfd, flush=True)
 
-            # Decode all pending batches
+            # Decode all pending batches, extracting freed_block_ids before merge
             batch_items = []
+            all_freed = b""
             for req_id, raw_payload in pending:
                 kwargs = msgpack.unpackb(raw_payload)
+                # Collect freed_block_ids from all batches (merger doesn't handle them)
+                freed = kwargs.pop("freed_block_ids", None)
+                if freed and len(freed) > 0:
+                    all_freed = all_freed + (freed if isinstance(freed, bytes) else bytes(freed))
                 batch_items.append((req_id, kwargs))
 
             # Merge
@@ -1274,6 +1279,10 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                 req_ids = [rid for rid, _ in batch_items]
                 counts = counts_fn(batches_list)
                 fire_kwargs = merge_fn(batches_list)
+
+            # Re-attach aggregated freed_block_ids to merged kwargs
+            if all_freed:
+                fire_kwargs["freed_block_ids"] = all_freed
 
             # Count total requests in merged batch
             import numpy as np

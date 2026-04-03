@@ -106,11 +106,9 @@ class SequenceTracker:
 
         self._num_kv_cache_groups: int = num_kv_cache_groups
 
-        # Absence counter for partial_batch GC. Tracks how many consecutive
-        # batches each active request has been absent from. Requests absent
-        # for >= _ABSENT_THRESHOLD batches are considered finished.
-        self._absent_count: dict[int, int] = {}  # seq_key -> consecutive absent count
-        _ABSENT_THRESHOLD = 3  # finish after 3 consecutive absences
+        # Block IDs freed by Rust ResourceManager (explicit finish signal).
+        # Accumulated between fire_batch calls, consumed in build_scheduler_output.
+        self._freed_block_ids: set[int] = set()
 
     # -- Public properties -------------------------------------------------
 
@@ -141,6 +139,17 @@ class SequenceTracker:
     @property
     def all_issued_req_ids(self) -> set[str]:
         return self._all_issued_req_ids
+
+    # -- Explicit finish signal from Rust ------------------------------------
+
+    def finish_by_block_ids(self, freed_ids: set) -> None:
+        """Queue freed block IDs for deterministic sequence cleanup.
+
+        Called when Rust ResourceManager deallocates KV pages (WASM Context
+        drops). The actual cleanup happens in build_scheduler_output() so
+        that finished_req_ids are included in the SchedulerOutput.
+        """
+        self._freed_block_ids |= freed_ids
 
     # -- Core methods ------------------------------------------------------
 
@@ -445,34 +454,34 @@ class SequenceTracker:
             num_scheduled_tokens[req_id] = num_new_tokens
             total += num_new_tokens
 
-        # Identify finished sequences using absence counting.
-        # With partial_batch=True (unlimited max_in_flight), a request
-        # absent from ONE batch might just be in a different in-flight
-        # batch. We track consecutive absences and only finish after
-        # _ABSENT_THRESHOLD consecutive misses.
-        # Note: finished_req_ids is initialised before the loop and may
-        # already contain fork-evicted requests.
-        _ABSENT_THRESHOLD = 1 if not partial_batch else 3
+        # Finish sequences whose KV pages were explicitly freed by Rust.
+        # This replaces absence-based GC — deterministic, no false positives.
+        if self._freed_block_ids:
+            to_remove = []
+            for seq_key, active_req in self._active_requests.items():
+                if seq_key in self._freed_block_ids:
+                    finished_req_ids.add(active_req.req_id)
+                    to_remove.append(seq_key)
+            for k in to_remove:
+                del self._active_requests[k]
+                self._token_history.pop(k, None)
+            self._freed_block_ids.clear()
+
+        # Fallback: finish sequences absent from current batch AND not
+        # in any active tracking. This handles edge cases like sentinel
+        # keys or sequences that were never properly tracked.
         absent_keys = set(self._active_requests.keys()) - current_last_blocks
         for fk in absent_keys:
             if fk < 0:
-                continue  # sentinel keys are ephemeral
-            self._absent_count[fk] = self._absent_count.get(fk, 0) + 1
-            if self._absent_count[fk] >= _ABSENT_THRESHOLD:
+                # Sentinel keys are ephemeral — finish immediately
                 finished_req_ids.add(self._active_requests[fk].req_id)
                 del self._active_requests[fk]
-                self._absent_count.pop(fk, None)
-
-        # Reset absence counter for present requests
-        for lb in current_last_blocks:
-            self._absent_count.pop(lb, None)
 
         # GC trace: track state sizes for debugging
         import os as _os
         if _os.environ.get("PIE_GC_TRACE") and (self._batch_counter % 50 == 0):
             print(f"[GC] batch={self._batch_counter} active={len(self._active_requests)} "
                   f"history={len(self._token_history)} issued={len(self._all_issued_req_ids)} "
-                  f"absent_tracking={len(self._absent_count)} "
                   f"current_batch={len(current_last_blocks)} "
                   f"finished_this_batch={len(finished_req_ids)}",
                   file=__import__('sys').stderr, flush=True)
@@ -485,17 +494,8 @@ class SequenceTracker:
             elif fk not in self._active_requests:
                 del self._token_history[fk]
 
-        # Clean up absent counts for sequences no longer tracked
-        stale_absent = set(self._absent_count.keys()) - set(self._active_requests.keys())
-        for k in stale_absent:
-            del self._absent_count[k]
-
         # Safety net: finish stale req_ids in vLLM's input_batch.
-        # Only finish req_ids whose sequences were already removed from
-        # _active_requests (by the absence threshold above). This prevents
-        # prematurely finishing in-flight requests that are in other batches.
         current_req_ids = set(num_scheduled_tokens.keys())
-        # Collect req_ids of still-active sequences (haven't passed threshold)
         still_active_req_ids = {ar.req_id for ar in self._active_requests.values()}
         stale_req_ids = self._all_issued_req_ids - current_req_ids - still_active_req_ids
         finished_req_ids |= stale_req_ids

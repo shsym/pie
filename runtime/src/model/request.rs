@@ -271,6 +271,12 @@ pub struct FormatChatResponse {
 #[derive(Debug, Clone, Default)]
 pub struct ByteVec(pub Vec<u32>);
 
+impl ByteVec {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 impl serde::Serialize for ByteVec {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -354,6 +360,11 @@ pub struct BatchedForwardPassRequest {
     // When >1, the Python backend loops internally.
     #[serde(default = "default_one")]
     pub max_decode_steps: u32,
+
+    // KV page IDs freed since last batch (explicit finish signal for SequenceTracker).
+    // Sent from Rust ResourceManager on deallocate/cleanup.
+    #[serde(default, skip_serializing_if = "ByteVec::is_empty")]
+    pub freed_block_ids: ByteVec,
 }
 
 impl BatchedForwardPassRequest {
@@ -385,6 +396,7 @@ impl BatchedForwardPassRequest {
             trace_context: None,
             group_id: None,
             max_decode_steps: 1,
+            freed_block_ids: ByteVec(Vec::new()),
         }
     }
 

@@ -969,6 +969,12 @@ class PieVllmRuntime:
         """
         t_start = time.perf_counter()
 
+        # --- 0. Process explicit freed_block_ids from Rust ResourceManager ---
+        freed_raw = kwargs.pop("freed_block_ids", None)
+        if freed_raw is not None and len(freed_raw) > 0:
+            freed_ids = set(np.frombuffer(freed_raw, dtype=np.uint32).tolist())
+            self._seq_tracker.finish_by_block_ids(freed_ids)
+
         # --- 1. Decode batch metadata ---
         arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
 
