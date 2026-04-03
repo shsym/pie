@@ -1208,6 +1208,10 @@ impl Model {
             Command::Import { inst_id, type_id, name, response } => {
                 match self.resource_manager.import(type_id, name) {
                     Ok((group_id, ptrs)) => {
+                        // Register imported pointers in the importing instance's
+                        // allocation table so they can be re-exported later.
+                        // This also increments the ref count for each page (+1
+                        // since the export already holds a ref).
                         self.resource_manager.register_imported(inst_id, type_id, group_id, &ptrs);
                         response.send(ptrs).ok();
                     }
