@@ -319,12 +319,18 @@ impl ResourceManager {
     }
 
     pub fn cleanup(&mut self, inst_id: InstanceId) -> Result<(), ResourceError> {
+        let _ = self.cleanup_with_freed_kv(inst_id)?;
+        Ok(())
+    }
+
+    /// Like cleanup() but returns the freed KV page IDs for explicit signaling.
+    pub fn cleanup_with_freed_kv(&mut self, inst_id: InstanceId) -> Result<Vec<ResourceId>, ResourceError> {
         // If instance was never assigned a group, just clean up start time and return
         let group_id = match self.instance_groups.get(&inst_id) {
             Some(g) => *g,
             None => {
                 self.inst_start_time.remove(&inst_id);
-                return Ok(());
+                return Ok(Vec::new());
             }
         };
 
@@ -341,6 +347,12 @@ impl ResourceManager {
             }
         });
 
+        // Collect freed KV page IDs before releasing
+        let freed_kv = to_release_by_type
+            .get(&KV_PAGE_TYPE_ID)
+            .cloned()
+            .unwrap_or_default();
+
         for (ty, ptrs) in to_release_by_type {
             let pool = self
                 .res_pool
@@ -352,7 +364,7 @@ impl ResourceManager {
         }
         self.inst_start_time.remove(&inst_id);
         self.instance_groups.remove(&inst_id);
-        Ok(())
+        Ok(freed_kv)
     }
 
     // --- export, import, release_exported, and get_all_exported methods ---
@@ -400,24 +412,31 @@ impl ResourceManager {
         &mut self,
         type_id: ResourceTypeId,
         name: String,
-    ) -> Result<Vec<ResourceId>, ResourceError> {
+    ) -> Result<(GroupId, Vec<ResourceId>), ResourceError> {
+        // Non-consuming import: the export entry stays so other instances
+        // can also import the same resource (read-only shared).  Pages are
+        // freed only when the export is explicitly released (e.g. session
+        // eviction) or when the resource pool needs to reclaim memory.
         self.res_exported
             .get(&type_id)
             .and_then(|exports| exports.get(&name))
-            .map(|(_, ptrs)| ptrs.clone())
+            .cloned()
             .ok_or(ResourceError::ExportNotFound { name })
     }
 
     /// Register imported resource pointers in the importing instance's
-    /// allocation table. This allows the instance to later re-export
-    /// these resources (e.g., session KV pages imported from a previous
-    /// turn that need to be re-exported after generation extends them).
+    /// allocation table AND assign the instance to the exporter's resource
+    /// group.  Without the group assignment, re-exporting the imported
+    /// pages fails with InstanceGroupNotFound.
     pub fn register_imported(
         &mut self,
         inst_id: InstanceId,
         type_id: ResourceTypeId,
+        group_id: GroupId,
         ptrs: &[ResourceId],
     ) {
+        self.instance_groups.entry(inst_id).or_insert(group_id);
+
         let allocated = self
             .res_allocated
             .entry((type_id, inst_id))
