@@ -85,6 +85,7 @@ class DecodedBatchArrays:
     adapter_indices: list[int | None]
 from .vllm_sampling_bridge import PieVllmSamplingBridge
 from .vllm_sequence_tracker import SequenceTracker
+from .vllm_capture import get_capture as _get_capture
 
 # vLLM is installed as a pip package (pip install vllm==0.17.0) with Pie
 # integration patches applied to the installed site-packages.  No source
@@ -316,7 +317,7 @@ class PieVllmRuntime:
         # For TP>1, use shared master_port from manager.py so all workers
         # in the TP group can find each other for NCCL init.
         # For TP=1 (master_port=0), use a random port (backward compat).
-        if self.config.master_port > 0:
+        if getattr(self.config, 'master_port', 0) > 0:
             port = self.config.master_port
         else:
             import socket
@@ -440,7 +441,6 @@ class PieVllmRuntime:
         seq_lens: np.ndarray,
         sampling_params_list: list[dict[str, Any]],
         adapter_indices: list[int | None] | None = None,
-        partial_batch: bool = False,
     ):
         """Delegate to SequenceTracker.build_scheduler_output()."""
         return self._seq_tracker.build_scheduler_output(
@@ -453,7 +453,6 @@ class PieVllmRuntime:
             sampling_params_list=sampling_params_list,
             adapter_indices=adapter_indices,
             adapter_registry=self._adapter_registry,
-            partial_batch=partial_batch,
         )
 
     # ------------------------------------------------------------------
@@ -543,7 +542,7 @@ class PieVllmRuntime:
             from transformers import AutoTokenizer
             self._hf_tokenizer = AutoTokenizer.from_pretrained(
                 self.config.hf_repo,
-                trust_remote_code=self.config.trust_remote_code,
+                trust_remote_code=getattr(self.config, 'trust_remote_code', False),
             )
 
         # Get stop tokens from HF tokenizer + GenerationConfig
@@ -818,10 +817,6 @@ class PieVllmRuntime:
                   f"seq_lens={arrays.seq_lens.tolist()[:10]}",
                   file=sys.stderr, flush=True)
 
-        # partial_batch: True when other batches may be in-flight (max_in_flight > 1).
-        # Tells SequenceTracker not to finish absent requests.
-        partial_batch = kwargs.get("_partial_batch", False)
-
         scheduler_output = self._build_scheduler_output(
             batch_id=batch_id,
             token_ids=arrays.token_ids,
@@ -831,7 +826,6 @@ class PieVllmRuntime:
             seq_lens=arrays.seq_lens,
             sampling_params_list=arrays.sampling_params_list,
             adapter_indices=arrays.adapter_indices,
-            partial_batch=partial_batch,
         )
 
         # BRLE masks (only for multi-token prefill steps)
@@ -1007,6 +1001,16 @@ class PieVllmRuntime:
             traceback.print_exc(file=sys.stderr)
             raise
 
+        # --- Capture input (step 0) ---
+        _cap = _get_capture()
+        _cap_bid = self._batch_counter - 1  # batch_id from prepare_step
+        if _cap.enabled:
+            _cap.capture_step(
+                batch_id=_cap_bid, step_index=0,
+                scheduler_output=scheduler_output,
+                tracker=self._seq_tracker, arrays=arrays,
+            )
+
         # --- 4. Execute model ---
         t_model_start = time.perf_counter()
         result = self.execute_step(scheduler_output)
@@ -1032,6 +1036,13 @@ class PieVllmRuntime:
                   file=sys.stderr, flush=True)
             traceback.print_exc(file=sys.stderr)
             raise
+
+        # --- Capture output (step 0) ---
+        if _cap.enabled:
+            _cap.capture_output(
+                batch_id=_cap_bid, step_index=0,
+                results=results, model_output=result,
+            )
 
         # --- 7. Store output embeddings (if requested) ---
         output_embed_ptrs = kwargs.get("output_embed_ptrs", [])
@@ -1100,39 +1111,13 @@ class PieVllmRuntime:
                 arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
                 num_requests = arrays.num_requests
 
-                # Between steps: drain side-channel for new requests and merge
-                # into the current batch. This enables continuous batching —
-                # new requests are processed in parallel with ongoing decode.
-                if _drain_fn and _merge_fn:
-                    _new_pending = _drain_fn()
-                    if os.environ.get("PIE_TRACE"):
-                        print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_drain {self._batch_counter} step={step_i} found={len(_new_pending) if _new_pending else 0}",
-                              file=sys.stderr, flush=True)
-                    if _new_pending:
-                        try:
-                            import msgpack as _msgpack
-                            _new_items = [(_rid, _msgpack.unpackb(_raw))
-                                          for _rid, _raw in _new_pending]
-                            _new_batches = [_kw for _, _kw in _new_items]
-                            _new_rids = [_rid for _rid, _ in _new_items]
-                            _new_counts = _counts_fn(_new_batches) if _counts_fn else [1] * len(_new_batches)
-                            _all_merged_req_ids.extend(_new_rids)
-                            _all_merged_counts.extend(_new_counts)
-                            _all_batches = [kwargs] + _new_batches
-                            kwargs = _merge_fn(_all_batches)
-                            arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
-                            num_requests = arrays.num_requests
-                            if os.environ.get("PIE_TRACE"):
-                                print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_merge {self._batch_counter} step={step_i} new_reqs={len(_new_pending)} total_reqs={num_requests}",
-                                      file=sys.stderr, flush=True)
-                        except Exception as _merge_err:
-                            # Merge failed — log error, skip merge, process new
-                            # requests after the loop instead
-                            import traceback
-                            print(f"[MS-MERGE-ERROR] step {step_i}: {_merge_err}\n{traceback.format_exc()}",
-                                  file=sys.stderr, flush=True)
-                            # Put back as raw tuples for manager.py to process later
-                            _all_merged_req_ids.extend(_new_pending)
+                # Between-step merge DISABLED for correctness.
+                # New requests drained here may contain prefill tokens that
+                # cannot safely merge into an ongoing decode step (different
+                # token counts, stale block IDs). Continuous batching happens
+                # at the manager level (merge fire_batches at drain time).
+                _merged_req_ids = None
+                _merged_counts = None
 
                 if os.environ.get("PIE_TRACE"):
                     print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_step {self._batch_counter} step={step_i} reqs={arrays.num_requests}",
@@ -1140,29 +1125,14 @@ class PieVllmRuntime:
 
                 try:
                     scheduler_output = self.prepare_step(arrays, kwargs)
-                    # Dump SchedulerOutput details for debugging
-                    if os.environ.get("PIE_MS_DEBUG"):
-                        _so = scheduler_output
-                        _nr = _so.scheduled_new_reqs
-                        _cr = _so.scheduled_cached_reqs
-                        _fi = _so.finished_req_ids
-                        _ns = _so.num_scheduled_tokens
-                        print(f"[MS-DEBUG] step={step_i} new_reqs={len(_nr)} "
-                              f"cached_req_ids={getattr(_cr, 'req_ids', [])} "
-                              f"finished={_fi} num_sched_tokens={_ns}",
-                              file=sys.stderr, flush=True)
-                        if _nr:
-                            for _nri, _nrd in enumerate(_nr):
-                                print(f"  NEW[{_nri}] req_id={_nrd.req_id} "
-                                      f"prompt_len={len(_nrd.prompt_token_ids)} "
-                                      f"num_computed={_nrd.num_computed_tokens} "
-                                      f"blocks={[b[:3] for b in _nrd.block_ids]}...",
-                                      file=sys.stderr, flush=True)
-                        if hasattr(_cr, 'req_ids') and _cr.req_ids:
-                            print(f"  CACHED req_ids={_cr.req_ids} "
-                                  f"num_computed={_cr.num_computed_tokens} "
-                                  f"num_output={_cr.num_output_tokens}",
-                                  file=sys.stderr, flush=True)
+                    if _cap.enabled:
+                        _cap.capture_step(
+                            batch_id=_cap_bid, step_index=step_i,
+                            scheduler_output=scheduler_output,
+                            tracker=self._seq_tracker, arrays=arrays,
+                            is_merged=bool(_merged_req_ids),
+                            merged_req_count=len(_merged_req_ids) if _merged_req_ids else 0,
+                        )
                     result = self.execute_step(scheduler_output)
                     logits_expanded = self._expand_logits_for_multi_position(
                         kwargs, arrays.qo_indptr, arrays.num_requests
@@ -1171,9 +1141,11 @@ class PieVllmRuntime:
                         result, kwargs, arrays.num_requests,
                         logits_expanded=logits_expanded,
                     )
-                    if os.environ.get("PIE_MS_DEBUG"):
-                        print(f"[MS-DEBUG] step={step_i} results={[{k: v for k, v in r.items() if k == 'tokens'} for r in results]}",
-                              file=sys.stderr, flush=True)
+                    if _cap.enabled:
+                        _cap.capture_output(
+                            batch_id=_cap_bid, step_index=step_i,
+                            results=results, model_output=result,
+                        )
                 except Exception as e:
                     print(f"[MS-ERROR] step {step_i}: {e}", file=sys.stderr, flush=True)
                     import traceback; traceback.print_exc(file=sys.stderr)

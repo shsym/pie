@@ -116,7 +116,10 @@ class RuntimeConfig:
         | None
     ):
         """Derive quantization config from weight_dtype (only for quantization types)."""
-        import torchao
+        try:
+            import torchao
+        except ImportError:
+            return None
 
         match self.weight_dtype:
             case "int4":

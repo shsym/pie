@@ -164,7 +164,6 @@ class SequenceTracker:
         sampling_params_list: list[dict[str, Any]],
         adapter_indices: list[int | None] | None = None,
         adapter_registry: dict[int, tuple[str, str]] | None = None,
-        partial_batch: bool = False,
         kv_page_size: int = 0,
     ):
         """Build a vLLM SchedulerOutput from translated Pie batch data.
@@ -234,6 +233,21 @@ class SequenceTracker:
         # within-batch collisions (e.g. fork creating two sequences
         # that share prefix blocks).
         batch_seen_last_blocks: set[int] = set()
+
+        # Process freed_block_ids BEFORE the per-request loop.
+        # Rust sends freed block IDs in the same batch that reuses them.
+        # If we process them after, the NEW request's entry gets matched
+        # and incorrectly finished.
+        if self._freed_block_ids:
+            to_remove = []
+            for seq_key, active_req in self._active_requests.items():
+                if seq_key in self._freed_block_ids:
+                    finished_req_ids.add(active_req.req_id)
+                    to_remove.append(seq_key)
+            for k in to_remove:
+                del self._active_requests[k]
+                self._token_history.pop(k, None)
+            self._freed_block_ids.clear()
 
         for i in range(num_requests):
             # Extract this request's NEW token IDs from the flat array
@@ -428,14 +442,17 @@ class SequenceTracker:
                             lora_path=path,
                         )
 
+                use_block_ids = block_ids
+                use_num_computed = num_computed_tokens
+
                 new_reqs.append(NewRequestData(
                     req_id=req_id,
                     prompt_token_ids=full_prompt_token_ids,
                     mm_features=[],
                     sampling_params=vllm_sampling_params,
                     pooling_params=None,
-                    block_ids=block_ids,
-                    num_computed_tokens=num_computed_tokens,
+                    block_ids=use_block_ids,
+                    num_computed_tokens=use_num_computed,
                     lora_request=lora_request,
                 ))
 
@@ -454,44 +471,21 @@ class SequenceTracker:
             num_scheduled_tokens[req_id] = num_new_tokens
             total += num_new_tokens
 
-        # Finish sequences whose KV pages were explicitly freed by Rust.
-        # This replaces absence-based GC — deterministic, no false positives.
-        if self._freed_block_ids:
-            to_remove = []
-            for seq_key, active_req in self._active_requests.items():
-                if seq_key in self._freed_block_ids:
-                    finished_req_ids.add(active_req.req_id)
-                    to_remove.append(seq_key)
-            for k in to_remove:
-                del self._active_requests[k]
-                self._token_history.pop(k, None)
-            self._freed_block_ids.clear()
+        # freed_block_ids already processed BEFORE the per-request loop.
 
-        # Fallback: finish sequences absent from current batch AND not
-        # in any active tracking. This handles edge cases like sentinel
-        # keys or sequences that were never properly tracked.
-        absent_keys = set(self._active_requests.keys()) - current_last_blocks
-        for fk in absent_keys:
-            if fk < 0:
-                # Sentinel keys are ephemeral — finish immediately
+        # Negative-sentinel cleanup: negative keys are within-batch
+        # collision sentinels that should be cleaned up when they
+        # disappear from the batch.
+        for fk in list(self._active_requests.keys()):
+            if fk < 0 and fk not in current_last_blocks:
                 finished_req_ids.add(self._active_requests[fk].req_id)
                 del self._active_requests[fk]
+                self._token_history.pop(fk, None)
 
-        # GC trace: track state sizes for debugging
-        import os as _os
-        if _os.environ.get("PIE_GC_TRACE") and (self._batch_counter % 50 == 0):
-            print(f"[GC] batch={self._batch_counter} active={len(self._active_requests)} "
-                  f"history={len(self._token_history)} issued={len(self._all_issued_req_ids)} "
-                  f"current_batch={len(current_last_blocks)} "
-                  f"finished_this_batch={len(finished_req_ids)}",
-                  file=__import__('sys').stderr, flush=True)
-
-        # Clean up token history for finished sequences
+        # Clean up token history for finished sequences.
         finished_history_keys = set(self._token_history.keys()) - current_last_blocks
         for fk in finished_history_keys:
-            if fk < 0:
-                del self._token_history[fk]
-            elif fk not in self._active_requests:
+            if fk not in self._active_requests:
                 del self._token_history[fk]
 
         # Safety net: finish stale req_ids in vLLM's input_batch.

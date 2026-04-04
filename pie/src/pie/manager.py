@@ -24,6 +24,50 @@ class EngineError(Exception):
     pass
 
 
+def _filter_config_for_from_args(config_dict: dict, exclude_keys: tuple = ("device", "devices")) -> dict:
+    """Filter config_dict to only include keys accepted by RuntimeConfig.from_args().
+
+    Uses inspect.signature to handle version differences in RuntimeConfig
+    without hardcoding parameter lists. Keys in exclude_keys are always removed.
+    """
+    import inspect
+    from pie_worker.config import RuntimeConfig
+    sig = inspect.signature(RuntimeConfig.from_args)
+    valid_params = set(sig.parameters.keys())
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+    if has_var_keyword:
+        # **kwargs accepted — only exclude explicit keys
+        return {k: v for k, v in config_dict.items() if k not in exclude_keys}
+    return {
+        k: v for k, v in config_dict.items()
+        if k not in exclude_keys and k in valid_params
+    }
+
+
+def _safe_from_args(config_dict: dict, **extra_kwargs) -> "RuntimeConfig":
+    """Call RuntimeConfig.from_args() filtering out any unsupported kwargs.
+
+    Merges config_dict (with device/devices excluded) and extra_kwargs,
+    then filters the combined dict to only include accepted parameters.
+    """
+    import inspect
+    from pie_worker.config import RuntimeConfig
+    sig = inspect.signature(RuntimeConfig.from_args)
+    valid_params = set(sig.parameters.keys())
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+    combined = {k: v for k, v in config_dict.items() if k not in ("device", "devices")}
+    combined.update(extra_kwargs)
+    if not has_var_keyword:
+        combined = {k: v for k, v in combined.items() if k in valid_params}
+    return RuntimeConfig.from_args(**combined)
+
+
 class FfiWorkerHandle:
     """Wrapper for FFI worker thread to look like a process for cleanup."""
 
@@ -372,9 +416,7 @@ def _create_runtime(
     from pie_worker.runtime import Runtime
 
     # Remove device/devices from config to avoid duplicate argument
-    filtered_config = {
-        k: v for k, v in config_dict.items() if k not in ("device", "devices")
-    }
+    filtered_config = _filter_config_for_from_args(config_dict)
 
     config = RuntimeConfig.from_args(
         **filtered_config,
@@ -689,9 +731,7 @@ def _ipc_worker_body(
     my_group_ranks = group_topology[my_group_id]
     group_devices = [devices[r] for r in my_group_ranks]
 
-    filtered_config = {
-        k: v for k, v in config_dict.items() if k not in ("device", "devices")
-    }
+    filtered_config = _filter_config_for_from_args(config_dict)
     config = RuntimeConfig.from_args(
         **filtered_config,
         devices=group_devices,  # All devices in this TP group
@@ -947,11 +987,8 @@ def _vllm_worker_process(
         my_group_ranks = group_topology[my_group_id]
         group_devices = [devices[r] for r in my_group_ranks]
 
-        filtered_config = {
-            k: v for k, v in config_dict.items() if k not in ("device", "devices")
-        }
-        config = RuntimeConfig.from_args(
-            **filtered_config,
+        config = _safe_from_args(
+            config_dict,
             devices=group_devices,
             rank=tp_rank,
             world_size=tp_degree,
@@ -1303,7 +1340,6 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
                     _drain_fn=side_channel.drain_requests if side_channel else None,
                     _merge_fn=merge_fn,
                     _counts_fn=counts_fn,
-                    _partial_batch=True,  # max_in_flight>1: batches may be partial
                     **fire_kwargs,
                 )
 
@@ -1372,9 +1408,7 @@ def _ipc_group_worker(
     from pie_worker.config import RuntimeConfig
 
     # Create runtime config for this group
-    filtered_config = {
-        k: v for k, v in config_dict.items() if k not in ("device", "devices")
-    }
+    filtered_config = _filter_config_for_from_args(config_dict)
 
     config = RuntimeConfig.from_args(
         **filtered_config,
