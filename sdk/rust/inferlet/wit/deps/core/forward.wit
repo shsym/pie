@@ -32,6 +32,7 @@ interface forward {
         pass: borrow<forward-pass>,
         kv-page-ptrs: list<pointer>,
         last-kv-page-len: u32,
+        actual-pages: u32,
     );
 
 

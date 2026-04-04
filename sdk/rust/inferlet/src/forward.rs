@@ -322,13 +322,13 @@ impl ForwardPass {
         api::forward::attention_mask(&self.inner, mask);
     }
 
-    pub fn kv_cache(&self, kv_pages: &[KvPage], last_kv_page_len: usize) {
+    pub fn kv_cache(&self, kv_pages: &[KvPage], last_kv_page_len: usize, actual_pages: u32) {
         let ptrs = kv_pages.iter().map(|kv| kv.ptr()).collect::<Vec<_>>();
-        api::forward::kv_cache(&self.inner, &ptrs, last_kv_page_len as u32);
+        api::forward::kv_cache(&self.inner, &ptrs, last_kv_page_len as u32, actual_pages);
     }
 
-    pub fn kv_cache_ptrs(&self, kv_page_ptrs: &[u32], last_kv_page_len: usize) {
-        api::forward::kv_cache(&self.inner, kv_page_ptrs, last_kv_page_len as u32);
+    pub fn kv_cache_ptrs(&self, kv_page_ptrs: &[u32], last_kv_page_len: usize, actual_pages: u32) {
+        api::forward::kv_cache(&self.inner, kv_page_ptrs, last_kv_page_len as u32, actual_pages);
     }
 
     /// Set maximum number of sequential decode steps per execute() call.

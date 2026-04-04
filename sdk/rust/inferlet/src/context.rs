@@ -457,7 +457,7 @@ impl Context {
 
         let p = self.queue.create_forward_pass();
         p.input_tokens(&pending_token_ids, &position_ids);
-        p.kv_cache(&self.kv_pages, self.kv_page_last_len);
+        p.kv_cache(&self.kv_pages, self.kv_page_last_len, self.kv_pages.len() as u32);
         p.attention_mask(&mask);
 
         let _ = p.execute().await;
@@ -686,9 +686,11 @@ impl Context {
         }
 
         p.input_tokens(&pending_token_ids, &position_ids);
-        // Pass only actual pages (not pre-allocated extras) to avoid
-        // vLLM attending to uninitialized KV positions.
-        p.kv_cache(&self.kv_pages[..actual_pages], actual_last_len);
+        // Send ALL pages (including pre-allocated extras from decode_n)
+        // so the scheduler and Python multi-step loop can cross page
+        // boundaries without round-tripping. actual_pages tells the
+        // runtime how many pages currently have data.
+        p.kv_cache(&self.kv_pages, actual_last_len, actual_pages as u32);
         p.attention_mask(&mask);
 
         let output_idx = pending_token_ids.len() as u32 - 1;
@@ -773,7 +775,7 @@ impl Context {
         }
 
         p.input_tokens(&pending_token_ids, &position_ids);
-        p.kv_cache(&self.kv_pages, self.kv_page_last_len);
+        p.kv_cache(&self.kv_pages, self.kv_page_last_len, self.kv_pages.len() as u32);
         p.attention_mask(&mask);
 
         let output_idx = pending_token_ids.len() as u32 - 1;
@@ -1128,7 +1130,7 @@ impl Context {
 
             // Run the forward pass.
             p.input_tokens(&batch_tokens, &batch_positions);
-            p.kv_cache(&self.kv_pages, self.kv_page_last_len);
+            p.kv_cache(&self.kv_pages, self.kv_page_last_len, self.kv_pages.len() as u32);
             p.attention_mask(&batch_masks);
             p.output_distributions(&out_range.map(|x| x as u32).collect::<Vec<_>>(), 0.0, None);
             let pass_result = p.execute().await;

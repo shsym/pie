@@ -67,6 +67,9 @@ pub struct ForwardPass {
     mask: Vec<Vec<u32>>,
     kv_page_ptrs: Vec<u32>,
     kv_page_last_len: u32,
+    /// Number of active (data-containing) KV pages. Pages beyond this
+    /// in kv_page_ptrs are pre-allocated reserves for page crossings.
+    kv_actual_pages: u32,
     output_token_indices: Vec<u32>,
     output_token_samplers: Vec<HashMap<String, rmpv::Value>>,
     output_embed_ptrs: Vec<u32>,
@@ -166,6 +169,7 @@ impl inferlet::core::forward::Host for InstanceState {
             mask: vec![],
             kv_page_ptrs: vec![],
             kv_page_last_len: 0,
+            kv_actual_pages: 0,
             output_token_indices: vec![],
             output_token_samplers: vec![],
             output_embed_ptrs: vec![],
@@ -191,12 +195,14 @@ impl inferlet::core::forward::Host for InstanceState {
         pass: Resource<ForwardPass>,
         kv_page_ptrs: Vec<ResourceId>,
         kv_page_last_len: u32,
+        actual_pages: u32,
     ) -> Result<()> {
         let svc_id = self.ctx().table.get(&pass)?.queue.service_id;
         let translated = self.translate_kv_pages_cached(svc_id, &kv_page_ptrs)?;
         let pass = self.ctx().table.get_mut(&pass)?;
         pass.kv_page_ptrs = translated;
         pass.kv_page_last_len = kv_page_last_len;
+        pass.kv_actual_pages = actual_pages;
         Ok(())
     }
 
@@ -476,6 +482,7 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
                 return_distributions: pass.return_distributions,
                 multi_step_tokens: Vec::new(),
                 kv_page_size: pass.queue.info.kv_page_size,
+                actual_kv_pages: pass.kv_actual_pages,
                 arrival_time: None, // Set in Model::submit() before queuing
                 inst_id: Some(self.id()),
                 token_stream_tx: None, // set below for multi-step
