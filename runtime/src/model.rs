@@ -487,6 +487,7 @@ impl Model {
             mpsc::unbounded_channel::<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>();
 
 
+
         // PROFILING: Track request rates and batch firing
         let mut prof_requests_received: Vec<usize> = vec![0; num_groups];
         let mut prof_batches_fired: Vec<usize> = vec![0; num_groups];
@@ -918,6 +919,13 @@ impl Model {
                                         && fp_req.kv_page_last_len > fp_req.kv_page_size
                                     {
                                         fp_req.kv_page_last_len = 1;
+                                        // Page crossed: include the next pre-allocated
+                                        // page (SDK sent all pages via kv_cache).
+                                        if fp_req.actual_kv_pages > 0
+                                            && (fp_req.actual_kv_pages as usize) < fp_req.kv_page_ptrs.len()
+                                        {
+                                            fp_req.actual_kv_pages += 1;
+                                        }
                                     }
                                     let next_pos = fp_req.input_token_positions.last()
                                         .map(|&p| p + 1).unwrap_or(0);

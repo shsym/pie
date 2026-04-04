@@ -686,9 +686,13 @@ impl Context {
         }
 
         p.input_tokens(&pending_token_ids, &position_ids);
-        // Pass only actual pages (not pre-allocated extras) to avoid
-        // vLLM attending to uninitialized KV positions.
-        p.kv_cache(&self.kv_pages[..actual_pages], actual_last_len);
+        // Send ALL pages (including pre-allocated extras from decode_n)
+        // so the scheduler can extend into them on page-boundary crossings.
+        // set_kv_actual_pages tells the runtime how many are currently active.
+        p.kv_cache(&self.kv_pages, actual_last_len);
+        if actual_pages < self.kv_pages.len() {
+            p.set_kv_actual_pages(actual_pages as u32);
+        }
         p.attention_mask(&mask);
 
         let output_idx = pending_token_ids.len() as u32 - 1;

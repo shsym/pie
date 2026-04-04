@@ -196,6 +196,11 @@ pub struct ForwardPassRequest {
     /// KV page size for multi-step KV state tracking (scheduler-only).
     #[serde(skip)]
     pub kv_page_size: u32,
+    /// Number of active KV pages (excluding pre-allocated extras).
+    /// Only the first `actual_kv_pages` are serialized into kv_page_indptr.
+    /// The scheduler extends this on page-boundary crossings.
+    #[serde(skip)]
+    pub actual_kv_pages: u32,
     /// Arrival time for scheduler estimation (not serialized).
     #[serde(skip)]
     pub arrival_time: Option<Instant>,
@@ -406,8 +411,14 @@ impl BatchedForwardPassRequest {
         self.token_ids.0.extend(&req.input_tokens);
         self.position_ids.0.extend(&req.input_token_positions);
 
-        // KV cache layout
-        self.kv_page_indices.0.extend(&req.kv_page_ptrs);
+        // KV cache layout — use actual_kv_pages to exclude pre-allocated
+        // extras from kv_page_indptr so Python's seq_lens is correct.
+        let active_pages = if req.actual_kv_pages > 0 {
+            (req.actual_kv_pages as usize).min(req.kv_page_ptrs.len())
+        } else {
+            req.kv_page_ptrs.len()
+        };
+        self.kv_page_indices.0.extend(&req.kv_page_ptrs[..active_pages]);
         self.kv_page_indptr.0.push(self.kv_page_indices.0.len() as u32);
         self.kv_last_page_lens.0.push(req.kv_page_last_len);
 

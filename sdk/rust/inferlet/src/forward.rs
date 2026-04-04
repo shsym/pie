@@ -338,4 +338,11 @@ impl ForwardPass {
         api::forward::set_max_decode_steps(&self.inner, max_steps);
     }
 
+    /// Set the number of active (non-pre-allocated) KV pages.
+    /// The runtime uses this for kv_page_indptr serialization and
+    /// extends it on page-boundary crossings during multi-step continuation.
+    pub fn set_kv_actual_pages(&self, actual_pages: u32) {
+        api::forward::set_kv_actual_pages(&self.inner, actual_pages);
+    }
+
 }

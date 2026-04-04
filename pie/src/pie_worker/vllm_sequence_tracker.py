@@ -238,12 +238,39 @@ class SequenceTracker:
         # Rust sends freed block IDs in the same batch that reuses them.
         # If we process them after, the NEW request's entry gets matched
         # and incorrectly finished.
+        #
+        # However, a freed block that appears as a FIRST block of a
+        # request in the current batch means the context is still live
+        # (decode_n shrunk a page then regrew — the first block is
+        # stable).  Don't finish those sequences; the per-request loop
+        # will re-key them.
         if self._freed_block_ids:
+            # Collect first blocks from current batch to protect live contexts
+            _live_first_blocks: set[int] = set()
+            for _bi in range(num_requests):
+                if blocks_per_req[_bi]:
+                    _live_first_blocks.add(blocks_per_req[_bi][0])
             to_remove = []
             for seq_key, active_req in self._active_requests.items():
                 if seq_key in self._freed_block_ids:
-                    finished_req_ids.add(active_req.req_id)
-                    to_remove.append(seq_key)
+                    # Check if ANY block in this active request's block list
+                    # is still referenced as a first_block in the current batch
+                    _still_live = False
+                    if active_req.block_ids:
+                        _first = active_req.block_ids[0]
+                        if _first in _live_first_blocks:
+                            _still_live = True
+                    if os.environ.get("PIE_VLLM_DEBUG"):
+                        print(f"[FREED-CHECK] seq_key={seq_key} "
+                              f"req={active_req.req_id} "
+                              f"first={active_req.block_ids[0] if active_req.block_ids else None} "
+                              f"live_firsts={_live_first_blocks} "
+                              f"still_live={_still_live} "
+                              f"freed={self._freed_block_ids}",
+                              file=sys.stderr, flush=True)
+                    if not _still_live:
+                        finished_req_ids.add(active_req.req_id)
+                        to_remove.append(seq_key)
             for k in to_remove:
                 del self._active_requests[k]
                 self._token_history.pop(k, None)
@@ -311,27 +338,39 @@ class SequenceTracker:
             effective_cached = min(effective_cached, existing_len)
 
             if existing_len > effective_cached:
-                # Fork or KV eviction: fewer tokens are cached than we
-                # tracked.  Truncate history to match reality and force
-                # NewRequestData so vLLM rebuilds its internal state.
+                # Distinguish page-overflow from fork/eviction:
                 #
-                # This handles two distinct cases:
-                #   Fork: partial page dropped, tokens become pending.
-                #     History[:effective_cached] has the correct prefix.
-                #   KV eviction (drop_masked_kv_pages): middle pages are
-                #     removed, so history[:effective_cached] may contain
-                #     "wrong" token values for the evicted positions.
-                #     This is harmless because num_computed_tokens prevents
-                #     vLLM from re-embedding those tokens -- the actual KV
-                #     data is read from the block_ids provided by the batch.
-                self._token_history[seq_key] = (
-                    self._token_history[seq_key][:effective_cached]
+                # Page overflow: the Rust scheduler wrapped kv_page_last_len
+                # on a page crossing without adding a new page to
+                # kv_page_indptr. seq_lens collapsed (e.g., 16 → 1) but
+                # the KV data is intact in the original page(s).
+                # Signal: effective_cached == 0, sequence is CONTINUING,
+                # and kv_len < existing_len (not just slightly less).
+                #
+                # In this case, trust existing_len as the actual cached
+                # count.  The SequenceTracker maintains the authoritative
+                # token history; kv_len from the batch metadata is wrong.
+                _is_page_overflow = (
+                    effective_cached == 0
+                    and existing_len > 0
+                    and seq_key in self._active_requests
+                    and kv_len < existing_len
                 )
-                if seq_key in self._active_requests:
-                    finished_req_ids.add(
-                        self._active_requests[seq_key].req_id
+                if _is_page_overflow:
+                    # Override: use token history as ground truth.
+                    effective_cached = existing_len
+                else:
+                    # Fork or KV eviction: fewer tokens are cached than we
+                    # tracked.  Truncate history to match reality and force
+                    # NewRequestData so vLLM rebuilds its internal state.
+                    self._token_history[seq_key] = (
+                        self._token_history[seq_key][:effective_cached]
                     )
-                    del self._active_requests[seq_key]
+                    if seq_key in self._active_requests:
+                        finished_req_ids.add(
+                            self._active_requests[seq_key].req_id
+                        )
+                        del self._active_requests[seq_key]
 
             # Accumulate full token history for this sequence.
             # For NEW sequences that share prefix with another request

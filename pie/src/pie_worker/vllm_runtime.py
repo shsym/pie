@@ -1111,13 +1111,41 @@ class PieVllmRuntime:
                 arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
                 num_requests = arrays.num_requests
 
-                # Between-step merge DISABLED for correctness.
-                # New requests drained here may contain prefill tokens that
-                # cannot safely merge into an ongoing decode step (different
-                # token counts, stale block IDs). Continuous batching happens
-                # at the manager level (merge fire_batches at drain time).
+                # Between-step merge: drain side-channel for new requests
+                # that arrived while GPU was busy, merge into current batch.
                 _merged_req_ids = None
                 _merged_counts = None
+                if _drain_fn and _merge_fn:
+                    import msgpack as _msgpack
+                    _new_pending = _drain_fn()
+                    if _new_pending:
+                        _new_items = [(_rid, _msgpack.unpackb(_raw))
+                                      for _rid, _raw in _new_pending]
+                        _new_batches = [_kw for _, _kw in _new_items]
+                        _merged_req_ids = [_rid for _rid, _ in _new_items]
+                        if _counts_fn:
+                            _merged_counts = _counts_fn(_new_batches)
+                        _all_batches = [kwargs] + _new_batches
+                        kwargs = _merge_fn(_all_batches)
+                        # Process freed_block_ids from merged batches BEFORE
+                        # prepare_step, so the tracker finishes sequences whose
+                        # blocks are about to be reused by the new requests.
+                        _merged_freed = kwargs.pop("freed_block_ids", None)
+                        if _merged_freed is not None and len(_merged_freed) > 0:
+                            _freed_set = set(np.frombuffer(
+                                _merged_freed, dtype=np.uint32
+                            ).tolist())
+                            self._seq_tracker.finish_by_block_ids(_freed_set)
+                        arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
+                        num_requests = arrays.num_requests
+                        _all_merged_req_ids.extend(_merged_req_ids)
+                        if _merged_counts:
+                            _all_merged_counts.extend(_merged_counts)
+                        else:
+                            _all_merged_counts.extend([1] * len(_merged_req_ids))
+                        if os.environ.get("PIE_TRACE"):
+                            print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_merge {self._batch_counter} step={step_i} new_reqs={len(_new_pending)}",
+                                  file=sys.stderr, flush=True)
 
                 if os.environ.get("PIE_TRACE"):
                     print(f"[PIE-TRACE] {time.clock_gettime_ns(time.CLOCK_MONOTONIC)} py.ms_step {self._batch_counter} step={step_i} reqs={arrays.num_requests}",
