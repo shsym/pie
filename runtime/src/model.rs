@@ -918,14 +918,11 @@ impl Model {
                                     if fp_req.kv_page_size > 0
                                         && fp_req.kv_page_last_len > fp_req.kv_page_size
                                     {
-                                        fp_req.kv_page_last_len = 1;
-                                        // Page crossed: include the next pre-allocated
-                                        // page (SDK sent all pages via kv_cache).
-                                        if fp_req.actual_kv_pages > 0
-                                            && (fp_req.actual_kv_pages as usize) < fp_req.kv_page_ptrs.len()
-                                        {
-                                            fp_req.actual_kv_pages += 1;
-                                        }
+                                        // Page boundary crossed: stop multi-step
+                                        // continuation.  The SDK's decode_n will
+                                        // allocate the next page on the next call
+                                        // via fill_token → grow_kv_pages.
+                                        fp_req.max_decode_steps = 0;
                                     }
                                     let next_pos = fp_req.input_token_positions.last()
                                         .map(|&p| p + 1).unwrap_or(0);

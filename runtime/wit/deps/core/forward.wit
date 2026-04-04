@@ -105,13 +105,4 @@ interface forward {
         max-steps: u32,
     );
 
-    /// Set the number of active (non-pre-allocated) KV pages.
-    /// kv-cache may include extra pre-allocated pages for decode_n;
-    /// only the first actual-pages are used for kv_page_indptr.
-    /// The scheduler extends this count on page-boundary crossings.
-    set-kv-actual-pages: func(
-        pass: borrow<forward-pass>,
-        actual-pages: u32,
-    );
-
 }

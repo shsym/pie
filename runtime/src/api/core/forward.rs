@@ -75,8 +75,6 @@ pub struct ForwardPass {
     max_decode_steps: u32,
     /// Return distributions alongside tokens for each step.
     return_distributions: bool,
-    /// Number of active (non-pre-allocated) KV pages.  Default 0 = use all.
-    kv_actual_pages: u32,
 }
 
 #[derive(Debug)]
@@ -174,7 +172,6 @@ impl inferlet::core::forward::Host for InstanceState {
             output_embed_indices: vec![],
             max_decode_steps: 1,
             return_distributions: false,
-            kv_actual_pages: 0, // 0 = use all pages
         };
         Ok(self.ctx().table.push(pass)?)
     }
@@ -438,16 +435,6 @@ impl inferlet::core::forward::Host for InstanceState {
         Ok(())
     }
 
-    async fn set_kv_actual_pages(
-        &mut self,
-        pass: Resource<ForwardPass>,
-        actual_pages: u32,
-    ) -> Result<()> {
-        let pass = self.ctx().table.get_mut(&pass)?;
-        pass.kv_actual_pages = actual_pages;
-        Ok(())
-    }
-
 }
 
 impl inferlet::core::forward::HostForwardPass for InstanceState {
@@ -489,7 +476,6 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
                 return_distributions: pass.return_distributions,
                 multi_step_tokens: Vec::new(),
                 kv_page_size: pass.queue.info.kv_page_size,
-                actual_kv_pages: pass.kv_actual_pages,
                 arrival_time: None, // Set in Model::submit() before queuing
                 inst_id: Some(self.id()),
                 token_stream_tx: None, // set below for multi-step
