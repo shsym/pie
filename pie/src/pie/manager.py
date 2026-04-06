@@ -1178,6 +1178,12 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
     parent_pid = os.getppid()
     check_parent_every = 100 if side_channel else 10
     poll_count = 0
+    # Adaptive coalesce: windowed max of last 4 batch sizes.
+    # When GPU finishes a batch and requests re-submit from WASM, wait
+    # for the expected count before firing (avoids batch-of-1 waste).
+    _recent_batches = [0, 0, 0, 0]
+    _recent_idx = 0
+    _expected_arrivals = 0
 
     # Batch merger imports (only when side-channel is active)
     merge_fn = None
@@ -1288,6 +1294,21 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
             if not pending:
                 continue
 
+            # Adaptive coalesce: when the batch is small relative to the
+            # expected concurrency, wait briefly for more WASM re-submissions.
+            # Uses windowed max of last 4 batch sizes to track expected count.
+            # Fires instantly at c=1 (no coalesce penalty for single requests).
+            if _expected_arrivals > 1 and len(pending) < _expected_arrivals:
+                import time as _time
+                _coalesce_deadline = _time.monotonic() + 0.002  # 2ms max
+                while _time.monotonic() < _coalesce_deadline:
+                    _more = side_channel.drain_requests()
+                    if _more:
+                        pending.extend(_more)
+                    if len(pending) >= _expected_arrivals:
+                        break
+                    _time.sleep(0.0001)  # 0.1ms poll
+
             # Emit deferred timestamps (only for non-idle steps)
             if _trace:
                 _tfd = _trace_fd
@@ -1326,6 +1347,10 @@ def _run_ipc_worker_loop(ipc_queue, runtime):
             _n_reqs = len(np.frombuffer(
                 fire_kwargs.get("qo_indptr", b"\x00\x00\x00\x00"), dtype=np.uint32
             )) - 1
+            # Update windowed max for adaptive coalesce
+            _recent_batches[_recent_idx % 4] = _n_reqs
+            _recent_idx += 1
+            _expected_arrivals = max(_recent_batches)
 
             if _trace:
                 _t("py.unpack_done", _bid, reqs=_n_reqs, drained=len(batch_items))
