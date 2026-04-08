@@ -389,8 +389,8 @@ class TestIsNewFlag:
             batch_id=1,
         ))
         assert _count_new_reqs(out) == 1, "Only Q should be NEW"
-        assert _new_req_ids(out) == ["req-Q"]
-        assert "req-P" in _cached_req_ids(out)
+        assert _new_req_ids(out) == ["pie-1-1"]
+        assert "pie-0-0" in _cached_req_ids(out)
 
 
 # ---------------------------------------------------------------------------

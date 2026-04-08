@@ -128,10 +128,16 @@ def merge_fire_batch_kwargs(kwargs_list: list[dict]) -> dict:
         single_token_mode = single_token_mode and kw.get("single_token_mode", True)
         max_decode_steps = max(max_decode_steps, kw.get("max_decode_steps", 1))
 
-        if "request_ids" in kw and kw["request_ids"]:
+        # Merge request identity atomically — both must be present together
+        _has_rids = "request_ids" in kw and kw["request_ids"]
+        _has_new = "is_new" in kw and kw["is_new"]
+        if _has_rids and _has_new:
             all_request_ids.extend(kw["request_ids"])
-        if "is_new" in kw and kw["is_new"]:
             all_is_new.extend(kw["is_new"])
+        elif _has_rids or _has_new:
+            # Partial identity — skip both to fall back to legacy mode
+            all_request_ids.clear()
+            all_is_new.clear()
 
         fb = kw.get("freed_block_ids", b"")
         if fb and len(fb) > 0:

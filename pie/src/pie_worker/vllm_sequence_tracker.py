@@ -580,10 +580,18 @@ class SequenceTracker:
         # freed_block_ids already processed BEFORE the per-request loop.
 
         if not use_explicit_identity:
-            # Legacy mode: negative-sentinel cleanup for within-batch
-            # collision sentinels that disappear from the batch.
+            # Legacy mode: finish sequences whose last_block disappeared
+            # from the batch (neither in current_last_blocks nor negative
+            # sentinels that are still present).
             for fk in list(self._active_requests.keys()):
-                if isinstance(fk, int) and fk < 0 and fk not in current_last_blocks:
+                if isinstance(fk, int) and fk < 0:
+                    # Negative-sentinel cleanup
+                    if fk not in current_last_blocks:
+                        finished_req_ids.add(self._active_requests[fk].req_id)
+                        del self._active_requests[fk]
+                        self._token_history.pop(fk, None)
+                elif fk not in current_last_blocks:
+                    # Block disappeared from batch — sequence is done
                     finished_req_ids.add(self._active_requests[fk].req_id)
                     del self._active_requests[fk]
                     self._token_history.pop(fk, None)
