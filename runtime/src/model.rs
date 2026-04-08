@@ -108,8 +108,19 @@ pub fn install_model(model_name: String, mut model: Model) -> Option<usize> {
     let model_id = MODEL_DISPATCHER.models.count() - 1;
 
     task::spawn(async move {
-        while let Some(cmd) = rx.recv().await {
-            model.handle(cmd).await;
+        loop {
+            tokio::select! {
+                biased;
+                // Flush deferred KV pages when inference_worker signals
+                // that fire_batch has returned (Python processed freed_block_ids).
+                Some(()) = model.flush_rx.recv() => {
+                    model.resource_manager.flush_pending_releases();
+                }
+                Some(cmd) = rx.recv() => {
+                    model.handle(cmd).await;
+                }
+                else => break,
+            }
         }
     });
 
@@ -235,6 +246,12 @@ pub enum Command {
     Cleanup {
         inst_id: InstanceId,
     },
+    /// Release deferred KV pages back to the free list.
+    /// Sent by the scheduler after fire_batch returns, confirming Python
+    /// has processed freed_block_ids.  Until this is called, freed blocks
+    /// are unavailable for allocation, preventing block-reuse collisions
+    /// in the SequenceTracker.
+    FlushPendingReleases,
     GetAllExported {
         type_id: ResourceTypeId,
         response: oneshot::Sender<Vec<(String, Vec<ResourceId>)>>,
@@ -328,6 +345,9 @@ pub struct Model {
     scheduler: SharedScheduler,
     /// Channel to send freed KV page IDs to inference_worker for Python signaling
     freed_kv_tx: mpsc::UnboundedSender<Vec<ResourceId>>,
+    /// Receives flush signals from inference_worker after fire_batch returns.
+    /// Triggers release of deferred KV pages in the ResourceManager.
+    flush_rx: mpsc::UnboundedReceiver<()>,
 }
 
 impl Model {
@@ -361,6 +381,11 @@ impl Model {
         // Channel for freed KV page IDs: Model command loop → inference_worker → Python
         let (freed_kv_tx, freed_kv_rx) = mpsc::unbounded_channel::<Vec<ResourceId>>();
 
+        // Channel for flush signal: inference_worker → Model command loop
+        // After fire_batch returns (Python processed freed_block_ids),
+        // the worker signals the command loop to release deferred pages.
+        let (flush_tx, flush_rx) = mpsc::unbounded_channel::<()>();
+
         let worker_handle = tokio::spawn(Self::inference_worker(
             backends.clone(),
             forward_pass_rx,
@@ -371,6 +396,7 @@ impl Model {
             scheduler_config.max_in_flight_batches,
             num_groups,
             freed_kv_rx,
+            flush_tx,
         ));
 
         let tokenizer = Arc::new(BytePairEncoder::new(
@@ -431,6 +457,7 @@ impl Model {
             scheduler_config,
             scheduler,
             freed_kv_tx,
+            flush_rx,
         })
     }
 
@@ -469,6 +496,7 @@ impl Model {
         max_in_flight_batches: usize,
         num_groups: usize,
         mut freed_kv_rx: mpsc::UnboundedReceiver<Vec<ResourceId>>,
+        flush_tx: mpsc::UnboundedSender<()>,
     ) {
         const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -681,6 +709,17 @@ impl Model {
 
                     // Move freed_block_ids into the first batch fired this iteration
                     let batch_freed = std::mem::take(&mut freed_block_ids);
+
+                    // Signal the command loop to release deferred pages NOW.
+                    // The freed_block_ids are committed to this batch, so Python
+                    // will process them in fire_batch before any new request's
+                    // build_scheduler_output runs.  Releasing pages here allows
+                    // the allocator to reuse them — but the SequenceTracker
+                    // will already have cleaned its stale entries by the time
+                    // any new request using those pages reaches Python.
+                    if !batch_freed.is_empty() {
+                        flush_tx.send(()).ok();
+                    }
 
                     if Self::sched_tracing_enabled() {
                         eprintln!(
@@ -1203,6 +1242,9 @@ impl Model {
                     }
                     Err(e) => terminate_instance_with_exception(inst_id, e),
                 }
+            }
+            Command::FlushPendingReleases => {
+                self.resource_manager.flush_pending_releases();
             }
             Command::GetAllExported { type_id, response } => {
                 response.send(self.resource_manager.get_all_exported(type_id)).ok();
