@@ -22,6 +22,12 @@ struct RefCountedPool {
     inner: IdPool<u32>,
     /// ref_count for each page. Only pages with ref_count > 0 are tracked.
     ref_counts: HashMap<u32, u32>,
+    /// Pages deferred from release until the next acquire.  Prevents
+    /// block-ID reuse before the scheduler has attached the corresponding
+    /// freed_block_ids to a fire_batch, guaranteeing the Python
+    /// SequenceTracker will clean up stale entries before any new request
+    /// using the reused block reaches build_scheduler_output.
+    pending_release: Vec<u32>,
 }
 
 impl RefCountedPool {
@@ -29,6 +35,7 @@ impl RefCountedPool {
         Self {
             inner: IdPool::new(capacity),
             ref_counts: HashMap::new(),
+            pending_release: Vec::new(),
         }
     }
 
@@ -46,6 +53,7 @@ impl RefCountedPool {
 
     /// Acquire a single page from the free list, setting ref_count = 1.
     fn acquire(&mut self) -> anyhow::Result<ResourceId> {
+        self.flush_pending();
         let id = self.inner.acquire()?;
         self.ref_counts.insert(id, 1);
         Ok(id)
@@ -53,6 +61,7 @@ impl RefCountedPool {
 
     /// Acquire multiple pages, each with ref_count = 1.
     fn acquire_many(&mut self, count: usize) -> anyhow::Result<Vec<ResourceId>> {
+        self.flush_pending();
         let ids = self.inner.acquire_many(count)?;
         for &id in &ids {
             self.ref_counts.insert(id, 1);
@@ -81,10 +90,19 @@ impl RefCountedPool {
         *count -= 1;
         if *count == 0 {
             self.ref_counts.remove(&id);
-            self.inner.release(id).expect("failed to release page back to pool");
+            self.pending_release.push(id);
             true
         } else {
             false
+        }
+    }
+
+    /// Release all deferred pages back to the free list.
+    /// Called at the start of acquire/acquire_many so that freed pages
+    /// become available exactly when needed — not before.
+    fn flush_pending(&mut self) {
+        for id in self.pending_release.drain(..) {
+            self.inner.release(id).expect("failed to release pending page");
         }
     }
 
