@@ -6,6 +6,7 @@ from the runtime's GPU worker and RPC concerns.
 """
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -23,6 +24,7 @@ class _ActiveRequest:
     req_id: str
     block_ids: list[int]
     num_output_tokens: int
+    last_block: int = -1
 
 
 def _expand_block_ids_for_groups(
@@ -86,14 +88,15 @@ class SequenceTracker:
         # vLLM's NewRequestData expects ALL tokens (not just new ones), with
         # num_computed_tokens indicating how many are already in KV cache.
         # Pie only sends new tokens per fire_batch, so we accumulate here.
-        # Key: first block ID (stable sequence identifier).
-        self._token_history: dict[int, list[int]] = {}
+        # Key: block ID (legacy mode) or request_id string (explicit identity).
+        self._token_history: dict[int | str, list[int]] = {}
 
         # Active request tracking for CachedRequestData optimisation.
-        # Key: first block ID -> _ActiveRequest with stable req_id and state.
+        # Key: block ID (legacy) or request_id string (explicit identity)
+        # -> _ActiveRequest with stable req_id and state.
         # Sequences present across fire_batch calls use CachedRequestData
         # (lightweight update) instead of NewRequestData (full re-add).
-        self._active_requests: dict[int, _ActiveRequest] = {}
+        self._active_requests: dict[int | str, _ActiveRequest] = {}
 
         # Ordered req_ids from the last build_scheduler_output call.
         # Used by _package_response to look up tokens in model output.
@@ -129,11 +132,11 @@ class SequenceTracker:
         self._last_batch_req_ids = value
 
     @property
-    def token_history(self) -> dict[int, list[int]]:
+    def token_history(self) -> dict[int | str, list[int]]:
         return self._token_history
 
     @property
-    def active_requests(self) -> dict[int, _ActiveRequest]:
+    def active_requests(self) -> dict[int | str, _ActiveRequest]:
         return self._active_requests
 
     @property
@@ -165,6 +168,8 @@ class SequenceTracker:
         adapter_indices: list[int | None] | None = None,
         adapter_registry: dict[int, tuple[str, str]] | None = None,
         kv_page_size: int = 0,
+        request_ids: list[str] | None = None,
+        is_new: list[bool] | None = None,
     ):
         """Build a vLLM SchedulerOutput from translated Pie batch data.
 
@@ -210,6 +215,12 @@ class SequenceTracker:
             adapter_registry = {}
 
         num_requests = len(tokens_per_req)
+        use_explicit_identity = (
+            request_ids is not None
+            and is_new is not None
+            and len(request_ids) == num_requests
+        )
+
         new_reqs: list[NewRequestData] = []
         num_scheduled_tokens: dict[str, int] = {}
         total: int = 0
@@ -245,35 +256,63 @@ class SequenceTracker:
         # stable).  Don't finish those sequences; the per-request loop
         # will re-key them.
         if self._freed_block_ids:
-            # Collect first blocks from current batch to protect live contexts
-            _live_first_blocks: set[int] = set()
-            for _bi in range(num_requests):
-                if blocks_per_req[_bi]:
-                    _live_first_blocks.add(blocks_per_req[_bi][0])
-            to_remove = []
-            for seq_key, active_req in self._active_requests.items():
-                if seq_key in self._freed_block_ids:
-                    # Check if ANY block in this active request's block list
-                    # is still referenced as a first_block in the current batch
-                    _still_live = False
-                    if active_req.block_ids:
-                        _first = active_req.block_ids[0]
-                        if _first in _live_first_blocks:
-                            _still_live = True
-                    if os.environ.get("PIE_VLLM_DEBUG"):
-                        print(f"[FREED-CHECK] seq_key={seq_key} "
-                              f"req={active_req.req_id} "
-                              f"first={active_req.block_ids[0] if active_req.block_ids else None} "
-                              f"live_firsts={_live_first_blocks} "
-                              f"still_live={_still_live} "
-                              f"freed={self._freed_block_ids}",
-                              file=sys.stderr, flush=True)
-                    if not _still_live:
-                        finished_req_ids.add(active_req.req_id)
-                        to_remove.append(seq_key)
-            for k in to_remove:
-                del self._active_requests[k]
-                self._token_history.pop(k, None)
+            if use_explicit_identity:
+                # Explicit identity mode: build reverse map from last_block
+                # to identity key, then finish any active request whose
+                # last_block was freed AND whose identity key is NOT in the
+                # current batch's request_ids.
+                _current_request_ids = set(request_ids)  # type: ignore[arg-type]
+                _last_block_to_key: dict[int, list] = {}
+                for _ik, _ar in self._active_requests.items():
+                    lb = _ar.last_block
+                    if lb >= 0:
+                        _last_block_to_key.setdefault(lb, []).append(_ik)
+                to_remove = []
+                for freed_block in self._freed_block_ids:
+                    for _ik in _last_block_to_key.get(freed_block, []):
+                        if _ik not in _current_request_ids:
+                            active_req = self._active_requests[_ik]
+                            if os.environ.get("PIE_VLLM_DEBUG"):
+                                print(f"[FREED-CHECK-EXPLICIT] key={_ik} "
+                                      f"req={active_req.req_id} "
+                                      f"last_block={freed_block} "
+                                      f"freed={self._freed_block_ids}",
+                                      file=sys.stderr, flush=True)
+                            finished_req_ids.add(active_req.req_id)
+                            to_remove.append(_ik)
+                for k in to_remove:
+                    self._active_requests.pop(k, None)
+                    self._token_history.pop(k, None)
+            else:
+                # Legacy mode: walk _active_requests by block-ID key.
+                _live_first_blocks: set[int] = set()
+                for _bi in range(num_requests):
+                    if blocks_per_req[_bi]:
+                        _live_first_blocks.add(blocks_per_req[_bi][0])
+                to_remove = []
+                for seq_key, active_req in self._active_requests.items():
+                    if seq_key in self._freed_block_ids:
+                        # Check if ANY block in this active request's block list
+                        # is still referenced as a first_block in the current batch
+                        _still_live = False
+                        if active_req.block_ids:
+                            _first = active_req.block_ids[0]
+                            if _first in _live_first_blocks:
+                                _still_live = True
+                        if os.environ.get("PIE_VLLM_DEBUG"):
+                            print(f"[FREED-CHECK] seq_key={seq_key} "
+                                  f"req={active_req.req_id} "
+                                  f"first={active_req.block_ids[0] if active_req.block_ids else None} "
+                                  f"live_firsts={_live_first_blocks} "
+                                  f"still_live={_still_live} "
+                                  f"freed={self._freed_block_ids}",
+                                  file=sys.stderr, flush=True)
+                        if not _still_live:
+                            finished_req_ids.add(active_req.req_id)
+                            to_remove.append(seq_key)
+                for k in to_remove:
+                    del self._active_requests[k]
+                    self._token_history.pop(k, None)
             self._freed_block_ids.clear()
 
         for i in range(num_requests):
@@ -283,33 +322,48 @@ class SequenceTracker:
             new_token_ids = token_ids[start:end].tolist()
             num_new_tokens = tokens_per_req[i]
 
-            # Identify sequence by LAST block ID.  Unlike first_block,
-            # the last block is unique per sequence even when forks
-            # share prefix blocks (each fork allocates its own suffix
-            # blocks).
             last_block = blocks_per_req[i][-1] if blocks_per_req[i] else -1
             current_last_blocks.add(last_block)
 
-            # Detect within-batch collision: if we've already seen
-            # this last_block in the current batch, disambiguate by
-            # using a negative sentinel key.
-            if last_block in batch_seen_last_blocks:
-                seq_key = -(batch_id * 10000 + i)  # unique negative key
-            else:
-                seq_key = last_block
-            batch_seen_last_blocks.add(last_block)
+            if use_explicit_identity:
+                # --- Explicit identity mode ---
+                # Use Rust-provided request_id as identity key and
+                # is_new flag to determine NEW vs CONTINUING.
+                identity_key: str | int = request_ids[i]  # type: ignore[index]
+                is_new_req = is_new[i]  # type: ignore[index]
 
-            # When blocks grow, last_block changes but the sequence is
-            # the same.  Check if the PREVIOUS last_block (now in the
-            # middle of the block list) is an active request key.
-            if seq_key not in self._active_requests and len(blocks_per_req[i]) > 1:
-                for block in blocks_per_req[i][:-1]:
-                    if block in self._active_requests:
-                        # Re-key: move active request to new last_block
-                        self._active_requests[seq_key] = self._active_requests.pop(block)
-                        if block in self._token_history:
-                            self._token_history[seq_key] = self._token_history.pop(block)
-                        break
+                # If this is a continuing request whose identity_key
+                # isn't tracked yet (shouldn't happen normally), treat
+                # as new to avoid KeyError.
+                if not is_new_req and identity_key not in self._active_requests:
+                    is_new_req = True
+            else:
+                # --- Legacy mode: infer identity from block IDs ---
+                is_new_req = True  # determined below
+
+                # Detect within-batch collision: if we've already seen
+                # this last_block in the current batch, disambiguate by
+                # using a negative sentinel key.
+                if last_block in batch_seen_last_blocks:
+                    identity_key = -(batch_id * 10000 + i)  # unique negative key
+                else:
+                    identity_key = last_block
+                batch_seen_last_blocks.add(last_block)
+
+                # When blocks grow, last_block changes but the sequence is
+                # the same.  Check if the PREVIOUS last_block (now in the
+                # middle of the block list) is an active request key.
+                if identity_key not in self._active_requests and len(blocks_per_req[i]) > 1:
+                    for block in blocks_per_req[i][:-1]:
+                        if block in self._active_requests:
+                            # Re-key: move active request to new last_block
+                            self._active_requests[identity_key] = self._active_requests.pop(block)
+                            if block in self._token_history:
+                                self._token_history[identity_key] = self._token_history.pop(block)
+                            break
+
+                if identity_key in self._active_requests:
+                    is_new_req = False
 
             # The scheduler's KV metadata is authoritative.
             # seq_lens[i] = total tokens after this step (from page count
@@ -327,10 +381,7 @@ class SequenceTracker:
             kv_len = int(seq_lens[i])
             effective_cached = kv_len - num_new_tokens
 
-            # For the continuing-sequence lookup we search by last_block.
-            # When a sequence grows new blocks, its last_block changes.
-            # We also check the _prev_last_to_current mapping.
-            existing_len = len(self._token_history.get(seq_key, []))
+            existing_len = len(self._token_history.get(identity_key, []))
 
             # Cap at what we've actually tracked. Pre-allocated KV pages
             # (from decode_n's extra_kv_tokens) inflate kv_len beyond the
@@ -353,7 +404,7 @@ class SequenceTracker:
                 _is_page_overflow = (
                     effective_cached == 0
                     and existing_len > 0
-                    and seq_key in self._active_requests
+                    and not is_new_req
                     and kv_len < existing_len
                 )
                 if _is_page_overflow:
@@ -363,27 +414,28 @@ class SequenceTracker:
                     # Fork or KV eviction: fewer tokens are cached than we
                     # tracked.  Truncate history to match reality and force
                     # NewRequestData so vLLM rebuilds its internal state.
-                    self._token_history[seq_key] = (
-                        self._token_history[seq_key][:effective_cached]
+                    self._token_history[identity_key] = (
+                        self._token_history[identity_key][:effective_cached]
                     )
-                    if seq_key in self._active_requests:
+                    if identity_key in self._active_requests:
                         finished_req_ids.add(
-                            self._active_requests[seq_key].req_id
+                            self._active_requests[identity_key].req_id
                         )
-                        del self._active_requests[seq_key]
+                        del self._active_requests[identity_key]
+                        is_new_req = True
 
             # Accumulate full token history for this sequence.
             # For NEW sequences that share prefix with another request
             # in the same batch (fork), we copy the prefix from the
             # parent's history if available.
-            if seq_key in self._token_history:
-                self._token_history[seq_key].extend(new_token_ids)
-            elif effective_cached > 0 and seq_key < 0:
-                # Within-batch fork: copy prefix from the parent
-                # (the other request with the same last_block).
+            if identity_key in self._token_history:
+                self._token_history[identity_key].extend(new_token_ids)
+            elif effective_cached > 0 and not use_explicit_identity and isinstance(identity_key, int) and identity_key < 0:
+                # Within-batch fork (legacy mode only): copy prefix from
+                # the parent (the other request with the same last_block).
                 parent_key = last_block
                 parent_history = self._token_history.get(parent_key, [])
-                self._token_history[seq_key] = (
+                self._token_history[identity_key] = (
                     list(parent_history[:effective_cached]) + new_token_ids
                 )
             elif effective_cached > 0:
@@ -393,10 +445,23 @@ class SequenceTracker:
                 #   2. Active request match -- find parent sharing the
                 #      same first block (covers dropped partial pages).
                 prefix_tokens: list[int] = []
-                for block in reversed(blocks_per_req[i][:-1]):
-                    if block in self._token_history:
-                        prefix_tokens = self._token_history[block][:effective_cached]
-                        break
+                if not use_explicit_identity:
+                    # Legacy mode: keys are block IDs, so direct lookup works.
+                    for block in reversed(blocks_per_req[i][:-1]):
+                        if block in self._token_history:
+                            prefix_tokens = self._token_history[block][:effective_cached]
+                            break
+                else:
+                    # Explicit identity mode: keys are request_id strings.
+                    # Search through _active_requests to find a parent whose
+                    # block_ids contain the target block.
+                    for block in reversed(blocks_per_req[i][:-1]):
+                        for _ak, _ar in self._active_requests.items():
+                            if block in _ar.block_ids and _ak in self._token_history:
+                                prefix_tokens = self._token_history[_ak][:effective_cached]
+                                break
+                        if prefix_tokens:
+                            break
                 if not prefix_tokens:
                     # Fallback: parent's last block was dropped (fork),
                     # so it's not in our block list.  Find parent via
@@ -408,24 +473,24 @@ class SequenceTracker:
                                 and akey in self._token_history):
                             prefix_tokens = self._token_history[akey][:effective_cached]
                             break
-                self._token_history[seq_key] = prefix_tokens + new_token_ids
+                self._token_history[identity_key] = prefix_tokens + new_token_ids
             else:
-                self._token_history[seq_key] = list(new_token_ids)
+                self._token_history[identity_key] = list(new_token_ids)
 
             # Cap token history to prevent unbounded memory growth.
             # Safe because num_computed_tokens ensures vLLM never
             # re-embeds tokens beyond the KV cache window.
-            history = self._token_history[seq_key]
+            history = self._token_history[identity_key]
             if len(history) > self._max_token_history_len:
                 excess = len(history) - self._max_token_history_len
-                self._token_history[seq_key] = history[excess:]
+                self._token_history[identity_key] = history[excess:]
 
-            full_prompt_token_ids = list(self._token_history[seq_key])
+            full_prompt_token_ids = list(self._token_history[identity_key])
             num_computed_tokens = len(full_prompt_token_ids) - num_new_tokens
 
-            if seq_key in self._active_requests:
+            if not is_new_req:
                 # --- CONTINUING sequence: CachedRequestData ---
-                active = self._active_requests[seq_key]
+                active = self._active_requests[identity_key]
                 req_id = active.req_id
 
                 # Compute block ID delta (new blocks since last call)
@@ -448,8 +513,9 @@ class SequenceTracker:
                 cached_num_output.append(active.num_output_tokens)
                 cached_all_token_ids[req_id] = full_prompt_token_ids
 
-                # Update tracking (block_ids stored for delta computation)
+                # Update tracking (block_ids and last_block for delta computation)
                 active.block_ids = list(curr_blocks)
+                active.last_block = last_block
             else:
                 # --- NEW sequence: NewRequestData ---
                 req_id = f"pie-{batch_id}-{i}"
@@ -500,10 +566,11 @@ class SequenceTracker:
                 # pie_manages_tokens flag, which forces token_ids_cpu
                 # updates from all_token_ids. This works for all request
                 # types including flush and distribution mode.
-                self._active_requests[seq_key] = _ActiveRequest(
+                self._active_requests[identity_key] = _ActiveRequest(
                     req_id=req_id,
                     block_ids=list(blocks_per_req[i]),
                     num_output_tokens=0,
+                    last_block=last_block,
                 )
 
             batch_req_ids.append(req_id)
@@ -512,18 +579,17 @@ class SequenceTracker:
 
         # freed_block_ids already processed BEFORE the per-request loop.
 
-        # Negative-sentinel cleanup: negative keys are within-batch
-        # collision sentinels that should be cleaned up when they
-        # disappear from the batch.
-        for fk in list(self._active_requests.keys()):
-            if fk < 0 and fk not in current_last_blocks:
-                finished_req_ids.add(self._active_requests[fk].req_id)
-                del self._active_requests[fk]
-                self._token_history.pop(fk, None)
+        if not use_explicit_identity:
+            # Legacy mode: negative-sentinel cleanup for within-batch
+            # collision sentinels that disappear from the batch.
+            for fk in list(self._active_requests.keys()):
+                if isinstance(fk, int) and fk < 0 and fk not in current_last_blocks:
+                    finished_req_ids.add(self._active_requests[fk].req_id)
+                    del self._active_requests[fk]
+                    self._token_history.pop(fk, None)
 
-        # Clean up token history for finished sequences.
-        finished_history_keys = set(self._token_history.keys()) - current_last_blocks
-        for fk in finished_history_keys:
+        # Clean up token history for keys not in _active_requests.
+        for fk in list(self._token_history.keys()):
             if fk not in self._active_requests:
                 del self._token_history[fk]
 
