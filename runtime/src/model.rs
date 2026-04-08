@@ -940,6 +940,7 @@ impl Model {
                                             Self::mono_ns(), fp_req.multi_step_tokens.len(),
                                             fp_req.max_decode_steps, token);
                                     }
+                                    fp_req.has_been_fired = true;
                                     pending_continuations.push((fp_req, resp_tx, group_id));
                                     continue;
                                 }
