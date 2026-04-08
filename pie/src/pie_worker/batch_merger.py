@@ -66,6 +66,8 @@ def merge_fire_batch_kwargs(kwargs_list: list[dict]) -> dict:
     all_output_embed_indices = []
 
     all_freed_block_ids = []
+    all_request_ids = []
+    all_is_new = []
 
     single_token_mode = True
     max_decode_steps = 1
@@ -126,6 +128,11 @@ def merge_fire_batch_kwargs(kwargs_list: list[dict]) -> dict:
         single_token_mode = single_token_mode and kw.get("single_token_mode", True)
         max_decode_steps = max(max_decode_steps, kw.get("max_decode_steps", 1))
 
+        if "request_ids" in kw and kw["request_ids"]:
+            all_request_ids.extend(kw["request_ids"])
+        if "is_new" in kw and kw["is_new"]:
+            all_is_new.extend(kw["is_new"])
+
         fb = kw.get("freed_block_ids", b"")
         if fb and len(fb) > 0:
             all_freed_block_ids.append(decode(fb, np.uint32))
@@ -170,6 +177,8 @@ def merge_fire_batch_kwargs(kwargs_list: list[dict]) -> dict:
         "single_token_mode": single_token_mode,
         "max_decode_steps": max_decode_steps,
         "freed_block_ids": _concat_and_encode(all_freed_block_ids) if all_freed_block_ids else b"",
+        "request_ids": all_request_ids if all_request_ids else None,
+        "is_new": all_is_new if all_is_new else None,
     }
 
     # Copy optional scalar fields from first batch
