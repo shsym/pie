@@ -22,13 +22,6 @@ struct RefCountedPool {
     inner: IdPool<u32>,
     /// ref_count for each page. Only pages with ref_count > 0 are tracked.
     ref_counts: HashMap<u32, u32>,
-    /// Pages whose ref_count reached 0 but haven't been released to the
-    /// free list yet.  Deferred release prevents block ID reuse before
-    /// the Python SequenceTracker processes the corresponding
-    /// freed_block_ids, eliminating KV cache contamination from stale
-    /// sequence entries.  Call flush_pending() after fire_batch confirms
-    /// Python processed the freed IDs.
-    pending_release: Vec<u32>,
 }
 
 impl RefCountedPool {
@@ -36,7 +29,6 @@ impl RefCountedPool {
         Self {
             inner: IdPool::new(capacity),
             ref_counts: HashMap::new(),
-            pending_release: Vec::new(),
         }
     }
 
@@ -89,20 +81,10 @@ impl RefCountedPool {
         *count -= 1;
         if *count == 0 {
             self.ref_counts.remove(&id);
-            // Defer: don't release to pool yet.  The block stays
-            // unavailable until flush_pending() is called after Python
-            // has processed the freed_block_ids for this batch.
-            self.pending_release.push(id);
+            self.inner.release(id).expect("failed to release page back to pool");
             true
         } else {
             false
-        }
-    }
-
-    /// Release all deferred pages back to the free list.
-    fn flush_pending(&mut self) {
-        for id in self.pending_release.drain(..) {
-            self.inner.release(id).expect("failed to release pending page");
         }
     }
 
@@ -537,14 +519,6 @@ impl ResourceManager {
             })
             .map(|((_, inst_id), _)| *inst_id)
             .collect()
-    }
-
-    /// Release all deferred KV pages back to the free list.
-    /// Call after Python has processed freed_block_ids (fire_batch returned).
-    pub fn flush_pending_releases(&mut self) {
-        for ((_group_id, _type_id), pool) in &mut self.res_pool {
-            pool.flush_pending();
-        }
     }
 
     pub fn cleanup(&mut self, inst_id: InstanceId) -> Result<(), ResourceError> {
