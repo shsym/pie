@@ -1119,6 +1119,9 @@ class PieVllmRuntime:
                 kwargs["flattened_masks"] = b""
                 kwargs["mask_indptr"] = np.zeros(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
                 kwargs["output_token_indptr"] = np.arange(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
+                # Continuing requests are no longer new after first fire
+                if "is_new" in kwargs and kwargs["is_new"]:
+                    kwargs["is_new"] = [False] * len(kwargs["is_new"])
                 # Re-decode kwargs through the standard path
                 arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
                 num_requests = arrays.num_requests
