@@ -493,6 +493,7 @@ impl inferlet::core::forward::HostForwardPass for InstanceState {
                 arrival_time: None, // Set in Model::submit() before queuing
                 inst_id: Some(self.id()),
                 token_stream_tx: None, // set below for multi-step
+                has_been_fired: false,
             };
 
             (request, svc_id, queue_id, priority)

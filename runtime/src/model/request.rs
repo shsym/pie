@@ -210,6 +210,10 @@ pub struct ForwardPassRequest {
     /// WASM inferlet to process tokens while the next GPU step runs.
     #[serde(skip)]
     pub token_stream_tx: Option<mpsc::UnboundedSender<u32>>,
+    /// Whether this request has been sent to Python before.
+    /// Set to true after first fire_batch; used to compute is_new in batched request.
+    #[serde(skip)]
+    pub has_been_fired: bool,
 }
 
 fn default_one() -> u32 {
@@ -370,6 +374,15 @@ pub struct BatchedForwardPassRequest {
     // Sent from Rust ResourceManager on deallocate/cleanup.
     #[serde(default, skip_serializing_if = "ByteVec::is_empty")]
     pub freed_block_ids: ByteVec,
+
+    // Per-request identity from Rust (inst_id UUID strings).
+    // Python uses these as authoritative sequence keys instead of block IDs.
+    #[serde(default)]
+    pub request_ids: Vec<String>,
+
+    // Per-request first-fire flag. true = first time this request is sent to Python.
+    #[serde(default)]
+    pub is_new: Vec<bool>,
 }
 
 impl BatchedForwardPassRequest {
@@ -402,6 +415,8 @@ impl BatchedForwardPassRequest {
             group_id: None,
             max_decode_steps: 1,
             freed_block_ids: ByteVec(Vec::new()),
+            request_ids: Vec::new(),
+            is_new: Vec::new(),
         }
     }
 
@@ -494,6 +509,12 @@ impl BatchedForwardPassRequest {
         if req.max_decode_steps > self.max_decode_steps {
             self.max_decode_steps = req.max_decode_steps;
         }
+
+        // Request identity for Python SequenceTracker
+        self.request_ids.push(
+            req.inst_id.map(|id| id.to_string()).unwrap_or_default()
+        );
+        self.is_new.push(!req.has_been_fired);
     }
 
     /// Get the number of requests in this batch.
