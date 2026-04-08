@@ -331,7 +331,7 @@ class TestIsNewFlag:
             batch_id=0,
         ))
         assert _count_new_reqs(out) == 1
-        assert _new_req_ids(out) == ["req-P"]
+        assert _new_req_ids(out) == ["pie-0-0"]
         assert len(_cached_req_ids(out)) == 0
 
     def test_is_new_false_yields_cached_request_data(self):
@@ -361,7 +361,7 @@ class TestIsNewFlag:
             batch_id=1,
         ))
         assert _count_new_reqs(out2) == 0, "is_new=False must yield CachedRequestData"
-        assert "req-P" in _cached_req_ids(out2)
+        assert "pie-0-0" in _cached_req_ids(out2)
 
     def test_mixed_batch_new_and_cached(self):
         """A batch with one new and one continuing request."""
