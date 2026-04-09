@@ -641,6 +641,13 @@ def _ipc_worker_process(
         ipc_server_names: IPC server names for each group
         ready_queue: Queue to signal when ready
     """
+    import os
+    import faulthandler as _fh
+
+    _pid = os.getpid()
+    _fault_log = open(f"/tmp/pie-worker-{_pid}.fault.log", "w")
+    _fh.enable(file=_fault_log, all_threads=True)
+
     from pie import _pie
     from pie_worker.runtime import Runtime
     from pie_worker.config import RuntimeConfig
@@ -941,6 +948,17 @@ def _vllm_worker_process(
         ready_queue: Queue to signal when ready
         tp_queues: Per-group queues for TP leader→follower signaling
     """
+    import os
+    import faulthandler as _fh
+
+    # Redirect stderr + install faulthandler so CUDA crashes leave a trace.
+    # Python can't catch SIGSEGV/SIGABRT, but faulthandler dumps a traceback
+    # to the fault log before the process dies.
+    _pid = os.getpid()
+    _stderr_log = open(f"/tmp/pie-worker-{_pid}.stderr.log", "w")
+    _fault_log = open(f"/tmp/pie-worker-{_pid}.fault.log", "w")
+    _fh.enable(file=_fault_log, all_threads=True)
+
     from pie import _pie
     from pie_worker.vllm_runtime import PieVllmRuntime
     from pie_worker.config import RuntimeConfig
@@ -1495,25 +1513,56 @@ def check_backend_processes(
                 return_code = process.returncode
                 stderr = process.stderr.read().decode() if process.stderr else ""
         else:
-            # Assume multiprocessing.Process
-            if not process.is_alive():
+            # SpawnContext (from mp.spawn): check individual worker processes
+            if hasattr(process, "processes"):
+                for p in process.processes:
+                    if not p.is_alive():
+                        is_dead = True
+                        return_code = p.exitcode
+                        signal_name = ""
+                        if return_code is not None and return_code < 0:
+                            import signal as _sig
+                            try:
+                                signal_name = _sig.Signals(-return_code).name
+                            except (ValueError, AttributeError):
+                                signal_name = f"signal {-return_code}"
+                        error_msg = (
+                            f"Worker PID {p.pid} died: "
+                            f"exit_code={return_code} ({signal_name})"
+                        )
+                        # Check for fault/stderr logs from the worker
+                        for log_path in [
+                            f"/tmp/pie-worker-{p.pid}.fault.log",
+                            f"/tmp/pie-worker-{p.pid}.stderr.log",
+                        ]:
+                            try:
+                                with open(log_path) as f:
+                                    content = f.read().strip()
+                                if content:
+                                    error_msg += f"\n  {log_path}:\n  {content[:500]}"
+                            except FileNotFoundError:
+                                pass
+                        if on_error:
+                            on_error(error_msg)
+                        else:
+                            print(f"❌ {error_msg}", file=sys.stderr, flush=True)
+                        break
+            elif not process.is_alive():
                 is_dead = True
                 return_code = process.exitcode
-                # Check for SpawnContext
-                if hasattr(process, "processes"):
-                    # For SpawnContext, is_alive checks if any process is alive
-                    # Context is "dead" if all processes are dead
-                    pass
 
         if is_dead:
             all_alive = False
-            error_msg = f"Backend process exited unexpectedly (exit code {return_code})"
-            if stderr:
-                error_msg += f" stderr: {stderr[:500]}"
-            if on_error:
-                on_error(error_msg)
-            else:
-                print(f"❌ {error_msg}", file=sys.stderr)
+            if not hasattr(process, "processes"):
+                # Only print generic message for non-SpawnContext
+                # (SpawnContext already printed per-worker details above)
+                error_msg = f"Backend process exited unexpectedly (exit code {return_code})"
+                if stderr:
+                    error_msg += f" stderr: {stderr[:500]}"
+                if on_error:
+                    on_error(error_msg)
+                else:
+                    print(f"❌ {error_msg}", file=sys.stderr, flush=True)
 
     return all_alive
 
