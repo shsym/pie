@@ -383,6 +383,12 @@ pub struct BatchedForwardPassRequest {
     // Per-request first-fire flag. true = first time this request is sent to Python.
     #[serde(default)]
     pub is_new: Vec<bool>,
+
+    // Instance UUIDs that have finished (from cleanup_instance).
+    // Sent alongside freed_block_ids but carries the authoritative identity
+    // so Python can finish requests directly by key without block-ID reverse map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finished_request_ids: Vec<String>,
 }
 
 impl BatchedForwardPassRequest {
@@ -417,6 +423,7 @@ impl BatchedForwardPassRequest {
             freed_block_ids: ByteVec(Vec::new()),
             request_ids: Vec::new(),
             is_new: Vec::new(),
+            finished_request_ids: Vec::new(),
         }
     }
 
