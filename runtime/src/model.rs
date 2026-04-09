@@ -108,8 +108,21 @@ pub fn install_model(model_name: String, mut model: Model) -> Option<usize> {
     let model_id = MODEL_DISPATCHER.models.count() - 1;
 
     task::spawn(async move {
+        let mut cmd_count: u64 = 0;
         while let Some(cmd) = rx.recv().await {
             model.handle(cmd).await;
+            cmd_count += 1;
+            if cmd_count % 500 == 0 {
+                let mut stats = HashMap::new();
+                model.resource_manager.append_stats_to(&mut stats);
+                eprintln!("[RESOURCE-STATS] cmds={} start_times={} groups={} allocated_entries={} kv_avail={}",
+                    cmd_count,
+                    stats.get("instances.start_time_count").unwrap_or(&"?".to_string()),
+                    stats.get("instances.groups_count").unwrap_or(&"?".to_string()),
+                    stats.get("instances.allocated_entries").unwrap_or(&"?".to_string()),
+                    stats.get("resource.g0.0.available").unwrap_or(&"?".to_string()),
+                );
+            }
         }
         eprintln!("[FATAL] Model command loop exited — all senders dropped");
     });

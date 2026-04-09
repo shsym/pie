@@ -226,8 +226,13 @@ impl ResourceManager {
             .or_insert_with(Instant::now);
 
         let available = self.available(group_id, type_id)?;
+        let total_capacity = self.res_pool.get(&(group_id, type_id))
+            .map(|p| p.capacity()).unwrap_or(0);
+        let active_instances = self.inst_start_time.len();
 
         if available < count {
+            eprintln!("[OOM-TRIGGER] inst={} type={} need={} avail={}/{} active_instances={}",
+                      inst_id, type_id, count, available, total_capacity, active_instances);
             tracing::debug!(
                 target: "resource.oom",
                 group_id = group_id,
@@ -727,10 +732,18 @@ impl ResourceManager {
             stats.insert(format!("resource.g{}.{}.used", group_id, type_id), used.to_string());
         }
 
-        // Report on active instances
+        // Report on active instances (detect metadata leaks)
         stats.insert(
-            "instances.active_count".to_string(),
+            "instances.start_time_count".to_string(),
             self.inst_start_time.len().to_string(),
+        );
+        stats.insert(
+            "instances.groups_count".to_string(),
+            self.instance_groups.len().to_string(),
+        );
+        stats.insert(
+            "instances.allocated_entries".to_string(),
+            self.res_allocated.len().to_string(),
         );
 
         // Report per-instance KV pages
