@@ -111,6 +111,7 @@ pub fn install_model(model_name: String, mut model: Model) -> Option<usize> {
         while let Some(cmd) = rx.recv().await {
             model.handle(cmd).await;
         }
+        eprintln!("[FATAL] Model command loop exited — all senders dropped");
     });
 
     Some(model_id)

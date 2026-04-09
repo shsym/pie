@@ -61,27 +61,37 @@ impl RefCountedPool {
     }
 
     /// Increment the reference count for a page.
-    /// Panics if the page is not currently tracked (ref_count == 0).
-    fn inc_ref(&mut self, id: ResourceId) {
-        let count = self
-            .ref_counts
-            .get_mut(&id)
-            .expect("inc_ref on page with ref_count == 0");
-        *count += 1;
+    /// Returns false if the page is not currently tracked (ref_count == 0).
+    fn inc_ref(&mut self, id: ResourceId) -> bool {
+        match self.ref_counts.get_mut(&id) {
+            Some(count) => {
+                *count += 1;
+                true
+            }
+            None => {
+                eprintln!("[WARN] inc_ref on page {} with ref_count == 0 (already freed)", id);
+                false
+            }
+        }
     }
 
     /// Decrement the reference count for a page.
     /// Returns `true` if the page was freed (ref_count reached 0).
-    /// Panics if the page is not currently tracked.
+    /// Returns `false` if still alive or if the page was already freed.
     fn dec_ref(&mut self, id: ResourceId) -> bool {
-        let count = self
-            .ref_counts
-            .get_mut(&id)
-            .expect("dec_ref on page with ref_count == 0");
+        let count = match self.ref_counts.get_mut(&id) {
+            Some(c) => c,
+            None => {
+                eprintln!("[WARN] dec_ref on page {} with ref_count == 0 (already freed)", id);
+                return false;
+            }
+        };
         *count -= 1;
         if *count == 0 {
             self.ref_counts.remove(&id);
-            self.inner.release(id).expect("failed to release page back to pool");
+            if let Err(e) = self.inner.release(id) {
+                eprintln!("[WARN] failed to release page {} back to pool: {:?}", id, e);
+            }
             true
         } else {
             false
@@ -788,19 +798,17 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "inc_ref on page with ref_count == 0")]
-    fn pool_inc_ref_panics_on_free_page() {
+    fn pool_inc_ref_returns_false_on_free_page() {
         let mut pool = RefCountedPool::new(10);
-        pool.inc_ref(0); // page 0 was never acquired
+        assert!(!pool.inc_ref(0)); // page 0 was never acquired → returns false
     }
 
     #[test]
-    #[should_panic(expected = "dec_ref on page with ref_count == 0")]
-    fn pool_dec_ref_panics_on_free_page() {
+    fn pool_dec_ref_returns_false_on_free_page() {
         let mut pool = RefCountedPool::new(10);
         let id = pool.acquire().unwrap();
-        pool.dec_ref(id); // ref -> 0, freed
-        pool.dec_ref(id); // should panic
+        assert!(pool.dec_ref(id)); // ref -> 0, freed
+        assert!(!pool.dec_ref(id)); // already freed → returns false, no panic
     }
 
     // ---- ResourceManager integration tests ----
