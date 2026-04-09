@@ -219,6 +219,12 @@ impl ResourceManager {
                 group
             });
 
+        // Record start time BEFORE OOM kill — the OOM killer needs the
+        // requester's start time to avoid self-eviction.
+        self.inst_start_time
+            .entry(inst_id)
+            .or_insert_with(Instant::now);
+
         let available = self.available(group_id, type_id)?;
 
         if available < count {

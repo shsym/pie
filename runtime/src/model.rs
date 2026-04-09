@@ -1200,7 +1200,11 @@ impl Model {
             Command::Allocate { inst_id, type_id, count, response } => {
                 match self.resource_manager.allocate_with_oom(inst_id, type_id, count) {
                     Ok(allocated_ids) => { response.send(allocated_ids).ok(); }
-                    Err(e) => terminate_instance_with_exception(inst_id, e),
+                    Err(e) => {
+                        eprintln!("[ALLOC-FAIL] inst={} type={} count={} err={:?}",
+                                  inst_id, type_id, count, e);
+                        terminate_instance_with_exception(inst_id, e);
+                    }
                 }
             }
             Command::Deallocate { inst_id, type_id, ptrs } => {
