@@ -912,6 +912,13 @@ impl Model {
         if Self::trace_enabled() {
             Self::trace("rs.rpc_done", trace_batch_id, &format!("reqs={}", batch_size));
         }
+        if let (Some(t0), Some(t1)) = (_t_pre_rpc, _t_post_rpc) {
+            if Self::sched_tracing_enabled() {
+                eprintln!("[IPC-TIMING] batch={} reqs={} toks={} ipc_ms={:.2}",
+                    trace_batch_id, batch_size, batch_tokens,
+                    (t1 - t0) as f64 / 1_000_000.0);
+            }
+        }
 
         match result {
             Ok(batch_resp) => {
