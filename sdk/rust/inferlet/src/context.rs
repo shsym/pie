@@ -817,18 +817,51 @@ impl Context {
     ) -> String {
         let mut generated_token_ids = Vec::new();
 
-        // The autoregressive generation loop
-        loop {
-            // start time
-            //let start_time = Instant::now();
-            let next_token_id = self.decode_step(&sampler).await;
+        // Multi-step decode: decode_n(N) yields N tokens per WASM async
+        // boundary, amortizing the ~5 ms wasmtime poll/wake overhead and
+        // letting Rust's continuation loop pipeline N forward passes
+        // without round-tripping through WASM. Stop condition is checked
+        // per-token within the chunk to avoid wasted forward passes if
+        // stop hits mid-chunk.
+        //
+        // Custom samplers fall back to single-step (decode_n internally
+        // panics on Custom + max_steps>1, so we use decode_step there).
+        const CHUNK_SIZE: u32 = 8;
+        let use_chunks = !matches!(sampler, Sampler::Custom { .. });
 
-            self.fill_token(next_token_id);
+        'outer: loop {
+            if !use_chunks {
+                let next = self.decode_step(&sampler).await;
+                self.fill_token(next);
+                generated_token_ids.push(next);
+                if stop_condition.check(&generated_token_ids) {
+                    break;
+                }
+                continue;
+            }
 
-            generated_token_ids.push(next_token_id);
-
-            if stop_condition.check(&generated_token_ids) {
+            let tokens = self.decode_n(&sampler, CHUNK_SIZE).await;
+            let num_tokens = tokens.len();
+            if num_tokens == 0 {
+                // Engine returned no tokens — final exit (e.g. all-flush
+                // or hard EOS). NOTE: getting fewer tokens than requested
+                // is NOT terminal — the engine may break early for a
+                // page boundary or other recoverable reason. We always
+                // continue the outer loop until num_tokens == 0 OR
+                // stop_condition fires.
                 break;
+            }
+
+            // decode_n's contract: all but the last token are committed
+            // to context state. The caller must fill_token() the last.
+            for (ti, &token_id) in tokens.iter().enumerate() {
+                if ti == num_tokens - 1 {
+                    self.fill_token(token_id);
+                }
+                generated_token_ids.push(token_id);
+                if stop_condition.check(&generated_token_ids) {
+                    break 'outer;
+                }
             }
         }
 
