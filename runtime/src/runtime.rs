@@ -1215,9 +1215,22 @@ impl Runtime {
                         (t_response - t_spawn).as_secs_f64() * 1000.0,
                     );
                 }
+                // Spawn cleanup: wait for WASM task to finish (streaming body),
+                // then call cleanup_instance to free resource manager metadata
+                // (inst_start_time, instance_groups). KV pages are freed by
+                // KvPage::drop when the store drops, but the metadata entries
+                // must be explicitly cleaned up to prevent unbounded growth.
+                tokio::spawn(async move {
+                    let _ = task.await;
+                    model::cleanup_instance(inst_id);
+                });
                 Ok(resp)
             }
-            Ok(Err(e)) => Err(e.into()),
+            Ok(Err(e)) => {
+                // WASM set an error response — task may still be running
+                model::cleanup_instance(inst_id);
+                Err(e.into())
+            }
             Err(_) => {
                 let e = match task.await {
                     Ok(r) => {
@@ -1225,6 +1238,7 @@ impl Runtime {
                     }
                     Err(e) => e.into(),
                 };
+                model::cleanup_instance(inst_id);
                 Err(e.context("guest never invoked `response-outparam::set` method"))
             }
         }

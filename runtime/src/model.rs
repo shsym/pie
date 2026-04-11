@@ -108,9 +108,23 @@ pub fn install_model(model_name: String, mut model: Model) -> Option<usize> {
     let model_id = MODEL_DISPATCHER.models.count() - 1;
 
     task::spawn(async move {
+        let mut cmd_count: u64 = 0;
         while let Some(cmd) = rx.recv().await {
             model.handle(cmd).await;
+            cmd_count += 1;
+            if cmd_count % 500 == 0 {
+                let mut stats = HashMap::new();
+                model.resource_manager.append_stats_to(&mut stats);
+                eprintln!("[RESOURCE-STATS] cmds={} start_times={} groups={} allocated_entries={} kv_avail={}",
+                    cmd_count,
+                    stats.get("instances.start_time_count").unwrap_or(&"?".to_string()),
+                    stats.get("instances.groups_count").unwrap_or(&"?".to_string()),
+                    stats.get("instances.allocated_entries").unwrap_or(&"?".to_string()),
+                    stats.get("resource.g0.0.available").unwrap_or(&"?".to_string()),
+                );
+            }
         }
+        eprintln!("[FATAL] Model command loop exited — all senders dropped");
     });
 
     Some(model_id)
@@ -328,6 +342,9 @@ pub struct Model {
     scheduler: SharedScheduler,
     /// Channel to send freed KV page IDs to inference_worker for Python signaling
     freed_kv_tx: mpsc::UnboundedSender<Vec<ResourceId>>,
+    /// Channel to send finished instance IDs (UUIDs) to inference_worker.
+    /// Decouples request lifecycle from resource lifecycle for SequenceTracker.
+    finished_requests_tx: mpsc::UnboundedSender<String>,
 }
 
 impl Model {
@@ -361,6 +378,9 @@ impl Model {
         // Channel for freed KV page IDs: Model command loop → inference_worker → Python
         let (freed_kv_tx, freed_kv_rx) = mpsc::unbounded_channel::<Vec<ResourceId>>();
 
+        // Channel for finished instance IDs: Model command loop → inference_worker → Python
+        let (finished_requests_tx, finished_requests_rx) = mpsc::unbounded_channel::<String>();
+
         let worker_handle = tokio::spawn(Self::inference_worker(
             backends.clone(),
             forward_pass_rx,
@@ -371,6 +391,7 @@ impl Model {
             scheduler_config.max_in_flight_batches,
             num_groups,
             freed_kv_rx,
+            finished_requests_rx,
         ));
 
         let tokenizer = Arc::new(BytePairEncoder::new(
@@ -431,6 +452,7 @@ impl Model {
             scheduler_config,
             scheduler,
             freed_kv_tx,
+            finished_requests_tx,
         })
     }
 
@@ -469,6 +491,7 @@ impl Model {
         max_in_flight_batches: usize,
         num_groups: usize,
         mut freed_kv_rx: mpsc::UnboundedReceiver<Vec<ResourceId>>,
+        mut finished_requests_rx: mpsc::UnboundedReceiver<String>,
     ) {
         const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -628,6 +651,12 @@ impl Model {
                 freed_block_ids.extend(ids);
             }
 
+            // Drain finished instance IDs (non-blocking) for Python SequenceTracker
+            let mut finished_request_ids: Vec<String> = Vec::new();
+            while let Ok(id) = finished_requests_rx.try_recv() {
+                finished_request_ids.push(id);
+            }
+
             // Fire non-empty groups immediately — no should_fire heuristic,
             // no coalesce. Only gate: max_in_flight (1 = Python controls GPU).
             let mut fired_any = false;
@@ -679,14 +708,15 @@ impl Model {
                     // Python's _batch_counter is 0-based; prof_batches_fired is post-increment
                     let trace_batch_id = prof_batches_fired[group_id].saturating_sub(1);
 
-                    // Move freed_block_ids into the first batch fired this iteration
+                    // Move freed_block_ids and finished_request_ids into the first batch fired
                     let batch_freed = std::mem::take(&mut freed_block_ids);
+                    let batch_finished = std::mem::take(&mut finished_request_ids);
 
                     if Self::sched_tracing_enabled() {
                         eprintln!(
-                            "[SCHED-FIRE] t={} group={} reqs={} toks={} in_flight={} freed_kv={}",
+                            "[SCHED-FIRE] t={} group={} reqs={} toks={} in_flight={} freed_kv={} finished_reqs={}",
                             Self::mono_ns(), group_id, batch_size, tokens_in_batch,
-                            in_flight_counts[group_id], batch_freed.len(),
+                            in_flight_counts[group_id], batch_freed.len(), batch_finished.len(),
                         );
                     }
 
@@ -695,7 +725,7 @@ impl Model {
                          Self::execute_forward_pass_batch(
                              &backend_clone, batch_to_fire, group_id,
                              REQUEST_TIMEOUT, &continuation_tx_clone,
-                             trace_batch_id, batch_freed,
+                             trace_batch_id, batch_freed, batch_finished,
                          ).await;
                          if Self::trace_enabled() {
                              Self::trace("rs.pre_completion", trace_batch_id,
@@ -785,7 +815,7 @@ impl Model {
         for group_id in 0..num_groups {
             if !batches[group_id].is_empty() {
                 let batch = std::mem::take(&mut batches[group_id]);
-                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, &continuation_tx, 0, Vec::new()).await;
+                Self::execute_forward_pass_batch(&backends[group_id], batch, group_id, REQUEST_TIMEOUT, &continuation_tx, 0, Vec::new(), Vec::new()).await;
             }
         }
 
@@ -824,7 +854,7 @@ impl Model {
 
     #[tracing::instrument(
         name = "rust.fire_batch",
-        skip(backend, requests, continuation_tx, freed_block_ids),
+        skip(backend, requests, continuation_tx, freed_block_ids, finished_request_ids),
         fields(batch_size = requests.len())
     )]
     async fn execute_forward_pass_batch(
@@ -835,6 +865,7 @@ impl Model {
         continuation_tx: &mpsc::UnboundedSender<(ForwardPassRequest, Option<oneshot::Sender<ForwardPassResponse>>, usize)>,
         trace_batch_id: usize,
         freed_block_ids: Vec<u32>,
+        finished_request_ids: Vec<String>,
     ) {
         let _t_entry = if Self::sched_tracing_enabled() { Some(Self::mono_ns()) } else { None };
 
@@ -844,6 +875,10 @@ impl Model {
         // Attach freed KV page IDs for Python SequenceTracker cleanup
         if !freed_block_ids.is_empty() {
             batch_req.freed_block_ids = request::ByteVec(freed_block_ids);
+        }
+        // Attach finished instance IDs for direct identity-based cleanup
+        if !finished_request_ids.is_empty() {
+            batch_req.finished_request_ids = finished_request_ids;
         }
         for (fp_req, _) in &requests {
             batch_req.add_request(fp_req);
@@ -876,6 +911,13 @@ impl Model {
         let _t_post_rpc = if Self::sched_tracing_enabled() { Some(Self::mono_ns()) } else { None };
         if Self::trace_enabled() {
             Self::trace("rs.rpc_done", trace_batch_id, &format!("reqs={}", batch_size));
+        }
+        if let (Some(t0), Some(t1)) = (_t_pre_rpc, _t_post_rpc) {
+            if Self::sched_tracing_enabled() {
+                eprintln!("[IPC-TIMING] batch={} reqs={} toks={} ipc_ms={:.2}",
+                    trace_batch_id, batch_size, batch_tokens,
+                    (t1 - t0) as f64 / 1_000_000.0);
+            }
         }
 
         match result {
@@ -941,6 +983,7 @@ impl Model {
                                             Self::mono_ns(), fp_req.multi_step_tokens.len(),
                                             fp_req.max_decode_steps, token);
                                     }
+                                    fp_req.has_been_fired = true;
                                     pending_continuations.push((fp_req, resp_tx, group_id));
                                     continue;
                                 }
@@ -1178,7 +1221,11 @@ impl Model {
             Command::Allocate { inst_id, type_id, count, response } => {
                 match self.resource_manager.allocate_with_oom(inst_id, type_id, count) {
                     Ok(allocated_ids) => { response.send(allocated_ids).ok(); }
-                    Err(e) => terminate_instance_with_exception(inst_id, e),
+                    Err(e) => {
+                        eprintln!("[ALLOC-FAIL] inst={} type={} count={} err={:?}",
+                                  inst_id, type_id, count, e);
+                        terminate_instance_with_exception(inst_id, e);
+                    }
                 }
             }
             Command::Deallocate { inst_id, type_id, ptrs } => {
@@ -1195,6 +1242,9 @@ impl Model {
                 }
             }
             Command::Cleanup { inst_id } => {
+                // Send finished instance ID for direct identity-based cleanup.
+                // This decouples request lifecycle from resource lifecycle.
+                let _ = self.finished_requests_tx.send(inst_id.to_string());
                 match self.resource_manager.cleanup_with_freed_kv(inst_id) {
                     Ok(freed_kv_ids) => {
                         if !freed_kv_ids.is_empty() {

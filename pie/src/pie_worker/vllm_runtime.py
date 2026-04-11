@@ -83,6 +83,8 @@ class DecodedBatchArrays:
     seq_lens: np.ndarray         # (num_requests,) int32
     sampling_params_list: list[dict[str, Any]]
     adapter_indices: list[int | None]
+    request_ids: list[str] | None = None
+    is_new: list[bool] | None = None
 from .vllm_sampling_bridge import PieVllmSamplingBridge
 from .vllm_sequence_tracker import SequenceTracker
 from .vllm_capture import get_capture as _get_capture
@@ -441,6 +443,8 @@ class PieVllmRuntime:
         seq_lens: np.ndarray,
         sampling_params_list: list[dict[str, Any]],
         adapter_indices: list[int | None] | None = None,
+        request_ids: list[str] | None = None,
+        is_new: list[bool] | None = None,
     ):
         """Delegate to SequenceTracker.build_scheduler_output()."""
         return self._seq_tracker.build_scheduler_output(
@@ -453,6 +457,8 @@ class PieVllmRuntime:
             sampling_params_list=sampling_params_list,
             adapter_indices=adapter_indices,
             adapter_registry=self._adapter_registry,
+            request_ids=request_ids,
+            is_new=is_new,
         )
 
     # ------------------------------------------------------------------
@@ -782,6 +788,8 @@ class PieVllmRuntime:
             kwargs, num_requests
         )
         adapter_indices = kwargs.get("adapter_indices", [None] * num_requests)
+        request_ids = kwargs.get("request_ids", None)
+        is_new = kwargs.get("is_new", None)
 
         return DecodedBatchArrays(
             token_ids=token_ids,
@@ -795,6 +803,8 @@ class PieVllmRuntime:
             seq_lens=seq_lens,
             sampling_params_list=sampling_params_list,
             adapter_indices=adapter_indices,
+            request_ids=request_ids,
+            is_new=is_new,
         )
 
     def prepare_step(
@@ -826,6 +836,8 @@ class PieVllmRuntime:
             seq_lens=arrays.seq_lens,
             sampling_params_list=arrays.sampling_params_list,
             adapter_indices=arrays.adapter_indices,
+            request_ids=arrays.request_ids,
+            is_new=arrays.is_new,
         )
 
         # BRLE masks (only for multi-token prefill steps)
@@ -1115,6 +1127,9 @@ class PieVllmRuntime:
                 kwargs["flattened_masks"] = b""
                 kwargs["mask_indptr"] = np.zeros(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
                 kwargs["output_token_indptr"] = np.arange(len(prev_tokens) + 1, dtype=np.uint32).tobytes()
+                # Continuing requests are no longer new after first fire
+                if "is_new" in kwargs and kwargs["is_new"]:
+                    kwargs["is_new"] = [False] * len(kwargs["is_new"])
                 # Re-decode kwargs through the standard path
                 arrays = self.decode_batch_arrays(kwargs, self.kv_page_size)
                 num_requests = arrays.num_requests
