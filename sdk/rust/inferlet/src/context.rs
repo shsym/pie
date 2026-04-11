@@ -276,6 +276,27 @@ impl Context {
         self.flush_chat_messages2(false);
     }
 
+    /// Returns `true` if the context has any user-set masked positions in
+    /// `token_mask_current` (via `mask_token`, `mask_tokens`, or
+    /// `mask_token_range` with `mask=true`).
+    ///
+    /// A pristine (causal-only) context has `token_mask_current` = `Brle::new(N)`
+    /// which is a single all-`false` run, meaning every position is visible.
+    /// Any masked positions introduce `true` runs into the BRLE.
+    ///
+    /// Used by multi-step decode paths (`decode_n`, `decode_stream`) to detect
+    /// the unsafe "user mask + multi-step continuation" combination: the engine
+    /// only applies the attention mask at the first internal step of a
+    /// multi-step decode, so subsequent steps silently fall back to default
+    /// causal attention and re-admit the masked positions into attention.
+    fn has_user_attention_mask(&self) -> bool {
+        let total = self.token_mask_current.total_size;
+        if total == 0 {
+            return false;
+        }
+        !self.token_mask_current.is_range_all_value(0, total, false)
+    }
+
     pub fn mask_tokens(&mut self, indices: &[usize], mask: bool) {
         self.token_mask_current.mask(indices, mask)
     }
@@ -528,6 +549,34 @@ impl Context {
             );
         }
 
+        // Validate: user-set attention masks are not honored across the
+        // engine's multi-step decode continuation. The engine only applies
+        // the per-token BRLE mask for the FIRST internal step; steps 2..N
+        // fall back to default causal attention, silently re-admitting the
+        // masked positions. This produces output that looks like the mask
+        // was never set.
+        //
+        // Callers that need attention masks during generation must use
+        // `decode_step` (or `decode_n` with `max_steps=1`) per token so the
+        // mask snapshot is refreshed and sent on every forward pass. If you
+        // want to eliminate masked positions entirely, use
+        // `drop_masked_kv_pages()` first to physically remove fully-masked
+        // pages from the block table — then `decode_n` is safe because the
+        // remaining pages need no mask.
+        if self.has_user_attention_mask() {
+            panic!(
+                "decode_n(max_steps={}) called on a Context with user-set \
+                 attention masks (via mask_token / mask_tokens / \
+                 mask_token_range). Multi-step decode continuation does not \
+                 re-apply the mask for internal steps 2..N, so masked \
+                 positions leak back into attention and generation ignores \
+                 the mask. Use decode_step per token, or call \
+                 drop_masked_kv_pages() first to physically remove \
+                 fully-masked pages from the block table.",
+                max_steps
+            );
+        }
+
         let (p, pending_token_ids, position_ids) =
             self.prepare_forward_pass(sampler, max_steps as usize - 1);
 
@@ -595,6 +644,22 @@ impl Context {
 
         if let Sampler::Custom { .. } = sampler {
             panic!("decode_stream requires engine-side sampling, not Custom sampler.");
+        }
+
+        // Same multi-step mask-safety check as decode_n — see the comment
+        // there for the full rationale.
+        if self.has_user_attention_mask() {
+            panic!(
+                "decode_stream(max_steps={}) called on a Context with user-set \
+                 attention masks (via mask_token / mask_tokens / \
+                 mask_token_range). Multi-step decode continuation does not \
+                 re-apply the mask for internal steps 2..N, so masked \
+                 positions leak back into attention and generation ignores \
+                 the mask. Use decode_step per token, or call \
+                 drop_masked_kv_pages() first to physically remove \
+                 fully-masked pages from the block table.",
+                max_steps
+            );
         }
 
         let (p, pending_token_ids, position_ids) =
