@@ -1083,3 +1083,100 @@ class MetalCompiler:
             group_size=(256, 1, 1),
         )
 
+    # -------------------------------------------------------------------
+    # Rand MV (Philox PRNG + batched randn generate/matmul)
+    # -------------------------------------------------------------------
+
+    def _ensure_rand_mv(self) -> object:
+        if "rand_mv" in self._libs:
+            return self._libs["rand_mv"]
+        self._ensure_env()
+        source = self._read_metal("metal_rand_mv.metal")
+        return self._compile(source, "rand_mv")
+
+    def run_randn_generate(
+        self,
+        seeds: "torch.Tensor",
+        S: "torch.Tensor",
+        output: "torch.Tensor",
+        col_offset: int,
+        global_cols: int,
+    ) -> None:
+        """Dispatch Metal randn_generate kernel.
+
+        Args:
+            seeds: [B] int32 on MPS
+            S: [I, O] float32 on MPS
+            output: [B, I, O] float32 on MPS (pre-allocated)
+            col_offset: column offset for sharding
+            global_cols: total columns for offset computation
+        """
+        lib = self._ensure_rand_mv()
+        B = seeds.shape[0]
+        I, O = S.shape
+        IO = I * O
+
+        params = self._get_params(
+            ("randn_generate", B, I, O, col_offset, global_cols),
+            [float(B), float(I), float(O), float(col_offset), float(global_cols)],
+        )
+
+        group = 256
+        threads_x = ((IO + group - 1) // group) * group
+
+        self._get_kernel_fn(lib, "randn_generate_f32")(
+            seeds,
+            S.contiguous().view(-1),
+            output.view(-1),
+            params,
+            threads=(threads_x, B, 1),
+            group_size=(group, 1, 1),
+        )
+
+    def run_randn_matmul(
+        self,
+        x: "torch.Tensor",
+        seeds: "torch.Tensor",
+        S: "torch.Tensor",
+        output: "torch.Tensor",
+        col_offset: int,
+        global_cols: int,
+    ) -> None:
+        """Dispatch Metal fused randn_matmul kernel.
+
+        Args:
+            x: [B, I] float16/bfloat16/float32 on MPS
+            seeds: [B] int32 on MPS
+            S: [I, O] float32 on MPS
+            output: [B, O] float32 on MPS (pre-allocated)
+            col_offset: column offset for sharding
+            global_cols: total columns for offset computation
+        """
+        lib = self._ensure_rand_mv()
+        B, I = x.shape
+        _, O = S.shape
+
+        params = self._get_params(
+            ("randn_matmul", B, I, O, col_offset, global_cols),
+            [float(B), float(I), float(O), float(col_offset), float(global_cols)],
+        )
+
+        _DTYPE_TO_KERNEL = {
+            torch.float32: "randn_matmul_f32",
+            torch.float16: "randn_matmul_f16",
+            torch.bfloat16: "randn_matmul_bf16",
+        }
+        kernel_name = _DTYPE_TO_KERNEL.get(x.dtype)
+        if kernel_name is None:
+            raise ValueError(f"Unsupported dtype {x.dtype} for randn_matmul")
+
+        # One simdgroup (32 threads) per output element, K split across lanes
+        self._get_kernel_fn(lib, kernel_name)(
+            x.contiguous().view(-1),
+            seeds,
+            S.contiguous().view(-1),
+            output.view(-1),
+            params,
+            threads=(O * 32, B, 1),
+            group_size=(32, 1, 1),
+        )

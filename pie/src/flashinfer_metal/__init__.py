@@ -16,6 +16,7 @@ from ._wrappers import (
     mm_fp8,
     trtllm_fp4_block_scale_moe,
 )
+from .rand_mv import batched_randn_matmul, batched_randn_generate
 
 __all__ = [
     "BatchAttentionWithAttentionSinkWrapper",
@@ -29,4 +30,6 @@ __all__ = [
     "get_batch_indices_positions",
     "mm_fp8",
     "trtllm_fp4_block_scale_moe",
+    "batched_randn_matmul",
+    "batched_randn_generate",
 ]

@@ -255,14 +255,18 @@ class Engine:
         if pool_size == 0:
             return [], 0
 
-        host_kv = [
-            torch.zeros(
+        # pin_memory() is CUDA-only; on MPS we use regular CPU tensors
+        use_pinned = torch.cuda.is_available()
+        host_kv = []
+        for _ in range(num_layers):
+            t = torch.zeros(
                 (pool_size, two, page_size, kv_heads, dim_head),
                 dtype=dtype,
                 device="cpu",
-            ).pin_memory()
-            for _ in range(num_layers)
-        ]
+            )
+            if use_pinned:
+                t = t.pin_memory()
+            host_kv.append(t)
 
         return host_kv, pool_size
 

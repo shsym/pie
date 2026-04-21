@@ -146,10 +146,12 @@ kernel void batch_prefill_attention_unified_fp16_simdgroup_kernel(
     const int last_page_len = kv_last_page_lens[seq_id];
     const int total_kv_len = (num_pages - 1) * page_size + last_page_len;
     const int seq_start = qo_indptr[seq_id];
+    const int seq_end = qo_indptr[seq_id + 1];
+    const int seq_qo_len = seq_end - seq_start;
     const int num_q_in_block = min(BQ_FP16, num_qo - q_seq_start);
 
     const int kv_head = map_query_to_kv_head(head_idx, num_query_heads, num_kv_heads);
-    const int kv_seq_start = total_kv_len - num_qo;
+    const int kv_seq_start = total_kv_len - seq_qo_len;
 
     // Threadgroup memory with compile-time sizes
     threadgroup half Qs[BQ_FP16 * LDQ];
@@ -983,10 +985,12 @@ kernel void batch_prefill_attention_unified_bfloat16_simdgroup_kernel(
     const int last_page_len = kv_last_page_lens[seq_id];
     const int total_kv_len = (num_pages - 1) * page_size + last_page_len;
     const int seq_start = qo_indptr[seq_id];
+    const int seq_end = qo_indptr[seq_id + 1];
+    const int seq_qo_len = seq_end - seq_start;
     const int num_q_in_block = min(BQ_BF16, num_qo - q_seq_start);
 
     const int kv_head = map_query_to_kv_head(head_idx, num_query_heads, num_kv_heads);
-    const int kv_seq_start = total_kv_len - num_qo;
+    const int kv_seq_start = total_kv_len - seq_qo_len;
 
     // Threadgroup memory with compile-time sizes
     threadgroup half Qs[BQ_BF16 * LDQ];

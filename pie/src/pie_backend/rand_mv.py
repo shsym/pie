@@ -16,27 +16,40 @@
 
 import torch
 
-# Guard: Only enable on CUDA
-RAND_MV_AVAILABLE = torch.cuda.is_available()
+# Guard: Enable on CUDA or MPS (via flashinfer_metal)
+RAND_MV_AVAILABLE = torch.cuda.is_available() or torch.backends.mps.is_available()
 
 if not RAND_MV_AVAILABLE:
-    # Stub implementations for non-CUDA platforms (e.g., Apple Metal)
+    # Stub implementations for platforms without CUDA or MPS
     def batched_randn_matmul(*args, **kwargs):
         raise RuntimeError(
-            "rand_mv.batched_randn_matmul requires CUDA. "
-            "This function is not available on non-CUDA platforms (e.g., Apple Metal)."
+            "rand_mv.batched_randn_matmul requires CUDA or MPS. "
+            "This function is not available on this platform."
         )
 
     def batched_randn_generate(*args, **kwargs):
         raise RuntimeError(
-            "rand_mv.batched_randn_generate requires CUDA. "
-            "This function is not available on non-CUDA platforms (e.g., Apple Metal)."
+            "rand_mv.batched_randn_generate requires CUDA or MPS. "
+            "This function is not available on this platform."
         )
 
     def run_tests():
         raise RuntimeError(
-            "rand_mv tests require CUDA. "
-            "Tests are not available on non-CUDA platforms."
+            "rand_mv tests require CUDA or MPS. "
+            "Tests are not available on this platform."
+        )
+
+elif not torch.cuda.is_available():
+    # MPS path: delegate to flashinfer_metal's pure-PyTorch Philox implementation
+    from flashinfer_metal.rand_mv import (
+        batched_randn_matmul,
+        batched_randn_generate,
+    )
+
+    def run_tests():
+        raise RuntimeError(
+            "rand_mv tests require CUDA for Triton baseline comparison. "
+            "The MPS implementation can be tested via flashinfer_metal."
         )
 
 else:

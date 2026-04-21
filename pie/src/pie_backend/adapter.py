@@ -542,8 +542,8 @@ class CmaesAdapter(Adapter):
 
         if not RAND_MV_AVAILABLE:
             raise RuntimeError(
-                "CmaesAdapter.update() requires CUDA for noise generation. "
-                "This function is not available on non-CUDA platforms (e.g., Apple Metal)."
+                "CmaesAdapter.update() requires CUDA or MPS for noise generation. "
+                "This function is not available on this platform."
             )
 
         if len(scores) != self.population_size or len(seeds) != self.population_size:
