@@ -8,17 +8,16 @@ mod dynamic_linking;
 mod output;
 mod state;
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use anyhow::{Result, anyhow};
 use tokio::sync::oneshot;
 use wasmtime::component::{Component, Instance as WasmInstance, Linker as WasmLinker};
-use wasmtime::{Engine, Module, Store};
+use wasmtime::{Engine, Store};
 
 use crate::api;
 use crate::program::{self, ProgramName};
+use crate::py_runtime;
 use crate::service::{Service, ServiceHandler};
 
 pub use state::InstanceState;
@@ -58,52 +57,71 @@ pub async fn instantiate(
     rx.await?
 }
 
+/// Run the host-side snapshot pipeline for a Python component.
+///
+/// Builds a throwaway linker (WASI + HTTP + API + full shared modules + deps),
+/// runs the instrumented initialization, and returns the snapshotted bytes.
+/// The caller compiles the result back into a Component.
+///
+/// This is a synchronous helper (not going through the actor) because snapshot
+/// only runs during program installation, which already holds the program
+/// service lock.
+pub(crate) async fn snapshot_component_bytes(
+    engine: &Engine,
+    raw_bytes: &[u8],
+    dep_components: Vec<Component>,
+) -> Result<Vec<u8>> {
+    let mut linker = WasmLinker::<InstanceState>::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .expect("Failed to link WASI");
+    wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
+        .expect("Failed to link WASI HTTP");
+    api::add_to_linker(&mut linker)?;
+
+    // Use FULL shared modules for snapshot creation: CPython must initialize
+    // from scratch so the snapshot captures the post-init state. Stripped
+    // modules are only for instantiating components that are already
+    // snapshotted (see Linker::instantiate).
+    for (name, module) in py_runtime::full_modules() {
+        linker
+            .root()
+            .module(name, module)
+            .unwrap_or_else(|e| panic!("Failed to register shared module '{name}': {e}"));
+    }
+
+    let inst_state = InstanceState::new(
+        uuid::Uuid::new_v4(),
+        "snapshot".to_string(),
+        false, // capture_outputs
+        false, // allow_filesystem
+        None,  // token_budget
+        py_runtime::py_runtime_dir(),
+    );
+    let mut store = Store::new(engine, inst_state);
+
+    if !dep_components.is_empty() {
+        dynamic_linking::instantiate_libraries(engine, &mut linker, &mut store, dep_components)
+            .await
+            .map_err(|e| anyhow!("Failed to instantiate deps for snapshot: {e}"))?;
+    }
+
+    crate::program::snapshot::snapshot_component(engine, raw_bytes, linker, store)
+        .await
+        .map_err(|e| anyhow!("snapshot_component failed: {e:#}"))
+}
+
 // ---- State ------------------------------------------------------------------
 
 struct Linker {
     engine: Engine,
     allow_filesystem: bool,
-    /// Shared core modules (e.g. CPython interpreter) loaded from py-runtime/shared/.
-    /// Registered with every per-instance WasmLinker so component imports can resolve.
-    shared_modules: Arc<Vec<(String, Module)>>,
-    /// Path to the py-runtime directory (~/.pie/py-runtime), if it exists.
-    /// Passed to InstanceState so Python inferlets get PYTHONHOME and preopened dirs.
-    py_runtime_dir: Option<PathBuf>,
 }
 
 impl Linker {
     fn new(engine: &Engine, allow_filesystem: bool) -> Self {
-        let py_runtime_dir = {
-            let dir = crate::path::get_py_runtime_dir();
-            if dir.is_dir() {
-                tracing::info!("Python runtime directory: {}", dir.display());
-                Some(dir)
-            } else {
-                tracing::info!("No Python runtime directory found at {}", dir.display());
-                None
-            }
-        };
-
-        let shared_modules = if let Some(ref dir) = py_runtime_dir {
-            let shared_dir = dir.join("shared");
-            if shared_dir.is_dir() {
-                load_shared_modules(engine, &shared_dir)
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        if !shared_modules.is_empty() {
-            tracing::info!("Loaded {} shared core module(s)", shared_modules.len());
-        }
-
         Linker {
             engine: engine.clone(),
             allow_filesystem,
-            shared_modules: Arc::new(shared_modules),
-            py_runtime_dir,
         }
     }
 
@@ -115,24 +133,34 @@ impl Linker {
         capture_outputs: bool,
         token_budget: Option<usize>,
     ) -> Result<(Store<InstanceState>, WasmInstance)> {
-        // 1. Get the main component
-        let component = program::get_wasm_component(program_name)
+        // 1. Get the main component (with snapshot status)
+        let (component, main_snapshotted) = program::get_wasm_component(program_name)
             .await
             .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
 
         // 2. Resolve dependencies and detect python-runtime requirement across
-        //    the main program and its direct dependencies.
-        let (dependency_components, python_runtime) =
-            self.resolve_dependencies_and_runtime(program_name).await?;
+        //    the main program and its direct dependencies. Also tracks whether
+        //    any Python component in the graph was snapshotted — that
+        //    determines which shared-module variant we use for instantiation.
+        let (dependency_components, python_runtime, any_snapshotted) =
+            self.resolve_dependencies_and_runtime(program_name, main_snapshotted).await?;
 
         // 3. Gate shared Python runtime loading by whether anything in the graph
         //    declared a python-runtime requirement. Non-Python inferlets pay no
         //    cost for the py-runtime env vars or preopens.
+        //
+        //    For Python inferlets, pick stripped shared modules when any
+        //    component in the graph is snapshotted — their data segments and
+        //    start sections have been baked into the snapshot image, so
+        //    running them again would clobber it. Use full modules otherwise
+        //    so CPython can initialize normally.
         let (shared_modules_for_linker, py_runtime_dir_for_state) = if python_runtime.is_some() {
-            (
-                self.shared_modules.as_ref().as_slice(),
-                self.py_runtime_dir.as_deref(),
-            )
+            let modules = if any_snapshotted {
+                py_runtime::stripped_modules()
+            } else {
+                py_runtime::full_modules()
+            };
+            (modules, py_runtime::py_runtime_dir())
         } else {
             (&[][..], None)
         };
@@ -189,25 +217,33 @@ impl Linker {
 
     /// Resolve dependency components for a program and derive the unified
     /// python-runtime version (if any) declared across the main manifest and
-    /// direct dependency manifests. Returns an error if multiple declarations
-    /// conflict.
+    /// direct dependency manifests. Also tracks whether any Python component
+    /// in the graph has been snapshotted — callers use this to pick stripped
+    /// vs full shared modules at instantiate time. Returns an error if
+    /// multiple python-runtime declarations conflict.
     async fn resolve_dependencies_and_runtime(
         &self,
         program_name: &ProgramName,
-    ) -> Result<(Vec<Component>, Option<String>)> {
+        main_snapshotted: bool,
+    ) -> Result<(Vec<Component>, Option<String>, bool)> {
         let manifest = program::fetch_manifest(program_name)
             .await
             .ok_or_else(|| anyhow!("Manifest not found for: {}", program_name))?;
 
         let mut python_runtime: Option<String> = manifest.runtime.get("python-runtime").cloned();
+        let mut any_snapshotted = main_snapshotted;
 
         let dep_names = manifest.dependency_names();
         let mut components = Vec::with_capacity(dep_names.len());
 
         for dep_name in dep_names {
-            let component = program::get_wasm_component(&dep_name)
+            let (component, dep_snapshotted) = program::get_wasm_component(&dep_name)
                 .await
                 .ok_or_else(|| anyhow!("Dependency component not found: {}", dep_name))?;
+
+            if dep_snapshotted {
+                any_snapshotted = true;
+            }
 
             let dep_manifest = program::fetch_manifest(&dep_name)
                 .await
@@ -233,46 +269,8 @@ impl Linker {
             components.push(component);
         }
 
-        Ok((components, python_runtime))
+        Ok((components, python_runtime, any_snapshotted))
     }
-}
-
-/// Loads shared core modules (.wasm files) from a directory.
-fn load_shared_modules(engine: &Engine, shared_dir: &Path) -> Vec<(String, Module)> {
-    let mut modules = Vec::new();
-    let entries = match fs::read_dir(shared_dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            tracing::warn!(
-                "Failed to read shared modules dir {}: {e}",
-                shared_dir.display()
-            );
-            return modules;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("Failed to read shared module entry: {e}");
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "wasm") {
-            let import_name = path.file_stem().unwrap().to_str().unwrap().to_string();
-            tracing::info!(
-                "Loading shared module: {} -> {}",
-                path.display(),
-                import_name
-            );
-            match Module::from_file(engine, &path) {
-                Ok(module) => modules.push((import_name, module)),
-                Err(e) => tracing::error!("Failed to load shared module {}: {e}", path.display()),
-            }
-        }
-    }
-    modules
 }
 
 // ---- Messages ---------------------------------------------------------------

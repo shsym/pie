@@ -834,7 +834,7 @@ fn instrument(component_bytes: &[u8]) -> Result<(Vec<u8>, Instrumentation)> {
 // strip_module_data
 // ---------------------------------------------------------------------------
 
-pub(super) fn strip_module_data(module_bytes: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn strip_module_data(module_bytes: &[u8]) -> Result<Vec<u8>> {
     let mut out = EncoderModule::new();
     for payload in Parser::new(0).parse_all(module_bytes) {
         let payload = payload?;
@@ -1275,7 +1275,7 @@ impl<T: Send + 'static> Invoker for HostInvoker<T> {
 // snapshot_component -- instruments, initializes, measures, and applies.
 // ---------------------------------------------------------------------------
 
-pub(super) async fn snapshot_component<T: Send + 'static>(
+pub(crate) async fn snapshot_component<T: Send + 'static>(
     engine: &Engine,
     original_bytes: &[u8],
     linker: Linker<T>,

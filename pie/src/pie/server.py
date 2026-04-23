@@ -292,6 +292,7 @@ def _bootstrap(
         models=[py_model],
         allow_filesystem=config.allow_filesystem,
         max_concurrent_processes=config.max_concurrent_processes,
+        python_snapshot=config.python_snapshot,
     )
 
     runtime_handle = pie_runtime.bootstrap(rust_config)
