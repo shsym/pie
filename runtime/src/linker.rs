@@ -120,21 +120,35 @@ impl Linker {
             .await
             .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
 
-        // 2. Get dependency components
-        let dependency_components = self.resolve_dependency_components(program_name).await?;
+        // 2. Resolve dependencies and detect python-runtime requirement across
+        //    the main program and its direct dependencies.
+        let (dependency_components, python_runtime) =
+            self.resolve_dependencies_and_runtime(program_name).await?;
 
-        // 3. Create instance state and store
+        // 3. Gate shared Python runtime loading by whether anything in the graph
+        //    declared a python-runtime requirement. Non-Python inferlets pay no
+        //    cost for the py-runtime env vars or preopens.
+        let (shared_modules_for_linker, py_runtime_dir_for_state) = if python_runtime.is_some() {
+            (
+                self.shared_modules.as_ref().as_slice(),
+                self.py_runtime_dir.as_deref(),
+            )
+        } else {
+            (&[][..], None)
+        };
+
+        // 4. Create instance state and store
         let inst_state = InstanceState::new(
             process_id,
             username,
             capture_outputs,
             self.allow_filesystem,
             token_budget,
-            self.py_runtime_dir.as_deref(),
+            py_runtime_dir_for_state,
         );
         let mut store = Store::new(&self.engine, inst_state);
 
-        // 4. Create and configure linker
+        // 5. Create and configure linker
         let mut linker = WasmLinker::<InstanceState>::new(&self.engine);
 
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -146,14 +160,14 @@ impl Linker {
 
         // Register shared core modules (e.g. CPython interpreter) so Python
         // inferlets can dynamically import the runtime instead of bundling it.
-        for (name, module) in self.shared_modules.iter() {
+        for (name, module) in shared_modules_for_linker.iter() {
             linker
                 .root()
                 .module(name, module)
                 .unwrap_or_else(|e| panic!("Failed to register shared module '{name}': {e}"));
         }
 
-        // 5. Instantiate library dependencies (dynamic linking)
+        // 6. Instantiate library dependencies (dynamic linking)
         if !dependency_components.is_empty() {
             dynamic_linking::instantiate_libraries(
                 &self.engine,
@@ -164,7 +178,7 @@ impl Linker {
             .await?;
         }
 
-        // 6. Instantiate the main component
+        // 7. Instantiate the main component
         let instance = linker
             .instantiate_async(&mut store, &component)
             .await
@@ -173,14 +187,19 @@ impl Linker {
         Ok((store, instance))
     }
 
-    /// Resolve and fetch all dependency components for a program.
-    async fn resolve_dependency_components(
+    /// Resolve dependency components for a program and derive the unified
+    /// python-runtime version (if any) declared across the main manifest and
+    /// direct dependency manifests. Returns an error if multiple declarations
+    /// conflict.
+    async fn resolve_dependencies_and_runtime(
         &self,
         program_name: &ProgramName,
-    ) -> Result<Vec<Component>> {
+    ) -> Result<(Vec<Component>, Option<String>)> {
         let manifest = program::fetch_manifest(program_name)
             .await
             .ok_or_else(|| anyhow!("Manifest not found for: {}", program_name))?;
+
+        let mut python_runtime: Option<String> = manifest.runtime.get("python-runtime").cloned();
 
         let dep_names = manifest.dependency_names();
         let mut components = Vec::with_capacity(dep_names.len());
@@ -189,10 +208,32 @@ impl Linker {
             let component = program::get_wasm_component(&dep_name)
                 .await
                 .ok_or_else(|| anyhow!("Dependency component not found: {}", dep_name))?;
+
+            let dep_manifest = program::fetch_manifest(&dep_name)
+                .await
+                .ok_or_else(|| anyhow!("Dependency manifest not found: {}", dep_name))?;
+
+            if let Some(dep_py_rt) = dep_manifest.runtime.get("python-runtime") {
+                match &python_runtime {
+                    Some(existing) if existing != dep_py_rt => {
+                        return Err(anyhow!(
+                            "Conflicting python-runtime versions among dependencies of {}: \
+                             '{}' vs '{}' (from {})",
+                            program_name,
+                            existing,
+                            dep_py_rt,
+                            dep_name,
+                        ));
+                    }
+                    None => python_runtime = Some(dep_py_rt.clone()),
+                    _ => {}
+                }
+            }
+
             components.push(component);
         }
 
-        Ok(components)
+        Ok((components, python_runtime))
     }
 }
 
