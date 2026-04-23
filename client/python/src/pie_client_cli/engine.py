@@ -316,16 +316,22 @@ def attach_process(client: PieClient, instance_id: str) -> Process:
     )
 
 
-def install_program(client: PieClient, wasm_path: str, manifest_path: str) -> None:
+def install_program(
+    client: PieClient,
+    wasm_path: str,
+    manifest_path: str,
+    force_overwrite: bool = False,
+) -> None:
     """Install a program (sync wrapper).
 
     Args:
         client: The PieClient instance.
         wasm_path: Path to the WASM binary file.
         manifest_path: Path to the manifest TOML file.
+        force_overwrite: If True, overwrite an existing program with the same name+version.
     """
     asyncio.get_event_loop().run_until_complete(
-        client.install_program(wasm_path, manifest_path)
+        client.install_program(wasm_path, manifest_path, force_overwrite=force_overwrite)
     )
 
 
