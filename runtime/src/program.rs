@@ -16,6 +16,7 @@ use crate::service::{Service, ServiceHandler};
 
 mod manifest;
 mod repository;
+mod snapshot;
 pub use manifest::Manifest;
 pub use repository::Repository;
 
