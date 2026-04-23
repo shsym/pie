@@ -4,7 +4,7 @@ use crate::adapter;
 use crate::api::pie;
 use crate::api::inference::ForwardPass;
 use crate::api::adapter::Adapter;
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

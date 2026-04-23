@@ -8,6 +8,7 @@ pub mod context;
 pub mod device;
 pub mod bootstrap;
 pub mod inference;
+pub mod instance;
 pub mod messaging;
 pub mod model;
 pub mod path;

@@ -4,7 +4,7 @@ use crate::api::pie;
 use crate::api::context::Context;
 use crate::api::model::Model;
 use crate::api::adapter::Adapter;
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 use crate::inference::brle::Brle;
 use crate::inference::request::{ForwardPassRequest, ForwardPassOutput};
 use crate::inference::structured::grammar::Grammar as InternalGrammar;

@@ -3,7 +3,7 @@
 use crate::api::model::Model;
 use crate::api::pie;
 use crate::context::{self, ContextId};
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 use crate::model::ModelId;
 use anyhow::Result;
 use wasmtime::component::Resource;

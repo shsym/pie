@@ -102,6 +102,11 @@ impl Manifest {
             .collect()
     }
 
+    /// Declared python-runtime version, if this program requires one.
+    pub fn python_runtime(&self) -> Option<&str> {
+        self.runtime.get("python-runtime").map(String::as_str)
+    }
+
     /// Fetch and parse manifest from a registry URL.
     pub async fn from_url(registry_url: &str, name: &ProgramName) -> Result<Self> {
         let url = manifest_url(registry_url, name);

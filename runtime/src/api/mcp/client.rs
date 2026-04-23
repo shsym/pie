@@ -4,7 +4,7 @@
 //! to MCP servers registered on the client session.
 
 use crate::api::pie;
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 use crate::process::{self, ProcessId};
 use crate::server;
 use anyhow::{Result, anyhow};

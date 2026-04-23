@@ -12,7 +12,6 @@ use tokio::sync::oneshot;
 use wasmtime::Engine as WasmEngine;
 use wasmtime::component::Component;
 
-use crate::linker;
 use crate::py_runtime;
 use crate::service::{Service, ServiceHandler};
 
@@ -120,9 +119,10 @@ pub async fn fetch_manifest(name: &ProgramName) -> Option<Manifest> {
     rx.await.ok().flatten()
 }
 
-/// Get the compiled component for an installed program, along with whether
-/// it was transformed by the host-side snapshot pipeline.
-pub async fn get_wasm_component(name: &ProgramName) -> Option<(Component, bool)> {
+/// Get the compiled component for an installed program, bundled with metadata
+/// the linker needs to instantiate it correctly (snapshot status and declared
+/// python-runtime version).
+pub async fn get_wasm_component(name: &ProgramName) -> Option<InstalledComponent> {
     let (tx, rx) = oneshot::channel();
     SERVICE.send(Message::GetWasmComponent {
         name: name.clone(),
@@ -191,6 +191,23 @@ struct InstalledProgram {
     /// pipeline. Consumers use this to pick the stripped shared-module
     /// variant at instantiate time.
     snapshotted: bool,
+    /// Declared python-runtime version, if any. Cached at install time so
+    /// linker consumers don't need to re-read the manifest to decide how to
+    /// wire shared modules.
+    python_runtime: Option<String>,
+}
+
+/// Public handle for an installed component, returned to consumers that need
+/// to instantiate it (e.g. the linker service).
+#[derive(Clone)]
+pub struct InstalledComponent {
+    pub component: Component,
+    /// True if the component was transformed by the host-side snapshot
+    /// pipeline. Pick the stripped shared-module variant at instantiate time
+    /// when this is set.
+    pub snapshotted: bool,
+    /// Declared python-runtime version, if this program requires one.
+    pub python_runtime: Option<String>,
 }
 
 impl ProgramService {
@@ -211,10 +228,12 @@ impl ProgramService {
         self.repository.fetch_manifest(name)
     }
 
-    fn get_component(&self, name: &ProgramName) -> Option<(Component, bool)> {
-        self.installed
-            .get(name)
-            .map(|p| (p.component.clone(), p.snapshotted))
+    fn get_component(&self, name: &ProgramName) -> Option<InstalledComponent> {
+        self.installed.get(name).map(|p| InstalledComponent {
+            component: p.component.clone(),
+            snapshotted: p.snapshotted,
+            python_runtime: p.python_runtime.clone(),
+        })
     }
 
     fn is_registered(&self, name: &ProgramName) -> bool {
@@ -279,11 +298,16 @@ impl ProgramService {
             if !self.installed.contains_key(dep_name) {
                 let dep_wasm = self.repository.fetch_wasm_binary(dep_name).await?;
                 let dep_component = compile_wasm_component(&self.wasm_engine, dep_wasm).await?;
+                let dep_python_runtime = self
+                    .repository
+                    .fetch_manifest(dep_name)
+                    .and_then(|m| m.python_runtime().map(str::to_string));
                 self.installed.insert(
                     dep_name.clone(),
                     InstalledProgram {
                         component: dep_component,
                         snapshotted: false,
+                        python_runtime: dep_python_runtime,
                     },
                 );
             }
@@ -300,14 +324,14 @@ impl ProgramService {
         // compile path below.
         let wasm_binary = self.repository.fetch_wasm_binary(name).await?;
 
-        let is_python = self
+        let python_runtime = self
             .repository
             .fetch_manifest(name)
-            .map(|m| m.runtime.contains_key("python-runtime"))
-            .unwrap_or(false);
+            .and_then(|m| m.python_runtime().map(str::to_string));
 
-        let should_snapshot =
-            is_python && py_runtime::has_py_runtime() && py_runtime::is_snapshot_enabled();
+        let should_snapshot = python_runtime.is_some()
+            && py_runtime::has_py_runtime()
+            && py_runtime::is_snapshot_enabled();
 
         let (component, snapshotted) = if should_snapshot {
             // Gather direct dep components (from self.installed, populated in Step 3).
@@ -321,7 +345,7 @@ impl ProgramService {
                 .filter_map(|n| self.installed.get(&n).map(|p| p.component.clone()))
                 .collect();
 
-            match linker::snapshot_component_bytes(
+            match snapshot::snapshot_from_bytes(
                 &self.wasm_engine,
                 &wasm_binary,
                 dep_components,
@@ -354,7 +378,11 @@ impl ProgramService {
         // Step 5: Track as installed and mark as explicitly installed
         self.installed.insert(
             name.clone(),
-            InstalledProgram { component, snapshotted },
+            InstalledProgram {
+                component,
+                snapshotted,
+                python_runtime,
+            },
         );
         self.explicit_installs.insert(name.clone());
 
@@ -487,11 +515,11 @@ enum Message {
         response: oneshot::Sender<bool>,
     },
 
-    /// Get the compiled component for an installed program, along with whether
-    /// it was transformed by the host-side snapshot pipeline.
+    /// Get the compiled component for an installed program, with snapshot
+    /// status and declared python-runtime version.
     GetWasmComponent {
         name: ProgramName,
-        response: oneshot::Sender<Option<(Component, bool)>>,
+        response: oneshot::Sender<Option<InstalledComponent>>,
     },
 }
 

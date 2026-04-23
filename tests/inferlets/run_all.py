@@ -26,7 +26,16 @@ from test_windowed_attention import test_windowed_attention
 from test_attention_sink import test_attention_sink
 from test_cacheback_decoding import test_cacheback_decoding
 from test_jacobi_decoding import test_jacobi_decoding
+from test_best_of_n import test_best_of_n
+from test_json_schema_validation import test_json_schema_validation
+from test_knowledge_graph import test_knowledge_graph
+from test_template_generation import test_template_generation
+from test_js_example import test_js_example
+from test_js_concurrency import test_js_concurrency
+from test_py_concurrency import test_py_concurrency
+from test_python_example import test_python_example
 from test_openresponses import test_openresponses
+from test_http_server import test_http_server
 
 
 ALL_TESTS = [
@@ -39,6 +48,8 @@ ALL_TESTS = [
     test_tree_of_thought,
     test_graph_of_thought,
     test_recursion_of_thought,
+    test_best_of_n,
+    test_knowledge_graph,
     test_agent_react,
     test_agent_codeact,
     test_image_fetch,
@@ -47,14 +58,22 @@ ALL_TESTS = [
     test_agent_swarm,
     test_output_validation,
     test_constrained_decoding,
+    test_json_schema_validation,
+    test_template_generation,
     test_watermarking,
     test_windowed_attention,
     test_attention_sink,
     test_cacheback_decoding,
+    # Tier 4: JS/Python SDK
+    test_js_example,
+    test_js_concurrency,
+    test_python_example,
+    test_py_concurrency,
     # Run last: jacobi may trigger CUDA errors that poison subsequent tests
     test_jacobi_decoding,
-    # HTTP daemon test (runs after all process-based tests)
+    # HTTP daemon tests (run after all process-based tests)
     test_openresponses,
+    test_http_server,
 ]
 
 if __name__ == "__main__":

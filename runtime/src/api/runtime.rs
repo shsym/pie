@@ -1,7 +1,7 @@
 //! pie:core/runtime - Runtime information and control functions
 
 use crate::api::pie;
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 use crate::model;
 
 use anyhow::Result;

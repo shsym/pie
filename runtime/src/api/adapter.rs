@@ -3,7 +3,7 @@
 use crate::adapter::{self, AdapterId};
 use crate::api::pie;
 use crate::api::model::Model;
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 use anyhow::Result;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

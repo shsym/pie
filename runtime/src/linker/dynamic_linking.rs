@@ -222,7 +222,7 @@ use wasmtime::component::{
 };
 use wasmtime::{Engine, Store, StoreContextMut};
 
-use super::InstanceState;
+use crate::instance::InstanceState;
 
 /// Proxy marker type for host-defined resources used in dynamic linking.
 /// This is a phantom type used to create host resource handles.
@@ -1207,7 +1207,7 @@ fn register_call_forwarding(
 /// This iterates through library components in dependency order, instantiates each one,
 /// and registers forwarding implementations for their exports so that subsequent
 /// components can import them.
-pub(super) async fn instantiate_libraries(
+pub(crate) async fn instantiate_libraries(
     engine: &Engine,
     linker: &mut Linker<InstanceState>,
     store: &mut Store<InstanceState>,
