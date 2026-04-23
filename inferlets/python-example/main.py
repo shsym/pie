@@ -16,7 +16,7 @@ async def main(input: dict) -> str:
     # Build context
     ctx = Context(model)
     ctx.system("You are a helpful assistant.")
-    ctx.user("Hello, world! Tell me a joke.")
+    ctx.user("What is the capital of France? Tell me a joke.")
 
     # Stream the response
     output = ""

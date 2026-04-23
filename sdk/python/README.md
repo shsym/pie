@@ -11,7 +11,7 @@ model = Model.load(runtime.models()[0])
 ctx = Context(model)
 
 ctx.system("You are a helpful assistant.")
-ctx.user("Hello, world!")
+ctx.user("What is the capital of France?")
 
 text = ctx.generate_text(Sampler.top_p())
 session.send(text)
