@@ -10,6 +10,7 @@ pub mod bootstrap;
 pub mod inference;
 pub mod messaging;
 pub mod model;
+pub mod path;
 pub mod program;
 pub mod server;
 pub mod linker;
