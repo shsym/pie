@@ -30,7 +30,7 @@ Every model has a tokenizer for converting between text and token IDs:
 let tokenizer = model.tokenizer();
 
 // Encode text → tokens
-let tokens = tokenizer.encode("Hello, world!");
+let tokens = tokenizer.encode("What is the capital of France?");
 
 // Decode tokens → text
 let text = tokenizer.decode(&tokens)?;

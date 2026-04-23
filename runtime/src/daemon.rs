@@ -199,6 +199,20 @@ impl Daemon {
         _input: String,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> Result<hyper::Response<HyperOutgoingBody>> {
+        // Buffer the request body before the WASM handler runs in a spawned
+        // task below. hyper's Incoming body uses a zero-capacity channel that
+        // requires sender and receiver to poll in the same task; a spawned
+        // handler deadlocks on bodies spanning multiple TCP segments (>~16KB).
+        let (parts, body) = req.into_parts();
+        let collected = http_body_util::BodyExt::collect(body)
+            .await
+            .map_err(|e| anyhow!("Failed to read request body: {e}"))?;
+        let buffered_body = http_body_util::BodyExt::map_err(
+            http_body_util::Full::new(collected.to_bytes()),
+            |never: std::convert::Infallible| -> hyper::Error { match never {} },
+        );
+        let req = hyper::Request::from_parts(parts, buffered_body);
+
         // Instantiate a fresh WASM component (store + instance) per request.
         // Daemons don't capture outputs — they serve HTTP responses directly.
         let (mut store, instance) =

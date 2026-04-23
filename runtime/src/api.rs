@@ -27,28 +27,28 @@ wasmtime::component::bindgen!({
         "wasi:random/insecure": wasmtime_wasi::p2::bindings::random::insecure,
         "wasi:random/insecure-seed": wasmtime_wasi::p2::bindings::random::insecure_seed,
         // pie:core/types
-        "pie:core/types/future-string": types::FutureString,
-        "pie:core/types/future-blob": types::FutureBlob,
+        "pie:core/types.future-string": types::FutureString,
+        "pie:core/types.future-blob": types::FutureBlob,
         // pie:core/context
-        "pie:core/context/context": context::Context,
+        "pie:core/context.context": context::Context,
         // pie:core/model
-        "pie:core/model/model": model::Model,
-        "pie:core/model/tokenizer": model::Tokenizer,
+        "pie:core/model.model": model::Model,
+        "pie:core/model.tokenizer": model::Tokenizer,
         // pie:core/inference
-        "pie:core/inference/forward-pass": inference::ForwardPass,
-        "pie:core/inference/future-output": inference::FutureOutput,
-        "pie:core/inference/grammar": inference::Grammar,
-        "pie:core/inference/matcher": inference::Matcher,
+        "pie:core/inference.forward-pass": inference::ForwardPass,
+        "pie:core/inference.future-output": inference::FutureOutput,
+        "pie:core/inference.grammar": inference::Grammar,
+        "pie:core/inference.matcher": inference::Matcher,
         // pie:core/messaging
-        "pie:core/messaging/subscription": messaging::Subscription,
+        "pie:core/messaging.subscription": messaging::Subscription,
         // pie:core/adapter
-        "pie:core/adapter/adapter": adapter::Adapter,
+        "pie:core/adapter.adapter": adapter::Adapter,
         // pie:mcp/client
-        "pie:mcp/client/session": mcp::Session,
+        "pie:mcp/client.session": mcp::Session,
         // pie:instruct
-        "pie:instruct/chat/decoder": instruct::chat::Decoder,
-        "pie:instruct/tool-use/decoder": instruct::tool_use::Decoder,
-        "pie:instruct/reasoning/decoder": instruct::reasoning::Decoder,
+        "pie:instruct/chat.decoder": instruct::chat::Decoder,
+        "pie:instruct/tool-use.decoder": instruct::tool_use::Decoder,
+        "pie:instruct/reasoning.decoder": instruct::reasoning::Decoder,
     },
     imports: { default: async | trappable },
     exports: { default: async },

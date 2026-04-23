@@ -17,7 +17,7 @@ export async function main(args: string[]) {
     // Build context
     const ctx = Context.create(model);
     ctx.system('You are a helpful assistant.');
-    ctx.user('Hello, world! Tell me a joke.');
+    ctx.user('What is the capital of France? Tell me a joke.');
 
     // Stream the response
     let output = '';

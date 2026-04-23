@@ -102,7 +102,7 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         "qwen3" => Arc::new(QwenInstruct::new(tokenizer, ChatMLConfig {
             has_thinking: true,
             has_tools: true,
-            stop_tokens: &["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         })),
         "qwen2" => Arc::new(self::qwen2::new(tokenizer)),
         "llama2" => Arc::new(self::llama2::LlamaInstruct::new(tokenizer)),

@@ -200,7 +200,7 @@ def run_test_suite(endpoint: str):
         # Test 1: Query
         print("\n--- Test 1: Query ---")
         try:
-            responses = client.send_query("Hello, world!")
+            responses = client.send_query("What is the capital of France?")
             print(f"✓ Query successful, got {len(responses)} response(s)")
         except Exception as e:
             print(f"✗ Query failed: {e}")

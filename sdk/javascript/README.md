@@ -11,7 +11,7 @@ const model = Model.load(runtime.models()[0]);
 const ctx = Context.create(model);
 
 ctx.system('You are a helpful assistant.');
-ctx.user('Hello, world!');
+ctx.user('What is the capital of France?');
 
 const text = ctx.generateText({
   sampler: Sampler.topP(0.6, 0.95),
