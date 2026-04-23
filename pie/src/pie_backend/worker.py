@@ -140,6 +140,39 @@ def worker_main(
         group_topology: List of groups, each containing ranks
         ready_queue: Queue to signal readiness: (rank, server_name|None, metadata|None)
     """
+    import torch
+    # On Jetson unified memory, CMA allocations leak if not explicitly freed
+    # before process exit — the driver does not reclaim on process death.
+    try:
+        _worker_body(
+            local_rank, world_size, devices, master_port,
+            model_config, group_topology, ready_queue,
+        )
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+        import gc
+        gc.collect()
+
+
+def _worker_body(
+    local_rank: int,
+    world_size: int,
+    devices: list[str],
+    master_port: int,
+    model_config: dict,
+    group_topology: list[list[int]],
+    ready_queue,
+):
+    """Inner body of worker_main, separated for CUDA cleanup guarantee."""
     rank = local_rank
 
     # Workers only need thread-safety for tqdm, not the default

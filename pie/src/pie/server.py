@@ -136,7 +136,7 @@ def _find_free_port() -> int:
 def _bootstrap(
     config: Config,
     console: Console,
-    timeout: float = 300.0,
+    timeout: float = 1200.0,
 ) -> tuple[Any, list]:
     """Spawn workers, collect ready signals, bootstrap the Rust runtime."""
     from pie import _runtime as pie_runtime
