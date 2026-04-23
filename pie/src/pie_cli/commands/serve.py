@@ -35,6 +35,12 @@ def serve(
     dummy: bool = typer.Option(
         False, "--dummy", help="Enable dummy mode (skip GPU weight loading, return random tokens)"
     ),
+    no_snapshot: bool = typer.Option(
+        False,
+        "--no-snapshot",
+        help="Disable the host-side Python snapshot optimization for this run "
+             "(overrides python_snapshot in the config file).",
+    ),
 ) -> None:
     """Start the Pie engine and enter an interactive session."""
     try:
@@ -47,6 +53,9 @@ def serve(
         if isinstance(e, FileNotFoundError):
             console.print("[dim]Run 'pie config init' first.[/dim]")
         raise typer.Exit(1)
+
+    if no_snapshot:
+        cfg.python_snapshot = False
 
     model = cfg.primary_model
     lines = Text()

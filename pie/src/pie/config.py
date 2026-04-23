@@ -86,6 +86,7 @@ class Config:
     models: list[ModelConfig] = field(default_factory=list)
     allow_filesystem: bool = False
     max_concurrent_processes: int | None = None
+    python_snapshot: bool = True
 
     @property
     def primary_model(self) -> ModelConfig:
@@ -124,6 +125,11 @@ registry = "https://registry.pie-project.org/"
 
 # Max concurrent processes (comment out or remove for no limit)
 # max_concurrent_processes = 64
+
+# Apply the host-side snapshot optimization to Python inferlets.
+# When true, CPython initialization is captured once at install time
+# and subsequent launches start from the post-init state.
+python_snapshot = true
 
 [auth]
 enabled = false
@@ -275,4 +281,5 @@ def load_config(
         models=models,
         allow_filesystem=raw.get("allow_filesystem", False),
         max_concurrent_processes=raw.get("max_concurrent_processes"),
+        python_snapshot=raw.get("python_snapshot", True),
     )

@@ -259,6 +259,9 @@ pub struct Config {
     /// Hard cap on concurrent processes. None = no limit.
     #[pyo3(get, set)]
     pub max_concurrent_processes: Option<usize>,
+    /// Whether to apply host-side snapshot optimization to Python components.
+    #[pyo3(get, set)]
+    pub python_snapshot: bool,
 }
 
 #[pymethods]
@@ -279,6 +282,7 @@ impl Config {
         models = vec![],
         allow_filesystem = false,
         max_concurrent_processes = None,
+        python_snapshot = true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -296,6 +300,7 @@ impl Config {
         models: Vec<ModelConfig>,
         allow_filesystem: bool,
         max_concurrent_processes: Option<usize>,
+        python_snapshot: bool,
     ) -> Self {
         Config {
             host,
@@ -312,6 +317,7 @@ impl Config {
             models,
             allow_filesystem,
             max_concurrent_processes,
+            python_snapshot,
         }
     }
 
@@ -378,6 +384,7 @@ impl From<Config> for BootstrapConfig {
             skip_tracing: false,
             allow_filesystem: cfg.allow_filesystem,
             max_concurrent_processes: cfg.max_concurrent_processes,
+            python_snapshot: cfg.python_snapshot,
         }
     }
 }

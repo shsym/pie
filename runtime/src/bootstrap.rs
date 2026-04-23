@@ -37,6 +37,10 @@ pub struct Config {
     /// Hard cap on the number of concurrent processes.
     /// `None` means no limit; `Some(n)` caps admission to `n`.
     pub max_concurrent_processes: Option<usize>,
+    /// Whether to apply host-side snapshot optimization to Python components.
+    /// Disable via `python_snapshot = false` in the engine config or the
+    /// `--no-snapshot` CLI flag.
+    pub python_snapshot: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +95,11 @@ pub async fn bootstrap(
         init_tracing(&config.log_dir, config.verbose, &config.telemetry)?;
     }
     let wasm_engine = init_wasmtime();
+
+    // Load the Python runtime shared modules (full + stripped variants) before
+    // the linker and program services spawn, so both can read from the shared
+    // py_runtime state rather than loading their own copies.
+    crate::py_runtime::init(&wasm_engine, config.python_snapshot);
 
     auth::spawn(
         config.auth.enabled,
