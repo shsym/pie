@@ -4,9 +4,7 @@
 //! Creates per-instance linkers with WASI, WASI HTTP, Pie API host bindings,
 //! and dynamically linked library dependencies.
 
-mod dynamic_linking;
-mod output;
-mod state;
+pub(crate) mod dynamic_linking;
 
 use std::sync::LazyLock;
 
@@ -16,13 +14,11 @@ use wasmtime::component::{Component, Instance as WasmInstance, Linker as WasmLin
 use wasmtime::{Engine, Store};
 
 use crate::api;
-use crate::program::{self, ProgramName};
+use crate::instance::InstanceState;
+use crate::process::ProcessId;
+use crate::program::{self, InstalledComponent, ProgramName};
 use crate::py_runtime;
 use crate::service::{Service, ServiceHandler};
-
-pub use state::InstanceState;
-
-use crate::process::ProcessId;
 
 // ---- Singleton Actor --------------------------------------------------------
 
@@ -57,59 +53,6 @@ pub async fn instantiate(
     rx.await?
 }
 
-/// Run the host-side snapshot pipeline for a Python component.
-///
-/// Builds a throwaway linker (WASI + HTTP + API + full shared modules + deps),
-/// runs the instrumented initialization, and returns the snapshotted bytes.
-/// The caller compiles the result back into a Component.
-///
-/// This is a synchronous helper (not going through the actor) because snapshot
-/// only runs during program installation, which already holds the program
-/// service lock.
-pub(crate) async fn snapshot_component_bytes(
-    engine: &Engine,
-    raw_bytes: &[u8],
-    dep_components: Vec<Component>,
-) -> Result<Vec<u8>> {
-    let mut linker = WasmLinker::<InstanceState>::new(engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-        .expect("Failed to link WASI");
-    wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
-        .expect("Failed to link WASI HTTP");
-    api::add_to_linker(&mut linker)?;
-
-    // Use FULL shared modules for snapshot creation: CPython must initialize
-    // from scratch so the snapshot captures the post-init state. Stripped
-    // modules are only for instantiating components that are already
-    // snapshotted (see Linker::instantiate).
-    for (name, module) in py_runtime::full_modules() {
-        linker
-            .root()
-            .module(name, module)
-            .unwrap_or_else(|e| panic!("Failed to register shared module '{name}': {e}"));
-    }
-
-    let inst_state = InstanceState::new(
-        uuid::Uuid::new_v4(),
-        "snapshot".to_string(),
-        false, // capture_outputs
-        false, // allow_filesystem
-        None,  // token_budget
-        py_runtime::py_runtime_dir(),
-    );
-    let mut store = Store::new(engine, inst_state);
-
-    if !dep_components.is_empty() {
-        dynamic_linking::instantiate_libraries(engine, &mut linker, &mut store, dep_components)
-            .await
-            .map_err(|e| anyhow!("Failed to instantiate deps for snapshot: {e}"))?;
-    }
-
-    crate::program::snapshot::snapshot_component(engine, raw_bytes, linker, store)
-        .await
-        .map_err(|e| anyhow!("snapshot_component failed: {e:#}"))
-}
-
 // ---- State ------------------------------------------------------------------
 
 struct Linker {
@@ -133,17 +76,18 @@ impl Linker {
         capture_outputs: bool,
         token_budget: Option<usize>,
     ) -> Result<(Store<InstanceState>, WasmInstance)> {
-        // 1. Get the main component (with snapshot status)
-        let (component, main_snapshotted) = program::get_wasm_component(program_name)
+        // 1. Get the main component (with snapshot status + python-runtime decl)
+        let main = program::get_wasm_component(program_name)
             .await
             .ok_or_else(|| anyhow!("Component not found for program: {}", program_name))?;
 
-        // 2. Resolve dependencies and detect python-runtime requirement across
-        //    the main program and its direct dependencies. Also tracks whether
-        //    any Python component in the graph was snapshotted — that
+        // 2. Resolve dependencies and reconcile the python-runtime requirement
+        //    across the main program and its direct dependencies. Also tracks
+        //    whether any Python component in the graph was snapshotted — that
         //    determines which shared-module variant we use for instantiation.
         let (dependency_components, python_runtime, any_snapshotted) =
-            self.resolve_dependencies_and_runtime(program_name, main_snapshotted).await?;
+            self.resolve_dependencies_and_runtime(program_name, &main).await?;
+        let component = main.component;
 
         // 3. Gate shared Python runtime loading by whether anything in the graph
         //    declared a python-runtime requirement. Non-Python inferlets pay no
@@ -215,41 +159,37 @@ impl Linker {
         Ok((store, instance))
     }
 
-    /// Resolve dependency components for a program and derive the unified
-    /// python-runtime version (if any) declared across the main manifest and
-    /// direct dependency manifests. Also tracks whether any Python component
-    /// in the graph has been snapshotted — callers use this to pick stripped
-    /// vs full shared modules at instantiate time. Returns an error if
-    /// multiple python-runtime declarations conflict.
+    /// Resolve dependency components for a program and reconcile the
+    /// python-runtime version declared across the main program and its direct
+    /// dependencies. Also tracks whether any Python component in the graph
+    /// has been snapshotted — callers use this to pick stripped vs full
+    /// shared modules at instantiate time. Returns an error if multiple
+    /// python-runtime declarations conflict.
     async fn resolve_dependencies_and_runtime(
         &self,
         program_name: &ProgramName,
-        main_snapshotted: bool,
+        main: &InstalledComponent,
     ) -> Result<(Vec<Component>, Option<String>, bool)> {
         let manifest = program::fetch_manifest(program_name)
             .await
             .ok_or_else(|| anyhow!("Manifest not found for: {}", program_name))?;
 
-        let mut python_runtime: Option<String> = manifest.runtime.get("python-runtime").cloned();
-        let mut any_snapshotted = main_snapshotted;
+        let mut python_runtime: Option<String> = main.python_runtime.clone();
+        let mut any_snapshotted = main.snapshotted;
 
         let dep_names = manifest.dependency_names();
         let mut components = Vec::with_capacity(dep_names.len());
 
         for dep_name in dep_names {
-            let (component, dep_snapshotted) = program::get_wasm_component(&dep_name)
+            let dep = program::get_wasm_component(&dep_name)
                 .await
                 .ok_or_else(|| anyhow!("Dependency component not found: {}", dep_name))?;
 
-            if dep_snapshotted {
+            if dep.snapshotted {
                 any_snapshotted = true;
             }
 
-            let dep_manifest = program::fetch_manifest(&dep_name)
-                .await
-                .ok_or_else(|| anyhow!("Dependency manifest not found: {}", dep_name))?;
-
-            if let Some(dep_py_rt) = dep_manifest.runtime.get("python-runtime") {
+            if let Some(dep_py_rt) = dep.python_runtime.as_deref() {
                 match &python_runtime {
                     Some(existing) if existing != dep_py_rt => {
                         return Err(anyhow!(
@@ -261,12 +201,12 @@ impl Linker {
                             dep_name,
                         ));
                     }
-                    None => python_runtime = Some(dep_py_rt.clone()),
+                    None => python_runtime = Some(dep_py_rt.to_string()),
                     _ => {}
                 }
             }
 
-            components.push(component);
+            components.push(dep.component);
         }
 
         Ok((components, python_runtime, any_snapshotted))

@@ -2,7 +2,7 @@
 
 use crate::api::pie;
 use crate::api::types::FutureString;
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 use crate::messaging;
 use crate::process::{self, ProcessEvent};
 use crate::server;

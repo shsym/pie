@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use crate::api::pie;
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 use crate::model;
 use anyhow::Result;
 use wasmtime::component::Resource;

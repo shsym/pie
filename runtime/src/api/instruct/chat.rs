@@ -4,7 +4,7 @@
 //! Delegates to the model's `Instruct` implementation.
 
 use crate::api::pie;
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 use crate::model::instruct::{ChatDecoder, ChatEvent};
 use anyhow::Result;
 use wasmtime::component::Resource;

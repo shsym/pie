@@ -1,7 +1,9 @@
 //! Instance state for WASM component execution.
 //!
-//! This module provides the runtime state for each WASM instance,
-//! including WASI context and dynamic linking support.
+//! Per-instance runtime state attached to every wasmtime `Store`: WASI
+//! context, filesystem/Python preopens, and dynamic-linking resource maps.
+
+mod output;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,7 +11,7 @@ use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
-use super::output::LogStream;
+use self::output::LogStream;
 
 use crate::context;
 use crate::process::ProcessId;

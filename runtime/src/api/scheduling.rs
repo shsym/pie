@@ -4,7 +4,7 @@ use crate::api::pie;
 use crate::api::model::Model;
 use crate::api::context::Context;
 use crate::context;
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 
 use anyhow::Result;
 use wasmtime::component::Resource;

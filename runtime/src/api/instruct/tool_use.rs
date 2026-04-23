@@ -4,7 +4,7 @@
 //! Delegates to the model's `Instruct` implementation.
 
 use crate::api::pie;
-use crate::linker::InstanceState;
+use crate::instance::InstanceState;
 use crate::model::instruct::{ToolDecoder, ToolEvent};
 use crate::inference::structured::grammar::Grammar as InternalGrammar;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;

@@ -112,6 +112,11 @@ use {
     },
 };
 
+use crate::api;
+use crate::instance::InstanceState;
+use crate::linker::dynamic_linking;
+use crate::py_runtime;
+
 const PAGE_SIZE_BYTES: i32 = 64 * 1024;
 const MAX_CONSECUTIVE_ZEROS: usize = 64;
 
@@ -1272,10 +1277,67 @@ impl<T: Send + 'static> Invoker for HostInvoker<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Public entry point: build a throwaway linker/store, then run the pipeline.
+// ---------------------------------------------------------------------------
+
+/// Run the host-side snapshot pipeline for a Python component.
+///
+/// Builds a throwaway linker (WASI + HTTP + API + full shared modules + deps),
+/// runs the instrumented initialization, and returns the snapshotted bytes.
+/// The caller compiles the result back into a Component.
+///
+/// This is a synchronous helper (not going through the actor) because snapshot
+/// only runs during program installation, which already holds the program
+/// service lock.
+pub(crate) async fn snapshot_from_bytes(
+    engine: &Engine,
+    raw_bytes: &[u8],
+    dep_components: Vec<Component>,
+) -> Result<Vec<u8>> {
+    let mut linker = Linker::<InstanceState>::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .expect("Failed to link WASI");
+    wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
+        .expect("Failed to link WASI HTTP");
+    api::add_to_linker(&mut linker)?;
+
+    // Use FULL shared modules for snapshot creation: CPython must initialize
+    // from scratch so the snapshot captures the post-init state. Stripped
+    // modules are only for instantiating components that are already
+    // snapshotted (see the linker service's instantiate path).
+    for (name, module) in py_runtime::full_modules() {
+        linker
+            .root()
+            .module(name, module)
+            .unwrap_or_else(|e| panic!("Failed to register shared module '{name}': {e}"));
+    }
+
+    let inst_state = InstanceState::new(
+        uuid::Uuid::new_v4(),
+        "snapshot".to_string(),
+        false, // capture_outputs
+        false, // allow_filesystem
+        None,  // token_budget
+        py_runtime::py_runtime_dir(),
+    );
+    let mut store = Store::new(engine, inst_state);
+
+    if !dep_components.is_empty() {
+        dynamic_linking::instantiate_libraries(engine, &mut linker, &mut store, dep_components)
+            .await
+            .map_err(|e| anyhow!("Failed to instantiate deps for snapshot: {e}"))?;
+    }
+
+    snapshot_component(engine, raw_bytes, linker, store)
+        .await
+        .map_err(|e| anyhow!("snapshot_component failed: {e:#}"))
+}
+
+// ---------------------------------------------------------------------------
 // snapshot_component -- instruments, initializes, measures, and applies.
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn snapshot_component<T: Send + 'static>(
+async fn snapshot_component<T: Send + 'static>(
     engine: &Engine,
     original_bytes: &[u8],
     linker: Linker<T>,
