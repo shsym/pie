@@ -119,25 +119,18 @@ fn validate(json_text: &str, schema_value: &Value) -> std::result::Result<Value,
     let parsed: Value = serde_json::from_str(json_text)
         .map_err(|e| format!("JSON parse error: {e}"))?;
 
-    let compiled = jsonschema::JSONSchema::compile(schema_value)
+    let validator = jsonschema::validator_for(schema_value)
         .map_err(|e| format!("Schema compile error: {e}"))?;
 
-    let error_msgs: Option<String> = {
-        let result = compiled.validate(&parsed);
-        match result {
-            Ok(()) => None,
-            Err(errors) => Some(
-                errors
-                    .map(|e| format!("- {} (at {})", e, e.instance_path))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-        }
-    };
+    let errors: Vec<String> = validator
+        .iter_errors(&parsed)
+        .map(|e| format!("- {} (at {})", e, e.instance_path()))
+        .collect();
 
-    match error_msgs {
-        None => Ok(parsed),
-        Some(msgs) => Err(msgs),
+    if errors.is_empty() {
+        Ok(parsed)
+    } else {
+        Err(errors.join("\n"))
     }
 }
 
