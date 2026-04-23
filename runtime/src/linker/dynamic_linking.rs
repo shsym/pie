@@ -888,9 +888,7 @@ async fn forward_call(
     // This signals to the caller that the borrows have completed.
     // This must happen after the callee function returns but before we return to the caller.
     for borrow in borrows_to_end {
-        borrow
-            .resource_drop_async::<InstanceState>(&mut *store)
-            .await?;
+        borrow.resource_drop_async(&mut *store).await?;
     }
 
     let returns_in_caller_view = transform_returns_to_caller_view(
@@ -960,7 +958,7 @@ fn register_stub_interface_exports(
                 )?;
             }
             ComponentItem::ComponentFunc(_) => {
-                inst.func_new_async(export_name, move |_store, _args, _results| {
+                inst.func_new_async(export_name, move |_store, _ty, _args, _results| {
                     Box::new(async move {
                         unreachable!("Stub function was unexpectedly called during validation");
                     })
@@ -1130,9 +1128,7 @@ fn register_interface_exports(
                         })?;
 
                     // Call the destructor of the guest resource
-                    guest_resource
-                        .resource_drop_async::<InstanceState>(&mut store)
-                        .await
+                    guest_resource.resource_drop_async(&mut store).await
                 })
             },
         )?;
@@ -1186,7 +1182,7 @@ fn register_call_forwarding(
     return_types: Arc<Vec<Type>>,
     defined_resource_types: Arc<Vec<ResourceType>>,
 ) -> Result<(), wasmtime::Error> {
-    inst.func_new_async(func_name, move |mut store, args, returns| {
+    inst.func_new_async(func_name, move |mut store, _ty, args, returns| {
         let arg_types = Arc::clone(&arg_types);
         let return_types = Arc::clone(&return_types);
         let defined_resource_types = Arc::clone(&defined_resource_types);
