@@ -8,12 +8,14 @@ mod dynamic_linking;
 mod output;
 mod state;
 
-use std::sync::LazyLock;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Result, anyhow};
 use tokio::sync::oneshot;
 use wasmtime::component::{Component, Instance as WasmInstance, Linker as WasmLinker};
-use wasmtime::{Engine, Store};
+use wasmtime::{Engine, Module, Store};
 
 use crate::api;
 use crate::program::{self, ProgramName};
@@ -61,11 +63,48 @@ pub async fn instantiate(
 struct Linker {
     engine: Engine,
     allow_filesystem: bool,
+    /// Shared core modules (e.g. CPython interpreter) loaded from py-runtime/shared/.
+    /// Registered with every per-instance WasmLinker so component imports can resolve.
+    shared_modules: Arc<Vec<(String, Module)>>,
+    /// Path to the py-runtime directory (~/.pie/py-runtime), if it exists.
+    /// Passed to InstanceState so Python inferlets get PYTHONHOME and preopened dirs.
+    py_runtime_dir: Option<PathBuf>,
 }
 
 impl Linker {
     fn new(engine: &Engine, allow_filesystem: bool) -> Self {
-        Linker { engine: engine.clone(), allow_filesystem }
+        let py_runtime_dir = {
+            let dir = crate::path::get_py_runtime_dir();
+            if dir.is_dir() {
+                tracing::info!("Python runtime directory: {}", dir.display());
+                Some(dir)
+            } else {
+                tracing::info!("No Python runtime directory found at {}", dir.display());
+                None
+            }
+        };
+
+        let shared_modules = if let Some(ref dir) = py_runtime_dir {
+            let shared_dir = dir.join("shared");
+            if shared_dir.is_dir() {
+                load_shared_modules(engine, &shared_dir)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        if !shared_modules.is_empty() {
+            tracing::info!("Loaded {} shared core module(s)", shared_modules.len());
+        }
+
+        Linker {
+            engine: engine.clone(),
+            allow_filesystem,
+            shared_modules: Arc::new(shared_modules),
+            py_runtime_dir,
+        }
     }
 
     async fn instantiate(
@@ -85,7 +124,14 @@ impl Linker {
         let dependency_components = self.resolve_dependency_components(program_name).await?;
 
         // 3. Create instance state and store
-        let inst_state = InstanceState::new(process_id, username, capture_outputs, self.allow_filesystem, token_budget);
+        let inst_state = InstanceState::new(
+            process_id,
+            username,
+            capture_outputs,
+            self.allow_filesystem,
+            token_budget,
+            self.py_runtime_dir.as_deref(),
+        );
         let mut store = Store::new(&self.engine, inst_state);
 
         // 4. Create and configure linker
@@ -97,6 +143,15 @@ impl Linker {
             .expect("Failed to link WASI HTTP");
 
         api::add_to_linker(&mut linker)?;
+
+        // Register shared core modules (e.g. CPython interpreter) so Python
+        // inferlets can dynamically import the runtime instead of bundling it.
+        for (name, module) in self.shared_modules.iter() {
+            linker
+                .root()
+                .module(name, module)
+                .unwrap_or_else(|e| panic!("Failed to register shared module '{name}': {e}"));
+        }
 
         // 5. Instantiate library dependencies (dynamic linking)
         if !dependency_components.is_empty() {
@@ -139,6 +194,44 @@ impl Linker {
 
         Ok(components)
     }
+}
+
+/// Loads shared core modules (.wasm files) from a directory.
+fn load_shared_modules(engine: &Engine, shared_dir: &Path) -> Vec<(String, Module)> {
+    let mut modules = Vec::new();
+    let entries = match fs::read_dir(shared_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to read shared modules dir {}: {e}",
+                shared_dir.display()
+            );
+            return modules;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Failed to read shared module entry: {e}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "wasm") {
+            let import_name = path.file_stem().unwrap().to_str().unwrap().to_string();
+            tracing::info!(
+                "Loading shared module: {} -> {}",
+                path.display(),
+                import_name
+            );
+            match Module::from_file(engine, &path) {
+                Ok(module) => modules.push((import_name, module)),
+                Err(e) => tracing::error!("Failed to load shared module {}: {e}", path.display()),
+            }
+        }
+    }
+    modules
 }
 
 // ---- Messages ---------------------------------------------------------------

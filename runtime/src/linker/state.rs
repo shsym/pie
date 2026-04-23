@@ -4,7 +4,7 @@
 //! including WASI context and dynamic linking support.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
@@ -70,6 +70,7 @@ impl InstanceState {
         capture_outputs: bool,
         allow_filesystem: bool,
         token_budget: Option<usize>,
+        py_runtime_dir: Option<&Path>,
     ) -> Self {
         // Register the process with all model context managers.
         // This creates the ProcessEntry with the correct token budget endowment
@@ -99,6 +100,42 @@ impl InstanceState {
                 DirPerms::all(),
                 FilePerms::all(),
             ).expect("failed to preopen scratch dir");
+        }
+
+        // Set up Python runtime environment if py-runtime directory is available.
+        // Layout: py-runtime/runtime/{python,bundled}, py-runtime/site-packages
+        if let Some(dir) = py_runtime_dir {
+            let runtime_dir = dir.join("runtime");
+            let site_packages_dir = dir.join("site-packages");
+
+            const PYTHON_PATH: &str = "/python:/0:/bundled";
+
+            builder
+                .env("PYTHONHOME", "/python")
+                .env("PYTHONPATH", PYTHON_PATH)
+                .env("PYTHONUNBUFFERED", "1");
+
+            builder
+                .preopened_dir(
+                    runtime_dir.join("python"),
+                    "python",
+                    DirPerms::all(),
+                    FilePerms::all(),
+                )
+                .expect("failed to preopen python dir");
+
+            builder
+                .preopened_dir(
+                    runtime_dir.join("bundled"),
+                    "bundled",
+                    DirPerms::all(),
+                    FilePerms::all(),
+                )
+                .expect("failed to preopen bundled dir");
+
+            builder
+                .preopened_dir(site_packages_dir, "0", DirPerms::all(), FilePerms::all())
+                .expect("failed to preopen site-packages dir");
         }
 
         InstanceState {
