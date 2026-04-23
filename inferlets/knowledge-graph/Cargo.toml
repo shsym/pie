@@ -1,0 +1,15 @@
+[package]
+name = "knowledge-graph"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+inferlet = { path = "../../sdk/rust/inferlet" }
+futures = "0.3"
+petgraph = "0.6"
+
+[profile.release]
+lto = true
