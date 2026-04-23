@@ -108,6 +108,7 @@ pub fn create_mock_env(
         skip_tracing: true,
         allow_filesystem: false,
         max_concurrent_processes: None,
+        python_snapshot: false,
     };
 
     MockEnv {
