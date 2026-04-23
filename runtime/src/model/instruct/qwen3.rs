@@ -437,7 +437,7 @@ mod tests {
     fn qwen3() -> QwenInstruct {
         QwenInstruct::new(make_tok(), ChatMLConfig {
             has_thinking: true, has_tools: true,
-            stop_tokens: &["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         })
     }
 
@@ -577,7 +577,7 @@ mod tests {
         let tok = Arc::new(Tokenizer::from_vocab(&v));
         let inst = QwenInstruct::new(tok, ChatMLConfig {
             has_thinking: true, has_tools: true,
-            stop_tokens: &["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         });
         let mut dec = inst.tool_decoder();
         // Feed: <tool_call> \n JSON \n </tool_call>
