@@ -7,11 +7,11 @@ use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Response};
 use wstd::io::AsyncWrite;
 
-use inferlet::context::Context;
+use inferlet::Context;
 use inferlet::inference::Sampler;
 use inferlet::model::Model;
 use inferlet::runtime;
-use inferlet::{ContextExt, InstructExt};
+use inferlet::{};
 
 /// Generate a unique ID for responses and messages
 fn generate_id(prefix: &str) -> String {
@@ -186,7 +186,7 @@ async fn handle_streaming_response(
     };
     let tokenizer = model.tokenizer();
 
-    let ctx = match Context::new(&model) {
+    let mut ctx = match Context::new(&model) {
         Ok(c) => c,
         Err(e) => {
             response.status = ResponseStatus::Failed;
@@ -202,7 +202,7 @@ async fn handle_streaming_response(
         }
     };
 
-    // Fill context using InstructExt
+    // Fill context using 
     if let Some(sys) = &system_message {
         ctx.system(sys);
     }
@@ -310,14 +310,14 @@ async fn handle_non_streaming_response(
     };
     let tokenizer = model.tokenizer();
 
-    let ctx = match Context::new(&model) {
+    let mut ctx = match Context::new(&model) {
         Ok(c) => c,
         Err(e) => {
             return error_response(responder, 500, "server_error", &format!("Failed to create context: {}", e), None, None).await;
         }
     };
 
-    // Fill context using InstructExt
+    // Fill context using 
     if let Some(sys) = &system_message {
         ctx.system(sys);
     }

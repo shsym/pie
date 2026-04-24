@@ -1,14 +1,17 @@
 //! Demonstrates CacheBack speculative decoding — using a cached draft model.
 //!
-//! This inferlet implements the `Speculate` trait from the SDK to provide
-//! custom speculative token drafting. The drafter generates candidate tokens
-//! which the verifier model checks in a single forward pass.
+//! This inferlet implements speculative decoding with a manual generation loop.
+//! A separate "drafter" context generates candidate tokens, which the main
+//! context verifies in a single forward pass. Accepted tokens are committed;
+//! rejected tokens are rolled back.
+//!
+//! Draft tokens are sent as regular `input_tokens` (not speculative_tokens)
+//! so the runtime's working_page_tokens tracking remains consistent.
 
 use inferlet::{
-    context::Context, model::Model, runtime,
-    ContextExt, InstructExt, Result,
+    Context, model::Model, runtime,
+    ForwardPassExt, Result,
     inference::{ForwardPass, Output, Sampler},
-    Speculate, Speculation,
 };
 use std::time::Instant;
 
@@ -23,115 +26,71 @@ Options:
   -d, --draft-length <N>     Number of draft tokens per speculation round [default: 4]
   -h, --help                 Prints this help message";
 
-/// A simple greedy drafter that uses a separate context for drafting.
-///
-/// This implements the `Speculate` trait from the SDK, providing draft tokens
-/// for speculative decoding.
+/// Simple greedy drafter using an independent context.
 struct GreedyDrafter {
     model: Model,
     draft_ctx: Context,
-    draft_length: usize,
     page_size: u32,
-    pending_tokens: Vec<u32>,
 }
 
 impl GreedyDrafter {
-    fn new(_model: &Model, source_ctx: &Context, draft_length: usize) -> Result<Self> {
-        let draft_ctx = source_ctx.fork()?;
-        let page_size = draft_ctx.tokens_per_page();
+    fn new(model: &Model) -> Result<Self> {
+        let draft_ctx = Context::new(model)?;
+        let page_size = draft_ctx.page_size();
         Ok(Self {
             model: Model::load(&runtime::models()[0])?,
             draft_ctx,
-            draft_length,
             page_size,
-            pending_tokens: Vec::new(),
         })
     }
-}
 
-impl Speculate for GreedyDrafter {
-    fn draft(&self) -> (Vec<u32>, Vec<u32>) {
-        // Synchronously generate draft tokens using ForwardPass
+    /// Generate `draft_length` tokens greedily using the draft context.
+    fn draft(&self, seed_token: u32, draft_length: usize) -> Vec<u32> {
         let mut tokens = Vec::new();
-        let mut positions = Vec::new();
+        let mut current = seed_token;
 
-        if self.pending_tokens.is_empty() {
-            return (tokens, positions);
-        }
+        for _ in 0..draft_length {
+            let wpt = self.draft_ctx.inner().working_page_token_count();
+            let seq_len = self.draft_ctx.inner().committed_page_count() * self.page_size + wpt;
 
-        let mut current_tokens = self.pending_tokens.clone();
-
-        for _i in 0..self.draft_length {
-            let wpt = self.draft_ctx.working_page_token_count();
-            let seq_len = self.draft_ctx.committed_page_count() * self.page_size + wpt;
-
-            let current_working_pages = self.draft_ctx.working_page_count();
-            let total_tokens_after = wpt + current_tokens.len() as u32;
-            let total_pages_needed = (total_tokens_after + self.page_size - 1) / self.page_size;
-            let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
-            if additional_pages > 0 {
-                if self.draft_ctx.reserve_working_pages(additional_pages).is_err() {
+            // Reserve pages
+            let current_working = self.draft_ctx.inner().working_page_count();
+            let total_after = wpt + 1;
+            let pages_needed = (total_after + self.page_size - 1) / self.page_size;
+            let additional = pages_needed.saturating_sub(current_working);
+            if additional > 0 {
+                if self.draft_ctx.inner().reserve_working_pages(additional).is_err() {
                     break;
                 }
             }
 
             let pass = ForwardPass::new(&self.model);
-            pass.context(&self.draft_ctx);
-            let pos: Vec<u32> = (seq_len..seq_len + current_tokens.len() as u32).collect();
-            pass.input_tokens(&current_tokens, &pos);
-            let last_idx = (current_tokens.len() - 1) as u32;
-            pass.sampler(&[last_idx], Sampler::TopP((0.0, 1.0)));
+            pass.context(self.draft_ctx.inner());
+            pass.input_tokens(&[current], &[seq_len]);
+            pass.sampler(&[0], Sampler::TopP((0.0, 1.0)));
 
             let output = pass.execute();
-            let Ok(future_output) = output else {
-                break;
-            };
+            let Ok(future_output) = output else { break };
+            let Some(result) = future_output.get() else { break };
 
-            // Poll to completion
-            let output = future_output.get();
-            let Some(result) = output else {
-                break;
-            };
-
-            let drafted = match result {
-                Output::Tokens(t) => t,
-                _ => break,
-            };
-
-            if let Some(&token) = drafted.first() {
-                tokens.push(token);
-                positions.push(seq_len + current_tokens.len() as u32);
-
-                // Commit pages
-                let new_wpt = wpt + current_tokens.len() as u32;
-                let pages_to_commit = new_wpt / self.page_size;
-                if pages_to_commit > 0 {
-                    let _ = self.draft_ctx.commit_working_pages(pages_to_commit);
+            match result {
+                Output::Tokens(t) if !t.is_empty() => {
+                    current = t[0];
+                    tokens.push(current);
                 }
-
-                current_tokens = vec![token];
-            } else {
-                break;
+                _ => break,
             }
         }
 
-        (tokens, positions)
+        tokens
     }
 
-    fn accept(&mut self, accepted_tokens: &[u32]) {
-        // Update the draft context to match the accepted state
-        if let Some(&last) = accepted_tokens.last() {
-            self.pending_tokens = vec![last];
+    /// Roll back the last `n` tokens from the draft context by truncating
+    /// working page tokens and releasing working pages if needed.
+    fn rollback(&self, n: u32) {
+        if n > 0 {
+            self.draft_ctx.inner().truncate_working_page_tokens(n);
         }
-    }
-
-    fn reset(&mut self) {
-        // Reset the draft context
-        self.pending_tokens.clear();
-    }
-
-    fn rollback(&mut self, _num_tokens: usize) {
-        // Rollback is a no-op for a simple greedy drafter
     }
 }
 
@@ -153,31 +112,173 @@ async fn main(args: Vec<String>) -> Result<String> {
     let start = Instant::now();
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
-    let _tokenizer = model.tokenizer();
+    let tokenizer = model.tokenizer();
+    let stop_tokens = inferlet::instruct::chat::stop_tokens(&model);
+    let page_size = {
+        let tmp = Context::new(&model)?;
+        tmp.page_size()
+    };
 
-    let ctx = Context::create(&model)?;
+    let mut ctx = Context::new(&model)?;
 
-    let mut pending_tokens: Vec<u32> = Vec::new();
-    pending_tokens.extend(ctx.system("You are a helpful assistant."));
-    pending_tokens.extend(ctx.user(&prompt));
-    pending_tokens.extend(ctx.cue());
-    ctx.flush(&pending_tokens).await?;
+    // Fill prompt and flush to populate the KV cache.
+    ctx.system("You are a helpful assistant.")
+        .user(&prompt)
+        .cue();
+    ctx.flush().await?;
 
-    // Create the drafter
-    let drafter = GreedyDrafter::new(&model, &ctx, draft_length)?;
-    let speculation = Speculation::custom(drafter);
+    // Bootstrap: sample the first token.
+    let first_token = {
+        let wpt = ctx.inner().working_page_token_count();
+        let seq_len = ctx.inner().committed_page_count() * page_size + wpt;
 
-    let text = ctx
-        .generate(Sampler::TopP((0.0, 1.0)))
-        .with_speculation(speculation)
-        .with_max_tokens(max_tokens)
-        .collect_text()
-        .await?;
+        let cue_tokens = inferlet::instruct::chat::cue(&model);
+        let trigger = *cue_tokens.last().unwrap_or(&0);
+
+        let current_working = ctx.inner().working_page_count();
+        let total_after = wpt + 1;
+        let pages_needed = (total_after + page_size - 1) / page_size;
+        let additional = pages_needed.saturating_sub(current_working);
+        if additional > 0 {
+            ctx.inner().reserve_working_pages(additional)
+                .map_err(|e| format!("Failed to reserve pages: {}", e))?;
+        }
+
+        let pass = ForwardPass::new(&model);
+        pass.context(ctx.inner());
+        pass.input_tokens(&[trigger], &[seq_len]);
+        pass.sampler(&[0], Sampler::TopP((0.0, 1.0)));
+        let output = pass.execute_async().await
+            .map_err(|e| format!("Bootstrap failed: {}", e))?;
+        match output {
+            Output::Tokens(t) if !t.is_empty() => t[0],
+            _ => return Err("Bootstrap produced no token".to_string()),
+        }
+    };
+
+    // Create the drafter.
+    let drafter = GreedyDrafter::new(&model)?;
+
+    let mut all_generated: Vec<u32> = vec![first_token];
+    let mut anchor = first_token;
+    let mut total_accepted = 1usize;
+    let mut total_steps = 0usize;
+
+    // Main speculative decoding loop.
+    while total_accepted < max_tokens {
+        // Step 1: Draft tokens using the separate drafter context.
+        let draft_tokens = drafter.draft(anchor, draft_length);
+        if draft_tokens.is_empty() {
+            // Drafter failed; fall back to normal decode with anchor only.
+            break;
+        }
+
+        // Step 2: Build verification pass on the main context.
+        // Send [anchor] + [draft_tokens] as regular input_tokens.
+        let mut verify_input = vec![anchor];
+        verify_input.extend_from_slice(&draft_tokens);
+        let input_count = verify_input.len();
+
+        let wpt = ctx.inner().working_page_token_count();
+        let seq_len = ctx.inner().committed_page_count() * page_size + wpt;
+
+        // Reserve pages for all input tokens.
+        let current_working = ctx.inner().working_page_count();
+        let total_after = wpt + input_count as u32;
+        let pages_needed = (total_after + page_size - 1) / page_size;
+        let additional = pages_needed.saturating_sub(current_working);
+        if additional > 0 {
+            ctx.inner().reserve_working_pages(additional)
+                .map_err(|e| format!("Failed to reserve pages: {}", e))?;
+        }
+
+        let pass = ForwardPass::new(&model);
+        pass.context(ctx.inner());
+
+        let positions: Vec<u32> = (seq_len..seq_len + input_count as u32).collect();
+        pass.input_tokens(&verify_input, &positions);
+
+        // Sample at all positions to verify drafts.
+        let sample_indices: Vec<u32> = (0..input_count as u32).collect();
+        pass.sampler(&sample_indices, Sampler::TopP((0.0, 1.0)));
+
+        let output = pass.execute_async().await
+            .map_err(|e| format!("Verification forward pass failed: {}", e))?;
+
+        let verified = match output {
+            Output::Tokens(tokens) => tokens,
+            _ => break,
+        };
+
+        if verified.is_empty() {
+            break;
+        }
+
+        // Step 3: Determine how many draft tokens match the verifier.
+        // verified[0] = model prediction after anchor position
+        // verified[i] = model prediction after draft_tokens[i-1] position
+        // Draft tokens[i] matches if verified[i] == draft_tokens[i]
+        let mut accepted_count = 1; // The first verified token is always accepted
+        for i in 1..verified.len().min(draft_tokens.len() + 1) {
+            let draft_idx = i - 1;
+            if draft_idx < draft_tokens.len() && verified[i - 1] == draft_tokens[draft_idx] {
+                accepted_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        let newly_accepted: Vec<u32> = verified[..accepted_count.min(verified.len())].to_vec();
+
+        // Step 4: Commit accepted tokens, truncate rejected ones.
+        let n_rejected = (input_count as u32) - (accepted_count as u32);
+        if n_rejected > 0 {
+            ctx.inner().truncate_working_page_tokens(n_rejected);
+        }
+
+        // Commit full pages from the accepted tokens.
+        let new_wpt = ctx.inner().working_page_token_count();
+        let pages_to_commit = new_wpt / page_size;
+        if pages_to_commit > 0 {
+            ctx.inner().commit_working_pages(pages_to_commit)
+                .map_err(|e| format!("Failed to commit pages: {}", e))?;
+        }
+
+        // Roll back rejected draft tokens from the drafter context too.
+        let drafter_rejected = draft_length as u32 - (accepted_count.saturating_sub(1) as u32);
+        if drafter_rejected > 0 {
+            drafter.rollback(drafter_rejected);
+        }
+
+        // Check for stop tokens.
+        let mut hit_stop = false;
+        for &t in &newly_accepted {
+            if stop_tokens.contains(&t) {
+                hit_stop = true;
+                break;
+            }
+            all_generated.push(t);
+            total_accepted += 1;
+        }
+
+        if hit_stop || total_accepted >= max_tokens {
+            break;
+        }
+
+        // The new anchor is the last accepted token.
+        anchor = *newly_accepted.last().unwrap_or(&anchor);
+        total_steps += 1;
+    }
+
+    // Decode output.
+    let text = tokenizer.decode(&all_generated)
+        .map_err(|e| format!("Decode failed: {e}"))?;
 
     println!(
-        "Generated in {:?}",
-        start.elapsed()
+        "--- CacheBack Decoding (draft_length={}, steps={}) ---",
+        draft_length, total_steps
     );
+    println!("Generated in {:?}", start.elapsed());
     println!("Output:\n{}", text);
 
     Ok(String::new())

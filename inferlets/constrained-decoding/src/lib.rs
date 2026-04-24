@@ -4,8 +4,8 @@
 //! using the built-in Grammar/Matcher infrastructure in the SDK.
 
 use inferlet::{
-    context::Context, model::Model, runtime,
-    ContextExt, InstructExt, Result,
+    Context, model::Model, runtime,
+    Result,
     inference::{Grammar, Sampler},
     Constrain,
 };
@@ -79,7 +79,7 @@ number ::= [0-9]+
     let grammar = Grammar::from_ebnf(grammar_str)?;
     let constraint = GrammarConstraint::new(&grammar, &model);
 
-    let ctx = Context::create(&model)?;
+    let mut ctx = Context::new(&model)?;
 
     ctx.system(
         "You are a helpful assistant that outputs structured data in JSON format."

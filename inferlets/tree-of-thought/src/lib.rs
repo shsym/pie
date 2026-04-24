@@ -6,8 +6,8 @@
 
 use futures::future;
 use inferlet::{
-    context::Context, inference::Sampler, model::Model,
-    runtime, ContextExt, InstructExt, Result,
+    Context, inference::Sampler, model::Model,
+    runtime, Result,
 };
 use std::time::Instant;
 
@@ -64,7 +64,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
 
-    let ctx_root = Context::new(&model)?;
+    let mut ctx_root = Context::new(&model)?;
     ctx_root.system(
         "You are a helpful, respectful, and honest assistant that excels at \
         mathematical reasoning. Please follow the user's instructions precisely.",
@@ -74,7 +74,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     // Build and execute tree in parallel
     let level1_futures = (0..num_branches)
         .map(|_| {
-            let propose_ctx = ctx_root.fork()?;
+            let mut propose_ctx = ctx_root.fork()?;
             let question_ = question.clone();
             Ok(async move {
                 // Level 1: Propose Plan
@@ -94,7 +94,7 @@ async fn main(args: Vec<String>) -> Result<String> {
 
                 let level2_futures = (0..num_branches)
                     .map(|_| {
-                        let execute_ctx = propose_ctx.fork()?;
+                        let mut execute_ctx = propose_ctx.fork()?;
                         Ok(async move {
                             execute_ctx.cue();
                             execute_ctx
@@ -109,7 +109,7 @@ async fn main(args: Vec<String>) -> Result<String> {
 
                             let level3_futures = (0..num_branches)
                                 .map(|_| {
-                                    let reflect_ctx = execute_ctx.fork()?;
+                                    let mut reflect_ctx = execute_ctx.fork()?;
                                     Ok(async move {
                                         reflect_ctx.cue();
                                         reflect_ctx

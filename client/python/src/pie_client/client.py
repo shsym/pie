@@ -434,7 +434,7 @@ class PieClient:
     async def launch_process(
         self,
         inferlet: str,
-        input: dict | None = None,
+        input: dict | list | None = None,
         capture_outputs: bool = True,
         token_budget: int | None = None,
     ) -> Process:
@@ -449,7 +449,7 @@ class PieClient:
         msg = {
             "type": "launch_process",
             "inferlet": inferlet,
-            "input": json.dumps(input or {}),
+            "input": json.dumps(input if input is not None else {}),
             "capture_outputs": capture_outputs,
         }
         if token_budget is not None:

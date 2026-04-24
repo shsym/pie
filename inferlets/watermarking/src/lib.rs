@@ -6,8 +6,8 @@
 //! decoding with Sampler::Dist to get distributions, then custom sampling.
 
 use inferlet::{
-    context::Context, model::Model, runtime,
-    InstructExt, ForwardPassExt, Result,
+    Context, model::Model, runtime,
+    ForwardPassExt, Result,
     inference::{ForwardPass, Output, Sampler},
 };
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -151,14 +151,14 @@ async fn main(args: Vec<String>) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
     let tokenizer = model.tokenizer();
-    let stop_tokens = Context::stop_tokens(&model);
+    let stop_tokens = inferlet::instruct::chat::stop_tokens(&model);
 
-    let ctx = Context::create(&model)?;
+    let mut ctx = Context::new(&model)?;
 
     let mut pending_tokens: Vec<u32> = Vec::new();
-    pending_tokens.extend(ctx.system("You are a helpful, respectful and honest assistant."));
-    pending_tokens.extend(ctx.user(&prompt));
-    pending_tokens.extend(ctx.cue());
+    pending_tokens.extend(inferlet::instruct::chat::system(&model, "You are a helpful, respectful and honest assistant."));
+    pending_tokens.extend(inferlet::instruct::chat::user(&model, &prompt));
+    pending_tokens.extend(inferlet::instruct::chat::cue(&model));
 
     // Manual decode loop with watermark sampling
     let mut watermark = WatermarkState::new(0.5, 2.0);
@@ -169,20 +169,20 @@ async fn main(args: Vec<String>) -> Result<String> {
             break;
         }
 
-        let page_size = ctx.tokens_per_page();
-        let wpt = ctx.working_page_token_count();
-        let seq_len = ctx.committed_page_count() * page_size + wpt;
-        let current_working_pages = ctx.working_page_count();
+        let page_size = ctx.page_size();
+        let wpt = ctx.inner().working_page_token_count();
+        let seq_len = ctx.inner().committed_page_count() * page_size + wpt;
+        let current_working_pages = ctx.inner().working_page_count();
         let total_tokens_after = wpt + pending_tokens.len() as u32;
         let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
         let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
         if additional_pages > 0 {
-            ctx.reserve_working_pages(additional_pages)
+            ctx.inner().reserve_working_pages(additional_pages)
                 .map_err(|e| format!("Failed to reserve pages at step {}: {}", step, e))?;
         }
 
         let pass = ForwardPass::new(&model);
-        pass.context(&ctx);
+        pass.context(ctx.inner());
         let positions: Vec<u32> = (seq_len..seq_len + pending_tokens.len() as u32).collect();
         pass.input_tokens(&pending_tokens, &positions);
 
@@ -197,7 +197,7 @@ async fn main(args: Vec<String>) -> Result<String> {
         let new_wpt = wpt + pending_tokens.len() as u32;
         let pages_to_commit = new_wpt / page_size;
         if pages_to_commit > 0 {
-            ctx.commit_working_pages(pages_to_commit)
+            ctx.inner().commit_working_pages(pages_to_commit)
                 .map_err(|e| format!("Failed to commit pages: {}", e))?;
         }
 

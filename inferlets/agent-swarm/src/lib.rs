@@ -5,9 +5,9 @@
 //! character creator, or dialogue writer) and passes work to the next agent.
 
 use inferlet::{
-    context::Context, model::Model, runtime,
+    Context, model::Model, runtime,
     messaging, SubscriptionExt,
-    ContextExt, InstructExt, Result,
+    Result,
     inference::Sampler,
 };
 
@@ -129,7 +129,7 @@ async fn main(args: Vec<String>) -> Result<String> {
         (initial_prompt, String::new())
     };
 
-    let ctx = Context::create(&model)?;
+    let mut ctx = Context::new(&model)?;
     ctx.system(config.system_message);
     ctx.user(&format!(
         "{}\nPlease start with \"### {}\"",
@@ -144,7 +144,7 @@ async fn main(args: Vec<String>) -> Result<String> {
         .await?;
 
     // Strip any EOS token text from the contribution
-    let stop_tokens = Context::stop_tokens(&model);
+    let stop_tokens = inferlet::instruct::chat::stop_tokens(&model);
     let stop_text: Vec<String> = stop_tokens
         .iter()
         .filter_map(|&t| tokenizer.decode(&[t]).ok())

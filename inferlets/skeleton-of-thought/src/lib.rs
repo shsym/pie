@@ -6,8 +6,8 @@
 
 use futures::future;
 use inferlet::{
-    context::Context, inference::Sampler, model::Model,
-    runtime, ContextExt, InstructExt, Result,
+    Context, inference::Sampler, model::Model,
+    runtime, Result,
 };
 use std::time::Instant;
 
@@ -27,14 +27,14 @@ Options:
 
 /// Generates a high-level plan and elaborates on each point in parallel.
 async fn plan_and_generate_parallel(
-    ctx: &Context,
+    ctx: &mut Context,
     question: &str,
     max_points: usize,
     plan_max_tokens: usize,
     elab_max_tokens: usize,
 ) -> Result<Vec<String>> {
     // 1. Fork a context for generating the plan.
-    let plan_ctx = ctx.fork()?;
+    let mut plan_ctx = ctx.fork()?;
     let plan_prompt = format!(
         "Generate up to {} key points that outline the answer to the following question: {}. \
         Each point must be enclosed between the <point> and </point> tags.",
@@ -66,7 +66,7 @@ async fn plan_and_generate_parallel(
     let leaf_futures = points
         .into_iter()
         .map(|point| {
-            let elab_ctx = ctx.fork()?;
+            let mut elab_ctx = ctx.fork()?;
             let complete_prompt = format!(
                 "Elaborate on the following point: {}. \
                 Your response should be complete and only concerned with this point.",
@@ -112,7 +112,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
 
-    let ctx = Context::new(&model)?;
+    let mut ctx = Context::new(&model)?;
     ctx.system("You are a helpful, respectful and honest assistant.");
     ctx.flush().await?;
 
@@ -122,7 +122,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     );
 
     let elaborations = plan_and_generate_parallel(
-        &ctx,
+        &mut ctx,
         &question,
         num_points,
         plan_max_tokens,

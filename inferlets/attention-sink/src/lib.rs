@@ -10,8 +10,8 @@
 //! so the model ignores masked tokens, but the KV memory is not freed.
 
 use inferlet::{
-    context::Context, model::Model, runtime,
-    ContextExt, ForwardPassExt, InstructExt, Result,
+    Context, model::Model, runtime,
+    ForwardPassExt, Result,
     inference::{ForwardPass, Output, Sampler},
 };
 use std::time::Instant;
@@ -69,16 +69,16 @@ async fn main(args: Vec<String>) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
 
-    let ctx = Context::create(&model)?;
-    let page_size = ctx.tokens_per_page();
-    let stop_tokens = Context::stop_tokens(&model);
+    let mut ctx = Context::new(&model)?;
+    let page_size = ctx.page_size();
+    let stop_tokens = inferlet::instruct::chat::stop_tokens(&model);
 
+    // Build prompt tokens into pending_tokens (manual tokenization for the
+    // manual forward-pass loop below — we need explicit token control).
     let mut pending_tokens: Vec<u32> = Vec::new();
-    pending_tokens.extend(ctx.system("You are a helpful assistant."));
-    pending_tokens.extend(ctx.user(&prompt));
-    pending_tokens.extend(ctx.cue());
-    ctx.flush(&pending_tokens).await?;
-    pending_tokens.clear();
+    pending_tokens.extend(inferlet::instruct::chat::system(&model, "You are a helpful assistant."));
+    pending_tokens.extend(inferlet::instruct::chat::user(&model, &prompt));
+    pending_tokens.extend(inferlet::instruct::chat::cue(&model));
 
     println!(
         "--- Attention Sink (sink={}, window={}, page_size={}) ---",
@@ -86,49 +86,31 @@ async fn main(args: Vec<String>) -> Result<String> {
     );
 
     // Manual generation loop with per-step attention masking.
-    // This follows the same page management pattern as the SDK's
-    // TokenStream::step(), but adds a sink-window attention_mask on
-    // each ForwardPass.
+    // The first iteration processes the full prompt. Subsequent iterations
+    // process one generated token at a time, applying the sink+window mask.
     let mut generated_tokens: Vec<u32> = Vec::new();
     let sampler = Sampler::TopP((0.0, 1.0));
 
-    // Bootstrap: sample the first token from the flushed KV cache
-    let bootstrap_pass = ForwardPass::new(&model);
-    bootstrap_pass.context(&ctx);
-    bootstrap_pass.sampler(&[0], sampler.clone());
-    let bootstrap_output = bootstrap_pass.execute_async().await?;
-    match bootstrap_output {
-        Output::Tokens(t) if !t.is_empty() => {
-            if stop_tokens.contains(&t[0]) {
-                // First token is stop — nothing to generate
-            } else {
-                generated_tokens.push(t[0]);
-                pending_tokens = vec![t[0]];
-            }
-        }
-        _ => {}
-    }
-
-    for _step in 1..max_tokens {
+    for _step in 0..max_tokens {
         if pending_tokens.is_empty() {
             break;
         }
 
-        let wpt = ctx.working_page_token_count();
-        let seq_len = ctx.committed_page_count() * page_size + wpt;
+        let wpt = ctx.inner().working_page_token_count();
+        let seq_len = ctx.inner().committed_page_count() * page_size + wpt;
 
         // Reserve additional pages for the new token(s)
-        let current_working_pages = ctx.working_page_count();
+        let current_working_pages = ctx.inner().working_page_count();
         let total_tokens_after = wpt + pending_tokens.len() as u32;
         let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
         let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
         if additional_pages > 0 {
-            ctx.reserve_working_pages(additional_pages)
+            ctx.inner().reserve_working_pages(additional_pages)
                 .map_err(|e| format!("Failed to reserve pages: {}", e))?;
         }
 
         let pass = ForwardPass::new(&model);
-        pass.context(&ctx);
+        pass.context(ctx.inner());
 
         let positions: Vec<u32> = (seq_len..seq_len + pending_tokens.len() as u32).collect();
         pass.input_tokens(&pending_tokens, &positions);
@@ -158,12 +140,12 @@ async fn main(args: Vec<String>) -> Result<String> {
             break;
         }
 
-        // Page management: commit pages
+        // Page management: commit full pages
         let new_wpt = wpt + pending_tokens.len() as u32;
         let pages_to_commit = new_wpt / page_size;
 
         if pages_to_commit > 0 {
-            ctx.commit_working_pages(pages_to_commit)
+            ctx.inner().commit_working_pages(pages_to_commit)
                 .map_err(|e| format!("Failed to commit pages: {}", e))?;
         }
 

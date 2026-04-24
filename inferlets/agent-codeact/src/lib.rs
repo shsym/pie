@@ -7,8 +7,8 @@
 
 use boa_engine::{Context as JsContext, Source};
 use inferlet::{
-    context::Context, inference::Sampler, model::Model,
-    runtime, ContextExt, InstructExt, Result,
+    Context, inference::Sampler, model::Model,
+    runtime, Result,
 };
 
 /// Result of parsing the assistant's response.
@@ -92,7 +92,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
 
-    let ctx = Context::new(&model)?;
+    let mut ctx = Context::new(&model)?;
     ctx.system(SYSTEM_PROMPT);
     ctx.user(&format!("{}\n\n{}", USER_PROMPT, "What is the first step?"));
     ctx.cue();
