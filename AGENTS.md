@@ -19,7 +19,7 @@ This document provides a concise overview of the key directories and components 
     *   `src/pie/`: Core engine management logic
     *   `src/pie_cli/`: CLI commands (`pie serve`, `pie run`, etc.)
     *   `src/pie_worker/`: Inference backend (was `pie-backend`) - handles model loading, KV caching, forward passes
-    *   `src/flashinfer_metal/`: Metal GPU kernels (Apple Silicon)
+    *   `src/pie_kernels/`: Unified kernel dispatch (routes to `pie_kernels.metal` on Apple Silicon, upstream `flashinfer` on CUDA; `pie_kernels.cuda/` hosts pie-owned CUDA/Triton kernels)
 *   **CLI**: Provides the `pie` command.
     *   `pie serve`: Starts the full engine and backend.
     *   `pie run`: Executes a one-shot inferlet.

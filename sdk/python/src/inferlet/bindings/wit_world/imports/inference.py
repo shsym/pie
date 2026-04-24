@@ -10,8 +10,8 @@ import weakref
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import adapter
 from ..imports import context
-from ..imports import poll
 from ..imports import model
+from ..imports import poll
 
 
 @dataclass

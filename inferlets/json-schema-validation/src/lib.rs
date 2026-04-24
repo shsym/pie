@@ -15,21 +15,22 @@
 use inferlet::{
     Context, GrammarConstraint, Result, inference::Sampler, model::Model, runtime,
 };
+use serde::Deserialize;
 use serde_json::Value;
 
-const HELP: &str = "\
-Usage: json-schema-validation [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default = "default_max_retries")]
+    max_retries: u32,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+}
 
-Generates JSON from an LLM with grammar-constrained decoding, then
-validates it against a JSON Schema. Retries with error feedback
-until the output satisfies the schema.
-
-Options:
-  -p, --prompt <STRING>      The prompt describing what to generate
-                             [default: a person profile]
-  -r, --max-retries <N>      Maximum validation/retry cycles [default: 3]
-  -t, --max-tokens <N>       Max tokens per generation attempt [default: 512]
-  -h, --help                 Prints help information";
+fn default_prompt() -> String { "Generate a profile for a fictional software engineer named Alice.".to_string() }
+fn default_max_retries() -> u32 { 3 }
+fn default_max_tokens() -> usize { 512 }
 
 const PERSON_SCHEMA: &str = r#"{
     "type": "object",
@@ -108,19 +109,10 @@ fn validate(json_text: &str, schema_value: &Value) -> std::result::Result<Value,
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let prompt: String = args.value_from_str(["-p", "--prompt"]).unwrap_or_else(|_| {
-        "Generate a profile for a fictional software engineer named Alice.".to_string()
-    });
-    let max_retries: u32 = args.value_from_str(["-r", "--max-retries"]).unwrap_or(3);
-    let max_tokens: usize = args.value_from_str(["-t", "--max-tokens"]).unwrap_or(512);
+async fn main(input: Input) -> Result<String> {
+    let prompt = input.prompt;
+    let max_retries = input.max_retries;
+    let max_tokens = input.max_tokens;
 
     let schema_value: Value =
         serde_json::from_str(PERSON_SCHEMA).map_err(|e| format!("Schema parse error: {e}"))?;

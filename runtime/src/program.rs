@@ -12,14 +12,16 @@ use tokio::sync::oneshot;
 use wasmtime::Engine as WasmEngine;
 use wasmtime::component::Component;
 
-use crate::py_runtime;
 use crate::service::{Service, ServiceHandler};
 
 mod manifest;
+pub(crate) mod python;
 mod repository;
-pub(crate) mod snapshot;
 pub use manifest::Manifest;
 pub use repository::Repository;
+
+use python::runtime as py_runtime;
+use python::snapshot;
 
 // =============================================================================
 // Public API
@@ -330,7 +332,7 @@ impl ProgramService {
             .and_then(|m| m.python_runtime().map(str::to_string));
 
         let should_snapshot = python_runtime.is_some()
-            && py_runtime::has_py_runtime()
+            && py_runtime::is_available()
             && py_runtime::is_snapshot_enabled();
 
         let (component, snapshotted) = if should_snapshot {

@@ -5,7 +5,7 @@ from conftest import run_inferlet, run_tests
 async def test_knowledge_graph(client, args):
     output = await run_inferlet(
         client, "knowledge-graph",
-        ["--max-tokens", "2048"],
+        {"max_tokens": 2048},
         timeout=max(args.timeout, 300),
     )
     assert "Stage 1: Extracting knowledge triples" in output, "Missing stage 1"

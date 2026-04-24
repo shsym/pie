@@ -67,12 +67,6 @@ impl ContextManager {
             return false;
         }
 
-        // Credit check: fire_deferred_ops charges make cost per alloc.
-        // A bankrupt context would immediately re-suspend after restore.
-        if deferred_pages > 0 && !self.can_afford(ctx_id, deferred_pages) {
-            return false;
-        }
-
         true
     }
 
@@ -429,16 +423,7 @@ impl ContextManager {
             if num_pages == 0 {
                 let op = ops.remove(0);
                 (op.on_alloc)(self, Vec::new());
-            } else if !self.can_afford(ctx_id, num_pages) {
-                // Insufficient credits — stall, re-suspend.
-                if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
-                    ctx.deferred_ops = ops;
-                }
-                self.suspend(ctx_id);
-                self.enqueue_restore(ctx_id);
-                return;
             } else if let Some(pages) = self.gpu_stores[device].alloc(num_pages) {
-                self.charge_make_cost(ctx_id, pages.len());
                 let op = ops.remove(0);
                 (op.on_alloc)(self, pages);
             } else {

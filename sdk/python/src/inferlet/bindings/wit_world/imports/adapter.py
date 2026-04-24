@@ -9,7 +9,6 @@ import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import model
-from ..imports import pie_core_types
 
 class Adapter:
     
@@ -25,13 +24,6 @@ class Adapter:
     def open(cls, model: model.Model, name: str) -> Optional[Self]:
         raise NotImplementedError
     def fork(self, name: str) -> Self:
-        raise NotImplementedError
-    def acquire_lock(self) -> pie_core_types.FutureBool:
-        raise NotImplementedError
-    def release_lock(self) -> None:
-        """
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
-        """
         raise NotImplementedError
     def load(self, path: str) -> None:
         """

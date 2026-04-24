@@ -13,33 +13,28 @@ use inferlet::{
     ForwardPassExt, Result,
     inference::{ForwardPass, Output, Sampler},
 };
+use serde::Deserialize;
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: jacobi-decoding [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_window_size")]
+    window_size: usize,
+}
 
-A program to demonstrate Jacobi decoding (parallel speculation via fixed-point iteration).
-
-Options:
-  -p, --prompt <PROMPT>      The prompt text [default: \"Write a poem about the ocean.\"]
-  -n, --max-tokens <TOKENS>  Maximum number of tokens to generate [default: 256]
-  -w, --window-size <N>      Number of speculative positions per iteration [default: 5]
-  -h, --help                 Prints this help message";
+fn default_prompt() -> String { "Write a poem about the ocean.".to_string() }
+fn default_max_tokens() -> usize { 256 }
+fn default_window_size() -> usize { 5 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let prompt: String = args
-        .value_from_str(["-p", "--prompt"])
-        .unwrap_or_else(|_| "Write a poem about the ocean.".to_string());
-    let max_tokens: usize = args.value_from_str(["-n", "--max-tokens"]).unwrap_or(256);
-    let window_size: usize = args.value_from_str(["-w", "--window-size"]).unwrap_or(5);
+async fn main(input: Input) -> Result<String> {
+    let prompt = input.prompt;
+    let max_tokens = input.max_tokens;
+    let window_size = input.window_size;
 
     let start = Instant::now();
     let models = runtime::models();

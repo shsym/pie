@@ -2,7 +2,6 @@
 
 import { Adapter as _Adapter } from 'pie:core/adapter';
 import type { Model } from './model.js';
-import { awaitFuture } from './_async.js';
 
 /**
  * A LoRA adapter instance.
@@ -36,16 +35,6 @@ export class Adapter {
     /** Fork this adapter with a new name. */
     fork(name: string): Adapter {
         return new Adapter(this._handle.fork(name));
-    }
-
-    /** Acquire an exclusive lock on the adapter. */
-    async acquireLock(): Promise<boolean> {
-        return awaitFuture(this._handle.acquireLock(), 'acquireLock() returned undefined');
-    }
-
-    /** Release the lock on the adapter. */
-    releaseLock(): void {
-        this._handle.releaseLock();
     }
 
     /** Load adapter weights from a file path. */

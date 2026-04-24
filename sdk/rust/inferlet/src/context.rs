@@ -26,6 +26,42 @@ pub use crate::pie::core::context::Context as RawContext;
 use crate::pie::instruct::chat;
 use crate::pie::instruct::tool_use;
 
+/// Budget-exhausting bid: the maximum per-page-per-step rent the process
+/// can sustain over `μ` steps of generation without going bankrupt.
+///
+/// Formula (SCHED.md §5):
+///
+/// ```text
+///     bid = (B/μ + d) / (p + μ(1 + cv²) / (2s))
+/// ```
+///
+/// where:
+/// - `B` = credit balance (market wallet, unit: pages)
+/// - `μ` = expected remaining steps
+/// - `d` = endowment-weighted dividend per step
+/// - `p` = pages currently held
+/// - `s` = page_size (tokens per page)
+/// - `cv²` = squared coefficient of variation of the remaining-steps
+///   distribution (0 = deterministic, 1 = geometric/memoryless)
+///
+/// The numerator is the per-step budget available for rent (balance
+/// amortized over horizon, plus incoming dividend). The denominator is
+/// the *total* page-steps of rent exposure: current pages `p` held for
+/// `μ` steps, plus the triangular accumulation of newly created pages.
+///
+/// This is the truthful bid under critical-value payments — bidding this
+/// value exhausts the wallet exactly at the end of the horizon. No
+/// make-cost term: forward-pass compute is billed against the token
+/// wallet, not the credit wallet.
+pub(crate) fn compute_bid(
+    balance: f64, pages: f64, mu: f64, cv2: f64, page_size: f64, dividend: f64,
+) -> f64 {
+    let mu = mu.max(1.0);
+    let numerator = balance / mu + dividend;
+    let denominator = pages + mu * (1.0 + cv2) / (2.0 * page_size);
+    if denominator > 0.0 { numerator / denominator } else { numerator }
+}
+
 // =============================================================================
 // Context
 // =============================================================================
@@ -146,6 +182,12 @@ impl Context {
 
     /// Set bid (willingness to pay per page per step).
     /// Higher bid = harder to evict, restored first.
+    ///
+    /// Bids are bounded below by zero; the runtime refuses negative values.
+    /// Stopping forward progress when the compute budget is spent is handled
+    /// on the **token wallet**, not here — calling `forward_pass()` after
+    /// `tokens_remaining == 0` fails with an error, independent of any bid
+    /// you set. Setting a low bid only affects admission under contention.
     pub fn bid(&self, value: f64) {
         self.inner.bid(value);
     }
@@ -171,6 +213,14 @@ impl Context {
     /// surplus). Marginal processes fold immediately (no surplus). The
     /// threshold is endogenous — no tuning parameter required.
     ///
+    /// ## Common case: free holds on uncontended devices
+    ///
+    /// The runtime charges zero rent when the device has free capacity and
+    /// no contexts are waiting for pages — holding across a tool call costs
+    /// nothing, and this function returns without changing the bid. This is
+    /// the dominant regime at normal load. The hold-vs-fold math only
+    /// matters on a saturated device.
+    ///
     /// Returns a [`BidGuard`] that restores the generation bid on drop.
     ///
     /// ```ignore
@@ -186,23 +236,19 @@ impl Context {
         let pages = (self.committed_pages + self.working_pages) as f64;
 
         // Budget-exhausting bid (§5 of SCHED.md) with geometric prior (cv²=1).
-        // bid = (B/μ + d − 1/s) / (p + μ/s)
-        // Conservative default: μ = 4096 (no horizon info in yield_bid).
+        // No horizon info available inside yield_bid → conservative μ = 4096.
         let mu = 4096.0_f64;
         let page_size = self.page_size as f64;
-        let g = 1.0 / page_size;
         let generation_bid = if pages > 0.0 {
-            let numerator = balance / mu + dividend - g;
-            let denominator = pages + mu / page_size;  // (1+cv²)/2 = 1 for cv²=1
-            numerator / denominator
+            compute_bid(balance, pages, mu, 1.0, page_size, dividend)
         } else { 0.0 };
 
         let step_secs = latency.max(0.001);
         let wait_steps = expected_wait.as_secs_f64() / step_secs;
 
-        // Hold if surplus covers the idle rent (§7):
-        //   W / remaining  <  (bid − rent) / rent
-        // Equivalently: rent-free or bid well above clearing price.
+        // Hold if either:
+        //   - `rent == 0`: device uncontended, holding is free (common case);
+        //   - surplus covers the idle rent (§7): W/remaining < (bid-rent)/rent.
         let hold = rent == 0.0
             || (generation_bid > rent
                 && wait_steps < mu * (generation_bid - rent) / rent);

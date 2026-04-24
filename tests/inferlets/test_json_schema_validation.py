@@ -7,7 +7,7 @@ from conftest import run_inferlet, run_tests
 async def test_json_schema_validation(client, args):
     output = await run_inferlet(
         client, "json-schema-validation",
-        ["--max-tokens", "512"],
+        {"max_tokens": 512},
         timeout=max(args.timeout, 300),
     )
     assert "Attempt 1/" in output, "Missing attempt header"

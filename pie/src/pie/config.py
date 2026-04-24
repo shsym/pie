@@ -52,7 +52,16 @@ class ModelConfig:
     use_cuda_graphs: bool = False
     random_seed: int = 42
     dummy_mode: bool = False
-    default_token_budget: int = 1024
+    # Default compute-wallet cap. `None` (the default) means *unlimited*:
+    # the process is not capped by the runtime. Clients can still opt into
+    # a cap on a per-launch basis via `client.launch_process(..., token_budget=N)`.
+    default_token_budget: int | None = None
+    # Default market endowment (in KV pages) assigned to a process launched
+    # without an explicit token_budget. One unit = one page of long-run
+    # entitled GPU residency under contention.
+    default_endowment_pages: int = 64
+    # Admission oversubscription factor: `Σ endowment ≤ capacity × factor`.
+    oversubscription_factor: float = 4.0
     max_batch_size: int = 512
 
     # Name derived from hf_repo if not explicitly set
@@ -61,10 +70,20 @@ class ModelConfig:
     def __post_init__(self):
         if not self.name:
             self.name = self.hf_repo
-        if self.default_token_budget is None or self.default_token_budget <= 0:
+        if self.default_token_budget is not None and self.default_token_budget <= 0:
             raise ValueError(
-                f"Model {self.name or self.hf_repo!r}: default_token_budget must be > 0 "
-                f"(got {self.default_token_budget!r})"
+                f"Model {self.name or self.hf_repo!r}: default_token_budget, when set, "
+                f"must be > 0 (got {self.default_token_budget!r})"
+            )
+        if self.default_endowment_pages <= 0:
+            raise ValueError(
+                f"Model {self.name or self.hf_repo!r}: default_endowment_pages "
+                f"must be > 0 (got {self.default_endowment_pages!r})"
+            )
+        if self.oversubscription_factor <= 0.0:
+            raise ValueError(
+                f"Model {self.name or self.hf_repo!r}: oversubscription_factor "
+                f"must be > 0 (got {self.oversubscription_factor!r})"
             )
 
 
@@ -143,9 +162,20 @@ service_name = "pie"
 [[model]]
 hf_repo = "{DEFAULT_MODEL}"
 
-# Default token budget per process (required, must be > 0).
-# Determines the credit endowment (= ceil(budget / page_size)).
-default_token_budget = 1024
+# Default compute cap per process. Unset (commented out) = unlimited — the
+# recommended default. Clients that want a cap pass `token_budget=N` to
+# `launch_process()` instead. Set a value here only to apply a cap to every
+# process that doesn't declare one (e.g. for shared hosting).
+# default_token_budget = 1024
+
+# Default market endowment, in KV pages, for processes launched without an
+# explicit token_budget. Controls this process's long-run share of GPU
+# residency under contention.
+default_endowment_pages = 64
+
+# Admission oversubscription factor. Σ endowment ≤ capacity × factor.
+# 1.0 = strict (no contention ever). >1.0 = overbook.
+oversubscription_factor = 4.0
 
 # Device assignment (single GPU or list for tensor parallel)
 device = [{formatted_device}]
@@ -262,7 +292,10 @@ def load_config(
             use_cuda_graphs=mc.get("use_cuda_graphs", False),
             random_seed=mc.get("random_seed", 42),
             dummy_mode=dummy_mode or mc.get("dummy_mode", False),
-            default_token_budget=mc.get("default_token_budget", 1024),
+            # None (omitted) = unlimited; set explicitly to cap.
+            default_token_budget=mc.get("default_token_budget"),
+            default_endowment_pages=mc.get("default_endowment_pages", 64),
+            oversubscription_factor=mc.get("oversubscription_factor", 4.0),
             name=mc.get("name", ""),
         )
         models.append(m)

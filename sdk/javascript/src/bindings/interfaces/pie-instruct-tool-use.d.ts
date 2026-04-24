@@ -2,11 +2,11 @@
 /**
  * Register available tools (list of JSON schema strings)
  */
-export function equip(ctx: Context, tools: Array<string>): void;
+export function equip(model: Model, tools: Array<string>): Uint32Array;
 /**
  * Provide a tool result (after a tool-call reply)
  */
-export function answer(ctx: Context, name: string, value: string): void;
+export function answer(model: Model, name: string, value: string): Uint32Array;
 /**
  * Create a decoder to detect tool calls in generated tokens
  */
@@ -15,7 +15,6 @@ export function createDecoder(model: Model): Decoder;
  * Create a grammar matcher to force-generate tool calls
  */
 export function createMatcher(model: Model, tools: Array<string>): Matcher;
-export type Context = import('./pie-core-context.js').Context;
 export type Model = import('./pie-core-model.js').Model;
 export type Matcher = import('./pie-core-inference.js').Matcher;
 export type Error = import('./pie-core-types.js').Error;

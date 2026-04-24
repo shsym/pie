@@ -9,15 +9,15 @@ use inferlet::{
     inference::{Grammar, Sampler},
     Constrain,
 };
+use serde::Deserialize;
 
-const HELP: &str = "\
-Usage: constrained-decoding [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_num_tokens")]
+    num_tokens: usize,
+}
 
-A program to generate text constrained by a grammar (EBNF, regex, or JSON schema).
-
-Options:
-  -n, --num-tokens <TOKENS>  Maximum number of tokens to generate [default: 512]
-  -h, --help                 Prints this help message";
+fn default_num_tokens() -> usize { 512 }
 
 /// A Grammar-based constraint for TokenStream.
 ///
@@ -55,15 +55,8 @@ impl Constrain for GrammarConstraint {
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let max_tokens: usize = args.value_from_str(["-n", "--num-tokens"]).unwrap_or(512);
+async fn main(input: Input) -> Result<String> {
+    let max_tokens = input.num_tokens;
 
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;

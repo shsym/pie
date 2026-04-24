@@ -9,28 +9,20 @@ use inferlet::{
     Context, inference::Sampler, model::Model,
     runtime, Result,
 };
+use serde::Deserialize;
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: parallel-generation [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+}
 
-A program to demonstrate parallel text generation from forked contexts.
-
-Options:
-  -n, --max-tokens <TOKENS>  Max tokens to generate for each prompt [default: 128]
-  -h, --help                 Prints this help message";
-
+fn default_max_tokens() -> usize { 128 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let max_num_outputs: usize = args.value_from_str(["-n", "--max-tokens"]).unwrap_or(128);
+async fn main(input: Input) -> Result<String> {
+    let max_num_outputs = input.max_tokens;
 
     let start = Instant::now();
 

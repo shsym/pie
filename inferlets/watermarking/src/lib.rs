@@ -10,18 +10,20 @@ use inferlet::{
     ForwardPassExt, Result,
     inference::{ForwardPass, Output, Sampler},
 };
+use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: watermarking [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+}
 
-A program to demonstrate watermarked text generation.
-
-Options:
-  -p, --prompt <PROMPT>      The prompt text [default: \"Explain the LLM decoding process ELI5.\"]
-  -n, --max-tokens <TOKENS>  Maximum number of tokens to generate [default: 256]
-  -h, --help                 Prints this help message";
+fn default_prompt() -> String { "Explain the LLM decoding process ELI5.".to_string() }
+fn default_max_tokens() -> usize { 256 }
 
 /// Watermarking state.
 struct WatermarkState {
@@ -131,21 +133,9 @@ fn weighted_sample(probs: &[f32], seed: u64) -> usize {
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let prompt: String = args
-        .value_from_str(["-p", "--prompt"])
-        .unwrap_or_else(|_| "Explain the LLM decoding process ELI5.".to_string());
-
-    let max_num_outputs: usize = args
-        .value_from_str(["-n", "--max-tokens"])
-        .unwrap_or(256);
+async fn main(input: Input) -> Result<String> {
+    let prompt = input.prompt;
+    let max_num_outputs = input.max_tokens;
 
     let start = Instant::now();
     let models = runtime::models();

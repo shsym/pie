@@ -513,27 +513,27 @@ export class Context implements Disposable {
 
   /** Fill a system message. */
   system(message: string): void {
-    this._appendPending(_chat.system(this._handle, message));
+    this._appendPending(_chat.system(this._handle.model(), message));
   }
 
   /** Fill a user message. */
   user(message: string): void {
-    this._appendPending(_chat.user(this._handle, message));
+    this._appendPending(_chat.user(this._handle.model(), message));
   }
 
   /** Fill an assistant message (for history replay). */
   assistant(message: string): void {
-    this._appendPending(_chat.assistant(this._handle, message));
+    this._appendPending(_chat.assistant(this._handle.model(), message));
   }
 
   /** Cue the model to generate (fills generation header). */
   cue(): void {
-    this._appendPending(_chat.cue(this._handle));
+    this._appendPending(_chat.cue(this._handle.model()));
   }
 
   /** Seal the current turn (inserts stop token). */
   seal(): void {
-    this._appendPending(_chat.seal(this._handle));
+    this._appendPending(_chat.seal(this._handle.model()));
   }
 
   /** Returns the stop token IDs for this context's model. */
@@ -545,12 +545,12 @@ export class Context implements Disposable {
 
   /** Register available tools (list of JSON schema strings). */
   equipTools(tools: string[]): void {
-    this._appendPending(_toolUse.equip(this._handle, tools));
+    this._appendPending(_toolUse.equip(this._handle.model(), tools));
   }
 
   /** Provide a tool result after a tool call. */
   answerTool(name: string, value: string): void {
-    this._appendPending(_toolUse.answer(this._handle, name, value));
+    this._appendPending(_toolUse.answer(this._handle.model(), name, value));
   }
 
   // ── Low-level context operations ──

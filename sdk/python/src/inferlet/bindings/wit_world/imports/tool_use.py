@@ -8,7 +8,6 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import context
 from ..imports import model
 from ..imports import inference
 
@@ -47,14 +46,14 @@ class Decoder:
 
 
 
-def equip(ctx: context.Context, tools: List[str]) -> None:
+def equip(model: model.Model, tools: List[str]) -> List[int]:
     """
     Register available tools (list of JSON schema strings)
     
     Raises: `wit_world.types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
-def answer(ctx: context.Context, name: str, value: str) -> None:
+def answer(model: model.Model, name: str, value: str) -> List[int]:
     """
     Provide a tool result (after a tool-call reply)
     """

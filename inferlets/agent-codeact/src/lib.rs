@@ -10,6 +10,18 @@ use inferlet::{
     Context, inference::Sampler, model::Model,
     runtime, Result,
 };
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_num_function_calls")]
+    num_function_calls: u32,
+    #[serde(default = "default_tokens_between_calls")]
+    tokens_between_calls: usize,
+}
+
+fn default_num_function_calls() -> u32 { 5 }
+fn default_tokens_between_calls() -> usize { 512 }
 
 /// Result of parsing the assistant's response.
 enum CodeResult {
@@ -18,16 +30,6 @@ enum CodeResult {
     /// No code block was found, indicating the model is providing a final answer.
     FinalAnswer,
 }
-
-const HELP: &str = "\
-Usage: agent-codeact [OPTIONS]
-
-An example of CodeACT-style agentic workflows with JavaScript code execution.
-
-Options:
-  -f, --num-function-calls <N>    Number of sequential code execution cycles [default: 5]
-  -t, --tokens-between-calls <N>  Max tokens for each generation step [default: 512]
-  -h, --help                      Prints help information";
 
 const SYSTEM_PROMPT: &str = "\
 You are CodeACT, a highly intelligent AI assistant that solves problems by writing \
@@ -73,20 +75,9 @@ steps or generate multiple code blocks at once.";
 const USER_PROMPT: &str = "Calculate the sum of the first 10 prime numbers.";
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let num_function_calls: u32 = args
-        .value_from_str(["-f", "--num-function-calls"])
-        .unwrap_or(5);
-    let tokens_between_calls: usize = args
-        .value_from_str(["-t", "--tokens-between-calls"])
-        .unwrap_or(512);
+async fn main(input: Input) -> Result<String> {
+    let num_function_calls = input.num_function_calls;
+    let tokens_between_calls = input.tokens_between_calls;
 
     let models = runtime::models();
     let model_name = models.first().ok_or("No models available")?;

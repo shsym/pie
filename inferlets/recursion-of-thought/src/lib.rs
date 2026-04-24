@@ -9,22 +9,27 @@ use inferlet::{
     Context, inference::Sampler, model::Model,
     runtime, Result,
 };
+use serde::Deserialize;
 
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: rot [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_question")]
+    question: String,
+    #[serde(default = "default_max_depth")]
+    max_depth: usize,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default)]
+    verbose: bool,
+}
 
-A program to solve a problem using a recursive divide-and-conquer strategy (Recursion-of-Thought).
-
-Options:
-  -q, --question <TEXT>   The initial question to solve [default: \"What is the sum of 123456789 and 987654321?\"]
-  -d, --max-depth <NUM>   The maximum recursion depth [default: 5]
-  -t, --max-tokens <NUM>  The max tokens to generate at each step [default: 128]
-  -v, --verbose           Print intermediate messages during recursion
-  -h, --help              Prints this help message";
+fn default_question() -> String { "Please calculate the expression (42 + 3) * 5 / 15.".to_string() }
+fn default_max_depth() -> usize { 5 }
+fn default_max_tokens() -> usize { 128 }
 
 /// Prints a message only if verbose mode is enabled.
 macro_rules! verbose_println {
@@ -198,23 +203,11 @@ fn divide_and_conquer<'a>(
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let question: String = args
-        .value_from_str(["-q", "--question"])
-        .unwrap_or_else(|_| "Please calculate the expression (42 + 3) * 5 / 15.".to_string());
-
-    let max_depth: usize = args.value_from_str(["-d", "--max-depth"]).unwrap_or(5);
-
-    let max_tokens: usize = args.value_from_str(["-t", "--max-tokens"]).unwrap_or(128);
-
-    let verbose: bool = args.contains(["-v", "--verbose"]);
+async fn main(input: Input) -> Result<String> {
+    let question = input.question;
+    let max_depth = input.max_depth;
+    let max_tokens = input.max_tokens;
+    let verbose = input.verbose;
 
     let start_time = Instant::now();
     println!("--- Initializing Model and Context ---");

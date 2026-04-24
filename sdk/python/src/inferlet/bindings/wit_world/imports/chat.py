@@ -8,7 +8,6 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import context
 from ..imports import model
 
 
@@ -51,21 +50,21 @@ class Decoder:
 
 
 
-def system(ctx: context.Context, message: str) -> None:
+def system(model: model.Model, message: str) -> List[int]:
     """
     Fill roles for history replay
     """
     raise NotImplementedError
-def user(ctx: context.Context, message: str) -> None:
+def user(model: model.Model, message: str) -> List[int]:
     raise NotImplementedError
-def assistant(ctx: context.Context, message: str) -> None:
+def assistant(model: model.Model, message: str) -> List[int]:
     raise NotImplementedError
-def cue(ctx: context.Context) -> None:
+def cue(model: model.Model) -> List[int]:
     """
     Cue the model to generate (fills generation header)
     """
     raise NotImplementedError
-def seal(ctx: context.Context) -> None:
+def seal(model: model.Model) -> List[int]:
     """
     Seal the current turn (insert stop token)
     """

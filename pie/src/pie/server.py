@@ -275,6 +275,8 @@ def _bootstrap(
             min_batch_for_optimization=8,
         ),
         default_token_budget=model.default_token_budget,
+        default_endowment_pages=model.default_endowment_pages,
+        oversubscription_factor=model.oversubscription_factor,
     )
 
     rust_config = pie_runtime.Config(

@@ -7,15 +7,15 @@ use image::{DynamicImage, load_from_memory};
 use inferlet::wstd::http::{Client, Method, Request};
 use inferlet::wstd::io::{AsyncRead, empty};
 use inferlet::Result;
+use serde::Deserialize;
 
-const HELP: &str = "\
-Usage: image-fetch [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_url")]
+    url: String,
+}
 
-A program to fetch and decode an image from a URL.
-
-Options:
-  -u, --url <URL>  The URL of the image to fetch [default: https://www.ilankelman.org/stopsigns/australia.jpg]
-  -h, --help       Prints this help message";
+fn default_url() -> String { "https://www.ilankelman.org/stopsigns/australia.jpg".to_string() }
 
 /// Asynchronously fetches an image from the given URL.
 pub async fn fetch_image(url: &str) -> Result<DynamicImage> {
@@ -39,17 +39,8 @@ pub async fn fetch_image(url: &str) -> Result<DynamicImage> {
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let url: String = args
-        .value_from_str(["-u", "--url"])
-        .unwrap_or_else(|_| "https://www.ilankelman.org/stopsigns/australia.jpg".to_string());
+async fn main(input: Input) -> Result<String> {
+    let url = input.url;
 
     println!("Fetching image from: {}", url);
     let image = fetch_image(&url).await?;

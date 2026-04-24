@@ -9,20 +9,25 @@ use inferlet::{
     Context, inference::Sampler, model::Model,
     runtime, Result,
 };
+use serde::Deserialize;
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: skeleton-of-thought [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_question")]
+    question: String,
+    #[serde(default = "default_num_points")]
+    num_points: usize,
+    #[serde(default = "default_plan_tokens")]
+    plan_tokens: usize,
+    #[serde(default = "default_elab_tokens")]
+    elab_tokens: usize,
+}
 
-A program that first generates a plan (a list of key points) for a question,
-and then elaborates on each point concurrently.
-
-Options:
-  -q, --question <TEXT>        The question to answer [default: What are the defining characteristics of Rome?]
-  -p, --num-points <POINTS>    Sets the maximum number of key points to generate in the plan [default: 3]
-  -t, --plan-tokens <TOKENS>   Sets the max tokens for the planning generation [default: 256]
-  -e, --elab-tokens <TOKENS>   Sets the max tokens for each elaboration generation [default: 256]
-  -h, --help                   Prints this help message";
+fn default_question() -> String { "What are the defining characteristics of Rome?".to_string() }
+fn default_num_points() -> usize { 3 }
+fn default_plan_tokens() -> usize { 256 }
+fn default_elab_tokens() -> usize { 256 }
 
 
 /// Generates a high-level plan and elaborates on each point in parallel.
@@ -90,21 +95,11 @@ async fn plan_and_generate_parallel(
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let question: String = args
-        .value_from_str(["-q", "--question"])
-        .unwrap_or_else(|_| "What are the defining characteristics of Rome?".to_string());
-
-    let num_points: usize = args.value_from_str(["-p", "--num-points"]).unwrap_or(3);
-    let plan_max_tokens: usize = args.value_from_str(["-t", "--plan-tokens"]).unwrap_or(256);
-    let elab_max_tokens: usize = args.value_from_str(["-e", "--elab-tokens"]).unwrap_or(256);
+async fn main(input: Input) -> Result<String> {
+    let question = input.question;
+    let num_points = input.num_points;
+    let plan_max_tokens = input.plan_tokens;
+    let elab_max_tokens = input.elab_tokens;
 
     let start = Instant::now();
 
