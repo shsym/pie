@@ -30,8 +30,10 @@ export async function main(args: string[]) {
     await stream
         .on('thinking', text => session.send(text))
         .on('text', text => { session.send(text); output += text; })
-        .on('done', () => session.send('\n[done]'))
         .run();
 
+    // Mirror python-example: emit [done] unconditionally after the stream.
+    // The 'done' chat event doesn't fire if the model produces zero tokens.
+    session.send('\n[done]');
     return output;
 }

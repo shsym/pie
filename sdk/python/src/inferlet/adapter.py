@@ -10,8 +10,6 @@ from typing import TYPE_CHECKING
 
 from wit_world.imports import adapter as _adapter
 
-from ._async import await_future
-
 if TYPE_CHECKING:
     from .model import Model
 
@@ -26,11 +24,10 @@ class Adapter:
         adapter.save("/path/to/output")
     """
 
-    __slots__ = ("_handle", "_locked")
+    __slots__ = ("_handle",)
 
     def __init__(self, handle: _adapter.Adapter) -> None:
         self._handle = handle
-        self._locked = False
 
     @staticmethod
     def create(model: Model, name: str) -> Adapter:
@@ -49,19 +46,6 @@ class Adapter:
         """Fork this adapter with a new name."""
         return Adapter(self._handle.fork(new_name))
 
-    async def acquire_lock(self) -> bool:
-        """Acquire an exclusive lock on this adapter."""
-        future = self._handle.acquire_lock()
-        result = await await_future(future, "Adapter lock failed")
-        if result:
-            self._locked = True
-        return result
-
-    def release_lock(self) -> None:
-        """Release the lock on this adapter."""
-        self._handle.release_lock()
-        self._locked = False
-
     def load(self, path: str) -> None:
         """Load adapter weights from a file path."""
         self._handle.load(path)
@@ -74,8 +58,7 @@ class Adapter:
         return self
 
     def __exit__(self, *args) -> None:
-        if self._locked:
-            self.release_lock()
+        pass
 
     def __repr__(self) -> str:
         return f"Adapter({id(self._handle):#x})"

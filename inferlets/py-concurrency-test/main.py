@@ -36,7 +36,7 @@ async def generate(ctx: Context, label: str) -> None:
     session.send(msg)
 
 
-async def main():
+async def main(input: dict) -> None:
     model = Model.load(runtime.models()[0])
 
     # Two separate contexts with different prompts

@@ -14,19 +14,25 @@ use inferlet::{
     ForwardPassExt, Result,
     inference::{ForwardPass, Output, Sampler},
 };
+use serde::Deserialize;
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: attention-sink [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_sink_size")]
+    sink_size: u32,
+    #[serde(default = "default_window_size")]
+    window_size: u32,
+}
 
-A program to demonstrate attention sink with bounded KV cache.
-
-Options:
-  -p, --prompt <PROMPT>        The prompt text [default: \"Tell me a long story about a cat.\"]
-  -n, --max-tokens <TOKENS>    Maximum number of tokens to generate [default: 512]
-  -s, --sink-size <SIZE>       Number of initial sink tokens to preserve [default: 4]
-  -w, --window-size <SIZE>     Sliding window size in tokens [default: 64]
-  -h, --help                   Prints this help message";
+fn default_prompt() -> String { "Tell me a long story about a cat.".to_string() }
+fn default_max_tokens() -> usize { 512 }
+fn default_sink_size() -> u32 { 4 }
+fn default_window_size() -> u32 { 64 }
 
 /// Build a BRLE attention mask for attention sink with sliding window.
 ///
@@ -50,20 +56,11 @@ fn build_sink_mask(seq_len: u32, sink_size: u32, window_size: u32) -> Vec<u32> {
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let prompt: String = args
-        .value_from_str(["-p", "--prompt"])
-        .unwrap_or_else(|_| "Tell me a long story about a cat.".to_string());
-    let max_tokens: usize = args.value_from_str(["-n", "--max-tokens"]).unwrap_or(512);
-    let sink_size: u32 = args.value_from_str(["-s", "--sink-size"]).unwrap_or(4);
-    let window_size: u32 = args.value_from_str(["-w", "--window-size"]).unwrap_or(64);
+async fn main(input: Input) -> Result<String> {
+    let prompt = input.prompt;
+    let max_tokens = input.max_tokens;
+    let sink_size = input.sink_size;
+    let window_size = input.window_size;
 
     let start = Instant::now();
     let models = runtime::models();

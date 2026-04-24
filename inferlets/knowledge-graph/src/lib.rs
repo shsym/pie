@@ -12,18 +12,19 @@
 use inferlet::{Context, Result, inference::Sampler, model::Model, runtime};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-const HELP: &str = "\
-Usage: knowledge-graph [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_depth")]
+    depth: usize,
+}
 
-Extracts a knowledge graph from text using an LLM and petgraph,
-then answers a question using the graph as context.
-
-Options:
-  -t, --max-tokens <N>  Max tokens per generation step [default: 2048]
-  -d, --depth <N>       Graph traversal depth for fact retrieval [default: 3]
-  -h, --help            Prints help information";
+fn default_max_tokens() -> usize { 2048 }
+fn default_depth() -> usize { 3 }
 
 const PASSAGE: &str = "\
 France is a country in Western Europe. Paris is the capital of France. \
@@ -146,16 +147,9 @@ fn retrieve_facts(
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let max_tokens: usize = args.value_from_str(["-t", "--max-tokens"]).unwrap_or(2048);
-    let depth: usize = args.value_from_str(["-d", "--depth"]).unwrap_or(3);
+async fn main(input: Input) -> Result<String> {
+    let max_tokens = input.max_tokens;
+    let depth = input.depth;
 
     let models = runtime::models();
     let model_name = models.first().ok_or("No models available")?;

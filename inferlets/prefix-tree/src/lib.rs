@@ -20,28 +20,19 @@ use inferlet::{
     Result,
     inference::Sampler,
 };
+use serde::Deserialize;
 
-const HELP: &str = "\
-Usage: prefix_tree [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_num_tokens")]
+    num_tokens: usize,
+}
 
-A program to test prefix tree caching by generating text from 8 related prompts.
-
-Options:
-  -n, --num-tokens <TOKENS>  Sets the number of tokens to generate for each prompt [default: 128]
-  -h, --help                 Prints this help message
-";
+fn default_num_tokens() -> usize { 128 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let max_num_outputs_per_prompt: usize =
-        args.value_from_str(["-n", "--num-tokens"]).unwrap_or(128);
+async fn main(input: Input) -> Result<String> {
+    let max_num_outputs_per_prompt = input.num_tokens;
 
     let start = std::time::Instant::now();
 

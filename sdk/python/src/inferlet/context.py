@@ -505,23 +505,23 @@ class Context:
 
     def system(self, message: str) -> None:
         """Fill a system message."""
-        self._pending_tokens.extend(_chat.system(self._handle, message))
+        self._pending_tokens.extend(_chat.system(self._model._handle, message))
 
     def user(self, message: str) -> None:
         """Fill a user message."""
-        self._pending_tokens.extend(_chat.user(self._handle, message))
+        self._pending_tokens.extend(_chat.user(self._model._handle, message))
 
     def assistant(self, message: str) -> None:
         """Fill a (previous) assistant message."""
-        self._pending_tokens.extend(_chat.assistant(self._handle, message))
+        self._pending_tokens.extend(_chat.assistant(self._model._handle, message))
 
     def cue(self) -> None:
         """Cue the model to generate (fills the generation header)."""
-        self._pending_tokens.extend(_chat.cue(self._handle))
+        self._pending_tokens.extend(_chat.cue(self._model._handle))
 
     def seal(self) -> None:
         """Seal the current turn (inserts stop token)."""
-        self._pending_tokens.extend(_chat.seal(self._handle))
+        self._pending_tokens.extend(_chat.seal(self._model._handle))
 
     def stop_tokens(self) -> list[int]:
         """Get the stop token IDs for this model."""
@@ -531,11 +531,11 @@ class Context:
 
     def equip_tools(self, tools: list[str]) -> None:
         """Register available tools (list of JSON schema strings)."""
-        self._pending_tokens.extend(_tool.equip(self._handle, tools))
+        self._pending_tokens.extend(_tool.equip(self._model._handle, tools))
 
     def answer_tool(self, name: str, value: str) -> None:
         """Provide a tool call result."""
-        self._pending_tokens.extend(_tool.answer(self._handle, name, value))
+        self._pending_tokens.extend(_tool.answer(self._model._handle, name, value))
 
     # --- Generate (ContextExt) ---
 

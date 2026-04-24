@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 inferlet = { path = "../../sdk/rust/inferlet" }
 evalexpr = "11.3"
 chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
 
 [profile.release]
 lto = true

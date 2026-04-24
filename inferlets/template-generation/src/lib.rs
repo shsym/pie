@@ -13,21 +13,22 @@ use inferlet::{
     Context, GrammarConstraint, Result, inference::Sampler, model::Model, runtime,
 };
 use minijinja::Environment;
+use serde::Deserialize;
 use serde_json::Value;
 
-const HELP: &str = "\
-Usage: template-generation [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default = "default_max_retries")]
+    max_retries: u32,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+}
 
-Generates structured JSON from an LLM with grammar-constrained decoding,
-validates it against a JSON Schema, then renders it through a Jinja2-style
-template using minijinja.
-
-Options:
-  -p, --prompt <STRING>      The product/topic to generate content for
-                             [default: an AI-powered code editor]
-  -r, --max-retries <N>      Maximum generation/render retry cycles [default: 3]
-  -t, --max-tokens <N>       Max tokens per generation attempt [default: 1024]
-  -h, --help                 Prints help information";
+fn default_prompt() -> String { "an AI-powered code editor".to_string() }
+fn default_max_retries() -> u32 { 3 }
+fn default_max_tokens() -> usize { 1024 }
 
 const TEMPLATE: &str = r#"
 ========================================
@@ -148,19 +149,10 @@ fn render(data: &Value) -> std::result::Result<String, String> {
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let prompt: String = args
-        .value_from_str(["-p", "--prompt"])
-        .unwrap_or_else(|_| "an AI-powered code editor".to_string());
-    let max_retries: u32 = args.value_from_str(["-r", "--max-retries"]).unwrap_or(3);
-    let max_tokens: usize = args.value_from_str(["-t", "--max-tokens"]).unwrap_or(1024);
+async fn main(input: Input) -> Result<String> {
+    let prompt = input.prompt;
+    let max_retries = input.max_retries;
+    let max_tokens = input.max_tokens;
 
     let schema_value: Value =
         serde_json::from_str(PRODUCT_SCHEMA).map_err(|e| format!("Schema parse error: {e}"))?;

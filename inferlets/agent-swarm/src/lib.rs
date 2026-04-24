@@ -10,25 +10,22 @@ use inferlet::{
     Result,
     inference::Sampler,
 };
+use serde::Deserialize;
 
-const HELP: &str = "\
-Usage: agent-swarm <role> [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    role: String,
+    #[serde(default = "default_group_id")]
+    group_id: u32,
+    #[serde(default = "default_tokens_per_step")]
+    tokens_per_step: usize,
+    #[serde(default = "default_prompt")]
+    prompt: String,
+}
 
-A single agent worker for a collaborative story-writing pipeline.
-
-Arguments:
-  <role>    The role of the agent. Must be one of:
-            - idea_generator
-            - plot_developer
-            - character_creator
-            - dialogue_writer
-
-Options:
-  -g, --group-id <ID>         The pipeline/group ID for this agent instance [default: 0]
-  -t, --tokens-per-step <N>   Max new tokens this agent should generate [default: 512]
-  -p, --prompt <PROMPT>       The prompt to send to the agent
-                              [default: \"A story about day dreaming in a park\"]
-  -h, --help                  Prints this help message";
+fn default_group_id() -> u32 { 0 }
+fn default_tokens_per_step() -> usize { 512 }
+fn default_prompt() -> String { "A story about day dreaming in a park".to_string() }
 
 struct AgentConfig {
     #[allow(dead_code)]
@@ -91,21 +88,10 @@ fn get_agent_config(role: &str) -> Result<AgentConfig> {
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let my_role: String = args
-        .free_from_str()
-        .map_err(|_| format!("Missing required <role> argument.\n\n{}", HELP))?;
-    let group_id: u32 = args.value_from_str(["-g", "--group-id"]).unwrap_or(0);
-    let tokens_per_step: usize = args
-        .value_from_str(["-t", "--tokens-per-step"])
-        .unwrap_or(512);
+async fn main(input: Input) -> Result<String> {
+    let my_role = input.role;
+    let group_id = input.group_id;
+    let tokens_per_step = input.tokens_per_step;
 
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
@@ -123,10 +109,7 @@ async fn main(args: Vec<String>) -> Result<String> {
         );
         (prompt, accumulated)
     } else {
-        let initial_prompt = args
-            .value_from_str(["-p", "--prompt"])
-            .unwrap_or("A story about day dreaming in a park".to_string());
-        (initial_prompt, String::new())
+        (input.prompt, String::new())
     };
 
     let mut ctx = Context::new(&model)?;

@@ -9,43 +9,65 @@ import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import model
-from ..imports import pie_core_types
 
 class Context:
     
     @classmethod
-    def create(cls, model: model.Model, name: str, fill: Optional[List[int]]) -> Self:
+    def create(cls, model: model.Model) -> Self:
         """
-        Creates a new context, optionally with a name
+        Creates a fresh empty context
+        
+        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    @classmethod
+    def open(cls, model: model.Model, name: str) -> Self:
+        """
+        Opens a snapshot (implicit fork — snapshot stays immutable, working pages are copied)
+        
+        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    @classmethod
+    def take(cls, model: model.Model, name: str) -> Self:
+        """
+        Takes ownership of a snapshot (snapshot is deleted, GPU pages transfer without copy)
+        
+        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    @classmethod
+    def delete(cls, model: model.Model, name: str) -> None:
+        """
+        Deletes a saved snapshot by name
+        
+        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    def fork(self) -> Self:
+        """
+        Forks into a new anonymous context (working pages are copied via GPU D2D or CPU H2D)
+        
+        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    def save(self, name: str) -> None:
+        """
+        Named save — snapshots committed chain + working pages under a user-chosen name
+        
+        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    def snapshot(self) -> str:
+        """
+        Anonymous save — snapshots committed chain + working pages, returns runtime-generated name
         
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def destroy(self) -> None:
-        raise NotImplementedError
-    @classmethod
-    def lookup(cls, model: model.Model, name: str) -> Optional[Self]:
         """
-        Retrieves an existing context by name
-        """
-        raise NotImplementedError
-    def fork(self, new_name: str) -> Self:
-        """
-        Forks this context into a new one with the given name
-        
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def acquire_lock(self) -> pie_core_types.FutureBool:
-        """
-        Acquires a lock on the context, returning a lock result
-        """
-        raise NotImplementedError
-    def release_lock(self) -> None:
-        """
-        Releases the lock
-        
-        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        Force-destroys immediately
         """
         raise NotImplementedError
     def tokens_per_page(self) -> int:
@@ -62,36 +84,53 @@ class Context:
         raise NotImplementedError
     def working_page_count(self) -> int:
         """
-        Number of working KV pages in the context
+        Number of working KV pages (based on buffered tokens in the resource handle)
         """
         raise NotImplementedError
     def commit_working_pages(self, num_pages: int) -> None:
         """
-        Commit the KV pages to the context
+        Commit working KV pages to the context
         
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def reserve_working_pages(self, num_pages: int) -> None:
         """
-        Reserve KV pages for the context
+        Reserve additional working GPU pages for the context
         
         Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def release_working_pages(self, num_pages: int) -> None:
         """
-        Release KV pages from the context
+        Release working GPU pages from the context
         """
         raise NotImplementedError
     def working_page_token_count(self) -> int:
         """
-        Number of tokens in working pages (filled but not committed)
+        Number of tokens in working pages (filled via forward pass but not yet committed)
         """
         raise NotImplementedError
     def truncate_working_page_tokens(self, num_tokens: int) -> None:
         """
-        Remove the last N tokens from working pages
+        Remove the last N tokens from working pages (for rollback, e.g. speculative rejection)
+        """
+        raise NotImplementedError
+    def suspend(self) -> None:
+        """
+        ── Market operations ──────────────────────────────────────
+        Suspend this context (release pages, stop rent).
+        Restoration is system-driven: highest-bid suspended contexts
+        are restored when memory frees up.
+        
+        Raises: `wit_world.types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    def bid(self, value: float) -> None:
+        """
+        Set bid: willingness to pay per page per step.
+        Drives suspension priority, restoration priority, and compute priority.
+        0.0 = use default (truthful) bidding.
         """
         raise NotImplementedError
     def __enter__(self) -> Self:

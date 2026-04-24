@@ -8,7 +8,7 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import pie_core_types
+
 
 
 def version() -> str:
@@ -29,13 +29,5 @@ def username() -> str:
 def models() -> List[str]:
     """
     Get a list of all available model names
-    """
-    raise NotImplementedError
-def spawn(package_name: str, args: List[str]) -> pie_core_types.FutureString:
-    """
-    Spawns a new inferlet with the given package name and arguments
-    Returns the result of the spawned inferlet
-    
-    Raises: `wit_world.types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError

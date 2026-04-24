@@ -8,15 +8,11 @@ use inferlet::{
     ForwardPassExt, Result,
     inference::{ForwardPass, Output, Sampler},
 };
+use serde::Deserialize;
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: output-validation [OPTIONS]
-
-A program to validate and rank candidate outputs based on their generation probability.
-
-Options:
-  -h, --help  Prints this help message";
+#[derive(Deserialize)]
+struct Input {}
 
 /// Calculates the normalized probability of a list of candidate strings being generated
 /// from a given context.
@@ -130,14 +126,7 @@ pub async fn validate_outputs(
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
+async fn main(_input: Input) -> Result<String> {
     let start = Instant::now();
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;

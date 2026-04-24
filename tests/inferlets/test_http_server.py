@@ -54,7 +54,7 @@ async def test_http_server(client, args):
     # Install
     manifest = tomllib.loads(manifest_path.read_text())
     inferlet_id = f"{manifest['package']['name']}@{manifest['package']['version']}"
-    await client.install_program(wasm_path, manifest_path)
+    await client.install_program(wasm_path, manifest_path, force_overwrite=True)
 
     # Launch daemon on a free port
     port = _find_free_port()

@@ -83,11 +83,21 @@ async def run_inferlet(
     if extra_args is None:
         extra_args = []
     wasm_name = name.replace("-", "_")
-    wasm_path = INFERLETS_DIR / name / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm"
-    manifest_path = INFERLETS_DIR / name / "Pie.toml"
+    # Rust: cargo emits to target/wasm32-wasip2/{release,debug}/<name>.wasm
+    # JS (bakery build) / Python (componentize-py): flat target/<name>.wasm
+    inferlet_dir = INFERLETS_DIR / name
+    candidates = [
+        inferlet_dir / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
+        inferlet_dir / "target" / f"{wasm_name}.wasm",
+    ]
+    wasm_path = next((p for p in candidates if p.exists()), None)
+    manifest_path = inferlet_dir / "Pie.toml"
 
-    if not wasm_path.exists():
-        raise FileNotFoundError(f"No WASM binary at {wasm_path}")
+    if wasm_path is None:
+        raise FileNotFoundError(
+            f"No WASM binary for {name} (tried: {', '.join(str(p) for p in candidates)})"
+        )
     if not manifest_path.exists():
         raise FileNotFoundError(f"No Pie.toml at {manifest_path}")
 
@@ -106,7 +116,9 @@ async def run_inferlet(
             if time.time() - start > timeout:
                 raise RuntimeError("TIMEOUT")
             event, msg = await asyncio.wait_for(process.recv(), timeout=timeout)
-            if event == Event.Stdout:
+            if event in (Event.Stdout, Event.Message):
+                # Message = session.send() from inside the inferlet (JS/Python SDKs
+                # emit their output there rather than to stdout).
                 output_parts.append(msg)
             elif event == Event.Return:
                 output_parts.append(msg)

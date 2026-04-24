@@ -11,19 +11,22 @@ use inferlet::{
     Context, inference::Sampler, model::Model,
     runtime, Result,
 };
+use serde::Deserialize;
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: graph-of-thought [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_question")]
+    question: String,
+    #[serde(default = "default_proposal_tokens")]
+    proposal_tokens: Vec<usize>,
+    #[serde(default = "default_aggregation_tokens")]
+    aggregation_tokens: usize,
+}
 
-A program to test hierarchical aggregation by generating and combining multiple proposals for a given question.
-
-Options:
-  --question <QUESTION>          The question to process [default: Calculate (42 + 3) * 5 / 15.]
-  --proposal-tokens <TOKENS>     Comma-separated list of max tokens for initial proposals
-                                 [default: 256,256,256,256,256,256,256,256]
-  --aggregation-tokens <TOKENS>  Max tokens for each aggregation step [default: 256]
-  -h, --help                     Prints this help message";
+fn default_question() -> String { "Calculate (42 + 3) * 5 / 15.".to_string() }
+fn default_proposal_tokens() -> Vec<usize> { vec![256, 256, 256, 256, 256, 256, 256, 256] }
+fn default_aggregation_tokens() -> usize { 256 }
 
 const SYSTEM_PROMPT: &str = "You are a helpful, respectful and honest assistant.";
 
@@ -122,29 +125,10 @@ async fn run_hierarchical_aggregation(
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let question: String = args
-        .value_from_str("--question")
-        .unwrap_or_else(|_| "Calculate (42 + 3) * 5 / 15.".to_string());
-
-    let proposal_tokens_str: String = args
-        .value_from_str("--proposal-tokens")
-        .unwrap_or_else(|_| "256,256,256,256,256,256,256,256".to_string());
-
-    let proposal_tokens: Vec<usize> = proposal_tokens_str
-        .split(',')
-        .map(|s| s.trim().parse::<usize>())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to parse proposal tokens: {}", e))?;
-
-    let aggregation_tokens: usize = args.value_from_str("--aggregation-tokens").unwrap_or(256);
+async fn main(input: Input) -> Result<String> {
+    let question = input.question;
+    let proposal_tokens = input.proposal_tokens;
+    let aggregation_tokens = input.aggregation_tokens;
 
     let start = Instant::now();
     println!(

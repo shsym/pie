@@ -5,7 +5,7 @@ from conftest import run_inferlet, run_tests
 async def test_template_generation(client, args):
     output = await run_inferlet(
         client, "template-generation",
-        ["--max-tokens", "1024"],
+        {"max_tokens": 1024},
         timeout=max(args.timeout, 300),
     )
     assert "Attempt 1/" in output, "Missing attempt header"

@@ -6,20 +6,22 @@
 
 use futures::future;
 use inferlet::{Context, Result, inference::Sampler, model::Model, runtime};
+use serde::Deserialize;
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: best-of-n [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_question")]
+    question: String,
+    #[serde(default = "default_num_candidates")]
+    num_candidates: usize,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+}
 
-Generates N candidate responses in parallel and selects the most
-central one using string similarity (self-consistency).
-
-Options:
-  -q, --question <TEXT>        The question to answer
-                               [default: What is 17 * 24 + 13?]
-  -n, --num-candidates <N>     Number of parallel candidates [default: 5]
-  -t, --max-tokens <N>         Max tokens per candidate [default: 1024]
-  -h, --help                   Prints help information";
+fn default_question() -> String { "What is 17 * 24 + 13?".to_string() }
+fn default_num_candidates() -> usize { 5 }
+fn default_max_tokens() -> usize { 1024 }
 
 const SYSTEM_PROMPT: &str = "\
 You are a helpful assistant that solves problems step by step. \
@@ -27,19 +29,10 @@ Show your reasoning, then give your final answer on the last line \
 in the format: Final Answer: <answer>";
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let question: String = args
-        .value_from_str(["-q", "--question"])
-        .unwrap_or_else(|_| "What is 17 * 24 + 13?".to_string());
-    let num_candidates: usize = args.value_from_str(["-n", "--num-candidates"]).unwrap_or(5);
-    let max_tokens: usize = args.value_from_str(["-t", "--max-tokens"]).unwrap_or(1024);
+async fn main(input: Input) -> Result<String> {
+    let question = input.question;
+    let num_candidates = input.num_candidates;
+    let max_tokens = input.max_tokens;
 
     let start = Instant::now();
 

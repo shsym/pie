@@ -9,18 +9,22 @@ use inferlet::{
     Context, inference::Sampler, model::Model,
     runtime, Result,
 };
+use serde::Deserialize;
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: tree_of_thought [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_question")]
+    question: String,
+    #[serde(default = "default_num_branches")]
+    num_branches: usize,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+}
 
-A program to perform a 3-level tree of thought (Propose, Execute, Reflect) search.
-
-Options:
-  -q, --question <TEXT>        The question to solve [default: Calculate (42 + 3) * 5 / 15.]
-  -b, --num-branches <INT>     Number of branches at each level of the tree [default: 2]
-  -t, --max-tokens <INT>       Max new tokens to generate at each step [default: 512]
-  -h, --help                   Prints this help message";
+fn default_question() -> String { "Calculate (42 + 3) * 5 / 15.".to_string() }
+fn default_num_branches() -> usize { 2 }
+fn default_max_tokens() -> usize { 512 }
 
 const PROPOSE_PROMPT_TEMPLATE: &str = "\
 Please generate a high-level plan for solving the following question. \
@@ -38,20 +42,10 @@ Please rigorously check the correctness of the calculations and the final answer
 
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let question: String = args
-        .value_from_str(["-q", "--question"])
-        .unwrap_or_else(|_| "Calculate (42 + 3) * 5 / 15.".to_string());
-
-    let num_branches: usize = args.value_from_str(["-b", "--num-branches"]).unwrap_or(2);
-    let max_tokens_per_step: usize = args.value_from_str(["-t", "--max-tokens"]).unwrap_or(512);
+async fn main(input: Input) -> Result<String> {
+    let question = input.question;
+    let num_branches = input.num_branches;
+    let max_tokens_per_step = input.max_tokens;
 
     let total_leaves = num_branches.pow(3);
     println!(

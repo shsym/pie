@@ -10,29 +10,6 @@ import weakref
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import poll
 
-class FutureBool:
-    """
-    Result of a synchronization attempt
-    """
-    
-    def pollable(self) -> poll.Pollable:
-        raise NotImplementedError
-    def get(self) -> Optional[bool]:
-        """
-        Returns a pollable for async readiness checks
-        """
-        raise NotImplementedError
-    def __enter__(self) -> Self:
-        """Returns self"""
-        return self
-                                
-    def __exit__(self, exc_type: type[BaseException] | None, exc_value: BaseException | None, traceback: TracebackType | None) -> bool | None:
-        """
-        Release this resource.
-        """
-        raise NotImplementedError
-
-
 class FutureString:
     """
     Result of an async receive operation

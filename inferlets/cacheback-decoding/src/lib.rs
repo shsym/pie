@@ -13,18 +13,22 @@ use inferlet::{
     ForwardPassExt, Result,
     inference::{ForwardPass, Output, Sampler},
 };
+use serde::Deserialize;
 use std::time::Instant;
 
-const HELP: &str = "\
-Usage: cacheback-decoding [OPTIONS]
+#[derive(Deserialize)]
+struct Input {
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_draft_length")]
+    draft_length: usize,
+}
 
-A program to demonstrate CacheBack speculative decoding with a custom drafter.
-
-Options:
-  -p, --prompt <PROMPT>      The prompt text [default: \"Explain quantum computing.\"]
-  -n, --max-tokens <TOKENS>  Maximum number of tokens to generate [default: 256]
-  -d, --draft-length <N>     Number of draft tokens per speculation round [default: 4]
-  -h, --help                 Prints this help message";
+fn default_prompt() -> String { "Explain quantum computing.".to_string() }
+fn default_max_tokens() -> usize { 256 }
+fn default_draft_length() -> usize { 4 }
 
 /// Simple greedy drafter using an independent context.
 struct GreedyDrafter {
@@ -95,19 +99,10 @@ impl GreedyDrafter {
 }
 
 #[inferlet::main]
-async fn main(args: Vec<String>) -> Result<String> {
-    let mut args = inferlet::parse_args(args);
-
-    if args.contains(["-h", "--help"]) {
-        println!("{}", HELP);
-        return Ok(String::new());
-    }
-
-    let prompt: String = args
-        .value_from_str(["-p", "--prompt"])
-        .unwrap_or_else(|_| "Explain quantum computing.".to_string());
-    let max_tokens: usize = args.value_from_str(["-n", "--max-tokens"]).unwrap_or(256);
-    let draft_length: usize = args.value_from_str(["-d", "--draft-length"]).unwrap_or(4);
+async fn main(input: Input) -> Result<String> {
+    let prompt = input.prompt;
+    let max_tokens = input.max_tokens;
+    let draft_length = input.draft_length;
 
     let start = Instant::now();
     let models = runtime::models();

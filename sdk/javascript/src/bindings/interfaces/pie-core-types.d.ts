@@ -12,18 +12,6 @@ export class FutureBlob {
   get(): Blob | undefined;
 }
 
-export class FutureBool {
-  /**
-   * This type does not have a public constructor.
-   */
-  private constructor();
-  pollable(): Pollable;
-  /**
-  * Returns a pollable for async readiness checks
-  */
-  get(): boolean | undefined;
-}
-
 export class FutureString {
   /**
    * This type does not have a public constructor.

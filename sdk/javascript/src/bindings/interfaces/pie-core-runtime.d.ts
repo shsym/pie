@@ -15,10 +15,4 @@ export function username(): string;
  * Get a list of all available model names
  */
 export function models(): Array<string>;
-/**
- * Spawns a new inferlet with the given package name and arguments
- * Returns the result of the spawned inferlet
- */
-export function spawn(packageName: string, args: Array<string>): FutureString;
 export type Error = import('./pie-core-types.js').Error;
-export type FutureString = import('./pie-core-types.js').FutureString;

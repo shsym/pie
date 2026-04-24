@@ -84,7 +84,7 @@ async def test_openresponses(client, args):
     # Install
     manifest = tomllib.loads(manifest_path.read_text())
     inferlet_id = f"{manifest['package']['name']}@{manifest['package']['version']}"
-    await client.install_program(wasm_path, manifest_path)
+    await client.install_program(wasm_path, manifest_path, force_overwrite=True)
 
     # Launch daemon on a free port
     port = _find_free_port()
@@ -115,7 +115,9 @@ async def test_openresponses(client, args):
         assert item.get("role") == "assistant"
         assert isinstance(item.get("content"), list) and len(item["content"]) > 0
         assert item["content"][0].get("type") == "output_text"
-        assert len(item["content"][0].get("text", "")) > 0
+        assert "text" in item["content"][0]
+        if not args.dummy:
+            assert len(item["content"][0]["text"]) > 0
 
         # --- Content-Type header ---
         resp = await http.post(f"{base}/responses", json={
@@ -173,7 +175,9 @@ async def test_openresponses(client, args):
         })
         assert resp.status_code == 200
         body = resp.json()
-        assert body.get("status") == "incomplete"
+        if not args.dummy:
+            # Dummy mode produces 0 tokens, so status is "completed" not "incomplete"
+            assert body.get("status") == "incomplete"
 
         # --- Developer role ---
         resp = await http.post(f"{base}/responses", json={
@@ -228,9 +232,10 @@ async def test_openresponses(client, args):
                            "response.output_item.done", "response.completed"]
         assert types[-4:] == expected_suffix, f"Wrong suffix: {types[-4:]}"
 
-        # Deltas exist
+        # Deltas exist (skipped in dummy mode where nothing is generated)
         deltas = [e for e in json_events if e.get("type") == "response.output_text.delta"]
-        assert len(deltas) > 0
+        if not args.dummy:
+            assert len(deltas) > 0
 
         # Delta concat == final text
         concat = "".join(e.get("delta", "") for e in deltas)
