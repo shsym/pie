@@ -182,8 +182,15 @@ pub struct ModelConfig {
     pub devices: Vec<DeviceConfig>,
     #[pyo3(get, set)]
     pub scheduler: SchedulerConfig,
+    /// Default compute-wallet cap. `None` = unlimited (default); `Some(n)`
+    /// caps any process launched without an explicit token_budget at `n`.
     #[pyo3(get, set)]
-    pub default_token_budget: usize,
+    pub default_token_budget: Option<usize>,
+    /// Default market endowment in KV pages.
+    #[pyo3(get, set)]
+    pub default_endowment_pages: usize,
+    #[pyo3(get, set)]
+    pub oversubscription_factor: f64,
 }
 
 #[pymethods]
@@ -195,8 +202,10 @@ impl ModelConfig {
         kv_page_size,
         tokenizer_path,
         devices,
-        default_token_budget,
+        default_token_budget = None,
         scheduler = None,
+        oversubscription_factor = 4.0,
+        default_endowment_pages = 64,
     ))]
     fn new(
         name: String,
@@ -204,8 +213,10 @@ impl ModelConfig {
         kv_page_size: usize,
         tokenizer_path: String,
         devices: Vec<DeviceConfig>,
-        default_token_budget: usize,
+        default_token_budget: Option<usize>,
         scheduler: Option<SchedulerConfig>,
+        oversubscription_factor: f64,
+        default_endowment_pages: usize,
     ) -> Self {
         ModelConfig {
             name,
@@ -215,6 +226,8 @@ impl ModelConfig {
             devices,
             scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(120, 50, 8)),
             default_token_budget,
+            default_endowment_pages,
+            oversubscription_factor,
         }
     }
 }
@@ -379,6 +392,8 @@ impl From<Config> for BootstrapConfig {
                         min_batch_for_optimization: m.scheduler.min_batch_for_optimization,
                     },
                     default_token_budget: m.default_token_budget,
+                    default_endowment_pages: m.default_endowment_pages,
+                    oversubscription_factor: m.oversubscription_factor,
                 })
                 .collect(),
             skip_tracing: false,

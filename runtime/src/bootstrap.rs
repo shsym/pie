@@ -51,9 +51,21 @@ pub struct ModelConfig {
     pub tokenizer_path: PathBuf,
     pub devices: Vec<DeviceConfig>,
     pub scheduler: SchedulerConfig,
-    /// Default token budget per process. Determines the credit endowment
-    /// (= ⌈budget / page_size⌉) and max concurrency (= ⌊total_pages / credit⌋).
-    pub default_token_budget: usize,
+    /// Default compute-wallet cap for processes that do not declare an
+    /// explicit token budget at launch. `None` = unlimited (no cap); most
+    /// deployments should leave this as `None` and let clients opt into
+    /// caps per-launch. `Some(n)` = default hard cap at `n` tokens.
+    pub default_token_budget: Option<usize>,
+    /// Default market endowment (in KV pages) assigned to processes that
+    /// do not declare an explicit token budget. One endowment unit = one
+    /// page of long-run guaranteed GPU residency under contention.
+    pub default_endowment_pages: usize,
+    /// Admission oversubscription factor: maximum allowed ratio of
+    /// `Σ endowment / total_gpu_pages`. Must be > 0. At 1.0 the provider
+    /// guarantees every admitted process its full endowment at all times;
+    /// at higher values the provider sells more entitlement than physical
+    /// capacity, betting on non-peak duty cycles (like a typical airline).
+    pub oversubscription_factor: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -133,11 +145,14 @@ pub async fn bootstrap(
         let num_gpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.total_pages).collect();
         let num_cpu_pages: Vec<usize> = cfg.devices.iter().map(|d| d.cpu_pages).collect();
 
-        // Derive credit endowment from token budget.
-        // default_credit = ⌈default_token_budget / page_size⌉  (pages per process)
-        let default_credit = cfg.default_token_budget.div_ceil(cfg.kv_page_size).max(1);
-
-        context::spawn(cfg.kv_page_size, num_gpu_pages, num_cpu_pages, default_credit);
+        context::spawn(
+            cfg.kv_page_size,
+            num_gpu_pages,
+            num_cpu_pages,
+            cfg.default_endowment_pages.max(1),
+            cfg.default_token_budget,
+            cfg.oversubscription_factor,
+        );
         inference::spawn(
             &devices,
             cfg.scheduler.request_timeout_secs,
@@ -176,9 +191,22 @@ fn verify_config(config: &Config) -> Result<()> {
             model.tokenizer_path.exists(),
             "Model {:?}: tokenizer not found at {:?}", model.name, model.tokenizer_path
         );
+        if let Some(t) = model.default_token_budget {
+            ensure!(
+                t > 0,
+                "Model {:?}: default_token_budget, when set, must be > 0 (got {})",
+                model.name, t
+            );
+        }
         ensure!(
-            model.default_token_budget > 0,
-            "Model {:?}: default_token_budget must be > 0", model.name
+            model.default_endowment_pages > 0,
+            "Model {:?}: default_endowment_pages must be > 0 (got {})",
+            model.name, model.default_endowment_pages
+        );
+        ensure!(
+            model.oversubscription_factor > 0.0 && model.oversubscription_factor.is_finite(),
+            "Model {:?}: oversubscription_factor must be > 0 and finite (got {})",
+            model.name, model.oversubscription_factor
         );
 
         for (i, dev) in model.devices.iter().enumerate() {

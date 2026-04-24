@@ -12,11 +12,11 @@ We allocate a perishable good — GPU KV-cache pages, renewed each batch step �
 
 - **Allocative efficiency.** Highest-value contexts are served each step.
 - **Truthfulness.** No context gains by misreporting its value.
-- **Conservation.** Total credits are preserved (modulo real compute cost). No bankruptcy spiral.
+- **Conservation.** Credits are exactly preserved in the market wallet; no bankruptcy spiral. Compute billing is accounted separately in the token wallet.
 - **Stability.** No evict→restore→re-evict thrashing.
 - **Simplicity.** Minimal moving parts. Analytically tractable for formal results.
 
-**Core claim.** A single mechanism — a greedy knapsack auction with critical-value payments and endowment-proportional dividends, composed with Shapley cost-sharing for prefix colocation — achieves all five properties with three equations and six API functions.
+**Core claim.** A greedy knapsack auction with critical-value payments and endowment-proportional dividends, composed with Shapley cost-sharing for prefix colocation and gated on actual contention, achieves all five properties. Compute metering is a separate, disjoint concern (the token wallet).
 
 ---
 
@@ -24,31 +24,65 @@ We allocate a perishable good — GPU KV-cache pages, renewed each batch step �
 
 ### 2.1 Entities
 
-**Process.** A wallet. Holds a credit balance and owns one or more contexts. No scheduling state of its own — a process is alive while it has at least one context.
+**Process.** Two wallets plus ownership: a credit balance (market) and a token budget (compute). Owns one or more contexts. Alive while it has at least one context.
 
-**Context.** The schedulable unit. Has a page count `n_i`, a private value `v_i` (per page, per step), and a state: ADMITTED (pages on GPU, running) or EXCLUDED (pages off GPU, idle). Each context belongs to exactly one process and draws from its balance.
+**Context.** The schedulable unit. Has a page count `n_i`, a private value `v_i` (per page, per step), and a state: ADMITTED (pages on GPU, running) or EXCLUDED (pages off GPU, idle). Each context belongs to exactly one process and draws rent from its process's credit balance.
 
 **Device.** A GPU with `C_d` page slots. Each device runs an independent auction. Multiple tiers (GPU, CPU cache) each run their own auction.
 
-### 2.2 Credits
+### 2.2 Two-Wallet Model
 
-Each credit represents one page of compute. A process admitted with token budget `T` receives an endowment:
+Each process holds **two independent wallets** that never exchange:
+
+1. **Token wallet** (`tokens_remaining`, unit: tokens). Compute/billing
+   currency. Monotonically destructive — debited by the number of tokens
+   processed on every successful forward pass. Reaching zero blocks further
+   passes. No market semantics.
+
+2. **Credit wallet** (`balance`, unit: pages). Market/scheduling currency.
+   Initialized to `endowment` at admission, then drifts via rent payments
+   and dividends. Perfectly conserved: no source or sink other than the
+   initial endowment.
+
+Given a process admitted with token budget `T`:
 
 ```
-E = ⌈T / page_size⌉   credits
+tokens_remaining  =  T                              (compute wallet)
+endowment         =  ⌈T / page_size⌉   pages        (credit wallet)
+balance           =  endowment                      (credit wallet, initial)
 ```
 
-Credits are destroyed only by the **make cost**: producing a new KV page via forward pass costs 1 credit. All other credit flows (rent, dividends) are conservative — they redistribute but do not create or destroy.
+Exhausting credits evicts the process from GPU but does not terminate it.
+Exhausting tokens terminates forward progress but does not affect market
+standing. The separation is deliberate: billing decisions (what to charge
+per token) evolve independently of scheduling decisions (who runs when).
 
 ### 2.3 Invariant
 
-At all times:
+At all times, within the population of admitted processes:
 
 ```
-Σ_i balance_i  =  Σ_i endowment_i  −  M(t)
+Σ_i balance_i  =  Σ_i endowment_i          (credit wallet, exactly)
+tokens_remaining_i  monotone non-increasing (token wallet)
 ```
 
-where `M(t)` is the cumulative make cost (total new pages ever produced across all contexts). This is an accounting identity, not an approximation.
+The credit-wallet identity is exact: rent payments and dividends are a
+partition of the same revenue, so they sum to zero globally. No cumulative
+make-cost term; no modulo caveats.
+
+### 2.4 Unit of Endowment
+
+Endowment is denominated in **KV pages** of long-run GPU residency.
+Under contention, a process's steady-state held pages equals its
+endowment share of capacity:
+
+```
+held_pages_i  =  (E_i / Σ_j E_j) × capacity     (at equilibrium)
+```
+
+So one endowment unit = one page of entitled long-run residency. This
+anchors endowment to a physical resource and makes admission decidable
+by a single integer compare (see §11).
 
 ---
 
@@ -111,32 +145,66 @@ dividend_i = (E_i / Σ_j E_j) × R
 
 ### 3.5 Net Balance Update
 
-Each step, for each context:
+Each step, for each context owned by process `p`:
 
 ```
-balance_i ← balance_i − payment_i + dividend_i − make_cost_i
+balance_p  ←  balance_p − payment_i + dividend_p
 
 where:
-    payment_i  = critical_bid_i × n_i    (if ADMITTED, else 0)
-    dividend_i   = (E_i / Σ_j E_j) × R    (always)
-    make_cost_i = max(0, total_pages_i − pages_paid_for_i)    (new pages only)
+    payment_i  = min(balance_p, critical_bid_i × n_i)   (clamped at balance)
+    dividend_p = (E_p / Σ_q E_q) × R                    (endowment share)
+    R          = Σ_i payment_i  (actually collected, not nominal)
 ```
 
-`pages_paid_for_i` is a high-water mark. Restoration after exclusion is free — the context already paid when it first produced those pages.
+The clamp prevents negative balances. Because `R` is summed from the
+*actual* debits (not the uncapped nominal payments), dividends distribute
+exactly what was collected — conservation holds even when a process defaults.
 
-### 3.6 Anti-Thrashing
+Token-wallet debits happen separately on successful forward pass completion:
 
-A context near the clearing price can oscillate between ADMITTED and EXCLUDED across consecutive steps. Each transition has a physical cost (GPU↔CPU page transfer). Three mechanisms prevent thrashing without distorting bids:
+```
+tokens_remaining_p  ←  tokens_remaining_p − num_tokens_in_pass
+```
 
-1. **Make cost.** Each restore cycle consumes credits (1 per replayed page). A thrashing context burns through its budget faster than a stable one, naturally reducing its bid and excluding it.
+### 3.6 Contention Gate
 
-2. **FCFS tiebreaker.** At equal bids, the eviction victim is the context whose owning process was spawned most recently. Incumbents have deterministic priority — no bid inflation needed.
+The auction charges rent **only when the device is contended**:
 
-3. **Admission check.** A suspended context is only restored when the device has enough free pages for working + replay + deferred ops, the process can afford the deferred ops' make cost, and the process can afford at least one step of rent at the current clearing price.
+```
+contended  ≡  device_full  ∨  ¬restore_queue.is_empty()  ∨  ¬alloc_queue.is_empty()
 
-4. **Default eviction.** Each tick, contexts whose process cannot afford full rent are flagged `defaulted`. Defaulted contexts are evicted first, regardless of bid. While suspended, the process accumulates dividends; the context is restored only when the balance recovers enough to pay rent.
+clearing_price_d  =  min(b_i : i ∈ GPU-resident on d)   if contended
+                  =  0                                    otherwise
+```
 
-**Property:** Anti-thrashing is achieved without modifying the bid signal. The auction uses raw bids; stability comes from economic cost (make cost), deterministic tiebreaking (FCFS), and automatic default enforcement.
+Without displacement pressure, the critical value is zero — no process
+faces eviction, so no one owes rent. This also zeros the dividend pool,
+so quiet devices do nothing. The market is dormant until demand exceeds
+supply.
+
+### 3.7 Anti-Thrashing
+
+A context near the clearing price can oscillate between ADMITTED and
+EXCLUDED across consecutive steps. Each transition has a physical cost
+(GPU↔CPU page transfer). Three mechanisms prevent thrashing without
+distorting bids:
+
+1. **FCFS tiebreaker.** At equal bids, the eviction victim is the context
+   whose owning process was spawned most recently. Incumbents have
+   deterministic priority — no bid inflation needed.
+
+2. **Admission check.** A suspended context is only restored when the
+   device has enough free pages for working + replay + deferred ops.
+
+3. **Default eviction.** Each tick, contexts whose process cannot afford
+   full rent are flagged `defaulted`. Defaulted contexts are evicted first,
+   regardless of bid. While suspended, the process accumulates dividends
+   (while the device is contended); the context is restored only when the
+   balance recovers enough to pay rent.
+
+**Property:** Anti-thrashing is achieved without modifying the bid signal.
+The auction uses raw bids; stability comes from deterministic tiebreaking
+(FCFS) and automatic default enforcement.
 
 ---
 
@@ -173,11 +241,15 @@ assign context i to:
     argmin_d [ effective_pages(i, d) × price_prev(d)  +  migration_cost(i, d) ]
 
 where:
-    migration_cost(i, d) = transfer_pages(i) × MAKE_COST   if d ≠ current_device(i)
-                         = 0                                 if d = current_device(i)
+    migration_cost(i, d) = transfer_pages(i) × TRANSFER_PENALTY   if d ≠ current_device(i)
+                         = 0                                        if d = current_device(i)
 ```
 
-`price_prev(d)` is the clearing price from the most recent auction on device `d`. Migration only occurs when rent savings exceed transfer cost.
+`price_prev(d)` is the clearing price from the most recent auction on
+device `d`. `TRANSFER_PENALTY` is a tunable physical-cost proxy (no longer
+the credit-burning "make cost" of the prior design — the credit wallet is
+conserved now). Migration only occurs when rent savings exceed transfer
+cost.
 
 ### 4.4 Prefix Colocation Emerges
 
@@ -224,33 +296,40 @@ This is quadratic in `n`. The naïve formula `p·n` ignores the triangular accum
 
 ### 5.2 Budget-Exhausting Bid
 
-The bid should be the **maximum sustainable rent per page per step** — the flat rate that exactly exhausts the budget at the end of the horizon.
+The bid should be the **maximum sustainable rent per page per step** — the
+flat rate that exactly exhausts the credit wallet at the end of the horizon.
 
 Over `n` steps while admitted, the balance evolves as:
 
 ```
-B_final = B + n·d − r·S − n·g = 0
-              ↑       ↑    ↑
-           dividends  rent  make costs
+B_final = B + n·d − r·S = 0
+              ↑       ↑
+           dividends  rent
 ```
 
-where `d` is the per-step dividend (received regardless of admission status) and `g = 1/page_size` is the make cost rate. Solving for `r`:
+where `d` is the per-step dividend (received regardless of admission status).
+Make cost no longer appears — forward-pass compute is billed against the
+token wallet, not the credit wallet. Solving for `r`:
 
 ```
-bid = (B + n·d − n/page_size) / (p·n + n(n−1) / (2·page_size))
+bid = (B + n·d) / (p·n + n(n−1) / (2·page_size))
 ```
 
 Factoring out `n`:
 
 ```
-bid = (B/n + d − 1/page_size) / (p + (n−1) / (2·page_size))
+bid = (B/n + d) / (p + (n−1) / (2·page_size))
 ```
 
-**Key differences from the prior formula `(B/n − d) / p`:**
+**Why this form:**
 
-1. **Denominator** includes `(n−1)/(2·page_size)` — the quadratic rent exposure. For large `n` this dominates, preventing overbidding.
-2. **Dividend is added**, not subtracted. Dividends are status-independent (§3.4): a context earns the same dividend whether admitted or excluded. They replenish the budget, increasing affordable rent. There is no opportunity cost to subtract.
-3. **Make cost is subtracted** (`1/page_size` per step for producing new pages).
+1. **Denominator** includes `(n−1)/(2·page_size)` — the quadratic rent
+   exposure. For large `n` this dominates, preventing overbidding on the
+   pages that will be created over time.
+2. **Dividend is added**, not subtracted. Dividends are status-independent:
+   a context earns the same dividend whether admitted or excluded. They
+   replenish the budget, increasing affordable rent. There is no
+   opportunity cost to subtract.
 
 ### 5.3 Stochastic Horizon
 
@@ -265,7 +344,7 @@ E[S] = p·μ + E[n(n−1)] / (2·page_size)
 where `cv² = σ²/μ²` is the squared coefficient of variation. The bid becomes:
 
 ```
-bid = (B/μ + d − 1/page_size) / (p + μ(1 + cv²) / (2·page_size))
+bid = (B/μ + d) / (p + μ(1 + cv²) / (2·page_size))
 ```
 
 The `(1 + cv²)` multiplier captures uncertainty. Higher variance → more weight on expensive long-tail outcomes (quadratic rent growth) → more conservative bid.
@@ -292,10 +371,17 @@ The Lindy heuristic uses only observables with no tuning parameters. The floor o
 
 ### 5.5 Properties
 
-- When `dividend ≈ 0` and `n ≪ p·page_size` (low load, small horizon), reduces to `B / (n·p)` — matching the original formula.
-- When `B/μ + d < 1/page_size`, the bid goes negative: the context cannot cover make costs. It prefers exclusion. **The compute-or-wait decision is embedded in the bid.**
-- The balance feedback loop makes the strategy self-correcting regardless of horizon error.
-- Truthful reporting of this value is a dominant strategy under critical-value payments (§10, Theorem 2).
+- When `dividend ≈ 0` and the device is uncontended, `clearing_price = 0`
+  (§3.6) and the bid is never collected against. Low-load behavior is
+  effectively bid-free.
+- The bid is always non-negative: `B/μ + d ≥ 0`. Contexts never prefer
+  exclusion on bid-value grounds. Termination happens through the token
+  wallet (tokens_remaining = 0) or through market eviction when the
+  process is outbid.
+- The balance feedback loop makes the strategy self-correcting regardless
+  of horizon error.
+- Truthful reporting of this value is a dominant strategy under
+  critical-value payments (§10, Theorem 2).
 
 ---
 
@@ -428,21 +514,62 @@ A new process arrives with token budget `T`. The system creates a wallet with en
 └─────────────────────────────────────────────────────┘
 ```
 
-### 8.3 Budget Exhaustion
+### 8.3 Wallet Exhaustion
 
-A context's balance drains through make costs (permanent) and net rent (payment minus dividend). Lifetime:
+Two independent exhaustion paths, matching the two wallets (§2.2):
 
-```
-lifetime ≈ E / (make_rate + net_rent_rate)
-```
+**Token wallet → termination.** `tokens_remaining` monotonically decreases
+by one per successful token processed. Reaching zero blocks any further
+forward pass (the `pin` step refuses with "token budget exhausted").
+This is the hard compute bound. Lifetime in tokens is exactly `T`, the
+admission-time budget.
 
-As balance approaches zero, the bid approaches zero, and the context is naturally excluded. While excluded, it earns dividend and never reaches exactly zero. This is the **no-bankruptcy guarantee**.
+**Credit wallet → eviction, not termination.** The credit balance drifts
+under rent/dividend flow. Because the flow is zero-sum (§3.5), an excluded
+process earns dividend and its balance strictly increases while others
+pay rent. So `balance_i` never reaches zero in finite time while excluded
+— this is the **no-bankruptcy guarantee**. A process with exhausted credits
+simply loses GPU access until dividends restore it, without any risk of
+accounting underflow.
 
-A context terminates when computation completes (EOS token, max_tokens reached) or when balance is too low to ever be competitively re-admitted.
+A process terminates when:
+1. Its token wallet hits zero, or
+2. Computation completes naturally (EOS, max_tokens, guest exit).
+
+Credit balance has no termination role. The guarantee that an exhausted-
+credit process can always recover enough to contend again is structural,
+not heuristic.
 
 ### 8.4 Multi-Context Processes
 
 A process with multiple contexts (multi-turn agent, parallel generations) has each context bid independently from the shared wallet. High-value contexts win pages; low-value ones yield and earn dividend. The market performs optimal internal allocation without any process-level coordination.
+
+### 8.5 Admission Gate
+
+Admission is the one gate where the system can refuse service. Because
+endowment is physical (§2.4) — one unit = one page of long-run residency
+— the admission rule is an integer compare:
+
+```
+admit iff  Σ E_live + E_new  ≤  capacity × oversubscription_factor
+```
+
+- `Σ E_live`: sum of endowments of currently admitted processes.
+- `E_new`: endowment requested by the new process (`⌈T / page_size⌉`).
+- `capacity`: total GPU pages across all devices.
+- `oversubscription_factor ∈ (0, ∞)`: a provider-chosen knob.
+
+**Regimes:**
+
+| factor | meaning |
+|---|---|
+| `1.0` | strict booking: every admitted process is guaranteed its full endowment at all times. No market contention arises. |
+| `> 1.0` | overbook: provider sells more entitlement than physical capacity, betting on non-peak duty cycles. Market resolves transient crossings. |
+
+This replaces the old unbounded admission (which let anyone in and let
+the market sort it out, with no structural cap). It also gives the
+provider a single knob to tune overall load rather than inferring it from
+queueing metrics.
 
 ---
 
@@ -491,9 +618,17 @@ where `n_max` is the largest context's page count.
 
 ### Theorem 4 (Conservation)
 
-Total credits satisfy `Σ_i balance_i(t) = Σ_i E_i − M(t)` at all times. Rent revenue is exactly redistributed. No context reaches zero balance in finite time while excluded.
+Total credits satisfy `Σ_i balance_i(t) = Σ_i E_i` at all times
+(for the currently admitted population). Rent revenue is exactly
+redistributed. No process reaches zero balance in finite time while
+excluded.
 
-*Proof:* Rent payments sum to R. Dividends sum to R (they are a partition of the revenue). Net flow from rent is zero. Make costs are the only credit destruction. An excluded context pays no rent and receives positive dividend, so its balance strictly increases while excluded.
+*Proof:* Actually-collected rent payments sum to `R`. Dividends sum to
+`R` (they are a partition of the revenue). Net flow from rent is zero.
+There is no other source or sink in the credit wallet (the token wallet
+is a separate, disjoint accounting — see §2.2). An excluded context pays
+no rent and receives positive dividend whenever the device is contended,
+so its balance strictly increases while excluded.
 
 ### Theorem 5 (Efficient Placement)
 
@@ -507,27 +642,36 @@ The two-level mechanism (Shapley placement + knapsack auction) preserves all pro
 
 ### Theorem 7 (Stability)
 
-The clearing price is computed exactly each step (no dynamics, no convergence). Make cost penalizes thrashing economically; FCFS tiebreaking provides deterministic incumbent priority at equal bids. The system has no oscillatory modes.
+The clearing price is computed exactly each step (no dynamics, no
+convergence). FCFS tiebreaking provides deterministic incumbent priority
+at equal bids. The admission check prevents restoring contexts that would
+immediately re-suspend. The system has no oscillatory modes.
 
-*Proof:* The auction is a static optimization, not a dynamic process. There is no feedback loop to oscillate. Each restore→re-evict cycle consumes make cost credits, strictly reducing the thrashing context's future bid. The admission check prevents restoring contexts that would immediately re-suspend.
+*Proof:* The auction is a static optimization, not a dynamic process.
+There is no feedback loop to oscillate. Deterministic tiebreaking
+eliminates bid-level ambiguity in the evict/admit decision. The admission
+check breaks the eviction↔restoration ping-pong by refusing restoration
+until structural capacity exists.
 
 ---
 
-## 11. Comparison with Original Design
+## 11. Design Evolution
 
-| Aspect | Original Design | New Design |
-|--------|----------------|------------|
-| **Congestion signal** | M/M/1 tax curve `λ/(1−λ)` | Clearing price (dual variable of knapsack) |
-| **Make cost** | Separate mechanism (1 credit/page) | Same (1 credit/page, consumed) |
-| **Interest** | Tax pool redistributed ∝ balance | Revenue redistributed ∝ endowment |
-| **Bid formula** | Prescribed: `balance/(horizon × pages)` | Default provided; override allowed. Truthfulness from payment rule, not formula. |
-| **Compute-or-wait** | Explicit MCC vs MBW check | Embedded in bid (negative bid = prefer waiting) |
-| **Anti-thrashing** | Utilization cap + budget check | Make cost + FCFS tiebreaker + admission check |
-| **Prefix sharing** | Shared pages split tax implicitly | Shapley cost-sharing (unique, axiomatic) |
-| **Device placement** | Not specified | Shapley cost minimization |
-| **Truthfulness** | DSIC via convex tax (requires correct formula) | DSIC via critical-value payments (model-free) |
-| **Conservation** | Tax in = interest out | Payment in = dividend out |
-| **Moving parts** | 5 mechanisms + 2 heuristics | 1 auction + 1 cost-sharing rule |
+| Aspect | Original (tax) | v1 (unified credit) | Current (two-wallet) |
+|--------|---------------|---------------------|----------------------|
+| **Currencies** | 1 (credit) | 1 (credit, with make-cost destruction) | 2 (tokens + credits) |
+| **Compute accounting** | Implicit in tax | Make cost drains market balance | Separate token wallet; no market coupling |
+| **Conservation** | Tax in = interest out | `Σ B = Σ E − M(t)` | `Σ B = Σ E` exactly |
+| **Congestion signal** | M/M/1 tax curve | Clearing price, always charged | Clearing price, **gated on contention** |
+| **Idle-device rent** | Positive (tax still applied) | Positive (min bid charged) | Zero (critical value = 0) |
+| **Endowment unit** | Abstract weight | Credits (pages of compute) | Pages of long-run GPU residency |
+| **Admission** | Unbounded | Unbounded | `Σ E ≤ capacity × overbook_factor` |
+| **Compute-or-wait** | Explicit MCC/MBW check | Negative bid = exclude | Always non-negative; budget gate is token-side |
+| **Bid formula** | Prescribed | `(B/μ + d − 1/s) / (p + μ(1+cv²)/(2s))` | `(B/μ + d) / (p + μ(1+cv²)/(2s))` |
+| **Anti-thrashing** | Utilization cap + budget | Make cost + FCFS + admission | FCFS + admission (make cost gone) |
+| **Prefix sharing** | Tax split implicitly | Shapley cost-sharing | Shapley cost-sharing |
+| **Truthfulness** | DSIC via convex tax | DSIC via critical-value payments | Unchanged |
+| **Lifetime bound** | Implicit via credit drain | Credit drain (make cost) | Explicit via `tokens_remaining` |
 
 ---
 

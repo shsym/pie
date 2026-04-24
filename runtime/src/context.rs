@@ -185,10 +185,13 @@ pub(crate) struct Market {
     pub tick_latency_ewa: DashMap<usize, f64>,
     /// Sum of `dividend_per_endowment` across all devices.
     pub dividend_rate: std::sync::atomic::AtomicU64,  // f64 bits via to/from_bits
-    /// Per-process credit balances.
+    /// Per-process credit balances (market wallet, unit: pages).
     pub balances: DashMap<ProcessId, f64>,
-    /// Per-process endowments (fixed at creation).
+    /// Per-process endowments (fixed at creation, unit: pages).
     pub endowments: DashMap<ProcessId, f64>,
+    /// Per-process remaining token budget (compute wallet, unit: tokens).
+    /// `None` = unlimited, no cap.
+    pub tokens_remaining: DashMap<ProcessId, Option<usize>>,
     /// Default credit endowment (pages) for new processes.
     pub default_credit: usize,
     /// Per-device GPU-resident Active context count (updated each tick).
@@ -207,6 +210,7 @@ impl Market {
             dividend_rate: std::sync::atomic::AtomicU64::new(0),
             balances: DashMap::new(),
             endowments: DashMap::new(),
+            tokens_remaining: DashMap::new(),
             default_credit,
             gpu_active: DashMap::new(),
             gpu_pinned: DashMap::new(),
@@ -229,11 +233,29 @@ impl Market {
 // =============================================================================
 
 /// Spawns a new context manager for a model.
-pub fn spawn(page_size: usize, num_gpu_pages: Vec<usize>, num_cpu_pages: Vec<usize>, default_credit: usize) -> usize {
+///
+/// - `default_endowment_pages`: market weight assigned to processes that
+///   don't declare an explicit `token_budget` at admission.
+/// - `default_tokens_remaining`: compute-wallet cap for the same;
+///   `None` means unlimited (the system-wide default).
+pub fn spawn(
+    page_size: usize,
+    num_gpu_pages: Vec<usize>,
+    num_cpu_pages: Vec<usize>,
+    default_endowment_pages: usize,
+    default_tokens_remaining: Option<usize>,
+    oversubscription_factor: f64,
+) -> usize {
     PAGE_SIZES.push(page_size);
-    MARKET.push(Market::new(default_credit));
+    MARKET.push(Market::new(default_endowment_pages));
     SERVICES.spawn(move || ContextManager::new(
-        SERVICES.len().saturating_sub(1), page_size, &num_gpu_pages, &num_cpu_pages, default_credit,
+        SERVICES.len().saturating_sub(1),
+        page_size,
+        &num_gpu_pages,
+        &num_cpu_pages,
+        default_endowment_pages,
+        default_tokens_remaining,
+        oversubscription_factor,
     )).expect("Failed to spawn context manager")
 }
 
@@ -279,10 +301,31 @@ pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
 
 /// Register a process across all models.
 /// Called from `InstanceState::new` before any context operations.
-pub fn register_process(pid: ProcessId, token_budget: Option<usize>) {
+///
+/// Fails fast if any model's admission gate would refuse the request (the
+/// `Σ endowment ≤ capacity × oversubscription_factor` invariant).
+/// On partial failure — e.g., model 0 admits but model 1 refuses — the
+/// successful registrations are rolled back so no orphan state remains.
+pub async fn register_process(pid: ProcessId, token_budget: Option<usize>) -> Result<()> {
+    let mut admitted: Vec<usize> = Vec::new();
     for model_idx in 0..SERVICES.len() {
-        let _ = SERVICES.send(model_idx, Message::RegisterProcess { pid, token_budget });
+        let (tx, rx) = oneshot::channel();
+        SERVICES.send(model_idx, Message::RegisterProcess {
+            pid, token_budget, response: tx,
+        })?;
+        match rx.await.context("register_process: actor dropped response")? {
+            Ok(()) => admitted.push(model_idx),
+            Err(e) => {
+                for m in admitted {
+                    let _ = SERVICES.send(m, Message::UnregisterProcess { pid });
+                }
+                return Err(e.context(format!(
+                    "register_process failed on model {model_idx}"
+                )));
+            }
+        }
     }
+    Ok(())
 }
 
 /// Unregister a process: destroy all contexts and remove the process entry.
@@ -415,6 +458,15 @@ pub fn get_endowment(model_idx: usize, pid: ProcessId) -> f64 {
     MARKET.get(model_idx)
         .and_then(|m| m.endowments.get(&pid).map(|v| *v))
         .unwrap_or(0.0)
+}
+
+/// Get a process's remaining token budget (compute wallet).
+/// Returns `None` for unknown processes or processes with no cap.
+/// `Some(n)` means the process is capped and has `n` tokens left.
+pub fn get_tokens_remaining(model_idx: usize, pid: ProcessId) -> Option<usize> {
+    MARKET.get(model_idx)
+        .and_then(|m| m.tokens_remaining.get(&pid).map(|v| *v))
+        .flatten()
 }
 
 /// Get the device index assigned to a specific context.
@@ -640,8 +692,6 @@ pub(crate) struct SchedCounters {
     pub ticks: u64,
     /// Contexts suspended due to contention (eviction victims).
     pub eviction_suspends: u64,
-    /// Contexts self-suspended due to credit bankruptcy in when_allocated.
-    pub credit_suspends: u64,
     /// Contexts self-suspended due to priority gate (lower bid than restore_queue head).
     pub priority_gate_suspends: u64,
     /// Contexts self-suspended because no eviction victim found.
@@ -724,8 +774,17 @@ pub(crate) struct ContextManager {
     pub(crate) restore_queue: BinaryHeap<RestoreEntry>,
     /// Per-device auction results from the last tick (clearing price, revenue, dividend rate).
     pub(crate) auction_results: Vec<AuctionResult>,
-    /// Default credit endowment for new processes without an explicit token budget.
+    /// Default credit endowment (pages) for new processes that do not
+    /// declare an explicit token_budget at admission. Pure market weight —
+    /// independent of the token wallet.
     pub(crate) default_endowment: f64,
+    /// Default compute-wallet cap for new processes that do not declare
+    /// an explicit token_budget at admission.
+    /// `None` = unlimited (the system-wide default); `Some(n)` = cap at `n`.
+    pub(crate) default_tokens_remaining: Option<usize>,
+    /// Admission cap: `Σ endowment ≤ total_gpu_capacity × oversubscription_factor`.
+    /// At 1.0 strictly bound by physical capacity; > 1.0 allows overbook.
+    pub(crate) oversubscription_factor: f64,
     /// Diagnostic counters for scheduler health.
     pub(crate) sched_counters: SchedCounters,
 }
@@ -736,7 +795,15 @@ impl ContextManager {
     /// evict→restore→re-evict thrashing cascade.
     const RESTORE_UTILIZATION_CAP: f64 = 0.85;
 
-    pub(crate) fn new(model_idx: usize, page_size: usize, num_gpu_pages: &[usize], num_cpu_pages: &[usize], default_credit: usize) -> Self {
+    pub(crate) fn new(
+        model_idx: usize,
+        page_size: usize,
+        num_gpu_pages: &[usize],
+        num_cpu_pages: &[usize],
+        default_endowment_pages: usize,
+        default_tokens_remaining: Option<usize>,
+        oversubscription_factor: f64,
+    ) -> Self {
         let gpu_stores: Vec<_> = num_gpu_pages.iter()
             .map(|&n| PageStore::new(page_size, n))
             .collect();
@@ -751,7 +818,9 @@ impl ContextManager {
             alloc_queue: VecDeque::new(),
             restore_queue: BinaryHeap::new(),
             auction_results: vec![AuctionResult::default(); num_gpu_pages.len()],
-            default_endowment: default_credit as f64,
+            default_endowment: default_endowment_pages as f64,
+            default_tokens_remaining,
+            oversubscription_factor,
             sched_counters: SchedCounters::default(),
         }
     }
@@ -1070,6 +1139,19 @@ impl ContextManager {
     ) {
         self.when_active(id, move |mgr| {
             let result = (|| -> Result<PinnedContext> {
+                // Token-budget gate: refuse to pin for a forward pass when
+                // the owning process has exhausted its compute budget. The
+                // actual debit happens on append_working_page_tokens after
+                // the pass completes; this pre-check prevents overdraft.
+                if num_input_tokens > 0
+                    && !mgr.has_token_budget(id, num_input_tokens as usize)
+                {
+                    anyhow::bail!(
+                        "pin: token budget exhausted for context {id} \
+                         (requested {num_input_tokens} tokens)"
+                    );
+                }
+
                 let ctx = mgr.contexts.get_mut(&id)
                     .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
                 if ctx.is_off_gpu() {
@@ -1288,6 +1370,7 @@ impl ContextManager {
         }
         let ctx = self.contexts.get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Context not found"))?;
+        let owner = ctx.owner;
         for (i, token) in tokens.into_iter().enumerate() {
             ctx.working_page_tokens.push(TokenInfo {
                 token, position: positions[i],
@@ -1295,6 +1378,11 @@ impl ContextManager {
                 adapter,
                 adapter_seed,
             });
+        }
+        // Debit the token wallet for the work just completed. Snapshots
+        // (owner=None) bypass billing.
+        if let Some(pid) = owner {
+            self.debit_tokens(pid, n);
         }
         Ok(())
     }
@@ -1338,7 +1426,11 @@ pub(crate) enum Message {
 
     DebugState { id: ContextId, response: oneshot::Sender<String> },
 
-    RegisterProcess { pid: ProcessId, token_budget: Option<usize> },
+    RegisterProcess {
+        pid: ProcessId,
+        token_budget: Option<usize>,
+        response: oneshot::Sender<Result<()>>,
+    },
     UnregisterProcess { pid: ProcessId },
 
     // ── Market messages ────────────────────────────────────────
@@ -1437,9 +1529,10 @@ impl ServiceHandler for ContextManager {
             Message::DebugState { id, response } => {
                 let _ = response.send(self.debug_state(id));
             }
-            Message::RegisterProcess { pid, token_budget } => {
+            Message::RegisterProcess { pid, token_budget, response } => {
                 let t0 = Instant::now();
-                self.register_process(pid, token_budget);
+                let result = self.register_process(pid, token_budget);
+                let _ = response.send(result);
                 self.sched_counters.register_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.register_count += 1;
             }

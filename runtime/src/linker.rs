@@ -117,7 +117,7 @@ impl Linker {
             self.allow_filesystem,
             token_budget,
             py_runtime_dir_for_state,
-        );
+        ).await?;
         let mut store = Store::new(&self.engine, inst_state);
 
         // 5. Create and configure linker

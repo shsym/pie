@@ -8,21 +8,7 @@ use crate::pie::instruct::chat;
 
 use super::{Context, Decoder, Event, Speculation, Constrain, GrammarConstraint};
 
-/// Budget-exhausting bid: maximum sustainable rent per page per step.
-///
-/// Formula (§5 of SCHED.md):
-///   bid = (B/μ + d − 1/s) / (p + μ(1 + cv²) / (2s))
-///
-/// where B = balance, μ = expected remaining steps, d = dividend per step,
-/// s = page_size, p = current pages, cv² = squared coefficient of variation
-/// of the remaining-steps distribution.
-fn compute_bid(balance: f64, pages: f64, mu: f64, cv2: f64, page_size: f64, dividend: f64) -> f64 {
-    let mu = mu.max(1.0);
-    let g = 1.0 / page_size;  // make cost rate (pages per step)
-    let numerator = balance / mu + dividend - g;
-    let denominator = pages + mu * (1.0 + cv2) / (2.0 * page_size);
-    if denominator > 0.0 { numerator / denominator } else { numerator }
-}
+use super::compute_bid;
 
 
 

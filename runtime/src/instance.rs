@@ -66,18 +66,19 @@ impl WasiHttpView for InstanceState {
 }
 
 impl InstanceState {
-    pub fn new(
+    pub async fn new(
         id: ProcessId,
         username: String,
         capture_outputs: bool,
         allow_filesystem: bool,
         token_budget: Option<usize>,
         py_runtime_dir: Option<&Path>,
-    ) -> Self {
-        // Register the process with all model context managers.
-        // This creates the ProcessEntry with the correct token budget endowment
-        // before any context operations. Symmetric with unregister_process in Drop.
-        context::register_process(id, token_budget);
+    ) -> anyhow::Result<Self> {
+        // Register the process with all model context managers. Fails if the
+        // admission gate (Σ endowment ≤ capacity × overbook) refuses.
+        // Partial failures are rolled back inside register_process, so Drop
+        // does not need to care about double-unregistration.
+        context::register_process(id, token_budget).await?;
 
         let mut builder = WasiCtx::builder();
         builder.inherit_network(); // TODO: Replace with socket_addr_check later.
@@ -140,7 +141,7 @@ impl InstanceState {
                 .expect("failed to preopen site-packages dir");
         }
 
-        InstanceState {
+        Ok(InstanceState {
             id,
             username,
             wasi_ctx: builder.build(),
@@ -151,7 +152,7 @@ impl InstanceState {
             dynamic_resource_map: HashMap::new(),
             guest_resource_map: Vec::new(),
             next_dynamic_rep: 1,
-        }
+        })
     }
 
     pub fn id(&self) -> ProcessId {

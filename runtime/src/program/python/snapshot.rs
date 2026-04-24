@@ -1320,7 +1320,7 @@ pub(crate) async fn snapshot_from_bytes(
         false, // allow_filesystem
         None,  // token_budget
         py_runtime::dir(),
-    );
+    ).await?;
     let mut store = Store::new(engine, inst_state);
 
     if !dep_components.is_empty() {

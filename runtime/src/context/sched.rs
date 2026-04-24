@@ -38,24 +38,38 @@ use super::{Context, ContextId, ContextManager, RestoreEntry, State, MARKET};
 // ProcessEntry — Wallet + Ownership
 // =============================================================================
 
-/// Per-process wallet and ownership record.
+/// Per-process state. Two disjoint wallets + ownership record.
 ///
-/// Credits are shared across all contexts owned by the process. Payments are
-/// charged per-context to this balance. Scheduling (eviction, restoration)
-/// operates on individual contexts using their own bids.
+/// **Token wallet (`tokens_remaining`)**: optional compute/billing cap.
+/// `None` = no cap (default), the process may compute indefinitely.
+/// `Some(n)` = monotonically destructive cap; decremented per successful
+/// forward pass, and when it saturates to zero further passes are rejected.
+/// No market semantics in either case.
+///
+/// **Credit wallet (`balance`)**: market/scheduling currency.
+/// Conserved — flows between processes via rent payments and endowment-
+/// weighted dividends. Never created or destroyed after admission.
+/// Drives auction allocation, never bounds compute.
+///
+/// The two wallets never exchange. Exhausting credits evicts the process
+/// from GPU but does not terminate it. Exhausting tokens terminates forward
+/// progress but does not affect market standing.
 #[derive(Debug)]
 pub(crate) struct ProcessEntry {
-    /// Credit balance (global, usable on any device).
-    /// Set at admission; debited by payments, credited by dividends.
+    /// Credit balance (market wallet, unit: pages). Initialized to `endowment`
+    /// at admission; drifts via rent payments and dividends. Conserved.
     pub balance: f64,
+    /// Remaining compute budget (token wallet, unit: tokens).
+    /// `None` = unlimited (no cap); `Some(n)` = hard cap that decrements
+    /// on forward-pass completion. Saturates to `Some(0)`, never wraps.
+    pub tokens_remaining: Option<usize>,
     /// Context IDs owned by this process.
     pub context_ids: Vec<ContextId>,
     /// Birth timestamp — used as FCFS tiebreaker at equal bid.
     pub created_at: Instant,
-    /// Per-process token budget requested at launch time (None = use default).
-    pub token_budget: Option<usize>,
-    /// Initial credit endowment (fixed at creation, used for dividend weighting).
-    /// Cannot be gamed by splitting or bidding — Sybil-resistant.
+    /// Share of long-run GPU capacity this process is entitled to (unit: pages).
+    /// Fixed at admission. One endowment unit = one KV page of long-run
+    /// residency under contention. Used to weight dividend distribution.
     pub endowment: f64,
 }
 
@@ -63,9 +77,9 @@ impl ProcessEntry {
     pub(crate) fn new() -> Self {
         ProcessEntry {
             balance: 0.0,
+            tokens_remaining: None,
             context_ids: Vec::new(),
             created_at: Instant::now(),
-            token_budget: None,
             endowment: 0.0,
         }
     }
@@ -133,28 +147,59 @@ impl ContextManager {
     /// Called once per process lifetime (from `InstanceState::new`).
     ///
     /// Panics on double-registration (indicates a bug in the caller).
-    pub(crate) fn register_process(&mut self, pid: ProcessId, token_budget: Option<usize>) {
+    pub(crate) fn register_process(
+        &mut self, pid: ProcessId, token_budget: Option<usize>
+    ) -> anyhow::Result<()> {
         assert!(
             !self.processes.contains_key(&pid),
             "register_process: process {pid} already registered"
         );
-        let mut entry = ProcessEntry::new();
-        entry.token_budget = token_budget;
-        let credit = match token_budget {
-            Some(budget) => {
-                // credit = ⌈token_budget / page_size⌉
-                let credit = budget.div_ceil(self.page_size.max(1));
-                credit as f64
-            }
+        // Two wallets, derived independently.
+        //
+        // Token wallet: Some(n) caps compute at n tokens; None = uncapped.
+        //   - If the caller passes Some, use it verbatim (explicit opt-in).
+        //   - If the caller passes None, inherit the config default, which
+        //     itself is Option<usize> (None = unlimited by default).
+        //
+        // Credit wallet (balance/endowment): pages entitled under long-run
+        // contention. Derived from the explicit token cap when present
+        // (⌈T / page_size⌉), or from the configured default endowment when
+        // the cap is unlimited.
+        let tokens_remaining = token_budget.or(self.default_tokens_remaining);
+        let endowment_pages = match token_budget {
+            Some(t) => t.div_ceil(self.page_size.max(1)) as f64,
             None => self.default_endowment,
         };
-        entry.balance = credit;
-        entry.endowment = credit;
+
+        // Admission gate: Σ endowment ≤ total_capacity × oversubscription_factor.
+        // Each endowment unit is a claim on one page of long-run GPU residency;
+        // selling more than capacity × factor would overcommit beyond what
+        // duty-cycle averaging can absorb.
+        let sigma_e: f64 = self.processes.values().map(|p| p.endowment).sum();
+        let total_capacity: f64 = self.gpu_stores.iter()
+            .map(|s| s.total_pages() as f64).sum();
+        let cap = total_capacity * self.oversubscription_factor;
+        if sigma_e + endowment_pages > cap {
+            anyhow::bail!(
+                "admission denied: Σ endowment ({sigma_e} + {endowment_pages} = \
+                 {}) would exceed capacity × factor ({total_capacity} × \
+                 {} = {cap})",
+                sigma_e + endowment_pages,
+                self.oversubscription_factor,
+            );
+        }
+
+        let mut entry = ProcessEntry::new();
+        entry.tokens_remaining = tokens_remaining;
+        entry.balance = endowment_pages;
+        entry.endowment = endowment_pages;
         self.processes.insert(pid, entry);
         if let Some(market) = MARKET.get(self.model_idx) {
-            market.balances.insert(pid, credit);
-            market.endowments.insert(pid, credit);
+            market.balances.insert(pid, endowment_pages);
+            market.endowments.insert(pid, endowment_pages);
+            market.tokens_remaining.insert(pid, tokens_remaining);
         }
+        Ok(())
     }
 
     /// Unregister a process: destroy all owned contexts and remove the process entry.
@@ -202,6 +247,7 @@ impl ContextManager {
         if let Some(market) = MARKET.get(self.model_idx) {
             market.balances.remove(&pid);
             market.endowments.remove(&pid);
+            market.tokens_remaining.remove(&pid);
         }
 
         let t_pre_drain = t_start.elapsed();
@@ -342,7 +388,6 @@ impl ContextManager {
         // Contexts that are Pinned but NOT in the batch (stale unpins, new pins)
         // are not charged — they didn't consume compute this tick.
         let mut ctx_payments: Vec<(ContextId, ProcessId, f64)> = Vec::new();
-        let mut device_revenue = 0.0f64;
         let mut n_charged = 0usize;
 
         for (&ctx_id, ctx) in &self.contexts {
@@ -356,7 +401,6 @@ impl ContextManager {
                 + ctx.working_pages.len() as f64;
 
             let payment = clearing_price * eff;
-            device_revenue += payment;
             n_charged += 1;
             if let Some(pid) = ctx.owner {
                 ctx_payments.push((ctx_id, pid, payment));
@@ -365,24 +409,17 @@ impl ContextManager {
 
         let t_pass2 = t_start.elapsed();
 
-        // Endowment-proportional dividends from this device's revenue.
-        let total_endowment: f64 = self.processes.values().map(|p| p.endowment).sum();
-        let dividend_rate = if total_endowment > 0.0 { device_revenue / total_endowment } else { 0.0 };
-
-        self.auction_results[dev_idx] = AuctionResult {
-            clearing_price,
-            cpu_clearing_price: 0.0,
-            total_revenue: device_revenue,
-            dividend_per_endowment: dividend_rate,
-        };
-
-        // Pass 3: charge rent, flag defaulted contexts.
-        // A context is defaulted if its process can't afford the full payment.
+        // Pass 3: debit rent, summing actual collected amounts.
+        // Revenue is the *actual* credits moved, not the nominal owed amount —
+        // clamping at the payer's balance would otherwise create credits
+        // (dividends distributed > rent collected → balances grow from nothing).
+        let mut device_revenue = 0.0f64;
         for (ctx_id, pid, payment) in &ctx_payments {
             if let Some(proc) = self.processes.get_mut(pid) {
                 let defaulted = proc.balance < *payment;
                 let actual = payment.min(proc.balance);
                 proc.balance -= actual;
+                device_revenue += actual;
                 if let Some(ctx) = self.contexts.get_mut(ctx_id) {
                     if defaulted && !ctx.defaulted {
                         self.sched_counters.defaults_flagged += 1;
@@ -392,7 +429,22 @@ impl ContextManager {
             }
         }
 
-        // Dividends: credit all processes.
+        // Endowment-proportional dividends from this device's *actual* revenue.
+        let total_endowment: f64 = self.processes.values().map(|p| p.endowment).sum();
+        let dividend_rate = if total_endowment > 0.0 {
+            device_revenue / total_endowment
+        } else {
+            0.0
+        };
+
+        self.auction_results[dev_idx] = AuctionResult {
+            clearing_price,
+            cpu_clearing_price: 0.0,
+            total_revenue: device_revenue,
+            dividend_per_endowment: dividend_rate,
+        };
+
+        // Credit dividends to all processes.
         for proc in self.processes.values_mut() {
             proc.balance += dividend_rate * proc.endowment;
         }
@@ -444,31 +496,40 @@ impl ContextManager {
     }
 
     // =========================================================================
-    // Make Cost
+    // Token Budget (compute wallet)
     // =========================================================================
 
-    /// Charge make cost for newly allocated pages to the owning process.
-    /// Called at point of allocation (not retroactively in tick).
-    pub(crate) fn charge_make_cost(&mut self, ctx_id: ContextId, num_pages: usize) {
-        if num_pages == 0 { return; }
-        let pid = match self.contexts.get(&ctx_id).and_then(|c| c.owner) {
-            Some(pid) => pid,
-            None => return,
-        };
+    /// Debit the token wallet by `num_tokens` on a successful forward pass.
+    /// Processes with an unlimited wallet (`None`) are not affected.
+    /// For capped wallets, saturates at zero — never wraps.
+    pub(crate) fn debit_tokens(&mut self, pid: ProcessId, num_tokens: usize) {
+        if num_tokens == 0 { return; }
         if let Some(proc) = self.processes.get_mut(&pid) {
-            proc.balance -= num_pages as f64;
+            if let Some(cap) = proc.tokens_remaining.as_mut() {
+                *cap = cap.saturating_sub(num_tokens);
+                let new_val = *cap;
+                if let Some(market) = MARKET.get(self.model_idx) {
+                    market.tokens_remaining.insert(pid, Some(new_val));
+                }
+            }
         }
     }
 
-    /// Check if the owning process can afford the make cost for `num_pages`.
-    pub(crate) fn can_afford(&self, ctx_id: ContextId, num_pages: usize) -> bool {
-        if num_pages == 0 { return true; }
+    /// Check whether the process owning `ctx_id` has at least `num_tokens`
+    /// in its token wallet. Returns true when the wallet is unlimited (None)
+    /// or when the remaining cap covers the request. Returns false if the
+    /// context/process is unknown or the cap is insufficient.
+    pub(crate) fn has_token_budget(&self, ctx_id: ContextId, num_tokens: usize) -> bool {
+        if num_tokens == 0 { return true; }
         let pid = match self.contexts.get(&ctx_id).and_then(|c| c.owner) {
             Some(pid) => pid,
-            None => return true, // snapshots (no owner) are always allowed
+            None => return true, // snapshots (no owner) bypass budget check
         };
         match self.processes.get(&pid) {
-            Some(proc) => proc.balance >= num_pages as f64,
+            Some(proc) => match proc.tokens_remaining {
+                None => true,                  // unlimited
+                Some(rem) => rem >= num_tokens,
+            },
             None => false,
         }
     }
@@ -528,20 +589,6 @@ impl ContextManager {
             return;
         }
 
-        // CREDIT CHECK: if process can't afford make cost, self-suspend.
-        if !self.can_afford(ctx_id, num_pages) {
-            self.sched_counters.credit_suspends += 1;
-            let pending = PendingAlloc {
-                device: dev_idx, num_pages,
-                on_alloc: Box::new(on_alloc),
-            };
-            self.contexts.get_mut(&ctx_id).unwrap().deferred_ops.push(pending);
-            self.suspend(ctx_id);
-            self.enqueue_restore(ctx_id);
-            self.drain_queues();
-            return;
-        }
-
         // Compute requester's bid from the context.
         let requester_bid = self.contexts[&ctx_id].bid;
 
@@ -565,7 +612,6 @@ impl ContextManager {
 
         // Step 3: TRY ALLOCATE from free pool.
         if let Some(pages) = self.gpu_stores[dev_idx].alloc(num_pages) {
-            self.charge_make_cost(ctx_id, pages.len());
             (on_alloc)(self, pages);
             return;
         }
@@ -613,7 +659,6 @@ impl ContextManager {
 
         // Post-loop: handle eviction results.
         if let Some(pages) = alloc_result {
-            self.charge_make_cost(ctx_id, pages.len());
             (on_alloc)(self, pages);
             self.drain_queues();
         } else {
@@ -922,9 +967,9 @@ mod tests {
     fn fixture(num_pages: usize, held_pages: usize, bid: f64)
         -> (ContextManager, ProcessId, ContextId)
     {
-        let mut mgr = ContextManager::new(0, 16, &[num_pages], &[num_pages], 10);
+        let mut mgr = ContextManager::new(0, 16, &[num_pages], &[num_pages], 10, None, 10000.0);
         let pid = ProcessId::new_v4();
-        mgr.register_process(pid, Some(160)); // 10 pages at page_size=16
+        mgr.register_process(pid, Some(160)).unwrap(); // 10 pages at page_size=16
 
         // Allocate `held_pages` from the GPU pool so `available()` reflects usage.
         let pages = mgr.gpu_stores[0].alloc(held_pages).expect("alloc");
@@ -1006,10 +1051,10 @@ mod tests {
     #[test]
     fn rent_redistributes_between_processes_under_contention() {
         // Both processes get large budgets so payment isn't balance-capped.
-        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 10);
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 10, None, 10000.0);
 
         let payer_pid = ProcessId::new_v4();
-        mgr.register_process(payer_pid, Some(16 * 1000)); // 1000-page budget
+        mgr.register_process(payer_pid, Some(16 * 1000)).unwrap(); // 1000-page budget
         let payer_pages = mgr.gpu_stores[0].alloc(5).expect("alloc");
         let payer_ctx = 1u64;
         let mut c1 = Context::new(Some(payer_pid));
@@ -1021,7 +1066,7 @@ mod tests {
         mgr.process_entry(payer_pid).context_ids.push(payer_ctx);
 
         let recv_pid = ProcessId::new_v4();
-        mgr.register_process(recv_pid, Some(16 * 1000));
+        mgr.register_process(recv_pid, Some(16 * 1000)).unwrap();
         let recv_pages = mgr.gpu_stores[0].alloc(5).expect("alloc");
         let recv_ctx = 2u64;
         let mut c2 = Context::new(Some(recv_pid));
@@ -1047,5 +1092,216 @@ mod tests {
         let after = payer_after + recv_after;
         assert!((before - after).abs() < 1e-9,
             "total balance conserved: before={before} after={after}");
+    }
+
+    // =============================================================================
+    // Phase 2: Two-wallet split (tokens vs credits)
+    // =============================================================================
+
+    /// Token wallet is initialized from token_budget, credit wallet from
+    /// ⌈budget / page_size⌉ pages. The two are independent quantities.
+    #[test]
+    fn register_process_sets_both_wallets() {
+        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 10, None, 10000.0);
+        let pid = ProcessId::new_v4();
+        mgr.register_process(pid, Some(1000)).unwrap();
+
+        let entry = mgr.process_entry(pid);
+        assert_eq!(entry.tokens_remaining, Some(1000),
+            "token wallet = Some(token_budget) when explicit cap requested");
+        // 1000 tokens / 16 tokens/page = 63 pages (ceil)
+        assert_eq!(entry.endowment, 63.0,
+            "endowment = ⌈budget / page_size⌉ pages");
+        assert_eq!(entry.balance, 63.0,
+            "initial balance = endowment");
+    }
+
+    /// Processes launched without an explicit budget inherit the default,
+    /// which is unlimited (None) by system policy.
+    #[test]
+    fn register_process_without_budget_is_unlimited() {
+        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 10, None, 10000.0);
+        let pid = ProcessId::new_v4();
+        mgr.register_process(pid, None).unwrap();
+        assert_eq!(mgr.process_entry(pid).tokens_remaining, None,
+            "no explicit cap → unlimited wallet");
+        assert_eq!(mgr.process_entry(pid).endowment, 10.0,
+            "endowment falls back to configured default");
+    }
+
+    /// debit_tokens decrements a capped wallet; saturates at zero; leaves
+    /// unlimited wallets untouched.
+    #[test]
+    fn debit_tokens_is_monotone_and_saturates() {
+        let mut mgr = ContextManager::new(0, 16, &[100], &[100], 10, None, 10000.0);
+        let pid = ProcessId::new_v4();
+        mgr.register_process(pid, Some(100)).unwrap();
+        assert_eq!(mgr.process_entry(pid).tokens_remaining, Some(100));
+
+        mgr.debit_tokens(pid, 30);
+        assert_eq!(mgr.process_entry(pid).tokens_remaining, Some(70));
+
+        mgr.debit_tokens(pid, 500); // underflow attempt
+        assert_eq!(mgr.process_entry(pid).tokens_remaining, Some(0),
+            "saturates at zero on underflow");
+
+        // Unlimited wallet is unaffected by debit.
+        let unlimited_pid = ProcessId::new_v4();
+        mgr.register_process(unlimited_pid, None).unwrap();
+        mgr.debit_tokens(unlimited_pid, 1_000_000);
+        assert_eq!(mgr.process_entry(unlimited_pid).tokens_remaining, None,
+            "debit has no effect on an unlimited wallet");
+    }
+
+    /// has_token_budget gates forward passes against the compute wallet only.
+    /// A context with a full credit balance but zero tokens should be rejected.
+    #[test]
+    fn has_token_budget_independent_of_credit_balance() {
+        let (mut mgr, pid, ctx_id) = fixture(100, 5, 2.0);
+        // Install a finite cap, then drain it.
+        mgr.process_entry(pid).tokens_remaining = Some(0);
+
+        assert!(mgr.process_entry(pid).balance > 0.0,
+            "credit balance still positive");
+        assert!(!mgr.has_token_budget(ctx_id, 1),
+            "token budget exhausted blocks forward pass");
+        assert!(mgr.has_token_budget(ctx_id, 0),
+            "zero-token pass always admitted");
+    }
+
+    /// Under no-make-cost, allocating pages leaves the credit balance
+    /// untouched. (Historical bug: `charge_make_cost` would drain balance
+    /// by `pages.len()` on every alloc.)
+    #[test]
+    fn allocation_does_not_touch_credit_balance() {
+        let (mut mgr, pid, _ctx_id) = fixture(100, 0, 1.0);
+        let balance_before = mgr.process_entry(pid).balance;
+
+        // Allocate pages through the contention primitive (zero-page no-op
+        // path is skipped; allocating 3 pages exercises the free-pool path).
+        let ctx_id = 1u64;
+        let new_ctx_id = 2u64;
+        let mut ctx = Context::new(Some(pid));
+        ctx.device = Some(0);
+        ctx.state = State::Active;
+        mgr.contexts.insert(new_ctx_id, ctx);
+        mgr.process_entry(pid).context_ids.push(new_ctx_id);
+        mgr.when_allocated(new_ctx_id, 0, 3, |_mgr, _pages| {});
+
+        assert_eq!(mgr.process_entry(pid).balance, balance_before,
+            "credit balance unchanged by alloc (no make cost)");
+        let _ = ctx_id;
+    }
+
+    /// Conservation under default: when a payer can't cover full rent,
+    /// dividends must be computed from *actual* collected credits, not
+    /// the nominal `payment`. Otherwise the system mints credits.
+    #[test]
+    fn conservation_holds_under_default() {
+        // Small token budget → small endowment → payer goes under.
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 10, None, 10000.0);
+
+        let payer_pid = ProcessId::new_v4();
+        mgr.register_process(payer_pid, Some(16)).unwrap(); // endowment = 1 page
+        let p_pages = mgr.gpu_stores[0].alloc(5).expect("alloc");
+        let payer_ctx = 1u64;
+        let mut c1 = Context::new(Some(payer_pid));
+        c1.device = Some(0); c1.state = State::Active;
+        c1.working_pages = p_pages; c1.bid = 10.0;
+        mgr.contexts.insert(payer_ctx, c1);
+        mgr.process_entry(payer_pid).context_ids.push(payer_ctx);
+
+        let recv_pid = ProcessId::new_v4();
+        mgr.register_process(recv_pid, Some(16 * 1000)).unwrap();
+        let r_pages = mgr.gpu_stores[0].alloc(5).expect("alloc");
+        let recv_ctx = 2u64;
+        let mut c2 = Context::new(Some(recv_pid));
+        c2.device = Some(0); c2.state = State::Active;
+        c2.working_pages = r_pages; c2.bid = 10.0;
+        mgr.contexts.insert(recv_ctx, c2);
+        mgr.process_entry(recv_pid).context_ids.push(recv_ctx);
+
+        let total_before: f64 = mgr.processes.values().map(|p| p.balance).sum();
+
+        // Only payer in batch. Payment owed = 10 × 5 = 50, but payer has 1.
+        mgr.tick(0, 0.001, &[payer_ctx]);
+
+        let total_after: f64 = mgr.processes.values().map(|p| p.balance).sum();
+        assert!((total_after - total_before).abs() < 1e-9,
+            "Σ balance conserved under default: before={total_before} after={total_after}");
+
+        // Payer should be flagged defaulted.
+        assert!(mgr.contexts[&payer_ctx].defaulted,
+            "payer under-capitalized → defaulted flag set");
+    }
+
+    // =============================================================================
+    // Phase 3: Admission gate (Σ endowment ≤ capacity × oversubscription_factor)
+    // =============================================================================
+
+    /// At factor = 1.0, exactly `capacity` pages worth of endowment fits.
+    /// The N+1th page pushes Σ over the cap and is rejected.
+    #[test]
+    fn admission_gate_at_factor_1_enforces_capacity() {
+        // 10 pages total, strict (factor = 1.0).
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, None, 1.0);
+
+        // 10 processes of 1 endowment-page each fit exactly.
+        for _ in 0..10 {
+            mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();
+        }
+        // The 11th process pushes Σ = 11 over cap = 10.
+        let eleventh = ProcessId::new_v4();
+        let err = mgr.register_process(eleventh, Some(16)).unwrap_err();
+        assert!(err.to_string().contains("admission denied"),
+            "expected admission-denied error, got: {err}");
+        // Rejected process must not have been inserted.
+        assert!(!mgr.processes.contains_key(&eleventh));
+    }
+
+    /// At factor = 2.0, the cap is 2× physical capacity.
+    #[test]
+    fn admission_gate_overbook_factor_scales_cap() {
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, None, 2.0);
+
+        // 20 processes at 1 page each = 20 endowment ≤ 20 cap. All admit.
+        for _ in 0..20 {
+            mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();
+        }
+        // 21st rejected.
+        assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err());
+    }
+
+    /// After a process unregisters, its endowment is released back into the
+    /// admission budget and the next admission succeeds.
+    #[test]
+    fn admission_frees_budget_on_unregister() {
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 1, None, 1.0);
+
+        let pids: Vec<_> = (0..10).map(|_| {
+            let pid = ProcessId::new_v4();
+            mgr.register_process(pid, Some(16)).unwrap();
+            pid
+        }).collect();
+        assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err(),
+            "saturated");
+
+        mgr.unregister_process(pids[0]);
+
+        // Now a new process can take the freed slot.
+        mgr.register_process(ProcessId::new_v4(), Some(16))
+            .expect("admission should succeed after unregister");
+    }
+
+    /// Capacity is summed across devices — endowment competes against the
+    /// total GPU pool, not just one device.
+    #[test]
+    fn admission_cap_is_sum_across_devices() {
+        let mut mgr = ContextManager::new(0, 16, &[5, 5], &[5, 5], 1, None, 1.0);
+        // 10 pages total across 2 devices.
+        for _ in 0..10 {
+            mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();
+        }
+        assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err());
     }
 }

@@ -103,7 +103,11 @@ pub fn create_mock_env(
                 max_wait_ms: 10,
                 min_batch_for_optimization: 1,
             },
-            default_token_budget: 4096,
+            default_token_budget: None,     // unlimited by default
+            default_endowment_pages: 4,     // small endowment for small mock GPUs
+            // Permissive for tests: allow up to 32× overbook so fixtures
+            // don't trip the admission gate on small-capacity mock devices.
+            oversubscription_factor: 32.0,
         }],
         skip_tracing: true,
         allow_filesystem: false,
