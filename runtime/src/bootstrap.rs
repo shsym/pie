@@ -98,8 +98,8 @@ pub async fn bootstrap(
 
     // Load the Python runtime shared modules (full + stripped variants) before
     // the linker and program services spawn, so both can read from the shared
-    // py_runtime state rather than loading their own copies.
-    crate::py_runtime::init(&wasm_engine, config.python_snapshot);
+    // runtime state rather than loading their own copies.
+    crate::program::python::runtime::init(&wasm_engine, config.python_snapshot);
 
     auth::spawn(
         config.auth.enabled,

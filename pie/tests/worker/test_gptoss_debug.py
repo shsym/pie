@@ -179,7 +179,7 @@ def instrumented_forward(engine: Engine, token_ids: torch.Tensor) -> torch.Tenso
 
     # Compute batch_indices and batch_positions (needed by attention)
     try:
-        import flashinfer_metal as ops
+        import pie_kernels.metal as ops
     except ImportError:
         import flashinfer as ops
 

@@ -28,15 +28,11 @@ from .gpt_oss_utils import (
 )
 from ..config import RuntimeConfig
 from ..adapter import AdapterSubpass
-from ..utils import is_apple_silicon, get_available_memory
+from ..utils import get_available_memory
 from ..schema import Schema, Source, WeightStore
 
-if is_apple_silicon():
-    import flashinfer_metal as ops  # type: ignore[import]
-    from flashinfer_metal import BatchAttentionWithAttentionSinkWrapper  # type: ignore[import]
-else:
-    import flashinfer as ops  # type: ignore[import]
-    from flashinfer.attention import BatchAttentionWithAttentionSinkWrapper  # type: ignore[import]
+import pie_kernels as ops
+from pie_kernels.attention import BatchAttentionWithAttentionSinkWrapper
 
 
 # =============================================================================

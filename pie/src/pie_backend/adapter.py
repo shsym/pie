@@ -4,10 +4,10 @@ import os
 import torch
 import torch.nn as nn
 import math
-from .rand_mv import RAND_MV_AVAILABLE
+from pie_kernels.rand_mv import RAND_MV_AVAILABLE
 
 if RAND_MV_AVAILABLE:
-    from . import rand_mv
+    from pie_kernels import rand_mv
 
 
 def run_length_encode(data: list[int]) -> list[tuple[int, int]]:

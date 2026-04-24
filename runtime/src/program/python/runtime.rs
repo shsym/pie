@@ -89,7 +89,7 @@ fn state() -> &'static State {
 }
 
 /// Returns the py-runtime directory path, or None if py-runtime is not installed.
-pub fn py_runtime_dir() -> Option<&'static Path> {
+pub fn dir() -> Option<&'static Path> {
     state().py_runtime_dir.as_deref()
 }
 
@@ -109,7 +109,7 @@ pub fn is_snapshot_enabled() -> bool {
 }
 
 /// Whether any shared modules were loaded (i.e., py-runtime is installed).
-pub fn has_py_runtime() -> bool {
+pub fn is_available() -> bool {
     !state().shared_modules_full.is_empty()
 }
 

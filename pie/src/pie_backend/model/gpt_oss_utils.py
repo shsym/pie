@@ -414,7 +414,7 @@ def quantize_into_mxfp4(
     is_sf_swizzled_layout: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FP4 batch quantization function."""
-    from flashinfer import fp4_quantize  # type: ignore[import]
+    from pie_kernels import fp4_quantize  # type: ignore[import]
 
     num_experts = a.shape[0]
     sf_vec_size = 32  # MXFP4 uses 32-element blocks
@@ -455,8 +455,8 @@ def quantize_shuffle_gate_up_weights(
     3. Shuffling for transposed MMA output
     4. Shuffling bias vectors to match weight row reordering
     """
-    from flashinfer.fp4_quantization import block_scale_interleave  # type: ignore[import]
-    from flashinfer.fused_moe.core import _maybe_get_cached_w3_w1_permute_indices  # type: ignore[import]
+    from pie_kernels.fp4_quantization import block_scale_interleave  # type: ignore[import]
+    from pie_kernels.fused_moe import _maybe_get_cached_w3_w1_permute_indices  # type: ignore[import]
 
     epilogue_tile_m = 128
     cache_permute_indices: dict[tuple, torch.Tensor] = {}
@@ -544,8 +544,8 @@ def quantize_shuffle_down_weights(
     3. Shuffling for transposed MMA output
     4. Shuffling bias vectors to match weight row reordering
     """
-    from flashinfer.fp4_quantization import block_scale_interleave  # type: ignore[import]
-    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache  # type: ignore[import]
+    from pie_kernels.fp4_quantization import block_scale_interleave  # type: ignore[import]
+    from pie_kernels.fused_moe import get_w2_permute_indices_with_cache  # type: ignore[import]
 
     epilogue_tile_m = 128
     cache_permute_indices: dict[tuple, torch.Tensor] = {}

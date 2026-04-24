@@ -16,8 +16,8 @@ use wasmtime::{Engine, Store};
 use crate::api;
 use crate::instance::InstanceState;
 use crate::process::ProcessId;
+use crate::program::python::runtime as py_runtime;
 use crate::program::{self, InstalledComponent, ProgramName};
-use crate::py_runtime;
 use crate::service::{Service, ServiceHandler};
 
 // ---- Singleton Actor --------------------------------------------------------
@@ -104,7 +104,7 @@ impl Linker {
             } else {
                 py_runtime::full_modules()
             };
-            (modules, py_runtime::py_runtime_dir())
+            (modules, py_runtime::dir())
         } else {
             (&[][..], None)
         };

@@ -1319,7 +1319,7 @@ pub(crate) async fn snapshot_from_bytes(
         false, // capture_outputs
         false, // allow_filesystem
         None,  // token_budget
-        py_runtime::py_runtime_dir(),
+        py_runtime::dir(),
     );
     let mut store = Store::new(engine, inst_state);
 

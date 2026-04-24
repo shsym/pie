@@ -31,13 +31,10 @@ import torch.distributed as dist
 from . import ModelConfig as ModelConfigBase
 from ..config import RuntimeConfig
 from ..adapter import AdapterSubpass
-from ..utils import is_apple_silicon, get_available_memory
+from ..utils import get_available_memory
 from ..schema import Schema, Source, WeightStore
 
-if is_apple_silicon():
-    import flashinfer_metal as ops  # type: ignore[import-not-found]
-else:
-    import flashinfer as ops  # type: ignore[import-not-found,no-redef]
+import pie_kernels as ops
 
 from . import common
 

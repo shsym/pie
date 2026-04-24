@@ -105,7 +105,7 @@ for step in range(10):
 
 # Benchmark if correct
 print("\n=== Performance test ===")
-from flashinfer_metal._wrappers import get_seq_lens, get_batch_indices_positions
+from pie_kernels.metal._wrappers import get_seq_lens, get_batch_indices_positions
 page_size = int(engine.kv_cache_at_layer[0].shape[2])
 kv_page_indices2 = torch.arange(32, dtype=torch.int32, device=device)
 kv_page_indptr2 = torch.tensor([0, 32], dtype=torch.int32, device=device)

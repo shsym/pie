@@ -13,7 +13,6 @@ pub mod messaging;
 pub mod model;
 pub mod path;
 pub mod program;
-pub mod py_runtime;
 pub mod server;
 pub mod linker;
 pub mod process;

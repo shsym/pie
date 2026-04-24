@@ -585,7 +585,7 @@ pub(crate) struct Context {
 }
 
 impl Context {
-    fn new(owner: Option<ProcessId>) -> Self {
+    pub(crate) fn new(owner: Option<ProcessId>) -> Self {
         Context {
             owner,
             device: None,

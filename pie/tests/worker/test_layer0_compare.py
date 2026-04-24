@@ -186,7 +186,7 @@ def main():
         q_manual, k_manual = manual_rope_neox(q_manual, k_manual, cos_sin_cache, positions, cfg.dim_head)
 
         # Step 5-7: Manual attention + O proj + residual
-        from flashinfer_metal._wrappers import trtllm_fp4_block_scale_moe
+        from pie_kernels.metal._wrappers import trtllm_fp4_block_scale_moe
 
         sinks = fp.weights.get("layers.0.attn_sinks")
         scaling = cfg.dim_head ** -0.5

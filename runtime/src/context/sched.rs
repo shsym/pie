@@ -306,21 +306,33 @@ impl ContextManager {
 
         // All contexts on this device are admitted by construction (the
         // contention/eviction system enforces physical capacity).
-        // Clearing price = smallest bid on the device (all GPU-resident contexts).
-        let mut clearing_price = f64::MAX;
+        // Clearing price = smallest bid on the device when contended; zero otherwise.
+        let mut min_bid = f64::MAX;
         let mut n_active = 0usize;
         let mut n_pinned = 0usize;
 
-        // Pass 1: find clearing price (min bid) across all GPU-resident contexts.
+        // Pass 1: find min bid across all GPU-resident contexts.
         for ctx in self.contexts.values() {
             if ctx.owner.is_none() { continue; }
             if ctx.device.unwrap_or(0) as usize != dev_idx { continue; }
             if ctx.is_off_gpu() { continue; }
-            clearing_price = clearing_price.min(ctx.bid);
+            min_bid = min_bid.min(ctx.bid);
             if ctx.is_pinned() { n_pinned += 1; }
             else if ctx.is_active() { n_active += 1; }
         }
-        if clearing_price == f64::MAX { clearing_price = 0.0; }
+
+        // Contention gate (SCHED.md §3.2): the clearing price is the critical
+        // value — the bid at which an admitted context would be displaced.
+        // When no one is waiting and the device has free capacity, no context
+        // faces displacement pressure, so the critical value is zero.
+        //
+        // Contended iff: device is full, or a waiter exists (restore/alloc queue).
+        // restore_queue / alloc_queue are manager-global, so any waiter anywhere
+        // conservatively marks every device contended this tick.
+        let device_full = self.gpu_stores[dev_idx].available() == 0;
+        let has_waiters = !self.restore_queue.is_empty() || !self.alloc_queue.is_empty();
+        let contended = device_full || has_waiters;
+        let clearing_price = if contended && min_bid != f64::MAX { min_bid } else { 0.0 };
 
         let t_pass1 = t_start.elapsed();
 
@@ -896,5 +908,144 @@ impl ContextManager {
             Some(_) => Err(anyhow::anyhow!("Context {id} is pinned, cannot voluntarily suspend")),
             None => Err(anyhow::anyhow!("Context {id} not found")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{Context, RestoreEntry, State};
+
+    /// Build a ContextManager with one device and `num_pages` GPU pages.
+    /// Installs one process (`pid`) and one GPU-resident context (`ctx_id`)
+    /// holding `held_pages` working pages, with `bid` as its declared bid.
+    fn fixture(num_pages: usize, held_pages: usize, bid: f64)
+        -> (ContextManager, ProcessId, ContextId)
+    {
+        let mut mgr = ContextManager::new(0, 16, &[num_pages], &[num_pages], 10);
+        let pid = ProcessId::new_v4();
+        mgr.register_process(pid, Some(160)); // 10 pages at page_size=16
+
+        // Allocate `held_pages` from the GPU pool so `available()` reflects usage.
+        let pages = mgr.gpu_stores[0].alloc(held_pages).expect("alloc");
+
+        let ctx_id = 1u64;
+        let mut ctx = Context::new(Some(pid));
+        ctx.device = Some(0);
+        ctx.working_pages = pages;
+        ctx.bid = bid;
+        ctx.state = State::Active;
+        mgr.contexts.insert(ctx_id, ctx);
+        mgr.process_entry(pid).context_ids.push(ctx_id);
+
+        (mgr, pid, ctx_id)
+    }
+
+    /// On an uncontended device (free capacity, no waiters), clearing price
+    /// is zero and no rent is charged even when contexts bid positively.
+    #[test]
+    fn uncontended_device_charges_no_rent() {
+        let (mut mgr, pid, ctx_id) = fixture(100, 5, 2.0);
+        let balance_before = mgr.process_entry(pid).balance;
+        assert!(mgr.gpu_stores[0].available() > 0, "device should have slack");
+        assert!(mgr.restore_queue.is_empty());
+        assert!(mgr.alloc_queue.is_empty());
+
+        mgr.tick(0, 0.001, &[ctx_id]);
+
+        assert_eq!(mgr.auction_results[0].clearing_price, 0.0,
+            "uncontended device must quote zero clearing price");
+        assert_eq!(mgr.auction_results[0].total_revenue, 0.0,
+            "no revenue when uncontended");
+        assert_eq!(mgr.process_entry(pid).balance, balance_before,
+            "balance must not drain when uncontended");
+    }
+
+    /// A non-empty restore_queue marks the device as contended even if the
+    /// GPU has free pages. Revenue is collected at min(bid) × eff_pages.
+    ///
+    /// (Balance of a lone process is invariant under rent/dividend because
+    /// the rent it pays flows back as its own dividend — zero-sum with one
+    /// endowment-holder. So we assert on `total_revenue`, which is the
+    /// direct observable of "rent was charged.")
+    #[test]
+    fn waiter_in_queue_triggers_rent() {
+        let (mut mgr, _pid, ctx_id) = fixture(100, 5, 2.0);
+
+        mgr.restore_queue.push(RestoreEntry {
+            ctx_id: 9999, bid: 0.1, defaulted: false,
+        });
+
+        mgr.tick(0, 0.001, &[ctx_id]);
+
+        assert_eq!(mgr.auction_results[0].clearing_price, 2.0,
+            "contended device quotes min(bid) as clearing price");
+        assert_eq!(mgr.auction_results[0].total_revenue, 10.0,
+            "revenue = clearing_price × eff_pages = 2 × 5");
+    }
+
+    /// A fully-packed device with no waiters is still contended — any new
+    /// arrival would force eviction, so the critical value is positive.
+    #[test]
+    fn full_device_charges_rent_even_with_no_waiters() {
+        let (mut mgr, _pid, ctx_id) = fixture(5, 5, 1.5);
+        assert_eq!(mgr.gpu_stores[0].available(), 0, "device is full");
+        assert!(mgr.restore_queue.is_empty());
+
+        mgr.tick(0, 0.001, &[ctx_id]);
+
+        assert_eq!(mgr.auction_results[0].clearing_price, 1.5);
+        assert_eq!(mgr.auction_results[0].total_revenue, 7.5,
+            "revenue = 1.5 × 5 eff pages");
+    }
+
+    /// Wealth transfer under contention: when only one of two equally-
+    /// endowed contexts is in-batch, rent flows from the payer to the
+    /// non-payer via the endowment-weighted dividend. Conservation holds
+    /// when payment isn't capped (both processes afford full rent).
+    #[test]
+    fn rent_redistributes_between_processes_under_contention() {
+        // Both processes get large budgets so payment isn't balance-capped.
+        let mut mgr = ContextManager::new(0, 16, &[10], &[10], 10);
+
+        let payer_pid = ProcessId::new_v4();
+        mgr.register_process(payer_pid, Some(16 * 1000)); // 1000-page budget
+        let payer_pages = mgr.gpu_stores[0].alloc(5).expect("alloc");
+        let payer_ctx = 1u64;
+        let mut c1 = Context::new(Some(payer_pid));
+        c1.device = Some(0);
+        c1.working_pages = payer_pages;
+        c1.bid = 4.0;
+        c1.state = State::Active;
+        mgr.contexts.insert(payer_ctx, c1);
+        mgr.process_entry(payer_pid).context_ids.push(payer_ctx);
+
+        let recv_pid = ProcessId::new_v4();
+        mgr.register_process(recv_pid, Some(16 * 1000));
+        let recv_pages = mgr.gpu_stores[0].alloc(5).expect("alloc");
+        let recv_ctx = 2u64;
+        let mut c2 = Context::new(Some(recv_pid));
+        c2.device = Some(0);
+        c2.working_pages = recv_pages;
+        c2.bid = 4.0;
+        c2.state = State::Active;
+        mgr.contexts.insert(recv_ctx, c2);
+        mgr.process_entry(recv_pid).context_ids.push(recv_ctx);
+
+        let payer_before = mgr.process_entry(payer_pid).balance;
+        let recv_before = mgr.process_entry(recv_pid).balance;
+
+        // Only payer_ctx in batch — recv_ctx sits out this tick.
+        mgr.tick(0, 0.001, &[payer_ctx]);
+
+        let payer_after = mgr.process_entry(payer_pid).balance;
+        let recv_after = mgr.process_entry(recv_pid).balance;
+
+        assert!(payer_after < payer_before, "payer should lose balance");
+        assert!(recv_after > recv_before, "receiver should gain balance");
+        let before = payer_before + recv_before;
+        let after = payer_after + recv_after;
+        assert!((before - after).abs() < 1e-9,
+            "total balance conserved: before={before} after={after}");
     }
 }
