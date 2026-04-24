@@ -54,10 +54,23 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _clear_wasmtime_cache():
+    """Remove the on-disk wasmtime module cache.
+
+    After WASM binaries are recompiled, stale cached compiled modules may
+    have incompatible WIT type orderings. Clearing the cache forces
+    wasmtime to recompile from the current .wasm files.
+    """
+    import shutil
+    cache_dir = Path.home() / ".cache" / "wasmtime"
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
 async def run_inferlet(
     client,
     name: str,
-    extra_args: dict | None = None,
+    extra_args: dict | list | None = None,
     *,
     timeout: int = 120,
 ) -> str:
@@ -67,7 +80,8 @@ async def run_inferlet(
     Raises ``RuntimeError`` on error or timeout, ``FileNotFoundError`` if the
     WASM binary or manifest is missing.
     """
-    extra_args = extra_args or {}
+    if extra_args is None:
+        extra_args = []
     wasm_name = name.replace("-", "_")
     wasm_path = INFERLETS_DIR / name / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm"
     manifest_path = INFERLETS_DIR / name / "Pie.toml"
@@ -82,7 +96,7 @@ async def run_inferlet(
     version = manifest["package"]["version"]
     inferlet_id = f"{pkg_name}@{version}"
 
-    await client.install_program(wasm_path, manifest_path)
+    await client.install_program(wasm_path, manifest_path, force_overwrite=True)
     process = await client.launch_process(inferlet_id, input=extra_args)
 
     output_parts: list[str] = []
@@ -116,6 +130,10 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     from pie.config import Config, ModelConfig, AuthConfig
 
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else args.device
+
+    # Clear stale wasmtime module cache to avoid linker mismatches
+    # between recompiled WASM components and cached compiled modules.
+    _clear_wasmtime_cache()
 
     print(f"Model:  {args.model}")
     print(f"Device: {device}")

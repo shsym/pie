@@ -9,8 +9,8 @@
 //! only the accepted prefix is committed to the KV cache.
 
 use inferlet::{
-    context::Context, model::Model, runtime,
-    ContextExt, ForwardPassExt, InstructExt, Result,
+    Context, model::Model, runtime,
+    ForwardPassExt, Result,
     inference::{ForwardPass, Output, Sampler},
 };
 use std::time::Instant;
@@ -45,16 +45,16 @@ async fn main(args: Vec<String>) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
     let tokenizer = model.tokenizer();
-    let stop_tokens = Context::stop_tokens(&model);
+    let stop_tokens = inferlet::instruct::chat::stop_tokens(&model);
 
-    let ctx = Context::create(&model)?;
-    let page_size = ctx.tokens_per_page();
+    let mut ctx = Context::new(&model)?;
+    let page_size = ctx.page_size();
 
-    let mut pending_tokens: Vec<u32> = Vec::new();
-    pending_tokens.extend(ctx.system("You are a helpful assistant."));
-    pending_tokens.extend(ctx.user(&prompt));
-    pending_tokens.extend(ctx.cue());
-    ctx.flush(&pending_tokens).await?;
+    // Fill the prompt using the Context API and flush to run prefill.
+    ctx.system("You are a helpful assistant.")
+        .user(&prompt)
+        .cue();
+    ctx.flush().await?;
 
     println!(
         "--- Jacobi Decoding (window_size={}, page_size={}) ---",
@@ -64,25 +64,48 @@ async fn main(args: Vec<String>) -> Result<String> {
     let mut all_generated: Vec<u32> = Vec::new();
     let sampler = Sampler::TopP((0.0, 1.0));
 
-    // Bootstrap: sample the first token from the flushed KV cache
-    let bootstrap_pass = ForwardPass::new(&model);
-    bootstrap_pass.context(&ctx);
-    bootstrap_pass.sampler(&[0], sampler.clone());
-    let bootstrap_output = bootstrap_pass.execute_async().await
-        .map_err(|e| format!("Bootstrap forward pass failed: {}", e))?;
-    let mut anchor = match bootstrap_output {
-        Output::Tokens(t) if !t.is_empty() => t[0],
-        _ => return Err("Bootstrap sampling produced no token".to_string()),
-    };
-    all_generated.push(anchor);
+    // Bootstrap: sample the first token from the prefilled context.
+    // After flush(), the context has pages allocated with prompt KV.
+    // We need to run a 1-token decode step to get the first output token.
+    {
+        let wpt = ctx.inner().working_page_token_count();
+        let seq_len = ctx.inner().committed_page_count() * page_size + wpt;
+
+        // Use the last cue token as decode trigger
+        let cue_tokens = inferlet::instruct::chat::cue(&model);
+        let trigger = *cue_tokens.last().unwrap_or(&0);
+
+        let current_working_pages = ctx.inner().working_page_count();
+        let total_tokens_after = wpt + 1;
+        let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
+        let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
+        if additional_pages > 0 {
+            ctx.inner().reserve_working_pages(additional_pages)
+                .map_err(|e| format!("Failed to reserve pages: {}", e))?;
+        }
+
+        let pass = ForwardPass::new(&model);
+        pass.context(ctx.inner());
+        pass.input_tokens(&[trigger], &[seq_len]);
+        pass.sampler(&[0], sampler.clone());
+        let output = pass.execute_async().await
+            .map_err(|e| format!("Bootstrap forward pass failed: {}", e))?;
+        match output {
+            Output::Tokens(t) if !t.is_empty() => {
+                all_generated.push(t[0]);
+            }
+            _ => return Err("Bootstrap sampling produced no token".to_string()),
+        }
+    }
+    let mut anchor = all_generated[0];
 
     // Speculative guesses initialized to copies of the anchor
     let mut window: Vec<u32> = vec![anchor; window_size];
     let mut total_accepted = 1; // anchor already counted
 
     while total_accepted < max_tokens {
-        let wpt = ctx.working_page_token_count();
-        let seq_len = ctx.committed_page_count() * page_size + wpt;
+        let wpt = ctx.inner().working_page_token_count();
+        let seq_len = ctx.inner().committed_page_count() * page_size + wpt;
 
         // Build the full token list: [anchor] + [window guesses]
         let mut input_all = vec![anchor];
@@ -91,17 +114,17 @@ async fn main(args: Vec<String>) -> Result<String> {
         let input_count = input_all.len();
 
         // Reserve additional pages
-        let current_working_pages = ctx.working_page_count();
+        let current_working_pages = ctx.inner().working_page_count();
         let total_tokens_after = wpt + input_count as u32;
         let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
         let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
         if additional_pages > 0 {
-            ctx.reserve_working_pages(additional_pages)
+            ctx.inner().reserve_working_pages(additional_pages)
                 .map_err(|e| format!("Failed to reserve pages: {}", e))?;
         }
 
         let pass = ForwardPass::new(&model);
-        pass.context(&ctx);
+        pass.context(ctx.inner());
 
         // All tokens go as regular input (so they're all embedded and processed)
         let positions: Vec<u32> = (seq_len..seq_len + input_count as u32).collect();
@@ -155,14 +178,14 @@ async fn main(args: Vec<String>) -> Result<String> {
         let new_wpt = wpt + commit_count as u32;
         let pages_to_commit = new_wpt / page_size;
         if pages_to_commit > 0 {
-            ctx.commit_working_pages(pages_to_commit)
+            ctx.inner().commit_working_pages(pages_to_commit)
                 .map_err(|e| format!("Failed to commit pages: {}", e))?;
         }
 
         // Pop un-accepted speculative tokens from working pages
         let speculative_count = input_count as u32 - commit_count as u32;
         if speculative_count > 0 {
-            ctx.pop_working_page_tokens(speculative_count);
+            ctx.inner().truncate_working_page_tokens(speculative_count);
         }
 
         if stop_at < newly_accepted.len() || total_accepted >= max_tokens {

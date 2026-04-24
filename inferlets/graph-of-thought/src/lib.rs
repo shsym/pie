@@ -8,8 +8,8 @@
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, future};
 use inferlet::{
-    context::Context, inference::Sampler, model::Model,
-    runtime, ContextExt, InstructExt, Result,
+    Context, inference::Sampler, model::Model,
+    runtime, Result,
 };
 use std::time::Instant;
 
@@ -39,7 +39,7 @@ and aggregate their ideas into a single, improved solution:\n";
 
 /// Main logic for running the hierarchical aggregation workflow.
 async fn run_hierarchical_aggregation(
-    base_context: &Context,
+    base_context: &mut Context,
     question: &str,
     proposal_tokens: Vec<usize>,
     aggregation_tokens: usize,
@@ -52,7 +52,7 @@ async fn run_hierarchical_aggregation(
     let mut proposal_tasks = proposal_tokens
         .into_iter()
         .map(|max_tokens| {
-            let ctx = base_context.fork()?;
+            let mut ctx = base_context.fork()?;
             Ok(async move {
                 ctx.cue();
                 let proposal_text = ctx
@@ -72,7 +72,7 @@ async fn run_hierarchical_aggregation(
     let mut pending_proposal: Option<(String, Context)> = None;
 
     while let Some(result) = proposal_tasks.next().await {
-        let (proposal_text, proposal_ctx) = result?;
+        let (proposal_text, mut proposal_ctx) = result?;
         if pending_proposal.is_none() {
             pending_proposal = Some((proposal_text, proposal_ctx));
         } else {
@@ -97,7 +97,7 @@ async fn run_hierarchical_aggregation(
     let mut pending_aggregation: Option<(String, Context)> = None;
 
     while let Some(result) = first_aggregation_tasks.next().await {
-        let (aggregation_text, aggregation_ctx) = result?;
+        let (aggregation_text, mut aggregation_ctx) = result?;
         if pending_aggregation.is_none() {
             pending_aggregation = Some((aggregation_text, aggregation_ctx));
         } else {
@@ -160,12 +160,12 @@ async fn main(args: Vec<String>) -> Result<String> {
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
 
-    let ctx_root = Context::new(&model)?;
+    let mut ctx_root = Context::new(&model)?;
     ctx_root.system(SYSTEM_PROMPT);
     ctx_root.flush().await?;
 
     let final_solutions = run_hierarchical_aggregation(
-        &ctx_root,
+        &mut ctx_root,
         &question,
         proposal_tokens,
         aggregation_tokens,

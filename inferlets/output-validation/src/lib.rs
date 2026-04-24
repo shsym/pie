@@ -4,8 +4,8 @@
 //! given a context, using the ForwardPass API with distribution sampling.
 
 use inferlet::{
-    context::Context, model::Model, runtime,
-    ContextExt, InstructExt, ForwardPassExt, Result,
+    Context, model::Model, runtime,
+    ForwardPassExt, Result,
     inference::{ForwardPass, Output, Sampler},
 };
 use std::time::Instant;
@@ -45,20 +45,20 @@ pub async fn validate_outputs(
                 break;
             }
 
-            let current_working_pages = candidate_ctx.working_page_count();
-            let page_size = candidate_ctx.tokens_per_page();
-            let wpt = candidate_ctx.working_page_token_count();
-            let seq_len = candidate_ctx.committed_page_count() * page_size + wpt;
+            let current_working_pages = candidate_ctx.inner().working_page_count();
+            let page_size = candidate_ctx.page_size();
+            let wpt = candidate_ctx.inner().working_page_token_count();
+            let seq_len = candidate_ctx.inner().committed_page_count() * page_size + wpt;
             let total_tokens_after = wpt + pending.len() as u32;
             let total_pages_needed = (total_tokens_after + page_size - 1) / page_size;
             let additional_pages = total_pages_needed.saturating_sub(current_working_pages);
             if additional_pages > 0 {
-                candidate_ctx.reserve_working_pages(additional_pages)
+                candidate_ctx.inner().reserve_working_pages(additional_pages)
                     .map_err(|e| format!("Failed to reserve pages: {}", e))?;
             }
 
             let pass = ForwardPass::new(model);
-            pass.context(&candidate_ctx);
+            pass.context(candidate_ctx.inner());
             let positions: Vec<u32> = (seq_len..seq_len + pending.len() as u32).collect();
             pass.input_tokens(&pending, &positions);
 
@@ -73,7 +73,7 @@ pub async fn validate_outputs(
             let new_wpt = wpt + pending.len() as u32;
             let pages_to_commit = new_wpt / page_size;
             if pages_to_commit > 0 {
-                candidate_ctx.commit_working_pages(pages_to_commit)
+                candidate_ctx.inner().commit_working_pages(pages_to_commit)
                     .map_err(|e| format!("Failed to commit pages: {}", e))?;
             }
 
@@ -142,19 +142,18 @@ async fn main(args: Vec<String>) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
 
-    let ctx = Context::create(&model)?;
+    let mut ctx = Context::new(&model)?;
 
     let mut pending_tokens: Vec<u32> = Vec::new();
-    pending_tokens.extend(ctx.system("You are an expert at information extraction."));
-    pending_tokens.extend(ctx.user(
+    pending_tokens.extend(inferlet::instruct::chat::system(&model, "You are an expert at information extraction."));
+    pending_tokens.extend(inferlet::instruct::chat::user(&model,
         "From the sentence \"The financial report was prepared by David Chen.\", \
         extract the person's name.",
     ));
-    pending_tokens.extend(ctx.cue());
+    pending_tokens.extend(inferlet::instruct::chat::cue(&model));
 
     let prompt = "The name of the person in the report is ";
     pending_tokens.extend(model.tokenizer().encode(prompt));
-    ctx.flush(&pending_tokens).await?;
 
     // Define the list of candidate outputs to validate
     let candidates = vec![

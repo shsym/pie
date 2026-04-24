@@ -6,8 +6,8 @@
 
 use futures::future;
 use inferlet::{
-    context::Context, inference::Sampler, model::Model,
-    runtime, ContextExt, InstructExt, Result,
+    Context, inference::Sampler, model::Model,
+    runtime, Result,
 };
 
 use std::future::Future;
@@ -92,7 +92,7 @@ fn divide_and_conquer<'a>(
     Box::pin(async move {
         // Base Case: If max depth is reached, solve the problem directly.
         if path.len() >= max_depth {
-            let solve_ctx = ctx.fork()?;
+            let mut solve_ctx = ctx.fork()?;
             let solve_prompt = format!("{} {}", SOLVE_PROMPT, question);
             solve_ctx.user(&solve_prompt);
             solve_ctx.cue();
@@ -111,7 +111,7 @@ fn divide_and_conquer<'a>(
 
         // Recursive Step: Try to divide the problem.
         verbose_println!(verbose, "Analysing problem at path {:?}", path);
-        let divide_ctx = ctx.fork()?;
+        let mut divide_ctx = ctx.fork()?;
         let divide_prompt = DIVIDE_PROMPT_TEMPLATE.replace("{}", question);
         divide_ctx.user(&divide_prompt);
         divide_ctx.cue();
@@ -171,7 +171,7 @@ fn divide_and_conquer<'a>(
                 }
 
                 verbose_println!(verbose, "Merging solutions at path {:?}", path);
-                let merge_ctx = ctx.fork()?;
+                let mut merge_ctx = ctx.fork()?;
                 let merge_prompt = format!(
                     "Subtask 1 solution: {}\nSubtask 2 solution: {}\n{}",
                     solution1, solution2, MERGE_PROMPT
@@ -223,7 +223,7 @@ async fn main(args: Vec<String>) -> Result<String> {
     let model_name = models.first().ok_or("No models available")?;
     let model = Model::load(model_name)?;
 
-    let ctx = Context::new(&model)?;
+    let mut ctx = Context::new(&model)?;
     ctx.system("You are a helpful, respectful and honest assistant.");
     ctx.flush().await?;
 
