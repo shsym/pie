@@ -344,19 +344,22 @@ class Batch:
             "top_k": top_k_tensor,
             "top_p": top_p_tensor,
             "min_p": min_p_tensor,
+            # `sampling_masks` is the effective logit mask at each logit
+            # position. Prefer whichever source populated it (historically two
+            # names coexisted; `logit_masks` came from grammar constraints via
+            # forward_pass.logit_mask, `sampling_masks` via a now-unused arg).
             "sampling_masks": (
                 torch.as_tensor(self.sampling_masks, device=device, dtype=torch.bool)
                 if self.sampling_masks is not None
-                else None
-            ),
-            "logit_masks": (
-                torch.as_tensor(
-                    np.repeat(self.logit_masks, self.indices_per_request, axis=0) if self.logit_masks is not None else [],
-                    device=device,
-                    dtype=torch.bool,
+                else (
+                    torch.as_tensor(
+                        np.repeat(self.logit_masks, self.indices_per_request, axis=0),
+                        device=device,
+                        dtype=torch.bool,
+                    )
+                    if self.logit_masks is not None
+                    else None
                 )
-                if self.logit_masks is not None
-                else None
             ),
         }
 
@@ -445,6 +448,12 @@ def decode_brle_batch(
     total_bits = token_acc_seq_lens[-1]
     result = np.zeros(total_bits, dtype=np.bool_)
 
+    # BRLE format (see runtime/src/inference/brle.rs): the sequence always
+    # begins with a `false` run (possibly zero-length), then alternates
+    # false, true, false, true, ... The inferlet convention for attention
+    # masks (see e.g. inferlets/attention-sink/src/lib.rs) matches:
+    #   [count_of_0s, count_of_1s, count_of_0s, ...]
+    # where 1 = "attend" (custom_mask True in flashinfer).
     for k in range(num_tokens):
         rle_start = mask_indptr[k]
         rle_end = mask_indptr[k + 1]
@@ -453,7 +462,7 @@ def decode_brle_batch(
 
         curr_bit_pos = global_bit_start
         bits_consumed = 0
-        is_true_run = True
+        is_true_run = False  # BRLE always starts with a (possibly-empty) false run
 
         for run_idx in range(rle_start, rle_end):
             if bits_consumed >= valid_len:
@@ -492,7 +501,11 @@ def decode_sampling_masks(
 
     Returns:
         Boolean array of shape (num_requests, vocab_size).
-        Initialized to True (allow all). BRLE runs are applied on top.
+
+    The BRLE format (see runtime/src/inference/brle.rs) always starts with
+    a `false` run (possibly zero-length), then alternates: false, true,
+    false, true, ... When a request has an empty BRLE we default to True
+    (allow all), matching the legacy "no constraint = no masking" behavior.
     """
     result = np.ones((num_requests, vocab_size), dtype=np.bool_)
 
@@ -500,13 +513,15 @@ def decode_sampling_masks(
         rle_start = mask_indptr[i]
         rle_end = mask_indptr[i + 1]
 
-        # If empty RLE, we leave as True (allow all)
+        # Empty BRLE for this request = no constraint, leave as all-True.
         if rle_end == rle_start:
             continue
 
-        # Standard BRLE decoding
+        # Non-empty BRLE: start from all-False and fill in the True runs.
+        result[i, :] = False
+
         curr_pos = 0
-        is_true_run = True  # Starts with True runs
+        is_true_run = False  # BRLE always starts with a (possibly-empty) false run
 
         for run_idx in range(rle_start, rle_end):
             if curr_pos >= vocab_size:
@@ -516,18 +531,10 @@ def decode_sampling_masks(
             remaining = vocab_size - curr_pos
             eff_len = min(run_len, remaining)
 
-            if eff_len > 0:
-                if not is_true_run:
-                    # Set to False
-                    result[i, curr_pos : curr_pos + eff_len] = False
-                # Else leave as True
+            if eff_len > 0 and is_true_run:
+                result[i, curr_pos : curr_pos + eff_len] = True
 
             curr_pos += eff_len
             is_true_run = not is_true_run
-
-        # If RLE ended before vocab_size, remaining are left as True (since we init to True)
-        # This is safe? Usually mask covers full range.
-        # If mask is short, we assume trailing are allowed? Or blocked?
-        # Protocol should assert full coverage, but 'allow' is safer default.
 
     return result

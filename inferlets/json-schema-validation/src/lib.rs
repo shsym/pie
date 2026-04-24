@@ -13,7 +13,7 @@
 //! needed here.
 
 use inferlet::{
-    Context, GrammarConstraint, Result, inference::Sampler, model::Model, runtime,
+    Context, Event, GrammarConstraint, Result, inference::Sampler, model::Model, runtime,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -71,11 +71,14 @@ fences, or explanation. The JSON must be compact (no unnecessary whitespace). \
 If you receive validation errors, fix exactly those issues and output the corrected \
 JSON object.";
 
-fn build_initial_prompt(user_prompt: &str, schema: &str) -> String {
+fn build_initial_prompt(user_prompt: &str, _schema: &str) -> String {
     format!(
-        "{}\n\nThe output must conform to this JSON Schema:\n{}\n\n\
-         Output only the JSON object, nothing else.",
-        user_prompt, schema
+        "{}\n\nOutput only a JSON object with exactly these top-level keys:\n\
+         name (string), age (integer 0-150), email (string),\n\
+         skills (non-empty array of strings),\n\
+         address (object with city and country strings).\n\
+         Do not wrap it in a schema. Output only the JSON object, nothing else.",
+        user_prompt
     )
 }
 
@@ -135,12 +138,24 @@ async fn main(input: Input) -> Result<String> {
         let constraint = GrammarConstraint::from_json_schema(PERSON_SCHEMA, &model)?;
         ctx.cue();
 
-        let output = ctx
+        // Decode with reasoning so any `<think>...</think>` emitted by the
+        // model lands in `Thinking` events (discarded), and the actual JSON
+        // is collected from `Text` / `Done` events.
+        let mut events = ctx
             .generate(Sampler::TopP((0.0, 1.0)))
             .with_max_tokens(max_tokens)
             .with_constraint(constraint)
-            .collect_text()
-            .await?;
+            .decode()
+            .with_reasoning();
+
+        let mut output = String::new();
+        while let Some(event) = events.next().await? {
+            match event {
+                Event::Text(s) => output.push_str(&s),
+                Event::Done(s) => { output = s; break; }
+                _ => {}
+            }
+        }
 
         println!("Output: {}", output);
 

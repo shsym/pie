@@ -170,10 +170,24 @@ class DummyForwardPass:
         if num_samples == 0:
             return {"tokens": [], "dists": [], "nan_indices": []}
 
-        # Generate random tokens within vocabulary range
-        random_tokens = torch.randint(
-            0, self.vocab_size, (num_samples,), device=self.device
-        ).tolist()
+        # If the inferlet supplied logit masks (e.g. grammar-constrained
+        # decoding), sample only from the tokens each mask allows — otherwise
+        # dummy generation can never satisfy a grammar. Mask is a bool tensor
+        # [num_samples, vocab_size]; True means the token is allowed.
+        sampling_masks = sampling_metadata.get("sampling_masks")
+
+        random_tokens: list[int] = []
+        for i in range(num_samples):
+            if sampling_masks is not None:
+                allowed = torch.nonzero(sampling_masks[i], as_tuple=True)[0]
+                if allowed.numel() > 0:
+                    pick = torch.randint(0, allowed.numel(), (1,), device=self.device).item()
+                    picked_tok = int(allowed[pick].item())
+                    random_tokens.append(picked_tok)
+                    continue
+            random_tokens.append(
+                int(torch.randint(0, self.vocab_size, (1,), device=self.device).item())
+            )
 
         # Build distributions: None for token-sampling, (ids, probs) for dist requests
         dists: list[tuple[list[int], list[float]] | None] = [None] * num_samples
@@ -192,9 +206,18 @@ class DummyForwardPass:
                         k = 128
                 k = min(k, self.vocab_size)
 
-                # Generate random token IDs and a random probability distribution
-                ids = torch.randint(0, self.vocab_size, (k,), device=self.device).tolist()
-                raw = torch.rand(k, device=self.device)
+                # Respect the logit mask for this row if present.
+                if sampling_masks is not None:
+                    allowed = torch.nonzero(sampling_masks[idx], as_tuple=True)[0]
+                    if allowed.numel() > 0:
+                        k_eff = min(k, allowed.numel())
+                        perm = torch.randperm(allowed.numel(), device=self.device)[:k_eff]
+                        ids = allowed[perm].tolist()
+                    else:
+                        ids = torch.randint(0, self.vocab_size, (k,), device=self.device).tolist()
+                else:
+                    ids = torch.randint(0, self.vocab_size, (k,), device=self.device).tolist()
+                raw = torch.rand(len(ids), device=self.device)
                 probs = (raw / raw.sum()).tolist()
                 dists[idx] = (ids, probs)
 

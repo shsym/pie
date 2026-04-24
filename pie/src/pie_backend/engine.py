@@ -186,20 +186,32 @@ class Engine:
 
         _log("Initializing in DUMMY MODE - no GPU weights will be loaded", "INFO")
 
+        # Load the real model's config.json (if available) to pick up the
+        # actual vocab size. Grammar-constrained decoding builds logit masks
+        # sized to the tokenizer's vocab, so a mismatched vocab here would
+        # make the Python BRLE decoder truncate/misalign the mask.
+        snapshot_dir = None
+        hf_vocab_size: int | None = None
+        try:
+            snapshot_dir = hf_utils.get_hf_snapshot_dir(config.hf_repo)
+            _log(f"Loaded tokenizer from {config.hf_repo}", "DEBUG")
+            import json as _json
+            from pathlib import Path as _Path
+            cfg_path = _Path(snapshot_dir) / "config.json"
+            if cfg_path.is_file():
+                hf_cfg = _json.loads(cfg_path.read_text())
+                hf_vocab_size = hf_cfg.get("vocab_size")
+        except Exception as e:
+            _log(f"Could not load tokenizer: {e}. Using empty tokenizer.", "WARN")
+
         model_config = DummyModelConfig()
+        if hf_vocab_size is not None:
+            model_config.vocab_size = int(hf_vocab_size)
         config.max_num_kv_pages = model_config.eval_max_num_kv_pages(config)
 
         forward_pass = DummyForwardPass(model_config, config)
         kv_cache_at_layer = create_kv_cache(model_config, config)
         adapter_at_layer = create_adapter_cache(model_config, config)
-
-        # Load tokenizer from HuggingFace (doesn't require GPU)
-        snapshot_dir = None
-        try:
-            snapshot_dir = hf_utils.get_hf_snapshot_dir(config.hf_repo)
-            _log(f"Loaded tokenizer from {config.hf_repo}", "DEBUG")
-        except Exception as e:
-            _log(f"Could not load tokenizer: {e}. Using empty tokenizer.", "WARN")
 
         info = {
             "architecture": {"type": "dummy"},

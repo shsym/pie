@@ -10,7 +10,7 @@
 //! it regenerates (still grammar-constrained). Retries cap at `--max-retries`.
 
 use inferlet::{
-    Context, GrammarConstraint, Result, inference::Sampler, model::Model, runtime,
+    Context, Event, GrammarConstraint, Result, inference::Sampler, model::Model, runtime,
 };
 use minijinja::Environment;
 use serde::Deserialize;
@@ -89,7 +89,8 @@ const PRODUCT_SCHEMA: &str = r#"{
             "type": ["integer", "null"]
         }
     },
-    "required": ["product_name", "tagline", "description", "features", "price", "release_date"]
+    "required": ["product_name", "tagline", "description", "features", "price", "release_date"],
+    "additionalProperties": false
 }"#;
 
 const SYSTEM_PROMPT: &str = "\
@@ -99,12 +100,15 @@ The JSON must conform to the JSON Schema provided in the user message. \
 If you receive validation or rendering errors, fix the JSON to address the issues \
 and output only the corrected JSON object.";
 
-fn build_initial_prompt(user_prompt: &str, schema: &str) -> String {
+fn build_initial_prompt(user_prompt: &str, _schema: &str) -> String {
     format!(
         "Generate product announcement data for: {}.\n\n\
-         The output must conform to this JSON Schema:\n{}\n\n\
-         Output only the JSON object, nothing else.",
-        user_prompt, schema
+         Output only a JSON object with exactly these top-level keys:\n\
+         product_name (string), tagline (string), description (string),\n\
+         features (non-empty array of strings), price (string),\n\
+         release_date (string), discount_percent (integer or null).\n\
+         Do not wrap it in a schema. Output only the JSON object, nothing else.",
+        user_prompt
     )
 }
 
@@ -173,12 +177,23 @@ async fn main(input: Input) -> Result<String> {
         let constraint = GrammarConstraint::from_json_schema(PRODUCT_SCHEMA, &model)?;
         ctx.cue();
 
-        let output = ctx
+        // Decode with reasoning so `<think>...</think>` lands in Thinking
+        // events (discarded); the actual JSON is accumulated from Text/Done.
+        let mut events = ctx
             .generate(Sampler::TopP((0.0, 1.0)))
             .with_max_tokens(max_tokens)
             .with_constraint(constraint)
-            .collect_text()
-            .await?;
+            .decode()
+            .with_reasoning();
+
+        let mut output = String::new();
+        while let Some(event) = events.next().await? {
+            match event {
+                Event::Text(s) => output.push_str(&s),
+                Event::Done(s) => { output = s; break; }
+                _ => {}
+            }
+        }
 
         println!("Output: {}", output);
 
