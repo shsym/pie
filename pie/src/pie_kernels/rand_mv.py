@@ -29,8 +29,9 @@ if not RAND_MV_AVAILABLE:
         )
 
 elif torch.cuda.is_available():
-    from .cuda.rand_mv import (  # noqa: F401
+    from .cuda.rand_mv_new import (  # noqa: F401
         batched_randn_matmul,
+        batched_randn_matmul_sectioned,
         batched_randn_generate,
         run_tests,
     )

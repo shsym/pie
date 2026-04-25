@@ -289,9 +289,13 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let output_speculative_tokens = pass.output_speculative_tokens;
         let masks = take(&mut pass.mask);
 
-        // WIT spec: "if not provided, fallback to causal mask"
+        // WIT spec: "if not provided, fallback to causal mask".
+        // Each token at position `pos` must attend to all (pos + 1) preceding
+        // positions including itself — i.e., the row is all-True over its
+        // valid prefix. Under the starts-with-False BRLE convention, that's
+        // a zero-length false-run prefix followed by a true run of pos+1.
         let masks = if masks.is_empty() && !positions.is_empty() {
-            positions.iter().map(|&pos| Brle::new((pos + 1) as usize)).collect()
+            positions.iter().map(|&pos| Brle::all_true((pos + 1) as usize)).collect()
         } else {
             masks
         };

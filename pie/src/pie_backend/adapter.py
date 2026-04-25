@@ -9,6 +9,13 @@ from pie_kernels.rand_mv import RAND_MV_AVAILABLE
 if RAND_MV_AVAILABLE:
     from pie_kernels import rand_mv
 
+# Fast path: the CUDA backend (rand_mv_new) exposes batched_randn_matmul_sectioned
+# and supports out=/beta=/W_mean=/seed_offset= for fused mean+noise kernels. The
+# Metal backend does not, so we fall back to the legacy per-section calls there.
+_HAS_FUSED_RAND_MV = RAND_MV_AVAILABLE and hasattr(
+    rand_mv, "batched_randn_matmul_sectioned"
+)
+
 
 def run_length_encode(data: list[int]) -> list[tuple[int, int]]:
     """
@@ -79,7 +86,6 @@ class AdapterSubpass:
             # q_state, k_state, v_state are SHARDED (local output).
 
             rand_seeds = self.rand_seeds[x_start:x_end]
-            inject_noise = rand_seeds.any().item()
             assert x.shape[0] == rand_seeds.shape[0], "Batch size must match seeds."
 
             Wd = self.adapter_at_layer[layer_idx][0][adapter_index]
@@ -89,86 +95,153 @@ class AdapterSubpass:
             adapter_info = self.adapter_extras[adapter_index]
 
             rank_lora = adapter_info.rank  # LoRA rank, not GPU rank
+            out_indptr = adapter_info.out_features_indptr
+            scaling = adapter_info.alpha / float(rank_lora)
+            is_cmaes = isinstance(adapter_info, CmaesAdapter)
 
-            # We assume CmaesAdapter was initialized with LOCAL out_features.
-            # So adapter_info.out_features is [local_d_q, local_d_k, local_d_v]
-            out_indptr = adapter_info.out_features_indptr  # [0, local_d_q, ...]
+            # UP-projection geometry (LOCAL out_features per rank)
+            Wu_q_local = Wu[:, out_indptr[0] : out_indptr[1]]
+            Wu_k_local = Wu[:, out_indptr[1] : out_indptr[2]]
+            Wu_v_local = Wu[:, out_indptr[2] : out_indptr[3]]
+            local_d_q = out_indptr[1] - out_indptr[0]
+            local_d_k = out_indptr[2] - out_indptr[1]
+            local_d_v = out_indptr[3] - out_indptr[2]
+            global_d_q = local_d_q * world_size
+            global_d_k = local_d_k * world_size
+            global_d_v = local_d_v * world_size
 
-            # Down-projection is replicated on input (x), produces replicated output (low-rank).
-            # This part executes identically on all ranks if X is identical.
+            if _HAS_FUSED_RAND_MV and is_cmaes:
+                # FAST PATH (CUDA): 2 kernels per layer when world_size == 1.
+                #
+                #   1× sectioned DOWN  — writes model-dtype scratch directly.
+                #   1× sectioned UP    — writes Q/K/V noise+mean directly into
+                #                         the contiguous qkv_proj backing
+                #                         tensor with alpha=scaling, beta=1.0.
+                #
+                # The UP-sectioned path requires world_size == 1 because the
+                # sectioned kernel takes one global col_offset/global_cols
+                # pair, which can't honour per-Q/K/V tensor-parallel sharding.
+                # Falls back to 3 separate UP kernels (4 launches total) when
+                # world_size > 1.
+                B = x.size(0)
+                if B == 0:
+                    i += count
+                    continue
+
+                Sd = adapter_info.qkv_down_sigma[layer_idx]  # (I, 3*rank)
+                if B <= adapter_info._scratch_max_B:
+                    qkv_down = adapter_info._cast_qkv_down_scratch[:B, : 3 * rank_lora]
+                else:
+                    qkv_down = torch.empty(
+                        B, 3 * rank_lora, device=x.device, dtype=x.dtype
+                    )
+                rand_mv.batched_randn_matmul_sectioned(
+                    x, rand_seeds, Sd,
+                    section_widths=(rank_lora, rank_lora, rank_lora),
+                    section_offsets=(layer_idx, layer_idx + 100, layer_idx + 200),
+                    W_mean=Wd, out=qkv_down, beta=0.0,
+                )
+
+                Su = adapter_info.qkv_up_sigma[layer_idx]  # (rank, LOCAL_d_sum)
+
+                if world_size == 1:
+                    # Reconstruct the contiguous qkv_proj view that backs
+                    # q/k/v_state — they are leftmost/middle/rightmost slices
+                    # of a single (B, sum_out) cublas output. Reusing one
+                    # sectioned launch + one fused matmul collapses 3 UP
+                    # kernels into 1.
+                    sum_out = local_d_q + local_d_k + local_d_v
+                    qkv_full = q_state[x_start:x_end].as_strided(
+                        (B, sum_out),
+                        q_state.stride(),
+                    )
+                    rand_mv.batched_randn_matmul_sectioned(
+                        qkv_down, rand_seeds, Su,
+                        section_widths=(local_d_q, local_d_k, local_d_v),
+                        section_offsets=(-layer_idx, -(layer_idx + 100), -(layer_idx + 200)),
+                        W_mean=Wu,
+                        out=qkv_full,
+                        alpha=scaling, beta=1.0,
+                    )
+                else:
+                    # TP fallback: per-Q/K/V col_offset/global_cols can't be
+                    # expressed via a single sectioned call.
+                    Su_q_local = Su[:, out_indptr[0] : out_indptr[1]]
+                    Su_k_local = Su[:, out_indptr[1] : out_indptr[2]]
+                    Su_v_local = Su[:, out_indptr[2] : out_indptr[3]]
+                    d_q, d_k, d_v = torch.split(
+                        qkv_down, [rank_lora, rank_lora, rank_lora], dim=-1
+                    )
+                    rand_mv.batched_randn_matmul(
+                        d_q, rand_seeds, Su_q_local,
+                        W_mean=Wu_q_local,
+                        out=q_state[x_start:x_end],
+                        alpha=scaling, beta=1.0,
+                        seed_offset=-layer_idx,
+                        col_offset=rank * local_d_q, global_cols=global_d_q,
+                    )
+                    rand_mv.batched_randn_matmul(
+                        d_k, rand_seeds, Su_k_local,
+                        W_mean=Wu_k_local,
+                        out=k_state[x_start:x_end],
+                        alpha=scaling, beta=1.0,
+                        seed_offset=-(layer_idx + 100),
+                        col_offset=rank * local_d_k, global_cols=global_d_k,
+                    )
+                    rand_mv.batched_randn_matmul(
+                        d_v, rand_seeds, Su_v_local,
+                        W_mean=Wu_v_local,
+                        out=v_state[x_start:x_end],
+                        alpha=scaling, beta=1.0,
+                        seed_offset=-(layer_idx + 200),
+                        col_offset=rank * local_d_v, global_cols=global_d_v,
+                    )
+
+                i += count
+                continue
+
+            # LEGACY PATH (Metal, or non-CMAES adapter on any backend).
             qkv_down = x @ Wd
             d_q, d_k, d_v = torch.split(
                 qkv_down, [rank_lora, rank_lora, rank_lora], dim=-1
             )
 
-            # Only inject noise if CUDA/Triton is available (rand_mv requires CUDA)
             inject_noise = RAND_MV_AVAILABLE
-
             if inject_noise:
-                if not isinstance(adapter_info, CmaesAdapter):
+                if not is_cmaes:
                     continue
 
-                Sd = adapter_info.qkv_down_sigma[layer_idx]  # (in_features, 3*rank)
+                Sd = adapter_info.qkv_down_sigma[layer_idx]
                 Sd_q, Sd_k, Sd_v = torch.split(
                     Sd, [rank_lora, rank_lora, rank_lora], dim=-1
                 )
-
-                # Noise generation for DOWN projection (input x is replicated, output d_q is replicated)
-                # We want the SAME noise on all ranks to keep d_q consistent.
-
-                q_noise_down = rand_mv.batched_randn_matmul(
-                    x,
-                    seeds=rand_seeds + layer_idx,
-                    S=Sd_q,
-                    out_dtype=x.dtype,
+                d_q = d_q + rand_mv.batched_randn_matmul(
+                    x, seeds=rand_seeds + layer_idx, S=Sd_q, out_dtype=x.dtype
                 )
-                k_noise_down = rand_mv.batched_randn_matmul(
+                d_k = d_k + rand_mv.batched_randn_matmul(
                     x,
                     seeds=rand_seeds + (layer_idx + 100),
                     S=Sd_k,
                     out_dtype=x.dtype,
                 )
-                v_noise_down = rand_mv.batched_randn_matmul(
+                d_v = d_v + rand_mv.batched_randn_matmul(
                     x,
                     seeds=rand_seeds + (layer_idx + 200),
                     S=Sd_v,
                     out_dtype=x.dtype,
                 )
 
-                d_q = d_q + q_noise_down
-                d_k = d_k + k_noise_down
-                d_v = d_v + v_noise_down
-
-            # Up-projection: Input (d_q/k/v) is replicated. Output (u_q/k/v) needs to be SHARDED.
-            # Wu is already LOCAL.
-
-            Wu_q_local = Wu[:, out_indptr[0] : out_indptr[1]]
-            Wu_k_local = Wu[:, out_indptr[1] : out_indptr[2]]
-            Wu_v_local = Wu[:, out_indptr[2] : out_indptr[3]]
-
-            # Compute local up-projection
             u_q_local = d_q @ Wu_q_local
             u_k_local = d_k @ Wu_k_local
             u_v_local = d_v @ Wu_v_local
 
             if inject_noise:
-                Su = adapter_info.qkv_up_sigma[layer_idx]  # (rank, LOCAL_d_sum)
-
-                # Slicing LOCAL Sigmas
+                Su = adapter_info.qkv_up_sigma[layer_idx]
                 Su_q_local = Su[:, out_indptr[0] : out_indptr[1]]
                 Su_k_local = Su[:, out_indptr[1] : out_indptr[2]]
                 Su_v_local = Su[:, out_indptr[2] : out_indptr[3]]
 
-                # Offsets for noise generation
-                local_d_q = out_indptr[1] - out_indptr[0]
-                local_d_k = out_indptr[2] - out_indptr[1]
-                local_d_v = out_indptr[3] - out_indptr[2]
-
-                global_d_q = local_d_q * world_size
-                global_d_k = local_d_k * world_size
-                global_d_v = local_d_v * world_size
-
-                q_noise_up = rand_mv.batched_randn_matmul(
+                u_q_local = u_q_local + rand_mv.batched_randn_matmul(
                     d_q,
                     seeds=rand_seeds - layer_idx,
                     S=Su_q_local,
@@ -176,7 +249,7 @@ class AdapterSubpass:
                     col_offset=rank * local_d_q,
                     global_cols=global_d_q,
                 )
-                k_noise_up = rand_mv.batched_randn_matmul(
+                u_k_local = u_k_local + rand_mv.batched_randn_matmul(
                     d_k,
                     seeds=rand_seeds - (layer_idx + 100),
                     S=Su_k_local,
@@ -184,7 +257,7 @@ class AdapterSubpass:
                     col_offset=rank * local_d_k,
                     global_cols=global_d_k,
                 )
-                v_noise_up = rand_mv.batched_randn_matmul(
+                u_v_local = u_v_local + rand_mv.batched_randn_matmul(
                     d_v,
                     seeds=rand_seeds - (layer_idx + 200),
                     S=Su_v_local,
@@ -192,20 +265,10 @@ class AdapterSubpass:
                     col_offset=rank * local_d_v,
                     global_cols=global_d_v,
                 )
-                u_q_local = u_q_local + q_noise_up
-                u_k_local = u_k_local + k_noise_up
-                u_v_local = u_v_local + v_noise_up
 
-            # ===== 3) Combine mean + noise =====
-            scaling = adapter_info.alpha / float(rank_lora)
-
-            q_final = scaling * u_q_local
-            k_final = scaling * u_k_local
-            v_final = scaling * u_v_local
-
-            q_state[x_start:x_end].add_(q_final)
-            k_state[x_start:x_end].add_(k_final)
-            v_state[x_start:x_end].add_(v_final)
+            q_state[x_start:x_end].add_(scaling * u_q_local)
+            k_state[x_start:x_end].add_(scaling * u_k_local)
+            v_state[x_start:x_end].add_(scaling * u_v_local)
 
             i += count
 
@@ -398,6 +461,16 @@ class CmaesAdapter(Adapter):
             torch.ones((rank, self.sum_out), dtype=f32, device=device)
             for _ in range(num_layers)
         ]
+
+        # Pre-allocated model-dtype scratch for the DOWN-projection result
+        # the eager fast path slices into. Sized for the typical decode
+        # max-batch; AdapterSubpass falls back to a one-shot torch.empty
+        # when a request exceeds this size. UP-projection writes directly
+        # into q/k/v_state via alpha/beta, so no fp32 scratch is needed.
+        self._scratch_max_B = 512
+        self._cast_qkv_down_scratch = torch.empty(
+            self._scratch_max_B, 3 * rank, device=device, dtype=dtype
+        )
 
     def upload(self, name: str, data: bytes) -> None:
         """Load the adapter's state from ``adapter_{name}.pt``."""

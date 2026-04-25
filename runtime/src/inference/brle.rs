@@ -40,6 +40,23 @@ impl Brle {
         }
     }
 
+    /// Creates a new `Brle` instance representing `size` `true` values.
+    /// The starts-with-False convention requires a zero-length false-run
+    /// prefix, so the buffer is `[0, size]`.
+    pub fn all_true(size: usize) -> Self {
+        if size == 0 {
+            Self {
+                buffer: vec![],
+                total_size: 0,
+            }
+        } else {
+            Self {
+                buffer: vec![0u32, size as u32],
+                total_size: size,
+            }
+        }
+    }
+
     /// Creates a `Brle` from an owned run-length buffer.
     pub fn from_vec(buffer: Vec<u32>) -> Self {
         let total_size = buffer.iter().map(|&x| x as usize).sum();
