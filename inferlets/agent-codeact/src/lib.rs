@@ -92,7 +92,7 @@ async fn main(input: Input) -> Result<String> {
 
     for _ in 0..num_function_calls {
         let response = ctx
-            .generate(Sampler::TopP((0.0, 1.0)))
+            .generate(Sampler::ARGMAX)
             .with_max_tokens(tokens_between_calls)
             .collect_text()
             .await?;

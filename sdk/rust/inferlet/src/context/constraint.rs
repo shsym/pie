@@ -1,66 +1,277 @@
 //! Sampling constraints for grammar-guided generation.
+//!
+//! The common path is declarative: pass a [`Schema`] to
+//! [`super::TokenStream::constrain`] and the SDK builds the matcher for you.
+//! For custom logic (banned tokens, learned constraints, etc.), implement
+//! [`Constrain`] and pass it via [`super::TokenStream::constrain_with`].
+//! Constraints compose — every applied constraint contributes a mask, and
+//! the masks are AND-ed before each forward pass.
 
+use crate::inference::Grammar;
 use crate::model::Model;
 use crate::Result;
 
 use super::Matcher;
 
-/// Trait for token sampling constraints (e.g., grammar-based token masking).
-pub trait Constrain {
-    /// Returns the logit mask as BRLE-encoded data.
-    fn mask(&self) -> Vec<u32>;
-
-    /// Called with the accepted tokens to update constraint state.
-    fn accept(&mut self, tokens: &[u32]);
-
-    /// Resets the constraint to its initial state.
-    fn reset(&mut self);
-
-    /// Rolls back the last `num_tokens` accepted tokens.
-    fn rollback(&mut self, num_tokens: usize);
+/// Token sampling constraint.
+///
+/// On each generation step, the [`super::TokenStream`] passes any newly
+/// accepted tokens (or `&[]` on the first step) and gets back the BRLE-encoded
+/// logit mask for the next position.
+///
+/// Returning `&[]` (empty mask) means "no restriction" and is treated as
+/// transparent during composition.
+pub trait Constrain: Send {
+    /// Advance internal state with `accepted` tokens, then return the mask
+    /// for the next position.
+    fn step(&mut self, accepted: &[u32]) -> &[u32];
 }
 
-/// Constraint adapter that wraps a WIT [`Matcher`] to implement [`Constrain`].
+/// Declarative description of a constraint.
 ///
-/// Used internally by [`super::TokenStream::collect_json`] and available for
-/// standalone use when you need grammar-constrained generation.
+/// Use with [`super::TokenStream::with_schema`]. The SDK compiles the schema
+/// into a [`GrammarConstraint`] internally.
+///
+/// ```ignore
+/// ctx.generate(Sampler::ARGMAX)
+///     .with_schema(Schema::Ebnf(grammar_str))?
+///     .collect_text().await?;
+/// ```
+pub enum Schema<'a> {
+    /// Constrain to JSON valid against the given JSON Schema string.
+    JsonSchema(&'a str),
+    /// Constrain to any valid JSON.
+    Json,
+    /// Constrain to strings matching the regular expression.
+    Regex(&'a str),
+    /// Constrain to a custom EBNF grammar.
+    Ebnf(&'a str),
+    /// Constrain to a pre-compiled grammar (compile once, reuse).
+    Grammar(&'a Grammar),
+}
+
+impl Schema<'_> {
+    pub(crate) fn build(&self, model: &Model) -> Result<GrammarConstraint> {
+        match self {
+            Self::JsonSchema(s) => GrammarConstraint::from_json_schema(s, model),
+            Self::Json => Ok(GrammarConstraint::json(model)),
+            Self::Regex(p) => GrammarConstraint::from_regex(p, model),
+            Self::Ebnf(g) => GrammarConstraint::from_ebnf(g, model),
+            Self::Grammar(g) => Ok(GrammarConstraint::from_grammar(g, model)),
+        }
+    }
+}
+
+/// Grammar-driven [`Constrain`] backed by a host [`Matcher`].
+///
+/// Most callers should reach for [`Schema`] instead — `GrammarConstraint`
+/// is the lower-level type for callers that want to keep a constraint
+/// instance around (e.g., to compose with [`super::TokenStream::with_constraint`]).
 pub struct GrammarConstraint {
     matcher: Matcher,
+    /// Cached mask returned from the last `step()`. Reused so `step` can
+    /// hand back a `&[u32]` without forcing the caller to clone.
+    cached_mask: Vec<u32>,
 }
 
 impl GrammarConstraint {
-    /// Create a grammar constraint from a [`Matcher`].
+    /// Wrap an existing [`Matcher`].
     pub fn new(matcher: Matcher) -> Self {
-        Self { matcher }
+        Self { matcher, cached_mask: Vec::new() }
     }
 
-    /// Create a grammar constraint from a JSON schema string.
-    pub fn from_json_schema(
-        schema: &str,
-        model: &Model,
-    ) -> Result<Self> {
-        let grammar = crate::inference::Grammar::from_json_schema(schema)?;
+    /// Build from a pre-compiled grammar (compile once, reuse across contexts).
+    pub fn from_grammar(grammar: &Grammar, model: &Model) -> Self {
         let tokenizer = model.tokenizer();
-        let matcher = Matcher::new(&grammar, &tokenizer);
-        Ok(Self { matcher })
+        Self::new(Matcher::new(grammar, &tokenizer))
+    }
+
+    /// Build a constraint that accepts any valid JSON.
+    pub fn json(model: &Model) -> Self {
+        Self::from_grammar(&Grammar::json(), model)
+    }
+
+    /// Build from a JSON Schema string.
+    pub fn from_json_schema(schema: &str, model: &Model) -> Result<Self> {
+        let grammar = Grammar::from_json_schema(schema)?;
+        Ok(Self::from_grammar(&grammar, model))
+    }
+
+    /// Build from a regular expression pattern.
+    pub fn from_regex(pattern: &str, model: &Model) -> Result<Self> {
+        let grammar = Grammar::from_regex(pattern)?;
+        Ok(Self::from_grammar(&grammar, model))
+    }
+
+    /// Build from an EBNF grammar string.
+    pub fn from_ebnf(ebnf: &str, model: &Model) -> Result<Self> {
+        let grammar = Grammar::from_ebnf(ebnf)?;
+        Ok(Self::from_grammar(&grammar, model))
     }
 }
 
 impl Constrain for GrammarConstraint {
-    fn mask(&self) -> Vec<u32> {
-        self.matcher.next_token_logit_mask()
+    fn step(&mut self, accepted: &[u32]) -> &[u32] {
+        if !accepted.is_empty() {
+            let _ = self.matcher.accept_tokens(accepted);
+        }
+        self.cached_mask = self.matcher.next_token_logit_mask();
+        &self.cached_mask
+    }
+}
+
+// =============================================================================
+// BRLE intersection (mask AND)
+// =============================================================================
+
+/// AND two BRLE-encoded masks of equal length.
+///
+/// Both inputs must encode the same total bit count (typically the model's
+/// vocabulary size). Returns the BRLE encoding of the bitwise AND.
+///
+/// BRLE format: `buffer[0]` is a (possibly zero) run of `false`, `buffer[1]`
+/// is a run of `true`, and so on.
+pub(crate) fn brle_and(a: &[u32], b: &[u32]) -> Vec<u32> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
     }
 
-    fn accept(&mut self, tokens: &[u32]) {
-        let _ = self.matcher.accept_tokens(tokens);
+    let mut out: Vec<u32> = Vec::with_capacity(a.len().max(b.len()));
+    let mut a_idx = 0usize;
+    let mut b_idx = 0usize;
+    let mut a_left = a[0];
+    let mut b_left = b[0];
+    let mut a_value = false;
+    let mut b_value = false;
+
+    // Output state. The first emitted run is always a `false` run by
+    // convention (may be zero-length).
+    let mut want_value = false;
+    let mut accum: u32 = 0;
+
+    loop {
+        let take = a_left.min(b_left);
+        let result = a_value && b_value;
+
+        if result == want_value {
+            accum += take;
+        } else {
+            out.push(accum);
+            accum = take;
+            want_value = !want_value;
+        }
+
+        a_left -= take;
+        b_left -= take;
+
+        if a_left == 0 {
+            a_idx += 1;
+            if a_idx == a.len() {
+                break;
+            }
+            a_left = a[a_idx];
+            a_value = !a_value;
+        }
+        if b_left == 0 {
+            b_idx += 1;
+            if b_idx == b.len() {
+                break;
+            }
+            b_left = b[b_idx];
+            b_value = !b_value;
+        }
     }
 
-    fn reset(&mut self) {
-        self.matcher.reset();
+    out.push(accum);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::brle_and;
+
+    /// Decode a BRLE buffer into a `Vec<bool>` for comparison.
+    fn decode(buf: &[u32]) -> Vec<bool> {
+        let mut out = Vec::new();
+        let mut value = false;
+        for &run in buf {
+            for _ in 0..run {
+                out.push(value);
+            }
+            value = !value;
+        }
+        out
     }
 
-    fn rollback(&mut self, _num_tokens: usize) {
-        // Matcher doesn't support rollback — reset instead.
-        self.matcher.reset();
+    fn encode(bits: &[bool]) -> Vec<u32> {
+        let mut buf = Vec::new();
+        if bits.is_empty() {
+            return buf;
+        }
+        let mut current = false;
+        let mut count = 0u32;
+        if bits[0] {
+            buf.push(0);
+            current = true;
+        }
+        for &b in bits {
+            if b == current {
+                count += 1;
+            } else {
+                buf.push(count);
+                current = b;
+                count = 1;
+            }
+        }
+        buf.push(count);
+        buf
+    }
+
+    fn check(a: Vec<bool>, b: Vec<bool>) {
+        assert_eq!(a.len(), b.len());
+        let expected: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x && *y).collect();
+        let result = brle_and(&encode(&a), &encode(&b));
+        assert_eq!(decode(&result), expected, "a={:?} b={:?}", a, b);
+    }
+
+    #[test]
+    fn all_false() {
+        check(vec![false; 8], vec![false; 8]);
+    }
+
+    #[test]
+    fn all_true_and_all_true() {
+        check(vec![true; 8], vec![true; 8]);
+    }
+
+    #[test]
+    fn all_true_and_all_false() {
+        check(vec![true; 8], vec![false; 8]);
+    }
+
+    #[test]
+    fn alternating() {
+        let a = vec![true, false, true, false, true, false, true, false];
+        let b = vec![false, true, false, true, false, true, false, true];
+        check(a, b);
+    }
+
+    #[test]
+    fn mixed_runs() {
+        let a = vec![true, true, false, false, true, true, true, false];
+        let b = vec![false, true, true, false, true, false, true, true];
+        check(a, b);
+    }
+
+    #[test]
+    fn leading_true() {
+        let a = vec![true, true, true, false, false];
+        let b = vec![true, false, true, true, true];
+        check(a, b);
+    }
+
+    #[test]
+    fn empty_inputs() {
+        assert_eq!(brle_and(&[], &[]), Vec::<u32>::new());
     }
 }

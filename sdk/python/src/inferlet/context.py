@@ -24,8 +24,9 @@ Usage::
 
 from __future__ import annotations
 
+import json as _json
 from dataclasses import dataclass
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable
 
 from wit_world.imports import context as _ctx
 from wit_world.imports import inference as _inf
@@ -36,6 +37,21 @@ from wit_world.imports import reasoning as _reasoning
 from ._async import await_future
 from .model import Model, Tokenizer
 from .sampler import Sampler
+from .grammar import Constraint, Schema, _StaticMaskConstraint
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
+
+# Optional pydantic v2 integration. Detected once at module load; the typed
+# generation method is exposed on Context only if pydantic v2 is available.
+try:
+    import pydantic as _pydantic
+    _PYDANTIC_AVAILABLE = (
+        getattr(_pydantic, "VERSION", "0").split(".", 1)[0] == "2"
+    )
+except ImportError:
+    _pydantic = None  # type: ignore[assignment]
+    _PYDANTIC_AVAILABLE = False
 
 
 
@@ -256,7 +272,8 @@ class TokenStream:
         "_page_size",
         "_stop_tokens",
         "_sampler",
-        "_logit_mask",
+        "_constraint",
+        "_constraint_pending",
         "_done",
         "_max_tokens",
         "_tokens_generated",
@@ -269,15 +286,22 @@ class TokenStream:
         sampler: Sampler,
         *,
         max_tokens: int | None = None,
-        logit_mask: list[int] | None = None,
+        constraint: Constraint | None = None,
+        stop_tokens: Iterable[int] | None = None,
         pending_tokens: list[int] | None = None,
     ) -> None:
         self._ctx = ctx
         self._model_handle = ctx._handle.model()
         self._page_size: int = ctx._handle.tokens_per_page()
-        self._stop_tokens: frozenset[int] = frozenset(_chat.stop_tokens(self._model_handle))
+        if stop_tokens is None:
+            self._stop_tokens: frozenset[int] = frozenset(
+                _chat.stop_tokens(self._model_handle)
+            )
+        else:
+            self._stop_tokens = frozenset(stop_tokens)
         self._sampler = sampler
-        self._logit_mask = logit_mask
+        self._constraint = constraint
+        self._constraint_pending: list[int] = []
         self._done = False
         self._max_tokens = max_tokens
         self._tokens_generated = 0
@@ -286,7 +310,19 @@ class TokenStream:
     # --- Generation ---
 
     async def _step(self) -> list[int]:
-        """One generation step: forward pass → sample → commit."""
+        """One generation step: forward pass → sample → commit.
+
+        If a constraint is attached, advances it on the previous step's
+        accepted tokens and applies the resulting mask to the forward pass.
+        """
+        # Advance the constraint and compute this step's mask.
+        mask: list[int] | None = None
+        if self._constraint is not None:
+            pending = self._constraint_pending
+            self._constraint_pending = []
+            m = self._constraint.step(pending)
+            mask = m if m else None
+
         if self._pending_tokens:
             output = await _reserve_and_run(
                 self._ctx._handle,
@@ -294,15 +330,15 @@ class TokenStream:
                 self._pending_tokens,
                 self._page_size,
                 sampler_variant=self._sampler._variant,
-                logit_mask=self._logit_mask,
+                logit_mask=mask,
             )
         else:
             # Bootstrap: sample from the last cached KV position (after flush)
             fwd = _inf.ForwardPass(self._model_handle)
             fwd.context(self._ctx._handle)
             fwd.sampler([0], self._sampler._variant)
-            if self._logit_mask is not None:
-                fwd.logit_mask(self._logit_mask)
+            if mask is not None:
+                fwd.logit_mask(mask)
             future = fwd.execute()
             output = await await_future(future, "Bootstrap forward pass failed")
 
@@ -310,6 +346,10 @@ class TokenStream:
         new_tokens = self._extract_tokens(output)
         if not new_tokens:
             return []
+
+        # Stash accepted tokens for the next step's constraint advance.
+        if self._constraint is not None:
+            self._constraint_pending.extend(new_tokens)
 
         # Seed pending_tokens with the last generated token for the next step
         self._pending_tokens = [new_tokens[-1]]
@@ -339,10 +379,6 @@ class TokenStream:
         async for batch in self:
             all_tokens.extend(batch)
         return all_tokens
-
-    # Deprecated aliases
-    collect_text = text
-    collect_tokens = tokens
 
     # --- Iterator protocol ---
 
@@ -473,15 +509,17 @@ class Context:
 
     # --- Fill (ContextExt) ---
 
-    def fill(self, text: str) -> None:
+    def fill(self, text: str) -> Context:
         """Fill the context buffer with text (encodes to tokens)."""
         tokenizer = self._model.tokenizer()
         tokens = tokenizer.encode(text)
         self._pending_tokens.extend(tokens)
+        return self
 
-    def fill_tokens(self, tokens: list[int]) -> None:
+    def fill_tokens(self, tokens: list[int]) -> Context:
         """Fill the context buffer with raw token IDs."""
         self._pending_tokens.extend(tokens)
+        return self
 
     async def flush(self) -> None:
         """Flush pending tokens: run forward pass and commit pages.
@@ -502,26 +540,35 @@ class Context:
         self._pending_tokens = []
 
     # --- Instruct (pie:instruct/chat) ---
+    #
+    # Filler methods return ``self`` so they can be chained:
+    #
+    #     ctx.system("...").user("...").cue()
 
-    def system(self, message: str) -> None:
+    def system(self, message: str) -> Context:
         """Fill a system message."""
         self._pending_tokens.extend(_chat.system(self._model._handle, message))
+        return self
 
-    def user(self, message: str) -> None:
+    def user(self, message: str) -> Context:
         """Fill a user message."""
         self._pending_tokens.extend(_chat.user(self._model._handle, message))
+        return self
 
-    def assistant(self, message: str) -> None:
+    def assistant(self, message: str) -> Context:
         """Fill a (previous) assistant message."""
         self._pending_tokens.extend(_chat.assistant(self._model._handle, message))
+        return self
 
-    def cue(self) -> None:
+    def cue(self) -> Context:
         """Cue the model to generate (fills the generation header)."""
         self._pending_tokens.extend(_chat.cue(self._model._handle))
+        return self
 
-    def seal(self) -> None:
+    def seal(self) -> Context:
         """Seal the current turn (inserts stop token)."""
         self._pending_tokens.extend(_chat.seal(self._model._handle))
+        return self
 
     def stop_tokens(self) -> list[int]:
         """Get the stop token IDs for this model."""
@@ -529,13 +576,24 @@ class Context:
 
     # --- Tool Use (pie:instruct/tool-use) ---
 
-    def equip_tools(self, tools: list[str]) -> None:
-        """Register available tools (list of JSON schema strings)."""
-        self._pending_tokens.extend(_tool.equip(self._model._handle, tools))
+    def equip_tools(self, tools: list[str | dict]) -> Context:
+        """Register available tools.
 
-    def answer_tool(self, name: str, value: str) -> None:
-        """Provide a tool call result."""
-        self._pending_tokens.extend(_tool.answer(self._model._handle, name, value))
+        Each tool may be either a JSON-schema string or a dict (auto-stringified).
+        """
+        strs = [t if isinstance(t, str) else _json.dumps(t) for t in tools]
+        self._pending_tokens.extend(_tool.equip(self._model._handle, strs))
+        return self
+
+    def answer_tool(self, name: str, value: str | dict | list) -> Context:
+        """Provide a tool call result.
+
+        ``value`` may be a string or a JSON-serializable dict / list
+        (auto-stringified).
+        """
+        s = value if isinstance(value, str) else _json.dumps(value)
+        self._pending_tokens.extend(_tool.answer(self._model._handle, name, s))
+        return self
 
     # --- Generate (ContextExt) ---
 
@@ -544,7 +602,9 @@ class Context:
         sampler: Sampler,
         *,
         max_tokens: int | None = None,
+        constrain: Schema | Constraint | None = None,
         logit_mask: list[int] | None = None,
+        stop_tokens: Iterable[int] | None = None,
         decode: bool = False,
         reasoning: bool = False,
         tool_use: bool = False,
@@ -552,13 +612,25 @@ class Context:
     ) -> TokenStream | EventStream:
         """Start generating tokens.
 
-        By default, calls ``cue()`` + ``flush()`` before starting
-        the generation stream. Set ``auto_flush=False`` to skip this.
+        **Auto-flush behavior**: when ``auto_flush=True`` (the default),
+        this method calls ``self.cue()`` followed by ``self.flush()`` before
+        starting the generation stream — any pending instruct fills are
+        committed and the model is cued to begin generating. Set
+        ``auto_flush=False`` if you want to manage flushing yourself
+        (e.g., to inspect the buffer before generation).
 
         Args:
             sampler: The sampling strategy to use.
             max_tokens: Maximum tokens to generate.
-            logit_mask: Optional BRLE logit mask.
+            constrain: Either a :class:`Schema` (compiled into a stateful
+                grammar matcher) or any object implementing the
+                :class:`Constraint` protocol. Mutually exclusive with
+                ``logit_mask``.
+            logit_mask: Static BRLE logit mask applied every step (for
+                stateless constraints — banned tokens, etc.). Mutually
+                exclusive with ``constrain``.
+            stop_tokens: Override stop token IDs. Defaults to the model's
+                chat stop tokens.
             decode: If ``True``, return an ``EventStream`` instead of ``TokenStream``.
             reasoning: Enable reasoning/thinking decoding (requires ``decode=True``).
             tool_use: Enable tool-use decoding (requires ``decode=True``).
@@ -567,11 +639,34 @@ class Context:
         Returns:
             ``TokenStream`` (default) or ``EventStream`` (when ``decode=True``).
         """
+        if constrain is not None and logit_mask is not None:
+            raise ValueError(
+                "constrain and logit_mask are mutually exclusive — "
+                "wrap the static mask in a Constraint implementation if you "
+                "need to combine both"
+            )
+
         if auto_flush:
             self.cue()
             await self.flush()
 
-        stream = TokenStream(self, sampler, max_tokens=max_tokens, logit_mask=logit_mask, pending_tokens=self._pending_tokens)
+        constraint: Constraint | None = None
+        if constrain is not None:
+            if isinstance(constrain, Schema):
+                constraint = constrain._build(self._model)
+            else:
+                constraint = constrain
+        elif logit_mask is not None:
+            constraint = _StaticMaskConstraint(logit_mask)
+
+        stream = TokenStream(
+            self,
+            sampler,
+            max_tokens=max_tokens,
+            constraint=constraint,
+            stop_tokens=stop_tokens,
+            pending_tokens=self._pending_tokens,
+        )
         self._pending_tokens = []
 
         if decode or reasoning or tool_use:
@@ -584,19 +679,24 @@ class Context:
         sampler: Sampler,
         *,
         max_tokens: int | None = None,
+        constrain: Schema | Constraint | None = None,
         logit_mask: list[int] | None = None,
+        stop_tokens: Iterable[int] | None = None,
         auto_flush: bool = True,
     ) -> str:
         """Generate and return the full response text (one-shot).
 
         Convenience wrapper that calls ``generate(decode=True)`` and
-        collects all ``Event.Text`` chunks into a single string.
+        collects all ``Event.Text`` chunks into a single string. See
+        :meth:`generate` for the auto-flush behavior.
         """
         parts: list[str] = []
         async for event in await self.generate(
             sampler,
             max_tokens=max_tokens,
+            constrain=constrain,
             logit_mask=logit_mask,
+            stop_tokens=stop_tokens,
             decode=True,
             auto_flush=auto_flush,
         ):
@@ -605,6 +705,81 @@ class Context:
             elif isinstance(event, Event.Done):
                 break
         return "".join(parts)
+
+    async def generate_json(
+        self,
+        sampler: Sampler,
+        *,
+        schema: str | None = None,
+        max_tokens: int | None = None,
+        stop_tokens: Iterable[int] | None = None,
+        auto_flush: bool = True,
+    ) -> Any:
+        """Generate JSON-constrained output and parse it.
+
+        If ``schema`` is provided, the output is constrained to be valid
+        JSON conforming to that JSON Schema. Otherwise, output is
+        constrained to any valid JSON.
+
+        Returns the parsed Python value (``dict`` / ``list`` / primitive).
+        For typed deserialization with pydantic, see :meth:`generate_pydantic`.
+        For msgspec / dataclasses-json / etc., parse the return value yourself.
+
+        ::
+
+            data = await ctx.generate_json(
+                Sampler.argmax(),
+                schema=PERSON_SCHEMA,
+            )
+        """
+        s = Schema.json_schema(schema) if schema is not None else Schema.json()
+        text = await self.generate_text(
+            sampler,
+            max_tokens=max_tokens,
+            constrain=s,
+            stop_tokens=stop_tokens,
+            auto_flush=auto_flush,
+        )
+        return _json.loads(text)
+
+    if _PYDANTIC_AVAILABLE:
+        async def generate_pydantic(
+            self,
+            model_class: type[BaseModel],
+            *,
+            sampler: Sampler,
+            max_tokens: int | None = None,
+            stop_tokens: Iterable[int] | None = None,
+            auto_flush: bool = True,
+        ) -> BaseModel:
+            """Generate JSON conforming to a pydantic model and validate it.
+
+            Requires pydantic v2.
+
+            ::
+
+                from pydantic import BaseModel
+
+                class Person(BaseModel):
+                    name: str
+                    age: int
+
+                person = await ctx.generate_pydantic(
+                    Person, sampler=Sampler.argmax(),
+                )
+
+            Returns an instance of ``model_class``.
+            """
+            schema_dict = model_class.model_json_schema()
+            schema_str = _json.dumps(schema_dict)
+            text = await self.generate_text(
+                sampler,
+                max_tokens=max_tokens,
+                constrain=Schema.json_schema(schema_str),
+                stop_tokens=stop_tokens,
+                auto_flush=auto_flush,
+            )
+            return model_class.model_validate_json(text)
 
     # --- Lifecycle ---
 

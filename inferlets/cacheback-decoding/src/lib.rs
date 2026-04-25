@@ -71,7 +71,7 @@ impl GreedyDrafter {
             let pass = ForwardPass::new(&self.model);
             pass.context(self.draft_ctx.inner());
             pass.input_tokens(&[current], &[seq_len]);
-            pass.sampler(&[0], Sampler::TopP((0.0, 1.0)));
+            pass.sampler(&[0], Sampler::ARGMAX);
 
             let output = pass.execute();
             let Ok(future_output) = output else { break };
@@ -142,7 +142,7 @@ async fn main(input: Input) -> Result<String> {
         let pass = ForwardPass::new(&model);
         pass.context(ctx.inner());
         pass.input_tokens(&[trigger], &[seq_len]);
-        pass.sampler(&[0], Sampler::TopP((0.0, 1.0)));
+        pass.sampler(&[0], Sampler::ARGMAX);
         let output = pass.execute_async().await
             .map_err(|e| format!("Bootstrap failed: {}", e))?;
         match output {
@@ -195,7 +195,7 @@ async fn main(input: Input) -> Result<String> {
 
         // Sample at all positions to verify drafts.
         let sample_indices: Vec<u32> = (0..input_count as u32).collect();
-        pass.sampler(&sample_indices, Sampler::TopP((0.0, 1.0)));
+        pass.sampler(&sample_indices, Sampler::ARGMAX);
 
         let output = pass.execute_async().await
             .map_err(|e| format!("Verification forward pass failed: {}", e))?;

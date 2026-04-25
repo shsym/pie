@@ -135,7 +135,7 @@ Sampler.minP(temperature, minP)           // min-p sampling
 Sampler.multinomial(temperature, topK)    // multinomial
 Sampler.topKTopP(temperature, topK, topP) // combined
 Sampler.embedding()                       // embedding extraction
-Sampler.dist(temperature, topK)           // full distribution
+Sampler.distribution(temperature, topK)   // full distribution
 ```
 
 ### Event Types
@@ -170,14 +170,41 @@ ctx.answerTool('get_weather', '{"temp": 72}');
 
 ### Structured Generation
 
-```js
-const grammar = Grammar.fromJsonSchema('{"type":"object",...}');
-const matcher = new Matcher(grammar, model.tokenizer());
+Pass `constrain: Schema.*` to `generate()` for grammar-constrained decoding.
+The SDK compiles the schema into a stateful matcher and drives it per token:
 
-// Use in generation loop for constrained decoding
-const mask = matcher.nextTokenLogitMask();
-// pass mask as logitMask option to generate()
+```typescript
+import { Schema } from 'inferlet';
+
+const text = await ctx.generateText({
+  sampler: Sampler.argmax(),
+  maxTokens: 512,
+  constrain: Schema.jsonSchema(PERSON_SCHEMA),
+});
+
+// parsed JSON in one call
+const data = await ctx.generateJson({
+  sampler: Sampler.argmax(),
+  maxTokens: 512,
+  schema: PERSON_SCHEMA,
+});
+
+// typed via Zod (or arktype, yup, etc.)
+import { z } from 'zod';
+import { zodToJsonSchema } from 'zod-to-json-schema';
+
+const Person = z.object({ name: z.string(), age: z.number() });
+const person = await ctx.generateJson({
+  sampler: Sampler.argmax(),
+  maxTokens: 512,
+  schema: JSON.stringify(zodToJsonSchema(Person)),
+  parse: Person.parse,
+});
+// person: z.infer<typeof Person>
 ```
+
+For schema choice, composition, sampler defaults, and the auto-flush
+behavior, see [`sdk/CONSTRAINED_DECODING.md`](../CONSTRAINED_DECODING.md).
 
 ### Session & Runtime
 

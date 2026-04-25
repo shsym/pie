@@ -1,7 +1,7 @@
 [package]
 name = "template-generation"
 version = "0.1.0"
-description = "Grammar-constrained JSON + schema validation + Jinja2 template rendering"
+description = "Grammar-constrained JSON + Jinja2 template rendering"
 authors = ["Pie Team"]
 
 [runtime]
@@ -10,5 +10,4 @@ mcp = "^0.2.0"
 
 [parameters]
 prompt = {type = "string", optional = true, description = "The product/topic to generate content for"}
-max_retries = {type = "int", optional = true, description = "Max retry cycles (default: 3)"}
-max_tokens = {type = "int", optional = true, description = "Max tokens per attempt (default: 1024)"}
+max_tokens = {type = "int", optional = true, description = "Max generation tokens (default: 1024)"}

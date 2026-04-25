@@ -103,7 +103,7 @@ fn divide_and_conquer<'a>(
             solve_ctx.cue();
 
             let response = solve_ctx
-                .generate(Sampler::TopP((0.0, 1.0)))
+                .generate(Sampler::ARGMAX)
                 .with_max_tokens(max_tokens)
                 .collect_text()
                 .await?;
@@ -122,7 +122,7 @@ fn divide_and_conquer<'a>(
         divide_ctx.cue();
 
         let response = divide_ctx
-            .generate(Sampler::TopP((0.0, 1.0)))
+            .generate(Sampler::ARGMAX)
             .with_max_tokens(max_tokens)
             .collect_text()
             .await?;
@@ -185,7 +185,7 @@ fn divide_and_conquer<'a>(
                 merge_ctx.cue();
 
                 let response = merge_ctx
-                    .generate(Sampler::TopP((0.0, 1.0)))
+                    .generate(Sampler::ARGMAX)
                     .with_max_tokens(max_tokens)
                     .collect_text()
                     .await?;

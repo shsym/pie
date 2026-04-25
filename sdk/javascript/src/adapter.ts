@@ -6,14 +6,24 @@ import type { Model } from './model.js';
 /**
  * A LoRA adapter instance.
  *
- * Wraps the `pie:core/adapter.Adapter` WIT resource.
+ * Wraps the `pie:core/adapter.Adapter` WIT resource. Implements
+ * `Disposable` for use with `using`:
+ *
+ *     using adapter = Adapter.create(model, "my-lora");
+ *     adapter.load("/path/to/weights");
+ *     // adapter.destroy() called automatically on scope exit
  */
-export class Adapter {
+export class Adapter implements Disposable {
     /** @internal */
     readonly _handle: _Adapter;
 
     private constructor(handle: _Adapter) {
         this._handle = handle;
+    }
+
+    /** Disposable protocol — calls `destroy()`. */
+    [Symbol.dispose](): void {
+        this.destroy();
     }
 
     /** Create a new adapter for a model with the given name. */
