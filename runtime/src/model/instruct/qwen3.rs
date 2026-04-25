@@ -6,11 +6,12 @@
 //! Reference: Qwen3 Jinja chat template with tool-calling support.
 
 use std::sync::Arc;
+use crate::inference::structured::grammar::Grammar;
 use crate::model::instruct::{
     ChatDecoder,
     Instruct,
     ReasoningDecoder,
-    ToolDecoder, ToolEvent,
+    ToolDecoder, ToolEvent, ToolGrammar,
 };
 use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder, NoopReasoningDecoder};
 use crate::model::tokenizer::Tokenizer;
@@ -361,11 +362,13 @@ impl Instruct for QwenInstruct {
         })
     }
 
-    fn tool_call_grammar(&self, tools: &[String]) -> Option<String> {
+    fn tool_call_grammar(&self, tools: &[String]) -> Option<ToolGrammar> {
         if !self.config.has_tools || tools.is_empty() {
             return None;
         }
-        Self::build_tool_call_grammar(tools)
+        let source = Self::build_tool_call_grammar(tools)?;
+        let grammar = Grammar::from_ebnf(&source, "root").ok()?;
+        Some(ToolGrammar { source, grammar: Arc::new(grammar) })
     }
 }
 

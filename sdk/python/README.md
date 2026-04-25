@@ -125,7 +125,7 @@ Sampler.min_p(temperature=0.6, min_p=0.1)           # min-p sampling
 Sampler.multinomial(temperature=1.0, seed=0)        # multinomial
 Sampler.top_k_top_p(temperature=0.6, top_k=50, top_p=0.95)  # combined
 Sampler.embedding()                                  # embedding extraction
-Sampler.dist(temperature=1.0, seed=0)               # full distribution
+Sampler.distribution(temperature=1.0, top_k=0)      # full distribution
 ```
 
 ### Event Types
@@ -158,14 +158,28 @@ ctx.answer_tool("get_weather", '{"temp": 72}')
 
 ### Structured Generation
 
-```python
-grammar = Grammar.from_json_schema('{"type":"object",...}')
-matcher = Matcher(grammar, model.tokenizer())
+Pass `constrain=Schema.*` to `generate()` for grammar-constrained decoding.
+The SDK compiles the schema into a stateful matcher and drives it per token:
 
-# Use in generation loop for constrained decoding
-mask = matcher.next_token_logit_mask()
-# pass mask as logit_mask to generate()
+```python
+from inferlet import Schema
+
+text = await ctx.generate_text(
+    Sampler.argmax(),
+    constrain=Schema.json_schema(PERSON_SCHEMA),
+    max_tokens=512,
+)
+
+# parsed JSON in one call
+data = await ctx.generate_json(Sampler.argmax(), schema=PERSON_SCHEMA)
+
+# typed via pydantic v2 (only available if pydantic is installed)
+class Person(pydantic.BaseModel): name: str; age: int
+person = await ctx.generate_pydantic(Person, sampler=Sampler.argmax())
 ```
+
+For schema choice, composition, sampler defaults, and the auto-flush
+behavior, see [`sdk/CONSTRAINED_DECODING.md`](../CONSTRAINED_DECODING.md).
 
 ### Session & Runtime
 

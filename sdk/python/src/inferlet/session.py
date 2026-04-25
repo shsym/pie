@@ -6,14 +6,35 @@ Client communication: send/receive text and files.
 
 from __future__ import annotations
 
+import json as _json
+from typing import Any
+
 import wit_world.imports.session as _session
 
 from ._async import await_future
 
 
-def send(message: str) -> None:
-    """Send a text message to the client."""
-    _session.send(message)
+def send(message: Any) -> None:
+    """Send a message to the client.
+
+    Strings are sent verbatim. Pydantic v2 models are serialized via
+    ``model_dump_json()``. Everything else is JSON-serialized via
+    ``json.dumps`` (dicts, lists, numbers, bools, None).
+
+    ::
+
+        session.send("plain text")
+        session.send({"event": "tick", "n": 3})       # dict → JSON
+        session.send([1, 2, 3])                       # list → JSON
+        session.send(person)                          # pydantic model → JSON
+    """
+    if isinstance(message, str):
+        _session.send(message)
+        return
+    if hasattr(message, "model_dump_json") and callable(message.model_dump_json):
+        _session.send(message.model_dump_json())
+        return
+    _session.send(_json.dumps(message, default=str))
 
 
 async def receive() -> str:

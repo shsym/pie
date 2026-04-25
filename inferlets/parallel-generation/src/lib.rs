@@ -40,7 +40,7 @@ async fn main(input: Input) -> Result<String> {
         ctx1.cue();
 
         let output = ctx1
-            .generate(Sampler::TopP((0.0, 1.0)))
+            .generate(Sampler::ARGMAX)
             .with_max_tokens(max_num_outputs)
             .collect_text()
             .await;
@@ -54,7 +54,7 @@ async fn main(input: Input) -> Result<String> {
         ctx2.cue();
 
         let output = ctx2
-            .generate(Sampler::TopP((0.0, 1.0)))
+            .generate(Sampler::ARGMAX)
             .with_max_tokens(max_num_outputs)
             .collect_text()
             .await;

@@ -57,7 +57,7 @@ async fn main(input: Input) -> Result<String> {
     );
 
     let mut all_generated: Vec<u32> = Vec::new();
-    let sampler = Sampler::TopP((0.0, 1.0));
+    let sampler = Sampler::ARGMAX;
 
     // Bootstrap: sample the first token from the prefilled context.
     // After flush(), the context has pages allocated with prompt KV.

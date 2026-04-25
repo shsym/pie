@@ -535,6 +535,11 @@ impl pie::core::inference::HostGrammar for InstanceState {
         }
     }
 
+    async fn to_string(&mut self, this: Resource<Grammar>) -> Result<String> {
+        let g = self.ctx().table.get(&this)?;
+        Ok(g.inner.to_string())
+    }
+
     async fn drop(&mut self, this: Resource<Grammar>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())

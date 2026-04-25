@@ -334,15 +334,20 @@ class Run(exports.Run):
             # Support both sync and async main()
             if asyncio.iscoroutine(result):
                 result = loop.run_until_complete(result)
-            # Serialize structured output to JSON
-            if isinstance(result, dict):
-                return json.dumps(result)
+            # Pass through strings; JSON-stringify everything else (dict,
+            # list, primitives, pydantic v2 models, dataclasses).
+            if result is None:
+                return _inferlet.get_return_value() or ""
             if isinstance(result, str):
                 return result
+            # Pydantic v2 BaseModel — use canonical JSON dump.
+            if hasattr(result, "model_dump_json") and callable(result.model_dump_json):
+                return result.model_dump_json()
+            return json.dumps(result, default=str)
         else:
             # Module execution happens at import time for scripts without main()
             pass
-        
+
         return _inferlet.get_return_value() or ""
 """
 
@@ -988,10 +993,25 @@ import {{ main as userMain }} from './{user_bundle_name}';
 
 // WIT interface export (inferlet:core/run)
 export const run = {{
-  async run(args) {{
+  async run(input) {{
     if (typeof userMain === 'function') {{
-      const result = await userMain(args);
-      return typeof result === 'string' ? result : '';
+      // Parse JSON input into an object for the user's main(), mirroring
+      // the Python wrapper. If input isn't valid JSON, fall back to
+      // {{ input: <raw> }}.
+      let inputData = {{}};
+      if (input) {{
+        try {{
+          inputData = JSON.parse(input);
+        }} catch {{
+          inputData = {{ input }};
+        }}
+      }}
+      const result = await userMain(inputData);
+      // Pass strings through; JSON-stringify everything else (objects,
+      // arrays, primitives). null/undefined become empty string.
+      if (result == null) return '';
+      if (typeof result === 'string') return result;
+      return JSON.stringify(result);
     }}
     return '';
   }},

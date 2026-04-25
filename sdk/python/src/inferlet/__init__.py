@@ -36,7 +36,7 @@ from . import zo
 # --- Inference ---
 from .forward import ForwardPass
 from .adapter import Adapter
-from .grammar import Grammar, Matcher
+from .grammar import Grammar, Matcher, Schema, Constraint, GrammarConstraint
 
 __all__ = [
     # Core
@@ -59,6 +59,9 @@ __all__ = [
     "Adapter",
     "Grammar",
     "Matcher",
+    "Schema",
+    "Constraint",
+    "GrammarConstraint",
 ]
 
 # --- Internal: return value plumbing for bakery wrapper ---

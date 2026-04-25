@@ -1,6 +1,6 @@
 interface tool-use {
     use pie:core/model.{model};
-    use pie:core/inference.{matcher};
+    use pie:core/inference.{grammar, matcher};
     use pie:core/types.{error};
 
     variant event {
@@ -18,6 +18,10 @@ interface tool-use {
 
     /// Create a decoder to detect tool calls in generated tokens
     create-decoder: func(model: borrow<model>) -> decoder;
+
+    /// Returns the grammar that constrains well-formed tool-call output for
+    /// this model and toolset, or none if the model has no enforceable format.
+    format: func(model: borrow<model>, tools: list<string>) -> option<grammar>;
 
     /// Create a grammar matcher to force-generate tool calls
     create-matcher: func(model: borrow<model>, tools: list<string>) -> matcher;

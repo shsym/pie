@@ -8,7 +8,7 @@ The WIT sampler is a discriminated union:
   - min-p(temperature, p)
   - top-k-top-p(temperature, k, p)
   - embedding
-  - dist(temperature, seed)
+  - dist(temperature, top_k)
 """
 
 from __future__ import annotations
@@ -44,8 +44,18 @@ class Sampler:
 
     @classmethod
     def greedy(cls) -> Sampler:
-        """Deterministic (greedy) sampling."""
+        """Deterministic (greedy / argmax) sampling.
+
+        Recommended default for grammar-constrained generation: most masked
+        positions have only a handful of valid tokens and stochastic
+        sampling rarely improves quality.
+        """
         return cls(Sampler_Multinomial((0.0, 1)))
+
+    @classmethod
+    def argmax(cls) -> Sampler:
+        """Argmax sampling. Alias for :meth:`greedy`."""
+        return cls.greedy()
 
     @classmethod
     def top_p(cls, temperature: float = 0.6, top_p: float = 0.95) -> Sampler:
@@ -83,9 +93,14 @@ class Sampler:
         return cls(Sampler_Embedding())
 
     @classmethod
-    def dist(cls, temperature: float = 1.0, seed: int = 0) -> Sampler:
-        """Distribution output mode (returns full probability distribution)."""
-        return cls(Sampler_Dist((temperature, seed)))
+    def distribution(cls, temperature: float = 1.0, top_k: int = 0) -> Sampler:
+        """Distribution output mode.
+
+        Returns the top-``top_k`` token IDs with their probabilities instead
+        of a sampled token. Useful for tree search, best-of-n, or external
+        samplers. ``top_k=0`` returns the full distribution.
+        """
+        return cls(Sampler_Dist((temperature, top_k)))
 
     def __repr__(self) -> str:
         return f"Sampler({self._variant})"

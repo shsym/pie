@@ -1,35 +1,23 @@
-//! Demonstrates CodeACT-style agentic workflow with code execution.
+//! CodeACT agent: solves problems by generating and executing JavaScript.
 //!
-//! This example implements a CodeACT agent that generates and executes
-//! JavaScript code to solve problems, using the Boa engine for execution.
-//! The agent iteratively writes code, receives execution results, and
-//! continues until it arrives at the final answer.
+//! The agent loops {generate → run code → feed result back} until the
+//! model emits a `Final Answer:` line.
 
-use boa_engine::{Context as JsContext, Source};
-use inferlet::{
-    Context, inference::Sampler, model::Model,
-    runtime, Result,
-};
+use inferlet::{inference::Sampler, model::Model, runtime, Context, Result};
 use serde::Deserialize;
+
+mod js;
 
 #[derive(Deserialize)]
 struct Input {
-    #[serde(default = "default_num_function_calls")]
+    #[serde(default = "default_steps")]
     num_function_calls: u32,
-    #[serde(default = "default_tokens_between_calls")]
+    #[serde(default = "default_tokens")]
     tokens_between_calls: usize,
 }
 
-fn default_num_function_calls() -> u32 { 5 }
-fn default_tokens_between_calls() -> usize { 512 }
-
-/// Result of parsing the assistant's response.
-enum CodeResult {
-    /// JavaScript code was found and executed (result returned).
-    Code(String),
-    /// No code block was found, indicating the model is providing a final answer.
-    FinalAnswer,
-}
+fn default_steps() -> u32 { 5 }
+fn default_tokens() -> usize { 512 }
 
 const SYSTEM_PROMPT: &str = "\
 You are CodeACT, a highly intelligent AI assistant that solves problems by writing \
@@ -72,113 +60,50 @@ Important Notes:
 Reminder: You must respond with the code for the NEXT STEP ONLY. Do not repeat previous \
 steps or generate multiple code blocks at once.";
 
-const USER_PROMPT: &str = "Calculate the sum of the first 10 prime numbers.";
+const TASK: &str = "Calculate the sum of the first 10 prime numbers.";
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let num_function_calls = input.num_function_calls;
-    let tokens_between_calls = input.tokens_between_calls;
-
-    let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
+    let model_name = runtime::models().first().cloned().ok_or("No models available")?;
+    let model = Model::load(&model_name)?;
 
     let mut ctx = Context::new(&model)?;
     ctx.system(SYSTEM_PROMPT);
-    ctx.user(&format!("{}\n\n{}", USER_PROMPT, "What is the first step?"));
+    ctx.user(&format!("{TASK}\n\nWhat is the first step?"));
     ctx.cue();
 
-    let mut final_answer = None;
-
-    for _ in 0..num_function_calls {
+    for _ in 0..input.num_function_calls {
         let response = ctx
-            .generate(Sampler::TopP((0.0, 1.0)))
-            .with_max_tokens(tokens_between_calls)
+            .generate(Sampler::ARGMAX)
+            .with_max_tokens(input.tokens_between_calls)
             .collect_text()
             .await?;
 
-        // Parse and execute any JavaScript code in the response
-        let code_result = parse_and_execute_code(&response);
-
-        match code_result {
-            CodeResult::Code(observation) => {
+        match js::try_eval_block(&response) {
+            Some(result) => {
                 ctx.user(&format!(
-                    "Code execution result: {observation}\n\nWhat is the next step?"
+                    "Code execution result: {result}\n\nWhat is the next step?"
                 ));
                 ctx.cue();
             }
-            CodeResult::FinalAnswer => {
-                final_answer = Some(extract_final_answer(&response));
-                break;
+            None => {
+                println!("Final answer: {}", final_answer(&response));
+                return Ok(String::new());
             }
         }
     }
 
-    if let Some(answer) = final_answer {
-        println!("Final answer: {}", answer);
-    } else {
-        println!("No final answer found within the iteration limit.");
-    }
-
+    println!("No final answer found within the iteration limit.");
     Ok(String::new())
 }
 
-/// Parses the assistant's response for JavaScript code blocks and executes them.
-fn parse_and_execute_code(text: &str) -> CodeResult {
-    if let Some(js_code) = extract_js_code(text) {
-        let result = execute_js_code(&js_code);
-        CodeResult::Code(result)
-    } else {
-        CodeResult::FinalAnswer
-    }
-}
-
-/// Extracts JavaScript code from a markdown block.
-/// Scans backwards to find the last code block, which is important for thinking models
-/// that may generate multiple code patterns during their reasoning process.
-fn extract_js_code(text: &str) -> Option<String> {
-    let start_marker = "```javascript";
-    let end_marker = "```";
-    // Search backwards to find the last code block
-    if let Some(start) = text.rfind(start_marker) {
-        let code_start = start + start_marker.len();
-        if let Some(end) = text[code_start..].find(end_marker) {
-            let code = &text[code_start..code_start + end];
-            return Some(code.trim().to_string());
-        }
-    }
-    None
-}
-
-/// Extracts the final answer from the response text.
-/// Scans backwards to find the last "Final Answer:" pattern, which is important for thinking
-/// models that may generate multiple answer patterns during their reasoning process.
-fn extract_final_answer(text: &str) -> String {
-    // Scan backwards through lines to find the last "Final Answer:" pattern
-    for line in text.lines().rev() {
-        let line = line.trim();
-        if let Some(answer) = line.strip_prefix("Final Answer:") {
-            return answer.trim().to_string();
-        }
-    }
-    // If no explicit final answer marker, return the last non-empty line
+/// Extracts the last `Final Answer:` line, falling back to the last
+/// non-empty line of the response.
+fn final_answer(text: &str) -> String {
     text.lines()
         .rev()
-        .find(|line| !line.trim().is_empty())
+        .find_map(|l| l.trim().strip_prefix("Final Answer:").map(str::trim))
+        .or_else(|| text.lines().rev().map(str::trim).find(|l| !l.is_empty()))
         .unwrap_or("Unknown")
-        .trim()
         .to_string()
-}
-
-/// Executes the given JavaScript code using the Boa engine.
-fn execute_js_code(code: &str) -> String {
-    let mut context = JsContext::default();
-    match context.eval(Source::from_bytes(code)) {
-        Ok(res) => res
-            .to_string(&mut context)
-            .unwrap_or_else(|_| "undefined".into())
-            .to_std_string()
-            .unwrap(),
-        Err(e) => format!("Execution Error: {}", e),
-    }
 }
