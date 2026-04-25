@@ -4,11 +4,12 @@
 //! Tool responses use the `ipython` role.
 
 use std::sync::Arc;
+use crate::inference::structured::grammar::Grammar;
 use crate::model::instruct::{
     ChatDecoder,
     Instruct,
     ReasoningDecoder,
-    ToolDecoder, ToolEvent,
+    ToolDecoder, ToolEvent, ToolGrammar,
 };
 use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::model::tokenizer::Tokenizer;
@@ -214,7 +215,7 @@ impl Instruct for LlamaInstruct {
         self.role_tokens(&self.ipython_prefix, value)
     }
 
-    fn tool_call_grammar(&self, tools: &[String]) -> Option<String> {
+    fn tool_call_grammar(&self, tools: &[String]) -> Option<ToolGrammar> {
         if tools.is_empty() {
              return None;
         }
@@ -254,7 +255,8 @@ ws ::= [ \t\n]*
 "#,
             name_alt = name_alt
         );
-        Some(grammar)
+        let parsed = Grammar::from_ebnf(&grammar, "root").ok()?;
+        Some(ToolGrammar { source: grammar, grammar: Arc::new(parsed) })
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
@@ -374,8 +376,8 @@ mod tests {
         let tools = vec![r#"{"function":{"name":"foo"}}"#.to_string()];
         let g = inst.tool_call_grammar(&tools).unwrap();
         // Check for single brace (escaped in string literal as \")
-        assert!(g.contains("tool-call ::= \"{\" ws \"name\""));
-        assert!(g.contains("foo"));
+        assert!(g.source.contains("tool-call ::= \"{\" ws \"name\""));
+        assert!(g.source.contains("foo"));
     }
 
     #[test]

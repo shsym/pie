@@ -4,7 +4,15 @@
 //! delegates to the model's `Instruct` impl for all instruct operations.
 
 use std::sync::Arc;
+use crate::inference::structured::grammar::Grammar;
 use crate::model::tokenizer::Tokenizer;
+
+/// A model-provided tool-call grammar: the EBNF source (used as a stable
+/// cache key when compiling for a tokenizer) paired with the parsed AST.
+pub struct ToolGrammar {
+    pub source: String,
+    pub grammar: Arc<Grammar>,
+}
 
 // Shared decoders
 pub mod decoders;
@@ -86,10 +94,10 @@ pub trait Instruct: Send + Sync {
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder>;
     fn tool_decoder(&self) -> Box<dyn ToolDecoder>;
 
-    /// Returns an EBNF grammar string that constrains generation to valid
-    /// tool-call format for this architecture, given a list of tool schemas.
+    /// Returns the parsed tool-call grammar that constrains generation to
+    /// the architecture's tool-call format, given a list of tool schemas.
     /// Returns `None` if the architecture doesn't support constrained tool calling.
-    fn tool_call_grammar(&self, _tools: &[String]) -> Option<String> {
+    fn tool_call_grammar(&self, _tools: &[String]) -> Option<ToolGrammar> {
         None
     }
 }
