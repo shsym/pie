@@ -186,7 +186,7 @@ async fn main(input: Input) -> Result<String> {
         max_num_outputs_per_prompt
     );
 
-    let sampler = Sampler::TopP((0.0, 1.0));
+    let sampler = Sampler::ARGMAX;
     let mut results: Vec<Result<String>> = Vec::new();
 
     for ctx in ctxs.iter_mut() {

@@ -46,7 +46,7 @@ pub use context::{
     Context, RawContext,
     TokenStream, EventStream,
     Speculate, Speculation, Constrain,
-    GrammarConstraint,
+    GrammarConstraint, Schema,
 };
 
 // =============================================================================
@@ -83,6 +83,60 @@ pub mod messaging {
 
 pub mod inference {
     pub use crate::pie::core::inference::*;
+}
+
+impl crate::pie::core::inference::Sampler {
+    /// Argmax sampling — deterministic, picks the highest-probability token.
+    ///
+    /// Recommended default for grammar-constrained generation: most masked
+    /// positions have only a handful of valid tokens and stochastic sampling
+    /// rarely improves quality.
+    pub const ARGMAX: Self = Self::TopP((0.0, 1.0));
+
+    /// Greedy / argmax sampling. Alias for [`ARGMAX`](Self::ARGMAX).
+    pub const fn greedy() -> Self { Self::ARGMAX }
+
+    /// Top-p (nucleus) sampling.
+    ///
+    /// `temperature = 0.0` collapses to argmax. `p = 1.0` allows the full
+    /// distribution. Common defaults: `top_p(0.6, 0.95)`.
+    pub const fn top_p(temperature: f32, p: f32) -> Self {
+        Self::TopP((temperature, p))
+    }
+
+    /// Top-k sampling: sample from the top `k` tokens by probability.
+    pub const fn top_k(temperature: f32, k: u32) -> Self {
+        Self::TopK((temperature, k))
+    }
+
+    /// Min-p sampling: keep tokens with probability ≥ `p × max_prob`.
+    pub const fn min_p(temperature: f32, p: f32) -> Self {
+        Self::MinP((temperature, p))
+    }
+
+    /// Combined top-k + top-p: first restrict to top `k`, then apply nucleus `p`.
+    pub const fn top_k_top_p(temperature: f32, k: u32, p: f32) -> Self {
+        Self::TopKTopP((temperature, k, p))
+    }
+
+    /// Plain multinomial: sample from the full distribution after temperature
+    /// scaling. The `u32` is a draws-per-sample multiplier (typically 1).
+    pub const fn multinomial(temperature: f32, draws: u32) -> Self {
+        Self::Multinomial((temperature, draws))
+    }
+
+    /// Distribution output: returns the top-`k` token IDs with their
+    /// probabilities instead of a sampled token. Useful for tree search,
+    /// best-of-n, or external samplers.
+    pub const fn distribution(temperature: f32, k: u32) -> Self {
+        Self::Dist((temperature, k))
+    }
+}
+
+impl Default for crate::pie::core::inference::Sampler {
+    /// Argmax. The most predictable default — switch to `top_p` for creative
+    /// tasks.
+    fn default() -> Self { Self::ARGMAX }
 }
 
 pub mod instruct {
@@ -195,9 +249,12 @@ pub fn parse_args(args: Vec<String>) -> Arguments {
 }
 
 /// Prelude module for convenient imports.
+///
+/// `use inferlet::prelude::*;` covers the common case so inferlets don't
+/// have to maintain a hand-rolled import grocery list.
 pub mod prelude {
     pub use crate::main;
-    pub use crate::Context;
+    pub use crate::{Context, Event, Result, Schema};
     pub use crate::inference::{ForwardPass, Output, Sampler};
     pub use crate::model::Model;
     pub use crate::runtime;

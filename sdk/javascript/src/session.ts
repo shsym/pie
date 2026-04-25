@@ -4,9 +4,23 @@
 import * as _session from 'pie:core/session';
 import { awaitFuture } from './_async.js';
 
-/** Sends a text message to the remote user client. */
-export function send(message: string): void {
-    _session.send(message);
+/** Sends a message to the remote user client.
+ *
+ * Strings are sent verbatim. Anything else is JSON-stringified
+ * (objects, arrays, numbers, bools).
+ *
+ * ```ts
+ * session.send("plain text");
+ * session.send({ event: "tick", n: 3 });
+ * session.send([1, 2, 3]);
+ * ```
+ */
+export function send(message: unknown): void {
+    if (typeof message === 'string') {
+        _session.send(message);
+    } else {
+        _session.send(JSON.stringify(message));
+    }
 }
 
 /** Receives a text message from the remote user client. */

@@ -8,7 +8,7 @@ import {
     session, runtime,
 } from 'inferlet';
 
-export async function main(args: string[]) {
+export async function main(_input: Record<string, unknown>) {
     const model = Model.load(runtime.models()[0]);
 
     // Create two separate contexts with different prompts

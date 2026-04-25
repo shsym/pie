@@ -1,16 +1,12 @@
-//! Demonstrates template-driven generation with grammar-constrained decoding.
+//! Demonstrates template-driven generation: a JSON-Schema-constrained model
+//! response feeds a `minijinja` template.
 //!
-//! Three layers:
-//!  1. Deva's built-in `GrammarConstraint::from_json_schema` constrains every
-//!     generated token to keep the output valid against the given JSON schema.
-//!  2. `jsonschema` validates the decoded JSON against the schema.
-//!  3. `minijinja` renders the validated data through a Jinja2-style template.
-//!
-//! On validation or render failure, the errors are fed back to the model and
-//! it regenerates (still grammar-constrained). Retries cap at `--max-retries`.
+//! `Schema::JsonSchema` guarantees the decoded text parses and conforms to
+//! the schema, so `serde_json::from_str` is the only step between the model
+//! output and the renderer.
 
 use inferlet::{
-    Context, Event, GrammarConstraint, Result, inference::Sampler, model::Model, runtime,
+    Context, Result, Schema, inference::Sampler, model::Model, runtime,
 };
 use minijinja::Environment;
 use serde::Deserialize;
@@ -20,14 +16,11 @@ use serde_json::Value;
 struct Input {
     #[serde(default = "default_prompt")]
     prompt: String,
-    #[serde(default = "default_max_retries")]
-    max_retries: u32,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
 }
 
 fn default_prompt() -> String { "an AI-powered code editor".to_string() }
-fn default_max_retries() -> u32 { 3 }
 fn default_max_tokens() -> usize { 1024 }
 
 const TEMPLATE: &str = r#"
@@ -62,82 +55,21 @@ PRICING & AVAILABILITY
 const PRODUCT_SCHEMA: &str = r#"{
     "type": "object",
     "properties": {
-        "product_name": {
-            "type": "string",
-            "minLength": 1
-        },
-        "tagline": {
-            "type": "string",
-            "minLength": 1
-        },
-        "description": {
-            "type": "string",
-            "minLength": 1
-        },
-        "features": {
-            "type": "array",
-            "items": { "type": "string" },
-            "minItems": 1
-        },
-        "price": {
-            "type": "string"
-        },
-        "release_date": {
-            "type": "string"
-        },
-        "discount_percent": {
-            "type": ["integer", "null"]
-        }
+        "product_name":     { "type": "string", "minLength": 1 },
+        "tagline":          { "type": "string", "minLength": 1 },
+        "description":      { "type": "string", "minLength": 1 },
+        "features":         { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "price":            { "type": "string" },
+        "release_date":     { "type": "string" },
+        "discount_percent": { "type": ["integer", "null"] }
     },
     "required": ["product_name", "tagline", "description", "features", "price", "release_date"],
     "additionalProperties": false
 }"#;
 
 const SYSTEM_PROMPT: &str = "\
-You are a helpful assistant that generates structured product data. \
-Output ONLY a raw JSON object with no additional text, markdown fences, or explanation. \
-The JSON must conform to the JSON Schema provided in the user message. \
-If you receive validation or rendering errors, fix the JSON to address the issues \
-and output only the corrected JSON object.";
-
-fn build_initial_prompt(user_prompt: &str, _schema: &str) -> String {
-    format!(
-        "Generate product announcement data for: {}.\n\n\
-         Output only a JSON object with exactly these top-level keys:\n\
-         product_name (string), tagline (string), description (string),\n\
-         features (non-empty array of strings), price (string),\n\
-         release_date (string), discount_percent (integer or null).\n\
-         Do not wrap it in a schema. Output only the JSON object, nothing else.",
-        user_prompt
-    )
-}
-
-fn build_retry_prompt(errors: &str) -> String {
-    format!(
-        "The JSON you produced has validation/rendering errors:\n{}\n\n\
-         Please fix these errors and output only the corrected JSON object, nothing else.",
-        errors
-    )
-}
-
-fn validate(json_text: &str, schema_value: &Value) -> std::result::Result<Value, String> {
-    let parsed: Value = serde_json::from_str(json_text)
-        .map_err(|e| format!("JSON parse error: {e}"))?;
-
-    let validator = jsonschema::validator_for(schema_value)
-        .map_err(|e| format!("Schema compile error: {e}"))?;
-
-    let errors: Vec<String> = validator
-        .iter_errors(&parsed)
-        .map(|e| format!("- {} (at {})", e, e.instance_path()))
-        .collect();
-
-    if errors.is_empty() {
-        Ok(parsed)
-    } else {
-        Err(errors.join("\n"))
-    }
-}
+You are a helpful assistant that generates structured product data. Output \
+ONLY a raw JSON object — no markdown, no explanation.";
 
 fn render(data: &Value) -> std::result::Result<String, String> {
     let mut env = Environment::new();
@@ -146,93 +78,34 @@ fn render(data: &Value) -> std::result::Result<String, String> {
     let tmpl = env
         .get_template("announcement")
         .map_err(|e| format!("Template lookup error: {e}"))?;
-    // Render with the validated JSON as the top-level context so fields
-    // like product_name/tagline/features are directly accessible.
     tmpl.render(data)
         .map_err(|e| format!("Template render error: {e}"))
 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    let prompt = input.prompt;
-    let max_retries = input.max_retries;
-    let max_tokens = input.max_tokens;
-
-    let schema_value: Value =
-        serde_json::from_str(PRODUCT_SCHEMA).map_err(|e| format!("Schema parse error: {e}"))?;
-
     let models = runtime::models();
-    let model_name = models.first().ok_or("No models available")?;
-    let model = Model::load(model_name)?;
+    let model = Model::load(models.first().ok_or("No models available")?)?;
 
     let mut ctx = Context::new(&model)?;
     ctx.system(SYSTEM_PROMPT);
-    ctx.user(&build_initial_prompt(&prompt, PRODUCT_SCHEMA));
+    ctx.user(&format!(
+        "Generate product announcement data for: {}.",
+        input.prompt,
+    ));
+    ctx.cue();
 
-    let mut rendered: Option<String> = None;
+    let text = ctx
+        .generate(Sampler::ARGMAX)
+        .with_max_tokens(input.max_tokens)
+        .with_schema(Schema::JsonSchema(PRODUCT_SCHEMA))?
+        .collect_text()
+        .await?;
 
-    for attempt in 1..=max_retries {
-        println!("--- Attempt {}/{} ---", attempt, max_retries);
+    let data: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("JSON parse error: {e}"))?;
 
-        let constraint = GrammarConstraint::from_json_schema(PRODUCT_SCHEMA, &model)?;
-        ctx.cue();
-
-        // Decode with reasoning so `<think>...</think>` lands in Thinking
-        // events (discarded); the actual JSON is accumulated from Text/Done.
-        let mut events = ctx
-            .generate(Sampler::TopP((0.0, 1.0)))
-            .with_max_tokens(max_tokens)
-            .with_constraint(constraint)
-            .decode()
-            .with_reasoning();
-
-        let mut output = String::new();
-        while let Some(event) = events.next().await? {
-            match event {
-                Event::Text(s) => output.push_str(&s),
-                Event::Done(s) => { output = s; break; }
-                _ => {}
-            }
-        }
-
-        println!("Output: {}", output);
-
-        let validated = match validate(&output, &schema_value) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                println!("Validation errors:\n{}", err);
-                ctx.assistant(&output);
-                ctx.user(&build_retry_prompt(&err));
-                continue;
-            }
-        };
-
-        match render(&validated) {
-            Ok(text) => {
-                println!("Rendered successfully.");
-                rendered = Some(text);
-                break;
-            }
-            Err(err) => {
-                println!("Render error:\n{}", err);
-                ctx.assistant(&output);
-                ctx.user(&build_retry_prompt(&err));
-            }
-        }
-    }
-
-    println!("\n--- Result ---");
-    match rendered {
-        Some(text) => {
-            println!("{}", text);
-            Ok(text)
-        }
-        None => {
-            println!("Failed to produce a valid rendered document after {} attempts.", max_retries);
-            Err(format!(
-                "template generation failed after {} attempts",
-                max_retries
-            ))
-        }
-    }
+    let rendered = render(&data)?;
+    println!("{}", rendered);
+    Ok(rendered)
 }

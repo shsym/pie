@@ -62,7 +62,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // Generate
     let mut events = ctx
-        .generate(Sampler::TopP((input.temperature, input.top_p)))
+        .generate(Sampler::top_p(input.temperature, input.top_p))
         .with_max_tokens(input.max_tokens)
         .decode()
         .with_reasoning();

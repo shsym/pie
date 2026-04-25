@@ -6,7 +6,8 @@ use crate::Result;
 
 use crate::pie::instruct::chat;
 
-use super::{Context, Decoder, Event, Speculation, Constrain, GrammarConstraint};
+use super::{Context, Decoder, Event, Speculation, Constrain, GrammarConstraint, Schema};
+use super::constraint::brle_and;
 
 use super::compute_bid;
 
@@ -26,7 +27,15 @@ pub struct TokenStream<'a> {
     sampler: Sampler,
     stop_tokens: Vec<u32>,
     speculation: Speculation,
-    constraint: Option<Box<dyn Constrain>>,
+    /// Active constraints. Multiple constraints compose via mask AND.
+    constraints: Vec<Box<dyn Constrain>>,
+    /// Tokens accepted in the previous step. Fed into each constraint's
+    /// `step()` at the start of the next iteration.
+    pending_accepts: Vec<u32>,
+    /// Set when a [`Schema`] is applied via [`TokenStream::constrain`].
+    /// `collect_json` errors if this is true, since it builds its own
+    /// schema from the deserialized type.
+    has_schema: bool,
     done: bool,
     max_tokens: Option<usize>,
     tokens_generated: usize,
@@ -55,7 +64,9 @@ impl<'a> TokenStream<'a> {
             sampler,
             stop_tokens,
             speculation: Speculation::system(),
-            constraint: None,
+            constraints: Vec::new(),
+            pending_accepts: Vec::new(),
+            has_schema: false,
             done: false,
             max_tokens: None,
             tokens_generated: 0,
@@ -88,9 +99,27 @@ impl<'a> TokenStream<'a> {
         self
     }
 
-    /// Sets a sampling constraint for logit masking.
+    /// Apply a declarative [`Schema`] constraint.
+    ///
+    /// Repeated calls (or combined with [`with_constraint`](Self::with_constraint))
+    /// AND their masks per step.
+    ///
+    /// Setting a schema is incompatible with [`collect_json`](Self::collect_json),
+    /// which derives its own schema from the deserialized type. Calling
+    /// `collect_json` after `with_schema(Schema::*)` returns an error.
+    pub fn with_schema(mut self, schema: Schema<'_>) -> Result<Self> {
+        let c = schema.build(&self.ctx.model)?;
+        self.constraints.push(Box::new(c));
+        self.has_schema = true;
+        Ok(self)
+    }
+
+    /// Apply a custom [`Constrain`] implementation.
+    ///
+    /// Composes with other constraints (including those added via
+    /// [`with_schema`](Self::with_schema)) by AND-ing masks.
     pub fn with_constraint<C: Constrain + 'static>(mut self, constraint: C) -> Self {
-        self.constraint = Some(Box::new(constraint));
+        self.constraints.push(Box::new(constraint));
         self
     }
 
@@ -199,38 +228,43 @@ impl<'a> TokenStream<'a> {
 
     /// Generate JSON-constrained output and deserialize into `T`.
     ///
-    /// This method:
-    /// 1. Extracts a JSON schema from `T` using [`schemars::JsonSchema`].
-    /// 2. Applies a grammar constraint so generation always produces valid JSON.
-    /// 3. Collects all tokens, decodes to text, and deserializes into `T`.
+    /// Builds a grammar constraint from `T`'s [`schemars::JsonSchema`]
+    /// derivation, generates, decodes, and deserializes.
+    ///
+    /// Errors if [`constrain`](Self::constrain) was already called with a
+    /// [`Schema`] — the two would be defining the JSON schema twice. Custom
+    /// constraints applied via [`constrain_with`](Self::constrain_with) are
+    /// orthogonal and compose freely.
     ///
     /// ```ignore
     /// #[derive(Deserialize, JsonSchema)]
     /// struct City { name: String, population: u64 }
     ///
     /// ctx.system("Extract city info.").user("Paris has 2M people.").cue();
-    /// let city: City = ctx.generate(sampler).collect_json().await?;
+    /// let city: City = ctx.generate(Sampler::ARGMAX).collect_json().await?;
     /// ```
     pub async fn collect_json<T>(mut self) -> Result<T>
     where
         T: serde::de::DeserializeOwned + schemars::JsonSchema,
     {
-        // 1. Extract JSON schema from T.
+        if self.has_schema {
+            return Err(
+                "collect_json::<T> derives its own JSON schema from T; \
+                 .with_schema(Schema::*) was already set"
+                    .to_string(),
+            );
+        }
+
         let schema = schemars::schema_for!(T);
         let schema_str = serde_json::to_string(&schema)
             .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
 
-        // 2. Create grammar constraint and apply.
-        let constraint = GrammarConstraint::from_json_schema(
-            &schema_str,
-            &self.ctx.model,
-        )?;
-        self.constraint = Some(Box::new(constraint));
+        let constraint = GrammarConstraint::from_json_schema(&schema_str, &self.ctx.model)?;
+        self.constraints.push(Box::new(constraint));
+        self.has_schema = true;
 
-        // 3. Generate, decode, and deserialize.
         let text = self.collect_text().await?;
-        serde_json::from_str(&text)
-            .map_err(|e| format!("Failed to deserialize JSON: {e}"))
+        serde_json::from_str(&text).map_err(|e| format!("Failed to deserialize JSON: {e}"))
     }
 
     async fn step(&mut self) -> Result<Vec<u32>> {
@@ -314,17 +348,37 @@ impl<'a> TokenStream<'a> {
         let sample_idx = if n_pending > 0 { n_pending - 1 } else { 0 };
         pass.sampler(&[sample_idx], self.sampler.clone());
 
-        // Apply logit mask if constraint is available.
-        if let Some(ref constraint) = self.constraint {
-            pass.logit_mask(&constraint.mask());
+        // Compose constraint masks: each constraint advances on tokens
+        // accepted in the previous step and returns its next-position mask.
+        // Empty masks are treated as "no restriction" (transparent under AND).
+        if !self.constraints.is_empty() {
+            let pending = std::mem::take(&mut self.pending_accepts);
+            let masks: Vec<Vec<u32>> = self
+                .constraints
+                .iter_mut()
+                .map(|c| c.step(&pending).to_vec())
+                .filter(|m| !m.is_empty())
+                .collect();
+            let combined = match masks.len() {
+                0 => None,
+                1 => Some(masks.into_iter().next().unwrap()),
+                _ => {
+                    let mut iter = masks.into_iter();
+                    let first = iter.next().unwrap();
+                    Some(iter.fold(first, |acc, m| brle_and(&acc, &m)))
+                }
+            };
+            if let Some(mask) = combined {
+                pass.logit_mask(&mask);
+            }
         }
 
         let output = pass.execute_async().await?;
         let new_tokens = self.speculation.accept(output);
 
-        // Update constraint with accepted tokens.
-        if let Some(ref mut constraint) = self.constraint {
-            constraint.accept(&new_tokens);
+        // Stash accepted tokens for the next step's constraint advance.
+        if !self.constraints.is_empty() {
+            self.pending_accepts.extend_from_slice(&new_tokens);
         }
 
         if new_tokens.is_empty() {

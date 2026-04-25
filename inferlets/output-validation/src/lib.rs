@@ -17,7 +17,7 @@ struct Input {}
 /// Calculates the normalized probability of a list of candidate strings being generated
 /// from a given context.
 ///
-/// Uses ForwardPass with Sampler::Dist to retrieve token probability distributions,
+/// Uses ForwardPass with Sampler::distribution to retrieve token probability distributions,
 /// then scores each candidate by its cumulative log probability.
 pub async fn validate_outputs(
     model: &Model,
@@ -60,7 +60,7 @@ pub async fn validate_outputs(
 
             // Sample distributions at the last token position
             let last_idx = (pending.len() - 1) as u32;
-            pass.sampler(&[last_idx], Sampler::Dist((0.0, 0)));
+            pass.sampler(&[last_idx], Sampler::distribution(0.0, 0));
 
             let output = pass.execute_async().await
                 .map_err(|e| format!("Forward pass failed: {}", e))?;

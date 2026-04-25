@@ -9,8 +9,15 @@ import type { Sampler as WitSampler } from 'pie:core/inference';
  * that can be passed to `ForwardPass.sampler()`.
  */
 export const Sampler = {
-  /** Greedy decoding (temperature=0, top-k=1). */
+  /** Greedy / argmax decoding (temperature=0, top-k=1).
+   *
+   * Recommended default for grammar-constrained generation. */
   greedy(): WitSampler {
+    return { tag: 'multinomial', val: [0.0, 1] };
+  },
+
+  /** Argmax sampling. Alias for {@link Sampler.greedy}. */
+  argmax(): WitSampler {
     return { tag: 'multinomial', val: [0.0, 1] };
   },
 
@@ -44,8 +51,12 @@ export const Sampler = {
     return { tag: 'embedding' };
   },
 
-  /** Full distribution output. */
-  dist(temperature: number, topK: number): WitSampler {
+  /** Distribution output mode.
+   *
+   * Returns the top-`topK` token IDs with their probabilities instead of a
+   * sampled token. Useful for tree search, best-of-n, or external samplers.
+   * `topK = 0` returns the full distribution. */
+  distribution(temperature: number, topK: number): WitSampler {
     return { tag: 'dist', val: [temperature, topK] };
   },
 } as const;

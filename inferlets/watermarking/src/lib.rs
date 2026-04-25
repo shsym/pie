@@ -3,7 +3,7 @@
 //! Uses a green/red list approach where tokens are partitioned based on the
 //! hash of the previous token, and green-listed tokens receive a probability
 //! boost during sampling. The watermark is applied via manual ForwardPass
-//! decoding with Sampler::Dist to get distributions, then custom sampling.
+//! decoding with Sampler::distribution to get distributions, then custom sampling.
 
 use inferlet::{
     Context, model::Model, runtime,
@@ -178,7 +178,7 @@ async fn main(input: Input) -> Result<String> {
 
         // Use Dist sampler to get the probability distribution
         let last_idx = (pending_tokens.len() - 1) as u32;
-        pass.sampler(&[last_idx], Sampler::Dist((0.0, 0)));
+        pass.sampler(&[last_idx], Sampler::distribution(0.0, 0));
 
         let output = pass.execute_async().await
             .map_err(|e| format!("Forward pass failed at step {}: {}", step, e))?;

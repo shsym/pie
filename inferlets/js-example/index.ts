@@ -10,7 +10,15 @@ import {
     session, runtime,
 } from 'inferlet';
 
-export async function main(args: string[]) {
+interface Input {
+    prompt?: string;
+    system?: string;
+    max_tokens?: number;
+    temperature?: number;
+    top_p?: number;
+}
+
+export async function main(_input: Input) {
     // Load model
     const model = Model.load(runtime.models()[0]);
 

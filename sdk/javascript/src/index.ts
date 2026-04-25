@@ -9,7 +9,8 @@ export type { Output, Brle } from './forward.js';
 export { Sampler } from './sampler.js';
 export type { SamplerType } from './sampler.js';
 export { Adapter } from './adapter.js';
-export { Grammar, Matcher } from './grammar.js';
+export { Grammar, Matcher, GrammarConstraint, Schema } from './grammar.js';
+export type { Constraint } from './grammar.js';
 
 // ── Function modules ──
 export * as runtime from './runtime.js';

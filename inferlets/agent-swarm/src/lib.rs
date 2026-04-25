@@ -121,7 +121,7 @@ async fn main(input: Input) -> Result<String> {
     ctx.cue();
 
     let contribution = ctx
-        .generate(Sampler::TopP((0.0, 1.0)))
+        .generate(Sampler::ARGMAX)
         .with_max_tokens(tokens_per_step)
         .collect_text()
         .await?;

@@ -1,7 +1,7 @@
 [package]
-name = "json-schema-validation"
+name = "js-constrained-decoding"
 version = "0.1.0"
-description = "Grammar-constrained JSON generation against a runtime-string JSON schema"
+description = "Grammar-constrained JSON generation in JavaScript via Schema.jsonSchema"
 authors = ["Pie Team"]
 
 [runtime]

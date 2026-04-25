@@ -86,7 +86,7 @@ async fn main(input: Input) -> Result<String> {
     // The first iteration processes the full prompt. Subsequent iterations
     // process one generated token at a time, applying the sink+window mask.
     let mut generated_tokens: Vec<u32> = Vec::new();
-    let sampler = Sampler::TopP((0.0, 1.0));
+    let sampler = Sampler::ARGMAX;
 
     for _step in 0..max_tokens {
         if pending_tokens.is_empty() {

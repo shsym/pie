@@ -167,7 +167,7 @@ async fn main(input: Input) -> Result<String> {
     extraction_ctx.cue();
 
     let extraction_output = extraction_ctx
-        .generate(Sampler::TopP((0.0, 1.0))) // greedy
+        .generate(Sampler::ARGMAX) // greedy
         .with_max_tokens(max_tokens)
         .collect_text()
         .await?;
@@ -246,7 +246,7 @@ async fn main(input: Input) -> Result<String> {
     query_ctx.cue();
 
     let answer = query_ctx
-        .generate(Sampler::TopP((0.0, 1.0)))
+        .generate(Sampler::ARGMAX)
         .with_max_tokens(max_tokens)
         .collect_text()
         .await?;

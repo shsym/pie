@@ -1,13 +1,10 @@
-//! Demonstrates grammar-constrained decoding using the Grammar and Matcher APIs.
+//! Demonstrates EBNF grammar-constrained decoding.
 //!
-//! This example constrains model output to follow a specific grammar format,
-//! using the built-in Grammar/Matcher infrastructure in the SDK.
+//! `Schema::Ebnf` compiles the grammar into a host matcher; every generated
+//! token is masked to keep the output a valid sentence in the grammar.
 
 use inferlet::{
-    Context, model::Model, runtime,
-    Result,
-    inference::{Grammar, Sampler},
-    Constrain,
+    Context, Result, Schema, inference::Sampler, model::Model, runtime,
 };
 use serde::Deserialize;
 
@@ -19,41 +16,6 @@ struct Input {
 
 fn default_num_tokens() -> usize { 512 }
 
-/// A Grammar-based constraint for TokenStream.
-///
-/// This implements the `Constrain` trait from the SDK, using the built-in
-/// Grammar/Matcher infrastructure to produce BRLE logit masks.
-struct GrammarConstraint {
-    matcher: inferlet::inference::Matcher,
-}
-
-impl GrammarConstraint {
-    fn new(grammar: &Grammar, model: &Model) -> Self {
-        let tokenizer = model.tokenizer();
-        let matcher = inferlet::inference::Matcher::new(grammar, &tokenizer);
-        Self { matcher }
-    }
-}
-
-impl Constrain for GrammarConstraint {
-    fn mask(&self) -> Vec<u32> {
-        self.matcher.next_token_logit_mask()
-    }
-
-    fn accept(&mut self, tokens: &[u32]) {
-        let _ = self.matcher.accept_tokens(tokens);
-    }
-
-    fn reset(&mut self) {
-        self.matcher.reset();
-    }
-
-    fn rollback(&mut self, _num_tokens: usize) {
-        // Grammar matcher doesn't support partial rollback; reset instead
-        self.matcher.reset();
-    }
-}
-
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     let max_tokens = input.num_tokens;
@@ -61,35 +23,28 @@ async fn main(input: Input) -> Result<String> {
     let models = runtime::models();
     let model = Model::load(models.first().ok_or("No models available")?)?;
 
-    // Define the grammar for the output (GBNF / standard EBNF format)
-    let grammar_str = r#"
+    let grammar = r#"
 root ::= "[" person ("," person)* "]"
 person ::= "{" "\"name\"" ":" string "," "\"age\"" ":" number "}"
 string ::= "\"" [^"]+ "\""
 number ::= [0-9]+
 "#;
 
-    let grammar = Grammar::from_ebnf(grammar_str)?;
-    let constraint = GrammarConstraint::new(&grammar, &model);
-
     let mut ctx = Context::new(&model)?;
-
-    ctx.system(
-        "You are a helpful assistant that outputs structured data in JSON format."
-    );
+    ctx.system("You are a helpful assistant that outputs structured data in JSON format.");
     ctx.user(
         "List three famous scientists with their approximate birth years. \
-        Format the output as a JSON array of objects with 'name' and 'age' fields. \
-        For 'age', use their approximate birth year."
+         Format the output as a JSON array of objects with 'name' and 'age' fields. \
+         For 'age', use their approximate birth year.",
     );
     ctx.cue();
 
     let start = std::time::Instant::now();
 
     let text = ctx
-        .generate(Sampler::TopP((0.0, 1.0)))
+        .generate(Sampler::ARGMAX)
         .with_max_tokens(max_tokens)
-        .with_constraint(constraint)
+        .with_schema(Schema::Ebnf(grammar))?
         .collect_text()
         .await?;
 
