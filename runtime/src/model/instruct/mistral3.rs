@@ -10,11 +10,12 @@
 //! Reference: Mistral V3 Jinja chat template.
 
 use std::sync::Arc;
+use crate::inference::structured::grammar::Grammar;
 use crate::model::instruct::{
     ChatDecoder,
     Instruct,
     ReasoningDecoder,
-    ToolDecoder, ToolEvent,
+    ToolDecoder, ToolEvent, ToolGrammar,
 };
 use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder};
 use crate::model::tokenizer::Tokenizer;
@@ -248,7 +249,7 @@ impl Instruct for MistralInstruct {
         })
     }
 
-    fn tool_call_grammar(&self, tools: &[String]) -> Option<String> {
+    fn tool_call_grammar(&self, tools: &[String]) -> Option<ToolGrammar> {
         if tools.is_empty() {
             return None;
         }
@@ -285,7 +286,8 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
 "#,
             name_alt = name_alt
         );
-        Some(grammar)
+        let parsed = Grammar::from_ebnf(&grammar, "root").ok()?;
+        Some(ToolGrammar { source: grammar, grammar: Arc::new(parsed) })
     }
 }
 
@@ -436,8 +438,8 @@ mod tests {
         let inst = mistral();
         let tools = vec![r#"{"function":{"name":"foo"}}"#.to_string()];
         let g = inst.tool_call_grammar(&tools).unwrap();
-        assert!(g.contains("tool-call ::= \"[TOOL_CALLS]\""));
-        assert!(g.contains("foo"));
+        assert!(g.source.contains("tool-call ::= \"[TOOL_CALLS]\""));
+        assert!(g.source.contains("foo"));
     }
 
     #[test]

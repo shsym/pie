@@ -91,6 +91,10 @@ interface inference {
 
         /// Construct from an EBNF grammar string.
         from-ebnf: static func(ebnf: string) -> result<grammar, error>;
+
+        /// Debug representation of the grammar. Format is unspecified and
+        /// may differ across grammar kinds; do not parse.
+        to-string: func() -> string;
     }
 
     /// Stateful matcher that walks the grammar automaton as tokens are

@@ -262,8 +262,36 @@ class ESTrainer:
         else:
             await self._setup_distributed()
 
+        await self._install_local_inferlets()
         await self._init_adapter()
         self._load_datasets()
+
+    async def _install_local_inferlets(self):
+        """Build-then-install the locally-built es-* inferlets on every client.
+        Bypasses the registry — uses the .wasm artifacts in
+        sdk/demo/zo-training/inferlets/target/wasm32-wasip2/release/."""
+        import os as _os
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        target_dir = _os.path.join(
+            here, "inferlets", "target", "wasm32-wasip2", "release"
+        )
+        manifests = _os.path.join(here, "inferlets")
+        artifacts = {
+            "es-init":    (_os.path.join(target_dir, "es_init.wasm"),    _os.path.join(manifests, "es-init", "Pie.toml")),
+            "es-rollout": (_os.path.join(target_dir, "es_rollout.wasm"), _os.path.join(manifests, "es-rollout", "Pie.toml")),
+            "es-update":  (_os.path.join(target_dir, "es_update.wasm"),  _os.path.join(manifests, "es-update", "Pie.toml")),
+        }
+        for name, (wasm, mf) in artifacts.items():
+            if not _os.path.exists(wasm) or not _os.path.exists(mf):
+                raise RuntimeError(
+                    f"Local inferlet artifact missing: {wasm} or {mf}. "
+                    f"Build with: cd inferlets && cargo build --release --target wasm32-wasip2"
+                )
+        tqdm.write("📦 Installing locally-built inferlets on all clients...")
+        for client in self.clients:
+            for name, (wasm, mf) in artifacts.items():
+                await client.install_program(wasm, mf, force_overwrite=True)
+        tqdm.write(f"✅ Installed {len(artifacts)} local inferlets on {len(self.clients)} client(s).")
 
     async def teardown(self):
         """Clean up all resources."""

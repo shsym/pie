@@ -6,11 +6,9 @@
 use crate::api::pie;
 use crate::instance::InstanceState;
 use crate::model::instruct::{ToolDecoder, ToolEvent};
-use crate::inference::structured::grammar::Grammar as InternalGrammar;
 use crate::inference::structured::compiled_grammar::CompiledGrammar;
 use crate::inference::structured::matcher::GrammarMatcher;
 use anyhow::Result;
-use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -56,6 +54,22 @@ impl pie::instruct::tool_use::Host for InstanceState {
         Ok(self.ctx().table.push(decoder)?)
     }
 
+    async fn format(
+        &mut self,
+        model: Resource<crate::api::model::Model>,
+        tools: Vec<String>,
+    ) -> Result<Option<Resource<crate::api::inference::Grammar>>> {
+        let model_res = self.ctx().table.get(&model)?;
+        let Some(tg) = model_res.model.instruct().tool_call_grammar(&tools) else {
+            return Ok(None);
+        };
+        let grammar = crate::api::inference::Grammar {
+            source: tg.source,
+            inner: tg.grammar,
+        };
+        Ok(Some(self.ctx().table.push(grammar)?))
+    }
+
     async fn create_matcher(
         &mut self,
         model: Resource<crate::api::model::Model>,
@@ -66,14 +80,10 @@ impl pie::instruct::tool_use::Host for InstanceState {
         let tok = model_res.model.tokenizer().clone();
         let stop_tokens = instruct.seal();
 
-        let ebnf = instruct.tool_call_grammar(&tools)
+        let tg = instruct.tool_call_grammar(&tools)
             .ok_or_else(|| anyhow::anyhow!("model does not support constrained tool-call generation"))?;
 
-        let grammar = InternalGrammar::from_ebnf(&ebnf, "root")
-            .map_err(|e| anyhow::anyhow!("failed to compile tool-call grammar: {}", e))?;
-        let grammar_arc = Arc::new(grammar);
-
-        let compiled = CompiledGrammar::get_or_compile(&ebnf, &grammar_arc, &tok);
+        let compiled = CompiledGrammar::get_or_compile(&tg.source, &tg.grammar, &tok);
         let inner = GrammarMatcher::with_compiled(compiled, tok, stop_tokens, 10);
 
         let matcher = crate::api::inference::Matcher { inner };

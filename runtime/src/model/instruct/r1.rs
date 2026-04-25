@@ -4,11 +4,12 @@
 //! Reference: DeepSeek R1 Jinja chat template with tool-calling support.
 
 use std::sync::Arc;
+use crate::inference::structured::grammar::Grammar;
 use crate::model::instruct::{
     ChatDecoder,
     Instruct,
     ReasoningDecoder,
-    ToolDecoder, ToolEvent,
+    ToolDecoder, ToolEvent, ToolGrammar,
 };
 use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder};
 use crate::model::tokenizer::Tokenizer;
@@ -275,7 +276,7 @@ impl Instruct for R1Instruct {
         })
     }
 
-    fn tool_call_grammar(&self, tools: &[String]) -> Option<String> {
+    fn tool_call_grammar(&self, tools: &[String]) -> Option<ToolGrammar> {
         if tools.is_empty() {
             return None;
         }
@@ -316,7 +317,8 @@ json-array ::= "[" (json-value ("," json-value)*)? "]"
 "#,
             name_alt = name_alt
         );
-        Some(grammar)
+        let parsed = Grammar::from_ebnf(&grammar, "root").ok()?;
+        Some(ToolGrammar { source: grammar, grammar: Arc::new(parsed) })
     }
 }
 
@@ -469,8 +471,8 @@ mod tests {
         let grammar = inst.tool_call_grammar(&tools);
         assert!(grammar.is_some());
         let g = grammar.unwrap();
-        assert!(g.contains("root"));
-        assert!(g.contains("get_weather"));
+        assert!(g.source.contains("root"));
+        assert!(g.source.contains("get_weather"));
     }
 
     #[test]
