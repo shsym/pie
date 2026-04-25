@@ -133,6 +133,13 @@ class ModelLoader:
                 schema = gemma3.create_schema(model_config)
                 num_layers = model_config.num_layers
 
+            case "gemma4":
+                from .model import gemma4
+
+                model_config = gemma4.ModelConfig.from_dict(hf_config)
+                schema = gemma4.create_schema(model_config)
+                num_layers = model_config.num_layers
+
             case "mistral3":
                 from .model import mistral3
 
