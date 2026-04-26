@@ -10,39 +10,33 @@ We extend each impl by *direct subclassing* — no mixin. Each subclass:
 
   * overrides `forward()` with a thin call into `_dispatch_masked_forward`,
     which checks for `pie_attn_extras` on the forward context;
-  * overrides `_compute_with_mask()` for a backend-specific fast path
-    (FlashInfer wrapper, FlexAttention block-mask, etc.).
-
-The default `_compute_with_mask` falls through to the universal SDPA gather,
-so a subclass that overrides nothing is automatically correct (just slower).
+  * overrides `_compute_with_mask()` to run the kernel-specific masked path.
 
 `install_mask_aware_impls(vllm_config)` walks every attention layer and
 re-types its impl in place via `instance.__class__ = MaskedSubclass`. The
 subclass shares the impl's `__slots__ = ()` layout so the assignment is
-ABI-compatible. Note that direct inheritance (not a mixin) is required for
-`__class__` assignment to work — CPython's layout check rejects the
-mixin-first MRO even when both classes declare empty slots.
+ABI-compatible. Direct inheritance (not a mixin) is required for `__class__`
+assignment to work — CPython's layout check rejects the mixin-first MRO
+even when both classes declare empty slots.
 
-Auto-synth
-----------
-Unknown impls get an auto-generated subclass via `_make_auto_subclass()` so
-that any attention backend Pie hasn't seen before still works correctly,
-just at SDPA speed. Add a hand-written subclass + register in
-`_explicit_subclasses()` to expose a fast path.
+Refusal policy
+--------------
+Impls without a registered subclass cause a NotImplementedError at engine
+init. Pie's runtime always emits a custom_mask buffer; silently ignoring it
+on an unverified backend would risk wrong tokens for inferlets that depend
+on non-causal attention. Add a fast-path subclass + register in
+`_explicit_subclasses()` to support a new backend.
 
 Caveats
 -------
 * Backends with `forward_includes_kv_cache_update=True` integrate KV write
   into their forward; we replicate that explicitly. All real V1 backends
   today are `False`, so vllm's `unified_kv_cache_update` runs before us.
-* MLA backends (compressed KV, projection-on-read) violate the "K/V live
-  in the cache as-is" assumption of the SDPA gather; auto-synth would
-  silently produce wrong logits, so we refuse them explicitly.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Callable
 
 from .mask_compute import PieAttnExtras, sdpa_gather_path
 
@@ -101,22 +95,6 @@ def _dispatch_masked_forward(
             impl.do_kv_cache_update(layer, key, value, kv_cache, layer_slot_mapping)
 
     impl._compute_with_mask(layer, query, kv_cache, extras, output)
-
-
-def _default_compute_with_mask(
-    self,
-    layer: Any,
-    query,
-    kv_cache,
-    extras: PieAttnExtras,
-    output,
-) -> None:
-    """Universal fallback installed on every masked subclass that doesn't
-    override it. Works on any HW PyTorch supports."""
-    sdpa_gather_path(
-        layer=layer, query=query, kv_cache=kv_cache,
-        extras=extras, output=output,
-    )
 
 
 # ----------------------------------------------------------------------------
@@ -185,67 +163,31 @@ def _explicit_subclasses() -> dict[type, type]:
 
 
 # ----------------------------------------------------------------------------
-# Auto-synthesis for unknown impls
+# Unsupported backends — refuse at engine init with a descriptive error.
 # ----------------------------------------------------------------------------
 
 
-def _make_auto_subclass(impl_cls: type) -> type:
-    """Build a default masked subclass for `impl_cls` — SDPA fallback only.
-
-    Defined inside a function so `super()` inside the synthesized `forward`
-    binds to the closure-time `__class__` cell.
-    """
-
-    class Auto(impl_cls):  # type: ignore[valid-type, misc]
-        __slots__ = ()
-
-        def forward(
-            self, layer, query, key, value, kv_cache, attn_metadata, output,
-            *args, **kwargs,
-        ):
-            return _dispatch_masked_forward(
-                self, super().forward,
-                layer, query, key, value, kv_cache, attn_metadata, output,
-                *args, **kwargs,
-            )
-
-        _compute_with_mask = _default_compute_with_mask
-
-    Auto.__name__ = f"PieMasked{impl_cls.__name__}"
-    Auto.__qualname__ = Auto.__name__
-    return Auto
+# Map of impl class names → reason. Listed explicitly rather than auto-
+# falling-back to SDPA because silent wrong-logit risk is unacceptable for
+# an inference engine. New backends require a hand-written subclass +
+# entry in `_explicit_subclasses()`.
+_UNSUPPORTED_IMPLS: dict[str, str] = {
+    "MLAImpl": "MLA — compressed KV / projection-on-read; standard gather invalid.",
+    "MLACommonImpl": "MLA — compressed KV / projection-on-read; standard gather invalid.",
+    "FlashInferMLAImpl": "DeepSeek MLA via FlashInfer — no custom_mask path.",
+    "TritonMLAImpl": "DeepSeek MLA via Triton — no custom_mask path.",
+    "FlashMLAImpl": "DeepSeek MLA — no custom_mask path.",
+    "CutlassMLAImpl": "DeepSeek MLA via CUTLASS — no custom_mask path.",
+}
 
 
-# ----------------------------------------------------------------------------
-# MLA refusal — auto-synth would gather garbage from compressed KV.
-# ----------------------------------------------------------------------------
-
-
-_MLA_BLOCKLIST_NAMES = (
-    "MLAImpl",
-    "MLACommonImpl",
-    "FlashInferMLAImpl",
-    "TritonMLAImpl",
-    "FlashMLAImpl",
-    "CutlassMLAImpl",
-)
-
-
-def _is_mla(impl_cls: type) -> bool:
-    if impl_cls.__name__ in _MLA_BLOCKLIST_NAMES:
-        return True
-    for base in impl_cls.__mro__:
-        if base.__name__ in _MLA_BLOCKLIST_NAMES:
-            return True
-    return False
+def _verified_impl_names(explicit: dict[type, type]) -> list[str]:
+    return sorted(impl_cls.__name__ for impl_cls in explicit)
 
 
 # ----------------------------------------------------------------------------
 # Installer
 # ----------------------------------------------------------------------------
-
-
-_AUTO_SYNTH_CACHE: dict[type, type] = {}
 
 
 def _is_pie_masked(cls: type) -> bool:
@@ -262,54 +204,42 @@ def _resolve_masked_class(
         return impl_cls
     if impl_cls in explicit:
         return explicit[impl_cls]
-    if impl_cls in _AUTO_SYNTH_CACHE:
-        return _AUTO_SYNTH_CACHE[impl_cls]
-    if _is_mla(impl_cls):
+
+    name = impl_cls.__name__
+    verified = _verified_impl_names(explicit)
+    if reason := _UNSUPPORTED_IMPLS.get(name):
         raise NotImplementedError(
-            f"pie_backend_vllm: {impl_cls.__name__} is an MLA-style backend "
-            "(compressed KV / projection-on-read). The SDPA gather fallback "
-            "would read garbage from the cache. Custom masks on MLA require "
-            "a dedicated _compute_with_mask implementation."
+            f"pie_backend_vllm: refusing to load with attention impl "
+            f"{name!r}: {reason} Pie's runtime always emits a custom_mask "
+            f"buffer; ignoring it would silently produce wrong tokens for "
+            f"inferlets that depend on non-causal attention. Pick a "
+            f"verified backend instead: {verified}."
         )
-    new_cls = _make_auto_subclass(impl_cls)
-    _AUTO_SYNTH_CACHE[impl_cls] = new_cls
-    return new_cls
+    raise NotImplementedError(
+        f"pie_backend_vllm: no mask strategy registered for impl {name!r}. "
+        f"Either add a subclass in pie_backend_vllm/mask_impls.py "
+        f"(see PieMaskedFlashInferImpl as a template) or pick a verified "
+        f"backend: {verified}."
+    )
 
 
 def install_mask_aware_impls(vllm_config) -> None:
     """Re-type each attention layer's impl to a mask-aware subclass.
 
-    Under compile mode (enforce_eager=False), we keep `use_direct_call=False`
-    so vllm routes attention through the `torch.ops.vllm.unified_*` custom
-    ops. Custom ops are opaque to Dynamo, which is what lets it trace through
-    the model without diving into FlashInfer's wrappers (Dynamo can't follow
-    them). Our patched `impl.forward` lives behind that opaque boundary too.
-
-    Under eager mode (enforce_eager=True), `do_not_compile=True` short-
-    circuits the @support_torch_compile path and Dynamo never runs — so we
-    can flip `use_direct_call=True` to skip ~15 µs × 2 ops × N layers of
-    dispatch overhead per step. The direct-call path invokes the same
-    `unified_*` *functions* without the torch dispatch layer.
-
     Idempotent — re-typing to the same class is a no-op.
+
+    Refuses (NotImplementedError) on impls without a registered mask
+    strategy: silent fallback risks wrong logits for inferlets that
+    depend on non-causal attention patterns.
     """
-    from vllm.config.compilation import CompilationMode
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
     explicit = _explicit_subclasses()
-
-    # Only safe to skip the custom-op dispatch when vllm isn't compiling.
-    # With compile active, Dynamo would trace through our patched
-    # impl.forward and fail on FlashInfer's wrappers.
-    is_eager = vllm_config.compilation_config.mode == CompilationMode.NONE
 
     fc = vllm_config.compilation_config.static_forward_context
     for _name, layer in fc.items():
         if not isinstance(layer, AttentionLayerBase):
             continue
-
-        if is_eager and hasattr(layer, "use_direct_call"):
-            layer.use_direct_call = True
 
         impl = layer.impl
         masked_cls = _resolve_masked_class(type(impl), explicit=explicit)

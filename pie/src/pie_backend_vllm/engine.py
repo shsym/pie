@@ -84,7 +84,6 @@ class VllmEngine:
 
         from .forward_pass import VllmForwardPass
         from .kv_cache import allocate_and_bind_kv_cache, allocate_host_pool
-        from .lean_forward import install_lean_forwards
         from .loader import load_vllm_model
         from .mask_impls import install_mask_aware_impls
 
@@ -116,13 +115,6 @@ class VllmEngine:
         # subclass so an absent `pie_attn_extras` is a single dict.get and
         # zero kernel-time overhead. See mask_impls.py.
         install_mask_aware_impls(loaded.vllm_config)
-
-        # Eager-mode forward-path optimizations: lean Linear + skip
-        # nn.Module hook machinery. Recovers ~1.7 ms/step on small models
-        # where vllm's framework overhead dominates. See lean_forward.py.
-        install_lean_forwards(
-            loaded.model, enforce_eager=bool(driver_config.enforce_eager),
-        )
 
         # `kv_page_size` is not on the lean RuntimeConfig — the shared RPC
         # worker reads it via `engine.capabilities().kv_page_size`, which
