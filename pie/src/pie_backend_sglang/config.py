@@ -27,8 +27,11 @@ class SGLangDriverConfig:
     attention_backend: str = "triton"
 
     # Fraction of free GPU memory to reserve for KV cache + activations.
-    # Mirrors sglang's `mem_fraction_static`.
-    mem_fraction_static: float = 0.85
+    # Mirrors sglang's `mem_fraction_static`. Default lower than sglang's
+    # standalone 0.88 because pie's KV-rebind allocates a parallel tensor
+    # in pie's canonical layout (see kv_cache.py); without slack we OOM at
+    # first fire_batch.
+    mem_fraction_static: float = 0.65
 
     # KV cache page size override. None = sglang picks based on the chosen
     # attention backend's allowed sizes.
