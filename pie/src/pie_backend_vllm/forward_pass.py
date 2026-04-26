@@ -8,6 +8,7 @@ while delegating the actual compute to vllm.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -16,6 +17,20 @@ from pie_backend.config import RuntimeConfig
 from pie_backend.model.common import sample_common
 
 from .attn_metadata import build_common_metadata
+
+
+@dataclass(frozen=True)
+class AttentionShape:
+    """Shape parameters for one attention layer.
+
+    Plain LLMs have a single shape across all layers. Mixed-attention
+    architectures (Gemma3 sliding+full, Qwen3-Next hybrid) carry different
+    shapes per layer; we capture per-layer to make that visible at the
+    type level even though we currently assert uniformity.
+    """
+    num_qo_heads: int
+    num_kv_heads: int
+    head_dim: int
 
 
 class VllmForwardPass:
@@ -50,12 +65,12 @@ class VllmForwardPass:
         self._builder = None
         self._kv_spec = None
         self._layer_names: list[str] = []
-        # Per-model attention shape (uniform across layers for plain LLMs;
-        # mixed-attention architectures would need per-layer plans, out of
-        # scope today). Captured during _ensure_metadata_builder().
-        self._num_qo_heads: int | None = None
-        self._num_kv_heads: int | None = None
-        self._head_dim_qk: int | None = None
+        # Per-layer attention shapes captured at install. Plain LLMs have
+        # one shape across the dict; mixed-attention models carry per-
+        # layer differences. Today we assert uniformity in transform()
+        # because the FlashInfer plan is one-shape-per-batch; per-layer
+        # plans are a future expansion when a real mixed model lands.
+        self._layer_shapes: dict[str, AttentionShape] = {}
         # True when the installed mask-aware impl declares it consumes the
         # FlashInfer prefill wrapper. Set during _ensure_metadata_builder.
         self._impl_uses_flashinfer_wrapper: bool = False
@@ -96,12 +111,16 @@ class VllmForwardPass:
         first_layer = attn_layers[0][1]
         backend = first_layer.attn_backend
 
-        # Capture attention shape for FlashInfer plan(). Vllm's Attention
-        # carries `num_heads` (post-TP) and `num_kv_heads`; head_size is
-        # uniform across Q/K for non-MLA architectures.
-        self._num_qo_heads = int(first_layer.num_heads)
-        self._num_kv_heads = int(first_layer.num_kv_heads)
-        self._head_dim_qk = int(first_layer.head_size)
+        # Per-layer attention shapes. `num_heads`/`num_kv_heads` are
+        # post-TP; `head_size` is uniform across Q/K for non-MLA archs.
+        self._layer_shapes = {
+            name: AttentionShape(
+                num_qo_heads=int(layer.num_heads),
+                num_kv_heads=int(layer.num_kv_heads),
+                head_dim=int(layer.head_size),
+            )
+            for name, layer in attn_layers
+        }
 
         # The installed mask strategy flags whether it needs the FlashInfer
         # prefill wrapper pre-planned this batch. We read from the first
@@ -122,6 +141,25 @@ class VllmForwardPass:
                 vllm_config=self.vllm_config,
                 device=self.device,
             )
+
+    def _uniform_shape_or_fail(self) -> AttentionShape:
+        """Return the model's attention shape, asserting all layers match.
+
+        The FlashInfer prefill wrapper is planned once per batch with a
+        single (num_qo_heads, num_kv_heads, head_dim) tuple. If a model
+        mixes shapes across layers (Gemma3 sliding+full, Qwen3-Next
+        hybrid attention), per-layer plans are needed — fail loudly here
+        so the bug surfaces as a refusal, not as silently-wrong logits.
+        """
+        shapes = set(self._layer_shapes.values())
+        if len(shapes) == 1:
+            return next(iter(shapes))
+        raise NotImplementedError(
+            "pie_backend_vllm: model has mixed attention shapes across "
+            f"layers ({len(shapes)} distinct shapes). FlashInfer plan() is "
+            "currently one-shape-per-batch; per-layer planning is not yet "
+            f"implemented. Shapes seen: {sorted(shapes, key=str)}."
+        )
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -197,10 +235,13 @@ class VllmForwardPass:
             )
 
             # Pre-plan FlashInfer wrapper ONCE for this batch IF the active
-            # impl uses it. Each masked subclass declares this via the
-            # `_pie_uses_flashinfer_wrapper` class attribute. Native pie
-            # follows the same shape: plan() per batch, run() per layer.
+            # strategy uses it. Native pie follows the same shape: plan()
+            # per batch, run() per layer. The plan is one-shape-per-batch,
+            # so we assert per-layer shape uniformity here — when a real
+            # mixed-attention model lands, this is the spot to grow into
+            # per-layer plans.
             if self._impl_uses_flashinfer_wrapper:
+                shape = self._uniform_shape_or_fail()
                 if self._mask_wrapper is None:
                     self._mask_wrapper = make_flashinfer_wrapper(
                         128 * 1024 * 1024, self.device,
@@ -211,9 +252,9 @@ class VllmForwardPass:
                     kv_page_indices=kv_page_indices,
                     kv_page_indptr=kv_page_indptr,
                     kv_last_page_lens=kv_last_page_lens,
-                    num_qo_heads=self._num_qo_heads,
-                    num_kv_heads=self._num_kv_heads,
-                    head_dim_qk=self._head_dim_qk,
+                    num_qo_heads=shape.num_qo_heads,
+                    num_kv_heads=shape.num_kv_heads,
+                    head_dim_qk=shape.head_dim,
                     q_data_type=input_embeds.dtype,
                 )
                 pie_attn_extras.flashinfer_wrapper = self._mask_wrapper
