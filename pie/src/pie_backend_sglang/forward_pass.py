@@ -23,7 +23,8 @@ import torch
 from pie_backend.config import RuntimeConfig
 from pie_backend.model.common import sample_common
 
-from .forward_batch import build_sglang_forward_batch
+from .forward_batch import build_sglang_forward_batch, compute_mask_indptr
+from .mask_hooks import make_mask_strategy
 
 
 class _HiddenCapture(torch.nn.Module):
@@ -87,6 +88,11 @@ class SGLangForwardPass:
         self._capture = _HiddenCapture()
         runner.model.logits_processor = self._capture
 
+        # Install the per-backend custom-mask strategy. One-shot monkeypatch
+        # on the `runner.attn_backend` instance; we feed it pie's mask each
+        # transform() call.
+        self._mask_strategy = make_mask_strategy(runner.attn_backend)
+
         # Resolve the LM head once. Used by sample() as `lm_head_fn`.
         # ParallelLMHead with TP > 1 needs an all-gather, but for v1 we only
         # support TP=1; the matmul-against-weight path matches sglang's own
@@ -131,10 +137,28 @@ class SGLangForwardPass:
             device=self.device,
         )
 
+        # Hand pie's BRLE-decoded mask to the strategy. Pie always emits a
+        # mask; for purely causal workloads it just encodes the upper-tri
+        # pattern. We compute mask_indptr from the FB's CSR-derived seq_lens.
+        if custom_mask is not None:
+            mask_indptr = compute_mask_indptr(
+                fb._pie_qo_indptr_np, fb._pie_seq_lens_np, self.device
+            )
+            self._mask_strategy.set(custom_mask, mask_indptr, fb._pie_seq_lens_np)
+        else:
+            self._mask_strategy.clear()
+
         # Run the model. Our `_HiddenCapture` runs in place of the
-        # LogitsProcessor and stashes full per-token hidden states.
+        # LogitsProcessor and stashes full per-token hidden states. The
+        # mask strategy's hooked `init_forward_metadata` runs from inside
+        # `runner.forward(fb)` and patches `attn_backend.forward_metadata`.
         self._capture.captured = None
-        self.runner.forward(fb)
+        try:
+            self.runner.forward(fb)
+        finally:
+            # Don't leak stale mask state across fire_batch calls — the next
+            # batch may have a different shape.
+            self._mask_strategy.clear()
 
         hidden_states = self._capture.captured
         if hidden_states is None:

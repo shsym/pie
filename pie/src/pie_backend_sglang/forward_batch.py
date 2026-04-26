@@ -84,6 +84,32 @@ def _build_out_cache_loc(
             out[q_start + i] = block_id * page_size + offset
 
 
+def compute_mask_indptr(
+    qo_indptr_np: np.ndarray,
+    seq_lens_np: np.ndarray,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-request offset into pie's flat BRLE-decoded mask buffer.
+
+    For request r with `query_len_r = qo_indptr[r+1] - qo_indptr[r]` query
+    tokens and `seq_lens[r]` total kv tokens, the mask occupies
+    `query_len_r * seq_lens[r]` consecutive bools, indexed row-major as
+    `mask[q_idx][kv_idx]`. mask_indptr is the cumulative-sum of those sizes.
+
+    Matches what sglang's Triton/AITER/Wave kernels expect:
+    `cur_seq_mask_start_idx = mask_indptr[r]` per
+    triton_ops/extend_attention.py:286.
+    """
+    batch = qo_indptr_np.shape[0] - 1
+    if batch == 0:
+        return torch.zeros(1, dtype=torch.int64, device=device)
+    query_lens = (qo_indptr_np[1:] - qo_indptr_np[:-1]).astype(np.int64)
+    per_req = query_lens * seq_lens_np.astype(np.int64)
+    indptr_np = np.zeros(batch + 1, dtype=np.int64)
+    np.cumsum(per_req, out=indptr_np[1:])
+    return torch.from_numpy(indptr_np).to(device, non_blocking=True)
+
+
 def build_sglang_forward_batch(
     *,
     runner: Any,                     # sglang.srt.model_executor.model_runner.ModelRunner
@@ -191,4 +217,12 @@ def build_sglang_forward_batch(
         token_to_kv_pool=runner.token_to_kv_pool,
         attn_backend=runner.attn_backend,
     )
+
+    # Tunnel pie's per-request seq_lens (numpy, CPU) onto the FB so the mask
+    # strategy can reuse them for FlexAttention's per-batch mask_mod without
+    # re-deriving from CSR metadata. Hidden under `_pie_*` to avoid colliding
+    # with future SGLang fields.
+    fb._pie_seq_lens_np = seq_lens_np
+    fb._pie_qo_indptr_np = qo_indptr_np
+
     return fb

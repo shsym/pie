@@ -143,6 +143,7 @@ class SGLangEngine:
             kv_last_page_lens=inputs["kv_last_page_lens"],
             single_token_inference_mode=inputs["single_token_inference_mode"],
             total_pages_cpu=inputs.get("total_pages_cpu", 0),
+            custom_mask=inputs.get("custom_mask"),
         )
 
         return self.forward_pass.sample(gathered_logits, sampling_metadata)
