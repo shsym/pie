@@ -77,9 +77,11 @@ class VllmForwardPass:
         if self._builder is not None:
             return
 
-        from vllm.config import set_current_vllm_config
-        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-        from vllm.model_executor.models.utils import extract_layer_index
+        from ._vllm_compat import (
+            AttentionLayerBase,
+            extract_layer_index,
+            set_current_vllm_config,
+        )
 
         fc = self.vllm_config.compilation_config.static_forward_context
         attn_layers = [
@@ -143,7 +145,7 @@ class VllmForwardPass:
         total_pages_cpu: int = 0,
     ) -> torch.Tensor:
         """Run the model's transformer trunk inside `set_forward_context`."""
-        from vllm.forward_context import set_forward_context
+        from ._vllm_compat import set_forward_context
 
         self._ensure_metadata_builder()
 
@@ -223,7 +225,7 @@ class VllmForwardPass:
             # `set_forward_context` takes its `additional_kwargs` from the
             # platform hook, not from a kwarg, so inject ours after entering.
             if pie_attn_extras is not None:
-                from vllm.forward_context import get_forward_context
+                from ._vllm_compat import get_forward_context
 
                 get_forward_context().additional_kwargs["pie_attn_extras"] = pie_attn_extras
 

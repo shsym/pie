@@ -86,7 +86,7 @@ def build_common_metadata(
     All inputs may live on CPU or GPU; outputs land on `device`. We do the
     Numba work on numpy arrays (CPU) and copy the result to GPU at the end.
     """
-    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from ._vllm_compat import CommonAttentionMetadata
 
     qo_np = qo_indptr.to(torch.int32).cpu().numpy()
     kv_idx_np = kv_page_indices.to(torch.int32).cpu().numpy()

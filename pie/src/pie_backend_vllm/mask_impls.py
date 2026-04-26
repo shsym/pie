@@ -66,7 +66,7 @@ def _dispatch_masked_forward(
     subclass passes `super().forward` here so we don't need to know the impl
     class at this site.
     """
-    from vllm.forward_context import get_forward_context
+    from ._vllm_compat import get_attention_context, get_forward_context
 
     extras = get_forward_context().additional_kwargs.get("pie_attn_extras")
     if extras is None:
@@ -80,10 +80,6 @@ def _dispatch_masked_forward(
     # written. Backends with `=True` write KV inside their forward; since we
     # skip super().forward, we do it ourselves.
     if getattr(layer.attn_backend, "forward_includes_kv_cache_update", False):
-        from vllm.model_executor.layers.attention.attention import (
-            get_attention_context,
-        )
-
         _, _, _, layer_slot_mapping = get_attention_context(layer.layer_name)
         if (
             impl.kv_sharing_target_layer_name is None
@@ -110,8 +106,10 @@ def _explicit_subclasses() -> dict[type, type]:
     """
     registry: dict[type, type] = {}
 
+    from ._vllm_compat import get_flashinfer_impl
+
     try:
-        from vllm.v1.attention.backends.flashinfer import FlashInferImpl
+        FlashInferImpl = get_flashinfer_impl()
     except ImportError:
         FlashInferImpl = None  # type: ignore
 
@@ -232,7 +230,7 @@ def install_mask_aware_impls(vllm_config) -> None:
     strategy: silent fallback risks wrong logits for inferlets that
     depend on non-causal attention patterns.
     """
-    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    from ._vllm_compat import AttentionLayerBase
 
     explicit = _explicit_subclasses()
 
